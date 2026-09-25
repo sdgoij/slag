@@ -1917,6 +1917,77 @@ mod tests {
         );
     }
 
+    /// A computed key on an object *method*/getter/setter is the enclosing
+    /// code's expression — evaluated where the literal is, not in the method's
+    /// body — so a binding it references must be captured by that enclosing
+    /// code. Both capture walks used to bind `Method`/`Get`/`Set` as
+    /// `{ function, .. }`/`{ body, .. }` and skip the key, so the read fell back
+    /// to an unresolvable name: deno's `mixinPairIterable`
+    /// (`ext:deno_webidl/00_webidl.js:1383`) reading its IIFE's `SymbolFor` was
+    /// the snapshot host's `ReferenceError: "SymbolFor" is not defined`.
+    #[test]
+    fn a_computed_method_key_captures_an_enclosing_binding() {
+        // Method key whose expression reads an enclosing `const`.
+        assert_eq!(
+            run("(function () { const K = 'k'; \
+                 function f() { return { [K]() { return 2; } }; } \
+                 return f()[K](); })()")
+            .unwrap(),
+            Value::Number(2.0)
+        );
+        // …and the method body still closes over the same binding.
+        assert_eq!(
+            run("(function () { const K = 'k'; \
+                 function f() { return { [K]() { return K; } }; } \
+                 return f()[K](); })()")
+            .unwrap(),
+            Value::String(Handle::new(JsString::from_utf8("k")))
+        );
+        // A getter, a setter, and a key nested two function scopes deep.
+        assert_eq!(
+            run("(function () { const K = 'k'; \
+                 function f() { return { get [K]() { return 3; } }; } \
+                 return f()[K]; })()")
+            .unwrap(),
+            Value::Number(3.0)
+        );
+        assert_eq!(
+            run("(function () { const G = 'g'; \
+                 function outer() { function inner() { return { [G]() { return 7; } }; } \
+                 return inner(); } \
+                 return outer()[G](); })()")
+            .unwrap(),
+            Value::Number(7.0)
+        );
+        // A setter.
+        assert_eq!(
+            run("(function () { const K = 'k'; let seen = 0; \
+                 function f() { return { set [K](v) { seen = v; } }; } \
+                 f()[K] = 5; return seen; })()")
+            .unwrap(),
+            Value::Number(5.0)
+        );
+        // A closure created *inside* a computed key of a method in a *nested*
+        // function (`closure_expr_allows` walks a closure's body).
+        assert_eq!(
+            run("(function () { const K = 'k'; \
+                 function f() { return { [(x => x + K)('a')]() { return 4; } }; } \
+                 return f()['a' + 'k'](); })()")
+            .unwrap(),
+            Value::Number(4.0)
+        );
+        // A closure created *inside* a computed key of a method at the body's
+        // OWN level (not inside a nested function): the enclosing body's
+        // closure-creation walk must reach the key to collect its captures.
+        assert_eq!(
+            run("(function () { const K = 'k'; \
+                 const o = { [(x => x + K)('a')]() { return 6; } }; \
+                 return o['a' + 'k'](); })()")
+            .unwrap(),
+            Value::Number(6.0)
+        );
+    }
+
     #[test]
     fn evaluates_a_trivial_script_to_a_value() {
         let mut agent = Agent::new();

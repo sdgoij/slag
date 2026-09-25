@@ -24030,6 +24030,22 @@ fn closure_stmt_allows(
     }
 }
 
+/// A property key is not a reference unless it is computed, and a computed
+/// key is the enclosing code's expression: it is evaluated where the object
+/// literal is, so it walks like any other expression of that code (including
+/// a nested closure's key, which is still evaluated in the enclosing scope).
+fn key_allows(
+    key: &PropertyName,
+    bindings: &HashSet<crux::AtomId>,
+    captured: &mut HashSet<crux::AtomId>,
+    own: bool,
+) -> bool {
+    match key {
+        PropertyName::Ident(_) | PropertyName::Str(_) | PropertyName::Number(_) => true,
+        PropertyName::Computed(e) => closure_expr_allows(e, bindings, captured, own),
+    }
+}
+
 fn closure_expr_allows(
     expr: &Expr,
     bindings: &HashSet<crux::AtomId>,
@@ -24061,25 +24077,26 @@ fn closure_expr_allows(
             }
         }),
         ExprKind::Object(object) => object.props.iter().all(|prop| match prop {
-            // A method/getter/setter is a nested closure: a body-binding
-            // reference inside it is a capture too.
-            ObjectProperty::Method { function, .. } => {
-                closure_allows(&function.params, &function.body.stmts, bindings, captured)
+            // A method/getter/setter's *body* is a nested closure, but its
+            // computed key is the enclosing code's expression (evaluated where
+            // the literal is), so the key walks like any other expression of
+            // that code — a binding it references is a capture too.
+            ObjectProperty::Method { key, function } => {
+                key_allows(key, bindings, captured, own)
+                    && closure_allows(&function.params, &function.body.stmts, bindings, captured)
             }
-            ObjectProperty::Get { body, .. } => {
-                closure_allows(&[], &body.stmts, bindings, captured)
+            ObjectProperty::Get { key, body, .. } => {
+                key_allows(key, bindings, captured, own)
+                    && closure_allows(&[], &body.stmts, bindings, captured)
             }
-            ObjectProperty::Set { body, .. } => {
+            ObjectProperty::Set { key, body, .. } => {
                 // The setter's parameter is bound in the closure.
-                closure_allows(&[], &body.stmts, bindings, captured)
+                key_allows(key, bindings, captured, own)
+                    && closure_allows(&[], &body.stmts, bindings, captured)
             }
             ObjectProperty::Init { key, value, .. } => {
-                let key_ok = match key {
-                    // A property key is not a reference.
-                    PropertyName::Ident(_) | PropertyName::Str(_) | PropertyName::Number(_) => true,
-                    PropertyName::Computed(e) => closure_expr_allows(e, bindings, captured, own),
-                };
-                key_ok && closure_expr_allows(value, bindings, captured, own)
+                key_allows(key, bindings, captured, own)
+                    && closure_expr_allows(value, bindings, captured, own)
             }
             ObjectProperty::Spread(e) => closure_expr_allows(e, bindings, captured, own),
         }),
