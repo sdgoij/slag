@@ -4947,6 +4947,16 @@ The three non-numbers: `Isolate::number_of_heap_spaces` is 0, consistently with 
 
 *Gates.* `cargo fmt --all -- --check` clean; both clippy runs clean; `cargo test --locked --workspace -- --skip function::tests::the_data_a_built_function_carries_a_collection` **5,446 passed / 0 failed** (this part's two tests live in the `simdutf` module, which the feature gates, so they run under `cargo test -p v8 --features simdutf` — **342 passed / 0 failed**, up two — rather than in the default workspace run); `cargo test -p runtime --no-default-features --lib` **912 passed / 0 failed** and `cargo check -p cli --no-default-features --features jit` green. **No sweeps**: the part touches only `crates/v8/simdutf.rs`, which is `#[cfg(feature = "simdutf")]` and in no runner's graph (the same tree check is **0**). deno's `deno_core --lib` holds at **453 passed / 6 failed**, the same six out-of-scope cases.
 
+*The withdrawn call path — §9's bullet, named before the edit.* The previous record left the snapshot host dying on the default 1 MiB stack while `Creating a snapshot...`. §9's diagnosis (written before any edit) put that on the interpreter's per-activation frame cost and chose shape (b) — withdraw the call frames so the dispatch frame is popped before a nested activation, rather than split the 3,133-line dispatch. Landed as designed, with three corrections the implementation forced: the seven arms are `Call`/`CallFast`/`CallApply`/`CallFastGlobal`/`CallFastSlot` plus the two fused call-store steps (the design's `…Vector` names were those `*Store` steps); ten exhaustive `VmOutcome` matches needed the unreachable arm, not four (`module.rs`'s `execute_module_body` was missing from the design); and the fused call-store arms do **not** withdraw. `fast_call_core`'s general path now records a `PendingCall { callee, this, arg_start, argc, below }` on the Vm and returns without its truncate/push; each call arm takes that record and returns `VmOutcome::Call(Box<PendingCall>)`; `run_inner_impl` performs the call with the dispatch frame popped, lands the result — or routes the callee's error through the same destructure/for-of/`try` machinery a step error takes — and continues the body. `complete_call`/`complete_pending_call` serve the four synchronous callers (the JIT's three helpers and `builtins/function.rs`'s leaf fallback), and a `debug_assert` at `run_inner_inner`'s entry catches a dropped record.
+
+*The fused call-store arms — a mutation not caught, and the finding it turned out to be.* The design threaded a `store_slot` through the record so the two `*Store` arms could defer their store to the driver. The mutation that dropped it (`complete_call` always pushing) was **not caught by the whole 942-test `runtime` suite** — a finding about the test, so it was traced rather than papered over. A compiler-side probe emitted neither step **zero** times across the suite, and a `const f = …; n = f(n)` source reached `emit_statement_store`'s fusion branch with a non-slot store target and a `CallFast` (not `CallFastGlobal`) predecessor: a statement-position store compiles its callee to `CallFast`, which the fusion pattern does not match. The extra state was removed and those two arms complete a withdrawn activation in place (`complete_pending_call`) — today's behaviour exactly, so an uncertifiable path stays out of the call machinery instead of riding along untested.
+
+*Tests — two, and two mutations, each caught by its own test.* `the_withdrawn_call_path_lifts_the_depth_reached_on_a_small_stack` runs `let d = 0; function f(){ d++; return f(); } try { f(); } catch (e) {} d` on a **2 MiB** thread and asserts the depth reached before the guard's `RangeError` is ≥ **100**; measured **133** (a plain non-tail chain — `f` is a reassignable global, so not a proper tail call). `a_withdrawn_call_leaves_the_value_stack_as_the_in_place_call_did` puts three non-leaf calls in statement position (`a = f(1); b = f(2); c = f(3)`, each a `CallFast` with `below = 2`) so a wrong call-site placement is a wrong value, not a leak under the top of the stack. Mutations, each run alone: reverting the withdrawal in `fast_call_core` (the in-place `call_inner` + truncate/push) drops the ladder to **12** and fails its own test; recording `argc.saturating_sub(1)` fails the value test. A third mutation — ignoring `below` in the truncate — is **not** value-visible (the interpreter addresses the stack relative to its top, so a leak under it changes no result), and that is recorded rather than claimed as a guard.
+
+*The measurement, and the frontier it made exact.* `cargo check -p deno_snapshots --keep-going` at the default 1 MiB still overflows while `Creating a snapshot...`, and the build script binary was rebuilt from this tree (its mtime is after the edits), so the withdrawal is in it. A `target/`-only `editbin` ladder pins the requirement at **between 2 and 4 MiB**: 2 MiB still overflows; 4 MiB gets **past the bootstrap** into a real error — `Failed to initialize JsRuntime … ReferenceError: "SymbolFor" is not defined`, the boundary symptom the diagnosis already named. This part therefore bought one step (the 8–16 MiB estimate is now 2–4 MiB) and, more usefully, replaced an opaque overflow with a named bug. The trace also identifies why the bootstrap is not a JS→JS chain: `loadExtScript` (`ext:core/01_core.js:986`) calls `op_load_ext_script`, a **native op** that evaluates the next script (`libs/core/modules/map.rs`), and the next `loadExtScript` runs inside that evaluation — each cycle re-enters JS through `fast_call_core`'s builtin/native handler arm, which still runs on the dispatch frame. Whether that op call takes the handler arm (`realm_count == 1`) or the now-withdrawn general path is the next part's first probe. The two side findings §9 already records (wrong stack attribution for the `SymbolFor` frame; the error duplicated seven times as it crosses nested `loadExtScript` calls) still stand.
+
+*Gates.* `cargo fmt --all -- --check` clean; `cargo clippy --locked --workspace --all-targets -- -D warnings` clean, and `cargo clippy -p v8 --features simdutf --all-targets -- -D warnings` with it; `cargo test --locked --workspace -- --skip function::tests::the_data_a_built_function_carries_a_collection` **5,448 passed / 0 failed** (up two — this part's tests; `v8` 334, `crux` 259, `runtime` 943, `ffi` 10, `slag` 4, `test262` 3324 with its two ignored); `cargo test -p runtime --no-default-features --lib` **914 passed / 0 failed** (up two); `cargo check -p cli --no-default-features --features jit` green. **Sweeps owed and run**, because this part is `runtime::ir` and every runner links it: test262 `all` (15s/15s) **48,464 pass / 0 fail / 0 crash / 0 hang / 158 skip of 48,622**; `intl402` **3,205 / 0 / 152 skip of 3,357**; wasm `run --strict` **20,662 pass / 0 fail** (+3 skipped) and the seven proposal dirs **25,990 / 77 / 7,485 / 105 / 654+1 / 8,709 / 912**, all 0 fail / 0 pending; the JS-API sweep **1,001 tests / 0 fail** — every number identical to the baseline. deno's `deno_core --lib`, rebuilt because the bridge links this engine: **453 passed / 6 failed**, the same six out-of-scope cases (four inspector, two Windows-only `uv_compat`).
+
 ## 8. Parked: the C++ face
 
 A working C++ face was built (`v8.h` + `api.cc` + a compat program, all green)
@@ -5822,6 +5832,102 @@ if that proves possible.
   decoder; the encode direction (`binary_to_base64`) is new as a Rust function
   too, because the call sites only ever used the C symbol for it. No engine
   change.
+- **The debug stack budget deno's snapshot host exceeds — diagnosed, and the fix
+  is a decision.** With the simdutf symbols in place the `deno_snapshots` build
+  script links, runs, and dies with `STATUS_STACK_OVERFLOW` while creating the
+  snapshot. The cause is not a bug in the walk: it is the interpreter's native
+  frame cost in an unoptimized build. Measured on this tree's debug `slag.exe`, a
+  plain JS call chain reaches **depth 4** before the guard's `RangeError` and
+  overflows the 1 MiB main stack at depth 5; the *release* binary reaches ~200.
+  `eval.rs` already documents the number (~160 KB per level unoptimized vs ~10 KB
+  optimized) and its own recursion tests run on a **64 MiB** thread for exactly
+  this reason. Deno's build script is compiled by the `dev` profile (deno sets
+  `[profile.dev.package.v8] opt-level = 1` for the *v8* crate, which is this
+  bridge, not `runtime`), it runs the full CLI bootstrap (a ~40-deep
+  `loadExtScript` chain), and it has the default 1 MiB — so it needs roughly
+  8-16 MiB in debug. A stack-size probe (raising the *built* build script's
+  reserve with `editbin`, touching only `target/`) confirmed it: with 256 MiB the
+  overflow is gone and the bootstrap runs into a real error instead (`SymbolFor`
+  unresolved, itself a boundary symptom of running at the guard's edge — the same
+  code passes or fails with the headroom available). The fix is **shape (b),
+  chosen**: the dispatch must not be the frame that is live across a nested JS
+  activation. The crux is one line — `fast_call_core`
+  (`crates/runtime/src/ir.rs:12864`) performs every general call with
+  `crate::function::call_inner(agent, &callee, this, args)?`, and everything
+  else in that function is either on-Vm already (the certified-leaf inline, a
+  registered builtin's native handler, the eval host) or the callability/bound
+  So the change is to have the general path *record* the activation on the Vm
+  instead of performing it under the dispatch frame: `fast_call_core`'s general
+  path sets `self.pending_call = Some(PendingCall { callee, this, arg_start,
+  argc, below })` and returns without the truncate/push it does today; each of
+  the five `do_call*` entry points keeps its signature; each call arm takes the
+  record after its `do_call*` and returns the new
+  `VmOutcome::Call(Box<PendingCall>)`; and `run_inner_impl` performs
+  `call_inner` with the dispatch frame popped, truncates/pushes exactly as the
+  call does today, and `continue`s the same body. That shape is chosen over
+  threading an `Option` through the call family because it leaves every
+  signature alone: the only other callers of `do_call*` are the JIT's three
+  runtime helpers and `builtins/function.rs`'s vector call, and those four
+  complete the record inline (`complete_pending_call`) — their frames are the
+  small ones, so they keep today's behaviour. The facts the shape rests on, each
+  checked: `ip` advances *before* the dispatch match (`ir.rs:6090`), so an arm
+  can return early and the driver resumes at the next step; `call_inner`
+  answers `Result<Value, JsError>` and an ordinary call cannot suspend
+  (`function.rs`'s "suspended unexpectedly" arms), so nothing out of band
+  crosses the driver; `run_inner_impl` has one caller (`run_inner`) and
+  `run_inner_inner` only one that can see a call (the leaf path's match cannot,
+  by leafhood), so `VmOutcome::Call` never escapes `run_inner_impl` and the
+  other drivers (`eval.rs`, `function.rs`, `async_await.rs`,
+  `async_generator.rs`) need only an unreachable arm. The recorded `Value`s stay
+  stack-resident (the general path truncates nothing), so they need no tracing,
+  and a `debug_assert` at `run_inner_inner`'s entry catches an arm that ever
+  drops a record. The driver's existing `Err`
+  routing (destructure/for-of close, the `try` handler table) must see a pending
+  call's error exactly as today, which is why the driver computes an effective
+  outcome before matching on it.
+- **The withdrawn call path — landed, with three corrections to the design above
+  and one measurement that moves the frontier.** The corrections, all found
+  while implementing: the seven arms are `Call`, `CallFast`, `CallApply`,
+  `CallFastGlobal`, `CallFastSlot` and the two fused call-store steps (there is
+  no `CallFastSlotVector`/`CallFastGlobalVector` — those are the `*Store`
+  steps); `module.rs`'s `execute_module_body` has an exhaustive `VmOutcome`
+  match too, so **ten** sites needed an unreachable arm, not the four listed;
+  and the fused call-store arms do **not** withdraw. The last is a real
+  finding, not a shortcut: the compiler never emits `CallFastGlobalStore` /
+  `CallFastSlotStore` in a statement-position store, because such a store
+  compiles its callee to `CallFast` (callee pushed on the stack), which
+  `emit_statement_store`'s fusion pattern does not match. A compiler-side probe
+  emitted neither step **zero** times across the whole `runtime` suite, and a
+  `const f = ...; n = f(n)` source reached the fusion branch with a non-slot
+  store target. Those two arms therefore complete a withdrawn activation in
+  place (`complete_pending_call`) — today's behaviour, no new state, and the
+  only posture that keeps an uncertifiable path out of the call machinery.
+  **Measured.** A plain call chain (`f(){ d++; return f(); }` — not a tail call)
+  reaches **133** levels on a 2 MiB thread in a debug build, against **12** with
+  the withdrawal reverted: ~14 KB of native stack per call, down from ~150 KB.
+  That is the part's acceptance test
+  (`eval.rs::the_withdrawn_call_path_lifts_the_depth_reached_on_a_small_stack`,
+  floor 100); the stack-placement companion
+  (`a_withdrawn_call_leaves_the_value_stack_as_the_in_place_call_did`) is the
+  other regression guard. On deno the snapshot host's build script still
+  overflows the default 1 MiB, and a `target/`-only `editbin` ladder pins its
+  requirement at **between 2 and 4 MiB** (2 MiB overflows; 4 MiB gets past
+  `Creating a snapshot...` into the real `SymbolFor` error below). The reason is
+  now visible in the trace and is *not* a JS→JS chain: deno's bootstrap
+  recursion is `loadExtScript` (`ext:core/01_core.js:986`) calling
+  `op_load_ext_script`, a **native op** that evaluates the next script
+  (`libs/core/modules/map.rs`), with the next `loadExtScript` running inside
+  that evaluation. Each cycle re-enters JS through `fast_call_core`'s
+  builtin/native handler arm, which still runs on the dispatch frame — the same
+  3,133-line loop this change withdrew from the general path only. The handler
+  arm is gated on `realm_count == 1`, so whether that op call takes the handler
+  arm or the (now withdrawn) general path is the deciding fact, and it is the
+  next part's first probe rather than a guess to act on. Two side
+  findings from the same run: the engine's stack attribution is wrong — the
+  `SymbolFor` frame is reported as `ext:deno_web/00_url.js:1334`, a file with
+  1259 lines, for a function defined in `00_webidl.js` — and the same error's
+  name, message and frame list are duplicated seven times as it propagates
+  through nested `loadExtScript` calls.
 - **The cppgc heap allocates and never collects.** The tier is stated in
   `crates/v8/cppgc.rs`'s header and in §7: real allocation, real handles, real
   tracing, real reclamation at the heap's end — and no collection before it,

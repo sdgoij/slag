@@ -2718,6 +2718,15 @@ fn run_compiled_body(
                 "tail call escaped the driver".into(),
             ));
         }
+        // `run_inner`'s driver performs a withdrawn call before the body can
+        // complete; an escaped one is an internal invariant violation.
+        Ok(VmOutcome::Call(_)) => {
+            agent.return_vm(vm);
+            return Err(JsError::new(
+                ErrorKind::TypeError,
+                "withdrawn call escaped the driver".into(),
+            ));
+        }
         // The body env's `using` resources dispose on an abrupt error too
         // (spec 14.2.3 step 6, mirroring the walker's eval_statement_list);
         // a throwing disposal folds into the error as a SuppressedError.
@@ -3204,6 +3213,16 @@ fn ordinary_construct(
                         "tail call escaped the driver".into(),
                     ));
                 }
+                // `run_inner`'s driver performs a withdrawn call before the
+                // body can complete; an escaped one is an internal invariant
+                // violation.
+                Ok(VmOutcome::Call(_)) => {
+                    agent.return_vm(vm);
+                    return Err(JsError::new(
+                        ErrorKind::TypeError,
+                        "withdrawn call escaped the driver".into(),
+                    ));
+                }
                 Err(error) => {
                     agent.return_vm(vm);
                     return Err(body_error_after_disposal(agent, &body_env, error));
@@ -3381,6 +3400,16 @@ fn ordinary_construct(
                         return Err(JsError::new(
                             ErrorKind::TypeError,
                             "tail call escaped the driver".into(),
+                        ));
+                    }
+                    // `run_inner`'s driver performs a withdrawn call before
+                    // the body can complete; an escaped one is an internal
+                    // invariant violation.
+                    Ok(VmOutcome::Call(_)) => {
+                        agent.return_vm(vm);
+                        return Err(JsError::new(
+                            ErrorKind::TypeError,
+                            "withdrawn call escaped the driver".into(),
                         ));
                     }
                     Err(error) => {

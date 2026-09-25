@@ -278,6 +278,15 @@ pub fn call_async_function(
                         "tail call escaped the async driver".into(),
                     ));
                 }
+                // `run_inner`'s driver performs a withdrawn call before the
+                // body can complete; an escaped one is an internal invariant
+                // violation.
+                VmOutcome::Call(_) => {
+                    return Err(JsError::new(
+                        ErrorKind::TypeError,
+                        "withdrawn call escaped the async driver".into(),
+                    ));
+                }
                 VmOutcome::Suspended(_) => {
                     return Err(JsError::new(
                         ErrorKind::TypeError,
@@ -435,6 +444,14 @@ fn resume_async(
             return Err(JsError::new(
                 ErrorKind::TypeError,
                 "tail call escaped the async driver".into(),
+            ));
+        }
+        // `run_inner`'s driver performs a withdrawn call before the body can
+        // complete; an escaped one is an internal invariant violation.
+        VmOutcome::Call(_) => {
+            return Err(JsError::new(
+                ErrorKind::TypeError,
+                "withdrawn call escaped the async driver".into(),
             ));
         }
         VmOutcome::Suspended(_) => {

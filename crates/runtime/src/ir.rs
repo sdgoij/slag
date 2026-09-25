@@ -1895,6 +1895,34 @@ impl Trace for ResumeAbrupt {
     }
 }
 
+/// A call step whose callee runs on its own activation rather than under the
+/// dispatch frame. `Vm::fast_call_core`'s general path records one instead of
+/// performing `call_inner` in place; `run_inner_impl` performs it with the
+/// dispatch frame (the interpreter's multi-thousand-line step loop) already
+/// popped. That is what keeps a deep JS call chain off the native stack in an
+/// unoptimized build, where the step loop's own frame is the whole cost
+/// (`.notes/embedding.md` §9).
+///
+/// The call site is left intact on the value stack (`arg_start` locates the
+/// top-`argc` arguments, `below` the values under them that the completion
+/// truncates with them), so the recorded `Value`s are stack-resident and need
+/// no rooting of their own.
+#[derive(Debug)]
+pub struct PendingCall {
+    callee: Value,
+    this: Value,
+    arg_start: usize,
+    argc: usize,
+    below: usize,
+}
+
+impl Trace for PendingCall {
+    fn trace(&self, visit: &mut dyn FnMut(GcAny)) {
+        self.callee.trace(visit);
+        self.this.trace(visit);
+    }
+}
+
 /// The result of a VM run.
 #[derive(Debug)]
 pub enum VmOutcome {
@@ -1904,6 +1932,9 @@ pub enum VmOutcome {
     /// up the callee's context and frame on this Vm, and `run_inner`'s
     /// driver continues with the carried body.
     TailCall(std::rc::Rc<CompiledBody>),
+    /// A call step withdrew its activation: the driver performs the recorded
+    /// call and resumes the same body (see [`PendingCall`]).
+    Call(Box<PendingCall>),
 }
 
 /// The body a [`Vm::run_inner`] driver is currently executing: a proper tail
@@ -3073,6 +3104,11 @@ pub struct Vm {
     /// disposes them (folding into the thrown value, spec 9.4.3) before
     /// binding the parameter. `(saved_env, env_depth)` of the try frame.
     pub pending_catch_disposal: Option<(EnvRef, usize)>,
+    /// A call step's activation withdrawn by `fast_call_core`'s general path
+    /// (see [`PendingCall`]): `run_inner_impl` performs it with the dispatch
+    /// frame popped. `None` whenever a step is dispatching, and always `None`
+    /// on a Vm that is idle or between bodies.
+    pending_call: Option<PendingCall>,
     /// Cut 45: the next body of a JIT tail-call chain — a compiled body's
     /// `tail_call` helper replaced the frame (via `tail_prepare_ordinary`)
     /// and stashed the callee's body here; `run_compiled_body` loops on it
@@ -3192,6 +3228,7 @@ impl Trace for Vm {
         }
         self.var_ref_stack.trace(visit);
         self.call_args.trace(visit);
+        self.pending_call.trace(visit);
         self.current_function.trace(visit);
         self.current_new_target.trace(visit);
         // The leaf-path JIT runs' private buffers (pushed by `run_jit_leaf`
@@ -3346,6 +3383,7 @@ impl Vm {
             array_index_stack: Vec::new(),
             args_base_stack: Vec::new(),
             call_args: Vec::new(),
+            pending_call: None,
             tail_replaced: None,
             current_function: None,
             current_new_target: None,
@@ -3409,6 +3447,7 @@ impl Vm {
         self.array_index_stack.clear();
         self.args_base_stack.clear();
         self.call_args.clear();
+        self.pending_call = None;
         self.current_function = None;
         self.current_new_target = None;
     }
@@ -5979,7 +6018,7 @@ impl Vm {
         crux::function::with_agent(agent as *mut Agent as *mut (), || {
             loop {
                 let body = current.get();
-                match self.run_inner_inner(agent, body) {
+                let outcome = match self.run_inner_inner(agent, body) {
                     Ok(VmOutcome::TailCall(next)) => {
                         current = CurrentBody::Owned(next);
                         // The tracked body must follow the tail call (the
@@ -5989,82 +6028,132 @@ impl Vm {
                                 last.body = current.get() as *const CompiledBody;
                             }
                         });
+                        continue;
                     }
+                    // A call step withdrew the dispatch frame: perform the
+                    // recorded activation here, with that frame popped, then
+                    // resume the same body. An error from the callee is the
+                    // step error path below (the callee's own body already
+                    // disposed its resources at its own level).
+                    Ok(VmOutcome::Call(pending)) => match self.complete_call(agent, *pending) {
+                        Ok(()) => continue,
+                        Err(error) => Err(error),
+                    },
+                    other => other,
+                };
+                match outcome {
                     Ok(outcome) => return Ok(outcome),
-                    // A step's engine error (a TypeError from a property access, a
-                    // ReferenceError from an unresolved identifier, ...) inside a
-                    // `try` is a thrown completion: route it through the handler
-                    // table so `catch` sees it, like the interpreter path. Without
-                    // a covering handler the original error propagates untouched.
-                    Err(error) => {
-                        // An error escaping a step while a destructuring pattern is
-                        // in progress closes the not-done iterators (spec
-                        // 13.15.5.2 step 5): the first throwing `return` replaces
-                        // the error (spec 7.4.11). The tree-walker's
-                        // array_assignment does the same on its error path. The
-                        // JIT's error path shares the close (Cut 59).
-                        let mut error = error;
-                        if !self.destructure_stack.is_empty()
-                            && !self.destructure_stepping
-                            && let Err(e) = self.close_destructures_throw(agent)
-                        {
-                            error = e;
-                        }
-                        // An error escaping a for-of body or head closes the
-                        // active iterators (spec 14.7.6.2: a head-binding error or
-                        // abrupt body completion returns IteratorClose). A `next()`
-                        // error is exempt: it propagates with the iterator open.
-                        // An error covered by a handler whose catch resumes inside
-                        // the loop body must leave the iterators intact — the loop
-                        // continues (mirrors the `throw`-statement path, which only
-                        // closes when the throw escapes).
-                        let covered = self.try_stack.iter().any(|frame| {
-                            body.handlers.get(frame.handler).is_some_and(|handler| {
-                                self.ip >= handler.start && self.ip < handler.try_end
-                            })
-                        });
-                        if !covered && !self.for_of_stepping {
-                            self.close_for_of_throw(agent);
-                        }
-                        if covered {
-                            // Route the engine error through the handler table
-                            // like a thrown value, then CONTINUE the same loop —
-                            // re-entering run_inner (throw_error) would recurse
-                            // once per caught error and overflow the stack on a
-                            // hot catch loop.
-                            let value = match crate::builtins::error::to_throwable(agent, &error) {
-                                Ok(value) => value,
-                                Err(_) => error_message_value(&error),
-                            };
-                            match self.throw_machinery(agent, body, value)? {
-                                CtlResult::Continue => continue,
-                                CtlResult::Done(outcome) => return Ok(outcome),
-                            }
-                        } else {
-                            // spec 9.4.3: an error escaping the body disposes the
-                            // active scopes' `using` resources (innermost first),
-                            // folding a throwing disposal into the error (the
-                            // tree-walker's statement lists do the same).
-                            let mut resources = Vec::new();
-                            self.env_stack.drain_disposables(&mut resources);
-                            if !resources.is_empty() {
-                                let thrown = crate::promise::error_value(agent, &error);
-                                if let Some(outcome) = self.start_scope_disposal(
-                                    agent,
-                                    body,
-                                    resources,
-                                    Completion::Throw(thrown),
-                                    DisposalResume::ApplyCompletion,
-                                )? {
-                                    return Ok(outcome);
-                                }
-                            }
-                            return Err(error);
-                        }
-                    }
+                    Err(error) => match self.route_step_error(agent, body, error)? {
+                        Some(outcome) => return Ok(outcome),
+                        None => continue,
+                    },
                 }
             }
         })
+    }
+
+    /// Route an error from a step (or from a withdrawn call's callee) through
+    /// the abrupt-completion machinery and the `try` handler table, exactly as
+    /// the in-place interpreter path does. `Ok(None)` means a handler resumed
+    /// inside the body and the driver continues it; `Ok(Some(outcome))` is the
+    /// body's outcome; `Err` propagates.
+    fn route_step_error(
+        &mut self,
+        agent: &mut Agent,
+        body: &CompiledBody,
+        error: JsError,
+    ) -> Result<Option<VmOutcome>, JsError> {
+        // An error escaping a step while a destructuring pattern is in
+        // progress closes the not-done iterators (spec 13.15.5.2 step 5): the
+        // first throwing `return` replaces the error (spec 7.4.11). The
+        // tree-walker's array_assignment does the same on its error path. The
+        // JIT's error path shares the close (Cut 59).
+        let mut error = error;
+        if !self.destructure_stack.is_empty()
+            && !self.destructure_stepping
+            && let Err(e) = self.close_destructures_throw(agent)
+        {
+            error = e;
+        }
+        // An error escaping a for-of body or head closes the active iterators
+        // (spec 14.7.6.2: a head-binding error or abrupt body completion
+        // returns IteratorClose). A `next()` error is exempt: it propagates
+        // with the iterator open. An error covered by a handler whose catch
+        // resumes inside the loop body must leave the iterators intact — the
+        // loop continues (mirrors the `throw`-statement path, which only closes
+        // when the throw escapes).
+        let covered = self.try_stack.iter().any(|frame| {
+            body.handlers
+                .get(frame.handler)
+                .is_some_and(|handler| self.ip >= handler.start && self.ip < handler.try_end)
+        });
+        if !covered && !self.for_of_stepping {
+            self.close_for_of_throw(agent);
+        }
+        if covered {
+            // Route the engine error through the handler table like a thrown
+            // value, then CONTINUE the same loop — re-entering run_inner
+            // (throw_error) would recurse once per caught error and overflow
+            // the stack on a hot catch loop.
+            let value = match crate::builtins::error::to_throwable(agent, &error) {
+                Ok(value) => value,
+                Err(_) => error_message_value(&error),
+            };
+            match self.throw_machinery(agent, body, value)? {
+                CtlResult::Continue => Ok(None),
+                CtlResult::Done(outcome) => Ok(Some(outcome)),
+            }
+        } else {
+            // spec 9.4.3: an error escaping the body disposes the active
+            // scopes' `using` resources (innermost first), folding a throwing
+            // disposal into the error (the tree-walker's statement lists do the
+            // same).
+            let mut resources = Vec::new();
+            self.env_stack.drain_disposables(&mut resources);
+            if !resources.is_empty() {
+                let thrown = crate::promise::error_value(agent, &error);
+                if let Some(outcome) = self.start_scope_disposal(
+                    agent,
+                    body,
+                    resources,
+                    Completion::Throw(thrown),
+                    DisposalResume::ApplyCompletion,
+                )? {
+                    return Ok(Some(outcome));
+                }
+            }
+            Err(error)
+        }
+    }
+
+    /// Take the record a call step just made, as the outcome the driver
+    /// performs with the dispatch frame popped.
+    fn take_pending_call(&mut self) -> Option<VmOutcome> {
+        self.pending_call
+            .take()
+            .map(|pending| VmOutcome::Call(Box::new(pending)))
+    }
+
+    /// Perform a call recorded by [`Vm::fast_call_core`]'s general path and
+    /// land its result exactly as the general path would in place: read the
+    /// arguments off the stack, run the callee, then replace the call site
+    /// (`below` values under the arguments) with the result.
+    fn complete_call(&mut self, agent: &mut Agent, pending: PendingCall) -> Result<(), JsError> {
+        let args = &self.stack[pending.arg_start..pending.arg_start + pending.argc];
+        let result = crate::function::call_inner(agent, &pending.callee, pending.this, args)?;
+        self.stack.truncate(pending.arg_start - pending.below);
+        self.stack.push(result);
+        Ok(())
+    }
+
+    /// Complete a record still on the Vm: a caller that performs a call
+    /// synchronously in its own (small) frame — the JIT's call helpers and the
+    /// builtin leaf fallback. A no-op when no call was withdrawn.
+    pub(crate) fn complete_pending_call(&mut self, agent: &mut Agent) -> Result<(), JsError> {
+        match self.pending_call.take() {
+            Some(pending) => self.complete_call(agent, pending),
+            None => Ok(()),
+        }
     }
 
     fn run_inner_inner(
@@ -6072,6 +6161,10 @@ impl Vm {
         agent: &mut Agent,
         body: &CompiledBody,
     ) -> Result<VmOutcome, JsError> {
+        debug_assert!(
+            self.pending_call.is_none(),
+            "a withdrawn call must be performed before the next body step"
+        );
         loop {
             let steps = &body.steps;
             let step = match steps.get(self.ip) {
@@ -7057,6 +7150,9 @@ impl Vm {
                 Step::Call { direct_eval, span } => {
                     self.set_site(agent, *span);
                     self.do_call(agent, *direct_eval)?;
+                    if let Some(outcome) = self.take_pending_call() {
+                        return Ok(outcome);
+                    }
                 }
                 Step::CallFast {
                     argc,
@@ -7065,10 +7161,16 @@ impl Vm {
                 } => {
                     self.set_site(agent, *span);
                     self.do_call_fast(agent, *argc as usize, *direct_eval)?;
+                    if let Some(outcome) = self.take_pending_call() {
+                        return Ok(outcome);
+                    }
                 }
                 Step::CallApply { argc, kind, span } => {
                     self.set_site(agent, *span);
                     self.do_call_apply(agent, *argc as usize, *kind)?;
+                    if let Some(outcome) = self.take_pending_call() {
+                        return Ok(outcome);
+                    }
                 }
                 Step::TailCallFast { argc, direct_eval } => {
                     return self.tail_call_fast(agent, *argc as usize, *direct_eval, body);
@@ -7122,10 +7224,16 @@ impl Vm {
                 } => {
                     self.set_site(agent, *span);
                     self.do_call_fast_global(agent, *name, None, *argc as usize, *direct_eval)?;
+                    if let Some(outcome) = self.take_pending_call() {
+                        return Ok(outcome);
+                    }
                 }
                 Step::CallFastSlot { slot, argc, span } => {
                     self.set_site(agent, *span);
                     self.do_call_fast_slot(agent, *slot, None, *argc as usize)?;
+                    if let Some(outcome) = self.take_pending_call() {
+                        return Ok(outcome);
+                    }
                 }
                 Step::CallFastSlotStore {
                     callee_slot,
@@ -7153,6 +7261,14 @@ impl Vm {
                         }
                     }
                     self.do_call_fast_slot(agent, *callee_slot, arg_base, arg_slots.len())?;
+                    // This fused step is not emitted by the current compiler
+                    // (a global or local callee compiles to `CallFast`/
+                    // `CallFastSlot` here), so no test reaches its general
+                    // path; a withdrawn activation, should one ever appear, is
+                    // completed in place rather than deferred, keeping the
+                    // arm's result placement exactly as it was. Recorded in
+                    // `.notes/embedding.md` §9.
+                    self.complete_pending_call(agent)?;
                     let result = self.pop();
                     if self.frame_get(*store_slot).is_uninitialized() {
                         return Err(JsError::new(
@@ -7185,6 +7301,10 @@ impl Vm {
                         }
                     }
                     self.do_call_fast_global(agent, *name, arg_base, arg_slots.len(), false)?;
+                    // See `CallFastSlotStore` above: the fused step is not
+                    // emitted by the current compiler, so complete a withdrawn
+                    // activation in place rather than deferring it.
+                    self.complete_pending_call(agent)?;
                     let result = self.pop();
                     if self.frame_get(*store_slot).is_uninitialized() {
                         return Err(JsError::new(
@@ -10404,10 +10524,15 @@ impl Vm {
                 ErrorKind::TypeError,
                 "ordinary function suspended unexpectedly".into(),
             )),
-            // A leaf body contains no calls, so a tail call cannot escape it.
+            // A leaf body contains no calls, so neither a tail call nor a
+            // withdrawn call can escape it.
             Ok(VmOutcome::TailCall(_)) => Err(JsError::new(
                 ErrorKind::TypeError,
                 "tail call escaped a leaf body".into(),
+            )),
+            Ok(VmOutcome::Call(_)) => Err(JsError::new(
+                ErrorKind::TypeError,
+                "withdrawn call escaped a leaf body".into(),
             )),
             Err(error) => Err(error),
         }
@@ -12861,9 +12986,19 @@ impl Vm {
                 format!("{} is not a function", crux::value::type_of(&callee)),
             ));
         }
-        let result = crate::function::call_inner(agent, &callee, this, args)?;
-        self.stack.truncate(arg_start - below);
-        self.stack.push(result);
+        // Withdraw the dispatch frame: record the activation for the driver to
+        // perform with that frame popped (see [`PendingCall`]), leaving the
+        // call site on the stack for the completion — `complete_call` reads
+        // the arguments in place and truncates `below` values under them,
+        // exactly as performing the call here would.
+        debug_assert!(self.pending_call.is_none());
+        self.pending_call = Some(PendingCall {
+            callee,
+            this,
+            arg_start,
+            argc,
+            below,
+        });
         Ok(())
     }
 

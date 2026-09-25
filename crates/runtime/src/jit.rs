@@ -1514,6 +1514,13 @@ extern "C" fn call_slow(
     }
     match vm.do_call_fast(agent, argc, direct_eval != 0) {
         Ok(()) => {
+            // The general path withdrew the activation instead of performing
+            // it in the dispatch frame; this helper's own frame is small, so
+            // complete it here before reading the result.
+            if let Err(error) = vm.complete_pending_call(agent) {
+                vm.stack.truncate(entry_len);
+                return slow_error(ctx, error);
+            }
             // `do_call_fast` replaced `[this, callee, args]` with the result.
             let result = match vm.stack.pop() {
                 Some(value) => value,
@@ -1568,6 +1575,12 @@ extern "C" fn call_apply(
     };
     match vm.do_call_apply(agent, argc, kind) {
         Ok(()) => {
+            // The general path (a shadowed apply/call or a non-leaf callee)
+            // withdrew the activation; complete it here (see `call_slow`).
+            if let Err(error) = vm.complete_pending_call(agent) {
+                vm.stack.truncate(entry_len);
+                return slow_error(ctx, error);
+            }
             let result = match vm.stack.pop() {
                 Some(value) => value,
                 None => {
@@ -2553,6 +2566,12 @@ extern "C" fn call_vector(ctx: *mut c_void, this: u64, callee: u64, direct_eval:
     // context push), direct eval, the callable check, and the general call.
     match vm.do_call_fast(agent, argc, direct_eval != 0) {
         Ok(()) => {
+            // The general path withdrew the activation; complete it here (see
+            // `call_slow`).
+            if let Err(error) = vm.complete_pending_call(agent) {
+                vm.stack.truncate(entry_len);
+                return slow_error(ctx, error);
+            }
             let result = match vm.stack.pop() {
                 Some(value) => value,
                 None => {

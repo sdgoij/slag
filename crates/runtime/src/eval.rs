@@ -122,6 +122,15 @@ pub fn eval_program(
                 "tail call in a script top level".into(),
             ));
         }
+        // `run_inner`'s driver performs a withdrawn call before the body can
+        // complete; an escaped one is an internal invariant violation.
+        Ok(crate::ir::VmOutcome::Call(_)) => {
+            agent.return_vm(vm);
+            return Err(JsError::new(
+                ErrorKind::TypeError,
+                "withdrawn call escaped the script driver".into(),
+            ));
+        }
         Err(error) => {
             agent.return_vm(vm);
             return Err(error);
@@ -1760,6 +1769,55 @@ mod tests {
                     .is_some_and(|name| name.to_string_lossy() == "RangeError"),
             ),
             "runaway recursion must throw a catchable RangeError"
+        );
+    }
+
+    /// The per-activation native cost, which is the whole reason the call path
+    /// withdraws the dispatch frame (`.notes/embedding.md` §9). Before that,
+    /// every level of a JS call chain kept the interpreter's giant step loop
+    /// live (~160 KB of native stack per level unoptimized), so even a 2 MiB
+    /// thread reached only a handful of levels before the guard's
+    /// `RangeError`. The withdrawn-call path pays a few small frames per level
+    /// instead: this thread reaches 133 levels in a debug build (~14 KB per
+    /// level, down from ~160 KB). The floor is the acceptance — far above the
+    /// pre-change depth and below the measured one.
+    #[test]
+    fn the_withdrawn_call_path_lifts_the_depth_reached_on_a_small_stack() {
+        let depth = std::thread::Builder::new()
+            .name("stack-ladder".into())
+            .stack_size(2 << 20)
+            .spawn(|| {
+                run("let d = 0; function f() { d++; return f(); } \
+                     try { f(); } catch (e) { e && e.name; } d")
+                .expect("the ladder script runs")
+                .as_number()
+                .expect("the ladder script completes with a number")
+            })
+            .expect("spawns the ladder thread")
+            .join()
+            .expect("the ladder thread panicked");
+        assert!(
+            depth >= 100.0,
+            "a withdrawn call must cost a few small frames rather than the whole \
+             dispatch frame; a 2 MiB stack reached only depth {depth}"
+        );
+    }
+
+    /// A withdrawn call must leave the value stack exactly as the in-place
+    /// call did: the call site (`below` values under the arguments) is
+    /// replaced by the result, and the values around it survive. `f` is
+    /// non-leaf (it calls `g`), so the call cannot take the leaf-inline path
+    /// and must withdraw, and a statement-position assignment compiles to
+    /// `CallFast` (`below` = 2, the `[this, callee]` pair) — so a wrong
+    /// `below`/truncate leaves the pair on the stack and later reads see it.
+    #[test]
+    fn a_withdrawn_call_leaves_the_value_stack_as_the_in_place_call_did() {
+        assert_eq!(
+            run("function g(x) { return x + 1; } \
+                 function f(x) { return g(x) * 2; } \
+                 let a, b, c; a = f(1); b = f(2); c = f(3); [a, b, c].join(',')")
+            .unwrap(),
+            Value::String(Handle::new(JsString::from_utf8("4,6,8")))
         );
     }
 

@@ -641,6 +641,12 @@ fn finish_resume(
                 ErrorKind::TypeError,
                 "tail call escaped the generator driver".into(),
             )),
+            // `run_inner`'s driver performs a withdrawn call before the body
+            // can complete; an escaped one is an internal invariant violation.
+            VmOutcome::Call(_) => Err(JsError::new(
+                ErrorKind::TypeError,
+                "withdrawn call escaped the generator driver".into(),
+            )),
             VmOutcome::Suspended(Suspension::Yield { value, delegate }) => {
                 let context = agent.execution_context_stack.pop().ok_or_else(|| {
                     JsError::new(ErrorKind::TypeError, "no context to pop".into())

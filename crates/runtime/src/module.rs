@@ -1758,6 +1758,15 @@ fn execute_module_body(
                 "tail call escaped the module driver".into(),
             ));
         }
+        // `run_inner`'s driver performs a withdrawn call before the body can
+        // complete; an escaped one is an internal invariant violation.
+        Ok(VmOutcome::Call(_)) => {
+            agent.execution_context_stack.pop();
+            return Err(JsError::new(
+                ErrorKind::TypeError,
+                "withdrawn call escaped the module driver".into(),
+            ));
+        }
         Ok(VmOutcome::Suspended(Suspension::Await(value))) => {
             // The body has come to rest at a top-level await, and where it rests
             // is what the message a host reports for a stalled module answers
