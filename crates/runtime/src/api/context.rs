@@ -27,6 +27,16 @@ pub struct Context {
     realm: Handle<Realm>,
 }
 
+/// Which microtask policy one embedder entry checkpoints under.
+#[derive(Clone, Copy, PartialEq)]
+enum Checkpoint {
+    /// Only when the isolate's policy is `Auto` — an ordinary entry.
+    Policy,
+    /// Whatever the isolate's policy is: an entry that checkpoints explicitly, the
+    /// way V8's `Module::Evaluate` does.
+    Always,
+}
+
 impl Context {
     /// InitializeHostDefinedRealm on `isolate` (spec 9.3.4) and push the
     /// bootstrap execution context.
@@ -229,7 +239,8 @@ impl Context {
         crux::function::with_agent(agent as *mut (), || body(unsafe { &mut *agent }))
     }
 
-    /// Run `body` as one embedder entry.
+    /// Run `body` as one embedder entry, checkpointing the job queues at the
+    /// outermost exit when the policy is `Auto`.
     ///
     /// The depth is what makes `MicrotasksPolicy::Auto` mean "after the
     /// outermost entry": a host callback that calls back in raises it, so the
@@ -238,9 +249,34 @@ impl Context {
     /// job that throws becomes the isolate's pending exception, where the crate
     /// we stand in for swallows it (the difference is a host's, and it is a
     /// rarer one: it can only be seen by asking).
-    fn entered<T>(
+    pub(crate) fn entered<T>(
         &self,
         body: impl FnOnce(&mut Agent) -> Result<T, JsError>,
+    ) -> Result<T, JsError> {
+        self.entered_with(body, Checkpoint::Policy)
+    }
+
+    /// The same entry, with the queues checkpointed at the outermost exit
+    /// **whatever the policy**: `policy` is the one this entry checkpoints under.
+    ///
+    /// A module evaluation is the caller: V8's `Module::Evaluate` performs a
+    /// checkpoint unconditionally — an explicit call, not an automatic one — which
+    /// is why a host that sets `MicrotasksPolicy::Explicit` (deno does,
+    /// `libs/core/runtime/setup.rs:284`) still sees a module whose top-level `await`
+    /// has already settled complete before `Evaluate` returns. The depth still
+    /// guards the drain, so a host callback that evaluates a module re-entrantly
+    /// cannot have the queues drain under it.
+    pub(crate) fn entered_checkpointing<T>(
+        &self,
+        body: impl FnOnce(&mut Agent) -> Result<T, JsError>,
+    ) -> Result<T, JsError> {
+        self.entered_with(body, Checkpoint::Always)
+    }
+
+    fn entered_with<T>(
+        &self,
+        body: impl FnOnce(&mut Agent) -> Result<T, JsError>,
+        checkpoint: Checkpoint,
     ) -> Result<T, JsError> {
         let isolate = unsafe { &*self.isolate };
         // A terminated isolate refuses the next entry rather than running it,
@@ -261,9 +297,9 @@ impl Context {
             // rather than a job. It runs first — the host's own bookkeeping,
             // and a finalizer may enqueue a job the drain below then runs.
             self.with_agent(|agent| agent.run_host_finalizers());
-            if isolate.get_microtasks_policy() == crate::api::MicrotasksPolicy::Auto
-                && let Err(error) = self.with_agent(|agent| agent.run_jobs())
-            {
+            let drains = checkpoint == Checkpoint::Always
+                || isolate.get_microtasks_policy() == crate::api::MicrotasksPolicy::Auto;
+            if drains && let Err(error) = self.with_agent(|agent| agent.run_jobs()) {
                 let thrown = self
                     .with_agent(|agent| crate::builtins::error::to_throwable(agent, &error))
                     .unwrap_or(Value::Undefined);

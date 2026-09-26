@@ -391,8 +391,16 @@ impl Module {
     }
 
     /// Evaluate the module (spec 16.2.1.6.2.1); the value is a promise.
+    ///
+    /// Routed through [`Context::entered_checkpointing`] because the body is
+    /// JavaScript and V8's `Module::Evaluate` checkpoints the job queues
+    /// explicitly: a module whose top-level `await` has already settled is
+    /// `Evaluated` when this returns, which is what `deno_core` reads
+    /// immediately afterwards.
     pub fn evaluate(&self, context: &Context) -> Result<Local, JsError> {
-        context.with_agent(|agent| module::module_evaluation(agent, &self.module).map(Local))
+        context.entered_checkpointing(|agent| {
+            module::module_evaluation(agent, &self.module).map(Local)
+        })
     }
 
     /// Start evaluating the module's asynchronous transitive dependencies and
@@ -707,6 +715,40 @@ mod tests {
         );
         assert_eq!(dep.status(), ModuleStatus::Evaluating);
         assert_eq!(main.status(), ModuleStatus::Instantiated);
+    }
+
+    /// A module whose top-level `await` has already settled is `Evaluated` when
+    /// `evaluate` returns, and the promise it answered is fulfilled — the
+    /// checkpoint V8's `Module::Evaluate` runs for the outermost entry.
+    ///
+    /// deno_core reads `get_status()` immediately after `evaluate()`
+    /// (`libs/core/modules/map/evaluation.rs:106`, a debug assert that accepts
+    /// only `Evaluated`/`Errored`), so a module that suspends and only finishes
+    /// when the host later drains is a panic there rather than a slow path.
+    #[test]
+    fn a_module_whose_await_settles_completes_inside_evaluate() {
+        let mut isolate = Isolate::new();
+        let context = Context::new(&mut isolate).expect("context");
+        let module = Module::compile(
+            &context,
+            "settled",
+            "await Promise.resolve(3);\nexport const done = true;",
+        )
+        .expect("module");
+        module.register(&context, "settled").expect("register");
+        module.instantiate(&context).expect("instantiate");
+
+        let promise = module.evaluate(&context).expect("evaluate");
+        assert_eq!(
+            module.status(),
+            ModuleStatus::Evaluated,
+            "the checkpoint runs inside evaluate, so the status is Evaluated already"
+        );
+        assert_eq!(
+            Promise::state(&context, &promise).expect("state"),
+            "fulfilled",
+            "and the promise it answered is settled rather than pending"
+        );
     }
 
     /// A module suspended on a top-level await that will not settle is what a
