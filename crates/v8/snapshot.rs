@@ -57,7 +57,11 @@
 //! namespace, a host object, an array with a hole — ends
 //! [`create_blob`](SnapshotCreator::create_blob) with a panic naming it, and so
 //! does a host callback the host's external-reference table does not hold, or one
-//! the host built constructible. The crate's signature is `Option`, which its own
+//! the host built constructible. A **function template** attached as context data
+//! is carried as the record [`template_record`] writes; a template carrying a part
+//! that record does not hold yet — a property of its own, an instance or prototype
+//! template, a parent — is refused where the host attaches it, naming the part.
+//! The crate's signature is `Option`, which its own
 //! callers unwrap,
 //! so the loudest available message is the honest one; a blob that quietly lost
 //! part of a host's state would move that failure to where the host cannot see
@@ -72,6 +76,7 @@
 
 use std::collections::HashMap;
 use std::ops::Deref;
+use std::rc::Rc;
 
 use runtime::api;
 use runtime::snapshot as format;
@@ -79,6 +84,7 @@ use runtime::snapshot as format;
 use crate::data::Data;
 use crate::handle::{Global, Local, Payload};
 use crate::isolate::{BuiltCallback, Isolate, OwnedIsolate};
+use format::HostCallbacks as _;
 
 /// Serialized engine state a host carries between runs (v8::StartupData).
 #[derive(Debug, Clone)]
@@ -497,6 +503,162 @@ fn engine_table(references: &[crate::ExternalReference]) -> Vec<*mut std::ffi::c
     table
 }
 
+/// The key a function template's record carries its own brand under.
+///
+/// A template has no engine object of its own, so the record has to be
+/// recognizable as *this bridge's* and not as a value a host attached. The key is
+/// a name no host would write, and strings compare by content — so the brand
+/// travels through a blob and comes back as itself.
+const TEMPLATE_RECORD: &str = "\u{1}slag:function-template";
+const TEMPLATE_CALLBACK: &str = "callback";
+const TEMPLATE_DATA: &str = "data";
+const TEMPLATE_LENGTH: &str = "length";
+const TEMPLATE_CONSTRUCTIBLE: &str = "constructible";
+const TEMPLATE_NAME: &str = "name";
+
+/// The pointer an `External` value carries, or `None` for a value that is not
+/// one — which is how this bridge recognizes its own template handles, whose
+/// payload is an `External` naming the template's address.
+fn external_pointer(value: &api::Local) -> Option<*mut std::ffi::c_void> {
+    let object = value.value().as_object()?;
+    match &object.kind {
+        crux::object::ObjectKind::External(pointer) => Some(*pointer as *mut std::ffi::c_void),
+        _ => None,
+    }
+}
+
+/// The record a function-template item is carried as, or `None` when the item is
+/// not one of this isolate's templates — which the engine then carries as the
+/// value it is.
+///
+/// A template's handle is an `External` naming the address the isolate took the
+/// `Rc<FunctionTemplate>` under, and an address means nothing to the process that
+/// reads a blob. So the item is written as what a template can be rebuilt from:
+/// its callback — as a host *pointer*, which the engine already carries as an
+/// index into the external-reference table both ends rebuild — the data it was
+/// built with, its `length`, whether it is constructible, and its class name.
+/// The load makes a new template under a fresh address, so the restored handle
+/// names this process's own.
+///
+/// # Panics
+///
+/// Panics when the template carries a part this record does not hold yet, naming
+/// it. A record that dropped one would come back as a template that is not the one
+/// that was written, which is the failure this bridge refuses everywhere else; a
+/// host attaches its data before it writes a blob, so this is where it is told.
+pub(crate) fn template_record<'s>(
+    isolate: &Isolate,
+    context: api::Context,
+    data: Local<'s, Data>,
+) -> Option<Local<'s, Data>> {
+    let pointer = external_pointer(data.engine())?;
+    if !isolate.owns_template(pointer) {
+        return None;
+    }
+    // SAFETY: `owns_template` said this isolate holds a template at the address,
+    // and the isolate outlives every handle on it.
+    let template = unsafe { &*(pointer as *const api::FunctionTemplate) };
+    let (callback, attached) = isolate.template_parts(pointer as usize)?;
+    if template.property_count() != 0 {
+        panic!(
+            "v8::Isolate::AddContextData: this function template cannot be carried yet: a property of its own"
+        );
+    }
+    if template.has_instance_template() || template.has_prototype_template() {
+        panic!(
+            "v8::Isolate::AddContextData: this function template cannot be carried yet: an instance or prototype template"
+        );
+    }
+    if template.has_parent() {
+        panic!(
+            "v8::Isolate::AddContextData: this function template cannot be carried yet: a template it inherits from"
+        );
+    }
+    let record = api::Object::new(&context).expect("bridge: a template record object");
+    let set = |key: &str, value: api::Local| {
+        api::Object::set(&context, &record, key, &value, false)
+            .expect("bridge: a template record property");
+    };
+    set(TEMPLATE_RECORD, api::Local::boolean(true));
+    set(
+        TEMPLATE_CALLBACK,
+        api::Local::from(crux::value::Value::Object(
+            crux::object::JsObject::external_object_create(callback, None),
+        )),
+    );
+    if let Some(attached) = attached {
+        set(TEMPLATE_DATA, attached.engine_value());
+    }
+    set(
+        TEMPLATE_LENGTH,
+        api::Local::number(f64::from(template.length())),
+    );
+    set(
+        TEMPLATE_CONSTRUCTIBLE,
+        api::Local::boolean(template.constructible()),
+    );
+    if let Some(name) = template.class_name() {
+        set(TEMPLATE_NAME, api::Local::string(name));
+    }
+    Some(Local::from_engine(record))
+}
+
+/// The function template a record names, taken under this isolate — or `None` for
+/// a value that is not a record, which is every other item a slot holds.
+///
+/// The template made here is the *load's*: its callback comes from the load's own
+/// external-reference table (the same entry the write side named), its data is the
+/// value the blob carried, and the isolate takes it under the address a handle in
+/// this process names. It is recorded in `template_callback` as well, so a snapshot
+/// *of this load* names it again rather than refusing it — which is what deno's
+/// two-pass creation needs.
+fn template_from_record(
+    isolate: &mut Isolate,
+    context: api::Context,
+    value: crux::value::Value,
+) -> Option<api::Local> {
+    let value = api::Local::from(value);
+    if !api::Object::has_own_key(&context, &value, &api::Local::string(TEMPLATE_RECORD)).ok()? {
+        return None;
+    }
+    let callback = api::Object::get(&context, &value, TEMPLATE_CALLBACK).ok()?;
+    let callback_pointer = external_pointer(&callback)?;
+    let attached = api::Object::has_own_key(&context, &value, &api::Local::string(TEMPLATE_DATA))
+        .ok()?
+        .then(|| api::Object::get(&context, &value, TEMPLATE_DATA).ok())
+        .flatten();
+    let length = api::Object::get(&context, &value, TEMPLATE_LENGTH)
+        .ok()?
+        .value()
+        .as_number()?;
+    let constructible = api::Object::get(&context, &value, TEMPLATE_CONSTRUCTIBLE)
+        .ok()?
+        .value()
+        .as_boolean()?;
+    let name = api::Object::get(&context, &value, TEMPLATE_NAME)
+        .ok()
+        .and_then(|name| name.value().as_string())
+        .map(|name| name.to_string_lossy());
+    // The callback is the one the load's table holds at that address — the host
+    // rebuilt the entry, and this is what resolves it back into a call.
+    let host = SnapshotCallbacks::for_load(*isolate);
+    let callback = host.callback_at(callback_pointer as usize, attached)?;
+    let template = api::FunctionTemplate::new(isolate.engine_mut(), callback);
+    template.set_length(length as i32);
+    template.set_constructible(constructible);
+    if let Some(name) = name {
+        template.set_class_name(&name);
+    }
+    let address = Rc::as_ptr(&template) as usize;
+    isolate.add_template(Rc::clone(&template));
+    let attached = attached
+        .map(|attached| Global::new(isolate, Local::<crate::data::Value>::from_engine(attached)));
+    isolate.template_callback(address, callback_pointer as usize, attached);
+    Some(api::Local::from(crux::value::Value::Object(
+        crux::object::JsObject::external_object_create(address, None),
+    )))
+}
+
 /// A context's identity: its global object, which is the identity this bridge
 /// already tells two contexts apart by.
 pub(crate) fn context_identity(context: api::Context) -> u64 {
@@ -551,7 +713,7 @@ impl SnapshotRestore {
     /// act on, and the crate we stand in for's own loader checks in the same
     /// situation — where answering `None` would send the host down its "boot
     /// from source" branch with no way to learn why.
-    fn restore(&mut self, isolate: &Isolate, context: api::Context, slot: usize) -> bool {
+    fn restore(&mut self, isolate: &mut Isolate, context: api::Context, slot: usize) -> bool {
         let table = engine_table(isolate.externals());
         let host = SnapshotCallbacks::for_load(*isolate);
         let items = match context.read_snapshot(self.blob.bytes(), slot, &table, Some(&host)) {
@@ -564,7 +726,16 @@ impl SnapshotRestore {
         let mut held = Vec::with_capacity(items.len());
         for item in items {
             let payload = match item {
-                format::SnapshotItem::Value(value) => Payload::Value(value.into()),
+                format::SnapshotItem::Value(value) => {
+                    // A function template is not a value the engine carried: the
+                    // record names what one is made of, and the template is made
+                    // here — under this process's own address — before the host
+                    // asks for it.
+                    match template_from_record(isolate, context, value) {
+                        Some(handle) => Payload::Value(handle),
+                        None => Payload::Value(value.into()),
+                    }
+                }
                 format::SnapshotItem::Module(module) => Payload::Module(module),
             };
             let handle: Local<'_, Data> = Local::from_payload(payload);
@@ -1734,6 +1905,134 @@ mod tests {
         // Loaded with a table that never had the address the blob names.
         let mut isolate = Isolate::new(crate::CreateParams::default().snapshot_blob(blob));
         let _ = restored_context(&mut isolate, DEFAULT_CONTEXT_SLOT);
+    }
+
+    /// A function template attached as context data comes back a template.
+    ///
+    /// A template has no engine object of its own — a handle is an `External`
+    /// naming the address the isolate took the `Rc<FunctionTemplate>` under — so
+    /// the item travels as the record `template_record` writes and the load makes
+    /// a template under *its own* address, which is what lets a handle in the
+    /// loading process mean anything. The callback is named through the host's
+    /// external-reference table, the same table a host callback's function is
+    /// named through.
+    #[test]
+    fn a_function_template_round_trips_as_a_template() {
+        use crate::support::MapFnTo;
+
+        fn answer(
+            _scope: &mut crate::scope::PinScope<'_, '_>,
+            args: crate::function::FunctionCallbackArguments,
+            rv: crate::function::ReturnValue,
+        ) {
+            rv.set(args.data());
+        }
+        let references = vec![crate::ExternalReference {
+            function: answer.map_fn_to(),
+        }];
+
+        let mut isolate =
+            Isolate::snapshot_creator(Some(std::borrow::Cow::Owned(references.clone())), None);
+        {
+            crate::scope!(let scope, &mut isolate);
+            let context = Context::new(scope, Default::default());
+            let scope = &mut crate::ContextScope::new(scope, context);
+            scope.set_default_context(context);
+            let template = crate::FunctionTemplate::builder(answer)
+                .length(3)
+                .data(crate::Number::new(scope, 7.0).into())
+                .build(scope);
+            template.set_class_name(crate::String::new(scope, "Answer").expect("a name"));
+            // Materialize the function *before* the template is attached: a host
+            // that registers a template has usually made a function from it
+            // already (deno does, for every op class it registers), and the record
+            // has to be readable afterwards.
+            let materialized = template.get_function(scope).expect("a function");
+            crate::test_support::bind(scope, "materialized", materialized.into());
+            scope.add_context_data(context, template);
+        }
+        let blob = isolate
+            .create_blob(FunctionCodeHandling::Keep)
+            .expect("a blob");
+
+        let mut isolate = isolate_from_with(blob, references);
+        let context = restored_context(&mut isolate, DEFAULT_CONTEXT_SLOT)
+            .expect("the blob names the default context");
+        crate::scope!(let scope, &mut isolate);
+        let context = context.open(scope);
+        let scope = &mut crate::ContextScope::new(scope, context);
+        let template = scope
+            .get_context_data_from_snapshot_once::<crate::FunctionTemplate>(0)
+            .expect("the template");
+        let function = template.get_function(scope).expect("a function");
+        crate::test_support::bind(scope, "restored", function.into());
+        // The callback, the data it reads, the length and the class name: the
+        // parts the record carries, each one observable from the function it
+        // makes.
+        assert_eq!(crate::test_support::eval_number(scope, "restored()"), 7.0);
+        assert_eq!(
+            crate::test_support::eval_number(scope, "restored.length"),
+            3.0
+        );
+        assert_eq!(
+            crate::test_support::eval(scope, "restored.name").to_rust_string_lossy(scope),
+            "Answer"
+        );
+    }
+
+    /// A template with a property of its own: the record holds no property yet, so
+    /// the write names the part rather than writing a template that would come
+    /// back without it.
+    #[test]
+    #[should_panic(expected = "cannot be carried yet: a property of its own")]
+    fn a_function_template_with_a_property_ends_the_build() {
+        use crate::support::MapFnTo;
+
+        fn answer(
+            _scope: &mut crate::scope::PinScope<'_, '_>,
+            _args: crate::function::FunctionCallbackArguments,
+            _rv: crate::function::ReturnValue,
+        ) {
+        }
+        let references = vec![crate::ExternalReference {
+            function: answer.map_fn_to(),
+        }];
+        let mut isolate =
+            Isolate::snapshot_creator(Some(std::borrow::Cow::Owned(references)), None);
+        {
+            crate::scope!(let scope, &mut isolate);
+            let context = Context::new(scope, Default::default());
+            let scope = &mut crate::ContextScope::new(scope, context);
+            scope.set_default_context(context);
+            let template = crate::FunctionTemplate::builder(answer).build(scope);
+            let key = crate::String::new(scope, "statics").expect("a key");
+            template.set(key.into(), crate::Number::new(scope, 1.0).into());
+            scope.add_context_data(context, template);
+        }
+    }
+
+    /// A template whose callback the host's table does not hold is refused where a
+    /// host callback's function is: the record names the callback as a *pointer*,
+    /// and an address the loading process cannot resolve is not carried.
+    #[test]
+    #[should_panic(expected = "the pointer is not in the external-reference table")]
+    fn a_function_template_outside_the_table_ends_the_build() {
+        fn answer(
+            _scope: &mut crate::scope::PinScope<'_, '_>,
+            _args: crate::function::FunctionCallbackArguments,
+            _rv: crate::function::ReturnValue,
+        ) {
+        }
+        let mut isolate = Isolate::snapshot_creator(None, None);
+        {
+            crate::scope!(let scope, &mut isolate);
+            let context = Context::new(scope, Default::default());
+            let scope = &mut crate::ContextScope::new(scope, context);
+            scope.set_default_context(context);
+            let template = crate::FunctionTemplate::builder(answer).build(scope);
+            scope.add_context_data(context, template);
+        }
+        let _ = isolate.create_blob(FunctionCodeHandling::Keep);
     }
 
     /// The table form of the reference list a creator or an isolate takes.

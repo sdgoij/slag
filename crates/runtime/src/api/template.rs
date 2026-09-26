@@ -240,6 +240,53 @@ impl FunctionTemplate {
         *self.class_name.borrow_mut() = Some(JsString::from_utf8(name));
     }
 
+    /// The `length` a host set (the read half of
+    /// [`set_length`](Self::set_length)).
+    pub fn length(&self) -> u32 {
+        self.length.get()
+    }
+
+    /// Whether the function this template makes may be constructed (the read
+    /// half of [`set_constructible`](Self::set_constructible)).
+    pub fn constructible(&self) -> bool {
+        self.constructible.get()
+    }
+
+    /// The class name a host set (the read half of
+    /// [`set_class_name`](Self::set_class_name)).
+    pub fn class_name(&self) -> Option<String> {
+        self.class_name
+            .borrow()
+            .as_ref()
+            .map(JsString::to_string_lossy)
+    }
+
+    /// Whether a host set the template for instances created by `new`. Asks
+    /// *without* making one, where
+    /// [`instance_template`](Self::instance_template) makes one on demand — for
+    /// a caller that must not change the template it is asking about.
+    pub fn has_instance_template(&self) -> bool {
+        self.instance_template.borrow().is_some()
+    }
+
+    /// Whether a host set the constructor's `.prototype` object template, asked
+    /// without making one ([`prototype_template`](Self::prototype_template)).
+    pub fn has_prototype_template(&self) -> bool {
+        self.prototype_template.borrow().is_some()
+    }
+
+    /// Whether a host made this template inherit from another
+    /// ([`inherit`](Self::inherit)).
+    pub fn has_parent(&self) -> bool {
+        self.parent.borrow().is_some()
+    }
+
+    /// How many properties a host set on the template itself
+    /// ([`set`](Self::set)).
+    pub fn property_count(&self) -> usize {
+        self.static_properties.borrow().len()
+    }
+
     /// The template for instances created by `new`, created lazily.
     pub fn instance_template(&self) -> Rc<ObjectTemplate> {
         if let Some(template) = self.instance_template.borrow().clone() {

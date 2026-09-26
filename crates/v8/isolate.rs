@@ -123,6 +123,7 @@ impl CreateParams {
 /// is a *value* the callback reads, so a blob carries it as a value. The data is
 /// held pinned because the snapshot walk reads it from here rather than through
 /// the closure the function calls through.
+#[derive(Clone)]
 pub(crate) struct BuiltCallback {
     /// The template's `FunctionCallback`, as the address its table entry holds.
     pub(crate) callback: usize,
@@ -1090,6 +1091,15 @@ impl Isolate {
         for<'l> Local<'l, T>: Into<Local<'l, Data>>,
     {
         let data: Local<'_, Data> = data.into();
+        // A template handle is not a value the engine can carry: its payload is an
+        // address into *this* process. The item is written as the record a load
+        // rebuilds a template from, when it is one of this isolate's templates.
+        let data = match data.payload() {
+            Payload::Value(_) => {
+                crate::snapshot::template_record(self, context.context(), data).unwrap_or(data)
+            }
+            _ => data,
+        };
         let held = Global::new(self, data);
         self.creator().add_context_data(context.context(), held)
     }
@@ -1209,14 +1219,39 @@ impl Isolate {
             .insert(address, BuiltCallback { callback, data });
     }
 
-    /// Move a template's callback and data onto the function it just
-    /// materialized, which is the identity the engine's snapshot walk asks with.
+    /// What a template was built from, by the address its handle names: the
+    /// callback address and the data it was built with, as
+    /// [`template_callback`](Self::template_callback) recorded them. `None` for
+    /// an address this isolate holds no template under.
+    ///
+    /// It stays readable after the template has materialized a function, which is
+    /// what a snapshot of the template needs: [`materialized`](Self::materialized)
+    /// *copies* the record onto the function rather than moving it, so both
+    /// identities — the address a template handle names, and the id of the function
+    /// it made — answer for the same callback.
+    pub(crate) fn template_parts(&self, address: usize) -> Option<(usize, Option<Global<Value>>)> {
+        self.inner()
+            .callback_templates
+            .borrow()
+            .get(&address)
+            .map(|recorded| (recorded.callback, recorded.data.clone()))
+    }
+
+    /// Copy a template's callback and data onto the function it just materialized,
+    /// which is the identity the engine's snapshot walk asks a *function* with.
+    ///
+    /// A copy rather than a move, so the template's own address keeps answering:
+    /// a host's template item is written from what the template was built from, and
+    /// by the time a snapshot is taken the template has usually materialized the
+    /// function already (a host that registers a template materializes it — deno
+    /// does, for every op class it registers).
     pub(crate) fn materialized(&self, address: usize, function: u64) {
         let recorded = self
             .inner()
             .callback_templates
-            .borrow_mut()
-            .remove(&address);
+            .borrow()
+            .get(&address)
+            .cloned();
         if let Some(recorded) = recorded {
             self.inner()
                 .callbacks
