@@ -2215,6 +2215,46 @@ fn arrow_in_a_class_static_field(program: &syntax::ast::Program) -> Option<Arrow
     })
 }
 
+/// A statement-list wrapper parsed in the one **goal** that admits the source a
+/// carried function may hold.
+///
+/// Script goal first, because that is what every source the format carried before
+/// this parses under and re-reading them differently would be a change nobody
+/// asked for. On refusal the source is read in module goal — `import.meta` is an
+/// early error in Script code and legal only in module code (spec 13.3.7), and a
+/// function carried from a module can read it. The module goal is *stricter*
+/// everywhere else (`await` is reserved, HTML comments are rejected), so the one
+/// construct it newly admits is `import.meta`: a wrapper that parses under it is
+/// one that genuinely needed module code. The reported error is the Script
+/// goal's, so a source that never parsed fails with the message it always did.
+fn parse_wrapper(text: &str) -> Result<syntax::ast::Program, crux::JsError> {
+    parser::parse_script(text)
+        .or_else(|script| parser::parse_script_in_module(text).map_err(|_| script))
+}
+
+/// A carried **function expression** parsed in the one goal that admits it, for
+/// the reason [`parse_wrapper`] gives.
+///
+/// The async forms are retried within each goal because `parse_function`
+/// requires the `function` keyword an `async function` source does not start
+/// with, which is the retry the reader had before the goal was added.
+fn parse_carried_function(text: &str) -> Result<syntax::ast::Function, crux::JsError> {
+    let script = match parser::parse_function(text) {
+        Ok(function) => return Ok(function),
+        Err(error) => error,
+    };
+    if let Ok(function) = parser::parse_function_with_async(text, true) {
+        return Ok(function);
+    }
+    if let Ok(function) = parser::parse_function_in_module(text, false) {
+        return Ok(function);
+    }
+    if let Ok(function) = parser::parse_function_in_module(text, true) {
+        return Ok(function);
+    }
+    Err(script)
+}
+
 /// The class a parsed `(<class source>)` names, if that is what it is: the one
 /// expression statement's expression, through the grouping paren the wrapper put
 /// there. The parser keeps a paren (it affects `new` binding and
@@ -4958,9 +4998,9 @@ impl Builder<'_> {
         // retried inside a method, which is where they are legal.
         let plain = format!("({text})");
         let in_method = format!("({{ m() {{ return ({text}); }} }})");
-        let (wrapped, program, needs_context) = match parser::parse_script(&plain) {
+        let (wrapped, program, needs_context) = match parse_wrapper(&plain) {
             Ok(program) => (plain, program, false),
-            Err(plain_error) => match parser::parse_script(&in_method) {
+            Err(plain_error) => match parse_wrapper(&in_method) {
                 Ok(program) => (in_method, program, true),
                 Err(method_error) => {
                     return Err(DecodeError::UnrebuildableFunction(format!(
@@ -5083,7 +5123,7 @@ impl Builder<'_> {
             current = env.outer;
         }
         let wrapped = format!("(class {{ {declarations} static m = ({text}); }})");
-        let program = parser::parse_script(&wrapped).map_err(|error| {
+        let program = parse_wrapper(&wrapped).map_err(|error| {
             DecodeError::UnrebuildableFunction(format!("its arrow source does not parse: {error}"))
         })?;
         let (is_async, params, body, span) =
@@ -5169,7 +5209,7 @@ impl Builder<'_> {
         })?;
         // The object literal is the only form a MethodDefinition has.
         let wrapped = format!("({{{text}}})");
-        let program = parser::parse_script(&wrapped).map_err(|error| {
+        let program = parse_wrapper(&wrapped).map_err(|error| {
             DecodeError::UnrebuildableFunction(format!("its method source does not parse: {error}"))
         })?;
         let definition = method_definition(&program).ok_or_else(|| {
@@ -5298,7 +5338,7 @@ impl Builder<'_> {
         // the parser keeps the grouping paren, which `class_expression` steps
         // through.
         let wrapped = format!("({text})");
-        let program = parser::parse_script(&wrapped).map_err(|error| {
+        let program = parse_wrapper(&wrapped).map_err(|error| {
             DecodeError::UnrebuildableFunction(format!("its class source does not parse: {error}"))
         })?;
         let class = class_expression(&program).ok_or_else(|| {
@@ -5429,17 +5469,11 @@ impl Builder<'_> {
         let text = String::from_utf16(source).map_err(|_| {
             DecodeError::UnrebuildableFunction("its source is not valid UTF-16".into())
         })?;
-        let parsed = match parser::parse_function(&text) {
-            Ok(function) => function,
-            // An `async function` source has no standalone expression entry in
-            // `parse_function`, which expects the `function` keyword first, so
-            // the async form is the one retry this needs.
-            Err(plain) => parser::parse_function_with_async(&text, true).map_err(|_| {
-                DecodeError::UnrebuildableFunction(format!(
-                    "its source does not parse as a function expression: {plain}"
-                ))
-            })?,
-        };
+        let parsed = parse_carried_function(&text).map_err(|plain| {
+            DecodeError::UnrebuildableFunction(format!(
+                "its source does not parse as a function expression: {plain}"
+            ))
+        })?;
         let realm = *self.realm;
         let environment = self.function_environment(environment)?;
         // A bootstrap execution context makes the realm current and gives the
@@ -8951,6 +8985,110 @@ mod tests {
                 .map(|text| text.to_string_lossy()),
             Some("() => this.#n".to_string()),
             "the constructor's arrow came back and answers its own source"
+        );
+    }
+
+    /// Evaluate a module in a fresh realm and answer the value it stored on the
+    /// global object, which is how these tests get a function whose source was
+    /// module code: `import.meta` is an early error in Script code and legal
+    /// only in module code (spec 13.3.7), so a module is the only way to make
+    /// one.
+    fn carried_from_a_module(source: &str) -> (Box<api::Isolate>, Handle<Realm>, Value) {
+        let mut isolate = api::Isolate::new();
+        let context = api::Context::new(&mut isolate).expect("a realm");
+        let realm = *context.realm();
+        let module = api::Module::compile(&context, "deno:carried", source).expect("a module");
+        module.evaluate(&context).expect("evaluate");
+        let value = context
+            .try_eval("__carried")
+            .expect("the module's value")
+            .into_value();
+        (isolate, realm, value)
+    }
+
+    /// The shape the CLI's own blob stopped on: a **module** function whose body
+    /// reads `import.meta`. Its source cannot be read back in Script goal, which
+    /// is what every carried function was read in before this, so the parse is
+    /// retried in module goal. The limit is stated rather than papered over: the
+    /// declaring module does not travel, so `import.meta` at call time is the
+    /// engine's no-module object, not the module's host-filled meta.
+    #[test]
+    fn a_module_function_reading_import_meta_round_trips() {
+        let (isolate, realm, value) = carried_from_a_module(
+            "globalThis.__carried = function carried() { return import.meta; };",
+        );
+        let back = round_trip(&isolate, &realm, value);
+        assert_eq!(
+            run_restored(&isolate, &realm, back, "restored.toString()")
+                .as_string()
+                .map(|text| text.to_string_lossy()),
+            Some("function carried() { return import.meta; }".to_string()),
+            "the restored function answers its own module source"
+        );
+        assert_eq!(
+            run_restored(&isolate, &realm, back, "typeof restored()")
+                .as_string()
+                .map(|text| text.to_string_lossy()),
+            Some("object".to_string()),
+            "and it is callable — `import.meta` is the no-module object, the stated limit"
+        );
+    }
+
+    /// The arrow wrapper is parsed in a goal too, so an arrow whose expression
+    /// reads `import.meta` needs the same retry.
+    #[test]
+    fn a_module_arrow_reading_import_meta_round_trips() {
+        let (isolate, realm, value) =
+            carried_from_a_module("globalThis.__carried = () => import.meta;");
+        let back = round_trip(&isolate, &realm, value);
+        assert_eq!(
+            run_restored(&isolate, &realm, back, "restored.toString()")
+                .as_string()
+                .map(|text| text.to_string_lossy()),
+            Some("() => import.meta".to_string()),
+            "the restored arrow answers its own source"
+        );
+        assert_eq!(
+            run_restored(&isolate, &realm, back, "typeof restored()")
+                .as_string()
+                .map(|text| text.to_string_lossy()),
+            Some("object".to_string()),
+            "and it is callable"
+        );
+    }
+
+    /// A method definition's wrapper is a statement list as well, so a module
+    /// method reading `import.meta` is read back in module goal by the same
+    /// retry.
+    #[test]
+    fn a_module_method_reading_import_meta_round_trips() {
+        let (isolate, realm, value) =
+            carried_from_a_module("globalThis.__carried = { m() { return import.meta; } }.m;");
+        let back = round_trip(&isolate, &realm, value);
+        assert_eq!(
+            run_restored(&isolate, &realm, back, "restored.toString()")
+                .as_string()
+                .map(|text| text.to_string_lossy()),
+            Some("m() { return import.meta; }".to_string()),
+            "the restored method answers its own source"
+        );
+    }
+
+    /// A class source is read through a statement-list wrapper as well: a module
+    /// class whose body reads `import.meta` is evaluated from the module-goal
+    /// parse.
+    #[test]
+    fn a_module_class_reading_import_meta_round_trips() {
+        let (isolate, realm, value) = carried_from_a_module(
+            "globalThis.__carried = class C { m() { return import.meta; } };",
+        );
+        let back = round_trip(&isolate, &realm, value);
+        assert_eq!(
+            run_restored(&isolate, &realm, back, "restored.toString()")
+                .as_string()
+                .map(|text| text.to_string_lossy()),
+            Some("class C { m() { return import.meta; } }".to_string()),
+            "the restored class answers its own source"
         );
     }
 

@@ -30,6 +30,30 @@ pub fn parse_script(source: &str) -> Result<Program, JsError> {
     )
 }
 
+/// Parses a statement list under the **module goal**: `import.meta` is legal
+/// (spec 13.3.7) and strict mode applies. The AST is the same [`Program`]
+/// `parse_script` answers — only the goal differs — which is what lets a caller
+/// that already reads a script wrapper re-read it when the source only module
+/// code may hold. Import/export declarations are still not accepted, because a
+/// Module's item list is a different production; this is a Script's statement
+/// list read under a Module's early errors.
+pub fn parse_script_in_module(source: &str) -> Result<Program, JsError> {
+    let source = SourceText::from_utf8(source);
+    let mut parser = Parser::new(&source, false, false);
+    parser.in_module = true;
+    parser.strict = true;
+    let body = stmt::parse_statement_list(&mut parser, syntax::TokenKind::Eof)?;
+    // The source must be fully consumed.
+    let tok = parser.peek()?.clone();
+    if tok.kind != syntax::TokenKind::Eof {
+        return Err(parser.unexpected(&tok));
+    }
+    let span = crux::Span::new(0, source.len() as u32);
+    let program = Program { body, span };
+    early_errors::check_script(&program)?;
+    Ok(program)
+}
+
 /// Parses a Script with the JSX extension enabled (`jsx` in the parser):
 /// JSX elements are desugared into `rlx.h(...)` calls. Spec parsing is
 /// untouched — without this entry point `<` stays a relational operator.
@@ -147,7 +171,7 @@ pub fn parse_module(source: &str) -> Result<Module, JsError> {
 /// assembles for `new Function(...)`. The expression must be fully consumed and
 /// the function's early errors apply.
 pub fn parse_function(source: &str) -> Result<syntax::ast::Function, JsError> {
-    parse_function_with_async(source, false)
+    parse_function_goal(source, false, false)
 }
 
 /// Like `parse_function`, for the `async function` / `async function*` forms
@@ -158,8 +182,31 @@ pub fn parse_function_with_async(
     source: &str,
     is_async: bool,
 ) -> Result<syntax::ast::Function, JsError> {
+    parse_function_goal(source, is_async, false)
+}
+
+/// Like `parse_function_with_async`, for a function whose source was written in
+/// a Module: `import.meta` is legal (spec 13.3.7) and strict mode applies.
+pub fn parse_function_in_module(
+    source: &str,
+    is_async: bool,
+) -> Result<syntax::ast::Function, JsError> {
+    parse_function_goal(source, is_async, true)
+}
+
+fn parse_function_goal(
+    source: &str,
+    is_async: bool,
+    in_module: bool,
+) -> Result<syntax::ast::Function, JsError> {
     let source = SourceText::from_utf8(source);
-    let mut parser = Parser::new(&source, true, false);
+    // A module rejects Annex B HTML comments, which is the one tokenizer
+    // difference between the goals.
+    let mut parser = Parser::new(&source, !in_module, false);
+    if in_module {
+        parser.in_module = true;
+        parser.strict = true;
+    }
     if is_async {
         parser.next()?; // `async`
     }
