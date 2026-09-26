@@ -24,9 +24,34 @@ enum GlobalState {
     PlatformShutdown,
 }
 
+/// The handler a fatal error is reported through, once a host installs one.
+type FatalErrorHandler = Box<dyn Fn(&str, i32, &str)>;
+
 thread_local! {
     static GLOBAL_STATE: RefCell<GlobalState> = const { RefCell::new(GlobalState::Uninitialized) };
     static FLAGS: RefCell<Option<String>> = const { RefCell::new(None) };
+    static FATAL_ERROR_HANDLER: RefCell<Option<FatalErrorHandler>> = const { RefCell::new(None) };
+}
+
+/// Install the handler a fatal error is reported through
+/// (v8::V8::SetFatalErrorHandler).
+///
+/// Recorded, and never called: V8's fatal handler exists because V8 can die in the
+/// middle of an operation and has a file, a line and a message to report it with,
+/// where this engine's failures are a Rust panic or the allocator's own abort —
+/// neither of which has a location to hand a host. A host that installs one gets
+/// the crate's surface and the process's failure reporting rather than V8's; what
+/// it must not get is a handler that looks installed and silently is not, which is
+/// why the slot is kept and the tier is stated here.
+pub fn set_fatal_error_handler(handler: impl Fn(&str, i32, &str) + 'static) {
+    FATAL_ERROR_HANDLER.with(|slot| *slot.borrow_mut() = Some(Box::new(handler)));
+}
+
+/// Whether a fatal-error handler has been installed (this bridge's own accessor,
+/// so the tier above is testable rather than only documented).
+#[cfg(test)]
+pub(crate) fn has_fatal_error_handler() -> bool {
+    FATAL_ERROR_HANDLER.with(|slot| slot.borrow().is_some())
 }
 
 /// Panic unless V8 is initialized (v8::V8::AssertInitialized).
@@ -171,6 +196,23 @@ mod tests {
     use super::*;
     use crate::PlatformImpl;
     use crate::platform::new_custom_platform;
+
+    /// The handler installed is the one kept: this engine reports its failures
+    /// through a panic or the allocator's abort, so the slot is what the install
+    /// can honestly be — and a host that reads it back must see its own handler
+    /// rather than a promise of V8's reporting.
+    #[test]
+    fn a_fatal_error_handler_is_kept() {
+        assert!(!has_fatal_error_handler());
+        set_fatal_error_handler(|file: &str, line: i32, message: &str| {
+            let _ = (file, line, message);
+        });
+        assert!(has_fatal_error_handler());
+        // The handler's own shape: a file, a line and a message, as V8's
+        // `FatalErrorCallback` takes them.
+        set_fatal_error_handler(|_file: &str, _line: i32, _message: &str| {});
+        assert!(has_fatal_error_handler());
+    }
 
     /// A host with no implementation of its own.
     struct Noop;

@@ -62,6 +62,16 @@ pub struct CreateParams {
     /// handed as V8's `initial_heap_limit`. A maximum of 0 is V8's own default
     /// — no limit — and leaves the engine's heap unbounded, as it was.
     heap_limits: Option<(usize, usize)>,
+    /// The generation and code-range sizes a host asked for
+    /// (`CreateParams::set_max_old_generation_size_in_bytes` and the two beside
+    /// it). **Recorded and reported, and nothing else**: a generation is a part
+    /// of a *V8* heap, and this engine's arena is not one. A host that reads
+    /// them back gets what it set, or `0` for "the engine's own policy" — not
+    /// V8's default, which would be a number invented here. What *does*
+    /// constrain the collector is [`CreateParams::heap_limits`].
+    max_old_generation_size: usize,
+    max_young_generation_size: usize,
+    code_range_size: usize,
 }
 
 impl CreateParams {
@@ -106,6 +116,61 @@ impl CreateParams {
     /// host that keeps one `CreateParams` around).
     pub fn get_heap_limits(&self) -> Option<(usize, usize)> {
         self.heap_limits
+    }
+
+    /// The heap's maximum old-generation size
+    /// (`CreateParams::set_max_old_generation_size_in_bytes`). Recorded and
+    /// reported: see the field's own note.
+    pub fn set_max_old_generation_size_in_bytes(mut self, size: usize) -> Self {
+        self.max_old_generation_size = size;
+        self
+    }
+
+    /// The heap's maximum young-generation size
+    /// (`CreateParams::set_max_young_generation_size_in_bytes`). Recorded and
+    /// reported, as the old-generation one is.
+    pub fn set_max_young_generation_size_in_bytes(mut self, size: usize) -> Self {
+        self.max_young_generation_size = size;
+        self
+    }
+
+    /// The heap's code range size
+    /// (`CreateParams::set_code_range_size_in_bytes`). Recorded and reported,
+    /// as the generation sizes are.
+    pub fn set_code_range_size_in_bytes(mut self, size: usize) -> Self {
+        self.code_range_size = size;
+        self
+    }
+
+    /// The maximum old-generation size a host set, or `0` for one that set none
+    /// (`CreateParams::max_old_generation_size_in_bytes`).
+    pub fn max_old_generation_size_in_bytes(&self) -> usize {
+        self.max_old_generation_size
+    }
+
+    /// The maximum young-generation size a host set, or `0` for one that set
+    /// none (`CreateParams::max_young_generation_size_in_bytes`).
+    pub fn max_young_generation_size_in_bytes(&self) -> usize {
+        self.max_young_generation_size
+    }
+
+    /// The code range size a host set, or `0` for one that set none
+    /// (`CreateParams::code_range_size_in_bytes`).
+    pub fn code_range_size_in_bytes(&self) -> usize {
+        self.code_range_size
+    }
+
+    /// Derive heap limits from the memory a system has
+    /// (`CreateParams::heap_limits_from_system_memory`): half of `total` for the
+    /// old generation and a sixteenth for the young one, leaving the code range
+    /// unset. The numbers are this bridge's own derivation, and — as with the
+    /// setters above — the engine's collector reads none of them; they exist so
+    /// that a host asking what a V8 heap would have been told gets a plausible
+    /// answer rather than zeros.
+    pub fn heap_limits_from_system_memory(mut self, total: u64, _limit: u64) -> Self {
+        self.max_old_generation_size = (total / 2) as usize;
+        self.max_young_generation_size = (total / 16) as usize;
+        self
     }
 
     /// The snapshot this host asked for, if any (this bridge's own accessor,
@@ -2304,6 +2369,33 @@ impl OwnedIsolate {
 mod tests {
     use super::*;
     use crate::promise::PromiseState;
+
+    /// The generation and code-range sizes a host sets are *reported back*, and
+    /// nothing else: a generation is a part of a V8 heap, and this engine's arena
+    /// is not one. What a host that reads them must not get is a number V8 would
+    /// have had — that would be invented here — so the answer is what the host
+    /// set, `0` when it set none, and a derivation from the system memory the
+    /// host hands in when it asks for one.
+    #[test]
+    fn heap_size_settings_are_reported_back() {
+        let params = CreateParams::default();
+        assert_eq!(params.max_old_generation_size_in_bytes(), 0);
+        assert_eq!(params.max_young_generation_size_in_bytes(), 0);
+        assert_eq!(params.code_range_size_in_bytes(), 0);
+
+        let params = params
+            .set_max_old_generation_size_in_bytes(1024 * 1024 * 512)
+            .set_max_young_generation_size_in_bytes(1024 * 1024 * 8)
+            .set_code_range_size_in_bytes(1024 * 1024 * 256);
+        assert_eq!(params.max_old_generation_size_in_bytes(), 1024 * 1024 * 512);
+        assert_eq!(params.max_young_generation_size_in_bytes(), 1024 * 1024 * 8);
+        assert_eq!(params.code_range_size_in_bytes(), 1024 * 1024 * 256);
+
+        let derived = CreateParams::default().heap_limits_from_system_memory(16 << 30, 0);
+        assert_eq!(derived.max_old_generation_size_in_bytes(), 8 << 30);
+        assert_eq!(derived.max_young_generation_size_in_bytes(), 1 << 30);
+        assert_eq!(derived.code_range_size_in_bytes(), 0);
+    }
 
     /// A host that kept the raw pointer can borrow the handle back out of its own
     /// storage, which is the shape `ext/napi`'s `Env` uses to reach the isolate its
