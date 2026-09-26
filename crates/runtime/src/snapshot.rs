@@ -31,8 +31,9 @@
 //! record a function closed over that is neither declarative nor function: a
 //! lookup walks a record's own binding list and nothing else, so an object,
 //! module or global record is refused by kind. A **method**, an **accessor**, a
-//! **typed array**, the **buffer** it views and a **host object** are no longer
-//! on that list: each carries what it is made of now.
+//! **typed array**, the **buffer** it views, a **host object**, an **arguments
+//! object** and a **String object** are no longer on that list: each carries
+//! what it is made of now.
 //!
 //! A host object carries its **state**, not its behaviour: the host's own
 //! internal methods are callbacks in the process that built the object, so what
@@ -47,6 +48,32 @@
 //! an array whose `length` is longer than its elements stays that way.
 //! Each entry is a subsystem to carry, and the walk refuses rather than writing
 //! something a restore would read back wrong.
+//!
+//! # The exotics whose own slots are the state
+//!
+//! Two object kinds are not an ordinary property table with something extra, but
+//! a primitive or a call with a property table over it, and each is carried as
+//! what it *is* rather than as the object its own keys make it look like:
+//!
+//! - A **String object** (spec 10.4.3) is the primitive it wraps. Its code-unit
+//!   index properties are virtual — `string_create` derives them — so the record
+//!   carries the primitive and the object part, and nothing is written per
+//!   character.
+//! - An **arguments object** (spec 10.4.4) comes in the two forms the spec
+//!   makes. An *unmapped* one is rebuilt by the engine's own creation from its
+//!   elements. A *mapped* one aliases the call's formal parameters, and the
+//!   aliasing is the whole of what it is: its parameter map is an object of
+//!   accessor properties whose getters and setters read a *named binding* of the
+//!   call's environment, and that name lives only inside the closure — the map's
+//!   own keys are indices. So the record carries the pair the map was built from,
+//!   the **formal names** (kept on the slots for exactly this reason) and the
+//!   **environment**, and the restore rebuilds the map over that same environment.
+//!   A restore that dropped the map — an ordinary object with index properties —
+//!   would read back as an arguments object whose indices no longer write the
+//!   parameters, which is the kind of silent difference this format refuses
+//!   everywhere else. The environment is not a language value, so it is reached
+//!   as a closure's is: the record names it by serial and the walk owes it every
+//!   record in the chain.
 //!
 //! # Functions
 //!
@@ -159,7 +186,7 @@ use crux::bigint::{self, BigInt};
 use crux::function::{Function, FunctionKind};
 use crux::handle::Handle;
 use crux::heap::Pin;
-use crux::object::{JsObject, ObjectKind, Property, PropertyKind};
+use crux::object::{ArgumentsSlots, JsObject, ObjectKind, Property, PropertyKind};
 use crux::property::{PropertyDescriptor, PropertyKey};
 use crux::string::{self, JsString};
 use crux::symbol::{self, Symbol};
@@ -207,6 +234,8 @@ const REC_MODULE: u8 = 18;
 const REC_ENV: u8 = 19;
 const REC_ARRAY_BUFFER: u8 = 20;
 const REC_TYPED_ARRAY: u8 = 21;
+const REC_ARGUMENTS: u8 = 22;
+const REC_STRING_OBJECT: u8 = 23;
 
 /// An array buffer's own flags, in the byte its record carries: whether it is
 /// resizable (a `maxByteLength` was given) and whether it is immutable
@@ -346,6 +375,9 @@ pub enum DecodeError {
     /// the numbers the record carries, or a buffer the engine will not allocate
     /// the way the record describes.
     UnrebuildableBuffer(String),
+    /// A record this version could not rebuild into the object it describes:
+    /// an arguments object or String object whose creation the engine refused.
+    UnrebuildableObject(String),
     /// A blob names an entry the host's external-reference table does not have.
     ExternalIndexOutOfRange { index: usize, count: usize },
 }
@@ -396,6 +428,9 @@ impl std::fmt::Display for DecodeError {
             }
             Self::UnrebuildableBuffer(reason) => {
                 write!(f, "snapshot buffer could not be rebuilt: {reason}")
+            }
+            Self::UnrebuildableObject(reason) => {
+                write!(f, "snapshot object could not be rebuilt: {reason}")
             }
             Self::ExternalIndexOutOfRange { index, count } => write!(
                 f,
@@ -543,6 +578,28 @@ enum Record {
         byte_length: u32,
         array_length: u32,
         auto_length: bool,
+        proto: u32,
+        extensible: bool,
+        properties: Vec<StoredProperty>,
+    },
+    /// An arguments exotic (spec 10.4.4): which of the two forms it is — a
+    /// mapped one also carries the formal names its parameter map is keyed by
+    /// and the environment the accessors read through — its element values, and
+    /// its object part. The element count is what the element list's own length
+    /// says; `length` is an ordinary property and travels with the object part.
+    Arguments {
+        mapped: bool,
+        formals: Vec<Vec<u16>>,
+        environment: u32,
+        elements: Vec<u32>,
+        proto: u32,
+        extensible: bool,
+        properties: Vec<StoredProperty>,
+    },
+    /// A String exotic (spec 10.4.3): the primitive it wraps, whose code units
+    /// are its virtual index properties, and its object part.
+    StringObject {
+        units: Vec<u16>,
         proto: u32,
         extensible: bool,
         properties: Vec<StoredProperty>,
@@ -1183,6 +1240,15 @@ fn visit(
             if realm.intrinsics.name_of_value(&value).is_none() {
                 if let ObjectKind::External(pointer) = &object.kind {
                     external_index(externals, *pointer)?;
+                }
+                // A mapped arguments object's parameter accessors read and write
+                // the call's *environment*, which is not a language value, so it
+                // is reached the way a closure's is: the record names the chain
+                // by serial, and the walk owes it every record in it.
+                if let ObjectKind::Arguments(slots) = &object.kind
+                    && let Some(environment) = mapped_environment(slots)
+                {
+                    visit_env(agent, realm, externals, host, environment, objects, serials)?;
                 }
                 for child in children(agent, &object)? {
                     visit(agent, realm, externals, host, child, objects, serials)?;
@@ -2167,7 +2233,7 @@ fn children(agent: &Agent, object: &Handle<JsObject>) -> Result<Vec<Value>, Unsu
     match &object.kind {
         ObjectKind::Ordinary => {}
         ObjectKind::Array(_) => {
-            for index in 0..array_length(object)? as u64 {
+            for index in 0..index_length(object, "an array")? as u64 {
                 let key = PropertyKey::String(string::index_atom(index));
                 match object.get_own_property_key(&key) {
                     Ok(Some(property)) => {
@@ -2190,17 +2256,43 @@ fn children(agent: &Agent, object: &Handle<JsObject>) -> Result<Vec<Value>, Unsu
                 }
             }
         }
-        ObjectKind::String(_) => {
-            return Err(Unsupported::new(
-                "a string object",
-                "a primitive wrapper is not carried yet",
-            ));
-        }
+        // A String exotic's code-unit indices are virtual: `string_create`
+        // derives them from the primitive the record carries, so walking them
+        // would write the same characters twice and write a thousand records
+        // for a long string. `length` is a real own property and is carried
+        // like one.
+        ObjectKind::String(_) => {}
         ObjectKind::Arguments(_) => {
-            return Err(Unsupported::new(
-                "an arguments object",
-                "a mapped parameter binding is not carried yet",
-            ));
+            // An arguments object's indices are its elements, read through the
+            // parameter map when one covers them: the map is rebuilt from the
+            // formals the record carries, so only the values travel. The count is
+            // the one the record's element list uses — see
+            // [`arguments_element_count`] for why it is not simply `length`.
+            for index in 0..arguments_element_count(object)? as u64 {
+                let key = PropertyKey::String(string::index_atom(index));
+                match object.get_own_property_key(&key) {
+                    Ok(Some(property)) => {
+                        if property.is_accessor() {
+                            return Err(Unsupported::new(
+                                "an arguments object",
+                                "an indexed accessor is not carried yet",
+                            ));
+                        }
+                        children.extend(property_values(&property));
+                    }
+                    // An index a call's arguments never filled, or one the
+                    // script deleted afterwards: absent, so the record says so
+                    // with `NO_REF` rather than writing `undefined`, exactly as
+                    // an Array's holes do.
+                    Ok(None) => {}
+                    Err(_) => {
+                        return Err(Unsupported::new(
+                            "an arguments object",
+                            "an element could not be read",
+                        ));
+                    }
+                }
+            }
         }
         ObjectKind::Proxy(_) => {
             return Err(Unsupported::new(
@@ -2253,15 +2345,25 @@ fn children(agent: &Agent, object: &Handle<JsObject>) -> Result<Vec<Value>, Unsu
 }
 
 /// Whether an own property is written as a property of its own, rather than as
-/// one of the slots an Array exotic keeps elsewhere: its indices are its
-/// elements, and its `length` is the exotic's own invariant.
+/// one of the slots an exotic keeps elsewhere: an Array's indices are its
+/// elements, a view's are virtual (they read the block its buffer holds), a
+/// mapped arguments object's are read through its parameter map, and a String's
+/// are the code units of the primitive it wraps. Each of those is *derived* from
+/// state the record already carries, so writing one as a property would write it
+/// twice — and for a String, once per code unit.
+///
+/// `length` is the one key that differs by kind: it is an Array's own invariant
+/// (kept in its slots while dense) and an ordinary own property everywhere else,
+/// including a String's, where `string_create` defines it.
 fn is_carried_key(object: &Handle<JsObject>, key: &PropertyKey) -> bool {
-    // An Array's indices live in its slots and a view's are virtual (they read
-    // the block its buffer holds), so neither is an own property the record
-    // carries — the difference between them is `length`: it is an Array's one
-    // own non-index key, and a view's `length` is an accessor on its prototype.
-    let is_array = matches!(&object.kind, ObjectKind::Array(_));
-    if !is_array && !matches!(&object.kind, ObjectKind::IntegerIndexed(_)) {
+    let indexed = matches!(
+        &object.kind,
+        ObjectKind::Array(_)
+            | ObjectKind::IntegerIndexed(_)
+            | ObjectKind::Arguments(_)
+            | ObjectKind::String(_)
+    );
+    if !indexed {
         return true;
     }
     let PropertyKey::String(atom) = key else {
@@ -2271,9 +2373,7 @@ fn is_carried_key(object: &Handle<JsObject>, key: &PropertyKey) -> bool {
     if canonical_index(&text).is_some() {
         return false;
     }
-    // `length` is an Array's own key; a view's is an accessor on its prototype,
-    // so it is an ordinary carried key there.
-    !(is_array && text.as_slice() == LENGTH_UNITS)
+    !(matches!(&object.kind, ObjectKind::Array(_)) && text.as_slice() == LENGTH_UNITS)
 }
 
 /// The index a property key spells, when it spells one canonically: the
@@ -2306,18 +2406,20 @@ fn property_values(property: &Property) -> Vec<Value> {
     }
 }
 
-/// An array's `length`, refused rather than guessed when it is not an index.
-fn array_length(array: &Handle<JsObject>) -> Result<u32, Unsupported> {
+/// An array index a value's `length` names, refused rather than guessed when it
+/// is not one. Generic over the exotics whose `length` counts indices: an Array
+/// and an arguments object both carry their length as an ordinary own property.
+fn index_length(object: &Handle<JsObject>, type_name: &'static str) -> Result<u32, Unsupported> {
     let key = JsString::from_utf16(LENGTH_UNITS);
-    let length = array
+    let length = object
         .get_own_property(&key)
-        .map_err(|_| Unsupported::new("an array", "its length could not be read"))?
+        .map_err(|_| Unsupported::new(type_name, "its length could not be read"))?
         .and_then(|property| property.value())
         .and_then(|value| value.as_number())
         .unwrap_or(0.0);
     if !(0.0..=4294967295.0).contains(&length) || length.trunc() != length {
         return Err(Unsupported::new(
-            "an array",
+            type_name,
             "its length is not an array index",
         ));
     }
@@ -2431,6 +2533,12 @@ fn write_record(
             }
             None if matches!(&object.kind, ObjectKind::IntegerIndexed(_)) => {
                 write_typed_array(realm, object, serials, body)?
+            }
+            None if matches!(&object.kind, ObjectKind::Arguments(_)) => {
+                write_arguments(realm, object, serials, body)?
+            }
+            None if matches!(&object.kind, ObjectKind::String(_)) => {
+                write_string_object(realm, object, serials, body)?
             }
             None => {
                 if let ObjectKind::External(pointer) = &object.kind {
@@ -2868,7 +2976,7 @@ fn write_array(
     serials: &HashMap<Identity, u32>,
     body: &mut Vec<u8>,
 ) -> Result<(), Unsupported> {
-    let length = array_length(&array)?;
+    let length = index_length(&array, "an array")?;
     body.push(REC_ARRAY);
     write_u32(body, prototype_serial(realm, &array, serials)?);
     body.push(u8::from(array.extensible.get()));
@@ -3003,6 +3111,136 @@ fn write_typed_array(
             length_as_u32(slots.array_length, "a typed array's length")?,
         );
     }
+    write_u32(body, prototype_serial(realm, &object, serials)?);
+    body.push(u8::from(object.extensible.get()));
+    write_properties(realm, &object, serials, body)?;
+    Ok(())
+}
+
+/// The environment a mapped arguments object's parameter accessors read and
+/// write, when it has one.
+///
+/// The slots keep the environment as an erased edge — it is not a language value
+/// — but the edge is written from an `EnvRef` when the object is made, so it is
+/// cast back by payload *type* rather than by trusting the address.
+fn mapped_environment(slots: &ArgumentsSlots) -> Option<EnvRef> {
+    let environment = slots.env?;
+    // SAFETY: the edge is set from an `EnvRef` and the box is rooted by the
+    // slots that hold it, so it is live; `cast` compares the payload's `TypeId`
+    // and answers `None` for anything else.
+    unsafe { environment.cast::<EnvRecord>() }
+}
+
+/// The number of element indices an arguments object occupies: its `length`, and
+/// at least as many as its highest index, because `length` is an ordinary
+/// writable property here and a script may set it below an index that exists.
+fn arguments_element_count(object: &Handle<JsObject>) -> Result<u32, Unsupported> {
+    let length = index_length(object, "an arguments object")?;
+    let mut highest = 0u32;
+    for key in object.own_property_keys().map_err(|_| {
+        Unsupported::new(
+            "an arguments object",
+            "its own property names could not be read",
+        )
+    })? {
+        if let PropertyKey::String(atom) = key
+            && let Some(index) = canonical_index(&string::lookup(atom))
+        {
+            highest = highest.max(index.saturating_add(1));
+        }
+    }
+    Ok(length.max(highest))
+}
+
+/// Write an arguments exotic as the form it is, its elements, and its object
+/// part.
+///
+/// A mapped object's parameter map is deliberately **not** written: its entries
+/// are accessors over the call's environment, and the closures that read a named
+/// binding cannot be named by a blob. What travels instead is the pair the map
+/// is made from — the formal names and the environment — and the restore rebuilds
+/// the map over the same environment, which is the only way an index write can go
+/// on aliasing the parameter binding the way it did before the snapshot.
+fn write_arguments(
+    realm: &Handle<Realm>,
+    object: Handle<JsObject>,
+    serials: &HashMap<Identity, u32>,
+    body: &mut Vec<u8>,
+) -> Result<(), Unsupported> {
+    // The walk refuses every other kind, so the match cannot miss; a miss would
+    // be a walk/writer disagreement.
+    let ObjectKind::Arguments(slots) = &object.kind else {
+        return Err(Unsupported::new(
+            "an arguments object",
+            "its kind is not the one this record is for",
+        ));
+    };
+    let mapped = slots.parameter_map.is_some();
+    let count = arguments_element_count(&object)?;
+    body.push(REC_ARGUMENTS);
+    body.push(u8::from(mapped));
+    if mapped {
+        let environment = mapped_environment(slots).ok_or(Unsupported::new(
+            "an arguments object",
+            "its parameter environment is not one this format can name",
+        ))?;
+        write_u32(body, env_serial(realm, environment, serials)?);
+        write_u32(
+            body,
+            length_as_u32(slots.formals.len(), "an arguments object")?,
+        );
+        for formal in &slots.formals {
+            write_units(body, formal.as_slice());
+        }
+    }
+    write_u32(body, count);
+    for index in 0..count as u64 {
+        let key = PropertyKey::String(string::index_atom(index));
+        match object.get_own_property_key(&key) {
+            Ok(Some(property)) => {
+                let value = property.value().unwrap_or(Value::Undefined);
+                write_u32(body, serial_in(realm, serials, value));
+            }
+            // An index the call never filled, or one the script deleted: the
+            // same `NO_REF` an Array's hole writes, because `undefined` is an
+            // element that is there.
+            Ok(None) => write_u32(body, NO_REF),
+            Err(_) => {
+                return Err(Unsupported::new(
+                    "an arguments object",
+                    "an element could not be read",
+                ));
+            }
+        }
+    }
+    write_u32(body, prototype_serial(realm, &object, serials)?);
+    body.push(u8::from(object.extensible.get()));
+    write_properties(realm, &object, serials, body)?;
+    Ok(())
+}
+
+/// Write a String exotic as the primitive it wraps plus its object part.
+///
+/// The code units are the record's substance: a String object's index properties
+/// are virtual, derived from the primitive by the same `string_create` the
+/// restore uses, and its `length` is that primitive's length — so the primitive
+/// is the whole of what a restore needs beyond the ordinary property list.
+fn write_string_object(
+    realm: &Handle<Realm>,
+    object: Handle<JsObject>,
+    serials: &HashMap<Identity, u32>,
+    body: &mut Vec<u8>,
+) -> Result<(), Unsupported> {
+    // The walk refuses every other kind, so the match cannot miss; a miss would
+    // be a walk/writer disagreement.
+    let ObjectKind::String(string) = &object.kind else {
+        return Err(Unsupported::new(
+            "a string object",
+            "its kind is not the one this record is for",
+        ));
+    };
+    body.push(REC_STRING_OBJECT);
+    write_units(body, string.as_slice());
     write_u32(body, prototype_serial(realm, &object, serials)?);
     body.push(u8::from(object.extensible.get()));
     write_properties(realm, &object, serials, body)?;
@@ -3221,6 +3459,52 @@ fn read_record(reader: &mut Reader<'_>) -> Result<Record, DecodeError> {
                 byte_length,
                 array_length,
                 auto_length,
+                proto,
+                extensible,
+                properties,
+            })
+        }
+        REC_ARGUMENTS => {
+            let mapped = reader.u8().ok_or(DecodeError::Truncated)? != 0;
+            // The two fields a mapped object has on top of an unmapped one are
+            // read under the same byte that writes them, so a blob that says
+            // "unmapped" and carries them is a blob that disagrees with itself.
+            let (environment, formals) = if mapped {
+                let environment = reader.u32().ok_or(DecodeError::Truncated)?;
+                let count = reader.u32().ok_or(DecodeError::Truncated)? as usize;
+                let mut formals = Vec::with_capacity(count.min(1024));
+                for _ in 0..count {
+                    formals.push(reader.units().ok_or(DecodeError::Truncated)?);
+                }
+                (environment, formals)
+            } else {
+                (NO_REF, Vec::new())
+            };
+            let count = reader.u32().ok_or(DecodeError::Truncated)? as usize;
+            let mut elements = Vec::with_capacity(count.min(1024));
+            for _ in 0..count {
+                elements.push(reader.u32().ok_or(DecodeError::Truncated)?);
+            }
+            let proto = reader.u32().ok_or(DecodeError::Truncated)?;
+            let extensible = reader.u8().ok_or(DecodeError::Truncated)? != 0;
+            let properties = read_properties(reader)?;
+            Ok(Record::Arguments {
+                mapped,
+                formals,
+                environment,
+                elements,
+                proto,
+                extensible,
+                properties,
+            })
+        }
+        REC_STRING_OBJECT => {
+            let units = reader.units().ok_or(DecodeError::Truncated)?;
+            let proto = reader.u32().ok_or(DecodeError::Truncated)?;
+            let extensible = reader.u8().ok_or(DecodeError::Truncated)? != 0;
+            let properties = read_properties(reader)?;
+            Ok(Record::StringObject {
+                units,
                 proto,
                 extensible,
                 properties,
@@ -4123,6 +4407,112 @@ impl Builder<'_> {
                         "the view tracks the buffer, the record does not say so".into(),
                     ));
                 }
+                self.remember(index, Built::Object(object));
+                define_properties(self, object, properties)?;
+                // Extensibility last, for the reason `Record::Object` states.
+                object.extensible.set(*extensible);
+                Built::Object(object)
+            }
+            Record::Arguments {
+                mapped,
+                formals,
+                environment,
+                elements,
+                proto,
+                extensible,
+                properties,
+            } => {
+                // The element values first: the engine's own arguments creation
+                // takes the call's arguments, and that list is what fills the
+                // index properties and — for a mapped object — decides which of
+                // them the parameter map covers (spec 10.4.4.2 step 22: only a
+                // formal that was *passed* maps). An absent index has to be
+                // given the constructor *something* to be a hole-shaped gap in
+                // the list, so it is deleted again below rather than left as the
+                // `undefined` the list had to carry.
+                let mut args = Vec::with_capacity(elements.len());
+                let mut absent = Vec::new();
+                for (position, element) in elements.iter().enumerate() {
+                    match *element {
+                        NO_REF => {
+                            args.push(Value::Undefined);
+                            absent.push(position as u64);
+                        }
+                        serial => args.push(self.materialize(serial)?),
+                    }
+                }
+                let prototype = self.prototype(*proto)?;
+                let realm = *self.realm;
+                // The creation reads the running realm and, for a mapped object,
+                // interns the formal names, so it runs under a bootstrap context
+                // the way a function record's instantiation does.
+                self.agent.push_bootstrap_context(realm);
+                let value = if *mapped {
+                    let environment = self.function_environment(*environment)?;
+                    let names = formals
+                        .iter()
+                        .map(|units| JsString::from_utf16(units))
+                        .collect::<Vec<_>>();
+                    crate::function::create_mapped_arguments_object(
+                        self.agent,
+                        Value::Undefined,
+                        &args,
+                        &names,
+                        environment,
+                    )
+                } else {
+                    crate::function::create_unmapped_arguments_object(self.agent, &args)
+                };
+                self.agent.execution_context_stack.pop();
+                let value = value.map_err(|error| {
+                    DecodeError::UnrebuildableObject(format!(
+                        "the engine would not make the arguments object: {error}"
+                    ))
+                })?;
+                let object = value.as_object().ok_or_else(|| {
+                    DecodeError::UnrebuildableObject(
+                        "the arguments creation did not answer an object".into(),
+                    )
+                })?;
+                // The engine's creation derives the prototype the way the
+                // writing realm's did, from `%Object.prototype%`; the record's is
+                // what that realm's object actually had, so it wins — the same
+                // rule a typed array's link follows.
+                object.set_prototype_of(prototype).map_err(|error| {
+                    DecodeError::UnrebuildableObject(format!(
+                        "its prototype could not be set: {error}"
+                    ))
+                })?;
+                for position in absent {
+                    let key = PropertyKey::String(string::index_atom(position));
+                    object.delete_key(&key).map_err(|error| {
+                        DecodeError::UnrebuildableObject(format!(
+                            "an absent element could not be left out: {error}"
+                        ))
+                    })?;
+                }
+                self.remember(index, Built::Object(object));
+                define_properties(self, object, properties)?;
+                // Extensibility last, for the reason `Record::Object` states.
+                object.extensible.set(*extensible);
+                Built::Object(object)
+            }
+            Record::StringObject {
+                units,
+                proto,
+                extensible,
+                properties,
+            } => {
+                // The engine's own StringCreate: it makes the virtual code-unit
+                // indices and the non-writable `length` from the primitive, which
+                // is why the record carries the primitive and not the characters.
+                let prototype = self.prototype(*proto)?;
+                let string = JsString::from_utf16(units);
+                let object = JsObject::string_create(string, prototype).map_err(|error| {
+                    DecodeError::UnrebuildableObject(format!(
+                        "the engine would not make the String object: {error}"
+                    ))
+                })?;
                 self.remember(index, Built::Object(object));
                 define_properties(self, object, properties)?;
                 // Extensibility last, for the reason `Record::Object` states.
@@ -5039,7 +5429,10 @@ mod tests {
             !array.extensible.get(),
             "the array came back non-extensible"
         );
-        assert_eq!(array_length(&array).expect("a length") as u64, 2);
+        assert_eq!(
+            index_length(&array, "an array").expect("a length") as u64,
+            2
+        );
         assert_eq!(number_of_key(&array, "tag"), Some(7.0));
 
         // A function with an own property that the fresh function does not
@@ -5327,7 +5720,7 @@ mod tests {
         );
         let back = round_trip(&isolate, &realm, array);
         let back = back.as_object().expect("an array");
-        assert_eq!(array_length(&back).expect("a length"), 3);
+        assert_eq!(index_length(&back, "an array").expect("a length"), 3);
         assert_eq!(
             back.get_own_property(&JsString::from_utf8("1"))
                 .expect("read")
@@ -5398,40 +5791,198 @@ mod tests {
                 .collect();
             assert_eq!(found, expected, "length {length}, elements {set:?}");
             assert_eq!(
-                array_length(&back).expect("a length") as f64,
+                index_length(&back, "an array").expect("a length") as f64,
                 length,
                 "length {length}, elements {set:?}"
             );
         }
     }
 
-    /// Each exotic kind is refused by name rather than written as the ordinary
-    /// object its shape would suggest: a proxy has traps in its slots, a typed
-    /// array has a buffer, a `String` object has a string, and none of that is
-    /// in `properties`.
+    /// A proxy is still refused by name: its traps and target live in its slots
+    /// and not in `properties`, so writing it as the ordinary object its keys
+    /// make it look like would restore an object that is not the one that was
+    /// written. The two exotics whose own slots *are* the state — a String object
+    /// and an arguments object — are carried now, and tested below.
     #[test]
-    fn an_exotic_object_is_refused_by_name() {
+    fn a_proxy_is_refused_by_name() {
         let mut isolate = api::Isolate::new();
         let context = api::Context::new(&mut isolate).expect("a realm");
         let realm = *context.realm();
-        for (source, expected) in [
-            ("new Proxy({}, {})", "a proxy"),
-            ("new String('x')", "a string object"),
-            (
-                "(function () { return arguments; })()",
-                "an arguments object",
+        let value = context
+            .try_eval("new Proxy({}, {})")
+            .expect("a value to refuse")
+            .into_value();
+        let error = encode(agent_of(&isolate), &realm, value).expect_err("the walk refuses");
+        assert_eq!(error.type_name, "a proxy");
+    }
+
+    /// A String object is carried as the primitive it wraps: its code-unit index
+    /// properties are virtual and its `length` is that primitive's length, so the
+    /// record is the string plus the object part and the restore is the engine's
+    /// own `string_create`.
+    #[test]
+    fn a_string_object_round_trips_as_the_string_it_wraps() {
+        let mut isolate = api::Isolate::new();
+        let context = api::Context::new(&mut isolate).expect("a realm");
+        let realm = *context.realm();
+        // A non-BMP character, so the record has to carry UTF-16 units rather
+        // than a nice UTF-8 string, and an own property so the object part is
+        // more than the wrapper's derived half.
+        let value = context
+            .try_eval(
+                "(function () { const s = new String('a\\u{1F600}b'); s.tag = 7; return s; })()",
+            )
+            .expect("a String object")
+            .into_value();
+
+        let back = round_trip(&isolate, &realm, value);
+        let back = back.as_object().expect("an object");
+        assert!(
+            matches!(back.kind, ObjectKind::String(_)),
+            "a restored String object is still a String exotic"
+        );
+        let read = |source: &str| run_restored(&isolate, &realm, Value::Object(back), source);
+        let text = |value: Value| value.as_string().map(|text| text.to_string_lossy());
+        assert_eq!(
+            text(read("Object.prototype.toString.call(restored)")),
+            Some("[object String]".into()),
+            "the restored object is still tagged as a String"
+        );
+        assert_eq!(text(read("String(restored)")), Some("a\u{1F600}b".into()));
+        assert_eq!(read("restored.length").as_number(), Some(4.0));
+        assert_eq!(text(read("restored[0]")), Some("a".into()));
+        // The first code unit of the surrogate pair, which is what a String
+        // object's index property *is* — code units, not characters.
+        assert_eq!(read("restored.charCodeAt(1)").as_number(), Some(55357.0));
+        assert_eq!(read("restored.tag").as_number(), Some(7.0));
+        assert_eq!(
+            read("String(restored) === restored.toString()").as_boolean(),
+            Some(true)
+        );
+    }
+
+    /// An arguments object's indices come back as indices of an arguments
+    /// *exotic* — so the tag, `callee` and `@@iterator` are the engine's — and an
+    /// index the call never filled, or one a script deleted, comes back absent
+    /// rather than as `undefined`.
+    #[test]
+    fn an_unmapped_arguments_object_round_trips() {
+        let mut isolate = api::Isolate::new();
+        let context = api::Context::new(&mut isolate).expect("a realm");
+        let realm = *context.realm();
+        let value = context
+            .try_eval(
+                "(function () { 'use strict'; const a = arguments; delete a[1]; return a; })(1, 2, 3)",
+            )
+            .expect("an arguments object")
+            .into_value();
+
+        let back = round_trip(&isolate, &realm, value);
+        let back = back.as_object().expect("an object");
+        let ObjectKind::Arguments(slots) = &back.kind else {
+            panic!("a restored arguments object is still an arguments exotic");
+        };
+        assert!(
+            slots.parameter_map.is_none(),
+            "a strict body's object has no parameter map"
+        );
+        let read = |source: &str| run_restored(&isolate, &realm, Value::Object(back), source);
+        let text = |value: Value| value.as_string().map(|text| text.to_string_lossy());
+        assert_eq!(
+            text(read("Object.prototype.toString.call(restored)")),
+            Some("[object Arguments]".into())
+        );
+        assert_eq!(read("restored.length").as_number(), Some(3.0));
+        assert_eq!(read("restored[2]").as_number(), Some(3.0));
+        assert_eq!(read("1 in restored").as_boolean(), Some(false));
+        assert_eq!(read("0 in restored").as_boolean(), Some(true));
+        assert_eq!(
+            read("restored[Symbol.iterator] === Array.prototype.values").as_boolean(),
+            Some(true)
+        );
+        assert_eq!(
+            outcome_restored(
+                &isolate,
+                &realm,
+                Value::Object(back),
+                "return restored.callee;"
             ),
-        ] {
-            let value = context
-                .try_eval(source)
-                .expect("a value to refuse")
-                .into_value();
-            let error = encode(agent_of(&isolate), &realm, value).expect_err("the walk refuses");
-            assert_eq!(
-                error.type_name, expected,
-                "{source} was refused as something else"
-            );
-        }
+            "TypeError",
+            "the unmapped form's `callee` throws"
+        );
+    }
+
+    /// The aliasing a mapped arguments object *is* survives the round trip: its
+    /// indices write the call's formal parameters, in both directions, and only
+    /// where a parameter covers one.
+    ///
+    /// This is the test the record exists for. The parameter map's entries are
+    /// accessors over the call's environment, and the binding one reads is named
+    /// only inside the closure — the map's own keys are indices — so a restore
+    /// that wrote the object's properties alone would hand back an arguments
+    /// object whose indices no longer write the parameters. The two values are
+    /// carried **together**, because they have to name one environment record:
+    /// `args`'s accessors and `read`'s free names resolve through the same chain,
+    /// and a restore that made two chains would make two parameters.
+    #[test]
+    fn a_mapped_arguments_object_still_aliases_its_parameters() {
+        let mut isolate = api::Isolate::new();
+        let context = api::Context::new(&mut isolate).expect("a realm");
+        let realm = *context.realm();
+        // Sloppy, simple parameter list: the mapped form. Three arguments for two
+        // formals, so the third index is not a parameter and stays an ordinary
+        // element.
+        let value = context
+            .try_eval(
+                "(function (a, b) { return { args: arguments, read: function () { return [a, b]; }, write: function (v) { a = v; } }; })(1, 2, 3)",
+            )
+            .expect("a mapped arguments object")
+            .into_value();
+
+        let back = round_trip(&isolate, &realm, value);
+        let back = back.as_object().expect("an object");
+        let args = own_property(&back, "args").value().expect("args");
+        let args = args.as_object().expect("an object");
+        let ObjectKind::Arguments(slots) = &args.kind else {
+            panic!("a restored mapped arguments object is still an arguments exotic");
+        };
+        assert!(
+            slots.parameter_map.is_some(),
+            "a sloppy simple-parameter body's object keeps its parameter map"
+        );
+        assert_eq!(
+            slots
+                .formals
+                .iter()
+                .map(|name| name.to_string_lossy())
+                .collect::<Vec<_>>(),
+            vec!["a".to_string(), "b".to_string()],
+            "the names the map is keyed by travel with the record"
+        );
+
+        let read = |source: &str| run_restored(&isolate, &realm, Value::Object(back), source);
+        // The values themselves.
+        assert_eq!(read("restored.args[0]").as_number(), Some(1.0));
+        assert_eq!(read("restored.args[2]").as_number(), Some(3.0));
+        assert_eq!(read("restored.read()[1]").as_number(), Some(2.0));
+        // An index writes the parameter...
+        assert_eq!(
+            read("(restored.args[0] = 9, restored.read()[0])").as_number(),
+            Some(9.0),
+            "writing an index writes the formal parameter"
+        );
+        // ...and the parameter is visible through the index.
+        assert_eq!(
+            read("(restored.write(7), restored.args[0])").as_number(),
+            Some(7.0),
+            "writing the formal parameter is visible through the index"
+        );
+        // An index past the formals is an ordinary element, not a parameter.
+        assert_eq!(
+            read("(restored.args[2] = 8, restored.read()[1])").as_number(),
+            Some(2.0),
+            "an index no parameter covers does not write one"
+        );
     }
 
     #[test]

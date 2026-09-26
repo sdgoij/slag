@@ -475,11 +475,16 @@ pub enum ObjectKind {
 /// formal parameter bindings. `env` roots the environment the accessors
 /// read from — it is not a language value, so it rides along as an opaque
 /// GC edge (GC-2: the accessor closures capture the environment handle
-/// directly; the object keeps the box alive).
+/// directly; the object keeps the box alive). `formals` is the parameter
+/// list the map was built from, kept because a mapped accessor's name lives
+/// only inside its closure: the map's keys are indices, so nothing else here
+/// can say which binding an entry reads, and a snapshot has to write that
+/// name.
 #[derive(Clone)]
 pub struct ArgumentsSlots {
     pub parameter_map: Option<Handle<JsObject>>,
     pub env: Option<crate::heap::GcAny>,
+    pub formals: Vec<crate::string::JsString>,
 }
 
 impl std::fmt::Debug for ArgumentsSlots {
@@ -487,6 +492,7 @@ impl std::fmt::Debug for ArgumentsSlots {
         f.debug_struct("ArgumentsSlots")
             .field("parameter_map", &self.parameter_map.is_some())
             .field("env", &self.env.is_some())
+            .field("formals", &self.formals)
             .finish()
     }
 }
@@ -534,6 +540,12 @@ impl Trace for ArgumentsSlots {
         }
         if let Some(env) = &self.env {
             visit(*env);
+        }
+        // A formal name is a `JsString`, which is a rope rather than a leaf
+        // when it was built by concatenation, so its own edges have to be
+        // traced like any other string's.
+        for formal in &self.formals {
+            formal.trace(visit);
         }
     }
 }
@@ -1844,6 +1856,7 @@ impl JsObject {
             kind: ObjectKind::Arguments(Handle::new(ArgumentsSlots {
                 parameter_map: Some(map),
                 env: None,
+                formals: formals.to_vec(),
             })),
             array_dense: Cell::new(None),
             typed_array: Cell::new(None),
@@ -1946,6 +1959,7 @@ impl JsObject {
             kind: ObjectKind::Arguments(Handle::new(ArgumentsSlots {
                 parameter_map: None,
                 env: None,
+                formals: Vec::new(),
             })),
             array_dense: Cell::new(None),
             typed_array: Cell::new(None),
