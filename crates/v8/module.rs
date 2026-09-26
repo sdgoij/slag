@@ -1365,6 +1365,59 @@ mod tests {
         );
     }
 
+    /// An import binding is an indirection — the environment that exported the
+    /// name, and the name *there* — and both halves travel, because the exporting
+    /// module's environment is carried like any other record. The `as` is what
+    /// makes both names load-bearing: the local one is `v` and the exported one
+    /// is `x`.
+    #[test]
+    fn an_import_bindings_indirection_travels_through_a_blob() {
+        let mut isolate = crate::Isolate::snapshot_creator(None, None);
+        {
+            crate::scope!(let scope, &mut isolate);
+            let context = crate::Context::new(scope, Default::default());
+            let scope = &mut crate::ContextScope::new(scope, context);
+            scope.set_default_context(context);
+            let realm = crate::realm_of(scope);
+            let module = api::Module::compile(
+                &realm,
+                "entry",
+                "import { x as v } from 'dep';\nglobalThis.__imported = () => v + 1;",
+            )
+            .expect("compile");
+            let module = Local::<Module>::from_module(module);
+            assert_eq!(
+                module.instantiate_module(scope, resolve_by_compiling),
+                Some(true)
+            );
+            module.evaluate(scope).expect("evaluate");
+            let imported = crate::test_support::eval(scope, "globalThis.__imported");
+            scope.add_context_data(context, imported);
+        }
+        let blob = isolate
+            .create_blob(crate::FunctionCodeHandling::Keep)
+            .expect("a blob");
+
+        let mut isolate = crate::Isolate::new(crate::CreateParams::default().snapshot_blob(blob));
+        crate::scope!(let scope, &mut isolate);
+        let context = crate::Context::from_snapshot(
+            scope,
+            crate::snapshot::DEFAULT_CONTEXT_SLOT,
+            Default::default(),
+        )
+        .expect("the blob names the default context");
+        let scope = &mut crate::ContextScope::new(scope, context);
+        let imported = scope
+            .get_context_data_from_snapshot_once::<crate::data::Value>(0)
+            .expect("the closure over the import");
+        crate::test_support::bind(scope, "imported", imported);
+        assert_eq!(
+            crate::test_support::eval_number(scope, "imported()"),
+            42.0,
+            "the indirection resolved through the module that exported it"
+        );
+    }
+
     /// The message minted for a stalled top-level await answers the location V8
     /// fills in: the module's own name and the `await` its body is suspended at,
     /// where a message with no recorded position answers nothing.

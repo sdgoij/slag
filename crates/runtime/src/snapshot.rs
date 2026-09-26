@@ -237,6 +237,10 @@ const BIND_MUTABLE: u8 = 1;
 const BIND_STRICT: u8 = 2;
 const BIND_DELETABLE: u8 = 4;
 const BIND_PARAMETER: u8 = 8;
+/// The binding is a module import indirection (spec 9.2.5.2): its value slot
+/// carries the *exported* name and its reserved slot the environment that exports
+/// it, so the record holds `(target, target_name)` rather than a value.
+const BIND_INDIRECT: u8 = 16;
 
 /// A function environment's [[ThisBindingStatus]] (spec 9.2.4), in the byte a
 /// function environment carries.
@@ -588,6 +592,10 @@ struct CarriedBinding {
     name: u32,
     flags: u8,
     value: u32,
+    /// What the last field of a binding holds: `NO_REF` for an ordinary binding,
+    /// and for an import indirection the serial of the environment that exports
+    /// the name the value slot carries.
+    reserved: u32,
 }
 
 /// A host callback the host built: the table entry its calls come from, whether
@@ -802,6 +810,10 @@ pub fn encode_slots(
                     name,
                     flags: binding_flags(&binding),
                     value,
+                    // A global binding is never an indirection: an import lives in
+                    // the module record that binds it, and `carried_global_bindings`
+                    // refuses one here.
+                    reserved: NO_REF,
                 });
             }
         }
@@ -1327,7 +1339,9 @@ struct CarriedEnvironment {
 /// closure's names resolve through: a lookup walks the record's own binding
 /// list, and all three hold one. An object record (whose names live on a binding
 /// object) and a global record (which the reading realm rebuilds) are refused by
-/// the kind they are, as is a binding that resolves through another module.
+/// the kind they are. A binding that resolves through another module is carried
+/// as the indirection it is: the environment it exports from travels like any
+/// other record, and the binding names it.
 fn carried_environment(env: &EnvRef) -> Result<CarriedEnvironment, Unsupported> {
     let (kind, declarative) = match &**env {
         EnvRecord::Declarative(declarative) => (ENV_DECLARATIVE, declarative),
@@ -1353,16 +1367,8 @@ fn carried_environment(env: &EnvRef) -> Result<CarriedEnvironment, Unsupported> 
         .bindings
         .borrow()
         .iter()
-        .map(|(name, binding)| {
-            if binding.indirect.is_some() {
-                return Err(Unsupported::new(
-                    "a module import binding",
-                    "it resolves through the module that exported it, which the blob does not hold",
-                ));
-            }
-            Ok((name.clone(), binding.clone()))
-        })
-        .collect::<Result<Vec<_>, Unsupported>>()?;
+        .map(|(name, binding)| (name.clone(), binding.clone()))
+        .collect::<Vec<_>>();
     Ok(CarriedEnvironment {
         kind,
         transparent: declarative.context_transparent.get(),
@@ -1478,6 +1484,21 @@ fn visit_env(
         )?;
         if let Some(value) = binding.value {
             visit(agent, realm, externals, host, value, objects, serials)?;
+        }
+        // A module import binding is an indirection, so what the walk owes it is
+        // the pair a read resolves through: the environment that exports the name
+        // and the exported name itself.
+        if let Some((target, target_name)) = &binding.indirect {
+            visit_env(agent, realm, externals, host, *target, objects, serials)?;
+            visit(
+                agent,
+                realm,
+                externals,
+                host,
+                Value::String(Handle::new(target_name.clone())),
+                objects,
+                serials,
+            )?;
         }
     }
     if let Some(outer) = env.outer() {
@@ -2567,13 +2588,31 @@ fn write_env(
             serial_in(realm, serials, Value::String(Handle::new(name.clone()))),
         );
         body.push(binding_flags(binding));
-        write_u32(
-            body,
-            binding
-                .value
-                .map_or(NO_REF, |value| serial_in(realm, serials, value)),
-        );
-        write_u32(body, NO_REF);
+        match &binding.indirect {
+            Some((target, target_name)) => {
+                // The exported name goes where a value would and the environment
+                // that exports it in the reserved slot: an indirection has no value
+                // of its own, only the pair a read resolves through.
+                write_u32(
+                    body,
+                    serial_in(
+                        realm,
+                        serials,
+                        Value::String(Handle::new(target_name.clone())),
+                    ),
+                );
+                write_u32(body, env_serial(realm, *target, serials)?);
+            }
+            None => {
+                write_u32(
+                    body,
+                    binding
+                        .value
+                        .map_or(NO_REF, |value| serial_in(realm, serials, value)),
+                );
+                write_u32(body, NO_REF);
+            }
+        }
     }
     if let EnvRecord::Function(function) = &*env {
         write_u32(
@@ -2621,6 +2660,9 @@ fn binding_flags(binding: &Binding) -> u8 {
     }
     if binding.deletable {
         flags |= BIND_DELETABLE;
+    }
+    if binding.indirect.is_some() {
+        flags |= BIND_INDIRECT;
     }
     if binding.parameter {
         flags |= BIND_PARAMETER;
@@ -3363,6 +3405,7 @@ fn read_bindings(reader: &mut Reader<'_>) -> Result<Vec<CarriedBinding>, DecodeE
             name: property.key,
             flags: property.flags,
             value: property.first,
+            reserved: property.second,
         })
         .collect())
 }
@@ -3517,7 +3560,22 @@ impl Builder<'_> {
                     NO_REF => None,
                     serial => Some(self.materialize(serial)?),
                 };
-                carried.push((name, *binding, value));
+                // An import indirection's target is resolved here, before the
+                // binding list is borrowed: `env_ref` builds, and a `RefCell` held
+                // across that is a collection the trace skips.
+                let indirect = if binding.flags & BIND_INDIRECT != 0 {
+                    let exported = self.materialize(binding.value)?;
+                    let ValueKind::String(exported) = exported.kind() else {
+                        return Err(DecodeError::UnrebuildableEnvironment(
+                            "an import binding's exported name is not a string".into(),
+                        ));
+                    };
+                    let target = self.env_ref(binding.reserved)?;
+                    Some((target, (*exported).clone()))
+                } else {
+                    None
+                };
+                carried.push((name, *binding, value, indirect));
             }
             let state = if *kind == ENV_FUNCTION {
                 let this_value = self.materialize(*this_value)?;
@@ -3548,7 +3606,7 @@ impl Builder<'_> {
             };
             // The barriers run before the binding list is borrowed, for the same
             // reason the materialization does.
-            for (_, _, value) in &carried {
+            for (_, _, value, _) in &carried {
                 if let Some(value) = value {
                     crux::heap::write_barrier(&*env, *value);
                 }
@@ -3568,7 +3626,7 @@ impl Builder<'_> {
             };
             {
                 let mut list = declarative.bindings.borrow_mut();
-                for (name, binding, value) in carried {
+                for (name, binding, value, indirect) in carried {
                     list.push((
                         (*name).clone(),
                         Binding {
@@ -3576,7 +3634,7 @@ impl Builder<'_> {
                             mutable: binding.flags & BIND_MUTABLE != 0,
                             strict: binding.flags & BIND_STRICT != 0,
                             deletable: binding.flags & BIND_DELETABLE != 0,
-                            indirect: None,
+                            indirect,
                             parameter: binding.flags & BIND_PARAMETER != 0,
                         },
                     ));
