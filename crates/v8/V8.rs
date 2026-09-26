@@ -65,9 +65,14 @@ pub fn assert_initialized() {
 /// Hand the command line to V8 and get back what it did not understand
 /// (v8::V8::SetFlagsFromCommandLine).
 ///
-/// Slag's engine has no flag surface, so nothing is consumed and the arguments
-/// come back as they went in: a host that parses its own flags off the returned
-/// list sees all of them.
+/// The flags this bridge's table names (`crate::flags`) are consumed and the
+/// rest are returned, which is V8's own shape (`remove_flags = true`): index 0 is
+/// the binary name and is kept, so a host that skips it reads only the flags that
+/// were not understood. A flag this bridge does not know travelling back is the
+/// point — it is the same signal V8 sends for a name it has never heard of, and a
+/// host must not see a flag it depends on silently ignored. Recognizing a name is
+/// not applying it; the table states each entry's tier.
+///
 pub fn set_flags_from_command_line(args: Vec<String>) -> Vec<String> {
     set_flags_from_command_line_with_usage(args, None)
 }
@@ -75,14 +80,16 @@ pub fn set_flags_from_command_line(args: Vec<String>) -> Vec<String> {
 /// [`set_flags_from_command_line`] with a usage string to print
 /// (v8::V8::SetFlagsFromCommandLine).
 ///
-/// The usage string is for the flags a host's engine would have printed it for;
-/// there are none here, so nothing is printed.
+/// The usage string is for the flag list a host's engine would have printed it
+/// with, and there is no such list here, so nothing is printed — including for
+/// `--help`, which is recognized (a host checks for it after this call, and Deno
+/// exits 0 on it) but has no list to show.
 pub fn set_flags_from_command_line_with_usage(
     args: Vec<String>,
     usage: Option<&str>,
 ) -> Vec<String> {
     let _ = usage;
-    args
+    crate::flags::consume(args)
 }
 
 /// Record the flags a host set (v8::V8::SetFlagsFromString).
@@ -262,10 +269,12 @@ mod tests {
         std::panic::set_hook(hook);
     }
 
-    /// Flags are recorded rather than interpreted, which is what the accessor is
-    /// for: a host can see what it set, and the engine honors none of it.
+    /// The string form is recorded rather than interpreted, and the
+    /// command-line form returns what it did not recognize: `--allow-net` is
+    /// Deno's own flag, not a V8 flag this bridge knows, so it travels back to the
+    /// host unchanged.
     #[test]
-    fn flags_are_recorded_verbatim_and_left_for_the_host_to_parse() {
+    fn flags_a_host_set_are_recorded_and_unknown_ones_come_back() {
         assert_eq!(get_flags(), None);
         set_flags_from_string("--js-float16array --expose-gc");
         assert_eq!(

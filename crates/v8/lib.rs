@@ -34,6 +34,7 @@ mod external;
 mod external_references;
 pub mod fast_api;
 mod fixed_array;
+mod flags;
 mod function;
 mod handle;
 mod heap;

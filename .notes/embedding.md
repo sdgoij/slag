@@ -5059,6 +5059,14 @@ The three non-numbers: `Isolate::number_of_heap_spaces` is 0, consistently with 
 
 *Gates.* `cargo fmt --all -- --check` clean; `cargo clippy --locked --workspace --all-targets -- -D warnings` clean, and `cargo clippy -p v8 --features simdutf --all-targets -- -D warnings` with it; `cargo test --locked --workspace -- --skip function::tests::the_data_a_built_function_carries_a_collection` **5,467 passed / 0 failed** (up three — this part's tests; `v8` 347, `crux` 259, `runtime` 951, `ffi` 10, `slag` 4, `test262` 3324 with its two ignored); `cargo test -p runtime --no-default-features --lib` **920 passed / 0 failed**; `cargo check -p cli --no-default-features --features jit` green. **No sweeps, and that is checked rather than argued**: the part touches `crates/v8` only (a new `icu` module, `CreateParams`, `V8`), and `cargo tree` answers **0** for `v8 v150` under both runner packages, so the bridge is in no runner's graph.
 
+*The flag surface — §9's bullet, named before the edit, and a bridge part rather than an engine one.* The frontier the last record named, and it is Deno's own check that defines it: `cli/util/v8.rs:33-44` exits 1 unless `deno_core::v8_set_flags` reports every flag it passed as recognized, and `v8_set_flags` is `v8::V8::set_flags_from_command_line` (`libs/core/flags.rs:7`), which the bridge had answering "unrecognized" for all of Deno's defaults by design. So `crates/v8/flags.rs` is new: a table of the flag *names* this bridge recognizes, a `consume` with V8's `remove_flags = true` shape (index 0 kept, recognized names removed, everything else returned in place), and — because recognizing a name is not applying it — a tier on every entry, recorded behind a `#[cfg(test)]` accessor beside `has_fatal_error_handler` so the tiers are pinned by tests rather than only asserted in prose. `HostOwned` is `--stack-size`, and that is measured rather than argued: V8's flag is a JS stack limit, while here the JS stack *is* the native thread stack — the guard's watermark is `low + STACK_GUARD_RESERVE` over the thread's own reserved bounds with no configurable budget anywhere (`crates/runtime/src/stack.rs:118-125`), and the depth a thread reaches is its stack size over the per-activation native cost (`crates/runtime/src/eval.rs:1784-1800`: 133 levels on a 2 MiB thread), which is exactly why Deno reserves 4 MB of it (`deno/.cargo/config.toml:22-31`). `Inert` is everything else, each for a stated absence: `--inspector-live-edit` (the inspector this bridge already refuses to create), `--external-memory-max-reasonable-size` (V8's external-memory accounting, a ledger this arena does not keep), `--max-old-space-size` (the tier §9 already gives the `CreateParams` heap-geometry knobs — recorded and reported, with `CreateParams::heap_limits` what actually constrains the collector), and `--help`/`-help`, recognized because Deno checks for them *itself, after* the call, and exits 0 — an unrecognized help would turn a help request into an error exit, while the list V8 would print is V8's. Lookup normalizes the spelling, because both reach one host's own strings (`deno_core`'s `base_flags` carries `--no-validate-asm` beside `--turbo_fast_api_calls`) and V8 accepts both: `-` becomes `_`, and a `no_` negation prefix is stripped, before the compare. No value is parsed, so a recognized flag with a malformed value is consumed where V8 would refuse it — stated in §9 rather than closed, because no host in the frontier passes one.
+
+*Tests — seven, and three mutations, each caught by its own test.* `denos_default_flags_are_recognized_and_the_binary_name_is_kept` is Deno's own list end to end: `construct_v8_flags` builds `[arg0, ...defaults, ...env, ...user]`, Deno reports whatever survives `.skip(1)`, and all three defaults are consumed with index 0 intact. `the_binary_name_is_never_parsed_even_when_it_looks_like_a_flag` is the same contract from the other side, and it exists because the mutation that removes the index-0 guard was **not** caught by the first test: V8's placeholder is not flag-shaped, so that bug is invisible until the binary name is. `the_lsp_defaults_heap_size_is_recognized_and_inert`, `an_unknown_flag_is_returned_to_the_host` (`--allow-net` is Deno's flag and comes back untouched), `the_spelling_and_the_negation_both_reach_the_entry` (`--no-inspector-live-edit`, `--stack_size=2048`), `a_help_request_is_recognized_in_both_spellings`, and `a_non_flag_is_left_alone` — which carries a bare `help` and a bare `stack-size=1024`, because without them the dash requirement is masked by the table lookup and the mutation that drops it goes uncaught. Mutations, each run alone: dropping the `no_` strip fails the spelling test with `["deno", "--no-inspector-live-edit"]` where `["deno"]` is due; dropping the index-0 guard fails the binary-name test with the argument eaten out of the returned list; dropping the dash requirement in `flag_name` fails the non-flag test by consuming `help` and `stack-size=1024`.
+
+*The measurement: Deno's flag check is passed, and the CLI reaches the blob for the first time.* `cargo build --manifest-path deno/Cargo.toml -p deno` links a fresh `deno.exe` against the bridge, and `deno eval "console.log(1 + 2)"` no longer prints the three `V8 did not recognize flag` errors and no longer exits in `cli/util/v8.rs:33-44`: the check passes and the runtime proceeds to *load* `CLI_SNAPSHOT.bin`. The load then dies at `crates/v8/snapshot.rs:777` — `v8::Context::FromSnapshot: the snapshot could not be read for context 1: snapshot function could not be rebuilt: its arrow source does not parse: SyntaxError: Private field access is only valid inside a class` — which is the next part, and the first *read*-side limit the blob's own contents have exposed: a carried function is rebuilt from its source text, and a source that names a private field cannot stand alone outside its class body. Two host prerequisites turned up on the way, both in `deno/`'s scratch and neither one part of the interface: the snapshot build script needed its 2 MiB stack patch again (cargo recompiles it whenever the bridge changes, and the patch is applied for the run and removed again rather than left behind — a build that recompiles the script must re-patch it), and the linked `deno.exe` aborted the bootstrap with `thread 'main' has overflowed its stack` before printing anything of its own, because its main-thread reserve was below the 4 MB `deno/.cargo/config.toml:31` asks for; `editbin /STACK:4194304` on the exe got past it (the header now reads `400000 size of stack reserve`). The reserve is a link argument, so the build that produced the exe did not carry that config — cargo discovers its config files from its working directory, and this build ran from the repository root. Building with the working directory inside `deno/` is the fix to try before patching the exe again, and the exe carries the patch in the meantime so the next part's measurement can run.
+
+*Gates.* `cargo fmt --all -- --check` clean; `cargo clippy --locked --workspace --all-targets -- -D warnings` clean, and `cargo clippy -p v8 --features simdutf --all-targets -- -D warnings` with it; `cargo test --locked --workspace -- --skip function::tests::the_data_a_built_function_carries_a_collection` **5,474 passed / 0 failed** (up seven — this part's tests; `v8` **354**, `crux` 259, `runtime` 951, `ffi` 10, `slag` 4, `test262` 3324 with its two ignored); `cargo test -p runtime --no-default-features --lib` **920 passed / 0 failed**; `cargo check -p cli --no-default-features --features jit` green; `deno_core --lib` (release, `--test-threads=1`) holds at **453 passed / 6 failed / 2 ignored**, the same six out-of-scope cases. **No sweeps, and that is checked rather than argued**: the part touches `crates/v8` only, and `cargo tree --locked -p test262 -e normal` and the same for `wasmtest` both answer **0** for `v8 v150`.
+
 ## 8. Parked: the C++ face
 
 A working C++ face was built (`v8.h` + `api.cc` + a compat program, all green)
@@ -5310,11 +5318,63 @@ if that proves possible.
   plainly. This is the one place where the bridge's tier is "accepted, not
   used"; when the engine grows background work (L3), the platform becomes its
   poster and this decision gets revisited.
-- **Flags are recorded, not interpreted.** `V8::set_flags_from_string` keeps the
+- **Flags are recorded, not interpreted; the command-line form additionally
+  consumes the names it recognizes.** `V8::set_flags_from_string` keeps the
   string and `V8::get_flags` (the bridge's own accessor) hands it back. The
-  engine has no flag surface; a host that needs a flag's effect must not depend
-  on it. `set_flags_from_command_line` consumes nothing, so a host sees all of
-  its own arguments on the returned list.
+  engine is not flag-configurable, so a host that needs a flag's effect must not
+  depend on it. `set_flags_from_command_line` consumes the flags the table below
+  names and returns the rest; until that landed it consumed nothing, and Deno's
+  own V8-flag check is what made the difference observable.
+- **The flag surface Deno's own check requires — named here before the edit, and
+  the first place a flag is *consumed* rather than recorded.**
+  `cli/util/v8.rs:33-44` exits 1 unless `deno_core::v8_set_flags` reports every
+  flag it passed as recognized, and it passes its own defaults —
+  `--stack-size=1024`, `--inspector-live-edit`,
+  `--external-memory-max-reasonable-size=0` (`cli/args/mod.rs:1709-1715`), with
+  `--max-old-space-size=3072` joining them for the `lsp` subcommand
+  (`cli/lib.rs:1136-1144`). `v8_set_flags` is
+  `v8::V8::set_flags_from_command_line` (`libs/core/flags.rs:7`), so the check is
+  this bridge's function, and the shape it must have is V8's: *remove the flags
+  you recognize and return what is left*, index 0 — the binary name — always
+  kept, which is why Deno skips the first element before reporting the rest. So
+  the function gains a table of recognized flag *names*, consumes those, and
+  returns the rest. A name the table does not hold still travels back to the
+  host: that is V8's own signal for a flag it has never heard of, and it is the
+  loud failure a host needs, since a flag that changes what its programs mean
+  must not be quietly ignored. Recognizing a name is not applying it, so every
+  entry carries a **tier**, and there are two. **`HostOwned`** is for the flag
+  whose subject belongs to the *host*: `--stack-size` is a JS stack limit in V8,
+  and here the JS stack *is* the native thread stack — not as a convenience but
+  as the engine's design, where the guard's watermark is derived from the
+  thread's own reserved bounds with no configurable budget anywhere
+  (`crates/runtime/src/stack.rs:118-125`, `low + STACK_GUARD_RESERVE`) and the
+  depth a thread reaches is its stack size over the per-activation native cost
+  (`crates/runtime/src/eval.rs:1784-1800` measures 133 levels on a 2 MiB
+  thread). Deno reserves 4 MB of thread stack for exactly this reason
+  (`deno/.cargo/config.toml:22-31`: 1 MB "leaves no headroom below V8's own JS
+  stack limit (`--stack-size`, 1MB by default)"), and the engine's guard turns
+  the overflow into V8's own `"Maximum call stack size exceeded"` `RangeError` —
+  so the flag's intent is met by the host, and what the bridge must not do is
+  claim a limit it cannot raise. **`Inert`** is for the rest, each for a stated
+  absence: `--inspector-live-edit` (the inspector this bridge already refuses to
+  create), `--external-memory-max-reasonable-size` (V8's accounting bound for
+  external memory, a ledger this arena does not keep), and
+  `--max-old-space-size` (the tier §9 already gives the `CreateParams`
+  heap-geometry knobs — recorded and reported; `CreateParams::heap_limits` is
+  what constrains the collector). `--help`/`-help` are `Inert` for a different
+  reason: Deno checks for them *itself, after* the call, and exits 0, so an
+  unrecognized help would turn a help request into an error exit — and the list
+  V8 would print is V8's, which is also why
+  `set_flags_from_command_line_with_usage` still ignores its usage string.
+  Recognition is by name only and no value is validated, so a recognized flag
+  with a malformed value is consumed where V8 would refuse it; that divergence is
+  stated rather than closed, because no host in the frontier passes one. Lookup
+  normalizes the spelling, because both reach one host's own strings
+  (`deno_core`'s `base_flags` carries `--no-validate-asm` beside
+  `--turbo_fast_api_calls`) and V8 accepts both: `-` becomes `_`, and a `no_`
+  prefix is stripped, before the compare. What was recognized, with its tier, is
+  recorded behind a `#[cfg(test)]` accessor beside `has_fatal_error_handler`, so
+  the tiers are pinned by tests rather than only asserted in prose.
 - **`get_constructor_name` is the map's answer only in the cases where the
   property chain agrees with it, and the difference is stated where a host would
   read it.** V8 reads the constructor the object's *map* was made with and the
