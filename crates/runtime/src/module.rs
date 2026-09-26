@@ -435,11 +435,14 @@ pub struct SyntheticModule {
     pub name: JsString,
     /// The declared export names, in the order the host gave them.
     pub export_names: Vec<JsString>,
-    /// What evaluation runs (v8::SyntheticModuleEvaluationSteps).
+    /// What evaluation runs (v8::SyntheticModuleEvaluationSteps). `fn` rather
+    /// than a closure because that is the shape V8 takes.
     pub evaluation_steps: crate::api::SyntheticModuleEvaluationSteps,
     /// The realm the module was made in, which is the context the callback is
-    /// handed.
-    pub context: crate::api::Context,
+    /// handed — `None` for a module the snapshot restored, whose host callback
+    /// cannot travel: a restored module's exports are the bindings the blob
+    /// carried, and it has no steps to run.
+    pub context: Option<crate::api::Context>,
 }
 
 impl Trace for SyntheticModule {
@@ -448,7 +451,9 @@ impl Trace for SyntheticModule {
         for name in &self.export_names {
             name.trace(visit);
         }
-        self.context.realm().trace(visit);
+        if let Some(context) = &self.context {
+            context.realm().trace(visit);
+        }
     }
 }
 
@@ -496,7 +501,74 @@ pub fn synthetic_module_create(
             name: name.clone(),
             export_names,
             evaluation_steps,
-            context,
+            context: Some(context),
+        }),
+        evaluation_error: RefCell::new(None),
+        import_meta: RefCell::new(None),
+        module_source: RefCell::new(None),
+        deferred_namespace: RefCell::new(None),
+        cycle_root: RefCell::new(None),
+        async_parents: RefCell::new(Vec::new()),
+        pending_async: RefCell::new(0),
+        stalled_await: RefCell::new(None),
+    });
+    Ok(module)
+}
+
+/// The steps a synthetic module has **none** of, after a restore.
+///
+/// A synthetic module's steps are a host `fn` pointer, which a blob cannot name
+/// and another binary cannot honour, so the record carries none and
+/// `module_synthetic_evaluation` refuses an evaluation of a restored module
+/// before this is reached. It exists because the record's shape needs a `fn`,
+/// not because anything can run it.
+pub fn restored_synthetic_steps(
+    _context: crate::api::Context,
+    _module: crate::api::Module,
+) -> Result<crate::api::Local, JsError> {
+    Err(JsError::new(
+        ErrorKind::TypeError,
+        "a restored synthetic module has no evaluation steps".into(),
+    ))
+}
+
+/// Rebuild a synthetic module a snapshot carried: its name and its export names,
+/// and **no context**, because its evaluation steps were a host callback.
+///
+/// The exports' *values* need no work here: a synthetic module's
+/// `[[Environment]]` is one binding per export name, and the reader installs the
+/// environment the blob carried, so what `ResolveExport` answers and what an
+/// importer reads are the same record — which is what lets a restored
+/// `ext:core/ops` be imported from again.
+pub fn synthetic_module_restore(
+    _agent: &mut Agent,
+    realm: Handle<Realm>,
+    name: &JsString,
+    export_names: Vec<JsString>,
+) -> Result<Handle<SourceTextModule>, JsError> {
+    let module = Handle::new(SourceTextModule {
+        realm,
+        // An empty program, exactly as `synthetic_module_create` makes: a
+        // synthetic module has no statements.
+        code: parser::parse_module("")?,
+        source: JsString::from_utf8(""),
+        name: Some(name.clone()),
+        kind: ModuleKind::Js,
+        status: RefCell::new(ModuleStatus::Unlinked),
+        environment: RefCell::new(None),
+        namespace: RefCell::new(None),
+        requested_modules: Vec::new(),
+        import_entries: Vec::new(),
+        local_export_entries: Vec::new(),
+        indirect_export_entries: Vec::new(),
+        star_export_entries: Vec::new(),
+        top_level_capability: RefCell::new(None),
+        synthetic_result: RefCell::new(None),
+        synthetic: Some(SyntheticModule {
+            name: name.clone(),
+            export_names,
+            evaluation_steps: restored_synthetic_steps,
+            context: None,
         }),
         evaluation_error: RefCell::new(None),
         import_meta: RefCell::new(None),
@@ -2586,6 +2658,18 @@ fn synthetic_module_evaluation(
             .as_ref()
             .ok_or_else(|| JsError::new(ErrorKind::TypeError, "not a synthetic module".into()))?;
         (synthetic.evaluation_steps, synthetic.context)
+    };
+    // A restored synthetic module has no steps to run: its context — and through
+    // it the host callback the steps were — did not travel, so the bindings the
+    // blob carried are the module's state and evaluating it again would be the
+    // "looks working" this format refuses. The status is what the record says, so
+    // only a module the writer captured *un*evaluated reaches here, and it is
+    // refused rather than answered with bindings nothing will fill.
+    let Some(context) = context else {
+        return Err(JsError::new(
+            ErrorKind::TypeError,
+            "a restored synthetic module has no evaluation steps: it was captured in the state it is in".into(),
+        ));
     };
     module.status.replace(ModuleStatus::Evaluating);
     let answered = match evaluation_steps(context, crate::api::Module::from_handle(*module)) {

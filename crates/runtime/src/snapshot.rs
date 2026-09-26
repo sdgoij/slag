@@ -565,6 +565,9 @@ enum Record {
     Module {
         name: Option<Vec<u16>>,
         source: Vec<u16>,
+        /// The export names a synthetic module's host declared, `None` for a
+        /// source text module.
+        synthetic: Option<Vec<Vec<u16>>>,
         status: u8,
         environment: u32,
         error: u32,
@@ -3290,6 +3293,20 @@ fn write_module(
         None => body.push(0),
     }
     write_units(body, module.source.as_slice());
+    // A synthetic module's exports are its host's declaration, so they are
+    // written rather than left to be read out of the source — which for a
+    // synthetic module is empty, and a reader that compiled it would rebuild a
+    // module with no exports at all.
+    match &module.synthetic {
+        Some(synthetic) => {
+            body.push(1);
+            write_u32(body, synthetic.export_names.len() as u32);
+            for name in &synthetic.export_names {
+                write_units(body, name.as_slice());
+            }
+        }
+        None => body.push(0),
+    }
     body.push(module.status.borrow().byte());
     match *module.environment.borrow() {
         Some(environment) => write_u32(body, env_serial(realm, environment, serials)?),
@@ -4110,6 +4127,16 @@ fn read_record(reader: &mut Reader<'_>) -> Result<Record, DecodeError> {
                 None
             };
             let source = reader.units().ok_or(DecodeError::Truncated)?;
+            let synthetic = if reader.u8().ok_or(DecodeError::Truncated)? == 1 {
+                let count = reader.u32().ok_or(DecodeError::Truncated)? as usize;
+                let mut names = Vec::with_capacity(count.min(1024));
+                for _ in 0..count {
+                    names.push(reader.units().ok_or(DecodeError::Truncated)?);
+                }
+                Some(names)
+            } else {
+                None
+            };
             let status = reader.u8().ok_or(DecodeError::Truncated)?;
             if crate::module::ModuleStatus::from_byte(status).is_none() {
                 return Err(DecodeError::BadModuleStatus(status));
@@ -4119,6 +4146,7 @@ fn read_record(reader: &mut Reader<'_>) -> Result<Record, DecodeError> {
             Ok(Record::Module {
                 name,
                 source,
+                synthetic,
                 status,
                 environment,
                 error,
@@ -4901,6 +4929,7 @@ impl Builder<'_> {
             Record::Module {
                 name,
                 source,
+                synthetic,
                 status,
                 environment,
                 error,
@@ -4908,25 +4937,47 @@ impl Builder<'_> {
                 // Compiled in the reading realm, exactly as the engine's own module
                 // path does it: a bootstrap context makes the realm current, and the
                 // specifier the record did not keep is the name (a host re-registers
-                // a restored module under its own specifier in any case).
+                // a restored module under its own specifier in any case). A
+                // **synthetic** module is rebuilt as what it is instead — its export
+                // names are the record's, because its source is empty and compiling
+                // it would answer a module with no exports at all.
                 let realm = *self.realm;
-                let source = JsString::from_utf16(source);
                 let name = name.as_ref().map(|units| JsString::from_utf16(units));
-                let specifier = name.clone().unwrap_or_else(|| JsString::from_utf8(""));
-                self.agent.push_bootstrap_context(realm);
-                let compiled = crate::module::parse_module(
-                    self.agent,
-                    &specifier,
-                    name.as_ref(),
-                    &source,
-                    &[],
-                );
-                self.agent.execution_context_stack.pop();
-                let module = compiled.map_err(|error| {
-                    DecodeError::UnrebuildableFunction(format!(
-                        "its module source could not be compiled: {error}"
-                    ))
-                })?;
+                let module = match synthetic {
+                    Some(names) => {
+                        let specifier = name.clone().unwrap_or_else(|| JsString::from_utf8(""));
+                        let names = names
+                            .iter()
+                            .map(|units| JsString::from_utf16(units))
+                            .collect::<Vec<_>>();
+                        crate::module::synthetic_module_restore(
+                            self.agent, realm, &specifier, names,
+                        )
+                        .map_err(|error| {
+                            DecodeError::UnrebuildableFunction(format!(
+                                "its synthetic module could not be rebuilt: {error}"
+                            ))
+                        })?
+                    }
+                    None => {
+                        let source = JsString::from_utf16(source);
+                        let specifier = name.clone().unwrap_or_else(|| JsString::from_utf8(""));
+                        self.agent.push_bootstrap_context(realm);
+                        let compiled = crate::module::parse_module(
+                            self.agent,
+                            &specifier,
+                            name.as_ref(),
+                            &source,
+                            &[],
+                        );
+                        self.agent.execution_context_stack.pop();
+                        compiled.map_err(|error| {
+                            DecodeError::UnrebuildableFunction(format!(
+                                "its module source could not be compiled: {error}"
+                            ))
+                        })?
+                    }
+                };
                 // The state the module was captured in, which is what makes the
                 // rebuilt record the module the snapshot carried rather than a
                 // source that has not run. The environment comes first, as a shell:
@@ -7223,6 +7274,73 @@ mod tests {
             run_restored(&isolate, &realm, namespace, "restored.bump()").as_number(),
             Some(42.0),
             "including a function whose own environment is the module's"
+        );
+    }
+
+    /// A synthetic module comes back as a synthetic module: its export names are
+    /// the record's, so what it exports still resolves.
+    ///
+    /// This is the shape `deno test` needs — deno_core's `ext:core/ops` is a
+    /// synthetic module whose exports are the host's op functions — and before
+    /// this part the reader rebuilt it by compiling its empty source, which
+    /// answered a module with **no exports at all**: `Module ext:core/ops does
+    /// not export op_current_thread_cpu_usage`.
+    #[test]
+    fn a_synthetic_module_comes_back_with_its_exports() {
+        fn steps(
+            context: api::Context,
+            module: api::Module,
+        ) -> Result<api::Local, crux::error::JsError> {
+            let name = api::Local::string("op_probe");
+            module
+                .set_synthetic_module_export(&name, &api::Local::number(41.0))
+                .expect("set an export");
+            api::Promise::resolve(&context, &api::Local::undefined())
+        }
+
+        let mut isolate = api::Isolate::new();
+        let context = api::Context::new(&mut isolate).expect("a realm");
+        let realm = *context.realm();
+        let names = [api::Local::string("op_probe")];
+        let module = api::Module::create_synthetic_module(
+            &context,
+            &api::Local::string("ops"),
+            &names,
+            steps,
+        )
+        .expect("a synthetic module");
+        module.register(&context, "ops").expect("register");
+        module.instantiate(&context).expect("instantiate");
+        module.evaluate(&context).expect("evaluate");
+        assert_eq!(module.status(), api::ModuleStatus::Evaluated);
+
+        let items = [SnapshotItem::Module(module)];
+        let slots = [Slot {
+            index: 0,
+            realm,
+            items: &items,
+            realm_global: false,
+        }];
+        let blob = encode_slots(agent_of(&isolate), &slots, &[], None).expect("a blob");
+        let back = decode_slot(agent_mut(&isolate), &realm, &blob, 0, &[], None)
+            .expect("a blob of this tree")
+            .expect("slot 0");
+        let SnapshotItem::Module(restored) = back[0] else {
+            panic!("the module came back as a language value");
+        };
+        assert_eq!(
+            restored.status(),
+            api::ModuleStatus::Evaluated,
+            "the state it was captured in is the state it comes back in"
+        );
+        let namespace = restored
+            .namespace(&context)
+            .expect("namespace")
+            .into_value();
+        assert_eq!(
+            run_restored(&isolate, &realm, namespace, "restored.op_probe").as_number(),
+            Some(41.0),
+            "and the export the host declared is what an import of it reads"
         );
     }
 
