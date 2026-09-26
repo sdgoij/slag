@@ -19,6 +19,11 @@ path = "lib.rs"
 # actually shares a buffer.
 runtime = { path = "../runtime", default-features = false, features = ["workers"] }
 crux = { path = "../crux" }
+# Every isolate compiles, so the JIT is a dependency of the boundary rather than
+# a feature of it: V8 has no interpreted mode and a host cannot ask for one
+# (`rusty_v8` links a JIT unconditionally), so a build of this crate without it
+# would be a different engine wearing these names. See `.notes/embedding.md` §9.
+jit = { path = "../jit" }
 # For `fast_api::Flags`, which the crate we stand in for spells as a bitflags
 # type; it is already in the workspace's lock, so this adds no new download.
 bitflags = "2"

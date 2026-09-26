@@ -833,6 +833,16 @@ impl Isolate {
     /// isolate takes ownership of one, because every isolate here has one.
     pub(crate) fn with(params: CreateParams, creator: Option<SnapshotCreator>) -> OwnedIsolate {
         let mut engine = *api::Isolate::new();
+        // Every isolate this boundary makes compiles: V8 has no interpreted
+        // mode, so neither does the engine standing in for it, and a host never
+        // asks for this the way it never asks a `v8` crate for a JIT. A cache
+        // that cannot be created (an environment Cranelift cannot allocate code
+        // in) is therefore an environment the boundary cannot honour — the
+        // class of failure this crate panics for, and the reason the error is
+        // surfaced rather than dropped.
+        if let Err(error) = jit::install(engine.agent()) {
+            panic!("bridge: the JIT could not be installed: {error}");
+        }
         if let Some((initial, maximum)) = params.heap_limits {
             engine.set_heap_limits(initial, maximum);
         }
