@@ -364,6 +364,8 @@ pub enum DecodeError {
     UnknownIntrinsic(String),
     /// A function record's grammar byte is not one this format's.
     BadGrammar(u8),
+    /// A module record's status byte is not one this format's.
+    BadModuleStatus(u8),
     /// A blob carries a host callback and the load supplied no callbacks.
     NoHostCallback(usize),
     /// An environment record this version cannot rebuild: a kind byte that is
@@ -417,6 +419,12 @@ impl std::fmt::Display for DecodeError {
                 write!(
                     f,
                     "snapshot function grammar byte {byte} is not one of this format's"
+                )
+            }
+            Self::BadModuleStatus(byte) => {
+                write!(
+                    f,
+                    "snapshot module status byte {byte} is not one of this format's"
                 )
             }
             Self::NoHostCallback(index) => write!(
@@ -539,9 +547,17 @@ enum Record {
     },
     /// A module record: the name it was compiled under, when it had one, and the
     /// source text it is compiled from.
+    /// A module, which is not a language value: the name and source the
+    /// engine's own compile path rebuilds it from, the **status** it was
+    /// captured in, the [[Environment]] its bindings live in (`NO_REF` when it
+    /// has none, which is a module that was never linked), and its
+    /// [[EvaluationError]] if it has one (`NO_REF` otherwise).
     Module {
         name: Option<Vec<u16>>,
         source: Vec<u16>,
+        status: u8,
+        environment: u32,
+        error: u32,
     },
     /// An environment record a closure closed over: which of the two kinds it
     /// is, whether a capture read skips it, its outer link, its bindings, and —
@@ -816,9 +832,14 @@ pub fn encode_slots(
                     &mut objects,
                     &mut serials,
                 )?,
-                SnapshotItem::Module(module) => {
-                    visit_module(module.handle(), &mut objects, &mut serials)
-                }
+                SnapshotItem::Module(module) => visit_module(
+                    agent,
+                    externals,
+                    host,
+                    module.handle(),
+                    &mut objects,
+                    &mut serials,
+                )?,
             });
         }
         // The realm's global is visited after its items so a value a host
@@ -1005,6 +1026,13 @@ pub fn decode_slot(
     for serial in items {
         values.push(builder.materialize_item(serial)?);
     }
+    // Whatever the items left half-built: an environment shell is created by the
+    // record that names it (`settle_envs`' own invariant) and filled once its
+    // owner is recorded, and a module's environment is named by the module item
+    // rather than by a function — so the drain is owed here as well as after a
+    // function record, or a module whose only export is a value would come back
+    // with no bindings at all.
+    builder.settle_envs()?;
     Ok(Some(values))
 }
 
@@ -1388,27 +1416,48 @@ fn visit(
     Ok(serial)
 }
 
-/// Give a module its serial: one record, written and read as the source and name
-/// the engine's own compile path rebuilds it from.
+/// Give a module its serial, and walk what a restore needs beyond its text: the
+/// **environment** its bindings live in — so a module captured evaluated comes
+/// back with exports that resolve — and its evaluation error, if it has one.
 ///
 /// A module is deduplicated by its own identity — a host that attached the same
 /// record to two contexts gets one — because the walk's books are keyed by
-/// identity and a module is a heap box like any other. Nothing descends into it:
-/// what a module is *made of* that the language can reach (its namespace, its
-/// bindings) is not in the value graph, which is why this needs no children.
+/// identity and a module is a heap box like any other. Its [[Namespace]] is not
+/// walked: it is made on first access from the environment, so carrying the
+/// environment is what makes the namespace answer.
 fn visit_module(
+    agent: &Agent,
+    externals: &[usize],
+    host: Option<&dyn HostCallbacks>,
     module: Handle<crate::module::SourceTextModule>,
     objects: &mut Vec<Entry>,
     serials: &mut HashMap<Identity, u32>,
-) -> u32 {
+) -> Result<u32, Unsupported> {
     let key = Identity::Module(crux::handle::Handle::as_ptr(module) as usize as u64);
     if let Some(serial) = serials.get(&key) {
-        return *serial;
+        return Ok(*serial);
     }
     let serial = objects.len() as u32;
     serials.insert(key, serial);
     objects.push(Entry::Module(module));
-    serial
+    // The realm the module was compiled in is the one whose global environment
+    // its chain reaches, so it is the one the walk's elision must compare to.
+    let realm = module.realm;
+    if let Some(environment) = *module.environment.borrow() {
+        visit_env(
+            agent,
+            &realm,
+            externals,
+            host,
+            environment,
+            objects,
+            serials,
+        )?;
+    }
+    if let Some(error) = *module.evaluation_error.borrow() {
+        visit(agent, &realm, externals, host, error, objects, serials)?;
+    }
+    Ok(serial)
 }
 
 /// What an environment record contributes to a blob: the kind byte it is written
@@ -2809,10 +2858,7 @@ fn write_carried(
         Entry::Value(value, realm) => {
             write_record(agent, realm, externals, host, *value, serials, body)
         }
-        Entry::Module(module) => {
-            write_module(module, body);
-            Ok(())
-        }
+        Entry::Module(module) => write_module(module, &module.realm, serials, body),
         Entry::Env(env, realm) => write_env(realm, *env, serials, body),
     }
 }
@@ -2962,16 +3008,24 @@ fn binding_flags(binding: &Binding) -> u8 {
     flags
 }
 
-/// Write a module record: the name it was compiled under, when it has one, and
-/// the source text it is rebuilt from.
+/// Write a module record: the name it was compiled under when it has one, the
+/// source text it is rebuilt from, and the **state** it was captured in — its
+/// status, the [[Environment]] its bindings live in, and its
+/// [[EvaluationError]] if it has one.
 ///
-/// Those two facts are the whole of what the engine's own compile path needs —
-/// `parse_module` takes a specifier, a name and a source — so a restored module is
-/// the same module the snapshot carried, as far as anything the blob can hold is
-/// concerned. What is not carried is what a module *is* beyond its text: its link
-/// status, its bindings and its namespace, none of which is in the value graph
-/// (a host that attached a module reaches it as a handle, not as a value).
-fn write_module(module: &Handle<crate::module::SourceTextModule>, body: &mut Vec<u8>) {
+/// The name and the source are what the engine's own compile path needs —
+/// `parse_module` takes a specifier, a name and a source — and the state is what
+/// makes the rebuilt record the module the snapshot carried rather than a source
+/// that has not run: a module captured `Evaluated` comes back with the
+/// environment its exports live in, so its namespace answers and an import of it
+/// resolves. A module captured mid-link or mid-evaluation comes back that way
+/// too, which is the state V8's own snapshot restores.
+fn write_module(
+    module: &Handle<crate::module::SourceTextModule>,
+    realm: &Handle<Realm>,
+    serials: &HashMap<Identity, u32>,
+    body: &mut Vec<u8>,
+) -> Result<(), Unsupported> {
     body.push(REC_MODULE);
     match &module.name {
         Some(name) => {
@@ -2981,6 +3035,16 @@ fn write_module(module: &Handle<crate::module::SourceTextModule>, body: &mut Vec
         None => body.push(0),
     }
     write_units(body, module.source.as_slice());
+    body.push(module.status.borrow().byte());
+    match *module.environment.borrow() {
+        Some(environment) => write_u32(body, env_serial(realm, environment, serials)?),
+        None => write_u32(body, NO_REF),
+    }
+    match *module.evaluation_error.borrow() {
+        Some(error) => write_u32(body, serial_in(realm, serials, error)),
+        None => write_u32(body, NO_REF),
+    }
+    Ok(())
 }
 
 /// Write a JavaScript function as the source text it can be rebuilt from, its
@@ -3763,7 +3827,19 @@ fn read_record(reader: &mut Reader<'_>) -> Result<Record, DecodeError> {
                 None
             };
             let source = reader.units().ok_or(DecodeError::Truncated)?;
-            Ok(Record::Module { name, source })
+            let status = reader.u8().ok_or(DecodeError::Truncated)?;
+            if crate::module::ModuleStatus::from_byte(status).is_none() {
+                return Err(DecodeError::BadModuleStatus(status));
+            }
+            let environment = reader.u32().ok_or(DecodeError::Truncated)?;
+            let error = reader.u32().ok_or(DecodeError::Truncated)?;
+            Ok(Record::Module {
+                name,
+                source,
+                status,
+                environment,
+                error,
+            })
         }
         REC_CLASS_METHOD => {
             let class = reader.u32().ok_or(DecodeError::Truncated)?;
@@ -4441,7 +4517,13 @@ impl Builder<'_> {
                 }
                 Built::Value(Value::Function(function))
             }
-            Record::Module { name, source } => {
+            Record::Module {
+                name,
+                source,
+                status,
+                environment,
+                error,
+            } => {
                 // Compiled in the reading realm, exactly as the engine's own module
                 // path does it: a bootstrap context makes the realm current, and the
                 // specifier the record did not keep is the name (a host re-registers
@@ -4464,7 +4546,25 @@ impl Builder<'_> {
                         "its module source could not be compiled: {error}"
                     ))
                 })?;
+                // The state the module was captured in, which is what makes the
+                // rebuilt record the module the snapshot carried rather than a
+                // source that has not run. The environment comes first, as a shell:
+                // a binding that holds a module-scope function whose own
+                // environment is this very record then names the shell rather than
+                // starting a second build, and the drain at the end of the slot
+                // fills it.
                 self.remember(index, Built::Module(module));
+                if *environment != NO_REF {
+                    let built = self.env_ref(*environment)?;
+                    *module.environment.borrow_mut() = Some(built);
+                }
+                if *error != NO_REF {
+                    let thrown = self.materialize(*error)?;
+                    *module.evaluation_error.borrow_mut() = Some(thrown);
+                }
+                let status = crate::module::ModuleStatus::from_byte(*status)
+                    .ok_or(DecodeError::BadModuleStatus(*status))?;
+                *module.status.borrow_mut() = status;
                 Built::Module(module)
             }
             Record::ArrayBuffer {
@@ -4740,16 +4840,19 @@ impl Builder<'_> {
                 // The outer link first: an environment is a chain, and the link is
                 // materialized — as a shell of its own — before the record that
                 // names it exists. `NO_REF` is the realm's own global environment,
-                // which the reading realm has already rebuilt. A **module**'s outer
-                // *is* that environment (spec 16.2.1.5 builds a module environment
-                // over the global one), so it is named rather than left absent: a
-                // chain that ends in a bare `None` resolves a name globally, which
-                // is what a declarative record wants, but a module's `globalThis`
-                // lives on the global *object*, and that is only reached through the
-                // record.
+                // which the reading realm has already rebuilt, and it means that for
+                // **every** kind: the writer answers it when the outer *is*
+                // `realm.global_env`, and also when there is no outer — and a record
+                // with no outer can be none other than a chain detached from any
+                // realm (the global record's own declarative half, which is never
+                // carried). Turning it into `None` for anything but a module loses
+                // the global, and a chain that ends in `None` is not "a name
+                // resolves globally": `get_identifier_reference` answers
+                // `Unresolvable`, which is why a restored closure inside a wrapper
+                // (deno's `ext/web/02_event.js` is an IIFE) could not reach a global
+                // name at all.
                 let outer = match *outer {
-                    NO_REF if *kind == ENV_MODULE => Some(self.realm.global_env),
-                    NO_REF => None,
+                    NO_REF => Some(self.realm.global_env),
                     serial => Some(self.env_ref(serial)?),
                 };
                 let env = match *kind {
@@ -6615,6 +6718,107 @@ mod tests {
             SnapshotItem::Value(_) => panic!("the module came back as a language value"),
         }
         assert_eq!(item_value(back[1]).as_number(), Some(9.0));
+    }
+
+    /// A module keeps the state it was captured in, which is what makes the
+    /// rebuilt record the module the snapshot carried rather than a source that
+    /// has not run: its status, the environment its exports live in, and — read
+    /// through that environment — its namespace.
+    #[test]
+    fn an_evaluated_module_comes_back_evaluated() {
+        let mut isolate = api::Isolate::new();
+        let context = api::Context::new(&mut isolate).expect("a realm");
+        let realm = *context.realm();
+        let module = api::Module::compile(
+            &context,
+            "deno:kept",
+            "export const kept = 41; export function bump() { return kept + 1; }",
+        )
+        .expect("a module");
+        module.register(&context, "deno:kept").expect("register");
+        module.instantiate(&context).expect("instantiate");
+        module.evaluate(&context).expect("evaluate");
+        assert_eq!(module.status(), api::ModuleStatus::Evaluated);
+
+        let items = [SnapshotItem::Module(module)];
+        let slots = [Slot {
+            index: 0,
+            realm,
+            items: &items,
+            realm_global: false,
+        }];
+        let blob = encode_slots(agent_of(&isolate), &slots, &[], None).expect("a blob");
+        let back = decode_slot(agent_mut(&isolate), &realm, &blob, 0, &[], None)
+            .expect("a blob of this tree")
+            .expect("slot 0");
+        let SnapshotItem::Module(restored) = back[0] else {
+            panic!("the module came back as a language value");
+        };
+        assert_eq!(
+            restored.status(),
+            api::ModuleStatus::Evaluated,
+            "the module came back in the state it was captured in"
+        );
+        let namespace = restored
+            .namespace(&context)
+            .expect("namespace")
+            .into_value();
+        assert_eq!(
+            run_restored(&isolate, &realm, namespace, "restored.kept").as_number(),
+            Some(41.0),
+            "and its bindings are the ones its exports live in"
+        );
+        assert_eq!(
+            run_restored(&isolate, &realm, namespace, "restored.bump()").as_number(),
+            Some(42.0),
+            "including a function whose own environment is the module's"
+        );
+    }
+
+    /// A carried chain's outer written as `NO_REF` is the reading realm's global
+    /// environment, for a **function**'s environment as much as a module's.
+    ///
+    /// deno's `ext/web/02_event.js` is an IIFE, so its functions live in a
+    /// function environment whose outer is the global one; a reader that turned
+    /// that `NO_REF` into "no outer" left every global name unresolvable from
+    /// inside them, which surfaced as `ReferenceError: "undefined" is not
+    /// defined` when a carried `defineEventHandler`'s default parameter was
+    /// evaluated.
+    #[test]
+    fn a_global_name_resolves_from_inside_a_carried_wrapper() {
+        let mut isolate = api::Isolate::new();
+        let context = api::Context::new(&mut isolate).expect("a realm");
+        let realm = *context.realm();
+        let value = context
+            .try_eval(
+                "(() => (function () { const captured = 3; \
+                 return function probe(a = undefined) { return typeof Symbol + a + captured; }; })())()",
+            )
+            .expect("a function inside a wrapper")
+            .into_value();
+        let called = |value: Value| {
+            run_restored(
+                &isolate,
+                &realm,
+                value,
+                "(function () { try { return String(restored()); } catch (e) { return e.constructor.name + ': ' + e.message; } })()",
+            )
+            .as_string()
+            .map(|text| text.to_string_lossy())
+        };
+        // The same call before the snapshot, so the test cannot pass on a body
+        // that resolves nothing freshly.
+        assert_eq!(
+            called(value),
+            Some("functionundefined3".to_string()),
+            "the fresh function resolves a global and the wrapper's binding"
+        );
+        let back = round_trip(&isolate, &realm, value);
+        assert_eq!(
+            called(back),
+            Some("functionundefined3".to_string()),
+            "and the restored one reaches both through the chain it carries"
+        );
     }
 
     /// Each slot is written against its own realm, so two realms' `%Object.prototype%`

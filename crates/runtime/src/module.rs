@@ -65,6 +65,35 @@ pub enum ModuleStatus {
     Evaluated,
 }
 
+impl ModuleStatus {
+    /// The byte this status is written under, for the one writer that carries a
+    /// module's state across a snapshot. Every variant has one: a host may
+    /// snapshot a graph mid-link or mid-evaluation, and the state it captured is
+    /// the state a restore owes it.
+    pub fn byte(self) -> u8 {
+        match self {
+            ModuleStatus::Unlinked => 0,
+            ModuleStatus::Linking => 1,
+            ModuleStatus::Linked => 2,
+            ModuleStatus::Evaluating => 3,
+            ModuleStatus::EvaluatingAsync => 4,
+            ModuleStatus::Evaluated => 5,
+        }
+    }
+
+    pub fn from_byte(byte: u8) -> Option<Self> {
+        match byte {
+            0 => Some(ModuleStatus::Unlinked),
+            1 => Some(ModuleStatus::Linking),
+            2 => Some(ModuleStatus::Linked),
+            3 => Some(ModuleStatus::Evaluating),
+            4 => Some(ModuleStatus::EvaluatingAsync),
+            5 => Some(ModuleStatus::Evaluated),
+            _ => None,
+        }
+    }
+}
+
 /// An export entry (spec 16.2.1.18).
 #[derive(Debug, Clone)]
 pub struct ExportEntry {
