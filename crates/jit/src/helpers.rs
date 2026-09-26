@@ -10,8 +10,8 @@
 //! Every helper takes `vm` (the opaque pointer the caller passed to the JIT
 //! entry point) so the runtime implementation can reach the `Vm`/`Agent`.
 //! `op`/`inc`/`name` arguments are the raw discriminants of
-//! [`syntax::ast::BinaryOp`]/[`syntax::ast::UpdateOp`] / the `AtomId`, passed
-//! as `u64`.
+//! [`syntax::ast::BinaryOp`]/[`syntax::ast::UpdateOp`]/
+//! [`syntax::ast::UnaryOp`] / the `AtomId`, passed as `u64`.
 
 use std::os::raw::c_void;
 
@@ -22,6 +22,9 @@ use crux::Value;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Helper {
     BinarySlow,
+    /// Full unary-operator semantics (`eval_unary_value`) for the coercing
+    /// kinds (`+x`, `-x`, `~x`); `op` is a `UnaryOp` discriminant.
+    UnarySlow,
     ConcatStrings,
     BuilderBind,
     BuilderStore,
@@ -178,6 +181,7 @@ impl Helper {
     pub fn name(self) -> &'static str {
         match self {
             Helper::BinarySlow => "binary_slow",
+            Helper::UnarySlow => "unary_slow",
             Helper::ConcatStrings => "concat_strings",
             Helper::BuilderBind => "builder_bind",
             Helper::BuilderStore => "builder_store",
@@ -355,6 +359,10 @@ pub struct JitHelpers {
     /// Full binary-operator semantics (`apply_binary`): `op` is a
     /// `BinaryOp` discriminant. Returns the result value.
     pub binary_slow: Option<extern "C" fn(vm: *mut c_void, op: u64, a: u64, b: u64) -> u64>,
+    /// Full unary-operator semantics (`eval_unary_value`) for the coercing
+    /// kinds (`+x`, `-x`, `~x`): `op` is a `UnaryOp` discriminant. Returns the
+    /// result value.
+    pub unary_slow: Option<extern "C" fn(vm: *mut c_void, op: u64, value: u64) -> u64>,
     /// Cut 41: the string-string `Add` fast path — the compiled `Add`
     /// checked both operands' string tags, so the rope concat runs directly.
     /// Returns the concatenated value (0 when either operand is not a
@@ -772,6 +780,7 @@ impl JitHelpers {
     pub fn none() -> Self {
         Self {
             binary_slow: None,
+            unary_slow: None,
             concat_strings: None,
             builder_bind: None,
             builder_store: None,
@@ -907,6 +916,7 @@ impl JitHelpers {
     pub fn get(&self, helper: Helper) -> Option<u64> {
         match helper {
             Helper::BinarySlow => self.binary_slow.map(|f| f as usize as u64),
+            Helper::UnarySlow => self.unary_slow.map(|f| f as usize as u64),
             Helper::ConcatStrings => self.concat_strings.map(|f| f as usize as u64),
             Helper::BuilderBind => self.builder_bind.map(|f| f as usize as u64),
             Helper::BuilderStore => self.builder_store.map(|f| f as usize as u64),
@@ -1062,6 +1072,11 @@ impl JitHelpers {
 /// Returns `42` — proves `binary_slow` was called with the right ABI.
 pub extern "C" fn test_binary_slow(_vm: *mut c_void, _op: u64, _a: u64, _b: u64) -> u64 {
     Value::Number(42.0).bits()
+}
+
+/// Returns `-42` — proves `unary_slow` was called with the right ABI.
+pub extern "C" fn test_unary_slow(_vm: *mut c_void, _op: u64, _value: u64) -> u64 {
+    Value::Number(-42.0).bits()
 }
 
 /// Returns the left operand unchanged — proves `concat_strings` was called
@@ -1900,6 +1915,7 @@ mod tests {
         let none = JitHelpers::none();
         for h in [
             Helper::BinarySlow,
+            Helper::UnarySlow,
             Helper::RelationalSlow,
             Helper::UpdateValueSlow,
             Helper::ToBooleanSlow,
@@ -1929,6 +1945,7 @@ mod tests {
     #[test]
     fn helper_names_are_stable() {
         assert_eq!(Helper::BinarySlow.name(), "binary_slow");
+        assert_eq!(Helper::UnarySlow.name(), "unary_slow");
         assert_eq!(Helper::TdzError.name(), "tdz_error");
         assert_eq!(Helper::CallSlow.name(), "call_slow");
         assert_eq!(Helper::CallApply.name(), "call_apply");

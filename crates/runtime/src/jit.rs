@@ -29,7 +29,7 @@ use std::os::raw::c_void;
 
 use crux::Value;
 use crux::value::ValueKind;
-use syntax::ast::{AssignOp, BinaryOp, UpdateOp};
+use syntax::ast::{AssignOp, BinaryOp, UnaryOp, UpdateOp};
 
 use crate::agent::Agent;
 use crate::context::ReferenceBase;
@@ -429,6 +429,11 @@ pub struct JitSlowPaths {
     /// Full binary-operator semantics (`apply_binary`); `op` is a
     /// `BinaryOp` discriminant.
     pub binary_slow: extern "C" fn(ctx: *mut c_void, op: u64, a: u64, b: u64) -> u64,
+    /// Full unary-operator semantics (`eval_unary_value`) for the coercing
+    /// kinds (`+x`, `-x`, `~x`): they may call user code (`valueOf`/
+    /// `toString`) and may throw (a BigInt/Number mix), so the compiled code
+    /// routes them here; `op` is a `UnaryOp` discriminant.
+    pub unary_slow: extern "C" fn(ctx: *mut c_void, op: u64, value: u64) -> u64,
     /// Cut 41: the string-string `Add` fast path — the compiled `Add`
     /// checked both operands' string tags, so the rope concat runs directly
     /// (skipping `apply_binary`'s dispatch and number checks). Returns the
@@ -985,6 +990,7 @@ pub struct JitSlowPaths {
 /// The runtime's slow-path table, installed into every `JitHook`.
 pub static JIT_SLOW_PATHS: JitSlowPaths = JitSlowPaths {
     binary_slow,
+    unary_slow,
     concat_strings,
     builder_bind,
     builder_store,
@@ -1167,6 +1173,22 @@ const BINARY_OPS: [BinaryOp; 22] = [
     BinaryOp::BitOr,
 ];
 
+/// The `UnaryOp` variants in declaration order (a fieldless enum's
+/// discriminant is its index — guaranteed by the language). Only the
+/// coercing kinds and `Not` are ever emitted as a `Step::Unary`
+/// (`delete`/`void`/`typeof` lower to their own steps), but the table covers
+/// every variant so the helper mirrors the interpreter's error for a stray
+/// one.
+const UNARY_OPS: [UnaryOp; 7] = [
+    UnaryOp::Delete,
+    UnaryOp::Void,
+    UnaryOp::Typeof,
+    UnaryOp::Plus,
+    UnaryOp::Minus,
+    UnaryOp::BitNot,
+    UnaryOp::Not,
+];
+
 const UPDATE_OPS: [UpdateOp; 2] = [UpdateOp::Increment, UpdateOp::Decrement];
 
 /// The `AssignOp` variants in declaration order (a fieldless enum's
@@ -1212,6 +1234,21 @@ extern "C" fn binary_slow(ctx: *mut c_void, op: u64, a: u64, b: u64) -> u64 {
         .copied()
         .unwrap_or(BinaryOp::Add);
     match crate::expr::apply_binary(agent, op, &Value::from_bits(a), &Value::from_bits(b)) {
+        Ok(value) => value.bits(),
+        Err(error) => slow_error(ctx, error),
+    }
+}
+
+/// The coercing unary operators' full semantics (`eval_unary_value`):
+/// `+x`/`-x`/`~x` may call user code and may throw, so the compiled code
+/// routes them here. `!x` lowers inline (a truthiness test plus a select) and
+/// never reaches this helper; `delete`/`void`/`typeof` lower to their own
+/// steps, and the table fallback mirrors the interpreter's error for them.
+extern "C" fn unary_slow(ctx: *mut c_void, op: u64, value: u64) -> u64 {
+    let ctx = unsafe { ctx_of(ctx) };
+    let agent = unsafe { &mut *ctx.agent };
+    let op = UNARY_OPS.get(op as usize).copied().unwrap_or(UnaryOp::Not);
+    match crate::expr::eval_unary_value(agent, &op, Value::from_bits(value)) {
         Ok(value) => value.bits(),
         Err(error) => slow_error(ctx, error),
     }
@@ -5402,6 +5439,7 @@ mod tests {
         // helper, so a null here would silently drop bodies to the
         // interpreter).
         assert_ne!(JIT_SLOW_PATHS.binary_slow as usize, 0);
+        assert_ne!(JIT_SLOW_PATHS.unary_slow as usize, 0);
         assert_ne!(JIT_SLOW_PATHS.concat_strings as usize, 0);
         assert_ne!(JIT_SLOW_PATHS.relational_slow as usize, 0);
         assert_ne!(JIT_SLOW_PATHS.update_value_slow as usize, 0);
@@ -5485,6 +5523,10 @@ mod tests {
             UPDATE_OPS[UpdateOp::Decrement as usize],
             UpdateOp::Decrement
         );
+        assert_eq!(UNARY_OPS.len(), 7);
+        assert_eq!(UNARY_OPS[UnaryOp::Plus as usize], UnaryOp::Plus);
+        assert_eq!(UNARY_OPS[UnaryOp::BitNot as usize], UnaryOp::BitNot);
+        assert_eq!(UNARY_OPS[UnaryOp::Not as usize], UnaryOp::Not);
         assert_eq!(ASSIGN_OPS.len(), 16);
         assert_eq!(ASSIGN_OPS[AssignOp::Assign as usize], AssignOp::Assign);
         assert_eq!(

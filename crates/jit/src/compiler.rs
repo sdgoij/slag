@@ -51,7 +51,7 @@ use runtime::jit::{
     VM_FOR_OF_STACK_LEN_OFFSET, VM_IP_OFFSET, VM_LEXICAL_ENV_OFFSET, VM_PENDING_LEN_OFFSET,
     VM_TRY_STACK_CAP_OFFSET, VM_TRY_STACK_LEN_OFFSET, VM_TRY_STACK_PTR_OFFSET,
 };
-use syntax::ast::{AssignOp, BinaryOp, UpdateOp};
+use syntax::ast::{AssignOp, BinaryOp, UnaryOp, UpdateOp};
 use target_lexicon::PointerWidth;
 
 use crate::helpers::{Helper, JitHelpers};
@@ -4188,6 +4188,34 @@ impl<'a> Lowerer<'a> {
                 let lhs = self.pop();
                 let rhs = self.const_value(&Value::Number(*imm))?;
                 let res = self.emit_binary(*op, lhs, rhs)?;
+                self.push(res);
+                self.fall_through(index);
+            }
+            Step::Unary(op) => {
+                let value = self.pop();
+                let res = match op {
+                    // `!x` cannot call user code and cannot throw
+                    // (`ToBoolean`), so it lowers to the same truthiness test
+                    // `JumpIfFalse` uses plus a select between the two
+                    // Boolean tags — no slow-path call, no leaf-epoch bump.
+                    UnaryOp::Not => {
+                        let falsy = self.emit_truthiness(value)?;
+                        let t = self.builder.ins().iconst(types::I64, self.true_bits);
+                        let f = self.builder.ins().iconst(types::I64, self.false_bits);
+                        let is_falsy = self.builder.ins().icmp_imm_u(IntCC::Equal, falsy, 1);
+                        self.builder.ins().select(is_falsy, t, f)
+                    }
+                    // The coercing kinds (`+x`, `-x`, `~x`) may call user
+                    // code and may throw, so they take the interpreter's
+                    // `eval_unary_value` through `unary_slow`. `delete`/
+                    // `void`/`typeof` never reach this arm (`compile_expr`
+                    // lowers each to its own steps); the helper mirrors the
+                    // interpreter's error for a stray one.
+                    _ => {
+                        let op_imm = self.builder.ins().iconst(types::I64, *op as i64);
+                        self.call_slow(self.sig_get_name, Helper::UnarySlow, &[op_imm, value])?
+                    }
+                };
                 self.push(res);
                 self.fall_through(index);
             }

@@ -336,6 +336,7 @@ fn runtime_helpers() -> JitHelpers {
     let rt = &runtime::jit::JIT_SLOW_PATHS;
     JitHelpers {
         binary_slow: Some(rt.binary_slow),
+        unary_slow: Some(rt.unary_slow),
         concat_strings: Some(rt.concat_strings),
         builder_bind: Some(rt.builder_bind),
         builder_store: Some(rt.builder_store),
@@ -555,6 +556,7 @@ mod tests {
     fn helpers_all() -> JitHelpers {
         JitHelpers {
             binary_slow: Some(helpers::test_binary_slow),
+            unary_slow: Some(helpers::test_unary_slow),
             concat_strings: Some(helpers::test_concat_strings),
             builder_bind: Some(helpers::test_builder_bind),
             builder_store: Some(helpers::test_builder_store),
@@ -954,6 +956,76 @@ mod tests {
         );
         let compiled = engine.compile(&body, &helpers_all()).expect("lowers");
         assert_eq!(run(&compiled, 0), Value::Number(42.0).bits());
+    }
+
+    #[test]
+    fn slow_unary_uses_the_helper() {
+        // The coercing kinds (`+x`, `-x`, `~x`) route through `unary_slow`,
+        // whose test double returns -42.
+        let engine = JitEngine::new().expect("native isa");
+        for op in [
+            syntax::ast::UnaryOp::Plus,
+            syntax::ast::UnaryOp::Minus,
+            syntax::ast::UnaryOp::BitNot,
+        ] {
+            let body = make_body(
+                vec![
+                    Step::Push(Value::Number(1.0)),
+                    Step::Unary(op),
+                    Step::Return,
+                ],
+                0,
+            );
+            let compiled = engine.compile(&body, &helpers_all()).expect("lowers");
+            assert_eq!(run(&compiled, 0), Value::Number(-42.0).bits(), "{op:?}");
+        }
+    }
+
+    #[test]
+    fn coercing_unary_bails_without_the_helper() {
+        let engine = JitEngine::new().expect("native isa");
+        let body = make_body(
+            vec![
+                Step::Push(Value::Number(1.0)),
+                Step::Unary(syntax::ast::UnaryOp::Minus),
+                Step::Return,
+            ],
+            0,
+        );
+        assert!(engine.compile(&body, &helpers_none()).is_none());
+    }
+
+    #[test]
+    fn not_matches_the_interpreter() {
+        // `!x` is a truthiness test plus a select: every non-heap operand is
+        // covered by `emit_truthiness`'s inline path (a Number or one of the
+        // falsy/truthy tags), so only the Boolean tags and the bare frame
+        // move — a heap operand would take the `to_boolean_slow` double.
+        let engine = JitEngine::new().expect("native isa");
+        for (value, expected) in [
+            (Value::Undefined, true),
+            (Value::Null, true),
+            (Value::Boolean(false), true),
+            (Value::Number(0.0), true),
+            (Value::Number(f64::NAN), true),
+            (Value::Boolean(true), false),
+            (Value::Number(1.0), false),
+        ] {
+            let body = make_body(
+                vec![
+                    Step::Push(value),
+                    Step::Unary(syntax::ast::UnaryOp::Not),
+                    Step::Return,
+                ],
+                0,
+            );
+            let compiled = engine.compile(&body, &helpers_all()).expect("lowers");
+            assert_eq!(
+                run(&compiled, 0),
+                Value::Boolean(expected).bits(),
+                "expected !operand == {expected}"
+            );
+        }
     }
 
     #[test]
@@ -2207,6 +2279,51 @@ mod tests {
         );
         assert_eq!(value.as_number(), Some(40.0 * 100000.0 + 1.0 * 10.0));
         assert!(compiled >= 1, "{compiled} bodies");
+    }
+
+    #[test]
+    fn installed_jit_unary_operators_match_the_interpreter() {
+        // The coercing kinds (`+x`, `-x`, `~x`) route through the real
+        // `unary_slow` (the interpreter's `eval_unary_value`); `!x` lowers
+        // inline. Covered: the inline number path, a numeric-string `+`, a
+        // BigInt `-`/`~`, a `!` over a heap value (the `to_boolean_slow`
+        // path), and a `+` whose `valueOf`/`toString` both return objects
+        // (the TypeError rides the pending-error ABI and is caught in the
+        // loop).
+        let source = "function neg(n) { var s = 0; for (var i = 0; i < n; i++) { s += -i; } return s; }\n\
+                      function pos(n) { var s = 0; for (var i = 0; i < n; i++) { s += +('' + i); } return s; }\n\
+                      function bit(n) { var s = 0; for (var i = 0; i < n; i++) { s += ~i; } return s; }\n\
+                      function nots(n) { var s = 0; for (var i = 0; i < n; i++) { s += !i ? 1 : 0; s += !'' ? 10 : 0; s += !({}) ? 100 : 0; } return s; }\n\
+                      function big(n) { var b = 5n; var s = 0; for (var i = 0; i < n; i++) { s += Number(-b) + Number(~b); } return s; }\n\
+                      function err(n) { var o = { valueOf: function () { return {}; }, toString: function () { return {}; } }; var c = 0; for (var i = 0; i < n; i++) { try { +o; } catch (e) { c++; } } return c; }\n\
+                      neg(5) + pos(4) + bit(3) + nots(2) + big(1) + err(3);";
+        let interp = {
+            let mut agent = runtime::Agent::new();
+            agent.initialize_host_defined_realm().expect("realm");
+            agent.run_script(source).expect("interp runs")
+        };
+        let (value, compiled) = with_jit_agent(|agent| agent.run_script(source).expect("jit runs"));
+        assert_eq!(
+            value, interp,
+            "the unary lowering must match the interpreter"
+        );
+        assert!(compiled >= 1, "{compiled} bodies");
+    }
+
+    #[test]
+    fn installed_jit_compiles_a_loop_whose_only_odd_step_is_unary() {
+        // A script with no functions: its loop is the ONLY body the cache can
+        // compile, so a missing `Unary` arm leaves the count at 0 (the bail
+        // is sticky — the body never re-enters the JIT).
+        let source = "var s = 0; for (var i = 0; i < 8; i++) { s += -i; } s;";
+        let interp = {
+            let mut agent = runtime::Agent::new();
+            agent.initialize_host_defined_realm().expect("realm");
+            agent.run_script(source).expect("interp runs")
+        };
+        let (value, compiled) = with_jit_agent(|agent| agent.run_script(source).expect("jit runs"));
+        assert_eq!(value, interp, "the compiled unary loop must match");
+        assert_eq!(compiled, 1, "the script body itself must compile");
     }
 
     #[test]
