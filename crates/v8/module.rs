@@ -546,8 +546,9 @@ impl<'s> LocalHandle<'s, Module> {
     /// and registering what it returns. `Ok(false)` means the host refused a
     /// request, whose exception is the pending one.
     ///
-    /// Every request edge is asked about, as the crate we stand in for asks
-    /// about every edge; each module is walked once, so a cycle terminates.
+    /// Every request edge of an *uninstantiated* module is asked about, which is
+    /// the set V8 asks about too — a module the host already instantiated has no
+    /// edges left to resolve. Each module is walked once, so a cycle terminates.
     fn resolve_graph<'s2>(
         &self,
         scope: &PinScope<'s2, '_>,
@@ -559,6 +560,16 @@ impl<'s> LocalHandle<'s, Module> {
         let mut visited: Vec<api::Module> = vec![entry];
         let mut queue: Vec<api::Module> = vec![entry];
         while let Some(module) = queue.pop() {
+            // A module the host already instantiated is not one to ask about
+            // again: V8 only asks about the edges of modules it is *linking*,
+            // and deno_core drops a module's registered edges the moment it is
+            // instantiated (`drop_instantiated_requests`) — so a second ask is a
+            // question the host no longer has an answer for, and a host that says
+            // so loudly (deno asserts) is right to. Its dependencies are linked
+            // already, so the walk stops here.
+            if module.status() != api::ModuleStatus::Uninstantiated {
+                continue;
+            }
             let referrer = Local::<Module>::from_module(module);
             for request in module.requested_modules() {
                 let text = api::Local::string(request.specifier.clone());
@@ -1128,6 +1139,95 @@ mod tests {
                 Local::<Object>::try_from(module.get_module_namespace()).expect("namespace");
             let key = JsString::new(scope, "doubled").expect("string").into();
             assert_eq!(number_of(namespace.get(scope, key).expect("get")), 82.0);
+        });
+    }
+
+    thread_local! {
+        /// The dependency an entry's resolver answers with, after the test has
+        /// linked it itself: a `fn` item cannot capture, and the answer must be
+        /// the same record the host already instantiated.
+        static LINKED_DEPENDENCY: std::cell::RefCell<Option<Global<Module>>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    /// The resolver of an entry whose dependency the host has already linked: it
+    /// answers that dependency, and anything else means the walk descended past a
+    /// module whose own edges are linked — the question the crate we stand in for
+    /// never asks, because a host has dropped it by then.
+    fn resolve_to_the_linked_dependency<'s>(
+        context: Local<'s, Context>,
+        specifier: Local<'s, JsString>,
+        _attributes: Local<'s, FixedArray>,
+        _referrer: Local<'s, Module>,
+    ) -> Option<Local<'s, Module>> {
+        crate::callback_scope!(unsafe scope, context);
+        let asked: Local<'s, Value> = specifier.into();
+        assert_eq!(
+            asked.to_rust_string_lossy(scope),
+            "mid",
+            "a dependency already instantiated was asked about again"
+        );
+        LINKED_DEPENDENCY.with(|held| {
+            let module = held.borrow();
+            let module = module.as_ref().expect("the test installed the dependency");
+            Some(Local::new(scope, module.clone()))
+        })
+    }
+
+    /// A dependency the host has already instantiated is not walked into.
+    ///
+    /// `entry` imports `mid`, and `mid` was linked before `entry` — so `mid`'s own
+    /// import (`leaf`) is linked already and its request is gone. To descend into
+    /// `mid` and ask about `leaf` is to ask a question the host no longer has an
+    /// answer for, which is the shape of a deno_core `no registered import edge`
+    /// assert.
+    #[test]
+    fn an_already_instantiated_dependency_is_not_walked_into() {
+        in_context!(scope, {
+            let text = JsString::new(scope, "import { x } from 'leaf';\nexport const mid = 1;")
+                .expect("string");
+            let mut source = Source::new(text, None);
+            let mid = compile_module(scope, &mut source).expect("compile");
+            assert_eq!(
+                mid.instantiate_module(scope, resolve_by_compiling),
+                Some(true)
+            );
+            assert_eq!(mid.get_status(), ModuleStatus::Instantiated);
+            LINKED_DEPENDENCY.with(|held| *held.borrow_mut() = Some(Global::new(scope, mid)));
+
+            let text = JsString::new(scope, "import { mid } from 'mid';\nexport const entry = 2;")
+                .expect("string");
+            let mut source = Source::new(text, None);
+            let entry = compile_module(scope, &mut source).expect("compile");
+            assert_eq!(entry.get_status(), ModuleStatus::Uninstantiated);
+            assert_eq!(
+                entry.instantiate_module(scope, resolve_to_the_linked_dependency),
+                Some(true)
+            );
+            assert_eq!(entry.get_status(), ModuleStatus::Instantiated);
+
+            LINKED_DEPENDENCY.with(|held| *held.borrow_mut() = None);
+        });
+    }
+
+    /// Linking a module the host already linked asks it nothing: no request is
+    /// left to put, so the resolver must not be reached at all.
+    #[test]
+    fn linking_twice_asks_the_host_once() {
+        in_context!(scope, {
+            let text = JsString::new(scope, "import { x } from 'dep';\nexport const y = x;")
+                .expect("string");
+            let mut source = Source::new(text, None);
+            let module = compile_module(scope, &mut source).expect("compile");
+            assert_eq!(
+                module.instantiate_module(scope, resolve_by_compiling),
+                Some(true)
+            );
+            assert_eq!(
+                module.instantiate_module(scope, resolve_to_the_linked_dependency),
+                Some(true),
+                "a second link asks the host nothing"
+            );
         });
     }
 
