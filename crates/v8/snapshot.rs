@@ -36,9 +36,16 @@
 //!
 //! # Index conventions
 //!
-//! V8's, because the host this stands in for reads them back: context slot 0 is
-//! the default context, and `AddContext` answers 1, 2, ... for contexts added
-//! after it (V8's `kFirstAddtlContextIndex`). A context's own data starts at 0.
+//! V8's, because the host this stands in for reads them back: the *added*
+//! contexts own the index space, numbered from 0 in the order they were added,
+//! and `AddContext` answers the index it gave one. The default context — the one
+//! a deserialized isolate starts in — is **not** in that space: a host reaches it
+//! as the startup context, not by `Context::FromSnapshot`, so a blob carries its
+//! data at the reserved [`DEFAULT_CONTEXT_SLOT`]. `deno_core` is the shape this
+//! serves: an embedder's node:vm context takes 0 and its own main realm takes 1,
+//! and it reads the realm back with `from_snapshot(1)` before falling back to
+//! `from_snapshot(0)` ("embedder may have used 0th for something else"). A
+//! context's own data starts at 0.
 //! A blob records a slot for every context the creator knows, holding
 //! `undefined` for one that was never recorded, so a slot the host never used
 //! answers "the blob names no such context" rather than "that context was
@@ -143,13 +150,26 @@ pub enum FunctionCodeHandling {
 /// [`create_blob`](Self::create_blob) writes it. Recording is what keeps the
 /// indices a host stores true numbers: they are the positions it asked for, not
 /// invented ones.
+/// The slot a blob carries the default context's data at — the context a
+/// deserialized isolate starts in.
+///
+/// It is deliberately outside any index a host can name. V8's *added* contexts
+/// own the index space (0, 1, ...) and the default context is not one of them, so
+/// giving it slot 0 would collide with the first added context — which is exactly
+/// what deno's node:vm context is. The reserved slot keeps the default's attached
+/// data restorable by the bridge's own load without taking an index a host means;
+/// it is the largest index the blob's 32-bit slot field can carry, which no host
+/// reaches by adding contexts.
+pub(crate) const DEFAULT_CONTEXT_SLOT: usize = u32::MAX as usize;
+
 #[derive(Default)]
 pub(crate) struct SnapshotCreator {
-    /// The context a deserialized isolate starts in (slot 0).
+    /// The context a deserialized isolate starts in, carried at
+    /// [`DEFAULT_CONTEXT_SLOT`].
     default_context: Option<api::Context>,
-    /// The contexts added after the default one, in the order they were added:
-    /// slot 1, 2, ... — V8's `kFirstAddtlContextIndex`.
-    contexts: Vec<api::Context>,
+    /// The contexts added after it, each with the index `add_context` answered
+    /// and the blob carries it under: 0, 1, ...
+    contexts: Vec<(usize, api::Context)>,
     /// The data attached to each context, by the slot that context has in the
     /// blob, in the order it was attached: the index a restore hands each one
     /// back under.
@@ -213,12 +233,14 @@ impl SnapshotCreator {
     /// Record another context, answering the index it was given
     /// (v8::SnapshotCreator::AddContext).
     ///
-    /// The index is slot 1 for the first context added, as in V8: slot 0 is the
-    /// default context whether or not one was set, and the host this stands in
-    /// for reads its realm back out of slot 1.
+    /// The added contexts own the index space, from 0 in the order they are
+    /// added — which is what a host reads back with `Context::FromSnapshot`. The
+    /// default context is not in that space (see [`DEFAULT_CONTEXT_SLOT`]), so
+    /// setting one does not shift these indices.
     pub(crate) fn add_context(&mut self, context: api::Context) -> usize {
-        self.contexts.push(context);
-        self.contexts.len()
+        let index = self.contexts.len();
+        self.contexts.push((index, context));
+        index
     }
 
     /// Record data attached to `context`, answering the index it was given
@@ -255,28 +277,29 @@ impl SnapshotCreator {
     }
 
     /// The slot a context's data is carried in, if this snapshot carries it:
-    /// slot 0 for the default context, then the ones added after it.
+    /// [`DEFAULT_CONTEXT_SLOT`] for the default context, else the index
+    /// `add_context` answered for it.
     fn slot_of(&self, context: api::Context) -> Option<usize> {
         let key = context_identity(context);
         if self
             .default_context
             .is_some_and(|default| context_identity(default) == key)
         {
-            return Some(0);
+            return Some(DEFAULT_CONTEXT_SLOT);
         }
         self.contexts
             .iter()
-            .position(|added| context_identity(*added) == key)
-            .map(|position| position + 1)
+            .find(|(_, added)| context_identity(*added) == key)
+            .map(|(index, _)| *index)
     }
 
     /// Write the blob.
     ///
-    /// The graph is the context table: the default context's attached data at
-    /// slot 0, then each context added after it at the index `add_context`
-    /// answered. A value the engine cannot carry ends this with a panic naming
-    /// it — see the module docs for why that is the loudest message this
-    /// signature allows.
+    /// The graph is the context table: each added context at the index
+    /// `add_context` answered, and the default context (if one was set) at
+    /// [`DEFAULT_CONTEXT_SLOT`]. A value the engine cannot carry ends this with a
+    /// panic naming it — see the module docs for why that is the loudest message
+    /// this signature allows.
     pub(crate) fn create_blob(
         &mut self,
         function_code_handling: FunctionCodeHandling,
@@ -291,11 +314,14 @@ impl SnapshotCreator {
         );
         let mut slots: Vec<(usize, api::Context, Vec<format::SnapshotItem>)> = Vec::new();
         if let Some(default) = self.default_context {
-            slots.push((0, default, self.items_of(0)));
+            slots.push((
+                DEFAULT_CONTEXT_SLOT,
+                default,
+                self.items_of(DEFAULT_CONTEXT_SLOT),
+            ));
         }
-        for position in 0..self.contexts.len() {
-            let slot = position + 1;
-            slots.push((slot, self.contexts[position], self.items_of(slot)));
+        for (index, context) in &self.contexts {
+            slots.push((*index, *context, self.items_of(*index)));
         }
         let host = SnapshotCallbacks {
             callbacks,
@@ -548,6 +574,14 @@ impl SnapshotRestore {
         true
     }
 
+    /// Whether the blob's context table names `slot`, answered from the table
+    /// alone — no realm is made for it. `None` when the table cannot be walked
+    /// at all: the caller then makes the realm and lets [`Self::restore`] name
+    /// the real reason.
+    fn names_slot(&self, slot: usize) -> Option<bool> {
+        format::names_slot(self.blob.bytes(), slot).ok()
+    }
+
     /// The item at `index` of a restored context's data, taken.
     fn take(&mut self, context_identity: u64, index: usize) -> Option<Global<Data>> {
         self.items
@@ -555,6 +589,23 @@ impl SnapshotRestore {
             .get_mut(index)?
             .take()
     }
+}
+
+/// Whether the isolate's blob names `slot`, answered without making a realm —
+/// `false` for an isolate that booted from source, which has no blob to name
+/// one.
+///
+/// The restore is taken out and put back for the borrow, the way
+/// [`restore_context`] does it. A table that cannot be walked is answered
+/// `true`, so the realm is made and `restore` reports why rather than a corrupt
+/// blob reading as a missing slot.
+pub(crate) fn blob_names_slot(isolate: &mut Isolate, slot: usize) -> bool {
+    let Some(restore) = isolate.take_restore() else {
+        return false;
+    };
+    let present = restore.names_slot(slot);
+    isolate.put_restore(restore);
+    present.unwrap_or(true)
 }
 
 /// Restore the context at `slot` of the isolate's blob, answering whether the
@@ -647,7 +698,8 @@ mod tests {
     /// them: one scope, each index once. `None` is an index that is not there,
     /// or has already been read.
     fn data(isolate: &mut OwnedIsolate, count: usize) -> Vec<Option<f64>> {
-        let context = restored_context(isolate, 0).expect("the blob names slot 0");
+        let context = restored_context(isolate, DEFAULT_CONTEXT_SLOT)
+            .expect("the blob names the default context");
         crate::scope!(let scope, isolate);
         let context = context.open(scope);
         let scope = &mut crate::ContextScope::new(scope, context);
@@ -660,6 +712,35 @@ mod tests {
                     .map(|number| number.value())
             })
             .collect()
+    }
+
+    /// A slot the blob does not name is answered without making a realm. A realm
+    /// made and passed over is still registered on the isolate and still counts,
+    /// and more than one realm is what takes every call in the isolate off the
+    /// engine's fast path — so the probe itself is what has to be free.
+    #[test]
+    fn a_slot_the_blob_does_not_name_costs_no_realm() {
+        let mut isolate = isolate_from(numbers_blob(&[7.0]));
+        let realms = |isolate: &mut OwnedIsolate| {
+            crate::scope!(let scope, isolate);
+            scope.get_heap_statistics().number_of_native_contexts()
+        };
+
+        // The probe `deno_core` makes, twice: a slot below the one the blob
+        // carries and one above it.
+        assert!(restored_context(&mut isolate, 0).is_none());
+        let after_miss = realms(&mut isolate);
+        assert!(restored_context(&mut isolate, 5).is_none());
+        assert_eq!(realms(&mut isolate), after_miss, "a miss makes no realm");
+
+        // And the hit that follows still restores, in exactly one realm.
+        let _restored = restored_context(&mut isolate, DEFAULT_CONTEXT_SLOT)
+            .expect("the blob names the default context");
+        assert_eq!(
+            realms(&mut isolate),
+            after_miss + 1,
+            "the restored realm, and none from either miss"
+        );
     }
 
     /// Attached data is what a blob carries, and a restore hands it back at the
@@ -697,7 +778,8 @@ mod tests {
             .expect("a blob");
 
         let mut isolate = isolate_from(blob);
-        let context = restored_context(&mut isolate, 0).expect("the blob names slot 0");
+        let context = restored_context(&mut isolate, DEFAULT_CONTEXT_SLOT)
+            .expect("the blob names the default context");
         crate::scope!(let scope, &mut isolate);
         let context = context.open(scope);
         let scope = &mut crate::ContextScope::new(scope, context);
@@ -739,7 +821,8 @@ mod tests {
             .expect("a blob");
 
         let mut isolate = isolate_from(blob);
-        let context = restored_context(&mut isolate, 0).expect("the blob names slot 0");
+        let context = restored_context(&mut isolate, DEFAULT_CONTEXT_SLOT)
+            .expect("the blob names the default context");
         crate::scope!(let scope, &mut isolate);
         let context = context.open(scope);
         let scope = &mut crate::ContextScope::new(scope, context);
@@ -796,7 +879,8 @@ mod tests {
             .expect("a blob");
 
         let mut isolate = isolate_from(blob);
-        let context = restored_context(&mut isolate, 0).expect("the blob names slot 0");
+        let context = restored_context(&mut isolate, DEFAULT_CONTEXT_SLOT)
+            .expect("the blob names the default context");
         crate::scope!(let scope, &mut isolate);
         let context = context.open(scope);
         let scope = &mut crate::ContextScope::new(scope, context);
@@ -817,7 +901,8 @@ mod tests {
     #[test]
     fn an_index_is_read_once() {
         let mut isolate = isolate_from(numbers_blob(&[1.0]));
-        let context = restored_context(&mut isolate, 0).expect("the blob names slot 0");
+        let context = restored_context(&mut isolate, DEFAULT_CONTEXT_SLOT)
+            .expect("the blob names the default context");
         crate::scope!(let scope, &mut isolate);
         let context = context.open(scope);
         let scope = &mut crate::ContextScope::new(scope, context);
@@ -854,7 +939,7 @@ mod tests {
     #[test]
     fn an_isolate_without_a_blob_has_no_data() {
         let mut isolate = Isolate::new(crate::CreateParams::default());
-        assert!(restored_context(&mut isolate, 0).is_none());
+        assert!(restored_context(&mut isolate, DEFAULT_CONTEXT_SLOT).is_none());
         let context = fresh_context(&mut isolate);
         crate::scope!(let scope, &mut isolate);
         let context = context.open(scope);
@@ -878,7 +963,7 @@ mod tests {
         let v8_blob = StartupData::from(vec![0x21, 0x00, 0x00, 0x00, 0x42, 0x42]);
         assert!(!v8_blob.is_valid());
         let mut isolate = isolate_from(v8_blob);
-        assert!(restored_context(&mut isolate, 0).is_none());
+        assert!(restored_context(&mut isolate, DEFAULT_CONTEXT_SLOT).is_none());
         let context = fresh_context(&mut isolate);
         crate::scope!(let scope, &mut isolate);
         let context = context.open(scope);
@@ -912,7 +997,8 @@ mod tests {
             .expect("a blob");
 
         let mut isolate = isolate_from(blob);
-        let context = restored_context(&mut isolate, 0).expect("the blob names slot 0");
+        let context = restored_context(&mut isolate, DEFAULT_CONTEXT_SLOT)
+            .expect("the blob names the default context");
         crate::scope!(let scope, &mut isolate);
         let context = context.open(scope);
         let scope = &mut crate::ContextScope::new(scope, context);
@@ -948,7 +1034,8 @@ mod tests {
             .expect("a blob");
 
         let mut isolate = isolate_from(blob);
-        let context = restored_context(&mut isolate, 0).expect("the blob names slot 0");
+        let context = restored_context(&mut isolate, DEFAULT_CONTEXT_SLOT)
+            .expect("the blob names the default context");
         crate::scope!(let scope, &mut isolate);
         let context = context.open(scope);
         let scope = &mut crate::ContextScope::new(scope, context);
@@ -978,7 +1065,8 @@ mod tests {
             .expect("a blob");
 
         let mut isolate = isolate_from(blob);
-        let context = restored_context(&mut isolate, 0).expect("the blob names slot 0");
+        let context = restored_context(&mut isolate, DEFAULT_CONTEXT_SLOT)
+            .expect("the blob names the default context");
         crate::scope!(let scope, &mut isolate);
         let context = context.open(scope);
         let scope = &mut crate::ContextScope::new(scope, context);
@@ -1018,7 +1106,8 @@ mod tests {
             .expect("a blob");
 
         let mut isolate = isolate_from(blob);
-        let context = restored_context(&mut isolate, 0).expect("the blob names slot 0");
+        let context = restored_context(&mut isolate, DEFAULT_CONTEXT_SLOT)
+            .expect("the blob names the default context");
         crate::scope!(let scope, &mut isolate);
         let context = context.open(scope);
         let scope = &mut crate::ContextScope::new(scope, context);
@@ -1056,7 +1145,8 @@ mod tests {
             .expect("a blob");
 
         let mut isolate = isolate_from(blob);
-        let context = restored_context(&mut isolate, 0).expect("the blob names slot 0");
+        let context = restored_context(&mut isolate, DEFAULT_CONTEXT_SLOT)
+            .expect("the blob names the default context");
         crate::scope!(let scope, &mut isolate);
         let context = context.open(scope);
         let scope = &mut crate::ContextScope::new(scope, context);
@@ -1094,7 +1184,8 @@ mod tests {
             .expect("a blob");
 
         let mut isolate = isolate_from(blob);
-        let context = restored_context(&mut isolate, 0).expect("the blob names slot 0");
+        let context = restored_context(&mut isolate, DEFAULT_CONTEXT_SLOT)
+            .expect("the blob names the default context");
         crate::scope!(let scope, &mut isolate);
         let context = context.open(scope);
         let scope = &mut crate::ContextScope::new(scope, context);
@@ -1133,7 +1224,8 @@ mod tests {
             .expect("a blob");
 
         let mut isolate = isolate_from(blob);
-        let context = restored_context(&mut isolate, 0).expect("the blob names slot 0");
+        let context = restored_context(&mut isolate, DEFAULT_CONTEXT_SLOT)
+            .expect("the blob names the default context");
         crate::scope!(let scope, &mut isolate);
         let context = context.open(scope);
         let scope = &mut crate::ContextScope::new(scope, context);
@@ -1173,7 +1265,8 @@ mod tests {
             .expect("a blob");
 
         let mut isolate = isolate_from(blob);
-        let context = restored_context(&mut isolate, 0).expect("the blob names slot 0");
+        let context = restored_context(&mut isolate, DEFAULT_CONTEXT_SLOT)
+            .expect("the blob names the default context");
         crate::scope!(let scope, &mut isolate);
         let context = context.open(scope);
         let scope = &mut crate::ContextScope::new(scope, context);
@@ -1213,7 +1306,8 @@ mod tests {
             .expect("a blob");
 
         let mut isolate = isolate_from(blob);
-        let context = restored_context(&mut isolate, 0).expect("the blob names slot 0");
+        let context = restored_context(&mut isolate, DEFAULT_CONTEXT_SLOT)
+            .expect("the blob names the default context");
         crate::scope!(let scope, &mut isolate);
         let context = context.open(scope);
         let scope = &mut crate::ContextScope::new(scope, context);
@@ -1278,7 +1372,8 @@ mod tests {
             .expect("a blob");
 
         let mut isolate = isolate_from_with(blob, references);
-        let context = restored_context(&mut isolate, 0).expect("the blob names slot 0");
+        let context = restored_context(&mut isolate, DEFAULT_CONTEXT_SLOT)
+            .expect("the blob names the default context");
         crate::scope!(let scope, &mut isolate);
         let context = context.open(scope);
         let scope = &mut crate::ContextScope::new(scope, context);
@@ -1340,7 +1435,8 @@ mod tests {
         );
         {
             crate::scope!(let scope, &mut warm);
-            let context = Context::from_snapshot(scope, 0, Default::default()).expect("slot 0");
+            let context = Context::from_snapshot(scope, DEFAULT_CONTEXT_SLOT, Default::default())
+                .expect("the default context");
             let scope = &mut crate::ContextScope::new(scope, context);
             scope.set_default_context(context);
             let function = scope
@@ -1359,7 +1455,8 @@ mod tests {
         // And the second blob stands on its own: a fresh isolate boots from it
         // and the callback still answers what it was built with.
         let mut isolate = isolate_from_with(second, references);
-        let context = restored_context(&mut isolate, 0).expect("the second blob names slot 0");
+        let context = restored_context(&mut isolate, DEFAULT_CONTEXT_SLOT)
+            .expect("the second blob names the default context");
         crate::scope!(let scope, &mut isolate);
         let context = context.open(scope);
         let scope = &mut crate::ContextScope::new(scope, context);
@@ -1398,17 +1495,18 @@ mod tests {
         let _ = isolate.create_blob(FunctionCodeHandling::Keep);
     }
 
-    /// The slot convention is V8's — the first added context is slot 1 — and a
-    /// blob names every context the creator recorded, empty ones included.
+    /// The index convention is V8's — the *added* contexts own the index space,
+    /// from 0 — and a blob names every context the creator recorded, empty ones
+    /// included.
     #[test]
-    fn an_added_context_gets_slot_one() {
+    fn an_added_context_gets_slot_zero() {
         let mut isolate = Isolate::snapshot_creator(None, None);
         {
             crate::scope!(let scope, &mut isolate);
             let default = Context::new(scope, Default::default());
             let added = Context::new(scope, Default::default());
             scope.set_default_context(default);
-            assert_eq!(scope.add_context(added), 1);
+            assert_eq!(scope.add_context(added), 0);
             let first: Local<Value> = Number::new(scope, 1.0).into();
             scope.add_context_data(default, first);
         }
@@ -1420,17 +1518,18 @@ mod tests {
         assert_eq!(data(&mut isolate, 1), vec![Some(1.0)]);
         // The added context was recorded, so its slot is named: what it holds is
         // nothing, which is not the same as the blob not naming it.
-        assert!(restored_context(&mut isolate, 1).is_some());
+        assert!(restored_context(&mut isolate, 0).is_some());
         assert!(
-            restored_context(&mut isolate, 2).is_none(),
+            restored_context(&mut isolate, 1).is_none(),
             "a slot no context was recorded for"
         );
     }
 
     /// Data attached to a context the creator added comes back at that
-    /// context's slot, in its own realm. This is the shape `deno_core` builds: an
-    /// empty default context at slot 0 and its bootstrapped realm at slot 1,
-    /// with everything it attached on the realm.
+    /// context's index, in its own realm, and a slot no context was recorded for
+    /// answers `None`. This is the shape `deno_core` builds:
+    /// its bootstrapped realm as the added context at 0, with everything it
+    /// attached on the realm.
     #[test]
     fn an_added_context_carries_its_own_data() {
         let mut isolate = Isolate::snapshot_creator(None, None);
@@ -1439,7 +1538,7 @@ mod tests {
             let default = Context::new(scope, Default::default());
             let added = Context::new(scope, Default::default());
             scope.set_default_context(default);
-            assert_eq!(scope.add_context(added), 1);
+            assert_eq!(scope.add_context(added), 0);
             let zero: Local<Value> = Number::new(scope, 0.0).into();
             scope.add_context_data(default, zero);
             // A value built in the added context's realm, which is what a host's
@@ -1456,11 +1555,11 @@ mod tests {
         assert_eq!(
             data(&mut isolate, 1),
             vec![Some(0.0)],
-            "slot 0 is the default context's own data"
+            "the default context's own data"
         );
 
         let mut isolate = isolate_from(blob);
-        let context = restored_context(&mut isolate, 1).expect("the blob names slot 1");
+        let context = restored_context(&mut isolate, 0).expect("the blob names the added context");
         crate::scope!(let scope, &mut isolate);
         let context = context.open(scope);
         let scope = &mut crate::ContextScope::new(scope, context);
@@ -1542,7 +1641,8 @@ mod tests {
                 .snapshot_blob(blob)
                 .external_references(references(&[other, pointer])),
         );
-        let context = restored_context(&mut isolate, 0).expect("the blob names slot 0");
+        let context = restored_context(&mut isolate, DEFAULT_CONTEXT_SLOT)
+            .expect("the blob names the default context");
         crate::scope!(let scope, &mut isolate);
         let context = context.open(scope);
         let scope = &mut crate::ContextScope::new(scope, context);
@@ -1593,7 +1693,7 @@ mod tests {
 
         // Loaded with a table that never had the address the blob names.
         let mut isolate = Isolate::new(crate::CreateParams::default().snapshot_blob(blob));
-        let _ = restored_context(&mut isolate, 0);
+        let _ = restored_context(&mut isolate, DEFAULT_CONTEXT_SLOT);
     }
 
     /// The table form of the reference list a creator or an isolate takes.
@@ -1664,7 +1764,8 @@ mod tests {
             .expect("a blob");
 
         let mut isolate = isolate_from(blob);
-        let context = restored_context(&mut isolate, 0).expect("the blob names slot 0");
+        let context = restored_context(&mut isolate, DEFAULT_CONTEXT_SLOT)
+            .expect("the blob names the default context");
         let held = {
             crate::scope!(let scope, &mut isolate);
             let context = context.open(scope);

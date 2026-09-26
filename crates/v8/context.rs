@@ -134,10 +134,13 @@ impl Context {
     /// slot's attached data rooted in it, which the host then reads out through
     /// [`get_context_data_from_snapshot_once`]. A slot the blob does not name
     /// answers `None` — the same refusal the crate we stand in for makes with
-    /// an empty `MaybeLocal`, so a host takes its own other branch. The realm
-    /// which is passed over that way stays the isolate's current one, which is
-    /// the realm a host that asked for a slot its blob does not have would have
-    /// made anyway.
+    /// an empty `MaybeLocal`, so a host takes its own other branch. A slot the
+    /// blob does not name makes **no realm at all**: the table is asked before a
+    /// realm exists, because one made and then passed over is not free — every
+    /// realm is registered on the isolate, and `Agent::realm_count` is the gate
+    /// that decides whether a call anywhere in it takes the engine's fast path.
+    /// `deno_core` probes `from_snapshot(1)` before its `from_snapshot(0)`
+    /// fallback, so a probe that cost a realm would cost the whole isolate.
     ///
     /// A restored context gets what a new one gets — the engine's realm and the
     /// console `Context::new` installs — plus the blob's data: what the blob
@@ -151,6 +154,9 @@ impl Context {
         options: ContextOptions<'_>,
     ) -> Option<Local<'s, Context>> {
         let mut isolate = scope.isolate_ptr();
+        if !crate::snapshot::blob_names_slot(&mut isolate, context_snapshot_index) {
+            return None;
+        }
         let handle = Self::new(scope, options);
         let context = handle.context();
         if !crate::snapshot::restore_context(&mut isolate, context, context_snapshot_index) {

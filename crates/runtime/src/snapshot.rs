@@ -867,27 +867,20 @@ pub fn decode_slot(
     let (body_len, context_count) = header(bytes)?;
     let mut body = Reader::new(&bytes[HEADER_LEN..HEADER_LEN + body_len]);
 
-    let mut wanted: Option<(u32, Vec<u32>, Vec<CarriedBinding>)> = None;
+    let mut wanted: Option<SlotRow> = None;
     for _ in 0..context_count {
-        let index = body.u32().ok_or(DecodeError::Truncated)? as usize;
-        let count = body.u32().ok_or(DecodeError::Truncated)? as usize;
-        if count > body.bytes.len() {
-            return Err(DecodeError::Truncated);
-        }
-        let global = body.u32().ok_or(DecodeError::Truncated)?;
-        let mut items = Vec::with_capacity(count);
-        for _ in 0..count {
-            items.push(body.u32().ok_or(DecodeError::Truncated)?);
-        }
-        // Read for every row, not only the wanted one: the binding list is part
-        // of a row, so skipping it would leave the reader at the wrong offset
-        // for the next context.
-        let bindings = read_bindings(&mut body)?;
-        if index == slot {
-            wanted = Some((global, items, bindings));
+        let row = read_slot_row(&mut body)?;
+        if row.index == slot {
+            wanted = Some(row);
         }
     }
-    let Some((global, items, bindings)) = wanted else {
+    let Some(SlotRow {
+        global,
+        items,
+        bindings,
+        ..
+    }) = wanted
+    else {
         return Ok(None);
     };
 
@@ -929,6 +922,40 @@ pub fn decode_slot(
     Ok(Some(values))
 }
 
+/// One row of the context table: the slot a host gave the context, the serial of
+/// the realm's own global, the serials of the context's items, and the bindings
+/// the realm's global was given.
+struct SlotRow {
+    index: usize,
+    global: u32,
+    items: Vec<u32>,
+    bindings: Vec<CarriedBinding>,
+}
+
+/// Read one row of the context table, leaving `body` at the row after it.
+fn read_slot_row(body: &mut Reader<'_>) -> Result<SlotRow, DecodeError> {
+    let index = body.u32().ok_or(DecodeError::Truncated)? as usize;
+    let count = body.u32().ok_or(DecodeError::Truncated)? as usize;
+    if count > body.bytes.len() {
+        return Err(DecodeError::Truncated);
+    }
+    let global = body.u32().ok_or(DecodeError::Truncated)?;
+    let mut items = Vec::with_capacity(count);
+    for _ in 0..count {
+        items.push(body.u32().ok_or(DecodeError::Truncated)?);
+    }
+    // Read for every row, not only a wanted one: the binding list is part of a
+    // row, so skipping it would leave the reader at the wrong offset for the
+    // next context.
+    let bindings = read_bindings(body)?;
+    Ok(SlotRow {
+        index,
+        global,
+        items,
+        bindings,
+    })
+}
+
 /// Read a blob, answering the value at slot 0's index 0.
 ///
 /// The single-value form of [`decode_slot`], matching [`encode`].
@@ -954,6 +981,28 @@ pub fn decode(
 /// with `StartupData::IsValid`.
 pub fn is_valid(bytes: &[u8]) -> bool {
     header(bytes).is_ok()
+}
+
+/// Whether a blob's context table names `slot`: the header and the table,
+/// walked without a realm.
+///
+/// [`decode_slot`] needs a realm because it makes engine values in one. This
+/// answers the one question a host asks *before* it has a realm — whether a slot
+/// is there at all — because a host that probes a slot its blob does not name
+/// must not pay for a realm it will not use. The crate we stand in for answers
+/// the same probe with an empty `MaybeLocal` rather than a context.
+///
+/// A table this cannot walk is an error, not a `false`: the caller decides
+/// whether an unreadable blob means "no such slot" or the loud failure it is.
+pub fn names_slot(bytes: &[u8], slot: usize) -> Result<bool, DecodeError> {
+    let (body_len, context_count) = header(bytes)?;
+    let mut body = Reader::new(&bytes[HEADER_LEN..HEADER_LEN + body_len]);
+    for _ in 0..context_count {
+        if read_slot_row(&mut body)?.index == slot {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// Read and check the header, answering the body's length and how many contexts
