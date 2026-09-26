@@ -214,9 +214,18 @@ impl Module {
             module::ModuleStatus::Unlinked => ModuleStatus::Uninstantiated,
             module::ModuleStatus::Linking => ModuleStatus::Instantiating,
             module::ModuleStatus::Linked => ModuleStatus::Instantiated,
-            module::ModuleStatus::Evaluating | module::ModuleStatus::EvaluatingAsync => {
-                ModuleStatus::Evaluating
-            }
+            // V8's model, measured against a real one rather than read off the
+            // spec: `Module::Evaluate` hands back a promise and the module is
+            // `kEvaluated` from that moment, the pending work being the promise's.
+            // `vm.SourceTextModule#status` in Node reports `evaluated` while the
+            // body is still awaiting — an already-settled await, a timer, a stalled
+            // `new Promise(() => {})`, and a module still awaiting a pending
+            // *dependency* alike. So only the synchronous phase is `Evaluating`
+            // (V8's `kEvaluating`); a body that has suspended is `Evaluated`, and
+            // `has_top_level_await` / `stalled_top_level_await_modules` are how a
+            // host learns it is still running.
+            module::ModuleStatus::Evaluating => ModuleStatus::Evaluating,
+            module::ModuleStatus::EvaluatingAsync => ModuleStatus::Evaluated,
             module::ModuleStatus::Evaluated => ModuleStatus::Evaluated,
         }
     }
@@ -713,7 +722,12 @@ mod tests {
             Promise::state(&context, &promise).expect("state"),
             "pending"
         );
-        assert_eq!(dep.status(), ModuleStatus::Evaluating);
+        // The dependency's evaluation has begun and it is `Evaluated` even though
+        // its body is still awaiting: that is V8, measured — Node's
+        // `vm.SourceTextModule#status` reports `evaluated` for a module whose
+        // top-level await has not settled. What says it is still running is the
+        // pending promise, not the status.
+        assert_eq!(dep.status(), ModuleStatus::Evaluated);
         assert_eq!(main.status(), ModuleStatus::Instantiated);
     }
 

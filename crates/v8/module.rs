@@ -1268,7 +1268,12 @@ mod tests {
                 Local::<Promise>::try_from(value).expect("promise").state(),
                 PromiseState::Pending
             );
-            assert_eq!(module.get_status(), ModuleStatus::Evaluating);
+            // `Evaluated` even though the await will never settle: V8 reports a
+            // module whose body has suspended as `kEvaluated` (measured through
+            // Node's `vm.SourceTextModule#status`, which answers `evaluated` for
+            // this exact shape), and the pending promise plus the stalled-message
+            // walk below are what say it is still running.
+            assert_eq!(module.get_status(), ModuleStatus::Evaluated);
 
             let stalled = module.get_stalled_top_level_await_message(scope);
             assert_eq!(stalled.len(), 1);
