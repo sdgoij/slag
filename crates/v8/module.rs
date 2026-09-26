@@ -1291,6 +1291,80 @@ mod tests {
         });
     }
 
+    /// A closure defined at a module's top level closes over the **module
+    /// environment**, and the blob carries that record as what it is: the engine
+    /// builds a module's record from a declarative half and no module link
+    /// (`ModuleEnv`), so the kind byte is the whole of what is not the half. The
+    /// restored closure therefore still reads the module's own binding, and still
+    /// sees `this` as undefined rather than walking out to the global's.
+    #[test]
+    fn a_module_environments_bindings_travel_through_a_blob() {
+        let mut isolate = crate::Isolate::snapshot_creator(None, None);
+        {
+            crate::scope!(let scope, &mut isolate);
+            let context = crate::Context::new(scope, Default::default());
+            let scope = &mut crate::ContextScope::new(scope, context);
+            scope.set_default_context(context);
+            let realm = crate::realm_of(scope);
+            let module = api::Module::compile(
+                &realm,
+                "deno:core",
+                "let secret = 7; globalThis.__mark = 100; \
+                 globalThis.__read = () => globalThis.__mark + secret; \
+                 globalThis.__thisValue = () => this;",
+            )
+            .expect("compile");
+            let module = Local::<Module>::from_module(module);
+            assert_eq!(
+                module.instantiate_module(scope, resolve_by_compiling),
+                Some(true)
+            );
+            module.evaluate(scope).expect("evaluate");
+            let read = crate::test_support::eval(scope, "globalThis.__read");
+            scope.add_context_data(context, read);
+            let this_value = crate::test_support::eval(scope, "globalThis.__thisValue");
+            scope.add_context_data(context, this_value);
+        }
+        let blob = isolate
+            .create_blob(crate::FunctionCodeHandling::Keep)
+            .expect("a blob");
+
+        let mut isolate = crate::Isolate::new(crate::CreateParams::default().snapshot_blob(blob));
+        crate::scope!(let scope, &mut isolate);
+        let context = crate::Context::from_snapshot(
+            scope,
+            crate::snapshot::DEFAULT_CONTEXT_SLOT,
+            Default::default(),
+        )
+        .expect("the blob names the default context");
+        let scope = &mut crate::ContextScope::new(scope, context);
+        let read = scope
+            .get_context_data_from_snapshot_once::<crate::data::Value>(0)
+            .expect("the closure over the module's binding");
+        let this_value = scope
+            .get_context_data_from_snapshot_once::<crate::data::Value>(1)
+            .expect("the closure over `this`");
+        crate::test_support::bind(scope, "read", read);
+        crate::test_support::bind(scope, "thisValue", this_value);
+        assert_eq!(
+            crate::test_support::eval_number(scope, "read()"),
+            107.0,
+            "the module's own binding and the global object both came back"
+        );
+        // A module's code runs in a record whose `this` is undefined, and the kind
+        // byte is what says so: a declarative record has no this binding at all,
+        // so the lookup either walks out to the global's or fails to resolve.
+        assert_eq!(
+            crate::test_support::eval(
+                scope,
+                "(() => { try { return String(thisValue()); } catch (e) { return 'threw ' + e.name; } })()",
+            )
+            .to_rust_string_lossy(scope),
+            "undefined",
+            "the record is a module's, whose `this` is undefined"
+        );
+    }
+
     /// The message minted for a stalled top-level await answers the location V8
     /// fills in: the module's own name and the `await` its body is suspended at,
     /// where a message with no recorded position answers nothing.

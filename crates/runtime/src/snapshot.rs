@@ -103,7 +103,9 @@
 //!
 //! A closure's free names are resolved through the environment records it
 //! closed over, so those records travel with it. `REC_ENV` carries a
-//! **declarative** or **function** record — the outer link and the bindings —
+//! **declarative**, **function** or **module** record — the outer link and the
+//! bindings, and for the module record the kind alone, because the engine's own
+//! `ModuleEnv` is a declarative half with no module link —
 //! and, for a function record, the `this` value and this-binding status that
 //! decide whether the record has a `this` binding, beside the `[[FunctionObject]]`
 //! and `[[NewTarget]]` an arrow reads `super` and `new.target` through: the
@@ -166,7 +168,9 @@ use crux::value::{Value, ValueKind};
 
 use crate::agent::Agent;
 use crate::builtins::array_buffer::BufferState;
-use crate::env::{Binding, DeclarativeEnv, EnvRecord, EnvRef, FunctionEnv, ThisBindingStatus};
+use crate::env::{
+    Binding, DeclarativeEnv, EnvRecord, EnvRef, FunctionEnv, ModuleEnv, ThisBindingStatus,
+};
 use crate::realm::Realm;
 
 /// The blob's first eight bytes, and its last eight: a blob that lost its head
@@ -211,10 +215,14 @@ const REC_TYPED_ARRAY: u8 = 21;
 const BUFFER_RESIZABLE: u8 = 1;
 const BUFFER_IMMUTABLE: u8 = 2;
 
-/// Which environment record an `REC_ENV` record is. Only these two are
-/// carried; an object, module or global record is refused by [`visit_env`].
+/// Which environment record an `REC_ENV` record is. These three are carried; an
+/// object or global record is refused by [`visit_env`].
 const ENV_DECLARATIVE: u8 = 0;
 const ENV_FUNCTION: u8 = 1;
+/// A module's record. The engine builds it from a declarative half and keeps no
+/// module link in it ([`ModuleEnv`]), so the kind byte is what carries the one
+/// thing that is not the half: a module's `this` is undefined.
+const ENV_MODULE: u8 = 2;
 
 /// The environment's own flags: whether the record is transparent to the
 /// static context-chain walk (a per-iteration copy or a named function
@@ -1315,11 +1323,11 @@ struct CarriedEnvironment {
 /// the kind byte it is written under and the attributes a restore puts back — or
 /// the reason this format cannot carry it.
 ///
-/// A declarative record and a function record are the two a closure's names
-/// resolve through: a lookup walks the record's own binding list, so an object
-/// record (whose names live on a binding object), a module record (whose
-/// bindings are import indirections) and a global record (which the reading
-/// realm rebuilds) are refused by the kind they are.
+/// A declarative record, a function record and a module record are what a
+/// closure's names resolve through: a lookup walks the record's own binding
+/// list, and all three hold one. An object record (whose names live on a binding
+/// object) and a global record (which the reading realm rebuilds) are refused by
+/// the kind they are, as is a binding that resolves through another module.
 fn carried_environment(env: &EnvRef) -> Result<CarriedEnvironment, Unsupported> {
     let (kind, declarative) = match &**env {
         EnvRecord::Declarative(declarative) => (ENV_DECLARATIVE, declarative),
@@ -1330,12 +1338,7 @@ fn carried_environment(env: &EnvRef) -> Result<CarriedEnvironment, Unsupported> 
                 "its names live on a binding object, and a lookup here walks a record's own binding list",
             ));
         }
-        EnvRecord::Module(_) => {
-            return Err(Unsupported::new(
-                "a module environment",
-                "its bindings are import indirections the reading realm would have to have linked already",
-            ));
-        }
+        EnvRecord::Module(module) => (ENV_MODULE, &module.declarative),
         EnvRecord::Global(_) => {
             return Err(Unsupported::new(
                 "a global environment",
@@ -3183,7 +3186,7 @@ fn read_record(reader: &mut Reader<'_>) -> Result<Record, DecodeError> {
         }
         REC_ENV => {
             let kind = reader.u8().ok_or(DecodeError::Truncated)?;
-            if kind != ENV_DECLARATIVE && kind != ENV_FUNCTION {
+            if kind != ENV_DECLARATIVE && kind != ENV_FUNCTION && kind != ENV_MODULE {
                 return Err(DecodeError::UnrebuildableEnvironment(format!(
                     "environment kind byte {kind} is not one of this format's"
                 )));
@@ -3556,6 +3559,7 @@ impl Builder<'_> {
             let declarative = match &*env {
                 EnvRecord::Declarative(declarative) => declarative,
                 EnvRecord::Function(function) => &function.declarative,
+                EnvRecord::Module(module) => &module.declarative,
                 _ => {
                     return Err(DecodeError::UnrebuildableEnvironment(format!(
                         "serial {serial} names an environment record this format does not carry"
@@ -4077,8 +4081,15 @@ impl Builder<'_> {
                 // The outer link first: an environment is a chain, and the link is
                 // materialized — as a shell of its own — before the record that
                 // names it exists. `NO_REF` is the realm's own global environment,
-                // which the reading realm has already rebuilt.
+                // which the reading realm has already rebuilt. A **module**'s outer
+                // *is* that environment (spec 16.2.1.5 builds a module environment
+                // over the global one), so it is named rather than left absent: a
+                // chain that ends in a bare `None` resolves a name globally, which
+                // is what a declarative record wants, but a module's `globalThis`
+                // lives on the global *object*, and that is only reached through the
+                // record.
                 let outer = match *outer {
+                    NO_REF if *kind == ENV_MODULE => Some(self.realm.global_env),
                     NO_REF => None,
                     serial => Some(self.env_ref(serial)?),
                 };
@@ -4110,6 +4121,19 @@ impl Builder<'_> {
                             function.declarative.mark_context_transparent();
                         }
                         Handle::new(EnvRecord::Function(function))
+                    }
+                    ENV_MODULE => {
+                        // A module's record is a declarative half and a kind: the
+                        // engine keeps no module link in it (`ModuleEnv`), and the
+                        // declarations a closure over it resolves through are the
+                        // half's. What the kind buys is `this` — a module's is
+                        // undefined, where a declarative record has none at all and
+                        // would let a lookup walk out to the global's.
+                        let declarative = DeclarativeEnv::new(outer);
+                        if *transparent {
+                            declarative.mark_context_transparent();
+                        }
+                        Handle::new(EnvRecord::Module(ModuleEnv { declarative }))
                     }
                     other => {
                         return Err(DecodeError::UnrebuildableEnvironment(format!(
