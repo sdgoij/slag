@@ -1205,6 +1205,13 @@ pub fn private_set(
     };
     match element.kind {
         crux::object::PrivateElementKind::Field(_) => {
+            // A private field's value is an own slot like any other, so the
+            // write records the object: a young value stored into an object
+            // the collector has promoted must be remembered, or a minor sweeps
+            // it out from under the live object (the A2 verifier's miss).
+            // `private_element_add` does this on the install path; this one
+            // replaces an element in place and has to do it too.
+            crux::heap::write_barrier(&*receiver, value);
             let mut elements = receiver.private_elements.borrow_mut();
             if let Some(existing) = elements.iter_mut().find(|e| e.name_id == name_id) {
                 existing.kind = crux::object::PrivateElementKind::Field(value);
@@ -1355,6 +1362,34 @@ mod tests {
             new_private_name(name("#probe")).id >= reserved,
             "the next minted id is past every reserved one"
         );
+    }
+
+    /// A private field write is a store like any other: a young value written
+    /// into an object the collector has promoted must be recorded in the
+    /// remembered set, or a minor sweeps it out from under the live object.
+    /// The A2 write-barrier verifier (`verify_barrier`, on in debug) is what
+    /// catches the missing call, and this is the shape it fires on.
+    ///
+    /// Deliberately *not* the stress collector: a per-allocation collection
+    /// promotes the fresh value by its own allocation, so the store it exists
+    /// to find is `old -> old` and nothing is missed. The default nursery
+    /// beside two long allocation runs is what leaves the value young while
+    /// the box has been promoted.
+    #[test]
+    fn a_private_field_write_records_a_young_value_on_an_old_object() {
+        let mut agent = Agent::new();
+        agent.initialize_host_defined_realm().unwrap();
+        let value = agent
+            .run_script(
+                "class Box { #held = null; set(v) { this.#held = v; } get() { return this.#held; } } \
+                 const box = new Box(); \
+                 for (let i = 0; i < 200000; i++) { const junk = { i }; } \
+                 box.set({ tag: 42 }); \
+                 for (let i = 0; i < 200000; i++) { const junk = { i }; } \
+                 box.get().tag",
+            )
+            .unwrap_or_else(|e| panic!("private-field barrier: {:?} {e}", e.kind));
+        assert_eq!(value.as_number(), Some(42.0));
     }
 
     #[test]

@@ -903,6 +903,14 @@ fn merge_private_accessor(
     let Some(obj) = home_object(home) else {
         return Ok(());
     };
+    // The get/set a merge writes are heap edges into a *live* object — the
+    // constructor can have been promoted by a collection during the class
+    // body's own evaluation — so the write records it, exactly as
+    // `private_element_add` does for the install path.
+    let written: [Option<Value>; 2] = match &element.kind {
+        crux::object::PrivateElementKind::Accessor { get, set } => [*get, *set],
+        _ => [None, None],
+    };
     if let Some(existing) = obj
         .private_elements
         .borrow_mut()
@@ -918,6 +926,9 @@ fn merge_private_accessor(
             *existing_get = get;
         } else {
             *existing_set = set;
+        }
+        for value in written.into_iter().flatten() {
+            crux::heap::write_barrier(&*obj, value);
         }
     } else {
         obj.private_element_add(element)?;
