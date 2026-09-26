@@ -5067,6 +5067,14 @@ The three non-numbers: `Isolate::number_of_heap_spaces` is 0, consistently with 
 
 *Gates.* `cargo fmt --all -- --check` clean; `cargo clippy --locked --workspace --all-targets -- -D warnings` clean, and `cargo clippy -p v8 --features simdutf --all-targets -- -D warnings` with it; `cargo test --locked --workspace -- --skip function::tests::the_data_a_built_function_carries_a_collection` **5,474 passed / 0 failed** (up seven — this part's tests; `v8` **354**, `crux` 259, `runtime` 951, `ffi` 10, `slag` 4, `test262` 3324 with its two ignored); `cargo test -p runtime --no-default-features --lib` **920 passed / 0 failed**; `cargo check -p cli --no-default-features --features jit` green; `deno_core --lib` (release, `--test-threads=1`) holds at **453 passed / 6 failed / 2 ignored**, the same six out-of-scope cases. **No sweeps, and that is checked rather than argued**: the part touches `crates/v8` only, and `cargo tree --locked -p test262 -e normal` and the same for `wasmtest` both answer **0** for `v8 v150`.
 
+*An arrow that reads a private name — §9's bullet, named before the edit.* The frontier the last record named, and the last engine-side limit the CLI's blob exposed on the read path: `crates/v8/snapshot.rs:777` reported `snapshot function could not be rebuilt: its arrow source does not parse: SyntaxError: Private field access is only valid inside a class`. The write side carries an arrow as the expression it was written as, and the reader parses it in an object-literal method (`({ m() { return (<source>); } })`) because instantiating rather than evaluating is what keeps the `this` the arrow captured. A `#name` is in scope only inside a class body, and an object literal is not one — while an arrow has no `[[HomeObject]]` to name its class the way `class_member` does for a method. So the arrow's class is found from the environment it captured: the nearest function environment in the chain is the invocation the arrow was created in, and it names the class two ways — the function *is* a class constructor (an instance field initializer runs in a function environment whose `[[FunctionObject]]` is the constructor, `crates/runtime/src/function.rs:3506-3511`), or it is a method whose `[[HomeObject]]` names the class exactly as `class_member` demands. `class_member`'s own `(class, holder)` computation became `class_of_home`, shared by both. The class travels as **one extra `u32`** on the arrow's function record — a new `Carried::Arrow`, `NO_REF` for the arrows that resolve no private name, so the arrow grammar gains exactly one field and nothing else in the format moves — and the reader parses the expression inside a **class expression with a static field initializer** (`(class { #a; #b; static m = (<source>); })`), taking the arrow back out through `arrow_of` (`arrow_in_a_class_static_field`). The rebuilt arrow's `[[PrivateEnvironment]]` is then **re-pointed** at the carried class's own, which is sound rather than a trick: a private reference resolves by *description* from the running context's private environment at call time (`resolve_private_name`, reached from every `Step::GetPrivate`/`AssignPrivate`/`UpdatePrivate`/`PrivateIn`), and a call pushes that environment from `record.private_environment`, so the ids the wrapper's parse minted never have to be the class's — the class's are what its instances share, and they are what the call reads. The probe that §9 asked for first answered the one open question: an *instance field initializer* is not a homed closure at all (there is no function record), so the instance-homed `[[HomeObject]]` `class_member`'s object branch rejects cannot arise; a method arrow resolves the class through the method's home object, and a static field arrow through the static initializer's, whose home object is the class itself. The limit is stated rather than papered over: no object's `[[PrivateElements]]` travel today, so a restored arrow is correct against instances the *restored class* constructs after the load, not against a carried instance — which is why the carried arrow whose captured `this` is the instance is asserted at the load and at its source, while the shape whose captured `this` is the class (a static private name) is asserted by *calling* it.
+
+*Tests — three, and two of three mutations caught (the third is a finding).* `an_arrow_that_reads_a_private_name_round_trips_against_its_class` is the deno shape made callable: a class with `static #n = 7` and a static method returning `() => this.#n`, carried and called after the round trip, asserting `7` through the restored class and `() => this.#n` from `toString` (so the private name is in scope for the parse only, not for the answer). `an_arrow_in_an_instance_field_round_trips_and_answers_its_source` is the measured failure itself — `#n = 1; m = () => this.#n`, carried as `{ ctor, arrow: new C().m }` — and asserts the load now succeeds where it died, plus the source. `a_constructor_arrow_round_trips` is the other half of the deno shape (the closure written in the constructor body, so its environment chain leads to the constructor and the class is named by that constructor being a class constructor); the deno line's own `new Promise(...)` wrapper cannot be carried for an unrelated reason — a live promise's resolver is a built-in the blob cannot name — so the arrow is stored on the instance directly, and the test says so. Mutations, each run alone: making `private_arrow` answer `None` fails all three at `decode` with the *exact* measured message (`Private field access is only valid inside a class; not inside a method either`), which is the strongest form the diagnosis can take; removing the `[[PrivateEnvironment]]` re-point fails the call test at `left: None` (the arrow throws, and the test reads the thrown constructor's name); but **dropping the wrapper's `outer`-chain walk is caught by no test**, and that is the finding: the restored class's private environment has `outer: None` — `build_class_function` re-evaluates the class under `push_bootstrap_context`, which sets `private_environment: None` (`crates/runtime/src/agent.rs:1631`) — so the walk never sees an outer name, and the walk is kept as forward-correct (the declaration set is right the moment a class rebuild carries an outer link) with the comment saying it is defensive rather than measurable. A cross-class case cannot stand in for it either: a class body that reads an *outer* class's private name is refused by that class's own rebuild (`Private field must be declared in an enclosing class`) before the wrapper is built, so the walk is genuinely unreachable today, not merely untested.
+
+*The measurement: the load is past the arrow, and the next read-side limit is `import.meta`.* `cargo build -p deno` links a fresh `deno.exe` (283,183,104 bytes) with the working directory **inside `deno/`**, so `deno/.cargo/config.toml`'s `link-arg=/STACK:4194304` reaches both the snapshot build script and the exe — the `editbin` patch the last two records needed was **not** applied this time, and no patched binary is left behind. The disk ran to zero once (32 GB reclaimed by deleting both `target/debug/incremental` trees, the documented reclaim), and the build with `CARGO_INCREMENTAL=0` finished in 3m26s. `deno eval "console.log(1 + 2)"` now gets **past the arrow**: the loaded blob reads through every arrow record it holds, and the first value it cannot rebuild is a different one — `crates/v8/snapshot.rs:777` reports `snapshot function could not be rebuilt: its source does not parse as a function expression: SyntaxError: import.meta is not allowed in script code`. That is a function carried by its source text whose body reads `import.meta`, which only module code may; the plain function path parses in script context. It is the next part and it is on the read side, like this one.
+
+*Gates.* `cargo fmt --all -- --check` clean; `cargo clippy --locked --workspace --all-targets -- -D warnings` clean, and `cargo clippy -p v8 --features simdutf --all-targets -- -D warnings` with it; `cargo test --locked --workspace -- --skip function::tests::the_data_a_built_function_carries_a_collection` **5,477 passed / 0 failed** (up three — this part's tests; `v8` 354, `crux` 259, `runtime` **954**, `ffi` 10, `slag` 4, `test262` 3324 with its two ignored); `cargo test -p runtime --no-default-features --lib` **923 passed / 0 failed** (up three); `cargo check -p cli --no-default-features --features jit` green. **No sweeps, and that is checked rather than argued**: the change is `crates/runtime/src/snapshot.rs`, `grep` for `snapshot` over `crates/test262`, `crates/wasmtest` and `crates/cli` finds the module in no runner, and `cargo tree --locked -p test262 -e normal` and the same for `wasmtest` both answer **0** for `v8 v150`.
+
 ## 8. Parked: the C++ face
 
 A working C++ face was built (`v8.h` + `api.cc` + a compat program, all green)
@@ -9129,6 +9137,98 @@ migrate, then delete.
   aliases — the poison makes the escapes the type system cannot see loud, it does
   not replace the type system. Memory is bounded by the outermost scope's
   high-water mark, not by the isolate's lifetime.
+
+- **An arrow that reads a private name — named here before the edit, and it is the
+  frontier §7's flag-surface record named.** The CLI's own snapshot now reads as
+  far as its first *function* record it cannot rebuild: `crates/v8/snapshot.rs:777`
+  reports `snapshot function could not be rebuilt: its arrow source does not
+  parse: SyntaxError: Private field access is only valid inside a class`. The
+  write side carries a function's `[[SourceText]]` and a grammar byte
+  (`crates/runtime/src/snapshot.rs:282-291`), and an arrow is the one form the
+  restore *parses* rather than evaluates — wrapped as `({ m() { return (<source>);
+  } })` — because evaluating it would capture the reading realm's `this`. A
+  private name has no scope in that object literal, so the parse fails on the
+  first one it meets, and the shape is real in the snapshot's own JavaScript: an
+  arrow created inside a constructor or method that reads the class's private
+  fields (`deno/ext/web/06_streams.js:126`, `this.#promise = new Promise((resolve,
+  reject) => { this.#resolve = resolve; ... })`). The engine's own **method**
+  analogue is already solved: a method that resolves a private name is carried as
+  a *member of its class* (`Record::ClassMethod`, `class_member`), because a
+  `#name` belongs to one class declaration and only that declaration's evaluation
+  has the brand the graph's instances use. An arrow has no `[[HomeObject]]` —
+  which is exactly why `class_member` answers `None` for it and it falls through
+  to the source path — so the class must be identified another way, and the
+  arrow's private environment is the identity that names it: the class
+  constructor's own `EcmaFunction::private_environment` **is** the class body's
+  environment (`crates/runtime/src/class.rs:304-308`), so the write side reaches
+  the class from an arrow through one map of `private environment -> class
+  constructor` built as it walks, and the record carries that class beside the
+  source. The read side then parses the source in a wrapper that *has* the names
+  in scope — a synthetic class body declaring each of the carried class's private
+  names — and re-points the rebuilt arrow's `private_environment` at the class's
+  own, which is sound because a private reference resolves at *call* time through
+  the function's environment and not at parse time: the call's own
+  `ExecutionContext` carries `data.private_environment`
+  (`crates/runtime/src/context.rs:352-362`) and `private_get`/`private_set` take a
+  `name_id` from it. **The route the implementation takes, sharper than the map
+  above:** no scan and no map are needed, because the arrow's own captured
+  environment names the enclosing function — an `EnvRecord::Function` carries the
+  function object it belongs to (`Record::Env`'s `function_object`, the field an
+  arrow reads `super` and `new.target` through) — and from that function the class
+  falls out the way `class_member` already gets it: the constructor *is* the class
+  when the enclosing function is one, and otherwise the enclosing method's
+  [[HomeObject]] names it. The class is then carried as one more `u32` on the
+  arrow's function record, written where `Carried` puts a grammar's extra value
+  and read by the grammar-conditional block `REC_FUNCTION` already has (the arrow
+  grammar gains exactly one field, and nothing else in the format moves). The
+  reader's wrapper becomes a **class expression with a static field initializer**
+  (`(class { #a; #b; static m = (<source>); })`) rather than the object literal,
+  so the private names have a class body to be declared in while the arrow is
+  still only *parsed* and taken back out through the same `arrow_of` the object
+  literal took it out through; a name declared twice is a parse error, so the
+  declarations come from the class's private environment with its `outer` chain
+  walked and the descriptions de-duplicated. **One open question the
+  implementation must settle first, because it decides whether the route is
+  complete:** an *instance* field initializer's synthetic closure may be homed to
+  the instance rather than the class or its prototype, and `class_member`'s
+  object branch deliberately rejects a home object that is not the constructor's
+  own `prototype` — so an arrow in an instance-field initializer would still fall
+  through. The probe for it is cheap (does the enclosing function env hold a home
+  object at all, and what is it) and it must be answered before the write side's
+  trigger is declared done.
+  The rejected alternative is to parse under a synthetic brand
+  and leave it there: the arrow would come back callable and throw on its first
+  private access, which is the "looks working" hazard §9 refuses elsewhere.
+  **What this does not fix, and must be stated rather than papered over:** an
+  object's `[[PrivateElements]]` do not travel at all today — nothing in
+  `crates/runtime/src/snapshot.rs` carries a private element for any object (the
+  word appears there only in the class-member machinery and its tests) — so a
+  restored arrow is correct against instances the *restored class* constructs
+  after the load, and a *carried* instance still has no private slots for it to
+  read. That is a second part if a host needs it; this one's §7 record names
+  whether it moved the load past the arrow.
+
+**What the probe and the tests settled — added after the edit, so §9 matches the tree.**
+  The probe §9 asked for first answers cleanly: an instance *field* initializer is
+  **not** a homed closure at all — there is no function record, it runs in a
+  function environment whose `[[FunctionObject]]` is the class constructor
+  (`crates/runtime/src/function.rs:3506-3511`) — so the instance-homed
+  `[[HomeObject]]` `class_member`'s object branch rejects cannot arise from it; a
+  method arrow resolves the class through the method's home object, and a static
+  field arrow through the static initializer's, whose home object is the class.
+  Two mutations are caught by their own tests (the class not identified — which
+  reproduces the measured message exactly — and the `[[PrivateEnvironment]]`
+  re-point removed, caught by the one test that *calls* the restored arrow); the
+  third is **not**: the wrapper's `outer`-chain walk is unreachable, because a
+  restored class's private environment always has `outer: None`
+  (`build_class_function` re-evaluates under `push_bootstrap_context`, which sets
+  `private_environment: None`), so the walk never sees an outer name — and a class
+  body that reads an outer class's private name is refused by that class's own
+  rebuild first, so no test can isolate the walk. It is kept as forward-correct
+  (the declaration set is right the moment a class rebuild carries an outer
+  link), and its comment says it is defensive rather than measurable. The stated
+  limit stands as written: a restored arrow is correct against instances the
+  *restored class* constructs after the load, not against a carried one.
 
 ## 11. Working rules
 

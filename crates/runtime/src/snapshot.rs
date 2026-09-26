@@ -498,13 +498,15 @@ enum Record {
     External(u32),
     /// A function: which grammar its source is read in, that source, whether it
     /// is strict, the environment chain it closed over, its [[HomeObject]] when
-    /// the grammar is a method, and its object part.
+    /// the grammar is a method, the class an arrow's private names belong to when
+    /// the grammar is an arrow, and its object part.
     Function {
         grammar: Grammar,
         source: Vec<u16>,
         strict: bool,
         environment: u32,
         home: u32,
+        class: u32,
         heritage: u32,
         keys: Vec<u32>,
         proto: u32,
@@ -1349,6 +1351,26 @@ fn visit(
                             visit(agent, realm, externals, host, home, objects, serials)?;
                         }
                     }
+                    Callable::PrivateArrow {
+                        class, environment, ..
+                    } => {
+                        // The class is visited for the reason a class member's is:
+                        // the record names it, so a class this format cannot carry
+                        // has to refuse here. The chain is the scope the arrow
+                        // closed over, visited exactly as a plain arrow's.
+                        visit(agent, realm, externals, host, class, objects, serials)?;
+                        if let Some(environment) = environment {
+                            visit_env(
+                                agent,
+                                realm,
+                                externals,
+                                host,
+                                environment,
+                                objects,
+                                serials,
+                            )?;
+                        }
+                    }
                 }
                 for child in children(agent, &function.object)? {
                     visit(agent, realm, externals, host, child, objects, serials)?;
@@ -1677,6 +1699,22 @@ enum Callable<'a> {
         form: Form,
         home: Option<Value>,
     },
+    /// An arrow that reads a private name: the class whose declaration owns the
+    /// name, beside the expression it was written as and the scope it closed
+    /// over.
+    ///
+    /// An arrow has no [[HomeObject]], so it cannot be carried the way a method
+    /// is — but its source still cannot be parsed on its own, because a `#name`
+    /// is in scope only inside a class body. The record therefore names the
+    /// class, and the restore parses the expression in a class body that
+    /// declares the class's private names and re-points the rebuilt arrow at
+    /// that class's own private environment (see `build_private_arrow`).
+    PrivateArrow {
+        class: Value,
+        source: &'a JsString,
+        strict: bool,
+        environment: Option<EnvRef>,
+    },
 }
 
 /// Which grammar a function record's source is read in.
@@ -1875,6 +1913,20 @@ fn callable<'a>(
                 // parser can read, so it is carried the way a class is — evaluated
                 // where it is being restored. `[[ThisMode]]` is what says so: it
                 // is lexical for an arrow and for nothing else in this engine.
+                //
+                // An arrow that reads a private name is the one exception: its
+                // expression has no class body to give `#name` a scope, so it is
+                // carried as a member of the class the name belongs to instead
+                // (see `private_arrow`).
+                if let Some(class) = private_arrow(agent, data) {
+                    return Ok(Callable::PrivateArrow {
+                        class,
+                        source,
+                        strict: data.strict,
+                        environment: carriable_environment(realm, data.environment)
+                            .then_some(data.environment),
+                    });
+                }
                 Grammar::Arrow
             } else {
                 Grammar::Function
@@ -1934,37 +1986,7 @@ fn class_member(
         return None;
     }
     let home = data.home_object?;
-    let (class, holder) = match home.kind() {
-        ValueKind::Function(class_function) => {
-            if !is_class_constructor(agent, &class_function) {
-                return None;
-            }
-            (home, class_function.object)
-        }
-        ValueKind::Object(object) => {
-            let constructor = object
-                .get_own_property(&JsString::from_utf8("constructor"))
-                .ok()
-                .flatten()
-                .and_then(|property| property.value())?;
-            let class_function = constructor.as_function()?;
-            if !is_class_constructor(agent, &class_function) {
-                return None;
-            }
-            let prototype = class_function
-                .object
-                .get_own_property(&JsString::from_utf8("prototype"))
-                .ok()
-                .flatten()
-                .and_then(|property| property.value())
-                .and_then(|value| value.as_object())?;
-            if prototype.id() != object.id() {
-                return None;
-            }
-            (constructor, object)
-        }
-        _ => return None,
-    };
+    let (class, holder) = class_of_home(agent, home)?;
     // The member is found by identity rather than by name: which key a method was
     // defined under is exactly the key whose descriptor holds *this* function, and
     // a computed key is no harder to find than any other.
@@ -1993,6 +2015,90 @@ fn class_member(
         }
     }
     None
+}
+
+/// The class a [[HomeObject]] names, with the object the member was defined on —
+/// the class itself for a static member, and the class constructor's own
+/// `prototype` for an instance member.
+///
+/// The class is accepted only when the home object makes it certain: a static
+/// member's [[HomeObject]] is the class itself, and an instance member's is the
+/// class constructor's own `prototype`, compared **by identity** so that an
+/// ordinary object which merely carries a class as its `constructor` is not
+/// mistaken for a class prototype.
+fn class_of_home(agent: &Agent, home: Value) -> Option<(Value, Handle<JsObject>)> {
+    match home.kind() {
+        ValueKind::Function(class_function) => {
+            if !is_class_constructor(agent, &class_function) {
+                return None;
+            }
+            Some((home, class_function.object))
+        }
+        ValueKind::Object(object) => {
+            let constructor = object
+                .get_own_property(&JsString::from_utf8("constructor"))
+                .ok()
+                .flatten()
+                .and_then(|property| property.value())?;
+            let class_function = constructor.as_function()?;
+            if !is_class_constructor(agent, &class_function) {
+                return None;
+            }
+            let prototype = class_function
+                .object
+                .get_own_property(&JsString::from_utf8("prototype"))
+                .ok()
+                .flatten()
+                .and_then(|property| property.value())
+                .and_then(|value| value.as_object())?;
+            if prototype.id() != object.id() {
+                return None;
+            }
+            Some((constructor, object))
+        }
+        _ => None,
+    }
+}
+
+/// The class whose declaration owns the private names an **arrow** resolves, or
+/// `None` when the arrow resolves none or its class cannot be identified.
+///
+/// An arrow has no [[HomeObject]], so the identity that names its class is the
+/// environment it captured: the nearest function environment in that chain is
+/// the invocation the arrow was created in — a class **constructor** for an
+/// instance-field initializer or a method body, or the method itself, whose home
+/// object names the class. That is the same certainty `class_member` demands of
+/// a method, reached through the arrow instead of through a [[HomeObject]] the
+/// arrow does not have.
+fn private_arrow(agent: &Agent, data: &crate::function::EcmaFunction) -> Option<Value> {
+    let private = data.private_environment?;
+    if private.names.borrow().is_empty() {
+        return None;
+    }
+    let enclosing = enclosing_function(data.environment)?;
+    let enclosing_data = agent.ecma_functions.get(&enclosing.id())?;
+    if enclosing_data.is_class_constructor {
+        return Some(Value::Function(enclosing));
+    }
+    let home = enclosing_data.home_object?;
+    class_of_home(agent, home).map(|(class, _)| class)
+}
+
+/// The function a closure's captured chain was created in: the nearest
+/// `[[FunctionObject]]` in the chain, which is the function whose invocation the
+/// closure was written inside.
+///
+/// A chain that reaches the global without passing through a function — a
+/// class's `static {}` block, whose scope is declarative — has no such identity,
+/// and answers `None` rather than guessing one.
+fn enclosing_function(env: EnvRef) -> Option<Handle<Function>> {
+    let mut env = env;
+    loop {
+        if let EnvRecord::Function(function) = &*env {
+            return function.function_object.get().as_function();
+        }
+        env = env.outer()?;
+    }
 }
 
 /// The single method definition a parsed `(<source>)` or `({<source>})` holds.
@@ -2089,6 +2195,24 @@ fn arrow_in_a_method(program: &syntax::ast::Program) -> Option<ArrowParts<'_>> {
         return None;
     };
     arrow_of(expression)
+}
+
+/// The arrow a parsed `(class { <names>; static m = (<arrow source>); })` holds.
+///
+/// A `#name` is in scope only inside a class body, so an arrow that reads one has
+/// to be parsed with the names declared around it — the class expression's static
+/// field initializer is where the expression goes, and this is the way back out
+/// through that one field's initializer.
+fn arrow_in_a_class_static_field(program: &syntax::ast::Program) -> Option<ArrowParts<'_>> {
+    let class = class_expression(program)?;
+    class.elements.iter().find_map(|element| match element {
+        syntax::ast::ClassElement::Field {
+            is_static: true,
+            init: Some(init),
+            ..
+        } => arrow_of(init),
+        _ => None,
+    })
 }
 
 /// The class a parsed `(<class source>)` names, if that is what it is: the one
@@ -2473,12 +2597,14 @@ fn write_record(
                     environment,
                 } => {
                     // `carries_home` is what says whether this grammar has a
-                    // value beside the source at all — a plain function and an
-                    // arrow have none.
-                    let carried = if grammar.carries_home() {
-                        Carried::Home(home)
-                    } else {
-                        Carried::None
+                    // value beside the source at all — a plain function and a
+                    // class have none, a method has its [[HomeObject]], and an
+                    // arrow has the class its private names belong to, which is
+                    // `NO_REF` for the arrows that resolve none.
+                    let carried = match grammar {
+                        Grammar::Method => Carried::Home(home),
+                        Grammar::Arrow => Carried::Arrow(None),
+                        Grammar::Function | Grammar::Class => Carried::None,
                     };
                     write_function(
                         realm,
@@ -2492,6 +2618,22 @@ fn write_record(
                         body,
                     )?
                 }
+                Callable::PrivateArrow {
+                    class,
+                    source,
+                    strict,
+                    environment,
+                } => write_function(
+                    realm,
+                    &function,
+                    Grammar::Arrow,
+                    source,
+                    strict,
+                    environment,
+                    Carried::Arrow(Some(class)),
+                    serials,
+                    body,
+                )?,
                 Callable::Class {
                     source,
                     heritage,
@@ -2600,12 +2742,14 @@ fn write_object(
 /// The grammar-conditional values a function record carries beside its source.
 ///
 /// Which of them a record has is exactly what its grammar means: a method's
-/// `[[HomeObject]]`, which is the one value `super` resolves through, or a
-/// class's definition-time inputs, which are the values the rebuild must not
-/// re-evaluate.
+/// `[[HomeObject]]`, which is the one value `super` resolves through; an arrow's
+/// class, which is what gives the private names in its expression a body to be
+/// declared in; or a class's definition-time inputs, which are the values the
+/// rebuild must not re-evaluate.
 enum Carried<'a> {
     None,
     Home(Option<Value>),
+    Arrow(Option<Value>),
     Class {
         heritage: Option<Value>,
         keys: &'a [PropertyKey],
@@ -2839,6 +2983,12 @@ fn write_function(
             write_u32(
                 body,
                 home.map_or(NO_REF, |home| serial_in(realm, serials, home)),
+            );
+        }
+        Carried::Arrow(class) => {
+            write_u32(
+                body,
+                class.map_or(NO_REF, |class| serial_in(realm, serials, class)),
             );
         }
         Carried::Class { heritage, keys } => {
@@ -3373,6 +3523,15 @@ fn read_record(reader: &mut Reader<'_>) -> Result<Record, DecodeError> {
             } else {
                 NO_REF
             };
+            // An arrow's one grammar-conditional field: the class whose private
+            // names its expression resolves, or `NO_REF` for an arrow that
+            // resolves none — which is every arrow the format carried before this
+            // field existed.
+            let class = if grammar == Grammar::Arrow {
+                reader.u32().ok_or(DecodeError::Truncated)?
+            } else {
+                NO_REF
+            };
             let (heritage, keys) = if grammar == Grammar::Class {
                 let heritage = reader.u32().ok_or(DecodeError::Truncated)?;
                 let count = reader.u32().ok_or(DecodeError::Truncated)? as usize;
@@ -3394,6 +3553,7 @@ fn read_record(reader: &mut Reader<'_>) -> Result<Record, DecodeError> {
                 strict,
                 environment,
                 home,
+                class,
                 heritage,
                 keys,
                 proto,
@@ -4152,6 +4312,7 @@ impl Builder<'_> {
                 strict,
                 environment: environment_serial,
                 home,
+                class,
                 heritage,
                 keys,
                 proto,
@@ -4181,7 +4342,17 @@ impl Builder<'_> {
                         *environment_serial,
                     )?,
                     Grammar::Arrow => {
-                        self.build_arrow_function(source, *proto, *strict, *environment_serial)?
+                        if *class == NO_REF {
+                            self.build_arrow_function(source, *proto, *strict, *environment_serial)?
+                        } else {
+                            self.build_private_arrow(
+                                source,
+                                *class,
+                                *proto,
+                                *strict,
+                                *environment_serial,
+                            )?
+                        }
                     }
                 };
                 // A class's own evaluation made a `prototype` object whose members
@@ -4834,6 +5005,123 @@ impl Builder<'_> {
         })?;
         // The instantiation derives a prototype link of its own; the record's is
         // what the blob was written with, so it wins.
+        function
+            .object
+            .set_prototype_of(Some(proto))
+            .map_err(|error| {
+                DecodeError::UnrebuildableFunction(format!(
+                    "its prototype could not be set: {error}"
+                ))
+            })?;
+        Ok(function)
+    }
+
+    /// An arrow that reads a private name, rebuilt inside a class body that
+    /// declares the names it resolves.
+    ///
+    /// The class the record carries supplies both halves of what the plain arrow
+    /// path cannot: the names its expression needs in scope, and the private
+    /// environment the rebuilt arrow has to resolve them through. The wrapper is
+    /// a **class expression whose static field initializer is the arrow**, so the
+    /// names have a class body to be declared in, and the arrow is taken back out
+    /// of the parse rather than evaluated — evaluating the field would run the
+    /// expression against the wrapper's own `this`. The rebuilt arrow's
+    /// `[[PrivateEnvironment]]` is then re-pointed at the carried class's own: a
+    /// private reference resolves by description from the *running* environment
+    /// at call time (`resolve_private_name`), so the ids the wrapper's parse
+    /// minted never have to be the class's — the class's are what its instances
+    /// share, and they are what the call reads.
+    fn build_private_arrow(
+        &mut self,
+        source: &[u16],
+        class: u32,
+        proto: u32,
+        strict: bool,
+        environment: u32,
+    ) -> Result<Handle<Function>, DecodeError> {
+        let proto = self.prototype(proto)?.ok_or_else(|| {
+            DecodeError::UnrebuildableFunction("the record names no prototype".into())
+        })?;
+        let text = String::from_utf16(source).map_err(|_| {
+            DecodeError::UnrebuildableFunction("its arrow source is not valid UTF-16".into())
+        })?;
+        let class = self.materialize(class)?;
+        let ValueKind::Function(class_function) = class.kind() else {
+            return Err(DecodeError::UnrebuildableFunction(
+                "the class its private names belong to is not a function".into(),
+            ));
+        };
+        let private = self
+            .agent
+            .ecma_functions
+            .get(&class_function.id())
+            .and_then(|data| data.private_environment)
+            .ok_or_else(|| {
+                DecodeError::UnrebuildableFunction(
+                    "the class its private names belong to declares none".into(),
+                )
+            })?;
+        // Every name in the class's chain is declared, so the expression parses
+        // wherever a name it reads lives. The walk is defensive rather than
+        // measurable today: a class body that reads an *outer* class's private
+        // name is refused by that class's own rebuild before this wrapper is
+        // built (the format carries a class's own names only), so a name the
+        // class itself does not declare cannot reach the parse. A name declared
+        // twice is a parse error, so the descriptions are de-duplicated, and a
+        // name the arrow never reads is harmless.
+        let mut declarations = String::new();
+        let mut declared: Vec<JsString> = Vec::new();
+        let mut current = Some(private);
+        while let Some(env) = current {
+            for name in env.names.borrow().iter() {
+                if !declared.contains(&name.description) {
+                    declared.push(name.description.clone());
+                    declarations.push_str(&name.description.to_string_lossy());
+                    declarations.push(';');
+                }
+            }
+            current = env.outer;
+        }
+        let wrapped = format!("(class {{ {declarations} static m = ({text}); }})");
+        let program = parser::parse_script(&wrapped).map_err(|error| {
+            DecodeError::UnrebuildableFunction(format!("its arrow source does not parse: {error}"))
+        })?;
+        let (is_async, params, body, span) =
+            arrow_in_a_class_static_field(&program).ok_or_else(|| {
+                DecodeError::UnrebuildableFunction("its source is not one arrow expression".into())
+            })?;
+        let realm = *self.realm;
+        let environment = self.function_environment(environment)?;
+        self.agent.push_bootstrap_context(realm);
+        if let Some(context) = self.agent.execution_context_stack.last_mut() {
+            context.source = Some(JsString::from_utf8(&wrapped));
+        }
+        let value = crate::function::instantiate_arrow(
+            self.agent,
+            is_async,
+            params,
+            body,
+            environment,
+            strict,
+            Vec::new(),
+            Vec::new(),
+            span,
+        );
+        self.agent.execution_context_stack.pop();
+        let value = value.map_err(|error| {
+            DecodeError::UnrebuildableFunction(format!(
+                "its arrow source could not be instantiated: {error}"
+            ))
+        })?;
+        let function = value.as_function().ok_or_else(|| {
+            DecodeError::UnrebuildableFunction("its source did not make a function".into())
+        })?;
+        // The re-point that makes the rebuilt arrow resolve through the carried
+        // class: the wrapper's parse gave it a brand of its own, and the class's
+        // is the one its instances share.
+        if let Some(data) = self.agent.ecma_functions.get_mut(&function.id()) {
+            data.private_environment = Some(private);
+        }
         function
             .object
             .set_prototype_of(Some(proto))
@@ -8552,6 +8840,117 @@ mod tests {
             .map(|text| text.to_string_lossy()),
             Some("x1".to_string()),
             "`super` resolved through the prototype the graph holds"
+        );
+    }
+
+    /// The measured deno shape: an **arrow** that reads a private name
+    /// (`this.#promise = new Promise((resolve, reject) => { this.#resolve = ... })`).
+    /// Its expression cannot be rebuilt on its own — a `#name` is in scope only
+    /// inside a class body, and an arrow has no [[HomeObject]] to name the class —
+    /// so it is carried as a member of the class its captured environment leads
+    /// to, and the restore parses it inside a class body that declares those names
+    /// and re-points it at that class's own private environment.
+    ///
+    /// The static shape is the one where the restored arrow can be **called**: its
+    /// captured `this` is the class itself, which the record carries and the
+    /// restore rebuilds, and a static private field is re-added to it by the
+    /// class's own evaluation.
+    #[test]
+    fn an_arrow_that_reads_a_private_name_round_trips_against_its_class() {
+        let mut isolate = api::Isolate::new();
+        let context = api::Context::new(&mut isolate).expect("a realm");
+        let realm = *context.realm();
+        let value = context
+            .try_eval(
+                "(() => { class C { static #n = 7; static make() { return () => this.#n; } } \
+                 return { ctor: C, arrow: C.make() }; })()",
+            )
+            .expect("a class and an arrow over its static private name")
+            .into_value();
+
+        let back = round_trip(&isolate, &realm, value);
+        assert_eq!(
+            run_restored(
+                &isolate,
+                &realm,
+                back,
+                "(() => { try { return restored.arrow(); } \
+                 catch (e) { return e.constructor.name; } })()",
+            )
+            .as_number(),
+            Some(7.0),
+            "the restored arrow read the private name through the restored class"
+        );
+        // The private name is in scope for the parse only; the arrow still answers
+        // its own text rather than the class wrapper it was parsed inside.
+        assert_eq!(
+            run_restored(&isolate, &realm, back, "restored.arrow.toString()")
+                .as_string()
+                .map(|text| text.to_string_lossy()),
+            Some("() => this.#n".to_string()),
+            "the restored arrow answers its own source"
+        );
+    }
+
+    /// The instance-field half of the deno shape, where only the **load** is the
+    /// promise: an arrow in an instance field initializer closes over the
+    /// instance, and the format carries no `[[PrivateElements]]` for a carried
+    /// object — so the restored arrow is correct against instances the restored
+    /// class constructs *after* the load, not against a carried one. What this
+    /// asserts is that the snapshot no longer **refuses** it: before this, the
+    /// load died with `Private field access is only valid inside a class`.
+    #[test]
+    fn an_arrow_in_an_instance_field_round_trips_and_answers_its_source() {
+        let mut isolate = api::Isolate::new();
+        let context = api::Context::new(&mut isolate).expect("a realm");
+        let realm = *context.realm();
+        let value = context
+            .try_eval(
+                "(() => { class C { #n = 1; m = () => this.#n; } \
+                 return { ctor: C, arrow: new C().m }; })()",
+            )
+            .expect("an instance field arrow")
+            .into_value();
+
+        let back = round_trip(&isolate, &realm, value);
+        assert_eq!(
+            run_restored(&isolate, &realm, back, "restored.arrow.toString()")
+                .as_string()
+                .map(|text| text.to_string_lossy()),
+            Some("() => this.#n".to_string()),
+            "the restored arrow answers its own source"
+        );
+    }
+
+    /// The arrow a constructor creates, the other half of the deno shape: the
+    /// closure is written in the constructor body, so the environment its chain
+    /// leads to is the constructor's — and the class it is attributed to is named
+    /// by that constructor being a class constructor.
+    ///
+    /// (The deno line itself wraps the arrow in `new Promise(...)`; a live promise
+    /// is refused for an unrelated reason — its resolver is a built-in the blob
+    /// cannot name — so the arrow is stored on the instance directly here.)
+    #[test]
+    fn a_constructor_arrow_round_trips() {
+        let mut isolate = api::Isolate::new();
+        let context = api::Context::new(&mut isolate).expect("a realm");
+        let realm = *context.realm();
+        let value = context
+            .try_eval(
+                "(() => { class C { #n = 1; read; \
+                 constructor() { this.read = () => this.#n; } } \
+                 return { ctor: C, c: new C() }; })()",
+            )
+            .expect("a constructor-created arrow")
+            .into_value();
+
+        let back = round_trip(&isolate, &realm, value);
+        assert_eq!(
+            run_restored(&isolate, &realm, back, "restored.c.read.toString()")
+                .as_string()
+                .map(|text| text.to_string_lossy()),
+            Some("() => this.#n".to_string()),
+            "the constructor's arrow came back and answers its own source"
         );
     }
 
