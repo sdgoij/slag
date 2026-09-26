@@ -515,6 +515,7 @@ const TEMPLATE_DATA: &str = "data";
 const TEMPLATE_LENGTH: &str = "length";
 const TEMPLATE_CONSTRUCTIBLE: &str = "constructible";
 const TEMPLATE_NAME: &str = "name";
+const TEMPLATE_PARENT: &str = "parent";
 
 /// The pointer an `External` value carries, or `None` for a value that is not
 /// one — which is how this bridge recognizes its own template handles, whose
@@ -558,7 +559,28 @@ pub(crate) fn template_record<'s>(
     // SAFETY: `owns_template` said this isolate holds a template at the address,
     // and the isolate outlives every handle on it.
     let template = unsafe { &*(pointer as *const api::FunctionTemplate) };
-    let (callback, attached) = isolate.template_parts(pointer as usize)?;
+    let record = template_record_of(isolate, context, pointer as usize, template)?;
+    Some(Local::from_engine(record))
+}
+
+/// The record for one template, by the address its handle names — the recursion
+/// [`template_record`] starts, and the one a template's parent goes through.
+///
+/// The record object is made and remembered **before** its properties are filled,
+/// so a template that inherits from one already being written — or from itself —
+/// names the record under construction. One object per template is what the load
+/// needs to come back with one template per record: the engine writes a value
+/// once, so the object two children name is the object they share.
+fn template_record_of(
+    isolate: &Isolate,
+    context: api::Context,
+    address: usize,
+    template: &api::FunctionTemplate,
+) -> Option<api::Local> {
+    let identity = context_identity(context);
+    if let Some(record) = isolate.template_record_for(identity, address) {
+        return Some(record.engine_value());
+    }
     if template.property_count() != 0 {
         panic!(
             "v8::Isolate::AddContextData: this function template cannot be carried yet: a property of its own"
@@ -569,12 +591,13 @@ pub(crate) fn template_record<'s>(
             "v8::Isolate::AddContextData: this function template cannot be carried yet: an instance or prototype template"
         );
     }
-    if template.has_parent() {
-        panic!(
-            "v8::Isolate::AddContextData: this function template cannot be carried yet: a template it inherits from"
-        );
-    }
+    let (callback, attached) = isolate.template_parts(address)?;
     let record = api::Object::new(&context).expect("bridge: a template record object");
+    isolate.remember_template_record(
+        identity,
+        address,
+        Global::new(isolate, Local::<Data>::from_engine(record)),
+    );
     let set = |key: &str, value: api::Local| {
         api::Object::set(&context, &record, key, &value, false)
             .expect("bridge: a template record property");
@@ -600,7 +623,11 @@ pub(crate) fn template_record<'s>(
     if let Some(name) = template.class_name() {
         set(TEMPLATE_NAME, api::Local::string(name));
     }
-    Some(Local::from_engine(record))
+    if let Some(parent) = template.parent() {
+        let parent = template_record_of(isolate, context, Rc::as_ptr(&parent) as usize, &parent)?;
+        set(TEMPLATE_PARENT, parent);
+    }
+    Some(record)
 }
 
 /// The function template a record names, taken under this isolate — or `None` for
@@ -616,26 +643,50 @@ fn template_from_record(
     isolate: &mut Isolate,
     context: api::Context,
     value: crux::value::Value,
+    rebuilt: &mut HashMap<u64, Rc<api::FunctionTemplate>>,
 ) -> Option<api::Local> {
     let value = api::Local::from(value);
     if !api::Object::has_own_key(&context, &value, &api::Local::string(TEMPLATE_RECORD)).ok()? {
         return None;
     }
-    let callback = api::Object::get(&context, &value, TEMPLATE_CALLBACK).ok()?;
+    let template = rebuild_template(isolate, context, &value, rebuilt)?;
+    Some(api::Local::from(crux::value::Value::Object(
+        crux::object::JsObject::external_object_create(Rc::as_ptr(&template) as usize, None),
+    )))
+}
+
+/// The template one record is, made **once per record**: the recursion a template's
+/// parent goes through, and what makes two children that named one record share the
+/// parent they come back with.
+///
+/// The made template is remembered before its parent is taken, so a chain that
+/// comes back to this record — a template that inherits from itself — names this
+/// template rather than starting a second one.
+fn rebuild_template(
+    isolate: &mut Isolate,
+    context: api::Context,
+    record: &api::Local,
+    rebuilt: &mut HashMap<u64, Rc<api::FunctionTemplate>>,
+) -> Option<Rc<api::FunctionTemplate>> {
+    let identity = record.value().as_object()?.id();
+    if let Some(template) = rebuilt.get(&identity) {
+        return Some(Rc::clone(template));
+    }
+    let callback = api::Object::get(&context, record, TEMPLATE_CALLBACK).ok()?;
     let callback_pointer = external_pointer(&callback)?;
-    let attached = api::Object::has_own_key(&context, &value, &api::Local::string(TEMPLATE_DATA))
+    let attached = api::Object::has_own_key(&context, record, &api::Local::string(TEMPLATE_DATA))
         .ok()?
-        .then(|| api::Object::get(&context, &value, TEMPLATE_DATA).ok())
+        .then(|| api::Object::get(&context, record, TEMPLATE_DATA).ok())
         .flatten();
-    let length = api::Object::get(&context, &value, TEMPLATE_LENGTH)
+    let length = api::Object::get(&context, record, TEMPLATE_LENGTH)
         .ok()?
         .value()
         .as_number()?;
-    let constructible = api::Object::get(&context, &value, TEMPLATE_CONSTRUCTIBLE)
+    let constructible = api::Object::get(&context, record, TEMPLATE_CONSTRUCTIBLE)
         .ok()?
         .value()
         .as_boolean()?;
-    let name = api::Object::get(&context, &value, TEMPLATE_NAME)
+    let name = api::Object::get(&context, record, TEMPLATE_NAME)
         .ok()
         .and_then(|name| name.value().as_string())
         .map(|name| name.to_string_lossy());
@@ -654,9 +705,13 @@ fn template_from_record(
     let attached = attached
         .map(|attached| Global::new(isolate, Local::<crate::data::Value>::from_engine(attached)));
     isolate.template_callback(address, callback_pointer as usize, attached);
-    Some(api::Local::from(crux::value::Value::Object(
-        crux::object::JsObject::external_object_create(address, None),
-    )))
+    rebuilt.insert(identity, Rc::clone(&template));
+    if api::Object::has_own_key(&context, record, &api::Local::string(TEMPLATE_PARENT)).ok()? {
+        let parent = api::Object::get(&context, record, TEMPLATE_PARENT).ok()?;
+        let parent = rebuild_template(isolate, context, &parent, rebuilt)?;
+        template.inherit(&parent);
+    }
+    Some(template)
 }
 
 /// A context's identity: its global object, which is the identity this bridge
@@ -724,6 +779,10 @@ impl SnapshotRestore {
             ),
         };
         let mut held = Vec::with_capacity(items.len());
+        // One template per record, for the items of this slot: two templates that
+        // shared a parent named one record for it, and this is what makes them
+        // share the parent they come back with.
+        let mut rebuilt = HashMap::new();
         for item in items {
             let payload = match item {
                 format::SnapshotItem::Value(value) => {
@@ -731,7 +790,7 @@ impl SnapshotRestore {
                     // record names what one is made of, and the template is made
                     // here — under this process's own address — before the host
                     // asks for it.
-                    match template_from_record(isolate, context, value) {
+                    match template_from_record(isolate, context, value, &mut rebuilt) {
                         Some(handle) => Payload::Value(handle),
                         None => Payload::Value(value.into()),
                     }
@@ -2033,6 +2092,88 @@ mod tests {
             scope.add_context_data(context, template);
         }
         let _ = isolate.create_blob(FunctionCodeHandling::Keep);
+    }
+
+    /// A template's parent travels with it, and two children that inherit from one
+    /// parent come back sharing **it**.
+    ///
+    /// The record for a template is *one* object, so both children name one record
+    /// for their parent, and the load makes one template per record. What that buys
+    /// is observable in JavaScript: if the parent were copied per child, two
+    /// subclasses would answer two different `Object.getPrototypeOf(child.prototype)`.
+    #[test]
+    fn a_function_templates_parent_round_trips_and_is_shared() {
+        use crate::support::MapFnTo;
+
+        fn base(
+            scope: &mut crate::scope::PinScope<'_, '_>,
+            _args: crate::function::FunctionCallbackArguments,
+            rv: crate::function::ReturnValue,
+        ) {
+            rv.set(crate::Number::new(scope, 1.0).into());
+        }
+        let references = vec![crate::ExternalReference {
+            function: base.map_fn_to(),
+        }];
+
+        let mut isolate =
+            Isolate::snapshot_creator(Some(std::borrow::Cow::Owned(references.clone())), None);
+        {
+            crate::scope!(let scope, &mut isolate);
+            let context = Context::new(scope, Default::default());
+            let scope = &mut crate::ContextScope::new(scope, context);
+            scope.set_default_context(context);
+            let parent = crate::FunctionTemplate::builder(base).build(scope);
+            parent.set_class_name(crate::String::new(scope, "Base").expect("a name"));
+            let first = crate::FunctionTemplate::builder(base).build(scope);
+            first.inherit(parent);
+            let second = crate::FunctionTemplate::builder(base).build(scope);
+            second.inherit(parent);
+            // Materialized, the way a host that registers a template does — and
+            // only the children are attached, so the parent travels through their
+            // records alone.
+            crate::test_support::bind(
+                scope,
+                "materialized",
+                first.get_function(scope).expect("a function").into(),
+            );
+            scope.add_context_data(context, first);
+            scope.add_context_data(context, second);
+        }
+        let blob = isolate
+            .create_blob(FunctionCodeHandling::Keep)
+            .expect("a blob");
+
+        let mut isolate = isolate_from_with(blob, references);
+        let context = restored_context(&mut isolate, DEFAULT_CONTEXT_SLOT)
+            .expect("the blob names the default context");
+        crate::scope!(let scope, &mut isolate);
+        let context = context.open(scope);
+        let scope = &mut crate::ContextScope::new(scope, context);
+        let first = scope
+            .get_context_data_from_snapshot_once::<crate::FunctionTemplate>(0)
+            .expect("the first child");
+        let second = scope
+            .get_context_data_from_snapshot_once::<crate::FunctionTemplate>(1)
+            .expect("the second child");
+        crate::test_support::bind(
+            scope,
+            "First",
+            first.get_function(scope).expect("a function").into(),
+        );
+        crate::test_support::bind(
+            scope,
+            "Second",
+            second.get_function(scope).expect("a function").into(),
+        );
+        assert!(
+            crate::test_support::eval(
+                scope,
+                "Object.getPrototypeOf(First.prototype) === Object.getPrototypeOf(Second.prototype)",
+            )
+            .is_true(),
+            "two children of one parent share the parent they come back with"
+        );
     }
 
     /// The table form of the reference list a creator or an isolate takes.

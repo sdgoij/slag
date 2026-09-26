@@ -281,6 +281,12 @@ impl FunctionTemplate {
         self.parent.borrow().is_some()
     }
 
+    /// The template this one inherits from (the read half of
+    /// [`inherit`](Self::inherit)).
+    pub fn parent(&self) -> Option<Rc<FunctionTemplate>> {
+        self.parent.borrow().clone()
+    }
+
     /// How many properties a host set on the template itself
     /// ([`set`](Self::set)).
     pub fn property_count(&self) -> usize {

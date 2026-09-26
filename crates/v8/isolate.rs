@@ -230,9 +230,20 @@ pub struct IsolateInner {
     /// The same, by the address a template's handle names, for the moment
     /// between a template being built and the function it materializes: a
     /// template has no engine object of its own, so the callback it was built
-    /// from is recorded against its address and moved onto each function
-    /// `get_function` makes.
+    /// from is recorded against its address and *copied* onto each function
+    /// `get_function` makes (a copy rather than a move, so a template a host is
+    /// serializing can still be read back by its own address).
     callback_templates: RefCell<HashMap<usize, BuiltCallback>>,
+    /// The record a snapshot carries a template as, by the context whose realm
+    /// the record was built in and the template's address.
+    ///
+    /// A snapshot item that is a template is written as a record object, and two
+    /// templates that inherit from one parent have to name *one* record for it —
+    /// the engine writes a value once, so sharing the object is what makes the
+    /// load rebuild one parent rather than one per child. Keyed by the context as
+    /// well because the record holds that realm's `%Object.prototype%`: a record
+    /// built in one realm is not a value another realm's slot can carry.
+    template_records: RefCell<HashMap<(u64, usize), Global<Data>>>,
     /// The object templates the host created on this isolate, held the same way
     /// and for the same reason as the function templates above.
     object_templates: RefCell<Vec<Rc<api::ObjectTemplate>>>,
@@ -791,6 +802,7 @@ impl Isolate {
             positions: RefCell::new(HashMap::new()),
             callbacks: RefCell::new(HashMap::new()),
             callback_templates: RefCell::new(HashMap::new()),
+            template_records: RefCell::new(HashMap::new()),
             object_templates: RefCell::new(Vec::new()),
             snapshot_creator: creator,
             restore: RefCell::new(restore),
@@ -1235,6 +1247,33 @@ impl Isolate {
             .borrow()
             .get(&address)
             .map(|recorded| (recorded.callback, recorded.data.clone()))
+    }
+
+    /// The record a snapshot already built for a template in `context`'s realm, if
+    /// it has one: what makes two templates that share a parent name *one* record
+    /// for it.
+    pub(crate) fn template_record_for(&self, context: u64, address: usize) -> Option<Global<Data>> {
+        self.inner()
+            .template_records
+            .borrow()
+            .get(&(context, address))
+            .cloned()
+    }
+
+    /// Remember the record a snapshot built for a template, before its properties
+    /// are filled: a template that inherits from one already being written (or from
+    /// itself) then names the record under construction rather than starting a
+    /// second one.
+    pub(crate) fn remember_template_record(
+        &self,
+        context: u64,
+        address: usize,
+        record: Global<Data>,
+    ) {
+        self.inner()
+            .template_records
+            .borrow_mut()
+            .insert((context, address), record);
     }
 
     /// Copy a template's callback and data onto the function it just materialized,
