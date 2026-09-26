@@ -366,6 +366,8 @@ pub enum DecodeError {
     BadGrammar(u8),
     /// A module record's status byte is not one this format's.
     BadModuleStatus(u8),
+    /// An object record's private-element kind byte is not one this format's.
+    BadPrivateElement(u8),
     /// A blob carries a host callback and the load supplied no callbacks.
     NoHostCallback(usize),
     /// An environment record this version cannot rebuild: a kind byte that is
@@ -425,6 +427,12 @@ impl std::fmt::Display for DecodeError {
                 write!(
                     f,
                     "snapshot module status byte {byte} is not one of this format's"
+                )
+            }
+            Self::BadPrivateElement(byte) => {
+                write!(
+                    f,
+                    "snapshot private element kind byte {byte} is not one of this format's"
                 )
             }
             Self::NoHostCallback(index) => write!(
@@ -507,7 +515,8 @@ enum Record {
     /// A function: which grammar its source is read in, that source, whether it
     /// is strict, the environment chain it closed over, its [[HomeObject]] when
     /// the grammar is a method, the class an arrow's private names belong to when
-    /// the grammar is an arrow, and its object part.
+    /// the grammar is an arrow, the private names a class declared when the
+    /// grammar is a class, and its object part.
     Function {
         grammar: Grammar,
         source: Vec<u16>,
@@ -517,6 +526,7 @@ enum Record {
         class: u32,
         heritage: u32,
         keys: Vec<u32>,
+        private_names: Vec<(Vec<u16>, u64)>,
         proto: u32,
         extensible: bool,
         properties: Vec<StoredProperty>,
@@ -538,7 +548,7 @@ enum Record {
     /// evaluates already holds the method, under the private name's own brand.
     ClassMethod {
         class: u32,
-        key: u32,
+        key: StoredMemberKey,
         form: Form,
         home: u32,
         proto: u32,
@@ -626,6 +636,7 @@ enum Record {
         proto: u32,
         extensible: bool,
         properties: Vec<StoredProperty>,
+        private_elements: Vec<(u64, StoredPrivateElement)>,
     },
     Array {
         proto: u32,
@@ -654,6 +665,42 @@ struct StoredProperty {
     first: u32,
     second: u32,
 }
+
+/// One `[[PrivateElements]]` entry as a blob carries it: the Private Name's id
+/// and which of the three kinds it is, each value a serial (`NO_REF` for an
+/// accessor half that is absent).
+///
+/// The **id** travels rather than the description because the brand is keyed by
+/// id: a carried instance's element is found by the id its class declared, and
+/// the class record carries those ids so the restored class installs them
+/// instead of minting fresh ones (see `carried_private_names`).
+enum StoredPrivateElement {
+    Field(u32),
+    Method(u32),
+    Accessor { get: u32, set: u32 },
+}
+
+/// How a class member record is addressed.
+///
+/// A **property** member is found by the key it was defined under; a **private**
+/// member is not an own property of its holder at all — it lives in the class's
+/// own `[[PrivateMethods]]` or the class constructor's brand — so it is addressed
+/// by the Private Name's id, which the class record's carried names make stable
+/// across a blob.
+enum StoredMemberKey {
+    Property(u32),
+    Private(u64),
+}
+
+/// The kind byte a private element is written under.
+const PRIVATE_FIELD: u8 = 0;
+const PRIVATE_METHOD: u8 = 1;
+const PRIVATE_ACCESSOR: u8 = 2;
+
+/// The flag byte a class member's key is written under: a property key's serial,
+/// or the id of the Private Name the member was declared as.
+const MEMBER_PROPERTY: u8 = 0;
+const MEMBER_PRIVATE: u8 = 1;
 
 /// A binding as read from a blob: its name, its attributes, and its value (a
 /// serial, or absent while the binding is uninitialized).
@@ -1169,6 +1216,10 @@ fn write_u32(buffer: &mut Vec<u8>, value: u32) {
     buffer.extend_from_slice(&value.to_le_bytes());
 }
 
+fn write_u64(buffer: &mut Vec<u8>, value: u64) {
+    buffer.extend_from_slice(&value.to_le_bytes());
+}
+
 fn write_f64(buffer: &mut Vec<u8>, value: f64) {
     buffer.extend_from_slice(&value.to_bits().to_le_bytes());
 }
@@ -1215,6 +1266,11 @@ impl<'a> Reader<'a> {
     fn u32(&mut self) -> Option<u32> {
         let bytes = self.take(4)?;
         Some(u32::from_le_bytes(bytes.try_into().ok()?))
+    }
+
+    fn u64(&mut self) -> Option<u64> {
+        let bytes = self.take(8)?;
+        Some(u64::from_le_bytes(bytes.try_into().ok()?))
     }
 
     fn f64(&mut self) -> Option<f64> {
@@ -1394,7 +1450,11 @@ fn visit(
                         // to refuse here rather than leave a record no load could
                         // read.
                         visit(agent, realm, externals, host, class, objects, serials)?;
-                        visit(agent, realm, externals, host, key, objects, serials)?;
+                        // Only a property key is a value; a private member is
+                        // named by the id the class record already carries.
+                        if let MemberKey::Property(key) = key {
+                            visit(agent, realm, externals, host, key, objects, serials)?;
+                        }
                         if let Some(home) = home {
                             visit(agent, realm, externals, host, home, objects, serials)?;
                         }
@@ -1714,6 +1774,12 @@ fn canonical(value: Value) -> Value {
     value
 }
 
+/// The key a class member is addressed by, in the writer's terms.
+enum MemberKey {
+    Property(Value),
+    Private(u64),
+}
+
 /// The values a function is carried by, or the reason this format cannot carry
 /// it.
 ///
@@ -1757,6 +1823,7 @@ enum Callable<'a> {
         source: &'a JsString,
         heritage: Option<Value>,
         keys: &'a [PropertyKey],
+        private_names: Vec<(JsString, u64)>,
         environment: Option<EnvRef>,
     },
     /// A method that reads a private name: the class whose declaration owns the
@@ -1766,7 +1833,7 @@ enum Callable<'a> {
     /// only the class's own evaluation can rebuild the method.
     ClassMember {
         class: Value,
-        key: Value,
+        key: MemberKey,
         form: Form,
         home: Option<Value>,
     },
@@ -1975,6 +2042,7 @@ fn callable<'a>(
                     source,
                     heritage: carried_heritage(agent, data),
                     keys: &data.computed_keys,
+                    private_names: carried_private_names(data),
                     // The class scope record every one of its methods closes over,
                     // with the same fall-back an arrow takes: a chain the format
                     // cannot carry leaves the class's methods resolving the
@@ -2062,7 +2130,7 @@ fn class_member(
     agent: &Agent,
     function: &Handle<Function>,
     data: &crate::function::EcmaFunction,
-) -> Option<(Value, Value, Form)> {
+) -> Option<(Value, MemberKey, Form)> {
     let private = data.private_environment?;
     if private.names.borrow().is_empty() {
         return None;
@@ -2093,10 +2161,70 @@ fn class_member(
                 .map(|(_, form)| form),
         };
         if let Some(form) = form {
-            return Some((class, key_value(&key), form));
+            return Some((class, MemberKey::Property(key_value(&key)), form));
+        }
+    }
+    // A private method or accessor is not an own property of the holder: an
+    // instance one lives in the class's own `[[PrivateMethods]]`, a static one in
+    // the class constructor's brand. Both are found by identity the same way, and
+    // addressed by the Private Name's id the class declaration minted.
+    let class_function = class.as_function()?;
+    let class_data = agent.ecma_functions.get(&class_function.id())?;
+    for element in &class_data.private_methods {
+        if let Some((name_id, form)) = private_member_form(element, id) {
+            return Some((class, MemberKey::Private(name_id), form));
+        }
+    }
+    for element in class_function.object.private_elements.borrow().iter() {
+        if let Some((name_id, form)) = private_member_form(element, id) {
+            return Some((class, MemberKey::Private(name_id), form));
         }
     }
     None
+}
+
+/// The Private Name a private method or accessor was declared as, with which of
+/// the three forms it is — found by the identity of the function in one of the
+/// element's halves, which is how `class_member` finds a keyed member by its key.
+fn private_member_form(element: &crux::object::PrivateElement, id: u64) -> Option<(u64, Form)> {
+    match &element.kind {
+        crux::object::PrivateElementKind::Method(value) => {
+            (value.as_function().map(|member| member.id()) == Some(id))
+                .then_some((element.name_id, Form::Method))
+        }
+        crux::object::PrivateElementKind::Accessor { get, set } => {
+            let getter = get.as_ref().and_then(|value| value.as_function());
+            let setter = set.as_ref().and_then(|value| value.as_function());
+            if getter.map(|member| member.id()) == Some(id) {
+                return Some((element.name_id, Form::Getter));
+            }
+            if setter.map(|member| member.id()) == Some(id) {
+                return Some((element.name_id, Form::Setter));
+            }
+            None
+        }
+        crux::object::PrivateElementKind::Field(_) => None,
+    }
+}
+
+/// The value of the private element `name_id` names, in the form a record says it
+/// is — the read half of [`private_member_form`], and the reason a private member
+/// is addressed by id rather than by a key: nothing about the holder exposes it.
+fn private_member_value(
+    element: &crux::object::PrivateElement,
+    name_id: u64,
+    form: Form,
+) -> Option<Value> {
+    if element.name_id != name_id {
+        return None;
+    }
+    match (&element.kind, form) {
+        (crux::object::PrivateElementKind::Method(value), Form::Method) => Some(*value),
+        (crux::object::PrivateElementKind::Field(value), Form::Method) => Some(*value),
+        (crux::object::PrivateElementKind::Accessor { get, .. }, Form::Getter) => *get,
+        (crux::object::PrivateElementKind::Accessor { set, .. }, Form::Setter) => *set,
+        _ => None,
+    }
 }
 
 /// The class a [[HomeObject]] names, with the object the member was defined on —
@@ -2382,6 +2510,29 @@ fn carried_heritage(agent: &Agent, data: &crate::function::EcmaFunction) -> Opti
     Some(super_constructor)
 }
 
+/// The private names a class declared, innermost first and one entry per
+/// description — the ids a carried instance of the class is branded with.
+///
+/// The chain is flattened because `resolve_private_identifier` resolves a
+/// `#name` by description, so one list holding every (description, id) pair the
+/// chain could answer preserves the answer for each name; innermost-first means
+/// a name an inner class shadows wins the way the chain walk does. A blank
+/// outer chain and a class with no `#name` both answer an empty list, which is
+/// every class the format carried before this field existed.
+fn carried_private_names(data: &crate::function::EcmaFunction) -> Vec<(JsString, u64)> {
+    let mut names: Vec<(JsString, u64)> = Vec::new();
+    let mut current = data.private_environment;
+    while let Some(env) = current {
+        for name in env.names.borrow().iter() {
+            if !names.iter().any(|(held, _)| held == &name.description) {
+                names.push((name.description.clone(), name.id));
+            }
+        }
+        current = env.outer;
+    }
+    names
+}
+
 /// Whether a function is a class constructor: what tells a class prototype's
 /// `constructor` from an ordinary function a host stored under that name.
 fn is_class_constructor(agent: &Agent, function: &Handle<Function>) -> bool {
@@ -2572,6 +2723,30 @@ fn children(agent: &Agent, object: &Handle<JsObject>) -> Result<Vec<Value>, Unsu
         // module docs for what that costs.
         ObjectKind::Host(_) => {}
     }
+    // A brand is part of what an object *is*, so its values travel with the record
+    // that rebuilds it — or the record refuses rather than dropping them. Only an
+    // ordinary object's record has a place for a brand: a class instance is one,
+    // and that is the case that exists.
+    {
+        let elements = object.private_elements.borrow();
+        if !elements.is_empty() {
+            if !matches!(object.kind, ObjectKind::Ordinary) {
+                return Err(Unsupported::new(
+                    "an object",
+                    "a private brand is not carried for an object of this kind yet",
+                ));
+            }
+            for element in elements.iter() {
+                match &element.kind {
+                    crux::object::PrivateElementKind::Field(value)
+                    | crux::object::PrivateElementKind::Method(value) => children.push(*value),
+                    crux::object::PrivateElementKind::Accessor { get, set } => {
+                        children.extend(get.iter().chain(set.iter()).copied());
+                    }
+                }
+            }
+        }
+    }
     for key in object
         .own_property_keys()
         .map_err(|_| Unsupported::new("an object", "its own property names could not be read"))?
@@ -2760,6 +2935,7 @@ fn write_record(
                     source,
                     heritage,
                     keys,
+                    private_names,
                     environment,
                 } => write_function(
                     realm,
@@ -2768,7 +2944,11 @@ fn write_record(
                     source,
                     true,
                     environment,
-                    Carried::Class { heritage, keys },
+                    Carried::Class {
+                        heritage,
+                        keys,
+                        private_names,
+                    },
                     serials,
                     body,
                 )?,
@@ -2859,6 +3039,46 @@ fn write_object(
     write_u32(body, prototype_serial(realm, &object, serials)?);
     body.push(u8::from(object.extensible.get()));
     write_properties(realm, &object, serials, body)?;
+    write_private_elements(realm, &object, serials, body)?;
+    Ok(())
+}
+
+/// Write an object's `[[PrivateElements]]`: the id each element's Private Name
+/// had and the serial of each value.
+///
+/// The walk reached every value, so a miss is a walk bug and refuses loudly the
+/// way `env_serial` does rather than writing `NO_REF`, which an accessor half
+/// reads as absent.
+fn write_private_elements(
+    realm: &Handle<Realm>,
+    object: &Handle<JsObject>,
+    serials: &HashMap<Identity, u32>,
+    body: &mut Vec<u8>,
+) -> Result<(), Unsupported> {
+    let elements = object.private_elements.borrow();
+    write_u32(body, elements.len() as u32);
+    for element in elements.iter() {
+        write_u64(body, element.name_id);
+        match &element.kind {
+            crux::object::PrivateElementKind::Field(value) => {
+                body.push(PRIVATE_FIELD);
+                write_u32(body, serial_in(realm, serials, *value));
+            }
+            crux::object::PrivateElementKind::Method(value) => {
+                body.push(PRIVATE_METHOD);
+                write_u32(body, serial_in(realm, serials, *value));
+            }
+            crux::object::PrivateElementKind::Accessor { get, set } => {
+                body.push(PRIVATE_ACCESSOR);
+                for half in [get, set] {
+                    write_u32(
+                        body,
+                        half.map_or(NO_REF, |half| serial_in(realm, serials, half)),
+                    );
+                }
+            }
+        }
+    }
     Ok(())
 }
 
@@ -2876,6 +3096,7 @@ enum Carried<'a> {
     Class {
         heritage: Option<Value>,
         keys: &'a [PropertyKey],
+        private_names: Vec<(JsString, u64)>,
     },
 }
 
@@ -3129,7 +3350,11 @@ fn write_function(
                 class.map_or(NO_REF, |class| serial_in(realm, serials, class)),
             );
         }
-        Carried::Class { heritage, keys } => {
+        Carried::Class {
+            heritage,
+            keys,
+            private_names,
+        } => {
             write_u32(
                 body,
                 heritage.map_or(NO_REF, |heritage| serial_in(realm, serials, heritage)),
@@ -3137,6 +3362,11 @@ fn write_function(
             write_u32(body, keys.len() as u32);
             for key in keys {
                 write_u32(body, serial_in(realm, serials, key_value(key)));
+            }
+            write_u32(body, private_names.len() as u32);
+            for (description, id) in private_names {
+                write_units(body, description.as_slice());
+                write_u64(body, id);
             }
         }
     }
@@ -3162,7 +3392,7 @@ fn write_class_method(
     realm: &Handle<Realm>,
     function: &Handle<Function>,
     class: Value,
-    key: Value,
+    key: MemberKey,
     form: Form,
     home: Option<Value>,
     serials: &HashMap<Identity, u32>,
@@ -3170,7 +3400,18 @@ fn write_class_method(
 ) -> Result<(), Unsupported> {
     body.push(REC_CLASS_METHOD);
     write_u32(body, serial_in(realm, serials, class));
-    write_u32(body, serial_in(realm, serials, key));
+    match key {
+        // A property key is written as its serial; a private member as the id its
+        // class declared, under the flag that says which follows.
+        MemberKey::Property(key) => {
+            body.push(MEMBER_PROPERTY);
+            write_u32(body, serial_in(realm, serials, key));
+        }
+        MemberKey::Private(name_id) => {
+            body.push(MEMBER_PRIVATE);
+            write_u64(body, name_id);
+        }
+    }
     body.push(form.byte());
     write_u32(
         body,
@@ -3670,16 +3911,23 @@ fn read_record(reader: &mut Reader<'_>) -> Result<Record, DecodeError> {
             } else {
                 NO_REF
             };
-            let (heritage, keys) = if grammar == Grammar::Class {
+            let (heritage, keys, private_names) = if grammar == Grammar::Class {
                 let heritage = reader.u32().ok_or(DecodeError::Truncated)?;
                 let count = reader.u32().ok_or(DecodeError::Truncated)? as usize;
                 let mut keys = Vec::with_capacity(count.min(1024));
                 for _ in 0..count {
                     keys.push(reader.u32().ok_or(DecodeError::Truncated)?);
                 }
-                (heritage, keys)
+                let count = reader.u32().ok_or(DecodeError::Truncated)? as usize;
+                let mut private_names = Vec::with_capacity(count.min(1024));
+                for _ in 0..count {
+                    let description = reader.units().ok_or(DecodeError::Truncated)?;
+                    let id = reader.u64().ok_or(DecodeError::Truncated)?;
+                    private_names.push((description, id));
+                }
+                (heritage, keys, private_names)
             } else {
-                (NO_REF, Vec::new())
+                (NO_REF, Vec::new(), Vec::new())
             };
             let source = reader.units().ok_or(DecodeError::Truncated)?;
             let proto = reader.u32().ok_or(DecodeError::Truncated)?;
@@ -3694,6 +3942,7 @@ fn read_record(reader: &mut Reader<'_>) -> Result<Record, DecodeError> {
                 class,
                 heritage,
                 keys,
+                private_names,
                 proto,
                 extensible,
                 properties,
@@ -3877,7 +4126,16 @@ fn read_record(reader: &mut Reader<'_>) -> Result<Record, DecodeError> {
         }
         REC_CLASS_METHOD => {
             let class = reader.u32().ok_or(DecodeError::Truncated)?;
-            let key = reader.u32().ok_or(DecodeError::Truncated)?;
+            let flag = reader.u8().ok_or(DecodeError::Truncated)?;
+            let key = match flag {
+                MEMBER_PROPERTY => {
+                    StoredMemberKey::Property(reader.u32().ok_or(DecodeError::Truncated)?)
+                }
+                MEMBER_PRIVATE => {
+                    StoredMemberKey::Private(reader.u64().ok_or(DecodeError::Truncated)?)
+                }
+                other => return Err(DecodeError::BadPrivateElement(other)),
+            };
             let byte = reader.u8().ok_or(DecodeError::Truncated)?;
             let form = Form::from_byte(byte).ok_or(DecodeError::BadGrammar(byte))?;
             let home = reader.u32().ok_or(DecodeError::Truncated)?;
@@ -3949,10 +4207,12 @@ fn read_record(reader: &mut Reader<'_>) -> Result<Record, DecodeError> {
             let proto = reader.u32().ok_or(DecodeError::Truncated)?;
             let extensible = reader.u8().ok_or(DecodeError::Truncated)? != 0;
             let properties = read_properties(reader)?;
+            let private_elements = read_private_elements(reader)?;
             Ok(Record::Object {
                 proto,
                 extensible,
                 properties,
+                private_elements,
             })
         }
         REC_ARRAY => {
@@ -3988,6 +4248,34 @@ fn read_properties(reader: &mut Reader<'_>) -> Result<Vec<StoredProperty>, Decod
         });
     }
     Ok(properties)
+}
+
+/// An object's `[[PrivateElements]]`, read in the shape `write_private_elements`
+/// wrote: the Private Name's id and a kind byte, with each value a serial.
+fn read_private_elements(
+    reader: &mut Reader<'_>,
+) -> Result<Vec<(u64, StoredPrivateElement)>, DecodeError> {
+    let count = reader.u32().ok_or(DecodeError::Truncated)? as usize;
+    let mut elements = Vec::with_capacity(count.min(1024));
+    for _ in 0..count {
+        let name_id = reader.u64().ok_or(DecodeError::Truncated)?;
+        let kind = reader.u8().ok_or(DecodeError::Truncated)?;
+        let element = match kind {
+            PRIVATE_FIELD => {
+                StoredPrivateElement::Field(reader.u32().ok_or(DecodeError::Truncated)?)
+            }
+            PRIVATE_METHOD => {
+                StoredPrivateElement::Method(reader.u32().ok_or(DecodeError::Truncated)?)
+            }
+            PRIVATE_ACCESSOR => StoredPrivateElement::Accessor {
+                get: reader.u32().ok_or(DecodeError::Truncated)?,
+                set: reader.u32().ok_or(DecodeError::Truncated)?,
+            },
+            other => return Err(DecodeError::BadPrivateElement(other)),
+        };
+        elements.push((name_id, element));
+    }
+    Ok(elements)
 }
 
 /// An environment's bindings, read in the shape a property's are: the same four
@@ -4087,6 +4375,55 @@ impl Builder<'_> {
             .ok_or_else(|| DecodeError::UnknownIntrinsic(name.clone()))?;
         crate::context::as_object(&value)
             .ok_or_else(|| DecodeError::UnrebuildableBuffer(format!("{name} is not an object")))
+    }
+
+    /// Install the private brand a record carried: each element's id and the
+    /// value(s) its kind holds.
+    ///
+    /// The ids are the ones the writing class declared, and the class record
+    /// carries them (see `carried_private_names`), so the restored class installs
+    /// the same ids and a restored method's by-description resolution answers the
+    /// id this brand is keyed by. The counter is raised past every carried id for
+    /// the same reason: without it, a name this process mints later could take an
+    /// id a brand already uses.
+    fn define_private_elements(
+        &mut self,
+        object: Handle<JsObject>,
+        elements: &[(u64, StoredPrivateElement)],
+    ) -> Result<(), DecodeError> {
+        for (name_id, element) in elements {
+            crate::context::reserve_private_ids(name_id.saturating_add(1));
+            let kind = match element {
+                StoredPrivateElement::Field(serial) => {
+                    crux::object::PrivateElementKind::Field(self.materialize(*serial)?)
+                }
+                StoredPrivateElement::Method(serial) => {
+                    crux::object::PrivateElementKind::Method(self.materialize(*serial)?)
+                }
+                StoredPrivateElement::Accessor { get, set } => {
+                    let get = match *get {
+                        NO_REF => None,
+                        serial => Some(self.materialize(serial)?),
+                    };
+                    let set = match *set {
+                        NO_REF => None,
+                        serial => Some(self.materialize(serial)?),
+                    };
+                    crux::object::PrivateElementKind::Accessor { get, set }
+                }
+            };
+            object
+                .private_element_add(crux::object::PrivateElement {
+                    name_id: *name_id,
+                    kind,
+                })
+                .map_err(|_| {
+                    DecodeError::UnrebuildableObject(
+                        "its private brand names an element it already has".into(),
+                    )
+                })?;
+        }
+        Ok(())
     }
 
     /// The environment record a serial names, for the function record that closes
@@ -4410,6 +4747,7 @@ impl Builder<'_> {
                 proto,
                 extensible,
                 properties,
+                private_elements,
             } => {
                 let prototype = self.prototype(*proto)?;
                 let object = JsObject::ordinary_object_create(prototype);
@@ -4418,6 +4756,7 @@ impl Builder<'_> {
                 // rather than restarting the build.
                 self.remember(index, Built::Object(object));
                 define_properties(self, object, properties)?;
+                self.define_private_elements(object, private_elements)?;
                 // Extensibility **last**: an object's own properties exist
                 // before it is made non-extensible, and `[[DefineOwnProperty]]`
                 // refuses to add one to an object that already is. Applying the
@@ -4465,6 +4804,7 @@ impl Builder<'_> {
                 class,
                 heritage,
                 keys,
+                private_names,
                 proto,
                 extensible,
                 properties,
@@ -4487,6 +4827,7 @@ impl Builder<'_> {
                         source,
                         *heritage,
                         keys,
+                        private_names,
                         *proto,
                         *environment_serial,
                     )?,
@@ -4970,7 +5311,7 @@ impl Builder<'_> {
                 if let Some(made) = self.made[index] {
                     return Ok(made);
                 }
-                let function = self.build_class_member(*class, *key, *form, *home)?;
+                let function = self.build_class_member(*class, key, *form, *home)?;
                 // The class's evaluation derived the member's own prototype link;
                 // the record's is what the blob was written with, so it wins — the
                 // same rule a function record's prototype follows.
@@ -5453,6 +5794,7 @@ impl Builder<'_> {
         source: &[u16],
         heritage: u32,
         keys: &[u32],
+        private_names: &[(Vec<u16>, u64)],
         proto: u32,
         environment: u32,
     ) -> Result<Handle<Function>, DecodeError> {
@@ -5504,8 +5846,24 @@ impl Builder<'_> {
             context.lexical_environment = environment;
             context.variable_environment = environment;
         }
-        let value = crate::class::class_definition_evaluation_with_keys(
-            self.agent, class, class.name, heritage, &resolved,
+        // The ids the writing class declared, so this evaluation installs them
+        // instead of minting fresh ones and a carried instance's brand keeps
+        // matching. The counter is raised past each, so a name this process mints
+        // later cannot take an id a carried brand already uses.
+        let carried_names: Vec<(JsString, u64)> = private_names
+            .iter()
+            .map(|(description, id)| {
+                crate::context::reserve_private_ids(id.saturating_add(1));
+                (JsString::from_utf16(description), *id)
+            })
+            .collect();
+        let value = crate::class::class_definition_evaluation_with_carried_names(
+            self.agent,
+            class,
+            class.name,
+            heritage,
+            &resolved,
+            &carried_names,
         );
         self.agent.execution_context_stack.pop();
         let value = value.map_err(|error| {
@@ -5541,55 +5899,95 @@ impl Builder<'_> {
     fn build_class_member(
         &mut self,
         class: u32,
-        key: u32,
+        key: &StoredMemberKey,
         form: Form,
         home: u32,
     ) -> Result<Handle<Function>, DecodeError> {
-        let key = self.materialize(key)?;
-        let key = crate::context::to_property_key(self.agent, &key).map_err(|error| {
-            DecodeError::UnrebuildableFunction(format!(
-                "its member key is not a property key: {error}"
-            ))
-        })?;
         let home_value = match home {
             NO_REF => None,
             home => Some(self.materialize(home)?),
         };
-        // The holder is the object the member was defined on: the class itself for
-        // a static, and the class's own evaluation prototype for an instance
-        // method — which is why a member whose class's prototype was replaced is
-        // not carried this way at all (see `class_member`).
-        let holder = match home_value.as_ref().map(|value| value.kind()) {
-            Some(ValueKind::Function(class_function)) => class_function.object,
-            _ => *self.class_prototypes.get(&class).ok_or_else(|| {
-                DecodeError::UnrebuildableFunction(
-                    "its class's own evaluation kept no prototype to read it from".into(),
-                )
-            })?,
+        // A private member is not an own property of anything: it lives in the
+        // class's own `[[PrivateMethods]]`, or in the class constructor's brand
+        // for a static one. The class record carried the ids it declared, so the
+        // id this record names is the restored class's own — which is what makes
+        // the lookup an identity, not a guess.
+        let member = match key {
+            StoredMemberKey::Private(name_id) => {
+                let class_function = self.materialize(class)?.as_function().ok_or_else(|| {
+                    DecodeError::UnrebuildableFunction(
+                        "its class record is not a class function".into(),
+                    )
+                })?;
+                let from_methods = self
+                    .agent
+                    .ecma_functions
+                    .get(&class_function.id())
+                    .and_then(|data| {
+                        data.private_methods
+                            .iter()
+                            .find_map(|element| private_member_value(element, *name_id, form))
+                    });
+                from_methods
+                    .or_else(|| {
+                        class_function
+                            .object
+                            .private_elements
+                            .borrow()
+                            .iter()
+                            .find_map(|element| private_member_value(element, *name_id, form))
+                    })
+                    .and_then(|value| value.as_function())
+                    .ok_or_else(|| {
+                        DecodeError::UnrebuildableFunction(
+                            "its class's own evaluation holds no such private member".into(),
+                        )
+                    })?
+            }
+            StoredMemberKey::Property(key) => {
+                let key = self.materialize(*key)?;
+                let key = crate::context::to_property_key(self.agent, &key).map_err(|error| {
+                    DecodeError::UnrebuildableFunction(format!(
+                        "its member key is not a property key: {error}"
+                    ))
+                })?;
+                // The holder is the object the member was defined on: the class
+                // itself for a static, and the class's own evaluation prototype for
+                // an instance method — which is why a member whose class's prototype
+                // was replaced is not carried this way at all (see `class_member`).
+                let holder = match home_value.as_ref().map(|value| value.kind()) {
+                    Some(ValueKind::Function(class_function)) => class_function.object,
+                    _ => *self.class_prototypes.get(&class).ok_or_else(|| {
+                        DecodeError::UnrebuildableFunction(
+                            "its class's own evaluation kept no prototype to read it from".into(),
+                        )
+                    })?,
+                };
+                let property = holder
+                    .get_own_property_key(&key)
+                    .map_err(|_| DecodeError::Truncated)?
+                    .ok_or_else(|| {
+                        DecodeError::UnrebuildableFunction(
+                            "its class's own evaluation has no such member".into(),
+                        )
+                    })?;
+                match (&property.kind, form) {
+                    (PropertyKind::Data { value, .. }, Form::Method) => value.as_function(),
+                    (PropertyKind::Accessor { get, .. }, Form::Getter) => {
+                        get.as_ref().and_then(|value| value.as_function())
+                    }
+                    (PropertyKind::Accessor { set, .. }, Form::Setter) => {
+                        set.as_ref().and_then(|value| value.as_function())
+                    }
+                    _ => None,
+                }
+                .ok_or_else(|| {
+                    DecodeError::UnrebuildableFunction(
+                        "its class's own evaluation did not define the member it is read as".into(),
+                    )
+                })?
+            }
         };
-        let property = holder
-            .get_own_property_key(&key)
-            .map_err(|_| DecodeError::Truncated)?
-            .ok_or_else(|| {
-                DecodeError::UnrebuildableFunction(
-                    "its class's own evaluation has no such member".into(),
-                )
-            })?;
-        let member = match (&property.kind, form) {
-            (PropertyKind::Data { value, .. }, Form::Method) => value.as_function(),
-            (PropertyKind::Accessor { get, .. }, Form::Getter) => {
-                get.as_ref().and_then(|value| value.as_function())
-            }
-            (PropertyKind::Accessor { set, .. }, Form::Setter) => {
-                set.as_ref().and_then(|value| value.as_function())
-            }
-            _ => None,
-        }
-        .ok_or_else(|| {
-            DecodeError::UnrebuildableFunction(
-                "its class's own evaluation did not define the member it is read as".into(),
-            )
-        })?;
         if let Some(home) = home_value {
             crate::function::make_method(self.agent, &Value::Function(member), home).map_err(
                 |error| {
@@ -6949,6 +7347,103 @@ mod tests {
             .map(|text| text.to_string_lossy()),
             Some("7".to_string()),
             "the constructor reaches the wrapper's binding through the chain the class carries"
+        );
+    }
+
+    /// A carried instance's private brand survives the round trip: a restored
+    /// method reads a private field on an instance that was created **before**
+    /// the snapshot.
+    ///
+    /// deno's `01_core.js` console is that object — created while the writer ran
+    /// the bootstrap and carried as a value, since the restored `01_core.js`
+    /// comes back `Evaluated` and its top-level code does not run again. Calling
+    /// a console method after the load failed with `Cannot read private member
+    /// #75 from an object whose class did not declare it` until both halves of
+    /// this part landed: the class installs the ids it declared, and the instance
+    /// keeps the brand those ids key.
+    #[test]
+    fn a_carried_instances_private_brand_survives() {
+        let mut isolate = api::Isolate::new();
+        let context = api::Context::new(&mut isolate).expect("a realm");
+        let realm = *context.realm();
+        // The instance and its class travel together: the instance carries the
+        // brand, the class names the ids that make it readable.
+        let value = context
+            .try_eval(
+                "(() => { class C { #x = 5; m() { return this.#x; } } \
+                 const c = new C(); return { c, m: C.prototype.m }; })()",
+            )
+            .expect("a class and an instance")
+            .into_value();
+        let call = |value: Value| {
+            run_restored(
+                &isolate,
+                &realm,
+                value,
+                "(function () { try { return String(restored.m.call(restored.c)); } \
+                 catch (e) { return e.constructor.name + ': ' + e.message; } })()",
+            )
+            .as_string()
+            .map(|text| text.to_string_lossy())
+        };
+        // The same call before the snapshot, so a body that resolves nothing
+        // freshly cannot make the restored assertion pass by accident.
+        assert_eq!(
+            call(value),
+            Some("5".to_string()),
+            "the fresh method reads the brand"
+        );
+        let back = round_trip(&isolate, &realm, value);
+        assert_eq!(
+            call(back),
+            Some("5".to_string()),
+            "and the restored one reads the brand the carried instance already had"
+        );
+    }
+
+    /// A brand that holds a private **method** travels too: a restored method
+    /// calls `this.#m()`, which reads the Method element out of the carried
+    /// instance's brand.
+    ///
+    /// That value has no own property to be found under — a private method is not
+    /// a property of its holder, which is why `class_member` looks a member up by
+    /// key and finds nothing — so it is carried by the Private Name's id its class
+    /// declared. deno's heap class is the measured shape: `#percolateUp` is an
+    /// instance private method its `push` calls through `this.#percolateUp(...)`.
+    #[test]
+    fn a_carried_instances_private_method_brand_survives() {
+        let mut isolate = api::Isolate::new();
+        let context = api::Context::new(&mut isolate).expect("a realm");
+        let realm = *context.realm();
+        let value = context
+            .try_eval(
+                "(() => { class C { #n = 4; #double() { return this.#n * 2; } \
+                 call() { return this.#double(); } } \
+                 return { c: new C(), call: C.prototype.call }; })()",
+            )
+            .expect("a class with a private method")
+            .into_value();
+        let call = |value: Value| {
+            run_restored(
+                &isolate,
+                &realm,
+                value,
+                "(function () { try { return String(restored.call.call(restored.c)); } \
+                 catch (e) { return e.constructor.name + ': ' + e.message; } })()",
+            )
+            .as_string()
+            .map(|text| text.to_string_lossy())
+        };
+        assert_eq!(
+            call(value),
+            Some("8".to_string()),
+            "the fresh method calls the private one"
+        );
+        let back = round_trip(&isolate, &realm, value);
+        assert_eq!(
+            call(back),
+            Some("8".to_string()),
+            "and the restored one calls it through the brand the carried instance kept"
         );
     }
 

@@ -53,7 +53,7 @@ pub fn class_definition_evaluation(
     // A class definition is always strict mode code (spec 15.7 note): the
     // heritage expression, computed keys, and element bodies run strict even
     // inside a sloppy script.
-    let scope = setup_class_scope(agent, class, class_binding)?;
+    let scope = setup_class_scope(agent, class, class_binding, None)?;
     let heritage = evaluate_heritage(agent, class, &scope)?;
     build_class(agent, class, class_binding, true, scope, heritage, None)
 }
@@ -70,7 +70,35 @@ pub fn class_definition_evaluation_with_keys(
     heritage: Option<Value>,
     keys: &[Option<PropertyKey>],
 ) -> Result<Value, JsError> {
-    let scope = setup_class_scope(agent, class, class_binding)?;
+    let scope = setup_class_scope(agent, class, class_binding, None)?;
+    let heritage = resolve_heritage(agent, heritage)?;
+    build_class(
+        agent,
+        class,
+        class_binding,
+        true,
+        scope,
+        heritage,
+        Some(keys),
+    )
+}
+
+/// ClassDefinitionEvaluation over the private names the class declared when the
+/// snapshot was written.
+///
+/// A carried instance's `[[PrivateElements]]` are keyed by the ids those names
+/// had, and a restored method resolves its `#name` by description, so the two
+/// meet only if this evaluation installs the carried ids instead of minting
+/// fresh ones. The rest is `class_definition_evaluation_with_keys`.
+pub fn class_definition_evaluation_with_carried_names(
+    agent: &mut Agent,
+    class: &Class,
+    class_binding: Option<crux::string::AtomId>,
+    heritage: Option<Value>,
+    keys: &[Option<PropertyKey>],
+    carried: &[(JsString, u64)],
+) -> Result<Value, JsError> {
+    let scope = setup_class_scope(agent, class, class_binding, Some(carried))?;
     let heritage = resolve_heritage(agent, heritage)?;
     build_class(
         agent,
@@ -130,6 +158,7 @@ fn setup_class_scope(
     agent: &mut Agent,
     class: &Class,
     class_binding: Option<crux::string::AtomId>,
+    carried: Option<&[(JsString, u64)]>,
 ) -> Result<ClassScope, JsError> {
     let outer_env = agent.running_context()?.lexical_environment;
     let class_env = new_declarative_environment(Some(outer_env));
@@ -138,8 +167,10 @@ fn setup_class_scope(
         class_env.create_immutable_binding(binding, true)?;
     }
 
-    // The class PrivateEnvironment (spec steps 4-10): a fresh Private Name
-    // per private identifier in the body, whose description is `#name`.
+    // The class PrivateEnvironment (spec steps 4-10): a Private Name per private
+    // identifier in the body, whose description is `#name`. A restore installs
+    // the ids the blob carried for those descriptions, so a carried instance's
+    // brand and a restored method's resolution answer one id.
     let outer_private_env = agent.running_context()?.private_environment;
     let class_private_env = new_private_environment(outer_private_env);
     {
@@ -151,7 +182,16 @@ fn setup_class_scope(
             let description =
                 JsString::from_utf8(&format!("#{}", crux::lookup(atom).to_string_lossy()));
             if !names.iter().any(|name| name.description == description) {
-                names.push(new_private_name(description));
+                let carried_id = carried.and_then(|carried| {
+                    carried
+                        .iter()
+                        .find(|(carried, _)| carried == &description)
+                        .map(|(_, id)| *id)
+                });
+                names.push(match carried_id {
+                    Some(id) => crate::context::carried_private_name(description, id),
+                    None => new_private_name(description),
+                });
             }
         }
     }

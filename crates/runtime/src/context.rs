@@ -430,6 +430,25 @@ pub fn new_private_name(description: JsString) -> PrivateName {
     }
 }
 
+/// A Private Name whose id a blob carried.
+///
+/// A restored instance's `[[PrivateElements]]` are keyed by the id the writing
+/// class declared, so a restored method's by-description resolution has to
+/// answer that same id rather than a fresh one — see
+/// [`reserve_private_ids`] for why the two cannot collide afterwards.
+pub fn carried_private_name(description: JsString, id: u64) -> PrivateName {
+    PrivateName { id, description }
+}
+
+/// Raise the private-name counter above `id`.
+///
+/// Ids are process-wide ([`NEXT_PRIVATE_ID`] starts at 1 in every process), so a
+/// carried id and a freshly minted one can name different classes. Called for
+/// every id a blob carries, before the load mints any of its own.
+pub fn reserve_private_ids(above: u64) {
+    NEXT_PRIVATE_ID.fetch_max(above, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// NewPrivateEnvironment (spec 9.2.1.1).
 pub fn new_private_environment(
     outer: Option<Handle<PrivateEnvironment>>,
@@ -1323,6 +1342,19 @@ mod tests {
 
     fn name(text: &str) -> JsString {
         JsString::from_utf8(text)
+    }
+
+    /// A carried id is never handed out again: `reserve_private_ids` raises the
+    /// counter past it, so a name this process mints after a load cannot take an
+    /// id a carried instance's brand already uses.
+    #[test]
+    fn a_reserved_private_id_is_never_minted_again() {
+        let reserved = 1_000_000_000;
+        reserve_private_ids(reserved);
+        assert!(
+            new_private_name(name("#probe")).id >= reserved,
+            "the next minted id is past every reserved one"
+        );
     }
 
     #[test]
