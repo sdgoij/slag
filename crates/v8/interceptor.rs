@@ -1163,18 +1163,37 @@ fn property_of(descriptor: crux::property::PropertyDescriptor) -> crux::object::
     }
 }
 
+/// Run a host property callback the way V8 runs one: with a handle region of its
+/// own.
+///
+/// A callback is handed handles before it is called — an argument adapter builds
+/// `PropertyCallbackInfo::context` as a `Local` — and it usually makes more of its
+/// own, and V8's guarantee is that they live in a handle scope that dies with the
+/// call. The engine re-enters a host object's internal methods from wherever it
+/// needs them: a script's own operation, where the host has a scope open, and a
+/// snapshot's write pass, where it has none. So the region is opened here rather
+/// than assumed, and everything a callback allocates is reclaimed when it returns.
+fn callback_region<T>(body: impl FnOnce() -> T) -> T {
+    crate::store::open_region();
+    let value = body();
+    crate::store::close_region();
+    value
+}
+
 impl crux::host::HostOps for GlobalHandler {
     fn get_own_property(
         &self,
         object: &crux::object::JsObject,
         key: &crux::property::PropertyKey,
     ) -> Option<Result<crux::object::Property, crux::error::JsError>> {
-        let (intercepted, answer) = self.call_value(
-            object,
-            key,
-            |config| config.descriptor,
-            |config| config.descriptor,
-        )?;
+        let (intercepted, answer) = callback_region(|| {
+            self.call_value(
+                object,
+                key,
+                |config| config.descriptor,
+                |config| config.descriptor,
+            )
+        })?;
         Some(match intercepted {
             // Not intercepted: the engine's own [[GetOwnProperty]] runs.
             Intercepted::kNo | Intercepted::kYesKeepExisting => return None,
@@ -1189,8 +1208,9 @@ impl crux::host::HostOps for GlobalHandler {
         key: &crux::property::PropertyKey,
         _receiver: &crux::value::Value,
     ) -> Option<Result<crux::value::Value, crux::error::JsError>> {
-        let (intercepted, answer) =
-            self.call_value(object, key, |config| config.getter, |config| config.getter)?;
+        let (intercepted, answer) = callback_region(|| {
+            self.call_value(object, key, |config| config.getter, |config| config.getter)
+        })?;
         Some(match intercepted {
             // Not intercepted: the engine's own [[Get]] runs.
             Intercepted::kNo => return None,
@@ -1204,7 +1224,7 @@ impl crux::host::HostOps for GlobalHandler {
         object: &crux::object::JsObject,
         key: &crux::property::PropertyKey,
     ) -> Option<Result<bool, crux::error::JsError>> {
-        let intercepted = self.call_query(object, key)?;
+        let intercepted = callback_region(|| self.call_query(object, key))?;
         Some(match intercepted {
             // Not intercepted: the engine's own [[HasProperty]] runs.
             Intercepted::kNo => return None,
@@ -1221,7 +1241,7 @@ impl crux::host::HostOps for GlobalHandler {
         _receiver: &crux::value::Value,
         throw_on_error: bool,
     ) -> Option<Result<bool, crux::error::JsError>> {
-        let intercepted = self.call_setter(object, key, value, throw_on_error)?;
+        let intercepted = callback_region(|| self.call_setter(object, key, value, throw_on_error))?;
         Some(match intercepted {
             // Not intercepted: the engine's own OrdinarySet runs.
             Intercepted::kNo => return None,
@@ -1237,7 +1257,7 @@ impl crux::host::HostOps for GlobalHandler {
         object: &crux::object::JsObject,
         key: &crux::property::PropertyKey,
     ) -> Option<Result<bool, crux::error::JsError>> {
-        self.call_deleter(object, key)
+        callback_region(|| self.call_deleter(object, key))
     }
 
     fn own_property_keys(
@@ -1250,23 +1270,25 @@ impl crux::host::HostOps for GlobalHandler {
             // Neither handler enumerates: the engine's own [[OwnPropertyKeys]].
             return None;
         }
-        let mut keys = Vec::new();
-        // The indexed enumerator answers with the element indices, which V8
-        // orders before the string keys (see this module's note on the split).
-        if let Some(callback) = indexed {
-            let info = EnumeratorCallbackInfo::parts(object)?;
-            // SAFETY: the callback pointer is the host's, and the info is alive
-            // for the call.
-            unsafe { callback(&info) };
-            keys.extend(keys_of_answer(&info.answer()));
-        }
-        if let Some(callback) = named {
-            let info = EnumeratorCallbackInfo::parts(object)?;
-            // SAFETY: as above.
-            unsafe { callback(&info) };
-            keys.extend(keys_of_answer(&info.answer()));
-        }
-        Some(Ok(keys))
+        callback_region(|| {
+            let mut keys = Vec::new();
+            // The indexed enumerator answers with the element indices, which V8
+            // orders before the string keys (see this module's note on the split).
+            if let Some(callback) = indexed {
+                let info = EnumeratorCallbackInfo::parts(object)?;
+                // SAFETY: the callback pointer is the host's, and the info is alive
+                // for the call.
+                unsafe { callback(&info) };
+                keys.extend(keys_of_answer(&info.answer()));
+            }
+            if let Some(callback) = named {
+                let info = EnumeratorCallbackInfo::parts(object)?;
+                // SAFETY: as above.
+                unsafe { callback(&info) };
+                keys.extend(keys_of_answer(&info.answer()));
+            }
+            Some(Ok(keys))
+        })
     }
 
     fn define_property(
@@ -1275,7 +1297,7 @@ impl crux::host::HostOps for GlobalHandler {
         key: &crux::property::PropertyKey,
         desc: &crux::property::PropertyDescriptor,
     ) -> Option<Result<bool, crux::error::JsError>> {
-        let intercepted = self.call_definer(object, key, desc)?;
+        let intercepted = callback_region(|| self.call_definer(object, key, desc))?;
         Some(match intercepted {
             // Not intercepted: the engine's own [[DefineOwnProperty]] runs.
             Intercepted::kNo => return None,
@@ -1602,6 +1624,85 @@ mod tests {
         assert!(
             !sloppy.contains(&"throw"),
             "a sloppy store reported Throw: {sloppy:?}"
+        );
+    }
+
+    /// Write a blob whose slot 0 is a context over a global template carrying
+    /// `config`, written the way deno's snapshot host writes one: with no scope of
+    /// the host's open.
+    fn blob_over_a_handler(config: NamedPropertyHandlerConfiguration) -> crate::StartupData {
+        let mut isolate = Isolate::snapshot_creator(None, None);
+        {
+            crate::scope!(let scope, &mut isolate);
+            let template = ObjectTemplate::new(scope);
+            template.set_named_property_handler(config);
+            let context = crate::Context::new(
+                scope,
+                ContextOptions {
+                    global_template: Some(template),
+                    ..Default::default()
+                },
+            );
+            let scope = &mut crate::ContextScope::new(scope, context);
+            crate::test_support::eval(scope, "globalThis.__carried = 7");
+            assert_eq!(scope.add_context(context), 0, "the first added context");
+        }
+        isolate
+            .create_blob(crate::FunctionCodeHandling::Keep)
+            .expect("a blob")
+    }
+
+    /// A host's handler is consulted by the snapshot write pass, where no scope of
+    /// the host's is open: the engine re-enters the global's internal methods from
+    /// its own walk. V8's guarantee is that a property callback runs inside a
+    /// handle scope, and an adapter needs one before it can hand the callback its
+    /// context — so without the region this write dies at `store::cell`.
+    #[test]
+    fn a_host_handler_runs_where_the_host_opened_no_scope() {
+        CALLS.with(|calls| calls.borrow_mut().clear());
+        // A descriptor is asked about every own key the walk carries, which is
+        // the whole of what a handler with no enumerator is consulted for.
+        let blob = blob_over_a_handler(config());
+        assert!(
+            calls().contains(&"descriptor"),
+            "the host's descriptor was not consulted: {:?}",
+            calls()
+        );
+
+        let mut isolate = Isolate::new(CreateParams::default().snapshot_blob(blob));
+        crate::scope!(let scope, &mut isolate);
+        let context = crate::Context::from_snapshot(scope, 0, ContextOptions::default())
+            .expect("the blob names slot 0");
+        let scope = &mut crate::ContextScope::new(scope, context);
+        assert_eq!(
+            crate::test_support::eval_number(scope, "globalThis.__carried"),
+            7.0,
+            "the write still carried the state it enumerated"
+        );
+    }
+
+    /// The enumerator is the callback deno's node:vm global actually has, and the
+    /// write asks it *before* any key exists — the first re-entry into the handler,
+    /// with no scope behind it.
+    #[test]
+    fn a_host_enumerator_runs_where_the_host_opened_no_scope() {
+        fn enumerator<'s>(
+            scope: &mut PinScope<'s, '_>,
+            _args: PropertyCallbackArguments<'s>,
+            rv: ReturnValue<'s, Array>,
+        ) {
+            record("enumerator");
+            rv.set(Array::new(scope, 0));
+        }
+
+        CALLS.with(|calls| calls.borrow_mut().clear());
+        let _blob = blob_over_a_handler(
+            NamedPropertyHandlerConfiguration::new().enumerator_raw(enumerator.map_fn_to()),
+        );
+        assert!(
+            calls().contains(&"enumerator"),
+            "the host's enumerator was not consulted: {:?}",
+            calls()
         );
     }
 }
