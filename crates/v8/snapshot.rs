@@ -793,6 +793,46 @@ mod tests {
         );
     }
 
+    /// A realm whose global the host built from a handler-bearing template — the
+    /// node:vm context the CLI's snapshot host adds as slot 0 — writes a blob and
+    /// reads it back instead of ending the write. What travels is the global's
+    /// *state*: the handler callbacks are pointers into the process that wrote the
+    /// blob, so the restored global is ordinary and does not intercept. That is
+    /// the tier the module docs state, and both halves are pinned here — the blob
+    /// is produced at all, and what the global carried comes back.
+    #[test]
+    fn a_host_objects_state_is_carried() {
+        let mut isolate = Isolate::snapshot_creator(None, None);
+        {
+            crate::scope!(let scope, &mut isolate);
+            let template = crate::ObjectTemplate::new(scope);
+            template.set_named_property_handler(crate::NamedPropertyHandlerConfiguration::new());
+            let context = Context::new(
+                scope,
+                ContextOptions {
+                    global_template: Some(template),
+                    ..Default::default()
+                },
+            );
+            let scope = &mut crate::ContextScope::new(scope, context);
+            crate::test_support::eval(scope, "globalThis.__carried = 7");
+            assert_eq!(scope.add_context(context), 0, "the first added context");
+        }
+        let blob = isolate
+            .create_blob(FunctionCodeHandling::Keep)
+            .expect("a blob");
+
+        let mut isolate = isolate_from(blob);
+        let context = restored_context(&mut isolate, 0).expect("the blob names slot 0");
+        crate::scope!(let scope, &mut isolate);
+        let context = context.open(scope);
+        let scope = &mut crate::ContextScope::new(scope, context);
+        assert_eq!(
+            crate::test_support::eval_number(scope, "globalThis.__carried"),
+            7.0
+        );
+    }
+
     /// A module a host attached is an item a blob carries rather than one it
     /// drops: it comes back as a module record at the index it was attached
     /// under, and the item attached after it keeps its own index.

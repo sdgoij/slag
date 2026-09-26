@@ -21,7 +21,7 @@
 //!   object — which is what a host's own bookkeeping depends on.
 //!
 //! What it does not carry yet ends the walk with [`Unsupported`], which names
-//! the value it refused: a proxy, a module namespace, a host object, an indexed
+//! the value it refused: a proxy, a module namespace, an indexed
 //! accessor, an array whose `length` is not an index, a `DataView`, a shared or
 //! detached buffer, a host pointer the host's external-reference table does not
 //! have, a host callback (a built-in that is not an intrinsic) when the host
@@ -31,8 +31,15 @@
 //! record a function closed over that is neither declarative nor function: a
 //! lookup walks a record's own binding list and nothing else, so an object,
 //! module or global record is refused by kind. A **method**, an **accessor**, a
-//! **typed array** and the **buffer** it views are no longer on that list: each
-//! carries what it is made of now.
+//! **typed array**, the **buffer** it views and a **host object** are no longer
+//! on that list: each carries what it is made of now.
+//!
+//! A host object carries its **state**, not its behaviour: the host's own
+//! internal methods are callbacks in the process that built the object, so what
+//! is written is the prototype and the own properties every object has, and a
+//! restored object is ordinary. A host that needs its interception back installs
+//! the handler again at load, because a blob is not somewhere a callback can
+//! live.
 //!
 //! An Array's element that is **absent** — a hole — travels as the absence it
 //! is, the serial `NO_REF` in the element list. So `1 in [1, , 3]` is still
@@ -2196,12 +2203,12 @@ fn children(agent: &Agent, object: &Handle<JsObject>) -> Result<Vec<Value>, Unsu
             ));
         }
         ObjectKind::External(_) => {}
-        ObjectKind::Host(_) => {
-            return Err(Unsupported::new(
-                "a host object",
-                "a host object is not carried yet",
-            ));
-        }
+        // A host object carries its state like any other object: its internal
+        // methods are callbacks in the process that built it, which a blob cannot
+        // name, so the prototype and own properties below are the whole of what
+        // there is to write. A restored object is therefore ordinary; see the
+        // module docs for what that costs.
+        ObjectKind::Host(_) => {}
     }
     for key in object
         .own_property_keys()
