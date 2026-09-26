@@ -167,9 +167,9 @@ impl<'s> LocalHandle<'s, FunctionTemplate> {
     /// a host asks for it, and the accessor shape this engine has is the one on
     /// an object template.
     ///
-    /// # Panics
-    ///
-    /// If `key` is not a string, as [`ObjectTemplate::set`](Self::set).
+    /// The key may be a **symbol** as well as a string, as `v8::Template::Set`
+    /// takes a `Local<Name>`: an op a host registers under `Symbol.for(...)` is
+    /// a property of the function it makes.
     pub fn set(&self, key: Local<'_, Name>, value: Local<'_, Data>) {
         self.set_with_attr(key, value, PropertyAttribute::NONE);
     }
@@ -181,9 +181,9 @@ impl<'s> LocalHandle<'s, FunctionTemplate> {
         value: Local<'_, Data>,
         attr: PropertyAttribute,
     ) {
-        let name = template_key_name(&key);
+        let name = template_key(&key);
         self.template_rc()
-            .set(&name, *value.engine(), engine_attributes(attr));
+            .set_key(&name, *value.engine(), engine_attributes(attr));
     }
 
     /// The template's `name`, and the name a `new` instance is printed under
@@ -254,12 +254,8 @@ impl<'s> LocalHandle<'s, ObjectTemplate> {
     /// The property is a plain data property: writable, enumerable and
     /// configurable ([`set_with_attr`](Self::set_with_attr) is the other three).
     ///
-    /// # Panics
-    ///
-    /// If `key` is not a string. The engine's templates are string-keyed — a
-    /// symbol key has no representation in one — and the crate we stand in for
-    /// gives this method no channel to report that on, so the alternative to
-    /// this panic is a property that silently does not exist.
+    /// The key may be a **symbol** as well as a string, as `v8::Template::Set`
+    /// takes a `Local<Name>`.
     pub fn set(&self, key: Local<'_, Name>, value: Local<'_, Data>) {
         self.set_with_attr(key, value, PropertyAttribute::NONE);
     }
@@ -272,9 +268,12 @@ impl<'s> LocalHandle<'s, ObjectTemplate> {
         value: Local<'_, Data>,
         attr: PropertyAttribute,
     ) {
-        let name = template_key_name(&key);
-        self.object_template()
-            .set_with_attributes(&name, *value.engine(), engine_attributes(attr));
+        let name = template_key(&key);
+        self.object_template().set_key_with_attributes(
+            &name,
+            *value.engine(),
+            engine_attributes(attr),
+        );
     }
 
     /// Define an accessor property whose getter and setter are the functions two
@@ -286,9 +285,8 @@ impl<'s> LocalHandle<'s, ObjectTemplate> {
     ///
     /// # Panics
     ///
-    /// If `key` is not a string (as [`set`](Self::set)), and if both `getter`
-    /// and `setter` are `None`, which is the crate's own assertion: an accessor
-    /// with neither half could only throw on every access.
+    /// If both `getter` and `setter` are `None`, which is the crate's own
+    /// assertion: an accessor with neither half could only throw on every access.
     pub fn set_accessor_property(
         &self,
         key: Local<'_, Name>,
@@ -300,7 +298,7 @@ impl<'s> LocalHandle<'s, ObjectTemplate> {
             getter.is_some() || setter.is_some(),
             "bridge: an accessor property needs a getter or a setter"
         );
-        let name = template_key_name(&key);
+        let name = template_key(&key);
         let callback = |template: &Local<'_, FunctionTemplate>| {
             template
                 .template_rc()
@@ -313,7 +311,7 @@ impl<'s> LocalHandle<'s, ObjectTemplate> {
         // here and it can fill the getter slot.
         let getter = getter.or_else(|| setter.clone()).expect("accessor");
         self.object_template()
-            .set_accessor_rc(&name, getter, setter, engine_attributes(attr));
+            .set_accessor_key_rc(&name, getter, setter, engine_attributes(attr));
     }
 
     /// Create an instance in the scope's realm
@@ -418,13 +416,20 @@ fn engine_attributes(attr: PropertyAttribute) -> api::PropertyAttributes {
     }
 }
 
-/// The engine's templates are string-keyed and the crate gives a method that
-/// takes a key no channel to report otherwise, so this is where that is said
-/// out loud instead of becoming a property that silently does not exist.
-fn template_key_name(key: &Local<'_, Name>) -> std::string::String {
-    key.engine().as_string().unwrap_or_else(|| {
-        panic!("bridge: a template property key must be a string (the engine's templates are string-keyed)")
-    })
+/// The engine's key for a template property: the crate passes a `Name`, and the
+/// engine's templates are `PropertyKey`-keyed — a string interns, and a **symbol**
+/// key is the symbol itself, as V8's templates are (`v8::Template::Set` takes a
+/// `Local<Name>`).
+fn template_key(key: &Local<'_, Name>) -> crux::property::PropertyKey {
+    let value = key.engine().value();
+    match value.kind() {
+        crux::value::ValueKind::Symbol(symbol) => crux::property::PropertyKey::Symbol(symbol),
+        _ => crux::property::PropertyKey::from_js_string(
+            &value
+                .as_string()
+                .expect("bridge: a template key is a string or a symbol"),
+        ),
+    }
 }
 
 /// Store an engine object template on the isolate and hand back the handle that
@@ -448,6 +453,7 @@ mod tests {
 
     use super::*;
     use crate::Number;
+    use crate::Symbol;
     use crate::data::{Data, Name};
     use crate::function::{FunctionCallbackArguments, ReturnValue};
     use crate::scope::GetIsolate;
@@ -617,6 +623,97 @@ mod tests {
     fn accept(_scope: &mut PinScope<'_, '_>, _args: FunctionCallbackArguments, rv: ReturnValue) {
         let undefined = crate::undefined(_scope);
         rv.set(undefined.into());
+    }
+
+    /// A static property keyed by a **symbol**, which is what `v8::Template::Set`'s
+    /// `Local<Name>` allows and what an op a host registers under
+    /// `Symbol.for(...)` uses (`deno_core`'s `#[op2(symbol)]`): the property is
+    /// keyed by the symbol, and a string of the same description is a different
+    /// property that does not exist.
+    #[test]
+    fn a_symbol_keyed_static_property_reaches_the_function() {
+        in_context!(scope, {
+            let template = FunctionTemplate::new(scope, sum);
+            let description = String::new(scope, "bridge.symbol.static").expect("string");
+            let key: Local<'_, Name> = Symbol::for_key(scope, description).into();
+            template.set(key, Number::new(scope, 7.0).cast::<Data>());
+
+            let function = template.get_function(scope).expect("function");
+            bind(scope, "Carrier", function.cast::<Value>());
+            assert_eq!(
+                eval_number(scope, "Carrier[Symbol.for('bridge.symbol.static')]"),
+                7.0,
+                "the property is the one the symbol key names"
+            );
+            assert_eq!(
+                eval_number(
+                    scope,
+                    "Carrier['bridge.symbol.static'] === undefined ? 1 : 0"
+                ),
+                1.0,
+                "and the string of the same description is not that key"
+            );
+        });
+    }
+
+    /// The same key kind on an object template, for a data property and for an
+    /// accessor built from two function templates: the key is held as the symbol
+    /// on both paths, and the accessor's name is built from the key rather than
+    /// from the string it once had to be.
+    #[test]
+    fn a_symbol_keyed_object_property_lands_on_the_instance() {
+        in_context!(scope, {
+            let template = ObjectTemplate::new(scope);
+            let data = String::new(scope, "bridge.symbol.data").expect("string");
+            let data_key: Local<'_, Name> = Symbol::for_key(scope, data).into();
+            template.set(data_key, Number::new(scope, 3.0).cast::<Data>());
+
+            let accessor = String::new(scope, "bridge.symbol.accessor").expect("string");
+            let accessor_key: Local<'_, Name> = Symbol::for_key(scope, accessor).into();
+            let getter = FunctionTemplate::new(scope, forty_two);
+            template.set_accessor_property(
+                accessor_key,
+                Some(getter),
+                None,
+                PropertyAttribute::NONE,
+            );
+
+            let instance = template.new_instance(scope).expect("instance");
+            bind(scope, "instance", instance.cast::<Value>());
+            assert_eq!(
+                eval_number(scope, "instance[Symbol.for('bridge.symbol.data')]"),
+                3.0,
+                "a symbol-keyed data property is on the instance"
+            );
+            assert_eq!(
+                eval_number(scope, "instance[Symbol.for('bridge.symbol.accessor')]"),
+                42.0,
+                "and a symbol-keyed accessor runs its getter's callback"
+            );
+        });
+    }
+
+    /// A key the host made itself rather than registered (`Symbol::new`) is
+    /// legal in `v8::Template::Set` and is the case the engine keeps alive itself:
+    /// nothing else roots it, and a template's storage is not in the collector's
+    /// graph.
+    #[test]
+    fn a_unique_symbol_key_reaches_the_instance() {
+        in_context!(scope, {
+            let template = ObjectTemplate::new(scope);
+            let symbol = Symbol::new(scope, None);
+            let key: Local<'_, Name> = symbol.into();
+            template.set(key, Number::new(scope, 11.0).cast::<Data>());
+            bind(scope, "theKey", symbol.cast::<Value>());
+
+            let instance = template.new_instance(scope).expect("instance");
+            bind(scope, "instance", instance.cast::<Value>());
+            assert_eq!(
+                eval_number(scope, "instance[theKey]"),
+                11.0,
+                "a unique symbol is a key the property can be set under"
+            );
+        });
     }
 
     /// An accessor property installed from two function *templates*: reading it

@@ -3862,7 +3862,16 @@ impl JsObject {
         key: &JsString,
         desc: &PropertyDescriptor,
     ) -> Result<(), JsError> {
-        if !self.define_property(key, desc)? {
+        self.define_property_key_or_throw(&PropertyKey::from_js_string(key), desc)
+    }
+
+    /// spec 7.3.6 DefinePropertyOrThrow, for a key that may be a symbol.
+    pub fn define_property_key_or_throw(
+        &self,
+        key: &PropertyKey,
+        desc: &PropertyDescriptor,
+    ) -> Result<(), JsError> {
+        if !self.define_property_key(key, desc)? {
             return Err(JsError::new(
                 ErrorKind::TypeError,
                 "Cannot redefine property".into(),

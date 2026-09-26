@@ -10,7 +10,7 @@ use crux::error::{ErrorKind, JsError};
 use crux::function::{Function, NativeCtor, NativeFn};
 use crux::handle::Handle;
 use crux::object::JsObject;
-use crux::property::PropertyDescriptor;
+use crux::property::{PropertyDescriptor, PropertyKey};
 use crux::string::JsString;
 use crux::value::{Value, ValueKind};
 
@@ -156,6 +156,10 @@ pub struct FunctionTemplate {
     /// `Child.prototype instanceof Parent` would be false with both objects
     /// looking identical.
     materialized: RefCell<Vec<Materialized>>,
+    /// Symbol keys this template's properties were set under, kept alive for as
+    /// long as the template: a `PropertyKey`'s symbol is rooted through the key's
+    /// trace, and nothing here is traced — see `pin_key`.
+    key_pins: RefCell<Vec<crux::heap::Pin>>,
 }
 
 /// A function as materialized in one realm.
@@ -182,6 +186,7 @@ impl FunctionTemplate {
             static_properties: RefCell::new(Vec::new()),
             parent: RefCell::new(None),
             materialized: RefCell::new(Vec::new()),
+            key_pins: RefCell::new(Vec::new()),
         })
     }
 
@@ -205,13 +210,27 @@ impl FunctionTemplate {
     /// Define a property on the function itself (v8::Template::Set with a
     /// function template), which is where a host's static methods go.
     pub fn set(&self, name: &str, value: Local, attributes: PropertyAttributes) {
+        self.set_key(&PropertyKey::from_utf8(name), value, attributes);
+    }
+
+    /// The same for a key that may be a **symbol** (v8::Template::Set takes a
+    /// `Local<Name>`, and a host's op table is symbol-keyed often enough that
+    /// the crate's own does). The key is stored as it is, and a symbol key is
+    /// pinned for the template's lifetime.
+    pub fn set_key(&self, name: &PropertyKey, value: Local, attributes: PropertyAttributes) {
+        self.pin_key(name);
         self.static_properties
             .borrow_mut()
             .push(TemplateProperty::Data {
-                name: JsString::from_utf8(name),
+                name: name.clone(),
                 value: value.into_value(),
                 attributes,
             });
+    }
+
+    /// Keep a symbol key alive for as long as this template — see [`pin_key`].
+    fn pin_key(&self, key: &PropertyKey) {
+        pin_key(&self.key_pins, key);
     }
 
     /// Inherit from `parent` (v8::FunctionTemplate::Inherit): the function this
@@ -454,7 +473,7 @@ impl FunctionTemplate {
                     attributes,
                 } = property
                 {
-                    function_object.define_property_or_throw(
+                    function_object.define_property_key_or_throw(
                         name,
                         &PropertyDescriptor {
                             value: Some(*value),
@@ -499,24 +518,41 @@ pub struct ObjectTemplate {
     /// a bridge keeps its own view of a template, which then lives exactly as
     /// long as the isolate that owns the template.
     host_state: RefCell<Option<Rc<dyn std::any::Any>>>,
+    /// Symbol keys this template's properties were set under, kept alive for as
+    /// long as the template — see `pin_key`.
+    key_pins: RefCell<Vec<crux::heap::Pin>>,
 }
 
 enum TemplateProperty {
     Data {
-        name: JsString,
+        name: PropertyKey,
         value: Value,
         attributes: PropertyAttributes,
     },
     Accessor {
-        name: JsString,
+        name: PropertyKey,
         getter: Rc<FunctionCallback>,
         setter: Option<Rc<FunctionCallback>>,
         attributes: PropertyAttributes,
     },
     SubTemplate {
-        name: JsString,
+        name: PropertyKey,
         template: Rc<ObjectTemplate>,
     },
+}
+
+/// Keep a symbol key alive for as long as the template that stores it.
+///
+/// A `PropertyKey`'s symbol is rooted through the key's own `Trace`, and a
+/// template is not in the collector's graph — it is a host-side `Rc` the isolate
+/// keeps alive — so a stored symbol key would otherwise be one the collector can
+/// take, which is a property that silently disappears. A registered `Symbol.for`
+/// is rooted by the agent's registry and a well-known symbol by its realm; this
+/// is for the unique symbol a host makes itself.
+fn pin_key(pins: &RefCell<Vec<crux::heap::Pin>>, key: &PropertyKey) {
+    if let PropertyKey::Symbol(symbol) = key {
+        pins.borrow_mut().push(crux::heap::pin_handle(*symbol));
+    }
 }
 
 /// The attributes a template's properties are created with
@@ -562,6 +598,7 @@ impl ObjectTemplate {
             properties: RefCell::new(Vec::new()),
             internal_field_count: std::cell::Cell::new(0),
             host_state: RefCell::new(None),
+            key_pins: RefCell::new(Vec::new()),
         })
     }
 
@@ -595,8 +632,20 @@ impl ObjectTemplate {
     /// Define a data property with attributes (v8::ObjectTemplate::Set's third
     /// argument, which is where a host's `DONT_ENUM | READ_ONLY` goes).
     pub fn set_with_attributes(&self, name: &str, value: Local, attributes: PropertyAttributes) {
+        self.set_key_with_attributes(&PropertyKey::from_utf8(name), value, attributes);
+    }
+
+    /// The same for a key that may be a **symbol**, for the reason
+    /// [`FunctionTemplate::set_key`] gives.
+    pub fn set_key_with_attributes(
+        &self,
+        name: &PropertyKey,
+        value: Local,
+        attributes: PropertyAttributes,
+    ) {
+        self.pin_key(name);
         self.properties.borrow_mut().push(TemplateProperty::Data {
-            name: JsString::from_utf8(name),
+            name: name.clone(),
             value: value.into_value(),
             attributes,
         });
@@ -605,12 +654,23 @@ impl ObjectTemplate {
     /// Define a property whose value is a fresh instance of `template`
     /// (v8::ObjectTemplate::Set with a template).
     pub fn set_template(&self, name: &str, template: &Rc<ObjectTemplate>) {
+        self.set_template_key(&PropertyKey::from_utf8(name), template);
+    }
+
+    /// The same for a key that may be a **symbol**.
+    pub fn set_template_key(&self, name: &PropertyKey, template: &Rc<ObjectTemplate>) {
+        self.pin_key(name);
         self.properties
             .borrow_mut()
             .push(TemplateProperty::SubTemplate {
-                name: JsString::from_utf8(name),
+                name: name.clone(),
                 template: Rc::clone(template),
             });
+    }
+
+    /// Keep a symbol key alive for as long as this template — see [`pin_key`].
+    fn pin_key(&self, key: &PropertyKey) {
+        pin_key(&self.key_pins, key);
     }
 
     /// Define an accessor property whose getter/setter are host callbacks
@@ -648,10 +708,22 @@ impl ObjectTemplate {
         setter: Option<Rc<FunctionCallback>>,
         attributes: PropertyAttributes,
     ) {
+        self.set_accessor_key_rc(&PropertyKey::from_utf8(name), getter, setter, attributes);
+    }
+
+    /// The same for a key that may be a **symbol**.
+    pub fn set_accessor_key_rc(
+        &self,
+        name: &PropertyKey,
+        getter: Rc<FunctionCallback>,
+        setter: Option<Rc<FunctionCallback>>,
+        attributes: PropertyAttributes,
+    ) {
+        self.pin_key(name);
         self.properties
             .borrow_mut()
             .push(TemplateProperty::Accessor {
-                name: JsString::from_utf8(name),
+                name: name.clone(),
                 getter,
                 setter,
                 attributes,
@@ -691,7 +763,7 @@ impl ObjectTemplate {
                     value,
                     attributes,
                 } => {
-                    target.define_property_or_throw(
+                    target.define_property_key_or_throw(
                         name,
                         &PropertyDescriptor {
                             value: Some(*value),
@@ -714,7 +786,7 @@ impl ObjectTemplate {
                         Rc::clone(getter),
                         Some(JsString::from_utf8(&format!(
                             "get {}",
-                            name.to_string_lossy()
+                            name.display_string()
                         ))),
                         function_prototype,
                         false,
@@ -726,7 +798,7 @@ impl ObjectTemplate {
                                 Rc::clone(setter),
                                 Some(JsString::from_utf8(&format!(
                                     "set {}",
-                                    name.to_string_lossy()
+                                    name.display_string()
                                 ))),
                                 function_prototype,
                                 false,
@@ -735,7 +807,7 @@ impl ObjectTemplate {
                         ),
                         None => None,
                     };
-                    target.define_property_or_throw(
+                    target.define_property_key_or_throw(
                         name,
                         &PropertyDescriptor {
                             value: None,
@@ -749,7 +821,7 @@ impl ObjectTemplate {
                 }
                 TemplateProperty::SubTemplate { name, template } => {
                     let instance = template.new_instance_with_realm(realm)?;
-                    target.define_property_or_throw(
+                    target.define_property_key_or_throw(
                         name,
                         &PropertyDescriptor {
                             value: Some(instance),
