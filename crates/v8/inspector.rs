@@ -6,13 +6,22 @@
 //! is engine work (the plan calls it "the inspector protocol" for that reason),
 //! not bridging work.
 //!
-//! So this module is the shape a host compiles against, and the entry point that
-//! would start a session — [`V8Inspector::create`] — aborts with that reason.
-//! Everything only reachable through a created inspector does the same, so a
-//! host that attaches a debugger is told at once instead of waiting on a session
-//! that would never answer. Failing loudly beats two alternatives: a silent
-//! session that a debugger hangs on, and a protocol that answers every method
-//! with an error a host cannot distinguish from a bug.
+//! The tier splits, and each half says so where a host meets it:
+//!
+//! * **Creation and the context lifecycle are inert.** [`V8Inspector::create`]
+//!   answers a real inspector, and [`V8Inspector::context_created`],
+//!   [`context_destroyed`](V8Inspector::context_destroyed) and
+//!   [`exception_thrown`](V8Inspector::exception_thrown) record nothing and do
+//!   nothing. That is what a host needs to *boot*: `deno_core` sets
+//!   `inspector: true` for its main worker and creates one for every runtime,
+//!   whether or not a debugger ever connects. None of these calls is read back
+//!   by the engine, so a program that never inspects cannot observe them.
+//! * **The protocol refuses.** [`V8Inspector::connect`] and everything a session
+//!   would answer abort with the reason, so a host that attaches a debugger is
+//!   told at once instead of waiting on a session that never answers. Failing
+//!   loudly beats two alternatives: a silent session that a debugger hangs on,
+//!   and a protocol that answers every method with an error a host cannot
+//!   distinguish from a bug.
 //!
 //! The *data* types here are real, and tested: [`StringView`], [`StringBuffer`],
 //! [`Channel`] and the client trait are Rust values that do what their names
@@ -26,8 +35,9 @@ use crate::data::{Context, Value};
 use crate::handle::Local;
 use crate::support::{UniquePtr, UniqueRef};
 
-/// The one reason every engine-backed operation here refuses, so a host reads
-/// the same sentence wherever it runs into the wall.
+/// The one reason every *protocol* operation here refuses, so a host reads the
+/// same sentence wherever it runs into the wall. Creation and the context
+/// lifecycle do not use it: they are inert, as the module documentation says.
 const NO_INSPECTOR: &str = "Slag has no inspector: no breakpoints, no stepping, no debug protocol, and no way to stop a running script";
 
 /// A string the inspector passes around, whose code units may be one byte or
@@ -177,9 +187,8 @@ impl fmt::Debug for Channel {
 
 /// A stack trace as the inspector handles it (`v8::inspector::V8StackTrace`).
 ///
-/// No value exists: [`V8Inspector::create_stack_trace`] refuses, and that is the
-/// only way the crate we stand in for makes one.
-#[derive(Debug)]
+/// The value is empty: [`V8Inspector::create_stack_trace`] answers one so a host
+/// has something to pass to `exception_thrown`, and nothing reads it.
 pub struct V8StackTrace(PhantomData<*const ()>);
 
 /// What a host tells the inspector while it debuggers
@@ -263,27 +272,32 @@ pub enum V8InspectorClientTrustLevel {
 
 /// The inspector itself (`v8::inspector::V8Inspector`).
 ///
-/// No value of this type can be obtained: [`create`](Self::create) refuses,
-/// because there is no debugger behind it. The type exists so a host's own
+/// An inspector with no debugger behind it.
+///
+/// **Inert.** [`create`](Self::create) answers one so a host can boot, the
+/// context lifecycle records nothing, and the protocol — [`connect`](Self::connect)
+/// and the session it would make — refuses. The type exists so a host's own
 /// inspector wrapper — `deno_core`'s `JsRuntimeInspector`, which holds an
-/// `Rc<V8Inspector>` — has something to name.
+/// `Rc<V8Inspector>` — has something to name and to hand around.
 pub struct V8Inspector {
     /// The client, held as the crate we stand in for holds it: for the
-    /// inspector's lifetime, which never begins here.
+    /// inspector's lifetime. Nothing here calls it, because only a debugger
+    /// would.
     _client: V8InspectorClient,
 }
 
 impl V8Inspector {
     /// Create an inspector for `isolate` (`v8::inspector::V8Inspector::Create`).
     ///
-    /// # Panics
-    ///
-    /// Always: Slag has no inspector to create. See the module documentation for
-    /// why this refuses rather than handing back a session that cannot answer.
+    /// The inspector is inert: it observes no isolate and reports nothing. What
+    /// it buys is that a host which starts a runtime *with* an inspector — which
+    /// `deno_core` does for every runtime — runs, and what it does not buy is a
+    /// debugger: a host that attaches one still meets the wall at
+    /// [`connect`](Self::connect).
     #[allow(clippy::new_ret_no_self)]
     pub fn create(isolate: &mut crate::Isolate, client: V8InspectorClient) -> V8Inspector {
-        let _ = (isolate, client);
-        panic!("v8::inspector::V8Inspector::create: {NO_INSPECTOR}")
+        let _ = isolate;
+        V8Inspector { _client: client }
     }
 
     /// Connect a front end to this inspector
@@ -291,7 +305,9 @@ impl V8Inspector {
     ///
     /// # Panics
     ///
-    /// Always. Only reachable through a created inspector, which cannot exist.
+    /// Always: the protocol is the half of this module that refuses. A host
+    /// that attaches a debugger is told at once rather than handed a session
+    /// that would never answer it.
     pub fn connect(
         &self,
         context_group_id: i32,
@@ -306,9 +322,9 @@ impl V8Inspector {
     /// Tell the inspector about a context
     /// (`v8::inspector::V8Inspector::contextCreated`).
     ///
-    /// # Panics
-    ///
-    /// Always, for the same reason as [`connect`](Self::connect).
+    /// Inert: the name and the aux data a host passes describe the context to a
+    /// debugger, and there is none. A runtime makes this call whether or not one
+    /// ever connects, which is why it must not refuse.
     pub fn context_created(
         &self,
         context: Local<Context>,
@@ -317,40 +333,36 @@ impl V8Inspector {
         aux_data: StringView,
     ) {
         let _ = (context, context_group_id, human_readable_name, aux_data);
-        panic!("v8::inspector::V8Inspector::context_created: {NO_INSPECTOR}")
     }
 
     /// Tell the inspector a context is gone
     /// (`v8::inspector::V8Inspector::contextDestroyed`).
     ///
-    /// # Panics
-    ///
-    /// Always, for the same reason as [`connect`](Self::connect).
+    /// Inert, for the same reason as [`context_created`](Self::context_created).
     pub fn context_destroyed(&self, context: Local<Context>) {
         let _ = context;
-        panic!("v8::inspector::V8Inspector::context_destroyed: {NO_INSPECTOR}")
     }
 
     /// Wrap a stack trace for the inspector
     /// (`v8::inspector::V8Inspector::createStackTrace`).
     ///
-    /// # Panics
-    ///
-    /// Always, for the same reason as [`connect`](Self::connect).
+    /// Inert: answers an empty trace, which is the one value a host hands back
+    /// to [`exception_thrown`](Self::exception_thrown). Nothing reads it.
     pub fn create_stack_trace(
         &self,
         stack_trace: Option<Local<crate::StackTrace>>,
     ) -> UniquePtr<V8StackTrace> {
         let _ = stack_trace;
-        panic!("v8::inspector::V8Inspector::create_stack_trace: {NO_INSPECTOR}")
+        UniquePtr::from(UniqueRef::new(V8StackTrace(PhantomData)))
     }
 
     /// Report an exception to the inspector
     /// (`v8::inspector::V8Inspector::exceptionThrown`).
     ///
-    /// # Panics
-    ///
-    /// Always, for the same reason as [`connect`](Self::connect).
+    /// Inert: nothing is reported, and the exception id V8 would answer is `0`.
+    /// The runtime's own handling does not depend on it — `deno_core` calls this
+    /// while dispatching an uncaught exception and then terminates the script
+    /// itself (`libs/core/error.rs`).
     #[allow(clippy::too_many_arguments)]
     pub fn exception_thrown(
         &self,
@@ -375,7 +387,7 @@ impl V8Inspector {
             stack_trace,
             script_id,
         );
-        panic!("v8::inspector::V8Inspector::exception_thrown: {NO_INSPECTOR}")
+        0
     }
 }
 
@@ -533,19 +545,98 @@ mod tests {
         );
     }
 
-    /// The one entry point that would debug refuses, and says why.
+    /// A host can *create* an inspector, which is what a runtime that sets
+    /// `inspector: true` needs before anything else can run.
     #[test]
-    #[should_panic(expected = "Slag has no inspector")]
-    fn creating_an_inspector_refuses_with_the_reason() {
+    fn an_inspector_is_created() {
         let isolate = &mut crate::Isolate::new(crate::CreateParams::default());
         crate::scope!(let scope, isolate);
         let client = V8InspectorClient::new(Box::new(Noop));
-        V8Inspector::create(scope, client);
+        let inspector = V8Inspector::create(scope, client);
+        let _ = inspector;
+    }
+
+    /// The context lifecycle is inert: a runtime tells its inspector about every
+    /// realm it makes, whether or not a debugger ever connects.
+    #[test]
+    fn telling_the_inspector_about_a_context_is_inert() {
+        let isolate = &mut crate::Isolate::new(crate::CreateParams::default());
+        crate::scope!(let scope, isolate);
+        let context = crate::Context::new(scope, Default::default());
+        let client = V8InspectorClient::new(Box::new(Noop));
+        let inspector = V8Inspector::create(scope, client);
+
+        inspector.context_created(
+            context,
+            1,
+            StringView::from(&b"main realm"[..]),
+            StringView::from(&br#"{"isDefault": true, "type": "default"}"#[..]),
+        );
+        inspector.context_destroyed(context);
+    }
+
+    /// The exception path is inert too: the runtime reports an uncaught
+    /// exception on its way to terminating the script, so both calls have to
+    /// answer — an empty trace to hand back, and the id `0`.
+    #[test]
+    fn the_inspectors_exception_path_is_inert() {
+        let isolate = &mut crate::Isolate::new(crate::CreateParams::default());
+        crate::scope!(let scope, isolate);
+        let context = crate::Context::new(scope, Default::default());
+        let client = V8InspectorClient::new(Box::new(Noop));
+        let inspector = V8Inspector::create(scope, client);
+
+        let trace = inspector.create_stack_trace(None);
+        assert!(!trace.is_null(), "an empty trace, not a null one");
+        let thrown: Local<'_, Value> = crate::undefined(scope).into();
+        assert_eq!(
+            inspector.exception_thrown(
+                context,
+                StringView::from(&b"Uncaught"[..]),
+                thrown,
+                StringView::empty(),
+                StringView::empty(),
+                0,
+                0,
+                trace,
+                0,
+            ),
+            0,
+            "nothing is reported, and the id is the crate's zero"
+        );
+    }
+
+    /// The tier's refusing half: a host that attaches a debugger still meets the
+    /// wall at once, which is the module's own "failing loudly beats a silent
+    /// session" kept where it is still true.
+    #[test]
+    #[should_panic(expected = "Slag has no inspector")]
+    fn connecting_a_debugger_refuses_with_the_reason() {
+        let isolate = &mut crate::Isolate::new(crate::CreateParams::default());
+        crate::scope!(let scope, isolate);
+        let client = V8InspectorClient::new(Box::new(Noop));
+        let inspector = V8Inspector::create(scope, client);
+        inspector.connect(
+            1,
+            Channel::new(Box::new(NoopChannel)),
+            StringView::empty(),
+            V8InspectorClientTrustLevel::FullyTrusted,
+        );
     }
 
     struct Noop;
 
     impl V8InspectorClientImpl for Noop {}
+
+    struct NoopChannel;
+
+    impl ChannelImpl for NoopChannel {
+        fn send_response(&self, _call_id: i32, _message: UniquePtr<StringBuffer>) {}
+
+        fn send_notification(&self, _message: UniquePtr<StringBuffer>) {}
+
+        fn flush_protocol_notifications(&self) {}
+    }
 
     /// A client is a real wrapper over the host's implementation, so a host's
     /// own trait impl compiles and its defaults are reachable.
