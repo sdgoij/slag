@@ -1346,7 +1346,27 @@ fn visit(
                             visit(agent, realm, externals, host, home, objects, serials)?;
                         }
                     }
-                    Callable::Class { heritage, keys, .. } => {
+                    Callable::Class {
+                        heritage,
+                        keys,
+                        environment,
+                        ..
+                    } => {
+                        // The class scope record its methods close over, walked the
+                        // way a closure's chain is: the class name binding it holds
+                        // names the class itself, which the serials map already
+                        // answers by the time this arm runs.
+                        if let Some(environment) = environment {
+                            visit_env(
+                                agent,
+                                realm,
+                                externals,
+                                host,
+                                environment,
+                                objects,
+                                serials,
+                            )?;
+                        }
                         // Both are values the record refers to by serial, so both
                         // are walked: a heritage this format cannot carry refuses
                         // here rather than becoming a reference no load could
@@ -1729,13 +1749,15 @@ enum Callable<'a> {
         data: Option<Value>,
         construct: bool,
     },
-    /// A class constructor: the class source, and the definition-time **inputs**
+    /// A class constructor: the class source, the definition-time **inputs**
     /// the rebuild must not re-evaluate — the heritage value (`None` for a class
-    /// with no `extends` clause) and the computed element keys.
+    /// with no `extends` clause) and the computed element keys — and its
+    /// [[Environment]], which is the class scope record its methods close over.
     Class {
         source: &'a JsString,
         heritage: Option<Value>,
         keys: &'a [PropertyKey],
+        environment: Option<EnvRef>,
     },
     /// A method that reads a private name: the class whose declaration owns the
     /// name, the member's key, which of the three forms it is, and its
@@ -1810,13 +1832,17 @@ impl Grammar {
     }
 
     /// Whether this grammar's record may name the [[Environment]] it closed
-    /// over: true for the three the restore *instantiates* from their source — a
-    /// function, a method and an arrow. A class constructor is the one evaluated
-    /// instead, so the environment it gets is the reading realm's global. The
-    /// writer decides per record whether a chain it *can* carry is written, so a
-    /// record may still answer `NO_REF` here (see `callable`).
+    /// over: true for every grammar whose body can read a name from the chain it
+    /// was written in — a function, a method, an arrow and a class constructor,
+    /// which the restore evaluates under the carried environment when it names
+    /// one (see `build_class_function`). The writer decides per record whether a
+    /// chain it *can* carry is written, so a record may still answer `NO_REF`
+    /// here (see `callable`).
     fn carries_environment(self) -> bool {
-        matches!(self, Grammar::Function | Grammar::Method | Grammar::Arrow)
+        matches!(
+            self,
+            Grammar::Function | Grammar::Method | Grammar::Arrow | Grammar::Class
+        )
     }
 }
 
@@ -1949,6 +1975,13 @@ fn callable<'a>(
                     source,
                     heritage: carried_heritage(agent, data),
                     keys: &data.computed_keys,
+                    // The class scope record every one of its methods closes over,
+                    // with the same fall-back an arrow takes: a chain the format
+                    // cannot carry leaves the class's methods resolving the
+                    // reading realm's global, which is where they were before this
+                    // field existed.
+                    environment: carriable_environment(realm, data.environment)
+                        .then_some(data.environment),
                 });
             } else if data.is_method {
                 // A method's source is the MethodDefinition it was written as, so
@@ -2727,13 +2760,14 @@ fn write_record(
                     source,
                     heritage,
                     keys,
+                    environment,
                 } => write_function(
                     realm,
                     &function,
                     Grammar::Class,
                     source,
                     true,
-                    None,
+                    environment,
                     Carried::Class { heritage, keys },
                     serials,
                     body,
@@ -4449,7 +4483,13 @@ impl Builder<'_> {
                     Grammar::Function => {
                         self.build_function(source, *strict, *environment_serial, *proto)?
                     }
-                    Grammar::Class => self.build_class_function(source, *heritage, keys, *proto)?,
+                    Grammar::Class => self.build_class_function(
+                        source,
+                        *heritage,
+                        keys,
+                        *proto,
+                        *environment_serial,
+                    )?,
                     Grammar::Method => self.build_method_function(
                         source,
                         *proto,
@@ -5414,6 +5454,7 @@ impl Builder<'_> {
         heritage: u32,
         keys: &[u32],
         proto: u32,
+        environment: u32,
     ) -> Result<Handle<Function>, DecodeError> {
         let proto = self.prototype(proto)?.ok_or_else(|| {
             DecodeError::UnrebuildableFunction("the record names no prototype".into())
@@ -5426,6 +5467,11 @@ impl Builder<'_> {
             NO_REF => None,
             heritage => Some(self.materialize(heritage)?),
         };
+        // The chain the class's methods close over: the record the writer named,
+        // or the reading realm's global when it named none. Resolved here, before
+        // the context is pushed, because building an environment record allocates
+        // and re-enters the builder.
+        let environment = self.function_environment(environment)?;
         let mut resolved = Vec::with_capacity(keys.len());
         for serial in keys {
             let value = self.materialize(*serial)?;
@@ -5450,6 +5496,13 @@ impl Builder<'_> {
         self.agent.push_bootstrap_context(realm);
         if let Some(context) = self.agent.execution_context_stack.last_mut() {
             context.source = Some(JsString::from_utf8(&wrapped));
+            // `setup_class_scope` builds the class scope record's outer from the
+            // running context's lexical environment, and every method the
+            // evaluation makes closes over that class scope record — so this is
+            // the field that decides whether the restored class's bodies can read
+            // the names the class was written among.
+            context.lexical_environment = environment;
+            context.variable_environment = environment;
         }
         let value = crate::class::class_definition_evaluation_with_keys(
             self.agent, class, class.name, heritage, &resolved,
@@ -6818,6 +6871,84 @@ mod tests {
             called(back),
             Some("functionundefined3".to_string()),
             "and the restored one reaches both through the chain it carries"
+        );
+    }
+
+    /// A class the snapshot captured inside a wrapper keeps the chain it was
+    /// written among: its constructor and its methods read a wrapper binding
+    /// after the round trip, which is what a class constructor's `[[Environment]]`
+    /// is for.
+    ///
+    /// deno's `ext/web/02_event.js` is an IIFE whose `Event` class's constructor
+    /// body reads the IIFE-level `const _canceledFlag`, which surfaced as
+    /// `ReferenceError: "_canceledFlag" is not defined` when the restored class
+    /// was constructed.
+    #[test]
+    fn a_class_defined_in_a_wrapper_round_trips() {
+        let mut isolate = api::Isolate::new();
+        let context = api::Context::new(&mut isolate).expect("a realm");
+        let realm = *context.realm();
+        let value = context
+            .try_eval(
+                "(() => { const kept = 7; return class { constructor() { this.n = kept; } \
+                 m() { return kept + 1; } }; })()",
+            )
+            .expect("a class inside a wrapper")
+            .into_value();
+        let call = |value: Value| {
+            run_restored(
+                &isolate,
+                &realm,
+                value,
+                "(function () { try { const c = new restored(); \
+                 return 'n=' + c.n + ' m=' + c.m(); } catch (e) { \
+                 return e.constructor.name + ': ' + e.message; } })()",
+            )
+            .as_string()
+            .map(|text| text.to_string_lossy())
+        };
+        // The same call before the snapshot, so the test cannot pass on a class
+        // whose bodies never read the wrapper at all.
+        assert_eq!(
+            call(value),
+            Some("n=7 m=8".to_string()),
+            "the fresh class reads the wrapper's binding"
+        );
+        let back = round_trip(&isolate, &realm, value);
+        assert_eq!(
+            call(back),
+            Some("n=7 m=8".to_string()),
+            "and the restored one reaches it through the chain the class carries"
+        );
+    }
+
+    /// A class whose chain is reachable **only** through the class record: with no
+    /// method to carry the same environment, the walk has to reach it from the
+    /// constructor, which is what pins the walk half of the class environment.
+    #[test]
+    fn a_class_with_no_methods_carries_its_chain() {
+        let mut isolate = api::Isolate::new();
+        let context = api::Context::new(&mut isolate).expect("a realm");
+        let realm = *context.realm();
+        let value = context
+            .try_eval(
+                "(() => { const kept = 7; return class { constructor() { this.n = kept; } }; })()",
+            )
+            .expect("a class inside a wrapper")
+            .into_value();
+        let back = round_trip(&isolate, &realm, value);
+        assert_eq!(
+            run_restored(
+                &isolate,
+                &realm,
+                back,
+                "(function () { try { return String(new restored().n); } catch (e) { \
+                 return e.constructor.name + ': ' + e.message; } })()",
+            )
+            .as_string()
+            .map(|text| text.to_string_lossy()),
+            Some("7".to_string()),
+            "the constructor reaches the wrapper's binding through the chain the class carries"
         );
     }
 
