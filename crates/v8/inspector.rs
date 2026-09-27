@@ -8,20 +8,33 @@
 //!
 //! The tier splits, and each half says so where a host meets it:
 //!
-//! * **Creation and the context lifecycle are inert.** [`V8Inspector::create`]
-//!   answers a real inspector, and [`V8Inspector::context_created`],
+//! * **Creation, the context lifecycle and a connection are inert.**
+//!   [`V8Inspector::create`] answers a real inspector,
+//!   [`context_created`](V8Inspector::context_created),
 //!   [`context_destroyed`](V8Inspector::context_destroyed) and
-//!   [`exception_thrown`](V8Inspector::exception_thrown) record nothing and do
-//!   nothing. That is what a host needs to *boot*: `deno_core` sets
-//!   `inspector: true` for its main worker and creates one for every runtime,
-//!   whether or not a debugger ever connects. None of these calls is read back
-//!   by the engine, so a program that never inspects cannot observe them.
-//! * **The protocol refuses.** [`V8Inspector::connect`] and everything a session
-//!   would answer abort with the reason, so a host that attaches a debugger is
-//!   told at once instead of waiting on a session that never answers. Failing
-//!   loudly beats two alternatives: a silent session that a debugger hangs on,
-//!   and a protocol that answers every method with an error a host cannot
-//!   distinguish from a bug.
+//!   [`exception_thrown`](V8Inspector::exception_thrown) record nothing, and
+//!   [`connect`](V8Inspector::connect) answers a session. That is what a host
+//!   needs to *boot*, and the connection has to be usable rather than refused:
+//!   `deno_core` creates an inspector for every runtime, and deno's CLI connects
+//!   a session for **every worker** whether or not a debugger ever attaches —
+//!   `cli/lib/worker.rs` stores the main runtime's session sender
+//!   unconditionally and the worker's event loop turns that into `connect` — so
+//!   refusing the connection would make a worker impossible rather than
+//!   undebuggable. None of these calls is read back by the engine, so a program
+//!   that never inspects cannot observe them.
+//! * **The protocol refuses.** A session answers `can_dispatch_method` `false`
+//!   for everything, and every method a front end would drive —
+//!   `dispatch_protocol_message`, `schedule_pause_on_next_statement`,
+//!   `cancel_pause_on_next_statement` — aborts with the reason. The refusal
+//!   therefore happens at the first message a debugger *sends* rather than at the
+//!   connection, and that is the same bet the module always made, one step later:
+//!   a host that attaches a debugger is told at once instead of waiting on a
+//!   session that never answers. The alternatives stay rejected — a silent session
+//!   a debugger hangs on, and a protocol answering every method with an error a
+//!   host cannot distinguish from a bug — and what the split buys is that a
+//!   connection is inert rather than a facade: nothing is ever sent to the
+//!   channel, and a session exists only because a host that boots one
+//!   unconditionally has to be able to.
 //!
 //! The *data* types here are real, and tested: [`StringView`], [`StringBuffer`],
 //! [`Channel`] and the client trait are Rust values that do what their names
@@ -36,8 +49,9 @@ use crate::handle::Local;
 use crate::support::{UniquePtr, UniqueRef};
 
 /// The one reason every *protocol* operation here refuses, so a host reads the
-/// same sentence wherever it runs into the wall. Creation and the context
-/// lifecycle do not use it: they are inert, as the module documentation says.
+/// same sentence wherever it runs into the wall. Creation, the context lifecycle
+/// and a connection do not use it: they are inert, as the module documentation
+/// says.
 const NO_INSPECTOR: &str = "Slag has no inspector: no breakpoints, no stepping, no debug protocol, and no way to stop a running script";
 
 /// A string the inspector passes around, whose code units may be one byte or
@@ -275,8 +289,8 @@ pub enum V8InspectorClientTrustLevel {
 /// An inspector with no debugger behind it.
 ///
 /// **Inert.** [`create`](Self::create) answers one so a host can boot, the
-/// context lifecycle records nothing, and the protocol — [`connect`](Self::connect)
-/// and the session it would make — refuses. The type exists so a host's own
+/// context lifecycle records nothing, and a connection is inert while the
+/// protocol refuses at its first message. The type exists so a host's own
 /// inspector wrapper — `deno_core`'s `JsRuntimeInspector`, which holds an
 /// `Rc<V8Inspector>` — has something to name and to hand around.
 pub struct V8Inspector {
@@ -303,11 +317,12 @@ impl V8Inspector {
     /// Connect a front end to this inspector
     /// (`v8::inspector::V8Inspector::connect`).
     ///
-    /// # Panics
-    ///
-    /// Always: the protocol is the half of this module that refuses. A host
-    /// that attaches a debugger is told at once rather than handed a session
-    /// that would never answer it.
+    /// Inert, and deliberately so: the session answers nothing and the channel is
+    /// never written to, but the call succeeds. A host may connect one before it
+    /// knows a debugger exists — deno's CLI does that for every worker — and a
+    /// refusal here would take the whole host down rather than the debugger. What
+    /// refuses is the first protocol message a front end sends, which is where a
+    /// host can still be told at once (see the module documentation).
     pub fn connect(
         &self,
         context_group_id: i32,
@@ -315,8 +330,8 @@ impl V8Inspector {
         state: StringView,
         client_trust_level: V8InspectorClientTrustLevel,
     ) -> V8InspectorSession {
-        let _ = (context_group_id, channel, state, client_trust_level);
-        panic!("v8::inspector::V8Inspector::connect: {NO_INSPECTOR}")
+        let _ = (context_group_id, state, client_trust_level);
+        V8InspectorSession { _channel: channel }
     }
 
     /// Tell the inspector about a context
@@ -394,10 +409,13 @@ impl V8Inspector {
 /// A front end's connection to the inspector
 /// (`v8::inspector::V8InspectorSession`).
 ///
-/// No value of this type can be obtained: [`V8Inspector::connect`] refuses.
+/// The connection is inert: a value of this type is obtained from
+/// [`V8Inspector::connect`], it holds the host's channel, nothing is ever sent to
+/// that channel, and the protocol methods below abort with the reason at the
+/// first call.
 pub struct V8InspectorSession {
-    /// The channel, held as the crate we stand in for holds it: for the
-    /// session's lifetime, which never begins here.
+    /// The channel, held as the crate we stand in for holds it: for the session's
+    /// lifetime. Nothing here writes to it.
     _channel: Channel,
 }
 
@@ -416,7 +434,11 @@ impl V8InspectorSession {
     ///
     /// # Panics
     ///
-    /// Always. Only reachable through a connected session, which cannot exist.
+    /// Always, and this is the point the module chooses: a session can be
+    /// connected — a host that boots one unconditionally has to be able to — but
+    /// the first message a front end sends is where a debugger is told the truth
+    /// rather than left waiting. Reachable exactly when something speaks the
+    /// protocol, and reaching it is the loud failure the tier promises.
     pub fn dispatch_protocol_message(&self, message: StringView) {
         let _ = message;
         panic!("v8::inspector::V8InspectorSession::dispatch_protocol_message: {NO_INSPECTOR}")
@@ -606,22 +628,64 @@ mod tests {
         );
     }
 
-    /// The tier's refusing half: a host that attaches a debugger still meets the
-    /// wall at once, which is the module's own "failing loudly beats a silent
-    /// session" kept where it is still true.
+    /// The tier's refusing half, at its new point: a connection is inert, and a
+    /// front end that speaks is told at once — which is the module's own "failing
+    /// loudly beats a silent session" kept where it is still true.
     #[test]
-    #[should_panic(expected = "Slag has no inspector")]
-    fn connecting_a_debugger_refuses_with_the_reason() {
+    fn a_session_can_be_connected_and_answers_nothing() {
         let isolate = &mut crate::Isolate::new(crate::CreateParams::default());
         crate::scope!(let scope, isolate);
         let client = V8InspectorClient::new(Box::new(Noop));
         let inspector = V8Inspector::create(scope, client);
-        inspector.connect(
+        // Holding the session is the assertion the tier is about: the call
+        // answers rather than refusing, which is what a host that boots one
+        // unconditionally needs.
+        let _session = inspector.connect(
             1,
             Channel::new(Box::new(NoopChannel)),
             StringView::empty(),
             V8InspectorClientTrustLevel::FullyTrusted,
         );
+        // No method the protocol has is answered, so a host that asks before it
+        // sends knows not to send.
+        assert!(!V8InspectorSession::can_dispatch_method(StringView::from(
+            "Runtime.enable".as_bytes()
+        )));
+    }
+
+    /// The same connection, at the first message a front end sends.
+    #[test]
+    #[should_panic(expected = "Slag has no inspector")]
+    fn the_protocol_refuses_at_the_first_message() {
+        let isolate = &mut crate::Isolate::new(crate::CreateParams::default());
+        crate::scope!(let scope, isolate);
+        let client = V8InspectorClient::new(Box::new(Noop));
+        let inspector = V8Inspector::create(scope, client);
+        let session = inspector.connect(
+            1,
+            Channel::new(Box::new(NoopChannel)),
+            StringView::empty(),
+            V8InspectorClientTrustLevel::FullyTrusted,
+        );
+        session.dispatch_protocol_message(StringView::from("{\"id\":1}".as_bytes()));
+    }
+
+    /// The same wall for the pause a debugger schedules, which a host reaches
+    /// through a session it already holds.
+    #[test]
+    #[should_panic(expected = "Slag has no inspector")]
+    fn scheduling_a_pause_refuses_with_the_reason() {
+        let isolate = &mut crate::Isolate::new(crate::CreateParams::default());
+        crate::scope!(let scope, isolate);
+        let client = V8InspectorClient::new(Box::new(Noop));
+        let inspector = V8Inspector::create(scope, client);
+        let session = inspector.connect(
+            1,
+            Channel::new(Box::new(NoopChannel)),
+            StringView::empty(),
+            V8InspectorClientTrustLevel::FullyTrusted,
+        );
+        session.schedule_pause_on_next_statement(StringView::empty(), StringView::empty());
     }
 
     struct Noop;
