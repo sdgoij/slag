@@ -3717,13 +3717,18 @@ mod tests {
         let buffer = wast::parser::ParseBuffer::new(source).expect("wat parse buffer");
         let mut module: wast::Wat = wast::parser::parse(&buffer).expect("wat parse");
         let bytes = module.encode().expect("wat encode");
-        let mut literal = String::with_capacity(bytes.len() * 4);
+        // A bracketed array literal, so call sites interpolate it as
+        // `new Uint8Array({bytes})` and get the bytes back (an unbracketed
+        // list would be read as a length).
+        let mut literal = String::with_capacity(bytes.len() * 4 + 2);
+        literal.push('[');
         for (index, byte) in bytes.iter().enumerate() {
             if index > 0 {
                 literal.push(',');
             }
             literal.push_str(&byte.to_string());
         }
+        literal.push(']');
         literal
     }
 

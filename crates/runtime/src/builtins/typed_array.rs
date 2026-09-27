@@ -580,9 +580,8 @@ fn assert_same_content_type(
     Ok(())
 }
 
-/// The TypedArray constructor (spec 25.2.2.1): `new` only, with the length,
-/// object (typed-array / buffer / iterable / array-like), and multiple-args
-/// paths.
+/// The TypedArray constructor (spec 25.2.2.1): `new` only, with the length and
+/// object (typed-array / buffer / iterable / array-like) paths.
 fn typed_array_construct(
     agent: &mut Agent,
     args: &[Value],
@@ -602,44 +601,31 @@ fn typed_array_construct(
     // The argument is classified (ToIndex for a non-object, a content-type
     // check for a typed-array source) before the constructor's prototype is
     // read, so e.g. `new TA(Symbol())` throws the ToIndex TypeError first
-    // (spec 25.2.2.1).
+    // (spec 25.2.2.1). A non-object first argument is a requested element
+    // count and any trailing arguments are ignored — `new TA(8, undefined,
+    // undefined)` is length 8, not length 3 — because there is no element-list
+    // form (spec 25.2.2.1 step 7).
     if let Some(first) = args.first()
         && !matches!(first.kind(), ValueKind::Object(_) | ValueKind::Function(_))
-        && args.len() == 1
     {
         let length = crate::context::to_index(agent, first)? as usize;
         let prototype = get_prototype_from_constructor(agent, new_target, kind.proto)?;
         return allocate_typed_array_buffer(agent, prototype, element_type, length);
     }
     let prototype = get_prototype_from_constructor(agent, new_target, kind.proto)?;
-    if args.is_empty() {
+    let Some(first) = args.first() else {
         return allocate_typed_array_buffer(agent, prototype, element_type, 0);
+    };
+    if is_typed_array(first) {
+        return copy_typed_array(agent, prototype, element_type, first);
     }
-    if let Some(first) = args.first()
-        && matches!(first.kind(), ValueKind::Object(_) | ValueKind::Function(_))
-    {
-        if is_typed_array(first) && args.len() == 1 {
-            return copy_typed_array(agent, prototype, element_type, first);
-        }
-        if is_array_buffer(agent, first) {
-            // spec 25.2.3.x step 5.b.ii: the buffer view takes byteOffset and
-            // length from the remaining arguments.
-            return typed_array_buffer_path(agent, prototype, element_type, first, &args[1..]);
-        }
-        if args.len() == 1 {
-            return iterate_source(agent, prototype, element_type, first);
-        }
+    if is_array_buffer(agent, first) {
+        // spec 25.2.3.x step 5.b.ii: the buffer view takes byteOffset and
+        // length from the remaining arguments.
+        return typed_array_buffer_path(agent, prototype, element_type, first, &args[1..]);
     }
-    // Multiple arguments: the argument list is the element list (spec step
-    // 7). The destination is a fresh typed array, so each element is coerced
-    // and written straight into the backing buffer (no per-element decimal
-    // key string or integer-indexed exotic [[Set]]).
-    let dst = allocate_typed_array_buffer(agent, prototype, element_type, args.len())?;
-    let dst_slots = typed_array_slots(&dst).expect("fresh typed array");
-    for (k, value) in args.iter().enumerate() {
-        write_fresh_element(agent, &dst_slots, k as u64, *value)?;
-    }
-    Ok(dst)
+    // An iterable or array-like source; only the first argument is read.
+    iterate_source(agent, prototype, element_type, first)
 }
 
 /// A dense Array source the TypedArray constructor can iterate by index
@@ -3475,9 +3461,8 @@ mod tests {
             text("new BigUint64Array([1n, 18446744073709551615n]).join(',')"),
             "1,18446744073709551615"
         );
-        // The call form throws; multiple args are the element list.
+        // The call form throws.
         assert!(run("Int8Array(3)").is_err());
-        assert_eq!(text("new Uint8Array(1, 2, 3).join(',')"), "1,2,3");
         // Array-like without an iterator.
         assert_eq!(
             text("new Uint8Array({length: 2, 0: 7, 1: 8}).join(',')"),
@@ -3845,6 +3830,36 @@ mod tests {
             ),
             "0"
         );
+    }
+
+    #[test]
+    fn a_non_object_first_argument_is_a_length_and_extra_arguments_are_ignored() {
+        // Node's `Buffer` subclass constructs with `super(length, undefined,
+        // undefined)`; the trailing arguments must not be read as an element
+        // list (spec 25.2.2.1: a non-object first argument is ToIndex'd, the
+        // rest are ignored), or every `Buffer.alloc(8)` silently becomes 3
+        // bytes.
+        assert_eq!(
+            number("new Uint8Array(8, undefined, undefined).length"),
+            8.0
+        );
+        assert_eq!(number("new Uint8Array(8, 0, 8).length"), 8.0);
+        assert_eq!(text("new Uint8Array(8, 0, 8).join(',')"), "0,0,0,0,0,0,0,0");
+        assert_eq!(number("new Uint8Array(1, 2, 3).length"), 1.0);
+        assert_eq!(
+            number(
+                "(function(){ class F extends Uint8Array { constructor(a, b, c) { super(a, b, c); } } return new F(8).length; })()"
+            ),
+            8.0
+        );
+        // An object first argument keeps its own semantics; extras are ignored.
+        assert_eq!(text("new Uint8Array([1, 2], 7).join(',')"), "1,2");
+        assert_eq!(
+            number("new Uint8Array(new Uint8Array([7, 8]), 9).length"),
+            2.0
+        );
+        assert_eq!(number("new Uint8Array({ 0: 9, length: 1 }, 7).length"), 1.0);
+        assert_eq!(number("new Uint8Array(new ArrayBuffer(8), 4).length"), 4.0);
     }
 
     #[test]
