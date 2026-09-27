@@ -1146,6 +1146,26 @@ pub(crate) const INLINE_JIT_BUF: usize = 64;
 /// never promote them). See `.notes/jit-compile-threshold.md`.
 pub(crate) const JIT_COMPILE_THRESHOLD: u32 = 16;
 
+/// The largest body (in steps) the JIT will compile at all. Compile cost is
+/// roughly linear in a body's step count, and a body above this cap costs more
+/// to compile than a pass over the workload repays, so the interpreter serves
+/// it. Measured on deno's tsc probe (`.notes/non-leaf-jit.md` §6): in a debug
+/// build the 567 compiled bodies cost **52.2 s** to compile, and the 125 of them
+/// above this cap cost **36.6 s** of that (18 bodies over 256 steps alone cost
+/// 17.3 s, the 2,277-step scanner ~2.8 s). Refusing them, two samples each in
+/// one session: ungated **151.7 s**, this cap **129.7 s** (the two samples
+/// agreeing to 0.2 s), and pre-`Unary` **136.4 s** — so the cap both removes the
+/// regression the `Unary` slice's extra compiles caused and lands ahead of the
+/// state before it. 514 of 567 bodies stay compiled; the compact loops the JIT
+/// actually wins (`--jit-bench` rows, the 2.4× leaf loop) are all far under it.
+/// A release build compiles ~10× cheaper, so the cap is conservative there — it
+/// trades a bounded compile for an unbounded one, which is the property worth
+/// keeping. A body containing a self-tail-call is exempt ([`body_has_self_tail
+/// _call`]), because its iterations are unbounded within one call. The proxy is
+/// the step count, so a `RunRegBody` (whose op list is inside the step) can hide
+/// cost; the cap errs toward compiling it.
+pub(crate) const JIT_MAX_COMPILE_STEPS: usize = 128;
+
 /// The `BinaryOp` variants in declaration order (a fieldless enum's
 /// discriminant is its index — guaranteed by the language).
 const BINARY_OPS: [BinaryOp; 22] = [
@@ -4926,6 +4946,32 @@ pub(crate) fn lookup_info(
     if known > 1 {
         known as *const JitCompiledInfo
     } else if known == 0 {
+        // The compile-size cap (Cut 92): a body this large is never compiled.
+        // Compile cost is roughly linear in the step count, so a body above
+        // the cap costs more to build than a pass over the workload repays;
+        // the interpreter serves it, which is what the pre-`Unary` census did
+        // for 111 of deno's biggest bodies anyway. The `1` mark is sticky
+        // because the fact cannot change, and it is the same "known
+        // non-compilable" state an unsupported step writes. An eviction
+        // clears it, so a re-consult re-checks against the same constant.
+        // A body with a self-tail-call is exempt: its iterations are unbounded
+        // within ONE call (the step IS the interpreter's TCO loop, which
+        // `body_has_loop` counts as a loop for the same reason), so the
+        // compile amortizes inside a single call however large the body —
+        // measured, the 65-argument vector self-jump of Cut 51/52 is well
+        // above the cap and must compile (`installed_jit_runs_a_vector_self_
+        // tail_call`).
+        if ir.steps.len() > JIT_MAX_COMPILE_STEPS && !crate::ir::body_has_self_tail_call(&ir.steps)
+        {
+            // Observable through the same switch the emitter's refusals use
+            // (`JIT_DUMP_CLIF`), so a census distinguishes "too large to
+            // compile" from "a step the emitter cannot lower".
+            if std::env::var("JIT_DUMP_CLIF").is_ok() {
+                eprintln!("jit skip: body too large ({} steps)", ir.steps.len());
+            }
+            ir.jit_info.set(1);
+            return std::ptr::null();
+        }
         // Cut 69: a straight-line body (`has_loop` false) is run
         // interpreted until it has been consulted `JIT_COMPILE_THRESHOLD`
         // times. The count is deliberately NOT cached (`jit_info` stays 0),
@@ -5732,6 +5778,10 @@ mod tests {
         std::sync::atomic::AtomicUsize::new(0);
     static FAKE_LOOP_LOOKUP_CALLS: std::sync::atomic::AtomicUsize =
         std::sync::atomic::AtomicUsize::new(0);
+    static FAKE_CAP_LOOKUP_CALLS: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(0);
+    static FAKE_EVICT_LOOKUP_CALLS: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(0);
 
     /// A fake cache lookup that always "compiles" (returns `FAKE_INFO`).
     unsafe extern "C" fn fake_lookup(
@@ -5752,14 +5802,36 @@ mod tests {
         FAKE_INFO as *const c_void
     }
 
+    unsafe extern "C" fn fake_cap_lookup(
+        _cache: *mut c_void,
+        _body: *const c_void,
+        _in_flight: bool,
+    ) -> *const c_void {
+        FAKE_CAP_LOOKUP_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        FAKE_INFO as *const c_void
+    }
+
+    unsafe extern "C" fn fake_evict_lookup(
+        _cache: *mut c_void,
+        _body: *const c_void,
+        _in_flight: bool,
+    ) -> *const c_void {
+        FAKE_EVICT_LOOKUP_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        FAKE_INFO as *const c_void
+    }
+
     unsafe extern "C" fn fake_drop_cache(_cache: *mut c_void) {}
 
     fn fake_lookup_calls() -> usize {
         FAKE_LOOKUP_CALLS.load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    fn fake_loop_lookup_calls() -> usize {
-        FAKE_LOOP_LOOKUP_CALLS.load(std::sync::atomic::Ordering::Relaxed)
+    fn fake_cap_lookup_calls() -> usize {
+        FAKE_CAP_LOOKUP_CALLS.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn fake_evict_lookup_calls() -> usize {
+        FAKE_EVICT_LOOKUP_CALLS.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     fn make_body(steps: Vec<crate::ir::Step>, has_loop: bool) -> std::rc::Rc<CompiledBody> {
@@ -5961,15 +6033,69 @@ mod tests {
     }
 
     #[test]
+    fn lookup_info_refuses_bodies_above_the_compile_size_cap() {
+        // Cut 92: a body above the size cap is never compiled, whatever its
+        // shape — a compile costs roughly linear in the step count, so a body
+        // this large is not repaid by a pass over the workload. The refusal is
+        // sticky (the same "known non-compilable" state an unsupported step
+        // writes), so the hook is never consulted and the threshold count is
+        // not spent.
+        FAKE_CAP_LOOKUP_CALLS.store(0, std::sync::atomic::Ordering::Relaxed);
+        let hook = JitHook {
+            cache: std::ptr::null_mut(),
+            lookup: fake_cap_lookup,
+            drop_cache: fake_drop_cache,
+            helpers: &JIT_SLOW_PATHS as *const JitSlowPaths,
+        };
+        let over = make_body(
+            vec![crate::ir::Step::Push(Value::Undefined); JIT_MAX_COMPILE_STEPS + 1],
+            true,
+        );
+        assert!(lookup_info(hook, &over, false).is_null());
+        assert_eq!(over.jit_info.get(), 1, "the refusal is sticky");
+        assert_eq!(over.jit_calls.get(), 0, "the threshold count is not spent");
+        assert_eq!(
+            fake_cap_lookup_calls(),
+            0,
+            "an oversized body never reaches the hook"
+        );
+        // A repeated consult stays refused through the sticky mark.
+        assert!(lookup_info(hook, &over, false).is_null());
+        assert_eq!(fake_cap_lookup_calls(), 0);
+        // A body exactly at the cap compiles as usual.
+        let at_cap = make_body(
+            vec![crate::ir::Step::Push(Value::Undefined); JIT_MAX_COMPILE_STEPS],
+            true,
+        );
+        assert!(!lookup_info(hook, &at_cap, false).is_null());
+        assert_eq!(fake_cap_lookup_calls(), 1);
+        // A body with a self-tail-call is exempt whatever its size: its
+        // per-call iterations are unbounded, so its compile always amortizes
+        // inside one call. Without the exemption the 65-argument vector
+        // self-jump (`installed_jit_runs_a_vector_self_tail_call`) lands on
+        // the interpreter and the compiled-chain contract is lost.
+        let mut oversized_tail_call =
+            vec![crate::ir::Step::Push(Value::Undefined); JIT_MAX_COMPILE_STEPS + 1];
+        oversized_tail_call.push(crate::ir::Step::TailCallSelf { argc: 1 });
+        let tail_call = make_body(oversized_tail_call, true);
+        assert!(!lookup_info(hook, &tail_call, false).is_null());
+        assert_eq!(fake_cap_lookup_calls(), 2);
+    }
+
+    #[test]
     fn lookup_info_waits_for_the_threshold_after_an_eviction() {
         // A body evicted from the cache does not recompile on its next call
         // however hot it is — it waits for the threshold again, which is what
         // keeps a once-per-frame body from paying a compile per frame. A loop
         // body bypasses the threshold only until it has been evicted once.
-        FAKE_LOOP_LOOKUP_CALLS.store(0, std::sync::atomic::Ordering::Relaxed);
+        // `fake_evict_lookup` and its own counter: the parallel
+        // `..._compiles_loop_bodies_on_the_first_consult` test asserts an
+        // absolute count on the shared `FAKE_LOOP_LOOKUP_CALLS`, so the two
+        // could not share it.
+        FAKE_EVICT_LOOKUP_CALLS.store(0, std::sync::atomic::Ordering::Relaxed);
         let hook = JitHook {
             cache: std::ptr::null_mut(),
-            lookup: fake_loop_lookup,
+            lookup: fake_evict_lookup,
             drop_cache: fake_drop_cache,
             helpers: &JIT_SLOW_PATHS as *const JitSlowPaths,
         };
@@ -5983,12 +6109,12 @@ mod tests {
         body.jit_info.set(0);
         body.jit_evictions.set(1);
         body.jit_calls.set(0);
-        let consulted = fake_loop_lookup_calls();
+        let consulted = fake_evict_lookup_calls();
         for _ in 0..JIT_COMPILE_THRESHOLD {
             assert!(lookup_info(hook, &body, false).is_null());
         }
         assert_eq!(
-            fake_loop_lookup_calls(),
+            fake_evict_lookup_calls(),
             consulted,
             "an evicted loop body waits for the threshold"
         );
@@ -5996,7 +6122,7 @@ mod tests {
             !lookup_info(hook, &body, false).is_null(),
             "the (K+1)th consult recompiles it"
         );
-        assert_eq!(fake_loop_lookup_calls(), consulted + 1);
+        assert_eq!(fake_evict_lookup_calls(), consulted + 1);
     }
 
     #[test]

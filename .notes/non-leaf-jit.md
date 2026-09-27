@@ -220,23 +220,30 @@ unchanged — `.notes/embedding.md` §7 has the full record.
 
 ## 6. Milestone 2 and after (ordered by the census, re-taken each time)
 
-- **First, the compile-cost gate — created by Milestone 1's measurement (§5.1).**
+- **First, the compile-cost gate — created by Milestone 1's measurement (§5.1). Landed.**
   A body with a loop compiles on its first consult regardless of size, and the A/B
-  measured what that costs: **72.4 s** of Cranelift compile over 567 bodies, six
-  bodies over a second each, against a **31% slower** tsc probe. So before any
-  more emit arms, the threshold needs a second axis — a loop body should earn a
-  compile too (a step-count cap, or a consult count like the straight-line side),
-  sized by the same same-binary A/B this plan already uses. The census will have
-  to be re-taken after it, because it is the *compile* count that moves, not the
-  refusal list. Cheap alternatives were considered and are worse: an inline number
-  fast path for `-x`/`+x`/`~x` (removing the helper call and its epoch bump) is
-  worth having but cannot fix a regression that is compile cost, and a
-  `SLAG_NO_JIT`-style switch would only measure, not fix.
+  measured what that costs: **52.2 s** of Cranelift compile over 567 bodies (the 125
+  over the cap cost 36.6 s of it), against a tsc probe that the `Unary` slice had
+  made **15 s slower** than before it. So the threshold gained its second axis:
+  `JIT_MAX_COMPILE_STEPS = 128` in `crates/runtime/src/jit.rs`, checked in
+  `lookup_info` before the threshold, refuses the body with the same sticky `1` an
+  unsupported step writes, and prints `jit skip: body too large (N steps)` under
+  `JIT_DUMP_CLIF`. A body with a self-tail-call is exempt (its iterations are
+  unbounded within one call — the tests caught the first cut sending the
+  65-argument vector self-jump of Cut 51/52 to the interpreter). Measured on the
+  file-based tsc probe, two samples each: **ungated 151.7 s, pre-`Unary` 136.4 s,
+  gated 129.7 s** (shipped binary, min-of-2: 155.8 / 140.5 / 134.7 s). The census
+  after the gate: 0 `Unary` bails, **122 skips**, 496 compiled, **one refusal left —
+  the unnamed catch-all (`Construct`)**. `.notes/embedding.md` §7 has the histogram
+  and the sweep table. Alternatives considered and rejected: an inline number fast
+  path for `-x`/`+x`/`~x` (worth having, but it cannot fix a cost that is compile
+  time), and a `SLAG_NO_JIT`-style switch (measures, does not fix).
 
-- **`Step::Construct`** (2 bodies by the catch-all name today, but `new` is
-  ubiquitous in real code, so this figure should be re-taken after
-  Milestone 1 — most `new` sites are currently hidden inside bodies that bail
-  on `Unary` first). The gap §18 records: `Construct` has no `emit_step` arm
+- **`Step::Construct`** (1 body by the catch-all name in the post-gate census — the
+  figure is now honest, because the `Unary` bails that hid most `new` sites are
+  gone, and `new` is ubiquitous in real code, so expect the count to stay small
+  while the *coverage* of it matters more). The gap §18 records: `Construct` has no
+  `emit_step` arm
   and no `step_name` entry; `NewTarget` *is* lowered, so the missing half is
   the construct *call*. The interpreter's reference implementation is the
   construct-inline leaf cache (`run_leaf_construct`, `construct_inline`).
@@ -299,8 +306,8 @@ Per milestone: the census re-taken (the named bails at 0), the engine's gates
 and the corpora green, the focused test plus the differential battery, and the
 two rows of §1 re-measured with the same-binary A/B the JIT wiring was measured
 with. **Milestone 1 met all four parts (§5.1) and its wall-clock row moved the
-wrong way — 31% slower, with the cause measured as compile cost — which is why
-§6 now leads with the compile-cost gate rather than `Construct`.**
+wrong way — the compile-cost gate now leads §6 and is landed with its own
+measurement — so `Construct` is the next milestone after all.**
 
 For the plan as a whole: the forced `deno test` check's wall time moving
 off 14m20s, or a written statement of what the offered bodies' shape is that

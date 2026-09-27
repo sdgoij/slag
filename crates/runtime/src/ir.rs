@@ -21333,15 +21333,9 @@ fn step_targets(step: &Step) -> Vec<usize> {
 /// would never promote them; they compile on first JIT use.
 pub(crate) fn body_has_loop(steps: &[Step]) -> bool {
     for (index, step) in steps.iter().enumerate() {
-        if matches!(
-            step,
-            Step::FastLoopHead { .. }
-                | Step::RunRegBody { .. }
-                | Step::TailCallSelf { .. }
-                | Step::TailCallSelfCheck { .. }
-                | Step::TailCallSelfVector
-                | Step::TailCallSelfCheckVector
-        ) {
+        if matches!(step, Step::FastLoopHead { .. } | Step::RunRegBody { .. })
+            || is_self_tail_call(step)
+        {
             return true;
         }
         for target in step_targets(step) {
@@ -21351,6 +21345,28 @@ pub(crate) fn body_has_loop(steps: &[Step]) -> bool {
         }
     }
     false
+}
+
+/// Whether `step` is a self-tail-call — the callee is statically the running
+/// body itself. The interpreter's TCO loop re-enters the body's entry without
+/// re-consulting the JIT, so such a body's iterations are unbounded within ONE
+/// call.
+fn is_self_tail_call(step: &Step) -> bool {
+    matches!(
+        step,
+        Step::TailCallSelf { .. }
+            | Step::TailCallSelfCheck { .. }
+            | Step::TailCallSelfVector
+            | Step::TailCallSelfCheckVector
+    )
+}
+
+/// Whether the body contains a self-tail-call step. Such a body is exempt
+/// from the JIT's compile-size cap (`crate::jit::JIT_MAX_COMPILE_STEPS`): its
+/// per-call benefit is unbounded (the step *is* the TCO loop), where the cap
+/// exists for bodies whose per-call benefit is bounded by their own size.
+pub(crate) fn body_has_self_tail_call(steps: &[Step]) -> bool {
+    steps.iter().any(is_self_tail_call)
 }
 
 /// Route B: whether `op` is one of the arithmetic shapes the register
