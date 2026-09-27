@@ -240,6 +240,16 @@ const REC_KEYED: u8 = 24;
 const REC_DATE: u8 = 25;
 const REC_REGEXP: u8 = 26;
 
+// Which of the four collection tables a `REC_KEYED` record describes: the strong
+// Map and Set, and the WeakMap and WeakSet. They share one record because they
+// share one shape — a list of entries, `None` for a deleted slot — and differ only
+// in which table the load puts them back in. The first two values are the ones this
+// record carried when it held a `bool`.
+const KEYED_SET: u8 = 0;
+const KEYED_MAP: u8 = 1;
+const KEYED_WEAK_MAP: u8 = 2;
+const KEYED_WEAK_SET: u8 = 3;
+
 /// An array buffer's own flags, in the byte its record carries: whether it is
 /// resizable (a `maxByteLength` was given) and whether it is immutable
 /// (`transferToImmutable`). A shared or detached buffer is refused by the walk
@@ -638,17 +648,21 @@ enum Record {
         extensible: bool,
         properties: Vec<StoredProperty>,
     },
-    /// A Map or a Set (spec 24.1.1 / 24.2.1): whether it is the map, its live
-    /// entries in order — key/value pairs flattened for a map, elements for a
-    /// set — and its object part.
+    /// A Map, a Set, a WeakMap or a WeakSet (spec 24.1.1 / 24.2.1 / 24.3.1 /
+    /// 24.4.1): which of the four it is, its live entries in order — key/value
+    /// pairs flattened for the maps, elements for the sets — and its object part.
     ///
-    /// The entries are the substance: the collection's state lives in the
-    /// agent's table rather than in the object, so nothing else in the record
-    /// would bring it back. The key index is an accelerator rather than state
-    /// and is not written; the load rebuilds it over the entries it reads, and
-    /// the tombstones a delete leaves behind are dropped with it.
+    /// The entries are the substance: a collection's state lives in the agent's
+    /// table rather than in the object, so nothing else in the record would bring
+    /// it back. The key index is an accelerator rather than state and is not
+    /// written; the load rebuilds it over the entries it reads, and the tombstones
+    /// a delete leaves behind are dropped with it. A weak collection's keys are
+    /// ephemerons on the live heap, but they are carried here as ordinary graph
+    /// values: the blob is transport, and a key that was alive when the snapshot
+    /// was written is alive again after the load, which is the state a host is
+    /// reading back.
     Keyed {
-        map: bool,
+        kind: u8,
         entries: Vec<u32>,
         proto: u32,
         extensible: bool,
@@ -2821,6 +2835,17 @@ fn children(agent: &Agent, object: &Handle<JsObject>) -> Result<Vec<Value>, Unsu
         for entry in data.entries.iter().flatten() {
             children.push(*entry);
         }
+    } else if let Some(data) = agent.weak_map_data.get(&object.id()) {
+        let data = data.borrow();
+        for (key, value) in data.iter().flatten() {
+            children.push(*key);
+            children.push(*value);
+        }
+    } else if let Some(data) = agent.weak_set_data.get(&object.id()) {
+        let data = data.borrow();
+        for entry in data.iter().flatten() {
+            children.push(*entry);
+        }
     }
     // A RegExp's source and the constructor it was allocated with live in the
     // agent's table too, so the walk owes the constructor — a value the record
@@ -3124,24 +3149,31 @@ fn write_object(
 /// That table is also the collection's brand, the thing `Map.prototype` methods
 /// check, so it is the one place the format can tell a collection from the
 /// ordinary object it otherwise looks like, and the one place the entries live.
-fn keyed_kind(agent: &Agent, object: &Handle<JsObject>) -> Option<bool> {
-    if agent.map_data.contains_key(&object.id()) {
-        Some(true)
-    } else if agent.set_data.contains_key(&object.id()) {
-        Some(false)
+fn keyed_kind(agent: &Agent, object: &Handle<JsObject>) -> Option<u8> {
+    let id = object.id();
+    if agent.map_data.contains_key(&id) {
+        Some(KEYED_MAP)
+    } else if agent.set_data.contains_key(&id) {
+        Some(KEYED_SET)
+    } else if agent.weak_map_data.contains_key(&id) {
+        Some(KEYED_WEAK_MAP)
+    } else if agent.weak_set_data.contains_key(&id) {
+        Some(KEYED_WEAK_SET)
     } else {
         None
     }
 }
 
-/// Write a Map or Set instance: whether it is the map, its live entries in
-/// order, and its object part.
+/// Write a Map, a Set, a WeakMap or a WeakSet: which of the four it is, its live
+/// entries in order, and its object part.
 ///
 /// The entries are read out of the agent's table in slot order, which is the
-/// order the collection iterates in, so a restored map walks its entries the way
-/// the written one did. Tombstones a delete left behind are skipped rather than
-/// carried: they exist so a parked iterator's index stays valid between jobs, and
-/// a snapshot is taken between jobs.
+/// order the collection iterates in, so a restored collection walks its entries the
+/// way the written one did. Tombstones a delete left behind are skipped rather
+/// than carried: they exist so a parked iterator's index stays valid between jobs,
+/// and a snapshot is taken between jobs. A weak collection's keys are ephemerons
+/// on the live heap; here they are ordinary graph values, because the blob is
+/// transport and a key alive at write time is alive again after the load.
 fn write_keyed(
     agent: &Agent,
     realm: &Handle<Realm>,
@@ -3149,29 +3181,61 @@ fn write_keyed(
     serials: &HashMap<Identity, u32>,
     body: &mut Vec<u8>,
 ) -> Result<(), Unsupported> {
-    let id = object.id();
-    if let Some(data) = agent.map_data.get(&id) {
-        body.push(REC_KEYED);
-        body.push(1);
-        let live: Vec<(Value, Value)> = data.borrow().entries.iter().flatten().copied().collect();
-        write_u32(body, length_as_u32(live.len(), "a map")?);
-        for (key, value) in live {
-            write_u32(body, serial_in(realm, serials, key));
-            write_u32(body, serial_in(realm, serials, value));
-        }
-    } else if let Some(data) = agent.set_data.get(&id) {
-        body.push(REC_KEYED);
-        body.push(0);
-        let live: Vec<Value> = data.borrow().entries.iter().flatten().copied().collect();
-        write_u32(body, length_as_u32(live.len(), "a set")?);
-        for entry in live {
-            write_u32(body, serial_in(realm, serials, entry));
-        }
-    } else {
+    let Some(kind) = keyed_kind(agent, &object) else {
         return Err(Unsupported::new(
-            "a Map or a Set",
+            "a collection",
             "the agent holds no collection state for this object, so there are no entries to write",
         ));
+    };
+    let id = object.id();
+    // Key/value pairs flattened for the maps, elements for the sets — the two weak
+    // tables borrow a plain `Vec` where the two strong ones borrow a
+    // `MapCollection`, which is what keeps this from being one branch.
+    let mut elements: Vec<Value> = Vec::new();
+    match kind {
+        KEYED_MAP => {
+            if let Some(data) = agent.map_data.get(&id) {
+                let data = data.borrow();
+                for (key, value) in data.entries.iter().flatten() {
+                    elements.push(*key);
+                    elements.push(*value);
+                }
+            }
+        }
+        KEYED_WEAK_MAP => {
+            if let Some(data) = agent.weak_map_data.get(&id) {
+                let data = data.borrow();
+                for (key, value) in data.iter().flatten() {
+                    elements.push(*key);
+                    elements.push(*value);
+                }
+            }
+        }
+        KEYED_SET => {
+            if let Some(data) = agent.set_data.get(&id) {
+                let data = data.borrow();
+                elements.extend(data.entries.iter().flatten().copied());
+            }
+        }
+        _ => {
+            if let Some(data) = agent.weak_set_data.get(&id) {
+                let data = data.borrow();
+                elements.extend(data.iter().flatten().copied());
+            }
+        }
+    }
+    body.push(REC_KEYED);
+    body.push(kind);
+    // A map's count is its entry count, and a set's its element count: the reader
+    // doubles the former back into serial slots.
+    let count = if matches!(kind, KEYED_MAP | KEYED_WEAK_MAP) {
+        elements.len() / 2
+    } else {
+        elements.len()
+    };
+    write_u32(body, length_as_u32(count, "a collection")?);
+    for element in elements {
+        write_u32(body, serial_in(realm, serials, element));
     }
     write_u32(body, prototype_serial(realm, &object, serials)?);
     body.push(u8::from(object.extensible.get()));
@@ -4452,9 +4516,12 @@ fn read_record(reader: &mut Reader<'_>) -> Result<Record, DecodeError> {
             })
         }
         REC_KEYED => {
-            let map = reader.u8().ok_or(DecodeError::Truncated)? != 0;
+            let kind = reader.u8().ok_or(DecodeError::Truncated)?;
+            if kind > KEYED_WEAK_SET {
+                return Err(DecodeError::BadTag(kind));
+            }
             let count = reader.u32().ok_or(DecodeError::Truncated)? as usize;
-            let values = if map {
+            let values = if matches!(kind, KEYED_MAP | KEYED_WEAK_MAP) {
                 count.checked_mul(2).ok_or(DecodeError::Truncated)?
             } else {
                 count
@@ -4467,7 +4534,7 @@ fn read_record(reader: &mut Reader<'_>) -> Result<Record, DecodeError> {
             let extensible = reader.u8().ok_or(DecodeError::Truncated)? != 0;
             let properties = read_properties(reader)?;
             Ok(Record::Keyed {
-                map,
+                kind,
                 entries,
                 proto,
                 extensible,
@@ -5505,7 +5572,7 @@ impl Builder<'_> {
                 Built::Object(object)
             }
             Record::Keyed {
-                map,
+                kind,
                 entries,
                 proto,
                 extensible,
@@ -5518,33 +5585,54 @@ impl Builder<'_> {
                 // than restarting the build.
                 self.remember(index, Built::Object(object));
                 let id = object.id();
-                if *map {
-                    if entries.len() % 2 != 0 {
-                        return Err(DecodeError::UnrebuildableObject(
-                            "a map record's entry list is not a list of pairs".into(),
-                        ));
+                match *kind {
+                    KEYED_MAP | KEYED_WEAK_MAP => {
+                        if entries.len() % 2 != 0 {
+                            return Err(DecodeError::UnrebuildableObject(
+                                "a map record's entry list is not a list of pairs".into(),
+                            ));
+                        }
+                        let mut pairs = Vec::with_capacity(entries.len() / 2);
+                        for pair in entries.chunks_exact(2) {
+                            let key = self.materialize(pair[0])?;
+                            let value = self.materialize(pair[1])?;
+                            pairs.push(Some((key, value)));
+                        }
+                        if *kind == KEYED_MAP {
+                            self.agent.map_data.insert(
+                                id,
+                                std::cell::RefCell::new(crate::agent::MapCollection::from_entries(
+                                    pairs,
+                                )),
+                            );
+                        } else {
+                            // A weak table is the plain entry list: the index the
+                            // strong map keeps is an accelerator a WeakMap has no
+                            // use for, and its keys are ephemerons rather than
+                            // strong children.
+                            self.agent
+                                .weak_map_data
+                                .insert(id, std::cell::RefCell::new(pairs));
+                        }
                     }
-                    let mut pairs = Vec::with_capacity(entries.len() / 2);
-                    for pair in entries.chunks_exact(2) {
-                        let key = self.materialize(pair[0])?;
-                        let value = self.materialize(pair[1])?;
-                        pairs.push(Some((key, value)));
+                    _ => {
+                        let mut elements = Vec::with_capacity(entries.len());
+                        for serial in entries {
+                            elements.push(Some(self.materialize(*serial)?));
+                        }
+                        if *kind == KEYED_SET {
+                            self.agent.set_data.insert(
+                                id,
+                                std::cell::RefCell::new(crate::agent::SetCollection::from_entries(
+                                    elements,
+                                )),
+                            );
+                        } else {
+                            self.agent
+                                .weak_set_data
+                                .insert(id, std::cell::RefCell::new(elements));
+                        }
                     }
-                    self.agent.map_data.insert(
-                        id,
-                        std::cell::RefCell::new(crate::agent::MapCollection::from_entries(pairs)),
-                    );
-                } else {
-                    let mut elements = Vec::with_capacity(entries.len());
-                    for serial in entries {
-                        elements.push(Some(self.materialize(*serial)?));
-                    }
-                    self.agent.set_data.insert(
-                        id,
-                        std::cell::RefCell::new(crate::agent::SetCollection::from_entries(
-                            elements,
-                        )),
-                    );
                 }
                 define_properties(self, object, properties)?;
                 // Extensibility last, for the reason `Record::Object` states.

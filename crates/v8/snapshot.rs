@@ -2295,6 +2295,82 @@ mod tests {
         );
     }
 
+    /// A WeakMap's entries live in an ephemeron table on the agent
+    /// (`Agent::weak_map_data`), which is also its brand — a restored one that
+    /// came back as an ordinary object is a WeakMap every method refuses. The key
+    /// is bound on the realm too, so the entry survives the load for the reason it
+    /// survived before it: the key is reachable from somewhere else.
+    #[test]
+    fn a_weak_map_round_trips_with_its_entries() {
+        let mut isolate = Isolate::snapshot_creator(None, None);
+        {
+            crate::scope!(let scope, &mut isolate);
+            let context = Context::new(scope, Default::default());
+            let scope = &mut crate::ContextScope::new(scope, context);
+            scope.set_default_context(context);
+            crate::test_support::bind(scope, "key", crate::test_support::eval(scope, "({})"));
+            let weak = crate::test_support::eval(scope, "new WeakMap([[key, 42]])");
+            scope.add_context_data(context, weak);
+        }
+        let blob = isolate
+            .create_blob(FunctionCodeHandling::Keep)
+            .expect("a blob");
+
+        let mut isolate = isolate_from(blob);
+        let context = restored_context(&mut isolate, DEFAULT_CONTEXT_SLOT)
+            .expect("the blob names the default context");
+        crate::scope!(let scope, &mut isolate);
+        let context = context.open(scope);
+        let scope = &mut crate::ContextScope::new(scope, context);
+        let weak = scope
+            .get_context_data_from_snapshot_once::<Value>(0)
+            .expect("the weak map");
+        crate::test_support::bind(scope, "restoredWeakMap", weak);
+        assert_eq!(
+            crate::test_support::eval_number(scope, "restoredWeakMap.get(key)"),
+            42.0,
+            "a restored WeakMap is a WeakMap"
+        );
+        assert_eq!(
+            crate::test_support::eval_number(scope, "restoredWeakMap.has(key) ? 1 : 0"),
+            1.0
+        );
+    }
+
+    /// A WeakSet's elements travel with it, for the reason a WeakMap's entries do.
+    #[test]
+    fn a_weak_set_round_trips_with_its_elements() {
+        let mut isolate = Isolate::snapshot_creator(None, None);
+        {
+            crate::scope!(let scope, &mut isolate);
+            let context = Context::new(scope, Default::default());
+            let scope = &mut crate::ContextScope::new(scope, context);
+            scope.set_default_context(context);
+            crate::test_support::bind(scope, "elem", crate::test_support::eval(scope, "({})"));
+            let weak = crate::test_support::eval(scope, "new WeakSet([elem])");
+            scope.add_context_data(context, weak);
+        }
+        let blob = isolate
+            .create_blob(FunctionCodeHandling::Keep)
+            .expect("a blob");
+
+        let mut isolate = isolate_from(blob);
+        let context = restored_context(&mut isolate, DEFAULT_CONTEXT_SLOT)
+            .expect("the blob names the default context");
+        crate::scope!(let scope, &mut isolate);
+        let context = context.open(scope);
+        let scope = &mut crate::ContextScope::new(scope, context);
+        let weak = scope
+            .get_context_data_from_snapshot_once::<Value>(0)
+            .expect("the weak set");
+        crate::test_support::bind(scope, "restoredWeakSet", weak);
+        assert_eq!(
+            crate::test_support::eval_number(scope, "restoredWeakSet.has(elem) ? 1 : 0"),
+            1.0,
+            "a restored WeakSet is a WeakSet"
+        );
+    }
+
     /// A template with a property of its own: the record holds no property yet, so
     /// the write names the part rather than writing a template that would come
     /// back without it.
