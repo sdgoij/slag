@@ -304,6 +304,7 @@ fn max_stack_usage(body: &CompiledBody) -> usize {
             }
             // The identifier read pushes; a reference write pops and
             // re-pushes (net 0); the identifier update pops and re-pushes.
+            Step::TypeofIdent { .. } => depth += 1,
             Step::LoadIdent { .. } => depth += 1,
             Step::ResolveVarIdent { .. } => {}
             Step::PutVarReference => {}
@@ -521,6 +522,7 @@ fn step_name(step: &Step) -> &'static str {
         Step::Throw { .. } => "Throw",
         Step::LoadIdent { .. } => "LoadIdent",
         Step::Unary(_) => "Unary",
+        Step::TypeofIdent { .. } => "TypeofIdent",
         Step::EnterTry { .. } => "EnterTry",
         Step::EnterWith => "EnterWith",
         Step::CreateFunction { .. } | Step::CreateArrow { .. } => "CreateFunction",
@@ -6078,11 +6080,25 @@ impl<'a> Lowerer<'a> {
                 self.fall_through(index);
             }
             // `typeof` of a value operand (Cut 60): a pure helper — pops the
-            // value, pushes the `typeof` string. The unresolvable-reference
-            // form (`TypeofIdent`) stays env-path.
+            // value, pushes the `typeof` string.
             Step::TypeofTop => {
                 let value = self.pop();
                 let res = self.emit_raw_call(self.sig_bool, Helper::TypeofTop, &[value])?;
+                self.push(res);
+                self.fall_through(index);
+            }
+            // `typeof` of a name resolved through the environment chain (Cut 93):
+            // the `BindingLoc::Env` form. Spec 13.5.3.2 step 1 makes an
+            // unresolvable reference `"undefined"` rather than a
+            // ReferenceError, which is why this is not `LoadIdent` +
+            // `TypeofTop`; `name` is an `AtomId` immediate. The helper can
+            // re-enter (an accessor on the global object), so it goes through
+            // `call_slow`'s pending check and its leaf-epoch bump. The step is
+            // leaf-excluded (`steps_are_leaf`) because an inlined leaf would
+            // resolve against the caller's environment.
+            Step::TypeofIdent { name } => {
+                let name_imm = self.builder.ins().iconst(types::I64, *name as i64);
+                let res = self.call_slow(self.sig_bool, Helper::TypeofIdent, &[name_imm])?;
                 self.push(res);
                 self.fall_through(index);
             }

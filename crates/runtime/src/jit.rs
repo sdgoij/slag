@@ -555,6 +555,10 @@ pub struct JitSlowPaths {
     /// The identifier read a certified body uses for an outer/global binding
     /// (`resolve_binding` + `get_value`); `name` is an `AtomId`.
     pub load_ident: extern "C" fn(ctx: *mut c_void, name: u64) -> u64,
+    /// `Step::TypeofIdent`: `typeof` of a name that resolves through the
+    /// environment chain; `name` is an `AtomId`. Returns the `typeof` string —
+    /// `"undefined"` for an unresolvable reference, per spec 13.5.3.2 step 1.
+    pub typeof_ident: extern "C" fn(ctx: *mut c_void, name: u64) -> u64,
     /// Resolve an identifier reference and push it onto the Vm's reference
     /// stack (the write path's `put_var_reference` pops it).
     pub resolve_var_ident: extern "C" fn(ctx: *mut c_void, name: u64) -> u64,
@@ -1015,6 +1019,7 @@ pub static JIT_SLOW_PATHS: JitSlowPaths = JitSlowPaths {
     set_global,
     set_global_slot,
     load_ident,
+    typeof_ident,
     resolve_var_ident,
     put_var_reference,
     update_ident,
@@ -1907,6 +1912,39 @@ extern "C" fn load_ident(ctx: *mut c_void, name: u64) -> u64 {
         vm.warm_global_cell(agent, name_atom, value, declarative);
     }
     value.bits()
+}
+
+/// `Step::TypeofIdent`: `typeof` of a name that resolves through the
+/// environment chain — the `BindingLoc::Env` form `compile_expr` emits when the
+/// name is neither a frame slot, a capture-context slot, the accumulator, nor a
+/// global fast binding. Spec 13.5.3.2 step 1 is why this is its own helper
+/// rather than `load_ident` + `typeof_top`: an UNRESOLVABLE reference must
+/// answer `"undefined"` and not throw, and `load_ident` errors on it. Resolving
+/// and reading can re-enter user code (an accessor on the global object), so a
+/// failure reports through `slow_error` and the caller's leaf-epoch bump
+/// applies. It deliberately does NOT warm the global-value cell the way
+/// `load_ident` does: no compiled probe reads a `typeof` of a name, so there is
+/// no cell to serve.
+extern "C" fn typeof_ident(ctx: *mut c_void, name: u64) -> u64 {
+    let ctx = unsafe { ctx_of(ctx) };
+    let agent = unsafe { &mut *ctx.agent };
+    let vm = unsafe { &mut *ctx.vm };
+    let reference = match crate::context::resolve_binding(
+        agent,
+        &crux::lookup(name as crux::AtomId),
+        vm.strict,
+    ) {
+        Ok(reference) => reference,
+        Err(error) => return slow_error(ctx, error),
+    };
+    let value = match &reference.base {
+        ReferenceBase::Unresolvable => Value::Undefined,
+        _ => match crate::context::get_value(agent, &reference) {
+            Ok(value) => value,
+            Err(error) => return slow_error(ctx, error),
+        },
+    };
+    typeof_bits(&value)
 }
 
 extern "C" fn resolve_var_ident(ctx: *mut c_void, name: u64) -> u64 {
@@ -4268,12 +4306,18 @@ extern "C" fn create_arguments(ctx: *mut c_void, step: u64) -> u64 {
 
 /// `Step::TypeofTop` (Cut 60): compute the `typeof` string of the popped
 /// value (spec 13.5.3.2 — a value operand; the unresolvable-reference form
-/// is `TypeofIdent`, which stays env-path). Never errors.
+/// is `TypeofIdent`, which `typeof_ident` serves). Never errors.
 extern "C" fn typeof_top(ctx: *mut c_void, value: u64) -> u64 {
     let _ = ctx;
-    let value = Value::from_bits(value);
+    typeof_bits(&Value::from_bits(value))
+}
+
+/// The `typeof` string for `value`, as the value's bits — the shape
+/// `typeof_top` (a value operand, Cut 60) and `typeof_ident` (a name resolved
+/// through the environment) both push.
+fn typeof_bits(value: &Value) -> u64 {
     Value::String(crux::Handle::new(crux::JsString::from_utf8(
-        crux::value::type_of(&value),
+        crux::value::type_of(value),
     )))
     .bits()
 }
@@ -5499,6 +5543,7 @@ mod tests {
         assert_ne!(JIT_SLOW_PATHS.get_global as usize, 0);
         assert_ne!(JIT_SLOW_PATHS.set_global as usize, 0);
         assert_ne!(JIT_SLOW_PATHS.load_ident as usize, 0);
+        assert_ne!(JIT_SLOW_PATHS.typeof_ident as usize, 0);
         assert_ne!(JIT_SLOW_PATHS.resolve_var_ident as usize, 0);
         assert_ne!(JIT_SLOW_PATHS.put_var_reference as usize, 0);
         assert_ne!(JIT_SLOW_PATHS.update_ident as usize, 0);

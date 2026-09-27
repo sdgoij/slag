@@ -239,22 +239,43 @@ unchanged — `.notes/embedding.md` §7 has the full record.
   path for `-x`/`+x`/`~x` (worth having, but it cannot fix a cost that is compile
   time), and a `SLAG_NO_JIT`-style switch (measures, does not fix).
 
-- **`Step::Construct`** (1 body by the catch-all name in the post-gate census — the
-  figure is now honest, because the `Unary` bails that hid most `new` sites are
-  gone, and `new` is ubiquitous in real code, so expect the count to stay small
-  while the *coverage* of it matters more). The gap §18 records: `Construct` has no
-  `emit_step` arm
-  and no `step_name` entry; `NewTarget` *is* lowered, so the missing half is
-  the construct *call*. The interpreter's reference implementation is the
-  construct-inline leaf cache (`run_leaf_construct`, `construct_inline`).
-- **`Step::Destructure`** (2 bodies measured). The JIT skill's §10 has the
+- **`Step::TypeofIdent` — the real remaining refusal, not `Construct` — landed (Cut 93).**
+  This bullet previously named `Step::Construct` on the `slag-jit` skill's §18,
+  and a probe showed the skill was stale: `Construct` has its `emit_step` arm
+  (`Helper::Construct`), its `step_name` entry and its `max_stack_usage` entry,
+  so a body containing `new` compiles. A temporary print naming the refusing
+  step's `Debug` in `emit_step`'s catch-all answered `TypeofIdent { name: 8116 }`
+  — a `typeof x` over a `BindingLoc::Env` name — and enumerating the `Step` enum
+  against `crates/jit/src/compiler.rs` confirmed it was the only uncovered
+  variant a certified body can carry (31 are absent from the emitter, 30 of them
+  unreachable from a certified body). Lowered as a helper mirroring the
+  interpreter's own arm (`typeof_ident`), with `step_name` and `max_stack_usage`
+  entries added. **Measured: the census's refusals reach 0** (0 `Unary`, 0
+  catch-all), 122 `body too large` skips, 497 compiled. `.agents/skills/slag-jit/
+  SKILL.md` §18 is corrected in the same change.
+
+- **`Step::Construct`** (already lowered — kept here only so the record of why it
+  was *planned* is not lost, and because the skill's stale claim is worth not
+  repeating). A body containing `new` compiles: `emit_step`'s `Construct` arm
+  calls `Helper::Construct`, which runs the interpreter's construct machinery (the
+  construct-inline leaf cache / general path). It was never the gap.
+- **`Step::Destructure`** (2 bodies in the pre-gate census; in the post-gate
+  census the same bodies are *skipped as too large* rather than refused, so the
+  emitter's view of them is no longer visible and a raised cap would show whether
+  the arm is still missing). The JIT skill's §10 has the
   rules (flat binds, the for-head trap, the close gates).
-- **Then re-census.** The next tier is whatever the re-taken numbers name; the
-  author's expectation, to be confirmed rather than assumed, is that calls
-  themselves are already covered (the general path offers them) and the next
-  wall is the *env/context machinery* the certified frame does not model
-  (closures over loop bodies, `try`/`with`, iterators), because those are what
-  the 1,553 uncertified bodies are made of.
+- **Then re-census — and with the emitter's refusals at 0 for this workload, the
+  two levers are named rather than left implicit.** (1) The **122 bodies the size
+  cap refuses**: they are off the JIT entirely, so the questions are whether the
+  cap is set right (it was sized on a debug build, where Cranelift is ~10× more
+  expensive — a release-side measurement is the better tuning input) and whether
+  any of them is hot enough to earn a compile through a larger consult count
+  instead of an absolute cap. (2) The **~1,553 uncertified bodies** of §3 — the
+  env/context machinery the certified frame does not model (closures over loop
+  bodies, `try`/`with`, iterators). The author's expectation, to be confirmed
+  rather than assumed, is that (2) is the larger wall for a tsc-class workload
+  now that the emitter's coverage is discharged; calls themselves are already
+  covered (the general path offers them).
 
 ## 7. Out of scope, and why
 

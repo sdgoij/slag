@@ -359,6 +359,7 @@ fn runtime_helpers() -> JitHelpers {
         set_global: Some(rt.set_global),
         set_global_slot: Some(rt.set_global_slot),
         load_ident: Some(rt.load_ident),
+        typeof_ident: Some(rt.typeof_ident),
         resolve_var_ident: Some(rt.resolve_var_ident),
         put_var_reference: Some(rt.put_var_reference),
         update_ident: Some(rt.update_ident),
@@ -579,6 +580,7 @@ mod tests {
             set_global: Some(helpers::test_set_global),
             set_global_slot: Some(helpers::test_set_global_slot),
             load_ident: Some(helpers::test_load_ident),
+            typeof_ident: Some(helpers::test_typeof_ident),
             resolve_var_ident: Some(helpers::test_resolve_var_ident),
             put_var_reference: Some(helpers::test_put_var_reference),
             update_ident: Some(helpers::test_update_ident),
@@ -4639,6 +4641,26 @@ mod tests {
     }
 
     #[test]
+    fn typeof_ident_lowers() {
+        // `TypeofIdent` pushes the `typeof` string with no operand: the test
+        // double answers `"undefined"`, which is also what spec 13.5.3.2 step 1
+        // requires for an unresolvable reference (the reason this is not
+        // `LoadIdent` + `TypeofTop`). The step takes the name as an immediate.
+        let engine = JitEngine::new().expect("native isa");
+        let body = make_body(vec![Step::TypeofIdent { name: 1 }, Step::Return], 0);
+        let compiled = engine.compile(&body, &helpers_all()).expect("lowers");
+        let value = Value::from_bits(run(&compiled, 0));
+        assert_eq!(
+            value.as_string().map(|s| s.to_string()),
+            Some("undefined".to_string()),
+            "the helper's typeof string is what the step pushes"
+        );
+        // Without the helper the body bails rather than resolving the name
+        // itself (a compiled body has no scope to resolve against).
+        assert!(engine.compile(&body, &helpers_none()).is_none());
+    }
+
+    #[test]
     fn installed_jit_runs_a_body_with_globals() {
         // `f` reads and writes a declared top-level `var` through the
         // direct-mapped global cells (`LoadGlobal`/`StoreGlobal` route to
@@ -4652,6 +4674,36 @@ mod tests {
         });
         assert_eq!(value.as_number(), Some(1000.0));
         assert!(compiled >= 1, "{compiled} bodies");
+    }
+
+    #[test]
+    fn installed_jit_typeof_ident_matches_the_interpreter() {
+        // The two `BindingLoc::Env` forms, both verified to emit the step (a
+        // `typeof x` over a *captured* binding lowers to
+        // `LoadContextSlot` + `TypeofTop` instead, which is why the closure
+        // shape is not here): a name no record binds, and a global read from
+        // inside a function body, which resolves through the environment chain
+        // at run time. The first is the spec-critical one — an unresolvable
+        // reference is "undefined", never a ReferenceError — and the second is
+        // the resolvable branch of the helper.
+        let source = "function free(n) { var s = 0; for (var i = 0; i < n; i++) { if (typeof no_such_name === 'undefined') s += 1; } return s; }\n\
+                      function glob(n) { var s = ''; for (var i = 0; i < n; i++) { s = typeof Math; } return s; }\n\
+                      free(4) + ':' + glob(4);";
+        let interp = {
+            let mut agent = runtime::Agent::new();
+            agent.initialize_host_defined_realm().expect("realm");
+            agent.run_script(source).expect("interp runs")
+        };
+        let (value, compiled) = with_jit_agent(|agent| agent.run_script(source).expect("jit runs"));
+        assert_eq!(
+            value, interp,
+            "the typeof lowering must match the interpreter"
+        );
+        assert_eq!(
+            value.as_string().map(|s| s.to_string()),
+            Some("4:object".to_string())
+        );
+        assert_eq!(compiled, 2, "both loop bodies must compile");
     }
 
     #[test]

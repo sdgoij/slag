@@ -227,7 +227,8 @@ only the JIT arm was missing. Traps:
   already excluded.
 - **`TypeofTop` (a `typeof` VALUE operand) is a bonus pair** — `typeof
   arguments.callee` and any member/computed `typeof` need it (the
-  `TypeofIdent` unresolvable-reference form stays env-path). It is a pure
+  `TypeofIdent` unresolvable-reference form lowers through `typeof_ident`,
+  which answers `"undefined"` for it — Cut 93). It is a pure
   helper (`crux::value::type_of`) — whitelist it in
   `disturbs_leaf_eligibility` and call it with `emit_raw_call` (it never
   sets the pending byte).
@@ -531,15 +532,25 @@ you which one tripped (verified 2026-09-01 on the `--bench` micro rows):
   the next call skips the cache too.
 
 The gates are independent: a body can pass scope and fail emit_step
-(`new` in a certified body), or fail scope and never be seen at all.
+(`Destructure`-era examples aside, the live one is any step this skill has not
+seen an arm for), or fail scope and never be seen at all.
 
-**`Step::Construct` is un-lowered.** A certified body containing `new`
-reaches the JIT and bails: `Construct` has no `emit_step` arm AND no
-`step_name` entry, so the catch-all reports the misleading literal name
-`"unsupported step"`. The interpreter's fast construct path is the
-construct-inline leaf cache (`run_leaf_construct`, `construct_inline` on
-`LeafEntry`); the JIT never grew the arm (`NewTarget` IS lowered — the
-Construct CALL is the gap).
+**`Step::Construct` IS lowered (corrected 2026-09-27).** This section
+previously claimed the opposite, and the claim was stale: `emit_step` has a
+`Step::Construct { .. }` arm that calls `Helper::Construct` (the
+construct-inline leaf cache / general path), `max_stack_usage` accounts for it
+(net 0), and `step_name` answers `"Construct"` — so a body containing `new`
+compiles, and the catch-all would NOT report `"unsupported step"` for it.
+It cost a plan entry: `.notes/non-leaf-jit.md` §6 named `Construct` as the next
+milestone on this section's word, and the step that actually bailed deno's last
+offered body was **`TypeofIdent`** (a `typeof x` over a `BindingLoc::Env`
+name; lowered as Cut 93). **Lesson: verify a "not lowered" claim against
+`compiler.rs` before planning around it** — the `emit_step` arms and the
+`step_name` entries are the only authority. A grep for `Step::<Variant>` across
+`crates/jit/src/compiler.rs` settles one variant in a command; enumerating the
+`Step` enum and diffing it against `compiler.rs` settles all of them at once,
+which is how the real gap was found in minutes after the wrong one had already
+been planned around.
 
 **The catch-all name is only as good as `step_name`'s coverage.** When
 adding a step arm, add its `step_name` entry in the same change — handled
