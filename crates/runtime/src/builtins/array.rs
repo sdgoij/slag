@@ -118,6 +118,26 @@ fn dense_own_element(value: &Value, index: u64) -> Option<Value> {
         .filter(|value| !value.is_hole())
 }
 
+/// The write half of [`dense_own_element`]: write `value` at `index` through
+/// the engine's own dense index write (`JsObject::array_element_write`, the
+/// path `arr[i] = v` takes), or the exact `[[Set]]` when that declines.
+///
+/// Pairing the two is exact for the same reason the read is: a canonical index
+/// on a dense Array is an own writable data property, so an ordinary `[[Set]]`
+/// updates it in place and consults nothing else — and `array_element_write`
+/// answers `None` for every shape where that is not true (a hole whose
+/// prototype chain is not clean, a non-dense receiver, an index past the
+/// length), which leaves the caller running the same `[[Set]]` the previous
+/// code ran, string key and all.
+fn set_own_element(object: &Value, index: u64, value: Value) -> Result<(), JsError> {
+    if let ValueKind::Object(obj) = object.kind()
+        && obj.array_element_write(index, value)?.is_some()
+    {
+        return Ok(());
+    }
+    set_property(object, &key(index), value)
+}
+
 /// IsArray (spec 7.2.2): Array exotics and proxies whose target is an
 /// array (recursively).
 pub fn is_array(value: &Value) -> bool {
@@ -928,10 +948,18 @@ fn copy_within(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value,
             1i64
         };
         for _ in 0..count {
-            let from_present = has_property(&object, &key(from))?;
-            if from_present {
-                let value = get(agent, &object, &key(from))?;
-                set_property(&object, &key(to), value)?;
+            let from_value = match dense_own_element(&object, from) {
+                Some(value) => Some(value),
+                None => {
+                    if has_property(&object, &key(from))? {
+                        Some(get(agent, &object, &key(from))?)
+                    } else {
+                        None
+                    }
+                }
+            };
+            if let Some(value) = from_value {
+                set_own_element(&object, to, value)?;
             } else {
                 delete_property_or_throw(&object, &key(to))?;
             }
@@ -1020,7 +1048,7 @@ fn fill(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsErro
     };
     let final_index = clamped_end(args.get(1..).unwrap_or(&[]), length)?;
     for k in k..final_index {
-        set_property(&object, &key(k), value)?;
+        set_own_element(&object, k, value)?;
     }
     Ok(object)
 }
@@ -1735,31 +1763,49 @@ fn reverse(agent: &mut Agent, this: &Value, _args: &[Value]) -> Result<Value, Js
         // spec steps 7.d-7.i: the lower value is read before HasProperty of
         // the upper index, so a getter that mutates the array (e.g. its
         // length) is observed (get_if_present_with_delete.js).
-        let lower_exists = has_property(&object, &lower_name)?;
-        let lower_value = if lower_exists {
-            Some(get(agent, &object, &lower_name)?)
-        } else {
-            None
+        // The dense fast path answers both questions at once: a dense own
+        // element is present and is its own value, so neither HasProperty nor
+        // [[Get]] can run user code for it — which is why reading the lower
+        // before the upper is observable only in the cases that keep the exact
+        // pair below.
+        let lower_value = match dense_own_element(&object, lower) {
+            Some(value) => Some(value),
+            None => {
+                if has_property(&object, &lower_name)? {
+                    Some(get(agent, &object, &lower_name)?)
+                } else {
+                    None
+                }
+            }
         };
-        let upper_exists = has_property(&object, &upper_name)?;
-        let upper_value = if upper_exists {
-            Some(get(agent, &object, &upper_name)?)
-        } else {
-            None
+        let upper_value = match dense_own_element(&object, upper) {
+            Some(value) => Some(value),
+            None => {
+                if has_property(&object, &upper_name)? {
+                    Some(get(agent, &object, &upper_name)?)
+                } else {
+                    None
+                }
+            }
         };
-        if lower_exists && upper_exists {
-            set_property(&object, &lower_name, upper_value.unwrap())?;
-            set_property(&object, &upper_name, lower_value.unwrap())?;
-        } else if lower_exists {
-            // spec 23.1.3.25 step 5.10: DeletePropertyOrThrow of the lower
-            // index runs before Set of the upper (delete-first ordering is
-            // observable through proxies, see
-            // length-exceeding-integer-limit-with-proxy.js).
-            delete_property_or_throw(&object, &lower_name)?;
-            set_property(&object, &upper_name, lower_value.unwrap())?;
-        } else if upper_exists {
-            set_property(&object, &lower_name, upper_value.unwrap())?;
-            delete_property_or_throw(&object, &upper_name)?;
+        match (lower_value, upper_value) {
+            (Some(lower_value), Some(upper_value)) => {
+                set_own_element(&object, lower, upper_value)?;
+                set_own_element(&object, upper, lower_value)?;
+            }
+            (Some(lower_value), None) => {
+                // spec 23.1.3.25 step 5.10: DeletePropertyOrThrow of the lower
+                // index runs before Set of the upper (delete-first ordering is
+                // observable through proxies, see
+                // length-exceeding-integer-limit-with-proxy.js).
+                delete_property_or_throw(&object, &lower_name)?;
+                set_own_element(&object, upper, lower_value)?;
+            }
+            (None, Some(upper_value)) => {
+                set_own_element(&object, lower, upper_value)?;
+                delete_property_or_throw(&object, &upper_name)?;
+            }
+            (None, None) => {}
         }
         lower += 1;
     }
@@ -1775,15 +1821,25 @@ fn shift(agent: &mut Agent, this: &Value, _args: &[Value]) -> Result<Value, JsEr
         set_property(&object, &JsString::from_utf8("length"), Value::Number(0.0))?;
         return Ok(Value::Undefined);
     }
-    let first = get(agent, &object, &key(0))?;
+    let first = match dense_own_element(&object, 0) {
+        Some(value) => value,
+        None => get(agent, &object, &key(0))?,
+    };
     for k in 1..length {
-        let from_name = key(k);
-        let to_name = key(k - 1);
-        if has_property(&object, &from_name)? {
-            let value = get(agent, &object, &from_name)?;
-            set_property(&object, &to_name, value)?;
-        } else {
-            delete_property_or_throw(&object, &to_name)?;
+        let value = match dense_own_element(&object, k) {
+            Some(value) => Some(value),
+            None => {
+                let from_name = key(k);
+                if has_property(&object, &from_name)? {
+                    Some(get(agent, &object, &from_name)?)
+                } else {
+                    None
+                }
+            }
+        };
+        match value {
+            Some(value) => set_own_element(&object, k - 1, value)?,
+            None => delete_property_or_throw(&object, &key(k - 1))?,
         }
     }
     delete_property_or_throw(&object, &key(length - 1))?;
@@ -2047,13 +2103,22 @@ fn splice(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsEr
     )?;
     if item_count < actual_delete_count {
         for k in actual_start..(length - actual_delete_count) {
-            let from_name = key(k + actual_delete_count);
-            let to_name = key(k + item_count);
-            if has_property(&object, &from_name)? {
-                let value = get(agent, &object, &from_name)?;
-                set_property(&object, &to_name, value)?;
-            } else {
-                delete_property_or_throw(&object, &to_name)?;
+            let from = k + actual_delete_count;
+            let to = k + item_count;
+            let value = match dense_own_element(&object, from) {
+                Some(value) => Some(value),
+                None => {
+                    let from_name = key(from);
+                    if has_property(&object, &from_name)? {
+                        Some(get(agent, &object, &from_name)?)
+                    } else {
+                        None
+                    }
+                }
+            };
+            match value {
+                Some(value) => set_own_element(&object, to, value)?,
+                None => delete_property_or_throw(&object, &key(to))?,
             }
         }
         let mut k = length;
@@ -2066,19 +2131,28 @@ fn splice(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsEr
         // the copy, so the last iteration moves O[actualStart + count]).
         let mut k = length - actual_delete_count;
         while k > actual_start {
-            let from_name = key(k + actual_delete_count - 1);
-            let to_name = key(k + item_count - 1);
-            if has_property(&object, &from_name)? {
-                let value = get(agent, &object, &from_name)?;
-                set_property(&object, &to_name, value)?;
-            } else {
-                delete_property_or_throw(&object, &to_name)?;
+            let from = k + actual_delete_count - 1;
+            let to = k + item_count - 1;
+            let value = match dense_own_element(&object, from) {
+                Some(value) => Some(value),
+                None => {
+                    let from_name = key(from);
+                    if has_property(&object, &from_name)? {
+                        Some(get(agent, &object, &from_name)?)
+                    } else {
+                        None
+                    }
+                }
+            };
+            match value {
+                Some(value) => set_own_element(&object, to, value)?,
+                None => delete_property_or_throw(&object, &key(to))?,
             }
             k -= 1;
         }
     }
     for (j, item) in args.iter().skip(2).enumerate() {
-        set_property(&object, &key(actual_start + j as u64), *item)?;
+        set_own_element(&object, actual_start + j as u64, *item)?;
     }
     let new_length = length - actual_delete_count + item_count;
     set_property(
@@ -2266,17 +2340,25 @@ fn unshift(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsE
         let mut k = length;
         while k > 0 {
             k -= 1;
-            let from_name = key(k);
-            let to_name = key(k + arg_count);
-            if has_property(&object, &from_name)? {
-                let value = get(agent, &object, &from_name)?;
-                set_property(&object, &to_name, value)?;
-            } else {
-                delete_property_or_throw(&object, &to_name)?;
+            let to = k + arg_count;
+            let value = match dense_own_element(&object, k) {
+                Some(value) => Some(value),
+                None => {
+                    let from_name = key(k);
+                    if has_property(&object, &from_name)? {
+                        Some(get(agent, &object, &from_name)?)
+                    } else {
+                        None
+                    }
+                }
+            };
+            match value {
+                Some(value) => set_own_element(&object, to, value)?,
+                None => delete_property_or_throw(&object, &key(to))?,
             }
         }
         for (j, item) in args.iter().enumerate() {
-            set_property(&object, &key(j as u64), *item)?;
+            set_own_element(&object, j as u64, *item)?;
         }
     }
     let new_length = length + arg_count;

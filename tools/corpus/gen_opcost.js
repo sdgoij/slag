@@ -25,7 +25,7 @@
 // differ by less than the round-to-round noise (the bare loop itself moves
 // ±10% between rounds). Every row also clears the cap by a wide margin — the
 // largest is under 64 steps, which the debug binary confirms by compiling all
-// 31 of them with its cap temporarily cut to 64.
+// 33 of them with its cap temporarily cut to 64.
 //
 // The bodies end in `| 0`, which keeps the accumulator an int32. That does two
 // things: the four modes agree on the result (so the parity check is a real
@@ -90,6 +90,10 @@ const rows = [
     'small.forEach(cb); s = (s + 1) | 0;',
   ],
   ['array_at', 'var small = [1, 2, 3, 4];', 's = (s + small.at(2)) | 0;'],
+  // The write side: `fill` is pure writes, `reverse` a read/write pair, so a
+  // change to one half shows up in one row and not the other.
+  ['array_fill', 'var small = [1, 2, 3, 4];', 'small.fill(0); s = (s + 1) | 0;'],
+  ['array_reverse', 'var small = [1, 2, 3, 4];', 'small.reverse(); s = (s + small.length) | 0;'],
   ['array_slice', 'var small = [1, 2, 3, 4];', 's = (s + small.slice(1, 3).length) | 0;'],
   [
     'array_to_sorted',
