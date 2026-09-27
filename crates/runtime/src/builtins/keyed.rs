@@ -332,8 +332,8 @@ impl crate::agent::MapCollection {
 
     /// A collection over an existing entries list, with every live entry
     /// indexed (the constructors that build the List directly: `groupBy` and
-    /// the result sets/maps of the set-methods).
-    fn from_entries(entries: Vec<MapEntry>) -> Self {
+    /// the result sets/maps of the set-methods, and a snapshot's load).
+    pub(crate) fn from_entries(entries: Vec<MapEntry>) -> Self {
         let mut collection = crate::agent::MapCollection {
             entries,
             index: std::collections::HashMap::new(),
@@ -431,7 +431,7 @@ impl crate::agent::SetCollection {
         }
     }
 
-    fn from_entries(entries: Vec<SetEntry>) -> Self {
+    pub(crate) fn from_entries(entries: Vec<SetEntry>) -> Self {
         let mut collection = crate::agent::SetCollection {
             entries,
             index: std::collections::HashMap::new(),

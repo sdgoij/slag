@@ -516,6 +516,7 @@ const TEMPLATE_LENGTH: &str = "length";
 const TEMPLATE_CONSTRUCTIBLE: &str = "constructible";
 const TEMPLATE_NAME: &str = "name";
 const TEMPLATE_PARENT: &str = "parent";
+const TEMPLATE_PROTOTYPE: &str = "prototype";
 
 /// The pointer an `External` value carries, or `None` for a value that is not
 /// one — which is how this bridge recognizes its own template handles, whose
@@ -586,9 +587,19 @@ fn template_record_of(
             "v8::Isolate::AddContextData: this function template cannot be carried yet: a property of its own"
         );
     }
-    if template.has_instance_template() || template.has_prototype_template() {
+    // An instance or prototype template with nothing in it is carried by carrying
+    // nothing: [`rebuild_template`] makes a fresh one, and a function template's
+    // instance template is re-linked to the function the same way. Only a template
+    // that would come back different ends the build.
+    let unrepresented = template
+        .instance_template_opt()
+        .is_some_and(|template| !template.carries_nothing())
+        || template
+            .prototype_template_opt()
+            .is_some_and(|template| !template.carries_nothing());
+    if unrepresented {
         panic!(
-            "v8::Isolate::AddContextData: this function template cannot be carried yet: an instance or prototype template"
+            "v8::Isolate::AddContextData: this function template cannot be carried yet: an instance or prototype template with properties"
         );
     }
     let (callback, attached) = isolate.template_parts(address)?;
@@ -626,6 +637,17 @@ fn template_record_of(
     if let Some(parent) = template.parent() {
         let parent = template_record_of(isolate, context, Rc::as_ptr(&parent) as usize, &parent)?;
         set(TEMPLATE_PARENT, parent);
+    }
+    // The function's `.prototype`, when this template made one in this realm: a
+    // restored template's instance template chains to it, so the host's
+    // properties here — deno puts an op class's methods on this object — reach an
+    // instance the load makes rather than being dropped with a fresh object.
+    if let Some(function) = template.materialized_function(&context) {
+        let prototype = api::Object::get(&context, &function, "prototype")
+            .expect("bridge: a function this template made has a .prototype");
+        if prototype.value().as_object().is_some() {
+            set(TEMPLATE_PROTOTYPE, prototype);
+        }
     }
     Some(record)
 }
@@ -699,6 +721,13 @@ fn rebuild_template(
     template.set_constructible(constructible);
     if let Some(name) = name {
         template.set_class_name(&name);
+    }
+    // The `.prototype` object the snapshot carried, when it did: the restored
+    // template's function uses it rather than making one, which is what keeps the
+    // methods the snapshot put there in reach of an instance.
+    if api::Object::has_own_key(&context, record, &api::Local::string(TEMPLATE_PROTOTYPE)).ok()? {
+        let prototype = api::Object::get(&context, record, TEMPLATE_PROTOTYPE).ok()?;
+        template.set_recorded_prototype(prototype.into_value());
     }
     let address = Rc::as_ptr(&template) as usize;
     isolate.add_template(Rc::clone(&template));
@@ -2036,6 +2065,156 @@ mod tests {
         assert_eq!(
             crate::test_support::eval(scope, "restored.name").to_rust_string_lossy(scope),
             "Answer"
+        );
+    }
+
+    /// A template whose function was materialized — with a method on the
+    /// function's `.prototype`, which is where a host puts an op class's methods
+    /// during a snapshot build — comes back so that an instance of its instance
+    /// template reaches that method.
+    ///
+    /// This is the shape a cppgc class registration needs
+    /// (`make_cppgc_empty_object`: `templ.instance_template(scope).new_instance(scope)`),
+    /// and it separates two questions: whether an instance template's instances
+    /// chain to the constructor's `.prototype` at all, and whether the snapshot
+    /// carries the link. The first assertion is in the *creator's* realm, so a
+    /// failure there is the engine's, not the record's.
+    #[test]
+    fn a_materialized_templates_prototype_reaches_an_instance() {
+        use crate::support::MapFnTo;
+
+        fn answer(
+            _scope: &mut crate::scope::PinScope<'_, '_>,
+            _args: crate::function::FunctionCallbackArguments,
+            _rv: crate::function::ReturnValue,
+        ) {
+        }
+        let references = vec![crate::ExternalReference {
+            function: answer.map_fn_to(),
+        }];
+        let mut isolate =
+            Isolate::snapshot_creator(Some(std::borrow::Cow::Owned(references.clone())), None);
+        {
+            crate::scope!(let scope, &mut isolate);
+            let context = Context::new(scope, Default::default());
+            let scope = &mut crate::ContextScope::new(scope, context);
+            scope.set_default_context(context);
+            let template = crate::FunctionTemplate::builder(answer).build(scope);
+            template.set_class_name(crate::String::new(scope, "Crypto").expect("a name"));
+            let function = template.get_function(scope).expect("a function");
+            let prototype_key: Local<Value> = crate::String::new(scope, "prototype")
+                .expect("a key")
+                .into();
+            let prototype = function
+                .get(scope, prototype_key)
+                .and_then(|value| Local::<Object>::try_from(value).ok())
+                .expect("the prototype object");
+            let method_key: Local<Value> = crate::String::new(scope, "getRandomValues")
+                .expect("a key")
+                .into();
+            prototype
+                .set(scope, method_key, function.into())
+                .expect("a set");
+            crate::test_support::bind(scope, "Crypto", function.into());
+            let instance = template
+                .instance_template(scope)
+                .new_instance(scope)
+                .expect("an instance");
+            crate::test_support::bind(scope, "creator_instance", instance.into());
+            assert!(
+                crate::test_support::eval(scope, "creator_instance.getRandomValues").is_function(),
+                "an instance template's instance chains to the constructor's prototype"
+            );
+            scope.add_context_data(context, template);
+        }
+        let blob = isolate
+            .create_blob(FunctionCodeHandling::Keep)
+            .expect("a blob");
+
+        let mut isolate = isolate_from_with(blob, references);
+        let context = restored_context(&mut isolate, DEFAULT_CONTEXT_SLOT)
+            .expect("the blob names the default context");
+        crate::scope!(let scope, &mut isolate);
+        let context = context.open(scope);
+        let scope = &mut crate::ContextScope::new(scope, context);
+        let template = scope
+            .get_context_data_from_snapshot_once::<crate::FunctionTemplate>(0)
+            .expect("the template");
+        let instance = template
+            .instance_template(scope)
+            .new_instance(scope)
+            .expect("an instance");
+        crate::test_support::bind(scope, "instance", instance.into());
+        assert!(
+            crate::test_support::eval(scope, "instance.getRandomValues").is_function(),
+            "a restored instance template's instance reaches the constructor's prototype methods"
+        );
+    }
+
+    /// A map's entries travel with it: its state lives in the agent's own table
+    /// (`Agent::map_data`), not in object properties, so an object record alone
+    /// brings back an object that `Map.prototype` methods refuse.
+    #[test]
+    fn a_map_round_trips_with_its_entries() {
+        let mut isolate = Isolate::snapshot_creator(None, None);
+        {
+            crate::scope!(let scope, &mut isolate);
+            let context = Context::new(scope, Default::default());
+            let scope = &mut crate::ContextScope::new(scope, context);
+            scope.set_default_context(context);
+            let map = crate::test_support::eval(scope, "new Map([['k', 1]])");
+            scope.add_context_data(context, map);
+        }
+        let blob = isolate
+            .create_blob(FunctionCodeHandling::Keep)
+            .expect("a blob");
+
+        let mut isolate = isolate_from(blob);
+        let context = restored_context(&mut isolate, DEFAULT_CONTEXT_SLOT)
+            .expect("the blob names the default context");
+        crate::scope!(let scope, &mut isolate);
+        let context = context.open(scope);
+        let scope = &mut crate::ContextScope::new(scope, context);
+        let map = scope
+            .get_context_data_from_snapshot_once::<Value>(0)
+            .expect("the map");
+        crate::test_support::bind(scope, "restoredMap", map);
+        assert_eq!(
+            crate::test_support::eval_number(scope, "restoredMap.get('k')"),
+            1.0
+        );
+    }
+
+    /// A set's elements travel with it, for the reason a map's entries do.
+    #[test]
+    fn a_set_round_trips_with_its_elements() {
+        let mut isolate = Isolate::snapshot_creator(None, None);
+        {
+            crate::scope!(let scope, &mut isolate);
+            let context = Context::new(scope, Default::default());
+            let scope = &mut crate::ContextScope::new(scope, context);
+            scope.set_default_context(context);
+            let set = crate::test_support::eval(scope, "new Set(['a', 'b'])");
+            scope.add_context_data(context, set);
+        }
+        let blob = isolate
+            .create_blob(FunctionCodeHandling::Keep)
+            .expect("a blob");
+
+        let mut isolate = isolate_from(blob);
+        let context = restored_context(&mut isolate, DEFAULT_CONTEXT_SLOT)
+            .expect("the blob names the default context");
+        crate::scope!(let scope, &mut isolate);
+        let context = context.open(scope);
+        let scope = &mut crate::ContextScope::new(scope, context);
+        let set = scope
+            .get_context_data_from_snapshot_once::<Value>(0)
+            .expect("the set");
+        crate::test_support::bind(scope, "restoredSet", set);
+        assert!(crate::test_support::eval(scope, "restoredSet.has('a')").is_true());
+        assert_eq!(
+            crate::test_support::eval_number(scope, "restoredSet.size"),
+            2.0
         );
     }
 

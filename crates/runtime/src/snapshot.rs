@@ -236,6 +236,7 @@ const REC_ARRAY_BUFFER: u8 = 20;
 const REC_TYPED_ARRAY: u8 = 21;
 const REC_ARGUMENTS: u8 = 22;
 const REC_STRING_OBJECT: u8 = 23;
+const REC_KEYED: u8 = 24;
 
 /// An array buffer's own flags, in the byte its record carries: whether it is
 /// resizable (a `maxByteLength` was given) and whether it is immutable
@@ -631,6 +632,22 @@ enum Record {
     /// are its virtual index properties, and its object part.
     StringObject {
         units: Vec<u16>,
+        proto: u32,
+        extensible: bool,
+        properties: Vec<StoredProperty>,
+    },
+    /// A Map or a Set (spec 24.1.1 / 24.2.1): whether it is the map, its live
+    /// entries in order — key/value pairs flattened for a map, elements for a
+    /// set — and its object part.
+    ///
+    /// The entries are the substance: the collection's state lives in the
+    /// agent's table rather than in the object, so nothing else in the record
+    /// would bring it back. The key index is an accelerator rather than state
+    /// and is not written; the load rebuilds it over the entries it reads, and
+    /// the tombstones a delete leaves behind are dropped with it.
+    Keyed {
+        map: bool,
+        entries: Vec<u32>,
         proto: u32,
         extensible: bool,
         properties: Vec<StoredProperty>,
@@ -2765,6 +2782,22 @@ fn children(agent: &Agent, object: &Handle<JsObject>) -> Result<Vec<Value>, Unsu
             children.extend(property_values(&property));
         }
     }
+    // A Map's or a Set's entries are its substance and they live in the agent's
+    // table rather than in properties, so the walk has to reach them here: a
+    // record that skipped them would bring back an object whose prototype's
+    // methods all refuse it (`RequireInternalSlot`).
+    if let Some(data) = agent.map_data.get(&object.id()) {
+        let data = data.borrow();
+        for (key, value) in data.entries.iter().flatten() {
+            children.push(*key);
+            children.push(*value);
+        }
+    } else if let Some(data) = agent.set_data.get(&object.id()) {
+        let data = data.borrow();
+        for entry in data.entries.iter().flatten() {
+            children.push(*entry);
+        }
+    }
     Ok(children)
 }
 
@@ -2988,6 +3021,9 @@ fn write_record(
             None if matches!(&object.kind, ObjectKind::String(_)) => {
                 write_string_object(realm, object, serials, body)?
             }
+            None if keyed_kind(agent, &object).is_some() => {
+                write_keyed(agent, realm, object, serials, body)?
+            }
             None => {
                 if let ObjectKind::External(pointer) = &object.kind {
                     body.push(REC_EXTERNAL);
@@ -3043,6 +3079,66 @@ fn write_object(
     body.push(u8::from(object.extensible.get()));
     write_properties(realm, &object, serials, body)?;
     write_private_elements(realm, &object, serials, body)?;
+    Ok(())
+}
+
+/// Whether the agent holds this object's Map or Set state — `true` for a map.
+///
+/// That table is also the collection's brand, the thing `Map.prototype` methods
+/// check, so it is the one place the format can tell a collection from the
+/// ordinary object it otherwise looks like, and the one place the entries live.
+fn keyed_kind(agent: &Agent, object: &Handle<JsObject>) -> Option<bool> {
+    if agent.map_data.contains_key(&object.id()) {
+        Some(true)
+    } else if agent.set_data.contains_key(&object.id()) {
+        Some(false)
+    } else {
+        None
+    }
+}
+
+/// Write a Map or Set instance: whether it is the map, its live entries in
+/// order, and its object part.
+///
+/// The entries are read out of the agent's table in slot order, which is the
+/// order the collection iterates in, so a restored map walks its entries the way
+/// the written one did. Tombstones a delete left behind are skipped rather than
+/// carried: they exist so a parked iterator's index stays valid between jobs, and
+/// a snapshot is taken between jobs.
+fn write_keyed(
+    agent: &Agent,
+    realm: &Handle<Realm>,
+    object: Handle<JsObject>,
+    serials: &HashMap<Identity, u32>,
+    body: &mut Vec<u8>,
+) -> Result<(), Unsupported> {
+    let id = object.id();
+    if let Some(data) = agent.map_data.get(&id) {
+        body.push(REC_KEYED);
+        body.push(1);
+        let live: Vec<(Value, Value)> = data.borrow().entries.iter().flatten().copied().collect();
+        write_u32(body, length_as_u32(live.len(), "a map")?);
+        for (key, value) in live {
+            write_u32(body, serial_in(realm, serials, key));
+            write_u32(body, serial_in(realm, serials, value));
+        }
+    } else if let Some(data) = agent.set_data.get(&id) {
+        body.push(REC_KEYED);
+        body.push(0);
+        let live: Vec<Value> = data.borrow().entries.iter().flatten().copied().collect();
+        write_u32(body, length_as_u32(live.len(), "a set")?);
+        for entry in live {
+            write_u32(body, serial_in(realm, serials, entry));
+        }
+    } else {
+        return Err(Unsupported::new(
+            "a Map or a Set",
+            "the agent holds no collection state for this object, so there are no entries to write",
+        ));
+    }
+    write_u32(body, prototype_serial(realm, &object, serials)?);
+    body.push(u8::from(object.extensible.get()));
+    write_properties(realm, &object, serials, body)?;
     Ok(())
 }
 
@@ -4260,6 +4356,29 @@ fn read_record(reader: &mut Reader<'_>) -> Result<Record, DecodeError> {
                 extras,
             })
         }
+        REC_KEYED => {
+            let map = reader.u8().ok_or(DecodeError::Truncated)? != 0;
+            let count = reader.u32().ok_or(DecodeError::Truncated)? as usize;
+            let values = if map {
+                count.checked_mul(2).ok_or(DecodeError::Truncated)?
+            } else {
+                count
+            };
+            let mut entries = Vec::with_capacity(values.min(1024));
+            for _ in 0..values {
+                entries.push(reader.u32().ok_or(DecodeError::Truncated)?);
+            }
+            let proto = reader.u32().ok_or(DecodeError::Truncated)?;
+            let extensible = reader.u8().ok_or(DecodeError::Truncated)? != 0;
+            let properties = read_properties(reader)?;
+            Ok(Record::Keyed {
+                map,
+                entries,
+                proto,
+                extensible,
+                properties,
+            })
+        }
         other => Err(DecodeError::BadTag(other)),
     }
 }
@@ -5257,6 +5376,53 @@ impl Builder<'_> {
                     ))
                 })?;
                 self.remember(index, Built::Object(object));
+                define_properties(self, object, properties)?;
+                // Extensibility last, for the reason `Record::Object` states.
+                object.extensible.set(*extensible);
+                Built::Object(object)
+            }
+            Record::Keyed {
+                map,
+                entries,
+                proto,
+                extensible,
+                properties,
+            } => {
+                let prototype = self.prototype(*proto)?;
+                let object = JsObject::ordinary_object_create(prototype);
+                // The shell is recorded before the entries are materialized, so an
+                // entry that refers back to this collection resolves to it rather
+                // than restarting the build.
+                self.remember(index, Built::Object(object));
+                let id = object.id();
+                if *map {
+                    if entries.len() % 2 != 0 {
+                        return Err(DecodeError::UnrebuildableObject(
+                            "a map record's entry list is not a list of pairs".into(),
+                        ));
+                    }
+                    let mut pairs = Vec::with_capacity(entries.len() / 2);
+                    for pair in entries.chunks_exact(2) {
+                        let key = self.materialize(pair[0])?;
+                        let value = self.materialize(pair[1])?;
+                        pairs.push(Some((key, value)));
+                    }
+                    self.agent.map_data.insert(
+                        id,
+                        std::cell::RefCell::new(crate::agent::MapCollection::from_entries(pairs)),
+                    );
+                } else {
+                    let mut elements = Vec::with_capacity(entries.len());
+                    for serial in entries {
+                        elements.push(Some(self.materialize(*serial)?));
+                    }
+                    self.agent.set_data.insert(
+                        id,
+                        std::cell::RefCell::new(crate::agent::SetCollection::from_entries(
+                            elements,
+                        )),
+                    );
+                }
                 define_properties(self, object, properties)?;
                 // Extensibility last, for the reason `Record::Object` states.
                 object.extensible.set(*extensible);

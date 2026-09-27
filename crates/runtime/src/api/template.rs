@@ -5,6 +5,7 @@
 use std::cell::Cell;
 use std::cell::RefCell;
 use std::rc::Rc;
+use std::rc::Weak;
 
 use crux::error::{ErrorKind, JsError};
 use crux::function::{Function, NativeCtor, NativeFn};
@@ -160,6 +161,12 @@ pub struct FunctionTemplate {
     /// long as the template: a `PropertyKey`'s symbol is rooted through the key's
     /// trace, and nothing here is traced — see `pin_key`.
     key_pins: RefCell<Vec<crux::heap::Pin>>,
+    /// The `.prototype` object this template's function uses in place of one it
+    /// would make. A load records the object a snapshot carried
+    /// ([`set_recorded_prototype`](Self::set_recorded_prototype)): the realm's own
+    /// object, with whatever a host put on it before the snapshot was written,
+    /// which making a fresh one here would drop.
+    recorded_prototype: RefCell<Option<Value>>,
 }
 
 /// A function as materialized in one realm.
@@ -187,6 +194,7 @@ impl FunctionTemplate {
             parent: RefCell::new(None),
             materialized: RefCell::new(Vec::new()),
             key_pins: RefCell::new(Vec::new()),
+            recorded_prototype: RefCell::new(None),
         })
     }
 
@@ -280,24 +288,47 @@ impl FunctionTemplate {
             .map(JsString::to_string_lossy)
     }
 
-    /// Whether a host set the template for instances created by `new`. Asks
+    /// The template a host set for instances created by `new`, or `None` — asked
     /// *without* making one, where
-    /// [`instance_template`](Self::instance_template) makes one on demand — for
-    /// a caller that must not change the template it is asking about.
-    pub fn has_instance_template(&self) -> bool {
-        self.instance_template.borrow().is_some()
+    /// [`instance_template`](Self::instance_template) makes one on demand, for a
+    /// caller that must not change the template it is asking about.
+    pub fn instance_template_opt(&self) -> Option<Rc<ObjectTemplate>> {
+        self.instance_template.borrow().clone()
     }
 
-    /// Whether a host set the constructor's `.prototype` object template, asked
-    /// without making one ([`prototype_template`](Self::prototype_template)).
-    pub fn has_prototype_template(&self) -> bool {
-        self.prototype_template.borrow().is_some()
+    /// The constructor's `.prototype` object template a host set, or `None` — the
+    /// same question about [`prototype_template`](Self::prototype_template).
+    pub fn prototype_template_opt(&self) -> Option<Rc<ObjectTemplate>> {
+        self.prototype_template.borrow().clone()
     }
 
     /// Whether a host made this template inherit from another
     /// ([`inherit`](Self::inherit)).
     pub fn has_parent(&self) -> bool {
         self.parent.borrow().is_some()
+    }
+
+    /// The function this template already made in `context`'s realm, if it made
+    /// one. Asked *without* making one, where
+    /// [`get_function`](Self::get_function) makes one on demand — for a caller
+    /// that must not change the template, or the realm, it is asking about.
+    pub fn materialized_function(&self, context: &Context) -> Option<Local> {
+        let realm_key = context.realm().as_ptr() as usize;
+        self.materialized
+            .borrow()
+            .iter()
+            .find(|entry| entry.realm == realm_key)
+            .map(|entry| Local(entry.function))
+    }
+
+    /// Adopt the `.prototype` object a snapshot carried for this template: the
+    /// loading process restored the realm's own object, with whatever a host put
+    /// on it before the snapshot was written, so
+    /// [`get_function`](Self::get_function) hands back a function whose
+    /// `.prototype` is *that* object and an instance of
+    /// [`instance_template`](Self::instance_template) reaches its methods.
+    pub fn set_recorded_prototype(&self, value: Value) {
+        *self.recorded_prototype.borrow_mut() = Some(value);
     }
 
     /// The template this one inherits from (the read half of
@@ -313,11 +344,17 @@ impl FunctionTemplate {
     }
 
     /// The template for instances created by `new`, created lazily.
-    pub fn instance_template(&self) -> Rc<ObjectTemplate> {
+    ///
+    /// The instances it makes have the function's `.prototype` as their own
+    /// prototype — the same link the construct path sets — so a host that makes
+    /// one through [`ObjectTemplate::new_instance`] rather than through `new` gets
+    /// an object of the same shape.
+    pub fn instance_template(self: &Rc<Self>) -> Rc<ObjectTemplate> {
         if let Some(template) = self.instance_template.borrow().clone() {
             return template;
         }
         let template = ObjectTemplate::from_ptr(self.isolate());
+        *template.owner.borrow_mut() = Some(Rc::downgrade(self));
         *self.instance_template.borrow_mut() = Some(template.clone());
         template
     }
@@ -432,21 +469,32 @@ impl FunctionTemplate {
         // The constructor's `.prototype`: an ordinary object whose prototype is
         // %Object.prototype%, or the parent's `.prototype` when this template
         // inherits one (v8::FunctionTemplate::Inherit) — populated from the
-        // prototype template (v8: non-writable, non-configurable).
-        let parent_prototype = match self.parent.borrow().clone() {
-            Some(parent) => {
-                let parent_function = parent.get_function(context)?;
-                let value = crate::api::Object::get(context, &parent_function, "prototype")?.0;
-                crate::context::as_object(&value)
+        // prototype template (v8: non-writable, non-configurable). A recorded one
+        // (a restored snapshot's) is used as it came back rather than made again:
+        // it is the realm's own object and carries the host's properties.
+        let prototype_object = match *self.recorded_prototype.borrow() {
+            Some(recorded) => recorded
+                .as_object()
+                .expect("api bug: a recorded prototype is an object"),
+            None => {
+                let parent_prototype = match self.parent.borrow().clone() {
+                    Some(parent) => {
+                        let parent_function = parent.get_function(context)?;
+                        let value =
+                            crate::api::Object::get(context, &parent_function, "prototype")?.0;
+                        crate::context::as_object(&value)
+                    }
+                    None => None,
+                };
+                let this = Rc::clone(self);
+                let object =
+                    JsObject::ordinary_object_create(parent_prototype.or(object_prototype));
+                if let Some(prototype_template) = this.prototype_template.borrow().clone() {
+                    prototype_template.apply(realm, &object)?;
+                }
+                object
             }
-            None => None,
         };
-        let this = Rc::clone(self);
-        let prototype_object =
-            JsObject::ordinary_object_create(parent_prototype.or(object_prototype));
-        if let Some(prototype_template) = this.prototype_template.borrow().clone() {
-            prototype_template.apply(realm, &prototype_object)?;
-        }
         function.define_property(
             &JsString::from_utf8("prototype"),
             &PropertyDescriptor {
@@ -509,6 +557,12 @@ impl FunctionTemplate {
 pub struct ObjectTemplate {
     isolate: *mut Isolate,
     properties: RefCell<Vec<TemplateProperty>>,
+    /// The function template whose instances these are, when this is one's
+    /// [`instance_template`](FunctionTemplate::instance_template). An instance's
+    /// prototype is that function's `.prototype` (v8::FunctionTemplate's instance
+    /// template), so the link has to be here to be found when the object is made.
+    /// Weak, because the function template holds this template.
+    owner: RefCell<Option<Weak<FunctionTemplate>>>,
     /// How many internal fields instances were promised. Recorded and reported,
     /// and nothing else: an object here has no internal-field slots (see the
     /// bridge's `set_internal_field_count`, which says the same where a host
@@ -596,6 +650,7 @@ impl ObjectTemplate {
         Rc::new(Self {
             isolate,
             properties: RefCell::new(Vec::new()),
+            owner: RefCell::new(None),
             internal_field_count: std::cell::Cell::new(0),
             host_state: RefCell::new(None),
             key_pins: RefCell::new(Vec::new()),
@@ -617,6 +672,16 @@ impl ObjectTemplate {
     /// `ObjectTemplate` has no counterpart, and nothing here reads it back).
     pub fn set_host_state(&self, state: Rc<dyn std::any::Any>) {
         *self.host_state.borrow_mut() = Some(state);
+    }
+
+    /// Whether this template carries nothing an instance would have to be given:
+    /// no properties, no internal-field count and no host state. A record can
+    /// carry such a template by carrying nothing, so a snapshot may accept one
+    /// where it refuses a template that would come back different.
+    pub fn carries_nothing(&self) -> bool {
+        self.properties.borrow().is_empty()
+            && self.internal_field_count.get() == 0
+            && self.host_state.borrow().is_none()
     }
 
     /// The host state attached above, if any.
@@ -731,12 +796,26 @@ impl ObjectTemplate {
     }
 
     /// Create an instance in `context`'s realm (v8::ObjectTemplate::NewInstance).
+    ///
+    /// An instance of a function's [`instance_template`](FunctionTemplate::instance_template)
+    /// gets that function's `.prototype` as its prototype — the link that puts a
+    /// class's methods in reach — and an instance of a plain object template gets
+    /// %Object.prototype%.
     pub fn new_instance(&self, context: &Context) -> Result<Local, JsError> {
-        let object_prototype = context
-            .realm()
-            .intrinsics
-            .get("%Object.prototype%")
-            .and_then(|value| value.as_object());
+        let owner_prototype = match self.owner.borrow().as_ref().and_then(Weak::upgrade) {
+            Some(owner) => {
+                let function = owner.get_function(context)?;
+                crate::api::Object::get(context, &function, "prototype")?.as_object()
+            }
+            None => None,
+        };
+        let object_prototype = owner_prototype.or_else(|| {
+            context
+                .realm()
+                .intrinsics
+                .get("%Object.prototype%")
+                .and_then(|value| value.as_object())
+        });
         let object = JsObject::ordinary_object_create(object_prototype);
         self.apply(context.realm(), &object)?;
         Ok(Local(Value::Object(object)))
