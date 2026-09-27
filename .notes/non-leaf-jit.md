@@ -4,11 +4,15 @@ The plan of record for widening the JIT's coverage past the shapes it handles
 today, named in `.notes/embedding.md` §9 and sized from a measurement of the
 one workload that exposes the gap. Written before any of it is built.
 
-Status: Milestone 1 (`Step::Unary`) landed and measured — see §5.1, which is
-what created the new first milestone in §6. Everything else is plan. The census
-numbers in §3/§4 were measured on 2026-09-26 against a debug `deno.exe` built
-from this tree; §5.1's after-measurement is 2026-09-27 on the same checkout,
-A/B'd against the pre-slice binary.
+Status: two milestones landed and measured — (1) `Step::Unary` (§5.1), (2) the
+compile size cap (§6), plus `Step::TypeofIdent` (§6) which took the census's
+refusals to 0. **The plan's expectation for the third lever was measured and
+refuted**: the uncertified bodies are ~1% of body entries, not the larger wall
+(§6), and with coverage fixed the JIT is still 14% net-negative on the tsc probe
+— so the next part is the full-check JIT A/B, not more coverage. Everything else
+below is plan. The census numbers in §3/§4 were measured on 2026-09-26 against a
+debug `deno.exe` built from this tree; §5.1's and §6's after-measurements are
+2026-09-27 on the same checkout, A/B'd against the committed binaries.
 
 ## 1. Why this exists
 
@@ -270,12 +274,25 @@ unchanged — `.notes/embedding.md` §7 has the full record.
   cap is set right (it was sized on a debug build, where Cranelift is ~10× more
   expensive — a release-side measurement is the better tuning input) and whether
   any of them is hot enough to earn a compile through a larger consult count
-  instead of an absolute cap. (2) The **~1,553 uncertified bodies** of §3 — the
-  env/context machinery the certified frame does not model (closures over loop
-  bodies, `try`/`with`, iterators). The author's expectation, to be confirmed
-  rather than assumed, is that (2) is the larger wall for a tsc-class workload
-  now that the emitter's coverage is discharged; calls themselves are already
-  covered (the general path offers them).
+  instead of an absolute cap. (2) The **~1,553 uncertified bodies** of §3.
+  **Measured 2026-09-27: (2) is not the lever.** Uncertified bodies take **0.31%**
+  of body entries on the tsc probe (8,297 of 2,719,876, over 1,718 refused bodies)
+  and **1.2-2.5%** on the full forced `deno test --reload` check (at least
+  200,000 of 16,285,554); certifying every one of them is worth about **0.8%**,
+  even though certification as a whole is worth **29%** of the probe (197.8 s with
+  `SLAG_NO_CERT` against 140.6 s) — the value is in the 98% of entries that
+  already certify. The two hot refusal sites are param rest/default (94% of the
+  probe's uncertified entries; 54% of the full check's) and `scan.stmts` (the
+  body-construct bucket; the rest), so the *tractable* half is param rest/default,
+  which needs spec 10.2.11's separate Parameter Environment — a risky semantic
+  slice for ~0.6 s of a 14-minute check. **What replaces it as the next part:**
+  with coverage fixed (0 refusals) the JIT is still **14% net-negative** on the
+  tsc probe (JIT off 125.3 s against JIT on 142.5 s, two samples each), so the
+  question is no longer coverage but whether the compile pays over the window it
+  is measured in — and the probe's window is 2.5 minutes against the check's 14,
+  so **the next measurement is the same A/B on the full check** (two 14-minute
+  runs), which decides whether the JIT is worth its compile on the workload this
+  plan exists to serve.
 
 ## 7. Out of scope, and why
 
@@ -284,8 +301,12 @@ unchanged — `.notes/embedding.md` §7 has the full record.
   No JIT arm changes that; the file-based tsc probe measures exactly this and
   is flat against the JIT (2m27s vs 2m5s). A genuine fix on that axis is
   engine throughput in `crux`'s string/collection code, a different plan.
-- **Certification widening.** Measured to be worth nothing until the offered
-  bodies compile (§3.3).
+- **Certification widening.** §3.3 argued it buys nothing *until* the offered
+  bodies compile; measured after they do, it buys **~0.8%** (uncertified bodies
+  are 0.31% of body entries on the tsc probe and 1.2-2.5% on the full check,
+  against a 29% value for certification as a whole). Out of scope on the
+  numbers, not on principle — a future part may revisit it if a workload's
+  uncertified share is large (a codebase heavy in default parameters, say).
 - **Removing the leaf paths / unifying them with the general path.** They exist
   for a reason (Cut 25-35) and are the JIT's current wins.
 - **The threshold's value.** 493 straight-line bodies sit on the interpreter
