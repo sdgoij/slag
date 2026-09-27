@@ -654,6 +654,17 @@ pub fn proto_atom() -> AtomId {
     *PROTO.get_or_init(|| intern_utf8("__proto__"))
 }
 
+/// The canonical atom for `"length"`. Cached for the same reason as
+/// [`proto_atom`]: `intern_utf8` collects a fresh `Vec<u16>` and takes the
+/// interner's process-wide lock on every call, and the engine needs this key
+/// far more often than it needs `"__proto__"` — once per array created, per
+/// array `length` write, and per define on an array, plus every comparison a
+/// write path makes against it.
+pub fn length_atom() -> AtomId {
+    static LENGTH: OnceLock<AtomId> = OnceLock::new();
+    *LENGTH.get_or_init(|| intern_utf8("length"))
+}
+
 /// Returns the interned text for `id`.
 pub fn lookup(id: AtomId) -> JsString {
     LOOKUP_MEMO.with(|memo| {

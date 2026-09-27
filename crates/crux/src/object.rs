@@ -22,9 +22,25 @@ use crate::map::canonical_empty_map;
 use crate::map::{Map, MapAttrs};
 use crate::ops::{same_value, same_value_zero};
 use crate::property::{PropertyDescriptor, PropertyKey};
-use crate::string::{AtomId, JsString, lookup};
+use crate::string::{AtomId, JsString, length_atom, lookup};
 use crate::symbol::well_known;
 use crate::value::{Value, ValueKind, is_callable};
+
+/// The property key `"length"`, built from the cached atom. Every array
+/// creation, every array length write and every define on an array needs this
+/// key, and `PropertyKey::from_utf8` re-interns it on each call — a `Vec<u16>`
+/// allocation plus the interner's process-wide lock.
+fn length_key() -> PropertyKey {
+    PropertyKey::String(length_atom())
+}
+
+/// Whether `key` is the string `"length"`, compared by atom id for the same
+/// reason as [`length_key`]: the comparison sites are on the per-write path
+/// (`write_data_property`, the ordinary define fast path), where interning
+/// just to compare is pure cost.
+fn is_length_key(key: &PropertyKey) -> bool {
+    matches!(key, PropertyKey::String(id) if *id == length_atom())
+}
 
 thread_local! {
     /// The next object id — thread-local (per-agent caches never mix
@@ -1601,7 +1617,7 @@ impl JsObject {
         // length entry so the generic paths (which read the first entry as
         // length) stay coherent while the cell is authoritative.
         array.properties.borrow_mut().push((
-            PropertyKey::from_utf8("length"),
+            length_key(),
             Property::data(Value::Number(length), true, false, false),
         ));
         Ok(array)
@@ -1644,7 +1660,7 @@ impl JsObject {
             enumerable: Some(false),
             configurable: Some(false),
         };
-        string.ordinary_define_own_property(&PropertyKey::from_utf8("length"), &length_desc)?;
+        string.ordinary_define_own_property(&length_key(), &length_desc)?;
         Ok(string)
     }
 
@@ -2203,7 +2219,7 @@ impl JsObject {
         // can exceed the current length. Both make sequential element fills
         // O(1) instead of O(n²).
         if let ObjectKind::Array(slots) = &self.kind {
-            if key == &PropertyKey::from_utf8("length") {
+            if is_length_key(key) {
                 if slots.dense.get() {
                     return Ok(Some(Property::data(
                         Value::Number(slots.length.get()),
@@ -3037,8 +3053,7 @@ impl JsObject {
         // intercept validates the new value (a non-uint32 length throws).
         // Anything else falls through to the full path.
         if matches!(self.kind, ObjectKind::Ordinary | ObjectKind::Array(_))
-            && !(matches!(self.kind, ObjectKind::Array(_))
-                && key == &PropertyKey::from_utf8("length"))
+            && !(matches!(self.kind, ObjectKind::Array(_)) && is_length_key(key))
         {
             let mut props = self.properties.borrow_mut();
             let position = if props.len() >= 16 {
@@ -3100,8 +3115,7 @@ impl JsObject {
     /// falls back to the full [[Set]].
     pub fn write_data_property(&self, key: &PropertyKey, value: Value) -> bool {
         if !matches!(self.kind, ObjectKind::Ordinary | ObjectKind::Array(_))
-            || (matches!(self.kind, ObjectKind::Array(_))
-                && key == &PropertyKey::from_utf8("length"))
+            || (matches!(self.kind, ObjectKind::Array(_)) && is_length_key(key))
         {
             return false;
         }
@@ -4097,7 +4111,7 @@ fn array_own_property_keys(array: &JsObject) -> Vec<PropertyKey> {
 fn string_own_property_keys(string: &JsString, obj: &JsObject) -> Vec<PropertyKey> {
     let mut keys = Vec::new();
     for i in 0..string.len() {
-        keys.push(PropertyKey::from_utf8(&i.to_string()));
+        keys.push(PropertyKey::from_index(i as u64));
     }
     let props = obj.properties.borrow();
     let mut late_indices: Vec<(u64, PropertyKey)> = Vec::new();
@@ -4571,7 +4585,7 @@ fn array_define_own_property(
     key: &PropertyKey,
     desc: &PropertyDescriptor,
 ) -> Result<bool, JsError> {
-    if *key == PropertyKey::from_utf8("length") {
+    if is_length_key(key) {
         return array_set_length(array, desc);
     }
     let Some(index) = array_index_of(key) else {
@@ -4605,7 +4619,7 @@ fn array_define_own_property(
     }
     {
         let length_desc = array
-            .ordinary_get_own_property(&PropertyKey::from_utf8("length"))?
+            .ordinary_get_own_property(&length_key())?
             .expect("arrays always have a length property");
         let PropertyKind::Data {
             value: length_value,
@@ -4691,10 +4705,7 @@ fn array_define_own_property(
             if let PropertyKind::Data { value, .. } = &mut new_length.kind {
                 *value = Value::Number(index as f64 + 1.0);
             }
-            array.ordinary_define_own_property(
-                &PropertyKey::from_utf8("length"),
-                &new_length.to_descriptor(),
-            )?;
+            array.ordinary_define_own_property(&length_key(), &new_length.to_descriptor())?;
         }
         Ok(true)
     }
@@ -4712,7 +4723,7 @@ fn array_set_length(array: &JsObject, desc: &PropertyDescriptor) -> Result<bool,
         {
             array.spill_dense_array(slots);
         }
-        return array.ordinary_define_own_property(&PropertyKey::from_utf8("length"), desc);
+        return array.ordinary_define_own_property(&length_key(), desc);
     };
     let new_length = crate::convert::to_uint32(crate::convert::to_number(value)?);
     let number_length = crate::convert::to_number(value)?;
@@ -4728,7 +4739,7 @@ fn array_set_length(array: &JsObject, desc: &PropertyDescriptor) -> Result<bool,
     let mut new_length_desc = desc.clone();
     new_length_desc.value = Some(Value::Number(new_length as f64));
     let old_length_desc = array
-        .ordinary_get_own_property(&PropertyKey::from_utf8("length"))?
+        .ordinary_get_own_property(&length_key())?
         .expect("arrays always have a length property");
     let old_length = old_length_desc
         .value()
@@ -4761,8 +4772,7 @@ fn array_set_length(array: &JsObject, desc: &PropertyDescriptor) -> Result<bool,
         {
             array.spill_dense_array(slots);
         }
-        return array
-            .ordinary_define_own_property(&PropertyKey::from_utf8("length"), &new_length_desc);
+        return array.ordinary_define_own_property(&length_key(), &new_length_desc);
     }
     if old_length_desc.writable() != Some(true) {
         return Ok(false);
@@ -4794,7 +4804,7 @@ fn array_set_length(array: &JsObject, desc: &PropertyDescriptor) -> Result<bool,
             return Ok(true);
         }
     }
-    if !array.ordinary_define_own_property(&PropertyKey::from_utf8("length"), &new_length_desc)? {
+    if !array.ordinary_define_own_property(&length_key(), &new_length_desc)? {
         return Ok(false);
     }
     // spec step 13: delete elements at or beyond the new length, descending;
@@ -4819,7 +4829,7 @@ fn array_set_length(array: &JsObject, desc: &PropertyDescriptor) -> Result<bool,
     // lock-bound on the 10k-key resets).
     let dense = keys.len() == old_length as usize + 1
         && (0..old_length as u64).all(|i| keys[i as usize] == PropertyKey::from_index(i))
-        && keys.last() == Some(&PropertyKey::from_utf8("length"));
+        && keys.last().is_some_and(is_length_key);
     if dense {
         let mut props = array.properties.borrow_mut();
         if props
@@ -4845,10 +4855,7 @@ fn array_set_length(array: &JsObject, desc: &PropertyDescriptor) -> Result<bool,
                     enumerable: None,
                     configurable: None,
                 };
-                array.ordinary_define_own_property(
-                    &PropertyKey::from_utf8("length"),
-                    &writable_false,
-                )?;
+                array.ordinary_define_own_property(&length_key(), &writable_false)?;
             }
             return Ok(true);
         }
@@ -4865,10 +4872,7 @@ fn array_set_length(array: &JsObject, desc: &PropertyDescriptor) -> Result<bool,
             if !new_writable {
                 new_length_desc.writable = Some(false);
             }
-            array.ordinary_define_own_property(
-                &PropertyKey::from_utf8("length"),
-                &new_length_desc,
-            )?;
+            array.ordinary_define_own_property(&length_key(), &new_length_desc)?;
             return Ok(false);
         }
     }
@@ -4881,7 +4885,7 @@ fn array_set_length(array: &JsObject, desc: &PropertyDescriptor) -> Result<bool,
             enumerable: None,
             configurable: None,
         };
-        array.ordinary_define_own_property(&PropertyKey::from_utf8("length"), &writable_false)?;
+        array.ordinary_define_own_property(&length_key(), &writable_false)?;
     }
     Ok(true)
 }
@@ -5129,7 +5133,7 @@ fn typed_array_define_own_property(
     // element-store gates under the accessor semantics — clear it when a
     // length define lands so those gates miss to the exact helpers (the
     // mirror is never restored, which is merely conservative).
-    if key == &PropertyKey::from_utf8("length") {
+    if is_length_key(key) {
         obj.typed_array.set(None);
     }
     obj.ordinary_define_own_property(key, desc)

@@ -25,7 +25,7 @@
 // differ by less than the round-to-round noise (the bare loop itself moves
 // ±10% between rounds). Every row also clears the cap by a wide margin — the
 // largest is under 64 steps, which the debug binary confirms by compiling all
-// 21 of them with its cap temporarily cut to 64.
+// 24 of them with its cap temporarily cut to 64.
 //
 // The bodies end in `| 0`, which keeps the accumulator an int32. That does two
 // things: the four modes agree on the result (so the parity check is a real
@@ -65,6 +65,13 @@ const set = ['var set = new Set();', 'for (var i = 0; i < 1024; i++) set.add(i);
 // the builtin-call premium from the other side.
 const rows = [
   ['baseline', '', 's = (s + k) | 0;'],
+  // Creation: the family measured element/property access but never the
+  // object the access is on, and allocation is what dominates every builtin
+  // whose body builds a container (`Object.keys`, `JSON.stringify`, a
+  // spread). `arr.length = 0` is the other half — the length-write path.
+  ['array_alloc', '', 's = (s + [k].length) | 0;'],
+  ['object_alloc', '', 's = (s + ({ a: 1 }).a) | 0;'],
+  ['array_length_write', 'var arr = [1, 2, 3];', 'arr.length = 0; s = (s + arr.length) | 0;'],
   ['element_read', arr, 's = (s + arr[k]) | 0;'],
   ['element_write', arr, 'arr[k] = i; s = (s + 1) | 0;'],
   ['obj_prop', 'var o = { x: 7 };', 's = (s + o.x) | 0;'],

@@ -31,7 +31,7 @@ standing "corpus probe" the perf notes keep gating deferred work on.
     its `jit` column is an interpreted time wearing a compiled label. A shared
     prologue is what put seven rows over the cap and made this family unable
     to measure the JIT it exists to measure; per-row setup leaves every row
-    well under it (all 21 are below 64 steps).
+    well under it (all 24 are below 64 steps).
   - **The `baseline` subtraction is valid because the bare loop is
     frame-insensitive.** Rows no longer share a frame shape, so this is
     measured rather than assumed: the same bare loop with 2 locals, with a Map
@@ -44,6 +44,11 @@ standing "corpus probe" the perf notes keep gating deferred work on.
     through a prototype instead of an own data property — which splits a
     method call into its chain-read and callee halves. `js_call` and `math_abs`
     bound the builtin-call premium from the other side.
+  - `array_alloc`, `object_alloc` and `array_length_write` cover **creation**,
+    which the family otherwise misses: element and property access was
+    measured but never the container it runs on, and allocation is what
+    dominates every builtin whose body builds one (`Object.keys`,
+    `JSON.stringify`, a spread).
 - `run_node.js` — the node-side runner (mirrors the CLI corpus mode's
   protocol: eval once, bind args once, 2 warm calls, 3 timed calls,
   report the min per-call time).
