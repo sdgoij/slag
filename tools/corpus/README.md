@@ -23,7 +23,27 @@ standing "corpus probe" the perf notes keep gating deferred work on.
   other's and its `baseline` row (the bare loop) can be subtracted to read
   what the operation costs on its own — per engine and per mode. That is what
   separates "the builtin's body is slow" from "the call and access machinery
-  around it is slow", which the family-level gap table cannot show.
+  around it is slow", which the family-level gap table cannot show. Two rules
+  make a row a measurement, and two of the rows are localizers rather than
+  operations; `gen_opcost.js`'s comment carries both:
+  - **A row declares only the setup its body needs.** A body above the
+    runtime's JIT compile cap (`JIT_MAX_COMPILE_STEPS`) is never compiled, so
+    its `jit` column is an interpreted time wearing a compiled label. A shared
+    prologue is what put seven rows over the cap and made this family unable
+    to measure the JIT it exists to measure; per-row setup leaves every row
+    well under it (all 21 are below 64 steps).
+  - **The `baseline` subtraction is valid because the bare loop is
+    frame-insensitive.** Rows no longer share a frame shape, so this is
+    measured rather than assumed: the same bare loop with 2 locals, with a Map
+    fill, and with 15 further locals plus objects, an array, a string, a regexp
+    and a function, run per-file, differ by less than the round-to-round noise
+    (±10% on the bare loop itself).
+  - Two rows are **localizers**, not operations: `proto_method_call` and
+    `own_builtin_call` exist to be subtracted from `method_call` and `map_get`
+    — the same function (and the same builtin, receiver and body) reached
+    through a prototype instead of an own data property — which splits a
+    method call into its chain-read and callee halves. `js_call` and `math_abs`
+    bound the builtin-call premium from the other side.
 - `run_node.js` — the node-side runner (mirrors the CLI corpus mode's
   protocol: eval once, bind args once, 2 warm calls, 3 timed calls,
   report the min per-call time).
@@ -95,3 +115,20 @@ excluded on both sides.
   gate is the fixture's own asserts throwing on divergence (the run fails
   loudly), not the returned value.
 - Result values must be integers < 2^53 (compared exactly across modes).
+- **One process per engine/mode makes a row's absolute number
+  context-sensitive.** Running every workload in the same process is what
+  keeps per-file startup out of the numbers and keeps both engines' sides
+  comparable — but for the allocation-heavy rows the context shows:
+  `opcost/json_stringify` measures ~127ms/100k when the row is run alone and
+  ~179ms in a whole-directory run of the same binary. For attribution, run the
+  rows of interest alone (copy them into a directory of their own and pass
+  that to `--corpus`) and compare **pairs within the same round**, not
+  absolute values across rounds: two rows measured back to back agree on
+  their difference to a percent while the absolute bare-loop time moves ±10%
+  between rounds.
+- **Check the JIT invariant when a row changes:**
+  `JIT_DUMP_CLIF=1 target/debug/slag.exe --corpus tools/corpus/workloads/opcost`
+  must print no `jit skip: body too large (N steps)` line. The debug cap is
+  the tighter of the two (128 against release's 1024), so a row that clears it
+  is a JIT row in both profiles; a line means that row is no longer a
+  measurement and must be slimmed, not read.
