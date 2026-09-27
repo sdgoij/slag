@@ -349,6 +349,36 @@ pub fn compile(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value,
     Ok(*this)
 }
 
+/// The `this` of a RegExp method: its object and its state, or the TypeError
+/// a non-RegExp receiver gets. Both lookups are the brand check.
+fn regexp_receiver(
+    agent: &Agent,
+    regexp: &Value,
+) -> Result<(Handle<JsObject>, RegExpState), JsError> {
+    let ValueKind::Object(obj) = regexp.kind() else {
+        return Err(regexp_receiver_error());
+    };
+    let Some(state) = agent.regexp_data.get(&obj.id()).cloned() else {
+        return Err(regexp_receiver_error());
+    };
+    Ok((obj, state))
+}
+
+fn regexp_receiver_error() -> JsError {
+    JsError::new(
+        ErrorKind::TypeError,
+        "RegExp exec called on an incompatible receiver".into(),
+    )
+}
+
+/// The raw outcome of a successful match, before the result array exists.
+struct MatchSpans {
+    /// The whole match and each capture; `None` for an unmatched group.
+    captures: Vec<Option<(usize, usize)>>,
+    /// The match start — the array's `index`.
+    index: usize,
+}
+
 /// spec 22.2.2.2 RegExpBuiltinExec: the lastIndex protocol and the match
 /// array. Returns `Ok(None)` for a failed match (null).
 fn regexp_builtin_exec(
@@ -356,28 +386,37 @@ fn regexp_builtin_exec(
     regexp: &Value,
     string: &JsString,
 ) -> Result<Option<Value>, JsError> {
-    let ValueKind::Object(obj) = regexp.kind() else {
-        return Err(JsError::new(
-            ErrorKind::TypeError,
-            "RegExp exec called on an incompatible receiver".into(),
-        ));
-    };
-    let Some(state) = agent.regexp_data.get(&obj.id()).cloned() else {
-        return Err(JsError::new(
-            ErrorKind::TypeError,
-            "RegExp exec called on an incompatible receiver".into(),
-        ));
-    };
+    let (obj, state) = regexp_receiver(agent, regexp)?;
+    match regexp_builtin_match(agent, regexp, &obj, &state, string)? {
+        Some(matched) => Ok(Some(regexp_match_array(agent, string, &state, &matched)?)),
+        None => Ok(None),
+    }
+}
+
+/// The matching half of RegExpBuiltinExec (spec 22.2.7.2 steps 1-12): the
+/// `lastIndex` read, the search, and the `lastIndex` write. It stops before
+/// the result array, so a caller that keeps only a boolean does not build
+/// one. The read is unconditional — the spec reads `lastIndex` *before* the
+/// global/sticky check that may then zero it, so it is observable on a
+/// non-global regex too (steps 4 and 8;
+/// `built-ins/RegExp/prototype/exec/failure-lastindex-access.js` pins the
+/// single read), and it must not be moved inside the check.
+fn regexp_builtin_match(
+    agent: &mut Agent,
+    regexp: &Value,
+    obj: &Handle<JsObject>,
+    state: &RegExpState,
+    string: &JsString,
+) -> Result<Option<MatchSpans>, JsError> {
     let length = string.len();
     let last_index_value = get_property(agent, regexp, &JsString::from_utf8("lastIndex"), *regexp)?;
     let mut last_index = to_length(to_number(&last_index_value)?) as usize;
     let global = state.flags.g;
     let sticky = state.flags.y;
-    let has_indices = state.flags.d;
     if !global && !sticky {
         last_index = 0;
     }
-    let match_result = if sticky {
+    let captures = if sticky {
         if last_index > length {
             obj.set(&JsString::from_utf8("lastIndex"), Value::Number(0.0), true)?;
             return Ok(None);
@@ -405,8 +444,7 @@ fn regexp_builtin_exec(
             }
         }
     };
-    let result = match_result;
-    let end_index = result[0].map(|(_, e)| e).unwrap_or(last_index);
+    let end_index = captures[0].map(|(_, e)| e).unwrap_or(last_index);
     if global || sticky {
         obj.set(
             &JsString::from_utf8("lastIndex"),
@@ -414,6 +452,22 @@ fn regexp_builtin_exec(
             true,
         )?;
     }
+    Ok(Some(MatchSpans {
+        captures,
+        index: last_index,
+    }))
+}
+
+/// The match result array (spec 22.2.7.2 step 13 onward).
+fn regexp_match_array(
+    agent: &mut Agent,
+    string: &JsString,
+    state: &RegExpState,
+    matched: &MatchSpans,
+) -> Result<Value, JsError> {
+    let result = &matched.captures;
+    let last_index = matched.index;
+    let has_indices = state.flags.d;
     let capturing_groups = state.compiled.capturing_groups;
     let array = crate::builtins::array::array_create(agent, (capturing_groups + 1) as f64)?;
     array.create_data_property(
@@ -431,7 +485,7 @@ fn regexp_builtin_exec(
         let groups_obj = JsObject::ordinary_object_create(None);
         let named = groups_obj;
         for name in &state.compiled.named_group_order {
-            let value = match last_named_span(&state.compiled, &result, name) {
+            let value = match last_named_span(&state.compiled, result, name) {
                 Some((s, e)) => Value::String(Handle::new(substring(string, s, e))),
                 None => Value::Undefined,
             };
@@ -464,7 +518,7 @@ fn regexp_builtin_exec(
         let groups_indices = if state.compiled.has_group_names {
             let groups_indices = JsObject::ordinary_object_create(None);
             for name in &state.compiled.named_group_order {
-                let pair = match last_named_span(&state.compiled, &result, name) {
+                let pair = match last_named_span(&state.compiled, result, name) {
                     Some((s, e)) => pair_array(agent, s, e)?,
                     None => Value::Undefined,
                 };
@@ -478,7 +532,7 @@ fn regexp_builtin_exec(
         indices_obj.create_data_property(&JsString::from_utf8("groups"), groups_indices)?;
         array.create_data_property(&JsString::from_utf8("indices"), Value::Object(indices_obj))?;
     }
-    Ok(Some(Value::Object(array)))
+    Ok(Value::Object(array))
 }
 
 fn pair_array(agent: &mut Agent, start: usize, end: usize) -> Result<Value, JsError> {
@@ -552,7 +606,13 @@ fn exec(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsErro
 fn test(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsError> {
     let string =
         crate::context::to_string(agent, &args.first().cloned().unwrap_or(Value::Undefined))?;
-    let matched = regexp_builtin_exec(agent, this, &string)?.is_some();
+    // The builtin exec's match half only: `test` keeps the boolean, so the
+    // result array — an array object, the `index`/`input`/`groups`
+    // properties and a substring per capture — would be built and thrown
+    // away. The `lastIndex` protocol is unchanged, because it lives in the
+    // match half.
+    let (obj, state) = regexp_receiver(agent, this)?;
+    let matched = regexp_builtin_match(agent, this, &obj, &state, &string)?.is_some();
     Ok(Value::Boolean(matched))
 }
 
@@ -1776,6 +1836,39 @@ mod tests {
             ValueKind::Boolean(b) => b,
             other => panic!("expected a boolean, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn test_keeps_the_last_index_protocol_without_building_a_match() {
+        // `RegExp.prototype.test` keeps only the boolean, so it no longer
+        // builds the match array — but the observable `lastIndex` protocol
+        // must be unchanged. The read happens even on a non-global regexp
+        // (spec 22.2.7.2 steps 4 and 8, and test262 pins the single read in
+        // `built-ins/RegExp/prototype/exec/failure-lastindex-access.js`), and
+        // the value is coerced as before.
+        assert_eq!(
+            text(
+                "(function(){ var gets = 0; var counter = { valueOf: function(){ gets++; return 0; } }; \
+                 var r = /a/; r.lastIndex = counter; r.test('nbc'); \
+                 return gets + ',' + (r.lastIndex === counter); })()"
+            ),
+            "1,true"
+        );
+        // Non-global: read but never written.
+        assert_eq!(
+            number(
+                "(function(){ var r = /a/; r.lastIndex = 7; r.test('banana'); return r.lastIndex; })()"
+            ),
+            7.0
+        );
+        // Global: written to the position past the match.
+        assert_eq!(
+            number("(function(){ var r = /a/g; r.test('banana'); return r.lastIndex; })()"),
+            2.0
+        );
+        // The boolean itself, and a capture group still reported by exec.
+        assert!(bool("/a/.test('banana')"));
+        assert_eq!(text("/a(b)/.exec('ab')[1]"), "b");
     }
 
     #[test]
