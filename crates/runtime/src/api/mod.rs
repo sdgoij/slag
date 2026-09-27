@@ -1202,6 +1202,46 @@ mod tests {
     }
 
     #[test]
+    fn a_materialized_prototype_names_its_constructor() {
+        let mut isolate = isolate();
+        let context = context(&mut isolate);
+        let template = FunctionTemplate::new(&mut isolate, Box::new(|_| {}));
+        template.set_class_name("Crypto");
+        let constructor = template.get_function(&context).unwrap();
+        Object::set(&context, &context.global(), "Crypto", &constructor, true).unwrap();
+
+        // The link V8 has: the prototype names the function, so an instance's
+        // `constructor` is the class rather than `Object`.
+        assert_eq!(
+            context
+                .eval("new Crypto().constructor === Crypto")
+                .to_local_checked()
+                .as_boolean(),
+            Some(true)
+        );
+        assert_eq!(
+            context
+                .eval("Object.getPrototypeOf(new Crypto()).constructor.name")
+                .to_local_checked()
+                .as_string()
+                .as_deref(),
+            Some("Crypto")
+        );
+        // V8's descriptor for the link.
+        assert_eq!(
+            context
+                .eval(
+                    "(function(){ var d = Object.getOwnPropertyDescriptor(Crypto.prototype, 'constructor'); \
+                     return d.writable + ',' + d.enumerable + ',' + d.configurable; })()"
+                )
+                .to_local_checked()
+                .as_string()
+                .as_deref(),
+            Some("true,false,true")
+        );
+    }
+
+    #[test]
     fn object_template_accessors_route_to_callbacks() {
         let mut isolate = isolate();
         let context = context(&mut isolate);

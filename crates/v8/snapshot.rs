@@ -2508,6 +2508,104 @@ mod tests {
         );
     }
 
+    /// A class's materialized prototype names its constructor, and an instance
+    /// carried through a blob reaches it — the crypto shape, where a restored
+    /// class's carried instance answers `constructor` as the class rather than
+    /// `Object`.
+    #[test]
+    fn a_carried_instance_reaches_its_restored_class() {
+        use crate::support::MapFnTo;
+
+        fn hash(
+            scope: &mut crate::scope::PinScope<'_, '_>,
+            _args: crate::function::FunctionCallbackArguments,
+            rv: crate::function::ReturnValue,
+        ) {
+            rv.set(crate::Number::new(scope, 32.0).into());
+        }
+        let references = vec![crate::ExternalReference {
+            function: hash.map_fn_to(),
+        }];
+
+        let mut isolate =
+            Isolate::snapshot_creator(Some(std::borrow::Cow::Owned(references.clone())), None);
+        {
+            crate::scope!(let scope, &mut isolate);
+            let context = Context::new(scope, Default::default());
+            let scope = &mut crate::ContextScope::new(scope, context);
+            scope.set_default_context(context);
+            let template = crate::FunctionTemplate::builder(hash).build(scope);
+            template.set_class_name(crate::String::new(scope, "Crypto").expect("a name"));
+            // Materialized the way a host registers an op class, with the method on
+            // the materialized function's own `.prototype` object — the object the
+            // record carries. This is deno's shape: it does not populate the
+            // template's prototype template.
+            crate::test_support::bind(
+                scope,
+                "Crypto",
+                template
+                    .get_function(scope)
+                    .expect("a function")
+                    .cast::<Value>(),
+            );
+            crate::test_support::bind(
+                scope,
+                "hash",
+                crate::FunctionTemplate::builder(hash)
+                    .build(scope)
+                    .get_function(scope)
+                    .expect("a function")
+                    .cast::<Value>(),
+            );
+            crate::test_support::eval(scope, "Crypto.prototype.hash = hash");
+            // An instance made before the snapshot and carried: what deno does with
+            // its `crypto` global.
+            crate::test_support::bind(
+                scope,
+                "carried",
+                crate::test_support::eval(scope, "new Crypto()"),
+            );
+            scope.add_context_data(context, template);
+        }
+        let blob = isolate
+            .create_blob(FunctionCodeHandling::Keep)
+            .expect("a blob");
+
+        let mut isolate = isolate_from_with(blob, references);
+        let context = restored_context(&mut isolate, DEFAULT_CONTEXT_SLOT)
+            .expect("the blob names the default context");
+        crate::scope!(let scope, &mut isolate);
+        let context = context.open(scope);
+        let scope = &mut crate::ContextScope::new(scope, context);
+        let template = scope
+            .get_context_data_from_snapshot_once::<crate::FunctionTemplate>(0)
+            .expect("the template");
+        crate::test_support::bind(
+            scope,
+            "Crypto",
+            template
+                .get_function(scope)
+                .expect("a function")
+                .cast::<Value>(),
+        );
+        assert!(
+            crate::test_support::eval(
+                scope,
+                "Object.getPrototypeOf(carried).constructor === Crypto",
+            )
+            .is_true(),
+            "a carried instance's prototype names the restored class"
+        );
+        assert!(
+            crate::test_support::eval(
+                scope,
+                "Object.getPrototypeOf(carried).constructor.name === 'Crypto'",
+            )
+            .is_true(),
+            "and the name a host registered comes back with it"
+        );
+    }
+
     /// The table form of the reference list a creator or an isolate takes.
     fn references(
         pointers: &[*mut std::ffi::c_void],

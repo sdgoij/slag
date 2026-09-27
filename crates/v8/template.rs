@@ -197,8 +197,20 @@ impl<'s> LocalHandle<'s, FunctionTemplate> {
     /// The function this template makes in the scope's realm
     /// (v8::FunctionTemplate::GetFunction).
     pub fn get_function(&self, scope: &PinScope<'_, '_, ()>) -> Option<Local<'s, Function>> {
+        let template = self.template_rc();
+        // Materialize the inherit chain before this template's own function. The
+        // engine materializes a parent as a side effect of a child — it reads the
+        // parent's `.prototype` to use as the child's `__proto__` — but that path
+        // never passes through this handle, so an ancestor's function carries no
+        // callback record. The child's record now reaches that function (through
+        // the `.prototype.constructor` the engine defines on the prototype), so a
+        // snapshot walk finds it and must be able to carry it. Walking the chain
+        // from here is what records every ancestor's callback.
+        if let Some(parent) = template.parent() {
+            function_template_handle(scope, parent).get_function(scope)?;
+        }
         let realm = crate::realm_of(scope);
-        let value = self.template_rc().get_function(&realm).ok()?;
+        let value = template.get_function(&realm).ok()?;
         let function: Local<'_, Function> = Local::from_engine(value);
         // The callback the template was built from belongs to this function now,
         // which is the identity the engine's snapshot walk asks the host with —
@@ -441,6 +453,23 @@ fn object_template_handle<'s>(
     let isolate = scope.isolate_ptr();
     let pointer = Rc::as_ptr(&template) as *mut c_void;
     isolate.add_object_template(template);
+    let handle: Local<'s, External> = External::new(scope, pointer);
+    // The pointer the template was just stored under, retagged: the bridge put
+    // it there itself, so there is nothing for a checked cast to ask.
+    handle.retag()
+}
+
+/// Store an engine function template on the isolate and hand back the handle that
+/// names it — the same shape [`FunctionBuilder::from_parts`] builds, for a
+/// template already held as an `Rc` (an inherited parent, walked by
+/// [`FunctionTemplate::get_function`]).
+fn function_template_handle<'s>(
+    scope: &PinScope<'s, '_, ()>,
+    template: Rc<api::FunctionTemplate>,
+) -> Local<'s, FunctionTemplate> {
+    let isolate = scope.isolate_ptr();
+    let pointer = Rc::as_ptr(&template) as *mut c_void;
+    isolate.add_template(template);
     let handle: Local<'s, External> = External::new(scope, pointer);
     // The pointer the template was just stored under, retagged: the bridge put
     // it there itself, so there is nothing for a checked cast to ask.

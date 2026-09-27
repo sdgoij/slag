@@ -507,6 +507,25 @@ impl FunctionTemplate {
             },
         )?;
 
+        // The prototype names its constructor back (an ordinary function's
+        // `.prototype.constructor`), which is what makes
+        // `Object.getPrototypeOf(instance).constructor` the class a host
+        // registered rather than `Object`. A restored prototype is re-pointed at
+        // the function just made, so `F.prototype.constructor === F` holds after
+        // a load too. V8's descriptor for the link is writable, non-enumerable,
+        // configurable.
+        prototype_object.define_property(
+            &JsString::from_utf8("constructor"),
+            &PropertyDescriptor {
+                value: Some(Value::Function(function)),
+                writable: Some(true),
+                enumerable: Some(false),
+                configurable: Some(true),
+                get: None,
+                set: None,
+            },
+        )?;
+
         // The host's static properties: `Template::Set` on a function template
         // puts them on the function object itself. Data properties only — the
         // crate's static *accessor* is absent until a host asks for it, since
