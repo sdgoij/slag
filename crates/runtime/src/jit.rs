@@ -1161,15 +1161,36 @@ pub(crate) const JIT_COMPILE_THRESHOLD: u32 = 16;
 /// one session: ungated **151.7 s**, this cap **129.7 s** (the two samples
 /// agreeing to 0.2 s), and pre-`Unary` **136.4 s** — so the cap both removes the
 /// regression the `Unary` slice's extra compiles caused and lands ahead of the
-/// state before it. 514 of 567 bodies stay compiled; the compact loops the JIT
-/// actually wins (`--jit-bench` rows, the 2.4× leaf loop) are all far under it.
+/// state before it. 514 of 567 bodies stay compiled; the compact loops that
+/// probe's build wins (`--jit-bench` rows, the 2.4× leaf loop) are all far under
+/// it — the claim that nothing worth compiling is refused does not survive the
+/// release measurement below, which finds the opcost loops sitting just over.
 /// A release build compiles ~10× cheaper, so the cap is conservative there — it
 /// trades a bounded compile for an unbounded one, which is the property worth
 /// keeping. A body containing a self-tail-call is exempt ([`body_has_self_tail
 /// _call`]), because its iterations are unbounded within one call. The proxy is
 /// the step count, so a `RunRegBody` (whose op list is inside the step) can hide
 /// cost; the cap errs toward compiling it.
+///
+/// The calibration above is a **debug** measurement, and debug is not what
+/// ships: the numbers it refuses are exactly the ones a release build compiles
+/// cheaply. So the cap is per-profile — debug keeps the measured 128, release
+/// gets the larger bound. Measured on the opcost family (per-file alternating
+/// A/B against the 128 binary, 3 samples each, release): the seven rows whose
+/// `bench()` body is 129-133 steps are refused at 128 and compile at 1024, where
+/// they run 1.2×-2.0× faster — `array_push` 2.0×, `math_call` 2.0×, `set_has`
+/// 1.9×, `obj_prop` 1.7×, `string_charat` 1.6×, `regexp_test` 1.2×,
+/// `string_indexof` 1.0× — and no already-compiled row regressed. The
+/// multi-thousand-step bodies the probe above names (the 2,277-step scanner)
+/// stay refused at both. Note the step count is a body-wide proxy: a large
+/// prologue around a small hot loop counts against it, which is the shape every
+/// opcost row has.
+#[cfg(debug_assertions)]
 pub(crate) const JIT_MAX_COMPILE_STEPS: usize = 128;
+
+/// Release's cap: see [`JIT_MAX_COMPILE_STEPS`].
+#[cfg(not(debug_assertions))]
+pub(crate) const JIT_MAX_COMPILE_STEPS: usize = 1024;
 
 /// The `BinaryOp` variants in declaration order (a fieldless enum's
 /// discriminant is its index — guaranteed by the language).

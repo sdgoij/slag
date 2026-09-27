@@ -719,7 +719,11 @@ pub fn get_property_key(
             // Primitive bases are boxed for the property read (spec 7.3.2
             // step 5.b), but the receiver stays the primitive: accessors see
             // `this` as the primitive (spec 10.4.3.4 StringExoticObject.
-            // [[Get]] passes Receiver through to OrdinaryGet).
+            // [[Get]] passes Receiver through to OrdinaryGet). The interpreter
+            // does not reach this arm for a primitive member read —
+            // `Vm::get_primitive_member` (ir.rs) serves those without the
+            // wrapper — so this is the exact, boxed fallback for direct
+            // callers of this operation.
             let object = to_object(agent, base)?;
             get_property_key(agent, &object, key, receiver)
         }
@@ -1549,5 +1553,179 @@ mod tests {
             value,
             Value::String(Handle::new(JsString::from_utf8("a,b")))
         );
+    }
+
+    fn text(value: &Value) -> String {
+        value
+            .as_string()
+            .expect("the script answers a string")
+            .to_string_lossy()
+    }
+
+    /// A property read through a primitive has one answer, whichever path
+    /// serves it: `GetV` (spec 7.3.2) is `ToObject(V).[[Get]](P, V)`. This is
+    /// the differential the primitive read is held to — every receiver and key
+    /// below must read the same through the primitive and through `Object(V)`.
+    /// It is the pin that fails if `length` is answered from
+    /// `String.prototype.length` instead of the value, because a String
+    /// wrapper's own `length` shadows that `0`.
+    #[test]
+    fn reading_through_a_primitive_agrees_with_reading_through_its_wrapper() {
+        let value = crate::agent::evaluate(
+            "function show(v) { return typeof v === 'symbol' ? 'symbol' : String(v); } \
+             const receivers = ['abc', '', '\\u{1F600}', 5, 0, -1.5, true, false, 10n, Symbol('d')]; \
+             const keys = ['length', '0', '1', '2', '5', '-1', '01', '1.5', 'NaN', 'foo', \
+                           'toString', 'constructor', 'description', 'valueOf']; \
+             const differing = []; \
+             for (const receiver of receivers) { \
+               const boxed = Object(receiver); \
+               for (const key of keys) { \
+                 const a = receiver[key]; \
+                 const b = boxed[key]; \
+                 if (a !== b) differing.push(typeof receiver + '/' + key + ': ' + show(a) + ' vs ' + show(b)); \
+               } \
+             } \
+             differing.join('; ')",
+        )
+        .unwrap();
+        assert_eq!(text(&value), "");
+    }
+
+    /// The receiver reached through the chain stays the primitive: a *strict*
+    /// accessor's `this` is the primitive, never a wrapper — `ToObject` is
+    /// only the base of the lookup (spec 10.4.3), not the receiver. The
+    /// getters are strict on purpose: a sloppy one boxes `this` itself in
+    /// `OrdinaryCallBindThis`, which would hide what this pins.
+    #[test]
+    fn an_accessor_read_through_a_primitive_sees_the_primitive() {
+        let value = crate::agent::evaluate(
+            "Object.defineProperty(Object.prototype, 'inherited', { \
+               configurable: true, \
+               get() { 'use strict'; return typeof this + ':' + (this instanceof Object); } }); \
+             ['ab'.inherited, (7).inherited, (true).inherited, (5n).inherited, \
+              Symbol('s').inherited, (7).__proto__ === Number.prototype].join('|')",
+        )
+        .unwrap();
+        assert_eq!(
+            text(&value),
+            "string:false|number:false|boolean:false|bigint:false|symbol:false|true"
+        );
+    }
+
+    /// The fast path must not turn `null.x` into `undefined`: Null and
+    /// Undefined have no wrapper, so the boxed path is entered and its
+    /// `ToObject` TypeError still raised.
+    #[test]
+    fn a_read_through_null_or_undefined_still_raises() {
+        for script in ["null.x", "undefined.x", "null[0]", "undefined['length']"] {
+            let error = crate::agent::evaluate(script).expect_err(script);
+            assert_eq!(error.kind, ErrorKind::TypeError, "{script}");
+        }
+    }
+
+    /// A String's own properties are `length` and the canonical numeric index
+    /// properties, and nothing else (spec 10.4.3.1). `'ab'.length` must not be
+    /// answered from `String.prototype.length` (which is 0), and an
+    /// out-of-range or non-canonical key must reach `undefined` rather than a
+    /// virtual index.
+    #[test]
+    fn a_string_read_distinguishes_length_from_an_index() {
+        let value = crate::agent::evaluate(
+            "['ab'.length, 'ab'[2], 'ab'['length'], 'ab'['2'], 'ab'[2.0], 'ab'[-0], \
+              ''[0], '\\u{1F600}'.length, '\\u{1F600}'[0].length, 'ab'['01'], \
+              'ab'[NaN], 'ab'[1.5], 'ab'[-1]].map(String).join('|')",
+        )
+        .unwrap();
+        assert_eq!(
+            text(&value),
+            "2|undefined|2|undefined|undefined|a|undefined|2|1|undefined|undefined|undefined|undefined"
+        );
+    }
+
+    /// The builtins a method read finds through a primitive receive the
+    /// primitive as `this`: every `%<Type>Prototype%` method that unboxes its
+    /// receiver must see the value, not a wrapper.
+    #[test]
+    fn a_method_read_through_a_primitive_reaches_its_builtin() {
+        let value = crate::agent::evaluate(
+            "[(5).toString(), (5).toFixed(2), (255).toString(16), (true).valueOf(), \
+              (!true).valueOf(), (10n).toString(), (10n).toString(2), Symbol('d').description, \
+              'abc'.toUpperCase(), 'abc'.slice(1), 'abc'.charCodeAt(0), \
+              'abc'[0].toUpperCase(), 'abc'.constructor === String].map(String).join('|')",
+        )
+        .unwrap();
+        assert_eq!(
+            text(&value),
+            "5|5.00|ff|true|false|10|1010|d|ABC|bc|97|A|true"
+        );
+    }
+
+    /// The prototype a primitive read lands on is the *current* intrinsic,
+    /// consulted live: adding an accessor to `String.prototype` changes what a
+    /// later read answers and deleting it changes it back. A fast path that
+    /// captured the chain, or answered from the value alone, would not see
+    /// either. The getter is strict, so its `this.length` is another
+    /// primitive read of the receiver itself.
+    #[test]
+    fn a_primitive_read_consults_its_prototype_live() {
+        let value = crate::agent::evaluate(
+            "const before = 'abc'.shape; \
+             Object.defineProperty(String.prototype, 'shape', { \
+               configurable: true, get() { 'use strict'; return this.length * 2; } }); \
+             const during = 'abc'.shape; \
+             delete String.prototype.shape; \
+             const after = 'abc'.shape; \
+             [String(before), during, String(after)].join('|')",
+        )
+        .unwrap();
+        assert_eq!(text(&value), "undefined|6|undefined");
+    }
+
+    /// The object path is unchanged: `Object('ab')` is still a real String
+    /// wrapper whose own properties are `length` and the enumerable index
+    /// properties.
+    #[test]
+    fn the_string_wrapper_object_path_is_unchanged() {
+        let value = crate::agent::evaluate(
+            "[Object('ab').length, Object('ab')[1], Object.keys(Object('ab')).join(','), \
+              Object('ab') instanceof String].join('|')",
+        )
+        .unwrap();
+        assert_eq!(text(&value), "2|b|0,1|true");
+    }
+
+    fn direct_read(agent: &mut Agent, base: &Value, key: &str) -> Value {
+        get_property_key(agent, base, &PropertyKey::from_utf8(key), *base)
+            .unwrap_or_else(|e| panic!("{key}: {:?} {e}", e.kind))
+    }
+
+    /// A direct caller of this operation (the interpreter's member reads go
+    /// through `Vm::get_primitive_member` instead) gets the boxed answers, and
+    /// `null`/`undefined` get the `ToObject` TypeError rather than a value.
+    #[test]
+    fn a_direct_primitive_read_boxes_the_base() {
+        let mut agent = Agent::new();
+        agent.initialize_host_defined_realm().unwrap();
+        let string = Value::String(Handle::new(JsString::from_utf8("abc")));
+        assert_eq!(
+            direct_read(&mut agent, &string, "length").as_number(),
+            Some(3.0)
+        );
+        assert_eq!(
+            direct_read(&mut agent, &string, "1")
+                .as_string()
+                .map(|s| s.to_string_lossy()),
+            Some("b".to_string())
+        );
+        assert!(direct_read(&mut agent, &string, "nope").is_undefined());
+        assert!(matches!(
+            direct_read(&mut agent, &Value::Number(5.0), "toFixed").kind(),
+            ValueKind::Function(_)
+        ));
+        for base in [Value::Null, Value::Undefined] {
+            let error = get_property_key(&mut agent, &base, &PropertyKey::from_utf8("x"), base)
+                .expect_err("a nullish base has no wrapper");
+            assert_eq!(error.kind, ErrorKind::TypeError);
+        }
     }
 }
