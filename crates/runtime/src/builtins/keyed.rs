@@ -677,7 +677,7 @@ fn map_get_or_insert_computed(
             return Ok(value);
         }
     }
-    let value = crate::function::call(
+    let value = crate::function::call_callback(
         agent,
         &callback,
         Value::Undefined,
@@ -714,7 +714,7 @@ fn map_for_each(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value
         }
         index += 1;
         if let Some((key, value)) = entry {
-            crate::function::call(agent, &callback, this_arg, &[value, key, *this])?;
+            crate::function::call_callback(agent, &callback, this_arg, &[value, key, *this])?;
         }
     }
     Ok(Value::Undefined)
@@ -895,7 +895,7 @@ fn set_for_each(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value
         }
         index += 1;
         if let Some(value) = entry {
-            crate::function::call(agent, &callback, this_arg, &[value, value, *this])?;
+            crate::function::call_callback(agent, &callback, this_arg, &[value, value, *this])?;
         }
     }
     Ok(Value::Undefined)
@@ -1057,7 +1057,7 @@ fn get_iterator_from_method(
     obj: &Value,
     method: &Value,
 ) -> Result<IteratorRecord, JsError> {
-    let iterator = crate::function::call(agent, method, *obj, &[])?;
+    let iterator = crate::function::call_callback(agent, method, *obj, &[])?;
     if !matches!(iterator.kind(), ValueKind::Object(_)) {
         return Err(JsError::new(
             ErrorKind::TypeError,
@@ -1443,7 +1443,7 @@ fn weak_map_get_or_insert_computed(
             return Ok(value);
         }
     }
-    let value = crate::function::call(
+    let value = crate::function::call_callback(
         agent,
         &callback,
         Value::Undefined,
@@ -1591,7 +1591,7 @@ where
             Some(value) => value,
             None => break,
         };
-        let key = match crate::function::call(
+        let key = match crate::function::call_callback(
             agent,
             callback,
             Value::Undefined,

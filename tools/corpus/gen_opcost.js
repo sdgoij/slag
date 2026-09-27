@@ -25,7 +25,7 @@
 // differ by less than the round-to-round noise (the bare loop itself moves
 // ±10% between rounds). Every row also clears the cap by a wide margin — the
 // largest is under 64 steps, which the debug binary confirms by compiling all
-// 35 of them with its cap temporarily cut to 64.
+// 36 of them with its cap temporarily cut to 64.
 //
 // The bodies end in `| 0`, which keeps the accumulator an int32. That does two
 // things: the four modes agree on the result (so the parity check is a real
@@ -141,6 +141,14 @@ const rows = [
     's = (s + mg.get(k)) | 0;',
   ],
   ['map_set', mapFor('m'), 'm.set(k, i); s = (s + 1) | 0;'],
+  // The Map twin of `array_for_each`: an iteration method that invokes a user
+  // callback once per entry, so it localizes the same builtin→callback lane on
+  // a different container.
+  [
+    'map_for_each',
+    'var small = new Map([[1, 1], [2, 2], [3, 3], [4, 4]]);\n  var cb = function (x) { return x + 1; };',
+    'small.forEach(cb); s = (s + 1) | 0;',
+  ],
   ['set_has', set, 's = (s + (set.has(k) ? 1 : 0)) | 0;'],
   ['regexp_test', STRS + '\n  var re = /[a-z]+/;', 's = (s + (re.test(strs[k & 3]) ? 1 : 0)) | 0;'],
   ['string_charat', STRS, 's = (s + strs[k & 3].charCodeAt(k & 7)) | 0;'],
