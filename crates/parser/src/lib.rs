@@ -1187,6 +1187,18 @@ mod tests {
     fn static_blocks_and_decorators() {
         // Static blocks are return-less.
         err("class C { static { return; } }");
+        // ...but the ban is the block's own grammar, not its nested functions':
+        // a function body declared inside one is a `return` context again, and
+        // every shape of nested body has to re-establish that (a `return` here is
+        // what deno's `ext/http/01_http.js` writes in a static block, and keeping
+        // the flag made a legal file refusable).
+        ok("class C { static { function f() { return 1; } f(); } }");
+        ok("class C { static { const f = function () { return 1; }; f(); } }");
+        ok("class C { static { const f = () => { return 1; }; f(); } }");
+        ok("class C { static { class D { m() { return 1; } } } }");
+        // The flag is restored, so a `return` after the nested function is still
+        // the block's early error.
+        err("class C { static { function f() { return 1; } return; } }");
         // Decorated classes and elements parse (syntax only).
         ok("@dec class C {};");
         ok("var C = @a.b @(c) class {};");

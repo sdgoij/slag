@@ -237,6 +237,8 @@ const REC_TYPED_ARRAY: u8 = 21;
 const REC_ARGUMENTS: u8 = 22;
 const REC_STRING_OBJECT: u8 = 23;
 const REC_KEYED: u8 = 24;
+const REC_DATE: u8 = 25;
+const REC_REGEXP: u8 = 26;
 
 /// An array buffer's own flags, in the byte its record carries: whether it is
 /// resizable (a `maxByteLength` was given) and whether it is immutable
@@ -648,6 +650,28 @@ enum Record {
     Keyed {
         map: bool,
         entries: Vec<u32>,
+        proto: u32,
+        extensible: bool,
+        properties: Vec<StoredProperty>,
+    },
+    /// A Date (spec 21.4.1): its time value, which lives in the agent's table, and
+    /// its object part. `NaN` — an invalid date — travels as itself.
+    Date {
+        time: f64,
+        proto: u32,
+        extensible: bool,
+        properties: Vec<StoredProperty>,
+    },
+    /// A RegExp (spec 22.2.3): the source and flags its matcher is rebuilt from,
+    /// the constructor it was allocated with, and its object part. The compiled
+    /// program is deliberately not carried — it is a function of the pattern and
+    /// the flags, so the load recompiles it, and a program is not a value a blob
+    /// could hold anyway. `lastIndex` is an ordinary own property and travels in
+    /// the object part.
+    RegExp {
+        source: Vec<u16>,
+        flags: Vec<u16>,
+        constructor: u32,
         proto: u32,
         extensible: bool,
         properties: Vec<StoredProperty>,
@@ -2798,6 +2822,13 @@ fn children(agent: &Agent, object: &Handle<JsObject>) -> Result<Vec<Value>, Unsu
             children.push(*entry);
         }
     }
+    // A RegExp's source and the constructor it was allocated with live in the
+    // agent's table too, so the walk owes the constructor — a value the record
+    // names by serial. The source is not walked: the record carries it as its own
+    // field, and the load makes a fresh string from it rather than sharing one.
+    if let Some(state) = agent.regexp_data.get(&object.id()) {
+        children.push(state.constructor);
+    }
     Ok(children)
 }
 
@@ -3023,6 +3054,12 @@ fn write_record(
             }
             None if keyed_kind(agent, &object).is_some() => {
                 write_keyed(agent, realm, object, serials, body)?
+            }
+            None if agent.date_data.contains_key(&object.id()) => {
+                write_date(agent, realm, object, serials, body)?
+            }
+            None if agent.regexp_data.contains_key(&object.id()) => {
+                write_regexp(agent, realm, object, serials, body)?
             }
             None => {
                 if let ObjectKind::External(pointer) = &object.kind {
@@ -3861,6 +3898,64 @@ fn write_arguments(
     Ok(())
 }
 
+/// Write a Date as its time value plus its object part.
+///
+/// The time is the record's substance — it lives in the agent's table, and
+/// nothing in the object holds it — so an object record alone would bring back a
+/// date whose every method reports an invalid receiver.
+fn write_date(
+    agent: &Agent,
+    realm: &Handle<Realm>,
+    object: Handle<JsObject>,
+    serials: &HashMap<Identity, u32>,
+    body: &mut Vec<u8>,
+) -> Result<(), Unsupported> {
+    let Some(time) = agent.date_data.get(&object.id()) else {
+        return Err(Unsupported::new(
+            "a Date",
+            "the agent holds no time value for this object",
+        ));
+    };
+    body.push(REC_DATE);
+    write_f64(body, *time);
+    write_u32(body, prototype_serial(realm, &object, serials)?);
+    body.push(u8::from(object.extensible.get()));
+    write_properties(realm, &object, serials, body)?;
+    Ok(())
+}
+
+/// Write a RegExp as the source and flags its matcher is rebuilt from, the
+/// constructor it was allocated with, and its object part.
+fn write_regexp(
+    agent: &Agent,
+    realm: &Handle<Realm>,
+    object: Handle<JsObject>,
+    serials: &HashMap<Identity, u32>,
+    body: &mut Vec<u8>,
+) -> Result<(), Unsupported> {
+    let Some(state) = agent.regexp_data.get(&object.id()) else {
+        return Err(Unsupported::new(
+            "a RegExp",
+            "the agent holds no regexp state for this object",
+        ));
+    };
+    body.push(REC_REGEXP);
+    write_units(body, state.source.as_slice());
+    write_units(
+        body,
+        state
+            .flags_text
+            .encode_utf16()
+            .collect::<Vec<u16>>()
+            .as_slice(),
+    );
+    write_u32(body, serial_in(realm, serials, state.constructor));
+    write_u32(body, prototype_serial(realm, &object, serials)?);
+    body.push(u8::from(object.extensible.get()));
+    write_properties(realm, &object, serials, body)?;
+    Ok(())
+}
+
 /// Write a String exotic as the primitive it wraps plus its object part.
 ///
 /// The code units are the record's substance: a String object's index properties
@@ -4374,6 +4469,34 @@ fn read_record(reader: &mut Reader<'_>) -> Result<Record, DecodeError> {
             Ok(Record::Keyed {
                 map,
                 entries,
+                proto,
+                extensible,
+                properties,
+            })
+        }
+        REC_DATE => {
+            let time = reader.f64().ok_or(DecodeError::Truncated)?;
+            let proto = reader.u32().ok_or(DecodeError::Truncated)?;
+            let extensible = reader.u8().ok_or(DecodeError::Truncated)? != 0;
+            let properties = read_properties(reader)?;
+            Ok(Record::Date {
+                time,
+                proto,
+                extensible,
+                properties,
+            })
+        }
+        REC_REGEXP => {
+            let source = reader.units().ok_or(DecodeError::Truncated)?;
+            let flags = reader.units().ok_or(DecodeError::Truncated)?;
+            let constructor = reader.u32().ok_or(DecodeError::Truncated)?;
+            let proto = reader.u32().ok_or(DecodeError::Truncated)?;
+            let extensible = reader.u8().ok_or(DecodeError::Truncated)? != 0;
+            let properties = read_properties(reader)?;
+            Ok(Record::RegExp {
+                source,
+                flags,
+                constructor,
                 proto,
                 extensible,
                 properties,
@@ -5423,6 +5546,67 @@ impl Builder<'_> {
                         )),
                     );
                 }
+                define_properties(self, object, properties)?;
+                // Extensibility last, for the reason `Record::Object` states.
+                object.extensible.set(*extensible);
+                Built::Object(object)
+            }
+            Record::Date {
+                time,
+                proto,
+                extensible,
+                properties,
+            } => {
+                let prototype = self.prototype(*proto)?;
+                let object = JsObject::ordinary_object_create(prototype);
+                // The time is the record's substance and it lives in the agent's
+                // table, so it has to be put back there — the object alone is not
+                // a date to any `Date.prototype` method.
+                self.agent.date_data.insert(object.id(), *time);
+                self.remember(index, Built::Object(object));
+                define_properties(self, object, properties)?;
+                // Extensibility last, for the reason `Record::Object` states.
+                object.extensible.set(*extensible);
+                Built::Object(object)
+            }
+            Record::RegExp {
+                source,
+                flags,
+                constructor,
+                proto,
+                extensible,
+                properties,
+            } => {
+                let prototype = self.prototype(*proto)?;
+                let object = JsObject::ordinary_object_create(prototype);
+                self.remember(index, Built::Object(object));
+                let source = JsString::from_utf16(source);
+                let flags_text = String::from_utf16_lossy(flags);
+                let parsed = regexp::Flags::parse(flags).map_err(|error| {
+                    DecodeError::UnrebuildableObject(format!(
+                        "the regexp's flags would not parse: {}",
+                        error.message
+                    ))
+                })?;
+                let compiled = std::rc::Rc::new(
+                    regexp::compile(source.as_slice(), parsed).map_err(|error| {
+                        DecodeError::UnrebuildableObject(format!(
+                            "the engine would not compile the regexp: {}",
+                            error.message
+                        ))
+                    })?,
+                );
+                let constructor = self.materialize(*constructor)?;
+                self.agent.regexp_data.insert(
+                    object.id(),
+                    crate::builtins::regexp::RegExpState {
+                        source,
+                        flags_text,
+                        flags: parsed,
+                        compiled,
+                        constructor,
+                    },
+                );
                 define_properties(self, object, properties)?;
                 // Extensibility last, for the reason `Record::Object` states.
                 object.extensible.set(*extensible);

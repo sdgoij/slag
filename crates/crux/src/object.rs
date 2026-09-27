@@ -3791,6 +3791,7 @@ impl JsObject {
         let mut props = self.properties.borrow_mut();
         let position = props.len();
         crate::heap::write_barrier(self, value);
+        barrier_key(self, key);
         props.push((
             key.clone(),
             Property::data(value, writable, enumerable, configurable),
@@ -4176,6 +4177,21 @@ pub(crate) fn barrier_property(target: &JsObject, property: &Property) {
     }
 }
 
+/// A2: record the write barrier for a property *key* being added to `target`.
+///
+/// The key is a heap reference when it is a symbol — a string key is an atom id,
+/// which the atom table roots — so growing a property table by a symbol-keyed
+/// entry on an object the collector has already promoted is an `old -> young`
+/// edge like any other. It has to be recorded here rather than in
+/// [`barrier_property`], which sees only the value: the key lives in the table
+/// entry beside the property, and a key no barrier recorded is a `Symbol` box a
+/// minor sweep drops out of a live table.
+pub(crate) fn barrier_key(target: &JsObject, key: &PropertyKey) {
+    if let PropertyKey::Symbol(symbol) = key {
+        crate::heap::write_barrier_handle(target, *symbol);
+    }
+}
+
 fn validate_and_apply(
     obj: Option<&JsObject>,
     key: &PropertyKey,
@@ -4197,6 +4213,7 @@ fn validate_and_apply(
             return Ok(false);
         };
         barrier_property(obj, &property);
+        barrier_key(obj, key);
         let mut props = obj.properties.borrow_mut();
         let position = props.len();
         props.push((key.clone(), property.clone()));

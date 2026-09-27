@@ -1392,6 +1392,56 @@ mod tests {
         assert_eq!(value.as_number(), Some(42.0));
     }
 
+    /// A property **key** is a store like any other: a young symbol added as a key
+    /// to an object the collector has promoted must be recorded in the remembered
+    /// set, or a minor sweeps the `Symbol` box out of a live property table. The
+    /// A2 verifier is what catches the missing call — this is the sibling of the
+    /// private-field test above, for the other place a value reaches an object's
+    /// own storage, and it needs the same default-nursery shape for the same
+    /// reason (a per-allocation collection would promote the symbol by its own
+    /// allocation and never produce an `old -> young` edge).
+    ///
+    /// The define path and the set path are two different stores and each needs
+    /// its own shape: a plain `holder[Symbol()] = 1` does *not* fire (an ordinary
+    /// object's fresh data define records the key already), while the descriptor
+    /// path below and a set on a long-lived builtin both do. Both were measured
+    /// against a symbolic-keyed probe over ten shapes, of which exactly four
+    /// missed — these two are the arms they exercised.
+    #[test]
+    fn a_symbol_key_defined_on_a_promoted_object_records_the_barrier() {
+        let mut agent = Agent::new();
+        agent.initialize_host_defined_realm().unwrap();
+        let value = agent
+            .run_script(
+                "const holder = {}; \
+                 for (let i = 0; i < 200000; i++) { const junk = { i }; } \
+                 Object.defineProperty(holder, Symbol(), { value: 42, enumerable: true }); \
+                 for (let i = 0; i < 200000; i++) { const junk = { i }; } \
+                 Object.getOwnPropertySymbols(holder).length",
+            )
+            .unwrap_or_else(|e| panic!("symbol-key define barrier: {:?} {e}", e.kind));
+        assert_eq!(value.as_number(), Some(1.0));
+    }
+
+    /// The same defect at the other store that adds a key: a symbol-keyed `[[Set]]`
+    /// on an object that has been old since the bootstrap (the global object, a
+    /// builtin's prototype), where the define path a fresh object takes is not the
+    /// one that runs.
+    #[test]
+    fn a_symbol_key_set_on_a_promoted_builtin_records_the_barrier() {
+        let mut agent = Agent::new();
+        agent.initialize_host_defined_realm().unwrap();
+        let value = agent
+            .run_script(
+                "for (let i = 0; i < 200000; i++) { const junk = { i }; } \
+                 Object.prototype[Symbol()] = 1; \
+                 for (let i = 0; i < 200000; i++) { const junk = { i }; } \
+                 Object.getOwnPropertySymbols(Object.prototype).length",
+            )
+            .unwrap_or_else(|e| panic!("symbol-key set barrier: {:?} {e}", e.kind));
+        assert_eq!(value.as_number(), Some(1.0));
+    }
+
     #[test]
     fn identifier_reference_walks_the_chain() {
         let mut agent = Agent::new();

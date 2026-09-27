@@ -2218,6 +2218,83 @@ mod tests {
         );
     }
 
+    /// A RegExp's state lives in the agent's own table (`Agent::regexp_data`),
+    /// not in object properties — that table is also its brand — so a restored
+    /// instance that is carried as an ordinary object is one every
+    /// `RegExp.prototype` method refuses.
+    #[test]
+    fn a_regexp_round_trips_as_a_regexp() {
+        let mut isolate = Isolate::snapshot_creator(None, None);
+        {
+            crate::scope!(let scope, &mut isolate);
+            let context = Context::new(scope, Default::default());
+            let scope = &mut crate::ContextScope::new(scope, context);
+            scope.set_default_context(context);
+            let regexp = crate::test_support::eval(scope, "new RegExp('^a+$', 'i')");
+            scope.add_context_data(context, regexp);
+        }
+        let blob = isolate
+            .create_blob(FunctionCodeHandling::Keep)
+            .expect("a blob");
+
+        let mut isolate = isolate_from(blob);
+        let context = restored_context(&mut isolate, DEFAULT_CONTEXT_SLOT)
+            .expect("the blob names the default context");
+        crate::scope!(let scope, &mut isolate);
+        let context = context.open(scope);
+        let scope = &mut crate::ContextScope::new(scope, context);
+        let regexp = scope
+            .get_context_data_from_snapshot_once::<Value>(0)
+            .expect("the regexp");
+        crate::test_support::bind(scope, "restoredRegExp", regexp);
+        assert_eq!(
+            crate::test_support::eval_number(scope, "restoredRegExp.test('AAA') ? 1 : 0"),
+            1.0,
+            "a restored regexp matches as a regexp"
+        );
+        assert_eq!(
+            crate::test_support::eval(scope, "restoredRegExp.source").to_rust_string_lossy(scope),
+            "^a+$"
+        );
+        assert_eq!(
+            crate::test_support::eval(scope, "restoredRegExp.flags").to_rust_string_lossy(scope),
+            "i"
+        );
+    }
+
+    /// A Date's time value lives in the agent's table too (`Agent::date_data`),
+    /// so a date carried as an ordinary object has no time to report.
+    #[test]
+    fn a_date_round_trips_with_its_time_value() {
+        let mut isolate = Isolate::snapshot_creator(None, None);
+        {
+            crate::scope!(let scope, &mut isolate);
+            let context = Context::new(scope, Default::default());
+            let scope = &mut crate::ContextScope::new(scope, context);
+            scope.set_default_context(context);
+            let date = crate::test_support::eval(scope, "new Date(1234567890123)");
+            scope.add_context_data(context, date);
+        }
+        let blob = isolate
+            .create_blob(FunctionCodeHandling::Keep)
+            .expect("a blob");
+
+        let mut isolate = isolate_from(blob);
+        let context = restored_context(&mut isolate, DEFAULT_CONTEXT_SLOT)
+            .expect("the blob names the default context");
+        crate::scope!(let scope, &mut isolate);
+        let context = context.open(scope);
+        let scope = &mut crate::ContextScope::new(scope, context);
+        let date = scope
+            .get_context_data_from_snapshot_once::<Value>(0)
+            .expect("the date");
+        crate::test_support::bind(scope, "restoredDate", date);
+        assert_eq!(
+            crate::test_support::eval_number(scope, "restoredDate.getTime()"),
+            1234567890123.0
+        );
+    }
+
     /// A template with a property of its own: the record holds no property yet, so
     /// the write names the part rather than writing a template that would come
     /// back without it.

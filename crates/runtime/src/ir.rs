@@ -21613,6 +21613,14 @@ fn steps_are_leaf(steps: &[Step]) -> bool {
                 | Step::CallFastSlot { .. }
                 | Step::CallFastSlotStore { .. }
                 | Step::CallFastGlobalStore { .. }
+                // `CallApply` is a call site like the rest: it resolves the
+                // callee's `call`/`apply` and, when that is not the realm's
+                // intrinsic, withdraws the call for the driver to perform — the
+                // same re-entry every other call step disqualifies a leaf for.
+                // Omitting it made a body containing one leaf-eligible, and the
+                // withdrawal then escaped as "withdrawn call escaped a leaf body"
+                // (deno's `node:stream` `Readable.from` is the reachable case).
+                | Step::CallApply { .. }
                 | Step::TailCall { .. }
                 | Step::TailCallFast { .. }
                 | Step::TailCallFastGlobal { .. }
@@ -27731,5 +27739,31 @@ fn script_expr_allows(expr: &Expr) -> bool {
         ExprKind::PrivateIn { .. } => false,
         ExprKind::Super => false,
         ExprKind::Yield { .. } | ExprKind::Await(_) => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every step that re-enters the VM with a fresh frame disqualifies a leaf
+    /// (see [`steps_are_leaf`]), and `Step::CallApply` is one of them: its handler
+    /// calls the resolved `call`/`apply` directly when that is the realm's
+    /// intrinsic and otherwise **withdraws** the call for the driver to perform —
+    /// a re-entry a leaf body cannot express. Omitting it from the list made a
+    /// body containing one leaf-eligible, and the withdrawal then surfaced as
+    /// `withdrawn call escaped a leaf body` from deno's `node:stream`
+    /// `Readable.from`, which is the case this pins.
+    #[test]
+    fn a_call_apply_site_is_not_leaf_eligible() {
+        let apply = [Step::CallApply {
+            argc: 2,
+            kind: ApplyKind::Call,
+            span: crux::Span::empty(0),
+        }];
+        assert!(!steps_are_leaf(&apply), "CallApply re-enters the VM");
+        // The counterpart, so the assertion is about `CallApply` rather than
+        // about a list that happens to refuse everything.
+        assert!(steps_are_leaf(&[Step::Push(Value::Number(1.0)), Step::Pop]));
     }
 }

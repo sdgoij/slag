@@ -2407,6 +2407,7 @@ pub(crate) fn parse_function_body_block(
         parser.in_async,
         parser.allow_super,
         parser.in_constructor,
+        parser.in_static_block,
         parser.top_level_await,
         parser.nt_context,
     );
@@ -2416,6 +2417,12 @@ pub(crate) fn parse_function_body_block(
     parser.in_async = is_async;
     parser.allow_super = allow_super;
     parser.in_constructor = in_constructor;
+    // A function body is its own `return` context even when it is nested in a
+    // class static initialization block: the block's ban on `return` is the
+    // block's own grammar, and a function declared inside one may return freely
+    // (spec 15.7.13's ClassStaticBlockBody is not a FunctionBody, so the flag
+    // must not survive the body that *is* one).
+    parser.in_static_block = false;
     parser.top_level_await = false;
     // Arrows do not establish a new.target context of their own: they
     // inherit from the enclosing function (spec 13.3.4).
@@ -2452,6 +2459,7 @@ pub(crate) fn parse_function_body_block(
         parser.in_async,
         parser.allow_super,
         parser.in_constructor,
+        parser.in_static_block,
         parser.top_level_await,
         parser.nt_context,
     ) = saved;
