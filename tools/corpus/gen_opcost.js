@@ -25,7 +25,7 @@
 // differ by less than the round-to-round noise (the bare loop itself moves
 // ±10% between rounds). Every row also clears the cap by a wide margin — the
 // largest is under 64 steps, which the debug binary confirms by compiling all
-// 34 of them with its cap temporarily cut to 64.
+// 35 of them with its cap temporarily cut to 64.
 //
 // The bodies end in `| 0`, which keeps the accumulator an int32. That does two
 // things: the four modes agree on the result (so the parity check is a real
@@ -96,6 +96,15 @@ const rows = [
     'array_for_each_js',
     'var small = [1, 2, 3, 4];\n  var cb = function (x) { return x + 1; };',
     's = (s + cb(small[k & 3]) + cb(small[(k + 1) & 3]) + cb(small[(k + 2) & 3]) + cb(small[(k + 3) & 3])) | 0;',
+  ],
+  // The typed-array twin of the two rows above: the same builtin→callback
+  // dispatch reached through a different container (a `Uint8Array`, which is
+  // what deno's `Buffer` is), so the two together show whether a fix landed in
+  // the shared call machinery or in one builtin's body.
+  [
+    'typed_array_for_each',
+    'var ta = new Uint8Array([1, 2, 3, 4]);\n  var cb = function (x) { return x + 1; };',
+    'ta.forEach(cb); s = (s + 1) | 0;',
   ],
   ['array_at', 'var small = [1, 2, 3, 4];', 's = (s + small.at(2)) | 0;'],
   // The write side: `fill` is pure writes, `reverse` a read/write pair, so a

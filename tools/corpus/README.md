@@ -31,7 +31,7 @@ standing "corpus probe" the perf notes keep gating deferred work on.
     its `jit` column is an interpreted time wearing a compiled label. A shared
     prologue is what put seven rows over the cap and made this family unable
     to measure the JIT it exists to measure; per-row setup leaves every row
-    well under it (all 34 are below 64 steps).
+    well under it (all 35 are below 64 steps).
   - **The `baseline` subtraction is valid because the bare loop is
     frame-insensitive.** Rows no longer share a frame shape, so this is
     measured rather than assumed: the same bare loop with 2 locals, with a Map

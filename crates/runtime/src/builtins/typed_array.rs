@@ -766,7 +766,7 @@ fn iterate_source(
             }
             return Ok(dst);
         }
-        let iterator = crate::function::call(agent, &method, *items, &[])?;
+        let iterator = crate::function::call_callback(agent, &method, *items, &[])?;
         let next = get_property(agent, &iterator, &JsString::from_utf8("next"), iterator)?;
         if !is_callable(&next) {
             return Err(JsError::new(
@@ -1127,7 +1127,7 @@ fn every(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsErr
     let this_arg = args.get(1).cloned().unwrap_or(Value::Undefined);
     for k in 0..typed_array_effective_length(&slots) as u64 {
         let k_value = element_read(this, &slots, k)?;
-        let test = crate::function::call(
+        let test = crate::function::call_callback(
             agent,
             &callbackfn,
             this_arg,
@@ -1210,7 +1210,7 @@ fn filter(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsEr
     let mut kept = Vec::new();
     for k in 0..typed_array_effective_length(&slots) as u64 {
         let k_value = element_read(this, &slots, k)?;
-        let selected = crate::function::call(
+        let selected = crate::function::call_callback(
             agent,
             &callbackfn,
             this_arg,
@@ -1245,7 +1245,7 @@ fn find_common(
     let this_arg = args.get(1).cloned().unwrap_or(Value::Undefined);
     for k in 0..typed_array_effective_length(&slots) as u64 {
         let k_value = element_read(this, &slots, k)?;
-        let test = crate::function::call(
+        let test = crate::function::call_callback(
             agent,
             &predicate,
             this_arg,
@@ -1295,7 +1295,7 @@ fn find_last_common(
     let mut k = typed_array_effective_length(&slots) as i64 - 1;
     while k >= 0 {
         let k_value = element_read(this, &slots, k as u64)?;
-        let test = crate::function::call(
+        let test = crate::function::call_callback(
             agent,
             &predicate,
             this_arg,
@@ -1340,7 +1340,7 @@ fn for_each(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, Js
     let this_arg = args.get(1).cloned().unwrap_or(Value::Undefined);
     for k in 0..typed_array_effective_length(&slots) as u64 {
         let k_value = element_read(this, &slots, k)?;
-        crate::function::call(
+        crate::function::call_callback(
             agent,
             &callbackfn,
             this_arg,
@@ -1513,7 +1513,7 @@ fn map(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsError
     let result = typed_array_species_create(agent, this, length as usize)?;
     for k in 0..length {
         let k_value = element_read(this, &slots, k)?;
-        let mapped = crate::function::call(
+        let mapped = crate::function::call_callback(
             agent,
             &callbackfn,
             this_arg,
@@ -1551,7 +1551,7 @@ fn reduce(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsEr
     }
     while k < length {
         let k_value = element_read(this, &slots, k)?;
-        accumulator = crate::function::call(
+        accumulator = crate::function::call_callback(
             agent,
             &callbackfn,
             Value::Undefined,
@@ -1589,7 +1589,7 @@ fn reduce_right(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value
     }
     while k >= 0 {
         let k_value = element_read(this, &slots, k as u64)?;
-        accumulator = crate::function::call(
+        accumulator = crate::function::call_callback(
             agent,
             &callbackfn,
             Value::Undefined,
@@ -1759,7 +1759,7 @@ fn some(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsErro
     let this_arg = args.get(1).cloned().unwrap_or(Value::Undefined);
     for k in 0..typed_array_effective_length(&slots) as u64 {
         let k_value = element_read(this, &slots, k)?;
-        let test = crate::function::call(
+        let test = crate::function::call_callback(
             agent,
             &callbackfn,
             this_arg,
@@ -1792,7 +1792,7 @@ fn typed_sort_compare(
         return Ok(-1.0);
     }
     if !matches!(comparefn.kind(), ValueKind::Undefined) {
-        let v = crate::function::call(agent, comparefn, Value::Undefined, &[*x, *y])?;
+        let v = crate::function::call_callback(agent, comparefn, Value::Undefined, &[*x, *y])?;
         let v = crate::context::to_number(agent, &v)?;
         return Ok(if v.is_nan() { 0.0 } else { v });
     }
@@ -1919,7 +1919,7 @@ fn to_locale_string(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<V
         }
         let boxed = crate::context::to_object(agent, &element)?;
         let method = get(agent, &boxed, &JsString::from_utf8("toLocaleString"))?;
-        let text = crate::function::call(agent, &method, boxed, &[locales, options])?;
+        let text = crate::function::call_callback(agent, &method, boxed, &[locales, options])?;
         result.push_str(&crate::context::to_string(agent, &text)?.to_string_lossy());
     }
     Ok(Value::String(Handle::new(JsString::from_utf8(&result))))
@@ -2070,7 +2070,7 @@ fn from(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsErro
     }
     let using_iterator = get_method(agent, &items, "@@iterator")?;
     if let Some(method) = using_iterator {
-        let iterator = crate::function::call(agent, &method, items, &[])?;
+        let iterator = crate::function::call_callback(agent, &method, items, &[])?;
         let next = get_property(agent, &iterator, &JsString::from_utf8("next"), iterator)?;
         if !is_callable(&next) {
             return Err(JsError::new(
@@ -2091,7 +2091,12 @@ fn from(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsErro
         let target = typed_array_create(agent, this, values.len())?;
         for (k, value) in values.into_iter().enumerate() {
             let mapped = if mapping {
-                crate::function::call(agent, &mapfn, this_arg, &[value, Value::Number(k as f64)])?
+                crate::function::call_callback(
+                    agent,
+                    &mapfn,
+                    this_arg,
+                    &[value, Value::Number(k as f64)],
+                )?
             } else {
                 value
             };
@@ -2105,7 +2110,12 @@ fn from(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsErro
     for k in 0..length {
         let value = get(agent, &array_like, &key(k as u64))?;
         let mapped = if mapping {
-            crate::function::call(agent, &mapfn, this_arg, &[value, Value::Number(k as f64)])?
+            crate::function::call_callback(
+                agent,
+                &mapfn,
+                this_arg,
+                &[value, Value::Number(k as f64)],
+            )?
         } else {
             value
         };

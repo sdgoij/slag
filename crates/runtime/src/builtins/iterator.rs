@@ -852,7 +852,7 @@ fn close_this_on_error(agent: &mut Agent, this: &Value, error: JsError) -> Resul
     if let Ok(return_method) = get_property(agent, this, &return_key, *this)
         && is_callable(&return_method)
     {
-        let _ = crate::function::call(agent, &return_method, *this, &[]);
+        let _ = crate::function::call_callback(agent, &return_method, *this, &[]);
     }
     Err(error)
 }
@@ -907,7 +907,7 @@ fn call_predicate(
     value: &Value,
     counter: f64,
 ) -> Result<bool, JsError> {
-    let result = crate::function::call(
+    let result = crate::function::call_callback(
         agent,
         f,
         Value::Undefined,
@@ -989,7 +989,7 @@ fn for_each_method(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Va
     }
     let record = get_iterator_direct(agent, this)?;
     iterate_eager(agent, &record, 0.0, |agent, value, counter| {
-        crate::function::call(
+        crate::function::call_callback(
             agent,
             &f,
             Value::Undefined,
@@ -1031,7 +1031,7 @@ fn reduce_method(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Valu
     };
     iterate_eager(agent, &record, start_counter, |agent, value, counter| {
         let acc = accumulator.unwrap_or(Value::Undefined);
-        accumulator = Some(crate::function::call(
+        accumulator = Some(crate::function::call_callback(
             agent,
             &reducer,
             Value::Undefined,
@@ -1151,7 +1151,7 @@ fn dispose_method(agent: &mut Agent, this: &Value, _args: &[Value]) -> Result<Va
     if let Ok(return_method) = get_property(agent, this, &return_key, *this)
         && is_callable(&return_method)
     {
-        crate::function::call(agent, &return_method, *this, &[])?;
+        crate::function::call_callback(agent, &return_method, *this, &[])?;
     }
     Ok(Value::Undefined)
 }
@@ -1565,7 +1565,7 @@ fn step_helper(agent: &mut Agent, state: &mut HelperState) -> Result<Value, JsEr
             };
             let counter = state.counter;
             state.counter += 1.0;
-            let mapped = match crate::function::call(
+            let mapped = match crate::function::call_callback(
                 agent,
                 mapper,
                 Value::Undefined,
@@ -1658,7 +1658,7 @@ fn step_helper(agent: &mut Agent, state: &mut HelperState) -> Result<Value, JsEr
                 };
                 let counter = state.counter;
                 state.counter += 1.0;
-                let mapped = match crate::function::call(
+                let mapped = match crate::function::call_callback(
                     agent,
                     mapper,
                     Value::Undefined,
@@ -1769,7 +1769,8 @@ fn step_helper(agent: &mut Agent, state: &mut HelperState) -> Result<Value, JsEr
                 *index += 1;
                 // GetIteratorDirect (spec 7.4.1): call the open method and
                 // require an object iterator with a callable next.
-                let iterator = crate::function::call(agent, &item.open_method, item.iterable, &[])?;
+                let iterator =
+                    crate::function::call_callback(agent, &item.open_method, item.iterable, &[])?;
                 if !matches!(
                     iterator.kind(),
                     ValueKind::Object(_) | ValueKind::Function(_)
@@ -1981,7 +1982,7 @@ fn get_iterator_flattenable(
             true,
         ));
     };
-    let iterator = crate::function::call(agent, &method, *value, &[])?;
+    let iterator = crate::function::call_callback(agent, &method, *value, &[])?;
     if !matches!(iterator.kind(), ValueKind::Object(_)) {
         return Err(JsError::new(
             ErrorKind::TypeError,
@@ -2038,7 +2039,8 @@ fn wrap_method(
     let record = state.borrow().record.clone();
     match name {
         NEXT => {
-            let result = crate::function::call(agent, &record.next, record.iterator, args)?;
+            let result =
+                crate::function::call_callback(agent, &record.next, record.iterator, args)?;
             if !matches!(result.kind(), ValueKind::Object(_)) {
                 return Err(JsError::new(
                     ErrorKind::TypeError,
@@ -2055,7 +2057,7 @@ fn wrap_method(
                 record.iterator,
             )?;
             if is_callable(&return_method) {
-                crate::function::call(agent, &return_method, record.iterator, args)
+                crate::function::call_callback(agent, &return_method, record.iterator, args)
             } else {
                 // spec 27.1.4.2.2 step 6: no return method — a fresh result
                 // object with an undefined value (not the argument).
@@ -2070,7 +2072,7 @@ fn wrap_method(
                 record.iterator,
             )?;
             if is_callable(&throw_method) {
-                crate::function::call(agent, &throw_method, record.iterator, args)
+                crate::function::call_callback(agent, &throw_method, record.iterator, args)
             } else {
                 let reason = args.first().cloned().unwrap_or(Value::Undefined);
                 Err(
