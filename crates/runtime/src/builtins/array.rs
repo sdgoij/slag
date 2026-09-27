@@ -979,17 +979,23 @@ fn every(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsErr
     }
     let this_arg = args.get(1).cloned().unwrap_or(Value::Undefined);
     for k in 0..length {
-        if has_property(&object, &key(k))? {
-            let k_value = get(agent, &object, &key(k))?;
-            let test = crate::function::call(
-                agent,
-                &callbackfn,
-                this_arg,
-                &[k_value, Value::Number(k as f64), object],
-            )?;
-            if !to_boolean(&test) {
-                return Ok(Value::Boolean(false));
+        let k_value = match dense_own_element(&object, k) {
+            Some(value) => value,
+            None => {
+                if !has_property(&object, &key(k))? {
+                    continue;
+                }
+                get(agent, &object, &key(k))?
             }
+        };
+        let test = crate::function::call(
+            agent,
+            &callbackfn,
+            this_arg,
+            &[k_value, Value::Number(k as f64), object],
+        )?;
+        if !to_boolean(&test) {
+            return Ok(Value::Boolean(false));
         }
     }
     Ok(Value::Boolean(true))
@@ -1078,7 +1084,10 @@ fn find(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsErro
     }
     let this_arg = args.get(1).cloned().unwrap_or(Value::Undefined);
     for k in 0..length {
-        let k_value = get(agent, &object, &key(k))?;
+        let k_value = match dense_own_element(&object, k) {
+            Some(value) => value,
+            None => get(agent, &object, &key(k))?,
+        };
         let test = crate::function::call(
             agent,
             &predicate,
@@ -1107,7 +1116,10 @@ fn find_index(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, 
     }
     let this_arg = args.get(1).cloned().unwrap_or(Value::Undefined);
     for k in 0..length {
-        let k_value = get(agent, &object, &key(k))?;
+        let k_value = match dense_own_element(&object, k) {
+            Some(value) => value,
+            None => get(agent, &object, &key(k))?,
+        };
         let test = crate::function::call(
             agent,
             &predicate,
@@ -1142,7 +1154,10 @@ fn find_last_common(
     let this_arg = args.get(1).cloned().unwrap_or(Value::Undefined);
     let mut k = length as i64 - 1;
     while k >= 0 {
-        let k_value = get(agent, &object, &key(k as u64))?;
+        let k_value = match dense_own_element(&object, k as u64) {
+            Some(value) => value,
+            None => get(agent, &object, &key(k as u64))?,
+        };
         let test = crate::function::call(
             agent,
             &predicate,
@@ -1314,7 +1329,10 @@ fn includes(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, Js
         (length as i64).saturating_add(n as i64).max(0) as u64
     };
     for k in k..length {
-        let element = get(agent, &object, &key(k))?;
+        let element = match dense_own_element(&object, k) {
+            Some(value) => value,
+            None => get(agent, &object, &key(k))?,
+        };
         if same_value_zero(&element, &search_element) {
             return Ok(Value::Boolean(true));
         }
@@ -1340,11 +1358,17 @@ fn index_of(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, Js
         (length as i64).saturating_add(n as i64).max(0) as u64
     };
     for k in k..length {
-        if has_property(&object, &key(k))? {
-            let element = get(agent, &object, &key(k))?;
-            if is_strictly_equal(&element, &search_element) {
-                return Ok(Value::Number(k as f64));
+        let element = match dense_own_element(&object, k) {
+            Some(value) => value,
+            None => {
+                if !has_property(&object, &key(k))? {
+                    continue;
+                }
+                get(agent, &object, &key(k))?
             }
+        };
+        if is_strictly_equal(&element, &search_element) {
+            return Ok(Value::Number(k as f64));
         }
     }
     Ok(Value::Number(-1.0))
@@ -1413,11 +1437,20 @@ fn last_index_of(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Valu
         kf as u64
     };
     loop {
-        if has_property(&object, &key(k))? {
-            let element = get(agent, &object, &key(k))?;
-            if is_strictly_equal(&element, &search_element) {
-                return Ok(Value::Number(k as f64));
+        let present_element = match dense_own_element(&object, k) {
+            Some(value) => Some(value),
+            None => {
+                if has_property(&object, &key(k))? {
+                    Some(get(agent, &object, &key(k))?)
+                } else {
+                    None
+                }
             }
+        };
+        if let Some(element) = present_element
+            && is_strictly_equal(&element, &search_element)
+        {
+            return Ok(Value::Number(k as f64));
         }
         if k == 0 {
             break;
@@ -1486,7 +1519,10 @@ fn pop(agent: &mut Agent, this: &Value, _args: &[Value]) -> Result<Value, JsErro
         return Ok(Value::Undefined);
     }
     let index = length - 1;
-    let element = get(agent, &object, &key(index))?;
+    let element = match dense_own_element(&object, index) {
+        Some(value) => value,
+        None => get(agent, &object, &key(index))?,
+    };
     delete_property_or_throw(&object, &key(index))?;
     set_property(
         &object,
@@ -1813,17 +1849,23 @@ fn some(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsErro
     }
     let this_arg = args.get(1).cloned().unwrap_or(Value::Undefined);
     for k in 0..length {
-        if has_property(&object, &key(k))? {
-            let k_value = get(agent, &object, &key(k))?;
-            let test = crate::function::call(
-                agent,
-                &callbackfn,
-                this_arg,
-                &[k_value, Value::Number(k as f64), object],
-            )?;
-            if to_boolean(&test) {
-                return Ok(Value::Boolean(true));
+        let k_value = match dense_own_element(&object, k) {
+            Some(value) => value,
+            None => {
+                if !has_property(&object, &key(k))? {
+                    continue;
+                }
+                get(agent, &object, &key(k))?
             }
+        };
+        let test = crate::function::call(
+            agent,
+            &callbackfn,
+            this_arg,
+            &[k_value, Value::Number(k as f64), object],
+        )?;
+        if to_boolean(&test) {
+            return Ok(Value::Boolean(true));
         }
     }
     Ok(Value::Boolean(false))

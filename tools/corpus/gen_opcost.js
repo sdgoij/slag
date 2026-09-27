@@ -25,7 +25,7 @@
 // differ by less than the round-to-round noise (the bare loop itself moves
 // ±10% between rounds). Every row also clears the cap by a wide margin — the
 // largest is under 64 steps, which the debug binary confirms by compiling all
-// 24 of them with its cap temporarily cut to 64.
+// 28 of them with its cap temporarily cut to 64.
 //
 // The bodies end in `| 0`, which keeps the accumulator an int32. That does two
 // things: the four modes agree on the result (so the parity check is a real
@@ -72,6 +72,23 @@ const rows = [
   ['array_alloc', '', 's = (s + [k].length) | 0;'],
   ['object_alloc', '', 's = (s + ({ a: 1 }).a) | 0;'],
   ['array_length_write', 'var arr = [1, 2, 3];', 'arr.length = 0; s = (s + arr.length) | 0;'],
+  // The two paths that reach the interner without a cached atom: a computed
+  // read whose key is a *string value* (ToString -> intern, once per read),
+  // and any array builtin (they all read `length` through a per-call
+  // `JsString::from_utf8`, so `indexOf` is the cheapest representative).
+  [
+    'dyn_key_read',
+    STRS +
+      '\n  var props = { abcdefgh: 1, ijklmnop: 2, qrstuvwx: 3, yz012345: 4 };',
+    's = (s + props[strs[k & 3]]) | 0;',
+  ],
+  ['array_indexof', 'var small = [1, 2, 3, 4];', 's = (s + small.indexOf(3)) | 0;'],
+  ['array_includes', 'var small = [1, 2, 3, 4];', 's = (s + (small.includes(4) ? 1 : 0)) | 0;'],
+  [
+    'array_for_each',
+    'var small = [1, 2, 3, 4];\n  var cb = function (x) { return x + 1; };',
+    'small.forEach(cb); s = (s + 1) | 0;',
+  ],
   ['element_read', arr, 's = (s + arr[k]) | 0;'],
   ['element_write', arr, 'arr[k] = i; s = (s + 1) | 0;'],
   ['obj_prop', 'var o = { x: 7 };', 's = (s + o.x) | 0;'],

@@ -31,7 +31,7 @@ standing "corpus probe" the perf notes keep gating deferred work on.
     its `jit` column is an interpreted time wearing a compiled label. A shared
     prologue is what put seven rows over the cap and made this family unable
     to measure the JIT it exists to measure; per-row setup leaves every row
-    well under it (all 24 are below 64 steps).
+    well under it (all 28 are below 64 steps).
   - **The `baseline` subtraction is valid because the bare loop is
     frame-insensitive.** Rows no longer share a frame shape, so this is
     measured rather than assumed: the same bare loop with 2 locals, with a Map
@@ -130,7 +130,13 @@ excluded on both sides.
   that to `--corpus`) and compare **pairs within the same round**, not
   absolute values across rounds: two rows measured back to back agree on
   their difference to a percent while the absolute bare-loop time moves ±10%
-  between rounds.
+  between rounds. When comparing two **binaries** the same rule has a trap of
+  its own: run A then B in one round and B then A in the next. Running A first
+  every time correlates with the machine's warm-up, and that alone produced a
+  "consistent" 13-20% win on rows that turned out to be identical (the same
+  binary landed at 4.06 and 7.96 ms in different rounds on a loaded box, a
+  ±40% band). If a binary's own control row — `baseline` — has moved, the pair
+  is not a measurement of anything.
 - **Check the JIT invariant when a row changes:**
   `JIT_DUMP_CLIF=1 target/debug/slag.exe --corpus tools/corpus/workloads/opcost`
   must print no `jit skip: body too large (N steps)` line. The debug cap is
