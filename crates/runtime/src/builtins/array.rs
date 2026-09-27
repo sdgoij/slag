@@ -716,7 +716,10 @@ fn at(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsError>
     if k >= length {
         return Ok(Value::Undefined);
     }
-    get(agent, &object, &key(k))
+    match dense_own_element(&object, k) {
+        Some(value) => Ok(value),
+        None => get(agent, &object, &key(k)),
+    }
 }
 
 /// IsConcatSpreadable (spec 23.1.3.2.2).
@@ -1607,9 +1610,19 @@ fn reduce(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsEr
     } else {
         let mut k_present = false;
         while k < length && !k_present {
-            k_present = has_property(&object, &key(k))?;
-            if k_present {
-                accumulator = Some(get(agent, &object, &key(k))?);
+            let found = match dense_own_element(&object, k) {
+                Some(value) => Some(value),
+                None => {
+                    if has_property(&object, &key(k))? {
+                        Some(get(agent, &object, &key(k))?)
+                    } else {
+                        None
+                    }
+                }
+            };
+            k_present = found.is_some();
+            if let Some(value) = found {
+                accumulator = Some(value);
             }
             k += 1;
         }
@@ -1663,9 +1676,19 @@ fn reduce_right(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value
     } else {
         let mut k_present = false;
         while k >= 0 && !k_present {
-            k_present = has_property(&object, &key(k as u64))?;
-            if k_present {
-                accumulator = Some(get(agent, &object, &key(k as u64))?);
+            let found = match dense_own_element(&object, k as u64) {
+                Some(value) => Some(value),
+                None => {
+                    if has_property(&object, &key(k as u64))? {
+                        Some(get(agent, &object, &key(k as u64))?)
+                    } else {
+                        None
+                    }
+                }
+            };
+            k_present = found.is_some();
+            if let Some(value) = found {
+                accumulator = Some(value);
             }
             k -= 1;
         }
@@ -2000,9 +2023,20 @@ fn splice(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsEr
     }
     let removed = array_species_create(agent, &object, actual_delete_count as f64)?;
     for k in 0..actual_delete_count {
-        let from_name = key(actual_start + k);
-        if has_property(&object, &from_name)? {
-            let value = get(agent, &object, &from_name)?;
+        let value = match dense_own_element(&object, actual_start + k) {
+            Some(value) => Some(value),
+            None => {
+                let from_name = key(actual_start + k);
+                if has_property(&object, &from_name)? {
+                    Some(get(agent, &object, &from_name)?)
+                } else {
+                    None
+                }
+            }
+        };
+        if let Some(value) = value
+            && !removed.create_data_property_index(k, value)?
+        {
             removed.create_data_property_or_throw(&key(k), value)?;
         }
     }
@@ -2068,7 +2102,10 @@ fn to_locale_string(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<V
         if k > 0 {
             result.push(',');
         }
-        let element = get(agent, &object, &key(k))?;
+        let element = match dense_own_element(&object, k) {
+            Some(value) => value,
+            None => get(agent, &object, &key(k))?,
+        };
         if matches!(element.kind(), ValueKind::Undefined | ValueKind::Null) {
             continue;
         }
@@ -2114,8 +2151,13 @@ fn to_sorted(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, J
     // spec step 6: ArrayCreate — @@species is ignored (ignores-species.js).
     let array = array_create(agent, length as f64)?;
     for k in 0..length {
-        let value = get(agent, &object, &key(k))?;
-        array.create_data_property_or_throw(&key(k), value)?;
+        let value = match dense_own_element(&object, k) {
+            Some(value) => value,
+            None => get(agent, &object, &key(k))?,
+        };
+        if !array.create_data_property_index(k, value)? {
+            array.create_data_property_or_throw(&key(k), value)?;
+        }
     }
     let copy = Value::Object(array);
     sort_indexed_properties(agent, &copy, length, &comparefn)?;
@@ -2161,18 +2203,30 @@ fn to_spliced(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, 
     // spec steps 11-14: copy the prefix, insert the items, copy the suffix.
     let mut i = 0u64;
     while i < actual_start {
-        let value = get(agent, &object, &key(i))?;
-        array.create_data_property_or_throw(&key(i), value)?;
+        let value = match dense_own_element(&object, i) {
+            Some(value) => value,
+            None => get(agent, &object, &key(i))?,
+        };
+        if !array.create_data_property_index(i, value)? {
+            array.create_data_property_or_throw(&key(i), value)?;
+        }
         i += 1;
     }
     for item in args.iter().skip(2) {
-        array.create_data_property_or_throw(&key(i), *item)?;
+        if !array.create_data_property_index(i, *item)? {
+            array.create_data_property_or_throw(&key(i), *item)?;
+        }
         i += 1;
     }
     let mut r = actual_start + actual_delete_count;
     while r < length {
-        let value = get(agent, &object, &key(r))?;
-        array.create_data_property_or_throw(&key(i), value)?;
+        let value = match dense_own_element(&object, r) {
+            Some(value) => value,
+            None => get(agent, &object, &key(r))?,
+        };
+        if !array.create_data_property_index(i, value)? {
+            array.create_data_property_or_throw(&key(i), value)?;
+        }
         i += 1;
         r += 1;
     }
