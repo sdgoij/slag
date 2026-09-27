@@ -1966,8 +1966,8 @@ thread_local! {
     /// through this map in O(1) instead of scanning the linear
     /// intrinsic-identity chains (`array::dispatch_call` runs ~50
     /// `intrinsics.get` lookups per call for the Array members).
-    static BUILTIN_HANDLERS: std::cell::RefCell<std::collections::HashMap<u64, BuiltinHandler>> =
-        std::cell::RefCell::new(std::collections::HashMap::new());
+    static BUILTIN_HANDLERS: std::cell::RefCell<crate::agent::IdMap<BuiltinHandler>> =
+        std::cell::RefCell::new(std::collections::HashMap::default());
 }
 
 /// An installed builtin constructor's native construct handler (the
@@ -1982,8 +1982,8 @@ thread_local! {
     /// `Intrinsics::define` at install time (the construct-side mirror of
     /// [`BUILTIN_HANDLERS`]). A warm construct dispatches in O(1).
     static CONSTRUCT_HANDLERS:
-        std::cell::RefCell<std::collections::HashMap<u64, BuiltinCtor>> =
-        std::cell::RefCell::new(std::collections::HashMap::new());
+        std::cell::RefCell<crate::agent::IdMap<BuiltinCtor>> =
+        std::cell::RefCell::new(std::collections::HashMap::default());
 }
 
 /// Register a builtin function's native handler (called from

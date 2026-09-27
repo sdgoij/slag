@@ -132,6 +132,17 @@ impl std::hash::Hasher for IdentityHasher {
     }
 }
 
+/// An id-keyed state map: the key is an object's or a function's identity — a
+/// sequential `u64` from the id counter — so the default SipHash is pure
+/// overhead on every lookup. The same reasoning (and the same hasher) already
+/// backs `ecma_functions`, which is on the function-call path.
+///
+/// Do NOT use this for a key that is not already well distributed: a map whose
+/// key is a raw `f64::to_bits()` (numbers below 1 have low bits clear) needs
+/// real mixing, which `IdentityHasher` does not do.
+pub type IdMap<V> =
+    std::collections::HashMap<u64, V, std::hash::BuildHasherDefault<IdentityHasher>>;
+
 /// The cached "the Array-iteration infrastructure is stock" verdict (Cut
 /// 24): %Array.prototype%'s own @@iterator is the intrinsic,
 /// %ArrayIteratorPrototype% has the stock `next`, and no `return` on the
@@ -706,7 +717,7 @@ pub struct Agent {
     /// `function::call_inner`. The result of that linear chain is memoized
     /// per function id: `0` means no agent dispatch (a plain closure
     /// builtin), otherwise the index into the dispatch table.
-    pub builtin_dispatch_cache: std::collections::HashMap<u64, u8>,
+    pub builtin_dispatch_cache: IdMap<u8>,
     /// Host-provided module sources, keyed by specifier (HostResolveImportedModule).
     pub host_modules:
         RefCell<std::collections::HashMap<crux::string::JsString, crate::module::HostModuleSource>>,
@@ -746,7 +757,7 @@ pub struct Agent {
     pub bigint_data: std::collections::HashMap<u64, crux::BigInt>,
     /// [[DateValue]] of Date instances, keyed by object identity (spec
     /// 21.4.3: ms since the epoch).
-    pub date_data: std::collections::HashMap<u64, f64>,
+    pub date_data: IdMap<f64>,
     /// The [[InitializedLocale]] records of Intl.Locale instances, keyed by
     /// object identity (ECMA-402 §15: the canonical locale string).
     pub intl_locale_data: std::collections::HashMap<u64, crate::builtins::intl::IntlLocaleRecord>,
@@ -823,7 +834,7 @@ pub struct Agent {
     /// The RegExp internal state ([[OriginalSource]], [[OriginalFlags]],
     /// [[RegExpRecord]], [[RegExpMatcher]]) of RegExp instances, keyed by
     /// object identity (spec 22.2.5).
-    pub regexp_data: std::collections::HashMap<u64, crate::builtins::regexp::RegExpState>,
+    pub regexp_data: IdMap<crate::builtins::regexp::RegExpState>,
     /// [[IteratingRegExp]], [[IteratedString]], [[Global]], [[Unicode]], and
     /// [[Done]] of RegExp String iterators (spec 22.2.6).
     pub regexp_string_iter_data:
@@ -1006,16 +1017,16 @@ pub struct Agent {
     /// 24.1.1: a List of entries; `None` marks a deleted ~empty~ slot that
     /// suspended Map iterators skip). The parallel key index makes the
     /// get/has/set/delete probes O(1) on the live entries.
-    pub map_data: std::collections::HashMap<u64, RefCell<MapCollection>>,
+    pub map_data: IdMap<RefCell<MapCollection>>,
     /// The [[SetData]] of Set instances, keyed by object identity (spec
     /// 24.2.1; `None` is a deleted ~empty~ slot) plus the element index.
-    pub set_data: std::collections::HashMap<u64, RefCell<SetCollection>>,
+    pub set_data: IdMap<RefCell<SetCollection>>,
     /// The [[WeakMapData]] of WeakMap instances, keyed by object identity
     /// (spec 26.3.1; the Rc model never collects the keys, Phase 18).
-    pub weak_map_data: std::collections::HashMap<u64, RefCell<Vec<MapEntry>>>,
+    pub weak_map_data: IdMap<RefCell<Vec<MapEntry>>>,
     /// The [[WeakSetData]] of WeakSet instances, keyed by object identity
     /// (spec 26.4.1).
-    pub weak_set_data: std::collections::HashMap<u64, RefCell<Vec<SetEntry>>>,
+    pub weak_set_data: IdMap<RefCell<Vec<SetEntry>>>,
     /// The [[IteratedMap]], [[MapNextIndex]], and [[MapIterationKind]] of Map
     /// iterators, keyed by iterator-object identity (spec 24.1.6). The map
     /// value is `None` once iteration is done.
@@ -1330,7 +1341,7 @@ impl Agent {
             disposable_async_cont: std::collections::HashMap::new(),
             async_body_disposal: std::collections::HashMap::new(),
             async_body_disposal_cont: std::collections::HashMap::new(),
-            builtin_dispatch_cache: std::collections::HashMap::new(),
+            builtin_dispatch_cache: std::collections::HashMap::default(),
             host_modules: RefCell::new(std::collections::HashMap::new()),
             module_namespaces: std::collections::HashMap::new(),
             deferred_namespaces: std::collections::HashMap::new(),
@@ -1343,7 +1354,7 @@ impl Agent {
             symbol_data: std::collections::HashMap::new(),
             number_data: std::collections::HashMap::new(),
             bigint_data: std::collections::HashMap::new(),
-            date_data: std::collections::HashMap::new(),
+            date_data: std::collections::HashMap::default(),
             intl_locale_data: std::collections::HashMap::new(),
             intl_number_format_data: std::collections::HashMap::new(),
             intl_format_functions: std::collections::HashMap::new(),
@@ -1361,7 +1372,7 @@ impl Agent {
             intl_duration_format_data: std::collections::HashMap::new(),
             temporal_data: std::collections::HashMap::new(),
             temporal_calendars: std::collections::HashMap::new(),
-            regexp_data: std::collections::HashMap::new(),
+            regexp_data: std::collections::HashMap::default(),
             regexp_string_iter_data: std::collections::HashMap::new(),
             string_iter_data: std::collections::HashMap::new(),
             error_data: std::collections::HashSet::new(),
@@ -1422,10 +1433,10 @@ impl Agent {
             buffer_data: std::collections::HashMap::new(),
             dataview_data: std::collections::HashMap::new(),
             raw_json_data: std::collections::HashMap::new(),
-            map_data: std::collections::HashMap::new(),
-            set_data: std::collections::HashMap::new(),
-            weak_map_data: std::collections::HashMap::new(),
-            weak_set_data: std::collections::HashMap::new(),
+            map_data: std::collections::HashMap::default(),
+            set_data: std::collections::HashMap::default(),
+            weak_map_data: std::collections::HashMap::default(),
+            weak_set_data: std::collections::HashMap::default(),
             map_iter_data: std::collections::HashMap::new(),
             set_iter_data: std::collections::HashMap::new(),
             field_initializer_depth: 0,
