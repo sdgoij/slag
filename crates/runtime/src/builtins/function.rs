@@ -435,13 +435,13 @@ fn call_method(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value,
     }
 }
 
-/// The apply/call builtins' leaf fast path: a certified-leaf callee runs
-/// through the leaf machinery on a pooled Vm — the register-op (or JIT)
-/// body execution with no execution-context push, mirroring how the
-/// vector-call steps route a `f(...args)` call through `do_call_fast`.
-/// `None` when the callee is not a leaf-inlineable ES function (the
-/// caller falls back to the general `crate::function::call`).
-fn try_leaf_call(
+/// The apply/call builtins' leaf fast path, shared with `function::call_callback`:
+/// a certified-leaf callee runs through the leaf machinery on a pooled Vm — the
+/// register-op (or JIT) body execution with no execution-context push, mirroring
+/// how the vector-call steps route a `f(...args)` call through `do_call_fast`.
+/// `None` when the callee is not a leaf-inlineable ES function (the caller falls
+/// back to the general `crate::function::call`).
+pub(crate) fn try_leaf_call(
     agent: &mut Agent,
     func: &Value,
     this_arg: Value,

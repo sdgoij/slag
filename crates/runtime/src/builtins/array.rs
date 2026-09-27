@@ -641,7 +641,7 @@ fn array_from(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, 
         } else {
             Value::Object(array_create(agent, 0.0)?)
         };
-        let iterator = crate::function::call(agent, &iterator_method, items, &[])?;
+        let iterator = crate::function::call_callback(agent, &iterator_method, items, &[])?;
         if !matches!(iterator.kind(), ValueKind::Object(_)) {
             return Err(JsError::new(
                 ErrorKind::TypeError,
@@ -672,7 +672,7 @@ fn array_from(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, 
             // The mapfn receives « nextValue, k » and an abrupt completion
             // closes the iterator (spec 23.1.2.2 step 4.g).
             let mapped_value = if mapping {
-                match crate::function::call(
+                match crate::function::call_callback(
                     agent,
                     &mapfn,
                     this_arg,
@@ -706,7 +706,12 @@ fn array_from(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, 
     for k in 0..length {
         let k_value = get(agent, &array_like, &key(k))?;
         let mapped_value = if mapping {
-            crate::function::call(agent, &mapfn, this_arg, &[k_value, Value::Number(k as f64)])?
+            crate::function::call_callback(
+                agent,
+                &mapfn,
+                this_arg,
+                &[k_value, Value::Number(k as f64)],
+            )?
         } else {
             k_value
         };
@@ -1019,7 +1024,7 @@ fn every(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsErr
                 get(agent, &object, &key(k))?
             }
         };
-        let test = crate::function::call(
+        let test = crate::function::call_callback(
             agent,
             &callbackfn,
             this_arg,
@@ -1079,7 +1084,7 @@ fn filter(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsEr
                 get(agent, &object, &key(k))?
             }
         };
-        let selected = crate::function::call(
+        let selected = crate::function::call_callback(
             agent,
             &callbackfn,
             this_arg,
@@ -1119,7 +1124,7 @@ fn find(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsErro
             Some(value) => value,
             None => get(agent, &object, &key(k))?,
         };
-        let test = crate::function::call(
+        let test = crate::function::call_callback(
             agent,
             &predicate,
             this_arg,
@@ -1151,7 +1156,7 @@ fn find_index(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, 
             Some(value) => value,
             None => get(agent, &object, &key(k))?,
         };
-        let test = crate::function::call(
+        let test = crate::function::call_callback(
             agent,
             &predicate,
             this_arg,
@@ -1189,7 +1194,7 @@ fn find_last_common(
             Some(value) => value,
             None => get(agent, &object, &key(k as u64))?,
         };
-        let test = crate::function::call(
+        let test = crate::function::call_callback(
             agent,
             &predicate,
             this_arg,
@@ -1240,7 +1245,7 @@ fn flatten_into_array(
         }
         let mut element = get(agent, source, &name)?;
         if let Some((mapfn, this_arg)) = mapper {
-            element = crate::function::call(
+            element = crate::function::call_callback(
                 agent,
                 mapfn,
                 *this_arg,
@@ -1332,7 +1337,7 @@ fn for_each(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, Js
                 get(agent, &object, &key(k))?
             }
         };
-        crate::function::call(
+        crate::function::call_callback(
             agent,
             &callbackfn,
             this_arg,
@@ -1518,7 +1523,7 @@ fn map(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsError
                 get(agent, &object, &key(k))?
             }
         };
-        let mapped = crate::function::call(
+        let mapped = crate::function::call_callback(
             agent,
             &callbackfn,
             this_arg,
@@ -1673,7 +1678,7 @@ fn reduce(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsEr
             }
         };
         let current = accumulator.take().unwrap_or(Value::Undefined);
-        accumulator = Some(crate::function::call(
+        accumulator = Some(crate::function::call_callback(
             agent,
             &callbackfn,
             Value::Undefined,
@@ -1739,7 +1744,7 @@ fn reduce_right(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value
             }
         };
         let current = accumulator.take().unwrap_or(Value::Undefined);
-        accumulator = Some(crate::function::call(
+        accumulator = Some(crate::function::call_callback(
             agent,
             &callbackfn,
             Value::Undefined,
@@ -1937,7 +1942,7 @@ fn some(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsErro
                 get(agent, &object, &key(k))?
             }
         };
-        let test = crate::function::call(
+        let test = crate::function::call_callback(
             agent,
             &callbackfn,
             this_arg,
@@ -1967,7 +1972,7 @@ fn sort_compare(
         return Ok(-1.0);
     }
     if !matches!(comparefn.kind(), ValueKind::Undefined) {
-        let v = crate::function::call(agent, comparefn, Value::Undefined, &[*x, *y])?;
+        let v = crate::function::call_callback(agent, comparefn, Value::Undefined, &[*x, *y])?;
         let v = to_number(&v)?;
         return Ok(if v.is_nan() { 0.0 } else { v });
     }
@@ -2189,7 +2194,7 @@ fn to_locale_string(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<V
         // receiver (not the box), so a primitives' overridden toString sees
         // the primitive (primitive_this_value.js); the locales and options
         // arguments pass through.
-        let text = crate::function::call(agent, &method, element, &[locales, options])?;
+        let text = crate::function::call_callback(agent, &method, element, &[locales, options])?;
         result.push_str(&crate::context::to_string(agent, &text)?.to_string_lossy());
     }
     Ok(Value::String(Handle::new(JsString::from_utf8(&result))))
@@ -2321,7 +2326,7 @@ fn to_string_method(agent: &mut Agent, this: &Value, _args: &[Value]) -> Result<
             .get("%Object.prototype.toString%")
             .unwrap_or(Value::Undefined)
     };
-    crate::function::call(agent, &func, object, &[])
+    crate::function::call_callback(agent, &func, object, &[])
 }
 
 /// spec 23.1.3.36 Array.prototype.unshift.
@@ -2584,7 +2589,7 @@ fn from_async_reject(
         from_async_iterator_close(agent, &record);
     }
     let rejection = crate::promise::error_value(agent, &error);
-    crate::function::call(agent, &reject, Value::Undefined, &[rejection])?;
+    crate::function::call_callback(agent, &reject, Value::Undefined, &[rejection])?;
     Ok(())
 }
 
@@ -2608,7 +2613,7 @@ fn from_async_finish(
         from_async_reject(agent, state, error)?;
         return Ok(Value::Undefined);
     }
-    crate::function::call(agent, &resolve, Value::Undefined, &[array])?;
+    crate::function::call_callback(agent, &resolve, Value::Undefined, &[array])?;
     Ok(Value::Undefined)
 }
 
@@ -2657,7 +2662,7 @@ fn from_async_define_and_advance(
         })?;
         (record.iterator, record.next)
     };
-    let step_promise = match crate::function::call(agent, &next, iterator, &[]) {
+    let step_promise = match crate::function::call_callback(agent, &next, iterator, &[]) {
         Ok(promise) => promise,
         Err(error) => {
             from_async_reject(agent, state, error)?;
@@ -2733,7 +2738,7 @@ fn from_async_map_and_await(
     let mapped = if matches!(mapfn.kind(), ValueKind::Undefined) {
         value
     } else {
-        match crate::function::call(
+        match crate::function::call_callback(
             agent,
             &mapfn,
             this_arg,
@@ -2839,7 +2844,7 @@ fn from_async(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, 
                 {
                     from_async_reject(agent, &state, error)?;
                 } else {
-                    crate::function::call(agent, &resolve, Value::Undefined, &[array])?;
+                    crate::function::call_callback(agent, &resolve, Value::Undefined, &[array])?;
                 }
                 return Ok(());
             }
@@ -2858,14 +2863,14 @@ fn from_async(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, 
                 })?;
                 (record.iterator, record.next)
             };
-            let step_promise = crate::function::call(agent, &next, iterator, &[])?;
+            let step_promise = crate::function::call_callback(agent, &next, iterator, &[])?;
             attach_from_async_await(agent, state.clone(), step_promise)?;
         }
         Ok(())
     })();
     if let Err(error) = result {
         let rejection = crate::promise::error_value(agent, &error);
-        crate::function::call(agent, &reject, Value::Undefined, &[rejection])?;
+        crate::function::call_callback(agent, &reject, Value::Undefined, &[rejection])?;
     }
     Ok(promise)
 }
@@ -2881,7 +2886,7 @@ fn async_iterator_from(
     sync_method: Option<Value>,
 ) -> Result<IteratorRecord, JsError> {
     if let Some(method) = async_method {
-        let iterator = crate::function::call(agent, &method, *items, &[])?;
+        let iterator = crate::function::call_callback(agent, &method, *items, &[])?;
         let next = get_property(agent, &iterator, &JsString::from_utf8("next"), iterator)?;
         if !is_callable(&next) {
             return Err(JsError::new(
@@ -2897,7 +2902,7 @@ fn async_iterator_from(
             "Value is not async iterable or iterable".into(),
         ));
     };
-    let sync_iterator = crate::function::call(agent, &sync_method, *items, &[])?;
+    let sync_iterator = crate::function::call_callback(agent, &sync_method, *items, &[])?;
     let next = get_property(
         agent,
         &sync_iterator,

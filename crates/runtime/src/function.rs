@@ -1709,6 +1709,23 @@ pub fn instantiate_arrow(
     Ok(Value::Function(function))
 }
 
+/// Call `callee` with `this` and `args` on a built-in's behalf: a certified
+/// leaf runs through the leaf machinery on a pooled Vm (no execution-context
+/// push, no `ordinary_call`) and everything else through [`call`]. A built-in
+/// that invokes a JS callback once per element — every array iteration method
+/// — pays this entry per element, so it is the cheap lane for that shape.
+pub(crate) fn call_callback(
+    agent: &mut Agent,
+    callee: &Value,
+    this: Value,
+    args: &[Value],
+) -> Result<Value, JsError> {
+    match crate::builtins::function::try_leaf_call(agent, callee, this, args) {
+        Some(result) => result,
+        None => call(agent, callee, this, args),
+    }
+}
+
 /// Call (spec 10.2.1): dispatch an ECMAScript function through its body, and
 /// everything else through `crux::function::call`. Bound chains are unwrapped
 /// here so they can reach user-function targets. The agent is recorded for

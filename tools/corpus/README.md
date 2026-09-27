@@ -31,19 +31,22 @@ standing "corpus probe" the perf notes keep gating deferred work on.
     its `jit` column is an interpreted time wearing a compiled label. A shared
     prologue is what put seven rows over the cap and made this family unable
     to measure the JIT it exists to measure; per-row setup leaves every row
-    well under it (all 33 are below 64 steps).
+    well under it (all 34 are below 64 steps).
   - **The `baseline` subtraction is valid because the bare loop is
     frame-insensitive.** Rows no longer share a frame shape, so this is
     measured rather than assumed: the same bare loop with 2 locals, with a Map
     fill, and with 15 further locals plus objects, an array, a string, a regexp
     and a function, run per-file, differ by less than the round-to-round noise
     (±10% on the bare loop itself).
-  - Two rows are **localizers**, not operations: `proto_method_call` and
+  - Three rows are **localizers**, not operations: `proto_method_call` and
     `own_builtin_call` exist to be subtracted from `method_call` and `map_get`
     — the same function (and the same builtin, receiver and body) reached
     through a prototype instead of an own data property — which splits a
     method call into its chain-read and callee halves. `js_call` and `math_abs`
-    bound the builtin-call premium from the other side.
+    bound the builtin-call premium from the other side. `array_for_each_js` is
+    the same four calls and four element reads as `array_for_each`, written by
+    hand, so the pair isolates what reaching a JS callback *through a builtin*
+    costs over reaching it from compiled JS.
   - `array_alloc`, `object_alloc` and `array_length_write` cover **creation**,
     which the family otherwise misses: element and property access was
     measured but never the container it runs on, and allocation is what
