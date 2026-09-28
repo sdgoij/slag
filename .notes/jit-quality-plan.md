@@ -318,19 +318,34 @@ The list, in the measured order:
   landed, Stage 5).** The read `a[i]` lowered to
   `call_slow(GetMemberComputed)` for every shape, while the write side already
   had inline paths; `GetMemberComputed` was 73.4M on 12 rows (`index_loop.js`
-  21.0M). The compiled read now inlines the dense-Array case
-  (`emit_dense_element_read`, shared by the step `GetMemberComputed` and the
-  register `GetMemberComputed`/`GetMemberComputedLocal`): the receiver is a
-  tagged Object whose `array_dense` cursor is live (non-null iff dense), the key
-  a canonical index Number (`< 2^32-1`), and the index below `elem_len` — then
-  the element is one buffer load. A hole is spec-absent and declines to the
-  helper (which consults the chain), as do a spilled array, a typed array (its
-  own `ObjectKind`), a string/out-of-range key, and a non-Array. Measured:
-  `arrays/index_loop` 37.9 → **20.7 ms** with `GetMemberComputed` 21,000,000 →
-  **0**, `objects/many_objects_read` 30.6 → **21.1 ms**, and the rows'
-  JIT-vs-interpreter ratio 3.3x → **6.0x** / 3.5x → **5.1x**. Typed-array
-  element reads still take the helper (a separate representation) — a
-  follow-up.
+  21.0M). The compiled read now inlines both buffer-backed element shapes
+  (`emit_element_read`, shared by the step `GetMemberComputed` and the register
+  `GetMemberComputed`/`GetMemberComputedLocal`), dispatching on the receiver:
+
+  - **A dense Array** (the `array_dense` cursor is live — non-null iff dense):
+    a canonical index Number (`< 2^32-1`) below `elem_len` reads one buffer
+    slot. A hole declines to the helper (spec-absent, so the chain must be
+    consulted; a stored `undefined` is a real value and IS served), as do a
+    spilled array, a string/out-of-range key, and a non-Array. Measured:
+    `arrays/index_loop` 37.9 → **20.7 ms** with `GetMemberComputed` 21,000,000 →
+    **0**, `objects/many_objects_read` 30.6 → **21.1 ms**, and their
+    JIT-vs-interpreter ratios 3.3x → **6.0x** / 3.5x → **5.1x**.
+  - **A numeric TypedArray** (`emit_typed_array_read_into`, the read mirror of
+    `emit_typed_array_store_inline`, which is Uint8-only): `detached == 0`,
+    `resizable == 0` (a fixed view's `array_length` is the effective length only
+    while a resizable buffer has not shrunk), a non-null data pointer, a
+    canonical index below `array_length`, then a load converted per element
+    kind (every integer width plus Float32/Float64). Float16 (a soft-float
+    decode) and BigInt64/BigUint64 (a BigInt allocation) decline. `immutable`
+    is not checked — reads of an immutable buffer are legal. Measured:
+    `arrays/typed_array` 50.1 → **35.6 ms** (`GetMemberComputed` 14,000,000 →
+    **0**; 3.8x → **5.3x** vs the interpreter), `opcost/typed_array_for_each`
+    78.2 → **68.4 ms**, and a dedicated `--jit-bench` row `typed-array read` at
+    ratio **0.15** (89.5 → 13.0 ms). The lane is single-agent only: under the
+    `workers` feature the shared-buffer block layout is cfg'd, so it declines to
+    the helper exactly as the inline store does — which is why the
+    workers-enabled `--workspace` test build and the test262 sweeps do not
+    exercise it (the corpus/`--jit-bench` CLI build and `cargo test -p jit` do).
 - **G3/G4/G5 — literals, iteration, string building**, as before: a helper
   sequence per element/step/property, measured in the table above.
 - **G6/G7/G8 — cell capacity, the register path's one shape, no feedback.**
@@ -706,26 +721,40 @@ One line per landed stage, newest last. This log is the arc's journal —
   `all` 48,464/0/0/0 of 48,622 and `intl402` 3,205/0/0/0 of 3,357 at 15s/15s,
   corpus parity 77 rows/0 mismatches, `--jit-bench` in band (arithmetic 0.08,
   function calls 0.16, non-leaf call 0.50).
-- **Stage 5, G1 — the inline dense-array element read (2026-09-28).** Stage 5's
+- **Stage 5, G1 — the inline computed element read (2026-09-28).** Stage 5's
   ordering was taken from the Stage 1 helper census, but a per-row instrument
   run first re-ranked it and falsified two of its items: G10's shape-free inline
   chain probe had already been measured and reverted (5-10% slower than the
   helper), and G11's `switch` is already 3.1x faster under the JIT than jitless.
   G1 survived: the read `a[i]` called `call_slow(GetMemberComputed)` for every
   shape while the write side had inline paths, at 73.4M helper calls over 12
-  rows. `emit_dense_element_read` now inlines the dense-Array case (a tagged
-  Object with a live `array_dense` cursor, a canonical index key below
-  `elem_len`, a non-hole element — the same dense invariants the compiled append
-  relies on); a hole (spec-absent → the chain), a spill, a typed array, a
-  non-index/out-of-range key, and a non-Array decline to the helper. Measured:
-  `arrays/index_loop` 37.9 → **20.7 ms** (`GetMemberComputed` 21,000,000 → 0),
-  `objects/many_objects_read` 30.6 → **21.1 ms**, and their JIT-vs-interpreter
-  ratios 3.3x → 6.0x and 3.5x → 5.1x. Two new tests: a helper-count proof
-  (~100,000 → ~3 calls, mutation-checked) and a hole→chain exactness test.
-  Gates: fmt clean, clippy workspace `-D warnings` clean, workspace **5,540
-  passed / 0 failed**, runtime `--no-default-features` 953/0, v8 `simdutf`
-  380/0, `cli --no-default-features --features jit` green, test262 `all`
-  48,464/0/0/0 of 48,622 and `intl402` 3,205/0/0/0 of 3,357 at 15s/15s, corpus
-  parity 77 rows/0 mismatches, `--jit-bench` in band (arithmetic 0.07, function
-  calls 0.17, non-leaf call 0.54). The remaining Stage 5 items are recorded in
-  §5 as closed by measurement.
+  rows. `emit_element_read` now inlines both buffer-backed element shapes,
+  dispatching on the receiver: a **dense Array** (a live `array_dense` cursor, a
+  canonical index key below `elem_len`, a non-hole element — the same dense
+  invariants the compiled append relies on) and a **numeric TypedArray** (the
+  read mirror of the Uint8-only inline store: not detached, not resizable, a
+  non-null data pointer, a canonical index below `array_length`, then a load
+  converted per element kind — every integer width plus Float32/Float64, with
+  Float16 and the BigInt kinds declining). A hole (spec-absent → the chain), a
+  spill, a non-index/out-of-range key, and a non-Array decline to the helper.
+  Measured: `arrays/index_loop` 37.9 → **20.7 ms** (`GetMemberComputed`
+  21,000,000 → 0), `objects/many_objects_read` 30.6 → **21.1 ms**,
+  `arrays/typed_array` 50.1 → **35.6 ms** (`GetMemberComputed` 14,000,000 → 0),
+  `opcost/typed_array_for_each` 78.2 → **68.4 ms**; the rows' JIT-vs-interpreter
+  ratios 3.3x → 6.0x, 3.5x → 5.1x, 3.8x → 5.3x; and a new `--jit-bench` row
+  `typed-array read` at ratio **0.15** (89.5 → 13.0 ms). Three new tests: a
+  dense helper-count proof (~100,000 → ~3 calls, mutation-checked), a dense
+  hole→chain exactness test, and a typed-array pair (a helper-count proof,
+  mutation-checked, plus a nine-element-kind exactness battery covering the
+  declines). A trap found here: `crates/test262`/`crates/v8` enable
+  `runtime/workers`, so a `--workspace` test build unifies the feature ON and
+  the typed lane (correctly) declines — the inline assertion is therefore gated
+  on `!crux::typed_array::WORKERS` and is only meaningful under `cargo test -p
+  jit` and the CLI builds. Gates: fmt clean, clippy workspace `-D warnings`
+  clean, workspace **5,542 passed / 0 failed** (`-p jit` 219/0, which is where
+  the inline assertion bites), runtime `--no-default-features` 953/0, v8
+  `simdutf` 380/0, `cli --no-default-features --features jit` green, test262
+  `all` 48,464/0/0/0 of 48,622 and `intl402` 3,205/0/0/0 of 3,357 at 15s/15s,
+  corpus parity 77 rows/0 mismatches, `--jit-bench` in band (arithmetic 0.08,
+  function calls 0.16, non-leaf call 0.50). The remaining Stage 5 items are
+  recorded in §5 as closed by measurement.

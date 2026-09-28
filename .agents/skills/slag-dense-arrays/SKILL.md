@@ -1,6 +1,6 @@
 ---
 name: slag-dense-arrays
-description: "Load when working on Slag's dense Array element storage, its compiled append, or its compiled element read — `ArraySlots` (crates/crux/src/object.rs), the `Value::hole()` sentinel, the `elem_ptr`/`elem_len`/`elem_cap` cursor and `elements()`/`elements_mut()` guards, the JIT's inline dense append (`emit_dense_array_append_inline`) and inline element read (`emit_dense_element_read`), the array-`length` read gates, or the `properties[0]` length mirror. Documents the traps - authoritative-vs-mirror length, cursor-based GC tracing, the hole sentinel's reserved tag, why a hole declines a read to the chain, inline re-validation of extensible + the chain verdict, and why the gate must stay branchy."
+description: "Load when working on Slag's dense Array element storage, its compiled append, or its compiled element read — `ArraySlots` (crates/crux/src/object.rs), the `Value::hole()` sentinel, the `elem_ptr`/`elem_len`/`elem_cap` cursor and `elements()`/`elements_mut()` guards, the JIT's inline dense append (`emit_dense_array_append_inline`) and inline element read (`emit_element_read` / `emit_dense_element_read_into` / `emit_typed_array_read_into`), the array-`length` read gates, or the `properties[0]` length mirror. Documents the traps - authoritative-vs-mirror length, cursor-based GC tracing, the hole sentinel's reserved tag, why a hole declines a read to the chain, inline re-validation of extensible + the chain verdict, why the read lane is single-agent only, and why the gate must stay branchy."
 ---
 
 # Slag dense Array stores and the compiled append
@@ -14,7 +14,8 @@ Locations: `crates/crux/src/object.rs` (`ArraySlots`, the cursor,
 `ChainVerdict`, `array_element_write`/`array_element_write_dense`,
 `spill_dense_array`, the length readers), `crates/crux/src/value.rs` (the
 hole sentinel), `crates/jit/src/compiler.rs`
-(`emit_dense_array_append_inline`, `emit_dense_element_read`,
+(`emit_dense_array_append_inline`, `emit_element_read`,
+`emit_dense_element_read_into`, `emit_typed_array_read_into`,
 `emit_computed_store`, `emit_member_cell_probe`'s length path),
 `crates/runtime/src/ir.rs` (`member_cell_get`, `array_length`,
 `array_element_get`).
@@ -190,14 +191,18 @@ an exotic intercept.
 - Rebuild `sweep.exe` and run all three areas (the append gate and the
   length probe are on shared read/store paths).
 
-## 8. The inline dense element read (`a[i]`)
+## 8. The inline computed element read (`a[i]` / `ta[k]`)
 
-`emit_dense_element_read` is the read mirror of the append: `Step::Get`
-`MemberComputed` and the register `GetMemberComputed`/`GetMemberComputedLocal`
-all lower through it, and an in-bounds, non-hole element of a dense Array is
-served by ONE buffer load instead of the `get_member_computed` helper.
+`emit_element_read` is the read mirror of the append, and both buffer-backed
+representations go through it: `Step::GetMemberComputed` and the register
+`GetMemberComputed`/`GetMemberComputedLocal` all lower through it, and it
+dispatches on the receiver — a live `array_dense` cursor means a dense Array
+(arm `emit_dense_element_read_into`), else a live `typed_array` cursor means an
+Integer-Indexed TypedArray (arm `emit_typed_array_read_into`, the read mirror of
+the Uint8-only inline store). Anything else falls to the `get_member_computed`
+helper.
 
-The gate, in order (keep it branchy, §5):
+### The dense arm
 
 - the receiver is a tagged Object (the packed prefix+Object compare);
 - `array_dense` is non-null. It IS the dense switch — a spill clears BOTH
@@ -206,7 +211,9 @@ The gate, in order (keep it branchy, §5):
 - the key is a canonical index Number: `idx = ToUint64Sat(num)` round-trips
   exactly (`fcvt_from_uint(idx) == num`) and `num < 2^32-1`. That rejects
   fractional, negative, huge, and non-double keys (a NaN-boxed heap value
-  bitcasts to a NaN, whose compare fails), and `-0.0` canonicalizes to 0;
+  bitcasts to a NaN, whose compare fails), and a `-0.0` key — which
+  `ToPropertyKey` normalizes to `"0"` before it ever reaches a computed read —
+  round-trips to index 0, which is what the helper does too;
 - `idx < elem_len` (the authoritative materialized length — `[0, elem_len)` is
   initialized);
 - the loaded element is not the hole sentinel.
@@ -215,18 +222,44 @@ The gate, in order (keep it branchy, §5):
 spec-absent, so `[[Get]]` consults the prototype chain (a prototype element or
 accessor wins); returning the sentinel bits would be a wrong value, not a
 wrong-looking one. A stored `undefined` is a real value and IS served. Also
-declining: a spilled array, a typed array (its own `ObjectKind`, so
-`array_dense` is null — typed-array element reads are a separate
-representation and still take the helper), a string/out-of-range key, and a
-non-Array receiver.
+declining: a spilled array, a string/out-of-range key, and a non-Array
+receiver.
 
 While dense every element is a writable data property (a non-w/e/c element
 descriptor spills the array), so an own buffer element shadows the whole chain
 — no chain check is needed on the served path. The read allocates nothing and
 holds no guard, so it needs no write barrier and no epoch check.
 
+### The TypedArray arm
+
+- the receiver's `typed_array` slots are non-null;
+- `detached == 0` and `resizable == 0`, and the `BlockState.data` pointer is
+  non-null. A detached buffer covers no element (the helper returns
+  `undefined`); a RESIZABLE buffer is declined because a fixed view's
+  `array_length` is the effective length only while the buffer has not shrunk
+  below its byte range, and a non-resizable buffer's view is never auto-length
+  — together `idx < array_length` is then `IsValidIntegerIndex` exactly.
+  `immutable` is deliberately NOT checked: reads of an immutable buffer are
+  legal (only the store rejects them);
+- the key gate is the dense arm's, plus `idx < array_length`;
+- the element kind dispatches to one conversion block per supported kind: every
+  integer width (sign- or zero-extended) plus Float32 (widened) and Float64
+  (its stored bytes already are its Number bits). Float16 (a soft-float decode)
+  and BigInt64/BigUint64 (a BigInt allocation) are absent and decline.
+
+**The whole lane is single-agent only.** Under the `workers` feature the
+shared-buffer block layout is cfg'd, so `emit_typed_array_read_into` jumps
+straight to the helper — exactly as `emit_typed_array_store_inline` does. A
+test that counts the typed helper must therefore be gated on
+`!crux::typed_array::WORKERS`: `crates/test262` and `crates/v8` enable
+`runtime/workers`, so a `--workspace` test build unifies the feature ON and the
+count assertion is vacuous there (it is meaningful under `cargo test -p jit`
+and the CLI/corpus builds, which do not enable it).
+
 Measured (`arrays/index_loop`): 37.9 → 20.7 ms with `GetMemberComputed`
-21,000,000 → 0; `objects/many_objects_read` 30.6 → 21.1 ms.
+21,000,000 → 0; `objects/many_objects_read` 30.6 → 21.1 ms;
+`arrays/typed_array` 50.1 → 35.6 ms (`GetMemberComputed` 14,000,000 → 0);
+`--jit-bench`'s `typed-array read` row 0.15 (89.5 → 13.0 ms).
 
 ## Relationship to the other skills
 

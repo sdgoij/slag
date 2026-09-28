@@ -6264,6 +6264,136 @@ mod tests {
         assert!(compiled >= 1, "{compiled} bodies");
     }
 
+    #[test]
+    fn installed_jit_typed_array_element_read_inlines() {
+        // The inline TypedArray element read: `ta[k]` over a numeric element
+        // kind in a compiled loop must take the machine-code load — the
+        // counting wrapper proves the `get_member_computed` helper runs only
+        // for the declined shapes, not per element — and the values must match
+        // the interpreter.
+        static READ_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        extern "C" fn counting_read(ctx: *mut c_void, object: u64, key: u64) -> u64 {
+            READ_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            (runtime::jit::JIT_SLOW_PATHS.get_member_computed)(ctx, object, key)
+        }
+        let mut helpers = runtime_helpers();
+        helpers.get_member_computed = Some(counting_read);
+        let source = r#"function sum(a, n) {
+                        var s = 0;
+                        for (var i = 0; i < n; i++) { s += a[i & 63]; }
+                        return s;
+                      }
+                      var u8 = new Uint8Array(64);
+                      var i32 = new Int32Array(64);
+                      var f64 = new Float64Array(64);
+                      for (var i = 0; i < 64; i++) {
+                        u8[i] = i; i32[i] = i * 1000; f64[i] = i / 4;
+                      }
+                      sum(u8, 10000) + sum(i32, 10000) + sum(f64, 10000);"#;
+        let interp = {
+            let mut agent = runtime::Agent::new();
+            agent.initialize_host_defined_realm().expect("realm");
+            agent.run_script(source).expect("interp runs")
+        };
+
+        extern "C" fn noop_drop(_cache: *mut c_void) {}
+        let mut agent = runtime::Agent::new();
+        agent.initialize_host_defined_realm().expect("realm");
+        let mut cache = JitCache::new(helpers).expect("isa");
+        agent.jit_hook = Some(runtime::jit::JitHook {
+            cache: (&mut cache as *mut JitCache) as *mut c_void,
+            lookup: jit_cache_lookup,
+            drop_cache: noop_drop,
+            helpers: &runtime::jit::JIT_SLOW_PATHS,
+        });
+        let value = agent.run_script(source).expect("jit runs");
+        let compiled = cache.compiled_count();
+        agent.jit_hook = None;
+        assert_eq!(
+            value, interp,
+            "the typed-array read must match the interpreter"
+        );
+        assert!(compiled >= 1, "{compiled} bodies must compile");
+        let reads = READ_CALLS.load(std::sync::atomic::Ordering::Relaxed);
+        // The `workers` build cfg's the shared-buffer block layout, so the
+        // typed-array lane deliberately declines to the helper there (as the
+        // inline store does) and every read counts. The inline assertion is
+        // only meaningful in the single-agent build (`cargo test -p jit`).
+        if !crux::typed_array::WORKERS {
+            assert!(
+                reads < 50,
+                "the compiled read loop must inline the typed-array element read ({reads} get_member_computed calls)"
+            );
+        }
+    }
+
+    #[test]
+    fn installed_jit_typed_array_element_read_matches_the_interpreter() {
+        // Every supported element kind through a compiled read loop, plus the
+        // declined shapes: an out-of-range / non-canonical key, a non-typed-
+        // array receiver, a detached buffer, a resizable-buffer view, and the
+        // BigInt element kinds (a helper allocation). The comparison is the
+        // exactness check.
+        let source = r#"function read(a, n) {
+                        var s = 0;
+                        for (var i = 0; i < n; i++) { s += a[i & 7]; }
+                        return s;
+                      }
+                      var kinds = [
+                        new Int8Array([-1, 2, -3, 4, -5, 6, -7, 8]),
+                        new Uint8Array([1, 2, 3, 4, 5, 6, 7, 8]),
+                        new Uint8ClampedArray([1, 2, 3, 4, 5, 6, 7, 8]),
+                        new Int16Array([-100, 200, -300, 400, -500, 600, -700, 800]),
+                        new Uint16Array([1, 2, 3, 4, 5, 6, 7, 8]),
+                        new Int32Array([-100000, 2, -3, 4, -5, 6, -7, 8]),
+                        new Uint32Array([4000000000, 2, 3, 4, 5, 6, 7, 8]),
+                        new Float32Array([1.5, -2.25, 3.125, 4, 5, 6, 7, 8]),
+                        new Float64Array([1.5, -2.25, 3.125, 4.5, 5.5, 6.5, 7.5, 8.5])
+                      ];
+                      var total = 0;
+                      for (var k = 0; k < kinds.length; k++) { total += read(kinds[k], 800); }
+                      var small = new Uint8Array([9, 8, 7, 6]);
+                      total += (small[99] === undefined ? 1 : 0);
+                      total += (small['x'] === undefined ? 1 : 0);
+                      total += (small[1.5] === undefined ? 1 : 0);
+                      total += read({ 0: 7, 1: 7, 2: 7, 3: 7, 4: 7, 5: 7, 6: 7, 7: 7 }, 800);
+                      if (typeof BigInt64Array === 'function') {
+                        var big = new BigInt64Array(4);
+                        big[1] = 5n;
+                        total += (big[1] === 5n ? 1 : 0);
+                        total += (big[3] === 0n ? 1 : 0);
+                      }
+                      if (typeof structuredClone === 'function') {
+                        try {
+                          var ab = new ArrayBuffer(8);
+                          var dview = new Uint8Array(ab);
+                          dview[0] = 7;
+                          structuredClone(ab, { transfer: [ab] });
+                          total += (dview[0] === undefined ? 1 : 0);
+                        } catch (e) { total += 0; }
+                      }
+                      if (typeof ArrayBuffer.prototype.resize === 'function') {
+                        var rab = new ArrayBuffer(8, { maxByteLength: 16 });
+                        var rview = new Uint8Array(rab);
+                        rview[0] = 3;
+                        total += read(rview, 800);
+                        rab.resize(4);
+                        total += (rview[3] === undefined ? 1 : 0);
+                      }
+                      total;"#;
+        let interp = {
+            let mut agent = runtime::Agent::new();
+            agent.initialize_host_defined_realm().expect("realm");
+            agent.run_script(source).expect("interp runs")
+        };
+        let (value, compiled) = with_jit_agent(|agent| agent.run_script(source).expect("runs"));
+        assert_eq!(
+            value, interp,
+            "every typed-array read kind and decline must match the interpreter"
+        );
+        assert!(compiled >= 1, "{compiled} bodies");
+    }
+
     /// A6: the compiled safe point drives the nursery. The compiled loop's
     /// allocations are garbage, so a minor reclaims them and stays enabled; the
     /// nursery threshold is lowered so the minor level answers before the major's
