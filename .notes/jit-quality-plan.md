@@ -124,11 +124,11 @@ corpus, one process per row** so a row's counters belong to it, summed:
 | `SetMemberSlot` | 70.0M | 3 | member writes off the in-place path (`this.x += n`, churn) | G1-adjacent |
 | `LeafCallProbe` | 33.7M | 50 | the probe re-run on epoch churn — plus the dead-path tax of G2 | G2 |
 | `LoadContext` | 30.3M | 4 | closure/context slot loads | — |
-| `ForOfNextBindLocal` | 21.0M | 1 | `for-of` step | G4 |
+| `ForOfNextBindLocal` | 21.0M | 1 | `for-of` step | **G17 — landed (Stage 6)** |
 | `SwitchDisc` | 21.0M | 1 | `switch` selector | G11 |
 | `BreakControl` | 21.0M | 1 | `break` inside a `switch` | G11 |
 | `ObjectFast` | 16.8M | 16 | object literal | G3 |
-| `TypedArrayLength` | 15.7M | 16 | typed-array `length` | — |
+| `TypedArrayLength` | 15.7M | 16 | array `length` read (misnamed: the FFI probe every `i < a.length` paid) | **G16 — landed (Stage 6)** |
 | `ForInNext` | 6.3M | 1 | `for-in` step | G4 |
 | `ConcatStrings` | 4.5M | 3 | string building | G5 |
 
@@ -346,8 +346,84 @@ The list, in the measured order:
     the helper exactly as the inline store does — which is why the
     workers-enabled `--workspace` test build and the test262 sweeps do not
     exercise it (the corpus/`--jit-bench` CLI build and `cargo test -p jit` do).
-- **G3/G4/G5 — literals, iteration, string building**, as before: a helper
-  sequence per element/step/property, measured in the table above.
+- **G16 — every array `length` read paid the typed-array FFI probe (landed,
+  Stage 6).** The census counted `TypedArrayLength` at 15.7M over 16 rows and
+  labelled it "typed-array `length`", which hid the shape: the helper is the
+  FFI probe reached from `emit_member_cell_probe`'s `length` branch, and the
+  compiled lowering sent the machine typed-array read's **miss straight to the
+  FFI helper** before trying the dense-Array probe. A machine read hits only a
+  fixed/live/writable IntegerIndexed receiver, so a plain Array — whose `length`
+  is the slots cell — failed the machine gate, called `typed_array_length`
+  (which answered its not-a-typed-array sentinel), and only then hit the dense
+  probe. Every `i < a.length` loop bound therefore paid a helper round trip per
+  iteration (measured at 14M calls and 14.8 → 13.6 ms on a plain
+  `for (i = 0; i < 2e6; i++) s += a.length` shape, −8.4%). The fix is a
+  lowering reorder, no new helper and no ABI change: the machine read's miss
+  lands on the dense-Array probe, the dense probe's miss (a non-Array object)
+  lands on the FFI probe, and a **non-Object** receiver skips the FFI probe
+  entirely (the probe answers its sentinel for every non-Object unconditionally,
+  so a primitive `length` — a String — no longer calls it either). Measured over
+  the 77-row corpus: `opcost` 10.9M → **0.7M**, overall `TypedArrayLength`
+  17.47M → **0.7M**; `--jit-bench` in band (`arithmetic` 0.09, `function calls`
+  0.16, `non-leaf call` 0.50, `typed-array length` 0.18). New test
+  `installed_jit_array_length_read_skips_the_ffi_probe` counts the helper through
+  a wrapper and asserts the dense loop never calls it; detouring the dense hit
+  through `ffi` makes it count 100,000 and fail (mutation-checked). Gates: fmt
+  clean, clippy workspace `-D warnings` clean, workspace **5,543 passed / 0
+  failed** (jit 220), runtime `--no-default-features` 953/0, v8 `simdutf` 380/0,
+  `cli --no-default-features --features jit` green, test262 `all`
+  48,464/0/0/0 of 48,622 and `intl402` 3,205/0/0/0 of 3,357 at 15s/15s, corpus
+  parity 77 rows/0 mismatches. No wasm sweep owed (`wasmtest` does not link
+  `crates/jit`). A census label that names the helper, not the shape, is the
+  trap here: "typed-array length" was really *array-length read*.
+- **G17 — the compiled for-of fast-array cursor (landed, Stage 6).** The
+  census's `ForOfNextBindLocal` (21.0M, one row) was the whole for-of advance:
+  even the dense-array fast verdict (`ForOfState::FastArray`) paid a
+  `call_slow` per element for `for_of_advance`'s two cache probes. `arrays/for_of_dense`
+  ran 38.8 ms against an equivalent inline index loop's 22.1 ms — the for-of
+  step was ~76% of the row. The fix is a **compiled cursor in two hidden frame
+  slots** (the `alloc_hoist_slot` mechanism), carried on `Step::ForOfBegin`
+  (`cursor: (array_slot, index_slot)`, `NO_FOR_OF_CURSOR` for a head without
+  the fused bind): the begin helper seeds the array slot with the dense-Array
+  Value (or `undefined`), and the compiled `ForOfNextBindLocal` reads
+  `elem_ptr[index]` straight from the live `array_dense` cursor — the same
+  invariants `emit_dense_element_read_into` relies on (a live cursor, the
+  index below `elem_len`, a non-hole element) — writes the loop slot, bumps
+  the cursor and takes the back edge with **no helper call and no value-stack
+  round trip**. The Vm's `for_of_stack` entry stays authoritative for the
+  shared core: the first decline (a hole, the end, a receiver that stopped
+  being dense) abandons the cursor (the array slot is set to `undefined`, so
+  every later step takes the helper) and runs the new `for_of_fast_next`,
+  which syncs the entry's index to the one the inline path reached before
+  advancing it through `for_of_advance`. A frame-slot cursor is what makes the
+  protocol safe: it survives nesting (each loop owns its slots), recursion
+  (each frame owns its slots) and suspension (the frame is saved), unlike a
+  per-context cursor.
+
+  Measured: `arrays/for_of_dense` **38.8 → 8.0 ms** (result byte-identical),
+  the row's `ForOfNextBindLocal` **21.0M → 0** with `ForOfFastNext` at one call
+  per loop entry (the Done decline), and the `arrays` family's `mean-jitGap`
+  28.72 → 21.54. Two new tests:
+  `installed_jit_dense_for_of_inlines_the_cursor` counts the per-element helper
+  through a wrapper and asserts it never runs (forcing the helper path counts
+  110,000 and fails, mutation-checked), and
+  `installed_jit_dense_for_of_matches_the_interpreter` folds a dense array, a
+  middle hole, a trailing hole (`length` past `elem_len`), a sparse array, a
+  Set / String / TypedArray, a mid-loop grow and shrink, a `break`, nesting,
+  and a captured per-iteration `const` into one checksum compared against the
+  interpreter. Gates: fmt clean, clippy workspace `-D warnings` clean,
+  workspace **5,545 passed / 0 failed** (jit 222), runtime
+  `--no-default-features` 953/0, v8 `simdutf` 380/0, `cli
+  --no-default-features --features jit` green, test262 `all`
+  48,464/0/0/0 of 48,622 and `intl402` 3,205/0/0/0 of 3,357 at 15s/15s, corpus
+  parity 77 rows/0 mismatches, `--jit-bench` in band. An `--gc-stress` run of a
+  for-of workload (including a middle hole and a `push`-per-iteration) is
+  byte-identical between jit and jitless, and a generator `yield`-ing inside a
+  for-of exercises the frame cursor across a suspension. No wasm sweep owed
+  (`wasmtest` does not link `crates/jit`).
+- **G3/G4/G5 — literals, iteration, string building.** G4's for-of advance
+  landed as **G17** (above); the for-in and `for-of` non-fused (`ForOfNext`)
+  steps stay on the helper. G3/G5 remain, as measured in the table above.
 - **G6/G7/G8 — cell capacity, the register path's one shape, no feedback.**
   G8 is now load-bearing for a sharper reason: G9, G10 and G11 are each a
   *missing inline path*, and doing them one at a time is how the current
@@ -431,6 +507,19 @@ The list, in the measured order:
   Recorded so a later pass does not re-open them.
 - **Stage 6 — G3/G4/G5, literals, iteration, string building.** Each is a
   helper-per-op sequence today; each gets an inline path or a fused step.
+  **G16 (the array `length` read) and G17 (the for-of fast-array cursor, §3)
+  landed first**, because a per-row instrument run on the current tree
+  re-ranked the census: the `length` read was the least discussed but the
+  cleanest to fix (a lowering reorder, no new helper), and the for-of step had
+  the largest measured headroom (`arrays/for_of_dense` 38.8 ms against an
+  equivalent inline index loop's 22.1 ms). One Stage-6 item was re-measured
+  and is **closed by measurement**: the `for-in` head-let row
+  (`language/statements/for-in/head-let-fresh-binding-per-iteration.js`, the
+  slowest corpus row at ~950 ms/rep) is **allocation-bound**, not a JIT gap —
+  `PerIteration` builds a spec-required fresh environment and a closure per
+  iteration, and the row runs **952 ms JIT against 1,058 ms jitless** (~10%),
+  so no inline path can pay. Still open: G3 (object literals), G5 (string
+  building), and the non-fused `ForOfNext` / `ForInNext` advances.
 - **Stage 7 — G6/G8, cells and feedback.** Capacity for the colliding cells,
   and a per-site feedback record so the inline paths above become a mechanism
   rather than a set of bespoke arms.
@@ -758,3 +847,80 @@ One line per landed stage, newest last. This log is the arc's journal —
   corpus parity 77 rows/0 mismatches, `--jit-bench` in band (arithmetic 0.08,
   function calls 0.16, non-leaf call 0.50). The remaining Stage 5 items are
   recorded in §5 as closed by measurement.
+- **Stage 6, G16 — every array `length` read paid the typed-array FFI probe
+  (2026-09-28).** The census's `TypedArrayLength` row (15.7M, 16 rows) was
+  labelled "typed-array `length`", which named the helper rather than the shape:
+  it is the FFI probe at the end of `emit_member_cell_probe`'s `length` branch,
+  and the compiled lowering sent the machine typed-array read's miss straight
+  to it, ahead of the dense-Array probe. A machine read hits only a
+  fixed/live/writable IntegerIndexed receiver, so a plain Array's `length`
+  (the ubiquitous `i < a.length` loop bound) failed the machine gate, paid the
+  helper, took its not-a-typed-array sentinel, and only then reached the dense
+  probe. `opcost` alone showed 10.9M calls. The fix is a reorder, no new helper
+  and no ABI change: the machine read's miss lands on the dense probe, the
+  dense probe's miss lands on the FFI probe, and a non-Object receiver skips
+  the FFI probe (it answers its sentinel for every non-Object unconditionally,
+  so a String `length` no longer calls it). A/B on a plain 2e6-iteration
+  `s += a.length` shape: **14.80 → 13.56 ms (−8.4%)**, `typed_array_length`
+  14,000,000 → **0**. Corpus: `opcost` 10.9M → 0.7M, overall 17.47M → **0.7M**;
+  `--jit-bench` in band (arithmetic 0.09, function calls 0.16, non-leaf call
+  0.50, typed-array length 0.18). The length-bound probe is the wall-time
+  evidence; the corpus rows that call the helper are bound elsewhere, so their
+  row times are flat, which is the plan's "not row-only slices" caveat in the
+  other direction — a general tax on a shape the corpus does not isolate. New
+  `installed_jit_array_length_read_skips_the_ffi_probe` counts the helper
+  through a wrapper (dense loop must never call it); detouring the dense hit
+  through `ffi` counts 100,000 and fails (mutation-checked). Gates: fmt clean,
+  clippy workspace `-D warnings` clean, workspace **5,543 passed / 0 failed**
+  (`-p jit` 220), runtime `--no-default-features` 953/0, v8 `simdutf` 380/0,
+  `cli --no-default-features --features jit` green, test262 `all`
+  48,464/0/0/0 of 48,622 and `intl402` 3,205/0/0/0 of 3,357 at 15s/15s, corpus
+  parity 77 rows/0 mismatches (mean-jitGap 70.99 this run). No wasm sweep owed
+  (`wasmtest` does not link `crates/jit`). Stage-6 re-measurement alongside it:
+  the `for-in` head-let row is allocation-bound (952 JIT vs 1,058 jitless) and
+  `arrays/for_of_dense` is already 1.52x under the JIT — both recorded in §5.
+- **Stage 6, G17 — the compiled for-of fast-array cursor (2026-09-28).** The
+  census's `ForOfNextBindLocal` (21.0M, one row) was the entire for-of advance:
+  even the dense-array fast verdict paid a `call_slow` per element for
+  `for_of_advance`'s two cache probes, so `arrays/for_of_dense` ran 38.8 ms
+  against an equivalent inline index loop's 22.1 ms. The cursor now lives in
+  **two hidden frame slots** (the `alloc_hoist_slot` mechanism), carried on
+  `Step::ForOfBegin` as `cursor: (array_slot, index_slot)` (and on
+  `Step::ForOfNextBindLocal`, `NO_FOR_OF_CURSOR` when the head has no fused
+  bind): `for_of_begin` seeds the array slot with the dense-Array Value (or
+  `undefined`), and the compiled `ForOfNextBindLocal` reads
+  `elem_ptr[index]` from the live `array_dense` cursor — the invariants
+  `emit_dense_element_read_into` already relies on (a live cursor, the index
+  below `elem_len`, a non-hole element) — writes the loop slot, bumps the
+  cursor and takes the back edge with no helper call and no value-stack round
+  trip. The Vm's `for_of_stack` entry stays authoritative for the shared core:
+  the first decline (a hole, the end, a receiver that stopped being dense)
+  abandons the cursor (the array slot becomes `undefined`, so every later step
+  takes the helper) and runs the new `for_of_fast_next`, which syncs the
+  entry's index to the inline path's before advancing through
+  `for_of_advance`. A **frame-slot** cursor is what makes it safe: it survives
+  nesting (each loop owns its slots), recursion (each frame owns its slots)
+  and suspension (the frame is saved), which a per-context cursor would not.
+  The `Fixup::ForOfBoundary` resolve had to preserve the new field (a
+  wholesale `ForOfBegin` reconstruction resets it — the same trap the bytecode
+  skill records for `ForOfNext`'s `back`). Measured: `arrays/for_of_dense`
+  **38.8 → 8.0 ms** (result byte-identical) with the row's
+  `ForOfNextBindLocal` **21.0M → 0** and `ForOfFastNext` at one call per loop
+  entry (the Done decline); the `arrays` family's `mean-jitGap` 28.72 → 21.54.
+  Two new tests: `installed_jit_dense_for_of_inlines_the_cursor` (a wrapper
+  count, mutation-checked — forcing the helper path counts 110,000 and fails)
+  and `installed_jit_dense_for_of_matches_the_interpreter` (a checksum over a
+  dense array, a middle hole, a trailing hole, a sparse array, a Set / String
+  / TypedArray, a mid-loop grow and shrink, a `break`, nesting and a captured
+  per-iteration `const`). Gates: fmt clean, clippy workspace `-D warnings`
+  clean, workspace **5,545 passed / 0 failed** (`-p jit` 222), runtime
+  `--no-default-features` 953/0, v8 `simdutf` 380/0, `cli
+  --no-default-features --features jit` green, test262 `all`
+  48,464/0/0/0 of 48,622 and `intl402` 3,205/0/0/0 of 3,357 at 15s/15s, corpus
+  parity 77 rows/0 mismatches, `--jit-bench` in band (arithmetic 0.08, function
+  calls 0.15, non-leaf call 0.51). An `--gc-stress` for-of workload (a middle
+  hole, a `push` per iteration) is byte-identical between jit and jitless, and
+  a generator `yield`-ing inside a for-of exercises the saved frame cursor
+  across a suspension. No wasm sweep owed (`wasmtest` does not link
+  `crates/jit`). With this the Stage-6 iteration surface is closed for the
+  fused `for-of`; G3, G5 and the non-fused `ForOfNext`/`ForInNext` remain.

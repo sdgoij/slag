@@ -152,6 +152,9 @@ pub enum Helper {
     ForOfBegin,
     ForOfNext,
     ForOfNextBindLocal,
+    /// G17: the compiled fast-array cursor's fallback advance — set the
+    /// innermost `Fast` entry's index to the inline cursor's, then advance.
+    ForOfFastNext,
     ForOfClose,
     ForOfCloseAll,
     EnterPerIteration,
@@ -294,6 +297,7 @@ impl Helper {
             Helper::ForOfBegin => "for_of_begin",
             Helper::ForOfNext => "for_of_next",
             Helper::ForOfNextBindLocal => "for_of_next_bind_local",
+            Helper::ForOfFastNext => "for_of_fast_next",
             Helper::ForOfClose => "for_of_close",
             Helper::ForOfCloseAll => "for_of_close_all",
             Helper::EnterPerIteration => "enter_per_iteration",
@@ -761,6 +765,9 @@ pub struct JitHelpers {
     pub for_of_begin: Option<extern "C" fn(vm: *mut c_void, step: u64, value: u64) -> u64>,
     pub for_of_next: Option<extern "C" fn(vm: *mut c_void, stack: u64) -> u64>,
     pub for_of_next_bind_local: Option<extern "C" fn(vm: *mut c_void, slot: u64) -> u64>,
+    /// G17: `for_of_next_bind_local`, but first syncing the innermost `Fast`
+    /// entry's index to the compiled inline cursor's.
+    pub for_of_fast_next: Option<extern "C" fn(vm: *mut c_void, slot: u64, index: u64) -> u64>,
     pub for_of_close: Option<extern "C" fn(vm: *mut c_void) -> u64>,
     pub for_of_close_all: Option<extern "C" fn(vm: *mut c_void) -> u64>,
     pub enter_per_iteration: Option<extern "C" fn(vm: *mut c_void, step: u64) -> u64>,
@@ -938,6 +945,7 @@ impl JitHelpers {
             for_of_begin: None,
             for_of_next: None,
             for_of_next_bind_local: None,
+            for_of_fast_next: None,
             for_of_close: None,
             for_of_close_all: None,
             enter_per_iteration: None,
@@ -1083,6 +1091,7 @@ impl JitHelpers {
             Helper::ForOfBegin => self.for_of_begin.map(|f| f as usize as u64),
             Helper::ForOfNext => self.for_of_next.map(|f| f as usize as u64),
             Helper::ForOfNextBindLocal => self.for_of_next_bind_local.map(|f| f as usize as u64),
+            Helper::ForOfFastNext => self.for_of_fast_next.map(|f| f as usize as u64),
             Helper::ForOfClose => self.for_of_close.map(|f| f as usize as u64),
             Helper::ForOfCloseAll => self.for_of_close_all.map(|f| f as usize as u64),
             Helper::EnterPerIteration => self.enter_per_iteration.map(|f| f as usize as u64),
@@ -1719,6 +1728,10 @@ pub extern "C" fn test_for_of_next(_vm: *mut c_void, _stack: u64) -> u64 {
 }
 
 pub extern "C" fn test_for_of_next_bind_local(_vm: *mut c_void, _slot: u64) -> u64 {
+    1
+}
+
+pub extern "C" fn test_for_of_fast_next(_vm: *mut c_void, _slot: u64, _index: u64) -> u64 {
     1
 }
 

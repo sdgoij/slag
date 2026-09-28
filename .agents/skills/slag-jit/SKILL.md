@@ -114,6 +114,43 @@ pushed) + `PerIteration` (fresh copy per later iteration, replacing
 without pushing) — both mark the env context-transparent (the try-cut
 TDZ regression trap) and both read their `names` from the step.
 
+**The fused `ForOfNextBindLocal` inlines a dense-array cursor (G17).**
+`Step::ForOfBegin` carries `cursor: (array_slot, index_slot)` — two hidden
+frame slots from the bytecode compiler's `alloc_hoist_slot` (`NO_FOR_OF_CURSOR`
+when the head has no fused bind, e.g. a captured/context binding or the
+non-certified path). The `for_of_begin` helper seeds them: the array slot gets
+the `ForOfState::FastArray` Value, or `undefined` for every other verdict, so
+the compiled advance can test it as an object tag. The compiled
+`ForOfNextBindLocal` then reads `elem_ptr[index]` straight from the live
+`array_dense` cursor with no helper call, mirroring
+`emit_dense_element_read_into`'s invariants (a live cursor, `index < elem_len`,
+a non-hole element — the `elem_len <= length` dense invariant is what makes
+`index < elem_len` imply `index < length`, exactly as the compiled `a[i]`
+relies on). The traps:
+
+- **The Vm entry, not the frame slot, is authoritative.** The inline path
+advances its own slot without touching `vm.for_of_stack`, so any step that
+cannot be served inline must first sync the entry. The first decline (a
+hole, the end, a receiver that stopped being dense) sets the ARRAY slot to
+`undefined` — so every later step takes the helper — and calls
+`for_of_fast_next(slot, index)`, which writes `index` into the innermost
+`Fast` entry before running the shared `for_of_advance`. Skipping the
+abandon makes the next step re-read the (now stale) slot index and yield the
+same element twice; skipping the sync makes the helper re-yield what the
+inline path already consumed.
+- **A frame-slot cursor, not a per-context one, is required.** A
+`JitCallContext` lives only for one synchronous compiled call, so a cursor
+there would be lost across a generator suspension and shared by nested
+invocations. Frame slots survive all three (nesting, recursion, suspension);
+a `yield`/`await` inside a for-of body resumes with its cursor intact.
+- **The index slot holds a raw `u64`, not a `Value`.** Only the compiled read
+touches it; its tag bits stay 0, so a frame scan cannot mistake it for a
+heap pointer. The array slot holds a real `Value` and is additionally rooted
+by the Vm's `for_of_stack` entry for the loop's lifetime.
+- **`Fixup::ForOfBoundary` must pattern-match `ForOfBegin`'s `cursor`** when it
+rewrites `(top, end)` — a wholesale reconstruction resets it to `(0, 0)`
+(the same trap the bytecode-vm skill records for `ForOfNext`'s `back`).
+
 **The `ForOfBegin` boundary span is fixup-patched**: the step compiles as
 `{ top: 0, end: 0 }` and `Fixup::ForOfBoundary` rewrites it after the
 loop compiles. The JIT helper MUST read `top`/`end` from the step payload

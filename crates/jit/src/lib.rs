@@ -435,6 +435,7 @@ fn runtime_helpers() -> JitHelpers {
         for_of_begin: Some(rt.for_of_begin),
         for_of_next: Some(rt.for_of_next),
         for_of_next_bind_local: Some(rt.for_of_next_bind_local),
+        for_of_fast_next: Some(rt.for_of_fast_next),
         for_of_close: Some(rt.for_of_close),
         for_of_close_all: Some(rt.for_of_close_all),
         enter_per_iteration: Some(rt.enter_per_iteration),
@@ -674,6 +675,7 @@ mod tests {
             for_of_begin: Some(helpers::test_for_of_begin),
             for_of_next: Some(helpers::test_for_of_next),
             for_of_next_bind_local: Some(helpers::test_for_of_next_bind_local),
+            for_of_fast_next: Some(helpers::test_for_of_fast_next),
             for_of_close: Some(helpers::test_for_of_close),
             for_of_close_all: Some(helpers::test_for_of_close_all),
             enter_per_iteration: Some(helpers::test_enter_per_iteration),
@@ -2506,6 +2508,153 @@ mod tests {
         });
         assert_eq!(value.as_number(), Some(7000.0));
         assert!(compiled >= 1, "{compiled} bodies");
+    }
+
+    #[test]
+    fn installed_jit_array_length_read_skips_the_ffi_probe() {
+        // A compiled loop reading `a.length` over a dense Array must be served
+        // by the machine-code dense probe, not the `typed_array_length` FFI
+        // probe: the counting wrapper proves the FFI probe never runs for the
+        // inlined shape. Routing the typed-array probe's miss straight to the
+        // FFI helper (the pre-change order) makes this count one call per
+        // iteration, so the assertion is the regression guard.
+        static LENGTH_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        extern "C" fn counting_length(ctx: *mut c_void, object: u64) -> u64 {
+            LENGTH_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            (runtime::jit::JIT_SLOW_PATHS.typed_array_length)(ctx, object)
+        }
+        let mut helpers = runtime_helpers();
+        helpers.typed_array_length = Some(counting_length);
+
+        let source = "function sum(a, n) {\n\
+                        var s = 0;\n\
+                        for (var i = 0; i < n; i++) { s += a.length; }\n\
+                        return s;\n\
+                      }\n\
+                      var a = [1, 2, 3, 4, 5, 6, 7, 8];\n\
+                      sum(a, 100000) + a.length;";
+        let interp = {
+            let mut agent = runtime::Agent::new();
+            agent.initialize_host_defined_realm().expect("realm");
+            agent.run_script(source).expect("interp runs")
+        };
+
+        extern "C" fn noop_drop(_cache: *mut c_void) {}
+        let mut agent = runtime::Agent::new();
+        agent.initialize_host_defined_realm().expect("realm");
+        let mut cache = JitCache::new(helpers).expect("isa");
+        agent.jit_hook = Some(runtime::jit::JitHook {
+            cache: (&mut cache as *mut JitCache) as *mut c_void,
+            lookup: jit_cache_lookup,
+            drop_cache: noop_drop,
+            helpers: &runtime::jit::JIT_SLOW_PATHS,
+        });
+        let value = agent.run_script(source).expect("jit runs");
+        let compiled = cache.compiled_count();
+        agent.jit_hook = None;
+        assert_eq!(value, interp, "the length read must match the interpreter");
+        assert!(compiled >= 1, "{compiled} bodies must compile");
+        let calls = LENGTH_CALLS.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            calls < 100,
+            "the compiled loop must serve the dense `length` from the slots ({calls} typed_array_length calls)"
+        );
+    }
+
+    #[test]
+    fn installed_jit_dense_for_of_inlines_the_cursor() {
+        // A compiled `for (const v of a)` over a dense Array must advance the
+        // machine-code fast cursor: the counting wrapper proves the
+        // per-element `for_of_next_bind_local` helper never runs (only the
+        // per-loop decline does, through `for_of_fast_next`). Disabling the
+        // inline lowering makes the count one call per element.
+        static BIND_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        extern "C" fn counting_bind(ctx: *mut c_void, slot: u64) -> u64 {
+            BIND_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            (runtime::jit::JIT_SLOW_PATHS.for_of_next_bind_local)(ctx, slot)
+        }
+        let mut helpers = runtime_helpers();
+        helpers.for_of_next_bind_local = Some(counting_bind);
+
+        let source = "function sum(a, reps) {\n\
+                        var s = 0;\n\
+                        for (var r = 0; r < reps; r++) {\n\
+                          for (const v of a) { s += v; }\n\
+                        }\n\
+                        return s;\n\
+                      }\n\
+                      sum([1, 2, 3, 4, 5, 6, 7, 8, 9, 10], 10000);";
+        let interp = {
+            let mut agent = runtime::Agent::new();
+            agent.initialize_host_defined_realm().expect("realm");
+            agent.run_script(source).expect("interp runs")
+        };
+
+        extern "C" fn noop_drop(_cache: *mut c_void) {}
+        let mut agent = runtime::Agent::new();
+        agent.initialize_host_defined_realm().expect("realm");
+        let mut cache = JitCache::new(helpers).expect("isa");
+        agent.jit_hook = Some(runtime::jit::JitHook {
+            cache: (&mut cache as *mut JitCache) as *mut c_void,
+            lookup: jit_cache_lookup,
+            drop_cache: noop_drop,
+            helpers: &runtime::jit::JIT_SLOW_PATHS,
+        });
+        let value = agent.run_script(source).expect("jit runs");
+        let compiled = cache.compiled_count();
+        agent.jit_hook = None;
+        assert_eq!(value, interp, "the dense for-of must match the interpreter");
+        assert!(compiled >= 1, "{compiled} bodies must compile");
+        let calls = BIND_CALLS.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            calls < 100,
+            "the compiled for-of must inline the dense cursor ({calls} for_of_next_bind_local calls)"
+        );
+    }
+
+    #[test]
+    fn installed_jit_dense_for_of_matches_the_interpreter() {
+        // The inline fast cursor against every decline shape: a dense Array
+        // (the served shape), a middle hole, a trailing hole (`length` past
+        // `elem_len`), a sparse (non-dense) Array, non-Array iterables (a Set,
+        // a String, a TypedArray), a mid-loop grow and shrink, a `break`, and
+        // nesting. Each variant's contribution is folded into one checksum, so
+        // any divergence from the interpreter moves the value.
+        let source = "function run() {\n\
+  var out = 0;\n\
+  for (const v of [1, 2, 3, 4, 5]) out = out * 3 + v;\n\
+  for (const v of [1, , 3]) out = out * 3 + (v === undefined ? 7 : v);\n\
+  var t = [1, 2]; t.length = 5;\n\
+  for (const v of t) out = out * 3 + (v === undefined ? 9 : v);\n\
+  var s = []; s[3] = 4;\n\
+  for (const v of s) out = out * 3 + (v === undefined ? 5 : v);\n\
+  for (const v of new Set([1, 2, 3])) out = out * 3 + v;\n\
+  for (const v of 'abc') out = out * 3 + v.charCodeAt(0);\n\
+  for (const v of new Int32Array([4, 5])) out = out * 3 + v;\n\
+  var m = [1, 2];\n\
+  for (const v of m) { out = out * 3 + v; if (m.length < 4) m.push(9); }\n\
+  var q = [1, 2, 3, 4];\n\
+  for (const v of q) { out = out * 3 + v; if (q.length > 2) q.length = 2; }\n\
+  for (const v of [1, 2, 3, 4, 5]) { if (v === 3) break; out = out * 3 + v; }\n\
+  for (const x of [[1, 2], [3]]) for (const y of x) out = out * 3 + y;\n\
+  var fns = [];\n\
+  for (const v of [1, 2, 3]) fns.push(function () { return v; });\n\
+  out = out * 3 + fns[0]() * 100 + fns[1]() * 10 + fns[2]();\n\
+  return out;\n\
+}\n\
+run(); run(); run(); run(); run(); run(); run(); run(); run();\n\
+run(); run(); run(); run(); run(); run(); run(); run(); run();";
+        let interp = {
+            let mut agent = runtime::Agent::new();
+            agent.initialize_host_defined_realm().expect("realm");
+            agent.run_script(source).expect("interp runs")
+        };
+        let (value, compiled) = with_jit_agent(|agent| agent.run_script(source).expect("jit runs"));
+        assert_eq!(
+            value, interp,
+            "every for-of shape must match the interpreter"
+        );
+        assert!(compiled >= 1, "{compiled} bodies must compile");
     }
 
     #[test]

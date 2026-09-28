@@ -1006,6 +1006,10 @@ pub struct JitSlowPaths {
     /// `Step::ForOfNextBindLocal` (Cut 57): like `for_of_next`, landing the
     /// element directly in frame slot `slot` (the fused bind).
     pub for_of_next_bind_local: extern "C" fn(ctx: *mut c_void, slot: u64) -> u64,
+    /// The compiled fast-array cursor's fallback advance (G17): set the
+    /// innermost `Fast` entry's index to the inline cursor's (the compiled
+    /// path advances its own copy), then `for_of_next_bind_local`'s advance.
+    pub for_of_fast_next: extern "C" fn(ctx: *mut c_void, slot: u64, index: u64) -> u64,
     /// `Step::ForOfClose` (Cut 57): pop the innermost boundary and close a
     /// generic iterator (the fast entry has nothing to close).
     pub for_of_close: extern "C" fn(ctx: *mut c_void) -> u64,
@@ -1233,6 +1237,7 @@ pub static JIT_SLOW_PATHS: JitSlowPaths = JitSlowPaths {
     for_of_begin,
     for_of_next,
     for_of_next_bind_local,
+    for_of_fast_next,
     for_of_close,
     for_of_close_all,
     enter_per_iteration,
@@ -4317,7 +4322,7 @@ extern "C" fn for_of_begin(ctx: *mut c_void, step: u64, value: u64) -> u64 {
     let ctx = unsafe { ctx_of(ctx) };
     let agent = unsafe { &mut *ctx.agent };
     let vm = unsafe { &mut *ctx.vm };
-    let Some(crate::ir::Step::ForOfBegin { top, end }) = step_at(ctx, step) else {
+    let Some(crate::ir::Step::ForOfBegin { top, end, cursor }) = step_at(ctx, step) else {
         unreachable!("for_of_begin on a non-ForOfBegin step");
     };
     let rhs = Value::from_bits(value);
@@ -4328,10 +4333,28 @@ extern "C" fn for_of_begin(ctx: *mut c_void, step: u64, value: u64) -> u64 {
         }
         Err(error) => return slow_error(ctx, error),
     };
+    // The compiled fast cursor (G17): seed `(array_slot, index_slot)` with the
+    // dense-Array Value (or `undefined` for every other receiver, so the
+    // compiled advance takes the helper path) and index 0. `frame_get_mut` is
+    // the same slot access the fused bind uses; a missing cursor leaves the
+    // slots untouched. The index rides as a raw `u64` (never a `Value`: only
+    // the compiled read touches it, and its tag bits are 0, so a frame scan
+    // cannot mistake it for a heap pointer).
+    let fast = match &entry {
+        crate::ir::ForOfEntry::Fast { array, .. } => *array,
+        crate::ir::ForOfEntry::Generic(_) => Value::Undefined,
+    };
     vm.for_of_stack.push(entry);
     // The fixup-patched span drives `close_for_of_upto` on an external
     // break/return/throw (mirroring the interpreter handler).
     vm.for_of_boundaries.push((*top, *end));
+    if cursor.0 != usize::MAX {
+        *vm.frame_get_mut(cursor.0) = fast;
+        // A raw element count, not a `Value`: only the compiled read touches
+        // it (its tag bits stay 0, so a frame scan cannot read it as a heap
+        // pointer), and it starts at 0.
+        *vm.frame_get_mut(cursor.1) = Value::from_bits(0);
+    }
     Value::Undefined.bits()
 }
 
@@ -4364,6 +4387,32 @@ extern "C" fn for_of_next_bind_local(ctx: *mut c_void, slot: u64) -> u64 {
     let ctx = unsafe { ctx_of(ctx) };
     let agent = unsafe { &mut *ctx.agent };
     let vm = unsafe { &mut *ctx.vm };
+    match vm.for_of_advance(agent) {
+        Ok(crate::ir::ForOfAdvance::Element(value)) => {
+            *vm.frame_get_mut(slot as usize) = value;
+            1
+        }
+        Ok(crate::ir::ForOfAdvance::Done) => 0,
+        Err(error) => slow_error(ctx, error),
+    }
+}
+
+/// The compiled fast-array cursor's fallback advance (G17): the inline
+/// `ForOfNextBindLocal` advances its own frame-slot cursor without touching the
+/// Vm entry, so the first step that cannot be served inline (a hole, the end, a
+/// receiver that stopped being dense) must hand the entry the index the inline
+/// path reached before running the shared `for_of_advance`. Only a `Fast`
+/// entry carries an index; a `Generic` one ignores it.
+extern "C" fn for_of_fast_next(ctx: *mut c_void, slot: u64, index: u64) -> u64 {
+    let ctx = unsafe { ctx_of(ctx) };
+    let agent = unsafe { &mut *ctx.agent };
+    let vm = unsafe { &mut *ctx.vm };
+    if let Some(crate::ir::ForOfEntry::Fast {
+        index: entry_index, ..
+    }) = vm.for_of_stack.last_mut()
+    {
+        *entry_index = index as usize;
+    }
     match vm.for_of_advance(agent) {
         Ok(crate::ir::ForOfAdvance::Element(value)) => {
             *vm.frame_get_mut(slot as usize) = value;

@@ -46,6 +46,12 @@ pub enum ApplyKind {
     Call,
 }
 
+/// The "no inline cursor" marker for `Step::ForOfBegin`/
+/// `Step::ForOfNextBindLocal`'s `cursor` pair: a for-of head without the fused
+/// slot bind (the element rides the working stack), or a body the interpreter
+/// runs (the slots are never touched).
+pub const NO_FOR_OF_CURSOR: (usize, usize) = (usize::MAX, usize::MAX);
+
 /// One resumable-function instruction.
 #[derive(Debug, Clone)]
 pub enum Step {
@@ -702,6 +708,12 @@ pub enum Step {
     ForOfBegin {
         top: usize,
         end: usize,
+        /// The compiled fast-array cursor: `(array_slot, index_slot)`, two
+        /// hidden frame slots the JIT's `for_of_begin` helper seeds with the
+        /// dense-Array fast verdict and `ForOfNextBindLocal` advances inline
+        /// (no per-element helper). `NO_FOR_OF_CURSOR` when the head has no
+        /// fused bind, or the body is interpreted (it ignores the slots).
+        cursor: (usize, usize),
     },
     ForOfNext {
         done: usize,
@@ -711,11 +723,14 @@ pub enum Step {
     /// element writes the frame slot directly — one less dispatch and no
     /// value-stack round-trip per element. The generic iterator path
     /// writes the slot the same way. `back` is the do-while body start
-    /// (Cut 35 slice 18).
+    /// (Cut 35 slice 18). `cursor` is the `ForOfBegin` fast cursor (see
+    /// there); the compiled step advances it inline and only syncs the Vm
+    /// entry (via a helper) on a decline.
     ForOfNextBindLocal {
         slot: usize,
         done: usize,
         back: usize,
+        cursor: (usize, usize),
     },
     ForOfBind {
         left: ForBinding,
@@ -8320,7 +8335,7 @@ impl Vm {
                 Step::ForInRestore => {
                     self.restore_per_iteration(agent)?;
                 }
-                Step::ForOfBegin { top, end } => {
+                Step::ForOfBegin { top, end, .. } => {
                     let rhs = self.pop();
                     let entry = match crate::expr::for_of_begin(agent, &rhs)? {
                         crate::expr::ForOfState::Generic(record) => ForOfEntry::Generic(record),
@@ -8334,7 +8349,9 @@ impl Vm {
                 Step::ForOfNext { done, back } => {
                     self.for_of_next(agent, *done, *back, ForOfNextTarget::Stack)?;
                 }
-                Step::ForOfNextBindLocal { slot, done, back } => {
+                Step::ForOfNextBindLocal {
+                    slot, done, back, ..
+                } => {
                     self.for_of_next(agent, *done, *back, ForOfNextTarget::Slot(*slot))?;
                 }
                 Step::ForOfBind { left } => {
@@ -16081,10 +16098,15 @@ impl Compiler {
                     }
                 }
                 Fixup::ForOfBoundary(index, top, end) => {
-                    self.steps[index] = Step::ForOfBegin {
-                        top: self.labels[&top],
-                        end: self.labels[&end],
-                    };
+                    // Preserve the compiler-assigned `cursor` (a wholesale
+                    // reconstruction would reset it to `(0, 0)`).
+                    if let Step::ForOfBegin { cursor, .. } = self.steps[index] {
+                        self.steps[index] = Step::ForOfBegin {
+                            top: self.labels[&top],
+                            end: self.labels[&end],
+                            cursor,
+                        };
+                    }
                 }
                 Fixup::AsyncForOfBoundary(index, top, end) => {
                     self.steps[index] = Step::AsyncForOfBegin {
@@ -18196,6 +18218,7 @@ impl Compiler {
         body: &Stmt,
         emit_next: Step,
         protocol_entered: bool,
+        cursor: (usize, usize),
     ) -> Result<(usize, usize), JsError> {
         let ForBinding::VarDecl { kind, pattern, .. } = left else {
             unreachable!("the certified scan only allows Ident VarDecl for-of/in heads")
@@ -18252,6 +18275,7 @@ impl Compiler {
                 slot,
                 done: 0,
                 back: 0,
+                cursor,
             });
             self.fixups
                 .push(Fixup::ForOfNextBindLocal(step_index, done_label));
@@ -18310,6 +18334,7 @@ impl Compiler {
                 slot,
                 done: 0,
                 back,
+                cursor,
             });
             self.fixups
                 .push(Fixup::ForOfNextBindLocal(loop_fetch, done_label));
@@ -18371,7 +18396,13 @@ impl Compiler {
         }
         self.compile_expr(right)?;
         self.emit(Step::ForInBegin);
-        self.compile_certified_for_loop(left, body, Step::ForInNext { done: 0, back: 0 }, false)?;
+        self.compile_certified_for_loop(
+            left,
+            body,
+            Step::ForInNext { done: 0, back: 0 },
+            false,
+            NO_FOR_OF_CURSOR,
+        )?;
         Ok(())
     }
 
@@ -18382,13 +18413,23 @@ impl Compiler {
         body: &Stmt,
     ) -> Result<(), JsError> {
         self.compile_expr(right)?;
-        self.emit(Step::ForOfBegin { top: 0, end: 0 });
+        // The inline fast-array cursor: two hidden frame slots the begin helper
+        // seeds and the fused bind advances without a per-element helper call.
+        // Allocated for every certified for-of (the fast verdict is dynamic —
+        // the slots stay `undefined` when the receiver is not a dense Array).
+        let cursor = (self.alloc_hoist_slot(), self.alloc_hoist_slot());
+        self.emit(Step::ForOfBegin {
+            top: 0,
+            end: 0,
+            cursor,
+        });
         let begin_index = self.steps.len() - 1;
         let (top, end) = self.compile_certified_for_loop(
             left,
             body,
             Step::ForOfNext { done: 0, back: 0 },
             true,
+            cursor,
         )?;
         self.fixups
             .push(Fixup::ForOfBoundary(begin_index, top, end));
@@ -18498,7 +18539,11 @@ impl Compiler {
         let tdz = self.enter_iter_tdz_env(left);
         self.compile_expr(right)?;
         self.leave_iter_tdz_env(tdz);
-        self.emit(Step::ForOfBegin { top: 0, end: 0 });
+        self.emit(Step::ForOfBegin {
+            top: 0,
+            end: 0,
+            cursor: NO_FOR_OF_CURSOR,
+        });
         let top_label = self.new_label();
         let end_label = self.new_label();
         let done_label = self.new_label();

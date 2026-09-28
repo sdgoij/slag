@@ -1431,39 +1431,36 @@ impl<'a> Lowerer<'a> {
         let field_hit = self.builder.create_block();
         let map_hit = self.builder.create_block();
         let overflow = self.builder.create_block();
-        // The typed-array length probe: only the `length` atom needs it. The
-        // machine read (gap-close M6) serves a fixed, live, writable-buffer
-        // IntegerIndexed receiver's length straight from the slots; a helper
-        // covers every other receiver (and the shadowed/auto/detached/
-        // resizable shapes), returning the slots length for an
-        // IntegerIndexed receiver or the canonical-NaN sentinel. A hit
-        // serves the value with no `get_member_name` call (the
-        // interpreter's `get_member_name` fast path serves the same slots
-        // length, gated on the own-`length` shadow — the probe is exact for
-        // the same receivers). Any other receiver falls into the
-        // member-cell probe below.
+        // The length read: only the `length` atom needs this. The dense-Array
+        // probe and the machine typed-array read (gap-close M6) both serve
+        // `length` straight from the slots with no helper call; the exact FFI
+        // probe covers every other IntegerIndexed receiver (the shadowed/
+        // auto/detached/resizable shapes) as a last resort, and answers the
+        // canonical-NaN sentinel for a receiver that is neither. A hit serves
+        // the value with no `get_member_name` call (the interpreter's
+        // `get_member_name` fast path serves the same slots length, gated on
+        // the own-`length` shadow — the probes are exact for the same
+        // receivers). Any other receiver falls into the member-cell probe
+        // below.
         if name == Self::length_atom() {
-            // The machine length read first (M6); its misses land here, the
-            // exact FFI probe (which also covers the receivers whose
-            // `typed_array` mirror an own-`length` define cleared).
-            let ffi = self.builder.create_block();
-            self.emit_typed_array_length_inline(object, value_var, ffi, merge)?;
-            self.builder.switch_to_block(ffi);
-            let len = self.emit_raw_call(self.sig_bool, Helper::TypedArrayLength, &[object])?;
-            let sentinel = self
-                .builder
-                .ins()
-                .iconst(types::I64, TYPED_ARRAY_LENGTH_SENTINEL as i64);
-            let hit = self.builder.ins().icmp(IntCC::NotEqual, len, sentinel);
-            self.builder.def_var(value_var, len);
+            // The machine typed-array read (M6) first; its misses land on the
+            // DENSE probe below, NOT the FFI helper. A plain Array's `length`
+            // (the ubiquitous `i < a.length` loop bound) is then served from
+            // the slots with no helper call — routing straight to the helper
+            // would make every array-length read pay a `typed_array_length`
+            // round trip only to be told it is not a typed array. The exact
+            // FFI probe (which also covers the receivers whose `typed_array`
+            // mirror an own-`length` define cleared, and the auto/detached/
+            // resizable shapes the machine gate declines) is the last resort,
+            // after the dense probe has missed too.
             let len_miss = self.builder.create_block();
-            self.builder.ins().brif(hit, merge, &[], len_miss, &[]);
-            self.builder.seal_block(ffi);
+            self.emit_typed_array_length_inline(object, value_var, len_miss, merge)?;
             // A dense Array's `length` is the slots cell, read straight from
             // the box: the member-value cell cannot serve it because the
             // compiled dense append bumps the generation on every store, so
-            // the cell misses each read. Any other receiver falls through to
-            // the shared tag check / member-cell probe below.
+            // the cell misses each read. A non-Array object falls through to
+            // the FFI probe, then to the shared tag check / member-cell probe.
+            let ffi = self.builder.create_block();
             let after = self.builder.create_block();
             let array_probe = self.builder.create_block();
             let array_hit = self.builder.create_block();
@@ -1480,6 +1477,8 @@ impl<'a> Lowerer<'a> {
                 .ins()
                 .icmp_imm_u(IntCC::Equal, tag, crux::TAG_OBJECT as i64);
             let plain = self.builder.ins().band(is_obj, tag_obj);
+            // A non-Object receiver can never be IntegerIndexed, so the FFI
+            // probe would answer its sentinel unconditionally — skip it.
             self.builder.ins().brif(plain, array_probe, &[], after, &[]);
             self.builder.seal_block(len_miss);
             self.builder.switch_to_block(array_probe);
@@ -1499,9 +1498,7 @@ impl<'a> Lowerer<'a> {
                 Offset32::new(std::mem::offset_of!(crux::JsObject, array_dense) as i32),
             );
             let is_array = self.builder.ins().icmp_imm_u(IntCC::NotEqual, slots, 0);
-            self.builder
-                .ins()
-                .brif(is_array, array_hit, &[], after, &[]);
+            self.builder.ins().brif(is_array, array_hit, &[], ffi, &[]);
             self.builder.seal_block(array_probe);
             self.builder.switch_to_block(array_hit);
             let slots_ptr = self
@@ -1521,6 +1518,20 @@ impl<'a> Lowerer<'a> {
             self.builder.def_var(value_var, length_bits);
             self.builder.ins().jump(merge, &[]);
             self.builder.seal_block(array_hit);
+            // The exact FFI probe: an IntegerIndexed receiver (including the
+            // shapes the machine gate declined) answers its slots length;
+            // every other receiver answers the canonical-NaN sentinel and
+            // falls through to the member-cell probe below.
+            self.builder.switch_to_block(ffi);
+            let len = self.emit_raw_call(self.sig_bool, Helper::TypedArrayLength, &[object])?;
+            let sentinel = self
+                .builder
+                .ins()
+                .iconst(types::I64, TYPED_ARRAY_LENGTH_SENTINEL as i64);
+            let hit = self.builder.ins().icmp(IntCC::NotEqual, len, sentinel);
+            self.builder.def_var(value_var, len);
+            self.builder.ins().brif(hit, merge, &[], after, &[]);
+            self.builder.seal_block(ffi);
             self.builder.switch_to_block(after);
             self.builder.seal_block(after);
         }
@@ -2676,6 +2687,144 @@ impl<'a> Lowerer<'a> {
         self.builder.switch_to_block(hit);
         self.builder.def_var(value_var, bits);
         self.builder.ins().jump(merge, &[]);
+        Ok(())
+    }
+
+    /// The compiled fast-array cursor's inline advance (G17). `ForOfBegin`
+    /// seeded `(array_slot, index_slot)` with the dense-Array fast verdict, so
+    /// the common `for (const v of arr)` step reads the element straight from
+    /// the array buffer — the index loop's shape — with no helper call. The
+    /// gate mirrors `emit_dense_element_read_into` (a live `array_dense`
+    /// cursor, the index below `elem_len`, a non-hole element). Any decline
+    /// abandons the cursor (the array slot is set to `undefined`, so every
+    /// later step takes the helper) after handing the Vm entry the index the
+    /// inline path reached: `for_of_fast_next` syncs the entry and advances it
+    /// through the shared `for_of_advance` core.
+    fn emit_for_of_fast_bind(
+        &mut self,
+        slot: usize,
+        back: Block,
+        done: Block,
+        cursor: (usize, usize),
+    ) -> Result<(), Unsupported> {
+        let (array_slot, index_slot) = cursor;
+        let array = self.load_slot(array_slot);
+        let object_pattern = (crux::TAG_PREFIX >> 44) | crux::TAG_OBJECT;
+        let tag_bits = self.builder.ins().ushr_imm_u(array, 44);
+        let obj_ok = self
+            .builder
+            .ins()
+            .icmp_imm_u(IntCC::Equal, tag_bits, object_pattern as i64);
+        let dense = self.builder.create_block();
+        let helper_plain = self.builder.create_block();
+        self.builder
+            .ins()
+            .brif(obj_ok, dense, &[], helper_plain, &[]);
+        self.builder.seal_block(dense);
+        self.builder.seal_block(helper_plain);
+        // The live dense cursor: non-null iff the receiver is a dense Array.
+        self.builder.switch_to_block(dense);
+        let obj_ptr = self
+            .builder
+            .ins()
+            .band_imm_u(array, crux::PAYLOAD_MASK as i64);
+        let obj_ptr = self.builder.ins().ishl_imm_u(obj_ptr, 4);
+        let obj_ptr = self
+            .builder
+            .ins()
+            .iadd_imm_s(obj_ptr, crux::heap::GCBOX_DATA_OFFSET as i64);
+        let dense_base = self.builder.ins().load(
+            types::I64,
+            MemFlagsData::new(),
+            obj_ptr,
+            Offset32::new(std::mem::offset_of!(crux::JsObject, array_dense) as i32),
+        );
+        let dense_ok = self
+            .builder
+            .ins()
+            .icmp_imm_u(IntCC::NotEqual, dense_base, 0);
+        let bounds = self.builder.create_block();
+        let helper_sync = self.builder.create_block();
+        self.builder
+            .ins()
+            .brif(dense_ok, bounds, &[], helper_sync, &[]);
+        self.builder.seal_block(bounds);
+        // The bounds gate: `elem_len` is the materialized length; a spilled
+        // array or an index past it (a trailing hole) declines.
+        self.builder.switch_to_block(bounds);
+        let slots_ptr = self
+            .builder
+            .ins()
+            .iadd_imm_s(dense_base, crux::heap::GCBOX_DATA_OFFSET as i64);
+        let idx = self.load_slot(index_slot);
+        let elem_len = self.builder.ins().load(
+            types::I64,
+            MemFlagsData::new(),
+            slots_ptr,
+            Offset32::new(std::mem::offset_of!(crux::object::ArraySlots, elem_len) as i32),
+        );
+        let in_bounds = self
+            .builder
+            .ins()
+            .icmp(IntCC::UnsignedLessThan, idx, elem_len);
+        let load_blk = self.builder.create_block();
+        self.builder
+            .ins()
+            .brif(in_bounds, load_blk, &[], helper_sync, &[]);
+        self.builder.seal_block(load_blk);
+        // The element load: a hole is spec-absent and declines to the shared
+        // core (a stored `undefined` is a real value and IS served).
+        self.builder.switch_to_block(load_blk);
+        let elem_ptr = self.builder.ins().load(
+            types::I64,
+            MemFlagsData::new(),
+            slots_ptr,
+            Offset32::new(std::mem::offset_of!(crux::object::ArraySlots, elem_ptr) as i32),
+        );
+        let offset = self.builder.ins().ishl_imm_u(idx, 3);
+        let addr = self.builder.ins().iadd(elem_ptr, offset);
+        let bits = self
+            .builder
+            .ins()
+            .load(types::I64, MemFlagsData::new(), addr, Offset32::new(0));
+        let is_hole =
+            self.builder
+                .ins()
+                .icmp_imm_u(IntCC::Equal, bits, crux::value::HOLE_BITS as i64);
+        let hit = self.builder.create_block();
+        self.builder.ins().brif(is_hole, helper_sync, &[], hit, &[]);
+        self.builder.seal_block(helper_sync);
+        self.builder.seal_block(hit);
+        // The hit: bind the frame slot, bump the cursor, and take the back edge
+        // (no per-element helper call and no value-stack round trip).
+        self.builder.switch_to_block(hit);
+        self.store_slot(slot, bits);
+        let next = self.builder.ins().iadd_imm_u(idx, 1);
+        self.store_slot(index_slot, next);
+        self.builder.ins().jump(back, &[]);
+        // The first decline: abandon the cursor so every later step runs the
+        // helper, after handing the entry the index the inline path reached.
+        self.builder.switch_to_block(helper_sync);
+        let undefined = self
+            .builder
+            .ins()
+            .iconst(types::I64, Value::Undefined.bits() as i64);
+        self.store_slot(array_slot, undefined);
+        let slot_imm = self.builder.ins().iconst(types::I64, slot as i64);
+        let sync_idx = self.load_slot(index_slot);
+        let code = self.call_slow(
+            self.sig_get_name,
+            Helper::ForOfFastNext,
+            &[slot_imm, sync_idx],
+        )?;
+        let is_elem = self.builder.ins().icmp_imm_u(IntCC::Equal, code, 1);
+        self.builder.ins().brif(is_elem, back, &[], done, &[]);
+        // The cursor is already gone (a non-Array receiver): the plain helper.
+        self.builder.switch_to_block(helper_plain);
+        let slot_imm = self.builder.ins().iconst(types::I64, slot as i64);
+        let code = self.call_slow(self.sig_bool, Helper::ForOfNextBindLocal, &[slot_imm])?;
+        let is_elem = self.builder.ins().icmp_imm_u(IntCC::Equal, code, 1);
+        self.builder.ins().brif(is_elem, back, &[], done, &[]);
         Ok(())
     }
 
@@ -6925,16 +7074,25 @@ impl<'a> Lowerer<'a> {
             Step::ForOfNext { done, back } => {
                 self.emit_for_fetch(*back, *done, Helper::ForOfNext)?;
             }
-            Step::ForOfNextBindLocal { slot, done, back } => {
-                let slot_imm = self.builder.ins().iconst(types::I64, *slot as i64);
-                let code =
-                    self.call_slow(self.sig_bool, Helper::ForOfNextBindLocal, &[slot_imm])?;
+            Step::ForOfNextBindLocal {
+                slot,
+                done,
+                back,
+                cursor,
+            } => {
                 let back_block = self.ensure_block(*back);
                 let done_block = self.ensure_block(*done);
-                let is_elem = self.builder.ins().icmp_imm_u(IntCC::Equal, code, 1);
-                self.builder
-                    .ins()
-                    .brif(is_elem, back_block, &[], done_block, &[]);
+                if cursor.0 == usize::MAX {
+                    let slot_imm = self.builder.ins().iconst(types::I64, *slot as i64);
+                    let code =
+                        self.call_slow(self.sig_bool, Helper::ForOfNextBindLocal, &[slot_imm])?;
+                    let is_elem = self.builder.ins().icmp_imm_u(IntCC::Equal, code, 1);
+                    self.builder
+                        .ins()
+                        .brif(is_elem, back_block, &[], done_block, &[]);
+                } else {
+                    self.emit_for_of_fast_bind(*slot, back_block, done_block, *cursor)?;
+                }
             }
             Step::ForOfBindLocal { slot } => {
                 // The element writes the frame slot directly (the write IS
