@@ -6,11 +6,13 @@ done (0 emitter refusals) — this plan exists because coverage turned out not t
 be the thing, and because the architecture below was read out of the code
 rather than inferred from timings.
 
-Status: Stage 0 is a **code audit, done 2026-09-28**. Result: the JIT is a
-per-`Step` lowering with hand-written inline fast paths for a named subset and
-`call_slow` into a 131-entry Rust helper table for everything else — **compiled
-dispatch with an inlined core**, not a typed-IR compiler. §3 is the gap
-inventory that follows, and it is the work list. No code changed.
+Status: **Stages 0-2** are done (2026-09-28): the code audit, the instrument,
+and G9 (the integer operators now inline). The JIT is a per-`Step` lowering with
+hand-written inline fast paths for a named subset and `call_slow` into a
+131-entry Rust helper table for everything else — **compiled dispatch with an
+inlined core**, not a typed-IR compiler. §3 is the gap inventory, ordered by
+measured helper traffic (the Stage 1 run, §4) and annotated with what has
+landed; §5 is the stage order. The instrument is gated off by default.
 
 Supersedes the first draft of this document, which concluded from `--jit-bench`
 that the compiled tier was "node-class and not the problem". That was wrong for
@@ -74,6 +76,13 @@ shapes the engine already handles.
   (`emit_dense_array_append_inline`); typed-array store and `length`
   (`emit_typed_array_store_inline`/`_length_inline`); and **leaf** calls
   (`emit_call`'s probe + `emit_leaf_call_tail`).
+- **Where that subset actually ends (measured, §3).** Three boundaries this
+  bullet did not know about, one of them now closed: a named read inlines
+  **only for an own data property** — any prototype-chain link, which is every
+  method read, takes `call_slow(GetMemberName)` (§3 G10); the **leaf-call inline
+  path is reached but never fires** for ordinary user functions (§3 G2); and the
+  integer operators did not inline at all until Stage 2 closed that (§3 G9 —
+  `&`, `|`, `^`, `<<`, `>>`, `>>>` now lower to a guarded `i32` op).
 - **Everything else is a helper call**, and three of them are structural rather
   than a long tail:
 
@@ -100,31 +109,85 @@ shapes the engine already handles.
 
 ## 3. The gap inventory (the work list)
 
-Ordered by how much real code should touch them, each a concrete emitter
-change with its own measurement:
+**Measured first (Stage 1, 2026-09-28): helper invocations over the 77-workload
+corpus, one process per row** so a row's counters belong to it, summed:
 
-- **G1 — computed-key access has no inline path.** `a[i]`/`s[i]`/`o[k]` reads
-  are a helper round-trip each; the write side already has two inline fast
-  paths. This is the largest single surface, and it subsumes the earlier
-  typed-array `element_read` finding (~90 ns/element through the helper vs
-  ~13-23 ns for a computed read that hits the cell machinery).
-- **G2 — only leaf calls inline.** Every ordinary call in compiled code pays a
-  `call_slow` round-trip; `--jit-bench`'s `non-leaf call` (1.8×) against
-  `function calls` (7.7×) is that gap in one pair.
-- **G3 — literals are helper sequences.** An array of *n* primitives costs
-  *n*+2 helper calls; an object, one per property. Literals are ubiquitous in
-  real code.
-- **G4 — iteration is all helpers**, so every `for-of` step is a round-trip.
-- **G5 — string building** (`ConcatStr`) is a helper outside the builder path.
-- **G6 — cell capacity.** 16-entry member and leaf cells collide at realistic
-  site counts; the fix is capacity (and/or a memo that does not degrade to the
-  helper) rather than a new mechanism.
-- **G7 — the register path is one shape.** `RunRegBody`/`LeafOp` is the only
-  generalized "compiled execution"; widening what lowers to it is the
-  structural version of G1-G5.
-- **G8 — no feedback.** Any of G1-G6 done as a bespoke fast path repeats the
-  existing pattern; doing them with a per-site feedback record is what makes
-  the coverage systematic (§5).
+| helper | invocations | rows | surface | first action |
+|---|---|---|---|---|
+| `BinarySlow` | 255.8M | 50 | integer operators (bitwise/shift); `+`/`-`/`*` inline | **G9 — landed (Stage 2)** |
+| `CallSlow` | 102.2M | 50 | every call not inlined by the leaf path | G2 |
+| `SwitchTest` | 91.9M | 1 | one per `case`, per execution | **new (G11)** |
+| `GetMemberName` | 90.4M | 54 | prototype-chain reads (every method read) | **new (G10)** |
+| `GetMemberComputed` | 73.4M | 12 | computed read `a[i]`; the write side has two inline paths | G1 |
+| `SetMemberSlot` | 70.0M | 3 | member writes off the in-place path (`this.x += n`, churn) | G1-adjacent |
+| `LeafCallProbe` | 33.7M | 50 | the probe re-run on epoch churn — plus the dead-path tax of G2 | G2 |
+| `LoadContext` | 30.3M | 4 | closure/context slot loads | — |
+| `ForOfNextBindLocal` | 21.0M | 1 | `for-of` step | G4 |
+| `SwitchDisc` | 21.0M | 1 | `switch` selector | G11 |
+| `BreakControl` | 21.0M | 1 | `break` inside a `switch` | G11 |
+| `ObjectFast` | 16.8M | 16 | object literal | G3 |
+| `TypedArrayLength` | 15.7M | 16 | typed-array `length` | — |
+| `ForInNext` | 6.3M | 1 | `for-in` step | G4 |
+| `ConcatStrings` | 4.5M | 3 | string building | G5 |
+
+Caveat, stated because it moves the ranking: the 36 `opcost` rows are generated
+with `k = i & MASK` and `s = (s + x) | 0` idioms, so they over-weight
+`BinarySlow`. The bitwise gap is real (verified with dedicated shapes, below),
+but its corpus share is inflated; the non-opcost families put calls, method
+reads and computed reads at the top instead.
+
+The list, in the measured order:
+
+- **G9 — integer operators (landed, Stage 2).** They used to lower to
+  `call_slow(BinarySlow)`, whose helper re-does the full `apply_binary`
+  (ToNumeric + `ToInt32`), while `+`/`-`/`*` on numbers inlined. Isolated
+  1M-iteration shapes before: `s = s + i * 2` 0.81 ms with **0** helper calls,
+  `s = s + (i << 1)` 12.0 ms with 7.0M `BinarySlow`, `k = i & MASK; s = (s + k)
+  | 0` 23.5 ms with 14.0M. Now the six operators inline as a guarded `i32` op
+  (`emit_int_binary`): both operands truncate to `i32` through the f64→i64
+  conversion (`cvttsd2si`; the `ireduce` is `ToInt32`'s modulo-2^32 step, and
+  cranelift's documented shift masking is the spec's `& 0x1F`), behind a range
+  guard (`|x| < 2^63`) that falls back to `BinarySlow` where saturation would
+  disagree with the spec's wrap-around (`NaN`, the infinities, `1e300`, `2^63`).
+  After: **`<<` 12.0 → 2.74 ms (−77%), `&`/`|0` 23.5 → 6.87 ms (−71%)**, both at
+  0 `BinarySlow` on in-range operands; the corpus's `mean-jitGap` 77.5 → 68.4 and
+  `--jit-bench`'s `typed-array write` 0.46 → 0.21 (the row whose body is
+  `ta[k] = k & 255`).
+- **G10 — named reads inline only for an own data property.** The read cell
+  covers `o.x` when `x` is an own data property; any prototype-chain link (a
+  method read, an inherited property, an accessor) falls back to
+  `call_slow(GetMemberName)`. 1M-iteration reads: own data 2.5 ms, 1
+  `GetMemberName`; inherited data 18.3 ms, 7.0M; `a.push` 18.6 ms, 7.0M — **~7×**.
+  Every method call therefore pays a helper on its callee read, which is why
+  `GetMemberName ≈ CallSlow` in the builtin-bound rows.
+- **G11 — `switch` is a helper chain.** `SwitchDisc` once, then one
+  `call_slow(SwitchTest)` per `case` with a dispatch per test, plus
+  `BreakControl` per `break` (`compiler.rs:6297`, `:6308`, `:5946`).
+  `switch_dispatch.js` measures 91.9M `SwitchTest` + 21M `SwitchDisc` + 21M
+  `BreakControl` over 3M iterations — ~30 helper calls per iteration for a shape
+  the interpreter handles as a jump table.
+- **G2 — the inline leaf-call path is effectively dead.** In every call-shaped
+  row measured, 100% of calls take `CallSlow`: `direct_leaf.js` 2,000,000
+  `CallSlow` / 0 inline; `method_call.js` 14,000,000 / 0. The probe rejects with
+  `no-compiled-code` because the callee is a straight-line body and Cut 69
+  defers compiling it until `JIT_COMPILE_THRESHOLD` (16) consults — while
+  `emit_call`'s probe path caches a rejection as a *stable zero* verdict (Cut
+  68's restamp reuses it across epoch bumps), so the compiled loop never
+  re-consults and the counter the threshold waits on cannot advance. The other
+  measured rejections are `leaf_lookup-miss` (the callee was never certified
+  `leaf_inline`) and `this-slot` (a sloppy function's `this` slot, which the
+  inline frame cannot bind). So the leaf machinery is reached and never fires
+  for ordinary user functions; §2's "leaf calls inline" bullet describes code
+  that is unreachable in practice.
+- **G1 — computed-key access has no inline path**, as before, now ranked below
+  calls and the read/write gaps: 73.4M on 12 rows, `index_loop.js` 21.0M.
+- **G3/G4/G5 — literals, iteration, string building**, as before: a helper
+  sequence per element/step/property, measured in the table above.
+- **G6/G7/G8 — cell capacity, the register path's one shape, no feedback.**
+  G8 is now load-bearing for a sharper reason: G9, G10 and G11 are each a
+  *missing inline path*, and doing them one at a time is how the current
+  asymmetry (an inline path for `+` but not `<<`, for an own read but not an
+  inherited one) came to exist.
 
 ## 4. How this gets measured (and what has been ruled out)
 
@@ -133,14 +196,22 @@ change with its own measurement:
   measurement this plan needs is a profile of **real** JS — where the time goes
   between inline paths and helper calls — plus wall time on workloads that are
   not what the JIT was tuned on.
-- **The helper-share instrument does not exist and is Stage 1 of the work.**
-  `JIT_DUMP_CLIF` prints bail/skip lines, not IR, so nothing today reports how
-  much of a compiled body's execution is `call_slow`. The cheap instrument is a
-  temporary per-body counter of emitted calls in `crates/jit/src/compiler.rs`
-  plus a per-helper invocation tally in `crates/runtime/src/jit.rs` — the
-  project's established temporary-instrument method (the census and the
-  `SLAG_NO_*` probes are the precedent), removed again once it has answered.
-  Without it, G1-G7 are ordered by reasoning rather than by data.
+- **The helper-share instrument exists (Stage 1, done).** It is a compile-time
+  emission in `crates/jit/src/compiler.rs::emit_raw_call` — the single funnel
+  every helper call passes through — that adds a four-instruction inline
+  increment of the helper's counter in `runtime::jit::JIT_HELPER_COUNTS`,
+  indexed by `Helper as usize`. It is emitted **only when `JIT_HELPER_STATS` is
+  set while the body is compiled**, so a default build is the same machine code
+  as before and the counters cannot contaminate a measurement that is not
+  asking for them; `crates/jit` asserts at compile time that `Helper::COUNT`
+  fits `runtime::jit::HELPER_COUNT`. The runner hooks the CLI's `run_corpus`,
+  which runs one mode over one directory in one process — point `--corpus` at a
+  one-workload directory and the closing dump is that row's histogram
+  (`helper <index> <count>`, resolved through `crates/jit/src/helpers.rs`'s
+  enum order). `JIT_DUMP_CLIF=1` prints the full CLIF **and** the disassembly
+  (the earlier note here that it prints only bail lines was wrong); the two
+  together separate which helpers a body calls statically from which it calls
+  in the hot loop. The stage-1 output is §3.
 - **`--jit-bench` and the corpus stay, as regression detectors**, not as
   quality evidence: `--jit-bench` must not regress, and the corpus parity run
   must stay at 0 mismatches.
@@ -157,24 +228,30 @@ change with its own measurement:
 
 ## 5. Stages
 
-- **Stage 1 — the instrument.** The helper-call counter (§4), run over
-  real-world JS, producing the table this plan currently lacks: helper
-  invocations per body, ranked by total time. Gate: the table exists and the
-  gap order in §3 is confirmed or rewritten by it.
-- **Stage 2 — G1, computed-key access.** An inline path for the computed read
-  mirroring the existing computed store (dense/typed-array fast paths first,
-  helper fallback), with a per-site shape guard. Gate: the instrument shows
-  the helper share for computed reads collapse; `--jit-bench` and the corpus
-  do not regress; the whole corpus and both corpora sweeps stay at baseline.
-- **Stage 3 — G2, calls beyond leaves.** Extend `emit_call`'s inline to
-  non-leaf certified callees (guard the callee, set up the frame, enter its
-  compiled code, fall back to `call_slow` on any miss) — the pattern the leaf
-  path already uses at a site. Gate: the instrument's call share drops;
-  `non-leaf call` moves; no row regresses.
-- **Stage 4 — G3/G4/G5, literals, iteration, string building.** Each is a
+- **Stage 1 — the instrument.** **Done** (§4). Output: the measured table in
+  §3, which rewrote the gap order.
+- **Stage 2 — G9, the integer operators.** **Done** — §3 G9 has the lowering
+  and the before/after numbers. Gate met: the isolated shapes (`<<`, `&`/`|0`)
+  drop to zero `BinarySlow`, `--jit-bench` does not regress (and `typed-array
+  write` improves 0.46 → 0.21), the corpus parity run stays at 0 mismatches, and
+  both test262 areas reproduce baseline. Left for a later pass: the guard runs
+  per operation, so a compile-time-constant operand (`| 0`, `& 255`) could
+  elide half of it — the corpus says the constant-operand cases are already
+  fast enough to not pay for the plumbing yet.
+- **Stage 3 — G2, the leaf-call path.** First make a rejection verdict not
+  suppress the tier-up consult (a zero cached entry must be re-probed when the
+  epoch moved, so Cut 69's threshold can be reached), then the remaining
+  eligibility gates (`leaf_lookup-miss` certification, the sloppy `this` slot).
+  Gate: `direct_leaf`/`method_call` show inline calls instead of 100%
+  `CallSlow`; `function calls` and `non-leaf call` move; `LeafCallProbe`
+  traffic falls.
+- **Stage 4 — G10, G11, G1, member writes.** Prototype-chain reads, the
+  `switch` chain, computed reads and the member-write path — the remaining
+  per-op helper surfaces, each with its own measurement.
+- **Stage 5 — G3/G4/G5, literals, iteration, string building.** Each is a
   helper-per-op sequence today; each gets an inline path or a fused step.
-- **Stage 5 — G6/G8, cells and feedback.** Capacity for the colliding cells,
-  and a per-site feedback record so the fast paths above are a mechanism
+- **Stage 6 — G6/G8, cells and feedback.** Capacity for the colliding cells,
+  and a per-site feedback record so the inline paths above become a mechanism
   rather than a set of bespoke arms.
 
 Each stage: the instrument re-run, the engine gates (fmt, clippy
@@ -227,3 +304,48 @@ One line per landed stage, newest last.
   iteration and string building. §3 is the resulting gap list; the earlier
   draft's "--jit-bench says the JIT is fine" conclusion is withdrawn as
   measuring only the inlined shapes. No code changed.
+- **Stage 1, the instrument (2026-09-28).** The helper-call counter landed
+  (§4): a gated four-instruction increment in `emit_raw_call` (the one funnel
+  every helper call passes through), the per-helper counter array in
+  `runtime::jit`, a compile-time `Helper::COUNT <= HELPER_COUNT` check, and a
+  dump wired into the CLI's `run_corpus`. Run over the 77-workload corpus, one
+  process per row; the result is §3's table, and it rewrote the work order —
+  G9/G10/G11 are new, G1 fell below calls and the read/write gaps, and G2
+  became "the leaf path is reached but never fires" rather than "only leaves
+  inline". Certifications on the changed tree: `cargo fmt --all -- --check`
+  clean; `cargo clippy --workspace --all-targets -- -D warnings` clean;
+  `cargo test --workspace` green (crux 259, jit 209, runtime 983, test262
+  3324, v8 372); both `--no-default-features` checks; test262 `all`
+  48,464/0/0/0 of 48,622 and `intl402` 3,205/0/0/0 of 3,357 at 15s/15s; the
+  eight wasm `run --strict` suites 64,594 checks 0 fail/0 pending and `jsapi`
+  1,001/0; corpus parity 77 rows/0 mismatches; `--jit-bench` unregressed
+  (`arithmetic` 0.08, `bare loop` 0.09, `function calls` 0.13, `non-leaf call`
+  0.59 — all in the documented band). The instrument emits no instructions when
+  `JIT_HELPER_STATS` is unset, which is why the sweeps reproduce the prior
+  numbers exactly.
+- **Stage 2, G9 the integer operators (2026-09-28).** The six integer operators
+  (`&`, `|`, `^`, `<<`, `>>`, `>>>`) now inline for two Numbers as a guarded
+  `i32` op — both operands truncate through the f64→i64 conversion with an
+  `ireduce` standing in for `ToInt32`'s modulo-2^32, behind a `|x| < 2^63` guard
+  that keeps `BinarySlow` for `NaN`, the infinities, `1e300` and `2^63` (where
+  the saturating conversion would disagree with the spec's wrap-around). The
+  shift count needs no `& 0x1F`: cranelift documents masking a shift amount to
+  the operand size. Measured on isolated 1M-iteration shapes: `s + (i << 1)`
+  12.0 → 2.74 ms (−77%) and `k = i & MASK; s = (s + k) | 0` 23.5 → 6.87 ms
+  (−71%), both to **0 `BinarySlow`** on in-range operands (`s + i * 2` was
+  already 0); the corpus `mean-jitGap` 77.5 → 68.4 over 77 rows/0 mismatches,
+  and `--jit-bench`'s `typed-array write` 0.46 → 0.21 with no row regressing
+  (four runs; `apply leaf call` read 0.45 once and 0.35-0.36 three times, which
+  is that row's own spread). Correctness: a new
+  `installed_jit_integer_operators_match_the_interpreter` test compares the
+  compiled path against the interpreter over 27 edge-case operands (a fraction,
+  `2^63`, `1e300`, `NaN`, the infinities, `'8'`, `true`, `null`, `undefined`,
+  BigInts, `>>>`'s BigInt TypeError) with variable shift counts; removing the
+  range guard makes it fail. A scratch differential over six ops × 34 edge
+  values is byte-identical between the compiled and interpreted modes. Gates:
+  fmt clean, clippy workspace `-D warnings` clean, `cargo test --workspace`
+  5,532 passed / 0 failed, runtime `--no-default-features` 952/0, v8 `simdutf`
+  380/0, `cli --no-default-features --features jit` green, test262 `all`
+  48,464/0/0/0 of 48,622 and `intl402` 3,205/0/0/0 of 3,357 at 15s/15s. No wasm
+  sweep is owed, and that is checked rather than argued: `cargo tree -p
+  wasmtest` does not contain `crates/jit`.

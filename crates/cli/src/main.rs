@@ -796,6 +796,13 @@ fn run_corpus(dir: &std::path::Path, jit: bool) -> Result<(), u8> {
             None => println!("bench\t{mode}\t{name}\t{ms}\tNA"),
         }
     }
+    // Temporary helper instrument: one process runs exactly one mode over one
+    // directory, so a one-workload directory attributes the histogram to that
+    // row. Compiled bodies only run in `jit` mode; inert unless
+    // `JIT_HELPER_STATS` was set when they were compiled.
+    if jit {
+        jit::dump_helper_counts();
+    }
     Ok(())
 }
 

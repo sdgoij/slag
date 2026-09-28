@@ -469,6 +469,22 @@ fn runtime_helpers() -> JitHelpers {
     }
 }
 
+/// Print the temporary helper-call instrument's histogram (`JIT_HELPER_STATS`),
+/// one line per helper that ran: `helper <index> <count>`. The index is
+/// `Helper as usize`; `crates/jit/src/helpers.rs` defines the order. A no-op
+/// when the instrument was not enabled at compile time (the counters stay zero).
+pub fn dump_helper_counts() {
+    if std::env::var("JIT_HELPER_STATS").is_err() {
+        return;
+    }
+    let counts = runtime::jit::JIT_HELPER_COUNTS.snapshot();
+    for (index, count) in counts.iter().enumerate() {
+        if *count > 0 {
+            println!("helper\t{index}\t{count}");
+        }
+    }
+}
+
 /// Install a JIT cache into `agent`: the runtime's leaf-call path consults
 /// it (via `Agent::jit_hook`) before interpreting a certified body. The
 /// cache is owned by the hook and freed when the agent drops.
@@ -2347,6 +2363,34 @@ mod tests {
         assert_eq!(
             value, interp,
             "the compiled body must match the interpreter"
+        );
+        assert!(compiled >= 1, "{compiled} bodies");
+    }
+
+    #[test]
+    fn installed_jit_integer_operators_match_the_interpreter() {
+        // The six integer operators inline for two Numbers inside the
+        // truncating conversion's range, guarded so anything outside it (and
+        // any non-Number) falls back to `binary_slow`. Covered: the inline path
+        // over a spread of integers and a fraction, the guard's fallbacks
+        // (`2^63`, `1e300`, `NaN`, the infinities), the coercing operands
+        // (`'8'`, `'x'`, `true`, `null`, `undefined`), `>>>`'s `ToUint32` over
+        // negatives, BigInt operands (the guard sends them to the helper) and
+        // `>>>`'s BigInt TypeError.
+        let source = "var V = [0, -0, 1, -1, 7, 255, 1023, 2147483647, -2147483648, 4294967296, -4294967296, 9007199254740991, 1e21, 9223372036854775808, 1e300, NaN, Infinity, -Infinity, 3.5, -3.5, 0.5, -0.5, '8', 'x', true, null, undefined];\n\
+                      function ops(n) { var a = 0, b = 0, c = 0, d = 0, e = 0, f = 0; for (var k = 0; k < n; k++) { for (var i = 0; i < V.length; i++) { var x = V[i]; var sh = V[(i + 3) % V.length]; a = a + (x & 255); b = b + (x | 7); c = c ^ x; d = d + (x << sh); e = e + (x >> sh); f = f + (x >>> sh); } } return a + ',' + b + ',' + c + ',' + d + ',' + e + ',' + f; }\n\
+                      function bigs(n) { var s = 0; for (var k = 0; k < n; k++) { s = s + Number(5n & 3n) + Number(5n | 3n) + Number(5n ^ 3n) + Number(5n << 2n) + Number(5n >> 1n); } return s; }\n\
+                      function bigushr(n) { var c = 0; for (var k = 0; k < n; k++) { try { 5n >>> 1n; } catch (e) { c++; } } return c; }\n\
+                      ops(3) + '|' + bigs(2) + '|' + bigushr(3);";
+        let interp = {
+            let mut agent = runtime::Agent::new();
+            agent.initialize_host_defined_realm().expect("realm");
+            agent.run_script(source).expect("interp runs")
+        };
+        let (value, compiled) = with_jit_agent(|agent| agent.run_script(source).expect("jit runs"));
+        assert_eq!(
+            value, interp,
+            "the integer-operator lowering must match the interpreter"
         );
         assert!(compiled >= 1, "{compiled} bodies");
     }

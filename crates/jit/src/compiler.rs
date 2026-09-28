@@ -43,13 +43,14 @@ use runtime::ir::{
 use runtime::jit::{
     AGENT_REALM_COUNT_OFFSET, BUILDER_BUF_OFFSET, BUILDER_CAP_OFFSET, BUILDER_ENABLED_OFFSET,
     BUILDER_LEN_OFFSET, BUILDER_OWNER_OFFSET, BUILDER_RHS_BITS_OFFSET, BUILDER_RHS_OK_OFFSET,
-    BUILDER_RHS_UNIT_OFFSET, GlobalValueCell, JIT_APPLY_MAX_ARGS, JIT_GC_PROBE_INTERVAL,
-    JitCallContext, LEAF_CALL_CACHE_ENTRIES, LeafCallSiteCache, LeafInlineInfo,
-    TYPED_ARRAY_LENGTH_SENTINEL, VM_ASYNC_FOR_OF_STACK_LEN_OFFSET, VM_BUILDER_OFFSET,
-    VM_COMPLETION_IS_EMPTY_OFFSET, VM_COMPLETION_OFFSET, VM_DESTRUCTURE_STACK_LEN_OFFSET,
-    VM_ENV_STACK_LEN_OFFSET, VM_FOR_IN_STACK_LEN_OFFSET, VM_FOR_OF_BOUNDARIES_LEN_OFFSET,
-    VM_FOR_OF_STACK_LEN_OFFSET, VM_IP_OFFSET, VM_LEXICAL_ENV_OFFSET, VM_PENDING_LEN_OFFSET,
-    VM_TRY_STACK_CAP_OFFSET, VM_TRY_STACK_LEN_OFFSET, VM_TRY_STACK_PTR_OFFSET,
+    BUILDER_RHS_UNIT_OFFSET, GlobalValueCell, HELPER_COUNT, JIT_APPLY_MAX_ARGS,
+    JIT_GC_PROBE_INTERVAL, JIT_HELPER_COUNTS, JitCallContext, LEAF_CALL_CACHE_ENTRIES,
+    LeafCallSiteCache, LeafInlineInfo, TYPED_ARRAY_LENGTH_SENTINEL,
+    VM_ASYNC_FOR_OF_STACK_LEN_OFFSET, VM_BUILDER_OFFSET, VM_COMPLETION_IS_EMPTY_OFFSET,
+    VM_COMPLETION_OFFSET, VM_DESTRUCTURE_STACK_LEN_OFFSET, VM_ENV_STACK_LEN_OFFSET,
+    VM_FOR_IN_STACK_LEN_OFFSET, VM_FOR_OF_BOUNDARIES_LEN_OFFSET, VM_FOR_OF_STACK_LEN_OFFSET,
+    VM_IP_OFFSET, VM_LEXICAL_ENV_OFFSET, VM_PENDING_LEN_OFFSET, VM_TRY_STACK_CAP_OFFSET,
+    VM_TRY_STACK_LEN_OFFSET, VM_TRY_STACK_PTR_OFFSET,
 };
 use syntax::ast::{AssignOp, BinaryOp, UnaryOp, UpdateOp};
 use target_lexicon::PointerWidth;
@@ -454,10 +455,26 @@ enum ArithOp {
     Div,
 }
 
+/// The integer operators (spec 13.9 shifts, 13.11 bitwise) the JIT inlines for
+/// two Numbers. Both operands go through `ToInt32`/`ToUint32`, which keep only
+/// the low 32 bits of the truncated value — exactly what an `ireduce` of the
+/// truncating f64→i64 conversion yields, with the shift count's `& 0x1F`
+/// reduction already implied by cranelift's shift semantics.
+#[derive(Clone, Copy)]
+enum IntOp {
+    BitAnd,
+    BitXor,
+    BitOr,
+    LeftShift,
+    RightShift,
+    UnsignedRightShift,
+}
+
 #[derive(Clone, Copy)]
 enum InlineBin {
     Arith(ArithOp),
     Cmp(FloatCC),
+    Int(IntOp),
 }
 
 /// A binary operand (slice C): `Bits` is a ready `Value`, `Num` is an f64 whose
@@ -479,6 +496,12 @@ fn inline_binary(op: BinaryOp) -> Option<InlineBin> {
         Sub => Some(InlineBin::Arith(ArithOp::Sub)),
         Mul => Some(InlineBin::Arith(ArithOp::Mul)),
         Div => Some(InlineBin::Arith(ArithOp::Div)),
+        BitAnd => Some(InlineBin::Int(IntOp::BitAnd)),
+        BitXor => Some(InlineBin::Int(IntOp::BitXor)),
+        BitOr => Some(InlineBin::Int(IntOp::BitOr)),
+        LeftShift => Some(InlineBin::Int(IntOp::LeftShift)),
+        RightShift => Some(InlineBin::Int(IntOp::RightShift)),
+        UnsignedRightShift => Some(InlineBin::Int(IntOp::UnsignedRightShift)),
         LessThan => Some(InlineBin::Cmp(FloatCC::LessThan)),
         GreaterThan => Some(InlineBin::Cmp(FloatCC::GreaterThan)),
         LessEqual => Some(InlineBin::Cmp(FloatCC::LessThanOrEqual)),
@@ -658,6 +681,10 @@ struct NumSlot {
 struct Lowerer<'a> {
     builder: FunctionBuilder<'a>,
     helpers: &'a JitHelpers,
+    /// Temporary instrumentation (`JIT_HELPER_STATS`): emit an inline increment
+    /// of the per-helper counter at every helper call. Off by default because
+    /// the increment is four instructions per call site.
+    helper_stats: bool,
     scope: Option<&'a ScopeInfo>,
     /// One block per step index, plus the past-the-end exit block.
     blocks: Vec<Option<Block>>,
@@ -958,6 +985,7 @@ impl<'a> Lowerer<'a> {
         Lowerer {
             builder,
             helpers,
+            helper_stats: std::env::var("JIT_HELPER_STATS").is_ok(),
             scope: body.scope.as_ref(),
             blocks: Vec::new(),
             back_targets: HashSet::new(),
@@ -3289,6 +3317,25 @@ impl<'a> Lowerer<'a> {
             .helpers
             .get(helper)
             .ok_or(Unsupported::Helper(helper.name()))?;
+        // Temporary instrumentation: one inline increment per helper call,
+        // indexed by the helper's discriminant into `JIT_HELPER_COUNTS`. Four
+        // instructions, emitted only when `JIT_HELPER_STATS` is set.
+        debug_assert!((helper as usize) < HELPER_COUNT);
+        if self.helper_stats {
+            let base = self
+                .builder
+                .ins()
+                .iconst(types::I64, JIT_HELPER_COUNTS.base() as i64);
+            let off = Offset32::new(((helper as usize) * 8) as i32);
+            let count = self
+                .builder
+                .ins()
+                .load(types::I64, MemFlagsData::new(), base, off);
+            let next = self.builder.ins().iadd_imm_u(count, 1);
+            self.builder
+                .ins()
+                .store(MemFlagsData::new(), next, base, off);
+        }
         let callee = self.builder.ins().iconst(types::I64, f as i64);
         // The vm pointer is the implicit first argument of every helper.
         let mut all_args = Vec::with_capacity(args.len() + 1);
@@ -7185,7 +7232,11 @@ impl<'a> Lowerer<'a> {
     /// dropped, and when BOTH operands are known the fast result is returned
     /// with no slow block and no branch — the `i * 2` of a numeric reduction
     /// lowers to a bare `fmul`. Sound because a canonical Number bit-casts to
-    /// its f64 and can never take the slow path.
+    /// its f64 and can never take the slow path. The integer operators
+    /// ([`IntOp`]) are the exception: their fast result is the spec's answer
+    /// only when both *values* are in the truncating-conversion's range, which
+    /// is a run-time fact rather than a tag, so they always keep the slow block
+    /// and branch on a range guard.
     fn emit_binary_known(
         &mut self,
         op: BinaryOp,
@@ -7206,7 +7257,10 @@ impl<'a> Lowerer<'a> {
             .builder
             .ins()
             .bitcast(types::F64, MemFlagsData::new(), rhs);
-        let fast = match inline {
+        // `int_guard` is the extra run-time condition the integer shapes need
+        // (both operands inside the truncating conversion's range); `None` for
+        // the float shapes, whose fast result is exact for any two Numbers.
+        let (fast, int_guard) = match inline {
             InlineBin::Arith(arith) => {
                 let res = match arith {
                     ArithOp::Add => self.builder.ins().fadd(lhs_num, rhs_num),
@@ -7218,16 +7272,20 @@ impl<'a> Lowerer<'a> {
                     .builder
                     .ins()
                     .bitcast(types::I64, MemFlagsData::new(), res);
-                self.canon(bits)
+                (self.canon(bits), None)
             }
             InlineBin::Cmp(cc) => {
                 let c = self.builder.ins().fcmp(cc, lhs_num, rhs_num);
                 let t = self.builder.ins().iconst(types::I64, self.true_bits);
                 let f = self.builder.ins().iconst(types::I64, self.false_bits);
-                self.builder.ins().select(c, t, f)
+                (self.builder.ins().select(c, t, f), None)
+            }
+            InlineBin::Int(int_op) => {
+                let (bits, guard) = self.emit_int_binary(int_op, lhs_num, rhs_num);
+                (bits, Some(guard))
             }
         };
-        if lhs_known && rhs_known {
+        if lhs_known && rhs_known && int_guard.is_none() {
             return Ok(fast);
         }
         let lhs_dbl = if lhs_known {
@@ -7241,6 +7299,10 @@ impl<'a> Lowerer<'a> {
             self.is_double(rhs)
         };
         let both = self.builder.ins().band(lhs_dbl, rhs_dbl);
+        let both = match int_guard {
+            Some(guard) => self.builder.ins().band(both, guard),
+            None => both,
+        };
         let res_var = self.builder.declare_var(types::I64);
         self.builder.def_var(res_var, fast);
         let merge = self.builder.create_block();
@@ -7365,6 +7427,67 @@ impl<'a> Lowerer<'a> {
         }
     }
 
+    /// The inlined integer operators ([`IntOp`]) for two Numbers. Each operand
+    /// is truncated toward zero by the f64→i64 conversion (`cvttsd2si`), and the
+    /// `ireduce` to `i32` is exactly `ToInt32`'s modulo-2^32 step; the shift
+    /// count takes the spec's `& 0x1F` reduction for free, since cranelift
+    /// masks a shift amount to the operand size.
+    ///
+    /// Returns the result's `Value` bits plus the guard that BOTH operands are
+    /// inside the conversion's range. The guard is required, not an
+    /// optimisation: outside it (`|x| >= 2^63`, and so `NaN` and the
+    /// infinities) the conversion saturates and would compute a different low
+    /// 32 bits than the spec's wrap-around, so the caller must fall back to
+    /// `BinarySlow`, which runs the interpreter's exact `ToInt32`.
+    fn emit_int_binary(
+        &mut self,
+        op: IntOp,
+        lhs_num: ClifValue,
+        rhs_num: ClifValue,
+    ) -> (ClifValue, ClifValue) {
+        let (l_wide, l_range) = self.trunc_i32(lhs_num);
+        let (r_wide, r_range) = self.trunc_i32(rhs_num);
+        let l = self.builder.ins().ireduce(types::I32, l_wide);
+        let r = self.builder.ins().ireduce(types::I32, r_wide);
+        // The shift count needs no `& 0x1F`: cranelift documents `ishl`/`sshr`/
+        // `ushr` as masking the amount to the operand size, which is the
+        // spec's own reduction.
+        let (res, unsigned) = match op {
+            IntOp::BitAnd => (self.builder.ins().band(l, r), false),
+            IntOp::BitXor => (self.builder.ins().bxor(l, r), false),
+            IntOp::BitOr => (self.builder.ins().bor(l, r), false),
+            IntOp::LeftShift => (self.builder.ins().ishl(l, r), false),
+            IntOp::RightShift => (self.builder.ins().sshr(l, r), false),
+            IntOp::UnsignedRightShift => (self.builder.ins().ushr(l, r), true),
+        };
+        // `>>>` answers a `ToUint32` (`0..2^32-1`); the others a signed `i32`.
+        let res = if unsigned {
+            let wide = self.builder.ins().uextend(types::I64, res);
+            self.builder.ins().fcvt_from_uint(types::F64, wide)
+        } else {
+            let wide = self.builder.ins().sextend(types::I64, res);
+            self.builder.ins().fcvt_from_sint(types::F64, wide)
+        };
+        let bits = self
+            .builder
+            .ins()
+            .bitcast(types::I64, MemFlagsData::new(), res);
+        let range = self.builder.ins().band(l_range, r_range);
+        (self.canon(bits), range)
+    }
+
+    /// Truncate an f64 toward zero to `i64` and report whether it is inside the
+    /// conversion's range (`|x| < 2^63`). Outside it — and for `NaN`, whose
+    /// compare is false — the saturating conversion's low 32 bits differ from
+    /// `ToInt32`'s wrap-around, so the caller takes the helper instead.
+    fn trunc_i32(&mut self, num: ClifValue) -> (ClifValue, ClifValue) {
+        let magnitude = self.builder.ins().fabs(num);
+        let bound = self.builder.ins().f64const(9223372036854775808.0);
+        let in_range = self.builder.ins().fcmp(FloatCC::LessThan, magnitude, bound);
+        let int = self.builder.ins().fcvt_to_sint_sat(types::I64, num);
+        (int, in_range)
+    }
+
     /// The bare float op for the `InlineBin::Arith` shapes.
     fn emit_arith(
         &mut self,
@@ -7413,12 +7536,10 @@ impl<'a> Lowerer<'a> {
                     let value = self.builder.ins().select(c, t, f);
                     self.set_acc_bits(value);
                 }
-                None => {
+                None | Some(InlineBin::Int(_)) => {
                     let l = self.bin_form_bits(lhs);
                     let r = self.bin_form_bits(rhs);
-                    let op_imm = self.builder.ins().iconst(types::I64, op as i64);
-                    let res =
-                        self.call_slow(self.sig_binary, Helper::BinarySlow, &[op_imm, l, r])?;
+                    let res = self.emit_binary_known(op, l, r, true, true)?;
                     self.set_acc_bits(res);
                 }
             }

@@ -421,6 +421,45 @@ impl crux::heap::Trace for GlobalValueCell {
     }
 }
 
+/// Bounds `Helper as usize` for the temporary helper instrument
+/// (`JIT_HELPER_STATS`); `crates/jit` asserts at compile time that every
+/// `Helper` variant fits, so the array can never be indexed out of bounds in a
+/// release build. `runtime` cannot name the enum (`jit` depends on `runtime`,
+/// not the reverse), hence the literal with headroom.
+pub const HELPER_COUNT: usize = 160;
+
+/// Temporary instrumentation: how many times each slow-path helper entry point
+/// ran, indexed by `Helper as usize` (`crates/jit/src/helpers.rs` defines the
+/// order). Compiled code bumps a slot with an inline load/store, so a host
+/// running several agents on several threads can lose increments — it measures,
+/// it does not synchronize. Off unless `JIT_HELPER_STATS` is set when the body
+/// is compiled.
+pub struct HelperCounts(core::cell::UnsafeCell<[u64; HELPER_COUNT]>);
+
+// SAFETY: the array is only touched by compiled code (which does not run
+// concurrently with the dumper for a one-shot measurement) and by the dumper.
+unsafe impl Sync for HelperCounts {}
+
+impl HelperCounts {
+    const fn new() -> Self {
+        Self(core::cell::UnsafeCell::new([0; HELPER_COUNT]))
+    }
+
+    /// The base address compiled code bakes in as its increment target.
+    pub fn base(&self) -> *mut u64 {
+        self.0.get() as *mut u64
+    }
+
+    /// A copy of the counters, for the dumper.
+    pub fn snapshot(&self) -> [u64; HELPER_COUNT] {
+        // SAFETY: a read of the instrument's own array (see the type's doc).
+        unsafe { *self.0.get() }
+    }
+}
+
+/// The single instrument counter array (see [`HelperCounts`]).
+pub static JIT_HELPER_COUNTS: HelperCounts = HelperCounts::new();
+
 /// The runtime's slow-path helper table (field order mirrors
 /// `jit::JitHelpers`).
 #[repr(C)]

@@ -180,6 +180,10 @@ pub enum Helper {
     ResolveSuperRefComputed,
 }
 
+// The instrument's counter array (`runtime::jit::HELPER_COUNT`) must cover every
+// variant, or a `JIT_HELPER_STATS` build would write past it in release.
+const _: () = assert!(Helper::COUNT <= runtime::jit::HELPER_COUNT);
+
 impl Helper {
     pub fn name(self) -> &'static str {
         match self {
@@ -316,6 +320,10 @@ impl Helper {
             Helper::ResolveSuperRefComputed => "resolve_super_ref_computed",
         }
     }
+
+    /// One past the last variant; bounds the temporary helper instrument's
+    /// counter array (`runtime::jit::HELPER_COUNT`).
+    pub const COUNT: usize = Helper::ResolveSuperRefComputed as usize + 1;
 
     /// Whether calling this helper can re-enter the interpreter (a getter,
     /// setter, `valueOf`/`toString`, or nested call), which is the only way
