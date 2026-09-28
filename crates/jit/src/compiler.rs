@@ -3776,9 +3776,28 @@ impl<'a> Lowerer<'a> {
         self.builder.seal_block(restamp);
         self.builder.seal_block(stale_block);
         self.builder.seal_block(stable_check);
-        // A cache hit: a cached zero entry is a stable rejection (go straight
-        // to `call_slow`); a nonzero entry reuses the verdict in-frame.
+        // A cache hit. G13: an environment-using leaf cannot be called
+        // in-frame (the `body_context`/`lexical_env` swap has to span the
+        // call), so its site takes the env lane, which performs the whole call
+        // from the record. Anything else is the in-frame lane: a cached zero
+        // entry is a stable rejection (straight to `call_slow`); a nonzero one
+        // reuses the verdict.
         self.builder.switch_to_block(hit_block);
+        let uses_env = self.builder.ins().load(
+            types::I32,
+            MemFlagsData::new(),
+            cache,
+            Offset32::new(
+                leaf_inline_offset(std::mem::offset_of!(LeafInlineInfo, uses_env)) as i32,
+            ),
+        );
+        let env_ok = self.builder.ins().icmp_imm_u(IntCC::NotEqual, uses_env, 0);
+        let env_lane = self.builder.create_block();
+        let plain_hit = self.builder.create_block();
+        self.builder
+            .ins()
+            .brif(env_ok, env_lane, &[], plain_hit, &[]);
+        self.builder.switch_to_block(plain_hit);
         let entry_zero = self.builder.ins().icmp_imm_u(IntCC::Equal, cached_entry, 0);
         let fast = self.builder.create_block();
         self.builder.ins().brif(entry_zero, slow, &[], fast, &[]);
@@ -3891,6 +3910,38 @@ impl<'a> Lowerer<'a> {
         let frame_bytes = self.builder.ins().imul_imm_s(frame_size_64, 8);
         let stack_ptr = self.builder.ins().iadd(frame_base, frame_bytes);
         self.emit_leaf_call_tail(filled, frame_base, stack_ptr, pre_call_sp, merge);
+        // The env lane (G13): the record says the leaf reads its environment,
+        // which the machine code cannot call in-frame — the
+        // `body_context`/`lexical_env` swap has to span the call. The frame is
+        // rebuilt first through the same `leaf_call_fill` the in-frame
+        // non-aliased lane uses (one fill and one room check for both lanes),
+        // then `leaf_call_env` performs the whole call and the machine code
+        // only lands the result.
+        self.builder.switch_to_block(env_lane);
+        let site_imm = self.builder.ins().iconst(types::I64, index as i64);
+        let filled = self.emit_raw_call(
+            self.sig_call,
+            Helper::LeafCallFill,
+            &[this, args_ptr, argc, site_imm],
+        )?;
+        let fill_ok = self.builder.ins().icmp_imm_u(IntCC::NotEqual, filled, 0);
+        let env_call = self.builder.create_block();
+        self.builder.ins().brif(fill_ok, env_call, &[], slow, &[]);
+        self.builder.switch_to_block(env_call);
+        let site_imm = self.builder.ins().iconst(types::I64, index as i64);
+        let value = self.emit_raw_call(
+            self.sig_call,
+            Helper::LeafCallEnv,
+            &[callee, args_ptr, argc, site_imm],
+        )?;
+        // The helper returns `u64::MAX` (no `Value` encoding) to fall back.
+        let env_failed = self.builder.ins().icmp_imm_u(IntCC::Equal, value, -1);
+        let env_done = self.builder.create_block();
+        self.builder
+            .ins()
+            .brif(env_failed, slow, &[], env_done, &[]);
+        self.builder.switch_to_block(env_done);
+        self.emit_leaf_result_tail(value, pre_call_sp, merge);
         // The probe path: the full validation + lookups + frame fill (Cut
         // 37); the probe records the cache identity so repeat visits skip it.
         self.builder.switch_to_block(probe_block);
@@ -3963,9 +4014,8 @@ impl<'a> Lowerer<'a> {
     }
 
     /// The in-frame leaf tail shared by the cache-hit and probe paths: call
-    /// `entry` with `(frame_ptr, stack_ptr, ctx)`, check the pending byte (a
-    /// throwing leaf slow path bails the whole body), then land the result
-    /// on the value stack and jump to `merge`.
+    /// `entry` with `(frame_ptr, stack_ptr, ctx)`, then land the result through
+    /// [`Self::emit_leaf_result_tail`].
     fn emit_leaf_call_tail(
         &mut self,
         entry: ClifValue,
@@ -3980,6 +4030,15 @@ impl<'a> Lowerer<'a> {
                 .ins()
                 .call_indirect(self.sig_entry, entry, &[frame_ptr, stack_ptr, ctx]);
         let result = self.builder.func.dfg.inst_results(inst)[0];
+        self.emit_leaf_result_tail(result, pre_call_sp, merge);
+    }
+
+    /// Land a leaf call's result: check the pending byte (a throwing leaf slow
+    /// path bails the whole body), then push `result` on the value stack and
+    /// jump to `merge`. Shared by the in-frame call above and the env lane,
+    /// where the helper performed the call and the result is already in hand.
+    fn emit_leaf_result_tail(&mut self, result: ClifValue, pre_call_sp: ClifValue, merge: Block) {
+        let ctx = self.vm();
         let pending =
             self.builder
                 .ins()

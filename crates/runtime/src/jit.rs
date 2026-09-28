@@ -108,6 +108,11 @@ pub struct LeafInlineInfo {
     /// the mask, which keeps the hit path on the full probe (its verdict is
     /// still valid — only the descriptor is truncated).
     pub fill_ok: u32,
+    /// G13: 1 when the leaf reads its environment (context or per-iteration
+    /// slots), so the compiled hit path cannot call it in-frame — the
+    /// `body_context`/`lexical_env` swap has to span the call. The site takes
+    /// the env lane (`leaf_call_env`) instead.
+    pub uses_env: u32,
 }
 
 impl LeafInlineInfo {
@@ -123,6 +128,7 @@ impl LeafInlineInfo {
             strict: 0,
             tdz_mask: 0,
             fill_ok: 0,
+            uses_env: 0,
         }
     }
 }
@@ -614,6 +620,12 @@ pub struct JitSlowPaths {
     /// the frame no longer fits (the site falls back to `call_slow`).
     pub leaf_call_fill:
         extern "C" fn(ctx: *mut c_void, this: u64, args: *mut u64, argc: u64, site: u64) -> u64,
+    /// G13: run a certified leaf that reads its environment on the caller's
+    /// ctx and buffer (the frame was already built by `leaf_call_fill`),
+    /// swapping `body_context`/`lexical_env` around the compiled entry.
+    /// Returns the result bits, or `u64::MAX` to fall back to `call_slow`.
+    pub leaf_call_env:
+        extern "C" fn(ctx: *mut c_void, callee: u64, args: *mut u64, argc: u64, site: u64) -> u64,
     /// Read a declared top-level `var` off the global object (`name` is an
     /// `AtomId`); returns the value.
     pub get_global: extern "C" fn(ctx: *mut c_void, name: u64) -> u64,
@@ -1099,6 +1111,7 @@ pub static JIT_SLOW_PATHS: JitSlowPaths = JitSlowPaths {
     apply_args_fill,
     leaf_call_probe,
     leaf_call_fill,
+    leaf_call_env,
     get_global,
     set_global,
     set_global_slot,
@@ -1843,6 +1856,7 @@ fn leaf_fill_info(
     strict: bool,
     entry: u64,
     stack_usage: usize,
+    uses_env: bool,
 ) -> LeafInlineInfo {
     let this_slot = scope.this_slot.map_or(NO_THIS_SLOT, |slot| slot as u32);
     let (tdz_mask, fill_ok) = if scope.frame_size > TDZ_MASK_SLOTS {
@@ -1865,6 +1879,7 @@ fn leaf_fill_info(
         strict: u32::from(strict),
         tdz_mask,
         fill_ok,
+        uses_env: u32::from(uses_env),
     }
 }
 
@@ -2043,9 +2058,6 @@ extern "C" fn leaf_call_probe(
     // borrow must end here.
     let strict = entry.strict;
     let ir = entry.ir.clone();
-    if ir.leaf_uses_env {
-        return 0;
-    }
     let Some(scope) = ir.scope.as_ref() else {
         return 0;
     };
@@ -2077,12 +2089,35 @@ extern "C" fn leaf_call_probe(
         return 0;
     }
     let compiled = unsafe { &*info_ptr };
-    let info = leaf_fill_info(scope, strict, compiled.entry as u64, compiled.stack_usage);
+    // G13: a body that reads its environment (context-slot steps, or the
+    // per-iteration reads) is a certified leaf like any other — the
+    // interpreter's own leaf gate (`fast_call_core`) has no env condition, and
+    // `run_jit_leaf` performs the swap. The MACHINE code cannot: the
+    // `body_context`/`lexical_env` swap would have to span the in-frame call,
+    // including its error exit. So the probe records the descriptor with
+    // `uses_env` set and refuses, and the compiled hit path's env lane
+    // (`leaf_call_env`) owns the whole call.
+    let uses_env = ir.leaf_uses_env;
+    let info = leaf_fill_info(
+        scope,
+        strict,
+        compiled.entry as u64,
+        compiled.stack_usage,
+        uses_env,
+    );
     // The frame fill (bind `this`, room check, write slots) is identical to
     // the compiled hit path's (G14) — see `fill_leaf_frame`; a rejection there
     // is the same rejection here. The probe fills from the scope itself, and
     // records the descriptor the hit path fills from, so the two cannot drift.
-    if !fill_leaf_frame(
+    // An env leaf is not filled here: the env lane fills from the record
+    // before it swaps the env in, so a wide frame (no usable mask) must not be
+    // recorded as env-inlineable either.
+    let mut info = info;
+    if uses_env {
+        if info.fill_ok == 0 {
+            info.entry = 0;
+        }
+    } else if !fill_leaf_frame(
         &info,
         &TdzSource::Store(&scope.tdz_store),
         this,
@@ -2094,7 +2129,117 @@ extern "C" fn leaf_call_probe(
         return 0;
     }
     cache_entry.leaf_inline = info;
+    if uses_env {
+        return 0;
+    }
     compiled.entry as u64
+}
+
+/// G13: run a certified leaf that READS ITS ENVIRONMENT on the caller's live
+/// `JitCallContext` and working buffer. The machine code cannot: the
+/// `body_context`/`lexical_env` swap has to span the in-frame call, including
+/// its error exit, and the leaf runs on the caller's ctx, so both must be put
+/// back before the caller resumes. The frame was already rebuilt in the
+/// caller's buffer by `leaf_call_fill` (the compiler's env lane calls it
+/// first), so this only re-derives the callee's environment, swaps it in,
+/// calls the compiled entry and restores — mirroring `run_jit_leaf`'s env
+/// handling and tail, in the same order, so the two cannot diverge. Returns
+/// the result bits, or `u64::MAX` (which no `Value` encoding uses) when the
+/// site must fall back to `call_slow`.
+extern "C" fn leaf_call_env(
+    ctx: *mut c_void,
+    callee: u64,
+    args: *mut u64,
+    argc: u64,
+    site: u64,
+) -> u64 {
+    let ctx = unsafe { ctx_of(ctx) };
+    let agent = unsafe { &mut *ctx.agent };
+    let vm = unsafe { &mut *ctx.vm };
+    let index = (site as usize ^ (site as usize >> 2)) % LEAF_CALL_CACHE_ENTRIES;
+    let cache_entry = &ctx.leaf_call_cache[index];
+    let info = &cache_entry.leaf_inline;
+    // Defense in depth: the machine code validated the record's `site`, the
+    // callee identity and the `uses_env` gate before branching here, and no JS
+    // runs between that gate and this call.
+    if cache_entry.site != site as u32 || info.entry == 0 || info.uses_env == 0 || info.fill_ok == 0
+    {
+        return u64::MAX;
+    }
+    let entry = info.entry;
+    let frame_size = info.frame_size as usize;
+    let arity = info.arity as usize;
+    if agent.jit_depth >= MAX_JIT_DEPTH {
+        return u64::MAX;
+    }
+    let callee = Value::from_bits(callee);
+    let ValueKind::Function(function) = callee.kind() else {
+        return u64::MAX;
+    };
+    let Some(leaf) = agent.leaf_lookup(function.id()) else {
+        return u64::MAX;
+    };
+    // An env leaf always carries its closure environment (`leaf_lookup` sets
+    // it from `leaf_uses_env`); without one the swap would install nothing.
+    let Some(environment) = leaf.environment else {
+        return u64::MAX;
+    };
+    let strict = leaf.strict;
+    let ir = leaf.ir.clone();
+    let Some(scope) = ir.scope.as_ref() else {
+        return u64::MAX;
+    };
+    let _ = strict;
+    let argc = argc as usize;
+    let aliased = frame_size == arity && argc >= frame_size;
+    let frame_base = if aliased {
+        args
+    } else {
+        // SAFETY: the caller's machine code pushed `argc` argument slots at
+        // `args`, and `leaf_call_fill` already checked the frame fits above
+        // them (the room check the in-frame lane also relies on).
+        unsafe { args.add(argc) }
+    };
+    // SAFETY: `args` points at `argc` live argument slots in the caller's
+    // buffer, and `Value` is `#[repr(transparent)]` over `u64`.
+    let args_slice = unsafe { std::slice::from_raw_parts(args as *const Value, argc) };
+    let Ok(body_env) = scope.new_body_context(&environment, args_slice) else {
+        return u64::MAX;
+    };
+    let body_env = body_env.unwrap_or(environment);
+    let caller_body_context = vm.body_context.replace(body_env);
+    let caller_lexical_env = if ir.leaf_needs_env {
+        Some(std::mem::replace(&mut vm.lexical_env, body_env))
+    } else {
+        None
+    };
+    // The frame lives in the caller's rooted working buffer, so a heap value it
+    // holds only the buffer references survives a collection a helper inside
+    // the leaf may trigger.
+    let stack_len = vm.stack.len();
+    let array_index_stack_len = vm.array_index_stack.len();
+    let stack_ptr = unsafe { frame_base.add(frame_size) } as *mut c_void;
+    let ctx_ptr = ctx as *mut JitCallContext as *mut c_void;
+    // SAFETY: `entry` is the leaf's compiled entry (the probe recorded it) with
+    // the `JitEntry` ABI; the frame and working area above `frame_base` were
+    // sized and rooted by the caller's buffer.
+    let entry: JitEntry = unsafe { std::mem::transmute(entry as usize) };
+    agent.jit_depth += 1;
+    let result = unsafe { (entry)(frame_base as *mut c_void, stack_ptr, ctx_ptr) };
+    agent.jit_depth -= 1;
+    // `run_jit_leaf`'s tail, in the same order: drop anything the leaf's
+    // helpers left transient, put the caller's environment back, then let the
+    // machine code's pending check surface a throw (the caller's ctx is the
+    // one this leaf ran on, so `pending` is already its own).
+    vm.stack.truncate(stack_len);
+    vm.array_index_stack.truncate(array_index_stack_len);
+    if let Some(saved_env) = caller_body_context {
+        vm.body_context = Some(saved_env);
+    }
+    if let Some(saved_env) = caller_lexical_env {
+        vm.lexical_env = saved_env;
+    }
+    result
 }
 
 extern "C" fn get_global(ctx: *mut c_void, name: u64) -> u64 {
@@ -5830,7 +5975,7 @@ mod tests {
         scope.arity = 1;
         scope.tdz_store = vec![false, true, false];
         scope.this_slot = Some(2);
-        let info = leaf_fill_info(&scope, false, 0x1234, 7);
+        let info = leaf_fill_info(&scope, false, 0x1234, 7, false);
         assert_eq!(info.entry, 0x1234);
         assert_eq!(info.stack_usage, 7);
         assert_eq!(info.frame_size, 3);
@@ -5839,13 +5984,22 @@ mod tests {
         assert_eq!(info.strict, 0);
         assert_eq!(info.tdz_mask, 1 << 1, "only slot 1 is lexical");
         assert_eq!(info.fill_ok, 1);
+        assert_eq!(info.uses_env, 0);
 
-        assert_eq!(leaf_fill_info(&scope, true, 0, 0).strict, 1);
+        assert_eq!(leaf_fill_info(&scope, true, 0, 0, true).strict, 1);
+        assert_eq!(
+            leaf_fill_info(&scope, false, 0, 0, true).uses_env,
+            1,
+            "an env leaf must be recorded as such"
+        );
         scope.this_slot = None;
-        assert_eq!(leaf_fill_info(&scope, false, 0, 0).this_slot, NO_THIS_SLOT);
+        assert_eq!(
+            leaf_fill_info(&scope, false, 0, 0, false).this_slot,
+            NO_THIS_SLOT
+        );
 
         let wide = scope_info(TDZ_MASK_SLOTS + 1);
-        let info = leaf_fill_info(&wide, false, 0, 0);
+        let info = leaf_fill_info(&wide, false, 0, 0, false);
         assert_eq!(
             info.fill_ok, 0,
             "a frame wider than the mask must fall back"

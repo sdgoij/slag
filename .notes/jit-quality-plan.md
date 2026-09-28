@@ -213,15 +213,52 @@ The list, in the measured order:
   *and* an identifier (`LoadIdent` is leaf-excluded, so such a body was never
   leaf-certified — G13's territory), and a strict body's plain-call
   `return this`, which refuses upstream of the probe.
-- **G13 — `leaf_lookup-miss` (open), and the gate that hides G12's other half.**
-  `closure_capture`, `recursive_fib`, `generator_loop` and `nested_read` are
-  EcmaScript callees that are not `leaf_inline`-certified, so their sites fall
-  back whatever the cache policy above does. This is also why a body that reads
-  `this` *and* an identifier stays on `call_slow`: `LoadIdent` is in
-  `steps_are_leaf`'s exclusion list, so such a body is never certified and the
-  probe never sees it (measured while building G12 — `function sloppy() {
-  return this !== undefined; }` refused with ~1 probe per invocation, i.e. a
-  cached `leaf_lookup` miss rather than a `this`-slot refusal).
+- **G13 — the environment-using leaf (landed, Stage 4).** The earlier text
+  grouped `closure_capture`, `recursive_fib`, `generator_loop` and
+  `nested_read` as "bodies that are not leaf-certified", attributed to a
+  `leaf_lookup` miss. Measuring all four (2M-call harness, release) split them
+  by root cause, and only one is the leaf lane:
+
+  | row | jit | jitless | root cause |
+  |---|---|---|---|
+  | `calls/closure_capture` | 82 ms | 139 ms | an env leaf, but its site is **polymorphic** (64 closures) — see G15 |
+  | `globals/nested_read` | 2.6 ms | 17.6 ms | already the compiled `LoadIdent` cell probe; one `call_slow` per bench |
+  | `calls/recursive_fib` | 310 ms | 474 ms | a re-entrant callee — a leaf contains no call, so this row has no leaf lane |
+  | `control/generator_loop` | 90 ms | 121 ms | generator resume machinery, not the call lane |
+
+  The tractable slice is the ENV leaf. `closure_capture`'s inner body reads
+  captures, which lower to `Step::LoadContextSlot` — leaf-safe (`steps_are_leaf`
+  does not exclude it, and the interpreter's own `fast_call_core` leaf gate has
+  no env condition; only `run_jit_leaf`'s fresh-ctx path and the JIT probe's
+  `ir.leaf_uses_env` refusal did). So a body reading a captured binding was a
+  certified leaf the compiled code could never call — which is the most common
+  inner function there is.
+
+  **The machine code cannot run it in-frame**: the
+  `body_context`/`lexical_env` swap has to span the call including its error
+  exit, and the leaf runs on the CALLER's ctx, so both must be put back before
+  the caller resumes. So the probe records the verdict with `uses_env` set (and
+  still refuses, so the site's first call goes to `call_slow`), and the compiled
+  hit path gained an env lane: `leaf_call_fill` rebuilds the frame (the same
+  helper and room check the in-frame lane uses), then `leaf_call_env`
+  re-derives the callee's environment, swaps it in, calls the compiled entry on
+  the caller's ctx and buffer, and restores — mirroring `run_jit_leaf`'s env
+  handling and tail in the same order. A frame too wide for the record's TDZ
+  mask records `entry = 0` instead, keeping the site on `call_slow` rather than
+  filling from a truncated mask.
+
+  Measured on a MONOMORPHIC env leaf (`function bench(){ var base = 1; function
+  inner(x){ return base + x; } … }`, 2M calls): **92 → 40.5 ms (−56%)**, with
+  `CallSlow` at the site 2,000,000 → **15**, against 88 ms interpreted.
+  `closure_capture` itself cannot show it — its site is polymorphic (G15).
+- **G15 — a polymorphic call site re-probes every visit (open; found by G13's
+  audit).** The per-site record holds ONE callee identity, so a site that sees
+  N callees (`calls/closure_capture`: 64 closures through `fns[i & 63](i)`)
+  fails the identity check on nearly every visit — `LeafCallProbe` 21,900,000
+  and `CallSlow` 23,300,000 for 1,000,000 calls, and the row sits at 82 ms with
+  no leaf lane in sight. A megamorphic site needs N records per site or a
+  shape-checked inline cache with a fallback: the classic answer, and a design
+  of its own.
 - **G14 — a non-aliased frame rebuilt from a cached descriptor (landed,
   Stage 3).** `emit_call`'s cache-hit path inlines in-frame only an *aliased*
   frame (`frame_size == arity`, the argument region IS the frame); anything
@@ -315,15 +352,20 @@ The list, in the measured order:
   8, the non-aliased shape 35.4 → 21.4 ms with `LeafCallProbe` 14,000,000 →
   30, `calls/method_call` → 58.7 ms, `--jit-bench` unregressed, parity at 0
   mismatches, both test262 areas at baseline. What remains of the leaf lane is
-  the residual G14 records (a machine-code fill for the no-`this`/no-lexical
-  case) plus the two refusals G12 and G13 record (a strict plain-call
-  `return this`, and any body that also reads an identifier — G13).
-- **Stage 4 — G10, G11, G1, member writes.** Prototype-chain reads, the
+  the residual G14 records (a machine-code fill) plus the refusals that are
+  not the env lane: a strict plain-call `return this`, and a body that reads an
+  identifier (`LoadIdent` is `steps_are_leaf`-excluded; G13's fix covers
+  captured bindings, which lower to `LoadContextSlot` — see Stage 4).
+- **Stage 4 — G13, the environment-using leaf, and G15.** **G13 done** (§3
+  G13 has the audit table and the numbers); the audit also produced **G15** (a
+  polymorphic call site re-probes per visit), which is the row the plan had
+  grouped under G13. G15 is open.
+- **Stage 5 — G10, G11, G1, member writes.** Prototype-chain reads, the
   `switch` chain, computed reads and the member-write path — the remaining
   per-op helper surfaces, each with its own measurement.
-- **Stage 5 — G3/G4/G5, literals, iteration, string building.** Each is a
+- **Stage 6 — G3/G4/G5, literals, iteration, string building.** Each is a
   helper-per-op sequence today; each gets an inline path or a fused step.
-- **Stage 6 — G6/G8, cells and feedback.** Capacity for the colliding cells,
+- **Stage 7 — G6/G8, cells and feedback.** Capacity for the colliding cells,
   and a per-site feedback record so the inline paths above become a mechanism
   rather than a set of bespoke arms.
 
@@ -553,3 +595,40 @@ One line per landed stage, newest last. This log is the arc's journal —
   (~4 ns/call fixed + ~0.7 ns/slot) — the next lever would be a machine-code
   fill for the no-`this`/no-lexical case, which under this design would buy
   about a nanosecond over the inlined helper.
+- **Stage 4, G13 the environment-using leaf (2026-09-28).** The gap the plan
+  called "`leaf_lookup`-miss" turned out, on measurement, to be four different
+  things — and only one of them the leaf lane. The audit (2M-call harness,
+  release) is the §3 G13 table: `nested_read` is already the compiled
+  `LoadIdent` cell probe at 2.6 ms, `recursive_fib` (310 ms) is a re-entrant
+  callee a leaf can never be, `generator_loop` (90 ms) is resume machinery, and
+  `closure_capture` (82 ms) is an env leaf whose site is *polymorphic* — which
+  is now its own gap, **G15** (`LeafCallProbe` 21,900,000 for 1,000,000 calls).
+  The slice that landed is the env leaf: a body reading a captured binding
+  lowers the read to `Step::LoadContextSlot`, which `steps_are_leaf` does not
+  exclude and the interpreter's own leaf gate has no condition against — so it
+  was a certified leaf the compiled code could never call. The machine code
+  cannot call it in-frame (the `body_context`/`lexical_env` swap must span the
+  call and be undone before the caller resumes), so the probe now records
+  `uses_env` (and still refuses, leaving the first call on `call_slow`) and the
+  hit path gained an env lane: `leaf_call_fill` for the frame and room check,
+  then a new `leaf_call_env` helper that re-derives the callee's environment,
+  swaps it in, calls the compiled entry on the CALLER's ctx and buffer, and
+  restores — mirroring `run_jit_leaf`'s env handling and tail in the same order.
+  A frame wider than the record's TDZ mask records `entry = 0` so the site
+  stays on `call_slow` rather than filling from a truncated mask. Measured on a
+  monomorphic env leaf (`var base = 1; function inner(x){ return base + x; }` at
+  2M calls): **92 → 40.5 ms (−56%)**, `CallSlow` 2,000,000 → **15**, against
+  88 ms interpreted. Correctness: the corpus row amounts match `--jitless` on
+  all four audit rows, and the new
+  `installed_jit_an_env_leaf_call_runs_through_the_env_lane` counts `call_slow`
+  at the site (refusing the env leaf again makes it count 100,000 and fail).
+  `LeafCallEnv` is registered in the four mirror files and is NOT in
+  `disturbs_leaf_eligibility` (the leaf's own compiled helpers bump the epoch
+  from inside, on the caller's ctx). Gates: fmt clean, clippy workspace
+  `-D warnings` clean, workspace **5,537 passed / 0 failed** (jit 214, runtime
+  +1), runtime `--no-default-features` 953/0, v8 `simdutf` 380/0, `cli
+  --no-default-features --features jit` green, test262 `all` 48,464/0/0/0 of
+  48,622 and `intl402` 3,205/0/0/0 of 3,357 at 15s/15s, corpus parity 77 rows/0
+  mismatches, `--jit-bench` in band. Open from the audit: **G15** (the
+  megamorphic site) — the row that made `closure_capture` look like a leaf
+  gap.

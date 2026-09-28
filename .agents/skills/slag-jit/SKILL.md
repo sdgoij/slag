@@ -493,6 +493,31 @@ verdict when it is at rest. Traps:
   is what let the hit path drop the `Rc` clone — and makes the probe and the
   hit path bind the identical global. Every `JitCallContext { … }` literal
   (three in `ir.rs`/`jit.rs`, four in the jit crate's tests) needs the field.
+- **An environment-using leaf gets the env lane, not `call_slow` (G13).** A
+  body reading a captured binding lowers to `LoadContextSlot`, which is
+  leaf-safe, so it IS `leaf_inline` — but the machine code cannot call it
+  in-frame: the `body_context`/`lexical_env` swap has to span the call
+  (including its error exit) and be undone before the caller resumes. The probe
+  records `uses_env` and still refuses (so the site's first call takes
+  `call_slow`, which runs the leaf via `try_jit_leaf`), and the hit path's env
+  lane calls `leaf_call_fill` (frame + room check, the same helper the in-frame
+  lane uses) then `leaf_call_env` (lookup the env → `new_body_context` → swap →
+  the compiled entry on the CALLER's ctx and buffer → restore), returning the
+  value or `u64::MAX` to fall back. Mirror `run_jit_leaf`'s env handling AND its
+  tail order exactly — the restore must happen before the machine code's pending
+  check — and note `new_body_context` is always `None` for a leaf, because a
+  leaf cannot create closures and so captures nothing itself. Measured on a
+  monomorphic env leaf: 92 → 40.5 ms at 2M calls. A frame wider than the
+  record's TDZ mask records `entry = 0`, so the site falls back instead of
+  filling from a truncated mask.
+- **A polymorphic call site re-probes every visit (G15, OPEN).** The record
+  holds ONE callee identity, so a site that sees N callees
+  (`calls/closure_capture` drives 64 closures through `fns[i & 63](i)`)
+  misses the identity check on nearly every visit — `LeafCallProbe` 21.9M for
+  1M calls — and no leaf lane (fill or env) can hold a verdict there. Read the
+  probe count before believing a "the leaf lane refuses this body" story: a
+  per-visit probe count usually means the SITE is polymorphic, not that the
+  body is ineligible.
 - **The hit path's cache loads MUST wrap `leaf_inline_offset`.** The probe
   path's base (`info`) already points at `leaf_inline`, so it uses a bare
   `offset_of!(LeafInlineInfo, …)`; the hit path's `cache` points at the

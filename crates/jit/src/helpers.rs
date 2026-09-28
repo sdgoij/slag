@@ -54,6 +54,9 @@ pub enum Helper {
     /// frame rebuild without the eligibility re-validation the cache gate
     /// already performed.
     LeafCallFill,
+    /// G13: run a certified leaf that reads its environment, which the machine
+    /// code cannot do in-frame (the env swap has to span the call).
+    LeafCallEnv,
     GetGlobal,
     SetGlobal,
     SetGlobalSlot,
@@ -212,6 +215,7 @@ impl Helper {
             Helper::CallSlow => "call_slow",
             Helper::LeafCallProbe => "leaf_call_probe",
             Helper::LeafCallFill => "leaf_call_fill",
+            Helper::LeafCallEnv => "leaf_call_env",
             Helper::GetGlobal => "get_global",
             Helper::SetGlobal => "set_global",
             Helper::SetGlobalSlot => "set_global_slot",
@@ -350,6 +354,7 @@ impl Helper {
             Helper::TdzError
                 | Helper::LeafCallProbe
                 | Helper::LeafCallFill
+                | Helper::LeafCallEnv
                 | Helper::ApplyArgsFill
                 | Helper::ToBooleanSlow
                 | Helper::ConcatStrings
@@ -472,6 +477,13 @@ pub struct JitHelpers {
     /// already performed.
     pub leaf_call_fill: Option<
         extern "C" fn(vm: *mut c_void, this: u64, args: *mut u64, argc: u64, site: u64) -> u64,
+    >,
+    /// G13: run a certified leaf that reads its environment on the caller's ctx
+    /// and buffer (the frame was already built by `leaf_call_fill`), swapping
+    /// `body_context`/`lexical_env` around the compiled entry. Returns the
+    /// result bits, or `u64::MAX` to fall back to `call_slow`.
+    pub leaf_call_env: Option<
+        extern "C" fn(vm: *mut c_void, callee: u64, args: *mut u64, argc: u64, site: u64) -> u64,
     >,
     /// Read a declared top-level `var` off the global object (`name` is an
     /// `AtomId`); returns the value.
@@ -839,6 +851,7 @@ impl JitHelpers {
             call_slow: None,
             leaf_call_probe: None,
             leaf_call_fill: None,
+            leaf_call_env: None,
             get_global: None,
             set_global: None,
             set_global_slot: None,
@@ -977,6 +990,7 @@ impl JitHelpers {
             Helper::CallSlow => self.call_slow.map(|f| f as usize as u64),
             Helper::LeafCallProbe => self.leaf_call_probe.map(|f| f as usize as u64),
             Helper::LeafCallFill => self.leaf_call_fill.map(|f| f as usize as u64),
+            Helper::LeafCallEnv => self.leaf_call_env.map(|f| f as usize as u64),
             Helper::GetGlobal => self.get_global.map(|f| f as usize as u64),
             Helper::SetGlobal => self.set_global.map(|f| f as usize as u64),
             Helper::SetGlobalSlot => self.set_global_slot.map(|f| f as usize as u64),
@@ -1931,6 +1945,19 @@ pub(crate) extern "C" fn test_leaf_call_fill(
     _site: u64,
 ) -> u64 {
     0
+}
+
+/// The G13 env-lane test double: always falls back, like the probe double, so
+/// the unit tests keep exercising `call_slow`.
+#[cfg(test)]
+pub(crate) extern "C" fn test_leaf_call_env(
+    _vm: *mut c_void,
+    _callee: u64,
+    _args: *mut u64,
+    _argc: u64,
+    _site: u64,
+) -> u64 {
+    u64::MAX
 }
 
 /// Sums the argument region (the `thisArg` first), mirroring

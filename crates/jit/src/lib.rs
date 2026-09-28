@@ -356,6 +356,7 @@ fn runtime_helpers() -> JitHelpers {
         call_slow: Some(rt.call_slow),
         leaf_call_probe: Some(rt.leaf_call_probe),
         leaf_call_fill: Some(rt.leaf_call_fill),
+        leaf_call_env: Some(rt.leaf_call_env),
         get_global: Some(rt.get_global),
         set_global: Some(rt.set_global),
         set_global_slot: Some(rt.set_global_slot),
@@ -594,6 +595,7 @@ mod tests {
             call_slow: Some(helpers::test_call_slow),
             leaf_call_probe: Some(helpers::test_leaf_call_probe),
             leaf_call_fill: Some(helpers::test_leaf_call_fill),
+            leaf_call_env: Some(helpers::test_leaf_call_env),
             get_global: Some(helpers::test_get_global),
             set_global: Some(helpers::test_set_global),
             set_global_slot: Some(helpers::test_set_global_slot),
@@ -3514,6 +3516,74 @@ mod tests {
         assert!(
             probes <= 200,
             "the probe must run only while the site warms up ({probes} probes): a per-visit re-probe would count ~100K"
+        );
+    }
+
+    #[test]
+    fn installed_jit_an_env_leaf_call_runs_through_the_env_lane() {
+        // G13: a leaf that reads a captured binding lowers the read to
+        // `LoadContextSlot`, which is leaf-safe — the interpreter's own leaf
+        // gate has no env condition. The compiled call site cannot run it
+        // in-frame (the body_context swap has to span the call), so the site
+        // takes the env lane, which performs the whole call from the record.
+        // Counting `call_slow` at the site isolates the fix.
+        static CALL_SLOW_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        extern "C" fn counting_call_slow(
+            ctx: *mut c_void,
+            callee: u64,
+            this: u64,
+            argc: u64,
+            args: *mut u64,
+            direct_eval: u64,
+        ) -> u64 {
+            CALL_SLOW_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            (runtime::jit::JIT_SLOW_PATHS.call_slow)(ctx, callee, this, argc, args, direct_eval)
+        }
+        let mut helpers = runtime_helpers();
+        helpers.call_slow = Some(counting_call_slow);
+
+        // `inner` reads `base` through the enclosing function's capture
+        // context, so it is an env leaf; the call site is monomorphic, so the
+        // record's verdict holds.
+        let source = "function run() {\n\
+                        var base = 1;\n\
+                        function inner(x) { return base + x; }\n\
+                        var s = 0;\n\
+                        for (var i = 0; i < 100000; i++) { s += inner(i); }\n\
+                        return s;\n\
+                      }\n\
+                      run();";
+        let interp = {
+            let mut agent = runtime::Agent::new();
+            agent.initialize_host_defined_realm().expect("realm");
+            agent.run_script(source).expect("interp runs")
+        };
+
+        extern "C" fn noop_drop(_cache: *mut c_void) {}
+        let mut agent = runtime::Agent::new();
+        agent.initialize_host_defined_realm().expect("realm");
+        let mut cache = JitCache::new(helpers).expect("isa");
+        agent.jit_hook = Some(runtime::jit::JitHook {
+            cache: (&mut cache as *mut JitCache) as *mut c_void,
+            lookup: jit_cache_lookup,
+            drop_cache: noop_drop,
+            helpers: &runtime::jit::JIT_SLOW_PATHS,
+        });
+        let value = agent.run_script(source).expect("jit runs");
+        let compiled = cache.compiled_count();
+        agent.jit_hook = None;
+        assert_eq!(
+            value, interp,
+            "the captured read must match the interpreter"
+        );
+        assert!(
+            compiled >= 2,
+            "{compiled} bodies (run + inner) must compile"
+        );
+        let slow = CALL_SLOW_CALLS.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            slow <= 60,
+            "the env site must inline after its tier-up window ({slow} call_slow calls): refusing the env leaf would count ~100K"
         );
     }
 
