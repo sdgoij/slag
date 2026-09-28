@@ -2454,9 +2454,14 @@ pub const GLOBAL_CELLS: usize = 256;
 /// `do_call_fast` needs to run a leaf inline — the compiled ir, strictness,
 /// and (for a leaf that reads an environment) the closure env — keyed by
 /// function id. Function ids are never reused, so a hit needs no generation
-/// check. Boxed so the Agent's hot-field cache footprint stays small (the
-/// Cut 27 lesson: an inline copy regressed the leaf path).
-pub(crate) const LEAF_CACHE: usize = 16;
+/// check. Sized so a megamorphic call site — many leaf callees through one
+/// call step — keeps their records live: the compiled hit path's env lane
+/// re-derives a leaf's closure env through this cache on every call (G15), so
+/// a table smaller than the site's callee count sends each call to the
+/// `ecma_functions` HashMap instead. Boxed so the Agent's hot-field cache
+/// footprint stays small (the Cut 27 lesson: an inline copy regressed the leaf
+/// path).
+pub(crate) const LEAF_CACHE: usize = 256;
 
 /// The direct-mapped installed-builtin handler cache (Cut 81): function id
 /// -> the agent-dependent builtin's native handler, populated lazily from
@@ -12705,6 +12710,14 @@ impl Vm {
         if agent.jit_depth >= crate::jit::MAX_JIT_DEPTH {
             return Ok(false);
         }
+        // G15: see `jit::run_jit_body` — this entry point's `lookup_info` can
+        // evict compiled code, so a top-level leaf run bumps the code
+        // generation to keep the agent's shared leaf-call records from naming
+        // a freed entry. (A leaf body has no call steps, so its own run never
+        // consults the table.)
+        if agent.jit_depth == 0 {
+            agent.leaf_gen = agent.leaf_gen.wrapping_add(1);
+        }
         let scope = ir.scope.as_ref().expect("a leaf is certified");
         // The per-body fast pointer (set on the first successful lookup —
         // the cache clears it when the entry is evicted, so a set pointer
@@ -12825,8 +12838,8 @@ impl Vm {
             buf_end: (buf.as_ptr() as usize + std::mem::size_of_val(buf))
                 as *mut std::os::raw::c_void,
             leaf_epoch: 0,
-            leaf_call_cache: [crate::jit::LeafCallSiteCache::empty();
-                crate::jit::LEAF_CALL_CACHE_ENTRIES],
+            leaf_records: agent.leaf_records.as_mut_ptr(),
+            leaf_gen: agent.leaf_gen,
             body: std::rc::Rc::as_ptr(ir),
             tail: false,
             current_function: 0,

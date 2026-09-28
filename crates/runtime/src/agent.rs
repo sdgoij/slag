@@ -479,6 +479,19 @@ pub struct Agent {
     /// leaf call skips the `ecma_functions` HashMap lookup. Boxed per the
     /// Cut 27 lesson.
     pub(crate) leaf_cache: Box<[Option<(u64, crate::ir::LeafEntry)>; crate::ir::LEAF_CACHE]>,
+    /// G15: the per-callee leaf-call record table the compiled call sites and
+    /// the slow-path helpers address (`JitCallContext::leaf_records`). It lives
+    /// on the agent rather than in the per-run JIT context so a run does not
+    /// memset it — the table is large enough to give a megamorphic site one
+    /// record per callee. Records carry `leaf_gen` (a code generation) so a run
+    /// that may have evicted compiled code re-probes instead of using a freed
+    /// entry; a sweeping collection clears the table (a recycled box address
+    /// could otherwise match a record's identity).
+    pub(crate) leaf_records: Box<[crate::jit::LeafCallRecord; crate::jit::LEAF_CALL_RECORDS]>,
+    /// G15: the code generation the agent's leaf-call records carry. Bumped at
+    /// the start of every top-level JIT run (whose lookup may have evicted
+    /// compiled code), so records left by an earlier run never match.
+    pub(crate) leaf_gen: u32,
     /// The builtin-call verdict cache (Cut 81's handler cell, widened to the
     /// full direct-dispatch decision): function id → the handler to run, the
     /// crux-native "run its own closure" verdict, or neither. Filling it
@@ -1285,6 +1298,10 @@ impl Agent {
             spread_cells: std::array::from_fn(|_| None),
             for_in_cells: Box::new(std::array::from_fn(|_| None)),
             leaf_cache: Box::new(std::array::from_fn(|_| None)),
+            leaf_records: Box::new(
+                [crate::jit::LeafCallRecord::empty(); crate::jit::LEAF_CALL_RECORDS],
+            ),
+            leaf_gen: 0,
             builtin_call_cells: Box::new(std::array::from_fn(|_| None)),
             builtin_ctor_cells: Box::new(std::array::from_fn(|_| None)),
             construct_property_patterns: Box::new(std::array::from_fn(|_| None)),

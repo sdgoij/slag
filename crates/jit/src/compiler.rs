@@ -44,13 +44,13 @@ use runtime::jit::{
     AGENT_REALM_COUNT_OFFSET, BUILDER_BUF_OFFSET, BUILDER_CAP_OFFSET, BUILDER_ENABLED_OFFSET,
     BUILDER_LEN_OFFSET, BUILDER_OWNER_OFFSET, BUILDER_RHS_BITS_OFFSET, BUILDER_RHS_OK_OFFSET,
     BUILDER_RHS_UNIT_OFFSET, GlobalValueCell, HELPER_COUNT, JIT_APPLY_MAX_ARGS,
-    JIT_GC_PROBE_INTERVAL, JIT_HELPER_COUNTS, JitCallContext, LEAF_CALL_CACHE_ENTRIES,
-    LeafCallSiteCache, LeafInlineInfo, TYPED_ARRAY_LENGTH_SENTINEL,
-    VM_ASYNC_FOR_OF_STACK_LEN_OFFSET, VM_BUILDER_OFFSET, VM_COMPLETION_IS_EMPTY_OFFSET,
-    VM_COMPLETION_OFFSET, VM_DESTRUCTURE_STACK_LEN_OFFSET, VM_ENV_STACK_LEN_OFFSET,
-    VM_FOR_IN_STACK_LEN_OFFSET, VM_FOR_OF_BOUNDARIES_LEN_OFFSET, VM_FOR_OF_STACK_LEN_OFFSET,
-    VM_IP_OFFSET, VM_LEXICAL_ENV_OFFSET, VM_PENDING_LEN_OFFSET, VM_TRY_STACK_CAP_OFFSET,
-    VM_TRY_STACK_LEN_OFFSET, VM_TRY_STACK_PTR_OFFSET,
+    JIT_GC_PROBE_INTERVAL, JIT_HELPER_COUNTS, JitCallContext, LEAF_CALL_RECORD_SHIFT,
+    LeafCallRecord, LeafInlineInfo, TYPED_ARRAY_LENGTH_SENTINEL, VM_ASYNC_FOR_OF_STACK_LEN_OFFSET,
+    VM_BUILDER_OFFSET, VM_COMPLETION_IS_EMPTY_OFFSET, VM_COMPLETION_OFFSET,
+    VM_DESTRUCTURE_STACK_LEN_OFFSET, VM_ENV_STACK_LEN_OFFSET, VM_FOR_IN_STACK_LEN_OFFSET,
+    VM_FOR_OF_BOUNDARIES_LEN_OFFSET, VM_FOR_OF_STACK_LEN_OFFSET, VM_IP_OFFSET,
+    VM_LEXICAL_ENV_OFFSET, VM_PENDING_LEN_OFFSET, VM_TRY_STACK_CAP_OFFSET, VM_TRY_STACK_LEN_OFFSET,
+    VM_TRY_STACK_PTR_OFFSET,
 };
 use syntax::ast::{AssignOp, BinaryOp, UnaryOp, UpdateOp};
 use target_lexicon::PointerWidth;
@@ -394,20 +394,28 @@ fn helper_sig(params: &[Type], conv: CallConv) -> Signature {
     sig
 }
 
-/// The byte offset of a `LeafInlineInfo` field inside `JitCallContext`'s
-/// `leaf_call_cache` record (Cranelift has no `offset_of!`, so the compiled
-/// code loads the fields at these fixed offsets).
+/// The byte offset of a `LeafInlineInfo` field inside a `LeafCallRecord`
+/// (Cranelift has no `offset_of!`, so the compiled code loads the fields at
+/// these fixed offsets).
 fn leaf_inline_offset(field: usize) -> usize {
-    std::mem::offset_of!(LeafCallSiteCache, leaf_inline) + field
+    std::mem::offset_of!(LeafCallRecord, leaf_inline) + field
 }
 
-/// The byte offset of the `leaf_call_cache` record for call-site step `index`
-/// inside `JitCallContext` (Cut 68: the direct-mapped set — the step index is
-/// a compile-time constant per call site, so the slot is a baked immediate).
-fn leaf_cache_entry_offset(index: usize) -> usize {
-    std::mem::offset_of!(JitCallContext, leaf_call_cache)
-        + (index ^ (index >> 2)) % LEAF_CALL_CACHE_ENTRIES
-            * std::mem::size_of::<LeafCallSiteCache>()
+/// G15: the agent record slot for `callee` — the machine-code half of
+/// `runtime::jit::leaf_record_slot` (a multiplicative hash taking the high
+/// bits). The two must compute the identical value: a divergence is SILENT
+/// (the verdict is written to one slot and read from another, so the site
+/// simply never inlines). `the_emitter_and_runtime_leaf_record_slots_agree`
+/// pins the two expressions together.
+fn emit_leaf_record_slot(lowerer: &mut Lowerer<'_>, callee: ClifValue) -> ClifValue {
+    let builder = &mut lowerer.builder;
+    let k = builder
+        .ins()
+        .iconst(types::I64, 0x9E37_79B9_7F4A_7C15u64 as i64);
+    let mixed = builder.ins().imul(callee, k);
+    builder
+        .ins()
+        .ushr_imm_u(mixed, LEAF_CALL_RECORD_SHIFT as i64)
 }
 
 /// Lower `body` into `func`. `func`/`fctx` are consumed by the builder and
@@ -3674,25 +3682,39 @@ impl<'a> Lowerer<'a> {
         emit_fall_through: bool,
     ) -> Result<(), Unsupported> {
         let ctx = self.vm();
-        let cache = self
+        let slot = emit_leaf_record_slot(self, callee);
+        let slot_bytes = self
             .builder
             .ins()
-            .iadd_imm_s(ctx, leaf_cache_entry_offset(index) as i64);
-        // The cache-reuse gate: the record matches this call site, the
+            .imul_imm_s(slot, std::mem::size_of::<LeafCallRecord>() as i64);
+        // The record table lives on the agent (`JitCallContext::leaf_records`):
+        // load its base and index by the callee's slot.
+        let records_base = self.builder.ins().load(
+            types::I64,
+            MemFlagsData::new(),
+            ctx,
+            Offset32::new(std::mem::offset_of!(JitCallContext, leaf_records) as i32),
+        );
+        let cache = self.builder.ins().iadd(records_base, slot_bytes);
+        // The record-reuse gate: the record's code generation matches this run
+        // (no compile evicted the callee's entry since it was written), the
         // leaf-eligibility epoch is unchanged since the probe wrote it (no
         // JS-running helper ran), and the live callee's NaN-box identity
         // (`bits >> 44` + `bits & PAYLOAD_MASK`, together all 64 bits)
         // matches the probed callee.
-        let site = self.builder.ins().load(
+        let code_gen = self.builder.ins().load(
+            types::I32,
+            MemFlagsData::new(),
+            ctx,
+            Offset32::new(std::mem::offset_of!(JitCallContext, leaf_gen) as i32),
+        );
+        let cached_gen = self.builder.ins().load(
             types::I32,
             MemFlagsData::new(),
             cache,
-            Offset32::new(std::mem::offset_of!(LeafCallSiteCache, site) as i32),
+            Offset32::new(std::mem::offset_of!(LeafCallRecord, code_gen) as i32),
         );
-        let site_ok = self
-            .builder
-            .ins()
-            .icmp_imm_u(IntCC::Equal, site, index as i64);
+        let gen_ok = self.builder.ins().icmp(IntCC::Equal, code_gen, cached_gen);
         let epoch = self.builder.ins().load(
             types::I32,
             MemFlagsData::new(),
@@ -3703,7 +3725,7 @@ impl<'a> Lowerer<'a> {
             types::I32,
             MemFlagsData::new(),
             cache,
-            Offset32::new(std::mem::offset_of!(LeafCallSiteCache, epoch) as i32),
+            Offset32::new(std::mem::offset_of!(LeafCallRecord, epoch) as i32),
         );
         let epoch_ok = self.builder.ins().icmp(IntCC::Equal, epoch, cached_epoch);
         let callee_hi = self.builder.ins().ushr_imm_u(callee, 44);
@@ -3711,7 +3733,7 @@ impl<'a> Lowerer<'a> {
             types::I32,
             MemFlagsData::new(),
             cache,
-            Offset32::new(std::mem::offset_of!(LeafCallSiteCache, callee_hi) as i32),
+            Offset32::new(std::mem::offset_of!(LeafCallRecord, callee_hi) as i32),
         );
         let cached_hi = self.builder.ins().uextend(types::I64, cached_hi);
         let hi_ok = self.builder.ins().icmp(IntCC::Equal, callee_hi, cached_hi);
@@ -3723,14 +3745,14 @@ impl<'a> Lowerer<'a> {
             types::I64,
             MemFlagsData::new(),
             cache,
-            Offset32::new(std::mem::offset_of!(LeafCallSiteCache, callee_payload) as i32),
+            Offset32::new(std::mem::offset_of!(LeafCallRecord, callee_payload) as i32),
         );
         let payload_ok = self
             .builder
             .ins()
             .icmp(IntCC::Equal, payload, cached_payload);
         let callee_hit = self.builder.ins().band(hi_ok, payload_ok);
-        let stable = self.builder.ins().band(site_ok, callee_hit);
+        let stable = self.builder.ins().band(callee_hit, gen_ok);
         let hit = self.builder.ins().band(stable, epoch_ok);
         let cached_entry = self.builder.ins().load(
             types::I64,
@@ -3770,7 +3792,7 @@ impl<'a> Lowerer<'a> {
             MemFlagsData::new(),
             epoch,
             cache,
-            Offset32::new(std::mem::offset_of!(LeafCallSiteCache, epoch) as i32),
+            Offset32::new(std::mem::offset_of!(LeafCallRecord, epoch) as i32),
         );
         self.builder.ins().jump(hit_block, &[]);
         self.builder.seal_block(restamp);
@@ -3889,14 +3911,13 @@ impl<'a> Lowerer<'a> {
             .ins()
             .brif(fill_ok, fill, &[], probe_block, &[]);
         // `leaf_call_fill` rebuilds the frame from the recorded descriptor
-        // (no callee, no `leaf_lookup`) and returns the cached entry, or 0
-        // when it no longer fits — hence `sig_call`, not `sig_call_slow`.
+        // (the callee only selects the record slot; no `leaf_lookup`) and
+        // returns the cached entry, or 0 when it no longer fits.
         self.builder.switch_to_block(fill);
-        let site_imm = self.builder.ins().iconst(types::I64, index as i64);
         let filled = self.emit_raw_call(
-            self.sig_call,
+            self.sig_call_slow,
             Helper::LeafCallFill,
-            &[this, args_ptr, argc, site_imm],
+            &[callee, this, args_ptr, argc, slot],
         )?;
         let fill_ok = self.builder.ins().icmp_imm_u(IntCC::NotEqual, filled, 0);
         let inline_filled = self.builder.create_block();
@@ -3918,21 +3939,19 @@ impl<'a> Lowerer<'a> {
         // then `leaf_call_env` performs the whole call and the machine code
         // only lands the result.
         self.builder.switch_to_block(env_lane);
-        let site_imm = self.builder.ins().iconst(types::I64, index as i64);
         let filled = self.emit_raw_call(
-            self.sig_call,
+            self.sig_call_slow,
             Helper::LeafCallFill,
-            &[this, args_ptr, argc, site_imm],
+            &[callee, this, args_ptr, argc, slot],
         )?;
         let fill_ok = self.builder.ins().icmp_imm_u(IntCC::NotEqual, filled, 0);
         let env_call = self.builder.create_block();
         self.builder.ins().brif(fill_ok, env_call, &[], slow, &[]);
         self.builder.switch_to_block(env_call);
-        let site_imm = self.builder.ins().iconst(types::I64, index as i64);
         let value = self.emit_raw_call(
             self.sig_call,
             Helper::LeafCallEnv,
-            &[callee, args_ptr, argc, site_imm],
+            &[callee, args_ptr, argc, slot],
         )?;
         // The helper returns `u64::MAX` (no `Value` encoding) to fall back.
         let env_failed = self.builder.ins().icmp_imm_u(IntCC::Equal, value, -1);
@@ -3945,24 +3964,21 @@ impl<'a> Lowerer<'a> {
         // The probe path: the full validation + lookups + frame fill (Cut
         // 37); the probe records the cache identity so repeat visits skip it.
         self.builder.switch_to_block(probe_block);
-        let site_imm = self.builder.ins().iconst(types::I64, index as i64);
         // `sig_call_slow` (six params) carries the receiver as well — the probe
         // binds it with OrdinaryCallBindThis and fills the callee's `this` slot
         // from the result.
         let probe = self.call_slow(
             self.sig_call_slow,
             Helper::LeafCallProbe,
-            &[callee, this, args_ptr, argc, site_imm],
+            &[callee, this, args_ptr, argc, slot],
         )?;
         let hit = self.builder.ins().icmp_imm_u(IntCC::NotEqual, probe, 0);
         let inline2 = self.builder.create_block();
         self.builder.ins().brif(hit, inline2, &[], slow, &[]);
         self.builder.switch_to_block(inline2);
-        let ctx = self.vm();
         let info = self.builder.ins().iadd_imm_s(
-            ctx,
-            (leaf_cache_entry_offset(index) + std::mem::offset_of!(LeafCallSiteCache, leaf_inline))
-                as i64,
+            cache,
+            std::mem::offset_of!(LeafCallRecord, leaf_inline) as i64,
         );
         let frame_size = self.builder.ins().load(
             types::I32,

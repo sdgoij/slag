@@ -715,6 +715,16 @@ mod tests {
         JitHelpers::none()
     }
 
+    /// A leaf-call record table for a test context: the compiled record gate
+    /// reads it (the test doubles never write it), so a leaked table per test
+    /// keeps a compiled body with a call step from dereferencing a null base.
+    fn test_leaf_records() -> *mut runtime::jit::LeafCallRecord {
+        Box::leak(Box::new(
+            [runtime::jit::LeafCallRecord::empty(); runtime::jit::LEAF_CALL_RECORDS],
+        ))
+        .as_mut_ptr()
+    }
+
     /// Run a compiled body against a fresh frame + stack and return the
     /// completion value. Canary slots around both buffers catch out-of-bounds
     /// writes from the compiled code. A real per-call context is passed (the
@@ -741,8 +751,8 @@ mod tests {
             globals_unshadowed: false,
             buf_end: std::ptr::null_mut(),
             leaf_epoch: 0,
-            leaf_call_cache: [runtime::jit::LeafCallSiteCache::empty();
-                runtime::jit::LEAF_CALL_CACHE_ENTRIES],
+            leaf_records: test_leaf_records(),
+            leaf_gen: 0,
             body: std::ptr::null(),
             tail: false,
             current_function: 0,
@@ -1166,8 +1176,8 @@ mod tests {
             globals_unshadowed: false,
             buf_end: std::ptr::null_mut(),
             leaf_epoch: 0,
-            leaf_call_cache: [runtime::jit::LeafCallSiteCache::empty();
-                runtime::jit::LEAF_CALL_CACHE_ENTRIES],
+            leaf_records: test_leaf_records(),
+            leaf_gen: 0,
             body: std::ptr::null(),
             tail: false,
             current_function: 0,
@@ -1439,8 +1449,8 @@ mod tests {
             globals_unshadowed: false,
             buf_end: std::ptr::null_mut(),
             leaf_epoch: 0,
-            leaf_call_cache: [runtime::jit::LeafCallSiteCache::empty();
-                runtime::jit::LEAF_CALL_CACHE_ENTRIES],
+            leaf_records: test_leaf_records(),
+            leaf_gen: 0,
             body: std::ptr::null(),
             tail: false,
             current_function: Value::Number(5.0).bits(),
@@ -1527,8 +1537,8 @@ mod tests {
             globals_unshadowed: false,
             buf_end: std::ptr::null_mut(),
             leaf_epoch: 0,
-            leaf_call_cache: [runtime::jit::LeafCallSiteCache::empty();
-                runtime::jit::LEAF_CALL_CACHE_ENTRIES],
+            leaf_records: test_leaf_records(),
+            leaf_gen: 0,
             body: std::ptr::null(),
             tail: false,
             current_function: 0,
@@ -3245,15 +3255,16 @@ mod tests {
     #[test]
     fn installed_jit_two_hot_leaf_sites_each_cache_separately() {
         // Cut 68: TWO hot leaf call sites in one loop body used to alternate
-        // on the single `LeafCallSiteCache` record — every visit missed on
-        // `site` and re-probed (~200K probes for a 100K-iteration loop). The
-        // direct-mapped set (indexed by `site % LEAF_CALL_CACHE_ENTRIES`)
-        // gives each site its own record, so each warms once and the loop
-        // reuses both verdicts. The counting probe wrapper proves it: each
-        // site probes only during `add`'s tier-up window (a deferred refusal
-        // is not cached by design — measured 10 total, bound admits both
-        // windows), and the ~200K remaining visits reuse the two cached
-        // verdicts. A per-iteration re-probe would count ~200K.
+        // on a single record — every visit missed and re-probed (~200K probes
+        // for a 100K-iteration loop). G15 keyed the agent's record table by
+        // the CALLEE, so two sites with different callees never collide at
+        // all (and two sites with the same callee share one warm verdict), so
+        // each site warms once and the loop reuses both. The counting probe
+        // wrapper proves it: each site probes only during `add`'s tier-up
+        // window (a deferred refusal is not cached by design — measured 10
+        // total, bound admits both windows), and the ~200K remaining visits
+        // reuse the two cached verdicts. A per-iteration re-probe would count
+        // ~200K.
         static PROBE_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         extern "C" fn counting_leaf_call_probe(
             ctx: *mut c_void,
@@ -3462,13 +3473,14 @@ mod tests {
         }
         extern "C" fn counting_leaf_call_fill(
             ctx: *mut c_void,
+            callee: u64,
             this: u64,
             args: *mut u64,
             argc: u64,
             site: u64,
         ) -> u64 {
             FILL_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            (runtime::jit::JIT_SLOW_PATHS.leaf_call_fill)(ctx, this, args, argc, site)
+            (runtime::jit::JIT_SLOW_PATHS.leaf_call_fill)(ctx, callee, this, args, argc, site)
         }
         let mut helpers = runtime_helpers();
         helpers.leaf_call_probe = Some(counting_leaf_call_probe);
@@ -3516,6 +3528,45 @@ mod tests {
         assert!(
             probes <= 200,
             "the probe must run only while the site warms up ({probes} probes): a per-visit re-probe would count ~100K"
+        );
+    }
+
+    #[test]
+    fn the_emitter_and_runtime_leaf_record_slots_agree() {
+        // G15: the compiled code computes the record slot in
+        // `emit_leaf_record_slot`; every runtime writer computes it in
+        // `runtime::jit::leaf_record_slot`. If they drift, a verdict is written
+        // to one slot and read from another — the site silently never inlines.
+        // Keep the two expressions byte-for-byte equivalent.
+        fn emitter(callee: u64) -> usize {
+            (callee.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> runtime::jit::LEAF_CALL_RECORD_SHIFT)
+                as usize
+        }
+        for callee in [
+            0u64,
+            0x7ff8_0000_0000_0000,
+            0x7ff8_0000_1234_5670,
+            0x7ff8_0000_9abc_def0,
+            0x7ff8_0001_0000_0000,
+            0x0fff_ffff_ffff_ffff,
+        ] {
+            assert_eq!(
+                emitter(callee),
+                runtime::jit::leaf_record_slot(callee),
+                "callee={callee:#x}"
+            );
+        }
+        // Every slot must be reachable (a dead slot would waste a record and
+        // leave its callees colliding forever). A direct-mapped table cannot
+        // avoid occasional collisions among arbitrary callees, so this checks
+        // coverage, not perfection.
+        let slots: std::collections::HashSet<usize> = (0..4096u64)
+            .map(|i| runtime::jit::leaf_record_slot(0x7ff8_0000_1000_0000 + i))
+            .collect();
+        assert_eq!(
+            slots.len(),
+            runtime::jit::LEAF_CALL_RECORDS,
+            "every slot must be reachable"
         );
     }
 

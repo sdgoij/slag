@@ -251,14 +251,44 @@ The list, in the measured order:
   inner(x){ return base + x; } … }`, 2M calls): **92 → 40.5 ms (−56%)**, with
   `CallSlow` at the site 2,000,000 → **15**, against 88 ms interpreted.
   `closure_capture` itself cannot show it — its site is polymorphic (G15).
-- **G15 — a polymorphic call site re-probes every visit (open; found by G13's
-  audit).** The per-site record holds ONE callee identity, so a site that sees
-  N callees (`calls/closure_capture`: 64 closures through `fns[i & 63](i)`)
-  fails the identity check on nearly every visit — `LeafCallProbe` 21,900,000
-  and `CallSlow` 23,300,000 for 1,000,000 calls, and the row sits at 82 ms with
-  no leaf lane in sight. A megamorphic site needs N records per site or a
-  shape-checked inline cache with a fallback: the classic answer, and a design
-  of its own.
+- **G15 — a megamorphic call site holds one record per callee (landed,
+  Stage 4).** The call record holds ONE callee identity, and its slot was a
+  pure function of the SITE, so a site that sees N callees re-probed on nearly
+  every visit. The measured curve (env leaf, 1M calls per bench) was the shape
+  of it: **mono 3.0 ns/call, 2 callees 10 ns/call, 64 callees ~13 ns/call**,
+  and `calls/closure_capture` (64 closures through `fns[i & 63](i)`) showed
+  `LeafCallProbe`/`CallSlow` ~7,000,000 for 1,000,000 iterations — every visit
+  probed, then fell to `call_slow`, and the env lane never ran. A floor build
+  whose probe returned immediately priced the probe's BODY at only ~1.4-3.5
+  ns/call, so the cost was the verdict never holding, not the probe's work.
+
+  The record is now keyed by the CALLEE and lives on the `Agent`
+  (`Agent::leaf_records`), addressed through a base pointer in `JitCallContext`
+  so a run — including the hot leaf path — pays no setup: an inline table made
+  every run memset it, and a 64-entry ctx table took `calls/recursive_fib`
+  329 → 732 ms. The verdict (entry + frame descriptor) is a pure function of the
+  callee's compiled body, so one record serves every site that calls it. The
+  slot is `runtime::jit::leaf_record_slot(callee)`, a golden-ratio multiply
+  taking the high bits (a low-bit fold collapsed consecutive box allocations
+  onto a handful of slots), mirrored by the compiler's `emit_leaf_record_slot`
+  and pinned by `the_emitter_and_runtime_leaf_record_slots_agree`.
+
+  Because a record's `entry` outlives a run, it also carries the code
+  generation (`LeafCallRecord::code_gen` against `JitCallContext::leaf_gen`): a
+  run bumps `Agent::leaf_gen` before its first `lookup_info`, whose compile may
+  evict and free the code a previous run's record named, so a stale record
+  re-probes rather than jumping to a freed entry (nested runs share the
+  generation — no eviction can happen in flight). A sweeping collection still
+  clears the table, since a recycled box address could match a record's
+  identity.
+
+  Measured: `calls/closure_capture` **88.8 → 50.9 ms**, with
+  `LeafCallProbe`/`CallSlow` down from 7,000,000 to ~900 and
+  `leaf_call_fill`/`leaf_call_env` at 7,000,000 (the env lane on every visit).
+  `LEAF_CACHE` (the interpreter's per-function leaf cache) was raised 16 → 256
+  so the env lane's per-call env lookup hits instead of falling to the
+  `ecma_functions` HashMap. `calls/construct_churn` 120 → ~103,
+  `calls/recursive_fib` 329 → 278; no call row regressed.
 - **G14 — a non-aliased frame rebuilt from a cached descriptor (landed,
   Stage 3).** `emit_call`'s cache-hit path inlines in-frame only an *aliased*
   frame (`frame_size == arity`, the argument region IS the frame); anything
@@ -356,10 +386,11 @@ The list, in the measured order:
   not the env lane: a strict plain-call `return this`, and a body that reads an
   identifier (`LoadIdent` is `steps_are_leaf`-excluded; G13's fix covers
   captured bindings, which lower to `LoadContextSlot` — see Stage 4).
-- **Stage 4 — G13, the environment-using leaf, and G15.** **G13 done** (§3
-  G13 has the audit table and the numbers); the audit also produced **G15** (a
-  polymorphic call site re-probes per visit), which is the row the plan had
-  grouped under G13. G15 is open.
+- **Stage 4 — G13, the environment-using leaf, and G15.** **Both done** (§3
+  G13 and G15 have the audit table and the numbers): G13 gave
+  environment-reading leaves the env lane, and G15 keyed the leaf-call record
+  by the callee on the agent, so a megamorphic site holds one record per
+  callee.
 - **Stage 5 — G10, G11, G1, member writes.** Prototype-chain reads, the
   `switch` chain, computed reads and the member-write path — the remaining
   per-op helper surfaces, each with its own measurement.
@@ -632,3 +663,26 @@ One line per landed stage, newest last. This log is the arc's journal —
   mismatches, `--jit-bench` in band. Open from the audit: **G15** (the
   megamorphic site) — the row that made `closure_capture` look like a leaf
   gap.
+- **Stage 4, G15 — the per-callee leaf-call record (2026-09-28).** G13's audit
+  left `calls/closure_capture` unexplained, and the measurement was why: the
+  call record holds ONE callee identity and its slot was a pure function of the
+  site, so a site that sees N callees re-probed on nearly every visit
+  (`LeafCallProbe`/`CallSlow` 7,000,000 for 1,000,000 iterations — the env lane
+  never ran). A first slice folded the callee into the slot, which helped a
+  2-callee site (70 → 27 ms) but not 64 — four slots cannot serve 64 callees.
+  This lands the end state: the record is keyed by the CALLEE on the `Agent`
+  (not inline in the per-run context, whose memset `recursive_fib` proved fatal
+  at 329 → 732 ms), with a golden-ratio high-bit hash mirrored by the emitter
+  and pinned by a test, and a code GENERATION so a record never outlives the
+  compiled entry it names (a run bumps the agent's generation before its first
+  `lookup_info`, which may evict; nested runs share it; a sweeping GC clears the
+  table). `LEAF_CACHE` went 16 → 256 for the env lane's per-call env lookup.
+  Measured: `calls/closure_capture` 88.8 → **50.9 ms** (`LeafCallProbe`/
+  `CallSlow` 7,000,000 → ~900, `leaf_call_fill`/`leaf_call_env` 7,000,000),
+  `construct_churn` ~120 → ~103, `recursive_fib` 329 → 278, no call row
+  regressed. Gates: fmt clean, clippy workspace `-D warnings` clean, workspace
+  **5,538 passed / 0 failed** (jit 215), runtime `--no-default-features` 953/0,
+  v8 `simdutf` 380/0, `cli --no-default-features --features jit` green, test262
+  `all` 48,464/0/0/0 of 48,622 and `intl402` 3,205/0/0/0 of 3,357 at 15s/15s,
+  corpus parity 77 rows/0 mismatches, `--jit-bench` in band (arithmetic 0.08,
+  function calls 0.16, non-leaf call 0.50).

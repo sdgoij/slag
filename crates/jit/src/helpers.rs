@@ -457,9 +457,10 @@ pub struct JitHelpers {
     /// The compiled leaf-call probe (Cut 37): validates the callee is an
     /// inlineable leaf and returns its JIT entry (0 = fall back to
     /// `call_slow`). `this` is the call's unbound receiver (the probe applies
-    /// `OrdinaryCallBindThis` when it fills the frame's `this` slot); `site` is
-    /// the call site's step index (Cut 39 — the probe records the cache
-    /// identity so repeat visits skip it).
+    /// `OrdinaryCallBindThis` when it fills the frame's `this` slot); `slot` is
+    /// the record slot the compiled call site selected (`leaf_record_slot` of
+    /// the callee) — the probe records the callee identity, the code
+    /// generation and the live leaf epoch there so repeat visits skip it.
     pub leaf_call_probe: Option<
         extern "C" fn(
             vm: *mut c_void,
@@ -467,23 +468,30 @@ pub struct JitHelpers {
             this: u64,
             args: *mut u64,
             argc: u64,
-            site: u64,
+            slot: u64,
         ) -> u64,
     >,
     /// G14: the compiled leaf-call hit path for a non-aliased frame — rebuild
     /// the leaf's frame above the argument region and return the cached entry
     /// (0 = the frame no longer fits, so fall back to `call_slow`). Skips the
-    /// re-validation `leaf_call_probe` does, which the compiled cache gate has
+    /// re-validation `leaf_call_probe` does, which the compiled record gate has
     /// already performed.
     pub leaf_call_fill: Option<
-        extern "C" fn(vm: *mut c_void, this: u64, args: *mut u64, argc: u64, site: u64) -> u64,
+        extern "C" fn(
+            vm: *mut c_void,
+            callee: u64,
+            this: u64,
+            args: *mut u64,
+            argc: u64,
+            slot: u64,
+        ) -> u64,
     >,
     /// G13: run a certified leaf that reads its environment on the caller's ctx
     /// and buffer (the frame was already built by `leaf_call_fill`), swapping
     /// `body_context`/`lexical_env` around the compiled entry. Returns the
     /// result bits, or `u64::MAX` to fall back to `call_slow`.
     pub leaf_call_env: Option<
-        extern "C" fn(vm: *mut c_void, callee: u64, args: *mut u64, argc: u64, site: u64) -> u64,
+        extern "C" fn(vm: *mut c_void, callee: u64, args: *mut u64, argc: u64, slot: u64) -> u64,
     >,
     /// Read a declared top-level `var` off the global object (`name` is an
     /// `AtomId`); returns the value.
@@ -1939,6 +1947,7 @@ pub(crate) extern "C" fn test_leaf_call_probe(
 #[cfg(test)]
 pub(crate) extern "C" fn test_leaf_call_fill(
     _vm: *mut c_void,
+    _callee: u64,
     _this: u64,
     _args: *mut u64,
     _argc: u64,

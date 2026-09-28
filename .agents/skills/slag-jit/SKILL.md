@@ -382,24 +382,26 @@ suite — new steps need one, including the iterator-close shapes
 
 ## 16. Leaf-cache revalidation on a stale epoch (Cut 68)
 
-The per-call-site leaf verdict (`LeafCallSiteCache` in `JitCallContext`) is
-only trusted while `cache.epoch == ctx.leaf_epoch`. A "disturbing" helper
+The per-callee leaf verdict (`LeafCallRecord` in the agent's
+`Agent::leaf_records`, addressed through `JitCallContext::leaf_records`) is
+only trusted while `record.epoch == ctx.leaf_epoch` and
+`record.code_gen == ctx.leaf_gen`. A "disturbing" helper
 (a getter, `valueOf`/`toString`, a nested call) bumps `leaf_epoch`, so the
 next visit misses. Before Cut 68 the miss ALWAYS re-probed — a monomorphic
 hot call next to a getter probed every iteration (100K probes per loop).
 Now the compiled gate re-validates the eligibility state and reuses the
 verdict when it is at rest. Traps:
 
-- **The epoch must gate separately from site/callee.** `hit = (site_ok &
-  callee_hit) & epoch_ok`; the re-validation runs only when the site AND
-  callee still match (`stable`) — a stale epoch on a DIFFERENT site/callee
+- **The epoch must gate separately from identity.** `hit = (identity_ok &
+  gen_ok & epoch_ok)`; the re-validation runs only when the callee AND
+  generation still match (`stable`) — a stale epoch on a DIFFERENT callee
   must probe, never re-stamp. The re-stamp path (`stale_block` →
-  `emit_leaf_state_at_rest()` → ok? store `cache.epoch = live epoch` →
+  `emit_leaf_state_at_rest()` → ok? store `record.epoch = live epoch` →
   jump to the HIT block) reuses the cached verdict INCLUDING a cached
   rejection (entry 0 → `call_slow`). The ONE exception is a *deferred*
   rejection: a body the compile threshold has not promoted yet leaves
-  `ir.jit_info` at `0`, and the probe clears the cache identity for it (see
-  §17's promotion chain) so the site re-probes and inlines once the body
+  `ir.jit_info` at `0`, and the probe clears the record's identity for it (see
+  §17's promotion chain) so the record re-probes and inlines once the body
   compiles. A *sticky* refusal (`jit_info == 1`: over the step cap, or an
   emitter refusal) is reused as before.
 - **`emit_leaf_state_at_rest` must mirror `leaf_call_probe`'s checks** —
@@ -418,23 +420,27 @@ verdict when it is at rest. Traps:
   ok = self.builder.ins().band(ok, empty_64);` — passing the `bint`
   result inline into `band` borrows `self.builder` twice and fails.
   Always hoist the `bint` into a temp first.
-- **Two hot call sites thrash a single record — fixed with a set.**
-  `leaf_call_cache` is a direct-mapped `[LeafCallSiteCache;
-  LEAF_CALL_CACHE_ENTRIES]` (4) set, indexed by
-  `(index ^ (index >> 2)) % LEAF_CALL_CACHE_ENTRIES` on BOTH sides: the
-  compiler bakes the slot into `emit_call`'s cache-pointer immediate
-  (`leaf_cache_entry_offset(index)` — the step index is a compile-time
-  constant), and the probe writes `[site % slot]` with the same fold. The
-  xor-fold is load-bearing: fused call-store statements land call sites
-  4-8 steps apart, and the plain `index % 4` maps a spacing of 4 (or any
-  multiple) to ONE slot — the two-hot-sites e2e test's sites at 13 and 21
-  (8 apart) both fell in slot 1 and still thrashed at ~200K probes until
-  the fold was added. A collision is only a re-probe (the exact `site`
-  check still gates reuse) — never a correctness issue, and never a place
-  to "fix" by making the check looser. If you change the slot function,
-  change it in `leaf_cache_entry_offset` (compiler) AND `leaf_call_probe`
-  (runtime) together; the empty record's `site = u32::MAX` never matches
-  a real site, so a fresh ctx starts cold in every slot.
+- **The record is keyed by the CALLEE, in the agent's table (G15).** A record
+  holds the leaf's entry + frame descriptor, and both are a pure function of
+  the callee's compiled body — so the table is keyed by the callee alone and
+  one record serves every site that calls it. The table lives on the `Agent`
+  (`Agent::leaf_records`, addressed through `JitCallContext::leaf_records`)
+  rather than inline in the per-run context: a context is created once per JIT
+  run INCLUDING the hot leaf path, and an inline table made every run pay its
+  memset (a 64-entry ctx table took `calls/recursive_fib` 329 → 732 ms before
+  the move). The slot is `runtime::jit::leaf_record_slot(callee)` — a
+  golden-ratio multiply taking the HIGH bits — mirrored by the compiler's
+  `emit_leaf_record_slot`, kept in lockstep by
+  `the_emitter_and_runtime_leaf_record_slots_agree` (a divergence is SILENT:
+  the verdict is written to one slot and read from another, so the site never
+  inlines). Use the high bits: the payload is the box address >> 4, so
+  consecutive closures differ only in the low bits, and the low-bit fold this
+  replaced (`>> 4` / `>> 16` / `>> 28`, or `payload & mask`) collapsed a run
+  of 64 closures onto a handful of slots. A collision is only a re-probe (the
+  exact identity + `code_gen` still gate reuse) — never a correctness issue,
+  and never a place to "fix" by loosening the check. A fresh run starts cold
+  for every slot: `LeafCallRecord::empty()`'s `callee_hi = u32::MAX` is
+  impossible for a real value.
 - **The probe-count drop is the evidence, not wall time.** The getter's
   own call cost dominates, so A/B wall-time deltas were noise (0.025 vs
   0.024s); the defensible measurements are the probe counts 100K → 1
@@ -445,7 +451,7 @@ verdict when it is at rest. Traps:
   `JitHelpers.leaf_call_probe` and assert the flat counts across a
   100K-iteration loop.
 - **The probe takes the call's unbound receiver (G12).** `leaf_call_probe(ctx,
-  callee, this, args, argc, site)` — the extra `this` is the spec's
+  callee, this, args, argc, slot)` — the extra `this` is the spec's
   `thisArgument`, and the probe applies `OrdinaryCallBindThis` before filling the
   frame's `this` slot: strict as-is; sloppy an object as-is, a nullish one → the
   realm's global object, a primitive one *boxed* (it allocates and can throw, so
@@ -463,8 +469,9 @@ verdict when it is at rest. Traps:
   (G14).** `emit_call`'s cache-hit path calls a leaf in-frame only when the
   frame IS the argument region (`frame_size == arity` with all args present);
   every other frame (a `this` slot, or any `var`/lexical slot past the params)
-  goes to `leaf_call_fill(ctx, this, args, argc, site)` — note `sig_call`, not
-  `sig_call_slow`: there is no callee argument. The probe caches the whole fill
+  goes to `leaf_call_fill(ctx, callee, this, args, argc, slot)` — note
+  `sig_call_slow` (the callee selects the record slot; there is no `site`
+  argument any more). The probe caches the whole fill
   descriptor in the record (`LeafInlineInfo.this_slot`/`strict`/`tdz_mask`/
   `fill_ok`) and the hit path rebuilds from it alone, returning the cached
   entry or 0 (the frame no longer fits → `call_slow`). Measured payoff: the
@@ -510,18 +517,42 @@ verdict when it is at rest. Traps:
   monomorphic env leaf: 92 → 40.5 ms at 2M calls. A frame wider than the
   record's TDZ mask records `entry = 0`, so the site falls back instead of
   filling from a truncated mask.
-- **A polymorphic call site re-probes every visit (G15, OPEN).** The record
-  holds ONE callee identity, so a site that sees N callees
-  (`calls/closure_capture` drives 64 closures through `fns[i & 63](i)`)
-  misses the identity check on nearly every visit — `LeafCallProbe` 21.9M for
-  1M calls — and no leaf lane (fill or env) can hold a verdict there. Read the
-  probe count before believing a "the leaf lane refuses this body" story: a
-  per-visit probe count usually means the SITE is polymorphic, not that the
-  body is ineligible.
+- **A polymorphic call site needs one record per callee (G15).** The record
+  holds ONE callee identity, so a site that sees N callees used to re-probe on
+  nearly every visit: `calls/closure_capture` (64 closures through
+  `fns[i & 63](i)`) showed `LeafCallProbe`/`CallSlow` 7,000,000 for 1,000,000
+  iterations — every visit took the probe and then `call_slow` — and a floor
+  build showed the probe's own body was only ~1.4-3.5 ns/call, so the cost was
+  the verdict never holding. Keying the agent table by the callee fixed it: the
+  same row now shows `LeafCallProbe`/`CallSlow` ~900 (the warm-up only) with
+  `leaf_call_fill`/`leaf_call_env` 7,000,000 (the env lane on every visit), and
+  the row fell 88.8 → **50.9 ms**. Because a record's `entry` outlives a run,
+  it must also carry the code GENERATION (`LeafCallRecord::code_gen` against
+  `JitCallContext::leaf_gen`): a run bumps `Agent::leaf_gen` before its first
+  `lookup_info` — whose compile may EVICT, freeing the code a previous run's
+  record named — so a stale record re-probes instead of jumping to a freed
+  entry. Nested runs share the enclosing run's generation (no eviction can
+  happen while a frame is in flight). A sweeping collection still clears the
+  table (`gc_safepoint`), because a recycled box address could match a record's
+  identity. `LEAF_CACHE` (the interpreter's per-function leaf cache) was raised
+  16 → 256 for the same reason: `leaf_call_env` re-derives the closure env
+  through it on every call, so a table smaller than the site's callee count
+  sends each call to the `ecma_functions` HashMap.
+- **Helpers are reached through an UNTYPED function pointer — arity slips are
+  silent.** `emit_raw_call` calls a helper's ADDRESS; a call site left on the
+  old argument list compiles cleanly and the machine code, not the compiler,
+  decides what the helper reads. That already cost a debugging cycle (a lane
+  left passing 4 values to a 5-value helper silently fell back to `call_slow`).
+  After changing any helper's arity, grep every `emit_raw_call`/`call_slow`
+  for it — the compiler will not tell you.
+- **Read the probe count before believing "the leaf lane refuses this body".**
+  A per-visit probe count usually means the SITE holds no verdict
+  (polymorphic, or a slot collision), not that the body is ineligible: G13's
+  audit found `calls/closure_capture` was polymorphic, not env-refused.
 - **The hit path's cache loads MUST wrap `leaf_inline_offset`.** The probe
   path's base (`info`) already points at `leaf_inline`, so it uses a bare
   `offset_of!(LeafInlineInfo, …)`; the hit path's `cache` points at the
-  `LeafCallSiteCache` record, so every field load there must go through
+  `LeafCallRecord` record, so every field load there must go through
   `leaf_inline_offset(offset_of!(…))`. Dropping the wrapper on ONE field
   (e.g. `arity`) reads the high half of `callee_payload` instead, which makes
   `aliased` false almost always: the aliased fast path goes dead and every

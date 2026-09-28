@@ -138,59 +138,87 @@ impl LeafInlineInfo {
 pub const NO_THIS_SLOT: u32 = u32::MAX;
 const TDZ_MASK_SLOTS: usize = u64::BITS as usize;
 
-/// The per-call-site leaf-call cache (Cut 39): the compiled `CallFast`/
-/// `CallFastSlot` sites reuse the probe helper's verdict instead of calling
-/// it every visit. The machine code trusts a record only when ALL of: the
-/// step index matches `site`, the ctx's LIVE `leaf_epoch` still equals
+/// The per-callee leaf-call record (Cut 39, G15): the compiled `CallFast`/
+/// `CallFastSlot` sites reuse the probe helper's verdict instead of calling it
+/// every visit. The record is keyed by the CALLEE, not the call site — the
+/// verdict (the leaf's entry and its frame layout) is a pure function of the
+/// callee's compiled body, so one record serves every site that calls it, and
+/// a megamorphic site (many callees through one call step) holds one record
+/// per callee instead of thrashing a handful of slots.
+///
+/// The table lives on the `Agent` (see `JitCallContext::leaf_records`) rather
+/// than inline in the per-run context: a context is created once per JIT run
+/// — including the hot leaf path — so an inline table makes every run pay its
+/// memset. The machine code trusts a record only when ALL of: its `code_gen`
+/// matches the running context's `leaf_gen` (the shared table outlives a run,
+/// and a run whose start could have evicted compiled code must re-probe rather
+/// than jump to a freed entry), the ctx's LIVE `leaf_epoch` still equals
 /// `epoch` (no slow-path helper that can re-enter the interpreter has run
 /// since the probe), and the callee's NaN-box upper bits + payload match
-/// `callee_hi`/`callee_payload` — together those cover all 64 value bits, so
-/// the identity check is exact (a polymorphic call site re-probes). The
-/// probe fills `leaf_inline`; a zero `entry` caches a rejection (the site
-/// falls back to `call_slow`). `#[repr(C)]` with all-scalar fields: the
-/// compiled code reads the fields at fixed offsets (`offset_of!`).
+/// `callee_hi`/`callee_payload` — together all 64 value bits, so the identity
+/// check is exact. The probe fills `leaf_inline`; a zero `entry` caches a
+/// rejection (the site falls back to `call_slow`). `#[repr(C)]` with
+/// all-scalar fields: the compiled code reads the fields at fixed offsets
+/// (`offset_of!`).
 #[repr(C)]
 #[derive(Clone, Copy)]
-pub struct LeafCallSiteCache {
-    /// The call-site step index this record belongs to (`u32::MAX` = none).
-    pub site: u32,
-    /// The leaf-eligibility epoch at probe time (see `JitCallContext::leaf_epoch`).
-    pub epoch: u32,
-    /// The callee's `bits >> 44` (the NaN-box prefix + tag) at probe time.
-    pub callee_hi: u32,
+pub struct LeafCallRecord {
     /// The callee's `bits & PAYLOAD_MASK` (the box address >> 4) at probe time.
     pub callee_payload: u64,
     /// The probe's verdict (see `LeafInlineInfo`).
     pub leaf_inline: LeafInlineInfo,
+    /// The leaf-eligibility epoch at probe time (see `JitCallContext::leaf_epoch`).
+    pub epoch: u32,
+    /// The code generation at probe time (see `JitCallContext::leaf_gen`).
+    pub code_gen: u32,
+    /// The callee's `bits >> 44` (the NaN-box prefix + tag) at probe time.
+    /// `u32::MAX` — impossible for a real value — marks an empty record, so an
+    /// unwritten slot never matches.
+    pub callee_hi: u32,
 }
 
-impl LeafCallSiteCache {
-    /// An empty record: no site matches (`site` is `u32::MAX`), so the first
-    /// visit probes.
+impl LeafCallRecord {
+    /// An empty record: `callee_hi` is impossible, so the first visit probes.
     pub const fn empty() -> Self {
         Self {
-            site: u32::MAX,
-            epoch: 0,
-            callee_hi: 0,
             callee_payload: 0,
             leaf_inline: LeafInlineInfo::empty(),
+            epoch: 0,
+            code_gen: 0,
+            callee_hi: u32::MAX,
         }
     }
 }
 
-/// Cut 68: the number of direct-mapped `LeafCallSiteCache` records in
-/// `JitCallContext` — the compiled code and the probe both index the set by
-/// `slot(index) = (index ^ (index >> 2)) % LEAF_CALL_CACHE_ENTRIES`, so two
-/// hot leaf call sites that hash to different slots each keep a warm verdict
-/// (a single record made alternating sites re-probe every other visit). The
-/// step index is a compile-time constant per call site, so the machine code
-/// bakes the slot offset in as an immediate. The xor-fold matters: fused
-/// call-store statements land call sites 4-8 steps apart, and the plain
-/// `index % N` would map a spacing of `N` steps to ONE slot (the
-/// two-hot-sites bench's sites at 13 and 21 both fell in slot 1). A
-/// collision (same slot, different site) is just a re-probe — the exact
-/// `site` field check still gates every reuse.
-pub const LEAF_CALL_CACHE_ENTRIES: usize = 4;
+/// G15: the number of direct-mapped `LeafCallRecord`s in the agent's table
+/// (see `JitCallContext::leaf_records`). Sized so a megamorphic call site —
+/// many callees through one call step — can hold one record per callee. A
+/// collision (two callees, one slot) is only a re-probe: the exact identity
+/// check still gates every reuse.
+pub const LEAF_CALL_RECORDS: usize = 256;
+
+/// The bit position [`leaf_record_slot`] shifts the callee hash down to
+/// [`LEAF_CALL_RECORDS`] slots — the table size in bits. The machine code
+/// (`emit_leaf_record_slot`) and the runtime share this constant, so keep
+/// them in lockstep.
+pub const LEAF_CALL_RECORD_SHIFT: u32 = 56;
+
+const _: () = assert!(LEAF_CALL_RECORDS == 1 << (u64::BITS - LEAF_CALL_RECORD_SHIFT));
+
+/// G15: the direct-mapped slot for `callee` in the agent's record table — a
+/// multiplicative hash of the full NaN-boxed value taking the HIGH bits. The
+/// payload is the box address >> 4, so consecutive allocations differ only in
+/// the LOW bits; a low-bit fold (`>> 4`, `>> 16`, `>> 28`, or `& mask` on the
+/// payload) collapsed a run of closures onto a handful of slots. Multiplying
+/// by the golden ratio spreads any allocation stride across the whole table.
+/// The machine code computes the same fold in `emit_leaf_record_slot`, and
+/// `the_emitter_and_runtime_leaf_record_slots_agree` pins the two together:
+/// a divergence is SILENT (the verdict is written to one slot and read from
+/// another, so the site simply never inlines).
+#[inline]
+pub fn leaf_record_slot(callee: u64) -> usize {
+    (callee.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> LEAF_CALL_RECORD_SHIFT) as usize
+}
 
 /// M10: the compiled `Step::CallApply` fast path inlines a dense
 /// `argArray`'s elements only up to this count (the fast-form cap): the
@@ -315,16 +343,24 @@ pub struct JitCallContext {
     pub buf_end: *mut c_void,
     /// Cut 39: the leaf-eligibility epoch — the compiled code bumps it after
     /// every slow-path helper that can re-enter the interpreter (a getter,
-    /// setter, `valueOf`/`toString`, or nested call), and the compiled
-    /// leaf-call cache is trusted only while `leaf_call_cache.epoch ==
-    /// leaf_epoch`. A certified body's own statements never touch the Vm
-    /// stacks or realm count the probe's eligibility checks, so a helper is
-    /// the only way those can change mid-run.
+    /// setter, `valueOf`/`toString`, or nested call), and a leaf-call record is
+    /// trusted only while its `epoch == leaf_epoch`. A certified body's own
+    /// statements never touch the Vm stacks or realm count the probe's
+    /// eligibility checks, so a helper is the only way those can change
+    /// mid-run.
     pub leaf_epoch: u32,
-    /// Cut 39: the per-call-site leaf-call cache (Cut 68: a direct-mapped
-    /// set of `LEAF_CALL_CACHE_ENTRIES` records, indexed by
-    /// `(index ^ (index >> 2)) % N` — see `LeafCallSiteCache`).
-    pub leaf_call_cache: [LeafCallSiteCache; LEAF_CALL_CACHE_ENTRIES],
+    /// Cut 39/G15: the running agent's leaf-call record table
+    /// (`Agent::leaf_records`). The compiled call sites and the slow-path
+    /// helpers address it through this base pointer rather than an inline
+    /// array, so a context — created once per JIT run, including the hot leaf
+    /// path — costs nothing to set up regardless of the table size.
+    pub leaf_records: *mut LeafCallRecord,
+    /// G15: the code generation this run's records carry (see `Agent::leaf_gen`).
+    /// The record table is shared across runs, so a record is trusted only
+    /// while its `code_gen` matches: a run whose start could have evicted compiled
+    /// code (freeing the entries a previous run recorded) re-probes instead of
+    /// jumping to a freed entry.
+    pub leaf_gen: u32,
     /// The compiled body whose machine code is running: the step-index
     /// helpers (`create_function`/`create_arrow`/`create_function_decl`/
     /// `regexp_literal`) read their step's payload (the AST and the
@@ -600,32 +636,41 @@ pub struct JitSlowPaths {
     /// call site falls back to `call_slow`). `args` points at the argument
     /// region's first slot; `argc` is the argument count; `this` is the call's
     /// UNBOUND receiver (spec's `thisArgument` — the probe applies
-    /// `OrdinaryCallBindThis` when it fills the frame's `this` slot); `site` is
-    /// the call site's step index (Cut 39 — the probe records it, plus the live
-    /// leaf-eligibility epoch and the callee identity, so the compiled code
-    /// can skip the probe on repeat visits).
+    /// `OrdinaryCallBindThis` when it fills the frame's `this` slot); `slot` is
+    /// the record slot the compiled call site selected (`leaf_record_slot` of
+    /// the callee) — the probe records the callee identity, the code
+    /// generation and the live leaf-eligibility epoch there, so the compiled
+    /// code can skip the probe on repeat visits.
     pub leaf_call_probe: extern "C" fn(
         ctx: *mut c_void,
         callee: u64,
         this: u64,
         args: *mut u64,
         argc: u64,
-        site: u64,
+        slot: u64,
     ) -> u64,
     /// G14: the compiled leaf-call hit path's frame rebuild for a NON-aliased
-    /// frame — `leaf_call_probe` minus the validation the compiled cache gate
-    /// already did (the site, the callee identity and the leaf-eligibility
-    /// epoch all matched). It re-derives the callee's scope, rebuilds its
-    /// frame above the argument region and returns the cached entry, or 0 when
-    /// the frame no longer fits (the site falls back to `call_slow`).
-    pub leaf_call_fill:
-        extern "C" fn(ctx: *mut c_void, this: u64, args: *mut u64, argc: u64, site: u64) -> u64,
+    /// frame — `leaf_call_probe` minus the validation the compiled record gate
+    /// already did (the generation, the callee identity and the
+    /// leaf-eligibility epoch all matched). It re-derives the callee's scope,
+    /// rebuilds its frame above the argument region and returns the cached
+    /// entry, or 0 when the frame no longer fits (the site falls back to
+    /// `call_slow`). `slot` is the compiled call site's record slot.
+    pub leaf_call_fill: extern "C" fn(
+        ctx: *mut c_void,
+        callee: u64,
+        this: u64,
+        args: *mut u64,
+        argc: u64,
+        slot: u64,
+    ) -> u64,
     /// G13: run a certified leaf that reads its environment on the caller's
     /// ctx and buffer (the frame was already built by `leaf_call_fill`),
     /// swapping `body_context`/`lexical_env` around the compiled entry.
     /// Returns the result bits, or `u64::MAX` to fall back to `call_slow`.
+    /// `slot` is the compiled call site's record slot.
     pub leaf_call_env:
-        extern "C" fn(ctx: *mut c_void, callee: u64, args: *mut u64, argc: u64, site: u64) -> u64,
+        extern "C" fn(ctx: *mut c_void, callee: u64, args: *mut u64, argc: u64, slot: u64) -> u64,
     /// Read a declared top-level `var` off the global object (`name` is an
     /// `AtomId`); returns the value.
     pub get_global: extern "C" fn(ctx: *mut c_void, name: u64) -> u64,
@@ -1521,7 +1566,7 @@ extern "C" fn gc_safepoint(ctx: *mut c_void) -> u64 {
     let agent = unsafe { &mut *ctx.agent };
     agent.maybe_collect();
     if crux::heap::take_swept_since_check() > 0 {
-        ctx.leaf_call_cache = [LeafCallSiteCache::empty(); LEAF_CALL_CACHE_ENTRIES];
+        agent.leaf_records.fill(LeafCallRecord::empty());
     }
     0
 }
@@ -1965,9 +2010,31 @@ fn fill_leaf_frame(
     true
 }
 
+/// G15: the masked record index the compiled call site selected. The machine
+/// code computed `leaf_record_slot(callee)`; the mask is defensive, so a
+/// corrupted argument can never index out of bounds. A wrong slot is caught by
+/// [`record_matches`], never applied.
+#[inline]
+fn record_slot_of(callee: u64, slot: u64) -> usize {
+    debug_assert_eq!(slot as usize, leaf_record_slot(callee));
+    (slot as usize) & (LEAF_CALL_RECORDS - 1)
+}
+
+/// G15: whether `record` still describes `callee` on this run — the code
+/// generation matches (the callee's compiled entry was not evicted since the
+/// probe) and the exact NaN-box identity matches. The helpers re-check what
+/// the machine code already validated, so a stale or collided record is
+/// rejected rather than applied.
+#[inline]
+fn record_matches(ctx: &JitCallContext, record: &LeafCallRecord, callee: u64) -> bool {
+    record.code_gen == ctx.leaf_gen
+        && record.callee_hi == (callee >> 44) as u32
+        && record.callee_payload == callee & crux::PAYLOAD_MASK
+}
+
 /// G14: the compiled leaf-call *hit* path for a non-aliased frame. The
-/// machine code calls this only after its cache gate matched the site, the
-/// callee's NaN-box identity and the live leaf-eligibility epoch, so the
+/// machine code calls this only after its record gate matched the callee's
+/// identity, the code generation and the live leaf-eligibility epoch, so the
 /// verdict is already known and the fill descriptor was recorded by the probe:
 /// this rebuilds the callee's frame straight from the record — no
 /// `leaf_lookup`, no `Rc` clone, no eligibility re-validation — and returns the
@@ -1975,19 +2042,19 @@ fn fill_leaf_frame(
 /// `call_slow`.
 extern "C" fn leaf_call_fill(
     ctx: *mut c_void,
+    callee: u64,
     this: u64,
     args: *mut u64,
     argc: u64,
-    site: u64,
+    slot: u64,
 ) -> u64 {
     let ctx = unsafe { ctx_of(ctx) };
-    let index = (site as usize ^ (site as usize >> 2)) % LEAF_CALL_CACHE_ENTRIES;
-    let cache_entry = &ctx.leaf_call_cache[index];
+    let cache_entry = unsafe { &*ctx.leaf_records.add(record_slot_of(callee, slot)) };
     let info = &cache_entry.leaf_inline;
-    // Defense in depth: the machine code validated the record's `site`, the
-    // callee identity and the `fill_ok` gate before branching here, and no JS
-    // runs between that gate and this call.
-    if cache_entry.site != site as u32 || info.entry == 0 || info.fill_ok == 0 {
+    // Defense in depth: the machine code validated the record's generation,
+    // the callee identity and the `fill_ok` gate before branching here, and
+    // no JS runs between that gate and this call.
+    if !record_matches(ctx, cache_entry, callee) || info.entry == 0 || info.fill_ok == 0 {
         return 0;
     }
     if !fill_leaf_frame(
@@ -2010,37 +2077,37 @@ extern "C" fn leaf_call_probe(
     this: u64,
     args: *mut u64,
     argc: u64,
-    site: u64,
+    slot: u64,
 ) -> u64 {
     let ctx = unsafe { ctx_of(ctx) };
     let agent = unsafe { &mut *ctx.agent };
     let vm = unsafe { &mut *ctx.vm };
-    // SAFETY: the xor-fold modulo `LEAF_CALL_CACHE_ENTRIES` is always in
-    // bounds.
-    let cache_entry =
-        &mut ctx.leaf_call_cache[(site as usize ^ (site as usize >> 2)) % LEAF_CALL_CACHE_ENTRIES];
-    // Record the cache identity up front, before any rejection: the compiled
-    // code reuses this record only when its step index, the live leaf epoch,
-    // and the callee's full NaN-box identity all match — so a cached zero
-    // entry skips the probe for a stable rejection, and a stale record is
+    // SAFETY: `record_slot_of` masks below `LEAF_CALL_RECORDS`, and
+    // `leaf_records` is the running agent's table, live for this run.
+    let cache_entry = unsafe { &mut *ctx.leaf_records.add(record_slot_of(callee, slot)) };
+    // Record the record identity up front, before any rejection: the compiled
+    // code reuses this record only when its code generation, the live leaf
+    // epoch, and the callee's full NaN-box identity all match — so a cached
+    // zero entry skips the probe for a stable rejection, and a stale record is
     // simply re-probed. The one rejection that is not stable — a body the
     // tier-up policy has not compiled yet — clears the identity instead (see
     // `lookup_info`'s null arm below), so the next visit re-probes.
-    *cache_entry = LeafCallSiteCache {
-        site: site as u32,
-        epoch: ctx.leaf_epoch,
-        callee_hi: (callee >> 44) as u32,
+    *cache_entry = LeafCallRecord {
         callee_payload: callee & crux::PAYLOAD_MASK,
         leaf_inline: LeafInlineInfo::empty(),
+        epoch: ctx.leaf_epoch,
+        code_gen: ctx.leaf_gen,
+        callee_hi: (callee >> 44) as u32,
     };
     let callee = Value::from_bits(callee);
     // The eligibility mirrors `fast_call_core`'s leaf gate (the compiled
     // call site is inside a certified body, whose own stacks are the ones
-    // `can_inline_leaf` checks), plus the inline-specific restrictions: the
-    // leaf must not read its environment (the body_context/lexical_env swap
-    // `run_jit_leaf` performs around the run cannot be split across the
-    // helper/machine-code boundary) and must have no `this` slot (the
-    // machine code cannot bind `this` into the frame).
+    // `can_inline_leaf` checks). G12/G13 lifted the old `this`-slot and
+    // environment refusals: a `this` slot is filled by `fill_leaf_frame` (the
+    // probe binds the receiver here, the hit path rebuilds it from the
+    // record), and an environment-reading leaf is recorded with `uses_env` so
+    // the compiled hit path routes it to the env lane (`leaf_call_env`)
+    // instead of calling it in-frame.
     if !vm.can_inline_leaf() || agent.realm_count.get() != 1 {
         return 0;
     }
@@ -2084,7 +2151,7 @@ extern "C" fn leaf_call_probe(
         // reached — the reason every straight-line leaf call stayed on
         // `call_slow`.
         if ir.jit_info.get() != 1 {
-            *cache_entry = LeafCallSiteCache::empty();
+            *cache_entry = LeafCallRecord::empty();
         }
         return 0;
     }
@@ -2151,18 +2218,20 @@ extern "C" fn leaf_call_env(
     callee: u64,
     args: *mut u64,
     argc: u64,
-    site: u64,
+    slot: u64,
 ) -> u64 {
     let ctx = unsafe { ctx_of(ctx) };
     let agent = unsafe { &mut *ctx.agent };
     let vm = unsafe { &mut *ctx.vm };
-    let index = (site as usize ^ (site as usize >> 2)) % LEAF_CALL_CACHE_ENTRIES;
-    let cache_entry = &ctx.leaf_call_cache[index];
+    let cache_entry = unsafe { &*ctx.leaf_records.add(record_slot_of(callee, slot)) };
     let info = &cache_entry.leaf_inline;
-    // Defense in depth: the machine code validated the record's `site`, the
-    // callee identity and the `uses_env` gate before branching here, and no JS
-    // runs between that gate and this call.
-    if cache_entry.site != site as u32 || info.entry == 0 || info.uses_env == 0 || info.fill_ok == 0
+    // Defense in depth: the machine code validated the record's generation,
+    // the callee identity and the `uses_env` gate before branching here, and
+    // no JS runs between that gate and this call.
+    if !record_matches(ctx, cache_entry, callee)
+        || info.entry == 0
+        || info.uses_env == 0
+        || info.fill_ok == 0
     {
         return u64::MAX;
     }
@@ -5540,6 +5609,15 @@ pub(crate) fn run_jit_body(
     if agent.jit_depth >= MAX_JIT_DEPTH {
         return Ok(JitRunOutcome::Interp);
     }
+    // G15: a top-level run may start after a compile evicted code, freeing the
+    // machine entries the agent's shared leaf-call record table still named
+    // (records are keyed by callee identity, and the entry they hold would
+    // dangle). Bump the code generation so this run re-probes rather than
+    // jumping to a freed entry. A nested run shares the enclosing run's
+    // generation: no eviction can happen while a frame is in flight.
+    if agent.jit_depth == 0 {
+        agent.leaf_gen = agent.leaf_gen.wrapping_add(1);
+    }
     // The JIT side of the JS stack-exhaustion guard (the interpreter checks
     // in `run_inner`): refuse to start a compiled activation that would
     // descend into the reserved bottom margin, throwing a catchable
@@ -5610,7 +5688,8 @@ pub(crate) fn run_jit_body(
         globals_unshadowed,
         buf_end: (work_ptr as usize + work_len * std::mem::size_of::<Value>()) as *mut c_void,
         leaf_epoch: 0,
-        leaf_call_cache: [LeafCallSiteCache::empty(); LEAF_CALL_CACHE_ENTRIES],
+        leaf_records: agent.leaf_records.as_mut_ptr(),
+        leaf_gen: agent.leaf_gen,
         body: std::rc::Rc::as_ptr(ir),
         tail: false,
         current_function: vm.current_function.map(|value| value.bits()).unwrap_or(0),
@@ -5755,6 +5834,11 @@ pub(crate) fn run_jit_resume(
     if agent.jit_depth >= MAX_JIT_DEPTH {
         return Ok(JitRunOutcome::Interp);
     }
+    // G15: see `run_jit_body` — a resumed body is a fresh run, and its lookup
+    // below may evict code a recorded entry named.
+    if agent.jit_depth == 0 {
+        agent.leaf_gen = agent.leaf_gen.wrapping_add(1);
+    }
     let info_ptr = lookup_info(hook, ir, agent.jit_depth > 0);
     if info_ptr.is_null() {
         return Ok(JitRunOutcome::Interp);
@@ -5843,7 +5927,8 @@ pub(crate) fn run_jit_resume(
         globals_unshadowed,
         buf_end: (work_ptr as usize + work_len * std::mem::size_of::<Value>()) as *mut c_void,
         leaf_epoch: 0,
-        leaf_call_cache: [LeafCallSiteCache::empty(); LEAF_CALL_CACHE_ENTRIES],
+        leaf_records: agent.leaf_records.as_mut_ptr(),
+        leaf_gen: agent.leaf_gen,
         body: std::rc::Rc::as_ptr(ir),
         tail: false,
         current_function: vm.current_function.map(|value| value.bits()).unwrap_or(0),
