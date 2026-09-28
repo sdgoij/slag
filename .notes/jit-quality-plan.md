@@ -554,24 +554,28 @@ The list, in the measured order:
   generation with no length/cursor change — exactly the interpreter's
   `array_element_write_dense` in-place branch. `opcost/element_write.js`
   1.84 → 1.17 ms, and both store helpers left the census top (§8).
-- **G21 — the compiled non-leaf call (planned, not landed).** The largest
-  remaining "real" deficit: `CallSlow` ~88M, `recursive_fib` 300 ms jit vs
-  518 jitless, and `--jit-bench`'s `non-leaf call` at 0.52 (the weakest arm).
-  Falsified first, per the plan's rule: `fib` IS compiled (its two recursive
-  sites emit the helper) but each call runs the callee through `do_call_fast` —
-  the *interpreter* — so the JIT pays the JIT-buffer spill/reload per call and
-  gets nothing back; the tail-recursive twin (which the JIT lowers to a frame
-  rebind with no helper) costs ~83 ns per recursion against ~262 ns for the
-  non-tail call, so the 3× is the call path, not the arithmetic. Design sketch:
-  a self-call fast path at a `CallSlow` site — check `callee ==
-  ctx.current_function` (a self-call's callee is the running closure, so its
-  body is this same compiled body), take a frame from a runtime-provided frame
-  stack (registered as ONE GC root, covering all levels), write `this`/args into
-  the fresh frame, `call` the compiled entry, pop — gated on frame-stack room
-  and on the body having no try/for-of/suspension (a throw or a suspend inside a
-  nested frame needs the runtime's unwind, and only the top frame is saved on
-  suspension). Needs its own design pass; recorded so the measurement is not
-  redone.
+- **G21 — the compiled non-leaf call — landed (Phase 1: the runtime self-call
+  path).** A compiled `CallSlow` site whose callee IS the running closure now
+  runs the callee's compiled body directly, with a nested frame in a private
+  buffer, instead of re-entering the interpreter's own call machinery
+  (`do_call_fast` -> `ordinary_call` -> `run_compiled_body` -> `run_jit_body`:
+  a fresh Vm take/return, an execution-context push, a frame setup, a
+  global-shadow walk, a root registration and a whole new ctx) per recursion
+  level. The mechanism lives in the runtime (`call_slow`'s `self_call_inline`,
+  `crates/runtime/src/jit.rs`), not in the emitter: the existing helper funnel
+  already receives the shared ctx and the argument region, so the slice is
+  runtime-only (no new helper, no four-file mirror, no Cranelift changes) and
+  is gated by `CompiledBody::self_call_eligible` (`crates/runtime/src/ir.rs`):
+  a certified body with no `this`/`arguments` slot, no per-call capture
+  context, and no try/for-in/for-of/destructuring/suspension step — the nested
+  activation then shares the caller's environment, working-area bound and
+  array-index cursor unmodified. Measured: `recursive_fib.js` **~290 -> ~43 ms
+  jit** (14.7x jitless), `--jit-bench`'s `non-leaf call` **0.52 -> 0.40** (no
+  longer the weakest arm; nothing else moved), corpus parity 77/77. Phase 2
+  remains: lift the funnel into a machine-code `call_indirect` lane (removing
+  the FFI round trip the leaf path already avoids), and extend the gate to
+  general (non-self) certified callees, which needs the callee's scope/entry
+  at the call site rather than the running body's.
 - **G6/G7 and the feedback record — cell capacity, the register path's one shape,
   per-site feedback.** G8 landed (above, Stage 7) as a key→atom cell, not the
   value cell the census implied, because the in-place store discipline forbids a
@@ -697,10 +701,14 @@ The list, in the measured order:
   landed next**: a compiled `break`/`continue` with no finally or for-of in
   scope jumps directly — `control/switch_dispatch.js` 63.5 → 42.2 ms.** G19
   (the switch discriminant + per-case strict-equality inline) then took that
-  row's remaining helper share to zero — 23.7 ms jit, 8.9× jitless. **G20 landed
-  next** (the dense-array overwrite: `opcost/element_write.js` 1.84 → 1.17 ms),
-  and **G21 (the compiled non-leaf call) is measured and planned**, not landed —
-  it needs its own design pass.
+  row's remaining helper share to zero — 23.7 ms jit, 8.9x jitless. **G20 landed
+  next** (the dense-array overwrite: `opcost/element_write.js` 1.84 -> 1.17 ms),
+  and **G21 (the compiled non-leaf call) landed** as a runtime self-call fast
+  path inside the existing `call_slow` funnel (§3, §8): the row's `CallSlow`
+  helper count is unchanged by design (the path lives inside the helper), but
+  `recursive_fib.js` fell ~290 -> ~43 ms and `--jit-bench`'s `non-leaf call`
+  0.52 -> 0.40. Lifting the funnel into a machine-code lane (Phase 2) is
+  recorded in §3.
 
 Each stage: the instrument re-run, the engine gates (fmt, clippy
 `-D warnings`, workspace tests, both `--no-default-features` checks), the
@@ -1420,3 +1428,59 @@ One line per landed stage, newest last. This log is the arc's journal —
   pass / 0 fail / 0 crash / 0 hang, `intl402` 3,205 pass / 0 fail, `--jit-bench`
   all `result-ok`, corpus parity 77 rows 0 mismatches (`mean-jitGap` 87.0 →
   67.8).
+- **Stage 7, G21 — the compiled self-call (2026-09-28).** The last "real" call-side
+  deficit: `recursive_fib.js` at ~290 ms jit vs ~518 jitless and `--jit-bench`'s
+  `non-leaf call` at 0.52 (the weakest arm). The design pass falsified the
+  obvious premise first: `fib`/`bench` DO compile and run compiled —
+  `ordinary_call` -> `run_compiled_body` -> `run_jit_body` is the general
+  activation funnel, so a non-leaf body is not interpreted wholesale — but each
+  recursion goes `emit_call` -> `Helper::CallSlow` -> `do_call_fast` ->
+  `ordinary_call` -> a fresh Vm take/return, an execution-context push, a frame
+  setup, a global-shadow walk, a root registration, a new `JitCallContext` and a
+  new working buffer, per level. The slice moves the fast path into the runtime:
+  `call_slow` (`crates/runtime/src/jit.rs`) checks `callee ==
+  ctx.current_function` (all 64 NaN-box bits, so a self-call's callee IS the
+  running closure and its body is this same compiled body) and, when the body is
+  `self_call_eligible` and `agent.jit_depth < MAX_JIT_DEPTH` and no termination
+  is pending, runs the compiled entry directly (`self_call_inline`): a nested
+  frame carved from a private per-call buffer, the params/TDZ/vars filled
+  (`run_leaf_body`'s layout, with the gate guaranteeing no `this`/`arguments`
+  slot and no per-call capture context, so the nested run shares the caller's
+  environment unchanged), the buffer rooted via `vm.jit_roots`, and `ctx.buf_end`
+  plus the array-index cursor swapped to the nested buffer for the call and
+  restored after. Doing it in the runtime (not the emitter) is what keeps the
+  slice small: the helper funnel already receives the shared ctx and the
+  argument region, so there is no new helper, no four-file mirror and no
+  Cranelift change, and the fallback is the unchanged interpreter path.
+  `CompiledBody::self_call_eligible` (`crates/runtime/src/ir.rs`) is the gate:
+  certified, no try/for-in/for-of/async-for-of/destructuring/suspension step, no
+  `CreateArguments`/`NewTarget`, no `CallApply`, `context_names` empty and no
+  `this`/`arguments` slot; `run_jit_body` takes the verdict as a parameter
+  (true only from `run_compiled_body`, false from the script/async/generator
+  drivers, so a resumable body can never take it). Measured on the `-p cli`-alone
+  binary: `recursive_fib.js` **~290 -> ~43 ms jit** (stable 42.0/42.8/43.8/43.3
+  over four runs; 14.7x jitless, `jlGap` 14.72), `--jit-bench` `non-leaf call`
+  **0.52 -> 0.40** (no longer the weakest arm; `compound assign` 0.50 is) with
+  every other arm in band and nothing regressed. The census is intentionally
+  unchanged (the path lives INSIDE the helper, so `call_slow`'s count is the
+  same; the wall clock is the evidence). Tests: `installed_jit_a_self_recursive_
+  call_matches_the_interpreter` (jit-vs-jitless differential over three shapes +
+  the absolute answers 4800/7660/800 + `compiled >= 2`; mutation-checked by
+  zeroing the param fill → the differential fails) and
+  `installed_jit_a_deep_self_recursion_falls_back_past_the_depth_cap` (depth 400
+  past `MAX_JIT_DEPTH` on a large stack computes correctly, and a runaway
+  recursion still surfaces the interpreter's catchable `RangeError` under both
+  modes). Recorded limitations: the nested activation pushes no
+  `ExecutionContext` (so a stack trace loses self-recursive frames — exactly as
+  the leaf-inline and `TailCallSelf` paths already do), and only self-calls take
+  it (a non-recursive call to another certified function still runs the full
+  funnel). Phase 2 (recorded in §3): a machine-code `call_indirect` lane that
+  removes the FFI round trip, and the general non-self callee (which needs the
+  callee's scope/entry at the call site). Gates: fmt, clippy `-D warnings`
+  (workspace, all-targets), workspace tests, `-p jit --lib`, `-p runtime --lib`
+  (981), `-p runtime --no-default-features --lib` (953), `-p v8 --features
+  simdutf --lib` (380), `-p cli --no-default-features --features jit`, test262
+  `all` 48,464 pass / 0 fail / 0 crash / 0 hang of 48,622, `intl402` 3,205 pass /
+  0 fail of 3,357, corpus parity 77 rows 0 mismatches, `--jit-bench` all
+  `result-ok`. No wasm sweep owed (`wasmtest` does not link `crates/jit`, and
+  `crux` is untouched).

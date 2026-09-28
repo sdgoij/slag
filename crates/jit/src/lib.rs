@@ -759,6 +759,9 @@ mod tests {
             body: std::ptr::null(),
             tail: false,
             current_function: 0,
+            self_entry: 0,
+            self_stack_usage: 0,
+            self_inline_ok: false,
             apply_builtin_bits: 0,
             call_builtin_bits: 0,
             dispatch_value: 0,
@@ -1185,6 +1188,9 @@ mod tests {
             body: std::ptr::null(),
             tail: false,
             current_function: 0,
+            self_entry: 0,
+            self_stack_usage: 0,
+            self_inline_ok: false,
             apply_builtin_bits: 0,
             call_builtin_bits: 0,
             dispatch_value: 0,
@@ -1459,6 +1465,9 @@ mod tests {
             body: std::ptr::null(),
             tail: false,
             current_function: Value::Number(5.0).bits(),
+            self_entry: 0,
+            self_stack_usage: 0,
+            self_inline_ok: false,
             apply_builtin_bits: 0,
             call_builtin_bits: 0,
             dispatch_value: 0,
@@ -1548,6 +1557,9 @@ mod tests {
             body: std::ptr::null(),
             tail: false,
             current_function: 0,
+            self_entry: 0,
+            self_stack_usage: 0,
+            self_inline_ok: false,
             apply_builtin_bits: 0,
             call_builtin_bits: 0,
             dispatch_value: 0,
@@ -3551,6 +3563,127 @@ run(); run(); run(); run(); run(); run(); run(); run(); run();";
             slow <= 40,
             "the site must inline after its tier-up window ({slow} call_slow calls): caching the transient refusal would count ~100K"
         );
+    }
+
+    /// Run `source` to completion, installing a fresh JIT cache when `jit` is
+    /// set, and return the script's numeric result and the compiled-body
+    /// count.
+    fn run_self_call_program(source: &str, jit: bool) -> (f64, usize) {
+        extern "C" fn noop_drop(_cache: *mut c_void) {}
+        let mut agent = runtime::Agent::new();
+        agent.initialize_host_defined_realm().expect("realm");
+        let mut cache = JitCache::new(runtime_helpers()).expect("isa");
+        if jit {
+            agent.jit_hook = Some(runtime::jit::JitHook {
+                cache: (&mut cache as *mut JitCache) as *mut c_void,
+                lookup: jit_cache_lookup,
+                drop_cache: noop_drop,
+                helpers: &runtime::jit::JIT_SLOW_PATHS,
+            });
+        }
+        let value = agent.run_script(source).expect("runs");
+        let compiled = cache.compiled_count();
+        agent.jit_hook = None;
+        (value.as_number().expect("a number"), compiled)
+    }
+
+    #[test]
+    fn installed_jit_a_self_recursive_call_matches_the_interpreter() {
+        // G21: a self-recursive function's non-tail call site goes through
+        // `call_slow`, which runs the callee's compiled body directly (the
+        // "compiled self-call") instead of re-entering the interpreter's call
+        // machinery. The path is JIT-only, so a differential against the
+        // interpreter (no hook) is the exercise: a wrong inline frame fill or
+        // control mistake shows up as a different result, and neutralizing
+        // the fill makes this test fail (a shared bug cannot hide because the
+        // literal answers below are asserted too). Each program is hot enough
+        // that `compiled >= 2`, so the recursive body really compiled.
+        let programs = [
+            // Argument passing through the inline frame (both params).
+            "function bench() {\n\
+               function sum(n, acc) { if (n <= 0) return acc; return sum(n - 1, acc + n * 2 + 1); }\n\
+               var s = 0;\n\
+               for (var i = 0; i < 100; i++) s += sum(6, 0);\n\
+               return s;\n\
+             }\n\
+             bench();",
+            // The corpus shape: a nested `fib` reading its own name from the
+            // enclosing context (`LoadContext`), under a hot outer loop.
+            "function bench() {\n\
+               function fib(n) { if (n < 2) return n; return fib(n - 1) + fib(n - 2); }\n\
+               var s = 0;\n\
+               for (var i = 0; i < 400; i++) { s += fib(i % 12); }\n\
+               return s;\n\
+             }\n\
+             bench();",
+            // A `var` slot past the params, reset at every inline entry.
+            "function bench() {\n\
+               function f(n) { var v; if (v !== undefined) return -1; v = 1; if (n <= 0) return 0; return 1 + f(n - 1); }\n\
+               var s = 0;\n\
+               for (var i = 0; i < 100; i++) s += f(8);\n\
+               return s;\n\
+             }\n\
+             bench();",
+        ];
+        for source in programs {
+            let (jit_value, compiled) = run_self_call_program(source, true);
+            let (interp_value, _) = run_self_call_program(source, false);
+            assert_eq!(
+                jit_value, interp_value,
+                "jit and interpreter disagree:\n{source}"
+            );
+            assert!(
+                compiled >= 2,
+                "the recursive body must compile so the self path is reachable ({compiled} bodies):\n{source}"
+            );
+        }
+        // The absolute answers, independent of any compiled run (a wrong
+        // param/vars frame fill in the self path yields a different number):
+        assert_eq!(run_self_call_program(programs[0], true).0, 4800.0);
+        assert_eq!(run_self_call_program(programs[0], false).0, 4800.0);
+        assert_eq!(run_self_call_program(programs[1], true).0, 7660.0);
+        assert_eq!(run_self_call_program(programs[2], true).0, 800.0);
+    }
+
+    #[test]
+    fn installed_jit_a_deep_self_recursion_falls_back_past_the_depth_cap() {
+        // Past `MAX_JIT_DEPTH` the self path declines to the interpreter
+        // (`run_jit_body` refuses a deeper compiled frame), so a recursion
+        // beyond the cap must still compute correctly, and a runaway one must
+        // still surface the interpreter's catchable stack-exhaustion guard
+        // rather than bypass it. The recursion is deliberately non-tail (the
+        // tail form would take `TailCallSelfCheck` and never reach the self
+        // path). The debug interpreter spends a lot of native stack per
+        // activation, so the default test stack cannot host many levels — the
+        // correct-computation case runs on a deliberately large stack.
+        let below_limit = "function bench() {\n\
+            function down(n, acc) { if (n <= 0) return acc; var r = down(n - 1, acc + 1); return r + 1; }\n\
+            return down(400, 0);\n\
+          }\n\
+          bench();";
+        let (jit_value, interp_value) = std::thread::Builder::new()
+            .stack_size(32 * 1024 * 1024)
+            .spawn(move || {
+                (
+                    run_self_call_program(below_limit, true).0,
+                    run_self_call_program(below_limit, false).0,
+                )
+            })
+            .expect("spawn")
+            .join()
+            .expect("joins");
+        assert_eq!(jit_value, 800.0);
+        assert_eq!(interp_value, 800.0);
+        // A runaway recursion hits the interpreter's guard (the self path caps
+        // at `MAX_JIT_DEPTH`, which is far below the exhaustion point): the
+        // error is catchable and identical with and without the JIT.
+        let runaway = "function bench() {\n\
+            function down(n, acc) { if (n <= 0) return acc; var r = down(n - 1, acc + 1); return r + 1; }\n\
+            try { down(1000000, 0); return 0; } catch (e) { return e instanceof RangeError ? 1 : 2; }\n\
+          }\n\
+          bench();";
+        assert_eq!(run_self_call_program(runaway, true).0, 1.0);
+        assert_eq!(run_self_call_program(runaway, false).0, 1.0);
     }
 
     #[test]

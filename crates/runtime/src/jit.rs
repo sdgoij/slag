@@ -389,6 +389,17 @@ pub struct JitCallContext {
     /// reassigned to a different closure). `0` when no function is running
     /// (a body that can contain the check always runs with one).
     pub current_function: u64,
+    /// G21: the running body's compiled entry and working-area size, when the
+    /// body is self-call eligible (`self_inline_ok`). A compiled `CallSlow`
+    /// site whose callee IS the running closure then runs this body's entry
+    /// directly with a nested frame in a private buffer, instead of
+    /// re-entering `do_call_fast`. `0`/`false` for a body that is not
+    /// eligible (a script, a resumable body, a leaf run) or not compiled.
+    pub self_entry: u64,
+    pub self_stack_usage: u64,
+    /// G21: whether the running body may take the compiled self-call path
+    /// (`CompiledBody::self_call_eligible`). Computed once at run entry.
+    pub self_inline_ok: bool,
     /// M10: the running realm's %Function.prototype.apply%/%call% intrinsic
     /// bits at ctx setup — the compiled `Step::CallApply` fast path compares
     /// the member-read result against them to recognize the intrinsic (then
@@ -1736,6 +1747,25 @@ extern "C" fn call_slow(
     direct_eval: u64,
 ) -> u64 {
     let ctx = unsafe { ctx_of(ctx) };
+    // G21: a self-call — the callee IS the running closure — runs the
+    // compiled body directly, with a nested frame in a private buffer,
+    // instead of re-entering the interpreter's call machinery
+    // (`do_call_fast` -> `ordinary_call` -> `run_compiled_body` ->
+    // `run_jit_body`: a fresh Vm take/return, an execution-context push, a
+    // frame setup, a global-shadow walk, a root registration and a whole new
+    // ctx) for every recursion level. The identity check is exact — a
+    // self-call's callee is the running closure, so its body is this same
+    // compiled body (`self_entry` names it). A termination request, a
+    // non-eligible body, or the depth cap falls through to the interpreter
+    // path below, which surfaces the error or runs interpreted.
+    if ctx.self_inline_ok
+        && direct_eval == 0
+        && ctx.current_function != 0
+        && callee == ctx.current_function
+        && let Some(result) = self_call_inline(ctx, args, argc)
+    {
+        return result;
+    }
     let argc = argc as usize;
     let agent = unsafe { &mut *ctx.agent };
     let vm = unsafe { &mut *ctx.vm };
@@ -1782,6 +1812,94 @@ extern "C" fn call_slow(
             slow_error(ctx, error)
         }
     }
+}
+
+/// G21: run the running body's compiled entry for a self-call (see
+/// [`call_slow`]) — a nested frame carved from a private buffer, the caller's
+/// working-area bound and array-index cursor swapped for its duration, and the
+/// entry called on the shared ctx. Returns `None` when the call must fall back
+/// to the interpreter path (the depth cap, a termination request, or an entry
+/// the body does not have).
+fn self_call_inline(ctx: &mut JitCallContext, args: *mut u64, argc: u64) -> Option<u64> {
+    let agent = unsafe { &mut *ctx.agent };
+    if agent.jit_depth >= MAX_JIT_DEPTH || agent.is_terminating() || ctx.self_entry == 0 {
+        return None;
+    }
+    // SAFETY: `ctx.body` is the `Rc<CompiledBody>` the runtime holds for the
+    // call's duration (see `JitCallContext::body`), and the machine code is
+    // suspended for this synchronous helper.
+    let body = unsafe { &*ctx.body };
+    let scope = body.scope.as_ref()?;
+    // SAFETY: `ctx.self_entry` is the entry `run_jit_body` obtained from the
+    // cache for this same body; a fn pointer is pointer-sized.
+    let entry: JitEntry = unsafe { std::mem::transmute(ctx.self_entry) };
+    let argc = argc as usize;
+    // SAFETY: the JIT passes a pointer into its own live stack buffer with
+    // `argc` slots (the machine code is suspended for this synchronous call).
+    let args = unsafe { std::slice::from_raw_parts(args as *const Value, argc) };
+    let frame_len = scope.frame_size;
+    let buf_len = frame_len + ctx.self_stack_usage as usize + JIT_STACK_SLACK;
+    let (mut inline_buf, mut heap_buf) = ([Value::Undefined; INLINE_JIT_BUF], Vec::<Value>::new());
+    let buf: &mut [Value] = if buf_len <= INLINE_JIT_BUF {
+        &mut inline_buf[..buf_len]
+    } else {
+        heap_buf.resize(buf_len, Value::Undefined);
+        &mut heap_buf[..]
+    };
+    // The frame fill mirrors `run_leaf_body`: the params from the call's
+    // arguments (missing stay undefined), the TDZ slots uninitialized, the
+    // vars undefined. `self_call_eligible` guarantees no `this`/`arguments`
+    // slot and no per-call capture context, so the nested run shares the
+    // caller's environment unchanged.
+    for (slot, cell) in buf.iter_mut().enumerate().take(frame_len) {
+        *cell = if slot < scope.arity {
+            args.get(slot).copied().unwrap_or(Value::Undefined)
+        } else if scope.tdz_store.get(slot).copied().unwrap_or(false) {
+            Value::uninitialized()
+        } else {
+            Value::Undefined
+        };
+    }
+    let frame_ptr = buf.as_mut_ptr() as *mut c_void;
+    // SAFETY: `buf` has `frame_len + stack_usage + slack` slots, so the
+    // working area starts inside it.
+    let stack_ptr = unsafe { buf.as_mut_ptr().add(frame_len) } as *mut c_void;
+    // The nested run shares the caller's ctx, so two caller-owned cursors must
+    // follow the nested buffer for the call's duration: `buf_end` (a leaf call
+    // inside the nested body re-checks its room against it) and the array
+    // index stack (a throw mid-literal must not leak an entry into the
+    // caller). Both are restored on return.
+    let saved_end = ctx.buf_end;
+    ctx.buf_end = unsafe { buf.as_mut_ptr().add(buf_len) } as *mut c_void;
+    let array_len = unsafe { (&*ctx.vm).array_index_stack.len() };
+    // Root the buffer for the call's duration (the Vm is already registered
+    // with the active-run tracer, so `run_jit_leaf`'s per-run registration is
+    // not needed): a helper it invokes can allocate and trigger a collection,
+    // and a heap value only the buffer references must survive until the JIT
+    // stores or returns it.
+    unsafe {
+        (&mut *ctx.vm)
+            .jit_roots
+            .push((buf.as_ptr() as usize, buf.len()))
+    };
+    agent.jit_depth += 1;
+    // SAFETY: `ctx` is the live per-call context the enclosing compiled body
+    // passed to this helper; the entry expects exactly that ABI.
+    let result = unsafe {
+        entry(
+            frame_ptr,
+            stack_ptr,
+            ctx as *mut JitCallContext as *mut c_void,
+        )
+    };
+    agent.jit_depth -= 1;
+    unsafe {
+        let vm = &mut *ctx.vm;
+        vm.jit_roots.pop();
+        vm.array_index_stack.truncate(array_len);
+    }
+    ctx.buf_end = saved_end;
+    Some(result)
 }
 
 extern "C" fn call_apply(
@@ -5657,6 +5775,7 @@ pub(crate) fn run_jit_body(
     agent: &mut Agent,
     vm: &mut Vm,
     ir: &std::rc::Rc<CompiledBody>,
+    self_call_ok: bool,
 ) -> Result<JitRunOutcome, JsError> {
     let Some(hook) = agent.jit_hook else {
         return Ok(JitRunOutcome::Interp);
@@ -5752,6 +5871,9 @@ pub(crate) fn run_jit_body(
         body: std::rc::Rc::as_ptr(ir),
         tail: false,
         current_function: vm.current_function.map(|value| value.bits()).unwrap_or(0),
+        self_entry: if self_call_ok { info.entry as u64 } else { 0 },
+        self_stack_usage: info.stack_usage as u64,
+        self_inline_ok: self_call_ok,
         apply_builtin_bits,
         call_builtin_bits,
         dispatch_value: 0,
@@ -5812,7 +5934,7 @@ pub(crate) fn run_jit_body_loop(
     ir: &mut std::rc::Rc<CompiledBody>,
 ) -> Result<crate::ir::VmOutcome, JsError> {
     loop {
-        match run_jit_body(agent, vm, ir)? {
+        match run_jit_body(agent, vm, ir, false)? {
             JitRunOutcome::Value(value) => {
                 return Ok(crate::ir::VmOutcome::Completed(
                     crate::flow::Completion::Return(value),
@@ -5992,6 +6114,9 @@ pub(crate) fn run_jit_resume(
         body: std::rc::Rc::as_ptr(ir),
         tail: false,
         current_function: vm.current_function.map(|value| value.bits()).unwrap_or(0),
+        self_entry: 0,
+        self_stack_usage: 0,
+        self_inline_ok: false,
         apply_builtin_bits,
         call_builtin_bits,
         dispatch_value: 0,

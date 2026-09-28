@@ -2685,7 +2685,7 @@ fn run_compiled_body(
     // native stack.
     if ir.scope.is_some() {
         loop {
-            match crate::jit::run_jit_body(agent, &mut vm, &ir)? {
+            match crate::jit::run_jit_body(agent, &mut vm, &ir, ir.self_call_eligible())? {
                 crate::jit::JitRunOutcome::Value(value) => {
                     let result = crate::eval::dispose_env_resources(
                         agent,

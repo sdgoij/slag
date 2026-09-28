@@ -783,3 +783,44 @@ Corollaries for any new cell:
   and `installed_jit_computed_read_after_inplace_store_matches_the_interpreter`
   pins the store-visibility contract; mutation-check both when the probe
   changes.
+
+## 20. The compiled self-call (G21) — `call_slow`'s runtime fast path
+
+A compiled `CallSlow` site whose callee IS the running closure is run by
+`call_slow`'s `self_call_inline` (`crates/runtime/src/jit.rs`) on the shared
+ctx, with a nested frame in a private per-call buffer — no re-entry through
+`do_call_fast`/`run_compiled_body`/`run_jit_body`. It is runtime-only (no new
+helper, no emitter change), gated in `CompiledBody::self_call_eligible`
+(`crates/runtime/src/ir.rs`) and passed to `run_jit_body` as `self_call_ok`
+(true only from `run_compiled_body`, false from the script/async/generator
+drivers, or a resumable body would take it and return a plain value instead of
+a promise/generator). Traps:
+
+- **The nested run SHARES the caller's ctx, so two caller-owned cursors must be
+  swapped to the nested buffer and restored: `ctx.buf_end`** (a leaf call inside
+  the nested body re-checks its room against it — leaving it pointing at the
+  caller's buffer makes the nested leaf carve into the caller's frame) **and
+  `Vm::array_index_stack`** (a throw mid-literal would otherwise leak an entry
+  into the caller's next literal). The private buffer is rooted via
+  `vm.jit_roots` for the call's duration (the Vm is already an active-run root);
+  `agent.jit_depth` is bumped so the cache cannot evict mid-run.
+- **The gate is what makes the shared environment sound.** It excludes every
+  body that builds a fresh per-call env (`context_names` non-empty), reads
+  `this`/`arguments`, or carries try/for-in/for-of/async-for-of/destructuring/
+  suspension/`NewTarget`/`CreateArguments`/`CallApply`. Reading the *enclosing*
+  context (`LoadContext`, as `fib` does for its own name) is fine — the env is
+  the same object at every recursion level — but a body that would call
+  `new_body_context` is not: the closure's outer env is not on the ctx.
+- **The path pushes no `ExecutionContext`** (same as the leaf-inline and
+  `TailCallSelf` paths), so a stack trace loses self-recursive frames. That is
+  deliberate and consistent; do not "fix" it by pushing a context per level.
+- **`ctx.self_entry`/`self_stack_usage`/`self_inline_ok` are set at run entry**
+  (from the cache `info`), which is why `run_jit_body` needs the `self_call_ok`
+  parameter and every `JitCallContext` literal (4 in `crates`, 4 more in
+  `crates/jit/src/lib.rs`'s scaffold tests) must set the three fields. A new
+  literal that forgets them fails to compile — which is the point.
+
+`installed_jit_a_self_recursive_call_matches_the_interpreter` (differential +
+absolute answers; mutation-check by zeroing the param fill) and
+`installed_jit_a_deep_self_recursion_falls_back_past_the_depth_cap` (the
+`MAX_JIT_DEPTH` decline and the catchable guard) pin it.

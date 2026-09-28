@@ -1757,6 +1757,68 @@ pub struct CompiledBody {
     pub has_call_apply: bool,
 }
 
+impl CompiledBody {
+    /// G21: whether a call to this body may take the runtime's compiled
+    /// self-call fast path (`crate::jit::call_slow`). When the callee IS the
+    /// running closure, the call runs this body's machine code directly with
+    /// a nested frame in a private buffer, instead of re-entering the
+    /// interpreter's call machinery (`ordinary_call` -> `run_compiled_body`)
+    /// for every recursion level.
+    ///
+    /// The gate is deliberately conservative: the nested activation must be
+    /// self-contained, sharing the caller's environment and control state.
+    /// - No `this` slot, `arguments` slot, or per-call capture context: the
+    ///   nested run reuses the caller's environment, so a body that reads
+    ///   `this`/`arguments` or builds a fresh capture context would be wrong.
+    /// - No try, for-in/for-of, destructuring, or suspension: their unwind /
+    ///   close / resume machinery spans one activation, and only the top
+    ///   frame is saved on suspension.
+    /// - No `CallApply` (a direct-eval callee must run in the caller's env).
+    ///
+    /// Everything else falls back to `call_slow`'s interpreter path.
+    pub(crate) fn self_call_eligible(&self) -> bool {
+        let Some(scope) = self.scope.as_ref() else {
+            return false;
+        };
+        if self.has_call_apply
+            || !scope.context_names.is_empty()
+            || scope.arguments_slot.is_some()
+            || scope.this_slot.is_some()
+        {
+            return false;
+        }
+        !self.steps.iter().any(|step| {
+            matches!(
+                step,
+                Step::EnterTry { .. }
+                    | Step::ForInBegin
+                    | Step::ForInNext { .. }
+                    | Step::ForOfBegin { .. }
+                    | Step::ForOfNext { .. }
+                    | Step::ForOfNextBindLocal { .. }
+                    | Step::AsyncForOfBegin { .. }
+                    | Step::AsyncForOfNext
+                    | Step::DestructureBegin
+                    | Step::DestructureNext
+                    | Step::DestructureUndef { .. }
+                    | Step::DestructureRest
+                    | Step::DestructureObjCoercible
+                    | Step::DestructureObjKey { .. }
+                    | Step::DestructureObjKeyComputed
+                    | Step::DestructureObjKeyStore
+                    | Step::DestructureObjKeyGet
+                    | Step::DestructureObjRest { .. }
+                    | Step::DestructureClose
+                    | Step::DestructureObjEnd
+                    | Step::Yield { .. }
+                    | Step::Await { .. }
+                    | Step::NewTarget
+                    | Step::CreateArguments { .. }
+            )
+        })
+    }
+}
+
 impl Trace for CompiledBody {
     fn trace(&self, visit: &mut dyn FnMut(GcAny)) {
         self.steps.trace(visit);
@@ -12982,6 +13044,9 @@ impl Vm {
             body: std::rc::Rc::as_ptr(ir),
             tail: false,
             current_function: 0,
+            self_entry: 0,
+            self_stack_usage: 0,
+            self_inline_ok: false,
             apply_builtin_bits,
             call_builtin_bits,
             dispatch_value: 0,
