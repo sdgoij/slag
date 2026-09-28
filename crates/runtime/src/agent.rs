@@ -356,6 +356,13 @@ pub struct Agent {
     /// cells at fixed offsets; `MemberValueCell::empty()`'s impossible id
     /// never validates.
     pub(crate) member_value_cells: Box<[crate::ir::MemberValueCell; crate::ir::MEMBER_CELLS]>,
+    /// The computed-read value cache (G8): (id, key Value, generation, value)
+    /// for `o[k]`, keyed by the key's identity rather than an interned atom so
+    /// the compiled probe can run before the key is converted. Boxed on the
+    /// same Cut 27 lesson; traced (the key box must outlive the cell, which is
+    /// what makes the identity match sound).
+    pub(crate) computed_read_cells:
+        Box<[crate::ir::ComputedReadCell; crate::ir::COMPUTED_READ_CELLS]>,
     /// The write-side value cache (L1a warm-store fast path): (id, name,
     /// generation, slot) — "at this generation, `name` is an own writable
     /// data property of `id` at property-vector `slot`". A store whose (id,
@@ -1258,6 +1265,9 @@ impl Agent {
             member_value_cells: Box::new(std::array::from_fn(|_| {
                 crate::ir::MemberValueCell::empty()
             })),
+            computed_read_cells: Box::new(std::array::from_fn(|_| {
+                crate::ir::ComputedReadCell::empty()
+            })),
             member_write_cells: {
                 // The write table is larger than the other IC tables; build it
                 // on the heap directly (a `from_fn` array temporary would sit on
@@ -1973,6 +1983,9 @@ impl Agent {
         // The IC value caches hold Values; the index-only caches re-resolve
         // from the (traced) objects and need no tracing.
         for cell in self.member_value_cells.iter() {
+            cell.trace(visit);
+        }
+        for cell in self.computed_read_cells.iter() {
             cell.trace(visit);
         }
         for cell in self.array_element_value_cells.iter() {

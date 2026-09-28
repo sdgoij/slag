@@ -322,6 +322,10 @@ pub struct JitCallContext {
     /// `GetMemberName` probe indexes it by `(object_id ^ name) &
     /// (MEMBER_CELLS - 1)` and reads the `#[repr(C)]` cells).
     pub member_value_cells: *mut c_void,
+    /// The `Agent::computed_read_cells` array base (the compiled computed-read
+    /// probe indexes it by `computed_read_cell_index(id, key_bits)` and reads
+    /// the `#[repr(C)]` cells).
+    pub computed_read_cells: *mut c_void,
     /// The `Agent::member_map_cells` array base (the compiled
     /// `GetMemberName` shape probe indexes it by `(map_id ^ name) &
     /// (MEMBER_CELLS - 1)` and reads the `#[repr(C)]` cells: a map id pins
@@ -5732,6 +5736,7 @@ pub(crate) fn run_jit_body(
         global_object: global.as_ptr() as *mut c_void,
         global_value_cells: agent.global_value_cells.as_ptr() as *mut c_void,
         member_value_cells: agent.member_value_cells.as_ptr() as *mut c_void,
+        computed_read_cells: agent.computed_read_cells.as_ptr() as *mut c_void,
         member_map_cells: agent.member_map_cells.as_ptr() as *mut c_void,
         globals_unshadowed,
         buf_end: (work_ptr as usize + work_len * std::mem::size_of::<Value>()) as *mut c_void,
@@ -5971,6 +5976,7 @@ pub(crate) fn run_jit_resume(
         global_object: global.as_ptr() as *mut c_void,
         global_value_cells: agent.global_value_cells.as_ptr() as *mut c_void,
         member_value_cells: agent.member_value_cells.as_ptr() as *mut c_void,
+        computed_read_cells: agent.computed_read_cells.as_ptr() as *mut c_void,
         member_map_cells: agent.member_map_cells.as_ptr() as *mut c_void,
         globals_unshadowed,
         buf_end: (work_ptr as usize + work_len * std::mem::size_of::<Value>()) as *mut c_void,

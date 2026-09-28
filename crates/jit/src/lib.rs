@@ -749,6 +749,7 @@ mod tests {
             global_bits: 0,
             global_value_cells: std::ptr::null_mut(),
             member_value_cells: std::ptr::null_mut(),
+            computed_read_cells: std::ptr::null_mut(),
             member_map_cells: std::ptr::null_mut(),
             globals_unshadowed: false,
             buf_end: std::ptr::null_mut(),
@@ -1174,6 +1175,7 @@ mod tests {
             global_bits: 0,
             global_value_cells: std::ptr::null_mut(),
             member_value_cells: std::ptr::null_mut(),
+            computed_read_cells: std::ptr::null_mut(),
             member_map_cells: std::ptr::null_mut(),
             globals_unshadowed: false,
             buf_end: std::ptr::null_mut(),
@@ -1447,6 +1449,7 @@ mod tests {
             global_bits: 0,
             global_value_cells: std::ptr::null_mut(),
             member_value_cells: std::ptr::null_mut(),
+            computed_read_cells: std::ptr::null_mut(),
             member_map_cells: std::ptr::null_mut(),
             globals_unshadowed: false,
             buf_end: std::ptr::null_mut(),
@@ -1535,6 +1538,7 @@ mod tests {
             global_bits: 0,
             global_value_cells: std::ptr::null_mut(),
             member_value_cells: std::ptr::null_mut(),
+            computed_read_cells: std::ptr::null_mut(),
             member_map_cells: std::ptr::null_mut(),
             globals_unshadowed: false,
             buf_end: std::ptr::null_mut(),
@@ -3745,6 +3749,39 @@ run(); run(); run(); run(); run(); run(); run(); run(); run();";
         assert_eq!(
             slots.len(),
             runtime::jit::LEAF_CALL_RECORDS,
+            "every slot must be reachable"
+        );
+    }
+
+    #[test]
+    fn the_emitter_and_runtime_computed_read_slots_agree() {
+        // G8: the compiled computed-read probe computes its slot inline in
+        // `emit_element_read`; every runtime access computes it in
+        // `runtime::ir::computed_read_cell_index`. If the two drift, the probe
+        // reads a slot the runtime never writes and the read silently never
+        // inlines. Keep the two expressions byte-for-byte equivalent.
+        fn emitter(key_bits: u64) -> usize {
+            (key_bits as usize) & (runtime::ir::COMPUTED_READ_CELLS - 1)
+        }
+        for key_bits in [
+            0u64,
+            0x7ff8_0000_0000_0000,
+            0x7ff8_0005_1234_5670,
+            0x0fff_ffff_ffff_ffff,
+        ] {
+            assert_eq!(
+                emitter(key_bits),
+                runtime::ir::computed_read_cell_index(key_bits),
+                "key={key_bits:#x}"
+            );
+        }
+        // Every slot must be reachable (a dead slot would waste a key forever).
+        let slots: std::collections::HashSet<usize> = (0..4096u64)
+            .map(|i| runtime::ir::computed_read_cell_index(0x7ff8_0000_1000_0000 + i))
+            .collect();
+        assert_eq!(
+            slots.len(),
+            runtime::ir::COMPUTED_READ_CELLS,
             "every slot must be reachable"
         );
     }
@@ -6409,6 +6446,103 @@ run(); run(); run(); run(); run(); run(); run(); run(); run();";
             reads < 100,
             "the compiled read loop must inline the dense element read ({reads} get_member_computed calls)"
         );
+    }
+
+    #[test]
+    fn installed_jit_computed_read_cell_inlines() {
+        // G8: a monomorphic `o[k]` read with a String key over an own data
+        // property in a compiled loop must serve from the computed-read cell —
+        // the counting wrapper proves the `get_member_computed` helper runs
+        // only while the cell warms up (a couple of reads per key), not per
+        // element — and the value must match the interpreter.
+        static READ_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        extern "C" fn counting_read(ctx: *mut c_void, object: u64, key: u64) -> u64 {
+            READ_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            (runtime::jit::JIT_SLOW_PATHS.get_member_computed)(ctx, object, key)
+        }
+        let mut helpers = runtime_helpers();
+        helpers.get_member_computed = Some(counting_read);
+
+        // The loop is the cell-served shape (an own data property, String keys
+        // cycling over five names); the tail exercises the declines — a Number
+        // key, an unrecorded String key, and a primitive receiver — which must
+        // still go through the helper.
+        let source = "function sum(o, keys, n) {\n\
+                        var s = 0;\n\
+                        for (var i = 0; i < n; i++) { s += o[keys[i % 5]]; }\n\
+                        return s;\n\
+                      }\n\
+                      var o = { a: 1, b: 2, c: 3, d: 4, e: 5 };\n\
+                      var keys = ['a', 'b', 'c', 'd', 'e'];\n\
+                      var r = sum(o, keys, 100000);\n\
+                      var num = o[0];\n\
+                      var miss = o['zzz'];\n\
+                      var prim = (5)['x'];\n\
+                      r + (num === undefined ? 1 : 0) + (miss === undefined ? 1 : 0)\n\
+                        + (prim === undefined ? 1 : 0);";
+        let interp = {
+            let mut agent = runtime::Agent::new();
+            agent.initialize_host_defined_realm().expect("realm");
+            agent.run_script(source).expect("interp runs")
+        };
+
+        extern "C" fn noop_drop(_cache: *mut c_void) {}
+        let mut agent = runtime::Agent::new();
+        agent.initialize_host_defined_realm().expect("realm");
+        let mut cache = JitCache::new(helpers).expect("isa");
+        agent.jit_hook = Some(runtime::jit::JitHook {
+            cache: (&mut cache as *mut JitCache) as *mut c_void,
+            lookup: jit_cache_lookup,
+            drop_cache: noop_drop,
+            helpers: &runtime::jit::JIT_SLOW_PATHS,
+        });
+        let value = agent.run_script(source).expect("jit runs");
+        let compiled = cache.compiled_count();
+        agent.jit_hook = None;
+        assert_eq!(
+            value, interp,
+            "the computed read must match the interpreter"
+        );
+        assert!(compiled >= 1, "{compiled} bodies must compile");
+        let reads = READ_CALLS.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            reads < 100,
+            "the compiled read loop must serve from the computed-read cell ({reads} get_member_computed calls)"
+        );
+    }
+
+    #[test]
+    fn installed_jit_computed_read_after_inplace_store_matches_the_interpreter() {
+        // G8: an in-place value write (`o[k] = v`, the compiled `SetMemberSlot`
+        // and the interpreter's warm store) deliberately does NOT bump the
+        // receiver's generation — it refreshes the read-side value cell instead.
+        // The compiled computed read takes its VALUE from that cell, so a store
+        // in the loop must be visible. A cell that cached the value itself would
+        // serve a stale read here (the corpus caught exactly this).
+        let source = "function bump(o, keys, n) {\n\
+                        var s = 0;\n\
+                        for (var i = 0; i < n; i++) {\n\
+                          var k = keys[i % 5];\n\
+                          s += o[k];\n\
+                          o[k] = o[k] + 1;\n\
+                        }\n\
+                        return s;\n\
+                      }\n\
+                      var o = { a: 0, b: 0, c: 0, d: 0, e: 0 };\n\
+                      var keys = ['a', 'b', 'c', 'd', 'e'];\n\
+                      var r = bump(o, keys, 1000);\n\
+                      r + o.a + o.b + o.c + o.d + o.e;";
+        let interp = {
+            let mut agent = runtime::Agent::new();
+            agent.initialize_host_defined_realm().expect("realm");
+            agent.run_script(source).expect("interp runs")
+        };
+        let (value, compiled) = with_jit_agent(|agent| agent.run_script(source).expect("runs"));
+        assert_eq!(
+            value, interp,
+            "a store must invalidate the compiled computed read"
+        );
+        assert!(compiled >= 1, "{compiled} bodies");
     }
 
     #[test]

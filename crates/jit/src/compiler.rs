@@ -37,8 +37,9 @@ use cranelift_control::ControlPlane;
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Variable};
 use crux::Value;
 use runtime::ir::{
-    ApplyKind, CompiledBody, FastLoopVar, GLOBAL_CELLS, LeafOp, MEMBER_CELLS, MemberMapCell,
-    MemberValueCell, NumRhs, RegOperand, RelLimit, ScopeInfo, Step, TryFrame, is_compound_assign,
+    ApplyKind, COMPUTED_READ_CELLS, CompiledBody, ComputedReadCell, FastLoopVar, GLOBAL_CELLS,
+    LeafOp, MEMBER_CELLS, MemberMapCell, MemberValueCell, NumRhs, RegOperand, RelLimit, ScopeInfo,
+    Step, TryFrame, is_compound_assign,
 };
 use runtime::jit::{
     AGENT_REALM_COUNT_OFFSET, BUILDER_BUF_OFFSET, BUILDER_CAP_OFFSET, BUILDER_ENABLED_OFFSET,
@@ -2527,19 +2528,21 @@ impl<'a> Lowerer<'a> {
         Ok(())
     }
 
-    /// The inline computed element read (`a[i]` / `ta[k]`), shared by the step
-    /// `GetMemberComputed` and the register `GetMemberComputed`/
+    /// The inline computed element read (`a[i]` / `ta[k]` / `o[k]`), shared by
+    /// the step `GetMemberComputed` and the register `GetMemberComputed`/
     /// `GetMemberComputedLocal` (the fast-loop shape). A dense Array's buffer
     /// element and a numeric TypedArray's element are served from machine code;
-    /// every other shape falls to the `get_member_computed` helper (which
-    /// re-resolves the key and serves a prototype element / accessor / an
-    /// unsupported element kind).
+    /// a String-keyed own-data read on a plain object or an Array is served
+    /// from the computed-read cell (G8); every other shape falls to the
+    /// `get_member_computed` helper (which re-resolves the key and serves a
+    /// prototype element / accessor / an unsupported element kind).
     ///
-    /// The two inline shapes are mutually exclusive — `array_dense` is non-null
-    /// iff the receiver is a dense Array, `typed_array` iff it is
+    /// The two inline element shapes are mutually exclusive — `array_dense` is
+    /// non-null iff the receiver is a dense Array, `typed_array` iff it is
     /// Integer-Indexed — so the `kind` block dispatches on `array_dense` and
-    /// each arm declines into the next. `value_var` is shared; the helper block
-    /// and `merge` are created and sealed here on return.
+    /// each arm declines into the next, then into the cell probe. `value_var` is
+    /// shared; the cell probe, the helper block and `merge` are created and
+    /// sealed here on return.
     fn emit_element_read(
         &mut self,
         object: ClifValue,
@@ -2547,21 +2550,26 @@ impl<'a> Lowerer<'a> {
     ) -> Result<ClifValue, Unsupported> {
         let value_var = self.builder.declare_var(types::I64);
         let merge = self.builder.create_block();
-        let helper = self.builder.create_block();
+        let slow = self.builder.create_block();
         let kind = self.builder.create_block();
         let dense = self.builder.create_block();
         let typed = self.builder.create_block();
+        let cell = self.builder.create_block();
+        let probe = self.builder.create_block();
+        let member = self.builder.create_block();
         // Object tag: a tagged value is `TAG_PREFIX | (tag << 44) | payload`,
         // so shifting the top 20 bits down and comparing against the packed
         // prefix+Object pattern checks the heap prefix AND the Object tag in
-        // one compare.
+        // one compare. Only an Object-tagged receiver can own a computed-read
+        // cell (the interpreter gates the cell on `ValueKind::Object`), so a
+        // Function or a primitive skips the probe straight to the helper.
         let object_pattern = (crux::TAG_PREFIX >> 44) | crux::TAG_OBJECT;
         let tag_bits = self.builder.ins().ushr_imm_u(object, 44);
         let obj_ok = self
             .builder
             .ins()
             .icmp_imm_u(IntCC::Equal, tag_bits, object_pattern as i64);
-        self.builder.ins().brif(obj_ok, kind, &[], helper, &[]);
+        self.builder.ins().brif(obj_ok, kind, &[], slow, &[]);
         self.builder.seal_block(kind);
         self.builder.switch_to_block(kind);
         let obj_ptr = self
@@ -2586,13 +2594,130 @@ impl<'a> Lowerer<'a> {
         self.builder.ins().brif(is_dense, dense, &[], typed, &[]);
         self.builder.seal_block(dense);
         self.builder.seal_block(typed);
-        self.emit_dense_element_read_into(dense_base, key, dense, value_var, helper, merge)?;
-        self.emit_typed_array_read_into(key, obj_ptr, typed, value_var, helper, merge)?;
-        // The helper: the full Get re-resolves the key, serves a prototype
-        // element / accessor / an unsupported element kind, and repopulates the
+        self.emit_dense_element_read_into(dense_base, key, dense, value_var, cell, merge)?;
+        self.emit_typed_array_read_into(key, obj_ptr, typed, value_var, cell, merge)?;
+        // G8: the computed-read key cache, the machine twin of the interpreter's
+        // `get_member_computed` key resolution. A dense-Array or TypedArray
+        // decline lands here (and only an Object-tagged receiver reaches this
+        // dispatch), so a String-keyed read on a plain object or an Array — the
+        // shape the two element arms cannot serve — resolves its name with no
+        // `intern` and no helper. The cell maps the key Value's identity (a
+        // String box; immutable) to its interned atom, so the probe runs BEFORE
+        // any key conversion; the VALUE then comes from `member_value_cells`, the
+        // cell the store paths maintain (an in-place value write refreshes it at
+        // the unchanged generation; a structural change bumps the generation and
+        // invalidates it), so this read is exactly the interpreter's own
+        // `member_cell_get`.
+        self.builder.seal_block(cell);
+        self.builder.switch_to_block(cell);
+        let key_is_string = self.is_string(key);
+        self.builder
+            .ins()
+            .brif(key_is_string, probe, &[], slow, &[]);
+        self.builder.seal_block(probe);
+        self.builder.switch_to_block(probe);
+        let ctx = self.vm();
+        let cells = self.builder.ins().load(
+            types::I64,
+            MemFlagsData::new(),
+            ctx,
+            Offset32::new(std::mem::offset_of!(JitCallContext, computed_read_cells) as i32),
+        );
+        // `runtime::ir::computed_read_cell_index` folds the key's bits into the
+        // table size; the emitter and the runtime must compute the identical
+        // slot (a divergence is silent: the probe never hits).
+        let cell_slot = self
+            .builder
+            .ins()
+            .band_imm_u(key, (COMPUTED_READ_CELLS - 1) as i64);
+        let index_bytes = self
+            .builder
+            .ins()
+            .imul_imm_s(cell_slot, std::mem::size_of::<ComputedReadCell>() as i64);
+        let cell_ptr = self.builder.ins().iadd(cells, index_bytes);
+        let cell_key = self.builder.ins().load(
+            types::I64,
+            MemFlagsData::new(),
+            cell_ptr,
+            Offset32::new(std::mem::offset_of!(ComputedReadCell, key) as i32),
+        );
+        let key_ok = self.builder.ins().icmp(IntCC::Equal, cell_key, key);
+        self.builder.ins().brif(key_ok, member, &[], slow, &[]);
+        // The member-value cell (id + name + generation validation): a hit is an
+        // own data property, current under the store paths' refresh discipline.
+        self.builder.seal_block(member);
+        self.builder.switch_to_block(member);
+        let atom = self.builder.ins().load(
+            types::I32,
+            MemFlagsData::new(),
+            cell_ptr,
+            Offset32::new(std::mem::offset_of!(ComputedReadCell, atom) as i32),
+        );
+        let live_id = self.builder.ins().load(
+            types::I64,
+            MemFlagsData::new(),
+            obj_ptr,
+            Offset32::new(std::mem::offset_of!(crux::JsObject, id) as i32),
+        );
+        let live_gen = self.builder.ins().load(
+            types::I32,
+            MemFlagsData::new(),
+            obj_ptr,
+            Offset32::new(std::mem::offset_of!(crux::JsObject, generation) as i32),
+        );
+        let member_cells = self.builder.ins().load(
+            types::I64,
+            MemFlagsData::new(),
+            ctx,
+            Offset32::new(std::mem::offset_of!(JitCallContext, member_value_cells) as i32),
+        );
+        let atom_bits = self.builder.ins().uextend(types::I64, atom);
+        let member_slot = self.builder.ins().bxor(live_id, atom_bits);
+        let member_slot = self
+            .builder
+            .ins()
+            .band_imm_u(member_slot, (MEMBER_CELLS - 1) as i64);
+        let member_bytes = self
+            .builder
+            .ins()
+            .imul_imm_s(member_slot, std::mem::size_of::<MemberValueCell>() as i64);
+        let member_cell = self.builder.ins().iadd(member_cells, member_bytes);
+        let member_id = self.builder.ins().load(
+            types::I64,
+            MemFlagsData::new(),
+            member_cell,
+            Offset32::new(std::mem::offset_of!(MemberValueCell, id) as i32),
+        );
+        let member_name = self.builder.ins().load(
+            types::I32,
+            MemFlagsData::new(),
+            member_cell,
+            Offset32::new(std::mem::offset_of!(MemberValueCell, name) as i32),
+        );
+        let member_gen = self.builder.ins().load(
+            types::I32,
+            MemFlagsData::new(),
+            member_cell,
+            Offset32::new(std::mem::offset_of!(MemberValueCell, generation) as i32),
+        );
+        let member_value = self.builder.ins().load(
+            types::I64,
+            MemFlagsData::new(),
+            member_cell,
+            Offset32::new(std::mem::offset_of!(MemberValueCell, value) as i32),
+        );
+        let id_ok = self.builder.ins().icmp(IntCC::Equal, member_id, live_id);
+        let name_ok = self.builder.ins().icmp(IntCC::Equal, member_name, atom);
+        let gen_ok = self.builder.ins().icmp(IntCC::Equal, member_gen, live_gen);
+        let id_name_ok = self.builder.ins().band(id_ok, name_ok);
+        let ok = self.builder.ins().band(id_name_ok, gen_ok);
+        self.builder.def_var(value_var, member_value);
+        self.builder.ins().brif(ok, merge, &[], slow, &[]);
+        // The helper: the full Get interns the key, serves a prototype element /
+        // accessor / an unsupported element kind, and repopulates the member
         // element cell.
-        self.builder.seal_block(helper);
-        self.builder.switch_to_block(helper);
+        self.builder.seal_block(slow);
+        self.builder.switch_to_block(slow);
         let res = self.call_slow(self.sig_get_comp, Helper::GetMemberComputed, &[object, key])?;
         self.builder.def_var(value_var, res);
         self.builder.ins().jump(merge, &[]);

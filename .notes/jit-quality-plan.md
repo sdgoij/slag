@@ -508,11 +508,28 @@ The list, in the measured order:
     real cost is the `o[k]` computed read on a non-Array object
     (`GetMemberComputed` 5.25M in the same directory — a per-site-IC surface,
     Stage 7), not the protocol. Recorded so it is not re-opened as an inline.
-- **G6/G7/G8 — cell capacity, the register path's one shape, no feedback.**
-  G8 is now load-bearing for a sharper reason: G9, G10 and G11 are each a
-  *missing inline path*, and doing them one at a time is how the current
-  asymmetry (an inline path for `+` but not `<<`, for an own read but not an
-  inherited one) came to exist.
+- **G8 — the computed read's per-read helper (landed, Stage 7).** The
+  census's `GetMemberComputed` (73.4M, 12 rows) was the whole helper, not the
+  interning: the same read *named* is 7.0 ns with zero helper calls (machine
+  code), *computed* was 35.1 ns with a helper per read, and neither key length
+  (30-char keys) nor key kind moved it. The landed fix is a **key → atom cell**
+  the compiled probe consults BEFORE the key is converted: `computed_read_cells`
+  maps a String box's identity to its interned atom (both immutable, so the map
+  never needs invalidation), and the probe then reads the VALUE from
+  `member_value_cells` — the cell every store path already maintains — so a hit
+  is exactly the interpreter's own `member_cell_get`. The first cut cached the
+  value in the key cell and was falsified by the corpus (an in-place value write
+  does not bump the generation), see §8. `str_key.js` 52.7 → 10.6 ms and the
+  real-world `control/for_in.js` **34.9 → 10.54 ms** — the row's `o[k]` cost,
+  now inline. Number-keyed `o[i]` is not served (the cell is String-keyed by
+  design), the same limitation the interpreter has.
+- **G6/G7 — cell capacity and the register path's one shape.** G8 landed (above,
+  Stage 7) as a key→atom cell, not the value cell the census implied, because
+  the in-place store discipline forbids a generation-validated value cache
+  (§8). G6 (capacity for the colliding named cells) and G7 remain: G9, G10 and
+  G11 are each a *missing inline path*, and doing them one at a time is how the
+  current asymmetry (an inline path for `+` but not `<<`, for an own read but
+  not an inherited one) came to exist.
 
 ## 4. How this gets measured (and what has been ruled out)
 
@@ -622,7 +639,10 @@ The list, in the measured order:
   completes Stage 6.
 - **Stage 7 — G6/G8, cells and feedback.** Capacity for the colliding cells,
   and a per-site feedback record so the inline paths above become a mechanism
-  rather than a set of bespoke arms.
+  rather than a set of bespoke arms. **G8 landed first** (§3, §8): the computed
+  read's per-read helper became a key → atom cell feeding the existing member
+  value cell — `str_key.js` 52.7 → 10.6 ms and the real-world
+  `control/for_in.js` 34.9 → 10.54 ms.
 
 Each stage: the instrument re-run, the engine gates (fmt, clippy
 `-D warnings`, workspace tests, both `--no-default-features` checks), the
@@ -1119,6 +1139,51 @@ One line per landed stage, newest last. This log is the arc's journal —
   machine-readable `keys` element layout. The row's real cost is elsewhere: an
   `o[k]` computed read on a non-Array object is ~35 ns of the 46.5 ns step
   (`GetMemberComputed` 5.25M in the same directory), which is a per-site-IC
-  surface — **Stage 7**, not an inline arm. Recorded so neither is re-opened as
-  one. No code changed (the plan's method is exactly this: falsify by
-  measurement before investing).
+  surface — **Stage 7** (landed as G8, below), not an inline arm. Recorded so
+  neither is re-opened as one. No code changed (the plan's method is exactly
+  this: falsify by measurement before investing).
+- **Stage 7, G8 — the computed read's key cell, and the store discipline that
+  falsified the first cut (2026-09-28).** The census's `GetMemberComputed`
+  (73.4M, 12 rows) was the whole helper, not the interning: the same read
+  *named* is 7.0 ns with zero helper calls (machine code), *computed* was
+  35.1 ns with a helper per read, and neither key length (`str_key_30.js`
+  54.7 ms, barely above the 30-char-free 52.7) nor key kind (`int_key.js`
+  61.1) moved it — so the cost was the helper body (nullish check,
+  `to_property_key`/intern, `member_cell_get`, key compare), not collisions.
+  The first design cached the **value** in a cell keyed by the key Value's
+  identity so the compiled probe could run before the key was converted: it
+  measured `str_key.js` 52.7 → **9.86 ms** and looked decisive, but it was
+  wrong. An in-place value write (`JsObject::write_data_property_slot`, the
+  JIT's `SetMemberSlot`) deliberately does NOT bump the receiver's generation —
+  it refreshes `member_value_cells` instead (see the `set_key`/
+  `write_data_property`/`write_data_property_slot` notes) — so a value cell
+  that validates only the generation served a stale read. The corpus caught it
+  at once: **59 `harness` fixtures failed** (`verifyProperty`'s
+  read/write/restore of a computed key), reproduced minimally by
+  `o["a"] = 1; o["a"]; o["a"] = 2; o["a"]` answering `1`. The landed design
+  keeps the key cell as a **box → atom map** (both sides immutable — strings
+  are immutable and the interner is append-only — so it never needs
+  invalidation) and takes the VALUE from `member_value_cells`, the cell every
+  store path already maintains, so a hit is exactly the interpreter's own
+  `member_cell_get`. The compiled probe is three branchy blocks in
+  `emit_element_read`: the receiver's Object tag (already the dispatch gate),
+  `is_string(key)`, the key cell's box compare, then `(live_id ^ atom) &
+  (MEMBER_CELLS-1)` validated on id/name/generation. Results: `str_key.js`
+  **52.7 → 10.6 ms** (helper 13: 31.5M → 35, warmup only), `str_key_30.js`
+  54.7 → 10.65, and the real-world `control/for_in.js` **34.9 → 10.54 ms jit**
+  (26.9 jitless) — the row's `o[k]` cost, now inline. `named.js` (0.23) and
+  `var_named.js` (11.3) are unregressed; corpus parity is 0 mismatches over 77
+  rows. Number-keyed `o[i]` is **not** served — the cell is String-keyed by
+  design, matching the interpreter's atom conversion — so `int_key.js` reads
+  ~68 ms, still 1.8× jitless, paying the added `is_string` gate on the unserved
+  path. Tests: `installed_jit_computed_read_cell_inlines` (the helper runs only
+  while the cell warms; mutation-checked by breaking the emitter's slot
+  arithmetic → 100,000 calls), `installed_jit_computed_read_after_inplace_store_matches_the_interpreter`
+  (the store-visibility contract the falsified design broke; mutation-checked),
+  and `the_emitter_and_runtime_computed_read_slots_agree`. Gates: fmt, clippy
+  `-D warnings`, workspace tests (test262 3,324, runtime 984, jit 226), runtime
+  `--no-default-features` 953, `v8 --features simdutf` 380, cli
+  `--no-default-features --features jit` check, test262 `all` 48,464 pass /
+  0 fail / 0 crash / 0 hang (158 skip), `intl402` 3,205 pass / 0 fail (152
+  skip), `--jit-bench` all `result-ok`, corpus parity 77 rows 0 mismatches. No
+  wasm sweep is owed: `wasmtest` does not link `crates/jit`.

@@ -738,3 +738,48 @@ stay ~par because `call_slow` dominates regardless of compilation.
 visit: step count, `has_loop`, `scope`, `leaf`) and in `JitEngine::compile`
 (the `Unsupported` error). No first-visit print for the body → scope gate;
 a print + bail → emit_step gate, and the error names the step.
+
+## 19. The read-side value cells and the store discipline
+
+`member_value_cells` is the read-side data-property value cache (16 slots,
+`#[repr(C)]`, indexed `(object_id ^ atom) & (MEMBER_CELLS - 1)`). Any probe that
+validates it (`emit_member_cell_probe`, and G8's computed read) must agree with
+how the STORE paths keep it current, and the store discipline has two regimes:
+
+- A STRUCTURAL change (define, delete, accessor conversion, map transition)
+  bumps `JsObject::generation`, which invalidates every generation-validated
+  cell.
+- An IN-PLACE VALUE write does NOT bump the generation. `set_key`'s fast path
+  bumps, but `JsObject::write_data_property_slot` (the interpreter's L1a warm
+  store) and `JsObject::write_data_property` (the JIT's compiled store, via the
+  `SetMemberSlot` helper) deliberately leave the generation put and REFRESH
+  `member_value_cells[member_cell_index(id, atom)]` with the new value instead.
+
+So a cell keyed by anything other than the atom cannot be kept current by the
+store paths — they know the atom, not the key box. That is the trap G8 hit: a
+computed-read cell keyed by the key Value's identity and holding the VALUE
+validated the receiver generation alone, so `o["a"] = 2` after a cached
+`o["a"]` served the stale value (the corpus caught it: 59 `harness` fixtures —
+`verifyProperty`'s read/write/restore of a computed key). The landed shape is a
+**box → atom map** (`computed_read_cells`, keyed by the key's own bits): both
+sides immutable (strings are immutable, the interner is append-only), so it
+never needs invalidation, and the compiled probe takes the VALUE from
+`member_value_cells` — exactly the interpreter's `member_cell_get`. The probe is
+three branchy blocks in `emit_element_read` (Object tag → `is_string(key)` →
+box compare → `(live_id ^ atom) & (MEMBER_CELLS-1)` validated on
+id/name/generation), so a String-keyed `o[k]` on a plain object is served with
+no `intern` and no helper (`str_key.js` 52.7 → 10.6 ms, `control/for_in.js`
+34.9 → 10.54 ms).
+
+Corollaries for any new cell:
+
+- If it caches a VALUE, either key it by the atom (so the store paths can
+  refresh it) or make it generation-validated AND ensure no in-place write can
+  change what it holds. A value cache keyed by a key box is not maintainable.
+- Never assume a write bumps the generation. Check the store path first
+  (`warm_store_*`, `write_data_property*`, `SetMemberSlot` — all refresh,
+  none bump for an in-place value write).
+- `the_emitter_and_runtime_computed_read_slots_agree` pins the slot arithmetic
+  and `installed_jit_computed_read_after_inplace_store_matches_the_interpreter`
+  pins the store-visibility contract; mutation-check both when the probe
+  changes.

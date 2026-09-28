@@ -2289,6 +2289,64 @@ impl MemberValueCell {
     }
 }
 
+/// The direct-mapped size of the string-key → atom cache (the computed-read
+/// cell table). Boxed on the Agent, so the count costs no hot-struct space.
+pub const COMPUTED_READ_CELLS: usize = 64;
+
+/// The computed member read's key cache (G8): `o[k]` for a String `k`, mapping
+/// the key Value's identity to its interned atom so the compiled probe can run
+/// BEFORE the key is converted — a monomorphic `o[k]` loop then resolves the
+/// name with no `intern` and no helper (`GetMemberComputed` measured 35 ns/read
+/// with a helper per read against 7 ns for the equivalent named `.a` read whose
+/// machine probe hits, 2026-09-28).
+///
+/// This cell deliberately does NOT cache a VALUE. An in-place value write
+/// (`JsObject::write_data_property_slot`, the JIT's `SetMemberSlot`) does not
+/// bump the receiver's generation — it refreshes `member_value_cells` instead
+/// (see the `set_key`/`write_data_property` notes) — so a value cached here
+/// would go stale on the next store. The compiled probe instead takes the atom
+/// from this cell and reads the value from `member_value_cells`, whose
+/// invalidation the store paths already maintain. Both the key box and the
+/// interned atom are immutable (strings are immutable; the interner is
+/// append-only), so this cell never needs invalidation. `#[repr(C)]` so the
+/// compiled probe reads it at fixed offsets; the key box is traced so its
+/// identity stays live.
+#[repr(C)]
+#[derive(Clone)]
+pub struct ComputedReadCell {
+    pub key: Value,
+    pub atom: crux::AtomId,
+}
+
+impl ComputedReadCell {
+    /// An empty cell: `key` is `undefined` (bits 0), which no String key's bits
+    /// can equal, so the compiled probe's validation never matches and the read
+    /// falls to the full Get.
+    pub(crate) const fn empty() -> Self {
+        Self {
+            key: Value::Undefined,
+            atom: 0,
+        }
+    }
+}
+
+/// The direct-mapped slot for a computed read, mirrored by the compiler's probe
+/// (`emit_element_read`) and pinned by
+/// `the_emitter_and_runtime_computed_read_slots_agree`: the key's Value bits
+/// folded into the table size. A box means one atom for every receiver, so the
+/// cell is shared across receivers.
+pub fn computed_read_cell_index(key_bits: u64) -> usize {
+    (key_bits as usize) & (COMPUTED_READ_CELLS - 1)
+}
+
+impl Trace for ComputedReadCell {
+    fn trace(&self, visit: &mut dyn FnMut(GcAny)) {
+        // The key box is what makes the identity match sound, so it must stay
+        // live while the cell does.
+        self.key.trace(visit);
+    }
+}
+
 /// `MemberWriteCell::field` value when no map-pinned field is recorded:
 /// the object was dictionary-mode or its map did not describe the key when
 /// the cell was recorded (a vector-only property).
@@ -9948,7 +10006,27 @@ impl Vm {
         {
             return Ok(Value::String(Handle::new(JsString::from_utf16(&[*unit]))));
         }
-        let key = crate::context::to_property_key(agent, &key)?;
+        // G8: resolve a String key through the computed-read key cache first —
+        // the box → atom mapping is immutable (strings are immutable; the
+        // interner is append-only), so a hit skips `to_property_key`'s `intern`
+        // with no invalidation concern. A miss interns and records the mapping
+        // for the compiled probe (which reads the VALUE from `member_value_cells`
+        // — see `ComputedReadCell`).
+        let key_value = key;
+        let key = if key_value.is_string() {
+            match Self::computed_read_atom_get(agent, &key_value) {
+                Some(atom) => PropertyKey::String(atom),
+                None => {
+                    let key = crate::context::to_property_key(agent, &key_value)?;
+                    if let PropertyKey::String(atom) = key {
+                        Self::computed_read_atom_put(agent, &key_value, atom);
+                    }
+                    key
+                }
+            }
+        } else {
+            crate::context::to_property_key(agent, &key_value)?
+        };
         let value = if !matches!(object.kind(), ValueKind::Object(_) | ValueKind::Function(_)) {
             Self::get_primitive_member(agent, object, &key)?
         } else {
@@ -9968,6 +10046,30 @@ impl Vm {
             Self::resolve_array_element(agent, &object, index);
         }
         Ok(value)
+    }
+
+    /// The computed-read key cache (G8): the interned atom for a String key
+    /// Value whose box this table has seen. A hit lets the caller skip
+    /// `to_property_key`'s `intern`; the mapping is immutable, so no invalidation
+    /// is needed (unlike a value cell).
+    fn computed_read_atom_get(agent: &Agent, key: &Value) -> Option<crux::AtomId> {
+        let cell = agent
+            .computed_read_cells
+            .get(computed_read_cell_index(key.bits()))?;
+        if cell.key.bits() == key.bits() {
+            return Some(cell.atom);
+        }
+        None
+    }
+
+    /// Record the interned atom for a String key Value (a pure cache: the
+    /// interner is append-only, so a recorded (box, atom) pair can never go
+    /// stale).
+    fn computed_read_atom_put(agent: &mut Agent, key: &Value, atom: crux::AtomId) {
+        let index = computed_read_cell_index(key.bits());
+        if let Some(cell) = agent.computed_read_cells.get_mut(index) {
+            *cell = ComputedReadCell { key: *key, atom };
+        }
     }
 
     /// The register member-write tail for the fused computed RMW ops:
@@ -12845,6 +12947,7 @@ impl Vm {
             global_bits: Value::Object(global).bits(),
             global_value_cells: agent.global_value_cells.as_ptr() as *mut std::os::raw::c_void,
             member_value_cells: agent.member_value_cells.as_ptr() as *mut std::os::raw::c_void,
+            computed_read_cells: agent.computed_read_cells.as_ptr() as *mut std::os::raw::c_void,
             member_map_cells: agent.member_map_cells.as_ptr() as *mut std::os::raw::c_void,
             globals_unshadowed,
             buf_end: (buf.as_ptr() as usize + std::mem::size_of_val(buf))
