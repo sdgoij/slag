@@ -3756,12 +3756,15 @@ run(); run(); run(); run(); run(); run(); run(); run(); run();";
     #[test]
     fn the_emitter_and_runtime_computed_read_slots_agree() {
         // G8: the compiled computed-read probe computes its slot inline in
-        // `emit_element_read`; every runtime access computes it in
-        // `runtime::ir::computed_read_cell_index`. If the two drift, the probe
-        // reads a slot the runtime never writes and the read silently never
-        // inlines. Keep the two expressions byte-for-byte equivalent.
+        // `emit_element_read` (`emit_computed_read_slot`); every runtime access
+        // computes it in `runtime::ir::computed_read_cell_index`. If the two
+        // drift, the probe reads a slot the runtime never writes and the read
+        // silently never inlines. Keep the two expressions byte-for-byte
+        // equivalent.
         fn emitter(key_bits: u64) -> usize {
-            (key_bits as usize) & (runtime::ir::COMPUTED_READ_CELLS - 1)
+            (key_bits.wrapping_mul(runtime::ir::COMPUTED_READ_INDEX_MUL)
+                >> runtime::ir::COMPUTED_READ_INDEX_SHIFT) as usize
+                & (runtime::ir::COMPUTED_READ_CELLS - 1)
         }
         for key_bits in [
             0u64,
@@ -6543,6 +6546,114 @@ run(); run(); run(); run(); run(); run(); run(); run(); run();";
             "a store must invalidate the compiled computed read"
         );
         assert!(compiled >= 1, "{compiled} bodies");
+    }
+
+    #[test]
+    fn installed_jit_direct_break_skips_the_control_helper() {
+        // G18: a `break` whose transfer has no finally to route through and no
+        // for-of iterator to close is exactly `ip = target`, so the compiled
+        // code jumps directly — no `BreakControl` helper and no epoch bump. The
+        // counting wrapper isolates the helper; the switch body (no try, no
+        // for-of) is the eligible shape, and the value must match the
+        // interpreter.
+        static BREAK_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        extern "C" fn counting_break(ctx: *mut c_void, ip: u64, target: u64) -> u64 {
+            BREAK_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            (runtime::jit::JIT_SLOW_PATHS.break_control)(ctx, ip, target)
+        }
+        let mut helpers = runtime_helpers();
+        helpers.break_control = Some(counting_break);
+        let source = "function sum(n) {\n\
+                        var s = 0;\n\
+                        for (var i = 0; i < n; i++) {\n\
+                          switch (i & 3) {\n\
+                            case 0: s += 1; break;\n\
+                            case 1: s += 2; break;\n\
+                            case 2: s += 3; break;\n\
+                            default: s += 4; break;\n\
+                          }\n\
+                        }\n\
+                        return s;\n\
+                      }\n\
+                      sum(100000);";
+        let interp = {
+            let mut agent = runtime::Agent::new();
+            agent.initialize_host_defined_realm().expect("realm");
+            agent.run_script(source).expect("interp runs")
+        };
+
+        extern "C" fn noop_drop(_cache: *mut c_void) {}
+        let mut agent = runtime::Agent::new();
+        agent.initialize_host_defined_realm().expect("realm");
+        let mut cache = JitCache::new(helpers).expect("isa");
+        agent.jit_hook = Some(runtime::jit::JitHook {
+            cache: (&mut cache as *mut JitCache) as *mut c_void,
+            lookup: jit_cache_lookup,
+            drop_cache: noop_drop,
+            helpers: &runtime::jit::JIT_SLOW_PATHS,
+        });
+        let value = agent.run_script(source).expect("jit runs");
+        let compiled = cache.compiled_count();
+        agent.jit_hook = None;
+        assert_eq!(value, interp, "the switch break must match the interpreter");
+        assert!(compiled >= 1, "{compiled} bodies must compile");
+        let calls = BREAK_CALLS.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            calls < 100,
+            "the compiled switch break must jump directly ({calls} break_control calls)"
+        );
+    }
+
+    #[test]
+    fn installed_jit_break_through_a_finally_still_uses_the_control_helper() {
+        // The G18 gate is exactly "no try and no for-of in the body", so a
+        // `break` that leaves a try/finally must still transfer through the
+        // helper (the finally runs before the loop exits). The counting wrapper
+        // must see calls, and the value must match the interpreter.
+        static BREAK_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        extern "C" fn counting_break(ctx: *mut c_void, ip: u64, target: u64) -> u64 {
+            BREAK_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            (runtime::jit::JIT_SLOW_PATHS.break_control)(ctx, ip, target)
+        }
+        let mut helpers = runtime_helpers();
+        helpers.break_control = Some(counting_break);
+        let source = "function f(n) {\n\
+                        var s = 0;\n\
+                        for (var i = 0; i < n; i++) {\n\
+                          try { if (i & 1) { break; } s += 1; } finally { s += 10; }\n\
+                        }\n\
+                        return s;\n\
+                      }\n\
+                      f(10);";
+        let interp = {
+            let mut agent = runtime::Agent::new();
+            agent.initialize_host_defined_realm().expect("realm");
+            agent.run_script(source).expect("interp runs")
+        };
+
+        extern "C" fn noop_drop(_cache: *mut c_void) {}
+        let mut agent = runtime::Agent::new();
+        agent.initialize_host_defined_realm().expect("realm");
+        let mut cache = JitCache::new(helpers).expect("isa");
+        agent.jit_hook = Some(runtime::jit::JitHook {
+            cache: (&mut cache as *mut JitCache) as *mut c_void,
+            lookup: jit_cache_lookup,
+            drop_cache: noop_drop,
+            helpers: &runtime::jit::JIT_SLOW_PATHS,
+        });
+        let value = agent.run_script(source).expect("jit runs");
+        let compiled = cache.compiled_count();
+        agent.jit_hook = None;
+        assert_eq!(
+            value, interp,
+            "the break through a finally must match the interpreter"
+        );
+        assert!(compiled >= 1, "{compiled} bodies must compile");
+        let calls = BREAK_CALLS.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            calls > 0,
+            "a break leaving a finally must route through the helper"
+        );
     }
 
     #[test]

@@ -126,7 +126,7 @@ corpus, one process per row** so a row's counters belong to it, summed:
 | `LoadContext` | 30.3M | 4 | closure/context slot loads | — |
 | `ForOfNextBindLocal` | 21.0M | 1 | `for-of` step | **G17 — landed (Stage 6)** |
 | `SwitchDisc` | 21.0M | 1 | `switch` selector | G11 |
-| `BreakControl` | 21.0M | 1 | `break` inside a `switch` | G11 |
+| `BreakControl` | 21.0M | 1 | `break` inside a `switch` | **G18 — landed (Stage 7)** |
 | `ObjectFast` | 16.8M | 16 | object literal (fused — the sequence was already collapsed by Cut 72) | **G3 — landed (Stage 6)** |
 | `TypedArrayLength` | 15.7M | 16 | array `length` read (misnamed: the FFI probe every `i < a.length` paid) | **G16 — landed (Stage 6)** |
 | `ForInNext` | 6.3M | 1 | `for-in` step | G4 |
@@ -523,13 +523,26 @@ The list, in the measured order:
   real-world `control/for_in.js` **34.9 → 10.54 ms** — the row's `o[k]` cost,
   now inline. Number-keyed `o[i]` is not served (the cell is String-keyed by
   design), the same limitation the interpreter has.
-- **G6/G7 — cell capacity and the register path's one shape.** G8 landed (above,
-  Stage 7) as a key→atom cell, not the value cell the census implied, because
-  the in-place store discipline forbids a generation-validated value cache
-  (§8). G6 (capacity for the colliding named cells) and G7 remain: G9, G10 and
-  G11 are each a *missing inline path*, and doing them one at a time is how the
-  current asymmetry (an inline path for `+` but not `<<`, for an own read but
-  not an inherited one) came to exist.
+- **G18 — the compiled `break`/`continue` transfer (landed, Stage 7).** Every
+  compiled `Step::Break`/`Continue` ran the `control_transfer` helper *and* an
+  epoch bump, even when the transfer is exactly `ip = target` (no finally to
+  route through, no for-of iterator to close). With the Lowerer's
+  `has_try`/`has_for_of` and a new `has_async_for_of` all false the arm now
+  jumps directly — `control/switch_dispatch.js` 63.5 → 42.2 ms jit and
+  `BreakControl` 21.0M → 0 (§8). **G19 (the `SwitchDisc`/`SwitchTest` inline)
+  remains**: the discriminant lives in `vm.switch_disc: Option<Value>`, which
+  machine code cannot read, so it needs a machineable home (a hoisted frame
+  slot, or a `Value` + presence flag) plus an inline strict-equality for the
+  case test.
+- **G6/G7 and the feedback record — cell capacity, the register path's one shape,
+  per-site feedback.** G8 landed (above, Stage 7) as a key→atom cell, not the
+  value cell the census implied, because the in-place store discipline forbids a
+  generation-validated value cache (§8). G6 (capacity for the colliding named
+  cells; widening `MEMBER_CELLS` 16→256 was measured and reverted — it cost hot
+  cache locality), G7 (the register path's one shape) and the per-site feedback
+  record remain: G9, G10 and G11 are each a *missing inline path*, and doing
+  them one at a time is how the current asymmetry (an inline path for `+` but
+  not `<<`, for an own read but not an inherited one) came to exist.
 
 ## 4. How this gets measured (and what has been ruled out)
 
@@ -637,12 +650,16 @@ The list, in the measured order:
   interpreter (its deficit is the helper call alone, 1.2 ms of the 34.9 ms
   `control/for_in.js` row, whose real cost is the `o[k]` computed read). That
   completes Stage 6.
-- **Stage 7 — G6/G8, cells and feedback.** Capacity for the colliding cells,
-  and a per-site feedback record so the inline paths above become a mechanism
-  rather than a set of bespoke arms. **G8 landed first** (§3, §8): the computed
-  read's per-read helper became a key → atom cell feeding the existing member
-  value cell — `str_key.js` 52.7 → 10.6 ms and the real-world
-  `control/for_in.js` 34.9 → 10.54 ms.
+- **Stage 7 — G6/G7, G18/G19, cells and feedback.** Capacity for the colliding
+  cells, the register path's one shape, and a per-site feedback record so the
+  inline paths above become a mechanism rather than a set of bespoke arms.
+  **G8 landed first** (§3, §8): the computed read's per-read helper became a
+  key → atom cell feeding the existing member value cell — `str_key.js`
+  52.7 → 10.6 ms and the real-world `control/for_in.js` 34.9 → 10.54 ms. **G18
+  landed next**: a compiled `break`/`continue` with no finally or for-of in
+  scope jumps directly — `control/switch_dispatch.js` 63.5 → 42.2 ms.** G19
+  (the switch discriminant + per-case strict-equality inline) is the rest of
+  that row's helper share.
 
 Each stage: the instrument re-run, the engine gates (fmt, clippy
 `-D warnings`, workspace tests, both `--no-default-features` checks), the
@@ -1187,3 +1204,101 @@ One line per landed stage, newest last. This log is the arc's journal —
   0 fail / 0 crash / 0 hang (158 skip), `intl402` 3,205 pass / 0 fail (152
   skip), `--jit-bench` all `result-ok`, corpus parity 77 rows 0 mismatches. No
   wasm sweep is owed: `wasmtest` does not link `crates/jit`.
+- **Stage 7, census re-rank — G8 verified, `LoadContext` closed by representation,
+  and a build trap that skews the census (2026-09-28).** Two findings.
+
+  **The census binary matters.** `cargo build --release -p cli -p test262`
+  UNIFIES `crux/typed_array::WORKERS` ON (test262 pulls `runtime/workers`), and
+  the compiled typed-array read/store lanes deliberately decline when WORKERS is
+  on (`emit_typed_array_read_into` jumps to `legacy` under `if
+  crux::typed_array::WORKERS`), so that binary measures the interpreter's element
+  lanes. The same row proves it: `arrays/typed_array.js` is **59.8 ms with the
+  unified binary and 30.3 ms with `-p cli` alone**, its helpers dropping from
+  14.0M `FastArrayElementWrite` + 14.0M `GetMemberComputed` to **zero**. Measure
+  the corpus with `-p cli` ALONE; only the *sweep* binaries come from
+  `-p cli -p test262` (the unification does not affect conformance, only timing
+  and the census).
+
+  **On the correct binary** the census is `GetMemberName` 96.1M (G10 — measured
+  and reverted: warm chain reads are fixed-cost), `SwitchTest` 91.9M +
+  `SwitchDisc` 21.0M + `BreakControl` 21.0M (G11 — closed: already 3.1× jitless),
+  `CallSlow` 90.9M (G2's non-leaf residue), `SetMemberSlot` 70.0M (~1 ns/iter,
+  closed), `BinarySlow` 43.7M (G9 landed the six bitwise/shift inlines; this is
+  the guard-fallback residue the plan already deferred), `LoadContext` 38.8M
+  (`calls/closure_capture.js` 14.0M, `recursive_fib.js` 14.9M, `language` 8.5M,
+  `control` 1.4M; `closure_capture` is 40.7 ms jit vs 134.3 jitless). **G8's
+  residual is under 2.1M** (not the 14.3M the skewed binary showed — that was the
+  typed-array artifact), and `FastArrayElementWrite` is only 2.24M while
+  `SetMemberComputed` is 6.2M, 77% of it the single small
+  `opcost/element_write.js` row (1.84 ms). The dense-array overwrite
+  (`arr[k] = v`, index below the length — the one store shape the append arm and
+  the typed-array store both decline) is therefore a **real but small** target,
+  contained and worth doing on its own merits, not the 16.2M the skewed census
+  implied.
+
+  `LoadContext` is **closed by representation, not by measurement**: a machine
+  read would have to walk `context_chain_env` (a `depth` count that skips
+  context-TRANSPARENT envs, so the walk length is not the static `depth`), through
+  `EnvRef`'s Rc indirection, check the `EnvRecord` variant, then index
+  `DeclarativeEnv::bindings: RefCell<Vec<(JsString, Binding)>>` — a borrow flag, a
+  tuple stride, and an enum-carrying `Option<Value>` TDZ marker. Inlining it would
+  be a `crux` env-model change (a flat, machine-addressable slot array), which is
+  out of this plan's scope; the same shape that makes `member_value_cells` usable
+  (a flat `#[repr(C)]` array on the Agent) is exactly what the env lacks. The
+  remaining call-side budget is **the non-leaf call** (`recursive_fib` 289.5 ms
+  jit vs 471.1 jitless — the largest single gap at 181.6 ms — and `--jit-bench`'s
+  `non-leaf call` ratio 0.51 on the corrected binary, the weakest arm), plus
+  `LeafCallFill` 23.2M and `FastArrayElementWrite` 2.24M. No code changed.
+
+  Suggested .rules additions for this session's PR: check `git log --oneline -3`
+  and `git status --short` before editing (the operator commits between turns, so
+  a file you edited may already be in HEAD); and `grep -c` exits non-zero on a
+  zero count, silently breaking `&&` chains.
+- **Stage 7, G8 follow-up — the key cell's index collided (2026-09-28).** The
+  landed G8 index was `key_bits & 63`, which reads only the box address's low
+  bits — 64 slots from six address bits. The suite exposed it: the
+  `installed_jit_computed_read_cell_inlines` bound (`< 100` helper calls) failed
+  about one `-p jit` run in six with **40,003** calls — two of the five key boxes
+  aliasing into two slots, so 2/5 of the reads missed to the helper (the box
+  addresses depend on the allocation history, which the parallel suite shifts).
+  The index is now a multiplicative hash (`COMPUTED_READ_INDEX_MUL`/`_SHIFT`,
+  the `leaf_record_slot` discipline, mirrored by the emitter's
+  `emit_computed_read_slot` and the agreement test); six consecutive full
+  `-p jit` runs green and `str_key.js` 10.9 ms with 35 helper-13 calls
+  (unregressed). Recorded because the same low-bits index pattern is the obvious
+  thing to reach for in a new direct-mapped cell.
+- **Stage 7, G18 — a compiled `break`/`continue` jumps directly when no finally
+  or for-of is in scope (2026-09-28).** The census's `BreakControl` (21.0M, the
+  one `control/switch_dispatch.js` row) was the whole compiled `Step::Break`:
+  `emit_dispatch_call` ran the `control_transfer` helper AND `bump_leaf_epoch`
+  (the call-site comment justified the bump as "the dispatch mutates the
+  try/pending/env stacks the leaf-call probe reads"). But for a `Break` with no
+  try frame and no for-of, `control_transfer` is exactly `self.ip = target`:
+  `aborts_pending` needs a pending finally, the finally loop needs a try frame,
+  and `close_for_of_upto` needs a for-of boundary — it pops the *async* stack
+  too, so a body with `AsyncForOfBegin`/`Next` must be excluded. The gate is the
+  Lowerer's existing `has_try`/`has_for_of` plus a new `has_async_for_of`
+  (computed beside them in `Lowerer::new`); when all three are false the arm
+  emits `jump(ensure_block(target))` — the `Step::Jump` idiom and nothing more.
+  Measured: `control/switch_dispatch.js` **63.5 → 42.2 ms jit** (219.3 jitless;
+  3.45× → 5.2×) with `BreakControl` **21.0M → 0**. The row's remaining helpers
+  are `SwitchDisc` 21.0M + `SwitchTest` 91.9M — **G19**, the discriminant and
+  per-case test inline (the discriminant lives in `vm.switch_disc:
+  Option<Value>`, which machine code cannot read, so G19 needs a machineable
+  home — a hoisted frame slot or a `Value` + presence-flag pair — plus an inline
+  strict-equality for the case test; the case values are usually literal
+  constants, and a Number/identity fast path with a helper fallback for
+  strings/BigInts is the shape). Tests:
+  `installed_jit_direct_break_skips_the_control_helper` (helper counted;
+  mutation-checked → 100,000 calls) and
+  `installed_jit_break_through_a_finally_still_uses_the_control_helper` (the
+  negative gate), with the existing
+  `installed_jit_for_of_break_and_return_close_the_iterator` and
+  `installed_jit_labeled_break_out_of_an_acc_loop_syncs_the_counter` guarding
+  the for-of/labeled cases. Gates: fmt, clippy `-D warnings`, workspace tests
+  (test262 3,324, runtime 984, jit 228), runtime `--no-default-features` 953,
+  `v8 --features simdutf` 380, cli `--no-default-features --features jit`, and
+  after the G8 index fix a re-run of the measurement set: test262 `all` 48,464
+  pass / 0 fail / 0 crash / 0 hang, `intl402` 3,205 pass / 0 fail, `--jit-bench`
+  all `result-ok`, corpus parity 77 rows 0 mismatches (`mean-jitGap` 87.0 →
+  67.8).

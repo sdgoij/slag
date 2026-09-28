@@ -37,9 +37,9 @@ use cranelift_control::ControlPlane;
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Variable};
 use crux::Value;
 use runtime::ir::{
-    ApplyKind, COMPUTED_READ_CELLS, CompiledBody, ComputedReadCell, FastLoopVar, GLOBAL_CELLS,
-    LeafOp, MEMBER_CELLS, MemberMapCell, MemberValueCell, NumRhs, RegOperand, RelLimit, ScopeInfo,
-    Step, TryFrame, is_compound_assign,
+    ApplyKind, COMPUTED_READ_CELLS, COMPUTED_READ_INDEX_MUL, COMPUTED_READ_INDEX_SHIFT,
+    CompiledBody, ComputedReadCell, FastLoopVar, GLOBAL_CELLS, LeafOp, MEMBER_CELLS, MemberMapCell,
+    MemberValueCell, NumRhs, RegOperand, RelLimit, ScopeInfo, Step, TryFrame, is_compound_assign,
 };
 use runtime::jit::{
     AGENT_REALM_COUNT_OFFSET, BUILDER_BUF_OFFSET, BUILDER_CAP_OFFSET, BUILDER_ENABLED_OFFSET,
@@ -419,6 +419,25 @@ fn emit_leaf_record_slot(lowerer: &mut Lowerer<'_>, callee: ClifValue) -> ClifVa
         .ushr_imm_u(mixed, LEAF_CALL_RECORD_SHIFT as i64)
 }
 
+/// The computed-read cell slot (G8): `runtime::ir::computed_read_cell_index`'s
+/// expression, emitted as machine code (a wrapping multiply, then the high
+/// bits). The two must compute the identical value — a divergence is SILENT:
+/// the probe reads a slot the runtime never writes and simply never hits.
+/// `the_emitter_and_runtime_computed_read_slots_agree` pins them together.
+fn emit_computed_read_slot(lowerer: &mut Lowerer<'_>, key: ClifValue) -> ClifValue {
+    let builder = &mut lowerer.builder;
+    let k = builder
+        .ins()
+        .iconst(types::I64, COMPUTED_READ_INDEX_MUL as i64);
+    let mixed = builder.ins().imul(key, k);
+    let mixed = builder
+        .ins()
+        .ushr_imm_u(mixed, COMPUTED_READ_INDEX_SHIFT as i64);
+    builder
+        .ins()
+        .band_imm_u(mixed, (COMPUTED_READ_CELLS - 1) as i64)
+}
+
 /// Lower `body` into `func`. `func`/`fctx` are consumed by the builder and
 /// finalized in place.
 fn lower<'a>(
@@ -784,6 +803,11 @@ struct Lowerer<'a> {
     /// iterators before the body returns (the callee Vm's stacks are
     /// discarded on the error surface).
     has_for_of: bool,
+    /// G18: whether the body contains for-await-of machinery
+    /// (`AsyncForOfBegin`/the fetch steps). `close_for_of_upto` — the
+    /// `Break`/`Continue` transfer's iterator close — pops the async for-of
+    /// stack too, so a body with one cannot take the direct compiled jump.
+    has_async_for_of: bool,
     /// Cut 59: whether the body contains destructuring machinery (any
     /// `Destructure*` step). A helper's engine error in such a body closes
     /// the active destructure iterators first (mirroring `run_inner`'s
@@ -922,6 +946,10 @@ impl<'a> Lowerer<'a> {
                 Step::ForOfBegin { .. } | Step::ForOfNext { .. } | Step::ForOfNextBindLocal { .. }
             )
         });
+        let has_async_for_of = body
+            .steps
+            .iter()
+            .any(|step| matches!(step, Step::AsyncForOfBegin { .. } | Step::AsyncForOfNext));
         // Cut 59: the body's destructuring machinery (any primitive
         // `Destructure*` step) — the error path must close the active
         // destructure iterators before surfacing a pending engine error.
@@ -1032,6 +1060,7 @@ impl<'a> Lowerer<'a> {
             sig_entry,
             has_try,
             has_for_of,
+            has_async_for_of,
             has_destructure,
             has_suspension,
             suspension_targets,
@@ -2623,13 +2652,10 @@ impl<'a> Lowerer<'a> {
             ctx,
             Offset32::new(std::mem::offset_of!(JitCallContext, computed_read_cells) as i32),
         );
-        // `runtime::ir::computed_read_cell_index` folds the key's bits into the
-        // table size; the emitter and the runtime must compute the identical
-        // slot (a divergence is silent: the probe never hits).
-        let cell_slot = self
-            .builder
-            .ins()
-            .band_imm_u(key, (COMPUTED_READ_CELLS - 1) as i64);
+        // `runtime::ir::computed_read_cell_index` hashes the key's bits into
+        // the table size; the emitter and the runtime must compute the
+        // identical slot (a divergence is silent: the probe never hits).
+        let cell_slot = emit_computed_read_slot(self, key);
         let index_bytes = self
             .builder
             .ins()
@@ -6803,18 +6829,37 @@ impl<'a> Lowerer<'a> {
                 self.emit_dispatch_call(self.sig_update, Helper::ThrowControl, &[ip, value])?;
             }
             Step::Break { target } => {
-                let ip = self.builder.ins().iconst(types::I64, (index + 1) as i64);
-                let target_imm = self.builder.ins().iconst(types::I64, *target as i64);
-                self.emit_dispatch_call(self.sig_update, Helper::BreakControl, &[ip, target_imm])?;
+                // G18: with no try/finally to route through and no for-of
+                // iterator to close (`control_transfer` does nothing else for
+                // a `Break`), the transfer is exactly `ip = target` — jump
+                // directly, skipping the helper call and its epoch bump (the
+                // dispatch mutated no stack the leaf-call probe reads).
+                if !self.has_try && !self.has_for_of && !self.has_async_for_of {
+                    let block = self.ensure_block(*target);
+                    self.builder.ins().jump(block, &[]);
+                } else {
+                    let ip = self.builder.ins().iconst(types::I64, (index + 1) as i64);
+                    let target_imm = self.builder.ins().iconst(types::I64, *target as i64);
+                    self.emit_dispatch_call(
+                        self.sig_update,
+                        Helper::BreakControl,
+                        &[ip, target_imm],
+                    )?;
+                }
             }
             Step::Continue { target } => {
-                let ip = self.builder.ins().iconst(types::I64, (index + 1) as i64);
-                let target_imm = self.builder.ins().iconst(types::I64, *target as i64);
-                self.emit_dispatch_call(
-                    self.sig_update,
-                    Helper::ContinueControl,
-                    &[ip, target_imm],
-                )?;
+                if !self.has_try && !self.has_for_of && !self.has_async_for_of {
+                    let block = self.ensure_block(*target);
+                    self.builder.ins().jump(block, &[]);
+                } else {
+                    let ip = self.builder.ins().iconst(types::I64, (index + 1) as i64);
+                    let target_imm = self.builder.ins().iconst(types::I64, *target as i64);
+                    self.emit_dispatch_call(
+                        self.sig_update,
+                        Helper::ContinueControl,
+                        &[ip, target_imm],
+                    )?;
+                }
             }
             Step::EnterTry { handler } => {
                 // Cut 70: snapshot the working-sp at the try entry — a

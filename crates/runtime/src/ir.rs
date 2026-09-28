@@ -2293,6 +2293,18 @@ impl MemberValueCell {
 /// cell table). Boxed on the Agent, so the count costs no hot-struct space.
 pub const COMPUTED_READ_CELLS: usize = 64;
 
+/// The multiplicative hash applied to a key Value's bits for the
+/// computed-read cell index (see [`computed_read_cell_index`]). A plain
+/// `bits & 63` reads only the box address's low bits — 64 slots from six
+/// address bits — which collides for the handful of keys one object holds
+/// (measured: a five-key switch loop lost two of five keys to aliasing),
+/// so the index mixes all 64 bits and keeps the high ones, the same
+/// discipline as `leaf_record_slot`.
+pub const COMPUTED_READ_INDEX_MUL: u64 = 0x9E37_79B9_7F4A_7C15;
+/// The shift applied after [`COMPUTED_READ_INDEX_MUL`] (the high bits carry
+/// the mix; the low bits are the alignment-zero payload).
+pub const COMPUTED_READ_INDEX_SHIFT: u32 = 40;
+
 /// The computed member read's key cache (G8): `o[k]` for a String `k`, mapping
 /// the key Value's identity to its interned atom so the compiled probe can run
 /// BEFORE the key is converted — a monomorphic `o[k]` loop then resolves the
@@ -2333,10 +2345,11 @@ impl ComputedReadCell {
 /// The direct-mapped slot for a computed read, mirrored by the compiler's probe
 /// (`emit_element_read`) and pinned by
 /// `the_emitter_and_runtime_computed_read_slots_agree`: the key's Value bits
-/// folded into the table size. A box means one atom for every receiver, so the
-/// cell is shared across receivers.
+/// hashed by [`COMPUTED_READ_INDEX_MUL`]/[`COMPUTED_READ_INDEX_SHIFT`]. A box
+/// means one atom for every receiver, so the cell is shared across receivers.
 pub fn computed_read_cell_index(key_bits: u64) -> usize {
-    (key_bits as usize) & (COMPUTED_READ_CELLS - 1)
+    (key_bits.wrapping_mul(COMPUTED_READ_INDEX_MUL) >> COMPUTED_READ_INDEX_SHIFT) as usize
+        & (COMPUTED_READ_CELLS - 1)
 }
 
 impl Trace for ComputedReadCell {
