@@ -736,6 +736,130 @@ The list, in the measured order:
   row is a *non-self* call and its jit time never moved; the ratio followed the
   load-sensitive interpreter column. That row — ~140 ns per call — is Phase 2b,
   the general call (§3).
+- **Stage 8 — the general compiled call (G21 Phase 2b).** The last call-side
+  deficit: a call to a *different* certified function still runs the full
+  `ordinary_call` -> `run_compiled_body` -> `run_jit_body` funnel, and
+  `--jit-bench`'s `non-leaf call` is ~140 ns/call. **Status: 8.0 measured; 8.1
+  is not worth a slice and 8.2 is not to be built — the redesign that is, is
+  Stage 9 below.** Phase 1's
+  shared-Vm/shared-ctx shape is explicitly **not** the vehicle — its tail bug
+  (§8) showed why: the
+  callee's body, closure environment, `globals_unshadowed`, and tail/suspend
+  handling all differ from the caller's, and a nested run on the caller's Vm
+  corrupts it. The design is a **pooled private Vm** plus a cached per-callee
+  descriptor, in three parts:
+  - **8.0 — measured (2026-09-28); the result cancels 8.1/8.2 as designed.**
+    Three probes, all temporary (removed; the tree is byte-identical above them):
+    (a) isolated per-op costs from a release micro-bench — `take_vm` +
+    `return_vm` (incl. `Vm::reset`) **12.8 ns**, the `ExecutionContext` push+pop
+    **14.9 ns**, the `globals_unshadowed` walk **2.4 ns**, the `ecma_functions`
+    hash on a hit **0.8 ns**, the `JitCallContext` build **3.0 ns**, a TLS
+    push/pop **1.4 ns**; (b) region timers showing the whole `call_slow`
+    interpreter path is essentially the entire per-call cost (~138 ns/call,
+    matching the row) — the emit-side probe and the helper entry are minor; and
+    (c) the remainder (~100 ns) is diffuse: the `do_call_fast`/`call_inner`/
+    `ordinary_call` dispatch arms and `run_compiled_body`/`run_jit_body`'s setup
+    (frame, root, ctx, work), with no single dominant item. **The two biggest
+    single costs — the per-call Vm take/return+reset and the `ExecutionContext`
+    push/pop — are structural to running each JS call on its own Vm and
+    execution context, and a private-Vm lane (8.2) keeps both.** What 8.1/8.2
+    can actually remove is the hash (0.8 ns), the walk (2.4 ns), the intrinsic
+    read and some dispatch — ~10-15 ns of ~138, about **10%**, for a large and
+    hazardous lane. So **8.1 is not worth a slice and 8.2 should not be built
+    as designed**; the real lever is architectural (run JS frames on one
+    Vm/stack, V8-style), which is out of this plan's scope. Recorded as a
+    measured negative result, per §6's rule.
+  - **8.1 — the per-callee descriptor (not built; 8.0 cancels it).** A new `Agent` table keyed by callee
+    identity, the `LeafCallRecord` shape, holding what is *fixed per closure*:
+    `entry`, `stack_usage`, `body: *const CompiledBody` (for `scope`),
+    `globals_unshadowed` (a certified body's env chain to the global is
+    immutable, so the verdict is stable), the apply/call intrinsic bits when
+    `has_call_apply`, and — only under `realm_count == 1` — the global. The
+    closure environment is the one field to be careful with: `ordinary_call`
+    already holds it (`data.environment`), but a *call-site* lane has only the
+    callee value. Reading it off the closure needs a new `Function::environment`
+    getter and must handle the registration elision (`set_environment_edge` is
+    called only when the env is NOT `realm.global_env`, so `None` means "the
+    global env"); caching it in the table instead makes the table a GC edge
+    source that must be traced and sweep-cleared. Choose one and record why —
+    do not assume the field is always populated. Validation reuses
+    `LeafCallRecord`'s exact-match identity plus `code_gen` (an evicted entry
+    must not be reused) and a clear on any sweep. This part
+    alone lets `run_jit_body` and `ordinary_call` skip the hash, the walk and
+    the intrinsic read, and it is landable on its own (measure the funnel after
+    it).
+  - **8.2 — the private-Vm lane (not to be built; 8.0 shows it keeps the two
+    biggest costs).** For a callee the descriptor marks runnable,
+    run its entry on a **pooled Vm** (`take_vm`/`return_vm`), with a *fresh*
+    `JitCallContext` built from the descriptor and never the caller's, a frame
+    built like `run_leaf_body` (params/vars/TDZ, plus `this` when `this_slot`
+    and `arguments` when `arguments_slot`), a capture context from the closure
+    env when `context_names` is non-empty, and the body's own work buffer. The
+    `ctx.tail` outcome loops on `vm.tail_replaced` (`run_compiled_body`'s loop);
+    a suspension returns `DISPATCH_SUSPEND` (a plain certified function has
+    none, and a generator/async reaches its driver through `call_inner` first,
+    so those are gated). The emitter change is a gate on the callee's
+    *descriptor* eligibility, like Phase 2a's; a miss falls to `call_slow`'s
+    interpreter path unchanged.
+  - **Acceptance.** `--jit-bench`'s `non-leaf call` *jit* milliseconds fall
+    (never the ratio — §8), and nothing regresses. Differential tests over a
+    non-self callee with captures, a `this` receiver, `arguments`, a tail call
+    inside the callee, and a throwing callee (so the pooled-Vm path's
+    `ExecutionContext`/`dispose_env_resources` fidelity is checked); a
+    `--gc-stress` call-heavy shape; the descriptor-invalidation mutation-check.
+  - **Traps.** The descriptor table must be cleared on any sweep (its key is a
+    callee box address, recyclable — the same reason `leaf_records` is cleared);
+    the pooled Vm must be an active run (`with_jit_run`) for the call's
+    duration so a mid-call collection traces it; the general call **is**
+    stack-observable (unlike the leaf path), so the `ExecutionContext` push and
+    `dispose_env_resources` must be preserved or a throwing callee's `e.stack`
+    and its `using` disposal regress; and the pooled Vm's `Vm::reset` cost is
+    part of what 8.0 measures, because it may make the whole lane a wash.
+
+- **Stage 9 — the one-Vm frame-record redesign (the call-side architecture).**
+  This *is* the "real lever" the call arc names: make a JS frame a compact,
+  stack-allocated record on **one** Vm, so a call is a push/pop rather than a
+  Vm `take_vm`/`return_vm`+reset. It replaces the cancelled 8.1/8.2.
+  - **Why sharing the Vm (8.2) does not pay — measured, not guessed.** The
+    per-frame `Vm` state a shared lane must save/restore is ~15 fields even for
+    a certified, no-try/for-of/suspend/vector/tail body (`ip`, `lexical_env`,
+    `body_context`, `current_function`, `current_new_target`, `args`,
+    `completion`+`completion_is_empty`, `switch_disc`+`switch_disc_set`,
+    `chain_short`, `globals_unshadowed`, `strict`, `tail_replaced`,
+    `pending_call`, `stack.len`, `jit_roots`), and the whole `Vm` is ~45. A
+    15-field save/restore is 10-15 ns — the same as the pooled take/reset
+    (13 ns) it removes — so 8.2 nets ~zero. **The fix is not to share the Vm;
+    it is to make the frame a record** (below).
+  - **Cut 1 — the `FrameRecord` + a per-Vm frame stack + the certified-call
+    lane.** A `FrameRecord { ip, lexical_env, body_context, current_function,
+    current_new_target, completion, completion_is_empty, switch_disc,
+    switch_disc_set, chain_short, globals_unshadowed, strict, tail_replaced,
+    pending_call }` (15 fields, `Copy`-ish) pushed on `Vm::frames: Vec<FrameRecord>`
+    with the frame/working area carved from a shared arena; a certified callee
+    (gated like `self_call_eligible`, plus no-tail) runs its entry on the
+    caller's Vm with the record pushed, and pops it on return. Cost: one push +
+    pop (~5 ns) against the 13 ns pool, and it makes the Phase-1 tail bug
+    structurally impossible (the record saves and restores `tail_replaced`).
+    The interpreter keeps the pool for uncertified callees initially.
+  - **Cut 2 — the `ExecutionContext`.** ~15 ns a call and load-bearing for the
+    callee's env and for `e.stack`; the leaf path already omits it and still
+    names frames, so cut 2 is to (a) set `vm.lexical_env` directly (not via
+    `running_context`) and (b) name frames from the frame stack (a `function` +
+    `source` on the record, or a lightweight push), then drop the per-call
+    `ExecutionContext` for certified calls.
+  - **Cut 3 — the interpreter's activations** use the same frame stack, and
+    cut 4 removes the pool entirely.
+  - **Before any of it, find the ~100 ns.** The redesign targets ~28 ns
+    (Vm + `ExecutionContext`) of a ~138 ns row; the other ~100 ns is
+    **unattributed** (8.0's region timers were defeated by nesting), and it is
+    not safe to redesign `Vm` blind at it. Cut 0 is a hot-path profile of the
+    release `non-leaf call` row (ablation builds, the project's usual method)
+    to locate that 100 ns first — the redesign should be aimed at it, and it
+    may turn out to be a smaller, non-architectural fix.
+  - **Traps:** the frame stack must be GC-traced (its values are live);
+    `new_body_context` per frame; error-stack fidelity (cut 2); suspension and
+    tail interaction (initially gated out); and `agent.jit_depth`/`ACTIVE_RUNS`
+    must follow the frame stack, not a per-call Vm.
 
 Each stage: the instrument re-run, the engine gates (fmt, clippy
 `-D warnings`, workspace tests, both `--no-default-features` checks), the
@@ -1588,3 +1712,47 @@ One line per landed stage, newest last. This log is the arc's journal —
   test262 `all` 48,464 pass / 0 fail / 0 crash / 0 hang of 48,622; `intl402`
   3,205 pass / 0 fail of 3,357; corpus parity 77 rows 0 mismatches. No wasm
   sweep owed.
+- **Stage 8 (G21 Phase 2b) design written, no code changed (2026-09-28).** §5's
+  Stage 8 is the general compiled call — a call to a *different* certified
+  function, still the ~140 ns/call funnel (`--jit-bench`'s `non-leaf call`, jit
+  ms). It is staged as **8.0** (measure the funnel's components before choosing
+  a slice — hash, `new_body_context`, context push/pop, `take_vm`/`return_vm` +
+  `Vm::reset`, frame setup, globals walk, ctx build, work-buffer init,
+  `with_jit_run`), **8.1** (a per-callee `Agent` descriptor holding the
+  per-closure-invariant entry/scope/`globals_unshadowed`/intrinsic bits, with
+  `Function::environment` read off the callee rather than cached — landable on
+  its own and re-measured), and **8.2** (a private-Vm lane that runs the callee
+  compiled on a pooled Vm with a fresh ctx, handling `ctx.tail` by looping). The
+  design's hard constraint comes from this arc's own bug: the callee must not
+  share the caller's Vm or ctx (§8's fix entry, skill §20.3). Acceptance and
+  traps (sweep-clear the descriptor, register the pooled Vm as an active run,
+  preserve the `ExecutionContext`/`dispose_env_resources` fidelity the general
+  call owes, and treat `Vm::reset` as a possible wash) are in §5. No code
+  changed.
+- **Stage 8.0 — the general-call funnel measured, and the result cancels 8.1/8.2
+  (2026-09-28).** Three temporary probes (all removed; the tree is byte-identical
+  above them apart from this record). **Per-op costs (release micro-bench):**
+  `take_vm`+`return_vm` incl. `Vm::reset` **12.8 ns**, `ExecutionContext`
+  push+pop **14.9 ns**, `global_reads_are_unshadowed` **2.4 ns**,
+  `ecma_functions.get` hit **0.8 ns**, `JitCallContext` build **3.0 ns**, TLS
+  push/pop **1.4 ns**. **Region timers** put the whole `call_slow` interpreter
+  path at ~138 ns/call (the row's own jit time) with the emit-side probe and
+  helper entry minor, and the remainder (~100 ns) diffuse across the
+  `do_call_fast`/`call_inner`/`ordinary_call` dispatch and
+  `run_compiled_body`/`run_jit_body`'s setup — no single dominant item. **The
+  finding:** the two largest single costs are the per-call Vm take/return+reset
+  and the `ExecutionContext` push/pop, both **structural to running each JS call
+  on its own Vm and execution context** and both **kept** by a private-Vm lane;
+  what 8.1/8.2 could remove (hash, globals walk, intrinsic read, some dispatch)
+  is ~10-15 ns of ~138, ~10%, for a large hazardous lane. **And 8.2's own shape
+  is a wash:** sharing the caller's Vm needs a ~15-field per-frame save/restore
+  (10-15 ns) that costs what the 13 ns pooled take/reset it removes costs — so
+  the fix is not to share the Vm but to make a frame a compact stack-allocated
+  record on one Vm (**§5 Stage 9**), and to find the ~100 ns the region timers
+  could not attribute before redesigning `Vm` at it. So §5's Stage 8 is
+  **closed by measurement**: 8.1 is not worth a slice, 8.2 is not to be built as
+  designed, and the architectural change it pointed at is written up as Stage 9
+  (the one-Vm frame-record redesign). No code changed. Gate note: the temporary
+  probes touched
+  `crates/runtime/src/jit.rs` and `crates/runtime/src/function.rs` and were
+  fully removed (both files match HEAD in content); only the plan differs.
