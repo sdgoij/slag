@@ -3721,24 +3721,23 @@ extern "C" fn concat_str(ctx: *mut c_void, value: u64, acc: u64) -> u64 {
     let agent = unsafe { &mut *ctx.agent };
     let value = Value::from_bits(value);
     let acc = Value::from_bits(acc);
-    let text = match crate::context::to_string(agent, &value) {
-        Ok(text) => text,
-        Err(error) => return slow_error(ctx, error),
-    };
-    let mut units = crate::ir::string_units_of(&acc);
-    units.extend_from_slice(text.as_slice());
-    Value::String(crux::Handle::new(crux::JsString::from_utf16(&units))).bits()
+    match crate::ir::concat_template(agent, &acc, &value) {
+        Ok(out) => out.bits(),
+        Err(error) => slow_error(ctx, error),
+    }
 }
 
 extern "C" fn concat_str_const(ctx: *mut c_void, acc: u64, step: u64) -> u64 {
     let ctx = unsafe { ctx_of(ctx) };
+    let agent = unsafe { &mut *ctx.agent };
     let acc = Value::from_bits(acc);
     let Some(crate::ir::Step::ConcatStrConst(text)) = step_at(ctx, step) else {
         unreachable!("concat_str_const on a non-ConcatStrConst step");
     };
-    let mut units = crate::ir::string_units_of(&acc);
-    units.extend_from_slice(text.as_slice());
-    Value::String(crux::Handle::new(crux::JsString::from_utf16(&units))).bits()
+    match crate::ir::concat_template_const(agent, &acc, text) {
+        Ok(out) => out.bits(),
+        Err(error) => slow_error(ctx, error),
+    }
 }
 
 extern "C" fn push_const(ctx: *mut c_void, step: u64) -> u64 {

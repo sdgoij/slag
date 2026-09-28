@@ -130,7 +130,7 @@ corpus, one process per row** so a row's counters belong to it, summed:
 | `ObjectFast` | 16.8M | 16 | object literal (fused — the sequence was already collapsed by Cut 72) | **G3 — landed (Stage 6)** |
 | `TypedArrayLength` | 15.7M | 16 | array `length` read (misnamed: the FFI probe every `i < a.length` paid) | **G16 — landed (Stage 6)** |
 | `ForInNext` | 6.3M | 1 | `for-in` step | G4 |
-| `ConcatStrings` | 4.5M | 3 | string building | G5 |
+| `ConcatStrings` | 4.5M | 3 | string building: the `+` rope concat (direct helper) and the template append | **G5 — landed (Stage 6)** |
 
 Caveat, stated because it moves the ranking: the 36 `opcost` rows are generated
 with `k = i & MASK` and `s = (s + x) | 0` idioms, so they over-weight
@@ -456,8 +456,32 @@ The list, in the measured order:
   here is not a JIT arm**: it is `JsObject`'s size (528 B, 128 B of it
   `in_fields`) or allocation sinking, and it is recorded as such so G3 is not
   re-opened as an inline path.
-- **G5 — string building.** `ConcatStrings`/`ConcatStr`/`ConcatStrConst`/
-  `PushStr` (~8M over 5 rows), as measured in the table above.
+- **G5 — string building: mostly landed before this arc, plus the template
+  append (landed, Stage 6).** The big G5 win was already in the tree (2026-09-07,
+  `.notes/perf.md`): `crux::number::to_string` writes an exactly-representable
+  integer's decimal directly (no ryu + digit-vector rebuild) and `Add` with one
+  string operand and a Number/Boolean/Null/Undefined fuses to a two-string
+  concat in `apply_binary` and the register executor — `coercion_concat` went
+  ~320 → ~160 ms then (103 ms jit today), and `ConcatStrings` (string+string)
+  is already a direct helper with no `apply_binary` round trip, so it is a
+  rope allocation and nothing else. What remained was the **template append**:
+  both the interpreter handler and the JIT helper rebuilt the accumulator flat
+  per substitution (`string_units_of` → `Vec<u16>` → `from_utf16`), so a k-part
+  template was O(k·len) — quadratic for a build loop. Both now go through one
+  shared `concat_template`/`concat_template_const` that appends with
+  `JsString::concat`, a rope concat: O(k), and still flat at or under the flat
+  threshold, so a short template keeps the leaf representation it had. Measured:
+  an 18-substitution build loop **929 → 473 ms (−49%)**, a 4-substitution one
+  **131 → 90 ms (−32%)**, and the real fixture
+  `language/expressions/template-literal/evaluation-order.js` **371 → 336 ms
+  (−9.5%)**. Content is identical (UTF-16 throughout, so lone surrogates
+  survive: a jit/jitless/node three-way on `\uD83D`, an astral pair and
+  `String.prototype.slice` agrees exactly). The `strings` family's remaining
+  gap to node is the builtin-call path (a method read + `CallSlow` per
+  `s.charCodeAt`), not string building — that is G10/CallSlow territory.
+- **G3/G4/G5 status.** G3 landed (above, with its residual in `crux`), G4 landed
+  as **G17**, and G5 landed as the template append above; the remaining Stage-6
+  item is the non-fused `ForOfNext` / `ForInNext` advances.
 - **G6/G7/G8 — cell capacity, the register path's one shape, no feedback.**
   G8 is now load-bearing for a sharper reason: G9, G10 and G11 are each a
   *missing inline path*, and doing them one at a time is how the current
@@ -554,12 +578,17 @@ The list, in the measured order:
   iteration, and the row runs **952 ms JIT against 1,058 ms jitless** (~10%),
   so no inline path can pay. Still open: G5 (string
   building) and the non-fused `ForOfNext` / `ForInNext` advances. **G3 (object
-  literals) landed** as the composite literal-shape cache (§3 G3): the fused
-  `ObjectFast` create was already one helper call (Cut 72), so the slice removed
-  the per-key transition walk (−12% on a 3- and 8-key literal, −5% on
-  `objects/destructure`), and the residual — the fresh 528 B `JsObject` write,
-  54 of the literal's 84 ns — is recorded as a `crux` concern (object size or
-  allocation sinking), not a JIT arm.
+  so no inline path can pay. **G3 (object literals) landed** as the composite
+  literal-shape cache (§3 G3): the fused `ObjectFast` create was already one
+  helper call (Cut 72), so the slice removed the per-key transition walk (−12%
+  on a 3- and 8-key literal, −5% on `objects/destructure`), and the residual —
+  the fresh 528 B `JsObject` write, 54 of the literal's 84 ns — is recorded as a
+  `crux` concern (object size or allocation sinking), not a JIT arm. **G5
+  (string building) landed** as the template-append rope (§3 G5): the
+  coercion/integer path had already landed in 2026-09-07, and the remaining
+  `string_units_of`/`from_utf16` rebuild per substitution was quadratic —
+  18-substitution build loop 929 → 473 ms. Still open: the non-fused
+  `ForOfNext` / `ForInNext` advances.
 - **Stage 7 — G6/G8, cells and feedback.** Capacity for the colliding cells,
   and a per-site feedback record so the inline paths above become a mechanism
   rather than a set of bespoke arms.
@@ -998,3 +1027,37 @@ One line per landed stage, newest last. This log is the arc's journal —
   `crates/jit`; the change is `crux`+`runtime` and IS covered by both test262
   areas). The G3 residual is now recorded as a `crux` lever (object size /
   allocation sinking), not an inline path, so it is not re-opened here.
+- **Stage 6, G5 — the template append: quadratic rebuild to a rope
+  (2026-09-28).** G5 was mostly already landed (2026-09-07): the
+  exactly-representable-integer `to_string` fast path and the fused
+  string+primitive `Add` (`concat_primitive`, in `apply_binary` and the register
+  executor's `binary_inline`), which took `coercion_concat` from ~320 to ~103 ms
+  jit. `ConcatStrings` (string+string `+`) is already a direct helper, so it is
+  a rope allocation and nothing else — string *building* had one quadratic
+  shape left: the template append. Both the interpreter handler and the JIT
+  helper rebuilt the accumulator flat per substitution (`string_units_of` →
+  `Vec<u16>` → `from_utf16`), so a k-part template copied the whole accumulator
+  k times — O(k·len), and an 18-substitution build loop measured 4.6 us per
+  iteration. Both now call one shared `concat_template`/`concat_template_const`
+  that appends with `JsString::concat` (a rope concat, O(k)), with the flat
+  threshold preserving the leaf representation for short templates and
+  `string_units_of` removed. Measured: 18-substitution build loop **929 →
+  473 ms (−49%)**, 4-substitution **131 → 90 ms (−32%)**, and the real fixture
+  `language/expressions/template-literal/evaluation-order.js` **371 → 336 ms
+  (−9.5%)**. Content parity: a three-way jit / jitless / node check on an
+  astral pair, a LONE surrogate and `s.slice(0)` agrees exactly (a lossy UTF-8
+  round trip would have shown U+FFFD), and the new
+  `installed_jit_template_rope_matches_the_interpreter` folds a
+  12-substitution rope build plus `s === s.slice(0)` and `s === f(...)` into
+  one checksum against the interpreter — mutation-checked by making the JIT's
+  `concat_str_const` append a wrong constant, which fails it. Gates: fmt clean,
+  clippy workspace `-D warnings` clean, workspace **5,547 passed / 0 failed**
+  (`-p jit` 223), runtime `--no-default-features` 953/0, v8 `simdutf` 380/0,
+  `cli --no-default-features --features jit` green, test262 `all`
+  48,464/0/0/0 of 48,622 and `intl402` 3,205/0/0/0 of 3,357 at 15s/15s, corpus
+  parity 77 rows/0 mismatches, `--jit-bench` in band (string concat 0.17,
+  buildString shape 0.20, buildString full 0.26). The `strings` family's
+  remaining gap to node is the builtin-call path (a method read + `CallSlow`
+  per `s.charCodeAt`), not string building, and belongs to G10/CallSlow.
+  No wasm sweep owed (`wasmtest` does not link `crates/jit`; the change is
+  `runtime` and IS covered by both test262 areas).

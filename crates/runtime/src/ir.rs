@@ -7795,18 +7795,13 @@ impl Vm {
                 Step::ConcatStr => {
                     let value = self.pop();
                     let acc = self.pop();
-                    let text = crate::context::to_string(agent, &value)?;
-                    let mut units = string_units_of(&acc);
-                    units.extend_from_slice(text.as_slice());
-                    self.stack
-                        .push(Value::String(Handle::new(JsString::from_utf16(&units))));
+                    let out = concat_template(agent, &acc, &value)?;
+                    self.stack.push(out);
                 }
                 Step::ConcatStrConst(text) => {
                     let acc = self.pop();
-                    let mut units = string_units_of(&acc);
-                    units.extend_from_slice(text.as_slice());
-                    self.stack
-                        .push(Value::String(Handle::new(JsString::from_utf16(&units))));
+                    let out = concat_template_const(agent, &acc, text)?;
+                    self.stack.push(out);
                 }
                 Step::ArgsBase => {
                     self.args_base_stack.push(self.args.len());
@@ -13774,15 +13769,52 @@ pub(crate) fn nullish_error(what: &str) -> JsError {
     JsError::new(ErrorKind::TypeError, what.into())
 }
 
-/// The UTF-16 units of a value converted to a string; used by the string
-/// concatenation steps, which must preserve lone surrogates (a lossy UTF-8
-/// round-trip would replace them with U+FFFD).
-pub(crate) fn string_units_of(value: &Value) -> Vec<u16> {
-    match value.kind() {
-        ValueKind::String(s) => s.as_slice().to_vec(),
-        _ => crux::convert::to_string(value)
-            .map(|s| s.as_slice().to_vec())
-            .unwrap_or_else(|_| vec![]),
+/// The template-literal append (spec 13.2.8.6): the accumulator concatenated
+/// with `value`'s `ToString`, as a ROPE concat (`JsString::concat`), NOT the
+/// flat `units`/`from_utf16` rebuild it used to be. The content is identical
+/// — UTF-16 throughout, so lone surrogates survive either way — but a k-part
+/// template costs O(k) instead of O(k·len): the old pair copied the whole
+/// accumulator per substitution, making an 18-part template build loop
+/// quadratic (measured ~4.6us/iteration, 2026-09-28). A result at or under
+/// `JsString::concat`'s flat threshold still comes back flat, so a short
+/// template keeps the leaf representation it had, and unit readers (`length`
+/// is cached; `as_slice` materializes once through the box's flatten cache)
+/// pay nothing extra.
+pub(crate) fn concat_template(
+    agent: &mut Agent,
+    acc: &Value,
+    value: &Value,
+) -> Result<Value, JsError> {
+    let right = match value.as_string() {
+        Some(text) => text,
+        None => Handle::new(crate::context::to_string(agent, value)?),
+    };
+    Ok(Value::String(JsString::concat(
+        &acc_string(agent, acc)?,
+        &right,
+    )))
+}
+
+/// [`concat_template`] for a `ConcatStrConst` step's constant quasi.
+pub(crate) fn concat_template_const(
+    agent: &mut Agent,
+    acc: &Value,
+    text: &JsString,
+) -> Result<Value, JsError> {
+    let right = Handle::new(text.clone());
+    Ok(Value::String(JsString::concat(
+        &acc_string(agent, acc)?,
+        &right,
+    )))
+}
+
+/// The accumulator side of a template append as a handle. Defensive: the
+/// accumulated value is a string on every path (the head quasi, then these
+/// appends), so the conversion arm is unreachable in practice.
+fn acc_string(agent: &mut Agent, acc: &Value) -> Result<Handle<JsString>, JsError> {
+    match acc.as_string() {
+        Some(text) => Ok(text),
+        None => Ok(Handle::new(crate::context::to_string(agent, acc)?)),
     }
 }
 

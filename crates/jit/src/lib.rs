@@ -2862,6 +2862,36 @@ run(); run(); run(); run(); run(); run(); run(); run(); run();";
     }
 
     #[test]
+    fn installed_jit_template_rope_matches_the_interpreter() {
+        // The template append is a ROPE concat now (`JsString::concat`; a
+        // 12-substitution result ropes well past the 128-unit threshold), so
+        // the content must still equal the interpreter's exactly — including
+        // an astral pair and a LONE surrogate, which a lossy UTF-8 round-trip
+        // would replace with U+FFFD. `s === s.slice(0)` and `s === f(...)`
+        // compare a rope against a flat rebuild inside the engine, so a
+        // representation-only divergence would drop those terms.
+        let source = "function f(a, i) { \
+                        return `${a}${i}-${a}${i}-${a}${i}-${a}${i}-${a}${i}-${a}${i}\
+                        -${a}${i}-${a}${i}-${a}${i}-${a}${i}-${a}${i}-${a}${i}`; } \
+                      f('x', 1); f('x', 1); f('x', 1); f('x', 1); f('x', 1); f('x', 1); f('x', 1); f('x', 1); \
+                      f('x', 1); f('x', 1); f('x', 1); f('x', 1); f('x', 1); f('x', 1); f('x', 1); f('x', 1); \
+                      var s = f('\\uD83D\\uDE00\\uD83D', 12345); \
+                      var t = s.length * 1000 + s.charCodeAt(0) + s.charCodeAt(1) + s.charCodeAt(s.length - 1); \
+                      t + (s === s.slice(0) ? 7 : 0) + (s === f('\\uD83D\\uDE00\\uD83D', 12345) ? 11 : 0);";
+        let interp = {
+            let mut agent = runtime::Agent::new();
+            agent.initialize_host_defined_realm().expect("realm");
+            agent.run_script(source).expect("interp runs")
+        };
+        let (value, compiled) = with_jit_agent(|agent| agent.run_script(source).expect("jit runs"));
+        assert_eq!(
+            value, interp,
+            "a rope template build must match the interpreter's content"
+        );
+        assert!(compiled >= 1, "{compiled} bodies");
+    }
+
+    #[test]
     fn installed_jit_runs_a_declared_vector_self_tail_call() {
         // Cut 51: the checked vector form — a top-level declaration's own
         // name, 33 plain arguments; the identity check takes the self jump
