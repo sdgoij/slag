@@ -12817,6 +12817,7 @@ impl Vm {
             agent: agent as *mut Agent,
             vm: self as *mut Vm,
             global_object: global.as_ptr() as *mut std::os::raw::c_void,
+            global_bits: Value::Object(global).bits(),
             global_value_cells: agent.global_value_cells.as_ptr() as *mut std::os::raw::c_void,
             member_value_cells: agent.member_value_cells.as_ptr() as *mut std::os::raw::c_void,
             member_map_cells: agent.member_map_cells.as_ptr() as *mut std::os::raw::c_void,

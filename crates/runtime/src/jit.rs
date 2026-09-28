@@ -35,7 +35,7 @@ use crate::agent::Agent;
 use crate::context::ReferenceBase;
 use crate::env::EnvRecord;
 use crate::ir::{
-    Builder, CompiledBody, EnvStack, MEMBER_CELLS, MemberValueCell, PropertyKeyName, Vm,
+    Builder, CompiledBody, EnvStack, MEMBER_CELLS, MemberValueCell, PropertyKeyName, ScopeInfo, Vm,
 };
 use crux::error::{ErrorKind, JsError};
 
@@ -90,11 +90,24 @@ pub struct LeafInlineInfo {
     pub entry: u64,
     /// The leaf's maximum value-stack depth above its frame, in slots.
     pub stack_usage: u64,
-    /// The leaf's frame size (params + vars + TDZ slots; a this-less leaf
-    /// by the probe's gate, so no `this` slot).
+    /// The leaf's frame size (params + vars + TDZ slots).
     pub frame_size: u32,
     /// The leaf's parameter count.
     pub arity: u32,
+    /// G14: the leaf's `this` slot, or [`NO_THIS_SLOT`] when it has none.
+    pub this_slot: u32,
+    /// G14: whether the leaf is strict (its `this` binding keeps the
+    /// receiver, so no nullish→global coercion applies).
+    pub strict: u32,
+    /// G14: per-slot TDZ bits for slots `0..min(frame_size, 64)` — a set bit
+    /// means the slot starts `uninitialized`, else `undefined`. Slots at or
+    /// above 64 are described only by `fill_ok`.
+    pub tdz_mask: u64,
+    /// G14: 1 when `tdz_mask` covers the whole frame, so the compiled hit
+    /// path can rebuild it from this record alone. 0 for a frame wider than
+    /// the mask, which keeps the hit path on the full probe (its verdict is
+    /// still valid — only the descriptor is truncated).
+    pub fill_ok: u32,
 }
 
 impl LeafInlineInfo {
@@ -106,9 +119,18 @@ impl LeafInlineInfo {
             stack_usage: 0,
             frame_size: 0,
             arity: 0,
+            this_slot: NO_THIS_SLOT,
+            strict: 0,
+            tdz_mask: 0,
+            fill_ok: 0,
         }
     }
 }
+
+/// G14: the `this_slot` sentinel for a leaf with no `this` slot, and the
+/// widest frame the record's `tdz_mask` can describe.
+pub const NO_THIS_SLOT: u32 = u32::MAX;
+const TDZ_MASK_SLOTS: usize = u64::BITS as usize;
 
 /// The per-call-site leaf-call cache (Cut 39): the compiled `CallFast`/
 /// `CallFastSlot` sites reuse the probe helper's verdict instead of calling
@@ -253,6 +275,12 @@ pub struct JitCallContext {
     /// live `id`/`generation` in place to validate the global-value cells —
     /// a stale ctx snapshot would miss a mutation a helper made mid-run.
     pub global_object: *mut c_void,
+    /// G14: the running realm's global object as a NaN-boxed value, snapshot
+    /// once per call alongside `global_object` — the leaf fill's
+    /// `OrdinaryCallBindThis` needs its BITS for a sloppy nullish receiver,
+    /// and reading them here keeps the fill off the `Agent` borrow (the probe
+    /// and the compiled hit path then bind the identical global).
+    pub global_bits: u64,
     /// The `Agent::global_value_cells` array base (the JIT indexes it by
     /// `name & (GLOBAL_CELLS - 1)` and reads the `#[repr(C)]` cells).
     pub global_value_cells: *mut c_void,
@@ -578,6 +606,14 @@ pub struct JitSlowPaths {
         argc: u64,
         site: u64,
     ) -> u64,
+    /// G14: the compiled leaf-call hit path's frame rebuild for a NON-aliased
+    /// frame — `leaf_call_probe` minus the validation the compiled cache gate
+    /// already did (the site, the callee identity and the leaf-eligibility
+    /// epoch all matched). It re-derives the callee's scope, rebuilds its
+    /// frame above the argument region and returns the cached entry, or 0 when
+    /// the frame no longer fits (the site falls back to `call_slow`).
+    pub leaf_call_fill:
+        extern "C" fn(ctx: *mut c_void, this: u64, args: *mut u64, argc: u64, site: u64) -> u64,
     /// Read a declared top-level `var` off the global object (`name` is an
     /// `AtomId`); returns the value.
     pub get_global: extern "C" fn(ctx: *mut c_void, name: u64) -> u64,
@@ -1062,6 +1098,7 @@ pub static JIT_SLOW_PATHS: JitSlowPaths = JitSlowPaths {
     call_apply,
     apply_args_fill,
     leaf_call_probe,
+    leaf_call_fill,
     get_global,
     set_global,
     set_global_slot,
@@ -1779,6 +1816,179 @@ extern "C" fn apply_args_fill(ctx: *mut c_void, arg_array: u64, dest: u64) -> u6
     length as u64
 }
 
+/// The per-slot TDZ source for a frame fill: the call record's mask (the
+/// compiled hit path, which has no scope) or the scope's own store (the probe,
+/// which can describe a frame wider than the mask).
+enum TdzSource<'a> {
+    Mask(u64),
+    Store(&'a Vec<bool>),
+}
+
+impl TdzSource<'_> {
+    #[inline]
+    fn is_uninitialized(&self, slot: usize) -> bool {
+        match self {
+            TdzSource::Mask(mask) => mask >> slot & 1 == 1,
+            TdzSource::Store(store) => store.get(slot).copied().unwrap_or(false),
+        }
+    }
+}
+
+/// Build the record's fill fields for `scope`: the `this` slot, strictness and
+/// the TDZ mask. `fill_ok` is 0 when the frame is wider than `TDZ_MASK_SLOTS`,
+/// which keeps the compiled hit path on the probe (the probe still fills such a
+/// frame from the scope itself).
+fn leaf_fill_info(
+    scope: &ScopeInfo,
+    strict: bool,
+    entry: u64,
+    stack_usage: usize,
+) -> LeafInlineInfo {
+    let this_slot = scope.this_slot.map_or(NO_THIS_SLOT, |slot| slot as u32);
+    let (tdz_mask, fill_ok) = if scope.frame_size > TDZ_MASK_SLOTS {
+        (0, 0)
+    } else {
+        let mut tdz_mask = 0;
+        for slot in 0..scope.frame_size {
+            if scope.tdz_store.get(slot).copied().unwrap_or(false) {
+                tdz_mask |= 1u64 << slot;
+            }
+        }
+        (tdz_mask, 1)
+    };
+    LeafInlineInfo {
+        entry,
+        stack_usage: stack_usage as u64,
+        frame_size: scope.frame_size as u32,
+        arity: scope.arity as u32,
+        this_slot,
+        strict: u32::from(strict),
+        tdz_mask,
+        fill_ok,
+    }
+}
+
+/// G14: rebuild a leaf's inline frame above the argument region — bind the
+/// receiver per `OrdinaryCallBindThis` (a strict callee keeps the receiver, a
+/// sloppy object keeps it too, a sloppy nullish one becomes the realm's global
+/// object — `global_bits`, the ctx snapshot of the running realm's global — and
+/// a sloppy primitive one BOXES, an allocation these synchronous helpers
+/// cannot do, so it refuses), check the frame + working area fits in the
+/// caller's buffer, then write the slots: params copied from the arguments
+/// (missing ones `undefined`), `var` slots `undefined`, lexical slots the TDZ
+/// marker, the `this` slot the bound receiver. The aliased frame IS the
+/// argument region, so only its working area is checked and nothing is
+/// written. Shared by `leaf_call_probe` (a site's first visit, which fills from
+/// the scope) and `leaf_call_fill` (the compiled hit path, which fills from the
+/// recorded descriptor), so both produce the identical frame and reject on the
+/// identical conditions. Returns false when the receiver cannot be bound or the
+/// area does not fit.
+#[inline]
+fn fill_leaf_frame(
+    info: &LeafInlineInfo,
+    tdz: &TdzSource<'_>,
+    this: u64,
+    args: *mut u64,
+    argc: usize,
+    buf_end: usize,
+    global_bits: u64,
+) -> bool {
+    let frame_size = info.frame_size as usize;
+    let arity = info.arity as usize;
+    let bound_this = if info.this_slot == NO_THIS_SLOT {
+        0
+    } else {
+        let receiver = Value::from_bits(this);
+        if info.strict != 0 {
+            receiver.bits()
+        } else {
+            match receiver.kind() {
+                ValueKind::Object(_) | ValueKind::Function(_) => receiver.bits(),
+                ValueKind::Undefined | ValueKind::Null => global_bits,
+                _ => return false,
+            }
+        }
+    };
+    // The inline frame + working area must fit above the argument region's
+    // top in the caller's working buffer: the aliased case (the frame IS the
+    // arguments) needs only the working area; the built frame adds its
+    // frame_size slots on top of the args.
+    let aliased = frame_size == arity && argc >= frame_size;
+    let args_top = (args as usize) + argc * 8;
+    let needed = (if aliased { 0 } else { frame_size }) + info.stack_usage as usize;
+    if args_top + needed * 8 > buf_end {
+        return false;
+    }
+    // Fill the leaf's frame above the arguments (the aliased case is the
+    // arguments themselves — no fill; missing arguments stay `undefined`,
+    // var slots `undefined`, lexical slots the uninitialized marker). The
+    // buffer is only written by the machine code, which is suspended for
+    // the duration of these synchronous helpers.
+    if !aliased {
+        let frame = args_top as *mut u64;
+        for slot in 0..frame_size {
+            let value = if slot as u32 == info.this_slot {
+                bound_this
+            } else if slot < arity {
+                if slot < argc {
+                    // SAFETY: the caller passes a pointer into its own (live)
+                    // stack buffer with `argc` slots.
+                    unsafe { *args.add(slot) }
+                } else {
+                    Value::Undefined.bits()
+                }
+            } else if tdz.is_uninitialized(slot) {
+                Value::uninitialized().bits()
+            } else {
+                Value::Undefined.bits()
+            };
+            // SAFETY: the room check above guarantees `frame_size` slots
+            // fit past the argument region's top.
+            unsafe { *frame.add(slot) = value };
+        }
+    }
+    true
+}
+
+/// G14: the compiled leaf-call *hit* path for a non-aliased frame. The
+/// machine code calls this only after its cache gate matched the site, the
+/// callee's NaN-box identity and the live leaf-eligibility epoch, so the
+/// verdict is already known and the fill descriptor was recorded by the probe:
+/// this rebuilds the callee's frame straight from the record — no
+/// `leaf_lookup`, no `Rc` clone, no eligibility re-validation — and returns the
+/// cached entry. Returns 0 when the frame no longer fits, so the site takes
+/// `call_slow`.
+extern "C" fn leaf_call_fill(
+    ctx: *mut c_void,
+    this: u64,
+    args: *mut u64,
+    argc: u64,
+    site: u64,
+) -> u64 {
+    let ctx = unsafe { ctx_of(ctx) };
+    let index = (site as usize ^ (site as usize >> 2)) % LEAF_CALL_CACHE_ENTRIES;
+    let cache_entry = &ctx.leaf_call_cache[index];
+    let info = &cache_entry.leaf_inline;
+    // Defense in depth: the machine code validated the record's `site`, the
+    // callee identity and the `fill_ok` gate before branching here, and no JS
+    // runs between that gate and this call.
+    if cache_entry.site != site as u32 || info.entry == 0 || info.fill_ok == 0 {
+        return 0;
+    }
+    if !fill_leaf_frame(
+        info,
+        &TdzSource::Mask(info.tdz_mask),
+        this,
+        args,
+        argc as usize,
+        ctx.buf_end as usize,
+        ctx.global_bits,
+    ) {
+        return 0;
+    }
+    info.entry
+}
+
 extern "C" fn leaf_call_probe(
     ctx: *mut c_void,
     callee: u64,
@@ -1867,79 +2077,23 @@ extern "C" fn leaf_call_probe(
         return 0;
     }
     let compiled = unsafe { &*info_ptr };
-    // The receiver the frame's `this` slot gets, matching `OrdinaryCallBindThis`
-    // (spec 10.2.1.1) as the interpreter's own certified path applies it: a
-    // strict callee keeps the call's receiver, a sloppy nullish one is coerced
-    // to the realm's global object, and a sloppy primitive one is BOXED — that
-    // boxing allocates and can throw, so only it stays on the helper. Computed
-    // only for a body that has the slot.
-    let bound_this = if scope.this_slot.is_some() {
-        let receiver = Value::from_bits(this);
-        if strict {
-            receiver.bits()
-        } else {
-            match receiver.kind() {
-                ValueKind::Object(_) | ValueKind::Function(_) => receiver.bits(),
-                ValueKind::Undefined | ValueKind::Null => {
-                    let Ok(global) = agent
-                        .running_context()
-                        .map(|context| context.realm.global_object)
-                    else {
-                        return 0;
-                    };
-                    Value::Object(global).bits()
-                }
-                _ => return 0,
-            }
-        }
-    } else {
-        0
-    };
-    // The inline frame + working area must fit above the argument region's
-    // top in the caller's working buffer: the aliased case (the frame IS
-    // the arguments) needs only the working area; the built frame adds its
-    // frame_size slots on top of the args.
-    let argc = argc as usize;
-    let aliased = scope.frame_size == scope.arity && argc >= scope.frame_size;
-    let args_top = (args as usize) + argc * 8;
-    let needed = (if aliased { 0 } else { scope.frame_size }) + compiled.stack_usage;
-    if args_top + needed * 8 > ctx.buf_end as usize {
+    let info = leaf_fill_info(scope, strict, compiled.entry as u64, compiled.stack_usage);
+    // The frame fill (bind `this`, room check, write slots) is identical to
+    // the compiled hit path's (G14) — see `fill_leaf_frame`; a rejection there
+    // is the same rejection here. The probe fills from the scope itself, and
+    // records the descriptor the hit path fills from, so the two cannot drift.
+    if !fill_leaf_frame(
+        &info,
+        &TdzSource::Store(&scope.tdz_store),
+        this,
+        args,
+        argc as usize,
+        ctx.buf_end as usize,
+        ctx.global_bits,
+    ) {
         return 0;
     }
-    // Fill the leaf's frame above the arguments (the aliased case is the
-    // arguments themselves — no fill; missing arguments stay `undefined`,
-    // var slots `undefined`, lexical slots the uninitialized marker). The
-    // buffer is only written by the machine code, which is suspended for
-    // the duration of this synchronous helper.
-    if !aliased {
-        let frame = args_top as *mut u64;
-        for slot in 0..scope.frame_size {
-            let value = if Some(slot) == scope.this_slot {
-                bound_this
-            } else if slot < scope.arity {
-                if slot < argc {
-                    // SAFETY: the JIT passes a pointer into its own (live)
-                    // stack buffer with `argc` slots.
-                    unsafe { *args.add(slot) }
-                } else {
-                    Value::Undefined.bits()
-                }
-            } else if scope.tdz_store.get(slot).copied().unwrap_or(false) {
-                Value::uninitialized().bits()
-            } else {
-                Value::Undefined.bits()
-            };
-            // SAFETY: the room check above guarantees `frame_size` slots
-            // fit past the argument region's top.
-            unsafe { *frame.add(slot) = value };
-        }
-    }
-    cache_entry.leaf_inline = LeafInlineInfo {
-        entry: compiled.entry as u64,
-        stack_usage: compiled.stack_usage as u64,
-        frame_size: scope.frame_size as u32,
-        arity: scope.arity as u32,
-    };
+    cache_entry.leaf_inline = info;
     compiled.entry as u64
 }
 
@@ -5320,6 +5474,7 @@ pub(crate) fn run_jit_body(
         dispatch_value: 0,
         suspension: None,
         suspend_sp: 0,
+        global_bits: Value::Object(global).bits(),
         resume_kind: 0,
         resume_ip: 0,
         resume_sp: 0,
@@ -5552,6 +5707,7 @@ pub(crate) fn run_jit_resume(
         dispatch_value: 0,
         suspension: None,
         suspend_sp: 0,
+        global_bits: Value::Object(global).bits(),
         resume_kind: kind,
         resume_ip: vm.ip,
         resume_sp: (work_ptr as usize + sp_offset * std::mem::size_of::<Value>()) as u64,
@@ -5639,6 +5795,62 @@ mod tests {
             1,
             "length after push"
         );
+    }
+
+    fn scope_info(frame_size: usize) -> crate::ir::ScopeInfo {
+        crate::ir::ScopeInfo {
+            frame_size,
+            arity: 0,
+            slots: Default::default(),
+            tdz_store: vec![false; frame_size],
+            shadow_slots: Default::default(),
+            shadowed_catch_params: Default::default(),
+            context_names: Vec::new(),
+            context_tdz: Vec::new(),
+            context_const: Vec::new(),
+            context_param: Vec::new(),
+            context_slots: Default::default(),
+            arguments_slot: None,
+            arguments_formals: None,
+            this_slot: None,
+            captured_this: None,
+            args_alias: false,
+            annex_b: Vec::new(),
+            statement_fns: Vec::new(),
+        }
+    }
+
+    /// G14: the record's fill descriptor must describe the frame the probe
+    /// actually fills — the `this` slot, strictness and the per-slot TDZ bits —
+    /// and must clear `fill_ok` for a frame wider than the mask, where the
+    /// compiled hit path falls back to the probe instead of mis-filling.
+    #[test]
+    fn leaf_fill_descriptor_matches_the_scope() {
+        let mut scope = scope_info(3);
+        scope.arity = 1;
+        scope.tdz_store = vec![false, true, false];
+        scope.this_slot = Some(2);
+        let info = leaf_fill_info(&scope, false, 0x1234, 7);
+        assert_eq!(info.entry, 0x1234);
+        assert_eq!(info.stack_usage, 7);
+        assert_eq!(info.frame_size, 3);
+        assert_eq!(info.arity, 1);
+        assert_eq!(info.this_slot, 2);
+        assert_eq!(info.strict, 0);
+        assert_eq!(info.tdz_mask, 1 << 1, "only slot 1 is lexical");
+        assert_eq!(info.fill_ok, 1);
+
+        assert_eq!(leaf_fill_info(&scope, true, 0, 0).strict, 1);
+        scope.this_slot = None;
+        assert_eq!(leaf_fill_info(&scope, false, 0, 0).this_slot, NO_THIS_SLOT);
+
+        let wide = scope_info(TDZ_MASK_SLOTS + 1);
+        let info = leaf_fill_info(&wide, false, 0, 0);
+        assert_eq!(
+            info.fill_ok, 0,
+            "a frame wider than the mask must fall back"
+        );
+        assert_eq!(info.tdz_mask, 0);
     }
 
     #[test]

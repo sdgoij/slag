@@ -222,16 +222,33 @@ The list, in the measured order:
   probe never sees it (measured while building G12 — `function sloppy() {
   return this !== undefined; }` refused with ~1 probe per invocation, i.e. a
   cached `leaf_lookup` miss rather than a `this`-slot refusal).
-- **G14 — a non-aliased frame re-probes on every call (open; the real cap on
-  G12, and on every leaf with a local).** `emit_call`'s cache-hit path inlines
-  only an *aliased* frame (`frame_size == arity`, the argument region IS the
-  frame); anything else — a `this` slot, or any `var`/lexical slot past the
-  params — branches back to the probe, which rebuilds the frame every call. On
-  `method_call` that is `LeafCallProbe` 14,000,000, and it is what caps G12 at
-  ≈39 ns/iteration instead of the ≈6.4 ns the aliased lane reaches. The emitter
-  knows `scope` at compile time, so it can write the frame itself behind the
-  existing `room` check (copy the params, `undefined` the var slots, the
-  uninitialized marker the lexical ones, the bound receiver the `this` slot).
+- **G14 — a non-aliased frame rebuilt from a cached descriptor (landed,
+  Stage 3).** `emit_call`'s cache-hit path inlines in-frame only an *aliased*
+  frame (`frame_size == arity`, the argument region IS the frame); anything
+  else — a `this` slot, or any `var`/lexical slot past the params — *did*
+  branch back to the full probe, which re-ran every eligibility check, the
+  `lookup_info` consult and the cache-record rewrite before rebuilding the
+  frame. On the plan's shape (`function f(x){var t=1;return x+t}` at 2M calls)
+  that was `LeafCallProbe` 14,000,000.
+  The hit path now calls `leaf_call_fill`, which rebuilds the frame from a
+  descriptor the probe cached in the call record (`this_slot`, `strict`, a
+  per-slot TDZ mask and `fill_ok`) and returns the entry, or 0 when the frame
+  no longer fits. Both paths fill through the one `fill_leaf_frame`, so a
+  site's first visit (from the scope) and every hit (from the record) cannot
+  drift.
+  The descriptor was found by measurement, not inference: a floor build whose
+  `leaf_call_fill` returned the cached entry right after the cache check priced
+  the indirect call at ~0.3-1 ns and the helper's *body* — the `leaf_lookup`,
+  the `Rc` clone and the scope dereference — at ~7 ns, so removing those three
+  was the lever. Measured: the shape 35.4 → **21.4 ms** with `LeafCallProbe`
+  14,000,000 → **30**, against an aliased control of **10.3 ms**;
+  `calls/method_call` 77.9 → **58.7 ms** (that row is non-aliased, so this is
+  where G12's remaining win was hiding). The residual is now the frame build
+  itself (~4 ns/call fixed + ~0.7 ns/slot), so the remaining lever is a
+  machine-code fill for the no-`this`/no-lexical case — recorded, not done.
+  A frame wider than 64 slots sets `fill_ok = 0` and keeps the probe fallback,
+  because the record's TDZ mask cannot describe it: exactness over a silent
+  mis-fill.
 - **G1 — computed-key access has no inline path**, as before, now ranked below
   calls and the read/write gaps: 73.4M on 12 rows, `index_loop.js` 21.0M.
 - **G3/G4/G5 — literals, iteration, string building**, as before: a helper
@@ -291,14 +308,16 @@ The list, in the measured order:
   per operation, so a compile-time-constant operand (`| 0`, `& 255`) could
   elide half of it — the corpus says the constant-operand cases are already
   fast enough to not pay for the plumbing yet.
-- **Stage 3 — G2 and G12, the leaf-call path.** **Both halves are done** (§3
-  G2 and G12, each with its own measurements and the withdrawn over-claim in
-  G2). Gate: the `direct_leaf` site's `CallSlow` 2,000,000 → 8, the
-  `calls/method_call` row 132.7 → 77.9 ms with its `CallSlow` 14,000,000 → 8,
-  `--jit-bench` unregressed, parity at 0 mismatches, both test262 areas at
-  baseline. What remains is **G14** — the non-aliased frame re-probes on every
-  call, which caps both halves — plus the two refusals G12 and G13 record (a
-  strict plain-call `return this`, and any body that also reads an identifier).
+- **Stage 3 — G2, G12 and G14, the leaf-call path.** **All three are done**
+  (§3 G2, G12 and G14, each with its own measurements and the withdrawn
+  over-claim in G2). Gate: the `direct_leaf` site's `CallSlow` 2,000,000 → 8,
+  the `calls/method_call` row 132.7 → 77.9 ms with its `CallSlow` 14,000,000 →
+  8, the non-aliased shape 35.4 → 21.4 ms with `LeafCallProbe` 14,000,000 →
+  30, `calls/method_call` → 58.7 ms, `--jit-bench` unregressed, parity at 0
+  mismatches, both test262 areas at baseline. What remains of the leaf lane is
+  the residual G14 records (a machine-code fill for the no-`this`/no-lexical
+  case) plus the two refusals G12 and G13 record (a strict plain-call
+  `return this`, and any body that also reads an identifier — G13).
 - **Stage 4 — G10, G11, G1, member writes.** Prototype-chain reads, the
   `switch` chain, computed reads and the member-write path — the remaining
   per-op helper surfaces, each with its own measurement.
@@ -462,3 +481,75 @@ One line per landed stage, newest last. This log is the arc's journal —
   --no-default-features --features jit` green, test262 `all` 48,464/0/0/0 of
   48,622 and `intl402` 3,205/0/0/0 of 3,357 at 15s/15s, corpus parity 77 rows/0
   mismatches, `--jit-bench` in band.
+- **Stage 3, G14 the non-aliased frame (2026-09-28).** A cache hit inlines a
+  leaf in-frame only when the frame IS the argument region (`frame_size ==
+  arity` with all args present); any other frame (a `this` slot, or a
+  `var`/lexical slot past the params) fell back to the full probe, which
+  re-ran `can_inline_leaf`/the realm check, `leaf_lookup`'s kind gate, the
+  `lookup_info` consult and the 48-byte cache-record rewrite before rebuilding
+  the frame — on every call. The hit path now calls a new `leaf_call_fill`
+  (the probe minus that validation: it re-derives the scope, fills through the
+  shared `bind_leaf_frame` the probe also uses, and returns the cached entry
+  or 0 when the frame no longer fits, which routes to `call_slow`). The fill
+  moved into one `bind_leaf_frame` helper so the probe's first visit and every
+  hit cannot drift. `leaf_call_fill` is registered in all four mirror files
+  (`JitSlowPaths`/`JIT_SLOW_PATHS`/the impl, the `Helper` entry and
+  `JitHelpers` field plus its test double, `runtime_helpers`/`helpers_all`, the
+  `emit_call` site — reusing `sig_call_slow`) and is added to
+  `disturbs_leaf_eligibility`'s EXCLUDED list (a read plus a frame write, no
+  re-entry, no compile). Measured on the plan's shape (`function f(x){var t=1;
+  return x}` at 2M calls): `LeafCallProbe` 14,000,000 → **30**, the row 35.4 →
+  **28.5 ms**, against an aliased control of **10.9 ms**; a frame-7 body shows
+  the ~8.6 ns fixed residual plus ~0.7 ns/slot. Correctness: the new
+  `installed_jit_a_non_aliased_leaf_call_fills_without_re_probing` compares
+  against the interpreter and asserts `leaf_call_fill` does the per-call work
+  (≥90,000 fills of 100,000) with the probe confined to the warm-up (≤200);
+  routing the hit path back to the probe makes it count 0 fills and fail. This
+  build also caught a self-inflicted hazard worth recording: the hit path's
+  cache loads need `leaf_inline_offset`, and dropping it on one field read
+  `callee_payload`'s high half as `arity` — a silent wrong answer that the
+  fuzz-free unit tests surfaced only as failing values. Gates: fmt clean,
+  clippy workspace `-D warnings` clean, workspace **5,535 passed / 0 failed**
+  (jit 213), runtime `--no-default-features` 952/0, v8 `simdutf` 380/0, `cli
+  --no-default-features --features jit` green, test262 `all` 48,464/0/0/0 of
+  48,622 and `intl402` 3,205/0/0/0 of 3,357 at 15s/15s, corpus parity 77 rows/0
+  mismatches, `--jit-bench` in band (arithmetic 0.09, bare loop 0.11, function
+  calls 0.13, non-leaf call 0.61).
+- **Stage 3, G14's residual — the cached fill descriptor (2026-09-28).** G14
+  had removed the per-call *probe*, but a floor build (whose `leaf_call_fill`
+  returned the cached entry right after the cache check) showed the helper's
+  body was still ~7 ns: the `leaf_lookup` into the agent's leaf cache, the
+  `Rc<CompiledBody>` clone that ended the borrow, and the scope dereference.
+  The probe now records the fill descriptor in the call record
+  (`LeafInlineInfo.this_slot`/`strict`/`tdz_mask`/`fill_ok`) and
+  `leaf_call_fill` rebuilds from it alone — no callee argument, no
+  `leaf_lookup`, no clone — so the fill helper shrank from `sig_call_slow` to
+  `sig_call`. Both the probe and the hit path fill through one
+  `fill_leaf_frame(&LeafInlineInfo, &TdzSource, …)`: the probe passes
+  `TdzSource::Store(&scope.tdz_store)` (exact for any frame), the hit path
+  `TdzSource::Mask(tdz_mask)` (exact for `frame_size <= 64`; a wider frame
+  records `fill_ok = 0` and the emitter keeps the probe fallback). The
+  `OrdinaryCallBindThis` global now comes from a new `JitCallContext::
+  global_bits`, snapshotted per call next to `global_object`, so the fill
+  needs no `Agent` borrow at all — and the probe and the hit path bind the
+  identical global. Measured: the plan's shape
+  (`function f(x){var t=1;return x+t}` at 2M calls) 27.8 → **21.4 ms** —
+  35.4 ms before G14 first landed — against an aliased control of 10.3 ms;
+  `f2` (`return x`) 25.4 → 19.4 ms; `calls/method_call` 77.9 → **58.7 ms**,
+  its first move since G12 because that row's `this` slot makes it
+  non-aliased. Correctness: a differential over six frame shapes (a `var`
+  slot, a `let` slot, a missing argument, a sloppy `this`→global, a strict
+  `this`→undefined, a method reading its receiver) is byte-identical between
+  the modes, and the existing
+  `installed_jit_inline_leaf_call_with_var_slot_builds_the_frame` still passes.
+  New `leaf_fill_descriptor_matches_the_scope` pins the mask/sentinel/`fill_ok`
+  values; emptying the mask makes it fail. Gates: fmt clean, clippy workspace
+  `-D warnings` clean, workspace **5,536 passed / 0 failed** (jit 213, runtime
+  +1), runtime `--no-default-features` 953/0, v8 `simdutf` 380/0, `cli
+  --no-default-features --features jit` green, test262 `all` 48,464/0/0/0 of
+  48,622 and `intl402` 3,205/0/0/0 of 3,357 at 15s/15s, corpus parity 77 rows/0
+  mismatches, `--jit-bench` in band (arithmetic 0.09, bare loop 0.11, function
+  calls 0.13, non-leaf call 0.64). The residual is now the frame build itself
+  (~4 ns/call fixed + ~0.7 ns/slot) — the next lever would be a machine-code
+  fill for the no-`this`/no-lexical case, which under this design would buy
+  about a nanosecond over the inlined helper.

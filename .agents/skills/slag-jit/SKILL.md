@@ -458,11 +458,52 @@ verdict when it is at rest. Traps:
   `this` *and* an identifier is not certified at all (`LoadIdent` is leaf-excluded),
   which is a `leaf_lookup` miss rather than a `this`-slot refusal when you trace
   it. Measured on the corpus's `calls/method_call`: `CallSlow` 14,000,000 → 8,
-  132.7 → 77.9 ms. The remaining cap is not the call lane: a *non-aliased* frame
-  (`frame_size != arity` — any `var`/lexical slot, or a `this` slot) sends every
-  cache hit back to the probe to have the frame rebuilt, so `LeafCallProbe` is
-  still per-call and the win lands at ~39 ns/iteration where an aliased frame
-  reaches ~6.4 ns.
+  132.7 → 77.9 ms.
+- **A non-aliased hit rebuilds the frame from the RECORD, not the scope
+  (G14).** `emit_call`'s cache-hit path calls a leaf in-frame only when the
+  frame IS the argument region (`frame_size == arity` with all args present);
+  every other frame (a `this` slot, or any `var`/lexical slot past the params)
+  goes to `leaf_call_fill(ctx, this, args, argc, site)` — note `sig_call`, not
+  `sig_call_slow`: there is no callee argument. The probe caches the whole fill
+  descriptor in the record (`LeafInlineInfo.this_slot`/`strict`/`tdz_mask`/
+  `fill_ok`) and the hit path rebuilds from it alone, returning the cached
+  entry or 0 (the frame no longer fits → `call_slow`). Measured payoff: the
+  plan's shape (2M calls of `function f(x){var t=1;return x+t}`) 35.4 →
+  **21.4 ms**, and `calls/method_call` 77.9 → **58.7 ms** — that row is
+  non-aliased, so it was the real cap on G12. Do NOT reintroduce a `leaf_lookup`
+  here: a floor build that returned the entry right after the cache check
+  showed the lookup + the `Rc` clone + the scope deref were ~7 ns of the
+  per-call cost, while the indirect call itself is under 1 ns. `leaf_call_fill`
+  is registered in all four mirror files and is deliberately NOT in
+  `disturbs_leaf_eligibility` (it is a read plus a frame write, no re-entry, no
+  compile).
+- **Both paths fill through one `fill_leaf_frame(&LeafInlineInfo, &TdzSource,
+  …)`.** The probe passes `TdzSource::Store(&scope.tdz_store)` (exact for any
+  frame); the hit path passes `TdzSource::Mask(info.tdz_mask)` (exact for
+  `frame_size <= 64`). A frame wider than the mask records `fill_ok = 0` and
+  the emitter's `not_aliased` block routes it back to `probe_block` — a
+  truncated descriptor must never be used to fill, or the lexical slots lose
+  their TDZ marker silently. If you add a field to `LeafInlineInfo`, keep the
+  hit path's loads going through `leaf_inline_offset`, and keep
+  `leaf_fill_info` (probe) and `leaf_call_fill` (hit) reading the SAME fields.
+- **`OrdinaryCallBindThis`'s global comes from `JitCallContext::global_bits`,
+  not the agent.** The fill needs the realm global's BITS for a sloppy nullish
+  receiver; snapshotting them once per call (next to `global_object`, from the
+  same `vm.global_object(agent)`) keeps the fill off the `Agent` borrow — which
+  is what let the hit path drop the `Rc` clone — and makes the probe and the
+  hit path bind the identical global. Every `JitCallContext { … }` literal
+  (three in `ir.rs`/`jit.rs`, four in the jit crate's tests) needs the field.
+- **The hit path's cache loads MUST wrap `leaf_inline_offset`.** The probe
+  path's base (`info`) already points at `leaf_inline`, so it uses a bare
+  `offset_of!(LeafInlineInfo, …)`; the hit path's `cache` points at the
+  `LeafCallSiteCache` record, so every field load there must go through
+  `leaf_inline_offset(offset_of!(…))`. Dropping the wrapper on ONE field
+  (e.g. `arity`) reads the high half of `callee_payload` instead, which makes
+  `aliased` false almost always: the aliased fast path goes dead and every
+  hit takes the fill path, producing silently wrong values (not a crash).
+  This is exactly the kind of plausible-looking wrong answer the sweeps
+  catch and unit reasoning does not — `JIT_DUMP_CLIF=1` shows it as the load
+  offset in the cache gate.
 
 ## 17. The compile threshold (Cut 69) — the gate in `lookup_info`
 

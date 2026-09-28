@@ -3782,11 +3782,14 @@ impl<'a> Lowerer<'a> {
         let entry_zero = self.builder.ins().icmp_imm_u(IntCC::Equal, cached_entry, 0);
         let fast = self.builder.create_block();
         self.builder.ins().brif(entry_zero, slow, &[], fast, &[]);
-        // The aliased in-frame call: the leaf's frame IS the argument region
-        // (`frame_size == arity` with all args present), so there is no frame
-        // fill for the machine code to reproduce — a built frame's per-slot
-        // TDZ markers come from the probe's fill, which a non-aliased hit
-        // falls back to.
+        // G14: a hit splits on the frame shape. An ALIASED frame (the leaf's
+        // frame IS the argument region — `frame_size == arity` with all args
+        // present) is called in-frame directly behind the room check. Any
+        // other frame (a `this` slot, or a `var`/lexical slot past the
+        // params) must be rebuilt above the arguments: `leaf_call_fill` does
+        // the fill from the cached verdict without re-running the probe's
+        // eligibility checks, which is what a non-aliased site paid on every
+        // call before.
         self.builder.switch_to_block(fast);
         let frame_size = self.builder.ins().load(
             types::I32,
@@ -3818,13 +3821,16 @@ impl<'a> Lowerer<'a> {
                 .icmp(IntCC::UnsignedLessThanOrEqual, frame_size_64, argc);
         let aliased = self.builder.ins().band(fs_eq_ar, argc_ge_fs);
         let room = self.builder.create_block();
+        let not_aliased = self.builder.create_block();
         self.builder
             .ins()
-            .brif(aliased, room, &[], probe_block, &[]);
+            .brif(aliased, room, &[], not_aliased, &[]);
         // The inline frame + working area must fit above the argument
         // region's top in the caller's working buffer (the probe checked it
         // once; the stack pointer at a merged-CFG call site can differ across
-        // visits, so re-check before trusting the cached verdict).
+        // visits, so re-check before trusting the cached verdict). The probe
+        // re-checks the identical condition, so a miss here means the probe
+        // would refuse too — go straight to `call_slow`.
         self.builder.switch_to_block(room);
         let buf_end = self.builder.ins().load(
             types::I64,
@@ -3841,12 +3847,50 @@ impl<'a> Lowerer<'a> {
             .ins()
             .icmp(IntCC::UnsignedLessThanOrEqual, top_needed, buf_end);
         let inline = self.builder.create_block();
-        self.builder.ins().brif(fits, inline, &[], probe_block, &[]);
+        self.builder.ins().brif(fits, inline, &[], slow, &[]);
         self.builder.switch_to_block(inline);
         let frame_size_64 = self.builder.ins().uextend(types::I64, frame_size);
         let frame_bytes = self.builder.ins().imul_imm_s(frame_size_64, 8);
         let stack_ptr = self.builder.ins().iadd(args_ptr, frame_bytes);
         self.emit_leaf_call_tail(cached_entry, args_ptr, stack_ptr, pre_call_sp, merge);
+        // The non-aliased hit: the probe's verdict stays valid, but only a
+        // frame the record can describe is rebuildable without the probe
+        // (`fill_ok`). A frame wider than the record's TDZ mask keeps the old
+        // probe fallback rather than mis-filling.
+        self.builder.switch_to_block(not_aliased);
+        let fill_ok = self.builder.ins().load(
+            types::I32,
+            MemFlagsData::new(),
+            cache,
+            Offset32::new(leaf_inline_offset(std::mem::offset_of!(LeafInlineInfo, fill_ok)) as i32),
+        );
+        let fill_ok = self.builder.ins().icmp_imm_u(IntCC::NotEqual, fill_ok, 0);
+        let fill = self.builder.create_block();
+        self.builder
+            .ins()
+            .brif(fill_ok, fill, &[], probe_block, &[]);
+        // `leaf_call_fill` rebuilds the frame from the recorded descriptor
+        // (no callee, no `leaf_lookup`) and returns the cached entry, or 0
+        // when it no longer fits — hence `sig_call`, not `sig_call_slow`.
+        self.builder.switch_to_block(fill);
+        let site_imm = self.builder.ins().iconst(types::I64, index as i64);
+        let filled = self.emit_raw_call(
+            self.sig_call,
+            Helper::LeafCallFill,
+            &[this, args_ptr, argc, site_imm],
+        )?;
+        let fill_ok = self.builder.ins().icmp_imm_u(IntCC::NotEqual, filled, 0);
+        let inline_filled = self.builder.create_block();
+        self.builder
+            .ins()
+            .brif(fill_ok, inline_filled, &[], slow, &[]);
+        self.builder.switch_to_block(inline_filled);
+        let argc_bytes = self.builder.ins().imul_imm_s(argc, 8);
+        let frame_base = self.builder.ins().iadd(args_ptr, argc_bytes);
+        let frame_size_64 = self.builder.ins().uextend(types::I64, frame_size);
+        let frame_bytes = self.builder.ins().imul_imm_s(frame_size_64, 8);
+        let stack_ptr = self.builder.ins().iadd(frame_base, frame_bytes);
+        self.emit_leaf_call_tail(filled, frame_base, stack_ptr, pre_call_sp, merge);
         // The probe path: the full validation + lookups + frame fill (Cut
         // 37); the probe records the cache identity so repeat visits skip it.
         self.builder.switch_to_block(probe_block);

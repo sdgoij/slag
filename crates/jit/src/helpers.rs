@@ -50,6 +50,10 @@ pub enum Helper {
     RmwUpdateComputed,
     CallSlow,
     LeafCallProbe,
+    /// G14: the compiled leaf-call hit path for a non-aliased frame — the
+    /// frame rebuild without the eligibility re-validation the cache gate
+    /// already performed.
+    LeafCallFill,
     GetGlobal,
     SetGlobal,
     SetGlobalSlot,
@@ -207,6 +211,7 @@ impl Helper {
             Helper::RmwUpdateComputed => "rmw_update_computed",
             Helper::CallSlow => "call_slow",
             Helper::LeafCallProbe => "leaf_call_probe",
+            Helper::LeafCallFill => "leaf_call_fill",
             Helper::GetGlobal => "get_global",
             Helper::SetGlobal => "set_global",
             Helper::SetGlobalSlot => "set_global_slot",
@@ -344,6 +349,7 @@ impl Helper {
             self,
             Helper::TdzError
                 | Helper::LeafCallProbe
+                | Helper::LeafCallFill
                 | Helper::ApplyArgsFill
                 | Helper::ToBooleanSlow
                 | Helper::ConcatStrings
@@ -458,6 +464,14 @@ pub struct JitHelpers {
             argc: u64,
             site: u64,
         ) -> u64,
+    >,
+    /// G14: the compiled leaf-call hit path for a non-aliased frame — rebuild
+    /// the leaf's frame above the argument region and return the cached entry
+    /// (0 = the frame no longer fits, so fall back to `call_slow`). Skips the
+    /// re-validation `leaf_call_probe` does, which the compiled cache gate has
+    /// already performed.
+    pub leaf_call_fill: Option<
+        extern "C" fn(vm: *mut c_void, this: u64, args: *mut u64, argc: u64, site: u64) -> u64,
     >,
     /// Read a declared top-level `var` off the global object (`name` is an
     /// `AtomId`); returns the value.
@@ -824,6 +838,7 @@ impl JitHelpers {
             rmw_update_computed: None,
             call_slow: None,
             leaf_call_probe: None,
+            leaf_call_fill: None,
             get_global: None,
             set_global: None,
             set_global_slot: None,
@@ -961,6 +976,7 @@ impl JitHelpers {
             Helper::RmwUpdateComputed => self.rmw_update_computed.map(|f| f as usize as u64),
             Helper::CallSlow => self.call_slow.map(|f| f as usize as u64),
             Helper::LeafCallProbe => self.leaf_call_probe.map(|f| f as usize as u64),
+            Helper::LeafCallFill => self.leaf_call_fill.map(|f| f as usize as u64),
             Helper::GetGlobal => self.get_global.map(|f| f as usize as u64),
             Helper::SetGlobal => self.set_global.map(|f| f as usize as u64),
             Helper::SetGlobalSlot => self.set_global_slot.map(|f| f as usize as u64),
@@ -1896,6 +1912,19 @@ pub(crate) extern "C" fn test_call_slow(
 pub(crate) extern "C" fn test_leaf_call_probe(
     _vm: *mut c_void,
     _callee: u64,
+    _this: u64,
+    _args: *mut u64,
+    _argc: u64,
+    _site: u64,
+) -> u64 {
+    0
+}
+
+/// The G14 fill test double: always rejects, like the probe double, so the
+/// unit tests exercise the `call_slow` fallback.
+#[cfg(test)]
+pub(crate) extern "C" fn test_leaf_call_fill(
+    _vm: *mut c_void,
     _this: u64,
     _args: *mut u64,
     _argc: u64,

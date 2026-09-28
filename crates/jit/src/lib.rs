@@ -355,6 +355,7 @@ fn runtime_helpers() -> JitHelpers {
         rmw_update_computed: Some(rt.rmw_update_computed),
         call_slow: Some(rt.call_slow),
         leaf_call_probe: Some(rt.leaf_call_probe),
+        leaf_call_fill: Some(rt.leaf_call_fill),
         get_global: Some(rt.get_global),
         set_global: Some(rt.set_global),
         set_global_slot: Some(rt.set_global_slot),
@@ -592,6 +593,7 @@ mod tests {
             rmw_update_computed: Some(helpers::test_rmw_update_computed),
             call_slow: Some(helpers::test_call_slow),
             leaf_call_probe: Some(helpers::test_leaf_call_probe),
+            leaf_call_fill: Some(helpers::test_leaf_call_fill),
             get_global: Some(helpers::test_get_global),
             set_global: Some(helpers::test_set_global),
             set_global_slot: Some(helpers::test_set_global_slot),
@@ -730,6 +732,7 @@ mod tests {
             // A null global routes the inline `LoadGlobal` fast path to the
             // helper (the test doubles), so the bare ctx stays safe.
             global_object: std::ptr::null_mut(),
+            global_bits: 0,
             global_value_cells: std::ptr::null_mut(),
             member_value_cells: std::ptr::null_mut(),
             member_map_cells: std::ptr::null_mut(),
@@ -1154,6 +1157,7 @@ mod tests {
             agent: std::ptr::null_mut(),
             vm: std::ptr::null_mut(),
             global_object: std::ptr::null_mut(),
+            global_bits: 0,
             global_value_cells: std::ptr::null_mut(),
             member_value_cells: std::ptr::null_mut(),
             member_map_cells: std::ptr::null_mut(),
@@ -1426,6 +1430,7 @@ mod tests {
             agent: std::ptr::null_mut(),
             vm: std::ptr::null_mut(),
             global_object: std::ptr::null_mut(),
+            global_bits: 0,
             global_value_cells: std::ptr::null_mut(),
             member_value_cells: std::ptr::null_mut(),
             member_map_cells: std::ptr::null_mut(),
@@ -1513,6 +1518,7 @@ mod tests {
             agent: std::ptr::null_mut(),
             vm: std::ptr::null_mut(),
             global_object: std::ptr::null_mut(),
+            global_bits: 0,
             global_value_cells: std::ptr::null_mut(),
             member_value_cells: std::ptr::null_mut(),
             member_map_cells: std::ptr::null_mut(),
@@ -3426,6 +3432,88 @@ mod tests {
         assert!(
             slow <= 60,
             "the method and `this`-reading sites must inline after their tier-up windows ({slow} call_slow calls): refusing a `this`-slot leaf would count ~200K"
+        );
+    }
+
+    #[test]
+    fn installed_jit_a_non_aliased_leaf_call_fills_without_re_probing() {
+        // G14: a leaf whose frame is NOT the argument region (any `var`/
+        // lexical slot past the params, or a `this` slot) must have its frame
+        // rebuilt above the arguments on every call. That used to re-run the
+        // whole `leaf_call_probe` per visit (its eligibility checks, its
+        // `lookup_info` consult and its cache-record rewrite); the compiled
+        // hit path now rebuilds the frame through `leaf_call_fill` instead, so
+        // the probe runs only while the site warms up. Counting the two
+        // helpers isolates the fix: the reverted per-visit probe counts ~100K.
+        static PROBE_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        static FILL_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        extern "C" fn counting_leaf_call_probe(
+            ctx: *mut c_void,
+            callee: u64,
+            this: u64,
+            args: *mut u64,
+            argc: u64,
+            site: u64,
+        ) -> u64 {
+            PROBE_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            (runtime::jit::JIT_SLOW_PATHS.leaf_call_probe)(ctx, callee, this, args, argc, site)
+        }
+        extern "C" fn counting_leaf_call_fill(
+            ctx: *mut c_void,
+            this: u64,
+            args: *mut u64,
+            argc: u64,
+            site: u64,
+        ) -> u64 {
+            FILL_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            (runtime::jit::JIT_SLOW_PATHS.leaf_call_fill)(ctx, this, args, argc, site)
+        }
+        let mut helpers = runtime_helpers();
+        helpers.leaf_call_probe = Some(counting_leaf_call_probe);
+        helpers.leaf_call_fill = Some(counting_leaf_call_fill);
+
+        // `f` has a `var` past its one parameter, so its frame (2 slots) is not
+        // the argument region (1 slot): every call needs a fill.
+        let source = "function f(x) { var t = 2; return x + t; }\n\
+                      function run() {\n\
+                        var s = 0;\n\
+                        for (var i = 0; i < 100000; i++) { s += f(i); }\n\
+                        return s;\n\
+                      }\n\
+                      run();";
+        let interp = {
+            let mut agent = runtime::Agent::new();
+            agent.initialize_host_defined_realm().expect("realm");
+            agent.run_script(source).expect("interp runs")
+        };
+
+        extern "C" fn noop_drop(_cache: *mut c_void) {}
+        let mut agent = runtime::Agent::new();
+        agent.initialize_host_defined_realm().expect("realm");
+        let mut cache = JitCache::new(helpers).expect("isa");
+        agent.jit_hook = Some(runtime::jit::JitHook {
+            cache: (&mut cache as *mut JitCache) as *mut c_void,
+            lookup: jit_cache_lookup,
+            drop_cache: noop_drop,
+            helpers: &runtime::jit::JIT_SLOW_PATHS,
+        });
+        let value = agent.run_script(source).expect("jit runs");
+        let compiled = cache.compiled_count();
+        agent.jit_hook = None;
+        assert_eq!(
+            value, interp,
+            "the built frame must bind exactly as the interpreter's"
+        );
+        assert!(compiled >= 2, "{compiled} bodies must compile");
+        let probes = PROBE_CALLS.load(std::sync::atomic::Ordering::Relaxed);
+        let fills = FILL_CALLS.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            fills >= 90_000,
+            "the warm site must fill every call through `leaf_call_fill` ({fills} fills)"
+        );
+        assert!(
+            probes <= 200,
+            "the probe must run only while the site warms up ({probes} probes): a per-visit re-probe would count ~100K"
         );
     }
 
