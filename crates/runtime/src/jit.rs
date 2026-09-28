@@ -276,6 +276,11 @@ pub const VM_TRY_STACK_PTR_OFFSET: usize = std::mem::offset_of!(Vm, try_stack) +
 pub const VM_TRY_STACK_CAP_OFFSET: usize = std::mem::offset_of!(Vm, try_stack) + VEC_CAP_OFFSET;
 pub const VM_LEXICAL_ENV_OFFSET: usize = std::mem::offset_of!(Vm, lexical_env);
 pub const VM_IP_OFFSET: usize = std::mem::offset_of!(Vm, ip);
+/// G19: the pending `switch` discriminant (a raw `Value` `u64`) and its
+/// presence flag — the compiled `SwitchDisc`/`SwitchTest` read and write them
+/// in machine code.
+pub const VM_SWITCH_DISC_OFFSET: usize = std::mem::offset_of!(Vm, switch_disc);
+pub const VM_SWITCH_DISC_SET_OFFSET: usize = std::mem::offset_of!(Vm, switch_disc_set);
 pub const VM_PENDING_LEN_OFFSET: usize = std::mem::offset_of!(Vm, pending) + VEC_LEN_OFFSET;
 pub const VM_FOR_OF_STACK_LEN_OFFSET: usize =
     std::mem::offset_of!(Vm, for_of_stack) + VEC_LEN_OFFSET;
@@ -4184,7 +4189,8 @@ extern "C" fn dispatch_error(ctx: *mut c_void, ip: u64) -> u64 {
 extern "C" fn switch_disc(ctx: *mut c_void, value: u64) -> u64 {
     let ctx = unsafe { ctx_of(ctx) };
     let vm = unsafe { &mut *ctx.vm };
-    vm.switch_disc = Some(Value::from_bits(value));
+    vm.switch_disc = Value::from_bits(value);
+    vm.switch_disc_set = true;
     Value::Undefined.bits()
 }
 
@@ -4192,7 +4198,7 @@ extern "C" fn switch_test(ctx: *mut c_void, case: u64, test: u64) -> u64 {
     let ctx = unsafe { ctx_of(ctx) };
     let vm = unsafe { &mut *ctx.vm };
     let test = Value::from_bits(test);
-    let Some(disc) = vm.switch_disc else {
+    if !vm.switch_disc_set {
         return slow_error(
             ctx,
             JsError::new(
@@ -4201,7 +4207,7 @@ extern "C" fn switch_test(ctx: *mut c_void, case: u64, test: u64) -> u64 {
             ),
         );
     };
-    if crux::ops::is_strictly_equal(&disc, &test) {
+    if crux::ops::is_strictly_equal(&vm.switch_disc, &test) {
         vm.ip = case as usize;
         1
     } else {

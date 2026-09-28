@@ -50,8 +50,8 @@ use runtime::jit::{
     VM_BUILDER_OFFSET, VM_COMPLETION_IS_EMPTY_OFFSET, VM_COMPLETION_OFFSET,
     VM_DESTRUCTURE_STACK_LEN_OFFSET, VM_ENV_STACK_LEN_OFFSET, VM_FOR_IN_STACK_LEN_OFFSET,
     VM_FOR_OF_BOUNDARIES_LEN_OFFSET, VM_FOR_OF_STACK_LEN_OFFSET, VM_IP_OFFSET,
-    VM_LEXICAL_ENV_OFFSET, VM_PENDING_LEN_OFFSET, VM_TRY_STACK_CAP_OFFSET, VM_TRY_STACK_LEN_OFFSET,
-    VM_TRY_STACK_PTR_OFFSET,
+    VM_LEXICAL_ENV_OFFSET, VM_PENDING_LEN_OFFSET, VM_SWITCH_DISC_OFFSET, VM_SWITCH_DISC_SET_OFFSET,
+    VM_TRY_STACK_CAP_OFFSET, VM_TRY_STACK_LEN_OFFSET, VM_TRY_STACK_PTR_OFFSET,
 };
 use syntax::ast::{AssignOp, BinaryOp, UnaryOp, UpdateOp};
 use target_lexicon::PointerWidth;
@@ -4133,6 +4133,61 @@ impl<'a> Lowerer<'a> {
         Ok(())
     }
 
+    /// The compiled `Step::SwitchTest` comparison (G19): the inlined
+    /// strictly-equal fast paths, falling to the `switch_test` helper for the
+    /// rest. Returns a 0/1 value in the current block.
+    fn emit_switch_test(&mut self, case: usize, test: ClifValue) -> Result<ClifValue, Unsupported> {
+        let var = self.builder.declare_var(types::I8);
+        let vm = self.vm_ptr();
+        let disc = self.load_vm(vm, VM_SWITCH_DISC_OFFSET);
+        let num = self.builder.create_block();
+        let bits = self.builder.create_block();
+        let same = self.builder.create_block();
+        let helper = self.builder.create_block();
+        let done = self.builder.create_block();
+        let disc_num = self.is_double(disc);
+        let test_num = self.is_double(test);
+        let both_num = self.builder.ins().band(disc_num, test_num);
+        self.builder.ins().brif(both_num, num, &[], bits, &[]);
+        // Two Numbers: `===` is the f64 compare (NaN unequal, +0 === -0).
+        self.builder.seal_block(num);
+        self.builder.switch_to_block(num);
+        let a = self
+            .builder
+            .ins()
+            .bitcast(types::F64, MemFlagsData::new(), disc);
+        let b = self
+            .builder
+            .ins()
+            .bitcast(types::F64, MemFlagsData::new(), test);
+        let eq = self.builder.ins().fcmp(FloatCC::Equal, a, b);
+        self.builder.def_var(var, eq);
+        self.builder.ins().jump(done, &[]);
+        // Not both Numbers: identical bits are the same value (an object, a
+        // symbol, a string box, a BigInt box, a boolean, null, undefined).
+        self.builder.seal_block(bits);
+        self.builder.switch_to_block(bits);
+        let same_bits = self.builder.ins().icmp(IntCC::Equal, disc, test);
+        self.builder.ins().brif(same_bits, same, &[], helper, &[]);
+        self.builder.seal_block(same);
+        self.builder.switch_to_block(same);
+        let one = self.builder.ins().iconst(types::I8, 1);
+        self.builder.def_var(var, one);
+        self.builder.ins().jump(done, &[]);
+        // The helper: distinct string/BigInt boxes with equal content, and the
+        // mixed-kind cases the fast paths decline.
+        self.builder.seal_block(helper);
+        self.builder.switch_to_block(helper);
+        let case_imm = self.builder.ins().iconst(types::I64, case as i64);
+        let res = self.call_slow(self.sig_update, Helper::SwitchTest, &[case_imm, test])?;
+        let nz = self.builder.ins().icmp_imm_u(IntCC::NotEqual, res, 0);
+        self.builder.def_var(var, nz);
+        self.builder.ins().jump(done, &[]);
+        self.builder.seal_block(done);
+        self.builder.switch_to_block(done);
+        Ok(self.builder.use_var(var))
+    }
+
     /// A `Vm` field load, from the vm pointer machine code already holds.
     fn load_vm(&mut self, vm: ClifValue, offset: usize) -> ClifValue {
         self.builder.ins().load(
@@ -7200,19 +7255,21 @@ impl<'a> Lowerer<'a> {
                 self.fall_through(index);
             }
             Step::SwitchDisc => {
+                // G19: the discriminant lands in the Vm (raw `Value` bits + the
+                // presence byte) with two stores, so the compiled `SwitchTest`
+                // reads it with one load and the interpreter and the helper
+                // fallback share the field (a register would not survive a
+                // suspension inside a case expression).
                 let disc = self.pop();
-                let _res = self.call_slow(self.sig_bool, Helper::SwitchDisc, &[disc])?;
+                let vm = self.vm_ptr();
+                self.store_vm(vm, VM_SWITCH_DISC_OFFSET, disc);
+                let set = self.builder.ins().iconst(types::I8, 1);
+                self.store_vm(vm, VM_SWITCH_DISC_SET_OFFSET, set);
                 self.fall_through(index);
             }
             Step::SwitchTest { case } => {
-                // Strictly-equal the case test against the stored
-                // discriminant; a match jumps to the case block (a static
-                // target), otherwise the next test (or the default jump)
-                // runs.
                 let test = self.pop();
-                let case_imm = self.builder.ins().iconst(types::I64, *case as i64);
-                let matched =
-                    self.call_slow(self.sig_update, Helper::SwitchTest, &[case_imm, test])?;
+                let matched = self.emit_switch_test(*case, test)?;
                 let target = self.ensure_block(*case);
                 self.cond_jump(matched, true, target, index + 1);
             }

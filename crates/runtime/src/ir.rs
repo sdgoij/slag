@@ -3198,7 +3198,15 @@ pub struct Vm {
     pub jit_work: Vec<Value>,
     /// Pending class definitions whose heritage/computed names suspend.
     pub class_stack: Vec<ClassEvalState>,
-    pub switch_disc: Option<Value>,
+    /// The pending `switch` discriminant (spec 13.12.11 case-block
+    /// evaluation), as a raw `Value` so the compiled `SwitchTest` can read it
+    /// with one load; `switch_disc_set` is the presence bit the interpreter and
+    /// the helper check (`switch (undefined)` has a real `undefined`
+    /// discriminant, so the value cannot carry a sentinel).
+    pub switch_disc: Value,
+    /// Whether [`Vm::switch_disc`] holds a pending `switch`'s discriminant (the
+    /// compiled `SwitchDisc` sets it in machine code).
+    pub switch_disc_set: bool,
     /// An upstream `?.` short-circuited: the rest of the chain (keys, args,
     /// further links) must not evaluate, and the chain is `undefined` (spec
     /// 13.4.3). Cleared when the outermost chain node finishes.
@@ -3485,7 +3493,8 @@ impl Vm {
             yield_star_stack: Vec::new(),
             jit_work: Vec::new(),
             class_stack: Vec::new(),
-            switch_disc: None,
+            switch_disc: Value::Undefined,
+            switch_disc_set: false,
             chain_short: false,
             pending_disposal: None,
             pending_catch_disposal: None,
@@ -3550,7 +3559,8 @@ impl Vm {
         self.yield_star_stack.clear();
         self.jit_work.clear();
         self.class_stack.clear();
-        self.switch_disc = None;
+        self.switch_disc = Value::Undefined;
+        self.switch_disc_set = false;
         self.chain_short = false;
         self.pending_disposal = None;
         self.pending_catch_disposal = None;
@@ -8506,17 +8516,18 @@ impl Vm {
                 }
                 Step::SwitchDisc => {
                     let disc = self.pop();
-                    self.switch_disc = Some(disc);
+                    self.switch_disc = disc;
+                    self.switch_disc_set = true;
                 }
                 Step::SwitchTest { case } => {
                     let test = self.pop();
-                    let disc = self.switch_disc.as_ref().ok_or_else(|| {
-                        JsError::new(
+                    if !self.switch_disc_set {
+                        return Err(JsError::new(
                             ErrorKind::SyntaxError,
                             "SwitchTest without a discriminant".into(),
-                        )
-                    })?;
-                    if crux::ops::is_strictly_equal(disc, &test) {
+                        ));
+                    }
+                    if crux::ops::is_strictly_equal(&self.switch_disc, &test) {
                         self.ip = *case;
                     }
                 }

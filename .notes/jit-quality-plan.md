@@ -118,14 +118,14 @@ corpus, one process per row** so a row's counters belong to it, summed:
 |---|---|---|---|---|
 | `BinarySlow` | 255.8M | 50 | integer operators (bitwise/shift); `+`/`-`/`*` inline | **G9 — landed (Stage 2)** |
 | `CallSlow` | 102.2M | 50 | every call not inlined by the leaf path | **G2 — landed (Stage 3)** |
-| `SwitchTest` | 91.9M | 1 | one per `case`, per execution | **new (G11)** |
+| `SwitchTest` | 91.9M | 1 | one per `case`, per execution | **G19 — landed (Stage 7)** |
 | `GetMemberName` | 90.4M | 54 | prototype-chain reads (every method read) | **new (G10)** |
 | `GetMemberComputed` | 73.4M | 12 | computed read `a[i]`; the write side has two inline paths | G1 |
 | `SetMemberSlot` | 70.0M | 3 | member writes off the in-place path (`this.x += n`, churn) | G1-adjacent |
 | `LeafCallProbe` | 33.7M | 50 | the probe re-run on epoch churn — plus the dead-path tax of G2 | G2 |
 | `LoadContext` | 30.3M | 4 | closure/context slot loads | — |
 | `ForOfNextBindLocal` | 21.0M | 1 | `for-of` step | **G17 — landed (Stage 6)** |
-| `SwitchDisc` | 21.0M | 1 | `switch` selector | G11 |
+| `SwitchDisc` | 21.0M | 1 | `switch` selector | **G19 — landed (Stage 7)** |
 | `BreakControl` | 21.0M | 1 | `break` inside a `switch` | **G18 — landed (Stage 7)** |
 | `ObjectFast` | 16.8M | 16 | object literal (fused — the sequence was already collapsed by Cut 72) | **G3 — landed (Stage 6)** |
 | `TypedArrayLength` | 15.7M | 16 | array `length` read (misnamed: the FFI probe every `i < a.length` paid) | **G16 — landed (Stage 6)** |
@@ -529,11 +529,17 @@ The list, in the measured order:
   route through, no for-of iterator to close). With the Lowerer's
   `has_try`/`has_for_of` and a new `has_async_for_of` all false the arm now
   jumps directly — `control/switch_dispatch.js` 63.5 → 42.2 ms jit and
-  `BreakControl` 21.0M → 0 (§8). **G19 (the `SwitchDisc`/`SwitchTest` inline)
-  remains**: the discriminant lives in `vm.switch_disc: Option<Value>`, which
-  machine code cannot read, so it needs a machineable home (a hoisted frame
-  slot, or a `Value` + presence flag) plus an inline strict-equality for the
-  case test.
+  `BreakControl` 21.0M → 0 (§8). **G19 landed the rest of the row** (§8): the
+  discriminant is a machine-readable `Value` + presence flag and the case test an
+  inline strict-equality, so `control/switch_dispatch.js` is 23.7 ms jit (8.9×
+  jitless) with `SwitchDisc`, `SwitchTest` and `BreakControl` all at 0.
+- **G19 — the `switch` discriminant and case test (landed, Stage 7).** G18 left
+  the row's `SwitchDisc` 21.0M + `SwitchTest` 91.9M, both helper calls for what
+  is a store and a compare. `Vm::switch_disc: Option<Value>` was the blocker (not
+  machine-readable), so the field became a raw `Value` plus `switch_disc_set`;
+  the compiled `SwitchDisc` now writes it with two stores and the compiled
+  `SwitchTest` compares inline with `===`'s three fast paths, falling to the
+  helper for distinct string/BigInt boxes and mixed kinds (§8).
 - **G6/G7 and the feedback record — cell capacity, the register path's one shape,
   per-site feedback.** G8 landed (above, Stage 7) as a key→atom cell, not the
   value cell the census implied, because the in-place store discipline forbids a
@@ -658,8 +664,8 @@ The list, in the measured order:
   52.7 → 10.6 ms and the real-world `control/for_in.js` 34.9 → 10.54 ms. **G18
   landed next**: a compiled `break`/`continue` with no finally or for-of in
   scope jumps directly — `control/switch_dispatch.js` 63.5 → 42.2 ms.** G19
-  (the switch discriminant + per-case strict-equality inline) is the rest of
-  that row's helper share.
+  (the switch discriminant + per-case strict-equality inline) then took that
+  row's remaining helper share to zero — 23.7 ms jit, 8.9× jitless.
 
 Each stage: the instrument re-run, the engine gates (fmt, clippy
 `-D warnings`, workspace tests, both `--no-default-features` checks), the
@@ -1266,7 +1272,47 @@ One line per landed stage, newest last. This log is the arc's journal —
   `emit_computed_read_slot` and the agreement test); six consecutive full
   `-p jit` runs green and `str_key.js` 10.9 ms with 35 helper-13 calls
   (unregressed). Recorded because the same low-bits index pattern is the obvious
-  thing to reach for in a new direct-mapped cell.
+  thing to reach for in a new direct-mapped cell. The hash fixed the OUTER
+  cell's aliasing (a real improvement), but a second aliasing cause remained:
+  the probe takes its VALUE from the 16-slot `member_value_cells`
+  (`(id ^ atom) & 15`), so a five-key object aliases there in roughly 30% of
+  layouts — and *which* atoms the keys get depends on the process-global
+  interner's state, i.e. on what ran first in the parallel suite, which is why
+  the count test kept failing intermittently at a lower rate. Addressed with
+  G19 (the count test is now a one-key shape; the many-key shape is
+  differential) — see that entry.
+- **Stage 7, G19 — the `switch` discriminant and case test in machine code
+  (2026-09-28).** G18 left the row's `SwitchDisc` 21.0M + `SwitchTest` 91.9M,
+  both helper calls for what is a store and a compare. The blocker was storage:
+  `Vm::switch_disc: Option<Value>` is not machine-readable (Rust's `Option`
+  layout, an unaddressable discriminant), so the field became a raw `Value` plus
+  a `switch_disc_set: bool`, with `VM_SWITCH_DISC_OFFSET`/
+  `VM_SWITCH_DISC_SET_OFFSET` exported like the other `VM_*` fields (a
+  *register* was rejected on purpose: a case expression can suspend, and only
+  Vm/frame state survives a resume). The compiled `SwitchDisc` writes the bits
+  and the flag with two stores; the compiled `SwitchTest` loads the bits and
+  compares inline with `===`'s three fast paths — two Numbers via one f64
+  compare (`NaN` unequal, `+0 === -0`), otherwise identical bits (the same
+  object/symbol/string box/BigInt box/bool/null/undefined) — falling to the
+  `switch_test` helper for distinct string/BigInt boxes with equal content and
+  kind-mismatched tests, which reads the same field. `control/switch_dispatch.js`
+  **42.2 → 23.7 ms jit** (210.8 jitless; the row is 63.5 → 23.7, **8.9×**), with
+  `SwitchDisc`/`SwitchTest`/`BreakControl` all at **0** corpus calls (only
+  `GcSafepoint` remains). Tests: `installed_jit_switch_disc_and_test_inline`
+  (both counters; mutation-checked → 100,000 `switch_disc` calls),
+  `installed_jit_switch_mixed_case_falls_to_the_helper` (a kind-mismatched case
+  must take the helper),
+  `installed_jit_switch_edge_values_match_the_interpreter` (differential over
+  `0`/`-0`/`true`/`null`/`undefined`/`'x'`/`1`/`NaN`), with the existing
+  switch-in-try and hot-switch-loop tests. Recorded limitation: the
+  computed-read probe's coverage is capped by `MEMBER_CELLS`, unlike the named
+  read, which also has the map/shape fallback — a follow-up if a many-key hot
+  object shows up. Gates: fmt, clippy `-D warnings`, workspace (test262 3,324,
+  runtime 984, jit 232), runtime `--no-default-features` 953, `v8 --features
+  simdutf` 380, cli `--no-default-features --features jit`, test262 `all` 48,464
+  pass / 0 fail / 0 crash / 0 hang, `intl402` 3,205 pass / 0 fail, `--jit-bench`
+  all `result-ok`, corpus parity 77 rows 0 mismatches, 12 consecutive `-p jit`
+  runs green.
 - **Stage 7, G18 — a compiled `break`/`continue` jumps directly when no finally
   or for-of is in scope (2026-09-28).** The census's `BreakControl` (21.0M, the
   one `control/switch_dispatch.js` row) was the whole compiled `Step::Break`:

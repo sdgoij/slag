@@ -6453,11 +6453,16 @@ run(); run(); run(); run(); run(); run(); run(); run(); run();";
 
     #[test]
     fn installed_jit_computed_read_cell_inlines() {
-        // G8: a monomorphic `o[k]` read with a String key over an own data
-        // property in a compiled loop must serve from the computed-read cell —
-        // the counting wrapper proves the `get_member_computed` helper runs
-        // only while the cell warms up (a couple of reads per key), not per
-        // element — and the value must match the interpreter.
+        // G8: a compiled `o[k]` read with a String key over an own data property
+        // must serve from the computed-read cell — the counting wrapper proves
+        // the `get_member_computed` helper runs only while the cell warms up, not
+        // per read — and the value must match the interpreter. The object holds
+        // ONE key deliberately: the probe's value comes from the 16-slot
+        // `member_value_cells` (keyed `(id ^ atom) & 15`), so a many-key object
+        // can alias there and the count would then depend on which atoms the
+        // process-global interner happened to assign (the parallel suite shifts
+        // that); the multi-key shape is checked differentially below. The loop
+        // writes through the same key so the read cannot be CSE'd away.
         static READ_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         extern "C" fn counting_read(ctx: *mut c_void, object: u64, key: u64) -> u64 {
             READ_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -6466,18 +6471,17 @@ run(); run(); run(); run(); run(); run(); run(); run(); run();";
         let mut helpers = runtime_helpers();
         helpers.get_member_computed = Some(counting_read);
 
-        // The loop is the cell-served shape (an own data property, String keys
-        // cycling over five names); the tail exercises the declines — a Number
-        // key, an unrecorded String key, and a primitive receiver — which must
-        // still go through the helper.
-        let source = "function sum(o, keys, n) {\n\
+        // The loop is the cell-served shape (an own data property, one String
+        // key); the tail exercises the declines — a Number key, an unrecorded
+        // String key, and a primitive receiver — which must still go through the
+        // helper.
+        let source = "function sum(o, k, n) {\n\
                         var s = 0;\n\
-                        for (var i = 0; i < n; i++) { s += o[keys[i % 5]]; }\n\
+                        for (var i = 0; i < n; i++) { o[k] = i; s += o[k]; }\n\
                         return s;\n\
                       }\n\
-                      var o = { a: 1, b: 2, c: 3, d: 4, e: 5 };\n\
-                      var keys = ['a', 'b', 'c', 'd', 'e'];\n\
-                      var r = sum(o, keys, 100000);\n\
+                      var o = { a: 0 };\n\
+                      var r = sum(o, 'a', 100000);\n\
                       var num = o[0];\n\
                       var miss = o['zzz'];\n\
                       var prim = (5)['x'];\n\
@@ -6512,6 +6516,32 @@ run(); run(); run(); run(); run(); run(); run(); run(); run();";
             reads < 100,
             "the compiled read loop must serve from the computed-read cell ({reads} get_member_computed calls)"
         );
+    }
+
+    #[test]
+    fn installed_jit_computed_read_multi_key_matches_the_interpreter() {
+        // The five-key shape (the `str_key` probe): its per-read hit rate depends
+        // on the 16-slot `member_value_cells` layout (see the inline test above),
+        // but the VALUE must match the interpreter for every key.
+        let source = "function sum(o, keys, n) {\n\
+                        var s = 0;\n\
+                        for (var i = 0; i < n; i++) { s += o[keys[i % 5]]; }\n\
+                        return s;\n\
+                      }\n\
+                      var o = { a: 1, b: 2, c: 3, d: 4, e: 5 };\n\
+                      var keys = ['a', 'b', 'c', 'd', 'e'];\n\
+                      sum(o, keys, 100000);";
+        let interp = {
+            let mut agent = runtime::Agent::new();
+            agent.initialize_host_defined_realm().expect("realm");
+            agent.run_script(source).expect("interp runs")
+        };
+        let (value, compiled) = with_jit_agent(|agent| agent.run_script(source).expect("runs"));
+        assert_eq!(
+            value, interp,
+            "the multi-key computed read must match the interpreter"
+        );
+        assert!(compiled >= 1, "{compiled} bodies");
     }
 
     #[test]
@@ -6654,6 +6684,170 @@ run(); run(); run(); run(); run(); run(); run(); run(); run();";
             calls > 0,
             "a break leaving a finally must route through the helper"
         );
+        assert!(
+            calls > 0,
+            "a break leaving a finally must route through the helper"
+        );
+    }
+
+    #[test]
+    fn installed_jit_switch_disc_and_test_inline() {
+        // G19: a `switch` over Numbers resolves its discriminant and its case
+        // tests in machine code — one Vm store for the discriminant and one f64
+        // compare per case — so neither `SwitchDisc` nor `SwitchTest` runs the
+        // helper. The counting wrappers isolate both; the value must match the
+        // interpreter.
+        static DISC_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        static TEST_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        extern "C" fn counting_disc(ctx: *mut c_void, value: u64) -> u64 {
+            DISC_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            (runtime::jit::JIT_SLOW_PATHS.switch_disc)(ctx, value)
+        }
+        extern "C" fn counting_test(ctx: *mut c_void, case: u64, test: u64) -> u64 {
+            TEST_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            (runtime::jit::JIT_SLOW_PATHS.switch_test)(ctx, case, test)
+        }
+        let mut helpers = runtime_helpers();
+        helpers.switch_disc = Some(counting_disc);
+        helpers.switch_test = Some(counting_test);
+        let source = "function sum(n) {\n\
+                        var s = 0;\n\
+                        for (var i = 0; i < n; i++) {\n\
+                          switch (i & 3) {\n\
+                            case 0: s += 1; break;\n\
+                            case 1: s += 2; break;\n\
+                            case 2: s += 3; break;\n\
+                            default: s += 4; break;\n\
+                          }\n\
+                        }\n\
+                        return s;\n\
+                      }\n\
+                      sum(100000);";
+        let interp = {
+            let mut agent = runtime::Agent::new();
+            agent.initialize_host_defined_realm().expect("realm");
+            agent.run_script(source).expect("interp runs")
+        };
+
+        extern "C" fn noop_drop(_cache: *mut c_void) {}
+        let mut agent = runtime::Agent::new();
+        agent.initialize_host_defined_realm().expect("realm");
+        let mut cache = JitCache::new(helpers).expect("isa");
+        agent.jit_hook = Some(runtime::jit::JitHook {
+            cache: (&mut cache as *mut JitCache) as *mut c_void,
+            lookup: jit_cache_lookup,
+            drop_cache: noop_drop,
+            helpers: &runtime::jit::JIT_SLOW_PATHS,
+        });
+        let value = agent.run_script(source).expect("jit runs");
+        let compiled = cache.compiled_count();
+        agent.jit_hook = None;
+        assert_eq!(value, interp, "the switch must match the interpreter");
+        assert!(compiled >= 1, "{compiled} bodies must compile");
+        let disc = DISC_CALLS.load(std::sync::atomic::Ordering::Relaxed);
+        let test = TEST_CALLS.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            disc < 100,
+            "the compiled discriminant must not call the helper ({disc} switch_disc calls)"
+        );
+        assert!(
+            test < 100,
+            "the compiled case tests must not call the helper ({test} switch_test calls)"
+        );
+    }
+
+    #[test]
+    fn installed_jit_switch_mixed_case_falls_to_the_helper() {
+        // The G19 fast paths decline a case test whose kind differs from the
+        // discriminant (a String case against a Number discriminant is never
+        // `===`), so that test resolves through the `switch_test` helper. The
+        // value must match the interpreter.
+        static TEST_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        extern "C" fn counting_test(ctx: *mut c_void, case: u64, test: u64) -> u64 {
+            TEST_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            (runtime::jit::JIT_SLOW_PATHS.switch_test)(ctx, case, test)
+        }
+        let mut helpers = runtime_helpers();
+        helpers.switch_test = Some(counting_test);
+        let source = "function f(n) {\n\
+                        var s = 0;\n\
+                        for (var i = 0; i < n; i++) {\n\
+                          switch (i % 4) {\n\
+                            case 1: s += 1; break;\n\
+                            case 2: s += 2; break;\n\
+                            default: s += 3; break;\n\
+                            case '1': s += 100; break;\n\
+                          }\n\
+                        }\n\
+                        return s;\n\
+                      }\n\
+                      f(10000);";
+        let interp = {
+            let mut agent = runtime::Agent::new();
+            agent.initialize_host_defined_realm().expect("realm");
+            agent.run_script(source).expect("interp runs")
+        };
+
+        extern "C" fn noop_drop(_cache: *mut c_void) {}
+        let mut agent = runtime::Agent::new();
+        agent.initialize_host_defined_realm().expect("realm");
+        let mut cache = JitCache::new(helpers).expect("isa");
+        agent.jit_hook = Some(runtime::jit::JitHook {
+            cache: (&mut cache as *mut JitCache) as *mut c_void,
+            lookup: jit_cache_lookup,
+            drop_cache: noop_drop,
+            helpers: &runtime::jit::JIT_SLOW_PATHS,
+        });
+        let value = agent.run_script(source).expect("jit runs");
+        let compiled = cache.compiled_count();
+        agent.jit_hook = None;
+        assert_eq!(
+            value, interp,
+            "the mixed-case switch must match the interpreter"
+        );
+        assert!(compiled >= 1, "{compiled} bodies must compile");
+        let calls = TEST_CALLS.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            calls > 0,
+            "a kind-mismatched case must resolve through the helper"
+        );
+    }
+
+    #[test]
+    fn installed_jit_switch_edge_values_match_the_interpreter() {
+        // The inline strict-equality's three paths, differentially: `0`/`-0`
+        // (the f64 compare — equal), `true`/`null`/`undefined` (identical bits),
+        // a String case and `1` against a String discriminant (the helper), and
+        // `NaN` (a Number, never `===` anything, so it always reaches default).
+        let source = "function f(vals, n) {\n\
+                        var s = 0;\n\
+                        for (var i = 0; i < n; i++) {\n\
+                          switch (vals[i % 8]) {\n\
+                            case 0: s += 1; break;\n\
+                            case -0: s += 2; break;\n\
+                            case true: s += 3; break;\n\
+                            case null: s += 4; break;\n\
+                            case undefined: s += 5; break;\n\
+                            case 'x': s += 6; break;\n\
+                            case 1: s += 7; break;\n\
+                            default: s += 8; break;\n\
+                          }\n\
+                        }\n\
+                        return s;\n\
+                      }\n\
+                      var vals = [0, -0, true, null, undefined, 'x', 1, NaN];\n\
+                      f(vals, 8000);";
+        let interp = {
+            let mut agent = runtime::Agent::new();
+            agent.initialize_host_defined_realm().expect("realm");
+            agent.run_script(source).expect("interp runs")
+        };
+        let (value, compiled) = with_jit_agent(|agent| agent.run_script(source).expect("runs"));
+        assert_eq!(
+            value, interp,
+            "the switch edge values must match the interpreter"
+        );
+        assert!(compiled >= 1, "{compiled} bodies");
     }
 
     #[test]
