@@ -4650,6 +4650,30 @@ impl<'a> Lowerer<'a> {
         emit_fall_through: bool,
     ) -> Result<(), Unsupported> {
         let ctx = self.vm();
+        // G21 (Phase 2): a call whose callee IS the running closure skips the
+        // leaf-probe machinery and takes the slow lane straight to `call_slow`'s
+        // compiled self-call path. The probe could only refuse such a callee
+        // (the running body contains this very call step, so it is not a leaf),
+        // and its ~20-instruction gate is pure per-call overhead on the hottest
+        // recursive shape. The identity is the full 64 NaN-box bits;
+        // `current_function` is 0 outside a function body, which no real callee
+        // equals (a script has no scope, so the gate is omitted there).
+        let slow = self.builder.create_block();
+        let merge = self.builder.create_block();
+        if self.scope.is_some() {
+            let cf = self.builder.ins().load(
+                types::I64,
+                MemFlagsData::new(),
+                ctx,
+                Offset32::new(std::mem::offset_of!(JitCallContext, current_function) as i32),
+            );
+            let is_self = self.builder.ins().icmp(IntCC::Equal, callee, cf);
+            let non_null = self.builder.ins().icmp_imm_u(IntCC::NotEqual, cf, 0);
+            let gate = self.builder.ins().band(is_self, non_null);
+            let leaf = self.builder.create_block();
+            self.builder.ins().brif(gate, slow, &[], leaf, &[]);
+            self.builder.switch_to_block(leaf);
+        }
         let slot = emit_leaf_record_slot(self, callee);
         let slot_bytes = self
             .builder
@@ -4732,8 +4756,6 @@ impl<'a> Lowerer<'a> {
         let stable_check = self.builder.create_block();
         let stale_block = self.builder.create_block();
         let probe_block = self.builder.create_block();
-        let slow = self.builder.create_block();
-        let merge = self.builder.create_block();
         self.builder
             .ins()
             .brif(hit, hit_block, &[], stable_check, &[]);

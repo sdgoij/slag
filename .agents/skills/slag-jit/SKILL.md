@@ -789,8 +789,10 @@ Corollaries for any new cell:
 A compiled `CallSlow` site whose callee IS the running closure is run by
 `call_slow`'s `self_call_inline` (`crates/runtime/src/jit.rs`) on the shared
 ctx, with a nested frame in a private per-call buffer — no re-entry through
-`do_call_fast`/`run_compiled_body`/`run_jit_body`. It is runtime-only (no new
-helper, no emitter change), gated in `CompiledBody::self_call_eligible`
+`do_call_fast`/`run_compiled_body`/`run_jit_body`. The runtime path is
+runtime-only (no new helper); since Phase 2a an emit-side gate reaches it
+directly without the leaf-record probe (§20.1). It is gated in
+`CompiledBody::self_call_eligible`
 (`crates/runtime/src/ir.rs`) and passed to `run_jit_body` as `self_call_ok`
 (true only from `run_compiled_body`, false from the script/async/generator
 drivers, or a resumable body would take it and return a plain value instead of
@@ -824,3 +826,33 @@ a promise/generator). Traps:
 absolute answers; mutation-check by zeroing the param fill) and
 `installed_jit_a_deep_self_recursion_falls_back_past_the_depth_cap` (the
 `MAX_JIT_DEPTH` decline and the catchable guard) pin it.
+
+### 20.1 The emit-side gate (Phase 2a)
+
+`emit_call` (`crates/jit/src/compiler.rs`) now loads
+`JitCallContext::current_function` and branches straight to the `call_slow`
+lane when the resolved callee's full 64 bits equal it (plus a non-zero check so
+a script's `0` never matches), skipping the leaf-record gate. This is sound
+because the running body contains this very call step, so the leaf probe could
+only *refuse* the callee. `slow`/`merge` are hoisted above the record loads, and
+the gate is emitted only when `self.scope.is_some()` (a script has no scope and
+`current_function` 0). The compare+branch is always not-taken at a non-self
+site, so it costs below measurement; `slow` gains one extra predecessor, which
+is fine because blocks seal at `seal_all_blocks`.
+
+### 20.2 Two traps this arc measured
+
+- **`--jit-bench`'s ratios are `jit/interp`, and the interpreter column is
+  load-sensitive — read the raw *jit* ms, not the ratio.** The `non-leaf call`
+  row (`bench` -> `mid` -> `leaf`) read 0.52 then 0.40 then 0.51 across three
+  sessions at an unchanged ~13.8 ms jit; only its `interp` moved (26.9 vs
+  34.9 ms). A ratio-only read attributed a self-call win to a row that has no
+  self-call in it.
+- **A `[Value; N]` stack buffer is initialized to `undefined` before it is
+  rooted, for a reason — do not shrink `N` to save the init.** Bounding the
+  self path's buffer at 24 slots measured ~11% on `recursive_fib`, but every
+  slot the GC traces must hold a *valid* Value: a persistent frame arena cannot
+  skip the init, because a reused slot holding a dead box's bits traces a stale
+  `GcAny` (its vtable/payload walk is unsound), and a smaller *static* array
+  heap-spills for any `frame_size + stack_usage > N - JIT_STACK_SLACK`, i.e. a
+  malloc per recursive call. Measure both directions before touching it.

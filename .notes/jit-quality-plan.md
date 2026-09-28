@@ -570,12 +570,29 @@ The list, in the measured order:
   context, and no try/for-in/for-of/destructuring/suspension step — the nested
   activation then shares the caller's environment, working-area bound and
   array-index cursor unmodified. Measured: `recursive_fib.js` **~290 -> ~43 ms
-  jit** (14.7x jitless), `--jit-bench`'s `non-leaf call` **0.52 -> 0.40** (no
-  longer the weakest arm; nothing else moved), corpus parity 77/77. Phase 2
-  remains: lift the funnel into a machine-code `call_indirect` lane (removing
-  the FFI round trip the leaf path already avoids), and extend the gate to
-  general (non-self) certified callees, which needs the callee's scope/entry
-  at the call site rather than the running body's.
+  jit** (14.7x jitless), corpus parity 77/77. The `--jit-bench` `non-leaf call`
+  ratio quoted for Phase 1 was a **misread and is retracted** (§8): its *jit*
+  time was unchanged (~13.9 ms) and the ratio moved with the load-sensitive
+  interpreter column.
+
+  **Phase 2a landed (the emit-side self gate).** A call site in a scoped body
+  now compares the resolved callee against `JitCallContext::current_function`
+  in machine code and branches to the `call_slow` lane, skipping the ~15-20
+  instruction leaf-record gate — the probe could only refuse such a callee (the
+  running body contains this call step, so it is not a leaf). `recursive_fib.js`
+  **~43 -> ~39.7 ms** (8%), leaf-call rows unregressed. **Phase 2b, the large
+  remaining lever:** the *non-self* call. `--jit-bench`'s `non-leaf call`
+  (`bench` -> `mid` -> `leaf`, no self-call) is **~140 ns per call at ~13.9 ms
+  jit vs 6.2 ms jitless**, and neither Phase 1 nor 2a touches it: a general
+  compiled call still pays the full `ordinary_call` -> `run_compiled_body` ->
+  `run_jit_body` funnel (Vm pool take/return, execution-context push,
+  `globals_unshadowed` chain walk, ctx build, 64-slot work-buffer init, root
+  registration). Running a non-self callee on the caller's ctx needs the
+  callee's *scope/entry* and its *closure environment* at the call site, which
+  the caller does not have; the tractable subset is a callee that reads neither
+  its context (`LoadContext`/`PerIter`) nor `this` and whose `LoadIdent` reads
+  can be shown unshadowed — a per-callee descriptor (the `LeafCallRecord`
+  shape, extended past leaves) plus a `run_compiled_body`-lite helper.
 - **G6/G7 and the feedback record — cell capacity, the register path's one shape,
   per-site feedback.** G8 landed (above, Stage 7) as a key→atom cell, not the
   value cell the census implied, because the in-place store discipline forbids a
@@ -706,9 +723,13 @@ The list, in the measured order:
   and **G21 (the compiled non-leaf call) landed** as a runtime self-call fast
   path inside the existing `call_slow` funnel (§3, §8): the row's `CallSlow`
   helper count is unchanged by design (the path lives inside the helper), but
-  `recursive_fib.js` fell ~290 -> ~43 ms and `--jit-bench`'s `non-leaf call`
-  0.52 -> 0.40. Lifting the funnel into a machine-code lane (Phase 2) is
-  recorded in §3.
+  `recursive_fib.js` fell ~290 -> ~43 ms, and **Phase 2a (the emit-side self
+  gate) followed immediately**: a self-call site now skips the leaf-record gate
+  in machine code, ~43 -> ~39.7 ms (~8%). The `--jit-bench` `non-leaf call`
+  ratio originally quoted here (0.52 -> 0.40) is **retracted** (§3, §8): that
+  row is a *non-self* call and its jit time never moved; the ratio followed the
+  load-sensitive interpreter column. That row — ~140 ns per call — is Phase 2b,
+  the general call (§3).
 
 Each stage: the instrument re-run, the engine gates (fmt, clippy
 `-D warnings`, workspace tests, both `--no-default-features` checks), the
@@ -1484,3 +1505,43 @@ One line per landed stage, newest last. This log is the arc's journal —
   0 fail of 3,357, corpus parity 77 rows 0 mismatches, `--jit-bench` all
   `result-ok`. No wasm sweep owed (`wasmtest` does not link `crates/jit`, and
   `crux` is untouched).
+- **Stage 7, G21 Phase 2a — the emit-side self gate, plus a retraction and two
+  measured next-levers (2026-09-28).** A call site in a scoped body now loads
+  `JitCallContext::current_function`, compares the resolved callee against it
+  (all 64 NaN-box bits, plus a non-zero check so a script's `0` never matches),
+  and branches straight to the `call_slow` lane — skipping the ~15-20
+  instruction leaf-record gate entirely. That gate could only ever *refuse* a
+  self callee (the running body contains this call step, so it is not a leaf),
+  and the branch is always not-taken at a non-self site, so the emit-side tax
+  is below measurement (`direct_leaf` 12.4 ms, unchanged). `slow`/`merge`
+  hoist to the top of `emit_call`; the gate is emitted only for a scoped body
+  (`self.scope.is_some()`), since a script's `current_function` is 0. Measured:
+  `recursive_fib.js` **~43 -> ~39.7 ms** (stable 39.68/39.78/39.83 over three
+  runs), every other row in band. **Retraction:** the Phase 1 entry's
+  `--jit-bench` `non-leaf call` `0.52 -> 0.40` claim above is withdrawn — that
+  row is `bench(n){ ...mid(i)... }` with `mid(x){ leaf(x)+1 }` and
+  `leaf(x){ x+1 }`, i.e. a **non-self** call, and its *jit* time never moved
+  (13.87 vs 13.82 ms); the ratio moved with the **interpreter** column, which
+  is load-sensitive (26.9 vs 34.9 ms across runs). The evidence Phase 1 owns is
+  `recursive_fib`'s **jit** wall time, and that one is solid. **Two next-levers
+  measured, both for Phase 2b, both blocked or deferred for stated reasons:**
+  (1) the self path's per-call `[Value; 64]` buffer + `vm.jit_roots` push/pop is
+  **~11%** — bounding the buffer at 24 slots measured `recursive_fib` at
+  37.6-39.7 ms — but a static bound of that size heap-spills for any body whose
+  `frame_size + stack_usage > 8`, i.e. a malloc per recursive call for a
+  real-looking walker, so a smaller const is **not** safe; the safe fix is a
+  per-run/per-agent frame arena rooted once, and that is blocked by `crux`'s
+  tracing of a **stale** (freed-slot) `GcAny` — a reused arena slot can hold a
+  dead box's bits, whose stale vtable walk is unsound — so the arena needs a
+  release-time clear (which is the same init cost) or a crux-side "is this
+  handle live" test before it can land. (2) the general non-self call is the
+  real lever: `--jit-bench`'s `non-leaf call` is **~140 ns/call**
+  (~13.9 ms jit for 100k, against ~6.2 ms jitless and the ~35 ns of the
+  hand-written `array_for_each_js` control), all of it the
+  `ordinary_call`/`run_compiled_body`/`run_jit_body` funnel. Gates: fmt; clippy
+  `-D warnings` (workspace, all-targets); `cargo test --workspace` green;
+  `-p jit --lib` 236; `-p runtime --no-default-features --lib` 953; `-p v8
+  --features simdutf --lib` 380; `-p cli --no-default-features --features jit`;
+  test262 `all` 48,464 pass / 0 fail / 0 crash / 0 hang of 48,622; `intl402`
+  3,205 pass / 0 fail of 3,357; corpus parity 77 rows 0 mismatches; `--jit-bench`
+  all `result-ok`. No wasm sweep owed.
