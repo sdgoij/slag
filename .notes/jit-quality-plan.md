@@ -540,6 +540,38 @@ The list, in the measured order:
   the compiled `SwitchDisc` now writes it with two stores and the compiled
   `SwitchTest` compares inline with `===`'s three fast paths, falling to the
   helper for distinct string/BigInt boxes and mixed kinds (§8).
+- **G20 — the dense-array element overwrite (landed, Stage 7).** The compiled
+  computed store inlined only the APPEND shape (`index == length`), so
+  `a[i] = v` over an already-filled array took the general helper on every
+  store (`SetMemberComputed` 6.2M — 77% of it `opcost/element_write.js` — plus
+  `FastArrayElementWrite` 2.25M). The new `emit_dense_element_store_into` arm
+  (wired into both the step and the register store tails) mirrors the read
+  arm's gates — canonical index, `idx < elem_len`, non-hole — plus the append's
+  write discipline: no attribute or chain check while dense, a registered
+  prototype declines (the generation bump advances the elements protector), and
+  the write stays inline only when no barrier can be needed (a young container
+  or a non-heap value). It writes `elem_ptr[idx] = value` and bumps the
+  generation with no length/cursor change — exactly the interpreter's
+  `array_element_write_dense` in-place branch. `opcost/element_write.js`
+  1.84 → 1.17 ms, and both store helpers left the census top (§8).
+- **G21 — the compiled non-leaf call (planned, not landed).** The largest
+  remaining "real" deficit: `CallSlow` ~88M, `recursive_fib` 300 ms jit vs
+  518 jitless, and `--jit-bench`'s `non-leaf call` at 0.52 (the weakest arm).
+  Falsified first, per the plan's rule: `fib` IS compiled (its two recursive
+  sites emit the helper) but each call runs the callee through `do_call_fast` —
+  the *interpreter* — so the JIT pays the JIT-buffer spill/reload per call and
+  gets nothing back; the tail-recursive twin (which the JIT lowers to a frame
+  rebind with no helper) costs ~83 ns per recursion against ~262 ns for the
+  non-tail call, so the 3× is the call path, not the arithmetic. Design sketch:
+  a self-call fast path at a `CallSlow` site — check `callee ==
+  ctx.current_function` (a self-call's callee is the running closure, so its
+  body is this same compiled body), take a frame from a runtime-provided frame
+  stack (registered as ONE GC root, covering all levels), write `this`/args into
+  the fresh frame, `call` the compiled entry, pop — gated on frame-stack room
+  and on the body having no try/for-of/suspension (a throw or a suspend inside a
+  nested frame needs the runtime's unwind, and only the top frame is saved on
+  suspension). Needs its own design pass; recorded so the measurement is not
+  redone.
 - **G6/G7 and the feedback record — cell capacity, the register path's one shape,
   per-site feedback.** G8 landed (above, Stage 7) as a key→atom cell, not the
   value cell the census implied, because the in-place store discipline forbids a
@@ -665,7 +697,10 @@ The list, in the measured order:
   landed next**: a compiled `break`/`continue` with no finally or for-of in
   scope jumps directly — `control/switch_dispatch.js` 63.5 → 42.2 ms.** G19
   (the switch discriminant + per-case strict-equality inline) then took that
-  row's remaining helper share to zero — 23.7 ms jit, 8.9× jitless.
+  row's remaining helper share to zero — 23.7 ms jit, 8.9× jitless. **G20 landed
+  next** (the dense-array overwrite: `opcost/element_write.js` 1.84 → 1.17 ms),
+  and **G21 (the compiled non-leaf call) is measured and planned**, not landed —
+  it needs its own design pass.
 
 Each stage: the instrument re-run, the engine gates (fmt, clippy
 `-D warnings`, workspace tests, both `--no-default-features` checks), the
@@ -1313,6 +1348,43 @@ One line per landed stage, newest last. This log is the arc's journal —
   pass / 0 fail / 0 crash / 0 hang, `intl402` 3,205 pass / 0 fail, `--jit-bench`
   all `result-ok`, corpus parity 77 rows 0 mismatches, 12 consecutive `-p jit`
   runs green.
+- **Stage 7, G20 — the dense-array element overwrite in machine code
+  (2026-09-28).** The compiled computed store had exactly two element arms (the
+  dense APPEND and the typed-array store), so `a[i] = v` with `i` below the
+  length — an in-place overwrite over an already-filled array — fell to the
+  general helper on every store. The census put `SetMemberComputed` at 6.2M
+  (77% of it the one `opcost/element_write.js` row) and
+  `FastArrayElementWrite` at 2.25M. The new `emit_dense_element_store_into` arm
+  is wired as the typed store's miss target in BOTH the step
+  (`AssignMemberComputed`) and register (`emit_computed_store`) tails, so the
+  helper chain is append → typed → overwrite → helper. Its gates mirror the
+  READ arm (the packed Object tag in one compare, the f64 round-trip
+  canonical-index test, `idx < elem_len`, the non-hole element) plus the
+  APPEND's write discipline: while dense every element is a writable data
+  property that shadows the whole chain (no attribute or chain check), a
+  registered prototype declines (the store's generation bump advances the
+  elements protector, which machine code does not), and the store stays inline
+  only when no write barrier can be needed (`slots_young || !value_is_heap`).
+  The write is `elem_ptr[idx] = value` plus the generation bump — no length or
+  cursor change, exactly the interpreter's `array_element_write_dense`
+  in-place branch, so the generation-keyed element/length cells invalidate as
+  they would there. Measured: `opcost/element_write.js` **1.84 → 1.17 ms**
+  (−36%) and the hot loop's `SetMemberComputed` **gone** (the row's remaining
+  `FastArrayElementWrite` is the `new Array(1024)` fill's *hole* fills, which
+  decline correctly). Tests: `installed_jit_dense_element_overwrite_inlines`
+  (counts both store helpers; mutation-checked via the prototype gate →
+  100,000 `set_member_computed` calls) and
+  `installed_jit_dense_element_overwrite_declines_match_the_interpreter`
+  (differential over a grow/hole-fill, a registered prototype, and heap object
+  values — the barrier gate). Gates: fmt, clippy `-D warnings`, workspace
+  (test262 3,324, runtime 984, jit 234), runtime `--no-default-features` 953,
+  `v8 --features simdutf` 380, cli `--no-default-features --features jit`,
+  test262 `all` 48,464 pass / 0 fail / 0 crash / 0 hang, `intl402` 3,205 pass /
+  0 fail, `--jit-bench` all `result-ok`, corpus parity 0 mismatches. Measurement
+  caveats recorded: the FIRST corpus run after a build is cold (`recursive_fib`
+  read 798 ms once against a warm 300 ms), and the corpus parity mean is
+  load-sensitive — compare the `jitless` column too (it moved 6.45 → 6.88 in
+  the same run the mean moved, which is machine load, not a regression).
 - **Stage 7, G18 — a compiled `break`/`continue` jumps directly when no finally
   or for-of is in scope (2026-09-28).** The census's `BreakControl` (21.0M, the
   one `control/switch_dispatch.js` row) was the whole compiled `Step::Break`:

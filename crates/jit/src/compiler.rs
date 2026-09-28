@@ -2841,6 +2841,174 @@ impl<'a> Lowerer<'a> {
         Ok(())
     }
 
+    /// The dense-Array OVERWRITE arm of the compiled computed store (G20): a
+    /// canonical index Number below the materialized length writes an EXISTING
+    /// element in place. The append arm only serves `index == length`, so
+    /// `a[i] = v` over a filled array took the general helper on every store
+    /// (`SetMemberComputed` 4.8M in `opcost/element_write.js` alone).
+    ///
+    /// The gates mirror `emit_dense_element_read_into` (the canonical index, the
+    /// bounds, the non-hole element — a hole is spec-absent, so a fill needs
+    /// [[Extensible]] and the chain verdict) plus the append arm's write
+    /// discipline: while dense every element is a writable data property that
+    /// shadows the whole chain, so there is no attribute or chain check; a
+    /// registered prototype declines (the generation bump advances the elements
+    /// protector for a prototype); and the store stays in machine code only when
+    /// no write barrier can be needed (a young container or a non-heap value).
+    /// The write is `elem_ptr[idx] = value` plus the generation bump — no length
+    /// or cursor change, exactly the interpreter's `array_element_write_dense`
+    /// in-place branch. Any decline jumps to `slow`; the write jumps to `merge`.
+    fn emit_dense_element_store_into(
+        &mut self,
+        object: ClifValue,
+        key: ClifValue,
+        value: ClifValue,
+        slow: Block,
+        merge: Block,
+    ) -> Result<(), Unsupported> {
+        let inline = self.builder.create_block();
+        let probe = self.builder.create_block();
+        let key_ok_check = self.builder.create_block();
+        let bounds = self.builder.create_block();
+        let hole_check = self.builder.create_block();
+        let value_check = self.builder.create_block();
+        let fast_write = self.builder.create_block();
+        self.builder.ins().jump(inline, &[]);
+        self.builder.switch_to_block(inline);
+        // Object tag: the packed prefix+Object pattern in one compare.
+        let object_pattern = (crux::TAG_PREFIX >> 44) | crux::TAG_OBJECT;
+        let tag_bits = self.builder.ins().ushr_imm_u(object, 44);
+        let obj_ok = self
+            .builder
+            .ins()
+            .icmp_imm_u(IntCC::Equal, tag_bits, object_pattern as i64);
+        self.builder.ins().brif(obj_ok, probe, &[], slow, &[]);
+        self.builder.seal_block(inline);
+        // The dense gate: the object's `array_dense` cursor (non-null iff it is
+        // a dense Array).
+        self.builder.switch_to_block(probe);
+        let obj_ptr = self
+            .builder
+            .ins()
+            .band_imm_u(object, crux::PAYLOAD_MASK as i64);
+        let obj_ptr = self.builder.ins().ishl_imm_u(obj_ptr, 4);
+        let obj_ptr = self
+            .builder
+            .ins()
+            .iadd_imm_s(obj_ptr, crux::heap::GCBOX_DATA_OFFSET as i64);
+        let slots_base = self.builder.ins().load(
+            types::I64,
+            MemFlagsData::new(),
+            obj_ptr,
+            Offset32::new(std::mem::offset_of!(crux::JsObject, array_dense) as i32),
+        );
+        let slots_ok = self
+            .builder
+            .ins()
+            .icmp_imm_u(IntCC::NotEqual, slots_base, 0);
+        self.builder
+            .ins()
+            .brif(slots_ok, key_ok_check, &[], slow, &[]);
+        self.builder.seal_block(probe);
+        // The canonical-index gate (mirrors the read arm's).
+        self.builder.switch_to_block(key_ok_check);
+        let num = self
+            .builder
+            .ins()
+            .bitcast(types::F64, MemFlagsData::new(), key);
+        let max = self.builder.ins().f64const(4294967295.0);
+        let lt_max = self.builder.ins().fcmp(FloatCC::LessThan, num, max);
+        let idx = self.builder.ins().fcvt_to_uint_sat(types::I64, num);
+        let back = self.builder.ins().fcvt_from_uint(types::F64, idx);
+        let integral = self.builder.ins().fcmp(FloatCC::Equal, back, num);
+        let key_ok = self.builder.ins().band(integral, lt_max);
+        self.builder.ins().brif(key_ok, bounds, &[], slow, &[]);
+        self.builder.seal_block(key_ok_check);
+        // The bounds gate: `elem_len` is the authoritative materialized length.
+        self.builder.switch_to_block(bounds);
+        let slots_ptr = self
+            .builder
+            .ins()
+            .iadd_imm_s(slots_base, crux::heap::GCBOX_DATA_OFFSET as i64);
+        let elem_len = self.builder.ins().load(
+            types::I64,
+            MemFlagsData::new(),
+            slots_ptr,
+            Offset32::new(std::mem::offset_of!(crux::object::ArraySlots, elem_len) as i32),
+        );
+        let in_bounds = self
+            .builder
+            .ins()
+            .icmp(IntCC::UnsignedLessThan, idx, elem_len);
+        self.builder
+            .ins()
+            .brif(in_bounds, hole_check, &[], slow, &[]);
+        self.builder.seal_block(bounds);
+        // The element load: a hole is spec-absent (a fill is a define).
+        self.builder.switch_to_block(hole_check);
+        let elem_ptr = self.builder.ins().load(
+            types::I64,
+            MemFlagsData::new(),
+            slots_ptr,
+            Offset32::new(std::mem::offset_of!(crux::object::ArraySlots, elem_ptr) as i32),
+        );
+        let offset = self.builder.ins().ishl_imm_u(idx, 3);
+        let addr = self.builder.ins().iadd(elem_ptr, offset);
+        let bits = self
+            .builder
+            .ins()
+            .load(types::I64, MemFlagsData::new(), addr, Offset32::new(0));
+        let is_hole =
+            self.builder
+                .ins()
+                .icmp_imm_u(IntCC::Equal, bits, crux::value::HOLE_BITS as i64);
+        self.builder
+            .ins()
+            .brif(is_hole, slow, &[], value_check, &[]);
+        self.builder.seal_block(hole_check);
+        // The write discipline: no barrier needed, and not a registered
+        // prototype (its generation bump advances the elements protector).
+        self.builder.switch_to_block(value_check);
+        let is_prototype = self.builder.ins().load(
+            types::I8,
+            MemFlagsData::new(),
+            obj_ptr,
+            Offset32::new(std::mem::offset_of!(crux::JsObject, is_prototype) as i32),
+        );
+        let not_prototype = self.builder.ins().icmp_imm_u(IntCC::Equal, is_prototype, 0);
+        let value_tag = self.builder.ins().band_imm_u(value, crux::TAG_MASK as i64);
+        let value_not_heap =
+            self.builder
+                .ins()
+                .icmp_imm_u(IntCC::NotEqual, value_tag, crux::TAG_PREFIX as i64);
+        let slots_young = self.box_ptr_is_young(slots_base);
+        let barrier_ok = self.builder.ins().bor(slots_young, value_not_heap);
+        let store_ok = self.builder.ins().band(not_prototype, barrier_ok);
+        self.builder
+            .ins()
+            .brif(store_ok, fast_write, &[], slow, &[]);
+        self.builder.seal_block(value_check);
+        // The in-place write: `elements[idx] = value` and the generation bump
+        // (the interpreter's discipline — invalidate the generation-keyed
+        // element/length read cells). The length and the cursor are unchanged.
+        self.builder.switch_to_block(fast_write);
+        self.builder
+            .ins()
+            .store(MemFlagsData::new(), value, addr, 0);
+        let generation_off = Offset32::new(std::mem::offset_of!(crux::JsObject, generation) as i32);
+        let generation =
+            self.builder
+                .ins()
+                .load(types::I32, MemFlagsData::new(), obj_ptr, generation_off);
+        let new_generation = self.builder.ins().iadd_imm_u(generation, 1);
+        self.builder
+            .ins()
+            .store(MemFlagsData::new(), new_generation, obj_ptr, generation_off);
+        self.builder.ins().jump(merge, &[]);
+        self.builder.seal_block(fast_write);
+        Ok(())
+    }
+
     /// The compiled fast-array cursor's inline advance (G17). `ForOfBegin`
     /// seeded `(array_slot, index_slot)` with the dense-Array fast verdict, so
     /// the common `for (const v of arr)` step reads the element straight from
@@ -5905,6 +6073,7 @@ impl<'a> Lowerer<'a> {
                     // checks and the [[Set]] machinery correctly (nothing
                     // observable ran on the fast paths).
                     let ta_gate = self.builder.create_block();
+                    let overwrite = self.builder.create_block();
                     let fast = self.builder.create_block();
                     let fallback = self.builder.create_block();
                     let merge = self.builder.create_block();
@@ -5914,10 +6083,15 @@ impl<'a> Lowerer<'a> {
                     // + value writes the byte straight into the block; the
                     // other typed-array shapes fall to the legacy helper.
                     self.builder.switch_to_block(ta_gate);
-                    self.emit_typed_array_store_inline(object, key, value, fast, merge)?;
-                    // The legacy helper: typed arrays, in-place updates,
-                    // hole-fills, spilled/non-dense arrays, and non-canonical
-                    // keys (the pre-existing inline element-store fast path).
+                    self.emit_typed_array_store_inline(object, key, value, overwrite, merge)?;
+                    // The in-place overwrite arm (G20): a canonical index below
+                    // the length writes an existing dense element in machine
+                    // code (the append arm only serves `index == length`).
+                    self.builder.switch_to_block(overwrite);
+                    self.emit_dense_element_store_into(object, key, value, fast, merge)?;
+                    // The legacy helper: typed arrays, hole-fills,
+                    // spilled/non-dense arrays, and non-canonical keys (the
+                    // pre-existing inline element-store fast path).
                     self.builder.switch_to_block(fast);
                     let ok = self.emit_raw_call(
                         self.sig_binary,
@@ -9099,10 +9273,10 @@ impl<'a> Lowerer<'a> {
     /// The shared computed-member store tail (the register `StoreMemberComputed`
     /// and `StoreMemberComputedLocal` ops): the inline dense-array append gate
     /// (shared with the step path, gap-close M1 C), then the machine
-    /// typed-array store (gap-close M5c); the remaining path is the full
-    /// `SetMemberComputed` slow call (the register executor discards the
-    /// store's result, so no push/merge value). `object`/`key`/`value` are
-    /// already materialized values.
+    /// typed-array store (gap-close M5c), then the in-place dense overwrite
+    /// (G20); the remaining path is the full `SetMemberComputed` slow call (the
+    /// register executor discards the store's result, so no push/merge value).
+    /// `object`/`key`/`value` are already materialized values.
     fn emit_computed_store(
         &mut self,
         object: ClifValue,
@@ -9110,11 +9284,14 @@ impl<'a> Lowerer<'a> {
         value: ClifValue,
     ) -> Result<(), Unsupported> {
         let ta_gate = self.builder.create_block();
+        let overwrite = self.builder.create_block();
         let slow = self.builder.create_block();
         let merge = self.builder.create_block();
         self.emit_dense_array_append_inline(object, key, value, ta_gate, merge)?;
         self.builder.switch_to_block(ta_gate);
-        self.emit_typed_array_store_inline(object, key, value, slow, merge)?;
+        self.emit_typed_array_store_inline(object, key, value, overwrite, merge)?;
+        self.builder.switch_to_block(overwrite);
+        self.emit_dense_element_store_into(object, key, value, slow, merge)?;
         self.builder.switch_to_block(slow);
         self.call_slow(
             self.sig_set_comp,

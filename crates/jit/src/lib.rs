@@ -6851,6 +6851,104 @@ run(); run(); run(); run(); run(); run(); run(); run(); run();";
     }
 
     #[test]
+    fn installed_jit_dense_element_overwrite_inlines() {
+        // G20: `a[k] = v` with a canonical index BELOW the length (an in-place
+        // overwrite, not an append) must write in machine code — the counting
+        // wrappers prove neither the register path's `SetMemberComputed` nor the
+        // step path's `FastArrayElementWrite` runs per store — and the value must
+        // match the interpreter. The `[]`-then-append fill keeps the
+        // materialization off the counters (the append arm is already inline).
+        static SET_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        static WRITE_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        extern "C" fn counting_set(ctx: *mut c_void, object: u64, key: u64, value: u64) -> u64 {
+            SET_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            (runtime::jit::JIT_SLOW_PATHS.set_member_computed)(ctx, object, key, value)
+        }
+        extern "C" fn counting_write(ctx: *mut c_void, object: u64, key: u64, value: u64) -> u64 {
+            WRITE_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            (runtime::jit::JIT_SLOW_PATHS.fast_array_element_write)(ctx, object, key, value)
+        }
+        let mut helpers = runtime_helpers();
+        helpers.set_member_computed = Some(counting_set);
+        helpers.fast_array_element_write = Some(counting_write);
+        let source = "function fill(a, n) {\n\
+                        var s = 0;\n\
+                        for (var i = 0; i < n; i++) { var k = i & 1023; a[k] = i; s += a[k]; }\n\
+                        return s;\n\
+                      }\n\
+                      var a = [];\n\
+                      for (var i = 0; i < 1024; i++) { a[i] = i; }\n\
+                      fill(a, 100000);";
+        let interp = {
+            let mut agent = runtime::Agent::new();
+            agent.initialize_host_defined_realm().expect("realm");
+            agent.run_script(source).expect("interp runs")
+        };
+
+        extern "C" fn noop_drop(_cache: *mut c_void) {}
+        let mut agent = runtime::Agent::new();
+        agent.initialize_host_defined_realm().expect("realm");
+        let mut cache = JitCache::new(helpers).expect("isa");
+        agent.jit_hook = Some(runtime::jit::JitHook {
+            cache: (&mut cache as *mut JitCache) as *mut c_void,
+            lookup: jit_cache_lookup,
+            drop_cache: noop_drop,
+            helpers: &runtime::jit::JIT_SLOW_PATHS,
+        });
+        let value = agent.run_script(source).expect("jit runs");
+        let compiled = cache.compiled_count();
+        agent.jit_hook = None;
+        assert_eq!(value, interp, "the overwrite must match the interpreter");
+        assert!(compiled >= 1, "{compiled} bodies must compile");
+        let set = SET_CALLS.load(std::sync::atomic::Ordering::Relaxed);
+        let write = WRITE_CALLS.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            set < 100,
+            "the in-place dense store must inline ({set} set_member_computed calls)"
+        );
+        assert!(
+            write < 100,
+            "the in-place dense store must inline ({write} fast_array_element_write calls)"
+        );
+    }
+
+    #[test]
+    fn installed_jit_dense_element_overwrite_declines_match_the_interpreter() {
+        // The G20 gates' declines, differentially: a grow / hole-fill (an index
+        // at or above the length), a registered prototype (the generation
+        // bump's elements-protector side effect), and heap object values (the
+        // write barrier).
+        let source = "function f(n) {\n\
+                        var s = 0;\n\
+                        for (var i = 0; i < n; i++) {\n\
+                          var k = i % 6;\n\
+                          a[k] = i;\n\
+                          s += (a[k] === undefined ? 0 : a[k]);\n\
+                          p[i % 3] = i;\n\
+                          h[i % 3] = { v: i };\n\
+                        }\n\
+                        return s;\n\
+                      }\n\
+                      var a = [1, 2, 3];\n\
+                      var p = [1, 2, 3];\n\
+                      var child = Object.create(p);\n\
+                      var h = [null, null, null];\n\
+                      f(1000);\n\
+                      a.length + a[0] + a[5] + child[0] + p[2] + h[0].v + h[2].v;";
+        let interp = {
+            let mut agent = runtime::Agent::new();
+            agent.initialize_host_defined_realm().expect("realm");
+            agent.run_script(source).expect("interp runs")
+        };
+        let (value, compiled) = with_jit_agent(|agent| agent.run_script(source).expect("runs"));
+        assert_eq!(
+            value, interp,
+            "the overwrite declines must match the interpreter"
+        );
+        assert!(compiled >= 1, "{compiled} bodies");
+    }
+
+    #[test]
     fn installed_jit_dense_element_read_declines_holes_to_the_chain() {
         // A dense Array element read is exact only for a real own value: a HOLE
         // is spec-absent, so the read must fall to the helper and consult the
