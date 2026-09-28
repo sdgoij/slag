@@ -6172,6 +6172,98 @@ mod tests {
         );
     }
 
+    #[test]
+    fn installed_jit_dense_array_element_read_inlines() {
+        // The inline dense-array element read: `a[i]` over a dense Array in a
+        // compiled loop must take the machine-code buffer read — the counting
+        // wrapper proves the `get_member_computed` helper runs only for the
+        // declined shapes, not per element — and the value must match the
+        // interpreter.
+        static READ_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        extern "C" fn counting_read(ctx: *mut c_void, object: u64, key: u64) -> u64 {
+            READ_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            (runtime::jit::JIT_SLOW_PATHS.get_member_computed)(ctx, object, key)
+        }
+        let mut helpers = runtime_helpers();
+        helpers.get_member_computed = Some(counting_read);
+
+        // The loop is the inlined shape (a dense, in-bounds, non-hole element);
+        // the tail exercises the declines — an out-of-range index, a string
+        // key, and a non-Array receiver — which must still go through the
+        // helper.
+        let source = "function sum(a, n) {\n\
+                        var s = 0;\n\
+                        for (var i = 0; i < n; i++) { s += a[i & 255]; }\n\
+                        return s;\n\
+                      }\n\
+                      var a = new Array(256);\n\
+                      for (var i = 0; i < 256; i++) { a[i] = i; }\n\
+                      var r = sum(a, 100000);\n\
+                      var oob = a[99999];\n\
+                      var sk = a['x'];\n\
+                      var obj = { 0: 42 };\n\
+                      var nr = obj[0];\n\
+                      r + (oob === undefined ? 1 : 0) + (sk === undefined ? 1 : 0) + nr;";
+        let interp = {
+            let mut agent = runtime::Agent::new();
+            agent.initialize_host_defined_realm().expect("realm");
+            agent.run_script(source).expect("interp runs")
+        };
+
+        extern "C" fn noop_drop(_cache: *mut c_void) {}
+        let mut agent = runtime::Agent::new();
+        agent.initialize_host_defined_realm().expect("realm");
+        let mut cache = JitCache::new(helpers).expect("isa");
+        agent.jit_hook = Some(runtime::jit::JitHook {
+            cache: (&mut cache as *mut JitCache) as *mut c_void,
+            lookup: jit_cache_lookup,
+            drop_cache: noop_drop,
+            helpers: &runtime::jit::JIT_SLOW_PATHS,
+        });
+        let value = agent.run_script(source).expect("jit runs");
+        let compiled = cache.compiled_count();
+        agent.jit_hook = None;
+        assert_eq!(value, interp, "the dense read must match the interpreter");
+        assert!(compiled >= 1, "{compiled} bodies must compile");
+        let reads = READ_CALLS.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            reads < 100,
+            "the compiled read loop must inline the dense element read ({reads} get_member_computed calls)"
+        );
+    }
+
+    #[test]
+    fn installed_jit_dense_element_read_declines_holes_to_the_chain() {
+        // A dense Array element read is exact only for a real own value: a HOLE
+        // is spec-absent, so the read must fall to the helper and consult the
+        // prototype chain. The compiled loop reads holes every iteration, and
+        // the prototype elements must win — matching the interpreter. A hole
+        // served as a value (the sentinel bits) would diverge here.
+        let source = "function read(a, n) {\n\
+                        var s = 0;\n\
+                        for (var i = 0; i < n; i++) { s += a[i & 3]; }\n\
+                        return s;\n\
+                      }\n\
+                      var a = [];\n\
+                      a[2] = 1;\n\
+                      Array.prototype[0] = 10;\n\
+                      Array.prototype[1] = 20;\n\
+                      Array.prototype[3] = 40;\n\
+                      var r = read(a, 1000);\n\
+                      delete Array.prototype[0];\n\
+                      delete Array.prototype[1];\n\
+                      delete Array.prototype[3];\n\
+                      r;";
+        let interp = {
+            let mut agent = runtime::Agent::new();
+            agent.initialize_host_defined_realm().expect("realm");
+            agent.run_script(source).expect("interp runs")
+        };
+        let (value, compiled) = with_jit_agent(|agent| agent.run_script(source).expect("runs"));
+        assert_eq!(value, interp, "the hole read must match the interpreter");
+        assert!(compiled >= 1, "{compiled} bodies");
+    }
+
     /// A6: the compiled safe point drives the nursery. The compiled loop's
     /// allocations are garbage, so a minor reclaims them and stays enabled; the
     /// nursery threshold is lowered so the minor level answers before the major's

@@ -6,9 +6,7 @@ done (0 emitter refusals) — this plan exists because coverage turned out not t
 be the thing, and because the architecture below was read out of the code
 rather than inferred from timings.
 
-Status: **Stages 0-3** are done (2026-09-28): the code audit, the instrument,
-G9 (the integer operators inline), G2 (the leaf-call refusal cache) and G12
-(`this`-slot leaves inline). The JIT is a per-`Step` lowering with hand-written
+Status: **Stages 0-5** are largely done (2026-09-28): the code audit, the instrument, G9 (the integer operators inline), G2 (the leaf-call refusal cache), G12 (`this`-slot leaves inline), G13 (the env-leaf lane), G14 (a cached frame descriptor), G15 (a per-callee call record), and G1's read side (the inline dense-array element read). Stage 5's remaining items — the chain read, `switch`, and the member-write path — are recorded in §5 as **closed by measurement** (already measured and reverted, or already cheaper than an inline path can beat), not as open work. The JIT is a per-`Step` lowering with hand-written
 inline fast paths for a named subset and `call_slow` into a 131-entry Rust
 helper table for everything else — **compiled dispatch with an inlined core**,
 not a typed-IR compiler. §3 is the gap inventory, ordered by measured helper
@@ -316,8 +314,23 @@ The list, in the measured order:
   A frame wider than 64 slots sets `fill_ok = 0` and keeps the probe fallback,
   because the record's TDZ mask cannot describe it: exactness over a silent
   mis-fill.
-- **G1 — computed-key access has no inline path**, as before, now ranked below
-  calls and the read/write gaps: 73.4M on 12 rows, `index_loop.js` 21.0M.
+- **G1 — computed-key access has no inline path on the read side (read side
+  landed, Stage 5).** The read `a[i]` lowered to
+  `call_slow(GetMemberComputed)` for every shape, while the write side already
+  had inline paths; `GetMemberComputed` was 73.4M on 12 rows (`index_loop.js`
+  21.0M). The compiled read now inlines the dense-Array case
+  (`emit_dense_element_read`, shared by the step `GetMemberComputed` and the
+  register `GetMemberComputed`/`GetMemberComputedLocal`): the receiver is a
+  tagged Object whose `array_dense` cursor is live (non-null iff dense), the key
+  a canonical index Number (`< 2^32-1`), and the index below `elem_len` — then
+  the element is one buffer load. A hole is spec-absent and declines to the
+  helper (which consults the chain), as do a spilled array, a typed array (its
+  own `ObjectKind`), a string/out-of-range key, and a non-Array. Measured:
+  `arrays/index_loop` 37.9 → **20.7 ms** with `GetMemberComputed` 21,000,000 →
+  **0**, `objects/many_objects_read` 30.6 → **21.1 ms**, and the rows'
+  JIT-vs-interpreter ratio 3.3x → **6.0x** / 3.5x → **5.1x**. Typed-array
+  element reads still take the helper (a separate representation) — a
+  follow-up.
 - **G3/G4/G5 — literals, iteration, string building**, as before: a helper
   sequence per element/step/property, measured in the table above.
 - **G6/G7/G8 — cell capacity, the register path's one shape, no feedback.**
@@ -391,9 +404,16 @@ The list, in the measured order:
   environment-reading leaves the env lane, and G15 keyed the leaf-call record
   by the callee on the agent, so a megamorphic site holds one record per
   callee.
-- **Stage 5 — G10, G11, G1, member writes.** Prototype-chain reads, the
-  `switch` chain, computed reads and the member-write path — the remaining
-  per-op helper surfaces, each with its own measurement.
+- **Stage 5 — G10, G11, G1, member writes.** **G1's read side is done** (§3
+  G1). The others are **closed by measurement, not landed**: G10's shape-free
+  inline chain probe was already measured and reverted (2026-09-01, 5-10%
+  slower than the helper — `.notes/perf.md`), and warm chain reads are
+  fixed-cost rather than walk-cost, so the fix is the L1c shape end-state, not
+  an inline path; G11's `switch` is already 3.1x faster under the JIT than
+  jitless (`switch_dispatch` 68 vs 213 ms) with the helper chain at ~6 calls
+  and ~3.3 ns/iter, so inlining it cannot pay; and the member-write rows
+  (`warm_store`, `compound_assign`) are ~pure `SetMemberSlot` at ~1 ns/iter.
+  Recorded so a later pass does not re-open them.
 - **Stage 6 — G3/G4/G5, literals, iteration, string building.** Each is a
   helper-per-op sequence today; each gets an inline path or a fused step.
 - **Stage 7 — G6/G8, cells and feedback.** Capacity for the colliding cells,
@@ -686,3 +706,26 @@ One line per landed stage, newest last. This log is the arc's journal —
   `all` 48,464/0/0/0 of 48,622 and `intl402` 3,205/0/0/0 of 3,357 at 15s/15s,
   corpus parity 77 rows/0 mismatches, `--jit-bench` in band (arithmetic 0.08,
   function calls 0.16, non-leaf call 0.50).
+- **Stage 5, G1 — the inline dense-array element read (2026-09-28).** Stage 5's
+  ordering was taken from the Stage 1 helper census, but a per-row instrument
+  run first re-ranked it and falsified two of its items: G10's shape-free inline
+  chain probe had already been measured and reverted (5-10% slower than the
+  helper), and G11's `switch` is already 3.1x faster under the JIT than jitless.
+  G1 survived: the read `a[i]` called `call_slow(GetMemberComputed)` for every
+  shape while the write side had inline paths, at 73.4M helper calls over 12
+  rows. `emit_dense_element_read` now inlines the dense-Array case (a tagged
+  Object with a live `array_dense` cursor, a canonical index key below
+  `elem_len`, a non-hole element — the same dense invariants the compiled append
+  relies on); a hole (spec-absent → the chain), a spill, a typed array, a
+  non-index/out-of-range key, and a non-Array decline to the helper. Measured:
+  `arrays/index_loop` 37.9 → **20.7 ms** (`GetMemberComputed` 21,000,000 → 0),
+  `objects/many_objects_read` 30.6 → **21.1 ms**, and their JIT-vs-interpreter
+  ratios 3.3x → 6.0x and 3.5x → 5.1x. Two new tests: a helper-count proof
+  (~100,000 → ~3 calls, mutation-checked) and a hole→chain exactness test.
+  Gates: fmt clean, clippy workspace `-D warnings` clean, workspace **5,540
+  passed / 0 failed**, runtime `--no-default-features` 953/0, v8 `simdutf`
+  380/0, `cli --no-default-features --features jit` green, test262 `all`
+  48,464/0/0/0 of 48,622 and `intl402` 3,205/0/0/0 of 3,357 at 15s/15s, corpus
+  parity 77 rows/0 mismatches, `--jit-bench` in band (arithmetic 0.07, function
+  calls 0.17, non-leaf call 0.54). The remaining Stage 5 items are recorded in
+  §5 as closed by measurement.

@@ -1,22 +1,23 @@
 ---
 name: slag-dense-arrays
-description: "Load when working on Slag's dense Array element storage or its compiled append — `ArraySlots` (crates/crux/src/object.rs), the `Value::hole()` sentinel, the `elem_ptr`/`elem_len`/`elem_cap` cursor and `elements()`/`elements_mut()` guards, the JIT's inline dense append (`emit_dense_array_append_inline`), the array-`length` read gates, or the `properties[0]` length mirror. Documents the traps - authoritative-vs-mirror length, cursor-based GC tracing, the hole sentinel's reserved tag, inline re-validation of extensible + the chain verdict, and why the gate must stay branchy."
+description: "Load when working on Slag's dense Array element storage, its compiled append, or its compiled element read — `ArraySlots` (crates/crux/src/object.rs), the `Value::hole()` sentinel, the `elem_ptr`/`elem_len`/`elem_cap` cursor and `elements()`/`elements_mut()` guards, the JIT's inline dense append (`emit_dense_array_append_inline`) and inline element read (`emit_dense_element_read`), the array-`length` read gates, or the `properties[0]` length mirror. Documents the traps - authoritative-vs-mirror length, cursor-based GC tracing, the hole sentinel's reserved tag, why a hole declines a read to the chain, inline re-validation of extensible + the chain verdict, and why the gate must stay branchy."
 ---
 
 # Slag dense Array stores and the compiled append
 
-The dense Array representation and the JIT's inline element append (the
-`array-store-plan.md` Phase C landing). These are the traps that cost real
-debugging time; the sweeps and the jit/jitless/`--gc-stress` differential
-battery are the backstop for this area.
+The dense Array representation and the JIT's inline element append and read
+(the `array-store-plan.md` Phase C landing plus the later inline read). These
+are the traps that cost real debugging time; the sweeps and the
+jit/jitless/`--gc-stress` differential battery are the backstop for this area.
 
 Locations: `crates/crux/src/object.rs` (`ArraySlots`, the cursor,
 `ChainVerdict`, `array_element_write`/`array_element_write_dense`,
 `spill_dense_array`, the length readers), `crates/crux/src/value.rs` (the
 hole sentinel), `crates/jit/src/compiler.rs`
-(`emit_dense_array_append_inline`, `emit_computed_store`,
-`emit_member_cell_probe`'s length path), `crates/runtime/src/ir.rs`
-(`member_cell_get`, `array_length`, `array_element_get`).
+(`emit_dense_array_append_inline`, `emit_dense_element_read`,
+`emit_computed_store`, `emit_member_cell_probe`'s length path),
+`crates/runtime/src/ir.rs` (`member_cell_get`, `array_length`,
+`array_element_get`).
 
 ## 1. The element buffer is `Vec<Value>` with an in-band hole sentinel
 
@@ -183,8 +184,49 @@ an exotic intercept.
   intercepting the append, mid-loop `length = 0`, the mirror readers
   (`getOwnPropertyDescriptor`, `Object.keys`/`entries`, `JSON.stringify`),
   `length` grow, and heap values read back.
+- For the read gate: in-bounds, a stored `undefined`, a hole with an
+  `Array.prototype` element behind it, an out-of-range index, a string key, a
+  `Uint8Array` (its own representation), and a non-Array receiver.
 - Rebuild `sweep.exe` and run all three areas (the append gate and the
   length probe are on shared read/store paths).
+
+## 8. The inline dense element read (`a[i]`)
+
+`emit_dense_element_read` is the read mirror of the append: `Step::Get`
+`MemberComputed` and the register `GetMemberComputed`/`GetMemberComputedLocal`
+all lower through it, and an in-bounds, non-hole element of a dense Array is
+served by ONE buffer load instead of the `get_member_computed` helper.
+
+The gate, in order (keep it branchy, §5):
+
+- the receiver is a tagged Object (the packed prefix+Object compare);
+- `array_dense` is non-null. It IS the dense switch — a spill clears BOTH
+  `dense` and `array_dense`, so a null cursor means "not dense"; do not test
+  `slots.dense` separately;
+- the key is a canonical index Number: `idx = ToUint64Sat(num)` round-trips
+  exactly (`fcvt_from_uint(idx) == num`) and `num < 2^32-1`. That rejects
+  fractional, negative, huge, and non-double keys (a NaN-boxed heap value
+  bitcasts to a NaN, whose compare fails), and `-0.0` canonicalizes to 0;
+- `idx < elem_len` (the authoritative materialized length — `[0, elem_len)` is
+  initialized);
+- the loaded element is not the hole sentinel.
+
+**A hole must decline to the helper, never be served.** A hole is
+spec-absent, so `[[Get]]` consults the prototype chain (a prototype element or
+accessor wins); returning the sentinel bits would be a wrong value, not a
+wrong-looking one. A stored `undefined` is a real value and IS served. Also
+declining: a spilled array, a typed array (its own `ObjectKind`, so
+`array_dense` is null — typed-array element reads are a separate
+representation and still take the helper), a string/out-of-range key, and a
+non-Array receiver.
+
+While dense every element is a writable data property (a non-w/e/c element
+descriptor spills the array), so an own buffer element shadows the whole chain
+— no chain check is needed on the served path. The read allocates nothing and
+holds no guard, so it needs no write barrier and no epoch check.
+
+Measured (`arrays/index_loop`): 37.9 → 20.7 ms with `GetMemberComputed`
+21,000,000 → 0; `objects/many_objects_read` 30.6 → 21.1 ms.
 
 ## Relationship to the other skills
 

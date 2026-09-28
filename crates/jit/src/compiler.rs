@@ -2516,6 +2516,148 @@ impl<'a> Lowerer<'a> {
         Ok(())
     }
 
+    /// The inline dense-array element read for a computed read (`a[i]`),
+    /// shared by the step `GetMemberComputed` and the register
+    /// `GetMemberComputed`/`GetMemberComputedLocal` (the fast-loop shape).
+    ///
+    /// The gate mirrors `emit_dense_array_append_inline`'s: the receiver is a
+    /// tagged Object, its `array_dense` cursor is live (non-null iff the dense
+    /// representation is active — a spill clears both), the key is a canonical
+    /// index Number, and the index is below `elem_len` (the authoritative
+    /// materialized length; the buffer `[0, elem_len)` is initialized). A live,
+    /// in-bounds, non-hole element is served straight from the buffer — no
+    /// `get_member_computed` helper, no key re-conversion, no cell probe.
+    ///
+    /// Every other shape falls to the helper (which re-resolves the key, serves
+    /// a prototype element / accessor / typed array, and records the element
+    /// cell): a non-Array, a non-index or out-of-range key, a hole (spec-absent,
+    /// so the chain must be consulted — a stored `undefined` is a real value and
+    /// IS served), a spilled array, and a typed array (its own `ObjectKind`, so
+    /// `array_dense` is null). While dense every element is a writable data
+    /// property (a non-w/e/c element descriptor spills the array), so an own
+    /// buffer element shadows the whole prototype chain.
+    fn emit_dense_element_read(
+        &mut self,
+        object: ClifValue,
+        key: ClifValue,
+    ) -> Result<ClifValue, Unsupported> {
+        let value_var = self.builder.declare_var(types::I64);
+        let merge = self.builder.create_block();
+        let probe = self.builder.create_block();
+        let key_gate = self.builder.create_block();
+        let bounds = self.builder.create_block();
+        let load_blk = self.builder.create_block();
+        let hit = self.builder.create_block();
+        let slow = self.builder.create_block();
+        // Object tag: a tagged value is `TAG_PREFIX | (tag << 44) | payload`,
+        // so shifting the top 20 bits down and comparing against the packed
+        // prefix+Object pattern checks the heap prefix AND the Object tag in
+        // one compare.
+        let object_pattern = (crux::TAG_PREFIX >> 44) | crux::TAG_OBJECT;
+        let tag_bits = self.builder.ins().ushr_imm_u(object, 44);
+        let obj_ok = self
+            .builder
+            .ins()
+            .icmp_imm_u(IntCC::Equal, tag_bits, object_pattern as i64);
+        self.builder.ins().brif(obj_ok, probe, &[], slow, &[]);
+        self.builder.seal_block(probe);
+        // The dense gate: `array_dense` is the ArraySlots box base, or 0 for a
+        // non-Array / a spilled array.
+        self.builder.switch_to_block(probe);
+        let obj_ptr = self
+            .builder
+            .ins()
+            .band_imm_u(object, crux::PAYLOAD_MASK as i64);
+        let obj_ptr = self.builder.ins().ishl_imm_u(obj_ptr, 4);
+        let obj_ptr = self
+            .builder
+            .ins()
+            .iadd_imm_s(obj_ptr, crux::heap::GCBOX_DATA_OFFSET as i64);
+        let slots_base = self.builder.ins().load(
+            types::I64,
+            MemFlagsData::new(),
+            obj_ptr,
+            Offset32::new(std::mem::offset_of!(crux::JsObject, array_dense) as i32),
+        );
+        let slots_ok = self
+            .builder
+            .ins()
+            .icmp_imm_u(IntCC::NotEqual, slots_base, 0);
+        self.builder.ins().brif(slots_ok, key_gate, &[], slow, &[]);
+        self.builder.seal_block(key_gate);
+        // The canonical-index gate (the append's, unchanged): `idx =
+        // ToUint64Sat(num)` round-trips exactly when `num` is an integral
+        // double in range, so one f64 -> u64 -> f64 round trip plus the
+        // `< 2^32-1` bound rejects fractional, negative, huge, and non-double
+        // keys (a NaN-boxed heap/undefined value bitcasts to a NaN, whose
+        // compare fails). The saturating conversion never traps, so no separate
+        // is-double block is needed; `-0.0` round-trips to index 0.
+        self.builder.switch_to_block(key_gate);
+        let num = self
+            .builder
+            .ins()
+            .bitcast(types::F64, MemFlagsData::new(), key);
+        let max = self.builder.ins().f64const(4294967295.0);
+        let lt_max = self.builder.ins().fcmp(FloatCC::LessThan, num, max);
+        let idx = self.builder.ins().fcvt_to_uint_sat(types::I64, num);
+        let back = self.builder.ins().fcvt_from_uint(types::F64, idx);
+        let integral = self.builder.ins().fcmp(FloatCC::Equal, back, num);
+        let key_ok = self.builder.ins().band(integral, lt_max);
+        self.builder.ins().brif(key_ok, bounds, &[], slow, &[]);
+        self.builder.seal_block(bounds);
+        // The bounds gate: `elem_len` is the authoritative materialized length.
+        self.builder.switch_to_block(bounds);
+        let slots_ptr = self
+            .builder
+            .ins()
+            .iadd_imm_s(slots_base, crux::heap::GCBOX_DATA_OFFSET as i64);
+        let elem_len = self.builder.ins().load(
+            types::I64,
+            MemFlagsData::new(),
+            slots_ptr,
+            Offset32::new(std::mem::offset_of!(crux::object::ArraySlots, elem_len) as i32),
+        );
+        let in_bounds = self
+            .builder
+            .ins()
+            .icmp(IntCC::UnsignedLessThan, idx, elem_len);
+        self.builder.ins().brif(in_bounds, load_blk, &[], slow, &[]);
+        self.builder.seal_block(load_blk);
+        // The element load: a hole is spec-absent.
+        self.builder.switch_to_block(load_blk);
+        let elem_ptr = self.builder.ins().load(
+            types::I64,
+            MemFlagsData::new(),
+            slots_ptr,
+            Offset32::new(std::mem::offset_of!(crux::object::ArraySlots, elem_ptr) as i32),
+        );
+        let offset = self.builder.ins().ishl_imm_u(idx, 3);
+        let addr = self.builder.ins().iadd(elem_ptr, offset);
+        let bits = self
+            .builder
+            .ins()
+            .load(types::I64, MemFlagsData::new(), addr, Offset32::new(0));
+        let is_hole =
+            self.builder
+                .ins()
+                .icmp_imm_u(IntCC::Equal, bits, crux::value::HOLE_BITS as i64);
+        self.builder.ins().brif(is_hole, slow, &[], hit, &[]);
+        self.builder.seal_block(hit);
+        self.builder.seal_block(slow);
+        self.builder.switch_to_block(hit);
+        self.builder.def_var(value_var, bits);
+        self.builder.ins().jump(merge, &[]);
+        // The helper: the full Get re-resolves the key, serves a prototype
+        // element / accessor / typed array, and repopulates the element cell.
+        self.builder.switch_to_block(slow);
+        let res = self.call_slow(self.sig_get_comp, Helper::GetMemberComputed, &[object, key])?;
+        self.builder.def_var(value_var, res);
+        self.builder.ins().jump(merge, &[]);
+        self.builder.seal_block(merge);
+        self.builder.switch_to_block(merge);
+        Ok(self.builder.use_var(value_var))
+    }
+
     /// The inline dense-array append gate (gap-close M1 C), shared by the
     /// step `AssignMemberComputed` and the register `StoreMemberComputed`
     /// emissions: verify the receiver is a dense Array (`array_dense`), the
@@ -4848,8 +4990,7 @@ impl<'a> Lowerer<'a> {
             Step::GetMemberComputed => {
                 let key = self.pop();
                 let object = self.pop();
-                let res =
-                    self.call_slow(self.sig_get_comp, Helper::GetMemberComputed, &[object, key])?;
+                let res = self.emit_dense_element_read(object, key)?;
                 self.push(res);
                 self.fall_through(index);
             }
@@ -8224,8 +8365,7 @@ impl<'a> Lowerer<'a> {
             LeafOp::GetMemberComputed { key } => {
                 let object = self.acc_bits();
                 let key = self.leaf_operand(step, op_index, 2, key)?;
-                let res =
-                    self.call_slow(self.sig_get_comp, Helper::GetMemberComputed, &[object, key])?;
+                let res = self.emit_dense_element_read(object, key)?;
                 self.set_acc_bits(res);
             }
             LeafOp::GetMemberNameLocal {
@@ -8250,8 +8390,7 @@ impl<'a> Lowerer<'a> {
                     self.emit_tdz_check(object)?;
                 }
                 let key = self.leaf_operand(step, op_index, 2, key)?;
-                let res =
-                    self.call_slow(self.sig_get_comp, Helper::GetMemberComputed, &[object, key])?;
+                let res = self.emit_dense_element_read(object, key)?;
                 self.set_acc_bits(res);
             }
             LeafOp::PushAcc => {
