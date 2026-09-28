@@ -396,7 +396,12 @@ verdict when it is at rest. Traps:
   must probe, never re-stamp. The re-stamp path (`stale_block` →
   `emit_leaf_state_at_rest()` → ok? store `cache.epoch = live epoch` →
   jump to the HIT block) reuses the cached verdict INCLUDING a cached
-  rejection (entry 0 → `call_slow`), which is always correct.
+  rejection (entry 0 → `call_slow`). The ONE exception is a *deferred*
+  rejection: a body the compile threshold has not promoted yet leaves
+  `ir.jit_info` at `0`, and the probe clears the cache identity for it (see
+  §17's promotion chain) so the site re-probes and inlines once the body
+  compiles. A *sticky* refusal (`jit_info == 1`: over the step cap, or an
+  emitter refusal) is reused as before.
 - **`emit_leaf_state_at_rest` must mirror `leaf_call_probe`'s checks** —
   all seven `Vm::can_inline_leaf` control stacks empty (`try_stack`,
   `pending`, `for_of_stack`, `for_of_boundaries`, `for_in_stack`,
@@ -439,6 +444,25 @@ verdict when it is at rest. Traps:
   `leaf_call_probe` in a counting fn via
   `JitHelpers.leaf_call_probe` and assert the flat counts across a
   100K-iteration loop.
+- **The probe takes the call's unbound receiver (G12).** `leaf_call_probe(ctx,
+  callee, this, args, argc, site)` — the extra `this` is the spec's
+  `thisArgument`, and the probe applies `OrdinaryCallBindThis` before filling the
+  frame's `this` slot: strict as-is; sloppy an object as-is, a nullish one → the
+  realm's global object, a primitive one *boxed* (it allocates and can throw, so
+  that case still refuses and stays on `call_slow`). The distinction that makes a
+  method inlineable: a `this` read in a certified body lowers to
+  `Step::LoadLocal { this_slot }` (a frame read, leaf-eligible) — `Step::ThisValue`
+  is leaf-excluded and only appears for `super`/receiver contexts, so a body whose
+  `this` is a plain read IS `leaf_inline`-certified and the old
+  `scope.this_slot.is_some()` refusal was the only blocker. A body that reads
+  `this` *and* an identifier is not certified at all (`LoadIdent` is leaf-excluded),
+  which is a `leaf_lookup` miss rather than a `this`-slot refusal when you trace
+  it. Measured on the corpus's `calls/method_call`: `CallSlow` 14,000,000 → 8,
+  132.7 → 77.9 ms. The remaining cap is not the call lane: a *non-aliased* frame
+  (`frame_size != arity` — any `var`/lexical slot, or a `this` slot) sends every
+  cache hit back to the probe to have the frame rebuilt, so `LeafCallProbe` is
+  still per-call and the win lands at ~39 ns/iteration where an aliased frame
+  reaches ~6.4 ns.
 
 ## 17. The compile threshold (Cut 69) — the gate in `lookup_info`
 
@@ -482,7 +506,11 @@ Traps that cost debugging time:
   to `call_slow` → `do_call_fast` → `fast_call_core` → `try_jit_leaf` →
   `run_jit_leaf` → `lookup_info` — count++ per call. The counter reaches
   K even though the site never re-probes, and after promotion the leaf's
-  machine code runs; the caller's site inlines on its NEXT fresh run.
+  machine code runs; the caller's site *re-probes* on its next visit (the
+  probe clears the identity for a deferred rejection — §16) and then inlines.
+  Before that clearing the site cached the below-threshold refusal as permanent,
+  so the caller stayed on `call_slow` for the whole run and only a *fresh*
+  caller (a new call, or a later benchmark invocation) saw the inline path.
 - **The count aggregates only across `Rc` clones of ONE declaration
   site.** Function declarations and arrows share the compiled body per
   site (Cut 43); a `function` expression VALUE does not — each

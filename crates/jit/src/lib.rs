@@ -3174,23 +3174,29 @@ mod tests {
         // Cut 68: a monomorphic hot leaf call next to a disturbing helper
         // (the `o.g` getter bumps the leaf-eligibility epoch on every
         // iteration) must NOT re-probe every iteration. The counting probe
-        // wrapper proves it: the first visit warms the cache, and each later
-        // visit finds a stale epoch, re-validates that the eligibility state
-        // is still at rest, and reuses the cached verdict — the loop's `add`
-        // site probes exactly once (a per-iteration re-probe would count
-        // ~100K). The upper bound allows the script body's `run()` call site
-        // to probe once too, should the script ever compile; today it does
-        // not, so the total is 1.
+        // wrapper proves it. `add` is a straight-line body, so the loop's call
+        // site is refused while the compile threshold defers it — and that
+        // refusal is deliberately NOT cached (it is transient; see
+        // `installed_jit_a_deferred_leaf_call_site_stops_using_call_slow`), so
+        // the site probes a few times during the tier-up window rather than
+        // once. Once `add` compiles the cached verdict is reused across the
+        // epoch bumps: each later visit finds a stale epoch, re-validates that
+        // the eligibility state is still at rest, and reuses it — so the count
+        // stays in the single digits (`JIT_COMPILE_THRESHOLD` is 16, and the
+        // `call_slow` lane advances the same counter, so the measured count is
+        // 9). A per-iteration re-probe would count ~100K; the bound admits the
+        // tier-up window and still fails that.
         static PROBE_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         extern "C" fn counting_leaf_call_probe(
             ctx: *mut c_void,
             callee: u64,
+            this: u64,
             args: *mut u64,
             argc: u64,
             site: u64,
         ) -> u64 {
             PROBE_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            (runtime::jit::JIT_SLOW_PATHS.leaf_call_probe)(ctx, callee, args, argc, site)
+            (runtime::jit::JIT_SLOW_PATHS.leaf_call_probe)(ctx, callee, this, args, argc, site)
         }
         let mut helpers = runtime_helpers();
         helpers.leaf_call_probe = Some(counting_leaf_call_probe);
@@ -3223,8 +3229,8 @@ mod tests {
         assert!(compiled >= 2, "{compiled} bodies (run + add) must compile");
         let probes = PROBE_CALLS.load(std::sync::atomic::Ordering::Relaxed);
         assert!(
-            (1..=2).contains(&probes),
-            "the leaf sites must probe once each ({probes} total): a per-iteration re-probe would count ~100K"
+            (1..=20).contains(&probes),
+            "the leaf site must probe only during the tier-up window and then reuse its verdict ({probes} total): a per-iteration re-probe would count ~100K"
         );
     }
 
@@ -3235,20 +3241,22 @@ mod tests {
         // `site` and re-probed (~200K probes for a 100K-iteration loop). The
         // direct-mapped set (indexed by `site % LEAF_CALL_CACHE_ENTRIES`)
         // gives each site its own record, so each warms once and the loop
-        // reuses both verdicts. The counting probe wrapper proves it: 2
-        // probes total (one per site), reused for the remaining ~200K
-        // visits (an upper bound of 3 allows the script body's `run()` site
-        // to probe once too, should the script ever compile).
+        // reuses both verdicts. The counting probe wrapper proves it: each
+        // site probes only during `add`'s tier-up window (a deferred refusal
+        // is not cached by design — measured 10 total, bound admits both
+        // windows), and the ~200K remaining visits reuse the two cached
+        // verdicts. A per-iteration re-probe would count ~200K.
         static PROBE_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         extern "C" fn counting_leaf_call_probe(
             ctx: *mut c_void,
             callee: u64,
+            this: u64,
             args: *mut u64,
             argc: u64,
             site: u64,
         ) -> u64 {
             PROBE_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            (runtime::jit::JIT_SLOW_PATHS.leaf_call_probe)(ctx, callee, args, argc, site)
+            (runtime::jit::JIT_SLOW_PATHS.leaf_call_probe)(ctx, callee, this, args, argc, site)
         }
         let mut helpers = runtime_helpers();
         helpers.leaf_call_probe = Some(counting_leaf_call_probe);
@@ -3280,8 +3288,144 @@ mod tests {
         assert!(compiled >= 2, "{compiled} bodies (run + add) must compile");
         let probes = PROBE_CALLS.load(std::sync::atomic::Ordering::Relaxed);
         assert!(
-            (2..=3).contains(&probes),
-            "each hot site must probe once ({probes} total): alternating single-record misses would count ~200K"
+            (2..=40).contains(&probes),
+            "each hot site must probe only during the tier-up window and then reuse its verdict ({probes} total): alternating single-record misses would count ~200K"
+        );
+    }
+
+    #[test]
+    fn installed_jit_a_deferred_leaf_call_site_stops_using_call_slow() {
+        // G2: a straight-line leaf is deferred by the compile threshold, so a
+        // compiled loop's call site is refused on its first visits. That
+        // refusal is transient — the consult counts toward the threshold — so
+        // the site must re-probe and then inline instead of caching "not
+        // inlineable" for the whole loop, which is what left every
+        // straight-line leaf call on `call_slow` (measured on `direct_leaf`:
+        // 2,000,000 `call_slow` calls before, 8 after). The counting wrapper
+        // proves it: the site reaches `call_slow` only during the tier-up
+        // window, not for all 100K iterations.
+        static CALL_SLOW_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        extern "C" fn counting_call_slow(
+            ctx: *mut c_void,
+            callee: u64,
+            this: u64,
+            argc: u64,
+            args: *mut u64,
+            direct_eval: u64,
+        ) -> u64 {
+            CALL_SLOW_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            (runtime::jit::JIT_SLOW_PATHS.call_slow)(ctx, callee, this, argc, args, direct_eval)
+        }
+        let mut helpers = runtime_helpers();
+        helpers.call_slow = Some(counting_call_slow);
+
+        extern "C" fn noop_drop(_cache: *mut c_void) {}
+        let mut agent = runtime::Agent::new();
+        agent.initialize_host_defined_realm().expect("realm");
+        let mut cache = JitCache::new(helpers).expect("isa");
+        agent.jit_hook = Some(runtime::jit::JitHook {
+            cache: (&mut cache as *mut JitCache) as *mut c_void,
+            lookup: jit_cache_lookup,
+            drop_cache: noop_drop,
+            helpers: &runtime::jit::JIT_SLOW_PATHS,
+        });
+        let value = agent
+            .run_script(
+                "function add(a, b) { return a + b; }\n\
+                 function run() {\n\
+                   var s = 0;\n\
+                   for (var i = 0; i < 100000; i++) { s += add(i, 1); }\n\
+                   return s;\n\
+                 }\n\
+                 run();",
+            )
+            .expect("runs");
+        let compiled = cache.compiled_count();
+        agent.jit_hook = None;
+        assert_eq!(value.as_number(), Some(5000050000.0));
+        assert!(compiled >= 2, "{compiled} bodies (run + add) must compile");
+        let slow = CALL_SLOW_CALLS.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            slow <= 40,
+            "the site must inline after its tier-up window ({slow} call_slow calls): caching the transient refusal would count ~100K"
+        );
+    }
+
+    #[test]
+    fn installed_jit_a_this_slot_leaf_call_inlines() {
+        // G12: a leaf whose body reads `this` lowers the read to
+        // `LoadLocal { this_slot }` (a frame read, leaf-eligible), so the body
+        // IS leaf-certified — but the probe refused it outright ("the machine
+        // code cannot bind `this`"), which left every method call on
+        // `call_slow`. The probe now takes the call's receiver, applies
+        // `OrdinaryCallBindThis`, and fills the frame's `this` slot. A sloppy
+        // primitive receiver boxes (an allocation the helper must do), so it
+        // still refuses; an object receiver — the method case — inlines.
+        static CALL_SLOW_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        extern "C" fn counting_call_slow(
+            ctx: *mut c_void,
+            callee: u64,
+            this: u64,
+            argc: u64,
+            args: *mut u64,
+            direct_eval: u64,
+        ) -> u64 {
+            CALL_SLOW_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            (runtime::jit::JIT_SLOW_PATHS.call_slow)(ctx, callee, this, argc, args, direct_eval)
+        }
+        let mut helpers = runtime_helpers();
+        helpers.call_slow = Some(counting_call_slow);
+
+        let source = "var g = this;\n\
+                      var o = { v: 1, m: function (x) { this.v += x; return this.v; } };\n\
+                      function who() { return this; }\n\
+                      function run() {\n\
+                        var s = 0;\n\
+                        for (var i = 0; i < 100000; i++) {\n\
+                          s += o.m(1);\n\
+                          if (who() === g) { s += 1; }\n\
+                        }\n\
+                        return s;\n\
+                      }\n\
+                      run();";
+        let interp = {
+            let mut agent = runtime::Agent::new();
+            agent.initialize_host_defined_realm().expect("realm");
+            agent.run_script(source).expect("interp runs")
+        };
+
+        extern "C" fn noop_drop(_cache: *mut c_void) {}
+        let mut agent = runtime::Agent::new();
+        agent.initialize_host_defined_realm().expect("realm");
+        let mut cache = JitCache::new(helpers).expect("isa");
+        agent.jit_hook = Some(runtime::jit::JitHook {
+            cache: (&mut cache as *mut JitCache) as *mut c_void,
+            lookup: jit_cache_lookup,
+            drop_cache: noop_drop,
+            helpers: &runtime::jit::JIT_SLOW_PATHS,
+        });
+        let value = agent.run_script(source).expect("jit runs");
+        let compiled = cache.compiled_count();
+        agent.jit_hook = None;
+        assert_eq!(
+            value, interp,
+            "the `this` binding must match the interpreter"
+        );
+        assert!(
+            compiled >= 2,
+            "{compiled} bodies (run + the methods) must compile"
+        );
+        let slow = CALL_SLOW_CALLS.load(std::sync::atomic::Ordering::Relaxed);
+        // The method's `this.v += x` store reads the receiver, and `who`
+        // returns its bound `this` (the realm global for a sloppy plain call).
+        // A body that reads `this` alongside an identifier read is NOT
+        // leaf-certified (`LoadIdent` is leaf-excluded), and a strict body's
+        // `return this` refuses for a reason upstream of this probe — both
+        // keep their `call_slow` fallback, so this test covers the shapes the
+        // probe now accepts.
+        assert!(
+            slow <= 60,
+            "the method and `this`-reading sites must inline after their tier-up windows ({slow} call_slow calls): refusing a `this`-slot leaf would count ~200K"
         );
     }
 

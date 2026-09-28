@@ -564,12 +564,20 @@ pub struct JitSlowPaths {
     /// params/vars/TDZ slots above the argument region; the aliased case is
     /// the arguments themselves), and returns the leaf's JIT entry (0 = the
     /// call site falls back to `call_slow`). `args` points at the argument
-    /// region's first slot; `argc` is the argument count; `site` is the call
-    /// site's step index (Cut 39 — the probe records it, plus the live
+    /// region's first slot; `argc` is the argument count; `this` is the call's
+    /// UNBOUND receiver (spec's `thisArgument` — the probe applies
+    /// `OrdinaryCallBindThis` when it fills the frame's `this` slot); `site` is
+    /// the call site's step index (Cut 39 — the probe records it, plus the live
     /// leaf-eligibility epoch and the callee identity, so the compiled code
     /// can skip the probe on repeat visits).
-    pub leaf_call_probe:
-        extern "C" fn(ctx: *mut c_void, callee: u64, args: *mut u64, argc: u64, site: u64) -> u64,
+    pub leaf_call_probe: extern "C" fn(
+        ctx: *mut c_void,
+        callee: u64,
+        this: u64,
+        args: *mut u64,
+        argc: u64,
+        site: u64,
+    ) -> u64,
     /// Read a declared top-level `var` off the global object (`name` is an
     /// `AtomId`); returns the value.
     pub get_global: extern "C" fn(ctx: *mut c_void, name: u64) -> u64,
@@ -1774,6 +1782,7 @@ extern "C" fn apply_args_fill(ctx: *mut c_void, arg_array: u64, dest: u64) -> u6
 extern "C" fn leaf_call_probe(
     ctx: *mut c_void,
     callee: u64,
+    this: u64,
     args: *mut u64,
     argc: u64,
     site: u64,
@@ -1789,7 +1798,9 @@ extern "C" fn leaf_call_probe(
     // code reuses this record only when its step index, the live leaf epoch,
     // and the callee's full NaN-box identity all match — so a cached zero
     // entry skips the probe for a stable rejection, and a stale record is
-    // simply re-probed.
+    // simply re-probed. The one rejection that is not stable — a body the
+    // tier-up policy has not compiled yet — clears the identity instead (see
+    // `lookup_info`'s null arm below), so the next visit re-probes.
     *cache_entry = LeafCallSiteCache {
         site: site as u32,
         epoch: ctx.leaf_epoch,
@@ -1817,6 +1828,10 @@ extern "C" fn leaf_call_probe(
     let Some(entry) = agent.leaf_lookup(function.id()) else {
         return 0;
     };
+    // Copy the fields out before `ir` is cloned: `leaf_lookup` returns a borrow
+    // of `agent`, and `strict` is needed much later (the `this` binding), so the
+    // borrow must end here.
+    let strict = entry.strict;
     let ir = entry.ir.clone();
     if ir.leaf_uses_env {
         return 0;
@@ -1824,9 +1839,10 @@ extern "C" fn leaf_call_probe(
     let Some(scope) = ir.scope.as_ref() else {
         return 0;
     };
-    if scope.this_slot.is_some() {
-        return 0;
-    }
+    // A body with a `this` slot is inlineable too — the slot is filled below
+    // (see `bound_this`). Its `this` reads lower to `LoadLocal { this_slot }`
+    // (a frame read, which is leaf-eligible); a body that reaches
+    // `Step::ThisValue` instead is not leaf-certified at all.
     // The leaf must have compiled machine code (compiling on first use); a
     // body without compiled code falls back to `call_slow`, whose
     // interpreter leaf-inline path handles it. The in-flight flag keeps the
@@ -1836,9 +1852,49 @@ extern "C" fn leaf_call_probe(
     };
     let info_ptr = crate::jit::lookup_info(hook, &ir, agent.jit_depth > 0);
     if info_ptr.is_null() {
+        // Two different nulls. A body the compile threshold has not promoted
+        // yet still counts the consult above toward that threshold, so a later
+        // visit can succeed; a body the policy has refused for good (over the
+        // step cap, or an emitter refusal) is sticky, which `jit_info`'s `1`
+        // marks. Only the first is transient, so only it must not leave a
+        // cached rejection behind: the compiled call site would otherwise
+        // reuse "not inlineable" forever and the threshold could never be
+        // reached — the reason every straight-line leaf call stayed on
+        // `call_slow`.
+        if ir.jit_info.get() != 1 {
+            *cache_entry = LeafCallSiteCache::empty();
+        }
         return 0;
     }
     let compiled = unsafe { &*info_ptr };
+    // The receiver the frame's `this` slot gets, matching `OrdinaryCallBindThis`
+    // (spec 10.2.1.1) as the interpreter's own certified path applies it: a
+    // strict callee keeps the call's receiver, a sloppy nullish one is coerced
+    // to the realm's global object, and a sloppy primitive one is BOXED — that
+    // boxing allocates and can throw, so only it stays on the helper. Computed
+    // only for a body that has the slot.
+    let bound_this = if scope.this_slot.is_some() {
+        let receiver = Value::from_bits(this);
+        if strict {
+            receiver.bits()
+        } else {
+            match receiver.kind() {
+                ValueKind::Object(_) | ValueKind::Function(_) => receiver.bits(),
+                ValueKind::Undefined | ValueKind::Null => {
+                    let Ok(global) = agent
+                        .running_context()
+                        .map(|context| context.realm.global_object)
+                    else {
+                        return 0;
+                    };
+                    Value::Object(global).bits()
+                }
+                _ => return 0,
+            }
+        }
+    } else {
+        0
+    };
     // The inline frame + working area must fit above the argument region's
     // top in the caller's working buffer: the aliased case (the frame IS
     // the arguments) needs only the working area; the built frame adds its
@@ -1858,7 +1914,9 @@ extern "C" fn leaf_call_probe(
     if !aliased {
         let frame = args_top as *mut u64;
         for slot in 0..scope.frame_size {
-            let value = if slot < scope.arity {
+            let value = if Some(slot) == scope.this_slot {
+                bound_this
+            } else if slot < scope.arity {
                 if slot < argc {
                     // SAFETY: the JIT passes a pointer into its own (live)
                     // stack buffer with `argc` slots.

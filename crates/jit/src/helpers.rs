@@ -445,10 +445,19 @@ pub struct JitHelpers {
     >,
     /// The compiled leaf-call probe (Cut 37): validates the callee is an
     /// inlineable leaf and returns its JIT entry (0 = fall back to
-    /// `call_slow`). `site` is the call site's step index (Cut 39 — the
-    /// probe records the cache identity so repeat visits skip it).
+    /// `call_slow`). `this` is the call's unbound receiver (the probe applies
+    /// `OrdinaryCallBindThis` when it fills the frame's `this` slot); `site` is
+    /// the call site's step index (Cut 39 — the probe records the cache
+    /// identity so repeat visits skip it).
     pub leaf_call_probe: Option<
-        extern "C" fn(vm: *mut c_void, callee: u64, args: *mut u64, argc: u64, site: u64) -> u64,
+        extern "C" fn(
+            vm: *mut c_void,
+            callee: u64,
+            this: u64,
+            args: *mut u64,
+            argc: u64,
+            site: u64,
+        ) -> u64,
     >,
     /// Read a declared top-level `var` off the global object (`name` is an
     /// `AtomId`); returns the value.
@@ -1887,6 +1896,7 @@ pub(crate) extern "C" fn test_call_slow(
 pub(crate) extern "C" fn test_leaf_call_probe(
     _vm: *mut c_void,
     _callee: u64,
+    _this: u64,
     _args: *mut u64,
     _argc: u64,
     _site: u64,

@@ -3851,10 +3851,13 @@ impl<'a> Lowerer<'a> {
         // 37); the probe records the cache identity so repeat visits skip it.
         self.builder.switch_to_block(probe_block);
         let site_imm = self.builder.ins().iconst(types::I64, index as i64);
+        // `sig_call_slow` (six params) carries the receiver as well — the probe
+        // binds it with OrdinaryCallBindThis and fills the callee's `this` slot
+        // from the result.
         let probe = self.call_slow(
-            self.sig_call,
+            self.sig_call_slow,
             Helper::LeafCallProbe,
-            &[callee, args_ptr, argc, site_imm],
+            &[callee, this, args_ptr, argc, site_imm],
         )?;
         let hit = self.builder.ins().icmp_imm_u(IntCC::NotEqual, probe, 0);
         let inline2 = self.builder.create_block();

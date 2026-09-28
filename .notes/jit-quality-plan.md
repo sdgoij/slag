@@ -6,13 +6,14 @@ done (0 emitter refusals) — this plan exists because coverage turned out not t
 be the thing, and because the architecture below was read out of the code
 rather than inferred from timings.
 
-Status: **Stages 0-2** are done (2026-09-28): the code audit, the instrument,
-and G9 (the integer operators now inline). The JIT is a per-`Step` lowering with
-hand-written inline fast paths for a named subset and `call_slow` into a
-131-entry Rust helper table for everything else — **compiled dispatch with an
-inlined core**, not a typed-IR compiler. §3 is the gap inventory, ordered by
-measured helper traffic (the Stage 1 run, §4) and annotated with what has
-landed; §5 is the stage order. The instrument is gated off by default.
+Status: **Stages 0-3** are done (2026-09-28): the code audit, the instrument,
+G9 (the integer operators inline), G2 (the leaf-call refusal cache) and G12
+(`this`-slot leaves inline). The JIT is a per-`Step` lowering with hand-written
+inline fast paths for a named subset and `call_slow` into a 131-entry Rust
+helper table for everything else — **compiled dispatch with an inlined core**,
+not a typed-IR compiler. §3 is the gap inventory, ordered by measured helper
+traffic (the Stage 1 run, §4) and annotated with what has landed; §5 is the
+stage order. The instrument is gated off by default.
 
 Supersedes the first draft of this document, which concluded from `--jit-bench`
 that the compiled tier was "node-class and not the problem". That was wrong for
@@ -76,13 +77,16 @@ shapes the engine already handles.
   (`emit_dense_array_append_inline`); typed-array store and `length`
   (`emit_typed_array_store_inline`/`_length_inline`); and **leaf** calls
   (`emit_call`'s probe + `emit_leaf_call_tail`).
-- **Where that subset actually ends (measured, §3).** Three boundaries this
-  bullet did not know about, one of them now closed: a named read inlines
-  **only for an own data property** — any prototype-chain link, which is every
-  method read, takes `call_slow(GetMemberName)` (§3 G10); the **leaf-call inline
-  path is reached but never fires** for ordinary user functions (§3 G2); and the
-  integer operators did not inline at all until Stage 2 closed that (§3 G9 —
-  `&`, `|`, `^`, `<<`, `>>`, `>>>` now lower to a guarded `i32` op).
+- **Where that subset actually ends (measured, §3).** Four boundaries this
+  bullet did not know about, two now closed: a named read inlines **only for an
+  own data property** — any prototype-chain link, which is every method read,
+  takes `call_slow(GetMemberName)` (§3 G10); the leaf-call inline path was
+  **wired but bypassed**, because a *transient* refusal was cached as permanent
+  (§3 G2, closed in Stage 3); the integer operators did not inline at all until
+  Stage 2 closed that (§3 G9 — `&`, `|`, `^`, `<<`, `>>`, `>>>` now lower to a
+  guarded `i32` op); and a leaf whose body uses `this` was refused outright,
+  which is every method — Stage 3 closed that too, and priced the lane it is on
+  (§3 G12; the alias `call_slow` ≈ 48-66 ns against ≈ 6-39 ns inlined).
 - **Everything else is a helper call**, and three of them are structural rather
   than a long tail:
 
@@ -115,7 +119,7 @@ corpus, one process per row** so a row's counters belong to it, summed:
 | helper | invocations | rows | surface | first action |
 |---|---|---|---|---|
 | `BinarySlow` | 255.8M | 50 | integer operators (bitwise/shift); `+`/`-`/`*` inline | **G9 — landed (Stage 2)** |
-| `CallSlow` | 102.2M | 50 | every call not inlined by the leaf path | G2 |
+| `CallSlow` | 102.2M | 50 | every call not inlined by the leaf path | **G2 — landed (Stage 3)** |
 | `SwitchTest` | 91.9M | 1 | one per `case`, per execution | **new (G11)** |
 | `GetMemberName` | 90.4M | 54 | prototype-chain reads (every method read) | **new (G10)** |
 | `GetMemberComputed` | 73.4M | 12 | computed read `a[i]`; the write side has two inline paths | G1 |
@@ -166,19 +170,68 @@ The list, in the measured order:
   `switch_dispatch.js` measures 91.9M `SwitchTest` + 21M `SwitchDisc` + 21M
   `BreakControl` over 3M iterations — ~30 helper calls per iteration for a shape
   the interpreter handles as a jump table.
-- **G2 — the inline leaf-call path is effectively dead.** In every call-shaped
-  row measured, 100% of calls take `CallSlow`: `direct_leaf.js` 2,000,000
-  `CallSlow` / 0 inline; `method_call.js` 14,000,000 / 0. The probe rejects with
-  `no-compiled-code` because the callee is a straight-line body and Cut 69
-  defers compiling it until `JIT_COMPILE_THRESHOLD` (16) consults — while
-  `emit_call`'s probe path caches a rejection as a *stable zero* verdict (Cut
-  68's restamp reuses it across epoch bumps), so the compiled loop never
-  re-consults and the counter the threshold waits on cannot advance. The other
-  measured rejections are `leaf_lookup-miss` (the callee was never certified
-  `leaf_inline`) and `this-slot` (a sloppy function's `this` slot, which the
-  inline frame cannot bind). So the leaf machinery is reached and never fires
-  for ordinary user functions; §2's "leaf calls inline" bullet describes code
-  that is unreachable in practice.
+- **G2 — the leaf-call inline path (landed, Stage 3).** The refusal that
+  matters is `no-compiled-code`: the callee is a straight-line body, so Cut 69
+  defers its compile until `JIT_COMPILE_THRESHOLD` (16) consults, while
+  `leaf_call_probe` recorded *every* refusal as a stable zero verdict that Cut
+  68's restamp then reused across epoch bumps. A refusal that is only a
+  deferral must not be cached as permanent, so the probe now clears the cache
+  identity when `jit_info` is not the sticky `1` (a genuine over-cap or emitter
+  refusal still caches, so a permanently ineligible callee is not re-probed
+  every visit). Measured at the fixed site (`direct_leaf`): `CallSlow`
+  2,000,000 → **8**, `LeafCallProbe` 7 → 15, the site inlining after its
+  tier-up window; corpus `mean-jitGap` 68.4 → **65.2**.
+
+  **The Stage 1 claim here — "100% of calls take `CallSlow`", the inline path
+  "effectively dead" — was an over-read of the aggregate counter and is
+  withdrawn.** In `bench_once` a call site's *first* invocation pays the
+  refusals while later invocations already inline: the leaf's body compiles
+  after 16 consults (`try_leaf_call`'s lane consults `lookup_info` on every
+  call), and the harness's two warmups exclude that first invocation from the
+  timing. So the 2,000,000-call aggregate was one un-measured pass, and the
+  defect is narrower than stated: it costs a site's first invocation, which is
+  the whole program for a single-entry long-running loop. Priced by measuring
+  both lanes in one build (a permanently refused `this`-slot callee against an
+  inlinable one, same body, 3M iterations): **`CallSlow` ≈ 48 ns/call against
+  ≈ 6.4 ns inlined, ~7.5×.**
+- **G12 — a leaf that reads `this` (landed, Stage 3).** The probe refused
+  `scope.this_slot.is_some()` outright — "the machine code cannot bind `this`"
+  — so every method call stayed on `call_slow`, and it is why `this` reads lower
+  to `LoadLocal { this_slot }` (a frame read, leaf-eligible) rather than to
+  `Step::ThisValue` (leaf-excluded). The probe now takes the call's unbound
+  receiver, applies `OrdinaryCallBindThis` as the interpreter's own certified
+  path does (strict: as-is; sloppy: an object as-is, a nullish one → the realm's
+  global object, a *primitive* one boxes — and boxing allocates and can throw,
+  so only that case still refuses), and fills the frame's `this` slot. The
+  helper signature gained the receiver, so the four-file mirror was paid.
+  Measured on `calls/method_call.js` (an object receiver): `CallSlow`
+  14,000,000 → **8**, the row 132.7 → **77.9 ms (−41%)**. Verified
+  behaviourally: a differential over method receivers, sloppy plain calls
+  (→ global), strict plain calls (→ undefined), boxed and unboxed primitives
+  and a `this`-capturing closure is identical between the two modes. Two
+  sub-cases still refuse and both are pre-existing: a body that reads `this`
+  *and* an identifier (`LoadIdent` is leaf-excluded, so such a body was never
+  leaf-certified — G13's territory), and a strict body's plain-call
+  `return this`, which refuses upstream of the probe.
+- **G13 — `leaf_lookup-miss` (open), and the gate that hides G12's other half.**
+  `closure_capture`, `recursive_fib`, `generator_loop` and `nested_read` are
+  EcmaScript callees that are not `leaf_inline`-certified, so their sites fall
+  back whatever the cache policy above does. This is also why a body that reads
+  `this` *and* an identifier stays on `call_slow`: `LoadIdent` is in
+  `steps_are_leaf`'s exclusion list, so such a body is never certified and the
+  probe never sees it (measured while building G12 — `function sloppy() {
+  return this !== undefined; }` refused with ~1 probe per invocation, i.e. a
+  cached `leaf_lookup` miss rather than a `this`-slot refusal).
+- **G14 — a non-aliased frame re-probes on every call (open; the real cap on
+  G12, and on every leaf with a local).** `emit_call`'s cache-hit path inlines
+  only an *aliased* frame (`frame_size == arity`, the argument region IS the
+  frame); anything else — a `this` slot, or any `var`/lexical slot past the
+  params — branches back to the probe, which rebuilds the frame every call. On
+  `method_call` that is `LeafCallProbe` 14,000,000, and it is what caps G12 at
+  ≈39 ns/iteration instead of the ≈6.4 ns the aliased lane reaches. The emitter
+  knows `scope` at compile time, so it can write the frame itself behind the
+  existing `room` check (copy the params, `undefined` the var slots, the
+  uninitialized marker the lexical ones, the bound receiver the `this` slot).
 - **G1 — computed-key access has no inline path**, as before, now ranked below
   calls and the read/write gaps: 73.4M on 12 rows, `index_loop.js` 21.0M.
 - **G3/G4/G5 — literals, iteration, string building**, as before: a helper
@@ -238,13 +291,14 @@ The list, in the measured order:
   per operation, so a compile-time-constant operand (`| 0`, `& 255`) could
   elide half of it — the corpus says the constant-operand cases are already
   fast enough to not pay for the plumbing yet.
-- **Stage 3 — G2, the leaf-call path.** First make a rejection verdict not
-  suppress the tier-up consult (a zero cached entry must be re-probed when the
-  epoch moved, so Cut 69's threshold can be reached), then the remaining
-  eligibility gates (`leaf_lookup-miss` certification, the sloppy `this` slot).
-  Gate: `direct_leaf`/`method_call` show inline calls instead of 100%
-  `CallSlow`; `function calls` and `non-leaf call` move; `LeafCallProbe`
-  traffic falls.
+- **Stage 3 — G2 and G12, the leaf-call path.** **Both halves are done** (§3
+  G2 and G12, each with its own measurements and the withdrawn over-claim in
+  G2). Gate: the `direct_leaf` site's `CallSlow` 2,000,000 → 8, the
+  `calls/method_call` row 132.7 → 77.9 ms with its `CallSlow` 14,000,000 → 8,
+  `--jit-bench` unregressed, parity at 0 mismatches, both test262 areas at
+  baseline. What remains is **G14** — the non-aliased frame re-probes on every
+  call, which caps both halves — plus the two refusals G12 and G13 record (a
+  strict plain-call `return this`, and any body that also reads an identifier).
 - **Stage 4 — G10, G11, G1, member writes.** Prototype-chain reads, the
   `switch` chain, computed reads and the member-write path — the remaining
   per-op helper surfaces, each with its own measurement.
@@ -293,7 +347,8 @@ GC-root discipline, the compile-size budget).
 
 ## 8. Status log
 
-One line per landed stage, newest last.
+One line per landed stage, newest last. This log is the arc's journal —
+`.notes/embedding.md` is the embedding contract and does not take JIT records.
 
 - (plan written 2026-09-28; no code changed)
 - **Stage 0, the code audit (2026-09-28).** The architecture read out of the
@@ -349,3 +404,61 @@ One line per landed stage, newest last.
   48,464/0/0/0 of 48,622 and `intl402` 3,205/0/0/0 of 3,357 at 15s/15s. No wasm
   sweep is owed, and that is checked rather than argued: `cargo tree -p
   wasmtest` does not contain `crates/jit`.
+- **Stage 3, G2 the leaf-call refusal cache (2026-09-28).** `leaf_call_probe`
+  cached every refusal as a stable zero verdict, and Cut 68's restamp reused it
+  across epoch bumps; for a straight-line callee the refusal is only a
+  *deferral* (Cut 69's compile threshold), so the site never re-consulted and
+  never inlined. The probe now clears the cache identity when `ir.jit_info` is
+  not the sticky `1`, so a deferred callee is re-probed (and inlines once it
+  compiles) while a genuine over-cap or emitter refusal still caches a zero and
+  is not re-probed per visit. Measured at that site (`direct_leaf`): `CallSlow`
+  2,000,000 → **8** with `LeafCallProbe` 7 → 15; corpus `mean-jitGap` 68.4 →
+  **65.2** over 77 rows/0 mismatches. **This stage also withdraws a Stage 1
+  over-claim**: "100% of calls take `CallSlow`" was the aggregate counter
+  dominated by a call site's *first* invocation, which `bench_once`'s two
+  warmups exclude from the timing — later invocations already inlined. The
+  defect is therefore narrower (a site's first invocation) and the fix's value
+  is priced by the two lanes in one build: **`CallSlow` ≈ 48 ns/call against
+  ≈ 6.4 ns inlined**, so it is a ~7.5× win for a single-entry long-running loop
+  and invisible to `--jit-bench`/the corpus by construction. Two Cut 68 tests
+  pinned the old policy and are amended to the new bounds (their measured probe
+  counts went 1 → 9 and 2 → 10, both far from the ~100K a per-iteration
+  re-probe would give); a new
+  `installed_jit_a_deferred_leaf_call_site_stops_using_call_slow` pins the fix
+  itself by counting `call_slow` at the site (≤ 40 of 100K, which a reverted
+  fix fails). Gates: fmt clean, clippy workspace `-D warnings` clean, workspace
+  **5,533 passed / 0 failed** (jit 211), runtime `--no-default-features` 952/0,
+  v8 `simdutf` 380/0, `cli --no-default-features --features jit` green, test262
+  `all` 48,464/0/0/0 of 48,622 and `intl402` 3,205/0/0/0 of 3,357 at 15s/15s,
+  `--jit-bench` unregressed. The eligibility half stays open and is now priced:
+  G12 (`this`-slot leaves, every method call) and G13 (`leaf_lookup-miss`).
+- **Stage 3, G12 the `this`-slot leaf (2026-09-28).** The probe refused
+  `scope.this_slot.is_some()` outright, so every method call stayed on
+  `call_slow`; it now takes the call's unbound receiver, applies
+  `OrdinaryCallBindThis` (strict as-is; sloppy: an object as-is, nullish → the
+  realm's global object, a primitive boxes and so still refuses), and fills the
+  frame's `this` slot. The receiver went into `leaf_call_probe`'s signature, so
+  the four-file mirror was paid (`JitSlowPaths`/`JIT_SLOW_PATHS`/the impl, the
+  `Helper` entry and `JitHelpers` field plus the test double, `runtime_helpers`
+  and `helpers_all`, and `emit_call`'s call site, which reuses `sig_call_slow`
+  for the extra argument). Measured on `calls/method_call.js`: `CallSlow`
+  14,000,000 → **8**, the row 132.7 → **77.9 ms (−41%)**, with the corpus's
+  `mean-jitGap` reading inside the ±8 band its rounds show (65.2 → 73.6, and the
+  same rounds' `mean-jlGap` moved too, so that is load rather than the change —
+  the rows this cannot touch, like `opcost/js_call`, are unmoved). Correctness is
+  a differential over method receivers, sloppy plain calls (→ global), strict
+  plain calls (→ undefined), `call(null)`/`call(5)`/`call("x")` and a
+  `this`-capturing closure: byte-identical between the modes. The new
+  `installed_jit_a_this_slot_leaf_call_inlines` test compares against the
+  interpreter and asserts `call_slow` stays small at the site; re-adding the
+  refusal makes it count 200,000 and fail. Two things the build exposed and
+  recorded rather than guessed: a body that reads `this` *and* an identifier is
+  not leaf-certified at all (`LoadIdent` is leaf-excluded — G13), and the
+  non-aliased frame re-probes on **every** call (`LeafCallProbe` 14,000,000 on
+  this row), which is what caps the win at ≈39 ns/iteration instead of the
+  ≈6.4 ns an aliased frame reaches — recorded as **G14**. Gates: fmt clean,
+  clippy workspace `-D warnings` clean, workspace **5,534 passed / 0 failed**
+  (jit 212), runtime `--no-default-features` 952/0, v8 `simdutf` 380/0, `cli
+  --no-default-features --features jit` green, test262 `all` 48,464/0/0/0 of
+  48,622 and `intl402` 3,205/0/0/0 of 3,357 at 15s/15s, corpus parity 77 rows/0
+  mismatches, `--jit-bench` in band.
