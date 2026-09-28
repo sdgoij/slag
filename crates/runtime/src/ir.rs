@@ -13986,20 +13986,36 @@ pub(crate) fn object_fast_create(
     let object = crux::object::JsObject::ordinary_object_create(proto);
     // Resolve the vector-free head shape from the object's (empty) map —
     // the cached child chain shared by every literal with the same key
-    // prefix — then adopt.
+    // prefix — then adopt. The base map is the canonical empty map for the
+    // prototype, so its whole-literal composite cache (G3) serves every
+    // `Step::ObjectFast` with this key list from one lookup instead of one
+    // `get_or_create_child` per key.
     let head = names.len().min(crux::object::INLINE_FIELDS);
-    let mut shape = object
+    let mut base = object
         .map
         .get()
         .ok_or_else(|| JsError::new(ErrorKind::TypeError, "fresh object without a map".into()))?;
-    let attrs = crux::MapAttrs::new(true, true, true);
-    for name in names.iter().take(head) {
-        shape = shape
-            .get_or_create_child(crux::PropertyKey::String(*name), attrs)
-            .ok_or_else(|| {
-                JsError::new(ErrorKind::TypeError, "cannot fork the literal shape".into())
-            })?;
-    }
+    // The composite cache covers the whole vector-free head only: a literal
+    // longer than `INLINE_FIELDS` sends its tail keys through the property
+    // vector, which the cached shape does not describe.
+    let shape = match base.composite_child(names) {
+        Some(shape) if head == names.len() => shape,
+        _ => {
+            let attrs = crux::MapAttrs::new(true, true, true);
+            let mut shape = base;
+            for name in names.iter().take(head) {
+                shape = shape
+                    .get_or_create_child(crux::PropertyKey::String(*name), attrs)
+                    .ok_or_else(|| {
+                        JsError::new(ErrorKind::TypeError, "cannot fork the literal shape".into())
+                    })?;
+            }
+            if head == names.len() {
+                base.set_composite_child(names, shape);
+            }
+            shape
+        }
+    };
     if object.adopt_vector_free_fields(shape, &values[..head]) {
         for (name, value) in names[head..].iter().zip(values[head..].iter()) {
             object.create_data_property_key(&crux::PropertyKey::String(*name), *value)?;

@@ -23,6 +23,7 @@ use crate::handle::Handle;
 use crate::heap::{FxHasher, GcAny, Trace};
 use crate::object::JsObject;
 use crate::property::PropertyKey;
+use crate::string::AtomId;
 
 /// A map descriptor: the name, field offset, and property attributes.
 ///
@@ -77,6 +78,16 @@ pub struct Map {
     /// function/prototype shapes per property append, and the keys are atom
     /// ids / symbol pointers — not attacker-controlled.
     transitions: HashMap<(PropertyKey, MapAttrs), Handle<Map>, BuildHasherDefault<FxHasher>>,
+    /// Whole-literal composite transitions (G3): a `Step::ObjectFast`'s key
+    /// list → the FINAL child shape, so an object literal resolves its shape
+    /// with one lookup instead of one per key. Only the all-default-attributes
+    /// fork a literal makes (`MapAttrs::new(true, true, true)`) is keyed, and
+    /// only the vector-free head's key list (a literal longer than
+    /// `INLINE_FIELDS` skips the cache, as its tail keys go through the
+    /// property vector). Bounded so an adversarial literal set cannot grow the
+    /// shared canonical empty map without limit. The entries keep the shapes
+    /// alive (each child reaches its parent through `back_pointer`).
+    composite: HashMap<Box<[AtomId]>, Handle<Map>, BuildHasherDefault<FxHasher>>,
     /// Back-pointer to the parent map in the transition tree.
     back_pointer: Option<Handle<Map>>,
     /// Generation counter: bumped when this map's shape changes.
@@ -114,6 +125,9 @@ impl Trace for Map {
             key.trace(visit);
             child.trace(visit);
         }
+        for child in self.composite.values() {
+            child.trace(visit);
+        }
         if let Some(bp) = self.back_pointer {
             bp.trace(visit);
         }
@@ -136,6 +150,7 @@ impl Map {
             descriptors: Vec::new(),
             prototype,
             transitions: HashMap::default(),
+            composite: HashMap::default(),
             back_pointer,
             generation: Cell::new(0),
         })
@@ -253,6 +268,24 @@ impl Map {
     /// Get the generation counter (for IC invalidation).
     pub fn generation(&self) -> u32 {
         self.generation.get()
+    }
+
+    /// The cached whole-literal shape for exactly `names` (G3), if the
+    /// composite transition was recorded. The caller must use only the
+    /// all-default-attributes fork a `Step::ObjectFast` makes.
+    pub fn composite_child(&self, names: &[AtomId]) -> Option<Handle<Map>> {
+        self.composite.get(names).copied()
+    }
+
+    /// Record the whole-literal shape for `names` (G3). A no-op once the
+    /// cache is at its cap, so a program with many distinct literal shapes
+    /// cannot grow the shared canonical empty map without limit (the uncached
+    /// shapes still resolve through the transition tree).
+    pub fn set_composite_child(&mut self, names: &[AtomId], child: Handle<Map>) {
+        const COMPOSITE_CAP: usize = 1024;
+        if self.composite.len() < COMPOSITE_CAP {
+            self.composite.insert(names.into(), child);
+        }
     }
 }
 
@@ -496,6 +529,45 @@ mod tests {
             current.field_offset(&PropertyKey::from_utf8(&format!("k{}", limit - 1))),
             Some(limit - 1)
         );
+    }
+
+    #[test]
+    fn composite_child_caches_the_whole_literal_walk() {
+        // G3: a `Step::ObjectFast` resolves its shape in one composite lookup
+        // instead of one transition per key. The cached value must be exactly
+        // the map the per-key walk produces, be keyed by the FULL key list, and
+        // leave the map untouched until the caller records it.
+        let mut map = Map::new_empty(None);
+        let atoms = |keys: &[&str]| -> Vec<AtomId> {
+            keys.iter()
+                .map(|name| crate::string::intern_utf8(name))
+                .collect()
+        };
+        let names = atoms(&["a", "b", "c"]);
+        assert_eq!(map.composite_child(&names).map(|m| m.id()), None, "cold");
+        let attrs = MapAttrs::new(true, true, true);
+        let mut shape = map;
+        for name in &names {
+            shape = shape
+                .get_or_create_child(PropertyKey::String(*name), attrs)
+                .expect("forks");
+        }
+        let walked = shape.id();
+        // The walk itself does not populate the composite cache (the caller
+        // records it only after the object adopts the shape).
+        assert_eq!(map.composite_child(&names).map(|m| m.id()), None);
+        map.set_composite_child(&names, shape);
+        assert_eq!(map.composite_child(&names).map(|m| m.id()), Some(walked));
+        // A prefix and a different key list must not match.
+        assert_eq!(map.composite_child(&names[..2]).map(|m| m.id()), None);
+        assert_eq!(
+            map.composite_child(&atoms(&["a", "b", "d"]))
+                .map(|m| m.id()),
+            None
+        );
+        // The cached shape describes the same property layout as the walk.
+        assert_eq!(shape.field_offset(&PropertyKey::from_utf8("b")), Some(1));
+        assert_eq!(shape.descriptor_count(), 3);
     }
 
     #[test]

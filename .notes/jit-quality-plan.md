@@ -127,7 +127,7 @@ corpus, one process per row** so a row's counters belong to it, summed:
 | `ForOfNextBindLocal` | 21.0M | 1 | `for-of` step | **G17 — landed (Stage 6)** |
 | `SwitchDisc` | 21.0M | 1 | `switch` selector | G11 |
 | `BreakControl` | 21.0M | 1 | `break` inside a `switch` | G11 |
-| `ObjectFast` | 16.8M | 16 | object literal | G3 |
+| `ObjectFast` | 16.8M | 16 | object literal (fused — the sequence was already collapsed by Cut 72) | **G3 — landed (Stage 6)** |
 | `TypedArrayLength` | 15.7M | 16 | array `length` read (misnamed: the FFI probe every `i < a.length` paid) | **G16 — landed (Stage 6)** |
 | `ForInNext` | 6.3M | 1 | `for-in` step | G4 |
 | `ConcatStrings` | 4.5M | 3 | string building | G5 |
@@ -421,9 +421,43 @@ The list, in the measured order:
   byte-identical between jit and jitless, and a generator `yield`-ing inside a
   for-of exercises the frame cursor across a suspension. No wasm sweep owed
   (`wasmtest` does not link `crates/jit`).
-- **G3/G4/G5 — literals, iteration, string building.** G4's for-of advance
-  landed as **G17** (above); the for-in and `for-of` non-fused (`ForOfNext`)
-  steps stay on the helper. G3/G5 remain, as measured in the table above.
+- **G3 — the object literal's shape walk (landed, Stage 6; the rest of the
+  gap is the allocator).** The plan's G3 premise ("a helper sequence per
+  element/step/property") was already addressed by Cut 72: `Step::ObjectFast`
+  lowers to ONE helper call that resolves the literal's shape and adopts every
+  field. Measuring the residual split the cost by shape (3M allocations per
+  row, release, repeatable): `{}` **53 ns**, `{a,b,c}` **84 ns**, `{a…h}`
+  **114 ns** — i.e. **54 ns is the fresh `JsObject` itself** (528 B, every
+  field written by `init_ordinary`, ~1.6 GB moved by the probe) and the rest is
+  ~9 ns per key. So the literal is ~64% fresh-object write bandwidth at the 3
+  key shape, and **no inline path can move that**: it needs a smaller object or
+  allocation sinking, both `crux` concerns.
+
+  The removable piece is the per-key `Map::get_or_create_child` walk (a
+  hash + probe per key). `Map` now carries a **composite transition cache**
+  (`composite: HashMap<Box<[AtomId]>, Handle<Map>>`, bounded at 1024 entries,
+  traced like `transitions`): `object_fast_create` resolves the whole vector-free
+  head with one lookup and records the shape on a miss, so a literal pays one
+  hash + probe instead of N — never more (a 1-key literal is a wash, a 16-key
+  one saves ~15 lookups), and the entries keep their shapes alive through
+  `back_pointer`. Measured: `{a,b,c}` **84 → 74 ns (−12%)**, `{a…h}` **114 → 100
+  ns (−12%)**, `{}` unchanged (53 ns), `objects/destructure` 176 → 166 ms (−5%).
+  Over the 77-row corpus this is inside the run-to-run noise (mean-jitGap 71.2
+  vs 68.4 across two runs, both 0 mismatches), which is the honest caveat: the
+  primitive improves, but literal-heavy corpus rows are allocation-bound and
+  only `destructure`/`spread_assign` exercise it. New crux test
+  `composite_child_caches_the_whole_literal_walk` pins that the cached shape is
+  exactly the walk's, is keyed by the full list, and is not populated by the
+  walk itself. Gates: fmt clean, clippy workspace `-D warnings` clean,
+  workspace **5,546 passed / 0 failed**, runtime `--no-default-features` 953/0,
+  v8 `simdutf` 380/0, `cli --no-default-features --features jit` green, test262
+  `all` 48,464/0/0/0 of 48,622 and `intl402` 3,205/0/0/0 of 3,357 at 15s/15s,
+  corpus parity 77 rows/0 mismatches, `--jit-bench` in band. **The next lever
+  here is not a JIT arm**: it is `JsObject`'s size (528 B, 128 B of it
+  `in_fields`) or allocation sinking, and it is recorded as such so G3 is not
+  re-opened as an inline path.
+- **G5 — string building.** `ConcatStrings`/`ConcatStr`/`ConcatStrConst`/
+  `PushStr` (~8M over 5 rows), as measured in the table above.
 - **G6/G7/G8 — cell capacity, the register path's one shape, no feedback.**
   G8 is now load-bearing for a sharper reason: G9, G10 and G11 are each a
   *missing inline path*, and doing them one at a time is how the current
@@ -518,8 +552,14 @@ The list, in the measured order:
   slowest corpus row at ~950 ms/rep) is **allocation-bound**, not a JIT gap —
   `PerIteration` builds a spec-required fresh environment and a closure per
   iteration, and the row runs **952 ms JIT against 1,058 ms jitless** (~10%),
-  so no inline path can pay. Still open: G3 (object literals), G5 (string
-  building), and the non-fused `ForOfNext` / `ForInNext` advances.
+  so no inline path can pay. Still open: G5 (string
+  building) and the non-fused `ForOfNext` / `ForInNext` advances. **G3 (object
+  literals) landed** as the composite literal-shape cache (§3 G3): the fused
+  `ObjectFast` create was already one helper call (Cut 72), so the slice removed
+  the per-key transition walk (−12% on a 3- and 8-key literal, −5% on
+  `objects/destructure`), and the residual — the fresh 528 B `JsObject` write,
+  54 of the literal's 84 ns — is recorded as a `crux` concern (object size or
+  allocation sinking), not a JIT arm.
 - **Stage 7 — G6/G8, cells and feedback.** Capacity for the colliding cells,
   and a per-site feedback record so the inline paths above become a mechanism
   rather than a set of bespoke arms.
@@ -924,3 +964,37 @@ One line per landed stage, newest last. This log is the arc's journal —
   across a suspension. No wasm sweep owed (`wasmtest` does not link
   `crates/jit`). With this the Stage-6 iteration surface is closed for the
   fused `for-of`; G3, G5 and the non-fused `ForOfNext`/`ForInNext` remain.
+- **Stage 6, G3 — the object literal: allocation-bound, and the shape walk
+  removed (2026-09-28).** The plan's premise ("a helper sequence per
+  element/step/property") was already false in the tree: Cut 72 fused
+  `Step::ObjectFast` into ONE helper call. Measuring the residual (3M
+  allocations per probe row, release, repeatable) split it: `{}` **53 ns**,
+  `{a,b,c}` **84 ns**, `{a…h}` **114 ns** — so **54 ns is the fresh `JsObject`**
+  (528 B initialized in `init_ordinary`; the three rows move ~1.6 GB), and
+  ~9 ns per key is the rest. The literal is therefore ~64% fresh-object write
+  bandwidth at the common 3-key shape, and no inline arm can touch it: that
+  needs a smaller object or allocation sinking, both `crux`.
+
+  The removable part is the per-key `Map::get_or_create_child` walk. `Map`
+  gained a composite transition cache (`HashMap<Box<[AtomId]>, Handle<Map>>`,
+  bounded at 1024, traced like `transitions`), so `object_fast_create`
+  resolves the whole vector-free head in one lookup and records the shape on a
+  miss — one hash + probe instead of N (a wash at 1 key, ~15 lookups saved at
+  16), and the entries keep their shapes alive through `back_pointer`. Measured:
+  `{a,b,c}` **84 → 74 ns (−12%)**, `{a…h}` **114 → 100 ns (−12%)**, `{}`
+  unchanged, `objects/destructure` **176 → 166 ms (−5%)**. Corpus-wide this is
+  inside the run-to-run noise (mean-jitGap 71.22 vs 68.35 over two runs, 0
+  mismatches both) — recorded plainly, because the only literal-heavy corpus
+  rows are `destructure` and `spread_assign`. New crux test
+  `composite_child_caches_the_whole_literal_walk` pins the equivalence (the
+  cached shape is exactly the walk's, keyed by the full list, and the walk does
+  not populate the cache). Gates: fmt clean, clippy workspace `-D warnings`
+  clean, workspace **5,546 passed / 0 failed** (crux +1), runtime
+  `--no-default-features` 953/0, v8 `simdutf` 380/0, `cli
+  --no-default-features --features jit` green, test262 `all`
+  48,464/0/0/0 of 48,622 and `intl402` 3,205/0/0/0 of 3,357 at 15s/15s, corpus
+  parity 77 rows/0 mismatches, `--jit-bench` in band (arithmetic 0.07, function
+  calls 0.16, non-leaf call 0.49). No wasm sweep owed (`wasmtest` does not link
+  `crates/jit`; the change is `crux`+`runtime` and IS covered by both test262
+  areas). The G3 residual is now recorded as a `crux` lever (object size /
+  allocation sinking), not an inline path, so it is not re-opened here.
