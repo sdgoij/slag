@@ -480,8 +480,34 @@ The list, in the measured order:
   gap to node is the builtin-call path (a method read + `CallSlow` per
   `s.charCodeAt`), not string building — that is G10/CallSlow territory.
 - **G3/G4/G5 status.** G3 landed (above, with its residual in `crux`), G4 landed
-  as **G17**, and G5 landed as the template append above; the remaining Stage-6
-  item is the non-fused `ForOfNext` / `ForInNext` advances.
+  as **G17**, and G5 landed as the template append above.
+- **G4's residue — the non-fused `ForOfNext` / `ForInNext` — closed by
+  measurement, not landed.**
+
+  - **`ForOfNext` (the stack variant) has 0 corpus calls.** It is emitted only
+    when the for-of head binding is a CONTEXT slot, which happens only when a
+    closure in the body captures the head — and a captured head emits
+    `EnterPerIteration`/`PerIteration`, i.e. a spec-required fresh environment
+    plus a closure allocation per iteration. The shape is therefore
+    allocation-bound (the same reason the for-in head-let row is), so inlining
+    the advance cannot pay; the G17 cursor is allocated for every certified
+    for-of anyway, so the change would be small, but with no measurable shape
+    behind it the plan's bar is not met.
+  - **`ForInNext` is 9.1M over one row, but the compiled step is within ~3.5%
+    of the interpreter.** The for-in `fast` verdict and the generation-skip
+    per-key check already landed (2026-09-06, `.notes/perf.md`), as did the
+    `ForInBegin` enumeration cache, so `control/for_in.js` is 34.9 ms jit /
+    49.7 ms jitless and the protocol is *not* the row's cost. Isolating it
+    (150k re-entries of a 5-key loop): a for-in with no computed read is
+    **8.53 ms jit** against an equivalent plain `for (i = 0; i < 5; i++) n += 1`
+    loop at **1.82 ms**, so the whole protocol is 6.7 ms — but the interpreter's
+    is 5.5 ms (19.03 − 13.56), i.e. **the compiled step's only deficit is the
+    helper call, ~1.2 ms of a 34.9 ms row (~3.5%)**. Inlining it needs a
+    FIVE-slot frame cursor (keys pointer/length/index, base pointer,
+    generation) plus a machine-readable `keys` element layout, and the row's
+    real cost is the `o[k]` computed read on a non-Array object
+    (`GetMemberComputed` 5.25M in the same directory — a per-site-IC surface,
+    Stage 7), not the protocol. Recorded so it is not re-opened as an inline.
 - **G6/G7/G8 — cell capacity, the register path's one shape, no feedback.**
   G8 is now load-bearing for a sharper reason: G9, G10 and G11 are each a
   *missing inline path*, and doing them one at a time is how the current
@@ -587,8 +613,13 @@ The list, in the measured order:
   (string building) landed** as the template-append rope (§3 G5): the
   coercion/integer path had already landed in 2026-09-07, and the remaining
   `string_units_of`/`from_utf16` rebuild per substitution was quadratic —
-  18-substitution build loop 929 → 473 ms. Still open: the non-fused
-  `ForOfNext` / `ForInNext` advances.
+  18-substitution build loop 929 → 473 ms. **The non-fused `ForOfNext` /
+  `ForInNext` are closed by measurement** (§3 G4's residue): `ForOfNext` has 0
+  corpus calls (a captured head, which forces per-iteration envs and closures —
+  allocation-bound), and the compiled `ForInNext` is within ~3.5% of the
+  interpreter (its deficit is the helper call alone, 1.2 ms of the 34.9 ms
+  `control/for_in.js` row, whose real cost is the `o[k]` computed read). That
+  completes Stage 6.
 - **Stage 7 — G6/G8, cells and feedback.** Capacity for the colliding cells,
   and a per-site feedback record so the inline paths above become a mechanism
   rather than a set of bespoke arms.
@@ -1061,3 +1092,33 @@ One line per landed stage, newest last. This log is the arc's journal —
   per `s.charCodeAt`), not string building, and belongs to G10/CallSlow.
   No wasm sweep owed (`wasmtest` does not link `crates/jit`; the change is
   `runtime` and IS covered by both test262 areas).
+- **Stage 6 closed — the non-fused `ForOfNext` / `ForInNext` measured, not
+  landed (2026-09-28).** Stage 6's last item was the two protocol steps G17
+  left on the helper. Measuring them first (the plan's own rule) closed both:
+
+  `ForOfNext` (the stack variant, the census's 21.0M was the *fused*
+  `ForOfNextBindLocal` that G17 inlined) now shows **0 corpus calls** — it is
+  emitted only for a for-of head bound to a CONTEXT slot, i.e. only when a body
+  closure captures the head, which also emits `EnterPerIteration`/`PerIteration`
+  (a spec-required fresh env plus a closure per iteration). That shape is
+  allocation-bound for the same reason the for-in head-let row is, so the
+  advance cannot pay; the G17 cursor is allocated for every certified for-of, so
+  extending it would be cheap, but there is no measured shape behind it.
+
+  `ForInNext` is 9.1M over `control/for_in.js`, and the decomposition shows the
+  compiled step is already within ~3.5% of the interpreter: the `fast` verdict,
+  the generation-skip per-key check and the `ForInBegin` enumeration cache all
+  landed 2026-09-06 (`.notes/perf.md`), so the row is 34.9 ms jit / 49.7 ms
+  jitless. Isolated (150k re-entries of a 5-key loop, min-of-reps) a for-in
+  with no computed read is **8.53 ms jit** against an equivalent plain
+  `for (i = 0; i < 5; i++) n += 1` loop at **1.82 ms** — the whole protocol is
+  6.7 ms — while the interpreter's protocol is 5.5 ms (19.03 − 13.56). The
+  compiled step's deficit is therefore **the helper call alone, ~1.2 ms of a
+  34.9 ms row (~3.5%)**, and inlining it would need a five-slot frame cursor
+  (keys pointer/length/index, base pointer, generation) plus a
+  machine-readable `keys` element layout. The row's real cost is elsewhere: an
+  `o[k]` computed read on a non-Array object is ~35 ns of the 46.5 ns step
+  (`GetMemberComputed` 5.25M in the same directory), which is a per-site-IC
+  surface — **Stage 7**, not an inline arm. Recorded so neither is re-opened as
+  one. No code changed (the plan's method is exactly this: falsify by
+  measurement before investing).
