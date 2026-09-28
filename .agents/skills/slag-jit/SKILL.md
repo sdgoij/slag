@@ -856,3 +856,27 @@ is fine because blocks seal at `seal_all_blocks`.
   `GcAny` (its vtable/payload walk is unsound), and a smaller *static* array
   heap-spills for any `frame_size + stack_usage > N - JIT_STACK_SLACK`, i.e. a
   malloc per recursive call. Measure both directions before touching it.
+
+### 20.3 The shared-state hazard (the Phase 1 bug)
+
+**A nested self run shares the caller's Vm AND ctx. Any step that mutates
+caller-owned Vm state, or runs user code while building it, must be gated out of
+`self_call_eligible` — the self path does not resume the machinery those steps
+drive.** The bug that proved it: a self-eligible body whose base case is a
+*strict* tail call emits `TailCall*`, whose helper runs `tail_prepare_ordinary`
+(swapping `vm`'s frame/context for the tail callee) and sets `ctx.tail`;
+`self_call_inline` ignored both, so the outer body resumed on a Vm reset for
+another body and pushed the tail helper's placeholder — `10714` where the
+interpreter answers `11200`. The gate now excludes every `TailCall*`/`TailCallSelf*`
+variant, `ArgsBase`/`ArgsPush`/`ArgsSpread`, the vector `Call`, `Construct`,
+`TaggedTemplate`/`TailTaggedTemplate` and `SuperCall`. Two live traps for the
+next widening (2b, the general call):
+
+- **Do NOT run a non-self callee on the caller's Vm/ctx.** The callee's body,
+  closure environment, `globals_unshadowed`, and tail/suspend handling all
+differ; the tractable design is a **pooled private Vm** plus a cached per-callee
+  descriptor (entry/scope, `Function::environment`, `globals_unshadowed` — all
+  fixed per closure, so cacheable). Sharing is what produced the tail bug.
+- **`Vm::args` is live across `ArgsSpread` (it iterates a user iterator),** so a
+  nested run that clobbers it corrupts the outer argument build — the reason the
+  vector-call steps are gated, not just the `Call` step itself.

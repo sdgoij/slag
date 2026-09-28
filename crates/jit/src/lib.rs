@@ -3565,6 +3565,79 @@ run(); run(); run(); run(); run(); run(); run(); run(); run();";
         );
     }
 
+    #[test]
+    fn installed_jit_a_self_recursion_with_a_tail_base_matches_the_interpreter() {
+        // Hazard probe for the shared-Vm self path: a strict self-eligible
+        // body whose base case is a *tail call* emits `Helper::TailCall`, which
+        // calls `tail_prepare_ordinary` on the Vm and sets `ctx.tail`. In the
+        // nested (self-inlined) run the Vm and ctx are the caller's, so if the
+        // self path does not account for that, the outer body resumes on a Vm
+        // reset for another body and computes a wrong value.
+        let source = "\"use strict\";\n\
+            function g(x) { return x + 100; }\n\
+            function bench() {\n\
+              function f(n) { if (n <= 0) return g(7); return f(n - 1) + 1; }\n\
+              var s = 0;\n\
+              for (var i = 0; i < 100; i++) s += f(5);\n\
+              return s;\n\
+            }\n\
+            bench();";
+        let (jit_value, _) = run_self_call_program(source, true);
+        let (interp_value, _) = run_self_call_program(source, false);
+        assert_eq!(jit_value, interp_value, "jit vs interpreter:\n{source}");
+        assert_eq!(jit_value, 11200.0);
+    }
+
+    #[test]
+    fn installed_jit_self_call_hazards_match_the_interpreter() {
+        // Shapes whose steps touch caller-owned Vm state the nested self run
+        // would otherwise share: the argument vector (a spread call), the
+        // string builder, and the statement-completion register (a
+        // statement-position fused call-store). `ArgsSpread`/`Call`/
+        // `TaggedTemplate` are gated out of self-call eligibility; the builder
+        // and completion register are not, so this test is what keeps them
+        // honest.
+        let shapes: &[(&str, f64)] = &[
+            (
+                "function h() { var t = 0; for (var i = 0; i < arguments.length; i++) t += arguments[i]; return t; }\n\
+                 function bench() {\n\
+                   function f(n) { var a = [1, 2, 3]; if (n <= 0) return h(...a); return f(n - 1) + 1; }\n\
+                   var s = 0;\n\
+                   for (var i = 0; i < 100; i++) s += f(5);\n\
+                   return s;\n\
+                 }\n\
+                 bench();",
+                1100.0,
+            ),
+            (
+                "function bench() {\n\
+                   function f(n) { var s = \"\"; for (var i = 0; i < 3; i++) s += n; if (n <= 0) return s; return f(n - 1) + s; }\n\
+                   var out = 0;\n\
+                   for (var i = 0; i < 100; i++) out += f(3).length;\n\
+                   return out;\n\
+                 }\n\
+                 bench();",
+                1200.0,
+            ),
+            (
+                "function bench() {\n\
+                   function f(n) { var r; if (n <= 0) return 0; r = f(n - 1); return r + 1; }\n\
+                   var s = 0;\n\
+                   for (var i = 0; i < 100; i++) s += f(5);\n\
+                   return s;\n\
+                 }\n\
+                 bench();",
+                500.0,
+            ),
+        ];
+        for (source, expected) in shapes {
+            let (jit_value, _) = run_self_call_program(source, true);
+            let (interp_value, _) = run_self_call_program(source, false);
+            assert_eq!(jit_value, interp_value, "jit vs interpreter:\n{source}");
+            assert_eq!(jit_value, *expected, "absolute:\n{source}");
+        }
+    }
+
     /// Run `source` to completion, installing a fresh JIT cache when `jit` is
     /// set, and return the script's numeric result and the compiled-body
     /// count.

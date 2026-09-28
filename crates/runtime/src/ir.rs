@@ -1774,6 +1774,12 @@ impl CompiledBody {
     ///   close / resume machinery spans one activation, and only the top
     ///   frame is saved on suspension.
     /// - No `CallApply` (a direct-eval callee must run in the caller's env).
+    /// - No step that runs user code while building caller-owned Vm state, or
+    ///   that mutates that state itself: a tail call (`tail_prepare_ordinary`
+    ///   swaps `Vm`'s frame/context and sets `ctx.tail`, which the self path
+    ///   does not resume) and the vector-call / template / construct steps
+    ///   (they build or consume `Vm::args`, which an `ArgsSpread` over a user
+    ///   iterator can leave half-built across a re-entry).
     ///
     /// Everything else falls back to `call_slow`'s interpreter path.
     pub(crate) fn self_call_eligible(&self) -> bool {
@@ -1814,6 +1820,29 @@ impl CompiledBody {
                     | Step::Await { .. }
                     | Step::NewTarget
                     | Step::CreateArguments { .. }
+                    // These run user code or mutate caller-owned Vm state the
+                    // nested run shares: a `TailCall*` calls
+                    // `tail_prepare_ordinary` (swapping `vm`'s frame/context
+                    // and setting `ctx.tail`), and the vector-call and
+                    // template/construct steps build or consume `Vm::args`
+                    // (an `ArgsSpread` iterating a user iterator can re-enter
+                    // with the vector half-built).
+                    | Step::TailCallFast { .. }
+                    | Step::TailCall { .. }
+                    | Step::TailCallFastGlobal { .. }
+                    | Step::TailCallFastSlot { .. }
+                    | Step::TailCallSelf { .. }
+                    | Step::TailCallSelfCheck { .. }
+                    | Step::TailCallSelfVector
+                    | Step::TailCallSelfCheckVector
+                    | Step::ArgsBase
+                    | Step::ArgsPush
+                    | Step::ArgsSpread
+                    | Step::Call { .. }
+                    | Step::Construct { .. }
+                    | Step::TaggedTemplate(_)
+                    | Step::TailTaggedTemplate(_)
+                    | Step::SuperCall
             )
         })
     }

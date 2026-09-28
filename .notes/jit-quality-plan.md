@@ -587,12 +587,18 @@ The list, in the measured order:
   compiled call still pays the full `ordinary_call` -> `run_compiled_body` ->
   `run_jit_body` funnel (Vm pool take/return, execution-context push,
   `globals_unshadowed` chain walk, ctx build, 64-slot work-buffer init, root
-  registration). Running a non-self callee on the caller's ctx needs the
-  callee's *scope/entry* and its *closure environment* at the call site, which
-  the caller does not have; the tractable subset is a callee that reads neither
-  its context (`LoadContext`/`PerIter`) nor `this` and whose `LoadIdent` reads
-  can be shown unshadowed — a per-callee descriptor (the `LeafCallRecord`
-  shape, extended past leaves) plus a `run_compiled_body`-lite helper.
+  registration). **A correctness bug in Phase 1 was found and fixed while
+  beginning 2b (2026-09-28, §8):** a self-eligible body whose base case is a
+  *strict tail call* corrupted the caller, because the nested `Helper::TailCall`
+  runs `tail_prepare_ordinary` on the **shared** Vm and sets `ctx.tail`, which
+  the self path ignored. That is the hazard class 2b must not repeat: **2b must
+  run the callee on a pooled (private) Vm, not the caller's**, and cache a
+  per-callee descriptor — the compiled entry/scope, the closure **environment**
+  (`Function::environment`, fixed per closure), and `globals_unshadowed` (also
+  fixed per closure, since a certified body's env chain to the global is
+  immutable) — so the hash lookup, globals walk, ctx build and Vm reset are
+  skipped without sharing state. That is its own design pass, not a Phase-1
+  widening.
 - **G6/G7 and the feedback record — cell capacity, the register path's one shape,
   per-site feedback.** G8 landed (above, Stage 7) as a key→atom cell, not the
   value cell the census implied, because the in-place store discipline forbids a
@@ -1545,3 +1551,40 @@ One line per landed stage, newest last. This log is the arc's journal —
   test262 `all` 48,464 pass / 0 fail / 0 crash / 0 hang of 48,622; `intl402`
   3,205 pass / 0 fail of 3,357; corpus parity 77 rows 0 mismatches; `--jit-bench`
   all `result-ok`. No wasm sweep owed.
+- **Stage 7, G21 — the Phase 1 self path corrupted a caller on a strict tail
+  base case; fixed by widening the eligibility gate (2026-09-28).** Found while
+  beginning Phase 2b: a self-eligible body whose base case is a **strict tail
+  call** ("use strict"; `function f(n) { if (n <= 0) return g(7); return
+  f(n-1)+1; }`) returned **10714 where the interpreter returns 11200**. Root
+  cause: the nested self run shares the caller's Vm, and a `TailCall*` step
+  calls `Helper::TailCall` -> `tail_prepare_ordinary`, which swaps `vm`'s
+  frame/context for the tail callee and sets `ctx.tail`; `self_call_inline`
+  ignored both, so the outer body resumed on a Vm reset for another body and
+  pushed the tail helper's placeholder as the call result. The bug is in the
+  committed Phase 1 (`212a6aa5`), and the phase-1 gates did not catch it because
+  no differential shape exercised a strict self-recursive body with a tail base
+  case. **Fix:** `CompiledBody::self_call_eligible` (`crates/runtime/src/ir.rs`)
+  now also excludes every step that runs user code while building caller-owned
+  Vm state, or mutates that state itself — all `TailCall*`/`TailCallSelf*`
+  variants, `ArgsBase`/`ArgsPush`/`ArgsSpread`, the vector `Call`, `Construct`,
+  `TaggedTemplate`/`TailTaggedTemplate`, and `SuperCall`. Bodies that hit one of
+  these fall back to `CallSlow` (correct, just not fast); `fib` has none and
+  keeps the fast path (**38.4-39.3 ms**, unchanged). **Evidence:** the new
+  `installed_jit_a_self_recursion_with_a_tail_base_matches_the_interpreter`
+  (differential + absolute 11200) and
+  `installed_jit_self_call_hazards_match_the_interpreter` (a spread call, a
+  string builder, and a statement-position fused call-store inside the self
+  body; differential + absolutes 1100/1200/500). Mutation-checked: removing
+  `Step::TailCallFast` from the gate reintroduces the 10714 result, so the gate
+  is the fix rather than a coincidence. Rendered live in release: a scratch
+  corpus row reads 11200 in both modes. **Design consequence for 2b:** the
+  shared-Vm/ctx assumption is the hazard source; a general compiled call must
+  run the callee on a **pooled private Vm** and carry a cached per-callee
+  descriptor (entry/scope, closure `environment`, `globals_unshadowed`), none of
+  which is available to Phase 1's shared-ctx shape (see §3). Gates: fmt; clippy
+  `-D warnings` (workspace, all-targets); `cargo test --workspace` green;
+  `-p jit --lib` 238; `-p runtime --no-default-features --lib` 953; `-p v8
+  --features simdutf --lib` 380; `-p cli --no-default-features --features jit`;
+  test262 `all` 48,464 pass / 0 fail / 0 crash / 0 hang of 48,622; `intl402`
+  3,205 pass / 0 fail of 3,357; corpus parity 77 rows 0 mismatches. No wasm
+  sweep owed.
