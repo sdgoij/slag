@@ -465,6 +465,11 @@ impl FunctionTemplate {
             construct,
             function_prototype,
         )?;
+        // A `v8::Function` is the host's own code: it may call back into the
+        // engine before it returns (deno's ops evaluate the next script), so
+        // the interpreter must run it on its own activation rather than under
+        // its caller's dispatch frame (`.notes/embedding.md` §9).
+        crate::function::mark_host_reentrant(function.id());
 
         // The constructor's `.prototype`: an ordinary object whose prototype is
         // %Object.prototype%, or the parent's `.prototype` when this template
@@ -1034,7 +1039,11 @@ pub(crate) fn host_function(
             Ok(Value::Object(instance))
         }
     });
-    Function::create_builtin(name, 0, call, constructible.then_some(construct), prototype)
+    let function =
+        Function::create_builtin(name, 0, call, constructible.then_some(construct), prototype)?;
+    // A host accessor is the host's own code and may re-enter (see `get_function`).
+    crate::function::mark_host_reentrant(function.id());
+    Ok(function)
 }
 
 /// The `.prototype` property of the `newTarget` — the instance's prototype.

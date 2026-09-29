@@ -1957,3 +1957,58 @@ One line per landed stage, newest last. This log is the arc's journal —
   skip and `intl402` 3,205 / 0 fail / 152 skip, both baseline; the eight wasm
   suites 64,594 / 0 fail / 0 pending and JS-API 1,001 / 0 fail; corpus parity 0
   mismatches (71.1-72.0 `mean-jitGap`, within the runner's spread).
+- **The builtin-arm withdrawal re-gated: a marked host callback withdraws, an
+  engine built-in runs in place (2026-09-29).** A `main`-vs-`feature/v8`
+  comparison (the operator's suspicion: the branch's features cost performance)
+  found one real, attributable regression and one diffuse one. **The
+  attributable one:** `4ed011bd` made `fast_call_core` *withdraw* the two arms
+  that run a builtin in place — the registered-handler arm and the crux-native
+  closure arm — recording a `PendingCall` and letting the driver run it with the
+  dispatch frame popped, for deno's re-entrant op depth (`op_load_ext_script` →
+  `evaluate → JS` reached 13 levels on a 2 MiB thread; 98/106 after the
+  withdrawal). But **deno's ops are `FunctionTemplate` closures** (`crates/v8`'s
+  own snapshot doc says so, and `register_builtin_handler` is `pub(crate)` whose
+  only caller is `Intrinsics::define`) — so every *engine* builtin
+  (`Math.abs`, `Map.prototype.get`, `String.prototype.charCodeAt`, JSON, the
+  typed-array methods) paid a `Box<PendingCall>` and a driver round-trip per
+  call for a re-entry it cannot perform per cycle. Measured on the two release
+  binaries, `--jitless`, min of N: `Math.abs` ×4M **199 → 369 ms (1.85×)**, `Map.get` ×4M
+  388-412 → 498-515 (1.26×), `charCodeAt` ×4M 301-362 → 467-488 (1.5×);
+  `--jit-bench`'s `builtin call` row **interp 4.9 → 9.0 ms (1.84×)**, jit 2.33 →
+  3.40 (1.46×). **The fix is a re-entrancy bit, folded into the verdict the
+  dispatch cell already caches**: `crate::function::mark_host_reentrant(id)` (a
+  `HOST_REENTRANT` thread-local `IdMap` mirroring `BUILTIN_HANDLERS`) is called
+  by the embedding boundary for every function it creates
+  (`FunctionTemplate::get_function`, `api`'s `host_function`);
+  `Agent::builtin_call_lookup` folds `host_reentrant(id)` into
+  `BuiltinCall::{Handler, Native}` so the hot path stays one cell hit; and
+  `fast_call_core` withdraws only when the bit is set, else runs the handler or
+  the native closure in place and lands the result. **Measured after:** `Math.abs`
+  357 → **191 ms**, `Map.get` 498-515 → **318-342** (main 401-404), `charCodeAt`
+  467-488 → **297-321** (main 319-352), `--jit-bench` `builtin call` interp 9.0 →
+  **4.85 ms** (main 4.9-5.1) — the interpreter rows are back at `main` (a
+  residual ~1.1× on the *jit* row, 2.75 vs main 2.4, is the JIT helpers' now
+  always-called `complete_pending_call`; named as a follow-up, not fixed here).
+  **Tests:** three ladders share a builder — a `mark_host_reentrant`ed handler and
+  native reach **≥50** levels on a 2 MiB thread (the deno shape), and an unmarked
+  native and an unmarked handler reach **< half** that (the engine shape), so
+  both mutations (drop the gate, or withdraw every builtin again) fail their own
+  test. **A trap this cost real time to clear, recorded because it is a property
+  of the engine, not of this change:** the first cut put the bit in
+  `FunctionKind::Builtin`, growing `FunctionKind` 40 → 48 and `Function` 128 →
+  136; that shifted arena/GC timing and made
+  `snapshot::a_host_callback_round_trips_through_the_table` abort on a garbage
+  `bound_args.len()`. Isolated by control — the same size change with the gate
+  forced back to "always withdraw" still crashed, and a `println!` in the test
+  alone made it pass — so it is **pre-existing**: the test holds decoded values
+  as bare `Value`s in a Rust `Vec`, which the collector cannot see, so it passes
+  only while no collection happens to fire during its window
+  (`.notes/embedding.md` §5's documented aliasing hazard). The bit therefore
+  lives in the runtime, not in `crux`, and `Function` is byte-identical to HEAD.
+  **Gates:** fmt and clippy (`--locked --workspace --all-targets -D warnings`)
+  clean; `cargo test --locked --workspace` **5,564 passed / 0 failed** across 38
+  binaries; test262 `all` **48,464 / 0 fail / 158 skip of 48,622** and `intl402`
+  **3,205 / 0 fail / 152 skip of 3,357**, both 100% of runnable; the eight wasm
+  `run --strict` suites 20,662 + 25,990 + 77 + 7,485 + 105 + 654 + 8,709 + 912 =
+  **64,594 checks, 0 fail / 0 pending**, JS-API **1,001 / 0**; corpus **77 rows /
+  0 mismatches**, `mean-jitGap` 70.94.

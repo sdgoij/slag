@@ -1966,11 +1966,19 @@ pub(crate) type BuiltinHandler = fn(&mut Agent, &Value, &[Value]) -> Result<Valu
 #[derive(Clone, Copy)]
 pub(crate) enum BuiltinCall {
     /// Run this registered agent-dependent handler (Cut 79/81).
-    Handler(BuiltinHandler),
+    Handler {
+        handler: BuiltinHandler,
+        /// See [`host_reentrant`]: the function is a host callback that may
+        /// re-enter the engine, so the interpreter withdraws its frame first.
+        reentrant: bool,
+    },
     /// A crux-native builtin whose own closure runs directly (Cut 80): the
     /// `builtin_dispatch_cache` verdict is 0 and the function carries a
     /// `FunctionKind::Builtin { call: Some(..) }`.
-    Native,
+    Native {
+        /// See [`host_reentrant`].
+        reentrant: bool,
+    },
     /// Neither: fall through to the general call path.
     Other,
 }
@@ -1985,6 +1993,33 @@ thread_local! {
     /// `intrinsics.get` lookups per call for the Array members).
     static BUILTIN_HANDLERS: std::cell::RefCell<crate::agent::IdMap<BuiltinHandler>> =
         std::cell::RefCell::new(std::collections::HashMap::default());
+}
+
+thread_local! {
+    /// Built-ins the host boundary created and marked re-entrant
+    /// ([`mark_host_reentrant`]): a `v8::Function` or an op, whose native body
+    /// may run JavaScript that nests before it returns. Keyed by the
+    /// process-unique function id like [`BUILTIN_HANDLERS`], so it is filled
+    /// once per host function and read only when a call's verdict is first
+    /// computed (the agent's direct-mapped cell caches the answer).
+    static HOST_REENTRANT: std::cell::RefCell<crate::agent::IdMap<()>> =
+        std::cell::RefCell::new(std::collections::HashMap::default());
+}
+
+/// Mark the built-in `id` as a host callback that may re-enter the engine
+/// before it returns. The embedding boundary calls this for every function it
+/// creates (`FunctionTemplate::get_function`), which is what keeps deno's ops
+/// off the native-stack ladder: a caller that would keep its dispatch frame
+/// live across the call withdraws it first (`.notes/embedding.md` §9). An
+/// engine-defined built-in is never marked and runs in place.
+pub(crate) fn mark_host_reentrant(id: u64) {
+    HOST_REENTRANT.with(|set| set.borrow_mut().insert(id, ()));
+}
+
+/// Whether [`mark_host_reentrant`] marked `id`; false for every engine-defined
+/// built-in.
+pub(crate) fn host_reentrant(id: u64) -> bool {
+    HOST_REENTRANT.with(|set| set.borrow().contains_key(&id))
 }
 
 /// An installed builtin constructor's native construct handler (the

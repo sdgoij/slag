@@ -13418,42 +13418,57 @@ impl Vm {
                 crux::function::FunctionKind::Builtin { call: Some(_), .. }
             );
             match agent.builtin_call_lookup(function.id(), is_native) {
-                // A registered builtin's handler and a crux-native closure are
-                // host-reachable callables that may re-enter JS (deno's ops
-                // evaluate the next script), so they run on their own
-                // activation like any other call: run here, they would keep
-                // this body's dispatch frame live for the whole re-entry (see
-                // `.notes/embedding.md` §9). The record carries the callable
-                // itself, so the driver runs exactly what this arm ran — no
-                // second dispatch lookup.
-                crate::function::BuiltinCall::Handler(handler) => {
-                    debug_assert!(self.pending_call.is_none());
-                    self.pending_call = Some(PendingCall::Handler {
-                        handler,
-                        this,
-                        arg_start,
-                        argc,
-                        below,
-                    });
-                    return Ok(());
-                }
-                // Warm crux-native builtins (Math/JSON/typed-array methods
-                // whose body is a plain `NativeFn`): the function's own
-                // native closure is the whole call. Only the closure case
-                // withdraws; a `call: None` builtin keeps falling through.
-                crate::function::BuiltinCall::Native => {
-                    if matches!(
-                        &function.kind,
-                        crux::function::FunctionKind::Builtin { call: Some(_), .. }
-                    ) {
+                // A registered builtin's handler — an agent-dependent engine
+                // method (the Map/Set/String/Array members `Intrinsics::define`
+                // installs). Only a host callback withdraws (see the
+                // crux-native note below); a handler the engine registered runs
+                // in place, its own body being the whole call.
+                crate::function::BuiltinCall::Handler { handler, reentrant } => {
+                    if reentrant {
                         debug_assert!(self.pending_call.is_none());
-                        self.pending_call = Some(PendingCall::Native {
-                            callee,
+                        self.pending_call = Some(PendingCall::Handler {
+                            handler,
                             this,
                             arg_start,
                             argc,
                             below,
                         });
+                        return Ok(());
+                    }
+                    let result = handler(agent, &this, args)?;
+                    self.stack.truncate(arg_start - below);
+                    self.stack.push(result);
+                    return Ok(());
+                }
+                // Warm crux-native builtins (Math/JSON/typed-array methods
+                // whose body is a plain `NativeFn`): the function's own
+                // native closure is the whole call. A host callback among
+                // them (`mark_host_reentrant` — a `v8::Function`, an op) may
+                // run JavaScript that nests before it returns, so it
+                // withdraws and runs on its own activation; every
+                // engine-defined built-in runs in place, where a
+                // `valueOf`/callback it triggers returns before it does and
+                // pays no frame per cycle. A `call: None` builtin keeps
+                // falling through.
+                crate::function::BuiltinCall::Native { reentrant } => {
+                    if let crux::function::FunctionKind::Builtin {
+                        call: Some(native), ..
+                    } = &function.kind
+                    {
+                        if reentrant {
+                            debug_assert!(self.pending_call.is_none());
+                            self.pending_call = Some(PendingCall::Native {
+                                callee,
+                                this,
+                                arg_start,
+                                argc,
+                                below,
+                            });
+                            return Ok(());
+                        }
+                        let result = native(&this, args)?;
+                        self.stack.truncate(arg_start - below);
+                        self.stack.push(result);
                         return Ok(());
                     }
                 }

@@ -1821,15 +1821,26 @@ mod tests {
         );
     }
 
+    /// Which of `fast_call_core`'s two builtin arms a ladder's `op` reaches,
+    /// and whether it carries `mark_host_reentrant`. `Marked*` is the
+    /// host-callback shape (withdraws); `Plain*` is an engine-defined built-in
+    /// (runs in place). `MarkedHandler`/`PlainHandler` use the
+    /// registered-handler arm, `MarkedNative`/`PlainNative` the crux-native
+    /// closure arm (a plain closure builtin with the dispatch verdict pinned
+    /// to "run its own closure", index 0 in `function.rs` — the arm an op
+    /// reaches after its first call).
+    #[derive(Clone, Copy, Debug)]
+    enum ReentryArm {
+        MarkedHandler,
+        MarkedNative,
+        PlainNative,
+        PlainHandler,
+    }
+
     /// The depth a JS→host→JS ladder reaches on a 2 MiB thread. `next`
     /// recurses through `op`, a host function that re-enters JS — deno's
     /// bootstrap shape (`loadExtScript` → `op_load_ext_script` → evaluate).
-    /// `native_arm` picks which of `fast_call_core`'s two builtin arms the
-    /// call takes: the registered-handler arm, or the crux-native closure arm
-    /// (a plain closure builtin with the dispatch verdict pinned to "run its
-    /// own closure", index 0 in `function.rs` — the arm an op reaches after
-    /// its first call).
-    fn host_reentry_depth(native_arm: bool) -> f64 {
+    fn host_reentry_depth(arm: ReentryArm) -> f64 {
         fn reenter(agent: &mut Agent, _this: &Value, _args: &[Value]) -> Result<Value, JsError> {
             let global = agent.running_context()?.realm.global_object;
             let next = global.get(&JsString::from_utf8("next"))?;
@@ -1843,34 +1854,49 @@ mod tests {
                 let mut agent = Agent::new();
                 agent.initialize_host_defined_realm().unwrap();
                 let global = agent.running_context().unwrap().realm.global_object;
-                let op = if native_arm {
-                    // A `NativeFn` has no agent parameter, so it re-enters the
-                    // way the bridge's host callbacks do: through the TLS
-                    // agent `crux::function` carries for the running body.
-                    let op = crux::function::Function::create_builtin(
-                        Some(JsString::from_utf8("op")),
-                        0,
-                        Box::new(move |_this, _args| {
-                            let next = global.get(&JsString::from_utf8("next"))?;
-                            crux::function::call(&next, Value::Undefined, &[])
-                        }),
-                        None,
-                        None,
-                    )
-                    .unwrap();
-                    agent.builtin_dispatch_cache.insert(op.id(), 0);
-                    op
-                } else {
-                    let op = crux::function::Function::create_builtin(
-                        Some(JsString::from_utf8("op")),
-                        0,
-                        Box::new(|_, _| Ok(Value::Undefined)),
-                        None,
-                        None,
-                    )
-                    .unwrap();
-                    crate::function::register_builtin_handler(op.id(), reenter);
-                    op
+                let op = match arm {
+                    ReentryArm::MarkedHandler | ReentryArm::PlainHandler => {
+                        let op = crux::function::Function::create_builtin(
+                            Some(JsString::from_utf8("op")),
+                            0,
+                            Box::new(|_, _| Ok(Value::Undefined)),
+                            None,
+                            None,
+                        )
+                        .unwrap();
+                        // A marked handler is the host-callback shape (a
+                        // `register_builtin_handler` op); an unmarked one is an
+                        // engine method and runs in place.
+                        if matches!(arm, ReentryArm::MarkedHandler) {
+                            crate::function::mark_host_reentrant(op.id());
+                        }
+                        crate::function::register_builtin_handler(op.id(), reenter);
+                        op
+                    }
+                    ReentryArm::MarkedNative | ReentryArm::PlainNative => {
+                        // A `NativeFn` has no agent parameter, so it re-enters the
+                        // way the bridge's host callbacks do: through the TLS
+                        // agent `crux::function` carries for the running body. A
+                        // marked one is the host-callback shape and withdraws; an
+                        // unmarked one is an engine-defined built-in (Math, a
+                        // typed-array method) and runs in place.
+                        let op = crux::function::Function::create_builtin(
+                            Some(JsString::from_utf8("op")),
+                            0,
+                            Box::new(move |_this, _args| {
+                                let next = global.get(&JsString::from_utf8("next"))?;
+                                crux::function::call(&next, Value::Undefined, &[])
+                            }),
+                            None,
+                            None,
+                        )
+                        .unwrap();
+                        if matches!(arm, ReentryArm::MarkedNative) {
+                            crate::function::mark_host_reentrant(op.id());
+                        }
+                        agent.builtin_dispatch_cache.insert(op.id(), 0);
+                        op
+                    }
                 };
                 global
                     .set(&JsString::from_utf8("op"), Value::Function(op), false)
@@ -1896,7 +1922,7 @@ mod tests {
     /// withdrew (`.notes/embedding.md` §9).
     #[test]
     fn a_host_handler_reentry_does_not_keep_the_dispatch_frame_live() {
-        let depth = host_reentry_depth(false);
+        let depth = host_reentry_depth(ReentryArm::MarkedHandler);
         assert!(
             depth >= 50.0,
             "a handler that re-enters JS must not pay the dispatch frame per cycle; \
@@ -1905,16 +1931,38 @@ mod tests {
     }
 
     /// The same for the crux-native closure arm, which is the one an op reaches
-    /// once its call has been memoized (`function.rs`'s verdict index 0). Before
-    /// this arm withdrew it reached 13 too.
+    /// once its call has been memoized (`function.rs`'s verdict index 0). It
+    /// withdraws because the op is a marked re-entering native
+    /// (`set_reentrant`); before this arm withdrew it reached 13 too.
     #[test]
     fn a_native_closure_reentry_does_not_keep_the_dispatch_frame_live() {
-        let depth = host_reentry_depth(true);
+        let depth = host_reentry_depth(ReentryArm::MarkedNative);
         assert!(
             depth >= 50.0,
             "a native closure that re-enters JS must not pay the dispatch frame per \
              cycle; a 2 MiB stack reached only depth {depth}"
         );
+    }
+
+    /// The gate's other half: an *unmarked* builtin is engine-defined — a
+    /// registered handler (`Map.get`, `String.prototype.charCodeAt`) or a
+    /// crux-native closure (`Math.abs`, a typed-array method) — whose own body
+    /// is the whole call, so it runs in place under the dispatch frame (the
+    /// built-in call path's fast shape; `.notes/embedding.md` §9). These
+    /// ladders have the marked shapes but are not marked, so they reach far
+    /// fewer levels — the mutation-catcher for the opposite mutation
+    /// (withdrawing every builtin again would make the depths equal).
+    #[test]
+    fn an_unmarked_builtin_runs_in_place_under_the_dispatch_frame() {
+        let marked = host_reentry_depth(ReentryArm::MarkedNative);
+        for arm in [ReentryArm::PlainNative, ReentryArm::PlainHandler] {
+            let plain = host_reentry_depth(arm);
+            assert!(
+                plain < marked / 2.0,
+                "an unmarked engine builtin ({arm:?}) must run in place: the marked \
+                 ladder reached {marked} and the unmarked one {plain}"
+            );
+        }
     }
 
     /// A computed key on an object *method*/getter/setter is the enclosing

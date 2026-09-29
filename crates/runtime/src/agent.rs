@@ -1592,11 +1592,21 @@ impl Agent {
         {
             return call;
         }
+        // A host callback's re-entrancy is a property the embedding boundary
+        // records once per function (`mark_host_reentrant`); an engine-defined
+        // built-in is never marked. Folding the bit into the cached verdict
+        // keeps the per-call cost a cell hit — the registry is read only when
+        // the verdict is first computed.
         let call = if let Some(handler) = crate::function::builtin_handler(id) {
-            crate::function::BuiltinCall::Handler(handler)
+            crate::function::BuiltinCall::Handler {
+                handler,
+                reentrant: crate::function::host_reentrant(id),
+            }
         } else if let Some(verdict) = self.builtin_dispatch_cache.get(&id) {
             if *verdict == 0 && is_native {
-                crate::function::BuiltinCall::Native
+                crate::function::BuiltinCall::Native {
+                    reentrant: crate::function::host_reentrant(id),
+                }
             } else {
                 crate::function::BuiltinCall::Other
             }
