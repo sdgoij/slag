@@ -3789,6 +3789,16 @@ run(); run(); run(); run(); run(); run(); run(); run(); run();";
              var d = new D();\n\
              function bench() { var s = 0; for (var i = 0; i < 100; i++) s += d.m(); return s; }\n\
              bench();",
+            // A strict body observing `arguments`: the unmapped object reads
+            // `Vm::call_args`, which the lane sets for the run.
+            "function f(a, b) { 'use strict'; return arguments.length + a + b; }\n\
+             function bench() { var s = 0; for (var i = 0; i < 100; i++) s += f(i, 2); return s; }\n\
+             bench();",
+            // The sloppy mapped form must fall back: its accessors alias the
+            // callee's parameter environment, which the lane does not build.
+            "function g(a) { a = 5; return arguments[0]; }\n\
+             function bench() { var s = 0; for (var i = 0; i < 100; i++) s += g(i); return s; }\n\
+             bench();",
         ];
         for source in programs {
             let (jit_value, compiled) = run_self_call_program(source, true);
@@ -3811,6 +3821,10 @@ run(); run(); run(); run(); run(); run(); run(); run(); run();";
         assert_eq!(run_self_call_program(programs[6], true).0, 5450.0);
         assert_eq!(run_self_call_program(programs[7], true).0, 200.0);
         assert_eq!(run_self_call_program(programs[7], false).0, 200.0);
+        assert_eq!(run_self_call_program(programs[8], true).0, 5350.0);
+        assert_eq!(run_self_call_program(programs[8], false).0, 5350.0);
+        assert_eq!(run_self_call_program(programs[9], true).0, 500.0);
+        assert_eq!(run_self_call_program(programs[9], false).0, 500.0);
     }
 
     #[test]

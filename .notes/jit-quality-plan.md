@@ -902,8 +902,26 @@ The list, in the measured order:
     run-to-run spread) — its method rows are leaves, which the leaf probe
     already inlines — so this slice's value is **coverage** of non-leaf methods,
     not a corpus number; `--jit-bench` does not regress (`non-leaf call`
-    5.9-6.3 ms). Mutation-checked: skipping the `this` bind fails the new
+    `5.9-6.3 ms`). Mutation-checked: skipping the `this` bind fails the new
     `probe()`/method shapes (`8.0` for `100.0`).
+- **Cut 1d — landed (2026-09-29): the `arguments` widening (the unmapped form
+  only).** `certified_callee_eligible` no longer refuses `arguments_slot`; the
+  lane sets `Vm::call_args` for the run (`mem::replace(&mut vm.call_args,
+  args.to_vec())`, only when the body has an `arguments` slot, so an ordinary
+  call stays allocation-free — the same swap `run_leaf_body` uses). Two
+  refusals remain: the **mapped** (sloppy) form, whose accessors alias the
+  callee's capture context the lane does not build, and a **cross-realm**
+  callee (the unmapped object is built from the *current* realm's intrinsics,
+  and a lane run pushes no context — the funnel pushes the callee's realm).
+  `Step::CreateArguments` left `has_shared_vm_step_hazard`; the self gate still
+  refuses it through `arguments_slot`. **Measured: neutral, and the arithmetic
+  says why** — an `arguments` body builds a fresh arguments object per call,
+  which dominates; the lane's ~80 ns of removed funnel work is inside the
+  per-call variance (lane off 4405-5421 ms, on 4496-4582 ms over the same
+  4M-call workload). So this slice is **gate uniformity, not speed**: the
+  refusals that remain are the ones that genuinely need machinery the lane
+  does not install. Mutation-checked: not setting `call_args` fails the strict
+  shape (`5166` for `5350`).
   - **Cut 2 — the `ExecutionContext`.** ~15 ns a call and load-bearing for the
     callee's env and for `e.stack`; the leaf path already omits it and still
     names frames, so cut 2 is to (a) set `vm.lexical_env` directly (not via
@@ -1919,3 +1937,23 @@ One line per landed stage, newest last. This log is the arc's journal —
   1,001 / 0 fail; corpus parity 0 mismatches. `arguments`-object callees still
   fall back (they need `Vm::call_args` and `create_arguments`), and so do
   methods using `super`.
+- **Stage 9, Cut 1d the `arguments` widening (2026-09-29).** `certified_callee_eligible`
+  now admits an `arguments_slot` body when its `CreateArguments` step is the
+  unmapped (strict) form, and the lane sets `Vm::call_args` for the run (the
+  `mem::replace` swap `run_leaf_body` uses, only when the slot exists, so an
+  ordinary call stays allocation-free). Two refusals remain and are in the gate:
+  the mapped (sloppy) form (its accessors alias the callee's capture context,
+  which the lane does not build) and a cross-realm callee (the unmapped object
+  is built from the current realm's intrinsics and a lane run pushes no context,
+  so compare `agent.current_realm()` against `record.realm`). `Step::CreateArguments`
+  left `has_shared_vm_step_hazard`; `self_call_eligible` still refuses it via
+  `arguments_slot`. **Measured: neutral** — lane off 4405-5421 ms against lane on
+  4496-4582 ms over the same 4M-call strict-`arguments` workload, because the
+  per-call arguments-object construction dominates and the lane's ~80 ns of
+  removed funnel work is inside the variance; so this slice is **gate
+  uniformity, not speed**. Mutation-checked: not setting `call_args` fails the
+  strict shape (`5166` for `5350`). Gates: fmt/clippy clean; workspace green
+  (`jit --lib` 239, `runtime --lib` 981); test262 `all` 48,464 / 0 fail / 158
+  skip and `intl402` 3,205 / 0 fail / 152 skip, both baseline; the eight wasm
+  suites 64,594 / 0 fail / 0 pending and JS-API 1,001 / 0 fail; corpus parity 0
+  mismatches (71.1-72.0 `mean-jitGap`, within the runner's spread).

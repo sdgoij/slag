@@ -909,6 +909,18 @@ produced a wrong answer first:
   a certified body is a frame-slot load (`LoadLocal { this_slot }`), not
   `ThisValue`, so it stays eligible. `self_call_eligible` keeps excluding
   `this_slot` — a self-call's receiver can differ from the running one.
+- **`arguments` bodies: the unmapped (strict) form only, and only same-realm.**
+  The lane sets `Vm::call_args` for the run via `mem::replace`, **only when
+  `scope.arguments_slot.is_some()`** — so an ordinary call stays
+  allocation-free (a `to_vec` `args` slice). `run_leaf_body` has the same swap.
+  Two refusals stay: the **mapped** (sloppy) form, whose per-name accessors
+  alias the callee's *capture context* which the lane does not build (and whose
+  names make `context_names` non-empty), and a **cross-realm** callee — the
+  unmapped object is built from the *current* realm's `%Object.prototype%` /
+  `%ThrowTypeError%` and a lane run pushes no context, so `current_realm` is the
+  caller's (compare it against `record.realm`; the funnel pushes the callee's
+  realm and is correct). `create_arguments` writes its slot through
+  `frame_get_mut`, so this depends on the `nested_frame` bullet below.
 - **Every per-activation `Vm` scratch register must be saved AND reset, not
   merely saved.** Use `Vm::save_scratch`/`restore_scratch` (defined in
   `ir.rs`): `ip`, `acc`, `loop_counter`, `loop_num`, the string builder

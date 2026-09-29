@@ -1796,23 +1796,41 @@ impl CompiledBody {
         !self.has_shared_vm_step_hazard()
     }
 
-    /// The certified-callee lane's gate: the self gate **minus** the `this`
-    /// requirement — the lane binds `OrdinaryCallBindThis` into the frame's
-    /// `this` slot, so a method, or a plain function that reads `this`, is
-    /// runnable — and **plus** the steps that read the *running context's*
-    /// `this` binding or home object, which a lane run does not install: every
-    /// `super` step and `ThisValue` (whose reader, `Vm::vm_this_binding`, walks
-    /// the current `ExecutionContext`; a plain `this` read in a certified body
-    /// is a frame-slot load, not `ThisValue`, so it stays eligible).
+    /// The certified-callee lane's gate. It is the self gate **minus** the
+    /// `this` and `arguments` requirements — the lane binds
+    /// `OrdinaryCallBindThis` into the frame's `this` slot (a method, or a plain
+    /// function that reads `this`, is runnable) and sets `Vm::call_args` for an
+    /// unmapped-`arguments` body — and **plus** the steps that read the
+    /// *running context's* `this` binding or home object, which a lane run does
+    /// not install: every `super` step and `ThisValue` (whose reader,
+    /// `Vm::vm_this_binding`, walks the current `ExecutionContext`; a plain
+    /// `this` read in a certified body is a frame-slot load, not `ThisValue`,
+    /// so it stays eligible).
     pub(crate) fn certified_callee_eligible(&self) -> bool {
         let Some(scope) = self.scope.as_ref() else {
             return false;
         };
-        if self.has_call_apply || !scope.context_names.is_empty() || scope.arguments_slot.is_some()
-        {
+        if self.has_call_apply || !scope.context_names.is_empty() {
             return false;
         }
         if self.has_shared_vm_step_hazard() {
+            return false;
+        }
+        // `arguments`: only the unmapped (strict) object, which reads just
+        // `Vm::call_args` — the lane sets that for the run (see
+        // `certified_call_inline`). The mapped (sloppy) form aliases the
+        // parameter bindings through per-name accessors over the callee's
+        // *capture context*, which the lane does not build (and whose names
+        // would make `context_names` non-empty anyway).
+        if self.steps.iter().any(|step| {
+            matches!(
+                step,
+                Step::CreateArguments {
+                    mapped: Some(_),
+                    ..
+                }
+            )
+        }) {
             return false;
         }
         !self.steps.iter().any(|step| {
@@ -1840,6 +1858,9 @@ impl CompiledBody {
     /// `vm`'s frame/context and setting `ctx.tail`), and the vector-call and
     /// template/construct steps build or consume `Vm::args` (an `ArgsSpread`
     /// iterating a user iterator can re-enter with the vector half-built).
+    /// `CreateArguments` is deliberately absent: the self gate refuses it via
+    /// `arguments_slot`, and the certified-callee gate admits only the unmapped
+    /// (strict) form, whose object reads `Vm::call_args`, which the lane sets.
     fn has_shared_vm_step_hazard(&self) -> bool {
         self.steps.iter().any(|step| {
             matches!(
@@ -1867,7 +1888,6 @@ impl CompiledBody {
                     | Step::Yield { .. }
                     | Step::Await { .. }
                     | Step::NewTarget
-                    | Step::CreateArguments { .. }
                     | Step::TailCallFast { .. }
                     | Step::TailCall { .. }
                     | Step::TailCallFastGlobal { .. }

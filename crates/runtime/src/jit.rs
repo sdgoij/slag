@@ -1961,22 +1961,33 @@ fn certified_call_inline(
     // Resolve the callee's registered record in one scoped borrow: a
     // generator/async body's call produces an iterator or a promise rather
     // than a run of the body, and a class constructor cannot be called at all.
-    let (body, environment, strict, global) = {
+    let (body, environment, strict, realm) = {
         let data = agent.ecma_functions.get(&function.id())?;
         if data.is_generator || data.is_async || data.is_class_constructor {
             return None;
         }
         let body = data.ir.clone()?;
-        (
-            body,
-            data.environment,
-            data.strict,
-            data.realm.global_object,
-        )
+        (body, data.environment, data.strict, data.realm)
     };
+    let global = realm.global_object;
     // The lane's gate: the self gate minus the `this` requirement (bound
     // below) plus the super/`ThisValue` machinery it cannot install.
     if !body.certified_callee_eligible() {
+        return None;
+    }
+    // An unmapped-`arguments` object is built from the *current* realm's
+    // intrinsics (`%Object.prototype%`, `%ThrowTypeError%`), and a lane run
+    // pushes no context, so `current_realm` is the caller's: a cross-realm
+    // callee would build its object in the wrong realm. Refuse that case — the
+    // funnel pushes the callee's realm and is correct.
+    if body
+        .scope
+        .as_ref()
+        .is_some_and(|scope| scope.arguments_slot.is_some())
+        && !agent
+            .current_realm()
+            .is_ok_and(|current| current.as_ptr() == realm.as_ptr())
+    {
         return None;
     }
     // Compile (or promote) through the same choke point every other JIT site
@@ -2071,12 +2082,20 @@ fn certified_call_inline(
     // `create_function_decl`) resolve `frame_get` through `nested_frame`, so
     // install the callee's buffer for the run — saving the previous value, so a
     // nested lane run stacks correctly. The shared cursors a nested run must
-    // not leak into are `save_scratch`'s.
-    let saved_nested = unsafe {
+    // not leak into are `save_scratch`'s. An unmapped-`arguments` body reads
+    // the call's argument slice through `Vm::call_args`, so set that too
+    // (mirroring `run_leaf_body`); the mapped (sloppy) form is refused by the
+    // gate.
+    let (saved_nested, saved_call_args) = unsafe {
         let vm = &mut *ctx.vm;
         let saved = vm.nested_frame;
         vm.nested_frame = Some(buf.as_mut_ptr());
-        saved
+        let call_args = if scope.arguments_slot.is_some() {
+            Some(std::mem::replace(&mut vm.call_args, args.to_vec()))
+        } else {
+            None
+        };
+        (saved, call_args)
     };
     // Root the buffer for the call's duration (the Vm is already registered
     // with the active-run tracer): a helper it invokes can allocate and
@@ -2135,6 +2154,9 @@ fn certified_call_inline(
         let vm = &mut *ctx.vm;
         vm.jit_roots.pop();
         vm.nested_frame = saved_nested;
+        if let Some(call_args) = saved_call_args {
+            vm.call_args = call_args;
+        }
         (
             vm.lexical_env,
             vm.body_context,
