@@ -830,17 +830,43 @@ The list, in the measured order:
     15-field save/restore is 10-15 ns — the same as the pooled take/reset
     (13 ns) it removes — so 8.2 nets ~zero. **The fix is not to share the Vm;
     it is to make the frame a record** (below).
-  - **Cut 1 — the `FrameRecord` + a per-Vm frame stack + the certified-call
-    lane.** A `FrameRecord { ip, lexical_env, body_context, current_function,
-    current_new_target, completion, completion_is_empty, switch_disc,
-    switch_disc_set, chain_short, globals_unshadowed, strict, tail_replaced,
-    pending_call }` (15 fields, `Copy`-ish) pushed on `Vm::frames: Vec<FrameRecord>`
-    with the frame/working area carved from a shared arena; a certified callee
-    (gated like `self_call_eligible`, plus no-tail) runs its entry on the
-    caller's Vm with the record pushed, and pops it on return. Cost: one push +
-    pop (~5 ns) against the 13 ns pool, and it makes the Phase-1 tail bug
-    structurally impossible (the record saves and restores `tail_replaced`).
-    The interpreter keeps the pool for uncertified callees initially.
+  - **Cut 1 — landed (2026-09-29): the certified-callee lane, and it is worth
+    2.7× on the row.** `call_slow` gained a second fast path beside the self
+    path (`self_call_inline`): a call to a *different* certified body resolves
+    the callee's record, takes the same gate (`self_call_eligible` plus a new
+    `private_frame_safe`), and runs its compiled entry directly on the caller's
+    ctx with a nested frame in a private buffer and its own `JitCallContext` —
+    no `do_call_fast`/`ordinary_call`/`run_compiled_body`/`run_jit_body`, no
+    pooled-Vm take/reset, no `ExecutionContext` push. `Vm::save_scratch`/
+    `restore_scratch` isolate the per-activation registers (`ip`, `acc`,
+    `loop_counter`, `loop_num`, the string builder, `completion`+
+    `completion_is_empty`, `switch_disc`+`switch_disc_set`, `chain_short`) and
+    the lane saves/restores the five control fields (`lexical_env`,
+    `body_context`, `current_function`, `current_new_target`, `strict`). The
+    self path uses the same `save_scratch` now (it had the same latent
+    clobber). Measured, A/B in one tree (`false &&` on the dispatch):
+    `--jit-bench` `non-leaf call` **14.59 → 5.40 ms** (ratio 0.54 → 0.21).
+    Three soundness rules fell out of the gates and are enforced by the gate
+    and the tests, not by hope:
+    - **A `vm.frame`-reading helper cannot run on a private-buffer frame.**
+      `builder_bind`/`builder_store`/`create_function_decl` read
+      `Vm::frame_get`, which the private buffer does not own, so a body with a
+      planned `s += e` loop or a hoisted block function declaration is refused
+      (`private_frame_safe`). A test caught this (a `mid`-style callee whose
+      `s += n` loop silently built into the caller's frame slot and returned
+      `0`), which is why the predicate exists.
+    - **Compiled binding reads must resolve from `vm.lexical_env`, not the
+      `ExecutionContext`.** `load_ident`/`typeof_ident`/`resolve_var_ident`/
+      `update_ident` called `resolve_binding`, which reads
+      `agent.running_context()` — the *caller's* env, since the lane pushes no
+      context. `context::resolve_binding_from(env, …)` is the fix; it is also
+      behavior-preserving for the funnel path (where the two envs are equal).
+      Without it the whole `resizable-buffer` fixture family failed with
+      `ReferenceError: "<global>" is not defined` under the lane.
+    - The gate stays conservative: `this`/`arguments`/capture contexts, try,
+      iterators, destructuring, suspension, tail and vector calls, generators,
+      async functions, class constructors and non-ECMA callees all fall back to
+      the funnel (which also ports and promotes them).
   - **Cut 2 — the `ExecutionContext`.** ~15 ns a call and load-bearing for the
     callee's env and for `e.stack`; the leaf path already omits it and still
     names frames, so cut 2 is to (a) set `vm.lexical_env` directly (not via
@@ -849,13 +875,35 @@ The list, in the measured order:
     `ExecutionContext` for certified calls.
   - **Cut 3 — the interpreter's activations** use the same frame stack, and
     cut 4 removes the pool entirely.
-  - **Before any of it, find the ~100 ns.** The redesign targets ~28 ns
-    (Vm + `ExecutionContext`) of a ~138 ns row; the other ~100 ns is
-    **unattributed** (8.0's region timers were defeated by nesting), and it is
-    not safe to redesign `Vm` blind at it. Cut 0 is a hot-path profile of the
-    release `non-leaf call` row (ablation builds, the project's usual method)
-    to locate that 100 ns first — the redesign should be aimed at it, and it
-    may turn out to be a smaller, non-architectural fix.
+  - **Cut 0 — done (2026-09-29): the cost is a chain, not one ~100 ns item,
+    and it is safe to aim the redesign at the whole chain.** The ablation plan
+    was replaced by an `rdtsc` exclusive-time profiler over 14 regions on the
+    release `non-leaf call` row (timing-only; removed again, `git diff crates/`
+    empty above it). Two facts first: `mid` **is** compiled — the callee's
+    machine code runs on every call (`jit_code` entries == call count) — and
+    there is no interpreter fallback (`vm.start` ran 16 times, the
+    pre-promotion warm-up). The instrumented row is 294.6 ns/call against the
+    uninstrumented 138 ns; the profiler's own ~11 ns per region-pair (14
+    pairs, ~157 ns) is the overhead, so leaf regions are pure and an
+    intermediate carries its children's entry/exit cost. Per-entry exclusive
+    ns (share): `run_compiled_body` 42.4 (14.4%), `run_jit_body` 40.0 (13.6%),
+    `ordinary_call` 28.1 (9.5%), `jit_code` 28.0 (9.5%), `complete_pending`
+    27.6 (9.4%), `do_call_fast` 24.9 (8.4%), `call_slow` 23.7 (8.1%),
+    `return_vm` 18.8 (6.4%), `with_jit_run` 18.5 (6.3%), then `globals_walk`
+    8.9, `lookup_info` 8.8, `setup_frame` 8.6, `take_vm` 8.1, `new_body_ctx`
+    8.0 (2.7-3.0% each). No region exceeds 14.4%, and the three clusters —
+    the interpreter round-trip (`do_call_fast`+`complete_pending`+
+    `ordinary_call`), the pooled-Vm round trip (`take_vm`+`return_vm`, both
+    pure readings, a real ~27 ns rather than the 13 ns the earlier isolated
+    probes suggested), and the JIT harness (`run_compiled_body`+
+    `run_jit_body`+`lookup_info`+`globals_walk`+`new_body_ctx`+`setup_frame`+
+    `with_jit_run`) — are all comparable. So the fix is to **collapse the
+    chain**, which is what the certified-call lane does: it removes the whole
+    interpreter round-trip and the pooled-Vm round trip at once rather than
+    shaving one item. The earlier "sharing the Vm does not pay" argument was
+    about a nested run **using `vm.frame`** (which must save 15 fields); the
+    self-path shape uses a private buffer and needs none of `ip`/`args`/
+    `completion`/`switch_*`/`tail_replaced`/`pending_call`.
   - **Traps:** the frame stack must be GC-traced (its values are live);
     `new_body_context` per frame; error-stack fidelity (cut 2); suspension and
     tail interaction (initially gated out); and `agent.jit_depth`/`ACTIVE_RUNS`
@@ -1756,3 +1804,41 @@ One line per landed stage, newest last. This log is the arc's journal —
   probes touched
   `crates/runtime/src/jit.rs` and `crates/runtime/src/function.rs` and were
   fully removed (both files match HEAD in content); only the plan differs.
+- **Stage 9, Cut 0 the call-side profile (2026-09-29).** An `rdtsc`
+  exclusive-time profiler over 14 regions on the release `non-leaf call` row
+  replaced the ablation plan (timing-only, removed again — `git diff crates/`
+  empty above it). Result: the row decomposes into a **chain of ~14 comparable
+  pieces, none over 14.4%**, not one ~100 ns item; `mid` is compiled and no
+  interpreter fallback runs in steady state (the `jit_code` entry count equals
+  the call count, `vm.start` ran 16 times). The two structural clusters are the
+  interpreter round-trip (`do_call_fast` 24.9 + `complete_pending` 27.6 +
+  `ordinary_call` 28.1 instrumented) and the pooled-Vm round trip (`take_vm`
+  8.1 + `return_vm` 18.8, both pure). This **revises Stage 9's Cut 1 shape**:
+  the lane is the self path's — a private frame/work buffer plus a per-callee
+  `JitCallContext`, entered from `call_slow`, saving only the handful of `Vm`
+  fields the callee reads — not a 15-field `FrameRecord` on `Vm::frames`
+  (that figure described sharing `vm.frame`). Numbers and the argument: §5
+  Stage 9's Cut 0 bullet. Only the plan differs from HEAD.
+- **Stage 9, Cut 1 the certified-callee lane (2026-09-29).** `call_slow` runs a
+  call to a *different* certified body's compiled entry directly (a nested
+  frame in a private buffer, its own `JitCallContext`) instead of the
+  interpreter funnel + pooled Vm. `Vm::save_scratch`/`restore_scratch` isolate
+  the per-activation registers; the lane saves/restores the five control
+  fields. **Measured A/B in one tree: `--jit-bench` `non-leaf call` 14.59 →
+  5.40 ms (ratio 0.54 → 0.21), 2.7×.** New gate `CompiledBody::
+  private_frame_safe` (a `vm.frame`-reading helper — the `s += e` builder, a
+  hoisted block function declaration — cannot run on a private-buffer frame),
+  and `context::resolve_binding_from` (compiled binding reads resolve from
+  `vm.lexical_env`, not the caller's `ExecutionContext`). A new differential
+  test (`installed_jit_a_certified_callee_matches_the_interpreter`) covers a
+  non-self callee with a `switch` under a fall-through caller, mutual
+  recursion, and a global-reading callee. Gates: fmt/clippy clean; workspace
+  green (`jit --lib` 239, `runtime --lib` 981, `crux` 260, `test262` 3324,
+  `v8` 372); test262 `all` **48,464 pass / 0 fail / 158 skip of 48,622** and
+  `intl402` **3,205 / 0 fail / 152 skip of 3,357** (both exactly baseline);
+  the eight wasm `run --strict` suites 20,662 + 25,990 + 77 + 7,485 + 105 +
+  654 + 8,709 + 912 = **64,594 checks, 0 fail / 0 pending**, JS-API **1,001 /
+  0 fail**; the corpus **77 rows / 0 mismatches**; no `--jit-bench` row
+  regressed. The `resolve_binding_from` change is additive and
+  behavior-preserving for the funnel path (the two envs are equal there), which
+  is why the sweeps reproduce the baseline exactly.

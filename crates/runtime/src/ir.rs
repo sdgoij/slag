@@ -1846,6 +1846,31 @@ impl CompiledBody {
             )
         })
     }
+
+    /// Whether a nested compiled run with its own private frame buffer (the
+    /// certified-call lane) is sound for this body: every frame-slot access
+    /// must go through the frame pointer the entry is handed. A step that
+    /// reaches a `vm.frame`-reading Rust helper instead would read or write the
+    /// *caller's* frame, so those bodies stay on the pooled-Vm path:
+    ///
+    /// - the `s += e` builder's bind/store (and, in the register body, its
+    ///   append) — `builder_bind`/`builder_store` read `Vm::frame_get`;
+    /// - a hoisted block function declaration's slot store
+    ///   (`create_function_decl` reads `Vm::frame_get_mut`).
+    ///
+    /// The other `vm.frame`-reading helpers (`catch_bind`, `for_of_*`,
+    /// `create_arguments`, `tail_call_self_vector`) are already excluded by
+    /// [`Self::self_call_eligible`].
+    pub(crate) fn private_frame_safe(&self) -> bool {
+        !self.steps.iter().any(|step| match step {
+            Step::BuilderBind { slot } | Step::BuilderStore { slot } => slot.is_some(),
+            Step::FunctionDeclInit { .. } => true,
+            Step::RunRegBody { ops } => ops
+                .iter()
+                .any(|op| matches!(op, LeafOp::BuilderAppend { .. })),
+            _ => false,
+        })
+    }
 }
 
 impl Trace for CompiledBody {
@@ -3127,6 +3152,21 @@ pub(crate) fn with_leaf_run<T>(vm: *mut Vm, body: *const CompiledBody, f: impl F
 }
 
 /// The resumable VM state. Saved across suspension by the driver.
+/// The caller's per-activation `Vm` scratch registers, saved across a nested
+/// certified JIT run on the shared `Vm` (see [`Vm::save_scratch`]).
+pub(crate) struct VmScratch {
+    ip: usize,
+    acc: Value,
+    loop_counter: f64,
+    loop_num: f64,
+    builder: Builder,
+    completion: Value,
+    completion_is_empty: bool,
+    switch_disc: Value,
+    switch_disc_set: bool,
+    chain_short: bool,
+}
+
 /// A per-Vm string builder for a planned `s += e` append loop.
 /// Live only while the loop runs; holds copied UTF-16 units, so it has no GC
 /// edges and needs no tracing. `owner` keys it to the accumulator slot so a
@@ -3606,6 +3646,52 @@ impl Vm {
             current_function: None,
             current_new_target: None,
         }
+    }
+
+    /// The per-activation scratch registers a nested certified run on the
+    /// shared `Vm` must neither observe nor clobber (the JIT's self-call and
+    /// certified-callee lanes): the `ip` span, the register-executor
+    /// accumulator and its counter/Numbers, the string builder, the
+    /// statement-completion register, and the `switch`/optional-chain control
+    /// flags. [`Vm::save_scratch`] saves and resets them; [`Vm::restore_scratch`]
+    /// puts the caller's back.
+    pub(crate) fn save_scratch(&mut self) -> VmScratch {
+        let scratch = VmScratch {
+            ip: self.ip,
+            acc: self.acc,
+            loop_counter: self.loop_counter,
+            loop_num: self.loop_num,
+            builder: std::mem::replace(&mut self.builder, Builder::inactive()),
+            completion: self.completion,
+            completion_is_empty: self.completion_is_empty,
+            switch_disc: self.switch_disc,
+            switch_disc_set: self.switch_disc_set,
+            chain_short: self.chain_short,
+        };
+        self.ip = 0;
+        self.acc = Value::Undefined;
+        self.loop_counter = 0.0;
+        self.loop_num = 0.0;
+        self.completion = Value::Undefined;
+        self.completion_is_empty = true;
+        self.switch_disc = Value::Undefined;
+        self.switch_disc_set = false;
+        self.chain_short = false;
+        scratch
+    }
+
+    /// Restore the scratch registers [`Vm::save_scratch`] saved.
+    pub(crate) fn restore_scratch(&mut self, scratch: VmScratch) {
+        self.ip = scratch.ip;
+        self.acc = scratch.acc;
+        self.loop_counter = scratch.loop_counter;
+        self.loop_num = scratch.loop_num;
+        self.builder = scratch.builder;
+        self.completion = scratch.completion;
+        self.completion_is_empty = scratch.completion_is_empty;
+        self.switch_disc = scratch.switch_disc;
+        self.switch_disc_set = scratch.switch_disc_set;
+        self.chain_short = scratch.chain_short;
     }
 
     /// Reset a pooled Vm for a new run (the per-call reuse): the Vec

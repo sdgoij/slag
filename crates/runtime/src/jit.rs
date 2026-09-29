@@ -1766,6 +1766,15 @@ extern "C" fn call_slow(
     {
         return result;
     }
+    // A call to a *different* certified body takes the same shape: its machine
+    // code runs directly, with a nested frame in a private buffer, instead of
+    // the interpreter funnel. `None` (an ineligible or not-yet-compiled callee)
+    // falls through to that funnel, which ports the callee and promotes it.
+    if direct_eval == 0
+        && let Some(result) = certified_call_inline(ctx, callee, args, argc)
+    {
+        return result;
+    }
     let argc = argc as usize;
     let agent = unsafe { &mut *ctx.agent };
     let vm = unsafe { &mut *ctx.vm };
@@ -1872,6 +1881,12 @@ fn self_call_inline(ctx: &mut JitCallContext, args: *mut u64, argc: u64) -> Opti
     let saved_end = ctx.buf_end;
     ctx.buf_end = unsafe { buf.as_mut_ptr().add(buf_len) } as *mut c_void;
     let array_len = unsafe { (&*ctx.vm).array_index_stack.len() };
+    // The nested activation shares the caller's `Vm`, so the per-activation
+    // scratch registers must not leak either way: a caller mid-`switch`
+    // (fall-through), mid-optional-chain, mid-`s += e` append loop, or writing
+    // an error span would otherwise have its live values read by the nested
+    // body or clobbered by it.
+    let saved_scratch = unsafe { (&mut *ctx.vm).save_scratch() };
     // Root the buffer for the call's duration (the Vm is already registered
     // with the active-run tracer, so `run_jit_leaf`'s per-run registration is
     // not needed): a helper it invokes can allocate and trigger a collection,
@@ -1897,8 +1912,215 @@ fn self_call_inline(ctx: &mut JitCallContext, args: *mut u64, argc: u64) -> Opti
         let vm = &mut *ctx.vm;
         vm.jit_roots.pop();
         vm.array_index_stack.truncate(array_len);
+        vm.restore_scratch(saved_scratch);
     }
     ctx.buf_end = saved_end;
+    Some(result)
+}
+
+/// The general certified-callee lane: a call to a *different* certified body
+/// runs its machine code directly on this ctx, with a nested frame in a
+/// private buffer, instead of the interpreter funnel (`do_call_fast` ->
+/// `ordinary_call` -> `run_compiled_body` -> `run_jit_body`: a pooled-Vm
+/// take/reset, an `ExecutionContext` push, a frame setup, a
+/// `globals_unshadowed` walk and a whole new ctx). It is [`self_call_inline`]'s
+/// shape generalised to any callee — the nested activation shares the caller's
+/// `Vm` and control state, and the gate (`self_call_eligible`) is exactly the
+/// guarantee that the body reads or writes none of the caller-owned state this
+/// lane does not save. Returns `None` when the callee is not an eligible,
+/// already-compiled certified body; the caller then takes the interpreter path,
+/// which ports the callee and promotes it.
+fn certified_call_inline(
+    ctx: &mut JitCallContext,
+    callee: u64,
+    args: *mut u64,
+    argc: u64,
+) -> Option<u64> {
+    let agent = unsafe { &mut *ctx.agent };
+    if agent.jit_depth >= MAX_JIT_DEPTH || agent.is_terminating() {
+        return None;
+    }
+    let hook = agent.jit_hook?;
+    let callee_value = Value::from_bits(callee);
+    let ValueKind::Function(function) = callee_value.kind() else {
+        return None;
+    };
+    if !matches!(function.kind, crux::function::FunctionKind::EcmaScript) {
+        return None;
+    }
+    // Resolve the callee's registered record in one scoped borrow: a
+    // generator/async body's call produces an iterator or a promise rather
+    // than a run of the body, and a class constructor cannot be called at all.
+    let (body, environment, strict, global) = {
+        let data = agent.ecma_functions.get(&function.id())?;
+        if data.is_generator || data.is_async || data.is_class_constructor {
+            return None;
+        }
+        let body = data.ir.clone()?;
+        (
+            body,
+            data.environment,
+            data.strict,
+            data.realm.global_object,
+        )
+    };
+    // The same gate the self path uses: no `this`/`arguments`/capture context,
+    // no try/for-in/for-of/destructure/suspend, no tail or vector-call step.
+    // It is what makes a nested run on the shared `Vm` sound.
+    if !body.self_call_eligible() || !body.private_frame_safe() {
+        return None;
+    }
+    // Compile (or promote) through the same choke point every other JIT site
+    // uses; a below-threshold or sticky-refused body falls back here.
+    let info_ptr = lookup_info(hook, &body, true);
+    if info_ptr.is_null() {
+        return None;
+    }
+    // SAFETY: `lookup_info` just returned the cache's live entry, and no frame
+    // is in flight to evict it (`in_flight` was true).
+    let info = unsafe { &*info_ptr };
+    let scope = body.scope.as_ref()?;
+    // SAFETY: `info.entry` is a code pointer the cache owns.
+    let entry: JitEntry = unsafe { std::mem::transmute(info.entry) };
+    let argc = argc as usize;
+    // SAFETY: the JIT passes a pointer into its own live stack buffer with
+    // `argc` slots (the machine code is suspended for this synchronous call).
+    let args = unsafe { std::slice::from_raw_parts(args as *const Value, argc) };
+    let frame_len = scope.frame_size;
+    let buf_len = frame_len + info.stack_usage + JIT_STACK_SLACK;
+    let (mut inline_buf, mut heap_buf) = ([Value::Undefined; INLINE_JIT_BUF], Vec::<Value>::new());
+    let buf: &mut [Value] = if buf_len <= INLINE_JIT_BUF {
+        &mut inline_buf[..buf_len]
+    } else {
+        heap_buf.resize(buf_len, Value::Undefined);
+        &mut heap_buf[..]
+    };
+    // The frame fill mirrors `setup_certified_frame` for a gated body: params
+    // from the call's arguments (missing stay undefined), TDZ slots
+    // uninitialized, `var`s undefined. `self_call_eligible` guarantees no
+    // `this`/`arguments` slot and no per-call capture context.
+    for (slot, cell) in buf.iter_mut().enumerate().take(frame_len) {
+        *cell = if slot < scope.arity {
+            args.get(slot).copied().unwrap_or(Value::Undefined)
+        } else if scope.tdz_store.get(slot).copied().unwrap_or(false) {
+            Value::uninitialized()
+        } else {
+            Value::Undefined
+        };
+    }
+    let frame_ptr = buf.as_mut_ptr() as *mut c_void;
+    // SAFETY: `buf` has `frame_len + stack_usage + slack` slots.
+    let stack_ptr = unsafe { buf.as_mut_ptr().add(frame_len) } as *mut c_void;
+    let (apply_builtin_bits, call_builtin_bits) = if body.has_call_apply {
+        call_apply_intrinsic_bits(agent)
+    } else {
+        (0, 0)
+    };
+    // The nested run reads the callee's environment, function and strictness
+    // from the shared `Vm`, and a *different* body may use the shared scratch
+    // registers (the `switch` discriminant, the statement-completion register,
+    // the optional-chain short flag, the string builder, the register
+    // accumulator, `ip`); `save_scratch` saves and resets them and
+    // `restore_scratch` puts the caller's back, so neither run sees the
+    // other's.
+    let (scratch, saved) = unsafe {
+        let vm = &mut *ctx.vm;
+        let scratch = vm.save_scratch();
+        let saved = (
+            vm.lexical_env,
+            vm.body_context,
+            vm.current_function,
+            vm.current_new_target,
+            vm.strict,
+        );
+        vm.lexical_env = environment;
+        vm.body_context = Some(environment);
+        vm.current_function = Some(callee_value);
+        vm.current_new_target = None;
+        vm.strict = strict;
+        (scratch, saved)
+    };
+    let array_len = unsafe { (&*ctx.vm).array_index_stack.len() };
+    // Root the buffer for the call's duration (the Vm is already registered
+    // with the active-run tracer): a helper it invokes can allocate and
+    // trigger a collection, and a heap value only the buffer references must
+    // survive until the JIT stores or returns it.
+    unsafe {
+        (&mut *ctx.vm)
+            .jit_roots
+            .push((buf.as_ptr() as usize, buf.len()))
+    };
+    let global_bits = Value::Object(global).bits();
+    let mut nested = JitCallContext {
+        pending: false,
+        error: None,
+        agent: ctx.agent,
+        vm: ctx.vm,
+        global_object: global.as_ptr() as *mut c_void,
+        global_value_cells: ctx.global_value_cells,
+        member_value_cells: ctx.member_value_cells,
+        computed_read_cells: ctx.computed_read_cells,
+        member_map_cells: ctx.member_map_cells,
+        globals_unshadowed: Vm::global_reads_are_unshadowed(environment, &body.ident_names),
+        buf_end: (buf.as_ptr() as usize + buf_len * std::mem::size_of::<Value>()) as *mut c_void,
+        leaf_epoch: 0,
+        leaf_records: ctx.leaf_records,
+        leaf_gen: ctx.leaf_gen,
+        body: std::rc::Rc::as_ptr(&body),
+        tail: false,
+        current_function: callee,
+        self_entry: info.entry as u64,
+        self_stack_usage: info.stack_usage as u64,
+        self_inline_ok: true,
+        apply_builtin_bits,
+        call_builtin_bits,
+        dispatch_value: 0,
+        suspension: None,
+        suspend_sp: 0,
+        global_bits,
+        resume_kind: 0,
+        resume_ip: 0,
+        resume_sp: 0,
+        resume_value: 0,
+        gc_ticks: JIT_GC_PROBE_INTERVAL,
+    };
+    agent.jit_depth += 1;
+    // SAFETY: `nested` is the live per-call context the entry expects.
+    let result = unsafe {
+        entry(
+            frame_ptr,
+            stack_ptr,
+            (&mut nested as *mut JitCallContext) as *mut c_void,
+        )
+    };
+    agent.jit_depth -= 1;
+    unsafe {
+        let vm = &mut *ctx.vm;
+        vm.jit_roots.pop();
+        vm.array_index_stack.truncate(array_len);
+        (
+            vm.lexical_env,
+            vm.body_context,
+            vm.current_function,
+            vm.current_new_target,
+            vm.strict,
+        ) = saved;
+        vm.restore_scratch(scratch);
+    }
+    if nested.pending {
+        return Some(slow_error(
+            ctx,
+            nested.error.take().expect("a pending JIT error is present"),
+        ));
+    }
+    debug_assert!(
+        !nested.tail,
+        "the certified-call gate excludes the tail steps that set ctx.tail"
+    );
+    debug_assert!(
+        result != DISPATCH_SUSPEND,
+        "the certified-call gate excludes the suspend steps"
+    );
     Some(result)
 }
 
@@ -2505,10 +2727,11 @@ extern "C" fn load_ident(ctx: *mut c_void, name: u64) -> u64 {
     let vm = unsafe { &mut *ctx.vm };
     let name_atom = name as crux::AtomId;
     let name_string = crux::lookup(name_atom);
-    let reference = match crate::context::resolve_binding(agent, &name_string, vm.strict) {
-        Ok(reference) => reference,
-        Err(error) => return slow_error(ctx, error),
-    };
+    let reference =
+        match crate::context::resolve_binding_from(vm.lexical_env, &name_string, vm.strict) {
+            Ok(reference) => reference,
+            Err(error) => return slow_error(ctx, error),
+        };
     let value = match crate::context::get_value(agent, &reference) {
         Ok(value) => value,
         Err(error) => return slow_error(ctx, error),
@@ -2547,8 +2770,8 @@ extern "C" fn typeof_ident(ctx: *mut c_void, name: u64) -> u64 {
     let ctx = unsafe { ctx_of(ctx) };
     let agent = unsafe { &mut *ctx.agent };
     let vm = unsafe { &mut *ctx.vm };
-    let reference = match crate::context::resolve_binding(
-        agent,
+    let reference = match crate::context::resolve_binding_from(
+        vm.lexical_env,
         &crux::lookup(name as crux::AtomId),
         vm.strict,
     ) {
@@ -2567,9 +2790,12 @@ extern "C" fn typeof_ident(ctx: *mut c_void, name: u64) -> u64 {
 
 extern "C" fn resolve_var_ident(ctx: *mut c_void, name: u64) -> u64 {
     let ctx = unsafe { ctx_of(ctx) };
-    let agent = unsafe { &mut *ctx.agent };
     let vm = unsafe { &mut *ctx.vm };
-    match crate::context::resolve_binding(agent, &crux::lookup(name as crux::AtomId), vm.strict) {
+    match crate::context::resolve_binding_from(
+        vm.lexical_env,
+        &crux::lookup(name as crux::AtomId),
+        vm.strict,
+    ) {
         Ok(reference) => {
             vm.var_ref_stack.push(reference);
             0
@@ -2615,8 +2841,8 @@ extern "C" fn update_ident(ctx: *mut c_void, name: u64, op: u64, prefix: u64, ol
         Ok(result) => result,
         Err(error) => return slow_error(ctx, error),
     };
-    let reference = match crate::context::resolve_binding(
-        agent,
+    let reference = match crate::context::resolve_binding_from(
+        vm.lexical_env,
         &crux::lookup(name as crux::AtomId),
         vm.strict,
     ) {

@@ -1,6 +1,6 @@
 ---
 name: slag-jit
-description: "Load when working on Slag's Cranelift JIT (crates/jit/src, crates/runtime/src/jit.rs, JIT-visible crates/runtime/src/ir.rs) — helper ABI registration, emit_step lowering, block sealing, dispatch sentinels, leaf-call probe, certified iterators (for-of/for-in/AsyncForOf*), suspension (Yield/Await resume dispatch, jit_work), super access, new.target, or destructuring (Destructure* steps, flat binds). Traps: the four-file helper mirror, the pending-error ABI, the dispatch-target chain, the element-via-work-stack-pointer convention, the ForOfBegin boundary span, the compiled for-of close requirements, the sealed-block/back-edge rules, the for_of_advance core contract, resumable-body rules, the destructure rules (flat binds, for-head trap, close gates), the script completion-register writes (compiled steps write vm.completion; eval_program maps the fall-off-end Return(undef)), and the Cut 69 compile threshold (the lookup_info gate, body_has_loop↔step_targets sync, the call_slow→try_jit_leaf chain)."
+description: "Load when working on Slag's Cranelift JIT (crates/jit/src, crates/runtime/src/jit.rs, JIT-visible crates/runtime/src/ir.rs) — helper ABI registration, emit_step lowering, block sealing, dispatch sentinels, leaf-call probe, certified iterators (for-of/for-in/AsyncForOf*), suspension (Yield/Await resume dispatch, jit_work), super access, new.target, or destructuring (Destructure* steps, flat binds). Traps: the four-file helper mirror, the pending-error ABI, the dispatch chain, the element-via-work-stack convention, the certified-callee lane, the ForOfBegin boundary span, the compiled for-of close requirements, the sealed-block/back-edge rules, the for_of_advance core contract, resumable-body rules, the destructure rules (flat binds, for-head trap, close gates), the script completion-register writes (compiled steps write vm.completion; eval_program maps the fall-off-end Return(undef)), and the Cut 69 compile threshold (the lookup_info gate, body_has_loop↔step_targets sync, the call_slow→try_jit_leaf chain)."
 ---
 
 # Slag JIT traps
@@ -872,11 +872,66 @@ variant, `ArgsBase`/`ArgsPush`/`ArgsSpread`, the vector `Call`, `Construct`,
 `TaggedTemplate`/`TailTaggedTemplate` and `SuperCall`. Two live traps for the
 next widening (2b, the general call):
 
-- **Do NOT run a non-self callee on the caller's Vm/ctx.** The callee's body,
-  closure environment, `globals_unshadowed`, and tail/suspend handling all
-differ; the tractable design is a **pooled private Vm** plus a cached per-callee
-  descriptor (entry/scope, `Function::environment`, `globals_unshadowed` — all
-  fixed per closure, so cacheable). Sharing is what produced the tail bug.
+- **A non-self callee CAN run on the caller's Vm/ctx — but only through the
+  certified-callee lane's full discipline (§21).** Sharing is what produced the
+  tail bug, so the earlier reading here was "do not share"; Cut 1 showed the
+  tractable shape is to share the `Vm`/ctx *with* explicit scratch isolation, a
+  private frame buffer, and an env-correct resolution path. Read §21 before
+  forming an opinion.
 - **`Vm::args` is live across `ArgsSpread` (it iterates a user iterator),** so a
   nested run that clobbers it corrupts the outer argument build — the reason the
   vector-call steps are gated, not just the `Call` step itself.
+
+## 21. The certified-callee lane (Stage 9 Cut 1) — a different body on the caller's Vm
+
+`call_slow` gained a second fast path beside `self_call_inline`:
+`certified_call_inline` resolves the callee's `EcmaFunction` record, requires
+`self_call_eligible()` **and** `private_frame_safe()`, and runs the callee's
+compiled entry with a nested frame in a private buffer and its own
+`JitCallContext` — skipping `do_call_fast`/`ordinary_call`/`run_compiled_body`/
+`run_jit_body`, the pooled Vm take/reset, and the `ExecutionContext` push. A
+miss (ineligible, uncompiled, below threshold, sticky-refused) falls to the
+funnel, which ports and promotes. Measured 2.7× on `--jit-bench`'s
+`non-leaf call`. The traps, all of which produced a wrong answer first:
+
+- **Every per-activation `Vm` scratch register must be saved AND reset, not
+  merely saved.** Use `Vm::save_scratch`/`restore_scratch` (defined in
+  `ir.rs`): `ip`, `acc`, `loop_counter`, `loop_num`, the string builder
+  (`Builder`, moved out via `mem::replace`, so no memset), `completion`,
+  `completion_is_empty`, `switch_disc`, `switch_disc_set`, `chain_short`. The
+  lane also saves/restores `lexical_env`, `body_context`, `current_function`,
+  `current_new_target`, `strict` (setting the callee's). The self path now uses
+  `save_scratch` too — it shared the same latent clobber (a fall-through
+  `switch` across a self call). Private fields (`acc`, `loop_counter`,
+  `loop_num`) are not reachable from `jit.rs`, which is why the helper lives on
+  `Vm` in `ir.rs`.
+- **A private frame buffer is NOT `vm.frame`.** Helpers that read frame slots
+  through `Vm::frame_get`/`frame_get_mut` — `builder_bind`/`builder_store`
+  (`s += e` plans, including the register body's `LeafOp::BuilderAppend`) and
+  `create_function_decl` (a hoisted block function declaration) — would address
+  the *caller's* frame. So a body with those steps is refused by
+  `CompiledBody::private_frame_safe`. Symptom if forgotten: a callee whose
+  `s += n` loop silently wrote the caller's frame slot and returned `""`/`0`.
+  The other `vm.frame` helpers (`catch_bind`, `for_of_*`, `create_arguments`,
+  `tail_call_self_vector`) are already excluded by `self_call_eligible`.
+- **Compiled binding resolution must read `vm.lexical_env`, not the running
+  `ExecutionContext`.** `load_ident`/`typeof_ident`/`resolve_var_ident`/
+  `update_ident` used `context::resolve_binding`, which reads
+  `agent.running_context()?.lexical_environment` — the *caller's* env, because
+  the lane pushes no context. Use `context::resolve_binding_from(vm.lexical_env,
+  …)`. For the funnel path the two are equal, so the change is
+  behavior-preserving; without it the whole `resizable-buffer` fixture family
+  failed with `ReferenceError: "<global>" is not defined`.
+- **`globals_unshadowed` is per-body.** The lane computes it from the callee's
+  `environment` (the funnel reads it from the pushed context); the nested ctx
+  carries the callee's `global_object`/`global_bits` from `record.realm`.
+- **Errors and tail/suspend are handled by gate, not by code.** The gate
+  excludes every `TailCall*`/`Yield`/`Await`, so `nested.tail` and
+  `DISPATCH_SUSPEND` cannot occur; the lane `debug_assert!`s both and propagates
+  a `nested.pending` error through `slow_error` on the *caller's* ctx. Generators
+  and async functions are refused explicitly (their call returns an object, not
+  a run of the body), as is a class constructor and any non-`EcmaScript` callee.
+- **Mode check, not assumed:** the lane is inert in a `--jitless` run and in
+  `wasmtest` (no hook), so a wasm sweep is not owed for a lane-only change —
+  but `context.rs`/`ir.rs` are linked by `wasmtest`, so run the wasm suites when
+  those change.

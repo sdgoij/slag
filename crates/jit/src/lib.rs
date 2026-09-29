@@ -3719,6 +3719,59 @@ run(); run(); run(); run(); run(); run(); run(); run(); run();";
     }
 
     #[test]
+    fn installed_jit_a_certified_callee_matches_the_interpreter() {
+        // Stage 9 Cut 1: a call to a *different* certified body runs its machine
+        // code directly on the caller's ctx (the certified-callee lane) instead
+        // of the interpreter funnel. The lane shares the caller's `Vm`, so this
+        // is where the scratch-register isolation (`switch_disc`,
+        // `chain_short`, the builder, `ip`) and the per-callee
+        // `globals_unshadowed` are exercised; a differential against the
+        // interpreter (no hook) is the check, with the absolute answers
+        // asserted too so a shared wrong value cannot hide.
+        let programs = [
+            // A callee's `switch` must not disturb the caller's fall-through
+            // switch discriminant (both live in `Vm::switch_disc`).
+            "function callee(x) { switch (x) { case 1: return 10; case 2: return 20; default: return 30; } }\n\
+             function bench() {\n\
+               var out = 0;\n\
+               for (var i = 0; i < 100; i++) {\n\
+                 switch (i & 1) {\n\
+                   case 0: out += callee(2);\n\
+                   case 1: out += callee(1);\n\
+                 }\n\
+               }\n\
+               return out;\n\
+             }\n\
+             bench();",
+            // Mutual recursion: every call is a different-body call, so the
+            // lane nests through `call_slow` at every level.
+            "function isEven(n) { if (n === 0) return 1; var r = isOdd(n - 1); return r; }\n\
+             function isOdd(n) { if (n === 0) return 0; var r = isEven(n - 1); return r; }\n\
+             function bench() { var c = 0; for (var i = 0; i < 100; i++) c += isEven(10); return c; }\n\
+             bench();",
+            // A callee reading a global: its `globals_unshadowed` must be
+            // computed for its own names, not the caller's.
+            "var g = 7;\n\
+             function addg(x) { return x + g; }\n\
+             function bench() { var s = 0; for (var i = 0; i < 100; i++) s += addg(i); return s; }\n\
+             bench();",
+        ];
+        for source in programs {
+            let (jit_value, compiled) = run_self_call_program(source, true);
+            let (interp_value, _) = run_self_call_program(source, false);
+            assert_eq!(jit_value, interp_value, "jit vs interpreter:\n{source}");
+            assert!(
+                compiled >= 2,
+                "the callee must compile so the lane is reachable ({compiled} bodies):\n{source}"
+            );
+        }
+        assert_eq!(run_self_call_program(programs[0], true).0, 2000.0);
+        assert_eq!(run_self_call_program(programs[0], false).0, 2000.0);
+        assert_eq!(run_self_call_program(programs[1], true).0, 100.0);
+        assert_eq!(run_self_call_program(programs[2], true).0, 5650.0);
+    }
+
+    #[test]
     fn installed_jit_a_deep_self_recursion_falls_back_past_the_depth_cap() {
         // Past `MAX_JIT_DEPTH` the self path declines to the interpreter
         // (`run_jit_body` refuses a deeper compiled frame), so a recursion

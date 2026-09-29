@@ -1115,6 +1115,21 @@ pub fn resolve_binding(agent: &Agent, name: &JsString, strict: bool) -> Result<R
     get_identifier_reference(Some(env), name, strict)
 }
 
+/// [`resolve_binding`] against an explicit lexical environment, for the
+/// compiled slow paths: they must resolve from the *running body's* env
+/// (`Vm::lexical_env`), not the current `ExecutionContext`'s. A nested compiled
+/// run on a shared `Vm` (the self-call and certified-callee lanes) sets
+/// `vm.lexical_env` to the callee's env while the current context still belongs
+/// to the caller, so resolving through the context would read the caller's
+/// chain.
+pub fn resolve_binding_from(
+    env: EnvRef,
+    name: &JsString,
+    strict: bool,
+) -> Result<Reference, JsError> {
+    get_identifier_reference(Some(env), name, strict)
+}
+
 /// spec 9.4.3 GetThisEnvironment: the innermost environment with a `this`
 /// binding.
 pub fn get_this_environment(agent: &Agent) -> Result<EnvRef, JsError> {
