@@ -6567,9 +6567,21 @@ impl Vm {
         Ok(())
     }
 
+    /// Whether a call record is waiting to be performed — a step withdrew an
+    /// activation (`fast_call_core`) and a driver must complete it. The JIT's
+    /// synchronous call helpers test this before
+    /// [`complete_pending_call`](Self::complete_pending_call), whose `Option`
+    /// move they would otherwise pay on every call, including the common one
+    /// where an engine builtin ran in place and withdrew nothing.
+    #[inline]
+    pub(crate) fn has_pending_call(&self) -> bool {
+        self.pending_call.is_some()
+    }
+
     /// Complete a record still on the Vm: a caller that performs a call
     /// synchronously in its own (small) frame — the JIT's call helpers and the
-    /// builtin leaf fallback. A no-op when no call was withdrawn.
+    /// builtin leaf fallback. A no-op when no call was withdrawn; callers on a
+    /// hot path test [`has_pending_call`](Self::has_pending_call) first.
     pub(crate) fn complete_pending_call(&mut self, agent: &mut Agent) -> Result<(), JsError> {
         match self.pending_call.take() {
             Some(pending) => self.complete_call(agent, pending),

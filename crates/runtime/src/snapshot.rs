@@ -6723,6 +6723,48 @@ mod tests {
         item.value().expect("a value item")
     }
 
+    /// A decoded slot whose values are rooted for as long as it lives.
+    ///
+    /// A bare `Value` in a Rust `Vec` is invisible to the collector, so a
+    /// restore that allocates could otherwise let a collection sweep one and a
+    /// later object reuse its slot — the aliasing hazard `.notes/embedding.md`
+    /// §5 names, which a test hit only when an unrelated struct's size shifted
+    /// the arena's allocation timing. This shadows the module's `decode_slot`
+    /// *inside `mod tests`*, so every test decode is rooted without a `pin`
+    /// line at each call site; the `Deref` keeps the existing `back[0]` reads.
+    struct RootedSlot {
+        items: Vec<SnapshotItem>,
+        #[allow(dead_code)]
+        pins: Vec<crux::heap::Pin>,
+    }
+
+    impl std::ops::Deref for RootedSlot {
+        type Target = [SnapshotItem];
+        fn deref(&self) -> &[SnapshotItem] {
+            &self.items
+        }
+    }
+
+    fn decode_slot(
+        agent: &mut Agent,
+        realm: &Handle<Realm>,
+        bytes: &[u8],
+        slot: usize,
+        externals: &[usize],
+        host: Option<&dyn HostCallbacks>,
+    ) -> Result<Option<RootedSlot>, DecodeError> {
+        Ok(
+            super::decode_slot(agent, realm, bytes, slot, externals, host)?.map(|items| {
+                let pins = items
+                    .iter()
+                    .filter_map(|item| item.value())
+                    .map(crux::heap::pin)
+                    .collect();
+                RootedSlot { items, pins }
+            }),
+        )
+    }
+
     fn round_trip(isolate: &api::Isolate, realm: &Handle<Realm>, value: Value) -> Value {
         let blob = encode_value(isolate, realm, value);
         decode(agent_mut(isolate), realm, &blob).expect("decode")

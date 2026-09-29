@@ -1986,9 +1986,9 @@ One line per landed stage, newest last. This log is the arc's journal —
   the native closure in place and lands the result. **Measured after:** `Math.abs`
   357 → **191 ms**, `Map.get` 498-515 → **318-342** (main 401-404), `charCodeAt`
   467-488 → **297-321** (main 319-352), `--jit-bench` `builtin call` interp 9.0 →
-  **4.85 ms** (main 4.9-5.1) — the interpreter rows are back at `main` (a
-  residual ~1.1× on the *jit* row, 2.75 vs main 2.4, is the JIT helpers' now
-  always-called `complete_pending_call`; named as a follow-up, not fixed here).
+  **4.85 ms** (main 4.9-5.1) — the interpreter rows are back at `main`. The
+  *jit* row keeps a ~0.3 ms residual (2.59 vs main 2.29), which the follow-up
+  below pins to Stage 9's lane probes rather than to this withdrawal.
   **Tests:** three ladders share a builder — a `mark_host_reentrant`ed handler and
   native reach **≥50** levels on a 2 MiB thread (the deno shape), and an unmarked
   native and an unmarked handler reach **< half** that (the engine shape), so
@@ -2012,3 +2012,39 @@ One line per landed stage, newest last. This log is the arc's journal —
   `run --strict` suites 20,662 + 25,990 + 77 + 7,485 + 105 + 654 + 8,709 + 912 =
   **64,594 checks, 0 fail / 0 pending**, JS-API **1,001 / 0**; corpus **77 rows /
   0 mismatches**, `mean-jitGap` 70.94.
+- **The re-gate's two follow-ups: the JIT builtin row's residual, and the
+  snapshot harness's unrooted decodes (2026-09-29).** The record above first
+  blamed the JIT `builtin call` row's residual on the JIT helpers' now
+  always-called `complete_pending_call`. **That attribution was wrong**, and the
+  correction is the point of recording it. Measured on `-p cli` alone, min of N:
+  (a) a `has_pending_call` guard before the completion sites (`call_slow`,
+  `call_apply`, `call_vector`, and `builtins/function.rs`'s `try_leaf_call`) plus
+  an `#[inline]` on `complete_pending_call` moved the row **not at all** (2.75 →
+  2.74 ms); (b) hoisting `certified_call_inline`'s cheapest discriminator — the
+  callee's `FunctionKind`, before its `jit_depth`/`jit_hook` reads — recovered
+  part of it (2.74 → **2.59 ms**, main 2.29). What is left is the **lane probes
+  themselves**: `call_slow` runs `self_call_inline` and `certified_call_inline`
+  on *every* call that reaches it, and a builtin can take neither lane, so a
+  builtin call pays two probes it can never use. Removing that needs the probe
+  decision at the **call site** (the compiler knows the callee's shape; the
+  helper does not) — a Stage 9 shape, recorded rather than chased. Both kept
+  changes are local and semantics-preserving; the guard is the requested shape
+  (skip the completion when nothing was withdrawn).
+  The second follow-up is the harness defect the re-gate exposed. Every snapshot
+  test that decodes a slot and then runs JavaScript held its values as bare
+  `Value`s in a Rust `Vec`, which the collector cannot see, so the tests passed
+  only while no collection fired inside that window — and an unrelated struct's
+  size change was enough to break one (see the re-gate record above). `mod
+  tests` now defines a **`decode_slot` that shadows the module's**, returning a
+  `RootedSlot` that pins every decoded value for as long as it lives and
+  `Deref`s to `[SnapshotItem]`, so the ~20 existing `back[0]` call sites are
+  rooted with no edit at any of them. **Mutation-checked both ways** on the
+  known trigger (the `Function` size change, temporarily re-applied and then
+  reverted): pin → the test passes; unpin → the original `memory allocation of
+  227435698250580896 bytes failed` abort. `crux` stays byte-identical to HEAD.
+  Gates for both: fmt and `clippy --locked --workspace --all-targets -- -D
+  warnings` clean; `cargo test --locked --workspace` **5,564 passed / 0 failed**
+  across 38 binaries; test262 `all` **48,464 / 0 fail / 158 skip of 48,622** and
+  `intl402` **3,205 / 0 fail / 152 skip of 3,357**, 100% of runnable; the eight
+  wasm `run --strict` suites **64,594 checks / 0 fail / 0 pending** and JS-API
+  **1,001 / 0**; corpus **77 rows / 0 mismatches**, `mean-jitGap` 71.09.

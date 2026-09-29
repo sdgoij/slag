@@ -1794,8 +1794,11 @@ extern "C" fn call_slow(
         Ok(()) => {
             // The general path withdrew the activation instead of performing
             // it in the dispatch frame; this helper's own frame is small, so
-            // complete it here before reading the result.
-            if let Err(error) = vm.complete_pending_call(agent) {
+            // complete it here before reading the result. An engine builtin
+            // that ran in place withdrew nothing, so the check is skipped.
+            if vm.has_pending_call()
+                && let Err(error) = vm.complete_pending_call(agent)
+            {
                 vm.stack.truncate(entry_len);
                 return slow_error(ctx, error);
             }
@@ -1946,11 +1949,11 @@ fn certified_call_inline(
     args: *mut u64,
     argc: u64,
 ) -> Option<u64> {
-    let agent = unsafe { &mut *ctx.agent };
-    if agent.jit_depth >= MAX_JIT_DEPTH || agent.is_terminating() {
-        return None;
-    }
-    let hook = agent.jit_hook?;
+    // A callee that is not an ECMAScript function — an engine builtin, a bound
+    // function, a proxy — can never be a lane target, and the value decode is
+    // the cheapest discriminator, so it comes before the depth/hook reads: the
+    // lane probe runs on *every* `call_slow`, and a builtin call (a `Math`/
+    // `Map`/`String` method) is the common one to reach here.
     let callee_value = Value::from_bits(callee);
     let ValueKind::Function(function) = callee_value.kind() else {
         return None;
@@ -1958,6 +1961,11 @@ fn certified_call_inline(
     if !matches!(function.kind, crux::function::FunctionKind::EcmaScript) {
         return None;
     }
+    let agent = unsafe { &mut *ctx.agent };
+    if agent.jit_depth >= MAX_JIT_DEPTH || agent.is_terminating() {
+        return None;
+    }
+    let hook = agent.jit_hook?;
     // Resolve the callee's registered record in one scoped borrow: a
     // generator/async body's call produces an iterator or a promise rather
     // than a run of the body, and a class constructor cannot be called at all.
@@ -2215,7 +2223,9 @@ extern "C" fn call_apply(
         Ok(()) => {
             // The general path (a shadowed apply/call or a non-leaf callee)
             // withdrew the activation; complete it here (see `call_slow`).
-            if let Err(error) = vm.complete_pending_call(agent) {
+            if vm.has_pending_call()
+                && let Err(error) = vm.complete_pending_call(agent)
+            {
                 vm.stack.truncate(entry_len);
                 return slow_error(ctx, error);
             }
@@ -3566,7 +3576,9 @@ extern "C" fn call_vector(ctx: *mut c_void, this: u64, callee: u64, direct_eval:
         Ok(()) => {
             // The general path withdrew the activation; complete it here (see
             // `call_slow`).
-            if let Err(error) = vm.complete_pending_call(agent) {
+            if vm.has_pending_call()
+                && let Err(error) = vm.complete_pending_call(agent)
+            {
                 vm.stack.truncate(entry_len);
                 return slow_error(ctx, error);
             }

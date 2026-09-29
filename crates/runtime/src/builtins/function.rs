@@ -484,8 +484,13 @@ pub(crate) fn try_leaf_call(
         vm.do_call_fast(agent, arg_list.len(), false)?;
         // A non-leaf callee (the entry went stale between the lookup and the
         // call) withdraws the activation; this pooled Vm's frame is small, so
-        // complete it here.
-        vm.complete_pending_call(agent)
+        // complete it here. An engine builtin that ran in place withdrew
+        // nothing, so the check is skipped.
+        if vm.has_pending_call() {
+            vm.complete_pending_call(agent)
+        } else {
+            Ok(())
+        }
     })
     .and_then(|()| {
         vm.stack.pop().ok_or_else(|| {
