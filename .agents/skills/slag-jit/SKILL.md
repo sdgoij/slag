@@ -886,15 +886,29 @@ next widening (2b, the general call):
 
 `call_slow` gained a second fast path beside `self_call_inline`:
 `certified_call_inline` resolves the callee's `EcmaFunction` record, requires
-`self_call_eligible()`, and runs the callee's compiled entry with a nested
-frame in a private buffer and its own `JitCallContext` — skipping
-`do_call_fast`/`ordinary_call`/`run_compiled_body`/`run_jit_body`, the pooled
-Vm take/reset, and the `ExecutionContext` push. A miss (ineligible, uncompiled,
-below threshold, sticky-refused) falls to the funnel, which ports and promotes.
-Measured 2.7× on `--jit-bench`'s `non-leaf call`; the widening below took the
-corpus `mean-jitGap` 78.3 → 70.1. The traps, all of which produced a wrong
-answer first:
+`CompiledBody::certified_callee_eligible()`, and runs the callee's compiled
+entry with a nested frame in a private buffer and its own `JitCallContext` —
+skipping `do_call_fast`/`ordinary_call`/`run_compiled_body`/`run_jit_body`, the
+pooled Vm take/reset, and the `ExecutionContext` push. A miss (ineligible,
+uncompiled, below threshold, sticky-refused) falls to the funnel, which ports
+and promotes. Measured 2.7× on `--jit-bench`'s `non-leaf call`; the widenings
+below took the corpus `mean-jitGap` 78.3 → 70-71. The traps, all of which
+produced a wrong answer first:
 
+- **A method callee needs `OrdinaryCallBindThis` into its frame's `this` slot,
+  and the super / `ThisValue` machinery must be refused.** The lane's gate
+  (`certified_callee_eligible`) is the self gate **minus** the `this_slot`
+  exclusion — the lane binds `this` (strict: as-is; sloppy nullish → the callee
+  realm's global object; sloppy object/function: as-is; **sloppy primitive:
+  falls back**, because boxing allocates and can throw) — **plus** the steps
+  that read the *running context's* `this` binding or home object: every
+  `super` step (`GetSuperName`/`GetSuperComputed`/`GetSuperComputedKeep`/
+  `GetSuperBase`/`AssignSuper*`/`ResolveSuperRef*`/`UpdateSuper*`/`DeleteSuper`/
+  `SuperCall`) and `ThisValue`, whose reader `Vm::vm_this_binding` walks the
+  current `ExecutionContext` a lane run does not install. A plain `this` read in
+  a certified body is a frame-slot load (`LoadLocal { this_slot }`), not
+  `ThisValue`, so it stays eligible. `self_call_eligible` keeps excluding
+  `this_slot` — a self-call's receiver can differ from the running one.
 - **Every per-activation `Vm` scratch register must be saved AND reset, not
   merely saved.** Use `Vm::save_scratch`/`restore_scratch` (defined in
   `ir.rs`): `ip`, `acc`, `loop_counter`, `loop_num`, the string builder

@@ -863,10 +863,11 @@ The list, in the measured order:
       behavior-preserving for the funnel path (where the two envs are equal).
       Without it the whole `resizable-buffer` fixture family failed with
       `ReferenceError: "<global>" is not defined` under the lane.
-    - The gate stays conservative: `this`/`arguments`/capture contexts, try,
-      iterators, destructuring, suspension, tail and vector calls, generators,
-      async functions, class constructors and non-ECMA callees all fall back to
-      the funnel (which also ports and promotes them).
+    - The gate stays conservative: `arguments`/capture contexts, try, iterators,
+      destructuring, suspension, tail and vector calls, generators, async
+      functions, class constructors, the super/`ThisValue` machinery and
+      non-ECMA callees all fall back to the funnel (which also ports and
+      promotes them). (`this` was later admitted by Cut 1c.)
   - **Cut 1b — landed (2026-09-29): the frame widening, so builder and
     function-declaration callees take the lane.** `Vm::nested_frame` (a
     `*mut Value` installed by both lanes for the run and restored to the
@@ -885,6 +886,24 @@ The list, in the measured order:
     `control` 31.4 → 21.2, `objects` 94.2 → 82.2). Mutation-checked: falling
     back to `Frame::get` in the `nested_frame` arm makes the new builder-callee
     test fail with `0.0` where it wants `500.0`.
+  - **Cut 1c — landed (2026-09-29): the method widening, so a callee that reads
+    `this` takes the lane.** The lane's gate is now
+    `CompiledBody::certified_callee_eligible` — the self gate **minus** the
+    `this_slot` exclusion (the lane performs `OrdinaryCallBindThis` into the
+    frame's `this` slot: strict as-is; sloppy nullish → the callee realm's
+    global object; sloppy object/function as-is; sloppy primitive falls back,
+    since boxing allocates and can throw) **plus** the steps that read the
+    *running context's* this binding or home object, which a lane run does not
+    install: every `super` step and `ThisValue` (`Vm::vm_this_binding` walks the
+    current execution context). A plain `this` read is a frame-slot load, not
+    `ThisValue`, so it stays eligible. `self_call_eligible` still excludes
+    `this_slot` (a self-call's receiver can differ). Measured: the corpus is
+    unchanged (71.39 vs 70.14 `mean-jitGap`, within the runner's own ±10%
+    run-to-run spread) — its method rows are leaves, which the leaf probe
+    already inlines — so this slice's value is **coverage** of non-leaf methods,
+    not a corpus number; `--jit-bench` does not regress (`non-leaf call`
+    5.9-6.3 ms). Mutation-checked: skipping the `this` bind fails the new
+    `probe()`/method shapes (`8.0` for `100.0`).
   - **Cut 2 — the `ExecutionContext`.** ~15 ns a call and load-bearing for the
     callee's env and for `e.stack`; the leaf path already omits it and still
     names frames, so cut 2 is to (a) set `vm.lexical_env` directly (not via
@@ -1881,3 +1900,22 @@ One line per landed stage, newest last. This log is the arc's journal —
   0 mismatches. One pre-existing stray doc line ("The resumable VM state…",
   present in the parent and attached to no item) was dropped while editing the
   adjacent `VmScratch` doc.
+- **Stage 9, Cut 1c the method widening (2026-09-29).** The lane now admits a
+  callee with a `this` slot (`CompiledBody::certified_callee_eligible` = the
+  self gate minus the `this_slot` exclusion) and performs `OrdinaryCallBindThis`
+  into the frame's `this` slot (strict as-is; sloppy nullish → the callee
+  realm's global; sloppy object/function as-is; sloppy primitive falls back).
+  The super and `ThisValue` steps are refused — they read the running context's
+  this binding/home object, which a lane run does not install. Measured: the
+  corpus is unchanged (71.39 `mean-jitGap` against Cut 1b's 70.14, inside the
+  runner's ±10% spread) because its method rows are leaves the leaf probe already
+  inlines, so the value here is **coverage** of non-leaf methods; `--jit-bench`
+  is unregressed (`non-leaf call` 5.9-6.3 ms, `function calls` 0.16,
+  `builtin call` 0.37). Mutation-checked: skipping the bind fails the new
+  `probe()`/method shapes (`8.0` for `100.0`). Gates: fmt/clippy clean;
+  workspace green (`jit --lib` 239, `runtime --lib` 981); test262 `all`
+  48,464 / 0 fail / 158 skip and `intl402` 3,205 / 0 fail / 152 skip, both
+  baseline; the eight wasm suites 64,594 / 0 fail / 0 pending and JS-API
+  1,001 / 0 fail; corpus parity 0 mismatches. `arguments`-object callees still
+  fall back (they need `Vm::call_args` and `create_arguments`), and so do
+  methods using `super`.

@@ -1771,7 +1771,7 @@ extern "C" fn call_slow(
     // the interpreter funnel. `None` (an ineligible or not-yet-compiled callee)
     // falls through to that funnel, which ports the callee and promotes it.
     if direct_eval == 0
-        && let Some(result) = certified_call_inline(ctx, callee, args, argc)
+        && let Some(result) = certified_call_inline(ctx, callee, this, args, argc)
     {
         return result;
     }
@@ -1942,6 +1942,7 @@ fn self_call_inline(ctx: &mut JitCallContext, args: *mut u64, argc: u64) -> Opti
 fn certified_call_inline(
     ctx: &mut JitCallContext,
     callee: u64,
+    this: u64,
     args: *mut u64,
     argc: u64,
 ) -> Option<u64> {
@@ -1973,10 +1974,9 @@ fn certified_call_inline(
             data.realm.global_object,
         )
     };
-    // The same gate the self path uses: no `this`/`arguments`/capture context,
-    // no try/for-in/for-of/destructure/suspend, no tail or vector-call step.
-    // It is what makes a nested run on the shared `Vm` sound.
-    if !body.self_call_eligible() {
+    // The lane's gate: the self gate minus the `this` requirement (bound
+    // below) plus the super/`ThisValue` machinery it cannot install.
+    if !body.certified_callee_eligible() {
         return None;
     }
     // Compile (or promote) through the same choke point every other JIT site
@@ -2015,6 +2015,24 @@ fn certified_call_inline(
             Value::uninitialized()
         } else {
             Value::Undefined
+        };
+    }
+    // OrdinaryCallBindThis (spec 10.2.1.1) into the callee's `this` slot — the
+    // same bind `setup_certified_frame` is handed by `ordinary_call`: strict
+    // keeps the call's `this` as-is; sloppy coerces a nullish `this` to the
+    // callee realm's global object and passes an object/function through. A
+    // primitive receiver must be boxed (`to_object` allocates and can throw),
+    // so that case falls back to the funnel instead.
+    if let Some(slot) = scope.this_slot {
+        let this = Value::from_bits(this);
+        buf[slot] = if strict {
+            this
+        } else {
+            match this.kind() {
+                ValueKind::Undefined | ValueKind::Null => Value::Object(global),
+                ValueKind::Object(_) | ValueKind::Function(_) => this,
+                _ => return None,
+            }
         };
     }
     let frame_ptr = buf.as_mut_ptr() as *mut c_void;

@@ -1793,7 +1793,55 @@ impl CompiledBody {
         {
             return false;
         }
+        !self.has_shared_vm_step_hazard()
+    }
+
+    /// The certified-callee lane's gate: the self gate **minus** the `this`
+    /// requirement — the lane binds `OrdinaryCallBindThis` into the frame's
+    /// `this` slot, so a method, or a plain function that reads `this`, is
+    /// runnable — and **plus** the steps that read the *running context's*
+    /// `this` binding or home object, which a lane run does not install: every
+    /// `super` step and `ThisValue` (whose reader, `Vm::vm_this_binding`, walks
+    /// the current `ExecutionContext`; a plain `this` read in a certified body
+    /// is a frame-slot load, not `ThisValue`, so it stays eligible).
+    pub(crate) fn certified_callee_eligible(&self) -> bool {
+        let Some(scope) = self.scope.as_ref() else {
+            return false;
+        };
+        if self.has_call_apply || !scope.context_names.is_empty() || scope.arguments_slot.is_some()
+        {
+            return false;
+        }
+        if self.has_shared_vm_step_hazard() {
+            return false;
+        }
         !self.steps.iter().any(|step| {
+            matches!(
+                step,
+                Step::ThisValue
+                    | Step::GetSuperName { .. }
+                    | Step::GetSuperComputed
+                    | Step::GetSuperComputedKeep
+                    | Step::GetSuperBase
+                    | Step::AssignSuperName { .. }
+                    | Step::AssignSuperComputed { .. }
+                    | Step::ResolveSuperRefName { .. }
+                    | Step::ResolveSuperRefComputed
+                    | Step::UpdateSuperName { .. }
+                    | Step::UpdateSuperComputed { .. }
+                    | Step::DeleteSuper
+            )
+        })
+    }
+
+    /// The steps neither shared-`Vm` lane may run: they drive machinery whose
+    /// state spans one activation, or they mutate caller-owned `Vm` state the
+    /// nested run shares — a `TailCall*` calls `tail_prepare_ordinary` (swapping
+    /// `vm`'s frame/context and setting `ctx.tail`), and the vector-call and
+    /// template/construct steps build or consume `Vm::args` (an `ArgsSpread`
+    /// iterating a user iterator can re-enter with the vector half-built).
+    fn has_shared_vm_step_hazard(&self) -> bool {
+        self.steps.iter().any(|step| {
             matches!(
                 step,
                 Step::EnterTry { .. }
@@ -1820,13 +1868,6 @@ impl CompiledBody {
                     | Step::Await { .. }
                     | Step::NewTarget
                     | Step::CreateArguments { .. }
-                    // These run user code or mutate caller-owned Vm state the
-                    // nested run shares: a `TailCall*` calls
-                    // `tail_prepare_ordinary` (swapping `vm`'s frame/context
-                    // and setting `ctx.tail`), and the vector-call and
-                    // template/construct steps build or consume `Vm::args`
-                    // (an `ArgsSpread` iterating a user iterator can re-enter
-                    // with the vector half-built).
                     | Step::TailCallFast { .. }
                     | Step::TailCall { .. }
                     | Step::TailCallFastGlobal { .. }

@@ -3726,7 +3726,8 @@ run(); run(); run(); run(); run(); run(); run(); run(); run();";
         // is where the scratch-register isolation (`switch_disc`,
         // `chain_short`, the builder, `ip`), the per-callee `globals_unshadowed`,
         // and the nested frame a frame-reading helper must address
-        // (`Vm::nested_frame`, for a builder or function-declaration callee) are
+        // (`Vm::nested_frame`, for a builder or function-declaration callee),
+        // and the `this` binding the lane performs for a method callee are
         // exercised; a differential against the interpreter (no hook) is the
         // check, with the absolute answers asserted too so a shared wrong value
         // cannot hide.
@@ -3769,6 +3770,25 @@ run(); run(); run(); run(); run(); run(); run(); run(); run();";
             "function outer() { function inner() { return 7; } return inner(); }\n\
              function bench() { var s = 0; for (var i = 0; i < 100; i++) s += outer(); return s; }\n\
              bench();",
+            // A callee that reads `this`: the lane binds OrdinaryCallBindThis
+            // into the frame's `this` slot (sloppy nullish -> the realm
+            // global).
+            "function probe() { return this === globalThis ? 1 : 0; }\n\
+             function bench() { var s = 0; for (var i = 0; i < 100; i++) s += probe(); return s; }\n\
+             bench();",
+            // A method (non-leaf, so the leaf probe cannot take it): `this` is
+            // the receiver.
+            "function add(a, b) { return a + b; }\n\
+             var o = { x: 5, m(n) { return add(this.x, n); } };\n\
+             function bench() { var s = 0; for (var i = 0; i < 100; i++) s += o.m(i); return s; }\n\
+             bench();",
+            // A `super` method must fall back: the lane installs no home
+            // object or this-binding for the super machinery.
+            "class B { m() { return 1; } }\n\
+             class D extends B { m() { return super.m() + 1; } }\n\
+             var d = new D();\n\
+             function bench() { var s = 0; for (var i = 0; i < 100; i++) s += d.m(); return s; }\n\
+             bench();",
         ];
         for source in programs {
             let (jit_value, compiled) = run_self_call_program(source, true);
@@ -3786,6 +3806,11 @@ run(); run(); run(); run(); run(); run(); run(); run(); run();";
         assert_eq!(run_self_call_program(programs[3], true).0, 500.0);
         assert_eq!(run_self_call_program(programs[3], false).0, 500.0);
         assert_eq!(run_self_call_program(programs[4], true).0, 700.0);
+        assert_eq!(run_self_call_program(programs[5], true).0, 100.0);
+        assert_eq!(run_self_call_program(programs[5], false).0, 100.0);
+        assert_eq!(run_self_call_program(programs[6], true).0, 5450.0);
+        assert_eq!(run_self_call_program(programs[7], true).0, 200.0);
+        assert_eq!(run_self_call_program(programs[7], false).0, 200.0);
     }
 
     #[test]
