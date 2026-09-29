@@ -3724,10 +3724,12 @@ run(); run(); run(); run(); run(); run(); run(); run(); run();";
         // code directly on the caller's ctx (the certified-callee lane) instead
         // of the interpreter funnel. The lane shares the caller's `Vm`, so this
         // is where the scratch-register isolation (`switch_disc`,
-        // `chain_short`, the builder, `ip`) and the per-callee
-        // `globals_unshadowed` are exercised; a differential against the
-        // interpreter (no hook) is the check, with the absolute answers
-        // asserted too so a shared wrong value cannot hide.
+        // `chain_short`, the builder, `ip`), the per-callee `globals_unshadowed`,
+        // and the nested frame a frame-reading helper must address
+        // (`Vm::nested_frame`, for a builder or function-declaration callee) are
+        // exercised; a differential against the interpreter (no hook) is the
+        // check, with the absolute answers asserted too so a shared wrong value
+        // cannot hide.
         let programs = [
             // A callee's `switch` must not disturb the caller's fall-through
             // switch discriminant (both live in `Vm::switch_disc`).
@@ -3755,6 +3757,18 @@ run(); run(); run(); run(); run(); run(); run(); run(); run();";
              function addg(x) { return x + g; }\n\
              function bench() { var s = 0; for (var i = 0; i < 100; i++) s += addg(i); return s; }\n\
              bench();",
+            // A callee with a planned `s += e` append loop: its builder helper
+            // reads frame slots through `Vm::frame_get`, which the lane points
+            // at the nested frame (`Vm::nested_frame`) — without that it would
+            // address the caller's frame and return the wrong string.
+            "function build(n) { var s = ''; for (var i = 0; i < n; i++) s += 'x'; return s.length; }\n\
+             function bench() { var out = 0; for (var i = 0; i < 100; i++) out += build(5); return out; }\n\
+             bench();",
+            // A callee with a hoisted block function declaration: its slot
+            // store also goes through `Vm::frame_get_mut` (same requirement).
+            "function outer() { function inner() { return 7; } return inner(); }\n\
+             function bench() { var s = 0; for (var i = 0; i < 100; i++) s += outer(); return s; }\n\
+             bench();",
         ];
         for source in programs {
             let (jit_value, compiled) = run_self_call_program(source, true);
@@ -3769,6 +3783,9 @@ run(); run(); run(); run(); run(); run(); run(); run(); run();";
         assert_eq!(run_self_call_program(programs[0], false).0, 2000.0);
         assert_eq!(run_self_call_program(programs[1], true).0, 100.0);
         assert_eq!(run_self_call_program(programs[2], true).0, 5650.0);
+        assert_eq!(run_self_call_program(programs[3], true).0, 500.0);
+        assert_eq!(run_self_call_program(programs[3], false).0, 500.0);
+        assert_eq!(run_self_call_program(programs[4], true).0, 700.0);
     }
 
     #[test]

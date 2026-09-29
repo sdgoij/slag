@@ -1846,31 +1846,6 @@ impl CompiledBody {
             )
         })
     }
-
-    /// Whether a nested compiled run with its own private frame buffer (the
-    /// certified-call lane) is sound for this body: every frame-slot access
-    /// must go through the frame pointer the entry is handed. A step that
-    /// reaches a `vm.frame`-reading Rust helper instead would read or write the
-    /// *caller's* frame, so those bodies stay on the pooled-Vm path:
-    ///
-    /// - the `s += e` builder's bind/store (and, in the register body, its
-    ///   append) — `builder_bind`/`builder_store` read `Vm::frame_get`;
-    /// - a hoisted block function declaration's slot store
-    ///   (`create_function_decl` reads `Vm::frame_get_mut`).
-    ///
-    /// The other `vm.frame`-reading helpers (`catch_bind`, `for_of_*`,
-    /// `create_arguments`, `tail_call_self_vector`) are already excluded by
-    /// [`Self::self_call_eligible`].
-    pub(crate) fn private_frame_safe(&self) -> bool {
-        !self.steps.iter().any(|step| match step {
-            Step::BuilderBind { slot } | Step::BuilderStore { slot } => slot.is_some(),
-            Step::FunctionDeclInit { .. } => true,
-            Step::RunRegBody { ops } => ops
-                .iter()
-                .any(|op| matches!(op, LeafOp::BuilderAppend { .. })),
-            _ => false,
-        })
-    }
 }
 
 impl Trace for CompiledBody {
@@ -3151,9 +3126,12 @@ pub(crate) fn with_leaf_run<T>(vm: *mut Vm, body: *const CompiledBody, f: impl F
     result
 }
 
-/// The resumable VM state. Saved across suspension by the driver.
-/// The caller's per-activation `Vm` scratch registers, saved across a nested
-/// certified JIT run on the shared `Vm` (see [`Vm::save_scratch`]).
+/// The caller's per-activation `Vm` state a nested certified JIT run on the
+/// shared `Vm` must neither observe nor clobber (see [`Vm::save_scratch`]): the
+/// scratch registers (saved and reset to a fresh activation's values) and the
+/// shared value/array-index/`var`-reference/class cursors (saved, and truncated
+/// back on restore so a nested run's error path cannot leak an entry into the
+/// caller).
 pub(crate) struct VmScratch {
     ip: usize,
     acc: Value,
@@ -3165,6 +3143,10 @@ pub(crate) struct VmScratch {
     switch_disc: Value,
     switch_disc_set: bool,
     chain_short: bool,
+    stack_len: usize,
+    array_index_len: usize,
+    var_ref_len: usize,
+    class_len: usize,
 }
 
 /// A per-Vm string builder for a planned `s += e` append loop.
@@ -3256,6 +3238,17 @@ pub struct Vm {
     /// `frame` stays in place (no 256-byte swap per call). `None` outside a
     /// leaf run.
     pub(crate) leaf_frame_base: Option<usize>,
+    /// The active nested-run frame (the self-call and certified-callee lanes'
+    /// private buffer): when `Some`, `frame_get`/`frame_get_mut` resolve frame
+    /// slots from it instead of [`Vm::frame`], so the frame-reading Rust
+    /// helpers (`builder_bind`, `builder_store`, `create_function_decl`)
+    /// address the nested activation's frame — the same frame its compiled
+    /// entry addresses through the `frame` pointer it was handed. The pointer
+    /// is into the lane's buffer, which outlives the run (and is rooted in
+    /// `jit_roots` for GC); the lane saves and restores the previous value, so
+    /// nested lane runs stack correctly. `None` outside a nested run, so a
+    /// top-level run always uses `frame`.
+    pub(crate) nested_frame: Option<*mut Value>,
     /// Cut 35 slice 23: an offset applied to `frame_get`/`frame_set` while
     /// a `LeafFrame::CallerSlots` register leaf runs — its frame IS the
     /// caller's frame at `base..` (the caller's `leaf_frame_base` stays
@@ -3597,6 +3590,7 @@ impl Vm {
             frame: Frame::Inline(std::array::from_fn(|_| Value::Undefined)),
             leaf_frame_base: None,
             leaf_frame_offset: 0,
+            nested_frame: None,
             args: Vec::new(),
             lexical_env,
             env_stack: EnvStack::with_base(lexical_env),
@@ -3667,6 +3661,10 @@ impl Vm {
             switch_disc: self.switch_disc,
             switch_disc_set: self.switch_disc_set,
             chain_short: self.chain_short,
+            stack_len: self.stack.len(),
+            array_index_len: self.array_index_stack.len(),
+            var_ref_len: self.var_ref_stack.len(),
+            class_len: self.class_stack.len(),
         };
         self.ip = 0;
         self.acc = Value::Undefined;
@@ -3692,6 +3690,14 @@ impl Vm {
         self.switch_disc = scratch.switch_disc;
         self.switch_disc_set = scratch.switch_disc_set;
         self.chain_short = scratch.chain_short;
+        // A nested run's pushes above these cursors are dropped (the lane
+        // returns its result through the entry's return value, not the shared
+        // stack), so an error path inside it cannot leave a stale entry for
+        // the caller's next step.
+        self.stack.truncate(scratch.stack_len);
+        self.array_index_stack.truncate(scratch.array_index_len);
+        self.var_ref_stack.truncate(scratch.var_ref_len);
+        self.class_stack.truncate(scratch.class_len);
     }
 
     /// Reset a pooled Vm for a new run (the per-call reuse): the Vec
@@ -3709,6 +3715,7 @@ impl Vm {
         self.jit_roots.clear();
         self.leaf_frame_base = None;
         self.leaf_frame_offset = 0;
+        self.nested_frame = None;
         self.args.clear();
         self.lexical_env = lexical_env;
         self.env_stack.reset(lexical_env);
@@ -3828,7 +3835,14 @@ impl Vm {
         let slot = slot + self.leaf_frame_offset;
         match self.leaf_frame_base {
             Some(base) => &self.stack[base + slot],
-            None => Frame::get(&self.frame, slot),
+            None => match self.nested_frame {
+                // SAFETY: set only by a lane run, for that run's duration, to
+                // a buffer the lane holds alive (and roots in `jit_roots`);
+                // the compiled code that could alias it is suspended while a
+                // helper runs.
+                Some(frame) => unsafe { &*frame.add(slot) },
+                None => Frame::get(&self.frame, slot),
+            },
         }
     }
 
@@ -3837,7 +3851,11 @@ impl Vm {
         let slot = slot + self.leaf_frame_offset;
         match self.leaf_frame_base {
             Some(base) => &mut self.stack[base + slot],
-            None => Frame::get_mut(&mut self.frame, slot),
+            None => match self.nested_frame {
+                // SAFETY: see `frame_get`.
+                Some(frame) => unsafe { &mut *frame.add(slot) },
+                None => Frame::get_mut(&mut self.frame, slot),
+            },
         }
     }
 

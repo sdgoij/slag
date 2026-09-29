@@ -1880,7 +1880,16 @@ fn self_call_inline(ctx: &mut JitCallContext, args: *mut u64, argc: u64) -> Opti
     // caller). Both are restored on return.
     let saved_end = ctx.buf_end;
     ctx.buf_end = unsafe { buf.as_mut_ptr().add(buf_len) } as *mut c_void;
-    let array_len = unsafe { (&*ctx.vm).array_index_stack.len() };
+    // The nested frame is what the frame-reading Rust helpers must address
+    // (`frame_get`); install it for the run and restore the previous value
+    // after, so a nested self-call stacks correctly. The shared cursors are
+    // `save_scratch`'s. See `certified_call_inline`.
+    let saved_nested = unsafe {
+        let vm = &mut *ctx.vm;
+        let saved = vm.nested_frame;
+        vm.nested_frame = Some(buf.as_mut_ptr());
+        saved
+    };
     // The nested activation shares the caller's `Vm`, so the per-activation
     // scratch registers must not leak either way: a caller mid-`switch`
     // (fall-through), mid-optional-chain, mid-`s += e` append loop, or writing
@@ -1911,7 +1920,7 @@ fn self_call_inline(ctx: &mut JitCallContext, args: *mut u64, argc: u64) -> Opti
     unsafe {
         let vm = &mut *ctx.vm;
         vm.jit_roots.pop();
-        vm.array_index_stack.truncate(array_len);
+        vm.nested_frame = saved_nested;
         vm.restore_scratch(saved_scratch);
     }
     ctx.buf_end = saved_end;
@@ -1967,7 +1976,7 @@ fn certified_call_inline(
     // The same gate the self path uses: no `this`/`arguments`/capture context,
     // no try/for-in/for-of/destructure/suspend, no tail or vector-call step.
     // It is what makes a nested run on the shared `Vm` sound.
-    if !body.self_call_eligible() || !body.private_frame_safe() {
+    if !body.self_call_eligible() {
         return None;
     }
     // Compile (or promote) through the same choke point every other JIT site
@@ -2040,7 +2049,17 @@ fn certified_call_inline(
         vm.strict = strict;
         (scratch, saved)
     };
-    let array_len = unsafe { (&*ctx.vm).array_index_stack.len() };
+    // The frame-reading Rust helpers (`builder_bind`/`builder_store`,
+    // `create_function_decl`) resolve `frame_get` through `nested_frame`, so
+    // install the callee's buffer for the run — saving the previous value, so a
+    // nested lane run stacks correctly. The shared cursors a nested run must
+    // not leak into are `save_scratch`'s.
+    let saved_nested = unsafe {
+        let vm = &mut *ctx.vm;
+        let saved = vm.nested_frame;
+        vm.nested_frame = Some(buf.as_mut_ptr());
+        saved
+    };
     // Root the buffer for the call's duration (the Vm is already registered
     // with the active-run tracer): a helper it invokes can allocate and
     // trigger a collection, and a heap value only the buffer references must
@@ -2097,7 +2116,7 @@ fn certified_call_inline(
     unsafe {
         let vm = &mut *ctx.vm;
         vm.jit_roots.pop();
-        vm.array_index_stack.truncate(array_len);
+        vm.nested_frame = saved_nested;
         (
             vm.lexical_env,
             vm.body_context,
@@ -6042,6 +6061,10 @@ pub(crate) fn run_jit_body(
     // receive `&mut Vm` and may reallocate `vm.stack`, so the JIT's raw
     // pointers must never alias it. A small body fits a stack array (no
     // per-call heap allocation); larger bodies spill to a Vec.
+    debug_assert!(
+        vm.nested_frame.is_none(),
+        "run_jit_body addresses `vm.frame` directly, so a nested_frame pointer would disagree with the frame the entry is handed"
+    );
     let (frame_ptr, _frame_len): (*mut Value, usize) = match &mut vm.frame {
         crate::ir::Frame::Inline(buf) => (buf.as_mut_ptr(), buf.len()),
         crate::ir::Frame::Heap(vec) => (vec.as_mut_ptr(), vec.len()),

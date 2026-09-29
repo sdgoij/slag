@@ -867,6 +867,24 @@ The list, in the measured order:
       iterators, destructuring, suspension, tail and vector calls, generators,
       async functions, class constructors and non-ECMA callees all fall back to
       the funnel (which also ports and promotes them).
+  - **Cut 1b — landed (2026-09-29): the frame widening, so builder and
+    function-declaration callees take the lane.** `Vm::nested_frame` (a
+    `*mut Value` installed by both lanes for the run and restored to the
+    *previous* value, so nested runs stack) makes `frame_get`/`frame_get_mut`
+    resolve frame slots from the lane's private buffer, so the frame-reading
+    helpers (`builder_bind`/`builder_store`, `create_function_decl`) address the
+    callee's frame; `private_frame_safe` is gone. `VmScratch` also gained the
+    four shared cursor lengths (`stack`, `array_index_stack`, `var_ref_stack`,
+    `class_stack`) and truncates them on restore, closing the error-path leak
+    the widening exposed (a throw mid-`var x = …` or mid-class would otherwise
+    leave an entry in the caller's stack). `run_jit_body` `debug_assert`s
+    `nested_frame.is_none()` — it addresses `vm.frame` directly, so the two must
+    never disagree. Cost: the extra saves moved `non-leaf call` 5.40 → 5.5-5.9
+    ms (min 5.53 over three runs); the payoff is coverage — the corpus
+    `mean-jitGap` **78.33 → 70.14** over the 77 rows (`calls` 16.6 → 12.3,
+    `control` 31.4 → 21.2, `objects` 94.2 → 82.2). Mutation-checked: falling
+    back to `Frame::get` in the `nested_frame` arm makes the new builder-callee
+    test fail with `0.0` where it wants `500.0`.
   - **Cut 2 — the `ExecutionContext`.** ~15 ns a call and load-bearing for the
     callee's env and for `e.stack`; the leaf path already omits it and still
     names frames, so cut 2 is to (a) set `vm.lexical_env` directly (not via
@@ -1842,3 +1860,24 @@ One line per landed stage, newest last. This log is the arc's journal —
   regressed. The `resolve_binding_from` change is additive and
   behavior-preserving for the funnel path (the two envs are equal there), which
   is why the sweeps reproduce the baseline exactly.
+- **Stage 9, Cut 1b the frame widening (2026-09-29).** `Vm::nested_frame`
+  points `frame_get`/`frame_get_mut` at the lane's private buffer while a nested
+  run is active (restoring the previous value, so nested runs stack), so
+  `builder_bind`/`builder_store` and `create_function_decl` address the callee's
+  frame; `private_frame_safe` is removed and those bodies now take the lane.
+  `VmScratch` gained the four shared cursor lengths (`stack`,
+  `array_index_stack`, `var_ref_stack`, `class_stack`) and truncates them on
+  restore, closing the error-path leak the widening exposed. `run_jit_body`
+  `debug_assert`s `nested_frame.is_none()`. **Measured: `--jit-bench`
+  `non-leaf call` 5.40 → 5.5-5.9 ms (min 5.53 of three runs), a small cost for
+  coverage; the corpus `mean-jitGap` 78.33 → 70.14** (77 rows, 0 mismatches;
+  `calls` 16.6 → 12.3, `control` 31.4 → 21.2, `objects` 94.2 → 82.2). The new
+  test shapes (a builder callee, a function-declaration callee) are
+  mutation-checked: falling back to `Frame::get` in the `nested_frame` arm
+  fails them (`0.0` for `500.0`). Gates: fmt/clippy clean; workspace green
+  (`jit --lib` 239, `runtime --lib` 981); test262 `all` 48,464 / 0 fail / 158
+  skip and `intl402` 3,205 / 0 fail / 152 skip, both baseline; the eight wasm
+  suites 64,594 / 0 fail / 0 pending and JS-API 1,001 / 0 fail; corpus parity
+  0 mismatches. One pre-existing stray doc line ("The resumable VM state…",
+  present in the parent and attached to no item) was dropped while editing the
+  adjacent `VmScratch` doc.

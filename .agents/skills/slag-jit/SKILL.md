@@ -886,13 +886,14 @@ next widening (2b, the general call):
 
 `call_slow` gained a second fast path beside `self_call_inline`:
 `certified_call_inline` resolves the callee's `EcmaFunction` record, requires
-`self_call_eligible()` **and** `private_frame_safe()`, and runs the callee's
-compiled entry with a nested frame in a private buffer and its own
-`JitCallContext` — skipping `do_call_fast`/`ordinary_call`/`run_compiled_body`/
-`run_jit_body`, the pooled Vm take/reset, and the `ExecutionContext` push. A
-miss (ineligible, uncompiled, below threshold, sticky-refused) falls to the
-funnel, which ports and promotes. Measured 2.7× on `--jit-bench`'s
-`non-leaf call`. The traps, all of which produced a wrong answer first:
+`self_call_eligible()`, and runs the callee's compiled entry with a nested
+frame in a private buffer and its own `JitCallContext` — skipping
+`do_call_fast`/`ordinary_call`/`run_compiled_body`/`run_jit_body`, the pooled
+Vm take/reset, and the `ExecutionContext` push. A miss (ineligible, uncompiled,
+below threshold, sticky-refused) falls to the funnel, which ports and promotes.
+Measured 2.7× on `--jit-bench`'s `non-leaf call`; the widening below took the
+corpus `mean-jitGap` 78.3 → 70.1. The traps, all of which produced a wrong
+answer first:
 
 - **Every per-activation `Vm` scratch register must be saved AND reset, not
   merely saved.** Use `Vm::save_scratch`/`restore_scratch` (defined in
@@ -905,15 +906,28 @@ funnel, which ports and promotes. Measured 2.7× on `--jit-bench`'s
   `switch` across a self call). Private fields (`acc`, `loop_counter`,
   `loop_num`) are not reachable from `jit.rs`, which is why the helper lives on
   `Vm` in `ir.rs`.
-- **A private frame buffer is NOT `vm.frame`.** Helpers that read frame slots
-  through `Vm::frame_get`/`frame_get_mut` — `builder_bind`/`builder_store`
-  (`s += e` plans, including the register body's `LeafOp::BuilderAppend`) and
-  `create_function_decl` (a hoisted block function declaration) — would address
-  the *caller's* frame. So a body with those steps is refused by
-  `CompiledBody::private_frame_safe`. Symptom if forgotten: a callee whose
-  `s += n` loop silently wrote the caller's frame slot and returned `""`/`0`.
-  The other `vm.frame` helpers (`catch_bind`, `for_of_*`, `create_arguments`,
-  `tail_call_self_vector`) are already excluded by `self_call_eligible`.
+- **A private frame buffer is NOT `vm.frame`, so `Vm::nested_frame` must point
+  at it.** Helpers that read frame slots through `Vm::frame_get`/`frame_get_mut`
+  — `builder_bind`/`builder_store` (`s += e` plans, including the register
+  body's `LeafOp::BuilderAppend`) and `create_function_decl` (a hoisted block
+  function declaration) — would otherwise address the *caller's* frame. Both
+  lanes install `nested_frame = Some(buf.as_mut_ptr())` for the run and restore
+  the **previous** value (not `None` — a lane can nest, f→g→h, and a hard `None`
+  would strip the outer level's frame after an inner return). `frame_get`
+  precedence is `leaf_frame_base` (a leaf's frame in `vm.stack`) →
+  `nested_frame` → `Frame::get(&self.frame)`. Symptom if forgotten: a callee
+  whose `s += n` loop silently wrote the caller's frame slot and returned `""`/
+  `0`. `run_jit_body` addresses `vm.frame` directly, so it `debug_assert`s
+  `nested_frame.is_none()` — the two must never disagree. The remaining
+  `vm.frame` helpers (`catch_bind`, `for_of_*`, `create_arguments`,
+  `tail_call_self_vector`) are excluded by `self_call_eligible`.
+- **Isolate the shared cursors, on the error path too.** A nested run on the
+  caller's `Vm` shares `stack`, `array_index_stack`, `var_ref_stack` and
+  `class_stack`; a push it does not pop (a throw mid-`var x = …` or mid-class)
+  would otherwise leak an entry into the caller. `save_scratch` records all four
+  lengths and `restore_scratch` truncates back to them. This is *not* optional
+  once the gate admits builder and function-declaration bodies; the earlier
+  `private_frame_safe` refusal was what hid it.
 - **Compiled binding resolution must read `vm.lexical_env`, not the running
   `ExecutionContext`.** `load_ident`/`typeof_ident`/`resolve_var_ident`/
   `update_ident` used `context::resolve_binding`, which reads
