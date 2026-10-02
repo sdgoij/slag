@@ -465,8 +465,9 @@ jobs:
           merge-multiple: true
       - name: List the assets
         run: ls -la dist
-      # One checksum file for every archive, written where the release step can
-      # pick it up with the rest of `dist/*`.
+      # One checksum file for every archive. The conformance jobs upload their
+      # report files as artifacts too, so the release attaches the archives and
+      # this checksum by explicit pattern rather than all of `dist/*`.
       - name: Write SHA256SUMS
         working-directory: dist
         run: |
@@ -474,7 +475,10 @@ jobs:
           cat SHA256SUMS
       - uses: softprops/action-gh-release@v3
         with:
-          files: dist/*
+          files: |
+            dist/*.zip
+            dist/*.tar.gz
+            dist/SHA256SUMS
           generate_release_notes: true
           draft: false
           # A semver prerelease (`v0.2.0-rc.1`) publishes as a prerelease;
