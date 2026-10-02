@@ -974,10 +974,14 @@ GC-root discipline, the compile-size budget).
 
 ## 6. Out of scope, and the traps
 
-- **Not a TurboFan rewrite.** The plan works inside the per-`Step` lowering
-  and the helper ABI: inline fast paths with guards, wider use of the register
-  path, and a feedback record. A typed SSA IR is a different plan and would
-  need its own justification.
+- **Not a TurboFan rewrite — superseded 2026-10-02 by
+  `.notes/optimizing-tier-plan.md`.** This plan works inside the per-`Step`
+  lowering and the helper ABI: inline fast paths with guards, wider use of the
+  register path, and a feedback record. That subset is landed or measured, and
+  the 2026-10-02 baseline shows the rows still at the top need transforms this
+  plan cannot reach — inlining, escape analysis, LICM — which needs a JS-level
+  SSA IR. That is the subject of the successor plan; read this one for the
+  census (§3) and the traps, that one for the direction.
 - **Not more coverage.** `.notes/non-leaf-jit.md` is done; do not reopen it
   without a census that says a new shape refuses.
 - **Not row-only slices.** Four slices moved rows 17-46% and moved nothing

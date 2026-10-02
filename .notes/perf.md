@@ -9,11 +9,25 @@ runtime (consolidated 2026-09-05 from the earlier plan, task-list, and
 scratch documents — everything those files said lives here now). Reading
 order: the failed-experiments register and the state/remaining sections
 below summarize the whole effort; the `## Active plan` section carries the
-current arc's yardstick, slice status, and gates; the `## Benchmark gate`
+(superseded 2026-09-19) V8/`d8` arc's yardstick, slice status, and gates; the
+`## Benchmark gate`
 section is the dated journal of every landing and probe; the milestone
 sections near the end record the major rewrites (NaN-boxed values,
 shapes/IC, ropes, the bytecode VM, the GC); and the final section archives
 the two superseded planning documents verbatim for provenance.
+
+**Plan of record (2026-10-02): the JIT direction is `.notes/optimizing-tier-plan.md`**
+— the optimizing tier (per-site feedback, deopt, inlining, escape analysis,
+LICM, a JS-level SSA IR) — which supersedes `jit-quality-plan.md` §6's "Not a
+TurboFan rewrite". `.notes/jit-quality-plan.md` (2026-09-29) stays the census
+and the trap list: the measured helper-share inventory and stages G1–G21
+through the Stage 9 call-side redesign. The `## Active plan` arc and its gap
+ranking below (2026-09-19) are the *previous* arc and are superseded: 12+
+stages have landed since and several of their ratios have moved a lot
+(`method_call` 132.7 → 58.7 ms, `recursive_fib` ~290 → ~39.7 ms,
+`for_of_dense` 38.8 → 8.0 ms). Read this file for the history and the
+failed-experiment register; take current numbers from a fresh `tools/corpus`
+baseline, never from a stored ratio.
 
 ## Failed experiments
 
@@ -423,7 +437,7 @@ remaining work is the storage decision below — start it only behind a
 probe showing a >4-key compiled read/write row (or a chain-read row) is
 hot enough to justify the migration.
 
-## Active plan — the V8/d8 yardstick and the JIT-pessimization closure (2026-09-19)
+## Active plan — the V8/d8 yardstick and the JIT-pessimization closure (2026-09-19; superseded 2026-09-29)
 
 The 2026-09-05 status sections above closed every item they tracked. This
 is the next arc, and it changes two things about how work is judged: the
@@ -431,7 +445,10 @@ comparison target moves from the node bundle to a locally built `d8`, and
 the corpus gains an automated gate for the case where the JIT is *slower*
 than the interpreter.
 
-Slice status lives here; dated records land in the journal below.
+**Superseded — the plan of record is `.notes/jit-quality-plan.md`.** The slice
+table and gap ranking below are historical; live slice status now lives in that
+file, and dated records still land in the journal below. Re-baseline with
+`tools/corpus` before quoting any ratio from here.
 
 | # | slice | status |
 |---|---|---|
@@ -688,6 +705,16 @@ Everything scales, so **V8 eliminates nothing** and the large gaps are real
 work. `try_catch_loop` is the one outlier at 6.00; its per-iteration cost sits
 at ~0.33ns at both sizes, so it scales too and the superlinearity is in the
 small base measurement.
+
+**CORRECTED 2026-10-02 — "it scales" proves the loop, not the operation.** The
+scaling test cannot see an operation TurboFan removes while the loop's residual
+work runs on. The counterexample is `destructure`, re-checked on the 2026-10-02
+baseline: its arithmetic scales 3.96x, but a d8 `--trace-gc` shows the
+allocations are gone — **8 scavenges, all in the first 6 ms, then none**, against
+**64** for `--jitless` on the same file — so the row's 214x ratio is V8 removing
+the work (escape analysis), not doing it faster. Treat a d8 ratio as *work* only
+after a `--trace-gc` (allocation rows) agrees; the re-ordered target list from
+that baseline is the 2026-10-02 record in `.notes/jit-quality-plan.md`.
 
 **The machine-code prover** (`tools/corpus/foldcheck.sh` + `foldcheck.awk`).
 It forces a workload into TurboFan (`--allow-natives-syntax

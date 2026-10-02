@@ -17,11 +17,18 @@
 # the only signal that settles it, and it is what produced the 2026-09-19
 # result below.
 #
-# Measured 2026-09-19 (V8 15.6.0, this machine): every row scales ~3.7-4.1x,
-# so V8 eliminates NONE of these workloads — including `destructure`,
-# `try_catch_loop` and `push_pop`, which earlier notes described as
-# closed-form-folded. The large slag/d8 gaps on those rows are real work, not
-# an artifact of the comparison.
+# Measured 2026-09-19 (V8 15.6.0, this machine): every row scales ~3.7-4.1x.
+#
+# CORRECTED 2026-10-02: scaling proves the *loop* does real work; it does NOT
+# prove the *operation under test* survives. The counterexample is
+# `destructure`, whose residual `s += a + b + d` arithmetic scales 3.96x while
+# the 2 objects/iteration are gone: `d8 --trace-gc` prints **8 scavenges, all
+# in the first 6 ms** (warm-up), then none, against **64** for `--jitless` on
+# the same file. TurboFan's escape analysis scalar-replaced them, so that row's
+# 214x ratio is V8 removing the work, not doing it faster. This script is
+# therefore necessary-but-not-sufficient for allocation rows: pair it with a
+# `--trace-gc` before treating a ratio as work. `try_catch_loop`/`push_pop`
+# were not re-checked.
 #
 # The table is per-row and explicit: a workload's iteration count is a literal
 # in its own source, so there is nothing generic to rewrite. Add a row by
@@ -44,6 +51,28 @@ rows=(
   "language/statements/for-in/head-let-fresh-binding-per-iteration.js|s/__t262Iter < 100000/__t262Iter < 400000/"
   "builtins/map_churn.js|s/i < 300000/i < 1200000/"
   "control/switch_dispatch.js|s/i < 3000000/i < 12000000/"
+  # Added 2026-10-02 from the re-baseline. The top of the gap table is now rows
+  # whose d8 jit column sits at or below the unrolled-iteration floor (~0.2-0.3
+  # ns per iteration), so their ratio may be V8 eliminating the work rather
+  # than doing it faster. The opcost family all share `i < 100000`
+  # (gen_opcost.js's N).
+  "opcost/array_alloc.js|s/i < 100000/i < 400000/"
+  "opcost/object_alloc.js|s/i < 100000/i < 400000/"
+  "opcost/array_at.js|s/i < 100000/i < 400000/"
+  "opcost/obj_prop.js|s/i < 100000/i < 400000/"
+  "opcost/element_read.js|s/i < 100000/i < 400000/"
+  "opcost/element_write.js|s/i < 100000/i < 400000/"
+  "opcost/prim_prop.js|s/i < 100000/i < 400000/"
+  "opcost/method_call.js|s/i < 100000/i < 400000/"
+  "opcost/js_call.js|s/i < 100000/i < 400000/"
+  "opcost/array_reverse.js|s/i < 100000/i < 400000/"
+  "opcost/baseline.js|s/i < 100000/i < 400000/"
+  "opcost/string_charat.js|s/i < 100000/i < 400000/"
+  "opcost/array_for_each_js.js|s/i < 100000/i < 400000/"
+  "opcost/array_push.js|s/i < 100000/i < 400000/"
+  "strings/char_ops.js|s/i < 300000/i < 1200000/"
+  "strings/search_slice.js|s/i < 100000/i < 400000/"
+  "control/generator_loop.js|s/i < 200000/i < 800000/"
 )
 
 while [ $# -gt 0 ]; do
