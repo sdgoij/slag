@@ -1099,8 +1099,14 @@ impl Isolate {
     }
 
     /// Drain the microtask and job queues (`v8::Isolate::PerformMicrotaskCheckpoint`).
+    ///
+    /// A handle scope is opened for the drain: a job the engine runs may call a
+    /// host function, and that callback builds handles, which need an open
+    /// region. `deno_core` calls this on the bare isolate (no scope of its own),
+    /// so the checkpoint is a host entry point and provides one.
     pub fn run_microtasks(&mut self) -> Result<(), crux::error::JsError> {
-        self.engine_mut().run_microtasks()
+        crate::scope!(let scope, self);
+        scope.engine_mut().run_microtasks()
     }
 
     /// Add a microtask that calls `callback` with no arguments when the queues
@@ -1121,8 +1127,10 @@ impl Isolate {
     /// `Auto` policy: the crate swallows what a job throws, and this makes it the
     /// pending exception instead, so a host that wants to see it can.
     pub fn perform_microtask_checkpoint(&mut self) {
-        if let Err(error) = self.run_microtasks() {
-            crate::throw(self, &error);
+        crate::scope!(let scope, self);
+        let result = scope.engine_mut().run_microtasks();
+        if let Err(error) = result {
+            crate::throw(scope, &error);
         }
     }
 

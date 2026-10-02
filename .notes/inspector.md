@@ -159,16 +159,19 @@ Verified from `deno repl` on a Deno built by `tools/build-deno.py`: `1 + 1` →
    consumer in this tree. Add it only when a front end that reads it (Chrome
    DevTools) becomes a target.
 
-   **Blocker found while testing (pre-existing, not this work).** Driving an
-   uncaught throw through the REPL panics inside the bridge:
+   **Blocker found while testing, and fixed.** Driving an uncaught throw
+   through the REPL panicked inside the bridge:
    `bridge bug: a handle was made with no handle scope open`
    (`crates/v8/store.rs:218`), reached from
-   `Isolate::perform_microtask_checkpoint` → a snapshot host callback →
-   `Local::from_engine` with no region open. No `inspector` frame is on the
-   stack, and `deno eval` with the same input is fine — the REPL is what calls
-   `perform_microtask_checkpoint`. So the notification is implemented and
-   unit-tested, but cannot be exercised end-to-end from `deno repl` until that
-   separate microtask-drain scope bug is fixed.
+   `Isolate::perform_microtask_checkpoint` -> a snapshot host callback ->
+   `Local::from_engine` with no region open. No `inspector` frame was on the
+   stack, and `deno eval` was fine with the same input. The cause: the bridge's
+   `run_microtasks` / `perform_microtask_checkpoint` are host entry points that
+   drain jobs, but `deno_core` calls them on the bare isolate with no handle
+   scope open, so a job that invokes a host callback had no region. Each now
+   opens a scope for the drain (`crates/v8/isolate.rs`). Verified: the microtask
+   throw now prints `Uncaught Error: micro boom` through
+   `Runtime.exceptionThrown`, with no panic.
 5. **Re-release the refusal.** The `Runtime` methods above are answered and
    `can_dispatch_method` says so; every other method (the `Debugger`/`Profiler`
    domains, `getProperties`, stepping, pause) still aborts with `NO_INSPECTOR`,
