@@ -128,7 +128,7 @@ await check("node:path / node:os / node:buffer", async () => {
   eq(slash(path.join("a", "b", "..", "c")), "a/c", "path.join");
   eq(path.basename("/x/y/z.txt"), "z.txt", "path.basename");
   eq(path.extname("a.tar.gz"), ".gz", "path.extname");
-  eq(path.isAbsolute("C:/x"), true, "path.isAbsolute");
+  eq(path.isAbsolute(Deno.build.os === "windows" ? "C:/x" : "/x"), true, "path.isAbsolute");
 
   const os = await import("node:os");
   eq(typeof os.platform(), "string", "os.platform");
@@ -197,7 +197,13 @@ await check("node:crypto + node:assert + node:url", async () => {
 
   if (part === "url" || part === "all") {
     const url = await import("node:url");
-    eq(url.fileURLToPath("file:///C:/x/y.txt").replace(/\\/g, "/"), "C:/x/y.txt", "fileURLToPath");
+    // A Windows file URL keeps its drive letter; a POSIX one is rooted at `/`.
+    const windows = Deno.build.os === "windows";
+    eq(
+      url.fileURLToPath(windows ? "file:///C:/x/y.txt" : "file:///x/y.txt").replace(/\\/g, "/"),
+      windows ? "C:/x/y.txt" : "/x/y.txt",
+      "fileURLToPath",
+    );
   }
 });
 
@@ -519,4 +525,7 @@ for (const [name, detail] of failures) {
   console.log("");
   console.log("=== " + name + " ===");
   console.log(detail);
+}
+if (failures.length > 0) {
+  Deno.exit(1);
 }

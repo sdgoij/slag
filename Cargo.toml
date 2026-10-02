@@ -21,10 +21,11 @@ members = [
 ]
 
 # A bare `cargo build`/`cargo test` at the root builds these; `crates/jsc`
-# (the drop-in JavaScriptCore C API) is deliberately left out — build it on
-# request with `cargo build -p jsc` or alongside the CLI with
-# `cargo build -p cli --features jsc`. `cargo build --workspace` still
-# covers everything.
+# (the drop-in JavaScriptCore C API) and `crates/v8` (the `rusty_v8` stand-in
+# Deno is built against) are deliberately left out. Build them on request:
+# `cargo build -p jsc` (or `cargo build -p cli --features jsc`), and
+# `cargo build -p v8` (or `tools/build-deno.py`, the bridge's one consumer).
+# `cargo build --workspace` still covers everything.
 default-members = [
     "crates/unicode",
     "crates/byteblock",
