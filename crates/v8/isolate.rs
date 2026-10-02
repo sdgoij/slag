@@ -1921,6 +1921,15 @@ impl runtime::HostHooks for BridgeHooks {
         } else {
             PromiseRejectEvent::PromiseRejectWithNoHandler
         };
+        // The host callback builds handles, so it runs under a callback scope:
+        // this hook is reached from the engine (a rejection the queue drain or
+        // the collector surfaces), not from a scope the host opened. As
+        // `prepare_stack_trace` below, the isolate's realm is the context.
+        let Some(context) = isolate.current_context() else {
+            return Ok(());
+        };
+        let context_local = Local::<Context>::from_payload(Payload::Context(context));
+        crate::callback_scope!(unsafe _scope, context_local);
         let message = PromiseRejectMessage::new(isolate, *promise, event, reason.copied());
         // SAFETY: the host installed this callback to be called with a
         // rejection, and this is that call, on the thread owning the isolate.

@@ -69,8 +69,11 @@ impl MicrotaskQueue {
     /// we stand in for swallows what a job throws, and this makes it the pending
     /// exception instead, so a host that wants to see it can.
     pub fn perform_checkpoint(&self, isolate: &mut Isolate) {
-        if let Err(error) = isolate.engine_mut().run_microtask_queue(self.id) {
-            crate::throw(isolate, &error);
+        // A handle scope for the drain, as the isolate's own checkpoint opens: a
+        // job may run a host callback, which builds handles and needs a region.
+        crate::scope!(let scope, isolate);
+        if let Err(error) = scope.engine_mut().run_microtask_queue(self.id) {
+            crate::throw(scope, &error);
         }
     }
 }

@@ -188,3 +188,22 @@ Verified from `deno repl` on a Deno built by `tools/build-deno.py`: `1 + 1` →
   what `cli`'s `cdp` types demand, and they deserialize strictly.
 - Handles are roots; without `releaseObject` the table grows for the life of a
   session. Acceptable for a REPL, worth bounding before any `--inspect` claim.
+
+## 9. The host-entry-point scope scan
+
+Fixing the microtask drain (§7) prompted a scan for the same shape elsewhere: a
+bridge entry point the engine or `deno_core` invokes *outside* any handle scope,
+which then runs a job or a host callback that builds handles — a panic in
+`store::cell` ("a handle was made with no handle scope open"). Found and fixed:
+
+- `Isolate::run_microtasks` / `perform_microtask_checkpoint` (`crates/v8/isolate.rs`) — the original, exercised from `deno repl`.
+- `MicrotaskQueue::perform_checkpoint` (`crates/v8/microtask.rs`) — the host-owned queue deno's `vm` drains; the same drain, with no scope.
+- `BridgeHooks::promise_rejection_tracker` (`crates/v8/isolate.rs`) — invoked the host's reject callback with no scope, unlike its sibling `prepare_stack_trace`, which opens a `callback_scope!`.
+
+Already correct, checked: the other `HostHooks` callbacks (`prepare_stack_trace`, `wasm_streaming`, `import_module_dynamically`, `initialize_import_meta_object`, `allow_wasm_code_generation`), the module resolver/loader callbacks, the interceptor callbacks, `Function::call`, and `Platform::run_idle_tasks` all open a scope. `IsolateGcObserver::run` (`crates/v8/heap.rs`) invokes GC callbacks with no scope, but V8's contract is that a GC callback allocates no JS, so it is left as is.
+
+The stray `Error:` line above a report is not this class: it is the REPL's own
+`closing()` probe (`deno/cli/tools/repl/mod.rs:67`), whose `Runtime.callFunctionOn`
+returns no value because the uncaught throw terminated execution. The same throw
+is still reported once through `Runtime.exceptionThrown`, and the REPL recovers
+on the next line.
