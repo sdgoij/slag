@@ -6,53 +6,40 @@
 //! is engine work (the plan calls it "the inspector protocol" for that reason),
 //! not bridging work.
 //!
-//! The tier splits, and each half says so where a host meets it:
+//! What the bridge *can* serve is the slice of the protocol that only needs to
+//! evaluate JavaScript on the running isolate: the `Runtime` domain the REPL
+//! drives (`Runtime.enable`, `Runtime.evaluate`, `Runtime.callFunctionOn`). That
+//! much is implemented here, against the isolate and realm `create` and
+//! `context_created` were handed. Everything a real debugger needs — breakpoints,
+//! stepping, `Runtime.getProperties`, the `Debugger`/`Profiler` domains, pausing
+//! — is still refused (see [`NO_INSPECTOR`]).
 //!
-//! * **Creation, the context lifecycle and a connection are inert.**
-//!   [`V8Inspector::create`] answers a real inspector,
-//!   [`context_created`](V8Inspector::context_created),
-//!   [`context_destroyed`](V8Inspector::context_destroyed) and
-//!   [`exception_thrown`](V8Inspector::exception_thrown) record nothing, and
-//!   [`connect`](V8Inspector::connect) answers a session. That is what a host
-//!   needs to *boot*, and the connection has to be usable rather than refused:
-//!   `deno_core` creates an inspector for every runtime, and deno's CLI connects
-//!   a session for **every worker** whether or not a debugger ever attaches —
-//!   `cli/lib/worker.rs` stores the main runtime's session sender
-//!   unconditionally and the worker's event loop turns that into `connect` — so
-//!   refusing the connection would make a worker impossible rather than
-//!   undebuggable. None of these calls is read back by the engine, so a program
-//!   that never inspects cannot observe them.
-//! * **The protocol refuses.** A session answers `can_dispatch_method` `false`
-//!   for everything, and every method a front end would drive —
-//!   `dispatch_protocol_message`, `schedule_pause_on_next_statement`,
-//!   `cancel_pause_on_next_statement` — aborts with the reason. The refusal
-//!   therefore happens at the first message a debugger *sends* rather than at the
-//!   connection, and that is the same bet the module always made, one step later:
-//!   a host that attaches a debugger is told at once instead of waiting on a
-//!   session that never answers. The alternatives stay rejected — a silent session
-//!   a debugger hangs on, and a protocol answering every method with an error a
-//!   host cannot distinguish from a bug — and what the split buys is that a
-//!   connection is inert rather than a facade: nothing is ever sent to the
-//!   channel, and a session exists only because a host that boots one
-//!   unconditionally has to be able to.
-//!
-//! The *data* types here are real, and tested: [`StringView`], [`StringBuffer`],
+//! The data types are real, and tested: [`StringView`], [`StringBuffer`],
 //! [`Channel`] and the client trait are Rust values that do what their names
 //! say, so a host's own `ChannelImpl` and `V8InspectorClientImpl` compile
 //! against the same shapes `deno_core` implements.
 
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::fmt;
 use std::marker::PhantomData;
+use std::rc::{Rc, Weak};
 
-use crate::data::{Context, Value};
-use crate::handle::Local;
+use crate::data::{Array, Boolean, Context, Number, Object, String as JsString, Value};
+use crate::handle::{Global, Local};
+use crate::scope::{ContextScope, PinScope};
 use crate::support::{UniquePtr, UniqueRef};
+use crate::{Isolate, UnsafeRawIsolatePtr, null, undefined};
 
-/// The one reason every *protocol* operation here refuses, so a host reads the
-/// same sentence wherever it runs into the wall. Creation, the context lifecycle
-/// and a connection do not use it: they are inert, as the module documentation
-/// says.
+/// The one reason every *protocol* operation this bridge does not serve refuses,
+/// so a host reads the same sentence wherever it runs into the wall.
 const NO_INSPECTOR: &str = "Slag has no inspector: no breakpoints, no stepping, no debug protocol, and no way to stop a running script";
+
+/// The context id reported to a front end (`Runtime.executionContextCreated`).
+///
+/// The engine has one realm per isolate, so one id is enough — and it must not
+/// be zero, which the REPL treats as "no context".
+const CONTEXT_ID: i64 = 1;
 
 /// A string the inspector passes around, whose code units may be one byte or
 /// two (`v8::inspector::StringView`).
@@ -121,9 +108,6 @@ impl StringView<'_> {
 
 /// Rendering a view gives the text it holds: one-byte units are Latin-1, two-byte
 /// units are UTF-16 (lossily, as a lone surrogate has no text to render).
-///
-/// The crate we stand in for prints a two-byte view as an array of numbers,
-/// which is a rendering of the units rather than of the text; this is the text.
 impl fmt::Display for StringView<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -154,9 +138,6 @@ impl StringBuffer {
 
 /// How a host's session sends messages to a debugger front end
 /// (`v8::inspector::ChannelImpl`).
-///
-/// A host implements this; nothing here calls it, because nothing here has
-/// messages to send.
 pub trait ChannelImpl {
     /// Answer a protocol call.
     fn send_response(&self, call_id: i32, message: UniquePtr<StringBuffer>);
@@ -207,10 +188,6 @@ pub struct V8StackTrace(PhantomData<*const ()>);
 
 /// What a host tells the inspector while it debuggers
 /// (`v8::inspector::V8InspectorClientImpl`).
-///
-/// Every method has the crate we stand in for's default, so a host implements
-/// only what it needs. Nothing here calls them: a client is only reached through
-/// a created inspector.
 #[allow(unused_variables)]
 pub trait V8InspectorClientImpl {
     /// A pause has begun and the host's loop should run.
@@ -254,8 +231,7 @@ pub trait V8InspectorClientImpl {
 
 /// A host's inspector client (`v8::inspector::V8InspectorClient`).
 pub struct V8InspectorClient(
-    /// The host's implementation, held only for its `Drop`: the engine is what
-    /// would call it, and there is no inspector to call it from.
+    /// The host's implementation, held only for its `Drop`.
     #[allow(dead_code)]
     Box<dyn V8InspectorClientImpl>,
 );
@@ -284,45 +260,101 @@ pub enum V8InspectorClientTrustLevel {
     FullyTrusted = 1,
 }
 
+/// The `objectId`s a front end holds, so a value it was handed keeps its
+/// identity across messages (`Runtime.RemoteObjectId`).
+///
+/// Every entry is a [`Global`], which pins what it names: a handle a front end
+/// still holds is a root, which is `v8`'s own semantics.
+#[derive(Default)]
+struct HandleTable {
+    next: u64,
+    values: HashMap<String, Global<Value>>,
+}
+
+impl HandleTable {
+    fn insert(&mut self, value: Global<Value>) -> String {
+        let id = format!("slag:{}", self.next);
+        self.next += 1;
+        self.values.insert(id.clone(), value);
+        id
+    }
+
+    fn get(&self, id: &str) -> Option<Global<Value>> {
+        self.values.get(id).cloned()
+    }
+}
+
+/// What the inspector and every session it hands out share: the isolate to
+/// evaluate on, the realm it was told about, and the handles live front ends
+/// hold. A `Rc` because `deno_core` keeps the inspector for the runtime's life
+/// and connects a session per worker off it.
+struct InspectorShared {
+    /// The isolate the runtime runs on. The runtime owns the isolate and the
+    /// inspector together, so a session can hold the raw handle and reconstruct
+    /// a scope when it evaluates.
+    isolate: UnsafeRawIsolatePtr,
+    /// The realm `context_created` named, as a persistent handle.
+    context: RefCell<Option<Global<Context>>>,
+    /// The `objectId`s handed to a front end.
+    handles: RefCell<HandleTable>,
+    /// The channels of the sessions a front end connected, so an event the
+    /// inspector itself raises — `Runtime.exceptionThrown` — can reach every one
+    /// of them. `Weak` because a session owns its channel, not the inspector.
+    channels: RefCell<Vec<Weak<Channel>>>,
+}
+
+impl InspectorShared {
+    /// The isolate as an owned handle for a scope to borrow.
+    fn isolate(&self) -> Isolate {
+        // SAFETY: the runtime keeps the isolate alive for at least as long as
+        // it keeps the inspector, and a session only runs under a live runtime.
+        unsafe { Isolate::from_raw_isolate_ptr(self.isolate) }
+    }
+
+    /// Send an event to every connected session, dropping the channels whose
+    /// session is gone.
+    fn broadcast(&self, method: &str, params: serde_json::Value) {
+        let body = serde_json::json!({ "method": method, "params": params }).to_string();
+        self.channels.borrow_mut().retain(|channel| {
+            if let Some(channel) = channel.upgrade() {
+                channel.send_notification(StringBuffer::create(StringView::from(body.as_bytes())));
+                true
+            } else {
+                false
+            }
+        });
+    }
+}
+
 /// The inspector itself (`v8::inspector::V8Inspector`).
 ///
-/// An inspector with no debugger behind it.
-///
-/// **Inert.** [`create`](Self::create) answers one so a host can boot, the
-/// context lifecycle records nothing, and a connection is inert while the
-/// protocol refuses at its first message. The type exists so a host's own
-/// inspector wrapper — `deno_core`'s `JsRuntimeInspector`, which holds an
-/// `Rc<V8Inspector>` — has something to name and to hand around.
+/// Creation, the context lifecycle and a connection answer; the `Runtime` half
+/// of the protocol is served on the realm the runtime named; the rest refuses.
 pub struct V8Inspector {
-    /// The client, held as the crate we stand in for holds it: for the
-    /// inspector's lifetime. Nothing here calls it, because only a debugger
-    /// would.
+    #[allow(dead_code)]
     _client: V8InspectorClient,
+    shared: Rc<InspectorShared>,
 }
 
 impl V8Inspector {
     /// Create an inspector for `isolate` (`v8::inspector::V8Inspector::Create`).
-    ///
-    /// The inspector is inert: it observes no isolate and reports nothing. What
-    /// it buys is that a host which starts a runtime *with* an inspector — which
-    /// `deno_core` does for every runtime — runs, and what it does not buy is a
-    /// debugger: a host that attaches one still meets the wall at
-    /// [`connect`](Self::connect).
     #[allow(clippy::new_ret_no_self)]
     pub fn create(isolate: &mut crate::Isolate, client: V8InspectorClient) -> V8Inspector {
-        let _ = isolate;
-        V8Inspector { _client: client }
+        V8Inspector {
+            _client: client,
+            shared: Rc::new(InspectorShared {
+                // SAFETY: the isolate is alive here, and the runtime keeps it
+                // alive for as long as this inspector.
+                isolate: unsafe { isolate.as_raw_isolate_ptr() },
+                context: RefCell::new(None),
+                handles: RefCell::new(HandleTable::default()),
+                channels: RefCell::new(Vec::new()),
+            }),
+        }
     }
 
     /// Connect a front end to this inspector
     /// (`v8::inspector::V8Inspector::connect`).
-    ///
-    /// Inert, and deliberately so: the session answers nothing and the channel is
-    /// never written to, but the call succeeds. A host may connect one before it
-    /// knows a debugger exists — deno's CLI does that for every worker — and a
-    /// refusal here would take the whole host down rather than the debugger. What
-    /// refuses is the first protocol message a front end sends, which is where a
-    /// host can still be told at once (see the module documentation).
     pub fn connect(
         &self,
         context_group_id: i32,
@@ -331,15 +363,19 @@ impl V8Inspector {
         client_trust_level: V8InspectorClientTrustLevel,
     ) -> V8InspectorSession {
         let _ = (context_group_id, state, client_trust_level);
-        V8InspectorSession { _channel: channel }
+        let channel = Rc::new(channel);
+        self.shared
+            .channels
+            .borrow_mut()
+            .push(Rc::downgrade(&channel));
+        V8InspectorSession {
+            channel,
+            shared: self.shared.clone(),
+        }
     }
 
-    /// Tell the inspector about a context
+    /// Remember the realm a front end's `Runtime.evaluate` will run in
     /// (`v8::inspector::V8Inspector::contextCreated`).
-    ///
-    /// Inert: the name and the aux data a host passes describe the context to a
-    /// debugger, and there is none. A runtime makes this call whether or not one
-    /// ever connects, which is why it must not refuse.
     pub fn context_created(
         &self,
         context: Local<Context>,
@@ -347,15 +383,16 @@ impl V8Inspector {
         human_readable_name: StringView,
         aux_data: StringView,
     ) {
-        let _ = (context, context_group_id, human_readable_name, aux_data);
+        let _ = (context_group_id, human_readable_name, aux_data);
+        let isolate = self.shared.isolate();
+        *self.shared.context.borrow_mut() = Some(Global::new(&isolate, context));
     }
 
-    /// Tell the inspector a context is gone
+    /// Forget the realm a front end's calls would run in
     /// (`v8::inspector::V8Inspector::contextDestroyed`).
-    ///
-    /// Inert, for the same reason as [`context_created`](Self::context_created).
     pub fn context_destroyed(&self, context: Local<Context>) {
         let _ = context;
+        *self.shared.context.borrow_mut() = None;
     }
 
     /// Wrap a stack trace for the inspector
@@ -371,13 +408,11 @@ impl V8Inspector {
         UniquePtr::from(UniqueRef::new(V8StackTrace(PhantomData)))
     }
 
-    /// Report an exception to the inspector
+    /// Report an uncaught exception to every connected front end
     /// (`v8::inspector::V8Inspector::exceptionThrown`).
     ///
-    /// Inert: nothing is reported, and the exception id V8 would answer is `0`.
-    /// The runtime's own handling does not depend on it — `deno_core` calls this
-    /// while dispatching an uncaught exception and then terminates the script
-    /// itself (`libs/core/error.rs`).
+    /// Emits `Runtime.exceptionThrown`, which is how the REPL surfaces a throw
+    /// that happens outside an `evaluate` — an unhandled rejection, a timer.
     #[allow(clippy::too_many_arguments)]
     pub fn exception_thrown(
         &self,
@@ -393,8 +428,6 @@ impl V8Inspector {
     ) -> u32 {
         let _ = (
             context,
-            message,
-            exception,
             detailed_message,
             url,
             line_number,
@@ -402,46 +435,125 @@ impl V8Inspector {
             stack_trace,
             script_id,
         );
-        0
+        self.shared.broadcast(
+            "Runtime.exceptionThrown",
+            serde_json::json!({
+                "exceptionDetails": {
+                    "text": message.to_string(),
+                    "exception": {
+                        "type": "object",
+                        "subtype": "error",
+                        "description": self.describe_exception(exception),
+                    },
+                }
+            }),
+        );
+        1
+    }
+
+    /// `String(exception)` in the realm, for the notification's description.
+    fn describe_exception(&self, exception: Local<Value>) -> String {
+        let mut isolate = self.shared.isolate();
+        crate::scope!(let scope, &mut isolate);
+        let Some(context) = self
+            .shared
+            .context
+            .borrow()
+            .as_ref()
+            .map(|global| global.get(scope))
+        else {
+            return "Uncaught".to_string();
+        };
+        let scope = &mut ContextScope::new(scope, context);
+        exception.to_rust_string_lossy(scope)
     }
 }
 
 /// A front end's connection to the inspector
 /// (`v8::inspector::V8InspectorSession`).
 ///
-/// The connection is inert: a value of this type is obtained from
-/// [`V8Inspector::connect`], it holds the host's channel, nothing is ever sent to
-/// that channel, and the protocol methods below abort with the reason at the
-/// first call.
+/// Serves the `Runtime` domain the REPL drives; every other protocol method
+/// aborts with the reason at the first call.
 pub struct V8InspectorSession {
-    /// The channel, held as the crate we stand in for holds it: for the session's
-    /// lifetime. Nothing here writes to it.
-    _channel: Channel,
+    channel: Rc<Channel>,
+    shared: Rc<InspectorShared>,
 }
 
 impl V8InspectorSession {
     /// Whether the protocol has a handler for `method`
     /// (`v8::inspector::V8InspectorSession::canDispatchMethod`).
-    ///
-    /// Answers `false` for everything, which is the truth: there is no protocol
-    /// and no handler.
     pub fn can_dispatch_method(method: StringView) -> bool {
-        let _ = method;
-        false
+        matches!(
+            method.to_string().as_str(),
+            "Runtime.enable" | "Runtime.evaluate" | "Runtime.callFunctionOn"
+        )
     }
 
-    /// Dispatch a protocol message (`v8::inspector::V8InspectorSession::dispatchProtocolMessage`).
+    /// Dispatch a protocol message
+    /// (`v8::inspector::V8InspectorSession::dispatchProtocolMessage`).
     ///
     /// # Panics
     ///
-    /// Always, and this is the point the module chooses: a session can be
-    /// connected — a host that boots one unconditionally has to be able to — but
-    /// the first message a front end sends is where a debugger is told the truth
-    /// rather than left waiting. Reachable exactly when something speaks the
-    /// protocol, and reaching it is the loud failure the tier promises.
+    /// For every method the `Runtime` slice does not serve: a front end that
+    /// asks for the debugger is told at once rather than left waiting.
     pub fn dispatch_protocol_message(&self, message: StringView) {
-        let _ = message;
-        panic!("v8::inspector::V8InspectorSession::dispatch_protocol_message: {NO_INSPECTOR}")
+        let text = message.to_string();
+        let Ok(request) = serde_json::from_str::<serde_json::Value>(&text) else {
+            return;
+        };
+        let id = request.get("id").and_then(|id| id.as_i64());
+        let method = request.get("method").and_then(|m| m.as_str()).unwrap_or("");
+        let params = request
+            .get("params")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
+
+        match method {
+            "Runtime.enable" => {
+                if let Some(id) = id {
+                    self.respond(id, serde_json::json!({}));
+                }
+                self.notify(
+                    "Runtime.executionContextCreated",
+                    serde_json::json!({
+                        "context": {
+                            "id": CONTEXT_ID,
+                            "auxData": { "isDefault": true, "type": "default" },
+                        }
+                    }),
+                );
+            }
+            "Runtime.evaluate" => {
+                let expression = params
+                    .get("expression")
+                    .and_then(|e| e.as_str())
+                    .unwrap_or("");
+                if let Some(id) = id {
+                    self.respond(id, self.evaluate(expression));
+                }
+            }
+            "Runtime.callFunctionOn" => {
+                let declaration = params
+                    .get("functionDeclaration")
+                    .and_then(|d| d.as_str())
+                    .unwrap_or("function () {}");
+                let object_id = params.get("objectId").and_then(|o| o.as_str());
+                let arguments = params
+                    .get("arguments")
+                    .and_then(|a| a.as_array())
+                    .cloned()
+                    .unwrap_or_default();
+                if let Some(id) = id {
+                    self.respond(
+                        id,
+                        self.call_function_on(declaration, object_id, &arguments),
+                    );
+                }
+            }
+            _ => panic!(
+                "v8::inspector::V8InspectorSession::dispatch_protocol_message: {NO_INSPECTOR}"
+            ),
+        }
     }
 
     /// Ask to pause at the next statement
@@ -449,8 +561,7 @@ impl V8InspectorSession {
     ///
     /// # Panics
     ///
-    /// Always, for the same reason as
-    /// [`dispatch_protocol_message`](Self::dispatch_protocol_message).
+    /// Always: there is no pause.
     pub fn schedule_pause_on_next_statement(&self, reason: StringView, detail: StringView) {
         let _ = (reason, detail);
         panic!(
@@ -463,11 +574,298 @@ impl V8InspectorSession {
     ///
     /// # Panics
     ///
-    /// Always, for the same reason as
-    /// [`dispatch_protocol_message`](Self::dispatch_protocol_message).
+    /// Always: there is no pause.
     pub fn cancel_pause_on_next_statement(&self) {
         panic!("v8::inspector::V8InspectorSession::cancel_pause_on_next_statement: {NO_INSPECTOR}")
     }
+
+    /// Answer a request: `{ "id": id, "result": result }`, the envelope
+    /// `deno_core`'s channel forwards verbatim and the REPL unwraps.
+    fn respond(&self, id: i64, result: serde_json::Value) {
+        let body = serde_json::json!({ "id": id, "result": result }).to_string();
+        self.channel.send_response(
+            id as i32,
+            StringBuffer::create(StringView::from(body.as_bytes())),
+        );
+    }
+
+    /// Send an event: `{ "method": method, "params": params }`.
+    fn notify(&self, method: &str, params: serde_json::Value) {
+        let body = serde_json::json!({ "method": method, "params": params }).to_string();
+        self.channel
+            .send_notification(StringBuffer::create(StringView::from(body.as_bytes())));
+    }
+
+    fn context_local<'s>(&self, scope: &PinScope<'s, '_, ()>) -> Option<Local<'s, Context>> {
+        self.shared
+            .context
+            .borrow()
+            .as_ref()
+            .map(|global| global.get(scope))
+    }
+
+    fn lookup_handle<'s, 'i>(
+        &self,
+        scope: &PinScope<'s, 'i, Context>,
+        id: &str,
+    ) -> Option<Local<'s, Value>> {
+        let global = self.shared.handles.borrow().get(id)?;
+        Some(global.get(scope))
+    }
+
+    fn store_handle(&self, value: Local<Value>) -> String {
+        let isolate = self.shared.isolate();
+        let global = Global::new(&isolate, value);
+        self.shared.handles.borrow_mut().insert(global)
+    }
+
+    /// Evaluate `expression` as a script in the realm and shape the answer as a
+    /// `Runtime.evaluate` result: `{ result, exceptionDetails }`.
+    fn evaluate(&self, expression: &str) -> serde_json::Value {
+        let mut isolate = self.shared.isolate();
+        crate::scope!(let scope, &mut isolate);
+        let Some(context) = self.context_local(scope) else {
+            return missing_context();
+        };
+        let scope = &mut ContextScope::new(scope, context);
+        let Some(code) = JsString::new(scope, expression) else {
+            return self.exception_response(scope);
+        };
+        match crate::Script::compile(scope, code, None) {
+            Some(script) => match script.run(scope) {
+                Some(value) => serde_json::json!({
+                    "result": self.remote_object(scope, value),
+                    "exceptionDetails": serde_json::Value::Null,
+                }),
+                None => self.exception_response(scope),
+            },
+            None => self.exception_response(scope),
+        }
+    }
+
+    /// Call a function expression with a receiver and arguments, shaped as a
+    /// `Runtime.callFunctionOn` result.
+    fn call_function_on(
+        &self,
+        declaration: &str,
+        object_id: Option<&str>,
+        arguments: &[serde_json::Value],
+    ) -> serde_json::Value {
+        let mut isolate = self.shared.isolate();
+        crate::scope!(let scope, &mut isolate);
+        let Some(context) = self.context_local(scope) else {
+            return missing_context();
+        };
+        let scope = &mut ContextScope::new(scope, context);
+        let receiver = match object_id.and_then(|id| self.lookup_handle(scope, id)) {
+            Some(value) => value,
+            None => {
+                // No receiver: the realm's global object, as V8 does when only a
+                // context is named.
+                let global = Local::<Object>::from_engine(crate::realm_of(scope).global());
+                global.into()
+            }
+        };
+        let source = format!("({declaration})");
+        let Some(code) = JsString::new(scope, &source) else {
+            return self.exception_response(scope);
+        };
+        let function = match crate::Script::compile(scope, code, None)
+            .and_then(|script| script.run(scope))
+            .and_then(|value| Local::<crate::Function>::try_from(value).ok())
+        {
+            Some(function) => function,
+            None => return self.exception_response(scope),
+        };
+        let values: Vec<Local<Value>> = arguments
+            .iter()
+            .map(|argument| self.call_argument(scope, argument))
+            .collect();
+        match function.call(scope, receiver, &values) {
+            Some(value) => serde_json::json!({
+                "result": self.remote_object(scope, value),
+                "exceptionDetails": serde_json::Value::Null,
+            }),
+            None => self.exception_response(scope),
+        }
+    }
+
+    /// A `CallArgument` as a value: a handle the front end holds, an
+    /// unserializable primitive, or a JSON value.
+    fn call_argument<'s, 'i>(
+        &self,
+        scope: &PinScope<'s, 'i, Context>,
+        argument: &serde_json::Value,
+    ) -> Local<'s, Value> {
+        if let Some(id) = argument.get("objectId").and_then(|id| id.as_str())
+            && let Some(value) = self.lookup_handle(scope, id)
+        {
+            return value;
+        }
+        if let Some(raw) = argument
+            .get("unserializableValue")
+            .and_then(|raw| raw.as_str())
+        {
+            match raw {
+                "NaN" => return Number::new(scope, f64::NAN).into(),
+                "Infinity" => return Number::new(scope, f64::INFINITY).into(),
+                "-Infinity" => return Number::new(scope, f64::NEG_INFINITY).into(),
+                "-0" => return Number::new(scope, -0.0).into(),
+                _ => {
+                    if let Some(digits) = raw.strip_suffix('n')
+                        && let Ok(value) = digits.parse::<i64>()
+                    {
+                        return Number::new(scope, value as f64).into();
+                    }
+                }
+            }
+        }
+        match argument.get("value") {
+            Some(serde_json::Value::Null) => null(scope).into(),
+            Some(serde_json::Value::Bool(value)) => Boolean::new(scope, *value).into(),
+            Some(serde_json::Value::Number(value)) => {
+                Number::new(scope, value.as_f64().unwrap_or(f64::NAN)).into()
+            }
+            Some(serde_json::Value::String(value)) => JsString::new(scope, value)
+                .map(|string| string.into())
+                .unwrap_or_else(|| undefined(scope).into()),
+            _ => undefined(scope).into(),
+        }
+    }
+
+    /// A value as a `RemoteObject`: primitives by value, objects by handle.
+    fn remote_object<'s, 'i>(
+        &self,
+        scope: &PinScope<'s, 'i, Context>,
+        value: Local<Value>,
+    ) -> serde_json::Value {
+        if value.is_undefined() {
+            return serde_json::json!({ "type": "undefined" });
+        }
+        if value.is_null() {
+            return serde_json::json!({
+                "type": "object",
+                "subtype": "null",
+                "value": serde_json::Value::Null,
+            });
+        }
+        if value.is_boolean() {
+            return serde_json::json!({ "type": "boolean", "value": value.boolean_value(scope) });
+        }
+        if value.is_number() {
+            return number_object(value.number_value(scope).unwrap_or(f64::NAN));
+        }
+        if value.is_string() {
+            return serde_json::json!({
+                "type": "string",
+                "value": value.to_rust_string_lossy(scope),
+            });
+        }
+        if value.is_big_int() {
+            let text = format!("{}n", value.to_rust_string_lossy(scope));
+            return serde_json::json!({
+                "type": "bigint",
+                "unserializableValue": text.clone(),
+                "description": text,
+            });
+        }
+        let object_id = self.store_handle(value);
+        if value.is_function() {
+            return serde_json::json!({
+                "type": "function",
+                "className": "Function",
+                "description": value.to_rust_string_lossy(scope),
+                "objectId": object_id,
+            });
+        }
+        if value.is_array() {
+            let length = Local::<Array>::try_from(value)
+                .map(|array| array.length())
+                .unwrap_or(0);
+            return serde_json::json!({
+                "type": "object",
+                "subtype": "array",
+                "className": "Array",
+                "description": format!("Array({length})"),
+                "objectId": object_id,
+            });
+        }
+        let class_name = Local::<Object>::try_from(value)
+            .map(|object| object.get_constructor_name().to_rust_string_lossy(scope))
+            .unwrap_or_else(|_| "Object".to_string());
+        serde_json::json!({
+            "type": "object",
+            "className": class_name,
+            "description": class_name,
+            "objectId": object_id,
+        })
+    }
+
+    /// The answer to a call whose script threw: the pending exception is taken
+    /// off the isolate (so the runtime's own error handling is not confused by
+    /// one it did not raise) and reported as `exceptionDetails`.
+    fn exception_response<'s, 'i>(&self, scope: &PinScope<'s, 'i, Context>) -> serde_json::Value {
+        let description = match scope.engine().take_pending_exception() {
+            Some(exception) => {
+                Local::<Value>::from_engine(exception.into()).to_rust_string_lossy(scope)
+            }
+            None => "Uncaught".to_string(),
+        };
+        let exception = serde_json::json!({
+            "type": "object",
+            "subtype": "error",
+            "description": description,
+        });
+        serde_json::json!({
+            "result": exception.clone(),
+            "exceptionDetails": { "text": "Uncaught", "exception": exception },
+        })
+    }
+}
+
+/// The answer when no realm was ever named: the runtime did not call
+/// `context_created` before a front end spoke, so there is nothing to evaluate
+/// against.
+fn missing_context() -> serde_json::Value {
+    serde_json::json!({
+        "result": { "type": "undefined" },
+        "exceptionDetails": serde_json::Value::Null,
+    })
+}
+
+/// A number as a `RemoteObject`: JSON for the finite ones, an
+/// `unserializableValue` for the rest, as V8 reports them.
+fn number_object(number: f64) -> serde_json::Value {
+    if number.is_nan() {
+        return serde_json::json!({
+            "type": "number",
+            "unserializableValue": "NaN",
+            "description": "NaN",
+        });
+    }
+    if number == f64::INFINITY {
+        return serde_json::json!({
+            "type": "number",
+            "unserializableValue": "Infinity",
+            "description": "Infinity",
+        });
+    }
+    if number == f64::NEG_INFINITY {
+        return serde_json::json!({
+            "type": "number",
+            "unserializableValue": "-Infinity",
+            "description": "-Infinity",
+        });
+    }
+    if number == 0.0 && number.is_sign_negative() {
+        return serde_json::json!({
+            "type": "number",
+            "unserializableValue": "-0",
+            "description": "-0",
+        });
+    }
+    let description = format!("{number}");
+    serde_json::json!({ "type": "number", "value": number, "description": description })
 }
 
 #[cfg(test)]
@@ -578,10 +976,9 @@ mod tests {
         let _ = inspector;
     }
 
-    /// The context lifecycle is inert: a runtime tells its inspector about every
-    /// realm it makes, whether or not a debugger ever connects.
+    /// The context lifecycle records the realm a front end's calls will run in.
     #[test]
-    fn telling_the_inspector_about_a_context_is_inert() {
+    fn telling_the_inspector_about_a_context_is_recorded() {
         let isolate = &mut crate::Isolate::new(crate::CreateParams::default());
         crate::scope!(let scope, isolate);
         let context = crate::Context::new(scope, Default::default());
@@ -594,24 +991,34 @@ mod tests {
             StringView::from(&b"main realm"[..]),
             StringView::from(&br#"{"isDefault": true, "type": "default"}"#[..]),
         );
+        assert!(inspector.shared.context.borrow().is_some());
         inspector.context_destroyed(context);
+        assert!(inspector.shared.context.borrow().is_none());
     }
 
-    /// The exception path is inert too: the runtime reports an uncaught
-    /// exception on its way to terminating the script, so both calls have to
-    /// answer — an empty trace to hand back, and the id `0`.
+    /// An uncaught exception the runtime reports is broadcast to every connected
+    /// front end as `Runtime.exceptionThrown`.
     #[test]
-    fn the_inspectors_exception_path_is_inert() {
+    fn the_inspectors_exception_path_reports() {
         let isolate = &mut crate::Isolate::new(crate::CreateParams::default());
         crate::scope!(let scope, isolate);
         let context = crate::Context::new(scope, Default::default());
         let client = V8InspectorClient::new(Box::new(Noop));
         let inspector = V8Inspector::create(scope, client);
+        inspector.context_created(context, 1, StringView::empty(), StringView::empty());
+
+        let recording = Rc::new(Recording::default());
+        let _session = inspector.connect(
+            1,
+            Channel::new(Box::new(RecordingChannel(Rc::clone(&recording)))),
+            StringView::empty(),
+            V8InspectorClientTrustLevel::FullyTrusted,
+        );
 
         let trace = inspector.create_stack_trace(None);
         assert!(!trace.is_null(), "an empty trace, not a null one");
         let thrown: Local<'_, Value> = crate::undefined(scope).into();
-        assert_eq!(
+        assert_ne!(
             inspector.exception_thrown(
                 context,
                 StringView::from(&b"Uncaught"[..]),
@@ -624,39 +1031,83 @@ mod tests {
                 0,
             ),
             0,
-            "nothing is reported, and the id is the crate's zero"
+            "a reported exception is not id zero"
         );
+        let calls = recording.calls.borrow();
+        let event = calls
+            .iter()
+            .find(|call| call.contains("Runtime.exceptionThrown"))
+            .expect("the exception event");
+        assert!(event.contains("\"text\":\"Uncaught\""), "{event}");
+        assert!(event.contains("exceptionDetails"), "{event}");
     }
 
-    /// The tier's refusing half, at its new point: a connection is inert, and a
-    /// front end that speaks is told at once — which is the module's own "failing
-    /// loudly beats a silent session" kept where it is still true.
+    /// The tier's refusing half, at its new point: a connection succeeds, and
+    /// the protocol's unimplemented methods still refuse.
     #[test]
-    fn a_session_can_be_connected_and_answers_nothing() {
+    fn a_session_can_be_connected_and_the_debugger_domain_refuses() {
         let isolate = &mut crate::Isolate::new(crate::CreateParams::default());
         crate::scope!(let scope, isolate);
         let client = V8InspectorClient::new(Box::new(Noop));
         let inspector = V8Inspector::create(scope, client);
-        // Holding the session is the assertion the tier is about: the call
-        // answers rather than refusing, which is what a host that boots one
-        // unconditionally needs.
         let _session = inspector.connect(
             1,
             Channel::new(Box::new(NoopChannel)),
             StringView::empty(),
             V8InspectorClientTrustLevel::FullyTrusted,
         );
-        // No method the protocol has is answered, so a host that asks before it
-        // sends knows not to send.
-        assert!(!V8InspectorSession::can_dispatch_method(StringView::from(
+        // The Runtime slice the REPL drives is answered, so a host that asks
+        // before it sends knows it can send.
+        assert!(V8InspectorSession::can_dispatch_method(StringView::from(
             "Runtime.enable".as_bytes()
+        )));
+        // A debugger's own messages still are not.
+        assert!(!V8InspectorSession::can_dispatch_method(StringView::from(
+            "Debugger.enable".as_bytes()
         )));
     }
 
-    /// The same connection, at the first message a front end sends.
+    /// The Runtime domain's `enable`: an empty result and the one
+    /// `executionContextCreated` the REPL reads the context id from.
+    #[test]
+    fn runtime_enable_answers_and_names_the_context() {
+        let isolate = &mut crate::Isolate::new(crate::CreateParams::default());
+        crate::scope!(let scope, isolate);
+        let context = crate::Context::new(scope, Default::default());
+        let client = V8InspectorClient::new(Box::new(Noop));
+        let inspector = V8Inspector::create(scope, client);
+        inspector.context_created(context, 1, StringView::empty(), StringView::empty());
+        let recording = Rc::new(Recording::default());
+        let session = inspector.connect(
+            1,
+            Channel::new(Box::new(RecordingChannel(Rc::clone(&recording)))),
+            StringView::empty(),
+            V8InspectorClientTrustLevel::FullyTrusted,
+        );
+
+        session.dispatch_protocol_message(StringView::from(
+            br#"{"id":7,"method":"Runtime.enable","params":null}"#.as_slice(),
+        ));
+
+        let calls = recording.calls.borrow();
+        assert!(
+            calls
+                .iter()
+                .any(|call| call.starts_with("response 7:") && call.contains("\"result\"")),
+            "the request is answered: {calls:?}"
+        );
+        let created = calls
+            .iter()
+            .find(|call| call.contains("Runtime.executionContextCreated"))
+            .expect("the context event");
+        assert!(created.contains("\"isDefault\":true"), "{created}");
+        assert!(created.contains("\"id\":1"), "{created}");
+    }
+
+    /// The same connection, at a message the debugger domain owns.
     #[test]
     #[should_panic(expected = "Slag has no inspector")]
-    fn the_protocol_refuses_at_the_first_message() {
+    fn an_unimplemented_method_refuses_at_the_first_message() {
         let isolate = &mut crate::Isolate::new(crate::CreateParams::default());
         crate::scope!(let scope, isolate);
         let client = V8InspectorClient::new(Box::new(Noop));
@@ -667,7 +1118,9 @@ mod tests {
             StringView::empty(),
             V8InspectorClientTrustLevel::FullyTrusted,
         );
-        session.dispatch_protocol_message(StringView::from("{\"id\":1}".as_bytes()));
+        session.dispatch_protocol_message(StringView::from(
+            br#"{"id":1,"method":"Debugger.enable"}"#.as_slice(),
+        ));
     }
 
     /// The same wall for the pause a debugger schedules, which a host reaches
@@ -700,6 +1153,45 @@ mod tests {
         fn send_notification(&self, _message: UniquePtr<StringBuffer>) {}
 
         fn flush_protocol_notifications(&self) {}
+    }
+
+    #[derive(Default)]
+    struct Recording {
+        calls: RefCell<Vec<String>>,
+    }
+
+    impl ChannelImpl for Recording {
+        fn send_response(&self, call_id: i32, message: UniquePtr<StringBuffer>) {
+            let text = message.unwrap().string().to_string();
+            self.calls
+                .borrow_mut()
+                .push(format!("response {call_id}: {text}"));
+        }
+
+        fn send_notification(&self, message: UniquePtr<StringBuffer>) {
+            let text = message.unwrap().string().to_string();
+            self.calls
+                .borrow_mut()
+                .push(format!("notification: {text}"));
+        }
+
+        fn flush_protocol_notifications(&self) {}
+    }
+
+    struct RecordingChannel(Rc<Recording>);
+
+    impl ChannelImpl for RecordingChannel {
+        fn send_response(&self, call_id: i32, message: UniquePtr<StringBuffer>) {
+            self.0.send_response(call_id, message);
+        }
+
+        fn send_notification(&self, message: UniquePtr<StringBuffer>) {
+            self.0.send_notification(message);
+        }
+
+        fn flush_protocol_notifications(&self) {
+            self.0.flush_protocol_notifications();
+        }
     }
 
     /// A client is a real wrapper over the host's implementation, so a host's

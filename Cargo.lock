@@ -1062,6 +1062,7 @@ dependencies = [
  "crux",
  "jit",
  "runtime",
+ "serde_json",
  "slag",
 ]
 

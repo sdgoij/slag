@@ -27,6 +27,10 @@ jit = { path = "../jit" }
 # For `fast_api::Flags`, which the crate we stand in for spells as a bitflags
 # type; it is already in the workspace's lock, so this adds no new download.
 bitflags = "2"
+# The inspector's CDP messages: the `Runtime` domain this bridge serves is
+# JSON-shaped end to end, and the engine's own `JSON` (crate::json) needs a scope
+# to read a message in. Already in the workspace's lock.
+serde_json = "1"
 # The host-facing engine entry points come through the embedding API rather
 # than from `runtime` directly. Its `wasm` feature is on here because the crate
 # we stand in for always has WebAssembly: `v8::WasmModuleObject` and the rest

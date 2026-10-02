@@ -8461,7 +8461,7 @@ landed, the tag-shape column is closed — what remains is methods to write and 
 subsystems they name; and the shape's own tail is (a) the methods moving
 from `LocalHandle` onto the tags, file by file, then (b) deleting `LocalHandle`
 and its deref table, which is when the tier §9 states stops being a tier;
-(3) point the local `deno/` checkout at the crate and run a script — the
+(3) point the local `deno/` checkout at the crate and run `tools/build-deno.py` — the
 `deno_core` type errors are gone, `deno_core`'s own bootstrap now *runs* (§7's
 last records: both snapshot build scripts build a `JsRuntimeForSnapshot`), and
 what stopped them was the engine-side item (3) below rather than anything in the
