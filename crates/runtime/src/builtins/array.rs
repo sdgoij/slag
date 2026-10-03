@@ -1418,15 +1418,21 @@ fn join(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsErro
     // a separator ToString that resizes a backing resizable buffer (shrinking
     // a fixed-length view out of bounds) does not change the iteration count.
     let length = length_of_array_like(agent, &object)?;
-    let separator = match args.first() {
-        Some(_v) if _v.is_undefined() => ",".to_string(),
-        None => ",".to_string(),
-        Some(value) => crate::context::to_string(agent, value)?.to_string_lossy(),
+    // The separator is coerced once, as units: a lossy UTF-8 round trip would
+    // both cost an encoding per call and mangle a lone surrogate.
+    let separator: Vec<u16> = match args.first() {
+        Some(value) if !value.is_undefined() => {
+            crate::context::to_string(agent, value)?.as_slice().to_vec()
+        }
+        _ => vec![b',' as u16],
     };
-    let mut result = String::new();
+    // Assemble in UTF-16. Each element appends its units directly, so nothing
+    // is encoded to UTF-8 and decoded back per element — the same defect the
+    // JSON stringifier carried (see `.notes/perf.md`'s string records).
+    let mut result: Vec<u16> = Vec::new();
     for k in 0..length {
         if k > 0 {
-            result.push_str(&separator);
+            result.extend_from_slice(&separator);
         }
         let element = match dense_own_element(&object, k) {
             Some(value) => value,
@@ -1435,9 +1441,10 @@ fn join(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsErro
         if matches!(element.kind(), ValueKind::Undefined | ValueKind::Null) {
             continue;
         }
-        result.push_str(&crate::context::to_string(agent, &element)?.to_string_lossy());
+        let text = crate::context::to_string(agent, &element)?;
+        result.extend_from_slice(text.as_slice());
     }
-    Ok(Value::String(Handle::new(JsString::from_utf8(&result))))
+    Ok(Value::String(Handle::new(JsString::from_utf16(&result))))
 }
 
 /// spec 23.1.3.18 Array.prototype.keys.

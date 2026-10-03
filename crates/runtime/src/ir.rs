@@ -20943,11 +20943,137 @@ impl Compiler {
         true
     }
 
+    /// Whether a member read compiles to a constant because its receiver is a
+    /// literal whose shape is statically known: `[k].length` and
+    /// `({ a: expr }).a` never build the literal, they push the folded value.
+    /// The literal is this read's receiver and nothing else observes it, so
+    /// the own data property (or element count) is exact; every element and
+    /// property value expression is still compiled, in order, so its side
+    /// effects and abrupt completions are preserved. Spreads, computed keys,
+    /// accessors/methods, `__proto__`, and a missing key all leave the
+    /// receiver on the ordinary member path.
+    fn try_literal_member_fold(
+        &mut self,
+        member: &syntax::ast::MemberExpr,
+    ) -> Result<bool, JsError> {
+        if member.optional || matches!(member.object.kind, ExprKind::Super) {
+            return Ok(false);
+        }
+        let syntax::ast::MemberProperty::Name(prop) = &member.property else {
+            return Ok(false);
+        };
+        let mut object = &member.object;
+        while let ExprKind::Paren(inner) = &object.kind {
+            object = inner;
+        }
+        match &object.kind {
+            ExprKind::Array(literal) => self.fold_array_length(literal, *prop),
+            ExprKind::Object(literal) => self.fold_object_property(literal, *prop),
+            _ => Ok(false),
+        }
+    }
+
+    /// `[el, …].length` lowers to the static element count (holes count, a
+    /// trailing comma does not — `elements` already encodes both). A spread
+    /// makes the length dynamic, so the whole literal stays on the member
+    /// path; an element expression is still compiled and popped for its side
+    /// effects.
+    fn fold_array_length(
+        &mut self,
+        literal: &syntax::ast::ArrayLiteral,
+        prop: crux::AtomId,
+    ) -> Result<bool, JsError> {
+        if prop != Self::length_atom() {
+            return Ok(false);
+        }
+        if literal
+            .elements
+            .iter()
+            .any(|element| matches!(element, ArrayElement::Spread(_)))
+        {
+            return Ok(false);
+        }
+        for element in &literal.elements {
+            if let ArrayElement::Expr(expr) = element {
+                self.compile_expr(expr)?;
+                self.emit(Step::Pop);
+            }
+        }
+        self.emit(Step::Push(Value::Number(literal.elements.len() as f64)));
+        Ok(true)
+    }
+
+    /// `({ a: expr, … }).a` lowers to the value of `a`'s LAST data init
+    /// (duplicate keys: the later define wins). Every property value is still
+    /// compiled in source order, so getters in the values, calls, and throws
+    /// all still run; only the non-selected results are popped. An anonymous
+    /// function definition as the selected value would lose its inferred
+    /// `.name`, so it keeps the literal.
+    fn fold_object_property(
+        &mut self,
+        literal: &ObjectLiteral,
+        prop: crux::AtomId,
+    ) -> Result<bool, JsError> {
+        let mut kept: Option<usize> = None;
+        for (index, property) in literal.props.iter().enumerate() {
+            let ObjectProperty::Init { key, .. } = property else {
+                return Ok(false);
+            };
+            let Some(id) = Self::static_property_atom(key)? else {
+                return Ok(false);
+            };
+            // `__proto__: v` sets the prototype (spec 13.2.5.5) rather than a
+            // data property, so the literal's shape is not what it looks like.
+            if id == crux::proto_atom() {
+                return Ok(false);
+            }
+            if id == prop {
+                kept = Some(index);
+            }
+        }
+        let Some(kept) = kept else {
+            return Ok(false);
+        };
+        let ObjectProperty::Init { value, .. } = &literal.props[kept] else {
+            unreachable!("the scan above rejected non-Init props")
+        };
+        if crate::function::is_anonymous_function_definition(value) {
+            return Ok(false);
+        }
+        for (index, property) in literal.props.iter().enumerate() {
+            let ObjectProperty::Init { value, .. } = property else {
+                unreachable!("the scan above rejected non-Init props")
+            };
+            self.compile_expr(value)?;
+            if index != kept {
+                self.emit(Step::Pop);
+            }
+        }
+        Ok(true)
+    }
+
+    /// The interned atom for a static object-literal key (`None` for a
+    /// computed key, which the fold cannot resolve). Mirrors the interning
+    /// `compile_object` does per key so `{1: x}` and `{"1": x}` collide.
+    fn static_property_atom(key: &PropertyName) -> Result<Option<crux::AtomId>, JsError> {
+        match key {
+            PropertyName::Ident(id) => Ok(Some(*id)),
+            PropertyName::Str(text) => Ok(Some(crux::intern(text.as_slice()))),
+            PropertyName::Number(n) => Ok(Some(crux::intern(
+                crux::convert::to_string(&Value::Number(*n))?.as_slice(),
+            ))),
+            PropertyName::Computed(_) => Ok(None),
+        }
+    }
+
     fn compile_member(&mut self, member: &syntax::ast::MemberExpr) -> Result<(), JsError> {
         if self.try_hoisted_length_read(member) {
             return Ok(());
         }
         if self.try_hoisted_member_read(member) {
+            return Ok(());
+        }
+        if self.try_literal_member_fold(member)? {
             return Ok(());
         }
         if matches!(member.object.kind, ExprKind::Super) {
