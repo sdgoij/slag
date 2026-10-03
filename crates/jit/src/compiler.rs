@@ -44,14 +44,15 @@ use runtime::ir::{
 use runtime::jit::{
     AGENT_REALM_COUNT_OFFSET, BUILDER_BUF_OFFSET, BUILDER_CAP_OFFSET, BUILDER_ENABLED_OFFSET,
     BUILDER_LEN_OFFSET, BUILDER_OWNER_OFFSET, BUILDER_RHS_BITS_OFFSET, BUILDER_RHS_OK_OFFSET,
-    BUILDER_RHS_UNIT_OFFSET, GlobalValueCell, HELPER_COUNT, JIT_APPLY_MAX_ARGS,
-    JIT_GC_PROBE_INTERVAL, JIT_HELPER_COUNTS, JitCallContext, LEAF_CALL_RECORD_SHIFT,
-    LeafCallRecord, LeafInlineInfo, TYPED_ARRAY_LENGTH_SENTINEL, VM_ASYNC_FOR_OF_STACK_LEN_OFFSET,
-    VM_BUILDER_OFFSET, VM_COMPLETION_IS_EMPTY_OFFSET, VM_COMPLETION_OFFSET,
-    VM_DESTRUCTURE_STACK_LEN_OFFSET, VM_ENV_STACK_LEN_OFFSET, VM_FOR_IN_STACK_LEN_OFFSET,
-    VM_FOR_OF_BOUNDARIES_LEN_OFFSET, VM_FOR_OF_STACK_LEN_OFFSET, VM_IP_OFFSET,
-    VM_LEXICAL_ENV_OFFSET, VM_PENDING_LEN_OFFSET, VM_SWITCH_DISC_OFFSET, VM_SWITCH_DISC_SET_OFFSET,
-    VM_TRY_STACK_CAP_OFFSET, VM_TRY_STACK_LEN_OFFSET, VM_TRY_STACK_PTR_OFFSET,
+    BUILDER_RHS_UNIT_OFFSET, DISPATCH_DEOPT, GlobalValueCell, HELPER_COUNT, JIT_APPLY_MAX_ARGS,
+    JIT_DEOPT_PROBE, JIT_GC_PROBE_INTERVAL, JIT_HELPER_COUNTS, JitCallContext,
+    LEAF_CALL_RECORD_SHIFT, LeafCallRecord, LeafInlineInfo, TYPED_ARRAY_LENGTH_SENTINEL,
+    VM_ASYNC_FOR_OF_STACK_LEN_OFFSET, VM_BUILDER_OFFSET, VM_COMPLETION_IS_EMPTY_OFFSET,
+    VM_COMPLETION_OFFSET, VM_DESTRUCTURE_STACK_LEN_OFFSET, VM_ENV_STACK_LEN_OFFSET,
+    VM_FOR_IN_STACK_LEN_OFFSET, VM_FOR_OF_BOUNDARIES_LEN_OFFSET, VM_FOR_OF_STACK_LEN_OFFSET,
+    VM_IP_OFFSET, VM_LEXICAL_ENV_OFFSET, VM_PENDING_LEN_OFFSET, VM_SWITCH_DISC_OFFSET,
+    VM_SWITCH_DISC_SET_OFFSET, VM_TRY_STACK_CAP_OFFSET, VM_TRY_STACK_LEN_OFFSET,
+    VM_TRY_STACK_PTR_OFFSET,
 };
 use syntax::ast::{AssignOp, BinaryOp, UnaryOp, UpdateOp};
 use target_lexicon::PointerWidth;
@@ -830,6 +831,15 @@ struct Lowerer<'a> {
     /// helpers return one of these (or a completion sentinel), and the
     /// machine code branches over this set.
     dispatch_targets: Vec<usize>,
+    /// Stage O probe: whether this body may carry a diagnostic deopt guard.
+    /// A leaf body is excluded because the leaf lane runs the entry directly
+    /// and does not handle `DISPATCH_DEOPT`; a suspension body because it
+    /// resumes through a different driver.
+    deopt_probe_ok: bool,
+    /// Stage O probe: step indexes inside a fused loop's span — the loop
+    /// counter and accumulator live in machine registers there, so a deopt
+    /// would lose them.
+    probe_forbidden: HashSet<usize>,
     /// Cut 55: the step being lowered — the pending-error dispatch passes
     /// `current_step + 1` as the interpreter ip (the loop-top increment).
     current_step: usize,
@@ -1019,6 +1029,22 @@ impl<'a> Lowerer<'a> {
             }
         }
         let dispatch_targets: Vec<usize> = dispatch_targets.into_iter().collect();
+        // Stage O probe: the fused loop keeps its counter/accumulator in
+        // machine registers, so a deopt inside its span (or at its machinery
+        // steps) would resume the interpreter without them.
+        let mut probe_forbidden: HashSet<usize> = HashSet::new();
+        for (index, step) in body.steps.iter().enumerate() {
+            if let Step::FastLoopHead {
+                body_start, after, ..
+            } = step
+            {
+                for inner in *body_start..*after {
+                    probe_forbidden.insert(inner);
+                }
+                probe_forbidden.insert(index);
+            }
+        }
+        let deopt_probe_ok = !body.leaf && !has_suspension;
         Lowerer {
             builder,
             helpers,
@@ -1065,6 +1091,8 @@ impl<'a> Lowerer<'a> {
             has_suspension,
             suspension_targets,
             dispatch_targets,
+            deopt_probe_ok,
+            probe_forbidden,
             current_step: 0,
             error_sp: None,
             acc_is_number: false,
@@ -5275,6 +5303,45 @@ impl<'a> Lowerer<'a> {
         Ok(())
     }
 
+    /// Stage O diagnostic (`SLAG_JIT_DEOPT_PROBE`): at the named step
+    /// boundary emit a guard that bails to the interpreter. A step boundary
+    /// is the operand stack's interpreter mirror, so the runtime rebuilds
+    /// `vm.stack` from the working region and resumes at `index`. Off unless
+    /// the environment names this exact step; leaf, suspension, and
+    /// fused-loop steps are excluded (their state is not memory-mirrored).
+    fn emit_deopt_probe(&mut self, index: usize) {
+        if !self.deopt_probe_ok
+            || self.probe_forbidden.contains(&index)
+            || JIT_DEOPT_PROBE.load(std::sync::atomic::Ordering::Relaxed) != index as i64
+        {
+            return;
+        }
+        let deopt = self.builder.create_block();
+        let cont = self.builder.create_block();
+        // A constant-true branch: the deopt block returns, and the
+        // continuation stays declared so the step's own lowering emits into a
+        // live block (Cranelift drops the now-unreachable continuation).
+        let guard = self.builder.ins().iconst(types::I8, 1);
+        self.builder.ins().brif(guard, deopt, &[], cont, &[]);
+        self.builder.switch_to_block(deopt);
+        self.builder.seal_block(deopt);
+        let ctx = self.vm();
+        let sp = self.builder.use_var(self.sp_var);
+        self.builder.ins().store(
+            MemFlagsData::new(),
+            sp,
+            ctx,
+            Offset32::new(std::mem::offset_of!(JitCallContext, suspend_sp) as i32),
+        );
+        let vm = self.vm_ptr();
+        let ip = self.builder.ins().iconst(types::I64, index as i64);
+        self.store_vm(vm, VM_IP_OFFSET, ip);
+        let sentinel = self.builder.ins().iconst(types::I64, DISPATCH_DEOPT as i64);
+        self.builder.ins().return_(&[sentinel]);
+        self.builder.switch_to_block(cont);
+        self.builder.seal_block(cont);
+    }
+
     fn emit_step(&mut self, index: usize, step: &Step) -> Result<(), Unsupported> {
         // Cut 55: the pending-error dispatch and the control helpers pass the
         // interpreter's ip for this step (the loop-top increment means a
@@ -5311,6 +5378,7 @@ impl<'a> Lowerer<'a> {
         {
             self.emit_gc_probe()?;
         }
+        self.emit_deopt_probe(index);
         match step {
             Step::Push(value) => {
                 let bits = match self.const_value(value) {

@@ -550,6 +550,36 @@ impl HelperCounts {
 /// The single instrument counter array (see [`HelperCounts`]).
 pub static JIT_HELPER_COUNTS: HelperCounts = HelperCounts::new();
 
+/// Stage O diagnostic (see [`DISPATCH_DEOPT`]): when non-negative, the
+/// compiler emits a deopt guard at that step in every eligible body, so the
+/// spill/resume path is exercised before any transform consumes it. Set
+/// from `SLAG_JIT_DEOPT_PROBE` (read once, at the first compiled run).
+pub static JIT_DEOPT_PROBE: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(-1);
+
+/// How many compiled bodies have bailed to the interpreter (Stage O
+/// telemetry).
+pub static JIT_DEOPT_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Whether each deopt is traced to stderr (`SLAG_JIT_DEOPT_TRACE`).
+pub(crate) static JIT_DEOPT_TRACE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Read the Stage O deopt-probe switches once. Diagnostics only: the probe
+/// is off unless the environment asks for it.
+fn init_deopt_probe_env() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        if let Ok(value) = std::env::var("SLAG_JIT_DEOPT_PROBE")
+            && let Ok(step) = value.parse::<i64>()
+        {
+            JIT_DEOPT_PROBE.store(step, std::sync::atomic::Ordering::Relaxed);
+        }
+        if std::env::var_os("SLAG_JIT_DEOPT_TRACE").is_some() {
+            JIT_DEOPT_TRACE.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    });
+}
+
 /// The runtime's slow-path helper table (field order mirrors
 /// `jit::JitHelpers`).
 #[repr(C)]
@@ -4219,6 +4249,14 @@ const DISPATCH_DONE: u64 = u64::MAX - 1;
 /// payload is in the ctx and the working region depth in `suspend_sp`;
 /// `run_jit_body` returns the outcome and the driver resumes later.
 const DISPATCH_SUSPEND: u64 = u64::MAX - 2;
+/// Stage O: a compiled guard failed and the body bails to the interpreter
+/// mid-run. The machine code set `vm.ip` to the step to resume at and
+/// `suspend_sp` to the live working-region top; `run_jit_body` rebuilds
+/// `vm.stack` from that region and returns `Interp`, so `run_compiled_body`
+/// resumes the interpreter at `vm.ip`. A deopt is a resume, not an error:
+/// the step is re-executed from scratch, so the guarded fast path must
+/// leave the step's operands exactly as the interpreter expects them.
+pub const DISPATCH_DEOPT: u64 = u64::MAX - 3;
 
 /// A thrown value escaping the body becomes the same `JsError` the
 /// interpreter's `body_completion_to_value` produces — the attached value
@@ -6074,6 +6112,7 @@ pub(crate) fn run_jit_body(
     ir: &std::rc::Rc<CompiledBody>,
     self_call_ok: bool,
 ) -> Result<JitRunOutcome, JsError> {
+    init_deopt_probe_env();
     let Some(hook) = agent.jit_hook else {
         return Ok(JitRunOutcome::Interp);
     };
@@ -6220,6 +6259,22 @@ pub(crate) fn run_jit_body(
         vm.jit_work.clear();
         vm.jit_work.extend_from_slice(&work[..depth]);
         return Ok(JitRunOutcome::Suspended(suspension));
+    }
+    if result == DISPATCH_DEOPT {
+        // Stage O: a compiled guard failed. The machine code already set
+        // `vm.ip` to the step to resume at and `suspend_sp` to the live
+        // working-region top. The activation's Vm is fresh, so the working
+        // region starts at `vm.stack[0]`; rebuilding the operand stack from
+        // it leaves the interpreter exactly where the guard was, and it
+        // re-executes that step from scratch.
+        let depth = (ctx.suspend_sp as usize - work_ptr as usize) / std::mem::size_of::<Value>();
+        vm.stack.clear();
+        vm.stack.extend_from_slice(&work[..depth]);
+        JIT_DEOPT_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if JIT_DEOPT_TRACE.load(std::sync::atomic::Ordering::Relaxed) {
+            eprintln!("jit-deopt step={} depth={}", vm.ip, depth);
+        }
+        return Ok(JitRunOutcome::Interp);
     }
     Ok(JitRunOutcome::Value(Value::from_bits(result)))
 }
