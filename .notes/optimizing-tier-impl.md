@@ -8,37 +8,42 @@ No code lands until its increment is written down here.
 
 ## 1. Layering
 
+There is no separate `opt` crate. The crate was built and then rejected: a
+new workspace member churns `Cargo.lock` and the workspace for a component
+only `jit` consumes. The IR lives **inside the `jit` crate** as
+`crates/jit/src/opt/`, kept Cranelift-free by discipline (the module does
+not `use cranelift_*`), not by the crate graph.
+
 ```
 syntax / lexer / parser
         |
      runtime            interpreter, Step compiler, CompiledBody, feedback store
-        |    \
-        |     \  lift: Step -> SSA
-        v      v
-       opt              SSA CFG IR, verifier, passes        (no Cranelift)
         |
         v
-       jit              lower: IR -> Cranelift, helper ABI   (owns the ISA)
+   crates/jit/src/
+     opt/            SSA CFG IR, verifier, passes   (Cranelift-free by discipline)
+     compiler.rs     per-step lowering              (the current path)
+     opt_lower.rs    IR -> Cranelift               (planned, shares the ABI)
 ```
 
-`opt` is the front end: the IR, the lift out of the runtime's `Step` stream,
-and the passes. It depends on `crux`, `syntax` and `runtime` (for `Step`,
-`CompiledBody`, `ScopeInfo`) and deliberately **not** on Cranelift.
+The IR is the front end: the IR itself, the lift out of the runtime's `Step`
+stream, and the passes. It depends on `crux`, `syntax` and `runtime` (for
+`Step`, `CompiledBody`, `ScopeInfo`) and deliberately **not** on Cranelift.
 
-`jit` is the back end. It gains a second lowering entry (`opt_lower.rs`)
-beside the current per-step emitter, both sharing `JitHelpers`,
-`JitCallContext`, `JIT_SLOW_PATHS` and the `Helper` enum. Keeping the
-lowering in `jit` is what stops the ABI forking: there stay exactly one
-helper table, one `JitCallContext` layout, one set of dispatch sentinels.
+The lowering stays in `jit`, beside the current per-step emitter, both
+sharing `JitHelpers`, `JitCallContext`, `JIT_SLOW_PATHS` and the `Helper`
+enum. Keeping the lowering in `jit` is what stops the ABI forking: there stay
+exactly one helper table, one `JitCallContext` layout, one set of dispatch
+sentinels.
 
 ## 2. Module tree
 
 ```
-crates/opt/src/
-  ir.rs         SSA CFG, type lattice, effect sets          [landed]
-  builder.rs    low-level SSA builder (block-param phis)    [landed]
-  verify.rs     the invariants every pass may assume        [landed]
-  print.rs      textual dump                                [landed]
+crates/jit/src/opt/
+  ir.rs         SSA CFG, type lattice, effect sets
+  builder.rs    low-level SSA builder (block-param phis)
+  verify.rs     the invariants every pass may assume
+  print.rs      textual dump
   lift/mod.rs   pub fn lift(&CompiledBody) -> Result<Function, Unsupported>
   lift/stack.rs operand stack -> SSA values
   lift/cfg.rs   jump targets + fall-through -> blocks/edges
@@ -47,18 +52,19 @@ crates/opt/src/
   pass/fold.rs  constant folding
   pass/dce.rs   dead-code elimination
   pass/inline.rs
+  pass/intrinsic.rs builtin intrinsic splice
   pass/escape.rs
   pass/gvn.rs
   pass/licm.rs
   pass/typer.rs
 crates/jit/src/opt_lower.rs    IR -> Cranelift (reuses the helper ABI)
-crates/runtime/src/feedback.rs per-site typed records
+crates/runtime/src/feedback.rs per-site typed records + retire hook
 ```
 
-`crates/opt` already exists with `ir.rs`, `builder.rs`, `verify.rs`,
-`print.rs` and three tests (lattice/effects, a well-formed loop verifies,
-bad uses/edges rejected). That is increment I0 and it is green under
-`cargo test -p opt` and `cargo clippy --workspace --all-targets -D warnings`.
+The core (`ir`/`builder`/`verify`/`print` plus the lattice/effects and CFG
+well-formedness tests) was built as the rejected `crates/opt` increment I0;
+it re-lands under `crates/jit/src/opt/`. Nothing else of the I0 tree is
+landed.
 
 ## 3. The lift (Step -> SSA): the hard part
 
@@ -117,25 +123,42 @@ the generation the entry was validated against. The interpreter's member,
 global, call and arithmetic handlers write it; the compiled tier's slow
 paths update it on a miss. Invalidation reuses the generations and epochs
 that already exist (member/global value cells, `leaf_gen`), so there is no
-second invalidation scheme. A **megamorphic valve** — past K distinct shapes
-at a site, the site stops speculating — is what keeps a guarded fast path
-from being slower than the helper it replaced.
+second invalidation scheme.
+
+The record carries the `ICState` mode and adaptive budget
+(`Specialized → Megamorphic → Generic`, `MaxOptimizedStubs = 6`,
+`maxFailures = 5 + 40 * stubs`): that **megamorphic valve** is what keeps a
+guarded fast path from being slower than the helper it replaced, and it is
+also what stops the retire hook thrashing.
+
+**Retirement, not deopt.** A compiled body records the premises it was
+compiled under (the cells/generations it validated, the intrinsics it
+spliced). Invalidation already fires when a premise dies; the retire hook
+consumes it and retires the body, so the next entry recompiles or falls back
+to the interpreter. A premise that dies is not a mid-activation event — the
+write can only come from a nested call, at a step boundary — so a running
+activation completes on the old code. No frame-state, no translation
+encoder, no side table; the `DISPATCH_DEOPT` exit in §4 remains a *resume*,
+used only where a runtime check is cheaper than coarse invalidation.
 
 ## 6. Increments
 
 Each increment is independently landable. `I0` is landed; the rest are
 proposals.
 
-| id | content | targets | status |
-|----|---------|---------|--------|
-| I0 | IR core: `ir`/`builder`/`verify`/`print` + tests | none (foundation) | landed |
-| I1 | lift (straight-line subset) + identity lowering behind `SLAG_OPT=1` | none (equivalence) | proposed |
-| I2 | lift control flow: branches, then simple loops with phis | none (equivalence) | proposed |
-| I3 | feedback records + count probe | none (enabling) | proposed |
-| I4 | inlining | `method_call`, `js_call`, `closure_capture`, `hof_methods`, `apply_call` | proposed |
-| I5 | escape analysis + scalar replacement | `destructure` 214x, `construct_churn`, `spread_assign`, `object_keys`, `json_*` | proposed |
-| I6 | GVN + LICM + load elimination | `obj_prop`, `element_read/write`, `array_at`, `typed_array` | proposed |
-| I7 | coarse typer driving guard elision | across I4–I6 | proposed |
+The `stage` column maps each increment to `optimizing-tier-plan.md` §6.
+
+| id | stage | content | targets | status |
+|----|-------|---------|---------|--------|
+| I0 | — | IR core: `ir`/`builder`/`verify`/`print` + tests | none (foundation) | built, re-lands under `crates/jit/src/opt/` |
+| I1 | — | lift (straight-line subset) + identity lowering behind `SLAG_OPT=1` | none (equivalence) | proposed |
+| I2 | — | lift control flow: branches, then simple loops with phis | none (equivalence) | proposed |
+| I3 | O | feedback records + `ICState` valve + retire hook + count probe | none (enabling) | proposed |
+| I4 | B | builtin intrinsic inlining (scalars first, then array/collection) | `math_abs`, `string_charat`, `regexp_test`, `set_has`/`map_get`, `array_indexof`/`slice` | proposed |
+| I5 | I | trial inlining (caller-specialized records) | `method_call`, `js_call`, `closure_capture`, `hof_methods`, `apply_call` | proposed |
+| I6 | E | escape analysis + scalar replacement | `object_keys`, `typed_array_for_each`, `array_alloc`/`object_alloc`, `destructure`, `construct_churn` | proposed |
+| I7 | L | GVN + LICM + load elimination | `obj_prop`, `prim_prop`, `element_read/write`, `array_at`, `typed_array` | proposed |
+| I8 | T | coarse typer driving guard elision | across I5–I7 | proposed |
 
 Every increment owes the same gate: `cargo clippy --workspace --all-targets
 -- -D warnings`; `cargo test --workspace`; test262 `language` and
@@ -157,10 +180,10 @@ the corpus writes; a TSV that outlives its binary is already a known trap.
   stack scan. A live SSA value holding a heap reference, and any object
   escape analysis sinks, must be in a traced region (`jit_roots`) or
   materialized before a safepoint.
-- **Deopt fidelity.** `e.stack`, `using` disposal and inlined-frame naming
-  have each broken once. A deopt must reconstruct the *unoptimized* frame
-  the interpreter expects, at a step boundary, with the operand stack
-  exactly as the interpreter would have it.
+- **Resume fidelity (was: deopt fidelity).** `e.stack`, `using` disposal and
+  inlined-frame naming have each broken once. Retirement makes resumption the
+  common path, so a resume must land at a step boundary with the operand
+  stack exactly as the interpreter would have it.
 - **The leaf lane.** `run_jit_leaf` / `run_inline_leaf` run an entry
   directly and do not handle `DISPATCH_DEOPT`. A lifted body must not be
   leaf-compiled until the lane handles it.
@@ -176,7 +199,7 @@ the corpus writes; a TSV that outlives its binary is already a known trap.
 
 ## 9. Immediate next increment (I1), in full
 
-- `crates/opt/src/lift/mod.rs`: `pub fn lift(body: &CompiledBody) -> Result<Function, Unsupported>`.
+- `crates/jit/src/opt/lift/mod.rs`: `pub fn lift(body: &CompiledBody) -> Result<Function, Unsupported>`.
 - Subset for I1: `Push`/`Pop`/`Dup`, `LoadLocal`/`StoreLocal`/`InitLocal`,
   `Binary`/`BinaryImm`, unary, `Return`, unconditional jumps, and frame
   slots. Every other step returns `Unsupported`. Control flow that is a

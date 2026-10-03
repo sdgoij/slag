@@ -131,6 +131,7 @@
 pub mod code_buffer;
 pub mod compiler;
 pub mod helpers;
+pub mod opt;
 
 pub use code_buffer::ExecutableCode;
 pub use compiler::JitEngine;
