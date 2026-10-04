@@ -1914,7 +1914,7 @@ impl CompiledBody {
     /// G21: whether a call to this body may take the runtime's compiled
     /// self-call fast path (`crate::jit::call_slow`). When the callee IS the
     /// running closure, the call runs this body's machine code directly with
-    /// a nested frame in a private buffer, instead of re-entering the
+    /// a nested frame carved from `vm.stack`, instead of re-entering the
     /// interpreter's call machinery (`ordinary_call` -> `run_compiled_body`)
     /// for every recursion level.
     ///
@@ -3243,11 +3243,6 @@ struct FastLoopShape {
 struct ActiveRun {
     vm: *const Vm,
     body: *const CompiledBody,
-    /// A JIT body's private frame/working buffer (heap values only it
-    /// references), as `(ptr as usize, len)` — `None` for an interpreter
-    /// run. A helper-triggered collection during the JIT body must trace it
-    /// like the Vm's own stacks.
-    jit_buffer: Option<(usize, usize)>,
 }
 thread_local! {
     static ACTIVE_RUNS: std::cell::RefCell<Vec<ActiveRun>> =
@@ -3305,7 +3300,7 @@ impl Drop for CompilingGuard {
 /// Trace every Vm currently running a body and its compiled body (GC-2
 /// root): the active Vms' heap buffers hold live values the stack scan
 /// cannot see, and the compiled steps hold the body's literal `Value`s. A
-/// JIT run's private working area is traced alongside (see [`with_jit_run`]).
+/// JIT run's working region is on `vm.stack`, traced with the Vm.
 pub(crate) fn trace_active_vms(visit: &mut dyn FnMut(crux::heap::GcAny)) {
     ACTIVE_RUNS.with(|stack| {
         for run in &*stack.borrow() {
@@ -3316,29 +3311,21 @@ pub(crate) fn trace_active_vms(visit: &mut dyn FnMut(crux::heap::GcAny)) {
             unsafe {
                 (&*run.vm).trace(visit);
                 (&*run.body).trace(visit);
-                if let Some((ptr, len)) = run.jit_buffer {
-                    for value in std::slice::from_raw_parts(ptr as *const Value, len) {
-                        value.trace(visit);
-                    }
-                }
             }
         }
     });
 }
 
 /// Root a JIT body running on `vm` (covering the vm's own state — its
-/// frame, stack, and any nested leaf jit roots — plus the private working
-/// area) for the duration of `f`: a helper the compiled code calls can
-/// allocate and trigger a collection, and a heap value only those buffers
-/// reference must survive until the JIT stores or returns it.
+/// frame, and its stack, which carries the working region) for the duration
+/// of `f`: a helper the compiled code calls can allocate and trigger a
+/// collection, and a heap value only that region references must survive
+/// until the JIT stores or returns it.
 pub(crate) fn with_jit_run<T>(vm: &Vm, body: &CompiledBody, f: impl FnOnce() -> T) -> T {
     ACTIVE_RUNS.with(|stack| {
         stack.borrow_mut().push(ActiveRun {
             vm: vm as *const Vm,
             body: body as *const CompiledBody,
-            // C0a: the working region is `vm.stack`, traced with the Vm, so
-            // there is no separate JIT buffer to root.
-            jit_buffer: None,
         });
     });
     let result = f();
@@ -3356,11 +3343,7 @@ pub(crate) fn with_jit_run<T>(vm: &Vm, body: &CompiledBody, f: impl FnOnce() -> 
 /// caller owns both for the call; `body` is the leaf's `Rc<CompiledBody>`).
 pub(crate) fn with_leaf_run<T>(vm: *mut Vm, body: *const CompiledBody, f: impl FnOnce() -> T) -> T {
     ACTIVE_RUNS.with(|stack| {
-        stack.borrow_mut().push(ActiveRun {
-            vm,
-            body,
-            jit_buffer: None,
-        });
+        stack.borrow_mut().push(ActiveRun { vm, body });
     });
     let result = f();
     ACTIVE_RUNS.with(|stack| {
@@ -3472,12 +3455,6 @@ pub struct Vm {
     /// `RangeError` before its first slot. A field rather than a bare constant
     /// so a test can lower it.
     pub(crate) stack_cap: usize,
-    /// The JIT runs' private buffers as `(ptr as usize, len)`, pushed for
-    /// the duration of each leaf-path JIT call on this Vm and traced with
-    /// it (the leaf path runs on the caller's Vm, which the active-run
-    /// tracer already covers — no thread-local registration needed). Empty
-    /// outside a JIT call.
-    pub(crate) jit_roots: Vec<(usize, usize)>,
     /// The fast-path frame (Cut 3): named-binding slots for the active body,
     /// sized by `ScopeInfo::frame_size`. Empty on the environment path.
     pub(crate) frame: Frame,
@@ -3487,13 +3464,13 @@ pub struct Vm {
     /// leaf run.
     pub(crate) leaf_frame_base: Option<usize>,
     /// The active nested-run frame (the self-call and certified-callee lanes'
-    /// private buffer): when `Some`, `frame_get`/`frame_get_mut` resolve frame
-    /// slots from it instead of [`Vm::frame`], so the frame-reading Rust
-    /// helpers (`builder_bind`, `builder_store`, `create_function_decl`)
-    /// address the nested activation's frame — the same frame its compiled
-    /// entry addresses through the `frame` pointer it was handed. The pointer
-    /// is into the lane's buffer, which outlives the run (and is rooted in
-    /// `jit_roots` for GC); the lane saves and restores the previous value, so
+    /// segment on `vm.stack`): when `Some`, `frame_get`/`frame_get_mut`
+    /// resolve frame slots from it instead of [`Vm::frame`], so the
+    /// frame-reading Rust helpers (`builder_bind`, `builder_store`,
+    /// `create_function_decl`) address the nested activation's frame — the
+    /// same frame its compiled entry addresses through the `frame` pointer it
+    /// was handed. The pointer is into the lane's `vm.stack` segment, which
+    /// outlives the run; the lane saves and restores the previous value, so
     /// nested lane runs stack correctly. `None` outside a nested run, so a
     /// top-level run always uses `frame`.
     pub(crate) nested_frame: Option<*mut Value>,
@@ -3729,15 +3706,6 @@ impl Trace for Vm {
         self.pending_call.trace(visit);
         self.current_function.trace(visit);
         self.current_new_target.trace(visit);
-        // The leaf-path JIT runs' private buffers (pushed by `run_jit_leaf`
-        // for the call's duration; empty otherwise).
-        // SAFETY: each entry is a buffer `run_jit_leaf` holds alive for its
-        // call, and the call outlives any collection it triggers.
-        for (ptr, len) in &self.jit_roots {
-            for value in unsafe { std::slice::from_raw_parts(*ptr as *const Value, *len) } {
-                value.trace(visit);
-            }
-        }
     }
 }
 
@@ -3835,7 +3803,6 @@ impl Vm {
             ip: 0,
             stack: Vec::new(),
             stack_cap: MAX_VALUE_STACK,
-            jit_roots: Vec::new(),
             frame: Frame::Inline(std::array::from_fn(|_| Value::Undefined)),
             leaf_frame_base: None,
             leaf_frame_offset: 0,
@@ -3961,7 +3928,6 @@ impl Vm {
         self.clear_frame();
         self.ip = 0;
         self.stack.clear();
-        self.jit_roots.clear();
         self.leaf_frame_base = None;
         self.leaf_frame_offset = 0;
         self.nested_frame = None;
@@ -4102,9 +4068,8 @@ impl Vm {
             Some(base) => &self.stack[base + slot],
             None => match self.nested_frame {
                 // SAFETY: set only by a lane run, for that run's duration, to
-                // a buffer the lane holds alive (and roots in `jit_roots`);
-                // the compiled code that could alias it is suspended while a
-                // helper runs.
+                // a `vm.stack` segment the run holds alive; the compiled code
+                // that could alias it is suspended while a helper runs.
                 Some(frame) => unsafe { &*frame.add(slot) },
                 None => Frame::get(&self.frame, slot),
             },
@@ -6346,7 +6311,6 @@ impl Vm {
             stack.borrow_mut().push(ActiveRun {
                 vm: self as *const Vm,
                 body: body as *const CompiledBody,
-                jit_buffer: None,
             });
         });
         let result = self.run_abrupt_inner(agent, body, resume);
@@ -6586,7 +6550,6 @@ impl Vm {
             stack.borrow_mut().push(ActiveRun {
                 vm: self as *const Vm,
                 body: body as *const CompiledBody,
-                jit_buffer: None,
             });
         });
         let result = self.run_inner_impl(agent, body);
@@ -19133,7 +19096,7 @@ impl Compiler {
                 // ITERATION — the interpreter merely grew its heap stack,
                 // but the JIT writes into a fixed working buffer sized from
                 // the static step depth, so a long loop ran past `buf_end`
-                // and segfaulted (~64 iterations, `INLINE_JIT_BUF`).
+                // and segfaulted (~64 iterations).
             }
         }
         self.compile_for_body(body)?;
@@ -23694,13 +23657,11 @@ fn steps_are_leaf(steps: &[Step]) -> bool {
                 | Step::ClassKeyToPropertyKey
                 | Step::ClassFinish { .. }
                 | Step::RegExpLiteral { .. }
-                // `CreateArguments` (Cut 60): the helper writes the body's
-                // `arguments` slot through `vm.frame`, but an inlined leaf's
-                // frame is a PRIVATE buffer (`run_jit_leaf` builds its own,
-                // separate from `vm.frame`) — a helper-written frame slot is
-                // wrong for a leaf. The mapped form additionally reads the
-                // running context's `function` (the caller's, when inlined).
-                // Both stay out of leaves.
+                // `CreateArguments` (Cut 60): the unmapped form's
+                // `vm.call_args` is only filled by `setup_certified_frame` on
+                // the non-leaf path, and the mapped form reads the running
+                // context's `function` (the caller's, when inlined). Both stay
+                // out of leaves.
                 | Step::CreateArguments { .. }
         ) && !string_literal_step_reads_body(step)
             // An ACTIVE builder loop must not be leaf-inlined (its

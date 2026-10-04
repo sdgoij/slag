@@ -4635,7 +4635,7 @@ mod tests {
         // leaking one value-stack slot PER ITERATION. The interpreter only
         // grew its heap stack, but the JIT writes into a fixed working
         // buffer sized from the static step depth, so a long loop ran past
-        // `buf_end` and segfaulted (~`INLINE_JIT_BUF` iterations).
+        // `buf_end` and segfaulted (~64 iterations).
         let mut agent = Agent::new();
         agent.initialize_host_defined_realm().unwrap();
         agent

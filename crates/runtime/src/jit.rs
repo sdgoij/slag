@@ -393,7 +393,7 @@ pub struct JitCallContext {
     /// G21: the running body's compiled entry and working-area size, when the
     /// body is self-call eligible (`self_inline_ok`). A compiled `CallSlow`
     /// site whose callee IS the running closure then runs this body's entry
-    /// directly with a nested frame in a private buffer, instead of
+    /// directly with a nested frame carved from `vm.stack`, instead of
     /// re-entering `do_call_fast`. `0`/`false` for a body that is not
     /// eligible (a script, a resumable body, a leaf run) or not compiled.
     pub self_entry: u64,
@@ -1382,16 +1382,10 @@ pub static JIT_SLOW_PATHS: JitSlowPaths = JitSlowPaths {
 pub const JIT_STACK_SLACK: usize = 16;
 
 /// The maximum number of JIT frames nested on the native stack. Each runs
-/// with its own private frame/working buffer (a stack array up to
-/// `INLINE_JIT_BUF` slots in `Vm::run_jit_leaf`), so unbounded JIT nesting
-/// would consume native stack faster than the interpreter; deeper recursion
-/// falls back to the interpreter.
+/// its frame/working region on `vm.stack`, so unbounded JIT nesting would
+/// still consume native stack (one machine frame per level); deeper
+/// recursion falls back to the interpreter.
 pub const MAX_JIT_DEPTH: usize = 128;
-
-/// The JIT's per-call frame/working buffer fits a stack array up to this
-/// many slots (512 bytes); larger bodies spill to a per-call heap Vec. Most
-/// certified bodies are far smaller, so the hot path avoids the allocation.
-pub(crate) const INLINE_JIT_BUF: usize = 64;
 
 /// Cut 69: the number of interpreted consultations a straight-line body
 /// (no loop) must receive before it is promoted to compiled code. The
@@ -1831,7 +1825,7 @@ extern "C" fn call_slow(
 ) -> u64 {
     let ctx = unsafe { ctx_of(ctx) };
     // G21: a self-call — the callee IS the running closure — runs the
-    // compiled body directly, with a nested frame in a private buffer,
+    // compiled body directly, with a nested frame carved from `vm.stack`,
     // instead of re-entering the interpreter's call machinery
     // (`do_call_fast` -> `ordinary_call` -> `run_compiled_body` ->
     // `run_jit_body`: a fresh Vm take/return, an execution-context push, a
@@ -1850,8 +1844,8 @@ extern "C" fn call_slow(
         return result;
     }
     // A call to a *different* certified body takes the same shape: its machine
-    // code runs directly, with a nested frame in a private buffer, instead of
-    // the interpreter funnel. `None` (an ineligible or not-yet-compiled callee)
+    // code runs directly, with a nested frame carved from `vm.stack`, instead
+    // of the interpreter funnel. `None` (an ineligible or not-yet-compiled callee)
     // falls through to that funnel, which ports the callee and promotes it.
     if direct_eval == 0
         && let Some(result) = certified_call_inline(ctx, callee, this, args, argc)
@@ -1910,7 +1904,7 @@ extern "C" fn call_slow(
 }
 
 /// G21: run the running body's compiled entry for a self-call (see
-/// [`call_slow`]) — a nested frame carved from a private buffer, the caller's
+/// [`call_slow`]) — a nested frame carved from `vm.stack`, the caller's
 /// working-area bound and array-index cursor swapped for its duration, and the
 /// entry called on the shared ctx. Returns `None` when the call must fall back
 /// to the interpreter path (the depth cap, a termination request, or an entry
@@ -1934,63 +1928,64 @@ fn self_call_inline(ctx: &mut JitCallContext, args: *mut u64, argc: u64) -> Opti
     let args = unsafe { std::slice::from_raw_parts(args as *const Value, argc) };
     let frame_len = scope.frame_size;
     let buf_len = frame_len + ctx.self_stack_usage as usize + JIT_STACK_SLACK;
-    let (mut inline_buf, mut heap_buf) = ([Value::Undefined; INLINE_JIT_BUF], Vec::<Value>::new());
-    let buf: &mut [Value] = if buf_len <= INLINE_JIT_BUF {
-        &mut inline_buf[..buf_len]
-    } else {
-        heap_buf.resize(buf_len, Value::Undefined);
-        &mut heap_buf[..]
+    // C0c: the nested frame/working region is a `vm.stack` segment above the
+    // caller's own region (which reserved the stack to `stack_cap`, so the
+    // `resize` below cannot reallocate under either run's baked pointers). A
+    // nest that would exceed the cap falls back to the funnel instead.
+    let (buf_base, saved_scratch) = unsafe {
+        let vm = &mut *ctx.vm;
+        let base = vm.stack.len();
+        if base + buf_len > vm.stack_cap {
+            return None;
+        }
+        // The per-activation scratch registers must not leak either way: a
+        // caller mid-`switch` (fall-through), mid-optional-chain, mid-`s += e`
+        // append loop, or writing an error span would otherwise have its live
+        // values read by the nested body or clobbered by it. `save_scratch`
+        // records the stack top (this segment's base) so `restore_scratch`
+        // unwinds the segment along with the other cursors.
+        let scratch = vm.save_scratch();
+        vm.stack.resize(base + buf_len, Value::Undefined);
+        vm.stack
+            .reserve(vm.stack_cap.saturating_sub(vm.stack.len()));
+        (base, scratch)
     };
+    let buf_ptr = unsafe { (&mut *ctx.vm).stack.as_mut_ptr().add(buf_base) };
     // The frame fill mirrors `run_leaf_body`: the params from the call's
     // arguments (missing stay undefined), the TDZ slots uninitialized, the
     // vars undefined. `self_call_eligible` guarantees no `this`/`arguments`
     // slot and no per-call capture context, so the nested run shares the
     // caller's environment unchanged.
-    for (slot, cell) in buf.iter_mut().enumerate().take(frame_len) {
-        *cell = if slot < scope.arity {
+    for slot in 0..frame_len {
+        let value = if slot < scope.arity {
             args.get(slot).copied().unwrap_or(Value::Undefined)
         } else if scope.tdz_store.get(slot).copied().unwrap_or(false) {
             Value::uninitialized()
         } else {
             Value::Undefined
         };
+        // SAFETY: `buf_ptr` points at a `frame_len + stack_usage + slack`
+        // segment on `vm.stack`.
+        unsafe { *buf_ptr.add(slot) = value };
     }
-    let frame_ptr = buf.as_mut_ptr() as *mut c_void;
-    // SAFETY: `buf` has `frame_len + stack_usage + slack` slots, so the
-    // working area starts inside it.
-    let stack_ptr = unsafe { buf.as_mut_ptr().add(frame_len) } as *mut c_void;
+    let frame_ptr = buf_ptr as *mut c_void;
+    let stack_ptr = unsafe { buf_ptr.add(frame_len) } as *mut c_void;
     // The nested run shares the caller's ctx, so two caller-owned cursors must
-    // follow the nested buffer for the call's duration: `buf_end` (a leaf call
+    // follow the nested region for the call's duration: `buf_end` (a leaf call
     // inside the nested body re-checks its room against it) and the array
     // index stack (a throw mid-literal must not leak an entry into the
     // caller). Both are restored on return.
     let saved_end = ctx.buf_end;
-    ctx.buf_end = unsafe { buf.as_mut_ptr().add(buf_len) } as *mut c_void;
+    ctx.buf_end = unsafe { buf_ptr.add(buf_len) } as *mut c_void;
     // The nested frame is what the frame-reading Rust helpers must address
     // (`frame_get`); install it for the run and restore the previous value
-    // after, so a nested self-call stacks correctly. The shared cursors are
-    // `save_scratch`'s. See `certified_call_inline`.
+    // after, so a nested self-call stacks correctly. See
+    // `certified_call_inline`.
     let saved_nested = unsafe {
         let vm = &mut *ctx.vm;
         let saved = vm.nested_frame;
-        vm.nested_frame = Some(buf.as_mut_ptr());
+        vm.nested_frame = Some(buf_ptr);
         saved
-    };
-    // The nested activation shares the caller's `Vm`, so the per-activation
-    // scratch registers must not leak either way: a caller mid-`switch`
-    // (fall-through), mid-optional-chain, mid-`s += e` append loop, or writing
-    // an error span would otherwise have its live values read by the nested
-    // body or clobbered by it.
-    let saved_scratch = unsafe { (&mut *ctx.vm).save_scratch() };
-    // Root the buffer for the call's duration (the Vm is already registered
-    // with the active-run tracer, so `run_jit_leaf`'s per-run registration is
-    // not needed): a helper it invokes can allocate and trigger a collection,
-    // and a heap value only the buffer references must survive until the JIT
-    // stores or returns it.
-    unsafe {
-        (&mut *ctx.vm)
-            .jit_roots
-            .push((buf.as_ptr() as usize, buf.len()))
     };
     agent.jit_depth += 1;
     // SAFETY: `ctx` is the live per-call context the enclosing compiled body
@@ -2005,7 +2000,6 @@ fn self_call_inline(ctx: &mut JitCallContext, args: *mut u64, argc: u64) -> Opti
     agent.jit_depth -= 1;
     unsafe {
         let vm = &mut *ctx.vm;
-        vm.jit_roots.pop();
         vm.nested_frame = saved_nested;
         vm.restore_scratch(saved_scratch);
     }
@@ -2014,8 +2008,8 @@ fn self_call_inline(ctx: &mut JitCallContext, args: *mut u64, argc: u64) -> Opti
 }
 
 /// The general certified-callee lane: a call to a *different* certified body
-/// runs its machine code directly on this ctx, with a nested frame in a
-/// private buffer, instead of the interpreter funnel (`do_call_fast` ->
+/// runs its machine code directly on this ctx, with a nested frame carved from
+/// `vm.stack`, instead of the interpreter funnel (`do_call_fast` ->
 /// `ordinary_call` -> `run_compiled_body` -> `run_jit_body`: a pooled-Vm
 /// take/reset, an `ExecutionContext` push, a frame setup, a
 /// `globals_unshadowed` walk and a whole new ctx). It is [`self_call_inline`]'s
@@ -2099,35 +2093,16 @@ fn certified_call_inline(
     let args = unsafe { std::slice::from_raw_parts(args as *const Value, argc) };
     let frame_len = scope.frame_size;
     let buf_len = frame_len + info.stack_usage + JIT_STACK_SLACK;
-    let (mut inline_buf, mut heap_buf) = ([Value::Undefined; INLINE_JIT_BUF], Vec::<Value>::new());
-    let buf: &mut [Value] = if buf_len <= INLINE_JIT_BUF {
-        &mut inline_buf[..buf_len]
-    } else {
-        heap_buf.resize(buf_len, Value::Undefined);
-        &mut heap_buf[..]
-    };
-    // The frame fill mirrors `setup_certified_frame` for a gated body: params
-    // from the call's arguments (missing stay undefined), TDZ slots
-    // uninitialized, `var`s undefined. `self_call_eligible` guarantees no
-    // `this`/`arguments` slot and no per-call capture context.
-    for (slot, cell) in buf.iter_mut().enumerate().take(frame_len) {
-        *cell = if slot < scope.arity {
-            args.get(slot).copied().unwrap_or(Value::Undefined)
-        } else if scope.tdz_store.get(slot).copied().unwrap_or(false) {
-            Value::uninitialized()
-        } else {
-            Value::Undefined
-        };
-    }
     // OrdinaryCallBindThis (spec 10.2.1.1) into the callee's `this` slot — the
     // same bind `setup_certified_frame` is handed by `ordinary_call`: strict
     // keeps the call's `this` as-is; sloppy coerces a nullish `this` to the
     // callee realm's global object and passes an object/function through. A
     // primitive receiver must be boxed (`to_object` allocates and can throw),
-    // so that case falls back to the funnel instead.
-    if let Some(slot) = scope.this_slot {
+    // so that case falls back to the funnel instead. Resolved before the region
+    // is carved so a refusal leaves no segment on the stack.
+    let bound_this = if scope.this_slot.is_some() {
         let this = Value::from_bits(this);
-        buf[slot] = if strict {
+        Some(if strict {
             this
         } else {
             match this.kind() {
@@ -2135,20 +2110,9 @@ fn certified_call_inline(
                 ValueKind::Object(_) | ValueKind::Function(_) => this,
                 _ => return None,
             }
-        };
-    }
-    let frame_ptr = buf.as_mut_ptr() as *mut c_void;
-    // SAFETY: `buf` has `frame_len + stack_usage + slack` slots.
-    let stack_ptr = unsafe { buf.as_mut_ptr().add(frame_len) } as *mut c_void;
-    let (apply_builtin_bits, call_builtin_bits) = if body.has_call_apply {
-        call_apply_intrinsic_bits(agent)
+        })
     } else {
-        (0, 0)
-    };
-    let intrinsic_bits = if body.has_call_intrinsic {
-        intrinsic_bits(agent)
-    } else {
-        [0; INTRINSIC_COUNT]
+        None
     };
     // The nested run reads the callee's environment, function and strictness
     // from the shared `Vm`, and a *different* body may use the shared scratch
@@ -2156,9 +2120,18 @@ fn certified_call_inline(
     // the optional-chain short flag, the string builder, the register
     // accumulator, `ip`); `save_scratch` saves and resets them and
     // `restore_scratch` puts the caller's back, so neither run sees the
-    // other's.
-    let (scratch, saved) = unsafe {
+    // other's. It runs before the region is carved so `restore_scratch` unwinds
+    // the segment along with the other cursors.
+    let (scratch, saved, buf_base) = unsafe {
         let vm = &mut *ctx.vm;
+        let base = vm.stack.len();
+        // C0c: the region is a `vm.stack` segment above the caller's own
+        // region, which reserved the stack to `stack_cap` so the `resize`
+        // below cannot reallocate under either run's baked pointers. A nest
+        // that would exceed the cap falls back to the funnel.
+        if base + buf_len > vm.stack_cap {
+            return None;
+        }
         let scratch = vm.save_scratch();
         let saved = (
             vm.lexical_env,
@@ -2172,35 +2145,63 @@ fn certified_call_inline(
         vm.current_function = Some(callee_value);
         vm.current_new_target = None;
         vm.strict = strict;
-        (scratch, saved)
+        (scratch, saved, base)
+    };
+    unsafe {
+        let vm = &mut *ctx.vm;
+        vm.stack.resize(buf_base + buf_len, Value::Undefined);
+        vm.stack
+            .reserve(vm.stack_cap.saturating_sub(vm.stack.len()));
+    }
+    let buf_ptr = unsafe { (&mut *ctx.vm).stack.as_mut_ptr().add(buf_base) };
+    // The frame fill mirrors `setup_certified_frame` for a gated body: params
+    // from the call's arguments (missing stay undefined), TDZ slots
+    // uninitialized, `var`s undefined, and the bound `this`. `self_call_eligible`
+    // guarantees no per-call capture context.
+    for slot in 0..frame_len {
+        let value = if slot < scope.arity {
+            args.get(slot).copied().unwrap_or(Value::Undefined)
+        } else if scope.tdz_store.get(slot).copied().unwrap_or(false) {
+            Value::uninitialized()
+        } else {
+            Value::Undefined
+        };
+        // SAFETY: `buf_ptr` points at a `frame_len + stack_usage + slack`
+        // segment on `vm.stack`.
+        unsafe { *buf_ptr.add(slot) = value };
+    }
+    if let (Some(slot), Some(value)) = (scope.this_slot, bound_this) {
+        unsafe { *buf_ptr.add(slot) = value };
+    }
+    let frame_ptr = buf_ptr as *mut c_void;
+    let stack_ptr = unsafe { buf_ptr.add(frame_len) } as *mut c_void;
+    let (apply_builtin_bits, call_builtin_bits) = if body.has_call_apply {
+        call_apply_intrinsic_bits(agent)
+    } else {
+        (0, 0)
+    };
+    let intrinsic_bits = if body.has_call_intrinsic {
+        intrinsic_bits(agent)
+    } else {
+        [0; INTRINSIC_COUNT]
     };
     // The frame-reading Rust helpers (`builder_bind`/`builder_store`,
     // `create_function_decl`) resolve `frame_get` through `nested_frame`, so
-    // install the callee's buffer for the run — saving the previous value, so a
-    // nested lane run stacks correctly. The shared cursors a nested run must
-    // not leak into are `save_scratch`'s. An unmapped-`arguments` body reads
+    // install the callee's segment for the run — saving the previous value, so
+    // a nested lane run stacks correctly. An unmapped-`arguments` body reads
     // the call's argument slice through `Vm::call_args`, so set that too
     // (mirroring `run_leaf_body`); the mapped (sloppy) form is refused by the
     // gate.
     let (saved_nested, saved_call_args) = unsafe {
         let vm = &mut *ctx.vm;
         let saved = vm.nested_frame;
-        vm.nested_frame = Some(buf.as_mut_ptr());
+        vm.nested_frame = Some(buf_ptr);
         let call_args = if scope.arguments_slot.is_some() {
             Some(std::mem::replace(&mut vm.call_args, args.to_vec()))
         } else {
             None
         };
         (saved, call_args)
-    };
-    // Root the buffer for the call's duration (the Vm is already registered
-    // with the active-run tracer): a helper it invokes can allocate and
-    // trigger a collection, and a heap value only the buffer references must
-    // survive until the JIT stores or returns it.
-    unsafe {
-        (&mut *ctx.vm)
-            .jit_roots
-            .push((buf.as_ptr() as usize, buf.len()))
     };
     let global_bits = Value::Object(global).bits();
     let mut nested = JitCallContext {
@@ -2214,7 +2215,7 @@ fn certified_call_inline(
         computed_read_cells: ctx.computed_read_cells,
         member_map_cells: ctx.member_map_cells,
         globals_unshadowed: Vm::global_reads_are_unshadowed(environment, &body.ident_names),
-        buf_end: (buf.as_ptr() as usize + buf_len * std::mem::size_of::<Value>()) as *mut c_void,
+        buf_end: (buf_ptr as usize + buf_len * std::mem::size_of::<Value>()) as *mut c_void,
         leaf_epoch: 0,
         leaf_records: ctx.leaf_records,
         leaf_gen: ctx.leaf_gen,
@@ -2249,7 +2250,6 @@ fn certified_call_inline(
     agent.jit_depth -= 1;
     unsafe {
         let vm = &mut *ctx.vm;
-        vm.jit_roots.pop();
         vm.nested_frame = saved_nested;
         if let Some(call_args) = saved_call_args {
             vm.call_args = call_args;
@@ -6272,10 +6272,9 @@ pub(crate) enum JitRunOutcome {
 /// Run `ir`'s compiled machine code for a body running on its own Vm — one
 /// that may contain calls, since leaf bodies never do (`steps_are_leaf`
 /// excludes every call step). The frame is `vm.frame` (the caller set it
-/// up: params, `var`s, TDZ slots, this slot); the working area is a
-/// private buffer, rooted for the call's duration. Returns `Interp` when
-/// no hook is installed or the body has no compiled code — the caller
-/// falls back to the interpreter.
+/// up: params, `var`s, TDZ slots, this slot); the working area is a segment
+/// of `vm.stack`. Returns `Interp` when no hook is installed or the body has
+/// no compiled code — the caller falls back to the interpreter.
 /// M10: the current realm's %Function.prototype.apply%/%call% intrinsic
 /// bits for the compiled `CallApply` fast path's identity check. `(0, 0)`
 /// when no realm is current or the intrinsic is not yet installed — the
@@ -6330,8 +6329,8 @@ pub(crate) fn run_jit_body(
         return Ok(JitRunOutcome::Interp);
     };
     // The recursion guard (see `Vm::run_jit_leaf`): beyond the cap, fall
-    // back to the interpreter so the JIT's private working buffers cannot
-    // exhaust the native stack.
+    // back to the interpreter. Each JIT activation is a native stack frame,
+    // so the cap bounds native-stack use.
     if agent.jit_depth >= MAX_JIT_DEPTH {
         return Ok(JitRunOutcome::Interp);
     }
@@ -6363,10 +6362,9 @@ pub(crate) fn run_jit_body(
     // is pointer-sized, so the integer cast is exact.
     let entry: JitEntry = unsafe { std::mem::transmute(info.entry) };
     // The frame lives in `vm.frame` (the caller filled it with `setup_frame`
-    // plus the this slot); the working area is a private buffer — helpers
-    // receive `&mut Vm` and may reallocate `vm.stack`, so the JIT's raw
-    // pointers must never alias it. A small body fits a stack array (no
-    // per-call heap allocation); larger bodies spill to a Vec.
+    // plus the this slot); the working area is a segment of `vm.stack`, which
+    // the run reserved to `stack_cap` so a helper push cannot reallocate it
+    // under the baked region pointer.
     debug_assert!(
         vm.nested_frame.is_none(),
         "run_jit_body addresses `vm.frame` directly, so a nested_frame pointer would disagree with the frame the entry is handed"
@@ -6447,11 +6445,10 @@ pub(crate) fn run_jit_body(
         resume_value: 0,
         gc_ticks: JIT_GC_PROBE_INTERVAL,
     };
-    // Register the vm (its trace covers `vm.frame`, `vm.stack`, and any
-    // nested leaf jit roots) plus the working area for the call's duration:
-    // a helper can allocate and trigger a collection, and a heap value only
-    // those buffers reference must survive until the JIT stores or returns
-    // it.
+    // Register the vm (its trace covers `vm.frame` and `vm.stack`, which
+    // carries the working region) for the call's duration: a helper can
+    // allocate and trigger a collection, and a heap value only the region
+    // references must survive until the JIT stores or returns it.
     agent.jit_depth += 1;
     let result = crate::ir::with_jit_run(vm, ir, || unsafe {
         (entry)(

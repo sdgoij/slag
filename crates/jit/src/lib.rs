@@ -3193,8 +3193,8 @@ run(); run(); run(); run(); run(); run(); run(); run(); run();";
     fn installed_jit_runs_a_testless_for_head() {
         // A `for (;;)` head has no test value to push: the old dummy test
         // push leaked one working-stack slot per iteration, and the compiled
-        // loop ran past its fixed buffer (a segfault after ~`INLINE_JIT_BUF`
-        // iterations). This must complete 100k iterations in compiled code.
+        // loop ran past its fixed buffer (a segfault after ~64 iterations).
+        // This must complete 100k iterations in compiled code.
         let (value, compiled) = with_jit_agent(|agent| {
             agent
                 .run_script(
