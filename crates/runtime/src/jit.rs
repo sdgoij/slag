@@ -6376,15 +6376,15 @@ pub(crate) fn run_jit_body(
         crate::ir::Frame::Heap(vec) => (vec.as_mut_ptr(), vec.len()),
     };
     let work_len = info.stack_usage + JIT_STACK_SLACK;
-    let (mut inline_work, mut heap_work) =
-        ([Value::Undefined; INLINE_JIT_BUF], Vec::<Value>::new());
-    let work: &mut [Value] = if work_len <= INLINE_JIT_BUF {
-        &mut inline_work[..work_len]
-    } else {
-        heap_work.resize(work_len, Value::Undefined);
-        &mut heap_work[..]
-    };
-    let work_ptr = work.as_mut_ptr() as *mut c_void;
+    // C0a (mechanism 1): the working region is a segment of `vm.stack`, and
+    // the stack is reserved to `stack_cap` here so no helper push during the
+    // run can reallocate it — the baked region pointer stays valid, so the
+    // compiled code needs no re-base.
+    let work_base = vm.stack.len();
+    vm.stack.resize(work_base + work_len, Value::Undefined);
+    vm.stack
+        .reserve(vm.stack_cap.saturating_sub(vm.stack.len()));
+    let work_ptr = unsafe { vm.stack.as_mut_ptr().add(work_base) } as *mut c_void;
     // The live global for the compiled `LoadGlobal` fast path (resolved and
     // cached on this Vm; the machine code re-reads its id/generation in
     // place, so a mid-run mutation invalidates the value cells).
@@ -6453,7 +6453,7 @@ pub(crate) fn run_jit_body(
     // those buffers reference must survive until the JIT stores or returns
     // it.
     agent.jit_depth += 1;
-    let result = crate::ir::with_jit_run(vm, ir, work, || unsafe {
+    let result = crate::ir::with_jit_run(vm, ir, || unsafe {
         (entry)(
             frame_ptr as *mut c_void,
             work_ptr,
@@ -6476,9 +6476,10 @@ pub(crate) fn run_jit_body(
             .suspension
             .take()
             .expect("a DISPATCH_SUSPEND result carries a payload");
-        let depth = (ctx.suspend_sp as usize - work_ptr as usize) / std::mem::size_of::<Value>();
+        let base = vm.stack.as_ptr() as usize + work_base * std::mem::size_of::<Value>();
+        let depth = (ctx.suspend_sp as usize).saturating_sub(base) / std::mem::size_of::<Value>();
         vm.jit_work.clear();
-        vm.jit_work.extend_from_slice(&work[..depth]);
+        vm.jit_work.extend_from_slice(&vm.stack[work_base..work_base + depth]);
         return Ok(JitRunOutcome::Suspended(suspension));
     }
     if result == DISPATCH_DEOPT {
@@ -6488,9 +6489,10 @@ pub(crate) fn run_jit_body(
         // region starts at `vm.stack[0]`; rebuilding the operand stack from
         // it leaves the interpreter exactly where the guard was, and it
         // re-executes that step from scratch.
-        let depth = (ctx.suspend_sp as usize - work_ptr as usize) / std::mem::size_of::<Value>();
-        vm.stack.clear();
-        vm.stack.extend_from_slice(&work[..depth]);
+        let base = vm.stack.as_ptr() as usize + work_base * std::mem::size_of::<Value>();
+        let depth = (ctx.suspend_sp as usize).saturating_sub(base) / std::mem::size_of::<Value>();
+        vm.stack.copy_within(work_base..work_base + depth, 0);
+        vm.stack.truncate(depth);
         JIT_DEOPT_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if JIT_DEOPT_TRACE.load(std::sync::atomic::Ordering::Relaxed) {
             eprintln!("jit-deopt step={} depth={}", vm.ip, depth);
@@ -6609,15 +6611,14 @@ pub(crate) fn run_jit_resume(
     // entry block re-enters at `vm.ip`.
     let saved = vm.jit_work.len();
     let work_len = saved + 1 + info.stack_usage + JIT_STACK_SLACK;
-    let (mut inline_work, mut heap_work) =
-        ([Value::Undefined; INLINE_JIT_BUF], Vec::<Value>::new());
-    let work: &mut [Value] = if work_len <= INLINE_JIT_BUF {
-        &mut inline_work[..work_len]
-    } else {
-        heap_work.resize(work_len, Value::Undefined);
-        &mut heap_work[..]
-    };
-    work[..saved].copy_from_slice(&vm.jit_work);
+    // C0a (mechanism 1): the region is a segment of `vm.stack`, reserved to
+    // `stack_cap` so it cannot reallocate mid-run (see `run_jit_body`).
+    let work_base = vm.stack.len();
+    vm.stack.resize(work_base + work_len, Value::Undefined);
+    vm.stack
+        .reserve(vm.stack_cap.saturating_sub(vm.stack.len()));
+    let work_ptr = unsafe { vm.stack.as_mut_ptr().add(work_base) } as *mut c_void;
+    vm.stack[work_base..work_base + saved].copy_from_slice(&vm.jit_work);
     let (frame_ptr, _frame_len): (*mut Value, usize) = match &mut vm.frame {
         crate::ir::Frame::Inline(buf) => (buf.as_mut_ptr(), buf.len()),
         crate::ir::Frame::Heap(vec) => (vec.as_mut_ptr(), vec.len()),
@@ -6655,9 +6656,8 @@ pub(crate) fn run_jit_resume(
     }
     let sp_offset = if push { saved + 1 } else { saved };
     if push {
-        work[saved] = resume_value;
+        vm.stack[work_base + saved] = resume_value;
     }
-    let work_ptr = work.as_mut_ptr() as *mut c_void;
     let global = vm.global_object(agent)?;
     // See `run_jit_body`: a `LoadIdent` hit serves the global-value cell, whose
     // table is shared by name across bodies, so the body's own reads must be
@@ -6713,7 +6713,7 @@ pub(crate) fn run_jit_resume(
         gc_ticks: JIT_GC_PROBE_INTERVAL,
     };
     agent.jit_depth += 1;
-    let result = crate::ir::with_jit_run(vm, ir, work, || unsafe {
+    let result = crate::ir::with_jit_run(vm, ir, || unsafe {
         (entry)(
             frame_ptr as *mut c_void,
             work_ptr,
@@ -6732,9 +6732,10 @@ pub(crate) fn run_jit_resume(
             .suspension
             .take()
             .expect("a DISPATCH_SUSPEND result carries a payload");
-        let depth = (ctx.suspend_sp as usize - work_ptr as usize) / std::mem::size_of::<Value>();
+        let base = vm.stack.as_ptr() as usize + work_base * std::mem::size_of::<Value>();
+        let depth = (ctx.suspend_sp as usize).saturating_sub(base) / std::mem::size_of::<Value>();
         vm.jit_work.clear();
-        vm.jit_work.extend_from_slice(&work[..depth]);
+        vm.jit_work.extend_from_slice(&vm.stack[work_base..work_base + depth]);
         return Ok(JitRunOutcome::Suspended(suspension));
     }
     Ok(JitRunOutcome::Value(Value::from_bits(result)))

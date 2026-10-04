@@ -234,36 +234,38 @@ describes): carry a stable base and treat `sp_var`/`entry_sp_var`/
 is a codegen-wide change, not a localized reload — C0a's real cost is that
 refactor, and the decision is whether to commit to it.
 
-**Status (2026-10-04): C0a-ii attempted, reverted — region stays a private
-buffer.** With the base+offset model landed (C0a-i), the region was moved onto
-`vm.stack` (top-level and resume), the compiled code re-basing after the
-push-capable helpers via a `stack_rebase` helper. Single-threaded it was green
-(the full workspace suite passed), but under the parallel test harness it
+**Status (2026-10-04): C0a-ii landed via mechanism 1 (non-moving
+region).** The first attempt made the region a `vm.stack` segment and re-based
+the compiled code after every push-capable helper. Single-threaded it was
+green (the full workspace suite passed) but under the parallel harness it
 reproduced a layout-dependent write into the freed old allocation
-(`STATUS_HEAP_CORRUPTION`/`STATUS_ACCESS_VIOLATION`). Two findings, both
-load-bearing for a re-attempt:
+(`STATUS_HEAP_CORRUPTION`/`STATUS_ACCESS_VIOLATION`); it was reverted, and two
+findings were recorded for the re-attempt:
 
 1. **A shared movement-delta cursor is consumed by a nested re-base.** Deriving
-the new base from `last_alloc_ptr` stored in the ctx fails because an in-frame
-leaf runs on the *caller's* ctx: the leaf's own re-base advances the cursor, so
-the caller's subsequent re-base sees delta 0 and never corrects its (now
-stale) base. The base must be re-derived from a per-body **slot index**
-(`vm.stack.as_ptr() + base_slot * 8`), which a `Vec` realloc preserves.
-2. **Even the slot-index re-base was not sufficient.** A rare move-triggered
-dangling write remained (the crash only surfaced under parallel allocator
-reuse; preventing the realloc — a large `reserve` — made it disappear). It was
-not isolated in the session. The candidates are the Rust lanes that hold a
-region pointer across an internal push (`construct`'s `sp`,
-`leaf_call_env`'s `frame_base`) and any helper the rebase set missed. Re-land
-this only with ASAN on CI and a design that cannot move the region (a
-fixed-capacity stack, mechanism 1 taken to its conclusion), not by patching
-re-base sites.
+the new base from a `last_alloc_ptr` in the ctx fails because an in-frame leaf
+runs on the *caller's* ctx: the leaf's own re-base advances the cursor, so the
+caller's subsequent re-base sees delta 0 and never corrects its (now stale)
+base. A per-body slot index (`vm.stack.as_ptr() + base_slot * 8`, preserved by
+a realloc) fixes that, but
+2. **even the slot-index re-base was not sufficient** — a rare move-triggered
+dangling write remained (it vanished when a `reserve` stopped the region
+moving). So re-basing sites is the wrong axis.
 
-Reverted per the step-1 rule (restore green, re-land on an audit). Kept: the
-base+offset model (C0a-i, behavior-neutral) and the `max_stack`/cap+guard
-pieces. Removed: the `vm.stack` region, `stack_rebase`, the `JitCallContext`
-region fields, and the args copy-outs in `call_slow`/`call_apply` (only needed
-while the region could move).
+The re-try removes the move instead of handling it. `run_jit_body`/
+`run_jit_resume` place the region on `vm.stack` and `reserve` it to
+`stack_cap`, so no helper push during the run can reallocate it — the baked
+region pointer stays valid and **no re-base machinery exists at all**. The
+`stack_cap` ceiling (C0a-i) is exactly the size the fixed, non-reallocating
+stack is sized to. `with_jit_run` drops its buffer argument (the region is
+traced with the Vm); `call_slow`/`call_apply` push straight from the region
+again (a realloc can no longer dangle it). Residual bound: a same-`Vm` push
+beyond the 1M-slot cap would still realloc (the activation guard bounds
+regions, not transients) — pathological, and not observed. Verified:
+`cargo clippy --workspace --all-targets -- -D warnings` clean; full workspace
+suite green; `jit` lib 260/260 across 15 consecutive parallel runs (where the
+re-base version aborted); full test262 sweep at baseline (48622 total, 48464
+pass, 0 fail/crash/hang, 158 skip).
 
 Sub-steps, each independently landable and gated on corpus equivalence plus
 `--gc-stress`/`--nursery-stress`/the six sweeps with no row regress:

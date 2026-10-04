@@ -3327,17 +3327,14 @@ pub(crate) fn trace_active_vms(visit: &mut dyn FnMut(crux::heap::GcAny)) {
 /// area) for the duration of `f`: a helper the compiled code calls can
 /// allocate and trigger a collection, and a heap value only those buffers
 /// reference must survive until the JIT stores or returns it.
-pub(crate) fn with_jit_run<T>(
-    vm: &Vm,
-    body: &CompiledBody,
-    work: &[Value],
-    f: impl FnOnce() -> T,
-) -> T {
+pub(crate) fn with_jit_run<T>(vm: &Vm, body: &CompiledBody, f: impl FnOnce() -> T) -> T {
     ACTIVE_RUNS.with(|stack| {
         stack.borrow_mut().push(ActiveRun {
             vm: vm as *const Vm,
             body: body as *const CompiledBody,
-            jit_buffer: Some((work.as_ptr() as usize, work.len())),
+            // C0a: the working region is `vm.stack`, traced with the Vm, so
+            // there is no separate JIT buffer to root.
+            jit_buffer: None,
         });
     });
     let result = f();
