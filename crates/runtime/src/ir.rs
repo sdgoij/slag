@@ -46,6 +46,59 @@ pub enum ApplyKind {
     Call,
 }
 
+/// A Stage-B builtin intrinsic the compiler recognizes by member-call name and
+/// splices in place of the call: the handler compares the resolved callee
+/// against the realm's `%Math.<name>%` and, on a match with a Number argument,
+/// computes the operation directly. The identity check is the retirement — a
+/// reassigned `Math.<name>`, a patched accessor, a non-`Math` receiver or a
+/// non-Number argument all take the general call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Intrinsic {
+    MathAbs,
+    MathCeil,
+    MathFloor,
+    MathTrunc,
+    MathSqrt,
+}
+
+/// The number of recognized intrinsics (a `Intrinsic` discriminant is an index
+/// into the per-run intrinsic-bit snapshot).
+pub const INTRINSIC_COUNT: usize = 5;
+
+/// Every recognized intrinsic, in discriminant order: the order that pairs an
+/// `intrinsic_bits` slot with its `Intrinsic`.
+pub const INTRINSICS: [Intrinsic; INTRINSIC_COUNT] = [
+    Intrinsic::MathAbs,
+    Intrinsic::MathCeil,
+    Intrinsic::MathFloor,
+    Intrinsic::MathTrunc,
+    Intrinsic::MathSqrt,
+];
+
+impl Intrinsic {
+    /// The member-call property name that recognizes this intrinsic.
+    pub fn member_name(self) -> &'static str {
+        match self {
+            Intrinsic::MathAbs => "abs",
+            Intrinsic::MathCeil => "ceil",
+            Intrinsic::MathFloor => "floor",
+            Intrinsic::MathTrunc => "trunc",
+            Intrinsic::MathSqrt => "sqrt",
+        }
+    }
+
+    /// The `%`-name the realm's intrinsic table holds for this one.
+    pub fn intrinsic_name(self) -> &'static str {
+        match self {
+            Intrinsic::MathAbs => "%Math.abs%",
+            Intrinsic::MathCeil => "%Math.ceil%",
+            Intrinsic::MathFloor => "%Math.floor%",
+            Intrinsic::MathTrunc => "%Math.trunc%",
+            Intrinsic::MathSqrt => "%Math.sqrt%",
+        }
+    }
+}
+
 /// The "no inline cursor" marker for `Step::ForOfBegin`/
 /// `Step::ForOfNextBindLocal`'s `cursor` pair: a for-of head without the fused
 /// slot bind (the element rides the working stack), or a body the interpreter
@@ -356,16 +409,18 @@ pub enum Step {
         direct_eval: bool,
         span: crux::Span,
     },
-    /// A member call whose property name is `abs` (`x.abs(...)`) — the shape a
-    /// `Math.abs(x)` call takes. The handler checks the resolved callee against
-    /// the realm's `%Math.abs%` intrinsic; on a match with a Number first
-    /// argument it computes the f64 absolute value in place (skipping the
-    /// builtin dispatch and the per-call machinery) and otherwise falls back to
-    /// the general call. The identity check is the retirement: a reassigned
-    /// `Math.abs` no longer matches and takes the fallback. Stack: the same
+    /// A member call whose property name is a recognized Stage-B intrinsic
+    /// (`x.abs(...)`, `x.floor(...)`, …) — the shape a `Math.<name>(x)` call
+    /// takes. The handler checks the resolved callee against the realm's
+    /// `%Math.<name>%` intrinsic; on a match with a Number first argument it
+    /// computes the operation in place (skipping the builtin dispatch and the
+    /// per-call machinery) and otherwise falls back to the general call. The
+    /// identity check is the retirement: a reassigned `Math.<name>` no longer
+    /// matches and takes the fallback. Stack: the same
     /// `[..., this, callee, arg1..argN]` as `CallFast`, and `this` is ignored
-    /// (`Math.abs` does not read it).
-    CallMathAbs {
+    /// (the `Math` intrinsics do not read it).
+    CallIntrinsic {
+        kind: Intrinsic,
         argc: u8,
         span: crux::Span,
     },
@@ -1812,9 +1867,10 @@ pub struct CompiledBody {
     /// only for such bodies (the snapshot costs a realm + intrinsics read
     /// per run, which every other compiled run would otherwise pay).
     pub has_call_apply: bool,
-    /// Whether the body contains a `Step::CallMathAbs` site. The JIT's per-run
-    /// context snapshots the realm's `%Math.abs%` bits only for such bodies.
-    pub has_call_math_abs: bool,
+    /// Whether the body contains a `Step::CallIntrinsic` site. The JIT's
+    /// per-run context snapshots the realm's intrinsic identity bits only for
+    /// such bodies.
+    pub has_call_intrinsic: bool,
 }
 
 impl CompiledBody {
@@ -7658,9 +7714,9 @@ impl Vm {
                         return Ok(outcome);
                     }
                 }
-                Step::CallMathAbs { argc, span } => {
+                Step::CallIntrinsic { kind, argc, span } => {
                     self.set_site(agent, *span);
-                    if !self.do_call_math_abs(agent, *argc as usize)? {
+                    if !self.do_call_intrinsic(agent, *kind, *argc as usize)? {
                         self.do_call_fast(agent, *argc as usize, false)?;
                     }
                     if let Some(outcome) = self.take_pending_call() {
@@ -12235,15 +12291,15 @@ impl Vm {
         )
     }
 
-    /// The `Step::CallMathAbs` intrinsic fast path: when the resolved callee is
-    /// the realm's `%Math.abs%` and the first argument is a Number, compute the
-    /// f64 absolute value in place — the identity check is the retirement (a
-    /// reassigned `Math.abs` no longer matches and takes the fallback). Returns
-    /// `false` to fall back to `do_call_fast`. Stack:
-    /// `[..., this, callee, arg1..argN]`.
-    pub(crate) fn do_call_math_abs(
+    /// The `Step::CallIntrinsic` fast path: when the resolved callee is the
+    /// realm's `%Math.<name>%` and the first argument is a Number, compute the
+    /// operation in place — the identity check is the retirement (a reassigned
+    /// `Math.<name>` no longer matches and takes the fallback). Returns `false`
+    /// to fall back to `do_call_fast`. Stack: `[..., this, callee, arg1..argN]`.
+    pub(crate) fn do_call_intrinsic(
         &mut self,
         agent: &mut Agent,
+        kind: Intrinsic,
         argc: usize,
     ) -> Result<bool, JsError> {
         if argc == 0 {
@@ -12252,7 +12308,7 @@ impl Vm {
         let n = self.stack.len();
         let arg_start = n - argc;
         let callee = self.stack[arg_start - 1];
-        let intrinsic = agent.current_realm()?.intrinsics.math_abs();
+        let intrinsic = agent.current_realm()?.intrinsics.math(kind);
         if Some(callee) != intrinsic {
             return Ok(false);
         }
@@ -12261,8 +12317,15 @@ impl Vm {
             // possible valueOf/toString side effects) — leave it to the call.
             return Ok(false);
         };
+        let result = match kind {
+            Intrinsic::MathAbs => value.abs(),
+            Intrinsic::MathCeil => value.ceil(),
+            Intrinsic::MathFloor => value.floor(),
+            Intrinsic::MathTrunc => value.trunc(),
+            Intrinsic::MathSqrt => value.sqrt(),
+        };
         self.stack.truncate(arg_start - 2);
-        self.stack.push(Value::Number(value.abs()));
+        self.stack.push(Value::Number(result));
         Ok(true)
     }
 
@@ -13368,10 +13431,10 @@ impl Vm {
         } else {
             (0, 0)
         };
-        let math_abs_bits = if ir.has_call_math_abs {
-            crate::jit::math_abs_intrinsic_bits(agent)
+        let intrinsic_bits = if ir.has_call_intrinsic {
+            crate::jit::intrinsic_bits(agent)
         } else {
-            0
+            [0; INTRINSIC_COUNT]
         };
         let mut ctx = crate::jit::JitCallContext {
             pending: false,
@@ -13398,7 +13461,7 @@ impl Vm {
             self_inline_ok: false,
             apply_builtin_bits,
             call_builtin_bits,
-            math_abs_bits,
+            intrinsic_bits,
             dispatch_value: 0,
             suspension: None,
             suspend_sp: 0,
@@ -21511,7 +21574,7 @@ impl Compiler {
             if self.try_compile_apply_call(member, call, tail)? {
                 return Ok(());
             }
-            if self.try_compile_math_abs(member, call, tail)? {
+            if self.try_compile_intrinsic(member, call, tail)? {
                 return Ok(());
             }
             self.compile_expr(&member.object)?;
@@ -21865,26 +21928,36 @@ impl Compiler {
         Ok(true)
     }
 
-    /// Call-site recognition of `Math.abs` (the first Stage-B intrinsic): a
-    /// member call `x.abs(a)` compiles to the normal member read — a shadowed
-    /// `abs`, a non-`Math` receiver or a patched accessor resolves onto the
-    /// stack and is called normally — plus `Step::CallMathAbs`, whose handler
-    /// computes the f64 absolute value when the resolved function is the
-    /// realm's `%Math.abs%` and the first argument is a Number, falling back to
-    /// the general call otherwise. Matching any `.abs` is the `apply`/`call`
-    /// discipline: the runtime identity check is the soundness gate, so a
-    /// shadowed `abs` simply takes the fallback.
-    fn try_compile_math_abs(
+    /// Call-site recognition of the Stage-B `Math.<name>` intrinsics: a member
+    /// call `x.<name>(a)` compiles to the normal member read — a shadowed
+    /// `<name>`, a non-`Math` receiver or a patched accessor resolves onto the
+    /// stack and is called normally — plus `Step::CallIntrinsic`, whose handler
+    /// computes the operation when the resolved function is the realm's
+    /// `%Math.<name>%` and the first argument is a Number, falling back to the
+    /// general call otherwise. Matching any recognized `<name>` is the
+    /// `apply`/`call` discipline: the runtime identity check is the soundness
+    /// gate, so a shadowed `<name>` simply takes the fallback.
+    fn try_compile_intrinsic(
         &mut self,
         member: &syntax::ast::MemberExpr,
         call: &syntax::ast::CallExpr,
         tail: bool,
     ) -> Result<bool, JsError> {
         let site = call_site(call);
-        match &member.property {
-            MemberProperty::Name(name) if crux::lookup(*name) == JsString::from_utf8("abs") => {}
+        let kind = match &member.property {
+            MemberProperty::Name(name) => {
+                let property = crux::lookup(*name);
+                match INTRINSICS
+                    .iter()
+                    .copied()
+                    .find(|kind| property == JsString::from_utf8(kind.member_name()))
+                {
+                    Some(kind) => kind,
+                    None => return Ok(false),
+                }
+            }
             _ => return Ok(false),
-        }
+        };
         if tail
             || member.optional
             || call.optional
@@ -21896,10 +21969,10 @@ impl Compiler {
         {
             return Ok(false);
         }
-        // `[..., x]` then `Dup` + the member read: `[..., x, abs]` exactly as
-        // the general member call, so the resolved function (and a shadowing
-        // own/prototype `abs`) is whatever the spec's GetValue produces — the
-        // step compares it against the intrinsic.
+        // `[..., x]` then `Dup` + the member read: `[..., x, <name>]` exactly
+        // as the general member call, so the resolved function (and a shadowing
+        // own/prototype `<name>`) is whatever the spec's GetValue produces —
+        // the step compares it against the intrinsic.
         self.compile_expr(&member.object)?;
         self.emit(Step::Dup);
         self.compile_member_property_guarded(member)?;
@@ -21908,7 +21981,8 @@ impl Compiler {
                 self.compile_expr(expr)?;
             }
         }
-        self.emit(Step::CallMathAbs {
+        self.emit(Step::CallIntrinsic {
+            kind,
             argc: call.args.len() as u8,
             span: site,
         });
@@ -22966,12 +23040,12 @@ pub(crate) fn body_has_call_apply(steps: &[Step]) -> bool {
         .any(|step| matches!(step, Step::CallApply { .. }))
 }
 
-/// Whether the body contains a `Step::CallMathAbs` site: the JIT's per-run
-/// context snapshots the realm's `%Math.abs%` bits only for such bodies.
-pub(crate) fn body_has_call_math_abs(steps: &[Step]) -> bool {
+/// Whether the body contains a `Step::CallIntrinsic` site: the JIT's per-run
+/// context snapshots the realm's intrinsic identity bits only for such bodies.
+pub(crate) fn body_has_call_intrinsic(steps: &[Step]) -> bool {
     steps
         .iter()
-        .any(|step| matches!(step, Step::CallMathAbs { .. }))
+        .any(|step| matches!(step, Step::CallIntrinsic { .. }))
 }
 
 /// The distinct names a body reads through the env chain (`Step::LoadIdent`),
@@ -23006,7 +23080,7 @@ fn steps_are_leaf(steps: &[Step]) -> bool {
             // own Vm. A leaf must contain none, so it cannot recurse.
             Step::Call { .. }
                 | Step::CallFast { .. }
-                | Step::CallMathAbs { .. }
+                | Step::CallIntrinsic { .. }
                 | Step::CallFastGlobal { .. }
                 | Step::CallFastSlot { .. }
                 | Step::CallFastSlotStore { .. }
@@ -24416,7 +24490,7 @@ pub fn compile_body(
     };
     let has_loop = body_has_loop(&compiler.steps);
     let has_call_apply = body_has_call_apply(&compiler.steps);
-    let has_call_math_abs = body_has_call_math_abs(&compiler.steps);
+    let has_call_intrinsic = body_has_call_intrinsic(&compiler.steps);
     let ident_names = collect_ident_names(&compiler.steps);
     Ok((
         CompiledBody {
@@ -24436,7 +24510,7 @@ pub fn compile_body(
             ident_names,
             has_loop,
             has_call_apply,
-            has_call_math_abs,
+            has_call_intrinsic,
         },
         compiler.this_writes,
     ))
@@ -24498,7 +24572,7 @@ pub fn compile_statements(
     compiler.resolve();
     let has_loop = body_has_loop(&compiler.steps);
     let has_call_apply = body_has_call_apply(&compiler.steps);
-    let has_call_math_abs = body_has_call_math_abs(&compiler.steps);
+    let has_call_intrinsic = body_has_call_intrinsic(&compiler.steps);
     let ident_names = collect_ident_names(&compiler.steps);
     Ok(CompiledBody {
         steps: compiler.steps,
@@ -24519,7 +24593,7 @@ pub fn compile_statements(
         ident_names,
         has_loop,
         has_call_apply,
-        has_call_math_abs,
+        has_call_intrinsic,
     })
 }
 

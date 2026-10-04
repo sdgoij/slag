@@ -18,6 +18,7 @@ use crux::value::{Value, ValueKind};
 
 use crate::agent::Agent;
 use crate::env::{EnvRef, new_global_environment};
+use crate::ir::{INTRINSIC_COUNT, Intrinsic};
 
 /// A Realm Record (spec 9.3 table): the intrinsic registry, the global
 /// object, and the global environment.
@@ -186,10 +187,11 @@ pub struct Intrinsics {
     /// populated at bootstrap and never reassigned).
     apply_builtin: RefCell<Option<Value>>,
     call_builtin: RefCell<Option<Value>>,
-    /// The realm's `%Math.abs%` builtin, cached after the first resolution:
-    /// the compiled `CallMathAbs` step compares the member-read result against
-    /// it per call, and the value is stable for the realm's life.
-    math_abs: RefCell<Option<Value>>,
+    /// The realm's cached `%Math.<name>%` builtins (index = `Intrinsic as
+    /// usize`), resolved once each like `function_prototypes`: the compiled
+    /// `CallIntrinsic` step compares the member-read result against its kind's
+    /// slot per call, and the values are stable for the realm's life.
+    math_intrinsics: RefCell<[Option<Value>; INTRINSIC_COUNT]>,
     /// The realm's %String.prototype% value, cached after the first
     /// resolution: primitive-string member reads resolve their chain
     /// directly against it instead of boxing a per-read String-exotic
@@ -260,6 +262,14 @@ impl Trace for Intrinsics {
         }
         self.apply_builtin.trace(visit);
         self.call_builtin.trace(visit);
+        match self.math_intrinsics.try_borrow() {
+            Ok(guard) => {
+                for slot in guard.iter() {
+                    slot.trace(visit);
+                }
+            }
+            Err(_) => crux::heap::note_aborted_trace(),
+        }
         self.string_prototype.trace(visit);
         match self.primitive_prototypes.try_borrow() {
             Ok(guard) => {
@@ -388,15 +398,16 @@ impl Intrinsics {
         Some(value)
     }
 
-    /// The realm's %Math.abs% builtin, cached after the first resolution (see
-    /// the struct field).
-    pub fn math_abs(&self) -> Option<Value> {
-        if let Some(value) = self.math_abs.borrow().as_ref() {
-            return Some(*value);
+    /// The realm's `%Math.<name>%` builtin for `kind`, cached after the first
+    /// resolution (see the struct field).
+    pub fn math(&self, kind: Intrinsic) -> Option<Value> {
+        let index = kind as usize;
+        if let Some(value) = self.math_intrinsics.borrow()[index] {
+            return Some(value);
         }
-        let value = self.get("%Math.abs%")?;
+        let value = self.get(kind.intrinsic_name())?;
         self.cache_barrier(value);
-        *self.math_abs.borrow_mut() = Some(value);
+        self.math_intrinsics.borrow_mut()[index] = Some(value);
         Some(value)
     }
 

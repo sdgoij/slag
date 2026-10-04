@@ -571,7 +571,7 @@ mod tests {
             ident_names: Vec::new(),
             has_loop: false,
             has_call_apply: false,
-            has_call_math_abs: false,
+            has_call_intrinsic: false,
         }
     }
 
@@ -766,7 +766,7 @@ mod tests {
             self_inline_ok: false,
             apply_builtin_bits: 0,
             call_builtin_bits: 0,
-            math_abs_bits: 0,
+            intrinsic_bits: [0; runtime::ir::INTRINSIC_COUNT],
             dispatch_value: 0,
             suspension: None,
             suspend_sp: 0,
@@ -1196,7 +1196,7 @@ mod tests {
             self_inline_ok: false,
             apply_builtin_bits: 0,
             call_builtin_bits: 0,
-            math_abs_bits: 0,
+            intrinsic_bits: [0; runtime::ir::INTRINSIC_COUNT],
             dispatch_value: 0,
             suspension: None,
             suspend_sp: 0,
@@ -1474,7 +1474,7 @@ mod tests {
             self_inline_ok: false,
             apply_builtin_bits: 0,
             call_builtin_bits: 0,
-            math_abs_bits: 0,
+            intrinsic_bits: [0; runtime::ir::INTRINSIC_COUNT],
             dispatch_value: 0,
             suspension: None,
             suspend_sp: 0,
@@ -1567,7 +1567,7 @@ mod tests {
             self_inline_ok: false,
             apply_builtin_bits: 0,
             call_builtin_bits: 0,
-            math_abs_bits: 0,
+            intrinsic_bits: [0; runtime::ir::INTRINSIC_COUNT],
             dispatch_value: 0,
             suspension: None,
             suspend_sp: 0,
@@ -2512,22 +2512,31 @@ mod tests {
     }
 
     #[test]
-    fn installed_jit_math_abs_intrinsic_matches_the_interpreter() {
-        // The Stage-B `Math.abs` splice: a `.abs(...)` call whose resolved
-        // callee is the realm's `%Math.abs%` computes `fabs` in machine code.
-        // The identity check is the retirement — a shadowed `Math.abs`, a
-        // non-`Math` receiver and a non-Number argument all take the general
-        // call — so each of those must agree with the interpreter too.
+    fn installed_jit_math_intrinsics_match_the_interpreter() {
+        // The Stage-B `Math.<name>` splice: a `.<name>(...)` call whose
+        // resolved callee is the realm's `%Math.<name>%` computes the operation
+        // in machine code. The identity check is the retirement — a shadowed
+        // `<name>`, a non-`Math` receiver and a non-Number argument all take
+        // the general call — so each of those must agree with the interpreter.
         let source = "var out = [];\n\
                       function t(v) { out.push(String(v)); }\n\
                       t(Math.abs(5)); t(Math.abs(-5)); t(Math.abs(-0)); t(Math.abs(NaN));\n\
                       t(Math.abs(Infinity)); t(Math.abs('5')); t(Math.abs('abc')); t(Math.abs(5, 9));\n\
                       var o = { valueOf: function () { return -7; } }; t(Math.abs(o));\n\
-                      var saved = Math.abs; Math.abs = function (x) { return x + 100; }; t(Math.abs(-5));\n\
-                      Math.abs = saved; t(Math.abs(-5));\n\
-                      t({ abs: Math.abs }.abs(-3));\n\
-                      t({ abs: function (x) { return x * 2; } }.abs(-3));\n\
-                      function loop(n) { var s = 0; for (var i = 0; i < n; i++) { s = (s + Math.abs(i)) | 0; } return s; }\n\
+                      t(Math.ceil(1.2)); t(Math.ceil(-1.2)); t(1 / Math.ceil(-0.5));\n\
+                      t(Math.floor(1.8)); t(Math.floor(-1.2)); t(1 / Math.floor(0.5));\n\
+                      t(Math.trunc(1.7)); t(Math.trunc(-1.7)); t(1 / Math.trunc(-0.5));\n\
+                      t(Math.sqrt(2)); t(Math.sqrt(-1)); t(1 / Math.sqrt(-0));\n\
+                      t(Math.floor('3.9'));\n\
+                      var saved = Math.floor; Math.floor = function (x) { return x + 100; }; t(Math.floor(-5));\n\
+                      Math.floor = saved; t(Math.floor(-5.5));\n\
+                      t({ floor: Math.floor }.floor(-3.2));\n\
+                      t({ ceil: function (x) { return x * 2; } }.ceil(2.5));\n\
+                      function loop(n) {\n\
+                        var s = 0;\n\
+                        for (var i = 0; i < n; i++) { s = (s + Math.floor(i * 0.5)) | 0; }\n\
+                        return s;\n\
+                      }\n\
                       t(loop(1000));\n\
                       out.join(',');";
         let interp = {
@@ -2538,7 +2547,7 @@ mod tests {
         let (value, compiled) = with_jit_agent(|agent| agent.run_script(source).expect("jit runs"));
         assert_eq!(
             value, interp,
-            "the Math.abs intrinsic splice must match the interpreter"
+            "the Math intrinsic splices must match the interpreter"
         );
         assert!(compiled >= 1, "{compiled} bodies");
     }

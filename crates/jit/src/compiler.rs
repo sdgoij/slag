@@ -38,9 +38,9 @@ use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Variable};
 use crux::Value;
 use runtime::ir::{
     ApplyKind, COMPUTED_READ_CELLS, COMPUTED_READ_INDEX_MUL, COMPUTED_READ_INDEX_SHIFT,
-    CompiledBody, ComputedReadCell, FastLoopVar, GLOBAL_CELLS, IntRhs, LeafOp, MEMBER_CELLS,
-    MemberMapCell, MemberValueCell, NumRhs, RegOperand, RelLimit, ScopeInfo, Step, TryFrame,
-    is_compound_assign,
+    CompiledBody, ComputedReadCell, FastLoopVar, GLOBAL_CELLS, IntRhs, Intrinsic, LeafOp,
+    MEMBER_CELLS, MemberMapCell, MemberValueCell, NumRhs, RegOperand, RelLimit, ScopeInfo, Step,
+    TryFrame, is_compound_assign,
 };
 use runtime::jit::{
     AGENT_REALM_COUNT_OFFSET, BUILDER_BUF_OFFSET, BUILDER_CAP_OFFSET, BUILDER_ENABLED_OFFSET,
@@ -224,7 +224,7 @@ fn max_stack_usage(body: &CompiledBody) -> usize {
             Step::CallFast { argc, .. } => {
                 depth = depth.saturating_sub(*argc as usize + 2).saturating_add(1);
             }
-            Step::CallMathAbs { argc, .. } => {
+            Step::CallIntrinsic { argc, .. } => {
                 depth = depth.saturating_sub(*argc as usize + 2).saturating_add(1);
             }
             // The compiled apply/call step pops the same region and pushes
@@ -559,7 +559,7 @@ fn rel_cc(op: BinaryOp) -> Result<FloatCC, Unsupported> {
 fn step_name(step: &Step) -> &'static str {
     match step {
         Step::Call { .. } | Step::CallFast { .. } => "Call",
-        Step::CallMathAbs { .. } => "CallMathAbs",
+        Step::CallIntrinsic { .. } => "CallIntrinsic",
         Step::CallApply { .. } => "CallApply",
         Step::Construct { .. } => "Construct",
         Step::TaggedTemplate(_) | Step::TailTaggedTemplate(_) => "TaggedTemplate",
@@ -6295,14 +6295,18 @@ impl<'a> Lowerer<'a> {
                     true,
                 )?;
             }
-            Step::CallMathAbs { argc, span: _ } => {
-                // Stage B, the first intrinsic: `[..., this, callee, a1..aN]`
-                // with the callee the member read's result. When it is the
-                // realm's `%Math.abs%` (`math_abs_bits`, 0 when the body has
-                // none) and the first argument is a Number, the machine code
-                // computes `fabs` in place; otherwise it falls to `emit_call`.
-                // The identity check is the retirement: a reassigned
-                // `Math.abs` no longer matches.
+            Step::CallIntrinsic {
+                kind,
+                argc,
+                span: _,
+            } => {
+                // Stage B: `[..., this, callee, a1..aN]` with the callee the
+                // member read's result. When it is the realm's `%Math.<name>%`
+                // (`intrinsic_bits[kind]`, 0 when the body has none) and the
+                // first argument is a Number, the machine code computes the
+                // operation in place; otherwise it falls to `emit_call`. The
+                // identity check is the retirement: a reassigned
+                // `Math.<name>` no longer matches.
                 let sp = self.builder.use_var(self.sp_var);
                 let args_ptr = self.builder.ins().iadd_imm_s(sp, -((*argc as i64) * 8));
                 let callee_ptr = self.builder.ins().iadd_imm_s(sp, -((*argc as i64 + 1) * 8));
@@ -6321,11 +6325,13 @@ impl<'a> Lowerer<'a> {
                 );
                 let argc_imm = self.builder.ins().iconst(types::I64, i64::from(*argc));
                 let ctx = self.vm();
+                let bit_offset =
+                    std::mem::offset_of!(JitCallContext, intrinsic_bits) + *kind as usize * 8;
                 let expected = self.builder.ins().load(
                     types::I64,
                     MemFlagsData::new(),
                     ctx,
-                    Offset32::new(std::mem::offset_of!(JitCallContext, math_abs_bits) as i32),
+                    Offset32::new(bit_offset as i32),
                 );
                 let non_zero = self.builder.ins().icmp_imm_u(IntCC::NotEqual, expected, 0);
                 let callee_ok = self.builder.ins().icmp(IntCC::Equal, callee, expected);
@@ -6342,25 +6348,31 @@ impl<'a> Lowerer<'a> {
                 let slow = self.builder.create_block();
                 let merge = self.builder.create_block();
                 self.builder.ins().brif(gate, fast, &[], slow, &[]);
-                // The fast path: `abs` of a Number argument is `fabs`; the
-                // result replaces the whole call region (`this` included —
-                // `Math.abs` never reads it).
+                // The fast path: the operation on a Number argument (each
+                // `Math.<name>` is a pure f64 op). The result replaces the
+                // whole call region (`this` included — none of them read it).
                 self.builder.switch_to_block(fast);
                 let num = self
                     .builder
                     .ins()
                     .bitcast(types::F64, MemFlagsData::new(), arg1);
-                let abs = self.builder.ins().fabs(num);
-                let abs_bits = self
+                let result = match kind {
+                    Intrinsic::MathAbs => self.builder.ins().fabs(num),
+                    Intrinsic::MathCeil => self.builder.ins().ceil(num),
+                    Intrinsic::MathFloor => self.builder.ins().floor(num),
+                    Intrinsic::MathTrunc => self.builder.ins().trunc(num),
+                    Intrinsic::MathSqrt => self.builder.ins().sqrt(num),
+                };
+                let bits = self
                     .builder
                     .ins()
-                    .bitcast(types::I64, MemFlagsData::new(), abs);
-                let value = self.canon(abs_bits);
+                    .bitcast(types::I64, MemFlagsData::new(), result);
+                let value = self.canon(bits);
                 self.builder.def_var(self.sp_var, this_ptr);
                 self.push(value);
                 self.builder.ins().jump(merge, &[]);
-                // The fallback: the general call machinery (a shadowed `abs`,
-                // a non-`Math` receiver, or a non-Number argument).
+                // The fallback: the general call machinery (a shadowed
+                // `<name>`, a non-`Math` receiver, or a non-Number argument).
                 self.builder.switch_to_block(slow);
                 self.emit_call(
                     index, callee, this, args_ptr, argc_imm, this_ptr, false, false,
