@@ -6374,7 +6374,8 @@ impl<'a> Lowerer<'a> {
                     | Intrinsic::SetHas
                     | Intrinsic::MapSet
                     | Intrinsic::ArrayAt
-                    | Intrinsic::ArrayIncludes => callee_gate,
+                    | Intrinsic::ArrayIncludes
+                    | Intrinsic::ArrayPush => callee_gate,
                     // A `this`-reading string method also needs a String
                     // primitive receiver and a Number position.
                     Intrinsic::StringCharCodeAt => {
@@ -6495,6 +6496,20 @@ impl<'a> Lowerer<'a> {
                             self.sig_binary,
                             Helper::ArrayIncludes,
                             &[this, arg1, from],
+                        )?;
+                        self.emit_intrinsic_hit(
+                            result,
+                            Value::hole().bits() as i64,
+                            slow,
+                            merge,
+                            this_ptr,
+                        );
+                    }
+                    Intrinsic::ArrayPush => {
+                        let result = self.emit_raw_call(
+                            self.sig_get_name,
+                            Helper::ArrayPush,
+                            &[this, arg1],
                         )?;
                         self.emit_intrinsic_hit(
                             result,

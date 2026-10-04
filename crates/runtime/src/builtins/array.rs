@@ -1738,6 +1738,30 @@ pub(crate) fn push(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Va
     Ok(Value::Number(length as f64))
 }
 
+/// The fast path of `Array.prototype.push` for a SINGLE appended element on a
+/// dense Array: append through the engine's dense element write (which maintains
+/// the length cell and its mirror) and return the new length. `None` declines —
+/// a non-Array/non-dense receiver, a length overflow, or a write that needed the
+/// generic `[[Set]]` — leaving the collection untouched, so the caller re-runs
+/// the exact builtin from scratch.
+pub(crate) fn push_fast(object: &Value, value: Value) -> Option<f64> {
+    let ValueKind::Object(array) = object.kind() else {
+        return None;
+    };
+    if !matches!(&array.kind, ObjectKind::Array(_)) {
+        return None;
+    }
+    let length = array.array_length_dense()?;
+    if length >= 9007199254740991 {
+        return None;
+    }
+    if array.array_element_write(length, value).ok()?.is_some() {
+        Some((length + 1) as f64)
+    } else {
+        None
+    }
+}
+
 /// spec 23.1.3.23 Array.prototype.reduce.
 fn reduce(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsError> {
     require_object_coercible(this)?;

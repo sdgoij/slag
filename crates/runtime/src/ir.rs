@@ -66,11 +66,12 @@ pub enum Intrinsic {
     MapSet,
     ArrayAt,
     ArrayIncludes,
+    ArrayPush,
 }
 
 /// The number of recognized intrinsics (a `Intrinsic` discriminant is an index
 /// into the per-run intrinsic-bit snapshot).
-pub const INTRINSIC_COUNT: usize = 12;
+pub const INTRINSIC_COUNT: usize = 13;
 
 /// Every recognized intrinsic, in discriminant order: the order that pairs an
 /// `intrinsic_bits` slot with its `Intrinsic`.
@@ -87,6 +88,7 @@ pub const INTRINSICS: [Intrinsic; INTRINSIC_COUNT] = [
     Intrinsic::MapSet,
     Intrinsic::ArrayAt,
     Intrinsic::ArrayIncludes,
+    Intrinsic::ArrayPush,
 ];
 
 impl Intrinsic {
@@ -105,6 +107,7 @@ impl Intrinsic {
             Intrinsic::MapSet => "set",
             Intrinsic::ArrayAt => "at",
             Intrinsic::ArrayIncludes => "includes",
+            Intrinsic::ArrayPush => "push",
         }
     }
 
@@ -123,6 +126,7 @@ impl Intrinsic {
             Intrinsic::MapSet => "%Map.prototype.set%",
             Intrinsic::ArrayAt => "%Array.prototype.at%",
             Intrinsic::ArrayIncludes => "%Array.prototype.includes%",
+            Intrinsic::ArrayPush => "%Array.prototype.push%",
         }
     }
 }
@@ -12454,6 +12458,12 @@ impl Vm {
                     None => return Ok(false),
                 }
             }
+            Intrinsic::ArrayPush => {
+                match crate::builtins::array::push_fast(&this, self.stack[arg_start]) {
+                    Some(length) => Value::Number(length),
+                    None => return Ok(false),
+                }
+            }
         };
         self.stack.truncate(arg_start - 2);
         self.stack.push(result);
@@ -22064,8 +22074,8 @@ impl Compiler {
     /// `<name>`, a non-`Math` receiver or a patched accessor resolves onto the
     /// stack and is called normally — plus `Step::CallIntrinsic`, whose handler
     /// computes the operation when the resolved function is the realm's
-    /// `%Math.<name>%` and the first argument is a Number, falling back to the
-    /// general call otherwise. Matching any recognized `<name>` is the
+    /// `%`-named intrinsic and the receiver/arguments allow it, falling back to
+    /// the general call otherwise. Matching any recognized `<name>` is the
     /// `apply`/`call` discipline: the runtime identity check is the soundness
     /// gate, so a shadowed `<name>` simply takes the fallback.
     fn try_compile_intrinsic(
@@ -22089,6 +22099,11 @@ impl Compiler {
             }
             _ => return Ok(false),
         };
+        // The single-element `push` form only (the helper appends one value); a
+        // multi-element push keeps the general call.
+        if kind == Intrinsic::ArrayPush && call.args.len() != 1 {
+            return Ok(false);
+        }
         if tail
             || member.optional
             || call.optional
