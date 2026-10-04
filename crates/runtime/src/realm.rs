@@ -959,6 +959,20 @@ mod tests {
             Some(abs),
             "a namespace object's method is named by the object's name and the key"
         );
+        // Every intrinsic `Step::CallIntrinsic` recognizes is retired against
+        // its `%Math.<name>%` identity, so each name must resolve in the
+        // registry (the compiler's `Intrinsic::intrinsic_name` must match what
+        // `name_members` derives).
+        for kind in crate::ir::INTRINSICS {
+            let member = math
+                .get(&JsString::from_utf8(kind.member_name()))
+                .unwrap_or_else(|_| panic!("Math.{} is installed", kind.member_name()));
+            assert_eq!(
+                realm.intrinsics.get(kind.intrinsic_name()),
+                Some(member),
+                "every recognized intrinsic's %Math.<name>% is named"
+            );
+        }
 
         // The two halves of an accessor are two names, distinguished the way the
         // installs that declare one distinguish them (`%get %TypedArray%…`), and a
