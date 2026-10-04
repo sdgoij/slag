@@ -9393,21 +9393,57 @@ impl<'a> Lowerer<'a> {
                 slot,
                 mask,
             } => {
-                // Route B (int32): the accumulator lives in an i32 register; the
-                // plan proved the seed and rhs int32, so a wrapping i32 op is
-                // exactly the spec's `ToInt32`.
+                // Route B (int32): the carried slot lives in an i32 register. A
+                // proven rhs runs as a wrapping i32 op (exactly the spec's
+                // `ToInt32`); the unproven `CounterChecked` guards the counter's
+                // conversion and computes the f64 op + `ToInt32` exactly outside
+                // the guard.
                 let Some(var) = self.int_slot_var(*slot) else {
                     return Err(Unsupported::Step("BinStoreInt without a plan"));
                 };
                 let left = self.builder.use_var(var);
+                let res_var = self.builder.declare_var(types::I32);
+                let checked = matches!(rhs, IntRhs::CounterChecked);
+                let (fast_block, slow_block, merge_block) = if checked {
+                    let fast = self.builder.create_block();
+                    let slow = self.builder.create_block();
+                    let merge = self.builder.create_block();
+                    // `|counter| < 2^52` keeps `f64(slot) op counter` exact, so
+                    // the wrapping i32 op is `ToInt32`; outside it the slow
+                    // block computes the spec's f64 op then `ToInt32`.
+                    let counter = self.builder.use_var(self.counter_var);
+                    let abs = self.builder.ins().fabs(counter);
+                    let bound = self.builder.ins().f64const(4503599627370496.0);
+                    let ok = self.builder.ins().fcmp(FloatCC::LessThan, abs, bound);
+                    self.builder.ins().brif(ok, fast, &[], slow, &[]);
+                    self.builder.switch_to_block(fast);
+                    (Some(fast), Some(slow), Some(merge))
+                } else {
+                    (None, None, None)
+                };
                 let right = match rhs {
                     IntRhs::Imm(i) => self.builder.ins().iconst(types::I32, *i as i64),
-                    IntRhs::Counter => {
-                        // The counter is an f64 (shared with the loop head) and
-                        // in int32 range by the plan's proof.
+                    IntRhs::Counter | IntRhs::CounterChecked => {
+                        // The counter is in int32 range by the plan's proof (or,
+                        // for `Checked`, by the guard just emitted).
                         let counter = self.builder.use_var(self.counter_var);
                         let wide = self.builder.ins().fcvt_to_sint_sat(types::I64, counter);
                         self.builder.ins().ireduce(types::I32, wide)
+                    }
+                    IntRhs::CounterBit { op: bit, imm } => {
+                        let counter = self.builder.use_var(self.counter_var);
+                        let wide = self.builder.ins().fcvt_to_sint_sat(types::I64, counter);
+                        let c = self.builder.ins().ireduce(types::I32, wide);
+                        let m = self.builder.ins().iconst(types::I32, *imm as i64);
+                        match bit {
+                            BinaryOp::BitAnd => self.builder.ins().band(c, m),
+                            BinaryOp::BitXor => self.builder.ins().bxor(c, m),
+                            BinaryOp::BitOr => self.builder.ins().bor(c, m),
+                            BinaryOp::LeftShift => self.builder.ins().ishl(c, m),
+                            BinaryOp::RightShift => self.builder.ins().sshr(c, m),
+                            BinaryOp::UnsignedRightShift => self.builder.ins().ushr(c, m),
+                            _ => return Err(Unsupported::Step("non-bitwise CounterBit")),
+                        }
                     }
                     IntRhs::Acc => {
                         // A2: the leading ops left the right operand in the
@@ -9424,11 +9460,64 @@ impl<'a> Lowerer<'a> {
                     BinaryOp::Mul => self.builder.ins().imul(left, right),
                     _ => return Err(Unsupported::Step("non-int BinStoreInt")),
                 };
-                let res = if *mask == -1 {
+                let masked = if *mask == -1 {
                     wrapped
                 } else {
                     let m = self.builder.ins().iconst(types::I32, *mask as i64);
                     self.builder.ins().band(wrapped, m)
+                };
+                let res = if let (Some(fast), Some(slow), Some(merge)) =
+                    (fast_block, slow_block, merge_block)
+                {
+                    self.builder.def_var(res_var, masked);
+                    self.builder.ins().jump(merge, &[]);
+                    self.builder.seal_block(fast);
+                    // The exact `ToInt32(f64(slot) op counter) & mask`.
+                    self.builder.switch_to_block(slow);
+                    let left_f = self.builder.ins().fcvt_from_sint(types::F64, left);
+                    let counter = self.builder.use_var(self.counter_var);
+                    let combined = match op {
+                        BinaryOp::Add => self.builder.ins().fadd(left_f, counter),
+                        BinaryOp::Sub => self.builder.ins().fsub(left_f, counter),
+                        BinaryOp::Mul => self.builder.ins().fmul(left_f, counter),
+                        _ => return Err(Unsupported::Step("non-int BinStoreInt")),
+                    };
+                    let combined_bits =
+                        self.builder
+                            .ins()
+                            .bitcast(types::I64, MemFlagsData::new(), combined);
+                    let combined_val = self.canon(combined_bits);
+                    let zero_bits = self
+                        .builder
+                        .ins()
+                        .iconst(types::I64, Value::Number(0.0).bits() as i64);
+                    let to_int = self.emit_binary_known(
+                        BinaryOp::BitOr,
+                        combined_val,
+                        zero_bits,
+                        false,
+                        true,
+                    )?;
+                    let to_int_f =
+                        self.builder
+                            .ins()
+                            .bitcast(types::F64, MemFlagsData::new(), to_int);
+                    let wide = self.builder.ins().fcvt_to_sint_sat(types::I64, to_int_f);
+                    let ti = self.builder.ins().ireduce(types::I32, wide);
+                    let slow_res = if *mask == -1 {
+                        ti
+                    } else {
+                        let m = self.builder.ins().iconst(types::I32, *mask as i64);
+                        self.builder.ins().band(ti, m)
+                    };
+                    self.builder.def_var(res_var, slow_res);
+                    self.builder.ins().jump(merge, &[]);
+                    self.builder.seal_block(slow);
+                    self.builder.seal_block(merge);
+                    self.builder.switch_to_block(merge);
+                    self.builder.use_var(res_var)
+                } else {
+                    masked
                 };
                 self.builder.def_var(var, res);
                 // acc = the result as a deferred Number (materialized only if

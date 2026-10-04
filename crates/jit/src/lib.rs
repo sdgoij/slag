@@ -2436,13 +2436,15 @@ mod tests {
     fn installed_jit_int32_accumulator_matches_the_interpreter() {
         // The int32 register lane: `s = (s + rhs) | 0` (or `& mask`) runs as
         // wrapping i32 in the shared num-slot register. Covered: an int32
-        // immediate, the bounded counter, a mask, the wrap across the int32
-        // boundary (`wrap`, `mul`), a negative seed, the A2 prefix proof
-        // (`band`/`bor`/`shl`/`xor` — a bitwise rhs on the counter, and
-        // `slotrhs`/`bandSlot`, which the plan cannot fold into the counter
-        // but can still prove `Int`), and the proof's rejections (a
-        // non-integral rhs and a fractional seed stay on the step path and
-        // must still agree).
+        // immediate, the bounded counter (A1), a mask, the wrap across the
+        // int32 boundary (`wrap`, `mul`), a negative seed, the A2 prefix proof
+        // (`band`/`bor`/`shl`/`shr`/`ushr`/`xor` — a bitwise rhs on a proven
+        // counter folds to `CounterBit`; `slotrhs`/`bandSlot` keep the prefix
+        // and prove `Int`), the guarded counter (`ctrSlot`/`negSlot`, a slot
+        // limit), the `Mul` bound (`mulBig`'s large constant rhs is excluded
+        // because the f64 product rounds past 2^53), a counter past the guard
+        // (`huge` takes the exact slow path), and the proof's rejections (a
+        // non-integral rhs and a fractional seed stay on the step path).
         let source = "function imm() { var s = 0; for (var i = 0; i < 1000; i++) { s = (s + 7) | 0; } return s; }\n\
                       function ctr() { var s = 0; for (var i = 0; i < 1000; i++) { s = (s + i) | 0; } return s; }\n\
                       function mask() { var s = 0; for (var i = 0; i < 1000; i++) { s = (s + i) & 1073741823; } return s; }\n\
@@ -2452,12 +2454,18 @@ mod tests {
                       function band() { var s = 0; for (var i = 0; i < 1000; i++) { s = (s + (i & 255)) | 0; } return s; }\n\
                       function bor() { var s = 0; for (var i = 0; i < 1000; i++) { s = (s + (i | 0)) | 0; } return s; }\n\
                       function shl() { var s = 0; for (var i = 0; i < 1000; i++) { s = (s + (i << 3)) | 0; } return s; }\n\
+                      function shr() { var s = 0; for (var i = 0; i < 1000; i++) { s = (s + (i >> 3)) | 0; } return s; }\n\
+                      function ushr() { var s = 0; for (var i = 0; i < 1000; i++) { s = (s + (i >>> 1)) | 0; } return s; }\n\
                       function xr() { var s = 0; for (var i = 0; i < 1000; i++) { s = (s + (i ^ 12345)) | 0; } return s; }\n\
                       function bandSlot(n) { var s = 0; for (var i = 0; i < n; i++) { s = (s + (i & 255)) | 0; } return s; }\n\
                       function slotrhs(n) { var s = 0; for (var i = 0; i < n; i++) { var k = i & 255; s = (s + k) | 0; } return s; }\n\
+                      function ctrSlot(n) { var s = 0; for (var i = 0; i < n; i++) { s = (s + i) | 0; } return s; }\n\
+                      function negSlot(n) { var s = -1000; for (var i = 0; i < n; i++) { s = (s - i) | 0; } return s; }\n\
+                      function mulBig() { var s = 1073741825; for (var i = 0; i < 1; i++) { s = (s * 1073741825) | 0; } return s; }\n\
+                      function huge(n) { var s = 0; for (var i = 4503599627370496; i < n; i++) { s = (s + i) | 0; } return s; }\n\
                       function frac(n) { var s = 1.5; for (var i = 0; i < n; i++) { s = (s + i) | 0; } return s; }\n\
                       function nonint() { var s = 0; for (var i = 0; i < 1000; i++) { s = (s + (i * 1.5)) | 0; } return s; }\n\
-                      [imm(), ctr(), mask(), wrap(), neg(), mul(), band(), bor(), shl(), xr(), bandSlot(1000), slotrhs(1000), frac(1000), nonint()].join(',');";
+                      [imm(), ctr(), mask(), wrap(), neg(), mul(), band(), bor(), shl(), shr(), ushr(), xr(), bandSlot(1000), slotrhs(1000), ctrSlot(1000), negSlot(1000), mulBig(), huge(4503599627370499), frac(1000), nonint()].join(',');";
         let interp = {
             let mut agent = runtime::Agent::new();
             agent.initialize_host_defined_realm().expect("realm");

@@ -1239,7 +1239,7 @@ pub enum NumRhs {
 /// The right operand of an int32 loop-carried slot's RMW
 /// ([`LeafOp::BinStoreInt`]). A1 admits only a form the plan can prove holds an
 /// int32 throughout the loop, so the wrapping i32 op needs no per-iteration
-/// guard; A2 will add a guarded form on the same op.
+/// guard; A2 adds the proven-`Int` prefix form and the guarded counter.
 #[derive(Debug, Clone, Copy)]
 pub enum IntRhs {
     /// An int32 literal.
@@ -1247,6 +1247,14 @@ pub enum IntRhs {
     /// The fused loop counter, proven to stay in int32 range (an ascending
     /// loop to an int32-immediate limit from an int32 seed).
     Counter,
+    /// The fused loop counter with a per-iteration exactness guard (A2): the
+    /// plan could not prove it int32, so the engines convert it behind a range
+    /// check and compute exactly outside it (the JIT falls to a slow block,
+    /// the interpreter to `ToInt32` in f64).
+    CounterChecked,
+    /// `i32(counter) <bitwise> imm` for a proven-in-i32 counter — the
+    /// `[LoadCounter, BinImm { bitwise, imm }]` prefix folded into the store.
+    CounterBit { op: BinaryOp, imm: i32 },
     /// The right operand the body's leading ops already computed into the
     /// accumulator, proven `Int` by the register provenance pass (A2). The
     /// leading ops are kept in the register body and run before the RMW.
@@ -11637,24 +11645,33 @@ impl Vm {
                 }
                 LeafOp::BinStoreInt { op, rhs, mask, .. } => {
                     // Route B (int32): the accumulator is an int32-valued f64 in
-                    // `Vm::loop_num`; the plan proved the seed and rhs int32, so
-                    // wrapping i32 is the spec's `ToInt32` and the source's
-                    // trailing truncation is the mask AND.
+                    // `Vm::loop_num`. A proven rhs runs as a wrapping i32 op (the
+                    // spec's `ToInt32`, with the trailing truncation the mask AND);
+                    // the unproven `CounterChecked` computes the spec's f64 op then
+                    // `ToInt32`, staying exact for a counter outside int32.
                     let left = self.loop_num as i32;
-                    let right = match rhs {
-                        IntRhs::Imm(i) => *i,
-                        IntRhs::Counter => self.loop_counter as i32,
-                        // A2: the leading ops left the proven-`Int` right operand
-                        // in the accumulator at the RMW.
-                        IntRhs::Acc => self.acc.as_number().unwrap_or(0.0) as i32,
+                    let res = match rhs {
+                        IntRhs::Imm(i) => wrap_int(*op, left, *i) & *mask,
+                        IntRhs::Counter => wrap_int(*op, left, self.loop_counter as i32) & *mask,
+                        IntRhs::CounterBit { op: bit, imm } => {
+                            let right =
+                                bitwise_i32(*bit, crux::convert::to_int32(self.loop_counter), *imm);
+                            wrap_int(*op, left, right) & *mask
+                        }
+                        IntRhs::Acc => {
+                            wrap_int(*op, left, self.acc.as_number().unwrap_or(0.0) as i32) & *mask
+                        }
+                        IntRhs::CounterChecked => {
+                            let combined = match op {
+                                BinaryOp::Add => self.loop_num + self.loop_counter,
+                                BinaryOp::Sub => self.loop_num - self.loop_counter,
+                                BinaryOp::Mul => self.loop_num * self.loop_counter,
+                                _ => unreachable!("plan_loop_int admits only is_int_wrap ops"),
+                            };
+                            crux::convert::to_int32(combined) & *mask
+                        }
                     };
-                    let wrapped = match op {
-                        BinaryOp::Add => left.wrapping_add(right),
-                        BinaryOp::Sub => left.wrapping_sub(right),
-                        BinaryOp::Mul => left.wrapping_mul(right),
-                        _ => unreachable!("plan_loop_int admits only is_int_wrap ops"),
-                    };
-                    self.loop_num = (wrapped & *mask) as f64;
+                    self.loop_num = res as f64;
                     self.acc = Value::Number(self.loop_num);
                 }
                 LeafOp::BinRemConst { divisor } => {
@@ -18192,16 +18209,13 @@ impl Compiler {
         };
         let Some((prefix_len, slot, op, rhs, mask)) = (match &self.steps[body_start] {
             Step::RunRegBody { ops } => {
-                int_rmw_shape(ops).or_else(|| int_rmw_prefix_shape(ops, counter))
+                int_rmw_shape(ops, counter).or_else(|| int_rmw_prefix_shape(ops, counter))
             }
             _ => None,
         }) else {
             return;
         };
         if !self.slot_seed_is_int32(slot, bind) {
-            return;
-        }
-        if matches!(rhs, IntRhs::Counter) && counter < RegInt::Int {
             return;
         }
         if let Step::FastLoopBind { num, .. } = &mut self.steps[bind] {
@@ -22241,6 +22255,30 @@ fn is_int_wrap(op: BinaryOp) -> bool {
     matches!(op, BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul)
 }
 
+/// The wrapping i32 result of `a <op> b` for the int32 lane's `Add`/`Sub`/`Mul`.
+fn wrap_int(op: BinaryOp, a: i32, b: i32) -> i32 {
+    match op {
+        BinaryOp::Add => a.wrapping_add(b),
+        BinaryOp::Sub => a.wrapping_sub(b),
+        BinaryOp::Mul => a.wrapping_mul(b),
+        _ => unreachable!("plan_loop_int admits only is_int_wrap ops"),
+    }
+}
+
+/// `a <bitwise> b` on two i32s, matching the spec's `ToInt32`/`ToUint32` (the
+/// shift count is masked to 5 bits; `>>>` is the zero-extended shift).
+fn bitwise_i32(op: BinaryOp, a: i32, b: i32) -> i32 {
+    match op {
+        BinaryOp::BitAnd => a & b,
+        BinaryOp::BitXor => a ^ b,
+        BinaryOp::BitOr => a | b,
+        BinaryOp::LeftShift => a.wrapping_shl((b as u32) & 0x1f),
+        BinaryOp::RightShift => a.wrapping_shr((b as u32) & 0x1f),
+        BinaryOp::UnsignedRightShift => ((a as u32) >> ((b as u32) & 0x1f)) as i32,
+        _ => a,
+    }
+}
+
 /// The `i32` value of an integral f64 inside int32 range, or `None`.
 fn int32_of(n: f64) -> Option<i32> {
     if n.fract() == 0.0 && (-2147483648.0..=2147483647.0).contains(&n) {
@@ -22265,12 +22303,39 @@ fn is_int_trunc(op: BinaryOp, imm: f64) -> Option<i32> {
     }
 }
 
+/// Whether the wrapping `op` is exact for this right operand. `Add`/`Sub` of
+/// two i32s are always exact in f64; `Mul`'s product is exact only while
+/// `|slot * rhs| <= 2^53`, which for an i32 slot holds for a constant rhs of
+/// magnitude `<= 2^22` — a larger rhs (or a computed one) can round, and the
+/// wrapping low bits then differ from `ToInt32`. So a `Mul` lane keeps only a
+/// small constant rhs.
+fn rhs_keeps_wrap_exact(op: BinaryOp, rhs: &IntRhs) -> bool {
+    match op {
+        BinaryOp::Mul => matches!(rhs, IntRhs::Imm(k) if k.unsigned_abs() <= (1 << 22)),
+        _ => true,
+    }
+}
+
+/// The bitwise/shift operators a `[LoadCounter, BinImm { op, imm }]` prefix can
+/// fold (all total `ToInt32`/`ToUint32`).
+fn is_bitwise(op: BinaryOp) -> bool {
+    matches!(
+        op,
+        BinaryOp::BitAnd
+            | BinaryOp::BitXor
+            | BinaryOp::BitOr
+            | BinaryOp::LeftShift
+            | BinaryOp::RightShift
+            | BinaryOp::UnsignedRightShift
+    )
+}
+
 /// Route B (int32): the exact leaf-op shape `plan_loop_int` accepts —
 /// `slot = (slot <arith> rhs) | 0` (or `& mask`) as a 3- or 4-op register body,
 /// and nothing else touching the slot. Returns the mask to AND after the wrap,
 /// and a `prefix_len` of `0` (both shapes fold their right operand into the
 /// op — the RMW is collapsed to a single [`LeafOp::BinStoreInt`]).
-fn int_rmw_shape(ops: &[LeafOp]) -> Option<(usize, usize, BinaryOp, IntRhs, i32)> {
+fn int_rmw_shape(ops: &[LeafOp], counter: RegInt) -> Option<(usize, usize, BinaryOp, IntRhs, i32)> {
     let shape = match ops {
         [
             LeafOp::BinImmLocal {
@@ -22289,7 +22354,11 @@ fn int_rmw_shape(ops: &[LeafOp]) -> Option<(usize, usize, BinaryOp, IntRhs, i32)
             },
         ] if slot == store_slot && is_int_wrap(*op) => {
             let mask = is_int_trunc(*trunc, *trunc_imm)?;
-            (0, *slot, *op, IntRhs::Imm(int32_of(*imm)?), mask)
+            let rhs = IntRhs::Imm(int32_of(*imm)?);
+            if !rhs_keeps_wrap_exact(*op, &rhs) {
+                return None;
+            }
+            (0, *slot, *op, rhs, mask)
         }
         [
             rhs_load,
@@ -22305,10 +22374,16 @@ fn int_rmw_shape(ops: &[LeafOp]) -> Option<(usize, usize, BinaryOp, IntRhs, i32)
         ] if slot == store_slot && is_int_wrap(*op) => {
             let mask = is_int_trunc(*trunc, *trunc_imm)?;
             let rhs = match rhs_load {
-                LeafOp::LoadCounter => IntRhs::Counter,
+                // A proven-int32 counter takes the guardless conversion; an
+                // unproven one takes the guarded conversion (A2).
+                LeafOp::LoadCounter if counter >= RegInt::Int => IntRhs::Counter,
+                LeafOp::LoadCounter => IntRhs::CounterChecked,
                 LeafOp::LoadConst(value) => IntRhs::Imm(int32_of_value(*value)?),
                 _ => return None,
             };
+            if !rhs_keeps_wrap_exact(*op, &rhs) {
+                return None;
+            }
             (0, *slot, *op, rhs, mask)
         }
         _ => return None,
@@ -22322,7 +22397,10 @@ fn int_rmw_shape(ops: &[LeafOp]) -> Option<(usize, usize, BinaryOp, IntRhs, i32)
 /// pass proves it `Int`. Unlike [`int_rmw_shape`] the prefix is KEPT (its
 /// effects are the loop's) and the tail collapses to
 /// `BinStoreInt { rhs: IntRhs::Acc }`; the prefix must not touch the carried
-/// slot, whose frame value is stale while the loop runs.
+/// slot, whose frame value is stale while the loop runs. The one shape folded
+/// out of the prefix is a proven-int32 counter's bitwise op
+/// (`IntRhs::CounterBit`), which the engines can compute without running the
+/// prefix's guarded integer op.
 fn int_rmw_prefix_shape(
     ops: &[LeafOp],
     counter: RegInt,
@@ -22350,10 +22428,29 @@ fn int_rmw_prefix_shape(
     if prefix.iter().any(|p| leaf_op_touches_slot(p, *slot)) {
         return None;
     }
-    if reg_int_acc(prefix, counter) < RegInt::Int {
+    let (prefix_len, rhs) = match prefix {
+        [LeafOp::LoadCounter, LeafOp::BinImm { op: bit, imm }]
+            if is_bitwise(*bit) && counter >= RegInt::Int =>
+        {
+            (
+                0,
+                IntRhs::CounterBit {
+                    op: *bit,
+                    imm: int32_of(*imm)?,
+                },
+            )
+        }
+        _ => {
+            if reg_int_acc(prefix, counter) < RegInt::Int {
+                return None;
+            }
+            (tail, IntRhs::Acc)
+        }
+    };
+    if !rhs_keeps_wrap_exact(*op, &rhs) {
         return None;
     }
-    Some((tail, *slot, *op, IntRhs::Acc, mask))
+    Some((prefix_len, *slot, *op, rhs, mask))
 }
 
 /// The integrality lattice for [`IntProvenance`]: `Unknown ⊂ Integer ⊂ Int`
@@ -29094,5 +29191,96 @@ mod tests {
             LeafOp::BuilderAppend { slot: 1 },
         ];
         assert_eq!(reg_int_acc(&ops, RegInt::Int), RegInt::Unknown);
+    }
+
+    #[test]
+    fn int_lane_wrap_exactness_and_casts() {
+        // `Mul` keeps only a small constant rhs: the f64 product must stay
+        // within 2^53, i.e. `|rhs| <= 2^22` for an i32 slot. A larger (or
+        // computed) rhs can round and the wrapping low bits diverge.
+        assert!(rhs_keeps_wrap_exact(BinaryOp::Mul, &IntRhs::Imm(1 << 22)));
+        assert!(!rhs_keeps_wrap_exact(
+            BinaryOp::Mul,
+            &IntRhs::Imm((1 << 22) + 1)
+        ));
+        assert!(!rhs_keeps_wrap_exact(
+            BinaryOp::Mul,
+            &IntRhs::Imm(-(1 << 23))
+        ));
+        assert!(!rhs_keeps_wrap_exact(BinaryOp::Mul, &IntRhs::Counter));
+        assert!(!rhs_keeps_wrap_exact(
+            BinaryOp::Mul,
+            &IntRhs::CounterChecked
+        ));
+        assert!(!rhs_keeps_wrap_exact(BinaryOp::Mul, &IntRhs::Acc));
+        for op in [BinaryOp::Add, BinaryOp::Sub] {
+            assert!(rhs_keeps_wrap_exact(op, &IntRhs::Counter));
+            assert!(rhs_keeps_wrap_exact(op, &IntRhs::Acc));
+        }
+
+        // The lane's wrapping arithmetic and i32 bitwise/shift semantics.
+        assert_eq!(wrap_int(BinaryOp::Add, i32::MAX, 1), i32::MIN);
+        assert_eq!(wrap_int(BinaryOp::Mul, 1 << 16, 1 << 16), 0);
+        assert_eq!(bitwise_i32(BinaryOp::BitAnd, 0x0f0f, 0x00ff), 0x000f);
+        assert_eq!(
+            bitwise_i32(BinaryOp::UnsignedRightShift, -1, 1),
+            0x7fff_ffff
+        );
+        assert_eq!(bitwise_i32(BinaryOp::LeftShift, 1, 33), 2);
+    }
+
+    #[test]
+    fn int_lane_mul_shape_is_bounded() {
+        let shape = |imm: f64| {
+            vec![
+                LeafOp::BinImmLocal {
+                    op: BinaryOp::Mul,
+                    slot: 1,
+                    tdz: false,
+                    imm,
+                },
+                LeafOp::BinImm {
+                    op: BinaryOp::BitOr,
+                    imm: 0.0,
+                },
+                LeafOp::StoreReg {
+                    slot: 1,
+                    tdz: false,
+                },
+            ]
+        };
+        assert!(int_rmw_shape(&shape(3.0), RegInt::Unknown).is_some());
+        assert!(int_rmw_shape(&shape(4194304.0), RegInt::Unknown).is_some());
+        assert!(int_rmw_shape(&shape(4194305.0), RegInt::Unknown).is_none());
+        assert!(int_rmw_shape(&shape(1073741825.0), RegInt::Unknown).is_none());
+    }
+
+    #[test]
+    fn int_lane_counter_shape_splits_on_the_proof() {
+        let ops = [
+            LeafOp::LoadCounter,
+            LeafOp::BinLeftReg {
+                op: BinaryOp::Add,
+                slot: 1,
+            },
+            LeafOp::BinImm {
+                op: BinaryOp::BitOr,
+                imm: 0.0,
+            },
+            LeafOp::StoreReg {
+                slot: 1,
+                tdz: false,
+            },
+        ];
+        // A proven-int32 counter takes the guardless conversion; an unproven
+        // one the guarded conversion.
+        assert!(matches!(
+            int_rmw_shape(&ops, RegInt::Int),
+            Some((_, _, _, IntRhs::Counter, _))
+        ));
+        assert!(matches!(
+            int_rmw_shape(&ops, RegInt::Unknown),
+            Some((_, _, _, IntRhs::CounterChecked, _))
+        ));
     }
 }
