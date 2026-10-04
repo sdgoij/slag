@@ -2465,6 +2465,34 @@ pub(crate) fn for_in_cache_put(
 /// call allocates nothing (the bench's simple-param functions are ≤ 8
 /// slots); larger layouts fall back to the heap.
 const INLINE_FRAME: usize = 8;
+
+/// The value-stack cap: the maximum number of slots one activation may use. A
+/// body's per-step stack effect is bounded by its [`CompiledBody::max_stack`],
+/// so a single check at activation entry ([`Vm::check_value_stack`], called
+/// from `run_inner` and the JIT entries) bounds every push the run makes,
+/// throwing the same `RangeError` the native-stack guard throws instead of
+/// letting a pathological body grow the stack without limit. It is also the
+/// ceiling a future fixed, non-reallocating stack would size itself to.
+const MAX_VALUE_STACK: usize = 1 << 20;
+
+/// Whether `len + max_stack` exceeds the value-stack `cap` (the guard
+/// predicate, extracted so it is testable without a `Vm`).
+const fn value_stack_overflows(len: usize, max_stack: usize, cap: usize) -> bool {
+    len.saturating_add(max_stack) > cap
+}
+
+#[cfg(test)]
+mod value_stack_tests {
+    use super::{MAX_VALUE_STACK, value_stack_overflows};
+
+    #[test]
+    fn guard_bounds_by_the_cap() {
+        assert!(!value_stack_overflows(0, MAX_VALUE_STACK, MAX_VALUE_STACK));
+        assert!(value_stack_overflows(1, MAX_VALUE_STACK, MAX_VALUE_STACK));
+        assert!(!value_stack_overflows(13, 3, 16));
+        assert!(value_stack_overflows(14, 3, 16));
+    }
+}
 /// The direct-mapped member-access cell count (P3): a power of two so the
 /// cache index is a mask. `pub` so the jit crate's inline member-cell probe
 /// indexes the same table.
@@ -3438,6 +3466,11 @@ fn builder_slice(builder: &Builder) -> &[u16] {
 pub struct Vm {
     pub ip: usize,
     pub stack: Vec<Value>,
+    /// The activation-granularity value-stack cap (see [`MAX_VALUE_STACK`]): an
+    /// activation whose `max_stack` would push `stack` past this throws a
+    /// `RangeError` before its first slot. A field rather than a bare constant
+    /// so a test can lower it.
+    pub(crate) stack_cap: usize,
     /// The JIT runs' private buffers as `(ptr as usize, len)`, pushed for
     /// the duration of each leaf-path JIT call on this Vm and traced with
     /// it (the leaf path runs on the caller's Vm, which the active-run
@@ -3800,6 +3833,7 @@ impl Vm {
         Self {
             ip: 0,
             stack: Vec::new(),
+            stack_cap: MAX_VALUE_STACK,
             jit_roots: Vec::new(),
             frame: Frame::Inline(std::array::from_fn(|_| Value::Undefined)),
             leaf_frame_base: None,
@@ -4018,6 +4052,22 @@ impl Vm {
     /// scope analysis certified.
     pub fn setup_frame(&mut self, scope: &ScopeInfo, args: &[Value]) {
         self.frame = leaf_frame(scope, args);
+    }
+
+    /// The activation-granularity value-stack guard: called once when a body
+    /// starts, before any of its slots are pushed. A body's per-step stack
+    /// effect is bounded by its `max_stack` (see [`max_stack_usage`]), so this
+    /// one check bounds every push the run makes — it is the value-stack
+    /// analogue of the native-stack guard `crate::stack::enter_js`.
+    #[inline]
+    pub(crate) fn check_value_stack(&self, max_stack: usize) -> Result<(), JsError> {
+        if value_stack_overflows(self.stack.len(), max_stack, self.stack_cap) {
+            return Err(JsError::new(
+                ErrorKind::RangeError,
+                "Maximum call stack size exceeded".into(),
+            ));
+        }
+        Ok(())
     }
 
     /// Cut 58: fill a certified resumable body's frame — params from `args`,
@@ -6512,6 +6562,9 @@ impl Vm {
         // catchable RangeError instead of overflowing the native stack (the
         // JIT side checks in `run_jit_body`).
         crate::stack::enter_js(agent)?;
+        // The value-stack side of the same guard: a body's `max_stack` bounds
+        // every slot it can push, so one check at entry bounds the run.
+        self.check_value_stack(body.max_stack)?;
         // Cut 36 mirror: whether every name this body reads through the env
         // chain resolves at the global env for the whole run — the read can
         // then serve the warmed global-value cell instead of walking the env
@@ -13463,6 +13516,8 @@ impl Vm {
         if agent.jit_depth >= crate::jit::MAX_JIT_DEPTH {
             return Ok(false);
         }
+        // The value-stack side of the guard (see `Vm::check_value_stack`).
+        self.check_value_stack(ir.max_stack)?;
         // G15: see `jit::run_jit_body` — this entry point's `lookup_info` can
         // evict compiled code, so a top-level leaf run bumps the code
         // generation to keep the agent's shared leaf-call records from naming

@@ -491,11 +491,16 @@ struct Lowerer<'a> {
     /// iteration, so these skip the duplicate probe.
     probe_suppressed: HashSet<usize>,
     frame_var: Variable,
+    /// The working region's absolute base. `sp_var` stays an absolute top, but
+    /// the persisted snapshots (`entry_sp_var`, `handler_sp_vars`, `error_sp`)
+    /// are offsets from this base (see `.notes/call-frame-plan.md` C0a-i).
+    base_var: Variable,
     sp_var: Variable,
     /// Cut 70: one variable per handler, holding the working-sp at the
-    /// handler's `EnterTry` — a covered error (or a finally route) resumes
-    /// the catch/finally there, discarding the erroring step's dead
-    /// operands (see `emit_step`'s entry reset and the `EnterTry` save).
+    /// handler's `EnterTry` as an offset from `base_var` — a covered error (or
+    /// a finally route) resumes the catch/finally there, discarding the
+    /// erroring step's dead operands (see `emit_step`'s entry reset and the
+    /// `EnterTry` save).
     handler_sp_vars: Vec<Variable>,
     /// Cut 70: handler-entry step index (a `catch.start` or `finally`
     /// start) → handler index — the dispatch-only blocks whose code must
@@ -511,9 +516,10 @@ struct Lowerer<'a> {
     /// `try`/`finally` fast path takes it as an argument (an Exit outside a
     /// handler's own table passes 0, which only makes that fast path miss).
     exit_handlers: std::collections::HashMap<usize, usize>,
-    /// Cut 46: the working-stack base the body started with — the `sp_var`
-    /// value at entry, saved so a self-tail-call back edge can reset the
-    /// working stack to the fresh-run base before re-entering the body.
+    /// Cut 46: the body's entry sp as an offset from `base_var` (always 0 —
+    /// the entry sp is the region base), saved so a self-tail-call back edge
+    /// can reset the working stack to the fresh-run base before re-entering
+    /// the body.
     entry_sp_var: Variable,
     /// Cut 46: the re-entry block a `TailCallSelf` back edge jumps to — it
     /// re-seeds the per-run variables (working-stack base, loop counter,
@@ -612,8 +618,9 @@ struct Lowerer<'a> {
     /// Cut 55: when a register body (`RunRegBody`) is being lowered, the
     /// working-stack pointer at its entry — a helper error inside the run
     /// must truncate the transient stack use back to it BEFORE dispatching
-    /// (the interpreter truncates before propagating; a catch block reads
-    /// the sp at the `RunRegBody` step).
+    /// The working-sp to restore on a helper error inside a register body,
+    /// as an offset from `base_var` (the interpreter truncates before
+    /// propagating; a catch block reads the sp at the `RunRegBody` step).
     error_sp: Option<ClifValue>,
     /// Slice A of the type-specialized loop lowering: whether `acc_var` holds
     /// a canonical `Value::Number` by construction. Tracked across a
@@ -663,6 +670,7 @@ impl<'a> Lowerer<'a> {
     ) -> Self {
         let mut builder = FunctionBuilder::new(func, fctx);
         let frame_var = builder.declare_var(types::I64);
+        let base_var = builder.declare_var(types::I64);
         let sp_var = builder.declare_var(types::I64);
         // Cut 70: per-handler try-entry sp snapshots (see the struct field).
         let handler_sp_vars: Vec<Variable> = (0..body.handlers.len())
@@ -843,6 +851,7 @@ impl<'a> Lowerer<'a> {
             probe_suppressed: HashSet::new(),
             reentry_block: None,
             frame_var,
+            base_var,
             sp_var,
             handler_sp_vars,
             handler_entry_steps,
@@ -927,8 +936,11 @@ impl<'a> Lowerer<'a> {
         if index == 0 {
             let params = self.builder.block_params(block).to_vec();
             self.builder.def_var(self.frame_var, params[0]);
+            self.builder.def_var(self.base_var, params[1]);
             self.builder.def_var(self.sp_var, params[1]);
-            self.builder.def_var(self.entry_sp_var, params[1]);
+            // The entry sp is the region base, so the entry offset is 0.
+            let zero = self.builder.ins().iconst(types::I64, 0);
+            self.builder.def_var(self.entry_sp_var, zero);
             self.builder.def_var(self.vm_var, params[2]);
         }
         if !self.back_targets.contains(&index) {
@@ -1038,7 +1050,10 @@ impl<'a> Lowerer<'a> {
             self.builder.switch_to_block(entry);
             let params = self.builder.block_params(entry).to_vec();
             self.builder.def_var(self.frame_var, params[0]);
-            self.builder.def_var(self.entry_sp_var, params[1]);
+            self.builder.def_var(self.base_var, params[1]);
+            // The entry sp is the region base, so the entry offset is 0.
+            let zero = self.builder.ins().iconst(types::I64, 0);
+            self.builder.def_var(self.entry_sp_var, zero);
             self.builder.def_var(self.vm_var, params[2]);
             let step0 = self.builder.create_block();
             self.blocks[0] = Some(step0);
@@ -1097,6 +1112,8 @@ impl<'a> Lowerer<'a> {
                     .brif(is_fresh, fresh_block, &[], resume_block, &[]);
                 self.builder.switch_to_block(fresh_block);
                 let fresh_sp = self.builder.use_var(self.entry_sp_var);
+                let base = self.builder.use_var(self.base_var);
+                let fresh_sp = self.builder.ins().iadd(base, fresh_sp);
                 self.builder.def_var(self.sp_var, fresh_sp);
                 let zero = self.builder.ins().f64const(0.0);
                 self.builder.def_var(self.counter_var, zero);
@@ -1134,6 +1151,8 @@ impl<'a> Lowerer<'a> {
                 self.builder.seal_block(entry);
                 self.builder.switch_to_block(reentry);
                 let fresh_sp = self.builder.use_var(self.entry_sp_var);
+                let base = self.builder.use_var(self.base_var);
+                let fresh_sp = self.builder.ins().iadd(base, fresh_sp);
                 self.builder.def_var(self.sp_var, fresh_sp);
                 let zero = self.builder.ins().f64const(0.0);
                 self.builder.def_var(self.counter_var, zero);
@@ -1217,6 +1236,21 @@ impl<'a> Lowerer<'a> {
             .store(MemFlagsData::new(), value, sp, Offset32::new(0));
         let next = self.builder.ins().iadd_imm_s(sp, 8);
         self.builder.def_var(self.sp_var, next);
+    }
+
+    /// Convert an absolute working-region pointer to an offset from the region
+    /// base (C0a-i: the region model is base+offset so a region that moves can
+    /// be re-based with one add; see `.notes/call-frame-plan.md`).
+    fn stack_offset(&mut self, ptr: ClifValue) -> ClifValue {
+        let base = self.builder.use_var(self.base_var);
+        self.builder.ins().isub(ptr, base)
+    }
+
+    /// Set `sp_var` to `base + offset` — the inverse of [`Self::stack_offset`].
+    fn set_sp_offset(&mut self, offset: ClifValue) {
+        let base = self.builder.use_var(self.base_var);
+        let sp = self.builder.ins().iadd(base, offset);
+        self.builder.def_var(self.sp_var, sp);
     }
 
     /// The interned "length" atom, cached once: the typed-array length probe
@@ -3999,8 +4033,8 @@ impl<'a> Lowerer<'a> {
             // A register body's transient stack use is unwound to its entry
             // depth before the error propagates (the interpreter truncates
             // before returning); the catch block reads the sp at the step.
-            if let Some(sp) = self.error_sp {
-                self.builder.def_var(self.sp_var, sp);
+            if let Some(offset) = self.error_sp {
+                self.set_sp_offset(offset);
             }
             let ip = self
                 .builder
@@ -4467,6 +4501,9 @@ impl<'a> Lowerer<'a> {
         emit_fall_through: bool,
     ) -> Result<(), Unsupported> {
         let ctx = self.vm();
+        // The call-result region base as an offset from the working-region base
+        // (C0a-i). Callers pass the absolute pointer.
+        let pre_call_sp = self.stack_offset(pre_call_sp);
         // G21 (Phase 2): a call whose callee IS the running closure skips the
         // leaf-probe machinery and takes the slow lane straight to `call_slow`'s
         // compiled self-call path. The probe could only refuse such a callee
@@ -4700,7 +4737,7 @@ impl<'a> Lowerer<'a> {
         let frame_size_64 = self.builder.ins().uextend(types::I64, frame_size);
         let frame_bytes = self.builder.ins().imul_imm_s(frame_size_64, 8);
         let stack_ptr = self.builder.ins().iadd(args_ptr, frame_bytes);
-        self.emit_leaf_call_tail(cached_entry, args_ptr, stack_ptr, pre_call_sp, merge);
+        self.emit_leaf_call_tail(cached_entry, args_ptr, stack_ptr, pre_call_sp, merge)?;
         // The non-aliased hit: the probe's verdict stays valid, but only a
         // frame the record can describe is rebuildable without the probe
         // (`fill_ok`). A frame wider than the record's TDZ mask keeps the old
@@ -4737,7 +4774,7 @@ impl<'a> Lowerer<'a> {
         let frame_size_64 = self.builder.ins().uextend(types::I64, frame_size);
         let frame_bytes = self.builder.ins().imul_imm_s(frame_size_64, 8);
         let stack_ptr = self.builder.ins().iadd(frame_base, frame_bytes);
-        self.emit_leaf_call_tail(filled, frame_base, stack_ptr, pre_call_sp, merge);
+        self.emit_leaf_call_tail(filled, frame_base, stack_ptr, pre_call_sp, merge)?;
         // The env lane (G13): the record says the leaf reads its environment,
         // which the machine code cannot call in-frame — the
         // `body_context`/`lexical_env` swap has to span the call. The frame is
@@ -4767,7 +4804,7 @@ impl<'a> Lowerer<'a> {
             .ins()
             .brif(env_failed, slow, &[], env_done, &[]);
         self.builder.switch_to_block(env_done);
-        self.emit_leaf_result_tail(value, pre_call_sp, merge);
+        self.emit_leaf_result_tail(value, pre_call_sp, merge)?;
         // The probe path: the full validation + lookups + frame fill (Cut
         // 37); the probe records the cache identity so repeat visits skip it.
         self.builder.switch_to_block(probe_block);
@@ -4811,7 +4848,7 @@ impl<'a> Lowerer<'a> {
         let frame_size_64 = self.builder.ins().uextend(types::I64, frame_size);
         let frame_bytes = self.builder.ins().imul_imm_s(frame_size_64, 8);
         let stack_ptr = self.builder.ins().iadd(frame_ptr, frame_bytes);
-        self.emit_leaf_call_tail(probe, frame_ptr, stack_ptr, pre_call_sp, merge);
+        self.emit_leaf_call_tail(probe, frame_ptr, stack_ptr, pre_call_sp, merge)?;
         // The slow path: the interpreter's call machinery (unchanged). The
         // `direct_eval` flag rides along (Cut 62): a direct-eval callee
         // must run `perform_eval` with the caller's environment intact.
@@ -4825,7 +4862,7 @@ impl<'a> Lowerer<'a> {
             Helper::CallSlow,
             &[callee, this, argc, args_ptr, direct_eval_imm],
         )?;
-        self.builder.def_var(self.sp_var, pre_call_sp);
+        self.set_sp_offset(pre_call_sp);
         self.push(res);
         self.builder.ins().jump(merge, &[]);
         self.builder.seal_block(merge);
@@ -4844,23 +4881,28 @@ impl<'a> Lowerer<'a> {
         entry: ClifValue,
         frame_ptr: ClifValue,
         stack_ptr: ClifValue,
-        pre_call_sp: ClifValue,
+        pre_call_offset: ClifValue,
         merge: Block,
-    ) {
+    ) -> Result<(), Unsupported> {
         let ctx = self.vm();
         let inst =
             self.builder
                 .ins()
                 .call_indirect(self.sig_entry, entry, &[frame_ptr, stack_ptr, ctx]);
         let result = self.builder.func.dfg.inst_results(inst)[0];
-        self.emit_leaf_result_tail(result, pre_call_sp, merge);
+        self.emit_leaf_result_tail(result, pre_call_offset, merge)
     }
 
     /// Land a leaf call's result: check the pending byte (a throwing leaf slow
     /// path bails the whole body), then push `result` on the value stack and
     /// jump to `merge`. Shared by the in-frame call above and the env lane,
     /// where the helper performed the call and the result is already in hand.
-    fn emit_leaf_result_tail(&mut self, result: ClifValue, pre_call_sp: ClifValue, merge: Block) {
+    fn emit_leaf_result_tail(
+        &mut self,
+        result: ClifValue,
+        pre_call_offset: ClifValue,
+        merge: Block,
+    ) -> Result<(), Unsupported> {
         let ctx = self.vm();
         let pending =
             self.builder
@@ -4875,9 +4917,10 @@ impl<'a> Lowerer<'a> {
         self.builder.ins().return_(&[undef]);
         self.builder.seal_block(err);
         self.builder.switch_to_block(cont);
-        self.builder.def_var(self.sp_var, pre_call_sp);
+        self.set_sp_offset(pre_call_offset);
         self.push(result);
         self.builder.ins().jump(merge, &[]);
+        Ok(())
     }
 
     /// Cut 46/47: rebind the frame for a self-tail-call re-entry — params
@@ -5045,12 +5088,13 @@ impl<'a> Lowerer<'a> {
         merge: Block,
         this_ptr: ClifValue,
     ) {
+        let offset = self.stack_offset(this_ptr);
         let sentinel = self.builder.ins().iconst(types::I64, sentinel);
         let fallback = self.builder.ins().icmp(IntCC::Equal, result, sentinel);
         let hit = self.builder.create_block();
         self.builder.ins().brif(fallback, slow, &[], hit, &[]);
         self.builder.switch_to_block(hit);
-        self.builder.def_var(self.sp_var, this_ptr);
+        self.set_sp_offset(offset);
         self.push(result);
         self.builder.ins().jump(merge, &[]);
     }
@@ -5175,7 +5219,9 @@ impl<'a> Lowerer<'a> {
         if !self.has_suspension
             && let Some(handler) = self.handler_entry_steps.get(&index)
         {
-            let entry = self.builder.use_var(self.handler_sp_vars[*handler]);
+            let offset = self.builder.use_var(self.handler_sp_vars[*handler]);
+            let base = self.builder.use_var(self.base_var);
+            let entry = self.builder.ins().iadd(base, offset);
             self.builder.def_var(self.sp_var, entry);
         }
         // The compiled GC safe point: a block that runs once per iteration —
@@ -5667,7 +5713,8 @@ impl<'a> Lowerer<'a> {
                 after,
             } => self.emit_fast_loop_head(*var, *op, *limit, *inc, *body_start, *after)?,
             Step::RunRegBody { ops } => {
-                let entry_sp = self.builder.use_var(self.sp_var);
+                let sp = self.builder.use_var(self.sp_var);
+                let entry_sp = self.stack_offset(sp);
                 self.seed_acc_undefined();
                 let returns = matches!(ops.last(), Some(LeafOp::ReturnAcc));
                 // Cut 55: a helper error inside the run must truncate the
@@ -5684,7 +5731,7 @@ impl<'a> Lowerer<'a> {
                 }
                 // The interpreter truncates the register body's transient
                 // stack use to the entry length.
-                self.builder.def_var(self.sp_var, entry_sp);
+                self.set_sp_offset(entry_sp);
                 self.fall_through(index);
             }
             Step::PushAcc => {
@@ -6286,7 +6333,8 @@ impl<'a> Lowerer<'a> {
                             Helper::CharCodeAt,
                             &[this, arg1],
                         )?;
-                        self.builder.def_var(self.sp_var, this_ptr);
+                        let offset = self.stack_offset(this_ptr);
+                        self.set_sp_offset(offset);
                         self.push(value);
                         self.builder.ins().jump(merge, &[]);
                     }
@@ -6307,7 +6355,8 @@ impl<'a> Lowerer<'a> {
                                 .ins()
                                 .bitcast(types::I64, MemFlagsData::new(), result);
                         let value = self.canon(bits);
-                        self.builder.def_var(self.sp_var, this_ptr);
+                        let offset = self.stack_offset(this_ptr);
+                        self.set_sp_offset(offset);
                         self.push(value);
                         self.builder.ins().jump(merge, &[]);
                     }
@@ -6368,6 +6417,9 @@ impl<'a> Lowerer<'a> {
                     Offset32::new(0),
                 );
                 let pre_call_sp = callee_ptr;
+                // The absolute pointer stays for `emit_call` (which converts
+                // it); this offset serves the direct `call_apply` reset below.
+                let pre_call_offset = self.stack_offset(pre_call_sp);
                 let ctx = self.vm();
                 let intrinsic_offset = match kind {
                     ApplyKind::Apply => {
@@ -6507,7 +6559,7 @@ impl<'a> Lowerer<'a> {
                     Helper::CallApply,
                     &[resolved, callee, argc_imm, args_ptr, kind_imm],
                 )?;
-                self.builder.def_var(self.sp_var, pre_call_sp);
+                self.set_sp_offset(pre_call_offset);
                 self.push(result);
                 self.fall_through(index);
                 self.builder.seal_block(slow);
@@ -7249,9 +7301,12 @@ impl<'a> Lowerer<'a> {
             Step::EnterTry { handler } => {
                 // Cut 70: snapshot the working-sp at the try entry — a
                 // covered error resumes the catch/finally at this depth
-                // (see the reset at the handler-entry steps).
+                // (see the reset at the handler-entry steps). Stored as an
+                // offset from the region base (C0a-i).
                 let sp = self.builder.use_var(self.sp_var);
-                self.builder.def_var(self.handler_sp_vars[*handler], sp);
+                let base = self.builder.use_var(self.base_var);
+                let offset = self.builder.ins().isub(sp, base);
+                self.builder.def_var(self.handler_sp_vars[*handler], offset);
                 self.emit_enter_try(*handler)?;
                 self.fall_through(index);
             }

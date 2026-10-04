@@ -206,6 +206,65 @@ realloc. This is the decision the stage turns on:
    `frame_get` already uses for the leaf frame. Robust, but every stack access
    pays a reload, so it is a codegen-wide change.
 
+**Carried requirement (2026-10-04).** Mechanism 1 is necessary but not
+sufficient. The call helpers push onto `vm.stack` for the duration of the call
+and then truncate: `call_slow` (`crates/runtime/src/jit.rs:1863`) and
+`call_apply` by `argc + 2`, and `call_vector` (`jit.rs:3654`) by
+`vm.stack.extend(args)` where `args` is the spread vector — unbounded
+(`f(...bigArray)`), so no compile-time reserve can cover it. A baked
+`work_ptr` therefore dangles on the realloc however generous the reserve. The
+region needs both halves: the cap/reserve (which bounds the non-call helper
+traffic and the `argc`-bounded pushes) **and** a re-derive of the working base
+at the call-helper boundaries. Concretely, `JitCallContext` would carry
+`work_base` as an index and the compiled code reload `work_ptr =
+vm.stack.as_ptr() + work_base * 8` (and `buf_end`) after
+`call_slow`/`call_apply`/`call_vector` return.
+
+**Audit correction (2026-10-04): the reload is not a small patch.** The
+compiler's stack model is absolute-pointer based. `Lowerer::sp_var`
+(`crates/jit/src/compiler.rs:494`) is the working top, `entry_sp_var`
+(`:516`) is the run's base (used to reset a self-tail-call back edge), and the
+per-handler `handler_sp_vars` (`:497`) are sp snapshots for error resume — all
+absolute addresses. One realloc at a call boundary therefore dangles *every*
+held pointer, not just `sp_var`, and a `try` can span a call, so the handler
+snapshots cannot be rebased by a fixed few instructions. The clean fix is to
+make the compiled stack model **base+offset** throughout (the shape mechanism 2
+describes): carry a stable base and treat `sp_var`/`entry_sp_var`/
+`handler_sp_vars` as offsets, so a moved allocation rebases with one add. That
+is a codegen-wide change, not a localized reload — C0a's real cost is that
+refactor, and the decision is whether to commit to it.
+
+**Status (2026-10-04): C0a-ii attempted, reverted — region stays a private
+buffer.** With the base+offset model landed (C0a-i), the region was moved onto
+`vm.stack` (top-level and resume), the compiled code re-basing after the
+push-capable helpers via a `stack_rebase` helper. Single-threaded it was green
+(the full workspace suite passed), but under the parallel test harness it
+reproduced a layout-dependent write into the freed old allocation
+(`STATUS_HEAP_CORRUPTION`/`STATUS_ACCESS_VIOLATION`). Two findings, both
+load-bearing for a re-attempt:
+
+1. **A shared movement-delta cursor is consumed by a nested re-base.** Deriving
+the new base from `last_alloc_ptr` stored in the ctx fails because an in-frame
+leaf runs on the *caller's* ctx: the leaf's own re-base advances the cursor, so
+the caller's subsequent re-base sees delta 0 and never corrects its (now
+stale) base. The base must be re-derived from a per-body **slot index**
+(`vm.stack.as_ptr() + base_slot * 8`), which a `Vec` realloc preserves.
+2. **Even the slot-index re-base was not sufficient.** A rare move-triggered
+dangling write remained (the crash only surfaced under parallel allocator
+reuse; preventing the realloc — a large `reserve` — made it disappear). It was
+not isolated in the session. The candidates are the Rust lanes that hold a
+region pointer across an internal push (`construct`'s `sp`,
+`leaf_call_env`'s `frame_base`) and any helper the rebase set missed. Re-land
+this only with ASAN on CI and a design that cannot move the region (a
+fixed-capacity stack, mechanism 1 taken to its conclusion), not by patching
+re-base sites.
+
+Reverted per the step-1 rule (restore green, re-land on an audit). Kept: the
+base+offset model (C0a-i, behavior-neutral) and the `max_stack`/cap+guard
+pieces. Removed: the `vm.stack` region, `stack_rebase`, the `JitCallContext`
+region fields, and the args copy-outs in `call_slow`/`call_apply` (only needed
+while the region could move).
+
 Sub-steps, each independently landable and gated on corpus equivalence plus
 `--gc-stress`/`--nursery-stress`/the six sweeps with no row regress:
 

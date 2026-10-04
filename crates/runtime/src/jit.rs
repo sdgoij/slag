@@ -6349,6 +6349,8 @@ pub(crate) fn run_jit_body(
     // descend into the reserved bottom margin, throwing a catchable
     // RangeError instead of overflowing the native stack.
     crate::stack::enter_js(agent)?;
+    // The value-stack side of the same guard (see `Vm::check_value_stack`).
+    vm.check_value_stack(ir.max_stack)?;
     let info_ptr = lookup_info(hook, ir, agent.jit_depth > 0);
     if info_ptr.is_null() {
         return Ok(JitRunOutcome::Interp);

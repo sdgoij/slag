@@ -360,12 +360,6 @@ impl Helper {
     /// checks can change mid-run. The compiled code bumps the ctx's
     /// leaf-eligibility epoch after such helpers so a cached leaf verdict is
     /// not reused across the disturbance. The excluded helpers are pure
-    /// Whether calling this helper can re-enter the interpreter (a getter,
-    /// setter, `valueOf`/`toString`, or nested call), which is the only way
-    /// the Vm stacks and realm count the leaf-call probe's eligibility
-    /// checks can change mid-run. The compiled code bumps the ctx's
-    /// leaf-eligibility epoch after such helpers so a cached leaf verdict is
-    /// not reused across the disturbance. The excluded helpers are pure
     /// slot/descriptor reads and writes, the string concat, or immediate
     /// throws (the probe itself is excluded — it only validates and fills).
     pub fn disturbs_leaf_eligibility(self) -> bool {
