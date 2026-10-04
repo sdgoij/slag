@@ -6301,12 +6301,12 @@ impl<'a> Lowerer<'a> {
                 span: _,
             } => {
                 // Stage B: `[..., this, callee, a1..aN]` with the callee the
-                // member read's result. When it is the realm's `%Math.<name>%`
-                // (`intrinsic_bits[kind]`, 0 when the body has none) and the
-                // first argument is a Number, the machine code computes the
-                // operation in place; otherwise it falls to `emit_call`. The
-                // identity check is the retirement: a reassigned
-                // `Math.<name>` no longer matches.
+                // member read's result. When it is the realm's `%`-named
+                // intrinsic for `kind` (`intrinsic_bits[kind]`, 0 when the body
+                // has none) and the receiver/argument shapes allow, the machine
+                // code computes the operation in place; otherwise it falls to
+                // `emit_call`. The identity check is the retirement: a
+                // reassigned method no longer matches.
                 let sp = self.builder.use_var(self.sp_var);
                 let args_ptr = self.builder.ins().iadd_imm_s(sp, -((*argc as i64) * 8));
                 let callee_ptr = self.builder.ins().iadd_imm_s(sp, -((*argc as i64 + 1) * 8));
@@ -6344,35 +6344,50 @@ impl<'a> Lowerer<'a> {
                 let arg_ok = self.is_double(arg1);
                 let gate = self.builder.ins().band(non_zero, callee_ok);
                 let gate = self.builder.ins().band(gate, arg_ok);
+                // A `this`-reading intrinsic (the string methods) additionally
+                // requires a String primitive receiver; the `Math` unaries
+                // ignore `this`.
+                let gate = if kind.reads_this() {
+                    let this_ok = self.is_string(this);
+                    self.builder.ins().band(gate, this_ok)
+                } else {
+                    gate
+                };
                 let fast = self.builder.create_block();
                 let slow = self.builder.create_block();
                 let merge = self.builder.create_block();
                 self.builder.ins().brif(gate, fast, &[], slow, &[]);
-                // The fast path: the operation on a Number argument (each
-                // `Math.<name>` is a pure f64 op). The result replaces the
-                // whole call region (`this` included — none of them read it).
+                // The fast path: compute the operation (a pure `Math` instruction
+                // or the string helper) and replace the whole call region.
                 self.builder.switch_to_block(fast);
-                let num = self
-                    .builder
-                    .ins()
-                    .bitcast(types::F64, MemFlagsData::new(), arg1);
-                let result = match kind {
-                    Intrinsic::MathAbs => self.builder.ins().fabs(num),
-                    Intrinsic::MathCeil => self.builder.ins().ceil(num),
-                    Intrinsic::MathFloor => self.builder.ins().floor(num),
-                    Intrinsic::MathTrunc => self.builder.ins().trunc(num),
-                    Intrinsic::MathSqrt => self.builder.ins().sqrt(num),
+                let value = match kind {
+                    Intrinsic::StringCharCodeAt => {
+                        self.emit_raw_call(self.sig_get_name, Helper::CharCodeAt, &[this, arg1])?
+                    }
+                    _ => {
+                        let num = self
+                            .builder
+                            .ins()
+                            .bitcast(types::F64, MemFlagsData::new(), arg1);
+                        let result = match kind {
+                            Intrinsic::MathAbs => self.builder.ins().fabs(num),
+                            Intrinsic::MathCeil => self.builder.ins().ceil(num),
+                            Intrinsic::MathFloor => self.builder.ins().floor(num),
+                            Intrinsic::MathTrunc => self.builder.ins().trunc(num),
+                            _ => self.builder.ins().sqrt(num),
+                        };
+                        let bits =
+                            self.builder
+                                .ins()
+                                .bitcast(types::I64, MemFlagsData::new(), result);
+                        self.canon(bits)
+                    }
                 };
-                let bits = self
-                    .builder
-                    .ins()
-                    .bitcast(types::I64, MemFlagsData::new(), result);
-                let value = self.canon(bits);
                 self.builder.def_var(self.sp_var, this_ptr);
                 self.push(value);
                 self.builder.ins().jump(merge, &[]);
-                // The fallback: the general call machinery (a shadowed
-                // `<name>`, a non-`Math` receiver, or a non-Number argument).
+                // The fallback: the general call machinery (a shadowed method,
+                // a non-`Math`/non-String receiver, or a non-Number argument).
                 self.builder.switch_to_block(slow);
                 self.emit_call(
                     index, callee, this, args_ptr, argc_imm, this_ptr, false, false,

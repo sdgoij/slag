@@ -48,10 +48,10 @@ pub enum ApplyKind {
 
 /// A Stage-B builtin intrinsic the compiler recognizes by member-call name and
 /// splices in place of the call: the handler compares the resolved callee
-/// against the realm's `%Math.<name>%` and, on a match with a Number argument,
-/// computes the operation directly. The identity check is the retirement — a
-/// reassigned `Math.<name>`, a patched accessor, a non-`Math` receiver or a
-/// non-Number argument all take the general call.
+/// against the realm's `%`-named intrinsic and, when the receiver and argument
+/// shapes allow, computes the operation directly. The identity check is the
+/// retirement — a reassigned method, a patched accessor, or a receiver/argument
+/// that would need a user-visible conversion all take the general call.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Intrinsic {
     MathAbs,
@@ -59,11 +59,12 @@ pub enum Intrinsic {
     MathFloor,
     MathTrunc,
     MathSqrt,
+    StringCharCodeAt,
 }
 
 /// The number of recognized intrinsics (a `Intrinsic` discriminant is an index
 /// into the per-run intrinsic-bit snapshot).
-pub const INTRINSIC_COUNT: usize = 5;
+pub const INTRINSIC_COUNT: usize = 6;
 
 /// Every recognized intrinsic, in discriminant order: the order that pairs an
 /// `intrinsic_bits` slot with its `Intrinsic`.
@@ -73,6 +74,7 @@ pub const INTRINSICS: [Intrinsic; INTRINSIC_COUNT] = [
     Intrinsic::MathFloor,
     Intrinsic::MathTrunc,
     Intrinsic::MathSqrt,
+    Intrinsic::StringCharCodeAt,
 ];
 
 impl Intrinsic {
@@ -84,6 +86,7 @@ impl Intrinsic {
             Intrinsic::MathFloor => "floor",
             Intrinsic::MathTrunc => "trunc",
             Intrinsic::MathSqrt => "sqrt",
+            Intrinsic::StringCharCodeAt => "charCodeAt",
         }
     }
 
@@ -95,7 +98,15 @@ impl Intrinsic {
             Intrinsic::MathFloor => "%Math.floor%",
             Intrinsic::MathTrunc => "%Math.trunc%",
             Intrinsic::MathSqrt => "%Math.sqrt%",
+            Intrinsic::StringCharCodeAt => "%String.prototype.charCodeAt%",
         }
+    }
+
+    /// Whether the intrinsic reads `this` as its receiver (the string methods)
+    /// rather than ignoring it (the `Math` unaries). The JIT adds a receiver
+    /// guard for these.
+    pub fn reads_this(self) -> bool {
+        matches!(self, Intrinsic::StringCharCodeAt)
     }
 }
 
@@ -12308,7 +12319,8 @@ impl Vm {
         let n = self.stack.len();
         let arg_start = n - argc;
         let callee = self.stack[arg_start - 1];
-        let intrinsic = agent.current_realm()?.intrinsics.math(kind);
+        let this = self.stack[arg_start - 2];
+        let intrinsic = agent.current_realm()?.intrinsics.intrinsic(kind);
         if Some(callee) != intrinsic {
             return Ok(false);
         }
@@ -12323,6 +12335,22 @@ impl Vm {
             Intrinsic::MathFloor => value.floor(),
             Intrinsic::MathTrunc => value.trunc(),
             Intrinsic::MathSqrt => value.sqrt(),
+            Intrinsic::StringCharCodeAt => {
+                // `this` must be a String primitive: a wrapper object or any
+                // other receiver needs the builtin's exact `ToString`, which can
+                // run user code. The position is already a Number (checked
+                // above), so `ToIntegerOrInfinity` is side-effect free.
+                let Some(string) = this.as_string() else {
+                    return Ok(false);
+                };
+                let position = crux::convert::to_integer_or_infinity(value);
+                let size = string.len() as f64;
+                if position < 0.0 || position >= size {
+                    f64::NAN
+                } else {
+                    string.code_unit(position as usize).unwrap_or(0) as f64
+                }
+            }
         };
         self.stack.truncate(arg_start - 2);
         self.stack.push(Value::Number(result));

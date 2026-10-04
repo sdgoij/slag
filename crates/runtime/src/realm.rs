@@ -187,11 +187,11 @@ pub struct Intrinsics {
     /// populated at bootstrap and never reassigned).
     apply_builtin: RefCell<Option<Value>>,
     call_builtin: RefCell<Option<Value>>,
-    /// The realm's cached `%Math.<name>%` builtins (index = `Intrinsic as
+    /// The realm's cached Stage-B intrinsic values (index = `Intrinsic as
     /// usize`), resolved once each like `function_prototypes`: the compiled
     /// `CallIntrinsic` step compares the member-read result against its kind's
     /// slot per call, and the values are stable for the realm's life.
-    math_intrinsics: RefCell<[Option<Value>; INTRINSIC_COUNT]>,
+    intrinsic_cache: RefCell<[Option<Value>; INTRINSIC_COUNT]>,
     /// The realm's %String.prototype% value, cached after the first
     /// resolution: primitive-string member reads resolve their chain
     /// directly against it instead of boxing a per-read String-exotic
@@ -262,7 +262,7 @@ impl Trace for Intrinsics {
         }
         self.apply_builtin.trace(visit);
         self.call_builtin.trace(visit);
-        match self.math_intrinsics.try_borrow() {
+        match self.intrinsic_cache.try_borrow() {
             Ok(guard) => {
                 for slot in guard.iter() {
                     slot.trace(visit);
@@ -398,16 +398,17 @@ impl Intrinsics {
         Some(value)
     }
 
-    /// The realm's `%Math.<name>%` builtin for `kind`, cached after the first
-    /// resolution (see the struct field).
-    pub fn math(&self, kind: Intrinsic) -> Option<Value> {
+    /// The realm's intrinsic value for `kind`, cached after the first
+    /// resolution (see the struct field). Resolves the kind's `%`-name —
+    /// `%Math.<name>%` or `%String.prototype.<name>%`.
+    pub fn intrinsic(&self, kind: Intrinsic) -> Option<Value> {
         let index = kind as usize;
-        if let Some(value) = self.math_intrinsics.borrow()[index] {
+        if let Some(value) = self.intrinsic_cache.borrow()[index] {
             return Some(value);
         }
         let value = self.get(kind.intrinsic_name())?;
         self.cache_barrier(value);
-        self.math_intrinsics.borrow_mut()[index] = Some(value);
+        self.intrinsic_cache.borrow_mut()[index] = Some(value);
         Some(value)
     }
 
@@ -960,17 +961,17 @@ mod tests {
             "a namespace object's method is named by the object's name and the key"
         );
         // Every intrinsic `Step::CallIntrinsic` recognizes is retired against
-        // its `%Math.<name>%` identity, so each name must resolve in the
-        // registry (the compiler's `Intrinsic::intrinsic_name` must match what
-        // `name_members` derives).
+        // its `%`-name, so each name must resolve in the registry to a function
+        // (the compiler's `Intrinsic::intrinsic_name` must match an install).
         for kind in crate::ir::INTRINSICS {
-            let member = math
-                .get(&JsString::from_utf8(kind.member_name()))
-                .unwrap_or_else(|_| panic!("Math.{} is installed", kind.member_name()));
-            assert_eq!(
-                realm.intrinsics.get(kind.intrinsic_name()),
-                Some(member),
-                "every recognized intrinsic's %Math.<name>% is named"
+            let value = realm
+                .intrinsics
+                .get(kind.intrinsic_name())
+                .unwrap_or_else(|| panic!("{} is named", kind.intrinsic_name()));
+            assert!(
+                value.as_function().is_some(),
+                "{} is a function",
+                kind.intrinsic_name()
             );
         }
 

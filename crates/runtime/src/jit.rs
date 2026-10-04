@@ -1145,6 +1145,11 @@ pub struct JitSlowPaths {
     /// `Step::TypeofTop` (Cut 60): compute the `typeof` string of the value
     /// (pops it) and return it. Never errors.
     pub typeof_top: extern "C" fn(ctx: *mut c_void, value: u64) -> u64,
+    /// `Step::CallIntrinsic` for `%String.prototype.charCodeAt%`: the receiver
+    /// (`this`, a String primitive per the compiled guard) and the Number
+    /// argument; returns the code unit as a Number, or NaN out of range. Never
+    /// errors, never triggers the collector.
+    pub char_code_at: extern "C" fn(ctx: *mut c_void, this: u64, arg: u64) -> u64,
     /// A compiled `GetMemberName` with the `length` atom: the slots length of
     /// an IntegerIndexed receiver, or the canonical-NaN sentinel otherwise
     /// (the machine code falls back to the member-cell probe /
@@ -1318,6 +1323,7 @@ pub static JIT_SLOW_PATHS: JitSlowPaths = JitSlowPaths {
     destructure_close_all,
     create_arguments,
     typeof_top,
+    char_code_at,
     typed_array_length,
     get_super_base,
     this_value,
@@ -5325,6 +5331,23 @@ extern "C" fn typeof_top(ctx: *mut c_void, value: u64) -> u64 {
     typeof_bits(&Value::from_bits(value))
 }
 
+/// `Step::CallIntrinsic` for `%String.prototype.charCodeAt%`: `this` is a String
+/// primitive (the compiled guard ensures it) and `arg` is a Number. `charCodeAt`
+/// needs no allocation, so this never triggers the collector (a rope's flatten
+/// is a plain Rust allocation).
+extern "C" fn char_code_at(ctx: *mut c_void, this: u64, arg: u64) -> u64 {
+    let _ = ctx;
+    let Some(string) = Value::from_bits(this).as_string() else {
+        return Value::Number(f64::NAN).bits();
+    };
+    let position = crux::convert::to_integer_or_infinity(f64::from_bits(arg));
+    let size = string.len() as f64;
+    if position < 0.0 || position >= size {
+        return Value::Number(f64::NAN).bits();
+    }
+    Value::Number(string.code_unit(position as usize).unwrap_or(0) as f64).bits()
+}
+
 /// The `typeof` string for `value`, as the value's bits — the shape
 /// `typeof_top` (a value operand, Cut 60) and `typeof_ident` (a name resolved
 /// through the environment) both push.
@@ -6133,7 +6156,7 @@ pub(crate) fn intrinsic_bits(agent: &Agent) -> [u64; INTRINSIC_COUNT] {
     for (slot, kind) in bits.iter_mut().zip(INTRINSICS) {
         *slot = realm
             .intrinsics
-            .math(kind)
+            .intrinsic(kind)
             .map(|value| value.bits())
             .unwrap_or(0);
     }

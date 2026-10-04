@@ -457,6 +457,7 @@ fn runtime_helpers() -> JitHelpers {
         destructure_close_all: Some(rt.destructure_close_all),
         create_arguments: Some(rt.create_arguments),
         typeof_top: Some(rt.typeof_top),
+        char_code_at: Some(rt.char_code_at),
         typed_array_length: Some(rt.typed_array_length),
         get_super_base: Some(rt.get_super_base),
         this_value: Some(rt.this_value),
@@ -698,6 +699,7 @@ mod tests {
             destructure_close_all: Some(helpers::test_destructure_close_all),
             create_arguments: Some(helpers::test_create_arguments),
             typeof_top: Some(helpers::test_typeof_top),
+            char_code_at: Some(helpers::test_char_code_at),
             typed_array_length: Some(helpers::test_typed_array_length),
             get_super_base: Some(helpers::test_get_super_base),
             this_value: Some(helpers::test_this_value),
@@ -2548,6 +2550,49 @@ mod tests {
         assert_eq!(
             value, interp,
             "the Math intrinsic splices must match the interpreter"
+        );
+        assert!(compiled >= 1, "{compiled} bodies");
+    }
+
+    #[test]
+    fn installed_jit_char_code_at_intrinsic_matches_the_interpreter() {
+        // The Stage-B `String.prototype.charCodeAt` splice: a `.charCodeAt(...)`
+        // call whose resolved callee is the realm's intrinsic and whose receiver
+        // is a String primitive computes the code unit in machine code. The
+        // identity check is the retirement and the receiver guard the soundness
+        // gate — a shadowed method, a non-String receiver, and a non-Number
+        // position all take the general call — so each must agree with the
+        // interpreter.
+        let source = "var out = [];\n\
+                      function t(v) { out.push(String(v)); }\n\
+                      t('hello'.charCodeAt(0)); t('hello'.charCodeAt(4)); t('hello'.charCodeAt(5));\n\
+                      t('hello'.charCodeAt(-1)); t('hello'.charCodeAt(1.9)); t('hello'.charCodeAt(NaN));\n\
+                      t('hello'.charCodeAt(-0.5)); t('hello'.charCodeAt(-0));\n\
+                      t(''.charCodeAt(0)); t('a😀b'.charCodeAt(1));\n\
+                      t('hello'.charCodeAt('1')); t('hello'.charCodeAt(1, 9)); t('hello'.charCodeAt());\n\
+                      var saved = String.prototype.charCodeAt;\n\
+                      String.prototype.charCodeAt = function (i) { return 999; };\n\
+                      t('hello'.charCodeAt(1));\n\
+                      String.prototype.charCodeAt = saved; t('hello'.charCodeAt(1));\n\
+                      t({ charCodeAt: String.prototype.charCodeAt }.charCodeAt(0));\n\
+                      t({ charCodeAt: function (i) { return i; } }.charCodeAt(7));\n\
+                      function loop(n) {\n\
+                        var strs = ['abcdefgh', 'ijklmnop', 'qrstuvwx', 'yz012345'];\n\
+                        var s = 0;\n\
+                        for (var i = 0; i < n; i++) { var k = i & 1023; s = (s + strs[k & 3].charCodeAt(k & 7)) | 0; }\n\
+                        return s;\n\
+                      }\n\
+                      t(loop(1000));\n\
+                      out.join(',');";
+        let interp = {
+            let mut agent = runtime::Agent::new();
+            agent.initialize_host_defined_realm().expect("realm");
+            agent.run_script(source).expect("interp runs")
+        };
+        let (value, compiled) = with_jit_agent(|agent| agent.run_script(source).expect("jit runs"));
+        assert_eq!(
+            value, interp,
+            "the charCodeAt intrinsic splice must match the interpreter"
         );
         assert!(compiled >= 1, "{compiled} bodies");
     }
