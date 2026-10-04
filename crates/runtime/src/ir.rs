@@ -13483,19 +13483,18 @@ impl Vm {
     }
 
     /// The JIT leaf path (see `crate::jit`): run `ir`'s compiled machine
-    /// code against a private frame/working-area buffer, mirroring
+    /// code against a `vm.stack` frame/working region, mirroring
     /// `run_inline_leaf`'s stack discipline — the call site's arguments are
     /// the top `argc` stack values and the result replaces them. Returns
     /// `Ok(true)` when the compiled body ran, `Ok(false)` when the body has
     /// no compiled code (the caller falls back to the interpreter), and
     /// `Err` on a thrown error.
     ///
-    /// The frame and the JIT's working area live in a local buffer, not on
-    /// `self.stack`: the slow-path helpers receive `&mut Vm` and may push
-    /// arbitrary values (a member helper can invoke a setter, which runs JS
-    /// on this stack and reallocates the `Vec` under the JIT's raw
-    /// pointers). The helpers never see the leaf's frame, so the private
-    /// buffer is unobservable.
+    /// C0b: the frame and the JIT's working area are a segment of
+    /// `self.stack` (mirroring `run_leaf_body`), reserved to `stack_cap` for
+    /// the run so a helper's push cannot reallocate the `Vec` under the
+    /// machine code's baked pointers. `leaf_frame_base` addresses the frame
+    /// half, so a helper's `frame_get` reads the leaf's own frame.
     #[allow(clippy::too_many_arguments)]
     fn run_jit_leaf(
         &mut self,
@@ -13580,38 +13579,37 @@ impl Vm {
             debug_assert!(!ir.leaf_uses_env);
             (None, None)
         };
-        // The frame (this slot, params, `var`s as undefined, `let`/`const`
+        // C0b: the frame (this slot, params, `var`s as undefined, `let`/`const`
         // in the TDZ — `run_leaf_body`'s layout) plus the JIT's working area
-        // and the helper slack, in a private buffer — helpers receive
-        // `&mut Vm` and may reallocate `self.stack`, so the JIT's raw
-        // pointers must never alias it. A small body fits a stack array (no
-        // per-call heap allocation); larger bodies spill to a Vec.
+        // and the helper slack is a segment of `vm.stack`, exactly like the
+        // interpreter leaf — not a private buffer. `leaf_frame_base` addresses
+        // it, so a helper's `frame_get` reads the leaf's own frame. The
+        // `reserve` to `stack_cap` keeps a helper push from reallocating the
+        // segment (the baked pointers must stay valid).
         let buf_len = scope.frame_size + info.stack_usage + crate::jit::JIT_STACK_SLACK;
-        let (mut inline_buf, mut heap_buf) = (
-            [Value::Undefined; crate::jit::INLINE_JIT_BUF],
-            Vec::<Value>::new(),
-        );
-        let buf: &mut [Value] = if buf_len <= crate::jit::INLINE_JIT_BUF {
-            &mut inline_buf[..buf_len]
-        } else {
-            heap_buf.resize(buf_len, Value::Undefined);
-            &mut heap_buf[..]
-        };
-        for (slot, cell) in buf.iter_mut().enumerate().take(scope.frame_size) {
-            *cell = if Some(slot) == scope.this_slot {
+        let frame_base = self.stack.len();
+        self.stack.resize(frame_base + buf_len, Value::Undefined);
+        self.stack
+            .reserve(self.stack_cap.saturating_sub(self.stack.len()));
+        for slot in 0..scope.frame_size {
+            let value = if Some(slot) == scope.this_slot {
                 this_value
+            } else if slot < scope.arity.min(argc) {
+                self.stack[pre_call + slot]
             } else if slot < scope.arity {
                 // Missing arguments stay `undefined` (spec 10.2.11).
-                self.stack
-                    .get(pre_call + slot)
-                    .copied()
-                    .unwrap_or(Value::Undefined)
+                Value::Undefined
             } else if scope.tdz_store.get(slot).copied().unwrap_or(false) {
                 Value::uninitialized()
             } else {
                 Value::Undefined
             };
+            self.stack[frame_base + slot] = value;
         }
+        // The region pointer is baked into the machine code and the ctx and
+        // must stay valid for the whole run; the `reserve` above pins the
+        // backing allocation for pushes up to `stack_cap`.
+        let region_ptr = unsafe { self.stack.as_mut_ptr().add(frame_base) };
         // The live global for the compiled `LoadGlobal` fast path: resolved
         // and cached on this Vm (the machine code re-reads its id/generation
         // in place, so a mid-run mutation invalidates the value cells).
@@ -13650,7 +13648,7 @@ impl Vm {
             computed_read_cells: agent.computed_read_cells.as_ptr() as *mut std::os::raw::c_void,
             member_map_cells: agent.member_map_cells.as_ptr() as *mut std::os::raw::c_void,
             globals_unshadowed,
-            buf_end: (buf.as_ptr() as usize + std::mem::size_of_val(buf))
+            buf_end: (region_ptr as usize + buf_len * std::mem::size_of::<Value>())
                 as *mut std::os::raw::c_void,
             leaf_epoch: 0,
             leaf_records: agent.leaf_records.as_mut_ptr(),
@@ -13673,22 +13671,22 @@ impl Vm {
             resume_value: 0,
             gc_ticks: crate::jit::JIT_GC_PROBE_INTERVAL,
         };
-        let frame_ptr = buf.as_mut_ptr() as *mut std::os::raw::c_void;
-        // SAFETY: `buf` has `frame_size + stack_usage + slack` slots.
-        let stack_ptr =
-            unsafe { buf.as_mut_ptr().add(scope.frame_size) } as *mut std::os::raw::c_void;
-        // Root the buffer for the call's duration via the Vm's jit-root list
-        // (this Vm is already registered with the active-run tracer, so no
-        // thread-local registration is needed): a helper it invokes can
-        // allocate and trigger a collection, and a heap value only the
-        // buffer references must survive until the JIT stores or returns it.
-        self.jit_roots.push((buf.as_ptr() as usize, buf.len()));
+        let frame_ptr = region_ptr as *mut std::os::raw::c_void;
+        // SAFETY: the region has `frame_size + stack_usage + slack` slots, so
+        // the working base sits `frame_size` values above the frame base.
+        let stack_ptr = unsafe { region_ptr.add(scope.frame_size) } as *mut std::os::raw::c_void;
         // Cut 51: an array literal (`ArrayBegin` is leaf-eligible — a leaf
         // may build an array) grows `array_index_stack` on the CALLER's Vm;
         // the leaf's steps keep it balanced on the normal path, but a throw
         // mid-literal must not leak the entry into the caller's next
         // literal — mirror `run_leaf_body`'s length save/truncate.
         let array_index_stack_len = self.array_index_stack.len();
+        // `leaf_frame_base` addresses the frame half of the region for the
+        // run, so a helper's `frame_get`/`frame_get_mut` reads the leaf's own
+        // frame (it outranks `nested_frame`/`frame`). Restore the caller's
+        // base once the machine code returns.
+        let caller_leaf_frame_base = self.leaf_frame_base;
+        self.leaf_frame_base = Some(frame_base);
         agent.jit_depth += 1;
         let result = unsafe {
             (entry)(
@@ -13698,11 +13696,11 @@ impl Vm {
             )
         };
         agent.jit_depth -= 1;
-        self.jit_roots.pop();
-        // Unwind the argument region (the frame/working area were local),
-        // then surface a pending error or land the result —
-        // `run_inline_leaf`'s tail. The compiled body stops executing after
-        // a throwing slow path, so the pending error, when set, is the
+        self.leaf_frame_base = caller_leaf_frame_base;
+        // Unwind the argument region and the frame/working area (the region is
+        // a `vm.stack` segment now), then surface a pending error or land the
+        // result — `run_inline_leaf`'s tail. The compiled body stops executing
+        // after a throwing slow path, so the pending error, when set, is the
         // call's only error.
         self.stack.truncate(pre_call - below);
         self.array_index_stack.truncate(array_index_stack_len);
