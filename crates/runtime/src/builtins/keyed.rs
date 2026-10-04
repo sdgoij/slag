@@ -491,6 +491,25 @@ fn set_of(agent: &Agent, this: &Value) -> Result<Handle<JsObject>, JsError> {
     Ok(object)
 }
 
+/// The fast path of `Map.prototype.get`: `Some(value)` for a Map receiver
+/// (including `undefined` for a missing key), `None` when the receiver is not a
+/// Map — the caller then runs the exact builtin, which throws the TypeError.
+pub(crate) fn map_get_fast(agent: &Agent, this: &Value, key: &Value) -> Option<Value> {
+    let object = map_of(agent, this).ok()?;
+    let key = canonicalize_key(*key);
+    let data = agent.map_data.get(&object.id()).unwrap().borrow();
+    Some(data.get_value(&key))
+}
+
+/// The fast path of `Set.prototype.has`: `Some(has)` for a Set receiver, `None`
+/// when the receiver is not a Set (the caller runs the exact builtin).
+pub(crate) fn set_has_fast(agent: &Agent, this: &Value, value: &Value) -> Option<bool> {
+    let object = set_of(agent, this).ok()?;
+    let value = canonicalize_key(*value);
+    let data = agent.set_data.get(&object.id()).unwrap().borrow();
+    Some(data.contains(&value))
+}
+
 /// The number of live elements of a Set's [[SetData]].
 fn set_data_count(agent: &Agent, id: u64) -> usize {
     agent

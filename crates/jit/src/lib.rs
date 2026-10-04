@@ -459,6 +459,8 @@ fn runtime_helpers() -> JitHelpers {
         typeof_top: Some(rt.typeof_top),
         char_code_at: Some(rt.char_code_at),
         array_index_of: Some(rt.array_index_of),
+        map_get: Some(rt.map_get),
+        set_has: Some(rt.set_has),
         typed_array_length: Some(rt.typed_array_length),
         get_super_base: Some(rt.get_super_base),
         this_value: Some(rt.this_value),
@@ -702,6 +704,8 @@ mod tests {
             typeof_top: Some(helpers::test_typeof_top),
             char_code_at: Some(helpers::test_char_code_at),
             array_index_of: Some(helpers::test_array_index_of),
+            map_get: Some(helpers::test_map_get),
+            set_has: Some(helpers::test_set_has),
             typed_array_length: Some(helpers::test_typed_array_length),
             get_super_base: Some(helpers::test_get_super_base),
             this_value: Some(helpers::test_this_value),
@@ -2637,6 +2641,54 @@ mod tests {
         assert_eq!(
             value, interp,
             "the indexOf intrinsic splice must match the interpreter"
+        );
+        assert!(compiled >= 1, "{compiled} bodies");
+    }
+
+    #[test]
+    fn installed_jit_map_set_intrinsics_match_the_interpreter() {
+        // The Stage-B `Map.prototype.get` / `Set.prototype.has` splices: a
+        // `.get(...)`/`.has(...)` call whose resolved callee is the realm's
+        // intrinsic probes the collection in a helper. A non-collection receiver
+        // makes the helper decline (the general call throws the exact TypeError),
+        // so a `call`/own-method receiver must agree with the interpreter too.
+        let source = "var out = [];\n\
+                      function t(v) { out.push(String(v)); }\n\
+                      function tc(f) { try { f(); out.push('no-throw'); } catch (e) { out.push(e instanceof TypeError ? 'TypeError' : 'other'); } }\n\
+                      var m = new Map(); m.set(1, 'a'); m.set('k', 2); m.set(NaN, 3); m.set(0, 'z');\n\
+                      t(m.get(1)); t(m.get('k')); t(m.get(NaN)); t(m.get(9)); t(m.get(-0));\n\
+                      var set = new Set(); set.add(1); set.add('k'); set.add(NaN); set.add(0);\n\
+                      t(set.has(1)); t(set.has('k')); t(set.has(NaN)); t(set.has(9)); t(set.has(-0));\n\
+                      tc(function () { Map.prototype.get.call({}, 1); });\n\
+                      tc(function () { Set.prototype.has.call({}, 1); });\n\
+                      tc(function () { ({get: Map.prototype.get}).get(1); });\n\
+                      var savedG = Map.prototype.get; Map.prototype.get = function () { return 42; };\n\
+                      t(m.get(1));\n\
+                      Map.prototype.get = savedG; t(m.get(1));\n\
+                      function loopMap(n) {\n\
+                        var mm = new Map(); for (var i = 0; i < 1024; i++) mm.set(i, i);\n\
+                        var s = 0;\n\
+                        for (var i = 0; i < n; i++) { var k = i & 1023; s = (s + mm.get(k)) | 0; }\n\
+                        return s;\n\
+                      }\n\
+                      t(loopMap(1000));\n\
+                      function loopSet(n) {\n\
+                        var ss = new Set(); for (var i = 0; i < 1024; i++) ss.add(i);\n\
+                        var c = 0;\n\
+                        for (var i = 0; i < n; i++) { var k = i & 1023; c = (c + (ss.has(k) ? 1 : 0)) | 0; }\n\
+                        return c;\n\
+                      }\n\
+                      t(loopSet(1000));\n\
+                      out.join(',');";
+        let interp = {
+            let mut agent = runtime::Agent::new();
+            agent.initialize_host_defined_realm().expect("realm");
+            agent.run_script(source).expect("interp runs")
+        };
+        let (value, compiled) = with_jit_agent(|agent| agent.run_script(source).expect("jit runs"));
+        assert_eq!(
+            value, interp,
+            "the Map.get/Set.has intrinsic splices must match the interpreter"
         );
         assert!(compiled >= 1, "{compiled} bodies");
     }

@@ -61,11 +61,13 @@ pub enum Intrinsic {
     MathSqrt,
     StringCharCodeAt,
     ArrayIndexOf,
+    MapGet,
+    SetHas,
 }
 
 /// The number of recognized intrinsics (a `Intrinsic` discriminant is an index
 /// into the per-run intrinsic-bit snapshot).
-pub const INTRINSIC_COUNT: usize = 7;
+pub const INTRINSIC_COUNT: usize = 9;
 
 /// Every recognized intrinsic, in discriminant order: the order that pairs an
 /// `intrinsic_bits` slot with its `Intrinsic`.
@@ -77,6 +79,8 @@ pub const INTRINSICS: [Intrinsic; INTRINSIC_COUNT] = [
     Intrinsic::MathSqrt,
     Intrinsic::StringCharCodeAt,
     Intrinsic::ArrayIndexOf,
+    Intrinsic::MapGet,
+    Intrinsic::SetHas,
 ];
 
 impl Intrinsic {
@@ -90,6 +94,8 @@ impl Intrinsic {
             Intrinsic::MathSqrt => "sqrt",
             Intrinsic::StringCharCodeAt => "charCodeAt",
             Intrinsic::ArrayIndexOf => "indexOf",
+            Intrinsic::MapGet => "get",
+            Intrinsic::SetHas => "has",
         }
     }
 
@@ -103,6 +109,8 @@ impl Intrinsic {
             Intrinsic::MathSqrt => "%Math.sqrt%",
             Intrinsic::StringCharCodeAt => "%String.prototype.charCodeAt%",
             Intrinsic::ArrayIndexOf => "%Array.prototype.indexOf%",
+            Intrinsic::MapGet => "%Map.prototype.get%",
+            Intrinsic::SetHas => "%Set.prototype.has%",
         }
     }
 }
@@ -12321,7 +12329,7 @@ impl Vm {
         if Some(callee) != intrinsic {
             return Ok(false);
         }
-        let result = match kind {
+        let result: Value = match kind {
             Intrinsic::MathAbs
             | Intrinsic::MathCeil
             | Intrinsic::MathFloor
@@ -12333,13 +12341,14 @@ impl Vm {
                     // call.
                     return Ok(false);
                 };
-                match kind {
+                let number = match kind {
                     Intrinsic::MathAbs => value.abs(),
                     Intrinsic::MathCeil => value.ceil(),
                     Intrinsic::MathFloor => value.floor(),
                     Intrinsic::MathTrunc => value.trunc(),
                     _ => value.sqrt(),
-                }
+                };
+                Value::Number(number)
             }
             Intrinsic::StringCharCodeAt => {
                 // `this` must be a String primitive: a wrapper object or any
@@ -12354,11 +12363,12 @@ impl Vm {
                 };
                 let position = crux::convert::to_integer_or_infinity(value);
                 let size = string.len() as f64;
-                if position < 0.0 || position >= size {
+                let number = if position < 0.0 || position >= size {
                     f64::NAN
                 } else {
                     string.code_unit(position as usize).unwrap_or(0) as f64
-                }
+                };
+                Value::Number(number)
             }
             Intrinsic::ArrayIndexOf => {
                 // The `fromIndex` must be a Number or absent — anything else is
@@ -12374,13 +12384,25 @@ impl Vm {
                     _ => return Ok(false),
                 };
                 match crate::builtins::array::index_of_dense(&this, &self.stack[arg_start], n) {
-                    Some(index) => index,
+                    Some(index) => Value::Number(index),
+                    None => return Ok(false),
+                }
+            }
+            Intrinsic::MapGet => {
+                match crate::builtins::keyed::map_get_fast(agent, &this, &self.stack[arg_start]) {
+                    Some(value) => value,
+                    None => return Ok(false),
+                }
+            }
+            Intrinsic::SetHas => {
+                match crate::builtins::keyed::set_has_fast(agent, &this, &self.stack[arg_start]) {
+                    Some(has) => Value::Boolean(has),
                     None => return Ok(false),
                 }
             }
         };
         self.stack.truncate(arg_start - 2);
-        self.stack.push(Value::Number(result));
+        self.stack.push(result);
         Ok(true)
     }
 

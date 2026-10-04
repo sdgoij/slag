@@ -1155,6 +1155,15 @@ pub struct JitSlowPaths {
     /// as a Number, or `undefined` to fall back (a hole, a sparse or non-Array
     /// receiver, or a non-Number `from`). Never errors.
     pub array_index_of: extern "C" fn(ctx: *mut c_void, this: u64, search: u64, from: u64) -> u64,
+    /// `Step::CallIntrinsic` for `%Map.prototype.get%`: the receiver and the key;
+    /// returns the value (or `undefined` for a missing key), or the hole
+    /// sentinel when the receiver is not a Map (the compiled site takes the
+    /// general call, which throws). Never errors.
+    pub map_get: extern "C" fn(ctx: *mut c_void, this: u64, key: u64) -> u64,
+    /// `Step::CallIntrinsic` for `%Set.prototype.has%`: the receiver and the
+    /// value; returns a Boolean, or the hole sentinel when the receiver is not a
+    /// Set. Never errors.
+    pub set_has: extern "C" fn(ctx: *mut c_void, this: u64, value: u64) -> u64,
     /// A compiled `GetMemberName` with the `length` atom: the slots length of
     /// an IntegerIndexed receiver, or the canonical-NaN sentinel otherwise
     /// (the machine code falls back to the member-cell probe /
@@ -1330,6 +1339,8 @@ pub static JIT_SLOW_PATHS: JitSlowPaths = JitSlowPaths {
     typeof_top,
     char_code_at,
     array_index_of,
+    map_get,
+    set_has,
     typed_array_length,
     get_super_base,
     this_value,
@@ -5373,6 +5384,39 @@ extern "C" fn array_index_of(ctx: *mut c_void, this: u64, search: u64, from: u64
     ) {
         Some(index) => Value::Number(index).bits(),
         None => Value::Undefined.bits(),
+    }
+}
+
+/// `Step::CallIntrinsic` for `%Map.prototype.get%`: the receiver and the key;
+/// returns the value (or `undefined` for a missing key), or the hole sentinel
+/// (`Value::hole`, never a valid map value) when the receiver is not a Map — the
+/// compiled site then takes the general call, which throws the exact TypeError.
+extern "C" fn map_get(ctx: *mut c_void, this: u64, key: u64) -> u64 {
+    let ctx = unsafe { ctx_of(ctx) };
+    let agent = unsafe { &mut *ctx.agent };
+    match crate::builtins::keyed::map_get_fast(
+        agent,
+        &Value::from_bits(this),
+        &Value::from_bits(key),
+    ) {
+        Some(value) => value.bits(),
+        None => Value::hole().bits(),
+    }
+}
+
+/// `Step::CallIntrinsic` for `%Set.prototype.has%`: the receiver and the value;
+/// returns a Boolean, or the hole sentinel when the receiver is not a Set (the
+/// compiled site takes the general call, which throws).
+extern "C" fn set_has(ctx: *mut c_void, this: u64, value: u64) -> u64 {
+    let ctx = unsafe { ctx_of(ctx) };
+    let agent = unsafe { &mut *ctx.agent };
+    match crate::builtins::keyed::set_has_fast(
+        agent,
+        &Value::from_bits(this),
+        &Value::from_bits(value),
+    ) {
+        Some(has) => Value::Boolean(has).bits(),
+        None => Value::hole().bits(),
     }
 }
 

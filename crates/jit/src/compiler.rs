@@ -5272,6 +5272,28 @@ impl<'a> Lowerer<'a> {
         self.builder.ins().select(collides, canon, bits)
     }
 
+    /// The compiled `CallIntrinsic` fast-path tail for a helper that reports a
+    /// fall-back with a sentinel bit pattern: when `result == sentinel`, route
+    /// to `slow` (the general call); otherwise store the result and jump to
+    /// `merge`.
+    fn emit_intrinsic_hit(
+        &mut self,
+        result: ClifValue,
+        sentinel: i64,
+        slow: Block,
+        merge: Block,
+        this_ptr: ClifValue,
+    ) {
+        let sentinel = self.builder.ins().iconst(types::I64, sentinel);
+        let fallback = self.builder.ins().icmp(IntCC::Equal, result, sentinel);
+        let hit = self.builder.create_block();
+        self.builder.ins().brif(fallback, slow, &[], hit, &[]);
+        self.builder.switch_to_block(hit);
+        self.builder.def_var(self.sp_var, this_ptr);
+        self.push(result);
+        self.builder.ins().jump(merge, &[]);
+    }
+
     /// The loop counter as a `Value` (`Value::Number(f64)` with the NaN
     /// canonicalization).
     fn counter_bits(&mut self) -> ClifValue {
@@ -6344,9 +6366,9 @@ impl<'a> Lowerer<'a> {
                 let arg_ok = self.is_double(arg1);
                 let callee_gate = self.builder.ins().band(non_zero, callee_ok);
                 let gate = match kind {
-                    // `indexOf` validates its receiver and `from` in the helper,
-                    // so only the callee identity is guarded here.
-                    Intrinsic::ArrayIndexOf => callee_gate,
+                    // `indexOf`/`get`/`has` validate their receiver (and `from`)
+                    // in the helper, so only the callee identity is guarded here.
+                    Intrinsic::ArrayIndexOf | Intrinsic::MapGet | Intrinsic::SetHas => callee_gate,
                     // A `this`-reading string method also needs a String
                     // primitive receiver and a Number position.
                     Intrinsic::StringCharCodeAt => {
@@ -6388,17 +6410,30 @@ impl<'a> Lowerer<'a> {
                         )?;
                         // `undefined` (never a valid index) is the fall-back
                         // sentinel: route it to the general call.
-                        let sentinel = self
-                            .builder
-                            .ins()
-                            .iconst(types::I64, Value::Undefined.bits() as i64);
-                        let fallback = self.builder.ins().icmp(IntCC::Equal, result, sentinel);
-                        let hit = self.builder.create_block();
-                        self.builder.ins().brif(fallback, slow, &[], hit, &[]);
-                        self.builder.switch_to_block(hit);
-                        self.builder.def_var(self.sp_var, this_ptr);
-                        self.push(result);
-                        self.builder.ins().jump(merge, &[]);
+                        self.emit_intrinsic_hit(
+                            result,
+                            Value::Undefined.bits() as i64,
+                            slow,
+                            merge,
+                            this_ptr,
+                        );
+                    }
+                    Intrinsic::MapGet | Intrinsic::SetHas => {
+                        let helper = match kind {
+                            Intrinsic::SetHas => Helper::SetHas,
+                            _ => Helper::MapGet,
+                        };
+                        let result =
+                            self.emit_raw_call(self.sig_get_name, helper, &[this, arg1])?;
+                        // The hole (never a valid map value or Boolean) is the
+                        // fall-back sentinel for a non-collection receiver.
+                        self.emit_intrinsic_hit(
+                            result,
+                            Value::hole().bits() as i64,
+                            slow,
+                            merge,
+                            this_ptr,
+                        );
                     }
                     Intrinsic::StringCharCodeAt => {
                         let value = self.emit_raw_call(

@@ -177,6 +177,8 @@ pub enum Helper {
     TypeofTop,
     CharCodeAt,
     ArrayIndexOf,
+    MapGet,
+    SetHas,
     TypedArrayLength,
     GetSuperBase,
     ThisValue,
@@ -322,6 +324,8 @@ impl Helper {
             Helper::TypeofTop => "typeof_top",
             Helper::CharCodeAt => "char_code_at",
             Helper::ArrayIndexOf => "array_index_of",
+            Helper::MapGet => "map_get",
+            Helper::SetHas => "set_has",
             Helper::TypedArrayLength => "typed_array_length",
             Helper::GetSuperBase => "get_super_base",
             Helper::ThisValue => "this_value",
@@ -376,6 +380,8 @@ impl Helper {
                 | Helper::TypeofTop
                 | Helper::CharCodeAt
                 | Helper::ArrayIndexOf
+                | Helper::MapGet
+                | Helper::SetHas
                 | Helper::TypedArrayLength
         )
     }
@@ -818,6 +824,12 @@ pub struct JitHelpers {
     /// from)`; returns the index or the `undefined` fall-back sentinel.
     pub array_index_of:
         Option<extern "C" fn(vm: *mut c_void, this: u64, search: u64, from: u64) -> u64>,
+    /// `Step::CallIntrinsic` for `%Map.prototype.get%`: `(this, key)`; returns
+    /// the value or the `hole` fall-back sentinel. Never errors.
+    pub map_get: Option<extern "C" fn(vm: *mut c_void, this: u64, key: u64) -> u64>,
+    /// `Step::CallIntrinsic` for `%Set.prototype.has%`: `(this, value)`; returns
+    /// a Boolean or the `hole` fall-back sentinel. Never errors.
+    pub set_has: Option<extern "C" fn(vm: *mut c_void, this: u64, value: u64) -> u64>,
     /// A compiled `GetMemberName` with the `length` atom on an IntegerIndexed
     /// receiver: the slots length, or a NaN sentinel when the receiver is not
     /// a typed array (the machine code falls back to the member-cell probe /
@@ -981,6 +993,8 @@ impl JitHelpers {
             typeof_top: None,
             char_code_at: None,
             array_index_of: None,
+            map_get: None,
+            set_has: None,
             typed_array_length: None,
             get_super_base: None,
             this_value: None,
@@ -1135,6 +1149,8 @@ impl JitHelpers {
             Helper::TypeofTop => self.typeof_top.map(|f| f as usize as u64),
             Helper::CharCodeAt => self.char_code_at.map(|f| f as usize as u64),
             Helper::ArrayIndexOf => self.array_index_of.map(|f| f as usize as u64),
+            Helper::MapGet => self.map_get.map(|f| f as usize as u64),
+            Helper::SetHas => self.set_has.map(|f| f as usize as u64),
             Helper::TypedArrayLength => self.typed_array_length.map(|f| f as usize as u64),
             Helper::GetSuperBase => self.get_super_base.map(|f| f as usize as u64),
             Helper::ThisValue => self.this_value.map(|f| f as usize as u64),
@@ -1856,6 +1872,14 @@ pub extern "C" fn test_array_index_of(
     _from: u64,
 ) -> u64 {
     Value::Number(-1.0).bits()
+}
+
+pub extern "C" fn test_map_get(_vm: *mut c_void, _this: u64, _key: u64) -> u64 {
+    Value::Undefined.bits()
+}
+
+pub extern "C" fn test_set_has(_vm: *mut c_void, _this: u64, _value: u64) -> u64 {
+    Value::Boolean(false).bits()
 }
 
 /// The typed-array length probe double: the canonical-NaN sentinel (the
