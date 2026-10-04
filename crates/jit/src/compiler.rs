@@ -224,6 +224,9 @@ fn max_stack_usage(body: &CompiledBody) -> usize {
             Step::CallFast { argc, .. } => {
                 depth = depth.saturating_sub(*argc as usize + 2).saturating_add(1);
             }
+            Step::CallMathAbs { argc, .. } => {
+                depth = depth.saturating_sub(*argc as usize + 2).saturating_add(1);
+            }
             // The compiled apply/call step pops the same region and pushes
             // the result. M10: the intrinsic fast path additionally copies a
             // dense `argArray`'s elements (up to `JIT_APPLY_MAX_ARGS` slots)
@@ -556,6 +559,7 @@ fn rel_cc(op: BinaryOp) -> Result<FloatCC, Unsupported> {
 fn step_name(step: &Step) -> &'static str {
     match step {
         Step::Call { .. } | Step::CallFast { .. } => "Call",
+        Step::CallMathAbs { .. } => "CallMathAbs",
         Step::CallApply { .. } => "CallApply",
         Step::Construct { .. } => "Construct",
         Step::TaggedTemplate(_) | Step::TailTaggedTemplate(_) => "TaggedTemplate",
@@ -6290,6 +6294,83 @@ impl<'a> Lowerer<'a> {
                     *direct_eval,
                     true,
                 )?;
+            }
+            Step::CallMathAbs { argc, span: _ } => {
+                // Stage B, the first intrinsic: `[..., this, callee, a1..aN]`
+                // with the callee the member read's result. When it is the
+                // realm's `%Math.abs%` (`math_abs_bits`, 0 when the body has
+                // none) and the first argument is a Number, the machine code
+                // computes `fabs` in place; otherwise it falls to `emit_call`.
+                // The identity check is the retirement: a reassigned
+                // `Math.abs` no longer matches.
+                let sp = self.builder.use_var(self.sp_var);
+                let args_ptr = self.builder.ins().iadd_imm_s(sp, -((*argc as i64) * 8));
+                let callee_ptr = self.builder.ins().iadd_imm_s(sp, -((*argc as i64 + 1) * 8));
+                let this_ptr = self.builder.ins().iadd_imm_s(sp, -((*argc as i64 + 2) * 8));
+                let callee = self.builder.ins().load(
+                    types::I64,
+                    MemFlagsData::new(),
+                    callee_ptr,
+                    Offset32::new(0),
+                );
+                let this = self.builder.ins().load(
+                    types::I64,
+                    MemFlagsData::new(),
+                    this_ptr,
+                    Offset32::new(0),
+                );
+                let argc_imm = self.builder.ins().iconst(types::I64, i64::from(*argc));
+                let ctx = self.vm();
+                let expected = self.builder.ins().load(
+                    types::I64,
+                    MemFlagsData::new(),
+                    ctx,
+                    Offset32::new(std::mem::offset_of!(JitCallContext, math_abs_bits) as i32),
+                );
+                let non_zero = self.builder.ins().icmp_imm_u(IntCC::NotEqual, expected, 0);
+                let callee_ok = self.builder.ins().icmp(IntCC::Equal, callee, expected);
+                let arg1 = self.builder.ins().load(
+                    types::I64,
+                    MemFlagsData::new(),
+                    args_ptr,
+                    Offset32::new(0),
+                );
+                let arg_ok = self.is_double(arg1);
+                let gate = self.builder.ins().band(non_zero, callee_ok);
+                let gate = self.builder.ins().band(gate, arg_ok);
+                let fast = self.builder.create_block();
+                let slow = self.builder.create_block();
+                let merge = self.builder.create_block();
+                self.builder.ins().brif(gate, fast, &[], slow, &[]);
+                // The fast path: `abs` of a Number argument is `fabs`; the
+                // result replaces the whole call region (`this` included —
+                // `Math.abs` never reads it).
+                self.builder.switch_to_block(fast);
+                let num = self
+                    .builder
+                    .ins()
+                    .bitcast(types::F64, MemFlagsData::new(), arg1);
+                let abs = self.builder.ins().fabs(num);
+                let abs_bits = self
+                    .builder
+                    .ins()
+                    .bitcast(types::I64, MemFlagsData::new(), abs);
+                let value = self.canon(abs_bits);
+                self.builder.def_var(self.sp_var, this_ptr);
+                self.push(value);
+                self.builder.ins().jump(merge, &[]);
+                // The fallback: the general call machinery (a shadowed `abs`,
+                // a non-`Math` receiver, or a non-Number argument).
+                self.builder.switch_to_block(slow);
+                self.emit_call(
+                    index, callee, this, args_ptr, argc_imm, this_ptr, false, false,
+                )?;
+                self.builder.ins().jump(merge, &[]);
+                self.builder.seal_block(fast);
+                self.builder.seal_block(slow);
+                self.builder.seal_block(merge);
+                self.builder.switch_to_block(merge);
+                self.fall_through(index);
             }
             Step::CallApply {
                 argc,

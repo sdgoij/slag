@@ -356,6 +356,19 @@ pub enum Step {
         direct_eval: bool,
         span: crux::Span,
     },
+    /// A member call whose property name is `abs` (`x.abs(...)`) — the shape a
+    /// `Math.abs(x)` call takes. The handler checks the resolved callee against
+    /// the realm's `%Math.abs%` intrinsic; on a match with a Number first
+    /// argument it computes the f64 absolute value in place (skipping the
+    /// builtin dispatch and the per-call machinery) and otherwise falls back to
+    /// the general call. The identity check is the retirement: a reassigned
+    /// `Math.abs` no longer matches and takes the fallback. Stack: the same
+    /// `[..., this, callee, arg1..argN]` as `CallFast`, and `this` is ignored
+    /// (`Math.abs` does not read it).
+    CallMathAbs {
+        argc: u8,
+        span: crux::Span,
+    },
     /// Call-site recognition of `Function.prototype.apply`/`call` (perf.md
     /// "remaining apply floor"): a member call `f.apply(x, arr)` /
     /// `f.call(x, ...)` compiles to the normal member read — a shadowed
@@ -1799,6 +1812,9 @@ pub struct CompiledBody {
     /// only for such bodies (the snapshot costs a realm + intrinsics read
     /// per run, which every other compiled run would otherwise pay).
     pub has_call_apply: bool,
+    /// Whether the body contains a `Step::CallMathAbs` site. The JIT's per-run
+    /// context snapshots the realm's `%Math.abs%` bits only for such bodies.
+    pub has_call_math_abs: bool,
 }
 
 impl CompiledBody {
@@ -7642,6 +7658,15 @@ impl Vm {
                         return Ok(outcome);
                     }
                 }
+                Step::CallMathAbs { argc, span } => {
+                    self.set_site(agent, *span);
+                    if !self.do_call_math_abs(agent, *argc as usize)? {
+                        self.do_call_fast(agent, *argc as usize, false)?;
+                    }
+                    if let Some(outcome) = self.take_pending_call() {
+                        return Ok(outcome);
+                    }
+                }
                 Step::CallApply { argc, kind, span } => {
                     self.set_site(agent, *span);
                     self.do_call_apply(agent, *argc as usize, *kind)?;
@@ -12210,6 +12235,37 @@ impl Vm {
         )
     }
 
+    /// The `Step::CallMathAbs` intrinsic fast path: when the resolved callee is
+    /// the realm's `%Math.abs%` and the first argument is a Number, compute the
+    /// f64 absolute value in place — the identity check is the retirement (a
+    /// reassigned `Math.abs` no longer matches and takes the fallback). Returns
+    /// `false` to fall back to `do_call_fast`. Stack:
+    /// `[..., this, callee, arg1..argN]`.
+    pub(crate) fn do_call_math_abs(
+        &mut self,
+        agent: &mut Agent,
+        argc: usize,
+    ) -> Result<bool, JsError> {
+        if argc == 0 {
+            return Ok(false);
+        }
+        let n = self.stack.len();
+        let arg_start = n - argc;
+        let callee = self.stack[arg_start - 1];
+        let intrinsic = agent.current_realm()?.intrinsics.math_abs();
+        if Some(callee) != intrinsic {
+            return Ok(false);
+        }
+        let Some(value) = self.stack[arg_start].as_number() else {
+            // A non-Number first argument is `ToNumber`'d by the builtin (with
+            // possible valueOf/toString side effects) — leave it to the call.
+            return Ok(false);
+        };
+        self.stack.truncate(arg_start - 2);
+        self.stack.push(Value::Number(value.abs()));
+        Ok(true)
+    }
+
     /// The `Step::CallApply` handler: the member read already resolved the
     /// `apply`/`call` function (a shadowed one is called with the original
     /// argument list — the fallback is exactly `CallFast`); when it IS the
@@ -13312,6 +13368,11 @@ impl Vm {
         } else {
             (0, 0)
         };
+        let math_abs_bits = if ir.has_call_math_abs {
+            crate::jit::math_abs_intrinsic_bits(agent)
+        } else {
+            0
+        };
         let mut ctx = crate::jit::JitCallContext {
             pending: false,
             error: None,
@@ -13337,6 +13398,7 @@ impl Vm {
             self_inline_ok: false,
             apply_builtin_bits,
             call_builtin_bits,
+            math_abs_bits,
             dispatch_value: 0,
             suspension: None,
             suspend_sp: 0,
@@ -21449,6 +21511,9 @@ impl Compiler {
             if self.try_compile_apply_call(member, call, tail)? {
                 return Ok(());
             }
+            if self.try_compile_math_abs(member, call, tail)? {
+                return Ok(());
+            }
             self.compile_expr(&member.object)?;
             self.emit(Step::Dup);
             if member.optional {
@@ -21795,6 +21860,56 @@ impl Compiler {
         self.emit(Step::CallApply {
             argc: call.args.len() as u8,
             kind,
+            span: site,
+        });
+        Ok(true)
+    }
+
+    /// Call-site recognition of `Math.abs` (the first Stage-B intrinsic): a
+    /// member call `x.abs(a)` compiles to the normal member read — a shadowed
+    /// `abs`, a non-`Math` receiver or a patched accessor resolves onto the
+    /// stack and is called normally — plus `Step::CallMathAbs`, whose handler
+    /// computes the f64 absolute value when the resolved function is the
+    /// realm's `%Math.abs%` and the first argument is a Number, falling back to
+    /// the general call otherwise. Matching any `.abs` is the `apply`/`call`
+    /// discipline: the runtime identity check is the soundness gate, so a
+    /// shadowed `abs` simply takes the fallback.
+    fn try_compile_math_abs(
+        &mut self,
+        member: &syntax::ast::MemberExpr,
+        call: &syntax::ast::CallExpr,
+        tail: bool,
+    ) -> Result<bool, JsError> {
+        let site = call_site(call);
+        match &member.property {
+            MemberProperty::Name(name) if crux::lookup(*name) == JsString::from_utf8("abs") => {}
+            _ => return Ok(false),
+        }
+        if tail
+            || member.optional
+            || call.optional
+            || self.chain_depth != 0
+            || call.args.is_empty()
+            || call.args.len() > FAST_CALL_MAX_ARGS
+            || !call.args.iter().all(|a| matches!(a, Argument::Expr(_)))
+            || expr_may_short_circuit(&member.object)
+        {
+            return Ok(false);
+        }
+        // `[..., x]` then `Dup` + the member read: `[..., x, abs]` exactly as
+        // the general member call, so the resolved function (and a shadowing
+        // own/prototype `abs`) is whatever the spec's GetValue produces — the
+        // step compares it against the intrinsic.
+        self.compile_expr(&member.object)?;
+        self.emit(Step::Dup);
+        self.compile_member_property_guarded(member)?;
+        for argument in &call.args {
+            if let Argument::Expr(expr) = argument {
+                self.compile_expr(expr)?;
+            }
+        }
+        self.emit(Step::CallMathAbs {
+            argc: call.args.len() as u8,
             span: site,
         });
         Ok(true)
@@ -22851,6 +22966,14 @@ pub(crate) fn body_has_call_apply(steps: &[Step]) -> bool {
         .any(|step| matches!(step, Step::CallApply { .. }))
 }
 
+/// Whether the body contains a `Step::CallMathAbs` site: the JIT's per-run
+/// context snapshots the realm's `%Math.abs%` bits only for such bodies.
+pub(crate) fn body_has_call_math_abs(steps: &[Step]) -> bool {
+    steps
+        .iter()
+        .any(|step| matches!(step, Step::CallMathAbs { .. }))
+}
+
 /// The distinct names a body reads through the env chain (`Step::LoadIdent`),
 /// in first-use order: what [`Vm::global_reads_are_unshadowed`] has to check
 /// before the global-value cell may serve those reads.
@@ -22883,6 +23006,7 @@ fn steps_are_leaf(steps: &[Step]) -> bool {
             // own Vm. A leaf must contain none, so it cannot recurse.
             Step::Call { .. }
                 | Step::CallFast { .. }
+                | Step::CallMathAbs { .. }
                 | Step::CallFastGlobal { .. }
                 | Step::CallFastSlot { .. }
                 | Step::CallFastSlotStore { .. }
@@ -24292,6 +24416,7 @@ pub fn compile_body(
     };
     let has_loop = body_has_loop(&compiler.steps);
     let has_call_apply = body_has_call_apply(&compiler.steps);
+    let has_call_math_abs = body_has_call_math_abs(&compiler.steps);
     let ident_names = collect_ident_names(&compiler.steps);
     Ok((
         CompiledBody {
@@ -24311,6 +24436,7 @@ pub fn compile_body(
             ident_names,
             has_loop,
             has_call_apply,
+            has_call_math_abs,
         },
         compiler.this_writes,
     ))
@@ -24372,6 +24498,7 @@ pub fn compile_statements(
     compiler.resolve();
     let has_loop = body_has_loop(&compiler.steps);
     let has_call_apply = body_has_call_apply(&compiler.steps);
+    let has_call_math_abs = body_has_call_math_abs(&compiler.steps);
     let ident_names = collect_ident_names(&compiler.steps);
     Ok(CompiledBody {
         steps: compiler.steps,
@@ -24392,6 +24519,7 @@ pub fn compile_statements(
         ident_names,
         has_loop,
         has_call_apply,
+        has_call_math_abs,
     })
 }
 

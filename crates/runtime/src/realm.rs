@@ -186,6 +186,10 @@ pub struct Intrinsics {
     /// populated at bootstrap and never reassigned).
     apply_builtin: RefCell<Option<Value>>,
     call_builtin: RefCell<Option<Value>>,
+    /// The realm's `%Math.abs%` builtin, cached after the first resolution:
+    /// the compiled `CallMathAbs` step compares the member-read result against
+    /// it per call, and the value is stable for the realm's life.
+    math_abs: RefCell<Option<Value>>,
     /// The realm's %String.prototype% value, cached after the first
     /// resolution: primitive-string member reads resolve their chain
     /// directly against it instead of boxing a per-read String-exotic
@@ -381,6 +385,18 @@ impl Intrinsics {
         let value = self.get("%Function.prototype.call%")?;
         self.cache_barrier(value);
         *self.call_builtin.borrow_mut() = Some(value);
+        Some(value)
+    }
+
+    /// The realm's %Math.abs% builtin, cached after the first resolution (see
+    /// the struct field).
+    pub fn math_abs(&self) -> Option<Value> {
+        if let Some(value) = self.math_abs.borrow().as_ref() {
+            return Some(*value);
+        }
+        let value = self.get("%Math.abs%")?;
+        self.cache_barrier(value);
+        *self.math_abs.borrow_mut() = Some(value);
         Some(value)
     }
 

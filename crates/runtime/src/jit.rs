@@ -411,6 +411,11 @@ pub struct JitCallContext {
     /// realms, so a per-run snapshot is sound.
     pub apply_builtin_bits: u64,
     pub call_builtin_bits: u64,
+    /// The realm's `%Math.abs%` bits (0 when the body has no `CallMathAbs`
+    /// site): the compiled `CallMathAbs` site compares the resolved callee
+    /// against it, and the identity check is the retirement — a reassigned
+    /// `Math.abs` no longer matches.
+    pub math_abs_bits: u64,
     /// Cut 55: a control-transfer dispatch that completed the body (a
     /// `return` reaching the end of the finally chain) carries the body's
     /// result value here — the dispatch helpers signal `DISPATCH_DONE` and
@@ -2092,6 +2097,11 @@ fn certified_call_inline(
     } else {
         (0, 0)
     };
+    let math_abs_bits = if body.has_call_math_abs {
+        math_abs_intrinsic_bits(agent)
+    } else {
+        0
+    };
     // The nested run reads the callee's environment, function and strictness
     // from the shared `Vm`, and a *different* body may use the shared scratch
     // registers (the `switch` discriminant, the statement-completion register,
@@ -2168,6 +2178,7 @@ fn certified_call_inline(
         self_inline_ok: true,
         apply_builtin_bits,
         call_builtin_bits,
+        math_abs_bits,
         dispatch_value: 0,
         suspension: None,
         suspend_sp: 0,
@@ -6106,6 +6117,20 @@ pub(crate) fn call_apply_intrinsic_bits(agent: &Agent) -> (u64, u64) {
     )
 }
 
+/// The realm's `%Math.abs%` bits for a compiled `CallMathAbs` site (0 when no
+/// realm or intrinsic is current — the identity check then never matches and
+/// the site falls back to the general call).
+pub(crate) fn math_abs_intrinsic_bits(agent: &Agent) -> u64 {
+    let Ok(realm) = agent.current_realm() else {
+        return 0;
+    };
+    realm
+        .intrinsics
+        .math_abs()
+        .map(|value| value.bits())
+        .unwrap_or(0)
+}
+
 pub(crate) fn run_jit_body(
     agent: &mut Agent,
     vm: &mut Vm,
@@ -6193,6 +6218,11 @@ pub(crate) fn run_jit_body(
     } else {
         (0, 0)
     };
+    let math_abs_bits = if ir.has_call_math_abs {
+        math_abs_intrinsic_bits(agent)
+    } else {
+        0
+    };
     let mut ctx = JitCallContext {
         pending: false,
         error: None,
@@ -6216,6 +6246,7 @@ pub(crate) fn run_jit_body(
         self_inline_ok: self_call_ok,
         apply_builtin_bits,
         call_builtin_bits,
+        math_abs_bits,
         dispatch_value: 0,
         suspension: None,
         suspend_sp: 0,
@@ -6452,6 +6483,11 @@ pub(crate) fn run_jit_resume(
     } else {
         (0, 0)
     };
+    let math_abs_bits = if ir.has_call_math_abs {
+        math_abs_intrinsic_bits(agent)
+    } else {
+        0
+    };
     let mut ctx = JitCallContext {
         pending: false,
         error: None,
@@ -6475,6 +6511,7 @@ pub(crate) fn run_jit_resume(
         self_inline_ok: false,
         apply_builtin_bits,
         call_builtin_bits,
+        math_abs_bits,
         dispatch_value: 0,
         suspension: None,
         suspend_sp: 0,
@@ -7007,6 +7044,7 @@ mod tests {
             ident_names: Vec::new(),
             has_loop,
             has_call_apply: false,
+            has_call_math_abs: false,
         })
     }
 
