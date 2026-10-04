@@ -3540,11 +3540,6 @@ pub struct Vm {
     /// rest copy skips them too.
     pub destructure_excluded: Vec<Vec<crux::property::PropertyKey>>,
     pub yield_star_stack: Vec<YieldStarState>,
-    /// Cut 58: the working region of a suspended compiled body — the machine
-    /// code's private buffer contents at the suspension point, saved so the
-    /// resume can restore them (the buffer itself is a per-run local).
-    /// Empty outside a suspended JIT run.
-    pub jit_work: Vec<Value>,
     /// Pending class definitions whose heritage/computed names suspend.
     pub class_stack: Vec<ClassEvalState>,
     /// The pending `switch` discriminant (spec 13.12.11 case-block
@@ -3688,7 +3683,6 @@ impl Trace for Vm {
         self.destructure_assign_keys.trace(visit);
         self.yield_star_stack.trace(visit);
         self.class_stack.trace(visit);
-        self.jit_work.trace(visit);
         self.switch_disc.trace(visit);
         self.pending_disposal.trace(visit);
         if let Some((env, _)) = &self.pending_catch_disposal {
@@ -3832,7 +3826,6 @@ impl Vm {
             destructure_assign_keys: Vec::new(),
             destructure_excluded: Vec::new(),
             yield_star_stack: Vec::new(),
-            jit_work: Vec::new(),
             class_stack: Vec::new(),
             switch_disc: Value::Undefined,
             switch_disc_set: false,
@@ -3956,7 +3949,6 @@ impl Vm {
         self.destructure_assign_keys.clear();
         self.destructure_excluded.clear();
         self.yield_star_stack.clear();
-        self.jit_work.clear();
         self.class_stack.clear();
         self.switch_disc = Value::Undefined;
         self.switch_disc_set = false;

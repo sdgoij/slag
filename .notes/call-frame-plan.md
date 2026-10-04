@@ -289,18 +289,26 @@ Sub-steps, each independently landable and gated on corpus equivalence plus
   `sp` and hands the entry that base (per the mechanism above); the compiled
   frame becomes a `vm.stack` segment, so `frame_get`'s `Frame::Inline/Heap`
   arm serves only the interpreter's own active body. Behavior-neutral.
-- **C0b — the leaf lane unifies.** `run_jit_leaf` uses the same base and drops
-  its private buffer, so the working base and `leaf_frame_base` are one
-  offset.
-- **C0c — the buffer and its root retire.** Delete `INLINE_JIT_BUF`, the
-  `inline_work`/`heap_work` pair, and the working-area `jit_roots`
-  registration: the region is `vm.stack`, traced with the Vm.
-- **C0d — suspension/resume.** `jit_work`'s save and restore read and write a
-  slice of `vm.stack`; the resume path re-derives the base.
+- **C0b — the leaf lane unifies (landed 2026-10-04).** `run_jit_leaf` runs
+  the leaf's frame/working area as a `vm.stack` segment and sets
+  `leaf_frame_base` for the run, so a helper's `frame_get` reads the leaf's own
+  frame and the working base and `leaf_frame_base` are one offset.
+- **C0c — the buffer and its root retire (landed 2026-10-04).** The self-call
+  and certified-callee lanes carve their nested frame/working region from
+  `vm.stack` too, so `INLINE_JIT_BUF`, the private per-call buffers,
+  `Vm::jit_roots`, and `ActiveRun::jit_buffer` all retire: every region is
+  `vm.stack`, traced with the Vm.
+- **C0d — suspension/resume (landed 2026-10-04).** A suspended body's live
+  working region stays on `vm.stack`, normalized to the stack bottom (the
+  DEOPT shape) on `DISPATCH_SUSPEND`; `run_jit_resume` re-derives the base as
+  the bottom and the live depth as `vm.stack.len()` and extends the region for
+  the resume value. `Vm::jit_work` and its trace plumbing retire.
 
 C0 lands nothing measurable by itself; it removes the buffer so C1 can push
 nested frames on the same region. Probe: the corpus at parity, and the
 private-buffer allocation count under a recursion workload (should be zero).
+All four sub-steps landed 2026-10-04: no private JIT frame/working buffer
+remains at any lane (body, leaf, self-call, certified-callee, or suspension).
 
 ## 5. Traps
 
