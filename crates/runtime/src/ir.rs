@@ -1247,6 +1247,10 @@ pub enum IntRhs {
     /// The fused loop counter, proven to stay in int32 range (an ascending
     /// loop to an int32-immediate limit from an int32 seed).
     Counter,
+    /// The right operand the body's leading ops already computed into the
+    /// accumulator, proven `Int` by the register provenance pass (A2). The
+    /// leading ops are kept in the register body and run before the RMW.
+    Acc,
 }
 
 /// A register instruction for a *leaf* body (Cut 35 slice 1). The step path
@@ -1489,6 +1493,13 @@ pub enum LeafOp {
         rhs: IntRhs,
         mask: i32,
     },
+    /// `acc = i64(acc) % divisor` for a nonzero constant divisor and an
+    /// accumulator the register provenance pass proved integral. The spec's
+    /// `fmod` equals the truncated integer remainder for integral operands
+    /// (taking the dividend's sign), so the JIT can use an `srem` behind a lone
+    /// `|acc| < 2^63` range guard, dropping the `%` lowering's per-operand
+    /// integrality checks; the interpreter stays exact.
+    BinRemConst { divisor: i32 },
     /// Complete with `Completion::Return(acc)`.
     ReturnAcc,
 }
@@ -11633,6 +11644,9 @@ impl Vm {
                     let right = match rhs {
                         IntRhs::Imm(i) => *i,
                         IntRhs::Counter => self.loop_counter as i32,
+                        // A2: the leading ops left the proven-`Int` right operand
+                        // in the accumulator at the RMW.
+                        IntRhs::Acc => self.acc.as_number().unwrap_or(0.0) as i32,
                     };
                     let wrapped = match op {
                         BinaryOp::Add => left.wrapping_add(right),
@@ -11642,6 +11656,13 @@ impl Vm {
                     };
                     self.loop_num = (wrapped & *mask) as f64;
                     self.acc = Value::Number(self.loop_num);
+                }
+                LeafOp::BinRemConst { divisor } => {
+                    // The plan proved the accumulator integral and the divisor a
+                    // nonzero i32, so the f64 `%` (fmod, the dividend's sign) is
+                    // exact — and Rust's `f64 %` is that `fmod`.
+                    let lhs = self.acc.as_number().unwrap_or(f64::NAN);
+                    self.acc = Value::Number(lhs % f64::from(*divisor));
                 }
                 LeafOp::ReturnAcc => {
                     return Ok(Completion::Return(self.acc));
@@ -18156,14 +18177,23 @@ impl Compiler {
     /// register. The plan proves the rhs and the seed are int32, so the
     /// wrapping op is exactly `ToInt32(slot <arith> rhs)` and the trailing
     /// truncation is a no-op — no per-iteration guard. A1 covers an int32
-    /// immediate and a bounded counter; anything the plan cannot prove stays on
-    /// the step path (A2 adds a guarded rhs).
+    /// immediate and a bounded counter; A2 covers any leading straight-line
+    /// prefix whose accumulator the provenance pass proves `Int` (e.g.
+    /// `(i & 255)`), keeping that prefix and folding only the RMW tail. A rhs
+    /// the pass cannot prove stays on the step path.
     fn plan_loop_int(&mut self, bind: usize, body_start: usize, head: usize, store: usize) {
         if head != body_start + 1 {
             return;
         }
-        let Some((_rmw_index, slot, op, rhs, mask)) = (match &self.steps[body_start] {
-            Step::RunRegBody { ops } => int_rmw_shape(ops),
+        let counter = if self.counter_is_int32(head, bind) {
+            RegInt::Int
+        } else {
+            RegInt::Unknown
+        };
+        let Some((prefix_len, slot, op, rhs, mask)) = (match &self.steps[body_start] {
+            Step::RunRegBody { ops } => {
+                int_rmw_shape(ops).or_else(|| int_rmw_prefix_shape(ops, counter))
+            }
             _ => None,
         }) else {
             return;
@@ -18171,7 +18201,7 @@ impl Compiler {
         if !self.slot_seed_is_int32(slot, bind) {
             return;
         }
-        if matches!(rhs, IntRhs::Counter) && !self.counter_is_int32(head, bind) {
+        if matches!(rhs, IntRhs::Counter) && counter < RegInt::Int {
             return;
         }
         if let Step::FastLoopBind { num, .. } = &mut self.steps[bind] {
@@ -18187,13 +18217,54 @@ impl Compiler {
         let Step::RunRegBody { ops } = &mut self.steps[body_start] else {
             return;
         };
-        *ops = vec![LeafOp::BinStoreInt {
+        // `prefix_len == 0` for A1 (the RMW collapses to one op); A2 keeps the
+        // prefix that computed the right operand.
+        let mut rebuilt: Vec<LeafOp> = ops[..prefix_len].to_vec();
+        rebuilt.push(LeafOp::BinStoreInt {
             op,
             slot,
             rhs,
             mask,
-        }]
-        .into_boxed_slice();
+        });
+        *ops = rebuilt.into_boxed_slice();
+    }
+
+    /// Fold a proven-integral `% <const>` in the loop's register body into
+    /// [`LeafOp::BinRemConst`], so the JIT can drop the `%` lowering's
+    /// per-operand integrality guards. The right operand must be a nonzero i32
+    /// constant and the accumulator must be `Integer` at that point (the
+    /// register provenance pass, with the loop's counter proof); anything else
+    /// stays a plain `BinImm`/`BinConst` and pays the guards.
+    fn plan_loop_rem(&mut self, body_start: usize, head: usize, bind: usize) {
+        let counter = if self.counter_is_int32(head, bind) {
+            RegInt::Int
+        } else {
+            RegInt::Unknown
+        };
+        let Step::RunRegBody { ops } = &mut self.steps[body_start] else {
+            return;
+        };
+        let mut pass = IntProvenance::new(counter);
+        for op in ops.iter_mut() {
+            let divisor = match op {
+                LeafOp::BinImm {
+                    op: BinaryOp::Rem,
+                    imm,
+                } => int32_of(*imm),
+                LeafOp::BinConst {
+                    op: BinaryOp::Rem,
+                    value,
+                } => value.as_number().and_then(int32_of),
+                _ => None,
+            };
+            if let Some(divisor) = divisor
+                && divisor != 0
+                && pass.acc >= RegInt::Integer
+            {
+                *op = LeafOp::BinRemConst { divisor };
+            }
+            pass.step(op);
+        }
     }
 
     /// Whether the loop's counter provably stays in int32: an ascending loop to
@@ -18668,6 +18739,7 @@ impl Compiler {
                         self.emit(Step::BuilderStore { slot: None });
                         self.plan_loop_num(bind_index, body_start_index, index, store_index);
                         self.plan_loop_int(bind_index, body_start_index, index, store_index);
+                        self.plan_loop_rem(body_start_index, index, bind_index);
                         self.plan_builder(
                             builder_bind_index,
                             body_start_index,
@@ -22195,7 +22267,9 @@ fn is_int_trunc(op: BinaryOp, imm: f64) -> Option<i32> {
 
 /// Route B (int32): the exact leaf-op shape `plan_loop_int` accepts —
 /// `slot = (slot <arith> rhs) | 0` (or `& mask`) as a 3- or 4-op register body,
-/// and nothing else touching the slot. Returns the mask to AND after the wrap.
+/// and nothing else touching the slot. Returns the mask to AND after the wrap,
+/// and a `prefix_len` of `0` (both shapes fold their right operand into the
+/// op — the RMW is collapsed to a single [`LeafOp::BinStoreInt`]).
 fn int_rmw_shape(ops: &[LeafOp]) -> Option<(usize, usize, BinaryOp, IntRhs, i32)> {
     let shape = match ops {
         [
@@ -22235,11 +22309,249 @@ fn int_rmw_shape(ops: &[LeafOp]) -> Option<(usize, usize, BinaryOp, IntRhs, i32)
                 LeafOp::LoadConst(value) => IntRhs::Imm(int32_of_value(*value)?),
                 _ => return None,
             };
-            (1, *slot, *op, rhs, mask)
+            (0, *slot, *op, rhs, mask)
         }
         _ => return None,
     };
     Some(shape)
+}
+
+/// Route B (int32), A2: the general RMW tail
+/// `[prefix…, BinLeftReg{op, slot}, BinImm{trunc}, StoreReg{slot}]` where the
+/// prefix computes the right operand into the accumulator and the provenance
+/// pass proves it `Int`. Unlike [`int_rmw_shape`] the prefix is KEPT (its
+/// effects are the loop's) and the tail collapses to
+/// `BinStoreInt { rhs: IntRhs::Acc }`; the prefix must not touch the carried
+/// slot, whose frame value is stale while the loop runs.
+fn int_rmw_prefix_shape(
+    ops: &[LeafOp],
+    counter: RegInt,
+) -> Option<(usize, usize, BinaryOp, IntRhs, i32)> {
+    let tail = ops.len().checked_sub(3)?;
+    let (
+        LeafOp::BinLeftReg { op, slot },
+        LeafOp::BinImm {
+            op: trunc,
+            imm: trunc_imm,
+        },
+        LeafOp::StoreReg {
+            slot: store_slot,
+            tdz: false,
+        },
+    ) = (&ops[tail], &ops[tail + 1], &ops[tail + 2])
+    else {
+        return None;
+    };
+    if slot != store_slot || !is_int_wrap(*op) {
+        return None;
+    }
+    let mask = is_int_trunc(*trunc, *trunc_imm)?;
+    let prefix = &ops[..tail];
+    if prefix.iter().any(|p| leaf_op_touches_slot(p, *slot)) {
+        return None;
+    }
+    if reg_int_acc(prefix, counter) < RegInt::Int {
+        return None;
+    }
+    Some((tail, *slot, *op, IntRhs::Acc, mask))
+}
+
+/// The integrality lattice for [`IntProvenance`]: `Unknown ⊂ Integer ⊂ Int`
+/// (the derived `Ord` orders the variants in that precision order).
+/// `Integer` means the value is provably a Number with no fractional part, of
+/// any magnitude; `Int` additionally means it lies in the signed i32 range, so
+/// an `f64 as i32` conversion and a wrapping i32 op reproduce the spec's
+/// `ToInt32` exactly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum RegInt {
+    Unknown,
+    Integer,
+    Int,
+}
+
+/// A forward provenance pass over a straight-line register run ([`LeafOp`]),
+/// tracking the accumulator's integrality and every value written to a frame
+/// slot. It exists to prove an operand integral without a per-iteration guard:
+/// the int32 loop-accumulator lane's RHS (A2) needs `Int`, and the `%` lowering
+/// drops its integrality checks for an `Integer` operator. `Unknown` is the
+/// conservative floor; bitwise operators are total (`ToInt32`/`ToUint32`), so
+/// they always produce an integral result, and `Add`/`Sub`/`Mul` of two
+/// integrals stay integral but can leave the i32 range (overflow), so they
+/// yield `Integer` — never `Int`.
+pub(crate) struct IntProvenance {
+    acc: RegInt,
+    slots: HashMap<usize, RegInt>,
+    counter: RegInt,
+}
+
+impl IntProvenance {
+    fn new(counter: RegInt) -> Self {
+        Self {
+            acc: RegInt::Unknown,
+            slots: HashMap::new(),
+            counter,
+        }
+    }
+
+    fn slot_of(&self, slot: usize) -> RegInt {
+        self.slots.get(&slot).copied().unwrap_or(RegInt::Unknown)
+    }
+
+    fn step(&mut self, op: &LeafOp) {
+        match op {
+            LeafOp::LoadReg { slot, .. } => self.acc = self.slot_of(*slot),
+            LeafOp::LoadContext { .. } | LeafOp::LoadPerIter { .. } => {
+                self.acc = RegInt::Unknown;
+            }
+            LeafOp::LoadCounter => self.acc = self.counter,
+            LeafOp::LoadConst(value) => self.acc = const_reg_int(*value),
+            LeafOp::BinImm { op, imm } => {
+                let right = f64_reg_int(*imm);
+                self.acc = combine_reg_int(self.acc, *op, right, *imm != 0.0);
+            }
+            LeafOp::BinConst { op, value } => {
+                let right = const_reg_int(*value);
+                let nonzero = value.as_number().is_some_and(|n| n != 0.0);
+                self.acc = combine_reg_int(self.acc, *op, right, nonzero);
+            }
+            LeafOp::BinReg { op, slot, .. } => {
+                let right = self.slot_of(*slot);
+                self.acc = combine_reg_int(self.acc, *op, right, false);
+            }
+            LeafOp::BinLeftReg { op, slot } => {
+                let left = self.slot_of(*slot);
+                self.acc = combine_reg_int(left, *op, self.acc, false);
+            }
+            LeafOp::BinCtxReg { op, .. } => {
+                self.acc = combine_reg_int(RegInt::Unknown, *op, RegInt::Unknown, false);
+            }
+            LeafOp::BinContext { op, .. } | LeafOp::BinPerIter { op, .. } => {
+                self.acc = combine_reg_int(self.acc, *op, RegInt::Unknown, false);
+            }
+            LeafOp::BinAccPop { op } => {
+                self.acc = combine_reg_int(RegInt::Unknown, *op, self.acc, false);
+            }
+            LeafOp::BinImmLocal { op, slot, imm, .. } => {
+                let left = self.slot_of(*slot);
+                let right = f64_reg_int(*imm);
+                self.acc = combine_reg_int(left, *op, right, *imm != 0.0);
+            }
+            LeafOp::StoreReg { slot, .. } => {
+                self.slots.insert(*slot, self.acc);
+            }
+            LeafOp::BinStoreReg { op, slot } => {
+                let left = self.slot_of(*slot);
+                let res = combine_reg_int(left, *op, self.acc, false);
+                self.acc = res;
+                self.slots.insert(*slot, res);
+            }
+            LeafOp::UpdateAcc { .. } => self.acc = update_reg_int(self.acc),
+            LeafOp::UpdateReg { slot, .. } => {
+                let updated = update_reg_int(self.slot_of(*slot));
+                self.slots.insert(*slot, updated);
+            }
+            LeafOp::BinStoreInt { slot, .. } => {
+                self.acc = RegInt::Int;
+                self.slots.insert(*slot, RegInt::Int);
+            }
+            // A proven integral `%` (nonzero constant divisor) stays integral.
+            LeafOp::BinRemConst { .. } => self.acc = RegInt::Integer,
+            LeafOp::GetMemberName { .. }
+            | LeafOp::GetMemberComputed { .. }
+            | LeafOp::GetMemberNameLocal { .. }
+            | LeafOp::GetMemberComputedLocal { .. }
+            | LeafOp::BuilderAppend { .. }
+            | LeafOp::BinStoreNum { .. } => self.acc = RegInt::Unknown,
+            // These ops use the accumulator as an operand (the member object or
+            // the update target) but never publish a new accumulator value, so
+            // the accumulator's provenance is unchanged.
+            LeafOp::StoreMemberName { .. }
+            | LeafOp::StoreMemberNameLocal { .. }
+            | LeafOp::StoreMemberComputed { .. }
+            | LeafOp::StoreMemberComputedSlot { .. }
+            | LeafOp::StoreMemberComputedLocal { .. }
+            | LeafOp::CompoundMemberComputedLocal { .. }
+            | LeafOp::UpdateMemberComputedLocal { .. }
+            | LeafOp::ReturnAcc => {}
+            _ => self.acc = RegInt::Unknown,
+        }
+    }
+}
+
+/// The accumulator's integrality after running the pass over `ops`, plus the
+/// integrality of each written frame slot.
+pub(crate) fn reg_int_provenance(
+    ops: &[LeafOp],
+    counter: RegInt,
+) -> (RegInt, HashMap<usize, RegInt>) {
+    let mut pass = IntProvenance::new(counter);
+    for op in ops {
+        pass.step(op);
+    }
+    (pass.acc, pass.slots)
+}
+
+/// The accumulator's integrality after running the pass over `ops` — the
+/// prefix query the A2 RHS proof and the `%` guard elision both use.
+pub(crate) fn reg_int_acc(ops: &[LeafOp], counter: RegInt) -> RegInt {
+    reg_int_provenance(ops, counter).0
+}
+
+/// The lattice transfer for a binary op given each operand's integrality.
+/// `rhs_nonzero` is the caller's proof that the right operand is a nonzero
+/// constant (only the constant forms can supply it) — `%` is integral only
+/// then, since a zero divisor yields `NaN`.
+fn combine_reg_int(left: RegInt, op: BinaryOp, right: RegInt, rhs_nonzero: bool) -> RegInt {
+    use BinaryOp::*;
+    match op {
+        // `ToInt32` is total, so these are always a signed i32 bit pattern.
+        BitAnd | BitXor | BitOr | LeftShift | RightShift => RegInt::Int,
+        // `ToUint32` is total but can exceed the signed i32 range.
+        UnsignedRightShift => RegInt::Integer,
+        Add | Sub | Mul => {
+            if left == RegInt::Unknown || right == RegInt::Unknown {
+                RegInt::Unknown
+            } else {
+                RegInt::Integer
+            }
+        }
+        Rem => {
+            if left >= RegInt::Integer && right >= RegInt::Integer && rhs_nonzero {
+                RegInt::Integer
+            } else {
+                RegInt::Unknown
+            }
+        }
+        // `Div`/`Exp` can be fractional, the relational/`in`/`instanceof`
+        // operators yield a Boolean, and the rest (comparisons) are unknown.
+        _ => RegInt::Unknown,
+    }
+}
+
+/// The constant's integrality: `Int` inside the i32 range, `Integer` for any
+/// other finite integral Number, else `Unknown` (`NaN`, the infinities, a
+/// non-Number, or a fractional value).
+fn const_reg_int(value: Value) -> RegInt {
+    value.as_number().map_or(RegInt::Unknown, f64_reg_int)
+}
+
+fn f64_reg_int(n: f64) -> RegInt {
+    if int32_of(n).is_some() {
+        RegInt::Int
+    } else if n.is_finite() && n.fract() == 0.0 {
+        RegInt::Integer
+    } else {
+        RegInt::Unknown
+    }
+}
+
+/// `ToNumeric(x) ± 1`: an `Int` can leave the i32 range at the boundary, so
+/// the update only preserves `Integer`.
+fn update_reg_int(value: RegInt) -> RegInt {
+    match value {
+        RegInt::Unknown => RegInt::Unknown,
+        _ => RegInt::Integer,
+    }
 }
 
 /// A leaf op that only reads a value with no user-observable side
@@ -28630,5 +28942,157 @@ mod tests {
         // The counterpart, so the assertion is about `CallApply` rather than
         // about a list that happens to refuse everything.
         assert!(steps_are_leaf(&[Step::Push(Value::Number(1.0)), Step::Pop]));
+    }
+
+    fn bin_imm(op: BinaryOp, imm: f64) -> LeafOp {
+        LeafOp::BinImm { op, imm }
+    }
+
+    #[test]
+    fn reg_int_constants_lattice() {
+        // i32-range integers are `Int`; larger integrals are `Integer`;
+        // fractional/NaN/infinite are `Unknown`.
+        assert_eq!(const_reg_int(Value::Number(5.0)), RegInt::Int);
+        assert_eq!(const_reg_int(Value::Number(-2147483648.0)), RegInt::Int);
+        assert_eq!(const_reg_int(Value::Number(1e30)), RegInt::Integer);
+        assert_eq!(const_reg_int(Value::Number(0.5)), RegInt::Unknown);
+        assert_eq!(const_reg_int(Value::Number(f64::NAN)), RegInt::Unknown);
+        assert_eq!(const_reg_int(Value::Number(f64::INFINITY)), RegInt::Unknown);
+        assert_eq!(const_reg_int(Value::Undefined), RegInt::Unknown);
+    }
+
+    #[test]
+    fn reg_int_bitwise_is_total() {
+        // `& | ^ << >>` are total `ToInt32` whatever the operand knowledge, so
+        // they always produce `Int`; `>>>` is `ToUint32` (can exceed i32).
+        for op in [
+            BinaryOp::BitAnd,
+            BinaryOp::BitXor,
+            BinaryOp::BitOr,
+            BinaryOp::LeftShift,
+            BinaryOp::RightShift,
+        ] {
+            assert_eq!(
+                combine_reg_int(RegInt::Unknown, op, RegInt::Unknown, false),
+                RegInt::Int,
+                "{op:?} of two unknowns"
+            );
+        }
+        assert_eq!(
+            combine_reg_int(
+                RegInt::Unknown,
+                BinaryOp::UnsignedRightShift,
+                RegInt::Unknown,
+                false
+            ),
+            RegInt::Integer
+        );
+    }
+
+    #[test]
+    fn reg_int_arith_stays_integral_but_leaves_i32() {
+        // The sum/product of two int32s can overflow i32, so the result is only
+        // `Integer` — never `Int`.
+        for op in [BinaryOp::Add, BinaryOp::Sub, BinaryOp::Mul] {
+            assert_eq!(
+                combine_reg_int(RegInt::Int, op, RegInt::Int, false),
+                RegInt::Integer
+            );
+            assert_eq!(
+                combine_reg_int(RegInt::Int, op, RegInt::Unknown, false),
+                RegInt::Unknown
+            );
+        }
+    }
+
+    #[test]
+    fn reg_int_rem_needs_a_nonzero_integer_divisor() {
+        assert_eq!(
+            combine_reg_int(RegInt::Integer, BinaryOp::Rem, RegInt::Int, true),
+            RegInt::Integer
+        );
+        // A zero divisor yields NaN — not integral.
+        assert_eq!(
+            combine_reg_int(RegInt::Integer, BinaryOp::Rem, RegInt::Int, false),
+            RegInt::Unknown
+        );
+    }
+
+    #[test]
+    fn reg_int_mulmod_chain_is_integer() {
+        // The `%` bench body's left operand: `i * 31 + 5`, with the counter
+        // proven int32.
+        let ops = [
+            LeafOp::LoadCounter,
+            bin_imm(BinaryOp::Mul, 31.0),
+            bin_imm(BinaryOp::Add, 5.0),
+        ];
+        assert_eq!(reg_int_acc(&ops, RegInt::Int), RegInt::Integer);
+        // Without the counter proof it is unknown.
+        assert_eq!(reg_int_acc(&ops, RegInt::Unknown), RegInt::Unknown);
+        // The `% 7` itself stays integral (a nonzero constant divisor).
+        let mut with_rem = ops.to_vec();
+        with_rem.push(bin_imm(BinaryOp::Rem, 7.0));
+        assert_eq!(reg_int_acc(&with_rem, RegInt::Int), RegInt::Integer);
+    }
+
+    #[test]
+    fn reg_int_masked_counter_is_int() {
+        // The A2 RHS `i & 255` is `Int` regardless of the counter's
+        // integrality (the bitwise result is always a signed i32).
+        let ops = [LeafOp::LoadCounter, bin_imm(BinaryOp::BitAnd, 255.0)];
+        assert_eq!(reg_int_acc(&ops, RegInt::Unknown), RegInt::Int);
+        assert_eq!(reg_int_acc(&ops, RegInt::Int), RegInt::Int);
+    }
+
+    #[test]
+    fn reg_int_slot_flow_tracks_stores() {
+        // A stored constant's type is read back through the slot.
+        let ops = [
+            LeafOp::LoadConst(Value::Number(5.0)),
+            LeafOp::StoreReg {
+                slot: 3,
+                tdz: false,
+            },
+            LeafOp::LoadReg {
+                slot: 3,
+                tdz: false,
+            },
+        ];
+        let (acc, slots) = reg_int_provenance(&ops, RegInt::Unknown);
+        assert_eq!(acc, RegInt::Int);
+        assert_eq!(slots.get(&3), Some(&RegInt::Int));
+        // An update can leave the i32 range, so it only preserves `Integer`.
+        let ops = [
+            LeafOp::LoadConst(Value::Number(2147483647.0)),
+            LeafOp::StoreReg {
+                slot: 1,
+                tdz: false,
+            },
+            LeafOp::UpdateReg {
+                slot: 1,
+                tdz: false,
+                op: syntax::ast::UpdateOp::Increment,
+            },
+            LeafOp::LoadReg {
+                slot: 1,
+                tdz: false,
+            },
+        ];
+        assert_eq!(reg_int_acc(&ops, RegInt::Unknown), RegInt::Integer);
+    }
+
+    #[test]
+    fn reg_int_member_read_is_unknown() {
+        // A string append (and every member read) resets the accumulator's
+        // integrality.
+        let ops = [
+            LeafOp::LoadReg {
+                slot: 0,
+                tdz: false,
+            },
+            LeafOp::BuilderAppend { slot: 1 },
+        ];
+        assert_eq!(reg_int_acc(&ops, RegInt::Int), RegInt::Unknown);
     }
 }

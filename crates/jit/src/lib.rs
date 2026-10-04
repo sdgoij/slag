@@ -2437,18 +2437,27 @@ mod tests {
         // The int32 register lane: `s = (s + rhs) | 0` (or `& mask`) runs as
         // wrapping i32 in the shared num-slot register. Covered: an int32
         // immediate, the bounded counter, a mask, the wrap across the int32
-        // boundary (`wrap`, `mul`), a negative seed, and the proof's
-        // rejections (a slot rhs and a fractional seed stay on the step path
-        // and must still agree).
-        let source = "function imm(n) { var s = 0; for (var i = 0; i < n; i++) { s = (s + 7) | 0; } return s; }\n\
-                      function ctr(n) { var s = 0; for (var i = 0; i < n; i++) { s = (s + i) | 0; } return s; }\n\
-                      function mask(n) { var s = 0; for (var i = 0; i < n; i++) { s = (s + i) & 1073741823; } return s; }\n\
-                      function wrap(n) { var s = 0; for (var i = 0; i < n; i++) { s = (s + 2000000000) | 0; } return s; }\n\
-                      function neg(n) { var s = -1000; for (var i = 0; i < n; i++) { s = (s - i) | 0; } return s; }\n\
-                      function mul(n) { var s = 3; for (var i = 0; i < n; i++) { s = (s * 3) | 0; } return s; }\n\
+        // boundary (`wrap`, `mul`), a negative seed, the A2 prefix proof
+        // (`band`/`bor`/`shl`/`xor` — a bitwise rhs on the counter, and
+        // `slotrhs`/`bandSlot`, which the plan cannot fold into the counter
+        // but can still prove `Int`), and the proof's rejections (a
+        // non-integral rhs and a fractional seed stay on the step path and
+        // must still agree).
+        let source = "function imm() { var s = 0; for (var i = 0; i < 1000; i++) { s = (s + 7) | 0; } return s; }\n\
+                      function ctr() { var s = 0; for (var i = 0; i < 1000; i++) { s = (s + i) | 0; } return s; }\n\
+                      function mask() { var s = 0; for (var i = 0; i < 1000; i++) { s = (s + i) & 1073741823; } return s; }\n\
+                      function wrap() { var s = 0; for (var i = 0; i < 100; i++) { s = (s + 2000000000) | 0; } return s; }\n\
+                      function neg() { var s = -1000; for (var i = 0; i < 1000; i++) { s = (s - i) | 0; } return s; }\n\
+                      function mul() { var s = 3; for (var i = 0; i < 20; i++) { s = (s * 3) | 0; } return s; }\n\
+                      function band() { var s = 0; for (var i = 0; i < 1000; i++) { s = (s + (i & 255)) | 0; } return s; }\n\
+                      function bor() { var s = 0; for (var i = 0; i < 1000; i++) { s = (s + (i | 0)) | 0; } return s; }\n\
+                      function shl() { var s = 0; for (var i = 0; i < 1000; i++) { s = (s + (i << 3)) | 0; } return s; }\n\
+                      function xr() { var s = 0; for (var i = 0; i < 1000; i++) { s = (s + (i ^ 12345)) | 0; } return s; }\n\
+                      function bandSlot(n) { var s = 0; for (var i = 0; i < n; i++) { s = (s + (i & 255)) | 0; } return s; }\n\
                       function slotrhs(n) { var s = 0; for (var i = 0; i < n; i++) { var k = i & 255; s = (s + k) | 0; } return s; }\n\
                       function frac(n) { var s = 1.5; for (var i = 0; i < n; i++) { s = (s + i) | 0; } return s; }\n\
-                      [imm(1000), ctr(1000), mask(1000), wrap(100), neg(1000), mul(20), slotrhs(1000), frac(1000)].join(',');";
+                      function nonint() { var s = 0; for (var i = 0; i < 1000; i++) { s = (s + (i * 1.5)) | 0; } return s; }\n\
+                      [imm(), ctr(), mask(), wrap(), neg(), mul(), band(), bor(), shl(), xr(), bandSlot(1000), slotrhs(1000), frac(1000), nonint()].join(',');";
         let interp = {
             let mut agent = runtime::Agent::new();
             agent.initialize_host_defined_realm().expect("realm");
@@ -2458,6 +2467,33 @@ mod tests {
         assert_eq!(
             value, interp,
             "the int32 accumulator lane must match the interpreter"
+        );
+        assert!(compiled >= 1, "{compiled} bodies");
+    }
+
+    #[test]
+    fn installed_jit_integral_rem_matches_the_interpreter() {
+        // `plan_loop_rem` folds a proven-integral `% <nonzero const>` into
+        // `LeafOp::BinRemConst`, which the JIT runs as an `srem` behind a lone
+        // `|acc| < 2^63` range guard. Covered: a positive dividend, a negative
+        // one (fmod's dividend sign), a non-constant divisor (no rewrite), a
+        // `% 0` (NaN, no rewrite), and the guard's boundary (a value past the
+        // i64 domain falls to the exact `binary_slow`).
+        let source = "function mulsign() { var s = 0; for (var i = 0; i < 1000; i++) { s = s + ((i * 31 + 5) % 7); } return s; }\n\
+                      function negsign() { var s = 0; for (var i = 0; i < 1000; i++) { s = s + ((5 - i * 31) % 7); } return s; }\n\
+                      function varMod() { var d = 7; var s = 0; for (var i = 0; i < 1000; i++) { s = s + ((i * 31 + 5) % d); } return s; }\n\
+                      function zeroMod() { var s = 0; for (var i = 0; i < 5; i++) { s = s + ((i * 31 + 5) % 0); } return String(s); }\n\
+                      function bigMod() { var s = 0; for (var i = 0; i < 3; i++) { s = s + (1e20 % 7); } return s; }\n\
+                      [mulsign(), negsign(), varMod(), zeroMod(), bigMod()].join(',');";
+        let interp = {
+            let mut agent = runtime::Agent::new();
+            agent.initialize_host_defined_realm().expect("realm");
+            agent.run_script(source).expect("interp runs")
+        };
+        let (value, compiled) = with_jit_agent(|agent| agent.run_script(source).expect("jit runs"));
+        assert_eq!(
+            value, interp,
+            "the integral-remainder lowering must match the interpreter"
         );
         assert!(compiled >= 1, "{compiled} bodies");
     }

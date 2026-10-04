@@ -8473,6 +8473,97 @@ impl<'a> Lowerer<'a> {
         self.emit_binary_known(op, lhs, rhs, false, false)
     }
 
+    /// Lower `%` for two Numbers as an integer `srem` when both are in-range
+    /// integers and the divisor is nonzero — where the spec's `fmod` equals the
+    /// integer remainder — else `BinarySlow`. Cranelift has no `frem`, and f64
+    /// `%` is a libm `fmod` (~8 ns); `srem` measures ~3.8 ns.
+    fn emit_mod_int(
+        &mut self,
+        lhs: ClifValue,
+        rhs: ClifValue,
+        lhs_known: bool,
+        rhs_known: bool,
+    ) -> Result<ClifValue, Unsupported> {
+        let lhs_num = self
+            .builder
+            .ins()
+            .bitcast(types::F64, MemFlagsData::new(), lhs);
+        let rhs_num = self
+            .builder
+            .ins()
+            .bitcast(types::F64, MemFlagsData::new(), rhs);
+        let (l_wide, _) = self.trunc_i32(lhs_num);
+        let (r_wide, _) = self.trunc_i32(rhs_num);
+        let l_back = self.builder.ins().fcvt_from_sint(types::F64, l_wide);
+        let r_back = self.builder.ins().fcvt_from_sint(types::F64, r_wide);
+        let l_int = self.builder.ins().fcmp(FloatCC::Equal, l_back, lhs_num);
+        let r_int = self.builder.ins().fcmp(FloatCC::Equal, r_back, rhs_num);
+        // The truncation to i32 is exact only for |x| <= 2^31-1; a larger
+        // integer would take the low 32 bits of the *rounded* value, which is
+        // not `a % b`. Require the int32 range explicitly.
+        let bound = self.builder.ins().f64const(2147483647.0);
+        let l_abs = self.builder.ins().fabs(lhs_num);
+        let r_abs = self.builder.ins().fabs(rhs_num);
+        let l_in_i32 = self
+            .builder
+            .ins()
+            .fcmp(FloatCC::LessThanOrEqual, l_abs, bound);
+        let r_in_i32 = self
+            .builder
+            .ins()
+            .fcmp(FloatCC::LessThanOrEqual, r_abs, bound);
+        let l = self.builder.ins().ireduce(types::I32, l_wide);
+        let r = self.builder.ins().ireduce(types::I32, r_wide);
+        let r_nonzero = self.builder.ins().icmp_imm_u(IntCC::NotEqual, r, 0);
+        let lhs_dbl = if lhs_known {
+            self.builder.ins().iconst(types::I8, 1)
+        } else {
+            self.is_double(lhs)
+        };
+        let rhs_dbl = if rhs_known {
+            self.builder.ins().iconst(types::I8, 1)
+        } else {
+            self.is_double(rhs)
+        };
+        let mut guard = self.builder.ins().band(lhs_dbl, rhs_dbl);
+        guard = self.builder.ins().band(guard, l_int);
+        guard = self.builder.ins().band(guard, r_int);
+        guard = self.builder.ins().band(guard, l_in_i32);
+        guard = self.builder.ins().band(guard, r_in_i32);
+        guard = self.builder.ins().band(guard, r_nonzero);
+        let res_var = self.builder.declare_var(types::I64);
+        let merge = self.builder.create_block();
+        let fast = self.builder.create_block();
+        let slow = self.builder.create_block();
+        self.builder.ins().brif(guard, fast, &[], slow, &[]);
+        // The integer remainder runs only on the fast path: `srem` by zero
+        // traps, so the nonzero guard has to gate the instruction itself.
+        self.builder.switch_to_block(fast);
+        let rem = self.builder.ins().srem(l, r);
+        let wide = self.builder.ins().sextend(types::I64, rem);
+        let rem_f = self.builder.ins().fcvt_from_sint(types::F64, wide);
+        // `fmod` takes the dividend's sign; `srem` matches except for a zero
+        // result (which it makes +0), so copy the dividend's sign onto it.
+        let rem_f = self.builder.ins().fcopysign(rem_f, lhs_num);
+        let bits = self
+            .builder
+            .ins()
+            .bitcast(types::I64, MemFlagsData::new(), rem_f);
+        let fast_res = self.canon(bits);
+        self.builder.def_var(res_var, fast_res);
+        self.builder.ins().jump(merge, &[]);
+        self.builder.switch_to_block(slow);
+        let op_imm = self.builder.ins().iconst(types::I64, BinaryOp::Rem as i64);
+        let slow_res = self.call_slow(self.sig_binary, Helper::BinarySlow, &[op_imm, lhs, rhs])?;
+        self.builder.def_var(res_var, slow_res);
+        self.builder.ins().jump(merge, &[]);
+        self.builder.seal_block(fast);
+        self.builder.seal_block(slow);
+        self.builder.seal_block(merge);
+        self.builder.switch_to_block(merge);
+        Ok(self.builder.use_var(res_var))
+    }
+
     /// `emit_binary` with compile-time knowledge that an operand is already a
     /// canonical `Value::Number` (the register executor's accumulator
     /// provenance, or a Number constant). A known operand's tag check is
@@ -8492,6 +8583,9 @@ impl<'a> Lowerer<'a> {
         lhs_known: bool,
         rhs_known: bool,
     ) -> Result<ClifValue, Unsupported> {
+        if op == BinaryOp::Rem {
+            return self.emit_mod_int(lhs, rhs, lhs_known, rhs_known);
+        }
         let Some(inline) = inline_binary(op) else {
             let op_imm = self.builder.ins().iconst(types::I64, op as i64);
             return self.call_slow(self.sig_binary, Helper::BinarySlow, &[op_imm, lhs, rhs]);
@@ -9315,6 +9409,14 @@ impl<'a> Lowerer<'a> {
                         let wide = self.builder.ins().fcvt_to_sint_sat(types::I64, counter);
                         self.builder.ins().ireduce(types::I32, wide)
                     }
+                    IntRhs::Acc => {
+                        // A2: the leading ops left the right operand in the
+                        // accumulator (a canonical Number, proven `Int` at plan
+                        // time); convert it to the i32 register.
+                        let num = self.acc_f64();
+                        let wide = self.builder.ins().fcvt_to_sint_sat(types::I64, num);
+                        self.builder.ins().ireduce(types::I32, wide)
+                    }
                 };
                 let wrapped = match op {
                     BinaryOp::Add => self.builder.ins().iadd(left, right),
@@ -9465,6 +9567,58 @@ impl<'a> Lowerer<'a> {
                 // which lowers to `LoadCounter` instead).
                 let bits = self.acc_bits();
                 self.push(bits);
+            }
+            LeafOp::BinRemConst { divisor } => {
+                // A proven-integral `% <const>`: the spec's `fmod` is the
+                // truncated integer remainder, so an `srem` is exact for
+                // `|acc| < 2^63`. One range guard stands in for the generic
+                // `%` lowering's per-operand integrality AND range checks; a
+                // value outside the conversion's domain falls to the exact
+                // `binary_slow`.
+                let lhs = self.acc_bits();
+                let num = self
+                    .builder
+                    .ins()
+                    .bitcast(types::F64, MemFlagsData::new(), lhs);
+                let abs = self.builder.ins().fabs(num);
+                let bound = self.builder.ins().f64const(9223372036854775808.0);
+                let in_range = self.builder.ins().fcmp(FloatCC::LessThan, abs, bound);
+                let res_var = self.builder.declare_var(types::I64);
+                let merge = self.builder.create_block();
+                let fast = self.builder.create_block();
+                let slow = self.builder.create_block();
+                self.builder.ins().brif(in_range, fast, &[], slow, &[]);
+                self.builder.switch_to_block(fast);
+                let l = self.builder.ins().fcvt_to_sint_sat(types::I64, num);
+                let r = self.builder.ins().iconst(types::I64, i64::from(*divisor));
+                let rem = self.builder.ins().srem(l, r);
+                let rem_f = self.builder.ins().fcvt_from_sint(types::F64, rem);
+                let bits = self
+                    .builder
+                    .ins()
+                    .bitcast(types::I64, MemFlagsData::new(), rem_f);
+                let fast_res = self.canon(bits);
+                self.builder.def_var(res_var, fast_res);
+                self.builder.ins().jump(merge, &[]);
+                self.builder.switch_to_block(slow);
+                let op_imm = self.builder.ins().iconst(types::I64, BinaryOp::Rem as i64);
+                let rhs_bits = self
+                    .builder
+                    .ins()
+                    .iconst(types::I64, Value::Number(f64::from(*divisor)).bits() as i64);
+                let slow_res = self.call_slow(
+                    self.sig_binary,
+                    Helper::BinarySlow,
+                    &[op_imm, lhs, rhs_bits],
+                )?;
+                self.builder.def_var(res_var, slow_res);
+                self.builder.ins().jump(merge, &[]);
+                self.builder.seal_block(fast);
+                self.builder.seal_block(slow);
+                self.builder.seal_block(merge);
+                self.builder.switch_to_block(merge);
+                let merged = self.builder.use_var(res_var);
+                self.set_acc_bits(merged);
             }
             LeafOp::ReturnAcc => {
                 let value = self.acc_bits();
