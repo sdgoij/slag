@@ -63,11 +63,12 @@ pub enum Intrinsic {
     ArrayIndexOf,
     MapGet,
     SetHas,
+    MapSet,
 }
 
 /// The number of recognized intrinsics (a `Intrinsic` discriminant is an index
 /// into the per-run intrinsic-bit snapshot).
-pub const INTRINSIC_COUNT: usize = 9;
+pub const INTRINSIC_COUNT: usize = 10;
 
 /// Every recognized intrinsic, in discriminant order: the order that pairs an
 /// `intrinsic_bits` slot with its `Intrinsic`.
@@ -81,6 +82,7 @@ pub const INTRINSICS: [Intrinsic; INTRINSIC_COUNT] = [
     Intrinsic::ArrayIndexOf,
     Intrinsic::MapGet,
     Intrinsic::SetHas,
+    Intrinsic::MapSet,
 ];
 
 impl Intrinsic {
@@ -96,6 +98,7 @@ impl Intrinsic {
             Intrinsic::ArrayIndexOf => "indexOf",
             Intrinsic::MapGet => "get",
             Intrinsic::SetHas => "has",
+            Intrinsic::MapSet => "set",
         }
     }
 
@@ -111,6 +114,7 @@ impl Intrinsic {
             Intrinsic::ArrayIndexOf => "%Array.prototype.indexOf%",
             Intrinsic::MapGet => "%Map.prototype.get%",
             Intrinsic::SetHas => "%Set.prototype.has%",
+            Intrinsic::MapSet => "%Map.prototype.set%",
         }
     }
 }
@@ -12397,6 +12401,22 @@ impl Vm {
             Intrinsic::SetHas => {
                 match crate::builtins::keyed::set_has_fast(agent, &this, &self.stack[arg_start]) {
                     Some(has) => Value::Boolean(has),
+                    None => return Ok(false),
+                }
+            }
+            Intrinsic::MapSet => {
+                let value = self
+                    .stack
+                    .get(arg_start + 1)
+                    .copied()
+                    .unwrap_or(Value::Undefined);
+                match crate::builtins::keyed::map_set_fast(
+                    agent,
+                    &this,
+                    &self.stack[arg_start],
+                    &value,
+                ) {
+                    Some(map) => map,
                     None => return Ok(false),
                 }
             }

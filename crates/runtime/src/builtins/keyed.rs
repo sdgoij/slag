@@ -510,6 +510,24 @@ pub(crate) fn set_has_fast(agent: &Agent, this: &Value, value: &Value) -> Option
     Some(data.contains(&value))
 }
 
+/// The fast path of `Map.prototype.set`: `Some(this)` (the receiver, the
+/// spec's return) for a Map receiver, `None` when the receiver is not a Map
+/// (the caller runs the exact builtin). `this` must be rooted by the caller for
+/// the duration — it is the entry's key/value lives that the insert adds edges
+/// to.
+pub(crate) fn map_set_fast(
+    agent: &Agent,
+    this: &Value,
+    key: &Value,
+    value: &Value,
+) -> Option<Value> {
+    let object = map_of(agent, this).ok()?;
+    let key = canonicalize_key(*key);
+    let mut data = agent.map_data.get(&object.id()).unwrap().borrow_mut();
+    data.set(key, *value);
+    Some(*this)
+}
+
 /// The number of live elements of a Set's [[SetData]].
 fn set_data_count(agent: &Agent, id: u64) -> usize {
     agent

@@ -461,6 +461,7 @@ fn runtime_helpers() -> JitHelpers {
         array_index_of: Some(rt.array_index_of),
         map_get: Some(rt.map_get),
         set_has: Some(rt.set_has),
+        map_set: Some(rt.map_set),
         typed_array_length: Some(rt.typed_array_length),
         get_super_base: Some(rt.get_super_base),
         this_value: Some(rt.this_value),
@@ -706,6 +707,7 @@ mod tests {
             array_index_of: Some(helpers::test_array_index_of),
             map_get: Some(helpers::test_map_get),
             set_has: Some(helpers::test_set_has),
+            map_set: Some(helpers::test_map_set),
             typed_array_length: Some(helpers::test_typed_array_length),
             get_super_base: Some(helpers::test_get_super_base),
             this_value: Some(helpers::test_this_value),
@@ -2679,6 +2681,19 @@ mod tests {
                         return c;\n\
                       }\n\
                       t(loopSet(1000));\n\
+                      var m2 = new Map(); t(m2.set(1, 'a') === m2); t(m2.get(1));\n\
+                      m2.set(1, 'b'); t(m2.get(1)); m2.set(NaN, 1); t(m2.get(NaN));\n\
+                      m2.set(-0, 'z'); t(m2.get(0)); m2.set(2); t(m2.get(2));\n\
+                      tc(function () { Map.prototype.set.call({}, 1, 2); });\n\
+                      var savedS = Map.prototype.set; Map.prototype.set = function () { return 'x'; };\n\
+                      t(m2.set(2, 'q')); t(m2.get(2));\n\
+                      Map.prototype.set = savedS; t(m2.set(2, 'w') === m2); t(m2.get(2));\n\
+                      function loopSet2(n) {\n\
+                        var mm = new Map();\n\
+                        for (var i = 0; i < n; i++) { mm.set(i & 1023, i); }\n\
+                        return mm.get(5);\n\
+                      }\n\
+                      t(loopSet2(5000));\n\
                       out.join(',');";
         let interp = {
             let mut agent = runtime::Agent::new();

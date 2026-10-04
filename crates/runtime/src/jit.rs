@@ -1164,6 +1164,10 @@ pub struct JitSlowPaths {
     /// value; returns a Boolean, or the hole sentinel when the receiver is not a
     /// Set. Never errors.
     pub set_has: extern "C" fn(ctx: *mut c_void, this: u64, value: u64) -> u64,
+    /// `Step::CallIntrinsic` for `%Map.prototype.set%`: the receiver, key and
+    /// value; returns the receiver (the spec's return), or the hole sentinel
+    /// when the receiver is not a Map. Never errors.
+    pub map_set: extern "C" fn(ctx: *mut c_void, this: u64, key: u64, value: u64) -> u64,
     /// A compiled `GetMemberName` with the `length` atom: the slots length of
     /// an IntegerIndexed receiver, or the canonical-NaN sentinel otherwise
     /// (the machine code falls back to the member-cell probe /
@@ -1341,6 +1345,7 @@ pub static JIT_SLOW_PATHS: JitSlowPaths = JitSlowPaths {
     array_index_of,
     map_get,
     set_has,
+    map_set,
     typed_array_length,
     get_super_base,
     this_value,
@@ -5416,6 +5421,23 @@ extern "C" fn set_has(ctx: *mut c_void, this: u64, value: u64) -> u64 {
         &Value::from_bits(value),
     ) {
         Some(has) => Value::Boolean(has).bits(),
+        None => Value::hole().bits(),
+    }
+}
+
+/// `Step::CallIntrinsic` for `%Map.prototype.set%`: the receiver, key and value;
+/// returns the receiver, or the hole sentinel when the receiver is not a Map
+/// (the compiled site takes the general call, which throws).
+extern "C" fn map_set(ctx: *mut c_void, this: u64, key: u64, value: u64) -> u64 {
+    let ctx = unsafe { ctx_of(ctx) };
+    let agent = unsafe { &mut *ctx.agent };
+    match crate::builtins::keyed::map_set_fast(
+        agent,
+        &Value::from_bits(this),
+        &Value::from_bits(key),
+        &Value::from_bits(value),
+    ) {
+        Some(map) => map.bits(),
         None => Value::hole().bits(),
     }
 }
