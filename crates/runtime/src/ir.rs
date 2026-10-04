@@ -64,11 +64,13 @@ pub enum Intrinsic {
     MapGet,
     SetHas,
     MapSet,
+    ArrayAt,
+    ArrayIncludes,
 }
 
 /// The number of recognized intrinsics (a `Intrinsic` discriminant is an index
 /// into the per-run intrinsic-bit snapshot).
-pub const INTRINSIC_COUNT: usize = 10;
+pub const INTRINSIC_COUNT: usize = 12;
 
 /// Every recognized intrinsic, in discriminant order: the order that pairs an
 /// `intrinsic_bits` slot with its `Intrinsic`.
@@ -83,6 +85,8 @@ pub const INTRINSICS: [Intrinsic; INTRINSIC_COUNT] = [
     Intrinsic::MapGet,
     Intrinsic::SetHas,
     Intrinsic::MapSet,
+    Intrinsic::ArrayAt,
+    Intrinsic::ArrayIncludes,
 ];
 
 impl Intrinsic {
@@ -99,6 +103,8 @@ impl Intrinsic {
             Intrinsic::MapGet => "get",
             Intrinsic::SetHas => "has",
             Intrinsic::MapSet => "set",
+            Intrinsic::ArrayAt => "at",
+            Intrinsic::ArrayIncludes => "includes",
         }
     }
 
@@ -115,6 +121,8 @@ impl Intrinsic {
             Intrinsic::MapGet => "%Map.prototype.get%",
             Intrinsic::SetHas => "%Set.prototype.has%",
             Intrinsic::MapSet => "%Map.prototype.set%",
+            Intrinsic::ArrayAt => "%Array.prototype.at%",
+            Intrinsic::ArrayIncludes => "%Array.prototype.includes%",
         }
     }
 }
@@ -12417,6 +12425,32 @@ impl Vm {
                     &value,
                 ) {
                     Some(map) => map,
+                    None => return Ok(false),
+                }
+            }
+            Intrinsic::ArrayAt => {
+                let Some(index) = self.stack[arg_start].as_number() else {
+                    return Ok(false);
+                };
+                let index = crux::convert::to_integer_or_infinity(index);
+                match crate::builtins::array::at_dense(&this, index) {
+                    Some(value) => value,
+                    None => return Ok(false),
+                }
+            }
+            Intrinsic::ArrayIncludes => {
+                let from = self
+                    .stack
+                    .get(arg_start + 1)
+                    .copied()
+                    .unwrap_or(Value::Undefined);
+                let n = match from.kind() {
+                    ValueKind::Number(x) => crux::convert::to_integer_or_infinity(x),
+                    ValueKind::Undefined => 0.0,
+                    _ => return Ok(false),
+                };
+                match crate::builtins::array::includes_dense(&this, &self.stack[arg_start], n) {
+                    Some(found) => Value::Boolean(found),
                     None => return Ok(false),
                 }
             }

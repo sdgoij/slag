@@ -6366,13 +6366,15 @@ impl<'a> Lowerer<'a> {
                 let arg_ok = self.is_double(arg1);
                 let callee_gate = self.builder.ins().band(non_zero, callee_ok);
                 let gate = match kind {
-                    // `indexOf`/`get`/`has`/`set` validate their receiver (and
-                    // `from`/the value) in the helper, so only the callee identity
-                    // is guarded here.
+                    // `indexOf`/`get`/`has`/`set`/`at`/`includes` validate their
+                    // receiver (and `from`/the index) in the helper, so only the
+                    // callee identity is guarded here.
                     Intrinsic::ArrayIndexOf
                     | Intrinsic::MapGet
                     | Intrinsic::SetHas
-                    | Intrinsic::MapSet => callee_gate,
+                    | Intrinsic::MapSet
+                    | Intrinsic::ArrayAt
+                    | Intrinsic::ArrayIncludes => callee_gate,
                     // A `this`-reading string method also needs a String
                     // primitive receiver and a Number position.
                     Intrinsic::StringCharCodeAt => {
@@ -6456,6 +6458,43 @@ impl<'a> Lowerer<'a> {
                             self.sig_binary,
                             Helper::MapSet,
                             &[this, arg1, value],
+                        )?;
+                        self.emit_intrinsic_hit(
+                            result,
+                            Value::hole().bits() as i64,
+                            slow,
+                            merge,
+                            this_ptr,
+                        );
+                    }
+                    Intrinsic::ArrayAt => {
+                        let result =
+                            self.emit_raw_call(self.sig_get_name, Helper::ArrayAt, &[this, arg1])?;
+                        self.emit_intrinsic_hit(
+                            result,
+                            Value::hole().bits() as i64,
+                            slow,
+                            merge,
+                            this_ptr,
+                        );
+                    }
+                    Intrinsic::ArrayIncludes => {
+                        let from = if *argc >= 2 {
+                            self.builder.ins().load(
+                                types::I64,
+                                MemFlagsData::new(),
+                                args_ptr,
+                                Offset32::new(8),
+                            )
+                        } else {
+                            self.builder
+                                .ins()
+                                .iconst(types::I64, Value::Undefined.bits() as i64)
+                        };
+                        let result = self.emit_raw_call(
+                            self.sig_binary,
+                            Helper::ArrayIncludes,
+                            &[this, arg1, from],
                         )?;
                         self.emit_intrinsic_hit(
                             result,

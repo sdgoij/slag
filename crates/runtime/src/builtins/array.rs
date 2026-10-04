@@ -159,6 +159,73 @@ pub(crate) fn index_of_dense(object: &Value, search_element: &Value, n: f64) -> 
     Some(-1.0)
 }
 
+/// The dense fast path of `Array.prototype.at`: `Some(element)` for a dense
+/// Array with a present element at the resolved index, `None` when the caller
+/// must run the exact machinery (a hole in range — `Get` walks the prototype
+/// chain — a sparse or non-Array receiver). An out-of-range index is
+/// `undefined` (spec step 5, before any `Get`); `index` is the already-coerced
+/// `ToIntegerOrInfinity`.
+pub(crate) fn at_dense(object: &Value, index: f64) -> Option<Value> {
+    let ValueKind::Object(obj) = object.kind() else {
+        return None;
+    };
+    let ObjectKind::Array(slots) = &obj.kind else {
+        return None;
+    };
+    if !slots.dense.get() {
+        return None;
+    }
+    let length = slots.length.get();
+    let k = if index < 0.0 { length + index } else { index };
+    if k < 0.0 || k >= length {
+        return Some(Value::Undefined);
+    }
+    let elements = slots.elements();
+    let element = elements.get(k as usize).copied()?;
+    if element.is_hole() {
+        return None;
+    }
+    Some(element)
+}
+
+/// The dense fast path of `Array.prototype.includes`: `Some(found)` for a dense
+/// Array whose scanned range has no hole, `None` otherwise (the same fall-back
+/// discipline as [`index_of_dense`], with `SameValueZero` instead of strict
+/// equality, so `NaN` matches `NaN`). `n` is the coerced `ToIntegerOrInfinity`
+/// of `fromIndex`.
+pub(crate) fn includes_dense(object: &Value, search_element: &Value, n: f64) -> Option<bool> {
+    let ValueKind::Object(obj) = object.kind() else {
+        return None;
+    };
+    let ObjectKind::Array(slots) = &obj.kind else {
+        return None;
+    };
+    if !slots.dense.get() {
+        return None;
+    }
+    let length = slots.length.get();
+    if length == 0.0 {
+        return Some(false);
+    }
+    let start = if n >= 0.0 { n } else { (length + n).max(0.0) };
+    if start >= length {
+        return Some(false);
+    }
+    let elements = slots.elements();
+    let mut k = start as u64;
+    while (k as f64) < length {
+        let element = elements
+            .get(k as usize)
+            .copied()
+            .filter(|value| !value.is_hole())?;
+        if crux::ops::same_value_zero(&element, search_element) {
+            return Some(true);
+        }
+        k += 1;
+    }
+    Some(false)
+}
+
 /// The write half of [`dense_own_element`]: write `value` at `index` through
 /// the engine's own dense index write (`JsObject::array_element_write`, the
 /// path `arr[i] = v` takes), or the exact `[[Set]]` when that declines.

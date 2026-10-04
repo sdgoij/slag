@@ -1168,6 +1168,14 @@ pub struct JitSlowPaths {
     /// value; returns the receiver (the spec's return), or the hole sentinel
     /// when the receiver is not a Map. Never errors.
     pub map_set: extern "C" fn(ctx: *mut c_void, this: u64, key: u64, value: u64) -> u64,
+    /// `Step::CallIntrinsic` for `%Array.prototype.at%`: the receiver and the
+    /// index; returns the element (or `undefined`), or the hole sentinel when
+    /// the receiver is not a dense Array. Never errors.
+    pub array_at: extern "C" fn(ctx: *mut c_void, this: u64, index: u64) -> u64,
+    /// `Step::CallIntrinsic` for `%Array.prototype.includes%`: the receiver, the
+    /// search element, and `fromIndex` (or `undefined`); returns a Boolean, or
+    /// the hole sentinel to fall back. Never errors.
+    pub array_includes: extern "C" fn(ctx: *mut c_void, this: u64, search: u64, from: u64) -> u64,
     /// A compiled `GetMemberName` with the `length` atom: the slots length of
     /// an IntegerIndexed receiver, or the canonical-NaN sentinel otherwise
     /// (the machine code falls back to the member-cell probe /
@@ -1346,6 +1354,8 @@ pub static JIT_SLOW_PATHS: JitSlowPaths = JitSlowPaths {
     map_get,
     set_has,
     map_set,
+    array_at,
+    array_includes,
     typed_array_length,
     get_super_base,
     this_value,
@@ -5438,6 +5448,41 @@ extern "C" fn map_set(ctx: *mut c_void, this: u64, key: u64, value: u64) -> u64 
         &Value::from_bits(value),
     ) {
         Some(map) => map.bits(),
+        None => Value::hole().bits(),
+    }
+}
+
+/// `Step::CallIntrinsic` for `%Array.prototype.at%`: the receiver and the index;
+/// returns the element (or `undefined`), or the hole sentinel when the receiver
+/// is not a dense Array (the compiled site takes the general call).
+extern "C" fn array_at(ctx: *mut c_void, this: u64, index: u64) -> u64 {
+    let _ = ctx;
+    let n = match Value::from_bits(index).kind() {
+        ValueKind::Number(x) => crux::convert::to_integer_or_infinity(x),
+        _ => return Value::hole().bits(),
+    };
+    match crate::builtins::array::at_dense(&Value::from_bits(this), n) {
+        Some(value) => value.bits(),
+        None => Value::hole().bits(),
+    }
+}
+
+/// `Step::CallIntrinsic` for `%Array.prototype.includes%`: the receiver, the
+/// search element, and `fromIndex` (or `undefined`); returns a Boolean, or the
+/// hole sentinel to fall back.
+extern "C" fn array_includes(ctx: *mut c_void, this: u64, search: u64, from: u64) -> u64 {
+    let _ = ctx;
+    let n = match Value::from_bits(from).kind() {
+        ValueKind::Number(x) => crux::convert::to_integer_or_infinity(x),
+        ValueKind::Undefined => 0.0,
+        _ => return Value::hole().bits(),
+    };
+    match crate::builtins::array::includes_dense(
+        &Value::from_bits(this),
+        &Value::from_bits(search),
+        n,
+    ) {
+        Some(found) => Value::Boolean(found).bits(),
         None => Value::hole().bits(),
     }
 }

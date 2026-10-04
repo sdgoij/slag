@@ -462,6 +462,8 @@ fn runtime_helpers() -> JitHelpers {
         map_get: Some(rt.map_get),
         set_has: Some(rt.set_has),
         map_set: Some(rt.map_set),
+        array_at: Some(rt.array_at),
+        array_includes: Some(rt.array_includes),
         typed_array_length: Some(rt.typed_array_length),
         get_super_base: Some(rt.get_super_base),
         this_value: Some(rt.this_value),
@@ -708,6 +710,8 @@ mod tests {
             map_get: Some(helpers::test_map_get),
             set_has: Some(helpers::test_set_has),
             map_set: Some(helpers::test_map_set),
+            array_at: Some(helpers::test_array_at),
+            array_includes: Some(helpers::test_array_includes),
             typed_array_length: Some(helpers::test_typed_array_length),
             get_super_base: Some(helpers::test_get_super_base),
             this_value: Some(helpers::test_this_value),
@@ -2704,6 +2708,48 @@ mod tests {
         assert_eq!(
             value, interp,
             "the Map.get/Set.has intrinsic splices must match the interpreter"
+        );
+        assert!(compiled >= 1, "{compiled} bodies");
+    }
+
+    #[test]
+    fn installed_jit_array_at_includes_intrinsics_match_the_interpreter() {
+        // The Stage-B `Array.prototype.at` / `Array.prototype.includes` splices:
+        // dense siblings of `indexOf`. `at` returns the element (or `undefined`),
+        // `includes` a Boolean; both decline (the general call runs) for a hole,
+        // a sparse/non-Array receiver, or a non-Number index/`from`.
+        let source = "var out = [];\n\
+                      function t(v) { out.push(String(v)); }\n\
+                      function tc(f) { try { f(); out.push('no-throw'); } catch (e) { out.push(e instanceof TypeError ? 'TypeError' : 'other'); } }\n\
+                      t([1,2,3,4].at(2)); t([1,2,3,4].at(-1)); t([1,2,3,4].at(-5));\n\
+                      t([1,2,3,4].at(9)); t([1,2,3,4].at(1.9)); t([1,2,3,4].at(-0));\n\
+                      var h = [1,,3]; t(h.at(1)); t(h.includes(undefined));\n\
+                      t([1,2,3,4].includes(4)); t([1,2,3,4].includes(9));\n\
+                      t([NaN].includes(NaN)); t([0].includes(-0)); t(['1'].includes(1));\n\
+                      t([1,2,3,4].includes(3, 3)); t([1,2,3,4].includes(3, 4)); t([1,2,3,4].includes(1, -1));\n\
+                      t(Array.prototype.at.call({length:2, 1:'x'}, 1));\n\
+                      t(Array.prototype.includes.call({length:2, 1:'x'}, 'x'));\n\
+                      tc(function () { Array.prototype.at.call(null, 1); });\n\
+                      var savedA = Array.prototype.at; Array.prototype.at = function () { return 'A'; };\n\
+                      t([1,2,3].at(1));\n\
+                      Array.prototype.at = savedA; t([1,2,3].at(1));\n\
+                      var savedI = Array.prototype.includes; Array.prototype.includes = function () { return 'I'; };\n\
+                      t([1,2,3].includes(2));\n\
+                      Array.prototype.includes = savedI; t([1,2,3].includes(2));\n\
+                      function loop(n) { var a = [1,2,3,4]; var s = 0;\n\
+                        for (var i = 0; i < n; i++) { s = (s + a.at(2)) | 0; s = (s + (a.includes(4) ? 1 : 0)) | 0; }\n\
+                        return s; }\n\
+                      t(loop(1000));\n\
+                      out.join(',');";
+        let interp = {
+            let mut agent = runtime::Agent::new();
+            agent.initialize_host_defined_realm().expect("realm");
+            agent.run_script(source).expect("interp runs")
+        };
+        let (value, compiled) = with_jit_agent(|agent| agent.run_script(source).expect("jit runs"));
+        assert_eq!(
+            value, interp,
+            "the Array.at/includes intrinsic splices must match the interpreter"
         );
         assert!(compiled >= 1, "{compiled} bodies");
     }

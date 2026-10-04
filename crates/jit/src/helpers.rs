@@ -180,6 +180,8 @@ pub enum Helper {
     MapGet,
     SetHas,
     MapSet,
+    ArrayAt,
+    ArrayIncludes,
     TypedArrayLength,
     GetSuperBase,
     ThisValue,
@@ -328,6 +330,8 @@ impl Helper {
             Helper::MapGet => "map_get",
             Helper::SetHas => "set_has",
             Helper::MapSet => "map_set",
+            Helper::ArrayAt => "array_at",
+            Helper::ArrayIncludes => "array_includes",
             Helper::TypedArrayLength => "typed_array_length",
             Helper::GetSuperBase => "get_super_base",
             Helper::ThisValue => "this_value",
@@ -384,6 +388,8 @@ impl Helper {
                 | Helper::ArrayIndexOf
                 | Helper::MapGet
                 | Helper::SetHas
+                | Helper::ArrayAt
+                | Helper::ArrayIncludes
                 | Helper::TypedArrayLength
         )
     }
@@ -835,6 +841,14 @@ pub struct JitHelpers {
     /// `Step::CallIntrinsic` for `%Map.prototype.set%`: `(this, key, value)`;
     /// returns the receiver or the `hole` fall-back sentinel.
     pub map_set: Option<extern "C" fn(vm: *mut c_void, this: u64, key: u64, value: u64) -> u64>,
+    /// `Step::CallIntrinsic` for `%Array.prototype.at%`: `(this, index)`;
+    /// returns the element or the `hole` fall-back sentinel.
+    pub array_at: Option<extern "C" fn(vm: *mut c_void, this: u64, index: u64) -> u64>,
+    /// `Step::CallIntrinsic` for `%Array.prototype.includes%`:
+    /// `(this, search, from)`; returns a Boolean or the `hole` fall-back
+    /// sentinel.
+    pub array_includes:
+        Option<extern "C" fn(vm: *mut c_void, this: u64, search: u64, from: u64) -> u64>,
     /// A compiled `GetMemberName` with the `length` atom on an IntegerIndexed
     /// receiver: the slots length, or a NaN sentinel when the receiver is not
     /// a typed array (the machine code falls back to the member-cell probe /
@@ -1001,6 +1015,8 @@ impl JitHelpers {
             map_get: None,
             set_has: None,
             map_set: None,
+            array_at: None,
+            array_includes: None,
             typed_array_length: None,
             get_super_base: None,
             this_value: None,
@@ -1158,6 +1174,8 @@ impl JitHelpers {
             Helper::MapGet => self.map_get.map(|f| f as usize as u64),
             Helper::SetHas => self.set_has.map(|f| f as usize as u64),
             Helper::MapSet => self.map_set.map(|f| f as usize as u64),
+            Helper::ArrayAt => self.array_at.map(|f| f as usize as u64),
+            Helper::ArrayIncludes => self.array_includes.map(|f| f as usize as u64),
             Helper::TypedArrayLength => self.typed_array_length.map(|f| f as usize as u64),
             Helper::GetSuperBase => self.get_super_base.map(|f| f as usize as u64),
             Helper::ThisValue => self.this_value.map(|f| f as usize as u64),
@@ -1891,6 +1909,19 @@ pub extern "C" fn test_set_has(_vm: *mut c_void, _this: u64, _value: u64) -> u64
 
 pub extern "C" fn test_map_set(_vm: *mut c_void, this: u64, _key: u64, _value: u64) -> u64 {
     this
+}
+
+pub extern "C" fn test_array_at(_vm: *mut c_void, _this: u64, _index: u64) -> u64 {
+    Value::Undefined.bits()
+}
+
+pub extern "C" fn test_array_includes(
+    _vm: *mut c_void,
+    _this: u64,
+    _search: u64,
+    _from: u64,
+) -> u64 {
+    Value::Boolean(false).bits()
 }
 
 /// The typed-array length probe double: the canonical-NaN sentinel (the
