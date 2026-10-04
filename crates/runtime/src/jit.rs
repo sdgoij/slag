@@ -7215,6 +7215,7 @@ mod tests {
     }
 
     fn make_body(steps: Vec<crate::ir::Step>, has_loop: bool) -> std::rc::Rc<CompiledBody> {
+        let max_stack = crate::ir::max_stack_usage(&steps);
         std::rc::Rc::new(CompiledBody {
             steps,
             handlers: Vec::new(),
@@ -7233,6 +7234,7 @@ mod tests {
             has_loop,
             has_call_apply: false,
             has_call_intrinsic: false,
+            max_stack,
         })
     }
 

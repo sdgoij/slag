@@ -150,15 +150,35 @@ The `stage` column maps each increment to `optimizing-tier-plan.md` §6.
 
 | id | stage | content | targets | status |
 |----|-------|---------|---------|--------|
-| I0 | — | IR core: `ir`/`builder`/`verify`/`print` + tests | none (foundation) | built, re-lands under `crates/jit/src/opt/` |
+| I0 | — | IR core: `ir`/`builder`/`verify`/`print` + tests | none (foundation) | **landed** at `crates/jit/src/opt/` |
 | I1 | — | lift (straight-line subset) + identity lowering behind `SLAG_OPT=1` | none (equivalence) | proposed |
 | I2 | — | lift control flow: branches, then simple loops with phis | none (equivalence) | proposed |
 | I3 | O | feedback records + `ICState` valve + retire hook + count probe | none (enabling) | proposed |
-| I4 | B | builtin intrinsic inlining (scalars first, then array/collection) | `math_abs`, `string_charat`, `regexp_test`, `set_has`/`map_get`, `array_indexof`/`slice` | proposed |
+| I4 | B | builtin intrinsic inlining (scalars first, then array/collection) | `regexp_test`, `array_slice`, `string_indexof` | partly landed, outside the IR |
 | I5 | I | trial inlining (caller-specialized records) | `method_call`, `js_call`, `closure_capture`, `hof_methods`, `apply_call` | proposed |
 | I6 | E | escape analysis + scalar replacement | `object_keys`, `typed_array_for_each`, `array_alloc`/`object_alloc`, `destructure`, `construct_churn` | proposed |
 | I7 | L | GVN + LICM + load elimination | `obj_prop`, `prim_prop`, `element_read/write`, `array_at`, `typed_array` | proposed |
 | I8 | T | coarse typer driving guard elision | across I5–I7 | proposed |
+
+Stage B is largely landed already, but not as an increment of this tier: the
+`Step::CallIntrinsic` sweep put `Math.*`, `charCodeAt`, array `indexOf`,
+`Map.get`/`Set.has`/`Map.set` and `at`/`includes`/`push` into the per-step
+path on both engines, retired by a realm `%`-identity check. I4 is therefore
+re-scoped to (a) lowering `CallIntrinsic` to an `opt::Op`, so the passes can
+hoist and sink a landed intrinsic — without this, L and E treat it as an
+opaque `Op::Call` — and (b) the residual rows the by-name, single-identity
+substrate cannot reach: `regexp_test`, `array_slice`, and `string_indexof`,
+which collides with `Array.prototype.indexOf` on the member name and needs a
+multi-identity generalization.
+
+**Ratified 2026-10-04.** Stage C0/C1 (`call-frame-plan.md`) are pulled ahead
+of I and E: I and E — the 20x–234x cluster — are gated on the one-frame
+substrate, and C1 is itself a ~18x call win. S1/S2 (I1/I2) proceed in
+parallel, since their write scope (`crates/jit/src/opt/`) is disjoint from
+the frame code. The feedback substrate is the full per-site record, not the
+guards-straight-to-Cranelift shortcut of the plan's §9.2. Feedback is per
+site; **retirement is per body** — a body aggregates its sites' premises, and
+a dead premise retires the whole body.
 
 Every increment owes the same gate: `cargo clippy --workspace --all-targets
 -- -D warnings`; `cargo test --workspace`; test262 `language` and
@@ -198,6 +218,10 @@ the corpus writes; a TSV that outlives its binary is already a known trap.
   throughout; the JIT is faster, never different.
 
 ## 9. Immediate next increment (I1), in full
+
+Ordering note (2026-10-04): C0 (`call-frame-plan.md` §4, "Stage C0 detail")
+lands first; I1/S1 below runs in parallel with it, and I3 (the per-site
+feedback record) is no longer gated behind Stage B.
 
 - `crates/jit/src/opt/lift/mod.rs`: `pub fn lift(body: &CompiledBody) -> Result<Function, Unsupported>`.
 - Subset for I1: `Push`/`Pop`/`Dup`, `LoadLocal`/`StoreLocal`/`InitLocal`,

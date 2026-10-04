@@ -1903,6 +1903,11 @@ pub struct CompiledBody {
     /// per-run context snapshots the realm's intrinsic identity bits only for
     /// such bodies.
     pub has_call_intrinsic: bool,
+    /// The body's maximum value-stack depth above its entry stack pointer, in
+    /// slots (see [`max_stack_usage`]). Computed once at compile time so the
+    /// JIT can size its working area and the interpreter can bound an
+    /// activation's stack growth without recomputing it per call.
+    pub max_stack: usize,
 }
 
 impl CompiledBody {
@@ -22464,6 +22469,251 @@ pub fn is_compound_assign(op: &AssignOp) -> bool {
     )
 }
 
+/// The body's maximum value-stack depth above its entry stack pointer, in
+/// slots. Stored on [`CompiledBody`] so the JIT can size its working area and
+/// the interpreter can bound an activation's stack growth without recomputing
+/// it per call.
+///
+/// A conservative straight-line bound: the compiler emits balanced push/pop
+/// pairs (the interpreter's own stack discipline keeps every loop body
+/// balanced, so the first-pass depth at a loop head is the depth each
+/// iteration sees), and a `RunRegBody` truncates its transient use back to the
+/// entry depth.
+///
+/// The catch-all is deliberate: steps the JIT never compiles contribute
+/// nothing. That is exact for the JIT (it bails before consulting this), but it
+/// is only an upper bound over JIT-compilable steps, so a consumer that runs
+/// *interpreted* bodies off it must first confirm every step is modeled.
+pub fn max_stack_usage(steps: &[Step]) -> usize {
+    let mut depth = 0usize;
+    let mut max = 0usize;
+    for step in steps {
+        match step {
+            Step::Push(_) | Step::Dup | Step::PushAcc => depth += 1,
+            Step::Pop => depth = depth.saturating_sub(1),
+            // Two operands in, one result out.
+            Step::Binary(_) | Step::BinaryImm { .. } => depth = depth.saturating_sub(1),
+            // The test pops; the keep variants leave the value.
+            Step::JumpIfFalse(_) | Step::JumpIfTrue(_) => depth = depth.saturating_sub(1),
+            // The hoist guard pops the receiver and pushes the length back on
+            // a probe hit (net 0); the miss jumps to a fresh evaluation.
+            Step::TypedArrayLengthHoist { .. } => {}
+            // LICM: the guard reads/writes frame slots only (no stack effect).
+            Step::HoistMemberGuard { .. } => {}
+            Step::HoistGlobalGuard { .. } => {}
+            // A store consumes the value; `UpdateLocal` pushes its result.
+            Step::StoreLocal { .. } | Step::FusedStoreLocal { .. } | Step::InitLocal { .. } => {
+                depth = depth.saturating_sub(1)
+            }
+            Step::UpdateLocal { .. } => depth += 1,
+            // `SetCompletion` pops the statement's value (the interpreter's
+            // handler does; a JIT no-op would accumulate one slot per
+            // statement inside a loop).
+            Step::SetCompletion => depth = depth.saturating_sub(1),
+            // Capture-context steps: a read pushes; a write pops; the fused
+            // update pushes its result. Per-iteration steps mirror them.
+            Step::LoadContextSlot { .. }
+            | Step::UpdateContextSlot { .. }
+            | Step::LoadPerIteration { .. }
+            | Step::UpdatePerIteration { .. } => depth += 1,
+            Step::StoreContextSlot { .. }
+            | Step::InitContextSlot { .. }
+            | Step::StorePerIteration { .. } => depth = depth.saturating_sub(1),
+            // Member read: pop, push the result back. Member writes pop the
+            // object + value (and the cached old value for a compound op) and
+            // push the stored value back.
+            Step::GetMemberName { .. } => {}
+            Step::GetMemberComputed => depth = depth.saturating_sub(1),
+            Step::AssignMemberName { op, .. } => {
+                let popped = if is_compound_assign(op) { 3 } else { 2 };
+                depth = depth.saturating_sub(popped).saturating_add(1);
+            }
+            Step::AssignMemberComputed { op } => {
+                let popped = if is_compound_assign(op) { 4 } else { 3 };
+                depth = depth.saturating_sub(popped).saturating_add(1);
+            }
+            // Super property access (Cut 61): `GetSuperBase`/`ThisValue`
+            // push the base/this; the reads pop the base(+key) and push the
+            // value back (net 0 / -1); the Keep pops the duplicated pair +
+            // write-copy key, advances past the converted key, and pushes the
+            // value (net -1); the assigns mirror the member forms; the
+            // updates pop old(+key)+base and push the result; the computed
+            // reference resolve consumes base+key into the reference stack;
+            // the name form and `DeleteSuper` leave the work stack as-is.
+            Step::GetSuperBase | Step::ThisValue => depth += 1,
+            Step::GetSuperName { .. } => {}
+            Step::GetSuperComputed | Step::GetSuperComputedKeep => depth = depth.saturating_sub(1),
+            Step::AssignSuperName { op, .. } => {
+                let popped = if is_compound_assign(op) { 3 } else { 2 };
+                depth = depth.saturating_sub(popped).saturating_add(1);
+            }
+            Step::AssignSuperComputed { op } => {
+                let popped = if is_compound_assign(op) { 4 } else { 3 };
+                depth = depth.saturating_sub(popped).saturating_add(1);
+            }
+            Step::UpdateSuperName { .. } => depth = depth.saturating_sub(1),
+            Step::UpdateSuperComputed { .. } => depth = depth.saturating_sub(2),
+            Step::DeleteSuper | Step::ResolveSuperRefName { .. } => {}
+            Step::ResolveSuperRefComputed => depth = depth.saturating_sub(2),
+            // The register body's transient pushes (each `PushAcc`) are
+            // unwound by the entry-depth truncate.
+            Step::RunRegBody { ops } => {
+                let transient = ops
+                    .iter()
+                    .filter(|op| matches!(op, LeafOp::PushAcc))
+                    .count();
+                max = max.max(depth + transient);
+            }
+            // The call pops `this` + callee + `argc` args and pushes the
+            // result.
+            Step::CallFast { argc, .. } => {
+                depth = depth.saturating_sub(*argc as usize + 2).saturating_add(1);
+            }
+            Step::CallIntrinsic { argc, .. } => {
+                depth = depth.saturating_sub(*argc as usize + 2).saturating_add(1);
+            }
+            // The compiled apply/call step pops the same region and pushes
+            // the result. M10: the intrinsic fast path additionally copies a
+            // dense `argArray`'s elements (up to `JIT_APPLY_MAX_ARGS` slots)
+            // above the current stack top before the in-frame leaf run —
+            // reserve the room or the copy always bails to the slow path
+            // (the leaf's own frame/work fit in the slack beyond the
+            // reserve, and the probe rejects a larger leaf).
+            Step::CallApply { argc, .. } => {
+                max = max.max(depth + crate::jit::JIT_APPLY_MAX_ARGS);
+                depth = depth.saturating_sub(*argc as usize + 2).saturating_add(1);
+            }
+            // The vector form (Cut 49): `ArgsPush`/`ArgsSpread` consume the
+            // value (it goes into the Vm's argument vector, not the work
+            // stack); the vector `Call` pops `this` + callee and pushes the
+            // result; the vector `TailCall` pops both and terminates.
+            Step::ArgsPush | Step::ArgsSpread => depth = depth.saturating_sub(1),
+            Step::Call { .. } => depth = depth.saturating_sub(1),
+            Step::TailCall { .. } => depth = depth.saturating_sub(2),
+            // The vector-form construct: `[callee]` on the work stack (the
+            // arguments are in the Vm's vector), popped and replaced by the
+            // result — net 0.
+            Step::Construct { .. } => {}
+            // A tagged template pops the tag + its `this` (2) and pushes the
+            // result (1) — net -1.
+            Step::TaggedTemplate(_) | Step::TailTaggedTemplate(_) => {
+                depth = depth.saturating_sub(1)
+            }
+            // Array literals (Cut 52): `ArrayBegin` pushes the array;
+            // `ArrayElement`/`ArraySpread` pop the element(s) + the array and
+            // push the array back; `ArrayHole`/`ArrayEnd` keep the array on
+            // the stack.
+            Step::ArrayBegin => depth += 1,
+            Step::ArrayElement | Step::ArraySpread => {
+                depth = depth.saturating_sub(2).saturating_add(1)
+            }
+            Step::ArrayHole | Step::ArrayEnd => {}
+            // Object literals (Cut 53): `ObjectBegin` pushes the object; an
+            // `Init` pops its value(s) + the object and pushes it back; the
+            // method/accessor/key/spread steps keep it net-neutral or pop
+            // the property's value.
+            Step::ObjectBegin => depth += 1,
+            // Cut 72: the value expressions pushed `names.len()` values;
+            // ObjectFast pops them all and pushes the object.
+            Step::ObjectFast { names } => {
+                depth = depth.saturating_sub(names.len()).saturating_add(1)
+            }
+            Step::ObjectInitName { .. }
+            | Step::ObjectMethodComputed { .. }
+            | Step::ObjectAccessorComputed { .. }
+            | Step::ObjectSpread => depth = depth.saturating_sub(2).saturating_add(1),
+            Step::ObjectInitComputed { .. } => depth = depth.saturating_sub(3).saturating_add(1),
+            Step::ObjectKeyToPropertyKey
+            | Step::ObjectMethodName { .. }
+            | Step::ObjectAccessorName { .. } => {}
+            // String literals (Cut 54): `PushStr` pushes the literal;
+            // `ConcatStr` pops the value + accumulator and pushes the
+            // concatenation; `ConcatStrConst` swaps the accumulator for the
+            // concatenation.
+            Step::PushStr(_) => depth += 1,
+            Step::ConcatStr => depth = depth.saturating_sub(2).saturating_add(1),
+            Step::ConcatStrConst(_) => {}
+            // The fused slot call pops `argc` args (the callee is the
+            // frame slot) and pushes the result.
+            Step::CallFastSlot { argc, .. } | Step::CallFastGlobal { argc, .. } => {
+                depth = depth.saturating_sub(*argc as usize).saturating_add(1);
+            }
+            // The fused `x = f(args)` stores (Cut 65): the materialized arg
+            // slots transiently raise the depth; the call replaces them with
+            // the result and the store pops it (net 0).
+            Step::CallFastSlotStore { arg_slots, .. }
+            | Step::CallFastGlobalStore { arg_slots, .. } => {
+                depth += arg_slots.len();
+                depth = depth
+                    .saturating_sub(arg_slots.len())
+                    .saturating_add(1)
+                    .saturating_sub(1);
+            }
+            // A global read pushes the value; a global write consumes it.
+            Step::LoadGlobal { .. } => depth += 1,
+            Step::StoreGlobal { .. } | Step::FusedStoreGlobal { .. } => {
+                depth = depth.saturating_sub(1)
+            }
+            // The identifier read pushes; a reference write pops and
+            // re-pushes (net 0); the identifier update pops and re-pushes.
+            Step::TypeofIdent { .. } => depth += 1,
+            Step::LoadIdent { .. } => depth += 1,
+            Step::ResolveVarIdent { .. } => {}
+            Step::PutVarReference => {}
+            Step::UpdateIdent { .. } => {}
+            // The reference machinery: `GetVarReference` pushes the value;
+            // the update pops the old and pushes the result (net 0); the
+            // compound pops both and pushes the result (net -1).
+            Step::GetVarReference => depth += 1,
+            Step::UpdateVarReference { .. } => {}
+            Step::PutVarReferenceOp { .. } => depth = depth.saturating_sub(1),
+            Step::PopVarReference => {}
+            // Control steps (Cut 55): `Return`/`Throw` pop their value; the
+            // transfers (`Exit`/`Break`/`Continue`/`FinallyEnd`) and the
+            // try/block machinery leave the stack as-is.
+            Step::Return | Step::Throw { .. } => depth = depth.saturating_sub(1),
+            // Switch steps (Cut 56): `SwitchDisc` and `SwitchTest` pop.
+            Step::SwitchDisc | Step::SwitchTest { .. } => depth = depth.saturating_sub(1),
+            // for-in/for-of machinery (Cut 57): `ForInBegin`/`ForOfBegin`
+            // pop the RHS; the fetch steps push the element (the `done`
+            // path pushes nothing — the worst case bounds the working
+            // area); `ForOfNextBindLocal` lands it in a frame slot; the
+            // bind steps pop it; the env-creation steps and `ForOfClose`
+            // leave the value stack as-is.
+            Step::ForInBegin | Step::ForOfBegin { .. } => depth = depth.saturating_sub(1),
+            Step::ForInNext { .. } | Step::ForOfNext { .. } => depth += 1,
+            Step::ForOfNextBindLocal { .. } => {}
+            Step::ForOfBindLocal { .. } | Step::ForOfBindGlobal { .. } => {
+                depth = depth.saturating_sub(1)
+            }
+            Step::ForOfClose | Step::EnterPerIteration { .. } | Step::PerIteration { .. } => {}
+            // Suspension (Cut 58): `Yield`/`Await` pop the value into the
+            // suspension payload (the saved region is what's below).
+            Step::Yield { .. } | Step::Await { .. } => depth = depth.saturating_sub(1),
+            // Destructuring (Cut 59): `DestructureBegin`/`DestructureObjCoercible`
+            // pop the value onto the Vm's pattern stacks; `DestructureNext`/
+            // `DestructureRest`/`DestructureObjKey`/`DestructureObjKeyGet`/
+            // `DestructureObjRest` push the element/key/rest value;
+            // `DestructureObjKeyComputed` swaps key for value; the close/end
+            // steps are net-neutral.
+            Step::DestructureBegin => depth = depth.saturating_sub(1),
+            Step::DestructureNext => depth += 1,
+            Step::DestructureUndef { .. } => {}
+            Step::DestructureRest => depth += 1,
+            Step::DestructureObjCoercible => depth = depth.saturating_sub(1),
+            Step::DestructureObjKey { .. } => depth += 1,
+            Step::DestructureObjKeyComputed => {}
+            Step::DestructureObjKeyStore => depth = depth.saturating_sub(1),
+            Step::DestructureObjKeyGet => depth += 1,
+            Step::DestructureObjRest { .. } => depth += 1,
+            Step::DestructureClose | Step::DestructureObjEnd => {}
+            _ => {}
+        }
+        max = max.max(depth);
+    }
+    max
+}
+
 /// The continue target of a labelled statement, when it is a loop.
 fn labeled_continue_target(body: &Stmt) -> Option<(usize, usize)> {
     // The label scope is resolved against the loop scope when the loop is
@@ -24638,6 +24888,7 @@ pub fn compile_body(
     let has_call_apply = body_has_call_apply(&compiler.steps);
     let has_call_intrinsic = body_has_call_intrinsic(&compiler.steps);
     let ident_names = collect_ident_names(&compiler.steps);
+    let max_stack = max_stack_usage(&compiler.steps);
     Ok((
         CompiledBody {
             steps: compiler.steps,
@@ -24657,6 +24908,7 @@ pub fn compile_body(
             has_loop,
             has_call_apply,
             has_call_intrinsic,
+            max_stack,
         },
         compiler.this_writes,
     ))
@@ -24720,6 +24972,7 @@ pub fn compile_statements(
     let has_call_apply = body_has_call_apply(&compiler.steps);
     let has_call_intrinsic = body_has_call_intrinsic(&compiler.steps);
     let ident_names = collect_ident_names(&compiler.steps);
+    let max_stack = max_stack_usage(&compiler.steps);
     Ok(CompiledBody {
         steps: compiler.steps,
         handlers: compiler.handlers,
@@ -24740,6 +24993,7 @@ pub fn compile_statements(
         has_loop,
         has_call_apply,
         has_call_intrinsic,
+        max_stack,
     })
 }
 

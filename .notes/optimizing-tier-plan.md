@@ -23,6 +23,8 @@ The 2026-10-03 re-baseline against the SpiderMonkey js shell (`tools/corpus/sm-a
 | `array_alloc` / `object_alloc` | 20x | escape analysis removes the allocation |
 | `method_call` / `js_call` | 6x / 3.6x | inlines the callee |
 
+`array_at`'s 139x is a constant-fold artifact, not a structural target: the varying probe below shows SM leaves `Array.prototype.at` a generic call (1.06x), exactly like us. The structural rows are the rest of the column.
+
 ### It is not folding — it is specialization
 
 The obvious hypothesis, that SM merely constant-folds the toy rows, is wrong, and the probe that shows it is the point of this section. Const/varying pairs:
@@ -131,10 +133,12 @@ Design decisions, each grounded above:
 
 Each stage is probe-first, lands on both engines where applicable, and owes the full gate. Order matters: O gates B, I, E, L; B is the first measured win; C0/C1 (`call-frame-plan.md`) gate I and E.
 
+**Ratified 2026-10-04.** C0/C1 are pulled ahead of I and E — they gate the 20x–234x cluster and C1 is itself a ~18x call win — with the IR lift (S1/S2) in parallel. Stage B is largely landed already, as the per-step `CallIntrinsic` sweep rather than an IR increment, so the B row below is the residual plus lowering `CallIntrinsic` into the IR.
+
 | stage | content | measured targets (2026-10-03) | needs |
 |---|---|---|---|
 | **O** | per-site feedback records (CacheIR-shaped data) + `ICState` valve + the retire hook | none (enabling) | — |
-| **B** | builtin intrinsic inlining (scalar intrinsics first, then array/collection) | `math_abs` 72x, `string_charat` 65x, `regexp_test` 31x, `set_has`/`map_get` ~29x, `array_indexof`, `array_slice` | O |
+| **B** | builtin intrinsic inlining (scalar intrinsics first, then array/collection) — the per-step `CallIntrinsic` sweep landed `math_abs`, `string_charat`, `set_has`/`map_get`, `array_indexof`; residual moves into the IR | `regexp_test` 31x, `array_slice` 33x, `string_indexof` | O |
 | **I** | trial inlining: caller-specialized records, inline a monomorphic callee's Steps under a size budget, recursing | `method_call` 6x, `js_call` 3.6x, `proto_method_call`, `own_builtin_call`, hof rows | O, C1 |
 | **E** | escape analysis + scalar replacement (non-speculative: no `Recover_*` needed) | `object_keys` 234x, `typed_array_for_each` 46x, `array_alloc`/`object_alloc` 20x, `destructure`, `construct_churn`, `json_*` | I |
 | **L** | GVN + LICM + load elimination over the SSA IR, with a `clobberize`-style effect oracle | `obj_prop` 23x, `prim_prop` 24x, `element_read/write`, `array_at` | O |

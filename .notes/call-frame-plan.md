@@ -174,6 +174,59 @@ new part is the recursive entry/exit and the per-frame watermarks. Probe:
 the `non-leaf call` row and `recursive_fib`, isolated A/B, plus
 `--gc-stress` and the six sweeps.
 
+**Stage C0 detail (the substrate).** C0 makes the compiled body's working
+region *be* `vm.stack`, so the frame and the operand stack are one described
+region both engines address. Today `run_jit_body` hands the entry a
+`frame_ptr` into the fixed `Frame` enum and a `work_ptr` into a private
+buffer (`crates/runtime/src/jit.rs:6363`, rooted by `with_jit_run` through
+`jit_roots`); `run_jit_leaf` does the same. The only reason for the private
+buffer is the reallocation hazard: a helper gets `&mut Vm` and may
+push/realloc `vm.stack`, so a raw pointer into `vm.stack` held across a
+helper call would dangle. The frame slots already prove the pattern is
+viable — the interpreter leaf addresses a flat `vm.stack` segment through
+`leaf_frame_base` (`Vm::frame_get`, `crates/runtime/src/ir.rs:4037`), and
+`DISPATCH_DEOPT` already spills the working region into `vm.stack`.
+
+The one mechanism C0 must settle first is how the compiled code survives a
+realloc. This is the decision the stage turns on:
+
+1. **Stable region (recommended).** Cap `vm.stack` so it never reallocates and
+   a baked pointer stays valid, as the entry ABI assumes today. The cap is not
+   enforced per push — `vm.stack.push` is scattered across the interpreter and
+   the builtins, so a per-push bound is invasive — but at *activation*
+   granularity: at each call entry, the current depth plus the frame's maximum
+   value-stack use must fit under the cap, else the entry throws the same
+   `RangeError` the native-stack guard does. That is a handful of check sites
+   (the interpreter call path, `run_jit_body`, `run_jit_leaf`,
+   `run_compiled_body`), and it keeps the entry ABI unchanged. It needs each
+   body's maximum value-stack use known to the interpreter too, which today
+   only `max_stack_usage` computes, for the JIT.
+2. **Base as an index.** Keep `vm.stack` a growing `Vec` and re-derive the
+   working base from `(vm.stack.as_ptr(), work_base)` at each use — the shape
+   `frame_get` already uses for the leaf frame. Robust, but every stack access
+   pays a reload, so it is a codegen-wide change.
+
+Sub-steps, each independently landable and gated on corpus equivalence plus
+`--gc-stress`/`--nursery-stress`/the six sweeps with no row regress:
+
+- **C0a — the working region moves onto `vm.stack` at the top level.**
+  `run_jit_body` reserves the body's `stack_usage + slack` above the caller's
+  `sp` and hands the entry that base (per the mechanism above); the compiled
+  frame becomes a `vm.stack` segment, so `frame_get`'s `Frame::Inline/Heap`
+  arm serves only the interpreter's own active body. Behavior-neutral.
+- **C0b — the leaf lane unifies.** `run_jit_leaf` uses the same base and drops
+  its private buffer, so the working base and `leaf_frame_base` are one
+  offset.
+- **C0c — the buffer and its root retire.** Delete `INLINE_JIT_BUF`, the
+  `inline_work`/`heap_work` pair, and the working-area `jit_roots`
+  registration: the region is `vm.stack`, traced with the Vm.
+- **C0d — suspension/resume.** `jit_work`'s save and restore read and write a
+  slice of `vm.stack`; the resume path re-derives the base.
+
+C0 lands nothing measurable by itself; it removes the buffer so C1 can push
+nested frames on the same region. Probe: the corpus at parity, and the
+private-buffer allocation count under a recursion workload (should be zero).
+
 ## 5. Traps
 
 - **Per-frame state is the whole difficulty.** `Vm` carries ~15 per-activation

@@ -562,6 +562,7 @@ mod tests {
     }
 
     fn make_body(steps: Vec<Step>, frame_size: usize) -> CompiledBody {
+        let max_stack = runtime::ir::max_stack_usage(&steps);
         CompiledBody {
             steps,
             handlers: Vec::new(),
@@ -580,6 +581,7 @@ mod tests {
             has_loop: false,
             has_call_apply: false,
             has_call_intrinsic: false,
+            max_stack,
         }
     }
 
