@@ -38,8 +38,9 @@ use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Variable};
 use crux::Value;
 use runtime::ir::{
     ApplyKind, COMPUTED_READ_CELLS, COMPUTED_READ_INDEX_MUL, COMPUTED_READ_INDEX_SHIFT,
-    CompiledBody, ComputedReadCell, FastLoopVar, GLOBAL_CELLS, LeafOp, MEMBER_CELLS, MemberMapCell,
-    MemberValueCell, NumRhs, RegOperand, RelLimit, ScopeInfo, Step, TryFrame, is_compound_assign,
+    CompiledBody, ComputedReadCell, FastLoopVar, GLOBAL_CELLS, IntRhs, LeafOp, MEMBER_CELLS,
+    MemberMapCell, MemberValueCell, NumRhs, RegOperand, RelLimit, ScopeInfo, Step, TryFrame,
+    is_compound_assign,
 };
 use runtime::jit::{
     AGENT_REALM_COUNT_OFFSET, BUILDER_BUF_OFFSET, BUILDER_CAP_OFFSET, BUILDER_ENABLED_OFFSET,
@@ -866,6 +867,11 @@ struct Lowerer<'a> {
     /// (at most one under v1), seeded at the loop's `FastLoopBind` and flushed
     /// at its `FastLoopStore`.
     num_slots: Vec<NumSlot>,
+    /// The int32 lane's slots (`LeafOp::BinStoreInt`), kept in i32 registers.
+    /// Detected from the body itself (no `Step` field): a slot named by a
+    /// `BinStoreInt` op, seeded/flushed from the same frame word as the Number
+    /// lane.
+    int_slots: Vec<NumSlot>,
     // NaN-boxing bit patterns (see `crux::value`).
     /// The `(vm, callee, this, argc, args, direct_eval) -> value` signature
     /// of the tail-call helper (Cut 45).
@@ -1001,6 +1007,23 @@ impl<'a> Lowerer<'a> {
                 var: builder.declare_var(types::F64),
             })
             .collect();
+        // The int32 lane's slots, from the body's `BinStoreInt` ops (each names
+        // a slot kept in an i32 register).
+        let mut int_slots: Vec<NumSlot> = Vec::new();
+        for step in &body.steps {
+            if let Step::RunRegBody { ops } = step {
+                for op in ops.iter() {
+                    if let LeafOp::BinStoreInt { slot, .. } = op
+                        && !int_slots.iter().any(|s| s.slot == *slot)
+                    {
+                        int_slots.push(NumSlot {
+                            slot: *slot,
+                            var: builder.declare_var(types::I32),
+                        });
+                    }
+                }
+            }
+        }
         let mut suspension_targets = Vec::new();
         for (index, step) in body.steps.iter().enumerate() {
             if matches!(step, Step::Yield { .. } | Step::Await { .. }) {
@@ -1098,6 +1121,7 @@ impl<'a> Lowerer<'a> {
             acc_is_number: false,
             acc_bits_valid: true,
             num_slots,
+            int_slots,
             undef_bits: Value::Undefined.bits() as i64,
             null_bits: Value::Null.bits() as i64,
             false_bits: Value::Boolean(false).bits() as i64,
@@ -5812,14 +5836,22 @@ impl<'a> Lowerer<'a> {
             Step::FastLoopBind { var, num } => {
                 self.emit_fast_loop_bind(*var)?;
                 if let Some(slot) = num {
-                    self.seed_num_slot(*slot);
+                    if self.int_slot_var(*slot).is_some() {
+                        self.seed_int_slot(*slot);
+                    } else {
+                        self.seed_num_slot(*slot);
+                    }
                 }
                 self.fall_through(index);
             }
             Step::FastLoopStore { var, num } => {
                 self.emit_fast_loop_store(*var)?;
                 if let Some(slot) = num {
-                    self.flush_num_slot(*slot);
+                    if self.int_slot_var(*slot).is_some() {
+                        self.flush_int_slot(*slot);
+                    } else {
+                        self.flush_num_slot(*slot);
+                    }
                 }
                 self.fall_through(index);
             }
@@ -8807,6 +8839,46 @@ impl<'a> Lowerer<'a> {
         self.store_slot(slot, value);
     }
 
+    fn int_slot_var(&self, slot: usize) -> Option<Variable> {
+        self.int_slots
+            .iter()
+            .find(|num| num.slot == slot)
+            .map(|num| num.var)
+    }
+
+    /// Seed the int32 register for `slot` from the frame word (a Number the
+    /// plan proved int32-valued).
+    fn seed_int_slot(&mut self, slot: usize) {
+        let Some(var) = self.int_slot_var(slot) else {
+            return;
+        };
+        let bits = self.load_slot(slot);
+        let num = self
+            .builder
+            .ins()
+            .bitcast(types::F64, MemFlagsData::new(), bits);
+        let wide = self.builder.ins().fcvt_to_sint_sat(types::I64, num);
+        let int = self.builder.ins().ireduce(types::I32, wide);
+        self.builder.def_var(var, int);
+    }
+
+    /// Flush the int32 register for `slot` back to the frame as a canonical
+    /// `Value::Number`.
+    fn flush_int_slot(&mut self, slot: usize) {
+        let Some(var) = self.int_slot_var(slot) else {
+            return;
+        };
+        let int = self.builder.use_var(var);
+        let wide = self.builder.ins().sextend(types::I64, int);
+        let num = self.builder.ins().fcvt_from_sint(types::F64, wide);
+        let bits = self
+            .builder
+            .ins()
+            .bitcast(types::I64, MemFlagsData::new(), num);
+        let value = self.canon(bits);
+        self.store_slot(slot, value);
+    }
+
     /// Slice B (Route A): `var = var fop acc`, the result re-canonicalized into
     /// the accumulator. Both operands are proven Numbers, so no tag check and
     /// no slow path are emitted.
@@ -9220,6 +9292,48 @@ impl<'a> Lowerer<'a> {
                 } else {
                     return Err(Unsupported::Step("BinStoreNum without a plan"));
                 }
+            }
+            LeafOp::BinStoreInt {
+                op,
+                rhs,
+                slot,
+                mask,
+            } => {
+                // Route B (int32): the accumulator lives in an i32 register; the
+                // plan proved the seed and rhs int32, so a wrapping i32 op is
+                // exactly the spec's `ToInt32`.
+                let Some(var) = self.int_slot_var(*slot) else {
+                    return Err(Unsupported::Step("BinStoreInt without a plan"));
+                };
+                let left = self.builder.use_var(var);
+                let right = match rhs {
+                    IntRhs::Imm(i) => self.builder.ins().iconst(types::I32, *i as i64),
+                    IntRhs::Counter => {
+                        // The counter is an f64 (shared with the loop head) and
+                        // in int32 range by the plan's proof.
+                        let counter = self.builder.use_var(self.counter_var);
+                        let wide = self.builder.ins().fcvt_to_sint_sat(types::I64, counter);
+                        self.builder.ins().ireduce(types::I32, wide)
+                    }
+                };
+                let wrapped = match op {
+                    BinaryOp::Add => self.builder.ins().iadd(left, right),
+                    BinaryOp::Sub => self.builder.ins().isub(left, right),
+                    BinaryOp::Mul => self.builder.ins().imul(left, right),
+                    _ => return Err(Unsupported::Step("non-int BinStoreInt")),
+                };
+                let res = if *mask == -1 {
+                    wrapped
+                } else {
+                    let m = self.builder.ins().iconst(types::I32, *mask as i64);
+                    self.builder.ins().band(wrapped, m)
+                };
+                self.builder.def_var(var, res);
+                // acc = the result as a deferred Number (materialized only if
+                // consumed); the source value is an integer Number.
+                let wide = self.builder.ins().sextend(types::I64, res);
+                let res_f = self.builder.ins().fcvt_from_sint(types::F64, wide);
+                self.set_acc_num(res_f);
             }
             LeafOp::StoreReg { slot, tdz } => {
                 if *tdz {

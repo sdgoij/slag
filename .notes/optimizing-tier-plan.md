@@ -152,6 +152,8 @@ Each stage is probe-first, lands on both engines where applicable, and owes the 
 
 **Stage T — the typer.** A small lattice on SSA values to eliminate redundant guards and pick representations. Probe: the guard count per site.
 
+**Outside this plan: the baseline numeric lowering.** `perf-findings.md` §2 covers a hole the stages do not. The int32 gap is **not** a missing operator — G9 already inlined the six integer ops; it is that the fast register lane (`plan_loop_num`/`rhs_recipe`/`NumRhs`) is f64-only, so a bitwise-wrapped RMW never enters it and the inline's per-op range guard plus the `Value` round-trip are paid every iteration. **A1 landed 2026-10-03**: `plan_loop_int` runs `s = (s <arith> rhs) | 0` / `& mask` as wrapping i32 in the shared `loop_num` register (7.1 → 2.75 ns), guarded-free because the plan proves the rhs int32. A2 (a guarded rhs for a slot or an unbounded counter) remains. `%` is not inlined by design (cranelift 0.134 has no `frem`); a faster `%` needs a direct helper and, for SM parity, an integer `srem` path.
+
 **Deferred, deliberately:** off-thread compilation (SM §3.4) and OSR *entry* until a function-level tier is at its ceiling; a mid-tier until compile time is the constraint; any engine-global type inference (SM deleted it); and the backend work (a top tier, not a swap) until the front end is closed.
 
 ## 7. Traps
@@ -185,4 +187,5 @@ Each stage is probe-first, lands on both engines where applicable, and owes the 
 - **`call-frame-plan.md`** supplies the invariant this plan leans on (one frame) and the context target (§3.6, the wasm `Instance`). C0/C1 gate stages I and E.
 - **`jit-quality-plan.md`** is the executed predecessor; its §6 "not a TurboFan rewrite" boundary is superseded here, as the earlier draft said, with SM as the reference.
 - **`spidermonkey-study.md`** and **`spidermonkey-wasm.md`** are the source notes for §3.
-- **`optimizing-tier-impl.md`** is the engineering companion and still places the IR crate at `crates/opt`; that crate was rejected, and the IR lives inside `crates/jit/src/opt/`.
+- **`perf-findings.md`** is the wider gap map and the baseline numeric hole (§2 above) that sits outside the stage order.
+- **`optimizing-tier-impl.md`** is the engineering companion; it is reconciled with this plan (the IR lives at `crates/jit/src/opt/`, the increments carry the stage letters, and I0 has landed).

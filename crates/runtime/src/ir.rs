@@ -1236,6 +1236,19 @@ pub enum NumRhs {
     Slot(usize),
 }
 
+/// The right operand of an int32 loop-carried slot's RMW
+/// ([`LeafOp::BinStoreInt`]). A1 admits only a form the plan can prove holds an
+/// int32 throughout the loop, so the wrapping i32 op needs no per-iteration
+/// guard; A2 will add a guarded form on the same op.
+#[derive(Debug, Clone, Copy)]
+pub enum IntRhs {
+    /// An int32 literal.
+    Imm(i32),
+    /// The fused loop counter, proven to stay in int32 range (an ascending
+    /// loop to an int32-immediate limit from an int32 seed).
+    Counter,
+}
+
 /// A register instruction for a *leaf* body (Cut 35 slice 1). The step path
 /// round-trips the value stack for every expression; these ops target a
 /// single accumulator (`Vm.acc`) plus the leaf's frame segment, capture
@@ -1463,6 +1476,18 @@ pub enum LeafOp {
         op: BinaryOp,
         slot: usize,
         rhs: NumRhs,
+    },
+    /// `loop_num = (i32(loop_num) op rhs) & mask`; the int32 counterpart of
+    /// [`LeafOp::BinStoreNum`]. The plan proved the rhs and the seed are int32,
+    /// so the wrapping op is exactly the spec's `ToInt32(slot op rhs)`; `mask`
+    /// is the source's trailing truncation (`| 0` is `-1`, `& m` is `m`). The
+    /// accumulator stays an int32-valued f64 in `Vm::loop_num` (the same
+    /// register), so the bind and store paths are shared with the Number lane.
+    BinStoreInt {
+        op: BinaryOp,
+        slot: usize,
+        rhs: IntRhs,
+        mask: i32,
     },
     /// Complete with `Completion::Return(acc)`.
     ReturnAcc,
@@ -11599,6 +11624,25 @@ impl Vm {
                         }
                     }
                 }
+                LeafOp::BinStoreInt { op, rhs, mask, .. } => {
+                    // Route B (int32): the accumulator is an int32-valued f64 in
+                    // `Vm::loop_num`; the plan proved the seed and rhs int32, so
+                    // wrapping i32 is the spec's `ToInt32` and the source's
+                    // trailing truncation is the mask AND.
+                    let left = self.loop_num as i32;
+                    let right = match rhs {
+                        IntRhs::Imm(i) => *i,
+                        IntRhs::Counter => self.loop_counter as i32,
+                    };
+                    let wrapped = match op {
+                        BinaryOp::Add => left.wrapping_add(right),
+                        BinaryOp::Sub => left.wrapping_sub(right),
+                        BinaryOp::Mul => left.wrapping_mul(right),
+                        _ => unreachable!("plan_loop_int admits only is_int_wrap ops"),
+                    };
+                    self.loop_num = (wrapped & *mask) as f64;
+                    self.acc = Value::Number(self.loop_num);
+                }
                 LeafOp::ReturnAcc => {
                     return Ok(Completion::Return(self.acc));
                 }
@@ -18107,6 +18151,78 @@ impl Compiler {
         }
     }
 
+    /// Route B (int32): recognize `slot = (slot <arith> rhs) | 0` (or
+    /// `& mask`) and run it as wrapping i32 in the shared `Vm::loop_num`
+    /// register. The plan proves the rhs and the seed are int32, so the
+    /// wrapping op is exactly `ToInt32(slot <arith> rhs)` and the trailing
+    /// truncation is a no-op — no per-iteration guard. A1 covers an int32
+    /// immediate and a bounded counter; anything the plan cannot prove stays on
+    /// the step path (A2 adds a guarded rhs).
+    fn plan_loop_int(&mut self, bind: usize, body_start: usize, head: usize, store: usize) {
+        if head != body_start + 1 {
+            return;
+        }
+        let Some((_rmw_index, slot, op, rhs, mask)) = (match &self.steps[body_start] {
+            Step::RunRegBody { ops } => int_rmw_shape(ops),
+            _ => None,
+        }) else {
+            return;
+        };
+        if !self.slot_seed_is_int32(slot, bind) {
+            return;
+        }
+        if matches!(rhs, IntRhs::Counter) && !self.counter_is_int32(head, bind) {
+            return;
+        }
+        if let Step::FastLoopBind { num, .. } = &mut self.steps[bind] {
+            *num = Some(slot);
+        } else {
+            return;
+        }
+        if let Step::FastLoopStore { num, .. } = &mut self.steps[store] {
+            *num = Some(slot);
+        } else {
+            return;
+        }
+        let Step::RunRegBody { ops } = &mut self.steps[body_start] else {
+            return;
+        };
+        *ops = vec![LeafOp::BinStoreInt {
+            op,
+            slot,
+            rhs,
+            mask,
+        }]
+        .into_boxed_slice();
+    }
+
+    /// Whether the loop's counter provably stays in int32: an ascending loop to
+    /// an int32-immediate limit from an int32-word seed.
+    fn counter_is_int32(&self, head: usize, bind: usize) -> bool {
+        let Step::FastLoopHead { op, limit, inc, .. } = &self.steps[head] else {
+            return false;
+        };
+        if !matches!(inc, syntax::ast::UpdateOp::Increment) {
+            return false;
+        }
+        if !matches!(op, BinaryOp::LessThan | BinaryOp::LessEqual) {
+            return false;
+        }
+        let RelLimit::Imm(n) = limit else {
+            return false;
+        };
+        if int32_of(*n).is_none() || *n < 0.0 {
+            return false;
+        }
+        match &self.steps[bind] {
+            Step::FastLoopBind {
+                var: FastLoopVar::Slot(slot),
+                ..
+            } => self.slot_seed_is_int32(*slot, bind),
+            _ => false,
+        }
+    }
+
     /// Prove that an acc-path loop's body is a plain string append
     /// (`s += <pure operand>`) and mark the loop with a `Vm` string builder: the
     /// `BuilderBind`/`BuilderStore` placeholders gain the accumulator slot, and
@@ -18173,6 +18289,25 @@ impl Compiler {
             return;
         };
         ops[1] = LeafOp::BuilderAppend { slot };
+    }
+
+    /// Whether `slot`'s last write before `before` is a straight-line store
+    /// of an int32-valued Number literal.
+    fn slot_seed_is_int32(&self, slot: usize, before: usize) -> bool {
+        let Some(write) = (0..before)
+            .rev()
+            .find(|&i| step_writes_slot(&self.steps[i], slot))
+        else {
+            return false;
+        };
+        write > 0
+            && matches!(&self.steps[write - 1], Step::Push(value) if int32_of_value(*value).is_some())
+            && matches!(
+                &self.steps[write],
+                Step::InitLocal { slot: s }
+                    | Step::StoreLocal { slot: s }
+                    | Step::FusedStoreLocal { slot: s } if *s == slot
+            )
     }
 
     /// Whether `slot`'s last write before `before` is a straight-line store
@@ -18532,6 +18667,7 @@ impl Compiler {
                         let builder_store_index = self.steps.len();
                         self.emit(Step::BuilderStore { slot: None });
                         self.plan_loop_num(bind_index, body_start_index, index, store_index);
+                        self.plan_loop_int(bind_index, body_start_index, index, store_index);
                         self.plan_builder(
                             builder_bind_index,
                             body_start_index,
@@ -22025,6 +22161,87 @@ fn is_inline_arith(op: BinaryOp) -> bool {
     )
 }
 
+/// The int32 arithmetic ops `plan_loop_int` runs as wrapping i32: the sum,
+/// difference and product of two int32s is exact, so the low 32 bits are the
+/// spec's `ToInt32`. `Div` is excluded (i32 division truncates but the spec's
+/// `ToInt32(s / x)` rounds in f64 first, and `x == 0` would trap).
+fn is_int_wrap(op: BinaryOp) -> bool {
+    matches!(op, BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul)
+}
+
+/// The `i32` value of an integral f64 inside int32 range, or `None`.
+fn int32_of(n: f64) -> Option<i32> {
+    if n.fract() == 0.0 && (-2147483648.0..=2147483647.0).contains(&n) {
+        Some(n as i32)
+    } else {
+        None
+    }
+}
+
+fn int32_of_value(value: Value) -> Option<i32> {
+    value.as_number().and_then(int32_of)
+}
+
+/// Whether `op imm` truncates a Number to int32 keeping only its low 32 bits,
+/// as an AND mask: the source's trailing `| 0` (mask `-1`, an identity) or
+/// `& <non-negative int32>` (mask `m`).
+fn is_int_trunc(op: BinaryOp, imm: f64) -> Option<i32> {
+    match op {
+        BinaryOp::BitOr if imm == 0.0 => Some(-1),
+        BinaryOp::BitAnd => int32_of(imm).filter(|m| *m >= 0),
+        _ => None,
+    }
+}
+
+/// Route B (int32): the exact leaf-op shape `plan_loop_int` accepts —
+/// `slot = (slot <arith> rhs) | 0` (or `& mask`) as a 3- or 4-op register body,
+/// and nothing else touching the slot. Returns the mask to AND after the wrap.
+fn int_rmw_shape(ops: &[LeafOp]) -> Option<(usize, usize, BinaryOp, IntRhs, i32)> {
+    let shape = match ops {
+        [
+            LeafOp::BinImmLocal {
+                op,
+                slot,
+                tdz: false,
+                imm,
+            },
+            LeafOp::BinImm {
+                op: trunc,
+                imm: trunc_imm,
+            },
+            LeafOp::StoreReg {
+                slot: store_slot,
+                tdz: false,
+            },
+        ] if slot == store_slot && is_int_wrap(*op) => {
+            let mask = is_int_trunc(*trunc, *trunc_imm)?;
+            (0, *slot, *op, IntRhs::Imm(int32_of(*imm)?), mask)
+        }
+        [
+            rhs_load,
+            LeafOp::BinLeftReg { op, slot },
+            LeafOp::BinImm {
+                op: trunc,
+                imm: trunc_imm,
+            },
+            LeafOp::StoreReg {
+                slot: store_slot,
+                tdz: false,
+            },
+        ] if slot == store_slot && is_int_wrap(*op) => {
+            let mask = is_int_trunc(*trunc, *trunc_imm)?;
+            let rhs = match rhs_load {
+                LeafOp::LoadCounter => IntRhs::Counter,
+                LeafOp::LoadConst(value) => IntRhs::Imm(int32_of_value(*value)?),
+                _ => return None,
+            };
+            (1, *slot, *op, rhs, mask)
+        }
+        _ => return None,
+    };
+    Some(shape)
+}
+
 /// A leaf op that only reads a value with no user-observable side
 /// effect (no getters, no calls, no coercion) — the append RHS the builder
 /// planner accepts.
@@ -22096,6 +22313,7 @@ fn leaf_op_touches_slot(op: &LeafOp, slot: usize) -> bool {
         | LeafOp::BinLeftReg { slot: s, .. }
         | LeafOp::BinStoreReg { slot: s, .. }
         | LeafOp::BinStoreNum { slot: s, .. }
+        | LeafOp::BinStoreInt { slot: s, .. }
         | LeafOp::UpdateReg { slot: s, .. }
         | LeafOp::BinImmLocal { slot: s, .. }
         | LeafOp::BinCtxReg { slot: s, .. }
@@ -22204,6 +22422,7 @@ fn run_acc_is_number(ops: &[LeafOp], upto: usize, proven: &HashSet<usize>) -> bo
             | LeafOp::BinLeftReg { .. }
             | LeafOp::BinStoreReg { .. }
             | LeafOp::BinStoreNum { .. }
+            | LeafOp::BinStoreInt { .. }
             | LeafOp::GetMemberName { .. }
             | LeafOp::GetMemberComputed { .. }
             | LeafOp::GetMemberNameLocal { .. }

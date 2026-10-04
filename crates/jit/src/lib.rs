@@ -2433,6 +2433,36 @@ mod tests {
     }
 
     #[test]
+    fn installed_jit_int32_accumulator_matches_the_interpreter() {
+        // The int32 register lane: `s = (s + rhs) | 0` (or `& mask`) runs as
+        // wrapping i32 in the shared num-slot register. Covered: an int32
+        // immediate, the bounded counter, a mask, the wrap across the int32
+        // boundary (`wrap`, `mul`), a negative seed, and the proof's
+        // rejections (a slot rhs and a fractional seed stay on the step path
+        // and must still agree).
+        let source = "function imm(n) { var s = 0; for (var i = 0; i < n; i++) { s = (s + 7) | 0; } return s; }\n\
+                      function ctr(n) { var s = 0; for (var i = 0; i < n; i++) { s = (s + i) | 0; } return s; }\n\
+                      function mask(n) { var s = 0; for (var i = 0; i < n; i++) { s = (s + i) & 1073741823; } return s; }\n\
+                      function wrap(n) { var s = 0; for (var i = 0; i < n; i++) { s = (s + 2000000000) | 0; } return s; }\n\
+                      function neg(n) { var s = -1000; for (var i = 0; i < n; i++) { s = (s - i) | 0; } return s; }\n\
+                      function mul(n) { var s = 3; for (var i = 0; i < n; i++) { s = (s * 3) | 0; } return s; }\n\
+                      function slotrhs(n) { var s = 0; for (var i = 0; i < n; i++) { var k = i & 255; s = (s + k) | 0; } return s; }\n\
+                      function frac(n) { var s = 1.5; for (var i = 0; i < n; i++) { s = (s + i) | 0; } return s; }\n\
+                      [imm(1000), ctr(1000), mask(1000), wrap(100), neg(1000), mul(20), slotrhs(1000), frac(1000)].join(',');";
+        let interp = {
+            let mut agent = runtime::Agent::new();
+            agent.initialize_host_defined_realm().expect("realm");
+            agent.run_script(source).expect("interp runs")
+        };
+        let (value, compiled) = with_jit_agent(|agent| agent.run_script(source).expect("jit runs"));
+        assert_eq!(
+            value, interp,
+            "the int32 accumulator lane must match the interpreter"
+        );
+        assert!(compiled >= 1, "{compiled} bodies");
+    }
+
+    #[test]
     fn installed_jit_shared_ctx_construct_leaf_recovers_after_a_throw() {
         // The shared-ctx construct leaf: a compiled loop's `new C(i)` runs an
         // environment-free leaf body on the CALLER's ctx with a frame carved
