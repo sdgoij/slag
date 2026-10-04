@@ -267,6 +267,20 @@ suite green; `jit` lib 260/260 across 15 consecutive parallel runs (where the
 re-base version aborted); full test262 sweep at baseline (48622 total, 48464
 pass, 0 fail/crash/hang, 158 skip).
 
+**Follow-ups (2026-10-04).** The region is released on every run exit
+(`vm.stack.truncate(work_base)` in `run_jit_body`/`run_jit_resume`): a
+tail-replacement loop recalls `run_jit_body` on the same `Vm`, so a region left
+in `vm.stack` would accumulate across iterations. `MAX_VALUE_STACK` is lowered
+from 1M to 64K slots, so the per-`Vm` reservation drops from ~8 MB to ~512 KB
+— still far beyond any body's operand depth. Stress gates: `jit` lib 260/260
+across 10 consecutive parallel runs; full workspace green; normal sweep at
+baseline; `--gc-verify` sweep 0 fail/0 crash (its 3 `copyWithin/*detached*
+hangs are borderline-slow — 8s normal, 14s under verify — and PASS when re-run
+individually); the `--gc-stress` sweep's 59 failures are ALL
+`Promise/allSettled` and reproduce byte-for-byte under `--jitless`, i.e. a
+pre-existing gc×async interaction, not the region; the CLI `--gc-stress` and
+`--nursery-stress` benchmark runs are 12/12 `ok=true`.
+
 Sub-steps, each independently landable and gated on corpus equivalence plus
 `--gc-stress`/`--nursery-stress`/the six sweeps with no row regress:
 

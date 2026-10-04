@@ -6461,17 +6461,22 @@ pub(crate) fn run_jit_body(
         )
     });
     agent.jit_depth -= 1;
+    // C0a: release the working region back to the stack bottom. A tail-call
+    // loop re-enters this `Vm` (the driver recalls `run_jit_body` on the same
+    // Vm, so the region would otherwise accumulate across iterations).
     if ctx.pending {
+        vm.stack.truncate(work_base);
         return Err(ctx.error.take().expect("a pending JIT error is present"));
     }
     if ctx.tail {
+        vm.stack.truncate(work_base);
         return Ok(JitRunOutcome::TailReplaced);
     }
     if result == DISPATCH_SUSPEND {
-        // The machine code suspended: save the working region (the buffer
-        // is a per-run local) into `vm.jit_work` — the driver holds the Vm
-        // across the suspension and `run_jit_resume` restores the region.
-        // `vm.ip` was set by the helper to the continuation step.
+        // The machine code suspended: save the working region into
+        // `vm.jit_work` — the driver holds the Vm across the suspension and
+        // `run_jit_resume` restores the region. `vm.ip` was set by the
+        // helper to the continuation step.
         let suspension = ctx
             .suspension
             .take()
@@ -6479,16 +6484,17 @@ pub(crate) fn run_jit_body(
         let base = vm.stack.as_ptr() as usize + work_base * std::mem::size_of::<Value>();
         let depth = (ctx.suspend_sp as usize).saturating_sub(base) / std::mem::size_of::<Value>();
         vm.jit_work.clear();
-        vm.jit_work.extend_from_slice(&vm.stack[work_base..work_base + depth]);
+        vm.jit_work
+            .extend_from_slice(&vm.stack[work_base..work_base + depth]);
+        vm.stack.truncate(work_base);
         return Ok(JitRunOutcome::Suspended(suspension));
     }
     if result == DISPATCH_DEOPT {
         // Stage O: a compiled guard failed. The machine code already set
         // `vm.ip` to the step to resume at and `suspend_sp` to the live
-        // working-region top. The activation's Vm is fresh, so the working
-        // region starts at `vm.stack[0]`; rebuilding the operand stack from
-        // it leaves the interpreter exactly where the guard was, and it
-        // re-executes that step from scratch.
+        // working-region top. Rebuilding the operand stack from the region
+        // (shifted to the bottom) leaves the interpreter exactly where the
+        // guard was, and it re-executes that step from scratch.
         let base = vm.stack.as_ptr() as usize + work_base * std::mem::size_of::<Value>();
         let depth = (ctx.suspend_sp as usize).saturating_sub(base) / std::mem::size_of::<Value>();
         vm.stack.copy_within(work_base..work_base + depth, 0);
@@ -6499,6 +6505,7 @@ pub(crate) fn run_jit_body(
         }
         return Ok(JitRunOutcome::Interp);
     }
+    vm.stack.truncate(work_base);
     Ok(JitRunOutcome::Value(Value::from_bits(result)))
 }
 
@@ -6721,10 +6728,13 @@ pub(crate) fn run_jit_resume(
         )
     });
     agent.jit_depth -= 1;
+    // C0a: release the working region (see `run_jit_body`).
     if ctx.pending {
+        vm.stack.truncate(work_base);
         return Err(ctx.error.take().expect("a pending JIT error is present"));
     }
     if ctx.tail {
+        vm.stack.truncate(work_base);
         return Ok(JitRunOutcome::TailReplaced);
     }
     if result == DISPATCH_SUSPEND {
@@ -6735,9 +6745,12 @@ pub(crate) fn run_jit_resume(
         let base = vm.stack.as_ptr() as usize + work_base * std::mem::size_of::<Value>();
         let depth = (ctx.suspend_sp as usize).saturating_sub(base) / std::mem::size_of::<Value>();
         vm.jit_work.clear();
-        vm.jit_work.extend_from_slice(&vm.stack[work_base..work_base + depth]);
+        vm.jit_work
+            .extend_from_slice(&vm.stack[work_base..work_base + depth]);
+        vm.stack.truncate(work_base);
         return Ok(JitRunOutcome::Suspended(suspension));
     }
+    vm.stack.truncate(work_base);
     Ok(JitRunOutcome::Value(Value::from_bits(result)))
 }
 

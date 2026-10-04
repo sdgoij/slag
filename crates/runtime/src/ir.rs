@@ -2472,8 +2472,12 @@ const INLINE_FRAME: usize = 8;
 /// from `run_inner` and the JIT entries) bounds every push the run makes,
 /// throwing the same `RangeError` the native-stack guard throws instead of
 /// letting a pathological body grow the stack without limit. It is also the
-/// ceiling a future fixed, non-reallocating stack would size itself to.
-const MAX_VALUE_STACK: usize = 1 << 20;
+/// ceiling the JIT's compiled working region sizes itself to: `run_jit_body`
+/// reserves `vm.stack` up to this cap, so no helper push can reallocate it and
+/// the baked region pointer stays valid (`.notes/call-frame-plan.md` C0a,
+/// mechanism 1). 64K slots (512 KB) is far beyond any real body's operand
+/// depth and bounds the per-`Vm` reservation.
+const MAX_VALUE_STACK: usize = 1 << 16;
 
 /// Whether `len + max_stack` exceeds the value-stack `cap` (the guard
 /// predicate, extracted so it is testable without a `Vm`).
