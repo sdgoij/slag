@@ -118,6 +118,47 @@ fn dense_own_element(value: &Value, index: u64) -> Option<Value> {
         .filter(|value| !value.is_hole())
 }
 
+/// The dense fast path of `Array.prototype.indexOf`: `Some(index)` when the
+/// receiver is a dense Array whose scanned range has no hole, `None` when the
+/// caller must run the exact per-element machinery (a hole, a sparse or
+/// non-Array receiver). `n` is the already-coerced `ToIntegerOrInfinity` of
+/// `fromIndex`; `this` is the raw receiver (not `ToObject`'d), so a primitive
+/// receiver declines here and the caller keeps the exact coercion and throw.
+/// The `?` on the hole is the fall-back: a hole's `HasProperty`/`[[Get]]` may
+/// observe the prototype chain, which this scan does not model.
+pub(crate) fn index_of_dense(object: &Value, search_element: &Value, n: f64) -> Option<f64> {
+    let ValueKind::Object(obj) = object.kind() else {
+        return None;
+    };
+    let ObjectKind::Array(slots) = &obj.kind else {
+        return None;
+    };
+    if !slots.dense.get() {
+        return None;
+    }
+    let length = slots.length.get();
+    if length == 0.0 {
+        return Some(-1.0);
+    }
+    let start = if n >= 0.0 { n } else { (length + n).max(0.0) };
+    if start >= length {
+        return Some(-1.0);
+    }
+    let elements = slots.elements();
+    let mut k = start as u64;
+    while (k as f64) < length {
+        let element = elements
+            .get(k as usize)
+            .copied()
+            .filter(|value| !value.is_hole())?;
+        if is_strictly_equal(&element, search_element) {
+            return Some(k as f64);
+        }
+        k += 1;
+    }
+    Some(-1.0)
+}
+
 /// The write half of [`dense_own_element`]: write `value` at `index` through
 /// the engine's own dense index write (`JsObject::array_element_write`, the
 /// path `arr[i] = v` takes), or the exact `[[Set]]` when that declines.

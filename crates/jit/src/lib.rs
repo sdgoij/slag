@@ -458,6 +458,7 @@ fn runtime_helpers() -> JitHelpers {
         create_arguments: Some(rt.create_arguments),
         typeof_top: Some(rt.typeof_top),
         char_code_at: Some(rt.char_code_at),
+        array_index_of: Some(rt.array_index_of),
         typed_array_length: Some(rt.typed_array_length),
         get_super_base: Some(rt.get_super_base),
         this_value: Some(rt.this_value),
@@ -700,6 +701,7 @@ mod tests {
             create_arguments: Some(helpers::test_create_arguments),
             typeof_top: Some(helpers::test_typeof_top),
             char_code_at: Some(helpers::test_char_code_at),
+            array_index_of: Some(helpers::test_array_index_of),
             typed_array_length: Some(helpers::test_typed_array_length),
             get_super_base: Some(helpers::test_get_super_base),
             this_value: Some(helpers::test_this_value),
@@ -2593,6 +2595,48 @@ mod tests {
         assert_eq!(
             value, interp,
             "the charCodeAt intrinsic splice must match the interpreter"
+        );
+        assert!(compiled >= 1, "{compiled} bodies");
+    }
+
+    #[test]
+    fn installed_jit_array_index_of_intrinsic_matches_the_interpreter() {
+        // The Stage-B `Array.prototype.indexOf` splice: a `.indexOf(...)` call
+        // whose resolved callee is the realm's intrinsic scans a dense array in
+        // a helper. The helper declines (the general call runs) for a hole, a
+        // sparse/non-Array receiver, or a non-Number `from`, so each must agree
+        // with the interpreter.
+        let source = "var out = [];\n\
+                      function t(v) { out.push(String(v)); }\n\
+                      t([1,2,3,4].indexOf(3)); t([1,2,3,4].indexOf(9));\n\
+                      t([1,2,3,4].indexOf(2, 1)); t([1,2,3,4].indexOf(1, 1));\n\
+                      t([1,2,3,4].indexOf(4, -1)); t([1,2,3,4].indexOf(1, -100)); t([1,2,3,4].indexOf(1, 100));\n\
+                      var a = [1,,3]; t(a.indexOf(3)); t(a.indexOf(undefined)); t(a.indexOf(undefined, 1));\n\
+                      t([NaN].indexOf(NaN)); t([0].indexOf(-0)); t([1,'1'].indexOf('1'));\n\
+                      t([1,2,3].indexOf('2')); t([1,2,3].indexOf(2, '1'));\n\
+                      t(Array.prototype.indexOf.call({length:1, 0:3}, 3));\n\
+                      var saved = Array.prototype.indexOf;\n\
+                      Array.prototype.indexOf = function () { return 999; };\n\
+                      t([1,2,3].indexOf(2));\n\
+                      Array.prototype.indexOf = saved; t([1,2,3].indexOf(2));\n\
+                      t({ indexOf: Array.prototype.indexOf }.indexOf(0));\n\
+                      function loop(n) {\n\
+                        var small = [1, 2, 3, 4];\n\
+                        var s = 0;\n\
+                        for (var i = 0; i < n; i++) { s = (s + small.indexOf(3)) | 0; }\n\
+                        return s;\n\
+                      }\n\
+                      t(loop(1000));\n\
+                      out.join(',');";
+        let interp = {
+            let mut agent = runtime::Agent::new();
+            agent.initialize_host_defined_realm().expect("realm");
+            agent.run_script(source).expect("interp runs")
+        };
+        let (value, compiled) = with_jit_agent(|agent| agent.run_script(source).expect("jit runs"));
+        assert_eq!(
+            value, interp,
+            "the indexOf intrinsic splice must match the interpreter"
         );
         assert!(compiled >= 1, "{compiled} bodies");
     }

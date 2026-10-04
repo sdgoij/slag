@@ -60,11 +60,12 @@ pub enum Intrinsic {
     MathTrunc,
     MathSqrt,
     StringCharCodeAt,
+    ArrayIndexOf,
 }
 
 /// The number of recognized intrinsics (a `Intrinsic` discriminant is an index
 /// into the per-run intrinsic-bit snapshot).
-pub const INTRINSIC_COUNT: usize = 6;
+pub const INTRINSIC_COUNT: usize = 7;
 
 /// Every recognized intrinsic, in discriminant order: the order that pairs an
 /// `intrinsic_bits` slot with its `Intrinsic`.
@@ -75,6 +76,7 @@ pub const INTRINSICS: [Intrinsic; INTRINSIC_COUNT] = [
     Intrinsic::MathTrunc,
     Intrinsic::MathSqrt,
     Intrinsic::StringCharCodeAt,
+    Intrinsic::ArrayIndexOf,
 ];
 
 impl Intrinsic {
@@ -87,6 +89,7 @@ impl Intrinsic {
             Intrinsic::MathTrunc => "trunc",
             Intrinsic::MathSqrt => "sqrt",
             Intrinsic::StringCharCodeAt => "charCodeAt",
+            Intrinsic::ArrayIndexOf => "indexOf",
         }
     }
 
@@ -99,14 +102,8 @@ impl Intrinsic {
             Intrinsic::MathTrunc => "%Math.trunc%",
             Intrinsic::MathSqrt => "%Math.sqrt%",
             Intrinsic::StringCharCodeAt => "%String.prototype.charCodeAt%",
+            Intrinsic::ArrayIndexOf => "%Array.prototype.indexOf%",
         }
-    }
-
-    /// Whether the intrinsic reads `this` as its receiver (the string methods)
-    /// rather than ignoring it (the `Math` unaries). The JIT adds a receiver
-    /// guard for these.
-    pub fn reads_this(self) -> bool {
-        matches!(self, Intrinsic::StringCharCodeAt)
     }
 }
 
@@ -12324,22 +12321,34 @@ impl Vm {
         if Some(callee) != intrinsic {
             return Ok(false);
         }
-        let Some(value) = self.stack[arg_start].as_number() else {
-            // A non-Number first argument is `ToNumber`'d by the builtin (with
-            // possible valueOf/toString side effects) — leave it to the call.
-            return Ok(false);
-        };
         let result = match kind {
-            Intrinsic::MathAbs => value.abs(),
-            Intrinsic::MathCeil => value.ceil(),
-            Intrinsic::MathFloor => value.floor(),
-            Intrinsic::MathTrunc => value.trunc(),
-            Intrinsic::MathSqrt => value.sqrt(),
+            Intrinsic::MathAbs
+            | Intrinsic::MathCeil
+            | Intrinsic::MathFloor
+            | Intrinsic::MathTrunc
+            | Intrinsic::MathSqrt => {
+                let Some(value) = self.stack[arg_start].as_number() else {
+                    // A non-Number argument is `ToNumber`'d by the builtin (with
+                    // possible valueOf/toString side effects) — leave it to the
+                    // call.
+                    return Ok(false);
+                };
+                match kind {
+                    Intrinsic::MathAbs => value.abs(),
+                    Intrinsic::MathCeil => value.ceil(),
+                    Intrinsic::MathFloor => value.floor(),
+                    Intrinsic::MathTrunc => value.trunc(),
+                    _ => value.sqrt(),
+                }
+            }
             Intrinsic::StringCharCodeAt => {
                 // `this` must be a String primitive: a wrapper object or any
                 // other receiver needs the builtin's exact `ToString`, which can
                 // run user code. The position is already a Number (checked
                 // above), so `ToIntegerOrInfinity` is side-effect free.
+                let Some(value) = self.stack[arg_start].as_number() else {
+                    return Ok(false);
+                };
                 let Some(string) = this.as_string() else {
                     return Ok(false);
                 };
@@ -12349,6 +12358,24 @@ impl Vm {
                     f64::NAN
                 } else {
                     string.code_unit(position as usize).unwrap_or(0) as f64
+                }
+            }
+            Intrinsic::ArrayIndexOf => {
+                // The `fromIndex` must be a Number or absent — anything else is
+                // `ToNumber`'d by the builtin, which can run user code.
+                let from = self
+                    .stack
+                    .get(arg_start + 1)
+                    .copied()
+                    .unwrap_or(Value::Undefined);
+                let n = match from.kind() {
+                    ValueKind::Number(x) => crux::convert::to_integer_or_infinity(x),
+                    ValueKind::Undefined => 0.0,
+                    _ => return Ok(false),
+                };
+                match crate::builtins::array::index_of_dense(&this, &self.stack[arg_start], n) {
+                    Some(index) => index,
+                    None => return Ok(false),
                 }
             }
         };

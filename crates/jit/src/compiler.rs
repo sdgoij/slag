@@ -6342,27 +6342,73 @@ impl<'a> Lowerer<'a> {
                     Offset32::new(0),
                 );
                 let arg_ok = self.is_double(arg1);
-                let gate = self.builder.ins().band(non_zero, callee_ok);
-                let gate = self.builder.ins().band(gate, arg_ok);
-                // A `this`-reading intrinsic (the string methods) additionally
-                // requires a String primitive receiver; the `Math` unaries
-                // ignore `this`.
-                let gate = if kind.reads_this() {
-                    let this_ok = self.is_string(this);
-                    self.builder.ins().band(gate, this_ok)
-                } else {
-                    gate
+                let callee_gate = self.builder.ins().band(non_zero, callee_ok);
+                let gate = match kind {
+                    // `indexOf` validates its receiver and `from` in the helper,
+                    // so only the callee identity is guarded here.
+                    Intrinsic::ArrayIndexOf => callee_gate,
+                    // A `this`-reading string method also needs a String
+                    // primitive receiver and a Number position.
+                    Intrinsic::StringCharCodeAt => {
+                        let arg = self.builder.ins().band(callee_gate, arg_ok);
+                        let this_ok = self.is_string(this);
+                        self.builder.ins().band(arg, this_ok)
+                    }
+                    // The `Math` unaries ignore `this` and need a Number argument.
+                    _ => self.builder.ins().band(callee_gate, arg_ok),
                 };
                 let fast = self.builder.create_block();
                 let slow = self.builder.create_block();
                 let merge = self.builder.create_block();
                 self.builder.ins().brif(gate, fast, &[], slow, &[]);
                 // The fast path: compute the operation (a pure `Math` instruction
-                // or the string helper) and replace the whole call region.
+                // or a helper) and replace the whole call region.
                 self.builder.switch_to_block(fast);
-                let value = match kind {
+                match kind {
+                    Intrinsic::ArrayIndexOf => {
+                        // The helper reads the optional `fromIndex`; the machine
+                        // code passes `undefined` when the call has one argument,
+                        // so the helper's default matches the spec.
+                        let from = if *argc >= 2 {
+                            self.builder.ins().load(
+                                types::I64,
+                                MemFlagsData::new(),
+                                args_ptr,
+                                Offset32::new(8),
+                            )
+                        } else {
+                            self.builder
+                                .ins()
+                                .iconst(types::I64, Value::Undefined.bits() as i64)
+                        };
+                        let result = self.emit_raw_call(
+                            self.sig_binary,
+                            Helper::ArrayIndexOf,
+                            &[this, arg1, from],
+                        )?;
+                        // `undefined` (never a valid index) is the fall-back
+                        // sentinel: route it to the general call.
+                        let sentinel = self
+                            .builder
+                            .ins()
+                            .iconst(types::I64, Value::Undefined.bits() as i64);
+                        let fallback = self.builder.ins().icmp(IntCC::Equal, result, sentinel);
+                        let hit = self.builder.create_block();
+                        self.builder.ins().brif(fallback, slow, &[], hit, &[]);
+                        self.builder.switch_to_block(hit);
+                        self.builder.def_var(self.sp_var, this_ptr);
+                        self.push(result);
+                        self.builder.ins().jump(merge, &[]);
+                    }
                     Intrinsic::StringCharCodeAt => {
-                        self.emit_raw_call(self.sig_get_name, Helper::CharCodeAt, &[this, arg1])?
+                        let value = self.emit_raw_call(
+                            self.sig_get_name,
+                            Helper::CharCodeAt,
+                            &[this, arg1],
+                        )?;
+                        self.builder.def_var(self.sp_var, this_ptr);
+                        self.push(value);
+                        self.builder.ins().jump(merge, &[]);
                     }
                     _ => {
                         let num = self
@@ -6380,12 +6426,12 @@ impl<'a> Lowerer<'a> {
                             self.builder
                                 .ins()
                                 .bitcast(types::I64, MemFlagsData::new(), result);
-                        self.canon(bits)
+                        let value = self.canon(bits);
+                        self.builder.def_var(self.sp_var, this_ptr);
+                        self.push(value);
+                        self.builder.ins().jump(merge, &[]);
                     }
-                };
-                self.builder.def_var(self.sp_var, this_ptr);
-                self.push(value);
-                self.builder.ins().jump(merge, &[]);
+                }
                 // The fallback: the general call machinery (a shadowed method,
                 // a non-`Math`/non-String receiver, or a non-Number argument).
                 self.builder.switch_to_block(slow);

@@ -1150,6 +1150,11 @@ pub struct JitSlowPaths {
     /// argument; returns the code unit as a Number, or NaN out of range. Never
     /// errors, never triggers the collector.
     pub char_code_at: extern "C" fn(ctx: *mut c_void, this: u64, arg: u64) -> u64,
+    /// `Step::CallIntrinsic` for `%Array.prototype.indexOf%`: the raw receiver,
+    /// the search element, and `fromIndex` (or `undefined`). Returns the index
+    /// as a Number, or `undefined` to fall back (a hole, a sparse or non-Array
+    /// receiver, or a non-Number `from`). Never errors.
+    pub array_index_of: extern "C" fn(ctx: *mut c_void, this: u64, search: u64, from: u64) -> u64,
     /// A compiled `GetMemberName` with the `length` atom: the slots length of
     /// an IntegerIndexed receiver, or the canonical-NaN sentinel otherwise
     /// (the machine code falls back to the member-cell probe /
@@ -1324,6 +1329,7 @@ pub static JIT_SLOW_PATHS: JitSlowPaths = JitSlowPaths {
     create_arguments,
     typeof_top,
     char_code_at,
+    array_index_of,
     typed_array_length,
     get_super_base,
     this_value,
@@ -5346,6 +5352,28 @@ extern "C" fn char_code_at(ctx: *mut c_void, this: u64, arg: u64) -> u64 {
         return Value::Number(f64::NAN).bits();
     }
     Value::Number(string.code_unit(position as usize).unwrap_or(0) as f64).bits()
+}
+
+/// `Step::CallIntrinsic` for `%Array.prototype.indexOf%`: `this` is the raw
+/// receiver, `search` the search element, `from` the `fromIndex` (or
+/// `undefined`). Returns the index as a Number, or `undefined` (never a valid
+/// index) to signal that the compiled site must take the general call — a hole
+/// or sparse/non-Array receiver, or a `from` that would need `ToNumber`.
+extern "C" fn array_index_of(ctx: *mut c_void, this: u64, search: u64, from: u64) -> u64 {
+    let _ = ctx;
+    let n = match Value::from_bits(from).kind() {
+        ValueKind::Number(x) => crux::convert::to_integer_or_infinity(x),
+        ValueKind::Undefined => 0.0,
+        _ => return Value::Undefined.bits(),
+    };
+    match crate::builtins::array::index_of_dense(
+        &Value::from_bits(this),
+        &Value::from_bits(search),
+        n,
+    ) {
+        Some(index) => Value::Number(index).bits(),
+        None => Value::Undefined.bits(),
+    }
 }
 
 /// The `typeof` string for `value`, as the value's bits — the shape
