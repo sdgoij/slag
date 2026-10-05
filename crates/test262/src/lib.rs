@@ -12580,11 +12580,6 @@ var $DONE = function (error) {
                     .into(),
             );
         }
-        if fm.features.iter().any(|f| f == "await-dictionary") {
-            // Promise.allKeyed/allSettledKeyed (the await-dictionary stage-3
-            // proposal) are not part of ECMA-262 ES2026.
-            return FixtureResult::Skip("await-dictionary is out of scope".into());
-        }
         if fm.features.iter().any(|f| f == "ShadowRealm") {
             // ShadowRealm is a stage-3 proposal, not part of ECMA-262 ES2026.
             return FixtureResult::Skip("ShadowRealm is out of scope".into());

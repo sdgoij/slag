@@ -3,7 +3,7 @@
 //! `construct` dispatch by intrinsic identity (the %eval% pattern), because
 //! every operation reaches user code and the agent.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use crux::error::{ErrorKind, JsError};
@@ -35,6 +35,8 @@ const ANY: &str = "any";
 const RACE: &str = "race";
 const WITH_RESOLVERS: &str = "withResolvers";
 const TRY: &str = "try";
+const ALL_KEYED: &str = "allKeyed";
+const ALL_SETTLED_KEYED: &str = "allSettledKeyed";
 
 /// Shared per-combinator state plus the per-element handler's index and role.
 /// Each element's closure holds its own `CompoundState` entry; the collect
@@ -51,7 +53,7 @@ pub enum CompoundState {
         resolve: Value,
         reject: Value,
         index: usize,
-        called: bool,
+        called: Rc<Cell<bool>>,
     },
     /// An `allSettled` element handler; `fulfilled` selects the value/reason
     /// wrapping.
@@ -61,7 +63,7 @@ pub enum CompoundState {
         resolve: Value,
         fulfilled: bool,
         index: usize,
-        called: bool,
+        called: Rc<Cell<bool>>,
     },
     /// An `any` element rejected handler: collects the error and rejects
     /// the result once all elements have rejected.
@@ -71,27 +73,47 @@ pub enum CompoundState {
         resolve: Value,
         reject: Value,
         index: usize,
-        called: bool,
+        called: Rc<Cell<bool>>,
+    },
+    /// An `allKeyed` element fulfillment handler: writes the settled value
+    /// into the shared `entries` list at `index`.
+    AllKeyed {
+        entries: Rc<RefCell<Vec<(PropertyKey, Value)>>>,
+        remaining: Rc<RefCell<usize>>,
+        resolve: Value,
+        index: usize,
+        called: Rc<Cell<bool>>,
+    },
+    /// An `allSettledKeyed` element handler; `fulfilled` selects the
+    /// value/reason wrapping.
+    AllSettledKeyed {
+        entries: Rc<RefCell<Vec<(PropertyKey, Value)>>>,
+        remaining: Rc<RefCell<usize>>,
+        resolve: Value,
+        fulfilled: bool,
+        index: usize,
+        called: Rc<Cell<bool>>,
     },
 }
 
 impl CompoundState {
     /// The element handler's [[AlreadyCalled]] guard: `true` when the
-    /// handler already ran (and marks it as run).
-    fn already_called(&mut self) -> bool {
+    /// handler already ran (and marks it as run). The cell is shared by the
+    /// `allSettledKeyed` fulfill/reject pair for one key, so the first call
+    /// wins.
+    fn already_called(&self) -> bool {
         let called = match self {
             CompoundState::All { called, .. }
             | CompoundState::AllSettled { called, .. }
-            | CompoundState::Any { called, .. } => *called,
+            | CompoundState::Any { called, .. }
+            | CompoundState::AllKeyed { called, .. }
+            | CompoundState::AllSettledKeyed { called, .. } => called.clone(),
         };
-        if !called {
-            match self {
-                CompoundState::All { called, .. }
-                | CompoundState::AllSettled { called, .. }
-                | CompoundState::Any { called, .. } => *called = true,
-            }
+        if called.get() {
+            return true;
         }
-        called
+        called.set(true);
+        false
     }
 }
 
@@ -123,6 +145,15 @@ impl Trace for CompoundState {
                 errors.trace(visit);
                 resolve.trace(visit);
                 reject.trace(visit);
+            }
+            CompoundState::AllKeyed {
+                entries, resolve, ..
+            }
+            | CompoundState::AllSettledKeyed {
+                entries, resolve, ..
+            } => {
+                entries.trace(visit);
+                resolve.trace(visit);
             }
         }
     }
@@ -304,6 +335,8 @@ fn install_statics(realm: &Handle<Realm>, ctor: &Handle<Function>) -> Result<(),
         (REJECT, 1),
         (ALL, 1),
         (ALL_SETTLED, 1),
+        (ALL_KEYED, 1),
+        (ALL_SETTLED_KEYED, 1),
         (ANY, 1),
         (RACE, 1),
         (WITH_RESOLVERS, 0),
@@ -385,6 +418,8 @@ pub fn dispatch_call(
         REJECT,
         ALL,
         ALL_SETTLED,
+        ALL_KEYED,
+        ALL_SETTLED_KEYED,
         ANY,
         RACE,
         WITH_RESOLVERS,
@@ -400,6 +435,8 @@ pub fn dispatch_call(
                 REJECT => promise_static_reject,
                 ALL => promise_all,
                 ALL_SETTLED => promise_all_settled,
+                ALL_KEYED => promise_all_keyed,
+                ALL_SETTLED_KEYED => promise_all_settled_keyed,
                 ANY => promise_any,
                 RACE => promise_race,
                 WITH_RESOLVERS => promise_with_resolvers,
@@ -818,7 +855,7 @@ fn promise_all(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value,
                 resolve,
                 reject,
                 index,
-                called: false,
+                called: Rc::new(Cell::new(false)),
             })),
         );
         if let Err(error) = invoke_then(
@@ -842,7 +879,7 @@ fn all_fulfilled(
     state: Rc<RefCell<CompoundState>>,
     args: &[Value],
 ) -> Result<Value, JsError> {
-    if state.borrow_mut().already_called() {
+    if state.borrow().already_called() {
         return Ok(Value::Undefined);
     }
     let (index, values, remaining, resolve) = {
@@ -955,7 +992,7 @@ fn promise_all_settled(agent: &mut Agent, this: &Value, args: &[Value]) -> Resul
                     resolve,
                     fulfilled,
                     index,
-                    called: false,
+                    called: Rc::new(Cell::new(false)),
                 })),
             );
             handlers.push((fulfilled, Value::Function(closure)));
@@ -978,7 +1015,7 @@ fn all_settled_handler(
     state: Rc<RefCell<CompoundState>>,
     args: &[Value],
 ) -> Result<Value, JsError> {
-    if state.borrow_mut().already_called() {
+    if state.borrow().already_called() {
         return Ok(Value::Undefined);
     }
     let (index, results, remaining, resolve, fulfilled) = {
@@ -1029,6 +1066,309 @@ fn all_settled_handler(
         drop(remaining);
         let array = values_array(agent, &results)?;
         crate::function::call(agent, &resolve, Value::Undefined, &[array])?;
+    }
+    Ok(Value::Undefined)
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum KeyedVariant {
+    All,
+    AllSettled,
+}
+
+/// Promise.allKeyed (the await-dictionary proposal): resolve an object of
+/// thenables into a null-prototype object of their values, keyed by the
+/// input's own enumerable keys.
+fn promise_all_keyed(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsError> {
+    promise_keyed(agent, this, args, KeyedVariant::All)
+}
+
+/// Promise.allSettledKeyed: like `allKeyed`, but each entry is a
+/// `{status, value|reason}` record.
+fn promise_all_settled_keyed(
+    agent: &mut Agent,
+    this: &Value,
+    args: &[Value],
+) -> Result<Value, JsError> {
+    promise_keyed(agent, this, args, KeyedVariant::AllSettled)
+}
+
+fn promise_keyed(
+    agent: &mut Agent,
+    this: &Value,
+    args: &[Value],
+    variant: KeyedVariant,
+) -> Result<Value, JsError> {
+    // GC-2: the per-element handler closures and the shared `entries` buffer
+    // are held in Rust locals while the loop runs user code (resolve/then),
+    // so suppress collections across the window.
+    let _stress = crate::ir::StressSuppress::new();
+    let capability = new_promise_capability(agent, this)?;
+    let Some(promise_resolve_fn) = get_promise_resolve(agent, this, &capability.reject)? else {
+        return Ok(capability.promise);
+    };
+    let promises = args.first().cloned().unwrap_or(Value::Undefined);
+    if !matches!(
+        promises.kind(),
+        ValueKind::Object(_) | ValueKind::Function(_)
+    ) {
+        let rejection = error_value(
+            agent,
+            &JsError::new(
+                ErrorKind::TypeError,
+                "Promise.allKeyed argument must be an object".into(),
+            ),
+        );
+        crate::function::call(agent, &capability.reject, Value::Undefined, &[rejection])?;
+        return Ok(capability.promise);
+    }
+    if let Err(error) = perform_all_keyed(
+        agent,
+        variant,
+        &promises,
+        this,
+        &capability.resolve,
+        &capability.reject,
+        &promise_resolve_fn,
+    ) {
+        let rejection = error_value(agent, &error);
+        crate::function::call(agent, &capability.reject, Value::Undefined, &[rejection])?;
+    }
+    Ok(capability.promise)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn perform_all_keyed(
+    agent: &mut Agent,
+    variant: KeyedVariant,
+    promises: &Value,
+    this: &Value,
+    resolve: &Value,
+    reject: &Value,
+    promise_resolve_fn: &Value,
+) -> Result<(), JsError> {
+    let object = crate::context::as_object(promises)
+        .ok_or_else(|| JsError::new(ErrorKind::TypeError, "promises is not an object".into()))?;
+    let all_keys = object.own_property_keys()?;
+    let entries: Rc<RefCell<Vec<(PropertyKey, Value)>>> = Rc::new(RefCell::new(Vec::new()));
+    let remaining = Rc::new(RefCell::new(1usize));
+    let fn_proto = function_prototype(agent);
+    let mut index = 0usize;
+    for key in all_keys {
+        let Some(descriptor) = object.get_own_property_key(&key)? else {
+            continue;
+        };
+        if !descriptor.enumerable {
+            continue;
+        }
+        let property_value = crate::context::get_property_key(agent, promises, &key, *promises)?;
+        entries.borrow_mut().push((key, Value::Undefined));
+        let next_promise =
+            crate::function::call(agent, promise_resolve_fn, *this, &[property_value])?;
+        *remaining.borrow_mut() += 1;
+        match variant {
+            KeyedVariant::All => {
+                let on_fulfilled = keyed_handler(
+                    agent,
+                    fn_proto,
+                    entries.clone(),
+                    remaining.clone(),
+                    *resolve,
+                    None,
+                    index,
+                    Rc::new(Cell::new(false)),
+                )?;
+                invoke_then(agent, &next_promise, Some(on_fulfilled), Some(*reject))?;
+            }
+            KeyedVariant::AllSettled => {
+                let called = Rc::new(Cell::new(false));
+                let on_fulfilled = keyed_handler(
+                    agent,
+                    fn_proto,
+                    entries.clone(),
+                    remaining.clone(),
+                    *resolve,
+                    Some(true),
+                    index,
+                    called.clone(),
+                )?;
+                let on_rejected = keyed_handler(
+                    agent,
+                    fn_proto,
+                    entries.clone(),
+                    remaining.clone(),
+                    *resolve,
+                    Some(false),
+                    index,
+                    called,
+                )?;
+                invoke_then(agent, &next_promise, Some(on_fulfilled), Some(on_rejected))?;
+            }
+        }
+        index += 1;
+    }
+    *remaining.borrow_mut() -= 1;
+    if *remaining.borrow() == 0 {
+        let result = keyed_result_object(&entries)?;
+        if let Err(error) = crate::function::call(agent, resolve, Value::Undefined, &[result]) {
+            let rejection = error_value(agent, &error);
+            crate::function::call(agent, reject, Value::Undefined, &[rejection])?;
+        }
+    }
+    Ok(())
+}
+
+/// CreateKeyedPromiseCombinatorResultObject (await-dictionary): a
+/// null-prototype object with one data property per entry.
+fn keyed_result_object(entries: &Rc<RefCell<Vec<(PropertyKey, Value)>>>) -> Result<Value, JsError> {
+    let object = JsObject::ordinary_object_create(None);
+    for (key, value) in entries.borrow().iter() {
+        object.create_data_property_or_throw_key(key, *value)?;
+    }
+    Ok(Value::Object(object))
+}
+
+/// Build a keyed element handler closure (anonymous, length 1) and register
+/// its state. `fulfilled` is `None` for `allKeyed` (a fulfillment handler)
+/// and `Some(_)` for `allSettledKeyed` (either handler).
+#[allow(clippy::too_many_arguments)]
+fn keyed_handler(
+    agent: &mut Agent,
+    fn_proto: Option<Handle<JsObject>>,
+    entries: Rc<RefCell<Vec<(PropertyKey, Value)>>>,
+    remaining: Rc<RefCell<usize>>,
+    resolve: Value,
+    fulfilled: Option<bool>,
+    index: usize,
+    called: Rc<Cell<bool>>,
+) -> Result<Value, JsError> {
+    let closure = Function::create_builtin(
+        Some(JsString::from_utf8("")),
+        1,
+        Box::new(placeholder("keyed handler")),
+        None,
+        fn_proto,
+    )?;
+    let state = match fulfilled {
+        None => CompoundState::AllKeyed {
+            entries,
+            remaining,
+            resolve,
+            index,
+            called,
+        },
+        Some(fulfilled) => CompoundState::AllSettledKeyed {
+            entries,
+            remaining,
+            resolve,
+            fulfilled,
+            index,
+            called,
+        },
+    };
+    agent
+        .promise_compound
+        .insert(closure.id(), Rc::new(RefCell::new(state)));
+    Ok(Value::Function(closure))
+}
+
+/// The `allKeyed` per-element fulfillment handler.
+fn all_keyed_fulfilled(
+    agent: &mut Agent,
+    state: Rc<RefCell<CompoundState>>,
+    args: &[Value],
+) -> Result<Value, JsError> {
+    if state.borrow().already_called() {
+        return Ok(Value::Undefined);
+    }
+    let (index, entries, remaining, resolve) = {
+        let state = state.borrow();
+        let CompoundState::AllKeyed {
+            entries,
+            remaining,
+            resolve,
+            index,
+            ..
+        } = &*state
+        else {
+            unreachable!("allKeyed handler state");
+        };
+        (*index, entries.clone(), remaining.clone(), *resolve)
+    };
+    let value = args.first().cloned().unwrap_or(Value::Undefined);
+    if let Some(entry) = entries.borrow_mut().get_mut(index) {
+        entry.1 = value;
+    }
+    settle_keyed(agent, &entries, &remaining, &resolve)
+}
+
+/// The `allSettledKeyed` per-element handler (fulfillment or rejection).
+fn all_settled_keyed_handler(
+    agent: &mut Agent,
+    state: Rc<RefCell<CompoundState>>,
+    args: &[Value],
+) -> Result<Value, JsError> {
+    if state.borrow().already_called() {
+        return Ok(Value::Undefined);
+    }
+    let (index, entries, remaining, resolve, fulfilled) = {
+        let state = state.borrow();
+        let CompoundState::AllSettledKeyed {
+            entries,
+            remaining,
+            resolve,
+            fulfilled,
+            index,
+            ..
+        } = &*state
+        else {
+            unreachable!("allSettledKeyed handler state");
+        };
+        (
+            *index,
+            entries.clone(),
+            remaining.clone(),
+            *resolve,
+            *fulfilled,
+        )
+    };
+    let value = args.first().cloned().unwrap_or(Value::Undefined);
+    let object_proto = agent
+        .current_realm()?
+        .intrinsics
+        .get("%Object.prototype%")
+        .and_then(|value| crate::context::as_object(&value));
+    let entry = JsObject::ordinary_object_create(object_proto);
+    entry.create_data_property(
+        &JsString::from_utf8("status"),
+        Value::String(Handle::new(JsString::from_utf8(if fulfilled {
+            "fulfilled"
+        } else {
+            "rejected"
+        }))),
+    )?;
+    entry.create_data_property(
+        &JsString::from_utf8(if fulfilled { "value" } else { "reason" }),
+        value,
+    )?;
+    if let Some(slot) = entries.borrow_mut().get_mut(index) {
+        slot.1 = Value::Object(entry);
+    }
+    settle_keyed(agent, &entries, &remaining, &resolve)
+}
+
+fn settle_keyed(
+    agent: &mut Agent,
+    entries: &Rc<RefCell<Vec<(PropertyKey, Value)>>>,
+    remaining: &Rc<RefCell<usize>>,
+    resolve: &Value,
+) -> Result<Value, JsError> {
+    let mut remaining = remaining.borrow_mut();
+    *remaining -= 1;
+    if *remaining == 0 {
+        drop(remaining);
+        let result = keyed_result_object(entries)?;
+        crate::function::call(agent, resolve, Value::Undefined, &[result])?;
     }
     Ok(Value::Undefined)
 }
@@ -1104,7 +1444,7 @@ fn promise_any(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value,
                 resolve,
                 reject,
                 index,
-                called: false,
+                called: Rc::new(Cell::new(false)),
             })),
         );
         // spec 27.2.4.4: the on-fulfilled passed to each element's `then` is
@@ -1127,7 +1467,7 @@ fn any_rejected(
     state: Rc<RefCell<CompoundState>>,
     args: &[Value],
 ) -> Result<Value, JsError> {
-    if state.borrow_mut().already_called() {
+    if state.borrow().already_called() {
         return Ok(Value::Undefined);
     }
     let (index, errors, remaining, reject) = {
@@ -1271,16 +1611,22 @@ fn dispatch_compound(
     enum Which {
         All,
         AllSettled,
+        AllKeyed,
+        AllSettledKeyed,
         AnyRejected,
     }
     let which = match &*state.borrow() {
         CompoundState::All { .. } => Which::All,
         CompoundState::AllSettled { .. } => Which::AllSettled,
+        CompoundState::AllKeyed { .. } => Which::AllKeyed,
+        CompoundState::AllSettledKeyed { .. } => Which::AllSettledKeyed,
         CompoundState::Any { .. } => Which::AnyRejected,
     };
     match which {
         Which::All => all_fulfilled(agent, state, args),
         Which::AllSettled => all_settled_handler(agent, state, args),
+        Which::AllKeyed => all_keyed_fulfilled(agent, state, args),
+        Which::AllSettledKeyed => all_settled_keyed_handler(agent, state, args),
         Which::AnyRejected => any_rejected(agent, state, args),
     }
 }

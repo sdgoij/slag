@@ -1638,7 +1638,6 @@ The harness's skip taxonomy (also used by the sweep):
 | Skip category | Reason |
 |---|---|
 | `features: [Temporal]` (unimplemented clusters) | Temporal is a stage-4 proposal; the whole `Temporal/*` tree now runs (4,602 of 4,603 fixtures), including the `Intl.Era-monthcode`-gated era/eraYear getters, the solar calendars, and the Intl `toLocaleString` integration. |
-| `features: [await-dictionary]` | `Promise.allKeyed`/`allSettledKeyed` (the await-dictionary stage-3 proposal) are not part of ECMA-262 ES2026. |
 | `features: [ShadowRealm]` | ShadowRealm is a stage-3 proposal, not part of ECMA-262 ES2026. |
 | `features: [source-phase-imports]` | `import.source()` is a stage-3 proposal, not part of ECMA-262 ES2026. |
 | `features: [import-defer]` / `[import-bytes]` / `[import-text]` | `import.defer(...)` / `import(..., { with: { type: "bytes" } })` / `import(..., { with: { type: "text" } })` are stage-3 proposals, not part of ECMA-262 ES2026. |
@@ -1717,9 +1716,9 @@ Temporal-featured fixtures from skip to pass (the 16 Duration
 remaining 42 `toLocaleString` (Intl) content-skips closed with the
 ECMA-402 integration, leaving the one stale fixture.)
 
-(Runnable = pass + fail + hang; the 154 skips are the out-of-scope
-await-dictionary (89) and ShadowRealm (64) proposal
-fixtures, and the one stale Temporal fixture.) The
+(Runnable = pass + fail + hang; the remaining skips are the out-of-scope
+ShadowRealm (64) proposal fixtures, the 4 CRLF checkout artifacts, and the
+one stale Temporal fixture.) The
 TCO cluster closed last (34/34 — proper tail calls, the one spec feature
 V8 and JSC still skip: a return in the innermost try's own
 catch-without-finally or finally clause replaces the frame, with the
@@ -1874,8 +1873,9 @@ Object.fromEntries, JSON.stringify, DataView, Object statics/
 constructor, Promise, Atomics, and the final Array/generator, Throw-
 TypeError, WeakRef/FinalizationRegistry, Uint8Array base64/hex, Set
 set-methods, JSON/parse, TypedArray BigInt, String, and SuppressedError
-closures (all 0 fail). The 154 built-ins skips are
-await-dictionary (89), ShadowRealm (64), and the one stale
+closures (all 0 fail). The remaining built-ins skips are
+ShadowRealm (64), the one CRLF `line-terminator-normalisation-LF` artifact,
+and the one stale
 `Temporal/Duration/prototype/total/relativeto-date-limits.js`
 fixture — the Temporal tree (including
 `Date.prototype.toTemporalInstant`, the 16 Duration `relativeTo`
@@ -2121,6 +2121,15 @@ ShadowRealm (64)).
   corpus-consistent, not exhaustive: the fixtures are relational (any correct
   per-region data passes), and `Intl.Locale-info`'s skip (60) is removed from
   both `run_fixture` and `tools/skip_tally.js`.
+- `await-dictionary` is implemented (it was 89 of the 158 `all` skips):
+  `Promise.allKeyed`/`Promise.allSettledKeyed` resolve an object of thenables
+  into a null-prototype object keyed by the input's own *enumerable* keys
+  (string and symbol), each handler's `[[AlreadyCalled]]` cell shared across
+  the `allSettledKeyed` fulfill/reject pair so the first call wins. The two
+  new `CompoundState` variants reuse the existing combinator machinery; the
+  await-dictionary gate is removed from both `run_fixture` and
+  `tools/skip_tally.js`. The remaining `all` skips are now ShadowRealm (64),
+  the 4 CRLF checkout artifacts, and the one stale Temporal fixture.
 - `canonical-tz` is implemented (it was the other 19 `intl402` skips). A named
   zone identifier is *preserved* with its canonical spelling: neither
   `Temporal.ZonedDateTime.timeZoneId` nor `DateTimeFormat`'s
