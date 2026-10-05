@@ -1679,13 +1679,14 @@ Temporal era-monthcode gate and the ECMA-402 Intl integration.
 | annexB | 1,086 | 1,086 | 0 | 0 | 0 | 100.0% |
 | **Total** | **48,622** | **48,234** | **0** | **154** | **234** | **99.52%** |
 
-(On this Windows tree the pinned test262 submodule is checked out CRLF,
-which taints 4 byte-exact fixtures: the 3 `import/import-bytes`
-byte-count fixtures and `line-terminator-normalisation-LF.js` read `\r\n`
-where the corpus asserts `\n`. They are **filtered in `run_fixture`** with
-a CRLF-conditional skip (see the skip taxonomy) — on a clean LF checkout
-they pass and the skip no-ops; the submodule itself is a read-only input
-and is kept as-is. The TCO-era direct-eval fix (`return eval(x)` tail
+(On this Windows tree the pinned test262 submodule was originally checked
+out CRLF (`core.autocrlf=true`), which tainted 4 byte-exact fixtures: the 3
+`import/import-bytes` byte-count fixtures and
+`line-terminator-normalisation-LF.js` read `\r\n` where the corpus asserts
+`\n`. The submodule is now configured `core.autocrlf=false` and checked out
+LF, so all 4 run; `run_fixture` keeps a CRLF-conditional skip (see the skip
+taxonomy) that no-ops on an LF tree and only fires on a CRLF checkout. The
+TCO-era direct-eval fix (`return eval(x)` tail
 calls now route through `perform_eval` with the caller's environment
 intact) closed the 7 eval/private-name fixtures TCO had uncovered; the
 release sweep is 48,006 pass / **0 fail** / 158 skip / 458 hang
@@ -1715,8 +1716,8 @@ Temporal-featured fixtures from skip to pass (the 16 Duration
 remaining 42 `toLocaleString` (Intl) content-skips closed with the
 ECMA-402 integration, leaving the one stale fixture.)
 
-(Runnable = pass + fail + hang; the remaining skips are the 4 CRLF checkout
-artifacts and the one stale Temporal fixture.) The
+(Runnable = pass + fail + hang; the only remaining skip is the one stale
+Temporal fixture.) The
 TCO cluster closed last (34/34 — proper tail calls, the one spec feature
 V8 and JSC still skip: a return in the innermost try's own
 catch-without-finally or finally clause replaces the frame, with the
@@ -1871,9 +1872,7 @@ Object.fromEntries, JSON.stringify, DataView, Object statics/
 constructor, Promise, Atomics, and the final Array/generator, Throw-
 TypeError, WeakRef/FinalizationRegistry, Uint8Array base64/hex, Set
 set-methods, JSON/parse, TypedArray BigInt, String, and SuppressedError
-closures (all 0 fail). The remaining built-ins skips are the one CRLF
-`line-terminator-normalisation-LF` artifact
-and the one stale
+closures (all 0 fail). The only remaining built-ins skip is the one stale
 `Temporal/Duration/prototype/total/relativeto-date-limits.js`
 fixture — the Temporal tree (including
 `Date.prototype.toTemporalInstant`, the 16 Duration `relativeTo`
@@ -2126,8 +2125,8 @@ ShadowRealm (64)).
   the `allSettledKeyed` fulfill/reject pair so the first call wins. The two
   new `CompoundState` variants reuse the existing combinator machinery; the
   await-dictionary gate is removed from both `run_fixture` and
-  `tools/skip_tally.js`. The remaining `all` skips are now the 4 CRLF checkout
-  artifacts and the one stale Temporal fixture.
+  `tools/skip_tally.js`. The remaining `all` skip is now the one stale
+  Temporal fixture (the 4 CRLF artifacts no longer trigger on the LF checkout).
 - `ShadowRealm` is implemented (it was the last 64 built-ins skips): the
   constructor + `evaluate` + `importValue` + `@@toStringTag`, a fresh inner
   realm per instance (`Agent::shadow_realms`), and the WrappedFunction exotic
@@ -2143,7 +2142,7 @@ ShadowRealm (64)).
   a caller-realm promise onto the engine's dynamic-import machinery and wraps
   the named export. The ShadowRealm gate is removed from `run_fixture` and
   `tools/skip_tally.js`; the 64 fixtures pass, and the only remaining `all`
-  skips are the 4 CRLF checkout artifacts and the one stale Temporal fixture.
+  skip is the one stale Temporal fixture.
 - `canonical-tz` is implemented (it was the other 19 `intl402` skips). A named
   zone identifier is *preserved* with its canonical spelling: neither
   `Temporal.ZonedDateTime.timeZoneId` nor `DateTimeFormat`'s

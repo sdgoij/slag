@@ -12556,9 +12556,11 @@ var $DONE = function (error) {
         }
         // A stale fixture: total/relativeto-date-limits pins
         // "+275760-09-12T00:00:01+00:00[UTC]" as out-of-range, but the
-        // current spec (and node v24) accept it — the epoch is a full day
-        // below the maximum instant. The duplicate round/relativeto-date-*
-        // fixture covers the still-valid date-limit assertions.
+        // current spec accepts it — the instant is a full day below the
+        // maximum (node v24 `--harmony-temporal` returns 0 for both
+        // "+275760-09-12T00:00:00+00:00[UTC]" and the +1s form). The
+        // duplicate round/relativeto-date-* fixture covers the still-valid
+        // date-limit assertions.
         if relative == "Temporal/Duration/prototype/total/relativeto-date-limits.js" {
             return FixtureResult::Skip(
                 "stale: +275760-09-12T00:00:01Z relativeTo is in range per the current spec".into(),
