@@ -70,6 +70,12 @@ pub fn get_function_realm(agent: &mut Agent, value: &Value) -> Result<Handle<Rea
                 }),
             crux::function::FunctionKind::Bound { target, .. } => get_function_realm(agent, target),
             crux::function::FunctionKind::Builtin { .. } => {
+                // A wrapped function exotic object's [[Realm]] is the realm it
+                // was created for (spec 10.2.6 GetFunctionRealm step 3); a
+                // realm builtin's is the realm whose intrinsic table holds it.
+                if let Some(wrapped) = agent.shadow_wrapped.get(&function.id()) {
+                    return Ok(wrapped.caller_realm);
+                }
                 crate::function::owning_realm(agent, &function).ok_or_else(|| {
                     JsError::new(
                         ErrorKind::TypeError,

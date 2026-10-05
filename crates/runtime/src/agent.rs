@@ -752,6 +752,15 @@ pub struct Agent {
     pub module_sources: std::collections::HashMap<u64, Handle<crate::module::SourceTextModule>>,
     /// The dynamic-import namespace resolvers, keyed by function identity.
     pub import_namespace_resolvers: std::collections::HashMap<u64, (Value, Value)>,
+    /// The [[ShadowRealm]] internal slot of each ShadowRealm instance:
+    /// object id → the inner realm it evaluates in.
+    pub shadow_realms: IdMap<Handle<Realm>>,
+    /// The wrapped functions the ShadowRealm callable boundary produced:
+    /// function id → the target function and the wrapper's [[Realm]].
+    pub shadow_wrapped: IdMap<crate::builtins::shadow_realm::ShadowWrapped>,
+    /// The `ShadowRealm.prototype.importValue` continuations, keyed by
+    /// function identity.
+    pub shadow_handlers: IdMap<crate::builtins::shadow_realm::ShadowHandler>,
     /// DeferredModule `.then` continuations (import-defer): each waiter
     /// function id maps to (wait id, is-rejection); the wait state holds the
     /// remaining async-dependency countdown and the capability.
@@ -1374,6 +1383,9 @@ impl Agent {
             deferred_namespaces: std::collections::HashMap::new(),
             module_sources: std::collections::HashMap::new(),
             import_namespace_resolvers: std::collections::HashMap::new(),
+            shadow_realms: std::collections::HashMap::default(),
+            shadow_wrapped: std::collections::HashMap::default(),
+            shadow_handlers: std::collections::HashMap::default(),
             deferred_module_waiter_fns: std::collections::HashMap::new(),
             deferred_module_waits: std::collections::HashMap::new(),
             deferred_module_thens: std::collections::HashMap::new(),
@@ -2134,6 +2146,9 @@ impl Agent {
         self.deferred_namespaces.trace(visit);
         self.module_sources.trace(visit);
         self.import_namespace_resolvers.trace(visit);
+        self.shadow_realms.trace(visit);
+        self.shadow_wrapped.trace(visit);
+        self.shadow_handlers.trace(visit);
         self.deferred_module_waits.trace(visit);
         self.deferred_module_thens.trace(visit);
         self.symbol_data.trace(visit);

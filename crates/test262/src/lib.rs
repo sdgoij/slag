@@ -12580,10 +12580,6 @@ var $DONE = function (error) {
                     .into(),
             );
         }
-        if fm.features.iter().any(|f| f == "ShadowRealm") {
-            // ShadowRealm is a stage-3 proposal, not part of ECMA-262 ES2026.
-            return FixtureResult::Skip("ShadowRealm is out of scope".into());
-        }
         // ECMA-402 feature gates (.notes/intl-plan.md): each `Intl.*` tag
         // skips with an explicit reason until its component lands. The
         // implemented set grows per cut; the mirror lives in

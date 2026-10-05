@@ -1786,7 +1786,7 @@ pub fn owning_realm(agent: &mut Agent, function: &Handle<Function>) -> Option<Ha
 /// error object is created from `realm`'s intrinsics while it is current
 /// (the cross-realm fixtures assert the realm of e.g. a class-constructor
 /// TypeError).
-fn realm_throwable(
+pub(crate) fn realm_throwable(
     agent: &mut Agent,
     error: JsError,
     realm: Handle<Realm>,
@@ -2134,6 +2134,7 @@ fn builtin_dispatch_at(
         40 => crate::builtins::intl::dispatch_call(agent, callee, this, args),
         #[cfg(feature = "wasm")]
         41 => crate::builtins::wasm::dispatch_call(agent, callee, this, args),
+        42 => crate::builtins::shadow_realm::dispatch_call(agent, callee, this, args),
         _ => None,
     }
 }
@@ -2146,7 +2147,7 @@ fn resolve_builtin_dispatch(
     this: &Value,
     args: &[Value],
 ) -> (u8, Option<Result<Value, JsError>>) {
-    for index in 1..=41 {
+    for index in 1..=42 {
         let result = builtin_dispatch_at(agent, index, callee, this, args);
         if result.is_some() {
             return (index, result);
@@ -2356,6 +2357,11 @@ fn construct_inner(
                 if let Some(result) =
                     crate::builtins::intl::dispatch_construct(agent, callee, args, new_target)
                 {
+                    return result;
+                }
+                if let Some(result) = crate::builtins::shadow_realm::dispatch_construct(
+                    agent, callee, args, new_target,
+                ) {
                     return result;
                 }
                 #[cfg(feature = "wasm")]

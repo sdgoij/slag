@@ -100,7 +100,6 @@ function classify(file, source) {
     // Fall through (no early return): an implemented Temporal fixture may
     // still hit a later gate, and the stale check below must be reachable.
   }
-  if (features.has("ShadowRealm")) return "ShadowRealm";
   // Windows-checkout CRLF artifacts (mirrors run_fixture): the pinned
   // test262 submodule is checked out CRLF under `core.autocrlf`, so these
   // byte-exact fixtures read `\r\n` where the corpus asserts `\n`. The

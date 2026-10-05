@@ -727,6 +727,20 @@ fn collect_private_names(agent: &Agent) -> Vec<crux::AtomId> {
 /// `direct` selects the direct-eval wiring: a direct eval's lexical
 /// environment extends the caller's, and its vars share the caller's
 /// variable environment (unless the eval code is strict).
+/// Parse `source` as a Script for `ShadowRealm.prototype.evaluate`, raising a
+/// SyntaxError in the caller's realm. PerformShadowRealmEval parses before
+/// switching to the shadow realm, so the error is the caller's; the body is
+/// never evaluated here.
+pub fn validate_shadow_realm_source(source: &JsString) -> Result<(), JsError> {
+    let eval_context = parser::EvalContext {
+        in_function: false,
+        in_method: false,
+        allow_private: false,
+    };
+    parser::parse_script_utf16_eval(source.as_slice(), &eval_context, &[])?;
+    Ok(())
+}
+
 pub fn perform_eval(
     agent: &mut Agent,
     source: &JsString,

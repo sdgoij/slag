@@ -29,6 +29,7 @@ pub mod promise;
 pub mod proxy;
 pub mod reflect;
 pub mod regexp;
+pub mod shadow_realm;
 pub mod string;
 pub mod symbol;
 pub mod temporal;
