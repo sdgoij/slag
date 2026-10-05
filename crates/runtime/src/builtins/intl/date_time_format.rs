@@ -799,18 +799,11 @@ fn initialize(
         let value = to_string(agent, &time_zone_value)?.to_string_lossy();
         if let Some(offset) = parse_offset_time_zone(&value) {
             format_offset_time_zone_identifier(offset)
-        } else if value.eq_ignore_ascii_case("utc")
-            || value.eq_ignore_ascii_case("etc/utc")
-            || value.eq_ignore_ascii_case("etc/gmt")
-        {
-            "UTC".to_string()
-        } else if value.starts_with("Etc/GMT+") || value.starts_with("Etc/GMT-") {
-            // The fixed-offset Etc/GMT±N zones.
-            value
-        } else if let Some(zone) = unicode::tz::resolve_zone(&value) {
-            // The IANA zones (case-insensitive; links resolve to their
-            // primary identifier).
-            unicode::tz::primary_identifier(zone).to_string()
+        } else if let Some(id) = unicode::tz::canonical_identifier(&value) {
+            // The named zones, ASCII-case-insensitive: the identifier is
+            // preserved with its canonical spelling (never canonicalized to
+            // the primary — CreateDateTimeFormat step 31c).
+            id.to_string()
         } else {
             return Err(range_error("Invalid time zone"));
         }
@@ -2156,10 +2149,15 @@ fn format_time_zone(record: &DateTimeFormatRecord, epoch_ms: f64, width: u32) ->
             format!("GMT{sign}{hours}:{minutes_part:02}")
         };
     }
+    // The display name (and the fallback) uses the zone's *primary*
+    // identifier: a Link renders its primary's name, so two identifiers that
+    // share a zone format identically (timezone-not-canonicalized.js), while
+    // `resolvedOptions().timeZone` still reports the given identifier.
+    let primary: &str = unicode::tz::primary_identifier_of(zone).unwrap_or(zone);
     if record.locale.starts_with("en")
         && let Some((short_std, long_std, short_dst, long_dst)) = EN_ZONE_NAMES
             .iter()
-            .find(|(z, ..)| *z == zone)
+            .find(|(z, ..)| *z == primary)
             .map(|(_, short_std, long_std, short_dst, long_dst)| {
                 (*short_std, *long_std, *short_dst, *long_dst)
             })
@@ -2173,7 +2171,7 @@ fn format_time_zone(record: &DateTimeFormatRecord, epoch_ms: f64, width: u32) ->
             (if dst { short_dst } else { short_std }).to_string()
         };
     }
-    zone.to_string()
+    primary.to_string()
 }
 
 fn format_fractional(local: &LocalTime, record: &DateTimeFormatRecord) -> String {

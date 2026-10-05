@@ -2090,11 +2090,11 @@ ShadowRealm (64)).
   TypedArray `copyWithin` fixtures above. Use a release build
   (`cargo run --release -p test262 --bin sweep`) — the debug build's deep
   recursion can overflow the stack on heavy fixtures.
-- The `intl402/` area is swept too (3,284 pass / 0 fail / 81 skip of 3,365;
+- The `intl402/` area is swept too (3,303 pass / 0 fail / 62 skip of 3,365;
   the corpus grew by 8 in the 2026-09 pull). The Temporal gate no longer skips a
   `features: [Temporal]` fixture just for living outside the `Temporal/<Type>/`
   namespace, so the ~71 `Intl.DateTimeFormat`/`DurationFormat` fixtures that
-  *format* Temporal values now run. That exposed 16 failures, all now fixed:
+  *format* Temporal values now run. That exposed 16 failures, all fixed:
   ToRawPrecision's carry (`significant-digits-rounding-magnitude*`), integer-ms
   `plain_epoch_ms` (`temporal-objects-no-time-clip*`), the `ToDateTimeFormattable`
   order (`to-datetime-formattable-with-different-arg-kinds*`), the same-date
@@ -2104,12 +2104,26 @@ ShadowRealm (64)).
   (`compare-to-temporal-lunisolar`), the `ar` `nu` likely-subtags default
   (`temporal-objects-no-time-clip-non-latin-numerals`), and German abbreviated
   weekdays (`german-weekday-no-year`). The remaining skips are `Intl.Locale-info`
-  (60), `Intl.DateTimeFormat-extend-timezonename` (2), and `canonical-tz` (19).
-  The harness prelude also now sets `assert._formatIdentityFreeValue`, which
-  `deepEqual.js`'s failure formatter calls — without it a failing `deepEqual`
-  reported as "undefined is not a function". Anything else that fails the sweep
-  should be triaged into bug / host-dependent / missing-hook categories and
-  either fixed or documented here.
+  (60) and `Intl.DateTimeFormat-extend-timezonename` (2). The harness prelude also
+  now sets `assert._formatIdentityFreeValue`, which `deepEqual.js`'s failure
+  formatter calls — without it a failing `deepEqual` reported as "undefined is not
+  a function". Anything else that fails the sweep should be triaged into bug /
+  host-dependent / missing-hook categories and either fixed or documented here.
+- `canonical-tz` is implemented (it was the other 19 `intl402` skips). A named
+  zone identifier is *preserved* with its canonical spelling: neither
+  `Temporal.ZonedDateTime.timeZoneId` nor `DateTimeFormat`'s
+  `resolvedOptions().timeZone` canonicalizes a Link to its primary
+  (`canonicalize-*`, `timezone-*`, `iana-legacy-names`, `links-*`,
+  `do-not-canonicalize-*`). `TimeZoneEquals` (`ZonedDateTime.prototype.equals`/
+  `since`/`until`) compares the *primary*, so two Links that resolve to one zone
+  are equal (`links.js`, `equals/canonicalize-timezone.js`), the `timeZoneName`
+  display uses the primary's name (`timezone-not-canonicalized.js`), and
+  `Intl.supportedValuesOf("timeZone")` returns the primary identifiers (deduped +
+  sorted; `equals/canonical-not-equal.js`). The data is a regenerated
+  `unicode::tz::NAME_INDEX` (folded -> canonical, primary, zone);
+  `tools/gen_tz_tables.py` derives the primary from `PRIMARY_OVERRIDES` (the
+  `backward`/`backzone` links the corpus pins) plus the `Etc/UTC|Etc/GMT|GMT` ->
+  `UTC` normalization.
 - Known flaky fixture: `TypedArray/prototype/reduce/callbackfn-arguments-default-accumulator.js`
   (Strict) intermittently fails with `Expected SameValue(«43», «41») to be true` — the second
   reduce callback's `arguments[0]` reads 43 (iteration 1's `kValue`) instead of 41 (iteration

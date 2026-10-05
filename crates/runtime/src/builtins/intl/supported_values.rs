@@ -83,12 +83,27 @@ pub fn dispatch_call(
 
 fn supported_values_of(agent: &mut Agent, key: Value) -> Result<Value, JsError> {
     let key = crate::context::to_string(agent, &key)?.to_string_lossy();
+    // AvailableTimeZones: the *primary* identifiers, deduped and sorted — a
+    // Link name folds to its primary, so `supportedValuesOf` returns only
+    // canonical IDs (timeZones.js, equals/canonical-not-equal.js).
+    if key == "timeZone" {
+        let mut names: Vec<&str> = SUPPORTED_TIME_ZONES
+            .iter()
+            .map(|z| unicode::tz::primary_identifier_of(z).unwrap_or(z))
+            .collect();
+        names.sort_unstable();
+        names.dedup();
+        let values: Vec<Value> = names
+            .iter()
+            .map(|s| Value::String(Handle::new(JsString::from_utf8(s))))
+            .collect();
+        return crate::builtins::array::array_from_values(agent, &values);
+    }
     let list: &[&str] = match key.as_str() {
         "calendar" => SUPPORTED_CALENDARS,
         "collation" => SUPPORTED_COLLATIONS,
         "currency" => ISO_4217_CURRENCIES,
         "numberingSystem" => SUPPORTED_NUMBERING_SYSTEMS,
-        "timeZone" => SUPPORTED_TIME_ZONES,
         "unit" => SANCTIONED_UNITS,
         _ => {
             return Err(JsError::new(

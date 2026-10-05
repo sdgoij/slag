@@ -105,6 +105,40 @@ BACKWARD_LINKS = {
     "US/Samoa": "Pacific/Pago_Pago",
 }
 
+# The spec primary for the TZDB `backward` links whose target is NOT their
+# shared blob's primary name (the fixed-name zones that are first-class
+# `supportedValuesOf` entries but are Links per the TZDB): the corpus pins
+# these as equal to their real zone (links.js). The `Etc/UTC`/`Etc/GMT`/`GMT`
+# normalization is applied separately.
+PRIMARY_OVERRIDES = {
+    "CET": "Europe/Brussels",
+    "MET": "Europe/Brussels",
+    "EET": "Europe/Athens",
+    "WET": "Europe/Lisbon",
+    "EST": "America/Panama",
+    "MST": "America/Phoenix",
+    "HST": "Pacific/Honolulu",
+    "EST5EDT": "America/New_York",
+    "CST6CDT": "America/Chicago",
+    "MST7MDT": "America/Denver",
+    "PST8PDT": "America/Los_Angeles",
+    # Former names that are ALSO first-class `supportedValuesOf` entries (so the
+    # generator gives them their own zone): their spec primary is the zone the
+    # corpus pins (links.js).
+    "Antarctica/South_Pole": "Antarctica/McMurdo",
+    "America/Virgin": "America/St_Thomas",
+    "Pacific/Enderbury": "Pacific/Kanton",
+    # Links whose shared blob has more than one supported name, so the
+    # blob's first supported name is not their TZDB target (links.js).
+    "Asia/Choibalsan": "Asia/Ulaanbaatar",
+    "Pacific/Ponape": "Pacific/Pohnpei",
+    "GB": "Europe/London",
+    "GB-Eire": "Europe/London",
+    "Iceland": "Atlantic/Reykjavik",
+    "NZ": "Pacific/Auckland",
+    "Singapore": "Asia/Singapore",
+}
+
 
 def parse_tzif(blob):
     """Parse a TZif v2+ blob. Returns (transitions, ttinfo, abbrs, posix)
@@ -384,9 +418,15 @@ def main():
             if n not in name_to_zone:
                 name_to_zone[n] = zone_of_blob[(lo, hi)]
 
+    def normalize_primary(primary):
+        if primary in ("Etc/UTC", "Etc/GMT", "GMT"):
+            return "UTC"
+        return primary
+
     name_index = []
     for name, idx in sorted(name_to_zone.items()):
-        name_index.append((name.lower(), idx))
+        primary = normalize_primary(PRIMARY_OVERRIDES.get(name, zones[idx][0]))
+        name_index.append((name.lower(), name, primary, idx))
 
     # Emit the Rust module.
     lines = []
@@ -450,10 +490,14 @@ def main():
         lines.append("    },")
     lines.append("];")
     lines.append("")
-    lines.append("/// The case-folded identifier -> zone index (sorted, for lookup).")
-    lines.append("pub static NAME_INDEX: &[(&str, u16)] = &[")
-    for name, idx in sorted(name_index):
-        lines.append(f"    ({rs_str(name)}, {idx}),")
+    lines.append("/// The case-folded identifier -> its canonical spelling, its primary")
+    lines.append("/// identifier (TimezoneEquals), and its zone index (sorted by the folded")
+    lines.append("/// name, for lookup).")
+    lines.append("pub static NAME_INDEX: &[(&str, &str, &str, u16)] = &[")
+    for folded, canonical, primary, idx in sorted(name_index, key=lambda e: e[0]):
+        lines.append(
+            f"    ({rs_str(folded)}, {rs_str(canonical)}, {rs_str(primary)}, {idx}),"
+        )
     lines.append("];")
 
     open(OUT, "w", encoding="utf-8").write("\n".join(lines) + "\n")

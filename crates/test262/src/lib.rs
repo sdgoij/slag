@@ -12583,13 +12583,6 @@ var $DONE = function (error) {
             // proposal) are not part of ECMA-262 ES2026.
             return FixtureResult::Skip("await-dictionary is out of scope".into());
         }
-        if fm.features.iter().any(|f| f == "canonical-tz") {
-            // The canonical-tz proposal (2024+: case normalization and
-            // primary-identifier canonicalization of IANA time zone names)
-            // is not part of the DateTimeFormat plan cut; the identifiers
-            // are matched as-written.
-            return FixtureResult::Skip("canonical-tz is out of scope".into());
-        }
         if fm.features.iter().any(|f| f == "ShadowRealm") {
             // ShadowRealm is a stage-3 proposal, not part of ECMA-262 ES2026.
             return FixtureResult::Skip("ShadowRealm is out of scope".into());

@@ -8,14 +8,35 @@ use crate::tz_data::{NAME_INDEX, TzTransition, TzZone, ZONES};
 /// The nanoseconds per second.
 const NS_PER_SEC: i128 = 1_000_000_000;
 
+/// The (canonical spelling, primary identifier, zone index) of a named zone
+/// identifier, ASCII-case-insensitive.
+fn identifier_record(name: &str) -> Option<(&'static str, &'static str, usize)> {
+    let folded = name.to_ascii_lowercase();
+    NAME_INDEX
+        .binary_search_by(|(n, _, _, _)| n.as_bytes().cmp(folded.as_bytes()))
+        .ok()
+        .map(|i| (NAME_INDEX[i].1, NAME_INDEX[i].2, NAME_INDEX[i].3 as usize))
+}
+
 /// Resolve a time-zone identifier (ASCII-case-insensitive) to its zone
 /// index. `None` when the identifier is not a known named zone.
 pub fn resolve_zone(name: &str) -> Option<usize> {
-    let folded = name.to_ascii_lowercase();
-    NAME_INDEX
-        .binary_search_by(|(n, _)| n.as_bytes().cmp(folded.as_bytes()))
-        .ok()
-        .map(|i| NAME_INDEX[i].1 as usize)
+    identifier_record(name).map(|(_, _, zone)| zone)
+}
+
+/// The canonical spelling of a named zone identifier. The given identifier is
+/// preserved (a Link name is NOT canonicalized to its primary — the spec's
+/// `[[Identifier]]`), only its ASCII case is normalized. `None` when the
+/// identifier is unknown.
+pub fn canonical_identifier(name: &str) -> Option<&'static str> {
+    identifier_record(name).map(|(canonical, _, _)| canonical)
+}
+
+/// The spec primary identifier of a named zone (what `TimeZoneEquals`
+/// compares): a Link's primary, with the `Etc/UTC`/`Etc/GMT`/`GMT` -> `UTC`
+/// normalization. `None` when the identifier is unknown.
+pub fn primary_identifier_of(name: &str) -> Option<&'static str> {
+    identifier_record(name).map(|(_, primary, _)| primary)
 }
 
 /// The zone record for an index.

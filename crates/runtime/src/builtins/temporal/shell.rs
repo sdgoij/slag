@@ -4644,10 +4644,11 @@ fn zoned_until_since(
         UnitOption::Unit(u) => u,
     };
     // spec 6.5.9: different time zones are only comparable in time units;
-    // the identifiers are canonicalized at creation (spec 11.1.15
-    // TimeZoneEquals — test262 canonicalize-iana-identifiers-before-
-    // comparing).
-    if largest.category() == iso::Category::Date && tz != ons_tz {
+    // the identifiers compare by their primary (spec 11.1.15 TimeZoneEquals —
+    // test262 canonicalize-iana-identifiers-before-comparing).
+    let tz_primary: &str = unicode::tz::primary_identifier_of(&tz).unwrap_or(&tz);
+    let ons_primary: &str = unicode::tz::primary_identifier_of(&ons_tz).unwrap_or(&ons_tz);
+    if largest.category() == iso::Category::Date && tz_primary != ons_primary {
         return Err(JsError::new(
             ErrorKind::RangeError,
             "time zones must match".into(),
@@ -7065,9 +7066,14 @@ fn zoned_equals(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value
         TemporalRecord::ZonedDateTime(ns, tz) => (ns, tz.to_string_lossy()),
         _ => unreachable!(),
     };
+    // TimeZoneEquals compares the *primary* identifiers: two Links that
+    // resolve to the same zone are equal even though their stored identifiers
+    // differ (canonicalize-timezone.js, links.js).
+    let primary_a = unicode::tz::primary_identifier_of(&tz).unwrap_or(&tz);
+    let primary_b = unicode::tz::primary_identifier_of(&otz).unwrap_or(&otz);
     Ok(Value::Boolean(
         ns == ons
-            && tz.eq_ignore_ascii_case(&otz)
+            && primary_a == primary_b
             && super::temporal_calendar_id(agent, this)
                 == super::temporal_calendar_id(agent, &other),
     ))
