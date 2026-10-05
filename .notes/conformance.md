@@ -2052,19 +2052,15 @@ SM-shell-specific semantics, so `run_fixture` skips it whole (mirrored in
 contributed 249 failures, 165 include-skips and both `hang`s, none of them
 signal.
 
-With `sm/` skipped, the tier measures **71 pass, 5 fail, 1,407 skip, 0 crash, 0
+With `sm/` skipped, the tier measures **73 pass, 3 fail, 1,407 skip, 0 crash, 0
 hang of 1,483 fixtures** (`--jobs 8 --batch 32 --timeout 15 --recheck-timeout
-15`, release). The 5 failures are the remaining genuine gaps:
+15`, release). The 3 failures are the remaining genuine gaps:
 
-- `explicit-resource-management/exception-handling.js` — `SuppressedError` is
-  not produced when a `using` disposal throws over a body throw.
-- `explicit-resource-management/async-disposal-from-sync-method-returning-a-promise.js`
-  — the async-disposal await path.
 - `decorators/public-auto-accessor.js` — the decorators proposal.
 - `source-phase-imports/{import-source-source-text-module,module-source-prototype-chain}.js`
   — `import.source()` (stage-3).
 
-Two fixes came out of this tier:
+Three fixes came out of this tier:
 
 - **The variable-length-typed-array `preventExtensions`/`seal` trio now
   passes.** `typed_array_buffer_path` derived a view's auto-length from the
@@ -2084,6 +2080,18 @@ Two fixes came out of this tier:
   instead of throwing. The builders now go through `crux::string::append_units`,
   which caps at `MAX_STRING_LENGTH` (1 GiB-1 code units, matching SpiderMonkey)
   and throws `RangeError: Invalid string length`.
+- **The two explicit-resource-management failures now pass.** A JS `throw`
+  escaping a body skipped `DisposeResources`: `throw_machinery`'s no-handler arm
+  returned the throw without draining the active scopes' `using` resources
+  (only the escaping-engine-error path did), so a throwing disposal was
+  silently dropped instead of folding a `SuppressedError`; the arm now drains
+  the env stack and runs disposal, the thrown-value twin of
+  `route_step_error`. Separately, an async context that fell back to a sync
+  `@@dispose` method took the async-dispose hint and awaited the method's
+  return value — GetDisposeMethod keeps the async hint only for an actual
+  `@@asyncDispose`, so the fallback is now sync-hint and its result is not
+  awaited (both `eval.rs::create_disposable_resource` for `await using` and
+  `get_dispose_method`/`drive_async_disposal` for `AsyncDisposableStack`).
 
 ## Open items
 

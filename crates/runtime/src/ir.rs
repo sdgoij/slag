@@ -15116,6 +15116,24 @@ impl Vm {
                     if !self.for_of_stepping {
                         self.close_for_of_throw(agent);
                     }
+                    // spec 9.4.3: the throw escapes the body, so dispose the
+                    // active scopes' `using` resources (innermost first),
+                    // folding a throwing disposal into it (a second throw nests
+                    // a SuppressedError). This is the thrown-value twin of
+                    // `route_step_error`'s drain for an escaping engine error.
+                    let mut resources = Vec::new();
+                    self.env_stack.drain_disposables(&mut resources);
+                    if !resources.is_empty()
+                        && let Some(outcome) = self.start_scope_disposal(
+                            agent,
+                            body,
+                            resources,
+                            Completion::Throw(value),
+                            DisposalResume::ApplyCompletion,
+                        )?
+                    {
+                        return Ok(CtlResult::Done(outcome));
+                    }
                     return Ok(CtlResult::Done(VmOutcome::Completed(Completion::Throw(
                         value,
                     ))));

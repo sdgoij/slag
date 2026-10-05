@@ -447,22 +447,40 @@ fn disposed_getter(agent: &mut Agent, this: &Value, is_async: bool) -> Result<Va
 
 /// GetDisposeMethod (spec 27.4.1.1): the value's `Symbol.dispose`/`
 /// Symbol.asyncDispose` method; `undefined` when absent.
-fn get_dispose_method(agent: &mut Agent, value: &Value, is_async: bool) -> Result<Value, JsError> {
-    let symbol = if is_async { "asyncDispose" } else { "dispose" };
+fn get_dispose_method(
+    agent: &mut Agent,
+    value: &Value,
+    is_async: bool,
+) -> Result<(Value, bool), JsError> {
+    // GetDisposeMethod (spec 27.4.1.1): an async hint prefers @@asyncDispose
+    // and falls back to the sync @@dispose, but only the @@asyncDispose method
+    // keeps the async hint — a sync fallback's return value is not awaited.
+    if is_async {
+        let method = crate::context::get_property_key(
+            agent,
+            value,
+            &PropertyKey::Symbol(crux::symbol::well_known("asyncDispose")),
+            *value,
+        )?;
+        if !matches!(method.kind(), ValueKind::Undefined | ValueKind::Null) {
+            if !is_callable(&method) {
+                return Err(JsError::new(
+                    ErrorKind::TypeError,
+                    "dispose method is not callable".into(),
+                ));
+            }
+            return Ok((method, true));
+        }
+    }
     let method = crate::context::get_property_key(
         agent,
         value,
-        &PropertyKey::Symbol(crux::symbol::well_known(symbol)),
+        &PropertyKey::Symbol(crux::symbol::well_known("dispose")),
         *value,
     )?;
-    if is_async && matches!(method.kind(), ValueKind::Undefined | ValueKind::Null) {
-        // async-dispose falls back to the sync @@dispose method (an async
-        // context can dispose sync resources, spec 27.4.1.1).
-        return get_dispose_method(agent, value, false);
-    }
     match method.kind() {
-        ValueKind::Undefined | ValueKind::Null => Ok(Value::Undefined),
-        _ if is_callable(&method) => Ok(method),
+        ValueKind::Undefined | ValueKind::Null => Ok((Value::Undefined, false)),
+        _ if is_callable(&method) => Ok((method, false)),
         _ => Err(JsError::new(
             ErrorKind::TypeError,
             "dispose method is not callable".into(),
@@ -552,14 +570,14 @@ fn use_value(
     }
     // GetDisposeMethod throws for a value with no (matching) dispose
     // method; primitives box during the property lookup and land here too.
-    let method = get_dispose_method(agent, &value, is_async)?;
+    let (method, async_hint) = get_dispose_method(agent, &value, is_async)?;
     if matches!(method.kind(), ValueKind::Undefined) {
         return Err(JsError::new(
             ErrorKind::TypeError,
             "value is not disposable".into(),
         ));
     }
-    add_resource(agent, id, value, method, is_async, DisposalCall::Receiver)?;
+    add_resource(agent, id, value, method, async_hint, DisposalCall::Receiver)?;
     Ok(value)
 }
 
@@ -580,13 +598,15 @@ fn check_not_disposed(agent: &Agent, id: u64) -> Result<(), JsError> {
 }
 
 /// AddDisposableResource (spec 27.4.1.2): append `{ value, method, hint }`
-/// to the stack, throwing when the stack is disposed.
+/// to the stack, throwing when the stack is disposed. `async_hint` is the
+/// resource's own hint — an async stack's sync `@@dispose` resource carries
+/// the sync hint and is not awaited.
 fn add_resource(
     agent: &mut Agent,
     id: u64,
     value: Value,
     method: Value,
-    is_async: bool,
+    async_hint: bool,
     call: DisposalCall,
 ) -> Result<(), JsError> {
     check_not_disposed(agent, id)?;
@@ -598,7 +618,7 @@ fn add_resource(
     data.resources.push(DisposableResource {
         value,
         method,
-        hint: is_async,
+        hint: async_hint,
         call,
     });
     Ok(())
@@ -917,6 +937,19 @@ fn drive_async_disposal(agent: &mut Agent, driver_id: u64) -> Result<Value, JsEr
             return drive_async_disposal(agent, driver_id);
         }
     };
+    if !resource.hint {
+        // Sync-hint resource (the method was found via @@dispose, even on an
+        // async stack): DisposeResources discards its return value without an
+        // Await (spec 27.4.1.3 step 3.c); only an @@asyncDispose result awaits.
+        let driver = agent
+            .disposable_async_drivers
+            .get(&driver_id)
+            .cloned()
+            .ok_or_else(|| JsError::new(ErrorKind::TypeError, "no disposal driver".into()))?;
+        driver.borrow_mut().index += 1;
+        drop(driver);
+        return drive_async_disposal(agent, driver_id);
+    }
     let promise_ctor = agent
         .current_realm()?
         .intrinsics

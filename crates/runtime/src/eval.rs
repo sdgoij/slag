@@ -479,17 +479,24 @@ pub(crate) fn create_disposable_resource(
             "using declarations may only initialize objects".into(),
         ));
     }
-    let symbol = if kind == DisposalKind::Async {
-        "@@asyncDispose"
+    // spec 9.3.1 GetDisposeMethod: an async context prefers @@asyncDispose and
+    // falls back to the sync @@dispose — but only an @@asyncDispose method
+    // carries the async-dispose hint, so a sync method's return value is not
+    // awaited even under `await using`.
+    let (method, hint) = if kind == DisposalKind::Async {
+        match crate::expr::get_method(agent, value, "@@asyncDispose")? {
+            Some(method) => (Some(method), crate::env::DisposalHint::Async),
+            None => (
+                crate::expr::get_method(agent, value, "@@dispose")?,
+                crate::env::DisposalHint::Sync,
+            ),
+        }
     } else {
-        "@@dispose"
+        (
+            crate::expr::get_method(agent, value, "@@dispose")?,
+            crate::env::DisposalHint::Sync,
+        )
     };
-    // spec 9.3.1 GetDisposeMethod: an async context falls back to the sync
-    // @@dispose method.
-    let mut method = crate::expr::get_method(agent, value, symbol)?;
-    if kind == DisposalKind::Async && method.is_none() {
-        method = crate::expr::get_method(agent, value, "@@dispose")?;
-    }
     let method = method.unwrap_or(Value::Undefined);
     if matches!(method.kind(), ValueKind::Undefined) {
         return Err(JsError::new(
@@ -500,11 +507,7 @@ pub(crate) fn create_disposable_resource(
     Ok(crate::env::DisposableResource {
         value: *value,
         method,
-        hint: if kind == DisposalKind::Async {
-            crate::env::DisposalHint::Async
-        } else {
-            crate::env::DisposalHint::Sync
-        },
+        hint,
     })
 }
 
