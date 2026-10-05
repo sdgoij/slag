@@ -31,6 +31,7 @@ See the following skills for full details:
 - **No stubs / real implementations**: `minix-c-to-rust` skill
 - **Testing requirements**: `minix-testing` skill
 - **Commit message format**: `git-commit-messages` skill
+- **GC rooting of GC values held in runtime/builtin locals**: `slag-gc-rooting` skill
 
 ## Sweep timeouts
 
@@ -66,6 +67,18 @@ The operator controls all staging and commit decisions. **Agents must never stag
 # Rules Hygiene
 
 These `.rules` files are read by every agent session. Keep them high-signal.
+
+## The home for detail is a skill, not `.rules`
+`.rules` is **not** the place for an explanation, a procedure, or a trap's
+body — and it is not where a newly-discovered pattern belongs. Every `.rules`
+file is injected into every session, so it must stay a short, high-signal
+pointer list. The detail goes in a skill under
+`.agents/skills/<name>/SKILL.md`, loaded on demand, and referenced from
+`.rules` with at most a one-line pointer (see "See the following skills for
+full details"). When you find a non-obvious pattern worth recording, **write
+the skill first**; only the pointer goes in `.rules`, never the body. If a
+draft rule is growing past a sentence or two, that is the signal it is a skill
+wearing the wrong name.
 
 ## After any agentic session
 If you discover a non-obvious pattern that would help future sessions, include a **"Suggested .rules additions"** heading in your PR description with the proposed text. Do **not** edit `.rules` inline during normal feature/fix work. Reviewers decide what gets merged.

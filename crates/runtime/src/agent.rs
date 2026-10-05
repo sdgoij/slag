@@ -2573,16 +2573,26 @@ impl Agent {
         // or bound functions) are filtered out.
         self.reap_dead_functions();
         self.reap_dead_wrappers();
+        // A `StressSuppress` window — and a running compile — holds GC handles
+        // in local buffers the stack scan cannot see, which is the whole reason
+        // the window suppresses the per-allocation collector. A safe-point
+        // collection is just as unsafe inside it: a handler held only in a
+        // builtin's local `Vec` would be swept out from under the call. So the
+        // window suppresses this trigger too.
+        let suppressed = crate::ir::is_compiling();
         let young = crux::heap::with_heap(|heap| heap.young_count());
-        if self.gc_stress.get()
-            || (!crux::heap::minor_disabled() && young >= self.nursery_threshold.get())
+        if !suppressed
+            && (self.gc_stress.get()
+                || (!crux::heap::minor_disabled() && young >= self.nursery_threshold.get()))
         {
             self.clear_derived_caches();
             self.collect_minor_garbage_with(None);
         }
         let live = crux::heap::with_heap(|heap| heap.live_count());
         let threshold = self.last_collected_live.get().max(1024).saturating_mul(2);
-        if self.gc_stress.get() || (!crux::heap::major_disabled() && live > threshold) {
+        if !suppressed
+            && (self.gc_stress.get() || (!crux::heap::major_disabled() && live > threshold))
+        {
             self.clear_derived_caches();
             self.collect_garbage();
         }

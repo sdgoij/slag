@@ -880,6 +880,11 @@ fn all_fulfilled(
 /// The `allSettled` per-element handler.
 /// Promise.allSettled (spec 27.2.4.3.1).
 fn promise_all_settled(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsError> {
+    // GC-2: the per-element handler closures live only in the local `handlers`
+    // buffer until `then` roots them, and the iterator/resolve calls below run
+    // user code that can allocate; suppress collections for the window so a
+    // mid-loop sweep cannot free a handler out from under the call.
+    let _stress = crate::ir::StressSuppress::new();
     let capability = new_promise_capability(agent, this)?;
     let Some(promise_resolve_fn) = get_promise_resolve(agent, this, &capability.reject)? else {
         return Ok(capability.promise);

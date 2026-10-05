@@ -541,6 +541,7 @@ time (`crates/runtime/src/builtins/array.rs` is the model) and need nothing.
 - `PLAN.md` — the implementation plan, per-phase spec coverage, and status
 - `.notes/conformance.md` — conformance methodology, results, and triage
 - `.notes/gc-plan.md` — the GC milestone plan (arena heap + mark-sweep, cut-by-cut)
+- `.notes/barrier-uaf.md` — open: a write-barrier miss / suspected use-after-free in the promise/arguments path under `--gc-stress`
 - `.notes/intl-plan.md` — the ECMA-402 (Intl) implementation plan and cut status
 - `.notes/jit-report.md` — the experimental Cranelift JIT: design, fast paths, hardening, validation, and remaining work
 - `.notes/memory-model.md` — ECMAScript ch. 28 shared-memory model
