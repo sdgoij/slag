@@ -2050,13 +2050,10 @@ SM-shell-specific semantics, so `run_fixture` skips it whole (mirrored in
 contributed 249 failures, 165 include-skips and both `hang`s, none of them
 signal.
 
-With `sm/` skipped, the tier measures **75 pass, 1 fail, 1,407 skip, 0 crash, 0
+With `sm/` skipped, the tier measures **76 pass, 0 fail, 1,407 skip, 0 crash, 0
 hang of 1,483 fixtures** (`--jobs 8 --batch 32 --timeout 15 --recheck-timeout
-15`, release). The single failure is the remaining genuine gap:
-
-- `decorators/public-auto-accessor.js` — the decorators proposal.
-
-Four fixes came out of this tier:
+15`, release) — every runnable staging fixture passes (the 1,407 skips are the
+`sm` suite and one Temporal fixture). Five fixes came out of this tier:
 
 - **The variable-length-typed-array `preventExtensions`/`seal` trio now
   passes.** `typed_array_buffer_path` derived a view's auto-length from the
@@ -2099,6 +2096,20 @@ Four fixes came out of this tier:
   `%AbstractModuleSource%.prototype`. The harness registers the test262
   `<module source>` host artifact for every module fixture — it is referenced
   only dynamically, so the static-request walk never saw it.
+- **The public auto-accessor failure now passes (the tier is fully green).**
+  The parser parsed `accessor name …` as a plain class field ("the accessor
+  semantics are not implemented"), so `accessor x` defined an own instance
+  field instead of the prototype get/set accessor pair with a hidden
+  per-instance backing slot. It is now desugared in the parser into the
+  elements the class machinery already implements: a hidden private storage
+  field plus a public `Get`/`Set` pair whose synthesized bodies read and write
+  it (`this.#storage`), so the override/merge ordering against a user
+  `get`/`set`, the static form, and the derived-class brand-check TypeError all
+  fall out of the existing element loop (`decorators/public-auto-accessor.js`).
+  A private `accessor #x` is observably a private field and stays one. The
+  desugaring evaluates a *computed* auto-accessor key twice (once for the
+  synthesized getter, once for the setter); no fixture exercises a
+  side-effecting key, and it is the one known simplification.
 
 ## Open items
 

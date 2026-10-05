@@ -2,7 +2,10 @@
 
 use crux::{JsError, Span, intern_utf8};
 use syntax::keywords::Keyword;
-use syntax::{Block, Class, ClassElement, ClassElementName, Function, TokenKind};
+use syntax::{
+    AssignOp, BindingPattern, Block, Class, ClassElement, ClassElementName, Expr, ExprKind,
+    Function, MemberExpr, MemberProperty, Stmt, StmtKind, TokenKind,
+};
 
 use crate::expr::{
     check_duplicate_params, is_property_name_start, parse_assignment, parse_expression,
@@ -73,64 +76,10 @@ pub(crate) fn parse_class(
     let mut constructor_count = 0usize;
     while !parser.at_punct(TokenKind::RightBrace)? {
         let element_start = parser.peek()?.span.start;
-        let Some(element) = parse_class_element(parser)? else {
-            continue; // `;` placeholder element
-        };
-        match &element {
-            ClassElement::Method {
-                is_static: false,
-                name,
-                function,
-            } if is_plain_constructor(name, function) => {
-                constructor_count += 1;
-                if constructor_count > 1 {
-                    return Err(
-                        parser.error_at(element_start, "A class may only have one constructor")
-                    );
-                }
-            }
-            ClassElement::Field {
-                is_static: false,
-                name,
-                ..
-            } if is_name(name, "constructor") => {
-                return Err(
-                    parser.error_at(element_start, "Class field may not be named constructor")
-                );
-            }
-            ClassElement::Field {
-                is_static: true,
-                name,
-                ..
-            } if is_name(name, "prototype") || is_name(name, "constructor") => {
-                return Err(parser.error_at(
-                    element_start,
-                    "Static class field may not be named prototype or constructor",
-                ));
-            }
-            ClassElement::Method {
-                is_static: true,
-                name,
-                ..
-            }
-            | ClassElement::Get {
-                is_static: true,
-                name,
-                ..
-            }
-            | ClassElement::Set {
-                is_static: true,
-                name,
-                ..
-            } if is_name(name, "prototype") => {
-                return Err(parser.error_at(
-                    element_start,
-                    "Static class method may not be named prototype",
-                ));
-            }
-            _ => {}
+        for element in parse_class_element(parser)? {
+            check_class_element(parser, &element, element_start, &mut constructor_count)?;
+            elements.push(element);
         }
-        elements.push(element);
     }
     parser.expect_punct(TokenKind::RightBrace)?;
     let end = parser.prev.as_ref().unwrap().span.end;
@@ -187,6 +136,67 @@ fn is_name(name: &ClassElementName, text: &str) -> bool {
     }
 }
 
+/// The element-level early errors a class body enforces on each parsed
+/// element (constructor count, the `constructor`/`prototype` name bans).
+fn check_class_element(
+    parser: &Parser,
+    element: &ClassElement,
+    element_start: u32,
+    constructor_count: &mut usize,
+) -> Result<(), JsError> {
+    match element {
+        ClassElement::Method {
+            is_static: false,
+            name,
+            function,
+        } if is_plain_constructor(name, function) => {
+            *constructor_count += 1;
+            if *constructor_count > 1 {
+                return Err(parser.error_at(element_start, "A class may only have one constructor"));
+            }
+        }
+        ClassElement::Field {
+            is_static: false,
+            name,
+            ..
+        } if is_name(name, "constructor") => {
+            return Err(parser.error_at(element_start, "Class field may not be named constructor"));
+        }
+        ClassElement::Field {
+            is_static: true,
+            name,
+            ..
+        } if is_name(name, "prototype") || is_name(name, "constructor") => {
+            return Err(parser.error_at(
+                element_start,
+                "Static class field may not be named prototype or constructor",
+            ));
+        }
+        ClassElement::Method {
+            is_static: true,
+            name,
+            ..
+        }
+        | ClassElement::Get {
+            is_static: true,
+            name,
+            ..
+        }
+        | ClassElement::Set {
+            is_static: true,
+            name,
+            ..
+        } if is_name(name, "prototype") => {
+            return Err(parser.error_at(
+                element_start,
+                "Static class method may not be named prototype",
+            ));
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
 /// Whether `static` at the current position is the class-element prefix
 /// rather than an element named `static`.
 fn static_is_prefix(parser: &mut Parser) -> Result<bool, JsError> {
@@ -209,9 +219,93 @@ fn accessor_is_prefix(parser: &mut Parser) -> Result<bool, JsError> {
     Ok(!parser.peek2()?.line_break_before && is_class_name_start(parser.peek2()?.kind.clone()))
 }
 
-fn parse_class_element(parser: &mut Parser) -> Result<Option<ClassElement>, JsError> {
-    if parser.eat_punct(TokenKind::Semicolon)? {
+/// The getter/setter bodies of a public auto-accessor: `get () { return
+/// this.#storage }` and `set (v) { this.#storage = v }`, where `#storage` is
+/// the auto-accessor's hidden backing private field. `span` is the whole
+/// `accessor …;` element (used as the accessors' `[[SourceText]]`).
+fn synthesize_auto_accessor_bodies(
+    span: Span,
+    storage: crux::string::AtomId,
+) -> (Block, BindingPattern, Block) {
+    let this_storage = || Expr {
+        span,
+        kind: ExprKind::Member(MemberExpr {
+            object: Box::new(Expr {
+                span,
+                kind: ExprKind::This,
+            }),
+            property: MemberProperty::Private(storage),
+            property_token: Some(span),
+            optional: false,
+            span,
+        }),
+    };
+    let get_body = Block {
+        stmts: vec![Stmt {
+            span,
+            kind: StmtKind::Return(Some(this_storage())),
+        }],
+        span,
+    };
+    let param = intern_utf8("v");
+    let set_body = Block {
+        stmts: vec![Stmt {
+            span,
+            kind: StmtKind::Expr(Expr {
+                span,
+                kind: ExprKind::Assign {
+                    op: AssignOp::Assign,
+                    target: Box::new(this_storage()),
+                    value: Box::new(Expr {
+                        span,
+                        kind: ExprKind::Ident(param),
+                    }),
+                },
+            }),
+        }],
+        span,
+    };
+    (get_body, BindingPattern::Ident(param), set_body)
+}
+
+/// A fresh, user-unreachable private-name atom for an auto-accessor's backing
+/// storage. A `#` private identifier can only be written with identifier
+/// characters, so the `%…%` spelling cannot be produced by source.
+fn auto_accessor_storage() -> crux::string::AtomId {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static NEXT: AtomicU32 = AtomicU32::new(0);
+    let id = NEXT.fetch_add(1, Ordering::Relaxed);
+    intern_utf8(&format!("%auto-accessor{id}%"))
+}
+
+/// `= AssignmentExpression?` after a field/auto-accessor name, with the
+/// `super`/`new.target` allowances of a field initializer.
+fn parse_field_initializer(parser: &mut Parser) -> Result<Option<Expr>, JsError> {
+    if !parser.eat_punct(TokenKind::Equal)? {
         return Ok(None);
+    }
+    // Field initializers may use `super` and `new.target` (the latter
+    // resolves to undefined at runtime; it is not an early error).
+    let saved = (
+        parser.allow_super,
+        parser.in_constructor,
+        parser.in_field_initializer,
+    );
+    parser.allow_super = true;
+    parser.in_constructor = false;
+    parser.in_field_initializer = true;
+    let value = parse_assignment(parser, true);
+    (
+        parser.allow_super,
+        parser.in_constructor,
+        parser.in_field_initializer,
+    ) = saved;
+    Ok(Some(value?))
+}
+
+fn parse_class_element(parser: &mut Parser) -> Result<Vec<ClassElement>, JsError> {
+    if parser.eat_punct(TokenKind::Semicolon)? {
+        return Ok(Vec::new());
     }
     // Decorators may precede any element (stage-3 proposal); they are
     // validated syntactically and discarded.
@@ -228,14 +322,74 @@ fn parse_class_element(parser: &mut Parser) -> Result<Option<ClassElement>, JsEr
     // `static { … }` — a class static initialization block.
     if is_static && parser.at_punct(TokenKind::LeftBrace)? {
         let body = parse_static_block(parser)?;
-        return Ok(Some(ClassElement::StaticBlock(body)));
+        return Ok(vec![ClassElement::StaticBlock(body)]);
     }
 
-    // `accessor name …` — an auto-accessor field (decorators proposal); the
-    // accessor semantics are not implemented, so the element parses as a
-    // plain field.
+    // `accessor name …` — an auto-accessor (decorators proposal). It is
+    // desugared here, into the elements the class machinery already
+    // implements: a hidden private storage field plus a public get/set
+    // accessor pair whose bodies read and write that field (see
+    // `synthesize_auto_accessor_bodies`). A private auto-accessor
+    // (`accessor #x`) is observably a private field — `this.#x` is its own
+    // backing slot — so it desugars to a single private field.
     if parser.at_contextual_unescaped("accessor")? && accessor_is_prefix(parser)? {
-        parser.next()?;
+        let accessor_start = parser.peek()?.span.start;
+        parser.next()?; // `accessor`
+        let name_start = parser.peek()?.span.start;
+        let name = parse_class_element_name(parser)?;
+        if matches!(name, ClassElementName::Private(_)) {
+            declare_private_name(parser, &name, PrivateNameKind::Other, is_static)?;
+            let init = parse_field_initializer(parser)?;
+            parser.expect_semicolon()?;
+            let end = parser.prev.as_ref().unwrap().span.end;
+            return Ok(vec![ClassElement::Field {
+                is_static,
+                name,
+                init,
+                span: Span::new(accessor_start, end),
+            }]);
+        }
+        // A public auto-accessor is a field-like element, so the field-name
+        // early errors apply; the synthesized accessor pair would bypass them.
+        if !is_static && is_name(&name, "constructor") {
+            return Err(parser.error_at(name_start, "Class field may not be named constructor"));
+        }
+        if is_static && (is_name(&name, "prototype") || is_name(&name, "constructor")) {
+            return Err(parser.error_at(
+                name_start,
+                "Static class field may not be named prototype or constructor",
+            ));
+        }
+        let init = parse_field_initializer(parser)?;
+        parser.expect_semicolon()?;
+        let end = parser.prev.as_ref().unwrap().span.end;
+        let span = Span::new(accessor_start, end);
+        let storage = auto_accessor_storage();
+        let storage_name = ClassElementName::Private(storage);
+        declare_private_name(parser, &storage_name, PrivateNameKind::Other, is_static)?;
+        let (get_body, set_param, set_body) = synthesize_auto_accessor_bodies(span, storage);
+        return Ok(vec![
+            ClassElement::Field {
+                is_static,
+                name: storage_name,
+                init,
+                span,
+            },
+            ClassElement::Get {
+                is_static,
+                name: name.clone(),
+                body: get_body,
+                span,
+            },
+            ClassElement::Set {
+                is_static,
+                name,
+                param: set_param,
+                init: None,
+                body: set_body,
+                span,
+            },
+        ]);
     }
 
     // `*name() {}` — generator method.
@@ -245,11 +399,11 @@ fn parse_class_element(parser: &mut Parser) -> Result<Option<ClassElement>, JsEr
         check_special_constructor(parser, &name, is_static)?;
         let function = parse_class_method_tail(parser, method_start, false, true)?;
         declare_private_name(parser, &name, PrivateNameKind::Other, is_static)?;
-        return Ok(Some(ClassElement::Method {
+        return Ok(vec![ClassElement::Method {
             is_static,
             name,
             function,
-        }));
+        }]);
     }
     // `async name() {}` / `async *name() {}`.
     if parser.at_contextual_unescaped("async")?
@@ -264,11 +418,11 @@ fn parse_class_element(parser: &mut Parser) -> Result<Option<ClassElement>, JsEr
         check_special_constructor(parser, &name, is_static)?;
         let function = parse_class_method_tail(parser, method_start, true, is_generator)?;
         declare_private_name(parser, &name, PrivateNameKind::Other, is_static)?;
-        return Ok(Some(ClassElement::Method {
+        return Ok(vec![ClassElement::Method {
             is_static,
             name,
             function,
-        }));
+        }]);
     }
     // `get name() {}` / `set name(p) {}`.
     if parser.at_contextual_unescaped("get")? && is_class_name_start(parser.peek2()?.kind.clone()) {
@@ -281,12 +435,12 @@ fn parse_class_element(parser: &mut Parser) -> Result<Option<ClassElement>, JsEr
         let (body, _) = parse_function_body_block(parser, false, false, &[], true, false, false)?;
         declare_private_name(parser, &name, PrivateNameKind::Getter(is_static), is_static)?;
         let span = Span::new(accessor_start, body.span.end);
-        return Ok(Some(ClassElement::Get {
+        return Ok(vec![ClassElement::Get {
             is_static,
             name,
             body,
             span,
-        }));
+        }]);
     }
     if parser.at_contextual_unescaped("set")? && is_class_name_start(parser.peek2()?.kind.clone()) {
         let accessor_start = parser.peek()?.span.start; // `set`
@@ -303,14 +457,14 @@ fn parse_class_element(parser: &mut Parser) -> Result<Option<ClassElement>, JsEr
         let (body, _) = parse_function_body_block(parser, false, false, &[], true, false, false)?;
         declare_private_name(parser, &name, PrivateNameKind::Setter(is_static), is_static)?;
         let span = Span::new(accessor_start, body.span.end);
-        return Ok(Some(ClassElement::Set {
+        return Ok(vec![ClassElement::Set {
             is_static,
             name,
             param,
             init,
             body,
             span,
-        }));
+        }]);
     }
 
     // Plain method or field.
@@ -321,45 +475,24 @@ fn parse_class_element(parser: &mut Parser) -> Result<Option<ClassElement>, JsEr
         let function =
             parse_class_method_tail_with(parser, name_start, false, false, in_constructor)?;
         declare_private_name(parser, &name, PrivateNameKind::Other, is_static)?;
-        return Ok(Some(ClassElement::Method {
+        return Ok(vec![ClassElement::Method {
             is_static,
             name,
             function,
-        }));
+        }]);
     }
 
-    // Field: `name Initializer? ;` (an `accessor` field is still a field for
-    // parsing purposes; the accessor semantics are not implemented).
+    // Field: `name Initializer? ;`.
     declare_private_name(parser, &name, PrivateNameKind::Other, is_static)?;
-    let init = if parser.eat_punct(TokenKind::Equal)? {
-        // Field initializers may use `super` and `new.target` (the latter
-        // resolves to undefined at runtime; it is not an early error).
-        let saved = (
-            parser.allow_super,
-            parser.in_constructor,
-            parser.in_field_initializer,
-        );
-        parser.allow_super = true;
-        parser.in_constructor = false;
-        parser.in_field_initializer = true;
-        let value = parse_assignment(parser, true)?;
-        (
-            parser.allow_super,
-            parser.in_constructor,
-            parser.in_field_initializer,
-        ) = saved;
-        Some(value)
-    } else {
-        None
-    };
+    let init = parse_field_initializer(parser)?;
     parser.expect_semicolon()?;
     let end = parser.prev.as_ref().unwrap().span.end;
-    Ok(Some(ClassElement::Field {
+    Ok(vec![ClassElement::Field {
         is_static,
         name,
         init,
         span: Span::new(name_start, end),
-    }))
+    }])
 }
 
 /// `constructor` may not be a getter/setter/async/generator method.
