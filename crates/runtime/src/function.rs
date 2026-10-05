@@ -2708,6 +2708,41 @@ fn run_compiled_body(
 ) -> Result<Value, JsError> {
     let body_env = agent.running_context()?.lexical_environment;
     let mut vm = agent.take_vm(body_env, strict);
+    let result = run_compiled_body_on(
+        agent,
+        &mut vm,
+        ir,
+        args,
+        this_value,
+        function_value,
+        body_env,
+        false,
+    );
+    agent.return_vm(vm);
+    result
+}
+
+/// The body of [`run_compiled_body`] on a caller-provided `Vm` (C3's nested
+/// interpreter activation): `agent` already has the callee's execution context
+/// pushed, and the caller has rebound `vm`'s env/strictness and parked whatever
+/// else the nested run must not observe. Used by the pooled path above and by
+/// `Vm::run_certified_call_nested`.
+///
+/// `frame_prepared` is `true` when the caller has already carved the callee's
+/// frame (C3.2: a flat `vm.stack` segment addressed by `leaf_frame_base`), so
+/// the certified frame setup is skipped; the pooled path and the C3a park path
+/// pass `false` and let `setup_certified_frame` fill `vm.frame`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn run_compiled_body_on(
+    agent: &mut Agent,
+    vm: &mut crate::ir::Vm,
+    ir: &std::rc::Rc<crate::ir::CompiledBody>,
+    args: &[Value],
+    this_value: Option<Value>,
+    function_value: Value,
+    body_env: crate::env::EnvRef,
+    frame_prepared: bool,
+) -> Result<Value, JsError> {
     // Cut 47: the closure whose body is running — the JIT's
     // `TailCallSelfCheck` compares the resolved callee against it to
     // recognize a global-name self-tail-call. Updated by
@@ -2724,8 +2759,9 @@ fn run_compiled_body(
     }
     // A certified body with no bindings (frame_size 0) never reads the
     // frame — `Vm::new` already left the inline buffer in place — so the
-    // slot-by-slot setup is skipped entirely.
-    if let Some(scope) = &ir.scope {
+    // slot-by-slot setup is skipped entirely. A caller that already carved the
+    // frame (C3.2) skips the whole setup too.
+    if !frame_prepared && let Some(scope) = &ir.scope {
         vm.setup_certified_frame(scope, args, this_value);
     }
     // The JIT path (when installed): the general path runs certified bodies
@@ -2740,14 +2776,13 @@ fn run_compiled_body(
     // native stack.
     if ir.scope.is_some() {
         loop {
-            match crate::jit::run_jit_body(agent, &mut vm, &ir, ir.self_call_eligible())? {
+            match crate::jit::run_jit_body(agent, vm, &ir, ir.self_call_eligible())? {
                 crate::jit::JitRunOutcome::Value(value) => {
                     let result = crate::eval::dispose_env_resources(
                         agent,
                         &body_env,
                         Ok(Completion::Return(value)),
                     );
-                    agent.return_vm(vm);
                     let completion = result?;
                     return body_completion_to_value(completion);
                 }
@@ -2762,7 +2797,6 @@ fn run_compiled_body(
                 crate::jit::JitRunOutcome::Suspended(_) => {
                     // A suspension only happens in a generator/async body,
                     // which runs through its own driver — never here.
-                    agent.return_vm(vm);
                     return Err(JsError::new(
                         ErrorKind::TypeError,
                         "ordinary function suspended unexpectedly".into(),
@@ -2775,7 +2809,6 @@ fn run_compiled_body(
     let completion = match vm.start(agent, &ir) {
         Ok(VmOutcome::Completed(completion)) => completion,
         Ok(VmOutcome::Suspended(_)) => {
-            agent.return_vm(vm);
             return Err(JsError::new(
                 ErrorKind::TypeError,
                 "ordinary function suspended unexpectedly".into(),
@@ -2784,7 +2817,6 @@ fn run_compiled_body(
         // `run_inner`'s driver consumes tail calls internally; an escaped one
         // is an internal invariant violation.
         Ok(VmOutcome::TailCall(_)) => {
-            agent.return_vm(vm);
             return Err(JsError::new(
                 ErrorKind::TypeError,
                 "tail call escaped the driver".into(),
@@ -2793,7 +2825,6 @@ fn run_compiled_body(
         // `run_inner`'s driver performs a withdrawn call before the body can
         // complete; an escaped one is an internal invariant violation.
         Ok(VmOutcome::Call(_)) => {
-            agent.return_vm(vm);
             return Err(JsError::new(
                 ErrorKind::TypeError,
                 "withdrawn call escaped the driver".into(),
@@ -2803,12 +2834,10 @@ fn run_compiled_body(
         // (spec 14.2.3 step 6, mirroring the walker's eval_statement_list);
         // a throwing disposal folds into the error as a SuppressedError.
         Err(error) => {
-            agent.return_vm(vm);
             return Err(body_error_after_disposal(agent, &body_env, error));
         }
     };
     let result = crate::eval::dispose_env_resources(agent, &body_env, Ok(completion));
-    agent.return_vm(vm);
     let completion = result?;
     body_completion_to_value(completion)
 }

@@ -2065,9 +2065,7 @@ fn self_call_inline(ctx: &mut JitCallContext, args: *mut u64, argc: u64) -> Opti
     // `certified_call_inline`.
     let saved_nested = unsafe {
         let vm = &mut *ctx.vm;
-        let saved = vm.nested_frame;
-        vm.nested_frame = Some(buf_ptr);
-        saved
+        vm.install_nested_frame(buf_ptr)
     };
     agent.jit_depth += 1;
     // SAFETY: `ctx` is the live per-call context the enclosing compiled body
@@ -2082,7 +2080,7 @@ fn self_call_inline(ctx: &mut JitCallContext, args: *mut u64, argc: u64) -> Opti
     agent.jit_depth -= 1;
     unsafe {
         let vm = &mut *ctx.vm;
-        vm.nested_frame = saved_nested;
+        vm.restore_nested_frame(saved_nested);
         vm.restore_scratch(saved_scratch);
     }
     ctx.buf_end = saved_end;
@@ -2350,8 +2348,7 @@ fn certified_lane_inline(
     // gate.
     let (saved_nested, saved_call_args) = unsafe {
         let vm = &mut *ctx.vm;
-        let saved = vm.nested_frame;
-        vm.nested_frame = Some(buf_ptr);
+        let saved = vm.install_nested_frame(buf_ptr);
         let call_args = if scope.arguments_slot.is_some() {
             Some(std::mem::replace(&mut vm.call_args, args.to_vec()))
         } else {
@@ -2409,7 +2406,7 @@ fn certified_lane_inline(
     agent.jit_depth -= 1;
     unsafe {
         let vm = &mut *ctx.vm;
-        vm.nested_frame = saved_nested;
+        vm.restore_nested_frame(saved_nested);
         if let Some(call_args) = saved_call_args {
             vm.call_args = call_args;
         }
@@ -6662,18 +6659,18 @@ pub(crate) fn run_jit_body(
     // SAFETY: `info.entry` is a code pointer the cache owns; a fn pointer
     // is pointer-sized, so the integer cast is exact.
     let entry: JitEntry = unsafe { std::mem::transmute(info.entry) };
-    // The frame lives in `vm.frame` (the caller filled it with `setup_frame`
-    // plus the this slot); the working area is a segment of `vm.stack`, which
-    // the run reserved to `stack_cap` so a helper push cannot reallocate it
-    // under the baked region pointer.
+    // The frame lives in `vm.frame` for a top-level run, or in a `vm.stack`
+    // segment addressed by `leaf_frame_base` for a C3.2 nested interpreter
+    // call (which carved the slots and installed the base); the working area
+    // is a segment of `vm.stack` above it, which the run reserved to
+    // `stack_cap` so a helper push cannot reallocate it under the baked region
+    // pointer. The frame pointer is derived AFTER the working-region reserve:
+    // the reserve may reallocate `vm.stack`, so a pointer taken before it could
+    // dangle.
     debug_assert!(
         vm.nested_frame.is_none(),
-        "run_jit_body addresses `vm.frame` directly, so a nested_frame pointer would disagree with the frame the entry is handed"
+        "run_jit_body addresses `vm.frame`/`leaf_frame_base` directly, so a nested_frame pointer would disagree with the frame the entry is handed"
     );
-    let (frame_ptr, _frame_len): (*mut Value, usize) = match &mut vm.frame {
-        crate::ir::Frame::Inline(buf) => (buf.as_mut_ptr(), buf.len()),
-        crate::ir::Frame::Heap(vec) => (vec.as_mut_ptr(), vec.len()),
-    };
     let work_len = info.stack_usage + JIT_STACK_SLACK;
     // C0a (mechanism 1): the working region is a segment of `vm.stack`, and
     // the stack is reserved to `stack_cap` here so no helper push during the
@@ -6683,6 +6680,16 @@ pub(crate) fn run_jit_body(
     vm.stack.resize(work_base + work_len, Value::Undefined);
     vm.stack
         .reserve(vm.stack_cap.saturating_sub(vm.stack.len()));
+    // SAFETY: `leaf_frame_base` (when set) indexes a live `vm.stack` segment the
+    // nested call carved below `work_base`; the reserve above pinned the
+    // backing allocation for the run.
+    let frame_ptr: *mut c_void = match vm.leaf_frame_base {
+        Some(base) => unsafe { vm.stack.as_mut_ptr().add(base) as *mut c_void },
+        None => match &mut vm.frame {
+            crate::ir::Frame::Inline(buf) => buf.as_mut_ptr() as *mut c_void,
+            crate::ir::Frame::Heap(vec) => vec.as_mut_ptr() as *mut c_void,
+        },
+    };
     let work_ptr = unsafe { vm.stack.as_mut_ptr().add(work_base) } as *mut c_void;
     // The live global for the compiled `LoadGlobal` fast path (resolved and
     // cached on this Vm; the machine code re-reads its id/generation in
@@ -7549,6 +7556,7 @@ mod tests {
             has_call_apply: false,
             has_call_intrinsic: false,
             max_stack,
+            nested_gate: std::cell::Cell::new(None),
         })
     }
 

@@ -1908,6 +1908,10 @@ pub struct CompiledBody {
     /// JIT can size its working area and the interpreter can bound an
     /// activation's stack growth without recomputing it per call.
     pub max_stack: usize,
+    /// C3: the cached `(nested_call_eligible, touches_semantic_control)` verdict
+    /// the interpreter's nested-call carve consults (both are pure functions of
+    /// the step list, so they are computed once instead of scanned per call).
+    pub nested_gate: std::cell::Cell<Option<(bool, bool)>>,
 }
 
 impl CompiledBody {
@@ -2056,6 +2060,64 @@ impl CompiledBody {
                     | Step::Construct { .. }
                     | Step::TaggedTemplate(_)
                     | Step::TailTaggedTemplate(_)
+                    | Step::SuperCall
+            )
+        })
+    }
+
+    /// C3a: whether the body can leave a *semantically scanned* control stack
+    /// (`try_stack`/for-in/for-of/destructure/yield-star/disposal) populated —
+    /// the stacks a nested run must start empty and can leave dangling on an
+    /// abrupt exit. The `*Next`/`*Close` steps only run after their
+    /// `*Begin`/`EnterTry`, so those cover every producer. A body with none of
+    /// them only pushes the LIFO `list_stack` (any block), which the
+    /// control-free fast path of `Vm::run_certified_call_nested` clears in one
+    /// step instead of parking ~twenty stacks.
+    pub(crate) fn touches_semantic_control(&self) -> bool {
+        self.steps.iter().any(|step| {
+            matches!(
+                step,
+                Step::EnterTry { .. }
+                    | Step::ForInBegin
+                    | Step::ForOfBegin { .. }
+                    | Step::AsyncForOfBegin { .. }
+                    | Step::DestructureBegin
+                    | Step::Yield { .. }
+                    | Step::Await { .. }
+            )
+        })
+    }
+
+    /// C3a: whether the body may run as a nested interpreter activation on the
+    /// caller's own `Vm` (the withdrawn interpreter call, `complete_call`).
+    /// Unlike the compiled lanes' `has_shared_vm_step_hazard`, the C3a run
+    /// isolates the caller's full control state (a watermark/clear, not the
+    /// lane's narrowed env-only save), so the control-flow steps (`try`/for-in/
+    /// for-of/destructure) are admissible. Excluded are only the steps that
+    /// either frame-replace through `Vm::reset` (`TailCall*`, which would clear
+    /// the caller's parked frame and control state and truncate its value
+    /// stack) or build/consume the shared `Vm::args` vector (which the caller
+    /// may hold live for an outer in-progress call). A resumable body never
+    /// reaches here — generators/async are refused by the caller's record gate.
+    pub(crate) fn nested_call_eligible(&self) -> bool {
+        !self.steps.iter().any(|step| {
+            matches!(
+                step,
+                Step::TailCallFast { .. }
+                    | Step::TailCall { .. }
+                    | Step::TailCallFastGlobal { .. }
+                    | Step::TailCallFastSlot { .. }
+                    | Step::TailCallSelf { .. }
+                    | Step::TailCallSelfCheck { .. }
+                    | Step::TailCallSelfVector
+                    | Step::TailCallSelfCheckVector
+                    | Step::TailTaggedTemplate(_)
+                    | Step::ArgsBase
+                    | Step::ArgsPush
+                    | Step::ArgsSpread
+                    | Step::Call { .. }
+                    | Step::Construct { .. }
+                    | Step::TaggedTemplate(_)
                     | Step::SuperCall
             )
         })
@@ -4000,6 +4062,110 @@ impl Vm {
         let mut scratch = scratch;
         scratch.control_saved = control_saved;
         scratch
+    }
+
+    /// C3a: [`save_scratch`] plus the caller's *full* per-activation control
+    /// state. The compiled lanes' `has_control_state` narrowing (only
+    /// `env_stack` can be lost, because a lane callee is a compiled body whose
+    /// gate excludes every other control-stack producer) does not hold for the
+    /// interpreter nested run: its callee may itself contain `try`/for-of/
+    /// destructure, so the whole control state must come off the shared stacks.
+    #[inline]
+    pub(crate) fn save_scratch_full(&mut self) -> VmScratch {
+        let mut scratch = self.save_scratch();
+        if !scratch.control_saved {
+            self.save_control_state();
+            scratch.control_saved = true;
+        }
+        scratch
+    }
+
+    /// C3: install a nested lane's frame pointer for the run, taking
+    /// `leaf_frame_base` off so [`frame_get`](Self::frame_get)/
+    /// [`frame_get_mut`](Self::frame_get_mut) route to it — a lane can run
+    /// inside a C3 frame carve, whose `leaf_frame_base` would otherwise outrank
+    /// `nested_frame`. Returns the saved pair for [`restore_nested_frame`].
+    #[inline]
+    pub(crate) fn install_nested_frame(
+        &mut self,
+        frame: *mut Value,
+    ) -> (Option<*mut Value>, Option<usize>) {
+        let saved = (self.nested_frame, self.leaf_frame_base);
+        self.nested_frame = Some(frame);
+        self.leaf_frame_base = None;
+        saved
+    }
+
+    /// Put back what [`install_nested_frame`](Self::install_nested_frame) took.
+    #[inline]
+    pub(crate) fn restore_nested_frame(&mut self, saved: (Option<*mut Value>, Option<usize>)) {
+        self.nested_frame = saved.0;
+        self.leaf_frame_base = saved.1;
+    }
+
+    /// C3a: whether the caller holds NO per-activation control state — the
+    /// common case at a call inside a certified body (no `try`/for-of/
+    /// destructure open, no statement-list or finally save running). When true,
+    /// the nested interpreter run can share the (empty) stacks and the restore
+    /// is [`clear_control_state`](Self::clear_control_state) — dropping
+    /// whatever the callee left behind on an abrupt exit — instead of parking
+    /// and swapping ~twenty stacks per call, which dominates the fast path.
+    /// Every field [`SavedControl`] carries is checked, so a `false` answer
+    /// always means the full save captures the caller's state.
+    #[inline]
+    fn is_control_free(&self) -> bool {
+        self.try_stack.is_empty()
+            && self.pending.is_empty()
+            && self.thrown.is_none()
+            && self.resume_abrupt.is_none()
+            && !self.for_of_stepping
+            && !self.async_for_of_stepping
+            && !self.destructure_stepping
+            && self.for_in_stack.is_empty()
+            && self.for_of_stack.is_empty()
+            && self.async_for_of_stack.is_empty()
+            && self.for_of_boundaries.is_empty()
+            && self.async_for_of_boundaries.is_empty()
+            && self.destructure_stack.is_empty()
+            && self.destructure_done.is_empty()
+            && self.destructure_obj_stack.is_empty()
+            && self.destructure_assign_keys.is_empty()
+            && self.destructure_excluded.is_empty()
+            && self.yield_star_stack.is_empty()
+            && self.completion_stack.is_empty()
+            && self.list_stack.is_empty()
+            && self.pending_disposal.is_none()
+            && self.pending_catch_disposal.is_none()
+            && self.env_stack.len() == 1
+    }
+
+    /// C3a: drop any control state a nested interpreter run left on the shared
+    /// stacks, used on the control-free fast path (the caller's state was empty
+    /// at entry, so a clear restores it). `env_stack` is left to
+    /// [`restore_scratch`](Self::restore_scratch)'s `env_swapped` reset.
+    fn clear_control_state(&mut self) {
+        self.try_stack.clear();
+        self.pending.clear();
+        self.thrown = None;
+        self.resume_abrupt = None;
+        self.for_of_stepping = false;
+        self.async_for_of_stepping = false;
+        self.destructure_stepping = false;
+        self.for_in_stack.clear();
+        self.for_of_stack.clear();
+        self.async_for_of_stack.clear();
+        self.for_of_boundaries.clear();
+        self.async_for_of_boundaries.clear();
+        self.destructure_stack.clear();
+        self.destructure_done.clear();
+        self.destructure_obj_stack.clear();
+        self.destructure_assign_keys.clear();
+        self.destructure_excluded.clear();
+        self.yield_star_stack.clear();
+        self.completion_stack.clear();
+        self.list_stack.clear();
+        self.pending_disposal = None;
+        self.pending_catch_disposal = None;
     }
 
     /// Push the caller's per-activation control state onto `saved_control` and
@@ -6896,6 +7062,233 @@ impl Vm {
             .map(|pending| VmOutcome::Call(Box::new(pending)))
     }
 
+    /// C3: run a certified callee's body as a nested activation on this Vm
+    /// (the interpreter driver's own), instead of `call_inner`'s pooled-Vm
+    /// take/reset. The callee's frame is carved as a flat `vm.stack` segment
+    /// and installed as `leaf_frame_base` (C3.2), so the caller's `vm.frame` is
+    /// never touched; the callee's activation is built with `new_body_context`,
+    /// the per-activation registers are saved by `save_scratch`, and the
+    /// control state is isolated (`save_scratch_full`/`clear_control_state`).
+    /// The body runs through the shared `run_compiled_body_on`. Returns
+    /// `Ok(None)` when the callee is not an ordinary certified body the nested
+    /// run can serve (the caller then takes `call_inner`).
+    fn run_certified_call_nested(
+        &mut self,
+        agent: &mut Agent,
+        callee: &Value,
+        this: Value,
+        arg_start: usize,
+        argc: usize,
+    ) -> Result<Option<Value>, JsError> {
+        let ValueKind::Function(function) = callee.kind() else {
+            return Ok(None);
+        };
+        if !matches!(function.kind, crux::function::FunctionKind::EcmaScript) {
+            return Ok(None);
+        }
+        // A cross-realm callee runs with its own bootstrap realm pushed by
+        // `call_inner`, which the nested run does not reproduce; a termination
+        // request is observed there too.
+        if agent.realm_count.get() != 1 || agent.is_terminating() {
+            return Ok(None);
+        }
+        let (ir, old_env, realm, strict, parse_text, callee_semantic_control) = {
+            let Some(data) = agent.ecma_functions.get(&function.id()) else {
+                return Ok(None);
+            };
+            // Resumable and class-machinery bodies keep the funnel, which owns
+            // the iterator/promise and field-initializer context handling.
+            if data.is_generator
+                || data.is_async
+                || data.is_class_constructor
+                || data.class_field_initializer
+            {
+                return Ok(None);
+            }
+            let Some(ir) = data.ir.clone() else {
+                return Ok(None);
+            };
+            if ir.scope.is_none() {
+                return Ok(None);
+            }
+            // The gate is a pure function of the step list; compute it once and
+            // cache it on the body (the carve runs on every withdrawn call).
+            let (nested_ok, semantic) = ir.nested_gate.get().unwrap_or_else(|| {
+                let gate = (ir.nested_call_eligible(), ir.touches_semantic_control());
+                ir.nested_gate.set(Some(gate));
+                gate
+            });
+            if !nested_ok {
+                return Ok(None);
+            }
+            (
+                ir,
+                data.environment,
+                data.realm,
+                data.strict,
+                data.parse_text.clone(),
+                semantic,
+            )
+        };
+        // The withdrawn call left its arguments at `arg_start` on the value
+        // stack, below the `base` the frame carve starts at; they are read by
+        // index after the carve so no borrow is held across the `&mut self`
+        // run.
+        debug_assert!(arg_start + argc <= self.stack.len());
+        let scope = ir.scope.as_ref().expect("a certified body has a scope");
+        // OrdinaryCallBindThis (spec 10.2.1.1), resolved before any mutation so
+        // a primitive receiver — which needs boxing, and thus allocation —
+        // falls back to `call_inner` instead of being quietly mis-bound.
+        let this_value = if scope.this_slot.is_some() {
+            if strict {
+                this
+            } else {
+                match this.kind() {
+                    ValueKind::Undefined | ValueKind::Null => Value::Object(realm.global_object),
+                    ValueKind::Object(_) | ValueKind::Function(_) => this,
+                    _ => return Ok(None),
+                }
+            }
+        } else {
+            Value::Undefined
+        };
+        // The capture context and execution context `ordinary_call`'s certified
+        // branch builds (the body's own `source`, so a closure it creates
+        // resolves its span against the right text). The transient arg slice
+        // does not touch `self.stack`.
+        let body_env =
+            match scope.new_body_context(&old_env, &self.stack[arg_start..arg_start + argc])? {
+                Some(context) => context,
+                None => old_env,
+            };
+        agent
+            .execution_context_stack
+            .push(crate::context::ExecutionContext {
+                function: Some(Value::Function(function)),
+                realm,
+                script_or_module: None,
+                lexical_environment: body_env,
+                variable_environment: body_env,
+                private_environment: None,
+                source: parse_text,
+                annex_b_hoistable: Default::default(),
+                position: None,
+            });
+        // C3.2: carve the callee's frame as a flat `vm.stack` segment (the leaf
+        // lane's layout) and install it as `leaf_frame_base`, so the caller's
+        // `vm.frame` is never touched — no frame park. `save_scratch` records
+        // the pre-carve top (`base`) so `restore_scratch` unwinds the whole
+        // frame segment and any operand residue on the error path too.
+        let base = self.stack.len();
+        let control_free = self.is_control_free();
+        // A callee with no semantic-control step can only leave a LIFO
+        // `list_stack` entry (a `return`/`break` skipping a block's
+        // `ListEnd`); one with `try`/for-of/destructure can leave the
+        // semantically scanned stacks, which the full clear drops. (The verdict
+        // is `callee_semantic_control`, cached on the body above.)
+        let scratch = if control_free {
+            let mut scratch = self.save_scratch();
+            scratch.mark_env_swapped();
+            scratch
+        } else {
+            self.save_scratch_full()
+        };
+        // Fill the frame in place above the call site: `this`, params (missing
+        // stay `undefined`), `var`s `undefined`, `let`/`const` in the TDZ —
+        // `leaf_frame`'s layout. Reading args by index (not a held slice) keeps
+        // the borrow checker happy across the resize; the args live below
+        // `base` and are preserved by it.
+        self.stack.resize(base + scope.frame_size, Value::Undefined);
+        for slot in 0..scope.frame_size {
+            let value = if Some(slot) == scope.this_slot {
+                this_value
+            } else if slot < scope.arity.min(argc) {
+                self.stack[arg_start + slot]
+            } else if slot < scope.arity {
+                Value::Undefined
+            } else if scope.tdz_store.get(slot).copied().unwrap_or(false) {
+                Value::uninitialized()
+            } else {
+                Value::Undefined
+            };
+            self.stack[base + slot] = value;
+        }
+        let saved_leaf_base = self.leaf_frame_base;
+        let saved_leaf_offset = self.leaf_frame_offset;
+        self.leaf_frame_base = Some(base);
+        self.leaf_frame_offset = 0;
+        // `nested_frame` is cleared because a JIT lane's callee (`call_slow` ->
+        // here) may have one installed, and `call_args` because the caller's
+        // `arguments` object may still need it.
+        let saved_nested = self.nested_frame;
+        self.nested_frame = None;
+        let saved_call_args = std::mem::take(&mut self.call_args);
+        if scope.arguments_slot.is_some() {
+            self.call_args = self.stack[arg_start..arg_start + argc].to_vec();
+        }
+        let saved_env_fields = (
+            self.lexical_env,
+            self.body_context,
+            self.current_function,
+            self.current_new_target,
+            self.strict,
+            agent.field_initializer_depth,
+        );
+        self.lexical_env = body_env;
+        self.env_stack.reset(body_env);
+        self.body_context = Some(body_env);
+        self.current_function = Some(Value::Function(function));
+        self.current_new_target = None;
+        self.strict = strict;
+        agent.field_initializer_depth = 0;
+        // The frame is already carved, so the certified frame setup is skipped
+        // (`frame_prepared`); run through the shared core so the JIT/interpreter
+        // choice, TCO loop and env disposal match `ordinary_call` exactly.
+        let run = crate::function::run_compiled_body_on(
+            agent,
+            self,
+            &ir,
+            &[],
+            None,
+            Value::Function(function),
+            body_env,
+            true,
+        );
+        let (lexical_env, body_context, current_function, current_new_target, strict, field_depth) =
+            saved_env_fields;
+        self.lexical_env = lexical_env;
+        self.body_context = body_context;
+        self.current_function = current_function;
+        self.current_new_target = current_new_target;
+        self.strict = strict;
+        agent.field_initializer_depth = field_depth;
+        self.call_args = saved_call_args;
+        self.nested_frame = saved_nested;
+        self.leaf_frame_base = saved_leaf_base;
+        self.leaf_frame_offset = saved_leaf_offset;
+        if control_free {
+            if callee_semantic_control {
+                self.clear_control_state();
+            } else {
+                self.list_stack.clear();
+            }
+        }
+        self.restore_scratch(scratch);
+        // A kind-only engine error escapes with the callee's realm context
+        // still current; build it while it is (mirrors `ordinary_call`).
+        let run = match run {
+            Err(error) if error.value.is_none() => {
+                match crate::builtins::error::to_throwable(agent, &error) {
+                    Ok(value) => Err(error.with_value(value)),
+                    Err(conversion) => Err(conversion),
+                }
+            }
+            other => other,
+        };
+        agent.execution_context_stack.pop();
+        run.map(Some)
+    }
+
     /// Perform a call recorded by [`Vm::fast_call_core`] and land its result
     /// exactly as the in-place path would: read the arguments off the stack,
     /// run the recorded callable, then replace the call site (`below` values
@@ -6924,21 +7317,34 @@ impl Vm {
                 ..
             } => (*this, *arg_start, *argc, *below),
         };
-        let args = &self.stack[arg_start..arg_start + argc];
         let result = match pending {
+            // C3a: a certified callee runs as a nested frame on this Vm; every
+            // other callable takes the pooled-Vm funnel.
             PendingCall::Function { callee, .. } => {
-                crate::function::call_inner(agent, &callee, this, args)?
+                match self.run_certified_call_nested(agent, &callee, this, arg_start, argc)? {
+                    Some(value) => value,
+                    None => {
+                        let args = &self.stack[arg_start..arg_start + argc];
+                        crate::function::call_inner(agent, &callee, this, args)?
+                    }
+                }
             }
-            PendingCall::Handler { handler, .. } => handler(agent, &this, args)?,
-            PendingCall::Native { callee, .. } => match callee.kind() {
-                ValueKind::Function(function) => match &function.kind {
-                    crux::function::FunctionKind::Builtin {
-                        call: Some(native), ..
-                    } => native(&this, args)?,
+            PendingCall::Handler { handler, .. } => {
+                let args = &self.stack[arg_start..arg_start + argc];
+                handler(agent, &this, args)?
+            }
+            PendingCall::Native { callee, .. } => {
+                let args = &self.stack[arg_start..arg_start + argc];
+                match callee.kind() {
+                    ValueKind::Function(function) => match &function.kind {
+                        crux::function::FunctionKind::Builtin {
+                            call: Some(native), ..
+                        } => native(&this, args)?,
+                        _ => crate::function::call_inner(agent, &callee, this, args)?,
+                    },
                     _ => crate::function::call_inner(agent, &callee, this, args)?,
-                },
-                _ => crate::function::call_inner(agent, &callee, this, args)?,
-            },
+                }
+            }
         };
         self.stack.truncate(arg_start - below);
         self.stack.push(result);
@@ -25175,6 +25581,7 @@ pub fn compile_body(
             has_call_apply,
             has_call_intrinsic,
             max_stack,
+            nested_gate: std::cell::Cell::new(None),
         },
         compiler.this_writes,
     ))
@@ -25260,6 +25667,7 @@ pub fn compile_statements(
         has_call_apply,
         has_call_intrinsic,
         max_stack,
+        nested_gate: std::cell::Cell::new(None),
     })
 }
 
