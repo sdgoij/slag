@@ -975,3 +975,20 @@ produced a wrong answer first:
   `wasmtest` (no hook), so a wasm sweep is not owed for a lane-only change —
   but `context.rs`/`ir.rs` are linked by `wasmtest`, so run the wasm suites when
   those change.
+- **A POSITIVE cached verdict needs a stronger identity than the leaf lane's
+  (C1's emit-side lane).** The leaf record's box-address identity
+  (`callee_payload`/`callee_hi` + `code_gen`/`epoch`) is safe only because a
+  stale leaf verdict is a REJECTION (entry 0 → `call_slow`, which is correct).
+  A cached *certified* verdict is POSITIVE (an entry + frame layout), so a swept
+  callee's box recycled by a different closure makes the address match while the
+  descriptor is another body's — and the lane runs the wrong body. Cache the
+  callee's function `id` and compare it (free: the lane already resolves it for
+  the `ecma_functions` lookup). `Iterator/zipKeyed/basic-longest` is the
+  regression net.
+- **The lane must refuse when the caller is not at rest
+  (`Vm::can_inline_leaf`).** It shares the caller's `try_stack`/`for_of_stack`/
+  `env_stack` and the completion/list stacks, which `save_scratch` does NOT
+  isolate, so a call inside the caller's `try` mis-propagates the callee's
+  thrown error into (or past) the caller's handler. The two
+  `installed_jit_*_does_not_drift` tests caught the unguarded path; C1c's
+  per-frame watermarks are what would lift the restriction.

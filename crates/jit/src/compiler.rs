@@ -45,14 +45,15 @@ use runtime::ir::{
 use runtime::jit::{
     AGENT_REALM_COUNT_OFFSET, BUILDER_BUF_OFFSET, BUILDER_CAP_OFFSET, BUILDER_ENABLED_OFFSET,
     BUILDER_LEN_OFFSET, BUILDER_OWNER_OFFSET, BUILDER_RHS_BITS_OFFSET, BUILDER_RHS_OK_OFFSET,
-    BUILDER_RHS_UNIT_OFFSET, DISPATCH_DEOPT, GlobalValueCell, HELPER_COUNT, JIT_DEOPT_PROBE,
-    JIT_GC_PROBE_INTERVAL, JIT_HELPER_COUNTS, JitCallContext, LEAF_CALL_RECORD_SHIFT,
-    LeafCallRecord, LeafInlineInfo, TYPED_ARRAY_LENGTH_SENTINEL, VM_ASYNC_FOR_OF_STACK_LEN_OFFSET,
-    VM_BUILDER_OFFSET, VM_COMPLETION_IS_EMPTY_OFFSET, VM_COMPLETION_OFFSET,
-    VM_DESTRUCTURE_STACK_LEN_OFFSET, VM_ENV_STACK_LEN_OFFSET, VM_FOR_IN_STACK_LEN_OFFSET,
-    VM_FOR_OF_BOUNDARIES_LEN_OFFSET, VM_FOR_OF_STACK_LEN_OFFSET, VM_IP_OFFSET,
-    VM_LEXICAL_ENV_OFFSET, VM_PENDING_LEN_OFFSET, VM_SWITCH_DISC_OFFSET, VM_SWITCH_DISC_SET_OFFSET,
-    VM_TRY_STACK_CAP_OFFSET, VM_TRY_STACK_LEN_OFFSET, VM_TRY_STACK_PTR_OFFSET,
+    BUILDER_RHS_UNIT_OFFSET, CertifiedInlineInfo, DISPATCH_DEOPT, GlobalValueCell, HELPER_COUNT,
+    JIT_DEOPT_PROBE, JIT_GC_PROBE_INTERVAL, JIT_HELPER_COUNTS, JitCallContext,
+    LEAF_CALL_RECORD_SHIFT, LeafCallRecord, LeafInlineInfo, TYPED_ARRAY_LENGTH_SENTINEL,
+    VM_ASYNC_FOR_OF_STACK_LEN_OFFSET, VM_BUILDER_OFFSET, VM_COMPLETION_IS_EMPTY_OFFSET,
+    VM_COMPLETION_OFFSET, VM_DESTRUCTURE_STACK_LEN_OFFSET, VM_ENV_STACK_LEN_OFFSET,
+    VM_FOR_IN_STACK_LEN_OFFSET, VM_FOR_OF_BOUNDARIES_LEN_OFFSET, VM_FOR_OF_STACK_LEN_OFFSET,
+    VM_IP_OFFSET, VM_LEXICAL_ENV_OFFSET, VM_PENDING_LEN_OFFSET, VM_SWITCH_DISC_OFFSET,
+    VM_SWITCH_DISC_SET_OFFSET, VM_TRY_STACK_CAP_OFFSET, VM_TRY_STACK_LEN_OFFSET,
+    VM_TRY_STACK_PTR_OFFSET,
 };
 use syntax::ast::{AssignOp, BinaryOp, UnaryOp, UpdateOp};
 use target_lexicon::PointerWidth;
@@ -166,6 +167,11 @@ fn helper_sig(params: &[Type], conv: CallConv) -> Signature {
 /// these fixed offsets).
 fn leaf_inline_offset(field: usize) -> usize {
     std::mem::offset_of!(LeafCallRecord, leaf_inline) + field
+}
+
+/// The byte offset of a `CertifiedInlineInfo` field inside a `LeafCallRecord`.
+fn certified_offset(field: usize) -> usize {
+    std::mem::offset_of!(LeafCallRecord, certified) + field
 }
 
 /// G15: the agent record slot for `callee` — the machine-code half of
@@ -4514,6 +4520,11 @@ impl<'a> Lowerer<'a> {
         // equals (a script has no scope, so the gate is omitted there).
         let slow = self.builder.create_block();
         let merge = self.builder.create_block();
+        // C1: the certified-callee lane. A leaf miss is first offered to the
+        // record's cached certified verdict; only a direct-eval call skips it
+        // (a direct eval must run the interpreter with the caller's env).
+        let cert = (!direct_eval).then(|| self.builder.create_block());
+        let miss = cert.unwrap_or(slow);
         if self.scope.is_some() {
             let cf = self.builder.ins().load(
                 types::I64,
@@ -4666,7 +4677,7 @@ impl<'a> Lowerer<'a> {
         self.builder.switch_to_block(plain_hit);
         let entry_zero = self.builder.ins().icmp_imm_u(IntCC::Equal, cached_entry, 0);
         let fast = self.builder.create_block();
-        self.builder.ins().brif(entry_zero, slow, &[], fast, &[]);
+        self.builder.ins().brif(entry_zero, miss, &[], fast, &[]);
         // G14: a hit splits on the frame shape. An ALIASED frame (the leaf's
         // frame IS the argument region — `frame_size == arity` with all args
         // present) is called in-frame directly behind the room check. Any
@@ -4732,7 +4743,7 @@ impl<'a> Lowerer<'a> {
             .ins()
             .icmp(IntCC::UnsignedLessThanOrEqual, top_needed, buf_end);
         let inline = self.builder.create_block();
-        self.builder.ins().brif(fits, inline, &[], slow, &[]);
+        self.builder.ins().brif(fits, inline, &[], miss, &[]);
         self.builder.switch_to_block(inline);
         let frame_size_64 = self.builder.ins().uextend(types::I64, frame_size);
         let frame_bytes = self.builder.ins().imul_imm_s(frame_size_64, 8);
@@ -4767,7 +4778,7 @@ impl<'a> Lowerer<'a> {
         let inline_filled = self.builder.create_block();
         self.builder
             .ins()
-            .brif(fill_ok, inline_filled, &[], slow, &[]);
+            .brif(fill_ok, inline_filled, &[], miss, &[]);
         self.builder.switch_to_block(inline_filled);
         let argc_bytes = self.builder.ins().imul_imm_s(argc, 8);
         let frame_base = self.builder.ins().iadd(args_ptr, argc_bytes);
@@ -4790,7 +4801,7 @@ impl<'a> Lowerer<'a> {
         )?;
         let fill_ok = self.builder.ins().icmp_imm_u(IntCC::NotEqual, filled, 0);
         let env_call = self.builder.create_block();
-        self.builder.ins().brif(fill_ok, env_call, &[], slow, &[]);
+        self.builder.ins().brif(fill_ok, env_call, &[], miss, &[]);
         self.builder.switch_to_block(env_call);
         let value = self.emit_raw_call(
             self.sig_call,
@@ -4802,7 +4813,7 @@ impl<'a> Lowerer<'a> {
         let env_done = self.builder.create_block();
         self.builder
             .ins()
-            .brif(env_failed, slow, &[], env_done, &[]);
+            .brif(env_failed, miss, &[], env_done, &[]);
         self.builder.switch_to_block(env_done);
         self.emit_leaf_result_tail(value, pre_call_sp, merge)?;
         // The probe path: the full validation + lookups + frame fill (Cut
@@ -4818,7 +4829,7 @@ impl<'a> Lowerer<'a> {
         )?;
         let hit = self.builder.ins().icmp_imm_u(IntCC::NotEqual, probe, 0);
         let inline2 = self.builder.create_block();
-        self.builder.ins().brif(hit, inline2, &[], slow, &[]);
+        self.builder.ins().brif(hit, inline2, &[], miss, &[]);
         self.builder.switch_to_block(inline2);
         let info = self.builder.ins().iadd_imm_s(
             cache,
@@ -4865,6 +4876,43 @@ impl<'a> Lowerer<'a> {
         self.set_sp_offset(pre_call_sp);
         self.push(res);
         self.builder.ins().jump(merge, &[]);
+        // C1: the certified-callee lane. It runs only when the record carries a
+        // certified verdict (a nonzero entry), so a callee that is neither a
+        // leaf nor a certified body (a builtin, a polymorphic miss) still goes
+        // straight to the interpreter funnel with one extra load + branch. The
+        // helper re-validates the record identity and returns `u64::MAX` to
+        // fall back.
+        if let Some(cert) = cert {
+            self.builder.switch_to_block(cert);
+            let cert_entry = self.builder.ins().load(
+                types::I64,
+                MemFlagsData::new(),
+                cache,
+                Offset32::new(
+                    certified_offset(std::mem::offset_of!(CertifiedInlineInfo, entry)) as i32,
+                ),
+            );
+            let has_cert = self
+                .builder
+                .ins()
+                .icmp_imm_u(IntCC::NotEqual, cert_entry, 0);
+            let cert_run = self.builder.create_block();
+            self.builder.ins().brif(has_cert, cert_run, &[], slow, &[]);
+            self.builder.switch_to_block(cert_run);
+            let result = self.emit_raw_call(
+                self.sig_call_slow,
+                Helper::CertifiedCall,
+                &[callee, this, args_ptr, argc, slot],
+            )?;
+            let fallback = self.builder.ins().icmp_imm_u(IntCC::Equal, result, -1);
+            let cert_done = self.builder.create_block();
+            self.builder.ins().brif(fallback, slow, &[], cert_done, &[]);
+            self.builder.switch_to_block(cert_done);
+            self.emit_leaf_result_tail(result, pre_call_sp, merge)?;
+            self.builder.seal_block(cert_done);
+            self.builder.seal_block(cert_run);
+            self.builder.seal_block(cert);
+        }
         self.builder.seal_block(merge);
         self.builder.switch_to_block(merge);
         if emit_fall_through {

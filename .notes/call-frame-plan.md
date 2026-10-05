@@ -174,6 +174,85 @@ new part is the recursive entry/exit and the per-frame watermarks. Probe:
 the `non-leaf call` row and `recursive_fib`, isolated A/B, plus
 `--gc-stress` and the six sweeps.
 
+**C1 reconciliation with the landed certified-callee lane (2026-10-05).** C0
+removed the private JIT frame/working buffer, and the certified-callee lane
+(`runtime::jit::certified_call_inline`, the slag-jit skill's §21) already runs a
+*different* certified body as a nested frame on the caller's `vm.stack` region,
+with its own `JitCallContext`, skipping
+`do_call_fast`/`ordinary_call`/`run_compiled_body`/`run_jit_body`. So the C1
+row is already half done at *runtime* — the frame push exists. What C1 adds is
+the **emit-side** recognition, so a certified non-leaf call site stops paying
+`call_slow`'s per-call re-derivation.
+
+Today a certified non-leaf site (`bench` -> `mid`, the `non-leaf call` row) is
+reached like this: the emit-side leaf probe refuses `mid` (it has a call step),
+the site takes `call_slow`, which tries the self path then
+`certified_call_inline`. Every call re-derives what is a pure function of the
+callee: the `Value` decode, the `ecma_functions` record lookup,
+`CompiledBody::certified_callee_eligible()` (a step scan), the `lookup_info`
+consult, and `Vm::global_reads_are_unshadowed(environment, ident_names)` (a
+chain walk). Baseline (2026-10-05): `non-leaf call` jit 7.41 ms / 100k iters
+(~74 ns/call); the leaf-call floor is ~6–7 ns.
+
+**C1 design: a certified verdict in the callee-keyed call-site record.**
+Extend `LeafCallRecord` with a `CertifiedInlineInfo` the probe fills when the
+leaf verdict refuses `{ entry, frame_size, arity, stack_usage, tdz_mask,
+this_slot, fill_ok, strict, globals_unshadowed, global_value, realm_ptr,
+has_call_apply, has_call_intrinsic, environment }` plus a `certified: bool`
+discriminator. The record's existing identity / `epoch` / `code_gen` gate guards
+reuse exactly as the leaf verdict does.
+
+**C1 emit-side lane (the measured win).** In `emit_call`, after the leaf gate
+misses, consult the record's certified verdict. On a hit, call a new helper
+`Helper::CertifiedCall` — a `certified_call_inline` keyed by the record, so it
+does no decode / HashMap lookup / eligibility scan / `lookup_info` / globals
+walk, only the frame fill, `save_scratch`, env swap, nested-ctx build and entry
+call — and land the result through `emit_leaf_result_tail`. The entry call stays
+inside the helper (the nested `JitCallContext` is a Rust local with a
+synchronous lifetime), so the split-ctx lifetime problem is avoided; the win is
+the re-derivation, not the FFI hop.
+
+**C1 slices** (each independently landable, probe-first):
+- **C1a** — extend `LeafCallRecord` with `CertifiedInlineInfo` and fill it in
+  `leaf_call_probe`; no behavior change (the emit lane ignores it). Measure
+  the probe's added cost is below noise.
+- **C1b** — add `Helper::CertifiedCall` + the emit lane gated on the record's
+  certified verdict; land the result through `emit_leaf_result_tail`. Probe the
+  `non-leaf call` row and `recursive_fib`.
+- **C1c** — the per-frame watermark audit: nested `try`/`finally`, for-of,
+  destructure, generator/async bodies called through the lane, under
+  `--gc-stress`/`--nursery-stress` and the six sweeps.
+
+**C1 traps.** (1) The record is callee-keyed and its `entry` outlives a run, so
+the certified info MUST carry the code generation like the leaf info (a stale
+entry after an eviction is a jump into freed code) and be cleared by
+`gc_safepoint`. (2) `environment` is a `GcAny` held across calls while the
+record lives on the `Agent` and is not traced — the same sweeping-collection
+clear that protects the leaf identity must clear it. (3) The lane keeps
+`certified_call_inline`'s gate exactly, the cross-realm unmapped-`arguments`
+refusal in particular, or the arguments object is built in the wrong realm.
+(4) `global_value`/`realm_ptr` are raw bits/pointers — do not add a traced
+handle to the record.
+
+**Status (2026-10-05): C1a + C1b landed.** The callee-keyed record now carries
+the `CertifiedInlineInfo` the probe fills, and `emit_call` offers a leaf miss to
+`Helper::CertifiedCall` (a `certified_call_inline` keyed by the record) before
+the interpreter funnel. Measured `non-leaf call` jit 7.41 → ~5.5 ms (~1.35×),
+stable across three runs. Two correctness fixes the gates forced, both in the
+landed change: the lane refuses when the caller is not at rest
+(`Vm::can_inline_leaf`) — it shares the caller's `try_stack`/`for_of_stack`/
+`env_stack`, which `save_scratch` does not isolate, and the previously-unguarded
+`call_slow` path mis-propagated a callee throw into a caller `try` (the two
+`…_does_not_drift` JIT tests) — and the cached verdict verifies the callee's
+function `id`, because the box-address identity is unsound for a POSITIVE cache
+(a swept callee's box can be recycled by another closure, so the address
+matches while the descriptor is another body's; `Iterator/zipKeyed/
+basic-longest` caught it). Gates: normal sweep at baseline (48464 / 0 / 0),
+`--gc-stress` 0 fail / 0 crash, `--gc-verify` at baseline, `cargo test
+--workspace` green, clippy `-D warnings`, the CLI `--gc-stress`/`--nursery-stress`
+benches 12/12, wasm 20,662/0 + js-api 1,001/0. **C1c** (the per-frame watermark
+audit that would lift the `can_inline_leaf` restriction) remains.
+
 **Stage C0 detail (the substrate).** C0 makes the compiled body's working
 region *be* `vm.stack`, so the frame and the operand stack are one described
 region both engines address. Today `run_jit_body` hands the entry a

@@ -134,6 +134,68 @@ impl LeafInlineInfo {
     }
 }
 
+/// C1: the per-callee certified-callee descriptor the probe writes when the
+/// LEAF verdict refuses a callee that is a certified (non-leaf) body. The
+/// compiled call site reads it to run the callee through `certified_call`
+/// without re-deriving what is a pure function of the callee — the
+/// `ecma_functions` lookup, `certified_callee_eligible()` and
+/// `global_reads_are_unshadowed` — on every visit. `#[repr(C)]`, all scalar
+/// fields, so the compiled code reads them at fixed offsets.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct CertifiedInlineInfo {
+    /// The callee's compiled entry (0 = the callee is not a certified-lane
+    /// target, so the site falls back to `call_slow`).
+    pub entry: u64,
+    /// The callee's maximum value-stack depth above its frame, in slots.
+    pub stack_usage: u64,
+    /// Frame-fill descriptor, mirroring [`LeafInlineInfo`]'s.
+    pub frame_size: u32,
+    pub arity: u32,
+    pub this_slot: u32,
+    pub strict: u32,
+    pub tdz_mask: u64,
+    /// 1 when `tdz_mask` covers the whole frame; 0 keeps the site on
+    /// `call_slow` (the fill cannot be rebuilt from a truncated mask).
+    pub fill_ok: u32,
+    /// `Vm::global_reads_are_unshadowed(environment, ident_names)` at probe
+    /// time — a chain walk the lane would otherwise repeat per call.
+    pub globals_unshadowed: u32,
+    /// Whether the callee body has a `CallApply`/intrinsic site, so the lane
+    /// can skip `call_apply_intrinsic_bits`/`intrinsic_bits` when absent.
+    pub has_call_apply: u32,
+    pub has_call_intrinsic: u32,
+    /// The callee's unique function id. The record's box-address identity
+    /// (`callee_payload`/`callee_hi`) is unsound on its own for a POSITIVE
+    /// cached verdict: a swept callee's box can be recycled by a different
+    /// closure, and the address then matches while the descriptor is another
+    /// body's. The leaf lane tolerates that (its stale verdicts are
+    /// rejections); the certified lane must re-check the id, which the lane
+    /// already resolves for the `ecma_functions` lookup.
+    pub callee_id: u64,
+}
+
+impl CertifiedInlineInfo {
+    /// An empty descriptor: entry 0 makes the compiled code fall back to
+    /// `call_slow`.
+    pub const fn empty() -> Self {
+        Self {
+            entry: 0,
+            stack_usage: 0,
+            frame_size: 0,
+            arity: 0,
+            this_slot: NO_THIS_SLOT,
+            strict: 0,
+            tdz_mask: 0,
+            fill_ok: 0,
+            globals_unshadowed: 0,
+            has_call_apply: 0,
+            has_call_intrinsic: 0,
+            callee_id: 0,
+        }
+    }
+}
+
 /// G14: the `this_slot` sentinel for a leaf with no `this` slot, and the
 /// widest frame the record's `tdz_mask` can describe.
 pub const NO_THIS_SLOT: u32 = u32::MAX;
@@ -168,6 +230,9 @@ pub struct LeafCallRecord {
     pub callee_payload: u64,
     /// The probe's verdict (see `LeafInlineInfo`).
     pub leaf_inline: LeafInlineInfo,
+    /// C1: the probe's certified-callee verdict (see `CertifiedInlineInfo`),
+    /// filled when the leaf verdict refuses. Unused by the leaf lanes.
+    pub certified: CertifiedInlineInfo,
     /// The leaf-eligibility epoch at probe time (see `JitCallContext::leaf_epoch`).
     pub epoch: u32,
     /// The code generation at probe time (see `JitCallContext::leaf_gen`).
@@ -184,6 +249,7 @@ impl LeafCallRecord {
         Self {
             callee_payload: 0,
             leaf_inline: LeafInlineInfo::empty(),
+            certified: CertifiedInlineInfo::empty(),
             epoch: 0,
             code_gen: 0,
             callee_hi: u32::MAX,
@@ -731,6 +797,19 @@ pub struct JitSlowPaths {
     /// `slot` is the compiled call site's record slot.
     pub leaf_call_env:
         extern "C" fn(ctx: *mut c_void, callee: u64, args: *mut u64, argc: u64, slot: u64) -> u64,
+    /// C1: run a certified (non-leaf) callee through the call-site record's
+    /// cached verdict — the layout the probe cached — without the per-call
+    /// `ecma_functions` re-derivation. Returns the result bits, or `u64::MAX`
+    /// to fall back to `call_slow`. `slot` is the compiled call site's record
+    /// slot.
+    pub certified_call: extern "C" fn(
+        ctx: *mut c_void,
+        callee: u64,
+        this: u64,
+        args: *mut u64,
+        argc: u64,
+        slot: u64,
+    ) -> u64,
     /// Read a declared top-level `var` off the global object (`name` is an
     /// `AtomId`); returns the value.
     pub get_global: extern "C" fn(ctx: *mut c_void, name: u64) -> u64,
@@ -1256,6 +1335,7 @@ pub static JIT_SLOW_PATHS: JitSlowPaths = JitSlowPaths {
     leaf_call_probe,
     leaf_call_fill,
     leaf_call_env,
+    certified_call,
     get_global,
     set_global,
     set_global_slot,
@@ -1848,7 +1928,7 @@ extern "C" fn call_slow(
     // of the interpreter funnel. `None` (an ineligible or not-yet-compiled callee)
     // falls through to that funnel, which ports the callee and promotes it.
     if direct_eval == 0
-        && let Some(result) = certified_call_inline(ctx, callee, this, args, argc)
+        && let Some(result) = certified_call_inline(ctx, callee, this, args, argc, None)
     {
         return result;
     }
@@ -2025,6 +2105,7 @@ fn certified_call_inline(
     this: u64,
     args: *mut u64,
     argc: u64,
+    cached: Option<&CertifiedInlineInfo>,
 ) -> Option<u64> {
     // A callee that is not an ECMAScript function — an engine builtin, a bound
     // function, a proxy — can never be a lane target, and the value decode is
@@ -2036,6 +2117,15 @@ fn certified_call_inline(
         return None;
     };
     if !matches!(function.kind, crux::function::FunctionKind::EcmaScript) {
+        return None;
+    }
+    // The lane shares the caller's `Vm` control stacks (`try_stack`,
+    // `for_of_stack`, the completion/list stacks, `env_stack`), which
+    // `save_scratch` does not isolate, so it may only run while the caller is
+    // at rest — the same precondition the leaf lane's `can_inline_leaf`
+    // enforces. A call inside the caller's `try`/for-of falls back to the
+    // interpreter funnel, which owns its own frame.
+    if !unsafe { &*ctx.vm }.can_inline_leaf() {
         return None;
     }
     let agent = unsafe { &mut *ctx.agent };
@@ -2056,8 +2146,9 @@ fn certified_call_inline(
     };
     let global = realm.global_object;
     // The lane's gate: the self gate minus the `this` requirement (bound
-    // below) plus the super/`ThisValue` machinery it cannot install.
-    if !body.certified_callee_eligible() {
+    // below) plus the super/`ThisValue` machinery it cannot install. The
+    // call-site probe already ran it (cached); the derived path re-runs it.
+    if cached.is_none() && !body.certified_callee_eligible() {
         return None;
     }
     // An unmapped-`arguments` object is built from the *current* realm's
@@ -2075,24 +2166,43 @@ fn certified_call_inline(
     {
         return None;
     }
-    // Compile (or promote) through the same choke point every other JIT site
-    // uses; a below-threshold or sticky-refused body falls back here.
-    let info_ptr = lookup_info(hook, &body, true);
-    if info_ptr.is_null() {
-        return None;
-    }
-    // SAFETY: `lookup_info` just returned the cache's live entry, and no frame
-    // is in flight to evict it (`in_flight` was true).
-    let info = unsafe { &*info_ptr };
     let scope = body.scope.as_ref()?;
-    // SAFETY: `info.entry` is a code pointer the cache owns.
-    let entry: JitEntry = unsafe { std::mem::transmute(info.entry) };
+    // C1: the call-site probe cached the entry, `stack_usage` and the frame
+    // descriptor, validated by the record's identity + code-generation gates.
+    // A run's eviction is a boundary event (the compile that opens a run), not
+    // a mid-run one, so the cached entry stays valid for the run and no
+    // `lookup_info` re-consult is needed; the derived path (the `call_slow`
+    // fallback) still compiles/promotes through the choke point.
+    let (entry, stack_usage, frame_len) = if let Some(cached) = cached {
+        // The box-address identity can match a recycled box whose descriptor
+        // is another body's; the id is the exact discriminator.
+        if cached.fill_ok == 0 || cached.callee_id != function.id() {
+            return None;
+        }
+        (
+            unsafe { std::mem::transmute::<u64, JitEntry>(cached.entry) },
+            cached.stack_usage as usize,
+            cached.frame_size as usize,
+        )
+    } else {
+        // Compile (or promote) through the same choke point every other JIT
+        // site uses; a below-threshold or sticky-refused body falls back here.
+        let info_ptr = lookup_info(hook, &body, true);
+        if info_ptr.is_null() {
+            return None;
+        }
+        // SAFETY: `lookup_info` just returned the cache's live entry, and no
+        // frame is in flight to evict it (`in_flight` was true).
+        let info = unsafe { &*info_ptr };
+        // SAFETY: `info.entry` is a code pointer the cache owns.
+        let entry: JitEntry = unsafe { std::mem::transmute(info.entry) };
+        (entry, info.stack_usage, scope.frame_size)
+    };
     let argc = argc as usize;
     // SAFETY: the JIT passes a pointer into its own live stack buffer with
     // `argc` slots (the machine code is suspended for this synchronous call).
     let args = unsafe { std::slice::from_raw_parts(args as *const Value, argc) };
-    let frame_len = scope.frame_size;
-    let buf_len = frame_len + info.stack_usage + JIT_STACK_SLACK;
+    let buf_len = frame_len + stack_usage + JIT_STACK_SLACK;
     // OrdinaryCallBindThis (spec 10.2.1.1) into the callee's `this` slot — the
     // same bind `setup_certified_frame` is handed by `ordinary_call`: strict
     // keeps the call's `this` as-is; sloppy coerces a nullish `this` to the
@@ -2100,7 +2210,15 @@ fn certified_call_inline(
     // primitive receiver must be boxed (`to_object` allocates and can throw),
     // so that case falls back to the funnel instead. Resolved before the region
     // is carved so a refusal leaves no segment on the stack.
-    let bound_this = if scope.this_slot.is_some() {
+    let (strict, this_slot, arity) = match cached {
+        Some(cached) => (
+            cached.strict != 0,
+            (cached.this_slot != NO_THIS_SLOT).then_some(cached.this_slot as usize),
+            cached.arity as usize,
+        ),
+        None => (strict, scope.this_slot, scope.arity),
+    };
+    let bound_this = if this_slot.is_some() {
         let this = Value::from_bits(this);
         Some(if strict {
             this
@@ -2159,9 +2277,12 @@ fn certified_call_inline(
     // uninitialized, `var`s undefined, and the bound `this`. `self_call_eligible`
     // guarantees no per-call capture context.
     for slot in 0..frame_len {
-        let value = if slot < scope.arity {
+        let value = if slot < arity {
             args.get(slot).copied().unwrap_or(Value::Undefined)
-        } else if scope.tdz_store.get(slot).copied().unwrap_or(false) {
+        } else if match cached {
+            Some(cached) => cached.tdz_mask >> slot & 1 == 1,
+            None => scope.tdz_store.get(slot).copied().unwrap_or(false),
+        } {
             Value::uninitialized()
         } else {
             Value::Undefined
@@ -2170,17 +2291,18 @@ fn certified_call_inline(
         // segment on `vm.stack`.
         unsafe { *buf_ptr.add(slot) = value };
     }
-    if let (Some(slot), Some(value)) = (scope.this_slot, bound_this) {
+    if let (Some(slot), Some(value)) = (this_slot, bound_this) {
         unsafe { *buf_ptr.add(slot) = value };
     }
     let frame_ptr = buf_ptr as *mut c_void;
     let stack_ptr = unsafe { buf_ptr.add(frame_len) } as *mut c_void;
-    let (apply_builtin_bits, call_builtin_bits) = if body.has_call_apply {
-        call_apply_intrinsic_bits(agent)
-    } else {
-        (0, 0)
-    };
-    let intrinsic_bits = if body.has_call_intrinsic {
+    let (apply_builtin_bits, call_builtin_bits) =
+        if cached.map_or(body.has_call_apply, |c| c.has_call_apply != 0) {
+            call_apply_intrinsic_bits(agent)
+        } else {
+            (0, 0)
+        };
+    let intrinsic_bits = if cached.map_or(body.has_call_intrinsic, |c| c.has_call_intrinsic != 0) {
         intrinsic_bits(agent)
     } else {
         [0; INTRINSIC_COUNT]
@@ -2214,7 +2336,10 @@ fn certified_call_inline(
         member_value_cells: ctx.member_value_cells,
         computed_read_cells: ctx.computed_read_cells,
         member_map_cells: ctx.member_map_cells,
-        globals_unshadowed: Vm::global_reads_are_unshadowed(environment, &body.ident_names),
+        globals_unshadowed: cached.map_or_else(
+            || Vm::global_reads_are_unshadowed(environment, &body.ident_names),
+            |c| c.globals_unshadowed != 0,
+        ),
         buf_end: (buf_ptr as usize + buf_len * std::mem::size_of::<Value>()) as *mut c_void,
         leaf_epoch: 0,
         leaf_records: ctx.leaf_records,
@@ -2222,8 +2347,8 @@ fn certified_call_inline(
         body: std::rc::Rc::as_ptr(&body),
         tail: false,
         current_function: callee,
-        self_entry: info.entry as u64,
-        self_stack_usage: info.stack_usage as u64,
+        self_entry: entry as usize as u64,
+        self_stack_usage: stack_usage as u64,
         self_inline_ok: true,
         apply_builtin_bits,
         call_builtin_bits,
@@ -2278,6 +2403,37 @@ fn certified_call_inline(
         "the certified-call gate excludes the suspend steps"
     );
     Some(result)
+}
+
+/// C1: the compiled call site's certified-callee fast path. The site gated on
+/// the record's certified verdict (callee identity + code generation), so this
+/// runs `certified_call_inline` with the verdict the probe cached — skipping
+/// the `certified_callee_eligible` scan, the `globals_unshadowed` walk and the
+/// `lookup_info` consult. Returns the result bits, or `u64::MAX` to fall back
+/// to `call_slow` (the site then takes the interpreter funnel).
+extern "C" fn certified_call(
+    ctx: *mut c_void,
+    callee: u64,
+    this: u64,
+    args: *mut u64,
+    argc: u64,
+    slot: u64,
+) -> u64 {
+    let ctx = unsafe { ctx_of(ctx) };
+    // Defense in depth: the machine code validated the record's identity, code
+    // generation and `fill_ok` before branching here, and no JS runs between
+    // that gate and this call.
+    // SAFETY: `record_slot_of` masks below `LEAF_CALL_RECORDS`, and
+    // `leaf_records` is the running agent's table, live for this run.
+    let cache_entry = unsafe { &*ctx.leaf_records.add(record_slot_of(callee, slot)) };
+    if !record_matches(ctx, cache_entry, callee)
+        || cache_entry.certified.entry == 0
+        || cache_entry.certified.fill_ok == 0
+    {
+        return u64::MAX;
+    }
+    certified_call_inline(ctx, callee, this, args, argc, Some(&cache_entry.certified))
+        .unwrap_or(u64::MAX)
 }
 
 extern "C" fn call_apply(
@@ -2583,6 +2739,73 @@ extern "C" fn leaf_call_fill(
     info.entry
 }
 
+/// C1: the certified-callee verdict for `function`, or an empty descriptor
+/// when it is not a lane target. Mirrors the gate in `certified_call_inline`
+/// (minus the per-call `this`/realm checks, which the lane re-runs) and caches
+/// the callee-static work — the `ecma_functions` facts, the eligibility scan,
+/// the globals walk and the compiled entry — in the call-site record.
+fn certified_verdict(
+    agent: &mut Agent,
+    function: &crux::function::Function,
+) -> CertifiedInlineInfo {
+    let (Some(hook), depth) = (agent.jit_hook, agent.jit_depth) else {
+        return CertifiedInlineInfo::empty();
+    };
+    // Resolve the callee-static facts in one scoped borrow. A generator/async
+    // call produces an iterator or a promise rather than a run of the body, and
+    // a class constructor cannot be called at all, so all three are refusals.
+    let (ir, environment, strict) = match agent.ecma_functions.get(&function.id()) {
+        Some(data) if !data.is_generator && !data.is_async && !data.is_class_constructor => {
+            match data.ir.clone() {
+                Some(ir) => (ir, data.environment, data.strict),
+                None => return CertifiedInlineInfo::empty(),
+            }
+        }
+        _ => return CertifiedInlineInfo::empty(),
+    };
+    if !ir.certified_callee_eligible() {
+        return CertifiedInlineInfo::empty();
+    }
+    let Some(scope) = ir.scope.as_ref() else {
+        return CertifiedInlineInfo::empty();
+    };
+    let info_ptr = crate::jit::lookup_info(hook, &ir, depth > 0);
+    if info_ptr.is_null() {
+        return CertifiedInlineInfo::empty();
+    }
+    // SAFETY: `lookup_info` returned the cache's live entry.
+    let compiled = unsafe { &*info_ptr };
+    let this_slot = scope.this_slot.map_or(NO_THIS_SLOT, |slot| slot as u32);
+    let (tdz_mask, fill_ok) = if scope.frame_size > TDZ_MASK_SLOTS {
+        (0, 0)
+    } else {
+        let mut tdz_mask = 0;
+        for slot in 0..scope.frame_size {
+            if scope.tdz_store.get(slot).copied().unwrap_or(false) {
+                tdz_mask |= 1u64 << slot;
+            }
+        }
+        (tdz_mask, 1)
+    };
+    CertifiedInlineInfo {
+        entry: compiled.entry as u64,
+        stack_usage: compiled.stack_usage as u64,
+        frame_size: scope.frame_size as u32,
+        arity: scope.arity as u32,
+        this_slot,
+        strict: u32::from(strict),
+        tdz_mask,
+        fill_ok,
+        globals_unshadowed: u32::from(Vm::global_reads_are_unshadowed(
+            environment,
+            &ir.ident_names,
+        )),
+        has_call_apply: u32::from(ir.has_call_apply),
+        has_call_intrinsic: u32::from(ir.has_call_intrinsic),
+        callee_id: function.id(),
+    }
+}
+
 extern "C" fn leaf_call_probe(
     ctx: *mut c_void,
     callee: u64,
@@ -2607,6 +2830,7 @@ extern "C" fn leaf_call_probe(
     *cache_entry = LeafCallRecord {
         callee_payload: callee & crux::PAYLOAD_MASK,
         leaf_inline: LeafInlineInfo::empty(),
+        certified: CertifiedInlineInfo::empty(),
         epoch: ctx.leaf_epoch,
         code_gen: ctx.leaf_gen,
         callee_hi: (callee >> 44) as u32,
@@ -2629,6 +2853,10 @@ extern "C" fn leaf_call_probe(
     if !matches!(function.kind, crux::function::FunctionKind::EcmaScript) {
         return 0;
     }
+    // C1: the certified verdict is cached here too (the caller is at rest, the
+    // precondition both nested lanes share), so a leaf-refusing site can fall
+    // to the certified helper without re-deriving it.
+    cache_entry.certified = certified_verdict(agent, &function);
     let Some(entry) = agent.leaf_lookup(function.id()) else {
         return 0;
     };

@@ -57,6 +57,9 @@ pub enum Helper {
     /// G13: run a certified leaf that reads its environment, which the machine
     /// code cannot do in-frame (the env swap has to span the call).
     LeafCallEnv,
+    /// C1: run a certified (non-leaf) callee through the call-site record's
+    /// cached verdict, skipping the per-call `ecma_functions` re-derivation.
+    CertifiedCall,
     GetGlobal,
     SetGlobal,
     SetGlobalSlot,
@@ -227,6 +230,7 @@ impl Helper {
             Helper::LeafCallProbe => "leaf_call_probe",
             Helper::LeafCallFill => "leaf_call_fill",
             Helper::LeafCallEnv => "leaf_call_env",
+            Helper::CertifiedCall => "certified_call",
             Helper::GetGlobal => "get_global",
             Helper::SetGlobal => "set_global",
             Helper::SetGlobalSlot => "set_global_slot",
@@ -369,6 +373,7 @@ impl Helper {
                 | Helper::LeafCallProbe
                 | Helper::LeafCallFill
                 | Helper::LeafCallEnv
+                | Helper::CertifiedCall
                 | Helper::ApplyArgsFill
                 | Helper::ToBooleanSlow
                 | Helper::ConcatStrings
@@ -512,6 +517,19 @@ pub struct JitHelpers {
     /// result bits, or `u64::MAX` to fall back to `call_slow`.
     pub leaf_call_env: Option<
         extern "C" fn(vm: *mut c_void, callee: u64, args: *mut u64, argc: u64, slot: u64) -> u64,
+    >,
+    /// C1: run a certified (non-leaf) callee through the call-site record's
+    /// cached verdict (see `certified_call`). Returns the result bits, or
+    /// `u64::MAX` to fall back to `call_slow`.
+    pub certified_call: Option<
+        extern "C" fn(
+            vm: *mut c_void,
+            callee: u64,
+            this: u64,
+            args: *mut u64,
+            argc: u64,
+            slot: u64,
+        ) -> u64,
     >,
     /// Read a declared top-level `var` off the global object (`name` is an
     /// `AtomId`); returns the value.
@@ -910,6 +928,7 @@ impl JitHelpers {
             leaf_call_probe: None,
             leaf_call_fill: None,
             leaf_call_env: None,
+            certified_call: None,
             get_global: None,
             set_global: None,
             set_global_slot: None,
@@ -1058,6 +1077,7 @@ impl JitHelpers {
             Helper::LeafCallProbe => self.leaf_call_probe.map(|f| f as usize as u64),
             Helper::LeafCallFill => self.leaf_call_fill.map(|f| f as usize as u64),
             Helper::LeafCallEnv => self.leaf_call_env.map(|f| f as usize as u64),
+            Helper::CertifiedCall => self.certified_call.map(|f| f as usize as u64),
             Helper::GetGlobal => self.get_global.map(|f| f as usize as u64),
             Helper::SetGlobal => self.set_global.map(|f| f as usize as u64),
             Helper::SetGlobalSlot => self.set_global_slot.map(|f| f as usize as u64),
@@ -2076,6 +2096,18 @@ pub(crate) extern "C" fn test_leaf_call_fill(
 pub(crate) extern "C" fn test_leaf_call_env(
     _vm: *mut c_void,
     _callee: u64,
+    _args: *mut u64,
+    _argc: u64,
+    _site: u64,
+) -> u64 {
+    u64::MAX
+}
+
+#[cfg(test)]
+pub(crate) extern "C" fn test_certified_call(
+    _vm: *mut c_void,
+    _callee: u64,
+    _this: u64,
     _args: *mut u64,
     _argc: u64,
     _site: u64,
