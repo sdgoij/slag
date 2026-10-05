@@ -423,7 +423,7 @@ fn resolve_locale_dtf(
     }
     let mut found_locale = found.unwrap_or_else(|| number_format::default_locale().to_string());
     let mut ca = "gregory".to_string();
-    let mut nu = "latn".to_string();
+    let mut nu = number_format::default_numbering_system(&found_locale).to_string();
     let mut hc: Option<String> = None;
     let mut supported: Vec<(String, String)> = Vec::new();
     if let Some(ext) = extension {
@@ -1934,18 +1934,36 @@ fn format_field_month(local: &LocalTime, width: u32, ns: &str, calendar: &str) -
     // The month number: the month code's number for chinese/dangi (the leap
     // month shifts the later months' ordinals: M11 is ordinal 12 in 2099),
     // the ordinal for the other calendars.
-    let month: i64 = match crate::builtins::temporal::calendar::calendar_iso_to_date(
+    let converted = crate::builtins::temporal::calendar::calendar_iso_to_date(
         calendar,
         local.year,
         local.month as i64,
         local.day as i64,
-    ) {
-        Some((cy, cm, _)) if matches!(calendar, "chinese" | "dangi") => {
-            crate::builtins::temporal::calendar::calendar_month_code(calendar, cy, cm)
-                .trim_start_matches('M')
-                .parse()
-                .unwrap_or(cm)
-        }
+    );
+    // A leap month has no numeric form, so it is emitted as `<n>L` with the
+    // code number as the numeric part (the corpus reads it back with
+    // parseInt and reconstructs `M<n>L`).
+    if matches!(calendar, "chinese" | "dangi")
+        && width <= 2
+        && let Some((cy, cm, _)) = converted
+    {
+        let code = crate::builtins::temporal::calendar::calendar_month_code(calendar, cy, cm);
+        let digits = code.trim_start_matches('M');
+        return match digits.strip_suffix('L') {
+            Some(number) => {
+                let n: i64 = number.parse().unwrap_or(cm);
+                format!("{}L", format_number(n, if width == 2 { 2 } else { 1 }, ns))
+            }
+            None => format_number(digits.parse().unwrap_or(cm), width, ns),
+        };
+    }
+    // Hebrew months are never numeric (CLDR-15510): emit the month name.
+    if calendar == "hebrew"
+        && let Some((cy, cm, _)) = converted
+    {
+        return hebrew_month_name(cy, cm).to_string();
+    }
+    let month: i64 = match converted {
         Some((_, cm, _)) => cm,
         None => local.month as i64,
     };
@@ -1961,6 +1979,24 @@ fn format_field_month(local: &LocalTime, width: u32, ns: &str, calendar: &str) -
         3 => names[1][index].to_string(),
         4 => names[0][index].to_string(),
         _ => names[2][index].to_string(),
+    }
+}
+
+/// The en month name of a Hebrew (year, month ordinal); the leap-year Adar
+/// split (Adar I / Adar II) follows the calendar's 13-month years.
+fn hebrew_month_name(year: i64, month: i64) -> &'static str {
+    const LEAP: [&str; 13] = [
+        "Tishri", "Heshvan", "Kislev", "Tevet", "Shevat", "Adar I", "Adar II", "Nisan", "Iyar",
+        "Sivan", "Tamuz", "Av", "Elul",
+    ];
+    const COMMON: [&str; 12] = [
+        "Tishri", "Heshvan", "Kislev", "Tevet", "Shevat", "Adar", "Nisan", "Iyar", "Sivan",
+        "Tamuz", "Av", "Elul",
+    ];
+    if crate::builtins::temporal::calendar::hebrew_leap_year(year) {
+        LEAP[(month - 1).clamp(0, 12) as usize]
+    } else {
+        COMMON[(month - 1).clamp(0, 11) as usize]
     }
 }
 

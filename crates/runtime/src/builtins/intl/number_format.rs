@@ -1632,6 +1632,25 @@ pub fn default_locale() -> &'static str {
     "en-US"
 }
 
+/// The CLDR `nu` likely-subtags default: `ar` uses Arabic-Indic digits except
+/// in the Maghreb (Algeria, Western Sahara, Libya, Morocco, Tunisia); every
+/// other supported locale falls back to Latin.
+pub(crate) fn default_numbering_system(locale: &str) -> &'static str {
+    let mut parts = locale.split(['-', '_']);
+    let language = parts.next().unwrap_or("");
+    let region = parts.next();
+    if language == "ar"
+        && !matches!(
+            region,
+            Some("DZ") | Some("EH") | Some("LY") | Some("MA") | Some("TN")
+        )
+    {
+        "arab"
+    } else {
+        "latn"
+    }
+}
+
 /// CanonicalizeLocaleList is shared with `%Intl%` (mod.rs).
 fn canonicalize_locale_list(agent: &mut Agent, locales: &Value) -> Result<Vec<String>, JsError> {
     crate::builtins::intl::canonicalize_locale_list(agent, locales)
@@ -1821,7 +1840,7 @@ pub(crate) fn resolve_locale(
         }
     }
     let mut found_locale = found.unwrap_or_else(|| default_locale().to_string());
-    let mut nu: String = "latn".to_string();
+    let mut nu: String = default_numbering_system(&found_locale).to_string();
     let mut supported_keyword: Option<(String, String)> = None;
     if let Some(ext) = extension
         && let Some(value) = unicode_extension_keyword_value(&ext, "nu")

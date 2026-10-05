@@ -2090,28 +2090,26 @@ ShadowRealm (64)).
   TypedArray `copyWithin` fixtures above. Use a release build
   (`cargo run --release -p test262 --bin sweep`) — the debug build's deep
   recursion can overflow the stack on heavy fixtures.
-- The `intl402/` area is swept too (3,282 pass / 2 fail / 81 skip of 3,365;
+- The `intl402/` area is swept too (3,284 pass / 0 fail / 81 skip of 3,365;
   the corpus grew by 8 in the 2026-09 pull). The Temporal gate no longer skips a
   `features: [Temporal]` fixture just for living outside the `Temporal/<Type>/`
   namespace, so the ~71 `Intl.DateTimeFormat`/`DurationFormat` fixtures that
-  *format* Temporal values now run (58 newly passing). The remaining skips are
-  `Intl.Locale-info` (60), `Intl.DateTimeFormat-extend-timezonename` (2), and
-  `canonical-tz` (19). The two remaining failures both need shared locale data:
-  `DateTimeFormat/prototype/format/temporal-objects-no-time-clip-non-latin-numerals.js`
-  (the `ar` numbering-system default is `latn`; needs the CLDR `nu`
-  likely-subtags table) and
-  `DateTimeFormat/prototype/formatToParts/compare-to-temporal-lunisolar.js`
-  (chinese/dangi leap months must keep the month *code* number — `M05L`, not the
-  ordinal `M06` — and Hebrew needs a month-name table; CLDR-15510 makes Hebrew
-  months non-numeric). The same pull added three fixtures that are now fixed:
-  `german-weekday-no-year.js` (German abbreviated weekdays carry a trailing
-  period) and the two `significant-digits-rounding-magnitude*` (ToRawPrecision
-  must handle the carry when the rounded mantissa reaches `10^p`). The harness
-  prelude also now sets `assert._formatIdentityFreeValue`, which `deepEqual.js`'s
-  failure formatter calls — without it a failing `deepEqual` reported as
-  "undefined is not a function". Anything else that fails the sweep should be
-  triaged into bug / host-dependent / missing-hook categories and either fixed or
-  documented here.
+  *format* Temporal values now run. That exposed 16 failures, all now fixed:
+  ToRawPrecision's carry (`significant-digits-rounding-magnitude*`), integer-ms
+  `plain_epoch_ms` (`temporal-objects-no-time-clip*`), the `ToDateTimeFormattable`
+  order (`to-datetime-formattable-with-different-arg-kinds*`), the same-date
+  time-range collapse (`temporal-objects-resolved-time-zone*`), the PlainMonthDay
+  era filter (`temporal-objects-format-with-era*`), the japanese era year
+  (`compare-to-temporal`), the chinese/dangi leap-month code + Hebrew month names
+  (`compare-to-temporal-lunisolar`), the `ar` `nu` likely-subtags default
+  (`temporal-objects-no-time-clip-non-latin-numerals`), and German abbreviated
+  weekdays (`german-weekday-no-year`). The remaining skips are `Intl.Locale-info`
+  (60), `Intl.DateTimeFormat-extend-timezonename` (2), and `canonical-tz` (19).
+  The harness prelude also now sets `assert._formatIdentityFreeValue`, which
+  `deepEqual.js`'s failure formatter calls — without it a failing `deepEqual`
+  reported as "undefined is not a function". Anything else that fails the sweep
+  should be triaged into bug / host-dependent / missing-hook categories and
+  either fixed or documented here.
 - Known flaky fixture: `TypedArray/prototype/reduce/callbackfn-arguments-default-accumulator.js`
   (Strict) intermittently fails with `Expected SameValue(«43», «41») to be true` — the second
   reduce callback's `arguments[0]` reads 43 (iteration 1's `kValue`) instead of 41 (iteration
