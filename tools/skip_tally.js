@@ -131,6 +131,7 @@ function classify(file, source) {
   // DisplayNames (+ the -v2 tag).
   const INTL_IMPLEMENTED = new Set([
     "Intl.Locale",
+    "Intl.Locale-info",
     "Intl.NumberFormat",
     "Intl.NumberFormat-unified",
     "Intl.NumberFormat-v3",

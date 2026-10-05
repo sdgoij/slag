@@ -13,7 +13,7 @@ use crux::string::JsString;
 use crux::value::{Value, ValueKind};
 
 use crate::agent::Agent;
-use crate::builtins::intl::{IntlLocaleRecord, bcp47};
+use crate::builtins::intl::{IntlLocaleRecord, bcp47, locale_info};
 use crate::context::{as_object, get_property, to_object, to_string};
 use crate::realm::Realm;
 
@@ -34,6 +34,13 @@ const LOCALE_NUMBERINGSYSTEM: &str = "%Intl.Locale.prototype.numberingSystem%";
 const LOCALE_NUMERIC: &str = "%Intl.Locale.prototype.numeric%";
 const LOCALE_FIRST_DAY_OF_WEEK: &str = "%Intl.Locale.prototype.firstDayOfWeek%";
 const LOCALE_VARIANTS: &str = "%Intl.Locale.prototype.variants%";
+const LOCALE_GET_CALENDARS: &str = "%Intl.Locale.prototype.getCalendars%";
+const LOCALE_GET_COLLATIONS: &str = "%Intl.Locale.prototype.getCollations%";
+const LOCALE_GET_HOUR_CYCLES: &str = "%Intl.Locale.prototype.getHourCycles%";
+const LOCALE_GET_NUMBERING_SYSTEMS: &str = "%Intl.Locale.prototype.getNumberingSystems%";
+const LOCALE_GET_TIME_ZONES: &str = "%Intl.Locale.prototype.getTimeZones%";
+const LOCALE_GET_TEXT_INFO: &str = "%Intl.Locale.prototype.getTextInfo%";
+const LOCALE_GET_WEEK_INFO: &str = "%Intl.Locale.prototype.getWeekInfo%";
 
 fn range_error(message: &str) -> JsError {
     JsError::new(ErrorKind::RangeError, message.into())
@@ -80,6 +87,13 @@ pub fn install(realm: &Handle<Realm>, intl_value: &Value) -> Result<(), JsError>
         ("toString", LOCALE_TO_STRING, 0),
         ("maximize", LOCALE_MAXIMIZE, 0),
         ("minimize", LOCALE_MINIMIZE, 0),
+        ("getCalendars", LOCALE_GET_CALENDARS, 0),
+        ("getCollations", LOCALE_GET_COLLATIONS, 0),
+        ("getHourCycles", LOCALE_GET_HOUR_CYCLES, 0),
+        ("getNumberingSystems", LOCALE_GET_NUMBERING_SYSTEMS, 0),
+        ("getTimeZones", LOCALE_GET_TIME_ZONES, 0),
+        ("getTextInfo", LOCALE_GET_TEXT_INFO, 0),
+        ("getWeekInfo", LOCALE_GET_WEEK_INFO, 0),
     ];
     for (name, key, length) in methods {
         let func = Function::create_builtin(
@@ -290,6 +304,27 @@ pub fn dispatch_call(
     if resolved.is(LOCALE_VARIANTS) {
         return Some(getter_opt(agent, this, bcp47::get_locale_variants));
     }
+    if resolved.is(LOCALE_GET_CALENDARS) {
+        return Some(get_calendars(agent, this));
+    }
+    if resolved.is(LOCALE_GET_COLLATIONS) {
+        return Some(get_collations(agent, this));
+    }
+    if resolved.is(LOCALE_GET_HOUR_CYCLES) {
+        return Some(get_hour_cycles(agent, this));
+    }
+    if resolved.is(LOCALE_GET_NUMBERING_SYSTEMS) {
+        return Some(get_numbering_systems(agent, this));
+    }
+    if resolved.is(LOCALE_GET_TIME_ZONES) {
+        return Some(get_time_zones(agent, this));
+    }
+    if resolved.is(LOCALE_GET_TEXT_INFO) {
+        return Some(get_text_info(agent, this));
+    }
+    if resolved.is(LOCALE_GET_WEEK_INFO) {
+        return Some(get_week_info(agent, this));
+    }
     None
 }
 
@@ -307,6 +342,129 @@ fn getter_opt(
         Some(value) => Value::String(Handle::new(JsString::from_utf8(&value))),
         None => Value::Undefined,
     })
+}
+
+fn string_value(text: &str) -> Value {
+    Value::String(Handle::new(JsString::from_utf8(text)))
+}
+
+fn array_of(agent: &mut Agent, items: impl Iterator<Item = Value>) -> Result<Value, JsError> {
+    let values: Vec<Value> = items.collect();
+    crate::builtins::array::array_from_values(agent, &values)
+}
+
+/// An ordinary object with %Object.prototype% (the info-object shape the
+/// `getWeekInfo`/`getTextInfo` getters return).
+fn info_object(agent: &mut Agent) -> Result<Handle<JsObject>, JsError> {
+    let object_proto = agent
+        .current_realm()?
+        .intrinsics
+        .get("%Object.prototype%")
+        .and_then(|value| as_object(&value));
+    Ok(JsObject::ordinary_object_create(object_proto))
+}
+
+fn define_data_property(obj: &Handle<JsObject>, name: &str, value: Value) -> Result<(), JsError> {
+    obj.define_property(
+        &JsString::from_utf8(name),
+        &PropertyDescriptor {
+            value: Some(value),
+            writable: Some(true),
+            get: None,
+            set: None,
+            enumerable: Some(true),
+            configurable: Some(true),
+        },
+    )
+    .map(|_| ())
+}
+
+fn get_calendars(agent: &mut Agent, this: &Value) -> Result<Value, JsError> {
+    let record = locale_record(agent, this)?;
+    if let Some(calendar) =
+        bcp47::unicode_extension_value(&record.locale, "ca").filter(|value| !value.is_empty())
+    {
+        return array_of(agent, std::iter::once(string_value(&calendar)));
+    }
+    array_of(
+        agent,
+        locale_info::calendars(&record.locale)
+            .into_iter()
+            .map(string_value),
+    )
+}
+
+fn get_collations(agent: &mut Agent, this: &Value) -> Result<Value, JsError> {
+    let record = locale_record(agent, this)?;
+    if let Some(collation) =
+        bcp47::unicode_extension_value(&record.locale, "co").filter(|value| !value.is_empty())
+    {
+        return array_of(agent, std::iter::once(string_value(&collation)));
+    }
+    array_of(
+        agent,
+        locale_info::collations(&record.locale)
+            .into_iter()
+            .map(string_value),
+    )
+}
+
+fn get_hour_cycles(agent: &mut Agent, this: &Value) -> Result<Value, JsError> {
+    let record = locale_record(agent, this)?;
+    if let Some(hour_cycle) =
+        bcp47::unicode_extension_value(&record.locale, "hc").filter(|value| !value.is_empty())
+    {
+        return array_of(agent, std::iter::once(string_value(&hour_cycle)));
+    }
+    array_of(
+        agent,
+        locale_info::hour_cycles(&record.locale)
+            .into_iter()
+            .map(string_value),
+    )
+}
+
+fn get_numbering_systems(agent: &mut Agent, this: &Value) -> Result<Value, JsError> {
+    let record = locale_record(agent, this)?;
+    if let Some(system) = bcp47::unicode_extension_value(&record.locale, "nu")
+        .filter(|value| !value.is_empty() && value != "true")
+    {
+        return array_of(agent, std::iter::once(string_value(&system)));
+    }
+    let systems = locale_info::numbering_systems(&record.locale);
+    array_of(agent, systems.iter().map(|system| string_value(system)))
+}
+
+fn get_time_zones(agent: &mut Agent, this: &Value) -> Result<Value, JsError> {
+    let record = locale_record(agent, this)?;
+    match locale_info::time_zones(&record.locale) {
+        Some(zones) => array_of(agent, zones.into_iter().map(string_value)),
+        None => Ok(Value::Undefined),
+    }
+}
+
+fn get_text_info(agent: &mut Agent, this: &Value) -> Result<Value, JsError> {
+    let record = locale_record(agent, this)?;
+    let info = info_object(agent)?;
+    if let Some(direction) = locale_info::text_direction(&record.locale) {
+        define_data_property(&info, "direction", string_value(direction))?;
+    }
+    Ok(Value::Object(info))
+}
+
+fn get_week_info(agent: &mut Agent, this: &Value) -> Result<Value, JsError> {
+    let record = locale_record(agent, this)?;
+    let first_day_of_week = bcp47::unicode_extension_value(&record.locale, "fw");
+    let (first_day, weekend) = locale_info::week_info(&record.locale, first_day_of_week.as_deref());
+    let info = info_object(agent)?;
+    define_data_property(&info, "firstDay", Value::Number(f64::from(first_day)))?;
+    let weekend_values: Vec<Value> = weekend
+        .iter()
+        .map(|day| Value::Number(f64::from(*day)))
+        .collect();
+    let weekend_array = crate::builtins::array::array_from_values(agent, &weekend_values)?;
+    define_data_property(&info, "weekend", weekend_array)?;
+    Ok(Value::Object(info))
 }
 
 /// `Intl.Locale.prototype.maximize`/`minimize`: a brand-new Locale with the
@@ -618,11 +776,10 @@ fn apply_unicode_options(agent: &mut Agent, tag: &str, options: &Value) -> Resul
         set_keyword("co", value);
     }
     if let Some(value) = string_option(agent, options, "firstDayOfWeek")? {
-        // WeekdayToUValue: the option is already the canonical 3-letter code.
-        if !matches!(
-            value.as_str(),
-            "mon" | "tue" | "wed" | "thu" | "fri" | "sat" | "sun"
-        ) {
+        // WeekdayToUValue maps the numeric weekday strings to their names;
+        // the result must then be a valid `type` value.
+        let value = weekday_to_u_value(&value);
+        if !is_type_option(&value) {
             return Err(range_error("Invalid firstDayOfWeek value"));
         }
         set_keyword("fw", value);
@@ -692,4 +849,20 @@ fn is_type_option(value: &str) -> bool {
         && value.split('-').all(|token| {
             (3..=8).contains(&token.len()) && token.bytes().all(|c| c.is_ascii_alphanumeric())
         })
+}
+
+/// WeekdayToUValue (ECMA-402): the numeric weekday strings "0".."7" map to
+/// their three-letter names (0 and 7 are Sunday); any other string is
+/// returned unchanged.
+fn weekday_to_u_value(value: &str) -> String {
+    match value.to_ascii_lowercase().as_str() {
+        "0" | "7" => "sun".to_string(),
+        "1" => "mon".to_string(),
+        "2" => "tue".to_string(),
+        "3" => "wed".to_string(),
+        "4" => "thu".to_string(),
+        "5" => "fri".to_string(),
+        "6" => "sat".to_string(),
+        _ => value.to_string(),
+    }
 }

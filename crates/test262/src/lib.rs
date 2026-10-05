@@ -12473,6 +12473,7 @@ var $DONE = function (error) {
     /// features still skip via `unimplemented_intl_feature`.
     const INTL_IMPLEMENTED: &[&str] = &[
         "Intl.Locale",
+        "Intl.Locale-info",
         "Intl.NumberFormat",
         "Intl.NumberFormat-unified",
         "Intl.NumberFormat-v3",

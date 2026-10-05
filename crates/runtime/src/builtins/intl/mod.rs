@@ -12,6 +12,7 @@ pub mod display_names;
 pub mod duration_format;
 pub mod list_format;
 pub mod locale;
+pub mod locale_info;
 pub mod number_data;
 pub mod number_format;
 pub mod plural_data;

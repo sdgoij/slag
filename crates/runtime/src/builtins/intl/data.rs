@@ -138,6 +138,19 @@ pub const LIKELY_SUBTAGS: &[(&str, &str)] = &[
     ("zh", "zh-Hans-CN"),
     ("bg", "bg-Cyrl-BG"),
     ("it", "it-Latn-IT"),
+    // The language defaults the Intl.Locale-info region lookups exercise
+    // (likely-subtags-region fixtures).
+    ("fa", "fa-Arab-IR"),
+    ("ja", "ja-Jpan-JP"),
+    ("sa", "sa-Deva-IN"),
+    ("ps", "ps-Arab-AF"),
+    ("am", "am-Ethi-ET"),
+    ("bn", "bn-Beng-BD"),
+    ("el", "el-Grek-GR"),
+    ("fil", "fil-Latn-PH"),
+    ("ko", "ko-Kore-KR"),
+    ("ms", "ms-Latn-MY"),
+    ("ur", "ur-Arab-PK"),
     // the grandfathered maximals (likely-subtags-grandfathered.js)
     ("jbo", "jbo-Latn-001"),
     ("hak", "hak-Hans-CN"),

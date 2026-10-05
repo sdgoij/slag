@@ -1653,9 +1653,9 @@ These categories are expected to stay non-runnable and are not counted
 against the runnable pass-rate target:
 
 - **Unimplemented ECMA-402 pieces** — ECMA-402 is a separate
-  specification; the `intl402/` fixtures needing `Intl.Locale-info`,
-  `Intl.DateTimeFormat-extend-timezonename`, or `canonical-tz` stay
-  skipped (see the sweep-area table above).
+  specification; the `intl402/` fixtures needing
+  `Intl.DateTimeFormat-extend-timezonename` stay skipped (see the sweep-area
+  table above).
 - **`dynamic import` specifier resolution** — `import(specifier)` resolves
   through host hooks (`HostResolveImportedModule`); the test262 harness
   registers the `_FIXTURE` siblings, so fixtures run, but no general
@@ -2090,7 +2090,7 @@ ShadowRealm (64)).
   TypedArray `copyWithin` fixtures above. Use a release build
   (`cargo run --release -p test262 --bin sweep`) — the debug build's deep
   recursion can overflow the stack on heavy fixtures.
-- The `intl402/` area is swept too (3,303 pass / 0 fail / 62 skip of 3,365;
+- The `intl402/` area is swept too (3,363 pass / 0 fail / 2 skip of 3,365;
   the corpus grew by 8 in the 2026-09 pull). The Temporal gate no longer skips a
   `features: [Temporal]` fixture just for living outside the `Temporal/<Type>/`
   namespace, so the ~71 `Intl.DateTimeFormat`/`DurationFormat` fixtures that
@@ -2103,12 +2103,25 @@ ShadowRealm (64)).
   (`compare-to-temporal`), the chinese/dangi leap-month code + Hebrew month names
   (`compare-to-temporal-lunisolar`), the `ar` `nu` likely-subtags default
   (`temporal-objects-no-time-clip-non-latin-numerals`), and German abbreviated
-  weekdays (`german-weekday-no-year`). The remaining skips are `Intl.Locale-info`
-  (60) and `Intl.DateTimeFormat-extend-timezonename` (2). The harness prelude also
+  weekdays (`german-weekday-no-year`). The remaining skips are only
+  `Intl.DateTimeFormat-extend-timezonename` (2). The harness prelude also
   now sets `assert._formatIdentityFreeValue`, which `deepEqual.js`'s failure
   formatter calls — without it a failing `deepEqual` reported as "undefined is not
   a function". Anything else that fails the sweep should be triaged into bug /
   host-dependent / missing-hook categories and either fixed or documented here.
+- `Intl.Locale-info` is implemented (it was the other 60 `intl402` skips): the
+  seven prototype methods `getCalendars`, `getCollations`, `getHourCycles`,
+  `getNumberingSystems`, `getTimeZones`, `getTextInfo` and `getWeekInfo`, plus
+  the `firstDayOfWeek` constructor option now accepting the full `type` grammar
+  (`WeekdayToUValue` maps `0`..`7`/names and a bare `true` is canonicalized to
+  the bare `fw` key). `crates/runtime/src/builtins/intl/locale_info.rs` carries
+  the CLDR 48 `weekData`/`calendarPreferenceData`/`timeData` tables and the IANA
+  `zone.tab` common-region zones; every getter resolves its region through the
+  spec's `RegionPreference` (region → `sd` subdivision → Add-Likely-Subtags →
+  "001", with the `rg` override taking priority when data exists). The tables are
+  corpus-consistent, not exhaustive: the fixtures are relational (any correct
+  per-region data passes), and `Intl.Locale-info`'s skip (60) is removed from
+  both `run_fixture` and `tools/skip_tally.js`.
 - `canonical-tz` is implemented (it was the other 19 `intl402` skips). A named
   zone identifier is *preserved* with its canonical spelling: neither
   `Temporal.ZonedDateTime.timeZoneId` nor `DateTimeFormat`'s
