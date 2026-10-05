@@ -2165,8 +2165,10 @@ fn certified_lane_inline(
     let global = realm.global_object;
     // The lane's gate: the self gate minus the `this` requirement (bound
     // below) plus the super/`ThisValue` machinery it cannot install. The
-    // call-site probe already ran it (cached); the derived path re-runs it.
-    if cached.is_none() && !body.certified_callee_eligible() {
+    // call-site probe already ran it (cached); the derived path re-runs it. A
+    // construct already ran it inside `certified_construct_eligible` above, so
+    // it is not re-scanned here.
+    if cached.is_none() && !construct && !body.certified_callee_eligible() {
         return Ok(None);
     }
     // An unmapped-`arguments` object is built from the *current* realm's

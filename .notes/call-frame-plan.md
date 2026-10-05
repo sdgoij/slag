@@ -314,19 +314,40 @@ methods (`initialize_instance_elements`: refused, they keep `ordinary_construct`
 a sloppy body's mapped `arguments` (refused like the call lane; the unmapped
 form reads `Vm::call_args`).
 
-**C2b — the construct-site verdict cache (emit-side, if the probe warrants).** A
-`Construct` site emits one `Helper::Construct` FFI with no site record; if the
-C2a probe still shows the per-construct re-derivation (the `leaf_lookup` HashMap
-+ verdict for a leaf, the `ecma_functions` lookup for a non-leaf) as the
-residual, add a construct-site record (a `ConstructInlineInfo` the site caches,
-keyed by the callee's `id` + site, with the same identity/`code_gen`/`epoch`
-gate the leaf record uses) and a `Helper::CertifiedConstruct` that skips it — the
-construct mirror of C1a/C1b. Probe first.
+**C2b — the construct-site verdict cache (emit-side): probed and declined
+(2026-10-05).** A `Construct` site emits one `Helper::Construct` FFI with no
+site record; C2b would add a construct-site record (`ConstructInlineInfo`, keyed
+by the callee's `id` + site, with the leaf record's identity/`code_gen`/`epoch`
+gate) and a `Helper::CertifiedConstruct` that skips the per-construct
+re-derivation — the construct mirror of C1a/C1b. The probe says it is not worth
+it. The one *re-derivation* in the construct lane was a **double eligibility
+scan**: `certified_construct_eligible` scans the body, then `certified_lane_inline`
+re-ran `certified_callee_eligible` on the same body. That was removed for
+constructs (C2b-lite, non-leaf 128 → ~111 ms / 500k). What remains of the ~50
+ns/construct residual (non-leaf ~111 ms vs leaf ~87 ms) is *not* the
+re-derivation a record can cache:
+
+- `CertifiedInlineInfo` carries only the *verdict* (entry, frame layout,
+  `globals_unshadowed`, `has_call_*`, `tdz_mask`, `callee_id`) — **not** the
+  `body`/`environment`/`realm`. So the lane's resolve
+  (`agent.ecma_functions.get(&id)` + `data.ir.clone()`) runs even on the cached
+  path. C1b has the same property; its win came from skipping the
+  `certified_callee_eligible` scan and the `global_reads_are_unshadowed` walk, not
+  the record lookup.
+- The lane's `save_scratch`/`env_stack` swap/`restore_scratch` is required (the
+  callee reads its capture environment) and cannot be cached away.
+- `lookup_info` is a cached-pointer load for a hot body (`ir.jit_info`), not a
+  per-call compile consult.
+
+So the record could only skip `lookup_info` (negligible) and the globals walk
+(empty for a constructor with no global reads). The C2a probe does not show the
+re-derivation as the residual, so C2b is declined. Revisit only if a construct
+row appears where the `ecma_functions` lookup or the env swap measurably
+dominates.
 
 Probes: a non-leaf certified base constructor row and the bare-construct probe
 (`--jit-bench`/the corpus), A/B; `construct_churn` and `recursive_fib` must not
-regress. Slices land in order C2a (the measured win), then C2b only if the
-residual is still the re-derivation.
+regress. C2a landed (the measured win); C2b was probed and declined (above).
 
 **Status (2026-10-05): C2a landed.** `certified_call_inline` is now
 `certified_lane_inline(ctx, callee, this, args, argc, cached, construct)` — one
@@ -343,8 +364,8 @@ it is the no-regress guard, not the win. Gates: normal sweep at baseline
 constructor, both base-return rule arms, a base class, and the
 derived/instance-field fallbacks); `cargo test -p runtime --lib` 994; a
 self-checking non-leaf construct under `--gc-stress`/`--nursery-stress`; the CLI
-benches 12/12 `ok=true`. **C2b** (the construct-site verdict cache) remains,
-if the probe still shows the re-derivation as the residual.
+benches 12/12 `ok=true`. **C2b** (the construct-site verdict cache) was probed
+and declined; C2b-lite removed the double eligibility scan (128 → ~111 ms).
 
 **Stage C0 detail (the substrate).** C0 makes the compiled body's working
 region *be* `vm.stack`, so the frame and the operand stack are one described
