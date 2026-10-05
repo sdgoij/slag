@@ -3122,12 +3122,16 @@ impl EnvStack {
 
     /// Re-point the stack at a fresh base, dropping the previous run's
     /// entries (the Vm pool reuses the stack across calls).
-    fn reset(&mut self, base: EnvRef) {
-        for slot in &mut self.inline {
+    pub(crate) fn reset(&mut self, base: EnvRef) {
+        // Only the used inline slots hold a value (the tail is already `None`),
+        // so clear just those: this runs on both sides of every nested call's
+        // env swap, and clearing the whole array measured on call-dominated
+        // workloads.
+        for slot in self.inline.iter_mut().take(self.len.min(ENV_INLINE)) {
             *slot = None;
         }
-        self.inline[0] = Some(base);
         self.heap.clear();
+        self.inline[0] = Some(base);
         self.len = 1;
     }
 
@@ -3373,6 +3377,93 @@ pub(crate) struct VmScratch {
     array_index_len: usize,
     var_ref_len: usize,
     class_len: usize,
+    /// Whether [`Vm::save_scratch`] moved the caller's per-activation control
+    /// state onto `Vm::saved_control` (the C1c isolation). When false, restore
+    /// resets the shared `env_stack` only if the nested run changed it.
+    control_saved: bool,
+    /// The `env_stack` depth at save (C1c); restore skips the reset when an
+    /// unchanged-depth run left the caller's base in place.
+    env_len: usize,
+    /// Whether the lane re-pointed `env_stack` at the callee's environment
+    /// (`certified_call_inline`); restore must reset it to the caller's base
+    /// even when the depth did not change.
+    env_swapped: bool,
+}
+
+impl VmScratch {
+    /// Mark that the lane re-pointed the shared `env_stack` at the callee's
+    /// environment, so [`Vm::restore_scratch`] resets it to the caller's base.
+    pub(crate) fn mark_env_swapped(&mut self) {
+        self.env_swapped = true;
+    }
+}
+
+/// C1c: the per-activation control state a nested compiled run (the self-call
+/// and certified-callee lanes) takes off the shared `Vm` for its duration, so
+/// the nested body observes none of the caller's `try`/for-of/for-in/
+/// destructure/completion state and cannot pop or scan the caller's entries.
+///
+/// It lives on the `Vm` (`Vm::saved_control`), not in the caller's Rust frame:
+/// the caller's state can hold live GC values (a `try` frame's env, an iterator
+/// record, a thrown value), and a Rust local is invisible to the collector, so
+/// a collection during the nested run would sweep them. [`Vm::trace`] walks it.
+#[derive(Debug)]
+pub(crate) struct SavedControl {
+    try_stack: Vec<TryFrame>,
+    pending: Vec<PendingControl>,
+    thrown: Option<Value>,
+    resume_abrupt: Option<ResumeAbrupt>,
+    for_of_stepping: bool,
+    async_for_of_stepping: bool,
+    destructure_stepping: bool,
+    for_in_stack: Vec<ForInState>,
+    for_of_stack: Vec<ForOfEntry>,
+    async_for_of_stack: Vec<crate::expr::IteratorRecord>,
+    for_of_boundaries: Vec<(usize, usize)>,
+    async_for_of_boundaries: Vec<(usize, usize)>,
+    destructure_stack: Vec<crate::expr::IteratorRecord>,
+    destructure_done: Vec<bool>,
+    destructure_obj_stack: Vec<Value>,
+    destructure_assign_keys: Vec<Value>,
+    destructure_excluded: Vec<Vec<crux::property::PropertyKey>>,
+    yield_star_stack: Vec<YieldStarState>,
+    completion_stack: Vec<(Value, bool)>,
+    list_stack: Vec<(Value, bool)>,
+    pending_disposal: Option<PendingDisposal>,
+    pending_catch_disposal: Option<(EnvRef, usize)>,
+    env_stack: EnvStack,
+}
+
+impl Trace for SavedControl {
+    fn trace(&self, visit: &mut dyn FnMut(GcAny)) {
+        self.try_stack.trace(visit);
+        self.pending.trace(visit);
+        self.thrown.trace(visit);
+        self.resume_abrupt.trace(visit);
+        for state in &self.for_in_stack {
+            state.base.trace(visit);
+            for (_, key) in &state.keys {
+                key.trace(visit);
+            }
+        }
+        self.for_of_stack.trace(visit);
+        self.async_for_of_stack.trace(visit);
+        self.destructure_stack.trace(visit);
+        self.destructure_obj_stack.trace(visit);
+        self.destructure_assign_keys.trace(visit);
+        self.yield_star_stack.trace(visit);
+        for (value, _) in &self.completion_stack {
+            value.trace(visit);
+        }
+        for (value, _) in &self.list_stack {
+            value.trace(visit);
+        }
+        self.pending_disposal.trace(visit);
+        if let Some((env, _)) = &self.pending_catch_disposal {
+            env.trace(visit);
+        }
+        self.env_stack.trace(visit);
+    }
 }
 
 /// A per-Vm string builder for a planned `s += e` append loop.
@@ -3651,6 +3742,10 @@ pub struct Vm {
     /// has an `arguments` slot, read by `Step::CreateArguments`. Distinct
     /// from `args` — the in-flight argument-construction stack.
     pub(crate) call_args: Vec<Value>,
+    /// C1c: the per-activation control state a nested compiled run took off
+    /// the live stacks (see [`SavedControl`]); traced so a collection during
+    /// the nested run keeps the caller's `try`/iterator state alive.
+    saved_control: Vec<SavedControl>,
 }
 
 impl Trace for Vm {
@@ -3700,6 +3795,7 @@ impl Trace for Vm {
         self.pending_call.trace(visit);
         self.current_function.trace(visit);
         self.current_new_target.trace(visit);
+        self.saved_control.trace(visit);
     }
 }
 
@@ -3848,6 +3944,7 @@ impl Vm {
             tail_replaced: None,
             current_function: None,
             current_new_target: None,
+            saved_control: Vec::new(),
         }
     }
 
@@ -3858,6 +3955,7 @@ impl Vm {
     /// statement-completion register, and the `switch`/optional-chain control
     /// flags. [`Vm::save_scratch`] saves and resets them; [`Vm::restore_scratch`]
     /// puts the caller's back.
+    #[inline]
     pub(crate) fn save_scratch(&mut self) -> VmScratch {
         let scratch = VmScratch {
             ip: self.ip,
@@ -3874,6 +3972,9 @@ impl Vm {
             array_index_len: self.array_index_stack.len(),
             var_ref_len: self.var_ref_stack.len(),
             class_len: self.class_stack.len(),
+            control_saved: false,
+            env_len: self.env_stack.len(),
+            env_swapped: false,
         };
         self.ip = 0;
         self.acc = Value::Undefined;
@@ -3884,10 +3985,80 @@ impl Vm {
         self.switch_disc = Value::Undefined;
         self.switch_disc_set = false;
         self.chain_short = false;
+        // C1c: only the caller's `env_stack` can be lost — a lane callee is a
+        // compiled body whose list/completion wrappers are no-ops and whose
+        // gate excludes every other control-stack producer (see
+        // `has_control_state`), so a caller deeper than its body env is the
+        // sole case that must be taken off the live stack. The state is stored
+        // on the `Vm` (traced), not in a Rust local, because an env holds live
+        // GC values and a nested run may allocate. The move is outlined into a
+        // cold helper so this hot path stays small enough to inline.
+        let control_saved = self.has_control_state();
+        if control_saved {
+            self.save_control_state();
+        }
+        let mut scratch = scratch;
+        scratch.control_saved = control_saved;
         scratch
     }
 
+    /// Push the caller's per-activation control state onto `saved_control` and
+    /// take it off the live stacks (the cold C1c path; see `has_control_state`).
+    #[cold]
+    #[inline(never)]
+    fn save_control_state(&mut self) {
+        self.saved_control.push(SavedControl {
+            try_stack: std::mem::take(&mut self.try_stack),
+            pending: std::mem::take(&mut self.pending),
+            thrown: self.thrown.take(),
+            resume_abrupt: self.resume_abrupt.take(),
+            for_of_stepping: self.for_of_stepping,
+            async_for_of_stepping: self.async_for_of_stepping,
+            destructure_stepping: self.destructure_stepping,
+            for_in_stack: std::mem::take(&mut self.for_in_stack),
+            for_of_stack: std::mem::take(&mut self.for_of_stack),
+            async_for_of_stack: std::mem::take(&mut self.async_for_of_stack),
+            for_of_boundaries: std::mem::take(&mut self.for_of_boundaries),
+            async_for_of_boundaries: std::mem::take(&mut self.async_for_of_boundaries),
+            destructure_stack: std::mem::take(&mut self.destructure_stack),
+            destructure_done: std::mem::take(&mut self.destructure_done),
+            destructure_obj_stack: std::mem::take(&mut self.destructure_obj_stack),
+            destructure_assign_keys: std::mem::take(&mut self.destructure_assign_keys),
+            destructure_excluded: std::mem::take(&mut self.destructure_excluded),
+            yield_star_stack: std::mem::take(&mut self.yield_star_stack),
+            completion_stack: std::mem::take(&mut self.completion_stack),
+            list_stack: std::mem::take(&mut self.list_stack),
+            pending_disposal: self.pending_disposal.take(),
+            pending_catch_disposal: self.pending_catch_disposal.take(),
+            env_stack: std::mem::replace(
+                &mut self.env_stack,
+                EnvStack::with_base(self.lexical_env),
+            ),
+        });
+        self.for_of_stepping = false;
+        self.async_for_of_stepping = false;
+        self.destructure_stepping = false;
+    }
+
+    /// Whether the caller holds per-activation state the nested compiled lanes
+    /// (C1c) must take off the shared `Vm`. Only `env_stack` can be lost: a lane
+    /// callee is always a compiled body, where the statement-list wrappers
+    /// (`ListBegin`/`ListEnd`) and the completion saves are no-ops, and the lane
+    /// gate (`has_shared_vm_step_hazard`) excludes every producer of the other
+    /// control stacks (`try_stack`, `pending`, the for-in/for-of, destructure
+    /// and yield-star stacks, disposal). The lane's env swap
+    /// (`certified_call_inline`'s `env_stack.reset(environment)`) is the one
+    /// mutation that can drop the caller's block scopes, so a caller deeper than
+    /// its body env (`env_stack.len() > 1`) is the case that must be saved.
+    /// Checked on every nested call: one length read, not a pointer chase over
+    /// twenty stacks.
+    #[inline]
+    fn has_control_state(&self) -> bool {
+        self.env_stack.len() > 1
+    }
+
     /// Restore the scratch registers [`Vm::save_scratch`] saved.
+    #[inline]
     pub(crate) fn restore_scratch(&mut self, scratch: VmScratch) {
         self.ip = scratch.ip;
         self.acc = scratch.acc;
@@ -3907,6 +4078,50 @@ impl Vm {
         self.array_index_stack.truncate(scratch.array_index_len);
         self.var_ref_stack.truncate(scratch.var_ref_len);
         self.class_stack.truncate(scratch.class_len);
+        // C1c: restore the caller's saved `env_stack` wholesale, else reset the
+        // shared one to the caller's base — but only when the nested run can
+        // have moved it (the lane swapped in the callee's environment, or the
+        // depth drifted from a leak on an abrupt exit). A balanced self-call
+        // leaves both untouched and skips the write.
+        if scratch.control_saved {
+            self.restore_control_state();
+        } else if scratch.env_swapped || self.env_stack.len() != scratch.env_len {
+            self.env_stack.reset(self.lexical_env);
+        }
+    }
+
+    /// Pop the caller's saved control state and put it back on the live stacks
+    /// (the cold C1c path; see `save_control_state`).
+    #[cold]
+    #[inline(never)]
+    fn restore_control_state(&mut self) {
+        let control = self
+            .saved_control
+            .pop()
+            .expect("a nested run's saved control state is pushed before it runs");
+        self.try_stack = control.try_stack;
+        self.pending = control.pending;
+        self.thrown = control.thrown;
+        self.resume_abrupt = control.resume_abrupt;
+        self.for_of_stepping = control.for_of_stepping;
+        self.async_for_of_stepping = control.async_for_of_stepping;
+        self.destructure_stepping = control.destructure_stepping;
+        self.for_in_stack = control.for_in_stack;
+        self.for_of_stack = control.for_of_stack;
+        self.async_for_of_stack = control.async_for_of_stack;
+        self.for_of_boundaries = control.for_of_boundaries;
+        self.async_for_of_boundaries = control.async_for_of_boundaries;
+        self.destructure_stack = control.destructure_stack;
+        self.destructure_done = control.destructure_done;
+        self.destructure_obj_stack = control.destructure_obj_stack;
+        self.destructure_assign_keys = control.destructure_assign_keys;
+        self.destructure_excluded = control.destructure_excluded;
+        self.yield_star_stack = control.yield_star_stack;
+        self.completion_stack = control.completion_stack;
+        self.list_stack = control.list_stack;
+        self.pending_disposal = control.pending_disposal;
+        self.pending_catch_disposal = control.pending_catch_disposal;
+        self.env_stack = control.env_stack;
     }
 
     /// Reset a pooled Vm for a new run (the per-call reuse): the Vec
@@ -3969,6 +4184,7 @@ impl Vm {
         self.pending_call = None;
         self.current_function = None;
         self.current_new_target = None;
+        self.saved_control.clear();
     }
 
     /// Re-point a pooled Vm at a new run's env and strictness. The pool hands

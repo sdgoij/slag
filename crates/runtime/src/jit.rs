@@ -2119,15 +2119,6 @@ fn certified_call_inline(
     if !matches!(function.kind, crux::function::FunctionKind::EcmaScript) {
         return None;
     }
-    // The lane shares the caller's `Vm` control stacks (`try_stack`,
-    // `for_of_stack`, the completion/list stacks, `env_stack`), which
-    // `save_scratch` does not isolate, so it may only run while the caller is
-    // at rest — the same precondition the leaf lane's `can_inline_leaf`
-    // enforces. A call inside the caller's `try`/for-of falls back to the
-    // interpreter funnel, which owns its own frame.
-    if !unsafe { &*ctx.vm }.can_inline_leaf() {
-        return None;
-    }
     let agent = unsafe { &mut *ctx.agent };
     if agent.jit_depth >= MAX_JIT_DEPTH || agent.is_terminating() {
         return None;
@@ -2250,7 +2241,8 @@ fn certified_call_inline(
         if base + buf_len > vm.stack_cap {
             return None;
         }
-        let scratch = vm.save_scratch();
+        let mut scratch = vm.save_scratch();
+        scratch.mark_env_swapped();
         let saved = (
             vm.lexical_env,
             vm.body_context,
@@ -2259,6 +2251,7 @@ fn certified_call_inline(
             vm.strict,
         );
         vm.lexical_env = environment;
+        vm.env_stack.reset(environment);
         vm.body_context = Some(environment);
         vm.current_function = Some(callee_value);
         vm.current_new_target = None;

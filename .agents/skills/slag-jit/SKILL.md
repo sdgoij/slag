@@ -985,10 +985,21 @@ produced a wrong answer first:
   callee's function `id` and compare it (free: the lane already resolves it for
   the `ecma_functions` lookup). `Iterator/zipKeyed/basic-longest` is the
   regression net.
-- **The lane must refuse when the caller is not at rest
-  (`Vm::can_inline_leaf`).** It shares the caller's `try_stack`/`for_of_stack`/
-  `env_stack` and the completion/list stacks, which `save_scratch` does NOT
-  isolate, so a call inside the caller's `try` mis-propagates the callee's
-  thrown error into (or past) the caller's handler. The two
-  `installed_jit_*_does_not_drift` tests caught the unguarded path; C1c's
-  per-frame watermarks are what would lift the restriction.
+- **The lane runs inside the caller's `try`/for-of/block (C1c).** C1b guarded
+  it with `Vm::can_inline_leaf`, so a call while any control stack was non-empty
+  fell to the funnel. The isolation C1c actually needs is *only* `env_stack`: a
+  lane callee is always a compiled body, the compiled model runs the
+  statement-list wrappers (`ListBegin`/`ListEnd`) and the completion saves as
+  no-ops, and the gate (`has_shared_vm_step_hazard`) excludes every producer of
+  the other stacks — so a nested run cannot touch the caller's `try_stack`/
+  pending/for-in/for-of/destructure/yield-star state, and its throw reaches the
+  caller's handler through the returned pending error. `has_control_state` is
+  just `env_stack.len() > 1`; the save lives in a cold `Vm::save_control_state`
+  (state on the traced `Vm::saved_control`), and the at-rest path only resets
+  the shared `env_stack`.
+- **Keep `save_scratch`/`restore_scratch` small.** Inlining the `SavedControl`
+  push/restore blocks bloated them past inlining and taxed *every* call even
+  when the branch was not taken (`recursive_fib` 54 → 87 ms, `non-leaf call`
+  5.5 → 6.3 ms); they are outlined into `#[cold] #[inline(never)]` helpers. New
+  caller-control-state shapes are netted by the two `…_does_not_drift` tests plus
+  `installed_jit_certified_callee_inside_caller_control_state_matches_the_interpreter`.

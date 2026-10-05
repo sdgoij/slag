@@ -234,24 +234,44 @@ refusal in particular, or the arguments object is built in the wrong realm.
 (4) `global_value`/`realm_ptr` are raw bits/pointers — do not add a traced
 handle to the record.
 
-**Status (2026-10-05): C1a + C1b landed.** The callee-keyed record now carries
-the `CertifiedInlineInfo` the probe fills, and `emit_call` offers a leaf miss to
-`Helper::CertifiedCall` (a `certified_call_inline` keyed by the record) before
-the interpreter funnel. Measured `non-leaf call` jit 7.41 → ~5.5 ms (~1.35×),
-stable across three runs. Two correctness fixes the gates forced, both in the
-landed change: the lane refuses when the caller is not at rest
-(`Vm::can_inline_leaf`) — it shares the caller's `try_stack`/`for_of_stack`/
-`env_stack`, which `save_scratch` does not isolate, and the previously-unguarded
-`call_slow` path mis-propagated a callee throw into a caller `try` (the two
-`…_does_not_drift` JIT tests) — and the cached verdict verifies the callee's
-function `id`, because the box-address identity is unsound for a POSITIVE cache
-(a swept callee's box can be recycled by another closure, so the address
-matches while the descriptor is another body's; `Iterator/zipKeyed/
-basic-longest` caught it). Gates: normal sweep at baseline (48464 / 0 / 0),
-`--gc-stress` 0 fail / 0 crash, `--gc-verify` at baseline, `cargo test
---workspace` green, clippy `-D warnings`, the CLI `--gc-stress`/`--nursery-stress`
-benches 12/12, wasm 20,662/0 + js-api 1,001/0. **C1c** (the per-frame watermark
-audit that would lift the `can_inline_leaf` restriction) remains.
+**Status (2026-10-05): C1a + C1b + C1c landed.** The callee-keyed record now
+carries the `CertifiedInlineInfo` the probe fills, and `emit_call` offers a leaf
+miss to `Helper::CertifiedCall` (a `certified_call_inline` keyed by the record)
+before the interpreter funnel. Measured `non-leaf call` jit 7.41 → ~5.5 ms
+(~1.35×) and `recursive_fib` unchanged; stable across three runs. Two
+correctness items the gates forced, both in the landed change: the cached verdict
+verifies the callee's function `id`, because the box-address identity is unsound
+for a POSITIVE cache (a swept callee's box can be recycled by another closure, so
+the address matches while the descriptor is another body's;
+`Iterator/zipKeyed/basic-longest` caught it); and **C1c lifts C1b's
+`can_inline_leaf` refusal** so the lane runs inside the caller's `try`/for-of/
+block/destructure instead of falling to the funnel.
+
+The isolation C1c actually needs is narrow. A lane callee is always a compiled
+body, and the compiled model runs the statement-list wrappers
+(`ListBegin`/`ListEnd`) and the completion saves as no-ops, while the lane gate
+(`has_shared_vm_step_hazard`) excludes every producer of the other control
+stacks — so the only shared stack a nested run can grow is `env_stack`. The lane
+thus save/restores `env_stack` and leaves the caller's other stacks in place: the
+callee cannot touch them, and its throw reaches the caller's handler through the
+returned pending error. `has_control_state` is therefore just
+`env_stack.len() > 1` (the save is the cold `save_control_state` path for a
+caller deeper than its body env; the at-rest fast path only resets the shared
+`env_stack`), and the per-activation state lives on the traced `Vm`
+(`Vm::saved_control`) so a collection during the nested run keeps it alive.
+
+**The measured C1c trap was code size, not the fast path.** The `SavedControl`
+push/restore blocks inlined into `save_scratch`/`restore_scratch` made them too
+large to inline, and every call — branch taken or not — paid for it (`non-leaf
+call` 5.5 → 6.3 ms, `recursive_fib` 54 → 87 ms). Outlining both into
+`#[cold] #[inline(never)]` helpers restored the rows (`non-leaf call` ~6.1 ms,
+`recursive_fib` ~56 ms; the residual is the lane's env swap). Verified: normal
+sweep at baseline (48622 / 48464 pass / 0 fail / 158 skip / 0 crash / 0 hang),
+clippy `-D warnings`, `cargo test -p jit --lib` 261 green (the two
+`…_does_not_drift` tests plus a new caller-control-state differential,
+`installed_jit_certified_callee_inside_caller_control_state_matches_the_interpreter`).
+The `--gc-stress`/`--gc-verify`/workspace/wasm re-run for C1c was deferred by the
+operator.
 
 **Stage C0 detail (the substrate).** C0 makes the compiled body's working
 region *be* `vm.stack`, so the frame and the operand stack are one described

@@ -3717,6 +3717,65 @@ run(); run(); run(); run(); run(); run(); run(); run(); run();";
     }
 
     #[test]
+    fn installed_jit_certified_callee_inside_caller_control_state_matches_the_interpreter() {
+        // C1c: the certified-callee lane now runs inside the caller's
+        // `try`/for-of/block instead of refusing the call (C1b's
+        // `can_inline_leaf` gate fell back to the funnel whenever any control
+        // stack was non-empty). The lane runs on the caller's `Vm`, so the
+        // caller's control state must survive the nested run: the callee throws
+        // inside the caller's `try` (the throw must route to the caller's
+        // handler, not be swallowed), the caller's for-of keeps iterating after
+        // the thrown element, a destructuring default calls the lane mid-
+        // destructure, and a block binding read AFTER a nested run must still
+        // see its value. Differential against the interpreter, with the folded
+        // answer asserted so a shared wrong value cannot hide.
+        let source = "function h(x) { return x + 1; }\n\
+                      function g(x) { return h(x) + 1; }\n\
+                      function run() {\n\
+                        var out = 0;\n\
+                        var a = [10, 20];\n\
+                        for (var i = 0; i < 100; i++) {\n\
+                          try {\n\
+                            let k = i & 1;\n\
+                            for (const v of a) {\n\
+                              if (k === 1 && v === 20) { throw v; }\n\
+                              out += g(v);\n\
+                            }\n\
+                          } catch (e) {\n\
+                            out += e;\n\
+                          }\n\
+                        }\n\
+                        var s = 0;\n\
+                        for (var j = 0; j < 50; j++) {\n\
+                          var [p = g(j), q = g(j + 1)] = [];\n\
+                          s += g(p) - g(q);\n\
+                        }\n\
+                        var t = 0;\n\
+                        for (var m = 0; m < 50; m++) {\n\
+                          {\n\
+                            let x = m;\n\
+                            t += g(x);\n\
+                            t += x;\n\
+                          }\n\
+                        }\n\
+                        return (out === 3300 && s === -50 && t === 2550) ? 1 : 0;\n\
+                      }\n\
+                      run();";
+        let interp = {
+            let mut agent = runtime::Agent::new();
+            agent.initialize_host_defined_realm().expect("realm");
+            agent.run_script(source).expect("interp runs")
+        };
+        let (value, compiled) = with_jit_agent(|agent| agent.run_script(source).expect("jit runs"));
+        assert_eq!(
+            value, interp,
+            "the lane inside caller control state must match the interpreter"
+        );
+        assert_eq!(value.as_number(), Some(1.0));
+        assert!(compiled >= 2, "{compiled} bodies (run + g) must compile");
+    }
+
+    #[test]
     fn installed_jit_apply_nullish_arraylike_and_empty_shapes() {
         // M10: the intrinsic fast path's arg-list shapes — a nullish
         // argArray (0 args), an empty dense array (0 args), and an
