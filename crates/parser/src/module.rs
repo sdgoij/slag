@@ -396,7 +396,7 @@ fn parse_export_default(parser: &mut Parser) -> Result<ExportDefault, JsError> {
     // `export default class …`.
     if parser.at_keyword(Keyword::Class)? {
         let class_start = parser.next()?.span.start;
-        let class: Class = crate::class::parse_class(parser, class_start, false)?;
+        let class: Class = crate::class::parse_class(parser, class_start, false, Vec::new())?;
         return Ok(ExportDefault::Class(class));
     }
     // `export default AssignmentExpression ;`.

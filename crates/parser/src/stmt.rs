@@ -80,10 +80,10 @@ fn parse_statement_inner(
                     "Lexical declaration cannot appear in a single-statement context",
                 ));
             }
-            crate::class::parse_decorators(parser)?;
+            let decorators = crate::class::parse_decorators(parser)?;
             parser.expect_keyword(Keyword::Class)?;
             let class_start = parser.prev.as_ref().unwrap().span.start;
-            let class = crate::class::parse_class(parser, class_start, true)?;
+            let class = crate::class::parse_class(parser, class_start, true, decorators)?;
             let end = class.span.end;
             return Ok(Stmt {
                 span: Span::new(start, end),
@@ -135,7 +135,7 @@ fn parse_statement_inner(
                     ));
                 }
                 let start = parser.next()?.span.start;
-                let class = crate::class::parse_class(parser, start, true)?;
+                let class = crate::class::parse_class(parser, start, true, Vec::new())?;
                 let end = class.span.end;
                 return Ok(Stmt {
                     span: Span::new(start, end),

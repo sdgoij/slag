@@ -665,6 +665,9 @@ pub struct Class {
     pub name: Option<AtomId>,
     /// The `extends` heritage, if any.
     pub heritage: Option<Expr>,
+    /// Decorators preceding the class (`@dec class C {}`, decorators proposal),
+    /// evaluated in source order at class-definition time.
+    pub decorators: Vec<Expr>,
     pub elements: Vec<ClassElement>,
 }
 
@@ -680,12 +683,14 @@ pub enum ClassElementName {
 pub enum ClassElement {
     /// A method: plain, `async`, generator, or `async`-generator.
     Method {
+        decorators: Vec<Expr>,
         is_static: bool,
         name: ClassElementName,
         function: Function,
     },
     /// `get name () { body }`.
     Get {
+        decorators: Vec<Expr>,
         is_static: bool,
         name: ClassElementName,
         body: Block,
@@ -696,6 +701,7 @@ pub enum ClassElement {
     /// `set name ( param ) { body }`. The parameter may carry a default
     /// initializer (`set x(v = 1) {}`).
     Set {
+        decorators: Vec<Expr>,
         is_static: bool,
         name: ClassElementName,
         param: BindingPattern,
@@ -707,6 +713,7 @@ pub enum ClassElement {
     },
     /// A class field with an optional initializer.
     Field {
+        decorators: Vec<Expr>,
         is_static: bool,
         name: ClassElementName,
         init: Option<Expr>,

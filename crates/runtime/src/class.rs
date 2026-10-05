@@ -331,6 +331,7 @@ fn build_class(
             is_static: false,
             name,
             function,
+            ..
         } if is_constructor(name, function) => Some(function),
         _ => None,
     });
@@ -438,6 +439,7 @@ fn build_class(
                 is_static: false,
                 name,
                 function,
+                ..
             } if is_constructor(name, function)
         ) {
             continue;
@@ -631,6 +633,22 @@ fn build_class(
     // and private names visible.
     agent.running_context_mut()?.lexical_environment = class_env;
     agent.running_context_mut()?.private_environment = Some(class_private_env);
+
+    // Class decorators are called after every element decorator and applied
+    // before the static fields run (proposal: applying decorators); their
+    // initializers run after the static fields.
+    let (ctor, class_initializers) = if class.decorators.is_empty() {
+        (ctor, Vec::new())
+    } else {
+        crate::decorators::decorate_class(
+            agent,
+            class.name.map(crux::lookup),
+            &class.decorators,
+            ctor,
+            strict,
+        )?
+    };
+
     for element in &static_elements {
         match element {
             StaticElement::Field {
@@ -668,6 +686,10 @@ fn build_class(
             }
         }
     }
+    for initializer in &class_initializers {
+        crate::function::call(agent, initializer, ctor, &[])?;
+    }
+
     agent.running_context_mut()?.lexical_environment = env_record;
     agent.running_context_mut()?.private_environment = outer_private_env;
 

@@ -53,10 +53,10 @@ pub(crate) fn parse_assignment(parser: &mut Parser, allow_in: bool) -> Result<Ex
     // list is a stage-3 proposal; the expressions are validated syntactically
     // and not evaluated.
     if parser.at_punct(TokenKind::At)? {
-        crate::class::parse_decorators(parser)?;
+        let decorators = crate::class::parse_decorators(parser)?;
         parser.expect_keyword(Keyword::Class)?;
         let class_start = parser.prev.as_ref().unwrap().span.start;
-        let class = crate::class::parse_class(parser, class_start, false)?;
+        let class = crate::class::parse_class(parser, class_start, false, decorators)?;
         let span = class.span;
         let expr = Expr {
             span,
@@ -1318,7 +1318,7 @@ fn parse_primary(parser: &mut Parser) -> Result<Expr, JsError> {
             }
             Some(Keyword::Class) => {
                 let start = parser.next()?.span.start;
-                let class = crate::class::parse_class(parser, start, false)?;
+                let class = crate::class::parse_class(parser, start, false, Vec::new())?;
                 Ok(Expr {
                     span: class.span,
                     kind: ExprKind::Class(Box::new(class)),

@@ -19,6 +19,7 @@ pub(crate) fn parse_class(
     parser: &mut Parser,
     start: u32,
     is_declaration: bool,
+    decorators: Vec<Expr>,
 ) -> Result<Class, JsError> {
     // A class definition is always strict mode code (spec 15.7.3), so the
     // name is parsed under the strict reserved-word rules (`class let {}`,
@@ -92,30 +93,31 @@ pub(crate) fn parse_class(
         span: Span::new(start, end),
         name,
         heritage,
+        decorators,
         elements,
     })
 }
 
-/// Consumes a decorator list (`@expr @expr …`) before a class or class
-/// element. The decorator grammar is a stage-3 proposal; each decorator is
-/// validated syntactically and the results are discarded (no evaluation).
-pub(crate) fn parse_decorators(parser: &mut Parser) -> Result<(), JsError> {
+/// Parses a decorator list (`@expr @expr …`) before a class or class element
+/// (the decorators proposal); the expressions are returned in source order for
+/// evaluation at class-definition time.
+pub(crate) fn parse_decorators(parser: &mut Parser) -> Result<Vec<Expr>, JsError> {
+    let mut decorators = Vec::new();
     while parser.eat_punct(TokenKind::At)? {
-        if parser.at_punct(TokenKind::LeftParen)? {
+        let expr = if parser.at_punct(TokenKind::LeftParen)? {
             // `@( Expression )`
             parser.next()?;
-            parse_expression(parser, true)?;
+            let inner = parse_expression(parser, true)?;
             parser.expect_punct(TokenKind::RightParen)?;
+            inner
         } else {
-            // `@ MemberExpression …` with optional `( args )`.
-            let expr = parse_lhs(parser)?;
-            if parser.at_punct(TokenKind::LeftParen)? {
-                crate::expr::parse_arguments(parser)?;
-            }
-            let _ = expr;
-        }
+            // `@ DecoratorMemberExpression` / `@ DecoratorCallExpression`:
+            // `parse_lhs` consumes the whole member/call chain.
+            parse_lhs(parser)?
+        };
+        decorators.push(expr);
     }
-    Ok(())
+    Ok(decorators)
 }
 
 /// Whether a plain method is the constructor: an instance method named
@@ -149,6 +151,7 @@ fn check_class_element(
             is_static: false,
             name,
             function,
+            ..
         } if is_plain_constructor(name, function) => {
             *constructor_count += 1;
             if *constructor_count > 1 {
@@ -308,10 +311,8 @@ fn parse_class_element(parser: &mut Parser) -> Result<Vec<ClassElement>, JsError
         return Ok(Vec::new());
     }
     // Decorators may precede any element (stage-3 proposal); they are
-    // validated syntactically and discarded.
-    if parser.at_punct(TokenKind::At)? {
-        parse_decorators(parser)?;
-    }
+    // captured in source order for evaluation at class-definition time.
+    let decorators = parse_decorators(parser)?;
     let is_static = if parser.at_contextual_unescaped("static")? && static_is_prefix(parser)? {
         parser.next()?;
         true
@@ -343,6 +344,7 @@ fn parse_class_element(parser: &mut Parser) -> Result<Vec<ClassElement>, JsError
             parser.expect_semicolon()?;
             let end = parser.prev.as_ref().unwrap().span.end;
             return Ok(vec![ClassElement::Field {
+                decorators,
                 is_static,
                 name,
                 init,
@@ -368,20 +370,25 @@ fn parse_class_element(parser: &mut Parser) -> Result<Vec<ClassElement>, JsError
         let storage_name = ClassElementName::Private(storage);
         declare_private_name(parser, &storage_name, PrivateNameKind::Other, is_static)?;
         let (get_body, set_param, set_body) = synthesize_auto_accessor_bodies(span, storage);
+        // The auto-accessor's decorators ride on the getter, the first
+        // publicly visible element of the synthesized trio (see S3).
         return Ok(vec![
             ClassElement::Field {
+                decorators: Vec::new(),
                 is_static,
                 name: storage_name,
                 init,
                 span,
             },
             ClassElement::Get {
+                decorators,
                 is_static,
                 name: name.clone(),
                 body: get_body,
                 span,
             },
             ClassElement::Set {
+                decorators: Vec::new(),
                 is_static,
                 name,
                 param: set_param,
@@ -400,6 +407,7 @@ fn parse_class_element(parser: &mut Parser) -> Result<Vec<ClassElement>, JsError
         let function = parse_class_method_tail(parser, method_start, false, true)?;
         declare_private_name(parser, &name, PrivateNameKind::Other, is_static)?;
         return Ok(vec![ClassElement::Method {
+            decorators,
             is_static,
             name,
             function,
@@ -419,6 +427,7 @@ fn parse_class_element(parser: &mut Parser) -> Result<Vec<ClassElement>, JsError
         let function = parse_class_method_tail(parser, method_start, true, is_generator)?;
         declare_private_name(parser, &name, PrivateNameKind::Other, is_static)?;
         return Ok(vec![ClassElement::Method {
+            decorators,
             is_static,
             name,
             function,
@@ -436,6 +445,7 @@ fn parse_class_element(parser: &mut Parser) -> Result<Vec<ClassElement>, JsError
         declare_private_name(parser, &name, PrivateNameKind::Getter(is_static), is_static)?;
         let span = Span::new(accessor_start, body.span.end);
         return Ok(vec![ClassElement::Get {
+            decorators,
             is_static,
             name,
             body,
@@ -458,6 +468,7 @@ fn parse_class_element(parser: &mut Parser) -> Result<Vec<ClassElement>, JsError
         declare_private_name(parser, &name, PrivateNameKind::Setter(is_static), is_static)?;
         let span = Span::new(accessor_start, body.span.end);
         return Ok(vec![ClassElement::Set {
+            decorators,
             is_static,
             name,
             param,
@@ -476,6 +487,7 @@ fn parse_class_element(parser: &mut Parser) -> Result<Vec<ClassElement>, JsError
             parse_class_method_tail_with(parser, name_start, false, false, in_constructor)?;
         declare_private_name(parser, &name, PrivateNameKind::Other, is_static)?;
         return Ok(vec![ClassElement::Method {
+            decorators,
             is_static,
             name,
             function,
@@ -488,6 +500,7 @@ fn parse_class_element(parser: &mut Parser) -> Result<Vec<ClassElement>, JsError
     parser.expect_semicolon()?;
     let end = parser.prev.as_ref().unwrap().span.end;
     Ok(vec![ClassElement::Field {
+        decorators,
         is_static,
         name,
         init,
