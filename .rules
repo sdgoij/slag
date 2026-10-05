@@ -56,14 +56,6 @@ started first.
 - If a boot config file (`data/boot.cfg` or similar) specifies process
   order, VM must precede all processes that allocate heap.
 
-## Git — DO NOT TOUCH STAGED FILES
-The operator controls all staging and commit decisions. **Agents must never stage or unstage anything.**
-- **NEVER** run `git add` — the operator decides what gets staged.
-- **NEVER** run `git commit` — the operator decides what gets committed and with what message.
-- The operator reviews **everything** before it enters the repo history.
-
----
-
 # Rules Hygiene
 
 These `.rules` files are read by every agent session. Keep them high-signal.
