@@ -13,7 +13,7 @@ use crux::heap::{GcAny, Trace};
 use crux::object::JsObject;
 use crux::ops::same_value;
 use crux::property::{PropertyDescriptor, PropertyKey};
-use crux::string::JsString;
+use crux::string::{JsString, append_units};
 use crux::value::{Value, ValueKind, is_callable, is_constructor};
 
 use crate::agent::Agent;
@@ -1241,15 +1241,15 @@ fn symbol_replace(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Val
             )?
         };
         if position >= next_source_position {
-            accumulated
-                .extend_from_slice(substring(&string, next_source_position, position).as_slice());
-            accumulated.extend_from_slice(replacement_string.as_slice());
+            let gap = substring(&string, next_source_position, position);
+            append_units(&mut accumulated, gap.as_slice())?;
+            append_units(&mut accumulated, replacement_string.as_slice())?;
             next_source_position = position + match_length;
         }
     }
     if next_source_position < string_length {
-        accumulated
-            .extend_from_slice(substring(&string, next_source_position, string_length).as_slice());
+        let tail = substring(&string, next_source_position, string_length);
+        append_units(&mut accumulated, tail.as_slice())?;
     }
     Ok(Value::String(Handle::new(JsString::from_utf16(
         &accumulated,

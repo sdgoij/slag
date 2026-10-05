@@ -12,7 +12,7 @@ use crux::function::{Function, NativeFn};
 use crux::handle::Handle;
 use crux::object::JsObject;
 use crux::property::{PropertyDescriptor, PropertyKey};
-use crux::string::JsString;
+use crux::string::{JsString, MAX_STRING_LENGTH, append_units, invalid_string_length};
 use crux::value::{Value, ValueKind, is_callable};
 
 use crate::agent::Agent;
@@ -266,7 +266,7 @@ fn from_code_point(_this: &Value, args: &[Value]) -> Result<Value, JsError> {
 fn raw(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsError> {
     let _ = this;
     let template = args.first().cloned().unwrap_or(Value::Undefined);
-    let substitutions = &args[1..];
+    let substitutions = args.get(1..).unwrap_or_default();
     let cooked = to_object(agent, &template)?;
     let raw_value = get_property(agent, &cooked, &JsString::from_utf8("raw"), cooked)?;
     let literals = to_object(agent, &raw_value)?;
@@ -371,9 +371,16 @@ fn code_point_at(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Valu
 /// spec 22.1.3.6 String.prototype.concat.
 fn concat(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsError> {
     require_object_coercible(this)?;
-    let mut units: Vec<u16> = crate::context::to_string(agent, this)?.as_slice().to_vec();
+    let mut units: Vec<u16> = Vec::new();
+    append_units(
+        &mut units,
+        crate::context::to_string(agent, this)?.as_slice(),
+    )?;
     for arg in args {
-        units.extend_from_slice(crate::context::to_string(agent, arg)?.as_slice());
+        append_units(
+            &mut units,
+            crate::context::to_string(agent, arg)?.as_slice(),
+        )?;
     }
     Ok(Value::String(Handle::new(JsString::from_utf16(&units))))
 }
@@ -631,6 +638,9 @@ fn string_padding_impl(
     if int_max <= s.len() as u64 {
         return Ok((int_max, JsString::from_utf8("")));
     }
+    if int_max > MAX_STRING_LENGTH as u64 {
+        return Err(invalid_string_length());
+    }
     let fill_string = if matches!(fill.kind(), ValueKind::Undefined) {
         JsString::from_utf8(" ")
     } else {
@@ -681,14 +691,14 @@ fn repeat(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsEr
     }
     let count = n as usize;
     let Some(total) = s.len().checked_mul(count) else {
-        return Err(JsError::new(
-            ErrorKind::RangeError,
-            "String too long".into(),
-        ));
+        return Err(invalid_string_length());
     };
-    let mut units = Vec::with_capacity(total);
+    if total > MAX_STRING_LENGTH {
+        return Err(invalid_string_length());
+    }
+    let mut units = Vec::new();
     for _ in 0..count {
-        units.extend_from_slice(s.as_slice());
+        append_units(&mut units, s.as_slice())?;
     }
     Ok(Value::String(Handle::new(JsString::from_utf16(&units))))
 }
@@ -1516,16 +1526,19 @@ fn get_substitution(
                 q += 2;
             }
             Some(u) if u == b'&' as u16 => {
-                result.extend_from_slice(matched.as_slice());
+                append_units(&mut result, matched.as_slice())?;
                 q += 2;
             }
             Some(u) if u == b'`' as u16 => {
-                result.extend_from_slice(&string.as_slice()[..position.min(string.len())]);
+                append_units(
+                    &mut result,
+                    &string.as_slice()[..position.min(string.len())],
+                )?;
                 q += 2;
             }
             Some(u) if u == b'\'' as u16 => {
                 let tail = (position + matched.len()).min(string.len());
-                result.extend_from_slice(&string.as_slice()[tail..]);
+                append_units(&mut result, &string.as_slice()[tail..])?;
                 q += 2;
             }
             Some(u) if (0x30..=0x39).contains(&u) => {
@@ -1546,7 +1559,7 @@ fn get_substitution(
                 }
                 if (1..=capture_length).contains(&index) {
                     if let Some(capture) = &captures[index - 1] {
-                        result.extend_from_slice(capture.as_slice());
+                        append_units(&mut result, capture.as_slice())?;
                     }
                     q += 1 + digit_count;
                 } else {
@@ -1579,7 +1592,8 @@ fn get_substitution(
                             Value::Object(*named),
                         )?;
                         if !matches!(capture.kind(), ValueKind::Undefined) {
-                            result.extend_from_slice(to_string(&capture)?.as_slice());
+                            let captured = to_string(&capture)?;
+                            append_units(&mut result, captured.as_slice())?;
                         }
                         q = gt_position + 1;
                     }

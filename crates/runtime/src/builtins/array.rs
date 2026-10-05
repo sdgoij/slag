@@ -16,7 +16,7 @@ use crux::heap::{GcAny, Trace};
 use crux::object::{JsObject, ObjectKind};
 use crux::ops::{is_strictly_equal, same_value_zero};
 use crux::property::{PropertyDescriptor, PropertyKey};
-use crux::string::JsString;
+use crux::string::{JsString, append_units};
 use crux::value::{Value, ValueKind, is_callable, is_constructor};
 
 use crate::agent::Agent;
@@ -1540,7 +1540,7 @@ fn join(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsErro
     let mut result: Vec<u16> = Vec::new();
     for k in 0..length {
         if k > 0 {
-            result.extend_from_slice(&separator);
+            append_units(&mut result, &separator)?;
         }
         let element = match dense_own_element(&object, k) {
             Some(value) => value,
@@ -1550,7 +1550,7 @@ fn join(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsErro
             continue;
         }
         let text = crate::context::to_string(agent, &element)?;
-        result.extend_from_slice(text.as_slice());
+        append_units(&mut result, text.as_slice())?;
     }
     Ok(Value::String(Handle::new(JsString::from_utf16(&result))))
 }
@@ -2315,10 +2315,10 @@ fn to_locale_string(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<V
     let length = length_of_array_like(agent, &object)?;
     let locales = args.first().cloned().unwrap_or(Value::Undefined);
     let options = args.get(1).cloned().unwrap_or(Value::Undefined);
-    let mut result = String::new();
+    let mut result: Vec<u16> = Vec::new();
     for k in 0..length {
         if k > 0 {
-            result.push(',');
+            append_units(&mut result, &[b',' as u16])?;
         }
         let element = match dense_own_element(&object, k) {
             Some(value) => value,
@@ -2334,9 +2334,10 @@ fn to_locale_string(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<V
         // the primitive (primitive_this_value.js); the locales and options
         // arguments pass through.
         let text = crate::function::call_callback(agent, &method, element, &[locales, options])?;
-        result.push_str(&crate::context::to_string(agent, &text)?.to_string_lossy());
+        let text = crate::context::to_string(agent, &text)?;
+        append_units(&mut result, text.as_slice())?;
     }
-    Ok(Value::String(Handle::new(JsString::from_utf8(&result))))
+    Ok(Value::String(Handle::new(JsString::from_utf16(&result))))
 }
 
 /// spec 23.1.3.32 Array.prototype.toReversed.

@@ -321,6 +321,9 @@ var $DONE = function (error) {
         /// three-area baseline (language/built-ins/annexB) stays stable
         /// while the Intl work is in flight.
         Intl402,
+        /// The not-yet-merged proposal tree (`test/staging`): test262 runs it
+        /// in its own tier, so it is opt-in here and never part of `all`.
+        Staging,
     }
 
     impl Area {
@@ -330,6 +333,7 @@ var $DONE = function (error) {
                 Area::Builtins => "../../test262/test/built-ins",
                 Area::AnnexB => "../../test262/test/annexB",
                 Area::Intl402 => "../../test262/test/intl402",
+                Area::Staging => "../../test262/test/staging",
             })
         }
     }
@@ -12867,6 +12871,7 @@ var $DONE = function (error) {
             "language" => vec![("language", Area::Language)],
             "built-ins" => vec![("built-ins", Area::Builtins)],
             "annexB" => vec![("annexB", Area::AnnexB)],
+            "staging" => vec![("staging", Area::Staging)],
             _ => vec![
                 ("language", Area::Language),
                 ("built-ins", Area::Builtins),

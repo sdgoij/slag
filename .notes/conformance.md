@@ -27,8 +27,9 @@ Two harnesses live in `crates/test262`:
    cargo run -p test262 --bin sweep -- [area] [options]
    ```
 
-   - `area`: `language` | `built-ins` | `annexB` | `intl402` | `all`
-     (default `all`)
+   - `area`: `language` | `built-ins` | `annexB` | `intl402` | `staging` | `all`
+     (default `all`; `all` is the three-area baseline and excludes `intl402`
+     and `staging`)
    - `--jobs N` concurrent batches, `--batch N` fixtures per batch
      (default 32), `--timeout SECS` batch deadline (default 30),
      `--recheck-timeout SECS` per-fixture hang recheck (default 5)
@@ -2034,6 +2035,53 @@ construction (see `crates/runtime/src/builtins/error.rs`). `message` text is
 engine-defined; the goal is V8-compatible phrasing for the common built-in
 errors, with exact wording verified fixture-by-fixture. `stack` follows the
 V8 shape (`ErrorType: message\n    at …`) with source spans from the parser.
+
+## staging tier (not part of `all`)
+
+`test/test262/test/staging` is test262's tier for not-yet-merged proposals and
+engine-specific tests (SpiderMonkey's own shell suite lives under
+`staging/sm`). It is wired as its own sweep area (`sweep.exe staging`) and
+deliberately kept out of `all`, so the documented three-area baseline is
+unaffected.
+
+Measured on the pinned submodule (`--jobs 8 --batch 32 --timeout 15
+--recheck-timeout 15`, release build): **1,059 pass, 257 fail, 165 skip, 0
+crash, 2 hang of 1,483 fixtures**. Almost all of the failure signal is
+`staging/sm` (249 fail): that is SpiderMonkey's own shell suite, whose helpers
+(`sm/non262-*-shell.js`, `sm/assertThrowsValue.js`) are not shipped, so those
+fixtures skip on "unsupported includes" and many of the rest assert
+SM-shell-specific behavior (stale expectations, shell globals). The non-`sm`
+failures are the genuine engine gaps:
+
+- `built-ins/Object/{preventExtensions,seal}` and
+  `built-ins/Reflect/preventExtensions` over the *variable-length* typed
+  arrays — a fixed-length view over a resizable buffer makes the buffer
+  non-extensible (TypeError from `preventExtensions`/`seal`, `false` from
+  `Reflect.preventExtensions`).
+- `explicit-resource-management/exception-handling.js` — `SuppressedError` is
+  not produced when a `using` disposal throws over a body throw.
+- `explicit-resource-management/async-disposal-from-sync-method-returning-a-promise.js`
+  — the async-disposal await path.
+- `decorators/public-auto-accessor.js` — the decorators proposal.
+- `source-phase-imports/{import-source-source-text-module,module-source-prototype-chain}.js`
+  — `import.source()` (stage-3).
+
+The 2 hangs are `sm/regress/regress-610026.js` (evals a script of 2^21 doubled
+empty blocks — a parser-throughput stress) and
+`sm/regress/regress-1507322-deep-weakmap.js` (a 100k-entry `WeakMap` chain +
+`$262.gc()`); both are SM performance regress tests, not correctness bugs.
+
+A crash in this tier was a real defect and is fixed: `String.prototype.replace`
+(via `GetSubstitution` and the `@@replace` accumulator) and the sibling string
+builders (`String.prototype.concat`/`repeat`/`padStart`/`padEnd`,
+`Array.prototype.join`/`toLocaleString`) grew a `Vec<u16>` without a length
+cap, so a result past available memory hit Rust's allocator failure handler and
+aborted the **process** (unrecoverable, taking its sweep batch with it) instead
+of throwing. The builders now go through `crux::string::append_units`, which
+caps at `MAX_STRING_LENGTH` (1 GiB-1 code units, matching SpiderMonkey) and
+throws `RangeError: Invalid string length`; `sm/String/replace-math.js` (and
+the four batch-collateral `sm/String/replace*.js` fixtures it had killed) now
+pass, and the three-area baseline is unchanged.
 
 ## Open items
 

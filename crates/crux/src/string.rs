@@ -103,6 +103,39 @@ const CONCAT_FLAT_THRESHOLD: usize = 16;
 /// small literal fits the single-allocation form.
 pub const SMALL_STRING_CAP: usize = 16;
 
+/// The maximum length, in UTF-16 code units, of a string the builders will
+/// produce. The spec permits up to 2^53-1 code units (6.1.4), but no
+/// implementation allocates that; a result past this throws `RangeError` (as
+/// V8 and SpiderMonkey do) instead of letting a `Vec` grow until the
+/// allocation fails — an allocation failure aborts the process and cannot be
+/// caught by script. 1 GiB-1 is SpiderMonkey's `JSString::MAX_LENGTH`.
+pub const MAX_STRING_LENGTH: usize = (1 << 30) - 1;
+
+/// The `RangeError` for a string result past [`MAX_STRING_LENGTH`] (V8's
+/// message).
+pub fn invalid_string_length() -> crate::JsError {
+    crate::JsError::new(crate::ErrorKind::RangeError, "Invalid string length".into())
+}
+
+/// Append `addition` to a code-unit builder, failing with
+/// [`invalid_string_length`] if the result would exceed
+/// [`MAX_STRING_LENGTH`]. Every builder that assembles a string from a
+/// caller-unbounded number of pieces (replace/join/repeat/pad) must use this:
+/// a `Vec<u16>` grown past available memory aborts the process rather than
+/// raising a catchable error. `try_reserve` maps an allocator refusal below
+/// the cap into the same `RangeError`.
+pub fn append_units(buffer: &mut Vec<u16>, addition: &[u16]) -> Result<(), crate::JsError> {
+    match buffer.len().checked_add(addition.len()) {
+        Some(total) if total <= MAX_STRING_LENGTH => {}
+        _ => return Err(invalid_string_length()),
+    }
+    buffer
+        .try_reserve(addition.len())
+        .map_err(|_| invalid_string_length())?;
+    buffer.extend_from_slice(addition);
+    Ok(())
+}
+
 impl Trace for JsString {
     fn trace(&self, visit: &mut dyn FnMut(GcAny)) {
         match self {
