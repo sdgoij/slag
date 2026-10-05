@@ -11439,7 +11439,11 @@ var $DONE = function (error) {
         fixture_dir: &Path,
         fixture_source: &str,
     ) -> Result<(), String> {
-        let mut specifiers: Vec<String> = Vec::new();
+        // The test262 `<module source>` host artifact is resolvable from any
+        // module fixture: it is referenced dynamically
+        // (`import.source('<module source>')`), which is not a walkable static
+        // request, so register it up front.
+        let mut specifiers: Vec<String> = vec!["<module source>".to_string()];
         scan_literal_imports(fixture_source, &mut specifiers);
         scan_fixture_siblings(fixture_dir, &mut specifiers);
         for specifier in specifiers {

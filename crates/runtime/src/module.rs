@@ -662,11 +662,6 @@ pub(crate) fn key_string(key: &AttributeKey) -> String {
     }
 }
 
-/// The kind of an already-resolved module record.
-pub(crate) fn module_kind_of(module: &Handle<SourceTextModule>) -> ModuleKind {
-    module.kind
-}
-
 /// CreateModuleSourceObject (source-phase-imports): an `%AbstractModuleSource%`
 /// instance wrapping the module. Cached on the module record; the source text
 /// comes from the host module bytes at `toString` time.
@@ -674,42 +669,39 @@ pub(crate) fn module_source_object(
     agent: &mut Agent,
     module: &Handle<SourceTextModule>,
 ) -> Result<Value, JsError> {
+    // GetModuleSource: a Module Record with no source representation (every
+    // ECMA-262 Module Record, i.e. a Source Text Module) has an *empty*
+    // [[ModuleSource]], so a source-phase import of it throws a SyntaxError
+    // (proposal InitializeEnvironment and ContinueDynamicImport).
+    if module.kind == ModuleKind::Js {
+        return Err(JsError::new(
+            ErrorKind::SyntaxError,
+            "source phase import is not available for this module".into(),
+        ));
+    }
     if let Some(source) = *module.module_source.borrow() {
         return Ok(source);
     }
     let realm = agent.current_realm()?;
+    // A Module Source Object's [[Prototype]] is an object whose own
+    // [[Prototype]] is %AbstractModuleSource%.prototype (proposal "Module
+    // Source Objects"); `%ModuleSource.prototype%` is this host's subclass.
     let prototype = realm
         .intrinsics
-        .get("%AbstractModuleSource.prototype%")
-        .and_then(|value| value.as_object());
+        .get("%ModuleSource.prototype%")
+        .and_then(|value| value.as_object())
+        .or_else(|| {
+            realm
+                .intrinsics
+                .get("%AbstractModuleSource.prototype%")
+                .and_then(|value| value.as_object())
+        });
     let object = JsObject::ordinary_object_create(prototype);
     let value = Value::Object(object);
     agent.module_sources.insert(object.id(), *module);
     crux::heap::write_barrier(&**module, value);
     module.module_source.replace(Some(value));
     Ok(value)
-}
-
-/// The raw source text of a module, for the source-phase import of a
-/// synthetic (JSON/text/bytes) module.
-pub(crate) fn module_source_text(
-    agent: &Agent,
-    module: &Handle<SourceTextModule>,
-) -> Result<Value, JsError> {
-    let realm = agent.current_realm()?;
-    let specifier = realm
-        .loaded_modules
-        .borrow()
-        .iter()
-        .find(|(_, m)| Handle::ptr_eq(**m, *module))
-        .map(|(specifier, _)| specifier.clone());
-    let bytes = specifier
-        .and_then(|specifier| agent.host_modules.borrow().get(&specifier).cloned())
-        .map(|entry| entry.bytes)
-        .unwrap_or_default();
-    Ok(Value::String(Handle::new(JsString::from_utf8(
-        &String::from_utf8_lossy(&bytes),
-    ))))
 }
 
 /// HostResolveImportedModule (spec 16.6.1.1.2): the agent's registered module
@@ -3455,21 +3447,12 @@ pub fn dynamic_import(
             let module = host_resolve_imported_module(agent, &specifier_text, &parsed_attributes)?;
             match phase {
                 ImportPhase::Source => {
-                    // GetModuleSource of a Source Text Module Record always
-                    // throws a SyntaxError (spec 16.2.1.7.2): a source-phase
-                    // import of a JavaScript module is unavailable. Synthetic
-                    // modules (JSON/text/bytes) expose their source text.
-                    if module_kind_of(&module) == ModuleKind::Js {
-                        let error = JsError::new(
-                            ErrorKind::SyntaxError,
-                            "source phase import is not available for this module".into(),
-                        );
-                        let rejection = crate::promise::error_value(agent, &error);
-                        crate::function::call(agent, &reject, Value::Undefined, &[rejection])?;
-                    } else {
-                        let source = module_source_text(agent, &module)?;
-                        crate::function::call(agent, &resolve, Value::Undefined, &[source])?;
-                    }
+                    // GetModuleSource (proposal ContinueDynamicImport): a module
+                    // with an empty [[ModuleSource]] (a Source Text Module)
+                    // rejects with a SyntaxError; otherwise the promise resolves
+                    // with the Module Source Object.
+                    let source = module_source_object(agent, &module)?;
+                    crate::function::call(agent, &resolve, Value::Undefined, &[source])?;
                     return Ok(());
                 }
                 ImportPhase::Defer => {

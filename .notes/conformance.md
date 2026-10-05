@@ -1639,8 +1639,6 @@ The harness's skip taxonomy (also used by the sweep):
 | Skip category | Reason |
 |---|---|
 | `features: [Temporal]` (unimplemented clusters) | Temporal is a stage-4 proposal; the whole `Temporal/*` tree now runs (4,602 of 4,603 fixtures), including the `Intl.Era-monthcode`-gated era/eraYear getters, the solar calendars, and the Intl `toLocaleString` integration. |
-| `features: [source-phase-imports]` | `import.source()` is a stage-3 proposal, not part of ECMA-262 ES2026. |
-| `features: [import-defer]` / `[import-bytes]` / `[import-text]` | `import.defer(...)` / `import(..., { with: { type: "bytes" } })` / `import(..., { with: { type: "text" } })` are stage-3 proposals, not part of ECMA-262 ES2026. |
 | `includes: [tcoHelper]` | (closed: proper tail calls now pass all 34 `tco-*` fixtures — see the Full-suite sweep section.) |
 | Unsupported `includes:` | Fixtures needing harness helpers beyond `assert.js`, `compareArray.js`, `detachArrayBuffer.js`, `isConstructor.js`, `propertyHelper.js`, `testAtomics.js`, `testTypedArray.js` are not run. |
 | Stale fixture | `Temporal/Duration/prototype/total/relativeto-date-limits.js` asserts a +1s boundary that is in range per the current spec (matching node v24), so it is skipped in `run_fixture`. |
@@ -2052,15 +2050,13 @@ SM-shell-specific semantics, so `run_fixture` skips it whole (mirrored in
 contributed 249 failures, 165 include-skips and both `hang`s, none of them
 signal.
 
-With `sm/` skipped, the tier measures **73 pass, 3 fail, 1,407 skip, 0 crash, 0
+With `sm/` skipped, the tier measures **75 pass, 1 fail, 1,407 skip, 0 crash, 0
 hang of 1,483 fixtures** (`--jobs 8 --batch 32 --timeout 15 --recheck-timeout
-15`, release). The 3 failures are the remaining genuine gaps:
+15`, release). The single failure is the remaining genuine gap:
 
 - `decorators/public-auto-accessor.js` — the decorators proposal.
-- `source-phase-imports/{import-source-source-text-module,module-source-prototype-chain}.js`
-  — `import.source()` (stage-3).
 
-Three fixes came out of this tier:
+Four fixes came out of this tier:
 
 - **The variable-length-typed-array `preventExtensions`/`seal` trio now
   passes.** `typed_array_buffer_path` derived a view's auto-length from the
@@ -2092,6 +2088,17 @@ Three fixes came out of this tier:
   `@@asyncDispose`, so the fallback is now sync-hint and its result is not
   awaited (both `eval.rs::create_disposable_resource` for `await using` and
   `get_dispose_method`/`drive_async_disposal` for `AsyncDisposableStack`).
+- **The two source-phase-import failures now pass.** A static `import source x
+  from './mod.js'` of a module with no source representation (a Source Text
+  Module) must throw a SyntaxError — its `[[ModuleSource]]` is *empty*;
+  `module_source_object` now rejects a `ModuleKind::Js` module, so the static
+  and dynamic paths both reject. The dynamic `import.source(…)` also resolved
+  the raw source *text*; it now resolves the Module Source *object* (proposal
+  ContinueDynamicImport), whose `[[Prototype]]` is a host subclass prototype
+  (`%ModuleSource.prototype%`) whose own prototype is
+  `%AbstractModuleSource%.prototype`. The harness registers the test262
+  `<module source>` host artifact for every module fixture — it is referenced
+  only dynamically, so the static-request walk never saw it.
 
 ## Open items
 

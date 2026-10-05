@@ -18,6 +18,7 @@ use crate::realm::Realm;
 
 const ABSTRACT_MODULE_SOURCE: &str = "%AbstractModuleSource%";
 const ABSTRACT_MODULE_SOURCE_PROTO: &str = "%AbstractModuleSource.prototype%";
+const MODULE_SOURCE_PROTO: &str = "%ModuleSource.prototype%";
 const PROTO_TO_STRING: &str = "%AbstractModuleSource.prototype.toString%";
 const PROTO_TO_STRING_TAG: &str = "%AbstractModuleSource.prototype[@@toStringTag]%";
 
@@ -52,6 +53,14 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
     realm
         .intrinsics
         .define(ABSTRACT_MODULE_SOURCE_PROTO, proto_value);
+
+    // A host Module Source subclass prototype: a Module Source Object's
+    // [[Prototype]] is an object whose own [[Prototype]] is
+    // %AbstractModuleSource%.prototype (proposal "Module Source Objects").
+    let module_source_proto = JsObject::ordinary_object_create(Some(proto));
+    realm
+        .intrinsics
+        .define(MODULE_SOURCE_PROTO, Value::Object(module_source_proto));
 
     ctor.define_property(
         &JsString::from_utf8("prototype"),
