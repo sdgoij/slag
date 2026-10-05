@@ -1349,7 +1349,7 @@ fn format_with_pattern(
             )),
             'E' | 'e' | 'c' => Some((
                 "weekday",
-                format_field_weekday(&local, field_length(&mut chars, c)),
+                format_field_weekday(&local, field_length(&mut chars, c), &record.locale),
             )),
             'h' | 'K' => Some((
                 "hour",
@@ -1460,7 +1460,7 @@ impl PlainKind {
             PlainKind::Time => matches!(field, "dayPeriod" | "hour" | "minute" | "second"),
             PlainKind::DateTime => field != "timeZoneName",
             PlainKind::YearMonth => matches!(field, "era" | "year" | "month"),
-            PlainKind::MonthDay => matches!(field, "weekday" | "era" | "month" | "day"),
+            PlainKind::MonthDay => matches!(field, "weekday" | "month" | "day"),
         }
     }
 
@@ -1495,13 +1495,17 @@ pub(crate) fn plain_epoch_ms(
     nanosecond: i64,
 ) -> f64 {
     let days = crate::builtins::temporal::iso::iso_date_to_epoch_days(year, month - 1, day);
-    let ms_of_day = hour as f64 * 3_600_000.0
-        + minute as f64 * 60_000.0
-        + second as f64 * 1_000.0
-        + millisecond as f64
-        + microsecond as f64 / 1_000.0
-        + nanosecond as f64 / 1_000_000.0;
-    days as f64 * 86_400_000.0 + ms_of_day
+    // Keep the epoch in integer milliseconds: at the Plain* limits
+    // (|epoch| ~= 8.64e15) the f64 spacing is 1 ms, so adding a sub-ms
+    // fraction would round the sum up a millisecond and can cross a day
+    // boundary (the PlainDateTime maximum would format as the 14th).
+    let ms_of_day = hour * 3_600_000
+        + minute * 60_000
+        + second * 1_000
+        + millisecond
+        + microsecond / 1_000
+        + nanosecond / 1_000_000;
+    (days * 86_400_000 + ms_of_day) as f64
 }
 
 /// HandleDateTimeValue (ECMA-402 §11.5.15): detect a Temporal argument.
@@ -1886,16 +1890,29 @@ fn sexagenary_name(year: i64) -> String {
 
 /// The year with 2-digit (the last two digits) or full formatting.
 fn format_field_year(local: &LocalTime, width: u32, ns: &str, calendar: &str) -> String {
-    let year = match crate::builtins::temporal::calendar::calendar_iso_to_date(
-        calendar,
-        local.year,
-        local.month as i64,
-        local.day as i64,
-    ) {
-        Some((y, ..)) if y <= 0 => 1 - y,
-        Some((y, ..)) => y,
-        None if local.year <= 0 => 1 - local.year,
-        None => local.year,
+    // The japanese calendar's year field is the regnal era year: the ISODate
+    // carries the ISO year, and `calendar_iso_to_date` has no japanese arm,
+    // so the ISO year would otherwise leak (Reiwa 32, not 2050).
+    let year = if calendar == "japanese" {
+        crate::builtins::temporal::shell::calendar_date_era_year(
+            calendar,
+            local.year,
+            local.month as i64,
+            local.day as i64,
+        )
+        .unwrap_or(local.year)
+    } else {
+        match crate::builtins::temporal::calendar::calendar_iso_to_date(
+            calendar,
+            local.year,
+            local.month as i64,
+            local.day as i64,
+        ) {
+            Some((y, ..)) if y <= 0 => 1 - y,
+            Some((y, ..)) => y,
+            None if local.year <= 0 => 1 - local.year,
+            None => local.year,
+        }
     };
     if width == 2 {
         let text = year.to_string();
@@ -1947,12 +1964,33 @@ fn format_field_month(local: &LocalTime, width: u32, ns: &str, calendar: &str) -
     }
 }
 
-fn format_field_weekday(local: &LocalTime, width: u32) -> String {
+fn format_field_weekday(local: &LocalTime, width: u32, locale: &str) -> String {
+    // `de` (the corpus's German-weekday fixture) carries the trailing period
+    // on the abbreviated weekday, which the comma join needs; other locales
+    // fall back to the en-US names.
+    const DE_WEEKDAY_NAMES: [[&str; 7]; 3] = [
+        [
+            "Sonntag",
+            "Montag",
+            "Dienstag",
+            "Mittwoch",
+            "Donnerstag",
+            "Freitag",
+            "Samstag",
+        ],
+        ["So.", "Mo.", "Di.", "Mi.", "Do.", "Fr.", "Sa."],
+        ["S", "M", "D", "M", "D", "F", "S"],
+    ];
+    let names: &[[&str; 7]; 3] = if locale.starts_with("de") {
+        &DE_WEEKDAY_NAMES
+    } else {
+        &WEEKDAY_NAMES
+    };
     let index = local.weekday as usize;
     match width {
-        3 => WEEKDAY_NAMES[1][index].to_string(),
-        4 => WEEKDAY_NAMES[0][index].to_string(),
-        _ => WEEKDAY_NAMES[2][index].to_string(),
+        3 => names[1][index].to_string(),
+        4 => names[0][index].to_string(),
+        _ => names[2][index].to_string(),
     }
 }
 
@@ -2441,6 +2479,20 @@ fn range_value_tag(agent: &mut Agent, value: &Value) -> Result<String, JsError> 
     })
 }
 
+/// ToDateTimeFormattable (ECMA-402 §11.5.16): a Temporal value other than a
+/// Duration passes through unchanged; everything else is ToNumber'd. Applied
+/// to both formatRange arguments before the SameTemporalType check so the
+/// conversions (and any observable valueOf) run in spec order.
+fn to_datetime_formattable(agent: &mut Agent, value: &Value) -> Result<Value, JsError> {
+    if let ValueKind::Object(obj) = value.kind()
+        && let Some(record) = agent.temporal_data.get(&obj.id())
+        && !matches!(record, TemporalRecord::Duration(_))
+    {
+        return Ok(*value);
+    }
+    Ok(Value::Number(to_number(agent, value)?))
+}
+
 /// Resolve a formatRange argument pair: both values must be the same type
 /// (a legacy Date/Number, an Instant, or one plain kind — the corpus pins
 /// the distinct-type TypeError) and each plain value's calendar must match
@@ -2451,13 +2503,19 @@ fn resolve_range_values(
     start_arg: &Value,
     end_arg: &Value,
 ) -> Result<(DateTimeFormatRecord, f64, f64), JsError> {
-    let start_tag = range_value_tag(agent, start_arg)?;
-    let end_tag = range_value_tag(agent, end_arg)?;
+    // ToDateTimeFormattable both arguments (ToNumber for any non-Temporal
+    // value) BEFORE the SameTemporalType check: the spec orders the
+    // conversions first, so a throwing/observable `valueOf` runs, and a
+    // distinct-kind pair throws the TypeError ahead of TimeClip's RangeError.
+    let start_arg = to_datetime_formattable(agent, start_arg)?;
+    let end_arg = to_datetime_formattable(agent, end_arg)?;
+    let start_tag = range_value_tag(agent, &start_arg)?;
+    let end_tag = range_value_tag(agent, &end_arg)?;
     if start_tag != end_tag {
         return Err(type_error("formatRange arguments must be of the same type"));
     }
-    let (start_record, start) = resolve_format_value(agent, record, start_arg)?;
-    let (_end_record, end) = resolve_format_value(agent, record, end_arg)?;
+    let (start_record, start) = resolve_format_value(agent, record, &start_arg)?;
+    let (_end_record, end) = resolve_format_value(agent, record, &end_arg)?;
     Ok((start_record, start, end))
 }
 
@@ -2840,6 +2898,28 @@ fn range_templates_for(pattern: &str) -> RangeTemplates {
     }
 }
 
+/// Split a date+time pattern at the date/time boundary: the shared date
+/// prefix (with its trailing connector literal) and the time sub-pattern.
+/// `None` for a pure-date or pure-time pattern.
+fn split_datetime_pattern(pattern: &str) -> Option<(&str, &str)> {
+    let is_time = |c: char| {
+        matches!(
+            c,
+            'h' | 'H' | 'K' | 'k' | 'm' | 's' | 'S' | 'a' | 'b' | 'B' | 'z' | 'v' | 'V'
+        )
+    };
+    let is_date = |c: char| matches!(c, 'y' | 'M' | 'L' | 'd' | 'E' | 'e' | 'c' | 'G' | 'r' | 'U');
+    let mut seen_date = false;
+    for (i, c) in pattern.char_indices() {
+        if is_date(c) {
+            seen_date = true;
+        } else if is_time(c) && seen_date {
+            return Some((&pattern[..i], &pattern[i..]));
+        }
+    }
+    None
+}
+
 /// PartitionDateTimeRangePattern (ECMA-402 §11.1.8): the shared/collapsed
 /// range parts for the en-US patterns (the corpus pins the day/month/year
 /// collapse of `MMM d, y` and the full join of `M/d/y`).
@@ -2860,6 +2940,37 @@ fn partition_date_time_range(record: &DateTimeFormatRecord, start: f64, end: f64
     let start_local = to_local_time(start, &record.time_zone);
     let end_local = to_local_time(end, &record.time_zone);
     let templates = range_templates_for(record.active_pattern());
+    // Same local date but different formatted strings: a time range. Share
+    // the date prefix and range only the time sub-pattern (the full join
+    // would repeat the whole date on both sides).
+    if start_local.year == end_local.year
+        && start_local.month == end_local.month
+        && start_local.day == end_local.day
+        && let Some((date_prefix, time_pattern)) = split_datetime_pattern(record.active_pattern())
+    {
+        let mut parts = Vec::new();
+        let mut shared = format_with_pattern(record, start, date_prefix);
+        for part in &mut shared {
+            part.source = Some("shared".to_string());
+        }
+        parts.append(&mut shared);
+        let mut start_time = format_with_pattern(record, start, time_pattern);
+        for part in &mut start_time {
+            part.source = Some("startRange".to_string());
+        }
+        parts.append(&mut start_time);
+        parts.push(DtfPart {
+            part_type: "literal".to_string(),
+            value: RANGE_SEPARATOR.to_string(),
+            source: Some("shared".to_string()),
+        });
+        let mut end_time = format_with_pattern(record, end, time_pattern);
+        for part in &mut end_time {
+            part.source = Some("endRange".to_string());
+        }
+        parts.append(&mut end_time);
+        return parts;
+    }
     // The spec's field-order selection: the collapse picks the coarsest
     // field that differs (year, then month, then day).
     let selected = if start_local.year != end_local.year {

@@ -5938,6 +5938,12 @@ pub fn calendar_date_era(calendar: &str, y: i64, m: i64, d: i64) -> Option<&'sta
     calendar_year_fields(calendar, y, m, d).1
 }
 
+/// The era year of the ISO date in the calendar (the DateTimeFormat year
+/// field is the regnal era year for a calendar with eras, e.g. japanese).
+pub fn calendar_date_era_year(calendar: &str, y: i64, m: i64, d: i64) -> Option<i64> {
+    calendar_year_fields(calendar, y, m, d).2
+}
+
 fn calendar_field_value(
     calendar: &str,
     y: i64,

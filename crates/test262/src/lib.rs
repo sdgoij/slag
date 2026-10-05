@@ -187,6 +187,13 @@ function formatSimpleValue(value) {
   }
 }
 
+// The real assert.js hangs these off `assert`; deepEqual.js calls
+// assert._formatIdentityFreeValue in its failure-message formatter, so a
+// missing one turns every failing --deepEqual-- assertion into an opaque
+// "undefined is not a function".
+assert._formatIdentityFreeValue = formatIdentityFreeValue;
+assert._toString = formatSimpleValue;
+
 $262 = {};
 $262.global = globalThis;
 $262.detachArrayBuffer = function (buffer) {
@@ -12519,6 +12526,11 @@ var $DONE = function (error) {
             // PlainMonthDay) plus ZonedDateTime (UTC + fixed-offset zones)
             // and Date.prototype.toTemporalInstant (an Instant, so it lives
             // under Date/ and is let through by path below).
+            // A `features: [Temporal]` fixture *outside* the Temporal namespace
+            // (e.g. an intl402 `Intl.DateTimeFormat`/`DurationFormat` fixture
+            // that formats a Temporal value) is not a Temporal-type fixture —
+            // the value is produced by an implemented type and consumed by an
+            // implemented Intl component — so it runs too.
             let implemented = relative.starts_with("Temporal/Duration/")
                 || relative.starts_with("Temporal/Instant/")
                 || relative.starts_with("Temporal/Now/")
@@ -12529,6 +12541,7 @@ var $DONE = function (error) {
                 || relative.starts_with("Temporal/PlainYearMonth/")
                 || relative.starts_with("Temporal/PlainMonthDay/")
                 || relative.starts_with("Temporal/ZonedDateTime/")
+                || !relative.contains("Temporal/")
                 || !relative["Temporal/".len()..].contains('/')
                 || relative.starts_with("Date/prototype/toTemporalInstant/");
             if !implemented {

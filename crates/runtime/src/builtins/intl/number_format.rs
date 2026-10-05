@@ -505,9 +505,19 @@ fn to_raw_precision(
     let r2 = (n2.clone(), scale_exp);
     let (n, _) = apply_unsigned_rounding_mode(x, &r1, &r2, mode);
     // The grid exponent for the mantissa string: n × 10^(e - p + 1) = r.
-    let e = scale_exp + p - 1;
+    let mut e = scale_exp + p - 1;
     let digits = crux::bigint::to_string(&n, 10);
-    let m = if n.is_zero() { "0".to_string() } else { digits };
+    // A rounded mantissa of 10^p (one digit more than p) means the value
+    // carried into the next order of magnitude: drop the overflow digit and
+    // bump e (spec ToRawPrecision; `0.0009999 → 0.00100`, `999.9 → 1000`).
+    let m = if digits.len() as i64 > p {
+        e += 1;
+        digits[..p as usize].to_string()
+    } else if n.is_zero() {
+        "0".to_string()
+    } else {
+        digits
+    };
     let formatted = format_raw_precision(&m, e, p, min_precision);
     let int_digits = if e >= 0 { (e + 1) as u32 } else { 1 };
     RawResult {

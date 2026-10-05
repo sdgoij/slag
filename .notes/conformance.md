@@ -2090,14 +2090,28 @@ ShadowRealm (64)).
   TypedArray `copyWithin` fixtures above. Use a release build
   (`cargo run --release -p test262 --bin sweep`) — the debug build's deep
   recursion can overflow the stack on heavy fixtures.
-- The `intl402/` area is swept too (3,205 pass / 0 fail / 152 skip of
-  3,357 — the skips are the unimplemented `Intl.Locale-info` (60) and
-  `Intl.DateTimeFormat-extend-timezonename` (2) fixtures, the out-of-scope
-  `canonical-tz` fixtures (19), and the Temporal-type-gated fixtures there
-  (71); the earlier `FallbackSymbol/per-realm.js` failure now passes);
-  anything else that fails the sweep should be triaged into bug /
-  host-dependent / missing-hook categories and either fixed or documented
-  here.
+- The `intl402/` area is swept too (3,282 pass / 2 fail / 81 skip of 3,365;
+  the corpus grew by 8 in the 2026-09 pull). The Temporal gate no longer skips a
+  `features: [Temporal]` fixture just for living outside the `Temporal/<Type>/`
+  namespace, so the ~71 `Intl.DateTimeFormat`/`DurationFormat` fixtures that
+  *format* Temporal values now run (58 newly passing). The remaining skips are
+  `Intl.Locale-info` (60), `Intl.DateTimeFormat-extend-timezonename` (2), and
+  `canonical-tz` (19). The two remaining failures both need shared locale data:
+  `DateTimeFormat/prototype/format/temporal-objects-no-time-clip-non-latin-numerals.js`
+  (the `ar` numbering-system default is `latn`; needs the CLDR `nu`
+  likely-subtags table) and
+  `DateTimeFormat/prototype/formatToParts/compare-to-temporal-lunisolar.js`
+  (chinese/dangi leap months must keep the month *code* number — `M05L`, not the
+  ordinal `M06` — and Hebrew needs a month-name table; CLDR-15510 makes Hebrew
+  months non-numeric). The same pull added three fixtures that are now fixed:
+  `german-weekday-no-year.js` (German abbreviated weekdays carry a trailing
+  period) and the two `significant-digits-rounding-magnitude*` (ToRawPrecision
+  must handle the carry when the rounded mantissa reaches `10^p`). The harness
+  prelude also now sets `assert._formatIdentityFreeValue`, which `deepEqual.js`'s
+  failure formatter calls — without it a failing `deepEqual` reported as
+  "undefined is not a function". Anything else that fails the sweep should be
+  triaged into bug / host-dependent / missing-hook categories and either fixed or
+  documented here.
 - Known flaky fixture: `TypedArray/prototype/reduce/callbackfn-arguments-default-accumulator.js`
   (Strict) intermittently fails with `Expected SameValue(«43», «41») to be true` — the second
   reduce callback's `arguments[0]` reads 43 (iteration 1's `kValue`) instead of 41 (iteration

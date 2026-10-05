@@ -74,7 +74,9 @@ function classify(file, source) {
   }
   if (features.has("Temporal")) {
     // Mirrors run_fixture: only the implemented clusters run; the rest of
-    // the Temporal namespace stays skipped.
+    // the Temporal namespace stays skipped. A fixture that merely *uses*
+    // Temporal (intl402 DateTimeFormat/DurationFormat) is outside the
+    // namespace and runs too.
     const rest = file.split("/Temporal/")[1] ?? "";
     // The root-level catch-all (`!rest.includes("/")`) applies only to files
     // actually under the Temporal/ directory; Date/prototype/toTemporalInstant
@@ -91,12 +93,15 @@ function classify(file, source) {
       rest.startsWith("PlainYearMonth/") ||
       rest.startsWith("PlainMonthDay/") ||
       rest.startsWith("ZonedDateTime/") ||
+      !file.includes("/Temporal/") ||
       (!rest.includes("/") && file.includes("/Temporal/")) ||
       file.includes("/Date/prototype/toTemporalInstant/");
     if (!implemented) return "Temporal type not yet implemented";
-    return null;
+    // Fall through (no early return): an implemented Temporal fixture may
+    // still hit a later gate, and the stale check below must be reachable.
   }
   if (features.has("await-dictionary")) return "await-dictionary";
+  if (features.has("canonical-tz")) return "canonical-tz";
   if (features.has("ShadowRealm")) return "ShadowRealm";
   // Windows-checkout CRLF artifacts (mirrors run_fixture): the pinned
   // test262 submodule is checked out CRLF under `core.autocrlf`, so these
