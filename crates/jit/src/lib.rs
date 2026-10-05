@@ -3776,6 +3776,68 @@ run(); run(); run(); run(); run(); run(); run(); run(); run();";
     }
 
     #[test]
+    fn installed_jit_a_certified_construct_matches_the_interpreter() {
+        // C2: a call to a certified base constructor runs its compiled body as
+        // a nested frame on the caller's `Vm` (the construct mirror of the
+        // certified-callee lane): `construct_this_object` for the receiver, the
+        // `this` slot, `current_new_target`, and the base-return rule. A
+        // NON-leaf body (one that calls functions) now takes the lane too. The
+        // shapes that must NOT (a derived `super()` constructor, a class with
+        // instance fields) fall back to the general machinery and must still be
+        // exact. Differential against the interpreter, with absolutes asserted
+        // so a shared wrong value cannot hide.
+        let programs = [
+            // A non-leaf base constructor calling a function.
+            "function h(x) { return x + 1; }\n\
+             function Item(x) { this.x = h(x); this.y = x + 2; }\n\
+             function bench() { var s = 0; for (var i = 0; i < 100; i++) { s += new Item(i).x; } return s; }\n\
+             bench();",
+            // The base-return rule: an object return wins over the receiver.
+            "function C(x) { this.x = x; return { tag: x + 1 }; }\n\
+             function bench() { var s = 0; for (var i = 0; i < 100; i++) { s += new C(i).tag; } return s; }\n\
+             bench();",
+            // The base-return rule: a primitive return falls back to the
+            // receiver.
+            "function C(x) { this.x = x; return 999; }\n\
+             function bench() { var s = 0; for (var i = 0; i < 100; i++) { s += new C(i).x; } return s; }\n\
+             bench();",
+            // A base class with no instance fields (a class constructor runs
+            // the lane).
+            "function h(x) { return x * 2; }\n\
+             class A { constructor(x) { this.x = h(x); } }\n\
+             function bench() { var s = 0; for (var i = 0; i < 100; i++) { s += new A(i).x; } return s; }\n\
+             bench();",
+            // A derived constructor (`super`) must fall back and stay exact.
+            "class B { constructor(x) { this.x = x; } }\n\
+             class D extends B { constructor(x) { super(x + 1); } }\n\
+             function bench() { var s = 0; for (var i = 0; i < 100; i++) { s += new D(i).x; } return s; }\n\
+             bench();",
+            // A class with instance fields must fall back and stay exact.
+            "function h(x) { return x + 1; }\n\
+             class F { y = h(5); constructor(x) { this.x = x; } }\n\
+             function bench() { var s = 0; for (var i = 0; i < 100; i++) { var o = new F(i); s += o.x + o.y; } return s; }\n\
+             bench();",
+        ];
+        for source in programs {
+            let (jit_value, compiled) = run_self_call_program(source, true);
+            let (interp_value, _) = run_self_call_program(source, false);
+            assert_eq!(
+                jit_value, interp_value,
+                "jit and interpreter disagree:\n{source}"
+            );
+            assert!(compiled >= 1, "{compiled} bodies must compile:\n{source}");
+        }
+        // Absolutes, independent of any compiled run.
+        assert_eq!(run_self_call_program(programs[0], true).0, 5050.0);
+        assert_eq!(run_self_call_program(programs[0], false).0, 5050.0);
+        assert_eq!(run_self_call_program(programs[1], true).0, 5050.0);
+        assert_eq!(run_self_call_program(programs[2], true).0, 4950.0);
+        assert_eq!(run_self_call_program(programs[3], true).0, 9900.0);
+        assert_eq!(run_self_call_program(programs[4], true).0, 5050.0);
+        assert_eq!(run_self_call_program(programs[5], true).0, 5550.0);
+    }
+
+    #[test]
     fn installed_jit_apply_nullish_arraylike_and_empty_shapes() {
         // M10: the intrinsic fast path's arg-list shapes — a nullish
         // argArray (0 args), an empty dense array (0 args), and an

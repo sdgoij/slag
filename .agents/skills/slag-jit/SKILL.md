@@ -1003,3 +1003,19 @@ produced a wrong answer first:
   5.5 → 6.3 ms); they are outlined into `#[cold] #[inline(never)]` helpers. New
   caller-control-state shapes are netted by the two `…_does_not_drift` tests plus
   `installed_jit_certified_callee_inside_caller_control_state_matches_the_interpreter`.
+- **The construct lane is the same core (C2a).** `certified_call_inline` is now
+  `certified_lane_inline(ctx, callee, this, args, argc, cached, construct)`; the
+  construct arm creates the receiver with `construct_this_object` (not
+  `OrdinaryCallBindThis`), sets `Vm::current_new_target` to the callee, gates on
+  `EcmaFunction::certified_construct_eligible` (base kind, no instance
+  fields/private methods, a constructible non-lexical `this`, plus the C1 lane
+  eligibility — it admits a NON-leaf body, unlike the leaf-only
+  `construct_inline`), and applies the base-return rule (an object/function
+  return wins, else the receiver). `step_construct_impl` roots the construct
+  args on `vm.stack` for the lane window (a local slice is invisible to the
+  collector) and takes the lane only for a JIT caller (`shared` ctx); a derived
+  `super()` or instance-field constructor is refused and keeps the general path.
+  The receiver is created *after* every refusal (so a declined construct leaves
+  no receiver — `construct_this_object` reads an observable `prototype` getter).
+  Measured: a non-leaf base constructor 259 → 128 ms / 500k (~2×);
+  `construct_churn` is a leaf-constructor row (the no-regress guard).

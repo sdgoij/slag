@@ -1928,7 +1928,9 @@ extern "C" fn call_slow(
     // of the interpreter funnel. `None` (an ineligible or not-yet-compiled callee)
     // falls through to that funnel, which ports the callee and promotes it.
     if direct_eval == 0
-        && let Some(result) = certified_call_inline(ctx, callee, this, args, argc, None)
+        && let Some(result) = certified_lane_inline(ctx, callee, this, args, argc, None, false)
+            .ok()
+            .flatten()
     {
         return result;
     }
@@ -2087,26 +2089,32 @@ fn self_call_inline(ctx: &mut JitCallContext, args: *mut u64, argc: u64) -> Opti
     Some(result)
 }
 
-/// The general certified-callee lane: a call to a *different* certified body
-/// runs its machine code directly on this ctx, with a nested frame carved from
+/// The shared certified-body lane: a call (`construct == false`) or a base
+/// constructor (`construct == true`) to a *different* certified body runs its
+/// machine code directly on this ctx, with a nested frame carved from
 /// `vm.stack`, instead of the interpreter funnel (`do_call_fast` ->
-/// `ordinary_call` -> `run_compiled_body` -> `run_jit_body`: a pooled-Vm
-/// take/reset, an `ExecutionContext` push, a frame setup, a
+/// `ordinary_call` -> `run_compiled_body` -> `run_jit_body`, or
+/// `step_construct_impl` -> `function::construct` -> `ordinary_construct`: a
+/// pooled-Vm take/reset, an `ExecutionContext` push, a frame setup, a
 /// `globals_unshadowed` walk and a whole new ctx). It is [`self_call_inline`]'s
 /// shape generalised to any callee — the nested activation shares the caller's
-/// `Vm` and control state, and the gate (`self_call_eligible`) is exactly the
-/// guarantee that the body reads or writes none of the caller-owned state this
-/// lane does not save. Returns `None` when the callee is not an eligible,
-/// already-compiled certified body; the caller then takes the interpreter path,
-/// which ports the callee and promotes it.
-fn certified_call_inline(
+/// `Vm`, and the gate (`certified_callee_eligible`, plus
+/// `certified_construct_eligible` for a construct) is exactly the guarantee
+/// that the body reads or writes none of the caller-owned state this lane does
+/// not save. A construct creates the receiver (`construct_this_object`) and
+/// applies the base-return rule. Returns `Ok(None)` when the callee is not an
+/// eligible, already-compiled certified body (the caller then takes the
+/// interpreter path, which ports and promotes it); `Err` only from
+/// `construct_this_object`'s prototype read.
+fn certified_lane_inline(
     ctx: &mut JitCallContext,
     callee: u64,
     this: u64,
     args: *mut u64,
     argc: u64,
     cached: Option<&CertifiedInlineInfo>,
-) -> Option<u64> {
+    construct: bool,
+) -> Result<Option<u64>, JsError> {
     // A callee that is not an ECMAScript function — an engine builtin, a bound
     // function, a proxy — can never be a lane target, and the value decode is
     // the cheapest discriminator, so it comes before the depth/hook reads: the
@@ -2114,25 +2122,44 @@ fn certified_call_inline(
     // `Map`/`String` method) is the common one to reach here.
     let callee_value = Value::from_bits(callee);
     let ValueKind::Function(function) = callee_value.kind() else {
-        return None;
+        return Ok(None);
     };
     if !matches!(function.kind, crux::function::FunctionKind::EcmaScript) {
-        return None;
+        return Ok(None);
     }
     let agent = unsafe { &mut *ctx.agent };
     if agent.jit_depth >= MAX_JIT_DEPTH || agent.is_terminating() {
-        return None;
+        return Ok(None);
     }
-    let hook = agent.jit_hook?;
+    let Some(hook) = agent.jit_hook else {
+        return Ok(None);
+    };
     // Resolve the callee's registered record in one scoped borrow: a
-    // generator/async body's call produces an iterator or a promise rather
-    // than a run of the body, and a class constructor cannot be called at all.
+    // generator/async body's call/construct produces an iterator or a promise
+    // rather than a run of the body. A class constructor cannot be CALLED at
+    // all (the call gate refuses it), but a base class constructor IS what the
+    // construct lane runs.
     let (body, environment, strict, realm) = {
-        let data = agent.ecma_functions.get(&function.id())?;
-        if data.is_generator || data.is_async || data.is_class_constructor {
-            return None;
+        let Some(data) = agent.ecma_functions.get(&function.id()) else {
+            return Ok(None);
+        };
+        if data.is_generator || data.is_async {
+            return Ok(None);
         }
-        let body = data.ir.clone()?;
+        if construct {
+            // C2: the construct gate (base kind, no fields/private methods, a
+            // constructible definition with a non-lexical `this`, and the
+            // shared-lane eligibility) — a non-leaf certified base constructor
+            // is admitted here, unlike the leaf-only `construct_inline`.
+            if !data.certified_construct_eligible() {
+                return Ok(None);
+            }
+        } else if data.is_class_constructor {
+            return Ok(None);
+        }
+        let Some(body) = data.ir.clone() else {
+            return Ok(None);
+        };
         (body, data.environment, data.strict, data.realm)
     };
     let global = realm.global_object;
@@ -2140,7 +2167,7 @@ fn certified_call_inline(
     // below) plus the super/`ThisValue` machinery it cannot install. The
     // call-site probe already ran it (cached); the derived path re-runs it.
     if cached.is_none() && !body.certified_callee_eligible() {
-        return None;
+        return Ok(None);
     }
     // An unmapped-`arguments` object is built from the *current* realm's
     // intrinsics (`%Object.prototype%`, `%ThrowTypeError%`), and a lane run
@@ -2155,9 +2182,11 @@ fn certified_call_inline(
             .current_realm()
             .is_ok_and(|current| current.as_ptr() == realm.as_ptr())
     {
-        return None;
+        return Ok(None);
     }
-    let scope = body.scope.as_ref()?;
+    let Some(scope) = body.scope.as_ref() else {
+        return Ok(None);
+    };
     // C1: the call-site probe cached the entry, `stack_usage` and the frame
     // descriptor, validated by the record's identity + code-generation gates.
     // A run's eviction is a boundary event (the compile that opens a run), not
@@ -2168,7 +2197,7 @@ fn certified_call_inline(
         // The box-address identity can match a recycled box whose descriptor
         // is another body's; the id is the exact discriminator.
         if cached.fill_ok == 0 || cached.callee_id != function.id() {
-            return None;
+            return Ok(None);
         }
         (
             unsafe { std::mem::transmute::<u64, JitEntry>(cached.entry) },
@@ -2180,7 +2209,7 @@ fn certified_call_inline(
         // site uses; a below-threshold or sticky-refused body falls back here.
         let info_ptr = lookup_info(hook, &body, true);
         if info_ptr.is_null() {
-            return None;
+            return Ok(None);
         }
         // SAFETY: `lookup_info` just returned the cache's live entry, and no
         // frame is in flight to evict it (`in_flight` was true).
@@ -2209,7 +2238,17 @@ fn certified_call_inline(
         ),
         None => (strict, scope.this_slot, scope.arity),
     };
-    let bound_this = if this_slot.is_some() {
+    let this_value: Option<Value> = if construct {
+        // C2: the receiver is created here — after every refusal above, so a
+        // declined construct leaves no receiver behind (`construct_this_object`
+        // reads the constructor's `prototype`, an observable getter). A direct
+        // `new C()` passes the callee as `new.target` (the construct helper's
+        // own new_target), so the lane needs no separate value.
+        Some(crate::function::construct_this_object(
+            agent,
+            &callee_value,
+        )?)
+    } else if this_slot.is_some() {
         let this = Value::from_bits(this);
         Some(if strict {
             this
@@ -2217,7 +2256,7 @@ fn certified_call_inline(
             match this.kind() {
                 ValueKind::Undefined | ValueKind::Null => Value::Object(global),
                 ValueKind::Object(_) | ValueKind::Function(_) => this,
-                _ => return None,
+                _ => return Ok(None),
             }
         })
     } else {
@@ -2239,7 +2278,7 @@ fn certified_call_inline(
         // below cannot reallocate under either run's baked pointers. A nest
         // that would exceed the cap falls back to the funnel.
         if base + buf_len > vm.stack_cap {
-            return None;
+            return Ok(None);
         }
         let mut scratch = vm.save_scratch();
         scratch.mark_env_swapped();
@@ -2254,7 +2293,7 @@ fn certified_call_inline(
         vm.env_stack.reset(environment);
         vm.body_context = Some(environment);
         vm.current_function = Some(callee_value);
-        vm.current_new_target = None;
+        vm.current_new_target = construct.then_some(callee_value);
         vm.strict = strict;
         (scratch, saved, base)
     };
@@ -2284,7 +2323,7 @@ fn certified_call_inline(
         // segment on `vm.stack`.
         unsafe { *buf_ptr.add(slot) = value };
     }
-    if let (Some(slot), Some(value)) = (this_slot, bound_this) {
+    if let (Some(slot), Some(value)) = (this_slot, this_value) {
         unsafe { *buf_ptr.add(slot) = value };
     }
     let frame_ptr = buf_ptr as *mut c_void;
@@ -2382,10 +2421,10 @@ fn certified_call_inline(
         vm.restore_scratch(scratch);
     }
     if nested.pending {
-        return Some(slow_error(
+        return Ok(Some(slow_error(
             ctx,
             nested.error.take().expect("a pending JIT error is present"),
-        ));
+        )));
     }
     debug_assert!(
         !nested.tail,
@@ -2395,7 +2434,20 @@ fn certified_call_inline(
         result != DISPATCH_SUSPEND,
         "the certified-call gate excludes the suspend steps"
     );
-    Some(result)
+    // C2: a base constructor's return rule (spec 10.2.1 [[Construct]] steps
+    // 15-21): an object/function return wins; anything else falls back to the
+    // receiver the lane created. A call returns the value unchanged.
+    if construct {
+        let value = Value::from_bits(result);
+        return Ok(Some(
+            match value.kind() {
+                ValueKind::Object(_) | ValueKind::Function(_) => value,
+                _ => this_value.unwrap_or(Value::Undefined),
+            }
+            .bits(),
+        ));
+    }
+    Ok(Some(result))
 }
 
 /// C1: the compiled call site's certified-callee fast path. The site gated on
@@ -2425,8 +2477,34 @@ extern "C" fn certified_call(
     {
         return u64::MAX;
     }
-    certified_call_inline(ctx, callee, this, args, argc, Some(&cache_entry.certified))
-        .unwrap_or(u64::MAX)
+    certified_lane_inline(
+        ctx,
+        callee,
+        this,
+        args,
+        argc,
+        Some(&cache_entry.certified),
+        false,
+    )
+    .ok()
+    .flatten()
+    .unwrap_or(u64::MAX)
+}
+
+/// C2: the construct-lane entry — run a certified base constructor's compiled
+/// body as a nested frame on the caller's `Vm` (the construct mirror of the
+/// call site's `certified_call`). `args` points at the construct arguments,
+/// which the caller (`Vm::step_construct_impl`) roots on `vm.stack` for the
+/// window; returns the constructed value's bits, or `Ok(None)` to fall back to
+/// the general construct machinery (the caller then runs it). A pending error
+/// is surfaced through `ctx` (the returned bits are the console-less sentinel).
+pub(crate) fn certified_construct_lane(
+    ctx: &mut JitCallContext,
+    callee: u64,
+    args: *const u64,
+    argc: usize,
+) -> Result<Option<u64>, JsError> {
+    certified_lane_inline(ctx, callee, 0, args as *mut u64, argc as u64, None, true)
 }
 
 extern "C" fn call_apply(

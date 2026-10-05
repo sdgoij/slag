@@ -12488,6 +12488,49 @@ impl Vm {
                 None
             };
             self.run_leaf_construct(agent, &ir, environment, strict, &callee, &args, shared)
+        } else if let Some((ctx_ptr, _sp)) = shared
+            && agent.realm_count.get() == 1
+            && let ValueKind::Function(function) = callee.kind()
+            && matches!(function.kind, crux::function::FunctionKind::EcmaScript)
+        {
+            // C2a: a certified base constructor runs its compiled body as a
+            // nested frame on the CALLER's Vm — no `function::construct`
+            // pooled-Vm take/reset, `ExecutionContext` push, or
+            // `run_compiled_body` per construct (the construct mirror of the
+            // call lane). The arguments are rooted on `vm.stack` for the
+            // window (a local slice is invisible to the collector), then
+            // dropped once the lane has filled its frame; a decline (an
+            // ineligible/non-base constructor, or no room) leaves `self.args`
+            // untouched for the general path below.
+            let argc = self.args.len() - base;
+            let push_at = self.stack.len();
+            let mut lane = Ok(None);
+            if push_at + argc <= self.stack_cap {
+                self.stack.extend_from_slice(&self.args[base..]);
+                // SAFETY: the args were just pushed at `push_at`, and the
+                // caller's region reserved the stack to `stack_cap` so the
+                // lane's `resize` cannot reallocate under this pointer.
+                let args_ptr = unsafe { self.stack.as_ptr().add(push_at) } as *const u64;
+                let ctx = unsafe { &mut *(ctx_ptr as *mut crate::jit::JitCallContext) };
+                lane = crate::jit::certified_construct_lane(ctx, callee.bits(), args_ptr, argc);
+            }
+            match lane {
+                Ok(Some(bits)) => {
+                    self.args.truncate(base);
+                    self.stack.truncate(push_at);
+                    Ok(Value::from_bits(bits))
+                }
+                Ok(None) => {
+                    self.stack.truncate(push_at);
+                    let _stress = StressSuppress::new();
+                    let args = self.args.split_off(base);
+                    crate::function::construct(agent, &callee, &args, &callee)
+                }
+                Err(error) => {
+                    self.stack.truncate(push_at);
+                    Err(error)
+                }
+            }
         } else if agent.realm_count.get() == 1
             && let ValueKind::Function(function) = callee.kind()
             && let Some(ctor) = agent.builtin_ctor_lookup(function.id())

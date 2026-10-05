@@ -273,6 +273,79 @@ clippy `-D warnings`, `cargo test -p jit --lib` 261 green (the two
 The `--gc-stress`/`--gc-verify`/workspace/wasm re-run for C1c was deferred by the
 operator.
 
+**Stage C2 detail (the construct protocol on the frame).** C2 is the construct
+mirror of C1. Today a compiled `new C()` emits one `Helper::Construct` FFI
+(`crates/jit/src/compiler.rs`, the `Construct` arm: pop the callee, call the
+helper with the caller's `sp`). `step_construct_impl`
+(`crates/runtime/src/ir.rs`) pops the argument boundary and runs the certified
+base-constructor LEAF path — `run_leaf_construct` (`construct_this_object` + the
+base-return rule, and a `try_shared_construct_leaf` run on the caller's ctx when
+the callee is an env-free leaf) — when `Vm::can_inline_leaf` and the leaf
+cache's `construct_inline` verdict hold; otherwise it falls to
+`function::construct` → `ordinary_construct`'s certified path, which pushes an
+`ExecutionContext`, `take_vm`s a pooled `Vm`, `setup_frame`s, and `vm.start`s the
+body. Two costs remain: (1) a **non-leaf** certified base constructor (a body
+with a call) never takes the leaf path, so it pays the pooled-`Vm` take/reset +
+context push + `run_compiled_body` per construct; (2) the **leaf** path
+re-derives per construct what is a pure function of the callee (the `leaf_lookup`
+HashMap probe + `construct_inline` verdict + the `lookup_info` consult inside
+`try_shared_construct_leaf`).
+
+**C2a — a non-leaf certified base constructor on the caller's frame
+(runtime-only).** Generalize the certified-callee lane (`certified_call_inline`)
+to construct: when the `shared` ctx + `sp` are present (a compiled caller) and
+the callee is a certified base constructor, carve the nested frame from
+`vm.stack` exactly as the call lane does, set the `this` slot to
+`construct_this_object(agent, new_target)`, set `Vm::current_new_target`, run the
+callee's compiled entry on the caller's ctx, and apply the base-return rule (an
+object/function return wins, else the receiver). Gate: `constructor_kind ==
+Base`, no instance `fields`/`private_methods` (the `ordinary_construct` certified
+gate), capture-free (`context_names` empty), single realm, and the C1 lane's
+`has_shared_vm_step_hazard` exclusion. `new_target` is the callee for a direct
+`new C()`; a `Reflect.construct`/subclass new_target differs and is refused
+(the lane uses the callee as the receiver's prototype source).
+
+**Hazards (construct adds over call).** The base-return rule (a returned object
+overrides the receiver); `new.target` — the body's `Step::NewTarget` reads
+`Vm::current_new_target`, which the call lane sets to `None` and the construct
+lane must set to the callee; derived constructors / `super()` (the this-TDZ
+before super: refused by the base-kind gate); class instance fields/private
+methods (`initialize_instance_elements`: refused, they keep `ordinary_construct`);
+a sloppy body's mapped `arguments` (refused like the call lane; the unmapped
+form reads `Vm::call_args`).
+
+**C2b — the construct-site verdict cache (emit-side, if the probe warrants).** A
+`Construct` site emits one `Helper::Construct` FFI with no site record; if the
+C2a probe still shows the per-construct re-derivation (the `leaf_lookup` HashMap
++ verdict for a leaf, the `ecma_functions` lookup for a non-leaf) as the
+residual, add a construct-site record (a `ConstructInlineInfo` the site caches,
+keyed by the callee's `id` + site, with the same identity/`code_gen`/`epoch`
+gate the leaf record uses) and a `Helper::CertifiedConstruct` that skips it — the
+construct mirror of C1a/C1b. Probe first.
+
+Probes: a non-leaf certified base constructor row and the bare-construct probe
+(`--jit-bench`/the corpus), A/B; `construct_churn` and `recursive_fib` must not
+regress. Slices land in order C2a (the measured win), then C2b only if the
+residual is still the re-derivation.
+
+**Status (2026-10-05): C2a landed.** `certified_call_inline` is now
+`certified_lane_inline(ctx, callee, this, args, argc, cached, construct)` — one
+frame-carve/run/restore core shared by the call and construct lanes — and
+`step_construct_impl` runs a certified base constructor as a nested frame on the
+caller's `Vm` (the construct args rooted on `vm.stack` for the window). Measured
+on a non-leaf base constructor (a body that calls a function), 500k constructs:
+**259 → 128 ms (~2×)**; a leaf constructor (already on `run_leaf_construct`) and
+`recursive_fib` are unchanged. `construct_churn` is a leaf-constructor row, so
+it is the no-regress guard, not the win. Gates: normal sweep at baseline
+(48622 / 48464 pass / 0 fail / 158 skip / 0 crash / 0 hang); clippy
+`-D warnings` clean; `cargo test -p jit --lib` 262 (the new
+`installed_jit_a_certified_construct_matches_the_interpreter` covers a non-leaf
+constructor, both base-return rule arms, a base class, and the
+derived/instance-field fallbacks); `cargo test -p runtime --lib` 994; a
+self-checking non-leaf construct under `--gc-stress`/`--nursery-stress`; the CLI
+benches 12/12 `ok=true`. **C2b** (the construct-site verdict cache) remains,
+if the probe still shows the re-derivation as the residual.
+
 **Stage C0 detail (the substrate).** C0 makes the compiled body's working
 region *be* `vm.stack`, so the frame and the operand stack are one described
 region both engines address. Today `run_jit_body` hands the entry a

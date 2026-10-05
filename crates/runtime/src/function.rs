@@ -311,6 +311,26 @@ impl EcmaFunction {
         self.ir = Some(ir);
         self.construct_inline = self.compute_construct_inline();
     }
+
+    /// C2: the construct-lane verdict — a certified base constructor whose body
+    /// runs as a nested frame on the caller's `Vm` (the construct mirror of
+    /// `CompiledBody::certified_callee_eligible`). It is the `ordinary_construct`
+    /// certified gate (base kind, no instance fields/private methods, a
+    /// constructible definition with a non-lexical `this`) plus the shared-lane
+    /// eligibility; unlike `construct_inline` it admits a NON-leaf body (a
+    /// constructor that calls functions runs through the lane too).
+    pub(crate) fn certified_construct_eligible(&self) -> bool {
+        self.constructor_kind == ConstructorKind::Base
+            && self.fields.is_empty()
+            && self.private_methods.is_empty()
+            && self.this_mode != ThisMode::Lexical
+            && (!self.is_method || self.is_class_constructor)
+            && !self.class_field_initializer
+            && self
+                .ir
+                .as_ref()
+                .is_some_and(|ir| ir.certified_callee_eligible())
+    }
 }
 
 /// FunctionBodyContainsUseStrict (spec 15.2.1): a `"use strict"` directive in
