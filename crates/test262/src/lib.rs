@@ -12525,6 +12525,16 @@ var $DONE = function (error) {
             Some(pair) => pair,
             None => return FixtureResult::Fail(format!("{relative}: missing frontmatter")),
         };
+        // `staging/sm` is SpiderMonkey's own shell test suite, imported into
+        // test262's staging tier; it is not ECMAScript conformance. It needs
+        // SM-only harness helpers (`sm/non262-*-shell.js`,
+        // `sm/assertThrowsValue.js`) and asserts SM-shell-specific semantics.
+        if area == Area::Staging && relative.starts_with("sm/") {
+            return FixtureResult::Skip(
+                "SpiderMonkey shell suite (staging/sm): SM-specific helpers/semantics, not ECMAScript conformance"
+                    .into(),
+            );
+        }
         if fm.features.iter().any(|f| f == "Temporal") {
             // Implemented clusters: Duration, Instant, Now, the root-level
             // namespace fixtures, the toStringTag fixtures, and the Plain*

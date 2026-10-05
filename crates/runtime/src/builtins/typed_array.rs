@@ -857,7 +857,7 @@ pub fn typed_array_buffer_path(
             "ArrayBuffer expected".into(),
         ));
     };
-    let (resizable, shared, buffer_byte_length) = {
+    let (variable_length, shared, buffer_byte_length) = {
         let state = agent
             .buffer_data
             .get(&buffer_object.id())
@@ -869,7 +869,15 @@ pub fn typed_array_buffer_path(
             ));
         }
         let state = state.borrow();
-        (state.resizable, state.shared.clone(), state.byte_length)
+        // [[ArrayBufferMaxByteLength]] set ⇒ not a fixed-length buffer (spec
+        // IsFixedLengthArrayBuffer 25.1.3.9), true for a resizable ArrayBuffer
+        // *and* a growable SharedArrayBuffer. The `resizable` flag alone is
+        // false for a growable SharedArrayBuffer, so it cannot stand in.
+        (
+            state.max_byte_length.is_some(),
+            state.shared.clone(),
+            state.byte_length,
+        )
     };
     let element_size = element_type.size();
     let byte_offset = match args.first() {
@@ -932,9 +940,10 @@ pub fn typed_array_buffer_path(
                 "byteOffset exceeds the buffer".into(),
             ));
         }
-        // A fixed-length view's byte range must be a whole number of
-        // elements (spec 25.2.2.1 step 13); a resizable buffer view is auto.
-        if !resizable && (buffer_byte_length - byte_offset) % element_size != 0 {
+        // A fixed-length buffer's view must cover a whole number of elements
+        // (spec 25.2.2.1 step 13); a variable-length buffer's view is auto and
+        // need not.
+        if !variable_length && (buffer_byte_length - byte_offset) % element_size != 0 {
             return Err(JsError::new(
                 ErrorKind::RangeError,
                 "byteLength must be a multiple of the element size".into(),
@@ -950,9 +959,9 @@ pub fn typed_array_buffer_path(
         byte_length,
         byte_offset,
         array_length,
-        // A view over a resizable buffer without an explicit length tracks
+        // A view over a variable-length buffer with no explicit length tracks
         // the buffer (spec 25.2.2.1: [[ArrayLength]] is auto).
-        auto_length: resizable && !explicit_length,
+        auto_length: variable_length && !explicit_length,
     };
     let object = JsObject::integer_indexed_object_create(slots, Some(prototype))?;
     Ok(Value::Object(object))

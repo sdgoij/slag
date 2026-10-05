@@ -1645,6 +1645,7 @@ The harness's skip taxonomy (also used by the sweep):
 | Unsupported `includes:` | Fixtures needing harness helpers beyond `assert.js`, `compareArray.js`, `detachArrayBuffer.js`, `isConstructor.js`, `propertyHelper.js`, `testAtomics.js`, `testTypedArray.js` are not run. |
 | Stale fixture | `Temporal/Duration/prototype/total/relativeto-date-limits.js` asserts a +1s boundary that is in range per the current spec (matching node v24), so it is skipped in `run_fixture`. |
 | CRLF checkout artifact | On a Windows checkout with `core.autocrlf`, git rewrites the pinned test262 submodule's LF text files to CRLF, so the byte-exact fixtures (`import/import-bytes/bytes-from-{js,json,txt}` and `Function/prototype/toString/line-terminator-normalisation-LF`) read `\r\n` where the corpus asserts `\n`. They are skipped in `run_fixture` only when the working tree is actually CRLF — a clean LF checkout runs them. |
+| `staging/sm` (SpiderMonkey shell suite) | SpiderMonkey's own shell test suite, imported into the staging tier; not ECMAScript conformance. It needs SM-only harness helpers (`sm/non262-*-shell.js`, `sm/assertThrowsValue.js`) and asserts SM-shell-specific semantics. Skipped in `run_fixture` for the staging area only. |
 
 ## Expected non-runnable tests
 
@@ -2039,25 +2040,22 @@ V8 shape (`ErrorType: message\n    at …`) with source spans from the parser.
 ## staging tier (not part of `all`)
 
 `test/test262/test/staging` is test262's tier for not-yet-merged proposals and
-engine-specific tests (SpiderMonkey's own shell suite lives under
-`staging/sm`). It is wired as its own sweep area (`sweep.exe staging`) and
-deliberately kept out of `all`, so the documented three-area baseline is
+engine-specific tests. It is wired as its own sweep area (`sweep.exe staging`)
+and deliberately kept out of `all`, so the documented three-area baseline is
 unaffected.
 
-Measured on the pinned submodule (`--jobs 8 --batch 32 --timeout 15
---recheck-timeout 15`, release build): **1,059 pass, 257 fail, 165 skip, 0
-crash, 2 hang of 1,483 fixtures**. Almost all of the failure signal is
-`staging/sm` (249 fail): that is SpiderMonkey's own shell suite, whose helpers
-(`sm/non262-*-shell.js`, `sm/assertThrowsValue.js`) are not shipped, so those
-fixtures skip on "unsupported includes" and many of the rest assert
-SM-shell-specific behavior (stale expectations, shell globals). The non-`sm`
-failures are the genuine engine gaps:
+The `staging/sm` subtree is SpiderMonkey's own shell test suite, imported into
+test262's staging tier — not ECMAScript conformance. It needs SM-only harness
+helpers (`sm/non262-*-shell.js`, `sm/assertThrowsValue.js`) and asserts
+SM-shell-specific semantics, so `run_fixture` skips it whole (mirrored in
+`tools/skip_tally.js`); it was left in the `fail` bucket in the first pass and
+contributed 249 failures, 165 include-skips and both `hang`s, none of them
+signal.
 
-- `built-ins/Object/{preventExtensions,seal}` and
-  `built-ins/Reflect/preventExtensions` over the *variable-length* typed
-  arrays — a fixed-length view over a resizable buffer makes the buffer
-  non-extensible (TypeError from `preventExtensions`/`seal`, `false` from
-  `Reflect.preventExtensions`).
+With `sm/` skipped, the tier measures **71 pass, 5 fail, 1,407 skip, 0 crash, 0
+hang of 1,483 fixtures** (`--jobs 8 --batch 32 --timeout 15 --recheck-timeout
+15`, release). The 5 failures are the remaining genuine gaps:
+
 - `explicit-resource-management/exception-handling.js` — `SuppressedError` is
   not produced when a `using` disposal throws over a body throw.
 - `explicit-resource-management/async-disposal-from-sync-method-returning-a-promise.js`
@@ -2066,22 +2064,26 @@ failures are the genuine engine gaps:
 - `source-phase-imports/{import-source-source-text-module,module-source-prototype-chain}.js`
   — `import.source()` (stage-3).
 
-The 2 hangs are `sm/regress/regress-610026.js` (evals a script of 2^21 doubled
-empty blocks — a parser-throughput stress) and
-`sm/regress/regress-1507322-deep-weakmap.js` (a 100k-entry `WeakMap` chain +
-`$262.gc()`); both are SM performance regress tests, not correctness bugs.
+Two fixes came out of this tier:
 
-A crash in this tier was a real defect and is fixed: `String.prototype.replace`
-(via `GetSubstitution` and the `@@replace` accumulator) and the sibling string
-builders (`String.prototype.concat`/`repeat`/`padStart`/`padEnd`,
-`Array.prototype.join`/`toLocaleString`) grew a `Vec<u16>` without a length
-cap, so a result past available memory hit Rust's allocator failure handler and
-aborted the **process** (unrecoverable, taking its sweep batch with it) instead
-of throwing. The builders now go through `crux::string::append_units`, which
-caps at `MAX_STRING_LENGTH` (1 GiB-1 code units, matching SpiderMonkey) and
-throws `RangeError: Invalid string length`; `sm/String/replace-math.js` (and
-the four batch-collateral `sm/String/replace*.js` fixtures it had killed) now
-pass, and the three-area baseline is unchanged.
+- **The variable-length-typed-array `preventExtensions`/`seal` trio now
+  passes.** `typed_array_buffer_path` derived a view's auto-length from the
+  buffer's `resizable` flag, which is set only for a resizable *ArrayBuffer*; a
+  growable *SharedArrayBuffer* carries `max_byte_length` but keeps `resizable`
+  false, so `new Ctor(gsab)` was built as a fixed-length view where the spec
+  makes it auto (spec 25.2.2.1 / `IsFixedLengthArrayBuffer` 25.1.3.9). The view
+  now keys auto-ness on `max_byte_length.is_some()`, so a length-tracking GSAB
+  view tracks growth and `[[PreventExtensions]]` correctly refuses
+  (`built-ins/{Object,Reflect}/…variable-length-typed-arrays.js`).
+- **A process-aborting crash is fixed.** `String.prototype.replace` (via
+  `GetSubstitution` and the `@@replace` accumulator) and the sibling string
+  builders (`String.prototype.concat`/`repeat`/`padStart`/`padEnd`,
+  `Array.prototype.join`/`toLocaleString`) grew a `Vec<u16>` without a length
+  cap, so a result past available memory hit Rust's allocator failure handler
+  and aborted the **process** (unrecoverable, taking its sweep batch with it)
+  instead of throwing. The builders now go through `crux::string::append_units`,
+  which caps at `MAX_STRING_LENGTH` (1 GiB-1 code units, matching SpiderMonkey)
+  and throws `RangeError: Invalid string length`.
 
 ## Open items
 

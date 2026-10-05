@@ -40,9 +40,16 @@ const AREAS = [
   ["built-ins", "test262/test/built-ins"],
   ["annexB", "test262/test/annexB"],
   ["intl402", "test262/test/intl402"],
+  ["staging", "test262/test/staging"],
 ];
 
 function classify(file, source) {
+  // staging/sm is SpiderMonkey's own shell suite (mirrors run_fixture): not
+  // ECMAScript conformance, needs SM-only helpers (`sm/non262-*-shell.js`,
+  // `sm/assertThrowsValue.js`), and asserts SM-shell-specific semantics.
+  if (file.includes("/staging/sm/")) {
+    return "SpiderMonkey shell suite (staging/sm): SM-specific helpers/semantics, not ECMAScript conformance";
+  }
   let frontmatter = "";
   const start = source.indexOf("/*---");
   if (start >= 0) {
