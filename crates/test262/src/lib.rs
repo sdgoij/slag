@@ -12561,6 +12561,9 @@ var $DONE = function (error) {
                 || relative.starts_with("Temporal/PlainYearMonth/")
                 || relative.starts_with("Temporal/PlainMonthDay/")
                 || relative.starts_with("Temporal/ZonedDateTime/")
+                // `Temporal/v8` is V8's ported mjsunit Temporal tests, not a
+                // type directory; they exercise the implemented types.
+                || relative.starts_with("Temporal/v8/")
                 || !relative.contains("Temporal/")
                 || !relative["Temporal/".len()..].contains('/')
                 || relative.starts_with("Date/prototype/toTemporalInstant/");

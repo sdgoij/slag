@@ -100,6 +100,7 @@ function classify(file, source) {
       rest.startsWith("PlainYearMonth/") ||
       rest.startsWith("PlainMonthDay/") ||
       rest.startsWith("ZonedDateTime/") ||
+      rest.startsWith("v8/") ||
       !file.includes("/Temporal/") ||
       (!rest.includes("/") && file.includes("/Temporal/")) ||
       file.includes("/Date/prototype/toTemporalInstant/");

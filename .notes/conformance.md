@@ -2050,10 +2050,10 @@ SM-shell-specific semantics, so `run_fixture` skips it whole (mirrored in
 contributed 249 failures, 165 include-skips and both `hang`s, none of them
 signal.
 
-With `sm/` skipped, the tier measures **76 pass, 0 fail, 1,407 skip, 0 crash, 0
+With `sm/` skipped, the tier measures **77 pass, 0 fail, 1,406 skip, 0 crash, 0
 hang of 1,483 fixtures** (`--jobs 8 --batch 32 --timeout 15 --recheck-timeout
-15`, release) — every runnable staging fixture passes (the 1,407 skips are the
-`sm` suite and one Temporal fixture). Five fixes came out of this tier:
+15`, release) — every runnable staging fixture passes (the 1,406 skips are all
+`sm`). Six fixes came out of this tier:
 
 - **The variable-length-typed-array `preventExtensions`/`seal` trio now
   passes.** `typed_array_buffer_path` derived a view's auto-length from the
@@ -2110,6 +2110,15 @@ hang of 1,483 fixtures** (`--jobs 8 --batch 32 --timeout 15 --recheck-timeout
   desugaring evaluates a *computed* auto-accessor key twice (once for the
   synthesized getter, once for the setter); no fixture exercises a
   side-effecting key, and it is the one known simplification.
+- **A Temporal fixture was skipped as a false positive.**
+  `Temporal/v8/calendar-day-of-week.js` is V8's ported mjsunit test (it uses
+  only `PlainDate`/`PlainDateTime`), but the implemented-type allowlist in
+  `run_fixture` read `Temporal/v8/` as an unimplemented Temporal *type*
+  directory and skipped it with "Temporal type not yet implemented".
+  `Temporal/v8/` is now recognized as V8's ported tests: all Temporal types are
+  implemented and the pinned corpus has no `Calendar`/`TimeZone` type
+  directories, so nothing is legitimately skipped by that gate. Mirrored in
+  `tools/skip_tally.js`.
 
 ## Open items
 
