@@ -1652,10 +1652,8 @@ The harness's skip taxonomy (also used by the sweep):
 These categories are expected to stay non-runnable and are not counted
 against the runnable pass-rate target:
 
-- **Unimplemented ECMA-402 pieces** — ECMA-402 is a separate
-  specification; the `intl402/` fixtures needing
-  `Intl.DateTimeFormat-extend-timezonename` stay skipped (see the sweep-area
-  table above).
+- **Unimplemented ECMA-402 pieces** — none remain: the `intl402/` area is
+  fully runnable (3,365/0/0 of 3,365).
 - **`dynamic import` specifier resolution** — `import(specifier)` resolves
   through host hooks (`HostResolveImportedModule`); the test262 harness
   registers the `_FIXTURE` siblings, so fixtures run, but no general
@@ -2090,8 +2088,9 @@ ShadowRealm (64)).
   TypedArray `copyWithin` fixtures above. Use a release build
   (`cargo run --release -p test262 --bin sweep`) — the debug build's deep
   recursion can overflow the stack on heavy fixtures.
-- The `intl402/` area is swept too (3,363 pass / 0 fail / 2 skip of 3,365;
-  the corpus grew by 8 in the 2026-09 pull). The Temporal gate no longer skips a
+- The `intl402/` area is swept too (3,365 pass / 0 fail / 0 skip of 3,365 —
+  the area is fully runnable; the corpus grew by 8 in the 2026-09 pull). The
+  Temporal gate no longer skips a
   `features: [Temporal]` fixture just for living outside the `Temporal/<Type>/`
   namespace, so the ~71 `Intl.DateTimeFormat`/`DurationFormat` fixtures that
   *format* Temporal values now run. That exposed 16 failures, all fixed:
@@ -2103,8 +2102,8 @@ ShadowRealm (64)).
   (`compare-to-temporal`), the chinese/dangi leap-month code + Hebrew month names
   (`compare-to-temporal-lunisolar`), the `ar` `nu` likely-subtags default
   (`temporal-objects-no-time-clip-non-latin-numerals`), and German abbreviated
-  weekdays (`german-weekday-no-year`). The remaining skips are only
-  `Intl.DateTimeFormat-extend-timezonename` (2). The harness prelude also
+  weekdays (`german-weekday-no-year`). No intl402 fixtures are skipped now. The
+  harness prelude also
   now sets `assert._formatIdentityFreeValue`, which `deepEqual.js`'s failure
   formatter calls — without it a failing `deepEqual` reported as "undefined is not
   a function". Anything else that fails the sweep should be triaged into bug /

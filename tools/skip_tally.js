@@ -145,6 +145,7 @@ function classify(file, source) {
     "Intl.DateTimeFormat-dayPeriod",
     "Intl.DateTimeFormat-datetimestyle",
     "Intl.DateTimeFormat-fractionalSecondDigits",
+    "Intl.DateTimeFormat-extend-timezonename",
     "Intl.Collator",
     "Intl.Segmenter",
     "Intl.DurationFormat",
