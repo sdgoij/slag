@@ -364,3 +364,36 @@ not machinery) and `strings` (28.69).
   targets, which is L2 and structural. Note also that `try/completion-values`
   is slower under the JIT than under the interpreter (479.5 vs 406.6 ms) — a
   JIT pessimization worth a separate look.
+- **2026-10-06 — the `JsObject` layout, and `INLINE_FIELDS` 16 -> 8 LANDED
+  (a bounded ~2-7% on creation).** The probe above says the per-create cost is
+  the allocation, and `perf.md` (2026-09-10) already measured the mechanism:
+  a ~16 ns allocation floor plus ~0.125 ns/byte of touched payload, so
+  "only a SMALLER struct reduces it — every 64 B removed is ~8 ns/create".
+  The struct is **472 B**, tight (no padding): `kind` 16, `id` 8,
+  `array_dense`/`typed_array`/`prototype`/`map` 8 each, **`in_fields` 128**,
+  `store_chain_clean` 8, **`properties` 152** (`SmallProps` 144 = 2 inline
+  `(PropertyKey 16, Property 40)` entries + len + the `Vec`),
+  **`property_index` 56** (`RefCell<Option<HashMap>>`), `private_elements` 32,
+  `self_handle`/`function_self` 8 each, `boxed` 16, `generation` 4, four flag
+  bytes. The one lever with no API churn is `in_fields` (the largest field, and
+  pure per-object reservation): **`INLINE_FIELDS` 16 -> 8 removes 64 B from
+  every object in the engine**, at the cost of descriptors at ordinals 8-15
+  spilling to the property vector.
+  **Measured** (min of 5, tag-shaped binaries, isolated 1M-iteration micros):
+  `[]` **1.066x**, `{a:i}` 1.057x, 3-prop literal 1.049x, `[i]` 1.049x,
+  `objects/destructure` 1.039x, 6-prop literal 1.025x, `[i×6]` 1.021x. Corpus
+  rows in isolation show no regression where the wide-object shapes would
+  (`opcost/object_keys` 1.10x faster, `opcost/json_stringify` 1.02x,
+  `objects/spread_assign` 1.04x, `objects/many_objects_read` and
+  `opcost/object_alloc` flat — the first whole-corpus run's apparent 1.26x
+  swings both ways were the documented single-process context noise).
+  **Gates: fmt and clippy clean, workspace 5,635 passed / 0 failed, test262
+  `all` 48,632 / 0 / 1 / 0 / 0 and `intl402` 3,365 / 0 / 0 / 0 / 0 at baseline.**
+  The residual is honest: ~4-7% on creation, not a multiplier, because in a
+  steady-state loop the slots are reused (hot) and the footprint cost is far
+  below the cold-alloc 0.125 ns/byte — the big win here is escape analysis
+  (which is why node is 501x ahead on `destructure`), i.e. L4. The other
+  layout levers (`property_index` 56 -> 16 and `private_elements` 32 -> 16 by
+  boxing, ~-56 B more, ~100 call sites of churn) and a smaller `Property`
+  (40 B -> ~24, which would shrink `properties` and every vector entry) are
+  recorded but not taken.

@@ -148,7 +148,7 @@ const INLINE_PROPS: usize = 2;
 /// cost is the Cells on every `JsObject` of every kind; the field/vector
 /// boundary, the vector-free materialize threshold, and the JIT shape gate
 /// all follow this constant.
-pub const INLINE_FIELDS: usize = 16;
+pub const INLINE_FIELDS: usize = 8;
 
 impl Default for SmallProps {
     fn default() -> Self {
