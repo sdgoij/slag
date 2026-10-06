@@ -217,6 +217,34 @@ const KEY_BINDING: &str = "%key%";
 /// body (the first `has`/`get`/`set` built would answer for all of them).
 static NEXT_SYNTH_SPAN: AtomicU32 = AtomicU32::new(0x8000_0000);
 
+/// The name of an element being decorated: a public property key, or a private
+/// name paired with the class PrivateEnvironment its synthesized access
+/// functions resolve `#name` against.
+pub(crate) enum ElementName<'a> {
+    Public(&'a PropertyKey),
+    Private {
+        atom: crux::string::AtomId,
+        environment: &'a Handle<crate::context::PrivateEnvironment>,
+    },
+}
+
+impl ElementName<'_> {
+    /// The `context.name` value: the property key, or the `#name` description a
+    /// private element exposes (proposal: private elements).
+    fn context_value(&self) -> Value {
+        match self {
+            ElementName::Public(key) => key_value(key),
+            ElementName::Private { atom, .. } => Value::String(Handle::new(JsString::from_utf8(
+                &format!("#{}", crux::lookup(*atom).to_string_lossy()),
+            ))),
+        }
+    }
+
+    fn is_private(&self) -> bool {
+        matches!(self, ElementName::Private { .. })
+    }
+}
+
 /// A property key as a language value (an `access` function closes over it).
 fn key_value(key: &PropertyKey) -> Value {
     match key {
@@ -225,22 +253,26 @@ fn key_value(key: &PropertyKey) -> Value {
     }
 }
 
-/// Synthesize a public `access` function — `has(obj)`, `get(obj)`, or
-/// `set(obj, v)` — as an ordinary closure over the property key, so the
-/// operation runs the full `[[Get]]`/`[[Set]]`/`[[HasProperty]]` protocol
-/// (getters, proxies, and all) rather than a raw lookup.
+/// Synthesize an `access` function — `has(obj)`, `get(obj)`, or `set(obj, v)`
+/// — as an ordinary closure, so the operation runs the full `[[Get]]`/`[[Set]]`/
+/// `[[HasProperty]]` protocol (getters, proxies, and all) rather than a raw
+/// lookup. A public element closes over the property key; a private one indexes
+/// the private name directly and carries the class PrivateEnvironment.
 fn synthesize_access_function(
     agent: &mut Agent,
-    key: &PropertyKey,
+    name: &ElementName,
     op: AccessOp,
 ) -> Result<Value, JsError> {
     let span_base = NEXT_SYNTH_SPAN.fetch_add(2, Ordering::Relaxed);
     let span = crux::Span::new(span_base, span_base + 1);
     let env = new_declarative_environment(Some(agent.running_context()?.lexical_environment));
+
     let key_atom = intern_utf8(KEY_BINDING);
-    let key_name = crux::lookup(key_atom);
-    env.create_immutable_binding(&key_name, false)?;
-    env.initialize_binding(&key_name, key_value(key))?;
+    if let ElementName::Public(key) = name {
+        let key_name = crux::lookup(key_atom);
+        env.create_immutable_binding(&key_name, false)?;
+        env.initialize_binding(&key_name, key_value(key))?;
+    }
 
     let obj_atom = intern_utf8("obj");
     let v_atom = intern_utf8("v");
@@ -252,11 +284,31 @@ fn synthesize_access_function(
         span,
         kind: ExprKind::Member(MemberExpr {
             object: Box::new(ident(obj_atom)),
-            property: MemberProperty::Computed(Box::new(ident(key_atom))),
+            property: match name {
+                ElementName::Public(_) => MemberProperty::Computed(Box::new(ident(key_atom))),
+                ElementName::Private { atom, .. } => MemberProperty::Private(*atom),
+            },
             property_token: None,
             optional: false,
             span,
         }),
+    };
+    let has_test = || match name {
+        ElementName::Public(_) => Expr {
+            span,
+            kind: ExprKind::Binary {
+                op: BinaryOp::In,
+                left: Box::new(ident(key_atom)),
+                right: Box::new(ident(obj_atom)),
+            },
+        },
+        ElementName::Private { atom, .. } => Expr {
+            span,
+            kind: ExprKind::PrivateIn {
+                name: *atom,
+                object: Box::new(ident(obj_atom)),
+            },
+        },
     };
     let param = |atom| BindingElement {
         pattern: BindingPattern::Ident(atom),
@@ -269,14 +321,7 @@ fn synthesize_access_function(
             vec![param(obj_atom)],
             Stmt {
                 span,
-                kind: StmtKind::Return(Some(Expr {
-                    span,
-                    kind: ExprKind::Binary {
-                        op: BinaryOp::In,
-                        left: Box::new(ident(key_atom)),
-                        right: Box::new(ident(obj_atom)),
-                    },
-                })),
+                kind: StmtKind::Return(Some(has_test())),
             },
         ),
         AccessOp::Get => (
@@ -313,7 +358,11 @@ fn synthesize_access_function(
         is_generator: false,
         statement_position: false,
     };
-    crate::function::instantiate_method(agent, &function, env, true)
+    let closure = crate::function::instantiate_method(agent, &function, env, true)?;
+    if let ElementName::Private { environment, .. } = name {
+        crate::class::set_private_environment(agent, &closure, environment)?;
+    }
+    Ok(closure)
 }
 
 /// Decorate a public method/getter/setter (spec: DecorateClassElement): call
@@ -325,7 +374,7 @@ pub(crate) fn decorate_element(
     decorators: &[Expr],
     strict: bool,
     kind: ElementKind,
-    key: &PropertyKey,
+    name: &ElementName,
     is_static: bool,
     value: Value,
 ) -> Result<(Value, Vec<Value>), JsError> {
@@ -340,7 +389,7 @@ pub(crate) fn decorate_element(
             ));
         }
         let finished = Rc::new(Cell::new(false));
-        let context = element_context(agent, kind, key, is_static, &initializers, &finished)?;
+        let context = element_context(agent, kind, name, is_static, &initializers, &finished)?;
         let result =
             crate::function::call(agent, decorator, Value::Undefined, &[current, context])?;
         finished.set(true);
@@ -368,7 +417,7 @@ pub(crate) fn decorate_field(
     agent: &mut Agent,
     decorators: &[Expr],
     strict: bool,
-    key: &PropertyKey,
+    name: &ElementName,
     is_static: bool,
 ) -> Result<(Vec<Value>, Vec<Value>), JsError> {
     let decorators = evaluate_decorators(agent, decorators, strict)?;
@@ -385,7 +434,7 @@ pub(crate) fn decorate_field(
         let context = element_context(
             agent,
             ElementKind::Field,
-            key,
+            name,
             is_static,
             &initializers,
             &finished,
@@ -413,11 +462,11 @@ pub(crate) fn decorate_field(
 }
 
 /// An element decorator's context object: `{ kind, name, static, private,
-/// access, addInitializer }` (public elements, so `private` is false).
+/// access, addInitializer }`.
 fn element_context(
     agent: &mut Agent,
     kind: ElementKind,
-    key: &PropertyKey,
+    name: &ElementName,
     is_static: bool,
     initializers: &InitializerList,
     finished: &Rc<Cell<bool>>,
@@ -427,26 +476,27 @@ fn element_context(
         &PropertyKey::from_utf8("kind"),
         Value::String(Handle::new(JsString::from_utf8(kind.as_str()))),
     )?;
-    object.create_data_property_or_throw_key(&PropertyKey::from_utf8("name"), key_value(key))?;
+    object
+        .create_data_property_or_throw_key(&PropertyKey::from_utf8("name"), name.context_value())?;
     object.create_data_property_or_throw_key(
         &PropertyKey::from_utf8("static"),
         Value::Boolean(is_static),
     )?;
     object.create_data_property_or_throw_key(
         &PropertyKey::from_utf8("private"),
-        Value::Boolean(false),
+        Value::Boolean(name.is_private()),
     )?;
 
     let access = JsObject::ordinary_object_create(object_prototype(agent)?);
-    let has = synthesize_access_function(agent, key, AccessOp::Has)?;
+    let has = synthesize_access_function(agent, name, AccessOp::Has)?;
     access.create_data_property_or_throw_key(&PropertyKey::from_utf8("has"), has)?;
     let (wants_get, wants_set) = kind.access_members();
     if wants_get {
-        let get = synthesize_access_function(agent, key, AccessOp::Get)?;
+        let get = synthesize_access_function(agent, name, AccessOp::Get)?;
         access.create_data_property_or_throw_key(&PropertyKey::from_utf8("get"), get)?;
     }
     if wants_set {
-        let set = synthesize_access_function(agent, key, AccessOp::Set)?;
+        let set = synthesize_access_function(agent, name, AccessOp::Set)?;
         access.create_data_property_or_throw_key(&PropertyKey::from_utf8("set"), set)?;
     }
     object.create_data_property_or_throw_key(
@@ -653,5 +703,65 @@ mod tests {
         )
         .unwrap();
         assert_eq!(result, string("TypeError"));
+    }
+
+    #[test]
+    fn private_element_context_uses_the_hash_name() {
+        let result = run(
+            "let seen = [];\n\
+             function d(value, context) { seen.push(context.kind + ':' + context.name + ':' + context.private + ':' + Object.keys(context.access).sort().join(',')); return value; }\n\
+             class C { @d #m() {} @d #f; }\n\
+             seen.join(' ');",
+        )
+        .unwrap();
+        assert_eq!(
+            result,
+            string("method:#m:true:get,has field:#f:true:get,has,set")
+        );
+    }
+
+    #[test]
+    fn private_field_access_reads_and_writes() {
+        let result = run("let acc;\n\
+             function d(value, context) { acc = context.access; return value; }\n\
+             class C { @d #f = 41; get() { return this.#f; } }\n\
+             let c = new C();\n\
+             acc.set(c, 99);\n\
+             acc.get(c) + ',' + c.get() + ',' + acc.has(c);")
+        .unwrap();
+        assert_eq!(result, string("99,99,true"));
+    }
+
+    #[test]
+    fn private_method_access_checks_the_brand_and_reads_the_method() {
+        let result = run("let acc;\n\
+             function d(value, context) { acc = context.access; return value; }\n\
+             class C { @d #m() { return 'M'; } call() { return this.#m(); } }\n\
+             let c = new C();\n\
+             acc.has(c) + ',' + acc.has({}) + ',' + acc.get(c).call(c);")
+        .unwrap();
+        assert_eq!(result, string("true,false,M"));
+    }
+
+    #[test]
+    fn private_field_decorator_value_initializer_transforms() {
+        let result = run(
+            "function d(value, context) { return function (init) { return init * 2; }; }\n\
+             class C { @d #f = 21; get() { return this.#f; } }\n\
+             new C().get();",
+        )
+        .unwrap();
+        assert_eq!(result, Value::Number(42.0));
+    }
+
+    #[test]
+    fn private_method_decorator_return_replaces_the_method() {
+        let result = run(
+            "function d(value, context) { return function () { return 'W'; }; }\n\
+             class C { @d #m() { return 'M'; } call() { return this.#m(); } }\n\
+             new C().call();",
+        )
+        .unwrap();
+        assert_eq!(result, string("W"));
     }
 }

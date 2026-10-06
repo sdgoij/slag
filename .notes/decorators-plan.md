@@ -89,13 +89,23 @@ initializers run before the static fields. Private elements and auto-accessors
 stay unevaluated (S3). Fifteen unit tests in the module; main 48632/0/1 and
 staging 77/0/1406 unchanged.
 
-## S3 — auto-accessor + private
+## S3 — private elements (done) + auto-accessors (next)
 
-`accessor` desugars in the parser to a private-storage field + public get/set
-sharing a span; the decorator list currently rides the synthesized **getter**
-(the first publicly visible element). S3 must reconstruct the trio as one
-`kind:"accessor"` decoration (`value = {get, set}`, `access = {has,get,set}`)
-and implement private elements (`name` is the `"#name"` string, `private:true`).
+**S3a done — private elements.** `ElementName` generalizes an element's name to
+a public key or a private name + the class PrivateEnvironment; the synthesized
+`access` closures index `#name` (`obj.#name`, `#name in obj`, `obj.#name = v`)
+and carry that environment, so `has` is the brand check and `get`/`set` run the
+private element. `context.name` is the `"#name"` description and `private` is
+true. Private method/get/set/field decoration (including field value
+initializers) all work. Five more unit tests (20 total); sweeps unchanged.
+
+**S3b — auto-accessors (next).** `accessor x = 1` desugars in the parser to a
+storage `Field` (`%auto-accessorN%`) + `Get` + `Set` sharing one span, with the
+decorator list riding the getter. Decorating it must present ONE `kind:"accessor"`
+context (`value = {get, set}`, `access = {has,get,set}`, and an `init` return
+that transforms the backing value), not separate getter/setter decorations. The
+open design choice is detection (recognize the trio by shared span +
+`%auto-accessor%` storage) versus adding an AST `Accessor` element.
 
 ## S4 — hand-written tests + notes
 

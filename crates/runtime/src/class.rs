@@ -469,16 +469,16 @@ fn build_class(
                 set_private_environment(agent, &closure, &class_private_env)?;
                 make_method(agent, &closure, home)?;
                 set_function_name(&closure, &element_name_text(name, key.as_ref()), None)?;
-                if private_id.is_none()
-                    && !decorators.is_empty()
-                    && let Some(key) = &key
+                if !decorators.is_empty()
+                    && let Some(element_name) =
+                        decorator_element_name(name, &key, &class_private_env)
                 {
                     let (decorated, initializers) = crate::decorators::decorate_element(
                         agent,
                         decorators,
                         strict,
                         crate::decorators::ElementKind::Method,
-                        key,
+                        &element_name,
                         is_static,
                         closure,
                     )?;
@@ -526,16 +526,16 @@ fn build_class(
                 set_private_environment(agent, &getter, &class_private_env)?;
                 make_method(agent, &getter, home)?;
                 set_function_name(&getter, &element_name_text(name, key.as_ref()), Some("get"))?;
-                if private_id.is_none()
-                    && !decorators.is_empty()
-                    && let Some(key) = &key
+                if !decorators.is_empty()
+                    && let Some(element_name) =
+                        decorator_element_name(name, &key, &class_private_env)
                 {
                     let (decorated, initializers) = crate::decorators::decorate_element(
                         agent,
                         decorators,
                         strict,
                         crate::decorators::ElementKind::Getter,
-                        key,
+                        &element_name,
                         is_static,
                         getter,
                     )?;
@@ -592,16 +592,16 @@ fn build_class(
                 set_private_environment(agent, &setter, &class_private_env)?;
                 make_method(agent, &setter, home)?;
                 set_function_name(&setter, &element_name_text(name, key.as_ref()), Some("set"))?;
-                if private_id.is_none()
-                    && !decorators.is_empty()
-                    && let Some(key) = &key
+                if !decorators.is_empty()
+                    && let Some(element_name) =
+                        decorator_element_name(name, &key, &class_private_env)
                 {
                     let (decorated, initializers) = crate::decorators::decorate_element(
                         agent,
                         decorators,
                         strict,
                         crate::decorators::ElementKind::Setter,
-                        key,
+                        &element_name,
                         is_static,
                         setter,
                     )?;
@@ -639,11 +639,17 @@ fn build_class(
                 let (private_id, key) =
                     element_key_with(agent, name, strict, precomputed_keys, computed_key_index)?;
                 record_computed_key(&mut computed_keys, element, &key);
-                let (decorator_inits, extra_inits) = if private_id.is_none()
-                    && !decorators.is_empty()
-                    && let Some(key) = &key
+                let (decorator_inits, extra_inits) = if !decorators.is_empty()
+                    && let Some(element_name) =
+                        decorator_element_name(name, &key, &class_private_env)
                 {
-                    crate::decorators::decorate_field(agent, decorators, strict, key, is_static)?
+                    crate::decorators::decorate_field(
+                        agent,
+                        decorators,
+                        strict,
+                        &element_name,
+                        is_static,
+                    )?
                 } else {
                     (Vec::new(), Vec::new())
                 };
@@ -660,8 +666,8 @@ fn build_class(
                                 crux::lookup(*atom).to_string_lossy()
                             )),
                             init: init.clone(),
-                            decorator_inits: Vec::new(),
-                            extra_inits: Vec::new(),
+                            decorator_inits,
+                            extra_inits,
                         });
                     } else {
                         fields.push(crate::function::ClassField {
@@ -669,8 +675,8 @@ fn build_class(
                             private_name: Some(name_id),
                             init: init.clone(),
                             environment: class_env,
-                            decorator_inits: Vec::new(),
-                            extra_inits: Vec::new(),
+                            decorator_inits,
+                            extra_inits,
                         });
                     }
                 } else if is_static {
@@ -875,6 +881,23 @@ fn element_is_static(element: &ClassElement) -> bool {
     }
 }
 
+/// The element name a decorator sees: a public key, or a private name paired
+/// with the class PrivateEnvironment (so the synthesized access can spell
+/// `#name`).
+fn decorator_element_name<'a>(
+    name: &ClassElementName,
+    key: &'a Option<PropertyKey>,
+    private_env: &'a Handle<crate::context::PrivateEnvironment>,
+) -> Option<crate::decorators::ElementName<'a>> {
+    match name {
+        ClassElementName::Private(atom) => Some(crate::decorators::ElementName::Private {
+            atom: *atom,
+            environment: private_env,
+        }),
+        ClassElementName::Property(_) => key.as_ref().map(crate::decorators::ElementName::Public),
+    }
+}
+
 /// Route a decorated element's `addInitializer` callbacks to the instance or
 /// the static list (proposal: initializers).
 fn route_decorator_initializers(
@@ -1004,7 +1027,7 @@ pub(crate) fn private_element_name(element: &ClassElement) -> Option<crux::strin
 
 /// Attach the class PrivateEnvironment to a function's record so its body
 /// can resolve `#name` (spec 10.2.1 [[PrivateEnvironment]]).
-fn set_private_environment(
+pub(crate) fn set_private_environment(
     agent: &mut Agent,
     function: &Value,
     private_env: &crux::handle::Handle<crate::context::PrivateEnvironment>,
