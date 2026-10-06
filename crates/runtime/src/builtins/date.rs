@@ -178,18 +178,18 @@ fn hour_from_time(time: f64) -> i64 {
     ((time / MS_PER_HOUR).floor() as i64).rem_euclid(24)
 }
 
-/// spec 21.4.1.15 MinFromTime.
-fn min_from_time(time: f64) -> i64 {
+/// spec 21.4.1.15 MinuteFromTime.
+fn minute_from_time(time: f64) -> i64 {
     ((time / MS_PER_MINUTE).floor() as i64).rem_euclid(60)
 }
 
-/// spec 21.4.1.16 SecFromTime.
-fn sec_from_time(time: f64) -> i64 {
+/// spec 21.4.1.16 SecondFromTime.
+fn second_from_time(time: f64) -> i64 {
     ((time / MS_PER_SECOND).floor() as i64).rem_euclid(60)
 }
 
-/// spec 21.4.1.17 msFromTime.
-fn ms_from_time(time: f64) -> i64 {
+/// spec 21.4.1.17 MillisecondFromTime.
+fn millisecond_from_time(time: f64) -> i64 {
     time.rem_euclid(1000.0) as i64
 }
 
@@ -646,8 +646,8 @@ fn format_time(t: f64) -> String {
         date_from_time(local) as i64,
         format_year(year_from_time(local)),
         hour_from_time(local),
-        min_from_time(local),
-        sec_from_time(local)
+        minute_from_time(local),
+        second_from_time(local)
     )
 }
 
@@ -663,8 +663,8 @@ fn format_utc_string(t: f64) -> String {
         MONTH_NAMES[month_from_time(t) as usize],
         format_year(year_from_time(t)),
         hour_from_time(t),
-        min_from_time(t),
-        sec_from_time(t)
+        minute_from_time(t),
+        second_from_time(t)
     )
 }
 
@@ -692,8 +692,8 @@ fn format_time_string(t: f64) -> String {
     format!(
         "{:02}:{:02}:{:02} GMT+0000",
         hour_from_time(local),
-        min_from_time(local),
-        sec_from_time(local)
+        minute_from_time(local),
+        second_from_time(local)
     )
 }
 
@@ -713,9 +713,9 @@ pub(crate) fn to_iso_string(t: f64) -> Result<String, JsError> {
         month_from_time(t) + 1,
         date_from_time(t) as i64,
         hour_from_time(t),
-        min_from_time(t),
-        sec_from_time(t),
-        ms_from_time(t)
+        minute_from_time(t),
+        second_from_time(t),
+        millisecond_from_time(t)
     ))
 }
 
@@ -789,9 +789,9 @@ fn set_components(
         month_from_time(base) as f64,
         date_from_time(base),
         hour_from_time(base) as f64,
-        min_from_time(base) as f64,
-        sec_from_time(base) as f64,
-        ms_from_time(base) as f64,
+        minute_from_time(base) as f64,
+        second_from_time(base) as f64,
+        millisecond_from_time(base) as f64,
     ];
     for i in 0..7 {
         if present[i] && (i == first || args.get(i - first).is_some()) {
@@ -1660,15 +1660,15 @@ fn hour_f(t: f64) -> f64 {
 }
 
 fn min_f(t: f64) -> f64 {
-    min_from_time(t) as f64
+    minute_from_time(t) as f64
 }
 
 fn sec_f(t: f64) -> f64 {
-    sec_from_time(t) as f64
+    second_from_time(t) as f64
 }
 
 fn ms_f(t: f64) -> f64 {
-    ms_from_time(t) as f64
+    millisecond_from_time(t) as f64
 }
 
 fn get_year_f(t: f64) -> f64 {
