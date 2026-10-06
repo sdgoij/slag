@@ -109,11 +109,12 @@ not machinery) and `strings` (28.69).
   receiver now writes `in_fields[slot]` inline instead of calling
   `SetMemberSlot`. The deferred store story is CLOSED (see §6). The call-funnel
   slice (`LeafCallFill` inline) measured **null** and was reverted (see §6).
-  **Next target: `GetMemberName`'s prototype-chain read** via a compiled
-  `member_chain_cells` probe — the corpus's #1 helper (102M) and the same
-  "delete the helper by giving the compiled path the cell" shape as the landed
-  slice. Remaining candidates: `LoadContext` (an env cell), the `strings`
-  `ConcatStrings`/`BinarySlow` pair, and `ApplyArgsFill`.
+  **The two "inline the read helper" targets are now both closed:** the
+  `LeafCallFill` inline (this program) and the inline prototype-chain probe
+  (`jit-report.md` row 46's follow-up, measured 2026-09-01 and reverted —
+  ~5-10% *slower* than the helper, same reason). So the remaining levers are
+  **L2 (allocation/frames)** for the `strings`/`language` amplified rows and
+  **L4 (the front half)**, not more inline coverage — see §6.
 
 ## 6. Status log
 
@@ -267,12 +268,21 @@ not machinery) and `strings` (28.69).
   remove is a few ns of a 26-45 ns call. A win has to REMOVE an operation, not
   re-implement it — which is exactly what the landed store slice did (it
   deleted `SetMemberSlot` by giving the compiled path the *cell* the helper
-  was rebuilding). Both remaining top helpers need that same shape of fix
-  rather than an inline: `GetMemberName` (102M corpus-wide; the compiled read
-  inlines an own data property but every prototype-chain method read pays the
-  helper) wants the `member_chain_cells` probe the compiler does not yet emit,
-  and `LoadContext` (28.9M in `calls`) wants an env cell. **Next target chosen:
-  `GetMemberName`'s chain read via a compiled chain-cell probe.** (This slice's
-  revert left one keeper: `compiler.rs` now surfaces a Cranelift codegen error
-  under `JIT_DUMP_CLIF` instead of swallowing it into the `None` fallback —
-  which is how the emit bug above was found.)
+  was rebuilding). `GetMemberName` (102M corpus-wide) and `LoadContext` (28.9M
+  in `calls`) looked like the same shape of fix — a chain-cell probe and an env
+  cell — but **`GetMemberName`'s chain read is already FALSIFIED**: `jit-report.md`
+  row 46's follow-up (2026-09-01) built exactly that inline probe and measured
+  it ~5-10% SLOWER than the helper, with the trap written down ("to win, a probe
+  must CUT the per-read validation — the link-generation walk is the
+  irreducible ~4 loads, the cell fields ~6-9 more — not re-implement it"). So
+  the lesson now has two independent confirmations (this slice and the
+  2026-09-01 chain probe): **in this engine, duplicating a lean helper's
+  validation/loop inline does not pay — the extern-call overhead is a few ns
+  and LLVM schedules the helper's 13-16 L1 loads better than raw Cranelift.**
+  `LoadContext` is the untried one (an env cell), and it is worth it only if
+  the env chain can be made machine-addressable so the cell DELETES the walk
+  rather than mirroring it. The rest of the budget belongs to L2
+  (allocation/frames) and L4 — see §5. (This slice's revert left one keeper:
+  `compiler.rs` now surfaces a Cranelift codegen error under `JIT_DUMP_CLIF`
+  instead of swallowing it into the `None` fallback — which is how the emit's
+  dominance bug above was found.)
