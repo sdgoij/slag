@@ -6,7 +6,7 @@
 
 Slag is a from-scratch, spec-faithful JavaScript engine in Rust, implementing the ECMAScript® 2026 Language Specification (17th edition). 
 
-The full pinned `test262` corpus is the regression net: **51,669 pass / 0 fail / 0 crash / 0 hang** across 
+The full pinned `test262` corpus is the regression net: **51,997 pass / 0 fail / 0 crash / 0 hang** across 
 the `language`, `built-ins`, Annex B and `intl402` sweep areas. That includes **proper tail calls** the 
 **Intl**  surface (ECMA-402 Cuts 1–8: NumberFormat, Locale, PluralRules, RelativeTimeFormat, ListFormat, 
 DisplayNames, DateTimeFormat, Collator, Segmenter, DurationFormat), and **Temporal**. 
@@ -19,15 +19,15 @@ embedding API, and drop-in JavaScriptCore C-API bindings.
 - **Spec-faithful** — written chapter-by-chapter against the vendored
   `spec.html`; abstract operations keep the spec's names, ordering, and
   edge cases so conformance bugs are easy to diff.
-- **Conformant** — 51,669 passing fixtures, **0 failures / 0 crashes /
-  0 hangs** across 51,979 `test262` fixtures (runnable-only; see
+- **Conformant** — 51,997 passing fixtures, **0 failures / 0 crashes /
+  0 hangs** across 51,998 `test262` fixtures (runnable-only; see
   `.notes/conformance.md`). Proper tail calls: 34/34 `tco-*`. Workspace
-  tests: 4,887 pass / 0 fail.
+  tests: 5,633 pass / 0 fail.
 - **Complete modern feature surface** — modules (source-text module
   machinery, top-level await, dynamic import), async/await, generators,
   Proxy/Reflect, TypedArrays, SharedArrayBuffer/Atomics with worker
-  threads, full Intl (ECMA-402 Cuts 1–8), and Temporal (the intl402×
-  Temporal integration, Cut 9, is in flight).
+  threads, full Intl (ECMA-402 Cuts 1–8) including its Temporal integration
+  (Cut 9), and Temporal.
 - **Full WebAssembly runtime + JS API** — a from-scratch engine
   (`crates/wasm`) plus the document/js-api surface, validated against the
   pinned `waspec` corpus: **64,594 core checks / 0 fail** and **1,001
@@ -258,26 +258,24 @@ own); current result (release build, this machine, 15s deadlines):
 
 | Area | Total | Pass | Fail | Skip | Hang | Pass % of runnable |
 |---|---|---|---|---|---|---|
-| language | 23,724 | 23,721 | 0 | 3 | 0 | 100.0% |
-| built-ins | 23,812 | 23,657 | 0 | 155 | 0 | 100.0% |
+| language | 23,726 | 23,726 | 0 | 0 | 0 | 100.0% |
+| built-ins | 23,821 | 23,820 | 0 | 1 | 0 | 100.0% |
 | annexB | 1,086 | 1,086 | 0 | 0 | 0 | 100.0% |
-| intl402 | 3,357 | 3,205 | 0 | 152 | 0 | 100.0% |
-| **Total** | **51,979** | **51,669** | **0** | **310** | **0** | **100.0%** |
+| intl402 | 3,365 | 3,365 | 0 | 0 | 0 | 100.0% |
+| **Total** | **51,998** | **51,997** | **0** | **1** | **0** | **100.0%** |
 
-The skips are the out-of-scope `await-dictionary` (89) and `ShadowRealm`
-(64) proposal fixtures, 152 `intl402` fixtures tagged with `Intl.*` features
-whose plan cuts have not landed (`.notes/intl-plan.md`), one stale Temporal
-fixture, and 4 fixtures this Windows checkout cannot run: the submodule is
-checked out CRLF by `core.autocrlf`, so their byte-exact assertions read
-`\r\n` where the corpus asserts `\n` (the skip is conditional — a clean LF
-checkout runs them). The 458 hangs this table used to report are closed: the
-RegExp property-escape cluster, the dense-elements and typed-array work, and
-the Temporal `since`/`until` day-difference loop (one iteration per day over
-edge-of-range dates, now a closed-form epoch-day difference) all landed
-since, and the last one — `intl402`'s quadratic walk over every pair of the
-444 supported time zones — went from 18.7s to 4.4s when the intrinsics probe
-stopped encoding a UTF-16 string per name lookup (see Performance). The full
-methodology and triage live in `.notes/conformance.md`.
+The one remaining skip is a stale Temporal fixture (`+275760-09-12T00:00:01Z`
+`relativeTo` is out of range per the current spec). Every other gate this
+table used to carry has closed: `await-dictionary` (89) and `ShadowRealm` (64)
+landed and their gates were removed, the 152 `intl402` proposal skips landed
+with the `Intl.Locale-info` and canonical-time-zone work, and the 4
+CRLF-affected fixtures run under a clean LF checkout. The 458 hangs this table
+used to report are closed too: the RegExp property-escape cluster, the
+dense-elements and typed-array work, and the Temporal `since`/`until`
+day-difference loop all landed, and the last one — `intl402`'s quadratic walk
+over every pair of the 444 supported time zones — went from 18.7s to 4.4s when
+the intrinsics probe stopped encoding a UTF-16 string per name lookup (see
+Performance). The full methodology and triage live in `.notes/conformance.md`.
 
 ## WebAssembly
 
@@ -378,29 +376,29 @@ both paths computed the same value):
 
 | Body | Interpreter | JIT | Ratio |
 |---|---|---|---|
-| `wide leaf call` | 25.85 ms | 1.714 ms | 0.07x |
-| `arithmetic` | 6.97 ms | 0.608 ms | 0.09x |
-| `bare loop` | 6.35 ms | 0.604 ms | 0.10x |
-| `property read` | 7.67 ms | 0.758 ms | 0.10x |
-| `global read` | 10.33 ms | 1.377 ms | 0.13x |
-| `function calls` | 6.06 ms | 0.833 ms | 0.14x |
-| `typed-array length` | 11.91 ms | 1.910 ms | 0.16x |
-| `string concat` | 1.12 ms | 0.185 ms | 0.17x |
-| `buildString shape` | 71.81 ms | 13.657 ms | 0.19x |
-| `buildString full` | 63.48 ms | 16.275 ms | 0.26x |
-| `apply leaf call` | 20.16 ms | 6.629 ms | 0.33x |
-| `typed-array write` | 26.64 ms | 12.530 ms | 0.47x |
-| `builtin call` | 4.74 ms | 2.282 ms | 0.48x |
-| `compound assign` | 3.14 ms | 1.543 ms | 0.49x |
-| `non-leaf call` | 17.93 ms | 12.413 ms | 0.69x |
+| `arithmetic` | 7.90 ms | 0.671 ms | 0.08x |
+| `wide leaf call` | 23.02 ms | 2.018 ms | 0.09x |
+| `bare loop` | 7.39 ms | 0.772 ms | 0.10x |
+| `property read` | 8.23 ms | 0.808 ms | 0.10x |
+| `global read` | 10.47 ms | 1.512 ms | 0.14x |
+| `typed-array read` | 96.48 ms | 14.522 ms | 0.15x |
+| `builtin call` | 4.60 ms | 0.748 ms | 0.16x |
+| `string concat` | 1.22 ms | 0.205 ms | 0.17x |
+| `function calls` | 5.97 ms | 1.006 ms | 0.17x |
+| `typed-array length` | 11.90 ms | 2.220 ms | 0.19x |
+| `buildString shape` | 79.47 ms | 15.672 ms | 0.20x |
+| `non-leaf call` | 28.11 ms | 6.394 ms | 0.23x |
+| `typed-array write` | 28.11 ms | 6.518 ms | 0.23x |
+| `buildString full` | 68.66 ms | 18.873 ms | 0.27x |
+| `apply leaf call` | 20.59 ms | 7.318 ms | 0.36x |
+| `compound assign` | 3.47 ms | 1.758 ms | 0.51x |
 
-`builtin call` and `non-leaf call` are the two rows the pooled-`Vm` and
-builtin-verdict work added; every other call row's callee is a certified leaf,
-which the JIT inlines. Neither of these can inline — a body that contains a
-call is not a leaf, and a crux-native builtin is not a JS leaf — so both engines
-run the general call path there and the ratio is set by that machinery, not by
-code generation. `.notes/perf.md` has the per-shape probe and what each row
-moved.
+`builtin call` and `non-leaf call` are the two rows that cannot inline — a body
+that contains a call is not a leaf, and a crux-native builtin is not a JS leaf —
+so both engines run the general call path there and the ratio is set by that
+machinery, not by code generation. `typed-array read` is the one row this suite
+gained over `v0.1.0-preview.2`; the rest of the set is unchanged.
+`.notes/perf.md` has the per-shape probe and what each row moved.
 
 One row needs a caveat: `wide leaf call`'s interpreter column is the suite's
 noisiest (±20% run to run), and it is the single row the pinned release profile
@@ -417,43 +415,44 @@ Gap = Slag ms / V8 ms, so > 1 means V8 was faster:
 
 | Family | Workloads | JIT gap | Interpreter gap |
 |---|---|---|---|
-| arrays | 6 | 30.72x | 5.83x |
-| builtins | 5 | 15.06x | 5.98x |
-| calls | 6 | 22.83x | 4.80x |
-| control | 5 | 67.99x | 6.32x |
-| globals | 4 | 2.07x | 0.83x |
-| language | 3 | 10.56x | 7.29x |
-| objects | 7 | 48.59x | 3.11x |
-| strings | 5 | 25.44x | 6.05x |
-| **All** | **41** | **30.34x** | **4.94x** |
+| arrays | 6 | 18.74x | 4.23x |
+| builtins | 5 | 10.60x | 5.07x |
+| calls | 6 | 13.02x | 5.63x |
+| control | 5 | 20.17x | 5.66x |
+| globals | 4 | 2.16x | 0.72x |
+| language | 3 | 14.39x | 10.26x |
+| objects | 7 | 87.57x | 3.22x |
+| opcost | 36 | 24.20x | 4.81x |
+| strings | 5 | 28.69x | 21.75x |
+| **All** | **77** | **26.28x** | **5.86x** |
 
-A sample of the per-workload rows (the command above prints all 41), ms per
+A sample of the per-workload rows (the command above prints all 77), ms per
 `bench()` call:
 
 | Workload | Slag JIT | Slag interp | V8 JIT | V8 `--jitless` | JIT gap | Interp gap |
 |---|---|---|---|---|---|---|
-| `arrays/for_of_dense.js` | 34.8 | 57.0 | 2.0 | 62.1 | 17.39x | 0.92x |
-| `arrays/typed_array.js` | 92.5 | 188.8 | 1.2 | 48.2 | 78.96x | 3.92x |
-| `builtins/json_roundtrip.js` | 77.4 | 83.9 | 17.9 | 15.7 | 4.33x | 5.33x |
-| `builtins/math_intrinsics.js` | 48.1 | 72.1 | 153.8 | 187.9 | 0.31x | 0.38x |
-| `calls/direct_leaf.js` | 10.3 | 85.2 | 1.1 | 37.9 | 9.02x | 2.25x |
-| `calls/recursive_fib.js` | 281.5 | 371.2 | 7.4 | 34.7 | 37.80x | 10.70x |
-| `control/generator_loop.js` | 79.6 | 89.4 | 2.4 | 9.4 | 33.18x | 9.49x |
-| `globals/declarative_read.js` | 2.5 | 18.2 | 0.6 | 12.6 | 4.09x | 1.45x |
-| `globals/hoisted_local.js` | 2.5 | 17.8 | 0.6 | 11.8 | 4.11x | 1.51x |
-| `globals/nested_read.js` | 2.5 | 18.3 | 88.3 | 104.1 | 0.03x | 0.18x |
-| `globals/object_read.js` | 2.4 | 18.1 | 83.3 | 97.5 | 0.03x | 0.19x |
-| `objects/destructure.js` | 191.7 | 251.3 | 0.8 | 48.8 | 246.63x | 5.16x |
-| `objects/own_read.js` | 3.0 | 32.7 | 1.3 | 49.1 | 2.35x | 0.67x |
-| `objects/warm_store.js` | 50.3 | 105.1 | 2.4 | 52.8 | 21.23x | 1.99x |
-| `strings/char_ops.js` | 24.0 | 28.6 | 0.4 | 5.6 | 64.32x | 5.11x |
+| `arrays/for_of_dense.js` | 8.4 | 59.4 | 1.9 | 70.0 | 4.34x | 0.85x |
+| `arrays/typed_array.js` | 34.1 | 201.1 | 1.2 | 42.4 | 29.02x | 4.74x |
+| `builtins/json_roundtrip.js` | 73.1 | 71.5 | 13.6 | 17.2 | 5.37x | 4.15x |
+| `builtins/math_intrinsics.js` | 11.3 | 68.8 | 170.5 | 200.9 | 0.07x | 0.34x |
+| `calls/direct_leaf.js` | 13.4 | 77.9 | 1.2 | 40.2 | 10.75x | 1.94x |
+| `calls/recursive_fib.js` | 54.9 | 574.8 | 7.8 | 37.1 | 7.00x | 15.48x |
+| `control/generator_loop.js` | 126.2 | 140.7 | 2.5 | 10.4 | 50.17x | 13.57x |
+| `globals/declarative_read.js` | 2.6 | 17.1 | 0.6 | 13.3 | 4.22x | 1.28x |
+| `globals/hoisted_local.js` | 2.7 | 17.0 | 0.6 | 13.1 | 4.35x | 1.30x |
+| `globals/nested_read.js` | 2.8 | 17.3 | 103.2 | 115.3 | 0.03x | 0.15x |
+| `globals/object_read.js` | 2.8 | 18.0 | 94.2 | 106.9 | 0.03x | 0.17x |
+| `objects/destructure.js` | 440.5 | 305.6 | 0.8 | 54.0 | 526.15x | 5.66x |
+| `objects/own_read.js` | 3.1 | 32.5 | 1.4 | 52.8 | 2.25x | 0.62x |
+| `objects/warm_store.js` | 74.9 | 111.3 | 2.7 | 57.4 | 28.02x | 1.94x |
+| `strings/char_ops.js` | 12.8 | 24.3 | 0.4 | 5.8 | 30.22x | 4.17x |
 
 The `globals` family is the one family that is a controlled experiment rather
 than a workload: the same loop reading the same value as a top-level `const`
 (`declarative_read`), hoisted into a local first (`hoisted_local`), read through
 the global object (`object_read`), and read through the same global object from a
 helper nested inside another function (`nested_read` — the shape a mod's kernels
-have). All four now measure the same 2.5 ms. Two gaps are closed there: the cell
+have). All four still measure the same ~2.6 ms. Two gaps were closed there: the cell
 was never warmed for the global env's declarative record (a top-level `const`
 cost 52.5 ms — 21x), and it was never *probed* from a body whose env chain was
 not the bare global record (a nested helper's global read cost 130.2 ms per 1M
@@ -467,6 +466,56 @@ Read the gaps as "where the work is", not as a verdict on the engine shape:
 the corpus's own README records the workloads V8 folds or scalar-evolves to a
 near-constant (which is why `destructure` and the other such rows have
 outsized JIT ratios), and a sub-1 gap means Slag was faster on that workload.
+
+### Against the previous release (`v0.1.0-preview.2`)
+
+The same corpus and micro-suite were run against the `v0.1.0-preview.2` tag
+(2026-09-26). The micro-suite is the cleaner comparison — both binaries print
+`result-ok`, i.e. every row compiled on both — and there three rows moved 2x or
+more while the rest are flat:
+
+| Micro row | preview.2 JIT | now JIT | Change |
+|---|---|---|---|
+| `builtin call` | 2.523 ms | 0.748 ms | 3.4x faster |
+| `non-leaf call` | 13.831 ms | 6.394 ms | 2.2x faster |
+| `typed-array write` | 13.418 ms | 6.518 ms | 2.1x faster |
+| `function calls` | 0.823 ms | 1.006 ms | ~flat (some slower) |
+| `wide leaf call` | 1.832 ms | 2.018 ms | ~flat |
+| every other row | — | — | within noise |
+
+(`typed-array read` is new since preview.2: 15 rows there, 16 now.)
+
+The corpus moved further, but its headline needs a caveat read first. Overall
+the corpus means went from `mean-jitGap` 116.05 / `mean-jlGap` 9.19 to
+**26.28** / **5.86** — yet that is dominated by the `opcost` family (36 of the
+77 rows), and `tools/corpus/README.md` says a two-binary pair is a measurement
+only if each binary's own control row is stable: *"If a binary's own control
+row — `baseline` — has moved, the pair is not a measurement of anything."* It
+moved here, 2.4 ms → 0.3 ms — a real ~8x gain on the `i & MASK` / `| 0` bare
+loop — so the `opcost` per-row deltas are not a clean per-operation
+attribution. Excluding `opcost`, the remaining 41 rows went from a JIT gap of
+**34.81x to 28.11x** (≈1.24x closer to V8) and an interpreter gap of **6.31x to
+6.77x** (about flat):
+
+| Family | Workloads | JIT gap (preview.2 → now) | Interpreter gap (preview.2 → now) |
+|---|---|---|---|
+| arrays | 6 | 35.22x → 18.74x | 5.87x → 4.23x |
+| builtins | 5 | 15.22x → 10.60x | 6.64x → 5.07x |
+| calls | 6 | 24.25x → 13.02x | 5.00x → 5.63x |
+| control | 5 | 26.74x → 20.17x | 5.45x → 5.66x |
+| globals | 4 | 2.12x → 2.16x | 0.69x → 0.72x |
+| language | 3 | 13.16x → 14.39x | 7.03x → 10.26x |
+| objects | 7 | 90.32x → 87.57x | 3.24x → 3.22x |
+| strings | 5 | 36.04x → 28.69x | 17.32x → 21.75x |
+| opcost (see caveat) | 36 | 208.57x → 24.20x | 12.46x → 4.81x |
+| **All** | **77** | **116.05x → 26.28x** | **9.19x → 5.86x** |
+| **All, excluding `opcost`** | **41** | **34.81x → 28.11x** | **6.31x → 6.77x** |
+
+Only one round was run per binary, so per-workload cross-binary rows carry the
+±warm-up band the corpus README describes; the family and overall means are the
+number to read. The shape: the JIT closed the most on arrays, calls and
+builtins, the interpreter is essentially unchanged outside `opcost`, and the
+`globals` family — already at parity — did not move.
 
 ### Temporal and Intl dispatch (fixed)
 

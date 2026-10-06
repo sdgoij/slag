@@ -50,12 +50,11 @@ Two harnesses live in `crates/test262`:
 
 ## Current results
 
-Workspace-wide: **4297 tests pass, 0 failures, 2 ignored** (`cargo test
---workspace`), of which the test262 crate contributes **3322 passing
-fixtures**; the remaining registered tests are the debug helpers and the
-ignored `scan_builtins_directories` directory scanner. The `workers`
-feature build adds 452 runtime tests (`cargo test -p runtime --features
-workers`).
+Workspace-wide: **5,633 tests pass, 0 failures, 4 ignored** (`cargo test
+--workspace`, summed over every `test result:` line), the bulk of them the
+vendored test262 fixtures plus the runtime/crux unit tests. The `workers`
+feature build adds the worker/Atomics runtime tests (`cargo test -p runtime
+--features workers`).
 
 The vendored fixtures cover, by phase: the execution model and language
 syntax (Phases 4-6), functions/classes/generators/async/modules (Phase 7),
@@ -2125,13 +2124,15 @@ hang of 1,483 fixtures** (`--jobs 8 --batch 32 --timeout 15 --recheck-timeout
 
 ## Open items
 
-- All three areas now measure **100% of runnable**: 23,724 + 23,424 + 1,086
-  pass / 0 fail / 0 crash of 23,724 + 23,812 + 1,086 fixtures
-  (the await-dictionary (89) and ShadowRealm
-  (64) proposal fixtures, and one stale Temporal fixture
-  skipped; the 234 built-ins hangs are slow-but-correct fixtures the
-  recheck misclassifies, `--timeout 120 --recheck-timeout 120`, release
-  build) — the plan's ≥95% runnable-pass-rate target is met. The language area closed its 2,048
+- The pinned corpus is at **100% of runnable**: **51,997 pass / 0 fail /
+  0 crash / 0 hang / 1 skip** of 51,998 fixtures (release build, 15s
+  deadlines) — language 23,726 / built-ins 23,820 of 23,821 / annexB 1,086 /
+  intl402 3,365. The one skip is the stale `relativeto-date-limits.js`
+  fixture. The `await-dictionary` (89) and `ShadowRealm` (64) gates, the 152
+  `intl402` proposal skips, the 4 CRLF-affected fixtures (they run on an LF
+  checkout), and the 234 slow-but-correct built-ins hangs have all closed;
+  the closure history follows. The plan's ≥95% runnable-pass-rate target is
+  met. The language area closed its 2,048
   failures via the eval-caller-context, field-initializer, and Annex B
   work described in the Full-suite sweep section; the final async-test
   gaps (`Array.fromAsync`, `for await`, and the dynamic-import cycle)
@@ -2155,18 +2156,18 @@ hang of 1,483 fixtures** (`--jobs 8 --batch 32 --timeout 15 --recheck-timeout
   discarded by the frame reset; a return in a try Block or under any
   enclosing try stays a normal call so the catch/finally still runs)
   (48,234 pass / 154 skip / 234 slow-but-correct hang
-total now; the Temporal clusters — Duration, Instant, Now, the namespace,
+at that point; the Temporal clusters — Duration, Instant, Now, the namespace,
 toStringTag, the five Plain clusters, and ZonedDateTime — and
-`Date.prototype.toTemporalInstant` have all been un-skipped since, and the
+`Date.prototype.toTemporalInstant` were all un-skipped after, and the
 `Intl.Era-monthcode` gate flipped last — the era-field getters and the
 solar-calendar arithmetic (buddhist, coptic, ethiopic, ethioaa, indian,
-persian, roc, islamic-umalqura) pass, leaving only the stale
-`relativeto-date-limits.js` fixture (1), await-dictionary (89), and
-ShadowRealm (64)).
-  Note: the TypedArray sweep should be run with the long deadline
-  (`--timeout 120 --recheck-timeout 120`) — the O(n²) property store
-  makes the 10,000-element crash-test fixtures take ~45s, which the
-  default 5s recheck misclassifies as hangs.
+persian, roc, islamic-umalqura) pass; the `await-dictionary` and `ShadowRealm`
+gates below closed too, leaving only the stale `relativeto-date-limits.js`
+fixture.)
+  Note: the whole corpus, TypedArray included, is clean at the standard
+  15s deadline now; the longer deadline the earlier sweeps used is obsolete
+  (the quadratic property store that made the 10,000-element crash-test
+  fixtures take ~45s is fixed).
 - The 27 original hangs were slow builtin calls (fixed via the dispatch
   cache) plus one real `Array.prototype.splice` infinite loop (fixed); the
   only hangs now are the slow-but-correct RegExp property-escape and

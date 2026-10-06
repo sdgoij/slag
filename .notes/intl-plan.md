@@ -9,20 +9,20 @@ regression net is the `intl402` fixture area of the pinned test262
 submodule — the corpus encodes the exact locale data this implementation
 must match.
 
-Status: Cuts 1-8 are committed and green (NumberFormat, Locale, PluralRules,
+Status: Cuts 1-9 are committed and green (NumberFormat, Locale, PluralRules,
 RelativeTimeFormat, ListFormat, DisplayNames, DateTimeFormat, Collator,
-Segmenter, DurationFormat). Cut 9 (the intl402/Temporal integration) is in
-flight: the Temporal×DateTimeFormat integration (format/toLocaleString on
-Temporal values, the [[Calendar]] slots, the un-skipped intl402 gate) is
-committed; the **time-zone data decision is made** (corpus-derived tables,
-spike validated — see `.notes/tz-data-decision.md`). The DST-aware Temporal
-algorithms are done (the wall→instant resolver + disambiguation in
+Segmenter, DurationFormat, and Cut 9, the intl402/Temporal integration:
+format/toLocaleString on Temporal values, the [[Calendar]] slots, the
+un-skipped intl402 gate, the corpus-derived time-zone tables — see
+`.notes/tz-data-decision.md` — and the non-iso calendar data). The DST-aware
+Temporal algorithms are done (the wall→instant resolver + disambiguation in
 `temporal/shell.rs`, AddZonedDateTime/AddInstant, zoned round/with/until/
 since, getTimeZoneTransition with strictly-before previous semantics, and
 the Duration `relativeTo`/difference/total machinery — the 116-fixture tz
-cluster is 116/116); the remaining work is the non-iso calendar data
-(era/eraYear beyond gregory, calendar arithmetic) and the surrounding
-intl402/Temporal fixtures it unblocks.
+cluster is 116/116), and the `Intl.Era-monthcode` gate flipped last: the
+solar-calendar arithmetic (buddhist, coptic, ethiopic, ethioaa, indian,
+persian, roc, islamic-umalqura) and the era-field getters pass, so the
+`intl402` area is fully runnable (3,365/0/0).
 
 ## 1. The fixture surface (measured)
 
