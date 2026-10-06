@@ -107,9 +107,11 @@ not machinery) and `strings` (28.69).
   2026-10-06 — the vector-free field update** (option (a)): a compiled store to
   a written, writable map-pinned in-object field on a `props_deferred`
   receiver now writes `in_fields[slot]` inline instead of calling
-  `SetMemberSlot`. Remaining candidates: the `strings` family
-  (`opcost/string_charat`, `strings/coercion_concat`, `strings/search_slice`),
-  the call funnel (`calls/apply_call`, the `--jit-bench` `apply leaf call` row).
+  `SetMemberSlot`. The deferred store story is CLOSED (see §6). **Next target:
+  the call funnel's `LeafCallFill`** (top call-family helper; see §6). Remaining
+  hard candidates: the `strings` read+concat triple (`GetMemberName` method
+  reads — the L1c shape end-state; `ConcatStrings`/`BinarySlow`) and
+  `LoadContext` (a machine-addressable env chain).
 
 ## 6. Status log
 
@@ -210,6 +212,42 @@ not machinery) and `strings` (28.69).
   `installed_jit_vector_free_field_update_matches_the_interpreter` test
   (constructor fill + a prototype setter that must not intercept the own-field
   update, compared against the interpreter), test262 `all` **48,632 / 0 / 1 /
-  0 / 0** and `intl402` **3,365 / 0 / 0 / 0 / 0** at baseline. The next slice
-  is the same shape for the map-pinned key at an ordinal `>= INLINE_FIELDS`
-  (vector storage — not machine-addressable) and for non-`Ordinary` receivers.
+  `intl402` **3,365 / 0 / 0 / 0 / 0** at baseline.
+- **The deferred store story is CLOSED; the proposed ordinal-`>=INLINE_FIELDS`
+  follow-up is moot.** `define_fresh` materializes an object at the
+  `INLINE_FIELDS`-th define, so a `props_deferred` receiver can only ever hold
+  descriptors at ordinals `< INLINE_FIELDS` — the `slot_inline` guard in the
+  update gate is defensive, never a real decline, and there is no
+  vector-storage variant of this slice. A MATERIALIZED receiver still pays
+  `write_data_property`'s vector scan on every store, and that one is not
+  inline-able: the property vector is a `SmallProps` (an inline array that
+  spills to a `Vec` behind a `RefCell`), so its address is not stable, and an
+  `in_fields`-only write would leave the descriptor value stale for
+  enumeration/`Object.values`/`JSON.stringify` (the map read path serves the
+  field, but the own-property lookup scans the vector). That is the
+  TurboFan-front-half / vector-redesign territory, not a slice.
+- **2026-10-06 — Stage 1, next target chosen by census: the call funnel's
+  `LeafCallFill`.** Per-row helper attribution (single-row `--corpus` dirs,
+  `Helper as usize`):
+  - `calls`: `LoadContext` **28.9M** (`closure_capture` 14.0M, `recursive_fib`
+    14.9M), `LeafCallFill` **23.2M** (`method_call` 14.0M, `closure_capture`
+    6.9M, `construct_churn` 3.5M), `CallSlow` 14.9M, `GetMemberName` 10.5M,
+    `ApplyArgsFill` 7.0M (`apply_call` alone is 7.0M `ApplyArgsFill` + 7.0M
+    `GetMemberName`), `LeafCallEnv` 5.7M, `Construct`/`ArgsPush`/`ArgsBase`
+    3.5M each.
+  - `strings`: `GetMemberName` **9.96M** + `ConcatStrings` 4.5M + `BinarySlow`
+    4.2M (`char_ops` 2.1M `GetMemberName`, `coercion_concat` 4.2M `BinarySlow` +
+    2.1M `ConcatStrings`, `concat_loop` 2.4M `ConcatStrings`,
+    `search_slice`/`split_join` `GetMemberName` + `CallSlow`).
+  - `language`: `BinarySlow` 9.88M, `CertifiedCall` 9.8M, `LoadContext` 8.5M.
+  **Chosen: `LeafCallFill`** — the top call-funnel helper, purely mechanical (no
+  speculation and no new architecture), and it moves `method_call`,
+  `closure_capture` and `construct_churn` at once. It is already lean
+  (`record_matches` + `fill_leaf_frame`, crates/runtime/src/jit.rs), so the
+  candidate is to emit the frame fill inline in the compiler — the same "give
+  the compiled path the work the helper does" move as this slice — **pending a
+  check of how much of `method_call`'s count takes the `aliased` branch**
+  (`frame_size == arity && argc >= frame_size` skips the fill loop entirely,
+  which would cap the win at the helper-call and cache-entry cost).
+  `GetMemberName`'s method reads and `LoadContext` stay the hard ones (the L1c
+  shape end-state and a machine-addressable env chain respectively).
