@@ -2328,6 +2328,41 @@ mod tests {
     }
 
     #[test]
+    fn installed_jit_vector_free_field_update_matches_the_interpreter() {
+        // The compiled vector-free field UPDATE: a written, writable
+        // map-pinned in-object field on a deferred receiver is stored inline.
+        // An own writable data property shadows the whole chain (spec
+        // 7.3.3), so a prototype setter must NOT intercept the update of an
+        // already-written own field — the case the hole-fill's chain gate
+        // declines. The result must match the interpreter exactly (a
+        // non-writable boilerplate field like a function's `length` declines
+        // to the helper; the shape cell for it is only warm once read).
+        let source = "var hits = 0;\n\
+                      function C() { this.x = 1; }\n\
+                      var o = new C();\n\
+                      Object.defineProperty(Object.prototype, 'x', { set: function (v) { hits += v; }, configurable: true });\n\
+                      var f = function (p, q) {};\n\
+                      function hot(a, fn) {\n\
+                        var s = 0;\n\
+                        for (var i = 0; i < 200; i++) { a.x = i; s += a.x; }\n\
+                        for (var i = 0; i < 200; i++) { s += fn.length; fn.length = i; }\n\
+                        return s;\n\
+                      }\n\
+                      var acc = 0;\n\
+                      for (var c = 0; c < 40; c++) { acc += hot(o, f); }\n\
+                      acc + hits * 100000 + o.x * 10 + f.length;";
+        let interp = {
+            let mut agent = runtime::Agent::new();
+            agent.initialize_host_defined_realm().expect("realm");
+            agent.run_script(source).expect("interp runs")
+        };
+        let (value, compiled) = with_jit_agent(|agent| agent.run_script(source).expect("jit runs"));
+        assert_eq!(value, interp, "the field update must match the interpreter");
+        assert_eq!(value.as_number(), Some(40.0 * 20300.0 + 199.0 * 10.0 + 2.0));
+        assert!(compiled >= 1, "{compiled} bodies");
+    }
+
+    #[test]
     fn installed_jit_constructor_fill_defers_to_a_mid_run_prototype_setter() {
         // The compiled vector-free constructor fill (a map-described presize
         // hole written inline) must stay exact against the prototype chain:

@@ -1906,17 +1906,24 @@ impl<'a> Lowerer<'a> {
         let gen_ok = self.builder.ins().icmp(IntCC::Equal, cell_gen, live_gen);
         let id_name_ok = self.builder.ins().band(id_ok, name_ok);
         let ok = self.builder.ins().band(id_name_ok, gen_ok);
-        self.builder.ins().brif(ok, fast, &[], shape, &[]);
+        let deferred = self.builder.create_block();
+        self.builder.ins().brif(ok, deferred, &[], shape, &[]);
+        // The value-cell hit: a vector-free (Option-3) receiver takes the
+        // inline field store (the write the read just warmed, but the
+        // descriptor-resolving helper would otherwise still charge); every
+        // other receiver keeps the narrow `set_member_slot` helper.
+        self.builder.switch_to_block(deferred);
+        self.emit_deferred_inline_store(object, name_imm, value, name, fast, merge)?;
         // The shape store: on a value-cell miss (a working set larger than
         // the cell), a map-described key is gated by the shared (map id,
-        // name) cells; the vector-free presize-hole fill is then served
-        // inline (see `emit_deferred_hole_fill`), and every other shape
-        // falls to the narrow `set_member_slot` write (`set_member_slot`'s
-        // own writable check stays the authoritative backstop).
+        // name) cells; the vector-free field store is then served inline (see
+        // `emit_deferred_field_store`), and every other shape falls to the
+        // narrow `set_member_slot` write (`set_member_slot`'s own writable
+        // check stays the authoritative backstop).
         self.builder.switch_to_block(shape);
         self.emit_shape_store_probe(object, name_imm, shape_hit, slow)?;
         self.builder.switch_to_block(shape_hit);
-        self.emit_deferred_hole_fill(object, name_imm, value, name, fast, merge)?;
+        self.emit_deferred_field_store(object, name_imm, value, name, fast, merge)?;
         // The fast path: the helper writes the property vector in place and
         // refreshes the cell (no generation bump). The store's result is
         // discarded by the run truncate.
@@ -1968,26 +1975,36 @@ impl<'a> Lowerer<'a> {
         self.box_ptr_is_young(box_ptr)
     }
 
-    /// The vector-free machine fill, shared by the step and register
+    /// The vector-free machine member store, shared by the step and register
     /// member-store paths (the register `StoreMemberName*` ops and the step
     /// `AssignMemberName` both route a shape-gate hit here). Entry: the
     /// current block is the shape-gate HIT block — the shared (map id,
     /// name) cells matched the receiver's live map, so its CURRENT map
     /// describes `name`. For a vector-free (deferred) receiver
     /// `in_fields[field_slot]` is the authoritative value slot (there is no
-    /// property-vector copy); when the field is an unwritten presize hole
-    /// and every higher field is also a hole (fills ascend the ordinals; a
-    /// fill below an already-written descriptor must materialize to
-    /// preserve creation order), the store is exactly the interpreter's
-    /// `define_fresh` described-key fill: write the field, bump the
-    /// generation, and refresh the (object id, name) value cell at the new
-    /// generation. Any other receiver — vector-authoritative
-    /// (`props_deferred` clear), a written field (the in-place update /
-    /// writability-check paths), an at-or-above-`INLINE_FIELDS` slot, or an
-    /// out-of-order fill — jumps to `fallback` (the narrow `set_member_slot`
-    /// write). A successful fill jumps to `ok`. The current block is
-    /// unspecified on return (the fill block is current, terminated).
-    fn emit_deferred_hole_fill(
+    /// property-vector copy), so the store is a machine field write:
+    ///
+    /// - An unwritten presize hole with every higher field also a hole (fills
+    ///   ascend the ordinals; a fill below an already-written descriptor must
+    ///   materialize to preserve creation order) is the interpreter's
+    ///   `define_fresh` described-key fill: write the field, bump the
+    ///   generation, refresh the (object id, name) value cell at the new
+    ///   generation.
+    /// - A WRITTEN, writable field is the interpreter's `deferred_field_write`
+    ///   in-place update: an own writable data property shadows the whole
+    ///   chain (spec 7.3.3), so no chain gate is needed — write the field and
+    ///   refresh the value cell at the UNCHANGED generation (the L1c no-bump
+    ///   discipline). The store needs no write barrier (a young receiver or a
+    ///   non-heap value); a receiver that is the global object declines (a
+    ///   no-bump write would leave the name-keyed global-value cell stale).
+    ///
+    /// Any other receiver — vector-authoritative (`props_deferred` clear), an
+    /// at-or-above-`INLINE_FIELDS` slot, a non-writable descriptor, an
+    /// out-of-order fill, or a barrier-needing store — jumps to `fallback`
+    /// (the narrow `set_member_slot` write, whose own checks are the
+    /// authoritative backstop). A successful store jumps to `ok`. The current
+    /// block is unspecified on return (every path is terminated).
+    fn emit_deferred_field_store(
         &mut self,
         object: ClifValue,
         name_imm: ClifValue,
@@ -2059,6 +2076,12 @@ impl<'a> Lowerer<'a> {
             MemFlagsData::new(),
             cell,
             Offset32::new(std::mem::offset_of!(MemberMapCell, slot) as i32),
+        );
+        let writable = self.builder.ins().load(
+            types::I32,
+            MemFlagsData::new(),
+            cell,
+            Offset32::new(std::mem::offset_of!(MemberMapCell, writable) as i32),
         );
         let slot_inline = self.builder.ins().icmp_imm_u(
             IntCC::UnsignedLessThan,
@@ -2200,8 +2223,103 @@ impl<'a> Lowerer<'a> {
         // barrier; a young one cannot hold an old->young edge. Bail to the
         // helper (which runs the barrier) for an old receiver.
         let young = self.value_box_is_young(object);
-        let gate = self.builder.ins().band(gate, young);
-        self.builder.ins().brif(gate, fill, &[], fallback, &[]);
+        let fill_gate = self.builder.ins().band(gate, young);
+        // The in-place UPDATE of an already-written field: an own writable
+        // data property shadows the whole chain (spec 7.3.3), so the only
+        // gates are the recorded writability (pinned by the map id), the
+        // field being written, a store that needs no write barrier, and a
+        // receiver that is not the global object (a no-bump field write
+        // cannot refresh the global-value cell the helper does).
+        let not_hole = self.builder.ins().icmp_imm_u(
+            IntCC::NotEqual,
+            field_bits,
+            crux::value::UNINITIALIZED_BITS as i64,
+        );
+        let writable_ok = self.builder.ins().icmp_imm_u(IntCC::NotEqual, writable, 0);
+        let value_tag = self.builder.ins().band_imm_u(value, crux::TAG_MASK as i64);
+        let value_not_heap =
+            self.builder
+                .ins()
+                .icmp_imm_u(IntCC::NotEqual, value_tag, crux::TAG_PREFIX as i64);
+        let barrier_ok = self.builder.ins().bor(young, value_not_heap);
+        let global = self.builder.ins().load(
+            types::I64,
+            MemFlagsData::new(),
+            ctx,
+            Offset32::new(std::mem::offset_of!(JitCallContext, global_object) as i32),
+        );
+        let not_global = self.builder.ins().icmp(IntCC::NotEqual, obj_ptr, global);
+        let deferred_inline = self.builder.ins().band(deferred_ok, slot_inline);
+        let upd = self.builder.ins().band(deferred_inline, not_hole);
+        let upd = self.builder.ins().band(upd, writable_ok);
+        let upd = self.builder.ins().band(upd, barrier_ok);
+        let upd = self.builder.ins().band(upd, not_global);
+        let update = self.builder.create_block();
+        let decide = self.builder.create_block();
+        self.builder.ins().brif(upd, update, &[], decide, &[]);
+        self.builder.switch_to_block(decide);
+        self.builder.ins().brif(fill_gate, fill, &[], fallback, &[]);
+        // The update: write the field, and refresh the (object id, name)
+        // value cell at the UNCHANGED generation (the L1c no-bump discipline)
+        // so the store-then-read pattern stays warm.
+        self.builder.switch_to_block(update);
+        self.builder
+            .ins()
+            .store(MemFlagsData::new(), value, field_addr, Offset32::new(0));
+        let upd_id = self.builder.ins().load(
+            types::I64,
+            MemFlagsData::new(),
+            obj_ptr,
+            Offset32::new(std::mem::offset_of!(crux::JsObject, id) as i32),
+        );
+        let upd_gen = self.builder.ins().load(
+            types::I32,
+            MemFlagsData::new(),
+            obj_ptr,
+            Offset32::new(std::mem::offset_of!(crux::JsObject, generation) as i32),
+        );
+        let vcells = self.builder.ins().load(
+            types::I64,
+            MemFlagsData::new(),
+            ctx,
+            Offset32::new(std::mem::offset_of!(JitCallContext, member_value_cells) as i32),
+        );
+        let vindex = self.builder.ins().bxor(upd_id, name_imm);
+        let vindex = self
+            .builder
+            .ins()
+            .band_imm_u(vindex, (MEMBER_CELLS - 1) as i64);
+        let vindex = self
+            .builder
+            .ins()
+            .imul_imm_s(vindex, std::mem::size_of::<MemberValueCell>() as i64);
+        let vcell = self.builder.ins().iadd(vcells, vindex);
+        self.builder.ins().store(
+            MemFlagsData::new(),
+            upd_id,
+            vcell,
+            Offset32::new(std::mem::offset_of!(MemberValueCell, id) as i32),
+        );
+        let name_imm32 = self.builder.ins().iconst(types::I32, name as i64);
+        self.builder.ins().store(
+            MemFlagsData::new(),
+            name_imm32,
+            vcell,
+            Offset32::new(std::mem::offset_of!(MemberValueCell, name) as i32),
+        );
+        self.builder.ins().store(
+            MemFlagsData::new(),
+            upd_gen,
+            vcell,
+            Offset32::new(std::mem::offset_of!(MemberValueCell, generation) as i32),
+        );
+        self.builder.ins().store(
+            MemFlagsData::new(),
+            value,
+            vcell,
+            Offset32::new(std::mem::offset_of!(MemberValueCell, value) as i32),
+        );
+        self.builder.ins().jump(ok, &[]);
         // The fill: write the field, bump the generation (the interpreter's
         // `define_fresh` fill bumps; the cells refreshed below are recorded
         // at the new generation), then refresh the (object id, name) value
@@ -2272,6 +2390,55 @@ impl<'a> Lowerer<'a> {
             Offset32::new(std::mem::offset_of!(MemberValueCell, value) as i32),
         );
         self.builder.ins().jump(ok, &[]);
+        Ok(())
+    }
+
+    /// Route a member store whose receiver may be vector-free (Option-3) to
+    /// the machine field write (see [`Self::emit_deferred_field_store`]).
+    /// Entry: the current block is the store site. A receiver with
+    /// `props_deferred` clear, or a shape the shared (map id, name) cells do
+    /// not pin, jumps to `fallback` (the narrow `set_member_slot` helper); a
+    /// stored value jumps to `ok`. Used from the value-cell HIT path of both
+    /// the register and step stores, where the receiver's read has warmed the
+    /// value cell but the write still pays the descriptor-resolving helper.
+    /// The current block is unspecified on return (every path is terminated).
+    fn emit_deferred_inline_store(
+        &mut self,
+        object: ClifValue,
+        name_imm: ClifValue,
+        value: ClifValue,
+        name: crux::AtomId,
+        fallback: Block,
+        ok: Block,
+    ) -> Result<(), Unsupported> {
+        let probe = self.builder.create_block();
+        let hit = self.builder.create_block();
+        let obj_ptr = self
+            .builder
+            .ins()
+            .band_imm_u(object, crux::PAYLOAD_MASK as i64);
+        let obj_ptr = self.builder.ins().ishl_imm_u(obj_ptr, 4);
+        let obj_ptr = self
+            .builder
+            .ins()
+            .iadd_imm_s(obj_ptr, crux::heap::GCBOX_DATA_OFFSET as i64);
+        let deferred_bit = self.builder.ins().load(
+            types::I8,
+            MemFlagsData::new(),
+            obj_ptr,
+            Offset32::new(std::mem::offset_of!(crux::JsObject, props_deferred) as i32),
+        );
+        let deferred_ok = self
+            .builder
+            .ins()
+            .icmp_imm_u(IntCC::NotEqual, deferred_bit, 0);
+        self.builder
+            .ins()
+            .brif(deferred_ok, probe, &[], fallback, &[]);
+        self.builder.switch_to_block(probe);
+        self.emit_shape_store_probe(object, name_imm, hit, fallback)?;
+        self.builder.switch_to_block(hit);
+        self.emit_deferred_field_store(object, name_imm, value, name, fallback, ok)?;
         Ok(())
     }
 
@@ -5989,38 +6156,65 @@ impl<'a> Lowerer<'a> {
                 let id_name_ok = self.builder.ins().band(id_ok, name_ok);
                 let ok = self.builder.ins().band(id_name_ok, gen_ok);
                 let fast = self.builder.create_block();
+                let deferred_check = self.builder.create_block();
+                let deferred_done = self.builder.create_block();
                 if compound {
-                    self.builder.ins().brif(ok, fast, &[], slow, &[]);
+                    // Compounds keep the old miss-to-helper behavior (their
+                    // cached old value came from the value-cell-validated
+                    // read); a value-cell hit routes through the vector-free
+                    // field store first (the computed `new` is the stored
+                    // value).
+                    self.builder.ins().brif(ok, deferred_check, &[], slow, &[]);
+                    self.builder.switch_to_block(deferred_check);
+                    self.emit_deferred_inline_store(
+                        object,
+                        name_imm,
+                        new,
+                        *name,
+                        fast,
+                        deferred_done,
+                    )?;
                 } else {
                     // Slice 2: on a value-cell miss a map-described key
                     // routes through the shared (map id, name) cells; the
-                    // vector-free presize-hole fill is served inline
-                    // (`emit_deferred_hole_fill`), and every other shape
+                    // vector-free field store is served inline
+                    // (`emit_deferred_field_store`), and every other shape
                     // falls to the narrow `set_member_slot` write below (the
                     // helper's own writable check is the backstop) or the
-                    // full assign helper. Compounds keep the old
-                    // miss-to-helper behavior (their cached old value came
-                    // from the value-cell-validated read).
+                    // full assign helper. The value-cell hit routes through
+                    // the same vector-free store first.
                     let shape = self.builder.create_block();
                     let shape_hit = self.builder.create_block();
-                    let shape_filled = self.builder.create_block();
-                    self.builder.ins().brif(ok, fast, &[], shape, &[]);
-                    self.builder.switch_to_block(shape);
-                    self.emit_shape_store_probe(object, name_imm, shape_hit, slow)?;
-                    self.builder.switch_to_block(shape_hit);
-                    self.emit_deferred_hole_fill(
+                    self.builder.ins().brif(ok, deferred_check, &[], shape, &[]);
+                    self.builder.switch_to_block(deferred_check);
+                    self.emit_deferred_inline_store(
                         object,
                         name_imm,
                         value,
                         *name,
                         fast,
-                        shape_filled,
+                        deferred_done,
                     )?;
-                    // The machine fill's result is the stored value.
-                    self.builder.switch_to_block(shape_filled);
-                    self.push(value);
-                    self.builder.ins().jump(merge, &[]);
+                    self.builder.switch_to_block(shape);
+                    self.emit_shape_store_probe(object, name_imm, shape_hit, slow)?;
+                    self.builder.switch_to_block(shape_hit);
+                    self.emit_deferred_field_store(
+                        object,
+                        name_imm,
+                        value,
+                        *name,
+                        fast,
+                        deferred_done,
+                    )?;
                 }
+                // The inline field store's result is the stored value.
+                self.builder.switch_to_block(deferred_done);
+                if compound {
+                    self.push(new);
+                } else {
+                    self.push(value);
+                }
+                self.builder.ins().jump(merge, &[]);
                 // The fast path: the helper writes the property vector in
                 // place and refreshes the cell (the write does not bump the
                 // generation, so the next read probe stays warm). The result

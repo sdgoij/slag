@@ -2904,6 +2904,12 @@ pub struct MemberMapCell {
     pub proto_id: u64,
     /// The recording receiver's direct prototype generation.
     pub proto_gen: u32,
+    /// Whether the descriptor is writable. A map id pins its descriptor
+    /// layout AND attributes (maps are immutable), so this is valid for every
+    /// instance of the shape. The compiled vector-free UPDATE gate
+    /// (an in-place `in_fields` write of a written, writable field) reads it;
+    /// a non-writable descriptor declines to the exact helper.
+    pub writable: u32,
 }
 
 impl MemberMapCell {
@@ -2918,6 +2924,7 @@ impl MemberMapCell {
             clean: 0,
             proto_id: 0,
             proto_gen: 0,
+            writable: 0,
         }
     }
 }
@@ -5067,6 +5074,13 @@ impl Vm {
         let key = PropertyKey::String(name);
         let slot = map.field_offset(&key)?;
         let value = object.map_field(slot)?;
+        // Record the descriptor's writability (pinned by the map id): the
+        // compiled vector-free update gate inlines a written writable field
+        // and declines a non-writable one to the exact helper.
+        let writable = map
+            .find(&key)
+            .and_then(|ord| map.descriptor_at(ord))
+            .is_some_and(|(_, _, attrs)| attrs.writable());
         let (proto_id, proto_gen) = Self::member_map_proto(object);
         agent.member_map_cells[index] = MemberMapCell {
             map_id,
@@ -5075,6 +5089,7 @@ impl Vm {
             clean: 0,
             proto_id,
             proto_gen,
+            writable: u32::from(writable),
         };
         agent.member_value_cells[Self::member_cell_index(object.id(), name)] = MemberValueCell {
             id: object.id(),
@@ -5642,6 +5657,10 @@ impl Vm {
             let map_id = map.id();
             let index = Self::member_map_cell_index(map_id, *atom);
             let (proto_id, proto_gen) = Self::member_map_proto(&receiver);
+            let writable = map
+                .find(&property_key)
+                .and_then(|ord| map.descriptor_at(ord))
+                .is_some_and(|(_, _, attrs)| attrs.writable());
             // `clean` 1: this fill only succeeded because the chain-verified
             // verdict (the probe above) held, so the cell records the
             // receiver's direct prototype for the compiled vector-free fill
@@ -5653,6 +5672,7 @@ impl Vm {
                 clean: 1,
                 proto_id,
                 proto_gen,
+                writable: u32::from(writable),
             };
         }
         if ok {
