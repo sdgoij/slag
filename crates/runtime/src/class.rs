@@ -486,15 +486,26 @@ fn build_class(
             } else {
                 Value::Object(proto)
             };
-            let (_, accessor_key) = element_key_with(
+            let (accessor_private, accessor_key) = element_key_with(
                 agent,
                 get_name,
                 strict,
                 precomputed_keys,
                 computed_key_index,
             )?;
-            let accessor_key = accessor_key.expect("auto-accessor name is public");
-            record_computed_key(&mut computed_keys, get_element, &Some(accessor_key.clone()));
+            record_computed_key(&mut computed_keys, get_element, &accessor_key);
+            let element_name = match &accessor_key {
+                Some(key) => crate::decorators::ElementName::Public(key),
+                None => {
+                    let ClassElementName::Private(atom) = get_name else {
+                        unreachable!("auto-accessor name is public or private");
+                    };
+                    crate::decorators::ElementName::Private {
+                        atom: *atom,
+                        environment: &class_private_env,
+                    }
+                }
+            };
 
             let getter = instantiate_accessor(
                 agent,
@@ -508,7 +519,7 @@ fn build_class(
             make_method(agent, &getter, home)?;
             set_function_name(
                 &getter,
-                &element_name_text(get_name, Some(&accessor_key)),
+                &element_name_text(get_name, accessor_key.as_ref()),
                 Some("get"),
             )?;
             let setter = instantiate_accessor(
@@ -528,11 +539,10 @@ fn build_class(
             make_method(agent, &setter, home)?;
             set_function_name(
                 &setter,
-                &element_name_text(get_name, Some(&accessor_key)),
+                &element_name_text(get_name, accessor_key.as_ref()),
                 Some("set"),
             )?;
 
-            let element_name = crate::decorators::ElementName::Public(&accessor_key);
             let crate::decorators::AccessorDecoration {
                 get,
                 set,
@@ -547,7 +557,27 @@ fn build_class(
                 getter,
                 setter,
             )?;
-            define_accessor_property(&home, &accessor_key, Some(get), Some(set))?;
+            if let Some(name_id) = accessor_private {
+                let element = crux::object::PrivateElement {
+                    name_id,
+                    kind: crux::object::PrivateElementKind::Accessor {
+                        get: Some(get),
+                        set: Some(set),
+                    },
+                };
+                if is_static {
+                    merge_private_accessor(&home, element)?;
+                } else {
+                    merge_instance_private_accessor(&mut instance_private_methods, element);
+                }
+            } else {
+                define_accessor_property(
+                    &home,
+                    accessor_key.as_ref().unwrap(),
+                    Some(get),
+                    Some(set),
+                )?;
+            }
 
             let storage_id = element_key_with(
                 agent,

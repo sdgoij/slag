@@ -911,4 +911,27 @@ mod tests {
         .unwrap();
         assert_eq!(result, string("true,7,3"));
     }
+
+    #[test]
+    fn private_auto_accessor_decorates_as_an_accessor() {
+        let result = run(
+            "let seen;\n\
+             function d(value, context) { seen = context.kind + ':' + context.name + ':' + context.private + ':' + Object.keys(value).sort().join(',') + ':' + Object.keys(context.access).sort().join(','); return value; }\n\
+             class C { @d accessor #x = 5; getX() { return this.#x; } }\n\
+             new C().getX() + '|' + seen;",
+        )
+        .unwrap();
+        assert_eq!(result, string("5|accessor:#x:true:get,set:get,has,set"));
+    }
+
+    #[test]
+    fn private_auto_accessor_decorator_can_wrap_get_set() {
+        let result = run(
+            "function d(value, context) { const get = value.get, set = value.set; return { get() { return 'G:' + get.call(this); }, set(v) { set.call(this, v); } }; }\n\
+             class C { @d accessor #x = 1; getX() { return this.#x; } setX(v) { this.#x = v; } }\n\
+             let c = new C(); let before = c.getX(); c.setX(9); before + ',' + c.getX();",
+        )
+        .unwrap();
+        assert_eq!(result, string("G:1,G:9"));
+    }
 }

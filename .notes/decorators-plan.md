@@ -106,9 +106,9 @@ trio decorates as ONE `kind:"accessor"` element: the context value is
 `{ get, set }`, `access` is `{ has, get, set }`, and a returned object may
 replace `get`/`set` and supply an `init` value initializer for the backing
 storage. Undecorated auto-accessors still take the ordinary Field/Get/Set arms
-(a computed key still evaluates twice, unchanged). A *private* auto-accessor
-(`accessor #x`) desugars to a single field, so its decorators apply as a field,
-not an accessor — a documented deviation. Three more tests (23 total).
+(a computed key still evaluates twice, unchanged). A private auto-accessor
+(`accessor #x`) desugars to a private getter/setter pair over its storage, so
+it decorates as an accessor too. Three more tests (23 total).
 
 ## S4 — hand-written tests + notes
 
@@ -117,16 +117,15 @@ test262 cannot gate S2/S3, so tests are written by hand (the
 calls, the context shape per kind, the class context with no
 `access`/`static`/`private`, method replacement, field value-initializers,
 `access.get/has/set` through the property protocol, and the initializer phase
-ordering, plus private elements and auto-accessors (23 tests in `decorators.rs`).
-The evaluation arc is done; `.notes/conformance.md` records it and its two
-deviations.
+ordering, plus private elements and auto-accessors (25 tests in `decorators.rs`).
+The evaluation arc is done, both deviations closed; `.notes/conformance.md`
+records it.
 
 ## Traps
 
 - A green test262 sweep proves nothing here; do not claim decorators work on it.
 - `context.metadata` is TypeScript-only — do not add it.
-- `@dec static {}` is currently parsed and dropped (S1 preserves the old
-  behaviour); the final proposal makes decorators on static blocks a
-  SyntaxError. Verify against PR 2417 and, if so, add the early error.
+- `@dec static {}` is a SyntaxError (the proposal gives ClassStaticBlock no
+  DecoratorList); enforced in `parse_class_element`.
 - Composed `@d [k](){}`: the decorator expression evaluates before the computed
   key (reading order), matching S1's capture.

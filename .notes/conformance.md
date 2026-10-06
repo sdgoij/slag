@@ -2106,7 +2106,10 @@ hang of 1,483 fixtures** (`--jobs 8 --batch 32 --timeout 15 --recheck-timeout
   it (`this.#storage`), so the override/merge ordering against a user
   `get`/`set`, the static form, and the derived-class brand-check TypeError all
   fall out of the existing element loop (`decorators/public-auto-accessor.js`).
-  A private `accessor #x` is observably a private field and stays one. The
+  A private `accessor #x` desugars the same way: a private getter/setter pair
+  named `#x` over a separate storage slot, so `this.#x` is the accessor (and a
+  `#x` field/method/accessor elsewhere in the class is a duplicate-name
+  SyntaxError) (`decorators/private-auto-accessor.js`). The
   desugaring evaluates a *computed* auto-accessor key twice (once for the
   synthesized getter, once for the setter); no fixture exercises a
   side-effecting key, and it is the one known simplification.
@@ -2256,12 +2259,11 @@ ShadowRealm (64)).
   phases (instance before fields; static before static fields; class last).
   `access` is synthesized as real JS closures over the key — or over `#name`
   with the class PrivateEnvironment — so it runs the full
-  Get/Set/HasProperty protocol (getters, proxies, brand checks). Validated by
-  23 hand-written unit tests in the module; `all` (48632/0/1) and `staging`
-  (77/0/1406) are unchanged. Two documented deviations: a *private*
-  auto-accessor (`accessor #x`) is decorated as a field, because the parser
-  desugar collapses it to a single field; and `@dec static {}` is still
-  parsed-and-dropped rather than a SyntaxError.
+  Get/Set/HasProperty protocol (getters, proxies, brand checks). Decorators on
+  a static block are a SyntaxError, and a private auto-accessor (`accessor #x`)
+  presents `kind:"accessor"` over its private getter/setter pair. Validated by
+  25 hand-written unit tests in the module; `all` (48632/0/1) and `staging`
+  (77/0/1406) are unchanged.
 - Known flaky fixture: `TypedArray/prototype/reduce/callbackfn-arguments-default-accumulator.js`
   (Strict) intermittently fails with `Expected SameValue(«43», «41») to be true` — the second
   reduce callback's `arguments[0]` reads 43 (iteration 1's `kValue`) instead of 41 (iteration

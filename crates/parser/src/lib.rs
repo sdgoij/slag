@@ -1184,6 +1184,12 @@ mod tests {
     }
 
     #[test]
+    fn decorators_cannot_target_a_static_block() {
+        ok("class C { static {} }");
+        err("class C { @dec static {} }");
+    }
+
+    #[test]
     fn static_blocks_and_decorators() {
         // Static blocks are return-less.
         err("class C { static { return; } }");

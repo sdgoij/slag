@@ -320,36 +320,70 @@ fn parse_class_element(parser: &mut Parser) -> Result<Vec<ClassElement>, JsError
         false
     };
 
-    // `static { … }` — a class static initialization block.
+    // `static { … }` — a class static initialization block. The decorator
+    // proposal gives ClassStaticBlock no DecoratorList, so a decorator here is
+    // a SyntaxError.
     if is_static && parser.at_punct(TokenKind::LeftBrace)? {
+        if let Some(first) = decorators.first() {
+            return Err(parser.error_at(
+                first.span.start,
+                "Decorators cannot be applied to a static initialization block",
+            ));
+        }
         let body = parse_static_block(parser)?;
         return Ok(vec![ClassElement::StaticBlock(body)]);
     }
 
     // `accessor name …` — an auto-accessor (decorators proposal). It is
     // desugared here, into the elements the class machinery already
-    // implements: a hidden private storage field plus a public get/set
-    // accessor pair whose bodies read and write that field (see
+    // implements: a hidden private storage field plus a get/set accessor pair
+    // whose bodies read and write that field (see
     // `synthesize_auto_accessor_bodies`). A private auto-accessor
-    // (`accessor #x`) is observably a private field — `this.#x` is its own
-    // backing slot — so it desugars to a single private field.
+    // (`accessor #x`) instantiates a private getter/setter pair named `#x`
+    // over a separate storage slot, so `this.#x` is the accessor — which is
+    // why it collides with a `#x` field/method/accessor elsewhere in the
+    // class.
     if parser.at_contextual_unescaped("accessor")? && accessor_is_prefix(parser)? {
         let accessor_start = parser.peek()?.span.start;
         parser.next()?; // `accessor`
         let name_start = parser.peek()?.span.start;
         let name = parse_class_element_name(parser)?;
         if matches!(name, ClassElementName::Private(_)) {
-            declare_private_name(parser, &name, PrivateNameKind::Other, is_static)?;
+            declare_private_name(parser, &name, PrivateNameKind::Getter(is_static), is_static)?;
+            declare_private_name(parser, &name, PrivateNameKind::Setter(is_static), is_static)?;
             let init = parse_field_initializer(parser)?;
             parser.expect_semicolon()?;
             let end = parser.prev.as_ref().unwrap().span.end;
-            return Ok(vec![ClassElement::Field {
-                decorators,
-                is_static,
-                name,
-                init,
-                span: Span::new(accessor_start, end),
-            }]);
+            let span = Span::new(accessor_start, end);
+            let storage = auto_accessor_storage();
+            let storage_name = ClassElementName::Private(storage);
+            declare_private_name(parser, &storage_name, PrivateNameKind::Other, is_static)?;
+            let (get_body, set_param, set_body) = synthesize_auto_accessor_bodies(span, storage);
+            return Ok(vec![
+                ClassElement::Field {
+                    decorators: Vec::new(),
+                    is_static,
+                    name: storage_name,
+                    init,
+                    span,
+                },
+                ClassElement::Get {
+                    decorators,
+                    is_static,
+                    name: name.clone(),
+                    body: get_body,
+                    span,
+                },
+                ClassElement::Set {
+                    decorators: Vec::new(),
+                    is_static,
+                    name,
+                    param: set_param,
+                    init: None,
+                    body: set_body,
+                    span,
+                },
+            ]);
         }
         // A public auto-accessor is a field-like element, so the field-name
         // early errors apply; the synthesized accessor pair would bypass them.
