@@ -2110,9 +2110,9 @@ hang of 1,483 fixtures** (`--jobs 8 --batch 32 --timeout 15 --recheck-timeout
   named `#x` over a separate storage slot, so `this.#x` is the accessor (and a
   `#x` field/method/accessor elsewhere in the class is a duplicate-name
   SyntaxError) (`decorators/private-auto-accessor.js`). The
-  desugaring evaluates a *computed* auto-accessor key twice (once for the
-  synthesized getter, once for the setter); no fixture exercises a
-  side-effecting key, and it is the one known simplification.
+  desugaring evaluates a *computed* auto-accessor key exactly once: the
+  synthesized getter carries the real name and the setter a placeholder, so the
+  trio occupies one key slot in the class builder's computed-key protocol.
 - **A Temporal fixture was skipped as a false positive.**
   `Temporal/v8/calendar-day-of-week.js` is V8's ported mjsunit test (it uses
   only `PlainDate`/`PlainDateTime`), but the implemented-type allowlist in
@@ -2262,7 +2262,7 @@ ShadowRealm (64)).
   Get/Set/HasProperty protocol (getters, proxies, brand checks). Decorators on
   a static block are a SyntaxError, and a private auto-accessor (`accessor #x`)
   presents `kind:"accessor"` over its private getter/setter pair. Validated by
-  25 hand-written unit tests in the module; `all` (48632/0/1) and `staging`
+  26 hand-written unit tests in the module; `all` (48632/0/1) and `staging`
   (77/0/1406) are unchanged.
 - Known flaky fixture: `TypedArray/prototype/reduce/callbackfn-arguments-default-accumulator.js`
   (Strict) intermittently fails with `Expected SameValue(«43», «41») to be true` — the second

@@ -934,4 +934,16 @@ mod tests {
         .unwrap();
         assert_eq!(result, string("G:1,G:9"));
     }
+
+    #[test]
+    fn computed_auto_accessor_key_is_evaluated_once() {
+        let result = run("let log = [];\n\
+             function k(name) { log.push(name); return name; }\n\
+             function d(value, context) { return value; }\n\
+             class C { @d accessor [k('a')] = 1; [k('b')]() { return 'B'; } }\n\
+             let c = new C();\n\
+             log.join(',') + '|' + c.a + '|' + typeof c.b;")
+        .unwrap();
+        assert_eq!(result, string("a,b|1|function"));
+    }
 }

@@ -453,11 +453,11 @@ fn build_class(
             continue;
         }
 
-        // A decorated public auto-accessor: the parser desugars `accessor x`
-        // to a private storage Field plus a Get and a Set sharing one span,
-        // and rides the decorator list on the Get. Decorate the trio as ONE
-        // `kind:"accessor"` element; an undecorated auto-accessor falls
-        // through to the ordinary Field/Get/Set arms below.
+        // A public auto-accessor: the parser desugars `accessor x` to a private
+        // storage Field plus a Get and a Set sharing one span, and rides the
+        // decorator list on the Get. Build it here as ONE `kind:"accessor"`
+        // element (the decorators may be empty). The Get carries the key, so a
+        // computed key is evaluated once.
         if let ClassElement::Field {
             name: ClassElementName::Private(storage),
             init,
@@ -478,7 +478,6 @@ fn build_class(
                 body: set_body,
                 ..
             }) = class.elements.get(index + 1)
-            && !decorators.is_empty()
         {
             let is_static = element_is_static(element);
             let home = if is_static {

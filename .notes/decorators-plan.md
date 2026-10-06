@@ -105,8 +105,9 @@ Field + a Get + a Set sharing one span) when the Get carries decorators. The
 trio decorates as ONE `kind:"accessor"` element: the context value is
 `{ get, set }`, `access` is `{ has, get, set }`, and a returned object may
 replace `get`/`set` and supply an `init` value initializer for the backing
-storage. Undecorated auto-accessors still take the ordinary Field/Get/Set arms
-(a computed key still evaluates twice, unchanged). A private auto-accessor
+storage. Every auto-accessor (decorated or not) takes this path, so a computed
+key is evaluated exactly once (the getter carries it; the setter gets a
+placeholder name). A private auto-accessor
 (`accessor #x`) desugars to a private getter/setter pair over its storage, so
 it decorates as an accessor too. Three more tests (23 total).
 
@@ -117,7 +118,7 @@ test262 cannot gate S2/S3, so tests are written by hand (the
 calls, the context shape per kind, the class context with no
 `access`/`static`/`private`, method replacement, field value-initializers,
 `access.get/has/set` through the property protocol, and the initializer phase
-ordering, plus private elements and auto-accessors (25 tests in `decorators.rs`).
+ordering, plus private elements and auto-accessors (26 tests in `decorators.rs`).
 The evaluation arc is done, both deviations closed; `.notes/conformance.md`
 records it.
 

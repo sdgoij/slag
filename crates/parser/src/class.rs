@@ -281,6 +281,16 @@ fn auto_accessor_storage() -> crux::string::AtomId {
     intern_utf8(&format!("%auto-accessor{id}%"))
 }
 
+/// The placeholder name for the synthesized setter of a *public* auto-accessor.
+/// Its key is the getter's (the class builder's auto-accessor path reads the
+/// getter's name), and keeping the setter non-computed is what makes a computed
+/// auto-accessor key evaluate exactly once and occupy one key slot.
+fn auto_accessor_set_name() -> ClassElementName {
+    ClassElementName::Property(syntax::PropertyName::Ident(intern_utf8(
+        "%auto-accessor-set%",
+    )))
+}
+
 /// `= AssignmentExpression?` after a field/auto-accessor name, with the
 /// `super`/`new.target` allowances of a field initializer.
 fn parse_field_initializer(parser: &mut Parser) -> Result<Option<Expr>, JsError> {
@@ -424,7 +434,7 @@ fn parse_class_element(parser: &mut Parser) -> Result<Vec<ClassElement>, JsError
             ClassElement::Set {
                 decorators: Vec::new(),
                 is_static,
-                name,
+                name: auto_accessor_set_name(),
                 param: set_param,
                 init: None,
                 body: set_body,
