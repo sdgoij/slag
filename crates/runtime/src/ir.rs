@@ -30320,6 +30320,48 @@ fn script_expr_allows(expr: &Expr) -> bool {
 mod tests {
     use super::*;
 
+    /// The global slot cache is indexed by the name atom alone (`name &
+    /// (GLOBAL_CELLS - 1)`), so two names can share an index. A resolve that
+    /// misses the global object — an accessor or an absent name — must clear a
+    /// stale hit left for the colliding name, or `warm_global_cell` would read
+    /// that foreign slot, record the accessor into the global-value cell as a
+    /// data value, and skip its getter on every later read. The collision
+    /// itself is left to the atom ids; here the stale entry a collision leaves
+    /// is planted directly, which is the state the fix has to erase.
+    #[test]
+    fn a_resolve_miss_clears_a_colliding_global_slot() {
+        let mut agent = Agent::new();
+        agent.initialize_host_defined_realm().unwrap();
+
+        let data = crux::intern_utf8("__global_cell_data__");
+        let collider = crux::intern_utf8("__global_cell_collider__");
+        agent
+            .run_script("var __global_cell_data__ = 1;")
+            .expect("the global var script");
+
+        let index = Vm::global_cell_index(collider);
+        assert_ne!(
+            Vm::global_cell_index(data),
+            index,
+            "the test plants the collision, so the two names must not share an index"
+        );
+        // The state a collision leaves: `collider`'s index holds `data`'s slot.
+        agent.global_cells[index] = Some((data, 0));
+
+        Vm::resolve_global_cell(&mut agent, collider);
+        assert!(
+            agent.global_cells[index].is_none(),
+            "a resolve miss must clear a stale colliding slot"
+        );
+
+        // The hit path still records the queried name's own slot.
+        Vm::resolve_global_cell(&mut agent, data);
+        assert!(
+            matches!(agent.global_cells[Vm::global_cell_index(data)], Some((name, _)) if name == data),
+            "a data property records its own slot"
+        );
+    }
+
     /// Every step that re-enters the VM with a fresh frame disqualifies a leaf
     /// (see [`steps_are_leaf`]), and `Step::CallApply` is one of them: its handler
     /// calls the resolved `call`/`apply` directly when that is the realm's
