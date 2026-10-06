@@ -4657,7 +4657,14 @@ impl Vm {
 
     /// Resolve and cache the global-object slot for a declared top-level
     /// name (own data property only; the reference path handles the rest).
+    /// A miss CLEARS the slot: the cache is indexed by the name atom alone,
+    /// so leaving a hit for a name that collides modulo `GLOBAL_CELLS` in
+    /// place would hand that slot to an accessor global, which
+    /// `warm_global_cell` would then record as a data value and serve from
+    /// the global-value cell — caching a getter's result and skipping it on
+    /// every later read.
     fn resolve_global_cell(agent: &mut Agent, name: crux::AtomId) {
+        let index = Self::global_cell_index(name);
         let key = PropertyKey::String(name);
         let Some(global) = agent
             .running_context()
@@ -4667,11 +4674,10 @@ impl Vm {
             return;
         };
         let props = global.properties.borrow();
-        if let Some(slot) = props.iter().position(|(stored, property)| {
+        let slot = props.iter().position(|(stored, property)| {
             *stored == key && matches!(property.kind, crux::object::PropertyKind::Data { .. })
-        }) {
-            agent.global_cells[Self::global_cell_index(name)] = Some((name, slot));
-        }
+        });
+        agent.global_cells[index] = slot.map(|slot| (name, slot));
     }
 
     /// Record the JIT's global-value cell for `name` under the version read
