@@ -106,6 +106,11 @@ pub struct ClassField {
     pub private_name: Option<u64>,
     pub init: Option<syntax::ast::Expr>,
     pub environment: EnvRef,
+    /// Field-decorator value initializers `(value) => value`, applied to the
+    /// field's value in reverse order (proposal: field decorators).
+    pub decorator_inits: Vec<Value>,
+    /// Field-decorator `addInitializer` callbacks, run after the field is set.
+    pub extra_inits: Vec<Value>,
 }
 
 impl Trace for ClassField {
@@ -114,6 +119,8 @@ impl Trace for ClassField {
             symbol.trace(visit);
         }
         self.environment.trace(visit);
+        self.decorator_inits.trace(visit);
+        self.extra_inits.trace(visit);
     }
 }
 
@@ -162,6 +169,10 @@ pub struct EcmaFunction {
     /// [[PrivateMethods]]: instance private methods/accessors added to each
     /// instance by InitializeInstanceElements.
     pub private_methods: Vec<crux::object::PrivateElement>,
+    /// Decorator `addInitializer` callbacks registered by non-static
+    /// method/get/set element decorators (proposal: initializers). Run on each
+    /// instance before the fields, in registration order.
+    pub decorator_initializers: Vec<Value>,
     /// [[PrivateEnvironment]]: the class's private names, captured so method
     /// bodies and field initializers can resolve `#name`.
     pub private_environment: Option<Handle<PrivateEnvironment>>,
@@ -273,6 +284,7 @@ impl Trace for EcmaFunction {
         self.home_object.trace(visit);
         self.fields.trace(visit);
         self.private_methods.trace(visit);
+        self.decorator_initializers.trace(visit);
         self.private_environment.trace(visit);
         self.super_constructor.trace(visit);
         self.computed_keys.trace(visit);
@@ -302,6 +314,7 @@ impl EcmaFunction {
                 && self.constructor_kind == ConstructorKind::Base
                 && self.fields.is_empty()
                 && self.private_methods.is_empty()
+                && self.decorator_initializers.is_empty()
                 && !self.class_field_initializer
         })
     }
@@ -323,6 +336,7 @@ impl EcmaFunction {
         self.constructor_kind == ConstructorKind::Base
             && self.fields.is_empty()
             && self.private_methods.is_empty()
+            && self.decorator_initializers.is_empty()
             && self.this_mode != ThisMode::Lexical
             && (!self.is_method || self.is_class_constructor)
             && !self.class_field_initializer
@@ -1293,6 +1307,7 @@ fn register_function(
         is_method: kind.is_method,
         fields: Vec::new(),
         private_methods: Vec::new(),
+        decorator_initializers: Vec::new(),
         private_environment,
         super_constructor: None,
         computed_keys: Vec::new(),
@@ -1684,6 +1699,7 @@ pub fn instantiate_arrow(
         is_method: false,
         fields: Vec::new(),
         private_methods: Vec::new(),
+        decorator_initializers: Vec::new(),
         private_environment,
         super_constructor: None,
         computed_keys: Vec::new(),
@@ -3593,6 +3609,12 @@ pub fn initialize_instance_elements(
         }
         obj.private_element_add(method.clone())?;
     }
+    // Decorator initializers registered by non-static method/get/set
+    // decorators run before the fields (proposal: initializers), in
+    // registration order, with the instance as `this`.
+    for initializer in &data.decorator_initializers {
+        call(agent, initializer, Value::Object(obj), &[])?;
+    }
     // Fields (spec 7.3.27 step 2): private fields via PrivateFieldAdd.
     for field in &data.fields {
         // DefineField (spec 7.3.23): the initializer runs in the class scope
@@ -3600,7 +3622,7 @@ pub fn initialize_instance_elements(
         // class environment through the constructor's [[Environment]]). A
         // direct eval inside an initializer applies the "Eval Inside
         // Initializer" early errors (spec 19.2.1.1).
-        let value = match &field.init {
+        let mut value = match &field.init {
             Some(init) => {
                 agent.field_initializer_depth += 1;
                 // The initializer runs in a function context of its own
@@ -3626,6 +3648,10 @@ pub fn initialize_instance_elements(
             }
             None => Value::Undefined,
         };
+        // Field-decorator value initializers compose in reverse (proposal).
+        for initializer in field.decorator_inits.iter().rev() {
+            value = call(agent, initializer, Value::Object(obj), &[value])?;
+        }
         if let Some(name_id) = field.private_name {
             // The initializer may have made `this` non-extensible; the add
             // still fails then (spec 10.2.10 step 1).
@@ -3642,6 +3668,10 @@ pub fn initialize_instance_elements(
             // [[DefineOwnProperty]] step 2 — the [[GetOwnProperty]] probe).
             crate::module::ensure_deferred_namespace_evaluation_key(agent, &obj, &field.name)?;
             obj.create_data_property_or_throw_key(&field.name, value)?;
+        }
+        // Field-decorator `addInitializer` callbacks run after the field is set.
+        for initializer in &field.extra_inits {
+            call(agent, initializer, Value::Object(obj), &[])?;
         }
     }
     Ok(())

@@ -6,18 +6,24 @@
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 use crux::Function;
 use crux::error::{ErrorKind, JsError};
 use crux::handle::Handle;
+use crux::intern_utf8;
 use crux::object::JsObject;
 use crux::property::PropertyKey;
 use crux::string::JsString;
 use crux::value::{Value, ValueKind};
 
-use syntax::ast::Expr;
+use syntax::ast::{
+    AssignOp, BinaryOp, BindingElement, BindingPattern, Block, Expr, ExprKind,
+    Function as FunctionAst, MemberExpr, MemberProperty, Stmt, StmtKind,
+};
 
 use crate::agent::Agent;
+use crate::env::new_declarative_environment;
 
 /// The initializers a site's decorators registered, in registration order.
 /// Shared by every decorator of the site; each decorator gets its own
@@ -162,6 +168,300 @@ fn object_prototype(agent: &mut Agent) -> Result<Option<Handle<JsObject>>, JsErr
         .and_then(|value| crate::context::as_object(&value)))
 }
 
+/// The kind of element a decorator context distinguishes (S2b: public method,
+/// getter, setter, and field).
+#[derive(Clone, Copy)]
+pub(crate) enum ElementKind {
+    Method,
+    Getter,
+    Setter,
+    Field,
+}
+
+impl ElementKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            ElementKind::Method => "method",
+            ElementKind::Getter => "getter",
+            ElementKind::Setter => "setter",
+            ElementKind::Field => "field",
+        }
+    }
+
+    /// The `access` members present: a method/getter reads, a setter writes,
+    /// a field reads and writes.
+    fn access_members(self) -> (bool, bool) {
+        match self {
+            ElementKind::Method | ElementKind::Getter => (true, false),
+            ElementKind::Setter => (false, true),
+            ElementKind::Field => (true, true),
+        }
+    }
+}
+
+/// A public `access` operation.
+#[derive(Clone, Copy)]
+enum AccessOp {
+    Has,
+    Get,
+    Set,
+}
+
+/// The binding holding a synthesized access function's property key.
+const KEY_BINDING: &str = "%key%";
+
+/// A unique span base for each synthesized function, past any real source
+/// offset. `shared_function_body` keys its body cache on the function node's
+/// address *and* span, and every call here passes the same stack address and
+/// (0,0) spans, so two synthesized functions would otherwise share one cached
+/// body (the first `has`/`get`/`set` built would answer for all of them).
+static NEXT_SYNTH_SPAN: AtomicU32 = AtomicU32::new(0x8000_0000);
+
+/// A property key as a language value (an `access` function closes over it).
+fn key_value(key: &PropertyKey) -> Value {
+    match key {
+        PropertyKey::String(atom) => Value::String(Handle::new(crux::lookup(*atom))),
+        PropertyKey::Symbol(symbol) => Value::Symbol(*symbol),
+    }
+}
+
+/// Synthesize a public `access` function — `has(obj)`, `get(obj)`, or
+/// `set(obj, v)` — as an ordinary closure over the property key, so the
+/// operation runs the full `[[Get]]`/`[[Set]]`/`[[HasProperty]]` protocol
+/// (getters, proxies, and all) rather than a raw lookup.
+fn synthesize_access_function(
+    agent: &mut Agent,
+    key: &PropertyKey,
+    op: AccessOp,
+) -> Result<Value, JsError> {
+    let span_base = NEXT_SYNTH_SPAN.fetch_add(2, Ordering::Relaxed);
+    let span = crux::Span::new(span_base, span_base + 1);
+    let env = new_declarative_environment(Some(agent.running_context()?.lexical_environment));
+    let key_atom = intern_utf8(KEY_BINDING);
+    let key_name = crux::lookup(key_atom);
+    env.create_immutable_binding(&key_name, false)?;
+    env.initialize_binding(&key_name, key_value(key))?;
+
+    let obj_atom = intern_utf8("obj");
+    let v_atom = intern_utf8("v");
+    let ident = |atom| Expr {
+        span,
+        kind: ExprKind::Ident(atom),
+    };
+    let member = || Expr {
+        span,
+        kind: ExprKind::Member(MemberExpr {
+            object: Box::new(ident(obj_atom)),
+            property: MemberProperty::Computed(Box::new(ident(key_atom))),
+            property_token: None,
+            optional: false,
+            span,
+        }),
+    };
+    let param = |atom| BindingElement {
+        pattern: BindingPattern::Ident(atom),
+        init: None,
+        rest: false,
+        span,
+    };
+    let (params, stmt) = match op {
+        AccessOp::Has => (
+            vec![param(obj_atom)],
+            Stmt {
+                span,
+                kind: StmtKind::Return(Some(Expr {
+                    span,
+                    kind: ExprKind::Binary {
+                        op: BinaryOp::In,
+                        left: Box::new(ident(key_atom)),
+                        right: Box::new(ident(obj_atom)),
+                    },
+                })),
+            },
+        ),
+        AccessOp::Get => (
+            vec![param(obj_atom)],
+            Stmt {
+                span,
+                kind: StmtKind::Return(Some(member())),
+            },
+        ),
+        AccessOp::Set => (
+            vec![param(obj_atom), param(v_atom)],
+            Stmt {
+                span,
+                kind: StmtKind::Expr(Expr {
+                    span,
+                    kind: ExprKind::Assign {
+                        op: AssignOp::Assign,
+                        target: Box::new(member()),
+                        value: Box::new(ident(v_atom)),
+                    },
+                }),
+            },
+        ),
+    };
+    let function = FunctionAst {
+        span,
+        name: None,
+        params,
+        body: Block {
+            stmts: vec![stmt],
+            span,
+        },
+        is_async: false,
+        is_generator: false,
+        statement_position: false,
+    };
+    crate::function::instantiate_method(agent, &function, env, true)
+}
+
+/// Decorate a public method/getter/setter (spec: DecorateClassElement): call
+/// its decorators with the closure and an element context, in reverse source
+/// order, applying a returned callable as the replacement. Returns the final
+/// closure and the `addInitializer` callbacks, in registration order.
+pub(crate) fn decorate_element(
+    agent: &mut Agent,
+    decorators: &[Expr],
+    strict: bool,
+    kind: ElementKind,
+    key: &PropertyKey,
+    is_static: bool,
+    value: Value,
+) -> Result<(Value, Vec<Value>), JsError> {
+    let decorators = evaluate_decorators(agent, decorators, strict)?;
+    let initializers: InitializerList = Rc::new(RefCell::new(Vec::new()));
+    let mut current = value;
+    for decorator in decorators.iter().rev() {
+        if !crux::value::is_callable(decorator) {
+            return Err(JsError::new(
+                ErrorKind::TypeError,
+                "decorator must be callable".into(),
+            ));
+        }
+        let finished = Rc::new(Cell::new(false));
+        let context = element_context(agent, kind, key, is_static, &initializers, &finished)?;
+        let result =
+            crate::function::call(agent, decorator, Value::Undefined, &[current, context])?;
+        finished.set(true);
+        match result.kind() {
+            ValueKind::Undefined => {}
+            _ if crux::value::is_callable(&result) => current = result,
+            _ => {
+                return Err(JsError::new(
+                    ErrorKind::TypeError,
+                    "method decorator returned a non-callable".into(),
+                ));
+            }
+        }
+    }
+    let taken = std::mem::take(&mut *initializers.borrow_mut());
+    Ok((current, taken))
+}
+
+/// Decorate a public field (spec: DecorateClassElement): call its decorators
+/// with `undefined` and a field context, in reverse source order. A returned
+/// callable is a value initializer applied to the field's value; the
+/// `addInitializer` callbacks run after the field is set. Returns the two
+/// lists, in registration order.
+pub(crate) fn decorate_field(
+    agent: &mut Agent,
+    decorators: &[Expr],
+    strict: bool,
+    key: &PropertyKey,
+    is_static: bool,
+) -> Result<(Vec<Value>, Vec<Value>), JsError> {
+    let decorators = evaluate_decorators(agent, decorators, strict)?;
+    let initializers: InitializerList = Rc::new(RefCell::new(Vec::new()));
+    let mut value_initializers = Vec::new();
+    for decorator in decorators.iter().rev() {
+        if !crux::value::is_callable(decorator) {
+            return Err(JsError::new(
+                ErrorKind::TypeError,
+                "decorator must be callable".into(),
+            ));
+        }
+        let finished = Rc::new(Cell::new(false));
+        let context = element_context(
+            agent,
+            ElementKind::Field,
+            key,
+            is_static,
+            &initializers,
+            &finished,
+        )?;
+        let result = crate::function::call(
+            agent,
+            decorator,
+            Value::Undefined,
+            &[Value::Undefined, context],
+        )?;
+        finished.set(true);
+        match result.kind() {
+            ValueKind::Undefined => {}
+            _ if crux::value::is_callable(&result) => value_initializers.push(result),
+            _ => {
+                return Err(JsError::new(
+                    ErrorKind::TypeError,
+                    "field decorator returned a non-callable".into(),
+                ));
+            }
+        }
+    }
+    let extras = std::mem::take(&mut *initializers.borrow_mut());
+    Ok((value_initializers, extras))
+}
+
+/// An element decorator's context object: `{ kind, name, static, private,
+/// access, addInitializer }` (public elements, so `private` is false).
+fn element_context(
+    agent: &mut Agent,
+    kind: ElementKind,
+    key: &PropertyKey,
+    is_static: bool,
+    initializers: &InitializerList,
+    finished: &Rc<Cell<bool>>,
+) -> Result<Value, JsError> {
+    let object = JsObject::ordinary_object_create(object_prototype(agent)?);
+    object.create_data_property_or_throw_key(
+        &PropertyKey::from_utf8("kind"),
+        Value::String(Handle::new(JsString::from_utf8(kind.as_str()))),
+    )?;
+    object.create_data_property_or_throw_key(&PropertyKey::from_utf8("name"), key_value(key))?;
+    object.create_data_property_or_throw_key(
+        &PropertyKey::from_utf8("static"),
+        Value::Boolean(is_static),
+    )?;
+    object.create_data_property_or_throw_key(
+        &PropertyKey::from_utf8("private"),
+        Value::Boolean(false),
+    )?;
+
+    let access = JsObject::ordinary_object_create(object_prototype(agent)?);
+    let has = synthesize_access_function(agent, key, AccessOp::Has)?;
+    access.create_data_property_or_throw_key(&PropertyKey::from_utf8("has"), has)?;
+    let (wants_get, wants_set) = kind.access_members();
+    if wants_get {
+        let get = synthesize_access_function(agent, key, AccessOp::Get)?;
+        access.create_data_property_or_throw_key(&PropertyKey::from_utf8("get"), get)?;
+    }
+    if wants_set {
+        let set = synthesize_access_function(agent, key, AccessOp::Set)?;
+        access.create_data_property_or_throw_key(&PropertyKey::from_utf8("set"), set)?;
+    }
+    object.create_data_property_or_throw_key(
+        &PropertyKey::from_utf8("access"),
+        Value::Object(access),
+    )?;
+
+    let add_initializer = add_initializer_function(agent, initializers, finished)?;
+    object.create_data_property_or_throw_key(
+        &PropertyKey::from_utf8("addInitializer"),
+        add_initializer,
+    )?;
+    Ok(Value::Object(object))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -253,6 +553,102 @@ mod tests {
             "function d(value, context) { return 42; }\n\
              let message;\n\
              try { let C = @d class {}; message = 'no-throw'; } catch (e) { message = e.constructor.name; }\n\
+             message;",
+        )
+        .unwrap();
+        assert_eq!(result, string("TypeError"));
+    }
+
+    #[test]
+    fn element_context_is_shaped_by_kind() {
+        let result = run(
+            "let seen = [];\n\
+             function d(value, context) { seen.push(context.kind + ':' + context.name + ':' + Object.keys(context.access).sort().join(',')); return value; }\n\
+             class C { @d m() {} @d get g() { return 1; } @d set s(v) {} @d f; }\n\
+             seen.join(' ');",
+        )
+        .unwrap();
+        assert_eq!(
+            result,
+            string("method:m:get,has getter:g:get,has setter:s:has,set field:f:get,has,set")
+        );
+    }
+
+    #[test]
+    fn method_decorator_return_replaces_the_method() {
+        let result = run(
+            "function d(value, context) { return function () { return 'wrapped'; }; }\n\
+             class C { @d m() { return 'orig'; } }\n\
+             new C().m();",
+        )
+        .unwrap();
+        assert_eq!(result, string("wrapped"));
+    }
+
+    #[test]
+    fn field_decorator_value_initializer_transforms_the_value() {
+        let result = run(
+            "function d(value, context) { return function (init) { return init + 1; }; }\n\
+             class C { @d f = 41; }\n\
+             new C().f;",
+        )
+        .unwrap();
+        assert_eq!(result, Value::Number(42.0));
+    }
+
+    #[test]
+    fn instance_method_initializer_runs_before_fields() {
+        let result = run(
+            "let order = [];\n\
+             function d(value, context) { context.addInitializer(function () { order.push('init'); }); return value; }\n\
+             class C { @d m() {} f = (order.push('field'), 1); }\n\
+             new C();\n\
+             order.join(',');",
+        )
+        .unwrap();
+        assert_eq!(result, string("init,field"));
+    }
+
+    #[test]
+    fn static_method_initializer_runs_before_static_fields() {
+        let result = run(
+            "let order = [];\n\
+             function d(value, context) { context.addInitializer(function () { order.push('init'); }); return value; }\n\
+             class C { @d static m() {} static f = (order.push('field'), 1); }\n\
+             order.join(',');",
+        )
+        .unwrap();
+        assert_eq!(result, string("init,field"));
+    }
+
+    #[test]
+    fn access_get_and_set_use_the_property_protocol() {
+        let result = run("let acc;\n\
+             function d(value, context) { acc = context.access; return value; }\n\
+             class C { @d get g() { return this.x; } }\n\
+             let c = new C(); c.x = 5;\n\
+             String(acc.get(c)) + ',' + acc.has(c);")
+        .unwrap();
+        assert_eq!(result, string("5,true"));
+    }
+
+    #[test]
+    fn element_decorators_call_in_reverse_source_order() {
+        let result = run("let log = [];\n\
+             function a(value, context) { log.push('a'); return value; }\n\
+             function b(value, context) { log.push('b'); return value; }\n\
+             class C { @a @b m() {} }\n\
+             log.join(',');")
+        .unwrap();
+        assert_eq!(result, string("b,a"));
+    }
+
+    #[test]
+    fn non_callable_method_decorator_result_throws() {
+        let result = run(
+            "function d(value, context) { return 5; }\n\
+             let message;\n\
+             try { class C { @d m() {} } message = 'no-throw'; } catch (e) { message = e.constructor.name; }\n\
              message;",
         )
         .unwrap();

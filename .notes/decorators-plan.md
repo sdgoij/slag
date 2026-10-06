@@ -75,23 +75,19 @@ the static fields, throwing on a late `addInitializer` or a non-callable result.
 `build_class` wires it in before the static-elements loop. Seven unit tests in
 the module; main sweep unchanged (48632/0/1).
 
-**S2b — element decorators (next).** In `crates/runtime/src/class.rs::build_class`,
-for each element with a non-empty `decorators` list:
-
-1. Build the `context` object: `kind`, `name` (key or `undefined`), `static`,
-   `private`, `access` (per the table), and `addInitializer`.
-2. Evaluate/applying order: call decorators reverse-source-order, threading the
-   value through; record `undefined` returns as "unchanged".
-3. Apply the result: replace the method/accessor function, or attach a field
-   initializer that wraps the existing initializer.
-4. Collect initializers and run them at the correct phase (see above).
-5. Class decorators: after the class value exists, call `(ctor, context)` with
-   `kind:"class"`, apply a returned replacement, then run class initializers.
-
-Needs a `context` helper in `crates/runtime/src/context.rs` and a
-`decorate_class_element(...)` in `class.rs` invoked at the top of the element
-loop. The compiled path (`ir.rs::compile_class`) only precomputes computed keys
-and delegates to `build_class`, so S2 is interpreter-side.
+**S2b done — public element decorators.** `decorate_element` (method/getter/
+setter) and `decorate_field` build the `{kind, name, static, private:false,
+access, addInitializer}` context and call the decorators in reverse source order.
+`access` is synthesized as real JS closures over the key (`obj[k]`, `k in obj`,
+`obj[k] = v`) so it runs the full `[[Get]]`/`[[Set]]`/`[[HasProperty]]` protocol
+— note the trap: a synthesized function must carry a *unique* span, or
+`shared_function_body` (keyed on the function node's address *and* span) hands
+the first-built body to all of them. Method/get/set replacement and field
+value-initializers apply; instance initializers are stored on the constructor
+(`EcmaFunction::decorator_initializers`, run before the fields) and static
+initializers run before the static fields. Private elements and auto-accessors
+stay unevaluated (S3). Fifteen unit tests in the module; main 48632/0/1 and
+staging 77/0/1406 unchanged.
 
 ## S3 — auto-accessor + private
 
@@ -103,11 +99,13 @@ and implement private elements (`name` is the `"#name"` string, `private:true`).
 
 ## S4 — hand-written tests + notes
 
-test262 cannot gate S2/S3, so tests must be written by hand (the
-`crates/runtime/src/**` `mod tests` `run(...)` style). Cover, at minimum:
-reverse-order calls, context shape per kind, class context with no
-`access`/`static`/`private`, field-initializer return, `access.get/has/set`,
-and initializer phase ordering. Update `.notes/conformance.md`.
+test262 cannot gate S2/S3, so tests are written by hand (the
+`crates/runtime/src/**` `mod tests` `run(...)` style). S2a/S2b cover reverse-order
+calls, the context shape per kind, the class context with no
+`access`/`static`/`private`, method replacement, field value-initializers,
+`access.get/has/set` through the property protocol, and the initializer phase
+ordering (15 tests in `decorators.rs`). S3 adds auto-accessor/private coverage.
+Update `.notes/conformance.md` when the evaluation arc completes.
 
 ## Traps
 

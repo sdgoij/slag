@@ -432,6 +432,11 @@ fn build_class(
     agent.running_context_mut()?.private_environment = Some(class_private_env);
     let mut computed_key_index = 0;
     let mut computed_keys: Vec<PropertyKey> = Vec::new();
+    // Decorator `addInitializer` callbacks: instance ones apply per instance
+    // (stored on the constructor), static ones run after the static methods
+    // are installed and before the static fields (proposal: initializers).
+    let mut instance_decorator_initializers: Vec<Value> = Vec::new();
+    let mut static_decorator_initializers: Vec<Value> = Vec::new();
     for element in &class.elements {
         if matches!(
             element,
@@ -451,14 +456,40 @@ fn build_class(
             Value::Object(proto)
         };
         match element {
-            ClassElement::Method { name, function, .. } => {
+            ClassElement::Method {
+                name,
+                function,
+                decorators,
+                ..
+            } => {
                 let (private_id, key) =
                     element_key_with(agent, name, strict, precomputed_keys, computed_key_index)?;
                 record_computed_key(&mut computed_keys, element, &key);
-                let closure = instantiate_method(agent, function, class_env, true)?;
+                let mut closure = instantiate_method(agent, function, class_env, true)?;
                 set_private_environment(agent, &closure, &class_private_env)?;
                 make_method(agent, &closure, home)?;
                 set_function_name(&closure, &element_name_text(name, key.as_ref()), None)?;
+                if private_id.is_none()
+                    && !decorators.is_empty()
+                    && let Some(key) = &key
+                {
+                    let (decorated, initializers) = crate::decorators::decorate_element(
+                        agent,
+                        decorators,
+                        strict,
+                        crate::decorators::ElementKind::Method,
+                        key,
+                        is_static,
+                        closure,
+                    )?;
+                    closure = decorated;
+                    route_decorator_initializers(
+                        is_static,
+                        initializers,
+                        &mut instance_decorator_initializers,
+                        &mut static_decorator_initializers,
+                    );
+                }
                 if let Some(name_id) = private_id {
                     // PrivateMethodOrAccessorAdd (spec 10.2.13).
                     let element = crux::object::PrivateElement {
@@ -475,12 +506,16 @@ fn build_class(
                 }
             }
             ClassElement::Get {
-                name, body, span, ..
+                name,
+                body,
+                span,
+                decorators,
+                ..
             } => {
                 let (private_id, key) =
                     element_key_with(agent, name, strict, precomputed_keys, computed_key_index)?;
                 record_computed_key(&mut computed_keys, element, &key);
-                let getter = instantiate_accessor(
+                let mut getter = instantiate_accessor(
                     agent,
                     Vec::new(),
                     body,
@@ -491,6 +526,27 @@ fn build_class(
                 set_private_environment(agent, &getter, &class_private_env)?;
                 make_method(agent, &getter, home)?;
                 set_function_name(&getter, &element_name_text(name, key.as_ref()), Some("get"))?;
+                if private_id.is_none()
+                    && !decorators.is_empty()
+                    && let Some(key) = &key
+                {
+                    let (decorated, initializers) = crate::decorators::decorate_element(
+                        agent,
+                        decorators,
+                        strict,
+                        crate::decorators::ElementKind::Getter,
+                        key,
+                        is_static,
+                        getter,
+                    )?;
+                    getter = decorated;
+                    route_decorator_initializers(
+                        is_static,
+                        initializers,
+                        &mut instance_decorator_initializers,
+                        &mut static_decorator_initializers,
+                    );
+                }
                 if let Some(name_id) = private_id {
                     let element = crux::object::PrivateElement {
                         name_id,
@@ -514,12 +570,13 @@ fn build_class(
                 init,
                 body,
                 span,
+                decorators,
                 ..
             } => {
                 let (private_id, key) =
                     element_key_with(agent, name, strict, precomputed_keys, computed_key_index)?;
                 record_computed_key(&mut computed_keys, element, &key);
-                let setter = instantiate_accessor(
+                let mut setter = instantiate_accessor(
                     agent,
                     vec![BindingElement {
                         pattern: param.clone(),
@@ -535,6 +592,27 @@ fn build_class(
                 set_private_environment(agent, &setter, &class_private_env)?;
                 make_method(agent, &setter, home)?;
                 set_function_name(&setter, &element_name_text(name, key.as_ref()), Some("set"))?;
+                if private_id.is_none()
+                    && !decorators.is_empty()
+                    && let Some(key) = &key
+                {
+                    let (decorated, initializers) = crate::decorators::decorate_element(
+                        agent,
+                        decorators,
+                        strict,
+                        crate::decorators::ElementKind::Setter,
+                        key,
+                        is_static,
+                        setter,
+                    )?;
+                    setter = decorated;
+                    route_decorator_initializers(
+                        is_static,
+                        initializers,
+                        &mut instance_decorator_initializers,
+                        &mut static_decorator_initializers,
+                    );
+                }
                 if let Some(name_id) = private_id {
                     let element = crux::object::PrivateElement {
                         name_id,
@@ -552,10 +630,23 @@ fn build_class(
                     define_accessor_property(&home, &key, None, Some(setter))?;
                 }
             }
-            ClassElement::Field { name, init, .. } => {
+            ClassElement::Field {
+                name,
+                init,
+                decorators,
+                ..
+            } => {
                 let (private_id, key) =
                     element_key_with(agent, name, strict, precomputed_keys, computed_key_index)?;
                 record_computed_key(&mut computed_keys, element, &key);
+                let (decorator_inits, extra_inits) = if private_id.is_none()
+                    && !decorators.is_empty()
+                    && let Some(key) = &key
+                {
+                    crate::decorators::decorate_field(agent, decorators, strict, key, is_static)?
+                } else {
+                    (Vec::new(), Vec::new())
+                };
                 if let Some(name_id) = private_id {
                     let ClassElementName::Private(atom) = name else {
                         unreachable!("private id implies a private name");
@@ -569,6 +660,8 @@ fn build_class(
                                 crux::lookup(*atom).to_string_lossy()
                             )),
                             init: init.clone(),
+                            decorator_inits: Vec::new(),
+                            extra_inits: Vec::new(),
                         });
                     } else {
                         fields.push(crate::function::ClassField {
@@ -576,6 +669,8 @@ fn build_class(
                             private_name: Some(name_id),
                             init: init.clone(),
                             environment: class_env,
+                            decorator_inits: Vec::new(),
+                            extra_inits: Vec::new(),
                         });
                     }
                 } else if is_static {
@@ -584,6 +679,8 @@ fn build_class(
                         private_name: None,
                         name_text: crate::expr::property_key_display(key.as_ref().unwrap()),
                         init: init.clone(),
+                        decorator_inits,
+                        extra_inits,
                     });
                 } else {
                     fields.push(crate::function::ClassField {
@@ -591,6 +688,8 @@ fn build_class(
                         private_name: None,
                         init: init.clone(),
                         environment: class_env,
+                        decorator_inits,
+                        extra_inits,
                     });
                 }
             }
@@ -614,6 +713,7 @@ fn build_class(
     if let Some(data) = agent.ecma_functions.get_mut(&ctor_handle.id()) {
         data.fields = fields;
         data.private_methods = instance_private_methods;
+        data.decorator_initializers = instance_decorator_initializers;
         data.private_environment = Some(class_private_env);
         data.computed_keys = computed_keys;
         // Cut 33: fields/private methods arrive after registration, so the
@@ -633,6 +733,13 @@ fn build_class(
     // and private names visible.
     agent.running_context_mut()?.lexical_environment = class_env;
     agent.running_context_mut()?.private_environment = Some(class_private_env);
+
+    // Static method/get/set decorator initializers run after the static methods
+    // are installed and before the static fields (proposal: initializers),
+    // with the class as `this`.
+    for initializer in &static_decorator_initializers {
+        crate::function::call(agent, initializer, ctor, &[])?;
+    }
 
     // Class decorators are called after every element decorator and applied
     // before the static fields run (proposal: applying decorators); their
@@ -656,14 +763,19 @@ fn build_class(
                 private_name,
                 name_text,
                 init,
+                decorator_inits,
+                extra_inits,
             } => {
-                let value = evaluate_static_field_initializer(
+                let mut value = evaluate_static_field_initializer(
                     agent,
                     init.as_ref(),
                     &ctor,
                     &class_env,
                     &class_private_env,
                 )?;
+                for initializer in decorator_inits.iter().rev() {
+                    value = crate::function::call(agent, initializer, ctor, &[value])?;
+                }
                 // DefineField step 7: an anonymous function definition takes
                 // the field name.
                 if init
@@ -679,6 +791,9 @@ fn build_class(
                         return Ok(ctor);
                     };
                     obj.create_data_property_or_throw_key(key.as_ref().unwrap(), value)?;
+                }
+                for initializer in extra_inits {
+                    crate::function::call(agent, initializer, ctor, &[])?;
                 }
             }
             StaticElement::Block(block) => {
@@ -710,6 +825,12 @@ enum StaticElement {
         /// (DefineField step 7): the property key display or `#name`.
         name_text: JsString,
         init: Option<Expr>,
+        /// Field-decorator value initializers, applied to the value in
+        /// reverse order (proposal: field decorators).
+        decorator_inits: Vec<Value>,
+        /// Field-decorator `addInitializer` callbacks, run after the field is
+        /// set.
+        extra_inits: Vec<Value>,
     },
     Block(Block),
 }
@@ -751,6 +872,21 @@ fn element_is_static(element: &ClassElement) -> bool {
         | ClassElement::Set { is_static, .. }
         | ClassElement::Field { is_static, .. } => *is_static,
         ClassElement::StaticBlock(_) => true,
+    }
+}
+
+/// Route a decorated element's `addInitializer` callbacks to the instance or
+/// the static list (proposal: initializers).
+fn route_decorator_initializers(
+    is_static: bool,
+    initializers: Vec<Value>,
+    instance: &mut Vec<Value>,
+    static_initializers: &mut Vec<Value>,
+) {
+    if is_static {
+        static_initializers.extend(initializers);
+    } else {
+        instance.extend(initializers);
     }
 }
 
