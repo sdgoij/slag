@@ -437,7 +437,10 @@ fn build_class(
     // are installed and before the static fields (proposal: initializers).
     let mut instance_decorator_initializers: Vec<Value> = Vec::new();
     let mut static_decorator_initializers: Vec<Value> = Vec::new();
-    for element in &class.elements {
+    let mut index = 0;
+    while index < class.elements.len() {
+        let element = &class.elements[index];
+        index += 1;
         if matches!(
             element,
             ClassElement::Method {
@@ -449,6 +452,147 @@ fn build_class(
         ) {
             continue;
         }
+
+        // A decorated public auto-accessor: the parser desugars `accessor x`
+        // to a private storage Field plus a Get and a Set sharing one span,
+        // and rides the decorator list on the Get. Decorate the trio as ONE
+        // `kind:"accessor"` element; an undecorated auto-accessor falls
+        // through to the ordinary Field/Get/Set arms below.
+        if let ClassElement::Field {
+            name: ClassElementName::Private(storage),
+            init,
+            span,
+            ..
+        } = element
+            && is_auto_accessor_storage(*storage)
+            && let Some(
+                get_element @ ClassElement::Get {
+                    name: get_name,
+                    body: get_body,
+                    decorators,
+                    ..
+                },
+            ) = class.elements.get(index)
+            && let Some(ClassElement::Set {
+                param,
+                body: set_body,
+                ..
+            }) = class.elements.get(index + 1)
+            && !decorators.is_empty()
+        {
+            let is_static = element_is_static(element);
+            let home = if is_static {
+                ctor
+            } else {
+                Value::Object(proto)
+            };
+            let (_, accessor_key) = element_key_with(
+                agent,
+                get_name,
+                strict,
+                precomputed_keys,
+                computed_key_index,
+            )?;
+            let accessor_key = accessor_key.expect("auto-accessor name is public");
+            record_computed_key(&mut computed_keys, get_element, &Some(accessor_key.clone()));
+
+            let getter = instantiate_accessor(
+                agent,
+                Vec::new(),
+                get_body,
+                class_env,
+                true,
+                crate::function::capture_source(agent, *span),
+            )?;
+            set_private_environment(agent, &getter, &class_private_env)?;
+            make_method(agent, &getter, home)?;
+            set_function_name(
+                &getter,
+                &element_name_text(get_name, Some(&accessor_key)),
+                Some("get"),
+            )?;
+            let setter = instantiate_accessor(
+                agent,
+                vec![BindingElement {
+                    pattern: param.clone(),
+                    init: None,
+                    rest: false,
+                    span: *span,
+                }],
+                set_body,
+                class_env,
+                true,
+                crate::function::capture_source(agent, *span),
+            )?;
+            set_private_environment(agent, &setter, &class_private_env)?;
+            make_method(agent, &setter, home)?;
+            set_function_name(
+                &setter,
+                &element_name_text(get_name, Some(&accessor_key)),
+                Some("set"),
+            )?;
+
+            let element_name = crate::decorators::ElementName::Public(&accessor_key);
+            let crate::decorators::AccessorDecoration {
+                get,
+                set,
+                init: accessor_init,
+                initializers,
+            } = crate::decorators::decorate_accessor(
+                agent,
+                decorators,
+                strict,
+                &element_name,
+                is_static,
+                getter,
+                setter,
+            )?;
+            define_accessor_property(&home, &accessor_key, Some(get), Some(set))?;
+
+            let storage_id = element_key_with(
+                agent,
+                &ClassElementName::Private(*storage),
+                strict,
+                precomputed_keys,
+                computed_key_index,
+            )?
+            .0
+            .expect("auto-accessor storage is private");
+            let decorator_inits: Vec<Value> = accessor_init.into_iter().collect();
+            let storage_text =
+                JsString::from_utf8(&format!("#{}", crux::lookup(*storage).to_string_lossy()));
+            if is_static {
+                static_elements.push(StaticElement::Field {
+                    key: None,
+                    private_name: Some(storage_id),
+                    name_text: storage_text,
+                    init: init.clone(),
+                    decorator_inits,
+                    extra_inits: Vec::new(),
+                });
+            } else {
+                fields.push(crate::function::ClassField {
+                    name: PropertyKey::from_utf8(""),
+                    private_name: Some(storage_id),
+                    init: init.clone(),
+                    environment: class_env,
+                    decorator_inits,
+                    extra_inits: Vec::new(),
+                });
+            }
+            route_decorator_initializers(
+                is_static,
+                initializers,
+                &mut instance_decorator_initializers,
+                &mut static_decorator_initializers,
+            );
+            index += 2;
+            if has_computed_public_name(get_element) {
+                computed_key_index += 1;
+            }
+            continue;
+        }
+
         let is_static = element_is_static(element);
         let home = if is_static {
             ctor
@@ -879,6 +1023,14 @@ fn element_is_static(element: &ClassElement) -> bool {
         | ClassElement::Field { is_static, .. } => *is_static,
         ClassElement::StaticBlock(_) => true,
     }
+}
+
+/// Whether a private name is the hidden storage of a parser-desugared public
+/// auto-accessor (`accessor x` becomes a field named `%auto-accessorN%`).
+fn is_auto_accessor_storage(atom: crux::string::AtomId) -> bool {
+    crux::lookup(atom)
+        .to_string_lossy()
+        .starts_with("%auto-accessor")
 }
 
 /// The element name a decorator sees: a public key, or a private name paired

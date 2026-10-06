@@ -176,6 +176,7 @@ pub(crate) enum ElementKind {
     Getter,
     Setter,
     Field,
+    Accessor,
 }
 
 impl ElementKind {
@@ -185,16 +186,17 @@ impl ElementKind {
             ElementKind::Getter => "getter",
             ElementKind::Setter => "setter",
             ElementKind::Field => "field",
+            ElementKind::Accessor => "accessor",
         }
     }
 
     /// The `access` members present: a method/getter reads, a setter writes,
-    /// a field reads and writes.
+    /// a field or auto-accessor reads and writes.
     fn access_members(self) -> (bool, bool) {
         match self {
             ElementKind::Method | ElementKind::Getter => (true, false),
             ElementKind::Setter => (false, true),
-            ElementKind::Field => (true, true),
+            ElementKind::Field | ElementKind::Accessor => (true, true),
         }
     }
 }
@@ -459,6 +461,109 @@ pub(crate) fn decorate_field(
     }
     let extras = std::mem::take(&mut *initializers.borrow_mut());
     Ok((value_initializers, extras))
+}
+
+/// A decorated auto-accessor's outcome: the (possibly replaced) get/set, the
+/// optional value initializer for the backing storage, and the
+/// `addInitializer` callbacks.
+pub(crate) struct AccessorDecoration {
+    pub get: Value,
+    pub set: Value,
+    pub init: Option<Value>,
+    pub initializers: Vec<Value>,
+}
+
+/// Decorate a public auto-accessor (spec: DecorateClassElement, `kind:
+/// "accessor"`): call its decorators with the `{ get, set }` pair and an
+/// accessor context, in reverse source order. A returned object may carry
+/// replacement `get`/`set` and an `init` value initializer.
+pub(crate) fn decorate_accessor(
+    agent: &mut Agent,
+    decorators: &[Expr],
+    strict: bool,
+    name: &ElementName,
+    is_static: bool,
+    get: Value,
+    set: Value,
+) -> Result<AccessorDecoration, JsError> {
+    let decorators = evaluate_decorators(agent, decorators, strict)?;
+    let initializers: InitializerList = Rc::new(RefCell::new(Vec::new()));
+    let mut current_get = get;
+    let mut current_set = set;
+    let mut current_init = None;
+    for decorator in decorators.iter().rev() {
+        if !crux::value::is_callable(decorator) {
+            return Err(JsError::new(
+                ErrorKind::TypeError,
+                "decorator must be callable".into(),
+            ));
+        }
+        let finished = Rc::new(Cell::new(false));
+        let context = element_context(
+            agent,
+            ElementKind::Accessor,
+            name,
+            is_static,
+            &initializers,
+            &finished,
+        )?;
+        let value = accessor_value(agent, current_get, current_set)?;
+        let result = crate::function::call(agent, decorator, Value::Undefined, &[value, context])?;
+        finished.set(true);
+        match result.kind() {
+            ValueKind::Undefined => {}
+            ValueKind::Object(_) => {
+                if let Some(get) = accessor_result_property(agent, &result, "get")? {
+                    current_get = get;
+                }
+                if let Some(set) = accessor_result_property(agent, &result, "set")? {
+                    current_set = set;
+                }
+                if let Some(init) = accessor_result_property(agent, &result, "init")? {
+                    current_init = Some(init);
+                }
+            }
+            _ => {
+                return Err(JsError::new(
+                    ErrorKind::TypeError,
+                    "accessor decorator returned a non-object".into(),
+                ));
+            }
+        }
+    }
+    let taken = std::mem::take(&mut *initializers.borrow_mut());
+    Ok(AccessorDecoration {
+        get: current_get,
+        set: current_set,
+        init: current_init,
+        initializers: taken,
+    })
+}
+
+/// The `{ get, set }` object an auto-accessor decorator receives.
+fn accessor_value(agent: &mut Agent, get: Value, set: Value) -> Result<Value, JsError> {
+    let object = JsObject::ordinary_object_create(object_prototype(agent)?);
+    object.create_data_property_or_throw_key(&PropertyKey::from_utf8("get"), get)?;
+    object.create_data_property_or_throw_key(&PropertyKey::from_utf8("set"), set)?;
+    Ok(Value::Object(object))
+}
+
+/// Read one `get`/`set`/`init` member of an auto-accessor decorator's returned
+/// object: `undefined` (absent) or a callable, else a TypeError.
+fn accessor_result_property(
+    agent: &mut Agent,
+    result: &Value,
+    key: &str,
+) -> Result<Option<Value>, JsError> {
+    let value = crate::context::get_property(agent, result, &JsString::from_utf8(key), *result)?;
+    match value.kind() {
+        ValueKind::Undefined => Ok(None),
+        _ if crux::value::is_callable(&value) => Ok(Some(value)),
+        _ => Err(JsError::new(
+            ErrorKind::TypeError,
+            format!("accessor {key} must be callable or undefined"),
+        )),
+    }
 }
 
 /// An element decorator's context object: `{ kind, name, static, private,
@@ -763,5 +868,47 @@ mod tests {
         )
         .unwrap();
         assert_eq!(result, string("W"));
+    }
+
+    #[test]
+    fn accessor_decorator_sees_one_accessor_context() {
+        let result = run(
+            "let seen;\n\
+             function d(value, context) { seen = context.kind + ':' + context.name + ':' + Object.keys(value).sort().join(',') + ':' + Object.keys(context.access).sort().join(','); return value; }\n\
+             class C { @d accessor x = 1; }\n\
+             seen;",
+        )
+        .unwrap();
+        assert_eq!(result, string("accessor:x:get,set:get,has,set"));
+    }
+
+    #[test]
+    fn accessor_decorator_wraps_get_set_and_init() {
+        let result = run(
+            "function d(value, context) {\n\
+               const get = value.get, set = value.set;\n\
+               return { get() { return 'G:' + get.call(this); }, set(v) { set.call(this, v * 2); }, init(v) { return v + 100; } };\n\
+             }\n\
+             class C { @d accessor x = 1; }\n\
+             let c = new C();\n\
+             let before = c.x;\n\
+             c.x = 5;\n\
+             before + ',' + c.x;",
+        )
+        .unwrap();
+        assert_eq!(result, string("G:101,G:10"));
+    }
+
+    #[test]
+    fn accessor_access_reads_and_writes() {
+        let result = run("let acc;\n\
+             function d(value, context) { acc = context.access; return value; }\n\
+             class C { @d accessor x = 7; }\n\
+             let c = new C();\n\
+             let first = acc.get(c);\n\
+             acc.set(c, 3);\n\
+             acc.has(c) + ',' + first + ',' + c.x;")
+        .unwrap();
+        assert_eq!(result, string("true,7,3"));
     }
 }

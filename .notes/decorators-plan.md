@@ -89,7 +89,7 @@ initializers run before the static fields. Private elements and auto-accessors
 stay unevaluated (S3). Fifteen unit tests in the module; main 48632/0/1 and
 staging 77/0/1406 unchanged.
 
-## S3 — private elements (done) + auto-accessors (next)
+## S3 — private elements + auto-accessors (done)
 
 **S3a done — private elements.** `ElementName` generalizes an element's name to
 a public key or a private name + the class PrivateEnvironment; the synthesized
@@ -99,13 +99,16 @@ private element. `context.name` is the `"#name"` description and `private` is
 true. Private method/get/set/field decoration (including field value
 initializers) all work. Five more unit tests (20 total); sweeps unchanged.
 
-**S3b — auto-accessors (next).** `accessor x = 1` desugars in the parser to a
-storage `Field` (`%auto-accessorN%`) + `Get` + `Set` sharing one span, with the
-decorator list riding the getter. Decorating it must present ONE `kind:"accessor"`
-context (`value = {get, set}`, `access = {has,get,set}`, and an `init` return
-that transforms the backing value), not separate getter/setter decorations. The
-open design choice is detection (recognize the trio by shared span +
-`%auto-accessor%` storage) versus adding an AST `Accessor` element.
+**S3b done — auto-accessors.** `build_class` now indexes the element list and
+recognizes the parser's desugared trio (a private `%auto-accessorN%` storage
+Field + a Get + a Set sharing one span) when the Get carries decorators. The
+trio decorates as ONE `kind:"accessor"` element: the context value is
+`{ get, set }`, `access` is `{ has, get, set }`, and a returned object may
+replace `get`/`set` and supply an `init` value initializer for the backing
+storage. Undecorated auto-accessors still take the ordinary Field/Get/Set arms
+(a computed key still evaluates twice, unchanged). A *private* auto-accessor
+(`accessor #x`) desugars to a single field, so its decorators apply as a field,
+not an accessor — a documented deviation. Three more tests (23 total).
 
 ## S4 — hand-written tests + notes
 
@@ -114,7 +117,7 @@ test262 cannot gate S2/S3, so tests are written by hand (the
 calls, the context shape per kind, the class context with no
 `access`/`static`/`private`, method replacement, field value-initializers,
 `access.get/has/set` through the property protocol, and the initializer phase
-ordering (15 tests in `decorators.rs`). S3 adds auto-accessor/private coverage.
+ordering, plus private elements and auto-accessors (23 tests in `decorators.rs`).
 Update `.notes/conformance.md` when the evaluation arc completes.
 
 ## Traps
