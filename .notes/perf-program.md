@@ -316,3 +316,51 @@ not machinery) and `strings` (28.69).
   documented options are the escape-analysis builder transform and the GC
   registry redesign — both plan-first, multi-session. The bounded low-risk
   alloc options left on the `perf.md` table are ~1-2 ns each.
+- **2026-10-06 — PROBE: construction, not calls or reads, is the dominant
+  per-iteration cost.** Fresh 4-mode gap table (`node tools/corpus/bench.js`,
+  parity ok) plus isolated decompositions (1M iterations, min of 3; loop floor
+  and read costs measured for reference):
+
+  | shape | jit ms | helpers/iter | cost/iter |
+  |---|---|---|---|
+  | `s += i` | 0.75 | 0 | **0.75 ns** (floor) |
+  | 3 reads (incl. nested `t.c.d`) | 15.7 | 0 | **~5 ns/read** |
+  | `{ a: i }` + read | 73.1 | 1 `ObjectFast` | 73 ns |
+  | `{ a,b,c }` | 83.5 | 1 | 83 ns |
+  | `{ a..f }` (6) | 96.4 | 1 | 96 ns |
+  | `[]` + `length` | 139.0 | 2 (`ArrayBegin`,`ArrayEnd`) | 139 ns |
+  | `[ i ]` | 174.4 | 3 | 174 ns |
+  | `[ i,1,1,1,1,1 ]` | 270.7 | 8 | 271 ns |
+  | `new C(i)` + read | 132.0 | 3 (`ArgsBase`,`ArgsPush`,`Construct`) | 132 ns |
+
+  Decomposition: an **object literal is ~68 ns fixed + ~4.7 ns/property** (it
+  is fused to ONE `ObjectFast` call); an **array literal is ~134 ns fixed +
+  ~19.4 ns/element** and is NOT fused (`ArrayBegin` + one `ArrayElement` per
+  element + `ArrayEnd`, so a per-element helper). The fixed cost is
+  construction — the ~530 B `JsObject` alloc through `Gc::new` (a TLS
+  `with_heap_mut` borrow + the bump/free-list + the young-list push + the full
+  payload init) — not the helper call: `{a:i}` (1 call) and `[]` (2 calls)
+  differ by a full extra helper yet the array's fixed cost is ~2x the object's,
+  and `ArrayElement` costs ~19 ns/element rather than the ~60 ns a call would
+  cost if the call itself dominated. This reframes the corpus: the rows with
+  the biggest jitGap are exactly the constructors — `objects/destructure` 501x
+  (it is two object literals plus four reads per iteration, 178 ms alone; the
+  ratio is inflated because node's escape analysis deletes the construction),
+  `opcost/array_alloc` 35x, `arrays/push_pop` 48x, `opcost/array_slice` 49x,
+  `calls/construct_churn` 13x (`new` = 3 helpers) — and the biggest ABSOLUTE
+  sinks are all fresh-binding/per-iteration allocation
+  (`.../head-let-fresh-binding-per-iteration.js` 829.8 ms, `template-literal/
+  evaluation-order.js` 524.1, `try/completion-values.js` 479.5).
+
+  **Two levers, in order.** (1) **Fuse the array literal** the way `ObjectFast`
+  fuses the object literal — one helper for the whole literal plus the
+  in-place dense appends the JIT already emits for `push`
+  (`emit_dense_array_append_inline`), removing `ArrayBegin`/`ArrayEnd`'s
+  index-stack push/pop and the per-element `ArrayElement` helper (~19 ns each).
+  Bounded, no new architecture, and it is the same "remove an operation" shape
+  the two landed slices had. (2) **The allocation itself** (~68 ns for a fresh
+  `JsObject` against a ~20-30 ns real floor): the `JsObject` payload init
+  (`in_fields` alone is 16×8 B) and the per-alloc TLS heap borrow are the
+  targets, which is L2 and structural. Note also that `try/completion-values`
+  is slower under the JIT than under the interpreter (479.5 vs 406.6 ms) — a
+  JIT pessimization worth a separate look.
