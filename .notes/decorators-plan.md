@@ -118,7 +118,8 @@ calls, the context shape per kind, the class context with no
 `access`/`static`/`private`, method replacement, field value-initializers,
 `access.get/has/set` through the property protocol, and the initializer phase
 ordering, plus private elements and auto-accessors (23 tests in `decorators.rs`).
-Update `.notes/conformance.md` when the evaluation arc completes.
+The evaluation arc is done; `.notes/conformance.md` records it and its two
+deviations.
 
 ## Traps
 

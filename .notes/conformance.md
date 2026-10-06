@@ -2243,6 +2243,25 @@ ShadowRealm (64)).
   `tools/gen_tz_tables.py` derives the primary from `PRIMARY_OVERRIDES` (the
   `backward`/`backzone` links the corpus pins) plus the `Etc/UTC|Etc/GMT|GMT` ->
   `UTC` normalization.
+- Stage-3 decorator **evaluation** is implemented. It is not gated by
+  test262: the main tree ships only 24 decorator *syntax* fixtures and no
+  evaluation fixtures, and decorators are not yet in ecma262 main. `crates/
+  runtime/src/decorators.rs` evaluates class decorators and public/private
+  method/getter/setter/field decorators, building the `{ kind, name, static,
+  private, access, addInitializer }` context, calling decorators in reverse
+  source order (cross-element order is source order), applying returned
+  replacements (method/get/set replace the closure; a field returns a value
+  initializer; a class returns a replacement; an accessor returns
+  `{ get, set, init }`), and running `addInitializer` callbacks in their
+  phases (instance before fields; static before static fields; class last).
+  `access` is synthesized as real JS closures over the key — or over `#name`
+  with the class PrivateEnvironment — so it runs the full
+  Get/Set/HasProperty protocol (getters, proxies, brand checks). Validated by
+  23 hand-written unit tests in the module; `all` (48632/0/1) and `staging`
+  (77/0/1406) are unchanged. Two documented deviations: a *private*
+  auto-accessor (`accessor #x`) is decorated as a field, because the parser
+  desugar collapses it to a single field; and `@dec static {}` is still
+  parsed-and-dropped rather than a SyntaxError.
 - Known flaky fixture: `TypedArray/prototype/reduce/callbackfn-arguments-default-accumulator.js`
   (Strict) intermittently fails with `Expected SameValue(«43», «41») to be true` — the second
   reduce callback's `arguments[0]` reads 43 (iteration 1's `kValue`) instead of 41 (iteration
