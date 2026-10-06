@@ -114,7 +114,19 @@ impl JitEngine {
         if std::env::var("JIT_DUMP_CLIF").is_ok() {
             ctx.set_disasm(true);
         }
-        let compiled = ctx.compile(&*self.isa, &mut ControlPlane::default()).ok()?;
+        // Unlike the `Unsupported` bail above, a Cranelift rejection (a verifier
+        // error, a codegen failure) is not a step the compiler chose to skip —
+        // it is a bug in the emit — so surface it under the same debug switch
+        // instead of swallowing it into the `None` fallback.
+        let compiled = match ctx.compile(&*self.isa, &mut ControlPlane::default()) {
+            Ok(compiled) => compiled,
+            Err(error) => {
+                if std::env::var("JIT_DUMP_CLIF").is_ok() {
+                    eprintln!("jit codegen error: {error:?}");
+                }
+                return None;
+            }
+        };
         if let Some(disasm) = compiled.vcode.as_ref() {
             eprintln!("--- disasm ---\n{disasm}");
         }

@@ -107,11 +107,13 @@ not machinery) and `strings` (28.69).
   2026-10-06 — the vector-free field update** (option (a)): a compiled store to
   a written, writable map-pinned in-object field on a `props_deferred`
   receiver now writes `in_fields[slot]` inline instead of calling
-  `SetMemberSlot`. The deferred store story is CLOSED (see §6). **Next target:
-  the call funnel's `LeafCallFill`** (top call-family helper; see §6). Remaining
-  hard candidates: the `strings` read+concat triple (`GetMemberName` method
-  reads — the L1c shape end-state; `ConcatStrings`/`BinarySlow`) and
-  `LoadContext` (a machine-addressable env chain).
+  `SetMemberSlot`. The deferred store story is CLOSED (see §6). The call-funnel
+  slice (`LeafCallFill` inline) measured **null** and was reverted (see §6).
+  **Next target: `GetMemberName`'s prototype-chain read** via a compiled
+  `member_chain_cells` probe — the corpus's #1 helper (102M) and the same
+  "delete the helper by giving the compiled path the cell" shape as the landed
+  slice. Remaining candidates: `LoadContext` (an env cell), the `strings`
+  `ConcatStrings`/`BinarySlow` pair, and `ApplyArgsFill`.
 
 ## 6. Status log
 
@@ -244,10 +246,33 @@ not machinery) and `strings` (28.69).
   speculation and no new architecture), and it moves `method_call`,
   `closure_capture` and `construct_churn` at once. It is already lean
   (`record_matches` + `fill_leaf_frame`, crates/runtime/src/jit.rs), so the
-  candidate is to emit the frame fill inline in the compiler — the same "give
-  the compiled path the work the helper does" move as this slice — **pending a
-  check of how much of `method_call`'s count takes the `aliased` branch**
-  (`frame_size == arity && argc >= frame_size` skips the fill loop entirely,
-  which would cap the win at the helper-call and cache-entry cost).
-  `GetMemberName`'s method reads and `LoadContext` stay the hard ones (the L1c
-  shape end-state and a machine-addressable env chain respectively).
+  candidate was to emit the frame fill inline in the compiler — the same "give
+  the compiled path the work the helper does" move as this slice.
+- **2026-10-06 — `LeafCallFill` inline frame fill: MEASURED NULL, reverted.**
+  The proposed slice (emit the leaf frame fill inline in the compiler, keeping
+  `leaf_call_fill` as the receiver/room fallback) was implemented and measured:
+  the dynamic-length fill loop emitted as a machine loop with a per-slot
+  `select` chain (this/param/local), plus the room check and the receiver
+  bind, branched to the helper only for a sloppy primitive/nullish receiver or
+  a frame that no longer fits. Result (tag binary vs slice binary, medians of
+  six `--jit-bench` runs): **no row improved and `function calls` regressed
+  ~6%** (0.909 -> 0.960 ms; `wide leaf call` 1.02, `non-leaf call` 0.99,
+  `apply leaf call` 1.04, `builtin call` 1.02 — all within noise). Reverted;
+  the tree is back at baseline (`function calls` 0.999 on the re-measure).
+  **The lesson, and it redirects the whole call-funnel line: the helper bodies
+  are already lean, so re-implementing their loops inline does not pay.**
+  `fill_leaf_frame`'s per-slot work is inherent (every slot must be written),
+  and the Rust loop's predictable branches beat the machine loop's
+  `select`-chain + counter; the extern-call overhead the inline was meant to
+  remove is a few ns of a 26-45 ns call. A win has to REMOVE an operation, not
+  re-implement it — which is exactly what the landed store slice did (it
+  deleted `SetMemberSlot` by giving the compiled path the *cell* the helper
+  was rebuilding). Both remaining top helpers need that same shape of fix
+  rather than an inline: `GetMemberName` (102M corpus-wide; the compiled read
+  inlines an own data property but every prototype-chain method read pays the
+  helper) wants the `member_chain_cells` probe the compiler does not yet emit,
+  and `LoadContext` (28.9M in `calls`) wants an env cell. **Next target chosen:
+  `GetMemberName`'s chain read via a compiled chain-cell probe.** (This slice's
+  revert left one keeper: `compiler.rs` now surfaces a Cranelift codegen error
+  under `JIT_DUMP_CLIF` instead of swallowing it into the `None` fallback —
+  which is how the emit bug above was found.)
