@@ -1,7 +1,7 @@
 # slag — JavaScript Runtime: Implementation Plan
 
 **Target:** a from-scratch, spec-faithful JavaScript engine in Rust that implements the complete
-ECMAScript® 2026 Language Specification (17th edition), as captured in [`spec.html`](spec.html).
+ECMAScript® 2027 Language Specification (18th edition), as captured in [`spec.html`](spec.html).
 **Goal state:** a `cargo` workspace whose members live under `crates/`, able to parse and execute
 arbitrary ES2026 source, pass the vast majority of the official `test262` conformance suite, and
 expose a small embedding API plus a CLI/REPL.
@@ -29,7 +29,7 @@ Build a JavaScript engine in Rust that is:
 
 **In scope**
 
-- All of ECMA-262 (2026): chapters 1–28 of `spec.html`, including Annex B legacy behaviors,
+- All of ECMA-262 (2027): chapters 1–28 of `spec.html`, including Annex B legacy behaviors,
   explicit resource management (`using` / `await using`, `DisposableStack`, `AsyncDisposableStack`,
   `SuppressedError`), the full standard library (including ES2026 additions: `Math.sumPrecise`,
   `Iterator.concat`, `Array.fromAsync`, `Error.isError`, `Map`/`WeakMap` `getOrInsert(Computed)`,

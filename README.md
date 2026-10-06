@@ -4,7 +4,7 @@
 
 > A test262 runner. It also happens to execute JavaScript.
 
-Slag is a from-scratch, spec-faithful JavaScript engine in Rust, implementing the ECMAScript® 2026 Language Specification (17th edition). 
+Slag is a from-scratch, spec-faithful JavaScript engine in Rust, implementing the ECMAScript® 2027 Language Specification (18th edition). 
 
 The full pinned `test262` corpus is the regression net: **51,997 pass / 0 fail / 0 crash / 0 hang** across 
 the `language`, `built-ins`, Annex B and `intl402` sweep areas. That includes **proper tail calls** the 
