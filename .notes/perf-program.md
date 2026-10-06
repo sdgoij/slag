@@ -286,3 +286,33 @@ not machinery) and `strings` (28.69).
   `compiler.rs` now surfaces a Cranelift codegen error under `JIT_DUMP_CLIF`
   instead of swallowing it into the `None` fallback — which is how the emit's
   dominance bug above was found.)
+- **2026-10-06 — the `strings` family is ALLOCATION-bound, and the JIT already
+  matches the interpreter's fused cost; no slice taken (a third never-run
+  null, priced before implementing).** The plan-of-record target was the
+  string family's `CallSlow`/`BinarySlow`, on the theory that string methods
+  are not registered intrinsics and that mixed `+` misses the fusion. Both
+  halves of that theory are wrong, and the numbers say so:
+  - **The jit/jitless gap is tiny** on every strings row — `coercion_concat`
+    86 vs 103 ms, `split_join` 71 vs 83, `search_slice` 20 vs 24, `char_ops`
+    12 vs 23, `concat_loop` 7.2 vs 10.4. A ~1.2x gap means the time is in the
+    builtins' and the collector's own work (shared by both engines), not in
+    the JS-level call plumbing an intrinsic would remove.
+  - **The fusion is already in the tree.** `expr::concat_primitive` fuses
+    `Add` with one String operand and a Number/Boolean/Null/Undefined on the
+    other, and both `apply_binary` (which `BinarySlow` calls) and the register
+    executor's `binary_inline` use it. A differential pins the JIT at that
+    fused cost: `s = "x" + i` (500k) is **57.3 ms jit / ~115 ns per iter**, and
+    the notes' landed measurement of the interpreter's fused `"" + i` is
+    ~55 ms — the same. The residual over an all-string concat (`"x" + "y"`,
+    `ConcatStrings`, 43 ns) is `primitive_to_string(number)` plus the extra
+    allocation, and the interpreter pays it too, so there is no dispatch left
+    to delete. `BinarySlow`'s 2-per-iteration count on `coercion_concat` is real
+    but it is a *call* into the already-fused path, not a slow path.
+  This is the tell §4 declared: the per-row work has stopped buying and the
+  family means are flat. **The remaining levers are L2 (allocation/GC — the
+  `perf.md` probes measure the concat append as
+  "allocation-REGISTRATION-bound": 26.6 ns/iter with the cost in the
+  concat+alloc machinery, not the lowering) and L4 (the front half),** whose
+  documented options are the escape-analysis builder transform and the GC
+  registry redesign — both plan-first, multi-session. The bounded low-risk
+  alloc options left on the `perf.md` table are ~1-2 ns each.
