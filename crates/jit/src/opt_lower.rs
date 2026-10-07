@@ -337,12 +337,13 @@ fn lower_inst(
         // region and the interpreter re-executes the step (see
         // `.notes/tier-resume-fidelity.md`). The continuation is a separate
         // block, so a guard may sit mid-block with the CFG intact.
+        // The continuation is a separate block, so a guard may sit mid-block
+        // with the CFG intact.
         Op::Check => {
             let Imm::Int(step) = inst.imm else {
                 return Err(Unsupported::Step("opt:check"));
             };
             let cond = arg(0)?;
-            let live = &inst.args[1..];
             let truthy = if types.get(inst.args[0] as usize) == Some(&Type::Bool) {
                 builder.ins().icmp_imm_u(
                     IntCC::NotEqual,
@@ -360,47 +361,28 @@ fn lower_inst(
                 )?;
                 builder.ins().icmp_imm_u(IntCC::NotEqual, t, 0)
             };
-            let deopt = builder.create_block();
-            let cont = builder.create_block();
-            builder.ins().brif(truthy, cont, &[], deopt, &[]);
-            builder.switch_to_block(deopt);
-            for (i, v) in live.iter().enumerate() {
-                let value = value_of(values, *v)?;
-                builder.ins().store(
-                    MemFlagsData::new(),
-                    value,
-                    abi.work,
-                    Offset32::new((i * 8) as i32),
-                );
-            }
-            let top = builder.ins().iadd_imm_u(abi.work, (live.len() * 8) as i64);
-            builder.ins().store(
-                MemFlagsData::new(),
-                top,
-                abi.vm,
-                Offset32::new(std::mem::offset_of!(JitCallContext, suspend_sp) as i32),
-            );
-            let vm = builder.ins().load(
-                types::I64,
-                MemFlagsData::new(),
-                abi.vm,
-                Offset32::new(std::mem::offset_of!(JitCallContext, vm) as i32),
-            );
-            let ip = builder.ins().iconst(types::I64, step as i64);
-            builder.ins().store(
-                MemFlagsData::new(),
-                ip,
-                vm,
-                Offset32::new(VM_IP_OFFSET as i32),
-            );
-            let sentinel = builder.ins().iconst(types::I64, DISPATCH_DEOPT as i64);
-            builder.ins().return_(&[sentinel]);
-            builder.seal_block(deopt);
-            builder.switch_to_block(cont);
-            builder.seal_block(cont);
+            emit_guard(builder, abi, truthy, step, &inst.args[1..], values)?;
             builder
                 .ins()
                 .iconst(types::I64, JsValue::Undefined.bits() as i64)
+        }
+        // A type guard (`.notes/tier-typer.md` T1): `args[0]`'s runtime value
+        // is asserted to have the result type, so a dominated op on it may
+        // lower tag-free; the guarded value is the same bits re-typed, so the
+        // success path emits no work. Only `Number` is checked for now — the
+        // type the bare arithmetic path (`emit_bare_numeric`) keys on; any
+        // other type is a refusal (the per-step path), never a silent guess.
+        Op::GuardType => {
+            let Imm::Int(step) = inst.imm else {
+                return Err(Unsupported::Step("opt:guard"));
+            };
+            let value = arg(0)?;
+            let ok = match inst.ty {
+                Type::Number => is_double(builder, value),
+                _ => return Err(Unsupported::Step("opt:guard-type")),
+            };
+            emit_guard(builder, abi, ok, step, &inst.args[1..], values)?;
+            value
         }
         // A TDZ guard: throw when the slot holds the uninitialized marker. The
         // helper sets the pending error and the body bails with `undefined`,
@@ -666,6 +648,73 @@ fn call_helper(
         bump_leaf_epoch(builder, abi.vm);
     }
     Ok(result)
+}
+
+/// Emit the shared tail of a speculation guard: branch on `ok`; on failure
+/// mirror the live operand stack (`live`, bottom to top) into the working
+/// region, point the context and `vm.ip` at the resume step, and return
+/// `DISPATCH_DEOPT`; on success continue in a fresh block. The caller returns
+/// its own result from the continuation block.
+///
+/// The `vm.ip` write is skipped when the ctx's `vm` pointer is null, matching
+/// `emit_completion_store` — the scaffold's bare-ctx test harness runs a
+/// guard's deopt with a null `vm`.
+fn emit_guard(
+    builder: &mut FunctionBuilder,
+    abi: &Abi,
+    ok: ClifValue,
+    step: i32,
+    live: &[ValueId],
+    values: &[Option<ClifValue>],
+) -> Result<(), Unsupported> {
+    let deopt = builder.create_block();
+    let cont = builder.create_block();
+    builder.ins().brif(ok, cont, &[], deopt, &[]);
+    builder.switch_to_block(deopt);
+    for (i, v) in live.iter().enumerate() {
+        let value = value_of(values, *v)?;
+        builder.ins().store(
+            MemFlagsData::new(),
+            value,
+            abi.work,
+            Offset32::new((i * 8) as i32),
+        );
+    }
+    let top = builder.ins().iadd_imm_u(abi.work, (live.len() * 8) as i64);
+    builder.ins().store(
+        MemFlagsData::new(),
+        top,
+        abi.vm,
+        Offset32::new(std::mem::offset_of!(JitCallContext, suspend_sp) as i32),
+    );
+    let vm = builder.ins().load(
+        types::I64,
+        MemFlagsData::new(),
+        abi.vm,
+        Offset32::new(std::mem::offset_of!(JitCallContext, vm) as i32),
+    );
+    let has_vm = builder.ins().icmp_imm_u(IntCC::NotEqual, vm, 0);
+    let store = builder.create_block();
+    let ret = builder.create_block();
+    builder.ins().brif(has_vm, store, &[], ret, &[]);
+    builder.switch_to_block(store);
+    let ip = builder.ins().iconst(types::I64, step as i64);
+    builder.ins().store(
+        MemFlagsData::new(),
+        ip,
+        vm,
+        Offset32::new(VM_IP_OFFSET as i32),
+    );
+    builder.ins().jump(ret, &[]);
+    builder.seal_block(store);
+    builder.switch_to_block(ret);
+    let sentinel = builder.ins().iconst(types::I64, DISPATCH_DEOPT as i64);
+    builder.ins().return_(&[sentinel]);
+    builder.seal_block(ret);
+    builder.seal_block(deopt);
+    builder.switch_to_block(cont);
+    builder.seal_block(cont);
+    Ok(())
 }
 
 /// Write the interpreter's completion register (`Vm::completion` plus

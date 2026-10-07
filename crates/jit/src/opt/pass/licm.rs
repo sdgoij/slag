@@ -11,8 +11,8 @@
 //!
 //! An entry-header loop (`do`/`while`, whose back edge targets block 0) has no
 //! predecessor outside the loop and is skipped — the same shape that made LICM
-//! impossible before the fused-test slice. `Op::Check`/`Op::TdzCheck` are never
-//! hoisted (a guard's timing is observable).
+//! impossible before the fused-test slice. `Op::Check`/`Op::TdzCheck`/
+//! `Op::GuardType` are never hoisted (a guard's timing is observable).
 
 use crate::opt::ir::{Function, Imm, Inst, Op, Term, ValueId};
 
@@ -139,7 +139,7 @@ fn hoistable(inst: &Inst, slots_stored: &[bool]) -> bool {
             inst.imm,
             Imm::Slot(s) if !slots_stored.get(s as usize).copied().unwrap_or(false)
         ),
-        Op::Check | Op::TdzCheck => false,
+        Op::Check | Op::TdzCheck | Op::GuardType => false,
         _ => inst.effects.is_pure(),
     }
 }

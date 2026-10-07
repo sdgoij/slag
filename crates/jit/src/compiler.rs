@@ -101,6 +101,18 @@ impl JitEngine {
         Ok(Self { isa, opt })
     }
 
+    /// Lower a hand-built IR function directly, bypassing the lift — the seam
+    /// for tests that exercise an op no producer emits yet.
+    #[cfg(test)]
+    pub(crate) fn compile_ir(
+        &self,
+        ir: &crate::opt::ir::Function,
+        helpers: &JitHelpers,
+        max_stack: usize,
+    ) -> Option<Compiled> {
+        crate::opt_lower::compile(&*self.isa, ir, helpers, max_stack)
+    }
+
     /// Compile `body` to executable machine code, or `None` when the body
     /// contains a step outside the supported subset or needs a slow-path
     /// helper that is missing from `helpers`.

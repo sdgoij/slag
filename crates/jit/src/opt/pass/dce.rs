@@ -5,9 +5,9 @@
 //! drop. Removal is by result-use, so it never touches an effect-only
 //! instruction (a store, a completion write) — those have no result and are
 //! kept. Eligible: a `pure` instruction (no reads, no writes) and an
-//! `Op::FrameLoad`, a private-slot read that cannot trap. `Op::Check` is
-//! deliberately exempt: its `default_effects` are pure (it produces a boolean),
-//! but dropping it would drop a speculation guard.
+//! `Op::FrameLoad`, a private-slot read that cannot trap. `Op::Check` and
+//! `Op::GuardType` are deliberately exempt: their `default_effects` are pure,
+//! but dropping one would drop a speculation guard.
 //!
 //! The pass iterates to a fixpoint: removing one instruction can make its
 //! operands (a chain of dead pure ops) dead in turn.
@@ -27,7 +27,7 @@ pub fn run(func: &mut Function) -> bool {
                     // Effect-only: a store or a completion write.
                     return true;
                 };
-                if inst.op == Op::Check {
+                if inst.op == Op::Check || inst.op == Op::GuardType {
                     return true;
                 }
                 // A pure computation, or a frame load (a private-slot read that

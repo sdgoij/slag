@@ -254,6 +254,12 @@ pub enum Op {
     /// A speculation guard. When it fails the body retires and the
     /// interpreter resumes at the current step.
     Check,
+    /// A type guard: `args[0]`'s runtime value is asserted to have the result
+    /// type, so ops it dominates may lower tag-free. `args[1..]` is the live
+    /// operand stack (bottom to top), mirroring [`Op::Check`]. On success the
+    /// result is `args[0]` re-typed; on failure the body retires and the
+    /// interpreter resumes at `imm`'s step.
+    GuardType,
     /// Throw a TDZ `ReferenceError` (spec 6.2.1.6.6) when the frame slot holds
     /// the uninitialized marker. Reads the slot; has no result.
     TdzCheck,
@@ -277,7 +283,9 @@ impl Op {
     pub fn default_effects(self) -> Effects {
         use Effects as E;
         match self {
-            Op::Const | Op::StrictEq | Op::ToBoolean | Op::Not | Op::Check => E::pure(),
+            Op::Const | Op::StrictEq | Op::ToBoolean | Op::Not | Op::Check | Op::GuardType => {
+                E::pure()
+            }
             Op::TdzCheck => E::read(Heap::Slots),
             Op::FrameLoad => E::read(Heap::Slots),
             Op::FrameStore => E::write(Heap::Slots),
@@ -490,6 +498,9 @@ mod tests {
     #[test]
     fn default_effects_are_sound() {
         assert!(Op::StrictEq.default_effects().is_pure());
+        // A guard neither reads nor writes; dropping it would drop the
+        // speculation, so `dce` keeps it explicitly.
+        assert!(Op::GuardType.default_effects().is_pure());
         // Loose equality can coerce, so it is a world effect.
         assert!(Op::Eq.default_effects().may_read(Heap::World));
         assert!(Op::Add.default_effects().may_read(Heap::World));

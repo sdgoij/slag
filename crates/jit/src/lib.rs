@@ -2231,6 +2231,76 @@ mod tests {
     }
 
     #[test]
+    fn opt_guard_type_lowers_tag_free_and_deopts_on_a_mismatch() {
+        // T1 (`.notes/tier-typer.md`): `Op::GuardType` asserted on a hand-built
+        // IR body. Two contracts are proven end to end:
+        //  (a) the fast path is tag-free — arithmetic on the guarded
+        //      (Number-typed) value lowers to the bare f64 op, which needs no
+        //      helper, so the body compiles against an empty helper table;
+        //  (b) a type mismatch retires the body — a guard on a non-Number value
+        //      returns the `DISPATCH_DEOPT` sentinel instead of computing.
+        use crate::opt::builder::Builder;
+        use crate::opt::ir::{Effects, Function, Imm, Op, Term, Type};
+        use runtime::jit::DISPATCH_DEOPT;
+
+        // `guarded = GuardType(v); return guarded + 1`, with `v` typed `Unknown`
+        // so only the guard types the `Add`'s operand. `args[1..]` is the live
+        // stack (bottom to top), whose top is also the guarded value.
+        fn guard_body(value_ty: Type, value_imm: Imm) -> Function {
+            let mut func = Function::new();
+            let entry = func.entry();
+            {
+                let mut b = Builder::new(&mut func);
+                let v = b.emit(entry, Op::Const, &[], value_ty, Effects::pure(), value_imm);
+                let guarded = b.emit(
+                    entry,
+                    Op::GuardType,
+                    &[v, v],
+                    Type::Number,
+                    Effects::pure(),
+                    Imm::Int(0),
+                );
+                let one = b.emit(
+                    entry,
+                    Op::Const,
+                    &[],
+                    Type::Number,
+                    Effects::pure(),
+                    Imm::Float(1.0),
+                );
+                let sum = b.emit(
+                    entry,
+                    Op::Add,
+                    &[guarded, one],
+                    Type::Number,
+                    Effects::call(),
+                    Imm::None,
+                );
+                b.term(entry, Term::Return(Some(sum)));
+            }
+            func
+        }
+
+        let engine = JitEngine::with_opt(true).expect("native isa");
+
+        // (a) A Number value: the guard holds and the tag-free `Add` needs no
+        // helper, so an empty helper table still compiles.
+        let ir = guard_body(Type::Unknown, Imm::Float(1.5));
+        let compiled = engine
+            .compile_ir(&ir, &helpers_none(), 2)
+            .expect("the guarded arithmetic lowers tag-free (no helper needed)");
+        assert_eq!(run(&compiled, 0), Value::Number(2.5).bits());
+
+        // (b) A Boolean value: the guard fails and the body retires
+        // (DISPATCH_DEOPT) rather than letting the tag-free `Add` miscompute.
+        let ir = guard_body(Type::Unknown, Imm::Bool(true));
+        let compiled = engine
+            .compile_ir(&ir, &helpers_none(), 2)
+            .expect("the guarded arithmetic still lowers");
+        assert_eq!(run(&compiled, 0), DISPATCH_DEOPT);
+    }
+
+    #[test]
     fn opt_tier_for_loop_matches_the_interpreter() {
         // A `for` loop with a literal bound and an `i = i + 1` update takes the
         // non-fused path, whose test is the fused `JumpIfLtImm` step the lift now

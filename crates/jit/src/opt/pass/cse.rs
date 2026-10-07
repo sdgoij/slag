@@ -42,7 +42,7 @@ pub fn run(func: &mut Function) -> bool {
                 avail.retain(|a| !a.is_load);
             }
             let Some(result) = inst.result else { continue };
-            if inst.op == Op::Check || inst.op == Op::TdzCheck {
+            if inst.op == Op::Check || inst.op == Op::TdzCheck || inst.op == Op::GuardType {
                 continue;
             }
             let is_load = inst.op == Op::FrameLoad;

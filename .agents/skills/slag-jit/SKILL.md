@@ -1019,3 +1019,30 @@ produced a wrong answer first:
   no receiver — `construct_this_object` reads an observable `prototype` getter).
   Measured: a non-leaf base constructor 259 → 128 ms / 500k (~2×);
   `construct_churn` is a leaf-constructor row (the no-regress guard).
+
+## 22. The optimizing tier's speculation guard (T1) — `vm.ip` is not per-step
+
+The optimizing tier's guards (`Op::Check`, `Op::GuardType`) lower through
+`opt_lower::emit_guard`: on failure it mirrors the live operand stack into the
+working region (`Abi::work`), sets `ctx.suspend_sp` and `vm.ip` to the resume
+step, and returns `DISPATCH_DEOPT`; `run_jit_body` rebuilds `vm.stack` from the
+region and re-enters the body at `vm.ip`.
+
+**Trap: `vm.ip` is NOT maintained per compiled step.** It is written only at a
+try-exit and at a deopt probe — during normal compiled execution it holds a
+stale value. No compiled code or helper may treat `vm.ip` as "the current
+step"; it is meaningful only after a deopt has returned to the runtime.
+
+- **The `vm.ip` write is null-guarded** (`ctx.vm == null` skips it), matching
+  `emit_completion_store`, so the bare-ctx test scaffold (`run`) can execute a
+  guard's deopt with a null `vm`. In production `run_jit_body` always passes a
+  real `vm`, so the store happens.
+- **A new guard op must be excluded from every pass.** `Op::Check` and
+  `Op::GuardType` are `pure` by `default_effects` yet are explicitly kept by
+  `dce`, skipped by `cse`, and refused by `licm::hoistable` — a guard's timing is
+  observable (dropping or moving one changes when the body deopts).
+- **`Op::GuardType` types its result value.** Its `Inst.ty` is the guarded type;
+  a dominated op reads `types[operand]` to pick the tag-free path
+  (`emit_bare_numeric`), so the guard result must be a *new* value, not the
+  operand re-used. T1 implements `Type::Number` only (`is_double`); any other
+  guarded type is `Unsupported` (the per-step path), never a silent guess.
