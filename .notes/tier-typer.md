@@ -1,6 +1,6 @@
 # The typer: guard-driven type specialization (stage I8)
 
-**Status: plan (2026-10-07).** `optimizing-tier-impl.md` §6 stage I8 ("a coarse
+**Status: T1 landed (2026-10-07).** `optimizing-tier-impl.md` §6 stage I8 ("a coarse
 typer to drive guard elision"). Scoped immediately after the read arc, whose
 findings make the case concrete.
 
@@ -60,7 +60,7 @@ statically provable (`narrow`), no guard is needed at all.
 
 | id | content | gate |
 |----|---------|------|
-| T1 | `Op::GuardType` + its lowering (via the landed deopt resume); no pass emits it yet | behavior-neutral; a hand-built-IR test proves the deopt and the tag-free fast path |
+| T1 | `Op::GuardType` + its lowering (via the landed deopt resume); no pass emits it yet | behavior-neutral; a hand-built-IR test proves the deopt and the tag-free fast path — **landed** |
 | T2 | a type guard inserted at a **loop preheader** for a loop-invariant value (the static, no-feedback slice: a member/element read whose cell is validated) | the `read`/`obj_prop` rows: guards removed, tag checks removed |
 | T3 | feedback-driven guards (the `I3` records say the site is monomorphic-typed) | no deopt thrash on the corpus |
 | T4 | the typer consumes the guard to make arithmetic tag-free across the loop | the hoist (G2b) revisited: does the register headroom return? |
@@ -68,6 +68,47 @@ statically provable (`narrow`), no guard is needed at all.
 T2 is deliberately **feedback-free**: the correctness premise is a *static* one
 ("this loop-invariant read is validated by a guard"), mirroring the read plan's
 simplification — the typer only *chooses* where to guard, the guard proves it.
+
+## T1 landed (2026-10-07)
+
+`Op::GuardType` + its deopt lowering are in (`opt_lower::emit_guard`, shared
+with `Op::Check`; the deopt mirrors `args[1..]`, the live operand stack). No
+producer emits it, so it is behavior-neutral: the lift, the pass pipeline and
+the conformance baseline are unchanged. Only `Type::Number` is checked
+(`is_double`); any other guarded type is `Unsupported` (a refusal, never a
+silent guess). `dce` keeps it, `cse` skips it, `licm` refuses to hoist it, and
+the deopt's `vm.ip` write is null-guarded so the bare-ctx scaffold can run a
+guard's deopt. The hand-built-IR test proves the fast path is tag-free (the
+guarded arithmetic compiles against an empty helper table; retyping the guard
+result `Unknown` makes it refuse) and that a non-Number value returns
+`DISPATCH_DEOPT` instead of computing. Gates: `cargo test --workspace` green
+(jit 308/0); `cargo clippy --workspace --all-targets -- -D warnings` clean.
+
+## T2 scoping — the placement fork
+
+T2's gate is "the `read`/`obj_prop` rows: guards removed, tag checks removed".
+Two placements, and the `tier-guarded-read.md` negative result decides between
+them:
+
+- **Preheader (the plan's wording).** Hoist the read's value out of the loop
+  and guard it once. This is the read arc's G3 hoist, which measured **~1.8x
+  slower** on `read_loop` from register pressure (`tier-guarded-read.md`). Its
+  resume step must be the loop entry, which needs `Block::start_step` in the IR
+  (the lift knows each block's first step; the IR does not carry it yet). T4's
+  tag-free arithmetic is the bet that the register headroom returns — so the
+  preheader work and T4's arithmetic are one experiment, not two.
+- **In-loop.** Guard the read's result where it is produced (`MemberCellLoad` →
+  `GuardType`), typing the `Add`'s operand without hoisting anything. No
+  register-pressure change (the value is already live), no `Block::start_step`
+  (the guard's resume step is the read's own step, which it carries in `imm`),
+  and it removes the arithmetic's tag checks for one guard per read. The cost is
+  the per-iteration guard; the win is the tag-freeness.
+
+Recommended first measurement: the **in-loop** placement on `read_loop` — it is
+the cheaper experiment (no `start_step`, no hoist) and isolates T4's core
+question ("does tag-free arithmetic pay for a guard per read?") from the
+register-pressure confound. Build the preheader hoist (with `Block::start_step`)
+only if the in-loop guard pays.
 
 ## Gates and traps
 
