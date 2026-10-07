@@ -116,10 +116,12 @@ so a drift would have shown).
 
 ## Measurement
 
-`scratch/tier-ab/wl/read_loop.js` (`s += o.x`, 5M iters) is the row: currently
-parity (`SLAG_OPT` 0 vs 1). The target is the hoist — the per-iteration read
-becomes a single load before the loop. Also watch `obj_prop`/`prim_prop` and the
-corpus `mean-jitGap` (noisy on this machine — use the interleaved micro-bench).
+`scratch/tier-ab/wl/read_loop.js` (`s += o.x`, 5M iters) is the row. The plain
+helper made the tier 1.586x slower; the inline read (G2b) is 0.991x. The hoist
+target — the per-iteration read becoming a single load before the loop — is a
+register-pressure regression (G2b) and is not landed. Also watch
+`obj_prop`/`prim_prop` and the corpus `mean-jitGap` (noisy on this machine — use
+the interleaved micro-bench).
 
 ## Traps
 
@@ -136,36 +138,38 @@ corpus `mean-jitGap` (noisy on this machine — use the interleaved micro-bench)
   resume point; the op must carry it (`imm`), because the lowering's deopt block
   sets `vm.ip` to it and the interpreter re-executes from there.
 
-## G2b: the hoisted read is a NEGATIVE result (2026-10-07)
+## G2b: the inline read landed; the hoist is the regression (2026-10-07)
 
-The pair landed (`Op::MemberCellLoad` + `Op::MemberGuard`, the guard comparing
-`cell.value` to the speculative load so an in-place write fails it) and LICM
-hoisted the load. On `read_loop` (`s += o.x`, 5M iters, min-of-6 interleaved) the
-result is the opposite of a win:
+**Landed — the inline member read.** `Op::MemberCellLoad` + `Op::MemberGuard`
+(the guard compares `cell.value` to the speculative load, so an in-place write
+fails it) replace the tier's `get_member_name` helper call with the same inline
+cell probe the per-step path has. On `read_loop` (`s += o.x`, 5M iters, min-of-5
+interleaved, `SLAG_OPT` 0 vs 1):
 
-| config | per-step | tier | ratio |
-|---|---|---|---|
-| hoist off | 40.3 ms | 38.4 ms | 0.954x |
-| hoist on | 35.6 ms | 63.8 ms | **1.79x slower** |
-| hoist on | 34.5 ms | 62.4 ms | **1.81x slower** |
+| tier's read | tier/per-step |
+|---|---|
+| `get_member_name` helper (before) | **1.586x slower** |
+| inline cell probe (this change) | **0.991x** |
 
-The tier is ~parity **without** the hoist and ~1.8x slower **with** it — a ~1.9x
-swing from moving one load out of the loop, which the saved work cannot explain.
-The regression is reproducible across rebuilds. `JIT_DUMP_CLIF` (which also
-dumps the disassembly) shows the emitted code is essentially the same *size*
-with and without the hoist (578 vs 584 CLIF lines; 295 vs 301 disasm lines) but
-**not the same register allocation**: the hoisted build saves more callee-saved
-registers and produces ~112 real instruction differences in a ~300-line function.
-The cause is **register pressure** — hoisting the cell value makes it live across
-the whole loop, and the tier's loop is register-tight (every `+`/`<` expands to a
-tag-check + `select` canonicalize sequence), so one extra loop-live value degrades
-the allocation enough to cost ~1.8x. Fixing that is a register-pressure project
-over the tier's arithmetic sequences, not a read-side tweak. The guarded read is
-therefore **reverted**: neither the pair (parity) nor the hoist (a regression)
-pays on the one row it targets. The tier's ~parity *without* the hoist is the
-useful datum: the tier is competitive on a plain read loop once the read is
-inline, and the N-reads-to-1 hoist — the plan's supposed lever — does not hold up
-for this code.
+The helper was a standing tier regression the read row had hidden — the per-step
+path already inlines its read (`emit_member_cell_probe`), so the tier paid a
+helper call per iteration where the interpreter paid none. The pair removes it: a
+~1.6x improvement for the tier on that row, and no regression elsewhere (`licm`
+0.727x, `arith` 0.731x, `for` 0.896x, `lcg` 0.922x; all tier-faster).
+
+**Not landed — the hoist.** Hoisting the cell load out of the loop (LICM) made
+`read_loop` **~1.8x slower**, reproducibly (per-step 35.6 ms vs tier 63.8 ms, and
+34.5 vs 62.4 on a repeat). `JIT_DUMP_CLIF` shows the emitted code is the same
+*size* (578 vs 584 CLIF lines; 295 vs 301 disasm lines) but **not the same
+register allocation** — the hoisted build saves more callee-saved registers and
+differs in ~112 real instructions. The cause is **register pressure**: hoisting
+makes the cell value live across the whole loop, and the tier's loop is
+register-tight (every `+`/`<` expands to a tag-check + `select` canonicalize
+sequence), so one extra loop-live value degrades the allocation enough to cost
+~1.8x. `Op::MemberCellLoad` is therefore **absent from LICM's hoistable set** — the
+plan's "N-reads-to-1" lever does not hold up for this code, though the read was
+well worth *inlining*. Fixing the register pressure is a separate project over the
+tier's arithmetic sequences.
 
 ## A real LICM bug, found en route (fixed)
 

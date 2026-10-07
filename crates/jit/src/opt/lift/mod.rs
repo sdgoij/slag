@@ -501,14 +501,26 @@ fn emit_step(
             );
             stack.push(v);
         }
-        // A member read (`o.x`): an opaque effect (a getter, a proxy trap, or a
-        // throwing receiver) until a speculation proves it is a plain data read.
+        // A member read (`o.x`): an inline member-value cell probe — a
+        // speculative cell load plus its validity guard — replacing the
+        // `get_member_name` helper call. The guard falls back to the helper, so
+        // a getter, a proxy trap, a throwing receiver or a plain miss is served
+        // exactly as before; the per-step path reaches the same shape with its
+        // own cell probe, so the tier stops paying a helper call per read.
         Step::GetMemberName { name } => {
             let object = stack.pop().ok_or(Unsupported::Stack)?;
+            let cell = builder.emit(
+                block,
+                Op::MemberCellLoad,
+                &[object],
+                Type::Unknown,
+                Effects::read(Heap::Slots).union(Effects::read(Heap::Members)),
+                Imm::Atom(*name),
+            );
             let v = builder.emit(
                 block,
-                Op::MemberLoad,
-                &[object],
+                Op::MemberGuard,
+                &[object, cell],
                 Type::Unknown,
                 Effects::call(),
                 Imm::Atom(*name),
@@ -1188,10 +1200,13 @@ mod tests {
         );
         let func = lift(&b).expect("lifts");
         let insts = &func.block(func.entry()).insts;
-        assert_eq!(insts[1].op, Op::MemberLoad);
+        // A member read is a speculative cell load plus its validity guard.
+        assert_eq!(insts[1].op, Op::MemberCellLoad);
         assert_eq!(insts[1].imm, Imm::Atom(member));
-        assert_eq!(insts[2].op, Op::GlobalLoad);
-        assert_eq!(insts[2].imm, Imm::Atom(global));
+        assert_eq!(insts[2].op, Op::MemberGuard);
+        assert_eq!(insts[2].imm, Imm::Atom(member));
+        assert_eq!(insts[3].op, Op::GlobalLoad);
+        assert_eq!(insts[3].imm, Imm::Atom(global));
     }
 
     #[test]

@@ -234,6 +234,16 @@ pub enum Op {
     IdentLoad,
     MemberLoad,
     MemberStore,
+    /// A speculative member-value cell load: `object`'s `atom` data-property
+    /// value read straight from the `member_value_cells` cache, safe for any
+    /// receiver (a non-Object yields a dummy) and validated by the covering
+    /// [`Op::MemberGuard`].
+    MemberCellLoad,
+    /// The validity guard for an [`Op::MemberCellLoad`] (args: the object, then
+    /// the speculative value): when the cell still matches `object`'s live id,
+    /// name and generation AND holds the speculative value, that value is the
+    /// read; otherwise the full `get_member_name` helper serves it. Never traps.
+    MemberGuard,
     ElementLoad,
     ElementStore,
     NewObject,
@@ -278,6 +288,8 @@ impl Op {
             Op::MemberStore => E::write(Heap::Slots)
                 .union(E::write(Heap::Elements))
                 .union(E::write(Heap::Members)),
+            Op::MemberCellLoad => E::read(Heap::Slots).union(E::read(Heap::Members)),
+            Op::MemberGuard => E::call(),
             Op::ElementLoad => E::read(Heap::Elements),
             Op::ElementStore => E::write(Heap::Elements).union(E::write(Heap::Members)),
             Op::CompletionReset | Op::CompletionStore => E::write(Heap::World),

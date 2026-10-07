@@ -273,17 +273,27 @@ fn lower_inst(
             // With both operands proven Numbers (the narrowing pass), the
             // arithmetic/comparison is a bare f64 op with no tag check, no slow
             // block and no branch — the same shape the per-step path reaches
-            // with a known-number operand.
-            let both_known = inst.args.iter().all(|a| {
-                types
-                    .get(*a as usize)
-                    .is_some_and(|t| matches!(t, Type::Number | Type::Int))
-            });
+            // with a known-number operand. When only one side is proven, the
+            // checked path still skips that side's tag check.
+            let known_lhs = types
+                .get(inst.args[0] as usize)
+                .is_some_and(|t| matches!(t, Type::Number | Type::Int));
+            let known_rhs = types
+                .get(inst.args[1] as usize)
+                .is_some_and(|t| matches!(t, Type::Number | Type::Int));
+            let both_known = known_lhs && known_rhs;
             let known = numeric && both_known;
             if known {
                 emit_bare_numeric(builder, inst.op, lhs, rhs)
             } else if numeric {
-                call_numeric_binary(builder, helpers, abi, inst.op, disc as i64, lhs, rhs)?
+                call_numeric_binary(
+                    builder,
+                    helpers,
+                    abi,
+                    inst.op,
+                    disc as i64,
+                    (lhs, rhs, (known_lhs, known_rhs)),
+                )?
             } else if inst.op == Op::Mod {
                 // `%` needs the integer fast path the arithmetic ops do not: a
                 // proven Number still has to satisfy the integrality, i32-range
@@ -442,6 +452,110 @@ fn lower_inst(
             let value = arg(0)?;
             emit_completion_store(builder, abi.vm, value, false);
             value
+        }
+        // A speculative member-value cell load (see `crate::cells`): the cell's
+        // value for `(object.id, atom)`, loaded behind an object-tag check so a
+        // non-Object receiver never dereferences. The value is only used under a
+        // covering `Op::MemberGuard`, which re-validates the cell and its value.
+        Op::MemberCellLoad => {
+            let Imm::Atom(atom) = &inst.imm else {
+                return Err(Unsupported::Step("opt:member-cell"));
+            };
+            let object = arg(0)?;
+            let name = builder.ins().iconst(types::I64, *atom as i64);
+            let cells = builder.ins().load(
+                types::I64,
+                MemFlagsData::new(),
+                abi.vm,
+                Offset32::new(std::mem::offset_of!(JitCallContext, member_value_cells) as i32),
+            );
+            let result = builder.declare_var(types::I64);
+            let dummy = builder
+                .ins()
+                .iconst(types::I64, JsValue::Undefined.bits() as i64);
+            builder.def_var(result, dummy);
+            let load = builder.create_block();
+            let merge = builder.create_block();
+            let obj_ok = crate::cells::is_plain_object(builder, object);
+            builder.ins().brif(obj_ok, load, &[], merge, &[]);
+            builder.switch_to_block(load);
+            let ptr = crate::cells::object_data_ptr(builder, object);
+            let live_id = builder.ins().load(
+                types::I64,
+                MemFlagsData::new(),
+                ptr,
+                Offset32::new(std::mem::offset_of!(crux::JsObject, id) as i32),
+            );
+            let cell = crate::cells::member_value_cell_addr(builder, cells, live_id, name);
+            let value = crate::cells::member_value_cell_value(builder, cell);
+            builder.def_var(result, value);
+            builder.ins().jump(merge, &[]);
+            builder.seal_block(load);
+            builder.switch_to_block(merge);
+            builder.seal_block(merge);
+            builder.use_var(result)
+        }
+        // The validity guard for a preceding `Op::MemberCellLoad`: when the cell
+        // still matches `object`'s live id, name and generation and holds the
+        // speculative value (arg 1), that value is the read; otherwise the full
+        // `get_member_name` helper serves it. Never traps.
+        Op::MemberGuard => {
+            let Imm::Atom(atom) = &inst.imm else {
+                return Err(Unsupported::Step("opt:member-guard"));
+            };
+            let object = arg(0)?;
+            let spec = arg(1)?;
+            let name = builder.ins().iconst(types::I64, *atom as i64);
+            let cells = builder.ins().load(
+                types::I64,
+                MemFlagsData::new(),
+                abi.vm,
+                Offset32::new(std::mem::offset_of!(JitCallContext, member_value_cells) as i32),
+            );
+            let result = builder.declare_var(types::I64);
+            let check = builder.create_block();
+            let slow = builder.create_block();
+            let merge = builder.create_block();
+            let obj_ok = crate::cells::is_plain_object(builder, object);
+            builder.ins().brif(obj_ok, check, &[], slow, &[]);
+            builder.switch_to_block(check);
+            let ptr = crate::cells::object_data_ptr(builder, object);
+            let live_id = builder.ins().load(
+                types::I64,
+                MemFlagsData::new(),
+                ptr,
+                Offset32::new(std::mem::offset_of!(crux::JsObject, id) as i32),
+            );
+            let live_gen = builder.ins().load(
+                types::I32,
+                MemFlagsData::new(),
+                ptr,
+                Offset32::new(std::mem::offset_of!(crux::JsObject, generation) as i32),
+            );
+            let cell = crate::cells::member_value_cell_addr(builder, cells, live_id, name);
+            let cell_ok =
+                crate::cells::member_value_cell_valid(builder, cell, live_id, *atom, live_gen);
+            let cell_value = crate::cells::member_value_cell_value(builder, cell);
+            let value_ok = builder.ins().icmp(IntCC::Equal, cell_value, spec);
+            let ok = builder.ins().band(cell_ok, value_ok);
+            builder.def_var(result, spec);
+            builder.ins().brif(ok, merge, &[], slow, &[]);
+            builder.seal_block(check);
+            builder.switch_to_block(slow);
+            let res = call_helper(
+                builder,
+                helpers,
+                abi,
+                abi.sig_unary,
+                Helper::GetMemberName,
+                &[object, name],
+            )?;
+            builder.def_var(result, res);
+            builder.ins().jump(merge, &[]);
+            builder.seal_block(slow);
+            builder.switch_to_block(merge);
+            builder.seal_block(merge);
+            builder.use_var(result)
         }
         // A lifted `o.x`: the same `get_member_name` helper the per-step path
         // calls on its slow path, so an optimizing body and a per-step one mean
@@ -652,9 +766,9 @@ fn call_numeric_binary(
     abi: &Abi,
     op: Op,
     disc: i64,
-    lhs: ClifValue,
-    rhs: ClifValue,
+    vals: (ClifValue, ClifValue, (bool, bool)),
 ) -> Result<ClifValue, Unsupported> {
+    let (lhs, rhs, (lhs_known, rhs_known)) = vals;
     let lhs_num = builder.ins().bitcast(types::F64, MemFlagsData::new(), lhs);
     let rhs_num = builder.ins().bitcast(types::F64, MemFlagsData::new(), rhs);
     let fast = match op {
@@ -685,8 +799,16 @@ fn call_numeric_binary(
             canon_double(builder, bits)
         }
     };
-    let lhs_dbl = is_double(builder, lhs);
-    let rhs_dbl = is_double(builder, rhs);
+    let lhs_dbl = if lhs_known {
+        builder.ins().iconst(types::I8, 1)
+    } else {
+        is_double(builder, lhs)
+    };
+    let rhs_dbl = if rhs_known {
+        builder.ins().iconst(types::I8, 1)
+    } else {
+        is_double(builder, rhs)
+    };
     let both = builder.ins().band(lhs_dbl, rhs_dbl);
     let result = builder.declare_var(types::I64);
     builder.def_var(result, fast);
