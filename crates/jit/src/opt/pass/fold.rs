@@ -34,6 +34,10 @@ pub fn run(func: &mut Function) -> bool {
 /// One folding sweep.
 fn pass(func: &mut Function) -> bool {
     let mut changed = false;
+    // The lowered code reads each value's `Function::value_type`, so a folded
+    // `Inst::ty` alone is invisible to it — collect and apply the value-table
+    // retypes after the block walk (which holds `func` mutably).
+    let mut retype: Vec<(ValueId, Type)> = Vec::new();
     for b in 0..func.block_count() as u32 {
         // Collect the fold sites first, so the read borrow of the block ends
         // before the write.
@@ -57,10 +61,16 @@ fn pass(func: &mut Function) -> bool {
             inst.ty = ty;
             inst.effects = Effects::pure();
             inst.imm = imm;
+            if let Some(r) = inst.result {
+                retype.push((r, ty));
+            }
             #[cfg(test)]
             FOLDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             changed = true;
         }
+    }
+    for (v, ty) in retype {
+        func.set_value_type(v, ty);
     }
     changed
 }
@@ -181,6 +191,33 @@ mod tests {
             .iter()
             .find(|i| i.result == Some(v))
             .map(|i| i.imm.clone())
+    }
+
+    #[test]
+    fn a_fold_retypes_the_value_table_too() {
+        // The lowering reads `Function::value_type`, so a fold must retype the
+        // value table, not only `Inst::ty` (the value table is what the tag-free
+        // arithmetic path keys on).
+        let mut func = Function::new();
+        let entry = func.entry();
+        let sum;
+        {
+            let mut b = Builder::new(&mut func);
+            let one = num_const(&mut b, entry, 1.0);
+            let two = num_const(&mut b, entry, 2.0);
+            sum = b.emit(
+                entry,
+                Op::Add,
+                &[one, two],
+                Type::Unknown,
+                Effects::call(),
+                Imm::None,
+            );
+            b.term(entry, Term::Return(Some(sum)));
+        }
+        assert!(run(&mut func));
+        assert_eq!(const_of(&func, entry, sum), Some(Imm::Float(3.0)));
+        assert_eq!(func.value_type(sum), Type::Number);
     }
 
     #[test]

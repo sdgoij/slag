@@ -6,7 +6,7 @@
 //! per block, edge arities that match the target's parameters, every value use
 //! dominated by its definition, and no unreachable block.
 
-use super::ir::{BlockId, Function, Term, ValueId};
+use super::ir::{BlockId, Function, Term, Type, ValueId};
 
 /// A well-formedness violation.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -35,6 +35,15 @@ pub enum Error {
     ValueOutOfRange(ValueId),
     /// A value is used in a block its definition does not dominate.
     UseNotDominated { block: BlockId, value: ValueId },
+    /// An instruction's declared result type disagrees with the value table.
+    /// The lowering reads the value *table*, so a pass that retypes a value must
+    /// update both — a stale `Inst::ty` is a missed optimization, never a wrong
+    /// program, but this check keeps a future pass from silently diverging.
+    TypeMismatch {
+        value: ValueId,
+        inst: Type,
+        table: Type,
+    },
 }
 
 /// Verify `func`.
@@ -65,6 +74,14 @@ pub fn verify(func: &Function) -> Result<(), Error> {
         }
         for (i, inst) in block.insts.iter().enumerate() {
             if let Some(r) = inst.result {
+                let table = func.value_type(r);
+                if inst.ty != table {
+                    return Err(Error::TypeMismatch {
+                        value: r,
+                        inst: inst.ty,
+                        table,
+                    });
+                }
                 define(&mut def_block, &mut def_pos, r, b, Some(i as u32))?;
             }
         }
@@ -454,6 +471,29 @@ mod tests {
             imm: Imm::Int(2),
         });
         assert_eq!(verify(&func), Err(Error::DuplicateDefinition { value: v }));
+    }
+
+    #[test]
+    fn a_value_table_type_mismatch_is_rejected() {
+        // `Inst::ty` and the value table must agree: the lowering reads the
+        // table, so a pass that retypes must update both.
+        let mut func = Function::new();
+        let entry = func.entry();
+        let v;
+        {
+            let mut b = Builder::new(&mut func);
+            v = const_int(&mut b, entry, 1);
+            b.term(entry, Term::Return(Some(v)));
+        }
+        func.block_mut(entry).insts[0].ty = Type::Number;
+        assert_eq!(
+            verify(&func),
+            Err(Error::TypeMismatch {
+                value: v,
+                inst: Type::Number,
+                table: Type::Int,
+            })
+        );
     }
 
     #[test]
