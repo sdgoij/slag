@@ -128,6 +128,7 @@
 //! runtime falls back to the interpreter so the private buffers cannot
 //! exhaust the native stack.
 
+pub(crate) mod cells;
 pub mod code_buffer;
 pub mod compiler;
 pub mod helpers;

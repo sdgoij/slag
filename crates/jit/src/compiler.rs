@@ -1414,32 +1414,13 @@ impl<'a> Lowerer<'a> {
             let array_probe = self.builder.create_block();
             let array_hit = self.builder.create_block();
             self.builder.switch_to_block(len_miss);
-            let is_heap = self.builder.ins().band_imm_u(object, crux::TAG_MASK as i64);
-            let is_obj =
-                self.builder
-                    .ins()
-                    .icmp_imm_u(IntCC::Equal, is_heap, crux::TAG_PREFIX as i64);
-            let tag = self.builder.ins().ushr_imm_u(object, 44);
-            let tag = self.builder.ins().band_imm_u(tag, 0xF);
-            let tag_obj = self
-                .builder
-                .ins()
-                .icmp_imm_u(IntCC::Equal, tag, crux::TAG_OBJECT as i64);
-            let plain = self.builder.ins().band(is_obj, tag_obj);
             // A non-Object receiver can never be IntegerIndexed, so the FFI
             // probe would answer its sentinel unconditionally — skip it.
+            let plain = crate::cells::is_plain_object(&mut self.builder, object);
             self.builder.ins().brif(plain, array_probe, &[], after, &[]);
             self.builder.seal_block(len_miss);
             self.builder.switch_to_block(array_probe);
-            let obj_ptr = self
-                .builder
-                .ins()
-                .band_imm_u(object, crux::PAYLOAD_MASK as i64);
-            let obj_ptr = self.builder.ins().ishl_imm_u(obj_ptr, 4);
-            let obj_ptr = self
-                .builder
-                .ins()
-                .iadd_imm_s(obj_ptr, crux::heap::GCBOX_DATA_OFFSET as i64);
+            let obj_ptr = crate::cells::object_data_ptr(&mut self.builder, object);
             let slots = self.builder.ins().load(
                 types::I64,
                 MemFlagsData::new(),
@@ -1484,35 +1465,16 @@ impl<'a> Lowerer<'a> {
             self.builder.switch_to_block(after);
             self.builder.seal_block(after);
         }
-        let is_heap = self.builder.ins().band_imm_u(object, crux::TAG_MASK as i64);
-        let is_obj = self
-            .builder
-            .ins()
-            .icmp_imm_u(IntCC::Equal, is_heap, crux::TAG_PREFIX as i64);
-        let tag = self.builder.ins().ushr_imm_u(object, 44);
-        let tag = self.builder.ins().band_imm_u(tag, 0xF);
-        let tag_obj = self
-            .builder
-            .ins()
-            .icmp_imm_u(IntCC::Equal, tag, crux::TAG_OBJECT as i64);
-        let is_plain_obj = self.builder.ins().band(is_obj, tag_obj);
+        let is_plain_obj = crate::cells::is_plain_object(&mut self.builder, object);
         self.builder.ins().brif(is_plain_obj, probe, &[], slow, &[]);
         // The probe: the cell's id/name/generation must match the
         // receiver's LIVE id and generation (a mutation anywhere bumps the
         // generation, so a match means the own data property is unchanged
         // since the cell was recorded).
         self.builder.switch_to_block(probe);
-        let ptr = self
-            .builder
-            .ins()
-            .band_imm_u(object, crux::PAYLOAD_MASK as i64);
-        let ptr = self.builder.ins().ishl_imm_u(ptr, 4);
-        // The payload stores the `GcBox` base; the `JsObject` sits after
-        // the box header (`mark` + `size`).
-        let ptr = self
-            .builder
-            .ins()
-            .iadd_imm_s(ptr, crux::heap::GCBOX_DATA_OFFSET as i64);
+        // The payload stores the `GcBox` base; the `JsObject` sits after the box
+        // header (`mark` + `size`).
+        let ptr = crate::cells::object_data_ptr(&mut self.builder, object);
         let live_id = self.builder.ins().load(
             types::I64,
             MemFlagsData::new(),
@@ -1525,48 +1487,11 @@ impl<'a> Lowerer<'a> {
             ptr,
             Offset32::new(std::mem::offset_of!(crux::JsObject, generation) as i32),
         );
-        let cell_slot = self.builder.ins().bxor(live_id, name_imm);
-        let cell_slot = self
-            .builder
-            .ins()
-            .band_imm_u(cell_slot, (MEMBER_CELLS - 1) as i64);
-        let index_bytes = self
-            .builder
-            .ins()
-            .imul_imm_s(cell_slot, std::mem::size_of::<MemberValueCell>() as i64);
-        let cell = self.builder.ins().iadd(cells, index_bytes);
-        let cell_id = self.builder.ins().load(
-            types::I64,
-            MemFlagsData::new(),
-            cell,
-            Offset32::new(std::mem::offset_of!(MemberValueCell, id) as i32),
-        );
-        let cell_name = self.builder.ins().load(
-            types::I32,
-            MemFlagsData::new(),
-            cell,
-            Offset32::new(std::mem::offset_of!(MemberValueCell, name) as i32),
-        );
-        let cell_gen = self.builder.ins().load(
-            types::I32,
-            MemFlagsData::new(),
-            cell,
-            Offset32::new(std::mem::offset_of!(MemberValueCell, generation) as i32),
-        );
-        let cell_value = self.builder.ins().load(
-            types::I64,
-            MemFlagsData::new(),
-            cell,
-            Offset32::new(std::mem::offset_of!(MemberValueCell, value) as i32),
-        );
-        let id_ok = self.builder.ins().icmp(IntCC::Equal, cell_id, live_id);
-        let name_ok = self
-            .builder
-            .ins()
-            .icmp_imm_u(IntCC::Equal, cell_name, name as i64);
-        let gen_ok = self.builder.ins().icmp(IntCC::Equal, cell_gen, live_gen);
-        let id_name_ok = self.builder.ins().band(id_ok, name_ok);
-        let ok = self.builder.ins().band(id_name_ok, gen_ok);
+        let cell =
+            crate::cells::member_value_cell_addr(&mut self.builder, cells, live_id, name_imm);
+        let cell_value = crate::cells::member_value_cell_value(&mut self.builder, cell);
+        let ok =
+            crate::cells::member_value_cell_valid(&mut self.builder, cell, live_id, name, live_gen);
         self.builder.def_var(value_var, cell_value);
         self.builder.ins().brif(ok, merge, &[], shape, &[]);
         // The shape read (Slice 1 + 3): on a value-cell miss, a map-pinned
@@ -1586,15 +1511,7 @@ impl<'a> Lowerer<'a> {
         // boilerplate pre-sized field the body skipped — not an own property,
         // so the prototype chain must be consulted).
         self.builder.switch_to_block(shape);
-        let obj_ptr = self
-            .builder
-            .ins()
-            .band_imm_u(object, crux::PAYLOAD_MASK as i64);
-        let obj_ptr = self.builder.ins().ishl_imm_u(obj_ptr, 4);
-        let obj_ptr = self
-            .builder
-            .ins()
-            .iadd_imm_s(obj_ptr, crux::heap::GCBOX_DATA_OFFSET as i64);
+        let obj_ptr = crate::cells::object_data_ptr(&mut self.builder, object);
         let map_handle = self.builder.ins().load(
             types::I64,
             MemFlagsData::new(),
@@ -1882,18 +1799,7 @@ impl<'a> Lowerer<'a> {
         let ctx = self.vm();
         // The object-kind gate (mirrors the read probe): the payload must
         // point at an object before the cell probe dereferences it.
-        let is_heap = self.builder.ins().band_imm_u(object, crux::TAG_MASK as i64);
-        let is_obj = self
-            .builder
-            .ins()
-            .icmp_imm_u(IntCC::Equal, is_heap, crux::TAG_PREFIX as i64);
-        let tag = self.builder.ins().ushr_imm_u(object, 44);
-        let tag = self.builder.ins().band_imm_u(tag, 0xF);
-        let tag_obj = self
-            .builder
-            .ins()
-            .icmp_imm_u(IntCC::Equal, tag, crux::TAG_OBJECT as i64);
-        let obj_ok = self.builder.ins().band(is_obj, tag_obj);
+        let obj_ok = crate::cells::is_plain_object(&mut self.builder, object);
         let validate = self.builder.create_block();
         let slow = self.builder.create_block();
         let merge = self.builder.create_block();
@@ -1911,15 +1817,7 @@ impl<'a> Lowerer<'a> {
             ctx,
             Offset32::new(std::mem::offset_of!(JitCallContext, member_value_cells) as i32),
         );
-        let ptr = self
-            .builder
-            .ins()
-            .band_imm_u(object, crux::PAYLOAD_MASK as i64);
-        let ptr = self.builder.ins().ishl_imm_u(ptr, 4);
-        let ptr = self
-            .builder
-            .ins()
-            .iadd_imm_s(ptr, crux::heap::GCBOX_DATA_OFFSET as i64);
+        let ptr = crate::cells::object_data_ptr(&mut self.builder, object);
         let live_id = self.builder.ins().load(
             types::I64,
             MemFlagsData::new(),
@@ -1932,42 +1830,10 @@ impl<'a> Lowerer<'a> {
             ptr,
             Offset32::new(std::mem::offset_of!(crux::JsObject, generation) as i32),
         );
-        let cell_slot = self.builder.ins().bxor(live_id, name_imm);
-        let cell_slot = self
-            .builder
-            .ins()
-            .band_imm_u(cell_slot, (MEMBER_CELLS - 1) as i64);
-        let index_bytes = self
-            .builder
-            .ins()
-            .imul_imm_s(cell_slot, std::mem::size_of::<MemberValueCell>() as i64);
-        let cell = self.builder.ins().iadd(cells, index_bytes);
-        let cell_id = self.builder.ins().load(
-            types::I64,
-            MemFlagsData::new(),
-            cell,
-            Offset32::new(std::mem::offset_of!(MemberValueCell, id) as i32),
-        );
-        let cell_name = self.builder.ins().load(
-            types::I32,
-            MemFlagsData::new(),
-            cell,
-            Offset32::new(std::mem::offset_of!(MemberValueCell, name) as i32),
-        );
-        let cell_gen = self.builder.ins().load(
-            types::I32,
-            MemFlagsData::new(),
-            cell,
-            Offset32::new(std::mem::offset_of!(MemberValueCell, generation) as i32),
-        );
-        let id_ok = self.builder.ins().icmp(IntCC::Equal, cell_id, live_id);
-        let name_ok = self
-            .builder
-            .ins()
-            .icmp_imm_u(IntCC::Equal, cell_name, name as i64);
-        let gen_ok = self.builder.ins().icmp(IntCC::Equal, cell_gen, live_gen);
-        let id_name_ok = self.builder.ins().band(id_ok, name_ok);
-        let ok = self.builder.ins().band(id_name_ok, gen_ok);
+        let cell =
+            crate::cells::member_value_cell_addr(&mut self.builder, cells, live_id, name_imm);
+        let ok =
+            crate::cells::member_value_cell_valid(&mut self.builder, cell, live_id, name, live_gen);
         let deferred = self.builder.create_block();
         self.builder.ins().brif(ok, deferred, &[], shape, &[]);
         // The value-cell hit: a vector-free (Option-3) receiver takes the

@@ -103,6 +103,17 @@ behind the in-loop validity guard (the deopt-free design); then G3 (LICM hoists
 the load). The `Check` guard mechanism stays the tool for premises that genuinely
 need a per-activation exit (a polymorphic shape), not for this read.
 
+**G2a landed (2026-10-07).** `crates/jit/src/cells.rs` holds the shared
+primitives — `object_data_ptr`, `is_plain_object`, `member_value_cell_addr`,
+`member_value_cell_valid`, `member_value_cell_value` — and both per-step probes
+(the read probe in `emit_member_cell_probe`, the store path in
+`emit_validated_member_store`) now call them. Scope note: the tier needs only
+these *primitives*, not the whole 370-line method — the length/typed-array/map
+machinery is per-step-only, so the refactor is small and behavior-neutral (clippy
+clean; `cargo test -p jit` 306 / 0; test262 `language` 23,726 / 0 and
+`built-ins` 23,820 / 0 / 1 at baseline — the probe is on the hottest read path,
+so a drift would have shown).
+
 ## Measurement
 
 `scratch/tier-ab/wl/read_loop.js` (`s += o.x`, 5M iters) is the row: currently
