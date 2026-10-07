@@ -151,7 +151,7 @@ The `stage` column maps each increment to `optimizing-tier-plan.md` §6.
 | id | stage | content | targets | status |
 |----|-------|---------|---------|--------|
 | I0 | — | IR core: `ir`/`builder`/`verify`/`print` + tests | none (foundation) | **landed** at `crates/jit/src/opt/` |
-| I1 | — | lift (straight-line subset) + identity lowering behind `SLAG_OPT=1` | none (equivalence) | proposed |
+| I1 | — | lift (straight-line subset) **landed**; identity lowering behind `SLAG_OPT=1` proposed | none (equivalence) | partly landed |
 | I2 | — | lift control flow: branches, then simple loops with phis | none (equivalence) | proposed |
 | I3 | O | feedback records + `ICState` valve + retire hook + count probe | none (enabling) | proposed |
 | I4 | B | builtin intrinsic inlining (scalars first, then array/collection) | `regexp_test`, `array_slice`, `string_indexof` | partly landed, outside the IR |
@@ -236,6 +236,20 @@ feedback record) is no longer gated behind Stage B.
   parity 0 and no row regressed.
 - No perf claim in I1; it proves the lift/lower round-trip is exact before
   any pass rewrites anything.
+
+**I1 status (2026-10-07): the lift landed as `crates/jit/src/opt/lift/`.**
+`lift(&CompiledBody) -> Result<Function, Unsupported>` covers the straight-line
+subset — `Push` of a number or boolean, `Pop`, `Dup`,
+`LoadLocal`/`StoreLocal`/`InitLocal` (frame slots), `Binary`, `BinaryImm`, the
+non-coercing-free unaries (`+`/`-`/`~`/`!`), and `Return` — with
+`Unsupported::{Uncertified, TdzSlot, Step, NoReturn, Stack, Invalid}`. It
+refuses control flow (I2) and TDZ-checked slots (the `is_uninitialized` check
+becomes an explicit op later; a body without one is params/`var`s only, so the
+check can never fire and the check-free `FrameLoad`/`FrameStore` are exact).
+The produced graph is run through `verify` before it leaves the lift. The
+identity lowering (`opt_lower.rs`) and the `SLAG_OPT=1` switch are the
+remaining half of I1, and nothing consumes the IR yet, so this slice is
+behavior-neutral by construction (10 unit tests in the module).
 
 ## 10. Open decisions
 

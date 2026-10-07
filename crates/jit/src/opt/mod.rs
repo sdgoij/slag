@@ -11,6 +11,7 @@
 
 pub mod builder;
 pub mod ir;
+pub mod lift;
 pub mod print;
 pub mod verify;
 
