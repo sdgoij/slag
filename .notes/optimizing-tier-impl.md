@@ -510,12 +510,23 @@ incl. the LICM hoist and the entry-header refusal); `cargo clippy --workspace
 (plus `FastLoopBind`/`FastLoopStore`) is still unlifted, and the *acc-path* form
 (`FastLoopHead { Counter }`) is additionally blocked by its `RunRegBody` body —
 a second front end for `LeafOp`s. `FastLoopHead { Global }` is refused by the
-per-step path too. The scalar replacer is deferred. (b) The tier's member read still calls `Helper::GetMemberName`
-unconditionally; inlining the member-value/map-shape probe would close the read
-regression, but the probe is ~300 lines of layout-coupled code, and copying it
-into `opt_lower` is exactly the private fork §6 warns against — it should be
-extracted into a shared lowering helper, which is a real refactor of the
-per-step path and needs its own gate.
+per-step path too. The scalar replacer is deferred. (b) **Resolved as a negative
+result** (below): the tier's unconditional member-read cell probe does not pay.
+
+**Negative result (2026-10-07): inlining the member-read cell probe does not pay.**
+I built the tier's inline member-value cell probe in `opt_lower` (the
+plain-object path of the per-step `emit_member_cell_probe`) and measured it on a
+read-heavy loop (`s += o.x`, 5M iters, min-of-5 interleaved, `SLAG_OPT` 0 vs 1):
+**~33.15ms with no probe vs ~32.87ms with it — under 1%, i.e. noise.** The reason
+is that the fallback `Helper::GetMemberName` is a C call into
+`Vm::get_member_name`, which already hits the same member cell; the tier's
+unconditional call is about as cheap as the inline probe, whose tag and cell
+checks are not free. So the probe is **reverted**: ~100 lines of layout-coupled
+duplication for no measured gain, and §6's "do not fork" applies squarely. The
+read regression the plan feared is **not real** — the tier is at parity on
+reads. The lever for reads is not an *unconditional* inline probe but a
+*guarded, hoisted* read whose premise (the cell's generation) the feedback
+record retires — the cell as a premise, not as a straight-line mirror.
 
 ## 10. Open decisions
 
