@@ -67,6 +67,42 @@ decision.
 | G4 | the decision gate (feedback valve, or a cheaper heuristic) so a polymorphic site is not guarded | no deopt thrash on the corpus |
 | G5 | retirement: bind the body to the cell generation, retire on invalidation | premise-invalidation test |
 
+## Scoping findings (2026-10-07, before G2)
+
+**G1 landed.** `Heap::Members` is a region now; `MemberStore`/`ElementStore` and
+`Effects::call` all clobber a `Members` read (`call` was widened to `0b1_1111`, or
+a call would not invalidate a hoisted read), with a clobber test. Behavior-
+neutral; the jit suite is green.
+
+Building the measurement exposed two prerequisites that make G2 larger than "one
+op":
+
+1. **Single-sourcing the cell probe.** The guard's lowering must emit the *same*
+   cell probe the per-step path emits (plan §6's "do not fork"); that probe is
+   `Compiler::emit_member_cell_probe`, ~370 lines coupled to the per-step
+   compiler's state. It must be factored into a shared emitter before the tier
+   can call it — a behavior-neutral refactor that is itself a slice.
+2. **The hoist's soundness.** The N→1 win needs the *cell value load* hoisted
+   while the *validity check* stays in the loop. Two designs:
+   - **Deopt (a hoisted `Check`).** A guard hoisted to the preheader deopts
+     *before the loop runs*, so its resume step must be the **loop entry**, and
+     the IR carries no block step indices (the lift knows them, the IR does
+     not). Needs `Block::start_step` plumbing before it is sound.
+   - **Deopt-free (preferred).** Hoist a *speculative cell value load* whose
+     address is computed behind a hoisted object-tag check, and keep the full
+     validity check (`id`/`name`/`generation`) **in the loop** with a
+     `Helper::GetMemberName` fallback. No deopt, no resume-step plumbing, and a
+     getter site simply always takes the helper — no thrash, so the megamorphic
+     valve stops being load-bearing for the throttle. The "guard" is a cheap
+     in-loop compare, not a `Check`; this resolves open decision #2 in favour of
+     the non-`Check` shape for reads.
+
+**Revised first sub-slices:** G2a — the shared cell-probe emitter (refactor,
+behavior-neutral); G2b — `Op::MemberCellLoad`, a speculative load that hoists
+behind the in-loop validity guard (the deopt-free design); then G3 (LICM hoists
+the load). The `Check` guard mechanism stays the tool for premises that genuinely
+need a per-activation exit (a polymorphic shape), not for this read.
+
 ## Measurement
 
 `scratch/tier-ab/wl/read_loop.js` (`s += o.x`, 5M iters) is the row: currently

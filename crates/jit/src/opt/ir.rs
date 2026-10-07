@@ -64,6 +64,8 @@ pub enum Heap {
     Elements,
     /// Global bindings.
     Globals,
+    /// The member-value cell cache (a property read's value cache).
+    Members,
     /// Everything else, and the whole world for a call.
     World,
 }
@@ -74,6 +76,7 @@ impl Heap {
             Heap::Slots => 1,
             Heap::Elements => 2,
             Heap::Globals => 4,
+            Heap::Members => 16,
             Heap::World => 8,
         }
     }
@@ -119,8 +122,8 @@ impl Effects {
     #[must_use]
     pub const fn call() -> Self {
         Effects {
-            reads: 0b1111,
-            writes: 0b1111,
+            reads: 0b1_1111,
+            writes: 0b1_1111,
         }
     }
 
@@ -272,9 +275,11 @@ impl Op {
             Op::GlobalStore => E::write(Heap::Globals),
             Op::IdentLoad => E::read(Heap::Globals),
             Op::MemberLoad => E::read(Heap::Slots).union(E::read(Heap::Elements)),
-            Op::MemberStore => E::write(Heap::Slots).union(E::write(Heap::Elements)),
+            Op::MemberStore => E::write(Heap::Slots)
+                .union(E::write(Heap::Elements))
+                .union(E::write(Heap::Members)),
             Op::ElementLoad => E::read(Heap::Elements),
-            Op::ElementStore => E::write(Heap::Elements),
+            Op::ElementStore => E::write(Heap::Elements).union(E::write(Heap::Members)),
             Op::CompletionReset | Op::CompletionStore => E::write(Heap::World),
             Op::Add
             | Op::Sub
@@ -478,5 +483,23 @@ mod tests {
         assert!(Op::Add.default_effects().may_read(Heap::World));
         assert!(Op::FrameLoad.default_effects().may_read(Heap::Slots));
         assert!(Op::FrameStore.default_effects().may_write(Heap::Slots));
+    }
+
+    #[test]
+    fn a_member_write_clobbers_a_members_read() {
+        // `Heap::Members` is the member-value cell cache: any member/element
+        // store or any call must invalidate a cell read, or LICM would hoist a
+        // read across the store that changed its value.
+        let read = Effects::read(Heap::Members);
+        assert!(Op::MemberStore.default_effects().may_clobber_reads_of(read));
+        assert!(
+            Op::ElementStore
+                .default_effects()
+                .may_clobber_reads_of(read)
+        );
+        assert!(Op::Call.default_effects().may_clobber_reads_of(read));
+        assert!(Effects::call().may_write(Heap::Members));
+        // A frame-slot write does not.
+        assert!(!Op::FrameStore.default_effects().may_clobber_reads_of(read));
     }
 }
