@@ -7,11 +7,13 @@
 //! backend. See `.notes/optimizing-tier-impl.md` for the layering and the
 //! increment plan.
 //!
-//! Status: I0, the IR core.
+//! Status: I0–I2 (the IR core, the lift, the lowering) plus the fold + DCE
+//! pass pipeline.
 
 pub mod builder;
 pub mod ir;
 pub mod lift;
+pub mod pass;
 pub mod print;
 pub mod verify;
 

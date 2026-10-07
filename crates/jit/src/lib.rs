@@ -2011,6 +2011,36 @@ mod tests {
     }
 
     #[test]
+    fn opt_tier_folded_constants_match_the_interpreter() {
+        // The pass pipeline runs between the lift and the lowering: `(1 + 2) *
+        // 3 - 4` lifts to a chain of `Const`s and arithmetic ops, folds to a
+        // single `Const`, and DCE drops the dead operands. The body must still
+        // match the interpreter, and the fold counter proves the pipeline
+        // actually fired (the compiler leaves literal arithmetic as steps).
+        let source = "function f() { return (1 + 2) * 3 - 4; } \
+                      var t = 0; \
+                      t += f(); t += f(); t += f(); t += f(); t += f(); \
+                      t += f(); t += f(); t += f(); t += f(); t += f(); \
+                      t += f(); t += f(); t += f(); t += f(); t += f(); \
+                      t += f(); t += f(); t += f(); t += f(); t += f(); \
+                      t;";
+        let interp = {
+            let mut agent = runtime::Agent::new();
+            agent.initialize_host_defined_realm().expect("realm");
+            agent.run_script(source).expect("interp runs")
+        };
+        let before = crate::opt::pass::fold::FOLDS.load(Ordering::Relaxed);
+        let (value, compiled) = with_opt_jit_agent(|agent| agent.run_script(source).expect("runs"));
+        let folds = crate::opt::pass::fold::FOLDS.load(Ordering::Relaxed) - before;
+        assert_eq!(
+            value, interp,
+            "the optimizing tier must match the interpreter"
+        );
+        assert!(compiled >= 1, "{compiled} bodies compiled");
+        assert!(folds >= 1, "the pipeline folded {folds} constants");
+    }
+
+    #[test]
     fn installed_jit_runs_a_member_callee() {
         // `return o.f(1) + 1` — a member callee (plain `CallFast`), no loop.
         // Cut 69: both bodies are straight-line, so the call repeats 17×

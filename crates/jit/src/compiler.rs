@@ -109,9 +109,15 @@ impl JitEngine {
         // the per-step path unchanged.
         if self.opt {
             match crate::opt::lift::lift(body) {
-                Ok(ir) => {
-                    if let Some(compiled) =
-                        crate::opt_lower::compile(&*self.isa, &ir, helpers, body.max_stack)
+                Ok(mut ir) => {
+                    // The pass pipeline (fold + DCE) runs before lowering. A
+                    // pass is allowed to change the IR but not to break it, so
+                    // re-verify and bail to the per-step path on a violation (a
+                    // pass bug is a refusal, never a wrong program).
+                    crate::opt::pass::run(&mut ir);
+                    if crate::opt::verify::verify(&ir).is_ok()
+                        && let Some(compiled) =
+                            crate::opt_lower::compile(&*self.isa, &ir, helpers, body.max_stack)
                     {
                         return Some(compiled);
                     }

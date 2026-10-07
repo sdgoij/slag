@@ -351,6 +351,28 @@ clippy --workspace --all-targets -- -D warnings` clean; `cargo test --workspace`
 green (6 `feedback` tests, including a classification probe); behavior-neutral
 when off.
 
+**Pass pipeline status (2026-10-07): fold + DCE landed (`opt/pass/`).** The tier
+now has a transform stage between the lift and the lowering (`pass::run` =
+`fold::run` then `dce::run`). `fold` is exact: it rewrites an op only when its
+operands are constants of a kind that makes the op a plain IEEE-754 operation
+(two numbers for `+`/`-`/`*`/`/` and the ordering comparisons, two numbers or two
+booleans for equality, a boolean for `!`, a number for unary `-`), and only when
+the operand constant is defined in the same block, so the verifier's dominance
+rule is never at risk; a mixed-kind `==`, a string operand, and the bitwise
+`%`/`**` ops are left for the typer's narrower folds. `dce` drops an instruction
+whose result nothing uses, is effect-free, and is not `Op::Check` (whose
+`default_effects` are pure but whose removal would drop a speculation guard). The
+pipeline is Cranelift-free and unit-tested on hand-built IR; `JitEngine::compile`
+re-verifies after the pipeline and bails to the per-step path on a violation (a
+pass bug is a refusal, never a wrong program). The tier is still behind
+`SLAG_OPT`, so a default build is unchanged. Gates: `cargo test --workspace`
+green (289 jit tests, +10: 5 `fold`, 4 `dce`, and an e2e that proves a fold fires
+on a real body via a counter); `cargo clippy --workspace --all-targets --
+-D warnings` clean; with `SLAG_OPT=1`, test262 `language` 23,726 / 0 and
+`built-ins` 23,820 / 0 / 1 (both at the I1 baseline). No perf claim — the passes
+are conservative (an arithmetic op's sound default effects are `World`, so DCE
+only removes dead constants today); the narrowing is the typer's job.
+
 ## 10. Open decisions
 
 1. **Feedback store location** — per body (`CompiledBody`) or per closure
