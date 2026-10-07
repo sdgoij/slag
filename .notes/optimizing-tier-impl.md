@@ -152,7 +152,7 @@ The `stage` column maps each increment to `optimizing-tier-plan.md` §6.
 |----|-------|---------|---------|--------|
 | I0 | — | IR core: `ir`/`builder`/`verify`/`print` + tests | none (foundation) | **landed** at `crates/jit/src/opt/` |
 | I1 | — | lift (straight-line subset) + identity lowering behind `SLAG_OPT=1` | none (equivalence) | **landed** |
-| I2 | — | lift control flow: branches, then simple loops with phis | none (equivalence) | proposed |
+| I2 | — | lift control flow: branches **landed**; simple loops with phis proposed | none (equivalence) | partly landed |
 | I3 | O | feedback records + `ICState` valve + retire hook + count probe | none (enabling) | proposed |
 | I4 | B | builtin intrinsic inlining (scalars first, then array/collection) | `regexp_test`, `array_slice`, `string_indexof` | partly landed, outside the IR |
 | I5 | I | trial inlining (caller-specialized records) | `method_call`, `js_call`, `closure_capture`, `hof_methods`, `apply_call` | proposed |
@@ -272,6 +272,24 @@ the lowering actually ran); `cargo test --workspace` all green. With
 `SLAG_OPT=1`: test262 `language` 23,726 / 0, `built-ins` 23,820 / 0 / 1,
 `annexB` 1,086 / 0 — the whole `all` area at 0 fail on the optimizing path.
 No perf claim (I1 is equivalence); the passes (I3+) are what move rows.
+
+**I2 status (2026-10-07): forward control flow landed (branches and forward
+jumps); loops are I2b.** The lift now builds a CFG: a block starts at 0, at
+every jump target and after every terminator; `Jump`/
+`JumpIfFalse`/`JumpIfTrue` and a fall-through become `Term::Jump`/
+`Term::Branch`. Frame slots stay in memory (the IR's `FrameLoad`/`FrameStore`
+read/write `Heap::Slots`), so **only the operand stack is SSA** — a join takes
+its stack as block parameters and each predecessor passes its stack as edge
+arguments (verified by `verify`'s arity/dominance checks). `opt_lower` lowers
+the multi-block form: one Cranelift block per IR block, IR parameters to
+Cranelift block parameters, `jump`/`brif` with `BlockArg`s, and the branch
+condition through `ToBooleanSlow` (its result tested `!= 0`). A back edge is
+refused (`Step("loop")`) because its target's parameters need a predecessor
+that has not been lifted yet — the fixpoint over join depths is I2b. `Throw`
+is refused. Two e2e tests (straight-line and a branch/ternary body) match the
+interpreter and assert the tier actually ran; `cargo test -p jit` 278 passed,
+workspace green, and with `SLAG_OPT=1` the whole test262 `all` area is at 0
+fail. Still no perf claim.
 
 ## 10. Open decisions
 

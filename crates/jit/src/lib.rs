@@ -1944,6 +1944,40 @@ mod tests {
     }
 
     #[test]
+    fn opt_tier_branch_body_matches_the_interpreter() {
+        // I2: a body with `if`/`else` and a ternary lowers to the multi-block
+        // IR (a branch plus a join whose stack value becomes a parameter) and
+        // must agree with the interpreter.
+        let source = "function f(a, b) { \
+                        var r; \
+                        if (a > b) { r = a - b; } else { r = b - a; } \
+                        return r > 3 ? r * 2 : r + 100; \
+                      } \
+                      var t = 0; \
+                      t += f(1, 2); t += f(9, 4); t += f(3, 3); t += f(7, 0); \
+                      t += f(5, 6); t += f(2, 8); t += f(4, 1); t += f(0, 9); \
+                      t += f(8, 8); t += f(6, 2); t += f(1, 7); t += f(9, 9); \
+                      t += f(3, 5); t += f(7, 1); t += f(2, 2); t += f(4, 9); \
+                      t += f(0, 0); t += f(8, 3); t += f(6, 6); t += f(5, 1); \
+                      t += f(9, 2); t += f(1, 4); t += f(7, 7); t += f(3, 0); \
+                      t;";
+        let interp = {
+            let mut agent = runtime::Agent::new();
+            agent.initialize_host_defined_realm().expect("realm");
+            agent.run_script(source).expect("interp runs")
+        };
+        let before = crate::opt_lower::OPT_COMPILED.load(Ordering::Relaxed);
+        let (value, compiled) = with_opt_jit_agent(|agent| agent.run_script(source).expect("runs"));
+        let lowered = crate::opt_lower::OPT_COMPILED.load(Ordering::Relaxed) - before;
+        assert_eq!(
+            value, interp,
+            "the optimizing tier must match the interpreter"
+        );
+        assert!(compiled >= 1, "{compiled} bodies compiled");
+        assert!(lowered >= 1, "the optimizing tier lowered {lowered} bodies");
+    }
+
+    #[test]
     fn installed_jit_runs_a_member_callee() {
         // `return o.f(1) + 1` — a member callee (plain `CallFast`), no loop.
         // Cut 69: both bodies are straight-line, so the call repeats 17×

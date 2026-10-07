@@ -9,7 +9,8 @@
 use cranelift_codegen::ir::condcodes::IntCC;
 use cranelift_codegen::ir::immediates::Offset32;
 use cranelift_codegen::ir::{
-    Function, InstBuilder, MemFlagsData, SigRef, UserFuncName, Value as ClifValue, types,
+    Block, BlockArg, Function, InstBuilder, MemFlagsData, SigRef, UserFuncName, Value as ClifValue,
+    types,
 };
 use cranelift_codegen::isa::{CallConv, TargetIsa};
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
@@ -20,7 +21,7 @@ use syntax::ast::{BinaryOp, UnaryOp};
 use crate::Compiled;
 use crate::compiler::{Unsupported, assemble, helper_sig, jit_sig, platform_call_conv};
 use crate::helpers::{Helper, JitHelpers};
-use crate::opt::ir::{Function as IrFunction, Imm, Inst, Op, Term, ValueId};
+use crate::opt::ir::{BlockId, Function as IrFunction, Imm, Inst, Op, Term, ValueId};
 
 /// How many bodies the optimizing tier has lowered (test introspection).
 #[cfg(test)]
@@ -56,6 +57,7 @@ struct Abi {
     vm: ClifValue,
     sig_binary: SigRef,
     sig_unary: SigRef,
+    sig_bool: SigRef,
 }
 
 fn lower(
@@ -65,47 +67,96 @@ fn lower(
     fctx: &mut FunctionBuilderContext,
     conv: CallConv,
 ) -> Result<(), Unsupported> {
-    // I1 shape: one block, no parameters, terminated by `Return`. The lift
-    // never produces anything else; multi-block/parameter forms arrive with I2.
-    if ir.block_count() != 1 || !ir.block(ir.entry()).params.is_empty() {
-        return Err(Unsupported::Step("opt:ir-shape"));
-    }
-    let block = ir.block(ir.entry());
-
     let mut builder = FunctionBuilder::new(func, fctx);
+    // One Cranelift block per IR block. The entry takes the function
+    // parameters; every other block takes its IR parameters (the join stack).
+    let mut clif: Vec<Block> = Vec::with_capacity(ir.block_count());
     let entry = builder.create_block();
     builder.append_block_params_for_function_params(entry);
-    builder.switch_to_block(entry);
-    let params = builder.block_params(entry).to_vec();
-    let abi = Abi {
-        frame: params[0],
-        vm: params[2],
-        sig_binary: builder.import_signature(helper_sig(&[types::I64; 4], conv)),
-        sig_unary: builder.import_signature(helper_sig(&[types::I64; 3], conv)),
-    };
-
-    let mut values: Vec<Option<ClifValue>> = vec![None; ir.value_count() as usize];
-    for inst in &block.insts {
-        let result = lower_inst(&mut builder, inst, &abi, helpers, &values)?;
-        if let Some(id) = inst.result {
-            values[id as usize] = Some(result);
+    clif.push(entry);
+    for b in 1..ir.block_count() as BlockId {
+        let block = builder.create_block();
+        for _ in 0..ir.block(b).params.len() {
+            builder.append_block_param(block, types::I64);
         }
+        clif.push(block);
     }
 
-    match &block.term {
-        Some(Term::Return(value)) => {
-            let v = match value {
-                Some(id) => value_of(&values, *id)?,
-                None => builder
-                    .ins()
-                    .iconst(types::I64, JsValue::Undefined.bits() as i64),
-            };
-            builder.ins().return_(&[v]);
+    builder.switch_to_block(clif[0]);
+    let entry_params = builder.block_params(clif[0]).to_vec();
+    let abi = Abi {
+        frame: entry_params[0],
+        vm: entry_params[2],
+        sig_binary: builder.import_signature(helper_sig(&[types::I64; 4], conv)),
+        sig_unary: builder.import_signature(helper_sig(&[types::I64; 3], conv)),
+        sig_bool: builder.import_signature(helper_sig(&[types::I64; 2], conv)),
+    };
+    let undefined = JsValue::Undefined.bits() as i64;
+
+    let mut values: Vec<Option<ClifValue>> = vec![None; ir.value_count() as usize];
+    for b in 0..ir.block_count() as BlockId {
+        let block = ir.block(b);
+        builder.switch_to_block(clif[b as usize]);
+        let params = builder.block_params(clif[b as usize]).to_vec();
+        for (i, p) in block.params.iter().enumerate() {
+            values[*p as usize] = Some(params[i]);
         }
-        _ => return Err(Unsupported::Step("opt:term")),
+        for inst in &block.insts {
+            let result = lower_inst(&mut builder, inst, &abi, helpers, &values)?;
+            if let Some(id) = inst.result {
+                values[id as usize] = Some(result);
+            }
+        }
+        match &block.term {
+            Some(Term::Return(value)) => {
+                let v = match value {
+                    Some(id) => value_of(&values, *id)?,
+                    None => builder.ins().iconst(types::I64, undefined),
+                };
+                builder.ins().return_(&[v]);
+            }
+            Some(Term::Jump { target, args }) => {
+                let vals = resolve(args, &values)?;
+                builder.ins().jump(clif[*target as usize], &vals);
+            }
+            Some(Term::Branch {
+                cond,
+                then_block,
+                then_args,
+                else_block,
+                else_args,
+            }) => {
+                let c = value_of(&values, *cond)?;
+                let truthy = call_helper(
+                    &mut builder,
+                    helpers,
+                    &abi,
+                    abi.sig_bool,
+                    Helper::ToBooleanSlow,
+                    &[c],
+                )?;
+                let test = builder.ins().icmp_imm_u(IntCC::NotEqual, truthy, 0);
+                let then_vals = resolve(then_args, &values)?;
+                let else_vals = resolve(else_args, &values)?;
+                builder.ins().brif(
+                    test,
+                    clif[*then_block as usize],
+                    &then_vals,
+                    clif[*else_block as usize],
+                    &else_vals,
+                );
+            }
+            _ => return Err(Unsupported::Step("opt:term")),
+        }
     }
     builder.seal_all_blocks();
     Ok(())
+}
+
+fn resolve(args: &[ValueId], values: &[Option<ClifValue>]) -> Result<Vec<BlockArg>, Unsupported> {
+    args.iter()
+        .map(|id| value_of(values, *id).map(Into::into))
+        .collect()
 }
 
 fn lower_inst(

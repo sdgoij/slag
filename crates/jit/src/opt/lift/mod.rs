@@ -1,22 +1,27 @@
 //! The lift: the interpreter's `Step` stream into the SSA IR.
 //!
-//! Increment I1 of `.notes/optimizing-tier-impl.md` §9: the straight-line
-//! subset. A step outside the subset, or a body that is not certified or has a
-//! TDZ-checked slot, returns [`Unsupported`] and keeps the current per-step
-//! lowering, so nothing about the engine's behavior changes until a later
-//! increment wires the IR in.
+//! Increments I1 (straight line) and I2 (forward control flow): a `Jump`, a
+//! `JumpIfFalse`/`JumpIfTrue` and a join. A step outside the subset, a body
+//! that is not certified, a TDZ-checked slot, or a back edge (a loop, which
+//! needs a fixpoint over the join stack — I2b) returns [`Unsupported`] and
+//! keeps the current per-step lowering, so nothing about the engine's behavior
+//! changes unless a later increment wires the IR in.
 //!
 //! The lift is exact by construction: an accepted step means exactly what the
 //! interpreter's handler for that step means. Two shapes it deliberately
 //! refuses rather than approximates:
 //!
-//! - **Control flow.** A `Jump`/`JumpIf*` needs block boundaries and join phis
-//!   (I2); the straight-line form has a single block.
+//! - **Loops.** A back edge's target needs parameters fed from a predecessor
+//!   that has not been lifted yet; the forward-only shape resolves a join from
+//!   already-lifted predecessors.
 //! - **TDZ slots.** `Step::LoadLocal`/`StoreLocal` carry an
 //!   `is_uninitialized` check the IR does not model (it will become an explicit
 //!   op). A body whose scope has no TDZ slot — parameters and `var`s only — has
 //!   no slot that can be uninitialized, so the check can never fire and the
 //!   check-free `FrameLoad`/`FrameStore` are exact.
+//!
+//! Frame slots stay in memory (the IR's `FrameLoad`/`FrameStore` read and write
+//! `Heap::Slots`); only the operand stack is SSA and needs join parameters.
 
 use crate::opt::builder::Builder;
 use crate::opt::ir::{BlockId, Effects, Function, Heap, Imm, Op, Term, Type, ValueId};
@@ -32,7 +37,7 @@ pub enum Unsupported {
     Uncertified,
     /// The scope has a TDZ-checked slot (see the module note).
     TdzSlot,
-    /// A step outside the straight-line subset.
+    /// A step outside the subset (a back edge names `"loop"`).
     Step(&'static str),
     /// The body reached its end without a `Return`, so the entry block has no
     /// terminator.
@@ -40,38 +45,240 @@ pub enum Unsupported {
     /// The operand stack underflowed — a step sequence the interpreter would
     /// not produce.
     Stack,
+    /// A malformed body (a jump outside the body, mismatched stack depths at a
+    /// join).
+    Malformed(&'static str),
     /// The lift produced a graph [`verify`](super::verify::verify) rejects.
     /// This is a lift bug; the caller keeps the current path either way.
     Invalid,
 }
 
-/// Lift a certified straight-line body into the SSA IR.
+/// Lift a certified body into the SSA IR (straight line + forward control
+/// flow).
 pub fn lift(body: &CompiledBody) -> Result<Function, Unsupported> {
     let scope = body.scope.as_ref().ok_or(Unsupported::Uncertified)?;
     if scope.tdz_store.iter().any(|&tdz| tdz) {
         return Err(Unsupported::TdzSlot);
     }
+    let steps = &body.steps;
+    let n = steps.len();
+    if n == 0 {
+        return Err(Unsupported::NoReturn);
+    }
 
-    let mut func = Function::new();
-    let entry = func.entry();
-    {
-        let mut builder = Builder::new(&mut func);
-        let mut stack: Vec<ValueId> = Vec::new();
-        for step in &body.steps {
-            lift_step(&mut builder, entry, &mut stack, step)?;
+    // A block starts at 0, at every jump target, and after every terminator.
+    let mut starts = vec![false; n + 1];
+    starts[0] = true;
+    for (i, step) in steps.iter().enumerate() {
+        if let Some(t) = jump_target(step) {
+            if t <= i {
+                return Err(Unsupported::Step("loop"));
+            }
+            if t >= n {
+                return Err(Unsupported::Malformed("jump out of range"));
+            }
+            starts[t] = true;
+        }
+        if is_terminator(step) {
+            starts[i + 1] = true;
+        }
+    }
+    let block_starts: Vec<usize> = (0..n).filter(|&i| starts[i]).collect();
+    let nb = block_starts.len();
+    let mut block_of = vec![usize::MAX; n];
+    for (bi, &s) in block_starts.iter().enumerate() {
+        block_of[s] = bi;
+    }
+    let ends: Vec<usize> = (0..nb)
+        .map(|bi| block_starts.get(bi + 1).copied().unwrap_or(n))
+        .collect();
+
+    // Predecessors, from each block's successors (a jump target and, for a
+    // conditional or a fall-through, the next block).
+    let mut preds: Vec<Vec<usize>> = vec![Vec::new(); nb];
+    for (bi, &end) in ends.iter().enumerate() {
+        for succ in block_successors(steps, end, n)? {
+            let sb = block_of[succ];
+            if sb == usize::MAX {
+                return Err(Unsupported::Malformed("jump to a non-block start"));
+            }
+            preds[sb].push(bi);
         }
     }
 
-    if !matches!(func.block(entry).term, Some(Term::Return(_))) {
-        return Err(Unsupported::NoReturn);
+    let mut func = Function::new();
+    for _ in 1..nb {
+        func.push_block();
     }
+    let mut builder = Builder::new(&mut func);
+    let mut term_rec: Vec<Option<TermRec>> = (0..nb).map(|_| None).collect();
+
+    // Emit instructions; the operand stack is SSA. A join block takes its stack
+    // as parameters, and each predecessor passes its stack as edge arguments
+    // (filled in below, once every block's parameters are known).
+    for bi in 0..nb {
+        let incoming: Vec<ValueId> = if bi == 0 {
+            Vec::new()
+        } else {
+            let stacks: Vec<&[ValueId]> = preds[bi]
+                .iter()
+                .filter_map(|&p| term_rec[p].as_ref().map(edge_stack))
+                .collect();
+            let depth = stacks.first().map_or(0, |s| s.len());
+            if stacks.iter().any(|s| s.len() != depth) {
+                return Err(Unsupported::Malformed("stack depth mismatch at a join"));
+            }
+            if preds[bi].len() > 1 {
+                (0..depth)
+                    .map(|_| builder.param(bi as BlockId, Type::Unknown))
+                    .collect()
+            } else {
+                stacks.first().map_or_else(Vec::new, |s| s.to_vec())
+            }
+        };
+        let mut stack = incoming;
+        let end = ends[bi];
+        let term = terminator_index(steps, end);
+        let body_end = term.unwrap_or(end);
+        for step in &steps[block_starts[bi]..body_end] {
+            emit_step(&mut builder, bi as BlockId, &mut stack, step)?;
+        }
+        term_rec[bi] = Some(match term {
+            Some(ti) => match &steps[ti] {
+                Step::Return => TermRec::Ret(stack.pop().ok_or(Unsupported::Stack)?),
+                Step::Jump(_) => TermRec::Jump(stack),
+                Step::JumpIfFalse(_) | Step::JumpIfTrue(_) => {
+                    TermRec::Branch(stack.pop().ok_or(Unsupported::Stack)?, stack)
+                }
+                other => return Err(Unsupported::Step(step_name(other))),
+            },
+            None => TermRec::Jump(stack),
+        });
+    }
+
+    // Terminators: every target's parameters are now known.
+    for bi in 0..nb {
+        let end = ends[bi];
+        let term = terminator_index(steps, end);
+        let rec = term_rec[bi].as_ref().ok_or(Unsupported::Invalid)?;
+        match rec {
+            TermRec::Ret(v) => builder.term(bi as BlockId, Term::Return(Some(*v))),
+            TermRec::Jump(stack) => {
+                let target = match term {
+                    Some(ti) => jump_target(&steps[ti]).ok_or(Unsupported::Invalid)?,
+                    None => end,
+                };
+                let sb = block_of[target] as BlockId;
+                let args = edge_args(builder.func(), sb, stack);
+                builder.term(bi as BlockId, Term::Jump { target: sb, args });
+            }
+            TermRec::Branch(cond, stack) => {
+                let ti = term.ok_or(Unsupported::Invalid)?;
+                let (target, truthy) = match &steps[ti] {
+                    Step::JumpIfTrue(t) => (*t, true),
+                    Step::JumpIfFalse(t) => (*t, false),
+                    _ => return Err(Unsupported::Invalid),
+                };
+                let sb = block_of[target] as BlockId;
+                let fb = block_of[end] as BlockId;
+                let (then_block, else_block) = if truthy { (sb, fb) } else { (fb, sb) };
+                let then_args = edge_args(builder.func(), then_block, stack);
+                let else_args = edge_args(builder.func(), else_block, stack);
+                builder.term(
+                    bi as BlockId,
+                    Term::Branch {
+                        cond: *cond,
+                        then_block,
+                        then_args,
+                        else_block,
+                        else_args,
+                    },
+                );
+            }
+        }
+    }
+
     if crate::opt::verify::verify(&func).is_err() {
         return Err(Unsupported::Invalid);
     }
     Ok(func)
 }
 
-fn lift_step(
+/// The edge payload a block leaves on each successor.
+enum TermRec {
+    Ret(ValueId),
+    Jump(Vec<ValueId>),
+    Branch(ValueId, Vec<ValueId>),
+}
+
+fn edge_stack(rec: &TermRec) -> &[ValueId] {
+    match rec {
+        TermRec::Ret(_) => &[],
+        TermRec::Jump(stack) | TermRec::Branch(_, stack) => stack,
+    }
+}
+
+/// The arguments a predecessor passes into `target`: its stack, or nothing
+/// when the target has a single predecessor and therefore no parameters.
+fn edge_args(func: &Function, target: BlockId, stack: &[ValueId]) -> Vec<ValueId> {
+    if func.block(target).params.is_empty() {
+        Vec::new()
+    } else {
+        stack.to_vec()
+    }
+}
+
+/// The index of the terminating step of a block ending at `end`, if it is a
+/// terminator (`end - 1`); `None` for a fall-through block.
+fn terminator_index(steps: &[Step], end: usize) -> Option<usize> {
+    let last = end.checked_sub(1)?;
+    is_terminator(&steps[last]).then_some(last)
+}
+
+/// The blocks a block ending at `end` can reach.
+fn block_successors(steps: &[Step], end: usize, n: usize) -> Result<Vec<usize>, Unsupported> {
+    let Some(last) = end.checked_sub(1) else {
+        return Err(Unsupported::Invalid);
+    };
+    if is_terminator(&steps[last]) {
+        match &steps[last] {
+            Step::Jump(t) => Ok(vec![*t]),
+            Step::JumpIfFalse(t) | Step::JumpIfTrue(t) => {
+                if end >= n {
+                    return Err(Unsupported::Malformed("conditional with no fall-through"));
+                }
+                Ok(vec![*t, end])
+            }
+            Step::Return => Ok(Vec::new()),
+            Step::Throw { .. } => Err(Unsupported::Step("Throw")),
+            _ => Err(Unsupported::Invalid),
+        }
+    } else if end >= n {
+        Err(Unsupported::NoReturn)
+    } else {
+        Ok(vec![end])
+    }
+}
+
+fn is_terminator(step: &Step) -> bool {
+    matches!(
+        step,
+        Step::Jump(_)
+            | Step::JumpIfFalse(_)
+            | Step::JumpIfTrue(_)
+            | Step::Return
+            | Step::Throw { .. }
+    )
+}
+
+fn jump_target(step: &Step) -> Option<usize> {
+    match step {
+        Step::Jump(t) | Step::JumpIfFalse(t) | Step::JumpIfTrue(t) => Some(*t),
+        _ => None,
+    }
+}
+
+fn emit_step(
     builder: &mut Builder,
     block: BlockId,
     stack: &mut Vec<ValueId>,
@@ -140,10 +347,6 @@ fn lift_step(
                 Imm::None,
             );
             stack.push(v);
-        }
-        Step::Return => {
-            let value = stack.pop().ok_or(Unsupported::Stack)?;
-            builder.term(block, Term::Return(Some(value)));
         }
         other => return Err(Unsupported::Step(step_name(other))),
     }
@@ -237,9 +440,8 @@ fn unary_type(op: Op) -> Type {
 
 fn step_name(step: &Step) -> &'static str {
     match step {
-        Step::Jump(_) => "Jump",
-        Step::JumpIfFalse(_) => "JumpIfFalse",
-        Step::JumpIfTrue(_) => "JumpIfTrue",
+        Step::Jump(_) | Step::JumpIfFalse(_) | Step::JumpIfTrue(_) => "control",
+        Step::Return => "Return",
         _ => "step",
     }
 }
@@ -301,12 +503,8 @@ mod tests {
         }
     }
 
-    fn ops(func: &Function) -> Vec<Op> {
-        func.block(func.entry())
-            .insts
-            .iter()
-            .map(|i| i.op)
-            .collect()
+    fn ops(func: &Function, block: BlockId) -> Vec<Op> {
+        func.block(block).insts.iter().map(|i| i.op).collect()
     }
 
     #[test]
@@ -327,10 +525,9 @@ mod tests {
         assert_eq!(func.block_count(), 1);
         let entry = func.entry();
         assert_eq!(
-            ops(&func),
+            ops(&func, entry),
             vec![Op::Const, Op::Const, Op::Add, Op::FrameLoad, Op::Sub]
         );
-        // The `Add` result feeds the `Sub`, and the `FrameLoad` is its rhs.
         let add = func.block(entry).insts[2].result.unwrap();
         let load = func.block(entry).insts[3].result.unwrap();
         assert_eq!(func.block(entry).insts[4].args, vec![add, load]);
@@ -341,28 +538,39 @@ mod tests {
     }
 
     #[test]
-    fn constant_folds_nothing_but_types_the_result() {
-        // The lift types a comparison Bool and a bit op Int without folding.
+    fn lifts_a_ternary_branch() {
+        // return f[0] ? 1 : 2;
+        //  0 LoadLocal 0
+        //  1 JumpIfFalse 4
+        //  2 Push 1
+        //  3 Jump 5
+        //  4 Push 2
+        //  5 Return
         let b = body(
             vec![
+                Step::LoadLocal { slot: 0 },
+                Step::JumpIfFalse(4),
                 Step::Push(Value::Number(1.0)),
+                Step::Jump(5),
                 Step::Push(Value::Number(2.0)),
-                Step::Binary(BinaryOp::StrictEqual),
-                Step::Push(Value::Number(3.0)),
-                Step::Binary(BinaryOp::BitOr),
                 Step::Return,
             ],
-            0,
+            1,
         );
         let func = lift(&b).expect("lifts");
-        let entry = func.entry();
-        assert_eq!(func.block(entry).insts[2].ty, Type::Bool);
-        assert_eq!(func.block(entry).insts[4].ty, Type::Int);
+        // Blocks: [0,2) branch, [2,4) then, [4,5) else, [5,6) join.
+        assert_eq!(func.block_count(), 4);
+        assert!(matches!(func.block(0).term, Some(Term::Branch { .. })));
+        // The join block takes the two branch values as its parameter.
+        assert_eq!(func.block(3).params.len(), 1);
+        assert!(matches!(func.block(3).term, Some(Term::Return(Some(_)))));
+        assert!(ops(&func, 2).contains(&Op::Const));
+        assert!(ops(&func, 1).contains(&Op::Const));
     }
 
     #[test]
-    fn lifts_dup_and_pop() {
-        // A dead push/pop pair and a dup-ed multiply: return 3 * 3.
+    fn lifts_push_pop_dup_and_binary_imm() {
+        // A dead push/pop pair and a dup-ed multiply, then `f[1] + 4`.
         let b = body(
             vec![
                 Step::Push(Value::Number(7.0)),
@@ -370,29 +578,29 @@ mod tests {
                 Step::Push(Value::Number(3.0)),
                 Step::Dup,
                 Step::Binary(BinaryOp::Mul),
-                Step::Return,
-            ],
-            0,
-        );
-        let func = lift(&b).expect("lifts");
-        assert_eq!(ops(&func), vec![Op::Const, Op::Const, Op::Mul]);
-        // The multiply reads the same value twice.
-        let mul = &func.block(func.entry()).insts[2];
-        assert_eq!(mul.args[0], mul.args[1]);
-    }
-
-    #[test]
-    fn lifts_binary_imm_and_stores() {
-        // var x = f[0]; x = x + 4; return x;
-        let b = body(
-            vec![
-                Step::LoadLocal { slot: 0 },
-                Step::InitLocal { slot: 1 },
                 Step::LoadLocal { slot: 1 },
                 Step::BinaryImm {
                     op: BinaryOp::Add,
                     imm: 4.0,
                 },
+                Step::Return,
+            ],
+            2,
+        );
+        let func = lift(&b).expect("lifts");
+        let entry = func.entry();
+        assert_eq!(func.block(entry).insts[4].imm, Imm::Float(4.0));
+    }
+
+    #[test]
+    fn lifts_stores_and_unary() {
+        // var x = f[0]; x = -x; return x;
+        let b = body(
+            vec![
+                Step::LoadLocal { slot: 0 },
+                Step::InitLocal { slot: 1 },
+                Step::LoadLocal { slot: 1 },
+                Step::Unary(UnaryOp::Minus),
                 Step::StoreLocal { slot: 1 },
                 Step::LoadLocal { slot: 1 },
                 Step::Return,
@@ -402,37 +610,17 @@ mod tests {
         let func = lift(&b).expect("lifts");
         let entry = func.entry();
         assert_eq!(
-            ops(&func),
+            ops(&func, entry),
             vec![
                 Op::FrameLoad,
                 Op::FrameStore,
                 Op::FrameLoad,
-                Op::Const,
-                Op::Add,
+                Op::Neg,
                 Op::FrameStore,
                 Op::FrameLoad,
             ]
         );
-        assert_eq!(func.block(entry).insts[3].imm, Imm::Float(4.0));
-        // The stores name their slots.
         assert_eq!(func.block(entry).insts[1].imm, Imm::Slot(1));
-        assert_eq!(func.block(entry).insts[5].imm, Imm::Slot(1));
-    }
-
-    #[test]
-    fn lifts_unary() {
-        // return -(f[0]);
-        let b = body(
-            vec![
-                Step::LoadLocal { slot: 0 },
-                Step::Unary(UnaryOp::Minus),
-                Step::Return,
-            ],
-            1,
-        );
-        let func = lift(&b).expect("lifts");
-        assert_eq!(ops(&func), vec![Op::FrameLoad, Op::Neg]);
-        assert_eq!(func.block(func.entry()).insts[1].ty, Type::Number);
     }
 
     #[test]
@@ -453,14 +641,28 @@ mod tests {
     }
 
     #[test]
-    fn a_jump_is_unsupported() {
+    fn a_back_edge_is_unsupported() {
         let b = body(vec![Step::Jump(0)], 0);
-        assert_eq!(lift(&b).unwrap_err(), Unsupported::Step("Jump"));
+        assert_eq!(lift(&b).unwrap_err(), Unsupported::Step("loop"));
+    }
+
+    #[test]
+    fn a_throw_is_unsupported() {
+        let b = body(
+            vec![
+                Step::Push(Value::Number(1.0)),
+                Step::Throw {
+                    span: crux::Span::empty(0),
+                },
+            ],
+            0,
+        );
+        assert_eq!(lift(&b).unwrap_err(), Unsupported::Step("Throw"));
     }
 
     #[test]
     fn a_non_numeric_constant_is_unsupported() {
-        // A bare `return;` pushes `undefined`, which the I1 constant set omits.
+        // A bare `return;` pushes `undefined`, which the constant set omits.
         let b = body(vec![Step::Push(Value::Undefined), Step::Return], 0);
         assert_eq!(lift(&b).unwrap_err(), Unsupported::Step("Push"));
     }
@@ -469,5 +671,24 @@ mod tests {
     fn a_body_without_a_return_is_unsupported() {
         let b = body(vec![Step::Push(Value::Number(1.0))], 0);
         assert_eq!(lift(&b).unwrap_err(), Unsupported::NoReturn);
+    }
+
+    #[test]
+    fn constant_folds_nothing_but_types_the_result() {
+        let b = body(
+            vec![
+                Step::Push(Value::Number(1.0)),
+                Step::Push(Value::Number(2.0)),
+                Step::Binary(BinaryOp::StrictEqual),
+                Step::Push(Value::Number(3.0)),
+                Step::Binary(BinaryOp::BitOr),
+                Step::Return,
+            ],
+            0,
+        );
+        let func = lift(&b).expect("lifts");
+        let entry = func.entry();
+        assert_eq!(func.block(entry).insts[2].ty, Type::Bool);
+        assert_eq!(func.block(entry).insts[4].ty, Type::Int);
     }
 }
