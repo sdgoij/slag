@@ -153,7 +153,7 @@ The `stage` column maps each increment to `optimizing-tier-plan.md` §6.
 | I0 | — | IR core: `ir`/`builder`/`verify`/`print` + tests | none (foundation) | **landed** at `crates/jit/src/opt/` |
 | I1 | — | lift (straight-line subset) + identity lowering behind `SLAG_OPT=1` | none (equivalence) | **landed** |
 | I2 | — | lift control flow: branches **landed**; simple loops with phis proposed | none (equivalence) | partly landed |
-| I3 | O | feedback records + `ICState` valve + retire hook + count probe | none (enabling) | proposed |
+| I3 | O | feedback records + `ICState` valve + retire hook + count probe | none (enabling) | partly landed (I3a) |
 | I4 | B | builtin intrinsic inlining (scalars first, then array/collection) | `regexp_test`, `array_slice`, `string_indexof` | partly landed, outside the IR |
 | I5 | I | trial inlining (caller-specialized records) | `method_call`, `js_call`, `closure_capture`, `hof_methods`, `apply_call` | proposed |
 | I6 | E | escape analysis + scalar replacement | `object_keys`, `typed_array_for_each`, `array_alloc`/`object_alloc`, `destructure`, `construct_churn` | proposed |
@@ -312,10 +312,32 @@ green, `cargo clippy --workspace --all-targets -- -D warnings` clean. The
 `while`/`for` shape still reaches the interpreter's `FastLoopHead` fusion first,
 so the lift's loop path is exercised by `do`/`while` today. Still no perf claim.
 
+**I3a status (2026-10-07): the feedback substrate and the count probe landed.**
+The store is **per body** (`.notes/optimizing-tier-impl.md` §10.1, resolved
+per-body to match §5's `(body, step)` keying): `crates/runtime/src/feedback.rs`
+defines `IcState` (the `Specialized → Megamorphic → Generic` valve),
+`MAX_OPTIMIZED_STUBS`/`max_failures`, a bounded `MemberReadSite` (the receiver
+maps a site has served, in first-seen order), the `SiteRecord` enum, and the
+`Feedback` store (one record per step). `CompiledBody` gains a
+`feedback: RefCell<Option<Feedback>>` field, allocated lazily on the first write
+(exactly the `jit_info`/`jit_calls` pattern), so a default build allocates
+nothing. The interpreter's `Step::GetMemberName` arm is the first writer
+(`CompiledBody::record_member_read`), gated on `feedback::enabled()`
+(`SLAG_FEEDBACK`) — one cached boolean load on the hot path when off. `writes()`
+is the stage-O count probe. Nothing consumes a record yet; the `ICState` valve
+and the retire hook, and the compiled tier's slow-path writers, are the next
+slice, and the retired-premise read (which cell/generation served a site) lands
+with the guard that needs it. Gates: `cargo clippy --workspace --all-targets --
+-D warnings` clean; `cargo test --workspace` green (5 new `feedback` tests,
+including an end-to-end probe that runs a member-read script with the forced on
+and asserts records were written); behavior-neutral by construction when off.
+
 ## 10. Open decisions
 
 1. **Feedback store location** — per body (`CompiledBody`) or per closure
-   (the function object). Decide at I3; the record is transient either way.
+   (the function object). **Decided (I3a): per body**, matching §5's
+   `(body, step)` key; the field is a lazily-allocated `RefCell<Option<Feedback>>`
+   on `CompiledBody`, like `jit_info`/`jit_calls`. The record is transient.
 2. **Lift output** — SSA directly via block params (recommended: the lift
    knows predecessors, so the join phis are explicit and no separate
    SSA-construction pass is needed) or a non-SSA CFG plus a Cytron pass.

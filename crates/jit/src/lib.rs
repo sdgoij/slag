@@ -596,6 +596,7 @@ mod tests {
             has_call_intrinsic: false,
             max_stack,
             nested_gate: std::cell::Cell::new(None),
+            feedback: std::cell::RefCell::new(None),
         }
     }
 

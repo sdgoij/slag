@@ -22,6 +22,7 @@ pub mod embed;
 pub mod env;
 pub mod eval;
 pub mod expr;
+pub mod feedback;
 pub mod flow;
 pub mod function;
 pub mod generator;

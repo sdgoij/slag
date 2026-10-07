@@ -1923,6 +1923,10 @@ pub struct CompiledBody {
     /// the interpreter's nested-call carve consults (both are pure functions of
     /// the step list, so they are computed once instead of scanned per call).
     pub nested_gate: std::cell::Cell<Option<(bool, bool)>>,
+    /// Stage O: the per-site feedback store (`.notes/optimizing-tier-plan.md`),
+    /// keyed by step index. Allocated lazily and only when the probe
+    /// (`SLAG_FEEDBACK`) is enabled, so a default build allocates nothing.
+    pub feedback: std::cell::RefCell<Option<crate::feedback::Feedback>>,
 }
 
 impl CompiledBody {
@@ -2132,6 +2136,22 @@ impl CompiledBody {
                     | Step::SuperCall
             )
         })
+    }
+
+    /// Stage O count probe: record the member read at step `ip` whose receiver
+    /// had object map id `map` (`0` = a receiver with no speculatable shape).
+    /// A no-op unless the probe is enabled; the store is allocated on the first
+    /// write. Nothing consumes the record yet.
+    pub(crate) fn record_member_read(&self, ip: usize, map: u64) {
+        if !crate::feedback::enabled() {
+            return;
+        }
+        let mut slot = self.feedback.borrow_mut();
+        let store = slot.get_or_insert_with(|| crate::feedback::Feedback::new(self.steps.len()));
+        if let Some(site) = store.member_read(ip) {
+            site.observe(map);
+            crate::feedback::record_write();
+        }
     }
 }
 
@@ -5042,6 +5062,14 @@ impl Vm {
         }
     }
 
+    /// The receiver's object map id for the stage-O member-read probe (`0` = a
+    /// receiver with no speculatable shape: a primitive or an exotic object).
+    fn member_read_map(value: &Value) -> u64 {
+        Self::cell_object(value)
+            .and_then(|object| object.map.get())
+            .map_or(0, |map| map.id())
+    }
+
     /// Part B, B5.2: map-based read fast path. Check the object's map for
     /// a descriptor of `name`, then read from `in_fields` at the assigned
     /// offset. Returns `None` if not in the map (falls through to
@@ -7734,6 +7762,7 @@ impl Vm {
                 }
                 Step::GetMemberName { name } => {
                     let object = self.pop();
+                    body.record_member_read(self.ip, Self::member_read_map(&object));
                     let value = self.get_member_name(agent, object, *name)?;
                     self.stack.push(value);
                 }
@@ -25693,6 +25722,7 @@ pub fn compile_body(
             has_call_intrinsic,
             max_stack,
             nested_gate: std::cell::Cell::new(None),
+            feedback: std::cell::RefCell::new(None),
         },
         compiler.this_writes,
     ))
@@ -25779,6 +25809,7 @@ pub fn compile_statements(
         has_call_intrinsic,
         max_stack,
         nested_gate: std::cell::Cell::new(None),
+        feedback: std::cell::RefCell::new(None),
     })
 }
 
