@@ -2071,6 +2071,45 @@ mod tests {
     }
 
     #[test]
+    fn opt_tier_guarded_read_resumes_on_a_non_number_value() {
+        // With the typer on, a non-leaf body's member read is guarded `Number`.
+        // When the property is not a Number the guard must deopt and the
+        // interpreter must resume at the step AFTER the read, so a read with an
+        // observable effect (a getter) is NOT re-executed. `f` reads a global,
+        // so it is non-leaf — the lane where a guard can resume at all.
+        let source = "var g = 1; var reads = 0; \
+                      function f(o) { return o.x + g; } \
+                      var a = { get x() { reads = reads + 1; return 'a'; } }; \
+                      var n = { x: 3 }; \
+                      var t = ''; \
+                      t += f(a); t += f(n); t += f(a); t += f(n); t += f(a); \
+                      t += f(n); t += f(a); t += f(n); t += f(a); t += f(n); \
+                      t += f(a); t += f(n); t += f(a); t += f(n); t += f(a); \
+                      t += f(n); t += f(a); t += f(n); t += f(a); t += f(n); \
+                      t += f(a); t += f(n); t += f(a); t += f(n); \
+                      t + '|' + reads;";
+        let interp = {
+            let mut agent = runtime::Agent::new();
+            agent.initialize_host_defined_realm().expect("realm");
+            agent.run_script(source).expect("interp runs")
+        };
+        let deopts_before = runtime::jit::JIT_DEOPT_COUNT.load(Ordering::Relaxed);
+        crate::opt::lift::OPT_TYPER.store(1, Ordering::Relaxed);
+        let (value, compiled) = with_opt_jit_agent(|agent| agent.run_script(source).expect("runs"));
+        crate::opt::lift::OPT_TYPER.store(0, Ordering::Relaxed);
+        let deopts = runtime::jit::JIT_DEOPT_COUNT.load(Ordering::Relaxed) - deopts_before;
+        // The value carries `reads`: if the deopt re-ran the read (`imm = index`
+        // instead of `index + 1`) the getter would fire twice on the deopting
+        // calls and `reads` would differ.
+        assert_eq!(
+            value, interp,
+            "the optimizing tier must match the interpreter"
+        );
+        assert!(compiled >= 1, "{compiled} bodies compiled");
+        assert!(deopts >= 1, "the read guard must have fired ({deopts})");
+    }
+
+    #[test]
     fn opt_tier_lexical_body_matches_the_interpreter() {
         // A `let`-using body is TDZ-checked; the tier models the check
         // (`Op::TdzCheck`), so the body compiles via the IR where it was

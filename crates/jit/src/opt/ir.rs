@@ -451,6 +451,17 @@ impl Function {
         id
     }
 
+    /// Overwrite a value's type. The narrowing pass uses this to tighten a
+    /// load's or an arithmetic result's type once it has proven the value
+    /// numeric — the lowering reads [`value_type`](Self::value_type), not
+    /// [`Inst::ty`], so a mutation of the instruction alone is not enough.
+    ///
+    /// # Panics
+    /// Panics if `v` is not a valid value.
+    pub(crate) fn set_value_type(&mut self, v: ValueId, ty: Type) {
+        self.value_types[v as usize] = ty;
+    }
+
     pub(crate) fn push_block(&mut self) -> BlockId {
         let id = self.blocks.len() as BlockId;
         self.blocks.push(Block::default());

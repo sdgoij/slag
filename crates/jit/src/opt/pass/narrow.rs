@@ -85,6 +85,9 @@ fn is_numeric_inst(inst: &Inst, values: &[bool], slot_numeric: &[bool]) -> bool 
     let arg_numeric = |a: &ValueId| values.get(*a as usize).copied().unwrap_or(false);
     match inst.op {
         Op::Const => matches!(inst.imm, Imm::Float(_) | Imm::Int(_)),
+        // A guard asserts its value's type, so a `Number` guard produces a
+        // Number (and lets a slot stored only guarded reads stay numeric).
+        Op::GuardType => inst.ty.is_numeric(),
         Op::FrameLoad => matches!(
             inst.imm,
             Imm::Slot(s) if slot_numeric.get(s as usize).copied().unwrap_or(false)
@@ -100,6 +103,10 @@ fn is_numeric_inst(inst: &Inst, values: &[bool], slot_numeric: &[bool]) -> bool 
 /// mark a load of a numeric slot as a `Number` so the lowering can trust it.
 fn rewrite(func: &mut Function, values: &[bool], slot_numeric: &[bool]) -> bool {
     let mut changed = false;
+    // The lowered code reads each value's `Function::value_type`, so a narrowed
+    // `Inst::ty` alone is invisible to it — collect and apply the value-table
+    // retypes after the instruction walk (which holds `func` mutably).
+    let mut retype: Vec<(ValueId, Type)> = Vec::new();
     for b in 0..func.block_count() as u32 {
         for inst in &mut func.block_mut(b).insts {
             if inst.op == Op::FrameLoad {
@@ -109,6 +116,11 @@ fn rewrite(func: &mut Function, values: &[bool], slot_numeric: &[bool]) -> bool 
                 {
                     inst.ty = Type::Number;
                     changed = true;
+                }
+                if inst.ty == Type::Number
+                    && let Some(r) = inst.result
+                {
+                    retype.push((r, Type::Number));
                 }
                 continue;
             }
@@ -134,6 +146,15 @@ fn rewrite(func: &mut Function, values: &[bool], slot_numeric: &[bool]) -> bool 
                 inst.ty = Type::Number;
                 changed = true;
             }
+            if let Some(r) = inst.result {
+                retype.push((r, Type::Number));
+            }
+        }
+    }
+    for (v, ty) in retype {
+        if func.value_type(v) != ty {
+            func.set_value_type(v, ty);
+            changed = true;
         }
     }
     changed
@@ -237,6 +258,90 @@ mod tests {
         let mut func = numeric_body();
         assert!(run(&mut func));
         assert!(op_effects(&func, Op::Mul).expect("mul").is_pure());
+        assert!(op_effects(&func, Op::Add).expect("add").is_pure());
+    }
+
+    #[test]
+    fn narrowed_values_carry_the_number_type() {
+        // The lowering reads each operand's `Function::value_type` (not
+        // `Inst::ty`), so a narrowed value must be re-typed in the value table
+        // too — otherwise the type the pass proves never reaches the tag-free
+        // arithmetic path.
+        let mut func = numeric_body();
+        run(&mut func);
+        let Some(Term::Return(Some(sum))) = func.block(func.entry()).term else {
+            panic!("the body returns the sum");
+        };
+        assert_eq!(func.value_type(sum), Type::Number);
+    }
+
+    #[test]
+    fn a_number_guard_makes_its_operand_numeric() {
+        // `s + guarded` where `guarded` is a `Number`-typed type guard: the
+        // guard's result counts as numeric, so the `Add` narrows `pure` and the
+        // slot storing it stays numeric (which is what lets the guard make the
+        // consuming arithmetic lower tag-free).
+        let mut func = Function::new();
+        let entry = func.entry();
+        {
+            let mut b = Builder::new(&mut func);
+            let zero = b.emit(
+                entry,
+                Op::Const,
+                &[],
+                Type::Number,
+                Effects::pure(),
+                Imm::Float(0.0),
+            );
+            b.emit_void(
+                entry,
+                Op::FrameStore,
+                &[zero],
+                Effects::write(crate::opt::ir::Heap::Slots),
+                Imm::Slot(0),
+            );
+            let s = b.emit(
+                entry,
+                Op::FrameLoad,
+                &[],
+                Type::Unknown,
+                Effects::read(crate::opt::ir::Heap::Slots),
+                Imm::Slot(0),
+            );
+            let read = b.emit(
+                entry,
+                Op::MemberGuard,
+                &[s, s],
+                Type::Unknown,
+                Effects::call(),
+                Imm::None,
+            );
+            let guarded = b.emit(
+                entry,
+                Op::GuardType,
+                &[read, read],
+                Type::Number,
+                Effects::pure(),
+                Imm::Int(1),
+            );
+            let add = b.emit(
+                entry,
+                Op::Add,
+                &[s, guarded],
+                Type::Unknown,
+                Effects::call(),
+                Imm::None,
+            );
+            b.emit_void(
+                entry,
+                Op::FrameStore,
+                &[add],
+                Effects::write(crate::opt::ir::Heap::Slots),
+                Imm::Slot(0),
+            );
+            b.term(entry, Term::Return(Some(add)));
+        }
+        run(&mut func);
         assert!(op_effects(&func, Op::Add).expect("add").is_pure());
     }
 

@@ -25,6 +25,8 @@
 //! by a predecessor's already-emitted stack, which is what lets a loop header's
 //! parameters be known before the header is emitted.
 
+use std::sync::atomic::{AtomicU8, Ordering};
+
 use crate::opt::builder::Builder;
 use crate::opt::ir::{BlockId, Effects, Function, Heap, Imm, Op, Term, Type, ValueId};
 use syntax::ast::{BinaryOp, UnaryOp};
@@ -62,9 +64,27 @@ pub enum Unsupported {
 pub(crate) static OPT_PROBE_DEPTH: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
+/// Whether the typer guards a member read's result in place (the T2 in-loop
+/// placement, `.notes/tier-typer.md`). `0` consults `SLAG_TYPER`; `1`/`2` force
+/// it on/off (tests). Off by default, so production is unchanged.
+pub(crate) static OPT_TYPER: AtomicU8 = AtomicU8::new(0);
+
+fn typer_reads_enabled() -> bool {
+    match OPT_TYPER.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => std::env::var("SLAG_TYPER").is_ok_and(|v| v != "0"),
+    }
+}
+
 /// Lift a certified body into the SSA IR (straight line and control flow,
 /// including loops).
 pub fn lift(body: &CompiledBody) -> Result<Function, Unsupported> {
+    lift_impl(body, typer_reads_enabled())
+}
+
+/// [`lift`] with the typer's read guard forced on or off (tests).
+fn lift_impl(body: &CompiledBody, guard_reads: bool) -> Result<Function, Unsupported> {
     let scope = body.scope.as_ref().ok_or(Unsupported::Uncertified)?;
     let tdz: &[bool] = &scope.tdz_store;
     let steps = &body.steps;
@@ -74,6 +94,7 @@ pub fn lift(body: &CompiledBody) -> Result<Function, Unsupported> {
     }
     // Resume (a guard deopting) only works on the `run_jit_body` entry; a leaf
     // body runs through `run_jit_leaf`, which does not handle `DISPATCH_DEOPT`.
+    let guard_reads = guard_reads && !body.leaf;
     let probe_depth = if body.leaf {
         None
     } else {
@@ -148,7 +169,15 @@ pub fn lift(body: &CompiledBody) -> Result<Function, Unsupported> {
                 emit_opt_probe(&mut builder, bi as BlockId, &stack, block_starts[bi] + off);
                 probed = true;
             }
-            emit_step(&mut builder, bi as BlockId, &mut stack, tdz, step)?;
+            emit_step(
+                &mut builder,
+                bi as BlockId,
+                &mut stack,
+                tdz,
+                block_starts[bi] + off,
+                guard_reads,
+                step,
+            )?;
         }
         term_rec[bi] = Some(match terms[bi] {
             Some(ti) => match &steps[ti] {
@@ -446,11 +475,40 @@ fn emit_opt_probe(builder: &mut Builder<'_>, block: BlockId, stack: &[ValueId], 
     );
 }
 
+/// The typer's in-loop type guard on a just-produced read value
+/// (`.notes/tier-typer.md` T2): assert the value is a Number so the arithmetic
+/// that consumes it lowers tag-free. The resume step is `index + 1` — the *next*
+/// step, since the read has already run once and the interpreter must not re-run
+/// it (a getter would fire twice); the mirrored stack is the post-read stack,
+/// which is that step's entry stack `[.., value]`.
+fn guard_read_value(
+    builder: &mut Builder,
+    block: BlockId,
+    stack: &[ValueId],
+    value: ValueId,
+    index: usize,
+) -> ValueId {
+    let mut args = Vec::with_capacity(stack.len() + 2);
+    args.push(value);
+    args.extend(stack.iter().copied());
+    args.push(value);
+    builder.emit(
+        block,
+        Op::GuardType,
+        &args,
+        Type::Number,
+        Effects::pure(),
+        Imm::Int(index as i32 + 1),
+    )
+}
+
 fn emit_step(
     builder: &mut Builder,
     block: BlockId,
     stack: &mut Vec<ValueId>,
     tdz: &[bool],
+    index: usize,
+    guard_reads: bool,
     step: &Step,
 ) -> Result<(), Unsupported> {
     let is_tdz = |slot: usize| tdz.get(slot).copied().unwrap_or(false);
@@ -525,7 +583,12 @@ fn emit_step(
                 Effects::call(),
                 Imm::Atom(*name),
             );
-            stack.push(v);
+            let value = if guard_reads {
+                guard_read_value(builder, block, stack, v, index)
+            } else {
+                v
+            };
+            stack.push(value);
         }
         // A computed member read (`o[k]`): the same opaque effect as the name
         // form; the key is a runtime value on the stack.
@@ -540,7 +603,12 @@ fn emit_step(
                 Effects::call(),
                 Imm::None,
             );
-            stack.push(v);
+            let value = if guard_reads {
+                guard_read_value(builder, block, stack, v, index)
+            } else {
+                v
+            };
+            stack.push(value);
         }
         // A global read through the global object (`LoadGlobal`); the same
         // opaque effect until proven data.
@@ -1198,7 +1266,7 @@ mod tests {
             ],
             1,
         );
-        let func = lift(&b).expect("lifts");
+        let func = lift_impl(&b, false).expect("lifts");
         let insts = &func.block(func.entry()).insts;
         // A member read is a speculative cell load plus its validity guard.
         assert_eq!(insts[1].op, Op::MemberCellLoad);
@@ -1207,6 +1275,39 @@ mod tests {
         assert_eq!(insts[2].imm, Imm::Atom(member));
         assert_eq!(insts[3].op, Op::GlobalLoad);
         assert_eq!(insts[3].imm, Imm::Atom(global));
+    }
+
+    #[test]
+    fn the_typer_guards_a_member_read_when_enabled() {
+        let member = crux::intern(&[u16::from(b'x')]);
+        // LoadLocal 0; GetMemberName {x}; Return
+        let b = body(
+            vec![
+                Step::LoadLocal { slot: 0 },
+                Step::GetMemberName { name: member },
+                Step::Return,
+            ],
+            1,
+        );
+        // Off (and for a leaf body, whose lane cannot resume a deopt): the read
+        // is the cell load + its validity guard, untyped.
+        let off = lift_impl(&b, false).expect("lifts");
+        let off_insts = &off.block(off.entry()).insts;
+        assert_eq!(off_insts[1].op, Op::MemberCellLoad);
+        assert_eq!(off_insts[2].op, Op::MemberGuard);
+        assert!(!off_insts.iter().any(|i| i.op == Op::GuardType));
+
+        // On: a `GuardType` types the read result `Number` so the arithmetic
+        // that consumes it lowers tag-free, resuming at the step AFTER the read
+        // (the read has already run once, so the interpreter must not re-run it).
+        let on = lift_impl(&b, true).expect("lifts");
+        let on_insts = &on.block(on.entry()).insts;
+        let guard = on_insts
+            .iter()
+            .find(|i| i.op == Op::GuardType)
+            .expect("the typer guards the read");
+        assert_eq!(guard.ty, Type::Number);
+        assert_eq!(guard.imm, Imm::Int(2));
     }
 
     #[test]
@@ -1221,7 +1322,7 @@ mod tests {
             ],
             1,
         );
-        let func = lift(&b).expect("lifts");
+        let func = lift_impl(&b, false).expect("lifts");
         let insts = &func.block(func.entry()).insts;
         assert_eq!(insts[0].op, Op::FrameLoad);
         assert_eq!(insts[1].op, Op::Const);

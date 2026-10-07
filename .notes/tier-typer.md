@@ -110,6 +110,62 @@ question ("does tag-free arithmetic pay for a guard per read?") from the
 register-pressure confound. Build the preheader hoist (with `Block::start_step`)
 only if the in-loop guard pays.
 
+## T2 in-loop measurement (2026-10-07) — a positive but non-leaf-only result
+
+The in-loop producer landed behind `SLAG_TYPER` (off by default): the lift emits
+`Op::GuardType` on a member/element read's result, typed `Number`, resuming at
+the step AFTER the read (the read has already run once, so the interpreter must
+not re-run it — a getter would otherwise fire twice; pinned by a getter-counting
+test that fails if the resume step is the read's own). The `args[1..]` mirror is
+the post-read stack, which is that step's entry stack.
+
+**The leaf lane caps the typer.** `steps_are_leaf` does not exclude the member
+steps, so a body whose only "impure" work is `o.x` is leaf-eligible — and
+`run_jit_leaf` has no `DISPATCH_DEOPT` handling, so a guard in it cannot resume.
+The guard is therefore emitted only for a NON-leaf body (`!body.leaf`), exactly
+like the `OPT_PROBE_DEPTH` diagnostic. The `read` row's `read_loop.js` is leaf,
+so it is unaffected by the guard; the guard's win needs a non-leaf read loop
+(a `LoadIdent` makes it non-leaf).
+
+**The load-bearing prerequisite was a bug.** `narrow` proved a value numeric and
+wrote `Inst::ty`, but the lowering reads each operand's `Function::value_type`
+(the value table), not `Inst::ty` — and the value table is append-only, so the
+pass's type tightening never reached the tag-free path. Fixed (`Function::set_
+value_type`; `rewrite` now syncs the value table). This is the piece that makes
+the guard pay: without it the guard only skips the read-side tag check while
+adding a check of its own (net ~zero); with it the consuming arithmetic sees
+both operands `Number` and lowers bare.
+
+Measured (min-of-5/7 interleaved; `scratch/tier-ab/`, `run.js` = tier vs
+per-step, `run_typer.js` = the guard on vs off on the tier):
+
+| row | tier/per-step (baseline) | tier/per-step (now) |
+|---|---|---|
+| `arith_loop` | 0.731 | **0.682** |
+| `read_loop` (leaf) | 0.991 | **0.905** |
+| `read_loop_nonleaf` | — | 0.909 |
+| `licm_loop` / `for_loop` / `lcg_loop` | 0.788 / 0.896 / 0.922 | 0.787 / 0.906 / 0.943 |
+
+The `arith`/`read` gains are the `narrow` value-table fix (it is always on and
+changes lowerings for every tier body); they are NOT the guard. The guard's own
+incremental effect (`run_typer.js`): `read_loop_nonleaf` **0.944x** (~5.6%),
+`read_loop` (leaf) 0.992x (no change, as expected), and the thrash case — a
+non-leaf loop reading a STRING property, so the guard fails every activation —
+**1.016x**, i.e. neutral (with the guard off the compiled body already calls
+`BinarySlow` per iteration; deopting to the interpreter is neither better nor
+worse).
+
+**Left off by default.** The guard's win is real but small, and it changes code
+gen for every non-leaf member read; T3's decision gate (feedback, or a cheaper
+heuristic) should own enabling it, not this slice. The `narrow` fix is
+always-on and is the slice's actual payoff.
+
+Gates: `cargo test --workspace` green (jit 312/0); clippy `--workspace
+--all-targets -- -D warnings` clean; test262 `language` 23,726/0/0/0 and
+`built-ins` 23,820/0/1/0 at baseline both with the typer off AND with
+`SLAG_TYPER=1` (the one `built-ins` hang under `SLAG_TYPER=1` was the documented
+`copyWithin` wobble — it passes in isolation).
+
 ## Gates and traps
 
 - **A wrong type guess must deopt, never miscompute.** Every gate is a full

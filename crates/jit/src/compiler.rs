@@ -129,6 +129,9 @@ impl JitEngine {
                     // re-verify and bail to the per-step path on a violation (a
                     // pass bug is a refusal, never a wrong program).
                     crate::opt::pass::run(&mut ir);
+                    if std::env::var("JIT_DUMP_IR").is_ok() {
+                        eprintln!("--- IR ---\n{}", crate::opt::print::dump(&ir));
+                    }
                     if crate::opt::verify::verify(&ir).is_ok()
                         && let Some(compiled) =
                             crate::opt_lower::compile(&*self.isa, &ir, helpers, body.max_stack)
