@@ -14,6 +14,7 @@ use crate::opt::ir::Function;
 pub mod cse;
 pub mod dce;
 pub mod fold;
+pub mod licm;
 pub mod narrow;
 
 /// Run the pass pipeline over `func`. Returns whether the IR changed.
@@ -21,6 +22,7 @@ pub fn run(func: &mut Function) -> bool {
     let folded = fold::run(func);
     let narrowed = narrow::run(func);
     let cse = cse::run(func);
+    let licm = licm::run(func);
     let dropped = dce::run(func);
-    folded || narrowed || cse || dropped
+    folded || narrowed || cse || licm || dropped
 }

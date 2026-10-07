@@ -149,15 +149,26 @@ fn lower(
                 else_args,
             }) => {
                 let c = value_of(&values, *cond)?;
-                let truthy = call_helper(
-                    &mut builder,
-                    helpers,
-                    &abi,
-                    abi.sig_bool,
-                    Helper::ToBooleanSlow,
-                    &[c],
-                )?;
-                let test = builder.ins().icmp_imm_u(IntCC::NotEqual, truthy, 0);
+                // A `Bool`-typed condition is already a canonical boolean, so
+                // the truthiness test is a compare against `false` — no helper
+                // call and no interpreter round-trip per branch (the loop test).
+                let test = if ir.value_type(*cond) == Type::Bool {
+                    builder.ins().icmp_imm_u(
+                        IntCC::NotEqual,
+                        c,
+                        JsValue::Boolean(false).bits() as i64,
+                    )
+                } else {
+                    let truthy = call_helper(
+                        &mut builder,
+                        helpers,
+                        &abi,
+                        abi.sig_bool,
+                        Helper::ToBooleanSlow,
+                        &[c],
+                    )?;
+                    builder.ins().icmp_imm_u(IntCC::NotEqual, truthy, 0)
+                };
                 let then_vals = resolve(then_args, &values)?;
                 let else_vals = resolve(else_args, &values)?;
                 builder.ins().brif(

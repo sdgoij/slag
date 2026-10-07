@@ -486,6 +486,26 @@ shape, so this slice is *reach*, and it hands those loops a real preheader block
 clippy --workspace --all-targets -- -D warnings` clean; with `SLAG_OPT=1` test262
 `language` 23,726 / 0 and `built-ins` 23,820 / 0 / 1, both at baseline.
 
+**LICM, and the branch-truthiness fix (2026-10-07).** `pass/licm.rs` finds
+natural loops from back edges (with a dominance gate so a self-loop header does
+not absorb its own preheader), requires a **unique** preheader, marks the
+invariant-and-speculatable instructions (a narrowed pure op, or a `FrameLoad` of
+a slot never stored in the loop — neither can trap, so running them once before a
+zero-trip loop is unobservable), and hoists them in dependency order. Entry-header
+`do`/`while` loops are skipped (no preheader) — which is exactly why LICM needed
+the fused-test slice.
+
+The bigger find was in the lowering: `Term::Branch` ran its condition through
+`Helper::ToBooleanSlow` **unconditionally** — a helper call and interpreter
+round-trip on *every* branch, i.e. every loop iteration. A `Bool`-typed condition
+is already a canonical boolean, so a compare against `false` suffices; that one
+change flipped the tier from ~1.2x slower to faster and supercharged the CSE row.
+Measured (min-of-5 interleaved): arith **~1.6x**, CSE **~4.0x**, LICM ~1.12x, `for`
+~1.19x. Gates: `cargo test --workspace` green (302 jit tests; 15 pass-unit tests
+incl. the LICM hoist and the entry-header refusal); `cargo clippy --workspace
+--all-targets -- -D warnings` clean; with `SLAG_OPT=1` test262 `language`
+23,726 / 0 and `built-ins` 23,820 / 0 / 1, both at baseline.
+
 **Queued (both need a slice, not a patch).** (a) The fused `FastLoopHead` itself
 (plus `FastLoopBind`/`FastLoopStore`) is still unlifted, and the *acc-path* form
 (`FastLoopHead { Counter }`) is additionally blocked by its `RunRegBody` body —
