@@ -73,11 +73,21 @@ const TRY_FRAME_ENV_DEPTH_OFFSET: usize = std::mem::offset_of!(TryFrame, env_dep
 /// compilation contexts.
 pub struct JitEngine {
     isa: Arc<dyn TargetIsa>,
+    /// Whether the optimizing-tier IR lowering (`.notes/optimizing-tier-impl.md`)
+    /// is enabled (`SLAG_OPT`). Off by default; a body the lift refuses falls
+    /// through to the per-step path either way.
+    opt: bool,
 }
 
 impl JitEngine {
-    /// Build a native ISA (host triple + `opt_level=speed`).
+    /// Build a native ISA (host triple + `opt_level=speed`). The optimizing
+    /// tier is enabled by `SLAG_OPT`.
     pub fn new() -> Result<Self, String> {
+        Self::with_opt(std::env::var("SLAG_OPT").map(|v| v != "0").unwrap_or(false))
+    }
+
+    /// Build an engine with the optimizing-tier lowering explicitly on or off.
+    pub fn with_opt(opt: bool) -> Result<Self, String> {
         let mut flag_builder = settings::builder();
         flag_builder
             .set("opt_level", "speed")
@@ -86,13 +96,33 @@ impl JitEngine {
         let isa = cranelift_native::builder()?
             .finish(flags)
             .map_err(|e| e.to_string())?;
-        Ok(Self { isa })
+        Ok(Self { isa, opt })
     }
 
     /// Compile `body` to executable machine code, or `None` when the body
     /// contains a step outside the supported subset or needs a slow-path
     /// helper that is missing from `helpers`.
     pub fn compile(&self, body: &CompiledBody, helpers: &JitHelpers) -> Option<Compiled> {
+        // The optimizing tier (I1): a body the lift accepts is lowered from the
+        // SSA IR instead of the per-step pass. Gated by `SLAG_OPT`; a body the
+        // lift refuses, or that the IR lowerer then declines, falls through to
+        // the per-step path unchanged.
+        if self.opt {
+            match crate::opt::lift::lift(body) {
+                Ok(ir) => {
+                    if let Some(compiled) =
+                        crate::opt_lower::compile(&*self.isa, &ir, helpers, body.max_stack)
+                    {
+                        return Some(compiled);
+                    }
+                }
+                Err(reason) => {
+                    if std::env::var("JIT_DUMP_CLIF").is_ok() {
+                        eprintln!("opt bail: {reason:?} ({} steps)", body.steps.len());
+                    }
+                }
+            }
+        }
         let conv = platform_call_conv(&*self.isa);
         let mut func =
             Function::with_name_signature(UserFuncName::testcase("jit_body"), jit_sig(conv));
@@ -107,40 +137,51 @@ impl JitEngine {
             }
             return None;
         }
-        if std::env::var("JIT_DUMP_CLIF").is_ok() {
-            eprintln!("{} \n", func.display());
-        }
-        let mut ctx = Context::for_function(func);
-        if std::env::var("JIT_DUMP_CLIF").is_ok() {
-            ctx.set_disasm(true);
-        }
-        // Unlike the `Unsupported` bail above, a Cranelift rejection (a verifier
-        // error, a codegen failure) is not a step the compiler chose to skip —
-        // it is a bug in the emit — so surface it under the same debug switch
-        // instead of swallowing it into the `None` fallback.
-        let compiled = match ctx.compile(&*self.isa, &mut ControlPlane::default()) {
-            Ok(compiled) => compiled,
-            Err(error) => {
-                if std::env::var("JIT_DUMP_CLIF").is_ok() {
-                    eprintln!("jit codegen error: {error:?}");
-                }
-                return None;
-            }
-        };
-        if let Some(disasm) = compiled.vcode.as_ref() {
-            eprintln!("--- disasm ---\n{disasm}");
-        }
-        let code = ExecutableCode::new(compiled.code_buffer()).ok()?;
-        // SAFETY: the allocation outlives the cast and is executable; a data
-        // pointer to a fn pointer is a plain integer cast on every supported
-        // target (no trampolines).
-        let entry: JitEntry = unsafe { std::mem::transmute(code.as_ptr()) };
-        let info = crate::JitCompiledInfo {
-            entry: entry as usize,
-            stack_usage: body.max_stack,
-        };
-        Some(Compiled { code, info })
+        assemble(&*self.isa, func, body.max_stack)
     }
+}
+
+/// Assemble a lowered CLIF function into executable code. Shared by the
+/// per-step lowerer and the optimizing tier's `opt_lower` so both hand the
+/// runtime an identical `Compiled`.
+pub(crate) fn assemble(
+    isa: &dyn TargetIsa,
+    func: Function,
+    stack_usage: usize,
+) -> Option<Compiled> {
+    if std::env::var("JIT_DUMP_CLIF").is_ok() {
+        eprintln!("{} \n", func.display());
+    }
+    let mut ctx = Context::for_function(func);
+    if std::env::var("JIT_DUMP_CLIF").is_ok() {
+        ctx.set_disasm(true);
+    }
+    // Unlike the `Unsupported` bail above, a Cranelift rejection (a verifier
+    // error, a codegen failure) is not a step the compiler chose to skip — it
+    // is a bug in the emit — so surface it under the same debug switch instead
+    // of swallowing it into the `None` fallback.
+    let compiled = match ctx.compile(isa, &mut ControlPlane::default()) {
+        Ok(compiled) => compiled,
+        Err(error) => {
+            if std::env::var("JIT_DUMP_CLIF").is_ok() {
+                eprintln!("jit codegen error: {error:?}");
+            }
+            return None;
+        }
+    };
+    if let Some(disasm) = compiled.vcode.as_ref() {
+        eprintln!("--- disasm ---\n{disasm}");
+    }
+    let code = ExecutableCode::new(compiled.code_buffer()).ok()?;
+    // SAFETY: the allocation outlives the cast and is executable; a data
+    // pointer to a fn pointer is a plain integer cast on every supported
+    // target (no trampolines).
+    let entry: JitEntry = unsafe { std::mem::transmute(code.as_ptr()) };
+    let info = crate::JitCompiledInfo {
+        entry: entry as usize,
+        stack_usage,
+    };
+    Some(Compiled { code, info })
 }
 
 /// The C ABI for the host platform: the JIT entry and the slow-path helpers
@@ -148,7 +189,7 @@ impl JitEngine {
 /// convention. Cranelift's `CallConv::Fast` is an internal, non-ABI-stable
 /// convention (System V registers even on Windows), which would pass the
 /// frame/stack/vm arguments in the wrong registers.
-fn platform_call_conv(isa: &dyn TargetIsa) -> CallConv {
+pub(crate) fn platform_call_conv(isa: &dyn TargetIsa) -> CallConv {
     if isa.triple().operating_system == target_lexicon::OperatingSystem::Windows {
         CallConv::WindowsFastcall
     } else {
@@ -157,7 +198,7 @@ fn platform_call_conv(isa: &dyn TargetIsa) -> CallConv {
 }
 
 /// The JIT entry signature: `(frame, stack, vm) -> completion value`.
-fn jit_sig(conv: CallConv) -> Signature {
+pub(crate) fn jit_sig(conv: CallConv) -> Signature {
     let mut sig = Signature::new(conv);
     sig.params.push(AbiParam::new(types::I64)); // frame
     sig.params.push(AbiParam::new(types::I64)); // stack
@@ -167,7 +208,7 @@ fn jit_sig(conv: CallConv) -> Signature {
 }
 
 /// A slow-path helper signature (all helpers return one I64 value).
-fn helper_sig(params: &[Type], conv: CallConv) -> Signature {
+pub(crate) fn helper_sig(params: &[Type], conv: CallConv) -> Signature {
     let mut sig = Signature::new(conv);
     sig.params.extend(params.iter().copied().map(AbiParam::new));
     sig.returns.push(AbiParam::new(types::I64));
@@ -248,7 +289,7 @@ fn lower<'a>(
 /// scaffold's `compile` currently swallows the error (`Option`).
 #[allow(dead_code)]
 #[derive(Debug)]
-enum Unsupported {
+pub(crate) enum Unsupported {
     Step(&'static str),
     Leaf(&'static str),
     Helper(&'static str),

@@ -151,7 +151,7 @@ The `stage` column maps each increment to `optimizing-tier-plan.md` §6.
 | id | stage | content | targets | status |
 |----|-------|---------|---------|--------|
 | I0 | — | IR core: `ir`/`builder`/`verify`/`print` + tests | none (foundation) | **landed** at `crates/jit/src/opt/` |
-| I1 | — | lift (straight-line subset) **landed**; identity lowering behind `SLAG_OPT=1` proposed | none (equivalence) | partly landed |
+| I1 | — | lift (straight-line subset) + identity lowering behind `SLAG_OPT=1` | none (equivalence) | **landed** |
 | I2 | — | lift control flow: branches, then simple loops with phis | none (equivalence) | proposed |
 | I3 | O | feedback records + `ICState` valve + retire hook + count probe | none (enabling) | proposed |
 | I4 | B | builtin intrinsic inlining (scalars first, then array/collection) | `regexp_test`, `array_slice`, `string_indexof` | partly landed, outside the IR |
@@ -250,6 +250,28 @@ The produced graph is run through `verify` before it leaves the lift. The
 identity lowering (`opt_lower.rs`) and the `SLAG_OPT=1` switch are the
 remaining half of I1, and nothing consumes the IR yet, so this slice is
 behavior-neutral by construction (10 unit tests in the module).
+
+**I1 status (2026-10-07): the identity lowering landed, so I1 is complete.**
+`opt_lower::compile` lowers the lifted IR to Cranelift, reusing `jit_sig`,
+`helper_sig`, the helper table and the `JitCallContext` ABI: `Const` -> a
+NaN-boxed `iconst`, `FrameLoad`/`FrameStore` -> a load/store at `frame +
+slot*8`, the arithmetic/bitwise/comparison ops -> `BinarySlow` with the
+`BinaryOp` discriminant, the coercing-free unaries -> `UnarySlow`, and
+`Return` -> `return_`. A helper call carries the pending-error ABI (a helper
+that errored bails the body with `undefined`) and bumps the leaf-epoch when it
+can re-enter. The switch lives on `JitEngine` (`SLAG_OPT`, or
+`JitEngine::with_opt`); a body the lift refuses — or the lowerer declines —
+falls through to the per-step path, so the tier is strictly opt-in and a
+default build is unchanged. `crates/jit/src/compiler.rs` grew
+`JitEngine::with_opt` and a shared `assemble` so both lowerings hand the
+runtime an identical `Compiled`.
+
+**Gates.** `cargo test -p jit` 276 passed (a new e2e test lowers a real
+straight-line function through the IR and matches the interpreter, asserting
+the lowering actually ran); `cargo test --workspace` all green. With
+`SLAG_OPT=1`: test262 `language` 23,726 / 0, `built-ins` 23,820 / 0 / 1,
+`annexB` 1,086 / 0 — the whole `all` area at 0 fail on the optimizing path.
+No perf claim (I1 is equivalence); the passes (I3+) are what move rows.
 
 ## 10. Open decisions
 

@@ -132,6 +132,7 @@ pub mod code_buffer;
 pub mod compiler;
 pub mod helpers;
 pub mod opt;
+pub mod opt_lower;
 
 pub use code_buffer::ExecutableCode;
 pub use compiler::JitEngine;
@@ -247,6 +248,15 @@ impl JitCache {
     /// A cache whose compile step uses `helpers` as the slow-path table.
     pub fn new(helpers: JitHelpers) -> Result<Self, String> {
         Self::with_capacity(helpers, MAX_CACHE_ENTRIES, EVICT_TO_ENTRIES)
+    }
+
+    /// A cache whose engine forces the optimizing-tier lowering on — the I1
+    /// equivalence tests (the default `new` takes it from `SLAG_OPT`).
+    #[cfg(test)]
+    pub(crate) fn new_with_opt(helpers: JitHelpers) -> Result<Self, String> {
+        let mut cache = Self::new(helpers)?;
+        cache.engine = JitEngine::with_opt(true)?;
+        Ok(cache)
     }
 
     /// A cache with a custom capacity/eviction floor (test introspection).
@@ -537,6 +547,7 @@ mod tests {
     use super::*;
     use crux::Value;
     use runtime::ir::{ApplyKind, CompiledBody, ScopeInfo, Step};
+    use std::sync::atomic::Ordering;
 
     /// A certified-style scope for the hand-built test bodies: 2 slots, both
     /// `var`-like (no TDZ), nothing captured.
@@ -1876,6 +1887,60 @@ mod tests {
         let compiled = cache.compiled_count();
         agent.jit_hook = None;
         (value, compiled)
+    }
+
+    /// Like [`with_jit_agent`] but with the optimizing tier forced on
+    /// (`SLAG_OPT`), so the I1 lowering is exercised end to end.
+    fn with_opt_jit_agent(f: impl FnOnce(&mut runtime::Agent) -> Value) -> (Value, usize) {
+        extern "C" fn noop_drop(_cache: *mut c_void) {}
+        let mut agent = runtime::Agent::new();
+        agent.initialize_host_defined_realm().expect("realm");
+        let mut cache = JitCache::new_with_opt(runtime_helpers()).expect("isa");
+        agent.jit_hook = Some(runtime::jit::JitHook {
+            cache: (&mut cache as *mut JitCache) as *mut c_void,
+            lookup: jit_cache_lookup,
+            drop_cache: noop_drop,
+            helpers: &runtime::jit::JIT_SLOW_PATHS,
+        });
+        let value = f(&mut agent);
+        let compiled = cache.compiled_count();
+        agent.jit_hook = None;
+        (value, compiled)
+    }
+
+    #[test]
+    fn opt_tier_straight_line_body_matches_the_interpreter() {
+        // I1: a straight-line certified function (params + `var`s + arithmetic)
+        // is lifted to the SSA IR and lowered through `opt_lower`, and must
+        // agree with the interpreter. The outer script body has calls, so the
+        // lift refuses it and it stays on the per-step path — the test proves
+        // both the equivalence and that `f` itself took the optimizing path.
+        let source = "function f(a, b) { \
+                        var x = a + b; \
+                        var y = x * 2 - b; \
+                        return (y + a) / 2; \
+                      } \
+                      var t = 0; \
+                      t += f(1, 2); t += f(2, 3); t += f(3, 4); t += f(4, 5); \
+                      t += f(5, 6); t += f(6, 7); t += f(7, 8); t += f(8, 9); \
+                      t += f(9, 1); t += f(1, 9); t += f(2, 8); t += f(3, 7); \
+                      t += f(4, 6); t += f(5, 5); t += f(6, 4); t += f(7, 3); \
+                      t += f(8, 2); t += f(9, 0); t += f(0, 9); t += f(1, 1); \
+                      t;";
+        let interp = {
+            let mut agent = runtime::Agent::new();
+            agent.initialize_host_defined_realm().expect("realm");
+            agent.run_script(source).expect("interp runs")
+        };
+        let before = crate::opt_lower::OPT_COMPILED.load(Ordering::Relaxed);
+        let (value, compiled) = with_opt_jit_agent(|agent| agent.run_script(source).expect("runs"));
+        let lowered = crate::opt_lower::OPT_COMPILED.load(Ordering::Relaxed) - before;
+        assert_eq!(
+            value, interp,
+            "the optimizing tier must match the interpreter"
+        );
+        assert!(compiled >= 1, "{compiled} bodies compiled");
+        assert!(lowered >= 1, "the optimizing tier lowered {lowered} bodies");
     }
 
     #[test]
