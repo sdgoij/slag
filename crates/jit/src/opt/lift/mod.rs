@@ -1,10 +1,11 @@
 //! The lift: the interpreter's `Step` stream into the SSA IR.
 //!
 //! Increments I1 (straight line) and I2 (control flow): `Jump`,
-//! `JumpIfFalse`/`JumpIfTrue`, joins and loops. A step outside the subset, a
-//! body that is not certified, or a TDZ-checked slot returns [`Unsupported`]
-//! and keeps the current per-step lowering, so nothing about the engine's
-//! behavior changes unless a later increment wires the IR in.
+//! `JumpIfFalse`/`JumpIfTrue`, joins and loops, plus the dominant reads
+//! (`GetMemberName`, `LoadGlobal`). A step outside the subset, a body that is
+//! not certified, or a TDZ-checked slot returns [`Unsupported`] and keeps the
+//! current per-step lowering, so nothing about the engine's behavior changes
+//! unless a later increment wires the IR in.
 //!
 //! The lift is exact by construction: an accepted step means exactly what the
 //! interpreter's handler for that step means. It refuses rather than
@@ -250,16 +251,17 @@ fn stack_depths(
 /// names the step rather than a spurious depth mismatch.
 fn stack_delta(step: &Step) -> Result<i32, Unsupported> {
     Ok(match step {
-        Step::Push(_) | Step::Dup | Step::LoadLocal { .. } => 1,
+        Step::Push(_) | Step::Dup | Step::LoadLocal { .. } | Step::LoadGlobal { .. } => 1,
         Step::Pop
         | Step::StoreLocal { .. }
         | Step::InitLocal { .. }
         | Step::FusedStoreLocal { .. }
         | Step::Binary(_)
         | Step::SetCompletion => -1,
-        // `BinaryImm` pops its left operand and pushes the result; the rest are
-        // net-neutral.
+        // `BinaryImm` pops its left operand and pushes the result, a member
+        // read pops the receiver and pushes the value; the rest are net-neutral.
         Step::BinaryImm { .. }
+        | Step::GetMemberName { .. }
         | Step::Unary(_)
         | Step::ResetCompletion
         | Step::NormalizeCompletion
@@ -365,6 +367,33 @@ fn emit_step(
                 Type::Unknown,
                 Effects::read(Heap::Slots),
                 Imm::Slot(*slot as u32),
+            );
+            stack.push(v);
+        }
+        // A member read (`o.x`): an opaque effect (a getter, a proxy trap, or a
+        // throwing receiver) until a speculation proves it is a plain data read.
+        Step::GetMemberName { name } => {
+            let object = stack.pop().ok_or(Unsupported::Stack)?;
+            let v = builder.emit(
+                block,
+                Op::MemberLoad,
+                &[object],
+                Type::Unknown,
+                Effects::call(),
+                Imm::Atom(*name),
+            );
+            stack.push(v);
+        }
+        // A global read through the global object (`LoadGlobal`); the same
+        // opaque effect until proven data.
+        Step::LoadGlobal { name } => {
+            let v = builder.emit(
+                block,
+                Op::GlobalLoad,
+                &[],
+                Type::Unknown,
+                Effects::call(),
+                Imm::Atom(*name),
             );
             stack.push(v);
         }
@@ -785,6 +814,28 @@ mod tests {
             func.block(2).term,
             Some(Term::Jump { target: 1, .. })
         ));
+    }
+
+    #[test]
+    fn lifts_member_and_global_reads() {
+        let member = crux::intern(&[u16::from(b'x')]);
+        let global = crux::intern(&[u16::from(b'g')]);
+        // LoadLocal 0; GetMemberName {x}; LoadGlobal {g}; Return
+        let b = body(
+            vec![
+                Step::LoadLocal { slot: 0 },
+                Step::GetMemberName { name: member },
+                Step::LoadGlobal { name: global },
+                Step::Return,
+            ],
+            1,
+        );
+        let func = lift(&b).expect("lifts");
+        let insts = &func.block(func.entry()).insts;
+        assert_eq!(insts[1].op, Op::MemberLoad);
+        assert_eq!(insts[1].imm, Imm::Atom(member));
+        assert_eq!(insts[2].op, Op::GlobalLoad);
+        assert_eq!(insts[2].imm, Imm::Atom(global));
     }
 
     #[test]

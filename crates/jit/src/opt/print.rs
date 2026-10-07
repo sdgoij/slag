@@ -82,6 +82,7 @@ fn imm_suffix(imm: &Imm) -> String {
         Imm::Str(s) => format!(" {s:?}"),
         Imm::Slot(i) => format!(" slot{i}"),
         Imm::Arg(i) => format!(" arg{i}"),
+        Imm::Atom(i) => format!(" atom{i}"),
     }
 }
 

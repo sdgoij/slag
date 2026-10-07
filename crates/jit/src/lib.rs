@@ -2041,6 +2041,35 @@ mod tests {
     }
 
     #[test]
+    fn opt_tier_member_reads_match_the_interpreter() {
+        // The tier lifts a property read (`GetMemberName`) into `Op::MemberLoad`
+        // and lowers it through the same `get_member_name` helper the per-step
+        // path uses, so a real property-reading body compiles via the IR.
+        let source = "function f(o) { return o.x + o.y; } \
+                      var p = { x: 3, y: 4 }; \
+                      var t = 0; \
+                      t += f(p); t += f(p); t += f(p); t += f(p); t += f(p); \
+                      t += f(p); t += f(p); t += f(p); t += f(p); t += f(p); \
+                      t += f(p); t += f(p); t += f(p); t += f(p); t += f(p); \
+                      t += f(p); t += f(p); t += f(p); t += f(p); t += f(p); \
+                      t;";
+        let interp = {
+            let mut agent = runtime::Agent::new();
+            agent.initialize_host_defined_realm().expect("realm");
+            agent.run_script(source).expect("interp runs")
+        };
+        let before = crate::opt_lower::OPT_COMPILED.load(Ordering::Relaxed);
+        let (value, compiled) = with_opt_jit_agent(|agent| agent.run_script(source).expect("runs"));
+        let lowered = crate::opt_lower::OPT_COMPILED.load(Ordering::Relaxed) - before;
+        assert_eq!(
+            value, interp,
+            "the optimizing tier must match the interpreter"
+        );
+        assert!(compiled >= 1, "{compiled} bodies compiled");
+        assert!(lowered >= 1, "the optimizing tier lowered {lowered} bodies");
+    }
+
+    #[test]
     fn installed_jit_runs_a_member_callee() {
         // `return o.f(1) + 1` — a member callee (plain `CallFast`), no loop.
         // Cut 69: both bodies are straight-line, so the call repeats 17×

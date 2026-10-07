@@ -278,6 +278,40 @@ fn lower_inst(
             emit_completion_store(builder, abi.vm, value, false);
             value
         }
+        // A lifted `o.x`: the same `get_member_name` helper the per-step path
+        // calls on its slow path, so an optimizing body and a per-step one mean
+        // the same thing at the call boundary.
+        Op::MemberLoad => {
+            let Imm::Atom(atom) = &inst.imm else {
+                return Err(Unsupported::Step("opt:member"));
+            };
+            let object = arg(0)?;
+            let name = builder.ins().iconst(types::I64, *atom as i64);
+            call_helper(
+                builder,
+                helpers,
+                abi,
+                abi.sig_unary,
+                Helper::GetMemberName,
+                &[object, name],
+            )?
+        }
+        // A lifted `LoadGlobal`: the same `get_global` helper as the per-step
+        // global fast path's miss block.
+        Op::GlobalLoad => {
+            let Imm::Atom(atom) = &inst.imm else {
+                return Err(Unsupported::Step("opt:global"));
+            };
+            let name = builder.ins().iconst(types::I64, *atom as i64);
+            call_helper(
+                builder,
+                helpers,
+                abi,
+                abi.sig_bool,
+                Helper::GetGlobal,
+                &[name],
+            )?
+        }
         _ => return Err(Unsupported::Step("opt:op")),
     })
 }

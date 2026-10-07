@@ -187,6 +187,8 @@ pub enum Imm {
     Slot(u32),
     /// An argument index.
     Arg(u32),
+    /// An interned property/binding name atom.
+    Atom(u32),
 }
 
 /// An instruction opcode.

@@ -373,6 +373,27 @@ on a real body via a counter); `cargo clippy --workspace --all-targets --
 are conservative (an arithmetic op's sound default effects are `World`, so DCE
 only removes dead constants today); the narrowing is the typer's job.
 
+**Lift broadening (2026-10-07): member and global reads.** The lift now accepts
+the two dominant read steps: `Step::GetMemberName` -> `Op::MemberLoad` and
+`Step::LoadGlobal` -> `Op::GlobalLoad`, both carrying the name as `Imm::Atom`,
+and `opt_lower` lowers them through the *same* helpers the per-step path uses on
+its slow paths (`Helper::GetMemberName`, `Helper::GetGlobal`), so a body meaning
+is unchanged at the call boundary and the tier can now compile real
+property-reading code (before this it could only lift pure `var` arithmetic).
+Both carry an opaque `Effects::call()` (a getter, a proxy trap, or a throwing
+receiver can run user code), so no reordering pass may move them.
+
+**The next gate is TDZ.** Any body with a `let`/`const` slot whose runtime `TDZ`
+check would fire is still refused whole (`Unsupported::TdzSlot`), which excludes
+most real functions from the tier. Lifting it needs a `TdzCheck` op (load the
+slot, compare to `UNINITIALIZED_BITS`, call `Helper::TdzError` on the
+uninitialized marker), so it is the immediate next slice together with
+`GetMemberComputed`; only then does "real code" enter the tier at all. Gates for
+the read broadening: `cargo test --workspace` green (5 opt-tier e2e tests, incl.
+a property-reading body that asserts the tier lowered it); clippy clean; with
+`SLAG_OPT=1` test262 `language` 23,726 / 0 and `built-ins` 23,820 / 0 / 1, both at
+baseline.
+
 ## 10. Open decisions
 
 1. **Feedback store location** — per body (`CompiledBody`) or per closure
