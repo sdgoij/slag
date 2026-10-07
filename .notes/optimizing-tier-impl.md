@@ -452,6 +452,32 @@ pass-unit tests, incl. the narrowing fixpoint and the CSE invalidation); `cargo
 clippy --workspace --all-targets -- -D warnings` clean; with `SLAG_OPT=1` test262
 `language` 23,726 / 0 and `built-ins` 23,820 / 0 / 1, both at baseline.
 
+**Bitwise inline, and the regression it removed (2026-10-07).** The tier's
+integer path for `&`/`|`/`^`/`<<`/`>>`/`>>>` is now inline: both operands
+Number-tagged and inside `ToInt32`'s range (`|x| < 2^63`, mirroring the per-step
+`emit_int_binary` + `trunc_i32`) -> truncate to i32, apply the op, convert back
+and canonicalize; else `BinarySlow`. Before this, every bitwise op was a helper
+call, so the tier *lost* on bitwise-heavy code: measured on a linear-congruential
+loop (5M iters, min-of-5 interleaved) the tier was **96.4ms against 47.4ms
+per-step — ~2.0x slower**; after, it is **47.8ms against 48.4ms — parity**, a
+~2.0x improvement for the tier. That is not a new win but the removal of a hard
+regression, which the tier needs before it can be enabled at all (its reads have
+the same gap, below). Gates: `cargo test --workspace` green (298 jit tests, one
+new bitwise-loop e2e); `cargo clippy --workspace --all-targets -- -D warnings`
+clean; with `SLAG_OPT=1` test262 `language` 23,726 / 0 and `built-ins`
+23,820 / 0 / 1, both at baseline.
+
+**Queued (both need a slice, not a patch).** (a) The tier still cannot lift the
+fused `FastLoopHead` (+ `FastLoopBind`/`FastLoopStore` and the fused relational
+test), which is what `for`/`while` counting loops compile to — so the common loop
+never enters the tier, and LICM has no preheader on the `do`/`while` bodies it
+can lift. (b) The tier's member read still calls `Helper::GetMemberName`
+unconditionally; inlining the member-value/map-shape probe would close the read
+regression, but the probe is ~300 lines of layout-coupled code, and copying it
+into `opt_lower` is exactly the private fork §6 warns against — it should be
+extracted into a shared lowering helper, which is a real refactor of the
+per-step path and needs its own gate.
+
 ## 10. Open decisions
 
 1. **Feedback store location** — per body (`CompiledBody`) or per closure

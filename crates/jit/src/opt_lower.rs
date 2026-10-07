@@ -247,12 +247,18 @@ fn lower_inst(
             let (lhs, rhs) = (arg(0)?, arg(1)?);
             // Arithmetic and the ordering comparisons take the inline numeric
             // fast path when both operands are Numbers (the common shape); the
-            // rest still go straight to the helper.
+            // bitwise/shift ops take the inline integer path (a Number-guarded
+            // `ToInt32`); the rest still go straight to the helper.
             if matches!(
                 inst.op,
                 Op::Add | Op::Sub | Op::Mul | Op::Div | Op::Lt | Op::Le | Op::Gt | Op::Ge
             ) {
                 call_numeric_binary(builder, helpers, abi, inst.op, disc as i64, lhs, rhs)?
+            } else if matches!(
+                inst.op,
+                Op::BitAnd | Op::BitOr | Op::BitXor | Op::Shl | Op::Shr | Op::UShr
+            ) {
+                call_int_binary(builder, helpers, abi, inst.op, disc as i64, lhs, rhs)?
             } else {
                 let op = builder.ins().iconst(types::I64, disc as i64);
                 call_helper(
@@ -560,6 +566,87 @@ fn canon_double(builder: &mut FunctionBuilder, bits: ClifValue) -> ClifValue {
         .ins()
         .iconst(types::I64, JsValue::Number(f64::NAN).bits() as i64);
     builder.ins().select(collides, canon, bits)
+}
+
+/// The inline integer fast path for the bitwise/shift ops: when both operands
+/// carry the double tag and lie inside the `ToInt32` conversion's range,
+/// truncate to i32, apply the bit op and convert back; otherwise fall through to
+/// `BinarySlow`. Mirrors the per-step lowerer's `emit_int_binary` + `trunc_i32`
+/// (outside `|x| < 2^63` the saturating conversion's low bits differ from the
+/// spec's wrap-around, so the range guard is required).
+fn call_int_binary(
+    builder: &mut FunctionBuilder,
+    helpers: &JitHelpers,
+    abi: &Abi,
+    op: Op,
+    disc: i64,
+    lhs: ClifValue,
+    rhs: ClifValue,
+) -> Result<ClifValue, Unsupported> {
+    let lhs_num = builder.ins().bitcast(types::F64, MemFlagsData::new(), lhs);
+    let rhs_num = builder.ins().bitcast(types::F64, MemFlagsData::new(), rhs);
+    let (l_wide, l_range) = trunc_i32(builder, lhs_num);
+    let (r_wide, r_range) = trunc_i32(builder, rhs_num);
+    let l = builder.ins().ireduce(types::I32, l_wide);
+    let r = builder.ins().ireduce(types::I32, r_wide);
+    // `ishl`/`sshr`/`ushr` mask the amount to the operand size, which is the
+    // spec's own shift-count reduction.
+    let (res, unsigned) = match op {
+        Op::BitAnd => (builder.ins().band(l, r), false),
+        Op::BitXor => (builder.ins().bxor(l, r), false),
+        Op::BitOr => (builder.ins().bor(l, r), false),
+        Op::Shl => (builder.ins().ishl(l, r), false),
+        Op::Shr => (builder.ins().sshr(l, r), false),
+        _ => (builder.ins().ushr(l, r), true),
+    };
+    // `>>>` answers a `ToUint32`; the others a signed i32.
+    let res_f = if unsigned {
+        let wide = builder.ins().uextend(types::I64, res);
+        builder.ins().fcvt_from_uint(types::F64, wide)
+    } else {
+        let wide = builder.ins().sextend(types::I64, res);
+        builder.ins().fcvt_from_sint(types::F64, wide)
+    };
+    let bits = builder
+        .ins()
+        .bitcast(types::I64, MemFlagsData::new(), res_f);
+    let fast = canon_double(builder, bits);
+    let lhs_dbl = is_double(builder, lhs);
+    let rhs_dbl = is_double(builder, rhs);
+    let both = builder.ins().band(lhs_dbl, rhs_dbl);
+    let in_range = builder.ins().band(l_range, r_range);
+    let both = builder.ins().band(both, in_range);
+    let result = builder.declare_var(types::I64);
+    builder.def_var(result, fast);
+    let merge = builder.create_block();
+    let slow = builder.create_block();
+    builder.ins().brif(both, merge, &[], slow, &[]);
+    builder.switch_to_block(slow);
+    let op_imm = builder.ins().iconst(types::I64, disc);
+    let slow_res = call_helper(
+        builder,
+        helpers,
+        abi,
+        abi.sig_binary,
+        Helper::BinarySlow,
+        &[op_imm, lhs, rhs],
+    )?;
+    builder.def_var(result, slow_res);
+    builder.ins().jump(merge, &[]);
+    builder.seal_block(slow);
+    builder.switch_to_block(merge);
+    builder.seal_block(merge);
+    Ok(builder.use_var(result))
+}
+
+/// Truncate an f64 toward zero to i64 and report whether it is inside the
+/// conversion's range (`|x| < 2^63`).
+fn trunc_i32(builder: &mut FunctionBuilder, num: ClifValue) -> (ClifValue, ClifValue) {
+    let magnitude = builder.ins().fabs(num);
+    let bound = builder.ins().f64const(9223372036854775808.0);
+    let in_range = builder.ins().fcmp(FloatCC::LessThan, magnitude, bound);
+    let int = builder.ins().fcvt_to_sint_sat(types::I64, num);
+    (int, in_range)
 }
 
 fn bump_leaf_epoch(builder: &mut FunctionBuilder, vm: ClifValue) {

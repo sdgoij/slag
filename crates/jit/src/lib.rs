@@ -2099,6 +2099,34 @@ mod tests {
     }
 
     #[test]
+    fn opt_tier_bitwise_loop_matches_the_interpreter() {
+        // A linear-congruential loop: the `&` takes the inline integer fast
+        // path (the ToInt32 guard), and the body must still match.
+        let source = "function f(n) { var x = 1; var i = 0; \
+                        do { x = (x * 1103515245 + 12345) & 2147483647; i = i + 1; } \
+                        while (i < n); return x; } \
+                      var t = 0; \
+                      t += f(3); t += f(5); t += f(1); t += f(7); \
+                      t += f(2); t += f(9); t += f(4); t += f(6); \
+                      t += f(0); t += f(8); t += f(10); t += f(11); \
+                      t;";
+        let interp = {
+            let mut agent = runtime::Agent::new();
+            agent.initialize_host_defined_realm().expect("realm");
+            agent.run_script(source).expect("interp runs")
+        };
+        let before = crate::opt_lower::OPT_COMPILED.load(Ordering::Relaxed);
+        let (value, compiled) = with_opt_jit_agent(|agent| agent.run_script(source).expect("runs"));
+        let lowered = crate::opt_lower::OPT_COMPILED.load(Ordering::Relaxed) - before;
+        assert_eq!(
+            value, interp,
+            "the optimizing tier must match the interpreter"
+        );
+        assert!(compiled >= 1, "{compiled} bodies compiled");
+        assert!(lowered >= 1, "the optimizing tier lowered {lowered} bodies");
+    }
+
+    #[test]
     fn installed_jit_runs_a_member_callee() {
         // `return o.f(1) + 1` — a member callee (plain `CallFast`), no loop.
         // Cut 69: both bodies are straight-line, so the call repeats 17×
