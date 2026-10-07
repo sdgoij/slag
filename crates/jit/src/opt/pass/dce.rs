@@ -1,11 +1,13 @@
 //! Dead-code elimination over the SSA IR (`.notes/optimizing-tier-impl.md` §2,
 //! `pass/dce.rs`).
 //!
-//! An instruction is dead when its result is used by nothing and it is
-//! side-effect-free. Removal is by result-use, so it never touches an
-//! effect-only instruction (a store, a completion write) — those have no result
-//! and are kept. `Op::Check` is deliberately exempt: its `default_effects` are
-//! pure (it produces a boolean), but dropping it would drop a speculation guard.
+//! An instruction is dead when its result is used by nothing and it is safe to
+//! drop. Removal is by result-use, so it never touches an effect-only
+//! instruction (a store, a completion write) — those have no result and are
+//! kept. Eligible: a `pure` instruction (no reads, no writes) and an
+//! `Op::FrameLoad`, a private-slot read that cannot trap. `Op::Check` is
+//! deliberately exempt: its `default_effects` are pure (it produces a boolean),
+//! but dropping it would drop a speculation guard.
 //!
 //! The pass iterates to a fixpoint: removing one instruction can make its
 //! operands (a chain of dead pure ops) dead in turn.
@@ -25,7 +27,12 @@ pub fn run(func: &mut Function) -> bool {
                     // Effect-only: a store or a completion write.
                     return true;
                 };
-                if inst.op == Op::Check || !inst.effects.is_pure() {
+                if inst.op == Op::Check {
+                    return true;
+                }
+                // A pure computation, or a frame load (a private-slot read that
+                // cannot trap).
+                if !inst.effects.is_pure() && inst.op != Op::FrameLoad {
                     return true;
                 }
                 used[result as usize]

@@ -432,6 +432,26 @@ tests); `cargo clippy --workspace --all-targets -- -D warnings` clean; with
 at baseline. Still behind `SLAG_OPT`; the number is the first time the tier beats
 the per-step path, and it is the base the next transforms build on.
 
+**CSE + numeric narrowing (2026-10-07): the first algorithmic win.**
+`pass/narrow.rs` computes, by greatest fixpoint, which frame slots and values
+are Numbers (a slot is numeric when it is stored at least once and every store
+is numeric; a value is numeric when it is a numeric constant, a load of a
+numeric slot, or arithmetic on numeric operands) and widens the provably-numeric
+arithmetic ops from their sound `call()` default to `pure()`. That is the
+unlock: with arithmetic no longer a `World` write, `pass/cse.rs` can apply. It
+CSEs block-locally — a pure op or a `FrameLoad` whose identity (op, immediate,
+resolved args) was seen earlier with no intervening `Slots` write — rewriting the
+second's uses to the first; `pass/dce.rs` now also drops the leftover unused
+`FrameLoad`s. Measured on a loop whose body computes `a * b` three times over
+invariant numeric locals (corpus protocol, min-of-5 interleaved, `SLAG_OPT`
+0 vs 1): **51.3ms per-step -> 31.3ms IR, ~1.64x**, and a dump of the emitted code
+shows the three `fmul`s collapsed to one (2 total across the two test bodies).
+The plain arithmetic loop stays ~1.21x, so the extra win is the CSE, not the
+structural advantage. Gates: `cargo test --workspace` green (297 jit tests; 13
+pass-unit tests, incl. the narrowing fixpoint and the CSE invalidation); `cargo
+clippy --workspace --all-targets -- -D warnings` clean; with `SLAG_OPT=1` test262
+`language` 23,726 / 0 and `built-ins` 23,820 / 0 / 1, both at baseline.
+
 ## 10. Open decisions
 
 1. **Feedback store location** — per body (`CompiledBody`) or per closure
