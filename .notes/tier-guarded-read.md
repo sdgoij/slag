@@ -151,14 +151,21 @@ result is the opposite of a win:
 
 The tier is ~parity **without** the hoist and ~1.8x slower **with** it — a ~1.9x
 swing from moving one load out of the loop, which the saved work cannot explain.
-The regression is reproducible across rebuilds; the cause is not isolated (a
-codegen artifact of the hoisted value being live across the loop, or of the
-preheader's internal `brif` diamond, is the leading guess — isolating it wants
-the emitted CLIF/asm, not built out here). The guarded read is therefore
-**reverted**: neither the pair (parity) nor the hoist (a regression) pays on the
-one row it targets. The tier's ~parity *without* the hoist is the useful datum:
-the tier is competitive on a plain read loop once the read is inline, and the
-N-reads-to-1 hoist — the plan's supposed lever — does not hold up.
+The regression is reproducible across rebuilds. `JIT_DUMP_CLIF` (which also
+dumps the disassembly) shows the emitted code is essentially the same *size*
+with and without the hoist (578 vs 584 CLIF lines; 295 vs 301 disasm lines) but
+**not the same register allocation**: the hoisted build saves more callee-saved
+registers and produces ~112 real instruction differences in a ~300-line function.
+The cause is **register pressure** — hoisting the cell value makes it live across
+the whole loop, and the tier's loop is register-tight (every `+`/`<` expands to a
+tag-check + `select` canonicalize sequence), so one extra loop-live value degrades
+the allocation enough to cost ~1.8x. Fixing that is a register-pressure project
+over the tier's arithmetic sequences, not a read-side tweak. The guarded read is
+therefore **reverted**: neither the pair (parity) nor the hoist (a regression)
+pays on the one row it targets. The tier's ~parity *without* the hoist is the
+useful datum: the tier is competitive on a plain read loop once the read is
+inline, and the N-reads-to-1 hoist — the plan's supposed lever — does not hold up
+for this code.
 
 ## A real LICM bug, found en route (fixed)
 
