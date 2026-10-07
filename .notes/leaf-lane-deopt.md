@@ -1,8 +1,48 @@
 # Extending the deopt resume to the leaf lane
 
-**Status: scope (2026-10-07).** Follows the typer arc
-(`.notes/tier-typer.md`). The typer's read guard is currently capped to non-leaf
-bodies; this is what lifting that cap would take. Not started.
+**Status: L2 + L1 landed (2026-10-07).** Follows the typer arc
+(`.notes/tier-typer.md`). The leaf lane now resumes a deopt; the lift emits the
+typer's read guard for leaf bodies too.
+
+## Landed (2026-10-07)
+
+**L2 — a deopt-bearing body is never inlined by a compiled caller.**
+`JitCompiledInfo` gains `deopts` (set when the lowered IR contains a guard), and
+the machine-code inline lanes refuse it: `leaf_call_probe` (clears the record and
+returns 0), `certified_verdict` (`CertifiedInlineInfo::empty()`),
+`try_shared_construct_leaf` (`Ok(None)`), and `run_jit_body`'s self-call lane
+(`self_inline_ok: self_call_ok && !info.deopts`). This was a **latent soundness
+hole in T2 as it stood**: a guard-bearing non-leaf body could be inlined by a
+compiled caller, and a deopt would then surface as a bogus value. The typer is
+off by default, so the hole was only reachable with `SLAG_TYPER=1`.
+
+**L1 — `run_jit_leaf` resumes a deopt.** On `DISPATCH_DEOPT` the lane no longer
+pushes the sentinel as a value: it truncates `vm.stack` to `frame_base +
+offset` (the frame + the mirrored operands — the layout matches the interpreter's
+leaf layout), sets the interpreter leaf-run state the compiled path never touched
+(`completion`, `loop_counter`, `strict`, `chain_short`, `call_args`), and runs
+`run_inner_inner` from `vm.ip`. Resuming mid-body (not re-running the whole body)
+is what keeps a read's side effect from firing twice — pinned by a
+getter-counting test. `try_shared_construct_leaf` is refused (L2) rather than
+taught the resume.
+
+The lift's `!body.leaf` gate is now lifted: a leaf body takes the read guard.
+
+Measured (`run_typer.js`, guard on vs off on the tier, min-of-7 interleaved):
+`read_loop` (leaf) **0.956x** (was 0.992x — the guard had no effect on it before
+L1), `read_loop_nonleaf` **0.929x**, `licm_loop` 0.968x; the arithmetic/loop rows
+without a read are ~1.000x. Gates: `cargo test --workspace` green (jit 316/0);
+clippy `--workspace --all-targets -- -D warnings` clean; test262 `language`
+23,726/0/0/0 and `built-ins` 23,820/0/1/0 with `SLAG_TYPER=1` (leaf bodies now
+exercise the deopt resume across the suite).
+
+The typer stays **off by default** (`.notes/tier-typer.md` T3): the win is real
+but small, and the residual risk is a `read`-that-feeds-no-arithmetic site paying
+a guard check for no payoff (`read_bare` ~1.03x, within noise).
+
+---
+
+**Below: the original scope.**
 
 ## Why the cap exists
 

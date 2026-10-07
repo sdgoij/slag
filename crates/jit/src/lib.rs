@@ -163,6 +163,9 @@ pub struct JitCompiledInfo {
     /// The body's maximum value-stack depth above the frame, in slots — the
     /// JIT's working area size.
     pub stack_usage: usize,
+    /// Whether the compiled code can return `DISPATCH_DEOPT` (a speculation
+    /// guard). A body with this set is never inlined by a compiled caller.
+    pub deopts: bool,
 }
 
 /// A compiled body's executable machine code.
@@ -2068,6 +2071,45 @@ mod tests {
         );
         assert!(compiled >= 1, "{compiled} bodies compiled");
         assert!(lowered >= 1, "the optimizing tier lowered {lowered} bodies");
+    }
+
+    #[test]
+    fn opt_tier_leaf_guard_resumes_on_a_non_number_value() {
+        // L1: a LEAF body (member read only — no calls, no globals) with the
+        // typer's read guard. A non-Number read deopts, and the leaf lane must
+        // resume mid-body, not re-run the read: `reads` counts the getter, so a
+        // re-run would change the value.
+        let source = "var reads = 0; \
+                      function f(o) { var s = 0; var i = 0; \
+                        for (; i < 3; i = i + 1) { s = s + o.x; } \
+                        return s; } \
+                      var a = { get x() { reads = reads + 1; return {}; } }; \
+                      var n = { x: 3 }; \
+                      var t = ''; \
+                      t += f(a); t += f(n); t += f(a); t += f(n); t += f(a); \
+                      t += f(n); t += f(a); t += f(n); t += f(a); t += f(n); \
+                      t += f(a); t += f(n); t += f(a); t += f(n); t += f(a); \
+                      t += f(n); t += f(a); t += f(n); t += f(a); t += f(n); \
+                      t + '|' + reads;";
+        let interp = {
+            let mut agent = runtime::Agent::new();
+            agent.initialize_host_defined_realm().expect("realm");
+            agent.run_script(source).expect("interp runs")
+        };
+        let deopts_before = runtime::jit::JIT_DEOPT_COUNT.load(Ordering::Relaxed);
+        crate::opt::lift::OPT_TYPER.store(1, Ordering::Relaxed);
+        let (value, compiled) = with_opt_jit_agent(|agent| agent.run_script(source).expect("runs"));
+        crate::opt::lift::OPT_TYPER.store(0, Ordering::Relaxed);
+        let deopts = runtime::jit::JIT_DEOPT_COUNT.load(Ordering::Relaxed) - deopts_before;
+        assert_eq!(
+            value, interp,
+            "the optimizing tier must match the interpreter"
+        );
+        assert!(compiled >= 1, "{compiled} bodies compiled");
+        assert!(
+            deopts >= 1,
+            "the leaf read guard must have fired ({deopts})"
+        );
     }
 
     #[test]

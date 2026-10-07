@@ -56,6 +56,13 @@ pub struct JitCompiledInfo {
     /// The body's maximum value-stack depth above the frame, in slots — the
     /// JIT's working area size.
     pub stack_usage: usize,
+    /// Whether the compiled code can return `DISPATCH_DEOPT` (a speculation
+    /// guard). Such a body must NOT be inlined by a compiled caller — the
+    /// caller's machine code has no deopt path, so a deopt would surface as a
+    /// bogus value. The inline lanes (`leaf_call_probe`, `certified_verdict`,
+    /// the self-call path) refuse a body with this set and fall back to a
+    /// runtime-driven lane that can resume.
+    pub deopts: bool,
 }
 
 /// The registry the `jit` crate populates (see `jit::install`).
@@ -2852,6 +2859,11 @@ fn certified_verdict(
     }
     // SAFETY: `lookup_info` returned the cache's live entry.
     let compiled = unsafe { &*info_ptr };
+    // A deopt-bearing callee must not be inlined by a compiled caller (the
+    // caller's machine code has no deopt path); fall back to `call_slow`.
+    if compiled.deopts {
+        return CertifiedInlineInfo::empty();
+    }
     let this_slot = scope.this_slot.map_or(NO_THIS_SLOT, |slot| slot as u32);
     let (tdz_mask, fill_ok) = if scope.frame_size > TDZ_MASK_SLOTS {
         (0, 0)
@@ -2973,6 +2985,15 @@ extern "C" fn leaf_call_probe(
         return 0;
     }
     let compiled = unsafe { &*info_ptr };
+    // A body whose machine code can deopt must not be inlined: the caller's
+    // machine code has no deopt path, so a `DISPATCH_DEOPT` return would surface
+    // as a bogus value. Clear the record (a stable rejection, like an
+    // uncompilable body) and fall back to `call_slow`, whose leaf lane
+    // (`run_jit_leaf`) can resume.
+    if compiled.deopts {
+        *cache_entry = LeafCallRecord::empty();
+        return 0;
+    }
     // G13: a body that reads its environment (context-slot steps, or the
     // per-iteration reads) is a certified leaf like any other — the
     // interpreter's own leaf gate (`fast_call_core`) has no env condition, and
@@ -6766,7 +6787,7 @@ pub(crate) fn run_jit_body(
         current_function: vm.current_function.map(|value| value.bits()).unwrap_or(0),
         self_entry: if self_call_ok { info.entry as u64 } else { 0 },
         self_stack_usage: info.stack_usage as u64,
-        self_inline_ok: self_call_ok,
+        self_inline_ok: self_call_ok && !info.deopts,
         apply_builtin_bits,
         call_builtin_bits,
         intrinsic_bits,

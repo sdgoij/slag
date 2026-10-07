@@ -47,7 +47,7 @@ pub fn compile(
     if lower(ir, helpers, &mut func, &mut fctx, conv).is_err() {
         return None;
     }
-    let compiled = assemble(isa, func, max_stack)?;
+    let compiled = assemble(isa, func, max_stack, ir_has_deopt(ir))?;
     #[cfg(test)]
     OPT_COMPILED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     Some(compiled)
@@ -198,6 +198,17 @@ fn resolve(args: &[ValueId], values: &[Option<ClifValue>]) -> Result<Vec<BlockAr
     args.iter()
         .map(|id| value_of(values, *id).map(Into::into))
         .collect()
+}
+
+/// Whether the lowered IR contains a speculation guard, so the machine code can
+/// return `DISPATCH_DEOPT` (and must not be inlined by a compiled caller).
+fn ir_has_deopt(ir: &IrFunction) -> bool {
+    (0..ir.block_count() as BlockId).any(|b| {
+        ir.block(b)
+            .insts
+            .iter()
+            .any(|inst| matches!(inst.op, Op::GuardType | Op::Check))
+    })
 }
 
 fn lower_inst(

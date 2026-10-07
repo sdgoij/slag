@@ -160,17 +160,27 @@ impl JitEngine {
             }
             return None;
         }
-        assemble(&*self.isa, func, body.max_stack)
+        assemble(
+            &*self.isa,
+            func,
+            body.max_stack,
+            // A conservative over-approximation: the Stage O diagnostic can make
+            // any body deopt when it names a step, and a deopt-bearing body must
+            // not be inlined by a compiled caller.
+            JIT_DEOPT_PROBE.load(std::sync::atomic::Ordering::Relaxed) >= 0,
+        )
     }
 }
 
 /// Assemble a lowered CLIF function into executable code. Shared by the
 /// per-step lowerer and the optimizing tier's `opt_lower` so both hand the
-/// runtime an identical `Compiled`.
+/// runtime an identical `Compiled`. `deopts` records whether the code can
+/// return `DISPATCH_DEOPT` (see [`crate::JitCompiledInfo::deopts`]).
 pub(crate) fn assemble(
     isa: &dyn TargetIsa,
     func: Function,
     stack_usage: usize,
+    deopts: bool,
 ) -> Option<Compiled> {
     if std::env::var("JIT_DUMP_CLIF").is_ok() {
         eprintln!("{} \n", func.display());
@@ -203,6 +213,7 @@ pub(crate) fn assemble(
     let info = crate::JitCompiledInfo {
         entry: entry as usize,
         stack_usage,
+        deopts,
     };
     Some(Compiled { code, info })
 }

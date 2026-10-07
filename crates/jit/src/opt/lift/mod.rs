@@ -92,9 +92,12 @@ fn lift_impl(body: &CompiledBody, guard_reads: bool) -> Result<Function, Unsuppo
     if n == 0 {
         return Err(Unsupported::NoReturn);
     }
-    // Resume (a guard deopting) only works on the `run_jit_body` entry; a leaf
-    // body runs through `run_jit_leaf`, which does not handle `DISPATCH_DEOPT`.
-    let guard_reads = guard_reads && !body.leaf;
+    // The typer's read guard needs a deopt lane. Non-leaf bodies resume via
+    // `run_jit_body`; leaf bodies resume via `run_jit_leaf` (L1). The machine-
+    // code inline lanes cannot resume, so a guard-bearing body is marked
+    // `deopts` and refused there (`leaf_call_probe`, `certified_verdict`, the
+    // shared-construct lane, the self-call path), falling back to a
+    // runtime-driven lane.
     let probe_depth = if body.leaf {
         None
     } else {

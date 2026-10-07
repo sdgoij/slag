@@ -12858,6 +12858,13 @@ impl Vm {
             return Ok(None);
         }
         let info = unsafe { &*info_ptr };
+        // A deopt-bearing body must not be run through this lane: it treats the
+        // return as a value, so a `DISPATCH_DEOPT` would surface as a bogus one.
+        // Fall back to the general construct path (the non-leaf lane), which
+        // resumes.
+        if info.deopts {
+            return Ok(None);
+        }
         let ctx = unsafe { &mut *(ctx_ptr as *mut crate::jit::JitCallContext) };
         // The frame + working area + helper slack must fit above `sp` in the
         // caller's buffer (the machine code's current working pointer is the
@@ -14269,6 +14276,9 @@ impl Vm {
             self.bind_this_value(agent, scope, strict, this_value)?
         };
         let pre_call = self.stack.len() - argc;
+        // Saved for a deopt resume: the machine code writes `vm.ip` on a
+        // `DISPATCH_DEOPT`, so the caller's position must be restored after.
+        let caller_ip = self.ip;
         // Cut 28/30 mirror: a leaf that reads captured bindings resolves
         // them against its own per-call capture context (`body_context`)
         // built from the closure's environment — clone it and swap both
@@ -14411,6 +14421,72 @@ impl Vm {
             )
         };
         agent.jit_depth -= 1;
+        // A guard in the leaf body failed. The machine code mirrored the live
+        // operand stack at `work` (right above the frame) and set `vm.ip` to the
+        // resume step. Run the rest of the leaf body interpreted from there, on
+        // this Vm, with the frame still in place — re-running the body from the
+        // start would double any read side effect. The frame layout matches the
+        // interpreter's leaf layout, so no rebuild is needed: frame at
+        // `frame_base`, operands above it.
+        if result == crate::jit::DISPATCH_DEOPT {
+            crate::jit::JIT_DEOPT_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let resume_ip = self.ip;
+            let off = (ctx.suspend_sp as usize).saturating_sub(region_ptr as usize)
+                / std::mem::size_of::<Value>();
+            self.stack.truncate(frame_base + off);
+            // The interpreter leaf-run state the compiled path never set (it
+            // touches none of these), mirroring `run_leaf_body`.
+            let caller_completion = std::mem::replace(&mut self.completion, Value::Undefined);
+            let caller_completion_is_empty = self.completion_is_empty;
+            self.completion_is_empty = true;
+            let caller_loop_counter = self.loop_counter;
+            self.loop_counter = 0.0;
+            let caller_strict = self.strict;
+            self.strict = strict;
+            let caller_chain_short = self.chain_short;
+            self.chain_short = false;
+            let caller_call_args = if scope.arguments_slot.is_some() {
+                Some(std::mem::replace(
+                    &mut self.call_args,
+                    self.stack[pre_call..pre_call + argc].to_vec(),
+                ))
+            } else {
+                None
+            };
+            self.ip = resume_ip;
+            let outcome = self.run_inner_inner(agent, ir);
+            self.ip = caller_ip;
+            self.completion = caller_completion;
+            self.completion_is_empty = caller_completion_is_empty;
+            self.loop_counter = caller_loop_counter;
+            self.strict = caller_strict;
+            self.chain_short = caller_chain_short;
+            if let Some(saved) = caller_call_args {
+                self.call_args = saved;
+            }
+            self.leaf_frame_base = caller_leaf_frame_base;
+            self.stack.truncate(pre_call - below);
+            self.array_index_stack.truncate(array_index_stack_len);
+            if let Some(saved_env) = caller_body_context {
+                self.body_context = Some(saved_env);
+            }
+            if let Some(saved_env) = caller_lexical_env {
+                self.lexical_env = saved_env;
+            }
+            let completion = match outcome {
+                Ok(crate::ir::VmOutcome::Completed(completion)) => completion,
+                Ok(_) => {
+                    return Err(JsError::new(
+                        ErrorKind::TypeError,
+                        "leaf deopt produced a non-return completion".into(),
+                    ));
+                }
+                Err(error) => return Err(error),
+            };
+            let value = Self::leaf_completion_result(completion)?;
+            self.stack.push(value);
+            return Ok(true);
+        }
         self.leaf_frame_base = caller_leaf_frame_base;
         // Unwind the argument region and the frame/working area (the region is
         // a `vm.stack` segment now), then surface a pending error or land the
