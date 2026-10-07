@@ -2141,16 +2141,31 @@ impl CompiledBody {
     /// Stage O count probe: record the member read at step `ip` whose receiver
     /// had object map id `map` (`0` = a receiver with no speculatable shape).
     /// A no-op unless the probe is enabled; the store is allocated on the first
-    /// write. Nothing consumes the record yet.
+    /// write, and a site that has turned generic is frozen (no further writes).
     pub(crate) fn record_member_read(&self, ip: usize, map: u64) {
+        use crate::feedback::Observed;
         if !crate::feedback::enabled() {
             return;
         }
         let mut slot = self.feedback.borrow_mut();
         let store = slot.get_or_insert_with(|| crate::feedback::Feedback::new(self.steps.len()));
-        if let Some(site) = store.member_read(ip) {
-            site.observe(map);
-            crate::feedback::record_write();
+        let Some(site) = store.member_read(ip) else {
+            return;
+        };
+        let observed = site.observe(map);
+        match observed {
+            Observed::Repeat | Observed::NewMap | Observed::Overflow => {
+                crate::feedback::record_write();
+            }
+            // A frozen or shapeless read writes nothing.
+            Observed::Shapeless | Observed::Frozen => return,
+        }
+        match observed {
+            // A second distinct shape means a monomorphic guard built from the
+            // first would have to retire.
+            Observed::NewMap if site.distinct_maps() == 2 => crate::feedback::record_polymorphic(),
+            Observed::Overflow => crate::feedback::record_generic(),
+            _ => {}
         }
     }
 }

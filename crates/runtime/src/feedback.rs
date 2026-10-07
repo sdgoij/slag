@@ -3,9 +3,12 @@
 //!
 //! A record is keyed by `(body, step)`: it lives on the
 //! [`CompiledBody`](crate::ir::CompiledBody) at the step's index and is written
-//! by the interpreter handlers as they run a site. Nothing consumes the records
-//! yet — this increment is the substrate and the count probe (`SLAG_FEEDBACK`),
-//! so a default build allocates nothing and behaves exactly as before.
+//! by the interpreter handlers as they run a site. The valve acts — a site that
+//! overflows its stub budget turns generic and stops being recorded — and the
+//! count probe ([`summary`]) reports how many sites did, which is the plan's
+//! "retirements that would fire" signal. No transform consumes a record yet, so
+//! a default build (`SLAG_FEEDBACK` unset) allocates nothing and behaves exactly
+//! as before.
 
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
@@ -45,23 +48,28 @@ pub struct MemberReadSite {
 
 impl MemberReadSite {
     /// Record a read whose receiver had map id `map` (`0` = a receiver with no
-    /// speculatable shape — a primitive or an exotic object). Returns the valve
-    /// state after observing it.
-    pub fn observe(&mut self, map: u64) -> IcState {
+    /// speculatable shape — a primitive or an exotic object). Returns what the
+    /// observation did to the record; a site that is already generic is frozen
+    /// (the valve's action: a generic site costs nothing more).
+    pub fn observe(&mut self, map: u64) -> Observed {
         self.hits = self.hits.saturating_add(1);
-        if map != 0 {
-            let len = self.len as usize;
-            if self.maps[..len].contains(&map) {
-                return self.state();
-            }
-            if len < self.maps.len() {
-                self.maps[len] = map;
-                self.len += 1;
-            } else {
-                self.generic = true;
-            }
+        if self.generic {
+            return Observed::Frozen;
         }
-        self.state()
+        if map == 0 {
+            return Observed::Shapeless;
+        }
+        let len = self.len as usize;
+        if self.maps[..len].contains(&map) {
+            return Observed::Repeat;
+        }
+        if len < self.maps.len() {
+            self.maps[len] = map;
+            self.len += 1;
+            return Observed::NewMap;
+        }
+        self.generic = true;
+        Observed::Overflow
     }
 
     /// A failed specialization (a guard that did not hold at run time).
@@ -99,6 +107,22 @@ impl MemberReadSite {
     pub fn over_budget(&self) -> bool {
         self.failures > max_failures(self.distinct_maps())
     }
+}
+
+/// What one member-read observation did to its site's record.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Observed {
+    /// The receiver had no speculatable shape (a primitive or an exotic).
+    Shapeless,
+    /// The map was already in the log.
+    Repeat,
+    /// A new distinct map entered the log. A transition to the second map means
+    /// a monomorphic guard built from the first would have to retire.
+    NewMap,
+    /// The log was full, so the site turned generic.
+    Overflow,
+    /// The site was already generic: the record was left untouched (frozen).
+    Frozen,
 }
 
 /// One step's record. A single variant now; the enum is the seam for the other
@@ -169,19 +193,53 @@ pub(crate) fn force_enabled(on: bool) {
     ENABLED.store(on, Ordering::Relaxed);
 }
 
-/// The number of feedback records written since process start (the stage-O
-/// count probe).
-pub static WRITES: AtomicUsize = AtomicUsize::new(0);
+/// The count probe of stage O (`.notes/optimizing-tier-plan.md` §6): how many
+/// records were written, how many sites went polymorphic ("retirements that
+/// would fire" for a monomorphic guard built on the first shape), and how many
+/// overflowed their stub budget and turned generic.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Summary {
+    /// Records actually written (a frozen or shapeless read writes none).
+    pub writes: usize,
+    /// Sites that saw a second distinct receiver map.
+    pub polymorphic: usize,
+    /// Sites that overflowed [`MAX_OPTIMIZED_STUBS`] and turned generic.
+    pub generic: usize,
+}
+
+static WRITES: AtomicUsize = AtomicUsize::new(0);
+static POLYMORPHIC: AtomicUsize = AtomicUsize::new(0);
+static GENERIC: AtomicUsize = AtomicUsize::new(0);
 
 /// Count one written record.
 pub fn record_write() {
     WRITES.fetch_add(1, Ordering::Relaxed);
 }
 
-/// The count `record_write` has accumulated.
+/// Count a site that went from monomorphic to polymorphic.
+pub fn record_polymorphic() {
+    POLYMORPHIC.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Count a site that overflowed its stub budget and turned generic.
+pub fn record_generic() {
+    GENERIC.fetch_add(1, Ordering::Relaxed);
+}
+
+/// The probe's running totals.
+#[must_use]
+pub fn summary() -> Summary {
+    Summary {
+        writes: WRITES.load(Ordering::Relaxed),
+        polymorphic: POLYMORPHIC.load(Ordering::Relaxed),
+        generic: GENERIC.load(Ordering::Relaxed),
+    }
+}
+
+/// The number of feedback records written since process start.
 #[must_use]
 pub fn writes() -> usize {
-    WRITES.load(Ordering::Relaxed)
+    summary().writes
 }
 
 #[cfg(test)]
@@ -191,27 +249,30 @@ mod tests {
     #[test]
     fn a_site_is_specialized_then_megamorphic_then_generic() {
         let mut site = MemberReadSite::default();
-        assert_eq!(site.observe(7), IcState::Specialized);
-        assert_eq!(site.observe(7), IcState::Specialized);
+        assert_eq!(site.observe(7), Observed::NewMap);
+        assert_eq!(site.state(), IcState::Specialized);
+        assert_eq!(site.observe(7), Observed::Repeat);
         assert_eq!(site.distinct_maps(), 1);
-        assert_eq!(site.observe(9), IcState::Megamorphic);
-        // The first `MAX_OPTIMIZED_STUBS` distinct maps stay megamorphic.
-        for map in 10..(10 + MAX_OPTIMIZED_STUBS as u64) {
+        assert_eq!(site.observe(9), Observed::NewMap);
+        assert_eq!(site.state(), IcState::Megamorphic);
+        // Fill the remaining stubs (two are already in the log).
+        for map in 10..(10 + MAX_OPTIMIZED_STUBS as u64 - 2) {
             let _ = site.observe(map);
         }
         assert_eq!(site.distinct_maps(), MAX_OPTIMIZED_STUBS);
-        // One more distinct shape overflows the stub budget: generic, and the
-        // log stops growing.
-        assert_eq!(site.observe(1000), IcState::Generic);
+        // One more distinct shape overflows the stub budget: generic, the log
+        // stops growing, and later reads are frozen.
+        assert_eq!(site.observe(1000), Observed::Overflow);
+        assert_eq!(site.state(), IcState::Generic);
         assert_eq!(site.distinct_maps(), MAX_OPTIMIZED_STUBS);
-        assert_eq!(site.observe(7), IcState::Generic);
+        assert_eq!(site.observe(7), Observed::Frozen);
     }
 
     #[test]
     fn a_shapeless_receiver_does_not_pollute_the_log() {
         let mut site = MemberReadSite::default();
-        assert_eq!(site.observe(0), IcState::Specialized);
-        assert_eq!(site.observe(0), IcState::Specialized);
+        assert_eq!(site.observe(0), Observed::Shapeless);
+        assert_eq!(site.observe(0), Observed::Shapeless);
         assert_eq!(site.distinct_maps(), 0);
         assert_eq!(site.hits(), 2);
     }
@@ -226,6 +287,31 @@ mod tests {
             site.fail();
         }
         assert!(site.over_budget());
+    }
+
+    #[test]
+    fn the_probe_classifies_sites() {
+        // One `f` body reads `o.a` on two distinct shapes across calls, so its
+        // site goes polymorphic (the retire-fires signal) and records writes.
+        force_enabled(true);
+        let before = summary();
+        let mut agent = crate::Agent::new();
+        agent.initialize_host_defined_realm().expect("realm");
+        let _ = agent
+            .run_script(
+                "function f(o, n) { var s = 0; var i = n; \
+                   do { s += o.a; i = i - 1; } while (i > 0); return s; } \
+                 var p = { a: 1 }; var q = { a: 2, b: 3 }; \
+                 f(p, 3); f(q, 3); f(p, 3);",
+            )
+            .expect("runs");
+        let after = summary();
+        force_enabled(false);
+        assert!(after.writes > before.writes, "records written");
+        assert!(
+            after.polymorphic > before.polymorphic,
+            "a site went polymorphic"
+        );
     }
 
     #[test]

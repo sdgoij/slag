@@ -153,7 +153,7 @@ The `stage` column maps each increment to `optimizing-tier-plan.md` §6.
 | I0 | — | IR core: `ir`/`builder`/`verify`/`print` + tests | none (foundation) | **landed** at `crates/jit/src/opt/` |
 | I1 | — | lift (straight-line subset) + identity lowering behind `SLAG_OPT=1` | none (equivalence) | **landed** |
 | I2 | — | lift control flow: branches **landed**; simple loops with phis proposed | none (equivalence) | partly landed |
-| I3 | O | feedback records + `ICState` valve + retire hook + count probe | none (enabling) | partly landed (I3a) |
+| I3 | O | feedback records + `ICState` valve + retire hook + count probe | none (enabling) | partly landed (I3a–b) |
 | I4 | B | builtin intrinsic inlining (scalars first, then array/collection) | `regexp_test`, `array_slice`, `string_indexof` | partly landed, outside the IR |
 | I5 | I | trial inlining (caller-specialized records) | `method_call`, `js_call`, `closure_capture`, `hof_methods`, `apply_call` | proposed |
 | I6 | E | escape analysis + scalar replacement | `object_keys`, `typed_array_for_each`, `array_alloc`/`object_alloc`, `destructure`, `construct_churn` | proposed |
@@ -331,6 +331,25 @@ with the guard that needs it. Gates: `cargo clippy --workspace --all-targets --
 -D warnings` clean; `cargo test --workspace` green (5 new `feedback` tests,
 including an end-to-end probe that runs a member-read script with the forced on
 and asserts records were written); behavior-neutral by construction when off.
+
+**I3b status (2026-10-07): the valve acts and the probe classifies.**
+`MemberReadSite::observe` now returns an `Observed` (`Shapeless`/`Repeat`/
+`NewMap`/`Overflow`/`Frozen`): a site whose log has overflowed the stub budget
+turns generic and **freezes** — later reads touch no record, the `ICState`
+valve's first real action. The probe (`feedback::summary`) counts writes plus two
+classification counters: the sites that went from monomorphic to polymorphic
+(the plan's "retirements that would fire" — a monomorphic guard built on the
+first shape would have to retire) and the sites that overflowed to generic. Two
+pieces are now explicit decisions rather than oversights: (1) capturing the
+*serving* premise (the member cell's generation, or a global cell's) needs the
+handler to receive its site — a signature change to `get_member_name`, so it
+lands with the guard that reads it; (2) the compiled-tier writer needs the step
+`ip` in the member-read helper ABI (the compiled code keeps `vm.ip` current only
+at try-exit and deopt probes, not per step), a four-file-mirror change the plan
+warns against, so it lands with the first speculative transform. Gates: `cargo
+clippy --workspace --all-targets -- -D warnings` clean; `cargo test --workspace`
+green (6 `feedback` tests, including a classification probe); behavior-neutral
+when off.
 
 ## 10. Open decisions
 
