@@ -2127,6 +2127,39 @@ mod tests {
     }
 
     #[test]
+    fn opt_tier_modulo_matches_the_interpreter() {
+        // `%` takes the inline integer fast path (the integrality, i32-range and
+        // nonzero-divisor guards around `srem`) for the in-range loop operands,
+        // and the `BinarySlow` fallback for the out-of-range (`n * 2^31`) and
+        // fractional (`n + 0.5`) dividends — both must match the interpreter.
+        let source = "function f(n) { \
+                        var x = 1; var i = 0; \
+                        do { x = (x * 31 + 7) % 101; i = i + 1; } while (i < n); \
+                        var big = (n * 2147483648) % 3; \
+                        var frac = (n + 0.5) % 2; \
+                        return x + big + frac; } \
+                      var t = 0; \
+                      t += f(3); t += f(5); t += f(1); t += f(7); \
+                      t += f(2); t += f(9); t += f(4); t += f(6); \
+                      t += f(0); t += f(8); t += f(10); t += f(11); \
+                      t;";
+        let interp = {
+            let mut agent = runtime::Agent::new();
+            agent.initialize_host_defined_realm().expect("realm");
+            agent.run_script(source).expect("interp runs")
+        };
+        let before = crate::opt_lower::OPT_COMPILED.load(Ordering::Relaxed);
+        let (value, compiled) = with_opt_jit_agent(|agent| agent.run_script(source).expect("runs"));
+        let lowered = crate::opt_lower::OPT_COMPILED.load(Ordering::Relaxed) - before;
+        assert_eq!(
+            value, interp,
+            "the optimizing tier must match the interpreter"
+        );
+        assert!(compiled >= 1, "{compiled} bodies compiled");
+        assert!(lowered >= 1, "the optimizing tier lowered {lowered} bodies");
+    }
+
+    #[test]
     fn opt_tier_for_loop_matches_the_interpreter() {
         // A `for` loop with a literal bound and an `i = i + 1` update takes the
         // non-fused path, whose test is the fused `JumpIfLtImm` step the lift now

@@ -543,6 +543,23 @@ reads. The lever for reads is not an *unconditional* inline probe but a
 *guarded, hoisted* read whose premise (the cell's generation) the feedback
 record retires — the cell as a premise, not as a straight-line mirror.
 
+**Modulo inline, and the regression it removed (2026-10-07).** The tier's `%`
+now takes the same integer fast path as the per-step lowerer: `call_mod_int` (in
+`opt_lower`) mirrors `emit_mod_int` — both operands Numbers, integral, inside
+the i32 range, divisor nonzero -> `srem` with the dividend's sign copied on,
+else `BinarySlow`; the tag check is dropped when the narrowing pass has proven
+both operands `Number`/`Int`. Before, `Op::Mod` fell straight to `BinarySlow`,
+so the tier *lost* on modulo-heavy code (measured on a `%` loop, 5M iters,
+min-of-5 interleaved, `SLAG_OPT` 0 vs 1: the tier was **85.7ms against 78.7ms
+per-step — 1.09x slower**; after, it is **75.6ms against 76.9ms — 0.98x**, a
+~1.13x improvement for the tier). `Op::Pow` stays on `BinarySlow` in *both*
+paths (cranelift 0.134 has no `fpow`, and `inline_binary` excludes `Exp`), so it
+is parity, not a regression. Gates: `cargo test --workspace` green (303 jit
+tests, incl. a modulo e2e that exercises both the in-range fast path and the
+out-of-range/fractional slow path); `cargo clippy --workspace --all-targets --
+-D warnings` clean; with the default (tier on) test262 `language` 23,726 / 0 and
+`built-ins` 23,820 / 0 / 1, both at baseline.
+
 ## 10. Open decisions
 
 1. **Feedback store location** — per body (`CompiledBody`) or per closure

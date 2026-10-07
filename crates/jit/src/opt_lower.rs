@@ -266,16 +266,21 @@ fn lower_inst(
             // arithmetic/comparison is a bare f64 op with no tag check, no slow
             // block and no branch — the same shape the per-step path reaches
             // with a known-number operand.
-            let known = numeric
-                && inst.args.iter().all(|a| {
-                    types
-                        .get(*a as usize)
-                        .is_some_and(|t| matches!(t, Type::Number | Type::Int))
-                });
+            let both_known = inst.args.iter().all(|a| {
+                types
+                    .get(*a as usize)
+                    .is_some_and(|t| matches!(t, Type::Number | Type::Int))
+            });
+            let known = numeric && both_known;
             if known {
                 emit_bare_numeric(builder, inst.op, lhs, rhs)
             } else if numeric {
                 call_numeric_binary(builder, helpers, abi, inst.op, disc as i64, lhs, rhs)?
+            } else if inst.op == Op::Mod {
+                // `%` needs the integer fast path the arithmetic ops do not: a
+                // proven Number still has to satisfy the integrality, i32-range
+                // and nonzero-divisor guards before `srem` is the spec's `fmod`.
+                call_mod_int(builder, helpers, abi, disc as i64, lhs, rhs, both_known)?
             } else if matches!(
                 inst.op,
                 Op::BitAnd | Op::BitOr | Op::BitXor | Op::Shl | Op::Shr | Op::UShr
@@ -699,6 +704,95 @@ fn call_int_binary(
     builder.seal_block(slow);
     builder.switch_to_block(merge);
     builder.seal_block(merge);
+    Ok(builder.use_var(result))
+}
+
+/// The inline integer fast path for `%`: when both operands are Numbers,
+/// integral, inside the i32 range and the divisor is nonzero — where the spec's
+/// `fmod` equals the integer remainder — compute `srem`; otherwise fall through
+/// to `BinarySlow`. Mirrors the per-step lowerer's `emit_mod_int` (Cranelift has
+/// no `frem`, and `fmod` is a libm call while `srem` is an instruction).
+fn call_mod_int(
+    builder: &mut FunctionBuilder,
+    helpers: &JitHelpers,
+    abi: &Abi,
+    disc: i64,
+    lhs: ClifValue,
+    rhs: ClifValue,
+    operands_known: bool,
+) -> Result<ClifValue, Unsupported> {
+    let lhs_num = builder.ins().bitcast(types::F64, MemFlagsData::new(), lhs);
+    let rhs_num = builder.ins().bitcast(types::F64, MemFlagsData::new(), rhs);
+    let (l_wide, _) = trunc_i32(builder, lhs_num);
+    let (r_wide, _) = trunc_i32(builder, rhs_num);
+    let l_back = builder.ins().fcvt_from_sint(types::F64, l_wide);
+    let r_back = builder.ins().fcvt_from_sint(types::F64, r_wide);
+    // The truncation is only exact for integral values, so a fractional operand
+    // takes the slow path.
+    let l_int = builder.ins().fcmp(FloatCC::Equal, l_back, lhs_num);
+    let r_int = builder.ins().fcmp(FloatCC::Equal, r_back, rhs_num);
+    // `srem` on the i32 reduction is `a % b` only for |x| <= 2^31-1; a larger
+    // integer would take the low 32 bits of the *rounded* value.
+    let bound = builder.ins().f64const(2147483647.0);
+    let l_abs = builder.ins().fabs(lhs_num);
+    let r_abs = builder.ins().fabs(rhs_num);
+    let l_in_i32 = builder.ins().fcmp(FloatCC::LessThanOrEqual, l_abs, bound);
+    let r_in_i32 = builder.ins().fcmp(FloatCC::LessThanOrEqual, r_abs, bound);
+    let l = builder.ins().ireduce(types::I32, l_wide);
+    let r = builder.ins().ireduce(types::I32, r_wide);
+    let r_nonzero = builder.ins().icmp_imm_u(IntCC::NotEqual, r, 0);
+    let lhs_dbl = if operands_known {
+        builder.ins().iconst(types::I8, 1)
+    } else {
+        is_double(builder, lhs)
+    };
+    let rhs_dbl = if operands_known {
+        builder.ins().iconst(types::I8, 1)
+    } else {
+        is_double(builder, rhs)
+    };
+    let mut guard = builder.ins().band(lhs_dbl, rhs_dbl);
+    guard = builder.ins().band(guard, l_int);
+    guard = builder.ins().band(guard, r_int);
+    guard = builder.ins().band(guard, l_in_i32);
+    guard = builder.ins().band(guard, r_in_i32);
+    guard = builder.ins().band(guard, r_nonzero);
+    let result = builder.declare_var(types::I64);
+    let merge = builder.create_block();
+    let fast = builder.create_block();
+    let slow = builder.create_block();
+    builder.ins().brif(guard, fast, &[], slow, &[]);
+    // The remainder runs only on the fast path: `srem` by zero traps, so the
+    // nonzero guard has to gate the instruction itself.
+    builder.switch_to_block(fast);
+    let rem = builder.ins().srem(l, r);
+    let wide = builder.ins().sextend(types::I64, rem);
+    let rem_f = builder.ins().fcvt_from_sint(types::F64, wide);
+    // `fmod` takes the dividend's sign; `srem` matches except for a zero result
+    // (which it makes +0), so copy the dividend's sign onto it.
+    let rem_f = builder.ins().fcopysign(rem_f, lhs_num);
+    let bits = builder
+        .ins()
+        .bitcast(types::I64, MemFlagsData::new(), rem_f);
+    let fast_res = canon_double(builder, bits);
+    builder.def_var(result, fast_res);
+    builder.ins().jump(merge, &[]);
+    builder.switch_to_block(slow);
+    let op_imm = builder.ins().iconst(types::I64, disc);
+    let slow_res = call_helper(
+        builder,
+        helpers,
+        abi,
+        abi.sig_binary,
+        Helper::BinarySlow,
+        &[op_imm, lhs, rhs],
+    )?;
+    builder.def_var(result, slow_res);
+    builder.ins().jump(merge, &[]);
+    builder.seal_block(fast);
+    builder.seal_block(slow);
+    builder.seal_block(merge);
+    builder.switch_to_block(merge);
     Ok(builder.use_var(result))
 }
 
