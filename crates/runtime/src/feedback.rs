@@ -246,6 +246,14 @@ pub fn writes() -> usize {
 mod tests {
     use super::*;
 
+    /// The probe's on/off flag is process-global, so the tests that flip it must
+    /// not interleave (one would turn it off inside the other's script).
+    fn probe_guard() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     #[test]
     fn a_site_is_specialized_then_megamorphic_then_generic() {
         let mut site = MemberReadSite::default();
@@ -293,6 +301,7 @@ mod tests {
     fn the_probe_classifies_sites() {
         // One `f` body reads `o.a` on two distinct shapes across calls, so its
         // site goes polymorphic (the retire-fires signal) and records writes.
+        let _guard = probe_guard();
         force_enabled(true);
         let before = summary();
         let mut agent = crate::Agent::new();
@@ -329,6 +338,7 @@ mod tests {
     fn the_probe_counts_member_reads() {
         // The interpreter wires `Step::GetMemberName` to `record_member_read`;
         // with the probe on, a script that reads members must record them.
+        let _guard = probe_guard();
         force_enabled(true);
         let before = writes();
         let mut agent = crate::Agent::new();
