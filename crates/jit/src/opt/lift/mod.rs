@@ -29,7 +29,7 @@ use crate::opt::builder::Builder;
 use crate::opt::ir::{BlockId, Effects, Function, Heap, Imm, Op, Term, Type, ValueId};
 use syntax::ast::{BinaryOp, UnaryOp};
 
-use runtime::ir::{CompiledBody, Step};
+use runtime::ir::{CompiledBody, RelLimit, Step};
 
 /// Why a body could not be lifted.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -133,6 +133,7 @@ pub fn lift(body: &CompiledBody) -> Result<Function, Unsupported> {
                 Step::JumpIfFalse(_) | Step::JumpIfTrue(_) => {
                     TermRec::Branch(stack.pop().ok_or(Unsupported::Stack)?, stack)
                 }
+                other if is_fused_test(other) => TermRec::FusedTest(stack),
                 other => return Err(Unsupported::Step(step_name(other))),
             },
             None => TermRec::Jump(stack),
@@ -169,6 +170,27 @@ pub fn lift(body: &CompiledBody) -> Result<Function, Unsupported> {
                     bi as BlockId,
                     Term::Branch {
                         cond: *cond,
+                        then_block,
+                        then_args,
+                        else_block,
+                        else_args,
+                    },
+                );
+            }
+            TermRec::FusedTest(stack) => {
+                let ti = terms[bi].ok_or(Unsupported::Invalid)?;
+                let (cond, jump_when_true) =
+                    emit_fused_test(&mut builder, bi as BlockId, &steps[ti], tdz)?;
+                let target = jump_target(&steps[ti]).ok_or(Unsupported::Invalid)?;
+                let sb = block_of[target] as BlockId;
+                let fb = block_of[end] as BlockId;
+                let (then_block, else_block) = if jump_when_true { (sb, fb) } else { (fb, sb) };
+                let then_args = edge_args(builder.func(), then_block, stack);
+                let else_args = edge_args(builder.func(), else_block, stack);
+                builder.term(
+                    bi as BlockId,
+                    Term::Branch {
+                        cond,
                         then_block,
                         then_args,
                         else_block,
@@ -277,6 +299,9 @@ enum TermRec {
     Ret(ValueId),
     Jump(Vec<ValueId>),
     Branch(ValueId, Vec<ValueId>),
+    /// A fused test: the condition is emitted from the step at terminator time
+    /// (it reads its operands itself), and the stack is passed to both edges.
+    FusedTest(Vec<ValueId>),
 }
 
 /// The arguments a predecessor passes into `target`: its stack, or nothing
@@ -302,14 +327,18 @@ fn block_successors(steps: &[Step], end: usize, n: usize) -> Result<Vec<usize>, 
         return Err(Unsupported::Invalid);
     };
     if is_terminator(&steps[last]) {
+        if let Some(target) = jump_target(&steps[last]) {
+            // An unconditional jump has one successor; every conditional (the
+            // `JumpIf*` pair and the fused loop test) also falls through.
+            return if matches!(steps[last], Step::Jump(_)) {
+                Ok(vec![target])
+            } else if end >= n {
+                Err(Unsupported::Malformed("conditional with no fall-through"))
+            } else {
+                Ok(vec![target, end])
+            };
+        }
         match &steps[last] {
-            Step::Jump(t) => Ok(vec![*t]),
-            Step::JumpIfFalse(t) | Step::JumpIfTrue(t) => {
-                if end >= n {
-                    return Err(Unsupported::Malformed("conditional with no fall-through"));
-                }
-                Ok(vec![*t, end])
-            }
             Step::Return => Ok(Vec::new()),
             Step::Throw { .. } => Err(Unsupported::Step("Throw")),
             _ => Err(Unsupported::Invalid),
@@ -322,19 +351,42 @@ fn block_successors(steps: &[Step], end: usize, n: usize) -> Result<Vec<usize>, 
 }
 
 fn is_terminator(step: &Step) -> bool {
+    jump_target(step).is_some() || matches!(step, Step::Return | Step::Throw { .. })
+}
+
+/// Whether `step` is one of the fused loop/strict-equality tests (a conditional
+/// jump that reads its operands itself rather than popping a stack condition).
+fn is_fused_test(step: &Step) -> bool {
     matches!(
         step,
-        Step::Jump(_)
-            | Step::JumpIfFalse(_)
-            | Step::JumpIfTrue(_)
-            | Step::Return
-            | Step::Throw { .. }
+        Step::JumpIfLtImm { .. }
+            | Step::JumpIfLeImm { .. }
+            | Step::JumpIfGtImm { .. }
+            | Step::JumpIfGeImm { .. }
+            | Step::JumpIfEqImm { .. }
+            | Step::JumpIfNeqImm { .. }
+            | Step::JumpIfRelLimit { .. }
+            | Step::JumpIfLtGlobalImm { .. }
+            | Step::JumpIfLeGlobalImm { .. }
+            | Step::JumpIfGtGlobalImm { .. }
+            | Step::JumpIfGeGlobalImm { .. }
     )
 }
 
 fn jump_target(step: &Step) -> Option<usize> {
     match step {
         Step::Jump(t) | Step::JumpIfFalse(t) | Step::JumpIfTrue(t) => Some(*t),
+        Step::JumpIfLtImm { target, .. }
+        | Step::JumpIfLeImm { target, .. }
+        | Step::JumpIfGtImm { target, .. }
+        | Step::JumpIfGeImm { target, .. }
+        | Step::JumpIfEqImm { target, .. }
+        | Step::JumpIfNeqImm { target, .. }
+        | Step::JumpIfRelLimit { target, .. }
+        | Step::JumpIfLtGlobalImm { target, .. }
+        | Step::JumpIfLeGlobalImm { target, .. }
+        | Step::JumpIfGtGlobalImm { target, .. }
+        | Step::JumpIfGeGlobalImm { target, .. } => Some(*target),
         _ => None,
     }
 }
@@ -541,6 +593,126 @@ fn emit_tdz_check(builder: &mut Builder, block: BlockId, slot: usize) {
         Effects::read(Heap::Slots),
         Imm::Slot(slot as u32),
     );
+}
+
+/// Emit the comparison of a fused test step and return the condition value plus
+/// whether the step jumps to its target when that condition is *true* (only
+/// `JumpIfNeqImm` does; every other fused test jumps when it is false). Mirrors
+/// `jump_if_rel_imm`/`jump_if_rel_limit`/`jump_if_rel_global` and
+/// `jump_if_strict_eq_imm`.
+fn emit_fused_test(
+    builder: &mut Builder,
+    block: BlockId,
+    step: &Step,
+    tdz: &[bool],
+) -> Result<(ValueId, bool), Unsupported> {
+    let slot_load = |b: &mut Builder, slot: usize| -> ValueId {
+        if tdz.get(slot).copied().unwrap_or(false) {
+            emit_tdz_check(b, block, slot);
+        }
+        b.emit(
+            block,
+            Op::FrameLoad,
+            &[],
+            Type::Unknown,
+            Effects::read(Heap::Slots),
+            Imm::Slot(slot as u32),
+        )
+    };
+    let num = |b: &mut Builder, v: f64| -> ValueId {
+        b.emit(
+            block,
+            Op::Const,
+            &[],
+            Type::Number,
+            Effects::pure(),
+            Imm::Float(v),
+        )
+    };
+    let global = |b: &mut Builder, name: crux::AtomId| -> ValueId {
+        b.emit(
+            block,
+            Op::GlobalLoad,
+            &[],
+            Type::Unknown,
+            Effects::call(),
+            Imm::Atom(name),
+        )
+    };
+    let cmp = |b: &mut Builder, op: Op, l: ValueId, r: ValueId| -> ValueId {
+        b.emit(
+            block,
+            op,
+            &[l, r],
+            Type::Bool,
+            op.default_effects(),
+            Imm::None,
+        )
+    };
+    Ok(match step {
+        Step::JumpIfLtImm { slot, imm, .. } => {
+            let l = slot_load(builder, *slot);
+            let r = num(builder, *imm);
+            (cmp(builder, Op::Lt, l, r), false)
+        }
+        Step::JumpIfLeImm { slot, imm, .. } => {
+            let l = slot_load(builder, *slot);
+            let r = num(builder, *imm);
+            (cmp(builder, Op::Le, l, r), false)
+        }
+        Step::JumpIfGtImm { slot, imm, .. } => {
+            let l = slot_load(builder, *slot);
+            let r = num(builder, *imm);
+            (cmp(builder, Op::Gt, l, r), false)
+        }
+        Step::JumpIfGeImm { slot, imm, .. } => {
+            let l = slot_load(builder, *slot);
+            let r = num(builder, *imm);
+            (cmp(builder, Op::Ge, l, r), false)
+        }
+        Step::JumpIfEqImm { slot, imm, .. } => {
+            let l = slot_load(builder, *slot);
+            let r = num(builder, *imm);
+            (cmp(builder, Op::StrictEq, l, r), false)
+        }
+        Step::JumpIfNeqImm { slot, imm, .. } => {
+            let l = slot_load(builder, *slot);
+            let r = num(builder, *imm);
+            (cmp(builder, Op::StrictEq, l, r), true)
+        }
+        Step::JumpIfRelLimit {
+            op, slot, limit, ..
+        } => {
+            let l = slot_load(builder, *slot);
+            let r = match limit {
+                RelLimit::Imm(i) => num(builder, *i),
+                RelLimit::Slot(s) => slot_load(builder, *s),
+                RelLimit::Global(name) => global(builder, *name),
+            };
+            (cmp(builder, binary_op(*op)?, l, r), false)
+        }
+        Step::JumpIfLtGlobalImm { name, imm, .. } => {
+            let l = global(builder, *name);
+            let r = num(builder, *imm);
+            (cmp(builder, Op::Lt, l, r), false)
+        }
+        Step::JumpIfLeGlobalImm { name, imm, .. } => {
+            let l = global(builder, *name);
+            let r = num(builder, *imm);
+            (cmp(builder, Op::Le, l, r), false)
+        }
+        Step::JumpIfGtGlobalImm { name, imm, .. } => {
+            let l = global(builder, *name);
+            let r = num(builder, *imm);
+            (cmp(builder, Op::Gt, l, r), false)
+        }
+        Step::JumpIfGeGlobalImm { name, imm, .. } => {
+            let l = global(builder, *name);
+            let r = num(builder, *imm);
+            (cmp(builder, Op::Ge, l, r), false)
+        }
+        other => return Err(Unsupported::Step(step_name(other))),
+    })
 }
 
 fn emit_binary(
@@ -886,6 +1058,47 @@ mod tests {
             func.block(2).term,
             Some(Term::Jump { target: 1, .. })
         ));
+    }
+
+    #[test]
+    fn lifts_a_fused_relational_test() {
+        // var i = 0; var s = 0; while (i < 10) { s = s + i; i = i + 1; } return s;
+        // The loop test is the fused `JumpIfLtImm` step.
+        let b = body(
+            vec![
+                Step::Push(Value::Number(0.0)),
+                Step::InitLocal { slot: 0 },
+                Step::Push(Value::Number(0.0)),
+                Step::InitLocal { slot: 1 },
+                Step::JumpIfLtImm {
+                    slot: 0,
+                    imm: 10.0,
+                    target: 13,
+                },
+                Step::LoadLocal { slot: 1 },
+                Step::LoadLocal { slot: 0 },
+                Step::Binary(BinaryOp::Add),
+                Step::StoreLocal { slot: 1 },
+                Step::LoadLocal { slot: 0 },
+                Step::BinaryImm {
+                    op: BinaryOp::Add,
+                    imm: 1.0,
+                },
+                Step::StoreLocal { slot: 0 },
+                Step::Jump(4),
+                Step::LoadLocal { slot: 1 },
+                Step::Return,
+            ],
+            2,
+        );
+        let func = lift(&b).expect("lifts");
+        // Some block ends in a `Branch` whose condition is the `i < 10` compare.
+        let has_test = (0..func.block_count() as u32).any(|bi| {
+            let block = func.block(bi);
+            matches!(block.term, Some(Term::Branch { .. }))
+                && block.insts.iter().any(|i| i.op == Op::Lt)
+        });
+        assert!(has_test, "the fused test lifted to a comparison + branch");
     }
 
     #[test]

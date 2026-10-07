@@ -467,11 +467,30 @@ new bitwise-loop e2e); `cargo clippy --workspace --all-targets -- -D warnings`
 clean; with `SLAG_OPT=1` test262 `language` 23,726 / 0 and `built-ins`
 23,820 / 0 / 1, both at baseline.
 
-**Queued (both need a slice, not a patch).** (a) The tier still cannot lift the
-fused `FastLoopHead` (+ `FastLoopBind`/`FastLoopStore` and the fused relational
-test), which is what `for`/`while` counting loops compile to — so the common loop
-never enters the tier, and LICM has no preheader on the `do`/`while` bodies it
-can lift. (b) The tier's member read still calls `Helper::GetMemberName`
+**Fused-test steps + unguarded numeric (2026-10-07).** The lift now accepts the
+fused loop/strict-equality test family as terminators — `JumpIf{Lt,Le,Gt,Ge}Imm`,
+the `…GlobalImm` siblings, `JumpIfRelLimit` and `JumpIf{Eq,Neq}Imm` — emitting the
+comparison plus a `Branch` (exactly `jump_if_rel_imm`/`jump_if_rel_limit`/
+`jump_if_rel_global`/`jump_if_strict_eq_imm`, TDZ check included). That alone lets
+a `for` loop with a literal bound and a non-`++` update (the *non-fused* path)
+enter the tier, where before the test step bailed it. In the same slice, the
+`narrow` pass now also marks a load of a numeric slot as `Type::Number`, and
+`opt_lower` emits a **bare f64 op** (no tag check, no slow block, no branch) when
+every operand is proven `Number`/`Int` — the shape the per-step path reaches with
+known-number provenance, so the narrowing pays off in the lowering, not just in
+CSE. Measured: the arithmetic `do`/`while` holds ~1.17x (no regression), and the
+new `for` loop is roughly parity/noisy — the per-step path is already good on that
+shape, so this slice is *reach*, and it hands those loops a real preheader block
+(the fused-test block) for a future LICM. Gates: `cargo test --workspace` green
+(302 jit tests, incl. a `for`-loop e2e that asserts the tier lowered it); `cargo
+clippy --workspace --all-targets -- -D warnings` clean; with `SLAG_OPT=1` test262
+`language` 23,726 / 0 and `built-ins` 23,820 / 0 / 1, both at baseline.
+
+**Queued (both need a slice, not a patch).** (a) The fused `FastLoopHead` itself
+(plus `FastLoopBind`/`FastLoopStore`) is still unlifted, and the *acc-path* form
+(`FastLoopHead { Counter }`) is additionally blocked by its `RunRegBody` body —
+a second front end for `LeafOp`s. `FastLoopHead { Global }` is refused by the
+per-step path too. The scalar replacer is deferred. (b) The tier's member read still calls `Helper::GetMemberName`
 unconditionally; inlining the member-value/map-shape probe would close the read
 regression, but the probe is ~300 lines of layout-coupled code, and copying it
 into `opt_lower` is exactly the private fork §6 warns against — it should be

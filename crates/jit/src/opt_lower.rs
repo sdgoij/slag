@@ -21,7 +21,7 @@ use syntax::ast::{BinaryOp, UnaryOp};
 use crate::Compiled;
 use crate::compiler::{Unsupported, assemble, helper_sig, jit_sig, platform_call_conv};
 use crate::helpers::{Helper, JitHelpers};
-use crate::opt::ir::{BlockId, Function as IrFunction, Imm, Inst, Op, Term, ValueId};
+use crate::opt::ir::{BlockId, Function as IrFunction, Imm, Inst, Op, Term, Type, ValueId};
 
 /// How many bodies the optimizing tier has lowered (test introspection).
 #[cfg(test)]
@@ -115,6 +115,7 @@ fn lower(
     }
 
     let mut values: Vec<Option<ClifValue>> = vec![None; ir.value_count() as usize];
+    let types = ir.value_types();
     for b in 0..ir.block_count() as BlockId {
         let block = ir.block(b);
         builder.switch_to_block(clif[b as usize]);
@@ -123,7 +124,7 @@ fn lower(
             values[*p as usize] = Some(params[i]);
         }
         for inst in &block.insts {
-            let result = lower_inst(&mut builder, inst, &abi, helpers, &values)?;
+            let result = lower_inst(&mut builder, inst, &abi, helpers, &values, types)?;
             if let Some(id) = inst.result {
                 values[id as usize] = Some(result);
             }
@@ -186,6 +187,7 @@ fn lower_inst(
     abi: &Abi,
     helpers: &JitHelpers,
     values: &[Option<ClifValue>],
+    types: &[Type],
 ) -> Result<ClifValue, Unsupported> {
     let arg = |i: usize| value_of(values, inst.args[i]);
     Ok(match inst.op {
@@ -245,14 +247,23 @@ fn lower_inst(
         | Op::Ge => {
             let disc = binary_op(inst.op).ok_or(Unsupported::Step("opt:binary"))?;
             let (lhs, rhs) = (arg(0)?, arg(1)?);
-            // Arithmetic and the ordering comparisons take the inline numeric
-            // fast path when both operands are Numbers (the common shape); the
-            // bitwise/shift ops take the inline integer path (a Number-guarded
-            // `ToInt32`); the rest still go straight to the helper.
-            if matches!(
+            let numeric = matches!(
                 inst.op,
                 Op::Add | Op::Sub | Op::Mul | Op::Div | Op::Lt | Op::Le | Op::Gt | Op::Ge
-            ) {
+            );
+            // With both operands proven Numbers (the narrowing pass), the
+            // arithmetic/comparison is a bare f64 op with no tag check, no slow
+            // block and no branch — the same shape the per-step path reaches
+            // with a known-number operand.
+            let known = numeric
+                && inst.args.iter().all(|a| {
+                    types
+                        .get(*a as usize)
+                        .is_some_and(|t| matches!(t, Type::Number | Type::Int))
+                });
+            if known {
+                emit_bare_numeric(builder, inst.op, lhs, rhs)
+            } else if numeric {
                 call_numeric_binary(builder, helpers, abi, inst.op, disc as i64, lhs, rhs)?
             } else if matches!(
                 inst.op,
@@ -472,6 +483,47 @@ fn emit_completion_store(
     builder.seal_block(store);
     builder.switch_to_block(skip);
     builder.seal_block(skip);
+}
+
+/// The bare f64 form of an arithmetic or ordering op whose operands are proven
+/// Numbers (the `narrow` pass): a canonical Number's bits bit-cast to its f64,
+/// so no tag check and no fallback are needed. A comparison yields a Boolean.
+fn emit_bare_numeric(
+    builder: &mut FunctionBuilder,
+    op: Op,
+    lhs: ClifValue,
+    rhs: ClifValue,
+) -> ClifValue {
+    let l = builder.ins().bitcast(types::F64, MemFlagsData::new(), lhs);
+    let r = builder.ins().bitcast(types::F64, MemFlagsData::new(), rhs);
+    match op {
+        Op::Lt | Op::Le | Op::Gt | Op::Ge => {
+            let cc = match op {
+                Op::Lt => FloatCC::LessThan,
+                Op::Le => FloatCC::LessThanOrEqual,
+                Op::Gt => FloatCC::GreaterThan,
+                _ => FloatCC::GreaterThanOrEqual,
+            };
+            let c = builder.ins().fcmp(cc, l, r);
+            let t = builder
+                .ins()
+                .iconst(types::I64, JsValue::Boolean(true).bits() as i64);
+            let f = builder
+                .ins()
+                .iconst(types::I64, JsValue::Boolean(false).bits() as i64);
+            builder.ins().select(c, t, f)
+        }
+        _ => {
+            let res = match op {
+                Op::Add => builder.ins().fadd(l, r),
+                Op::Sub => builder.ins().fsub(l, r),
+                Op::Mul => builder.ins().fmul(l, r),
+                _ => builder.ins().fdiv(l, r),
+            };
+            let bits = builder.ins().bitcast(types::I64, MemFlagsData::new(), res);
+            canon_double(builder, bits)
+        }
+    }
 }
 
 /// The inline numeric fast path for `+`/`-`/`*`/`/` and the ordering

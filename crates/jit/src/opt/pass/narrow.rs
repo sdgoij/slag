@@ -24,7 +24,7 @@ pub fn run(func: &mut Function) -> bool {
         let values = value_numerics(func, &slot_numeric);
         let next = slot_numerics(func, &values, slots);
         if next == slot_numeric {
-            return rewrite(func, &values);
+            return rewrite(func, &values, &slot_numeric);
         }
         slot_numeric = next;
     }
@@ -96,11 +96,22 @@ fn is_numeric_inst(inst: &Inst, values: &[bool], slot_numeric: &[bool]) -> bool 
     }
 }
 
-/// Widen the effects (and tighten the type) of the now-provably-numeric ops.
-fn rewrite(func: &mut Function, values: &[bool]) -> bool {
+/// Widen the effects (and tighten the type) of the now-provably-numeric ops, and
+/// mark a load of a numeric slot as a `Number` so the lowering can trust it.
+fn rewrite(func: &mut Function, values: &[bool], slot_numeric: &[bool]) -> bool {
     let mut changed = false;
     for b in 0..func.block_count() as u32 {
         for inst in &mut func.block_mut(b).insts {
+            if inst.op == Op::FrameLoad {
+                if let Imm::Slot(s) = inst.imm
+                    && slot_numeric.get(s as usize).copied().unwrap_or(false)
+                    && inst.ty != Type::Number
+                {
+                    inst.ty = Type::Number;
+                    changed = true;
+                }
+                continue;
+            }
             if !matches!(
                 inst.op,
                 Op::Add | Op::Sub | Op::Mul | Op::Div | Op::Mod | Op::Pow | Op::Neg | Op::ToNumber
