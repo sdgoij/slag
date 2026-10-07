@@ -560,6 +560,22 @@ out-of-range/fractional slow path); `cargo clippy --workspace --all-targets --
 -D warnings` clean; with the default (tier on) test262 `language` 23,726 / 0 and
 `built-ins` 23,820 / 0 / 1, both at baseline.
 
+**Resume fidelity + `LoadIdent` (2026-10-07).** `Op::Check` now lowers: a
+speculation guard whose `args[0]` is the condition, `args[1..]` the live operand
+stack, and `imm` the resume step, emitted as `brif(cond, cont, deopt)` with the
+deopt block mirroring the stack into the working region (`Abi::work`, the entry's
+second parameter) and returning `DISPATCH_DEOPT`. That is the per-activation exit
+the guarded, hoisted read needs. It required lifting `Step::LoadIdent` (a
+`BindingLoc::Env` global read) — every body the lift previously accepted was
+leaf-eligible and ran through the leaf lane, which has no deopt handling, so a
+non-leaf body is what runs through `run_jit_body`, where the resume works (see
+`.notes/tier-resume-fidelity.md`). The slice also fixed a latent nested-deopt bug:
+`run_jit_body`'s DEOPT arm shifted the operands to the stack bottom, which
+destroyed a nested certified call's carved frame. Gates: `cargo test --workspace`
+5683 passed / 0 failed (incl. a `load_ident` e2e and a deopt-resume e2e);
+`cargo clippy --workspace --all-targets -- -D warnings` clean; test262 `language`
+23,726 / 0, `built-ins` 23,820 / 0 / 1, `annexB` 1,086 / 0, all at baseline.
+
 ## 10. Open decisions
 
 1. **Feedback store location** — per body (`CompiledBody`) or per closure

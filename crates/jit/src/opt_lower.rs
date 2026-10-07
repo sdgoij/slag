@@ -15,7 +15,10 @@ use cranelift_codegen::ir::{
 use cranelift_codegen::isa::{CallConv, TargetIsa};
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
 use crux::Value as JsValue;
-use runtime::jit::{JitCallContext, VM_COMPLETION_IS_EMPTY_OFFSET, VM_COMPLETION_OFFSET};
+use runtime::jit::{
+    DISPATCH_DEOPT, JitCallContext, VM_COMPLETION_IS_EMPTY_OFFSET, VM_COMPLETION_OFFSET,
+    VM_IP_OFFSET,
+};
 use syntax::ast::{BinaryOp, UnaryOp};
 
 use crate::Compiled;
@@ -50,10 +53,14 @@ pub fn compile(
     Some(compiled)
 }
 
-/// The entry ABI a lowered op reads: the frame base, the `JitCallContext`
-/// pointer, and the shared helper signatures.
+/// The entry ABI a lowered op reads: the frame base, the working-region base,
+/// the `JitCallContext` pointer, and the shared helper signatures.
 struct Abi {
     frame: ClifValue,
+    /// The working-region base handed to the compiled body (the second
+    /// parameter of the entry signature). A guard mirrors the operand stack
+    /// here before it resumes the interpreter.
+    work: ClifValue,
     vm: ClifValue,
     sig_binary: SigRef,
     sig_unary: SigRef,
@@ -103,6 +110,7 @@ fn lower(
     let entry_params = builder.block_params(func_entry).to_vec();
     let abi = Abi {
         frame: entry_params[0],
+        work: entry_params[1],
         vm: entry_params[2],
         sig_binary: builder.import_signature(helper_sig(&[types::I64; 4], conv)),
         sig_unary: builder.import_signature(helper_sig(&[types::I64; 3], conv)),
@@ -311,7 +319,79 @@ fn lower_inst(
                 &[op, value],
             )?
         }
-        Op::Check => return Err(Unsupported::Step("opt:check")),
+        // A speculation guard. `args[0]` is the condition (exit when falsy),
+        // `args[1..]` the live operand stack (bottom to top), and `imm` the
+        // step to resume at. The deopt block mirrors the stack into the working
+        // region, points the context and `vm.ip` at the resume step, and
+        // returns `DISPATCH_DEOPT`; `run_jit_body` rebuilds `vm.stack` from the
+        // region and the interpreter re-executes the step (see
+        // `.notes/tier-resume-fidelity.md`). The continuation is a separate
+        // block, so a guard may sit mid-block with the CFG intact.
+        Op::Check => {
+            let Imm::Int(step) = inst.imm else {
+                return Err(Unsupported::Step("opt:check"));
+            };
+            let cond = arg(0)?;
+            let live = &inst.args[1..];
+            let truthy = if types.get(inst.args[0] as usize) == Some(&Type::Bool) {
+                builder.ins().icmp_imm_u(
+                    IntCC::NotEqual,
+                    cond,
+                    JsValue::Boolean(false).bits() as i64,
+                )
+            } else {
+                let t = call_helper(
+                    builder,
+                    helpers,
+                    abi,
+                    abi.sig_bool,
+                    Helper::ToBooleanSlow,
+                    &[cond],
+                )?;
+                builder.ins().icmp_imm_u(IntCC::NotEqual, t, 0)
+            };
+            let deopt = builder.create_block();
+            let cont = builder.create_block();
+            builder.ins().brif(truthy, cont, &[], deopt, &[]);
+            builder.switch_to_block(deopt);
+            for (i, v) in live.iter().enumerate() {
+                let value = value_of(values, *v)?;
+                builder.ins().store(
+                    MemFlagsData::new(),
+                    value,
+                    abi.work,
+                    Offset32::new((i * 8) as i32),
+                );
+            }
+            let top = builder.ins().iadd_imm_u(abi.work, (live.len() * 8) as i64);
+            builder.ins().store(
+                MemFlagsData::new(),
+                top,
+                abi.vm,
+                Offset32::new(std::mem::offset_of!(JitCallContext, suspend_sp) as i32),
+            );
+            let vm = builder.ins().load(
+                types::I64,
+                MemFlagsData::new(),
+                abi.vm,
+                Offset32::new(std::mem::offset_of!(JitCallContext, vm) as i32),
+            );
+            let ip = builder.ins().iconst(types::I64, step as i64);
+            builder.ins().store(
+                MemFlagsData::new(),
+                ip,
+                vm,
+                Offset32::new(VM_IP_OFFSET as i32),
+            );
+            let sentinel = builder.ins().iconst(types::I64, DISPATCH_DEOPT as i64);
+            builder.ins().return_(&[sentinel]);
+            builder.seal_block(deopt);
+            builder.switch_to_block(cont);
+            builder.seal_block(cont);
+            builder
+                .ins()
+                .iconst(types::I64, JsValue::Undefined.bits() as i64)
+        }
         // A TDZ guard: throw when the slot holds the uninitialized marker. The
         // helper sets the pending error and the body bails with `undefined`,
         // which the runtime surfaces as the `ReferenceError` (mirrors the
@@ -396,6 +476,23 @@ fn lower_inst(
         }
         // A lifted `LoadGlobal`: the same `get_global` helper as the per-step
         // global fast path's miss block.
+        // A `LoadIdent`: the same `load_ident` helper the per-step path uses on
+        // its slow path (the global-value cell fast path is a later slice), so an
+        // optimizing body and a per-step one mean the same thing at the boundary.
+        Op::IdentLoad => {
+            let Imm::Atom(atom) = &inst.imm else {
+                return Err(Unsupported::Step("opt:ident"));
+            };
+            let name = builder.ins().iconst(types::I64, *atom as i64);
+            call_helper(
+                builder,
+                helpers,
+                abi,
+                abi.sig_bool,
+                Helper::LoadIdent,
+                &[name],
+            )?
+        }
         Op::GlobalLoad => {
             let Imm::Atom(atom) = &inst.imm else {
                 return Err(Unsupported::Step("opt:global"));

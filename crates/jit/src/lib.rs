@@ -2160,6 +2160,76 @@ mod tests {
     }
 
     #[test]
+    fn opt_tier_global_ident_read_matches_the_interpreter() {
+        // `LoadIdent` (a global read from a function body, `BindingLoc::Env`)
+        // lifts to `Op::IdentLoad` and lowers through the `load_ident` helper.
+        // The body is non-leaf (`steps_are_leaf` excludes `LoadIdent`) and must
+        // still agree with the interpreter.
+        let source = "var g = 7; \
+                      function f(n) { var s = g; var i = 0; \
+                        do { s = s + i; i = i + 1; } while (i < n); \
+                        return s; } \
+                      var t = 0; \
+                      t += f(3); t += f(5); t += f(1); t += f(7); \
+                      t += f(2); t += f(9); t += f(4); t += f(6); \
+                      t;";
+        let interp = {
+            let mut agent = runtime::Agent::new();
+            agent.initialize_host_defined_realm().expect("realm");
+            agent.run_script(source).expect("interp runs")
+        };
+        let before = crate::opt_lower::OPT_COMPILED.load(Ordering::Relaxed);
+        let (value, compiled) = with_opt_jit_agent(|agent| agent.run_script(source).expect("runs"));
+        let lowered = crate::opt_lower::OPT_COMPILED.load(Ordering::Relaxed) - before;
+        assert_eq!(
+            value, interp,
+            "the optimizing tier must match the interpreter"
+        );
+        assert!(compiled >= 1, "{compiled} bodies compiled");
+        assert!(lowered >= 1, "the optimizing tier lowered {lowered} bodies");
+    }
+
+    #[test]
+    fn opt_tier_deopt_probe_resumes_the_interpreter() {
+        // The tier's resume-fidelity path: a forced `Op::Check` mirrors the live
+        // operand stack into the working region and returns `DISPATCH_DEOPT`;
+        // `run_jit_body` rebuilds `vm.stack` and the interpreter resumes at the
+        // step. The body reads a global, so it is non-leaf and runs through
+        // `run_jit_body` (the leaf lane has no `DISPATCH_DEOPT` handling). The
+        // value must match pure interpretation, the body must have been
+        // lowered, and the guard must have fired.
+        let source = "var g = 7; \
+                      function f(n) { var s = g; var i = 0; \
+                        do { s = s + i; i = i + 1; } while (i < n); \
+                        return s; } \
+                      var t = 0; \
+                      t += f(3); t += f(5); t += f(1); t += f(7); \
+                      t += f(2); t += f(9); t += f(4); t += f(6); \
+                      t;";
+        let interp = {
+            let mut agent = runtime::Agent::new();
+            agent.initialize_host_defined_realm().expect("realm");
+            agent.run_script(source).expect("interp runs")
+        };
+        let before = crate::opt_lower::OPT_COMPILED.load(Ordering::Relaxed);
+        let deopts_before = runtime::jit::JIT_DEOPT_COUNT.load(Ordering::Relaxed);
+        // Force the guard at the first non-leaf body step whose incoming stack
+        // has depth 1.
+        crate::opt::lift::OPT_PROBE_DEPTH.store(1, Ordering::Relaxed);
+        let (value, compiled) = with_opt_jit_agent(|agent| agent.run_script(source).expect("runs"));
+        crate::opt::lift::OPT_PROBE_DEPTH.store(0, Ordering::Relaxed);
+        let lowered = crate::opt_lower::OPT_COMPILED.load(Ordering::Relaxed) - before;
+        let deopts = runtime::jit::JIT_DEOPT_COUNT.load(Ordering::Relaxed) - deopts_before;
+        assert_eq!(
+            value, interp,
+            "the optimizing tier must match the interpreter"
+        );
+        assert!(compiled >= 1, "{compiled} bodies compiled");
+        assert!(lowered >= 1, "the optimizing tier lowered {lowered} bodies");
+        assert!(deopts >= 1, "the guard must have fired ({deopts} deopts)");
+    }
+
+    #[test]
     fn opt_tier_for_loop_matches_the_interpreter() {
         // A `for` loop with a literal bound and an `i = i + 1` update takes the
         // non-fused path, whose test is the fused `JumpIfLtImm` step the lift now

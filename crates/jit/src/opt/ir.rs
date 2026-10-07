@@ -225,6 +225,10 @@ pub enum Op {
     FrameStore,
     GlobalLoad,
     GlobalStore,
+    /// A global/outer identifier read through the environment chain
+    /// (`Step::LoadIdent`), lowered through the same `load_ident` helper the
+    /// per-step path uses on its slow path.
+    IdentLoad,
     MemberLoad,
     MemberStore,
     ElementLoad,
@@ -266,6 +270,7 @@ impl Op {
             Op::FrameStore => E::write(Heap::Slots),
             Op::GlobalLoad => E::read(Heap::Globals),
             Op::GlobalStore => E::write(Heap::Globals),
+            Op::IdentLoad => E::read(Heap::Globals),
             Op::MemberLoad => E::read(Heap::Slots).union(E::read(Heap::Elements)),
             Op::MemberStore => E::write(Heap::Slots).union(E::write(Heap::Elements)),
             Op::ElementLoad => E::read(Heap::Elements),

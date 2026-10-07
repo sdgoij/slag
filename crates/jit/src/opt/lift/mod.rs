@@ -53,6 +53,15 @@ pub enum Unsupported {
     Invalid,
 }
 
+/// A diagnostic guard depth (tests only). When non-zero, [`lift`] emits a
+/// constant-false `Op::Check` at the first step whose incoming operand stack has
+/// this depth, so the body deopts there and the interpreter resumes. It
+/// exercises the tier's resume fidelity (`.notes/tier-resume-fidelity.md`);
+/// zero (the default) is off and a normal run never sets it. It is ignored for a
+/// leaf-eligible body: the leaf lane has no `DISPATCH_DEOPT` handling.
+pub(crate) static OPT_PROBE_DEPTH: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
 /// Lift a certified body into the SSA IR (straight line and control flow,
 /// including loops).
 pub fn lift(body: &CompiledBody) -> Result<Function, Unsupported> {
@@ -63,6 +72,17 @@ pub fn lift(body: &CompiledBody) -> Result<Function, Unsupported> {
     if n == 0 {
         return Err(Unsupported::NoReturn);
     }
+    // Resume (a guard deopting) only works on the `run_jit_body` entry; a leaf
+    // body runs through `run_jit_leaf`, which does not handle `DISPATCH_DEOPT`.
+    let probe_depth = if body.leaf {
+        None
+    } else {
+        match OPT_PROBE_DEPTH.load(std::sync::atomic::Ordering::Relaxed) {
+            0 => None,
+            d => Some(d),
+        }
+    };
+    let mut probed = false;
 
     // A block starts at 0, at every jump target (forward or a back edge), and
     // after every terminator.
@@ -123,7 +143,11 @@ pub fn lift(body: &CompiledBody) -> Result<Function, Unsupported> {
     for bi in 0..nb {
         let mut stack: Vec<ValueId> = builder.func().block(bi as BlockId).params.clone();
         let body_end = terms[bi].unwrap_or(ends[bi]);
-        for step in &steps[block_starts[bi]..body_end] {
+        for (off, step) in steps[block_starts[bi]..body_end].iter().enumerate() {
+            if !probed && probe_depth == Some(stack.len()) {
+                emit_opt_probe(&mut builder, bi as BlockId, &stack, block_starts[bi] + off);
+                probed = true;
+            }
             emit_step(&mut builder, bi as BlockId, &mut stack, tdz, step)?;
         }
         term_rec[bi] = Some(match terms[bi] {
@@ -271,7 +295,11 @@ fn stack_depths(
 /// names the step rather than a spurious depth mismatch.
 fn stack_delta(step: &Step) -> Result<i32, Unsupported> {
     Ok(match step {
-        Step::Push(_) | Step::Dup | Step::LoadLocal { .. } | Step::LoadGlobal { .. } => 1,
+        Step::Push(_)
+        | Step::Dup
+        | Step::LoadLocal { .. }
+        | Step::LoadGlobal { .. }
+        | Step::LoadIdent { .. } => 1,
         Step::Pop
         | Step::StoreLocal { .. }
         | Step::InitLocal { .. }
@@ -392,6 +420,32 @@ fn jump_target(step: &Step) -> Option<usize> {
 }
 
 /// Lift one `Step` into IR instructions.
+/// Emit the diagnostic guard: an `Op::Check` carrying the live operand stack
+/// (bottom to top) and the step to resume at. The condition is constant
+/// **false** — the guard exits when its condition is falsy, so this forces the
+/// deopt — and a constant condition keeps both arms of the guard structurally
+/// reachable, so the graph still verifies.
+fn emit_opt_probe(builder: &mut Builder<'_>, block: BlockId, stack: &[ValueId], index: usize) {
+    let cond = builder.emit(
+        block,
+        Op::Const,
+        &[],
+        Type::Bool,
+        Effects::pure(),
+        Imm::Bool(false),
+    );
+    let mut args = Vec::with_capacity(stack.len() + 1);
+    args.push(cond);
+    args.extend_from_slice(stack);
+    builder.emit_void(
+        block,
+        Op::Check,
+        &args,
+        Effects::pure(),
+        Imm::Int(index as i32),
+    );
+}
+
 fn emit_step(
     builder: &mut Builder,
     block: BlockId,
@@ -412,6 +466,23 @@ fn emit_step(
         Step::Dup => {
             let top = *stack.last().ok_or(Unsupported::Stack)?;
             stack.push(top);
+        }
+        // A read of a name that resolves through the environment chain (a
+        // global read from a function body, `BindingLoc::Env`): an opaque effect
+        // like `LoadGlobal`, lowered through the same `load_ident` helper the
+        // per-step path uses on its slow path. It also makes the body **non-leaf**
+        // (`steps_are_leaf` excludes `LoadIdent`), so it runs through
+        // `run_jit_body` — the entry where a guard can resume.
+        Step::LoadIdent { name } => {
+            let v = builder.emit(
+                block,
+                Op::IdentLoad,
+                &[],
+                Type::Unknown,
+                Effects::call(),
+                Imm::Atom(*name),
+            );
+            stack.push(v);
         }
         Step::LoadLocal { slot } => {
             // A lexical slot carries a TDZ check the interpreter runs before

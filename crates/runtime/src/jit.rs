@@ -6828,8 +6828,13 @@ pub(crate) fn run_jit_body(
         // guard was, and it re-executes that step from scratch.
         let base = vm.stack.as_ptr() as usize + work_base * std::mem::size_of::<Value>();
         let depth = (ctx.suspend_sp as usize).saturating_sub(base) / std::mem::size_of::<Value>();
-        vm.stack.copy_within(work_base..work_base + depth, 0);
-        vm.stack.truncate(depth);
+        // The machine code mirrored the live operands at `work_base`, right
+        // above the frame segment a nested certified call carved there. Drop the
+        // slack above and leave the frame in place — `leaf_frame_base` addresses
+        // it and `vm.start` re-runs the body through the interpreter. Shifting
+        // the region to the stack bottom (the suspend shape) would destroy that
+        // frame.
+        vm.stack.truncate(work_base + depth);
         JIT_DEOPT_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if JIT_DEOPT_TRACE.load(std::sync::atomic::Ordering::Relaxed) {
             eprintln!("jit-deopt step={} depth={}", vm.ip, depth);
