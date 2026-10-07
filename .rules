@@ -73,7 +73,7 @@ draft rule is growing past a sentence or two, that is the signal it is a skill
 wearing the wrong name.
 
 ## After any agentic session
-If you discover a non-obvious pattern that would help future sessions, include a **"Suggested .rules additions"** heading in your PR description with the proposed text. Do **not** edit `.rules` inline during normal feature/fix work. Reviewers decide what gets merged.
+If you discover a **trap a future code change must avoid**, include a **"Suggested .rules additions"** heading in your PR description with the proposed text. Do **not** edit `.rules` inline during normal feature/fix work. Reviewers decide what gets merged. A pattern that is a procedure, a measurement, or an explanation of a mechanism is **not** a `.rules` suggestion — write the skill instead (see "What NOT to put in `.rules`").
 
 ## High bar for new rules
 Editing or clarifying existing rules is always welcome. New rules must meet **all three** criteria:
@@ -84,7 +84,25 @@ Editing or clarifying existing rules is always welcome. New rules must meet **al
 Rules that apply to a single crate belong in that crate's own `.rules` file, not the repo root.
 
 ## What NOT to put in `.rules`
-Avoid architectural descriptions of a crate (module layout, data flow, key types). These go stale fast and the agent can gather them by reading the code. Rules should be **traps to avoid**, not **maps to follow**.
+- **Documentation.** `.rules` is not a place for explanations, subsystem
+  descriptions, procedures, or how-to prose — those belong in a skill under
+  `.agents/skills/` (or the doc that owns the area). A `.rules` entry is one
+  actionable line a code change must avoid or follow; if what you are writing
+  needs a paragraph, it is documentation, not a rule.
+- **Architectural descriptions of a crate** (module layout, data flow, key
+  types). These go stale fast and the agent can gather them by reading the
+  code. Rules should be **traps to avoid**, not **maps to follow**.
+
+**A lesson about *how to work* is not a rule — it is a skill.** This file is
+for what a contributor writing code must do differently: traps in the code,
+the build, or the workflow, each an actionable line. A *procedure* — how to
+measure a change, how to diagnose a subsystem, anything whose value is in its
+steps and measurements — belongs in the skill that owns that area, where it
+can be loaded when relevant; this file is read by every session, so it stays
+high-signal. Reach for the skill first: a "Suggested `.rules` additions" note
+in a PR is for a trap a code change must avoid, not for methodology. A
+measured negative result ("X does not pay") is a skill or an area doc too,
+never a rule.
 
 ## No drive-by additions
 Rules emerge from validated patterns, not one-off observations. The workflow is:
