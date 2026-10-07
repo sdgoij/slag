@@ -434,3 +434,24 @@ not machinery) and `strings` (28.69).
   `language --gc-stress` 23,715 / 0 fail / 0 crash (only the documented
   `--gc-stress` timeout hangs) plus `built-ins *Array* --gc-stress` 0 fail /
   0 crash (`built-ins *Array*` without stress is 5,714 / 0 / 0).**
+- **2026-10-07 — the allocation-SIZE levers are SPEED-NEUTRAL (measured, not
+  landed).** Boxed `property_index` (`RefCell<Option<HashMap>>` 56 B ->
+  `RefCell<Option<Box<HashMap>>>` 16 B): the `JsObject` payload is **408 ->
+  368 B** and the 16-byte-rounded arena box is
+  **432 -> 384** (~11% less per object). **Measured** (min of 5, `slag-if8.exe`
+  vs the boxed binary): `{a:i}` 1.010x, `{a:i..f:i}` 1.008x, a 24-property
+  literal 0.987x, `[]` 1.003x, `new Array(3)` 1.004x — every row within noise.
+  The mechanism is now clear: the arena's granularity is 16 B and the
+  free-list reuses swept slots, so a steady-state allocation is a size-class
+  pop, not `0.125 ns/byte` of payload; and `RefCell::new(None)` for
+  `Option<HashMap>` optimizes to an 8-byte discriminant write (the map fields
+  are unread when `None`), so a smaller field does not shrink the init writes
+  either. `INLINE_FIELDS` 16 -> 8 paid (2-7%) precisely because `in_fields` is
+  64 B of *real* hot-path writes on every object, which this lever is not.
+  Clippy also rejects `Box<HashMap>` (`box_collection`). **Conclusion: the
+  remaining size levers (`private_elements` 32 -> 16, `Property` 40 -> 24) are
+  deprioritized for speed by the same argument.** The `Property` shrink is the
+  one worth revisiting, but only against a READ-heavy row (it shrinks every
+  property-vector entry and `SmallProps`, so the win would be cache density on
+  reads, not the allocation) — measure `objects/many_objects_read` and
+  `opcost/prop_read`, do not assume.
