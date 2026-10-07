@@ -136,6 +136,47 @@ corpus `mean-jitGap` (noisy on this machine — use the interleaved micro-bench)
   resume point; the op must carry it (`imm`), because the lowering's deopt block
   sets `vm.ip` to it and the interpreter re-executes from there.
 
+## G2b: the hoisted read is a NEGATIVE result (2026-10-07)
+
+The pair landed (`Op::MemberCellLoad` + `Op::MemberGuard`, the guard comparing
+`cell.value` to the speculative load so an in-place write fails it) and LICM
+hoisted the load. On `read_loop` (`s += o.x`, 5M iters, min-of-6 interleaved) the
+result is the opposite of a win:
+
+| config | per-step | tier | ratio |
+|---|---|---|---|
+| hoist off | 40.3 ms | 38.4 ms | 0.954x |
+| hoist on | 35.6 ms | 63.8 ms | **1.79x slower** |
+| hoist on | 34.5 ms | 62.4 ms | **1.81x slower** |
+
+The tier is ~parity **without** the hoist and ~1.8x slower **with** it — a ~1.9x
+swing from moving one load out of the loop, which the saved work cannot explain.
+The regression is reproducible across rebuilds; the cause is not isolated (a
+codegen artifact of the hoisted value being live across the loop, or of the
+preheader's internal `brif` diamond, is the leading guess — isolating it wants
+the emitted CLIF/asm, not built out here). The guarded read is therefore
+**reverted**: neither the pair (parity) nor the hoist (a regression) pays on the
+one row it targets. The tier's ~parity *without* the hoist is the useful datum:
+the tier is competitive on a plain read loop once the read is inline, and the
+N-reads-to-1 hoist — the plan's supposed lever — does not hold up.
+
+## A real LICM bug, found en route (fixed)
+
+Chasing the hoist exposed that `pass/licm.rs`'s `natural_loop` **never added the
+back-edge source block** — it added only the source's predecessors. So for any
+loop whose back edge's source is a separate block (`entry -> pre -> header ->
+body -> header`, an ordinary `for`/`while`), `body` was not in the loop, the
+header's outside predecessors were `{preheader, body}` (no unique preheader), and
+**nothing hoisted at all**. Only self-loops (a back edge to the header itself)
+were ever optimized. The fix adds the source and walks up through the
+header-dominated predecessors; pinned by `hoists_from_a_non_self_loop`.
+
+Measured (min-of-5 interleaved, `SLAG_OPT` 0 vs 1): `licm_loop` **0.879x ->
+0.788x** (1.14x -> 1.27x), `for` 0.894x, `arith` 0.744x. Gates: clippy clean;
+`cargo test -p jit` 307 / 0; test262 `language` 23,726 / 0, `built-ins`
+23,820 / 0 / 1, `annexB` 1,086 / 0 — all at baseline (one `built-ins` run showed
+3 hangs under build load and 0 on a quiet re-run: the documented wobble).
+
 ## Open decisions
 
 1. **The decision gate (load-bearing).** Guard every member read and rely on the
