@@ -58,6 +58,7 @@ struct Abi {
     sig_binary: SigRef,
     sig_unary: SigRef,
     sig_bool: SigRef,
+    sig_tdz: SigRef,
 }
 
 fn lower(
@@ -106,6 +107,7 @@ fn lower(
         sig_binary: builder.import_signature(helper_sig(&[types::I64; 4], conv)),
         sig_unary: builder.import_signature(helper_sig(&[types::I64; 3], conv)),
         sig_bool: builder.import_signature(helper_sig(&[types::I64; 2], conv)),
+        sig_tdz: builder.import_signature(helper_sig(&[types::I64; 1], conv)),
     };
     let undefined = JsValue::Undefined.bits() as i64;
     if loops_to_entry {
@@ -265,6 +267,46 @@ fn lower_inst(
                 Helper::UnarySlow,
                 &[op, value],
             )?
+        }
+        Op::Check => return Err(Unsupported::Step("opt:check")),
+        // A TDZ guard: throw when the slot holds the uninitialized marker. The
+        // helper sets the pending error and the body bails with `undefined`,
+        // which the runtime surfaces as the `ReferenceError` (mirrors the
+        // per-step `emit_tdz_check`).
+        Op::TdzCheck => {
+            let Imm::Slot(slot) = &inst.imm else {
+                return Err(Unsupported::Step("opt:tdz"));
+            };
+            let bits = builder.ins().load(
+                types::I64,
+                MemFlagsData::new(),
+                abi.frame,
+                Offset32::new((*slot as i32) * 8),
+            );
+            let is_uninit = builder.ins().icmp_imm_u(
+                IntCC::Equal,
+                bits,
+                crux::value::UNINITIALIZED_BITS as i64,
+            );
+            let throw = builder.create_block();
+            let cont = builder.create_block();
+            builder.ins().brif(is_uninit, throw, &[], cont, &[]);
+            builder.switch_to_block(throw);
+            let f = helpers
+                .get(Helper::TdzError)
+                .ok_or(Unsupported::Helper(Helper::TdzError.name()))?;
+            let callee = builder.ins().iconst(types::I64, f as i64);
+            builder.ins().call_indirect(abi.sig_tdz, callee, &[abi.vm]);
+            let undef = builder
+                .ins()
+                .iconst(types::I64, JsValue::Undefined.bits() as i64);
+            builder.ins().return_(&[undef]);
+            builder.seal_block(throw);
+            builder.switch_to_block(cont);
+            builder.seal_block(cont);
+            builder
+                .ins()
+                .iconst(types::I64, JsValue::Undefined.bits() as i64)
         }
         Op::CompletionReset => {
             let undefined = builder

@@ -237,6 +237,9 @@ pub enum Op {
     /// A speculation guard. When it fails the body retires and the
     /// interpreter resumes at the current step.
     Check,
+    /// Throw a TDZ `ReferenceError` (spec 6.2.1.6.6) when the frame slot holds
+    /// the uninitialized marker. Reads the slot; has no result.
+    TdzCheck,
     /// Write the statement-completion register to `undefined` and mark it
     /// empty (spec 6.2.2.3).
     CompletionReset,
@@ -258,6 +261,7 @@ impl Op {
         use Effects as E;
         match self {
             Op::Const | Op::StrictEq | Op::ToBoolean | Op::Not | Op::Check => E::pure(),
+            Op::TdzCheck => E::read(Heap::Slots),
             Op::FrameLoad => E::read(Heap::Slots),
             Op::FrameStore => E::write(Heap::Slots),
             Op::GlobalLoad => E::read(Heap::Globals),

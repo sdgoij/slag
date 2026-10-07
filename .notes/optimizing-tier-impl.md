@@ -394,6 +394,23 @@ a property-reading body that asserts the tier lowered it); clippy clean; with
 `SLAG_OPT=1` test262 `language` 23,726 / 0 and `built-ins` 23,820 / 0 / 1, both at
 baseline.
 
+**TDZ status (2026-10-07): lexical slots lifted.** The whole-body
+`TdzSlot` refusal is gone. The lift threads `scope.tdz_store` into `emit_step`
+and, for a lexical slot, emits an `Op::TdzCheck` (a `Slots` read) before a
+`LoadLocal`/`StoreLocal`/`FusedStoreLocal` — `InitLocal` (the initializing
+store) needs none. `opt_lower` lowers a `TdzCheck` by loading the slot,
+comparing it to `UNINITIALIZED_BITS`, and on a match calling `Helper::TdzError`
+(a new `sig_tdz` = ctx-only, mirroring the per-step `emit_tdz_check`): the
+helper sets the pending error and the body bails with `undefined`, which the
+runtime surfaces as the `ReferenceError`. With reads and TDZ both lifted, an
+ordinary `let`-using, property-reading function now enters the tier. Gates:
+`cargo test --workspace` green (292 jit tests; a `let`-body e2e that asserts the
+tier lowered a body it previously refused whole); `cargo clippy --workspace
+--all-targets -- -D warnings` clean; with `SLAG_OPT=1` test262 `language`
+23,726 / 0 and `built-ins` 23,820 / 0 / 1, both at baseline — the TDZ-throwing
+fixtures included. Next: `GetMemberComputed`, then the first transform that
+consumes the widened IR.
+
 ## 10. Open decisions
 
 1. **Feedback store location** — per body (`CompiledBody`) or per closure

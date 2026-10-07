@@ -1,21 +1,23 @@
 //! The lift: the interpreter's `Step` stream into the SSA IR.
 //!
 //! Increments I1 (straight line) and I2 (control flow): `Jump`,
-//! `JumpIfFalse`/`JumpIfTrue`, joins and loops, plus the dominant reads
-//! (`GetMemberName`, `LoadGlobal`). A step outside the subset, a body that is
-//! not certified, or a TDZ-checked slot returns [`Unsupported`] and keeps the
-//! current per-step lowering, so nothing about the engine's behavior changes
-//! unless a later increment wires the IR in.
+//! `JumpIfFalse`/`JumpIfTrue`, joins and loops, the dominant reads
+//! (`GetMemberName`, `LoadGlobal`), and the `let`/`const` TDZ checks. A step
+//! outside the subset or a body that is not certified returns [`Unsupported`]
+//! and keeps the current per-step lowering, so nothing about the engine's
+//! behavior changes unless a later increment wires the IR in.
 //!
 //! The lift is exact by construction: an accepted step means exactly what the
 //! interpreter's handler for that step means. It refuses rather than
-//! approximates:
+//! approximates.
 //!
-//! - **TDZ slots.** `Step::LoadLocal`/`StoreLocal` carry an
-//!   `is_uninitialized` check the IR does not model (it will become an explicit
-//!   op). A body whose scope has no TDZ slot — parameters and `var`s only — has
-//!   no slot that can be uninitialized, so the check can never fire and the
-//!   check-free `FrameLoad`/`FrameStore` are exact.
+//! - **TDZ slots.** A `let`/`const` slot (`scope.tdz_store`) carries an
+//!   `is_uninitialized` check the interpreter runs before a load or store (a
+//!   read or assignment before initialization is a `ReferenceError`). The IR
+//!   models it as an explicit `Op::TdzCheck` emitted before the `FrameLoad`/
+//!   `FrameStore`; `InitLocal` (the initializing store) needs none, and a body
+//!   whose scope has no lexical slot — parameters and `var`s only — emits no
+//!   check at all.
 //!
 //! Frame slots stay in memory (the IR's `FrameLoad`/`FrameStore` read and write
 //! `Heap::Slots`); only the operand stack is SSA, so a join takes its stack as
@@ -35,8 +37,6 @@ pub enum Unsupported {
     /// The body is not certified (`CompiledBody::scope` is `None`): it has no
     /// frame slots to lift against.
     Uncertified,
-    /// The scope has a TDZ-checked slot (see the module note).
-    TdzSlot,
     /// A step outside the subset.
     Step(&'static str),
     /// The body reached its end without a `Return`, so the entry block has no
@@ -57,9 +57,7 @@ pub enum Unsupported {
 /// including loops).
 pub fn lift(body: &CompiledBody) -> Result<Function, Unsupported> {
     let scope = body.scope.as_ref().ok_or(Unsupported::Uncertified)?;
-    if scope.tdz_store.iter().any(|&tdz| tdz) {
-        return Err(Unsupported::TdzSlot);
-    }
+    let tdz: &[bool] = &scope.tdz_store;
     let steps = &body.steps;
     let n = steps.len();
     if n == 0 {
@@ -126,7 +124,7 @@ pub fn lift(body: &CompiledBody) -> Result<Function, Unsupported> {
         let mut stack: Vec<ValueId> = builder.func().block(bi as BlockId).params.clone();
         let body_end = terms[bi].unwrap_or(ends[bi]);
         for step in &steps[block_starts[bi]..body_end] {
-            emit_step(&mut builder, bi as BlockId, &mut stack, step)?;
+            emit_step(&mut builder, bi as BlockId, &mut stack, tdz, step)?;
         }
         term_rec[bi] = Some(match terms[bi] {
             Some(ti) => match &steps[ti] {
@@ -340,12 +338,15 @@ fn jump_target(step: &Step) -> Option<usize> {
     }
 }
 
+/// Lift one `Step` into IR instructions.
 fn emit_step(
     builder: &mut Builder,
     block: BlockId,
     stack: &mut Vec<ValueId>,
+    tdz: &[bool],
     step: &Step,
 ) -> Result<(), Unsupported> {
+    let is_tdz = |slot: usize| tdz.get(slot).copied().unwrap_or(false);
     match step {
         Step::Push(value) => {
             let (imm, ty) = constant(value)?;
@@ -360,6 +361,12 @@ fn emit_step(
             stack.push(top);
         }
         Step::LoadLocal { slot } => {
+            // A lexical slot carries a TDZ check the interpreter runs before
+            // the read; mirror it (`let`/`const` slots only — params and
+            // `var`s are never the uninitialized marker).
+            if is_tdz(*slot) {
+                emit_tdz_check(builder, block, *slot);
+            }
             let v = builder.emit(
                 block,
                 Op::FrameLoad,
@@ -397,7 +404,24 @@ fn emit_step(
             );
             stack.push(v);
         }
-        Step::StoreLocal { slot } | Step::InitLocal { slot } => {
+        Step::StoreLocal { slot } => {
+            let value = stack.pop().ok_or(Unsupported::Stack)?;
+            // A lexical store checks the *current* binding for the
+            // uninitialized marker first (assignment before initialization is
+            // a ReferenceError).
+            if is_tdz(*slot) {
+                emit_tdz_check(builder, block, *slot);
+            }
+            builder.emit_void(
+                block,
+                Op::FrameStore,
+                &[value],
+                Effects::write(Heap::Slots),
+                Imm::Slot(*slot as u32),
+            );
+        }
+        // `let x = v` initializes the binding: no TDZ check.
+        Step::InitLocal { slot } => {
             let value = stack.pop().ok_or(Unsupported::Stack)?;
             builder.emit_void(
                 block,
@@ -408,9 +432,13 @@ fn emit_step(
             );
         }
         Step::FusedStoreLocal { slot } => {
-            // A statement-position assignment: store, then set the completion
-            // register to the stored value (spec 6.2.2.4).
+            // A statement-position assignment: check (when lexical), store,
+            // then set the completion register to the stored value (spec
+            // 6.2.2.4).
             let value = stack.pop().ok_or(Unsupported::Stack)?;
+            if is_tdz(*slot) {
+                emit_tdz_check(builder, block, *slot);
+            }
             builder.emit_void(
                 block,
                 Op::FrameStore,
@@ -485,6 +513,18 @@ fn emit_step(
         other => return Err(Unsupported::Step(step_name(other))),
     }
     Ok(())
+}
+
+/// A TDZ guard on `slot`: throw a `ReferenceError` when the slot still holds
+/// the uninitialized marker. Mirrors the per-step lowerer's `emit_tdz_check`.
+fn emit_tdz_check(builder: &mut Builder, block: BlockId, slot: usize) {
+    builder.emit_void(
+        block,
+        Op::TdzCheck,
+        &[],
+        Effects::read(Heap::Slots),
+        Imm::Slot(slot as u32),
+    );
 }
 
 fn emit_binary(
@@ -766,13 +806,29 @@ mod tests {
     }
 
     #[test]
-    fn a_tdz_slot_is_unsupported() {
-        let mut b = body(vec![Step::Push(Value::Number(1.0)), Step::Return], 1);
+    fn a_lexical_slot_gets_a_tdz_check() {
+        // A `let` slot is TDZ-checked on load and store; `InitLocal`
+        // (the initializing store) is not.
+        let mut b = body(
+            vec![
+                Step::Push(Value::Number(1.0)),
+                Step::InitLocal { slot: 0 },
+                Step::LoadLocal { slot: 0 },
+                Step::Return,
+            ],
+            1,
+        );
         b.scope = Some(ScopeInfo {
             tdz_store: vec![true],
             ..scope(1)
         });
-        assert_eq!(lift(&b).unwrap_err(), Unsupported::TdzSlot);
+        let func = lift(&b).expect("lifts now");
+        let insts = &func.block(func.entry()).insts;
+        // Push, the InitLocal store (no check), then a TdzCheck before the load.
+        assert_eq!(insts[0].op, Op::Const);
+        assert_eq!(insts[1].op, Op::FrameStore);
+        assert_eq!(insts[2].op, Op::TdzCheck);
+        assert_eq!(insts[3].op, Op::FrameLoad);
     }
 
     #[test]
