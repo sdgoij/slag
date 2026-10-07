@@ -83,7 +83,9 @@ impl JitEngine {
     /// Build a native ISA (host triple + `opt_level=speed`). The optimizing
     /// tier is enabled by `SLAG_OPT`.
     pub fn new() -> Result<Self, String> {
-        Self::with_opt(std::env::var("SLAG_OPT").map(|v| v != "0").unwrap_or(false))
+        // The optimizing tier is on by default; `SLAG_OPT=0` disables it (a body
+        // the lift refuses keeps the per-step path either way).
+        Self::with_opt(std::env::var("SLAG_OPT").map(|v| v != "0").unwrap_or(true))
     }
 
     /// Build an engine with the optimizing-tier lowering explicitly on or off.

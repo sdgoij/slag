@@ -828,7 +828,7 @@ mod tests {
 
     #[test]
     fn compile_and_run_binary_add() {
-        let engine = JitEngine::new().expect("native isa");
+        let engine = JitEngine::with_opt(false).expect("native isa");
         let body = make_body(
             vec![
                 Step::Push(Value::Number(1.0)),
@@ -849,7 +849,7 @@ mod tests {
         // accumulator path — the exact certified shape the compiler emits:
         // FastLoopBind, the fused initial test, the step-path body (PushAcc),
         // the FastLoopHead back edge, and the counter store.
-        let engine = JitEngine::new().expect("native isa");
+        let engine = JitEngine::with_opt(false).expect("native isa");
         let body = make_body(
             vec![
                 Step::ResetCompletion,
@@ -902,7 +902,7 @@ mod tests {
         // ACCUMULATOR, not the loop counter; the counter push is
         // `Step::PushAcc`, which a register body reads via `LoadCounter`).
         // Expected 3; pushing the counter (seeded 0) would return 2.
-        let engine = JitEngine::new().expect("native isa");
+        let engine = JitEngine::with_opt(false).expect("native isa");
         let body = make_body(
             vec![Step::RunRegBody {
                 ops: vec![
@@ -926,7 +926,7 @@ mod tests {
     fn compile_and_run_register_loop_body() {
         // The register-lowered body: `n = n + 1` (LoadReg + BinImmLocal +
         // StoreReg) inside the counter loop, i.e. a `RunRegBody` body.
-        let engine = JitEngine::new().expect("native isa");
+        let engine = JitEngine::with_opt(false).expect("native isa");
         let body = make_body(
             vec![
                 Step::ResetCompletion,
@@ -987,7 +987,7 @@ mod tests {
     fn compile_and_run_control_flow() {
         // `if (true) { 42 } else { 0 }` — the truthiness inline path (a
         // Boolean tag) plus the forward branch.
-        let engine = JitEngine::new().expect("native isa");
+        let engine = JitEngine::with_opt(false).expect("native isa");
         let body = make_body(
             vec![
                 Step::Push(Value::Boolean(true)),
@@ -1021,7 +1021,7 @@ mod tests {
     fn slow_binary_uses_the_helper() {
         // `BinaryOp::In` is not in the inline set — the whole op routes
         // through `binary_slow`, whose test double returns 42.
-        let engine = JitEngine::new().expect("native isa");
+        let engine = JitEngine::with_opt(false).expect("native isa");
         let body = make_body(
             vec![
                 Step::Push(Value::Number(1.0)),
@@ -1039,7 +1039,7 @@ mod tests {
     fn slow_unary_uses_the_helper() {
         // The coercing kinds (`+x`, `-x`, `~x`) route through `unary_slow`,
         // whose test double returns -42.
-        let engine = JitEngine::new().expect("native isa");
+        let engine = JitEngine::with_opt(false).expect("native isa");
         for op in [
             syntax::ast::UnaryOp::Plus,
             syntax::ast::UnaryOp::Minus,
@@ -1060,7 +1060,7 @@ mod tests {
 
     #[test]
     fn coercing_unary_bails_without_the_helper() {
-        let engine = JitEngine::new().expect("native isa");
+        let engine = JitEngine::with_opt(false).expect("native isa");
         let body = make_body(
             vec![
                 Step::Push(Value::Number(1.0)),
@@ -1078,7 +1078,7 @@ mod tests {
         // covered by `emit_truthiness`'s inline path (a Number or one of the
         // falsy/truthy tags), so only the Boolean tags and the bare frame
         // move — a heap operand would take the `to_boolean_slow` double.
-        let engine = JitEngine::new().expect("native isa");
+        let engine = JitEngine::with_opt(false).expect("native isa");
         for (value, expected) in [
             (Value::Undefined, true),
             (Value::Null, true),
@@ -1107,7 +1107,7 @@ mod tests {
 
     #[test]
     fn missing_helper_bails() {
-        let engine = JitEngine::new().expect("native isa");
+        let engine = JitEngine::with_opt(false).expect("native isa");
         // `Binary` needs `binary_slow` (a string operand is possible); with
         // no helpers the compile must bail to the interpreter.
         let body = make_body(
@@ -1124,7 +1124,7 @@ mod tests {
 
     #[test]
     fn unsupported_step_bails() {
-        let engine = JitEngine::new().expect("native isa");
+        let engine = JitEngine::with_opt(false).expect("native isa");
         let body = make_body(
             vec![
                 Step::Push(Value::Number(1.0)),
@@ -1142,7 +1142,7 @@ mod tests {
         // longer bails — each lowers to a step-index helper call. `NewTarget`
         // needs no payload (the step-index helpers are exercised by the
         // installed e2e tests against the real runtime table).
-        let engine = JitEngine::new().expect("native isa");
+        let engine = JitEngine::with_opt(false).expect("native isa");
         let body = make_body(vec![Step::NewTarget, Step::Return], 0);
         let compiled = engine.compile(&body, &helpers_all()).expect("lowers");
         assert_ne!(compiled.info.entry, 0);
@@ -1152,7 +1152,7 @@ mod tests {
     fn tail_call_lowers_and_returns_the_helper_result() {
         // Cut 45: a `TailCallFast` terminates the body with the helper's
         // result (52 from the test double) — no fall-through, no stack leak.
-        let engine = JitEngine::new().expect("native isa");
+        let engine = JitEngine::with_opt(false).expect("native isa");
         let body = make_body(
             vec![
                 Step::Push(Value::Undefined),
@@ -1177,7 +1177,7 @@ mod tests {
         // slot 0 (a parameter, arity 1) and tail-self-calls until it is 0,
         // then returns it: starting from 5, the loop runs five times with
         // the back edge and returns 0.
-        let engine = JitEngine::new().expect("native isa");
+        let engine = JitEngine::with_opt(false).expect("native isa");
         let mut body = make_body(
             vec![
                 Step::JumpIfGtImm {
@@ -1259,7 +1259,7 @@ mod tests {
         // Cut 49: the vector call form (`ArgsBase`/`ArgsPush` build the
         // argument vector; `Call` runs it) lowers to the helpers — the test
         // doubles return 53 from `call_vector`.
-        let engine = JitEngine::new().expect("native isa");
+        let engine = JitEngine::with_opt(false).expect("native isa");
         let body = make_body(
             vec![
                 Step::Push(Value::Undefined),
@@ -1285,7 +1285,7 @@ mod tests {
     fn vector_tail_call_lowers_and_returns_the_helper_result() {
         // Cut 49: the vector `TailCall` terminates the body with the helper's
         // result (54 from the test double).
-        let engine = JitEngine::new().expect("native isa");
+        let engine = JitEngine::with_opt(false).expect("native isa");
         let body = make_body(
             vec![
                 Step::Push(Value::Undefined),
@@ -1308,7 +1308,7 @@ mod tests {
         // a1..aN]` on the work stack, the argument region passed by pointer.
         // The test double sums the argument region (the `thisArg` first), so
         // `[1, 2]` returns 3.
-        let engine = JitEngine::new().expect("native isa");
+        let engine = JitEngine::with_opt(false).expect("native isa");
         let body = make_body(
             vec![
                 Step::Push(Value::Number(7.0)), // f
@@ -1333,7 +1333,7 @@ mod tests {
         // Cut 52: the array literal steps lower to the helpers — `ArrayBegin`
         // creates the array (the double returns 60), the element steps echo
         // it back, `ArrayEnd` closes it, and the body returns the value.
-        let engine = JitEngine::new().expect("native isa");
+        let engine = JitEngine::with_opt(false).expect("native isa");
         let body = make_body(
             vec![
                 Step::ArrayBegin,
@@ -1356,7 +1356,7 @@ mod tests {
         // Cut 53: the object literal steps lower to the helpers — `ObjectBegin`
         // creates the object (the double returns 70), the init/key/spread
         // steps echo it back, and the body returns the value.
-        let engine = JitEngine::new().expect("native isa");
+        let engine = JitEngine::with_opt(false).expect("native isa");
         let body = make_body(
             vec![
                 Step::ObjectBegin,
@@ -1387,7 +1387,7 @@ mod tests {
         // the working sp, the machine code drops them, and the body returns
         // the created value. Values pushed v0 then v1; ObjectFast pops 2
         // and pushes the object.
-        let engine = JitEngine::new().expect("native isa");
+        let engine = JitEngine::with_opt(false).expect("native isa");
         let body = make_body(
             vec![
                 Step::Push(Value::Number(1.0)),
@@ -1411,7 +1411,7 @@ mod tests {
         // sp, the machine code drops them, and the body returns the created
         // value. Values pushed v0 then v1; ArrayFast pops 2 and pushes the
         // array.
-        let engine = JitEngine::new().expect("native isa");
+        let engine = JitEngine::with_opt(false).expect("native isa");
         let body = make_body(
             vec![
                 Step::Push(Value::Number(1.0)),
@@ -1430,7 +1430,7 @@ mod tests {
         // Cut 54: the string literal steps lower to the helpers — `PushStr`
         // returns the literal (the double returns 80), the concat steps echo
         // the accumulator, and the body returns the value.
-        let engine = JitEngine::new().expect("native isa");
+        let engine = JitEngine::with_opt(false).expect("native isa");
         let body = make_body(
             vec![
                 Step::PushStr(crux::JsString::from_utf8("a")),
@@ -1451,7 +1451,7 @@ mod tests {
         // Cut 47: a `TailCallSelfCheck` whose resolved callee does NOT match
         // the running closure (`ctx.current_function` is 0) falls to the
         // `tail_call` helper — the test double returns 52.
-        let engine = JitEngine::new().expect("native isa");
+        let engine = JitEngine::with_opt(false).expect("native isa");
         let body = make_body(
             vec![
                 Step::Push(Value::Undefined),
@@ -1474,7 +1474,7 @@ mod tests {
         // machine-code invocation. The body decrements slot 0 (a parameter)
         // and tail-self-calls until 0, returning it: starting from 5, the
         // loop runs five times and returns 0.
-        let engine = JitEngine::new().expect("native isa");
+        let engine = JitEngine::with_opt(false).expect("native isa");
         let mut body = make_body(
             vec![
                 Step::JumpIfGtImm {
@@ -1566,7 +1566,7 @@ mod tests {
         // (The test double reports the success signal without touching the
         // frame — the body's own decrement keeps the loop state, and the
         // runtime-side integration verifies the real in-place rebind.)
-        let engine = JitEngine::new().expect("native isa");
+        let engine = JitEngine::with_opt(false).expect("native isa");
         let mut body = make_body(
             vec![
                 Step::JumpIfGtImm {
@@ -1653,7 +1653,7 @@ mod tests {
         // match the running closure (`ctx.current_function` is 0) falls to
         // the general vector `tail_call` helper — the test double returns
         // 54.
-        let engine = JitEngine::new().expect("native isa");
+        let engine = JitEngine::with_opt(false).expect("native isa");
         let body = make_body(
             vec![
                 Step::Push(Value::Undefined),
@@ -1673,7 +1673,7 @@ mod tests {
     fn compile_reports_the_stack_usage() {
         // `Push, Push, Binary, Return`: the depth peaks at 2 (two operands
         // live before the `Binary` consumes one).
-        let engine = JitEngine::new().expect("native isa");
+        let engine = JitEngine::with_opt(false).expect("native isa");
         let body = make_body(
             vec![
                 Step::Push(Value::Number(1.0)),
@@ -1827,7 +1827,7 @@ mod tests {
     fn call_fast_lowers_and_passes_args_by_pointer() {
         // `[this, callee, 1, 2, 3] -> CallFast(argc=3)`: the test double
         // sums the numeric arguments, proving the `args` pointer/`argc` ABI.
-        let engine = JitEngine::new().expect("native isa");
+        let engine = JitEngine::with_opt(false).expect("native isa");
         let body = make_body(
             vec![
                 Step::Push(Value::Undefined),
@@ -1856,7 +1856,7 @@ mod tests {
         // `perform_eval` with the caller's environment intact). The
         // compiler never emits one (a direct eval always takes the vector
         // form), so the test proves the step compiles rather than bailing.
-        let engine = JitEngine::new().expect("native isa");
+        let engine = JitEngine::with_opt(false).expect("native isa");
         let body = make_body(
             vec![Step::CallFast {
                 argc: 0,
@@ -6374,7 +6374,7 @@ run(); run(); run(); run(); run(); run(); run(); run(); run();";
     fn global_load_store_lower() {
         // The test doubles: `get_global` returns 42; `set_global` returns
         // the stored value (discarded by `StoreGlobal`).
-        let engine = JitEngine::new().expect("native isa");
+        let engine = JitEngine::with_opt(false).expect("native isa");
         let body = make_body(vec![Step::LoadGlobal { name: 1 }, Step::Return], 0);
         let compiled = engine.compile(&body, &helpers_all()).expect("lowers");
         assert_eq!(run(&compiled, 0), Value::Number(42.0).bits());
@@ -6396,7 +6396,7 @@ run(); run(); run(); run(); run(); run(); run(); run(); run();";
     fn ident_load_store_update_lower() {
         // The test doubles: `load_ident` returns 42, `put_var_reference`
         // returns the value, `update_ident` returns old + 1.
-        let engine = JitEngine::new().expect("native isa");
+        let engine = JitEngine::with_opt(false).expect("native isa");
         let body = make_body(vec![Step::LoadIdent { name: 1 }, Step::Return], 0);
         let compiled = engine.compile(&body, &helpers_all()).expect("lowers");
         assert_eq!(run(&compiled, 0), Value::Number(42.0).bits());
@@ -6438,7 +6438,7 @@ run(); run(); run(); run(); run(); run(); run(); run(); run();";
         // double answers `"undefined"`, which is also what spec 13.5.3.2 step 1
         // requires for an unresolvable reference (the reason this is not
         // `LoadIdent` + `TypeofTop`). The step takes the name as an immediate.
-        let engine = JitEngine::new().expect("native isa");
+        let engine = JitEngine::with_opt(false).expect("native isa");
         let body = make_body(vec![Step::TypeofIdent { name: 1 }, Step::Return], 0);
         let compiled = engine.compile(&body, &helpers_all()).expect("lowers");
         let value = Value::from_bits(run(&compiled, 0));
@@ -6825,7 +6825,7 @@ run(); run(); run(); run(); run(); run(); run(); run(); run();";
     #[test]
     fn compound_member_assign_lowers() {
         // The test doubles: `old + value` for a compound op, else `value`.
-        let engine = JitEngine::new().expect("native isa");
+        let engine = JitEngine::with_opt(false).expect("native isa");
         // Named compound: [object, old=5, value=3] -> 8.
         let body = make_body(
             vec![
@@ -6881,7 +6881,7 @@ run(); run(); run(); run(); run(); run(); run(); run(); run();";
     fn context_steps_lower() {
         // The test doubles: `load_context` returns 42, `update_context` 43;
         // the stores echo the stored value.
-        let engine = JitEngine::new().expect("native isa");
+        let engine = JitEngine::with_opt(false).expect("native isa");
         // LoadContextSlot pushes the read value: [LoadContextSlot] -> 42.
         let body = make_body(
             vec![Step::LoadContextSlot { depth: 0, index: 0 }, Step::Return],
@@ -6937,7 +6937,7 @@ run(); run(); run(); run(); run(); run(); run(); run(); run();";
     fn per_iteration_steps_lower() {
         // The test doubles: `load_per_iter` returns 44, `update_per_iter` 45;
         // the store echoes the stored value.
-        let engine = JitEngine::new().expect("native isa");
+        let engine = JitEngine::with_opt(false).expect("native isa");
         // LoadPerIteration pushes the read value: -> 44.
         let body = make_body(
             vec![Step::LoadPerIteration { depth: 0, index: 0 }, Step::Return],
@@ -6980,7 +6980,7 @@ run(); run(); run(); run(); run(); run(); run(); run(); run();";
     fn reference_machinery_lowers() {
         // The test doubles: `get_var_reference` returns 46, the update
         // returns `old + 1`, the compound `old + value`.
-        let engine = JitEngine::new().expect("native isa");
+        let engine = JitEngine::with_opt(false).expect("native isa");
         // GetVarReference pushes the read value: -> 46.
         let body = make_body(
             vec![

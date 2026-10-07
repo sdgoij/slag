@@ -513,7 +513,22 @@ a second front end for `LeafOp`s. `FastLoopHead { Global }` is refused by the
 per-step path too. The scalar replacer is deferred. (b) **Resolved as a negative
 result** (below): the tier's unconditional member-read cell probe does not pay.
 
-**Negative result (2026-10-07): inlining the member-read cell probe does not pay.**
+**The tier is on by default (2026-10-07).** `JitEngine::new()` now enables the
+optimizing tier unless `SLAG_OPT=0` (a body the lift refuses keeps the per-step
+path either way), so `install` and every default run go through the lift. The
+per-step lowerer's unit tests — which assert helper call *structure* via test
+doubles (`slow_unary_uses_the_helper` expects the `-42` double, and the IR now
+correctly folds `-1` instead) — are pinned to `with_opt(false)`. Validation in
+the **default** config: test262 `language` 23,726 / 0, `built-ins`
+23,820 / 0 / 1, `annexB` 1,086 / 0, `staging` 77 / 0; wasm `jsapi` 1,001 tests
+0 fail. Two caveats recorded honestly: (1) the corpus A/B is too noisy on this
+machine to read — two *identical* `SLAG_OPT=1` runs differ by >5% on 36 of 77
+rows (up to 2x) — so the enablement rests on the interleaved micro-benchmarks
+(1.1–4x on lifted shapes) plus the conformance baseline, not on a corpus-wide
+net win; (2) with the default flipped, the `installed_jit_*` e2e tests now
+exercise the tier, so the per-step path's e2e coverage is the pinned unit tests
+plus the `SLAG_OPT=0` sweeps.
+
 I built the tier's inline member-value cell probe in `opt_lower` (the
 plain-object path of the per-step `emit_member_cell_probe`) and measured it on a
 read-heavy loop (`s += o.x`, 5M iters, min-of-5 interleaved, `SLAG_OPT` 0 vs 1):
