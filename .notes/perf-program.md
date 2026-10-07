@@ -397,3 +397,40 @@ not machinery) and `strings` (28.69).
   boxing, ~-56 B more, ~100 call sites of churn) and a smaller `Property`
   (40 B -> ~24, which would shrink `properties` and every vector entry) are
   recorded but not taken.
+- **2026-10-07 — the fused array literal (`Step::ArrayFast`) LANDED (the
+  per-element cost collapses to a memcpy).** The probe above named the array
+  literal as the clear next win: it was NOT fused — `ArrayBegin` + one
+  `ArrayElement` per element + `ArrayEnd`, ~19.4 ns/element on top of the
+  allocation. `Step::ArrayFast { count }` (the array analogue of `ObjectFast`)
+  is emitted when every element is a plain expression (no hole, no spread, and
+  non-empty — the empty literal measures no faster, so it keeps the old path
+  and `array_create` stays untouched). The N values are evaluated first (they
+  sit on the rooted work stack / JIT buffer), then ONE helper creates the array
+  and fills it; the shared core is `array_fast_create` (the interpreter handler
+  and the JIT `array_fast` helper), mirroring the `ObjectFast` four-file helper
+  mirror.
+  The bulk fill is `JsObject::array_extend_dense(values)` — one `elements_mut`
+  borrow, one buffer grow, one length/mirror/generation update instead of a
+  `create_data_property_index` per element, and **no per-element write
+  barrier** (a fresh young array can hold no old->young edge; a young box is
+  traced fully, so its `dirty_from = (0,0)` is never consulted).
+  **A first cut was wrong and is recorded as the trap:** it added
+  `array_create_from_values` and factored `array_create` through a shared
+  `array_create_with_slots`, which cost **~4% on EVERY `array_create` caller**
+  (`new Array(3)` micro 0.962, `[]` 0.931 — a real regression, not layout: the
+  untouched control rows measured 1.00 and `#[inline]` did not recover it). It
+  was reverted for the post-create extend, which leaves `array_create`
+  byte-identical (`new Array`/`[]` back to ~1.00, and `new Array` is the
+  surface for spread, `Array.from`, and every array-returning builtin).
+  **Measured** (min of 5, isolated 1M-iteration micros, `slag-if8.exe`
+  [pre-fusion, `INLINE_FIELDS` 8] vs the fused binary): `[i]` **1.056x**,
+  `[i×6]` **1.593x**, `[i×10]` **2.028x**; `[]` and `new Array(3)` ~1.00. The
+  6- and 10-element literals now cost the same (~154 ns) — the per-element
+  cost is the buffer memcpy, so the residual is entirely the `array_create`
+  allocation plus one buffer malloc (L2).
+  **Gates: fmt and clippy clean; workspace green (crux 260, jit 265, runtime
+  1,030, test262 3,324, all 0 failed); test262 `all` 48,632 / 0 / 1 and
+  `intl402` 3,365 / 0 / 0 at baseline; and the new-path soundness net:
+  `language --gc-stress` 23,715 / 0 fail / 0 crash (only the documented
+  `--gc-stress` timeout hangs) plus `built-ins *Array* --gc-stress` 0 fail /
+  0 crash (`built-ins *Array*` without stress is 5,714 / 0 / 0).**

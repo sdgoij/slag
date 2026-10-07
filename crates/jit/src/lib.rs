@@ -404,6 +404,7 @@ fn runtime_helpers() -> JitHelpers {
         array_spread: Some(rt.array_spread),
         array_hole: Some(rt.array_hole),
         array_end: Some(rt.array_end),
+        array_fast: Some(rt.array_fast),
         object_begin: Some(rt.object_begin),
         object_fast: Some(rt.object_fast),
         object_init_name: Some(rt.object_init_name),
@@ -657,6 +658,7 @@ mod tests {
             array_spread: Some(helpers::test_array_spread),
             array_hole: Some(helpers::test_array_hole),
             array_end: Some(helpers::test_array_end),
+            array_fast: Some(helpers::test_array_fast),
             object_begin: Some(helpers::test_object_begin),
             object_fast: Some(helpers::test_object_fast),
             object_init_name: Some(helpers::test_object_init_name),
@@ -1387,6 +1389,28 @@ mod tests {
         );
         let compiled = engine.compile(&body, &helpers_all()).expect("lowers");
         assert_eq!(run(&compiled, 0), Value::Number(70.0).bits());
+    }
+
+    #[test]
+    fn array_fast_lowers_to_the_fused_helper() {
+        // The array analogue of `object_fast_lowers_to_the_fused_helper`: a
+        // whole-simple literal lowers to ONE `ArrayFast` step — the fused
+        // helper (the double returns 61) reads the values below the working
+        // sp, the machine code drops them, and the body returns the created
+        // value. Values pushed v0 then v1; ArrayFast pops 2 and pushes the
+        // array.
+        let engine = JitEngine::new().expect("native isa");
+        let body = make_body(
+            vec![
+                Step::Push(Value::Number(1.0)),
+                Step::Push(Value::Number(2.0)),
+                Step::ArrayFast { count: 2 },
+                Step::Return,
+            ],
+            0,
+        );
+        let compiled = engine.compile(&body, &helpers_all()).expect("lowers");
+        assert_eq!(run(&compiled, 0), Value::Number(61.0).bits());
     }
 
     #[test]
@@ -3203,6 +3227,42 @@ run(); run(); run(); run(); run(); run(); run(); run(); run();";
         assert_eq!(
             value, interp,
             "the compiled fused-object-literal creates must match the interpreter"
+        );
+        assert!(compiled >= 1, "{compiled} bodies");
+    }
+
+    #[test]
+    fn installed_jit_fused_array_literal_matches_the_interpreter() {
+        // The array analogue of the fused-object-literal e2e: a whole-simple
+        // literal lowers to ONE fused `ArrayFast` helper (not `ArrayBegin` +
+        // N per-element `ArrayElement` + `ArrayEnd`) — a compiled loop
+        // creating empty, nested, and longer literals every iteration must
+        // agree with the interpreter on the values and `length`. The unfused
+        // shapes (a hole, a spread) stay on the per-element path and must
+        // also agree.
+        let source = "function f(n) { var s = 0; \
+                      for (var i = 0; i < n; i++) { \
+                        var a = [i, i + 1, i + 2]; \
+                        s += a[0] + a[2] + a.length; \
+                        var e = []; \
+                        s += e.length; \
+                        var nested = [[i, i + 1], i + 2]; \
+                        s += nested[0][1] + nested[1] + nested.length; \
+                        var h = [i, , i + 2]; \
+                        s += h[0] + h[2] + h.length + (1 in h ? 1000 : 0); \
+                        var sp = [...a, i]; \
+                        s += sp[3] + sp.length; \
+                      } return s; } \
+                      f(2000);";
+        let interp = {
+            let mut agent = runtime::Agent::new();
+            agent.initialize_host_defined_realm().expect("realm");
+            agent.run_script(source).expect("interp runs")
+        };
+        let (value, compiled) = with_jit_agent(|agent| agent.run_script(source).expect("jit runs"));
+        assert_eq!(
+            value, interp,
+            "the compiled fused-array-literal creates must match the interpreter"
         );
         assert!(compiled >= 1, "{compiled} bodies");
     }

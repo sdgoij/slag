@@ -119,6 +119,10 @@ pub enum Helper {
     ArraySpread,
     ArrayHole,
     ArrayEnd,
+    /// A whole-literal fast create (the array analogue of `ObjectFast`) — the
+    /// compiled step lowers to ONE helper call instead of `ArrayBegin` + N
+    /// per-element `ArrayElement` calls + `ArrayEnd`.
+    ArrayFast,
     ObjectBegin,
     /// Cut 72: the fused `Step::ObjectFast` whole-literal create — the
     /// compiled step lowers to ONE helper call instead of `ObjectBegin` + N
@@ -276,6 +280,7 @@ impl Helper {
             Helper::ArraySpread => "array_spread",
             Helper::ArrayHole => "array_hole",
             Helper::ArrayEnd => "array_end",
+            Helper::ArrayFast => "array_fast",
             Helper::ObjectBegin => "object_begin",
             Helper::ObjectFast => "object_fast",
             Helper::ObjectInitName => "object_init_name",
@@ -722,6 +727,11 @@ pub struct JitHelpers {
     pub array_spread: Option<extern "C" fn(vm: *mut c_void, array: u64, iterable: u64) -> u64>,
     pub array_hole: Option<extern "C" fn(vm: *mut c_void) -> u64>,
     pub array_end: Option<extern "C" fn(vm: *mut c_void, array: u64) -> u64>,
+    /// A whole-literal fast create (the array analogue of `ObjectFast`): the
+    /// compiled step pushed one value per element in source order below the
+    /// working `sp`, so the helper creates the array and appends them in one
+    /// call.
+    pub array_fast: Option<extern "C" fn(vm: *mut c_void, count: u64, sp: u64) -> u64>,
     /// Object literal steps (Cut 53): `ObjectBegin` creates the plain
     /// object; the init/method/accessor steps define the properties;
     /// `ObjectKeyToPropertyKey` converts a computed key;
@@ -974,6 +984,7 @@ impl JitHelpers {
             array_spread: None,
             array_hole: None,
             array_end: None,
+            array_fast: None,
             object_begin: None,
             object_fast: None,
             object_init_name: None,
@@ -1125,6 +1136,7 @@ impl JitHelpers {
             Helper::ArraySpread => self.array_spread.map(|f| f as usize as u64),
             Helper::ArrayHole => self.array_hole.map(|f| f as usize as u64),
             Helper::ArrayEnd => self.array_end.map(|f| f as usize as u64),
+            Helper::ArrayFast => self.array_fast.map(|f| f as usize as u64),
             Helper::ObjectBegin => self.object_begin.map(|f| f as usize as u64),
             Helper::ObjectFast => self.object_fast.map(|f| f as usize as u64),
             Helper::ObjectInitName => self.object_init_name.map(|f| f as usize as u64),
@@ -1639,6 +1651,12 @@ pub extern "C" fn test_array_hole(_vm: *mut c_void) -> u64 {
 
 pub extern "C" fn test_array_end(_vm: *mut c_void, array: u64) -> u64 {
     array
+}
+
+/// `array_fast` double: returns a fixed heap value (the array), the same way
+/// `test_array_begin` proves the ABI wiring for the unfused path.
+pub extern "C" fn test_array_fast(_vm: *mut c_void, _count: u64, _sp: u64) -> u64 {
+    Value::Number(61.0).bits()
 }
 
 /// `object_begin` double: returns 70 (the object the property steps echo).
@@ -2181,6 +2199,7 @@ mod tests {
             Helper::AssignMemberComputed,
             Helper::FastArrayElementWrite,
             Helper::DenseArrayAppend,
+            Helper::ArrayFast,
             Helper::TypedArrayLength,
         ] {
             assert!(none.get(h).is_none(), "{} should be None", h.name());

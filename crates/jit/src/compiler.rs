@@ -369,7 +369,8 @@ fn step_name(step: &Step) -> &'static str {
         | Step::ArrayElement
         | Step::ArraySpread
         | Step::ArrayHole
-        | Step::ArrayEnd => "ArrayLiteral",
+        | Step::ArrayEnd
+        | Step::ArrayFast { .. } => "ArrayLiteral",
         Step::ObjectBegin
         | Step::ObjectFast { .. }
         | Step::ObjectInitName { .. }
@@ -8067,6 +8068,22 @@ impl<'a> Lowerer<'a> {
             Step::ArrayEnd => {
                 let array = self.pop();
                 let array = self.call_slow(self.sig_bool, Helper::ArrayEnd, &[array])?;
+                self.push(array);
+                self.fall_through(index);
+            }
+            Step::ArrayFast { count } => {
+                // The interpreter's fused whole-literal create lowers to ONE
+                // helper call: the n values sit below the machine-code
+                // working `sp` in source order, the helper creates the array
+                // and appends them, and the machine code drops the consumed
+                // values and pushes the returned array.
+                let n = *count as usize;
+                let sp = self.builder.use_var(self.sp_var);
+                let count_imm = self.builder.ins().iconst(types::I64, *count as i64);
+                let array =
+                    self.call_slow(self.sig_step_sp, Helper::ArrayFast, &[count_imm, sp])?;
+                let base = self.builder.ins().iadd_imm_s(sp, -8 * (n as i64));
+                self.builder.def_var(self.sp_var, base);
                 self.push(array);
                 self.fall_through(index);
             }

@@ -1623,6 +1623,38 @@ impl JsObject {
         Ok(array)
     }
 
+    /// Bulk-append a fully-materialized element run to a fresh, dense Array
+    /// (the fused array literal's tail): one `elements_mut` borrow, one buffer
+    /// grow, one length update, and one generation bump instead of a
+    /// `create_data_property_index` per element. The array must be a fresh
+    /// young dense Array (whose elements are the canonical w/e/c run `0..n`)
+    /// and unobservable while this runs, so no per-element write barrier is
+    /// needed — a young target can hold no old→young edge.
+    pub fn array_extend_dense(&self, values: &[Value]) -> Result<(), JsError> {
+        let ObjectKind::Array(slots) = &self.kind else {
+            return Err(JsError::new(ErrorKind::TypeError, "not an array".into()));
+        };
+        if !slots.dense.get() {
+            return Err(JsError::new(
+                ErrorKind::TypeError,
+                "not a dense array".into(),
+            ));
+        }
+        let start = slots.length.get() as usize;
+        {
+            let mut elements = slots.elements_mut();
+            if elements.len() < start {
+                elements.resize(start, Value::hole());
+            }
+            elements.extend_from_slice(values);
+        }
+        let length = (start + values.len()) as f64;
+        slots.length.set(length);
+        self.write_length_mirror(length);
+        self.bump_generation();
+        Ok(())
+    }
+
     /// StringCreate (spec 10.4.3.2): a String exotic with the virtual
     /// code-unit index properties and the `length` data property.
     pub fn string_create(

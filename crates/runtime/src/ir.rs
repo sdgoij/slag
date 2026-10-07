@@ -640,6 +640,17 @@ pub enum Step {
     /// Finish the array literal: set its length to the element count (spec
     /// 13.2.4.1 step 6).
     ArrayEnd,
+    /// A whole-literal fast create — the array analogue of `ObjectFast`.
+    /// Every element is a plain expression (no holes, no spread), so the
+    /// array is unobservable while its values evaluate (spec 13.2.4.1 element
+    /// evaluation order is preserved, but the half-built literal never
+    /// escapes). The compiler emits the N value expressions first, then this
+    /// step pops them, creates a fresh dense Array, and appends the values at
+    /// indices `0..count` in one fused call (no `ArrayBegin`/`ArrayEnd`
+    /// index-stack push/pop and no per-element helper call).
+    ArrayFast {
+        count: u32,
+    },
     // ----- class definitions with suspending heritage/computed names -----
     ClassBegin {
         class: Box<Class>,
@@ -8727,6 +8738,20 @@ impl Vm {
                     }
                     self.stack.push(array);
                 }
+                Step::ArrayFast { count } => {
+                    // The whole-literal fused create (the array analogue of
+                    // `ObjectFast`): the N element expressions already
+                    // pushed (in source order) and this step pops them,
+                    // creates a fresh dense Array, and appends the values
+                    // (the literal is unobservable until it escapes). The
+                    // fused create is shared with the JIT's `array_fast`
+                    // helper (see `array_fast_create`).
+                    let n = *count as usize;
+                    let base = self.stack.len() - n;
+                    let array = array_fast_create(agent, &self.stack[base..base + n])?;
+                    self.stack.truncate(base);
+                    self.stack.push(array);
+                }
                 Step::ObjectBegin => {
                     let proto = agent
                         .current_realm()?
@@ -15547,6 +15572,19 @@ pub(crate) fn object_fast_create(
     Ok(Value::Object(object))
 }
 
+/// The fused whole-literal array create (`Step::ArrayFast`'s shared core): a
+/// fresh dense Array on the realm's `Array.prototype`, then `values` appended
+/// as its dense elements at indices `0..n` in one bulk extend. The literal
+/// carries no holes and no spread, so the final length is exactly
+/// `values.len()` and the array is unobservable until it escapes. Shared by
+/// the interpreter's `ArrayFast` handler and the JIT's `array_fast` helper so
+/// the two engines cannot drift.
+pub(crate) fn array_fast_create(agent: &mut Agent, values: &[Value]) -> Result<Value, JsError> {
+    let array = crate::builtins::array::array_create(agent, 0.0)?;
+    array.array_extend_dense(values)?;
+    Ok(Value::Object(array))
+}
+
 pub(crate) fn object_init(
     object: &Value,
     key: &PropertyName,
@@ -20907,6 +20945,30 @@ impl Compiler {
             }
             ExprKind::Template(template) => self.compile_template(template),
             ExprKind::Array(literal) => {
+                // A whole-literal fast create (the array analogue of
+                // `ObjectFast`): with no holes and no spread the array is
+                // unobservable while its values evaluate, so the values are
+                // computed first and ONE `ArrayFast` step creates the array
+                // and appends them (no index-stack push/pop and no
+                // per-element helper). Anything else — including the empty
+                // literal, where the fused create measures no faster — keeps
+                // the per-element steps below.
+                if !literal.elements.is_empty()
+                    && literal
+                        .elements
+                        .iter()
+                        .all(|element| matches!(element, ArrayElement::Expr(_)))
+                    && let Ok(count) = u32::try_from(literal.elements.len())
+                {
+                    for element in &literal.elements {
+                        let ArrayElement::Expr(expr) = element else {
+                            unreachable!("the Expr-only check above holds")
+                        };
+                        self.compile_expr(expr)?;
+                    }
+                    self.emit(Step::ArrayFast { count });
+                    return Ok(());
+                }
                 self.emit(Step::ArrayBegin);
                 for element in &literal.elements {
                     match element {
@@ -23326,6 +23388,11 @@ pub fn max_stack_usage(steps: &[Step]) -> usize {
                 depth = depth.saturating_sub(2).saturating_add(1)
             }
             Step::ArrayHole | Step::ArrayEnd => {}
+            // The N element expressions pushed `count` values; ArrayFast pops
+            // them all and pushes the array.
+            Step::ArrayFast { count } => {
+                depth = depth.saturating_sub(*count as usize).saturating_add(1)
+            }
             // Object literals (Cut 53): `ObjectBegin` pushes the object; an
             // `Init` pops its value(s) + the object and pushes it back; the
             // method/accessor/key/spread steps keep it net-neutral or pop

@@ -261,6 +261,42 @@ Measured (`arrays/index_loop`): 37.9 → 20.7 ms with `GetMemberComputed`
 `arrays/typed_array` 50.1 → 35.6 ms (`GetMemberComputed` 14,000,000 → 0);
 `--jit-bench`'s `typed-array read` row 0.15 (89.5 → 13.0 ms).
 
+## 9. The fused array literal (`Step::ArrayFast`)
+
+`[a, b, c]` with every element a plain expression (no hole, no spread, and
+non-empty) compiles to ONE `Step::ArrayFast { count }` instead of `ArrayBegin` +
+one `ArrayElement` per element + `ArrayEnd`. The array analogue of `ObjectFast`:
+the N value expressions are evaluated first (they sit on the rooted work stack /
+JIT buffer), then the step pops them, creates the array, and fills it. The
+shared core is `array_fast_create` (`crates/runtime/src/ir.rs`), called by the
+interpreter handler and by the JIT `array_fast(count, sp)` helper.
+
+- **The fill is `JsObject::array_extend_dense(values)`**, not a
+  `create_data_property_index` per element: one `elements_mut` borrow, one
+  buffer grow, one `length`/mirror/generation update. The per-element cost
+  collapses to the buffer memcpy, so 6- and 10-element literals cost the same.
+- **No write barrier, and that is correct here.** The target is a fresh YOUNG
+  array, so it can hold no old->young edge; a young box is traced with the full
+  `trace` (never `trace_dirty`), so its `dirty_from = (0,0)` from
+  `ArraySlots::new` is never consulted. Do not add a per-element barrier to this
+  path "for safety" — it is pure waste, and the `--gc-stress` sweep is the net
+  that proves it.
+- **The EMPTY literal is deliberately NOT fused** (`!elements.is_empty()`): the
+  fused create measures no faster for `[]`, and leaving it unfused keeps
+  `array_create` untouched.
+- **Trap: do NOT refactor `array_create` to share code with the fused path.**
+  A first cut added `array_create_from_values` and factored `array_create`
+  through a shared `array_create_with_slots`; that added a call layer that cost
+  **~4% on every `array_create` caller** (`new Array(3)` micro 0.962, `[]`
+  0.931 — real, not layout: the untouched control rows measured 1.00 and
+  `#[inline]` did not recover it). `array_create` is the surface for `new
+  Array`, spread, `Array.from`, and every array-returning builtin, so the
+  post-create extend (which leaves `array_create` byte-identical) is the shape
+  to keep.
+- Measured (isolated 1M-iteration micros): `[i]` 1.056x, `[i x6]` 1.593x,
+  `[i x10]` 2.028x; `[]` and `new Array(3)` neutral. The residual is the
+  `array_create` allocation plus one buffer malloc.
+
 ## Relationship to the other skills
 
 - `slag-property-writes` — the named-member store machinery and the

@@ -1017,6 +1017,12 @@ pub struct JitSlowPaths {
     /// `Step::ArrayEnd`: pop the index stack, set the array's `length`, and
     /// return the array.
     pub array_end: extern "C" fn(ctx: *mut c_void, array: u64) -> u64,
+    /// The compiled `Step::ArrayFast` fused whole-literal create
+    /// (`array_fast(ctx, count, sp)`) — the machine code pushed one value per
+    /// element in source order below the working `sp`, so the helper creates
+    /// the array and appends them in one call (the interpreter's fused
+    /// handler).
+    pub array_fast: extern "C" fn(ctx: *mut c_void, count: u64, sp: u64) -> u64,
     /// `Step::ObjectBegin`: create a plain object with the realm's
     /// `Object.prototype` and return it (the machine code pushes it onto the
     /// work stack for the property steps).
@@ -1379,6 +1385,7 @@ pub static JIT_SLOW_PATHS: JitSlowPaths = JitSlowPaths {
     array_spread,
     array_hole,
     array_end,
+    array_fast,
     object_begin,
     object_fast,
     object_init_name,
@@ -4277,6 +4284,26 @@ extern "C" fn array_end(ctx: *mut c_void, array: u64) -> u64 {
         }
     }
     array.bits()
+}
+
+/// The compiled `Step::ArrayFast` fused whole-literal create. The machine
+/// code pushed one value per element in source order below the working `sp`,
+/// in the rooted JIT buffer, so the shared create (which allocates the array
+/// and appends the values) is safe to run under them. The machine code drops
+/// the consumed values and pushes the returned array.
+extern "C" fn array_fast(ctx: *mut c_void, count: u64, sp: u64) -> u64 {
+    let ctx = unsafe { ctx_of(ctx) };
+    let agent = unsafe { &mut *ctx.agent };
+    let n = count as usize;
+    let base = (sp as usize).saturating_sub(n * 8);
+    // SAFETY: `sp` points into the machine-code working region (the rooted
+    // JIT buffer) with the n consumed values below it — the compiled
+    // `ArrayFast` step pushed exactly one value per element in source order.
+    let values: &[Value] = unsafe { std::slice::from_raw_parts(base as *const Value, n) };
+    match crate::ir::array_fast_create(agent, values) {
+        Ok(value) => value.bits(),
+        Err(error) => slow_error(ctx, error),
+    }
 }
 
 // ----- Cut 53: object literals -----
@@ -7236,6 +7263,7 @@ mod tests {
         assert_ne!(JIT_SLOW_PATHS.array_spread as usize, 0);
         assert_ne!(JIT_SLOW_PATHS.array_hole as usize, 0);
         assert_ne!(JIT_SLOW_PATHS.array_end as usize, 0);
+        assert_ne!(JIT_SLOW_PATHS.array_fast as usize, 0);
         assert_ne!(JIT_SLOW_PATHS.object_begin as usize, 0);
         assert_ne!(JIT_SLOW_PATHS.object_fast as usize, 0);
         assert_ne!(JIT_SLOW_PATHS.object_init_name as usize, 0);
