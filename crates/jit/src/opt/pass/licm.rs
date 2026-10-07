@@ -172,14 +172,17 @@ fn slot_stores(func: &Function, in_loop: &[bool]) -> Vec<bool> {
 fn natural_loop(func: &Function, source: u32, header: u32, dom: &[Vec<bool>]) -> Vec<bool> {
     let mut in_loop = vec![false; func.block_count()];
     in_loop[header as usize] = true;
+    // The back-edge source is in the loop by definition; then walk up through
+    // every predecessor the header dominates. The dominance gate is what
+    // excludes the header's own outside predecessor (and keeps a self-loop from
+    // absorbing its preheader).
     let mut stack = vec![source];
     while let Some(b) = stack.pop() {
+        if std::mem::replace(&mut in_loop[b as usize], true) {
+            continue;
+        }
         for p in predecessors(func, b) {
-            if in_loop[p as usize] || !dom[p as usize][header as usize] {
-                continue;
-            }
-            in_loop[p as usize] = true;
-            if p != header {
+            if !in_loop[p as usize] && dom[p as usize][header as usize] {
                 stack.push(p);
             }
         }
@@ -391,6 +394,119 @@ mod tests {
         assert!(
             !func.block(header).insts.iter().any(|i| i.op == Op::Mul),
             "and out of the loop header"
+        );
+    }
+
+    /// A loop whose back edge's source is a SEPARATE block
+    /// (`entry -> pre -> header -> body -> header`). `natural_loop` must include
+    /// that source block, or the body is never treated as in-loop: the header's
+    /// outside predecessors would then be `{pre, body}`, no unique preheader
+    /// exists, and nothing hoists (the bug this test pins).
+    #[test]
+    fn hoists_from_a_non_self_loop() {
+        let mut func = Function::new();
+        let entry = func.entry();
+        let pre;
+        let header;
+        let body;
+        {
+            let mut b = Builder::new(&mut func);
+            let three = b.emit(
+                entry,
+                Op::Const,
+                &[],
+                Type::Number,
+                Effects::pure(),
+                Imm::Float(3.0),
+            );
+            pre = b.block();
+            header = b.block();
+            body = b.block();
+            let exit = b.block();
+            b.term(
+                entry,
+                Term::Jump {
+                    target: pre,
+                    args: vec![],
+                },
+            );
+            let two = b.emit(
+                pre,
+                Op::Const,
+                &[],
+                Type::Number,
+                Effects::pure(),
+                Imm::Float(2.0),
+            );
+            let five = b.emit(
+                pre,
+                Op::Const,
+                &[],
+                Type::Number,
+                Effects::pure(),
+                Imm::Float(5.0),
+            );
+            b.term(
+                pre,
+                Term::Jump {
+                    target: header,
+                    args: vec![],
+                },
+            );
+            let k = b.param(header, Type::Number);
+            let cond = b.emit(
+                header,
+                Op::Lt,
+                &[k, three],
+                Type::Bool,
+                Effects::pure(),
+                Imm::None,
+            );
+            b.term(
+                header,
+                Term::Branch {
+                    cond,
+                    then_block: body,
+                    then_args: vec![k],
+                    else_block: exit,
+                    else_args: vec![k],
+                },
+            );
+            let kb = b.param(body, Type::Number);
+            let inv = b.emit(
+                body,
+                Op::Mul,
+                &[two, five],
+                Type::Number,
+                Effects::pure(),
+                Imm::None,
+            );
+            let k2 = b.emit(
+                body,
+                Op::Add,
+                &[kb, inv],
+                Type::Number,
+                Effects::pure(),
+                Imm::None,
+            );
+            b.term(
+                body,
+                Term::Jump {
+                    target: header,
+                    args: vec![k2],
+                },
+            );
+            let r = b.param(exit, Type::Number);
+            b.term(exit, Term::Return(Some(r)));
+        }
+        assert!(run(&mut func));
+        assert!(
+            func.block(pre).insts.iter().any(|i| i.op == Op::Mul),
+            "the invariant multiply moved to the preheader"
+        );
+        assert!(
+            !func.block(body).insts.iter().any(|i| i.op == Op::Mul),
+            "and out of the loop body"
         );
     }
 
