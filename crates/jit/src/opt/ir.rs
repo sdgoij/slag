@@ -235,6 +235,13 @@ pub enum Op {
     /// A speculation guard. When it fails the body retires and the
     /// interpreter resumes at the current step.
     Check,
+    /// Write the statement-completion register to `undefined` and mark it
+    /// empty (spec 6.2.2.3).
+    CompletionReset,
+    /// Write the statement-completion register to the operand, marked
+    /// non-empty (spec 6.2.2.4). The register lives on the `Vm`, not in a
+    /// [`Heap`] region, so both ops are modelled as `World` writes.
+    CompletionStore,
 }
 
 impl Op {
@@ -257,6 +264,7 @@ impl Op {
             Op::MemberStore => E::write(Heap::Slots).union(E::write(Heap::Elements)),
             Op::ElementLoad => E::read(Heap::Elements),
             Op::ElementStore => E::write(Heap::Elements),
+            Op::CompletionReset | Op::CompletionStore => E::write(Heap::World),
             Op::Add
             | Op::Sub
             | Op::Mul

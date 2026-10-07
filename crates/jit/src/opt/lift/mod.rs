@@ -1,19 +1,15 @@
 //! The lift: the interpreter's `Step` stream into the SSA IR.
 //!
-//! Increments I1 (straight line) and I2 (forward control flow): a `Jump`, a
-//! `JumpIfFalse`/`JumpIfTrue` and a join. A step outside the subset, a body
-//! that is not certified, a TDZ-checked slot, or a back edge (a loop, which
-//! needs a fixpoint over the join stack — I2b) returns [`Unsupported`] and
-//! keeps the current per-step lowering, so nothing about the engine's behavior
-//! changes unless a later increment wires the IR in.
+//! Increments I1 (straight line) and I2 (control flow): `Jump`,
+//! `JumpIfFalse`/`JumpIfTrue`, joins and loops. A step outside the subset, a
+//! body that is not certified, or a TDZ-checked slot returns [`Unsupported`]
+//! and keeps the current per-step lowering, so nothing about the engine's
+//! behavior changes unless a later increment wires the IR in.
 //!
 //! The lift is exact by construction: an accepted step means exactly what the
-//! interpreter's handler for that step means. Two shapes it deliberately
-//! refuses rather than approximates:
+//! interpreter's handler for that step means. It refuses rather than
+//! approximates:
 //!
-//! - **Loops.** A back edge's target needs parameters fed from a predecessor
-//!   that has not been lifted yet; the forward-only shape resolves a join from
-//!   already-lifted predecessors.
 //! - **TDZ slots.** `Step::LoadLocal`/`StoreLocal` carry an
 //!   `is_uninitialized` check the IR does not model (it will become an explicit
 //!   op). A body whose scope has no TDZ slot — parameters and `var`s only — has
@@ -21,7 +17,10 @@
 //!   check-free `FrameLoad`/`FrameStore` are exact.
 //!
 //! Frame slots stay in memory (the IR's `FrameLoad`/`FrameStore` read and write
-//! `Heap::Slots`); only the operand stack is SSA and needs join parameters.
+//! `Heap::Slots`); only the operand stack is SSA, so a join takes its stack as
+//! block parameters. Those parameters are sized by a stack-depth fixpoint, not
+//! by a predecessor's already-emitted stack, which is what lets a loop header's
+//! parameters be known before the header is emitted.
 
 use crate::opt::builder::Builder;
 use crate::opt::ir::{BlockId, Effects, Function, Heap, Imm, Op, Term, Type, ValueId};
@@ -37,7 +36,7 @@ pub enum Unsupported {
     Uncertified,
     /// The scope has a TDZ-checked slot (see the module note).
     TdzSlot,
-    /// A step outside the subset (a back edge names `"loop"`).
+    /// A step outside the subset.
     Step(&'static str),
     /// The body reached its end without a `Return`, so the entry block has no
     /// terminator.
@@ -53,8 +52,8 @@ pub enum Unsupported {
     Invalid,
 }
 
-/// Lift a certified body into the SSA IR (straight line + forward control
-/// flow).
+/// Lift a certified body into the SSA IR (straight line and control flow,
+/// including loops).
 pub fn lift(body: &CompiledBody) -> Result<Function, Unsupported> {
     let scope = body.scope.as_ref().ok_or(Unsupported::Uncertified)?;
     if scope.tdz_store.iter().any(|&tdz| tdz) {
@@ -66,14 +65,12 @@ pub fn lift(body: &CompiledBody) -> Result<Function, Unsupported> {
         return Err(Unsupported::NoReturn);
     }
 
-    // A block starts at 0, at every jump target, and after every terminator.
+    // A block starts at 0, at every jump target (forward or a back edge), and
+    // after every terminator.
     let mut starts = vec![false; n + 1];
     starts[0] = true;
     for (i, step) in steps.iter().enumerate() {
         if let Some(t) = jump_target(step) {
-            if t <= i {
-                return Err(Unsupported::Step("loop"));
-            }
             if t >= n {
                 return Err(Unsupported::Malformed("jump out of range"));
             }
@@ -92,58 +89,45 @@ pub fn lift(body: &CompiledBody) -> Result<Function, Unsupported> {
     let ends: Vec<usize> = (0..nb)
         .map(|bi| block_starts.get(bi + 1).copied().unwrap_or(n))
         .collect();
+    let terms: Vec<Option<usize>> = ends.iter().map(|&e| terminator_index(steps, e)).collect();
 
-    // Predecessors, from each block's successors (a jump target and, for a
-    // conditional or a fall-through, the next block).
-    let mut preds: Vec<Vec<usize>> = vec![Vec::new(); nb];
-    for (bi, &end) in ends.iter().enumerate() {
+    // Successors, then each block's entry stack depth. The depth is a fixpoint:
+    // a loop header's depth is fed by a back edge from a block not yet visited.
+    let mut succs: Vec<Vec<usize>> = Vec::with_capacity(nb);
+    for &end in &ends {
+        let mut row = Vec::new();
         for succ in block_successors(steps, end, n)? {
             let sb = block_of[succ];
             if sb == usize::MAX {
                 return Err(Unsupported::Malformed("jump to a non-block start"));
             }
-            preds[sb].push(bi);
+            row.push(sb);
         }
+        succs.push(row);
     }
+    let depths = stack_depths(steps, &block_starts, &ends, &terms, &succs)?;
 
     let mut func = Function::new();
     for _ in 1..nb {
         func.push_block();
     }
     let mut builder = Builder::new(&mut func);
+    // Every join takes its stack as parameters, sized by the fixpoint. Uniform
+    // (a single predecessor passes its stack too), which is what lets a loop
+    // header's parameters be known before the header is emitted.
+    for (bi, &depth) in depths.iter().enumerate().skip(1) {
+        for _ in 0..depth {
+            builder.param(bi as BlockId, Type::Unknown);
+        }
+    }
     let mut term_rec: Vec<Option<TermRec>> = (0..nb).map(|_| None).collect();
-
-    // Emit instructions; the operand stack is SSA. A join block takes its stack
-    // as parameters, and each predecessor passes its stack as edge arguments
-    // (filled in below, once every block's parameters are known).
     for bi in 0..nb {
-        let incoming: Vec<ValueId> = if bi == 0 {
-            Vec::new()
-        } else {
-            let stacks: Vec<&[ValueId]> = preds[bi]
-                .iter()
-                .filter_map(|&p| term_rec[p].as_ref().map(edge_stack))
-                .collect();
-            let depth = stacks.first().map_or(0, |s| s.len());
-            if stacks.iter().any(|s| s.len() != depth) {
-                return Err(Unsupported::Malformed("stack depth mismatch at a join"));
-            }
-            if preds[bi].len() > 1 {
-                (0..depth)
-                    .map(|_| builder.param(bi as BlockId, Type::Unknown))
-                    .collect()
-            } else {
-                stacks.first().map_or_else(Vec::new, |s| s.to_vec())
-            }
-        };
-        let mut stack = incoming;
-        let end = ends[bi];
-        let term = terminator_index(steps, end);
-        let body_end = term.unwrap_or(end);
+        let mut stack: Vec<ValueId> = builder.func().block(bi as BlockId).params.clone();
+        let body_end = terms[bi].unwrap_or(ends[bi]);
         for step in &steps[block_starts[bi]..body_end] {
             emit_step(&mut builder, bi as BlockId, &mut stack, step)?;
         }
-        term_rec[bi] = Some(match term {
+        term_rec[bi] = Some(match terms[bi] {
             Some(ti) => match &steps[ti] {
                 Step::Return => TermRec::Ret(stack.pop().ok_or(Unsupported::Stack)?),
                 Step::Jump(_) => TermRec::Jump(stack),
@@ -156,15 +140,13 @@ pub fn lift(body: &CompiledBody) -> Result<Function, Unsupported> {
         });
     }
 
-    // Terminators: every target's parameters are now known.
     for bi in 0..nb {
         let end = ends[bi];
-        let term = terminator_index(steps, end);
         let rec = term_rec[bi].as_ref().ok_or(Unsupported::Invalid)?;
         match rec {
             TermRec::Ret(v) => builder.term(bi as BlockId, Term::Return(Some(*v))),
             TermRec::Jump(stack) => {
-                let target = match term {
+                let target = match terms[bi] {
                     Some(ti) => jump_target(&steps[ti]).ok_or(Unsupported::Invalid)?,
                     None => end,
                 };
@@ -173,7 +155,7 @@ pub fn lift(body: &CompiledBody) -> Result<Function, Unsupported> {
                 builder.term(bi as BlockId, Term::Jump { target: sb, args });
             }
             TermRec::Branch(cond, stack) => {
-                let ti = term.ok_or(Unsupported::Invalid)?;
+                let ti = terms[bi].ok_or(Unsupported::Invalid)?;
                 let (target, truthy) = match &steps[ti] {
                     Step::JumpIfTrue(t) => (*t, true),
                     Step::JumpIfFalse(t) => (*t, false),
@@ -204,18 +186,96 @@ pub fn lift(body: &CompiledBody) -> Result<Function, Unsupported> {
     Ok(func)
 }
 
+/// Every block's entry stack depth, as a fixpoint (a loop header's depth is
+/// fed by a back edge, so one forward pass is not enough). Every edge into a
+/// block must agree; a block with no predecessors is unreachable.
+fn stack_depths(
+    steps: &[Step],
+    starts: &[usize],
+    ends: &[usize],
+    terms: &[Option<usize>],
+    succs: &[Vec<usize>],
+) -> Result<Vec<usize>, Unsupported> {
+    let nb = ends.len();
+    let mut depth: Vec<Option<i32>> = vec![None; nb];
+    depth[0] = Some(0);
+    loop {
+        let mut changed = false;
+        for bi in 0..nb {
+            let Some(entry) = depth[bi] else {
+                continue;
+            };
+            let mut out = entry;
+            for step in &steps[starts[bi]..terms[bi].unwrap_or(ends[bi])] {
+                out += stack_delta(step)?;
+            }
+            // A conditional pops its condition on the way out.
+            let edge = match terms[bi] {
+                Some(ti) if matches!(steps[ti], Step::JumpIfFalse(_) | Step::JumpIfTrue(_)) => {
+                    out - 1
+                }
+                _ => out,
+            };
+            if edge < 0 {
+                return Err(Unsupported::Malformed("stack underflow"));
+            }
+            for &s in &succs[bi] {
+                match depth[s] {
+                    None => {
+                        depth[s] = Some(edge);
+                        changed = true;
+                    }
+                    Some(known) if known != edge => {
+                        return Err(Unsupported::Malformed("stack depth mismatch at a join"));
+                    }
+                    _ => {}
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    depth
+        .into_iter()
+        .map(|d| {
+            d.map(|d| d as usize)
+                .ok_or(Unsupported::Malformed("unreachable block"))
+        })
+        .collect()
+}
+
+/// The operand-stack effect of a step the lift accepts (it must mirror
+/// `emit_step`); a step outside the subset is refused here too, so the bail
+/// names the step rather than a spurious depth mismatch.
+fn stack_delta(step: &Step) -> Result<i32, Unsupported> {
+    Ok(match step {
+        Step::Push(_) | Step::Dup | Step::LoadLocal { .. } => 1,
+        Step::Pop
+        | Step::StoreLocal { .. }
+        | Step::InitLocal { .. }
+        | Step::FusedStoreLocal { .. }
+        | Step::Binary(_)
+        | Step::SetCompletion => -1,
+        // `BinaryImm` pops its left operand and pushes the result; the rest are
+        // net-neutral.
+        Step::BinaryImm { .. }
+        | Step::Unary(_)
+        | Step::ResetCompletion
+        | Step::NormalizeCompletion
+        | Step::ListBegin
+        | Step::ListEnd
+        | Step::SaveCompletion
+        | Step::RestoreCompletion => 0,
+        other => return Err(Unsupported::Step(step_name(other))),
+    })
+}
+
 /// The edge payload a block leaves on each successor.
 enum TermRec {
     Ret(ValueId),
     Jump(Vec<ValueId>),
     Branch(ValueId, Vec<ValueId>),
-}
-
-fn edge_stack(rec: &TermRec) -> &[ValueId] {
-    match rec {
-        TermRec::Ret(_) => &[],
-        TermRec::Jump(stack) | TermRec::Branch(_, stack) => stack,
-    }
 }
 
 /// The arguments a predecessor passes into `target`: its stack, or nothing
@@ -318,6 +378,51 @@ fn emit_step(
                 Imm::Slot(*slot as u32),
             );
         }
+        Step::FusedStoreLocal { slot } => {
+            // A statement-position assignment: store, then set the completion
+            // register to the stored value (spec 6.2.2.4).
+            let value = stack.pop().ok_or(Unsupported::Stack)?;
+            builder.emit_void(
+                block,
+                Op::FrameStore,
+                &[value],
+                Effects::write(Heap::Slots),
+                Imm::Slot(*slot as u32),
+            );
+            builder.emit_void(
+                block,
+                Op::CompletionStore,
+                &[value],
+                Op::CompletionStore.default_effects(),
+                Imm::None,
+            );
+        }
+        Step::SetCompletion => {
+            let value = stack.pop().ok_or(Unsupported::Stack)?;
+            builder.emit_void(
+                block,
+                Op::CompletionStore,
+                &[value],
+                Op::CompletionStore.default_effects(),
+                Imm::None,
+            );
+        }
+        Step::ResetCompletion => {
+            builder.emit_void(
+                block,
+                Op::CompletionReset,
+                &[],
+                Op::CompletionReset.default_effects(),
+                Imm::None,
+            );
+        }
+        // The compiled model treats the normalize and save/restore as no-ops
+        // (the completion register is unobservable within a certified body).
+        Step::NormalizeCompletion
+        | Step::ListBegin
+        | Step::ListEnd
+        | Step::SaveCompletion
+        | Step::RestoreCompletion => {}
         Step::Binary(op) => {
             let right = stack.pop().ok_or(Unsupported::Stack)?;
             let left = stack.pop().ok_or(Unsupported::Stack)?;
@@ -641,9 +746,44 @@ mod tests {
     }
 
     #[test]
-    fn a_back_edge_is_unsupported() {
-        let b = body(vec![Step::Jump(0)], 0);
-        assert_eq!(lift(&b).unwrap_err(), Unsupported::Step("loop"));
+    fn lifts_a_loop() {
+        // var s = 0; while (s < 3) { s = s + 1; } return s;
+        //  0 Push 0        5 LoadLocal 1
+        //  1 InitLocal 1   6 BinaryImm + 1
+        //  2 LoadLocal 1   7 StoreLocal 1
+        //  3 BinaryImm < 3 8 Jump 2      (back edge)
+        //  4 JumpIfFalse 9 9 LoadLocal 1
+        //                 10 Return
+        let b = body(
+            vec![
+                Step::Push(Value::Number(0.0)),
+                Step::InitLocal { slot: 1 },
+                Step::LoadLocal { slot: 1 },
+                Step::BinaryImm {
+                    op: BinaryOp::LessThan,
+                    imm: 3.0,
+                },
+                Step::JumpIfFalse(9),
+                Step::LoadLocal { slot: 1 },
+                Step::BinaryImm {
+                    op: BinaryOp::Add,
+                    imm: 1.0,
+                },
+                Step::StoreLocal { slot: 1 },
+                Step::Jump(2),
+                Step::LoadLocal { slot: 1 },
+                Step::Return,
+            ],
+            2,
+        );
+        let func = lift(&b).expect("lifts");
+        // Blocks: [0,2) entry, [2,5) header, [5,9) body, [9,11) exit.
+        assert_eq!(func.block_count(), 4);
+        // The loop body (block 2) jumps back to the header (block 1).
+        assert!(matches!(
+            func.block(2).term,
+            Some(Term::Jump { target: 1, .. })
+        ));
     }
 
     #[test]

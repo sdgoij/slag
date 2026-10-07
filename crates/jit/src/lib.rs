@@ -1978,6 +1978,38 @@ mod tests {
     }
 
     #[test]
+    fn opt_tier_loop_body_matches_the_interpreter() {
+        // I2b: a `do`/`while` loop takes the plain back-edge path (its body
+        // starts at step 0, so the back edge targets the entry block and the
+        // lowering's prologue is exercised) and must agree with the
+        // interpreter.
+        let source = "function f(n) { var s = 0; var i = n; \
+                        do { s = s + i; i = i - 1; } while (i > 0); \
+                        return s; } \
+                      var t = 0; \
+                      t += f(3); t += f(5); t += f(1); t += f(7); \
+                      t += f(2); t += f(9); t += f(4); t += f(6); \
+                      t += f(0); t += f(8); t += f(10); t += f(11); \
+                      t += f(12); t += f(13); t += f(14); t += f(15); \
+                      t += f(16); t += f(17); t += f(18); t += f(19); \
+                      t;";
+        let interp = {
+            let mut agent = runtime::Agent::new();
+            agent.initialize_host_defined_realm().expect("realm");
+            agent.run_script(source).expect("interp runs")
+        };
+        let before = crate::opt_lower::OPT_COMPILED.load(Ordering::Relaxed);
+        let (value, compiled) = with_opt_jit_agent(|agent| agent.run_script(source).expect("runs"));
+        let lowered = crate::opt_lower::OPT_COMPILED.load(Ordering::Relaxed) - before;
+        assert_eq!(
+            value, interp,
+            "the optimizing tier must match the interpreter"
+        );
+        assert!(compiled >= 1, "{compiled} bodies compiled");
+        assert!(lowered >= 1, "the optimizing tier lowered {lowered} bodies");
+    }
+
+    #[test]
     fn installed_jit_runs_a_member_callee() {
         // `return o.f(1) + 1` — a member callee (plain `CallFast`), no loop.
         // Cut 69: both bodies are straight-line, so the call repeats 17×

@@ -291,6 +291,27 @@ interpreter and assert the tier actually ran; `cargo test -p jit` 278 passed,
 workspace green, and with `SLAG_OPT=1` the whole test262 `all` area is at 0
 fail. Still no perf claim.
 
+**I2b status (2026-10-07): loops and the completion register landed, so I2 is
+complete.** The lift admits back edges (a block start at a jump target that
+precedes it is no longer refused) and models the statement-completion steps
+(`SetCompletion`/`ResetCompletion` -> `Op::CompletionStore`/`CompletionReset`,
+both `World` writes; `FusedStoreLocal` -> store + completion;
+`NormalizeCompletion`/`ListBegin`/`ListEnd`/`SaveCompletion`/
+`RestoreCompletion` -> no-ops, matching the compiled model). Join block
+parameters are no longer sized from an already-lifted predecessor: a
+**stack-depth fixpoint** (`stack_depths`) runs over the successor edges first,
+so a loop header's parameters are known before the header is emitted, and every
+join is **uniform** (a single predecessor passes its stack too). `opt_lower`
+grows an entry prologue when anything targets IR block 0 (Cranelift forbids
+jumping to the entry block) and lowers the completion ops to stores of
+`Vm::completion`/`completion_is_empty` (the `Vm` pointer is loaded from the ctx
+inside the helper, not hoisted, so the entry block stays pristine for the I2a
+re-switch). A `do`/`while` reduction e2e test matches the interpreter and
+asserts the tier ran; `cargo test -p jit` 279 passed, `cargo test --workspace`
+green, `cargo clippy --workspace --all-targets -- -D warnings` clean. The
+`while`/`for` shape still reaches the interpreter's `FastLoopHead` fusion first,
+so the lift's loop path is exercised by `do`/`while` today. Still no perf claim.
+
 ## 10. Open decisions
 
 1. **Feedback store location** — per body (`CompiledBody`) or per closure

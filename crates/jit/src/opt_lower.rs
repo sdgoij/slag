@@ -15,7 +15,7 @@ use cranelift_codegen::ir::{
 use cranelift_codegen::isa::{CallConv, TargetIsa};
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
 use crux::Value as JsValue;
-use runtime::jit::JitCallContext;
+use runtime::jit::{JitCallContext, VM_COMPLETION_IS_EMPTY_OFFSET, VM_COMPLETION_OFFSET};
 use syntax::ast::{BinaryOp, UnaryOp};
 
 use crate::Compiled;
@@ -68,12 +68,28 @@ fn lower(
     conv: CallConv,
 ) -> Result<(), Unsupported> {
     let mut builder = FunctionBuilder::new(func, fctx);
-    // One Cranelift block per IR block. The entry takes the function
-    // parameters; every other block takes its IR parameters (the join stack).
+    // Cranelift forbids jumping to the entry block, so when anything targets IR
+    // block 0 (a loop back to the body start) the function entry is a prologue
+    // that binds the parameters and jumps to a separate block 0.
+    let loops_to_entry = (0..ir.block_count() as BlockId).any(|b| match &ir.block(b).term {
+        Some(Term::Jump { target, .. }) => *target == 0,
+        Some(Term::Branch {
+            then_block,
+            else_block,
+            ..
+        }) => *then_block == 0 || *else_block == 0,
+        _ => false,
+    });
+    let func_entry = builder.create_block();
+    builder.append_block_params_for_function_params(func_entry);
+    // One Cranelift block per IR block; every block takes its IR parameters as
+    // Cranelift block parameters.
     let mut clif: Vec<Block> = Vec::with_capacity(ir.block_count());
-    let entry = builder.create_block();
-    builder.append_block_params_for_function_params(entry);
-    clif.push(entry);
+    if loops_to_entry {
+        clif.push(builder.create_block());
+    } else {
+        clif.push(func_entry);
+    }
     for b in 1..ir.block_count() as BlockId {
         let block = builder.create_block();
         for _ in 0..ir.block(b).params.len() {
@@ -82,8 +98,8 @@ fn lower(
         clif.push(block);
     }
 
-    builder.switch_to_block(clif[0]);
-    let entry_params = builder.block_params(clif[0]).to_vec();
+    builder.switch_to_block(func_entry);
+    let entry_params = builder.block_params(func_entry).to_vec();
     let abi = Abi {
         frame: entry_params[0],
         vm: entry_params[2],
@@ -92,6 +108,9 @@ fn lower(
         sig_bool: builder.import_signature(helper_sig(&[types::I64; 2], conv)),
     };
     let undefined = JsValue::Undefined.bits() as i64;
+    if loops_to_entry {
+        builder.ins().jump(clif[0], &[]);
+    }
 
     let mut values: Vec<Option<ClifValue>> = vec![None; ir.value_count() as usize];
     for b in 0..ir.block_count() as BlockId {
@@ -247,6 +266,18 @@ fn lower_inst(
                 &[op, value],
             )?
         }
+        Op::CompletionReset => {
+            let undefined = builder
+                .ins()
+                .iconst(types::I64, JsValue::Undefined.bits() as i64);
+            emit_completion_store(builder, abi.vm, undefined, true);
+            undefined
+        }
+        Op::CompletionStore => {
+            let value = arg(0)?;
+            emit_completion_store(builder, abi.vm, value, false);
+            value
+        }
         _ => return Err(Unsupported::Step("opt:op")),
     })
 }
@@ -292,6 +323,50 @@ fn call_helper(
         bump_leaf_epoch(builder, abi.vm);
     }
     Ok(result)
+}
+
+/// Write the interpreter's completion register (`Vm::completion` plus
+/// `completion_is_empty`) from lowered code, mirroring the per-step lowerer's
+/// `emit_completion_store`. The `Vm` pointer is loaded from the ctx here (not
+/// hoisted) so the entry block stays pristine — the I2a lowerer re-switches to
+/// it, and Cranelift requires a re-switched block to be untouched. The write is
+/// skipped when the ctx's `vm` pointer is null — the scaffold's bare-ctx test
+/// harness (which never dereferences it) calls the compiled code with a null
+/// `vm`.
+fn emit_completion_store(
+    builder: &mut FunctionBuilder,
+    ctx: ClifValue,
+    value: ClifValue,
+    is_empty: bool,
+) {
+    let vm = builder.ins().load(
+        types::I64,
+        MemFlagsData::new(),
+        ctx,
+        Offset32::new(std::mem::offset_of!(JitCallContext, vm) as i32),
+    );
+    let has_vm = builder.ins().icmp_imm_u(IntCC::NotEqual, vm, 0);
+    let store = builder.create_block();
+    let skip = builder.create_block();
+    builder.ins().brif(has_vm, store, &[], skip, &[]);
+    builder.switch_to_block(store);
+    builder.ins().store(
+        MemFlagsData::new(),
+        value,
+        vm,
+        Offset32::new(VM_COMPLETION_OFFSET as i32),
+    );
+    let empty = builder.ins().iconst(types::I8, is_empty as i64);
+    builder.ins().store(
+        MemFlagsData::new(),
+        empty,
+        vm,
+        Offset32::new(VM_COMPLETION_IS_EMPTY_OFFSET as i32),
+    );
+    builder.ins().jump(skip, &[]);
+    builder.seal_block(store);
+    builder.switch_to_block(skip);
+    builder.seal_block(skip);
 }
 
 fn bump_leaf_epoch(builder: &mut FunctionBuilder, vm: ClifValue) {
