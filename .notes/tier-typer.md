@@ -62,8 +62,8 @@ statically provable (`narrow`), no guard is needed at all.
 |----|---------|------|
 | T1 | `Op::GuardType` + its lowering (via the landed deopt resume); no pass emits it yet | behavior-neutral; a hand-built-IR test proves the deopt and the tag-free fast path — **landed** |
 | T2 | a type guard inserted at a **loop preheader** for a loop-invariant value (the static, no-feedback slice: a member/element read whose cell is validated) | the `read`/`obj_prop` rows: guards removed, tag checks removed |
-| T3 | feedback-driven guards (the `I3` records say the site is monomorphic-typed) | no deopt thrash on the corpus |
-| T4 | the typer consumes the guard to make arithmetic tag-free across the loop | the hoist (G2b) revisited: does the register headroom return? |
+| T3 | feedback-driven guards (the `I3` records say the site is monomorphic-typed) | no deopt thrash on the corpus — **not needed; see below** |
+| T4 | the typer consumes the guard to make arithmetic tag-free across the loop | the hoist (G2b) revisited: does the register headroom return? — **no; see below** |
 
 T2 is deliberately **feedback-free**: the correctness premise is a *static* one
 ("this loop-invariant read is validated by a guard"), mirroring the read plan's
@@ -165,6 +165,32 @@ Gates: `cargo test --workspace` green (jit 312/0); clippy `--workspace
 `built-ins` 23,820/0/1/0 at baseline both with the typer off AND with
 `SLAG_TYPER=1` (the one `built-ins` hang under `SLAG_TYPER=1` was the documented
 `copyWithin` wobble — it passes in isolation).
+
+## T3 — no decision gate is needed (measured)
+
+T3's premise was deopt thrash on a read that is not a Number. Measured, the
+thrash is neutral: a non-leaf loop reading a STRING property (`read_loop_string`)
+measures **1.016x** with the guard on — with the guard off the compiled body
+already calls `BinarySlow` per iteration, so deopting to the interpreter is
+neither better nor worse. And where the guard is pure overhead — a non-leaf loop
+that reads a number property but never uses it arithmetically (`read_bare`,
+the read feeds a `FrameStore`) — it measures **0.972x**, i.e. within noise. So
+the guard is (mildly) neutral-to-positive everywhere measured, and a gate buys
+nothing that can be measured on this machine. The guard stays **off by default**
+anyway: the win is small and the corpus A/B is too noisy here to validate a
+broad default-on; a future session with a quieter machine can flip it.
+
+## T4 — the hoist still regresses with tag-free arithmetic (negative)
+
+T4's hypothesis was that the tag-free arithmetic (the `narrow` fix) frees enough
+registers for the read hoist (G2b) to pay. Refuted: with `Op::MemberCellLoad`
+re-added to LICM's hoistable set, `read_loop` goes **0.905 -> 1.701x** and
+`read_loop_nonleaf` **0.909 -> 1.657x** (tier/per-step; `arith_loop` unchanged at
+0.666). The regression is the same shape as G2b. The reason is structural: the
+tag checks are *transient* (not loop-live), while the hoisted cell value *is*
+loop-live — so the register pressure is orthogonal to what the typer removes.
+`Op::MemberCellLoad` stays out of LICM's hoistable set. The read's win is the
+inlining (G2b) plus the now-tag-free arithmetic, not the hoist.
 
 ## Gates and traps
 
