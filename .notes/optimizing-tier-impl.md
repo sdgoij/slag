@@ -411,6 +411,27 @@ tier lowered a body it previously refused whole); `cargo clippy --workspace
 fixtures included. Next: `GetMemberComputed`, then the first transform that
 consumes the widened IR.
 
+**First transform + a number (2026-10-07): inline numeric arithmetic.** The
+lift now also takes `Step::GetMemberComputed` (`o[k]`) into `Op::ElementLoad`,
+lowed through `Helper::GetMemberComputed`, completing the read set. `opt_lower`
+is no longer helper-only: `+`/`-`/`*`/`/` and the ordering comparisons emit an
+inline numeric fast path — when both operands carry the double tag, compute in
+f64 registers (bitcast, `fadd`/`fsub`/`fmul`/`fdiv`/`fcmp`, result
+canonicalized against the tag region exactly like `Value::Number`) and take **no
+helper call and no interpreter round-trip**; otherwise fall through to
+`BinarySlow`. This mirrors the per-step lowerer's `emit_binary_known` float path,
+so the tier's hot arithmetic costs what a per-step body's does, and the tier's
+structural advantage (no per-step dispatch) can show. Measured on an arithmetic
+`do`/`while` loop (5M iterations, `tools/corpus` protocol, min-of-5 interleaved,
+`SLAG_OPT=0` vs `SLAG_OPT=1` on one binary): **24.8ms per-step -> 20.5ms IR,
+~1.21x** — confirmed the body ran as `jit_opt_body` (the IR path, 0 bails), not
+noise. A single-run corpus A/B over all 77 workloads showed **0 result
+mismatches** with the tier on. Gates: `cargo test --workspace` green (293 jit
+tests); `cargo clippy --workspace --all-targets -- -D warnings` clean; with
+`SLAG_OPT=1` test262 `language` 23,726 / 0 and `built-ins` 23,820 / 0 / 1, both
+at baseline. Still behind `SLAG_OPT`; the number is the first time the tier beats
+the per-step path, and it is the base the next transforms build on.
+
 ## 10. Open decisions
 
 1. **Feedback store location** — per body (`CompiledBody`) or per closure

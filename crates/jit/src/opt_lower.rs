@@ -6,7 +6,7 @@
 //! `SLAG_OPT` (see [`JitEngine`](crate::JitEngine)); a body `opt::lift` refuses
 //! — or that this lowerer then declines — keeps the per-step path.
 
-use cranelift_codegen::ir::condcodes::IntCC;
+use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
 use cranelift_codegen::ir::immediates::Offset32;
 use cranelift_codegen::ir::{
     Block, BlockArg, Function, InstBuilder, MemFlagsData, SigRef, UserFuncName, Value as ClifValue,
@@ -244,16 +244,26 @@ fn lower_inst(
         | Op::Gt
         | Op::Ge => {
             let disc = binary_op(inst.op).ok_or(Unsupported::Step("opt:binary"))?;
-            let op = builder.ins().iconst(types::I64, disc as i64);
             let (lhs, rhs) = (arg(0)?, arg(1)?);
-            call_helper(
-                builder,
-                helpers,
-                abi,
-                abi.sig_binary,
-                Helper::BinarySlow,
-                &[op, lhs, rhs],
-            )?
+            // Arithmetic and the ordering comparisons take the inline numeric
+            // fast path when both operands are Numbers (the common shape); the
+            // rest still go straight to the helper.
+            if matches!(
+                inst.op,
+                Op::Add | Op::Sub | Op::Mul | Op::Div | Op::Lt | Op::Le | Op::Gt | Op::Ge
+            ) {
+                call_numeric_binary(builder, helpers, abi, inst.op, disc as i64, lhs, rhs)?
+            } else {
+                let op = builder.ins().iconst(types::I64, disc as i64);
+                call_helper(
+                    builder,
+                    helpers,
+                    abi,
+                    abi.sig_binary,
+                    Helper::BinarySlow,
+                    &[op, lhs, rhs],
+                )?
+            }
         }
         Op::ToNumber | Op::Neg | Op::BitNot | Op::Not => {
             let disc = unary_op(inst.op).ok_or(Unsupported::Step("opt:unary"))?;
@@ -336,6 +346,19 @@ fn lower_inst(
                 abi.sig_unary,
                 Helper::GetMemberName,
                 &[object, name],
+            )?
+        }
+        // A lifted `o[k]`: the `get_member_computed` helper.
+        Op::ElementLoad => {
+            let object = arg(0)?;
+            let key = arg(1)?;
+            call_helper(
+                builder,
+                helpers,
+                abi,
+                abi.sig_unary,
+                Helper::GetMemberComputed,
+                &[object, key],
             )?
         }
         // A lifted `LoadGlobal`: the same `get_global` helper as the per-step
@@ -443,6 +466,100 @@ fn emit_completion_store(
     builder.seal_block(store);
     builder.switch_to_block(skip);
     builder.seal_block(skip);
+}
+
+/// The inline numeric fast path for `+`/`-`/`*`/`/` and the ordering
+/// comparisons: when both operands are Numbers (the NaN-boxed double tag),
+/// compute in f64 registers with no helper call and no interpreter round-trip;
+/// otherwise fall through to `BinarySlow`. Mirrors the per-step lowerer's
+/// `emit_binary_known` float path (a Number's bits bit-cast to its f64 and the
+/// result canonicalized against the tag region), so an optimizing body's hot
+/// arithmetic costs what a per-step body's does.
+fn call_numeric_binary(
+    builder: &mut FunctionBuilder,
+    helpers: &JitHelpers,
+    abi: &Abi,
+    op: Op,
+    disc: i64,
+    lhs: ClifValue,
+    rhs: ClifValue,
+) -> Result<ClifValue, Unsupported> {
+    let lhs_num = builder.ins().bitcast(types::F64, MemFlagsData::new(), lhs);
+    let rhs_num = builder.ins().bitcast(types::F64, MemFlagsData::new(), rhs);
+    let fast = match op {
+        Op::Lt | Op::Le | Op::Gt | Op::Ge => {
+            let cc = match op {
+                Op::Lt => FloatCC::LessThan,
+                Op::Le => FloatCC::LessThanOrEqual,
+                Op::Gt => FloatCC::GreaterThan,
+                _ => FloatCC::GreaterThanOrEqual,
+            };
+            let c = builder.ins().fcmp(cc, lhs_num, rhs_num);
+            let t = builder
+                .ins()
+                .iconst(types::I64, JsValue::Boolean(true).bits() as i64);
+            let f = builder
+                .ins()
+                .iconst(types::I64, JsValue::Boolean(false).bits() as i64);
+            builder.ins().select(c, t, f)
+        }
+        _ => {
+            let res = match op {
+                Op::Add => builder.ins().fadd(lhs_num, rhs_num),
+                Op::Sub => builder.ins().fsub(lhs_num, rhs_num),
+                Op::Mul => builder.ins().fmul(lhs_num, rhs_num),
+                _ => builder.ins().fdiv(lhs_num, rhs_num),
+            };
+            let bits = builder.ins().bitcast(types::I64, MemFlagsData::new(), res);
+            canon_double(builder, bits)
+        }
+    };
+    let lhs_dbl = is_double(builder, lhs);
+    let rhs_dbl = is_double(builder, rhs);
+    let both = builder.ins().band(lhs_dbl, rhs_dbl);
+    let result = builder.declare_var(types::I64);
+    builder.def_var(result, fast);
+    let merge = builder.create_block();
+    let slow = builder.create_block();
+    builder.ins().brif(both, merge, &[], slow, &[]);
+    builder.switch_to_block(slow);
+    let op_imm = builder.ins().iconst(types::I64, disc);
+    let slow_res = call_helper(
+        builder,
+        helpers,
+        abi,
+        abi.sig_binary,
+        Helper::BinarySlow,
+        &[op_imm, lhs, rhs],
+    )?;
+    builder.def_var(result, slow_res);
+    builder.ins().jump(merge, &[]);
+    builder.seal_block(slow);
+    builder.switch_to_block(merge);
+    builder.seal_block(merge);
+    Ok(builder.use_var(result))
+}
+
+/// `bits & TAG_MASK != TAG_PREFIX` — the Number (double) tag check.
+fn is_double(builder: &mut FunctionBuilder, bits: ClifValue) -> ClifValue {
+    let masked = builder.ins().band_imm_u(bits, crux::TAG_MASK as i64);
+    builder
+        .ins()
+        .icmp_imm_u(IntCC::NotEqual, masked, crux::TAG_PREFIX as i64)
+}
+
+/// Canonicalize a computed double's bits: a NaN whose top bits collide with the
+/// tag region would read as a tag, so replace it with the canonical NaN (the
+/// same normalization `Value::Number` does).
+fn canon_double(builder: &mut FunctionBuilder, bits: ClifValue) -> ClifValue {
+    let masked = builder.ins().band_imm_u(bits, crux::TAG_MASK as i64);
+    let collides = builder
+        .ins()
+        .icmp_imm_u(IntCC::Equal, masked, crux::TAG_PREFIX as i64);
+    let canon = builder
+        .ins()
+        .iconst(types::I64, JsValue::Number(f64::NAN).bits() as i64);
+    builder.ins().select(collides, canon, bits)
 }
 
 fn bump_leaf_epoch(builder: &mut FunctionBuilder, vm: ClifValue) {

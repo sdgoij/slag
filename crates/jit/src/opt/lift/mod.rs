@@ -255,6 +255,7 @@ fn stack_delta(step: &Step) -> Result<i32, Unsupported> {
         | Step::InitLocal { .. }
         | Step::FusedStoreLocal { .. }
         | Step::Binary(_)
+        | Step::GetMemberComputed
         | Step::SetCompletion => -1,
         // `BinaryImm` pops its left operand and pushes the result, a member
         // read pops the receiver and pushes the value; the rest are net-neutral.
@@ -388,6 +389,21 @@ fn emit_step(
                 Type::Unknown,
                 Effects::call(),
                 Imm::Atom(*name),
+            );
+            stack.push(v);
+        }
+        // A computed member read (`o[k]`): the same opaque effect as the name
+        // form; the key is a runtime value on the stack.
+        Step::GetMemberComputed => {
+            let key = stack.pop().ok_or(Unsupported::Stack)?;
+            let object = stack.pop().ok_or(Unsupported::Stack)?;
+            let v = builder.emit(
+                block,
+                Op::ElementLoad,
+                &[object, key],
+                Type::Unknown,
+                Effects::call(),
+                Imm::None,
             );
             stack.push(v);
         }
@@ -892,6 +908,26 @@ mod tests {
         assert_eq!(insts[1].imm, Imm::Atom(member));
         assert_eq!(insts[2].op, Op::GlobalLoad);
         assert_eq!(insts[2].imm, Imm::Atom(global));
+    }
+
+    #[test]
+    fn lifts_a_computed_read() {
+        // LoadLocal 0; Push 1; GetMemberComputed; Return
+        let b = body(
+            vec![
+                Step::LoadLocal { slot: 0 },
+                Step::Push(crux::Value::Number(1.0)),
+                Step::GetMemberComputed,
+                Step::Return,
+            ],
+            1,
+        );
+        let func = lift(&b).expect("lifts");
+        let insts = &func.block(func.entry()).insts;
+        assert_eq!(insts[0].op, Op::FrameLoad);
+        assert_eq!(insts[1].op, Op::Const);
+        assert_eq!(insts[2].op, Op::ElementLoad);
+        assert_eq!(insts[2].args.len(), 2);
     }
 
     #[test]
