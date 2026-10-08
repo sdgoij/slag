@@ -27,7 +27,7 @@ pub fn run(func: &mut Function) -> bool {
                     // Effect-only: a store or a completion write.
                     return true;
                 };
-                if inst.op == Op::Check || inst.op == Op::GuardType {
+                if inst.op == Op::Check || inst.op == Op::GuardType || inst.op == Op::GuardCallee {
                     return true;
                 }
                 // A pure computation, or a frame load (a private-slot read that

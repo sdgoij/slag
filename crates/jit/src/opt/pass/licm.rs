@@ -139,7 +139,7 @@ fn hoistable(inst: &Inst, slots_stored: &[bool]) -> bool {
             inst.imm,
             Imm::Slot(s) if !slots_stored.get(s as usize).copied().unwrap_or(false)
         ),
-        Op::Check | Op::TdzCheck | Op::GuardType => false,
+        Op::Check | Op::TdzCheck | Op::GuardType | Op::GuardCallee => false,
         _ => inst.effects.is_pure(),
     }
 }

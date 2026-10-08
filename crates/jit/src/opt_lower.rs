@@ -236,6 +236,9 @@ fn lower_inst(
                 Imm::Float(f) => JsValue::Number(*f).bits() as i64,
                 Imm::Int(i) => JsValue::Number(*i as f64).bits() as i64,
                 Imm::Bool(b) => JsValue::Boolean(*b).bits() as i64,
+                // Raw NaN-boxed bits (a boxed `Value` constant, e.g. a callee
+                // guard's expected function identity).
+                Imm::U64(v) => *v as i64,
                 _ => return Err(Unsupported::Step("opt:const")),
             };
             builder.ins().iconst(types::I64, bits)
@@ -404,6 +407,22 @@ fn lower_inst(
             };
             emit_guard(builder, abi, ok, step, &inst.args[1..], values)?;
             value
+        }
+        // A callee guard (I5c-2b): the success path is the callee value
+        // unchanged; a mismatch retires the body via the same deopt block
+        // `Op::GuardType` uses. `args[2..]` is the live operand stack.
+        Op::GuardCallee => {
+            let Imm::Int(step) = inst.imm else {
+                return Err(Unsupported::Step("opt:guard-callee"));
+            };
+            if inst.args.len() < 2 {
+                return Err(Unsupported::Step("opt:guard-callee"));
+            }
+            let callee = arg(0)?;
+            let expected = arg(1)?;
+            let ok = builder.ins().icmp(IntCC::Equal, callee, expected);
+            emit_guard(builder, abi, ok, step, &inst.args[2..], values)?;
+            callee
         }
         // A TDZ guard: throw when the slot holds the uninitialized marker. The
         // helper sets the pending error and the body bails with `undefined`,

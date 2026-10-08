@@ -2430,6 +2430,67 @@ mod tests {
     }
 
     #[test]
+    fn opt_guard_callee_holds_or_deopts() {
+        // I5c-2b (`.notes/optimizing-tier-impl.md`): `Op::GuardCallee` asserted
+        // on a hand-built IR body. On a match the guard yields the callee
+        // unchanged (the box identity a splice assumes); on a mismatch the body
+        // retires (`DISPATCH_DEOPT`) so a splice compiled for one callee never
+        // runs for another. No helper is involved on either path.
+        use crate::opt::builder::Builder;
+        use crate::opt::ir::{Effects, Function, Imm, Op, Term, Type};
+        use runtime::jit::DISPATCH_DEOPT;
+
+        // `g = GuardCallee(callee, expected); return g` — `callee` and
+        // `expected` are raw box constants. `args[2..]` (the live operand
+        // stack) is the callee itself.
+        fn guard_body(callee: u64, expected: u64) -> Function {
+            let mut func = Function::new();
+            let entry = func.entry();
+            {
+                let mut b = Builder::new(&mut func);
+                let c = b.emit(
+                    entry,
+                    Op::Const,
+                    &[],
+                    Type::Object,
+                    Effects::pure(),
+                    Imm::U64(callee),
+                );
+                let e = b.emit(
+                    entry,
+                    Op::Const,
+                    &[],
+                    Type::Object,
+                    Effects::pure(),
+                    Imm::U64(expected),
+                );
+                let g = b.emit(
+                    entry,
+                    Op::GuardCallee,
+                    &[c, e, c],
+                    Type::Object,
+                    Effects::pure(),
+                    Imm::Int(0),
+                );
+                b.term(entry, Term::Return(Some(g)));
+            }
+            func
+        }
+
+        let engine = JitEngine::with_opt(true).expect("native isa");
+        let (a, b) = (0x1234_5678_9abc_def0_u64, 0x0fed_cba9_8765_4321_u64);
+        // A match: the guard yields the callee unchanged.
+        let ir = guard_body(a, a);
+        let compiled = engine.compile_ir(&ir, &helpers_none(), 2).expect("lowers");
+        assert_eq!(run(&compiled, 0), a);
+        // A mismatch: the body retires rather than run a splice for another
+        // callee.
+        let ir = guard_body(a, b);
+        let compiled = engine.compile_ir(&ir, &helpers_none(), 2).expect("lowers");
+        assert_eq!(run(&compiled, 0), DISPATCH_DEOPT);
+    }
+
+    #[test]
     fn opt_tier_for_loop_matches_the_interpreter() {
         // A `for` loop with a literal bound and an `i = i + 1` update takes the
         // non-fused path, whose test is the fused `JumpIfLtImm` step the lift now

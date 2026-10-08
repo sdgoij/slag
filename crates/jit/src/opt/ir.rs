@@ -192,6 +192,8 @@ pub enum Imm {
     Arg(u32),
     /// An interned property/binding name atom.
     Atom(u32),
+    /// Raw 64 bits (a NaN-boxed `Value` or an identity).
+    U64(u64),
 }
 
 /// An instruction opcode.
@@ -260,6 +262,14 @@ pub enum Op {
     /// result is `args[0]` re-typed; on failure the body retires and the
     /// interpreter resumes at `imm`'s step.
     GuardType,
+    /// A callee guard (I5c-2b): `args[0]` (a call site's callee `Value`) is
+    /// asserted to equal `args[1]` (the expected callee, a constant `Value` —
+    /// the box identity), so a splice the caller compiled for that callee is
+    /// valid. `args[2..]` is the live operand stack (bottom to top), like
+    /// [`Op::GuardType`], and `imm` is the step to resume at. On success the
+    /// result is `args[0]`; on failure the body retires and the interpreter
+    /// resumes at `imm`'s step.
+    GuardCallee,
     /// Throw a TDZ `ReferenceError` (spec 6.2.1.6.6) when the frame slot holds
     /// the uninitialized marker. Reads the slot; has no result.
     TdzCheck,
@@ -283,9 +293,13 @@ impl Op {
     pub fn default_effects(self) -> Effects {
         use Effects as E;
         match self {
-            Op::Const | Op::StrictEq | Op::ToBoolean | Op::Not | Op::Check | Op::GuardType => {
-                E::pure()
-            }
+            Op::Const
+            | Op::StrictEq
+            | Op::ToBoolean
+            | Op::Not
+            | Op::Check
+            | Op::GuardType
+            | Op::GuardCallee => E::pure(),
             Op::TdzCheck => E::read(Heap::Slots),
             Op::FrameLoad => E::read(Heap::Slots),
             Op::FrameStore => E::write(Heap::Slots),
