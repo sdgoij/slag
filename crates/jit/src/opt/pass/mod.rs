@@ -17,6 +17,10 @@
 //! fixpoint performs no additional work on any sampled body, so the single round
 //! is kept. The caller re-verifies the graph after the pipeline, because a pass
 //! bug must be a refusal (the per-step path), never a wrong program.
+//!
+//! `mem2reg` is not part of this pipeline: it runs on a callee's lifted IR inside
+//! the trial-inline resolver (I5c-2c-iii-b), so a spliced callee's `var` slots
+//! have no frame home in the caller.
 
 use crate::opt::ir::Function;
 
@@ -26,6 +30,7 @@ pub mod fold;
 pub mod guard;
 pub mod inline;
 pub mod licm;
+pub mod mem2reg;
 pub mod narrow;
 
 /// Whether the read-guard pruning pass runs. On by default; `SLAG_GUARD=0`

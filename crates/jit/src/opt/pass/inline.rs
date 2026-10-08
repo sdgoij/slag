@@ -235,10 +235,11 @@ fn try_inline(
     true
 }
 
-/// Whether this cut can splice `callee`: call-free, and every slot access is a
-/// load of an **input** slot (`< arity` or the `this` slot). A `FrameStore`, a
-/// `TdzCheck`, or a load of any other slot (a `var`) is refused — that is
-/// mem2reg's territory (I5c-2c-iii-b).
+/// Whether this cut can splice `callee`: call-free, and every remaining slot
+/// access is a load of an **input** slot (`< arity` or the `this` slot). The
+/// resolver promotes the callee's `var` slots to SSA first (`pass/mem2reg.rs`,
+/// I5c-2c-iii-b), so a `FrameStore`, a `TdzCheck`, or a load of any other slot
+/// means promotion could not lift it — refused.
 fn spliceable(callee: &Callee) -> bool {
     let mut returns_a_value = false;
     for k in 0..callee.ir.block_count() as u32 {
@@ -480,9 +481,10 @@ mod tests {
     }
 
     #[test]
-    fn leaves_a_var_writing_callee_alone() {
-        // I5c-2c-iii-b: a callee whose locals live in its frame (a `var` store)
-        // is refused — its slots have no home in the caller's frame.
+    fn leaves_an_unpromoted_var_writing_callee_alone() {
+        // This pass sees the resolver's output, after `pass::mem2reg`; a callee
+        // whose `var` still lives in the frame (a `FrameStore` or a non-input
+        // load) is refused — the slot has no home in the caller's frame.
         let mut f = Function::new();
         let e = f.entry();
         {
@@ -521,5 +523,55 @@ mod tests {
         let mut resolve = |_id: u64| Some(var_callee.clone());
         assert!(!run(&mut func, &site(), &mut resolve));
         assert!(ops(&func).contains(&Op::Call));
+    }
+
+    #[test]
+    fn splices_a_local_writing_callee_once_promoted() {
+        // I5c-2c-iii-b: `pass::mem2reg` promotes the callee's `var` slots to SSA,
+        // after which a callee with locals (`var t = 7; return t;`) splices.
+        let mut f = Function::new();
+        let e = f.entry();
+        {
+            let mut b = Builder::new(&mut f);
+            let seven = b.emit(
+                e,
+                Op::Const,
+                &[],
+                Type::Number,
+                Effects::pure(),
+                Imm::Float(7.0),
+            );
+            b.emit_void(
+                e,
+                Op::FrameStore,
+                &[seven],
+                Effects::write(Heap::Slots),
+                Imm::Slot(1),
+            );
+            let t = b.emit(
+                e,
+                Op::FrameLoad,
+                &[],
+                Type::Unknown,
+                Effects::read(Heap::Slots),
+                Imm::Slot(1),
+            );
+            b.term(e, Term::Return(Some(t)));
+        }
+        assert!(crate::opt::pass::mem2reg::run(&mut f), "the var promoted");
+        assert!(
+            !f.block(e).insts.iter().any(|i| i.op == Op::FrameStore),
+            "no frame store survives promotion"
+        );
+        let callee = Callee {
+            ir: Rc::new(f),
+            arity: 0,
+            this_slot: None,
+        };
+        let mut func = caller_ir();
+        let mut resolve = |_id: u64| Some(callee.clone());
+        assert!(run(&mut func, &site(), &mut resolve), "the callee spliced");
+        assert!(!ops(&func).contains(&Op::Call), "the call is gone");
+        assert_eq!(verify(&func), Ok(()), "the spliced IR verifies");
     }
 }

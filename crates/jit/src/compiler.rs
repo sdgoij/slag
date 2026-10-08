@@ -149,9 +149,17 @@ impl JitEngine {
                             return hit.clone();
                         }
                         let resolved = runtime::jit::resolve_callee(id).and_then(|callee| {
-                            let ir = crate::opt::lift::lift(&callee.body).ok();
+                            let mut ir = crate::opt::lift::lift(&callee.body).ok()?;
+                            // I5c-2c-iii-b: a callee's `var` slots have no home
+                            // in the caller's frame, so promote them to SSA
+                            // before the splice (a slot that cannot promote
+                            // keeps its frame access and the splice refuses).
+                            crate::opt::pass::mem2reg::run(&mut ir);
+                            if crate::opt::verify::verify(&ir).is_err() {
+                                return None;
+                            }
                             Some(crate::opt::pass::inline::Callee {
-                                ir: std::rc::Rc::new(ir?),
+                                ir: std::rc::Rc::new(ir),
                                 arity: callee.arity,
                                 this_slot: callee.this_slot,
                             })
