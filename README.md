@@ -376,22 +376,22 @@ both paths computed the same value):
 
 | Body | Interpreter | JIT | Ratio |
 |---|---|---|---|
-| `arithmetic` | 7.90 ms | 0.671 ms | 0.08x |
-| `wide leaf call` | 23.02 ms | 2.018 ms | 0.09x |
-| `bare loop` | 7.39 ms | 0.772 ms | 0.10x |
-| `property read` | 8.23 ms | 0.808 ms | 0.10x |
-| `global read` | 10.47 ms | 1.512 ms | 0.14x |
-| `typed-array read` | 96.48 ms | 14.522 ms | 0.15x |
-| `builtin call` | 4.60 ms | 0.748 ms | 0.16x |
-| `string concat` | 1.22 ms | 0.205 ms | 0.17x |
-| `function calls` | 5.97 ms | 1.006 ms | 0.17x |
-| `typed-array length` | 11.90 ms | 2.220 ms | 0.19x |
-| `buildString shape` | 79.47 ms | 15.672 ms | 0.20x |
-| `non-leaf call` | 28.11 ms | 6.394 ms | 0.23x |
-| `typed-array write` | 28.11 ms | 6.518 ms | 0.23x |
-| `buildString full` | 68.66 ms | 18.873 ms | 0.27x |
-| `apply leaf call` | 20.59 ms | 7.318 ms | 0.36x |
-| `compound assign` | 3.47 ms | 1.758 ms | 0.51x |
+| `arithmetic` | 7.92 ms | 0.608 ms | 0.08x |
+| `wide leaf call` | 20.53 ms | 1.807 ms | 0.09x |
+| `bare loop` | 7.35 ms | 0.695 ms | 0.09x |
+| `property read` | 8.17 ms | 0.721 ms | 0.09x |
+| `global read` | 10.87 ms | 1.349 ms | 0.12x |
+| `typed-array read` | 88.83 ms | 13.152 ms | 0.15x |
+| `string concat` | 1.18 ms | 0.185 ms | 0.16x |
+| `builtin call` | 4.17 ms | 0.672 ms | 0.16x |
+| `function calls` | 5.67 ms | 0.896 ms | 0.16x |
+| `typed-array length` | 12.24 ms | 2.006 ms | 0.16x |
+| `buildString shape` | 71.61 ms | 14.195 ms | 0.20x |
+| `non-leaf call` | 26.94 ms | 5.599 ms | 0.21x |
+| `typed-array write` | 26.64 ms | 6.041 ms | 0.23x |
+| `buildString full` | 62.76 ms | 16.777 ms | 0.27x |
+| `compound assign` | 3.34 ms | 1.147 ms | 0.34x |
+| `apply leaf call` | 18.96 ms | 6.627 ms | 0.35x |
 
 `builtin call` and `non-leaf call` are the two rows that cannot inline — a body
 that contains a call is not a leaf, and a crux-native builtin is not a JS leaf —
@@ -415,37 +415,37 @@ Gap = Slag ms / V8 ms, so > 1 means V8 was faster:
 
 | Family | Workloads | JIT gap | Interpreter gap |
 |---|---|---|---|
-| arrays | 6 | 18.74x | 4.23x |
-| builtins | 5 | 10.60x | 5.07x |
-| calls | 6 | 13.02x | 5.63x |
-| control | 5 | 20.17x | 5.66x |
-| globals | 4 | 2.16x | 0.72x |
-| language | 3 | 14.39x | 10.26x |
-| objects | 7 | 87.57x | 3.22x |
-| opcost | 36 | 24.20x | 4.81x |
-| strings | 5 | 28.69x | 21.75x |
-| **All** | **77** | **26.28x** | **5.86x** |
+| arrays | 6 | 18.23x | 4.10x |
+| builtins | 5 | 10.28x | 5.10x |
+| calls | 6 | 11.42x | 5.46x |
+| control | 5 | 17.89x | 5.15x |
+| globals | 4 | 2.14x | 0.75x |
+| language | 3 | 11.42x | 9.05x |
+| objects | 7 | 66.63x | 2.90x |
+| opcost | 36 | 23.20x | 4.77x |
+| strings | 5 | 23.03x | 17.53x |
+| **All** | **77** | **23.09x** | **5.43x** |
 
 A sample of the per-workload rows (the command above prints all 77), ms per
 `bench()` call:
 
 | Workload | Slag JIT | Slag interp | V8 JIT | V8 `--jitless` | JIT gap | Interp gap |
 |---|---|---|---|---|---|---|
-| `arrays/for_of_dense.js` | 8.4 | 59.4 | 1.9 | 70.0 | 4.34x | 0.85x |
-| `arrays/typed_array.js` | 34.1 | 201.1 | 1.2 | 42.4 | 29.02x | 4.74x |
-| `builtins/json_roundtrip.js` | 73.1 | 71.5 | 13.6 | 17.2 | 5.37x | 4.15x |
-| `builtins/math_intrinsics.js` | 11.3 | 68.8 | 170.5 | 200.9 | 0.07x | 0.34x |
-| `calls/direct_leaf.js` | 13.4 | 77.9 | 1.2 | 40.2 | 10.75x | 1.94x |
-| `calls/recursive_fib.js` | 54.9 | 574.8 | 7.8 | 37.1 | 7.00x | 15.48x |
-| `control/generator_loop.js` | 126.2 | 140.7 | 2.5 | 10.4 | 50.17x | 13.57x |
-| `globals/declarative_read.js` | 2.6 | 17.1 | 0.6 | 13.3 | 4.22x | 1.28x |
-| `globals/hoisted_local.js` | 2.7 | 17.0 | 0.6 | 13.1 | 4.35x | 1.30x |
-| `globals/nested_read.js` | 2.8 | 17.3 | 103.2 | 115.3 | 0.03x | 0.15x |
-| `globals/object_read.js` | 2.8 | 18.0 | 94.2 | 106.9 | 0.03x | 0.17x |
-| `objects/destructure.js` | 440.5 | 305.6 | 0.8 | 54.0 | 526.15x | 5.66x |
-| `objects/own_read.js` | 3.1 | 32.5 | 1.4 | 52.8 | 2.25x | 0.62x |
-| `objects/warm_store.js` | 74.9 | 111.3 | 2.7 | 57.4 | 28.02x | 1.94x |
-| `strings/char_ops.js` | 12.8 | 24.3 | 0.4 | 5.8 | 30.22x | 4.17x |
+| `arrays/for_of_dense.js` | 7.8 | 54.7 | 1.8 | 61.2 | 4.32x | 0.89x |
+| `arrays/typed_array.js` | 31.3 | 186.4 | 1.1 | 46.0 | 29.18x | 4.06x |
+| `builtins/json_roundtrip.js` | 59.5 | 61.5 | 12.8 | 15.4 | 4.64x | 3.98x |
+| `builtins/math_intrinsics.js` | 10.1 | 64.2 | 147.9 | 177.9 | 0.07x | 0.36x |
+| `calls/direct_leaf.js` | 10.9 | 74.2 | 1.1 | 36.2 | 9.60x | 2.05x |
+| `calls/recursive_fib.js` | 57.3 | 504.7 | 7.1 | 34.0 | 8.04x | 14.86x |
+| `control/generator_loop.js` | 93.9 | 116.8 | 2.3 | 9.5 | 41.37x | 12.31x |
+| `globals/declarative_read.js` | 2.4 | 16.0 | 0.6 | 12.8 | 4.23x | 1.25x |
+| `globals/hoisted_local.js` | 2.4 | 16.2 | 0.6 | 12.0 | 4.29x | 1.35x |
+| `globals/nested_read.js` | 2.4 | 15.3 | 88.1 | 99.2 | 0.03x | 0.15x |
+| `globals/object_read.js` | 2.4 | 22.6 | 81.5 | 93.1 | 0.03x | 0.24x |
+| `objects/destructure.js` | 295.6 | 246.9 | 0.8 | 52.3 | 390.81x | 4.72x |
+| `objects/own_read.js` | 2.9 | 34.2 | 1.2 | 65.1 | 2.35x | 0.53x |
+| `objects/warm_store.js` | 57.5 | 100.9 | 2.3 | 51.3 | 25.44x | 1.97x |
+| `strings/char_ops.js` | 11.3 | 21.2 | 0.4 | 5.4 | 30.20x | 3.93x |
 
 The `globals` family is the one family that is a controlled experiment rather
 than a workload: the same loop reading the same value as a top-level `const`
@@ -476,40 +476,40 @@ more while the rest are flat:
 
 | Micro row | preview.2 JIT | now JIT | Change |
 |---|---|---|---|
-| `builtin call` | 2.523 ms | 0.748 ms | 3.4x faster |
-| `non-leaf call` | 13.831 ms | 6.394 ms | 2.2x faster |
-| `typed-array write` | 13.418 ms | 6.518 ms | 2.1x faster |
-| `function calls` | 0.823 ms | 1.006 ms | ~flat (some slower) |
-| `wide leaf call` | 1.832 ms | 2.018 ms | ~flat |
+| `builtin call` | 2.523 ms | 0.672 ms | 3.8x faster |
+| `non-leaf call` | 13.831 ms | 5.599 ms | 2.5x faster |
+| `typed-array write` | 13.418 ms | 6.041 ms | 2.2x faster |
+| `function calls` | 0.823 ms | 0.896 ms | ~flat (some slower) |
+| `wide leaf call` | 1.832 ms | 1.807 ms | ~flat |
 | every other row | — | — | within noise |
 
 (`typed-array read` is new since preview.2: 15 rows there, 16 now.)
 
 The corpus moved further, but its headline needs a caveat read first. Overall
 the corpus means went from `mean-jitGap` 116.05 / `mean-jlGap` 9.19 to
-**26.28** / **5.86** — yet that is dominated by the `opcost` family (36 of the
+**23.09** / **5.43** — yet that is dominated by the `opcost` family (36 of the
 77 rows), and `tools/corpus/README.md` says a two-binary pair is a measurement
 only if each binary's own control row is stable: *"If a binary's own control
 row — `baseline` — has moved, the pair is not a measurement of anything."* It
 moved here, 2.4 ms → 0.3 ms — a real ~8x gain on the `i & MASK` / `| 0` bare
 loop — so the `opcost` per-row deltas are not a clean per-operation
 attribution. Excluding `opcost`, the remaining 41 rows went from a JIT gap of
-**34.81x to 28.11x** (≈1.24x closer to V8) and an interpreter gap of **6.31x to
-6.77x** (about flat):
+**34.81x to 23.00x** (≈1.5x closer to V8) and an interpreter gap of **6.31x to
+6.02x** (about flat):
 
 | Family | Workloads | JIT gap (preview.2 → now) | Interpreter gap (preview.2 → now) |
 |---|---|---|---|
-| arrays | 6 | 35.22x → 18.74x | 5.87x → 4.23x |
-| builtins | 5 | 15.22x → 10.60x | 6.64x → 5.07x |
-| calls | 6 | 24.25x → 13.02x | 5.00x → 5.63x |
-| control | 5 | 26.74x → 20.17x | 5.45x → 5.66x |
-| globals | 4 | 2.12x → 2.16x | 0.69x → 0.72x |
-| language | 3 | 13.16x → 14.39x | 7.03x → 10.26x |
-| objects | 7 | 90.32x → 87.57x | 3.24x → 3.22x |
-| strings | 5 | 36.04x → 28.69x | 17.32x → 21.75x |
-| opcost (see caveat) | 36 | 208.57x → 24.20x | 12.46x → 4.81x |
-| **All** | **77** | **116.05x → 26.28x** | **9.19x → 5.86x** |
-| **All, excluding `opcost`** | **41** | **34.81x → 28.11x** | **6.31x → 6.77x** |
+| arrays | 6 | 35.22x → 18.23x | 5.87x → 4.10x |
+| builtins | 5 | 15.22x → 10.28x | 6.64x → 5.10x |
+| calls | 6 | 24.25x → 11.42x | 5.00x → 5.46x |
+| control | 5 | 26.74x → 17.89x | 5.45x → 5.15x |
+| globals | 4 | 2.12x → 2.14x | 0.69x → 0.75x |
+| language | 3 | 13.16x → 11.42x | 7.03x → 9.05x |
+| objects | 7 | 90.32x → 66.63x | 3.24x → 2.90x |
+| strings | 5 | 36.04x → 23.03x | 17.32x → 17.53x |
+| opcost (see caveat) | 36 | 208.57x → 23.20x | 12.46x → 4.77x |
+| **All** | **77** | **116.05x → 23.09x** | **9.19x → 5.43x** |
+| **All, excluding `opcost`** | **41** | **34.81x → 23.00x** | **6.31x → 6.02x** |
 
 Only one round was run per binary, so per-workload cross-binary rows carry the
 ±warm-up band the corpus README describes; the family and overall means are the

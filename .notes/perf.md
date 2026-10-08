@@ -13339,3 +13339,22 @@ If you'd rather land the storage the JIT end-state needs *now* and eat the doubl
 Want me to proceed with Option 1 (alignment gate + presize-at-4 + `map_set`/`map_field`/`map_store_field` ≥4 + updated crux tests, gated on clippy/workspace tests), or did the thread specify something closer to Option 2?
 
 _Resolution: Option 1 proceeded and landed as the map-describes-every-default-key slice; see the L1c decision section at the top of this file for the outcome and the remaining Option-3 gate._
+
+## The corpus is usable for a pre/post pair when the control row is stable (2026-10-07)
+
+The standing warning — "the corpus A/B is too noisy on this machine, never use it for a net effect" — is really two rules, and only one of them bites:
+
+- **Cross-*time* comparisons are unusable.** The corpus family gaps and the micro-suite's absolute ms drift with machine state. This session a single micro-suite run read the interpreter column ~10–20% slower than the README snapshot, then matched it (arithmetic 7.90 → 7.92 ms) once the protocol's median-of-five was used. A single noisy run is not a snapshot.
+- **A *pre/post pair within one session is usable* when each binary's own control row is stable.** `tools/corpus/README.md` states the rule; this session exercised it.
+
+Method: build the pre binary (`d2f66a7b`, before the typer arc) and the post (HEAD), then run the corpus four times — twice pre-then-post, twice post-then-pre — and take the per-row geometric mean of the four post/pre ratios. The geometric mean is order-free by construction: if the first invocation in a round is slower by a factor `f`, then round 1 gives `(P/A)/f` and round 2 gives `(P/A)·f`, so `sqrt(r1·r2) = P/A` exactly. (`opcost/baseline` read 0.3 ms in all eight runs, so the pair is valid per the corpus rule.)
+
+Result (post/pre; < 1 = post faster): median / mean **0.969**; p10 / p90 **0.932 / 1.004**.
+
+The movers are arithmetic-in-a-loop and member-read rows — `opcost/typed_array_for_each` 0.865, `language/.../try/completion-values` 0.865, `language/.../for-in/head-let-fresh-binding` 0.866, `strings/coercion_concat` 0.909, `objects/spread_assign` 0.919, `objects/proto_read` 0.934, `objects/compound_assign` 0.940 — exactly the shape the change targets. The direct interleaved tier A/B agrees: `read_loop` 0.882, `read_loop_nonleaf` 0.937, `arith_loop` 0.947, `licm_loop` 0.996.
+
+The change measured is the `narrow` value-table sync (the typer arc): `narrow` proved values numeric and wrote `Inst::ty`, but the lowering reads `Function::value_type` and that table was append-only — so the proof never reached the tag-free arithmetic path. Wiring it up (and the same fix in `fold`) is the whole delta. The typer proper (`Op::GuardType`, T2–T4, the leaf-lane deopt) is off by default and contributes nothing here.
+
+The micro-suite (`--jit-bench`) is **insensitive** to this change: its bodies take the per-step lowering, which the fix does not touch (pre/post mean 1.011). The corpus and tier rows take the optimizing tier. So a flat `--jit-bench` is not a flat tier.
+
+Caveat kept: one binary pair, one machine, eight runs; p90 is 1.004, so a few rows are within noise. The family-level means remain the number to read.
