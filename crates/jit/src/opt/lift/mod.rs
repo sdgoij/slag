@@ -352,6 +352,12 @@ fn stack_delta(step: &Step) -> Result<i32, Unsupported> {
         | Step::ListEnd
         | Step::SaveCompletion
         | Step::RestoreCompletion => 0,
+        // A `CallFast` pops `this` + callee + `argc` args and pushes the result.
+        Step::CallFast {
+            argc,
+            direct_eval: false,
+            ..
+        } => -(*argc as i32) - 1,
         other => return Err(Unsupported::Step(step_name(other))),
     })
 }
@@ -733,6 +739,31 @@ fn emit_step(
                 Imm::None,
             );
             stack.push(v);
+        }
+        // A `CallFast` (`[this, callee, a1..aN]` on the stack): the tier's first
+        // call. Lifted to an opaque `Op::Call`, whose identity lowering runs it
+        // through the general `call_slow` helper (I5c-0). A direct-eval call is
+        // refused — the compiler never emits one (direct eval takes the vector
+        // form).
+        Step::CallFast {
+            argc,
+            direct_eval: false,
+            ..
+        } => {
+            let argc = *argc as usize;
+            if stack.len() < argc + 2 {
+                return Err(Unsupported::Stack);
+            }
+            let args = stack.split_off(stack.len() - (argc + 2));
+            let result = builder.emit(
+                block,
+                Op::Call,
+                &args,
+                Type::Unknown,
+                Effects::call(),
+                Imm::None,
+            );
+            stack.push(result);
         }
         other => return Err(Unsupported::Step(step_name(other))),
     }

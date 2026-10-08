@@ -31,6 +31,12 @@ use crate::opt::ir::{BlockId, Function as IrFunction, Imm, Inst, Op, Term, Type,
 pub(crate) static OPT_COMPILED: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
+/// The number of `Op::Call` instructions the identity lowering has emitted
+/// (test introspection: a calling body lowered through the tier).
+#[cfg(test)]
+pub(crate) static OPT_CALLS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
 /// Lower a lifted straight-line IR function to executable code, or `None` when
 /// the IR uses a shape this increment does not handle (the caller keeps the
 /// per-step path).
@@ -66,6 +72,9 @@ struct Abi {
     sig_unary: SigRef,
     sig_bool: SigRef,
     sig_tdz: SigRef,
+    /// The `(vm, callee, this, argc, args, direct_eval)` signature of the
+    /// general `call_slow` helper.
+    sig_call_slow: SigRef,
 }
 
 fn lower(
@@ -116,6 +125,7 @@ fn lower(
         sig_unary: builder.import_signature(helper_sig(&[types::I64; 3], conv)),
         sig_bool: builder.import_signature(helper_sig(&[types::I64; 2], conv)),
         sig_tdz: builder.import_signature(helper_sig(&[types::I64; 1], conv)),
+        sig_call_slow: builder.import_signature(helper_sig(&[types::I64; 6], conv)),
     };
     let undefined = JsValue::Undefined.bits() as i64;
     if loops_to_entry {
@@ -612,6 +622,39 @@ fn lower_inst(
                 abi.sig_bool,
                 Helper::GetGlobal,
                 &[name],
+            )?
+        }
+        // A general call (I5c-0): `args = [this, callee, a1..aN]`. The identity
+        // lowering materializes the arguments at the working-region base and
+        // runs the general `call_slow` helper, so a calling body enters the
+        // tier; a later slice (I5c-2) splices the callee in place of the call.
+        Op::Call => {
+            if inst.args.len() < 2 {
+                return Err(Unsupported::Step("opt:call"));
+            }
+            #[cfg(test)]
+            OPT_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let this = arg(0)?;
+            let callee = arg(1)?;
+            let argc = inst.args.len() - 2;
+            for k in 0..argc {
+                let a = arg(2 + k)?;
+                builder.ins().store(
+                    MemFlagsData::new(),
+                    a,
+                    abi.work,
+                    Offset32::new((k * 8) as i32),
+                );
+            }
+            let argc_imm = builder.ins().iconst(types::I64, argc as i64);
+            let dir_imm = builder.ins().iconst(types::I64, 0);
+            call_helper(
+                builder,
+                helpers,
+                abi,
+                abi.sig_call_slow,
+                Helper::CallSlow,
+                &[callee, this, argc_imm, abi.work, dir_imm],
             )?
         }
         _ => return Err(Unsupported::Step("opt:op")),

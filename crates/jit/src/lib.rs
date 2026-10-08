@@ -2080,6 +2080,48 @@ mod tests {
     }
 
     #[test]
+    fn opt_tier_call_body_matches_the_interpreter() {
+        // I5c-0: a body with a `CallFast` now lifts to `Op::Call` and lowers
+        // through the general `call_slow` helper, so a calling body enters the
+        // tier for the first time. `o.m(i)` is a member read (the callee on the
+        // stack) plus a `CallFast`, inside a `do`/`while` so the fused-loop path
+        // does not apply. The tier must agree with the interpreter.
+        //
+        // `callee` builds an object literal, which the lift refuses, so `f` is
+        // the only body the optimizing tier can lower — which makes the
+        // `OPT_CALLS` delta proof that the *call* body lowered, not merely that
+        // some body did.
+        let source = "function callee(x) { var o = { a: x }; return o.a + 2; } \
+                      function f(o, n) { var s = 0; var i = 0; \
+                        do { s = s + o.m(i); i = i + 1; } while (i < n); \
+                        return s; } \
+                      var obj = { m: callee }; \
+                      var t = 0; \
+                      t += f(obj, 3); t += f(obj, 5); t += f(obj, 8); \
+                      t += f(obj, 13); t += f(obj, 21); t += f(obj, 1); \
+                      t += f(obj, 2); t += f(obj, 4); t += f(obj, 7); \
+                      t += f(obj, 11); t += f(obj, 6); t += f(obj, 9); \
+                      t += f(obj, 10); t += f(obj, 12); t += f(obj, 14); \
+                      t += f(obj, 15); t += f(obj, 16); t += f(obj, 17); \
+                      t += f(obj, 18); t += f(obj, 19); t += f(obj, 20); \
+                      t;";
+        let interp = {
+            let mut agent = runtime::Agent::new();
+            agent.initialize_host_defined_realm().expect("realm");
+            agent.run_script(source).expect("interp runs")
+        };
+        let before = crate::opt_lower::OPT_CALLS.load(Ordering::Relaxed);
+        let (value, compiled) = with_opt_jit_agent(|agent| agent.run_script(source).expect("runs"));
+        let calls = crate::opt_lower::OPT_CALLS.load(Ordering::Relaxed) - before;
+        assert_eq!(
+            value, interp,
+            "the optimizing tier must match the interpreter"
+        );
+        assert!(compiled >= 1, "{compiled} bodies compiled");
+        assert!(calls >= 1, "the optimizing tier lowered {calls} calls");
+    }
+
+    #[test]
     fn opt_tier_leaf_guard_resumes_on_a_non_number_value() {
         // L1: a LEAF body (member read only — no calls, no globals) with the
         // typer's read guard. A non-Number read deopts, and the leaf lane must
