@@ -225,6 +225,27 @@ four interleaved corpus rounds; `scratch/ab-arc/ab_guard.js`,
 so the guard is retained (`SLAG_GUARD` on/off reads 1.012, i.e. unchanged) — the
 FrameStore exception is what keeps a later arithmetic read of the slot tag-free.
 
+## T5b — the FrameStore exception is not worth refining (negative)
+
+The obvious follow-up is to keep a store-only guard only when the slot is later
+read arithmetically — `read_bare` stores `t = o.x` in the loop but uses `t` only
+once, after the loop, so the per-iteration guard buys a single tag-free add. The
+upper bound of any such criterion is an ablation that drops the exception
+entirely (`SLAG_GUARD=2`, a probe since reverted). Measured same-binary (typer
+pinned on):
+
+- **Corpus (77 rows):** median **1.000**, mean **1.002** — neutral. Dropping
+every store-only guard changes nothing measurable.
+- **`read_bare` alone:** **0.980x** (~2%), i.e. the whole effect of the ablation
+  is one synthetic row.
+
+So a refinement is not worth building: its effect is *bounded above* by the
+ablation (which is neutral on the corpus), and the precise criterion (keep iff
+the slot is read arithmetically) would **keep** `read_bare` — because `return t +
+z` does read `t` arithmetically — so it would not even capture the 0.98. The
+FrameStore exception stays as cheap insurance for the hot read-then-use pattern
+(`x = o.x; s = s + x`), not as a measured corpus win.
+
 Gates: `cargo test --workspace` green (jit 318/0); clippy `--workspace
 --all-targets -- -D warnings` clean; test262 `language` 23,726/0/0/0 and
 `built-ins` 23,820/0/1/0 at baseline (the one documented skip).
