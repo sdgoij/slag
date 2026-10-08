@@ -192,6 +192,43 @@ loop-live — so the register pressure is orthogonal to what the typer removes.
 `Op::MemberCellLoad` stays out of LICM's hoistable set. The read's win is the
 inlining (G2b) plus the now-tag-free arithmetic, not the hoist.
 
+## T5 — the consumer gate: prune the guards that pay nothing (landed)
+
+The guard is now **on by default** (the T3 measurement removed the reason to hold
+it off), and its remaining cost — a guard whose result no type-sensitive op reads
+— is pruned by a new pipeline pass (`opt/pass/guard.rs`, run after `narrow`). A
+guard is kept only when a **type-sensitive** op consumes it (the
+arithmetic/comparison ops whose lowering reads the operand type to pick the
+cheaper path), a `FrameStore` consumes it (`narrow`'s numeric-slot proof feeds on
+the stored value's type), or it is an **edge argument** (it may be consumed
+type-sensitively in the target block). Every other use — a call argument, a
+`return`, a member store — forwards to the guard's operand, so the guard is pure
+type erasure and dropping it is sound.
+
+Order matters: the pass runs **after** `narrow`, because `narrow` reads a guard
+to prove a slot numeric (a slot stored only a guarded value is numeric); running
+it before would let a store that feeds nothing type-sensitive lose the guard
+`narrow` counted on. `SLAG_GUARD=0` disables it (the same-binary A/B seam).
+
+Measured (same-binary env toggle, one executable, order-free geometric mean of
+four interleaved corpus rounds; `scratch/ab-arc/ab_guard.js`,
+`corpus_guard_env.sh`):
+
+- **The pass's marginal effect** (typer pinned on, `SLAG_GUARD` off vs on):
+  corpus median **0.988**, mean **0.984** — ~1-1.6% off the typer's corpus cost.
+- **The typer as a whole** (guard on by default, `SLAG_TYPER` off vs on): corpus
+  median **0.984**, mean **0.975** — **net-positive**, where before the gate the
+  same instrument read ~1.017/0.996 (flat-to-negative). The read-loop win holds
+  (typer toggle: `read_loop` 0.966, `read_loop_nonleaf` 0.942).
+
+`read_bare` is not the gate's target in the end: its read feeds a `FrameStore`,
+so the guard is retained (`SLAG_GUARD` on/off reads 1.012, i.e. unchanged) — the
+FrameStore exception is what keeps a later arithmetic read of the slot tag-free.
+
+Gates: `cargo test --workspace` green (jit 318/0); clippy `--workspace
+--all-targets -- -D warnings` clean; test262 `language` 23,726/0/0/0 and
+`built-ins` 23,820/0/1/0 at baseline (the one documented skip).
+
 ## Gates and traps
 
 - **A wrong type guess must deopt, never miscompute.** Every gate is a full

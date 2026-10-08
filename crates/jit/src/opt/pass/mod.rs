@@ -1,32 +1,46 @@
 //! The pass pipeline over the optimizing SSA IR (`.notes/optimizing-tier-impl.md`
 //! §2, `pass/`).
 //!
-//! The pipeline is folding, numeric effect narrowing, CSE, LICM, then dead-code
-//! elimination. The order is chosen so a single round reaches the fixpoint — a
-//! later pass never enables an earlier one (folding creates constants, narrowing
-//! gives arithmetic pure effects, CSE reuses them, DCE removes the leftovers).
-//! Verified empirically (`.notes/pass-pipeline-fixpoint.md`): iterating the
-//! pipeline to a fixpoint performs no additional work on any sampled body, so the
-//! single round is kept. The caller re-verifies the graph after the pipeline,
-//! because a pass bug must be a refusal (the per-step path), never a wrong
-//! program.
+//! The pipeline is folding, numeric effect narrowing, read-guard pruning, CSE,
+//! LICM, then dead-code elimination. The order is chosen so a single round
+//! reaches the fixpoint — a later pass never enables an earlier one (folding
+//! creates constants, narrowing gives arithmetic pure effects, guard pruning only
+//! removes, CSE reuses them, DCE removes the leftovers). Guard pruning runs after
+//! narrowing because narrowing's numeric-slot proof *reads* a guard (a slot
+//! stored only a guarded value is numeric); running it before would let a store
+//! that feeds nothing type-sensitive lose the guard narrowing counted on. Verified
+//! empirically (`.notes/pass-pipeline-fixpoint.md`): iterating the pipeline to a
+//! fixpoint performs no additional work on any sampled body, so the single round
+//! is kept. The caller re-verifies the graph after the pipeline, because a pass
+//! bug must be a refusal (the per-step path), never a wrong program.
 
 use crate::opt::ir::Function;
 
 pub mod cse;
 pub mod dce;
 pub mod fold;
+pub mod guard;
 pub mod licm;
 pub mod narrow;
+
+/// Whether the read-guard pruning pass runs. On by default; `SLAG_GUARD=0`
+/// disables it — the same-binary seam for measuring the pass's marginal effect
+/// (one executable, so no code-layout confound).
+fn guard_enabled() -> bool {
+    std::env::var("SLAG_GUARD")
+        .map(|v| v != "0")
+        .unwrap_or(true)
+}
 
 /// Run the pass pipeline over `func`. Returns whether the IR changed.
 pub fn run(func: &mut Function) -> bool {
     let folded = fold::run(func);
     let narrowed = narrow::run(func);
+    let guarded = guard_enabled() && guard::run(func);
     let cse = cse::run(func);
     let licm = licm::run(func);
     let dropped = dce::run(func);
-    folded || narrowed || cse || licm || dropped
+    folded || narrowed || guarded || cse || licm || dropped
 }
 
 #[cfg(test)]
