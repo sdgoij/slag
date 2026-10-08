@@ -2168,6 +2168,24 @@ impl CompiledBody {
             _ => {}
         }
     }
+
+    /// I5a count probe: record the call at step `ip` whose callee's encoded
+    /// `Value` bits are `callee`. A no-op unless the probe is enabled; the store
+    /// is allocated on the first write, and a site that has turned generic is
+    /// frozen (no further writes). `certified`/`steps` describe the callee's
+    /// compiled body when it has one (`steps` is `0` otherwise).
+    pub(crate) fn record_call(&self, ip: usize, callee: u64, certified: bool, steps: u32) {
+        if !crate::feedback::enabled() {
+            return;
+        }
+        let mut slot = self.feedback.borrow_mut();
+        let store = slot.get_or_insert_with(|| crate::feedback::Feedback::new(self.steps.len()));
+        let Some(site) = store.call_site(ip) else {
+            return;
+        };
+        let observed = site.observe(callee);
+        crate::feedback::record_call(observed, site.distinct_callees(), certified, steps);
+    }
 }
 
 impl Trace for CompiledBody {
@@ -5083,6 +5101,42 @@ impl Vm {
         Self::cell_object(value)
             .and_then(|object| object.map.get())
             .map_or(0, |map| map.id())
+    }
+
+    /// Record a call site for the I5a probe
+    /// (`.notes/optimizing-tier-impl.md`). A no-op unless the probe is enabled;
+    /// `body` is the caller's compiled body (the record key is `(body, ip)`).
+    fn record_call_site(&self, agent: &Agent, body: &CompiledBody, callee: &Value) {
+        if !crate::feedback::enabled() {
+            return;
+        }
+        let (identity, certified, steps) = Self::callee_call_identity(agent, callee);
+        body.record_call(self.ip, identity, certified, steps);
+    }
+
+    /// The callee's identity for the I5a probe and its compiled-body shape:
+    /// `(identity, certified, steps)`. The identity is the callee's shared
+    /// `CompiledBody` pointer — every closure from one declaration site shares
+    /// one (Cut 43), so a site that re-instantiates its callee (a `bench()`
+    /// that declares the callee in-body) is still monomorphic *in code*, which
+    /// is what a trial inline would guard on. A callee with no compiled body
+    /// (a builtin) keeps its `Value` bits as identity and is never certified; a
+    /// non-function is `0` (shapeless).
+    fn callee_call_identity(agent: &Agent, callee: &Value) -> (u64, bool, u32) {
+        let Some(function) = callee.as_function() else {
+            return (0, false, 0);
+        };
+        match agent.ecma_functions.get(&function.id()) {
+            Some(data) => match &data.ir {
+                Some(ir) => (
+                    std::rc::Rc::as_ptr(ir) as u64,
+                    ir.scope.is_some(),
+                    ir.steps.len() as u32,
+                ),
+                None => (callee.bits(), false, 0),
+            },
+            None => (callee.bits(), false, 0),
+        }
     }
 
     /// Part B, B5.2: map-based read fast path. Check the object's map for
@@ -8447,6 +8501,9 @@ impl Vm {
                 }
                 Step::Call { direct_eval, span } => {
                     self.set_site(agent, *span);
+                    if let Some(&callee) = self.stack.last() {
+                        self.record_call_site(agent, body, &callee);
+                    }
                     self.do_call(agent, *direct_eval)?;
                     if let Some(outcome) = self.take_pending_call() {
                         return Ok(outcome);
@@ -8458,7 +8515,13 @@ impl Vm {
                     span,
                 } => {
                     self.set_site(agent, *span);
-                    self.do_call_fast(agent, *argc as usize, *direct_eval)?;
+                    let argc = *argc as usize;
+                    let n = self.stack.len();
+                    if n > argc {
+                        let callee = self.stack[n - argc - 1];
+                        self.record_call_site(agent, body, &callee);
+                    }
+                    self.do_call_fast(agent, argc, *direct_eval)?;
                     if let Some(outcome) = self.take_pending_call() {
                         return Ok(outcome);
                     }
@@ -8530,6 +8593,10 @@ impl Vm {
                     span,
                 } => {
                     self.set_site(agent, *span);
+                    if crate::feedback::enabled() {
+                        let callee = self.load_global_value(agent, *name)?;
+                        self.record_call_site(agent, body, &callee);
+                    }
                     self.do_call_fast_global(agent, *name, None, *argc as usize, *direct_eval)?;
                     if let Some(outcome) = self.take_pending_call() {
                         return Ok(outcome);
@@ -8537,6 +8604,8 @@ impl Vm {
                 }
                 Step::CallFastSlot { slot, argc, span } => {
                     self.set_site(agent, *span);
+                    let callee = *self.frame_get(*slot);
+                    self.record_call_site(agent, body, &callee);
                     self.do_call_fast_slot(agent, *slot, None, *argc as usize)?;
                     if let Some(outcome) = self.take_pending_call() {
                         return Ok(outcome);
@@ -8549,6 +8618,10 @@ impl Vm {
                     span,
                 } => {
                     self.set_site(agent, *span);
+                    if crate::feedback::enabled() {
+                        let callee = *self.frame_get(*callee_slot);
+                        self.record_call_site(agent, body, &callee);
+                    }
                     // Cut 35 slice 17: the fused `x = f(args)` — TDZ-check
                     // the arg slots in order (their `LoadLocal` checks),
                     // run the slot-callee call, and store the result to
@@ -8592,6 +8665,10 @@ impl Vm {
                     span,
                 } => {
                     self.set_site(agent, *span);
+                    if crate::feedback::enabled() {
+                        let callee = self.load_global_value(agent, *name)?;
+                        self.record_call_site(agent, body, &callee);
+                    }
                     // Cut 35 slice 20: the fused `x = f(args)` for a global
                     // callee — same shape as `CallFastSlotStore` through
                     // `do_call_fast_global` (the global leaf cache). The

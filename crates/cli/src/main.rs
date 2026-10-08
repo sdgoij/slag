@@ -807,6 +807,9 @@ fn run_corpus(dir: &std::path::Path, jit: bool) -> Result<(), u8> {
     if jit {
         jit::dump_helper_counts();
     }
+    // The I5a call-site probe runs in the INTERPRETER (`--jitless`), so it dumps
+    // in either mode; inert unless `SLAG_FEEDBACK` is set.
+    jit::dump_feedback_summary();
     Ok(())
 }
 

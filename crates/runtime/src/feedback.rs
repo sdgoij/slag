@@ -10,7 +10,7 @@
 //! a default build (`SLAG_FEEDBACK` unset) allocates nothing and behaves exactly
 //! as before.
 
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 /// The `ICState` valve (`optimizing-tier-plan.md` §3.2): how many distinct
 /// shapes a site may specialize to before it turns generic.
@@ -125,13 +125,98 @@ pub enum Observed {
     Frozen,
 }
 
-/// One step's record. A single variant now; the enum is the seam for the other
-/// site classes (global, call, arithmetic) the later increments add.
+/// A call site's record (stage I, `.notes/optimizing-tier-impl.md` I5a): the
+/// distinct callee identities it has seen, in first-seen order (bounded by
+/// [`MAX_OPTIMIZED_STUBS`]), and the valve state. The identity is the callee's
+/// encoded `Value` bits — the same `u64` the compiled call path keys its leaf
+/// record on — so a monomorphic site is exactly one a trial inline could guard.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct CallSite {
+    callees: [u64; MAX_OPTIMIZED_STUBS],
+    len: u8,
+    generic: bool,
+    hits: u64,
+}
+
+impl CallSite {
+    /// Record a call whose callee's encoded bits are `callee` (`0` = a callee
+    /// with no identity: a non-function or an unresolved one). Returns what the
+    /// observation did to the record; a site that is already generic is frozen.
+    pub fn observe(&mut self, callee: u64) -> CallObserved {
+        self.hits = self.hits.saturating_add(1);
+        if self.generic {
+            return CallObserved::Frozen;
+        }
+        if callee == 0 {
+            return CallObserved::Shapeless;
+        }
+        let len = self.len as usize;
+        if self.callees[..len].contains(&callee) {
+            return CallObserved::Repeat;
+        }
+        if len < self.callees.len() {
+            self.callees[len] = callee;
+            self.len += 1;
+            return if self.len == 1 {
+                CallObserved::First
+            } else {
+                CallObserved::NewCallee
+            };
+        }
+        self.generic = true;
+        CallObserved::Overflow
+    }
+
+    /// The distinct callees this site has served.
+    #[must_use]
+    pub fn distinct_callees(&self) -> usize {
+        self.len as usize
+    }
+
+    /// The calls this site has served.
+    #[must_use]
+    pub fn hits(&self) -> u64 {
+        self.hits
+    }
+
+    /// The valve state implied by the callees seen so far.
+    #[must_use]
+    pub fn state(&self) -> IcState {
+        if self.generic {
+            IcState::Generic
+        } else if self.len <= 1 {
+            IcState::Specialized
+        } else {
+            IcState::Megamorphic
+        }
+    }
+}
+
+/// What one call observation did to its site's record.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum CallObserved {
+    /// The callee had no identity (a non-function or an unresolved one).
+    Shapeless,
+    /// The identity was already in the log.
+    Repeat,
+    /// The first callee this site has seen (the site is new).
+    First,
+    /// A second-or-later distinct callee: the site went polymorphic.
+    NewCallee,
+    /// The log was full, so the site turned generic.
+    Overflow,
+    /// The site was already generic: the record was left untouched (frozen).
+    Frozen,
+}
+
+/// One step's record. The enum is the seam for the site classes the later
+/// increments add.
 #[derive(Clone, Copy, Debug, Default)]
 pub enum SiteRecord {
     #[default]
     Empty,
     MemberRead(MemberReadSite),
+    Call(CallSite),
 }
 
 /// The per-body feedback store: one [`SiteRecord`] per step, allocated lazily
@@ -157,10 +242,26 @@ impl Feedback {
                 *record = SiteRecord::MemberRead(MemberReadSite::default());
                 match record {
                     SiteRecord::MemberRead(site) => Some(site),
-                    SiteRecord::Empty => None,
+                    _ => None,
                 }
             }
             SiteRecord::MemberRead(site) => Some(site),
+            _ => None,
+        }
+    }
+
+    /// The call record at step `ip`, initialized on first use.
+    pub fn call_site(&mut self, ip: usize) -> Option<&mut CallSite> {
+        match self.sites.get_mut(ip)? {
+            record @ SiteRecord::Empty => {
+                *record = SiteRecord::Call(CallSite::default());
+                match record {
+                    SiteRecord::Call(site) => Some(site),
+                    _ => None,
+                }
+            }
+            SiteRecord::Call(site) => Some(site),
+            _ => None,
         }
     }
 
@@ -240,6 +341,127 @@ pub fn summary() -> Summary {
 #[must_use]
 pub fn writes() -> usize {
     summary().writes
+}
+
+/// The provisional callee-size budget for the I5a probe
+/// (`.notes/optimizing-tier-impl.md`): a monomorphic site whose callee's
+/// compiled body is at most this many steps counts as inlinable. The printed
+/// size histogram is what fixes the real number for I5c.
+pub const CALLEE_BUDGET_STEPS: u32 = 128;
+
+/// The number of step-count buckets in the callee-size histogram.
+pub const SIZE_BUCKETS: usize = 5;
+
+/// The bucket a callee's compiled-body step count falls in.
+fn size_bucket(steps: u32) -> usize {
+    match steps {
+        0..=16 => 0,
+        17..=64 => 1,
+        65..=256 => 2,
+        257..=1024 => 3,
+        _ => 4,
+    }
+}
+
+/// Classify one call observation for the I5a probe. `distinct` is the site's
+/// distinct-callee count *after* the observation; `certified`/`steps` describe
+/// the callee's compiled body (when it has one). The deciding number is
+/// `inlinable_hits / hits`: the share of call traffic at a monomorphic site
+/// whose callee is a certified body under the budget — the traffic a trial
+/// inline would cover before any retirement.
+pub fn record_call(observed: CallObserved, distinct: usize, certified: bool, steps: u32) {
+    if observed == CallObserved::Frozen {
+        return;
+    }
+    CALL_HITS.fetch_add(1, Ordering::Relaxed);
+    if observed == CallObserved::First {
+        CALL_SITES.fetch_add(1, Ordering::Relaxed);
+    }
+    if matches!(observed, CallObserved::First | CallObserved::NewCallee) {
+        CALL_SIZE_HIST[size_bucket(steps)].fetch_add(1, Ordering::Relaxed);
+    }
+    if observed == CallObserved::Overflow {
+        CALL_GENERIC_HITS.fetch_add(1, Ordering::Relaxed);
+        return;
+    }
+    match distinct {
+        1 => {
+            CALL_MONO_HITS.fetch_add(1, Ordering::Relaxed);
+            if certified && steps <= CALLEE_BUDGET_STEPS {
+                CALL_INLINABLE_HITS.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        2..=MAX_OPTIMIZED_STUBS => {
+            CALL_POLY_HITS.fetch_add(1, Ordering::Relaxed);
+        }
+        _ => {}
+    }
+}
+
+/// The I5a call-site probe's running totals.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CallSummary {
+    /// Call-site records created (a new site's first callee).
+    pub sites: usize,
+    /// Every call observation (excluding a frozen site's later calls).
+    pub hits: u64,
+    /// Observations at a site serving exactly one callee so far.
+    pub mono_hits: u64,
+    /// Observations at a site serving two or more.
+    pub poly_hits: u64,
+    /// Observations at a site that overflowed its stub budget.
+    pub generic_hits: u64,
+    /// Observations at a monomorphic site whose callee is a certified body
+    /// under [`CALLEE_BUDGET_STEPS`].
+    pub inlinable_hits: u64,
+    /// The callee-body step-count histogram (see [`SIZE_BUCKETS`]).
+    pub size_hist: [u64; SIZE_BUCKETS],
+}
+
+static CALL_SITES: AtomicUsize = AtomicUsize::new(0);
+static CALL_HITS: AtomicU64 = AtomicU64::new(0);
+static CALL_MONO_HITS: AtomicU64 = AtomicU64::new(0);
+static CALL_POLY_HITS: AtomicU64 = AtomicU64::new(0);
+static CALL_GENERIC_HITS: AtomicU64 = AtomicU64::new(0);
+static CALL_INLINABLE_HITS: AtomicU64 = AtomicU64::new(0);
+static CALL_SIZE_HIST: [AtomicU64; SIZE_BUCKETS] = [
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+];
+
+/// The I5a probe's running totals.
+#[must_use]
+pub fn call_summary() -> CallSummary {
+    CallSummary {
+        sites: CALL_SITES.load(Ordering::Relaxed),
+        hits: CALL_HITS.load(Ordering::Relaxed),
+        mono_hits: CALL_MONO_HITS.load(Ordering::Relaxed),
+        poly_hits: CALL_POLY_HITS.load(Ordering::Relaxed),
+        generic_hits: CALL_GENERIC_HITS.load(Ordering::Relaxed),
+        inlinable_hits: CALL_INLINABLE_HITS.load(Ordering::Relaxed),
+        size_hist: CALL_SIZE_HIST.each_ref().map(|c| c.load(Ordering::Relaxed)),
+    }
+}
+
+/// Print the I5a call-site summary (the corpus runner's closing dump). A no-op
+/// unless the probe is enabled; one `call\t<key>\t<value>` line each.
+pub fn dump_call_summary() {
+    if !enabled() {
+        return;
+    }
+    let s = call_summary();
+    println!("call\tsites\t{}", s.sites);
+    println!("call\thits\t{}", s.hits);
+    println!("call\tmono_hits\t{}", s.mono_hits);
+    println!("call\tpoly_hits\t{}", s.poly_hits);
+    println!("call\tgeneric_hits\t{}", s.generic_hits);
+    println!("call\tinlinable_hits\t{}", s.inlinable_hits);
+    for (i, count) in s.size_hist.iter().enumerate() {
+        println!("call\tsize_bucket_{i}\t{count}");
+    }
 }
 
 #[cfg(test)]
@@ -349,5 +571,69 @@ mod tests {
         let wrote = writes() - before;
         force_enabled(false);
         assert!(wrote > 0, "the probe recorded {wrote} member reads");
+    }
+
+    #[test]
+    fn a_call_site_is_monomorphic_then_polymorphic_then_generic() {
+        let mut site = CallSite::default();
+        assert_eq!(site.observe(0x1000), CallObserved::First);
+        assert_eq!(site.observe(0x1000), CallObserved::Repeat);
+        assert_eq!(site.distinct_callees(), 1);
+        assert_eq!(site.state(), IcState::Specialized);
+        assert_eq!(site.observe(0x2000), CallObserved::NewCallee);
+        assert_eq!(site.state(), IcState::Megamorphic);
+        for id in 0x3000..(0x3000 + MAX_OPTIMIZED_STUBS as u64 - 2) {
+            let _ = site.observe(id);
+        }
+        assert_eq!(site.distinct_callees(), MAX_OPTIMIZED_STUBS);
+        // One more distinct callee overflows the stub budget.
+        assert_eq!(site.observe(0x9999), CallObserved::Overflow);
+        assert_eq!(site.state(), IcState::Generic);
+        assert_eq!(site.observe(0x1000), CallObserved::Frozen);
+    }
+
+    #[test]
+    fn a_shapeless_callee_does_not_pollute_the_call_log() {
+        let mut site = CallSite::default();
+        assert_eq!(site.observe(0), CallObserved::Shapeless);
+        assert_eq!(site.distinct_callees(), 0);
+        assert_eq!(site.hits(), 1);
+    }
+
+    #[test]
+    fn the_probe_counts_calls() {
+        // The interpreter wires the call steps to `record_call`; with the
+        // probe on, a script that calls a function in a loop must record both
+        // the site and its observations, and a monomorphic site must dominate.
+        let _guard = probe_guard();
+        force_enabled(true);
+        let before = call_summary();
+        let mut agent = crate::Agent::new();
+        agent.initialize_host_defined_realm().expect("realm");
+        let _ = agent
+            .run_script(
+                "function f(x) { return x + 1; }\n\
+                 var s = 0;\n\
+                 for (var i = 0; i < 50; i = i + 1) { s = f(s); }\n\
+                 s;",
+            )
+            .expect("runs");
+        let after = call_summary();
+        force_enabled(false);
+        assert!(after.sites > before.sites, "call sites recorded");
+        assert!(after.hits > before.hits, "call observations recorded");
+        assert!(
+            after.mono_hits > before.mono_hits,
+            "the loop's call site is monomorphic"
+        );
+    }
+
+    #[test]
+    fn a_call_store_materializes_a_call_site_on_first_use() {
+        let mut feedback = Feedback::new(3);
+        assert!(feedback.call_site(1).is_some());
+        assert!(matches!(feedback.site(1), Some(SiteRecord::Call(_))));
+        // A step past the body is simply absent.
+        assert!(feedback.call_site(9).is_none());
     }
 }

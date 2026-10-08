@@ -513,6 +513,12 @@ pub fn dump_helper_counts() {
     }
 }
 
+/// Print the I5a feedback call-site probe summary (`.notes/optimizing-tier-impl.md`)
+/// — the corpus runner's closing dump. A no-op unless `SLAG_FEEDBACK` is set.
+pub fn dump_feedback_summary() {
+    runtime::feedback::dump_call_summary();
+}
+
 /// Install a JIT cache into `agent`: the runtime's leaf-call path consults
 /// it (via `Agent::jit_hook`) before interpreting a certified body. The
 /// cache is owned by the hook and freed when the agent drops.
