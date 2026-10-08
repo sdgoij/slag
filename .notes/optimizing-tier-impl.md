@@ -155,7 +155,7 @@ The `stage` column maps each increment to `optimizing-tier-plan.md` §6.
 | I2 | — | lift control flow: branches **landed**; simple loops with phis proposed | none (equivalence) | partly landed |
 | I3 | O | feedback records + `ICState` valve + retire hook + count probe | none (enabling) | partly landed (I3a–b) |
 | I4 | B | builtin intrinsic inlining (scalars first, then array/collection) | `regexp_test`, `array_slice`, `string_indexof` | partly landed, outside the IR |
-| I5 | I | trial inlining (caller-specialized records) | `method_call`, `js_call`, `closure_capture`, `hof_methods`, `apply_call` | proposed |
+| I5 | I | trial inlining (caller-specialized records) | `method_call`, `js_call`, `closure_capture`, `hof_methods`, `apply_call` | **opened** (probe-first, below) |
 | I6 | E | escape analysis + scalar replacement | `object_keys`, `typed_array_for_each`, `array_alloc`/`object_alloc`, `destructure`, `construct_churn` | proposed |
 | I7 | L | GVN + LICM + load elimination | `obj_prop`, `prim_prop`, `element_read/write`, `array_at`, `typed_array` | proposed |
 | I8 | T | coarse typer driving guard elision | across I5–I7 | proposed |
@@ -184,6 +184,31 @@ Every increment owes the same gate: `cargo clippy --workspace --all-targets
 -- -D warnings`; `cargo test --workspace`; test262 `language` and
 `built-ins`; the wasm suites; corpus parity 0; the jit-loss gate. **A perf
 change that costs a fixture is reverted.**
+
+### I5 — trial inlining, in full (opened 2026-10-08; probe-first)
+
+Inline a monomorphic callee's `Step`s at a caller's call site, under a size budget, recursing. Targets (`optimizing-tier-plan.md` §6): `method_call` 6x, `js_call` 3.6x, `closure_capture`, `hof_methods`, `apply_call`. It is the **enabler of I6**: an allocation can be elided only where the code that allocates and the code that consumes it are one body, so escape analysis has nothing to work on until the call boundary is gone.
+
+**The part we get for free.** SM allocates a fresh `ICScript` per call site so a function can be monomorphic *per caller* while polymorphic overall (`optimizing-tier-plan.md` §3.3). Slag's feedback record is keyed `(body, step)` and lives on the caller's `CompiledBody` — the body *is* the caller, so a site's record is already caller-private. Trial inlining needs no `ICScript` analog; the existing key is it (a `we delete` item, plan §3.7).
+
+**I5a — the probe (no transform; land this first, and only this if it says no).**
+- Extend `feedback.rs` with a `SiteRecord::Call(CallSite)` variant — the enum's documented seam — where `CallSite` holds the distinct callee identities it has seen (bounded by `MAX_OPTIMIZED_STUBS`, reusing `IcState`/`Observed`). The identity is the callee function's box address (what `runtime::jit::leaf_record_slot` already keys on), `0` for a non-function or unresolved callee.
+- The writers: the call-step arms of `run_inner_inner` (start with `Step::Call` and `CallFast`, then the rest), calling `CompiledBody::record_call(ip, id)`, mirroring `record_member_read`. The callee's size is `CompiledBody::steps.len()` of the body the identity resolves to (when it is certified).
+- Extend `feedback::summary` to classify call sites — monomorphic-within-budget / polymorphic / over-budget — and count callee-body step sizes.
+- **The deciding number:** over the 77-row corpus and `--jit-bench`, the share of *call traffic* (weighted, not just site count) at sites that are monomorphic AND whose callee is a certified body under the budget, against the polymorphic count (the retirements a monomorphic inline would fire). A small share is a recorded negative, and I5 stops at I5a.
+- Gate: §6's gate, no perf claim; the probe is off by default (`SLAG_FEEDBACK`).
+
+**I5b — the premise and the retire hook (shared with I4/I6/I7).** An inlined callee's identity is a premise, and it is the first premise that is not a value-cell generation. A body carries the premises it was compiled under; invalidation retires the caller's body (`optimizing-tier-plan.md` §5). This is I3's remaining slice and lands here because inlining is the first transform that needs it.
+
+**I5c — the transform (the simplest shape).** At an `Op::Call` whose site record is `Specialized` and whose callee is a certified body under the budget, lift the callee's `Step`s with the same exact `lift` (no speculation) and splice them at the call: the call's arguments bind to the callee's parameter slots, and the callee's return becomes the call's result. Recurse under the budget.
+- **First cut admits only a guard-free callee** (`JitCompiledInfo::deopts` empty) — the L2 invariant (a body whose compiled code can deopt is refused by every machine-code inline lane). The frame invariant (`optimizing-tier-plan.md` §2) is the reason: an inlined body that exits must resume at a step boundary with the operand stack exactly as the interpreter expects, and a resume across an inlined frame is work this cut does not do. Widening to a deoptable callee owes that work and must say so.
+- Differential tests: a callee with captures, `this`, `arguments`, a tail call, and a throw.
+
+**I5d — widening.** Recursion beyond one level, then the callee shapes the leaf lane already admits (captures, `this`, `arguments`).
+
+**Traps.** §8's list applies in full; two consequences are I5-specific. Inlining grows a body past `JIT_MAX_COMPILE_STEPS` (128 debug / 1024 release), and an over-cap body silently returns to the interpreter, so measure sizes as inlining lands. And the inlined callee's heap references become SSA values, invisible to the conservative stack scan, so they must be in `jit_roots` across a safepoint. Retire thrash — the design's central risk — is what I5a's polymorphic count measures before I5c ships.
+
+**Open (settle as I5 lands).** The inlined callee's IR source (cache the lifted `Function` per certified body, or re-lift per site); the size budget's number (start from I5a's step-size histogram, then SM/V8's ~30 B "small"); and whether the first cut's premise is the callee identity alone or also the argument count.
 
 ## 7. Measurement discipline
 
