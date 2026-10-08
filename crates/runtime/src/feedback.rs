@@ -731,6 +731,74 @@ mod tests {
     }
 
     #[test]
+    fn records_key_by_the_executing_step_not_the_next() {
+        // The run loop increments `self.ip` before dispatching a step, so a probe
+        // that recorded `self.ip` files a record one step too high. The lift's
+        // `Op::Call` imm (and the inline pass's site map) index by the true step,
+        // so a record must land on the step itself. Regression for the off-by-one
+        // that kept I5c splices from firing: without it, every record sat at
+        // `step + 1`.
+        let _guard = probe_guard();
+        force_enabled(true);
+        let mut agent = crate::Agent::new();
+        agent.initialize_host_defined_realm().expect("realm");
+        let _ = agent
+            .run_script(
+                "function f(x) { return x + 1; }\n\
+                 function g(o, n) { var s = 0; for (var i = 0; i < n; i = i + 1) { s = s + o.m(i); } return s; }\n\
+                 g({ m: f }, 50);",
+            )
+            .expect("runs");
+        force_enabled(false);
+        let mut calls = 0;
+        let mut reads = 0;
+        for data in agent.ecma_functions.values() {
+            let Some(body) = data.ir.as_ref() else {
+                continue;
+            };
+            let store = body.feedback.borrow();
+            let Some(store) = store.as_ref() else {
+                continue;
+            };
+            for (ip, step) in body.steps.iter().enumerate() {
+                let keyed_call = matches!(store.site(ip), Some(SiteRecord::Call(_)));
+                let keyed_read = matches!(store.site(ip), Some(SiteRecord::MemberRead(_)));
+                if records_a_call(step) || keyed_call {
+                    assert!(
+                        records_a_call(step) && keyed_call,
+                        "a call at {ip} keys at {ip}"
+                    );
+                    calls += 1;
+                }
+                if matches!(step, crate::ir::Step::GetMemberName { .. }) || keyed_read {
+                    assert!(
+                        matches!(step, crate::ir::Step::GetMemberName { .. }) && keyed_read,
+                        "a member read at {ip} keys at {ip}"
+                    );
+                    reads += 1;
+                }
+            }
+        }
+        assert!(calls > 0, "the script exercised a call step");
+        assert!(reads > 0, "the script exercised a member-read step");
+    }
+
+    /// Whether a step is one the interpreter wires to `record_call` (the six
+    /// call shapes that publish a site).
+    fn records_a_call(step: &crate::ir::Step) -> bool {
+        use crate::ir::Step;
+        matches!(
+            step,
+            Step::Call { .. }
+                | Step::CallFast { .. }
+                | Step::CallFastGlobal { .. }
+                | Step::CallFastSlot { .. }
+                | Step::CallFastSlotStore { .. }
+                | Step::CallFastGlobalStore { .. }
+        )
+    }
+
+    #[test]
     fn a_call_store_materializes_a_call_site_on_first_use() {
         let mut feedback = Feedback::new(3);
         assert!(feedback.call_site(1).is_some());

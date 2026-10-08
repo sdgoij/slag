@@ -930,6 +930,20 @@ by the fresh-function setup, and the fast paths have traps:
   overhead (~0.4µs) is the other half. A closure-creation loop measures
   ~1.4µs/closure after this cut (~20% faster than before).
 
+## 18. The feedback probe keys by step index — account for the run loop's pre-increment
+
+The `run_inner_inner` loop does `let step = &body.steps[self.ip]; self.ip += 1;`
+**before** the dispatch match, so inside every step handler `self.ip` is
+already `step_index + 1`. Any probe that records against a step index must
+pass `self.ip - 1`, not `self.ip`: `Feedback`'s store is one record per step
+(`Feedback::new(body.steps.len())`), and the JIT's `sites_from_feedback` — and
+the lift's `Op::Call` `Imm::Int` — key by the true step index. Recording at
+`self.ip` files every site one step too high, so the consumer finds no site and
+the transform silently never fires (this is exactly the bug that kept I5c trial
+splices inert). The regression is pinned by
+`feedback::tests::records_key_by_the_executing_step_not_the_next`; mutate the
+recorder back to `self.ip` and it bites.
+
 ## Validation loop
 
 `cargo clippy --workspace --all-targets -- -D warnings` clean, then

@@ -5130,7 +5130,10 @@ impl Vm {
             return;
         }
         let (identity, id, value, certified, steps) = Self::callee_call_info(agent, callee);
-        body.record_call(self.ip, identity, id, value, certified, steps);
+        // A handler runs after the loop's `self.ip += 1`, so the executing step
+        // is `self.ip - 1`; the feedback store is keyed by step index (the same
+        // index the lift puts in `Op::Call`'s `Imm::Int`).
+        body.record_call(self.ip - 1, identity, id, value, certified, steps);
     }
 
     /// The callee's call identity for the I5a/I5c-2a probes:
@@ -7853,7 +7856,7 @@ impl Vm {
                 }
                 Step::GetMemberName { name } => {
                     let object = self.pop();
-                    body.record_member_read(self.ip, Self::member_read_map(&object));
+                    body.record_member_read(self.ip - 1, Self::member_read_map(&object));
                     let value = self.get_member_name(agent, object, *name)?;
                     self.stack.push(value);
                 }

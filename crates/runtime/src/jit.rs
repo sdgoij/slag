@@ -6512,6 +6512,37 @@ extern "C" fn pop_var_reference(ctx: *mut c_void) -> u64 {
     }
 }
 
+/// A callee resolved for the optimizing-tier inline pass
+/// (`.notes/optimizing-tier-impl.md` I5c-2c-ii): its compiled body and the input
+/// frame layout the splice binds.
+pub struct ResolvedCallee {
+    pub body: std::rc::Rc<CompiledBody>,
+    pub arity: usize,
+    pub this_slot: Option<usize>,
+}
+
+/// Resolve a call site's retained callee id through the agent on the
+/// thread-local `with_agent` window — the window `Agent::run_script_mode` opens
+/// around every run, so a JIT compile is always inside one. Returns `None`
+/// outside an agent window or when the id no longer names a function with a
+/// compiled body (a collected callee).
+pub fn resolve_callee(id: u64) -> Option<ResolvedCallee> {
+    let agent = crux::function::current_agent();
+    if agent.is_null() {
+        return None;
+    }
+    // SAFETY: `with_agent` guarantees a live `&mut Agent` for the duration of
+    // the enclosing run, which is where every compile happens; this only reads.
+    let agent = unsafe { &*(agent as *const crate::agent::Agent) };
+    let body = agent.ecma_functions.get(&id)?.ir.clone()?;
+    let scope = body.scope.as_ref()?;
+    Some(ResolvedCallee {
+        arity: scope.arity,
+        this_slot: scope.this_slot,
+        body,
+    })
+}
+
 /// The body's compiled-info pointer: the per-body fast cell when set (the
 /// first successful lookup stores it; an eviction clears it, so a set
 /// pointer is always valid), else a consult of the installed hook
@@ -7613,6 +7644,14 @@ mod tests {
             nested_gate: std::cell::Cell::new(None),
             feedback: std::cell::RefCell::new(None),
         })
+    }
+
+    #[test]
+    fn resolve_callee_is_none_outside_an_agent_window() {
+        // A JIT compile runs inside `Agent::run_script_mode`'s `with_agent`
+        // window; off that window (a bare test) there is no agent, so the
+        // resolver declines rather than dereferencing a null pointer.
+        assert!(resolve_callee(0).is_none());
     }
 
     #[test]

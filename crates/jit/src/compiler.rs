@@ -129,11 +129,36 @@ impl JitEngine {
                     // re-verify and bail to the per-step path on a violation (a
                     // pass bug is a refusal, never a wrong program).
                     let sites = crate::opt::pass::inline::sites_from_feedback(body);
-                    // I5c-2c-ii wires the agent resolver; until then the tier
-                    // never resolves a callee, so the inline pass is inert (the
-                    // map is empty in a default build and the resolver declines
-                    // a recorded site).
-                    let mut resolve = |_: u64| -> Option<crate::opt::pass::inline::Callee> { None };
+                    // I5c-2c-ii: the splice is gated until it is measured
+                    // (`SLAG_INLINE`), so a default build never resolves a callee
+                    // and the inline pass is inert. The resolver lifts the
+                    // callee's body through the agent window a compile runs
+                    // inside, caching per id for the compile.
+                    let inline_enabled = std::env::var("SLAG_INLINE")
+                        .map(|v| v != "0")
+                        .unwrap_or(false);
+                    let mut lifted: std::collections::HashMap<
+                        u64,
+                        Option<crate::opt::pass::inline::Callee>,
+                    > = std::collections::HashMap::new();
+                    let mut resolve = |id: u64| -> Option<crate::opt::pass::inline::Callee> {
+                        if !inline_enabled {
+                            return None;
+                        }
+                        if let Some(hit) = lifted.get(&id) {
+                            return hit.clone();
+                        }
+                        let resolved = runtime::jit::resolve_callee(id).and_then(|callee| {
+                            let ir = crate::opt::lift::lift(&callee.body).ok();
+                            Some(crate::opt::pass::inline::Callee {
+                                ir: std::rc::Rc::new(ir?),
+                                arity: callee.arity,
+                                this_slot: callee.this_slot,
+                            })
+                        });
+                        lifted.insert(id, resolved.clone());
+                        resolved
+                    };
                     crate::opt::pass::run(&mut ir, &sites, &mut resolve);
                     if std::env::var("JIT_DUMP_IR").is_ok() {
                         eprintln!("--- IR ---\n{}", crate::opt::print::dump(&ir));
