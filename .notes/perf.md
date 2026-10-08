@@ -13358,3 +13358,13 @@ The change measured is the `narrow` value-table sync (the typer arc): `narrow` p
 The micro-suite (`--jit-bench`) is **insensitive** to this change: its bodies take the per-step lowering, which the fix does not touch (pre/post mean 1.011). The corpus and tier rows take the optimizing tier. So a flat `--jit-bench` is not a flat tier.
 
 Caveat kept: one binary pair, one machine, eight runs; p90 is 1.004, so a few rows are within noise. The family-level means remain the number to read.
+
+### The right corpus instrument for an env-gated feature is the same binary (2026-10-07)
+
+The pre/post-binary pair above works for a change with no runtime switch, but it carries a confound the corpus README only warns about sideways: two binaries built from near-identical source differ by a few percent in *code layout*, and that offset is **systematic, not noise**. Measured here on the typer (`Op::GuardType`), which *is* switchable (`SLAG_TYPER`): as a two-binary pair (`slag_post` vs `slag_typer`, differing by one line) the gap-corrected median read **0.969** — but that is the layout floor, not the feature. The tell is that the "wins" landed on rows the typer cannot touch (`opcost/object_keys`, `opcost/json_stringify`, `control/nested_loops` are builtin/loop rows with no member read).
+
+The fix is to A/B the **same binary** with the feature's env toggled (`SLAG_TYPER=0` vs `1`), four interleaved rounds, gap-corrected. Two independent four-round passes gave **1.017** and **0.996** (p10/p90 ≈ 0.95–1.04) — the typer is **~0 on the corpus**, and the instrument now resolves ~1% against the ~3% two-binary layout floor.
+
+So the rule: **a pre/post *binary* pair measures a build (layout included); an env-toggle on one binary measures the *feature*.** Use the latter whenever the change is switchable.
+
+The typer's real effect is per-shape, and the tier micro-rows (direct A/B, same binary, min-of-11) show it: `read_loop` **0.939x**, `read_loop_nonleaf` **0.954x**, `read_bare` 1.002x, `arith_loop` 1.007x, `licm_loop` 1.012x — ~5–6% on read loops, neutral where a read feeds no arithmetic. Net on the corpus: a wash. So default-on is a trade (read loops gain, corpus flat), not a win; it is kept on because the win is reproducible and the cost is under the instrument's floor.
