@@ -761,7 +761,9 @@ fn emit_step(
                 &args,
                 Type::Unknown,
                 Effects::call(),
-                Imm::None,
+                // The step index, so the inline pass (I5c-2c) can find this
+                // site's feedback record and the guard can resume here.
+                Imm::Int(index as i32),
             );
             stack.push(result);
         }

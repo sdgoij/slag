@@ -2174,7 +2174,15 @@ impl CompiledBody {
     /// is allocated on the first write, and a site that has turned generic is
     /// frozen (no further writes). `certified`/`steps` describe the callee's
     /// compiled body when it has one (`steps` is `0` otherwise).
-    pub(crate) fn record_call(&self, ip: usize, callee: u64, certified: bool, steps: u32) {
+    pub(crate) fn record_call(
+        &self,
+        ip: usize,
+        identity: u64,
+        function_id: u64,
+        bits: u64,
+        certified: bool,
+        steps: u32,
+    ) {
         if !crate::feedback::enabled() {
             return;
         }
@@ -2183,7 +2191,7 @@ impl CompiledBody {
         let Some(site) = store.call_site(ip) else {
             return;
         };
-        let observed = site.observe(callee);
+        let observed = site.observe(identity, function_id, bits);
         crate::feedback::record_call(observed, site.distinct_callees(), certified, steps);
     }
 }
@@ -5110,32 +5118,37 @@ impl Vm {
         if !crate::feedback::enabled() {
             return;
         }
-        let (identity, certified, steps) = Self::callee_call_identity(agent, callee);
-        body.record_call(self.ip, identity, certified, steps);
+        let (identity, id, bits, certified, steps) = Self::callee_call_info(agent, callee);
+        body.record_call(self.ip, identity, id, bits, certified, steps);
     }
 
-    /// The callee's identity for the I5a probe and its compiled-body shape:
-    /// `(identity, certified, steps)`. The identity is the callee's shared
-    /// `CompiledBody` pointer — every closure from one declaration site shares
-    /// one (Cut 43), so a site that re-instantiates its callee (a `bench()`
-    /// that declares the callee in-body) is still monomorphic *in code*, which
-    /// is what a trial inline would guard on. A callee with no compiled body
-    /// (a builtin) keeps its `Value` bits as identity and is never certified; a
-    /// non-function is `0` (shapeless).
-    fn callee_call_identity(agent: &Agent, callee: &Value) -> (u64, bool, u32) {
+    /// The callee's call identity for the I5a/I5c-2a probes:
+    /// `(identity, function_id, box, certified, steps)`. `identity` is the
+    /// shared `CompiledBody` pointer (the in-code monomorphism key); the
+    /// function id is the splice's handle (never reused, resolved through the
+    /// agent at compile time, so a stale one is a lookup miss, not a dangling
+    /// body); the box is `Op::GuardCallee`'s expected constant. A non-function
+    /// is all-zero (shapeless); a callee with no compiled body (a builtin)
+    /// keeps its box identity and a zero id.
+    fn callee_call_info(agent: &Agent, callee: &Value) -> (u64, u64, u64, bool, u32) {
+        let bits = callee.bits();
         let Some(function) = callee.as_function() else {
-            return (0, false, 0);
+            return (0, 0, 0, false, 0);
         };
-        match agent.ecma_functions.get(&function.id()) {
-            Some(data) => match &data.ir {
-                Some(ir) => (
-                    std::rc::Rc::as_ptr(ir) as u64,
-                    ir.scope.is_some(),
-                    ir.steps.len() as u32,
-                ),
-                None => (callee.bits(), false, 0),
-            },
-            None => (callee.bits(), false, 0),
+        let id = function.id();
+        match agent
+            .ecma_functions
+            .get(&id)
+            .and_then(|data| data.ir.as_ref())
+        {
+            Some(ir) => (
+                std::rc::Rc::as_ptr(ir) as u64,
+                id,
+                bits,
+                ir.scope.is_some(),
+                ir.steps.len() as u32,
+            ),
+            None => (bits, 0, bits, false, 0),
         }
     }
 
