@@ -1,12 +1,12 @@
 //! Trial inlining over the SSA IR (`.notes/optimizing-tier-impl.md` I5c-2c).
 //!
 //! At a monomorphic call site, replace the call with the callee's IR — the same
-//! exact `lift`, cloned into the caller. This first cut handles only a call that
-//! is its block's **last instruction** (so the call's result is used only by the
+//! exact `lift`, cloned into the caller. This cut handles only a call that is its
+//! block's **last instruction** (so the call's result is used only by the
 //! terminator or by blocks it dominates, and no block split is needed) and a
-//! callee that is **slot-free** (no `FrameLoad`/`FrameStore`/`TdzCheck`: the
-//! callee's locals have no home in the caller's frame — promoting them is
-//! I5c-2c-iii) and **call-free** (recursion is I5c-2c-iv).
+//! callee whose slots are all **inputs** (params and `this`, bound to the call's
+//! operands) — a callee that writes a `var` still needs mem2reg (I5c-2c-iii-b)
+//! and recursion is I5c-2c-iv.
 //!
 //! The site map and the resolver are injected, so the pass is agent-free and
 //! testable. The pipeline re-verifies after the pass and bails to the per-step
@@ -22,6 +22,17 @@ use crate::opt::ir::{BlockId, Effects, Function, Imm, Inst, Op, Term, Type, Valu
 pub struct InlineSite {
     pub callee_id: u64,
     pub callee_box: u64,
+}
+
+/// A resolved callee: its lifted IR and the input frame layout (`ScopeInfo`)
+/// the splice binds.
+#[derive(Clone)]
+pub struct Callee {
+    pub ir: Rc<Function>,
+    /// The parameter count; params occupy slots `0..arity` in source order.
+    pub arity: usize,
+    /// The frame slot holding the call's receiver, if the body reads `this`.
+    pub this_slot: Option<usize>,
 }
 
 /// The monomorphic call sites of `body`, indexed by step: a site whose
@@ -52,12 +63,12 @@ pub fn sites_from_feedback(body: &runtime::ir::CompiledBody) -> Vec<Option<Inlin
 }
 
 /// Inline every spliceable monomorphic call site. `sites` is indexed by step
-/// (the `Op::Call`'s `Imm::Int`); `resolve` yields the callee's lifted IR.
-/// Returns whether the IR changed.
+/// (the `Op::Call`'s `Imm::Int`); `resolve` yields the callee. Returns whether
+/// the IR changed.
 pub fn run(
     func: &mut Function,
     sites: &[Option<InlineSite>],
-    resolve: &mut dyn FnMut(u64) -> Option<Rc<Function>>,
+    resolve: &mut dyn FnMut(u64) -> Option<Callee>,
 ) -> bool {
     let mut changed = false;
     let blocks = func.block_count() as u32;
@@ -74,7 +85,7 @@ fn try_inline(
     func: &mut Function,
     b: BlockId,
     sites: &[Option<InlineSite>],
-    resolve: &mut dyn FnMut(u64) -> Option<Rc<Function>>,
+    resolve: &mut dyn FnMut(u64) -> Option<Callee>,
 ) -> bool {
     let (args, result, ty, step, site) = {
         let Some(last) = func.block(b).insts.last() else {
@@ -94,13 +105,11 @@ fn try_inline(
         };
         (last.args.clone(), result, last.ty, step, site)
     };
-    if args.len() < 2 {
-        return false;
-    }
     let Some(callee) = resolve(site.callee_id) else {
         return false;
     };
-    if !spliceable(&callee) {
+    // Every input slot must have a call operand to bind to.
+    if args.len() < 2 + callee.arity || !spliceable(&callee) {
         return false;
     }
 
@@ -113,25 +122,39 @@ fn try_inline(
     func.block_mut(cont).params.push(param);
     func.block_mut(cont).term = old_term;
 
-    // Clone the callee's blocks with fresh ids.
-    let block_map: Vec<BlockId> = (0..callee.block_count())
+    // Clone the callee's blocks with fresh ids, binding its input slots to the
+    // call's receiver (`args[0]`) and arguments (`args[2 + slot]`).
+    let block_map: Vec<BlockId> = (0..callee.ir.block_count())
         .map(|_| func.push_block())
         .collect();
-    let mut value_map: Vec<Option<ValueId>> = vec![None; callee.value_count() as usize];
-    for k in 0..callee.block_count() as u32 {
-        let src = callee.block(k);
+    let mut value_map: Vec<Option<ValueId>> = vec![None; callee.ir.value_count() as usize];
+    for k in 0..callee.ir.block_count() as u32 {
+        let src = callee.ir.block(k);
         let dst = block_map[k as usize];
         for &p in &src.params {
-            let nv = func.push_value(callee.value_type(p));
+            let nv = func.push_value(callee.ir.value_type(p));
             func.block_mut(dst).params.push(nv);
             value_map[p as usize] = Some(nv);
         }
     }
-    for k in 0..callee.block_count() as u32 {
-        let src = callee.block(k);
+    for k in 0..callee.ir.block_count() as u32 {
+        let src = callee.ir.block(k);
         let dst = block_map[k as usize];
         let mut insts = Vec::with_capacity(src.insts.len());
         for inst in &src.insts {
+            // An input-slot load is the bound operand, not a frame read.
+            if inst.op == Op::FrameLoad {
+                let Imm::Slot(slot) = inst.imm else {
+                    return false;
+                };
+                let bound = if Some(slot as usize) == callee.this_slot {
+                    args[0]
+                } else {
+                    args[2 + slot as usize]
+                };
+                value_map[inst.result.expect("a load has a result") as usize] = Some(bound);
+                continue;
+            }
             let result = inst.result.map(|r| {
                 let nv = func.push_value(inst.ty);
                 value_map[r as usize] = Some(nv);
@@ -212,20 +235,29 @@ fn try_inline(
     true
 }
 
-/// Whether this cut can splice `callee`: slot-free and call-free, with every
-/// path returning a value.
-fn spliceable(callee: &Function) -> bool {
+/// Whether this cut can splice `callee`: call-free, and every slot access is a
+/// load of an **input** slot (`< arity` or the `this` slot). A `FrameStore`, a
+/// `TdzCheck`, or a load of any other slot (a `var`) is refused — that is
+/// mem2reg's territory (I5c-2c-iii-b).
+fn spliceable(callee: &Callee) -> bool {
     let mut returns_a_value = false;
-    for k in 0..callee.block_count() as u32 {
-        for inst in &callee.block(k).insts {
-            if matches!(
-                inst.op,
-                Op::Call | Op::FrameLoad | Op::FrameStore | Op::TdzCheck
-            ) {
-                return false;
+    for k in 0..callee.ir.block_count() as u32 {
+        for inst in &callee.ir.block(k).insts {
+            match inst.op {
+                Op::Call | Op::FrameStore | Op::TdzCheck => return false,
+                Op::FrameLoad => {
+                    let Imm::Slot(slot) = inst.imm else {
+                        return false;
+                    };
+                    let slot = slot as usize;
+                    if slot >= callee.arity && Some(slot) != callee.this_slot {
+                        return false;
+                    }
+                }
+                _ => {}
             }
         }
-        match callee.block(k).term.as_ref() {
+        match callee.ir.block(k).term.as_ref() {
             Some(Term::Return(Some(_))) => returns_a_value = true,
             Some(Term::Jump { .. } | Term::Branch { .. }) => {}
             // `Return(None)` (undefined), a throw, and an unreachable point are
@@ -280,9 +312,11 @@ fn replace_uses(func: &mut Function, from: ValueId, to: ValueId) {
 mod tests {
     use super::*;
     use crate::opt::builder::Builder;
+    use crate::opt::ir::Heap;
     use crate::opt::verify::verify;
 
-    fn callee_ir() -> Rc<Function> {
+    /// A callee returning a constant.
+    fn constant_callee() -> Callee {
         let mut f = Function::new();
         let e = f.entry();
         let mut b = Builder::new(&mut f);
@@ -295,10 +329,51 @@ mod tests {
             Imm::Float(42.0),
         );
         b.term(e, Term::Return(Some(c)));
-        Rc::new(f)
+        Callee {
+            ir: Rc::new(f),
+            arity: 0,
+            this_slot: None,
+        }
     }
 
-    /// `call(this, callee); return result` — the call is the last instruction.
+    /// `function (x) { return x + 1; }` — one param, read only.
+    fn param_callee() -> Callee {
+        let mut f = Function::new();
+        let e = f.entry();
+        let mut b = Builder::new(&mut f);
+        let x = b.emit(
+            e,
+            Op::FrameLoad,
+            &[],
+            Type::Unknown,
+            Effects::read(Heap::Slots),
+            Imm::Slot(0),
+        );
+        let one = b.emit(
+            e,
+            Op::Const,
+            &[],
+            Type::Number,
+            Effects::pure(),
+            Imm::Float(1.0),
+        );
+        let sum = b.emit(
+            e,
+            Op::Add,
+            &[x, one],
+            Type::Number,
+            Effects::call(),
+            Imm::None,
+        );
+        b.term(e, Term::Return(Some(sum)));
+        Callee {
+            ir: Rc::new(f),
+            arity: 1,
+            this_slot: None,
+        }
+    }
+
+    /// `call(this, callee, a1); return result` — one argument.
     fn caller_ir() -> Function {
         let mut f = Function::new();
         let e = f.entry();
@@ -319,10 +394,18 @@ mod tests {
             Effects::pure(),
             Imm::U64(0xabc),
         );
+        let a1 = b.emit(
+            e,
+            Op::Const,
+            &[],
+            Type::Number,
+            Effects::pure(),
+            Imm::Float(10.0),
+        );
         let r = b.emit(
             e,
             Op::Call,
-            &[this, callee],
+            &[this, callee, a1],
             Type::Unknown,
             Effects::call(),
             Imm::Int(0),
@@ -337,62 +420,106 @@ mod tests {
             .collect()
     }
 
-    #[test]
-    fn splices_a_monomorphic_slot_free_callee() {
-        let mut func = caller_ir();
-        let sites = vec![Some(InlineSite {
+    fn site() -> Vec<Option<InlineSite>> {
+        vec![Some(InlineSite {
             callee_id: 7,
             callee_box: 0xabc,
-        })];
-        let mut resolve = |id: u64| (id == 7).then(callee_ir);
-        assert!(run(&mut func, &sites, &mut resolve), "the site inlined");
+        })]
+    }
+
+    #[test]
+    fn splices_a_parameter_reading_callee() {
+        // The callee's param load becomes the call's argument, so
+        // `x + 1` with `x = 10` splices to `11`.
+        let mut func = caller_ir();
+        let mut resolve = |id: u64| (id == 7).then(param_callee);
+        assert!(run(&mut func, &site(), &mut resolve), "the site inlined");
         assert!(!ops(&func).contains(&Op::Call), "the call is gone");
+        assert!(!ops(&func).contains(&Op::FrameLoad), "the param is bound");
         assert!(
             ops(&func).contains(&Op::GuardCallee),
             "the callee is guarded"
         );
         assert_eq!(verify(&func), Ok(()), "the spliced IR verifies");
+        // The bound value flows: the callee's `Add` now reads the caller's
+        // argument (`Const(Float(10.0))`).
+        let mut ten = None;
+        let mut add_args = None;
+        for b in 0..func.block_count() as u32 {
+            for inst in &func.block(b).insts {
+                if inst.op == Op::Const && inst.imm == Imm::Float(10.0) {
+                    ten = inst.result;
+                }
+                if inst.op == Op::Add {
+                    add_args = Some(inst.args.clone());
+                }
+            }
+        }
+        assert_eq!(
+            add_args.expect("the callee's Add")[0],
+            ten.expect("the caller's argument"),
+            "the param load became the call's argument"
+        );
+    }
+
+    #[test]
+    fn splices_a_constant_callee() {
+        let mut func = caller_ir();
+        let mut resolve = |id: u64| (id == 7).then(constant_callee);
+        assert!(run(&mut func, &site(), &mut resolve));
+        assert!(!ops(&func).contains(&Op::Call));
+        assert_eq!(verify(&func), Ok(()));
     }
 
     #[test]
     fn leaves_a_site_the_resolver_declines() {
-        // A site with no resolved callee is left untouched.
         let mut func = caller_ir();
-        let sites = vec![Some(InlineSite {
-            callee_id: 7,
-            callee_box: 0xabc,
-        })];
         let mut resolve = |_id: u64| None;
-        assert!(!run(&mut func, &sites, &mut resolve));
+        assert!(!run(&mut func, &site(), &mut resolve));
         assert!(ops(&func).contains(&Op::Call));
     }
 
     #[test]
-    fn leaves_a_slot_using_callee_alone() {
-        // I5c-2c-iii: a callee whose locals live in its frame (any param or
-        // `var`) is refused — its slots have no home in the caller's frame.
-        let mut func = caller_ir();
-        let mut slot_using = Function::new();
-        let e = slot_using.entry();
+    fn leaves_a_var_writing_callee_alone() {
+        // I5c-2c-iii-b: a callee whose locals live in its frame (a `var` store)
+        // is refused — its slots have no home in the caller's frame.
+        let mut f = Function::new();
+        let e = f.entry();
         {
-            let mut b = Builder::new(&mut slot_using);
-            let v = b.emit(
+            let mut b = Builder::new(&mut f);
+            let zero = b.emit(
+                e,
+                Op::Const,
+                &[],
+                Type::Number,
+                Effects::pure(),
+                Imm::Float(0.0),
+            );
+            b.emit_void(
+                e,
+                Op::FrameStore,
+                &[zero],
+                Effects::write(Heap::Slots),
+                Imm::Slot(1),
+            );
+            let t = b.emit(
                 e,
                 Op::FrameLoad,
                 &[],
                 Type::Unknown,
-                Effects::read(crate::opt::ir::Heap::Slots),
-                Imm::Slot(0),
+                Effects::read(Heap::Slots),
+                Imm::Slot(1),
             );
-            b.term(e, Term::Return(Some(v)));
+            b.term(e, Term::Return(Some(t)));
         }
-        let slot_using = Rc::new(slot_using);
-        let sites = vec![Some(InlineSite {
-            callee_id: 7,
-            callee_box: 0xabc,
-        })];
-        let mut resolve = |_id: u64| Some(slot_using.clone());
-        assert!(!run(&mut func, &sites, &mut resolve));
+        let var_callee = Callee {
+            ir: Rc::new(f),
+            arity: 0,
+            this_slot: None,
+        };
+        let mut func = caller_ir();
+        let mut resolve = |_id: u64| Some(var_callee.clone());
+        assert!(!run(&mut func, &site(), &mut resolve));
         assert!(ops(&func).contains(&Op::Call));
     }
 }

@@ -133,8 +133,7 @@ impl JitEngine {
                     // never resolves a callee, so the inline pass is inert (the
                     // map is empty in a default build and the resolver declines
                     // a recorded site).
-                    let mut resolve =
-                        |_: u64| -> Option<std::rc::Rc<crate::opt::ir::Function>> { None };
+                    let mut resolve = |_: u64| -> Option<crate::opt::pass::inline::Callee> { None };
                     crate::opt::pass::run(&mut ir, &sites, &mut resolve);
                     if std::env::var("JIT_DUMP_IR").is_ok() {
                         eprintln!("--- IR ---\n{}", crate::opt::print::dump(&ir));

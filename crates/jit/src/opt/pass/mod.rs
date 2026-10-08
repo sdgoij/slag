@@ -43,7 +43,7 @@ fn guard_enabled() -> bool {
 pub fn run(
     func: &mut Function,
     sites: &[Option<inline::InlineSite>],
-    resolve: &mut dyn FnMut(u64) -> Option<std::rc::Rc<Function>>,
+    resolve: &mut dyn FnMut(u64) -> Option<inline::Callee>,
 ) -> bool {
     let folded = fold::run(func);
     let narrowed = narrow::run(func);
