@@ -128,7 +128,14 @@ impl JitEngine {
                     // pass is allowed to change the IR but not to break it, so
                     // re-verify and bail to the per-step path on a violation (a
                     // pass bug is a refusal, never a wrong program).
-                    crate::opt::pass::run(&mut ir);
+                    let sites = crate::opt::pass::inline::sites_from_feedback(body);
+                    // I5c-2c-ii wires the agent resolver; until then the tier
+                    // never resolves a callee, so the inline pass is inert (the
+                    // map is empty in a default build and the resolver declines
+                    // a recorded site).
+                    let mut resolve =
+                        |_: u64| -> Option<std::rc::Rc<crate::opt::ir::Function>> { None };
+                    crate::opt::pass::run(&mut ir, &sites, &mut resolve);
                     if std::env::var("JIT_DUMP_IR").is_ok() {
                         eprintln!("--- IR ---\n{}", crate::opt::print::dump(&ir));
                     }
