@@ -12,6 +12,9 @@
 
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
+use crux::Value;
+use crux::heap::{GcAny, Trace};
+
 /// The `ICState` valve (`optimizing-tier-plan.md` §3.2): how many distinct
 /// shapes a site may specialize to before it turns generic.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -130,28 +133,49 @@ pub enum Observed {
 /// [`MAX_OPTIMIZED_STUBS`]), and the valve state. The identity is the callee's
 /// encoded `Value` bits — the same `u64` the compiled call path keys its leaf
 /// record on — so a monomorphic site is exactly one a trial inline could guard.
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug)]
 pub struct CallSite {
     callees: [u64; MAX_OPTIMIZED_STUBS],
     len: u8,
     generic: bool,
     hits: u64,
-    /// The first callee's function id (`Function::id()`, never reused) and its
-    /// encoded `Value` bits. The id is what a splice resolves (through the
-    /// agent's `ecma_functions`, at compile time) and the box is what
-    /// `Op::GuardCallee` compares at run time. `0` when the first callee had no
+    /// The first callee's function id (`Function::id()`, never reused) and the
+    /// callee itself as a GC `Value`. The id is what a splice resolves (through
+    /// the agent's `ecma_functions`), and the `Value` is what `Op::GuardCallee`
+    /// compares at run time **and holds alive**: a box is recyclable once its
+    /// function is collected, and compiled code cannot clear a guard the way the
+    /// leaf caches clear a record, so the retained `Value` is what keeps the
+    /// guard exact (I5c-2c-ii). `undefined` when the first callee had no
     /// compiled body (a builtin).
     first_id: u64,
-    first_box: u64,
+    first_callee: Value,
+}
+
+impl Default for CallSite {
+    fn default() -> Self {
+        CallSite {
+            callees: [0; MAX_OPTIMIZED_STUBS],
+            len: 0,
+            generic: false,
+            hits: 0,
+            first_id: 0,
+            first_callee: Value::Undefined,
+        }
+    }
+}
+
+impl Trace for CallSite {
+    fn trace(&self, visit: &mut dyn FnMut(GcAny)) {
+        self.first_callee.trace(visit);
+    }
 }
 
 impl CallSite {
     /// Record a call whose callee's code identity is `identity` (the shared
-    /// `CompiledBody` pointer), function id `function_id` and encoded bits
-    /// `box` (`0` identity = a callee with none: a non-function). Returns what
-    /// the observation did to the record; a site that is already generic is
-    /// frozen.
-    pub fn observe(&mut self, identity: u64, function_id: u64, bits: u64) -> CallObserved {
+    /// `CompiledBody` pointer), function id `function_id`, and value `callee`
+    /// (`0` identity = a callee with none: a non-function). Returns what the
+    /// observation did to the record; a site that is already generic is frozen.
+    pub fn observe(&mut self, identity: u64, function_id: u64, callee: Value) -> CallObserved {
         self.hits = self.hits.saturating_add(1);
         if self.generic {
             return CallObserved::Frozen;
@@ -168,7 +192,7 @@ impl CallSite {
             self.len += 1;
             if self.len == 1 {
                 self.first_id = function_id;
-                self.first_box = bits;
+                self.first_callee = callee;
                 return CallObserved::First;
             }
             return CallObserved::NewCallee;
@@ -178,18 +202,21 @@ impl CallSite {
     }
 
     /// The first callee's function id (`0` when it had no compiled body). The
-    /// handle a splice resolves at compile time — an id, not a borrowed body,
-    /// so a stale one is rejected by a lookup miss rather than kept alive.
+    /// handle a splice resolves at compile time through the agent.
     #[must_use]
     pub fn first_callee_id(&self) -> u64 {
         self.first_id
     }
 
-    /// The first callee's encoded `Value` bits (the `Op::GuardCallee`
-    /// expected constant).
+    /// The first callee's encoded `Value` bits (the `Op::GuardCallee` expected
+    /// constant); `0` when there was no compiled-body callee.
     #[must_use]
     pub fn first_callee_box(&self) -> u64 {
-        self.first_box
+        if self.first_id == 0 {
+            0
+        } else {
+            self.first_callee.bits()
+        }
     }
 
     /// The distinct callees this site has served.
@@ -244,11 +271,29 @@ pub enum SiteRecord {
     Call(CallSite),
 }
 
+impl Trace for SiteRecord {
+    fn trace(&self, visit: &mut dyn FnMut(GcAny)) {
+        // Only a call site retains a GC value (its callee); a member-read site's
+        // log is plain map ids.
+        if let SiteRecord::Call(site) = self {
+            site.trace(visit);
+        }
+    }
+}
+
 /// The per-body feedback store: one [`SiteRecord`] per step, allocated lazily
 /// and only when the probe is enabled.
 #[derive(Clone, Debug, Default)]
 pub struct Feedback {
     sites: Box<[SiteRecord]>,
+}
+
+impl Trace for Feedback {
+    fn trace(&self, visit: &mut dyn FnMut(GcAny)) {
+        for site in &self.sites {
+            site.trace(visit);
+        }
+    }
 }
 
 impl Feedback {
@@ -601,40 +646,58 @@ mod tests {
     #[test]
     fn a_call_site_is_monomorphic_then_polymorphic_then_generic() {
         let mut site = CallSite::default();
-        assert_eq!(site.observe(0x1000, 7, 0xabc), CallObserved::First);
-        assert_eq!(site.observe(0x1000, 7, 0xabc), CallObserved::Repeat);
+        let callee = Value::Number(1.0);
+        assert_eq!(site.observe(0x1000, 7, callee), CallObserved::First);
+        assert_eq!(site.observe(0x1000, 7, callee), CallObserved::Repeat);
         assert_eq!(site.distinct_callees(), 1);
         assert_eq!(site.state(), IcState::Specialized);
-        assert_eq!(site.observe(0x2000, 0, 0), CallObserved::NewCallee);
+        assert_eq!(
+            site.observe(0x2000, 0, Value::Undefined),
+            CallObserved::NewCallee
+        );
         assert_eq!(site.state(), IcState::Megamorphic);
         for id in 0x3000..(0x3000 + MAX_OPTIMIZED_STUBS as u64 - 2) {
-            let _ = site.observe(id, 0, 0);
+            let _ = site.observe(id, 0, Value::Undefined);
         }
         assert_eq!(site.distinct_callees(), MAX_OPTIMIZED_STUBS);
         // One more distinct callee overflows the stub budget.
-        assert_eq!(site.observe(0x9999, 0, 0), CallObserved::Overflow);
+        assert_eq!(
+            site.observe(0x9999, 0, Value::Undefined),
+            CallObserved::Overflow
+        );
         assert_eq!(site.state(), IcState::Generic);
-        assert_eq!(site.observe(0x1000, 0, 0), CallObserved::Frozen);
+        assert_eq!(
+            site.observe(0x1000, 0, Value::Undefined),
+            CallObserved::Frozen
+        );
     }
 
     #[test]
     fn a_call_site_remembers_its_first_callee() {
-        // I5c-2a: the first callee's function id and box are the handle a
-        // splice resolves and the constant `Op::GuardCallee` compares. They are
-        // the retire premise, so a later distinct body must not overwrite them.
+        // I5c-2a/I5c-2c-ii: the first callee's id is what a splice resolves and
+        // its `Value` is what `Op::GuardCallee` compares and what keeps the
+        // callee (and its box) alive. They are the retire premise, so a later
+        // distinct body must not overwrite them.
         let mut site = CallSite::default();
-        assert_eq!(site.observe(0x1000, 7, 0xabc), CallObserved::First);
+        let callee = Value::Number(2.5);
+        assert_eq!(site.observe(0x1000, 7, callee), CallObserved::First);
         assert_eq!(site.first_callee_id(), 7);
-        assert_eq!(site.first_callee_box(), 0xabc);
-        assert_eq!(site.observe(0x2000, 9, 0xdef), CallObserved::NewCallee);
+        assert_eq!(site.first_callee_box(), callee.bits());
+        assert_eq!(
+            site.observe(0x2000, 9, Value::Number(9.0)),
+            CallObserved::NewCallee
+        );
         assert_eq!(site.first_callee_id(), 7);
-        assert_eq!(site.first_callee_box(), 0xabc);
+        assert_eq!(site.first_callee_box(), callee.bits());
     }
 
     #[test]
     fn a_shapeless_callee_does_not_pollute_the_call_log() {
         let mut site = CallSite::default();
-        assert_eq!(site.observe(0, 0, 0), CallObserved::Shapeless);
+        assert_eq!(
+            site.observe(0, 0, Value::Undefined),
+            CallObserved::Shapeless
+        );
         assert_eq!(site.distinct_callees(), 0);
         assert_eq!(site.hits(), 1);
     }

@@ -2179,7 +2179,7 @@ impl CompiledBody {
         ip: usize,
         identity: u64,
         function_id: u64,
-        bits: u64,
+        callee: Value,
         certified: bool,
         steps: u32,
     ) {
@@ -2191,7 +2191,7 @@ impl CompiledBody {
         let Some(site) = store.call_site(ip) else {
             return;
         };
-        let observed = site.observe(identity, function_id, bits);
+        let observed = site.observe(identity, function_id, callee);
         crate::feedback::record_call(observed, site.distinct_callees(), certified, steps);
     }
 }
@@ -2199,6 +2199,17 @@ impl CompiledBody {
 impl Trace for CompiledBody {
     fn trace(&self, visit: &mut dyn FnMut(GcAny)) {
         self.steps.trace(visit);
+        // A call site retains its first callee as a `Value` so the callee
+        // function (and thus its box) stays alive: compiled `Op::GuardCallee`
+        // code cannot be cleared the way the leaf caches are, so the retained
+        // value is what keeps the guard exact against box recycling
+        // (`.notes/optimizing-tier-impl.md` I5c-2c-ii). A `RefCell` borrowed
+        // mid-collection aborts the trace (safe).
+        if let Ok(feedback) = self.feedback.try_borrow()
+            && let Some(store) = feedback.as_ref()
+        {
+            store.trace(visit);
+        }
     }
 }
 
@@ -5118,22 +5129,20 @@ impl Vm {
         if !crate::feedback::enabled() {
             return;
         }
-        let (identity, id, bits, certified, steps) = Self::callee_call_info(agent, callee);
-        body.record_call(self.ip, identity, id, bits, certified, steps);
+        let (identity, id, value, certified, steps) = Self::callee_call_info(agent, callee);
+        body.record_call(self.ip, identity, id, value, certified, steps);
     }
 
     /// The callee's call identity for the I5a/I5c-2a probes:
-    /// `(identity, function_id, box, certified, steps)`. `identity` is the
+    /// `(identity, function_id, callee, certified, steps)`. `identity` is the
     /// shared `CompiledBody` pointer (the in-code monomorphism key); the
-    /// function id is the splice's handle (never reused, resolved through the
-    /// agent at compile time, so a stale one is a lookup miss, not a dangling
-    /// body); the box is `Op::GuardCallee`'s expected constant. A non-function
-    /// is all-zero (shapeless); a callee with no compiled body (a builtin)
-    /// keeps its box identity and a zero id.
-    fn callee_call_info(agent: &Agent, callee: &Value) -> (u64, u64, u64, bool, u32) {
-        let bits = callee.bits();
+    /// function id is the splice's resolution key; the `Value` is what
+    /// `Op::GuardCallee` compares and what the feedback retains (roots). A
+    /// non-function is all-zero (shapeless); a callee with no compiled body (a
+    /// builtin) keeps its box identity and a zero id.
+    fn callee_call_info(agent: &Agent, callee: &Value) -> (u64, u64, Value, bool, u32) {
         let Some(function) = callee.as_function() else {
-            return (0, 0, 0, false, 0);
+            return (0, 0, Value::Undefined, false, 0);
         };
         let id = function.id();
         match agent
@@ -5144,11 +5153,11 @@ impl Vm {
             Some(ir) => (
                 std::rc::Rc::as_ptr(ir) as u64,
                 id,
-                bits,
+                *callee,
                 ir.scope.is_some(),
                 ir.steps.len() as u32,
             ),
-            None => (bits, 0, bits, false, 0),
+            None => (callee.bits(), 0, *callee, false, 0),
         }
     }
 
