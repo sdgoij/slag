@@ -689,6 +689,30 @@ fn lower_inst(
             }
             emit_intrinsic(builder, helpers, abi, kind, this, callee, &call_args)?
         }
+        // A lifted whole-literal array create (`Step::ArrayFast`): the args are
+        // the element values in source order. Materialize them at the working
+        // region base and run the same `array_fast` helper the per-step path
+        // uses (I6-0a).
+        Op::NewArray => {
+            let mut values = Vec::with_capacity(inst.args.len());
+            for i in 0..inst.args.len() {
+                values.push(arg(i)?);
+            }
+            emit_new_array(builder, helpers, abi, &values)?
+        }
+        // A lifted whole-literal object create (`Step::ObjectFast`): the args are
+        // the property values in source order; the `names` payload stays in the
+        // running body and the helper reads it back via the step index (`imm`).
+        Op::NewObject => {
+            let Imm::Int(step) = inst.imm else {
+                return Err(Unsupported::Step("opt:new-object"));
+            };
+            let mut values = Vec::with_capacity(inst.args.len());
+            for i in 0..inst.args.len() {
+                values.push(arg(i)?);
+            }
+            emit_new_object(builder, helpers, abi, step, &values)?
+        }
         _ => return Err(Unsupported::Step("opt:op")),
     })
 }
@@ -1198,6 +1222,69 @@ fn emit_global_read(
     builder.seal_block(merge);
     builder.switch_to_block(merge);
     Ok(builder.use_var(value))
+}
+
+/// The fused whole-literal array create (I6-0a), the mirror of the per-step
+/// `Step::ArrayFast`: materialize the element values at the working-region base
+/// and run `array_fast`, which reads the `n` values below the `sp` passed here
+/// (`work + 8n`).
+fn emit_new_array(
+    builder: &mut FunctionBuilder,
+    helpers: &JitHelpers,
+    abi: &Abi,
+    values: &[ClifValue],
+) -> Result<ClifValue, Unsupported> {
+    let n = values.len();
+    for (k, v) in values.iter().enumerate() {
+        builder.ins().store(
+            MemFlagsData::new(),
+            *v,
+            abi.work,
+            Offset32::new((k * 8) as i32),
+        );
+    }
+    let count = builder.ins().iconst(types::I64, n as i64);
+    let sp = builder.ins().iadd_imm_u(abi.work, (n * 8) as i64);
+    call_helper(
+        builder,
+        helpers,
+        abi,
+        abi.sig_unary,
+        Helper::ArrayFast,
+        &[count, sp],
+    )
+}
+
+/// The fused whole-literal object create (I6-0a), the mirror of the per-step
+/// `Step::ObjectFast`: the `names` payload is read back from the running body
+/// via `step` (`step_at`), and the `n` property values are materialized at the
+/// working-region base below the `sp` passed here (`work + 8n`).
+fn emit_new_object(
+    builder: &mut FunctionBuilder,
+    helpers: &JitHelpers,
+    abi: &Abi,
+    step: i32,
+    values: &[ClifValue],
+) -> Result<ClifValue, Unsupported> {
+    let n = values.len();
+    for (k, v) in values.iter().enumerate() {
+        builder.ins().store(
+            MemFlagsData::new(),
+            *v,
+            abi.work,
+            Offset32::new((k * 8) as i32),
+        );
+    }
+    let step_imm = builder.ins().iconst(types::I64, step as i64);
+    let sp = builder.ins().iadd_imm_u(abi.work, (n * 8) as i64);
+    call_helper(
+        builder,
+        helpers,
+        abi,
+        abi.sig_unary,
+        Helper::ObjectFast,
+        &[step_imm, sp],
+    )
 }
 
 /// `bits & TAG_MASK == TAG_PREFIX` and `(bits >> 44) & 0xF == TAG_STRING` — the

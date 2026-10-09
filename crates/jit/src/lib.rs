@@ -8336,6 +8336,42 @@ run(); run(); run(); run(); run(); run(); run(); run(); run();";
     }
 
     #[test]
+    fn installed_jit_lifted_literal_creates_match_the_interpreter() {
+        // I6-0a: a `for` body creating an array and an object literal per
+        // iteration (the fused `ArrayFast`/`ObjectFast` creates) lifts to
+        // `Op::NewArray`/`Op::NewObject`, lowered through the same fused helpers.
+        // The value must match the interpreter and the opt body must be produced.
+        let source = "function f(n) {\n\
+                        var s = 0;\n\
+                        for (var i = 0; i < n; i++) {\n\
+                          var a = [i, i + 1, i + 2];\n\
+                          var o = { x: i, y: i * 2 };\n\
+                          s = (s + a[0] + a[1] + a[2] + o.x + o.y) | 0;\n\
+                        }\n\
+                        return s;\n\
+                      }\n\
+                      f(100000);";
+        let interp = {
+            let mut agent = runtime::Agent::new();
+            agent.initialize_host_defined_realm().expect("realm");
+            agent.run_script(source).expect("interp runs")
+        };
+        let before = crate::opt_lower::OPT_COMPILED.load(std::sync::atomic::Ordering::Relaxed);
+        let (value, compiled) = with_opt_jit_agent(|agent| agent.run_script(source).expect("runs"));
+        let opt_bodies =
+            crate::opt_lower::OPT_COMPILED.load(std::sync::atomic::Ordering::Relaxed) - before;
+        assert!(compiled >= 1, "{compiled} bodies must compile");
+        assert_eq!(
+            value, interp,
+            "the literal creates must match the interpreter"
+        );
+        assert!(
+            opt_bodies >= 1,
+            "the literal-creating body must lower through the opt path (got {opt_bodies})"
+        );
+    }
+
+    #[test]
     fn installed_jit_computed_read_cell_inlines() {
         // G8: a compiled `o[k]` read with a String key over an own data property
         // must serve from the computed-read cell — the counting wrapper proves

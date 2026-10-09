@@ -397,6 +397,10 @@ fn stack_delta(step: &Step) -> Result<i32, Unsupported> {
         | Step::RunRegBody { .. } => 0,
         Step::PushAcc => 1,
         Step::PopAcc => -1,
+        // The whole-literal fused creates (I6-0a) pop their N values and push
+        // the created array/object.
+        Step::ArrayFast { count } => -(*count as i32) + 1,
+        Step::ObjectFast { names } => -(names.len() as i32) + 1,
         other => return Err(Unsupported::Step(step_name(other))),
     })
 }
@@ -875,6 +879,44 @@ fn emit_step(
         }
         Step::RunRegBody { ops } => {
             emit_reg_body(builder, block, ops, counter)?;
+        }
+        // The whole-literal fused creates (I6-0a): the N value expressions are
+        // already on the operand stack (in source order), so the lift pops them
+        // into `Op::NewArray`/`Op::NewObject`. The lowering runs the same fused
+        // helper the per-step path uses (`array_fast`/`object_fast`), so the
+        // semantics are unchanged.
+        Step::ArrayFast { count } => {
+            let n = *count as usize;
+            if stack.len() < n {
+                return Err(Unsupported::Stack);
+            }
+            let values = stack.split_off(stack.len() - n);
+            let result = builder.emit(
+                block,
+                Op::NewArray,
+                &values,
+                Type::Object,
+                Op::NewArray.default_effects(),
+                // The step index (the lowering passes it to the helper).
+                Imm::Int(index as i32),
+            );
+            stack.push(result);
+        }
+        Step::ObjectFast { names } => {
+            let n = names.len();
+            if stack.len() < n {
+                return Err(Unsupported::Stack);
+            }
+            let values = stack.split_off(stack.len() - n);
+            let result = builder.emit(
+                block,
+                Op::NewObject,
+                &values,
+                Type::Object,
+                Op::NewObject.default_effects(),
+                Imm::Int(index as i32),
+            );
+            stack.push(result);
         }
         other => return Err(Unsupported::Step(step_name(other))),
     }
