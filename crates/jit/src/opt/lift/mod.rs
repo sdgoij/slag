@@ -31,7 +31,7 @@ use crate::opt::builder::Builder;
 use crate::opt::ir::{BlockId, Effects, Function, Heap, Imm, Op, Term, Type, ValueId};
 use syntax::ast::{BinaryOp, UnaryOp, UpdateOp};
 
-use runtime::ir::{CompiledBody, FastLoopVar, LeafOp, NumRhs, RelLimit, Step};
+use runtime::ir::{CompiledBody, FastLoopVar, LeafOp, NumRhs, RegOperand, RelLimit, Step};
 
 /// Why a body could not be lifted.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1175,6 +1175,34 @@ fn emit_named_read(
     )
 }
 
+/// Resolve a register operand (a leaf op's direct operand) to an SSA value: a
+/// frame slot, a constant, or the accumulator-loop counter. `Acc`/`Spilled`/
+/// `PostInc` and the context/per-iteration forms refuse (their own slice).
+fn emit_reg_operand(
+    builder: &mut Builder,
+    block: BlockId,
+    operand: &RegOperand,
+    counter: Option<usize>,
+) -> Result<ValueId, Unsupported> {
+    Ok(match operand {
+        RegOperand::Reg { slot, tdz } => {
+            if *tdz {
+                emit_tdz_check(builder, block, *slot);
+            }
+            emit_frame_load(builder, block, *slot)
+        }
+        RegOperand::Const(value) => {
+            let (imm, ty) = constant(value)?;
+            builder.emit(block, Op::Const, &[], ty, Effects::pure(), imm)
+        }
+        RegOperand::Counter => {
+            let slot = counter.ok_or(Unsupported::Step("RunRegBody"))?;
+            emit_frame_load(builder, block, slot)
+        }
+        _ => return Err(Unsupported::Step("RunRegBody")),
+    })
+}
+
 fn emit_leaf_op(
     builder: &mut Builder,
     block: BlockId,
@@ -1294,6 +1322,33 @@ fn emit_leaf_op(
         } => {
             let object = load(builder, *object_slot, *t);
             emit_named_read(builder, block, object, *name)
+        }
+        // The register-body member stores (`o.name = v`): the object is the
+        // accumulator (`StoreMemberName`) or a frame slot (`StoreMemberNameLocal`),
+        // the value a register/const operand or the accumulator. Effect-only;
+        // the accumulator is unchanged (the per-step register executor discards
+        // the assigned value).
+        LeafOp::StoreMemberName { name, value } => {
+            let value = emit_reg_operand(builder, block, value, counter)?;
+            builder.emit_void(
+                block,
+                Op::MemberStore,
+                &[acc, value],
+                Op::MemberStore.default_effects(),
+                Imm::Atom(*name),
+            );
+            acc
+        }
+        LeafOp::StoreMemberNameLocal { object_slot, name } => {
+            let object = emit_frame_load(builder, block, *object_slot);
+            builder.emit_void(
+                block,
+                Op::MemberStore,
+                &[object, acc],
+                Op::MemberStore.default_effects(),
+                Imm::Atom(*name),
+            );
+            acc
         }
         // The operand-stack spill: `PushAcc` saves the accumulator, `BinAccPop`
         // pops it back into a binary with the current accumulator.

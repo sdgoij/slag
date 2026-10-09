@@ -604,6 +604,21 @@ fn lower_inst(
                 &[object, name],
             )?
         }
+        // A lifted member store (`o.x = v`): the validated store — the
+        // member-value cell probe → the narrow `set_member_slot`, falling back
+        // to the full `set_member_name` helper. `args = [object, value]`,
+        // `Imm::Atom(name)`; effect-only.
+        Op::MemberStore => {
+            let Imm::Atom(atom) = &inst.imm else {
+                return Err(Unsupported::Step("opt:member-store"));
+            };
+            let object = arg(0)?;
+            let value = arg(1)?;
+            emit_member_store(builder, helpers, abi, object, value, *atom)?;
+            builder
+                .ins()
+                .iconst(types::I64, JsValue::Undefined.bits() as i64)
+        }
         // A lifted `o[k]`: the inline dense element read (the read mirror of
         // the append), falling back to `get_member_computed` for every other
         // receiver, key, or a hole.
@@ -1629,6 +1644,75 @@ fn emit_intrinsic_sentinel(
 /// Emit a helper call with the pending-error ABI: with no try machinery a
 /// helper that hit an interpreter error bails the body with `undefined` (the
 /// runtime surfaces the stored error). Mirrors `call_slow`'s non-try path.
+/// The validated member-name store (mirrors the per-step lowerer's
+/// `emit_validated_member_store`): a plain-object receiver whose member-value
+/// cell validates writes through the narrow `set_member_slot` (no generation
+/// bump, no [[Set]] walk); every other receiver falls to the full
+/// `set_member_name` helper, which is also the authoritative backstop when
+/// `set_member_slot`'s own writable check fails.
+fn emit_member_store(
+    builder: &mut FunctionBuilder,
+    helpers: &JitHelpers,
+    abi: &Abi,
+    object: ClifValue,
+    value: ClifValue,
+    name: crux::AtomId,
+) -> Result<(), Unsupported> {
+    let name_imm = builder.ins().iconst(types::I64, name as i64);
+    let obj_ok = crate::cells::is_plain_object(builder, object);
+    let validate = builder.create_block();
+    let fast = builder.create_block();
+    let slow = builder.create_block();
+    let merge = builder.create_block();
+    builder.ins().brif(obj_ok, validate, &[], slow, &[]);
+    builder.switch_to_block(validate);
+    let cells = builder.ins().load(
+        types::I64,
+        MemFlagsData::new(),
+        abi.vm,
+        Offset32::new(std::mem::offset_of!(JitCallContext, member_value_cells) as i32),
+    );
+    let ptr = crate::cells::object_data_ptr(builder, object);
+    let live_id = builder.ins().load(
+        types::I64,
+        MemFlagsData::new(),
+        ptr,
+        Offset32::new(std::mem::offset_of!(crux::JsObject, id) as i32),
+    );
+    let live_gen = builder.ins().load(
+        types::I32,
+        MemFlagsData::new(),
+        ptr,
+        Offset32::new(std::mem::offset_of!(crux::JsObject, generation) as i32),
+    );
+    let cell = crate::cells::member_value_cell_addr(builder, cells, live_id, name_imm);
+    let ok = crate::cells::member_value_cell_valid(builder, cell, live_id, name, live_gen);
+    builder.ins().brif(ok, fast, &[], slow, &[]);
+    builder.switch_to_block(fast);
+    call_helper(
+        builder,
+        helpers,
+        abi,
+        abi.sig_binary,
+        Helper::SetMemberSlot,
+        &[object, name_imm, value],
+    )?;
+    builder.ins().jump(merge, &[]);
+    builder.switch_to_block(slow);
+    call_helper(
+        builder,
+        helpers,
+        abi,
+        abi.sig_binary,
+        Helper::SetMemberName,
+        &[object, name_imm, value],
+    )?;
+    builder.ins().jump(merge, &[]);
+    builder.seal_block(merge);
+    builder.switch_to_block(merge);
+    Ok(())
+}
+
 fn call_helper(
     builder: &mut FunctionBuilder,
     helpers: &JitHelpers,
