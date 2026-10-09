@@ -656,22 +656,7 @@ fn emit_step(
         // own cell probe, so the tier stops paying a helper call per read.
         Step::GetMemberName { name } => {
             let object = stack.pop().ok_or(Unsupported::Stack)?;
-            let cell = builder.emit(
-                block,
-                Op::MemberCellLoad,
-                &[object],
-                Type::Unknown,
-                Effects::read(Heap::Slots).union(Effects::read(Heap::Members)),
-                Imm::Atom(*name),
-            );
-            let v = builder.emit(
-                block,
-                Op::MemberGuard,
-                &[object, cell],
-                Type::Unknown,
-                Effects::call(),
-                Imm::Atom(*name),
-            );
+            let v = emit_named_read(builder, block, object, *name);
             let value = if guard_reads {
                 guard_read_value(builder, block, stack, v, index)
             } else {
@@ -1152,10 +1137,42 @@ fn emit_reg_body(
         Effects::pure(),
         Imm::U64(crux::Value::Undefined.bits()),
     );
+    // A body with more live values than the single accumulator can hold spills
+    // the accumulator (`PushAcc`) and pops it back into a binary (`BinAccPop`);
+    // the pairs balance inside the body.
+    let mut spill: Vec<ValueId> = Vec::new();
     for op in ops {
-        acc = emit_leaf_op(builder, block, op, acc, counter)?;
+        acc = emit_leaf_op(builder, block, op, acc, counter, &mut spill)?;
     }
     Ok(())
+}
+
+/// A named member read (`o.name`) as the inline member-value cell probe: a
+/// speculative cell load plus its validity guard, which falls back to the
+/// `get_member_name` helper on any mismatch (a getter, a proxy trap, a throwing
+/// receiver, or a plain miss).
+fn emit_named_read(
+    builder: &mut Builder,
+    block: BlockId,
+    object: ValueId,
+    name: crux::AtomId,
+) -> ValueId {
+    let cell = builder.emit(
+        block,
+        Op::MemberCellLoad,
+        &[object],
+        Type::Unknown,
+        Effects::read(Heap::Slots).union(Effects::read(Heap::Members)),
+        Imm::Atom(name),
+    );
+    builder.emit(
+        block,
+        Op::MemberGuard,
+        &[object, cell],
+        Type::Unknown,
+        Effects::call(),
+        Imm::Atom(name),
+    )
 }
 
 fn emit_leaf_op(
@@ -1164,6 +1181,7 @@ fn emit_leaf_op(
     op: &LeafOp,
     acc: ValueId,
     counter: Option<usize>,
+    spill: &mut Vec<ValueId>,
 ) -> Result<ValueId, Unsupported> {
     let load = |b: &mut Builder, slot: usize, t: bool| -> ValueId {
         if t {
@@ -1267,10 +1285,29 @@ fn emit_leaf_op(
             emit_frame_store(builder, block, *slot, next);
             next
         }
-        // The remaining leaf ops (the member/frame-vector stores, the operand
-        // stack's `BinAccPop`/`PushAcc`, the `UpdateAcc` BigInt case, the Route-B
-        // num/int forms, and the context/per-iteration reads) need their own
-        // slice; refuse so the body keeps the per-step path.
+        // acc = frame[slot].name (the fused `LoadLocal` + `GetMemberName`): the
+        // same inline member-value cell probe as the `Step::GetMemberName` arm.
+        LeafOp::GetMemberNameLocal {
+            object_slot,
+            tdz: t,
+            name,
+        } => {
+            let object = load(builder, *object_slot, *t);
+            emit_named_read(builder, block, object, *name)
+        }
+        // The operand-stack spill: `PushAcc` saves the accumulator, `BinAccPop`
+        // pops it back into a binary with the current accumulator.
+        LeafOp::PushAcc => {
+            spill.push(acc);
+            acc
+        }
+        LeafOp::BinAccPop { op } => {
+            let left = spill.pop().ok_or(Unsupported::Stack)?;
+            bin(builder, binary_op(*op)?, left, acc)
+        }
+        // The remaining leaf ops (the member/frame-vector stores, the `UpdateAcc`
+        // BigInt case, the Route-B int form, and the context/per-iteration reads)
+        // need their own slice; refuse so the body keeps the per-step path.
         _ => return Err(Unsupported::Step("RunRegBody")),
     })
 }

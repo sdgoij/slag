@@ -8412,14 +8412,12 @@ run(); run(); run(); run(); run(); run(); run(); run(); run();";
     }
 
     #[test]
-    fn installed_jit_hoist_guard_falls_back_and_matches_the_interpreter() {
+    fn installed_jit_lifted_hoist_guard_matches_the_interpreter() {
         // A `for` loop reading an invariant member (`o.x`) makes the compiler
-        // emit a `HoistMemberGuard` on the LICM hoist path — but that path is
-        // the fused loop, whose register body carries a `GetMemberNameLocal`
-        // leaf the lift cannot lower, so the body is REFUSED today. This asserts
-        // the value matches through the per-step fallback and pins the refusal
-        // (`opt == 0`), so it fails loudly when the register-body leaf set
-        // widens and the guard actually lifts.
+        // emit a `HoistMemberGuard`; the lift models it as always-miss (the
+        // guard is a pure perf-guard, so the general copy is semantically
+        // identical). With the member leaves handled (F3a) the body lifts and
+        // must match the interpreter.
         let source = "function f(o, n) {\n\
                         var s = 0;\n\
                         for (var i = 0; i < n; i++) { s = (s + o.x) | 0; }\n\
@@ -8438,11 +8436,9 @@ run(); run(); run(); run(); run(); run(); run(); run(); run();";
             value, interp,
             "the hoist-guarded loop must match the interpreter"
         );
-        assert_eq!(
-            opt_bodies, 0,
-            "the hoist-guarded body is refused by the register-body leaf gate (got {opt_bodies} \
-             opt compiles); if this changed, the leaf set widened — flip this to an opt-path \
-             assertion"
+        assert!(
+            opt_bodies >= 1,
+            "the hoist-guarded body must lower through the opt path (got {opt_bodies})"
         );
     }
 
