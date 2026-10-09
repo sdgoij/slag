@@ -8439,6 +8439,45 @@ run(); run(); run(); run(); run(); run(); run(); run(); run();";
     }
 
     #[test]
+    fn installed_jit_lifted_vector_construct_matches_the_interpreter() {
+        // I-vector: `new Map()` (ArgsBase+Construct, 0 args) and
+        // `new Set([1,2,3])` (ArgsBase+ArrayFast+ArgsPush+Construct, 1 arg)
+        // lift through the same helpers the per-step path calls.
+        //
+        // The body must be one the lift actually accepts. A `for`-loop body
+        // (the corpus's `{ArgsBase, Construct}` shape) is refused earlier, at
+        // the fused-loop `Some`-slot gate, so it never reaches the vector ops —
+        // a straight-line body called past the compile threshold is the shape
+        // that exercises the new lowering.
+        let source = "function g() {\n\
+                        var m = new Map();\n\
+                        var set = new Set([1, 2, 3]);\n\
+                        return m.size + set.size;\n\
+                      }\n\
+                      var s = 0;\n\
+                      for (var i = 0; i < 200; i++) { s += g(); }\n\
+                      s;";
+        let interp = {
+            let mut agent = runtime::Agent::new();
+            agent.initialize_host_defined_realm().expect("realm");
+            agent.run_script(source).expect("interp runs")
+        };
+        let before = crate::opt_lower::OPT_COMPILED.load(std::sync::atomic::Ordering::Relaxed);
+        let (value, compiled) = with_opt_jit_agent(|agent| agent.run_script(source).expect("runs"));
+        let opt_bodies =
+            crate::opt_lower::OPT_COMPILED.load(std::sync::atomic::Ordering::Relaxed) - before;
+        assert!(compiled >= 1, "{compiled} bodies must compile");
+        assert_eq!(
+            value, interp,
+            "the vector construct must match the interpreter"
+        );
+        assert!(
+            opt_bodies >= 1,
+            "the constructing body must lower through the opt path (got {opt_bodies})"
+        );
+    }
+
+    #[test]
     fn installed_jit_computed_read_cell_inlines() {
         // G8: a compiled `o[k]` read with a String key over an own data property
         // must serve from the computed-read cell — the counting wrapper proves

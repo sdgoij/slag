@@ -1072,3 +1072,34 @@ wrong) in the caller. `spliceable` therefore refuses any callee holding
   only sound deopt target. A callee whose guard *is* consumed by arithmetic stays
   refused — re-running the outer call would re-fire the getter the guard followed
   (the read a `GuardType` trails may be a getter).
+
+## 24. The lift-coverage census is a stack-delta count, not the real lift rate
+
+`blocking_step_names` (`crates/jit/src/opt/lift/mod.rs`) enumerates blockers by
+`stack_delta(step).is_err()` with terminators excluded. It therefore sees a step
+only when the lift's *stack-delta model* refuses it — never when `emit_step`
+refuses a *variant* of a step the model accepts. The fused-loop gate is exactly
+this shape: `step_name` collapses the whole fused family to `"FusedLoop"`, and
+`emit_step` accepts only the accumulator-path head plus the `None` builder/num
+slots, refusing `FastLoopHead` with a `Slot`/`Global` counter and the `Some`
+(Route-B `num` / string-builder) slots. `stack_delta` accepts all of those, so
+the census reports such rows as "fully lifting" when the real lift `opt bail`s.
+
+- **Never read the census as coverage.** A family dropping to 0 in
+  `opt-blockers` means its steps now pass `stack_delta`, not that any body lifts.
+  Measure the real rate by counting the IR actually produced: `JIT_DUMP_IR=1`
+  prints one `--- IR ---` per accepted lift, `JIT_DUMP_CLIF=1` prints
+  `opt bail: {reason}` per refusal (`scratch/probe_liftrate.sh` counts both).
+  As of 2026-10-09 that rate is 11 of 77 corpus rows — far below the census's 48.
+- **The first `opt bail` reason names the real blocker.** `opt bail:
+  Step("FusedLoop")` is the `Some`-slot gate (a `Some`-slot `BuilderBind`/
+  `BuilderStore`/`FastLoopBind`/`FastLoopStore`); `Step("FastLoopHead")` is the
+  non-`Counter` head. Those two, not the argument-vector family, gate the
+  canonical `for` loops and almost every arithmetic corpus row.
+- **An opt-lift test that only asserts a global `OPT_COMPILED` delta is vacuous
+  if its body does not actually lift.** `OPT_COMPILED` is process-global and the
+  tests run in parallel, so any concurrently-lifting test supplies the delta;
+  such tests pass under the default parallel run and fail when run alone. A test
+  for a lift feature must use a body the lift actually accepts (a straight-line
+  body called past `JIT_COMPILE_THRESHOLD`, or the exact acc-path loop shape) —
+  verify with `cargo test -p jit --lib <name> -- --test-threads=1`.

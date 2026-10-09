@@ -760,6 +760,57 @@ fn lower_inst(
                 &[object, name, set, short, value],
             )?
         }
+        // The vector-call argument steps (I-vector): the same `args_*` helpers
+        // the per-step path calls (the vector lives in the VM).
+        Op::ArgsBase => {
+            call_helper(builder, helpers, abi, abi.sig_tdz, Helper::ArgsBase, &[])?;
+            builder
+                .ins()
+                .iconst(types::I64, JsValue::Undefined.bits() as i64)
+        }
+        Op::ArgsPush => {
+            let value = arg(0)?;
+            call_helper(
+                builder,
+                helpers,
+                abi,
+                abi.sig_bool,
+                Helper::ArgsPush,
+                &[value],
+            )?;
+            builder
+                .ins()
+                .iconst(types::I64, JsValue::Undefined.bits() as i64)
+        }
+        Op::ArgsSpread => {
+            let iterable = arg(0)?;
+            call_helper(
+                builder,
+                helpers,
+                abi,
+                abi.sig_bool,
+                Helper::ArgsSpread,
+                &[iterable],
+            )?;
+            builder
+                .ins()
+                .iconst(types::I64, JsValue::Undefined.bits() as i64)
+        }
+        // The vector-form construct (`[callee]` on the stack, the args in the
+        // VM vector): the helper runs the construct machinery; `sp` is the
+        // working-region base (a soft carve base — an out-of-room `sp` falls back
+        // to `run_jit_leaf`).
+        Op::Construct => {
+            let callee = arg(0)?;
+            call_helper(
+                builder,
+                helpers,
+                abi,
+                abi.sig_unary,
+                Helper::Construct,
+                &[callee, abi.work],
+            )?
+        }
         _ => return Err(Unsupported::Step("opt:op")),
     })
 }

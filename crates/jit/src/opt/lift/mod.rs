@@ -407,6 +407,11 @@ fn stack_delta(step: &Step) -> Result<i32, Unsupported> {
         Step::ArrayBegin | Step::ObjectBegin => 1,
         Step::ArrayElement | Step::ObjectInitName { .. } => -1,
         Step::ArrayEnd => 0,
+        // The vector-call argument steps (I-vector): `ArgsBase`/`Construct` are
+        // net-neutral, `ArgsPush`/`ArgsSpread` pop the value into the VM's
+        // argument vector.
+        Step::ArgsBase | Step::Construct { .. } => 0,
+        Step::ArgsPush | Step::ArgsSpread => -1,
         other => return Err(Unsupported::Step(step_name(other))),
     })
 }
@@ -1014,6 +1019,50 @@ fn emit_step(
                 Imm::None,
             );
             stack.push(v);
+        }
+        // The vector-call argument steps (I-vector): the vector lives in the VM,
+        // so these are effect-only (no result) except `Construct`, which pops
+        // the callee and pushes the constructed value.
+        Step::ArgsBase => {
+            builder.emit_void(
+                block,
+                Op::ArgsBase,
+                &[],
+                Op::ArgsBase.default_effects(),
+                Imm::None,
+            );
+        }
+        Step::ArgsPush => {
+            let value = stack.pop().ok_or(Unsupported::Stack)?;
+            builder.emit_void(
+                block,
+                Op::ArgsPush,
+                &[value],
+                Op::ArgsPush.default_effects(),
+                Imm::None,
+            );
+        }
+        Step::ArgsSpread => {
+            let iterable = stack.pop().ok_or(Unsupported::Stack)?;
+            builder.emit_void(
+                block,
+                Op::ArgsSpread,
+                &[iterable],
+                Op::ArgsSpread.default_effects(),
+                Imm::None,
+            );
+        }
+        Step::Construct { .. } => {
+            let callee = stack.pop().ok_or(Unsupported::Stack)?;
+            let result = builder.emit(
+                block,
+                Op::Construct,
+                &[callee],
+                Type::Unknown,
+                Op::Construct.default_effects(),
+                Imm::None,
+            );
+            stack.push(result);
         }
         other => return Err(Unsupported::Step(step_name(other))),
     }

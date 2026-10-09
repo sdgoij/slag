@@ -265,6 +265,14 @@ pub enum Op {
     /// the compile-time payload the helper reads; it yields the object.
     ObjectBegin,
     ObjectInitName,
+    /// The vector-call argument steps. The argument vector lives in the VM
+    /// (`Vm::args` + `args_base_stack`), built and consumed by helpers, so these
+    /// carry no result and the lowering calls the same `args_base`/
+    /// `args_push`/`args_spread` helpers the per-step path uses. `ArgsPush` is
+    /// `args = [value]`; `ArgsSpread` is `args = [iterable]`.
+    ArgsBase,
+    ArgsPush,
+    ArgsSpread,
     NewClosure,
     Call,
     /// A Stage-B builtin intrinsic call (`Step::CallIntrinsic`): `args = [this,
@@ -369,7 +377,10 @@ impl Op {
             | Op::ArrayElement
             | Op::ArrayEnd
             | Op::ObjectBegin
-            | Op::ObjectInitName => E::call(),
+            | Op::ObjectInitName
+            | Op::ArgsBase
+            | Op::ArgsPush
+            | Op::ArgsSpread => E::call(),
         }
     }
 }
