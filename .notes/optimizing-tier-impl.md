@@ -263,6 +263,20 @@ So I4a is worth writing. Land the probe first (the diagnostic + script), then th
 
 **Next: I6-0 (allocation lifts) is the actual corpus unblock now** — the fused loop was the *first* blocker; the literal families are the next. S3 (member reads) and S4 (stores) widen the register-body subset.
 
+### I6-0 — lift the literal creates (opened 2026-10-09; probe-first)
+
+**Why.** With the fused loop landed, the literal families are the dominant blocker: 41 corpus rows are gated on `ArrayLiteral`/`ObjectLiteral`, and ~20 of them on a literal family *alone*. The lift refuses every literal step, so any body that creates an object or array never enters the tier. `Op::NewObject`/`Op::NewArray` (and `ElementStore`/`MemberStore`) are declared in `ir.rs` and never produced or lowered — I6-0 is the ground E (escape analysis) stands on, not an optimization.
+
+**Probe (2026-10-09): the fused forms dominate.** `scratch/probe_literals.sh` (the `shape_census` diagnostic, filtered to the literal-gated rows): of 41 rows, `ArrayFast` 20, `ObjectFast` 15, `ArrayBegin` 6, `ArrayEnd` 6, `ObjectBegin` 4, `ObjectInitName` 2. So **I6-0a (the two whole-literal fused creates) covers 35 of 41**; the non-fused incremental forms (`ArrayBegin`/`Element`/`End`, `ObjectBegin`/`InitName`) are the tail and need `Op::ElementStore`/`Op::MemberStore` (I6-0b).
+
+**I6-0a — the fused creates (behavior-neutral).** Lift `Step::ArrayFast { count }` → `Op::NewArray` (args = the `count` element values, `Imm::Int(step)`) and `Step::ObjectFast { names }` → `Op::NewObject` (args = the `names.len()` values, `Imm::Int(step)`). Lower each by materializing the values at `abi.work[0..n)` and calling the **same** fused helper the per-step path calls: `Helper::ArrayFast(count, work + 8n)` / `Helper::ObjectFast(step, work + 8n)`, which read the n consumed values *below* the `sp` (`sp - 8n .. sp`). `ObjectFast`'s `names` payload is read back from the running body via the step index (`step_at(ctx, step)`), exactly as the per-step path does — the opt body is compiled from the same `CompiledBody`. `abi.sig_unary` (vm + 2); no new helper, no new semantics. Stack effect `-(n) + 1`.
+
+**I6-0b — the non-fused forms (the tail).** `ArrayBegin`/`ArrayElement`/`ArrayHole`/`ArraySpread`/`ArrayEnd` and `ObjectBegin`/`ObjectInitName`/`ObjectInitComputed`/`ObjectKeyToPropertyKey`/`ObjectSpread` → the same `Op::NewArray`/`NewObject` opens plus `Op::ElementStore`/`Op::MemberStore` for the inits (whose opt lowering is a separate port; the per-step path uses `array_element`/`object_init_name` helpers with the object riding the work stack). Later slice.
+
+**Tests.** An e2e `for` body creating an array literal and an object literal per iteration (a lifting body), asserting the opt body is produced (`OPT_COMPILED`) and the aggregate value matches the interpreter; the value parity over many iterations pins the fused-create correctness.
+
+**Gate.** §6's gate. Land I6-0a, re-probe, then I6-0b as needed.
+
 ### I5 — trial inlining, in full (opened 2026-10-08; probe-first)
 
 Inline a monomorphic callee's `Step`s at a caller's call site, under a size budget, recursing. Targets (`optimizing-tier-plan.md` §6): `method_call` 6x, `js_call` 3.6x, `closure_capture`, `hof_methods`, `apply_call`. It is the **enabler of I6**: an allocation can be elided only where the code that allocates and the code that consumes it are one body, so escape analysis has nothing to work on until the call boundary is gone.
