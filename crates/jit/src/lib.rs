@@ -8372,6 +8372,38 @@ run(); run(); run(); run(); run(); run(); run(); run(); run();";
     }
 
     #[test]
+    fn installed_jit_lifted_hoist_guard_matches_the_interpreter() {
+        // A `for` loop reading an invariant member (`o.x`) makes the compiler
+        // emit a `HoistMemberGuard`; the lift models it as always-miss (the
+        // guard is a pure perf-guard, so the general copy is semantically
+        // identical), so the body lifts and must match.
+        let source = "function f(o, n) {\n\
+                        var s = 0;\n\
+                        for (var i = 0; i < n; i++) { s = (s + o.x) | 0; }\n\
+                        return s;\n\
+                      }\n\
+                      f({ x: 3 }, 100000);";
+        let interp = {
+            let mut agent = runtime::Agent::new();
+            agent.initialize_host_defined_realm().expect("realm");
+            agent.run_script(source).expect("interp runs")
+        };
+        let before = crate::opt_lower::OPT_COMPILED.load(std::sync::atomic::Ordering::Relaxed);
+        let (value, compiled) = with_opt_jit_agent(|agent| agent.run_script(source).expect("runs"));
+        let opt_bodies =
+            crate::opt_lower::OPT_COMPILED.load(std::sync::atomic::Ordering::Relaxed) - before;
+        assert!(compiled >= 1, "{compiled} bodies must compile");
+        assert_eq!(
+            value, interp,
+            "the hoist-guarded loop must match the interpreter"
+        );
+        assert!(
+            opt_bodies >= 1,
+            "the hoist-guarded body must lower through the opt path (got {opt_bodies})"
+        );
+    }
+
+    #[test]
     fn installed_jit_computed_read_cell_inlines() {
         // G8: a compiled `o[k]` read with a String key over an own data property
         // must serve from the computed-read cell — the counting wrapper proves

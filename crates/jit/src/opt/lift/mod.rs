@@ -466,7 +466,11 @@ fn is_terminator(step: &Step) -> bool {
 }
 
 /// Whether `step` is one of the fused loop/strict-equality tests (a conditional
-/// jump that reads its operands itself rather than popping a stack condition).
+/// jump that reads its operands itself rather than popping a stack condition),
+/// or one of the LICM hoist guards. A hoist guard is a pure compiler perf-guard:
+/// on a hit the guarded copy runs with a hoisted value, on a miss the general
+/// copy runs — both compute the same result, so the lift models it as an
+/// always-miss branch (see `emit_fused_test`) and lifts only the general copy.
 fn is_fused_test(step: &Step) -> bool {
     matches!(
         step,
@@ -482,6 +486,8 @@ fn is_fused_test(step: &Step) -> bool {
             | Step::JumpIfGtGlobalImm { .. }
             | Step::JumpIfGeGlobalImm { .. }
             | Step::FastLoopHead { .. }
+            | Step::HoistMemberGuard { .. }
+            | Step::HoistGlobalGuard { .. }
     )
 }
 
@@ -502,6 +508,11 @@ fn jump_target(step: &Step) -> Option<usize> {
         // The fused loop head jumps back to `body_start` when the test passes
         // (its fall-through is `after`).
         Step::FastLoopHead { body_start, .. } => Some(*body_start),
+        // A hoist guard's miss target (the general loop); the lift always takes
+        // the miss (see `emit_fused_test`).
+        Step::HoistMemberGuard { target, .. } | Step::HoistGlobalGuard { target, .. } => {
+            Some(*target)
+        }
         _ => None,
     }
 }
@@ -1240,6 +1251,22 @@ fn emit_fused_test(
             };
             (cmp(builder, binary_op(*op)?, next, limit_v), true)
         }
+        // A LICM hoist guard: a pure compiler perf-guard. On a hit the guarded
+        // copy runs with a hoisted value, on a miss the general copy; both are
+        // the same loop, so the lift models "always miss" — a constant-false hit
+        // condition jumps (via the `jump_when_false` convention) to the general
+        // copy, and the guarded copy is lifted but never taken.
+        Step::HoistMemberGuard { .. } | Step::HoistGlobalGuard { .. } => {
+            let hit = builder.emit(
+                block,
+                Op::Const,
+                &[],
+                Type::Bool,
+                Effects::pure(),
+                Imm::Bool(false),
+            );
+            (hit, false)
+        }
         other => return Err(Unsupported::Step(step_name(other))),
     })
 }
@@ -1374,14 +1401,20 @@ fn step_name(step: &Step) -> &'static str {
     }
 }
 
-/// The distinct step families that actually *block* the lift in `body`, sorted
-/// — a probe aid for `JIT_DUMP_STEPS`. `stack_delta` mirrors `emit_step`'s
-/// support and errors on every step outside the subset, so a removed terminator
-/// leaves exactly the blocking families (a step family is listed once even when
-/// the body has several). This answers what `distinct_step_names` cannot: which
-/// families a body is *gated* on, not merely which it contains.
-pub(crate) fn blocking_step_names(body: &CompiledBody) -> Vec<&'static str> {
-    let mut names: Vec<&'static str> = body
+/// The debug name of a value's variant (up to its first payload character),
+/// e.g. `ArrayFast` from `ArrayFast { count: 3 }`.
+fn variant_name(debug: &str) -> &str {
+    debug.split(['(', '{', ' ']).next().unwrap_or(debug)
+}
+
+/// The distinct step *variants* that actually block the lift in `body`, sorted —
+/// a probe aid for `JIT_DUMP_STEPS`. `stack_delta` mirrors `emit_step`'s support
+/// and errors on every step outside the subset, so a removed terminator leaves
+/// exactly the blocking variants (listed once even when the body has several).
+/// Variant names, not `step_name`'s coarse families, so the specific blocker is
+/// visible (e.g. `ArgsBase` rather than `step`).
+pub(crate) fn blocking_step_names(body: &CompiledBody) -> Vec<String> {
+    let mut names: Vec<String> = body
         .steps
         .iter()
         .filter(|step| {
@@ -1391,7 +1424,10 @@ pub(crate) fn blocking_step_names(body: &CompiledBody) -> Vec<&'static str> {
             ) || is_fused_test(step);
             !terminator_ok && stack_delta(step).is_err()
         })
-        .map(step_name)
+        .map(|step| {
+            let debug = format!("{step:?}");
+            variant_name(&debug).to_string()
+        })
         .collect();
     names.sort_unstable();
     names.dedup();
@@ -1405,17 +1441,14 @@ pub(crate) fn blocking_step_names(body: &CompiledBody) -> Vec<&'static str> {
 /// family into `FusedLoop`, and say nothing about which leaf ops the register
 /// body uses.
 pub(crate) fn shape_census(body: &CompiledBody) -> String {
-    fn variant(debug: &str) -> &str {
-        debug.split(['(', '{', ' ']).next().unwrap_or(debug)
-    }
     let mut names: Vec<String> = Vec::new();
     for step in &body.steps {
         let debug = format!("{step:?}");
-        names.push(variant(&debug).to_string());
+        names.push(variant_name(&debug).to_string());
         if let Step::RunRegBody { ops } = step {
             for op in ops.iter() {
                 let leaf = format!("{op:?}");
-                names.push(format!("leaf:{}", variant(&leaf)));
+                names.push(format!("leaf:{}", variant_name(&leaf)));
             }
         }
     }
