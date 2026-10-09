@@ -1046,3 +1046,29 @@ step"; it is meaningful only after a deopt has returned to the runtime.
   (`emit_bare_numeric`), so the guard result must be a *new* value, not the
   operand re-used. T1 implements `Type::Number` only (`is_double`); any other
   guarded type is `Unsupported` (the per-step path), never a silent guess.
+
+## 23. Trial-inline splices must stay guard-free (I5c-2c-iv)
+
+A guard's deopt resumes its `imm` step with a mirrored operand stack (section 22).
+That `imm` is a step index in the body the guard was **lifted from**, so a callee
+inlined into another body would carry deopt steps that are meaningless (and
+wrong) in the caller. `spliceable` therefore refuses any callee holding
+`Op::GuardType`/`Op::Check`.
+
+- **The failure mode is a live crash, not a wrong number.** A callee
+  `function getx(o) { return o.x + 1; }` spliced into a caller throws
+  `TypeError: undefined is not a function` once `o.x` is a string and the guard
+  fires: the caller resumes at the callee's step and re-runs the wrong step.
+  `cargo test` and the sweeps will not catch it — the sweeps run with
+  `SLAG_INLINE` off.
+- **The resolver must run `pass::optimize` (fold/narrow/guard/cse/licm/dce) on
+  the lifted callee, not just `mem2reg`.** A member-read callee's `GuardType` is
+  pruned when its value feeds a call rather than arithmetic; without the guard
+  pass on the callee, the guard-free gate would refuse *every* member-reading
+  callee (a delegation chain `a → o.b → o.leaf` would never splice).
+- **A nested splice's own `GuardCallee` must resume the OUTERMOST call** with its
+  operands (`try_inline`'s `root`), not the nested call: the inlined region holds
+  no frame state, so discarding it and re-running the outer call as a call is the
+  only sound deopt target. A callee whose guard *is* consumed by arithmetic stays
+  refused — re-running the outer call would re-fire the getter the guard followed
+  (the read a `GuardType` trails may be a getter).

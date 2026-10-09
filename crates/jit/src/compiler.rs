@@ -155,6 +155,9 @@ impl JitEngine {
                             // before the splice (a slot that cannot promote
                             // keeps its frame access and the splice refuses).
                             crate::opt::pass::mem2reg::run(&mut ir);
+                            // Optimize the callee like the caller's body, so a
+                            // prunable guard does not spuriously refuse it.
+                            crate::opt::pass::optimize(&mut ir);
                             if crate::opt::verify::verify(&ir).is_err() {
                                 return None;
                             }
@@ -162,6 +165,12 @@ impl JitEngine {
                                 ir: std::rc::Rc::new(ir),
                                 arity: callee.arity,
                                 this_slot: callee.this_slot,
+                                steps: callee.body.steps.len(),
+                                // I5c-2c-iv: the callee's own sites, so the
+                                // splice recurses into its calls.
+                                sites: std::rc::Rc::new(
+                                    crate::opt::pass::inline::sites_from_feedback(&callee.body),
+                                ),
                             })
                         });
                         lifted.insert(id, resolved.clone());

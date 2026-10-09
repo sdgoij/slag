@@ -60,6 +60,21 @@ pub fn run(
     folded || narrowed || guarded || inlined || cse || licm || dropped
 }
 
+/// Run the pipeline without trial inlining over a single body. The resolver
+/// applies it to a callee's lifted IR, so the callee is optimized like the
+/// caller's body — in particular a guard that pruning removes (its value feeds a
+/// call, not arithmetic) does not spuriously refuse the splice.
+pub fn optimize(func: &mut Function) {
+    fold::run(func);
+    narrow::run(func);
+    if guard_enabled() {
+        guard::run(func);
+    }
+    cse::run(func);
+    licm::run(func);
+    dce::run(func);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

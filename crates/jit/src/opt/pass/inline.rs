@@ -24,8 +24,8 @@ pub struct InlineSite {
     pub callee_box: u64,
 }
 
-/// A resolved callee: its lifted IR and the input frame layout (`ScopeInfo`)
-/// the splice binds.
+/// A resolved callee: its lifted IR (its `var` slots promoted by
+/// `pass/mem2reg.rs`) and the input frame layout (`ScopeInfo`) the splice binds.
 #[derive(Clone)]
 pub struct Callee {
     pub ir: Rc<Function>,
@@ -33,6 +33,11 @@ pub struct Callee {
     pub arity: usize,
     /// The frame slot holding the call's receiver, if the body reads `this`.
     pub this_slot: Option<usize>,
+    /// The callee's own monomorphic call sites, indexed by its step index, so the
+    /// splice can recurse into the callee's calls (I5c-2c-iv).
+    pub sites: Rc<Vec<Option<InlineSite>>>,
+    /// The callee body's step count, the inline budget's unit.
+    pub steps: usize,
 }
 
 /// The monomorphic call sites of `body`, indexed by step: a site whose
@@ -62,9 +67,22 @@ pub fn sites_from_feedback(body: &runtime::ir::CompiledBody) -> Vec<Option<Inlin
     sites
 }
 
-/// Inline every spliceable monomorphic call site. `sites` is indexed by step
-/// (the `Op::Call`'s `Imm::Int`); `resolve` yields the callee. Returns whether
-/// the IR changed.
+/// The default total step budget for one top-level splice (its recursive
+/// expansion): a bound on code growth and on self-recursion. `SLAG_INLINE_BUDGET`
+/// overrides it.
+const DEFAULT_INLINE_BUDGET: usize = 256;
+
+fn inline_budget() -> usize {
+    std::env::var("SLAG_INLINE_BUDGET")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(DEFAULT_INLINE_BUDGET)
+}
+
+/// Inline every spliceable monomorphic call site, recursing into a callee's own
+/// sites under a step budget. `sites` is indexed by step (the `Op::Call`'s
+/// `Imm::Int`); `resolve` yields the callee. Returns whether the IR changed.
 pub fn run(
     func: &mut Function,
     sites: &[Option<InlineSite>],
@@ -73,19 +91,28 @@ pub fn run(
     let mut changed = false;
     let blocks = func.block_count() as u32;
     for b in 0..blocks {
-        if try_inline(func, b, sites, resolve) {
+        // The budget is per top-level site; the recursion shares it, so a
+        // self-recursive callee stops expanding and leaves a real call.
+        let mut budget = inline_budget();
+        if try_inline(func, b, sites, resolve, &mut budget, None) {
             changed = true;
         }
     }
     changed
 }
 
-/// Splice the call at the end of block `b` if it has a spliceable site.
+/// Splice the call at the end of block `b` if it has a spliceable site, then
+/// recurse into the callee's own sites. `root` is the outermost call's operands
+/// and step (`None` at the top level): every guard in the expanding region is
+/// rewritten to it, so a deopt resumes the outer call as a call and discards the
+/// region rather than resuming at a spliced-in step.
 fn try_inline(
     func: &mut Function,
     b: BlockId,
     sites: &[Option<InlineSite>],
     resolve: &mut dyn FnMut(u64) -> Option<Callee>,
+    budget: &mut usize,
+    root: Option<(&[ValueId], i32)>,
 ) -> bool {
     let (args, result, ty, step, site) = {
         let Some(last) = func.block(b).insts.last() else {
@@ -105,13 +132,19 @@ fn try_inline(
         };
         (last.args.clone(), result, last.ty, step, site)
     };
+    let (root_args, root_step): (&[ValueId], i32) = match root {
+        Some((a, s)) => (a, s),
+        None => (&args, step),
+    };
     let Some(callee) = resolve(site.callee_id) else {
         return false;
     };
-    // Every input slot must have a call operand to bind to.
-    if args.len() < 2 + callee.arity || !spliceable(&callee) {
+    // Every input slot must have a call operand to bind to, the callee must be
+    // spliceable, and it must fit the remaining budget.
+    if args.len() < 2 + callee.arity || !spliceable(&callee) || callee.steps > *budget {
         return false;
     }
+    *budget -= callee.steps;
 
     // The call's result is now produced by the continuation, which every
     // successor of `b` passes through (its only edge is `b -> callee -> cont`).
@@ -205,7 +238,9 @@ fn try_inline(
     }
 
     // Guard the assumed callee, then enter it. The guard's live operand stack is
-    // the call's operands, so a deopt re-runs the call step exactly.
+    // the **outer** call's operands and its resume step the outer call's, so a
+    // deopt re-runs the outer call and discards the region (identical to the
+    // local call at the top level, and the only sound target inside a splice).
     let expected = func.push_value(Type::Object);
     func.block_mut(b).insts.push(Inst {
         op: Op::Const,
@@ -217,14 +252,14 @@ fn try_inline(
     });
     let guarded = func.push_value(Type::Object);
     let mut guard_args = vec![args[1], expected];
-    guard_args.extend_from_slice(&args);
+    guard_args.extend_from_slice(root_args);
     func.block_mut(b).insts.push(Inst {
         op: Op::GuardCallee,
         args: guard_args,
         result: Some(guarded),
         ty: Type::Object,
         effects: Effects::pure(),
-        imm: Imm::Int(step),
+        imm: Imm::Int(root_step),
     });
     func.block_mut(b).term = Some(Term::Jump {
         target: block_map[0],
@@ -232,20 +267,40 @@ fn try_inline(
     });
 
     replace_uses(func, result, param);
+
+    // I5c-2c-iv: recurse into the callee's own calls, under the shared budget and
+    // the same root guard (a nested deopt still resumes the outermost call).
+    for &dst in &block_map {
+        try_inline(
+            func,
+            dst,
+            callee.sites.as_slice(),
+            resolve,
+            budget,
+            Some((root_args, root_step)),
+        );
+    }
     true
 }
 
-/// Whether this cut can splice `callee`: call-free, and every remaining slot
-/// access is a load of an **input** slot (`< arity` or the `this` slot). The
+/// Whether this cut can splice `callee`: every remaining slot access is a load
+/// of an **input** slot (`< arity` or the `this` slot), and no guard. The
 /// resolver promotes the callee's `var` slots to SSA first (`pass/mem2reg.rs`,
 /// I5c-2c-iii-b), so a `FrameStore`, a `TdzCheck`, or a load of any other slot
 /// means promotion could not lift it — refused.
+///
+/// A guard (`Op::GuardType`/`Op::Check`) is refused too (the design's guard-free
+/// callee, I5c-1): its deopt resumes the `imm` step, which for a spliced callee
+/// is the *callee's* step, and the read a guard follows may have fired a getter —
+/// re-running the outer call to discard the region would fire it twice. An
+/// `Op::Call` is allowed: the splice recurses into it (I5c-2c-iv), and a call it
+/// declines simply stays a call.
 fn spliceable(callee: &Callee) -> bool {
     let mut returns_a_value = false;
     for k in 0..callee.ir.block_count() as u32 {
         for inst in &callee.ir.block(k).insts {
             match inst.op {
-                Op::Call | Op::FrameStore | Op::TdzCheck => return false,
+                Op::FrameStore | Op::TdzCheck | Op::GuardType | Op::Check => return false,
                 Op::FrameLoad => {
                     let Imm::Slot(slot) = inst.imm else {
                         return false;
@@ -334,6 +389,8 @@ mod tests {
             ir: Rc::new(f),
             arity: 0,
             this_slot: None,
+            sites: Rc::new(Vec::new()),
+            steps: 1,
         }
     }
 
@@ -371,6 +428,8 @@ mod tests {
             ir: Rc::new(f),
             arity: 1,
             this_slot: None,
+            sites: Rc::new(Vec::new()),
+            steps: 1,
         }
     }
 
@@ -518,6 +577,8 @@ mod tests {
             ir: Rc::new(f),
             arity: 0,
             this_slot: None,
+            sites: Rc::new(Vec::new()),
+            steps: 1,
         };
         let mut func = caller_ir();
         let mut resolve = |_id: u64| Some(var_callee.clone());
@@ -567,11 +628,137 @@ mod tests {
             ir: Rc::new(f),
             arity: 0,
             this_slot: None,
+            sites: Rc::new(Vec::new()),
+            steps: 1,
         };
         let mut func = caller_ir();
         let mut resolve = |_id: u64| Some(callee.clone());
         assert!(run(&mut func, &site(), &mut resolve), "the callee spliced");
         assert!(!ops(&func).contains(&Op::Call), "the call is gone");
         assert_eq!(verify(&func), Ok(()), "the spliced IR verifies");
+    }
+
+    /// `function (x) { return next(x); }` — one param read, one block-last call.
+    fn chain_callee(id: u64, box_bits: u64) -> Callee {
+        let mut f = Function::new();
+        let e = f.entry();
+        let mut b = Builder::new(&mut f);
+        let this = b.emit(
+            e,
+            Op::Const,
+            &[],
+            Type::Object,
+            Effects::pure(),
+            Imm::U64(0),
+        );
+        let callee = b.emit(
+            e,
+            Op::Const,
+            &[],
+            Type::Object,
+            Effects::pure(),
+            Imm::U64(box_bits),
+        );
+        let arg = b.emit(
+            e,
+            Op::FrameLoad,
+            &[],
+            Type::Unknown,
+            Effects::read(Heap::Slots),
+            Imm::Slot(0),
+        );
+        let r = b.emit(
+            e,
+            Op::Call,
+            &[this, callee, arg],
+            Type::Unknown,
+            Effects::call(),
+            Imm::Int(0),
+        );
+        b.term(e, Term::Return(Some(r)));
+        Callee {
+            ir: Rc::new(f),
+            arity: 1,
+            this_slot: None,
+            sites: Rc::new(vec![Some(InlineSite {
+                callee_id: id,
+                callee_box: box_bits,
+            })]),
+            steps: 3,
+        }
+    }
+
+    #[test]
+    fn recurses_into_a_callees_own_call() {
+        // The caller calls A (id 7); A's own site 0 calls B (id 8). Both splice,
+        // so the region is call-free and guards twice.
+        let mut func = caller_ir();
+        let mut resolve = |id: u64| match id {
+            7 => Some(chain_callee(8, 0xdef)),
+            8 => Some(constant_callee()),
+            _ => None,
+        };
+        assert!(run(&mut func, &site(), &mut resolve));
+        assert!(!ops(&func).contains(&Op::Call), "both calls inlined");
+        assert_eq!(
+            ops(&func).iter().filter(|o| **o == Op::GuardCallee).count(),
+            2,
+            "one guard per splice level"
+        );
+        assert_eq!(verify(&func), Ok(()));
+    }
+
+    #[test]
+    fn a_self_recursive_callee_stops_at_the_budget() {
+        // A's own site calls A: the recursion expands until the budget is spent,
+        // then leaves the innermost call real. A hang would fail the test.
+        let mut func = caller_ir();
+        let mut resolve = |id: u64| (id == 7).then(|| chain_callee(7, 0xabc));
+        assert!(run(&mut func, &site(), &mut resolve));
+        assert_eq!(verify(&func), Ok(()));
+        assert!(
+            ops(&func).contains(&Op::Call),
+            "the budget stopped the self-recursion"
+        );
+    }
+
+    #[test]
+    fn leaves_a_guard_bearing_callee_alone() {
+        // A guard's deopt resumes the callee's step; spliced, that step is wrong
+        // in the caller, and re-running the outer call could double a getter. So
+        // a guard-bearing callee is refused.
+        let mut f = Function::new();
+        let e = f.entry();
+        {
+            let mut b = Builder::new(&mut f);
+            let v = b.emit(
+                e,
+                Op::Const,
+                &[],
+                Type::Number,
+                Effects::pure(),
+                Imm::Float(1.0),
+            );
+            b.emit(
+                e,
+                Op::GuardType,
+                &[v, v],
+                Type::Number,
+                Effects::pure(),
+                Imm::Int(0),
+            );
+            b.term(e, Term::Return(Some(v)));
+        }
+        let guarded = Callee {
+            ir: Rc::new(f),
+            arity: 0,
+            this_slot: None,
+            sites: Rc::new(Vec::new()),
+            steps: 1,
+        };
+        let mut func = caller_ir();
+        let mut resolve = |_id: u64| Some(guarded.clone());
+        assert!(!run(&mut func, &site(), &mut resolve));
+        assert!(ops(&func).contains(&Op::Call));
     }
 }
