@@ -1014,8 +1014,48 @@ fn step_name(step: &Step) -> &'static str {
         | Step::ObjectSpread => "ObjectLiteral",
         Step::RegExpLiteral { .. } => "RegExpLiteral",
         Step::PushStr(_) | Step::ConcatStr => "String",
+        // I4a: name the intrinsic call (the `Math.*`/array/collection sweep),
+        // so the coverage probe can count bodies gated on it.
+        Step::CallIntrinsic { .. } => "CallIntrinsic",
+        // The fused canonical `for` loop family (the lift's remaining I2 part);
+        // named so the probe can tell a body blocked solely on it + the
+        // intrinsic apart from one with other blockers.
+        Step::FastLoopHead { .. }
+        | Step::FastLoopBind { .. }
+        | Step::FastLoopStore { .. }
+        | Step::BuilderBind { .. }
+        | Step::BuilderStore { .. }
+        | Step::RunRegBody { .. }
+        | Step::PushAcc
+        | Step::PopAcc
+        | Step::IncAcc
+        | Step::DecAcc => "FusedLoop",
         _ => "step",
     }
+}
+
+/// The distinct step families that actually *block* the lift in `body`, sorted
+/// — a probe aid for `JIT_DUMP_STEPS`. `stack_delta` mirrors `emit_step`'s
+/// support and errors on every step outside the subset, so a removed terminator
+/// leaves exactly the blocking families (a step family is listed once even when
+/// the body has several). This answers what `distinct_step_names` cannot: which
+/// families a body is *gated* on, not merely which it contains.
+pub(crate) fn blocking_step_names(body: &CompiledBody) -> Vec<&'static str> {
+    let mut names: Vec<&'static str> = body
+        .steps
+        .iter()
+        .filter(|step| {
+            let terminator_ok = matches!(
+                step,
+                Step::Return | Step::Jump(_) | Step::JumpIfFalse(_) | Step::JumpIfTrue(_)
+            ) || is_fused_test(step);
+            !terminator_ok && stack_delta(step).is_err()
+        })
+        .map(step_name)
+        .collect();
+    names.sort_unstable();
+    names.dedup();
+    names
 }
 
 #[cfg(test)]

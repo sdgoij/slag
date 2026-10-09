@@ -191,6 +191,12 @@ impl JitEngine {
                     if std::env::var("JIT_DUMP_CLIF").is_ok() {
                         eprintln!("opt bail: {reason:?} ({} steps)", body.steps.len());
                     }
+                    if std::env::var("JIT_DUMP_STEPS").is_ok() {
+                        eprintln!(
+                            "opt-blockers: {}",
+                            crate::opt::lift::blocking_step_names(body).join(",")
+                        );
+                    }
                 }
             }
         }
