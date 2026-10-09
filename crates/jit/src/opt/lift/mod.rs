@@ -993,6 +993,27 @@ fn step_name(step: &Step) -> &'static str {
     match step {
         Step::Jump(_) | Step::JumpIfFalse(_) | Step::JumpIfTrue(_) => "control",
         Step::Return => "Return",
+        // The allocation and string literal families name themselves, so the
+        // `opt bail` diagnostic says which step blocked a body (I6) rather than
+        // the generic "step".
+        Step::ArrayBegin
+        | Step::ArrayElement
+        | Step::ArraySpread
+        | Step::ArrayHole
+        | Step::ArrayEnd
+        | Step::ArrayFast { .. } => "ArrayLiteral",
+        Step::ObjectBegin
+        | Step::ObjectFast { .. }
+        | Step::ObjectInitName { .. }
+        | Step::ObjectInitComputed { .. }
+        | Step::ObjectKeyToPropertyKey
+        | Step::ObjectMethodName { .. }
+        | Step::ObjectMethodComputed { .. }
+        | Step::ObjectAccessorName { .. }
+        | Step::ObjectAccessorComputed { .. }
+        | Step::ObjectSpread => "ObjectLiteral",
+        Step::RegExpLiteral { .. } => "RegExpLiteral",
+        Step::PushStr(_) | Step::ConcatStr => "String",
         _ => "step",
     }
 }
