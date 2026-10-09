@@ -1139,3 +1139,38 @@ iteration).
   so it cannot be used to "calibrate" the opt count — `installed_jit_opt_tier_
   leaf_call_inlines_not_call_slow` asserts `opt_compiled_count >= 2` (caller +
   callee) and a small `call_slow` count instead.
+
+## 26. Lifting for-of/for-in: the fetch is a divergent terminator
+
+The opt tier lifts the fused-bind `for-of`/`for-in` shapes: `Op::ForOfBegin`/
+`ForOfNextBindLocal`/`ForOfClose`/`ForInBegin`/`ForInNext`/`ForOfBindLocal`
+(all `Effects::call()`), plus `opt_lower::emit_for_of_bind` (the G17 fast-array
+cursor port) and `licm`'s slot-store accounting. `ForOfNext` (the non-fused
+stack form) is refused (`is_for_fetch` names it so the bail is explicit).
+
+- **A fetch's two targets are `back` and `done`, NOT `[jump_target, end]`.** The
+  prologue fetch's `back` IS its fall-through (`back = step_index + 1`), so the
+  generic conditional shape collapses both edges onto one block. `starts` and
+  `block_successors` special-case `for_fetch_targets`.
+- **The bottom fetch's dead `ForOfClose` tail.** A `break`-less loop's
+  `ForOfClose` (at `end_label`) is reachable only via a `break`, but it sits
+  right after the bottom fetch, so `end - 1` is not the fetch. `terminator_index`
+  finds the block's FIRST terminator, `starts[i+1]` is not marked for a fetch,
+  and the dead tail is dropped.
+- **A helper's raw `0`/`1` code is not a `Type::Bool` value.** The IR's
+  `Term::Branch` lowering, for a `Type::Bool` condition, compares against the
+  NaN-boxed `false` bits — a raw `0`/`1` fetch code always branched true (the
+  done edge was never taken; a re-entry fetch then hit an empty for-of stack:
+  `ForOfNext without a for-of`). `raw_code_to_bool` converts it to a canonical
+  `Value` boolean.
+- **`licm::slot_stores` must name EVERY frame-slot writer, not just
+  `Op::FrameStore`.** `ForOfNextBindLocal`/`ForOfBindLocal` write their `imm`'s
+  slot directly, so a loop's element `FrameLoad` was hoisted out of the body
+  (`s` accumulated the first element only). `Op::FunctionDecl`'s slot is only in
+  the step payload, so it flags `slots_unknown` and blocks all slot-load
+  hoisting — an under-accounting here is a silent wrong value, never a refusal.
+- **The for-in key is the fetch's value, with `undefined` as the done sentinel.**
+  The IR's operand stack is SSA and cannot push-then-pop across the branch, so
+  `Op::ForInNext` returns the key or `undefined` (a for-in key is always a
+  string), and the terminator branches on `!= undefined` and passes the key to
+  the bind block as an edge argument.

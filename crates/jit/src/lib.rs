@@ -2165,6 +2165,53 @@ mod tests {
     }
 
     #[test]
+    fn opt_tier_for_of_matches_the_interpreter() {
+        // The certified for-of lift: a dense-array `for-of` binds its element
+        // through the G17 fast cursor (`ForOfNextBindLocal`), so the opt body
+        // must match the interpreter and actually lift.
+        let source = "function bench() { \
+                        var a = [1, 2, 3, 4, 5]; \
+                        var s = 0; \
+                        for (var v of a) { s += v; } \
+                        return s; \
+                      } \
+                      bench();";
+        let interp = {
+            let mut agent = runtime::Agent::new();
+            agent.initialize_host_defined_realm().expect("realm");
+            agent.run_script(source).expect("interp runs")
+        };
+        let (value, _compiled, opt) =
+            with_opt_jit_agent_counts(|agent| agent.run_script(source).expect("runs"));
+        assert_eq!(value, interp, "for-of must match the interpreter");
+        assert_eq!(value.as_number(), Some(15.0));
+        assert!(opt >= 1, "the for-of body must lift ({opt} opt bodies)");
+    }
+
+    #[test]
+    fn opt_tier_for_in_matches_the_interpreter() {
+        // The certified for-in lift: the key rides the fetch's element edge
+        // (`Op::ForInNext`) and the bind block stores it (`Op::ForOfBindLocal`).
+        let source = "function bench() { \
+                        var o = { a: 1, b: 2, c: 3, d: 4 }; \
+                        var s = 0; \
+                        for (var k in o) { s += 1; } \
+                        return s; \
+                      } \
+                      bench();";
+        let interp = {
+            let mut agent = runtime::Agent::new();
+            agent.initialize_host_defined_realm().expect("realm");
+            agent.run_script(source).expect("interp runs")
+        };
+        let (value, _compiled, opt) =
+            with_opt_jit_agent_counts(|agent| agent.run_script(source).expect("runs"));
+        assert_eq!(value, interp, "for-in must match the interpreter");
+        assert_eq!(value.as_number(), Some(4.0));
+        assert!(opt >= 1, "the for-in body must lift ({opt} opt bodies)");
+    }
+
+    #[test]
     fn opt_tier_leaf_guard_resumes_on_a_non_number_value() {
         // L1: a LEAF body (member read only — no calls, no globals) with the
         // typer's read guard. A non-Number read deopts, and the leaf lane must

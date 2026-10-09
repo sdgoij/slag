@@ -408,6 +408,38 @@ The **certified lane** (C1) is a separate miss target — the record's cached ce
 
 Two adjacent bounded attempts, both **inert and reverted**: (1) a counter *stack* in the lift (for nested/sequential fused loops) — `nested_loops`/`hof_methods`/`closure_capture` still bail `FastLoopHead`, so their head bails on the `var` case (a non-`Counter` head), not a stale counter; (2) `Op::RegExp` via `Step::RegExpLiteral` (the F6 step-index-helper pattern) — the single regexp row then bails on `Push` (its source string), i.e. the G-gated gap. **The F-arc lift coverage is now walled behind the big feature ports** (for-of/for-in, switch/try/yield, the `var`-counter fused head); the bounded widenings are done.
 
+### The certified for-of/for-in lift (opened 2026-10-09; probe-first)
+
+**Why.** `arrays/for_of_dense.js` bails on `ForOfBegin`/`ForOfNextBindLocal`/`ForOfClose`; `control/for_in.js` on `ForInBegin`/`ForInNext`/`ForOfBindLocal`. These are the last two corpus rows the F-arc's bounded widenings cannot reach. The scope is the **fused-bind** shapes both rows use; the stack forms (`ForOfNext`/`ForInBind`/the env heads) are left refused (they need a divergent value flow the SSA operand stack does not carry).
+
+**The shapes, read from the per-step `emit_step`.**
+- `ForOfBegin { top, end, cursor }` → `for_of_begin(step, rhs)`; net **−1** (pops the receiver); fall through.
+- `ForOfNextBindLocal { slot, done, back, cursor }` → a conditional, no stack change: the **G17 fast-array cursor** binds `slot` inline on a dense hit (index bump, jump `back`), else `for_of_fast_next`/`for_of_next_bind_local` returns 1 (element bound → `back`) / 0 (done → fall-through).
+- `ForInBegin` → `for_in_begin(rhs)`; net **−1**; fall through.
+- `ForInNext { done, back }` → `for_in_next(sp)` returns 1 (key pushed at `sp` → `back`) / 0 (done → fall-through): the `back` edge is **one deeper**.
+- `ForOfBindLocal { slot }` → pop → frame slot; net **−1**. `ForOfClose` → `for_of_close()`; net 0.
+
+**The lift's model.** The fetch steps are already terminators in the graph — `jump_target` returns `back` and the fall-through is `done` — so the CFG construction needs nothing. The work is:
+- `stack_delta` + `emit_step` for the heads/bind/close (all opaque helper ops).
+- A `TermRec::Fetch` (emitted in the second pass, like `TermRec::FusedTest`) that emits the fetch op and branches, passing the element on the `back` edge and nothing on the `done` edge. This is the **divergent depth** the uniform `TermRec::Branch` cannot express; `stack_depths` gains the fetch's `+1` element edge, mirroring its existing `JumpIf*` `−1` special case.
+- Because the IR's operand stack is SSA, the for-in key cannot be "pushed and later popped" across the branch. `Op::ForInNext` therefore returns the key **or `undefined` when done** (a for-in key is always a string, so the sentinel is exact) and the terminator branches on `!= undefined`; the `ForOfBindLocal` block receives the key as an edge argument and stores it. The for-of fetch binds its slot in the op (no value on the stack), so it needs no sentinel.
+
+**The G17 cursor in `opt_lower`.** `Op::ForOfNextBindLocal` returns the code (1 element / 0 done) and ports `emit_for_of_fast_bind`: a dense-Array tag check, a live `array_dense` cursor, `idx < elem_len`, a non-hole load → `FrameStore(slot)`, `FrameStore(index_slot, idx+1)`, return 1; any decline abandons the cursor (`FrameStore(array_slot, undefined)`) and returns `for_of_fast_next(slot, idx)`'s code; a non-Array receiver returns `for_of_next_bind_local(slot)`'s code. Without this the lift would call a helper per element where the per-step reads the element inline — a parity regression on the very row this targets.
+
+**New IR ops.** `ForOfBegin`, `ForOfNextBindLocal { slot, cursor }`, `ForOfClose`, `ForInBegin`, `ForInNext`, `ForOfBindLocal { slot }` — all non-pure (`Effects::call()`). New helpers needed in the table: none (all exist).
+
+**Acceptance.** `for_of_dense` and `for_in` produce IR; `cargo test --workspace` green; clippy `-D warnings` clean; test262 `language`/`built-ins` at baseline; both rows exact and at parity (min-of-3, opt vs `SLAG_OPT=0`) under `--gc-stress`/`--gc-verify`; the §6 corpus gate.
+
+**Status (2026-10-09): landed for the fused-bind for-of; `for_in` walled behind the head.** New IR ops `ForOfBegin`/`ForOfNextBindLocal`/`ForOfClose`/`ForInBegin`/`ForInNext`/`ForOfBindLocal` (all `Effects::call()`), the `TermRec::Fetch` terminator, and `opt_lower::emit_for_of_bind` (the G17 cursor port). Lifted corpus **66 → 67 rows** (`arrays/for_of_dense.js` now lifts; the for-in machinery is lifted too — its blocker is the OUTER loop's non-`Counter` `FastLoopHead`, the same head `nested_loops` hits). Read parity holds: `for_of_dense` **7.82ms** opt vs **8.07ms** per-step (min-of-3); the full corpus's JIT vs jitless values are identical; `language` 23,726/0/0/0 and `built-ins` 23,820/0/1/0 at baseline; `cargo test --workspace` green (jit 347/0, runtime 1043/0, crux 3324/0); clippy clean.
+
+**Two traps this slice exposed (both fixed).**
+1. **A helper's raw `0`/`1` code is not a `Type::Bool` value.** The IR's `Term::Branch` lowering, when the condition is `Type::Bool`, compares against the NaN-boxed `false` bits — so a fetch op that returned a raw `0`/`1` under a `Bool` type always branched true (the exhaustion edge was never taken, and a re-entry fetch hit an empty for-of stack). `raw_code_to_bool` converts the code to a canonical `Value` boolean.
+2. **`licm::slot_stores` only saw `Op::FrameStore`.** `ForOfNextBindLocal`/`ForOfBindLocal` write their `imm`'s frame slot directly (no `FrameStore`), so LICM hoisted the loop's element `FrameLoad` out of the body — the element read stayed at its first value (`s` accumulated `1+1+1+1+1`). `slot_stores` now names those ops (and flags `Op::FunctionDecl`, whose slot is only in the step payload, as an unknown writer that blocks all slot-load hoisting).
+
+**The lift's block model needed two fixes for the fetch.** A fetch's `back` is often the fall-through itself (the prologue fetch), so `block_successors` must use the step's explicit `back`/`done`, not `[jump_target, end]`. And a `break`-less loop's `ForOfClose` block (`end_label`, reachable only via a `break`) is dead but sits right after the bottom fetch, so `terminator_index` now finds the block's FIRST terminator (the fetch) rather than `end - 1`, and the fetch's `starts[i+1]` is not marked (the dead tail is dropped).
+
+**Still refused.** `ForOfNext` (the non-fused stack form) is named in `is_for_fetch` and refused explicitly. `for_in` additionally needs the non-`Counter` `FastLoopHead`. `opcost/element_read` needs the computed-read cell (its `GetMemberComputedLocal` arm was tried and reverted: the per-step computed read has a computed-read-cell fast path the opt `Op::ElementLoad` lacks, so lifting the row regressed it to a `get_member_computed` per iteration).
+
 ### I5 — trial inlining, in full (opened 2026-10-08; probe-first)
 
 Inline a monomorphic callee's `Step`s at a caller's call site, under a size budget, recursing. Targets (`optimizing-tier-plan.md` §6): `method_call` 6x, `js_call` 3.6x, `closure_capture`, `hof_methods`, `apply_call`. It is the **enabler of I6**: an allocation can be elided only where the code that allocates and the code that consumes it are one body, so escape analysis has nothing to work on until the call boundary is gone.

@@ -118,6 +118,17 @@ fn lift_impl(body: &CompiledBody, guard_reads: bool) -> Result<Function, Unsuppo
     let mut starts = vec![false; n + 1];
     starts[0] = true;
     for (i, step) in steps.iter().enumerate() {
+        // A for-of/for-in fetch branches only to its `back`/`done` targets — it
+        // never falls through (the interpreter always jumps), so `i + 1` is a
+        // block start only when it IS one of them.
+        if let Some((back, done)) = for_fetch_targets(step) {
+            if back >= n || done >= n {
+                return Err(Unsupported::Malformed("jump out of range"));
+            }
+            starts[back] = true;
+            starts[done] = true;
+            continue;
+        }
         if let Some(t) = jump_target(step) {
             if t >= n {
                 return Err(Unsupported::Malformed("jump out of range"));
@@ -137,14 +148,20 @@ fn lift_impl(body: &CompiledBody, guard_reads: bool) -> Result<Function, Unsuppo
     let ends: Vec<usize> = (0..nb)
         .map(|bi| block_starts.get(bi + 1).copied().unwrap_or(n))
         .collect();
-    let terms: Vec<Option<usize>> = ends.iter().map(|&e| terminator_index(steps, e)).collect();
+    // The block's terminator is its FIRST terminator step. For most blocks that
+    // is `end - 1`; for a for-of/for-in fetch whose dead fall-through (the
+    // `ForOfClose` block a `break`-less loop never reaches) is not a block
+    // start, the fetch sits before that dead tail.
+    let terms: Vec<Option<usize>> = (0..nb)
+        .map(|bi| terminator_index(steps, block_starts[bi], ends[bi]))
+        .collect();
 
     // Successors, then each block's entry stack depth. The depth is a fixpoint:
     // a loop header's depth is fed by a back edge from a block not yet visited.
     let mut succs: Vec<Vec<usize>> = Vec::with_capacity(nb);
-    for &end in &ends {
+    for bi in 0..nb {
         let mut row = Vec::new();
-        for succ in block_successors(steps, end, n)? {
+        for succ in block_successors(steps, terms[bi], ends[bi], n)? {
             let sb = block_of[succ];
             if sb == usize::MAX {
                 return Err(Unsupported::Malformed("jump to a non-block start"));
@@ -209,6 +226,7 @@ fn lift_impl(body: &CompiledBody, guard_reads: bool) -> Result<Function, Unsuppo
                     TermRec::Branch(stack.pop().ok_or(Unsupported::Stack)?, stack)
                 }
                 other if is_fused_test(other) => TermRec::FusedTest { counter, stack },
+                other if is_for_fetch(other) => TermRec::Fetch { stack },
                 other => return Err(Unsupported::Step(step_name(other))),
             },
             None => TermRec::Jump(stack),
@@ -282,6 +300,83 @@ fn lift_impl(body: &CompiledBody, guard_reads: bool) -> Result<Function, Unsuppo
                     },
                 );
             }
+            TermRec::Fetch { stack } => {
+                let ti = terms[bi].ok_or(Unsupported::Invalid)?;
+                // `back` is the element edge, `done` the exhaustion edge — NOT
+                // the fall-through, which for the prologue fetch equals `back`.
+                let (back, done) = for_fetch_targets(&steps[ti]).ok_or(Unsupported::Invalid)?;
+                let sb = block_of[back] as BlockId;
+                let fb = block_of[done] as BlockId;
+                let (cond, then_stack): (ValueId, Vec<ValueId>) = match &steps[ti] {
+                    Step::ForOfNextBindLocal { slot, cursor, .. } => {
+                        let code = builder.emit(
+                            bi as BlockId,
+                            Op::ForOfNextBindLocal,
+                            &[],
+                            Type::Bool,
+                            Op::ForOfNextBindLocal.default_effects(),
+                            Imm::ForOfBind {
+                                slot: *slot as u32,
+                                cursor: (cursor.0 as u32, cursor.1 as u32),
+                            },
+                        );
+                        (code, stack.clone())
+                    }
+                    Step::ForInNext { .. } => {
+                        // The fetch yields the key, or `undefined` when done (a
+                        // for-in key is always a string); the terminator tests
+                        // `key != undefined` and passes the key to the bind block.
+                        let value = builder.emit(
+                            bi as BlockId,
+                            Op::ForInNext,
+                            &[],
+                            Type::Unknown,
+                            Op::ForInNext.default_effects(),
+                            Imm::None,
+                        );
+                        let undef = builder.emit(
+                            bi as BlockId,
+                            Op::Const,
+                            &[],
+                            Type::Undefined,
+                            Effects::pure(),
+                            Imm::U64(crux::Value::Undefined.bits()),
+                        );
+                        let is_undef = builder.emit(
+                            bi as BlockId,
+                            Op::StrictEq,
+                            &[value, undef],
+                            Type::Bool,
+                            Effects::pure(),
+                            Imm::None,
+                        );
+                        let cond = builder.emit(
+                            bi as BlockId,
+                            Op::Not,
+                            &[is_undef],
+                            Type::Bool,
+                            Effects::pure(),
+                            Imm::None,
+                        );
+                        let mut back_stack = stack.clone();
+                        back_stack.push(value);
+                        (cond, back_stack)
+                    }
+                    other => return Err(Unsupported::Step(step_name(other))),
+                };
+                let then_args = edge_args(builder.func(), sb, &then_stack);
+                let else_args = edge_args(builder.func(), fb, stack);
+                builder.term(
+                    bi as BlockId,
+                    Term::Branch {
+                        cond,
+                        then_block: sb,
+                        then_args,
+                        else_block: fb,
+                        else_args,
+                    },
+                );
+            }
         }
     }
 
@@ -324,13 +419,21 @@ fn stack_depths(
             if edge < 0 {
                 return Err(Unsupported::Malformed("stack underflow"));
             }
-            for &s in &succs[bi] {
+            // A for-of/for-in fetch pushes the element/key onto its `back` edge
+            // only; `block_successors` places `back` first, the `done`
+            // fall-through second.
+            let fetch_push = matches!(
+                terms[bi].map(|ti| &steps[ti]),
+                Some(Step::ForOfNext { .. } | Step::ForInNext { .. })
+            );
+            for (k, &s) in succs[bi].iter().enumerate() {
+                let d = if fetch_push && k == 0 { edge + 1 } else { edge };
                 match depth[s] {
                     None => {
-                        depth[s] = Some(edge);
+                        depth[s] = Some(d);
                         changed = true;
                     }
-                    Some(known) if known != edge => {
+                    Some(known) if known != d => {
                         return Err(Unsupported::Malformed("stack depth mismatch at a join"));
                     }
                     _ => {}
@@ -442,6 +545,15 @@ fn stack_delta(step: &Step) -> Result<i32, Unsupported> {
         // argument vector.
         Step::ArgsBase | Step::Construct { .. } => 0,
         Step::ArgsPush | Step::ArgsSpread => -1,
+        // The certified for-of/for-in steps: the heads pop the receiver, the
+        // local bind pops the element, and the close is net-neutral. The
+        // fetches are terminators (`jump_target`); their body delta is 0 and
+        // their element edge's +1 is handled in `stack_depths`.
+        Step::ForOfBegin { .. } | Step::ForInBegin | Step::ForOfBindLocal { .. } => -1,
+        Step::ForOfClose
+        | Step::ForOfNext { .. }
+        | Step::ForInNext { .. }
+        | Step::ForOfNextBindLocal { .. } => 0,
         other => return Err(Unsupported::Step(step_name(other))),
     })
 }
@@ -461,6 +573,13 @@ enum TermRec {
         counter: Option<usize>,
         stack: Vec<ValueId>,
     },
+    /// A for-of/for-in fetch: the terminator reads the step and emits the fetch
+    /// op at terminator time, branching on its code (element → `back`, done →
+    /// the fall-through). `stack` is the entry stack, passed to the `done` edge;
+    /// the for-in key is appended for the `back` edge.
+    Fetch {
+        stack: Vec<ValueId>,
+    },
 }
 
 /// The arguments a predecessor passes into `target`: its stack, or nothing
@@ -473,39 +592,53 @@ fn edge_args(func: &Function, target: BlockId, stack: &[ValueId]) -> Vec<ValueId
     }
 }
 
-/// The index of the terminating step of a block ending at `end`, if it is a
-/// terminator (`end - 1`); `None` for a fall-through block.
-fn terminator_index(steps: &[Step], end: usize) -> Option<usize> {
-    let last = end.checked_sub(1)?;
-    is_terminator(&steps[last]).then_some(last)
+/// The index of the first terminating step of a block spanning `[start, end)`,
+/// or `None` for a fall-through block. Usually the last step; a for-of/for-in
+/// fetch's dead tail (the unreached `ForOfClose`) sits after it.
+fn terminator_index(steps: &[Step], start: usize, end: usize) -> Option<usize> {
+    (start..end).find(|&i| is_terminator(&steps[i]))
 }
 
-/// The blocks a block ending at `end` can reach.
-fn block_successors(steps: &[Step], end: usize, n: usize) -> Result<Vec<usize>, Unsupported> {
-    let Some(last) = end.checked_sub(1) else {
-        return Err(Unsupported::Invalid);
+/// The blocks a block whose terminator is `term` (if any) and whose end is
+/// `end` can reach.
+fn block_successors(
+    steps: &[Step],
+    term: Option<usize>,
+    end: usize,
+    n: usize,
+) -> Result<Vec<usize>, Unsupported> {
+    let Some(last) = term else {
+        return if end >= n {
+            Err(Unsupported::NoReturn)
+        } else {
+            Ok(vec![end])
+        };
     };
-    if is_terminator(&steps[last]) {
-        if let Some(target) = jump_target(&steps[last]) {
-            // An unconditional jump has one successor; every conditional (the
-            // `JumpIf*` pair and the fused loop test) also falls through.
-            return if matches!(steps[last], Step::Jump(_)) {
-                Ok(vec![target])
-            } else if end >= n {
-                Err(Unsupported::Malformed("conditional with no fall-through"))
-            } else {
-                Ok(vec![target, end])
-            };
+    // A for-of/for-in fetch has two explicit forward/backward targets — `back`
+    // (the element edge) and `done` — and `back` is often the fall-through
+    // itself (the prologue fetch), so the generic `[jump_target, end]` shape
+    // would collapse the two edges onto one block.
+    if let Some((back, done)) = for_fetch_targets(&steps[last]) {
+        if back >= n || done >= n {
+            return Err(Unsupported::Malformed("jump out of range"));
         }
-        match &steps[last] {
-            Step::Return => Ok(Vec::new()),
-            Step::Throw { .. } => Err(Unsupported::Step("Throw")),
-            _ => Err(Unsupported::Invalid),
-        }
-    } else if end >= n {
-        Err(Unsupported::NoReturn)
-    } else {
-        Ok(vec![end])
+        return Ok(vec![back, done]);
+    }
+    if let Some(target) = jump_target(&steps[last]) {
+        // An unconditional jump has one successor; every conditional (the
+        // `JumpIf*` pair and the fused loop test) also falls through.
+        return if matches!(steps[last], Step::Jump(_)) {
+            Ok(vec![target])
+        } else if end >= n {
+            Err(Unsupported::Malformed("conditional with no fall-through"))
+        } else {
+            Ok(vec![target, end])
+        };
+    }
+    match &steps[last] {
+        Step::Return => Ok(Vec::new()),
+        Step::Throw { .. } => Err(Unsupported::Step("Throw")),
+        _ => Err(Unsupported::Invalid),
     }
 }
 
@@ -539,6 +672,25 @@ fn is_fused_test(step: &Step) -> bool {
     )
 }
 
+/// Whether `step` is a for-of/for-in fetch (a conditional terminator whose
+/// element rides a dedicated edge, not the operand stack). `ForOfNext`
+/// (the non-fused stack form) is named here so its refusal is explicit.
+fn is_for_fetch(step: &Step) -> bool {
+    for_fetch_targets(step).is_some()
+}
+
+/// The `(back, done)` targets of a for-of/for-in fetch, or `None` for any
+/// other step. `back` is where a successful fetch continues (the body start),
+/// `done` where exhaustion lands.
+fn for_fetch_targets(step: &Step) -> Option<(usize, usize)> {
+    match step {
+        Step::ForOfNext { done, back }
+        | Step::ForInNext { done, back }
+        | Step::ForOfNextBindLocal { done, back, .. } => Some((*back, *done)),
+        _ => None,
+    }
+}
+
 fn jump_target(step: &Step) -> Option<usize> {
     match step {
         Step::Jump(t) | Step::JumpIfFalse(t) | Step::JumpIfTrue(t) => Some(*t),
@@ -561,6 +713,12 @@ fn jump_target(step: &Step) -> Option<usize> {
         Step::HoistMemberGuard { target, .. } | Step::HoistGlobalGuard { target, .. } => {
             Some(*target)
         }
+        // A for-of/for-in fetch jumps back to the body start when an element is
+        // available (its fall-through is the `done` label); the lift models it
+        // as a conditional terminator (`TermRec::Fetch`).
+        Step::ForOfNext { back, .. }
+        | Step::ForOfNextBindLocal { back, .. }
+        | Step::ForInNext { back, .. } => Some(*back),
         _ => None,
     }
 }
@@ -1268,6 +1426,48 @@ fn emit_step(
                 Imm::None,
             );
             stack.push(result);
+        }
+        // The certified for-of/for-in head/bind/close steps (the fetch steps are
+        // terminators — `TermRec::Fetch`). All are opaque helper ops: the
+        // fetch step's element flow never rides the SSA operand stack.
+        Step::ForOfBegin { .. } => {
+            let rhs = stack.pop().ok_or(Unsupported::Stack)?;
+            builder.emit_void(
+                block,
+                Op::ForOfBegin,
+                &[rhs],
+                Op::ForOfBegin.default_effects(),
+                Imm::Int(index as i32),
+            );
+        }
+        Step::ForInBegin => {
+            let rhs = stack.pop().ok_or(Unsupported::Stack)?;
+            builder.emit_void(
+                block,
+                Op::ForInBegin,
+                &[rhs],
+                Op::ForInBegin.default_effects(),
+                Imm::None,
+            );
+        }
+        Step::ForOfBindLocal { slot } => {
+            let value = stack.pop().ok_or(Unsupported::Stack)?;
+            builder.emit_void(
+                block,
+                Op::ForOfBindLocal,
+                &[value],
+                Op::ForOfBindLocal.default_effects(),
+                Imm::Int(*slot as i32),
+            );
+        }
+        Step::ForOfClose => {
+            builder.emit_void(
+                block,
+                Op::ForOfClose,
+                &[],
+                Op::ForOfClose.default_effects(),
+                Imm::None,
+            );
         }
         other => return Err(Unsupported::Step(step_name(other))),
     }

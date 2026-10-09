@@ -197,6 +197,13 @@ pub enum Imm {
         depth: u32,
         index: u32,
     },
+    /// A `for-of`/`for-in` bind: the frame `slot` to write and, for the fused
+    /// `for-of` fetch, the fast-array cursor slots `(array, index)`
+    /// (`u32::MAX` in both when the head has no fused bind cursor).
+    ForOfBind {
+        slot: u32,
+        cursor: (u32, u32),
+    },
     /// Raw 64 bits (a NaN-boxed `Value` or an identity).
     U64(u64),
 }
@@ -328,6 +335,28 @@ pub enum Op {
     /// non-empty (spec 6.2.2.4). The register lives on the `Vm`, not in a
     /// [`Heap`] region, so both ops are modelled as `World` writes.
     CompletionStore,
+    /// A `for-of` head (`Step::ForOfBegin`): opens the iteration, seeding the
+    /// fast-array cursor; `imm` is the step index (the helper reads the head
+    /// payload), `args = [rhs]`. Net stack −1 (pops the receiver).
+    ForOfBegin,
+    /// A fused `for-of` fetch-and-bind (`Step::ForOfNextBindLocal`): the
+    /// result is the code (1 = element bound to `imm`'s slot, 0 = done), which
+    /// the branch terminator tests. `args` empty; `imm` carries the bind slot
+    /// and the fast-array cursor slots.
+    ForOfNextBindLocal,
+    /// A `for-of` close (`Step::ForOfClose`): `for_of_close()`.
+    ForOfClose,
+    /// A `for-in` head (`Step::ForInBegin`): opens the enumeration; `args =
+    /// [rhs]`. Net stack −1 (pops the receiver).
+    ForInBegin,
+    /// A `for-in` fetch (`Step::ForInNext`): the result is the key, or
+    /// `undefined` when the enumeration is done (a for-in key is always a
+    /// string, so the sentinel is exact); the branch terminator tests it and
+    /// passes it to the bind block.
+    ForInNext,
+    /// A `for-of`/`for-in` local bind (`Step::ForOfBindLocal`): pops the value
+    /// into `imm`'s frame slot. Net stack −1.
+    ForOfBindLocal,
 }
 
 impl Op {
@@ -402,7 +431,13 @@ impl Op {
             | Op::ArgsSpread
             | Op::ContextLoad
             | Op::ContextStore
-            | Op::ContextInit => E::call(),
+            | Op::ContextInit
+            | Op::ForOfBegin
+            | Op::ForOfNextBindLocal
+            | Op::ForOfClose
+            | Op::ForInBegin
+            | Op::ForInNext
+            | Op::ForOfBindLocal => E::call(),
         }
     }
 }

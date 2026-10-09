@@ -48,7 +48,7 @@ fn hoist_loop(
     preheader: u32,
     def_block: &[Option<u32>],
 ) -> bool {
-    let slots_stored = slot_stores(func, in_loop);
+    let (slots_stored, slots_unknown) = slot_stores(func, in_loop);
     // Fixpoint: an instruction is invariant when it is hoistable and every
     // operand is either defined outside the loop or already invariant.
     let mut invariant = vec![false; func.value_count() as usize];
@@ -60,7 +60,7 @@ fn hoist_loop(
             }
             for inst in &func.block(b).insts {
                 let Some(r) = inst.result else { continue };
-                if invariant[r as usize] || !hoistable(inst, &slots_stored) {
+                if invariant[r as usize] || !hoistable(inst, &slots_stored, slots_unknown) {
                     continue;
                 }
                 let ready = inst.args.iter().all(|a| {
@@ -133,36 +133,58 @@ fn hoist_loop(
 }
 
 /// Whether an instruction may be speculated before the loop body.
-fn hoistable(inst: &Inst, slots_stored: &[bool]) -> bool {
+fn hoistable(inst: &Inst, slots_stored: &[bool], slots_unknown: bool) -> bool {
     match inst.op {
-        Op::FrameLoad => matches!(
-            inst.imm,
-            Imm::Slot(s) if !slots_stored.get(s as usize).copied().unwrap_or(false)
-        ),
+        Op::FrameLoad => {
+            !slots_unknown
+                && matches!(
+                    inst.imm,
+                    Imm::Slot(s) if !slots_stored.get(s as usize).copied().unwrap_or(false)
+                )
+        }
         Op::Check | Op::TdzCheck | Op::GuardType | Op::GuardCallee => false,
         _ => inst.effects.is_pure(),
     }
 }
 
-/// Which frame slots the loop stores to.
-fn slot_stores(func: &Function, in_loop: &[bool]) -> Vec<bool> {
+/// Which frame slots the loop stores to, and whether any in-loop instruction
+/// writes a frame slot the scan cannot name.
+///
+/// A `FrameLoad` may be hoisted only when its slot is provably unmodified, so
+/// EVERY in-loop writer of a frame slot must be accounted for — not just
+/// `Op::FrameStore`. `ForOfBindLocal`/`ForOfNextBindLocal` write their `imm`'s
+/// slot directly (no `FrameStore`), and `Op::FunctionDecl` stores a closure
+/// into a slot named only by its step payload; missing either would let LICM
+/// hoist a loop-varying element read out of a for-of body (measured: the
+/// element read stayed at the first element).
+fn slot_stores(func: &Function, in_loop: &[bool]) -> (Vec<bool>, bool) {
     let mut stored: Vec<bool> = Vec::new();
+    let mut unknown = false;
+    let mark = |stored: &mut Vec<bool>, s: u32| {
+        if s as usize >= stored.len() {
+            stored.resize(s as usize + 1, false);
+        }
+        stored[s as usize] = true;
+    };
     for b in 0..func.block_count() as u32 {
         if !in_loop[b as usize] {
             continue;
         }
         for inst in &func.block(b).insts {
-            if inst.op == Op::FrameStore
-                && let Imm::Slot(s) = inst.imm
-            {
-                if s as usize >= stored.len() {
-                    stored.resize(s as usize + 1, false);
+            match (inst.op, &inst.imm) {
+                (Op::FrameStore, Imm::Slot(s)) => mark(&mut stored, *s),
+                (Op::ForOfBindLocal, Imm::Int(s)) => mark(&mut stored, *s as u32),
+                (Op::ForOfNextBindLocal, Imm::ForOfBind { slot, .. }) => {
+                    mark(&mut stored, *slot);
                 }
-                stored[s as usize] = true;
+                // A slot named only by the step payload (its write target is
+                // not in the IR): treat every slot as possibly stored.
+                (Op::FunctionDecl, _) => unknown = true,
+                _ => {}
             }
         }
     }
-    stored
+    (stored, unknown)
 }
 
 /// The natural loop of the back edge `source -> header`: `header` plus every

@@ -934,8 +934,275 @@ fn lower_inst(
                 &[callee, abi.work],
             )?
         }
+        // The certified for-of/for-in heads/bind/close: opaque helpers, all
+        // effect-only (the element flow never rides the SSA operand stack).
+        Op::ForOfBegin => {
+            let Imm::Int(step) = inst.imm else {
+                return Err(Unsupported::Step("opt:for-of-begin"));
+            };
+            let rhs = arg(0)?;
+            let step_imm = builder.ins().iconst(types::I64, step as i64);
+            call_helper(
+                builder,
+                helpers,
+                abi,
+                abi.sig_unary,
+                Helper::ForOfBegin,
+                &[step_imm, rhs],
+            )?;
+            builder
+                .ins()
+                .iconst(types::I64, JsValue::Undefined.bits() as i64)
+        }
+        Op::ForInBegin => {
+            let rhs = arg(0)?;
+            call_helper(
+                builder,
+                helpers,
+                abi,
+                abi.sig_bool,
+                Helper::ForInBegin,
+                &[rhs],
+            )?;
+            builder
+                .ins()
+                .iconst(types::I64, JsValue::Undefined.bits() as i64)
+        }
+        Op::ForOfBindLocal => {
+            let Imm::Int(slot) = inst.imm else {
+                return Err(Unsupported::Step("opt:for-of-bind"));
+            };
+            let value = arg(0)?;
+            builder.ins().store(
+                MemFlagsData::new(),
+                value,
+                abi.frame,
+                Offset32::new(slot * 8),
+            );
+            builder
+                .ins()
+                .iconst(types::I64, JsValue::Undefined.bits() as i64)
+        }
+        Op::ForOfClose => {
+            call_helper(builder, helpers, abi, abi.sig_tdz, Helper::ForOfClose, &[])?;
+            builder
+                .ins()
+                .iconst(types::I64, JsValue::Undefined.bits() as i64)
+        }
+        // A fused for-of fetch: returns the code (1 element bound, 0 done).
+        Op::ForOfNextBindLocal => {
+            let Imm::ForOfBind { slot, cursor } = inst.imm else {
+                return Err(Unsupported::Step("opt:for-of-next"));
+            };
+            emit_for_of_bind(builder, helpers, abi, slot, cursor)?
+        }
+        // A for-in fetch: returns the key, or `undefined` when done (a for-in
+        // key is always a string). The key the helper wrote at the working base
+        // is only meaningful when the code is 1.
+        Op::ForInNext => {
+            let code = call_helper(
+                builder,
+                helpers,
+                abi,
+                abi.sig_bool,
+                Helper::ForInNext,
+                &[abi.work],
+            )?;
+            let is_elem = builder.ins().icmp_imm_u(IntCC::Equal, code, 1);
+            let key =
+                builder
+                    .ins()
+                    .load(types::I64, MemFlagsData::new(), abi.work, Offset32::new(0));
+            let undef = builder
+                .ins()
+                .iconst(types::I64, JsValue::Undefined.bits() as i64);
+            builder.ins().select(is_elem, key, undef)
+        }
         _ => return Err(Unsupported::Step("opt:op")),
     })
+}
+
+/// Convert a helper's raw `0`/`1` code into a canonical `Value` boolean, so a
+/// branch terminator's `Type::Bool` lowering (which compares against the
+/// NaN-boxed `false` bits) works — a raw code is not a NaN-boxed `Value`.
+fn raw_code_to_bool(builder: &mut FunctionBuilder, code: ClifValue) -> ClifValue {
+    let nonzero = builder.ins().icmp_imm_u(IntCC::NotEqual, code, 0);
+    let t = builder
+        .ins()
+        .iconst(types::I64, JsValue::Boolean(true).bits() as i64);
+    let f = builder
+        .ins()
+        .iconst(types::I64, JsValue::Boolean(false).bits() as i64);
+    builder.ins().select(nonzero, t, f)
+}
+
+/// The fused for-of fetch-and-bind (`.notes/optimizing-tier-impl.md` §6, the
+/// certified for-of lift). Returns the code the branch terminator tests: 1 when
+/// an element was bound to `slot`, 0 when the iteration is done. Ports the
+/// per-step `emit_for_of_fast_bind` (G17): the fast-array cursor reads the
+/// element straight from the array buffer on a dense hit; any decline abandons
+/// the cursor and hands the current index to `for_of_fast_next`; a cursor-less
+/// head (or a non-Array receiver) runs `for_of_next_bind_local`.
+fn emit_for_of_bind(
+    builder: &mut FunctionBuilder,
+    helpers: &JitHelpers,
+    abi: &Abi,
+    slot: u32,
+    cursor: (u32, u32),
+) -> Result<ClifValue, Unsupported> {
+    let value = builder.declare_var(types::I64);
+    let merge = builder.create_block();
+    let plain = |builder: &mut FunctionBuilder,
+                 helpers: &JitHelpers,
+                 value: Variable,
+                 merge: Block|
+     -> Result<(), Unsupported> {
+        let slot_imm = builder.ins().iconst(types::I64, slot as i64);
+        let code = call_helper(
+            builder,
+            helpers,
+            abi,
+            abi.sig_bool,
+            Helper::ForOfNextBindLocal,
+            &[slot_imm],
+        )?;
+        let bits = raw_code_to_bool(builder, code);
+        builder.def_var(value, bits);
+        builder.ins().jump(merge, &[]);
+        Ok(())
+    };
+    // No fused-bind cursor: the plain helper.
+    if cursor.0 == u32::MAX {
+        plain(builder, helpers, value, merge)?;
+        builder.seal_block(merge);
+        builder.switch_to_block(merge);
+        return Ok(builder.use_var(value));
+    }
+    let (array_slot, index_slot) = cursor;
+    let array = builder.ins().load(
+        types::I64,
+        MemFlagsData::new(),
+        abi.frame,
+        Offset32::new((array_slot as i32) * 8),
+    );
+    let object_pattern = (crux::TAG_PREFIX >> 44) | crux::TAG_OBJECT;
+    let tag_bits = builder.ins().ushr_imm_u(array, 44);
+    let obj_ok = builder
+        .ins()
+        .icmp_imm_u(IntCC::Equal, tag_bits, object_pattern as i64);
+    let dense = builder.create_block();
+    let helper_plain = builder.create_block();
+    builder.ins().brif(obj_ok, dense, &[], helper_plain, &[]);
+    builder.switch_to_block(dense);
+    let obj_ptr = builder.ins().band_imm_u(array, crux::PAYLOAD_MASK as i64);
+    let obj_ptr = builder.ins().ishl_imm_u(obj_ptr, 4);
+    let obj_ptr = builder
+        .ins()
+        .iadd_imm_s(obj_ptr, crux::heap::GCBOX_DATA_OFFSET as i64);
+    let dense_base = builder.ins().load(
+        types::I64,
+        MemFlagsData::new(),
+        obj_ptr,
+        Offset32::new(std::mem::offset_of!(crux::JsObject, array_dense) as i32),
+    );
+    let dense_ok = builder.ins().icmp_imm_u(IntCC::NotEqual, dense_base, 0);
+    let bounds = builder.create_block();
+    let helper_sync = builder.create_block();
+    builder.ins().brif(dense_ok, bounds, &[], helper_sync, &[]);
+    builder.switch_to_block(bounds);
+    let slots_ptr = builder
+        .ins()
+        .iadd_imm_s(dense_base, crux::heap::GCBOX_DATA_OFFSET as i64);
+    let idx = builder.ins().load(
+        types::I64,
+        MemFlagsData::new(),
+        abi.frame,
+        Offset32::new((index_slot as i32) * 8),
+    );
+    let elem_len = builder.ins().load(
+        types::I64,
+        MemFlagsData::new(),
+        slots_ptr,
+        Offset32::new(std::mem::offset_of!(crux::object::ArraySlots, elem_len) as i32),
+    );
+    let in_bounds = builder.ins().icmp(IntCC::UnsignedLessThan, idx, elem_len);
+    let load_blk = builder.create_block();
+    builder
+        .ins()
+        .brif(in_bounds, load_blk, &[], helper_sync, &[]);
+    builder.switch_to_block(load_blk);
+    let elem_ptr = builder.ins().load(
+        types::I64,
+        MemFlagsData::new(),
+        slots_ptr,
+        Offset32::new(std::mem::offset_of!(crux::object::ArraySlots, elem_ptr) as i32),
+    );
+    let offset = builder.ins().ishl_imm_u(idx, 3);
+    let addr = builder.ins().iadd(elem_ptr, offset);
+    let bits = builder
+        .ins()
+        .load(types::I64, MemFlagsData::new(), addr, Offset32::new(0));
+    let is_hole = builder
+        .ins()
+        .icmp_imm_u(IntCC::Equal, bits, crux::value::HOLE_BITS as i64);
+    let hit = builder.create_block();
+    builder.ins().brif(is_hole, helper_sync, &[], hit, &[]);
+    // The hit: bind the slot, bump the cursor, report an element.
+    builder.switch_to_block(hit);
+    builder.ins().store(
+        MemFlagsData::new(),
+        bits,
+        abi.frame,
+        Offset32::new((slot as i32) * 8),
+    );
+    let next = builder.ins().iadd_imm_u(idx, 1);
+    builder.ins().store(
+        MemFlagsData::new(),
+        next,
+        abi.frame,
+        Offset32::new((index_slot as i32) * 8),
+    );
+    let one = builder
+        .ins()
+        .iconst(types::I64, JsValue::Boolean(true).bits() as i64);
+    builder.def_var(value, one);
+    builder.ins().jump(merge, &[]);
+    // The first decline: abandon the cursor (so every later step runs the
+    // helper), hand `for_of_fast_next` the index the inline path reached.
+    builder.switch_to_block(helper_sync);
+    let undef = builder
+        .ins()
+        .iconst(types::I64, JsValue::Undefined.bits() as i64);
+    builder.ins().store(
+        MemFlagsData::new(),
+        undef,
+        abi.frame,
+        Offset32::new((array_slot as i32) * 8),
+    );
+    let slot_imm = builder.ins().iconst(types::I64, slot as i64);
+    let sync_idx = builder.ins().load(
+        types::I64,
+        MemFlagsData::new(),
+        abi.frame,
+        Offset32::new((index_slot as i32) * 8),
+    );
+    let code = call_helper(
+        builder,
+        helpers,
+        abi,
+        abi.sig_unary,
+        Helper::ForOfFastNext,
+        &[slot_imm, sync_idx],
+    )?;
+    let bits = raw_code_to_bool(builder, code);
+    builder.def_var(value, bits);
+    builder.ins().jump(merge, &[]);
+    // A non-Array receiver: the plain helper (the cursor is already gone).
+    builder.switch_to_block(helper_plain);
+    plain(builder, helpers, value, merge)?;
+    builder.seal_block(merge);
+    builder.switch_to_block(merge);
+    Ok(builder.use_var(value))
 }
 
 /// The inline computed element read: a dense Array's canonical-index element or

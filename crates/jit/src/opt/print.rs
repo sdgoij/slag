@@ -84,6 +84,9 @@ fn imm_suffix(imm: &Imm) -> String {
         Imm::Arg(i) => format!(" arg{i}"),
         Imm::Atom(i) => format!(" atom{i}"),
         Imm::Context { depth, index } => format!(" ctx{depth}:{index}"),
+        Imm::ForOfBind { slot, cursor } => {
+            format!(" slot{slot} cursor({},{})", cursor.0, cursor.1)
+        }
         Imm::U64(v) => format!(" {v:#x}"),
     }
 }
