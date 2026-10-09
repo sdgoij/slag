@@ -371,6 +371,39 @@ The eight `RunRegBody` first-bails, and a slice of the coarse `step` 26, are mem
 
 **F9 status (2026-10-09): landed (the inline element store).** Port the per-step `emit_dense_element_store_into` (and its `box_ptr_is_young`) into `opt_lower` as `emit_dense_element_store`/`emit_element_store`, and rewire `Op::ElementStore` through it (falling back to `set_member_computed`). Re-enable `Step::AssignMemberComputed` (plain `=`) → `Op::ElementStore`. Lifted corpus bodies **66 → 68**; rows producing IR **54 → 56** (`element_write`, `element_read`). Parity flips from the F8 regression to a win: min-of-3, `scratch/ew_bench.js`, opt **1738ms** vs per-step **2481ms** (+30%). Still not ported: the dense-append gate (`emit_dense_array_append_inline`) and the typed-array gate (`emit_typed_array_store_inline`) — an append or typed-array store shape falls to the full helper where the per-step inlines, a remaining gap.
 
+**F10 negative (2026-10-09).** The `Push(non-constant)` gap (13 rows) is string literals (11 rows) and `undefined` (2: `closure_capture`, `recursive_fib`, whose other gaps F5/F6/F7 cleared). Accepting `undefined`/`null`/string in `constant()` lifted **+10 rows** (56 → 66) but **regressed the call-heavy ones**: five leaf-call tests fail with exactly **200000** `call_slow` calls (2 per iteration × 100000), because the opt tier's `Op::Call` lowers through `call_slow` where the per-step path uses the leaf-call probe — so admitting a call-heavy body loses the inline. This is the **I5c-2 dependency** made concrete: the opt call path must splice/inline a leaf callee before `Push(string)` bodies can be admitted at parity. Reverted (the earlier `undefined`/`null`-only attempt was also a negative: 0 bodies then, because the same rows still had the F5/F6/F7 gaps).
+
+### G — opt-tier call parity (opened 2026-10-09; probe-first)
+
+**Why.** F10 found that admitting a call-heavy body to the opt tier *regresses* it: the opt `Op::Call` lowers through `call_slow`, while the per-step `emit_call` first runs a runtime **leaf-call probe** that inlines any certified leaf callee in machine code. So a lifted body loses the inline — five leaf-call tests fail with exactly 200000 `call_slow` calls (2 per iteration). That blocks the 13 `Push(non-constant)` rows (11 string-heavy, 2 `undefined`) and is the real per-call cost of every already-lifted call body (F6/F7).
+
+**What exists.** The compile-time **trial-inline splice** (I5c-2) is fully landed — the resolver, `GuardCallee`, the site map, mem2reg, recursion, the guard-free gate — but **gated off** (`SLAG_INLINE` + `SLAG_FEEDBACK`) and narrow (a call that is its block's last instruction, a monomorphic box-stable callee). It does not cover the per-step leaf probe's shapes (any certified leaf, any position), so enabling it will not close the F10 gap.
+
+**The per-step lane, read from the code (the behaviour to reproduce).** `emit_call` (`compiler.rs` 4691):
+1. **the self-call gate (G21)** — when `scope.is_some()` and `callee == ctx.current_function` (non-zero), skip the probe and take `call_slow`'s compiled-self-call path;
+2. **the record slot** — `emit_leaf_record_slot(callee)` = `(callee * 0x9E37…9F4A_7C15) >> LEAF_CALL_RECORD_SHIFT`, indexing `ctx.leaf_records`;
+3. **the reuse gate** — the record's `code_gen`, `epoch`, callee `hi` and `payload` all match → `hit`;
+4. **on a miss** — split on `stable` (a stale epoch with `emit_leaf_state_at_rest` still true → restamp the epoch and reuse) else **the probe lane** (`leaf_call_probe`, which runs the interpreter's eligibility checks and *writes the record*);
+5. **a hit** — `uses_env` → the env lane; else the in-frame lane: `entry == 0` → a stable rejection → `call_slow`; else the **aliased/fill split**, the **room check** (`argc*8 + frame_size*8 + stack_usage*8 <= ctx.buf_end`), then `entry(args_ptr, args_ptr + frame_size*8, ctx)` with `entry` the cached `LeafInlineInfo::entry`;
+6. **the result tail** — the pending byte → `return_`; else restore the sp and push the result.
+The **certified lane** (C1) is a separate miss target — the record's cached certified verdict, consumed by `call_slow`'s certified path.
+
+**Why it is not separable.** The record the hit path reads is written *only* by the probe (step 4), so a partial "read the record + entry call" always misses until something runs the probe. The port therefore must include the probe lane — which is what makes it ~600 lines (`emit_call` 4689→~5000 + `emit_leaf_call_tail` + `emit_leaf_result_tail` + `emit_leaf_state_at_rest` + `emit_leaf_record_slot` + the certified lane).
+
+**The port (`opt_lower.rs`), staged — each stage keeps `call_slow` as the fallback, so a partial port is always correct.**
+- **G-a — the leaf in-frame lane.** `emit_leaf_record_slot` as a free fn; the `LeafCallRecord`/`LeafInlineInfo` field offsets (via `leaf_inline_offset`); the reuse gate; the hit's aliased path (the room check against `ctx.buf_end`, `entry(args_ptr, stack_ptr, ctx)`, the pending-byte tail); `call_slow` on every miss. New `Abi` field: the leaf-entry signature (`sig_entry`).
+- **G-b — the probe lane.** Call the `leaf_call_probe`-equivalent helper (the per-step probe's helper, same args) so the record fills; plus the env lane and the `fill`/`not_aliased` split. **This is the stage that makes it pay** — without it, G-a always misses.
+- **G-c — the certified lane + the self-call gate.**
+- **G-d — the restamp** (`emit_leaf_state_at_rest`).
+
+**The design question the port must answer.** The per-step lane is built on a running sp (`sp_var`) and a push-based value stack; the opt IR has neither (the operand stack is SSA values, and `abi.work` is the helper-arg region). So (i) the leaf frame's carve base is `abi.work` — a soft base, the `Op::Construct` precedent; and (ii) `Op::Call` yields the result as an SSA value, so the result tail is simpler than the per-step's — the pending-byte check then the value, with no sp restore or push.
+
+**Acceptance.** The five `installed_jit_*leaf_call*` tests pass with the opt tier on (the F10 failure gone); `scratch/call_bench.js`-style parity (min-of-3); then re-run the F10 `Push` widening for its +10 rows; §6 gate.
+
+**G probe results (2026-10-09).** Reading the leaf lane (`emit_call` 4689–~5000 + `emit_leaf_call_tail`/`emit_leaf_result_tail`/`emit_leaf_state_at_rest` + the certified lane + `emit_leaf_record_slot`) puts the port at **~600 lines, not ~300, and it is not separable**: the leaf record is written by the *probe*, which is part of the lane, so a "record read + in-frame call" partial still needs the probe and the result tails. Not started — a changeset that size on a `Lowerer`-state-dependent subsystem is a dedicated session, not a slice.
+
+Two adjacent bounded attempts, both **inert and reverted**: (1) a counter *stack* in the lift (for nested/sequential fused loops) — `nested_loops`/`hof_methods`/`closure_capture` still bail `FastLoopHead`, so their head bails on the `var` case (a non-`Counter` head), not a stale counter; (2) `Op::RegExp` via `Step::RegExpLiteral` (the F6 step-index-helper pattern) — the single regexp row then bails on `Push` (its source string), i.e. the G-gated gap. **The F-arc lift coverage is now walled behind G (call parity) and the big feature ports** (for-of/for-in, switch/try/yield); every remaining bounded widening is inert.
+
 ### I5 — trial inlining, in full (opened 2026-10-08; probe-first)
 
 Inline a monomorphic callee's `Step`s at a caller's call site, under a size budget, recursing. Targets (`optimizing-tier-plan.md` §6): `method_call` 6x, `js_call` 3.6x, `closure_capture`, `hof_methods`, `apply_call`. It is the **enabler of I6**: an allocation can be elided only where the code that allocates and the code that consumes it are one body, so escape analysis has nothing to work on until the call boundary is gone.
