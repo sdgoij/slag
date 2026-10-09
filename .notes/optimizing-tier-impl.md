@@ -217,6 +217,21 @@ So I4a is worth writing. Land the probe first (the diagnostic + script), then th
 
 **Gate.** §6's gate. Ordering: land I4a, **then** re-open the fused-loop lift with both element-read arms and I4a in place — the lift-widening contract is then satisfied for the dense read, the typed read, and the intrinsic.
 
+### Parity port 3 — the inline global read (`Op::IdentLoad` / `Op::GlobalLoad`) (opened 2026-10-09; probe-first)
+
+**Why.** The per-step path inlines the direct-mapped global-value fast cell for both `LoadGlobal` (`compiler.rs::emit_global_read` → `emit_global_read_probe`) and `LoadIdent` (the same probe plus the `globals_unshadowed` gate), falling back to `get_global`/`load_ident` on a miss. The opt path has no such probe: `opt_lower` lowers `Op::GlobalLoad` through `Helper::GetGlobal` and `Op::IdentLoad` through `Helper::LoadIdent` — an unconditional C call per read (the `Op::IdentLoad` comment even says "the global-value cell fast path is a later slice"). So a lifted loop body reading a global pays a full env-chain resolve every iteration. This is the same parity contract the two element-read ports satisfied, and it is the last read-parity gap before the fused-loop lift can widen: **every one of I4a's intrinsic rows reads `Math` (a global) in its loop**, so lifting them as-is regresses them.
+
+**Probe (measured 2026-10-09; the shape is plain).**
+- `scratch/global_read.js`: a `while` body reading a primitive global (`P`) and one reading an object global (`O`) are **both ~1000ms in the opt path vs ~62–78ms per-step (~13-16x)**, on the I4a and pre-I4a binaries alike. `scratch/intrinsic_isolate.js`'s `mathRead` (`Math.PI`) is ~804ms vs ~74ms. It is the read, not the receiver: a `while` body has no compiler-emitted `HoistGlobalGuard` (that is a `for`-loop feature, `compile_hoisted_member_for`), so the per-step 62ms is the inline cell probe and the opt 1000ms is the helper call.
+- The fallback really is a heavy resolve (an env/global walk), unlike the reverted member-cell probe whose fallback `get_member_name` already hit the same cell — so the inline probe should pay here.
+- **Decide: proceed.** A liftable `while` body reading a top-level `var` is ~16x slower under the (default-on) opt tier — a live regression, not just a corpus one.
+
+**The port.** Add a shared `emit_global_read(builder, helpers, abi, atom, gated, fallback)` in `opt_lower`, mirroring `compiler.rs::emit_global_read_probe`: load `ctx.global_object` and `ctx.global_value_cells`; when `gated`, also require `ctx.globals_unshadowed != 0`; require `global != 0`; probe the cell (`cell_name == atom`, `global_id == live id`, `generation == live gen`) → the cached value, else `fallback`. `Op::GlobalLoad` → `fallback = Helper::GetGlobal`, not gated; `Op::IdentLoad` → `fallback = Helper::LoadIdent`, gated. Reuses the existing helper sigs (`abi.sig_bool` = vm + name); no new helper.
+
+**Tests.** A `while` body reading a global, asserting the value matches the interpreter and that the fallback helper runs under a threshold (a counting wrapper on `LoadIdent`/`GetGlobal`, as the element-read tests count `get_member_computed`); a shadowed global (the `globals_unshadowed` gate must miss so the shadowed value is read); and a mid-loop global mutation (the generation bump must miss to the helper).
+
+**Gate.** §6's gate. **Ordering:** land this before re-opening the fused-loop lift; it is the last read-parity port and directly enables the intrinsic rows.
+
 ### I5 — trial inlining, in full (opened 2026-10-08; probe-first)
 
 Inline a monomorphic callee's `Step`s at a caller's call site, under a size budget, recursing. Targets (`optimizing-tier-plan.md` §6): `method_call` 6x, `js_call` 3.6x, `closure_capture`, `hof_methods`, `apply_call`. It is the **enabler of I6**: an allocation can be elided only where the code that allocates and the code that consumes it are one body, so escape analysis has nothing to work on until the call boundary is gone.
