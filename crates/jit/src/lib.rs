@@ -8050,6 +8050,66 @@ run(); run(); run(); run(); run(); run(); run(); run(); run();";
     }
 
     #[test]
+    fn installed_jit_lifted_typed_array_element_read_inlines() {
+        // The IR path's typed-array arm, exercised by a body the tier actually
+        // lifts (a `while` loop, not a `for`, whose fused prologue bails the
+        // lift): the inline typed read must serve the loop with the counting
+        // `get_member_computed` wrapper under 100. Before the port the opt path
+        // lowered every computed read through the helper.
+        static READ_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        extern "C" fn counting_read(ctx: *mut c_void, object: u64, key: u64) -> u64 {
+            READ_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            (runtime::jit::JIT_SLOW_PATHS.get_member_computed)(ctx, object, key)
+        }
+        let mut helpers = runtime_helpers();
+        helpers.get_member_computed = Some(counting_read);
+
+        let source = "function sum(a, n) {\n\
+                        var s = 0;\n\
+                        var i = 0;\n\
+                        while (i < n) { s += a[i & 63]; i = i + 1; }\n\
+                        return s;\n\
+                      }\n\
+                      var u8 = new Uint8Array(64);\n\
+                      for (var j = 0; j < 64; j++) { u8[j] = j; }\n\
+                      var total = sum(u8, 100000);\n\
+                      var oob = u8[99999];\n\
+                      var sk = u8['x'];\n\
+                      total + (oob === undefined ? 1 : 0) + (sk === undefined ? 1 : 0);";
+        let interp = {
+            let mut agent = runtime::Agent::new();
+            agent.initialize_host_defined_realm().expect("realm");
+            agent.run_script(source).expect("interp runs")
+        };
+
+        extern "C" fn noop_drop(_cache: *mut c_void) {}
+        let mut agent = runtime::Agent::new();
+        agent.initialize_host_defined_realm().expect("realm");
+        let mut cache = JitCache::new(helpers).expect("isa");
+        agent.jit_hook = Some(runtime::jit::JitHook {
+            cache: (&mut cache as *mut JitCache) as *mut c_void,
+            lookup: jit_cache_lookup,
+            drop_cache: noop_drop,
+            helpers: &runtime::jit::JIT_SLOW_PATHS,
+        });
+        let value = agent.run_script(source).expect("jit runs");
+        let compiled = cache.compiled_count();
+        agent.jit_hook = None;
+        assert_eq!(value, interp, "the typed read must match the interpreter");
+        assert!(compiled >= 1, "{compiled} bodies must compile");
+        // The `workers` build cfg's the shared-buffer block layout, so the
+        // typed-array lane declines to the helper there (as the store does) and
+        // every read counts; the inline assertion is single-agent-only.
+        if !crux::typed_array::WORKERS {
+            let reads = READ_CALLS.load(std::sync::atomic::Ordering::Relaxed);
+            assert!(
+                reads < 100,
+                "the lifted read loop must inline the typed-array element read ({reads} get_member_computed calls)"
+            );
+        }
+    }
+
+    #[test]
     fn installed_jit_computed_read_cell_inlines() {
         // G8: a compiled `o[k]` read with a String key over an own data property
         // must serve from the computed-read cell — the counting wrapper proves

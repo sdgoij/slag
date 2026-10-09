@@ -13,7 +13,7 @@ use cranelift_codegen::ir::{
     types,
 };
 use cranelift_codegen::isa::{CallConv, TargetIsa};
-use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
+use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Variable};
 use crux::Value as JsValue;
 use runtime::jit::{
     DISPATCH_DEOPT, JitCallContext, VM_COMPLETION_IS_EMPTY_OFFSET, VM_COMPLETION_OFFSET,
@@ -675,11 +675,10 @@ fn lower_inst(
     })
 }
 
-/// The inline computed element read: a dense Array's canonical-index element
-/// (the read mirror of the append), declining to `get_member_computed` for any
-/// other receiver, key, or a hole. Ports the per-step `emit_element_read`'s
-/// dense arm (`.agents/skills/slag-dense-arrays` §8); the typed-array arm is
-/// not yet ported and declines to the helper.
+/// The inline computed element read: a dense Array's canonical-index element or
+/// a numeric TypedArray element, declining to `get_member_computed` for any
+/// other receiver, key, or shape. Ports the per-step `emit_element_read`'s dense
+/// and typed arms (`.agents/skills/slag-dense-arrays` §8).
 fn emit_element_read(
     builder: &mut FunctionBuilder,
     helpers: &JitHelpers,
@@ -689,9 +688,8 @@ fn emit_element_read(
 ) -> Result<ClifValue, Unsupported> {
     let value = builder.declare_var(types::I64);
     let kind = builder.create_block();
-    let bounds = builder.create_block();
-    let load_blk = builder.create_block();
-    let hit = builder.create_block();
+    let dense = builder.create_block();
+    let typed = builder.create_block();
     let slow = builder.create_block();
     let merge = builder.create_block();
 
@@ -705,8 +703,9 @@ fn emit_element_read(
     builder.ins().brif(obj_ok, kind, &[], slow, &[]);
     builder.seal_block(kind);
 
-    // The dense cursor: `array_dense` is non-null iff the dense representation
-    // is active (a spill clears it), so it IS the dense switch.
+    // The receiver pointer and the dense cursor: `array_dense` is non-null iff
+    // the dense representation is active (a spill clears it), so it IS the
+    // dense switch; otherwise the object may be a numeric TypedArray.
     builder.switch_to_block(kind);
     let obj_ptr = builder.ins().band_imm_u(object, crux::PAYLOAD_MASK as i64);
     let obj_ptr = builder.ins().ishl_imm_u(obj_ptr, 4);
@@ -720,14 +719,54 @@ fn emit_element_read(
         Offset32::new(std::mem::offset_of!(crux::JsObject, array_dense) as i32),
     );
     let is_dense = builder.ins().icmp_imm_u(IntCC::NotEqual, dense_base, 0);
-    builder.ins().brif(is_dense, bounds, &[], slow, &[]);
-    builder.seal_block(bounds);
+    builder.ins().brif(is_dense, dense, &[], typed, &[]);
+    builder.seal_block(dense);
+    builder.seal_block(typed);
+    emit_dense_element_read(builder, dense_base, key, dense, value, slow, merge);
+    emit_typed_element_read(builder, obj_ptr, key, typed, value, slow, merge);
+
+    // The helper: the full `[[Get]]` interns the key, serves a prototype
+    // element or accessor, and every other shape.
+    builder.seal_block(slow);
+    builder.switch_to_block(slow);
+    let res = call_helper(
+        builder,
+        helpers,
+        abi,
+        abi.sig_unary,
+        Helper::GetMemberComputed,
+        &[object, key],
+    )?;
+    builder.def_var(value, res);
+    builder.ins().jump(merge, &[]);
+
+    builder.seal_block(merge);
+    builder.switch_to_block(merge);
+    Ok(builder.use_var(value))
+}
+
+/// The dense-Array arm of [`emit_element_read`]: the canonical-index gate, the
+/// `idx < elem_len` bound, and the hole decline to `slow`. A hole is
+/// spec-absent, so the chain may serve it — it must never be returned; a stored
+/// `undefined` IS a real value and is served.
+fn emit_dense_element_read(
+    builder: &mut FunctionBuilder,
+    dense_base: ClifValue,
+    key: ClifValue,
+    entry: Block,
+    value: Variable,
+    slow: Block,
+    merge: Block,
+) {
+    let in_len = builder.create_block();
+    let load_blk = builder.create_block();
+    let hit = builder.create_block();
 
     // The canonical-index gate: `idx = ToUint64Sat(num)` round-trips exactly
     // when `num` is an integral double below 2^32-1, rejecting fractional,
     // negative, huge and non-double keys (a NaN-boxed heap value bitcasts to a
     // NaN, whose compare fails).
-    builder.switch_to_block(bounds);
+    builder.switch_to_block(entry);
     let num = builder.ins().bitcast(types::F64, MemFlagsData::new(), key);
     let max = builder.ins().f64const(4294967295.0);
     let lt_max = builder.ins().fcmp(FloatCC::LessThan, num, max);
@@ -735,7 +774,6 @@ fn emit_element_read(
     let back = builder.ins().fcvt_from_uint(types::F64, idx);
     let integral = builder.ins().fcmp(FloatCC::Equal, back, num);
     let key_ok = builder.ins().band(integral, lt_max);
-    let in_len = builder.create_block();
     builder.ins().brif(key_ok, in_len, &[], slow, &[]);
     builder.seal_block(in_len);
 
@@ -776,25 +814,257 @@ fn emit_element_read(
     builder.switch_to_block(hit);
     builder.def_var(value, bits);
     builder.ins().jump(merge, &[]);
+}
 
-    // The helper: the full `[[Get]]` interns the key, serves a prototype
-    // element or accessor, and every non-dense shape.
-    builder.seal_block(slow);
-    builder.switch_to_block(slow);
-    let res = call_helper(
-        builder,
-        helpers,
-        abi,
-        abi.sig_unary,
-        Helper::GetMemberComputed,
-        &[object, key],
-    )?;
-    builder.def_var(value, res);
-    builder.ins().jump(merge, &[]);
+/// The numeric-TypedArray arm of [`emit_element_read`], the read mirror of the
+/// per-step `emit_typed_array_read_into`. The geometry gate is a READ gate: a
+/// detached buffer covers no element (the helper returns `undefined`), a
+/// resizable buffer is declined (a fixed view's `array_length` is the effective
+/// length only while the buffer has not shrunk below it), and a null data
+/// pointer declines before any load. `immutable` is deliberately NOT checked —
+/// reads of an immutable buffer are allowed. Float16 and the BigInt kinds are
+/// absent (a soft-float decode / a BigInt allocation) and decline.
+fn emit_typed_element_read(
+    builder: &mut FunctionBuilder,
+    obj_ptr: ClifValue,
+    key: ClifValue,
+    entry: Block,
+    value: Variable,
+    slow: Block,
+    merge: Block,
+) {
+    // (discriminant, element width in bytes, signed, float).
+    const KINDS: [(u8, u8, bool, bool); 9] = [
+        (crux::typed_array::ElementType::Uint8 as u8, 1, false, false),
+        (
+            crux::typed_array::ElementType::Uint8Clamped as u8,
+            1,
+            false,
+            false,
+        ),
+        (crux::typed_array::ElementType::Int8 as u8, 1, true, false),
+        (crux::typed_array::ElementType::Int16 as u8, 2, true, false),
+        (
+            crux::typed_array::ElementType::Uint16 as u8,
+            2,
+            false,
+            false,
+        ),
+        (crux::typed_array::ElementType::Int32 as u8, 4, true, false),
+        (
+            crux::typed_array::ElementType::Uint32 as u8,
+            4,
+            false,
+            false,
+        ),
+        (
+            crux::typed_array::ElementType::Float32 as u8,
+            4,
+            false,
+            true,
+        ),
+        (
+            crux::typed_array::ElementType::Float64 as u8,
+            8,
+            false,
+            true,
+        ),
+    ];
+    builder.switch_to_block(entry);
+    if crux::typed_array::WORKERS {
+        builder.ins().jump(slow, &[]);
+        return;
+    }
+    let geom = builder.create_block();
+    let key_gate = builder.create_block();
+    let mut tests: Vec<Block> = Vec::with_capacity(KINDS.len());
+    let mut convs: Vec<Block> = Vec::with_capacity(KINDS.len());
+    for _ in 0..KINDS.len() {
+        tests.push(builder.create_block());
+        convs.push(builder.create_block());
+    }
+    // The typed-array gate: the object's `typed_array` cell (the slots box base,
+    // or 0 when the object is not Integer-Indexed).
+    let slots_base = builder.ins().load(
+        types::I64,
+        MemFlagsData::new(),
+        obj_ptr,
+        Offset32::new(std::mem::offset_of!(crux::JsObject, typed_array) as i32),
+    );
+    let slots_ok = builder.ins().icmp_imm_u(IntCC::NotEqual, slots_base, 0);
+    builder.ins().brif(slots_ok, geom, &[], slow, &[]);
+    builder.seal_block(geom);
+    builder.switch_to_block(geom);
+    let slots_ptr = builder
+        .ins()
+        .iadd_imm_s(slots_base, crux::heap::GCBOX_DATA_OFFSET as i64);
+    let etype = builder.ins().load(
+        types::I8,
+        MemFlagsData::new(),
+        slots_ptr,
+        Offset32::new(std::mem::offset_of!(crux::object::TypedArraySlots, element_type) as i32),
+    );
+    const STATE_OFFSET: usize = std::mem::offset_of!(crux::object::TypedArraySlots, buffer)
+        + std::mem::offset_of!(crux::typed_array::SharedBuffer, state);
+    const FLAGS_OFFSET: usize = std::mem::offset_of!(crux::object::TypedArraySlots, buffer)
+        + std::mem::offset_of!(crux::typed_array::SharedBuffer, flags);
+    let state_addr = builder.ins().load(
+        types::I64,
+        MemFlagsData::new(),
+        slots_ptr,
+        Offset32::new(STATE_OFFSET as i32),
+    );
+    let flags_addr = builder.ins().load(
+        types::I64,
+        MemFlagsData::new(),
+        slots_ptr,
+        Offset32::new(FLAGS_OFFSET as i32),
+    );
+    let data = builder.ins().load(
+        types::I64,
+        MemFlagsData::new(),
+        state_addr,
+        Offset32::new(std::mem::offset_of!(crux::typed_array::BlockState, data) as i32),
+    );
+    let detached = builder.ins().load(
+        types::I8,
+        MemFlagsData::new(),
+        flags_addr,
+        Offset32::new(std::mem::offset_of!(crux::typed_array::BufferFlags, detached) as i32),
+    );
+    let resizable = builder.ins().load(
+        types::I8,
+        MemFlagsData::new(),
+        flags_addr,
+        Offset32::new(std::mem::offset_of!(crux::typed_array::BufferFlags, resizable) as i32),
+    );
+    let arr_len = builder.ins().load(
+        types::I64,
+        MemFlagsData::new(),
+        slots_ptr,
+        Offset32::new(std::mem::offset_of!(crux::object::TypedArraySlots, array_length) as i32),
+    );
+    let byte_offset = builder.ins().load(
+        types::I64,
+        MemFlagsData::new(),
+        slots_ptr,
+        Offset32::new(std::mem::offset_of!(crux::object::TypedArraySlots, byte_offset) as i32),
+    );
+    let det_ok = builder.ins().icmp_imm_u(IntCC::Equal, detached, 0);
+    let res_ok = builder.ins().icmp_imm_u(IntCC::Equal, resizable, 0);
+    let has_data = builder.ins().icmp_imm_u(IntCC::NotEqual, data, 0);
+    let geom_ok = builder.ins().band(det_ok, res_ok);
+    let geom_ok = builder.ins().band(geom_ok, has_data);
+    builder.ins().brif(geom_ok, key_gate, &[], slow, &[]);
+    builder.seal_block(key_gate);
+    // The key gate + bounds (the dense arm's gate, plus the element-count bound).
+    builder.switch_to_block(key_gate);
+    let num = builder.ins().bitcast(types::F64, MemFlagsData::new(), key);
+    let max = builder.ins().f64const(4294967295.0);
+    let lt_max = builder.ins().fcmp(FloatCC::LessThan, num, max);
+    let idx = builder.ins().fcvt_to_uint_sat(types::I64, num);
+    let back = builder.ins().fcvt_from_uint(types::F64, idx);
+    let integral = builder.ins().fcmp(FloatCC::Equal, back, num);
+    let in_bounds = builder.ins().icmp(IntCC::UnsignedLessThan, idx, arr_len);
+    let key_ok = builder.ins().band(integral, lt_max);
+    let read_ok = builder.ins().band(key_ok, in_bounds);
+    let base = builder.ins().iadd(data, byte_offset);
+    builder.ins().brif(read_ok, tests[0], &[], slow, &[]);
+    builder.seal_block(tests[0]);
+    // The element-kind dispatch: one test per supported kind, chained; the last
+    // kind's miss is `slow`.
+    for i in 0..KINDS.len() {
+        builder.switch_to_block(tests[i]);
+        let matches = builder
+            .ins()
+            .icmp_imm_u(IntCC::Equal, etype, KINDS[i].0 as i64);
+        let next = if i + 1 < KINDS.len() {
+            tests[i + 1]
+        } else {
+            slow
+        };
+        builder.ins().brif(matches, convs[i], &[], next, &[]);
+        builder.seal_block(convs[i]);
+        if i + 1 < KINDS.len() {
+            builder.seal_block(tests[i + 1]);
+        }
+    }
+    for (i, &(_, width, signed, float)) in KINDS.iter().enumerate() {
+        builder.switch_to_block(convs[i]);
+        let shift = match width {
+            1 => 0,
+            2 => 1,
+            4 => 2,
+            _ => 3,
+        };
+        let scaled = if shift == 0 {
+            idx
+        } else {
+            builder.ins().ishl_imm_u(idx, shift)
+        };
+        let addr = builder.ins().iadd(base, scaled);
+        let bits = if float {
+            emit_typed_element_float(builder, addr, width)
+        } else {
+            emit_typed_element_number(builder, addr, width, signed)
+        };
+        builder.def_var(value, bits);
+        builder.ins().jump(merge, &[]);
+    }
+}
 
-    builder.seal_block(merge);
-    builder.switch_to_block(merge);
-    Ok(builder.use_var(value))
+/// Load a numeric TypedArray element at `addr` and convert it to NaN-boxed
+/// Number bits: `width` bytes, `signed` selecting sign- vs zero-extension.
+fn emit_typed_element_number(
+    builder: &mut FunctionBuilder,
+    addr: ClifValue,
+    width: u8,
+    signed: bool,
+) -> ClifValue {
+    debug_assert!(width < 8, "8-byte integer elements are BigInt (declined)");
+    let loaded = match width {
+        1 => builder
+            .ins()
+            .load(types::I8, MemFlagsData::new(), addr, Offset32::new(0)),
+        2 => builder
+            .ins()
+            .load(types::I16, MemFlagsData::new(), addr, Offset32::new(0)),
+        _ => builder
+            .ins()
+            .load(types::I32, MemFlagsData::new(), addr, Offset32::new(0)),
+    };
+    let wide = if signed {
+        builder.ins().sextend(types::I64, loaded)
+    } else {
+        builder.ins().uextend(types::I64, loaded)
+    };
+    let num = if signed {
+        builder.ins().fcvt_from_sint(types::F64, wide)
+    } else {
+        builder.ins().fcvt_from_uint(types::F64, wide)
+    };
+    builder.ins().bitcast(types::I64, MemFlagsData::new(), num)
+}
+
+/// Load a Float32/Float64 TypedArray element at `addr` as NaN-boxed Number bits
+/// (a Float64's stored bytes are already its Number bits; a Float32 widens).
+fn emit_typed_element_float(
+    builder: &mut FunctionBuilder,
+    addr: ClifValue,
+    width: u8,
+) -> ClifValue {
+    if width == 4 {
+        let raw = builder
+            .ins()
+            .load(types::I32, MemFlagsData::new(), addr, Offset32::new(0));
+        let narrow = builder.ins().bitcast(types::F32, MemFlagsData::new(), raw);
+        let wide = builder.ins().fpromote(types::F64, narrow);
+        builder.ins().bitcast(types::I64, MemFlagsData::new(), wide)
+    } else {
+        builder
+            .ins()
+            .load(types::I64, MemFlagsData::new(), addr, Offset32::new(0))
+    }
 }
 
 /// Emit a helper call with the pending-error ABI: with no try machinery a
