@@ -192,6 +192,11 @@ pub enum Imm {
     Arg(u32),
     /// An interned property/binding name atom.
     Atom(u32),
+    /// A context (environment) slot: `depth` chain links out, slot `index`.
+    Context {
+        depth: u32,
+        index: u32,
+    },
     /// Raw 64 bits (a NaN-boxed `Value` or an identity).
     U64(u64),
 }
@@ -234,6 +239,15 @@ pub enum Op {
     /// (`Step::LoadIdent`), lowered through the same `load_ident` helper the
     /// per-step path uses on its slow path.
     IdentLoad,
+    /// A context (environment) slot read (`Step::LoadContextSlot`), lowered
+    /// through the `load_context` helper (the env walk the interpreter shares).
+    ContextLoad,
+    /// A context slot store (`Step::StoreContextSlot`), lowered through
+    /// `store_context`; `args = [value]`.
+    ContextStore,
+    /// A context slot init (`Step::InitContextSlot`), lowered through
+    /// `init_context`; `args = [value]`.
+    ContextInit,
     MemberLoad,
     MemberStore,
     /// A speculative member-value cell load: `object`'s `atom` data-property
@@ -380,7 +394,10 @@ impl Op {
             | Op::ObjectInitName
             | Op::ArgsBase
             | Op::ArgsPush
-            | Op::ArgsSpread => E::call(),
+            | Op::ArgsSpread
+            | Op::ContextLoad
+            | Op::ContextStore
+            | Op::ContextInit => E::call(),
         }
     }
 }

@@ -356,14 +356,17 @@ fn stack_delta(step: &Step) -> Result<i32, Unsupported> {
         | Step::Dup
         | Step::LoadLocal { .. }
         | Step::LoadGlobal { .. }
-        | Step::LoadIdent { .. } => 1,
+        | Step::LoadIdent { .. }
+        | Step::LoadContextSlot { .. } => 1,
         Step::Pop
         | Step::StoreLocal { .. }
         | Step::InitLocal { .. }
         | Step::FusedStoreLocal { .. }
         | Step::Binary(_)
         | Step::GetMemberComputed
-        | Step::SetCompletion => -1,
+        | Step::SetCompletion
+        | Step::StoreContextSlot { .. }
+        | Step::InitContextSlot { .. } => -1,
         // `BinaryImm` pops its left operand and pushes the result, a member
         // read pops the receiver and pushes the value; the rest are net-neutral.
         Step::BinaryImm { .. }
@@ -696,6 +699,49 @@ fn emit_step(
                 Imm::Atom(*name),
             );
             stack.push(v);
+        }
+        // A captured-variable read/write (`LoadContextSlot`/
+        // `StoreContextSlot`/`InitContextSlot`): the shared env-walk helpers,
+        // exactly the per-step path's slow path.
+        Step::LoadContextSlot { depth, index } => {
+            let v = builder.emit(
+                block,
+                Op::ContextLoad,
+                &[],
+                Type::Unknown,
+                Op::ContextLoad.default_effects(),
+                Imm::Context {
+                    depth: *depth as u32,
+                    index: *index as u32,
+                },
+            );
+            stack.push(v);
+        }
+        Step::StoreContextSlot { depth, index } => {
+            let value = stack.pop().ok_or(Unsupported::Stack)?;
+            builder.emit_void(
+                block,
+                Op::ContextStore,
+                &[value],
+                Op::ContextStore.default_effects(),
+                Imm::Context {
+                    depth: *depth as u32,
+                    index: *index as u32,
+                },
+            );
+        }
+        Step::InitContextSlot { index } => {
+            let value = stack.pop().ok_or(Unsupported::Stack)?;
+            builder.emit_void(
+                block,
+                Op::ContextInit,
+                &[value],
+                Op::ContextInit.default_effects(),
+                Imm::Context {
+                    depth: 0,
+                    index: *index as u32,
+                },
+            );
         }
         Step::StoreLocal { slot } => {
             let value = stack.pop().ok_or(Unsupported::Stack)?;

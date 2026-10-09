@@ -664,6 +664,62 @@ fn lower_inst(
             };
             emit_global_read(builder, helpers, abi, *atom, true, Helper::LoadIdent)?
         }
+        // A lifted `LoadContextSlot`: the shared env-walk helper. `Imm::Context`
+        // carries (depth, index).
+        Op::ContextLoad => {
+            let Imm::Context { depth, index } = &inst.imm else {
+                return Err(Unsupported::Step("opt:context"));
+            };
+            let depth = builder.ins().iconst(types::I64, *depth as i64);
+            let slot = builder.ins().iconst(types::I64, *index as i64);
+            call_helper(
+                builder,
+                helpers,
+                abi,
+                abi.sig_unary,
+                Helper::LoadContext,
+                &[depth, slot],
+            )?
+        }
+        // A lifted `StoreContextSlot`: `args = [value]`.
+        Op::ContextStore => {
+            let Imm::Context { depth, index } = &inst.imm else {
+                return Err(Unsupported::Step("opt:context"));
+            };
+            let value = arg(0)?;
+            let depth = builder.ins().iconst(types::I64, *depth as i64);
+            let slot = builder.ins().iconst(types::I64, *index as i64);
+            call_helper(
+                builder,
+                helpers,
+                abi,
+                abi.sig_binary,
+                Helper::StoreContext,
+                &[depth, slot, value],
+            )?;
+            builder
+                .ins()
+                .iconst(types::I64, JsValue::Undefined.bits() as i64)
+        }
+        // A lifted `InitContextSlot`: `args = [value]` (depth 0).
+        Op::ContextInit => {
+            let Imm::Context { index, .. } = &inst.imm else {
+                return Err(Unsupported::Step("opt:context"));
+            };
+            let value = arg(0)?;
+            let slot = builder.ins().iconst(types::I64, *index as i64);
+            call_helper(
+                builder,
+                helpers,
+                abi,
+                abi.sig_unary,
+                Helper::InitContext,
+                &[slot, value],
+            )?;
+            builder
+                .ins()
+                .iconst(types::I64, JsValue::Undefined.bits() as i64)
+        }
         // A general call (I5c-0): `args = [this, callee, a1..aN]`. The identity
         // lowering materializes the arguments at the working-region base and
         // runs the general `call_slow` helper, so a calling body enters the
