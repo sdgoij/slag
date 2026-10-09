@@ -1106,3 +1106,36 @@ the census reports such rows as "fully lifting" when the real lift `opt bail`s.
   use a body the lift actually accepts (a straight-line body called past
   `JIT_COMPILE_THRESHOLD`, or the exact acc-path loop shape) — verify with
   `cargo test -p jit --lib <name> -- --test-threads=1`.
+
+## 25. The optimizing tier's call lane is the per-step leaf lane, not `call_slow`
+
+A lifted call body must inline its certified leaf callee. `opt_lower`'s
+`Op::Call` lowers through `emit_leaf_call` (the G port), reproducing the
+per-step `emit_call`: the record-reuse gate, the probe/restamp miss split, the
+in-frame/aliased/fill/env lanes, the certified lane, and `call_slow` only as
+the universal fallback. Before it, the opt `Op::Call` ran `call_slow`
+unconditionally, so admitting a call-heavy body to the tier *regressed* it
+(the F10 negative: a leaf call went from inlined to one `call_slow` per
+iteration).
+
+- **The lane is not separable.** The leaf record the hit path reads is written
+  only by the *probe* (`leaf_call_probe`), which is part of the lane, so a
+  "read the record + call the entry" partial always misses. G-a alone (the
+  in-frame lane with `call_slow` on every miss) is inert; the probe lane is what
+  makes it pay.
+- **The opt IR has no push stack, so the argument region is `Abi::work`.** The
+  args are materialized at the working-region base (`Op::Call` already does
+  this), the leaf frame carves above them, and the call yields an SSA result
+  (`emit_leaf_result_tail`: the pending-byte check then the value — no sp
+  restore).
+- **The non-aliased probe frame sits at `args_ptr + argc*8`.** The per-step
+  computed that as its runtime `sp`; the opt lane must compute `args_top`
+  explicitly (`fill_leaf_frame` fills there). The aliased frame IS the args
+  region, and only that case uses the compiled room check (the non-aliased and
+  probe paths let the helpers do the full frame-size check).
+- **Verify with a body that lifts AND calls.** The `s = s + leaf(i)` loop shape
+  lifts; the `s += leaf(i)` fused-store head bails at `FastLoopHead` (section
+  24). A callee carrying a step the lift refuses stops being a certified leaf,
+  so it cannot be used to "calibrate" the opt count — `installed_jit_opt_tier_
+  leaf_call_inlines_not_call_slow` asserts `opt_compiled_count >= 2` (caller +
+  callee) and a small `call_slow` count instead.

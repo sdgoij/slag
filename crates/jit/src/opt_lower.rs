@@ -17,8 +17,11 @@ use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Variable};
 use crux::Value as JsValue;
 use runtime::ir::{GLOBAL_CELLS, INTRINSICS, Intrinsic};
 use runtime::jit::{
-    DISPATCH_DEOPT, GlobalValueCell, JitCallContext, VM_COMPLETION_IS_EMPTY_OFFSET,
-    VM_COMPLETION_OFFSET, VM_IP_OFFSET,
+    AGENT_REALM_COUNT_OFFSET, CertifiedInlineInfo, DISPATCH_DEOPT, GlobalValueCell, JitCallContext,
+    LEAF_CALL_RECORD_SHIFT, LeafCallRecord, LeafInlineInfo, VM_ASYNC_FOR_OF_STACK_LEN_OFFSET,
+    VM_COMPLETION_IS_EMPTY_OFFSET, VM_COMPLETION_OFFSET, VM_DESTRUCTURE_STACK_LEN_OFFSET,
+    VM_ENV_STACK_LEN_OFFSET, VM_FOR_IN_STACK_LEN_OFFSET, VM_FOR_OF_BOUNDARIES_LEN_OFFSET,
+    VM_FOR_OF_STACK_LEN_OFFSET, VM_IP_OFFSET, VM_PENDING_LEN_OFFSET, VM_TRY_STACK_LEN_OFFSET,
 };
 use syntax::ast::{BinaryOp, UnaryOp};
 
@@ -82,6 +85,12 @@ struct Abi {
     /// The `(vm, callee, this, argc, args, direct_eval)` signature of the
     /// general `call_slow` helper.
     sig_call_slow: SigRef,
+    /// The `(vm, callee, args, argc, slot)` signature of the env-lane helper
+    /// (`leaf_call_env`), which performs the whole call.
+    sig_call: SigRef,
+    /// The `(frame, stack, ctx) -> value` signature of a compiled body's entry —
+    /// the in-frame leaf lane calls the callee's entry with it directly.
+    sig_entry: SigRef,
 }
 
 fn lower(
@@ -133,6 +142,8 @@ fn lower(
         sig_bool: builder.import_signature(helper_sig(&[types::I64; 2], conv)),
         sig_tdz: builder.import_signature(helper_sig(&[types::I64; 1], conv)),
         sig_call_slow: builder.import_signature(helper_sig(&[types::I64; 6], conv)),
+        sig_call: builder.import_signature(helper_sig(&[types::I64; 5], conv)),
+        sig_entry: builder.import_signature(helper_sig(&[types::I64; 3], conv)),
     };
     let undefined = JsValue::Undefined.bits() as i64;
     if loops_to_entry {
@@ -749,10 +760,12 @@ fn lower_inst(
                 .ins()
                 .iconst(types::I64, JsValue::Undefined.bits() as i64)
         }
-        // A general call (I5c-0): `args = [this, callee, a1..aN]`. The identity
-        // lowering materializes the arguments at the working-region base and
-        // runs the general `call_slow` helper, so a calling body enters the
-        // tier; a later slice (I5c-2) splices the callee in place of the call.
+        // A general call (I5c-0 launcher, G lane): `args = [this, callee,
+        // a1..aN]`. The args materialize at the working-region base and the
+        // call lowers through [`emit_leaf_call`] — the per-step leaf-call lane
+        // (record gate, probe, in-frame/env/certified lanes, `call_slow`
+        // fallback) — so a certified leaf callee inlines in machine code
+        // instead of paying `call_slow` per iteration.
         Op::Call => {
             if inst.args.len() < 2 {
                 return Err(Unsupported::Step("opt:call"));
@@ -772,15 +785,7 @@ fn lower_inst(
                 );
             }
             let argc_imm = builder.ins().iconst(types::I64, argc as i64);
-            let dir_imm = builder.ins().iconst(types::I64, 0);
-            call_helper(
-                builder,
-                helpers,
-                abi,
-                abi.sig_call_slow,
-                Helper::CallSlow,
-                &[callee, this, argc_imm, abi.work, dir_imm],
-            )?
+            emit_leaf_call(builder, helpers, abi, callee, this, abi.work, argc_imm)?
         }
         // A lifted `x.f(a, ...)` intrinsic (I4a): `args = [this, callee, a1..aN]`,
         // `imm` the `Intrinsic` discriminant. The lowering reproduces the
@@ -2013,6 +2018,512 @@ fn call_helper(
         bump_leaf_epoch(builder, abi.vm);
     }
     Ok(result)
+}
+
+/// The byte offset of a `LeafInlineInfo` field inside a `LeafCallRecord`
+/// (Cranelift has no `offset_of!`, so the compiled code loads the fields at
+/// these fixed offsets). Mirrors `crate::compiler::leaf_inline_offset`.
+fn leaf_inline_offset(field: usize) -> usize {
+    std::mem::offset_of!(LeafCallRecord, leaf_inline) + field
+}
+
+/// The byte offset of a `CertifiedInlineInfo` field inside a `LeafCallRecord`.
+fn certified_offset(field: usize) -> usize {
+    std::mem::offset_of!(LeafCallRecord, certified) + field
+}
+
+/// The direct-mapped record slot for `callee` — the same hash the runtime's
+/// `leaf_record_slot` uses, so the compiled site and the helpers agree.
+fn emit_leaf_record_slot(builder: &mut FunctionBuilder, callee: ClifValue) -> ClifValue {
+    let k = builder
+        .ins()
+        .iconst(types::I64, 0x9E37_79B9_7F4A_7C15u64 as i64);
+    let mixed = builder.ins().imul(callee, k);
+    builder
+        .ins()
+        .ushr_imm_u(mixed, LEAF_CALL_RECORD_SHIFT as i64)
+}
+
+/// Re-validate that the leaf-eligibility state is AT REST — the `Vm` stacks the
+/// probe's verdicts assume empty and the realm count — so a stale-epoch record
+/// can be re-stamped instead of re-probed. Ports the per-step
+/// `emit_leaf_state_at_rest`.
+fn emit_leaf_state_at_rest(builder: &mut FunctionBuilder, abi: &Abi) -> ClifValue {
+    let vm = builder.ins().load(
+        types::I64,
+        MemFlagsData::new(),
+        abi.vm,
+        Offset32::new(std::mem::offset_of!(JitCallContext, vm) as i32),
+    );
+    let mut ok = builder.ins().iconst(types::I64, 1);
+    for offset in [
+        VM_TRY_STACK_LEN_OFFSET,
+        VM_PENDING_LEN_OFFSET,
+        VM_FOR_OF_STACK_LEN_OFFSET,
+        VM_FOR_OF_BOUNDARIES_LEN_OFFSET,
+        VM_FOR_IN_STACK_LEN_OFFSET,
+        VM_ASYNC_FOR_OF_STACK_LEN_OFFSET,
+        VM_DESTRUCTURE_STACK_LEN_OFFSET,
+    ] {
+        let len = builder.ins().load(
+            types::I64,
+            MemFlagsData::new(),
+            vm,
+            Offset32::new(offset as i32),
+        );
+        let empty = builder.ins().icmp_imm_u(IntCC::Equal, len, 0);
+        let empty_64 = builder.ins().uextend(types::I64, empty);
+        ok = builder.ins().band(ok, empty_64);
+    }
+    let env_len = builder.ins().load(
+        types::I64,
+        MemFlagsData::new(),
+        vm,
+        Offset32::new(VM_ENV_STACK_LEN_OFFSET as i32),
+    );
+    let env_ok = builder.ins().icmp_imm_u(IntCC::Equal, env_len, 1);
+    let env_ok_64 = builder.ins().uextend(types::I64, env_ok);
+    ok = builder.ins().band(ok, env_ok_64);
+    let agent = builder.ins().load(
+        types::I64,
+        MemFlagsData::new(),
+        abi.vm,
+        Offset32::new(std::mem::offset_of!(JitCallContext, agent) as i32),
+    );
+    let realm = builder.ins().load(
+        types::I64,
+        MemFlagsData::new(),
+        agent,
+        Offset32::new(AGENT_REALM_COUNT_OFFSET as i32),
+    );
+    let realm_ok = builder.ins().icmp_imm_u(IntCC::Equal, realm, 1);
+    let realm_ok_64 = builder.ins().uextend(types::I64, realm_ok);
+    builder.ins().band(ok, realm_ok_64)
+}
+
+/// The room check for the aliased in-frame carve: the argument region plus the
+/// leaf's working area must fit below the caller's `buf_end` (re-checked because
+/// the base can differ across visits). Ports the per-step `room` check.
+fn emit_leaf_room_check(
+    builder: &mut FunctionBuilder,
+    abi: &Abi,
+    args_ptr: ClifValue,
+    argc: ClifValue,
+    stack_usage: ClifValue,
+) -> ClifValue {
+    let buf_end = builder.ins().load(
+        types::I64,
+        MemFlagsData::new(),
+        abi.vm,
+        Offset32::new(std::mem::offset_of!(JitCallContext, buf_end) as i32),
+    );
+    let argc_bytes = builder.ins().imul_imm_s(argc, 8);
+    let args_top = builder.ins().iadd(args_ptr, argc_bytes);
+    let stack_bytes = builder.ins().imul_imm_s(stack_usage, 8);
+    let top_needed = builder.ins().iadd(args_top, stack_bytes);
+    builder
+        .ins()
+        .icmp(IntCC::UnsignedLessThanOrEqual, top_needed, buf_end)
+}
+
+/// The in-frame leaf tail: call `entry(frame_ptr, stack_ptr, ctx)` and land the
+/// result through [`emit_leaf_result_tail`]. Ports the per-step
+/// `emit_leaf_call_tail`.
+fn emit_leaf_call_tail(
+    builder: &mut FunctionBuilder,
+    abi: &Abi,
+    entry: ClifValue,
+    frame_ptr: ClifValue,
+    stack_ptr: ClifValue,
+    value: Variable,
+    merge: Block,
+) {
+    let inst = builder
+        .ins()
+        .call_indirect(abi.sig_entry, entry, &[frame_ptr, stack_ptr, abi.vm]);
+    let result = builder.func.dfg.inst_results(inst)[0];
+    emit_leaf_result_tail(builder, abi, result, value, merge);
+}
+
+/// Land a leaf call's result: check the pending byte (a throwing leaf slow path
+/// bails the whole body), then bind the result to `value` and jump to `merge`.
+/// The opt IR has no sp to restore, so this is the per-step result tail minus
+/// the push.
+fn emit_leaf_result_tail(
+    builder: &mut FunctionBuilder,
+    abi: &Abi,
+    result: ClifValue,
+    value: Variable,
+    merge: Block,
+) {
+    let pending = builder
+        .ins()
+        .load(types::I8, MemFlagsData::new(), abi.vm, Offset32::new(0));
+    let ok = builder.ins().icmp_imm_u(IntCC::Equal, pending, 0);
+    let cont = builder.create_block();
+    let err = builder.create_block();
+    builder.ins().brif(ok, cont, &[], err, &[]);
+    builder.switch_to_block(err);
+    let undef = builder
+        .ins()
+        .iconst(types::I64, JsValue::Undefined.bits() as i64);
+    builder.ins().return_(&[undef]);
+    builder.switch_to_block(cont);
+    builder.def_var(value, result);
+    builder.ins().jump(merge, &[]);
+}
+
+/// The opt-tier call (`.notes/optimizing-tier-impl.md` §6 G): reproduce the
+/// per-step leaf-call lane — the record-reuse gate, the probe/restamp miss
+/// split, the in-frame/aliased/fill/env lanes and the certified lane — with
+/// `call_slow` as the universal fallback, so a lifted call-heavy body inlines
+/// a certified leaf callee exactly like the per-step path instead of always
+/// paying `call_slow`. The opt IR has no push stack, so the arguments are the
+/// caller's working-region base (`args_ptr`) and the leaf frame carves above
+/// it; the call yields its result as an SSA value (the pending-byte check then
+/// the value — no sp restore).
+fn emit_leaf_call(
+    builder: &mut FunctionBuilder,
+    helpers: &JitHelpers,
+    abi: &Abi,
+    callee: ClifValue,
+    this: ClifValue,
+    args_ptr: ClifValue,
+    argc: ClifValue,
+) -> Result<ClifValue, Unsupported> {
+    let value = builder.declare_var(types::I64);
+    let slow = builder.create_block();
+    // C1: the certified-callee lane a leaf miss is first offered. A direct-eval
+    // call would skip it, but the opt lift never produces one (direct eval
+    // takes the vector form), so it is always present.
+    let cert = builder.create_block();
+    let merge = builder.create_block();
+    let probe_block = builder.create_block();
+
+    // G21: a call whose callee IS the running closure skips the probe
+    // machinery and takes `call_slow`'s compiled self-call path. The identity
+    // is the full 64 NaN-box bits; `current_function` is 0 outside a function
+    // body, which no real callee equals.
+    let leaf = builder.create_block();
+    let cf = builder.ins().load(
+        types::I64,
+        MemFlagsData::new(),
+        abi.vm,
+        Offset32::new(std::mem::offset_of!(JitCallContext, current_function) as i32),
+    );
+    let is_self = builder.ins().icmp(IntCC::Equal, callee, cf);
+    let non_null = builder.ins().icmp_imm_u(IntCC::NotEqual, cf, 0);
+    let gate = builder.ins().band(is_self, non_null);
+    builder.ins().brif(gate, slow, &[], leaf, &[]);
+    builder.switch_to_block(leaf);
+
+    let slot = emit_leaf_record_slot(builder, callee);
+    let slot_bytes = builder
+        .ins()
+        .imul_imm_s(slot, std::mem::size_of::<LeafCallRecord>() as i64);
+    let records_base = builder.ins().load(
+        types::I64,
+        MemFlagsData::new(),
+        abi.vm,
+        Offset32::new(std::mem::offset_of!(JitCallContext, leaf_records) as i32),
+    );
+    let cache = builder.ins().iadd(records_base, slot_bytes);
+    // The record-reuse gate: the code generation, the leaf-eligibility epoch,
+    // and the live callee's exact NaN-box identity all match the record.
+    let code_gen = builder.ins().load(
+        types::I32,
+        MemFlagsData::new(),
+        abi.vm,
+        Offset32::new(std::mem::offset_of!(JitCallContext, leaf_gen) as i32),
+    );
+    let cached_gen = builder.ins().load(
+        types::I32,
+        MemFlagsData::new(),
+        cache,
+        Offset32::new(std::mem::offset_of!(LeafCallRecord, code_gen) as i32),
+    );
+    let gen_ok = builder.ins().icmp(IntCC::Equal, code_gen, cached_gen);
+    let epoch = builder.ins().load(
+        types::I32,
+        MemFlagsData::new(),
+        abi.vm,
+        Offset32::new(std::mem::offset_of!(JitCallContext, leaf_epoch) as i32),
+    );
+    let cached_epoch = builder.ins().load(
+        types::I32,
+        MemFlagsData::new(),
+        cache,
+        Offset32::new(std::mem::offset_of!(LeafCallRecord, epoch) as i32),
+    );
+    let epoch_ok = builder.ins().icmp(IntCC::Equal, epoch, cached_epoch);
+    let callee_hi = builder.ins().ushr_imm_u(callee, 44);
+    let cached_hi = builder.ins().load(
+        types::I32,
+        MemFlagsData::new(),
+        cache,
+        Offset32::new(std::mem::offset_of!(LeafCallRecord, callee_hi) as i32),
+    );
+    let cached_hi = builder.ins().uextend(types::I64, cached_hi);
+    let hi_ok = builder.ins().icmp(IntCC::Equal, callee_hi, cached_hi);
+    let payload = builder.ins().band_imm_u(callee, crux::PAYLOAD_MASK as i64);
+    let cached_payload = builder.ins().load(
+        types::I64,
+        MemFlagsData::new(),
+        cache,
+        Offset32::new(std::mem::offset_of!(LeafCallRecord, callee_payload) as i32),
+    );
+    let payload_ok = builder.ins().icmp(IntCC::Equal, payload, cached_payload);
+    let callee_hit = builder.ins().band(hi_ok, payload_ok);
+    let stable = builder.ins().band(callee_hit, gen_ok);
+    let hit = builder.ins().band(stable, epoch_ok);
+    let cached_entry = builder.ins().load(
+        types::I64,
+        MemFlagsData::new(),
+        cache,
+        Offset32::new(leaf_inline_offset(std::mem::offset_of!(LeafInlineInfo, entry)) as i32),
+    );
+    let hit_block = builder.create_block();
+    let stable_check = builder.create_block();
+    let stale_block = builder.create_block();
+    builder.ins().brif(hit, hit_block, &[], stable_check, &[]);
+    // A miss is either a different site/callee (probe) or a stale epoch. If the
+    // eligibility state is still at rest, the cached verdict is still valid:
+    // re-stamp the epoch and reuse it rather than re-probing every iteration.
+    builder.switch_to_block(stable_check);
+    builder
+        .ins()
+        .brif(stable, stale_block, &[], probe_block, &[]);
+    builder.switch_to_block(stale_block);
+    let state_ok = emit_leaf_state_at_rest(builder, abi);
+    let restamp = builder.create_block();
+    builder.ins().brif(state_ok, restamp, &[], probe_block, &[]);
+    builder.switch_to_block(restamp);
+    builder.ins().store(
+        MemFlagsData::new(),
+        epoch,
+        cache,
+        Offset32::new(std::mem::offset_of!(LeafCallRecord, epoch) as i32),
+    );
+    builder.ins().jump(hit_block, &[]);
+
+    // A cache hit. An environment-using leaf takes the env lane; anything else
+    // is the in-frame lane, where a cached zero entry is a stable rejection.
+    builder.switch_to_block(hit_block);
+    let uses_env = builder.ins().load(
+        types::I32,
+        MemFlagsData::new(),
+        cache,
+        Offset32::new(leaf_inline_offset(std::mem::offset_of!(LeafInlineInfo, uses_env)) as i32),
+    );
+    let env_ok = builder.ins().icmp_imm_u(IntCC::NotEqual, uses_env, 0);
+    let env_lane = builder.create_block();
+    let plain_hit = builder.create_block();
+    builder.ins().brif(env_ok, env_lane, &[], plain_hit, &[]);
+    builder.switch_to_block(plain_hit);
+    let entry_zero = builder.ins().icmp_imm_u(IntCC::Equal, cached_entry, 0);
+    let fast = builder.create_block();
+    builder.ins().brif(entry_zero, cert, &[], fast, &[]);
+
+    // The in-frame hit: an ALIASED frame (the leaf's frame IS the argument
+    // region) is called directly behind the room check; any other frame is
+    // rebuilt above the arguments by `leaf_call_fill`.
+    builder.switch_to_block(fast);
+    let frame_size = builder.ins().load(
+        types::I32,
+        MemFlagsData::new(),
+        cache,
+        Offset32::new(leaf_inline_offset(std::mem::offset_of!(LeafInlineInfo, frame_size)) as i32),
+    );
+    let arity = builder.ins().load(
+        types::I32,
+        MemFlagsData::new(),
+        cache,
+        Offset32::new(leaf_inline_offset(std::mem::offset_of!(LeafInlineInfo, arity)) as i32),
+    );
+    let stack_usage = builder.ins().load(
+        types::I64,
+        MemFlagsData::new(),
+        cache,
+        Offset32::new(leaf_inline_offset(std::mem::offset_of!(LeafInlineInfo, stack_usage)) as i32),
+    );
+    let fs_eq_ar = builder.ins().icmp(IntCC::Equal, frame_size, arity);
+    let frame_size_64 = builder.ins().uextend(types::I64, frame_size);
+    let argc_ge_fs = builder
+        .ins()
+        .icmp(IntCC::UnsignedLessThanOrEqual, frame_size_64, argc);
+    let aliased = builder.ins().band(fs_eq_ar, argc_ge_fs);
+    let room = builder.create_block();
+    let not_aliased = builder.create_block();
+    builder.ins().brif(aliased, room, &[], not_aliased, &[]);
+    builder.switch_to_block(room);
+    let fits = emit_leaf_room_check(builder, abi, args_ptr, argc, stack_usage);
+    let inline = builder.create_block();
+    builder.ins().brif(fits, inline, &[], cert, &[]);
+    builder.switch_to_block(inline);
+    let frame_bytes = builder.ins().imul_imm_s(frame_size_64, 8);
+    let stack_ptr = builder.ins().iadd(args_ptr, frame_bytes);
+    emit_leaf_call_tail(
+        builder,
+        abi,
+        cached_entry,
+        args_ptr,
+        stack_ptr,
+        value,
+        merge,
+    );
+
+    // The non-aliased hit: rebuild the frame from the recorded descriptor
+    // (`leaf_call_fill`, no `leaf_lookup`), then call the cached entry above it.
+    builder.switch_to_block(not_aliased);
+    let fill_ok = builder.ins().load(
+        types::I32,
+        MemFlagsData::new(),
+        cache,
+        Offset32::new(leaf_inline_offset(std::mem::offset_of!(LeafInlineInfo, fill_ok)) as i32),
+    );
+    let fill_ok = builder.ins().icmp_imm_u(IntCC::NotEqual, fill_ok, 0);
+    let fill = builder.create_block();
+    builder.ins().brif(fill_ok, fill, &[], probe_block, &[]);
+    builder.switch_to_block(fill);
+    let filled = call_helper(
+        builder,
+        helpers,
+        abi,
+        abi.sig_call_slow,
+        Helper::LeafCallFill,
+        &[callee, this, args_ptr, argc, slot],
+    )?;
+    let fill_hit = builder.ins().icmp_imm_u(IntCC::NotEqual, filled, 0);
+    let inline_filled = builder.create_block();
+    builder.ins().brif(fill_hit, inline_filled, &[], cert, &[]);
+    builder.switch_to_block(inline_filled);
+    let argc_bytes = builder.ins().imul_imm_s(argc, 8);
+    let frame_base = builder.ins().iadd(args_ptr, argc_bytes);
+    let frame_bytes = builder.ins().imul_imm_s(frame_size_64, 8);
+    let stack_ptr = builder.ins().iadd(frame_base, frame_bytes);
+    emit_leaf_call_tail(builder, abi, filled, frame_base, stack_ptr, value, merge);
+
+    // The env lane: rebuild the frame first (one fill and one room check for
+    // both lanes), then `leaf_call_env` performs the whole call.
+    builder.switch_to_block(env_lane);
+    let filled = call_helper(
+        builder,
+        helpers,
+        abi,
+        abi.sig_call_slow,
+        Helper::LeafCallFill,
+        &[callee, this, args_ptr, argc, slot],
+    )?;
+    let fill_hit = builder.ins().icmp_imm_u(IntCC::NotEqual, filled, 0);
+    let env_call = builder.create_block();
+    builder.ins().brif(fill_hit, env_call, &[], cert, &[]);
+    builder.switch_to_block(env_call);
+    let result = call_helper(
+        builder,
+        helpers,
+        abi,
+        abi.sig_call,
+        Helper::LeafCallEnv,
+        &[callee, args_ptr, argc, slot],
+    )?;
+    // The helper returns `u64::MAX` (no `Value` encoding) to fall back.
+    let env_failed = builder.ins().icmp_imm_u(IntCC::Equal, result, -1);
+    let env_done = builder.create_block();
+    builder.ins().brif(env_failed, cert, &[], env_done, &[]);
+    builder.switch_to_block(env_done);
+    emit_leaf_result_tail(builder, abi, result, value, merge);
+
+    // The probe: the full validation, lookups and frame fill; it records the
+    // cache identity so repeat visits skip it.
+    builder.switch_to_block(probe_block);
+    let probe = call_helper(
+        builder,
+        helpers,
+        abi,
+        abi.sig_call_slow,
+        Helper::LeafCallProbe,
+        &[callee, this, args_ptr, argc, slot],
+    )?;
+    let probe_hit = builder.ins().icmp_imm_u(IntCC::NotEqual, probe, 0);
+    let inline2 = builder.create_block();
+    builder.ins().brif(probe_hit, inline2, &[], cert, &[]);
+    builder.switch_to_block(inline2);
+    let info = builder.ins().iadd_imm_s(
+        cache,
+        std::mem::offset_of!(LeafCallRecord, leaf_inline) as i64,
+    );
+    let frame_size = builder.ins().load(
+        types::I32,
+        MemFlagsData::new(),
+        info,
+        Offset32::new(std::mem::offset_of!(LeafInlineInfo, frame_size) as i32),
+    );
+    let arity = builder.ins().load(
+        types::I32,
+        MemFlagsData::new(),
+        info,
+        Offset32::new(std::mem::offset_of!(LeafInlineInfo, arity) as i32),
+    );
+    let fs_eq_ar = builder.ins().icmp(IntCC::Equal, frame_size, arity);
+    let frame_size_64 = builder.ins().uextend(types::I64, frame_size);
+    let argc_ge_fs = builder
+        .ins()
+        .icmp(IntCC::UnsignedLessThanOrEqual, frame_size_64, argc);
+    let aliased = builder.ins().band(fs_eq_ar, argc_ge_fs);
+    // The probe filled the frame at the argument region (aliased) or just above
+    // it (non-aliased, at `args_top`).
+    let argc_bytes = builder.ins().imul_imm_s(argc, 8);
+    let args_top = builder.ins().iadd(args_ptr, argc_bytes);
+    let frame_ptr = builder.ins().select(aliased, args_ptr, args_top);
+    let frame_bytes = builder.ins().imul_imm_s(frame_size_64, 8);
+    let stack_ptr = builder.ins().iadd(frame_ptr, frame_bytes);
+    emit_leaf_call_tail(builder, abi, probe, frame_ptr, stack_ptr, value, merge);
+
+    // C1: the certified-callee lane. It runs only when the record carries a
+    // certified verdict (a nonzero entry); the helper re-validates the record
+    // identity and returns `u64::MAX` to fall back.
+    builder.switch_to_block(cert);
+    let cert_entry = builder.ins().load(
+        types::I64,
+        MemFlagsData::new(),
+        cache,
+        Offset32::new(certified_offset(std::mem::offset_of!(CertifiedInlineInfo, entry)) as i32),
+    );
+    let has_cert = builder.ins().icmp_imm_u(IntCC::NotEqual, cert_entry, 0);
+    let cert_run = builder.create_block();
+    builder.ins().brif(has_cert, cert_run, &[], slow, &[]);
+    builder.switch_to_block(cert_run);
+    let result = call_helper(
+        builder,
+        helpers,
+        abi,
+        abi.sig_call_slow,
+        Helper::CertifiedCall,
+        &[callee, this, args_ptr, argc, slot],
+    )?;
+    let fallback = builder.ins().icmp_imm_u(IntCC::Equal, result, -1);
+    let cert_done = builder.create_block();
+    builder.ins().brif(fallback, slow, &[], cert_done, &[]);
+    builder.switch_to_block(cert_done);
+    emit_leaf_result_tail(builder, abi, result, value, merge);
+
+    // The slow path: the interpreter's call machinery (unchanged).
+    builder.switch_to_block(slow);
+    let dir_imm = builder.ins().iconst(types::I64, 0);
+    let res = call_helper(
+        builder,
+        helpers,
+        abi,
+        abi.sig_call_slow,
+        Helper::CallSlow,
+        &[callee, this, argc, args_ptr, dir_imm],
+    )?;
+    builder.def_var(value, res);
+    builder.ins().jump(merge, &[]);
+
+    builder.seal_block(merge);
+    builder.switch_to_block(merge);
+    Ok(builder.use_var(value))
 }
 
 /// Emit the shared tail of a speculation guard: branch on `ok`; on failure

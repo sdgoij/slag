@@ -1877,6 +1877,19 @@ fn constant(value: &crux::Value) -> Result<(Imm, Type), Unsupported> {
     if let Some(b) = value.as_boolean() {
         return Ok((Imm::Bool(b), Type::Bool));
     }
+    if value.is_undefined() {
+        return Ok((Imm::U64(crux::Value::Undefined.bits()), Type::Undefined));
+    }
+    if value.is_null() {
+        return Ok((Imm::U64(crux::Value::Null.bits()), Type::Null));
+    }
+    // A heap constant (a string literal) embeds its NaN-boxed pointer bits
+    // directly — sound for the same reason the per-step `const_value` does it:
+    // the box never moves, and the `Push` step the body holds keeps it alive
+    // for the compiled code's lifetime.
+    if value.is_string() {
+        return Ok((Imm::U64(value.bits()), Type::String));
+    }
     Err(Unsupported::Step("Push"))
 }
 
@@ -2421,9 +2434,35 @@ mod tests {
     }
 
     #[test]
-    fn a_non_numeric_constant_is_unsupported() {
-        // A bare `return;` pushes `undefined`, which the constant set omits.
+    fn undefined_null_and_string_constants_lift_but_an_object_does_not() {
+        // The F10 widening: `undefined`/`null` are constant-folded (a call's
+        // `this` is `Push(undefined)`), so a call body can enter the tier, and a
+        // string literal embeds its (non-moving, body-held) box bits.
         let b = body(vec![Step::Push(Value::Undefined), Step::Return], 0);
+        let func = lift(&b).expect("undefined lifts");
+        assert_eq!(func.block(func.entry()).insts[0].ty, Type::Undefined);
+        let b = body(vec![Step::Push(Value::Null), Step::Return], 0);
+        let func = lift(&b).expect("null lifts");
+        assert_eq!(func.block(func.entry()).insts[0].ty, Type::Null);
+        let b = body(
+            vec![
+                Step::Push(Value::String(crux::Handle::new(crux::JsString::from_utf8(
+                    "x",
+                )))),
+                Step::Return,
+            ],
+            0,
+        );
+        let func = lift(&b).expect("a string lifts");
+        assert_eq!(func.block(func.entry()).insts[0].ty, Type::String);
+        // An object constant still refuses (a `Push` should never carry one).
+        let b = body(
+            vec![
+                Step::Push(Value::Object(crux::JsObject::ordinary_object_create(None))),
+                Step::Return,
+            ],
+            0,
+        );
         assert_eq!(lift(&b).unwrap_err(), Unsupported::Step("Push"));
     }
 

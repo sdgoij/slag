@@ -4834,6 +4834,67 @@ run(); run(); run(); run(); run(); run(); run(); run(); run();";
     }
 
     #[test]
+    fn installed_jit_opt_tier_leaf_call_inlines_not_call_slow() {
+        // G (call parity): a call-heavy body that the optimizing tier LIFTS must
+        // still inline its certified leaf callee. The opt `Op::Call` reproduces
+        // the per-step leaf lane, so the site reaches `call_slow` only during
+        // the tier-up window; before G it reached it once per iteration (the
+        // F10 regression). The loop is the `s = s + add(i, 1)` form — the `+=`
+        // fused-store head bails the lift at `FastLoopHead`, so only this shape
+        // enters the tier and exercises the opt lane. Both bodies (`run` and
+        // `add`) opt-compile, so `opt_compiled_count >= 2` proves the caller
+        // lifted (the F10 failure mode needs the caller in the tier).
+        static CALL_SLOW_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        extern "C" fn counting_call_slow(
+            ctx: *mut c_void,
+            callee: u64,
+            this: u64,
+            argc: u64,
+            args: *mut u64,
+            direct_eval: u64,
+        ) -> u64 {
+            CALL_SLOW_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            (runtime::jit::JIT_SLOW_PATHS.call_slow)(ctx, callee, this, argc, args, direct_eval)
+        }
+        let mut helpers = runtime_helpers();
+        helpers.call_slow = Some(counting_call_slow);
+
+        extern "C" fn noop_drop(_cache: *mut c_void) {}
+        let mut agent = runtime::Agent::new();
+        agent.initialize_host_defined_realm().expect("realm");
+        let mut cache = JitCache::new(helpers).expect("isa");
+        agent.jit_hook = Some(runtime::jit::JitHook {
+            cache: (&mut cache as *mut JitCache) as *mut c_void,
+            lookup: jit_cache_lookup,
+            drop_cache: noop_drop,
+            helpers: &runtime::jit::JIT_SLOW_PATHS,
+        });
+        let value = agent
+            .run_script(
+                "function add(a, b) { return a + b; }\n\
+                 function run() {\n\
+                   var s = 0;\n\
+                   for (var i = 0; i < 100000; i++) { s = s + add(i, 1); }\n\
+                   return s;\n\
+                 }\n\
+                 run();",
+            )
+            .expect("runs");
+        let opt_compiled = cache.opt_compiled_count();
+        agent.jit_hook = None;
+        assert_eq!(value.as_number(), Some(5000050000.0));
+        assert!(
+            opt_compiled >= 2,
+            "both the caller and the leaf must lift into the optimizing tier ({opt_compiled} opt bodies)"
+        );
+        let slow = CALL_SLOW_CALLS.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            slow <= 40,
+            "the lifted site must inline the leaf through the opt lane ({slow} call_slow calls)"
+        );
+    }
+
+    #[test]
     fn installed_jit_a_self_recursion_with_a_tail_base_matches_the_interpreter() {
         // Hazard probe for the shared-Vm self path: a strict self-eligible
         // body whose base case is a *tail call* emits `Helper::TailCall`, which
