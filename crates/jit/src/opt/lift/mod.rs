@@ -1082,6 +1082,32 @@ pub(crate) fn blocking_step_names(body: &CompiledBody) -> Vec<&'static str> {
     names
 }
 
+/// A probe aid (`JIT_DUMP_STEPS`): the distinct *step-variant* names in `body`,
+/// including every `LeafOp` inside a `RunRegBody` (prefixed `leaf:`).
+/// `step_name`/`blocking_step_names` are too coarse for the fused-loop
+/// reshaping — they collapse the whole `FastLoop*`/`Builder*`/`RunRegBody`
+/// family into `FusedLoop`, and say nothing about which leaf ops the register
+/// body uses.
+pub(crate) fn shape_census(body: &CompiledBody) -> String {
+    fn variant(debug: &str) -> &str {
+        debug.split(['(', '{', ' ']).next().unwrap_or(debug)
+    }
+    let mut names: Vec<String> = Vec::new();
+    for step in &body.steps {
+        let debug = format!("{step:?}");
+        names.push(variant(&debug).to_string());
+        if let Step::RunRegBody { ops } = step {
+            for op in ops.iter() {
+                let leaf = format!("{op:?}");
+                names.push(format!("leaf:{}", variant(&leaf)));
+            }
+        }
+    }
+    names.sort();
+    names.dedup();
+    names.join(",")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

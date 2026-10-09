@@ -196,6 +196,7 @@ impl JitEngine {
                             "opt-blockers: {}",
                             crate::opt::lift::blocking_step_names(body).join(",")
                         );
+                        eprintln!("opt-shapes: {}", crate::opt::lift::shape_census(body));
                     }
                 }
             }
