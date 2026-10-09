@@ -386,6 +386,9 @@ fn stack_delta(step: &Step) -> Result<i32, Unsupported> {
             direct_eval: false,
             ..
         } => -(*argc as i32) - 1,
+        // The slot/global call forms pop only the `argc` args (`this` is
+        // `undefined` and the callee reads the frame/global).
+        Step::CallFastSlot { argc, .. } | Step::CallFastGlobal { argc, .. } => 1 - (*argc as i32),
         // A `CallIntrinsic` has the same shape as `CallFast`.
         Step::CallIntrinsic { argc, .. } => -(*argc as i32) - 1,
         // The fused canonical loop machinery (the lift-widening slice): the
@@ -897,6 +900,79 @@ fn emit_step(
                 Effects::call(),
                 // The step index, so the inline pass (I5c-2c) can find this
                 // site's feedback record and the guard can resume here.
+                Imm::Int(index as i32),
+            );
+            stack.push(result);
+        }
+        // A `CallFastSlot` (`[a1..aN]`, the callee read from the frame slot and
+        // `this` `undefined`) and a `CallFastGlobal` (`[a1..aN]`, the callee
+        // through the global cell): the same opaque `Op::Call` as `CallFast`.
+        Step::CallFastSlot { slot, argc, .. } => {
+            let argc = *argc as usize;
+            if stack.len() < argc {
+                return Err(Unsupported::Stack);
+            }
+            let args = stack.split_off(stack.len() - argc);
+            let callee = emit_frame_load(builder, block, *slot);
+            let this = builder.emit(
+                block,
+                Op::Const,
+                &[],
+                Type::Unknown,
+                Effects::pure(),
+                Imm::U64(crux::Value::Undefined.bits()),
+            );
+            let mut call_args = Vec::with_capacity(argc + 2);
+            call_args.push(this);
+            call_args.push(callee);
+            call_args.extend(args);
+            let result = builder.emit(
+                block,
+                Op::Call,
+                &call_args,
+                Type::Unknown,
+                Effects::call(),
+                Imm::Int(index as i32),
+            );
+            stack.push(result);
+        }
+        Step::CallFastGlobal {
+            name,
+            argc,
+            direct_eval: false,
+            ..
+        } => {
+            let argc = *argc as usize;
+            if stack.len() < argc {
+                return Err(Unsupported::Stack);
+            }
+            let args = stack.split_off(stack.len() - argc);
+            let callee = builder.emit(
+                block,
+                Op::GlobalLoad,
+                &[],
+                Type::Unknown,
+                Effects::call(),
+                Imm::Atom(*name),
+            );
+            let this = builder.emit(
+                block,
+                Op::Const,
+                &[],
+                Type::Unknown,
+                Effects::pure(),
+                Imm::U64(crux::Value::Undefined.bits()),
+            );
+            let mut call_args = Vec::with_capacity(argc + 2);
+            call_args.push(this);
+            call_args.push(callee);
+            call_args.extend(args);
+            let result = builder.emit(
+                block,
+                Op::Call,
+                &call_args,
+                Type::Unknown,
+                Effects::call(),
                 Imm::Int(index as i32),
             );
             stack.push(result);
