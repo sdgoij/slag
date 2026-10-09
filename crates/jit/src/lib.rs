@@ -226,6 +226,11 @@ pub struct JitCache {
     /// The entry count an eviction leaves behind (a floor below the cap, so
     /// a burst of new bodies does not thrash the cache one entry at a time).
     evict_to: usize,
+    /// How many bodies this cache compiled through the optimizing tier. A
+    /// per-cache signal for the opt-tier tests: the process-global
+    /// `OPT_COMPILED` counter is bumped by every parallel test's cache, so a
+    /// global delta cannot tell whether the body under test lifted.
+    opt_compiled: usize,
 }
 
 /// One cached body: the strong `Rc` (pins the body so its identity cannot
@@ -272,6 +277,7 @@ impl JitCache {
             clock: 0,
             cap,
             evict_to,
+            opt_compiled: 0,
         })
     }
 
@@ -288,7 +294,11 @@ impl JitCache {
             entry.last_used = self.clock;
         } else {
             self.evict_if_needed(in_flight);
-            let compiled = self.engine.compile(body, &self.helpers).map(Rc::new);
+            let (compiled, used_opt) = self.engine.compile_counted(body, &self.helpers);
+            if used_opt {
+                self.opt_compiled += 1;
+            }
+            let compiled = compiled.map(Rc::new);
             self.entries.insert(
                 key,
                 Entry {
@@ -342,6 +352,13 @@ impl JitCache {
             .values()
             .filter(|entry| entry.compiled.is_some())
             .count()
+    }
+
+    /// The number of bodies this cache compiled through the optimizing tier
+    /// (test introspection). Unlike the global `OPT_COMPILED`, this is not
+    /// shared across caches, so a parallel test cannot inflate it.
+    pub fn opt_compiled_count(&self) -> usize {
+        self.opt_compiled
     }
 }
 
@@ -1917,6 +1934,32 @@ mod tests {
         let compiled = cache.compiled_count();
         agent.jit_hook = None;
         (value, compiled)
+    }
+
+    /// Like [`with_opt_jit_agent`], but also returns the number of bodies the
+    /// cache compiled through the optimizing tier. That per-cache count is
+    /// immune to the process-global `OPT_COMPILED` counter's cross-test
+    /// pollution (each parallel test runs its own cache), so an opt-tier test
+    /// asserting on it fails when its own body does not lift — which the
+    /// global delta cannot detect.
+    fn with_opt_jit_agent_counts(
+        f: impl FnOnce(&mut runtime::Agent) -> Value,
+    ) -> (Value, usize, usize) {
+        extern "C" fn noop_drop(_cache: *mut c_void) {}
+        let mut agent = runtime::Agent::new();
+        agent.initialize_host_defined_realm().expect("realm");
+        let mut cache = JitCache::new_with_opt(runtime_helpers()).expect("isa");
+        agent.jit_hook = Some(runtime::jit::JitHook {
+            cache: (&mut cache as *mut JitCache) as *mut c_void,
+            lookup: jit_cache_lookup,
+            drop_cache: noop_drop,
+            helpers: &runtime::jit::JIT_SLOW_PATHS,
+        });
+        let value = f(&mut agent);
+        let compiled = cache.compiled_count();
+        let opt_compiled = cache.opt_compiled_count();
+        agent.jit_hook = None;
+        (value, compiled, opt_compiled)
     }
 
     #[test]
@@ -8254,11 +8297,14 @@ run(); run(); run(); run(); run(); run(); run(); run(); run();";
     }
 
     #[test]
-    fn installed_jit_lifted_for_loop_matches_the_interpreter() {
-        // The fused canonical `for` (the corpus-wide blocker): the counter is
-        // modelled as its binding slot, `FastLoopHead` is the back-edge
-        // terminator, and the register body lowers to IR ops. The body must lift
-        // (`OPT_COMPILED`) and match the interpreter.
+    fn installed_jit_fused_for_loop_falls_back_and_matches_the_interpreter() {
+        // The fused canonical `for` body is REFUSED by the lift today: the head
+        // gate accepts only the accumulator-path (`FastLoopVar::Counter`)
+        // counter, and this `var` counter compiles to the `Slot`/`Some`-slot
+        // fused form the lift declines. So the body runs on the per-step path;
+        // this asserts the value still matches and pins the refusal via the
+        // per-cache opt count (`opt == 0`), so it fails loudly when the head
+        // gate widens and the body starts lifting.
         let source = "function f(n) {\n\
                         var s = 0;\n\
                         for (var i = 0; i < n; i++) { s = s + i; }\n\
@@ -8270,15 +8316,14 @@ run(); run(); run(); run(); run(); run(); run(); run(); run();";
             agent.initialize_host_defined_realm().expect("realm");
             agent.run_script(source).expect("interp runs")
         };
-        let before = crate::opt_lower::OPT_COMPILED.load(std::sync::atomic::Ordering::Relaxed);
-        let (value, compiled) = with_opt_jit_agent(|agent| agent.run_script(source).expect("runs"));
-        let opt_bodies =
-            crate::opt_lower::OPT_COMPILED.load(std::sync::atomic::Ordering::Relaxed) - before;
+        let (value, compiled, opt_bodies) =
+            with_opt_jit_agent_counts(|agent| agent.run_script(source).expect("runs"));
         assert!(compiled >= 1, "{compiled} bodies must compile");
         assert_eq!(value, interp, "the for loop must match the interpreter");
-        assert!(
-            opt_bodies >= 1,
-            "the fused for body must lower through the opt path (got {opt_bodies})"
+        assert_eq!(
+            opt_bodies, 0,
+            "the fused for body is refused by the head gate (got {opt_bodies} opt compiles); \
+             if this changed, the head gate widened — flip this to an opt-path assertion"
         );
     }
 
@@ -8337,29 +8382,28 @@ run(); run(); run(); run(); run(); run(); run(); run(); run();";
 
     #[test]
     fn installed_jit_lifted_literal_creates_match_the_interpreter() {
-        // I6-0a: a `for` body creating an array and an object literal per
-        // iteration (the fused `ArrayFast`/`ObjectFast` creates) lifts to
+        // I6-0a: a straight-line body creating an array and an object literal
+        // (the fused `ArrayFast`/`ObjectFast` creates) lifts to
         // `Op::NewArray`/`Op::NewObject`, lowered through the same fused helpers.
-        // The value must match the interpreter and the opt body must be produced.
-        let source = "function f(n) {\n\
-                        var s = 0;\n\
-                        for (var i = 0; i < n; i++) {\n\
-                          var a = [i, i + 1, i + 2];\n\
-                          var o = { x: i, y: i * 2 };\n\
-                          s = (s + a[0] + a[1] + a[2] + o.x + o.y) | 0;\n\
-                        }\n\
-                        return s;\n\
+        // The body must be straight-line and called past `JIT_COMPILE_THRESHOLD`:
+        // a `for`-loop body is refused earlier at the fused-loop gate, so it
+        // never reaches the literal ops — the reason this test was vacuous when
+        // it used a loop body.
+        let source = "function g() {\n\
+                        var a = [1, 2, 3];\n\
+                        var o = { x: 4, y: 5 };\n\
+                        return (a[0] + a[1] + a[2] + o.x + o.y) | 0;\n\
                       }\n\
-                      f(100000);";
+                      var s = 0;\n\
+                      for (var i = 0; i < 200; i++) { s += g(); }\n\
+                      s;";
         let interp = {
             let mut agent = runtime::Agent::new();
             agent.initialize_host_defined_realm().expect("realm");
             agent.run_script(source).expect("interp runs")
         };
-        let before = crate::opt_lower::OPT_COMPILED.load(std::sync::atomic::Ordering::Relaxed);
-        let (value, compiled) = with_opt_jit_agent(|agent| agent.run_script(source).expect("runs"));
-        let opt_bodies =
-            crate::opt_lower::OPT_COMPILED.load(std::sync::atomic::Ordering::Relaxed) - before;
+        let (value, compiled, opt_bodies) =
+            with_opt_jit_agent_counts(|agent| agent.run_script(source).expect("runs"));
         assert!(compiled >= 1, "{compiled} bodies must compile");
         assert_eq!(
             value, interp,
@@ -8372,11 +8416,14 @@ run(); run(); run(); run(); run(); run(); run(); run(); run();";
     }
 
     #[test]
-    fn installed_jit_lifted_hoist_guard_matches_the_interpreter() {
+    fn installed_jit_hoist_guard_falls_back_and_matches_the_interpreter() {
         // A `for` loop reading an invariant member (`o.x`) makes the compiler
-        // emit a `HoistMemberGuard`; the lift models it as always-miss (the
-        // guard is a pure perf-guard, so the general copy is semantically
-        // identical), so the body lifts and must match.
+        // emit a `HoistMemberGuard` on the LICM hoist path — but that path is
+        // the fused loop, whose register body carries a `GetMemberNameLocal`
+        // leaf the lift cannot lower, so the body is REFUSED today. This asserts
+        // the value matches through the per-step fallback and pins the refusal
+        // (`opt == 0`), so it fails loudly when the register-body leaf set
+        // widens and the guard actually lifts.
         let source = "function f(o, n) {\n\
                         var s = 0;\n\
                         for (var i = 0; i < n; i++) { s = (s + o.x) | 0; }\n\
@@ -8388,45 +8435,43 @@ run(); run(); run(); run(); run(); run(); run(); run(); run();";
             agent.initialize_host_defined_realm().expect("realm");
             agent.run_script(source).expect("interp runs")
         };
-        let before = crate::opt_lower::OPT_COMPILED.load(std::sync::atomic::Ordering::Relaxed);
-        let (value, compiled) = with_opt_jit_agent(|agent| agent.run_script(source).expect("runs"));
-        let opt_bodies =
-            crate::opt_lower::OPT_COMPILED.load(std::sync::atomic::Ordering::Relaxed) - before;
+        let (value, compiled, opt_bodies) =
+            with_opt_jit_agent_counts(|agent| agent.run_script(source).expect("runs"));
         assert!(compiled >= 1, "{compiled} bodies must compile");
         assert_eq!(
             value, interp,
             "the hoist-guarded loop must match the interpreter"
         );
-        assert!(
-            opt_bodies >= 1,
-            "the hoist-guarded body must lower through the opt path (got {opt_bodies})"
+        assert_eq!(
+            opt_bodies, 0,
+            "the hoist-guarded body is refused by the register-body leaf gate (got {opt_bodies} \
+             opt compiles); if this changed, the leaf set widened — flip this to an opt-path \
+             assertion"
         );
     }
 
     #[test]
     fn installed_jit_lifted_nonfused_literals_match_the_interpreter() {
         // I6-0b: an empty array literal (`ArrayBegin`/`ArrayEnd`) and an empty
-        // object literal (`ObjectBegin`) per iteration lift through the same
-        // helpers the per-step path calls, with the container threaded as SSA.
-        let source = "function f(n) {\n\
-                        var s = 0;\n\
-                        for (var i = 0; i < n; i++) {\n\
-                          var a = [];\n\
-                          var o = {};\n\
-                          s = (s + a.length + (o ? 1 : 0)) | 0;\n\
-                        }\n\
-                        return s;\n\
+        // object literal (`ObjectBegin`) in a straight-line body lift through
+        // the same helpers the per-step path calls, with the container threaded
+        // as SSA. Straight-line and past the compile threshold, for the same
+        // reason as the fused-create test above.
+        let source = "function g() {\n\
+                        var a = [];\n\
+                        var o = {};\n\
+                        return (a.length + (o ? 1 : 0)) | 0;\n\
                       }\n\
-                      f(100000);";
+                      var s = 0;\n\
+                      for (var i = 0; i < 200; i++) { s += g(); }\n\
+                      s;";
         let interp = {
             let mut agent = runtime::Agent::new();
             agent.initialize_host_defined_realm().expect("realm");
             agent.run_script(source).expect("interp runs")
         };
-        let before = crate::opt_lower::OPT_COMPILED.load(std::sync::atomic::Ordering::Relaxed);
-        let (value, compiled) = with_opt_jit_agent(|agent| agent.run_script(source).expect("runs"));
-        let opt_bodies =
-            crate::opt_lower::OPT_COMPILED.load(std::sync::atomic::Ordering::Relaxed) - before;
+        let (value, compiled, opt_bodies) =
+            with_opt_jit_agent_counts(|agent| agent.run_script(source).expect("runs"));
         assert!(compiled >= 1, "{compiled} bodies must compile");
         assert_eq!(
             value, interp,

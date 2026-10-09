@@ -117,6 +117,20 @@ impl JitEngine {
     /// contains a step outside the supported subset or needs a slow-path
     /// helper that is missing from `helpers`.
     pub fn compile(&self, body: &CompiledBody, helpers: &JitHelpers) -> Option<Compiled> {
+        self.compile_counted(body, helpers).0
+    }
+
+    /// Like [`JitEngine::compile`], but also reports whether the optimizing
+    /// tier produced the code (rather than the per-step path). `JitCache`
+    /// turns the flag into a per-cache count, which the opt-tier tests assert
+    /// on instead of the process-global `OPT_COMPILED` counter — cross-test
+    /// parallelism bumps the latter, so a global-delta assertion can pass even
+    /// when the body under test never lifted.
+    pub(crate) fn compile_counted(
+        &self,
+        body: &CompiledBody,
+        helpers: &JitHelpers,
+    ) -> (Option<Compiled>, bool) {
         // The optimizing tier (I1): a body the lift accepts is lowered from the
         // SSA IR instead of the per-step pass. Gated by `SLAG_OPT`; a body the
         // lift refuses, or that the IR lowerer then declines, falls through to
@@ -184,7 +198,7 @@ impl JitEngine {
                         && let Some(compiled) =
                             crate::opt_lower::compile(&*self.isa, &ir, helpers, body.max_stack)
                     {
-                        return Some(compiled);
+                        return (Some(compiled), true);
                     }
                 }
                 Err(reason) => {
@@ -213,16 +227,19 @@ impl JitEngine {
             if std::env::var("JIT_DUMP_CLIF").is_ok() {
                 eprintln!("jit bail: {reason:?} ({} steps)", body.steps.len());
             }
-            return None;
+            return (None, false);
         }
-        assemble(
-            &*self.isa,
-            func,
-            body.max_stack,
-            // A conservative over-approximation: the Stage O diagnostic can make
-            // any body deopt when it names a step, and a deopt-bearing body must
-            // not be inlined by a compiled caller.
-            JIT_DEOPT_PROBE.load(std::sync::atomic::Ordering::Relaxed) >= 0,
+        (
+            assemble(
+                &*self.isa,
+                func,
+                body.max_stack,
+                // A conservative over-approximation: the Stage O diagnostic can make
+                // any body deopt when it names a step, and a deopt-bearing body must
+                // not be inlined by a compiled caller.
+                JIT_DEOPT_PROBE.load(std::sync::atomic::Ordering::Relaxed) >= 0,
+            ),
+            false,
         )
     }
 }

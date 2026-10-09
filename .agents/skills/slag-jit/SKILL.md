@@ -1096,10 +1096,13 @@ the census reports such rows as "fully lifting" when the real lift `opt bail`s.
   `BuilderStore`/`FastLoopBind`/`FastLoopStore`); `Step("FastLoopHead")` is the
   non-`Counter` head. Those two, not the argument-vector family, gate the
   canonical `for` loops and almost every arithmetic corpus row.
-- **An opt-lift test that only asserts a global `OPT_COMPILED` delta is vacuous
-  if its body does not actually lift.** `OPT_COMPILED` is process-global and the
-  tests run in parallel, so any concurrently-lifting test supplies the delta;
-  such tests pass under the default parallel run and fail when run alone. A test
-  for a lift feature must use a body the lift actually accepts (a straight-line
-  body called past `JIT_COMPILE_THRESHOLD`, or the exact acc-path loop shape) —
-  verify with `cargo test -p jit --lib <name> -- --test-threads=1`.
+- **Assert on the per-cache opt count, not the global `OPT_COMPILED` delta.**
+  `OPT_COMPILED` is process-global and the tests run in parallel, so any
+  concurrently-lifting test supplies the delta and a test whose own body never
+  lifted still passes — four `installed_jit_lifted_*` tests were vacuous this
+  way until 2026-10-09. `JitEngine::compile_counted` + `JitCache::
+  opt_compiled_count` (reached through `with_opt_jit_agent_counts`) give a
+  per-cache count immune to that pollution. A test for a lift feature must also
+  use a body the lift actually accepts (a straight-line body called past
+  `JIT_COMPILE_THRESHOLD`, or the exact acc-path loop shape) — verify with
+  `cargo test -p jit --lib <name> -- --test-threads=1`.

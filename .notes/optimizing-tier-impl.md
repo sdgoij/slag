@@ -309,6 +309,14 @@ With `blocking_step_names` reporting *variant* names (not `step_name`'s coarse f
 
 **Census correction.** The census above counts `blocking_step_names`, which is `stack_delta`-level: it sees a step only when the lift's *stack-delta* model refuses it, not when `emit_step` refuses a *variant* of an otherwise-modelled step. The fused-loop gate (`FusedLoop` = the `Some`-slot variants and the non-`Counter` `FastLoopHead`) is exactly such an emit-time refusal, so it is **invisible** to the census and the census over-reports coverage. The honest metric is the IR actually produced (`JIT_DUMP_IR=1`, counted by `scratch/probe_liftrate.sh`): **11 of 77 rows produce any lifted IR**, and the leading real blocker is the fused-loop `Some`-slot gate, not the argument vector. Use the IR/CLIF dump, not `blocking_step_names`, when the question is "did this row actually lift".
 
+### The opt-tier test vacuity — fixed (2026-10-09)
+
+The four `installed_jit_lifted_*` tests for the fused-for (S1+S2), the hoist guard, and the I6-0 literal creates were **vacuous**: each asserted a *process-global* `OPT_COMPILED` delta that a parallel test's cache satisfied, so they passed while their own body never lifted (all four failed under `--test-threads=1`). Root causes and the fix:
+
+- **`JitEngine::compile_counted` + `JitCache::opt_compiled_count`.** The compile path now reports whether the optimizing tier produced the code, and the cache counts it per cache. A per-cache count is immune to the global counter's cross-test pollution, so an assertion on it fails when the body under test does not lift; `with_opt_jit_agent_counts` returns it.
+- **The literal tests (I6-0a/b) now lift for real.** Both used a `for`-loop body, refused at the fused-loop gate, so they never reached the literal ops. They now use a straight-line body called past `JIT_COMPILE_THRESHOLD` (which the lift accepts), whose IR carries `NewArray`/`NewObject` and `ArrayBegin`/`ArrayEnd`/`ObjectBegin` respectively.
+- **The fused-for and hoist-guard tests assert the fallback.** Neither shape lifts today — the fused `for` refuses at the head gate, and the hoist guard's register body carries a `GetMemberNameLocal` leaf the lift cannot lower. They are renamed `..._falls_back_and_matches_the_interpreter` and assert the value matches through the per-step path plus `opt == 0` (the per-cache count), so they fail loudly when the head/leaf gates widen.
+
 ### I5 — trial inlining, in full (opened 2026-10-08; probe-first)
 
 Inline a monomorphic callee's `Step`s at a caller's call site, under a size budget, recursing. Targets (`optimizing-tier-plan.md` §6): `method_call` 6x, `js_call` 3.6x, `closure_capture`, `hof_methods`, `apply_call`. It is the **enabler of I6**: an allocation can be elided only where the code that allocates and the code that consumes it are one body, so escape analysis has nothing to work on until the call boundary is gone.
