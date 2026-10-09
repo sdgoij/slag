@@ -29,9 +29,12 @@ use std::sync::atomic::{AtomicU8, Ordering};
 
 use crate::opt::builder::Builder;
 use crate::opt::ir::{BlockId, Effects, Function, Heap, Imm, Op, Term, Type, ValueId};
-use syntax::ast::{BinaryOp, UnaryOp, UpdateOp};
+use syntax::ast::{AssignOp, BinaryOp, UnaryOp, UpdateOp};
 
-use runtime::ir::{CompiledBody, FastLoopVar, IntRhs, LeafOp, NumRhs, RegOperand, RelLimit, Step};
+use runtime::ir::{
+    CompiledBody, FastLoopVar, IntRhs, LeafOp, NumRhs, RegOperand, RelLimit, Step,
+    is_compound_assign,
+};
 
 /// Why a body could not be lifted.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -380,6 +383,16 @@ fn stack_delta(step: &Step) -> Result<i32, Unsupported> {
         | Step::SaveCompletion
         | Step::RestoreCompletion
         | Step::FunctionDeclInit { .. } => 0,
+        // A member-name assignment pops `value` (and, for the compound form, the
+        // old value) plus the object, and pushes the stored value (the
+        // expression result).
+        Step::AssignMemberName { op, .. } => {
+            if is_compound_assign(op) {
+                -2
+            } else {
+                -1
+            }
+        }
         // A `CallFast` pops `this` + callee + `argc` args and pushes the result.
         Step::CallFast {
             argc,
@@ -690,6 +703,28 @@ fn emit_step(
             } else {
                 v
             };
+            stack.push(value);
+        }
+        // A plain member-name assignment (`o.x = v`, stack `[object, value]`)
+        // and a plain computed assignment (`o[k] = v`, stack
+        // `[object, key, value]`): the validated `Op::MemberStore` and the
+        // `Op::ElementStore` (via `set_member_computed`). The compound forms
+        // (a read-modify-write) are refused — their own slice.
+        Step::AssignMemberName { name, op } => {
+            if *op != AssignOp::Assign {
+                return Err(Unsupported::Step(step_name(step)));
+            }
+            let value = stack.pop().ok_or(Unsupported::Stack)?;
+            let object = stack.pop().ok_or(Unsupported::Stack)?;
+            builder.emit_void(
+                block,
+                Op::MemberStore,
+                &[object, value],
+                Op::MemberStore.default_effects(),
+                Imm::Atom(*name),
+            );
+            // The stored value is the expression result (the per-step arm
+            // pushes it).
             stack.push(value);
         }
         // A global read through the global object (`LoadGlobal`); the same
