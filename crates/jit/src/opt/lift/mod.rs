@@ -31,7 +31,7 @@ use crate::opt::builder::Builder;
 use crate::opt::ir::{BlockId, Effects, Function, Heap, Imm, Op, Term, Type, ValueId};
 use syntax::ast::{BinaryOp, UnaryOp, UpdateOp};
 
-use runtime::ir::{CompiledBody, FastLoopVar, LeafOp, NumRhs, RegOperand, RelLimit, Step};
+use runtime::ir::{CompiledBody, FastLoopVar, IntRhs, LeafOp, NumRhs, RegOperand, RelLimit, Step};
 
 /// Why a body could not be lifted.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1310,6 +1310,77 @@ fn emit_leaf_op(
                 NumRhs::Slot(other) => emit_frame_load(builder, block, *other),
             };
             let next = bin(builder, binary_op(*op)?, cur, right);
+            emit_frame_store(builder, block, *slot, next);
+            next
+        }
+        // Route B (int32): `loop_num = (i32(loop_num) op rhs) & mask; acc =
+        // Number(loop_num)`. The lift keeps the loop-carried slot in the frame
+        // (the `FastLoopBind` no-op), so this is a frame RMW in int32: `ToInt32`
+        // is `| 0`, the wrapping op is the f64 op then `| 0`, and `& mask` is
+        // the source's trailing truncation.
+        LeafOp::BinStoreInt {
+            op,
+            slot,
+            rhs,
+            mask,
+        } => {
+            let counter = || counter.ok_or(Unsupported::Step("RunRegBody"));
+            let cur = emit_frame_load(builder, block, *slot);
+            let to_i32 = |b: &mut Builder, v: ValueId| -> ValueId {
+                let zero = emit_number(b, block, 0.0);
+                b.emit(
+                    block,
+                    Op::BitOr,
+                    &[v, zero],
+                    Type::Number,
+                    Op::BitOr.default_effects(),
+                    Imm::None,
+                )
+            };
+            // The unproven `CounterChecked` keeps the exact f64 op then `ToInt32`
+            // (the counter may be outside int32); every other rhs is a proven i32.
+            let wrapped = match rhs {
+                IntRhs::CounterChecked => {
+                    let right = emit_frame_load(builder, block, counter()?);
+                    let f64_op = match op {
+                        BinaryOp::Add => Op::Add,
+                        BinaryOp::Sub => Op::Sub,
+                        BinaryOp::Mul => Op::Mul,
+                        _ => return Err(Unsupported::Step("RunRegBody")),
+                    };
+                    let combined = builder.emit(
+                        block,
+                        f64_op,
+                        &[cur, right],
+                        Type::Number,
+                        f64_op.default_effects(),
+                        Imm::None,
+                    );
+                    to_i32(builder, combined)
+                }
+                _ => {
+                    let left = to_i32(builder, cur);
+                    let right = match rhs {
+                        IntRhs::Imm(i) => emit_number(builder, block, f64::from(*i)),
+                        IntRhs::Counter => {
+                            let c = emit_frame_load(builder, block, counter()?);
+                            to_i32(builder, c)
+                        }
+                        IntRhs::CounterBit { op: bit, imm } => {
+                            let cf = emit_frame_load(builder, block, counter()?);
+                            let c = to_i32(builder, cf);
+                            let i = emit_number(builder, block, f64::from(*imm));
+                            bin(builder, binary_op(*bit)?, c, i)
+                        }
+                        IntRhs::Acc => to_i32(builder, acc),
+                        IntRhs::CounterChecked => unreachable!(),
+                    };
+                    let combined = bin(builder, binary_op(*op)?, left, right);
+                    to_i32(builder, combined)
+                }
+            };
+            let m = emit_number(builder, block, f64::from(*mask));
+            let next = bin(builder, Op::BitAnd, wrapped, m);
             emit_frame_store(builder, block, *slot, next);
             next
         }
