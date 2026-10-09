@@ -15,6 +15,7 @@ use cranelift_codegen::ir::{
 use cranelift_codegen::isa::{CallConv, TargetIsa};
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Variable};
 use crux::Value as JsValue;
+use runtime::ir::{INTRINSICS, Intrinsic};
 use runtime::jit::{
     DISPATCH_DEOPT, JitCallContext, VM_COMPLETION_IS_EMPTY_OFFSET, VM_COMPLETION_OFFSET,
     VM_IP_OFFSET,
@@ -35,6 +36,12 @@ pub(crate) static OPT_COMPILED: std::sync::atomic::AtomicUsize =
 /// (test introspection: a calling body lowered through the tier).
 #[cfg(test)]
 pub(crate) static OPT_CALLS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// The number of `Op::Intrinsic` instructions the lowering has emitted (test
+/// introspection: a body with an intrinsic lowered through the tier).
+#[cfg(test)]
+pub(crate) static OPT_INTRINSICS: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
 /// Lower a lifted straight-line IR function to executable code, or `None` when
@@ -671,6 +678,31 @@ fn lower_inst(
                 &[callee, this, argc_imm, abi.work, dir_imm],
             )?
         }
+        // A lifted `x.f(a, ...)` intrinsic (I4a): `args = [this, callee, a1..aN]`,
+        // `imm` the `Intrinsic` discriminant. The lowering reproduces the
+        // per-step fast path (the `%`-identity gate, an inline `Math` op or a
+        // narrow helper) and falls back to the general call.
+        Op::Intrinsic => {
+            let Imm::Int(disc) = inst.imm else {
+                return Err(Unsupported::Step("opt:intrinsic"));
+            };
+            if inst.args.len() < 2 {
+                return Err(Unsupported::Step("opt:intrinsic"));
+            }
+            let kind = INTRINSICS
+                .get(disc as usize)
+                .copied()
+                .ok_or(Unsupported::Step("opt:intrinsic"))?;
+            #[cfg(test)]
+            OPT_INTRINSICS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let this = arg(0)?;
+            let callee = arg(1)?;
+            let mut call_args = Vec::with_capacity(inst.args.len() - 2);
+            for i in 2..inst.args.len() {
+                call_args.push(arg(i)?);
+            }
+            emit_intrinsic(builder, helpers, abi, kind, this, callee, &call_args)?
+        }
         _ => return Err(Unsupported::Step("opt:op")),
     })
 }
@@ -1065,6 +1097,247 @@ fn emit_typed_element_float(
             .ins()
             .load(types::I64, MemFlagsData::new(), addr, Offset32::new(0))
     }
+}
+
+/// `bits & TAG_MASK == TAG_PREFIX` and `(bits >> 44) & 0xF == TAG_STRING` — the
+/// string check, mirroring the per-step `is_string` (the heap-prefix test runs
+/// first: a double can carry the tag bits by coincidence).
+fn is_string(builder: &mut FunctionBuilder, bits: ClifValue) -> ClifValue {
+    let is_heap = builder.ins().band_imm_u(bits, crux::TAG_MASK as i64);
+    let is_heap = builder
+        .ins()
+        .icmp_imm_u(IntCC::Equal, is_heap, crux::TAG_PREFIX as i64);
+    let tag = builder.ins().ushr_imm_u(bits, 44);
+    let tag = builder.ins().band_imm_u(tag, 0xF);
+    let is_str = builder
+        .ins()
+        .icmp_imm_u(IntCC::Equal, tag, crux::TAG_STRING as i64);
+    builder.ins().band(is_heap, is_str)
+}
+
+/// The `Step::CallIntrinsic` fast path, mirroring the per-step `emit_step` arm:
+/// a `%`-identity gate on the callee (plus the shape checks each kind needs), an
+/// inline `Math` op or a narrow helper with a sentinel fall-back, and the
+/// general call as the fallback. `this` and `callee` are the resolved receiver
+/// and callee; `args` is `a1..aN`.
+fn emit_intrinsic(
+    builder: &mut FunctionBuilder,
+    helpers: &JitHelpers,
+    abi: &Abi,
+    kind: Intrinsic,
+    this: ClifValue,
+    callee: ClifValue,
+    args: &[ClifValue],
+) -> Result<ClifValue, Unsupported> {
+    let value = builder.declare_var(types::I64);
+    let fast = builder.create_block();
+    let slow = builder.create_block();
+    let merge = builder.create_block();
+
+    let undefined = builder
+        .ins()
+        .iconst(types::I64, JsValue::Undefined.bits() as i64);
+    let arg1 = args.first().copied().unwrap_or(undefined);
+
+    // The gate: the callee is the realm's `%`-named intrinsic for `kind`
+    // (`ctx.intrinsic_bits[kind]`, 0 when the body has none), plus the shape
+    // checks each kind needs. The collection/array kinds validate their receiver
+    // and index/`from` in the helper, so only the callee identity is guarded;
+    // `Math` and `charCodeAt` need a Number argument, and `charCodeAt` a String
+    // receiver.
+    let bit_offset = std::mem::offset_of!(JitCallContext, intrinsic_bits)
+        + kind as usize * std::mem::size_of::<u64>();
+    let expected = builder.ins().load(
+        types::I64,
+        MemFlagsData::new(),
+        abi.vm,
+        Offset32::new(bit_offset as i32),
+    );
+    let non_zero = builder.ins().icmp_imm_u(IntCC::NotEqual, expected, 0);
+    let callee_ok = builder.ins().icmp(IntCC::Equal, callee, expected);
+    let mut gate = builder.ins().band(non_zero, callee_ok);
+    match kind {
+        Intrinsic::StringCharCodeAt => {
+            let arg_ok = is_double(builder, arg1);
+            gate = builder.ins().band(gate, arg_ok);
+            let this_ok = is_string(builder, this);
+            gate = builder.ins().band(gate, this_ok);
+        }
+        Intrinsic::MathAbs
+        | Intrinsic::MathCeil
+        | Intrinsic::MathFloor
+        | Intrinsic::MathTrunc
+        | Intrinsic::MathSqrt => {
+            let arg_ok = is_double(builder, arg1);
+            gate = builder.ins().band(gate, arg_ok);
+        }
+        Intrinsic::ArrayIndexOf
+        | Intrinsic::MapGet
+        | Intrinsic::SetHas
+        | Intrinsic::MapSet
+        | Intrinsic::ArrayAt
+        | Intrinsic::ArrayIncludes
+        | Intrinsic::ArrayPush => {}
+    }
+    builder.ins().brif(gate, fast, &[], slow, &[]);
+    builder.seal_block(fast);
+
+    // The fast path: an inline `Math` op (no helper) or a narrow helper whose
+    // sentinel result routes to the general call.
+    builder.switch_to_block(fast);
+    match kind {
+        Intrinsic::MathAbs
+        | Intrinsic::MathCeil
+        | Intrinsic::MathFloor
+        | Intrinsic::MathTrunc
+        | Intrinsic::MathSqrt => {
+            let num = builder.ins().bitcast(types::F64, MemFlagsData::new(), arg1);
+            let result = match kind {
+                Intrinsic::MathAbs => builder.ins().fabs(num),
+                Intrinsic::MathCeil => builder.ins().ceil(num),
+                Intrinsic::MathFloor => builder.ins().floor(num),
+                Intrinsic::MathTrunc => builder.ins().trunc(num),
+                _ => builder.ins().sqrt(num),
+            };
+            let bits = builder
+                .ins()
+                .bitcast(types::I64, MemFlagsData::new(), result);
+            let bits = canon_double(builder, bits);
+            builder.def_var(value, bits);
+            builder.ins().jump(merge, &[]);
+        }
+        Intrinsic::StringCharCodeAt => {
+            let result = call_helper(
+                builder,
+                helpers,
+                abi,
+                abi.sig_unary,
+                Helper::CharCodeAt,
+                &[this, arg1],
+            )?;
+            builder.def_var(value, result);
+            builder.ins().jump(merge, &[]);
+        }
+        _ => {
+            let result = match kind {
+                Intrinsic::ArrayIndexOf => {
+                    let from = args.get(1).copied().unwrap_or(undefined);
+                    call_helper(
+                        builder,
+                        helpers,
+                        abi,
+                        abi.sig_binary,
+                        Helper::ArrayIndexOf,
+                        &[this, arg1, from],
+                    )?
+                }
+                Intrinsic::MapGet | Intrinsic::SetHas => {
+                    let helper = if kind == Intrinsic::SetHas {
+                        Helper::SetHas
+                    } else {
+                        Helper::MapGet
+                    };
+                    call_helper(builder, helpers, abi, abi.sig_unary, helper, &[this, arg1])?
+                }
+                Intrinsic::MapSet => {
+                    let v = args.get(1).copied().unwrap_or(undefined);
+                    call_helper(
+                        builder,
+                        helpers,
+                        abi,
+                        abi.sig_binary,
+                        Helper::MapSet,
+                        &[this, arg1, v],
+                    )?
+                }
+                Intrinsic::ArrayAt => call_helper(
+                    builder,
+                    helpers,
+                    abi,
+                    abi.sig_unary,
+                    Helper::ArrayAt,
+                    &[this, arg1],
+                )?,
+                Intrinsic::ArrayIncludes => {
+                    let from = args.get(1).copied().unwrap_or(undefined);
+                    call_helper(
+                        builder,
+                        helpers,
+                        abi,
+                        abi.sig_binary,
+                        Helper::ArrayIncludes,
+                        &[this, arg1, from],
+                    )?
+                }
+                _ => call_helper(
+                    builder,
+                    helpers,
+                    abi,
+                    abi.sig_unary,
+                    Helper::ArrayPush,
+                    &[this, arg1],
+                )?,
+            };
+            // `ArrayIndexOf`'s sentinel is `undefined` (never a valid index);
+            // the remaining kinds use the hole.
+            let sentinel = if kind == Intrinsic::ArrayIndexOf {
+                JsValue::Undefined.bits() as i64
+            } else {
+                JsValue::hole().bits() as i64
+            };
+            emit_intrinsic_sentinel(builder, result, sentinel, slow, merge, value);
+        }
+    }
+
+    // The fallback: the general call (a shadowed method, or a receiver/argument
+    // shape the helper declines). The args sit at the working-region base.
+    builder.seal_block(slow);
+    builder.switch_to_block(slow);
+    for (k, a) in args.iter().enumerate() {
+        builder.ins().store(
+            MemFlagsData::new(),
+            *a,
+            abi.work,
+            Offset32::new((k * 8) as i32),
+        );
+    }
+    let argc_imm = builder.ins().iconst(types::I64, args.len() as i64);
+    let dir_imm = builder.ins().iconst(types::I64, 0);
+    let res = call_helper(
+        builder,
+        helpers,
+        abi,
+        abi.sig_call_slow,
+        Helper::CallSlow,
+        &[callee, this, argc_imm, abi.work, dir_imm],
+    )?;
+    builder.def_var(value, res);
+    builder.ins().jump(merge, &[]);
+
+    builder.seal_block(merge);
+    builder.switch_to_block(merge);
+    Ok(builder.use_var(value))
+}
+
+/// The sentinel tail of an intrinsic helper: when the result equals `sentinel`
+/// (the helper declined the receiver), jump to `slow` (the general call);
+/// otherwise store the result and jump to `merge`.
+fn emit_intrinsic_sentinel(
+    builder: &mut FunctionBuilder,
+    result: ClifValue,
+    sentinel: i64,
+    slow: Block,
+    merge: Block,
+    value: Variable,
+) {
+    let sentinel = builder.ins().iconst(types::I64, sentinel);
+    let fallback = builder.ins().icmp(IntCC::Equal, result, sentinel);
+    let hit = builder.create_block();
+    builder.ins().brif(fallback, slow, &[], hit, &[]);
+    builder.seal_block(hit);
+    builder.switch_to_block(hit);
+    builder.def_var(value, result);
+    builder.ins().jump(merge, &[]);
 }
 
 /// Emit a helper call with the pending-error ABI: with no try machinery a

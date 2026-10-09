@@ -8110,6 +8110,99 @@ run(); run(); run(); run(); run(); run(); run(); run(); run();";
     }
 
     #[test]
+    fn installed_jit_lifted_intrinsic_math_matches_the_interpreter() {
+        // I4a: a `while` body with `Math.abs` lifts (a `for` would bail on the
+        // fused loop) and lowers through `Op::Intrinsic`, whose `%`-identity gate
+        // fires and computes `fabs` inline. The tier must have emitted the
+        // intrinsic op and the value must match the interpreter.
+        let source = "function f(n) {\n\
+                        var s = 0;\n\
+                        var i = 0;\n\
+                        while (i < n) { s = (s + Math.abs(i - 12345)) | 0; i = i + 1; }\n\
+                        return s;\n\
+                      }\n\
+                      f(100000);";
+        let interp = {
+            let mut agent = runtime::Agent::new();
+            agent.initialize_host_defined_realm().expect("realm");
+            agent.run_script(source).expect("interp runs")
+        };
+        let before = crate::opt_lower::OPT_INTRINSICS.load(std::sync::atomic::Ordering::Relaxed);
+        let comp_before = crate::opt_lower::OPT_COMPILED.load(std::sync::atomic::Ordering::Relaxed);
+        let (value, compiled) = with_opt_jit_agent(|agent| agent.run_script(source).expect("runs"));
+        let lowered =
+            crate::opt_lower::OPT_INTRINSICS.load(std::sync::atomic::Ordering::Relaxed) - before;
+        let opt_bodies =
+            crate::opt_lower::OPT_COMPILED.load(std::sync::atomic::Ordering::Relaxed) - comp_before;
+        assert!(compiled >= 1, "{compiled} bodies must compile");
+        assert_eq!(value, interp, "the intrinsic must match the interpreter");
+        assert!(
+            lowered >= 1 && opt_bodies >= 1,
+            "the body must lower an Op::Intrinsic through the opt path (ops={lowered}, opt bodies={opt_bodies})"
+        );
+    }
+
+    #[test]
+    fn installed_jit_lifted_intrinsic_array_indexof_matches_the_interpreter() {
+        // I4a: `a.indexOf(x)` over an Array parameter (no literal, so the body
+        // lifts) lowers through `Op::Intrinsic`'s `ArrayIndexOf` sentinel arm — a
+        // hit serves the index with no general call.
+        let source = "function f(a, n) {\n\
+                        var s = 0;\n\
+                        var i = 0;\n\
+                        while (i < n) { s = s + a.indexOf(i & 7); i = i + 1; }\n\
+                        return s;\n\
+                      }\n\
+                      var arr = new Array(8);\n\
+                      for (var j = 0; j < 8; j++) { arr[j] = j * 10; }\n\
+                      f(arr, 100000);";
+        let interp = {
+            let mut agent = runtime::Agent::new();
+            agent.initialize_host_defined_realm().expect("realm");
+            agent.run_script(source).expect("interp runs")
+        };
+        let before = crate::opt_lower::OPT_INTRINSICS.load(std::sync::atomic::Ordering::Relaxed);
+        let comp_before = crate::opt_lower::OPT_COMPILED.load(std::sync::atomic::Ordering::Relaxed);
+        let (value, compiled) = with_opt_jit_agent(|agent| agent.run_script(source).expect("runs"));
+        let lowered =
+            crate::opt_lower::OPT_INTRINSICS.load(std::sync::atomic::Ordering::Relaxed) - before;
+        let opt_bodies =
+            crate::opt_lower::OPT_COMPILED.load(std::sync::atomic::Ordering::Relaxed) - comp_before;
+        assert!(compiled >= 1, "{compiled} bodies must compile");
+        assert_eq!(value, interp, "the intrinsic must match the interpreter");
+        assert!(
+            lowered >= 1 && opt_bodies >= 1,
+            "the body must lower an Op::Intrinsic through the opt path (ops={lowered}, opt bodies={opt_bodies})"
+        );
+    }
+
+    #[test]
+    fn installed_jit_lifted_intrinsic_declined_receiver_falls_back() {
+        // I4a: the same `a.indexOf(x)` step over a String receiver — the
+        // `ArrayIndexOf` helper declines (its `undefined` sentinel) and the
+        // general call serves `String.prototype.indexOf`. The value must match
+        // the interpreter, so the fallback is exact.
+        let source = "function f(a, n) {\n\
+                        var s = 0;\n\
+                        var i = 0;\n\
+                        while (i < n) { s = s + a.indexOf(i & 7); i = i + 1; }\n\
+                        return s;\n\
+                      }\n\
+                      f('abcdefgh', 100000);";
+        let interp = {
+            let mut agent = runtime::Agent::new();
+            agent.initialize_host_defined_realm().expect("realm");
+            agent.run_script(source).expect("interp runs")
+        };
+        let (value, compiled) = with_opt_jit_agent(|agent| agent.run_script(source).expect("runs"));
+        assert!(compiled >= 1, "{compiled} bodies must compile");
+        assert_eq!(
+            value, interp,
+            "the declined-receiver fallback must match the interpreter"
+        );
+    }
+
+    #[test]
     fn installed_jit_computed_read_cell_inlines() {
         // G8: a compiled `o[k]` read with a String key over an own data property
         // must serve from the computed-read cell — the counting wrapper proves

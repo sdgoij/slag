@@ -358,6 +358,8 @@ fn stack_delta(step: &Step) -> Result<i32, Unsupported> {
             direct_eval: false,
             ..
         } => -(*argc as i32) - 1,
+        // A `CallIntrinsic` has the same shape as `CallFast`.
+        Step::CallIntrinsic { argc, .. } => -(*argc as i32) - 1,
         other => return Err(Unsupported::Step(step_name(other))),
     })
 }
@@ -764,6 +766,28 @@ fn emit_step(
                 // The step index, so the inline pass (I5c-2c) can find this
                 // site's feedback record and the guard can resume here.
                 Imm::Int(index as i32),
+            );
+            stack.push(result);
+        }
+        // A `CallIntrinsic` (`[this, callee, a1..aN]` on the stack): a Stage-B
+        // intrinsic call. Lifted to `Op::Intrinsic` (the `Intrinsic`
+        // discriminant as `Imm::Int`); the lowering reproduces the per-step fast
+        // path — a `%`-identity gate plus an inline `Math` op or a narrow helper
+        // — and falls back to the general call, so a lifted body keeps the
+        // per-step inlining (I4a).
+        Step::CallIntrinsic { kind, argc, .. } => {
+            let argc = *argc as usize;
+            if stack.len() < argc + 2 {
+                return Err(Unsupported::Stack);
+            }
+            let args = stack.split_off(stack.len() - (argc + 2));
+            let result = builder.emit(
+                block,
+                Op::Intrinsic,
+                &args,
+                Type::Unknown,
+                Op::Intrinsic.default_effects(),
+                Imm::Int(*kind as i32),
             );
             stack.push(result);
         }

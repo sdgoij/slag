@@ -252,6 +252,13 @@ pub enum Op {
     NewArray,
     NewClosure,
     Call,
+    /// A Stage-B builtin intrinsic call (`Step::CallIntrinsic`): `args = [this,
+    /// callee, a1..aN]`, `imm` is the `runtime::ir::Intrinsic` discriminant. The
+    /// lowering reproduces the per-step fast path — a `%`-identity gate on the
+    /// callee, an inline `Math` op or a narrow helper, with the general call as
+    /// the fallback — so a lifted body keeps the per-step inlining. Modelled as
+    /// an opaque call for now: the op carries no speculative premise until I4b.
+    Intrinsic,
     Construct,
     /// A speculation guard. When it fails the body retires and the
     /// interpreter resumes at the current step.
@@ -341,6 +348,7 @@ impl Op {
             | Op::NewArray
             | Op::NewClosure
             | Op::Call
+            | Op::Intrinsic
             | Op::Construct => E::call(),
         }
     }
