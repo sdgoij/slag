@@ -357,7 +357,8 @@ fn stack_delta(step: &Step) -> Result<i32, Unsupported> {
         | Step::LoadLocal { .. }
         | Step::LoadGlobal { .. }
         | Step::LoadIdent { .. }
-        | Step::LoadContextSlot { .. } => 1,
+        | Step::LoadContextSlot { .. }
+        | Step::CreateFunction { .. } => 1,
         Step::Pop
         | Step::StoreLocal { .. }
         | Step::InitLocal { .. }
@@ -377,7 +378,8 @@ fn stack_delta(step: &Step) -> Result<i32, Unsupported> {
         | Step::ListBegin
         | Step::ListEnd
         | Step::SaveCompletion
-        | Step::RestoreCompletion => 0,
+        | Step::RestoreCompletion
+        | Step::FunctionDeclInit { .. } => 0,
         // A `CallFast` pops `this` + callee + `argc` args and pushes the result.
         Step::CallFast {
             argc,
@@ -741,6 +743,29 @@ fn emit_step(
                     depth: 0,
                     index: *index as u32,
                 },
+            );
+        }
+        // Closure creation (`CreateFunction`): the helper reads the step's
+        // payload by index and instantiates against the current environment.
+        Step::CreateFunction { .. } => {
+            let v = builder.emit(
+                block,
+                Op::NewClosure,
+                &[],
+                Type::Unknown,
+                Op::NewClosure.default_effects(),
+                Imm::Int(index as i32),
+            );
+            stack.push(v);
+        }
+        // A hoisted function declaration's store: no value.
+        Step::FunctionDeclInit { .. } => {
+            builder.emit_void(
+                block,
+                Op::FunctionDecl,
+                &[],
+                Op::FunctionDecl.default_effects(),
+                Imm::Int(index as i32),
             );
         }
         Step::StoreLocal { slot } => {

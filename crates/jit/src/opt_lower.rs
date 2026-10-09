@@ -720,6 +720,40 @@ fn lower_inst(
                 .ins()
                 .iconst(types::I64, JsValue::Undefined.bits() as i64)
         }
+        // A lifted `CreateFunction`/`FunctionDeclInit`: the closure helper
+        // reads the step's payload by index (the same helpers the per-step path
+        // calls) and instantiates against the current lexical environment.
+        Op::NewClosure => {
+            let Imm::Int(step) = &inst.imm else {
+                return Err(Unsupported::Step("opt:closure"));
+            };
+            let step_imm = builder.ins().iconst(types::I64, *step as i64);
+            call_helper(
+                builder,
+                helpers,
+                abi,
+                abi.sig_tdz,
+                Helper::CreateFunction,
+                &[step_imm],
+            )?
+        }
+        Op::FunctionDecl => {
+            let Imm::Int(step) = &inst.imm else {
+                return Err(Unsupported::Step("opt:closure"));
+            };
+            let step_imm = builder.ins().iconst(types::I64, *step as i64);
+            call_helper(
+                builder,
+                helpers,
+                abi,
+                abi.sig_tdz,
+                Helper::CreateFunctionDecl,
+                &[step_imm],
+            )?;
+            builder
+                .ins()
+                .iconst(types::I64, JsValue::Undefined.bits() as i64)
+        }
         // A general call (I5c-0): `args = [this, callee, a1..aN]`. The identity
         // lowering materializes the arguments at the working-region base and
         // runs the general `call_slow` helper, so a calling body enters the

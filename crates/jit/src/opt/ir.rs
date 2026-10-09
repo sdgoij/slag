@@ -288,6 +288,10 @@ pub enum Op {
     ArgsPush,
     ArgsSpread,
     NewClosure,
+    /// A hoisted function declaration's store (`Step::FunctionDeclInit`): the
+    /// helper reads the step payload by index and stores the closure into its
+    /// frame or context slot; no value.
+    FunctionDecl,
     Call,
     /// A Stage-B builtin intrinsic call (`Step::CallIntrinsic`): `args = [this,
     /// callee, a1..aN]`, `imm` is the `runtime::ir::Intrinsic` discriminant. The
@@ -384,6 +388,7 @@ impl Op {
             | Op::NewObject
             | Op::NewArray
             | Op::NewClosure
+            | Op::FunctionDecl
             | Op::Call
             | Op::Intrinsic
             | Op::Construct
