@@ -1421,6 +1421,26 @@ fn emit_leaf_op(
             );
             acc
         }
+        // The computed register-body store (`o[k] = v`): the object is a frame
+        // slot, the key and value direct operands. Effect-only; the accumulator
+        // is unchanged.
+        LeafOp::StoreMemberComputedSlot {
+            object_slot,
+            key,
+            value,
+        } => {
+            let object = emit_frame_load(builder, block, *object_slot);
+            let key = emit_reg_operand(builder, block, key, counter)?;
+            let value = emit_reg_operand(builder, block, value, counter)?;
+            builder.emit_void(
+                block,
+                Op::ElementStore,
+                &[object, key, value],
+                Op::ElementStore.default_effects(),
+                Imm::None,
+            );
+            acc
+        }
         // The operand-stack spill: `PushAcc` saves the accumulator, `BinAccPop`
         // pops it back into a binary with the current accumulator.
         LeafOp::PushAcc => {

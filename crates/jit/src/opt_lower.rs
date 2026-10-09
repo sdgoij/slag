@@ -627,6 +627,24 @@ fn lower_inst(
             let key = arg(1)?;
             emit_element_read(builder, helpers, abi, object, key)?
         }
+        // A lifted `a[k] = v`: the authoritative computed store helper. `args =
+        // [object, key, value]`; effect-only.
+        Op::ElementStore => {
+            let object = arg(0)?;
+            let key = arg(1)?;
+            let value = arg(2)?;
+            call_helper(
+                builder,
+                helpers,
+                abi,
+                abi.sig_binary,
+                Helper::SetMemberComputed,
+                &[object, key, value],
+            )?;
+            builder
+                .ins()
+                .iconst(types::I64, JsValue::Undefined.bits() as i64)
+        }
         // A lifted `LoadGlobal`: the inline direct-mapped global-value cell (the
         // read mirror of the per-step `emit_global_read`), falling back to the
         // `get_global` helper on a miss.
