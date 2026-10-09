@@ -401,6 +401,12 @@ fn stack_delta(step: &Step) -> Result<i32, Unsupported> {
         // the created array/object.
         Step::ArrayFast { count } => -(*count as i32) + 1,
         Step::ObjectFast { names } => -(names.len() as i32) + 1,
+        // The non-fused literal steps (I6-0b): the create steps push the
+        // container, an element/init pops it and its value and pushes it back
+        // (net -1), and `ArrayEnd` is net-neutral.
+        Step::ArrayBegin | Step::ObjectBegin => 1,
+        Step::ArrayElement | Step::ObjectInitName { .. } => -1,
+        Step::ArrayEnd => 0,
         other => return Err(Unsupported::Step(step_name(other))),
     })
 }
@@ -929,6 +935,86 @@ fn emit_step(
             );
             stack.push(result);
         }
+        // The non-fused literal steps (I6-0b): each mirrors the per-step helper
+        // with the container threaded as an SSA value (the VM's index stack
+        // tracks the element index between steps, exactly as the per-step path).
+        Step::ArrayBegin => {
+            let v = builder.emit(
+                block,
+                Op::ArrayBegin,
+                &[],
+                Type::Object,
+                Op::ArrayBegin.default_effects(),
+                Imm::None,
+            );
+            stack.push(v);
+        }
+        Step::ArrayElement => {
+            let value = stack.pop().ok_or(Unsupported::Stack)?;
+            let array = stack.pop().ok_or(Unsupported::Stack)?;
+            let v = builder.emit(
+                block,
+                Op::ArrayElement,
+                &[array, value],
+                Type::Object,
+                Op::ArrayElement.default_effects(),
+                Imm::None,
+            );
+            stack.push(v);
+        }
+        Step::ArrayEnd => {
+            let array = stack.pop().ok_or(Unsupported::Stack)?;
+            let v = builder.emit(
+                block,
+                Op::ArrayEnd,
+                &[array],
+                Type::Object,
+                Op::ArrayEnd.default_effects(),
+                Imm::None,
+            );
+            stack.push(v);
+        }
+        Step::ObjectBegin => {
+            let v = builder.emit(
+                block,
+                Op::ObjectBegin,
+                &[],
+                Type::Object,
+                Op::ObjectBegin.default_effects(),
+                Imm::None,
+            );
+            stack.push(v);
+        }
+        Step::ObjectInitName {
+            name,
+            set_name,
+            shorthand,
+        } => {
+            let value = stack.pop().ok_or(Unsupported::Stack)?;
+            let object = stack.pop().ok_or(Unsupported::Stack)?;
+            let name_c = emit_const(builder, block, Imm::U64(*name as u64), Type::Unknown);
+            let set_c = emit_const(
+                builder,
+                block,
+                Imm::U64(u64::from(*set_name)),
+                Type::Unknown,
+            );
+            let short_c = emit_const(
+                builder,
+                block,
+                Imm::U64(u64::from(*shorthand)),
+                Type::Unknown,
+            );
+            let v = builder.emit(
+                block,
+                Op::ObjectInitName,
+                &[object, value, name_c, set_c, short_c],
+                Type::Object,
+                Op::ObjectInitName.default_effects(),
+                Imm::None,
+            );
+            stack.push(v);
+        }
         other => return Err(Unsupported::Step(step_name(other))),
     }
     Ok(())
@@ -978,6 +1064,10 @@ fn emit_number(builder: &mut Builder, block: BlockId, v: f64) -> ValueId {
         Effects::pure(),
         Imm::Float(v),
     )
+}
+
+fn emit_const(builder: &mut Builder, block: BlockId, imm: Imm, ty: Type) -> ValueId {
+    builder.emit(block, Op::Const, &[], ty, Effects::pure(), imm)
 }
 
 /// Lower a `RunRegBody` (`[LeafOp]`) into IR ops. The register executor's

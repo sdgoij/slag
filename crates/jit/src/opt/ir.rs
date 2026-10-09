@@ -250,6 +250,21 @@ pub enum Op {
     ElementStore,
     NewObject,
     NewArray,
+    /// The non-fused array literal steps (I6-0b). The container rides as the
+    /// op's argument/result (the per-step path keeps it on the work stack, and
+    /// the VM's `array_index_stack` tracks the element index between steps);
+    /// the lowering calls the same `array_begin`/`array_element`/`array_end`
+    /// helpers. `ArrayElement` is `args = [array, value]`; `ArrayEnd` is
+    /// `args = [array]`; both yield the array.
+    ArrayBegin,
+    ArrayElement,
+    ArrayEnd,
+    /// The non-fused object literal steps (I6-0b), the same container-threading
+    /// shape. `ObjectInitName` is
+    /// `args = [object, value, name, set_name, shorthand]` — the last three are
+    /// the compile-time payload the helper reads; it yields the object.
+    ObjectBegin,
+    ObjectInitName,
     NewClosure,
     Call,
     /// A Stage-B builtin intrinsic call (`Step::CallIntrinsic`): `args = [this,
@@ -349,7 +364,12 @@ impl Op {
             | Op::NewClosure
             | Op::Call
             | Op::Intrinsic
-            | Op::Construct => E::call(),
+            | Op::Construct
+            | Op::ArrayBegin
+            | Op::ArrayElement
+            | Op::ArrayEnd
+            | Op::ObjectBegin
+            | Op::ObjectInitName => E::call(),
         }
     }
 }

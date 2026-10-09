@@ -713,6 +713,53 @@ fn lower_inst(
             }
             emit_new_object(builder, helpers, abi, step, &values)?
         }
+        // The non-fused array literal steps (I6-0b): the same `array_*` helpers
+        // the per-step path calls, with the container threaded as an SSA value
+        // (the VM's `array_index_stack` tracks the element index between steps).
+        Op::ArrayBegin => call_helper(builder, helpers, abi, abi.sig_tdz, Helper::ArrayBegin, &[])?,
+        Op::ArrayElement => {
+            let array = arg(0)?;
+            let value = arg(1)?;
+            call_helper(
+                builder,
+                helpers,
+                abi,
+                abi.sig_unary,
+                Helper::ArrayElement,
+                &[array, value],
+            )?
+        }
+        Op::ArrayEnd => {
+            let array = arg(0)?;
+            call_helper(
+                builder,
+                helpers,
+                abi,
+                abi.sig_bool,
+                Helper::ArrayEnd,
+                &[array],
+            )?
+        }
+        // The non-fused object literal steps (I6-0b). `ObjectInitName`'s payload
+        // (name, set_name, shorthand) rides as the last three SSA args.
+        Op::ObjectBegin => {
+            call_helper(builder, helpers, abi, abi.sig_tdz, Helper::ObjectBegin, &[])?
+        }
+        Op::ObjectInitName => {
+            let object = arg(0)?;
+            let value = arg(1)?;
+            let name = arg(2)?;
+            let set = arg(3)?;
+            let short = arg(4)?;
+            call_helper(
+                builder,
+                helpers,
+                abi,
+                abi.sig_call_slow,
+                Helper::ObjectInitName,
+                &[object, name, set, short, value],
+            )?
+        }
         _ => return Err(Unsupported::Step("opt:op")),
     })
 }

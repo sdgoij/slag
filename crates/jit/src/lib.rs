@@ -8404,6 +8404,41 @@ run(); run(); run(); run(); run(); run(); run(); run(); run();";
     }
 
     #[test]
+    fn installed_jit_lifted_nonfused_literals_match_the_interpreter() {
+        // I6-0b: an empty array literal (`ArrayBegin`/`ArrayEnd`) and an empty
+        // object literal (`ObjectBegin`) per iteration lift through the same
+        // helpers the per-step path calls, with the container threaded as SSA.
+        let source = "function f(n) {\n\
+                        var s = 0;\n\
+                        for (var i = 0; i < n; i++) {\n\
+                          var a = [];\n\
+                          var o = {};\n\
+                          s = (s + a.length + (o ? 1 : 0)) | 0;\n\
+                        }\n\
+                        return s;\n\
+                      }\n\
+                      f(100000);";
+        let interp = {
+            let mut agent = runtime::Agent::new();
+            agent.initialize_host_defined_realm().expect("realm");
+            agent.run_script(source).expect("interp runs")
+        };
+        let before = crate::opt_lower::OPT_COMPILED.load(std::sync::atomic::Ordering::Relaxed);
+        let (value, compiled) = with_opt_jit_agent(|agent| agent.run_script(source).expect("runs"));
+        let opt_bodies =
+            crate::opt_lower::OPT_COMPILED.load(std::sync::atomic::Ordering::Relaxed) - before;
+        assert!(compiled >= 1, "{compiled} bodies must compile");
+        assert_eq!(
+            value, interp,
+            "the non-fused literals must match the interpreter"
+        );
+        assert!(
+            opt_bodies >= 1,
+            "the non-fused-literal body must lower through the opt path (got {opt_bodies})"
+        );
+    }
+
+    #[test]
     fn installed_jit_computed_read_cell_inlines() {
         // G8: a compiled `o[k]` read with a String key over an own data property
         // must serve from the computed-read cell — the counting wrapper proves
