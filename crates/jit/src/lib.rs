@@ -7992,6 +7992,64 @@ run(); run(); run(); run(); run(); run(); run(); run(); run();";
     }
 
     #[test]
+    fn installed_jit_lifted_dense_element_read_inlines() {
+        // The IR path's `Op::ElementLoad` lowering, exercised by a body the tier
+        // actually lifts (`while`, not the `for` above, which bails on the fused
+        // loop): the inline dense read must serve the loop with the counting
+        // `get_member_computed` wrapper under 100. Before the port the opt path
+        // lowered every computed read through the helper, so lifting a body made
+        // it pay a helper call per element.
+        static READ_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        extern "C" fn counting_read(ctx: *mut c_void, object: u64, key: u64) -> u64 {
+            READ_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            (runtime::jit::JIT_SLOW_PATHS.get_member_computed)(ctx, object, key)
+        }
+        let mut helpers = runtime_helpers();
+        helpers.get_member_computed = Some(counting_read);
+
+        let source = "function sum(a, n) {\n\
+                        var s = 0;\n\
+                        var i = 0;\n\
+                        while (i < n) { s += a[i & 255]; i = i + 1; }\n\
+                        return s;\n\
+                      }\n\
+                      var a = new Array(256);\n\
+                      for (var j = 0; j < 256; j++) { a[j] = j; }\n\
+                      var r = sum(a, 100000);\n\
+                      var oob = a[99999];\n\
+                      var sk = a['x'];\n\
+                      var obj = { 0: 42 };\n\
+                      var nr = obj[0];\n\
+                      r + (oob === undefined ? 1 : 0) + (sk === undefined ? 1 : 0) + nr;";
+        let interp = {
+            let mut agent = runtime::Agent::new();
+            agent.initialize_host_defined_realm().expect("realm");
+            agent.run_script(source).expect("interp runs")
+        };
+
+        extern "C" fn noop_drop(_cache: *mut c_void) {}
+        let mut agent = runtime::Agent::new();
+        agent.initialize_host_defined_realm().expect("realm");
+        let mut cache = JitCache::new(helpers).expect("isa");
+        agent.jit_hook = Some(runtime::jit::JitHook {
+            cache: (&mut cache as *mut JitCache) as *mut c_void,
+            lookup: jit_cache_lookup,
+            drop_cache: noop_drop,
+            helpers: &runtime::jit::JIT_SLOW_PATHS,
+        });
+        let value = agent.run_script(source).expect("jit runs");
+        let compiled = cache.compiled_count();
+        agent.jit_hook = None;
+        assert_eq!(value, interp, "the dense read must match the interpreter");
+        assert!(compiled >= 1, "{compiled} bodies must compile");
+        let reads = READ_CALLS.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            reads < 100,
+            "the lifted read loop must inline the dense element read ({reads} get_member_computed calls)"
+        );
+    }
+
+    #[test]
     fn installed_jit_computed_read_cell_inlines() {
         // G8: a compiled `o[k]` read with a String key over an own data property
         // must serve from the computed-read cell — the counting wrapper proves

@@ -261,6 +261,16 @@ Measured (`arrays/index_loop`): 37.9 → 20.7 ms with `GetMemberComputed`
 `arrays/typed_array` 50.1 → 35.6 ms (`GetMemberComputed` 14,000,000 → 0);
 `--jit-bench`'s `typed-array read` row 0.15 (89.5 → 13.0 ms).
 
+**The optimizing tier mirrors the dense arm** (`opt_lower::emit_element_read`).
+A body the tier lifts lowers `Op::ElementLoad` through the same dense-arm gates as
+the per-step `emit_dense_element_read_into` — the parity port that took the opt
+path's element-read loop from the `get_member_computed` helper (~61ms) to an
+inline read (~31ms) on the `while` shape the tier lifts (see the
+optimizing-tier notes, §6). The typed-array arm and the G8 computed-read cell are
+NOT ported there yet (they decline to the helper), so a lifted body is at parity for
+dense Arrays only — and widening the lift is gated on porting the typed arm too,
+or the tier's bodies lose an inlining the per-step path has.
+
 ## 9. The fused array literal (`Step::ArrayFast`)
 
 `[a, b, c]` with every element a plain expression (no hole, no spread, and

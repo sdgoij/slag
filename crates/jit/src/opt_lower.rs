@@ -597,18 +597,13 @@ fn lower_inst(
                 &[object, name],
             )?
         }
-        // A lifted `o[k]`: the `get_member_computed` helper.
+        // A lifted `o[k]`: the inline dense element read (the read mirror of
+        // the append), falling back to `get_member_computed` for every other
+        // receiver, key, or a hole.
         Op::ElementLoad => {
             let object = arg(0)?;
             let key = arg(1)?;
-            call_helper(
-                builder,
-                helpers,
-                abi,
-                abi.sig_unary,
-                Helper::GetMemberComputed,
-                &[object, key],
-            )?
+            emit_element_read(builder, helpers, abi, object, key)?
         }
         // A lifted `LoadGlobal`: the same `get_global` helper as the per-step
         // global fast path's miss block.
@@ -678,6 +673,128 @@ fn lower_inst(
         }
         _ => return Err(Unsupported::Step("opt:op")),
     })
+}
+
+/// The inline computed element read: a dense Array's canonical-index element
+/// (the read mirror of the append), declining to `get_member_computed` for any
+/// other receiver, key, or a hole. Ports the per-step `emit_element_read`'s
+/// dense arm (`.agents/skills/slag-dense-arrays` §8); the typed-array arm is
+/// not yet ported and declines to the helper.
+fn emit_element_read(
+    builder: &mut FunctionBuilder,
+    helpers: &JitHelpers,
+    abi: &Abi,
+    object: ClifValue,
+    key: ClifValue,
+) -> Result<ClifValue, Unsupported> {
+    let value = builder.declare_var(types::I64);
+    let kind = builder.create_block();
+    let bounds = builder.create_block();
+    let load_blk = builder.create_block();
+    let hit = builder.create_block();
+    let slow = builder.create_block();
+    let merge = builder.create_block();
+
+    // Object tag: the top 20 bits equal the packed prefix+Object pattern, so
+    // one compare checks the heap prefix and the Object tag.
+    let object_pattern = (crux::TAG_PREFIX >> 44) | crux::TAG_OBJECT;
+    let tag_bits = builder.ins().ushr_imm_u(object, 44);
+    let obj_ok = builder
+        .ins()
+        .icmp_imm_u(IntCC::Equal, tag_bits, object_pattern as i64);
+    builder.ins().brif(obj_ok, kind, &[], slow, &[]);
+    builder.seal_block(kind);
+
+    // The dense cursor: `array_dense` is non-null iff the dense representation
+    // is active (a spill clears it), so it IS the dense switch.
+    builder.switch_to_block(kind);
+    let obj_ptr = builder.ins().band_imm_u(object, crux::PAYLOAD_MASK as i64);
+    let obj_ptr = builder.ins().ishl_imm_u(obj_ptr, 4);
+    let obj_ptr = builder
+        .ins()
+        .iadd_imm_s(obj_ptr, crux::heap::GCBOX_DATA_OFFSET as i64);
+    let dense_base = builder.ins().load(
+        types::I64,
+        MemFlagsData::new(),
+        obj_ptr,
+        Offset32::new(std::mem::offset_of!(crux::JsObject, array_dense) as i32),
+    );
+    let is_dense = builder.ins().icmp_imm_u(IntCC::NotEqual, dense_base, 0);
+    builder.ins().brif(is_dense, bounds, &[], slow, &[]);
+    builder.seal_block(bounds);
+
+    // The canonical-index gate: `idx = ToUint64Sat(num)` round-trips exactly
+    // when `num` is an integral double below 2^32-1, rejecting fractional,
+    // negative, huge and non-double keys (a NaN-boxed heap value bitcasts to a
+    // NaN, whose compare fails).
+    builder.switch_to_block(bounds);
+    let num = builder.ins().bitcast(types::F64, MemFlagsData::new(), key);
+    let max = builder.ins().f64const(4294967295.0);
+    let lt_max = builder.ins().fcmp(FloatCC::LessThan, num, max);
+    let idx = builder.ins().fcvt_to_uint_sat(types::I64, num);
+    let back = builder.ins().fcvt_from_uint(types::F64, idx);
+    let integral = builder.ins().fcmp(FloatCC::Equal, back, num);
+    let key_ok = builder.ins().band(integral, lt_max);
+    let in_len = builder.create_block();
+    builder.ins().brif(key_ok, in_len, &[], slow, &[]);
+    builder.seal_block(in_len);
+
+    // The bounds gate: `elem_len` is the authoritative materialized length.
+    builder.switch_to_block(in_len);
+    let slots_ptr = builder
+        .ins()
+        .iadd_imm_s(dense_base, crux::heap::GCBOX_DATA_OFFSET as i64);
+    let elem_len = builder.ins().load(
+        types::I64,
+        MemFlagsData::new(),
+        slots_ptr,
+        Offset32::new(std::mem::offset_of!(crux::object::ArraySlots, elem_len) as i32),
+    );
+    let in_bounds = builder.ins().icmp(IntCC::UnsignedLessThan, idx, elem_len);
+    builder.ins().brif(in_bounds, load_blk, &[], slow, &[]);
+    builder.seal_block(load_blk);
+
+    // The element load: a hole is spec-absent and must decline to the helper
+    // (the chain may serve it), never be returned.
+    builder.switch_to_block(load_blk);
+    let elem_ptr = builder.ins().load(
+        types::I64,
+        MemFlagsData::new(),
+        slots_ptr,
+        Offset32::new(std::mem::offset_of!(crux::object::ArraySlots, elem_ptr) as i32),
+    );
+    let offset = builder.ins().ishl_imm_u(idx, 3);
+    let addr = builder.ins().iadd(elem_ptr, offset);
+    let bits = builder
+        .ins()
+        .load(types::I64, MemFlagsData::new(), addr, Offset32::new(0));
+    let is_hole = builder
+        .ins()
+        .icmp_imm_u(IntCC::Equal, bits, crux::value::HOLE_BITS as i64);
+    builder.ins().brif(is_hole, slow, &[], hit, &[]);
+    builder.seal_block(hit);
+    builder.switch_to_block(hit);
+    builder.def_var(value, bits);
+    builder.ins().jump(merge, &[]);
+
+    // The helper: the full `[[Get]]` interns the key, serves a prototype
+    // element or accessor, and every non-dense shape.
+    builder.seal_block(slow);
+    builder.switch_to_block(slow);
+    let res = call_helper(
+        builder,
+        helpers,
+        abi,
+        abi.sig_unary,
+        Helper::GetMemberComputed,
+        &[object, key],
+    )?;
+    builder.def_var(value, res);
+    builder.ins().jump(merge, &[]);
+
+    builder.seal_block(merge);
+    builder.switch_to_block(merge);
+    Ok(builder.use_var(value))
 }
 
 /// Emit a helper call with the pending-error ABI: with no try machinery a
