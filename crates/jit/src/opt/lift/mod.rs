@@ -31,7 +31,7 @@ use crate::opt::builder::Builder;
 use crate::opt::ir::{BlockId, Effects, Function, Heap, Imm, Op, Term, Type, ValueId};
 use syntax::ast::{BinaryOp, UnaryOp, UpdateOp};
 
-use runtime::ir::{CompiledBody, FastLoopVar, LeafOp, RelLimit, Step};
+use runtime::ir::{CompiledBody, FastLoopVar, LeafOp, NumRhs, RelLimit, Step};
 
 /// Why a body could not be lifted.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -876,7 +876,11 @@ fn emit_step(
         // `None` placeholders are inert; the `Some` string-builder variants and
         // the Route-B `num` slot need their own slice and refuse.
         Step::BuilderBind { slot: None } | Step::BuilderStore { slot: None } => {}
-        Step::FastLoopBind { num: None, .. } | Step::FastLoopStore { num: None, .. } => {}
+        // `num: Some(slot)` is the Route-B marker: the frame slot `slot` is the
+        // loop-carried accumulator, kept in `Vm::loop_num` at run time and synced
+        // by these two steps. The lift keeps it in the frame slot instead (the
+        // `BinStoreNum` leaf below models that RMW), so both forms are no-ops.
+        Step::FastLoopBind { .. } | Step::FastLoopStore { .. } => {}
         Step::PushAcc => {
             let slot = counter.ok_or(Unsupported::Step("PushAcc"))?;
             let v = emit_frame_load(builder, block, slot);
@@ -1224,6 +1228,42 @@ fn emit_leaf_op(
         LeafOp::BinStoreReg { op, slot } => {
             let cur = emit_frame_load(builder, block, *slot);
             let next = bin(builder, binary_op(*op)?, cur, acc);
+            emit_frame_store(builder, block, *slot, next);
+            next
+        }
+        // Route B: `loop_num = loop_num op <rhs>; acc = Number(loop_num)`. The
+        // lift keeps the loop-carried slot in the frame (see the `FastLoopBind`
+        // no-op), so this is the same frame RMW as `BinStoreReg` with the rhs
+        // computed from the counter or a literal. `plan_loop_num` proved every
+        // operand a Number, so the generic `bin` op is the f64 arithmetic the
+        // interpreter's `num_arith` runs.
+        LeafOp::BinStoreNum { op, slot, rhs } => {
+            let counter = || counter.ok_or(Unsupported::Step("RunRegBody"));
+            let cur = emit_frame_load(builder, block, *slot);
+            let right = match rhs {
+                NumRhs::Acc => acc,
+                NumRhs::Imm(imm) => emit_number(builder, block, *imm),
+                NumRhs::Counter => emit_frame_load(builder, block, counter()?),
+                NumRhs::CounterImm { op: inner, imm } => {
+                    let c = emit_frame_load(builder, block, counter()?);
+                    let i = emit_number(builder, block, *imm);
+                    bin(builder, binary_op(*inner)?, c, i)
+                }
+                NumRhs::CounterImm2 {
+                    op1,
+                    imm1,
+                    op2,
+                    imm2,
+                } => {
+                    let c = emit_frame_load(builder, block, counter()?);
+                    let i1 = emit_number(builder, block, *imm1);
+                    let mid = bin(builder, binary_op(*op1)?, c, i1);
+                    let i2 = emit_number(builder, block, *imm2);
+                    bin(builder, binary_op(*op2)?, mid, i2)
+                }
+                NumRhs::Slot(other) => emit_frame_load(builder, block, *other),
+            };
+            let next = bin(builder, binary_op(*op)?, cur, right);
             emit_frame_store(builder, block, *slot, next);
             next
         }

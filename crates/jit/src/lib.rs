@@ -8297,14 +8297,11 @@ run(); run(); run(); run(); run(); run(); run(); run(); run();";
     }
 
     #[test]
-    fn installed_jit_fused_for_loop_falls_back_and_matches_the_interpreter() {
-        // The fused canonical `for` body is REFUSED by the lift today: the head
-        // gate accepts only the accumulator-path (`FastLoopVar::Counter`)
-        // counter, and this `var` counter compiles to the `Slot`/`Some`-slot
-        // fused form the lift declines. So the body runs on the per-step path;
-        // this asserts the value still matches and pins the refusal via the
-        // per-cache opt count (`opt == 0`), so it fails loudly when the head
-        // gate widens and the body starts lifting.
+    fn installed_jit_lifted_for_loop_matches_the_interpreter() {
+        // The fused canonical `for` (acc-path counter + register body): the
+        // numeric accumulation lifts now that the counter is captured per block
+        // (F0) and the Route-B `num` slot and `BinStoreNum` leaf are modelled
+        // (F1/F2). The body must lift (`opt_bodies`) and match the interpreter.
         let source = "function f(n) {\n\
                         var s = 0;\n\
                         for (var i = 0; i < n; i++) { s = s + i; }\n\
@@ -8320,10 +8317,9 @@ run(); run(); run(); run(); run(); run(); run(); run(); run();";
             with_opt_jit_agent_counts(|agent| agent.run_script(source).expect("runs"));
         assert!(compiled >= 1, "{compiled} bodies must compile");
         assert_eq!(value, interp, "the for loop must match the interpreter");
-        assert_eq!(
-            opt_bodies, 0,
-            "the fused for body is refused by the head gate (got {opt_bodies} opt compiles); \
-             if this changed, the head gate widened — flip this to an opt-path assertion"
+        assert!(
+            opt_bodies >= 1,
+            "the fused for body must lower through the opt path (got {opt_bodies})"
         );
     }
 
