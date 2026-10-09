@@ -341,6 +341,16 @@ The four `installed_jit_lifted_*` tests for the fused-for (S1+S2), the hoist gua
 
 **Measurement.** `scratch/probe_liftrate.sh` (rows producing IR) plus the first-`opt bail` histogram; F0 should clear the `FastLoopHead` rows. Gate: §6, plus the two `..._falls_back_and_matches_the_interpreter` tests flipping back to opt-path assertions when their shape (the fused `for`, the hoist guard) lands.
 
+**F3b — the member-store port (opened 2026-10-09; probe-first).**
+
+The eight `RunRegBody` first-bails, and a slice of the coarse `step` 26, are member **stores**: `AssignMemberName`/`AssignMemberComputed` are unhandled at the `Step` level entirely, and the register-body store leaves (`StoreMemberName`/`StoreMemberNameLocal`/`StoreMemberComputedSlot`/`StoreMemberComputed`/`StoreMemberComputedLocal`) need `Op::MemberStore`/`Op::ElementStore`, which the opt IR defines but `opt_lower` never lowers.
+
+**The parity trap.** A lowering that calls the authoritative `SetMemberName`/`SetMemberComputed` helpers is *correct* but **violates the read-parity contract**: the per-step register path lowers the same leaf through `emit_validated_member_store` (the member-value cell probe → narrow `set_member_slot`) and `emit_dense_array_append_inline` (the dense append), so a helper-only opt lowering is *slower* than the per-step path for exactly the hot store shapes the lift would admit. The port must reproduce the inline machinery instead: the member-cell/shape-gate probe → `set_member_slot`, the deferred inline field store, the dense-array append, and the typed-array element store — the `Lowerer` methods `emit_validated_member_store`/`emit_dense_array_append_inline`/`emit_element_store` lifted into (or shared with) `opt_lower`.
+
+**Design.** (1) `Op::MemberStore { object, value }` with `Imm::Atom(name)` → the validated name store (`StoreMemberName`/`StoreMemberNameLocal`). (2) `Op::ElementStore { object, key, value }` → the dense-append/typed/element store (`StoreMemberComputed*`). (3) The lift arms for the store leaves plus the `Step::AssignMember*` forms (the latter also thread the completion register — `SetCompletion`). (4) `RegOperand` resolution in a leaf arm: `Reg`/`Const` resolve, `Ctx`/`PerIter` refuse (their own slice).
+
+**Acceptance.** The two element-read regression tests (`installed_jit_lifted_dense_array_element_read_inlines`, `installed_jit_lifted_for_element_read_matches_the_interpreter`) plus the corpus store rows (`element_write`, `dyn_key_read`, `index_loop`, `baseline`) at parity (min-of-3), the §6 gate, and the eight `RunRegBody` rows converting.
+
 ### I5 — trial inlining, in full (opened 2026-10-08; probe-first)
 
 Inline a monomorphic callee's `Step`s at a caller's call site, under a size budget, recursing. Targets (`optimizing-tier-plan.md` §6): `method_call` 6x, `js_call` 3.6x, `closure_capture`, `hof_methods`, `apply_call`. It is the **enabler of I6**: an allocation can be elided only where the code that allocates and the code that consumes it are one body, so escape analysis has nothing to work on until the call boundary is gone.
