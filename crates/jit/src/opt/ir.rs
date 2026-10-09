@@ -357,6 +357,11 @@ pub enum Op {
     /// A `for-of`/`for-in` local bind (`Step::ForOfBindLocal`): pops the value
     /// into `imm`'s frame slot. Net stack −1.
     ForOfBindLocal,
+    /// A generic `++`/`--` on `args[0]` (`ToNumeric(x) ± 1`, BigInt-aware),
+    /// lowered through the `update_value_slow` helper; `imm` is the `UpdateOp`
+    /// discriminant. Used by the non-`Counter` fused-loop head, whose counter
+    /// is not Number-proven.
+    UpdateValue,
 }
 
 impl Op {
@@ -437,7 +442,8 @@ impl Op {
             | Op::ForOfClose
             | Op::ForInBegin
             | Op::ForInNext
-            | Op::ForOfBindLocal => E::call(),
+            | Op::ForOfBindLocal
+            | Op::UpdateValue => E::call(),
         }
     }
 }

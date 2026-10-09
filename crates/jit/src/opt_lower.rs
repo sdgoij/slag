@@ -23,7 +23,7 @@ use runtime::jit::{
     VM_ENV_STACK_LEN_OFFSET, VM_FOR_IN_STACK_LEN_OFFSET, VM_FOR_OF_BOUNDARIES_LEN_OFFSET,
     VM_FOR_OF_STACK_LEN_OFFSET, VM_IP_OFFSET, VM_PENDING_LEN_OFFSET, VM_TRY_STACK_LEN_OFFSET,
 };
-use syntax::ast::{BinaryOp, UnaryOp};
+use syntax::ast::{BinaryOp, UnaryOp, UpdateOp};
 
 use crate::Compiled;
 use crate::compiler::{Unsupported, assemble, helper_sig, jit_sig, platform_call_conv};
@@ -982,6 +982,53 @@ fn lower_inst(
             builder
                 .ins()
                 .iconst(types::I64, JsValue::Undefined.bits() as i64)
+        }
+        // A generic `++`/`--` (`ToNumeric(x) ± 1`), the non-`Counter` fused-loop
+        // head's counter update. `imm` is the `UpdateOp` discriminant. A Number
+        // updates inline as an f64 ± 1 (mirrors the per-step `emit_update`, and
+        // is the counter's whole cost); anything else — a BigInt, a coercible
+        // object — takes the general helper.
+        Op::UpdateValue => {
+            let Imm::Int(inc) = inst.imm else {
+                return Err(Unsupported::Step("opt:update-value"));
+            };
+            let value = arg(0)?;
+            let result = builder.declare_var(types::I64);
+            let fast = builder.create_block();
+            let slow = builder.create_block();
+            let merge = builder.create_block();
+            let is_num = is_double(builder, value);
+            builder.ins().brif(is_num, fast, &[], slow, &[]);
+            builder.switch_to_block(fast);
+            let num = builder
+                .ins()
+                .bitcast(types::F64, MemFlagsData::new(), value);
+            let delta = if inc == UpdateOp::Increment as i32 {
+                1.0
+            } else {
+                -1.0
+            };
+            let delta = builder.ins().f64const(delta);
+            let new = builder.ins().fadd(num, delta);
+            let bits = builder.ins().bitcast(types::I64, MemFlagsData::new(), new);
+            let bits = canon_double(builder, bits);
+            builder.def_var(result, bits);
+            builder.ins().jump(merge, &[]);
+            builder.switch_to_block(slow);
+            let inc_imm = builder.ins().iconst(types::I64, inc as i64);
+            let slow_value = call_helper(
+                builder,
+                helpers,
+                abi,
+                abi.sig_unary,
+                Helper::UpdateValueSlow,
+                &[inc_imm, value],
+            )?;
+            builder.def_var(result, slow_value);
+            builder.ins().jump(merge, &[]);
+            builder.seal_block(merge);
+            builder.switch_to_block(merge);
+            builder.use_var(result)
         }
         Op::ForOfClose => {
             call_helper(builder, helpers, abi, abi.sig_tdz, Helper::ForOfClose, &[])?;

@@ -1174,3 +1174,22 @@ stack form) is refused (`is_for_fetch` names it so the bail is explicit).
   `Op::ForInNext` returns the key or `undefined` (a for-in key is always a
   string), and the terminator branches on `!= undefined` and passes the key to
   the bind block as an edge argument.
+
+## 27. The non-`Counter` fused head needs a Number fast path
+
+A fused canonical loop's head is `Counter` (the acc-path, Number-proven) or a
+frame-slot `Slot` (`FastLoopVar::Slot`); `emit_fused_test` accepted only
+`Counter` until 2026-10-09. The `Slot` head's semantics are `fast_loop_inc` — a
+Number increments as `num ± 1`, anything else via `update_value` (ToNumeric,
+BigInt-aware) — so it is a generic `++` plus a generic relational.
+
+- **`Op::UpdateValue`'s lowering MUST inline the Number case.** It lowers
+  through `update_value_slow`, but a plain helper call per iteration regressed
+  `nested_loops` to 44.9ms vs the per-step's 29.3ms (~1.5x slower) — the head
+  is the loop's whole cost and the per-step inlines `num ± 1`. The lowering
+  branches on `is_double`, does an inline `f64` add with `canon_double`, and
+  falls to the helper only for a non-Number. This is the read-parity contract:
+  measure the head-dominated row (`nested_loops`), not a method-call-dominated
+  one (`hof_methods`, ~parity either way).
+- **A `Global` head is still refused.** Its `++` needs the identifier-update
+  machinery (`update_ident`), a separate helper and name resolution.

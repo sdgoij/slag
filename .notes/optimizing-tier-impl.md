@@ -440,6 +440,16 @@ Two adjacent bounded attempts, both **inert and reverted**: (1) a counter *stack
 
 **Still refused.** `ForOfNext` (the non-fused stack form) is named in `is_for_fetch` and refused explicitly. `for_in` additionally needs the non-`Counter` `FastLoopHead`. `opcost/element_read` needs the computed-read cell (its `GetMemberComputedLocal` arm was tried and reverted: the per-step computed read has a computed-read-cell fast path the opt `Op::ElementLoad` lacks, so lifting the row regressed it to a `get_member_computed` per iteration).
 
+### The non-`Counter` fused head (opened 2026-10-09)
+
+**Why.** A fused canonical loop's head is `Counter` (the acc-path, Number-proven) or `Slot`/`Global`; `emit_fused_test` refused everything but `Counter`, walling `nested_loops`, `hof_methods`, `closure_capture`, and (once the for-of/for-in lift landed) `for_in`'s outer loop.
+
+**What the `Slot` head means.** `fast_loop_inc`: a Number increments as `num ± 1`, anything else via `update_value` (ToNumeric, BigInt-aware); `fast_loop_test` compares numerically when both sides are Numbers, else via `apply_binary`. So the head is a generic `++` plus a generic relational.
+
+**The port.** New `Op::UpdateValue { inc }` (`args = [value]`, `Effects::call()`), lowered through `update_value_slow` with the per-step's **inline f64 ± 1 fast path** for a Number — without that path the head regressed `nested_loops` to 44ms vs 29ms, because the helper ran on every iteration. The head arm accepts `Counter | Slot` and still refuses `Global` (the identifier update needs its own machinery). The `Slot` head stores the updated counter and compares with the existing `Op::Lt`/`Le`/`Gt`/`Ge`.
+
+**Status (2026-10-09): landed.** Corpus rows producing IR **64 → 67** (`nested_loops`, `hof_methods`, `closure_capture`); 10 still bail. Parity: `nested_loops` **24.5ms** opt vs **28.1ms** per-step, `closure_capture` 37.2 vs 47.0, `hof_methods` ~parity (method-call-dominated). Corpus JIT-vs-jitless values identical; `language` 23,726/0/0/0 and `built-ins` 23,820/0/1/0 at baseline; `cargo test --workspace` green (jit 351/0); clippy clean. `for_in` now needs only the computed-read cell for its body's `o[k]`.
+
 ### I5 — trial inlining, in full (opened 2026-10-08; probe-first)
 
 Inline a monomorphic callee's `Step`s at a caller's call site, under a size budget, recursing. Targets (`optimizing-tier-plan.md` §6): `method_call` 6x, `js_call` 3.6x, `closure_capture`, `hof_methods`, `apply_call`. It is the **enabler of I6**: an allocation can be elided only where the code that allocates and the code that consumes it are one body, so escape analysis has nothing to work on until the call boundary is gone.

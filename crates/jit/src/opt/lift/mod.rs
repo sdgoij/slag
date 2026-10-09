@@ -1985,11 +1985,11 @@ fn emit_fused_test(
             (cmp(builder, Op::Ge, l, r), false)
         }
         // The fused loop head: increment the counter, re-test, and jump back to
-        // the body when the test passes. Only the acc-path
-        // (`FastLoopVar::Counter`) is accepted — its compile gate proves the init
-        // a Number, so the counter is a Number and `slot = slot ± 1` / `slot op
-        // limit` are exact; the general `Slot`/`Global` head runs the generic
-        // `++`/relational fallback, which no IR op reproduces.
+        // the body when the test passes. The acc-path (`FastLoopVar::Counter`)
+        // counter is Number-proven, so plain arithmetic is exact; a frame-slot
+        // (`Slot`) counter may be a non-Number (`fast_loop_inc`'s general path),
+        // so its update is the generic `++`/`--` (`Op::UpdateValue`). A global
+        // counter needs the identifier update machinery — refused.
         Step::FastLoopHead {
             var,
             op,
@@ -1997,24 +1997,36 @@ fn emit_fused_test(
             inc,
             ..
         } => {
-            if !matches!(var, FastLoopVar::Counter) {
-                return Err(Unsupported::Step("FastLoopHead"));
-            }
-            let slot = counter.ok_or(Unsupported::Step("FastLoopHead"))?;
-            let cur = slot_load(builder, slot);
-            let one = num(builder, 1.0);
-            let step_op = match inc {
-                UpdateOp::Increment => Op::Add,
-                UpdateOp::Decrement => Op::Sub,
+            let slot = match var {
+                FastLoopVar::Counter => counter.ok_or(Unsupported::Step("FastLoopHead"))?,
+                FastLoopVar::Slot(slot) => *slot,
+                FastLoopVar::Global(_) => return Err(Unsupported::Step("FastLoopHead")),
             };
-            let next = builder.emit(
-                block,
-                step_op,
-                &[cur, one],
-                Type::Unknown,
-                step_op.default_effects(),
-                Imm::None,
-            );
+            let cur = slot_load(builder, slot);
+            let next = if matches!(var, FastLoopVar::Counter) {
+                let one = num(builder, 1.0);
+                let step_op = match inc {
+                    UpdateOp::Increment => Op::Add,
+                    UpdateOp::Decrement => Op::Sub,
+                };
+                builder.emit(
+                    block,
+                    step_op,
+                    &[cur, one],
+                    Type::Unknown,
+                    step_op.default_effects(),
+                    Imm::None,
+                )
+            } else {
+                builder.emit(
+                    block,
+                    Op::UpdateValue,
+                    &[cur],
+                    Type::Unknown,
+                    Op::UpdateValue.default_effects(),
+                    Imm::Int(*inc as i32),
+                )
+            };
             builder.emit_void(
                 block,
                 Op::FrameStore,

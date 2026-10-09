@@ -2212,6 +2212,59 @@ mod tests {
     }
 
     #[test]
+    fn opt_tier_slot_counter_head_matches_the_interpreter() {
+        // The non-`Counter` fused head: a nested `for` whose counter the
+        // acc-path gate did not prove a Number is a frame-slot (`Slot`) head,
+        // updated by the generic `++` (`Op::UpdateValue`).
+        let source = "function bench() { \
+                        var s = 0; \
+                        for (var i = 0; i < 40; i++) { \
+                          for (var j = 0; j < 40; j++) { s += (i * 31 + j) % 7; } \
+                        } \
+                        return s; \
+                      } \
+                      bench();";
+        let interp = {
+            let mut agent = runtime::Agent::new();
+            agent.initialize_host_defined_realm().expect("realm");
+            agent.run_script(source).expect("interp runs")
+        };
+        let (value, _compiled, opt) =
+            with_opt_jit_agent_counts(|agent| agent.run_script(source).expect("runs"));
+        assert_eq!(value, interp, "the slot-counter head must match");
+        assert!(
+            opt >= 1,
+            "the nested-loop body must lift ({opt} opt bodies)"
+        );
+    }
+
+    #[test]
+    fn opt_tier_non_number_counter_head_matches_the_interpreter() {
+        // A string-initialized counter forces a `Slot` head whose generic
+        // `++` runs the `update_value_slow` helper on the first iteration and
+        // the inline Number path after (both must be exact).
+        let source = "function bench() { \
+                        var s = 0; \
+                        for (var i = '0'; i < 5; i++) { s += 1; } \
+                        return s; \
+                      } \
+                      bench();";
+        let interp = {
+            let mut agent = runtime::Agent::new();
+            agent.initialize_host_defined_realm().expect("realm");
+            agent.run_script(source).expect("interp runs")
+        };
+        let (value, _compiled, opt) =
+            with_opt_jit_agent_counts(|agent| agent.run_script(source).expect("runs"));
+        assert_eq!(value, interp, "the non-number counter head must match");
+        assert_eq!(value.as_number(), Some(5.0));
+        assert!(
+            opt >= 1,
+            "the non-number counter body must lift ({opt} opt bodies)"
+        );
+    }
+
+    #[test]
     fn opt_tier_leaf_guard_resumes_on_a_non_number_value() {
         // L1: a LEAF body (member read only — no calls, no globals) with the
         // typer's read guard. A non-Number read deopts, and the leaf lane must
