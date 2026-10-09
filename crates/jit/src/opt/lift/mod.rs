@@ -29,9 +29,9 @@ use std::sync::atomic::{AtomicU8, Ordering};
 
 use crate::opt::builder::Builder;
 use crate::opt::ir::{BlockId, Effects, Function, Heap, Imm, Op, Term, Type, ValueId};
-use syntax::ast::{BinaryOp, UnaryOp};
+use syntax::ast::{BinaryOp, UnaryOp, UpdateOp};
 
-use runtime::ir::{CompiledBody, RelLimit, Step};
+use runtime::ir::{CompiledBody, FastLoopVar, LeafOp, RelLimit, Step};
 
 /// Why a body could not be lifted.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -166,6 +166,11 @@ fn lift_impl(body: &CompiledBody, guard_reads: bool) -> Result<Function, Unsuppo
         }
     }
     let mut term_rec: Vec<Option<TermRec>> = (0..nb).map(|_| None).collect();
+    // The fused canonical loop's counter slot, tracked across blocks: a
+    // `FastLoopBind` proves the counter's binding is a frame slot (the acc-path
+    // gate), and every in-loop counter access is redirected to the Acc steps,
+    // so the lift models the counter as that slot (see `emit_step`).
+    let mut counter: Option<usize> = None;
     for bi in 0..nb {
         let mut stack: Vec<ValueId> = builder.func().block(bi as BlockId).params.clone();
         let body_end = terms[bi].unwrap_or(ends[bi]);
@@ -182,7 +187,16 @@ fn lift_impl(body: &CompiledBody, guard_reads: bool) -> Result<Function, Unsuppo
                 block_starts[bi] + off,
                 guard_reads,
                 step,
+                counter,
             )?;
+            match step {
+                Step::FastLoopBind {
+                    var: FastLoopVar::Slot(slot),
+                    ..
+                } => counter = Some(*slot),
+                Step::FastLoopStore { .. } => counter = None,
+                _ => {}
+            }
         }
         term_rec[bi] = Some(match terms[bi] {
             Some(ti) => match &steps[ti] {
@@ -237,8 +251,17 @@ fn lift_impl(body: &CompiledBody, guard_reads: bool) -> Result<Function, Unsuppo
             }
             TermRec::FusedTest(stack) => {
                 let ti = terms[bi].ok_or(Unsupported::Invalid)?;
+                // A `FastLoopHead`'s fall-through is its `after` label, so the
+                // block end must be exactly that (the compiler places it there).
+                if let Step::FastLoopHead { after, .. } = &steps[ti]
+                    && *after != end
+                {
+                    return Err(Unsupported::Malformed(
+                        "FastLoopHead after is not the fall-through",
+                    ));
+                }
                 let (cond, jump_when_true) =
-                    emit_fused_test(&mut builder, bi as BlockId, &steps[ti], tdz)?;
+                    emit_fused_test(&mut builder, bi as BlockId, &steps[ti], tdz, counter)?;
                 let target = jump_target(&steps[ti]).ok_or(Unsupported::Invalid)?;
                 let sb = block_of[target] as BlockId;
                 let fb = block_of[end] as BlockId;
@@ -360,6 +383,20 @@ fn stack_delta(step: &Step) -> Result<i32, Unsupported> {
         } => -(*argc as i32) - 1,
         // A `CallIntrinsic` has the same shape as `CallFast`.
         Step::CallIntrinsic { argc, .. } => -(*argc as i32) - 1,
+        // The fused canonical loop machinery (the lift-widening slice): the
+        // `FastLoop*`/`Builder*` steps are no-ops in the counter-is-the-slot
+        // model, `RunRegBody` uses the accumulator and truncates its transient
+        // stack use (net 0), and the Acc steps move the counter on/off the
+        // operand stack. `FastLoopHead` is a terminator (see `jump_target`).
+        Step::BuilderBind { .. }
+        | Step::BuilderStore { .. }
+        | Step::FastLoopBind { .. }
+        | Step::FastLoopStore { .. }
+        | Step::IncAcc
+        | Step::DecAcc
+        | Step::RunRegBody { .. } => 0,
+        Step::PushAcc => 1,
+        Step::PopAcc => -1,
         other => return Err(Unsupported::Step(step_name(other))),
     })
 }
@@ -440,6 +477,7 @@ fn is_fused_test(step: &Step) -> bool {
             | Step::JumpIfLeGlobalImm { .. }
             | Step::JumpIfGtGlobalImm { .. }
             | Step::JumpIfGeGlobalImm { .. }
+            | Step::FastLoopHead { .. }
     )
 }
 
@@ -457,6 +495,9 @@ fn jump_target(step: &Step) -> Option<usize> {
         | Step::JumpIfLeGlobalImm { target, .. }
         | Step::JumpIfGtGlobalImm { target, .. }
         | Step::JumpIfGeGlobalImm { target, .. } => Some(*target),
+        // The fused loop head jumps back to `body_start` when the test passes
+        // (its fall-through is `after`).
+        Step::FastLoopHead { body_start, .. } => Some(*body_start),
         _ => None,
     }
 }
@@ -515,6 +556,7 @@ fn guard_read_value(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn emit_step(
     builder: &mut Builder,
     block: BlockId,
@@ -523,6 +565,7 @@ fn emit_step(
     index: usize,
     guard_reads: bool,
     step: &Step,
+    counter: Option<usize>,
 ) -> Result<(), Unsupported> {
     let is_tdz = |slot: usize| tdz.get(slot).copied().unwrap_or(false);
     match step {
@@ -791,6 +834,48 @@ fn emit_step(
             );
             stack.push(result);
         }
+        // The fused canonical loop machinery (the lift-widening slice). The
+        // counter is modelled as its binding frame slot: the acc-path gate proves
+        // the init a Number and every in-loop counter access is redirected to the
+        // Acc steps, so `FastLoopBind`/`FastLoopStore` (which only move the
+        // counter between the slot and the dedicated `Vm` field) are no-ops, and
+        // the Acc steps read/write the slot. The `BuilderBind`/`BuilderStore`
+        // `None` placeholders are inert; the `Some` string-builder variants and
+        // the Route-B `num` slot need their own slice and refuse.
+        Step::BuilderBind { slot: None } | Step::BuilderStore { slot: None } => {}
+        Step::FastLoopBind { num: None, .. } | Step::FastLoopStore { num: None, .. } => {}
+        Step::PushAcc => {
+            let slot = counter.ok_or(Unsupported::Step("PushAcc"))?;
+            let v = emit_frame_load(builder, block, slot);
+            stack.push(v);
+        }
+        Step::PopAcc => {
+            let slot = counter.ok_or(Unsupported::Step("PopAcc"))?;
+            let value = stack.pop().ok_or(Unsupported::Stack)?;
+            emit_frame_store(builder, block, slot, value);
+        }
+        Step::IncAcc | Step::DecAcc => {
+            let slot = counter.ok_or(Unsupported::Step("IncAcc"))?;
+            let cur = emit_frame_load(builder, block, slot);
+            let one = emit_number(builder, block, 1.0);
+            let op = if matches!(step, Step::IncAcc) {
+                Op::Add
+            } else {
+                Op::Sub
+            };
+            let next = builder.emit(
+                block,
+                op,
+                &[cur, one],
+                Type::Unknown,
+                op.default_effects(),
+                Imm::None,
+            );
+            emit_frame_store(builder, block, slot, next);
+        }
+        Step::RunRegBody { ops } => {
+            emit_reg_body(builder, block, ops, counter)?;
+        }
         other => return Err(Unsupported::Step(step_name(other))),
     }
     Ok(())
@@ -808,6 +893,149 @@ fn emit_tdz_check(builder: &mut Builder, block: BlockId, slot: usize) {
     );
 }
 
+/// A frame-slot load / store and a numeric constant, the building blocks of the
+/// fused-loop and register-body lowering.
+fn emit_frame_load(builder: &mut Builder, block: BlockId, slot: usize) -> ValueId {
+    builder.emit(
+        block,
+        Op::FrameLoad,
+        &[],
+        Type::Unknown,
+        Effects::read(Heap::Slots),
+        Imm::Slot(slot as u32),
+    )
+}
+
+fn emit_frame_store(builder: &mut Builder, block: BlockId, slot: usize, value: ValueId) {
+    builder.emit_void(
+        block,
+        Op::FrameStore,
+        &[value],
+        Effects::write(Heap::Slots),
+        Imm::Slot(slot as u32),
+    );
+}
+
+fn emit_number(builder: &mut Builder, block: BlockId, v: f64) -> ValueId {
+    builder.emit(
+        block,
+        Op::Const,
+        &[],
+        Type::Number,
+        Effects::pure(),
+        Imm::Float(v),
+    )
+}
+
+/// Lower a `RunRegBody` (`[LeafOp]`) into IR ops. The register executor's
+/// accumulator is scratch, seeded `undefined` (mirrors `seed_acc_undefined`);
+/// its final value is discarded and its transient operand-stack use is
+/// truncated, so the run has no net stack effect. `counter` is the enclosing
+/// fused loop's counter slot, which `LoadCounter` reads. Each `LeafOp` is
+/// lowered to the *generic* IR op — the register path's Number-provenance
+/// inline is an optimization, and the generic op computes the same
+/// `apply_binary`/`apply_unary`, so the result is exact.
+fn emit_reg_body(
+    builder: &mut Builder,
+    block: BlockId,
+    ops: &[LeafOp],
+    counter: Option<usize>,
+) -> Result<(), Unsupported> {
+    let mut acc = builder.emit(
+        block,
+        Op::Const,
+        &[],
+        Type::Unknown,
+        Effects::pure(),
+        Imm::U64(crux::Value::Undefined.bits()),
+    );
+    for op in ops {
+        acc = emit_leaf_op(builder, block, op, acc, counter)?;
+    }
+    Ok(())
+}
+
+fn emit_leaf_op(
+    builder: &mut Builder,
+    block: BlockId,
+    op: &LeafOp,
+    acc: ValueId,
+    counter: Option<usize>,
+) -> Result<ValueId, Unsupported> {
+    let load = |b: &mut Builder, slot: usize, t: bool| -> ValueId {
+        if t {
+            emit_tdz_check(b, block, slot);
+        }
+        emit_frame_load(b, block, slot)
+    };
+    let bin = |b: &mut Builder, o: Op, l: ValueId, r: ValueId| -> ValueId {
+        b.emit(
+            block,
+            o,
+            &[l, r],
+            binary_type(o),
+            o.default_effects(),
+            Imm::None,
+        )
+    };
+    Ok(match op {
+        LeafOp::LoadReg { slot, tdz: t } => load(builder, *slot, *t),
+        LeafOp::LoadCounter => {
+            let slot = counter.ok_or(Unsupported::Step("RunRegBody"))?;
+            emit_frame_load(builder, block, slot)
+        }
+        LeafOp::LoadConst(value) => {
+            let (imm, ty) = constant(value)?;
+            builder.emit(block, Op::Const, &[], ty, Effects::pure(), imm)
+        }
+        LeafOp::BinReg { op, slot, tdz: t } => {
+            let right = load(builder, *slot, *t);
+            bin(builder, binary_op(*op)?, acc, right)
+        }
+        LeafOp::BinLeftReg { op, slot } => {
+            let left = emit_frame_load(builder, block, *slot);
+            bin(builder, binary_op(*op)?, left, acc)
+        }
+        LeafOp::BinImm { op, imm } => {
+            let right = emit_number(builder, block, *imm);
+            bin(builder, binary_op(*op)?, acc, right)
+        }
+        LeafOp::BinImmLocal {
+            op,
+            slot,
+            tdz: t,
+            imm,
+        } => {
+            let left = load(builder, *slot, *t);
+            let right = emit_number(builder, block, *imm);
+            bin(builder, binary_op(*op)?, left, right)
+        }
+        LeafOp::BinConst { op, value } => {
+            let (imm, ty) = constant(value)?;
+            let right = builder.emit(block, Op::Const, &[], ty, Effects::pure(), imm);
+            bin(builder, binary_op(*op)?, acc, right)
+        }
+        LeafOp::StoreReg { slot, tdz: t } => {
+            if *t {
+                emit_tdz_check(builder, block, *slot);
+            }
+            emit_frame_store(builder, block, *slot, acc);
+            acc
+        }
+        LeafOp::BinStoreReg { op, slot } => {
+            let cur = emit_frame_load(builder, block, *slot);
+            let next = bin(builder, binary_op(*op)?, cur, acc);
+            emit_frame_store(builder, block, *slot, next);
+            next
+        }
+        // The remaining leaf ops (the member/frame-vector stores, the operand
+        // stack's `BinAccPop`/`PushAcc`, the `UpdateAcc` BigInt case, the Route-B
+        // num/int forms, and the context/per-iteration reads) need their own
+        // slice; refuse so the body keeps the per-step path.
+        _ => return Err(Unsupported::Step("RunRegBody")),
+    })
+}
+
 /// Emit the comparison of a fused test step and return the condition value plus
 /// whether the step jumps to its target when that condition is *true* (only
 /// `JumpIfNeqImm` does; every other fused test jumps when it is false). Mirrors
@@ -818,6 +1046,7 @@ fn emit_fused_test(
     block: BlockId,
     step: &Step,
     tdz: &[bool],
+    counter: Option<usize>,
 ) -> Result<(ValueId, bool), Unsupported> {
     let slot_load = |b: &mut Builder, slot: usize| -> ValueId {
         if tdz.get(slot).copied().unwrap_or(false) {
@@ -923,6 +1152,51 @@ fn emit_fused_test(
             let l = global(builder, *name);
             let r = num(builder, *imm);
             (cmp(builder, Op::Ge, l, r), false)
+        }
+        // The fused loop head: increment the counter, re-test, and jump back to
+        // the body when the test passes. Only the acc-path
+        // (`FastLoopVar::Counter`) is accepted — its compile gate proves the init
+        // a Number, so the counter is a Number and `slot = slot ± 1` / `slot op
+        // limit` are exact; the general `Slot`/`Global` head runs the generic
+        // `++`/relational fallback, which no IR op reproduces.
+        Step::FastLoopHead {
+            var,
+            op,
+            limit,
+            inc,
+            ..
+        } => {
+            if !matches!(var, FastLoopVar::Counter) {
+                return Err(Unsupported::Step("FastLoopHead"));
+            }
+            let slot = counter.ok_or(Unsupported::Step("FastLoopHead"))?;
+            let cur = slot_load(builder, slot);
+            let one = num(builder, 1.0);
+            let step_op = match inc {
+                UpdateOp::Increment => Op::Add,
+                UpdateOp::Decrement => Op::Sub,
+            };
+            let next = builder.emit(
+                block,
+                step_op,
+                &[cur, one],
+                Type::Unknown,
+                step_op.default_effects(),
+                Imm::None,
+            );
+            builder.emit_void(
+                block,
+                Op::FrameStore,
+                &[next],
+                Effects::write(Heap::Slots),
+                Imm::Slot(slot as u32),
+            );
+            let limit_v = match limit {
+                RelLimit::Imm(i) => num(builder, *i),
+                RelLimit::Slot(s) => slot_load(builder, *s),
+                RelLimit::Global(name) => global(builder, *name),
+            };
+            (cmp(builder, binary_op(*op)?, next, limit_v), true)
         }
         other => return Err(Unsupported::Step(step_name(other))),
     })
