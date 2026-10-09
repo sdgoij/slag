@@ -8203,6 +8203,57 @@ run(); run(); run(); run(); run(); run(); run(); run(); run();";
     }
 
     #[test]
+    fn installed_jit_lifted_global_read_inlines() {
+        // Parity port 3: a `while` body reading an env-resolved global (`G`
+        // resolves as `BindingLoc::Env` in a function body → `Op::IdentLoad`)
+        // must serve the read from the inline global-value cell, not the
+        // `load_ident` helper per iteration. The counting wrapper proves it and
+        // the value must match the interpreter.
+        static IDENT_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        extern "C" fn counting_ident(ctx: *mut c_void, name: u64) -> u64 {
+            IDENT_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            (runtime::jit::JIT_SLOW_PATHS.load_ident)(ctx, name)
+        }
+        let mut helpers = runtime_helpers();
+        helpers.load_ident = Some(counting_ident);
+
+        let source = "var G = 5;\n\
+                      function f(n) {\n\
+                        var s = 0;\n\
+                        var i = 0;\n\
+                        while (i < n) { s = (s + G) | 0; i = i + 1; }\n\
+                        return s;\n\
+                      }\n\
+                      f(100000);";
+        let interp = {
+            let mut agent = runtime::Agent::new();
+            agent.initialize_host_defined_realm().expect("realm");
+            agent.run_script(source).expect("interp runs")
+        };
+
+        extern "C" fn noop_drop(_cache: *mut c_void) {}
+        let mut agent = runtime::Agent::new();
+        agent.initialize_host_defined_realm().expect("realm");
+        let mut cache = JitCache::new(helpers).expect("isa");
+        agent.jit_hook = Some(runtime::jit::JitHook {
+            cache: (&mut cache as *mut JitCache) as *mut c_void,
+            lookup: jit_cache_lookup,
+            drop_cache: noop_drop,
+            helpers: &runtime::jit::JIT_SLOW_PATHS,
+        });
+        let value = agent.run_script(source).expect("jit runs");
+        let compiled = cache.compiled_count();
+        agent.jit_hook = None;
+        assert_eq!(value, interp, "the global read must match the interpreter");
+        assert!(compiled >= 1, "{compiled} bodies must compile");
+        let calls = IDENT_CALLS.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            calls < 100,
+            "the lifted read loop must inline the global-value cell ({calls} load_ident calls)"
+        );
+    }
+
+    #[test]
     fn installed_jit_computed_read_cell_inlines() {
         // G8: a compiled `o[k]` read with a String key over an own data property
         // must serve from the computed-read cell — the counting wrapper proves

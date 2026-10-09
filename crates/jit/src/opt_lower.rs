@@ -15,10 +15,10 @@ use cranelift_codegen::ir::{
 use cranelift_codegen::isa::{CallConv, TargetIsa};
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Variable};
 use crux::Value as JsValue;
-use runtime::ir::{INTRINSICS, Intrinsic};
+use runtime::ir::{GLOBAL_CELLS, INTRINSICS, Intrinsic};
 use runtime::jit::{
-    DISPATCH_DEOPT, JitCallContext, VM_COMPLETION_IS_EMPTY_OFFSET, VM_COMPLETION_OFFSET,
-    VM_IP_OFFSET,
+    DISPATCH_DEOPT, GlobalValueCell, JitCallContext, VM_COMPLETION_IS_EMPTY_OFFSET,
+    VM_COMPLETION_OFFSET, VM_IP_OFFSET,
 };
 use syntax::ast::{BinaryOp, UnaryOp};
 
@@ -612,38 +612,24 @@ fn lower_inst(
             let key = arg(1)?;
             emit_element_read(builder, helpers, abi, object, key)?
         }
-        // A lifted `LoadGlobal`: the same `get_global` helper as the per-step
-        // global fast path's miss block.
-        // A `LoadIdent`: the same `load_ident` helper the per-step path uses on
-        // its slow path (the global-value cell fast path is a later slice), so an
-        // optimizing body and a per-step one mean the same thing at the boundary.
-        Op::IdentLoad => {
-            let Imm::Atom(atom) = &inst.imm else {
-                return Err(Unsupported::Step("opt:ident"));
-            };
-            let name = builder.ins().iconst(types::I64, *atom as i64);
-            call_helper(
-                builder,
-                helpers,
-                abi,
-                abi.sig_bool,
-                Helper::LoadIdent,
-                &[name],
-            )?
-        }
+        // A lifted `LoadGlobal`: the inline direct-mapped global-value cell (the
+        // read mirror of the per-step `emit_global_read`), falling back to the
+        // `get_global` helper on a miss.
         Op::GlobalLoad => {
             let Imm::Atom(atom) = &inst.imm else {
                 return Err(Unsupported::Step("opt:global"));
             };
-            let name = builder.ins().iconst(types::I64, *atom as i64);
-            call_helper(
-                builder,
-                helpers,
-                abi,
-                abi.sig_bool,
-                Helper::GetGlobal,
-                &[name],
-            )?
+            emit_global_read(builder, helpers, abi, *atom, false, Helper::GetGlobal)?
+        }
+        // A lifted `LoadIdent` (an env-resolved global read, `BindingLoc::Env`):
+        // the same inline cell probe, gated on the ctx's `globals_unshadowed` (a
+        // hit returns the GLOBAL binding's value, so the body's own reads must not
+        // be shadowed by its chain), falling back to the `load_ident` helper.
+        Op::IdentLoad => {
+            let Imm::Atom(atom) = &inst.imm else {
+                return Err(Unsupported::Step("opt:ident"));
+            };
+            emit_global_read(builder, helpers, abi, *atom, true, Helper::LoadIdent)?
         }
         // A general call (I5c-0): `args = [this, callee, a1..aN]`. The identity
         // lowering materializes the arguments at the working-region base and
@@ -1097,6 +1083,121 @@ fn emit_typed_element_float(
             .ins()
             .load(types::I64, MemFlagsData::new(), addr, Offset32::new(0))
     }
+}
+
+/// The inline direct-mapped global-value read (the read mirror of the per-step
+/// `emit_global_read_probe`): validate the cell's name and captured
+/// identity/generation against the global object's LIVE id/generation, returning
+/// the cached value on a hit and calling `fallback` (`get_global` for
+/// `LoadGlobal`, `load_ident` for `LoadIdent`) on a miss. `gated` adds the
+/// `globals_unshadowed` check an env-resolved read needs.
+fn emit_global_read(
+    builder: &mut FunctionBuilder,
+    helpers: &JitHelpers,
+    abi: &Abi,
+    atom: u32,
+    gated: bool,
+    fallback: Helper,
+) -> Result<ClifValue, Unsupported> {
+    let value = builder.declare_var(types::I64);
+    let probe = builder.create_block();
+    let slow = builder.create_block();
+    let merge = builder.create_block();
+
+    let global = builder.ins().load(
+        types::I64,
+        MemFlagsData::new(),
+        abi.vm,
+        Offset32::new(std::mem::offset_of!(JitCallContext, global_object) as i32),
+    );
+    let cells = builder.ins().load(
+        types::I64,
+        MemFlagsData::new(),
+        abi.vm,
+        Offset32::new(std::mem::offset_of!(JitCallContext, global_value_cells) as i32),
+    );
+    let has_global = builder.ins().icmp_imm_u(IntCC::NotEqual, global, 0);
+    let gate = if gated {
+        let clean = builder.ins().load(
+            types::I8,
+            MemFlagsData::new(),
+            abi.vm,
+            Offset32::new(std::mem::offset_of!(JitCallContext, globals_unshadowed) as i32),
+        );
+        let clean_ok = builder.ins().icmp_imm_u(IntCC::NotEqual, clean, 0);
+        builder.ins().band(has_global, clean_ok)
+    } else {
+        has_global
+    };
+    builder.ins().brif(gate, probe, &[], slow, &[]);
+    builder.seal_block(probe);
+
+    // The fast path: the cell's name and captured version must match the live
+    // global (a stale cell, another realm's global, or a mid-run mutation all
+    // miss).
+    builder.switch_to_block(probe);
+    let live_id = builder.ins().load(
+        types::I64,
+        MemFlagsData::new(),
+        global,
+        Offset32::new(std::mem::offset_of!(crux::JsObject, id) as i32),
+    );
+    let live_gen = builder.ins().load(
+        types::I32,
+        MemFlagsData::new(),
+        global,
+        Offset32::new(std::mem::offset_of!(crux::JsObject, generation) as i32),
+    );
+    let cell = builder.ins().iadd_imm_s(
+        cells,
+        ((atom as usize & (GLOBAL_CELLS - 1)) * std::mem::size_of::<GlobalValueCell>()) as i64,
+    );
+    let cell_name = builder.ins().load(
+        types::I32,
+        MemFlagsData::new(),
+        cell,
+        Offset32::new(std::mem::offset_of!(GlobalValueCell, name) as i32),
+    );
+    let cell_id = builder.ins().load(
+        types::I64,
+        MemFlagsData::new(),
+        cell,
+        Offset32::new(std::mem::offset_of!(GlobalValueCell, global_id) as i32),
+    );
+    let cell_gen = builder.ins().load(
+        types::I32,
+        MemFlagsData::new(),
+        cell,
+        Offset32::new(std::mem::offset_of!(GlobalValueCell, generation) as i32),
+    );
+    let cell_value = builder.ins().load(
+        types::I64,
+        MemFlagsData::new(),
+        cell,
+        Offset32::new(std::mem::offset_of!(GlobalValueCell, value) as i32),
+    );
+    let name_ok = builder
+        .ins()
+        .icmp_imm_u(IntCC::Equal, cell_name, atom as i64);
+    let id_ok = builder.ins().icmp(IntCC::Equal, cell_id, live_id);
+    let gen_ok = builder.ins().icmp(IntCC::Equal, cell_gen, live_gen);
+    let ok = builder.ins().band(name_ok, id_ok);
+    let ok = builder.ins().band(ok, gen_ok);
+    builder.def_var(value, cell_value);
+    builder.ins().brif(ok, merge, &[], slow, &[]);
+
+    // The helper: the full resolve (which also warms the cell for the next
+    // read when the binding is a global data property).
+    builder.seal_block(slow);
+    builder.switch_to_block(slow);
+    let name = builder.ins().iconst(types::I64, atom as i64);
+    let res = call_helper(builder, helpers, abi, abi.sig_bool, fallback, &[name])?;
+    builder.def_var(value, res);
+    builder.ins().jump(merge, &[]);
+
+    builder.seal_block(merge);
+    builder.switch_to_block(merge);
+    Ok(builder.use_var(value))
 }
 
 /// `bits & TAG_MASK == TAG_PREFIX` and `(bits >> 44) & 0xF == TAG_STRING` — the
