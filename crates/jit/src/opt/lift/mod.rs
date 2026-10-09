@@ -205,7 +205,7 @@ fn lift_impl(body: &CompiledBody, guard_reads: bool) -> Result<Function, Unsuppo
                 Step::JumpIfFalse(_) | Step::JumpIfTrue(_) => {
                     TermRec::Branch(stack.pop().ok_or(Unsupported::Stack)?, stack)
                 }
-                other if is_fused_test(other) => TermRec::FusedTest(stack),
+                other if is_fused_test(other) => TermRec::FusedTest { counter, stack },
                 other => return Err(Unsupported::Step(step_name(other))),
             },
             None => TermRec::Jump(stack),
@@ -249,7 +249,7 @@ fn lift_impl(body: &CompiledBody, guard_reads: bool) -> Result<Function, Unsuppo
                     },
                 );
             }
-            TermRec::FusedTest(stack) => {
+            TermRec::FusedTest { counter, stack } => {
                 let ti = terms[bi].ok_or(Unsupported::Invalid)?;
                 // A `FastLoopHead`'s fall-through is its `after` label, so the
                 // block end must be exactly that (the compiler places it there).
@@ -261,7 +261,7 @@ fn lift_impl(body: &CompiledBody, guard_reads: bool) -> Result<Function, Unsuppo
                     ));
                 }
                 let (cond, jump_when_true) =
-                    emit_fused_test(&mut builder, bi as BlockId, &steps[ti], tdz, counter)?;
+                    emit_fused_test(&mut builder, bi as BlockId, &steps[ti], tdz, *counter)?;
                 let target = jump_target(&steps[ti]).ok_or(Unsupported::Invalid)?;
                 let sb = block_of[target] as BlockId;
                 let fb = block_of[end] as BlockId;
@@ -423,7 +423,14 @@ enum TermRec {
     Branch(ValueId, Vec<ValueId>),
     /// A fused test: the condition is emitted from the step at terminator time
     /// (it reads its operands itself), and the stack is passed to both edges.
-    FusedTest(Vec<ValueId>),
+    /// `counter` is captured here, in the first pass, because the fused-loop
+    /// terminators (`FastLoopHead`) are emitted in the second pass — by which
+    /// time the linear counter tracker has already walked the loop-exit block
+    /// and seen its `FastLoopStore` clear the slot.
+    FusedTest {
+        counter: Option<usize>,
+        stack: Vec<ValueId>,
+    },
 }
 
 /// The arguments a predecessor passes into `target`: its stack, or nothing

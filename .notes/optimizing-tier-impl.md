@@ -325,6 +325,8 @@ The four `installed_jit_lifted_*` tests for the fused-for (S1+S2), the hoist gua
 
 **F0 — capture the counter per block.** Record the in-scope `counter` on `TermRec::FusedTest` at terminator time (pass 1) and use that captured value in pass 2, not the end-of-pass value. Behaviour-neutral where the counter is already right (an acc-path loop whose bind precedes its own head), and it unblocks the acc-path loops with `None` slots and a fully-handled register body.
 
+**F0 status (2026-10-09): landed.** Lifted corpus bodies **14 → 37**; rows producing any IR **11 → 36** (23 now lift every body); the `FastLoopHead` first-`opt bail` count **24 → 1**. Gate green: jit 346/0 (parallel and `--test-threads=1`), `cargo test --workspace`, `cargo clippy --workspace --all-targets -- -D warnings`, test262 `language` 23,726/0/0/0 and `built-ins` 23,820/0/1/0, and `scratch/loop_port.js` identical (5000100046) under `--jitless`/`--gc-stress`/`--gc-verify`/`--nursery-stress`. The remaining first-bails are `step` 26, `Push` 11, `RunRegBody` 10 (the register-body leaf set), `FusedLoop` 3 (the `Some` slots), `FastLoopHead` 1 — i.e. F1-F3 next.
+
 **F1 — the `Some` slots.** `FastLoopBind/Store { num: Some(_) }` is the Route-B mirror (`Vm::loop_num` holds the accumulator frame slot `s`); model it as a no-op, exactly as the `None` form. `BuilderBind/Store { slot: Some(_) }` is the string builder — refuse until its own slice.
 
 **F2 — the Route-B leaves.** `LeafOp::BinStoreNum`/`BinStoreInt` (`loop_num = loop_num op rhs`) model as the frame-slot RMW they mirror (`BinStoreReg` semantics), sound because `plan_loop_num`/`plan_loop_int` prove the slot has no other reference while the loop runs.
