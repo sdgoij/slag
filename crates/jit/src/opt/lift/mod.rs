@@ -393,6 +393,15 @@ fn stack_delta(step: &Step) -> Result<i32, Unsupported> {
                 -1
             }
         }
+        // A computed member assignment pops `value` (and, for the compound form,
+        // the old value) plus the key and object, and pushes the stored value.
+        Step::AssignMemberComputed { op } => {
+            if is_compound_assign(op) {
+                -3
+            } else {
+                -2
+            }
+        }
         // A `CallFast` pops `this` + callee + `argc` args and pushes the result.
         Step::CallFast {
             argc,
@@ -725,6 +734,24 @@ fn emit_step(
             );
             // The stored value is the expression result (the per-step arm
             // pushes it).
+            stack.push(value);
+        }
+        // A plain computed assignment (`o[k] = v`, stack `[object, key, value]`),
+        // the inline element store. The compound form is refused.
+        Step::AssignMemberComputed { op } => {
+            if *op != AssignOp::Assign {
+                return Err(Unsupported::Step(step_name(step)));
+            }
+            let value = stack.pop().ok_or(Unsupported::Stack)?;
+            let key = stack.pop().ok_or(Unsupported::Stack)?;
+            let object = stack.pop().ok_or(Unsupported::Stack)?;
+            builder.emit_void(
+                block,
+                Op::ElementStore,
+                &[object, key, value],
+                Op::ElementStore.default_effects(),
+                Imm::None,
+            );
             stack.push(value);
         }
         // A global read through the global object (`LoadGlobal`); the same

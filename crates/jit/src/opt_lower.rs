@@ -627,20 +627,15 @@ fn lower_inst(
             let key = arg(1)?;
             emit_element_read(builder, helpers, abi, object, key)?
         }
-        // A lifted `a[k] = v`: the authoritative computed store helper. `args =
-        // [object, key, value]`; effect-only.
+        // A lifted `a[k] = v`: the inline dense-Array element store (the write
+        // mirror of `emit_element_read`), falling back to `set_member_computed`
+        // for every other receiver, key, or a hole. `args = [object, key,
+        // value]`; effect-only.
         Op::ElementStore => {
             let object = arg(0)?;
             let key = arg(1)?;
             let value = arg(2)?;
-            call_helper(
-                builder,
-                helpers,
-                abi,
-                abi.sig_binary,
-                Helper::SetMemberComputed,
-                &[object, key, value],
-            )?;
+            emit_element_store(builder, helpers, abi, object, key, value)?;
             builder
                 .ins()
                 .iconst(types::I64, JsValue::Undefined.bits() as i64)
@@ -1752,6 +1747,165 @@ fn emit_intrinsic_sentinel(
 /// Emit a helper call with the pending-error ABI: with no try machinery a
 /// helper that hit an interpreter error bails the body with `undefined` (the
 /// runtime surfaces the stored error). Mirrors `call_slow`'s non-try path.
+/// Whether the GC box at `box_ptr` is young (A2): the `flags` word at the
+/// box's offset 0 has the young bit set. An inline store into a young container
+/// cannot create an old->young edge, so it needs no write barrier.
+fn box_ptr_is_young(builder: &mut FunctionBuilder, box_ptr: ClifValue) -> ClifValue {
+    let flags = builder
+        .ins()
+        .load(types::I32, MemFlagsData::new(), box_ptr, Offset32::new(0));
+    let young = builder
+        .ins()
+        .band_imm_u(flags, crux::heap::GC_FLAG_YOUNG as i64);
+    builder.ins().icmp_imm_u(IntCC::NotEqual, young, 0)
+}
+
+/// The inline dense-Array element store (the write mirror of
+/// `emit_element_read`): a dense-Array receiver, a canonical in-bounds index, a
+/// non-hole element, and a barrier-safe value write the element in place with
+/// the interpreter's generation bump. Any decline jumps to `slow`; the write
+/// jumps to `merge`.
+fn emit_dense_element_store(
+    builder: &mut FunctionBuilder,
+    object: ClifValue,
+    key: ClifValue,
+    value: ClifValue,
+    slow: Block,
+    merge: Block,
+) -> Result<(), Unsupported> {
+    let inline = builder.create_block();
+    let probe = builder.create_block();
+    let key_ok_check = builder.create_block();
+    let bounds = builder.create_block();
+    let hole_check = builder.create_block();
+    let value_check = builder.create_block();
+    let fast_write = builder.create_block();
+    builder.ins().jump(inline, &[]);
+    builder.switch_to_block(inline);
+    let object_pattern = (crux::TAG_PREFIX >> 44) | crux::TAG_OBJECT;
+    let tag_bits = builder.ins().ushr_imm_u(object, 44);
+    let obj_ok = builder
+        .ins()
+        .icmp_imm_u(IntCC::Equal, tag_bits, object_pattern as i64);
+    builder.ins().brif(obj_ok, probe, &[], slow, &[]);
+    builder.seal_block(inline);
+    builder.switch_to_block(probe);
+    let obj_ptr = builder.ins().band_imm_u(object, crux::PAYLOAD_MASK as i64);
+    let obj_ptr = builder.ins().ishl_imm_u(obj_ptr, 4);
+    let obj_ptr = builder
+        .ins()
+        .iadd_imm_s(obj_ptr, crux::heap::GCBOX_DATA_OFFSET as i64);
+    let slots_base = builder.ins().load(
+        types::I64,
+        MemFlagsData::new(),
+        obj_ptr,
+        Offset32::new(std::mem::offset_of!(crux::JsObject, array_dense) as i32),
+    );
+    let slots_ok = builder.ins().icmp_imm_u(IntCC::NotEqual, slots_base, 0);
+    builder.ins().brif(slots_ok, key_ok_check, &[], slow, &[]);
+    builder.seal_block(probe);
+    builder.switch_to_block(key_ok_check);
+    let num = builder.ins().bitcast(types::F64, MemFlagsData::new(), key);
+    let max = builder.ins().f64const(4294967295.0);
+    let lt_max = builder.ins().fcmp(FloatCC::LessThan, num, max);
+    let idx = builder.ins().fcvt_to_uint_sat(types::I64, num);
+    let back = builder.ins().fcvt_from_uint(types::F64, idx);
+    let integral = builder.ins().fcmp(FloatCC::Equal, back, num);
+    let key_ok = builder.ins().band(integral, lt_max);
+    builder.ins().brif(key_ok, bounds, &[], slow, &[]);
+    builder.seal_block(key_ok_check);
+    builder.switch_to_block(bounds);
+    let slots_ptr = builder
+        .ins()
+        .iadd_imm_s(slots_base, crux::heap::GCBOX_DATA_OFFSET as i64);
+    let elem_len = builder.ins().load(
+        types::I64,
+        MemFlagsData::new(),
+        slots_ptr,
+        Offset32::new(std::mem::offset_of!(crux::object::ArraySlots, elem_len) as i32),
+    );
+    let in_bounds = builder.ins().icmp(IntCC::UnsignedLessThan, idx, elem_len);
+    builder.ins().brif(in_bounds, hole_check, &[], slow, &[]);
+    builder.seal_block(bounds);
+    builder.switch_to_block(hole_check);
+    let elem_ptr = builder.ins().load(
+        types::I64,
+        MemFlagsData::new(),
+        slots_ptr,
+        Offset32::new(std::mem::offset_of!(crux::object::ArraySlots, elem_ptr) as i32),
+    );
+    let offset = builder.ins().ishl_imm_u(idx, 3);
+    let addr = builder.ins().iadd(elem_ptr, offset);
+    let bits = builder
+        .ins()
+        .load(types::I64, MemFlagsData::new(), addr, Offset32::new(0));
+    let is_hole = builder
+        .ins()
+        .icmp_imm_u(IntCC::Equal, bits, crux::value::HOLE_BITS as i64);
+    builder.ins().brif(is_hole, slow, &[], value_check, &[]);
+    builder.seal_block(hole_check);
+    builder.switch_to_block(value_check);
+    let is_prototype = builder.ins().load(
+        types::I8,
+        MemFlagsData::new(),
+        obj_ptr,
+        Offset32::new(std::mem::offset_of!(crux::JsObject, is_prototype) as i32),
+    );
+    let not_prototype = builder.ins().icmp_imm_u(IntCC::Equal, is_prototype, 0);
+    let value_tag = builder.ins().band_imm_u(value, crux::TAG_MASK as i64);
+    let value_not_heap =
+        builder
+            .ins()
+            .icmp_imm_u(IntCC::NotEqual, value_tag, crux::TAG_PREFIX as i64);
+    let slots_young = box_ptr_is_young(builder, slots_base);
+    let barrier_ok = builder.ins().bor(slots_young, value_not_heap);
+    let store_ok = builder.ins().band(not_prototype, barrier_ok);
+    builder.ins().brif(store_ok, fast_write, &[], slow, &[]);
+    builder.seal_block(value_check);
+    builder.switch_to_block(fast_write);
+    builder.ins().store(MemFlagsData::new(), value, addr, 0);
+    let generation_off = Offset32::new(std::mem::offset_of!(crux::JsObject, generation) as i32);
+    let generation = builder
+        .ins()
+        .load(types::I32, MemFlagsData::new(), obj_ptr, generation_off);
+    let new_generation = builder.ins().iadd_imm_u(generation, 1);
+    builder
+        .ins()
+        .store(MemFlagsData::new(), new_generation, obj_ptr, generation_off);
+    builder.ins().jump(merge, &[]);
+    builder.seal_block(fast_write);
+    Ok(())
+}
+
+/// The computed element store: the inline dense-Array write, falling back to
+/// the full `set_member_computed` helper for every other receiver, key, or a
+/// hole.
+fn emit_element_store(
+    builder: &mut FunctionBuilder,
+    helpers: &JitHelpers,
+    abi: &Abi,
+    object: ClifValue,
+    key: ClifValue,
+    value: ClifValue,
+) -> Result<(), Unsupported> {
+    let slow = builder.create_block();
+    let merge = builder.create_block();
+    emit_dense_element_store(builder, object, key, value, slow, merge)?;
+    builder.switch_to_block(slow);
+    call_helper(
+        builder,
+        helpers,
+        abi,
+        abi.sig_binary,
+        Helper::SetMemberComputed,
+        &[object, key, value],
+    )?;
+    builder.ins().jump(merge, &[]);
+    builder.seal_block(merge);
+    builder.switch_to_block(merge);
+    Ok(())
+}
+
 /// The validated member-name store (mirrors the per-step lowerer's
 /// `emit_validated_member_store`): a plain-object receiver whose member-value
 /// cell validates writes through the narrow `set_member_slot` (no generation
