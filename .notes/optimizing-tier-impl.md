@@ -317,6 +317,24 @@ The four `installed_jit_lifted_*` tests for the fused-for (S1+S2), the hoist gua
 - **The literal tests (I6-0a/b) now lift for real.** Both used a `for`-loop body, refused at the fused-loop gate, so they never reached the literal ops. They now use a straight-line body called past `JIT_COMPILE_THRESHOLD` (which the lift accepts), whose IR carries `NewArray`/`NewObject` and `ArrayBegin`/`ArrayEnd`/`ObjectBegin` respectively.
 - **The fused-for and hoist-guard tests assert the fallback.** Neither shape lifts today — the fused `for` refuses at the head gate, and the hoist guard's register body carries a `GetMemberNameLocal` leaf the lift cannot lower. They are renamed `..._falls_back_and_matches_the_interpreter` and assert the value matches through the per-step path plus `opt == 0` (the per-cache count), so they fail loudly when the head/leaf gates widen.
 
+### F — the fused-loop head widening (opened 2026-10-09; probe-first)
+
+**Why.** This is the real coverage wall. The first-`opt bail` histogram over the 77 rows is `step` 26, `FastLoopHead` 24, `Push` 11, `RunRegBody` 10 — and *no* corpus row's lifted IR contains a single fused-loop op. The ordinary `for (var i = 0; i < n; i++)` — the dominant corpus shape — is refused, so the I6-0, I4, and I-vector work sits behind it.
+
+**The probe (2026-10-09).** Dumping a loop's steps (`f1` = `for (var i = 0; i < n; i++) { s = s + 1; }` — acc-path, `None` slots, a fully-handled register body) shows the cause is not the head gate at all. The counter is a **first-pass linear variable** (`counter` in `lift_impl`), but the `FastLoopHead` is a *terminator*, emitted in the **second pass** (`TermRec::FusedTest`) — after the first pass has already walked the loop-exit block and cleared `counter` with `FastLoopStore`. So every fused loop's head reads `counter == None` and bails at `counter.ok_or(Unsupported::Step("FastLoopHead"))`. The 24 rows that name `FastLoopHead` are this bug, not the head's `var`; rows that bail on the `Some` slots or a leaf op bail in pass 1 and never reach the head (which is why the ones reported as "reached `RunRegBody`" are exactly the ones whose `Some`/leaf gate fired first).
+
+**F0 — capture the counter per block.** Record the in-scope `counter` on `TermRec::FusedTest` at terminator time (pass 1) and use that captured value in pass 2, not the end-of-pass value. Behaviour-neutral where the counter is already right (an acc-path loop whose bind precedes its own head), and it unblocks the acc-path loops with `None` slots and a fully-handled register body.
+
+**F1 — the `Some` slots.** `FastLoopBind/Store { num: Some(_) }` is the Route-B mirror (`Vm::loop_num` holds the accumulator frame slot `s`); model it as a no-op, exactly as the `None` form. `BuilderBind/Store { slot: Some(_) }` is the string builder — refuse until its own slice.
+
+**F2 — the Route-B leaves.** `LeafOp::BinStoreNum`/`BinStoreInt` (`loop_num = loop_num op rhs`) model as the frame-slot RMW they mirror (`BinStoreReg` semantics), sound because `plan_loop_num`/`plan_loop_int` prove the slot has no other reference while the loop runs.
+
+**F3 — the member leaves.** `GetMemberNameLocal`/`StoreMemberComputedSlot` via the same member helpers the per-step path uses.
+
+**F4 — the general fused head.** `FastLoopHead { var: Slot | Global }` (the path `f2`/`g1` take): the counter is a frame slot, so model the increment as a `FrameStore` and the test with the same `slot_load`/`emit_fused_test` machinery the acc path already uses.
+
+**Measurement.** `scratch/probe_liftrate.sh` (rows producing IR) plus the first-`opt bail` histogram; F0 should clear the `FastLoopHead` rows. Gate: §6, plus the two `..._falls_back_and_matches_the_interpreter` tests flipping back to opt-path assertions when their shape (the fused `for`, the hoist guard) lands.
+
 ### I5 — trial inlining, in full (opened 2026-10-08; probe-first)
 
 Inline a monomorphic callee's `Step`s at a caller's call site, under a size budget, recursing. Targets (`optimizing-tier-plan.md` §6): `method_call` 6x, `js_call` 3.6x, `closure_capture`, `hof_methods`, `apply_call`. It is the **enabler of I6**: an allocation can be elided only where the code that allocates and the code that consumes it are one body, so escape analysis has nothing to work on until the call boundary is gone.
