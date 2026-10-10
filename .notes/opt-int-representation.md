@@ -158,7 +158,25 @@ the representation is a property of a value, so it is global or absent):
   a parallel-test failure; regression test
   `opt_tier_int_value_survives_a_guard_deopt`).
 
-Measured (isolated, min-of-3, opt vs `SLAG_OPT=0`):
+Measured two ways. **Isolated, min-of-5, HEAD build vs this build** (`scratch/row-after-ab.sh`, the only reliable instrument — the corpus `mean-jitGap` moves ±0.7 run-to-run on the *same* binary and its big rows ±60 ms, which is what made the first corpus diff of this change look like a wash):
+
+| row | HEAD | this | delta |
+| --- | --- | --- | --- |
+| `opcost/baseline` | 1.344 | 0.292 | **-78%** |
+| `opcost/object_alloc` | 1.366 | 0.252 | **-82%** |
+| `opcost/array_alloc` | 0.608 | 0.251 | **-59%** |
+| `opcost/array_at` | 2.646 | 2.618 | -1% |
+| `opcost/element_write` | 0.694 | 0.714 | +3% |
+| `opcost/element_read` | 0.686 | 0.884 | **+29%** |
+| `objects/destructure` | 169.4 | 168.7 | -0.4% |
+| `control/generator_loop` | 76.0 | 77.3 | +2% |
+| `arrays/typed_array` | 42.4 | 39.6 | -7% |
+| `calls/construct_churn` | 94.1 | 95.8 | +2% |
+| `opcost/array_to_sorted` | 148.6 | 147.6 | -1% |
+
+The rows a single corpus run flagged as regressions (`destructure`, `generator_loop`, `construct_churn`, `array_to_sorted`) are **flat** under the isolated harness — do not trust a one-shot corpus diff for this.
+
+The opt-vs-`SLAG_OPT=0` view (min-of-3) of the same rows:
 
 | row | before | after |
 | --- | --- | --- |
@@ -168,16 +186,34 @@ Measured (isolated, min-of-3, opt vs `SLAG_OPT=0`):
 | `opcost/array_alloc` | 0.59 vs 0.68 (-12%) | 0.26 vs 0.69 (-63%) |
 | `opcost/element_read` | 0.70 vs 0.78 (-10%) | 0.92 vs 0.81 (+13%) |
 
-The headline regression is closed (baseline 1.35 -> 0.30 ms, 4.5x). The
-residuals are honest: `baseline` is ~+12% off the per-step lane (the counter's
-`i & MASK` range guard, a separate range proof), and `element_read` regressed
-— its `s = (s + arr[k]) | 0` accumulator is an `Int` that lives in a **frame
-slot** `mem2reg` does not promote (the body's `new Array` observes the frame),
-so it pays an i32<->word conversion per iteration. Promoting the int slots in a
-body with an observing call is the next lever (a per-slot observability check,
-not the whole-function `slots_unobserved`).
+The headline regression is closed (baseline 1.34 -> 0.29 ms, 4.6x; object_alloc
+5.4x; array_alloc 2.4x). `element_read` is the one real regression (+29%): its
+`k = i & MASK` result is a proven `Int` stored to a **frame slot** `mem2reg`
+does not promote (the body's `new Array` gives the whole function a Slots
+observer, so `slots_unobserved` is false), and each iteration then pays an
+i32<->word conversion on the store and the load.
+
+Two ways to close it, neither taken yet. (a) A per-slot promotion: a frame slot
+is a GC root and a call may read the frame, so promoting one the body's own call
+might observe is unsound unless the slot is proven not live across the observer
+— this needs real per-slot liveness, not a tweak to `slots_unobserved`, and is
+too risky for one micro-row. (b) Type selection: `narrow` types every bit-op
+result `Int`, but `k` here feeds only an element key (an i64 context), so it
+did not need the i32 representation at all — a consumer-driven int-use
+propagation would leave it a `Number` and remove the conversions without
+relaxing anything. (b) is the safer lever.
+
+`baseline` is ~+12% off the per-step lane: its counter `i` is a `Number`, so
+`i & MASK` keeps the f64 range guard — a separate range proof on the loop
+counter, not the representation.
 
 Gates: clippy clean; `cargo test --workspace` green (parallel; the serial-only
 `opt_tier_leaf_guard` failure predates this change); test262 `language`
 23726/0/0/0 and `built-ins` 23820/0/1/0 at `--timeout 15`; corpus differential
 0 mismatches; `--gc-stress` values exact on the int rows.
+
+Measurement note: the corpus `mean-jitGap` is not trustworthy at this grain —
+it is dominated by rows with a near-zero `node` denominator and by two
+~400 ms outliers, and it moves ±0.7 on a *fixed* binary. Use the isolated
+min-of-N row A/B (`corpus-row-ab.sh` for opt-vs-per-step, `row-after-ab.sh` for
+binary-vs-binary).
