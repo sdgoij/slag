@@ -52,6 +52,50 @@ mod tests {
         assert_eq!(value.as_number(), Some(3.0));
     }
 
+    #[test]
+    fn two_contexts_on_one_thread() {
+        let mut a = Context::new().unwrap();
+        let mut b = Context::new().unwrap();
+        assert_eq!(a.eval("1 + 1").unwrap().as_number(), Some(2.0));
+        assert_eq!(b.eval("2 + 2").unwrap().as_number(), Some(4.0));
+    }
+
+    #[test]
+    fn contexts_stored_together_survive_moves() {
+        // The host shape the sibling-GC bug bit: several contexts kept in one
+        // container, so pushing reallocates and moves the earlier ones, and a
+        // sibling collection roots the non-current ones.
+        let mut contexts: Vec<Context> = Vec::new();
+        for i in 0..4 {
+            let mut context = Context::new().unwrap();
+            context.eval(&format!("globalThis.tag = {i};")).unwrap();
+            contexts.push(context);
+        }
+        // A collection driven by the last context must root the earlier ones.
+        contexts[3].agent_mut().collect_garbage();
+        for (i, context) in contexts.iter_mut().enumerate() {
+            assert_eq!(
+                context.eval("globalThis.tag").unwrap().as_number(),
+                Some(i as f64)
+            );
+        }
+    }
+
+    #[cfg(feature = "jit")]
+    #[test]
+    fn two_jit_contexts_on_one_thread() {
+        let mut a = Context::new().unwrap();
+        install_jit(&mut a).unwrap();
+        assert_eq!(a.eval("1 + 1").unwrap().as_number(), Some(2.0));
+        let mut b = Context::new().unwrap();
+        install_jit(&mut b).unwrap();
+        // Compile bodies and allocate in `b`, then evaluate in `a`.
+        b.eval("var acc = []; for (var i = 0; i < 20000; i++) { acc.push({ i: i }); } acc.length")
+            .unwrap();
+        assert_eq!(a.eval("1 + 1").unwrap().as_number(), Some(2.0));
+        assert_eq!(b.eval("2 + 2").unwrap().as_number(), Some(4.0));
+    }
+
     /// A host that installs its own global object implements [`api::HostOps`],
     /// so that trait is part of the boundary: this names it through `slag` alone
     /// — no `crux` dependency — builds a context over it, and calls the

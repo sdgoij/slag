@@ -256,7 +256,7 @@ pub(crate) fn live_agent_entered(agent: *mut ()) {
 }
 
 /// The registered live agents' pointers (see [`LIVE_AGENTS`]).
-fn live_agent_ptrs() -> Vec<*const Agent> {
+pub(crate) fn live_agent_ptrs() -> Vec<*const Agent> {
     LIVE_AGENTS.with(|live| live.borrow().iter().map(|&(_, ptr)| ptr).collect())
 }
 

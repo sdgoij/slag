@@ -228,7 +228,14 @@ struct TimerState {
 
 /// The embedding context: an initialized agent plus host globals.
 pub struct Context {
-    agent: Agent,
+    /// Boxed so the agent's address is stable. The GC registers a live agent
+    /// by its address (see `Agent::initialize_host_defined_realm`), and this
+    /// constructor registers before moving the agent into the context and
+    /// returning it by value — an inline agent would leave the registry
+    /// pointing at a dead stack slot, so a sibling context's collection would
+    /// trace a stale address (use-after-free). `api::Isolate::new` boxes for
+    /// the same reason.
+    agent: Box<Agent>,
     callbacks: Rc<RefCell<HostCallbacks>>,
     timers: Rc<RefCell<TimerState>>,
 }
@@ -237,7 +244,7 @@ impl Context {
     /// Create a fresh agent, initialize its realm, and install the
     /// host-defined globals (`console`, timers, the `Math.random` override).
     pub fn new() -> Result<Self, JsError> {
-        let mut agent = Agent::new();
+        let mut agent = Box::new(Agent::new());
         agent.initialize_host_defined_realm()?;
         let callbacks = Rc::new(RefCell::new(HostCallbacks::default()));
         agent.host_hooks = Some(Box::new(RejectionHooks {
@@ -2100,6 +2107,51 @@ mod tests {
 
     fn eval(source: &str) -> JsValue {
         Context::new().unwrap().eval(source).unwrap()
+    }
+
+    #[test]
+    fn a_context_registers_its_agent_at_a_stable_address() {
+        // `Context::new` registers the agent with the thread-local live-agent
+        // registry at realm initialization, then moves the agent into the
+        // context and returns it by value. The registry holds a raw address, so
+        // it must name the address the context keeps for the agent's whole
+        // life, not the dead pre-move stack slot. A sibling context's
+        // collection traces that address, so a stale one is a use-after-free.
+        let context = Context::new().unwrap();
+        let ptr = context.agent() as *const Agent;
+        assert!(
+            crate::agent::live_agent_ptrs().contains(&ptr),
+            "the context's agent must be registered at its own address"
+        );
+        // Moving the context (as the host does when it stores it) must not
+        // change where the agent is rooted either.
+        let moved = context;
+        let moved_ptr = moved.agent() as *const Agent;
+        assert_eq!(ptr, moved_ptr, "the boxed agent must not move");
+        assert!(crate::agent::live_agent_ptrs().contains(&moved_ptr));
+    }
+
+    #[test]
+    fn sibling_allocation_keeps_the_first_context_alive() {
+        // Two live contexts share the thread-local heap. A collection driven by
+        // the second must root the first even though the first is not current
+        // and has not entered a `with_agent` window since being built.
+        let mut first = Context::new().unwrap();
+        first.eval("globalThis.marker = 'alive';").unwrap();
+        let mut second = Context::new().unwrap();
+        second
+            .eval("var acc = []; for (var i = 0; i < 100000; i++) acc.push({ i: i }); acc.length")
+            .unwrap();
+        second.agent_mut().collect_garbage();
+        assert_eq!(
+            first
+                .eval("globalThis.marker")
+                .unwrap()
+                .as_string()
+                .as_deref(),
+            Some("alive")
+        );
+        assert_eq!(first.eval("1 + 1").unwrap().as_number(), Some(2.0));
     }
 
     #[test]
