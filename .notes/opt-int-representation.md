@@ -219,3 +219,30 @@ it is dominated by rows with a near-zero `node` denominator and by two
 ~400 ms outliers, and it moves ±0.7 on a *fixed* binary. Use the isolated
 min-of-N row A/B (`corpus-row-ab.sh` for opt-vs-per-step, `row-after-ab.sh` for
 binary-vs-binary).
+
+## 8. The loop-counter range proof (2026-10-10)
+
+The last guard on `opcost/baseline` was `i & MASK`'s left operand: the counter
+`i` is a `Number` (an `Add` of Numbers may exceed `2^31`), so `narrow` cannot
+type it `Int`, and the lowering kept the f64 range guard the per-step lane
+drops (its plan proved the counter in range). `pass/loop_counter` proves it on
+the IR: a block parameter whose entry edge passes an int32 constant and whose
+single back edge passes `i ± c` bounded by an int32 constant guards every
+reachable value; its increment is then exactly `IntAdd`/`IntSub` and the
+parameter joins to `Int` via `normalize_param_types`.
+
+Measured (min-of-3, opt vs `SLAG_OPT=0`): `opcost/baseline` **0.290 -> 0.098 ms**
+(was +12% off the per-step lane, now **62% faster** — the guard and its `brif`
+were a large part of the loop). No other sampled row moved, and the differential
+stays exact.
+
+Soundness is the whole of this pass, so it is deliberately strict: **every**
+edge into the header must classify (an unrecognised incoming value refuses — an
+edge that was merely *ignored* could carry a value outside the proven range); a
+`Jump` back edge (no guard) refuses; the guard is negated when the header is the
+branch's *false* side; the constant must be private to the increment (one use)
+before it is re-typed; and the span check admits only counters whose range plus
+the step stays in `[i32::MIN, i32::MAX]` (a limit above `2^31`, or within one
+step of the boundary, refuses). Pinned by
+`loop_counter::tests::{proves_a_bounded_counter, refuses_a_counter_beyond_int32}`
+and `opt_tier_bounded_counter_matches_the_interpreter`.

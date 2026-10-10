@@ -34,6 +34,7 @@ pub mod fold;
 pub mod guard;
 pub mod inline;
 pub mod licm;
+pub mod loop_counter;
 pub mod mem2reg;
 pub mod narrow;
 
@@ -70,8 +71,18 @@ pub fn run(
     let cse = cse::run(func);
     let licm = licm::run(func);
     let dropped = dce::run(func);
+    let counted = loop_counter::run(func);
     let retyped = normalize_param_types(func);
-    folded || narrowed || promoted || guarded || inlined || cse || licm || dropped || retyped
+    folded
+        || narrowed
+        || promoted
+        || guarded
+        || inlined
+        || cse
+        || licm
+        || dropped
+        || counted
+        || retyped
 }
 
 /// Type every block parameter as the join of its incoming edge arguments' types.
@@ -219,6 +230,7 @@ pub fn optimize(func: &mut Function) {
     cse::run(func);
     licm::run(func);
     dce::run(func);
+    loop_counter::run(func);
     normalize_param_types(func);
 }
 

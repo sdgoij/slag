@@ -2440,6 +2440,36 @@ mod tests {
     }
 
     #[test]
+    fn opt_tier_bounded_counter_matches_the_interpreter() {
+        // `i & MASK` on a `for (i = 0; i < 1000; i++)` counter: `loop_counter`
+        // proves the counter is int32 for every iteration and rewrites its
+        // increment to `IntAdd`, so `i & MASK` drops the f64 range guard the
+        // per-step lane already drops. Differential, and the body must reach
+        // the tier.
+        let source = "function f() { var MASK = 1023; var s = 0; \
+                        for (var i = 0; i < 1000; i++) { var k = i & MASK; s = (s + k) | 0; } \
+                        return s; } \
+                      var t = 0; \
+                      t += f(); t += f(); t += f(); t += f(); t += f(); \
+                      t += f(); t += f(); t += f(); t += f(); t += f(); \
+                      t;";
+        let interp = {
+            let mut agent = runtime::Agent::new();
+            agent.initialize_host_defined_realm().expect("realm");
+            agent.run_script(source).expect("interp runs")
+        };
+        let before = crate::opt_lower::OPT_COMPILED.load(Ordering::Relaxed);
+        let (value, compiled) = with_opt_jit_agent(|agent| agent.run_script(source).expect("runs"));
+        let lowered = crate::opt_lower::OPT_COMPILED.load(Ordering::Relaxed) - before;
+        assert_eq!(
+            value, interp,
+            "the bounded counter must match the interpreter"
+        );
+        assert!(compiled >= 1, "{compiled} bodies compiled");
+        assert!(lowered >= 1, "the optimizing tier lowered {lowered} bodies");
+    }
+
+    #[test]
     fn opt_tier_modulo_matches_the_interpreter() {
         // `%` takes the inline integer fast path (the integrality, i32-range and
         // nonzero-divisor guards around `srem`) for the in-range loop operands,
