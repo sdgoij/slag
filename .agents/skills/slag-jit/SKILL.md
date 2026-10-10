@@ -1223,5 +1223,24 @@ identity to its interned atom, then the `member_value_cells` value validated by
   and merges a later same-op/same-imm value into an earlier one, so a same-block
   `Type::Undefined` for-in sentinel was merged into an `Unknown` `undefined`
   const and LOST its type — and anything keying on a value's static type (the
-  `=== undefined` inline above, `narrow`'s proofs) then silently degrades. Emit
+  the `=== undefined` inline above, `narrow`'s proofs) then silently degrades. Emit
   every constant with its exact type.
+
+## 29. The LICM hoist guard is a real probe, not a free branch
+
+`crates/runtime` compiles a certified fused loop whose body has loop-invariant
+member/global reads into a `Step::HoistMemberGuard`/`HoistGlobalGuard` head plus
+TWO copies of the loop: a GUARDED copy whose reads are hoisted into hidden frame
+slots (the guard's hit path), and the general per-iteration copy (the miss
+path). The opt lift must not model the guard as "always miss": that is a
+*pessimization*, not a neutral choice — the per-step tier takes the hit and
+reads once, while the opt tier then runs every read per iteration.
+
+- Measured: `objects/own_read` (`s += o.a + o.b`) was **+571%** in the opt tier
+  (19.8 vs 3.0ms) under the always-miss model, and the `globals/*` read rows
+  ~+60% each. The lift now REFUSES the guard (`Err(Unsupported::Step)` in
+  `emit_fused_test`) so those bodies run the per-step tier, which implements it.
+- The refusal costs opt coverage (69 → 63 IR-producing rows) because the guarded
+  copy already lifts (its reads lower to hoist-slot `FrameLoad`s) — only the
+  guard's probe and hoist-slot stores are unmodelled. Implementing the guard in
+  the lift is the follow-up that recovers both the coverage and the hoist.

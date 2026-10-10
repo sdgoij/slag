@@ -2060,21 +2060,18 @@ fn emit_fused_test(
             };
             (cmp(builder, binary_op(*op)?, next, limit_v), true)
         }
-        // A LICM hoist guard: a pure compiler perf-guard. On a hit the guarded
-        // copy runs with a hoisted value, on a miss the general copy; both are
-        // the same loop, so the lift models "always miss" — a constant-false hit
-        // condition jumps (via the `jump_when_false` convention) to the general
-        // copy, and the guarded copy is lifted but never taken.
+        // A LICM hoist guard: the compiler's pre-loop probe that hoists the
+        // loop's invariant member/global reads into hidden slots. On a hit the
+        // GUARDED copy (the fall-through) runs with the reads done once; on a
+        // miss the general copy. The lift models "always miss", which is a
+        // PESSIMIZATION, not a neutral choice: the per-step tier takes the hit
+        // and reads once, so an always-miss opt body runs every read per
+        // iteration. Measured (min-of-3, opt vs `SLAG_OPT=0`): `objects/own_read`
+        // +571%, and the `globals/declarative_read`/`nested_read`/`object_read`
+        // rows ~+60% each. Absent a modelled probe, refuse so those bodies run
+        // the per-step tier, which implements the guard (the parity contract).
         Step::HoistMemberGuard { .. } | Step::HoistGlobalGuard { .. } => {
-            let hit = builder.emit(
-                block,
-                Op::Const,
-                &[],
-                Type::Bool,
-                Effects::pure(),
-                Imm::Bool(false),
-            );
-            (hit, false)
+            return Err(Unsupported::Step(step_name(step)));
         }
         other => return Err(Unsupported::Step(step_name(other))),
     })

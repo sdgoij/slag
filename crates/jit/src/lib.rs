@@ -8573,12 +8573,14 @@ run(); run(); run(); run(); run(); run(); run(); run(); run();";
     }
 
     #[test]
-    fn installed_jit_lifted_hoist_guard_matches_the_interpreter() {
+    fn hoist_guarded_loop_defers_to_the_per_step_tier() {
         // A `for` loop reading an invariant member (`o.x`) makes the compiler
-        // emit a `HoistMemberGuard`; the lift models it as always-miss (the
-        // guard is a pure perf-guard, so the general copy is semantically
-        // identical). With the member leaves handled (F3a) the body lifts and
-        // must match the interpreter.
+        // emit a `HoistMemberGuard` — a pre-loop probe that hoists the read into
+        // a hidden slot, with a guarded fast copy and a general copy. The lift
+        // does not model the probe, and running the general copy unconditionally
+        // is a PESSIMIZATION (measured +571% versus the per-step tier, which
+        // takes the hit), so the lift REFUSES the guard and the body runs the
+        // per-step tier. This asserts the semantics are still exact.
         let source = "function f(o, n) {\n\
                         var s = 0;\n\
                         for (var i = 0; i < n; i++) { s = (s + o.x) | 0; }\n\
@@ -8590,16 +8592,12 @@ run(); run(); run(); run(); run(); run(); run(); run(); run();";
             agent.initialize_host_defined_realm().expect("realm");
             agent.run_script(source).expect("interp runs")
         };
-        let (value, compiled, opt_bodies) =
+        let (value, compiled, _opt_bodies) =
             with_opt_jit_agent_counts(|agent| agent.run_script(source).expect("runs"));
         assert!(compiled >= 1, "{compiled} bodies must compile");
         assert_eq!(
             value, interp,
             "the hoist-guarded loop must match the interpreter"
-        );
-        assert!(
-            opt_bodies >= 1,
-            "the hoist-guarded body must lower through the opt path (got {opt_bodies})"
         );
     }
 
