@@ -107,6 +107,28 @@ duplicate read; to pin.
 This reorders the slices below: the leaf-call lane (§6.1) is the largest
 *absolute* win (one row, ~+50ms), ahead of the int-op work.
 
+**Resolved (2026-10-10).** The cause is the **typer's read guard**. `lift`
+emits `guard_read_value` — a `GuardType` asserting a read's value is a Number so
+the arithmetic that consumes it lowers tag-free — and a guard-bearing body is
+marked `deopts`. Every machine-code inline lane refuses a `deopts` callee (the
+caller has no deopt path), so a *leaf* body carrying the read guard could never
+be inlined and its call fell to `CallSlow`. The per-step tier's bodies are not
+`deopts` (its flag is a diagnostic probe, normally false), so its leaf lane
+fired.
+
+The fix: do **not** emit the read guard for a *leaf* body (`lift` now passes
+`typer_reads_enabled() && !body.leaf`). A leaf body is a call-site inline
+candidate, so its inlinability is worth more than its own tag-free arithmetic;
+a non-leaf body, which no caller inlines, keeps the guard. This is always
+sound — the guard is a speculation, so removing it only leaves the consuming
+arithmetic on its tag-checked path.
+
+Measured: `construct_churn` **222.9 -> 94.7ms** (per-step 91.6, ~parity); the
+census flips to `LeafCallFill` 3,499,133 / `CallSlow` 0 / `LeafCallProbe` 867,
+and the `JIT_LEAF_TRACE` diagnostic shows only the transient `no-compiled-code`
+rejection. The guard's benefit is preserved where it pays (`opcost/dyn_key_read`
+-8.8%, `opcost/baseline` and `objects/destructure` unchanged).
+
 ## 5. `many_objects_read` is (mostly) inherent
 
 `os[i & 1023].w` cycles 1024 objects past the 16-entry direct-mapped member
@@ -116,9 +138,10 @@ its fused-loop register lane does the *element* read inline. The residual is
 
 ## 6. Proposed slices (probe-first, ordered by value)
 
-1. **The inline leaf-call lane for a `this`-taking callee** (§4). The largest
-   *absolute* win (`construct_churn` ~1.5x). The opt's probe must cache its
-   verdict and admit the shape the per-step's admits.
+1. **The inline leaf-call lane for a `this`-taking callee** (§4). **DONE
+   2026-10-10** — the read guard is no longer emitted for a leaf body, so a
+   leaf callee stays inlinable. (`calls/direct_leaf`'s callee still keeps the
+   guard and misses ~6%; revisit if the guard's leaf-body value is worth it.)
 2. **`Int`-proven operands + `call_int_binary` guard elision** (§3.3). Bounded,
    sound (an int32 cannot saturate the f64→i64 conversion), and it helps the 36
    `opcost/*` rows — the largest family. Extend `narrow`'s lattice with an `Int`

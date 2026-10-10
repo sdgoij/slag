@@ -85,7 +85,14 @@ fn typer_reads_enabled() -> bool {
 /// Lift a certified body into the SSA IR (straight line and control flow,
 /// including loops).
 pub fn lift(body: &CompiledBody) -> Result<Function, Unsupported> {
-    lift_impl(body, typer_reads_enabled())
+    // A leaf body is a call-site inline candidate, and the typer's read guard
+    // marks a body `deopts` — which every machine-code inline lane refuses (the
+    // caller has no deopt path), so the guard here costs the whole call site
+    // more than the tag-free arithmetic it buys (measured: `construct_churn`'
+    // `s += new Item(i).sum()` is 1.5x slower in the opt tier with the guard,
+    // the leaf lane falling to `call_slow`). Only a non-leaf body, which no
+    // caller inlines, takes the guard.
+    lift_impl(body, typer_reads_enabled() && !body.leaf)
 }
 
 /// [`lift`] with the typer's read guard forced on or off (tests).

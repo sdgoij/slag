@@ -2895,6 +2895,14 @@ fn certified_verdict(
     }
 }
 
+/// Whether the `JIT_LEAF_TRACE` rejection diagnostic is on, read once per
+/// process.
+fn leaf_trace_on() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("JIT_LEAF_TRACE").is_ok())
+}
+
 extern "C" fn leaf_call_probe(
     ctx: *mut c_void,
     callee: u64,
@@ -2906,6 +2914,21 @@ extern "C" fn leaf_call_probe(
     let ctx = unsafe { ctx_of(ctx) };
     let agent = unsafe { &mut *ctx.agent };
     let vm = unsafe { &mut *ctx.vm };
+    // Diagnostic (`JIT_LEAF_TRACE`): print the first few rejection reasons a
+    // compiled call site's probe hits (cached gate, so it costs one load on the
+    // already-cold rejection path).
+    macro_rules! reject {
+        ($why:expr) => {{
+            if leaf_trace_on() {
+                use std::sync::atomic::{AtomicUsize, Ordering};
+                static N: AtomicUsize = AtomicUsize::new(0);
+                if N.fetch_add(1, Ordering::Relaxed) < 8 {
+                    eprintln!("leaf-probe reject: {}", $why);
+                }
+            }
+            return 0;
+        }};
+    }
     // SAFETY: `record_slot_of` masks below `LEAF_CALL_RECORDS`, and
     // `leaf_records` is the running agent's table, live for this run.
     let cache_entry = unsafe { &mut *ctx.leaf_records.add(record_slot_of(callee, slot)) };
@@ -2934,20 +2957,20 @@ extern "C" fn leaf_call_probe(
     // the compiled hit path routes it to the env lane (`leaf_call_env`)
     // instead of calling it in-frame.
     if !vm.can_inline_leaf() || agent.realm_count.get() != 1 {
-        return 0;
+        reject!("not-at-rest");
     }
     let ValueKind::Function(function) = callee.kind() else {
-        return 0;
+        reject!("not-a-function");
     };
     if !matches!(function.kind, crux::function::FunctionKind::EcmaScript) {
-        return 0;
+        reject!("not-ecmascript");
     }
     // C1: the certified verdict is cached here too (the caller is at rest, the
     // precondition both nested lanes share), so a leaf-refusing site can fall
     // to the certified helper without re-deriving it.
     cache_entry.certified = certified_verdict(agent, &function);
     let Some(entry) = agent.leaf_lookup(function.id()) else {
-        return 0;
+        reject!("leaf-lookup-miss");
     };
     // Copy the fields out before `ir` is cloned: `leaf_lookup` returns a borrow
     // of `agent`, and `strict` is needed much later (the `this` binding), so the
@@ -2955,7 +2978,7 @@ extern "C" fn leaf_call_probe(
     let strict = entry.strict;
     let ir = entry.ir.clone();
     let Some(scope) = ir.scope.as_ref() else {
-        return 0;
+        reject!("no-scope");
     };
     // A body with a `this` slot is inlineable too — the slot is filled below
     // (see `bound_this`). Its `this` reads lower to `LoadLocal { this_slot }`
@@ -2966,7 +2989,7 @@ extern "C" fn leaf_call_probe(
     // interpreter leaf-inline path handles it. The in-flight flag keeps the
     // cache from evicting a frame running right now.
     let Some(hook) = agent.jit_hook else {
-        return 0;
+        reject!("no-jit-hook");
     };
     let info_ptr = crate::jit::lookup_info(hook, &ir, agent.jit_depth > 0);
     if info_ptr.is_null() {
@@ -2982,7 +3005,7 @@ extern "C" fn leaf_call_probe(
         if ir.jit_info.get() != 1 {
             *cache_entry = LeafCallRecord::empty();
         }
-        return 0;
+        reject!("no-compiled-code");
     }
     let compiled = unsafe { &*info_ptr };
     // A body whose machine code can deopt must not be inlined: the caller's
@@ -2992,7 +3015,7 @@ extern "C" fn leaf_call_probe(
     // (`run_jit_leaf`) can resume.
     if compiled.deopts {
         *cache_entry = LeafCallRecord::empty();
-        return 0;
+        reject!("deopts");
     }
     // G13: a body that reads its environment (context-slot steps, or the
     // per-iteration reads) is a certified leaf like any other — the
@@ -3031,11 +3054,11 @@ extern "C" fn leaf_call_probe(
         ctx.buf_end as usize,
         ctx.global_bits,
     ) {
-        return 0;
+        reject!("fill-frame-failed");
     }
     cache_entry.leaf_inline = info;
     if uses_env {
-        return 0;
+        reject!("uses-env");
     }
     compiled.entry as u64
 }

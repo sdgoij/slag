@@ -1263,3 +1263,27 @@ number exactly).
   (0-based variant order); the CLI prints the raw index.
 - It is a **tool, not a fix**: enabling it slows the run (four instructions per
   call site), so measure with it unset. Read it as traffic, never as time.
+
+`JIT_LEAF_TRACE=1` is its companion for the leaf-call lane: the first few
+`leaf_call_probe` rejection reasons are printed (cached gate, so it costs one
+load on the already-cold rejection path).
+
+## 31. A body's read guard must not cost it the leaf-call lane
+
+`lift` emits `guard_read_value` — a `GuardType` asserting a read's value is a
+Number so the arithmetic consuming it lowers tag-free — and any body carrying a
+`GuardType` or `Check` is marked `deopts`. **Every machine-code inline lane
+refuses a `deopts` callee** (`leaf_call_probe`, `certified_verdict`, the
+self-call path), because the caller's compiled code has no deopt path. So a
+*leaf* body that carries the read guard can never be inlined and its call falls
+to `call_slow` — measured as `calls/construct_churn` (a prototype method called
+on a fresh object) being 1.5x slower in the opt tier than the per-step tier,
+whose bodies are not `deopts`.
+
+- The fix: `lift` gates the guard on `!body.leaf`. A leaf body is a call-site
+  inline candidate, so its inlinability is worth more than its own tag-free
+  arithmetic; a non-leaf body, which no caller inlines, keeps the guard.
+  Removing a speculation is always sound — the arithmetic falls back to its
+  tag-checked path.
+- Diagnose with `JIT_LEAF_TRACE=1` (the rejection reason — `deopts` here) and
+  confirm with `JIT_HELPER_STATS=1` (`LeafCallFill` up, `CallSlow` to 0).
