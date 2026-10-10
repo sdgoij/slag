@@ -41,6 +41,34 @@ Per-family, `control/generator_loop` measures 96 ms — matching the README's
 93.9 ms — while the whole-corpus process gives 1044 ms. So the README's run did
 not have the effect; it is a regression.
 
+## 2b. Decisive: the whole corpus regressed since the README commit
+
+Building `b3fd0d9e` (the README's own refresh commit) and running the *identical*
+`--corpus tools/corpus/workloads` command on the same machine:
+
+| row | b3fd0d9e (README) | HEAD |
+|---|---|---|
+| `opcost/baseline.js` | 0.26 | 1.36 |
+| `strings/search_slice.js` | 60.4 | 1739 |
+| `calls/construct_churn.js` | 128.9 | 1498 |
+| `control/generator_loop.js` | 103.6 | 647 |
+| `language/.../evaluation-order.js` | 460.7 | 5315 |
+| `strings/coercion_concat.js` | 194.7 | 106 |
+| whole-process sum (77 rows) | **4813** | **13185** |
+
+`b3fd0d9e` matches the README (generator_loop 103.6 ≈ 93.9; `baseline` 0.26 ≈ the
+0.3 control row), so the README's run is reproducible and HEAD is 2.7x worse
+overall. Two components, both from the opt-lift arc (the F*/I5*/I6* commits
+between `b3fd0d9e` and HEAD):
+
+1. **Lift coverage moved bodies into the opt tier, which is slower on some
+   shapes.** `opcost/baseline` was per-step at `b3fd0d9e` (0.26 ms) and is opt
+   at HEAD (1.36 ms) — the opt tier's known ~5x loss on the `i & MASK`/`| 0`
+   loop (`.notes/opt-per-op-overhead.md` §1), now applied because the body lifts.
+2. **The opt tier has a severe cross-workload pathology the per-step tier does
+   not.** `search_slice` is *faster* in the opt tier isolated (22 ms vs the
+   per-step ~60 ms) but 29x slower in a long-lived process (1739 ms) — §3-4.
+
 ## 3. A clean reproducer, and the bisect
 
 Two files in one directory, run in one process (`coercion_concat` first, sorting
@@ -64,7 +92,7 @@ into the opt tier's `Op::Call` via `emit_leaf_call` — as the first bad commit.
 Its own message verifies correctness (`--gc-stress`/`--nursery-stress`/
 `--gc-verify` exact on the corpus) but not this cross-workload timing.
 
-## 4. Mechanism evidence, and the leading hypothesis
+## 4. Mechanism evidence, and the corrected trigger
 
 - **Same helper counts.** `JIT_HELPER_STATS=1` on the pair is exactly the sum of
   the two alone runs (`CallSlow` stays 1.4M for `search_slice`); nothing explodes.
@@ -73,14 +101,22 @@ Its own message verifies correctness (`--gc-stress`/`--nursery-stress`/
   (275.9 -> 236.5 ms).
 - **JIT-only.** `--jitless` on the same pair is 26 ms.
 
-Leading hypothesis: the ported lane almost tripled `opt_lower` (541 lines) and
-generates far more machine code per call site, so a call-heavy compiled body no
-longer fits the instruction cache/btb after another call-heavy workload has
-evicted it — the same ops, cache-thrashed. This is consistent with "same helper
-counts, JIT-only, call-heavy rows and their predecessors only, allocation-free
-numeric rows unaffected". It needs confirming (compiled code size per body with
-and without the port), and the fix is either a slimmer call lowering or a revert
-of the port.
+The trigger is the **string-literal constant widening** in `efa7bb91`'s
+`constant()` (`Imm::U64(value.bits())`, `Type::String`): a body containing a
+string literal used to bail (`Unsupported::Step("Push")`) and stay on the
+per-step tier; now it lifts. A seam on that one arm (`SLAG_STRCONST=0`) restores
+the per-step path and drops the isolated-pair reproducer from 209 ms to 23 ms.
+
+The `Op::Call` leaf lane is **ruled out**: a seam that lowers `Op::Call` back to
+`call_slow` (`SLAG_OPTCALL=0`) leaves the pair degraded (210 vs 202 ms), and
+`search_slice`'s calls lower as `Op::Intrinsic`, not `Op::Call`.
+
+But disabling the string-const lift is **not** a fix: on the whole corpus it
+makes `coercion_concat` explode to 19027 ms (reproducible) and the process sum
+worse (32260 vs 13185). So the lift is net-positive overall; it merely *exposes*
+the pathology. The mechanism proper is still open — the only facts are "same ops,
+JIT-only, ~10x slower after another workload ran", which needs native profiling
+(RSS, GC-pause distribution, code-cache stats) rather than more guessing.
 
 ## 5. Why it matters
 
