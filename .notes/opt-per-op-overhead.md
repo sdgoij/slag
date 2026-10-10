@@ -159,6 +159,20 @@ its fused-loop register lane does the *element* read inline. The residual is
 The opt-tier helper instrument is landed (§4) and should be used to rank the
 remaining call-shaped rows before 1 is attempted.
 
+**Partial (2026-10-10) — the int-op fast path.** `call_int_binary` now elides
+`is_double` for an operand the typer proves a Number (mirroring
+`call_numeric_binary`) and drops `canon_double` entirely (an int32's `f64` is an
+integer, never a NaN), and `narrow`'s `is_numeric_inst` gained the bit ops, so a
+slot stored `k = i & MASK` is proven numeric and its re-load lowers tag-free.
+Measured (isolated, min-of-3, opt/per): `opcost/baseline` +510% -> +420%,
+`opcost/object_alloc` +460% -> +400%, `opcost/element_read` +3% -> **-6.8%**,
+`opcost/dyn_key_read` -8.8% -> **-16.4%**, `opcost/array_at`/`map_get` ~-6%.
+Unchanged elsewhere. The **range guard remains** (§3.3): it needs an operand
+proven an *int32*, which needs an `Int` lattice in `narrow` (the lift sets
+`Type::Int` on a `&`/`| 0` result, but the value is re-loaded through a slot
+`narrow` types `Number`). §6.3's arithmetic-op `canon` sinking and §6.4/§6.5
+remain.
+
 ## 7. Measurement discipline
 
 - One row per process (`scratch/corpus-row-ab.sh <row>`), min-of-3, interleaved

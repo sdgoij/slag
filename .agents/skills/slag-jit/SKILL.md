@@ -1287,3 +1287,22 @@ whose bodies are not `deopts`.
   tag-checked path.
 - Diagnose with `JIT_LEAF_TRACE=1` (the rejection reason — `deopts` here) and
   confirm with `JIT_HELPER_STATS=1` (`LeafCallFill` up, `CallSlow` to 0).
+
+## 32. The int-op fast path's redundant work
+
+`call_int_binary` (the inline path for `&`/`|`/`^`/`<<`/`>>`/`>>>`) is the whole
+cost of an `opcost`-shaped loop (`k = i & MASK; s = (s + k) | 0`), ~24
+instructions per bit op. Two of them were free to remove:
+
+- **The result needs no `canon_double`.** It is an integer `f64` (`fcvt` of an
+  i32), and an integer's bits never land in the NaN-boxed tag region, so the
+  canonicalization was three no-op instructions.
+- **`is_double` is unnecessary for an operand the typer proves a Number** —
+  mirror `call_numeric_binary`'s `known` pair. That needs `narrow`'s
+  `is_numeric_inst` to include the bit ops (a bit op on Numbers is a Number; the
+  arg-numeric guard is required because a BigInt operand yields a BigInt).
+- **The `|x| < 2^63` range guard remains**, and is now the dominant per-op cost:
+  skipping it needs an operand proven an *int32*. The lift sets `Type::Int` on a
+  `&`/`| 0` result, but a slot stored one re-loads through a slot `narrow` types
+  only `Number` — so it needs an `Int` lattice in `narrow`, not a lowering
+  change.

@@ -366,7 +366,14 @@ fn lower_inst(
                 inst.op,
                 Op::BitAnd | Op::BitOr | Op::BitXor | Op::Shl | Op::Shr | Op::UShr
             ) {
-                call_int_binary(builder, helpers, abi, inst.op, disc as i64, lhs, rhs)?
+                call_int_binary(
+                    builder,
+                    helpers,
+                    abi,
+                    inst.op,
+                    disc as i64,
+                    (lhs, rhs, (known_lhs, known_rhs)),
+                )?
             } else {
                 let op = builder.ins().iconst(types::I64, disc as i64);
                 call_helper(
@@ -3290,9 +3297,9 @@ fn call_int_binary(
     abi: &Abi,
     op: Op,
     disc: i64,
-    lhs: ClifValue,
-    rhs: ClifValue,
+    vals: (ClifValue, ClifValue, (bool, bool)),
 ) -> Result<ClifValue, Unsupported> {
+    let (lhs, rhs, (lhs_known, rhs_known)) = vals;
     let lhs_num = builder.ins().bitcast(types::F64, MemFlagsData::new(), lhs);
     let rhs_num = builder.ins().bitcast(types::F64, MemFlagsData::new(), rhs);
     let (l_wide, l_range) = trunc_i32(builder, lhs_num);
@@ -3317,12 +3324,26 @@ fn call_int_binary(
         let wide = builder.ins().sextend(types::I64, res);
         builder.ins().fcvt_from_sint(types::F64, wide)
     };
+    // No `canon_double`: the result is an integer `f64` (`fcvt` of an i32), and
+    // an integer's bits never land in the NaN-boxed tag region, so the
+    // canonicalization would be a no-op three instructions.
     let bits = builder
         .ins()
         .bitcast(types::I64, MemFlagsData::new(), res_f);
-    let fast = canon_double(builder, bits);
-    let lhs_dbl = is_double(builder, lhs);
-    let rhs_dbl = is_double(builder, rhs);
+    let fast = bits;
+    // An operand proven a Number needs no tag check (mirrors
+    // `call_numeric_binary`); the range check stays, an arbitrary Number can
+    // still saturate the f64->i64 conversion.
+    let lhs_dbl = if lhs_known {
+        builder.ins().iconst(types::I8, 1)
+    } else {
+        is_double(builder, lhs)
+    };
+    let rhs_dbl = if rhs_known {
+        builder.ins().iconst(types::I8, 1)
+    } else {
+        is_double(builder, rhs)
+    };
     let both = builder.ins().band(lhs_dbl, rhs_dbl);
     let in_range = builder.ins().band(l_range, r_range);
     let both = builder.ins().band(both, in_range);

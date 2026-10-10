@@ -9,7 +9,7 @@
 //! A frame slot is numeric when it is stored at least once and every store
 //! stores a numeric value (a slot with no store is a parameter or `undefined`,
 //! never a number). A value is numeric when it is a numeric constant, a load of
-//! a numeric slot, or an arithmetic op on numeric operands. The result is the
+//! a numeric slot, or an arithmetic or bit op on numeric operands. The result is the
 //! **greatest fixpoint** of a monotone (shrinking) operator, which is the sound
 //! over-approximation for the "must be numeric" property.
 
@@ -93,6 +93,15 @@ fn is_numeric_inst(inst: &Inst, values: &[bool], slot_numeric: &[bool]) -> bool 
             Imm::Slot(s) if slot_numeric.get(s as usize).copied().unwrap_or(false)
         ),
         Op::Add | Op::Sub | Op::Mul | Op::Div | Op::Mod | Op::Pow | Op::Neg | Op::ToNumber => {
+            !inst.args.is_empty() && inst.args.iter().all(arg_numeric)
+        }
+        // A bit op on genuine Numbers is a Number (`ToInt32`/`ToUint32` of a
+        // Number is an integral Number). The arg-numeric guard is required: a
+        // BigInt operand makes the result a BigInt, not a Number. This is a
+        // *type* fact only — `rewrite` widens the arithmetic ops, not these —
+        // but it lets a slot stored a `&`/`|`/`<<` be proven numeric, so its
+        // later reads lower tag-free.
+        Op::BitAnd | Op::BitOr | Op::BitXor | Op::Shl | Op::Shr | Op::UShr | Op::BitNot => {
             !inst.args.is_empty() && inst.args.iter().all(arg_numeric)
         }
         _ => false,
