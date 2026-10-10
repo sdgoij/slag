@@ -198,3 +198,41 @@ Component 1 (§2b) is untouched: the opt tier is still slower than the per-step
 register lane on shapes like `opcost/baseline` (1.36 ms vs 0.26 ms), which now
 lifts into it — that is the read-parity work in `.notes/opt-per-op-overhead.md`,
 not this regression.
+
+## 7. Component 1: the opt tier vs the per-step register lane (measured)
+
+After the GC-safe-point fix (§6), the optimizing tier is still slower than the
+per-step register lane on int/bit-heavy register bodies, and *faster* on element
+bodies. The `SLAG_NOREG=1` seam (`opt/lift/mod.rs`) refuses `RunRegBody` lifting
+so the body stays on the register lane; the "refuse" column is the same binary
+with it set:
+
+| row | opt | refuse (= per-step) | opt better? |
+|---|---|---|---|
+| `opcost/baseline` | 1.354 | 0.264 | no (5.1x worse) |
+| `opcost/object_alloc` | 1.372 | 0.272 | no (5.0x) |
+| `objects/compound_assign` | 55.6 | 43.9 | no (1.27x) |
+| `opcost/element_write` | 0.699 | 1.134 | yes (1.62x) |
+| `opcost/array_alloc` | 0.603 | 0.693 | yes (1.15x) |
+| `opcost/array_at` | 2.671 | 2.873 | yes (1.08x) |
+| `objects/many_objects_read` | 37.4 | 37.1 | ~equal |
+
+**Refusing the lift is a net wash** — it recovers `baseline`/`object_alloc`/
+`compound_assign` to the register lane's speed but gives back
+`element_write`/`array_alloc`/`array_at`. So the fix is not the lift decision;
+it is the opt tier's lowering.
+
+The opt CLIF for `opcost/baseline`'s loop shows why. `i & MASK` lowers to
+`bitcast.f64` -> `fcvt_to_sint_sat` -> `fabs`+`fcmp` (the range guard) ->
+`ireduce` -> `band` -> `sextend` -> `fcvt_from_sint` -> `bitcast`, plus a `brif`
+to a `BinarySlow` fallback — and that per-op shape repeats ~6 times per
+iteration, with frame-slot round-trips between. The per-step register lane folds
+the same loop into ~3 i32 instructions with the accumulator in an i32 register.
+The reason is representation: the opt IR carries `Int`-typed values as f64 bit
+patterns, so every int op converts f64<->i32 and re-guards.
+
+**Direction:** keep an `Int`-typed value as i32 through the lowering (a
+per-type representation) so a chain of int ops stays in i32 — no `fcvt`, no
+`sextend`, no guard-visible f64 round trip. That is the `Int`-lattice work's
+natural continuation (`.notes/opt-per-op-overhead.md` §6); the lift-decision
+refusal is ruled out by the table above.
