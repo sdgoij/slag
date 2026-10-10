@@ -63,13 +63,13 @@ what the register lane does in ~10.
    canonicalizes once, at the exit. Sinking it to the points where a `Value` is
    materialized (stores, call args, returns) is sound but needs every escape
    point enumerated — a missed one is a NaN reading as a tag (crash).
-3. **Int-op range guards on provable operands (~15-20%).** `call_int_binary`
-   always emits the `|x| < 2^63` guard; for an operand whose IR type is `Int`
-   (a `| 0` / bit-op result, an int32) or an in-range constant the guard is
-   unnecessary. Needs (a) the typer to prove an `Int` slot (today `narrow`
-   proves only Number, so a slot stored `k = i & MASK` reads back `Unknown`) and
-   (b) `call_int_binary` to take the operand proven-ness, as
-   `call_numeric_binary` already does.
+3. **Int-op range guards on provable operands (~15-20%). Done 2026-10-10.**
+   `call_int_binary` always emitted the `|x| < 2^63` guard; an operand whose IR
+   type is `Int` (a `| 0` / bit-op result, an int32) or an in-range constant
+   cannot saturate the f64→i64 conversion. `narrow` now carries an `Int` lattice
+   beside its `Number` one (a slot whose every store is `Int`), `trunc_i32`
+   skips the `fabs`/`fcmp` for an `Int` operand, and the `known && known` tag
+   conjunction constant-folds. See §6.2.
 4. **Boolean materialization for a comparison terminator (~10%).** `Op::Lt`
    builds a canonical Boolean `Value`, and `Term::Branch` compares it against
    the NaN-boxed `false` bits; the register lane branches straight on the
@@ -142,12 +142,12 @@ its fused-loop register lane does the *element* read inline. The residual is
    2026-10-10** — the read guard is no longer emitted for a leaf body, so a
    leaf callee stays inlinable. (`calls/direct_leaf`'s callee still keeps the
    guard and misses ~6%; revisit if the guard's leaf-body value is worth it.)
-2. **`Int`-proven operands + `call_int_binary` guard elision** (§3.3). Bounded,
-   sound (an int32 cannot saturate the f64→i64 conversion), and it helps the 36
-   `opcost/*` rows — the largest family. Extend `narrow`'s lattice with an `Int`
-   flag (a slot whose every store is `Type::Int`) and skip `trunc_i32`'s range
-   check for an `Int`/in-range-constant operand. Expected ~1.2-1.4x on
-   `baseline`.
+2. **`Int`-proven operands + `call_int_binary` guard elision** (§3.3). **DONE
+   2026-10-10.** `narrow` gained an `Int` lattice (a slot whose every store is
+   `Int`), the lift's `Type::Int` on a `&`/`| 0` result now reaches the lowering
+   through the value table, `trunc_i32(…, known_int)` returns the constant guard
+   for an `Int` operand, and the `known && known` tag conjunction folds. See the
+   measured result below.
 3. **`canon_double` sinking for `Int`-typed results** (§3.2, narrow case). An
    int32's f64 is never a NaN, so an `Int`-resulting op needs no canon at all —
    the cheapest cut of the canon cost, no escape analysis required.
@@ -159,19 +159,25 @@ its fused-loop register lane does the *element* read inline. The residual is
 The opt-tier helper instrument is landed (§4) and should be used to rank the
 remaining call-shaped rows before 1 is attempted.
 
-**Partial (2026-10-10) — the int-op fast path.** `call_int_binary` now elides
-`is_double` for an operand the typer proves a Number (mirroring
-`call_numeric_binary`) and drops `canon_double` entirely (an int32's `f64` is an
-integer, never a NaN), and `narrow`'s `is_numeric_inst` gained the bit ops, so a
-slot stored `k = i & MASK` is proven numeric and its re-load lowers tag-free.
-Measured (isolated, min-of-3, opt/per): `opcost/baseline` +510% -> +420%,
-`opcost/object_alloc` +460% -> +400%, `opcost/element_read` +3% -> **-6.8%**,
-`opcost/dyn_key_read` -8.8% -> **-16.4%**, `opcost/array_at`/`map_get` ~-6%.
-Unchanged elsewhere. The **range guard remains** (§3.3): it needs an operand
-proven an *int32*, which needs an `Int` lattice in `narrow` (the lift sets
-`Type::Int` on a `&`/`| 0` result, but the value is re-loaded through a slot
-`narrow` types `Number`). §6.3's arithmetic-op `canon` sinking and §6.4/§6.5
-remain.
+**Done (2026-10-10) — the int-op fast path + the `Int` lattice.** The first cut:
+`call_int_binary` elides `is_double` for an operand the typer proves a Number
+(mirroring `call_numeric_binary`), drops `canon_double` entirely (an int32's `f64`
+is an integer, never a NaN), and `narrow`'s `is_numeric_inst` gained the bit ops,
+so a slot stored `k = i & MASK` is proven numeric and its re-load lowers
+tag-free. The second cut: `narrow` carries an `Int` lattice beside the `Number`
+one, so `trunc_i32` skips its `|x| < 2^63` guard for an operand proven `Int` (and
+the `known && known` tag conjunction constant-folds). Measured (isolated,
+min-of-3, opt/per): `opcost/baseline` +510% -> +420% -> **+321.6%**,
+`opcost/object_alloc` +460% -> +400% -> **+330%**, `opcost/element_read` +3% ->
+-6.8% -> **-14.9%**, `opcost/dyn_key_read` -8.8% -> **~-16%**, `opcost/array_at`
+-> **-11.6%**, `opcost/math_abs` -14.3%, `opcost/prim_prop` -17.4%,
+`opcost/set_has` -13.0%, `objects/warm_store` -17.1%, `control/nested_loops`
+-11.6%. No row regressed (the opt-slower rows — §1's `object_keys` ~+9%,
+`many_objects_read` ~+73%, `compound_assign` ~+22%, `hoisted_local` ~+13% — are
+unchanged). The residual on `baseline` is structural: `i` is stored `i + 1`, an
+`Add` whose result `narrow` types `Number` (a sum of int32s can exceed `2^31`),
+so the `i & MASK` left operand keeps its guard — only `k`, `s` and the constants
+are provably `Int`. §6.3's arithmetic-op `canon` sinking and §6.4/§6.5 remain.
 
 ## 7. Measurement discipline
 

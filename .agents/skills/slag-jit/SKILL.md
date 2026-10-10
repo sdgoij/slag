@@ -1292,7 +1292,7 @@ whose bodies are not `deopts`.
 
 `call_int_binary` (the inline path for `&`/`|`/`^`/`<<`/`>>`/`>>>`) is the whole
 cost of an `opcost`-shaped loop (`k = i & MASK; s = (s + k) | 0`), ~24
-instructions per bit op. Two of them were free to remove:
+instructions per bit op. Three pieces were free to remove:
 
 - **The result needs no `canon_double`.** It is an integer `f64` (`fcvt` of an
   i32), and an integer's bits never land in the NaN-boxed tag region, so the
@@ -1301,8 +1301,20 @@ instructions per bit op. Two of them were free to remove:
   mirror `call_numeric_binary`'s `known` pair. That needs `narrow`'s
   `is_numeric_inst` to include the bit ops (a bit op on Numbers is a Number; the
   arg-numeric guard is required because a BigInt operand yields a BigInt).
-- **The `|x| < 2^63` range guard remains**, and is now the dominant per-op cost:
-  skipping it needs an operand proven an *int32*. The lift sets `Type::Int` on a
-  `&`/`| 0` result, but a slot stored one re-loads through a slot `narrow` types
-  only `Number` — so it needs an `Int` lattice in `narrow`, not a lowering
-  change.
+- **The `|x| < 2^63` range guard is elided for an operand proven an int32
+  (2026-10-10).** `narrow` carries an `Int` lattice beside the `Number` one
+  (`slot_int`/`value_ints`/`is_int_inst`/`is_int_const`), the lift's `Type::Int`
+  on a `&`/`| 0` result reaches the lowering through the value table, and
+  `trunc_i32(…, known_int)` returns the constant `1` guard when set, so
+  `call_int_binary` skips the `fabs`/`fcmp`; a `(bool, bool)` int pair beside the
+  `known` pair feeds it, and the `known && known` tag conjunction constant-folds.
+- **Only `Const`, an `Int`-slot `FrameLoad`, and a bit op on numeric operands
+  produce `Int` — an `Add` does NOT.** A sum of int32s can exceed `2^31`, so
+  `narrow` types it `Number`. A counter stored `i = i + 1` therefore stays `num`
+  and its `i & MASK` left operand keeps the guard; only `k = i & MASK` (a
+  bit-op result), `s` (stored a bit-op result) and the constants are provably
+  `Int`. Do not "fix" this by typing `Add` `Int` — it is unsound.
+- **Keep `is_numeric_inst` (the `Number` lattice) alongside `is_int_inst`.**
+  They are independent greatest fixpoints sharing `slot_flags`; replacing the
+  former with the latter (a natural-looking edit) leaves `value_numerics`
+  calling a function that no longer exists.

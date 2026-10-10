@@ -366,13 +366,17 @@ fn lower_inst(
                 inst.op,
                 Op::BitAnd | Op::BitOr | Op::BitXor | Op::Shl | Op::Shr | Op::UShr
             ) {
+                // An operand the typer proves an int32 is always in range, so
+                // its `|x| < 2^63` guard can be skipped (`call_int_binary`).
+                let int_l = types.get(inst.args[0] as usize) == Some(&Type::Int);
+                let int_r = types.get(inst.args[1] as usize) == Some(&Type::Int);
                 call_int_binary(
                     builder,
                     helpers,
                     abi,
                     inst.op,
                     disc as i64,
-                    (lhs, rhs, (known_lhs, known_rhs)),
+                    (lhs, rhs, (known_lhs, known_rhs), (int_l, int_r)),
                 )?
             } else {
                 let op = builder.ins().iconst(types::I64, disc as i64);
@@ -3297,13 +3301,13 @@ fn call_int_binary(
     abi: &Abi,
     op: Op,
     disc: i64,
-    vals: (ClifValue, ClifValue, (bool, bool)),
+    vals: (ClifValue, ClifValue, (bool, bool), (bool, bool)),
 ) -> Result<ClifValue, Unsupported> {
-    let (lhs, rhs, (lhs_known, rhs_known)) = vals;
+    let (lhs, rhs, (lhs_known, rhs_known), (lhs_int, rhs_int)) = vals;
     let lhs_num = builder.ins().bitcast(types::F64, MemFlagsData::new(), lhs);
     let rhs_num = builder.ins().bitcast(types::F64, MemFlagsData::new(), rhs);
-    let (l_wide, l_range) = trunc_i32(builder, lhs_num);
-    let (r_wide, r_range) = trunc_i32(builder, rhs_num);
+    let (l_wide, l_range) = trunc_i32(builder, lhs_num, lhs_int);
+    let (r_wide, r_range) = trunc_i32(builder, rhs_num, rhs_int);
     let l = builder.ins().ireduce(types::I32, l_wide);
     let r = builder.ins().ireduce(types::I32, r_wide);
     // `ishl`/`sshr`/`ushr` mask the amount to the operand size, which is the
@@ -3333,20 +3337,26 @@ fn call_int_binary(
     let fast = bits;
     // An operand proven a Number needs no tag check (mirrors
     // `call_numeric_binary`); the range check stays, an arbitrary Number can
-    // still saturate the f64->i64 conversion.
-    let lhs_dbl = if lhs_known {
-        builder.ins().iconst(types::I8, 1)
-    } else {
-        is_double(builder, lhs)
-    };
-    let rhs_dbl = if rhs_known {
-        builder.ins().iconst(types::I8, 1)
-    } else {
-        is_double(builder, rhs)
-    };
-    let both = builder.ins().band(lhs_dbl, rhs_dbl);
+    // still saturate the f64->i64 conversion — except for an operand proven an
+    // int32, whose guard `trunc_i32` already dropped.
     let in_range = builder.ins().band(l_range, r_range);
-    let both = builder.ins().band(both, in_range);
+    let both = if lhs_known && rhs_known {
+        // Both tag checks are the constant `1`; skip the conjunction.
+        in_range
+    } else {
+        let lhs_dbl = if lhs_known {
+            builder.ins().iconst(types::I8, 1)
+        } else {
+            is_double(builder, lhs)
+        };
+        let rhs_dbl = if rhs_known {
+            builder.ins().iconst(types::I8, 1)
+        } else {
+            is_double(builder, rhs)
+        };
+        let known = builder.ins().band(lhs_dbl, rhs_dbl);
+        builder.ins().band(known, in_range)
+    };
     let result = builder.declare_var(types::I64);
     builder.def_var(result, fast);
     let merge = builder.create_block();
@@ -3386,8 +3396,8 @@ fn call_mod_int(
 ) -> Result<ClifValue, Unsupported> {
     let lhs_num = builder.ins().bitcast(types::F64, MemFlagsData::new(), lhs);
     let rhs_num = builder.ins().bitcast(types::F64, MemFlagsData::new(), rhs);
-    let (l_wide, _) = trunc_i32(builder, lhs_num);
-    let (r_wide, _) = trunc_i32(builder, rhs_num);
+    let (l_wide, _) = trunc_i32(builder, lhs_num, false);
+    let (r_wide, _) = trunc_i32(builder, rhs_num, false);
     let l_back = builder.ins().fcvt_from_sint(types::F64, l_wide);
     let r_back = builder.ins().fcvt_from_sint(types::F64, r_wide);
     // The truncation is only exact for integral values, so a fractional operand
@@ -3461,11 +3471,21 @@ fn call_mod_int(
 
 /// Truncate an f64 toward zero to i64 and report whether it is inside the
 /// conversion's range (`|x| < 2^63`).
-fn trunc_i32(builder: &mut FunctionBuilder, num: ClifValue) -> (ClifValue, ClifValue) {
+fn trunc_i32(
+    builder: &mut FunctionBuilder,
+    num: ClifValue,
+    known_int: bool,
+) -> (ClifValue, ClifValue) {
+    let int = builder.ins().fcvt_to_sint_sat(types::I64, num);
+    if known_int {
+        // An int32 is always inside `|x| < 2^63`, so the guard is the constant
+        // `1` and the `fabs`/`fcmp` are skipped.
+        let one = builder.ins().iconst(types::I8, 1);
+        return (int, one);
+    }
     let magnitude = builder.ins().fabs(num);
     let bound = builder.ins().f64const(9223372036854775808.0);
     let in_range = builder.ins().fcmp(FloatCC::LessThan, magnitude, bound);
-    let int = builder.ins().fcvt_to_sint_sat(types::I64, num);
     (int, in_range)
 }
 

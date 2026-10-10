@@ -12,6 +12,11 @@
 //! a numeric slot, or an arithmetic or bit op on numeric operands. The result is the
 //! **greatest fixpoint** of a monotone (shrinking) operator, which is the sound
 //! over-approximation for the "must be numeric" property.
+//!
+//! A second, independent fixpoint tracks the stronger "is an int32" property
+//! (a bit-op result, an in-range integral constant, or a slot stored only such
+//! values). A load of an `Int` slot is typed `Int`, so the lowering can skip the
+//! `|x| < 2^63` range guard on that operand (`opt_lower::call_int_binary`).
 
 use crate::opt::ir::{Effects, Function, Imm, Inst, Op, Type, ValueId};
 
@@ -20,13 +25,17 @@ use crate::opt::ir::{Effects, Function, Imm, Inst, Op, Type, ValueId};
 pub fn run(func: &mut Function) -> bool {
     let slots = slot_count(func);
     let mut slot_numeric = vec![true; slots];
+    let mut slot_int = vec![true; slots];
     loop {
         let values = value_numerics(func, &slot_numeric);
-        let next = slot_numerics(func, &values, slots);
-        if next == slot_numeric {
-            return rewrite(func, &values, &slot_numeric);
+        let ints = value_ints(func, &values, &slot_int);
+        let next = slot_flags(func, &values, slots);
+        let next_int = slot_flags(func, &ints, slots);
+        if next == slot_numeric && next_int == slot_int {
+            return rewrite(func, &values, &ints, &slot_numeric, &slot_int);
         }
         slot_numeric = next;
+        slot_int = next_int;
     }
 }
 
@@ -54,30 +63,6 @@ fn value_numerics(func: &Function, slot_numeric: &[bool]) -> Vec<bool> {
         }
     }
     numeric
-}
-
-/// Each slot's flag: stored at least once, and every store is numeric.
-fn slot_numerics(func: &Function, values: &[bool], slots: usize) -> Vec<bool> {
-    let mut stored = vec![false; slots];
-    let mut all_numeric = vec![true; slots];
-    for b in 0..func.block_count() as u32 {
-        for inst in &func.block(b).insts {
-            if inst.op != Op::FrameStore {
-                continue;
-            }
-            let Imm::Slot(s) = inst.imm else { continue };
-            let Some(&value) = inst.args.first() else {
-                continue;
-            };
-            let s = s as usize;
-            if s >= slots {
-                continue;
-            }
-            stored[s] = true;
-            all_numeric[s] &= values.get(value as usize).copied().unwrap_or(false);
-        }
-    }
-    (0..slots).map(|s| stored[s] && all_numeric[s]).collect()
 }
 
 /// Whether an instruction produces a Number, given its operands' flags.
@@ -108,9 +93,85 @@ fn is_numeric_inst(inst: &Inst, values: &[bool], slot_numeric: &[bool]) -> bool 
     }
 }
 
+/// Each slot's flag: stored at least once, and every store is a member of the
+/// lattice (`values` carries the value flag for that lattice).
+fn slot_flags(func: &Function, values: &[bool], slots: usize) -> Vec<bool> {
+    let mut stored = vec![false; slots];
+    let mut all = vec![true; slots];
+    for b in 0..func.block_count() as u32 {
+        for inst in &func.block(b).insts {
+            if inst.op != Op::FrameStore {
+                continue;
+            }
+            let Imm::Slot(s) = inst.imm else { continue };
+            let Some(&value) = inst.args.first() else {
+                continue;
+            };
+            let s = s as usize;
+            if s >= slots {
+                continue;
+            }
+            stored[s] = true;
+            all[s] &= values.get(value as usize).copied().unwrap_or(false);
+        }
+    }
+    (0..slots).map(|s| stored[s] && all[s]).collect()
+}
+
+/// Each value's "is an int32" flag, given the numeric-value flags and the
+/// per-slot int flags. An int32 is a Number, so the numeric flags gate the
+/// bit-op case (`ToInt32` of a BigInt is a BigInt, not an int32).
+fn value_ints(func: &Function, values: &[bool], slot_int: &[bool]) -> Vec<bool> {
+    let mut ints = vec![false; func.value_count() as usize];
+    for b in 0..func.block_count() as u32 {
+        for inst in &func.block(b).insts {
+            if let Some(r) = inst.result {
+                ints[r as usize] = is_int_inst(inst, values, slot_int);
+            }
+        }
+    }
+    ints
+}
+
+/// Whether `imm` is an int32 — an `Imm::Int`, or an integral `f64` inside the
+/// i32 range. These are the constants whose `|x| < 2^63` guard can be skipped.
+fn is_int_const(imm: &Imm) -> bool {
+    match imm {
+        Imm::Int(_) => true,
+        Imm::Float(f) => f.fract() == 0.0 && f.abs() < 2_147_483_648.0,
+        _ => false,
+    }
+}
+
+/// Whether an instruction produces an int32, given its operands' numeric flags
+/// and the per-slot int flags.
+fn is_int_inst(inst: &Inst, values: &[bool], slot_int: &[bool]) -> bool {
+    let arg_numeric = |a: &ValueId| values.get(*a as usize).copied().unwrap_or(false);
+    match inst.op {
+        Op::Const => is_int_const(&inst.imm),
+        Op::FrameLoad => matches!(
+            inst.imm,
+            Imm::Slot(s) if slot_int.get(s as usize).copied().unwrap_or(false)
+        ),
+        // `ToInt32`/`ToUint32` of a Number is an int32, whatever the operand's
+        // magnitude — so the range guard is unnecessary on it.
+        Op::BitAnd | Op::BitOr | Op::BitXor | Op::Shl | Op::Shr | Op::UShr | Op::BitNot => {
+            !inst.args.is_empty() && inst.args.iter().all(arg_numeric)
+        }
+        _ => false,
+    }
+}
+
 /// Widen the effects (and tighten the type) of the now-provably-numeric ops, and
-/// mark a load of a numeric slot as a `Number` so the lowering can trust it.
-fn rewrite(func: &mut Function, values: &[bool], slot_numeric: &[bool]) -> bool {
+/// mark a load of a numeric slot as a `Number` (`Int` for an int slot) so the
+/// lowering can trust it.
+fn rewrite(
+    func: &mut Function,
+    values: &[bool],
+    values_int: &[bool],
+    slot_numeric: &[bool],
+    slot_int: &[bool],
+) -> bool {
     let mut changed = false;
     // The lowered code reads each value's `Function::value_type`, so a narrowed
     // `Inst::ty` alone is invisible to it — collect and apply the value-table
@@ -119,18 +180,34 @@ fn rewrite(func: &mut Function, values: &[bool], slot_numeric: &[bool]) -> bool 
     for b in 0..func.block_count() as u32 {
         for inst in &mut func.block_mut(b).insts {
             if inst.op == Op::FrameLoad {
-                if let Imm::Slot(s) = inst.imm
-                    && slot_numeric.get(s as usize).copied().unwrap_or(false)
-                    && inst.ty != Type::Number
-                {
-                    inst.ty = Type::Number;
+                let Imm::Slot(s) = inst.imm else { continue };
+                let s = s as usize;
+                let want = if slot_int.get(s).copied().unwrap_or(false) {
+                    Type::Int
+                } else if slot_numeric.get(s).copied().unwrap_or(false) {
+                    Type::Number
+                } else {
+                    continue;
+                };
+                if inst.ty != want {
+                    inst.ty = want;
                     changed = true;
                 }
-                if inst.ty == Type::Number
-                    && let Some(r) = inst.result
-                {
-                    retype.push((r, Type::Number));
+                if let Some(r) = inst.result {
+                    retype.push((r, want));
                 }
+                continue;
+            }
+            // An int32-producing instruction (a bit op, an in-range integral
+            // constant) is typed `Int`, so the lowering skips its range guard.
+            if let Some(r) = inst.result
+                && values_int.get(r as usize).copied().unwrap_or(false)
+            {
+                if inst.ty != Type::Int {
+                    inst.ty = Type::Int;
+                    changed = true;
+                }
+                retype.push((r, Type::Int));
                 continue;
             }
             if !matches!(
