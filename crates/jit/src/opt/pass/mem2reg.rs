@@ -26,6 +26,18 @@ use crate::opt::ir::{BlockId, Function, Imm, Op, Term, Type, ValueId};
 
 /// Promote every storable frame slot in `func`. Returns whether the IR changed.
 pub fn run(func: &mut Function) -> bool {
+    promote(func, None)
+}
+
+/// Promote only the slots `allow` names (`.notes/opt-per-op-overhead.md` §8).
+/// The top-level pipeline uses it to promote a sealed body's slots, restricted
+/// to those that never hold a heap value: a frame slot is a GC root, so
+/// promoting a heap value into an untraced register would unroot it.
+pub fn run_restricted(func: &mut Function, allow: &HashSet<u32>) -> bool {
+    promote(func, Some(allow))
+}
+
+fn promote(func: &mut Function, allow: Option<&HashSet<u32>>) -> bool {
     let n = func.block_count();
     if n == 0 {
         return false;
@@ -41,7 +53,12 @@ pub fn run(func: &mut Function) -> bool {
         if tdz.contains(&slot) {
             continue;
         }
-        if promote(func, slot, &preds, &df, &children) {
+        if let Some(allow) = allow
+            && !allow.contains(&slot)
+        {
+            continue;
+        }
+        if promote_slot(func, slot, &preds, &df, &children) {
             changed = true;
         }
     }
@@ -77,7 +94,7 @@ fn slots_with_stores(func: &Function) -> (Vec<u32>, HashSet<u32>) {
 
 /// Promote one slot, or return `false` (leaving the IR untouched) when it is not
 /// promotable.
-fn promote(
+fn promote_slot(
     func: &mut Function,
     slot: u32,
     preds: &[Vec<BlockId>],
@@ -136,8 +153,57 @@ fn promote(
     let mut stack: Vec<ValueId> = Vec::new();
     let mut repl: HashMap<ValueId, ValueId> = HashMap::new();
     rename(func, entry, slot, &phi, children, &mut stack, &mut repl);
+    retype_phis(func, &phi, preds);
     apply(func, slot, &repl);
     true
+}
+
+/// Re-type each promoted phi as the join of its incoming values' types.
+///
+/// The placeholder is created before the rename fills the edges, when the
+/// incoming types are not yet known, so it starts `Unknown`. `narrow` ran before
+/// promotion and never sees the new parameter, so without this the lowering
+/// cannot recognize a loop-carried value (an `Int` accumulator) as `Int` — the
+/// representation work depends on it.
+fn retype_phis(func: &mut Function, phi: &HashMap<BlockId, usize>, preds: &[Vec<BlockId>]) {
+    let mut retype: Vec<(ValueId, Type)> = Vec::new();
+    for (&m, &index) in phi {
+        let mut ty = Type::Never;
+        for &p in &preds[m as usize] {
+            if let Some(v) = edge_arg(func, p, m, index) {
+                ty = ty.join(func.value_type(v));
+            }
+        }
+        if ty != Type::Never {
+            retype.push((func.block(m).params[index], ty));
+        }
+    }
+    for (v, ty) in retype {
+        func.set_value_type(v, ty);
+    }
+}
+
+/// The argument a `from -> to` edge passes for the target's parameter `index`.
+fn edge_arg(func: &Function, from: BlockId, to: BlockId, index: usize) -> Option<ValueId> {
+    match &func.block(from).term {
+        Some(Term::Jump { target, args }) if *target == to => args.get(index).copied(),
+        Some(Term::Branch {
+            then_block,
+            then_args,
+            else_block,
+            else_args,
+            ..
+        }) => {
+            if *then_block == to {
+                then_args.get(index).copied()
+            } else if *else_block == to {
+                else_args.get(index).copied()
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
 }
 
 /// The dominator-tree walk that rewrites the slot's loads to their reaching

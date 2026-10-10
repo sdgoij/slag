@@ -2343,6 +2343,46 @@ mod tests {
     }
 
     #[test]
+    fn opt_tier_int_value_survives_a_guard_deopt() {
+        // The guard's deopt mirrors the live operand stack into the working
+        // region as `Value` words. An `Int`-represented value (an i32 register)
+        // on that stack must widen back to its `Value` word; a raw i32 store
+        // would corrupt the slot the interpreter resumes from. Here `s & 255`
+        // is a proven `Int` live on the stack when the `o.x` read guard deopts,
+        // and the getter's object result makes the resume *stringify* that
+        // `Int`, so a corrupted slot is observable (not NaN-masked).
+        let source = "var G = 0; var reads = 0; \
+                      function f(o) { var s = 0; s = (s + 1) | 0; \
+                        return '' + ((s & 255) + o.x + G); } \
+                      var a = { get x() { reads = reads + 1; return {}; } }; \
+                      var n = { x: 3 }; \
+                      var t = ''; \
+                      t += f(a); t += f(n); t += f(a); t += f(n); t += f(a); \
+                      t += f(n); t += f(a); t += f(n); t += f(a); t += f(n); \
+                      t += f(a); t += f(n); t += f(a); t += f(n); t += f(a); \
+                      t += f(n); t += f(a); t += f(n); t += f(a); t += f(n); \
+                      t += f(a); t += f(n); t += f(a); t += f(n); t += f(a); \
+                      t += f(n); t += f(a); t += f(n); t + '|' + reads;";
+        let interp = {
+            let mut agent = runtime::Agent::new();
+            agent.initialize_host_defined_realm().expect("realm");
+            agent.run_script(source).expect("interp runs")
+        };
+        let before = crate::opt_lower::OPT_COMPILED.load(Ordering::Relaxed);
+        let deopts_before = runtime::jit::JIT_DEOPT_COUNT.load(Ordering::Relaxed);
+        let (value, compiled) = with_opt_jit_agent(|agent| agent.run_script(source).expect("runs"));
+        let lowered = crate::opt_lower::OPT_COMPILED.load(Ordering::Relaxed) - before;
+        let deopts = runtime::jit::JIT_DEOPT_COUNT.load(Ordering::Relaxed) - deopts_before;
+        assert_eq!(
+            value, interp,
+            "an Int value on the deopt stack must round-trip"
+        );
+        assert!(compiled >= 1, "{compiled} bodies compiled");
+        assert!(lowered >= 1, "the optimizing tier lowered {lowered} bodies");
+        assert!(deopts >= 1, "the guard must have fired ({deopts} deopts)");
+    }
+
+    #[test]
     fn opt_tier_lexical_body_matches_the_interpreter() {
         // A `let`-using body is TDZ-checked; the tier models the check
         // (`Op::TdzCheck`), so the body compiles via the IR where it was

@@ -1527,6 +1527,18 @@ fn emit_number(builder: &mut Builder, block: BlockId, v: f64) -> ValueId {
     )
 }
 
+/// An int32 constant (`Type::Int`), the i32 representation's constant form.
+fn emit_int(builder: &mut Builder, block: BlockId, v: i32) -> ValueId {
+    builder.emit(
+        block,
+        Op::Const,
+        &[],
+        Type::Int,
+        Effects::pure(),
+        Imm::Int(v),
+    )
+}
+
 fn emit_const(builder: &mut Builder, block: BlockId, imm: Imm, ty: Type) -> ValueId {
     builder.emit(block, Op::Const, &[], ty, Effects::pure(), imm)
 }
@@ -1743,12 +1755,12 @@ fn emit_leaf_op(
             let counter = || counter.ok_or(Unsupported::Step("RunRegBody"));
             let cur = emit_frame_load(builder, block, *slot);
             let to_i32 = |b: &mut Builder, v: ValueId| -> ValueId {
-                let zero = emit_number(b, block, 0.0);
+                let zero = emit_int(b, block, 0);
                 b.emit(
                     block,
                     Op::BitOr,
                     &[v, zero],
-                    Type::Number,
+                    Type::Int,
                     Op::BitOr.default_effects(),
                     Imm::None,
                 )
@@ -1777,7 +1789,7 @@ fn emit_leaf_op(
                 _ => {
                     let left = to_i32(builder, cur);
                     let right = match rhs {
-                        IntRhs::Imm(i) => emit_number(builder, block, f64::from(*i)),
+                        IntRhs::Imm(i) => emit_int(builder, block, *i),
                         IntRhs::Counter => {
                             let c = emit_frame_load(builder, block, counter()?);
                             to_i32(builder, c)
@@ -1785,18 +1797,31 @@ fn emit_leaf_op(
                         IntRhs::CounterBit { op: bit, imm } => {
                             let cf = emit_frame_load(builder, block, counter()?);
                             let c = to_i32(builder, cf);
-                            let i = emit_number(builder, block, f64::from(*imm));
+                            let i = emit_int(builder, block, *imm);
                             bin(builder, binary_op(*bit)?, c, i)
                         }
                         IntRhs::Acc => to_i32(builder, acc),
                         IntRhs::CounterChecked => unreachable!(),
                     };
-                    let combined = bin(builder, binary_op(*op)?, left, right);
-                    to_i32(builder, combined)
+                    // A proven-int32 rhs runs as a wrapping i32 op — exactly
+                    // `ToInt32` of the f64 sum — so the chain stays i32 with no
+                    // `| 0` and no f64 round trip.
+                    let int = match op {
+                        BinaryOp::Add => Op::IntAdd,
+                        BinaryOp::Sub => Op::IntSub,
+                        BinaryOp::Mul => Op::IntMul,
+                        _ => return Err(Unsupported::Step("RunRegBody")),
+                    };
+                    bin(builder, int, left, right)
                 }
             };
-            let m = emit_number(builder, block, f64::from(*mask));
-            let next = bin(builder, Op::BitAnd, wrapped, m);
+            // A mask of `-1` is the identity (`x & -1`), so skip the op.
+            let next = if *mask == -1 {
+                wrapped
+            } else {
+                let m = emit_int(builder, block, *mask);
+                bin(builder, Op::BitAnd, wrapped, m)
+            };
             emit_frame_store(builder, block, *slot, next);
             next
         }
@@ -2169,7 +2194,12 @@ fn unary_op(op: UnaryOp) -> Result<Op, Unsupported> {
 fn binary_type(op: Op) -> Type {
     match op {
         Op::Eq | Op::StrictEq | Op::Lt | Op::Le | Op::Gt | Op::Ge => Type::Bool,
-        Op::BitAnd | Op::BitOr | Op::BitXor | Op::Shl | Op::Shr | Op::UShr => Type::Int,
+        Op::BitAnd | Op::BitOr | Op::BitXor | Op::Shl | Op::Shr => Type::Int,
+        Op::IntAdd | Op::IntSub | Op::IntMul => Type::Int,
+        // `>>>` answers a `ToUint32` (`0..2^32-1`), which is a Number but not a
+        // signed int32 — typing it `Int` would make the i32 representation
+        // convert it with the wrong signedness.
+        Op::UShr => Type::Number,
         _ => Type::Unknown,
     }
 }

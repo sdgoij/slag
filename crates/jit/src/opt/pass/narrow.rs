@@ -19,6 +19,7 @@
 //! `|x| < 2^63` range guard on that operand (`opt_lower::call_int_binary`).
 
 use crate::opt::ir::{Effects, Function, Imm, Inst, Op, Type, ValueId};
+use std::collections::HashMap;
 
 /// Widen the provably-numeric arithmetic ops to `pure()`. Returns whether the
 /// IR changed.
@@ -32,7 +33,14 @@ pub fn run(func: &mut Function) -> bool {
         let next = slot_flags(func, &values, slots);
         let next_int = slot_flags(func, &ints, slots);
         if next == slot_numeric && next_int == slot_int {
-            return rewrite(func, &values, &ints, &slot_numeric, &slot_int);
+            return rewrite(
+                func,
+                &values,
+                &ints,
+                &slot_numeric,
+                &slot_int,
+                widen_effects(),
+            );
         }
         slot_numeric = next;
         slot_int = next_int;
@@ -89,6 +97,8 @@ fn is_numeric_inst(inst: &Inst, values: &[bool], slot_numeric: &[bool]) -> bool 
         Op::BitAnd | Op::BitOr | Op::BitXor | Op::Shl | Op::Shr | Op::UShr | Op::BitNot => {
             !inst.args.is_empty() && inst.args.iter().all(arg_numeric)
         }
+        // A wrapping i32 op is an integral Number.
+        Op::IntAdd | Op::IntSub | Op::IntMul => true,
         _ => false,
     }
 }
@@ -153,13 +163,26 @@ fn is_int_inst(inst: &Inst, values: &[bool], slot_int: &[bool]) -> bool {
             inst.imm,
             Imm::Slot(s) if slot_int.get(s as usize).copied().unwrap_or(false)
         ),
-        // `ToInt32`/`ToUint32` of a Number is an int32, whatever the operand's
-        // magnitude — so the range guard is unnecessary on it.
-        Op::BitAnd | Op::BitOr | Op::BitXor | Op::Shl | Op::Shr | Op::UShr | Op::BitNot => {
+        // `ToInt32` of a Number is a signed int32, whatever the operand's
+        // magnitude — so the range guard is unnecessary on it. `>>>` is excluded:
+        // its `ToUint32` result (`0..2^32-1`) needs an unsigned conversion, so it
+        // stays a `Number` (see `lift::binary_type`).
+        Op::BitAnd | Op::BitOr | Op::BitXor | Op::Shl | Op::Shr | Op::BitNot => {
             !inst.args.is_empty() && inst.args.iter().all(arg_numeric)
         }
+        // A wrapping i32 op is an int32 by construction.
+        Op::IntAdd | Op::IntSub | Op::IntMul => true,
         _ => false,
     }
+}
+
+/// Whether the bit-op and numeric-comparison effect widening runs
+/// (`SLAG_WIDEN=0` disables it, the same-binary seam for measuring its marginal
+/// effect).
+fn widen_effects() -> bool {
+    std::env::var("SLAG_WIDEN")
+        .map(|v| v != "0")
+        .unwrap_or(true)
 }
 
 /// Widen the effects (and tighten the type) of the now-provably-numeric ops, and
@@ -171,6 +194,7 @@ fn rewrite(
     values_int: &[bool],
     slot_numeric: &[bool],
     slot_int: &[bool],
+    widen: bool,
 ) -> bool {
     let mut changed = false;
     // The lowered code reads each value's `Function::value_type`, so a narrowed
@@ -207,8 +231,64 @@ fn rewrite(
                     inst.ty = Type::Int;
                     changed = true;
                 }
+                // A bit op on provable Numbers runs no user code and cannot
+                // throw (`ToInt32` of a Number is pure), so its `call()`
+                // effects widen to `pure()`.
+                if widen && !inst.effects.is_pure() {
+                    inst.effects = Effects::pure();
+                    changed = true;
+                }
                 retype.push((r, Type::Int));
                 continue;
+            }
+            // A comparison of two provable Numbers likewise runs no user code
+            // and cannot throw; only its effects change (its result is `Bool`).
+            if matches!(inst.op, Op::Lt | Op::Le | Op::Gt | Op::Ge)
+                && !inst.args.is_empty()
+                && inst
+                    .args
+                    .iter()
+                    .all(|a| values.get(*a as usize).copied().unwrap_or(false))
+                && widen
+                && !inst.effects.is_pure()
+            {
+                inst.effects = Effects::pure();
+                changed = true;
+            }
+            // A bit op on provable Numbers is pure whatever its result type —
+            // this reaches `>>>`, whose `Number` result the branch above (which
+            // retypes to `Int`) skipped.
+            if matches!(
+                inst.op,
+                Op::BitAnd | Op::BitOr | Op::BitXor | Op::Shl | Op::Shr | Op::UShr | Op::BitNot
+            ) && !inst.args.is_empty()
+                && inst
+                    .args
+                    .iter()
+                    .all(|a| values.get(*a as usize).copied().unwrap_or(false))
+                && widen
+                && !inst.effects.is_pure()
+            {
+                inst.effects = Effects::pure();
+                changed = true;
+            }
+            // The lift types every bit op `Int` unconditionally
+            // (`lift::binary_type`); the prover did not confirm this value is an
+            // int32 (its operands are not both proven Numbers), so the guard path
+            // is required. Keep it in the `Value`-word representation rather than
+            // an i32 register (a `| 0` of an unproven expression would otherwise
+            // convert on every frame round trip).
+            if inst.ty == Type::Int
+                && matches!(
+                    inst.op,
+                    Op::BitAnd | Op::BitOr | Op::BitXor | Op::Shl | Op::Shr | Op::UShr | Op::BitNot
+                )
+            {
+                inst.ty = Type::Unknown;
+                if let Some(r) = inst.result {
+                    retype.push((r, Type::Unknown));
+                }
+                changed = true;
             }
             if !matches!(
                 inst.op,
@@ -240,6 +320,69 @@ fn rewrite(
     for (v, ty) in retype {
         if func.value_type(v) != ty {
             func.set_value_type(v, ty);
+            changed = true;
+        }
+    }
+    let fused = fuse_wrapping_arith(func, values_int);
+    changed || fused
+}
+
+/// Fuse a `ToInt32(a op b)` — a `| 0`/`^ 0` on a `+`/`-` of two int32s — into a
+/// wrapping i32 op (`IntAdd`/`IntSub`). The typer types the arithmetic `Number`
+/// (a sum of int32s can exceed `2^31`) but the `ToInt32` truncates it, and
+/// `ToInt32(a + b)` of two int32s IS the wrapping i32 add — so the whole chain
+/// lowers to one `iadd`, no f64 round trip. The original arithmetic op stays
+/// (DCE removes it if the fused use was its only use).
+///
+/// `*` is *excluded*: an int32 product can exceed `2^53`, so the spec's f64
+/// multiply rounds before `ToInt32`, and the wrapping i32 multiply would differ
+/// (the register-body plan's separate `Mul` bound is what makes its `IntMul`
+/// safe).
+fn fuse_wrapping_arith(func: &mut Function, values_int: &[bool]) -> bool {
+    let mut def: HashMap<ValueId, (Op, Imm, Vec<ValueId>)> = HashMap::new();
+    for b in 0..func.block_count() as u32 {
+        for inst in &func.block(b).insts {
+            if let Some(r) = inst.result {
+                def.insert(r, (inst.op, inst.imm.clone(), inst.args.clone()));
+            }
+        }
+    }
+    let is_zero = |v: ValueId| match def.get(&v) {
+        Some((Op::Const, Imm::Int(0), _)) => true,
+        Some((Op::Const, Imm::Float(f), _)) => *f == 0.0,
+        _ => false,
+    };
+    let mut changed = false;
+    for b in 0..func.block_count() as u32 {
+        for inst in &mut func.block_mut(b).insts {
+            // `x | 0` and `x ^ 0` are both `ToInt32(x)`.
+            if !matches!(inst.op, Op::BitOr | Op::BitXor) || inst.args.len() != 2 {
+                continue;
+            }
+            let other = if is_zero(inst.args[0]) {
+                inst.args[1]
+            } else if is_zero(inst.args[1]) {
+                inst.args[0]
+            } else {
+                continue;
+            };
+            let Some((op, _, args)) = def.get(&other) else {
+                continue;
+            };
+            let int = match op {
+                Op::Add => Op::IntAdd,
+                Op::Sub => Op::IntSub,
+                _ => continue,
+            };
+            if args.len() != 2
+                || !values_int.get(args[0] as usize).copied().unwrap_or(false)
+                || !values_int.get(args[1] as usize).copied().unwrap_or(false)
+            {
+                continue;
+            }
+            inst.op = int;
+            inst.args = args.clone();
+            inst.ty = Type::Int;
             changed = true;
         }
     }

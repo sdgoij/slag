@@ -219,6 +219,14 @@ pub enum Op {
     Div,
     Mod,
     Pow,
+    /// Wrapping 32-bit integer arithmetic (`IntAdd`/`IntSub`/`IntMul`). The
+    /// operands are proven int32 and the result is `Int`; the op is exactly the
+    /// spec's `ToInt32(f64 add)`, so it stays in an i32 register with no f64
+    /// round trip. Emitted only by the register-body lift, where the plan already
+    /// proved both operands int32.
+    IntAdd,
+    IntSub,
+    IntMul,
     BitAnd,
     BitOr,
     BitXor,
@@ -376,6 +384,9 @@ impl Op {
         use Effects as E;
         match self {
             Op::Const
+            | Op::IntAdd
+            | Op::IntSub
+            | Op::IntMul
             | Op::StrictEq
             | Op::ToBoolean
             | Op::Not

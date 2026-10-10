@@ -129,8 +129,8 @@ fn lower(
     }
     for b in 1..ir.block_count() as BlockId {
         let block = builder.create_block();
-        for _ in 0..ir.block(b).params.len() {
-            builder.append_block_param(block, types::I64);
+        for &p in &ir.block(b).params {
+            builder.append_block_param(block, repr(ir.value_type(p)));
         }
         clif.push(block);
     }
@@ -205,13 +205,22 @@ fn lower(
         match &block.term {
             Some(Term::Return(value)) => {
                 let v = match value {
-                    Some(id) => value_of(&values, *id)?,
+                    Some(id) => {
+                        let v = value_of(&values, *id)?;
+                        // The return ABI is a `Value` word; an `Int` result
+                        // converts back from its i32 register.
+                        if ir.value_type(*id) == Type::Int {
+                            int_to_bits(&mut builder, v)
+                        } else {
+                            v
+                        }
+                    }
                     None => builder.ins().iconst(types::I64, undefined),
                 };
                 builder.ins().return_(&[v]);
             }
             Some(Term::Jump { target, args }) => {
-                let vals = resolve(args, &values)?;
+                let vals = resolve(&mut builder, ir, *target, args, &values)?;
                 builder.ins().jump(clif[*target as usize], &vals);
             }
             Some(Term::Branch {
@@ -222,6 +231,11 @@ fn lower(
                 else_args,
             }) => {
                 let c = value_of(&values, *cond)?;
+                let c = if ir.value_type(*cond) == Type::Int {
+                    int_to_bits(&mut builder, c)
+                } else {
+                    c
+                };
                 // A `Bool`-typed condition is already a canonical boolean, so
                 // the truthiness test is a compare against `false` — no helper
                 // call and no interpreter round-trip per branch (the loop test).
@@ -242,8 +256,8 @@ fn lower(
                     )?;
                     builder.ins().icmp_imm_u(IntCC::NotEqual, truthy, 0)
                 };
-                let then_vals = resolve(then_args, &values)?;
-                let else_vals = resolve(else_args, &values)?;
+                let then_vals = resolve(&mut builder, ir, *then_block, then_args, &values)?;
+                let else_vals = resolve(&mut builder, ir, *else_block, else_args, &values)?;
                 builder.ins().brif(
                     test,
                     clif[*then_block as usize],
@@ -259,9 +273,33 @@ fn lower(
     Ok(())
 }
 
-fn resolve(args: &[ValueId], values: &[Option<ClifValue>]) -> Result<Vec<BlockArg>, Unsupported> {
+/// Resolve an edge's argument values to CLIF block arguments, converting an
+/// `Int` argument to its `Value`-word form when the target parameter is not an
+/// int32 (a mixed parameter the join typed away from `Int`, e.g. `Int | Unknown`
+/// → `Unknown`). A non-`Int` value never feeds an `Int` parameter: the join
+/// would not be `Int` if it did.
+fn resolve(
+    builder: &mut FunctionBuilder,
+    ir: &IrFunction,
+    target: BlockId,
+    args: &[ValueId],
+    values: &[Option<ClifValue>],
+) -> Result<Vec<BlockArg>, Unsupported> {
+    let params = &ir.block(target).params;
     args.iter()
-        .map(|id| value_of(values, *id).map(Into::into))
+        .enumerate()
+        .map(|(i, id)| {
+            let v = value_of(values, *id)?;
+            let want_int = params
+                .get(i)
+                .is_some_and(|p| ir.value_type(*p) == Type::Int);
+            let v = if ir.value_type(*id) == Type::Int && !want_int {
+                int_to_bits(builder, v)
+            } else {
+                v
+            };
+            Ok(v.into())
+        })
         .collect()
 }
 
@@ -284,9 +322,30 @@ fn lower_inst(
     values: &[Option<ClifValue>],
     types: &[Type],
 ) -> Result<ClifValue, Unsupported> {
-    let arg = |i: usize| value_of(values, inst.args[i]);
+    // `arg!` yields an operand in its i64 `Value`-word form, converting an
+    // `Int` operand (an i32 register) at the boundary — the form every helper
+    // and memory write expects. The int-native ops read `values` directly.
+    macro_rules! arg {
+        ($i:expr) => {{
+            let id = inst.args[$i];
+            let v = value_of(values, id)?;
+            if types.get(id as usize) == Some(&Type::Int) {
+                int_to_bits(builder, v)
+            } else {
+                v
+            }
+        }};
+    }
     Ok(match inst.op {
         Op::Const => {
+            if inst.ty == Type::Int {
+                let value = match &inst.imm {
+                    Imm::Int(i) => *i,
+                    Imm::Float(f) => *f as i32,
+                    _ => return Err(Unsupported::Step("opt:const")),
+                };
+                return Ok(builder.ins().iconst(types::I32, value as i64));
+            }
             let bits = match &inst.imm {
                 Imm::Float(f) => JsValue::Number(*f).bits() as i64,
                 Imm::Int(i) => JsValue::Number(*i as f64).bits() as i64,
@@ -302,18 +361,24 @@ fn lower_inst(
             let Imm::Slot(slot) = &inst.imm else {
                 return Err(Unsupported::Step("opt:frame"));
             };
-            builder.ins().load(
+            let bits = builder.ins().load(
                 types::I64,
                 MemFlagsData::new(),
                 abi.frame,
                 Offset32::new((*slot as i32) * 8),
-            )
+            );
+            // `narrow` types a load of an int slot `Int`; the stored word is
+            // proven an int32, so the representation conversion is exact.
+            if inst.ty == Type::Int {
+                return Ok(bits_to_int(builder, bits));
+            }
+            bits
         }
         Op::FrameStore => {
             let Imm::Slot(slot) = &inst.imm else {
                 return Err(Unsupported::Step("opt:frame"));
             };
-            let value = arg(0)?;
+            let value = arg!(0);
             builder.ins().store(
                 MemFlagsData::new(),
                 value,
@@ -344,7 +409,7 @@ fn lower_inst(
         | Op::Gt
         | Op::Ge => {
             let disc = binary_op(inst.op).ok_or(Unsupported::Step("opt:binary"))?;
-            let (lhs, rhs) = (arg(0)?, arg(1)?);
+            let (lhs, rhs) = (arg!(0), arg!(1));
             // `x === undefined` (either order) is a bits comparison against the
             // unique `undefined` sentinel, so it needs no helper. Sound because
             // `undefined` is not a Number: no `+0`/`-0`/NaN aliasing applies,
@@ -399,8 +464,13 @@ fn lower_inst(
                 inst.op,
                 Op::BitAnd | Op::BitOr | Op::BitXor | Op::Shl | Op::Shr | Op::UShr
             ) {
-                // An operand the typer proves an int32 is always in range, so
-                // its `|x| < 2^63` guard can be skipped (`call_int_binary`).
+                // An operand the typer proves an int32 rides in an i32 register
+                // (no conversion); a `Number` operand truncates behind its
+                // `|x| < 2^63` guard. An `Int` result stays i32, so a chain of
+                // bit ops (a `| 0`/`& mask` chain) never round-trips through f64;
+                // `>>>` (`UShr`, typed `Number`) converts back to a value word.
+                let lhs_native = value_of(values, inst.args[0])?;
+                let rhs_native = value_of(values, inst.args[1])?;
                 let int_l = types.get(inst.args[0] as usize) == Some(&Type::Int);
                 let int_r = types.get(inst.args[1] as usize) == Some(&Type::Int);
                 call_int_binary(
@@ -409,7 +479,13 @@ fn lower_inst(
                     abi,
                     inst.op,
                     disc as i64,
-                    (lhs, rhs, (known_lhs, known_rhs), (int_l, int_r)),
+                    lhs_native,
+                    rhs_native,
+                    known_lhs,
+                    known_rhs,
+                    int_l,
+                    int_r,
+                    inst.ty == Type::Int,
                 )?
             } else {
                 let op = builder.ins().iconst(types::I64, disc as i64);
@@ -423,11 +499,24 @@ fn lower_inst(
                 )?
             }
         }
+        // Wrapping i32 arithmetic (`IntAdd`/`IntSub`/`IntMul`): both operands are
+        // i32 registers (the lift's register-body plan proved them int32), and
+        // the op is exactly the spec's `ToInt32` of the f64 arithmetic, so it
+        // stays in i32 with no conversion.
+        Op::IntAdd | Op::IntSub | Op::IntMul => {
+            let lhs = value_of(values, inst.args[0])?;
+            let rhs = value_of(values, inst.args[1])?;
+            match inst.op {
+                Op::IntAdd => builder.ins().iadd(lhs, rhs),
+                Op::IntSub => builder.ins().isub(lhs, rhs),
+                _ => builder.ins().imul(lhs, rhs),
+            }
+        }
         Op::ToNumber | Op::Neg | Op::BitNot | Op::Not => {
             // `!b` on a proven Boolean `Value` is a flip of the canonical bits
             // — the `select` the branch terminator folds, no helper.
             if inst.op == Op::Not && types.get(inst.args[0] as usize) == Some(&Type::Bool) {
-                let value = arg(0)?;
+                let value = arg!(0);
                 let is_false = builder.ins().icmp_imm_u(
                     IntCC::Equal,
                     value,
@@ -437,15 +526,22 @@ fn lower_inst(
             }
             let disc = unary_op(inst.op).ok_or(Unsupported::Step("opt:unary"))?;
             let op = builder.ins().iconst(types::I64, disc as i64);
-            let value = arg(0)?;
-            call_helper(
+            let value = arg!(0);
+            let res = call_helper(
                 builder,
                 helpers,
                 abi,
                 abi.sig_unary,
                 Helper::UnarySlow,
                 &[op, value],
-            )?
+            )?;
+            // `~x` is typed `Int` (`narrow`); the helper answers a Number, so an
+            // `Int` result must return to the i32 representation.
+            if inst.ty == Type::Int {
+                bits_to_int(builder, res)
+            } else {
+                res
+            }
         }
         // A speculation guard. `args[0]` is the condition (exit when falsy),
         // `args[1..]` the live operand stack (bottom to top), and `imm` the
@@ -461,7 +557,7 @@ fn lower_inst(
             let Imm::Int(step) = inst.imm else {
                 return Err(Unsupported::Step("opt:check"));
             };
-            let cond = arg(0)?;
+            let cond = arg!(0);
             let truthy = if types.get(inst.args[0] as usize) == Some(&Type::Bool) {
                 builder.ins().icmp_imm_u(
                     IntCC::NotEqual,
@@ -494,7 +590,7 @@ fn lower_inst(
             let Imm::Int(step) = inst.imm else {
                 return Err(Unsupported::Step("opt:guard"));
             };
-            let value = arg(0)?;
+            let value = arg!(0);
             let ok = match inst.ty {
                 Type::Number => is_double(builder, value),
                 _ => return Err(Unsupported::Step("opt:guard-type")),
@@ -512,8 +608,8 @@ fn lower_inst(
             if inst.args.len() < 2 {
                 return Err(Unsupported::Step("opt:guard-callee"));
             }
-            let callee = arg(0)?;
-            let expected = arg(1)?;
+            let callee = arg!(0);
+            let expected = arg!(1);
             let ok = builder.ins().icmp(IntCC::Equal, callee, expected);
             emit_guard(builder, abi, ok, step, &inst.args[2..], values)?;
             callee
@@ -565,7 +661,7 @@ fn lower_inst(
             undefined
         }
         Op::CompletionStore => {
-            let value = arg(0)?;
+            let value = arg!(0);
             emit_completion_store(builder, abi.vm, value, false);
             value
         }
@@ -577,7 +673,7 @@ fn lower_inst(
             let Imm::Atom(atom) = &inst.imm else {
                 return Err(Unsupported::Step("opt:member-cell"));
             };
-            let object = arg(0)?;
+            let object = arg!(0);
             let name = builder.ins().iconst(types::I64, *atom as i64);
             let cells = builder.ins().load(
                 types::I64,
@@ -619,8 +715,8 @@ fn lower_inst(
             let Imm::Atom(atom) = &inst.imm else {
                 return Err(Unsupported::Step("opt:member-guard"));
             };
-            let object = arg(0)?;
-            let spec = arg(1)?;
+            let object = arg!(0);
+            let spec = arg!(1);
             let name = builder.ins().iconst(types::I64, *atom as i64);
             let cells = builder.ins().load(
                 types::I64,
@@ -680,7 +776,7 @@ fn lower_inst(
             let Imm::Atom(atom) = &inst.imm else {
                 return Err(Unsupported::Step("opt:member"));
             };
-            let object = arg(0)?;
+            let object = arg!(0);
             let name = builder.ins().iconst(types::I64, *atom as i64);
             call_helper(
                 builder,
@@ -699,8 +795,8 @@ fn lower_inst(
             let Imm::Atom(atom) = &inst.imm else {
                 return Err(Unsupported::Step("opt:member-store"));
             };
-            let object = arg(0)?;
-            let value = arg(1)?;
+            let object = arg!(0);
+            let value = arg!(1);
             emit_member_store(builder, helpers, abi, object, value, *atom)?;
             builder
                 .ins()
@@ -710,8 +806,8 @@ fn lower_inst(
         // the append), falling back to `get_member_computed` for every other
         // receiver, key, or a hole.
         Op::ElementLoad => {
-            let object = arg(0)?;
-            let key = arg(1)?;
+            let object = arg!(0);
+            let key = arg!(1);
             emit_element_read(builder, helpers, abi, object, key)?
         }
         // A lifted `a[k] = v`: the inline dense-Array element store (the write
@@ -719,9 +815,9 @@ fn lower_inst(
         // for every other receiver, key, or a hole. `args = [object, key,
         // value]`; effect-only.
         Op::ElementStore => {
-            let object = arg(0)?;
-            let key = arg(1)?;
-            let value = arg(2)?;
+            let object = arg!(0);
+            let key = arg!(1);
+            let value = arg!(2);
             emit_element_store(builder, helpers, abi, object, key, value)?;
             builder
                 .ins()
@@ -768,7 +864,7 @@ fn lower_inst(
             let Imm::Context { depth, index } = &inst.imm else {
                 return Err(Unsupported::Step("opt:context"));
             };
-            let value = arg(0)?;
+            let value = arg!(0);
             let depth = builder.ins().iconst(types::I64, *depth as i64);
             let slot = builder.ins().iconst(types::I64, *index as i64);
             call_helper(
@@ -788,7 +884,7 @@ fn lower_inst(
             let Imm::Context { index, .. } = &inst.imm else {
                 return Err(Unsupported::Step("opt:context"));
             };
-            let value = arg(0)?;
+            let value = arg!(0);
             let slot = builder.ins().iconst(types::I64, *index as i64);
             call_helper(
                 builder,
@@ -848,11 +944,11 @@ fn lower_inst(
             }
             #[cfg(test)]
             OPT_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            let this = arg(0)?;
-            let callee = arg(1)?;
+            let this = arg!(0);
+            let callee = arg!(1);
             let argc = inst.args.len() - 2;
             for k in 0..argc {
-                let a = arg(2 + k)?;
+                let a = arg!(2 + k);
                 builder.ins().store(
                     MemFlagsData::new(),
                     a,
@@ -880,11 +976,11 @@ fn lower_inst(
                 .ok_or(Unsupported::Step("opt:intrinsic"))?;
             #[cfg(test)]
             OPT_INTRINSICS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            let this = arg(0)?;
-            let callee = arg(1)?;
+            let this = arg!(0);
+            let callee = arg!(1);
             let mut call_args = Vec::with_capacity(inst.args.len() - 2);
             for i in 2..inst.args.len() {
-                call_args.push(arg(i)?);
+                call_args.push(arg!(i));
             }
             emit_intrinsic(builder, helpers, abi, kind, this, callee, &call_args)?
         }
@@ -895,7 +991,7 @@ fn lower_inst(
         Op::NewArray => {
             let mut values = Vec::with_capacity(inst.args.len());
             for i in 0..inst.args.len() {
-                values.push(arg(i)?);
+                values.push(arg!(i));
             }
             emit_new_array(builder, helpers, abi, &values)?
         }
@@ -908,7 +1004,7 @@ fn lower_inst(
             };
             let mut values = Vec::with_capacity(inst.args.len());
             for i in 0..inst.args.len() {
-                values.push(arg(i)?);
+                values.push(arg!(i));
             }
             emit_new_object(builder, helpers, abi, step, &values)?
         }
@@ -917,8 +1013,8 @@ fn lower_inst(
         // (the VM's `array_index_stack` tracks the element index between steps).
         Op::ArrayBegin => call_helper(builder, helpers, abi, abi.sig_tdz, Helper::ArrayBegin, &[])?,
         Op::ArrayElement => {
-            let array = arg(0)?;
-            let value = arg(1)?;
+            let array = arg!(0);
+            let value = arg!(1);
             call_helper(
                 builder,
                 helpers,
@@ -929,7 +1025,7 @@ fn lower_inst(
             )?
         }
         Op::ArrayEnd => {
-            let array = arg(0)?;
+            let array = arg!(0);
             call_helper(
                 builder,
                 helpers,
@@ -945,11 +1041,11 @@ fn lower_inst(
             call_helper(builder, helpers, abi, abi.sig_tdz, Helper::ObjectBegin, &[])?
         }
         Op::ObjectInitName => {
-            let object = arg(0)?;
-            let value = arg(1)?;
-            let name = arg(2)?;
-            let set = arg(3)?;
-            let short = arg(4)?;
+            let object = arg!(0);
+            let value = arg!(1);
+            let name = arg!(2);
+            let set = arg!(3);
+            let short = arg!(4);
             call_helper(
                 builder,
                 helpers,
@@ -968,7 +1064,7 @@ fn lower_inst(
                 .iconst(types::I64, JsValue::Undefined.bits() as i64)
         }
         Op::ArgsPush => {
-            let value = arg(0)?;
+            let value = arg!(0);
             call_helper(
                 builder,
                 helpers,
@@ -982,7 +1078,7 @@ fn lower_inst(
                 .iconst(types::I64, JsValue::Undefined.bits() as i64)
         }
         Op::ArgsSpread => {
-            let iterable = arg(0)?;
+            let iterable = arg!(0);
             call_helper(
                 builder,
                 helpers,
@@ -1000,7 +1096,7 @@ fn lower_inst(
         // working-region base (a soft carve base — an out-of-room `sp` falls back
         // to `run_jit_leaf`).
         Op::Construct => {
-            let callee = arg(0)?;
+            let callee = arg!(0);
             call_helper(
                 builder,
                 helpers,
@@ -1016,7 +1112,7 @@ fn lower_inst(
             let Imm::Int(step) = inst.imm else {
                 return Err(Unsupported::Step("opt:for-of-begin"));
             };
-            let rhs = arg(0)?;
+            let rhs = arg!(0);
             let step_imm = builder.ins().iconst(types::I64, step as i64);
             call_helper(
                 builder,
@@ -1031,7 +1127,7 @@ fn lower_inst(
                 .iconst(types::I64, JsValue::Undefined.bits() as i64)
         }
         Op::ForInBegin => {
-            let rhs = arg(0)?;
+            let rhs = arg!(0);
             call_helper(
                 builder,
                 helpers,
@@ -1048,7 +1144,7 @@ fn lower_inst(
             let Imm::Int(slot) = inst.imm else {
                 return Err(Unsupported::Step("opt:for-of-bind"));
             };
-            let value = arg(0)?;
+            let value = arg!(0);
             builder.ins().store(
                 MemFlagsData::new(),
                 value,
@@ -1068,7 +1164,7 @@ fn lower_inst(
             let Imm::Int(inc) = inst.imm else {
                 return Err(Unsupported::Step("opt:update-value"));
             };
-            let value = arg(0)?;
+            let value = arg!(0);
             let result = builder.declare_var(types::I64);
             let fast = builder.create_block();
             let slow = builder.create_block();
@@ -1163,6 +1259,34 @@ fn canonical_bool(builder: &mut FunctionBuilder, cond: ClifValue) -> ClifValue {
         .ins()
         .iconst(types::I64, JsValue::Boolean(false).bits() as i64);
     builder.ins().select(cond, t, f)
+}
+
+/// The register an IR value of type `ty` rides in: an `Int` is a signed int32
+/// (an i32 register), everything else an i64 `Value` word. This is the whole
+/// of the representation decision — every boundary conversion keys on it.
+fn repr(ty: Type) -> cranelift_codegen::ir::Type {
+    if ty == Type::Int {
+        types::I32
+    } else {
+        types::I64
+    }
+}
+
+/// Convert an i32-represented `Int` to the i64 `Value` word an ABI boundary (a
+/// frame slot, a helper argument, a return) expects. A signed int32's `f64` is
+/// exact, and an integer's bits never land in the NaN-boxed tag region, so no
+/// canonicalization is needed.
+fn int_to_bits(builder: &mut FunctionBuilder, v: ClifValue) -> ClifValue {
+    let f = builder.ins().fcvt_from_sint(types::F64, v);
+    builder.ins().bitcast(types::I64, MemFlagsData::new(), f)
+}
+
+/// Convert an i64 `Value` word that is *proven* an int32 (`Type::Int`) to the
+/// i32 representation. The saturating conversion is exact on an in-range value,
+/// so no range guard is needed.
+fn bits_to_int(builder: &mut FunctionBuilder, v: ClifValue) -> ClifValue {
+    let f = builder.ins().bitcast(types::F64, MemFlagsData::new(), v);
+    builder.ins().fcvt_to_sint_sat(types::I32, f)
 }
 
 /// The fused for-of fetch-and-bind (`.notes/optimizing-tier-impl.md` §6, the
@@ -2522,8 +2646,14 @@ fn emit_gc_probe(
     let due = builder.ins().icmp_imm_u(IntCC::Equal, next, 0);
     let poll = builder.create_block();
     let cont = builder.create_block();
-    for _ in 0..params.len() {
-        builder.append_block_param(cont, types::I64);
+    // `cont`'s parameters mirror the loop header's, representation included
+    // (an `Int` parameter stays an i32 register across the probe).
+    let param_types: Vec<cranelift_codegen::ir::Type> = params
+        .iter()
+        .map(|&p| builder.func.dfg.value_type(p))
+        .collect();
+    for ty in param_types {
+        builder.append_block_param(cont, ty);
     }
     let args: Vec<BlockArg> = params.iter().map(|&p| p.into()).collect();
     builder.ins().brif(due, poll, &[], cont, &args);
@@ -3138,6 +3268,15 @@ fn emit_guard(
     builder.switch_to_block(deopt);
     for (i, v) in live.iter().enumerate() {
         let value = value_of(values, *v)?;
+        // The mirror is a `Value`-word (`u64`) slot the interpreter resumes
+        // from, so an `Int` live value (an i32 register) must widen back to its
+        // `Value` word — a raw i32 store would write 4 bytes and corrupt the
+        // slot the resume reads.
+        let value = if builder.func.dfg.value_type(value) == types::I32 {
+            int_to_bits(builder, value)
+        } else {
+            value
+        };
         builder.ins().store(
             MemFlagsData::new(),
             value,
@@ -3369,27 +3508,31 @@ fn canon_double(builder: &mut FunctionBuilder, bits: ClifValue) -> ClifValue {
     builder.ins().select(collides, canon, bits)
 }
 
-/// The inline integer fast path for the bitwise/shift ops: when both operands
-/// carry the double tag and lie inside the `ToInt32` conversion's range,
-/// truncate to i32, apply the bit op and convert back; otherwise fall through to
-/// `BinarySlow`. Mirrors the per-step lowerer's `emit_int_binary` + `trunc_i32`
-/// (outside `|x| < 2^63` the saturating conversion's low bits differ from the
-/// spec's wrap-around, so the range guard is required).
+/// The inline integer fast path for the bitwise/shift ops. An operand the typer
+/// proves an int32 is already an i32 register (`int_operand`); a `Number` operand
+/// truncates behind its `|x| < 2^63` guard. With `want_int` the signed result
+/// stays i32 (a chain of `| 0`/`& mask` never round-trips through f64); `>>>`'s
+/// `ToUint32` (`want_int` false) converts back to a value word. Mirrors the
+/// per-step lowerer's `emit_int_binary` + `trunc_i32` (outside `|x| < 2^63` the
+/// saturating conversion's low bits differ from the spec's wrap-around, so the
+/// range guard is required).
+#[allow(clippy::too_many_arguments)]
 fn call_int_binary(
     builder: &mut FunctionBuilder,
     helpers: &JitHelpers,
     abi: &Abi,
     op: Op,
     disc: i64,
-    vals: (ClifValue, ClifValue, (bool, bool), (bool, bool)),
+    lhs: ClifValue,
+    rhs: ClifValue,
+    lhs_known: bool,
+    rhs_known: bool,
+    lhs_int: bool,
+    rhs_int: bool,
+    want_int: bool,
 ) -> Result<ClifValue, Unsupported> {
-    let (lhs, rhs, (lhs_known, rhs_known), (lhs_int, rhs_int)) = vals;
-    let lhs_num = builder.ins().bitcast(types::F64, MemFlagsData::new(), lhs);
-    let rhs_num = builder.ins().bitcast(types::F64, MemFlagsData::new(), rhs);
-    let (l_wide, l_range) = trunc_i32(builder, lhs_num, lhs_int);
-    let (r_wide, r_range) = trunc_i32(builder, rhs_num, rhs_int);
-    let l = builder.ins().ireduce(types::I32, l_wide);
-    let r = builder.ins().ireduce(types::I32, r_wide);
+    let (l, l_range) = int_operand(builder, lhs, lhs_int);
+    let (r, r_range) = int_operand(builder, rhs, rhs_int);
     // `ishl`/`sshr`/`ushr` mask the amount to the operand size, which is the
     // spec's own shift-count reduction.
     let (res, unsigned) = match op {
@@ -3400,44 +3543,59 @@ fn call_int_binary(
         Op::Shr => (builder.ins().sshr(l, r), false),
         _ => (builder.ins().ushr(l, r), true),
     };
-    // `>>>` answers a `ToUint32`; the others a signed i32.
-    let res_f = if unsigned {
-        let wide = builder.ins().uextend(types::I64, res);
-        builder.ins().fcvt_from_uint(types::F64, wide)
+    let fast = if want_int {
+        // A signed int32 result stays in i32 — no f64 round trip.
+        res
     } else {
-        let wide = builder.ins().sextend(types::I64, res);
-        builder.ins().fcvt_from_sint(types::F64, wide)
+        // `>>>` answers a `ToUint32`; the others a signed i32.
+        let res_f = if unsigned {
+            let wide = builder.ins().uextend(types::I64, res);
+            builder.ins().fcvt_from_uint(types::F64, wide)
+        } else {
+            let wide = builder.ins().sextend(types::I64, res);
+            builder.ins().fcvt_from_sint(types::F64, wide)
+        };
+        // No `canon_double`: an integer `f64`'s bits never land in the NaN-boxed
+        // tag region, so the canonicalization would be a no-op three
+        // instructions.
+        builder
+            .ins()
+            .bitcast(types::I64, MemFlagsData::new(), res_f)
     };
-    // No `canon_double`: the result is an integer `f64` (`fcvt` of an i32), and
-    // an integer's bits never land in the NaN-boxed tag region, so the
-    // canonicalization would be a no-op three instructions.
-    let bits = builder
-        .ins()
-        .bitcast(types::I64, MemFlagsData::new(), res_f);
-    let fast = bits;
+    // Both operands proven int32 (and no `>>>`): the fast path is exact with no
+    // tag check, no range guard and no slow block — the register lane's shape.
+    if lhs_int && rhs_int {
+        return Ok(fast);
+    }
     // An operand proven a Number needs no tag check (mirrors
     // `call_numeric_binary`); the range check stays, an arbitrary Number can
     // still saturate the f64->i64 conversion — except for an operand proven an
-    // int32, whose guard `trunc_i32` already dropped.
+    // int32, whose guard `int_operand` already dropped.
     let in_range = builder.ins().band(l_range, r_range);
-    let both = if lhs_known && rhs_known {
-        // Both tag checks are the constant `1`; skip the conjunction.
-        in_range
+    let lhs_dbl = if lhs_known {
+        builder.ins().iconst(types::I8, 1)
     } else {
-        let lhs_dbl = if lhs_known {
-            builder.ins().iconst(types::I8, 1)
-        } else {
-            is_double(builder, lhs)
-        };
-        let rhs_dbl = if rhs_known {
-            builder.ins().iconst(types::I8, 1)
-        } else {
-            is_double(builder, rhs)
-        };
-        let known = builder.ins().band(lhs_dbl, rhs_dbl);
-        builder.ins().band(known, in_range)
+        is_double(builder, lhs)
     };
-    let result = builder.declare_var(types::I64);
+    let rhs_dbl = if rhs_known {
+        builder.ins().iconst(types::I8, 1)
+    } else {
+        is_double(builder, rhs)
+    };
+    let known = builder.ins().band(lhs_dbl, rhs_dbl);
+    let both = builder.ins().band(known, in_range);
+    // The slow helper takes `Value` words, so an int operand converts back.
+    let lhs_bits = if lhs_int {
+        int_to_bits(builder, lhs)
+    } else {
+        lhs
+    };
+    let rhs_bits = if rhs_int {
+        int_to_bits(builder, rhs)
+    } else {
+        rhs
+    };
+    let result = builder.declare_var(if want_int { types::I32 } else { types::I64 });
     builder.def_var(result, fast);
     let merge = builder.create_block();
     let slow = builder.create_block();
@@ -3450,14 +3608,37 @@ fn call_int_binary(
         abi,
         abi.sig_binary,
         Helper::BinarySlow,
-        &[op_imm, lhs, rhs],
+        &[op_imm, lhs_bits, rhs_bits],
     )?;
+    let slow_res = if want_int {
+        bits_to_int(builder, slow_res)
+    } else {
+        slow_res
+    };
     builder.def_var(result, slow_res);
     builder.ins().jump(merge, &[]);
     builder.seal_block(slow);
     builder.switch_to_block(merge);
     builder.seal_block(merge);
     Ok(builder.use_var(result))
+}
+
+/// The i32 operand for a bit op: an `Int` operand is already an i32 register
+/// (its range guard is the constant `1`); a `Number` operand bitcasts to f64 and
+/// truncates behind its `|x| < 2^63` guard.
+fn int_operand(
+    builder: &mut FunctionBuilder,
+    v: ClifValue,
+    is_int: bool,
+) -> (ClifValue, ClifValue) {
+    if is_int {
+        let one = builder.ins().iconst(types::I8, 1);
+        (v, one)
+    } else {
+        let num = builder.ins().bitcast(types::F64, MemFlagsData::new(), v);
+        let (wide, range) = trunc_i32(builder, num, false);
+        (builder.ins().ireduce(types::I32, wide), range)
+    }
 }
 
 /// The inline integer fast path for `%`: when both operands are Numbers,

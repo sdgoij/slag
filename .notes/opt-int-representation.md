@@ -129,3 +129,55 @@ test262 sweeps, the corpus differential, `--gc-stress` on the int rows.
 - **The register lane is the reference, not a rival.** Where its i32 path is
   simpler than the opt lowering can express, port its shape rather than invent
   one.
+
+## 7. Result (Cut A/B, 2026-10-10)
+
+The `Int`-as-i32 representation landed whole (there is no useful"bounded Cut A":
+the representation is a property of a value, so it is global or absent):
+
+- **Lowering** (`opt_lower`): a `Type::Int` value rides in an i32 register;
+  block parameters, `Op::Const`, and `Op::FrameLoad` follow the type; every
+  other use widens back to its `Value` word (`int_to_bits`/`bits_to_int`). The
+  bit-op fast path (`call_int_binary`) keeps a signed result in i32, converts
+  only a `Number` operand, and skips the guard/slow-block entirely when both
+  operands are already i32.
+- **New IR ops** `IntAdd`/`IntSub`/`IntMul` (wrapping int32, `pure`) for the
+  register body's proven-int arithmetic, and `narrow::fuse_wrapping_arith`
+  rewrites a general `ToInt32(a + b)`/`(a - b)` (two int32 operands) to them.
+  **`*` is excluded**: an int32 product can exceed `2^53`, so the spec's f64
+  multiply rounds before `ToInt32` (the register plan's separate `Mul` bound is
+  what keeps its `IntMul` safe).
+- **`mem2reg` phis** are retyped to the join of their incoming values, and
+  `pass::normalize_param_types` re-types every block parameter the same way (a
+  lifted merge parameter is often `Unknown` while its edges are `Int`);
+  `opt_lower::resolve` widens an `Int` edge argument when the parameter is not
+  an int32.
+- **The guard mirror** (`emit_guard`) widens an `Int` live value back to its
+  `Value` word before mirroring the operand stack into the working region — a
+  raw i32 store would corrupt the slot the interpreter resumes from (found via
+  a parallel-test failure; regression test
+  `opt_tier_int_value_survives_a_guard_deopt`).
+
+Measured (isolated, min-of-3, opt vs `SLAG_OPT=0`):
+
+| row | before | after |
+| --- | --- | --- |
+| `opcost/baseline` | 1.35 vs 0.25 (+427%) | 0.30 vs 0.27 (+12%) |
+| `opcost/object_alloc` | 1.35 vs 0.28 (+390%) | 0.27 vs 0.28 (-9%) |
+| `opcost/element_write` | 0.69 vs 1.13 (-39%) | 0.77 vs 1.16 (-34%) |
+| `opcost/array_alloc` | 0.59 vs 0.68 (-12%) | 0.26 vs 0.69 (-63%) |
+| `opcost/element_read` | 0.70 vs 0.78 (-10%) | 0.92 vs 0.81 (+13%) |
+
+The headline regression is closed (baseline 1.35 -> 0.30 ms, 4.5x). The
+residuals are honest: `baseline` is ~+12% off the per-step lane (the counter's
+`i & MASK` range guard, a separate range proof), and `element_read` regressed
+— its `s = (s + arr[k]) | 0` accumulator is an `Int` that lives in a **frame
+slot** `mem2reg` does not promote (the body's `new Array` observes the frame),
+so it pays an i32<->word conversion per iteration. Promoting the int slots in a
+body with an observing call is the next lever (a per-slot observability check,
+not the whole-function `slots_unobserved`).
+
+Gates: clippy clean; `cargo test --workspace` green (parallel; the serial-only
+`opt_tier_leaf_guard` failure predates this change); test262 `language`
+23726/0/0/0 and `built-ins` 23820/0/1/0 at `--timeout 15`; corpus differential
+0 mismatches; `--gc-stress` values exact on the int rows.
