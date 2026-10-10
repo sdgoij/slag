@@ -164,3 +164,37 @@ safe point (and the major trigger), not a codegen or scan change.
 the gap-versus-README and is invisible to the isolated `scratch/corpus-row-ab.sh`
 measurements the opt-tier notes have been using. Any whole-corpus or long-lived
 comparison (the README tables, the Deno embed) sits on top of it.
+
+The `search_slice` figure above is the pre-fix number; §6 records the fix.
+
+## 6. Fixed (2026-10-10): the optimizing tier had no GC safe point
+
+The mechanism in §4b — a compiled loop that allocates with no collection — is
+that `opt_lower.rs` had **no** safe point: `emit_gc_probe` / `GcSafepoint` /
+`gc_ticks` existed only in the per-step compiler (`compiler.rs`), so every loop
+that LIFTED into the optimizing tier ran with no probe at all. The `SLAG_GC_LOG`
+seam confirmed it: the reproducer's `coercion_concat` loop made **0**
+`gc_safepoint` calls over 300k iterations (1.5M allocations), while the per-step
+path polled ~292 times.
+
+Fix: `opt_lower::emit_gc_probe`, emitted at each loop header (the target of a
+back edge, `target <= source`), mirroring the per-step probe — decrement the
+ctx's `gc_ticks`, and on underflow reset it and call `gc_safepoint` through
+`call_helper` (whose pending check is the termination channel). The loop block's
+parameters flow through the poll's continuation block.
+
+Measured: the isolated reproducer's `search_slice` **194.7 -> 22.6 ms**; the
+whole-corpus process sum **13185 -> 4385 ms** (the README commit `b3fd0d9e` was
+4813, so the fix also clears the residual); `node tools/corpus/bench.js`
+mean-jitGap **41.25 -> 24.98** (README 23.09), mean-jlGap 5.55 (README 5.43),
+with `calls` 28.9 -> 11.9, `control` 72.5 -> 18.3, `language` 88.3 -> 12.7,
+`strings` 183.1 -> 24.7. Values unchanged (0 corpus mismatches; `baseline` /
+`dyn_key_read` exact under `--gc-stress`). Gates: clippy clean, 38 suites green,
+test262 `language` 23726/0/0/0 and `built-ins` 23820/0/1/0. A regression test,
+`installed_jit_opt_loop_safe_point_runs_minors`, pins it (a lifted allocating
+loop runs minors and its cohort stays bounded).
+
+Component 1 (§2b) is untouched: the opt tier is still slower than the per-step
+register lane on shapes like `opcost/baseline` (1.36 ms vs 0.26 ms), which now
+lifts into it — that is the read-parity work in `.notes/opt-per-op-overhead.md`,
+not this regression.

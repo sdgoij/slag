@@ -9387,6 +9387,60 @@ run(); run(); run(); run(); run(); run(); run(); run(); run();";
         );
     }
 
+    /// The OPTIMIZING tier's loop must carry the same safe point as the per-step
+    /// path (`opt_lower::emit_gc_probe`). A body that LIFTS allocates in machine
+    /// code, and before the probe was added its allocations never reached the
+    /// collector: the `coercion_concat`-shaped loop allocated 1,503,182 young
+    /// boxes with no collection, then paid a 46ms one (`.notes/corpus-regression.md`).
+    /// `f` is a function body because that is the shape that lifts (the string
+    /// literal widening admits it); the cohort bound is the same probe-interval
+    /// evidence the per-step test uses.
+    #[test]
+    fn installed_jit_opt_loop_safe_point_runs_minors() {
+        extern "C" fn noop_drop(_cache: *mut c_void) {}
+        let mut agent = runtime::Agent::new();
+        agent.initialize_host_defined_realm().expect("realm");
+        let mut cache = JitCache::new(runtime_helpers()).expect("isa");
+        agent.jit_hook = Some(runtime::jit::JitHook {
+            cache: (&mut cache as *mut JitCache) as *mut c_void,
+            lookup: jit_cache_lookup,
+            drop_cache: noop_drop,
+            helpers: &runtime::jit::JIT_SLOW_PATHS,
+        });
+        agent.set_nursery_threshold(512);
+        crux::heap::set_gc_trace(true);
+        let _ = crux::heap::take_gc_trace_records();
+        let value = agent
+            .run_script(
+                "function f() {\n\
+                   var s = 0;\n\
+                   for (var i = 0; i < 200000; i++) { var t = \"v\" + i; s += t.length; }\n\
+                   return s;\n\
+                 }\n\
+                 f();",
+            )
+            .expect("runs");
+        let records = crux::heap::take_gc_trace_records();
+        crux::heap::set_gc_trace(false);
+        let compiled = cache.compiled_count();
+        agent.jit_hook = None;
+
+        // Sum of the lengths of "v" + i for i in 0..200000.
+        assert_eq!(value.as_number(), Some(1288890.0));
+        assert!(compiled >= 1, "{compiled} bodies");
+        let minors: Vec<_> = records.iter().filter(|r| r.level == "minor").collect();
+        assert!(
+            !minors.is_empty(),
+            "the optimizing tier's loop must run minors ({} collections)",
+            records.len()
+        );
+        let worst = minors.iter().map(|r| r.young).max().unwrap_or(0);
+        assert!(
+            worst < 20000,
+            "the opt probe must pace the cohort (peaked at {worst} over 200k allocations)"
+        );
+    }
+
     /// A6: a primitive append into a PROMOTED dense array still takes the inline
     /// path. The write barrier is a no-op for a non-heap value, so the
     /// ArraySlots box's age is irrelevant for a Number store — a container-only

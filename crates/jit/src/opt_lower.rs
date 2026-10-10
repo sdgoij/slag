@@ -21,11 +21,11 @@ use runtime::ir::{
 };
 use runtime::jit::{
     AGENT_REALM_COUNT_OFFSET, CertifiedInlineInfo, DISPATCH_DEOPT, GlobalValueCell, HELPER_COUNT,
-    JIT_HELPER_COUNTS, JitCallContext, LEAF_CALL_RECORD_SHIFT, LeafCallRecord, LeafInlineInfo,
-    VM_ASYNC_FOR_OF_STACK_LEN_OFFSET, VM_COMPLETION_IS_EMPTY_OFFSET, VM_COMPLETION_OFFSET,
-    VM_DESTRUCTURE_STACK_LEN_OFFSET, VM_ENV_STACK_LEN_OFFSET, VM_FOR_IN_STACK_LEN_OFFSET,
-    VM_FOR_OF_BOUNDARIES_LEN_OFFSET, VM_FOR_OF_STACK_LEN_OFFSET, VM_IP_OFFSET,
-    VM_PENDING_LEN_OFFSET, VM_TRY_STACK_LEN_OFFSET,
+    JIT_GC_PROBE_INTERVAL, JIT_HELPER_COUNTS, JitCallContext, LEAF_CALL_RECORD_SHIFT,
+    LeafCallRecord, LeafInlineInfo, VM_ASYNC_FOR_OF_STACK_LEN_OFFSET,
+    VM_COMPLETION_IS_EMPTY_OFFSET, VM_COMPLETION_OFFSET, VM_DESTRUCTURE_STACK_LEN_OFFSET,
+    VM_ENV_STACK_LEN_OFFSET, VM_FOR_IN_STACK_LEN_OFFSET, VM_FOR_OF_BOUNDARIES_LEN_OFFSET,
+    VM_FOR_OF_STACK_LEN_OFFSET, VM_IP_OFFSET, VM_PENDING_LEN_OFFSET, VM_TRY_STACK_LEN_OFFSET,
 };
 use syntax::ast::{BinaryOp, UnaryOp, UpdateOp};
 
@@ -156,10 +156,43 @@ fn lower(
 
     let mut values: Vec<Option<ClifValue>> = vec![None; ir.value_count() as usize];
     let types = ir.value_types();
+    // A loop header is the target of a back edge (an edge to a block at or
+    // before its own index). Each one carries a GC safe point: the optimizing
+    // tier lowered none before 2026-10-10, so a lifted allocating loop never
+    // collected — the young cohort ballooned and the eventual collection was a
+    // huge pause (see `emit_gc_probe`).
+    let mut loop_headers: std::collections::HashSet<BlockId> = std::collections::HashSet::new();
+    for s in 0..ir.block_count() as BlockId {
+        match &ir.block(s).term {
+            Some(Term::Jump { target, .. }) => {
+                if *target <= s {
+                    loop_headers.insert(*target);
+                }
+            }
+            Some(Term::Branch {
+                then_block,
+                else_block,
+                ..
+            }) => {
+                if *then_block <= s {
+                    loop_headers.insert(*then_block);
+                }
+                if *else_block <= s {
+                    loop_headers.insert(*else_block);
+                }
+            }
+            _ => {}
+        }
+    }
     for b in 0..ir.block_count() as BlockId {
         let block = ir.block(b);
         builder.switch_to_block(clif[b as usize]);
         let params = builder.block_params(clif[b as usize]).to_vec();
+        let params = if loop_headers.contains(&b) {
+            emit_gc_probe(&mut builder, &abi, helpers, &params)?
+        } else {
+            params
+        };
         for (i, p) in block.params.iter().enumerate() {
             values[*p as usize] = Some(params[i]);
         }
@@ -2460,6 +2493,53 @@ fn emit_member_store(
     builder.seal_block(merge);
     builder.switch_to_block(merge);
     Ok(())
+}
+
+/// The optimizing tier's compiled GC safe point — the `opt_lower` twin of
+/// `compiler.rs::emit_gc_probe`. Emitted at the top of a loop header: count the
+/// ctx's per-run ticker down, and on underflow reset it to
+/// [`JIT_GC_PROBE_INTERVAL`] and call `gc_safepoint`, which runs the collection
+/// trigger when the allocation budget is exceeded (and bails the body when a
+/// termination request is outstanding — `call_helper`'s pending check is the
+/// channel). Without it a lifted loop allocates without ever collecting, so the
+/// young cohort balloons and one enormous collection follows. The block's
+/// parameters flow through the poll's continuation (the probe needs none of
+/// them; the loop body runs there).
+fn emit_gc_probe(
+    builder: &mut FunctionBuilder,
+    abi: &Abi,
+    helpers: &JitHelpers,
+    params: &[ClifValue],
+) -> Result<Vec<ClifValue>, Unsupported> {
+    let offset = Offset32::new(std::mem::offset_of!(JitCallContext, gc_ticks) as i32);
+    let ticks = builder
+        .ins()
+        .load(types::I64, MemFlagsData::new(), abi.vm, offset);
+    let next = builder.ins().iadd_imm_s(ticks, -1);
+    builder
+        .ins()
+        .store(MemFlagsData::new(), next, abi.vm, offset);
+    let due = builder.ins().icmp_imm_u(IntCC::Equal, next, 0);
+    let poll = builder.create_block();
+    let cont = builder.create_block();
+    for _ in 0..params.len() {
+        builder.append_block_param(cont, types::I64);
+    }
+    let args: Vec<BlockArg> = params.iter().map(|&p| p.into()).collect();
+    builder.ins().brif(due, poll, &[], cont, &args);
+    builder.switch_to_block(poll);
+    let interval = builder
+        .ins()
+        .iconst(types::I64, JIT_GC_PROBE_INTERVAL as i64);
+    builder
+        .ins()
+        .store(MemFlagsData::new(), interval, abi.vm, offset);
+    let _ = call_helper(builder, helpers, abi, abi.sig_tdz, Helper::GcSafepoint, &[])?;
+    builder.ins().jump(cont, &args);
+    builder.seal_block(poll);
+    builder.switch_to_block(cont);
+    builder.seal_block(cont);
+    Ok(builder.block_params(cont).to_vec())
 }
 
 fn call_helper(

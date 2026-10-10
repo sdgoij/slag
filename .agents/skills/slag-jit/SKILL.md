@@ -1318,3 +1318,35 @@ instructions per bit op. Three pieces were free to remove:
   They are independent greatest fixpoints sharing `slot_flags`; replacing the
   former with the latter (a natural-looking edit) leaves `value_numerics`
   calling a function that no longer exists.
+
+## 33. The optimizing tier must emit the GC safe point
+
+`compiler.rs::emit_gc_probe` (the per-step loop-header poll) had no `opt_lower.rs`
+twin until 2026-10-10, so **every loop that lifted into the optimizing tier ran
+with NO GC probe**: it allocated in machine code without `gc_safepoint` ever
+firing, the young cohort ballooned (1,503,182 boxes measured on a 300k-iteration
+string loop, which made 0 safepoint calls), and the eventual collection was a
+~46 ms pause. It is process-lifetime visible — a workload's JIT time depended on
+what ran before it (`strings/search_slice` 60 -> 1739 ms in the whole-corpus
+process) while `--jitless` was unaffected. Full write-up:
+`.notes/corpus-regression.md`.
+
+- **A new lowered-loop form needs its safe point.** The probe is emitted in
+  `opt_lower::lower` at each loop header — a block targeted by a back edge
+  (`target <= source`, which covers a self-branch). A terminator or loop shape
+  that is not a back-edge target gets no probe.
+- **The probe splits the header block; the IR parameters must flow through it.**
+  `emit_gc_probe` creates a `poll`/`cont` diamond; `cont` carries the block's
+  parameters (passed from the header) and the loop body runs there, so the
+  parameter binding happens after the probe. The helper call goes through
+  `call_helper`, whose pending check is the termination channel (an error bails
+  the body).
+- **"A compiled loop never collects" points here first.** Diagnose with the
+  `SLAG_GC_LOG` / `SLAG_GC_SKIP` / `SLAG_GC_POLL` seams: zero `gc_safepoint`
+  calls over a huge allocation count on a lifted loop is the tell. The regression
+  test `installed_jit_opt_loop_safe_point_runs_minors` pins it (a lifted
+  allocating loop runs minors and its cohort stays bounded).
+- **A whole-corpus measurement is the only place this shows.** An isolated row
+  is fine (its cohort is collected at the script boundary); the pathology needs a
+  preceding allocating workload. `node tools/corpus/bench.js` at the README's
+  commit vs HEAD is the check.
