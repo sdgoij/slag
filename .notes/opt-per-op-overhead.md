@@ -187,3 +187,78 @@ are provably `Int`. §6.3's arithmetic-op `canon` sinking and §6.4/§6.5 remain
   judged on the family sum, not one row.
 - `--jit-bench`'s `arithmetic`, `bare loop`, `property read`, `typed-array *`
   are the companion micros.
+
+## 8. The register lane: promote slots to SSA (plan, probe-first)
+
+**Status: proposed 2026-10-10.** The dominant residual on `opcost/baseline`
+(opt ~4.6x the per-step, §1) is §3.1: the per-step tier keeps the loop's `s` and
+`i` in registers, while the opt lift round-trips every variable through its frame
+slot (`FrameLoad slot; <op>; FrameStore slot` per iteration — see the dumped
+`opcost/baseline` IR).
+
+`pass::mem2reg` already implements the promotion this needs, including
+loop-carried slots (a block-parameter phi on the back edge, `append_edge_arg`),
+but the pipeline runs it only on a *callee's* lifted IR inside the trial-inline
+resolver (`pass/mod.rs`: "`mem2reg` is not part of this pipeline"). The reason is
+soundness: a spliced callee's slots are private, while a top-level body's slots
+are observable — a frame-reading helper (`builder_bind`/`builder_store`,
+`create_function_decl`, `create_arguments` all go through `Vm::frame_get`) and a
+deopt's interpreter re-execution both read them.
+
+### Cuts
+
+**Cut 0 — widen the bit-op and numeric-comparison effects (prerequisite, small).**
+`default_effects` gives `Op::BitAnd..UShr` and `Op::Lt..Ge`/`Op::Eq`
+`Effects::call()`, so today every bit op and the loop test are slot-observers (the
+dumped `opcost/baseline` IR shows `BitAnd ... [segw/segw]`). `narrow` already
+proves a bit op numeric when its operands are; extend `rewrite` to widen those
+ops — and a comparison whose operands are both numeric — to `pure()`. Sound:
+`ToInt32`/`ToUint32` of a Number and a numeric comparison run no user code and
+cannot throw. This alone also unblinds `dce`/`cse`/`licm` around bit ops.
+
+**Cut A — run `mem2reg` on the top-level body when no slot-observer or deopt
+remains.** After Cut 0 a pure register-loop body (`opcost/baseline`,
+`object_alloc`) has no op reading/writing `Heap::Slots` except the slot accesses
+themselves, and no `Op::Check`/`GuardType`/`GuardCallee` (a guard is `pure()` by
+effects, so it must be excluded explicitly). There a promoted slot is
+unobservable, so plain `mem2reg` is sound and closes the row. Gate: promote only
+if the body has no op with `may_read(Heap::Slots) || may_write(Heap::Slots)`
+outside `FrameLoad`/`FrameStore`, and no guard; **and** promote only a slot whose
+every store is a non-heap value (see the GC trap below).
+
+**Cut B — flush-aware promotion (the general case).** For a body with a
+slot-observing op or a deopt, mem2reg must materialize: (a) store every live
+promoted slot back to its frame slot before such an op, and start a fresh def
+from a reload after it (a barrier splits the promoted region, like a merge);
+(b) flush every live promoted slot before a guard's deopt branch, because the
+resumed interpreter reads the frame. `emit_guard` already mirrors the operand
+stack for deopt; it must also receive the live slot set.
+
+### Measurement
+
+`scratch/corpus-row-ab.sh opcost/baseline opcost/object_alloc` (isolated,
+min-of-3) is the target; Cut 0 is judged on the family sum and must not regress
+`objects/own_read`/`globals/*`. A promoted body is confirmed by `JIT_DUMP_IR=1`
+losing its `FrameLoad`/`FrameStore` pairs. Gates: clippy, workspace tests, both
+sweeps (effect widening changes `cse`/`dce` behavior), the corpus differential,
+GC-stress on `baseline`.
+
+### Traps
+
+- **A frame slot is a GC root — promoting a heap value unroots it.** The
+  compiled frame is traced (conservatively, per the GC design), so a slot is the
+  only reference to a young box it holds; promoting that slot to an untraced
+  Cranelift register lets the collector free the box (the barrier-UAF/`EnvRecord`
+  class). Cut A must therefore restrict promotion to slots whose every store is
+  non-heap (`Number`/`Int`/`Bool`/`Undefined`/`Null` — `narrow`'s
+  `slot_numeric`/`slot_int` give exactly this for the numeric rows); the general
+  Cut B case must root the promoted value by another means before a collection.
+- **A guard is `pure()` by effects but deopts.** Excluding it from the
+  "no slot-observer" gate must be explicit.
+- **`Op::Eq` is loose `==`.** Widening it is sound only when both operands are
+  provably numeric.
+- **A slot-observing call can *write* the slot.** After a barrier the promoted
+  value is invalid — reload, don't reuse.
+- **The entry block cannot carry a phi** (`verify`), and `mem2reg` already
+  refuses a slot whose entry load needs the initial `undefined`; this is why the
+  register body's `Const undefined` accumulator seed is not a candidate.
