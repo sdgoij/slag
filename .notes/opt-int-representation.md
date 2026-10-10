@@ -64,6 +64,44 @@ the IR is final.
   operands, with the §2 boundary conversions. Verify the rows the opt tier
   already wins (`element_write`, `array_alloc`, `array_at`) do not regress.
 
+## 4b. Probe result (Cut P, 2026-10-10)
+
+Re-applying the widening + mem2reg and dumping `baseline`'s post-pipeline IR
+(`JIT_DUMP_IR=1`):
+
+```
+b1(v27:?, v31:?):
+  v6:int  = BitAnd(v31, v5)
+  v10:int = BitOr(v27, v9)
+  v12:int = BitOr(v6, v9)
+  v13:num = Add(v10, v12)
+  v15:int = BitOr(v13, v9)
+  v17:int = BitAnd(v15, v16)
+  v24:num = Add(v31, v23)
+  v26:bool = Lt(v24, v25)
+  branch v26, b1(v17, v24), b2(v17, v24)
+```
+
+The loop is **pure SSA**: 0 frame-slot crossings and 0 helper crossings for an
+`Int` value, so the representation's boundary conversions (§2) will not cap the
+win — Cut A/B can proceed. The timing is unchanged (1.39 ms), confirming the
+residual is the per-op f64 round trip, not the boundary. Two preconditions
+surfaced, both now part of the arc:
+
+1. **`mem2reg`'s phis are `Type::Unknown`.** `v27`/`v31` dump as `?`: `narrow`
+   runs *before* `promote` in the pipeline, and nothing re-types the new block
+   parameters. So the i32 representation would not see the loop-carried
+   accumulator as `Int` without a re-type after `mem2reg` (a second `narrow`, or
+   running `promote` before `narrow` once the IR is in SSA).
+2. **The counter `v31` joins to `Number`, not `Int`.** Its stores are the entry
+   `Const 0` (`Int`) and `Add(i, 1)` (`Number`), so `i & MASK`'s left operand
+   keeps its range guard. That is a separate range proof on the loop counter;
+   the i32 representation removes the round trip on `s` and the `| 0`/`& -1`
+   results but not the guard on `i`.
+
+The probe patch (the reverted widening + mem2reg) is not shipped; this note is
+the artifact.
+
 ## 5. Measurement and gates
 
 Target: the register-lane rows reach parity with the per-step lane (`opt/per`
