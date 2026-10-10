@@ -187,21 +187,23 @@ The opt-vs-`SLAG_OPT=0` view (min-of-3) of the same rows:
 | `opcost/element_read` | 0.70 vs 0.78 (-10%) | 0.92 vs 0.81 (+13%) |
 
 The headline regression is closed (baseline 1.34 -> 0.29 ms, 4.6x; object_alloc
-5.4x; array_alloc 2.4x). `element_read` is the one real regression (+29%): its
-`k = i & MASK` result is a proven `Int` stored to a **frame slot** `mem2reg`
+5.4x; array_alloc 2.4x). `element_read` was the one real regression (+29%):
+its `k = i & MASK` result is a proven `Int` stored to a **frame slot** `mem2reg`
 does not promote (the body's `new Array` gives the whole function a Slots
-observer, so `slots_unobserved` is false), and each iteration then pays an
-i32<->word conversion on the store and the load.
+observer), and each iteration then paid an i32<->word conversion on the store
+and the load.
 
-Two ways to close it, neither taken yet. (a) A per-slot promotion: a frame slot
-is a GC root and a call may read the frame, so promoting one the body's own call
-might observe is unsound unless the slot is proven not live across the observer
-— this needs real per-slot liveness, not a tweak to `slots_unobserved`, and is
-too risky for one micro-row. (b) Type selection: `narrow` types every bit-op
-result `Int`, but `k` here feeds only an element key (an i64 context), so it
-did not need the i32 representation at all — a consumer-driven int-use
-propagation would leave it a `Number` and remove the conversions without
-relaxing anything. (b) is the safer lever.
+**Fixed by consumer-driven typing** (`narrow::restrict_int_to_arith_use`): the
+representation is worth carrying only inside an int chain, so a value whose uses
+are all boundaries (a frame store, a helper arg, an element key) stays a
+`Number` — the store/load then cost nothing. A value is kept `Int` when it has an
+arithmetic/bit use, or is the store of a slot read into one (the register body's
+accumulator), and `IntAdd`/`IntSub`/`IntMul` results are always kept (their
+lowering *is* an i32 op). This is safe by construction: a fusion operand is by
+definition an arith use, so no `ToInt32(a + b)` fusion is ever lost, and no
+`IntAdd` operand can be downgraded (which would have been a refusal). Result:
+`element_read` 0.884 -> 0.74 ms (now 6% *faster* than the per-step lane, was 29%
+slower) and `element_write` 0.77 -> 0.60 ms.
 
 `baseline` is ~+12% off the per-step lane: its counter `i` is a `Number`, so
 `i & MASK` keeps the f64 range guard — a separate range proof on the loop

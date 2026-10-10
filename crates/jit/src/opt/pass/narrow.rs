@@ -29,7 +29,7 @@ pub fn run(func: &mut Function) -> bool {
     let mut slot_int = vec![true; slots];
     loop {
         let values = value_numerics(func, &slot_numeric);
-        let ints = value_ints(func, &values, &slot_int);
+        let ints = restrict_int_to_arith_use(func, value_ints(func, &values, &slot_int), slots);
         let next = slot_flags(func, &values, slots);
         let next_int = slot_flags(func, &ints, slots);
         if next == slot_numeric && next_int == slot_int {
@@ -176,6 +176,93 @@ fn is_int_inst(inst: &Inst, values: &[bool], slot_int: &[bool]) -> bool {
     }
 }
 
+/// Restrict the forward int32 lattice to the values that *benefit* from the i32
+/// representation.
+///
+/// A value that is an int32 but whose only uses are boundaries — a frame store,
+/// a helper argument, an element key — need not carry the representation: the
+/// lowering would convert it at every crossing, and the frame slot it feeds is
+/// a `Value` word the interpreter and the deopt resume read regardless. Keep
+/// `Int` only for a value with an arithmetic/bit use, or for the store of a slot
+/// that is read into such a use (the register body's accumulator slot, whose
+/// loads feed its own `IntAdd`). `IntAdd`/`IntSub`/`IntMul` results are
+/// inherently i32 — their lowering emits an i32 op — and are always kept.
+fn restrict_int_to_arith_use(func: &Function, mut ints: Vec<bool>, slots: usize) -> Vec<bool> {
+    let is_arith = |op: Op| {
+        matches!(
+            op,
+            Op::Add
+                | Op::Sub
+                | Op::Mul
+                | Op::Div
+                | Op::Mod
+                | Op::Pow
+                | Op::Neg
+                | Op::BitAnd
+                | Op::BitOr
+                | Op::BitXor
+                | Op::Shl
+                | Op::Shr
+                | Op::UShr
+                | Op::BitNot
+                | Op::IntAdd
+                | Op::IntSub
+                | Op::IntMul
+        )
+    };
+    let mut arith = vec![false; ints.len()];
+    for b in 0..func.block_count() as u32 {
+        for inst in &func.block(b).insts {
+            if is_arith(inst.op) {
+                for &a in &inst.args {
+                    if let Some(flag) = arith.get_mut(a as usize) {
+                        *flag = true;
+                    }
+                }
+            }
+        }
+    }
+    // A slot is arith-read when one of its loads is used by an arithmetic/bit op.
+    let mut slot_arith = vec![false; slots];
+    for b in 0..func.block_count() as u32 {
+        for inst in &func.block(b).insts {
+            if inst.op == Op::FrameLoad
+                && let Imm::Slot(s) = inst.imm
+                && inst
+                    .result
+                    .is_some_and(|r| arith.get(r as usize).copied().unwrap_or(false))
+                && let Some(flag) = slot_arith.get_mut(s as usize)
+            {
+                *flag = true;
+            }
+        }
+    }
+    for b in 0..func.block_count() as u32 {
+        for inst in &func.block(b).insts {
+            if inst.op == Op::FrameStore
+                && let Imm::Slot(s) = inst.imm
+                && slot_arith.get(s as usize).copied().unwrap_or(false)
+                && let Some(&v) = inst.args.first()
+                && let Some(flag) = arith.get_mut(v as usize)
+            {
+                *flag = true;
+            }
+        }
+    }
+    for b in 0..func.block_count() as u32 {
+        for inst in &func.block(b).insts {
+            if let Some(r) = inst.result
+                && ints.get(r as usize).copied().unwrap_or(false)
+                && !arith.get(r as usize).copied().unwrap_or(false)
+                && !matches!(inst.op, Op::IntAdd | Op::IntSub | Op::IntMul)
+            {
+                ints[r as usize] = false;
+            }
+        }
+    }
+    ints
+}
+
 /// Whether the bit-op and numeric-comparison effect widening runs
 /// (`SLAG_WIDEN=0` disables it, the same-binary seam for measuring its marginal
 /// effect).
@@ -273,20 +360,37 @@ fn rewrite(
                 changed = true;
             }
             // The lift types every bit op `Int` unconditionally
-            // (`lift::binary_type`); the prover did not confirm this value is an
-            // int32 (its operands are not both proven Numbers), so the guard path
-            // is required. Keep it in the `Value`-word representation rather than
-            // an i32 register (a `| 0` of an unproven expression would otherwise
-            // convert on every frame round trip).
+            // (`lift::binary_type`); the prover either did not confirm this
+            // value is an int32 (its operands are not both proven Numbers), or
+            // confirmed it but the value has only boundary uses (see
+            // `restrict_int_to_arith_use`). Keep it in the `Value`-word
+            // representation rather than an i32 register. A numeric value is a
+            // `Number`; anything else (a bit op on a non-Number operand) is left
+            // `Unknown` so the lowering takes the guarded path.
             if inst.ty == Type::Int
                 && matches!(
                     inst.op,
-                    Op::BitAnd | Op::BitOr | Op::BitXor | Op::Shl | Op::Shr | Op::UShr | Op::BitNot
+                    Op::BitAnd
+                        | Op::BitOr
+                        | Op::BitXor
+                        | Op::Shl
+                        | Op::Shr
+                        | Op::UShr
+                        | Op::BitNot
+                        | Op::Const
                 )
             {
-                inst.ty = Type::Unknown;
+                let ty = if inst
+                    .result
+                    .is_some_and(|r| values.get(r as usize).copied().unwrap_or(false))
+                {
+                    Type::Number
+                } else {
+                    Type::Unknown
+                };
+                inst.ty = ty;
                 if let Some(r) = inst.result {
-                    retype.push((r, Type::Unknown));
+                    retype.push((r, ty));
                 }
                 changed = true;
             }
