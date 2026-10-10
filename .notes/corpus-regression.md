@@ -118,6 +118,45 @@ the pathology. The mechanism proper is still open — the only facts are "same o
 JIT-only, ~10x slower after another workload ran", which needs native profiling
 (RSS, GC-pause distribution, code-cache stats) rather than more guessing.
 
+## 4b. The compiled-loop GC safe point is the cost
+
+Seams on the safepoint (`runtime::jit::gc_safepoint` → `Agent::maybe_collect`),
+one build, the isolated pair:
+
+| seam | `search_slice` |
+|---|---|
+| (none) | 194.7 ms |
+| `SLAG_GC_POLL=0` (skip the safepoint) | **18.9 ms** |
+| `SLAG_GC_SKIP=minor` | 204.2 ms |
+| `SLAG_GC_SKIP=major` | **19.2 ms** |
+
+So the compiled loop's safe point runs a **major** collection, and that is the
+whole cost. `SLAG_GC_LOG=1` on the corpus pair shows ~171 majors at a *tiny* live
+set (`live=7260 last=3164`): after each sweep `last_collected_live` drops to the
+swept-down live (~3164), the loop's allocations double `live` back to ~7260, and
+the check `live > 2*last_collected_live` re-fires — a major every ~585
+iterations, ~1 ms each.
+
+`--gc-trace` (the corpus path does not apply it — use the file path) on an
+equivalent single-file pair shows the JIT and the interpreter diverge on
+*pacing*, not on collection cost:
+
+| | collections | max pause | young at the big one |
+|---|---|---|---|
+| jitless | hundreds (majors, `swept=4100`) | **306 µs** | — |
+| jit | 14 | **46,643 µs** | **1,504,007 boxes** |
+
+The compiler's fast path lets the young cohort balloon to 1.5M boxes and then
+pays a 46 ms collection, where the interpreter's back-edge pacing keeps every
+collection ~150-300 µs. `stack_words` is modest in both (~6000), so it is NOT
+the conservative scan — it is the collection cadence.
+
+**Root cause:** the compiled loop's safe point does not pace collections like the
+interpreter's back-edge check, so an allocating compiled loop either majors
+repeatedly (`live > 2*last` sawtoothing at a tiny live set) or accumulates a huge
+cohort; either way the pause dominates. The fix is a pacing fix in the compiled
+safe point (and the major trigger), not a codegen or scan change.
+
 ## 5. Why it matters
 
 `search_slice` alone is ~22 ms; in the whole-corpus process it is ~2200 ms — a
