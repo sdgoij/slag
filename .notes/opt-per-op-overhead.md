@@ -190,11 +190,12 @@ are provably `Int`. §6.3's arithmetic-op `canon` sinking and §6.4/§6.5 remain
 
 ## 8. The register lane: promote slots to SSA (plan, probe-first)
 
-**Status: proposed 2026-10-10.** The dominant residual on `opcost/baseline`
-(opt ~4.6x the per-step, §1) is §3.1: the per-step tier keeps the loop's `s` and
+**Status: Cut 0 + Cut A tried 2026-10-10 and REVERTED (net ~zero); Cut B
+untouched. The result below refutes §3.1** — slot traffic is not the `opcost`
+gap. The original premise: the dominant residual on `opcost/baseline`
+(opt ~4.6x the per-step, §1) is §3.1 — the per-step tier keeps the loop's `s` and
 `i` in registers, while the opt lift round-trips every variable through its frame
-slot (`FrameLoad slot; <op>; FrameStore slot` per iteration — see the dumped
-`opcost/baseline` IR).
+slot (`FrameLoad slot; <op>; FrameStore slot` per iteration).
 
 `pass::mem2reg` already implements the promotion this needs, including
 loop-carried slots (a block-parameter phi on the back edge, `append_edge_arg`),
@@ -233,6 +234,44 @@ from a reload after it (a barrier splits the promoted region, like a merge);
 (b) flush every live promoted slot before a guard's deopt branch, because the
 resumed interpreter reads the frame. `emit_guard` already mirrors the operand
 stack for deopt; it must also receive the live slot set.
+
+### Result (2026-10-10): Cut 0 + Cut A reverted
+
+Both cuts were implemented, gated (`SLAG_WIDEN=0`, `SLAG_MEM2REG=0`) and
+measured in one binary (2x2, isolated, min-of-3; `scratch/ab-2x2.sh`):
+
+| row | none | +widen | +m2r | both |
+|---|---|---|---|---|
+| `opcost/baseline` | 1.479 | 1.485 | 1.457 | 1.479 |
+| `opcost/object_keys` | 74.0 | 74.4 | 68.9 | 69.2 |
+| `control/nested_loops` | 28.9 | 29.6 | 30.4 | 28.8 |
+| `opcost/element_read` | 0.878 | 0.840 | 0.856 | 0.831 |
+| `objects/compound_assign` | 68.0 | 67.5 | 68.1 | 68.8 |
+| `calls/construct_churn` | 122.2 | 121.7 | 123.6 | 126.5 |
+
+**Cut 0 (effect widening) moves nothing** — the `+widen` column equals `none` on
+every row. The bytecode compiler's own `| 0`/`& -1` normalizations and the
+surrounding ops mean a widened bit op is not on a path the optimizer can
+recompute or hoist usefully. **Cut A (mem2reg) wins `object_keys` ~7%** (a
+member-heavy loop whose slot traffic is real) and `element_read` ~4%, but is a
+wash or a touch worse on `nested_loops`/`construct_churn`. Net ~zero for a new
+pipeline pass (which adds a dominator computation to every lifted body), so both
+are reverted — this note is the only artifact; the code is back at `d93eafb`.
+
+**§3.1 refuted.** The `opcost/baseline` gap is NOT the frame-slot round trip.
+Promoting `s`/`i` to SSA block params (`JIT_DUMP_IR=1` confirms the loop loses
+every `FrameLoad`/`FrameStore` and every op is `[-/-]`) leaves the time at 1.44ms
+vs 1.49ms with the slots. The gap is the *lowering*: `call_int_binary`
+round-trips every value through f64 (`bitcast` -> `fcvt_to_sint_sat` -> i32 op ->
+`sextend`/`fcvt_from_sint` -> `bitcast`) with a tag check, a range check and a
+branch to `BinarySlow` per bit op, where the per-step register lane folds the
+whole `k = i & MASK; s = (s + k) | 0` into ~3 i32 instructions in an i32 register.
+Matching that needs an **i32 value representation** in the opt IR (an `Int` value
+is i32 bits, not an f64 bit pattern), not the slot promotion.
+
+**Redirect:** the next lever is the int-op lowering's representation (§6.3/§6.4
+re-read in this light) — and the slot promotion is at most a prerequisite for it,
+never a win alone.
 
 ### Measurement
 
