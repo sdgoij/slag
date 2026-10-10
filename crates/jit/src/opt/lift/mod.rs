@@ -1138,7 +1138,7 @@ fn emit_step(
                 block,
                 Op::Const,
                 &[],
-                Type::Unknown,
+                Type::Undefined,
                 Effects::pure(),
                 Imm::U64(crux::Value::Undefined.bits()),
             );
@@ -1179,7 +1179,7 @@ fn emit_step(
                 block,
                 Op::Const,
                 &[],
-                Type::Unknown,
+                Type::Undefined,
                 Effects::pure(),
                 Imm::U64(crux::Value::Undefined.bits()),
             );
@@ -1542,7 +1542,7 @@ fn emit_reg_body(
         block,
         Op::Const,
         &[],
-        Type::Unknown,
+        Type::Undefined,
         Effects::pure(),
         Imm::U64(crux::Value::Undefined.bits()),
     );
@@ -1802,6 +1802,25 @@ fn emit_leaf_op(
         } => {
             let object = load(builder, *object_slot, *t);
             emit_named_read(builder, block, object, *name)
+        }
+        // acc = frame[slot][key] (the fused `LoadLocal` + `GetMemberComputed`):
+        // the same inline element read (dense/typed arm, then the computed-read
+        // cell) as the `Step::GetMemberComputed` arm.
+        LeafOp::GetMemberComputedLocal {
+            object_slot,
+            tdz: t,
+            key,
+        } => {
+            let object = load(builder, *object_slot, *t);
+            let key = emit_reg_operand(builder, block, key, counter)?;
+            builder.emit(
+                block,
+                Op::ElementLoad,
+                &[object, key],
+                Type::Unknown,
+                Effects::call(),
+                Imm::None,
+            )
         }
         // The register-body member stores (`o.name = v`): the object is the
         // accumulator (`StoreMemberName`) or a frame slot (`StoreMemberNameLocal`),

@@ -15,7 +15,10 @@ use cranelift_codegen::ir::{
 use cranelift_codegen::isa::{CallConv, TargetIsa};
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Variable};
 use crux::Value as JsValue;
-use runtime::ir::{GLOBAL_CELLS, INTRINSICS, Intrinsic};
+use runtime::ir::{
+    COMPUTED_READ_CELLS, COMPUTED_READ_INDEX_MUL, COMPUTED_READ_INDEX_SHIFT, ComputedReadCell,
+    GLOBAL_CELLS, INTRINSICS, Intrinsic, MEMBER_CELLS, MemberValueCell,
+};
 use runtime::jit::{
     AGENT_REALM_COUNT_OFFSET, CertifiedInlineInfo, DISPATCH_DEOPT, GlobalValueCell, JitCallContext,
     LEAF_CALL_RECORD_SHIFT, LeafCallRecord, LeafInlineInfo, VM_ASYNC_FOR_OF_STACK_LEN_OFFSET,
@@ -308,6 +311,23 @@ fn lower_inst(
         | Op::Ge => {
             let disc = binary_op(inst.op).ok_or(Unsupported::Step("opt:binary"))?;
             let (lhs, rhs) = (arg(0)?, arg(1)?);
+            // `x === undefined` (either order) is a bits comparison against the
+            // unique `undefined` sentinel, so it needs no helper. Sound because
+            // `undefined` is not a Number: no `+0`/`-0`/NaN aliasing applies,
+            // and the type pass proves the constant side exactly.
+            if inst.op == Op::StrictEq {
+                let l_undef = types.get(inst.args[0] as usize) == Some(&Type::Undefined);
+                let r_undef = types.get(inst.args[1] as usize) == Some(&Type::Undefined);
+                if l_undef || r_undef {
+                    let value = if l_undef { rhs } else { lhs };
+                    let eq = builder.ins().icmp_imm_u(
+                        IntCC::Equal,
+                        value,
+                        JsValue::Undefined.bits() as i64,
+                    );
+                    return Ok(canonical_bool(builder, eq));
+                }
+            }
             let numeric = matches!(
                 inst.op,
                 Op::Add | Op::Sub | Op::Mul | Op::Div | Op::Lt | Op::Le | Op::Gt | Op::Ge
@@ -359,6 +379,17 @@ fn lower_inst(
             }
         }
         Op::ToNumber | Op::Neg | Op::BitNot | Op::Not => {
+            // `!b` on a proven Boolean `Value` is a flip of the canonical bits
+            // — the `select` the branch terminator folds, no helper.
+            if inst.op == Op::Not && types.get(inst.args[0] as usize) == Some(&Type::Bool) {
+                let value = arg(0)?;
+                let is_false = builder.ins().icmp_imm_u(
+                    IntCC::Equal,
+                    value,
+                    JsValue::Boolean(false).bits() as i64,
+                );
+                return Ok(canonical_bool(builder, is_false));
+            }
             let disc = unary_op(inst.op).ok_or(Unsupported::Step("opt:unary"))?;
             let op = builder.ins().iconst(types::I64, disc as i64);
             let value = arg(0)?;
@@ -1074,13 +1105,19 @@ fn lower_inst(
 /// NaN-boxed `false` bits) works — a raw code is not a NaN-boxed `Value`.
 fn raw_code_to_bool(builder: &mut FunctionBuilder, code: ClifValue) -> ClifValue {
     let nonzero = builder.ins().icmp_imm_u(IntCC::NotEqual, code, 0);
+    canonical_bool(builder, nonzero)
+}
+
+/// A canonical NaN-boxed `Value` boolean from a CLIF condition (`true` when
+/// `cond` is nonzero) — what the IR's `Type::Bool` names.
+fn canonical_bool(builder: &mut FunctionBuilder, cond: ClifValue) -> ClifValue {
     let t = builder
         .ins()
         .iconst(types::I64, JsValue::Boolean(true).bits() as i64);
     let f = builder
         .ins()
         .iconst(types::I64, JsValue::Boolean(false).bits() as i64);
-    builder.ins().select(nonzero, t, f)
+    builder.ins().select(cond, t, f)
 }
 
 /// The fused for-of fetch-and-bind (`.notes/optimizing-tier-impl.md` §6, the
@@ -1253,9 +1290,10 @@ fn emit_for_of_bind(
 }
 
 /// The inline computed element read: a dense Array's canonical-index element or
-/// a numeric TypedArray element, declining to `get_member_computed` for any
-/// other receiver, key, or shape. Ports the per-step `emit_element_read`'s dense
-/// and typed arms (`.agents/skills/slag-dense-arrays` §8).
+/// a numeric TypedArray element, a String-keyed own-data read on a plain object
+/// or an Array through the computed-read key cache, declining to
+/// `get_member_computed` for every other shape. Ports the per-step
+/// `emit_element_read` (`.agents/skills/slag-dense-arrays` §8).
 fn emit_element_read(
     builder: &mut FunctionBuilder,
     helpers: &JitHelpers,
@@ -1267,6 +1305,9 @@ fn emit_element_read(
     let kind = builder.create_block();
     let dense = builder.create_block();
     let typed = builder.create_block();
+    let cell = builder.create_block();
+    let probe = builder.create_block();
+    let member = builder.create_block();
     let slow = builder.create_block();
     let merge = builder.create_block();
 
@@ -1282,7 +1323,8 @@ fn emit_element_read(
 
     // The receiver pointer and the dense cursor: `array_dense` is non-null iff
     // the dense representation is active (a spill clears it), so it IS the
-    // dense switch; otherwise the object may be a numeric TypedArray.
+    // dense switch; otherwise the object may be a numeric TypedArray. Both
+    // arms decline to the computed-read cell (a String key on an object).
     builder.switch_to_block(kind);
     let obj_ptr = builder.ins().band_imm_u(object, crux::PAYLOAD_MASK as i64);
     let obj_ptr = builder.ins().ishl_imm_u(obj_ptr, 4);
@@ -1299,8 +1341,106 @@ fn emit_element_read(
     builder.ins().brif(is_dense, dense, &[], typed, &[]);
     builder.seal_block(dense);
     builder.seal_block(typed);
-    emit_dense_element_read(builder, dense_base, key, dense, value, slow, merge);
-    emit_typed_element_read(builder, obj_ptr, key, typed, value, slow, merge);
+    emit_dense_element_read(builder, dense_base, key, dense, value, cell, merge);
+    emit_typed_element_read(builder, obj_ptr, key, typed, value, cell, merge);
+
+    // G8: the computed-read key cache (the machine twin of the interpreter's
+    // `get_member_computed` name resolution) plus the member-value cell. It
+    // serves a String-keyed read on a plain object or an Array — the shape the
+    // element arms cannot — with no `intern` and no helper: the cell maps the
+    // key Value's identity to its interned atom, and the value comes from the
+    // cell the store paths maintain.
+    builder.seal_block(cell);
+    builder.switch_to_block(cell);
+    let key_is_string = is_string(builder, key);
+    builder.ins().brif(key_is_string, probe, &[], slow, &[]);
+    builder.seal_block(probe);
+    builder.switch_to_block(probe);
+    let cells = builder.ins().load(
+        types::I64,
+        MemFlagsData::new(),
+        abi.vm,
+        Offset32::new(std::mem::offset_of!(JitCallContext, computed_read_cells) as i32),
+    );
+    let cell_slot = emit_computed_read_slot(builder, key);
+    let index_bytes = builder
+        .ins()
+        .imul_imm_s(cell_slot, std::mem::size_of::<ComputedReadCell>() as i64);
+    let cell_ptr = builder.ins().iadd(cells, index_bytes);
+    let cell_key = builder.ins().load(
+        types::I64,
+        MemFlagsData::new(),
+        cell_ptr,
+        Offset32::new(std::mem::offset_of!(ComputedReadCell, key) as i32),
+    );
+    let key_ok = builder.ins().icmp(IntCC::Equal, cell_key, key);
+    builder.ins().brif(key_ok, member, &[], slow, &[]);
+    builder.seal_block(member);
+    builder.switch_to_block(member);
+    let atom = builder.ins().load(
+        types::I32,
+        MemFlagsData::new(),
+        cell_ptr,
+        Offset32::new(std::mem::offset_of!(ComputedReadCell, atom) as i32),
+    );
+    let live_id = builder.ins().load(
+        types::I64,
+        MemFlagsData::new(),
+        obj_ptr,
+        Offset32::new(std::mem::offset_of!(crux::JsObject, id) as i32),
+    );
+    let live_gen = builder.ins().load(
+        types::I32,
+        MemFlagsData::new(),
+        obj_ptr,
+        Offset32::new(std::mem::offset_of!(crux::JsObject, generation) as i32),
+    );
+    let member_cells = builder.ins().load(
+        types::I64,
+        MemFlagsData::new(),
+        abi.vm,
+        Offset32::new(std::mem::offset_of!(JitCallContext, member_value_cells) as i32),
+    );
+    let atom_bits = builder.ins().uextend(types::I64, atom);
+    let member_slot = builder.ins().bxor(live_id, atom_bits);
+    let member_slot = builder
+        .ins()
+        .band_imm_u(member_slot, (MEMBER_CELLS - 1) as i64);
+    let member_bytes = builder
+        .ins()
+        .imul_imm_s(member_slot, std::mem::size_of::<MemberValueCell>() as i64);
+    let member_cell = builder.ins().iadd(member_cells, member_bytes);
+    let member_id = builder.ins().load(
+        types::I64,
+        MemFlagsData::new(),
+        member_cell,
+        Offset32::new(std::mem::offset_of!(MemberValueCell, id) as i32),
+    );
+    let member_name = builder.ins().load(
+        types::I32,
+        MemFlagsData::new(),
+        member_cell,
+        Offset32::new(std::mem::offset_of!(MemberValueCell, name) as i32),
+    );
+    let member_gen = builder.ins().load(
+        types::I32,
+        MemFlagsData::new(),
+        member_cell,
+        Offset32::new(std::mem::offset_of!(MemberValueCell, generation) as i32),
+    );
+    let member_value = builder.ins().load(
+        types::I64,
+        MemFlagsData::new(),
+        member_cell,
+        Offset32::new(std::mem::offset_of!(MemberValueCell, value) as i32),
+    );
+    let id_ok = builder.ins().icmp(IntCC::Equal, member_id, live_id);
+    let name_ok = builder.ins().icmp(IntCC::Equal, member_name, atom);
+    let gen_ok = builder.ins().icmp(IntCC::Equal, member_gen, live_gen);
+    let id_name_ok = builder.ins().band(id_ok, name_ok);
+    let ok = builder.ins().band(id_name_ok, gen_ok);
+    builder.def_var(value, member_value);
+    builder.ins().brif(ok, merge, &[], slow, &[]);
 
     // The helper: the full `[[Get]]` interns the key, serves a prototype
     // element or accessor, and every other shape.
@@ -1320,6 +1460,22 @@ fn emit_element_read(
     builder.seal_block(merge);
     builder.switch_to_block(merge);
     Ok(builder.use_var(value))
+}
+
+/// The computed-read cell slot: `runtime::ir::computed_read_cell_index`'s
+/// expression as machine code (a wrapping multiply, then the high bits). The
+/// emitter and the runtime must compute the identical slot.
+fn emit_computed_read_slot(builder: &mut FunctionBuilder, key: ClifValue) -> ClifValue {
+    let k = builder
+        .ins()
+        .iconst(types::I64, COMPUTED_READ_INDEX_MUL as i64);
+    let mixed = builder.ins().imul(key, k);
+    let mixed = builder
+        .ins()
+        .ushr_imm_u(mixed, COMPUTED_READ_INDEX_SHIFT as i64);
+    builder
+        .ins()
+        .band_imm_u(mixed, (COMPUTED_READ_CELLS - 1) as i64)
 }
 
 /// The dense-Array arm of [`emit_element_read`]: the canonical-index gate, the

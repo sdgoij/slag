@@ -1174,6 +1174,14 @@ stack form) is refused (`is_for_fetch` names it so the bail is explicit).
   `Op::ForInNext` returns the key or `undefined` (a for-in key is always a
   string), and the terminator branches on `!= undefined` and passes the key to
   the bind block as an edge argument.
+- **The `!= undefined` sentinel comparison must inline; by default it lowered to
+  two helpers per element.** `lower_inst` mapped `Op::StrictEq` to `BinarySlow`
+  and `Op::Not` to `UnarySlow`, so an opt for-in loop paid THREE helper calls
+  per element (`for_in_next` plus the two) where the per-step pays one plus an
+  inline `icmp`/`brif` — measured **2.2x** on an isolated for-in body. Both are
+  now inline: `x === undefined` (either order) is a bits compare against the
+  unique sentinel (sound — `undefined` is not a Number, so no `+0`/`-0`/NaN
+  aliasing applies), and `!b` on a `Type::Bool` is a canonical-bits flip.
 
 ## 27. The non-`Counter` fused head needs a Number fast path
 
@@ -1193,3 +1201,27 @@ BigInt-aware) — so it is a generic `++` plus a generic relational.
   one (`hof_methods`, ~parity either way).
 - **A `Global` head is still refused.** Its `++` needs the identifier-update
   machinery (`update_ident`), a separate helper and name resolution.
+
+## 28. The computed-read element read, and a const's type must match its value
+
+`opt_lower::emit_element_read` (the `Op::ElementLoad` lowering, fed by
+`Step::GetMemberComputed` and the register `LeafOp::GetMemberComputedLocal`)
+ports the per-step emitter's three arms in order: the dense-Array element read,
+the numeric-TypedArray read, and the G8 computed-read cell. The cell is the
+key-identity probe (`JitCallContext.computed_read_cells`, its slot =
+`runtime::ir::computed_read_cell_index` — the emitter and the runtime MUST
+compute the identical slot, a divergence is silent) mapping a String key's
+identity to its interned atom, then the `member_value_cells` value validated by
+`(id, name, generation)`. Without the cell arm a lifted `o[k]`/`a[k]` falls to a
+`get_member_computed` helper per iteration — the pessimization that had
+`GetMemberComputedLocal` reverted once already.
+
+- **A `Const`'s declared `Type` must match the value it holds; a mismatch is a
+  silent optimization loss after CSE.** The lift emitted three `undefined`
+  constants (the `this` for `CallFastSlot`/`CallFastGlobal`, and
+  `emit_reg_body`'s accumulator seed) with `Type::Unknown`. CSE is block-local
+  and merges a later same-op/same-imm value into an earlier one, so a same-block
+  `Type::Undefined` for-in sentinel was merged into an `Unknown` `undefined`
+  const and LOST its type — and anything keying on a value's static type (the
+  `=== undefined` inline above, `narrow`'s proofs) then silently degrades. Emit
+  every constant with its exact type.
