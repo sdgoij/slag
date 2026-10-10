@@ -1244,3 +1244,22 @@ reads once, while the opt tier then runs every read per iteration.
   copy already lifts (its reads lower to hoist-slot `FrameLoad`s) — only the
   guard's probe and hoist-slot stores are unmodelled. Implementing the guard in
   the lift is the follow-up that recovers both the coverage and the hoist.
+
+## 30. The helper-traffic instrument (both tiers)
+
+`JIT_HELPER_STATS=1` emits, at compile time, one inline increment per helper
+call indexed by `Helper as usize` into `runtime::jit::JIT_HELPER_COUNTS`; the
+CLI's `run_corpus` prints the histogram at the end (`helper <idx> <count>`), and
+one workload per process attributes it to that row. It is off by default, so a
+default build is byte-for-byte unchanged (which is why a sweep reproduces its
+number exactly).
+
+- The per-step funnel is `compiler.rs::emit_raw_call`; the opt tier's is
+  `opt_lower::call_helper` (added 2026-10-10 — before that the opt tier had no
+  helper census, so a call-shaped row could not be attributed). One helper
+  (`Helper::TdzError`, thrown from a TDZ site) calls `call_indirect` directly
+  and is not counted; it never returns normally.
+- Enumerate the `Helper` enum in `crates/jit/src/helpers.rs` to map an index
+  (0-based variant order); the CLI prints the raw index.
+- It is a **tool, not a fix**: enabling it slows the run (four instructions per
+  call site), so measure with it unset. Read it as traffic, never as time.

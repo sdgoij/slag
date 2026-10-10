@@ -20,11 +20,12 @@ use runtime::ir::{
     GLOBAL_CELLS, INTRINSICS, Intrinsic, MEMBER_CELLS, MemberValueCell,
 };
 use runtime::jit::{
-    AGENT_REALM_COUNT_OFFSET, CertifiedInlineInfo, DISPATCH_DEOPT, GlobalValueCell, JitCallContext,
-    LEAF_CALL_RECORD_SHIFT, LeafCallRecord, LeafInlineInfo, VM_ASYNC_FOR_OF_STACK_LEN_OFFSET,
-    VM_COMPLETION_IS_EMPTY_OFFSET, VM_COMPLETION_OFFSET, VM_DESTRUCTURE_STACK_LEN_OFFSET,
-    VM_ENV_STACK_LEN_OFFSET, VM_FOR_IN_STACK_LEN_OFFSET, VM_FOR_OF_BOUNDARIES_LEN_OFFSET,
-    VM_FOR_OF_STACK_LEN_OFFSET, VM_IP_OFFSET, VM_PENDING_LEN_OFFSET, VM_TRY_STACK_LEN_OFFSET,
+    AGENT_REALM_COUNT_OFFSET, CertifiedInlineInfo, DISPATCH_DEOPT, GlobalValueCell, HELPER_COUNT,
+    JIT_HELPER_COUNTS, JitCallContext, LEAF_CALL_RECORD_SHIFT, LeafCallRecord, LeafInlineInfo,
+    VM_ASYNC_FOR_OF_STACK_LEN_OFFSET, VM_COMPLETION_IS_EMPTY_OFFSET, VM_COMPLETION_OFFSET,
+    VM_DESTRUCTURE_STACK_LEN_OFFSET, VM_ENV_STACK_LEN_OFFSET, VM_FOR_IN_STACK_LEN_OFFSET,
+    VM_FOR_OF_BOUNDARIES_LEN_OFFSET, VM_FOR_OF_STACK_LEN_OFFSET, VM_IP_OFFSET,
+    VM_PENDING_LEN_OFFSET, VM_TRY_STACK_LEN_OFFSET,
 };
 use syntax::ast::{BinaryOp, UnaryOp, UpdateOp};
 
@@ -2461,6 +2462,25 @@ fn call_helper(
     let f = helpers
         .get(helper)
         .ok_or(Unsupported::Helper(helper.name()))?;
+    // Temporary instrumentation (`JIT_HELPER_STATS`), the opt-tier twin of
+    // `compiler.rs::emit_raw_call`'s counter: one inline increment per helper
+    // call, indexed by the helper's discriminant into `JIT_HELPER_COUNTS`,
+    // emitted only when the env var is set at compile time so a default build
+    // is byte-for-byte unchanged. This is the only funnel for the opt tier's
+    // helper calls, so the census covers it (`JIT_DUMP_HELPER_STATS` and the
+    // CLI's `run_corpus` histogram print it like the per-step path's).
+    if helper_stats() {
+        debug_assert!((helper as usize) < HELPER_COUNT);
+        let base = builder
+            .ins()
+            .iconst(types::I64, JIT_HELPER_COUNTS.base() as i64);
+        let off = Offset32::new(((helper as usize) * 8) as i32);
+        let count = builder
+            .ins()
+            .load(types::I64, MemFlagsData::new(), base, off);
+        let next = builder.ins().iadd_imm_u(count, 1);
+        builder.ins().store(MemFlagsData::new(), next, base, off);
+    }
     let callee = builder.ins().iconst(types::I64, f as i64);
     let mut all = Vec::with_capacity(args.len() + 1);
     all.push(abi.vm);
@@ -2488,6 +2508,14 @@ fn call_helper(
         bump_leaf_epoch(builder, abi.vm);
     }
     Ok(result)
+}
+
+/// Whether the temporary helper-call instrument (`JIT_HELPER_STATS`) is on,
+/// read once per process (the env is set before any compile).
+fn helper_stats() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("JIT_HELPER_STATS").is_ok())
 }
 
 /// The byte offset of a `LeafInlineInfo` field inside a `LeafCallRecord`

@@ -77,16 +77,35 @@ what the register lane does in ~10.
 5. **The compiler's own `| 0` / `& -1` normalization ops.** Both tiers carry
    these; not an opt-vs-per-step difference.
 
-## 4. `construct_churn` is a *different* item — the prototype-read IC
+## 4. `construct_churn` is a *different* item — the leaf-call lane
 
-`s += new Item(i).sum()` reads `.sum` off a **fresh** object every iteration.
-The opt tier's member read is a per-object cell keyed `(object.id, atom)`
-(`Op::MemberCellLoad`/`MemberGuard`); a fresh object's id is never in the cell,
-so the guard **misses every iteration** and calls `get_member_name`. The method
-lives on `Item.prototype`, so the read is a prototype-chain lookup — the same
-gap `.notes/perf-findings.md` records (`proto_read` 20.5ns/read vs SM 2.4, "a
-chain-caching IC that keys the lookup on the holder's shape"). Fixing it is a
-shape-keyed prototype IC, not a loop-lane change.
+**Corrected 2026-10-10 by the newly instrumented opt tier.** The opt lowerer
+now carries the same compile-time-gated helper counter as the per-step path
+(`opt_lower::call_helper`, the single funnel for the opt tier's helper calls;
+`JIT_HELPER_STATS`, off by default so a default build is byte-identical). The
+census for `s += new Item(i).sum()` over 500k iterations (helper index =
+`Helper as usize`):
+
+| helper | opt | per-step |
+|---|---|---|
+| 11 `GetMemberName` | 7,000,003 | 3,500,007 |
+| 18 `CallSlow` | **3,500,000** | 0 |
+| 19 `LeafCallProbe` | **3,500,000** | 867 |
+| 20 `LeafCallFill` | 0 | **3,499,133** |
+| 53/54/57 `ArgsBase`/`ArgsPush`/`Construct` | 3,500,000 | 3,500,000 |
+
+So it is **not** a prototype-read IC: both tiers resolve `.sum` identically
+(the same `GetMemberName` misses). The gap is the **inline leaf-call lane**:
+the opt tier's probe fires on every call and always misses to `CallSlow`,
+while the per-step tier's probe is cached (867 verdicts → 3.5M `LeafCallFill`).
+That is the "the inline leaf-call path is reached and never fires" finding in
+`.notes/jit-quality-plan.md` §3 (G2), which the G port was meant to close but
+which still bites a `this`-taking prototype method. The opt also makes **2x the
+`GetMemberName` calls** (7M vs 3.5M) — the `CallSlow` path re-resolving, or a
+duplicate read; to pin.
+
+This reorders the slices below: the leaf-call lane (§6.1) is the largest
+*absolute* win (one row, ~+50ms), ahead of the int-op work.
 
 ## 5. `many_objects_read` is (mostly) inherent
 
@@ -97,24 +116,25 @@ its fused-loop register lane does the *element* read inline. The residual is
 
 ## 6. Proposed slices (probe-first, ordered by value)
 
-1. **`Int`-proven operands + `call_int_binary` guard elision** (§3.3). Bounded,
+1. **The inline leaf-call lane for a `this`-taking callee** (§4). The largest
+   *absolute* win (`construct_churn` ~1.5x). The opt's probe must cache its
+   verdict and admit the shape the per-step's admits.
+2. **`Int`-proven operands + `call_int_binary` guard elision** (§3.3). Bounded,
    sound (an int32 cannot saturate the f64→i64 conversion), and it helps the 36
    `opcost/*` rows — the largest family. Extend `narrow`'s lattice with an `Int`
    flag (a slot whose every store is `Type::Int`) and skip `trunc_i32`'s range
    check for an `Int`/in-range-constant operand. Expected ~1.2-1.4x on
    `baseline`.
-2. **`canon_double` sinking for `Int`-typed results** (§3.2, narrow case). An
+3. **`canon_double` sinking for `Int`-typed results** (§3.2, narrow case). An
    int32's f64 is never a NaN, so an `Int`-resulting op needs no canon at all —
    the cheapest cut of the canon cost, no escape analysis required.
-3. **Frame-slot promotion with deopt materialization** (§3.1). The largest
+4. **Frame-slot promotion with deopt materialization** (§3.1). The largest
    structural slice; needs the flush-point design (deopt ops + `Heap::Slots`
-   effects). Do after 1-2 so the register-allocation win is measurable alone.
-4. **`Lt`→`Branch` fusion** (§3.4). Small, removes the bool round trip.
-5. **The prototype-read IC** (§4). Separate arc; the largest absolute row.
+   effects). Do after 2-3 so the register-allocation win is measurable alone.
+5. **`Lt`→`Branch` fusion** (§3.4). Small, removes the bool round trip.
 
-Two slices (1, 2) are contained enough to land independently; 3 is the arc-scale
-one. Anything here must be judged on the isolated rows above, never the
-whole-corpus sweep.
+The opt-tier helper instrument is landed (§4) and should be used to rank the
+remaining call-shaped rows before 1 is attempted.
 
 ## 7. Measurement discipline
 
