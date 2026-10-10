@@ -17,7 +17,7 @@ use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Variable};
 use crux::Value as JsValue;
 use runtime::ir::{
     COMPUTED_READ_CELLS, COMPUTED_READ_INDEX_MUL, COMPUTED_READ_INDEX_SHIFT, ComputedReadCell,
-    GLOBAL_CELLS, INTRINSICS, Intrinsic, MEMBER_CELLS, MemberValueCell,
+    GLOBAL_CELLS, INTRINSICS, Intrinsic, MEMBER_CELLS, MemberMapCell, MemberValueCell,
 };
 use runtime::jit::{
     AGENT_REALM_COUNT_OFFSET, CertifiedInlineInfo, DISPATCH_DEOPT, GlobalValueCell, HELPER_COUNT,
@@ -754,6 +754,126 @@ fn lower_inst(
             builder.ins().brif(ok, merge, &[], slow, &[]);
             builder.seal_block(check);
             builder.switch_to_block(slow);
+            // `slow` is reached both for a non-object receiver (the tag gate
+            // above) and for a plain object whose value cell missed, so
+            // re-check the tag before dereferencing — the map load below would
+            // fault on a primitive.
+            let map_present = builder.create_block();
+            let map_hit = builder.create_block();
+            let field = builder.create_block();
+            let overflow = builder.create_block();
+            let fallback = builder.create_block();
+            let shape_done = builder.create_block();
+            builder.append_block_param(shape_done, types::I64);
+            let plain_here = crate::cells::is_plain_object(builder, object);
+            let shape_entry = builder.create_block();
+            builder
+                .ins()
+                .brif(plain_here, shape_entry, &[], fallback, &[]);
+            builder.seal_block(slow);
+            builder.switch_to_block(shape_entry);
+            // The map-keyed shape fast path (the opt-tier mirror of
+            // `compiler.rs::emit_member_cell_probe`'s `shape` arm). The value
+            // cell above is keyed by the object id, so a loop over many
+            // instances of one shape misses it on nearly every read; the map
+            // cell is keyed by the shape's map, so every instance shares one
+            // entry. A hit needs no per-object identity or generation (a map
+            // id pins the descriptor layout; a structural change transitions
+            // or drops the object off the map).
+            let obj_ptr = crate::cells::object_data_ptr(builder, object);
+            let map_handle = builder.ins().load(
+                types::I64,
+                MemFlagsData::new(),
+                obj_ptr,
+                Offset32::new(std::mem::offset_of!(crux::JsObject, map) as i32),
+            );
+            let has_map = builder.ins().icmp_imm_u(IntCC::NotEqual, map_handle, 0);
+            builder.ins().brif(has_map, map_present, &[], fallback, &[]);
+            builder.seal_block(shape_entry);
+            builder.switch_to_block(map_present);
+            let map_data = builder
+                .ins()
+                .iadd_imm_s(map_handle, crux::heap::GCBOX_DATA_OFFSET as i64);
+            let map_id = builder.ins().load(
+                types::I64,
+                MemFlagsData::new(),
+                map_data,
+                Offset32::new(crux::map::MAP_ID_OFFSET as i32),
+            );
+            let map_cells = builder.ins().load(
+                types::I64,
+                MemFlagsData::new(),
+                abi.vm,
+                Offset32::new(std::mem::offset_of!(JitCallContext, member_map_cells) as i32),
+            );
+            let cell = crate::cells::member_map_cell_addr(builder, map_cells, map_id, name);
+            let cell_map_id = builder.ins().load(
+                types::I64,
+                MemFlagsData::new(),
+                cell,
+                Offset32::new(std::mem::offset_of!(MemberMapCell, map_id) as i32),
+            );
+            let cell_name = builder.ins().load(
+                types::I32,
+                MemFlagsData::new(),
+                cell,
+                Offset32::new(std::mem::offset_of!(MemberMapCell, name) as i32),
+            );
+            let field_slot = builder.ins().load(
+                types::I64,
+                MemFlagsData::new(),
+                cell,
+                Offset32::new(std::mem::offset_of!(MemberMapCell, slot) as i32),
+            );
+            let map_ok = builder.ins().icmp(IntCC::Equal, cell_map_id, map_id);
+            let name_ok = builder
+                .ins()
+                .icmp_imm_u(IntCC::Equal, cell_name, *atom as i64);
+            let described = builder.ins().band(map_ok, name_ok);
+            builder.ins().brif(described, map_hit, &[], fallback, &[]);
+            builder.seal_block(map_present);
+            builder.switch_to_block(map_hit);
+            let slot_inline = builder.ins().icmp_imm_u(
+                IntCC::UnsignedLessThan,
+                field_slot,
+                crux::object::INLINE_FIELDS as i64,
+            );
+            builder.ins().brif(slot_inline, field, &[], overflow, &[]);
+            builder.seal_block(map_hit);
+            builder.switch_to_block(field);
+            let field_bytes = builder.ins().ishl_imm_u(field_slot, 3);
+            let field_base = builder.ins().iadd_imm_s(
+                obj_ptr,
+                std::mem::offset_of!(crux::JsObject, in_fields) as i64,
+            );
+            let field_addr = builder.ins().iadd(field_base, field_bytes);
+            let field_value = builder.ins().load(
+                types::I64,
+                MemFlagsData::new(),
+                field_addr,
+                Offset32::new(0),
+            );
+            let is_hole = builder.ins().icmp_imm_u(
+                IntCC::Equal,
+                field_value,
+                crux::value::UNINITIALIZED_BITS as i64,
+            );
+            builder
+                .ins()
+                .brif(is_hole, fallback, &[], shape_done, &[field_value.into()]);
+            builder.seal_block(field);
+            builder.switch_to_block(overflow);
+            let slot_value = call_helper(
+                builder,
+                helpers,
+                abi,
+                abi.sig_binary,
+                Helper::GetMemberMapSlot,
+                &[object, name, field_slot],
+            )?;
+            builder.ins().jump(shape_done, &[slot_value.into()]);
+            builder.seal_block(overflow);
+            builder.switch_to_block(fallback);
             let res = call_helper(
                 builder,
                 helpers,
@@ -762,9 +882,13 @@ fn lower_inst(
                 Helper::GetMemberName,
                 &[object, name],
             )?;
-            builder.def_var(result, res);
+            builder.ins().jump(shape_done, &[res.into()]);
+            builder.seal_block(fallback);
+            builder.switch_to_block(shape_done);
+            let shape_value = builder.block_params(shape_done)[0];
+            builder.def_var(result, shape_value);
             builder.ins().jump(merge, &[]);
-            builder.seal_block(slow);
+            builder.seal_block(shape_done);
             builder.switch_to_block(merge);
             builder.seal_block(merge);
             builder.use_var(result)
@@ -2569,6 +2693,7 @@ fn emit_member_store(
     let validate = builder.create_block();
     let fast = builder.create_block();
     let slow = builder.create_block();
+    let shape = builder.create_block();
     let merge = builder.create_block();
     builder.ins().brif(obj_ok, validate, &[], slow, &[]);
     builder.switch_to_block(validate);
@@ -2593,7 +2718,14 @@ fn emit_member_store(
     );
     let cell = crate::cells::member_value_cell_addr(builder, cells, live_id, name_imm);
     let ok = crate::cells::member_value_cell_valid(builder, cell, live_id, name, live_gen);
-    builder.ins().brif(ok, fast, &[], slow, &[]);
+    // The value cell is keyed by the object id, so a store loop whose object
+    // working set exceeds the 16 cells misses it on nearly every write; the
+    // map-keyed shape cell is shared by every instance of the shape, so a hit
+    // routes the write to the same narrow `set_member_slot` the value-cell hit
+    // takes (whose writable check stays the authoritative backstop).
+    builder.ins().brif(ok, fast, &[], shape, &[]);
+    builder.switch_to_block(shape);
+    emit_shape_store_probe(builder, abi, object, name_imm, fast, slow);
     builder.switch_to_block(fast);
     call_helper(
         builder,
@@ -2617,6 +2749,69 @@ fn emit_member_store(
     builder.seal_block(merge);
     builder.switch_to_block(merge);
     Ok(())
+}
+
+/// The opt-tier mirror of `compiler.rs::emit_shape_store_probe`: the current
+/// block is a plain-object value-cell miss, so a map-described key is served by
+/// the shared `(map id, name)` cells — valid for ANY object count (a map id
+/// pins the descriptor layout; a structural change transitions or drops the
+/// object off the map). On a match jump to `hit` (the narrow store); on no map
+/// or an undescribed key jump to `miss` (the full helper).
+fn emit_shape_store_probe(
+    builder: &mut FunctionBuilder,
+    abi: &Abi,
+    object: ClifValue,
+    name_imm: ClifValue,
+    hit: Block,
+    miss: Block,
+) {
+    let entry = builder.current_block().expect("a current block");
+    let obj_ptr = crate::cells::object_data_ptr(builder, object);
+    let map_handle = builder.ins().load(
+        types::I64,
+        MemFlagsData::new(),
+        obj_ptr,
+        Offset32::new(std::mem::offset_of!(crux::JsObject, map) as i32),
+    );
+    let map_start = builder.create_block();
+    let has_map = builder.ins().icmp_imm_u(IntCC::NotEqual, map_handle, 0);
+    builder.ins().brif(has_map, map_start, &[], miss, &[]);
+    builder.seal_block(entry);
+    builder.switch_to_block(map_start);
+    let map_data = builder
+        .ins()
+        .iadd_imm_s(map_handle, crux::heap::GCBOX_DATA_OFFSET as i64);
+    let map_id = builder.ins().load(
+        types::I64,
+        MemFlagsData::new(),
+        map_data,
+        Offset32::new(crux::map::MAP_ID_OFFSET as i32),
+    );
+    let map_cells = builder.ins().load(
+        types::I64,
+        MemFlagsData::new(),
+        abi.vm,
+        Offset32::new(std::mem::offset_of!(JitCallContext, member_map_cells) as i32),
+    );
+    let cell = crate::cells::member_map_cell_addr(builder, map_cells, map_id, name_imm);
+    let cell_map_id = builder.ins().load(
+        types::I64,
+        MemFlagsData::new(),
+        cell,
+        Offset32::new(std::mem::offset_of!(MemberMapCell, map_id) as i32),
+    );
+    let cell_name = builder.ins().load(
+        types::I32,
+        MemFlagsData::new(),
+        cell,
+        Offset32::new(std::mem::offset_of!(MemberMapCell, name) as i32),
+    );
+    let map_ok = builder.ins().icmp(IntCC::Equal, cell_map_id, map_id);
+    let cell_name = builder.ins().uextend(types::I64, cell_name);
+    let name_ok = builder.ins().icmp(IntCC::Equal, cell_name, name_imm);
+    let shape_ok = builder.ins().band(map_ok, name_ok);
+    builder.ins().brif(shape_ok, hit, &[], miss, &[]);
+    builder.seal_block(map_start);
 }
 
 /// The optimizing tier's compiled GC safe point — the `opt_lower` twin of

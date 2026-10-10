@@ -11,7 +11,7 @@ use cranelift_codegen::ir::immediates::Offset32;
 use cranelift_codegen::ir::{InstBuilder, MemFlagsData, Value, types};
 use cranelift_frontend::FunctionBuilder;
 
-use runtime::ir::{MEMBER_CELLS, MemberValueCell};
+use runtime::ir::{MEMBER_CELLS, MemberMapCell, MemberValueCell};
 
 /// The `JsObject` data pointer from a NaN-boxed Object `Value`: the payload
 /// shifted past the NaN tag plus the `GcBox` header offset. Only valid for an
@@ -52,6 +52,24 @@ pub(crate) fn member_value_cell_addr(
     let index_bytes = builder
         .ins()
         .imul_imm_s(slot, std::mem::size_of::<MemberValueCell>() as i64);
+    builder.ins().iadd(cells, index_bytes)
+}
+
+/// The address of the map-keyed member cell for `(map_id, name_imm)`, mirroring
+/// `Vm::member_map_cell_index` (`(map_id ^ atom) & (MEMBER_CELLS - 1)`). A map
+/// id pins the descriptor layout for every instance of the shape, so this cell
+/// serves any object count with no per-object identity or generation.
+pub(crate) fn member_map_cell_addr(
+    builder: &mut FunctionBuilder,
+    cells: Value,
+    map_id: Value,
+    name_imm: Value,
+) -> Value {
+    let slot = builder.ins().bxor(map_id, name_imm);
+    let slot = builder.ins().band_imm_u(slot, (MEMBER_CELLS - 1) as i64);
+    let index_bytes = builder
+        .ins()
+        .imul_imm_s(slot, std::mem::size_of::<MemberMapCell>() as i64);
     builder.ins().iadd(cells, index_bytes)
 }
 

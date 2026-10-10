@@ -2595,18 +2595,33 @@ impl Agent {
         // builtin's local `Vec` would be swept out from under the call. So the
         // window suppresses this trigger too.
         let suppressed = crate::ir::is_compiling();
+        let live = crux::heap::with_heap(|heap| heap.live_count());
         let young = crux::heap::with_heap(|heap| heap.young_count());
+        let threshold = self.last_collected_live.get().max(1024).saturating_mul(2);
+        // The young cohort is the minor's to collect. Pace it by its size, and
+        // also collect it when the heap has grown past the major threshold on
+        // young alone: a total-live comparison fires a full major there, but the
+        // growth is young, so a minor reclaims it for a fraction of the cost.
+        // This is the shape a churn loop hits — the young reaches the major
+        // threshold (about half the post-major live) well before the nursery
+        // threshold, so without this the major would starve the minor.
+        let young_dominated = live > threshold && young > 0;
         if !suppressed
             && (self.gc_stress.get()
-                || (!crux::heap::minor_disabled() && young >= self.nursery_threshold.get()))
+                || (!crux::heap::minor_disabled()
+                    && (young >= self.nursery_threshold.get() || young_dominated)))
         {
             self.clear_derived_caches();
             self.collect_minor_garbage_with(None);
         }
+        // A major paces the *old generation's* growth. `live_count` carries the
+        // young cohort still awaiting its minor, so the comparison subtracts it
+        // and only promoted growth counts.
         let live = crux::heap::with_heap(|heap| heap.live_count());
-        let threshold = self.last_collected_live.get().max(1024).saturating_mul(2);
+        let young = crux::heap::with_heap(|heap| heap.young_count());
+        let old_gen_live = live.saturating_sub(young);
         if !suppressed
-            && (self.gc_stress.get() || (!crux::heap::major_disabled() && live > threshold))
+            && (self.gc_stress.get() || (!crux::heap::major_disabled() && old_gen_live > threshold))
         {
             self.clear_derived_caches();
             self.collect_garbage();
