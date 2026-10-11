@@ -359,7 +359,9 @@ Two harnesses measure the engine, and both are reproducible from the repo:
 the CLI's micro-suite (`slag --jit-bench` runs the same bodies through the
 Cranelift JIT and the interpreter) and the cross-engine workload corpus
 (`node tools/corpus/bench.js` runs the workloads under Slag and V8, each with
-its JIT and with it disabled — see `tools/corpus/README.md`). The numbers
+its JIT and with it disabled — see `tools/corpus/README.md`). The optimization
+switches behind these numbers (`SLAG_OPT`, `SLAG_TYPER`, the inline/pass seams,
+and the `JIT_*` diagnostics) are documented in `ENVIRONMENT.md`. The numbers
 below are one machine (AMD Ryzen 9 7950X, Windows 11, rustc 1.96.0, node
 v24.12.0): medians of five runs for the micro-suite, one run for the corpus.
 The release profile is part of the measurement, not an aside: `[profile.release]`
@@ -587,6 +589,7 @@ time (`crates/runtime/src/builtins/array.rs` is the model) and need nothing.
 
 ## Documentation
 
+- `ENVIRONMENT.md` — every environment variable (engine tuning, JIT diagnostics, tooling) and the CLI-flag knobs
 - `PLAN.md` — the implementation plan, per-phase spec coverage, and status
 - `.notes/conformance.md` — conformance methodology, results, and triage
 - `.notes/gc-plan.md` — the GC milestone plan (arena heap + mark-sweep, cut-by-cut)

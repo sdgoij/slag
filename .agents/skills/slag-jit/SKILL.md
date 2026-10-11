@@ -1341,9 +1341,10 @@ process) while `--jitless` was unaffected. Full write-up:
   parameter binding happens after the probe. The helper call goes through
   `call_helper`, whose pending check is the termination channel (an error bails
   the body).
-- **"A compiled loop never collects" points here first.** Diagnose with the
-  `SLAG_GC_LOG` / `SLAG_GC_SKIP` / `SLAG_GC_POLL` seams: zero `gc_safepoint`
-  calls over a huge allocation count on a lifted loop is the tell. The regression
+- **"A compiled loop never collects" points here first.** The tell is a lifted
+  allocating loop with no GC activity: `--gc-trace` shows collections far below
+  the allocation volume, and the `gc_safepoint` helper's count (the
+  `JIT_HELPER_STATS` histogram, indexed by helper) sits at zero. The regression
   test `installed_jit_opt_loop_safe_point_runs_minors` pins it (a lifted
   allocating loop runs minors and its cohort stays bounded).
 - **A whole-corpus measurement is the only place this shows.** An isolated row

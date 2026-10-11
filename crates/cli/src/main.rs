@@ -171,6 +171,44 @@ fn run(command: Command) -> Result<(), u8> {
             );
             eprintln!("  --gc-trace                per-collection GC telemetry + an exit summary");
             eprintln!("  --harmony-*               (no-op)");
+            if cfg!(feature = "jit") {
+                eprintln!();
+                eprintln!("environment variables:");
+                eprintln!(
+                    "  SLAG_OPT=0                disable the optimizing JIT tier (default: on)"
+                );
+                eprintln!(
+                    "  SLAG_TYPER=0              disable the typer's read guard (default: on)"
+                );
+                eprintln!(
+                    "  SLAG_INLINE=1             enable the trial-inline splice (default: off)"
+                );
+                eprintln!("  SLAG_INLINE_BUDGET=N      inline code-growth budget (default: 256)");
+                eprintln!(
+                    "  SLAG_FEEDBACK=1           enable the call-site feedback probe (default: off)"
+                );
+                eprintln!(
+                    "  SLAG_GUARD=0              disable the read-guard pruning pass (default: on)"
+                );
+                eprintln!("  SLAG_MEM2REG=0            disable frame-slot promotion (default: on)");
+                eprintln!(
+                    "  SLAG_WIDEN=0              disable narrow's effect widening (default: on)"
+                );
+                eprintln!(
+                    "  JIT_DUMP_IR=1             dump the optimizing tier's SSA IR to stderr"
+                );
+                eprintln!(
+                    "  JIT_DUMP_CLIF=1           dump Cranelift CLIF, disassembly, and bail reasons"
+                );
+                eprintln!(
+                    "  JIT_DUMP_STEPS=1          dump blocking steps and shapes on a lift refusal"
+                );
+                eprintln!("  JIT_HELPER_STATS=1        print per-helper call counts at exit");
+                eprintln!("  JIT_LEAF_TRACE=1          trace leaf-probe rejections");
+                eprintln!("  SLAG_JIT_DEOPT_PROBE=N    force a deopt guard at step N");
+                eprintln!("  SLAG_JIT_DEOPT_TRACE=1    trace each deopt");
+                eprintln!("  see ENVIRONMENT.md for the full list (incl. test/tooling switches)");
+            }
             eprintln!();
             eprintln!("compiled features: {}", compiled_features());
             Err(2)
