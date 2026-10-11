@@ -82,3 +82,77 @@ so any divergence there (a mis-sealed `cont`, a dropped value across the split,
 a phi whose edge args lose a value) is the bug. A minimal lift→lower unit test
 with a `GuardType` before a block-branching consumer should reproduce it without
 Deno.
+
+## Update (2026-10-11): the guard's own code is correct; the added CFG perturbs
+codegen elsewhere
+
+Dumped the culprit body's CLIF for both `SLAG_TYPER` values from the pinned Deno
+(`JIT_DUMP_IR=1 JIT_DUMP_CLIF=1`, `deno run -A scratch/h_only.js`). Exactly one
+body reaches the opt tier — the same body the guard changes. It is small: six IR
+blocks, `let` slots with `TdzCheck`, two `ElementLoad` reads, a `MemberCellLoad`,
+a `Call`, and five `ElementStore`s. Its CLIF is 242 blocks (the shape-cell
+fast paths expand), and a **normalized diff** (block/value ids and constants
+rewritten) shows the guard adds **only** its own blocks — nothing else moves:
+
+```
+# per guard                                   # guard off
+v# = band v#, <TAG_MASK>                        (the store, straight-line)
+v# = icmp ne v#, <TAG_PREFIX>                   store.i64 v#, v#+8
+brif v#, cont, deopt
+d: store.i64 v#, v#            # mirror the value into work+0
+   store v#+8, ctx+suspend_sp
+   brif vm != 0, s, r
+s: store <step>, vm+ip; jump r
+r: return -4
+cont: store.i64 v#, frame+slot  # the guarded read's store, unchanged
+```
+
+Reading the emitted machine code for the same region (`JIT_DUMP_CLIF` prints the
+disasm), the guard is correct: `movq %rax, %rcx; andq <mask>, %rcx; cmpq <prefix>,
+%rcx; jnz <cont>` with `%rax` the guarded value, and `cont` does `movq %rax,
+slot(frame)`. The value the guard checks is the value `cont` stores.
+
+Three toggles pin the trigger (each an env `emit_guard`/`run_jit_body` seam):
+
+- **No deopt fires.** An unconditional print in the `DISPATCH_DEOPT` branch
+  (`run_jit_body`) is silent for the header run, so the guard's *check passes* and
+  `cont` runs. `vm.ip`/`suspend_sp` are never written; the resume path is not it.
+- **Forcing the condition true fixes it.** `ok = iconst 1` (so Cranelift folds the
+  `brif` and drops the `deopt` block) makes every call correct. A constant-true
+  branch is a semantic no-op given the check already passes — yet it is the only
+  thing that turns the wrong answer right.
+- **The deopt block's *contents* and the seal timing do not matter.** Replacing the
+  deopt block with a bare `return -4` (no mirror, no `vm.ip`) still miscompiles,
+  and moving `seal_block(cont)` to `seal_all_blocks` (lazy seal) still
+  miscompiles.
+
+So the guard's blocks and its machine code are each correct, no deopt is taken,
+and yet the *presence* of the conditional branch is what corrupts the body. The
+only variable is Cranelift's layout/register allocation with the extra (live but
+never-entered) `deopt`/`cont` blocks. This is **not** a CLIF-level mistake in
+`emit_guard` that reading the dump reveals — it is a codegen-level consequence.
+
+Also confirmed to matter (each tried on the pinned build): `SLAG_TYPER=0` fixes
+it; `SLAG_GUARD=0`, `SLAG_MEM2REG=0`, `SLAG_WIDEN=0`, `SLAG_INLINE=1` do **not**.
+The guard survives `pass/guard.rs`'s pruning because its result feeds a
+`FrameStore` (and, for the third guard, a block edge argument) — both of which
+that pass keeps unconditionally.
+
+### Next attempts, in order
+
+1. **A self-contained lift→lower unit test.** This is the blocker: the CLI mimics
+   do not reproduce, so every experiment costs a ~15-minute Deno rebuild. A test
+   that lifts a body of this shape (a guarded read whose result is stored, a
+   block-param merge, a `let` slot) and runs the compiled code against the
+   interpreter would iterate in seconds. Find the minimal shape that diverges.
+2. **Thread the guarded value through `cont` as a block parameter.** The current
+   shape relies on the value being live from `cont`'s predecessor's body into the
+   sealed single-predecessor `cont`. If the divergence is a liveness/spill bug,
+   making the value an explicit `cont` argument (the standard Cranelift phi) is a
+   plausible dodge — and a small, local change to `emit_guard` plus its three
+   callers.
+3. **Tighten `pass/guard.rs`.** A `FrameStore` currently keeps its guard
+   unconditionally, but the guard only pays if the *slot* is later read into a
+   type-sensitive op. Slot-aware pruning would drop all three guards in this body
+   (a real ~1% win the pass already targets) and sidestep the trigger — but it
+   does not fix a *paying* guard that hits the same codegen path.
