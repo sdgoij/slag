@@ -68,17 +68,18 @@ pub(crate) static OPT_PROBE_DEPTH: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
 /// Whether the typer guards a member read's result in place (the T2 in-loop
-/// placement, `.notes/tier-typer.md`). On by default like `SLAG_OPT`;
-/// `SLAG_TYPER=0` disables it. `1`/`2` force it on/off (tests).
+/// placement, `.notes/tier-typer.md`). **Off by default**: the guard's
+/// Cranelift lowering miscompiles Deno's `Headers`/`Response` path — the body
+/// computes the wrong answer *without* deopting, so it is not the resume path
+/// (`.notes/typer-guard-miscompile.md`). Opt in with `SLAG_TYPER=1` until it is
+/// fixed; `1`/`2` force it on/off (tests).
 pub(crate) static OPT_TYPER: AtomicU8 = AtomicU8::new(0);
 
 fn typer_reads_enabled() -> bool {
     match OPT_TYPER.load(Ordering::Relaxed) {
         1 => true,
         2 => false,
-        _ => std::env::var("SLAG_TYPER")
-            .map(|v| v != "0")
-            .unwrap_or(true),
+        _ => std::env::var("SLAG_TYPER").is_ok_and(|v| v != "0"),
     }
 }
 
