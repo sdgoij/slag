@@ -2265,11 +2265,16 @@ mod tests {
     }
 
     #[test]
-    fn opt_tier_leaf_guard_resumes_on_a_non_number_value() {
-        // L1: a LEAF body (member read only — no calls, no globals) with the
-        // typer's read guard. A non-Number read deopts, and the leaf lane must
-        // resume mid-body, not re-run the read: `reads` counts the getter, so a
-        // re-run would change the value.
+    fn opt_tier_leaf_body_matches_the_interpreter_without_a_read_guard() {
+        // 9b4ce2b1: a leaf body is a call-site inline candidate, and a guard
+        // marks a body `deopts` — which every machine-code inline lane refuses
+        // (its caller has no deopt path) — so the typer's read guard is emitted
+        // only for a NON-leaf body (`lift_impl(body, typer_reads_enabled() &&
+        // !body.leaf)`). This leaf body (a member read only — no calls, no
+        // globals) must therefore take no guard: with the typer forced on its
+        // value still has to match the interpreter exactly, including the
+        // getter's `reads` count, on the unguarded path. The guard's own
+        // deopt-resume is covered by the non-leaf `opt_tier_guarded_read_...`.
         let source = "var reads = 0; \
                       function f(o) { var s = 0; var i = 0; \
                         for (; i < 3; i = i + 1) { s = s + o.x; } \
@@ -2287,20 +2292,14 @@ mod tests {
             agent.initialize_host_defined_realm().expect("realm");
             agent.run_script(source).expect("interp runs")
         };
-        let deopts_before = runtime::jit::JIT_DEOPT_COUNT.load(Ordering::Relaxed);
         crate::opt::lift::OPT_TYPER.store(1, Ordering::Relaxed);
         let (value, compiled) = with_opt_jit_agent(|agent| agent.run_script(source).expect("runs"));
         crate::opt::lift::OPT_TYPER.store(0, Ordering::Relaxed);
-        let deopts = runtime::jit::JIT_DEOPT_COUNT.load(Ordering::Relaxed) - deopts_before;
         assert_eq!(
             value, interp,
             "the optimizing tier must match the interpreter"
         );
         assert!(compiled >= 1, "{compiled} bodies compiled");
-        assert!(
-            deopts >= 1,
-            "the leaf read guard must have fired ({deopts})"
-        );
     }
 
     #[test]

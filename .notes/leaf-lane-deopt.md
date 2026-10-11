@@ -1,8 +1,17 @@
 # Extending the deopt resume to the leaf lane
 
-**Status: L2 + L1 landed (2026-10-07).** Follows the typer arc
-(`.notes/tier-typer.md`). The leaf lane now resumes a deopt; the lift emits the
-typer's read guard for leaf bodies too.
+**Status: superseded (2026-10-10).** L2 + L1 landed (2026-10-07) and follow
+the typer arc (`.notes/tier-typer.md`). But `9b4ce2b1` then re-flipped the
+lift's gate to `typer_reads_enabled() && !body.leaf` (a guard-bearing leaf body
+loses the machine-code inline lane, costing `calls/construct_churn` 1.5x — see
+`.notes/opt-per-op-overhead.md` §4). A leaf body therefore takes **no** read
+guard today, which makes the L1 resume below **latent/unreachable**: the only
+`Op::Check`/`GuardType` sources (`guard_read_value`, `emit_opt_probe`) are both
+gated off for a leaf body. The L2 refusal stays load-bearing (a `deopts` callee
+must still be refused by `leaf_call_probe`). `run_jit_leaf`'s `DISPATCH_DEOPT`
+branch is kept so re-enabling the leaf guard needs no resume work; the leaf test
+that pinned it (`opt_tier_leaf_guard_resumes_on_a_non_number_value`) was
+retargeted to the ungated path.
 
 ## Landed (2026-10-07)
 
