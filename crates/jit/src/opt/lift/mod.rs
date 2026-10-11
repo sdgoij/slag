@@ -104,6 +104,21 @@ fn lift_impl(body: &CompiledBody, guard_reads: bool) -> Result<Function, Unsuppo
     if n == 0 {
         return Err(Unsupported::NoReturn);
     }
+    // A `return` executed with an open for-of boundary must close the iterator
+    // first, and a throwing `return()` replaces the return (spec 14.7.5.6 step
+    // 7 / 7.4.6) — the interpreter routes that through `return_control`. The
+    // lift lowers a `Return` to a bare machine-code return with no close, so it
+    // refuses any `Return` that can run inside a for-of (any return but the
+    // body's final step, where no loop can still be open) rather than
+    // miscompile it. The bytecode's dead steps after such a `return` used to
+    // trip the `unreachable block` bail and hide this; the corrected boundary
+    // rule below exposes it.
+    let has_for_of = steps.iter().any(|s| {
+        matches!(
+            s,
+            Step::ForOfBegin { .. } | Step::ForOfNext { .. } | Step::ForOfNextBindLocal { .. }
+        )
+    });
     // The typer's read guard needs a deopt lane. Non-leaf bodies resume via
     // `run_jit_body`; leaf bodies resume via `run_jit_leaf` (L1). The machine-
     // code inline lanes cannot resume, so a guard-bearing body is marked
@@ -142,7 +157,17 @@ fn lift_impl(body: &CompiledBody, guard_reads: bool) -> Result<Function, Unsuppo
             }
             starts[t] = true;
         }
-        if is_terminator(step) {
+        // A block boundary is minted after a terminator only when control can
+        // fall through into it: a conditional (`JumpIfFalse`/`JumpIfTrue`, and
+        // the fused loop/hoist tests, whose `block_successors` shape is
+        // `[target, end]`). An unconditional `Jump` reaches only its target
+        // (recorded above) and a `Return`/`Throw` reaches nothing, so marking
+        // `i + 1` a start there mints a block no edge enters — the bytecode
+        // compiler leaves exactly such dead steps after a `return` (a trailing
+        // `ListEnd; Jump`), and the depth fixpoint would refuse the whole body
+        // as `Malformed("unreachable block")`.
+        if is_terminator(step) && !matches!(step, Step::Jump(_) | Step::Return | Step::Throw { .. })
+        {
             starts[i + 1] = true;
         }
     }
@@ -227,7 +252,12 @@ fn lift_impl(body: &CompiledBody, guard_reads: bool) -> Result<Function, Unsuppo
         }
         term_rec[bi] = Some(match terms[bi] {
             Some(ti) => match &steps[ti] {
-                Step::Return => TermRec::Ret(stack.pop().ok_or(Unsupported::Stack)?),
+                Step::Return => {
+                    if has_for_of && ti + 1 != n {
+                        return Err(Unsupported::Step("Return"));
+                    }
+                    TermRec::Ret(stack.pop().ok_or(Unsupported::Stack)?)
+                }
                 Step::Jump(_) => TermRec::Jump(stack),
                 Step::JumpIfFalse(_) | Step::JumpIfTrue(_) => {
                     TermRec::Branch(stack.pop().ok_or(Unsupported::Stack)?, stack)
