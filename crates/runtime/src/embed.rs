@@ -149,6 +149,22 @@ impl FunctionCall<'_> {
         )))
     }
 
+    /// Create an array in the running realm (the re-entrant counterpart of
+    /// [`Context::create_array`]).
+    pub fn create_array(&self, values: &[JsValue]) -> Result<JsValue, JsError> {
+        // SAFETY: `JsValue` is `#[repr(transparent)]` over `Value`, so the two
+        // element types share size and alignment and the slice is
+        // reinterpreted in place (the same cast `args` makes).
+        // `array_from_values` consumes it before returning, so no handle is
+        // held across a collection.
+        let values =
+            unsafe { std::slice::from_raw_parts(values.as_ptr() as *const Value, values.len()) };
+        Ok(JsValue(crate::builtins::array::array_from_values(
+            current_agent_mut()?,
+            values,
+        )?))
+    }
+
     /// Create a host function in the running realm (the re-entrant counterpart
     /// of [`Context::create_function`]), for a host function that must build
     /// the functions it returns.
@@ -458,6 +474,21 @@ impl Context {
         Ok(JsObject(CruxObject::ordinary_object_create(
             realm_object_prototype(&self.agent)?,
         )))
+    }
+
+    /// A fresh dense array inheriting `%Array.prototype%` with one own data
+    /// property per value — `Array.isArray` is true and `length` is
+    /// `values.len()` (no `eval("[]")` needed; the array and its elements are
+    /// the only allocations).
+    pub fn create_array(&self, values: &[JsValue]) -> Result<JsValue, JsError> {
+        // SAFETY: `JsValue` is `#[repr(transparent)]` over `Value`, so the slice
+        // shares a layout; `array_from_values` consumes it before returning.
+        let values =
+            unsafe { std::slice::from_raw_parts(values.as_ptr() as *const Value, values.len()) };
+        Ok(JsValue(crate::builtins::array::array_from_values(
+            &self.agent,
+            values,
+        )?))
     }
 
     /// Define an accessor property on `target` whose getter and/or setter are
@@ -2342,6 +2373,68 @@ mod tests {
     }
 
     #[test]
+    fn create_array_builds_a_dense_array() {
+        let mut context = Context::new().unwrap();
+        let array = context
+            .create_array(&[
+                JsValue::number(1.0),
+                JsValue::string("two"),
+                JsValue::boolean(true),
+            ])
+            .unwrap();
+        context.set_global("host_array", array).unwrap();
+        assert_eq!(
+            context
+                .eval("Array.isArray(host_array)")
+                .unwrap()
+                .as_boolean(),
+            Some(true)
+        );
+        assert_eq!(
+            context.eval("host_array.length").unwrap().as_number(),
+            Some(3.0)
+        );
+        assert_eq!(
+            context.eval("host_array[0]").unwrap().as_number(),
+            Some(1.0)
+        );
+        assert_eq!(
+            context
+                .eval("host_array[1]")
+                .unwrap()
+                .as_string()
+                .as_deref(),
+            Some("two")
+        );
+        assert_eq!(
+            context.eval("host_array[2]").unwrap().as_boolean(),
+            Some(true)
+        );
+        assert_eq!(
+            context
+                .eval("Object.getPrototypeOf(host_array) === Array.prototype")
+                .unwrap()
+                .as_boolean(),
+            Some(true)
+        );
+        // Each element is an own data property, not a proxy or accessor.
+        assert_eq!(
+            context
+                .eval("Object.getOwnPropertyDescriptor(host_array, '0').value")
+                .unwrap()
+                .as_number(),
+            Some(1.0)
+        );
+        // An empty input is a valid empty array.
+        let empty = context.create_array(&[]).unwrap();
+        context.set_global("empty_array", empty).unwrap();
+        assert_eq!(
+            context.eval("empty_array.length").unwrap().as_number(),
+            Some(0.0)
+        );
+    }
+
+    #[test]
     fn function_call_exposes_coercions_and_zero_copy_args() {
         // The `args()` slice cast relies on the two types sharing a layout.
         assert_eq!(std::mem::size_of::<JsValue>(), std::mem::size_of::<Value>());
@@ -2731,6 +2824,41 @@ mod tests {
         assert_eq!(
             context.eval("build().computed").unwrap().as_number(),
             Some(9.0)
+        );
+    }
+
+    #[test]
+    fn function_call_can_build_an_array_reentrantly() {
+        let mut context = Context::new().unwrap();
+        context
+            .register_fn(
+                "pair",
+                2,
+                Box::new(|call| {
+                    let a = call.arg(0).unwrap_or_else(JsValue::undefined);
+                    let b = call.arg(1).unwrap_or_else(JsValue::undefined);
+                    call.create_array(&[a, b])
+                }),
+            )
+            .unwrap();
+        assert_eq!(
+            context
+                .eval("Array.isArray(pair(1, 2))")
+                .unwrap()
+                .as_boolean(),
+            Some(true)
+        );
+        assert_eq!(
+            context.eval("pair(1, 2).length").unwrap().as_number(),
+            Some(2.0)
+        );
+        assert_eq!(
+            context
+                .eval("pair('a', 'b')[1]")
+                .unwrap()
+                .as_string()
+                .as_deref(),
+            Some("b")
         );
     }
 
