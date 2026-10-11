@@ -2342,6 +2342,57 @@ mod tests {
     }
 
     #[test]
+    fn opt_tier_guarded_callee_deopt_from_a_compiled_caller_matches_the_interpreter() {
+        // Deno's `headerListFromHeaders` (`ext/fetch/20_headers.js`), the body
+        // the typer's read guard miscompiled: a guarded symbol-keyed read into a
+        // `let`, a `=== null` lazy init whose two arms (a call and a named member
+        // read) merge through a block parameter, and five element stores. `run`
+        // is compiled too, so the call reaches a compiled caller's `call_slow`
+        // lane; the guard fires on the array read, and that lane must funnel the
+        // deopt through the interpreter rather than treat its `DISPATCH_DEOPT`
+        // sentinel as the call's result.
+        let source = "var K1 = Symbol('hl'), K2 = Symbol('ln'), K3 = Symbol('hlg'), \
+                       K4 = Symbol('hg'), K5 = Symbol('ht'); \
+                      function f(h) { \
+                        let list = h[K1]; \
+                        if (list === null) { \
+                          const target = h[K5]; \
+                          list = target === null ? h[K3]() : target.headerList; \
+                          h[K1] = list; h[K2] = null; h[K3] = null; \
+                          h[K4] = null; h[K5] = null; \
+                        } \
+                        return list; \
+                      } \
+                      function run() { \
+                        var t = 0; \
+                        for (var i = 0; i < 100; i++) { \
+                          var h = {}; \
+                          h[K1] = [['etag', '1']]; \
+                          h[K2] = null; h[K3] = null; h[K4] = null; h[K5] = null; \
+                          var got = f(h); \
+                          t = t + got.length + got[0][0].length; \
+                        } \
+                        return t; \
+                      } \
+                      var t = 0; \
+                      for (var j = 0; j < 60; j++) { t = t + run(); } \
+                      t;";
+        let interp = {
+            let mut agent = runtime::Agent::new();
+            agent.initialize_host_defined_realm().expect("realm");
+            agent.run_script(source).expect("interp runs")
+        };
+        crate::opt::lift::OPT_TYPER.store(1, Ordering::Relaxed);
+        let (value, compiled) = with_opt_jit_agent(|agent| agent.run_script(source).expect("runs"));
+        crate::opt::lift::OPT_TYPER.store(0, Ordering::Relaxed);
+        assert_eq!(
+            value, interp,
+            "the optimizing tier must match the interpreter"
+        );
+        assert!(compiled >= 1, "{compiled} bodies compiled");
+    }
+
+    #[test]
     fn opt_tier_int_value_survives_a_guard_deopt() {
         // The guard's deopt mirrors the live operand stack into the working
         // region as `Value` words. An `Int`-represented value (an i32 register)

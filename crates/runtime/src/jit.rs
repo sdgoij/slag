@@ -2240,6 +2240,15 @@ fn certified_lane_inline(
         // SAFETY: `lookup_info` just returned the cache's live entry, and no
         // frame is in flight to evict it (`in_flight` was true).
         let info = unsafe { &*info_ptr };
+        // A deopt-bearing callee must not run in this lane: unlike the probe
+        // path (`certified_verdict`) and `leaf_call_probe`, this derived
+        // fallback has no deopt path of its own, so a `DISPATCH_DEOPT` from the
+        // callee would be returned to the caller as if it were the call's
+        // result. Refuse, and let the caller funnel through the interpreter,
+        // which resumes the deopt (`run_jit_body`).
+        if info.deopts {
+            return Ok(None);
+        }
         // SAFETY: `info.entry` is a code pointer the cache owns.
         let entry: JitEntry = unsafe { std::mem::transmute(info.entry) };
         (entry, info.stack_usage, scope.frame_size)

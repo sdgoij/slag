@@ -1,158 +1,88 @@
-# The typer read guard miscompiles Deno's header path (no deopt)
+# The typer read guard miscompiled Deno's header path (fixed)
 
-**Status: guard disabled by default (2026-10-10).** The optimizing tier's
-typer read guard (`SLAG_TYPER`, on by default since `eaaacae4`) miscompiles
-Deno's `Headers`/`Response` construction: a `Headers` built from a record keeps
-no entries once its body is compiled, so `response.headers.get("etag")` answers
-`null`.
+**Status: FIXED (2026-10-11).** The optimizing tier's typer read guard
+(`SLAG_TYPER`, on by default since `eaaacae4`) miscompiled Deno's
+`Headers`/`Response` construction: a `Headers` built from a record kept no
+entries once its body was compiled, so `response.headers.get("etag")` answered
+`null`. The guard is correct; the bug was a **deopt from a compiled caller's
+certified-callee lane swallowed as a value**. Fixed in `certified_lane_inline`
+and the guard is on by default again.
 
-## Symptom
+## Root cause
 
-The Deno embedding CI job fails on every platform:
+`certified_lane_inline` (`.notes/…`, `crates/runtime/src/jit.rs`) has two
+routes: the **probe path** (`cached: Some(..)`, from `certified_call`) and the
+**derived fallback** (`cached: None`, from `call_slow` and
+`certified_construct_lane`). Every other machine-code lane refuses a
+deopt-bearing callee — the caller's compiled code has no deopt path, so a
+`DISPATCH_DEOPT` would surface as a bogus value. `certified_verdict` (the probe)
+and `leaf_call_probe` both check `compiled.deopts` for exactly this reason.
 
-```
-FAIL Request/Response/Headers/AbortController: headers = null want 1
-```
+The **derived fallback did not**. It consulted `lookup_info`, read
+`info.entry`/`info.stack_usage`, and ran the callee's machine code — with no
+`info.deopts` gate. When the callee's body then deopted, its `-4`
+(`DISPATCH_DEOPT = u64::MAX - 3`) was returned as `Ok(Some(result))`, i.e. **as
+if it were the call's return value**, straight back into the caller's compiled
+frame.
 
-at `new Response("abc", { headers: { etag: "1" } }).headers.get("etag")`.
-
-## Reproduction
-
-Rebuilt the pinned Deno (`tools/build-deno.py`, rev `abd22074e4`) against the
-tree; it reproduces deterministically. Minimised (fresh process):
-
-- `new Headers({ etag: "1" })` — the **first** call is right; **every later**
-  call loses the entry (`get` → `null`). Unrolled pairs are fine; a loop fails
-  from the 2nd iteration. Instrumenting the JS masks it (a body-shape-sensitive
-  miscompile), so the probes below are engine-side or env toggles only.
-
-## Isolation (what it is *not*)
-
-- `SLAG_OPT=0` → correct (no optimizing tier). `SLAG_TYPER=0` → correct (tier
-  on, guard off). So it is the typer read guard, `lift`'s `guard_read_value` →
-  `Op::GuardType`.
-- **It does not deopt.** `SLAG_JIT_DEOPT_TRACE=1` prints nothing for the header
-  run (it does print for `SLAG_JIT_DEOPT_PROBE=1`), so the guard's check is not
-  failing — the compiled body computes the wrong answer. This is **not** the
-  deopt-resume path.
-- **Not the numeric-slot retype.** A `SLAG_SLOTTYPE=0` seam that skips
-  `narrow`'s `FrameLoad`→`Number` retype does not change the failure.
-- **Not the guard's effect modelling.** Emitting the guard `Effects::call()`
-  instead of `pure()` does not fix it.
-- **Not `9fae69f4` and not the int-rep arc.** It reproduces at `d612ce0c`,
-  `b94f48c1`, and (minimised) since at least the guard's own introduction
-  (`bb5c0998`, Oct 7) — it predates the shape cells and the i32 representation.
-
-## The IR evidence
-
-`JIT_DUMP_IR=1` (the single optimizing-tier body compiled in the minimal run)
-shows the guard adds one `GuardType` **and** (via `narrow`) retypes a slot load:
-
-```
-# guard on                                   # guard off
-v3:?  = ElementLoad(v1, v2) [segw/segw]      v3:? = ElementLoad(v1, v2) [segw/segw]
-v4:num = GuardType(v3, v3) 3 [-/-]           FrameStore(v3) slot1 [-/s]
-FrameStore(v4) slot1 [-/s]
-...
-v20:num = FrameLoad() slot2 [s/-]            v17:? = FrameLoad() slot2 [s/-]
-v21:?  = MemberCellLoad(v20) atom5413        v18:? = MemberCellLoad(v17) atom5413
-v22:?  = MemberGuard(v20, v21) atom5413      v19:? = MemberGuard(v17, v18) atom5413
-v23:num = GuardType(v22, v22) 26 [-/-]
-```
-
-The IR itself verifies; the difference is the `GuardType` presence. Since the
-guard never fires and the retype/effects are ruled out, the miscompile is in the
-guard's **Cranelift lowering** — `emit_guard`'s `deopt`/`cont` block wiring (the
-success path splits every guarded read across extra blocks) — or its interaction
-with the surrounding value/phi handling, for a body of this shape.
+Deno's `headerListFromHeaders` (`ext/fetch/20_headers.js:744`) is that callee:
+its read guard (`is_double` on `headers[_headerList]`, an array) fires on every
+call, so the body deopts every call. Called from the compiled `Headers.get`
+through `call_slow`, the deopt sentinel came back as the header list — hence the
+empty list. The `-4` never reached `run_jit_body`'s `DISPATCH_DEOPT` branch,
+which is why the earlier probes saw "no deopt".
 
 ## Fix
 
-`typer_reads_enabled()` is back to **off by default** (`SLAG_TYPER=1` opts in) —
-it reverts only `eaaacae4`'s default flip, one line to restore once the lowering
-bug is fixed. A guard that silently miscalculates a real program cannot stay on
-by default. The guard's code path is still exercised by the
-`opt_tier_guarded_read_*` / `opt_tier_int_value_*` tests (they force `OPT_TYPER`).
+One gate in the derived path, mirroring the probe path:
 
-## Next step
-
-Dump the culprit body's CLIF (`JIT_DUMP_CLIF=1`) guard-on vs guard-off and
-compare `emit_guard`'s blocks — the success path returns the operand unchanged,
-so any divergence there (a mis-sealed `cont`, a dropped value across the split,
-a phi whose edge args lose a value) is the bug. A minimal lift→lower unit test
-with a `GuardType` before a block-branching consumer should reproduce it without
-Deno.
-
-## Update (2026-10-11): the guard's own code is correct; the added CFG perturbs
-codegen elsewhere
-
-Dumped the culprit body's CLIF for both `SLAG_TYPER` values from the pinned Deno
-(`JIT_DUMP_IR=1 JIT_DUMP_CLIF=1`, `deno run -A scratch/h_only.js`). Exactly one
-body reaches the opt tier — the same body the guard changes. It is small: six IR
-blocks, `let` slots with `TdzCheck`, two `ElementLoad` reads, a `MemberCellLoad`,
-a `Call`, and five `ElementStore`s. Its CLIF is 242 blocks (the shape-cell
-fast paths expand), and a **normalized diff** (block/value ids and constants
-rewritten) shows the guard adds **only** its own blocks — nothing else moves:
-
-```
-# per guard                                   # guard off
-v# = band v#, <TAG_MASK>                        (the store, straight-line)
-v# = icmp ne v#, <TAG_PREFIX>                   store.i64 v#, v#+8
-brif v#, cont, deopt
-d: store.i64 v#, v#            # mirror the value into work+0
-   store v#+8, ctx+suspend_sp
-   brif vm != 0, s, r
-s: store <step>, vm+ip; jump r
-r: return -4
-cont: store.i64 v#, frame+slot  # the guarded read's store, unchanged
+```rust
+let info = unsafe { &*info_ptr };
+if info.deopts {
+    return Ok(None);
+}
 ```
 
-Reading the emitted machine code for the same region (`JIT_DUMP_CLIF` prints the
-disasm), the guard is correct: `movq %rax, %rcx; andq <mask>, %rcx; cmpq <prefix>,
-%rcx; jnz <cont>` with `%rax` the guarded value, and `cont` does `movq %rax,
-slot(frame)`. The value the guard checks is the value `cont` stores.
+`Ok(None)` falls out to the interpreter funnel, which resumes the deopt through
+`run_jit_body` (the designed path). This covers both `call_slow`'s fallback and
+`certified_construct_lane` (same derived route). A post-hoc
+`result == DISPATCH_DEOPT` check would be wrong — the callee's machine code has
+already run, so re-running the whole body interpreted could repeat side effects;
+the pre-check refuses before any of it runs.
 
-Three toggles pin the trigger (each an env `emit_guard`/`run_jit_body` seam):
+Regression test:
+`opt_tier_guarded_callee_deopt_from_a_compiled_caller_matches_the_interpreter`
+(`crates/jit/src/lib.rs`) — Deno's `headerListFromHeaders` shape, called from a
+compiled `run`, compared against the interpreter.
 
-- **No deopt fires.** An unconditional print in the `DISPATCH_DEOPT` branch
-  (`run_jit_body`) is silent for the header run, so the guard's *check passes* and
-  `cont` runs. `vm.ip`/`suspend_sp` are never written; the resume path is not it.
-- **Forcing the condition true fixes it.** `ok = iconst 1` (so Cranelift folds the
-  `brif` and drops the `deopt` block) makes every call correct. A constant-true
-  branch is a semantic no-op given the check already passes — yet it is the only
-  thing that turns the wrong answer right.
-- **The deopt block's *contents* and the seal timing do not matter.** Replacing the
-  deopt block with a bare `return -4` (no mirror, no `vm.ip`) still miscompiles,
-  and moving `seal_block(cont)` to `seal_all_blocks` (lazy seal) still
-  miscompiles.
+## Gates (guard on by default)
 
-So the guard's blocks and its machine code are each correct, no deopt is taken,
-and yet the *presence* of the conditional branch is what corrupts the body. The
-only variable is Cranelift's layout/register allocation with the extra (live but
-never-entered) `deopt`/`cont` blocks. This is **not** a CLIF-level mistake in
-`emit_guard` that reading the dump reveals — it is a codegen-level consequence.
+`cargo test -p jit --lib` 357/0; `cargo test -p runtime --lib` 1042/0; clippy
+`--workspace --all-targets -D warnings` clean; test262 `language`
+23726/0/0/0/0 and `built-ins` 23820/0/1/0/0; Deno surface 29/29; `h_only.js`
+(`new Headers({etag:"1"})` × 6) all `"1"`.
 
-Also confirmed to matter (each tried on the pinned build): `SLAG_TYPER=0` fixes
-it; `SLAG_GUARD=0`, `SLAG_MEM2REG=0`, `SLAG_WIDEN=0`, `SLAG_INLINE=1` do **not**.
-The guard survives `pass/guard.rs`'s pruning because its result feeds a
-`FrameStore` (and, for the third guard, a block edge argument) — both of which
-that pass keeps unconditionally.
+## How the earlier investigation was misled (kept for the record)
 
-### Next attempts, in order
+The bug looked like a miscompiled body because the swallowed deopt made the
+DISPATCH_DEOPT branch never run:
 
-1. **A self-contained lift→lower unit test.** This is the blocker: the CLI mimics
-   do not reproduce, so every experiment costs a ~15-minute Deno rebuild. A test
-   that lifts a body of this shape (a guarded read whose result is stored, a
-   block-param merge, a `let` slot) and runs the compiled code against the
-   interpreter would iterate in seconds. Find the minimal shape that diverges.
-2. **Thread the guarded value through `cont` as a block parameter.** The current
-   shape relies on the value being live from `cont`'s predecessor's body into the
-   sealed single-predecessor `cont`. If the divergence is a liveness/spill bug,
-   making the value an explicit `cont` argument (the standard Cranelift phi) is a
-   plausible dodge — and a small, local change to `emit_guard` plus its three
-   callers.
-3. **Tighten `pass/guard.rs`.** A `FrameStore` currently keeps its guard
-   unconditionally, but the guard only pays if the *slot* is later read into a
-   type-sensitive op. Slot-aware pruning would drop all three guards in this body
-   (a real ~1% win the pass already targets) and sidestep the trigger — but it
-   does not fix a *paying* guard that hits the same codegen path.
+- `SLAG_JIT_DEOPT_TRACE=1` and an unconditional print in `run_jit_body`'s
+  `DISPATCH_DEOPT` branch were both **silent** — because the deopt never got
+  there (it was returned as a value). This is a *symptom*, not evidence the guard
+  passed.
+- The culprit body's CLIF differs from the guard-off build by the guard's blocks
+  **only** (a normalized diff), and the emitted machine code for the guard and
+  its continuation is correct — the guard checks the value `cont` stores. There
+  is no CLIF bug to find.
+- Forcing the guard's condition true (so Cranelift drops the `deopt` block)
+  "fixed" it — because that removes the deopt that was being swallowed. Bare
+  deopt and lazy seal did not change it, for the same reason: the failure was
+  never in the emitted guard code.
+- Only `SLAG_TYPER` mattered (`SLAG_GUARD`, `SLAG_MEM2REG`, `SLAG_WIDEN`,
+  `SLAG_INLINE` were all inert) — the read guard is what can deopt.
+- The first call was right and every later call wrong because the first call ran
+  interpreted; later calls reached the compiled caller's `call_slow` lane.
+
+The CLI mimics never reproduced because a caller has to be **compiled** for the
+call to reach `call_slow`'s certified lane rather than `run_jit_body`.
