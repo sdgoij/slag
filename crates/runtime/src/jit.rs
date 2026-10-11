@@ -46,6 +46,18 @@ use crux::error::{ErrorKind, JsError};
 pub type JitEntry =
     unsafe extern "C" fn(frame: *mut c_void, stack: *mut c_void, ctx: *mut c_void) -> u64;
 
+/// Reinterpret a stored code-entry word (a `usize` the JIT widened to `u64`)
+/// as a [`JitEntry`]. Going through `usize` keeps the cast size-matched on
+/// every target: a function pointer is 32 bits on wasm32, so a direct `u64`
+/// transmute would not compile. The JIT hook itself is native-only, but this
+/// module and its interpreter references compile for wasm32 too.
+fn entry_from_word(word: u64) -> JitEntry {
+    // SAFETY: callers pass only a word the JIT wrote from a real entry
+    // (`JitCompiledInfo::entry as u64`); `usize` and a function pointer are
+    // both pointer-sized, so the transmute is exact.
+    unsafe { std::mem::transmute::<usize, JitEntry>(word as usize) }
+}
+
 /// The per-body compiled-code metadata the cache returns on a hit (mirrors
 /// `jit::JitCompiledInfo` — `#[repr(C)]`, layout-identical).
 #[repr(C)]
@@ -2016,8 +2028,8 @@ fn self_call_inline(ctx: &mut JitCallContext, args: *mut u64, argc: u64) -> Opti
     let body = unsafe { &*ctx.body };
     let scope = body.scope.as_ref()?;
     // SAFETY: `ctx.self_entry` is the entry `run_jit_body` obtained from the
-    // cache for this same body; a fn pointer is pointer-sized.
-    let entry: JitEntry = unsafe { std::mem::transmute(ctx.self_entry) };
+    // cache for this same body.
+    let entry = entry_from_word(ctx.self_entry);
     let argc = argc as usize;
     // SAFETY: the JIT passes a pointer into its own live stack buffer with
     // `argc` slots (the machine code is suspended for this synchronous call).
@@ -2214,7 +2226,7 @@ fn certified_lane_inline(
             return Ok(None);
         }
         (
-            unsafe { std::mem::transmute::<u64, JitEntry>(cached.entry) },
+            entry_from_word(cached.entry),
             cached.stack_usage as usize,
             cached.frame_size as usize,
         )
