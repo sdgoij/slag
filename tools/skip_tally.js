@@ -122,13 +122,6 @@ function classify(file, source) {
   if (CRLF_ARTIFACTS.includes(file) && source.includes("\r\n")) {
     return "CRLF checkout artifact: fixture asserts LF bytes; passes on a clean checkout";
   }
-  // Stale fixture (mirrors run_fixture): total/relativeto-date-limits pins
-  // "+275760-09-12T00:00:01+00:00[UTC]" as out-of-range, but the current
-  // spec (and node v24) accept it — the epoch is a full day below the
-  // maximum instant.
-  if (file.endsWith("Temporal/Duration/prototype/total/relativeto-date-limits.js")) {
-    return "stale: +275760-09-12T00:00:01Z relativeTo is in range per the current spec";
-  }
   // ECMA-402 feature gates (mirrors run_fixture): each `Intl.*` tag skips
   // until its component lands (.notes/intl-plan.md cuts). Cut 1 implements
   // `Intl.Locale`; Cut 2 opens NumberFormat (basic/unified/v3) and

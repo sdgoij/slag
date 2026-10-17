@@ -6,7 +6,7 @@
 
 Slag is a from-scratch, spec-faithful JavaScript engine in Rust, implementing the ECMAScript® 2027 Language Specification (18th edition). 
 
-The full pinned `test262` corpus is the regression net: **51,997 pass / 0 fail / 0 crash / 0 hang** across 
+The full pinned `test262` corpus is the regression net: **51,998 pass / 0 fail / 0 crash / 0 hang** across 
 the `language`, `built-ins`, Annex B and `intl402` sweep areas. That includes **proper tail calls** the 
 **Intl**  surface (ECMA-402 Cuts 1–8: NumberFormat, Locale, PluralRules, RelativeTimeFormat, ListFormat, 
 DisplayNames, DateTimeFormat, Collator, Segmenter, DurationFormat), and **Temporal**. 
@@ -19,7 +19,7 @@ embedding API, and drop-in JavaScriptCore C-API bindings.
 - **Spec-faithful** — written chapter-by-chapter against the vendored
   `spec.html`; abstract operations keep the spec's names, ordering, and
   edge cases so conformance bugs are easy to diff.
-- **Conformant** — 51,997 passing fixtures, **0 failures / 0 crashes /
+- **Conformant** — 51,998 passing fixtures, **0 failures / 0 crashes /
   0 hangs** across 51,998 `test262` fixtures (runnable-only; see
   `.notes/conformance.md`). Proper tail calls: 34/34 `tco-*`. Workspace
   tests: 5,633 pass / 0 fail.
@@ -259,13 +259,18 @@ own); current result (release build, this machine, 15s deadlines):
 | Area | Total | Pass | Fail | Skip | Hang | Pass % of runnable |
 |---|---|---|---|---|---|---|
 | language | 23,726 | 23,726 | 0 | 0 | 0 | 100.0% |
-| built-ins | 23,821 | 23,820 | 0 | 1 | 0 | 100.0% |
+| built-ins | 23,821 | 23,821 | 0 | 0 | 0 | 100.0% |
 | annexB | 1,086 | 1,086 | 0 | 0 | 0 | 100.0% |
 | intl402 | 3,365 | 3,365 | 0 | 0 | 0 | 100.0% |
-| **Total** | **51,998** | **51,997** | **0** | **1** | **0** | **100.0%** |
+| **Total** | **51,998** | **51,998** | **0** | **0** | **0** | **100.0%** |
 
-The one remaining skip is a stale Temporal fixture (`+275760-09-12T00:00:01Z`
-`relativeTo` is out of range per the current spec). Every other gate this
+No skips remain. The last one, `Temporal/Duration/prototype/total/`
+`relativeto-date-limits.js`, was a real engine bug: for a zero duration the
+nudge window's end (`relativeTo + 1 day`) was never materialised because the
+sign passed to `ComputeNudgeWindow` was 0 instead of the spec's +1. The sign
+is now normalised to ±1 at both `RoundRelativeDuration` and
+`TotalRelativeDuration`, so the out-of-range window end is validated and the
+fixture passes. Every other gate this
 table used to carry has closed: `await-dictionary` (89) and `ShadowRealm` (64)
 landed and their gates were removed, the 152 `intl402` proposal skips landed
 with the `Intl.Locale-info` and canonical-time-zone work, and the 4

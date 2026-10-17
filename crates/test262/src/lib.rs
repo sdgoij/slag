@@ -12575,18 +12575,6 @@ var $DONE = function (error) {
             // arithmetic and the zoned day-boundary range check; nothing is
             // left in this bucket.
         }
-        // A stale fixture: total/relativeto-date-limits pins
-        // "+275760-09-12T00:00:01+00:00[UTC]" as out-of-range, but the
-        // current spec accepts it — the instant is a full day below the
-        // maximum (node v24 `--harmony-temporal` returns 0 for both
-        // "+275760-09-12T00:00:00+00:00[UTC]" and the +1s form). The
-        // duplicate round/relativeto-date-* fixture covers the still-valid
-        // date-limit assertions.
-        if relative == "Temporal/Duration/prototype/total/relativeto-date-limits.js" {
-            return FixtureResult::Skip(
-                "stale: +275760-09-12T00:00:01Z relativeTo is in range per the current spec".into(),
-            );
-        }
         // Windows-checkout CRLF artifacts: the pinned test262 submodule is
         // checked out with `core.autocrlf` rewriting LF to CRLF, so these
         // byte-exact fixtures read `\r\n` where the corpus asserts `\n`.

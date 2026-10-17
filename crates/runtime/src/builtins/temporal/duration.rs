@@ -1194,7 +1194,13 @@ pub fn round_relative_duration(
 ) -> Result<(), JsError> {
     let irregular =
         iso::is_calendar_unit(smallest_unit) || (time_zone.is_some() && smallest_unit == Unit::Day);
-    let sign = internal_duration_sign(duration);
+    // spec 7.5.38 RoundRelativeDuration: sign is -1 only for a negative
+    // duration, never 0.
+    let sign = if internal_duration_sign(duration) < 0 {
+        -1
+    } else {
+        1
+    };
     let (nudged, did_expand, nudged_ns) = if irregular {
         nudge_to_calendar_unit(
             sign,
@@ -1909,6 +1915,9 @@ pub fn nudge_to_calendar_unit_total(
     increment: i64,
     unit: Unit,
 ) -> Result<f64, JsError> {
+    // spec 7.5.39 TotalRelativeDuration: sign is -1 only for a negative
+    // duration, so a zero duration uses +1 and materialises its window end.
+    let sign = if sign < 0 { -1 } else { 1 };
     let window = compute_nudge_window(
         sign,
         duration,

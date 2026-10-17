@@ -1412,7 +1412,7 @@ across the VM, the parser, and the built-ins:
 
 Temporal is a stage-4 proposal being implemented cluster by cluster. A
 sweep of the `Temporal/*` tree (`sweep.exe built-ins --filter
-'Temporal/*'`) reports **4,602 pass, 0 fail, 1 skip** of 4,603
+'Temporal/*'`) reports **4,605 pass, 0 fail, 0 skip** of 4,605
 fixtures (the whole namespace previously sat behind the
 `features: [Temporal]` gate). Implemented and passing: **Duration,
 Instant, Now, the root-level namespace, the `toStringTag` fixtures,
@@ -1420,9 +1420,10 @@ the PlainDate / PlainTime / PlainDateTime / PlainYearMonth /
 PlainMonthDay clusters, and ZonedDateTime** (PlainDate 652, PlainTime
 493, PlainDateTime 773, PlainYearMonth 509, PlainMonthDay 199,
 ZonedDateTime 901, Duration 540, and the root-level namespace 3 —
-all 0 skip). The only skip in the whole tree is the stale
-`Duration/prototype/total/relativeto-date-limits.js` fixture (its +1s
-boundary is in range per the current spec, matching node v24); the 42
+all 0 skip). The last skip, `Duration/prototype/total/relativeto-date-
+limits.js`, was a real engine bug: a zero duration supplied sign 0 to
+`ComputeNudgeWindow`, collapsing the window before its out-of-range end could
+be validated; normalising the sign to the spec's ±1 closed it. The 42
 `toLocaleString` (Intl) content-skips closed with the ECMA-402 Intl
 integration, and the 16 Duration `relativeTo` content-skips with the
 zoned day-boundary range check below. Fixes in
@@ -1637,10 +1638,9 @@ The harness's skip taxonomy (also used by the sweep):
 
 | Skip category | Reason |
 |---|---|
-| `features: [Temporal]` (unimplemented clusters) | Temporal is a stage-4 proposal; the whole `Temporal/*` tree now runs (4,602 of 4,603 fixtures), including the `Intl.Era-monthcode`-gated era/eraYear getters, the solar calendars, and the Intl `toLocaleString` integration. |
+| `features: [Temporal]` (unimplemented clusters) | Temporal is a stage-4 proposal; the whole `Temporal/*` tree now runs (4,605 of 4,605 fixtures), including the `Intl.Era-monthcode`-gated era/eraYear getters, the solar calendars, and the Intl `toLocaleString` integration. |
 | `includes: [tcoHelper]` | (closed: proper tail calls now pass all 34 `tco-*` fixtures — see the Full-suite sweep section.) |
 | Unsupported `includes:` | Fixtures needing harness helpers beyond `assert.js`, `compareArray.js`, `detachArrayBuffer.js`, `isConstructor.js`, `propertyHelper.js`, `testAtomics.js`, `testTypedArray.js` are not run. |
-| Stale fixture | `Temporal/Duration/prototype/total/relativeto-date-limits.js` asserts a +1s boundary that is in range per the current spec (matching node v24), so it is skipped in `run_fixture`. |
 | CRLF checkout artifact | On a Windows checkout with `core.autocrlf`, git rewrites the pinned test262 submodule's LF text files to CRLF, so the byte-exact fixtures (`import/import-bytes/bytes-from-{js,json,txt}` and `Function/prototype/toString/line-terminator-normalisation-LF`) read `\r\n` where the corpus asserts `\n`. They are skipped in `run_fixture` only when the working tree is actually CRLF — a clean LF checkout runs them. |
 | `staging/sm` (SpiderMonkey shell suite) | SpiderMonkey's own shell test suite, imported into the staging tier; not ECMAScript conformance. It needs SM-only harness helpers (`sm/non262-*-shell.js`, `sm/assertThrowsValue.js`) and asserts SM-shell-specific semantics. Skipped in `run_fixture` for the staging area only. |
 
@@ -1706,17 +1706,17 @@ hangs are slow-but-correct fixtures, not bugs: ~222
 `TypedArray/prototype/copyWithin` 10,000-element allocations pass with the
 long config — batches containing several of them exceed the 120s deadline
 under 8-job load and the recheck misclassifies them; none are Temporal (the
-`Temporal/*` filter sweep is 4,602 pass / 0 fail / 1 skip / 0 hang).
+`Temporal/*` filter sweep is 4,605 pass / 0 fail / 0 skip / 0 hang).
 The Temporal clusters implemented so far — Duration, Instant, Now, the
 root-level namespace, toStringTag, the five Plain clusters, ZonedDateTime,
 and `Date.prototype.toTemporalInstant` — moved 4,569 of the 4,611
 Temporal-featured fixtures from skip to pass (the 16 Duration
 `relativeTo` content-skips closed last); the
 remaining 42 `toLocaleString` (Intl) content-skips closed with the
-ECMA-402 integration, leaving the one stale fixture.)
+ECMA-402 integration, and the final date-limits skip closed with the
+nudge-sign fix.)
 
-(Runnable = pass + fail + hang; the only remaining skip is the one stale
-Temporal fixture.) The
+(Runnable = pass + fail + hang; no skips remain.) The
 TCO cluster closed last (34/34 — proper tail calls, the one spec feature
 V8 and JSC still skip: a return in the innermost try's own
 catch-without-finally or finally clause replaces the frame, with the
@@ -1871,9 +1871,7 @@ Object.fromEntries, JSON.stringify, DataView, Object statics/
 constructor, Promise, Atomics, and the final Array/generator, Throw-
 TypeError, WeakRef/FinalizationRegistry, Uint8Array base64/hex, Set
 set-methods, JSON/parse, TypedArray BigInt, String, and SuppressedError
-closures (all 0 fail). The only remaining built-ins skip is the one stale
-`Temporal/Duration/prototype/total/relativeto-date-limits.js`
-fixture — the Temporal tree (including
+closures (all 0 fail). The built-ins area has no skips — the Temporal tree (including
 `Date.prototype.toTemporalInstant`, the 16 Duration `relativeTo`
 content-skips, and the `Intl.Era-monthcode`-gated era/eraYear
 getters and solar calendars), atomicsHelper
@@ -2124,11 +2122,13 @@ hang of 1,483 fixtures** (`--jobs 8 --batch 32 --timeout 15 --recheck-timeout
 
 ## Open items
 
-- The pinned corpus is at **100% of runnable**: **51,997 pass / 0 fail /
-  0 crash / 0 hang / 1 skip** of 51,998 fixtures (release build, 15s
-  deadlines) — language 23,726 / built-ins 23,820 of 23,821 / annexB 1,086 /
-  intl402 3,365. The one skip is the stale `relativeto-date-limits.js`
-  fixture. The `await-dictionary` (89) and `ShadowRealm` (64) gates, the 152
+- The pinned corpus is at **100% of runnable**: **51,998 pass / 0 fail /
+  0 crash / 0 hang / 0 skip** of 51,998 fixtures (release build, 15s
+  deadlines) — language 23,726 / built-ins 23,821 of 23,821 / annexB 1,086 /
+  intl402 3,365. No skips remain: the last one,
+  `relativeto-date-limits.js`, was a real engine bug (a zero duration
+  supplied sign 0 to `ComputeNudgeWindow`), fixed by normalising the sign to
+  the spec's ±1. The `await-dictionary` (89) and `ShadowRealm` (64) gates, the 152
   `intl402` proposal skips, the 4 CRLF-affected fixtures (they run on an LF
   checkout), and the 234 slow-but-correct built-ins hangs have all closed;
   the closure history follows. The plan's ≥95% runnable-pass-rate target is
@@ -2162,8 +2162,8 @@ toStringTag, the five Plain clusters, and ZonedDateTime — and
 `Intl.Era-monthcode` gate flipped last — the era-field getters and the
 solar-calendar arithmetic (buddhist, coptic, ethiopic, ethioaa, indian,
 persian, roc, islamic-umalqura) pass; the `await-dictionary` and `ShadowRealm`
-gates below closed too, leaving only the stale `relativeto-date-limits.js`
-fixture.)
+gates below closed too; the final date-limits skip closed with the
+nudge-sign fix.)
   Note: the whole corpus, TypedArray included, is clean at the standard
   15s deadline now; the longer deadline the earlier sweeps used is obsolete
   (the quadratic property store that made the 10,000-element crash-test
@@ -2214,8 +2214,8 @@ fixture.)
   the `allSettledKeyed` fulfill/reject pair so the first call wins. The two
   new `CompoundState` variants reuse the existing combinator machinery; the
   await-dictionary gate is removed from both `run_fixture` and
-  `tools/skip_tally.js`. The remaining `all` skip is now the one stale
-  Temporal fixture (the 4 CRLF artifacts no longer trigger on the LF checkout).
+  `tools/skip_tally.js`. No `all` skips remain (the 4 CRLF artifacts no
+  longer trigger on the LF checkout).
 - `ShadowRealm` is implemented (it was the last 64 built-ins skips): the
   constructor + `evaluate` + `importValue` + `@@toStringTag`, a fresh inner
   realm per instance (`Agent::shadow_realms`), and the WrappedFunction exotic
@@ -2230,8 +2230,7 @@ fixture.)
   TypeErrors via `realm_throwable` in the wrapper's realm. `importValue` chains
   a caller-realm promise onto the engine's dynamic-import machinery and wraps
   the named export. The ShadowRealm gate is removed from `run_fixture` and
-  `tools/skip_tally.js`; the 64 fixtures pass, and the only remaining `all`
-  skip is the one stale Temporal fixture.
+  `tools/skip_tally.js`; the 64 fixtures pass, and no `all` skips remain.
 - `canonical-tz` is implemented (it was the other 19 `intl402` skips). A named
   zone identifier is *preserved* with its canonical spelling: neither
   `Temporal.ZonedDateTime.timeZoneId` nor `DateTimeFormat`'s
