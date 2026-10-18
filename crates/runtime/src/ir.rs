@@ -2956,7 +2956,8 @@ pub(crate) struct MemberMapWriteCell {
 /// bump the link's generation under the L1c record discipline — is always
 /// observed (the slot is stable while the link's generation is unchanged,
 /// which the walk validates). All-scalar; no trace edges.
-#[derive(Clone)]
+#[repr(C)]
+#[derive(Clone, Copy)]
 pub struct MemberChainCell {
     pub id: u64,
     pub name: crux::AtomId,
@@ -2964,6 +2965,21 @@ pub struct MemberChainCell {
     pub slot: usize,
     pub link_count: u8,
     pub links: [(u64, u32); 2],
+}
+
+impl MemberChainCell {
+    /// An empty cell: map ids start at 1, so 0 never matches the compiled
+    /// probe's live map id.
+    pub(crate) const fn empty() -> Self {
+        Self {
+            id: 0,
+            name: 0,
+            generation: 0,
+            slot: 0,
+            link_count: 0,
+            links: [(0, 0); 2],
+        }
+    }
 }
 
 /// Part B, B5.2: map-keyed read-cell cache `(map_id, name) → slot` — the
@@ -5404,8 +5420,8 @@ impl Vm {
         // the object to dictionary mode (map None) — all miss.
         let map = object.map.get()?;
         let map_index = Self::member_map_cell_index(map.id(), name);
-        if let Some(cell) = agent.member_chain_map_cells[map_index].as_ref()
-            && cell.id == map.id()
+        let cell = &agent.member_chain_map_cells[map_index];
+        if cell.id == map.id()
             && cell.name == name
             && !object.has_own_property_atom(name)
             && let Some(value) =
@@ -5462,13 +5478,25 @@ impl Vm {
         if *stored != key {
             return None;
         }
-        match &property.kind {
-            crux::object::PropertyKind::Data { value, .. } => Some(*value),
+        let value = match &property.kind {
+            crux::object::PropertyKind::Data { value, .. } => *value,
             // The found property converted to an accessor: the structural
             // change bumped the link's generation, so the walk above would
             // have missed; this is the exact fallback for a missed bump.
-            _ => None,
-        }
+            _ => return None,
+        };
+        drop(props);
+        // Re-warm the derived value cell: a collection clears it
+        // (`Agent::clear_derived_caches`), and without this the compiled
+        // chain probe would miss on every iteration for the rest of the run
+        // (the helper serves the read but never re-fronts the cell).
+        agent.member_value_cells[vindex] = MemberValueCell {
+            id: found_link.id(),
+            name,
+            generation: found_link.generation(),
+            value,
+        };
+        Some(value)
     }
 
     /// Whether an own `name` on `object` is ruled out WITHOUT the object's
@@ -5568,14 +5596,14 @@ impl Vm {
                         // guard above) plus the shared map are baked in.
                         if let Some(map) = object.map.get() {
                             let map_index = Self::member_map_cell_index(map.id(), name);
-                            agent.member_chain_map_cells[map_index] = Some(MemberChainCell {
+                            agent.member_chain_map_cells[map_index] = MemberChainCell {
                                 id: map.id(),
                                 name,
                                 generation: object.generation(),
                                 slot,
                                 link_count: count as u8,
                                 links,
-                            });
+                            };
                         }
                         // Warm the found link's (link, name) member value
                         // cell: a chain hit re-reads the found property
@@ -14545,6 +14573,8 @@ impl Vm {
             member_value_cells: agent.member_value_cells.as_ptr() as *mut std::os::raw::c_void,
             computed_read_cells: agent.computed_read_cells.as_ptr() as *mut std::os::raw::c_void,
             member_map_cells: agent.member_map_cells.as_ptr() as *mut std::os::raw::c_void,
+            member_chain_cells: agent.member_chain_map_cells.as_mut_ptr()
+                as *mut std::os::raw::c_void,
             globals_unshadowed,
             buf_end: (region_ptr as usize + buf_len * std::mem::size_of::<Value>())
                 as *mut std::os::raw::c_void,
@@ -30764,6 +30794,53 @@ mod tests {
         assert!(
             matches!(agent.global_cells[Vm::global_cell_index(data)], Some((name, _)) if name == data),
             "a data property records its own slot"
+        );
+    }
+
+    #[test]
+    fn a_chain_record_caches_the_map_resolution_for_a_dense_array() {
+        // The compiled chain probe depends on exactly this state: the map-keyed
+        // cell holds the receiver's map id and the walked links, and the found
+        // link's value cell is warm and valid. Both arrays are created in ONE
+        // evaluation because the canonical empty-array map is collectable: a
+        // collection between two scripts hands the later array a fresh map id
+        // and the record would (correctly) miss.
+        let mut agent = Agent::new();
+        agent.initialize_host_defined_realm().unwrap();
+        let value = agent
+            .run_script("(function () { var a = [1, 2]; var b = [1, 2]; a.push(3); return b; })()")
+            .expect("the push script");
+        let ValueKind::Object(array) = value.kind() else {
+            panic!("the script returns the array");
+        };
+        assert_eq!(
+            array.named_version.get(),
+            0,
+            "an array with no named own property keeps named_version at 0"
+        );
+        let name = crux::intern_utf8("push");
+        let map_id = array.map.get().expect("the array keeps its map").id();
+        let cell = &agent.member_chain_map_cells[Vm::member_map_cell_index(map_id, name)];
+        assert_eq!(cell.id, map_id, "the map-keyed chain cell is recorded");
+        assert_eq!(cell.name, name);
+        assert_eq!(cell.link_count, 1);
+        let proto = array.get_prototype_of().unwrap().expect("Array.prototype");
+        assert_eq!(cell.links[0], (proto.id(), proto.generation()));
+        // The value cell is a DERIVED cache: a collection clears it, so it is
+        // not asserted warm. What must hold is that the recorded slot still
+        // serves the read through the chain cell — the map-keyed resolution
+        // outlives both a GC and the push call that mutated the receiver.
+        let push_fn = proto
+            .get(&crux::lookup(name))
+            .expect("Array.prototype.push");
+        let served = Vm::member_chain_get(&mut agent, &value, name)
+            .expect("the map-keyed chain cell serves a fresh array's method read");
+        assert_eq!(served, push_fn, "the chain hit re-reads the recorded slot");
+        let vcell = &agent.member_value_cells[Vm::member_cell_index(proto.id(), name)];
+        assert_eq!(
+            (vcell.id, vcell.name, vcell.generation),
+            (proto.id(), name, proto.generation()),
+            "a chain hit through the slot re-warms the derived value cell"
         );
     }
 

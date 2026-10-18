@@ -940,6 +940,14 @@ pub struct JsObject {
     /// so the JIT's inline global fast path can read it in place (via
     /// `offset_of!`) to validate its global-value cells.
     pub generation: Cell<u32>,
+    /// Whether this object has ever gained or lost a STRING-keyed own property
+    /// (the named-property version). Distinct from `generation`, which also
+    /// advances on dense element writes: a compiled prototype-chain method
+    /// read can trust its cached resolution for a receiver whose version is
+    /// still 0, because no named own property has ever shadowed the chain —
+    /// element churn does not affect that. `pub` so the JIT reads it in place
+    /// via `offset_of!`.
+    pub named_version: Cell<u32>,
     /// Whether this object is registered as a [[Prototype]] of another object
     /// (set by `mark_prototype` at the child's creation or on
     /// `set_prototype_of`). When set, any own-property change to this object
@@ -1123,6 +1131,7 @@ impl JsObject {
             extensible: Cell::new(true),
             immutable_prototype: Cell::new(false),
             generation: Cell::new(0),
+            named_version: Cell::new(0),
             store_chain_clean: Cell::new(0),
             is_prototype: Cell::new(false),
             properties: RefCell::new(SmallProps::new()),
@@ -1167,6 +1176,7 @@ impl JsObject {
                 Cell::new(false),
             );
             std::ptr::write(std::ptr::addr_of_mut!((*this).generation), Cell::new(0));
+            std::ptr::write(std::ptr::addr_of_mut!((*this).named_version), Cell::new(0));
             std::ptr::write(
                 std::ptr::addr_of_mut!((*this).is_prototype),
                 Cell::new(false),
@@ -1490,6 +1500,7 @@ impl JsObject {
             extensible: Cell::new(true),
             immutable_prototype: Cell::new(false),
             generation: Cell::new(0),
+            named_version: Cell::new(0),
             store_chain_clean: Cell::new(0),
             is_prototype: Cell::new(false),
             properties: RefCell::new(SmallProps::new()),
@@ -1516,6 +1527,7 @@ impl JsObject {
             extensible: Cell::new(true),
             immutable_prototype: Cell::new(false),
             generation: Cell::new(0),
+            named_version: Cell::new(0),
             store_chain_clean: Cell::new(0),
             is_prototype: Cell::new(false),
             properties: RefCell::new(SmallProps::new()),
@@ -1580,6 +1592,7 @@ impl JsObject {
                     Cell::new(false),
                 );
                 std::ptr::write(std::ptr::addr_of_mut!((*this).generation), Cell::new(0));
+                std::ptr::write(std::ptr::addr_of_mut!((*this).named_version), Cell::new(0));
                 std::ptr::write(
                     std::ptr::addr_of_mut!((*this).is_prototype),
                     Cell::new(false),
@@ -1673,6 +1686,7 @@ impl JsObject {
             extensible: Cell::new(true),
             immutable_prototype: Cell::new(false),
             generation: Cell::new(0),
+            named_version: Cell::new(0),
             store_chain_clean: Cell::new(0),
             is_prototype: Cell::new(false),
             properties: RefCell::new(SmallProps::new()),
@@ -1710,6 +1724,7 @@ impl JsObject {
             extensible: Cell::new(true),
             immutable_prototype: Cell::new(false),
             generation: Cell::new(0),
+            named_version: Cell::new(0),
             store_chain_clean: Cell::new(0),
             is_prototype: Cell::new(false),
             properties: RefCell::new(SmallProps::new()),
@@ -1742,6 +1757,7 @@ impl JsObject {
             extensible: Cell::new(true),
             immutable_prototype: Cell::new(false),
             generation: Cell::new(0),
+            named_version: Cell::new(0),
             store_chain_clean: Cell::new(0),
             is_prototype: Cell::new(false),
             properties: RefCell::new(SmallProps::new()),
@@ -1855,6 +1871,7 @@ impl JsObject {
             extensible: Cell::new(false),
             immutable_prototype: Cell::new(false),
             generation: Cell::new(0),
+            named_version: Cell::new(0),
             store_chain_clean: Cell::new(0),
             is_prototype: Cell::new(false),
             properties: RefCell::new(SmallProps::new()),
@@ -1914,6 +1931,7 @@ impl JsObject {
             extensible: Cell::new(true),
             immutable_prototype: Cell::new(false),
             generation: Cell::new(0),
+            named_version: Cell::new(0),
             store_chain_clean: Cell::new(0),
             is_prototype: Cell::new(false),
             properties: RefCell::new(SmallProps::new()),
@@ -2017,6 +2035,7 @@ impl JsObject {
             extensible: Cell::new(true),
             immutable_prototype: Cell::new(false),
             generation: Cell::new(0),
+            named_version: Cell::new(0),
             store_chain_clean: Cell::new(0),
             is_prototype: Cell::new(false),
             properties: RefCell::new(SmallProps::new()),
@@ -3584,6 +3603,15 @@ impl JsObject {
         validate_and_apply(Some(self), key, self.extensible.get(), desc, current)
     }
 
+    /// Advance the named-property version (see [`Self::named_version`]).
+    /// Called by every path that adds or removes a string-keyed own property;
+    /// over-bumping only costs a compiled chain-read cache hit.
+    #[inline]
+    pub fn bump_named_version(&self) {
+        self.named_version
+            .set(self.named_version.get().wrapping_add(1));
+    }
+
     /// spec 7.3.4 CreateDataProperty.
     pub fn create_data_property(&self, key: &JsString, value: Value) -> Result<bool, JsError> {
         self.create_data_property_key(&PropertyKey::from_js_string(key), value)
@@ -3757,6 +3785,7 @@ impl JsObject {
         crate::heap::write_barrier_handle(self, map);
         self.map.set(Some(map));
         self.props_deferred.set(true);
+        self.bump_named_version();
         true
     }
 
@@ -3822,6 +3851,9 @@ impl JsObject {
     ) -> bool {
         if !matches!(self.kind, ObjectKind::Ordinary) || !self.extensible.get() {
             return false;
+        }
+        if matches!(key, PropertyKey::String(_)) {
+            self.bump_named_version();
         }
         let attrs = MapAttrs::new(writable, enumerable, configurable);
         // Deferred (vector-free) service: keep map + in_fields as the only
@@ -4045,6 +4077,7 @@ impl JsObject {
                             *self.property_index.borrow_mut() = None;
                             self.drop_map_if_mapped(key);
                             self.bump_generation();
+                            self.bump_named_version();
                             true
                         } else {
                             false
@@ -4081,6 +4114,7 @@ impl JsObject {
                     *self.property_index.borrow_mut() = None;
                     self.drop_map_if_mapped(key);
                     self.bump_generation();
+                    self.bump_named_version();
                     true
                 } else {
                     false
@@ -4321,6 +4355,9 @@ fn validate_and_apply(
         let position = props.len();
         props.push((key.clone(), property.clone()));
         drop(props);
+        if matches!(key, PropertyKey::String(_)) {
+            obj.bump_named_version();
+        }
         // Part B, B5.3: a fresh data property defined through the full path
         // transitions the map when its attributes allow, so the map read
         // path serves it like a `fresh_data_define`.
@@ -5315,6 +5352,7 @@ fn typed_array_delete(
         if props[position].1.configurable {
             props.remove(position);
             *obj.property_index.borrow_mut() = None;
+            obj.bump_named_version();
             return Ok(true);
         }
         return Ok(false);

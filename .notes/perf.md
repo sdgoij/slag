@@ -13703,3 +13703,58 @@ re-entrant handler can move when it resizes `vm.stack` — that is exactly what
 the `reentrant` gate excludes. The lane also returns before the pending-call
 completion check the funnel performs, which is sound only because a
 non-reentrant handler never withdraws.
+
+## Prototype-chain method reads serve the opt tier (2026-10-18)
+
+A method read (`arr.push`, `p.get`) resolved through the full `[[Get]]` on
+every compiled iteration: the value cell is keyed by the receiver's id, but
+the method lives on the prototype, so the guard could never hit it. A
+map-keyed chain cell now caches the RESOLUTION (receiver map id, walked links'
+(id, generation), the found data property's vector slot) and the compiled
+guard reads it before the exact helper. A hit re-validates each link and
+re-reads the found property through the link's member value cell under its
+live generation, so a value write to the prototype method is observed. The
+shape probe runs first, so object loops that read map-described fields keep
+their inline path instead of paying a chain-probe gate that only bails.
+
+Three latent opt-tier bugs kept the probe from executing; all were found by
+dumping the runtime cells at the moment the helper ran:
+
+- `emit_chain_probe` emitted its first `iconst` before `switch_to_block(entry)`.
+  In release the whole probe was appended after the caller's terminator (dead
+  code); in a debug build Cranelift panicked with "cannot add an instruction
+  to a block already filled".
+- `emit_chain_value_read` was called with `(hit, miss)` against `(slow, merge)`
+  parameters, so a VALID value cell branched to the miss block. Every hit
+  declined. The parameters are now named `miss`/`hit` to match the callers.
+- `emit_array_push_inline` called `Helper::ArrayPush` with `sig_binary` (four
+  parameters) while passing two arguments, so Cranelift's verifier rejected
+  the whole body and `opt_lower::compile` returned `None` silently. Every body
+  containing `.push` fell back to the per-step tier. `CreateFunction` and
+  `CreateFunctionDecl` had the same class of mismatch with `sig_tdz`. Both
+  silent fallbacks now print under `JIT_DUMP_CLIF`.
+
+Measured (release, one file each): `opcost/array_push` 6.69 -> 1.50 ms,
+`array_reverse` 9.57 -> 2.55, `array_includes` 7.90 -> 2.67, `array_indexof`
+7.05 -> 2.40, `array_at` 3.87 -> 1.42, `arrays/push_pop` 4.38 -> 1.94. The
+push/pop helper census drops `GetMemberName` from 1.4M calls to 2. The full
+corpus pass was thermally noisy (unrelated rows moved both ways depending on
+the pass); the array rows reproduced across three passes.
+
+Trap: the canonical empty-array map is collectable, so two array literals in
+SEPARATE evaluations can get different map ids. `resolve_chain_cell` records a
+map-keyed cell; a collection between scripts drops that map from the cache and
+the next literal gets a fresh id, which correctly misses. The unit test must
+create both arrays in one evaluation.
+
+Trap: `chain_cell_read` must re-warm the found link's value cell when it falls
+back to the vector slot. A collection clears the derived cells
+(`Agent::clear_derived_caches`), and without the re-warm the compiled probe
+would miss on every iteration for the rest of the run while the helper served
+the read from the slot.
+
+Bodies containing `NewClosure`/`FunctionDecl` are declined explicitly by
+`opt_lower::compile` for now: with the ABI corrected they assemble, but the
+prototype-method-call shape a closure exposes measures 3.4 ms per-step against
+9.0 ms in the opt tier (`opcost/proto_method_call`). The call lane is the
+suspect; the decline keeps that regression out until it is fixed.

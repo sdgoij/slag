@@ -402,8 +402,7 @@ pub struct Agent {
     /// recorded links' (id, generation) exactly like the identity cell. `id`
     /// holds the map id; the hit ignores `generation`. All-scalar — no
     /// trace edges.
-    pub(crate) member_chain_map_cells:
-        Box<[Option<crate::ir::MemberChainCell>; crate::ir::MEMBER_CELLS]>,
+    pub(crate) member_chain_map_cells: Box<[crate::ir::MemberChainCell; crate::ir::MEMBER_CELLS]>,
     /// The fronting array-element value cache (Cut 35 slice 13): (id, index,
     /// generation, value) — a hit returns the element with no
     /// property-vector borrow. Boxed per the Cut 27 lesson.
@@ -1315,7 +1314,9 @@ impl Agent {
                     .unwrap_or_else(|_| unreachable!("sized exactly MEMBER_MAP_WRITE_CELLS"))
             },
             member_chain_cells: Box::new(std::array::from_fn(|_| None)),
-            member_chain_map_cells: Box::new(std::array::from_fn(|_| None)),
+            member_chain_map_cells: Box::new(
+                [const { crate::ir::MemberChainCell::empty() }; crate::ir::MEMBER_CELLS],
+            ),
             array_element_value_cells: Box::new(std::array::from_fn(|_| None)),
             array_length_cells: Box::new(std::array::from_fn(|_| None)),
             member_proto_cells: [None; crate::ir::MEMBER_CELLS],

@@ -423,6 +423,11 @@ pub struct JitCallContext {
     /// the descriptor layout for every instance of the shape, so a hit needs
     /// no per-object identity or generation).
     pub member_map_cells: *mut c_void,
+    /// The `Agent::member_chain_map_cells` array base (the compiled
+    /// prototype-chain read probe indexes it by `(map_id ^ name) &
+    /// (MEMBER_CELLS - 1)` and re-validates the map id, the name, and the
+    /// receiver's `named_version == 0`).
+    pub member_chain_cells: *mut c_void,
     /// Whether every name the body reads through the env chain
     /// ([`CompiledBody::ident_names`]) resolves at the global environment
     /// record — the compiled `LoadIdent` probe is sound only then, because a
@@ -2456,6 +2461,7 @@ fn certified_lane_inline(
         member_value_cells: ctx.member_value_cells,
         computed_read_cells: ctx.computed_read_cells,
         member_map_cells: ctx.member_map_cells,
+        member_chain_cells: ctx.member_chain_cells,
         globals_unshadowed: cached.map_or_else(
             || Vm::global_reads_are_unshadowed(environment, &body.ident_names),
             |c| c.globals_unshadowed != 0,
@@ -6928,6 +6934,7 @@ pub(crate) fn run_jit_body(
         member_value_cells: agent.member_value_cells.as_ptr() as *mut c_void,
         computed_read_cells: agent.computed_read_cells.as_ptr() as *mut c_void,
         member_map_cells: agent.member_map_cells.as_ptr() as *mut c_void,
+        member_chain_cells: agent.member_chain_map_cells.as_mut_ptr() as *mut c_void,
         globals_unshadowed,
         buf_end: (work_ptr as usize + work_len * std::mem::size_of::<Value>()) as *mut c_void,
         leaf_epoch: 0,
@@ -7204,6 +7211,7 @@ pub(crate) fn run_jit_resume(
         member_value_cells: agent.member_value_cells.as_ptr() as *mut c_void,
         computed_read_cells: agent.computed_read_cells.as_ptr() as *mut c_void,
         member_map_cells: agent.member_map_cells.as_ptr() as *mut c_void,
+        member_chain_cells: agent.member_chain_map_cells.as_mut_ptr() as *mut c_void,
         globals_unshadowed,
         buf_end: (work_ptr as usize + work_len * std::mem::size_of::<Value>()) as *mut c_void,
         leaf_epoch: 0,

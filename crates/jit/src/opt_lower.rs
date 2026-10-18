@@ -17,7 +17,8 @@ use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Variable};
 use crux::Value as JsValue;
 use runtime::ir::{
     COMPUTED_READ_CELLS, COMPUTED_READ_INDEX_MUL, COMPUTED_READ_INDEX_SHIFT, ComputedReadCell,
-    GLOBAL_CELLS, INTRINSICS, Intrinsic, MEMBER_CELLS, MemberMapCell, MemberValueCell,
+    GLOBAL_CELLS, INTRINSICS, Intrinsic, MEMBER_CELLS, MemberChainCell, MemberMapCell,
+    MemberValueCell,
 };
 use runtime::jit::{
     AGENT_REALM_COUNT_OFFSET, CertifiedInlineInfo, DISPATCH_DEOPT, GlobalValueCell, HELPER_COUNT,
@@ -60,14 +61,39 @@ pub fn compile(
     helpers: &JitHelpers,
     max_stack: usize,
 ) -> Option<Compiled> {
+    // The opt tier is slower than the per-step tier on bodies that create
+    // functions: the prototype-method-call shape a closure exposes
+    // (`p.get(k)` with a certified leaf callee) measured 3.4 ms per-step vs
+    // 9.0 ms here (`opcost/proto_method_call`, 2026-10-18). The call lane is
+    // the suspect. Decline those bodies explicitly so the regression cannot
+    // ship on the strength of the ABI fix below.
+    if (0..ir.block_count() as BlockId).any(|b| {
+        ir.block(b)
+            .insts
+            .iter()
+            .any(|i| matches!(i.op, Op::NewClosure | Op::FunctionDecl))
+    }) {
+        return None;
+    }
     let conv = platform_call_conv(isa);
     let mut func =
         Function::with_name_signature(UserFuncName::testcase("jit_opt_body"), jit_sig(conv));
     let mut fctx = FunctionBuilderContext::new();
-    if lower(ir, helpers, &mut func, &mut fctx, conv).is_err() {
+    if let Err(reason) = lower(ir, helpers, &mut func, &mut fctx, conv) {
+        if std::env::var("JIT_DUMP_CLIF").is_ok() {
+            eprintln!("opt-lower bail: {reason:?}");
+        }
         return None;
     }
-    let compiled = assemble(isa, func, max_stack, ir_has_deopt(ir))?;
+    let compiled = match assemble(isa, func, max_stack, ir_has_deopt(ir)) {
+        Some(compiled) => compiled,
+        None => {
+            if std::env::var("JIT_DUMP_CLIF").is_ok() {
+                eprintln!("opt assemble failed");
+            }
+            return None;
+        }
+    };
     #[cfg(test)]
     OPT_COMPILED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     Some(compiled)
@@ -768,12 +794,51 @@ fn lower_inst(
             let shape_done = builder.create_block();
             builder.append_block_param(shape_done, types::I64);
             let plain_here = crate::cells::is_plain_object(builder, object);
-            let shape_entry = builder.create_block();
+            let plain_entry = builder.create_block();
+            let chain_entry = builder.create_block();
+            let shape_probe = builder.create_block();
             builder
                 .ins()
-                .brif(plain_here, shape_entry, &[], fallback, &[]);
+                .brif(plain_here, plain_entry, &[], fallback, &[]);
             builder.seal_block(slow);
-            builder.switch_to_block(shape_entry);
+            // A dense Array's `length` is the slots cell (the compiled dense
+            // append updates it in machine code), so the own-property read
+            // needs no helper and no generation-validated value cell.
+            builder.switch_to_block(plain_entry);
+            if *atom == crux::string::length_atom() {
+                let obj_ptr = crate::cells::object_data_ptr(builder, object);
+                let dense = builder.ins().load(
+                    types::I64,
+                    MemFlagsData::new(),
+                    obj_ptr,
+                    Offset32::new(std::mem::offset_of!(crux::JsObject, array_dense) as i32),
+                );
+                let dense_ok = builder.ins().icmp_imm_u(IntCC::NotEqual, dense, 0);
+                let len_hit = builder.create_block();
+                builder.ins().brif(dense_ok, len_hit, &[], chain_entry, &[]);
+                builder.seal_block(len_hit);
+                builder.switch_to_block(len_hit);
+                let slots_ptr = builder
+                    .ins()
+                    .iadd_imm_s(dense, crux::heap::GCBOX_DATA_OFFSET as i64);
+                let length = builder.ins().load(
+                    types::F64,
+                    MemFlagsData::new(),
+                    slots_ptr,
+                    Offset32::new(std::mem::offset_of!(crux::object::ArraySlots, length) as i32),
+                );
+                let bits = builder
+                    .ins()
+                    .bitcast(types::I64, MemFlagsData::new(), length);
+                builder.def_var(result, bits);
+                builder.ins().jump(merge, &[]);
+            } else {
+                // The shape probe runs first: a map-described own property is
+                // the common case for the object loops (many instances of one
+                // shape), and the chain probe's gate would only bail on them.
+                builder.ins().jump(shape_probe, &[]);
+            }
+            builder.switch_to_block(shape_probe);
             // The map-keyed shape fast path (the opt-tier mirror of
             // `compiler.rs::emit_member_cell_probe`'s `shape` arm). The value
             // cell above is keyed by the object id, so a loop over many
@@ -790,8 +855,10 @@ fn lower_inst(
                 Offset32::new(std::mem::offset_of!(crux::JsObject, map) as i32),
             );
             let has_map = builder.ins().icmp_imm_u(IntCC::NotEqual, map_handle, 0);
-            builder.ins().brif(has_map, map_present, &[], fallback, &[]);
-            builder.seal_block(shape_entry);
+            builder
+                .ins()
+                .brif(has_map, map_present, &[], chain_entry, &[]);
+            builder.seal_block(shape_probe);
             builder.switch_to_block(map_present);
             let map_data = builder
                 .ins()
@@ -832,7 +899,9 @@ fn lower_inst(
                 .ins()
                 .icmp_imm_u(IntCC::Equal, cell_name, *atom as i64);
             let described = builder.ins().band(map_ok, name_ok);
-            builder.ins().brif(described, map_hit, &[], fallback, &[]);
+            builder
+                .ins()
+                .brif(described, map_hit, &[], chain_entry, &[]);
             builder.seal_block(map_present);
             builder.switch_to_block(map_hit);
             let slot_inline = builder.ins().icmp_imm_u(
@@ -862,7 +931,7 @@ fn lower_inst(
             );
             builder
                 .ins()
-                .brif(is_hole, fallback, &[], shape_done, &[field_value.into()]);
+                .brif(is_hole, chain_entry, &[], shape_done, &[field_value.into()]);
             builder.seal_block(field);
             builder.switch_to_block(overflow);
             let slot_value = call_helper(
@@ -875,6 +944,21 @@ fn lower_inst(
             )?;
             builder.ins().jump(shape_done, &[slot_value.into()]);
             builder.seal_block(overflow);
+            // The prototype-method read last: a dense Array with no
+            // string-keyed own property resolves through the shared chain
+            // cell. Reached only after the own-shape probe declines (a method
+            // read), so the object loops pay no chain-probe gate.
+            builder.seal_block(chain_entry);
+            emit_chain_probe(
+                builder,
+                abi,
+                object,
+                *atom,
+                chain_entry,
+                merge,
+                fallback,
+                result,
+            );
             builder.switch_to_block(fallback);
             let res = call_helper(
                 builder,
@@ -903,15 +987,22 @@ fn lower_inst(
                 return Err(Unsupported::Step("opt:member"));
             };
             let object = arg!(0);
-            let name = builder.ins().iconst(types::I64, *atom as i64);
-            call_helper(
-                builder,
-                helpers,
-                abi,
-                abi.sig_unary,
-                Helper::GetMemberName,
-                &[object, name],
-            )?
+            // An index-like atom never reaches the chain probe: an own dense
+            // element can appear without touching `named_version`, so those
+            // reads keep the exact helper (the element paths serve them).
+            if crux::object::is_canonical_index_key(&crux::PropertyKey::String(*atom)) {
+                let name = builder.ins().iconst(types::I64, *atom as i64);
+                call_helper(
+                    builder,
+                    helpers,
+                    abi,
+                    abi.sig_unary,
+                    Helper::GetMemberName,
+                    &[object, name],
+                )?
+            } else {
+                emit_member_chain_read(builder, helpers, abi, object, *atom)?
+            }
         }
         // A lifted member store (`o.x = v`): the validated store — the
         // member-value cell probe → the narrow `set_member_slot`, falling back
@@ -1036,7 +1127,7 @@ fn lower_inst(
                 builder,
                 helpers,
                 abi,
-                abi.sig_tdz,
+                abi.sig_bool,
                 Helper::CreateFunction,
                 &[step_imm],
             )?
@@ -1050,7 +1141,7 @@ fn lower_inst(
                 builder,
                 helpers,
                 abi,
-                abi.sig_tdz,
+                abi.sig_bool,
                 Helper::CreateFunctionDecl,
                 &[step_imm],
             )?;
@@ -2860,7 +2951,7 @@ fn emit_array_push_inline(
         builder,
         helpers,
         abi,
-        abi.sig_binary,
+        abi.sig_unary,
         Helper::ArrayPush,
         &[object, value],
     )?;
@@ -3552,6 +3643,323 @@ fn emit_deferred_update_store(
         Offset32::new(std::mem::offset_of!(MemberValueCell, value) as i32),
     );
     builder.ins().jump(ok, &[]);
+}
+
+/// The compiled prototype-chain probe: a dense Array receiver that has never
+/// gained a string-keyed own property resolves its method from the shared
+/// map-keyed chain cell. `entry` is already known to be a plain object. A
+/// validated hit writes the value to `value` and jumps to `hit`; every
+/// decline jumps to `miss` (the caller's shape probe or exact helper). The
+/// cell caches the RESOLUTION (map id, link count, each link's (id,
+/// generation)), not the value: the found link's `member_value_cells` entry
+/// is re-read under its live generation, so a prototype method's value write
+/// (a no-bump warm store refreshes that cell) is observed.
+#[allow(clippy::too_many_arguments)]
+fn emit_chain_probe(
+    builder: &mut FunctionBuilder,
+    abi: &Abi,
+    object: ClifValue,
+    name: crux::AtomId,
+    entry: Block,
+    hit: Block,
+    miss: Block,
+    value: Variable,
+) {
+    let gated = builder.create_block();
+    let map_id_blk = builder.create_block();
+    let links1 = builder.create_block();
+    let link1_live = builder.create_block();
+    let after1 = builder.create_block();
+    let links2 = builder.create_block();
+    let link2_live = builder.create_block();
+    let value1 = builder.create_block();
+    let value2 = builder.create_block();
+
+    // The fast-path receiver: a dense Array that has never had a
+    // string-keyed own property installed. `array_dense` non-null pins the
+    // dense Array representation; `named_version == 0` is the layout-safe
+    // proof that no own name can shadow the chain (dense element churn never
+    // advances it).
+    builder.switch_to_block(entry);
+    let name_imm = builder.ins().iconst(types::I64, name as i64);
+    let obj_ptr = crate::cells::object_data_ptr(builder, object);
+    let dense = builder.ins().load(
+        types::I64,
+        MemFlagsData::new(),
+        obj_ptr,
+        Offset32::new(std::mem::offset_of!(crux::JsObject, array_dense) as i32),
+    );
+    let dense_ok = builder.ins().icmp_imm_u(IntCC::NotEqual, dense, 0);
+    let named_version = builder.ins().load(
+        types::I32,
+        MemFlagsData::new(),
+        obj_ptr,
+        Offset32::new(std::mem::offset_of!(crux::JsObject, named_version) as i32),
+    );
+    let clean = builder.ins().icmp_imm_u(IntCC::Equal, named_version, 0);
+    let gate = builder.ins().band(dense_ok, clean);
+    builder.ins().brif(gate, gated, &[], miss, &[]);
+    builder.seal_block(gated);
+    builder.switch_to_block(gated);
+    let map_handle = builder.ins().load(
+        types::I64,
+        MemFlagsData::new(),
+        obj_ptr,
+        Offset32::new(std::mem::offset_of!(crux::JsObject, map) as i32),
+    );
+    let has_map = builder.ins().icmp_imm_u(IntCC::NotEqual, map_handle, 0);
+    builder.ins().brif(has_map, map_id_blk, &[], miss, &[]);
+    builder.seal_block(map_id_blk);
+    // The map-keyed chain cell: `(map_id ^ name) & (MEMBER_CELLS - 1)`.
+    builder.switch_to_block(map_id_blk);
+    let map_data = builder
+        .ins()
+        .iadd_imm_s(map_handle, crux::heap::GCBOX_DATA_OFFSET as i64);
+    let map_id = builder.ins().load(
+        types::I64,
+        MemFlagsData::new(),
+        map_data,
+        Offset32::new(crux::map::MAP_ID_OFFSET as i32),
+    );
+    let chain_cells = builder.ins().load(
+        types::I64,
+        MemFlagsData::new(),
+        abi.vm,
+        Offset32::new(std::mem::offset_of!(JitCallContext, member_chain_cells) as i32),
+    );
+    let slot = builder.ins().bxor(map_id, name_imm);
+    let slot = builder.ins().band_imm_u(slot, (MEMBER_CELLS - 1) as i64);
+    let bytes = builder
+        .ins()
+        .imul_imm_s(slot, std::mem::size_of::<MemberChainCell>() as i64);
+    let cell = builder.ins().iadd(chain_cells, bytes);
+    let cell_id = builder.ins().load(
+        types::I64,
+        MemFlagsData::new(),
+        cell,
+        Offset32::new(std::mem::offset_of!(MemberChainCell, id) as i32),
+    );
+    let cell_name = builder.ins().load(
+        types::I32,
+        MemFlagsData::new(),
+        cell,
+        Offset32::new(std::mem::offset_of!(MemberChainCell, name) as i32),
+    );
+    let cell_name = builder.ins().uextend(types::I64, cell_name);
+    let id_ok = builder.ins().icmp(IntCC::Equal, cell_id, map_id);
+    let name_ok = builder.ins().icmp(IntCC::Equal, cell_name, name_imm);
+    let cell_ok = builder.ins().band(id_ok, name_ok);
+    builder.ins().brif(cell_ok, links1, &[], miss, &[]);
+    builder.seal_block(links1);
+    // The links: each cached (id, generation) is re-checked walking from the
+    // receiver's direct prototype. The link_count decides whether the found
+    // property is on the first or second link.
+    builder.switch_to_block(links1);
+    let link_count = builder.ins().load(
+        types::I8,
+        MemFlagsData::new(),
+        cell,
+        Offset32::new(std::mem::offset_of!(MemberChainCell, link_count) as i32),
+    );
+    let link_count = builder.ins().uextend(types::I64, link_count);
+    let one = builder.ins().iconst(types::I64, 1);
+    let count_is_one = builder.ins().icmp(IntCC::Equal, link_count, one);
+    let link0_off = std::mem::offset_of!(MemberChainCell, links) as i32;
+    let link0_id = builder.ins().load(
+        types::I64,
+        MemFlagsData::new(),
+        cell,
+        Offset32::new(link0_off),
+    );
+    let link0_gen = builder.ins().load(
+        types::I32,
+        MemFlagsData::new(),
+        cell,
+        Offset32::new(link0_off + 8),
+    );
+    let proto = builder.ins().load(
+        types::I64,
+        MemFlagsData::new(),
+        obj_ptr,
+        Offset32::new(std::mem::offset_of!(crux::JsObject, prototype) as i32),
+    );
+    let has_proto = builder.ins().icmp_imm_u(IntCC::NotEqual, proto, 0);
+    builder.ins().brif(has_proto, link1_live, &[], miss, &[]);
+    builder.seal_block(link1_live);
+    builder.switch_to_block(link1_live);
+    let proto_data = builder
+        .ins()
+        .iadd_imm_s(proto, crux::heap::GCBOX_DATA_OFFSET as i64);
+    let live_id1 = builder.ins().load(
+        types::I64,
+        MemFlagsData::new(),
+        proto_data,
+        Offset32::new(std::mem::offset_of!(crux::JsObject, id) as i32),
+    );
+    let live_gen1 = builder.ins().load(
+        types::I32,
+        MemFlagsData::new(),
+        proto_data,
+        Offset32::new(std::mem::offset_of!(crux::JsObject, generation) as i32),
+    );
+    let id1_ok = builder.ins().icmp(IntCC::Equal, live_id1, link0_id);
+    let gen1_ok = builder.ins().icmp(IntCC::Equal, live_gen1, link0_gen);
+    let link1_ok = builder.ins().band(id1_ok, gen1_ok);
+    builder.ins().brif(link1_ok, after1, &[], miss, &[]);
+    builder.seal_block(after1);
+    builder.switch_to_block(after1);
+    builder.ins().brif(count_is_one, value1, &[], links2, &[]);
+    builder.seal_block(value1);
+    builder.seal_block(links2);
+    builder.switch_to_block(value1);
+    emit_chain_value_read(
+        builder, abi, name_imm, live_id1, live_gen1, value, miss, hit,
+    );
+    // The second link, for a method found on the prototype of the receiver's
+    // prototype (Object.prototype members on an Array).
+    builder.switch_to_block(links2);
+    let proto2 = builder.ins().load(
+        types::I64,
+        MemFlagsData::new(),
+        proto_data,
+        Offset32::new(std::mem::offset_of!(crux::JsObject, prototype) as i32),
+    );
+    let has_proto2 = builder.ins().icmp_imm_u(IntCC::NotEqual, proto2, 0);
+    builder.ins().brif(has_proto2, link2_live, &[], miss, &[]);
+    builder.seal_block(link2_live);
+    builder.switch_to_block(link2_live);
+    let proto2_data = builder
+        .ins()
+        .iadd_imm_s(proto2, crux::heap::GCBOX_DATA_OFFSET as i64);
+    let link1_off = link0_off + std::mem::size_of::<(u64, u32)>() as i32;
+    let link1_id = builder.ins().load(
+        types::I64,
+        MemFlagsData::new(),
+        cell,
+        Offset32::new(link1_off),
+    );
+    let link1_gen = builder.ins().load(
+        types::I32,
+        MemFlagsData::new(),
+        cell,
+        Offset32::new(link1_off + 8),
+    );
+    let live_id2 = builder.ins().load(
+        types::I64,
+        MemFlagsData::new(),
+        proto2_data,
+        Offset32::new(std::mem::offset_of!(crux::JsObject, id) as i32),
+    );
+    let live_gen2 = builder.ins().load(
+        types::I32,
+        MemFlagsData::new(),
+        proto2_data,
+        Offset32::new(std::mem::offset_of!(crux::JsObject, generation) as i32),
+    );
+    let id2_ok = builder.ins().icmp(IntCC::Equal, live_id2, link1_id);
+    let gen2_ok = builder.ins().icmp(IntCC::Equal, live_gen2, link1_gen);
+    let link2_ok = builder.ins().band(id2_ok, gen2_ok);
+    builder.ins().brif(link2_ok, value2, &[], miss, &[]);
+    builder.seal_block(value2);
+    builder.switch_to_block(value2);
+    emit_chain_value_read(
+        builder, abi, name_imm, live_id2, live_gen2, value, miss, hit,
+    );
+}
+
+/// The named member read for a non-fused site: the chain probe, then the
+/// general `get_member_name` helper.
+fn emit_member_chain_read(
+    builder: &mut FunctionBuilder,
+    helpers: &JitHelpers,
+    abi: &Abi,
+    object: ClifValue,
+    name: crux::AtomId,
+) -> Result<ClifValue, Unsupported> {
+    let value = builder.declare_var(types::I64);
+    let entry = builder.create_block();
+    let slow = builder.create_block();
+    let merge = builder.create_block();
+    let obj_ok = crate::cells::is_plain_object(builder, object);
+    builder.ins().brif(obj_ok, entry, &[], slow, &[]);
+    builder.seal_block(entry);
+    emit_chain_probe(builder, abi, object, name, entry, merge, slow, value);
+    builder.seal_block(slow);
+    builder.switch_to_block(slow);
+    let name_imm = builder.ins().iconst(types::I64, name as i64);
+    let resolved = call_helper(
+        builder,
+        helpers,
+        abi,
+        abi.sig_unary,
+        Helper::GetMemberName,
+        &[object, name_imm],
+    )?;
+    builder.def_var(value, resolved);
+    builder.ins().jump(merge, &[]);
+    builder.seal_block(merge);
+    builder.switch_to_block(merge);
+    Ok(builder.use_var(value))
+}
+
+/// The chain hit's value tail: validate the found link's member value cell
+/// (id + name + live generation) and land its value in `value`; a miss jumps
+/// to `miss`.
+#[allow(clippy::too_many_arguments)]
+fn emit_chain_value_read(
+    builder: &mut FunctionBuilder,
+    abi: &Abi,
+    name_imm: ClifValue,
+    link_id: ClifValue,
+    link_gen: ClifValue,
+    value: Variable,
+    miss: Block,
+    hit: Block,
+) {
+    let cells = builder.ins().load(
+        types::I64,
+        MemFlagsData::new(),
+        abi.vm,
+        Offset32::new(std::mem::offset_of!(JitCallContext, member_value_cells) as i32),
+    );
+    let index = builder.ins().bxor(link_id, name_imm);
+    let index = builder.ins().band_imm_u(index, (MEMBER_CELLS - 1) as i64);
+    let bytes = builder
+        .ins()
+        .imul_imm_s(index, std::mem::size_of::<MemberValueCell>() as i64);
+    let cell = builder.ins().iadd(cells, bytes);
+    let id = builder.ins().load(
+        types::I64,
+        MemFlagsData::new(),
+        cell,
+        Offset32::new(std::mem::offset_of!(MemberValueCell, id) as i32),
+    );
+    let name_bits = builder.ins().load(
+        types::I32,
+        MemFlagsData::new(),
+        cell,
+        Offset32::new(std::mem::offset_of!(MemberValueCell, name) as i32),
+    );
+    let cell_gen = builder.ins().load(
+        types::I32,
+        MemFlagsData::new(),
+        cell,
+        Offset32::new(std::mem::offset_of!(MemberValueCell, generation) as i32),
+    );
+    let cell_value = builder.ins().load(
+        types::I64,
+        MemFlagsData::new(),
+        cell,
+        Offset32::new(std::mem::offset_of!(MemberValueCell, value) as i32),
+    );
+    let name_bits = builder.ins().uextend(types::I64, name_bits);
+    let id_ok = builder.ins().icmp(IntCC::Equal, id, link_id);
+    let name_ok = builder.ins().icmp(IntCC::Equal, name_bits, name_imm);
+    let gen_ok = builder.ins().icmp(IntCC::Equal, cell_gen, link_gen);
+    let ok = builder.ins().band(id_ok, name_ok);
+    let ok = builder.ins().band(ok, gen_ok);
+    builder.def_var(value, cell_value);
+    builder.ins().brif(ok, hit, &[], miss, &[]);
 }
 
 /// The opt-tier mirror of `compiler.rs::emit_shape_store_probe`: the current
