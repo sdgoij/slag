@@ -2128,7 +2128,7 @@ mod tests {
         // are replaced by the literal's elements (the array and its slot store
         // disappear). The read is only in-range-index safe, so this also pins
         // that the pass fires on the shape V8 scalar-replaces.
-        let source = "function f(n) { var s = 0; var i = 0;                       while (i < n) { var a = [i, i + 1];                         s += a[0] * a[1]; i = i + 1; }                       return s; }                       f(1000);";
+        let source = "function f(n) { var s = 0; var i = 0;                       while (i < n) { var a = [i, i + 1];                         s += a[0] * a[1] + a.length; i = i + 1; }                       return s; }                       f(1000);";
         let interp = {
             let mut agent = runtime::Agent::new();
             agent.initialize_host_defined_realm().expect("realm");

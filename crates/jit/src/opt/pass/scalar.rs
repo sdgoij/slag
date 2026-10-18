@@ -35,7 +35,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use runtime::ir::{CompiledBody, Step};
 
-use crate::opt::ir::{Block, Function, Imm, Op, Term, ValueId};
+use crate::opt::ir::{Block, Effects, Function, Imm, Op, Term, Type, ValueId};
 
 /// The reads this pass has replaced (the opt-tier tests assert the pass ran).
 pub(crate) static REPLACED: AtomicU64 = AtomicU64::new(0);
@@ -86,6 +86,9 @@ fn one_pass(func: &mut Function, body: &CompiledBody) -> bool {
     let mut subst: Vec<Option<ValueId>> = vec![None; func.value_count() as usize];
     let mut remove: Vec<ValueId> = Vec::new();
     let mut replaced_objects: HashSet<ValueId> = HashSet::new();
+    // Array `.length` reads need a fresh `Const` in the (dominating) block; the
+    // instruction cannot be inserted while the block is borrowed for the scan.
+    let mut length_reads: Vec<(u32, ValueId, usize)> = Vec::new();
     for b in 0..func.block_count() as u32 {
         for inst in &func.block(b).insts {
             let (Op::MemberGuard, Some(guard), Imm::Atom(atom)) = (inst.op, inst.result, &inst.imm)
@@ -95,18 +98,35 @@ fn one_pass(func: &mut Function, body: &CompiledBody) -> bool {
             if inst.args.len() != 2 {
                 continue;
             }
-            let Some(object) = root_of(inst.args[0], &objects, &aliases) else {
+            let Some((object, is_array)) = root_of_any(inst.args[0], &objects, &arrays, &aliases)
+            else {
                 continue;
             };
             let Some((load_object, load_atom, load)) = load_for(func, inst.args[1]) else {
                 continue;
             };
             if load_atom != *atom
-                || root_of(load_object, &objects, &aliases) != Some(object)
+                || root_of_any(load_object, &objects, &arrays, &aliases) != Some((object, is_array))
             {
                 continue;
             }
             if uses_of(func, load) != 1 {
+                continue;
+            }
+            if is_array {
+                // A fresh literal array's own `length` is the element count;
+                // any other member read (a prototype method) is not replaced.
+                if *atom != length_atom() {
+                    continue;
+                }
+                let Some(count) = arrays.get(&object).map(Vec::len) else {
+                    continue;
+                };
+                REPLACED.fetch_add(1, Ordering::Relaxed);
+                length_reads.push((b, guard, count));
+                remove.push(load);
+                remove.push(guard);
+                replaced_objects.insert(object);
                 continue;
             }
             let Some(entries) = objects.get(&object) else {
@@ -122,6 +142,12 @@ fn one_pass(func: &mut Function, body: &CompiledBody) -> bool {
             replaced_objects.insert(object);
         }
     }
+    for (block, guard, count) in length_reads {
+        subst[guard as usize] = Some(push_number_const(func, block, count as f64));
+    }
+    // The length constants are values created after `subst` was sized; the
+    // substitution chains and the rewrite index by every value id.
+    subst.resize(func.value_count() as usize, None);
     // Constant element reads of a non-escaping literal array: the literal's
     // own element is the read only for an in-range index (an out-of-range read
     // consults the prototype chain, which the pass cannot rule out).
@@ -344,16 +370,30 @@ fn escaping_literals(
     escaping
 }
 
-/// The literal a value denotes: itself, or the candidate an alias forwards.
-fn root_of(
-    value: ValueId,
-    objects: &HashMap<ValueId, Vec<(u32, ValueId)>>,
-    aliases: &HashMap<ValueId, ValueId>,
-) -> Option<ValueId> {
-    if objects.contains_key(&value) {
-        return Some(value);
-    }
-    aliases.get(&value).copied()
+/// The interned `length` atom (the array length read's key).
+fn length_atom() -> crux::AtomId {
+    use std::sync::OnceLock;
+    static LENGTH: OnceLock<crux::AtomId> = OnceLock::new();
+    *LENGTH.get_or_init(|| crux::string::intern_utf8("length"))
+}
+
+/// Materialize a Number constant at the START of `block`, so it dominates every
+/// instruction and every use the block dominates (the same region the replaced
+/// guard did).
+fn push_number_const(func: &mut Function, block: u32, value: f64) -> ValueId {
+    let result = func.push_value(Type::Number);
+    func.block_mut(block).insts.insert(
+        0,
+        crate::opt::ir::Inst {
+            op: Op::Const,
+            args: Vec::new(),
+            result: Some(result),
+            ty: Type::Number,
+            effects: Effects::pure(),
+            imm: Imm::Float(value),
+        },
+    );
+    result
 }
 
 /// The literal a value denotes and whether it is an array literal.
