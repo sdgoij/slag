@@ -1,8 +1,9 @@
 //! Scalar replacement of non-escaping object literals.
 //!
-//! A whole-literal `NewObject` (`Step::ObjectFast`) whose result is only ever
-//! read through named members is work V8 eliminates (TurboFan's escape
-//! analysis + scalar replacement). The object is fresh, its keys are static
+//! A whole-literal `NewObject` (`Step::ObjectFast`) or `NewArray`
+//! (`Step::ArrayFast`) whose result is only ever read through named members or
+//! constant element indexes is work V8 eliminates (TurboFan's escape analysis
+//! and scalar replacement). The object is fresh, its keys are static
 //! data properties, and nothing can observe it: every read can be served by
 //! the SSA value the literal stored under that key.
 //!
@@ -67,13 +68,16 @@ pub fn run(func: &mut Function, body: &CompiledBody) -> bool {
 
 fn one_pass(func: &mut Function, body: &CompiledBody) -> bool {
     let mut objects = literal_objects(func, body);
-    if objects.is_empty() {
+    let mut arrays = literal_arrays(func, body);
+    if objects.is_empty() && arrays.is_empty() {
         return false;
     }
-    let aliases = slot_aliases(func, &objects);
-    let escaping = escaping_objects(func, &objects, &aliases);
+    let roots: HashSet<ValueId> = objects.keys().chain(arrays.keys()).copied().collect();
+    let aliases = slot_aliases(func, &roots);
+    let escaping = escaping_literals(func, &objects, &arrays, &aliases);
     objects.retain(|object, _| !escaping.contains(object));
-    if objects.is_empty() {
+    arrays.retain(|array, _| !escaping.contains(array));
+    if objects.is_empty() && arrays.is_empty() {
         return false;
     }
 
@@ -118,6 +122,32 @@ fn one_pass(func: &mut Function, body: &CompiledBody) -> bool {
             replaced_objects.insert(object);
         }
     }
+    // Constant element reads of a non-escaping literal array: the literal's
+    // own element is the read only for an in-range index (an out-of-range read
+    // consults the prototype chain, which the pass cannot rule out).
+    for b in 0..func.block_count() as u32 {
+        for inst in &func.block(b).insts {
+            let (Op::ElementLoad, Some(result)) = (inst.op, inst.result) else {
+                continue;
+            };
+            if inst.args.len() != 2 {
+                continue;
+            }
+            let Some((array, true)) = root_of_any(inst.args[0], &objects, &arrays, &aliases) else {
+                continue;
+            };
+            let Some(index) = const_index(func, inst.args[1]) else {
+                continue;
+            };
+            let Some(&value) = arrays.get(&array).and_then(|values| values.get(index)) else {
+                continue;
+            };
+            REPLACED.fetch_add(1, Ordering::Relaxed);
+            subst[result as usize] = Some(value);
+            remove.push(result);
+            replaced_objects.insert(array);
+        }
+    }
     if remove.is_empty() {
         return false;
     }
@@ -150,7 +180,7 @@ fn strip_dead_literals(func: &mut Function, replaced: &HashSet<ValueId>) {
                 .insts
                 .iter()
                 .filter(|inst| {
-                    inst.op == Op::NewObject
+                    matches!(inst.op, Op::NewObject | Op::NewArray)
                         && inst
                             .result
                             .is_some_and(|result| replaced.contains(&result) && uses_of(func, result) == 0)
@@ -202,15 +232,36 @@ fn literal_objects(func: &Function, body: &CompiledBody) -> HashMap<ValueId, Vec
     objects
 }
 
+/// The whole-literal arrays this pass may replace: value -> element values in
+/// index order. `Imm::Int(step)` points at the `ArrayFast` count.
+fn literal_arrays(func: &Function, body: &CompiledBody) -> HashMap<ValueId, Vec<ValueId>> {
+    let mut arrays = HashMap::new();
+    for b in 0..func.block_count() as u32 {
+        for inst in &func.block(b).insts {
+            let (Op::NewArray, Some(result)) = (inst.op, inst.result) else {
+                continue;
+            };
+            let Imm::Int(step) = &inst.imm else {
+                continue;
+            };
+            let Some(Step::ArrayFast { count }) = body.steps.get(*step as usize) else {
+                continue;
+            };
+            if *count as usize != inst.args.len() {
+                continue;
+            }
+            arrays.insert(result, inst.args.clone());
+        }
+    }
+    arrays
+}
+
 /// Values that alias a candidate through a private frame slot: a `FrameLoad`
 /// after a `FrameStore` of the object, within one block and with no
 /// slot-writing effect in between (a call may observe the slot through a
 /// closure created earlier only if it was captured, which makes it a context
 /// slot, not a frame slot  -  so a read here is the stored value).
-fn slot_aliases(
-    func: &Function,
-    objects: &HashMap<ValueId, Vec<(u32, ValueId)>>,
-) -> HashMap<ValueId, ValueId> {
+fn slot_aliases(func: &Function, roots: &HashSet<ValueId>) -> HashMap<ValueId, ValueId> {
     let mut aliases: HashMap<ValueId, ValueId> = HashMap::new();
     for b in 0..func.block_count() as u32 {
         let mut slot_value: HashMap<u32, ValueId> = HashMap::new();
@@ -224,7 +275,7 @@ fn slot_aliases(
                 Op::FrameStore => {
                     let Imm::Slot(slot) = inst.imm else { continue };
                     match inst.args.first().copied() {
-                        Some(value) if objects.contains_key(&value) => {
+                        Some(value) if roots.contains(&value) => {
                             slot_value.insert(slot, value);
                         }
                         _ => {
@@ -251,14 +302,15 @@ fn slot_aliases(
 /// read. A candidate used for anything else (a call argument, a second
 /// literal's field value, a return) escapes and is left alone; the pass is
 /// per-object, so one escaping literal does not disable the others.
-fn escaping_objects(
+fn escaping_literals(
     func: &Function,
     objects: &HashMap<ValueId, Vec<(u32, ValueId)>>,
+    arrays: &HashMap<ValueId, Vec<ValueId>>,
     aliases: &HashMap<ValueId, ValueId>,
 ) -> HashSet<ValueId> {
     let mut escaping: HashSet<ValueId> = HashSet::new();
     let mut value_root: HashMap<ValueId, ValueId> = HashMap::new();
-    for &object in objects.keys() {
+    for &object in objects.keys().chain(arrays.keys()) {
         value_root.insert(object, object);
     }
     for (&alias, &object) in aliases {
@@ -275,6 +327,7 @@ fn escaping_objects(
                     Op::FrameStore => inst.args.first() == Some(&arg),
                     Op::MemberCellLoad => inst.args.len() == 1 && inst.args[0] == arg,
                     Op::MemberGuard => inst.args.len() == 2 && inst.args[0] == arg,
+                    Op::ElementLoad => inst.args.len() == 2 && inst.args[0] == arg,
                     _ => false,
                 };
                 if !allowed {
@@ -291,7 +344,7 @@ fn escaping_objects(
     escaping
 }
 
-/// The object a value denotes: itself, or the candidate an alias forwards.
+/// The literal a value denotes: itself, or the candidate an alias forwards.
 fn root_of(
     value: ValueId,
     objects: &HashMap<ValueId, Vec<(u32, ValueId)>>,
@@ -301,6 +354,46 @@ fn root_of(
         return Some(value);
     }
     aliases.get(&value).copied()
+}
+
+/// The literal a value denotes and whether it is an array literal.
+fn root_of_any(
+    value: ValueId,
+    objects: &HashMap<ValueId, Vec<(u32, ValueId)>>,
+    arrays: &HashMap<ValueId, Vec<ValueId>>,
+    aliases: &HashMap<ValueId, ValueId>,
+) -> Option<(ValueId, bool)> {
+    if objects.contains_key(&value) {
+        return Some((value, false));
+    }
+    if arrays.contains_key(&value) {
+        return Some((value, true));
+    }
+    aliases
+        .get(&value)
+        .map(|&root| (root, arrays.contains_key(&root)))
+}
+
+/// The element index a key value denotes, when it is a non-negative integer
+/// constant. Anything else (a runtime key, a negative/fractional number, a
+/// string) bails: an out-of-range or non-index read consults the prototype
+/// chain.
+fn const_index(func: &Function, value: ValueId) -> Option<usize> {
+    for b in 0..func.block_count() as u32 {
+        for inst in &func.block(b).insts {
+            if inst.result != Some(value) || inst.op != Op::Const {
+                continue;
+            }
+            return match &inst.imm {
+                Imm::Int(n) if *n >= 0 => Some(*n as usize),
+                Imm::Float(n) if *n >= 0.0 && n.fract() == 0.0 && *n <= usize::MAX as f64 => {
+                    Some(*n as usize)
+                }
+                _ => None,
+            };
+        }
+    }
+    None
 }
 
 /// The `MemberCellLoad` that produced `value`, with its atom and object.

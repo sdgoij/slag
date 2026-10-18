@@ -2123,6 +2123,29 @@ mod tests {
     }
 
     #[test]
+    fn opt_tier_scalar_replaces_a_literal_array() {
+        // The array analogue: constant element reads of a whole-literal array
+        // are replaced by the literal's elements (the array and its slot store
+        // disappear). The read is only in-range-index safe, so this also pins
+        // that the pass fires on the shape V8 scalar-replaces.
+        let source = "function f(n) { var s = 0; var i = 0;                       while (i < n) { var a = [i, i + 1];                         s += a[0] * a[1]; i = i + 1; }                       return s; }                       f(1000);";
+        let interp = {
+            let mut agent = runtime::Agent::new();
+            agent.initialize_host_defined_realm().expect("realm");
+            agent.run_script(source).expect("interp runs")
+        };
+        let before = crate::opt::pass::scalar::REPLACED.load(Ordering::Relaxed);
+        let (value, compiled) = with_opt_jit_agent(|agent| agent.run_script(source).expect("runs"));
+        let replaced = crate::opt::pass::scalar::REPLACED.load(Ordering::Relaxed) - before;
+        assert_eq!(
+            value, interp,
+            "the optimizing tier must match the interpreter"
+        );
+        assert!(compiled >= 1, "{compiled} bodies compiled");
+        assert!(replaced >= 1, "the scalar pass replaced {replaced} reads");
+    }
+
+    #[test]
     fn opt_tier_scalar_replaces_a_destructured_literal() {
         // A whole-literal object read back through named members is scalar
         // replaced in the optimizing tier (the allocation and its slot store
