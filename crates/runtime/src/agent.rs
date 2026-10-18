@@ -1015,6 +1015,8 @@ pub struct Agent {
     /// otherwise every entry's iterated array stays a root forever.
     pub array_iter_data:
         std::cell::RefCell<std::collections::HashMap<u64, (Value, usize, u32, crux::heap::GcAny)>>,
+    pub promise_addrs: std::cell::RefCell<std::collections::HashMap<u64, crux::heap::GcAny>>,
+    pending_dead_promises: std::cell::RefCell<Vec<u64>>,
     /// The `Array.fromAsync` continuation states, keyed by handler-function
     /// identity (spec 23.1.2.4.1); the bool selects the reject handler.
     pub array_from_async: std::collections::HashMap<
@@ -1471,6 +1473,8 @@ impl Agent {
             pending_cleanup_jobs: std::cell::RefCell::new(Vec::new()),
             finalization_registries: std::collections::HashMap::new(),
             array_iter_data: std::cell::RefCell::new(std::collections::HashMap::new()),
+            promise_addrs: std::cell::RefCell::new(std::collections::HashMap::new()),
+            pending_dead_promises: std::cell::RefCell::new(Vec::new()),
             array_from_async: std::collections::HashMap::new(),
             wait_async: std::collections::HashMap::new(),
             buffer_data: std::collections::HashMap::new(),
@@ -1979,6 +1983,7 @@ impl Agent {
             // entry and collection trigger).
             self.reap_dead_functions();
             self.reap_dead_wrappers();
+            self.reap_dead_promises();
             let realm = self.current_realm()?;
             let script = if jsx {
                 crate::script::parse_script_jsx(source, realm, name)?
@@ -2448,13 +2453,36 @@ impl Agent {
                     // SAFETY: as above.
                     && unsafe { (&*agent).array_iter_data.try_borrow().is_ok_and(|map| !map.is_empty()) }
             });
-        if has_iterators {
+        // Every promise ever constructed has an entry in `promise_addrs`, and
+        // `promises` (traced) retains each settled promise's result and
+        // reactions until the id is reaped.
+        let has_promise_addrs = self
+            .promise_addrs
+            .try_borrow()
+            .is_ok_and(|map| !map.is_empty())
+            || live.iter().any(|&agent| {
+                agent != self_ptr
+                    // SAFETY: as above.
+                    && unsafe { (&*agent).promise_addrs.try_borrow().is_ok_and(|map| !map.is_empty()) }
+            });
+        if has_iterators || has_promise_addrs {
             swept_addrs.sort_unstable();
+        }
+        if has_iterators {
             self.reap_dead_iterators(&swept_addrs);
             for &agent in &live {
                 if agent != self_ptr {
                     // SAFETY: as above.
                     unsafe { (&*agent).reap_dead_iterators(&swept_addrs) };
+                }
+            }
+        }
+        if has_promise_addrs {
+            self.reap_promise_addrs(&swept_addrs);
+            for &agent in &live {
+                if agent != self_ptr {
+                    // SAFETY: as above.
+                    unsafe { (&*agent).reap_promise_addrs(&swept_addrs) };
                 }
             }
         }
@@ -2657,6 +2685,10 @@ impl Agent {
             self.clear_derived_caches();
             self.collect_garbage();
         }
+        // Drain the promise ids the sweep reclaimed. The entry's traced
+        // `PromiseData` holds the settled result and its reactions, which is
+        // the bulk of a long-lived promise's retained graph.
+        self.reap_dead_promises();
         // After the collections, so a host's heap-limit callback is not fired
         // for a heap a collection just brought back under the limit.
         self.check_heap_limit();
@@ -2710,6 +2742,10 @@ impl Agent {
             return;
         }
         for id in dead {
+            // A resolver record is keyed by the function's id and outlives the
+            // function by one collection; release it here so the table does
+            // not accumulate stale records.
+            self.promise_resolvers.remove(&id);
             if self.ecma_functions.remove(&id).is_none() {
                 continue;
             }
@@ -2739,6 +2775,33 @@ impl Agent {
             self.number_data.remove(&id);
             self.boolean_data.remove(&id);
             self.bigint_data.remove(&id);
+        }
+    }
+
+    fn reap_promise_addrs(&self, dead: &[usize]) {
+        if dead.is_empty() {
+            return;
+        }
+        let Ok(mut pending) = self.pending_dead_promises.try_borrow_mut() else {
+            return;
+        };
+        let Ok(mut addrs) = self.promise_addrs.try_borrow_mut() else {
+            return;
+        };
+        addrs.retain(|id, addr| {
+            if dead.binary_search(&addr.addr()).is_ok() {
+                pending.push(*id);
+                false
+            } else {
+                true
+            }
+        });
+    }
+
+    fn reap_dead_promises(&mut self) {
+        let ids = std::mem::take(&mut *self.pending_dead_promises.borrow_mut());
+        for id in ids {
+            self.promises.remove(&id);
         }
     }
 

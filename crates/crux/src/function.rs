@@ -222,6 +222,15 @@ pub struct Function {
     /// source string - alive for that extra collection, promoting them to the
     /// old generation where only a major could reclaim them.
     environment: Cell<Option<crate::heap::GcAny>>,
+    /// The [[Promise]] edge of a promise resolving function (spec 27.2.1.3.1),
+    /// as an erased heap edge. The runtime's resolver record holds the typed
+    /// value and does not trace it: a record is an Agent root and outlives its
+    /// function by one collection, so an edge on the record kept a dead
+    /// function's promise (with its settled value and reactions) alive for that
+    /// extra collection, promoting it to the old generation where only a major
+    /// could reclaim it. The edge lives here so it disappears in the same
+    /// collection that frees the function.
+    resolving_promise: Cell<Option<crate::heap::GcAny>>,
 }
 
 impl Trace for Function {
@@ -236,6 +245,11 @@ impl Trace for Function {
         // edge is on the closure rather than on the record (see the field).
         if let Some(environment) = self.environment.get() {
             visit(environment);
+        }
+        // A resolving function's [[Promise]] is reachable exactly while the
+        // function is (see the field).
+        if let Some(promise) = self.resolving_promise.get() {
+            visit(promise);
         }
         // A bound function's target, bound `this`, and bound argument list
         // are Values — heap edges (GC-2; a swept target turned `extends`
@@ -295,6 +309,11 @@ impl Function {
         self.environment.set(environment);
     }
 
+    /// Attach the promise a resolving function settles (see the field).
+    pub fn set_resolving_promise(&self, promise: crate::heap::GcAny) {
+        self.resolving_promise.set(Some(promise));
+    }
+
     /// A bare ECMAScript function value: identity and name only, used until
     /// the Phase 7 evaluator fills in the callable body. The object starts
     /// with a null prototype.
@@ -318,6 +337,7 @@ impl Function {
             kind: FunctionKind::EcmaScript,
             self_handle: Cell::new(None),
             environment: Cell::new(None),
+            resolving_promise: Cell::new(None),
         });
         function.self_handle.set(Some(function));
         function.object.function_self.set(Some(function));
@@ -355,6 +375,7 @@ impl Function {
             },
             self_handle: Cell::new(None),
             environment: Cell::new(None),
+            resolving_promise: Cell::new(None),
         });
         Self::link_self_handle(&function);
         function.object.function_self.set(Some(function));
@@ -411,6 +432,7 @@ impl Function {
             },
             self_handle: Cell::new(None),
             environment: Cell::new(None),
+            resolving_promise: Cell::new(None),
         });
         Self::link_self_handle(&function);
         function.object.function_self.set(Some(function));

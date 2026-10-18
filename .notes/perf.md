@@ -13389,3 +13389,42 @@ Measured (same binary, `SLAG_SCALAR=0` vs on, 5 interleaved rounds): `objects/de
 The fix stores the iterator's box address in the entry and, after each sweep, drops the entries whose iterator box the sweep reclaimed. The swept list is the **conservative** mark's result, so an iterator held only in a Rust stack local (the stack scan's job) is never pruned; the iterated array was marked live through the map in that cycle and is reclaimed on the next. The sweep's address list is arena order, not sorted, so it is sorted before the binary-search membership test — only when an iterator table is non-empty, which keeps the no-iterator collection free of the work.
 
 Measured (release, 100k iterations per row): `[i,i+1].values()` **3177 → 39.4 ms (80x)**; array destructuring **5191 → 161.5 ms (32x)**; the hoisted-receiver iterator **164 → 14.5 ms**; `live` after the run **203k → 9.3k**, minor pause **15.7 ms → 0.17 ms**. Full test262 stays at baseline (`all` 48,633 + `intl402` 3,365, 0 fail/crash/hang/skip); workspace tests and clippy clean.
+
+## Promise records are reaped with their promise (2026-10-18)
+
+`agent.promises` is the side table holding each promise's [[PromiseState]] —
+the settled value and its reaction lists (spec 27.2.1.3). It had no eviction:
+every promise ever created left an entry whose traced state rooted the settled
+value, and the `promise_resolvers` record held the promise as a strong edge, so
+an unreachable promise box could never be swept. A churn loop of 100k
+`Promise.resolve({x:i})` ended with `promises=100000`, `live=209,232`, and
+minor pauses averaging **15.8 ms**; the table's trace grew with the number of
+promises ever created, so repeated runs in one context degraded (the corpus
+harness ran the same 100k loop five times; its fastest call was still 25 s).
+
+Three changes:
+
+- `promise_addrs` (id → box address) lets the sweep identify the promise boxes
+  it reclaimed, the same shape as `array_iter_data`; the dead ids are queued
+  and drained into `promises` at the next collection trigger and script entry.
+- `reap_dead_functions` also drops the dead function's `promise_resolvers`
+  entry.
+- The resolver record no longer traces its [[Promise]]: the edge lives on the
+  **resolver function box** (`Function::resolving_promise`). This is the part
+  that mattered. A record outlives its function by one collection (its id only
+  reaches the death queue at the sweep that frees the function), so an edge on
+  the record marked the promise in that same collection, promoted it to the old
+  generation, and left it for the next major. With the edge on the function box
+  the promise dies in the collection that frees the resolver — the same
+  placement the closure [[Environment]] edge already uses.
+
+Measured (release, 100k `Promise.resolve({x:i})`, direct run with `--gc-trace`):
+minor pause average **15,838 → 865 µs** (max 34,465 → 1,038 µs), `swept`
+900,001 → 1,099,905 over the same 100 collections, wall clock 5.57 → 3.75 s.
+The corpus `prom` row (five calls per binary, best per-call time) went
+**25,080.75 → 3,198.72 ms (7.8x)**. A resolver kept alive in a global still
+keeps its promise alive, as it must: a `--gc-stress` probe that drops the
+promise and resolves it after 20k allocations exits cleanly.
+
+Full test262 stays at baseline: `all` 48,633 + `intl402` 3,365, 0
+fail/crash/hang/skip. Workspace tests and clippy clean.

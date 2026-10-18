@@ -144,8 +144,13 @@ pub struct ResolverData {
 }
 
 impl Trace for ResolverData {
-    fn trace(&self, visit: &mut dyn FnMut(GcAny)) {
-        self.promise.trace(visit);
+    fn trace(&self, _visit: &mut dyn FnMut(GcAny)) {
+        // The [[Promise]] edge lives on the resolver function box, not on this
+        // record: a record outlives its function by one collection (its id
+        // only reaches the death queue at the sweep that frees the function),
+        // so tracing here kept every dead promise alive for that extra
+        // collection and promoted it to the old generation. See
+        // `Function::resolving_promise`.
     }
 }
 
@@ -318,6 +323,9 @@ pub fn create_resolving_functions(agent: &mut Agent, promise: &Value) -> (Value,
             function_proto,
         )
         .expect("builtin creation cannot fail");
+        if let Some(promise) = crate::agent::value_box_addr(promise) {
+            resolver.set_resolving_promise(promise);
+        }
         agent.promise_resolvers.insert(
             resolver.id(),
             Rc::new(RefCell::new(ResolverData {

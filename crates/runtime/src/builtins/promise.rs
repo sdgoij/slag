@@ -514,6 +514,10 @@ fn promise_constructor(
             is_handled: false,
         }),
     );
+    agent
+        .promise_addrs
+        .borrow_mut()
+        .insert(promise.id(), promise.as_any());
     // The context's init hook runs once the promise exists, which is where V8
     // fires it from the constructor and capability paths.
     crate::promise::run_promise_hook(
@@ -1705,6 +1709,32 @@ mod tests {
 
     fn run(source: &str) -> Result<Value, JsError> {
         evaluate(source)
+    }
+
+    /// A dropped promise is reclaimed. Its record holds the settled value and
+    /// the reaction lists, so a churn loop that never reaped them grew without
+    /// bound; the [[Promise]] edge on the resolver function (not the resolver
+    /// record) is what keeps a promise alive, so both die in the collection
+    /// that frees the resolver.
+    #[test]
+    fn dropped_promises_are_reaped() {
+        let mut agent = Agent::new();
+        agent.initialize_host_defined_realm().unwrap();
+        agent.set_nursery_threshold(1024);
+        agent
+            .run_script("for (var i = 0; i < 4000; i++) { Promise.resolve({ x: i }); }")
+            .unwrap();
+        // The second script entry reaps the resolver records (their functions
+        // died at the last sweep); the major sweeps the promises, and the
+        // third entry drains the ids it queued into the promise table.
+        agent.run_script("0").unwrap();
+        agent.collect_garbage();
+        agent.run_script("0").unwrap();
+        assert!(
+            agent.promises.len() < 500,
+            "{} promise records survived the churn",
+            agent.promises.len()
+        );
     }
 
     /// Evaluate a script whose final expression is a promise, then drain the
