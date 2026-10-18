@@ -47,7 +47,42 @@ pub type SetEntry = Option<Value>;
 /// between distinct keys is resolved by the caller's exact SameValue check
 /// on the slot (with a linear-scan fallback), so the index is a pure
 /// accelerator over the tombstoned `entries` List.
-pub type KeyedIndex = std::collections::HashMap<u64, usize>;
+pub type KeyedIndex =
+    std::collections::HashMap<u64, usize, std::hash::BuildHasherDefault<MixHasher>>;
+
+/// A cheap avalanche hasher for the already-64-bit key words of
+/// [`KeyedIndex`]. Std's SipHash costs ~20ns per Map/Set operation for no
+/// distribution benefit (the word is already a hash), but the raw word cannot
+/// be used directly: a small integer's f64 bit pattern has all-zero low bits,
+/// so identity hashing would cluster every numeric key into one bucket.
+/// splitmix64's finalizer is a handful of instructions and spreads both.
+#[derive(Default)]
+pub struct MixHasher(u64);
+
+impl std::hash::Hasher for MixHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+    fn write(&mut self, bytes: &[u8]) {
+        let mut buf = [0u8; 8];
+        for (dst, src) in buf.iter_mut().zip(bytes) {
+            *dst = *src;
+        }
+        self.write_u64(u64::from_ne_bytes(buf));
+    }
+    fn write_u64(&mut self, i: u64) {
+        let mut z = i.wrapping_add(0x9e37_79b9_7f4a_7c15);
+        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        self.0 = z ^ (z >> 31);
+    }
+    fn write_u32(&mut self, i: u32) {
+        self.write_u64(i as u64);
+    }
+    fn write_usize(&mut self, i: usize) {
+        self.write_u64(i as u64);
+    }
+}
 
 /// The [[MapData]] List of a Map instance (spec 24.1.1; `None` is a deleted
 /// ~empty~ slot kept so suspended iterators keep working) plus its key

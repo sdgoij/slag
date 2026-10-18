@@ -336,7 +336,7 @@ impl crate::agent::MapCollection {
     pub(crate) fn from_entries(entries: Vec<MapEntry>) -> Self {
         let mut collection = crate::agent::MapCollection {
             entries,
-            index: std::collections::HashMap::new(),
+            index: Default::default(),
             collided: false,
         };
         collection.rebuild_index();
@@ -434,7 +434,7 @@ impl crate::agent::SetCollection {
     pub(crate) fn from_entries(entries: Vec<SetEntry>) -> Self {
         let mut collection = crate::agent::SetCollection {
             entries,
-            index: std::collections::HashMap::new(),
+            index: Default::default(),
             collided: false,
         };
         collection.rebuild_index();

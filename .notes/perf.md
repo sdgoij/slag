@@ -13758,3 +13758,22 @@ Bodies containing `NewClosure`/`FunctionDecl` are declined explicitly by
 prototype-method-call shape a closure exposes measures 3.4 ms per-step against
 9.0 ms in the opt tier (`opcost/proto_method_call`). The call lane is the
 suspect; the decline keeps that regression out until it is fixed.
+
+## Map/Set key index drops SipHash (2026-10-18)
+
+`KeyedIndex` — the Map/Set collection key word -> entry slot index — was a
+plain `HashMap<u64, usize>`, so every `has`/`get`/`set`/`add` re-hashed an
+already-hashed 64-bit word through std's SipHash. The index now uses
+`BuildHasherDefault<MixHasher>` (a splitmix64 finalizer). Plain identity
+hashing would be wrong here: a small integer's f64 bit pattern has all-zero
+low bits, so every numeric key would land in one bucket; the mixer is a few
+instructions and still spreads them.
+
+Measured with a same-session baseline: `builtins/map_churn` 40.8 -> 36.4-39.2
+ms and `builtins/set_churn` 58.9 -> 53.5 ms (the thermal noise this session is
+comparable to the win, so treat it as ~9%).
+
+The same probes show the allocation path is NOT the bottleneck for the churn
+rows: `opcost/object_alloc` runs 100k `({ a: 1 }).a` iterations in 0.33 ms
+(~3.3 ns per allocation). The remaining gap on `construct_churn` and
+`spread_assign` is the call/builtin lane, not GC.
