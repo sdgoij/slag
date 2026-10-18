@@ -2123,6 +2123,30 @@ mod tests {
     }
 
     #[test]
+    fn opt_tier_scalar_replaces_a_destructured_literal() {
+        // A whole-literal object read back through named members is scalar
+        // replaced in the optimizing tier (the allocation and its slot store
+        // disappear). The tier must agree with the interpreter, and the pass
+        // must actually fire -- a refactor that loses the pattern would leave
+        // this row 20x slower while staying correct.
+        let source = "function f(n) { var s = 0; var i = 0;                       while (i < n) { var o = { a: i, b: i + 1 };                         s += o.a + o.b; i = i + 1; }                       return s; }                       f(1000);";
+        let interp = {
+            let mut agent = runtime::Agent::new();
+            agent.initialize_host_defined_realm().expect("realm");
+            agent.run_script(source).expect("interp runs")
+        };
+        let before = crate::opt::pass::scalar::REPLACED.load(Ordering::Relaxed);
+        let (value, compiled) = with_opt_jit_agent(|agent| agent.run_script(source).expect("runs"));
+        let replaced = crate::opt::pass::scalar::REPLACED.load(Ordering::Relaxed) - before;
+        assert_eq!(
+            value, interp,
+            "the optimizing tier must match the interpreter"
+        );
+        assert!(compiled >= 1, "{compiled} bodies compiled");
+        assert!(replaced >= 1, "the scalar pass replaced {replaced} reads");
+    }
+
+    #[test]
     fn opt_tier_call_body_matches_the_interpreter() {
         // I5c-0: a body with a `CallFast` now lifts to `Op::Call` and lowers
         // through the general `call_slow` helper, so a calling body enters the

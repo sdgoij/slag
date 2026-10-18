@@ -37,6 +37,7 @@ pub mod licm;
 pub mod loop_counter;
 pub mod mem2reg;
 pub mod narrow;
+pub mod scalar;
 
 /// Whether the read-guard pruning pass runs. On by default; `SLAG_GUARD=0`
 /// disables it — the same-binary seam for measuring the pass's marginal effect
@@ -60,6 +61,7 @@ fn mem2reg_enabled() -> bool {
 /// lifted IR (I5c-2c); an empty map makes the inline pass a no-op.
 pub fn run(
     func: &mut Function,
+    body: Option<&runtime::ir::CompiledBody>,
     sites: &[Option<inline::InlineSite>],
     resolve: &mut dyn FnMut(u64) -> Option<inline::Callee>,
 ) -> bool {
@@ -70,6 +72,7 @@ pub fn run(
     let inlined = inline::run(func, sites, resolve);
     let cse = cse::run(func);
     let licm = licm::run(func);
+    let scalarized = body.is_some_and(|body| scalar::run(func, body));
     let dropped = dce::run(func);
     let counted = loop_counter::run(func);
     let retyped = normalize_param_types(func);
@@ -80,6 +83,7 @@ pub fn run(
         || inlined
         || cse
         || licm
+        || scalarized
         || dropped
         || counted
         || retyped
@@ -277,11 +281,11 @@ mod tests {
             b.term(entry, Term::Return(Some(sum)));
         }
         assert!(
-            run(&mut func, &[], &mut |_: u64| None),
+            run(&mut func, None, &[], &mut |_: u64| None),
             "the first round folds `1 + 2`"
         );
         assert!(
-            !run(&mut func, &[], &mut |_: u64| None),
+            !run(&mut func, None, &[], &mut |_: u64| None),
             "the second round finds nothing"
         );
     }

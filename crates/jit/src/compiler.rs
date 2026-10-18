@@ -190,7 +190,7 @@ impl JitEngine {
                         lifted.insert(id, resolved.clone());
                         resolved
                     };
-                    crate::opt::pass::run(&mut ir, &sites, &mut resolve);
+                    crate::opt::pass::run(&mut ir, Some(body), &sites, &mut resolve);
                     if std::env::var("JIT_DUMP_IR").is_ok() {
                         eprintln!("--- IR ---\n{}", crate::opt::print::dump(&ir));
                     }

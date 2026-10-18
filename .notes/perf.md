@@ -13368,3 +13368,16 @@ The fix is to A/B the **same binary** with the feature's env toggled (`SLAG_TYPE
 So the rule: **a pre/post *binary* pair measures a build (layout included); an env-toggle on one binary measures the *feature*.** Use the latter whenever the change is switchable.
 
 The typer's real effect is per-shape, and the tier micro-rows (direct A/B, same binary, min-of-11) show it: `read_loop` **0.939x**, `read_loop_nonleaf` **0.954x**, `read_bare` 1.002x, `arith_loop` 1.007x, `licm_loop` 1.012x — ~5–6% on read loops, neutral where a read feeds no arithmetic. Net on the corpus: a wash. So default-on is a trade (read loops gain, corpus flat), not a win; it is kept on because the win is reproducible and the cost is under the instrument's floor.
+
+## Scalar replacement of non-escaping object literals (2026-10-18)
+
+`objects/destructure` was the corpus's worst gap (112 ms vs node's 0.8 ms) and, unlike the other large rows, a single mechanism: the census showed **14,000,000 `ObjectFast` calls** (two per iteration) and only four `GetMemberName` calls — the entire time was object construction. A Slag `JsObject` is 408 bytes; V8 scalar-replaces the literal away entirely.
+
+`opt/pass/scalar.rs` (default on, `SLAG_SCALAR=0` is the same-binary seam) replaces a `NewObject`'s named reads with the SSA values the literal stored. It is per-object and conservative: a use that is not a `FrameStore`, a `FrameLoad` forwarding, or a `MemberCellLoad`/`MemberGuard` pair bails that literal; each load must feed exactly one guard of the same object and atom; the atom must have a literal value. `ObjectFast` already guarantees static, unique, non-`__proto__` data keys, so an own data read cannot be an accessor or a shadowed key.
+
+Two traps cost the debugging time:
+
+- **A private frame slot is not clobbered by a call.** The first version cleared the slot-forwarding map on any instruction with `Slots` effects. The guard itself has `Effects::call()`, so the second read of the same local lost its alias and only one of three reads was replaced. A call cannot reach this invocation's frame slot (a captured binding is a context slot; a certified body has no `eval`/`with`), so only a `FrameStore` to the slot invalidates it.
+- **DCE keeps `NewObject`.** `Op::NewObject`'s effects are not pure (allocation drives the carrier/GC bookkeeping), so an unused allocation survives dead-code elimination. The pass removes unused literals explicitly, and iterates: replacing the outer literal exposes the inner one it held, whose slot store then forwards and which is replaced on the next round.
+
+Measured (same binary, `SLAG_SCALAR=0` vs on, 5 interleaved rounds): `objects/destructure` **111.45 → 4.98 ms (22.4x)**, `ObjectFast` 14M → 0. The rest of the corpus is a wash (same-binary medians ~1.0; the two-binary run's 0.83–0.93 outliers are the documented layout/noise floor). Full test262 stays at baseline: `all` 48,633 and `intl402` 3,365, 0 fail / 0 crash / 0 hang / 0 skip.
