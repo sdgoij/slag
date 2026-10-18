@@ -809,15 +809,7 @@ fn setter_that_ignores_prototype_properties(
 
 /// CreateIterResultObject (spec 8.4.11).
 fn iterator_result(agent: &Agent, value: Value, done: bool) -> Result<Value, JsError> {
-    let object_proto = agent
-        .current_realm()
-        .ok()
-        .and_then(|realm| realm.intrinsics.get("%Object.prototype%"))
-        .and_then(|value| as_object(&value));
-    let object = JsObject::ordinary_object_create(object_proto);
-    object.create_data_property(&JsString::from_utf8("value"), value)?;
-    object.create_data_property(&JsString::from_utf8("done"), Value::Boolean(done))?;
-    Ok(Value::Object(object))
+    crate::context::create_iter_result_object(agent, value, done).map(Value::Object)
 }
 
 /// GetIteratorDirect (spec 7.4.1): `this` must be an object with a callable

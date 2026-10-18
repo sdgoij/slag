@@ -2580,15 +2580,7 @@ fn with(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsErro
 
 /// CreateIterResultObject (spec 7.3.17).
 fn iter_result(agent: &Agent, value: Value, done: bool) -> Result<Value, JsError> {
-    let proto = agent
-        .current_realm()?
-        .intrinsics
-        .get("%Object.prototype%")
-        .and_then(|v| as_object(&v));
-    let result = JsObject::ordinary_object_create(proto);
-    result.create_data_property(&JsString::from_utf8("value"), value)?;
-    result.create_data_property(&JsString::from_utf8("done"), Value::Boolean(done))?;
-    Ok(Value::Object(result))
+    crate::context::create_iter_result_object(agent, value, done).map(Value::Object)
 }
 
 /// spec 23.1.5.2.1 ArrayIterator.prototype.next.

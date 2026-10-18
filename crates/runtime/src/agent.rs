@@ -1126,6 +1126,13 @@ pub struct Agent {
     /// a collection between creates cannot free the shape (`function.rs`
     /// `function_boilerplate_map`).
     pub(crate) function_boilerplate_maps: [Option<crux::Handle<crux::Map>>; 2],
+    /// CreateIterResultObject's cached `{value, done}` shape and the realm it
+    /// was forked in (a realm switch refork). The two sequential
+    /// `create_data_property` calls it replaces cost ~100-140 ns each on a
+    /// fresh object; a generator `next()` spent ~160 ns there. Both handles
+    /// are traced below.
+    pub(crate) iter_result_realm: std::cell::Cell<Option<Handle<Realm>>>,
+    pub(crate) iter_result_map: std::cell::Cell<Option<crux::Handle<crux::Map>>>,
     /// The host's collection observers, in registration order
     /// (`crux::heap::GcObserver`). Taken out for the duration of a collection
     /// so one that runs host code cannot re-enter this list — a nested
@@ -1332,6 +1339,8 @@ impl Agent {
             construct_property_patterns: Box::new(std::array::from_fn(|_| None)),
             construct_maps: Box::new(std::array::from_fn(|_| None)),
             function_boilerplate_maps: [None; 2],
+            iter_result_realm: std::cell::Cell::new(None),
+            iter_result_map: std::cell::Cell::new(None),
             collection_observers: RefCell::new(Vec::new()),
             microtask_queues: Vec::new(),
             vm_pool: Vec::new(),
@@ -2054,6 +2063,12 @@ impl Agent {
         }
         // Cut 73: the cached ordinary-function boilerplate shapes.
         for map in self.function_boilerplate_maps.iter().flatten() {
+            map.trace(visit);
+        }
+        if let Some(realm) = self.iter_result_realm.get() {
+            realm.trace(visit);
+        }
+        if let Some(map) = self.iter_result_map.get() {
             map.trace(visit);
         }
         for vm in &self.vm_pool {

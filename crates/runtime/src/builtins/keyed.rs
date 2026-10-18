@@ -610,15 +610,7 @@ pub(crate) fn can_be_held_weakly(agent: &Agent, value: &Value) -> bool {
 
 /// A CreateIteratorResultObject (spec 7.4.7.2).
 fn iter_result(agent: &Agent, value: Value, done: bool) -> Result<Value, JsError> {
-    let proto = agent
-        .current_realm()?
-        .intrinsics
-        .get("%Object.prototype%")
-        .and_then(|v| as_object(&v));
-    let result = JsObject::ordinary_object_create(proto);
-    result.create_data_property(&JsString::from_utf8("value"), value)?;
-    result.create_data_property(&JsString::from_utf8("done"), Value::Boolean(done))?;
-    Ok(Value::Object(result))
+    crate::context::create_iter_result_object(agent, value, done).map(Value::Object)
 }
 
 /// Map.prototype.set (spec 24.1.3.11): update in place or append.

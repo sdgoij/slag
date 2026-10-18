@@ -715,17 +715,7 @@ fn finish_resume(
 
 /// The iterator-result object `{ value, done }` (spec 27.4.3.2 step 11).
 fn iterator_result(agent: &mut Agent, value: Value, done: bool) -> Result<Value, JsError> {
-    // CreateIterResultObject (spec 7.3.17): an object inheriting
-    // %Object.prototype% (result-prototype.js).
-    let proto = agent
-        .current_realm()?
-        .intrinsics
-        .get("%Object.prototype%")
-        .and_then(|v| crate::context::as_object(&v));
-    let object = JsObject::ordinary_object_create(proto);
-    object.create_data_property(&JsString::from_utf8("value"), value)?;
-    object.create_data_property(&JsString::from_utf8("done"), Value::Boolean(done))?;
-    Ok(Value::Object(object))
+    crate::context::create_iter_result_object(agent, value, done).map(Value::Object)
 }
 
 #[cfg(test)]
@@ -735,6 +725,27 @@ mod tests {
 
     fn run(source: &str) -> Result<Value, JsError> {
         evaluate(source)
+    }
+
+    #[test]
+    fn iterator_results_keep_the_create_data_property_shape() {
+        // CreateIterResultObject adopts a cached {value, done} shape; the
+        // descriptors and the per-call identity must stay exactly what two
+        // CreateDataProperty calls produce, including on the array path.
+        let value = run("function* g() { yield 1; } \
+             var a = g().next(); \
+             var b = g().next(); \
+             var c = [7].values().next(); \
+             var v = Object.getOwnPropertyDescriptor(a, 'value'); \
+             var d = Object.getOwnPropertyDescriptor(a, 'done'); \
+             Object.getPrototypeOf(a) === Object.prototype \
+               && v.writable && v.enumerable && v.configurable \
+               && d.writable && d.enumerable && d.configurable \
+               && Object.keys(a).join(',') === 'value,done' \
+               && c.value === 7 && c.done === false \
+               && a !== b && a !== c")
+        .unwrap();
+        assert_eq!(value, Value::Boolean(true));
     }
 
     #[test]

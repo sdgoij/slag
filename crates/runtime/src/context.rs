@@ -6,9 +6,10 @@ use std::cell::RefCell;
 use crux::error::{ErrorKind, JsError};
 use crux::handle::Handle;
 use crux::heap::{GcAny, Trace};
+use crux::map::{Map, MapAttrs, canonical_empty_map};
 use crux::object::JsObject;
 use crux::property::PropertyKey;
-use crux::string::JsString;
+use crux::string::{JsString, intern_utf8};
 use crux::value::{Value, ValueKind};
 
 use crate::agent::Agent;
@@ -115,6 +116,57 @@ pub fn as_object(value: &Value) -> Option<Handle<JsObject>> {
         ValueKind::Function(f) => f.object.handle(),
         _ => None,
     }
+}
+
+/// CreateIterResultObject (spec 7.3.17): a fresh `{ value, done }` object
+/// inheriting `%Object.prototype%`.
+///
+/// The two `CreateDataProperty` calls dominate the cost on a fresh object
+/// (~100-140 ns each). Fork the two-key shape once per realm and adopt it in
+/// one step; fall back to the sequential defines if the shape cannot be
+/// adopted.
+pub fn create_iter_result_object(
+    agent: &Agent,
+    value: Value,
+    done: bool,
+) -> Result<Handle<JsObject>, JsError> {
+    let realm = agent.current_realm().ok();
+    let map = iter_result_map(agent, realm);
+    let proto = map.and_then(|map| map.prototype());
+    let object = JsObject::ordinary_object_create(proto);
+    if let Some(map) = map
+        && object.adopt_vector_free_fields(map, &[value, Value::Boolean(done)])
+    {
+        return Ok(object);
+    }
+    object.create_data_property(&JsString::from_utf8("value"), value)?;
+    object.create_data_property(&JsString::from_utf8("done"), Value::Boolean(done))?;
+    Ok(object)
+}
+
+/// The per-agent cached `{value, done}` shape. The shape links to a realm's
+/// `%Object.prototype%`, so a realm switch refork. Keying on the realm handle
+/// (rather than the resolved prototype) keeps the intrinsic-table lookup off
+/// the hot path.
+fn iter_result_map(agent: &Agent, realm: Option<Handle<Realm>>) -> Option<Handle<Map>> {
+    let same_realm = match (agent.iter_result_realm.get(), realm) {
+        (Some(cached), Some(current)) => cached.ptr_eq(current),
+        (None, None) => true,
+        _ => false,
+    };
+    if same_realm && let Some(map) = agent.iter_result_map.get() {
+        return Some(map);
+    }
+    let proto = realm
+        .and_then(|realm| realm.intrinsics.get("%Object.prototype%"))
+        .and_then(|value| as_object(&value));
+    let attrs = MapAttrs::new(true, true, true);
+    let mut map = canonical_empty_map(proto);
+    map = map.get_or_create_child(PropertyKey::String(intern_utf8("value")), attrs)?;
+    map = map.get_or_create_child(PropertyKey::String(intern_utf8("done")), attrs)?;
+    agent.iter_result_realm.set(realm);
+    agent.iter_result_map.set(Some(map));
+    Some(map)
 }
 
 /// ToPrimitive (spec 7.1.1) with agent dispatch: an object's builtin

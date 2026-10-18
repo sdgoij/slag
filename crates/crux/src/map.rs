@@ -156,6 +156,13 @@ impl Map {
         })
     }
 
+    /// The prototype every object on this map inherits (forked children copy
+    /// it), so a cached shape can construct its objects without resolving the
+    /// intrinsic that produced the prototype again.
+    pub fn prototype(&self) -> Option<Handle<JsObject>> {
+        self.prototype
+    }
+
     /// Return the map's unique identity.
     pub fn id(&self) -> u64 {
         self.id

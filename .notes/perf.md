@@ -13531,3 +13531,37 @@ the frozen case throw its TypeError.
 Measured: `opcost/array_reverse` **23.92 → 4.56 ms (5.2x)**, gap to node
 **47x → 9.0x**; `array_reverse` 2M calls on the row and no `call_slow`. Corpus
 values are unchanged on all 77 rows and the full-corpus median is flat.
+
+## Iterator results fork their shape once per realm (2026-10-18)
+
+`CreateIterResultObject` built `{ value, done }` with two sequential
+`create_data_property` calls on a fresh object. Each is a `CreateDataProperty`
+through the descriptor machinery (~100-140 ns), so a generator `next()` spent
+about 160 ns of its 375 ns in the result object alone (`control/generator_loop`
+measured 82.3 ms for 200k resumptions).
+
+The five implementations of the operation (generator, async generator, array
+iterator, keyed iterator, iterator helpers) now share
+`context::create_iter_result_object`, which forks the two-key shape once per
+realm and adopts it with `JsObject::adopt_vector_free_fields` in one step,
+falling back to the two defines if adoption declines. The shape is cached on
+the agent (`iter_result_map`) and keyed on the realm handle
+(`iter_result_realm`): a realm switch refork, but the hot path never has to
+resolve `%Object.prototype%` through the intrinsic table — that lookup was the
+remaining cost after the first version still resolved it per call. A cache hit
+reads the prototype back from the map (`Map::prototype`), and the map's own
+trace keeps that prototype alive.
+
+Measured on the `scratch/ab/gen` probe (generator applying `next().value`):
+**82.3 → 57.5 ms (1.43x)**, i.e. ~411 → ~288 ns per resumption, over five
+interleaved runs. Corpus: `control/generator_loop` **89.6 → 67.4 ms (1.33x)**;
+the other 76 rows' names and checksums are unchanged and their median ratio is
+inside the documented ±10% run noise.
+
+Trap: `adopt_vector_free_fields` requires the object to start on the empty
+canonical map, so the result must be created with `ordinary_object_create`, not
+`ordinary_object_create_with_map` (the latter starts on the non-empty final
+map and fails the fresh-map guard). The cached map's all-true attributes are
+what make the adoption equivalent to two CreateDataProperty calls; a shape
+forked with any non-default flag would change the descriptors the caller
+observes.
