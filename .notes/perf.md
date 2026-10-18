@@ -13781,6 +13781,37 @@ machinery, not the argument vector, dominates it. The helper census drops
 `ArgsBase`/`ArgsPush` (one per iteration each) and keeps `ConstructArgs` at
 one per iteration; the full-corpus checksums are unchanged.
 
+## Construct/leaf profile, and the fill-path gate (2026-10-18)
+
+Isolated probes (2M iterations each unless noted; the corpus runner reports
+one call, so the figures are per-call ms with ns/iter in parentheses): a `{}`
+literal 70 ms (35 ns/iter, incl. the `ObjectBegin` helper), `new Object()`
+93 ms (46 ns/iter), `new Empty()` 115 ms (57 ns), `new Item(x)` with one
+field store 195 ms (98 ns), `new Item(x, y)` with two 240 ms (120 ns), and
+`new Item(i).sum()` 85 ms per 500k (170 ns/iter). The leaf call and own reads
+are cheap: `p.sum()` on a stable receiver 75 ms (37 ns), two own reads 1.5 ms
+(~0.4 ns each). A field store on a stable receiver is ~4 ns; the constructor's
+first field store costs 44 ns, the second 19 ns.
+
+The first-store gap is the object's fill. `construct_this_object` starts the
+receiver on a presized map and vector-free (`props_deferred`), so the first
+`this.x =` is a HOLE fill. The per-step compiler has that inline
+(`compiler.rs::emit_deferred_field_store`'s fill block: write the field, bump
+the generation, refresh the value cell). `opt_lower`'s
+`emit_deferred_update_store` only has the UPDATE path (`not_hole`), so under
+the optimizing tier every constructor store falls to the `SetMemberSlot`
+helper — the census shows 1-2 calls per iteration that the per-step tier does
+not pay.
+
+This is why fall-off-end lifting is blocked: constructors (and scripts) have
+no `Step::Return`, and teaching the lift to answer `undefined` at the end
+(attempted 2026-10-18) makes constructors opt-compile, which regressed
+`new Item(x)` 200 -> 272 ms and `new Item(x, y)` 239 -> 393 ms. The change was
+reverted. To enable it, port the fill block into
+`opt_lower::emit_deferred_update_store` first (the same gates: deferred bit,
+inline slot, every higher field a hole, the clean-proto deref, young
+receiver), then re-measure; the per-step store is the floor to beat.
+
 Bodies containing `NewClosure`/`FunctionDecl` are now opt-compiled. The
 earlier explicit decline was a workaround for a 3x regression on
 `opcost/proto_method_call`, but the cause was the intrinsic slow path, not
