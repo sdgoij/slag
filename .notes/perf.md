@@ -13675,3 +13675,31 @@ hit (`emit_intrinsic_value` / `emit_intrinsic_hit`). Jumping straight to the
 merge block without writing the call region leaves the stack pointer and the
 argument slots in the caller's frame corrupted, which the loop case in the new
 jit test exercises.
+
+## Registered builtins run on the JIT argument buffer (2026-10-18)
+
+A compiled call to a registered builtin (`String.fromCharCode`,
+`Array.prototype.join`, `RegExp.prototype.test`, the Map/Set members) left
+`call_slow` through the interpreter funnel: push `this`/callee/args onto
+`vm.stack`, run `do_call_fast` -> `fast_call_core`, let the registered-builtin
+arm call the handler, then truncate the stack and read the result back. The
+handler itself is a plain `(agent, this, args)` call; only the round trip
+around it is overhead.
+
+`call_slow` now offers the builtin verdict first: the same per-function-id
+`builtin_call_lookup` cell `fast_call_core` uses, with the JIT's argument
+buffer as the args slice and the result returned directly. The lane is gated
+on a single-realm agent, no direct eval, no termination request, and a
+non-reentrant verdict; a reentrant host callback still withdraws to its own
+activation, and an engine-defined ECMAScript body keeps the funnel.
+
+Measured on a one-element `join` loop, the stable probe: **19.0 -> 17.4 ms
+(1.09x)**. The other builtin-heavy rows moved in the same direction but the
+machine was thermally variable this session, so they are not quoted. Corpus
+names and checksums are unchanged on all 77 rows.
+
+Trap: the args slice points into the compiled body's working buffer, which a
+re-entrant handler can move when it resizes `vm.stack` — that is exactly what
+the `reentrant` gate excludes. The lane also returns before the pending-call
+completion check the funnel performs, which is sound only because a
+non-reentrant handler never withdraws.

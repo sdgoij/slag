@@ -1970,6 +1970,50 @@ extern "C" fn call_slow(
     {
         return result;
     }
+    // A registered builtin runs its handler directly on the JIT's argument
+    // buffer: the `vm.stack` round trip (push `this`/callee/args, the funnel,
+    // the truncate/pop) is the whole overhead this lane removes. The verdict
+    // is the same per-function-id cell `fast_call_core` uses. A reentrant host
+    // callback still needs its own activation, and a cross-realm call keeps
+    // the general path (the callee's realm must be current for its handler).
+    if direct_eval == 0
+        && !unsafe { &*ctx.agent }.is_terminating()
+        && unsafe { &*ctx.agent }.realm_count.get() == 1
+        && let ValueKind::Function(function) = Value::from_bits(callee).kind()
+    {
+        let agent = unsafe { &mut *ctx.agent };
+        let is_native = matches!(
+            &function.kind,
+            crux::function::FunctionKind::Builtin { call: Some(_), .. }
+        );
+        // SAFETY: the JIT passes a pointer into its own live stack buffer with
+        // `argc` slots; the machine code is suspended for this call.
+        let args_slice = unsafe { std::slice::from_raw_parts(args as *const Value, argc as usize) };
+        let this_value = Value::from_bits(this);
+        match agent.builtin_call_lookup(function.id(), is_native) {
+            crate::function::BuiltinCall::Handler {
+                handler,
+                reentrant: false,
+            } => {
+                return match handler(agent, &this_value, args_slice) {
+                    Ok(value) => value.bits(),
+                    Err(error) => slow_error(ctx, error),
+                };
+            }
+            crate::function::BuiltinCall::Native { reentrant: false } => {
+                if let crux::function::FunctionKind::Builtin {
+                    call: Some(native), ..
+                } = &function.kind
+                {
+                    return match native(&this_value, args_slice) {
+                        Ok(value) => value.bits(),
+                        Err(error) => slow_error(ctx, error),
+                    };
+                }
+            }
+            _ => {}
+        }
+    }
     let argc = argc as usize;
     let agent = unsafe { &mut *ctx.agent };
     let vm = unsafe { &mut *ctx.vm };
