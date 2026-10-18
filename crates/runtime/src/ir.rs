@@ -6096,6 +6096,23 @@ impl Vm {
                     generation,
                     value,
                 };
+                // Warm the compiled store's map-keyed shape cell too: a hit
+                // routes the next write through the inline deferred field
+                // update instead of the helper. A map id pins the descriptor
+                // layout; `clean` stays 0 (a write never verifies the chain).
+                if let Some((map_id, field)) = object.map_store_field(&key) {
+                    let shape_index = Self::member_map_cell_index(map_id, name);
+                    let (proto_id, proto_gen) = Self::member_map_proto(object);
+                    agent.member_map_cells[shape_index] = MemberMapCell {
+                        map_id,
+                        name,
+                        slot: field,
+                        clean: 0,
+                        proto_id,
+                        proto_gen,
+                        writable: 1,
+                    };
+                }
                 Self::refresh_global_read_cell(agent, object, name, value);
                 return true;
             }
@@ -6188,30 +6205,45 @@ impl Vm {
             return;
         };
         let key = PropertyKey::String(name);
-        let Some(slot) = object.property_slot(&key) else {
-            return;
+        // A vector-free receiver stores its own data properties as written map
+        // fields. Resolving the slot through `property_slot` would materialize
+        // the vector, which permanently disables the compiled deferred field
+        // store: a hot `o.x = v` loop would pay the descriptor-resolving
+        // helper on every write. Resolve the descriptor ordinal instead and
+        // let the store cell carry it as the slot (the deferred arm of
+        // `write_data_property_slot` serves that form).
+        let (slot, value) = if let Some((slot, value)) = object.deferred_field_value(&key) {
+            (slot, value)
+        } else {
+            if object.props_deferred.get() {
+                return;
+            }
+            let Some(slot) = object.property_slot(&key) else {
+                return;
+            };
+            let props = object.properties.borrow();
+            let Some((stored, property)) = props.get(slot) else {
+                return;
+            };
+            if *stored != key {
+                return;
+            }
+            let crux::object::PropertyKind::Data { value, writable } = &property.kind else {
+                return;
+            };
+            if !*writable {
+                return;
+            }
+            (slot, *value)
         };
-        let props = object.properties.borrow();
-        let Some((stored, property)) = props.get(slot) else {
-            return;
-        };
-        if *stored != key {
-            return;
-        }
-        let crux::object::PropertyKind::Data { value, writable } = &property.kind else {
-            return;
-        };
-        if !*writable {
-            return;
-        }
-        let value = *value;
         // Pin the map field when the object's map describes the key: the
         // next warm write mirrors the in-object field at the pinned offset
         // (below INLINE_FIELDS) or skips the mirror entirely (the pinned
         // offset equals the vector slot the write already stored) without
         // the descriptor scan. Dictionary-mode and vector-only properties
         // record no pin.
-        let (map_id, field) = match object.map_store_field(&key) {
+        let mapped = object.map_store_field(&key);
+        let (map_id, field) = match mapped {
             Some((map_id, field)) => (map_id, encode_pinned_field(field)),
             None => (0, MEMBER_WRITE_FIELD_NONE),
         };
@@ -6240,6 +6272,23 @@ impl Vm {
                 slot,
                 field,
             });
+            // The compiled store's shape probe reads the READ-side map cells;
+            // warm it here too, so the first compiled store after this cold
+            // write hits the shape gate instead of the helper. A map id pins
+            // the descriptor layout, so the recorded ordinal and writability
+            // are valid for every object on the shape; `clean` stays 0 (a
+            // write never verifies the chain for the fill path).
+            let read_index = Self::member_map_cell_index(map_id, name);
+            let (proto_id, proto_gen) = Self::member_map_proto(&object);
+            agent.member_map_cells[read_index] = MemberMapCell {
+                map_id,
+                name,
+                slot,
+                clean: 0,
+                proto_id,
+                proto_gen,
+                writable: 1,
+            };
         }
         // The read-side value cell keeps the SMALL table's index.
         let read_index = Self::member_cell_index(object.id(), name);
@@ -30715,6 +30764,36 @@ mod tests {
         assert!(
             matches!(agent.global_cells[Vm::global_cell_index(data)], Some((name, _)) if name == data),
             "a data property records its own slot"
+        );
+    }
+
+    #[test]
+    fn an_interpreted_store_keeps_a_vector_free_receiver_deferred() {
+        // The first store to a vector-free (Option-3) object runs the full
+        // [[Set]] and then records the warm-store cell. Resolving that cell's
+        // slot through `property_slot` materializes the vector, which turns
+        // every later compiled store into the descriptor-resolving helper; the
+        // record must resolve the map ordinal instead.
+        let mut agent = Agent::new();
+        agent.initialize_host_defined_realm().unwrap();
+        let value = agent
+            .run_script("(function () { var o = {a: 1, b: 2}; o.b = 3; return o; })()")
+            .expect("the script");
+        let ValueKind::Object(object) = value.kind() else {
+            panic!("the script returns the object");
+        };
+        let key = crux::PropertyKey::String(crux::intern_utf8("b"));
+        let atom = crux::intern_utf8("b");
+        assert_eq!(
+            object.deferred_field_value(&key),
+            Some((1, Value::Number(3.0))),
+            "the warm-store record must not materialize the vector"
+        );
+        let map = object.map.get().expect("the object keeps its map");
+        let map_cell = &agent.member_map_cells[Vm::member_map_cell_index(map.id(), atom)];
+        assert!(
+            map_cell.map_id == map.id() && map_cell.name == atom,
+            "the compiled store's shape probe must find the recorded cell"
         );
     }
 

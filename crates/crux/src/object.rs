@@ -3271,6 +3271,13 @@ impl JsObject {
         if !matches!(self.kind, ObjectKind::Ordinary) {
             return false;
         }
+        // A vector-free receiver has no vector slot: its own data properties
+        // are written map fields, and the store cell records the descriptor
+        // ordinal as the slot for exactly this case. Materializing here would
+        // defeat the compiled deferred field store.
+        if self.props_deferred.get() {
+            return self.deferred_field_write(key, value);
+        }
         let mut props = self.properties.borrow_mut();
         let Some((stored, property)) = props.get_mut(slot) else {
             return false;
@@ -3345,6 +3352,25 @@ impl JsObject {
     /// non-writable descriptor (length/caller/arguments boilerplate — the
     /// full [[Set]] must enforce the writability outcome), or any
     /// non-deferred object (the vector-scan paths serve those).
+    /// The (descriptor ordinal, live value) of a written, writable,
+    /// map-described field on a vector-free object, or `None`. Read-only: it
+    /// never materializes the property vector (unlike [`Self::property_slot`]),
+    /// so the warm-store recorders can cache a deferred receiver's store
+    /// without destroying the deferred state the compiled field store needs.
+    pub fn deferred_field_value(&self, key: &PropertyKey) -> Option<(usize, Value)> {
+        if !self.props_deferred.get() {
+            return None;
+        }
+        let map = self.map.get()?;
+        let ord = map.find(key)?;
+        let (_, offset, attrs) = map.descriptor_at(ord)?;
+        if offset >= INLINE_FIELDS || !attrs.writable() {
+            return None;
+        }
+        let value = self.in_fields[offset].get();
+        (!value.is_uninitialized()).then_some((offset, value))
+    }
+
     pub fn deferred_field_write(&self, key: &PropertyKey, value: Value) -> bool {
         if !self.props_deferred.get() {
             return false;

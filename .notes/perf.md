@@ -13597,3 +13597,48 @@ The row is now dominated by the `small.at` member read, not the call: the
 identical loop with `small[2]` measures 0.60 ms against 2.60 ms, and
 `GetMemberName` still runs ~2.8M times. The next slice on this shape is the
 named method read, not `at` itself.
+
+## Vector-free field stores stay inline (2026-10-18)
+
+`objects/warm_store` (`o.d = i; s += o.d` on a literal) measured 55.7 ms
+for 4M iterations and issued a `SetMemberSlot` helper call on every store.
+The literal is vector-free (Option-3): `object_fast_create` adopts the
+`{a,b,c,d}` shape and writes the fields, leaving `props_deferred` set.
+The compiled store's deferred arm was therefore available, but two things
+kept the helper on the hot path.
+
+First, the warm-store record path called `JsObject::property_slot`, which
+materializes the property vector and clears `props_deferred` — one cold
+store and the object was never deferred again. `warm_store_record` now
+resolves the descriptor ordinal through a new read-only
+`JsObject::deferred_field_value` and records that ordinal as the store
+cell's slot; `write_data_property_slot` gained a deferred arm that routes
+the cell hit to `deferred_field_write`. The first store no longer
+destroys the representation it needs.
+
+Second, the optimizing tier had no deferred store at all: the per-step
+path served a value-cell hit through `emit_deferred_inline_store`, while
+`opt_lower::emit_member_store` called `SetMemberSlot` on a cell hit.
+`emit_deferred_update_store` is the opt-tier mirror of the per-step
+update arm — the deferred bit, the map cell's ordinal in
+`in_fields`, a written field, writability, a barrier-free store (young
+receiver or non-heap value), and the non-global receiver gate — and the
+store now reaches it through the shared map-keyed shape probe. Both warm
+paths also warm `member_map_cells`, which the compiled probe reads; the
+write-side `member_write_map_cells` table is interpreter-only. The shape
+cell matters beyond the value cell because `clear_derived_caches` empties
+`member_value_cells` at every collection while the map cells survive.
+
+Measured: the standalone store probe (`o.d = i`) **47.6 → 18.8 ms
+(2.5x)** with the `SetMemberSlot` census 28M → 0; store-then-read
+**57.7 → 27.5 ms**. Corpus: `objects/warm_store` **55.72 → 27.88 ms
+(2.0x)** and `objects/compound_assign` **60.33 → 37.39 ms (1.61x)**. The
+other 75 rows keep their names and checksums, the corpus median is flat
+(1.003), and p90 is 1.031.
+
+Trap: never resolve a store cell's slot with `property_slot` on a
+receiver whose `props_deferred` may be set — the materialization is
+permanent for the object and silently returns every later compiled store
+to the descriptor-resolving helper. The deferred branch of
+`warm_store_fallback` had the same gap in the shape cell (it warmed only
+the value cell), which a store loop with no preceding read exposed.

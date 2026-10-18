@@ -3155,41 +3155,20 @@ fn emit_member_store(
     let name_imm = builder.ins().iconst(types::I64, name as i64);
     let obj_ok = crate::cells::is_plain_object(builder, object);
     let validate = builder.create_block();
+    let deferred = builder.create_block();
     let fast = builder.create_block();
     let slow = builder.create_block();
-    let shape = builder.create_block();
     let merge = builder.create_block();
     builder.ins().brif(obj_ok, validate, &[], slow, &[]);
     builder.switch_to_block(validate);
-    let cells = builder.ins().load(
-        types::I64,
-        MemFlagsData::new(),
-        abi.vm,
-        Offset32::new(std::mem::offset_of!(JitCallContext, member_value_cells) as i32),
-    );
-    let ptr = crate::cells::object_data_ptr(builder, object);
-    let live_id = builder.ins().load(
-        types::I64,
-        MemFlagsData::new(),
-        ptr,
-        Offset32::new(std::mem::offset_of!(crux::JsObject, id) as i32),
-    );
-    let live_gen = builder.ins().load(
-        types::I32,
-        MemFlagsData::new(),
-        ptr,
-        Offset32::new(std::mem::offset_of!(crux::JsObject, generation) as i32),
-    );
-    let cell = crate::cells::member_value_cell_addr(builder, cells, live_id, name_imm);
-    let ok = crate::cells::member_value_cell_valid(builder, cell, live_id, name, live_gen);
-    // The value cell is keyed by the object id, so a store loop whose object
-    // working set exceeds the 16 cells misses it on nearly every write; the
-    // map-keyed shape cell is shared by every instance of the shape, so a hit
-    // routes the write to the same narrow `set_member_slot` the value-cell hit
-    // takes (whose writable check stays the authoritative backstop).
-    builder.ins().brif(ok, fast, &[], shape, &[]);
-    builder.switch_to_block(shape);
-    emit_shape_store_probe(builder, abi, object, name_imm, fast, slow);
+    // The map-keyed shape cell pins the descriptor ordinal and writability for
+    // every instance of the shape, so one probe serves both a cold value cell
+    // and a warmed receiver. A hit on a vector-free receiver takes the inline
+    // field update; every other shape keeps the narrow `set_member_slot`
+    // helper (whose writable check is the authoritative backstop).
+    emit_shape_store_probe(builder, abi, object, name_imm, deferred, slow);
+    builder.switch_to_block(deferred);
+    emit_deferred_update_store(builder, abi, object, name_imm, value, name, fast, merge);
     builder.switch_to_block(fast);
     call_helper(
         builder,
@@ -3213,6 +3192,176 @@ fn emit_member_store(
     builder.seal_block(merge);
     builder.switch_to_block(merge);
     Ok(())
+}
+
+/// The in-place UPDATE of a written, writable map field on a vector-free
+/// receiver (the opt-tier mirror of the per-step deferred store's update arm).
+/// Entry: the current block is a validated shape-cell hit, so the cell's map
+/// id and name are the live pair and its `slot` is the descriptor ordinal of
+/// `name`. The field must be written (a hole is a define), the descriptor
+/// writable, the store barrier-free (a young receiver or a non-heap value), and
+/// the receiver must not be the global object (a no-bump write cannot refresh
+/// the name-keyed global cell). Any decline jumps to `fallback` (the narrow
+/// `set_member_slot` helper); a completed write jumps to `ok`.
+#[allow(clippy::too_many_arguments)]
+fn emit_deferred_update_store(
+    builder: &mut FunctionBuilder,
+    abi: &Abi,
+    object: ClifValue,
+    name_imm: ClifValue,
+    value: ClifValue,
+    name: crux::AtomId,
+    fallback: Block,
+    ok: Block,
+) {
+    let obj_ptr = crate::cells::object_data_ptr(builder, object);
+    let deferred_bit = builder.ins().load(
+        types::I8,
+        MemFlagsData::new(),
+        obj_ptr,
+        Offset32::new(std::mem::offset_of!(crux::JsObject, props_deferred) as i32),
+    );
+    let deferred_ok = builder.ins().icmp_imm_u(IntCC::NotEqual, deferred_bit, 0);
+    let map_handle = builder.ins().load(
+        types::I64,
+        MemFlagsData::new(),
+        obj_ptr,
+        Offset32::new(std::mem::offset_of!(crux::JsObject, map) as i32),
+    );
+    let map_data = builder
+        .ins()
+        .iadd_imm_s(map_handle, crux::heap::GCBOX_DATA_OFFSET as i64);
+    let map_id = builder.ins().load(
+        types::I64,
+        MemFlagsData::new(),
+        map_data,
+        Offset32::new(crux::map::MAP_ID_OFFSET as i32),
+    );
+    let map_cells = builder.ins().load(
+        types::I64,
+        MemFlagsData::new(),
+        abi.vm,
+        Offset32::new(std::mem::offset_of!(JitCallContext, member_map_cells) as i32),
+    );
+    let cell = crate::cells::member_map_cell_addr(builder, map_cells, map_id, name_imm);
+    let field_slot = builder.ins().load(
+        types::I64,
+        MemFlagsData::new(),
+        cell,
+        Offset32::new(std::mem::offset_of!(MemberMapCell, slot) as i32),
+    );
+    let writable = builder.ins().load(
+        types::I32,
+        MemFlagsData::new(),
+        cell,
+        Offset32::new(std::mem::offset_of!(MemberMapCell, writable) as i32),
+    );
+    let slot_inline = builder.ins().icmp_imm_u(
+        IntCC::UnsignedLessThan,
+        field_slot,
+        crux::object::INLINE_FIELDS as i64,
+    );
+    let field_base = builder.ins().iadd_imm_s(
+        obj_ptr,
+        std::mem::offset_of!(crux::JsObject, in_fields) as i64,
+    );
+    let field_bytes = builder.ins().ishl_imm_u(field_slot, 3);
+    let field_addr = builder.ins().iadd(field_base, field_bytes);
+    let field_bits = builder.ins().load(
+        types::I64,
+        MemFlagsData::new(),
+        field_addr,
+        Offset32::new(0),
+    );
+    let not_hole = builder.ins().icmp_imm_u(
+        IntCC::NotEqual,
+        field_bits,
+        crux::value::UNINITIALIZED_BITS as i64,
+    );
+    let writable_ok = builder.ins().icmp_imm_u(IntCC::NotEqual, writable, 0);
+    // A2: an inline store into an old receiver would need the write barrier;
+    // a young one cannot create an old->young edge, and a non-heap value
+    // needs no barrier in either direction.
+    let box_ptr = builder.ins().band_imm_u(object, crux::PAYLOAD_MASK as i64);
+    let box_ptr = builder.ins().ishl_imm_u(box_ptr, 4);
+    let young = box_ptr_is_young(builder, box_ptr);
+    let value_tag = builder.ins().band_imm_u(value, crux::TAG_MASK as i64);
+    let value_not_heap =
+        builder
+            .ins()
+            .icmp_imm_u(IntCC::NotEqual, value_tag, crux::TAG_PREFIX as i64);
+    let barrier_ok = builder.ins().bor(young, value_not_heap);
+    let global = builder.ins().load(
+        types::I64,
+        MemFlagsData::new(),
+        abi.vm,
+        Offset32::new(std::mem::offset_of!(JitCallContext, global_object) as i32),
+    );
+    let not_global = builder.ins().icmp(IntCC::NotEqual, obj_ptr, global);
+    let gate = builder.ins().band(deferred_ok, slot_inline);
+    let gate = builder.ins().band(gate, not_hole);
+    let gate = builder.ins().band(gate, writable_ok);
+    let gate = builder.ins().band(gate, barrier_ok);
+    let gate = builder.ins().band(gate, not_global);
+    let update = builder.create_block();
+    builder.ins().brif(gate, update, &[], fallback, &[]);
+    builder.seal_block(update);
+    builder.switch_to_block(update);
+    builder
+        .ins()
+        .store(MemFlagsData::new(), value, field_addr, Offset32::new(0));
+    // The L1c no-bump discipline: front the read-side value cell at the
+    // UNCHANGED generation so the store-then-read pattern stays warm.
+    let live_id = builder.ins().load(
+        types::I64,
+        MemFlagsData::new(),
+        obj_ptr,
+        Offset32::new(std::mem::offset_of!(crux::JsObject, id) as i32),
+    );
+    let live_gen = builder.ins().load(
+        types::I32,
+        MemFlagsData::new(),
+        obj_ptr,
+        Offset32::new(std::mem::offset_of!(crux::JsObject, generation) as i32),
+    );
+    let cells = builder.ins().load(
+        types::I64,
+        MemFlagsData::new(),
+        abi.vm,
+        Offset32::new(std::mem::offset_of!(JitCallContext, member_value_cells) as i32),
+    );
+    let vindex = builder.ins().bxor(live_id, name_imm);
+    let vindex = builder.ins().band_imm_u(vindex, (MEMBER_CELLS - 1) as i64);
+    let vindex = builder
+        .ins()
+        .imul_imm_s(vindex, std::mem::size_of::<MemberValueCell>() as i64);
+    let vcell = builder.ins().iadd(cells, vindex);
+    builder.ins().store(
+        MemFlagsData::new(),
+        live_id,
+        vcell,
+        Offset32::new(std::mem::offset_of!(MemberValueCell, id) as i32),
+    );
+    let name_imm32 = builder.ins().iconst(types::I32, name as i64);
+    builder.ins().store(
+        MemFlagsData::new(),
+        name_imm32,
+        vcell,
+        Offset32::new(std::mem::offset_of!(MemberValueCell, name) as i32),
+    );
+    builder.ins().store(
+        MemFlagsData::new(),
+        live_gen,
+        vcell,
+        Offset32::new(std::mem::offset_of!(MemberValueCell, generation) as i32),
+    );
+    builder.ins().store(
+        MemFlagsData::new(),
+        value,
+        vcell,
+        Offset32::new(std::mem::offset_of!(MemberValueCell, value) as i32),
+    );
+    builder.ins().jump(ok, &[]);
 }
 
 /// The opt-tier mirror of `compiler.rs::emit_shape_store_probe`: the current
