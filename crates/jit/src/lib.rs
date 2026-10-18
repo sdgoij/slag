@@ -3876,6 +3876,67 @@ mod tests {
     }
 
     #[test]
+    fn installed_jit_array_push_inline_matches_the_interpreter() {
+        // The `Array.prototype.push` splice appends in place when a dense Array
+        // has cursor room. Grows, holes, multi-element calls, non-dense or
+        // generic receivers, and a frozen array keep the general path; the
+        // helper count must stay far below one per loop iteration.
+        static PUSH_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        extern "C" fn counting_push(ctx: *mut c_void, this: u64, value: u64) -> u64 {
+            PUSH_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            (runtime::jit::JIT_SLOW_PATHS.array_push)(ctx, this, value)
+        }
+        let mut helpers = runtime_helpers();
+        helpers.array_push = Some(counting_push);
+        let source = "var out = [];\n\
+                      function t(v) { out.push(String(v)); }\n\
+                      var a = []; t(a.push(1)); t(a.push(2)); t(a.length); t(a.join(','));\n\
+                      t([1, 2].push(3));\n\
+                      var m = []; t(m.push(1, 2)); t(m.join(','));\n\
+                      var h = [1]; h[3] = 4; t(h.push(5)); t(h.join(','));\n\
+                      var f = Object.freeze([1, 2]);\n\
+                      try { f.push(3); t('no-throw'); } catch (e) { t(e instanceof TypeError ? 'TypeError' : 'other'); }\n\
+                      t(Array.prototype.push.call({length: 0}, 'x'));\n\
+                      var sh = [1]; sh.push = function () { return 'shadow'; }; t(sh.push(2));\n\
+                      function loop(n) { var a2 = []; var s = 0;\n\
+                        for (var i = 0; i < n; i++) {\n\
+                          a2.push(i);\n\
+                          if (a2.length > 8) { s += a2.pop(); }\n\
+                        }\n\
+                        return s; }\n\
+                      t(loop(5000));\n\
+                      out.join(',');";
+        let interp = {
+            let mut agent = runtime::Agent::new();
+            agent.initialize_host_defined_realm().expect("realm");
+            agent.run_script(source).expect("interp runs")
+        };
+        extern "C" fn noop_drop(_cache: *mut c_void) {}
+        let mut agent = runtime::Agent::new();
+        agent.initialize_host_defined_realm().expect("realm");
+        let mut cache = JitCache::new(helpers).expect("isa");
+        agent.jit_hook = Some(runtime::jit::JitHook {
+            cache: (&mut cache as *mut JitCache) as *mut c_void,
+            lookup: jit_cache_lookup,
+            drop_cache: noop_drop,
+            helpers: &runtime::jit::JIT_SLOW_PATHS,
+        });
+        let value = agent.run_script(source).expect("jit runs");
+        let compiled = cache.compiled_count();
+        agent.jit_hook = None;
+        assert_eq!(
+            value, interp,
+            "the Array.push inline append must match the interpreter"
+        );
+        assert!(compiled >= 1, "{compiled} bodies");
+        let calls = PUSH_CALLS.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            calls < 100,
+            "the compiled dense push must not call the helper per element ({calls} calls)"
+        );
+    }
+
+    #[test]
     fn installed_jit_array_reverse_intrinsic_matches_the_interpreter() {
         // The `Array.prototype.reverse` splice (zero arguments): a `.reverse()`
         // call whose resolved callee is the realm's intrinsic reverses a fully

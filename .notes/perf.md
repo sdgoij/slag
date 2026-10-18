@@ -13642,3 +13642,36 @@ permanent for the object and silently returns every later compiled store
 to the descriptor-resolving helper. The deferred branch of
 `warm_store_fallback` had the same gap in the shape cell (it warmed only
 the value cell), which a store loop with no preceding read exposed.
+
+## Dense Array.prototype.push appends inline (2026-10-18)
+
+`push` had a Stage-B intrinsic splice, but each call dropped into
+`Helper::ArrayPush` (`push_fast`): re-derive the receiver, `array_length_dense`,
+then `array_element_write` with its dense/spill/grow branching. The
+machine-code append that already served `a[a.length] = v` was not reachable
+from the intrinsic, and the optimizing tier had no append arm at all.
+
+Both tiers now inline a single-element dense append. The gates are the
+append's: an Object-tagged receiver with a non-null `array_dense`, extensible,
+not a registered prototype, a current clean-chain verdict
+(`store_chain_clean == PROTOTYPE_EPOCH`), the 2^53-1 length cap,
+`elem_len == length`, cursor room (`elem_len < elem_cap`), and a barrier-free
+store (young slots or a non-heap value). The success path writes
+`elements[elem_len]`, bumps `elem_len`, the f64 length, and the generation,
+and answers the new length as a Number. A grow, a hole, a spilled buffer, a
+frozen array, or a stale verdict falls to the narrow `array_push` helper,
+whose hole sentinel still routes to the general call.
+
+Measured: the probe's `array_push` helper count falls **960k -> 100** (the
+grows) with the checksum unchanged, and the isolated 60k push/pop cycle runs
+**~5.0 -> ~4.4 ms**. The full-corpus pass in this session ran thermally
+skewed (median 0.84 against the earlier baseline, with unrelated rows such as
+`warm_store` moving 27.9 -> 31.3), so it is not quoted as evidence; the row's
+checksum is unchanged and the push helper is gone from the census.
+
+Trap: `push` answers the new length, not the stored value, so the inline path
+must go through the same result-and-restore protocol as every other intrinsic
+hit (`emit_intrinsic_value` / `emit_intrinsic_hit`). Jumping straight to the
+merge block without writing the call region leaves the stack pointer and the
+argument slots in the caller's frame corrupted, which the loop case in the new
+jit test exercises.

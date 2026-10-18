@@ -2683,6 +2683,198 @@ fn emit_new_object(
     )
 }
 
+/// The `%Array.prototype.push%` inline append: a dense Array with room in its
+/// materialized prefix appends one element in place and answers the new length.
+/// The gates mirror the interpreter's append — extensible, not a registered
+/// prototype, a current clean-chain verdict, the length cap, `elem_len ==
+/// length`, cursor room, and a barrier-free store (young slots or a non-heap
+/// value). A grow, a hole, a spilled buffer, or a stale verdict jumps to
+/// `helper` (the narrow `array_push` helper, whose result can then take the
+/// sentinel fallback to the general call).
+#[allow(clippy::too_many_arguments)]
+fn emit_array_push_inline(
+    builder: &mut FunctionBuilder,
+    helpers: &JitHelpers,
+    abi: &Abi,
+    object: ClifValue,
+    value: ClifValue,
+    slow: Block,
+    merge: Block,
+    out: Variable,
+) -> Result<(), Unsupported> {
+    let kind = builder.create_block();
+    let gated = builder.create_block();
+    let verdict = builder.create_block();
+    let room = builder.create_block();
+    let write = builder.create_block();
+    let helper = builder.create_block();
+
+    let object_pattern = (crux::TAG_PREFIX >> 44) | crux::TAG_OBJECT;
+    let tag_bits = builder.ins().ushr_imm_u(object, 44);
+    let obj_ok = builder
+        .ins()
+        .icmp_imm_u(IntCC::Equal, tag_bits, object_pattern as i64);
+    builder.ins().brif(obj_ok, kind, &[], helper, &[]);
+    builder.seal_block(kind);
+    builder.switch_to_block(kind);
+    let obj_ptr = builder.ins().band_imm_u(object, crux::PAYLOAD_MASK as i64);
+    let obj_ptr = builder.ins().ishl_imm_u(obj_ptr, 4);
+    let obj_ptr = builder
+        .ins()
+        .iadd_imm_s(obj_ptr, crux::heap::GCBOX_DATA_OFFSET as i64);
+    let slots_base = builder.ins().load(
+        types::I64,
+        MemFlagsData::new(),
+        obj_ptr,
+        Offset32::new(std::mem::offset_of!(crux::JsObject, array_dense) as i32),
+    );
+    let dense = builder.ins().icmp_imm_u(IntCC::NotEqual, slots_base, 0);
+    builder.ins().brif(dense, gated, &[], helper, &[]);
+    builder.seal_block(gated);
+    builder.switch_to_block(gated);
+    let extensible = builder.ins().load(
+        types::I8,
+        MemFlagsData::new(),
+        obj_ptr,
+        Offset32::new(std::mem::offset_of!(crux::JsObject, extensible) as i32),
+    );
+    let is_prototype = builder.ins().load(
+        types::I8,
+        MemFlagsData::new(),
+        obj_ptr,
+        Offset32::new(std::mem::offset_of!(crux::JsObject, is_prototype) as i32),
+    );
+    let ext_ok = builder.ins().icmp_imm_u(IntCC::NotEqual, extensible, 0);
+    let not_prototype = builder.ins().icmp_imm_u(IntCC::Equal, is_prototype, 0);
+    let gate_ok = builder.ins().band(ext_ok, not_prototype);
+    builder.ins().brif(gate_ok, verdict, &[], helper, &[]);
+    builder.seal_block(verdict);
+    builder.switch_to_block(verdict);
+    let recorded = builder.ins().load(
+        types::I64,
+        MemFlagsData::new(),
+        obj_ptr,
+        Offset32::new(std::mem::offset_of!(crux::JsObject, store_chain_clean) as i32),
+    );
+    let epoch_addr = builder.ins().iconst(
+        types::I64,
+        std::ptr::addr_of!(crux::object::PROTOTYPE_EPOCH) as i64,
+    );
+    let epoch = builder
+        .ins()
+        .load(types::I64, MemFlagsData::new(), epoch_addr, 0);
+    let has_verdict = builder.ins().icmp_imm_u(IntCC::NotEqual, recorded, 0);
+    let epoch_ok = builder.ins().icmp(IntCC::Equal, recorded, epoch);
+    let verdict_ok = builder.ins().band(has_verdict, epoch_ok);
+    builder.ins().brif(verdict_ok, room, &[], helper, &[]);
+    builder.seal_block(room);
+    builder.switch_to_block(room);
+    let slots_ptr = builder
+        .ins()
+        .iadd_imm_s(slots_base, crux::heap::GCBOX_DATA_OFFSET as i64);
+    let length = builder.ins().load(
+        types::F64,
+        MemFlagsData::new(),
+        slots_ptr,
+        Offset32::new(std::mem::offset_of!(crux::object::ArraySlots, length) as i32),
+    );
+    let max = builder.ins().f64const(9007199254740991.0);
+    let len_ok = builder.ins().fcmp(FloatCC::LessThan, length, max);
+    let elem_len = builder.ins().load(
+        types::I64,
+        MemFlagsData::new(),
+        slots_ptr,
+        Offset32::new(std::mem::offset_of!(crux::object::ArraySlots, elem_len) as i32),
+    );
+    let elem_cap = builder.ins().load(
+        types::I64,
+        MemFlagsData::new(),
+        slots_ptr,
+        Offset32::new(std::mem::offset_of!(crux::object::ArraySlots, elem_cap) as i32),
+    );
+    let len_u = builder.ins().fcvt_to_uint_sat(types::I64, length);
+    let at_end = builder.ins().icmp(IntCC::Equal, elem_len, len_u);
+    let has_room = builder
+        .ins()
+        .icmp(IntCC::UnsignedLessThan, elem_len, elem_cap);
+    let slots_young = box_ptr_is_young(builder, slots_base);
+    let value_tag = builder.ins().band_imm_u(value, crux::TAG_MASK as i64);
+    let value_not_heap =
+        builder
+            .ins()
+            .icmp_imm_u(IntCC::NotEqual, value_tag, crux::TAG_PREFIX as i64);
+    let barrier_ok = builder.ins().bor(slots_young, value_not_heap);
+    let ok = builder.ins().band(len_ok, at_end);
+    let ok = builder.ins().band(ok, has_room);
+    let ok = builder.ins().band(ok, barrier_ok);
+    builder.ins().brif(ok, write, &[], helper, &[]);
+    builder.seal_block(write);
+    builder.switch_to_block(write);
+    let elem_ptr = builder.ins().load(
+        types::I64,
+        MemFlagsData::new(),
+        slots_ptr,
+        Offset32::new(std::mem::offset_of!(crux::object::ArraySlots, elem_ptr) as i32),
+    );
+    let offset = builder.ins().ishl_imm_u(elem_len, 3);
+    let dest = builder.ins().iadd(elem_ptr, offset);
+    builder
+        .ins()
+        .store(MemFlagsData::new(), value, dest, Offset32::new(0));
+    let new_len = builder.ins().iadd_imm_u(elem_len, 1);
+    builder.ins().store(
+        MemFlagsData::new(),
+        new_len,
+        slots_ptr,
+        Offset32::new(std::mem::offset_of!(crux::object::ArraySlots, elem_len) as i32),
+    );
+    let one = builder.ins().f64const(1.0);
+    let new_length = builder.ins().fadd(length, one);
+    builder.ins().store(
+        MemFlagsData::new(),
+        new_length,
+        slots_ptr,
+        Offset32::new(std::mem::offset_of!(crux::object::ArraySlots, length) as i32),
+    );
+    let generation = builder.ins().load(
+        types::I32,
+        MemFlagsData::new(),
+        obj_ptr,
+        Offset32::new(std::mem::offset_of!(crux::JsObject, generation) as i32),
+    );
+    let new_generation = builder.ins().iadd_imm_u(generation, 1);
+    builder.ins().store(
+        MemFlagsData::new(),
+        new_generation,
+        obj_ptr,
+        Offset32::new(std::mem::offset_of!(crux::JsObject, generation) as i32),
+    );
+    let bits = builder
+        .ins()
+        .bitcast(types::I64, MemFlagsData::new(), new_length);
+    builder.def_var(out, bits);
+    builder.ins().jump(merge, &[]);
+    builder.seal_block(helper);
+    builder.switch_to_block(helper);
+    let pushed = call_helper(
+        builder,
+        helpers,
+        abi,
+        abi.sig_binary,
+        Helper::ArrayPush,
+        &[object, value],
+    )?;
+    emit_intrinsic_sentinel(
+        builder,
+        pushed,
+        JsValue::hole().bits() as i64,
+        slow,
+        merge,
+        out,
+    );
+    Ok(())
+}
+
 /// `bits & TAG_MASK == TAG_PREFIX` and `(bits >> 44) & 0xF == TAG_STRING` — the
 /// string check, mirroring the per-step `is_string` (the heap-prefix test runs
 /// first: a double can carry the tag bits by coincidence).
@@ -2839,6 +3031,9 @@ fn emit_intrinsic(
             builder.seal_block(dense_blk);
             emit_array_at_inline(builder, dense_base, arg1, dense_blk, slow, merge, value);
         }
+        Intrinsic::ArrayPush => {
+            emit_array_push_inline(builder, helpers, abi, this, arg1, slow, merge, value)?;
+        }
         _ => {
             let result = match kind {
                 Intrinsic::ArrayIndexOf => {
@@ -2898,14 +3093,9 @@ fn emit_intrinsic(
                     Helper::ArrayReverse,
                     &[this],
                 )?,
-                _ => call_helper(
-                    builder,
-                    helpers,
-                    abi,
-                    abi.sig_unary,
-                    Helper::ArrayPush,
-                    &[this, arg1],
-                )?,
+                // Every remaining kind is handled by an outer arm above; an
+                // unhandled one here is a lowering bug, not a fallback case.
+                _ => return Err(Unsupported::Step("opt:intrinsic")),
             };
             // `ArrayIndexOf`'s sentinel is `undefined` (never a valid index);
             // the remaining kinds use the hole.
