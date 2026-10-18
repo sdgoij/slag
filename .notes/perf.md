@@ -13428,3 +13428,35 @@ promise and resolves it after 20k allocations exits cleanly.
 
 Full test262 stays at baseline: `all` 48,633 + `intl402` 3,365, 0
 fail/crash/hang/skip. Workspace tests and clippy clean.
+
+## TypedArray stores take the inline path (2026-10-18)
+
+`arrays/typed_array.js` (2M iterations of `ta[k] = v; s += ta[k]`) measured
+124.5 ms against node's 1.13 ms. The read was already inlined in both JIT
+tiers; the *store* was only inlined in the per-step lane, and the optimizing
+tier's `opt_lower::emit_element_store` had a dense-Array arm and a helper
+fallback, so every compiled typed-array store paid `set_member_computed` (the
+census showed 14,000,000 calls for the row).
+
+`emit_element_store` now dispatches on `array_dense` exactly like the read:
+dense cursor → the existing inline store; otherwise the new
+`emit_typed_element_store`, which gates the slots and geometry (not detached,
+not immutable, not resizable, data non-null) and the canonical-index key
+(`idx < array_length`), then dispatches on the element kind. A value is stored
+inline when it is already a valid Number of the kind — an integral double in
+the kind's range for the integer kinds, a finite double for Float32/64 — and
+declines to the helper for everything else (fractional, out of range, NaN,
+±Infinity, or a heap value needing ToNumber), which is where the exact
+wrapping/clamping/coercion behavior stays.
+
+Measured (release CLI, single-agent build): `arrays/typed_array.js` **124.50 →
+24.55 ms (5.1x)**, gap to node **110x → 21.7x**; `set_member_computed`
+14,000,000 → 0 for the row. `cargo test -p jit` 360 pass (the store test covers
+every element kind plus the declined shapes against the interpreter). Full
+corpus values unchanged on all 77 rows.
+
+Build-config trap found on the way: `cargo build --release -p cli -p test262`
+in one invocation unifies `workers` (test262 enables it), and
+`crux::typed_array::WORKERS` then compiles *every* JIT typed-array inline path
+out. The isolated read+write loop measures 58.6 ms in that build against
+24.8 ms in a CLI-alone build. Build the CLI alone for perf runs.

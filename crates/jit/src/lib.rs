@@ -9433,6 +9433,82 @@ run(); run(); run(); run(); run(); run(); run(); run(); run();";
     }
 
     #[test]
+    fn installed_jit_typed_array_element_store_inlines() {
+        // The inline TypedArray element store: `ta[k] = v` over a numeric
+        // element kind in a compiled loop must take the machine-code store —
+        // the counting wrapper proves the `set_member_computed` helper runs
+        // only for the declined shapes (a fractional or out-of-range value, a
+        // heap value needing ToNumber, a resizable/detached buffer) — and the
+        // values must match the interpreter.
+        static SET_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        extern "C" fn counting_set(ctx: *mut c_void, object: u64, key: u64, value: u64) -> u64 {
+            SET_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            (runtime::jit::JIT_SLOW_PATHS.set_member_computed)(ctx, object, key, value)
+        }
+        let mut helpers = runtime_helpers();
+        helpers.set_member_computed = Some(counting_set);
+        let source = r#"function fill(a, n) {
+                        var s = 0;
+                        for (var i = 0; i < n; i++) { a[i & 7] = i & 7; }
+                        for (var i = 0; i < 8; i++) { s = s * 31 + a[i]; }
+                        return s;
+                      }
+                      function odd(a) {
+                        a[0] = 3.5; a[1] = 1e300; a[2] = -0; a[3] = 7;
+                        a[4] = '5'; a[5] = 100; a[8] = 1;
+                        return a[0] + a[1] + a[2] + a[3] + a[4] + a[5] + a[6];
+                      }
+                      var kinds = [
+                        new Int8Array(8), new Uint8Array(8),
+                        new Uint8ClampedArray(8), new Int16Array(8),
+                        new Uint16Array(8), new Int32Array(8),
+                        new Uint32Array(8), new Float32Array(8),
+                        new Float64Array(8)
+                      ];
+                      var total = 0;
+                      for (var k = 0; k < kinds.length; k++) {
+                        total += fill(kinds[k], 5000) + odd(kinds[k]);
+                      }
+                      var rab = new ArrayBuffer(16, { maxByteLength: 32 });
+                      var rv = new Uint8Array(rab, 0, 4);
+                      fill(rv, 10);
+                      total += rv[0] + rv[1] + rv[2] + rv[3];
+                      total;"#;
+        let interp = {
+            let mut agent = runtime::Agent::new();
+            agent.initialize_host_defined_realm().expect("realm");
+            agent.run_script(source).expect("interp runs")
+        };
+
+        extern "C" fn noop_drop(_cache: *mut c_void) {}
+        let mut agent = runtime::Agent::new();
+        agent.initialize_host_defined_realm().expect("realm");
+        let mut cache = JitCache::new(helpers).expect("isa");
+        agent.jit_hook = Some(runtime::jit::JitHook {
+            cache: (&mut cache as *mut JitCache) as *mut c_void,
+            lookup: jit_cache_lookup,
+            drop_cache: noop_drop,
+            helpers: &runtime::jit::JIT_SLOW_PATHS,
+        });
+        let value = agent.run_script(source).expect("jit runs");
+        let compiled = cache.compiled_count();
+        agent.jit_hook = None;
+        assert_eq!(
+            value, interp,
+            "the typed-array store must match the interpreter"
+        );
+        assert!(compiled >= 1, "{compiled} bodies must compile");
+        let writes = SET_CALLS.load(std::sync::atomic::Ordering::Relaxed);
+        // A `workers` build's shared-buffer layout declines to the helper.
+        if !crux::typed_array::WORKERS {
+            assert!(
+                writes < 200,
+                "the compiled store loop must inline the typed-array element store ({writes} set_member_computed calls)"
+            );
+        }
+    }
+
+    #[test]
     fn installed_jit_typed_array_element_read_matches_the_interpreter() {
         // Every supported element kind through a compiled read loop, plus the
         // declined shapes: an out-of-range / non-canonical key, a non-typed-

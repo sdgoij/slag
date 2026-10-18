@@ -2039,6 +2039,321 @@ fn emit_typed_element_read(
     }
 }
 
+/// The numeric-TypedArray arm of [`emit_element_store`]: the write mirror of
+/// [`emit_typed_element_read`]. A fixed view over a detached, immutable or
+/// resizable buffer declines; so does a value that is not already a valid
+/// Number of the element kind (a fractional or out-of-range Number, a heap value
+/// needing ToNumber, NaN/Infinity into a float view), which the helper converts
+/// with the exact observable behavior.
+fn emit_typed_element_store(
+    builder: &mut FunctionBuilder,
+    obj_ptr: ClifValue,
+    key: ClifValue,
+    value: ClifValue,
+    entry: Block,
+    slow: Block,
+    merge: Block,
+) {
+    // (discriminant, element width in bytes, signed, float, value min, value max).
+    const KINDS: [(u8, u8, bool, bool, f64, f64); 9] = [
+        (
+            crux::typed_array::ElementType::Uint8 as u8,
+            1,
+            false,
+            false,
+            0.0,
+            255.0,
+        ),
+        (
+            crux::typed_array::ElementType::Uint8Clamped as u8,
+            1,
+            false,
+            false,
+            0.0,
+            255.0,
+        ),
+        (
+            crux::typed_array::ElementType::Int8 as u8,
+            1,
+            true,
+            false,
+            -128.0,
+            127.0,
+        ),
+        (
+            crux::typed_array::ElementType::Int16 as u8,
+            2,
+            true,
+            false,
+            -32768.0,
+            32767.0,
+        ),
+        (
+            crux::typed_array::ElementType::Uint16 as u8,
+            2,
+            false,
+            false,
+            0.0,
+            65535.0,
+        ),
+        (
+            crux::typed_array::ElementType::Int32 as u8,
+            4,
+            true,
+            false,
+            -2147483648.0,
+            2147483647.0,
+        ),
+        (
+            crux::typed_array::ElementType::Uint32 as u8,
+            4,
+            false,
+            false,
+            0.0,
+            4294967295.0,
+        ),
+        (
+            crux::typed_array::ElementType::Float32 as u8,
+            4,
+            false,
+            true,
+            f64::NEG_INFINITY,
+            f64::INFINITY,
+        ),
+        (
+            crux::typed_array::ElementType::Float64 as u8,
+            8,
+            false,
+            true,
+            f64::NEG_INFINITY,
+            f64::INFINITY,
+        ),
+    ];
+    builder.switch_to_block(entry);
+    if crux::typed_array::WORKERS {
+        builder.ins().jump(slow, &[]);
+        return;
+    }
+    let geom = builder.create_block();
+    let key_gate = builder.create_block();
+    let mut tests: Vec<Block> = Vec::with_capacity(KINDS.len());
+    let mut bodies: Vec<Block> = Vec::with_capacity(KINDS.len());
+    for _ in 0..KINDS.len() {
+        tests.push(builder.create_block());
+        bodies.push(builder.create_block());
+    }
+    // The typed-array gate: the object's `typed_array` cell.
+    let slots_base = builder.ins().load(
+        types::I64,
+        MemFlagsData::new(),
+        obj_ptr,
+        Offset32::new(std::mem::offset_of!(crux::JsObject, typed_array) as i32),
+    );
+    let slots_ok = builder.ins().icmp_imm_u(IntCC::NotEqual, slots_base, 0);
+    builder.ins().brif(slots_ok, geom, &[], slow, &[]);
+    builder.seal_block(geom);
+    builder.switch_to_block(geom);
+    let slots_ptr = builder
+        .ins()
+        .iadd_imm_s(slots_base, crux::heap::GCBOX_DATA_OFFSET as i64);
+    let etype = builder.ins().load(
+        types::I8,
+        MemFlagsData::new(),
+        slots_ptr,
+        Offset32::new(std::mem::offset_of!(crux::object::TypedArraySlots, element_type) as i32),
+    );
+    const STATE_OFFSET: usize = std::mem::offset_of!(crux::object::TypedArraySlots, buffer)
+        + std::mem::offset_of!(crux::typed_array::SharedBuffer, state);
+    const FLAGS_OFFSET: usize = std::mem::offset_of!(crux::object::TypedArraySlots, buffer)
+        + std::mem::offset_of!(crux::typed_array::SharedBuffer, flags);
+    let state_addr = builder.ins().load(
+        types::I64,
+        MemFlagsData::new(),
+        slots_ptr,
+        Offset32::new(STATE_OFFSET as i32),
+    );
+    let flags_addr = builder.ins().load(
+        types::I64,
+        MemFlagsData::new(),
+        slots_ptr,
+        Offset32::new(FLAGS_OFFSET as i32),
+    );
+    let data = builder.ins().load(
+        types::I64,
+        MemFlagsData::new(),
+        state_addr,
+        Offset32::new(std::mem::offset_of!(crux::typed_array::BlockState, data) as i32),
+    );
+    let detached = builder.ins().load(
+        types::I8,
+        MemFlagsData::new(),
+        flags_addr,
+        Offset32::new(std::mem::offset_of!(crux::typed_array::BufferFlags, detached) as i32),
+    );
+    let immutable = builder.ins().load(
+        types::I8,
+        MemFlagsData::new(),
+        flags_addr,
+        Offset32::new(std::mem::offset_of!(crux::typed_array::BufferFlags, immutable) as i32),
+    );
+    let resizable = builder.ins().load(
+        types::I8,
+        MemFlagsData::new(),
+        flags_addr,
+        Offset32::new(std::mem::offset_of!(crux::typed_array::BufferFlags, resizable) as i32),
+    );
+    let arr_len = builder.ins().load(
+        types::I64,
+        MemFlagsData::new(),
+        slots_ptr,
+        Offset32::new(std::mem::offset_of!(crux::object::TypedArraySlots, array_length) as i32),
+    );
+    let byte_offset = builder.ins().load(
+        types::I64,
+        MemFlagsData::new(),
+        slots_ptr,
+        Offset32::new(std::mem::offset_of!(crux::object::TypedArraySlots, byte_offset) as i32),
+    );
+    let det_ok = builder.ins().icmp_imm_u(IntCC::Equal, detached, 0);
+    let imm_ok = builder.ins().icmp_imm_u(IntCC::Equal, immutable, 0);
+    let res_ok = builder.ins().icmp_imm_u(IntCC::Equal, resizable, 0);
+    let clear_ok = builder.ins().band(det_ok, imm_ok);
+    let clear_ok = builder.ins().band(clear_ok, res_ok);
+    let has_data = builder.ins().icmp_imm_u(IntCC::NotEqual, data, 0);
+    let geom_ok = builder.ins().band(clear_ok, has_data);
+    builder.ins().brif(geom_ok, key_gate, &[], slow, &[]);
+    builder.seal_block(key_gate);
+    // The canonical-index key gate (same as the dense arm's, plus the
+    // element-count bound).
+    builder.switch_to_block(key_gate);
+    let num = builder.ins().bitcast(types::F64, MemFlagsData::new(), key);
+    let max = builder.ins().f64const(4294967295.0);
+    let lt_max = builder.ins().fcmp(FloatCC::LessThan, num, max);
+    let idx = builder.ins().fcvt_to_uint_sat(types::I64, num);
+    let back = builder.ins().fcvt_from_uint(types::F64, idx);
+    let integral = builder.ins().fcmp(FloatCC::Equal, back, num);
+    let in_bounds = builder.ins().icmp(IntCC::UnsignedLessThan, idx, arr_len);
+    let key_ok = builder.ins().band(integral, lt_max);
+    let write_ok = builder.ins().band(key_ok, in_bounds);
+    let base = builder.ins().iadd(data, byte_offset);
+    builder.ins().brif(write_ok, tests[0], &[], slow, &[]);
+    builder.seal_block(tests[0]);
+    // The element-kind dispatch: one test per supported kind, chained; the
+    // last kind's miss is `slow`.
+    for i in 0..KINDS.len() {
+        builder.switch_to_block(tests[i]);
+        let matches = builder
+            .ins()
+            .icmp_imm_u(IntCC::Equal, etype, KINDS[i].0 as i64);
+        let next = if i + 1 < KINDS.len() {
+            tests[i + 1]
+        } else {
+            slow
+        };
+        builder.ins().brif(matches, bodies[i], &[], next, &[]);
+        builder.seal_block(bodies[i]);
+        if i + 1 < KINDS.len() {
+            builder.seal_block(tests[i + 1]);
+        }
+    }
+    for (i, &(_, width, signed, float, vmin, vmax)) in KINDS.iter().enumerate() {
+        builder.switch_to_block(bodies[i]);
+        if float {
+            // A finite Number only: an ordered comparison is false for NaN
+            // (which is also how a heap value's bits decode) and for the
+            // infinities, so those go to the helper, which distinguishes a
+            // real NaN from the NaN-boxed non-Number tags.
+            let vnum = builder
+                .ins()
+                .bitcast(types::F64, MemFlagsData::new(), value);
+            let lo = builder.ins().f64const(vmin);
+            let hi = builder.ins().f64const(vmax);
+            let gt = builder.ins().fcmp(FloatCC::GreaterThan, vnum, lo);
+            let lt = builder.ins().fcmp(FloatCC::LessThan, vnum, hi);
+            let ok = builder.ins().band(gt, lt);
+            let write = builder.create_block();
+            builder.ins().brif(ok, write, &[], slow, &[]);
+            builder.seal_block(write);
+            builder.switch_to_block(write);
+            let addr = typed_element_addr(builder, base, idx, width);
+            if width == 4 {
+                let narrow = builder.ins().fdemote(types::F32, vnum);
+                let bits = builder
+                    .ins()
+                    .bitcast(types::I32, MemFlagsData::new(), narrow);
+                builder
+                    .ins()
+                    .store(MemFlagsData::new(), bits, addr, Offset32::new(0));
+            } else {
+                builder
+                    .ins()
+                    .store(MemFlagsData::new(), value, addr, Offset32::new(0));
+            }
+            builder.ins().jump(merge, &[]);
+            continue;
+        }
+        let vnum = builder
+            .ins()
+            .bitcast(types::F64, MemFlagsData::new(), value);
+        let lo = builder.ins().f64const(vmin);
+        let hi = builder.ins().f64const(vmax);
+        let ge = builder.ins().fcmp(FloatCC::GreaterThanOrEqual, vnum, lo);
+        let le = builder.ins().fcmp(FloatCC::LessThanOrEqual, vnum, hi);
+        // The saturating conversions never trap on the NaN bits of a heap
+        // value; the round trip below then rejects them.
+        let (conv, vback) = if signed {
+            let conv = builder.ins().fcvt_to_sint_sat(types::I64, vnum);
+            let back = builder.ins().fcvt_from_sint(types::F64, conv);
+            (conv, back)
+        } else {
+            let conv = builder.ins().fcvt_to_uint_sat(types::I64, vnum);
+            let back = builder.ins().fcvt_from_uint(types::F64, conv);
+            (conv, back)
+        };
+        // The round trip rejects a fractional or out-of-range Number (and
+        // -0.0 passes as 0, which is what ToIntegerOrInfinity(-0) is).
+        let integral = builder.ins().fcmp(FloatCC::Equal, vback, vnum);
+        let in_range = builder.ins().band(ge, le);
+        let ok = builder.ins().band(in_range, integral);
+        let write = builder.create_block();
+        builder.ins().brif(ok, write, &[], slow, &[]);
+        builder.seal_block(write);
+        builder.switch_to_block(write);
+        let addr = typed_element_addr(builder, base, idx, width);
+        let narrowed = match width {
+            1 => builder.ins().ireduce(types::I8, conv),
+            2 => builder.ins().ireduce(types::I16, conv),
+            _ => builder.ins().ireduce(types::I32, conv),
+        };
+        builder
+            .ins()
+            .store(MemFlagsData::new(), narrowed, addr, Offset32::new(0));
+        builder.ins().jump(merge, &[]);
+    }
+}
+
+/// The byte address of element `idx` in a TypedArray view (the element width
+/// selects the shift).
+fn typed_element_addr(
+    builder: &mut FunctionBuilder,
+    base: ClifValue,
+    idx: ClifValue,
+    width: u8,
+) -> ClifValue {
+    let shift = match width {
+        1 => 0,
+        2 => 1,
+        4 => 2,
+        _ => 3,
+    };
+    let scaled = if shift == 0 {
+        idx
+    } else {
+        builder.ins().ishl_imm_u(idx, shift)
+    };
+    builder.ins().iadd(base, scaled)
+}
+
 /// Load a numeric TypedArray element at `addr` and convert it to NaN-boxed
 /// Number bits: `width` bytes, `signed` selecting sign- vs zero-extension.
 fn emit_typed_element_number(
@@ -2528,51 +2843,28 @@ fn box_ptr_is_young(builder: &mut FunctionBuilder, box_ptr: ClifValue) -> ClifVa
     builder.ins().icmp_imm_u(IntCC::NotEqual, young, 0)
 }
 
-/// The inline dense-Array element store (the write mirror of
-/// `emit_element_read`): a dense-Array receiver, a canonical in-bounds index, a
-/// non-hole element, and a barrier-safe value write the element in place with
-/// the interpreter's generation bump. Any decline jumps to `slow`; the write
-/// jumps to `merge`.
-fn emit_dense_element_store(
+/// The dense arm of [`emit_element_store`] (the write mirror of the dense
+/// read arm): a canonical in-bounds index, a non-hole element, and a
+/// barrier-safe value write the element in place with the interpreter's
+/// generation bump. `dense_base` is the receiver's live dense cursor, read by
+/// the caller's dispatch; any decline jumps to `slow`, the write to `merge`.
+#[allow(clippy::too_many_arguments)]
+fn emit_dense_element_store_inline(
     builder: &mut FunctionBuilder,
-    object: ClifValue,
+    dense_base: ClifValue,
+    obj_ptr: ClifValue,
     key: ClifValue,
     value: ClifValue,
+    entry: Block,
     slow: Block,
     merge: Block,
 ) -> Result<(), Unsupported> {
-    let inline = builder.create_block();
-    let probe = builder.create_block();
     let key_ok_check = builder.create_block();
     let bounds = builder.create_block();
     let hole_check = builder.create_block();
     let value_check = builder.create_block();
     let fast_write = builder.create_block();
-    builder.ins().jump(inline, &[]);
-    builder.switch_to_block(inline);
-    let object_pattern = (crux::TAG_PREFIX >> 44) | crux::TAG_OBJECT;
-    let tag_bits = builder.ins().ushr_imm_u(object, 44);
-    let obj_ok = builder
-        .ins()
-        .icmp_imm_u(IntCC::Equal, tag_bits, object_pattern as i64);
-    builder.ins().brif(obj_ok, probe, &[], slow, &[]);
-    builder.seal_block(inline);
-    builder.switch_to_block(probe);
-    let obj_ptr = builder.ins().band_imm_u(object, crux::PAYLOAD_MASK as i64);
-    let obj_ptr = builder.ins().ishl_imm_u(obj_ptr, 4);
-    let obj_ptr = builder
-        .ins()
-        .iadd_imm_s(obj_ptr, crux::heap::GCBOX_DATA_OFFSET as i64);
-    let slots_base = builder.ins().load(
-        types::I64,
-        MemFlagsData::new(),
-        obj_ptr,
-        Offset32::new(std::mem::offset_of!(crux::JsObject, array_dense) as i32),
-    );
-    let slots_ok = builder.ins().icmp_imm_u(IntCC::NotEqual, slots_base, 0);
-    builder.ins().brif(slots_ok, key_ok_check, &[], slow, &[]);
-    builder.seal_block(probe);
-    builder.switch_to_block(key_ok_check);
+    builder.switch_to_block(entry);
     let num = builder.ins().bitcast(types::F64, MemFlagsData::new(), key);
     let max = builder.ins().f64const(4294967295.0);
     let lt_max = builder.ins().fcmp(FloatCC::LessThan, num, max);
@@ -2585,7 +2877,7 @@ fn emit_dense_element_store(
     builder.switch_to_block(bounds);
     let slots_ptr = builder
         .ins()
-        .iadd_imm_s(slots_base, crux::heap::GCBOX_DATA_OFFSET as i64);
+        .iadd_imm_s(dense_base, crux::heap::GCBOX_DATA_OFFSET as i64);
     let elem_len = builder.ins().load(
         types::I64,
         MemFlagsData::new(),
@@ -2625,7 +2917,7 @@ fn emit_dense_element_store(
         builder
             .ins()
             .icmp_imm_u(IntCC::NotEqual, value_tag, crux::TAG_PREFIX as i64);
-    let slots_young = box_ptr_is_young(builder, slots_base);
+    let slots_young = box_ptr_is_young(builder, dense_base);
     let barrier_ok = builder.ins().bor(slots_young, value_not_heap);
     let store_ok = builder.ins().band(not_prototype, barrier_ok);
     builder.ins().brif(store_ok, fast_write, &[], slow, &[]);
@@ -2645,9 +2937,9 @@ fn emit_dense_element_store(
     Ok(())
 }
 
-/// The computed element store: the inline dense-Array write, falling back to
-/// the full `set_member_computed` helper for every other receiver, key, or a
-/// hole.
+/// The computed element store: the inline dense-Array write, the inline
+/// numeric-TypedArray write, and the full `set_member_computed` helper for
+/// every other receiver, key, or value.
 fn emit_element_store(
     builder: &mut FunctionBuilder,
     helpers: &JitHelpers,
@@ -2658,7 +2950,37 @@ fn emit_element_store(
 ) -> Result<(), Unsupported> {
     let slow = builder.create_block();
     let merge = builder.create_block();
-    emit_dense_element_store(builder, object, key, value, slow, merge)?;
+    let kind = builder.create_block();
+    let dense = builder.create_block();
+    let typed = builder.create_block();
+    // Object tag: the top 20 bits equal the packed prefix+Object pattern.
+    let object_pattern = (crux::TAG_PREFIX >> 44) | crux::TAG_OBJECT;
+    let tag_bits = builder.ins().ushr_imm_u(object, 44);
+    let obj_ok = builder
+        .ins()
+        .icmp_imm_u(IntCC::Equal, tag_bits, object_pattern as i64);
+    builder.ins().brif(obj_ok, kind, &[], slow, &[]);
+    builder.seal_block(kind);
+    // A non-null `array_dense` is the dense switch; otherwise the object may
+    // be a numeric TypedArray.
+    builder.switch_to_block(kind);
+    let obj_ptr = builder.ins().band_imm_u(object, crux::PAYLOAD_MASK as i64);
+    let obj_ptr = builder.ins().ishl_imm_u(obj_ptr, 4);
+    let obj_ptr = builder
+        .ins()
+        .iadd_imm_s(obj_ptr, crux::heap::GCBOX_DATA_OFFSET as i64);
+    let dense_base = builder.ins().load(
+        types::I64,
+        MemFlagsData::new(),
+        obj_ptr,
+        Offset32::new(std::mem::offset_of!(crux::JsObject, array_dense) as i32),
+    );
+    let is_dense = builder.ins().icmp_imm_u(IntCC::NotEqual, dense_base, 0);
+    builder.ins().brif(is_dense, dense, &[], typed, &[]);
+    builder.seal_block(dense);
+    builder.seal_block(typed);
+    emit_dense_element_store_inline(builder, dense_base, obj_ptr, key, value, dense, slow, merge)?;
+    emit_typed_element_store(builder, obj_ptr, key, value, typed, slow, merge);
     builder.switch_to_block(slow);
     call_helper(
         builder,
