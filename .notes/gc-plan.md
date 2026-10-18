@@ -206,7 +206,7 @@ precise JS-visible roots plus a conservative native-stack scan:
   live box set — a raw `Gc<T>` word or a NaN-boxed `Value` payload
   (`Value::encoded_box_address`) — so Rust locals and closure captures
   survive. Stack bounds come from `GetCurrentThreadStackLimits` (Windows)
-  or `/proc/self/maps` (Linux); wasm scans its linear memory (GC-7); other
+  or `/proc/self/maps` (Linux); wasm stops at the module-initial stack top (GC-7); other
   platforms run precise-roots-only.
 - **Marking is iterative** (an explicit worklist): a deep rope or prototype
   chain cannot overflow the native stack (the recursive first cut crashed
@@ -520,11 +520,21 @@ across an allocation, replacing the opaque `Box<dyn FnOnce>` job closures'
 audit; the poison sweep + a scan-disable knob are the reliable detectors for
 driving it incrementally.
 
-**Landed fix (this cut).** `stack_bounds()` for wasm scans from the current
-frame to the end of the current linear memory
-(`core::arch::wasm32::memory_size`); the region above the real stack top is
-dlmalloc heap/static data that share linear memory, and the conservative
-scan only ever retains, so the wider region is safe (it widens retention).
+**Landed fix (this cut).** `stack_bounds()` for wasm captures the
+module-initial stack pointer in an `.init_array` constructor and scans from the
+current frame to that bound, so the dlmalloc heap and static data above the
+stack are no longer in the root set. The first cut scanned to the end of linear
+memory (`core::arch::wasm32::memory_size`) because the conservative scan only
+retains; that was safe but pathological: every heap word holding a box address
+became a root, so `live` climbed while `swept` stayed at zero, and the pause
+grew with the heap. Measured on the standalone `wasm32-unknown-emscripten`
+repro (60 frames of 20k allocations, `-sALLOW_MEMORY_GROWTH=1
+-sSTACK_SIZE=8388608`): before, `stack_words=196,785,793`, `live=4.1M`,
+`swept=0`, `pause_us=560,000`; after, `stack_words=1,698`, `live=6.6k->3.5k`,
+`swept=3,071`, `pause_us=~63`. The `.init_array` static is kept by `#[used]`
+and compiles on emscripten, `wasm32-unknown-unknown`, and `wasip1`; a target
+that does not run constructors falls back to the memory-end bound (over-retains,
+never frees a live box).
 `scan_stack` now dedups scanned boxes (an `AddrSet` per scan), bounding the
 work list by the live set instead of by every stored reference in the
 scanned region — this removed the `capacity overflow` the earlier
@@ -564,9 +574,10 @@ detector.
    regresses, the frame-slot/leaf-inline contracts (see the
    `slag-bytecode-vm` skill) are the places to recover it.
 6. **The conservative scan is platform-dependent.** Windows/Linux have stack
-   bounds; wasm now scans the whole linear memory (safe, over-retains) and
-   needs a precise stack-top capture to tighten (GC-7). A precise-root-only
-   future must not assume the scan can simply be deleted.
+   bounds; wasm bounds the scan at the module-initial stack pointer captured by
+   an `.init_array` constructor (GC-7), falling back to the linear-memory end
+   on a target that does not run constructors. A precise-root-only future must
+   not assume the scan can simply be deleted.
 7. **Rust-held transients at safe points are load-bearing.** The poison-sweep
    experiment proved the embed boundary (a `Context::eval` completion value)
    is swept without the scan on every platform — native only masks it via

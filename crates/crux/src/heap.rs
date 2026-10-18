@@ -2026,20 +2026,47 @@ fn maps_stack_top(sp: usize) -> Option<usize> {
     None
 }
 
-/// wasm32: the shadow stack lives in the module's linear memory (rustc's
-/// wasm layout), and wasm has no OS stack API to query. Scan from the
-/// current frame to the end of the current memory. The region above the
-/// real stack top is the dlmalloc heap and static data that share linear
-/// memory; the conservative scan only ever retains (never falsely frees),
-/// so the wider region is safe — it just widens retention. See the GC-7
-/// note in .notes/gc-plan.md: capturing the module-initial stack pointer
-/// would bound the scan to the actual stack.
+/// wasm32: the shadow stack lives in the module's linear memory, and the
+/// platform has no stack API. The module-initial stack pointer is captured by
+/// an `.init_array` constructor, so the scan stops at the real stack top
+/// instead of the end of linear memory. Scanning past the top is not merely
+/// wasteful: the dlmalloc heap and static data live there, so every address
+/// stored in the heap becomes a root, `live` climbs, `swept` stays zero, and
+/// the pause grows with the heap (GC-7). The constructor's own frame sits just
+/// below the initial stack pointer; the frames above it belong to the runtime's
+/// constructor call chain, which holds no GC handles.
 #[cfg(target_arch = "wasm32")]
 fn stack_bounds() -> Option<(usize, usize)> {
     let probe = 0usize;
     let sp = &probe as *const usize as usize;
+    let high = WASM_STACK_HIGH.load(core::sync::atomic::Ordering::Relaxed);
+    if high > sp {
+        return Some((sp, high));
+    }
+    // The constructor did not run (a target that does not invoke
+    // `.init_array`): fall back to the memory end. That is wider than the real
+    // stack, so it only widens retention -- it never frees a live box.
     let end = core::arch::wasm32::memory_size::<0>().saturating_mul(65536);
     (end > sp).then_some((sp, end))
+}
+
+/// The stack pointer recorded at module initialization (see `stack_bounds`).
+#[cfg(target_arch = "wasm32")]
+static WASM_STACK_HIGH: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(target_arch = "wasm32")]
+#[used]
+#[unsafe(link_section = ".init_array")]
+static WASM_STACK_HIGH_INIT: extern "C" fn() = record_wasm_stack_high;
+
+#[cfg(target_arch = "wasm32")]
+extern "C" fn record_wasm_stack_high() {
+    let probe = 0usize;
+    WASM_STACK_HIGH.store(
+        &probe as *const usize as usize,
+        core::sync::atomic::Ordering::Relaxed,
+    );
 }
 
 /// Platforms without a stack-bounds source: no conservative scan.
