@@ -487,6 +487,8 @@ fn lower_inst(
                     int_r,
                     inst.ty == Type::Int,
                 )?
+            } else if inst.op == Op::StrictEq && crate::strict_eq_inline_enabled() {
+                emit_strict_eq(builder, helpers, abi, lhs, rhs)?
             } else {
                 let op = builder.ins().iconst(types::I64, disc as i64);
                 call_helper(
@@ -3880,6 +3882,98 @@ fn emit_completion_store(
     builder.seal_block(store);
     builder.switch_to_block(skip);
     builder.seal_block(skip);
+}
+
+/// Inline strict equality for every shape a tag check can decide. Two equal
+/// bit patterns are equal unless they are a Number NaN; a Number pair compares
+/// as f64 (so `+0 === -0` and `NaN !== NaN` follow the spec); every other
+/// unequal-bit pair is unequal, because only Strings and BigInts compare by
+/// content and those fall to the helper. `lhs`/`rhs` are tagged Value bits.
+fn emit_strict_eq(
+    builder: &mut FunctionBuilder,
+    helpers: &JitHelpers,
+    abi: &Abi,
+    lhs: ClifValue,
+    rhs: ClifValue,
+) -> Result<ClifValue, Unsupported> {
+    let value = builder.declare_var(types::I64);
+    let fast = builder.create_block();
+    let slow = builder.create_block();
+    let merge = builder.create_block();
+    let same = builder.ins().icmp(IntCC::Equal, lhs, rhs);
+    let lf = builder.ins().bitcast(types::F64, MemFlagsData::new(), lhs);
+    let rf = builder.ins().bitcast(types::F64, MemFlagsData::new(), rhs);
+    // A tagged value's bits also decode as a NaN, so the NaN test is gated on
+    // the double tag: `undefined === undefined` must not read as unequal.
+    let l_dbl_bits = builder.ins().band_imm_u(lhs, crux::TAG_MASK as i64);
+    let r_dbl_bits = builder.ins().band_imm_u(rhs, crux::TAG_MASK as i64);
+    let l_dbl = builder
+        .ins()
+        .icmp_imm_u(IntCC::NotEqual, l_dbl_bits, crux::TAG_PREFIX as i64);
+    let r_dbl = builder
+        .ins()
+        .icmp_imm_u(IntCC::NotEqual, r_dbl_bits, crux::TAG_PREFIX as i64);
+    let l_nan = builder.ins().fcmp(FloatCC::Unordered, lf, lf);
+    let l_nan = builder.ins().band(l_nan, l_dbl);
+    // Comparison results are i8 0/1, so a negation is `bxor 1` (`bnot`
+    // would answer 0xFE, which `select` still reads as true).
+    let one = builder.ins().iconst(types::I8, 1);
+    let not_nan = builder.ins().bxor(l_nan, one);
+    let same_non_nan = builder.ins().band(same, not_nan);
+    let zero = builder.ins().f64const(0.0);
+    let l_zero = builder.ins().fcmp(FloatCC::Equal, lf, zero);
+    let r_zero = builder.ins().fcmp(FloatCC::Equal, rf, zero);
+    let both_zero = builder.ins().band(l_zero, r_zero);
+    let eq = builder.ins().bor(same_non_nan, both_zero);
+    // Strings and BigInts compare by content even when their boxes differ.
+    let l_non_dbl = builder.ins().bxor(l_dbl, one);
+    let r_non_dbl = builder.ins().bxor(r_dbl, one);
+    let l_tag = builder.ins().ushr_imm_u(lhs, 44);
+    let l_tag = builder.ins().band_imm_u(l_tag, 0xF);
+    let r_tag = builder.ins().ushr_imm_u(rhs, 44);
+    let r_tag = builder.ins().band_imm_u(r_tag, 0xF);
+    let l_is_str = builder
+        .ins()
+        .icmp_imm_u(IntCC::Equal, l_tag, crux::TAG_STRING as i64);
+    let l_str = builder.ins().band(l_non_dbl, l_is_str);
+    let r_is_str = builder
+        .ins()
+        .icmp_imm_u(IntCC::Equal, r_tag, crux::TAG_STRING as i64);
+    let r_str = builder.ins().band(r_non_dbl, r_is_str);
+    let l_is_big = builder
+        .ins()
+        .icmp_imm_u(IntCC::Equal, l_tag, crux::TAG_BIGINT as i64);
+    let l_big = builder.ins().band(l_non_dbl, l_is_big);
+    let r_is_big = builder
+        .ins()
+        .icmp_imm_u(IntCC::Equal, r_tag, crux::TAG_BIGINT as i64);
+    let r_big = builder.ins().band(r_non_dbl, r_is_big);
+    let both_str = builder.ins().band(l_str, r_str);
+    let both_big = builder.ins().band(l_big, r_big);
+    let needs_helper = builder.ins().bor(both_str, both_big);
+    builder.ins().brif(needs_helper, slow, &[], fast, &[]);
+    builder.seal_block(fast);
+    builder.switch_to_block(fast);
+    let answer = canonical_bool(builder, eq);
+    builder.def_var(value, answer);
+    builder.ins().jump(merge, &[]);
+    builder.seal_block(slow);
+    builder.switch_to_block(slow);
+    let disc = binary_op(Op::StrictEq).expect("strict eq discriminant");
+    let disc = builder.ins().iconst(types::I64, disc as i64);
+    let answer = call_helper(
+        builder,
+        helpers,
+        abi,
+        abi.sig_binary,
+        Helper::BinarySlow,
+        &[disc, lhs, rhs],
+    )?;
+    builder.def_var(value, answer);
+    builder.ins().jump(merge, &[]);
+    builder.seal_block(merge);
+    builder.switch_to_block(merge);
+    Ok(builder.use_var(value))
 }
 
 /// The bare f64 form of an arithmetic or ordering op whose operands are proven

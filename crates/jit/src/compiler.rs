@@ -5280,6 +5280,24 @@ impl<'a> Lowerer<'a> {
     }
 
     /// `bits & TAG_MASK == TAG_PREFIX` and `(bits >> 44) & 0xF ==
+    /// TAG_BIGINT` — the BigInt check (I8). BigInt/BigInt `===` compares by
+    /// value, so the inline strict-equality path declines it to the helper.
+    fn is_bigint(&mut self, bits: ClifValue) -> ClifValue {
+        let is_heap = self.builder.ins().band_imm_u(bits, crux::TAG_MASK as i64);
+        let is_heap = self
+            .builder
+            .ins()
+            .icmp_imm_u(IntCC::Equal, is_heap, crux::TAG_PREFIX as i64);
+        let tag = self.builder.ins().ushr_imm_u(bits, 44);
+        let tag = self.builder.ins().band_imm_u(tag, 0xF);
+        let is_big = self
+            .builder
+            .ins()
+            .icmp_imm_u(IntCC::Equal, tag, crux::TAG_BIGINT as i64);
+        self.builder.ins().band(is_heap, is_big)
+    }
+
+    /// `bits & TAG_MASK == TAG_PREFIX` and `(bits >> 44) & 0xF ==
     /// TAG_FUNCTION` — the function check (M10: the compiled `CallApply`
     /// fast path's callee gate — a non-function receiver must keep the slow
     /// path's exact `do_call_apply` TypeError). Same discipline as
@@ -8937,6 +8955,72 @@ impl<'a> Lowerer<'a> {
         Ok(self.builder.use_var(res_var))
     }
 
+    /// Inline `===`/`!==` for every shape a tag check can decide (the per-step
+    /// twin of `opt_lower::emit_strict_eq`): equal bits are equal unless they
+    /// are a Number NaN; a Number pair compares as f64 (`+0 === -0`); every
+    /// other unequal-bit pair is unequal, because only String/String and
+    /// BigInt/BigInt compare by content and those fall to the helper.
+    fn emit_strict_eq_inline(
+        &mut self,
+        op: BinaryOp,
+        lhs: ClifValue,
+        rhs: ClifValue,
+    ) -> Result<ClifValue, Unsupported> {
+        let same = self.builder.ins().icmp(IntCC::Equal, lhs, rhs);
+        let lf = self
+            .builder
+            .ins()
+            .bitcast(types::F64, MemFlagsData::new(), lhs);
+        let rf = self
+            .builder
+            .ins()
+            .bitcast(types::F64, MemFlagsData::new(), rhs);
+        let l_dbl = self.is_double(lhs);
+        let l_nan = self.builder.ins().fcmp(FloatCC::Unordered, lf, lf);
+        let l_nan = self.builder.ins().band(l_nan, l_dbl);
+        // Comparison results are i8 0/1, so a negation is `bxor 1` (`bnot`
+        // would answer 0xFE, which `select` still reads as true).
+        let one = self.builder.ins().iconst(types::I8, 1);
+        let not_nan = self.builder.ins().bxor(l_nan, one);
+        let same_non_nan = self.builder.ins().band(same, not_nan);
+        let zero = self.builder.ins().f64const(0.0);
+        let l_zero = self.builder.ins().fcmp(FloatCC::Equal, lf, zero);
+        let r_zero = self.builder.ins().fcmp(FloatCC::Equal, rf, zero);
+        let both_zero = self.builder.ins().band(l_zero, r_zero);
+        let mut eq = self.builder.ins().bor(same_non_nan, both_zero);
+        if op == BinaryOp::StrictNotEqual {
+            eq = self.builder.ins().bxor(eq, one);
+        }
+        let l_str = self.is_string(lhs);
+        let r_str = self.is_string(rhs);
+        let both_str = self.builder.ins().band(l_str, r_str);
+        let l_big = self.is_bigint(lhs);
+        let r_big = self.is_bigint(rhs);
+        let both_big = self.builder.ins().band(l_big, r_big);
+        let needs_helper = self.builder.ins().bor(both_str, both_big);
+        let res_var = self.builder.declare_var(types::I64);
+        let fast = self.builder.create_block();
+        let slow = self.builder.create_block();
+        let merge = self.builder.create_block();
+        self.builder.ins().brif(needs_helper, slow, &[], fast, &[]);
+        self.builder.switch_to_block(fast);
+        let t = self.builder.ins().iconst(types::I64, self.true_bits);
+        let f = self.builder.ins().iconst(types::I64, self.false_bits);
+        let answer = self.builder.ins().select(eq, t, f);
+        self.builder.def_var(res_var, answer);
+        self.builder.ins().jump(merge, &[]);
+        self.builder.switch_to_block(slow);
+        let op_imm = self.builder.ins().iconst(types::I64, op as i64);
+        let slow_res = self.call_slow(self.sig_binary, Helper::BinarySlow, &[op_imm, lhs, rhs])?;
+        self.builder.def_var(res_var, slow_res);
+        self.builder.ins().jump(merge, &[]);
+        self.builder.seal_block(fast);
+        self.builder.seal_block(slow);
+        self.builder.seal_block(merge);
+        self.builder.switch_to_block(merge);
+        Ok(self.builder.use_var(res_var))
+    }
+
     /// `emit_binary` with compile-time knowledge that an operand is already a
     /// canonical `Value::Number` (the register executor's accumulator
     /// provenance, or a Number constant). A known operand's tag check is
@@ -8958,6 +9042,15 @@ impl<'a> Lowerer<'a> {
     ) -> Result<ClifValue, Unsupported> {
         if op == BinaryOp::Rem {
             return self.emit_mod_int(lhs, rhs, lhs_known, rhs_known);
+        }
+        // Strict equality has a complete inline for every operand shape; only
+        // the both-known-Number case is cheaper as a bare f64 compare, so the
+        // general path takes over whenever either side is unproven.
+        if matches!(op, BinaryOp::StrictEqual | BinaryOp::StrictNotEqual)
+            && !(lhs_known && rhs_known)
+            && crate::strict_eq_inline_enabled()
+        {
+            return self.emit_strict_eq_inline(op, lhs, rhs);
         }
         let Some(inline) = inline_binary(op) else {
             let op_imm = self.builder.ins().iconst(types::I64, op as i64);

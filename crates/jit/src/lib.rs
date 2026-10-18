@@ -139,6 +139,14 @@ pub use code_buffer::ExecutableCode;
 pub use compiler::JitEngine;
 pub use helpers::JitHelpers;
 
+/// Whether the inline strict-equality lowering is on (both lanes).
+/// `SLAG_STRICT_EQ=0` turns it off for a same-binary A/B; a lowering decision is
+/// made once per compiled body, so the env read is compiled-code-time only.
+pub(crate) fn strict_eq_inline_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("SLAG_STRICT_EQ").is_none_or(|value| value != "0"))
+}
+
 use std::collections::HashMap;
 use std::os::raw::c_void;
 use std::rc::Rc;
@@ -9506,6 +9514,65 @@ run(); run(); run(); run(); run(); run(); run(); run(); run();";
                 "the compiled store loop must inline the typed-array element store ({writes} set_member_computed calls)"
             );
         }
+    }
+
+    #[test]
+    fn installed_jit_strict_equality_matches_the_interpreter() {
+        // The inline strict-equality path: equal bits are equal unless they are
+        // a Number NaN, a Number pair compares as f64 (+0 === -0), and only a
+        // String/String or BigInt/BigInt pair falls to the helper. The matrix
+        // covers every tag and both content types, so the exactness comparison
+        // is the check; the helper count proves the tag-decided pairs inline.
+        static EQ_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        extern "C" fn counting_eq(ctx: *mut c_void, op: u64, a: u64, b: u64) -> u64 {
+            EQ_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            (runtime::jit::JIT_SLOW_PATHS.binary_slow)(ctx, op, a, b)
+        }
+        let mut helpers = runtime_helpers();
+        helpers.binary_slow = Some(counting_eq);
+        let source = r#"function eq(a, b) { return a === b; }
+                      var sym = Symbol('s');
+                      var o1 = {}, o2 = {};
+                      var f1 = function () {}, f2 = function () {};
+                      var vals = [0, -0, 1, 1.5, -1, NaN, Infinity, -Infinity,
+                        0.1, '1', 'a', '', 'a', true, false, undefined, null,
+                        o1, o1, o2, f1, f1, f2, sym, sym, 1n, 2n, 1n];
+                      var n = 0;
+                      for (var i = 0; i < vals.length; i++) {
+                        for (var j = 0; j < vals.length; j++) {
+                          if (eq(vals[i], vals[j])) n++;
+                        }
+                      }
+                      n;"#;
+        let interp = {
+            let mut agent = runtime::Agent::new();
+            agent.initialize_host_defined_realm().expect("realm");
+            agent.run_script(source).expect("interp runs")
+        };
+        extern "C" fn noop_drop(_cache: *mut c_void) {}
+        let mut agent = runtime::Agent::new();
+        agent.initialize_host_defined_realm().expect("realm");
+        let mut cache = JitCache::new(helpers).expect("isa");
+        agent.jit_hook = Some(runtime::jit::JitHook {
+            cache: (&mut cache as *mut JitCache) as *mut c_void,
+            lookup: jit_cache_lookup,
+            drop_cache: noop_drop,
+            helpers: &runtime::jit::JIT_SLOW_PATHS,
+        });
+        let value = agent.run_script(source).expect("jit runs");
+        let compiled = cache.compiled_count();
+        agent.jit_hook = None;
+        assert_eq!(
+            value, interp,
+            "compiled strict equality must match the interpreter"
+        );
+        assert!(compiled >= 1, "{compiled} bodies");
+        let calls = EQ_CALLS.load(std::sync::atomic::Ordering::Relaxed);
+        // Only the String/String and BigInt/BigInt pairs (25 of 784) need it.
+        assert!(
+            calls < 100,
+            "strict equality must inline the tag-decided pairs ({calls} binary_slow calls)"
+        );
     }
 
     #[test]

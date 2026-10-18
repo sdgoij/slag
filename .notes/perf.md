@@ -13460,3 +13460,33 @@ in one invocation unifies `workers` (test262 enables it), and
 `crux::typed_array::WORKERS` then compiles *every* JIT typed-array inline path
 out. The isolated read+write loop measures 58.6 ms in that build against
 24.8 ms in a CLI-alone build. Build the CLI alone for perf runs.
+
+## Strict equality inlines for every tag-decided pair (2026-10-18)
+
+Both compiled lanes sent `===`/`!==` to `binary_slow` unless the operands were
+proven Numbers (the per-step lane) or one side was `undefined` (the optimizing
+lane), so `undefined === null`, boolean and object-identity comparisons each
+paid a ~30 ns helper call. The test262-derived rows showed the count plainly:
+`head-let-fresh-binding` made 8.4M `BinarySlow` calls over 700k body
+iterations, `template-literal/evaluation-order` 1.4M.
+
+`emit_strict_eq` and the per-step twin `Compiler::emit_strict_eq_inline` decide
+the comparison from the tags: equal bits are equal unless they are a Number
+NaN; two Numbers compare as f64 (so `+0 === -0` and `NaN !== NaN`); any other
+unequal-bit pair is unequal. Only String/String and BigInt/BigInt compare by
+content, and those still call the helper, which also serves every coercion case
+for `==`/`!=`. `SLAG_STRICT_EQ=0` is the same-binary seam.
+
+Measured with the seam on a six-comparison loop over
+`undefined/null/two objects/two booleans/three numbers` (2M iterations):
+**130.7 → 104.1 ms (1.26x)**, stable across three interleaved rounds. On the
+corpus it is a wash: `head-let-fresh-binding`'s helper count halves (8.4M →
+4.2M) and its median moves ~3% (inside that row's ±10% run noise), while the
+full-corpus median stays inside the documented noise floor. Kept because it is
+a strict reduction in work for a shape real code uses constantly — nullable
+and object-identity checks — with no measured regression.
+
+Trap for the inline: Cranelift comparison results here are i8 0/1, so a
+negation must be `bxor(x, 1)`. `bnot` answers 0xFE, which `select` still reads
+as true, and `!==` then never becomes false (the trace loop ran forever). The
+jit suite caught it as a hang, and `while (l !== n)` is the cheap reproduction.
