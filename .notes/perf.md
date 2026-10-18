@@ -13803,14 +13803,32 @@ the optimizing tier every constructor store falls to the `SetMemberSlot`
 helper — the census shows 1-2 calls per iteration that the per-step tier does
 not pay.
 
-This is why fall-off-end lifting is blocked: constructors (and scripts) have
-no `Step::Return`, and teaching the lift to answer `undefined` at the end
-(attempted 2026-10-18) makes constructors opt-compile, which regressed
-`new Item(x)` 200 -> 272 ms and `new Item(x, y)` 239 -> 393 ms. The change was
-reverted. To enable it, port the fill block into
-`opt_lower::emit_deferred_update_store` first (the same gates: deferred bit,
-inline slot, every higher field a hole, the clean-proto deref, young
-receiver), then re-measure; the per-step store is the floor to beat.
+This was the gate that kept constructors on the per-step tier. It is now
+ported: `opt_lower::emit_deferred_update_store` emits both paths — the
+in-place UPDATE of a written field (no generation bump) and the FILL of a
+presized hole (write the field, bump the generation, refresh the value cell at
+the NEW generation). The fill gates mirror the per-step ones: the deferred
+bit, an inline slot, every field above the slot still a hole (the layout must
+stay prefix-dense), a clean chain record whose direct prototype is still the
+live one, and a young receiver (a fill into an old object would need the write
+barrier).
+
+With the fill path in, the lift also answers `undefined` for a body that falls
+off the end, so constructors, functions with no explicit `return`, and scripts
+opt-compile. The `SetMemberSlot` helper leaves the constructor census (one
+call per field before). Measured: `calls/construct_churn` 91.5 -> 83.6 ms
+(9%), the one-field construct probe at per-step parity (195 -> 200 ms) and the
+two-field one 241 -> 256 ms (inside this session's spread), `new Item(i).sum()`
+85 -> 84 ms. The full corpus has no checksum changes and no regression beyond
+the noise floor; the largest rows moved in both directions with the thermal
+drift.
+
+Trap: the fill path trusts the map cell's `clean`/`proto_id`/`proto_gen`
+record. A read-recorded cell (`clean == 0`) must decline to the exact helper —
+it never validated the chain, so filling through it could skip an inherited
+setter or a non-writable descriptor.
+
+## Intrinsic-named calls take the leaf lane (2026-10-18)
 
 Bodies containing `NewClosure`/`FunctionDecl` are now opt-compiled. The
 earlier explicit decline was a workaround for a 3x regression on

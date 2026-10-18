@@ -342,7 +342,13 @@ fn lift_impl(body: &CompiledBody, guard_reads: bool) -> Result<Function, Unsuppo
                 other if is_for_fetch(other) => TermRec::Fetch { stack },
                 other => return Err(Unsupported::Step(step_name(other))),
             },
-            None => TermRec::Jump(stack),
+            None => {
+                if ends[bi] >= n {
+                    TermRec::FallOff
+                } else {
+                    TermRec::Jump(stack)
+                }
+            }
         });
     }
 
@@ -351,6 +357,17 @@ fn lift_impl(body: &CompiledBody, guard_reads: bool) -> Result<Function, Unsuppo
         let rec = term_rec[bi].as_ref().ok_or(Unsupported::Invalid)?;
         match rec {
             TermRec::Ret(v) => builder.term(bi as BlockId, Term::Return(Some(*v))),
+            TermRec::FallOff => {
+                let undefined = builder.emit(
+                    bi as BlockId,
+                    Op::Const,
+                    &[],
+                    Type::Undefined,
+                    Effects::pure(),
+                    Imm::U64(crux::Value::Undefined.bits()),
+                );
+                builder.term(bi as BlockId, Term::Return(Some(undefined)));
+            }
             TermRec::Jump(stack) => {
                 let target = match terms[bi] {
                     Some(ti) => jump_target(&steps[ti]).ok_or(Unsupported::Invalid)?,
@@ -674,6 +691,9 @@ fn stack_delta(step: &Step) -> Result<i32, Unsupported> {
 /// The edge payload a block leaves on each successor.
 enum TermRec {
     Ret(ValueId),
+    /// A body that falls off the end (a constructor, a function with no
+    /// explicit `return`, a script): the entry answers `undefined`.
+    FallOff,
     Jump(Vec<ValueId>),
     Branch(ValueId, Vec<ValueId>),
     /// A fused test: the condition is emitted from the step at terminator time
@@ -721,8 +741,10 @@ fn block_successors(
     n: usize,
 ) -> Result<Vec<usize>, Unsupported> {
     let Some(last) = term else {
+        // The final block of a body with no explicit `return` falls off the
+        // end; every other unterminated block continues to the next.
         return if end >= n {
-            Err(Unsupported::NoReturn)
+            Ok(Vec::new())
         } else {
             Ok(vec![end])
         };
@@ -2860,9 +2882,26 @@ mod tests {
     }
 
     #[test]
-    fn a_body_without_a_return_is_unsupported() {
-        let b = body(vec![Step::Push(Value::Number(1.0))], 0);
-        assert_eq!(lift(&b).unwrap_err(), Unsupported::NoReturn);
+    fn a_body_without_a_return_falls_off_the_end_as_undefined() {
+        // Constructors, functions with no explicit return, and scripts end
+        // without a `Step::Return`; the entry answers `undefined`, exactly the
+        // interpreter's fall-off completion.
+        let b = body(vec![Step::Push(Value::Number(1.0)), Step::Pop], 0);
+        let func = lift(&b).expect("a fall-off-end body lifts");
+        let block = func.block(0);
+        let Some(Term::Return(Some(v))) = &block.term else {
+            panic!("the entry returns: {:?}", block.term);
+        };
+        let inst = block
+            .insts
+            .iter()
+            .find(|inst| inst.result == Some(*v))
+            .expect("the returned value is defined");
+        assert!(matches!(inst.op, Op::Const));
+        assert!(matches!(
+            inst.imm,
+            Imm::U64(bits) if bits == crux::Value::Undefined.bits()
+        ));
     }
 
     #[test]

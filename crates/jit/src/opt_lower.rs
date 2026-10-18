@@ -3592,14 +3592,188 @@ fn emit_deferred_update_store(
         Offset32::new(std::mem::offset_of!(JitCallContext, global_object) as i32),
     );
     let not_global = builder.ins().icmp(IntCC::NotEqual, obj_ptr, global);
-    let gate = builder.ins().band(deferred_ok, slot_inline);
-    let gate = builder.ins().band(gate, not_hole);
-    let gate = builder.ins().band(gate, writable_ok);
-    let gate = builder.ins().band(gate, barrier_ok);
-    let gate = builder.ins().band(gate, not_global);
+    // The UPDATE gate: the field is already written, writable, and the store
+    // needs no barrier.
+    let update_ok = builder.ins().band(deferred_ok, slot_inline);
+    let update_ok = builder.ins().band(update_ok, not_hole);
+    let update_ok = builder.ins().band(update_ok, writable_ok);
+    let update_ok = builder.ins().band(update_ok, barrier_ok);
+    let update_ok = builder.ins().band(update_ok, not_global);
     let update = builder.create_block();
-    builder.ins().brif(gate, update, &[], fallback, &[]);
+    let decide = builder.create_block();
+    let fill = builder.create_block();
+    builder.ins().brif(update_ok, update, &[], decide, &[]);
     builder.seal_block(update);
+    // The FILL gate: a presized map described this key but the field is still
+    // the unwritten hole (the receiver is born vector-free by
+    // `construct_this_object`). Filling it in place is what turns a
+    // constructor's first `this.x =` into a plain field write instead of the
+    // descriptor-resolving `SetMemberSlot` helper. Every field BELOW the slot
+    // is already written (`init_ordinary` writes no holes past the map's
+    // descriptor count); every field ABOVE it must still be a hole, or the
+    // vector-free layout would no longer be prefix-dense. The chain verdict
+    // must be a clean record whose direct prototype is still the live one.
+    builder.switch_to_block(decide);
+    let is_hole = builder.ins().icmp_imm_u(
+        IntCC::Equal,
+        field_bits,
+        crux::value::UNINITIALIZED_BITS as i64,
+    );
+    let mut fill_ok = builder.ins().band(deferred_ok, slot_inline);
+    fill_ok = builder.ins().band(fill_ok, is_hole);
+    for i in 1..crux::object::INLINE_FIELDS {
+        let f_bits = builder.ins().load(
+            types::I64,
+            MemFlagsData::new(),
+            field_base,
+            Offset32::new((i * std::mem::size_of::<crux::Value>()) as i32),
+        );
+        let f_hole =
+            builder
+                .ins()
+                .icmp_imm_u(IntCC::Equal, f_bits, crux::value::UNINITIALIZED_BITS as i64);
+        let at_or_above =
+            builder
+                .ins()
+                .icmp_imm_u(IntCC::UnsignedGreaterThanOrEqual, field_slot, i as i64);
+        let both = builder.ins().bor(f_hole, at_or_above);
+        fill_ok = builder.ins().band(fill_ok, both);
+    }
+    let proto_handle = builder.ins().load(
+        types::I64,
+        MemFlagsData::new(),
+        obj_ptr,
+        Offset32::new(std::mem::offset_of!(crux::JsObject, prototype) as i32),
+    );
+    let no_proto = builder.ins().icmp_imm_u(IntCC::Equal, proto_handle, 0);
+    let has_proto = builder.ins().icmp_imm_u(IntCC::NotEqual, proto_handle, 0);
+    let clean = builder.ins().load(
+        types::I32,
+        MemFlagsData::new(),
+        cell,
+        Offset32::new(std::mem::offset_of!(MemberMapCell, clean) as i32),
+    );
+    let clean_ok = builder.ins().icmp_imm_u(IntCC::NotEqual, clean, 0);
+    let fill_var = builder.declare_var(types::I8);
+    let clean_gate = builder.ins().bor(no_proto, clean_ok);
+    builder.def_var(fill_var, clean_gate);
+    let gate = builder.use_var(fill_var);
+    let fill_ok = builder.ins().band(fill_ok, gate);
+    // The deref checks run only when a prototype exists (dereferencing the
+    // null handle would fault).
+    let proto_check = builder.create_block();
+    let proto_merge = builder.create_block();
+    builder
+        .ins()
+        .brif(has_proto, proto_check, &[], proto_merge, &[]);
+    builder.switch_to_block(proto_check);
+    let proto_data = builder
+        .ins()
+        .iadd_imm_s(proto_handle, crux::heap::GCBOX_DATA_OFFSET as i64);
+    let proto_id = builder.ins().load(
+        types::I64,
+        MemFlagsData::new(),
+        proto_data,
+        Offset32::new(std::mem::offset_of!(crux::JsObject, id) as i32),
+    );
+    let proto_gen = builder.ins().load(
+        types::I32,
+        MemFlagsData::new(),
+        proto_data,
+        Offset32::new(std::mem::offset_of!(crux::JsObject, generation) as i32),
+    );
+    let cell_proto_id = builder.ins().load(
+        types::I64,
+        MemFlagsData::new(),
+        cell,
+        Offset32::new(std::mem::offset_of!(MemberMapCell, proto_id) as i32),
+    );
+    let cell_proto_gen = builder.ins().load(
+        types::I32,
+        MemFlagsData::new(),
+        cell,
+        Offset32::new(std::mem::offset_of!(MemberMapCell, proto_gen) as i32),
+    );
+    let id_ok = builder.ins().icmp(IntCC::Equal, proto_id, cell_proto_id);
+    let gen_ok = builder.ins().icmp(IntCC::Equal, proto_gen, cell_proto_gen);
+    let deref_ok = builder.ins().band(id_ok, gen_ok);
+    let merged = builder.ins().band(fill_ok, deref_ok);
+    builder.def_var(fill_var, merged);
+    builder.ins().jump(proto_merge, &[]);
+    builder.switch_to_block(proto_merge);
+    builder.seal_block(proto_merge);
+    // A fill into an OLD receiver would need the write barrier; a young one
+    // cannot create an old->young edge.
+    let gate = builder.use_var(fill_var);
+    let fill_gate = builder.ins().band(gate, young);
+    builder.ins().brif(fill_gate, fill, &[], fallback, &[]);
+    builder.seal_block(decide);
+    builder.seal_block(proto_check);
+    builder.switch_to_block(fill);
+    builder
+        .ins()
+        .store(MemFlagsData::new(), value, field_addr, Offset32::new(0));
+    // The fill bumps the generation (a structural change: a name appeared)
+    // and fronts the read-side value cell at the NEW generation.
+    let fill_gen = builder.ins().load(
+        types::I32,
+        MemFlagsData::new(),
+        obj_ptr,
+        Offset32::new(std::mem::offset_of!(crux::JsObject, generation) as i32),
+    );
+    let gen1 = builder.ins().iadd_imm_u(fill_gen, 1);
+    builder.ins().store(
+        MemFlagsData::new(),
+        gen1,
+        obj_ptr,
+        Offset32::new(std::mem::offset_of!(crux::JsObject, generation) as i32),
+    );
+    let fill_id = builder.ins().load(
+        types::I64,
+        MemFlagsData::new(),
+        obj_ptr,
+        Offset32::new(std::mem::offset_of!(crux::JsObject, id) as i32),
+    );
+    let fill_cells = builder.ins().load(
+        types::I64,
+        MemFlagsData::new(),
+        abi.vm,
+        Offset32::new(std::mem::offset_of!(JitCallContext, member_value_cells) as i32),
+    );
+    let fill_index = builder.ins().bxor(fill_id, name_imm);
+    let fill_index = builder
+        .ins()
+        .band_imm_u(fill_index, (MEMBER_CELLS - 1) as i64);
+    let fill_index = builder
+        .ins()
+        .imul_imm_s(fill_index, std::mem::size_of::<MemberValueCell>() as i64);
+    let fill_cell = builder.ins().iadd(fill_cells, fill_index);
+    builder.ins().store(
+        MemFlagsData::new(),
+        fill_id,
+        fill_cell,
+        Offset32::new(std::mem::offset_of!(MemberValueCell, id) as i32),
+    );
+    let name_imm32 = builder.ins().iconst(types::I32, name as i64);
+    builder.ins().store(
+        MemFlagsData::new(),
+        name_imm32,
+        fill_cell,
+        Offset32::new(std::mem::offset_of!(MemberValueCell, name) as i32),
+    );
+    builder.ins().store(
+        MemFlagsData::new(),
+        gen1,
+        fill_cell,
+        Offset32::new(std::mem::offset_of!(MemberValueCell, generation) as i32),
+    );
+    builder.ins().store(
+        MemFlagsData::new(),
+        value,
+        fill_cell,
+        Offset32::new(std::mem::offset_of!(MemberValueCell, value) as i32),
+    );
+    builder.ins().jump(ok, &[]);
     builder.switch_to_block(update);
     builder
         .ins()
@@ -3656,6 +3830,7 @@ fn emit_deferred_update_store(
         Offset32::new(std::mem::offset_of!(MemberValueCell, value) as i32),
     );
     builder.ins().jump(ok, &[]);
+    builder.seal_block(fill);
 }
 
 /// The compiled prototype-chain probe: a dense Array receiver that has never
