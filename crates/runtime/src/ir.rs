@@ -67,11 +67,12 @@ pub enum Intrinsic {
     ArrayAt,
     ArrayIncludes,
     ArrayPush,
+    ArrayPop,
 }
 
 /// The number of recognized intrinsics (a `Intrinsic` discriminant is an index
 /// into the per-run intrinsic-bit snapshot).
-pub const INTRINSIC_COUNT: usize = 13;
+pub const INTRINSIC_COUNT: usize = 14;
 
 /// Every recognized intrinsic, in discriminant order: the order that pairs an
 /// `intrinsic_bits` slot with its `Intrinsic`.
@@ -89,6 +90,7 @@ pub const INTRINSICS: [Intrinsic; INTRINSIC_COUNT] = [
     Intrinsic::ArrayAt,
     Intrinsic::ArrayIncludes,
     Intrinsic::ArrayPush,
+    Intrinsic::ArrayPop,
 ];
 
 impl Intrinsic {
@@ -108,6 +110,7 @@ impl Intrinsic {
             Intrinsic::ArrayAt => "at",
             Intrinsic::ArrayIncludes => "includes",
             Intrinsic::ArrayPush => "push",
+            Intrinsic::ArrayPop => "pop",
         }
     }
 
@@ -127,6 +130,7 @@ impl Intrinsic {
             Intrinsic::ArrayAt => "%Array.prototype.at%",
             Intrinsic::ArrayIncludes => "%Array.prototype.includes%",
             Intrinsic::ArrayPush => "%Array.prototype.push%",
+            Intrinsic::ArrayPop => "%Array.prototype.pop%",
         }
     }
 }
@@ -13217,7 +13221,7 @@ impl Vm {
         kind: Intrinsic,
         argc: usize,
     ) -> Result<bool, JsError> {
-        if argc == 0 {
+        if argc == 0 && kind != Intrinsic::ArrayPop {
             return Ok(false);
         }
         let n = self.stack.len();
@@ -13347,6 +13351,10 @@ impl Vm {
                     None => return Ok(false),
                 }
             }
+            Intrinsic::ArrayPop => match crate::builtins::array::pop_fast(&this) {
+                Some(value) => value,
+                None => return Ok(false),
+            },
         };
         self.stack.truncate(arg_start - 2);
         self.stack.push(result);
@@ -23138,7 +23146,7 @@ impl Compiler {
             || member.optional
             || call.optional
             || self.chain_depth != 0
-            || call.args.is_empty()
+            || (call.args.is_empty() && kind != Intrinsic::ArrayPop)
             || call.args.len() > FAST_CALL_MAX_ARGS
             || !call.args.iter().all(|a| matches!(a, Argument::Expr(_)))
             || expr_may_short_circuit(&member.object)

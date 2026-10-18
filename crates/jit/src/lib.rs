@@ -506,6 +506,7 @@ fn runtime_helpers() -> JitHelpers {
         array_at: Some(rt.array_at),
         array_includes: Some(rt.array_includes),
         array_push: Some(rt.array_push),
+        array_pop: Some(rt.array_pop),
         typed_array_length: Some(rt.typed_array_length),
         get_super_base: Some(rt.get_super_base),
         this_value: Some(rt.this_value),
@@ -768,6 +769,7 @@ mod tests {
             array_at: Some(helpers::test_array_at),
             array_includes: Some(helpers::test_array_includes),
             array_push: Some(helpers::test_array_push),
+            array_pop: Some(helpers::test_array_pop),
             typed_array_length: Some(helpers::test_typed_array_length),
             get_super_base: Some(helpers::test_get_super_base),
             this_value: Some(helpers::test_this_value),
@@ -3815,6 +3817,60 @@ mod tests {
             "the Array.push intrinsic splice must match the interpreter"
         );
         assert!(compiled >= 1, "{compiled} bodies");
+    }
+
+    #[test]
+    fn installed_jit_array_pop_intrinsic_matches_the_interpreter() {
+        // The `Array.prototype.pop` splice (zero arguments): a `.pop()` call
+        // whose resolved callee is the realm's intrinsic truncates a dense Array
+        // and returns the last element. The helper declines for a non-Array/non-
+        // dense receiver or a hole at the end, and those take the general call.
+        static POP_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        extern "C" fn counting_pop(ctx: *mut c_void, this: u64) -> u64 {
+            POP_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            (runtime::jit::JIT_SLOW_PATHS.array_pop)(ctx, this)
+        }
+        let mut helpers = runtime_helpers();
+        helpers.array_pop = Some(counting_pop);
+        let source = "var out = [];\n\
+                      function t(v) { out.push(String(v)); }\n\
+                      var a = [1, 2, 3]; t(a.pop()); t(a.length); t(a.pop(9)); t(a.join(','));\n\
+                      t([].pop());\n\
+                      var h = [1]; h[3] = 4; t(h.pop()); t(h.pop()); t(h.length);\n\
+                      t(Array.prototype.pop.call({length: 2, 0: 'x', 1: 'y'}));\n\
+                      function loop(n) { var a2 = []; var s = 0;\n\
+                        for (var i = 0; i < n; i++) { a2.push(i); if (a2.length > 10) s += a2.pop(); }\n\
+                        return s; }\n\
+                      t(loop(5000));\n\
+                      out.join(',');";
+        let interp = {
+            let mut agent = runtime::Agent::new();
+            agent.initialize_host_defined_realm().expect("realm");
+            agent.run_script(source).expect("interp runs")
+        };
+        extern "C" fn noop_drop(_cache: *mut c_void) {}
+        let mut agent = runtime::Agent::new();
+        agent.initialize_host_defined_realm().expect("realm");
+        let mut cache = JitCache::new(helpers).expect("isa");
+        agent.jit_hook = Some(runtime::jit::JitHook {
+            cache: (&mut cache as *mut JitCache) as *mut c_void,
+            lookup: jit_cache_lookup,
+            drop_cache: noop_drop,
+            helpers: &runtime::jit::JIT_SLOW_PATHS,
+        });
+        let value = agent.run_script(source).expect("jit runs");
+        let compiled = cache.compiled_count();
+        agent.jit_hook = None;
+        assert_eq!(
+            value, interp,
+            "the Array.pop intrinsic splice must match the interpreter"
+        );
+        assert!(compiled >= 1, "{compiled} bodies");
+        let calls = POP_CALLS.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            calls >= 1000,
+            "the compiled loop must splice the pop intrinsic ({calls} helper calls)"
+        );
     }
 
     #[test]

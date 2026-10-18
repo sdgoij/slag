@@ -1284,6 +1284,10 @@ pub struct JitSlowPaths {
     /// receiver and the value; returns the new length, or the hole sentinel to
     /// fall back. Never errors.
     pub array_push: extern "C" fn(ctx: *mut c_void, this: u64, value: u64) -> u64,
+    /// `Step::CallIntrinsic` for `%Array.prototype.pop%`: the receiver;
+    /// returns the popped element (or `undefined`), or the hole sentinel to
+    /// fall back. Never errors.
+    pub array_pop: extern "C" fn(ctx: *mut c_void, this: u64) -> u64,
     /// A compiled `GetMemberName` with the `length` atom: the slots length of
     /// an IntegerIndexed receiver, or the canonical-NaN sentinel otherwise
     /// (the machine code falls back to the member-cell probe /
@@ -1467,6 +1471,7 @@ pub static JIT_SLOW_PATHS: JitSlowPaths = JitSlowPaths {
     array_at,
     array_includes,
     array_push,
+    array_pop,
     typed_array_length,
     get_super_base,
     this_value,
@@ -5890,6 +5895,17 @@ extern "C" fn array_push(ctx: *mut c_void, this: u64, value: u64) -> u64 {
     let _ = ctx;
     match crate::builtins::array::push_fast(&Value::from_bits(this), Value::from_bits(value)) {
         Some(length) => Value::Number(length).bits(),
+        None => Value::hole().bits(),
+    }
+}
+
+/// `Step::CallIntrinsic` for `%Array.prototype.pop%`: the receiver; returns the
+/// popped element (or `undefined`), or the hole sentinel when the receiver
+/// needs the general call. Never errors.
+extern "C" fn array_pop(ctx: *mut c_void, this: u64) -> u64 {
+    let _ = ctx;
+    match crate::builtins::array::pop_fast(&Value::from_bits(this)) {
+        Some(value) => value.bits(),
         None => Value::hole().bits(),
     }
 }

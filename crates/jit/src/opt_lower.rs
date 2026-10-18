@@ -2666,7 +2666,8 @@ fn emit_intrinsic(
         | Intrinsic::MapSet
         | Intrinsic::ArrayAt
         | Intrinsic::ArrayIncludes
-        | Intrinsic::ArrayPush => {}
+        | Intrinsic::ArrayPush
+        | Intrinsic::ArrayPop => {}
     }
     builder.ins().brif(gate, fast, &[], slow, &[]);
     builder.seal_block(fast);
@@ -2758,6 +2759,14 @@ fn emit_intrinsic(
                         &[this, arg1, from],
                     )?
                 }
+                Intrinsic::ArrayPop => call_helper(
+                    builder,
+                    helpers,
+                    abi,
+                    abi.sig_bool,
+                    Helper::ArrayPop,
+                    &[this],
+                )?,
                 _ => call_helper(
                     builder,
                     helpers,

@@ -1095,10 +1095,10 @@ pub(crate) fn create_array_iterator(
         .get(ARRAY_ITERATOR)
         .and_then(|value| as_object(&value));
     let iterator = JsObject::ordinary_object_create(proto);
-    agent
-        .array_iter_data
-        .borrow_mut()
-        .insert(iterator.id(), (array, 0usize, kind as u32, iterator.as_any()));
+    agent.array_iter_data.borrow_mut().insert(
+        iterator.id(),
+        (array, 0usize, kind as u32, iterator.as_any()),
+    );
     Ok(Value::Object(iterator))
 }
 
@@ -1761,6 +1761,16 @@ pub(crate) fn push_fast(object: &Value, value: Value) -> Option<f64> {
     } else {
         None
     }
+}
+
+/// `Array.prototype.pop`'s dense fast path for the compiled intrinsic: the last
+/// own element of a dense Array, or `None` when the receiver needs the exact
+/// machinery (a non-dense/non-Array receiver, or a hole at the end).
+pub(crate) fn pop_fast(object: &Value) -> Option<Value> {
+    let ValueKind::Object(array) = object.kind() else {
+        return None;
+    };
+    array.array_pop_dense().ok().flatten()
 }
 
 /// spec 23.1.3.23 Array.prototype.reduce.
@@ -2603,10 +2613,10 @@ fn array_iterator_next(agent: &mut Agent, this: &Value, _args: &[Value]) -> Resu
     let length = length_of_array_like(agent, &array)?;
     let next_index = index as u64;
     if next_index >= length {
-        agent.array_iter_data.borrow_mut().insert(
-            obj.id(),
-            (Value::Undefined, index, kind, obj.as_any()),
-        );
+        agent
+            .array_iter_data
+            .borrow_mut()
+            .insert(obj.id(), (Value::Undefined, index, kind, obj.as_any()));
         return iter_result(agent, Value::Undefined, true);
     }
     let name = key(next_index);

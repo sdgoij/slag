@@ -190,6 +190,7 @@ pub enum Helper {
     ArrayAt,
     ArrayIncludes,
     ArrayPush,
+    ArrayPop,
     TypedArrayLength,
     GetSuperBase,
     ThisValue,
@@ -343,6 +344,7 @@ impl Helper {
             Helper::ArrayAt => "array_at",
             Helper::ArrayIncludes => "array_includes",
             Helper::ArrayPush => "array_push",
+            Helper::ArrayPop => "array_pop",
             Helper::TypedArrayLength => "typed_array_length",
             Helper::GetSuperBase => "get_super_base",
             Helper::ThisValue => "this_value",
@@ -876,6 +878,7 @@ pub struct JitHelpers {
     /// `Step::CallIntrinsic` for `%Array.prototype.push%`: `(this, value)`;
     /// returns the new length or the `hole` fall-back sentinel.
     pub array_push: Option<extern "C" fn(vm: *mut c_void, this: u64, value: u64) -> u64>,
+    pub array_pop: Option<extern "C" fn(vm: *mut c_void, this: u64) -> u64>,
     /// A compiled `GetMemberName` with the `length` atom on an IntegerIndexed
     /// receiver: the slots length, or a NaN sentinel when the receiver is not
     /// a typed array (the machine code falls back to the member-cell probe /
@@ -1047,6 +1050,7 @@ impl JitHelpers {
             array_at: None,
             array_includes: None,
             array_push: None,
+            array_pop: None,
             typed_array_length: None,
             get_super_base: None,
             this_value: None,
@@ -1209,6 +1213,7 @@ impl JitHelpers {
             Helper::ArrayAt => self.array_at.map(|f| f as usize as u64),
             Helper::ArrayIncludes => self.array_includes.map(|f| f as usize as u64),
             Helper::ArrayPush => self.array_push.map(|f| f as usize as u64),
+            Helper::ArrayPop => self.array_pop.map(|f| f as usize as u64),
             Helper::TypedArrayLength => self.typed_array_length.map(|f| f as usize as u64),
             Helper::GetSuperBase => self.get_super_base.map(|f| f as usize as u64),
             Helper::ThisValue => self.this_value.map(|f| f as usize as u64),
@@ -1965,6 +1970,10 @@ pub extern "C" fn test_array_includes(
 
 pub extern "C" fn test_array_push(_vm: *mut c_void, _this: u64, _value: u64) -> u64 {
     Value::Number(1.0).bits()
+}
+
+pub extern "C" fn test_array_pop(_vm: *mut c_void, _this: u64) -> u64 {
+    Value::Undefined.bits()
 }
 
 /// The typed-array length probe double: the canonical-NaN sentinel (the

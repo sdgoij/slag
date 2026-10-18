@@ -13490,3 +13490,22 @@ Trap for the inline: Cranelift comparison results here are i8 0/1, so a
 negation must be `bxor(x, 1)`. `bnot` answers 0xFE, which `select` still reads
 as true, and `!==` then never becomes false (the trace loop ran forever). The
 jit suite caught it as a hang, and `while (l !== n)` is the cheap reproduction.
+
+## Array.prototype.pop splices on the compiled path (2026-10-18)
+
+`push` had a Stage-B intrinsic splice; `pop` did not, so every compiled `a.pop()`
+ran through `call_slow` (960k slow calls on the `arrays/push_pop` row). The
+recognition also refused zero-argument calls outright, and `do_call_intrinsic`
+returned early for `argc == 0`, which is why `pop` could not be classified as an
+intrinsic at all.
+
+`Intrinsic::ArrayPop` is now in the table (`%Array.prototype.pop%`, recognized
+by name and gated on the realm's function identity). `pop_fast` serves the
+dense-Array truncate through `array_pop_dense` and returns the hole sentinel for
+every other receiver (a non-Array, a spilled array, or a hole at the end), which
+keeps the general call. Zero-argument calls are allowed for this kind in both
+`try_compile_intrinsic` and `do_call_intrinsic`.
+
+Measured: `arrays/push_pop` **6.48 → 4.70 ms (1.38x)**, `call_slow` 960k → 0
+and `array_pop` 0 → 1.2M on the row; gap to node **55x → 40x**. Corpus values
+unchanged on all 77 rows and the full-corpus median is flat (1.003).
