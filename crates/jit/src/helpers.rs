@@ -191,6 +191,7 @@ pub enum Helper {
     ArrayIncludes,
     ArrayPush,
     ArrayPop,
+    ArrayReverse,
     TypedArrayLength,
     GetSuperBase,
     ThisValue,
@@ -345,6 +346,7 @@ impl Helper {
             Helper::ArrayIncludes => "array_includes",
             Helper::ArrayPush => "array_push",
             Helper::ArrayPop => "array_pop",
+            Helper::ArrayReverse => "array_reverse",
             Helper::TypedArrayLength => "typed_array_length",
             Helper::GetSuperBase => "get_super_base",
             Helper::ThisValue => "this_value",
@@ -879,6 +881,7 @@ pub struct JitHelpers {
     /// returns the new length or the `hole` fall-back sentinel.
     pub array_push: Option<extern "C" fn(vm: *mut c_void, this: u64, value: u64) -> u64>,
     pub array_pop: Option<extern "C" fn(vm: *mut c_void, this: u64) -> u64>,
+    pub array_reverse: Option<extern "C" fn(vm: *mut c_void, this: u64) -> u64>,
     /// A compiled `GetMemberName` with the `length` atom on an IntegerIndexed
     /// receiver: the slots length, or a NaN sentinel when the receiver is not
     /// a typed array (the machine code falls back to the member-cell probe /
@@ -1051,6 +1054,7 @@ impl JitHelpers {
             array_includes: None,
             array_push: None,
             array_pop: None,
+            array_reverse: None,
             typed_array_length: None,
             get_super_base: None,
             this_value: None,
@@ -1214,6 +1218,7 @@ impl JitHelpers {
             Helper::ArrayIncludes => self.array_includes.map(|f| f as usize as u64),
             Helper::ArrayPush => self.array_push.map(|f| f as usize as u64),
             Helper::ArrayPop => self.array_pop.map(|f| f as usize as u64),
+            Helper::ArrayReverse => self.array_reverse.map(|f| f as usize as u64),
             Helper::TypedArrayLength => self.typed_array_length.map(|f| f as usize as u64),
             Helper::GetSuperBase => self.get_super_base.map(|f| f as usize as u64),
             Helper::ThisValue => self.this_value.map(|f| f as usize as u64),
@@ -1973,6 +1978,10 @@ pub extern "C" fn test_array_push(_vm: *mut c_void, _this: u64, _value: u64) -> 
 }
 
 pub extern "C" fn test_array_pop(_vm: *mut c_void, _this: u64) -> u64 {
+    Value::Undefined.bits()
+}
+
+pub extern "C" fn test_array_reverse(_vm: *mut c_void, _this: u64) -> u64 {
     Value::Undefined.bits()
 }
 

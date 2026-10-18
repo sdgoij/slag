@@ -13509,3 +13509,25 @@ keeps the general call. Zero-argument calls are allowed for this kind in both
 Measured: `arrays/push_pop` **6.48 → 4.70 ms (1.38x)**, `call_slow` 960k → 0
 and `array_pop` 0 → 1.2M on the row; gap to node **55x → 40x**. Corpus values
 unchanged on all 77 rows and the full-corpus median is flat (1.003).
+
+## Array.prototype.reverse inlines for a dense array (2026-10-18)
+
+`reverse` had no intrinsic splice, so every compiled `a.reverse()` ran the
+spec's pairwise read/`HasProperty`/`Set` loop through the general call (the two
+element swaps per call went through the generic property machinery).
+`opcost/array_reverse` measured 23.9 ms for 100k four-element reversals against
+node's 0.51 ms.
+
+`Intrinsic::ArrayReverse` joins the table (`%Array.prototype.reverse%`) and
+`reverse_fast` reverses a fully-populated dense Array in place:
+`JsObject::array_reverse_dense` requires dense mode, an integral non-negative
+length, and no hole in the populated range (a hole makes the swap consult the
+prototype chain), reverses the buffer, stamps the GC's dirty bound at 0 (the
+values moved, so a minor must trace the whole buffer) and bumps the generation.
+Everything else — a non-Array receiver, a spill, a hole, or a frozen array
+whose elements are non-writable — keeps the general call, which is what makes
+the frozen case throw its TypeError.
+
+Measured: `opcost/array_reverse` **23.92 → 4.56 ms (5.2x)**, gap to node
+**47x → 9.0x**; `array_reverse` 2M calls on the row and no `call_slow`. Corpus
+values are unchanged on all 77 rows and the full-corpus median is flat.

@@ -1288,6 +1288,10 @@ pub struct JitSlowPaths {
     /// returns the popped element (or `undefined`), or the hole sentinel to
     /// fall back. Never errors.
     pub array_pop: extern "C" fn(ctx: *mut c_void, this: u64) -> u64,
+    /// `Step::CallIntrinsic` for `%Array.prototype.reverse%`: the receiver;
+    /// reverses a fully-populated dense Array in place and returns it, or the
+    /// hole sentinel to fall back. Never errors.
+    pub array_reverse: extern "C" fn(ctx: *mut c_void, this: u64) -> u64,
     /// A compiled `GetMemberName` with the `length` atom: the slots length of
     /// an IntegerIndexed receiver, or the canonical-NaN sentinel otherwise
     /// (the machine code falls back to the member-cell probe /
@@ -1472,6 +1476,7 @@ pub static JIT_SLOW_PATHS: JitSlowPaths = JitSlowPaths {
     array_includes,
     array_push,
     array_pop,
+    array_reverse,
     typed_array_length,
     get_super_base,
     this_value,
@@ -5906,6 +5911,17 @@ extern "C" fn array_pop(ctx: *mut c_void, this: u64) -> u64 {
     let _ = ctx;
     match crate::builtins::array::pop_fast(&Value::from_bits(this)) {
         Some(value) => value.bits(),
+        None => Value::hole().bits(),
+    }
+}
+
+/// `Step::CallIntrinsic` for `%Array.prototype.reverse%`: the receiver; returns
+/// it after an in-place dense reversal, or the hole sentinel when the receiver
+/// needs the general call. Never errors.
+extern "C" fn array_reverse(ctx: *mut c_void, this: u64) -> u64 {
+    let _ = ctx;
+    match crate::builtins::array::reverse_fast(&Value::from_bits(this)) {
+        Some(()) => this,
         None => Value::hole().bits(),
     }
 }

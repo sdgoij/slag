@@ -2686,6 +2686,37 @@ impl JsObject {
         Ok(Some(value))
     }
 
+    /// Reverse the elements of a fully-populated dense Array in place, or
+    /// `None` when the exact `Array.prototype.reverse` machinery must run (a
+    /// non-array or spilled receiver, a fractional/negative length, or any hole
+    /// in the populated range — a hole makes the swap consult the prototype
+    /// chain). Exposed for the compiled intrinsic.
+    pub fn array_reverse_dense(&self) -> Option<()> {
+        let ObjectKind::Array(slots) = &self.kind else {
+            return None;
+        };
+        if !slots.dense.get() {
+            return None;
+        }
+        let length = slots.length.get();
+        if !length.is_finite() || length < 0.0 || length.fract() != 0.0 {
+            return None;
+        }
+        let n = length as usize;
+        {
+            let elements = slots.elements();
+            if elements.len() < n || elements[..n].iter().any(|value| value.is_hole()) {
+                return None;
+            }
+        }
+        slots.elements_mut()[..n].reverse();
+        // The values moved: a minor's dirty bound must cover the whole buffer
+        // (a young element can now sit below a previously recorded bound).
+        slots.note_dirty_slot(0);
+        self.bump_generation();
+        Some(())
+    }
+
     /// Materialize the dense buffer into `properties` and drop dense mode:
     /// the array then behaves exactly like the generic properties path, so
     /// the buffer is a fast path, never a second implementation. Spills are

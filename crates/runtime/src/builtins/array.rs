@@ -1773,6 +1773,17 @@ pub(crate) fn pop_fast(object: &Value) -> Option<Value> {
     array.array_pop_dense().ok().flatten()
 }
 
+/// `Array.prototype.reverse`'s dense fast path for the compiled intrinsic:
+/// `Some(())` when the in-place reversal ran, `None` when the exact machinery
+/// must (a non-dense/non-Array receiver, or a hole). Returns the receiver, the
+/// spec's answer.
+pub(crate) fn reverse_fast(object: &Value) -> Option<()> {
+    let ValueKind::Object(array) = object.kind() else {
+        return None;
+    };
+    array.array_reverse_dense()
+}
+
 /// spec 23.1.3.23 Array.prototype.reduce.
 fn reduce(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsError> {
     require_object_coercible(this)?;

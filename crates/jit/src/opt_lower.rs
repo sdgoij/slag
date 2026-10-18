@@ -2667,7 +2667,8 @@ fn emit_intrinsic(
         | Intrinsic::ArrayAt
         | Intrinsic::ArrayIncludes
         | Intrinsic::ArrayPush
-        | Intrinsic::ArrayPop => {}
+        | Intrinsic::ArrayPop
+        | Intrinsic::ArrayReverse => {}
     }
     builder.ins().brif(gate, fast, &[], slow, &[]);
     builder.seal_block(fast);
@@ -2765,6 +2766,14 @@ fn emit_intrinsic(
                     abi,
                     abi.sig_bool,
                     Helper::ArrayPop,
+                    &[this],
+                )?,
+                Intrinsic::ArrayReverse => call_helper(
+                    builder,
+                    helpers,
+                    abi,
+                    abi.sig_bool,
+                    Helper::ArrayReverse,
                     &[this],
                 )?,
                 _ => call_helper(

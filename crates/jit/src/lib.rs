@@ -507,6 +507,7 @@ fn runtime_helpers() -> JitHelpers {
         array_includes: Some(rt.array_includes),
         array_push: Some(rt.array_push),
         array_pop: Some(rt.array_pop),
+        array_reverse: Some(rt.array_reverse),
         typed_array_length: Some(rt.typed_array_length),
         get_super_base: Some(rt.get_super_base),
         this_value: Some(rt.this_value),
@@ -770,6 +771,7 @@ mod tests {
             array_includes: Some(helpers::test_array_includes),
             array_push: Some(helpers::test_array_push),
             array_pop: Some(helpers::test_array_pop),
+            array_reverse: Some(helpers::test_array_reverse),
             typed_array_length: Some(helpers::test_typed_array_length),
             get_super_base: Some(helpers::test_get_super_base),
             this_value: Some(helpers::test_this_value),
@@ -3870,6 +3872,65 @@ mod tests {
         assert!(
             calls >= 1000,
             "the compiled loop must splice the pop intrinsic ({calls} helper calls)"
+        );
+    }
+
+    #[test]
+    fn installed_jit_array_reverse_intrinsic_matches_the_interpreter() {
+        // The `Array.prototype.reverse` splice (zero arguments): a `.reverse()`
+        // call whose resolved callee is the realm's intrinsic reverses a fully
+        // populated dense Array in place and returns it. A hole, a non-Array
+        // receiver, or a non-writable element takes the general call (the last
+        // one must throw, and the frozen case proves the fast path declines).
+        static REV_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        extern "C" fn counting_rev(ctx: *mut c_void, this: u64) -> u64 {
+            REV_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            (runtime::jit::JIT_SLOW_PATHS.array_reverse)(ctx, this)
+        }
+        let mut helpers = runtime_helpers();
+        helpers.array_reverse = Some(counting_rev);
+        let source = "var out = [];\n\
+                      function t(v) { out.push(String(v)); }\n\
+                      var a = [1, 2, 3]; t(a.reverse() === a); t(a.join(','));\n\
+                      var b = [1, 2, 3, 4]; b.reverse(); t(b.join(','));\n\
+                      t([].reverse().length);\n\
+                      var h = [1, 2]; h[4] = 5; h.reverse(); t(h.join(','));\n\
+                      var f = Object.freeze([1, 2, 3]);\n\
+                      try { f.reverse(); t('no-throw'); } catch (e) { t(e instanceof TypeError ? 'TypeError' : 'other'); }\n\
+                      t(f.join(','));\n\
+                      var o = {length: 3, 0: 'a', 1: 'b', 2: 'c'}; Array.prototype.reverse.call(o); t(o[0]);\n\
+                      function loop(n) { var a2 = [1, 2, 3, 4]; var s = 0;\n\
+                        for (var i = 0; i < n; i++) { a2.reverse(); s += a2[0]; }\n\
+                        return s; }\n\
+                      t(loop(3000));\n\
+                      out.join(',');";
+        let interp = {
+            let mut agent = runtime::Agent::new();
+            agent.initialize_host_defined_realm().expect("realm");
+            agent.run_script(source).expect("interp runs")
+        };
+        extern "C" fn noop_drop(_cache: *mut c_void) {}
+        let mut agent = runtime::Agent::new();
+        agent.initialize_host_defined_realm().expect("realm");
+        let mut cache = JitCache::new(helpers).expect("isa");
+        agent.jit_hook = Some(runtime::jit::JitHook {
+            cache: (&mut cache as *mut JitCache) as *mut c_void,
+            lookup: jit_cache_lookup,
+            drop_cache: noop_drop,
+            helpers: &runtime::jit::JIT_SLOW_PATHS,
+        });
+        let value = agent.run_script(source).expect("jit runs");
+        let compiled = cache.compiled_count();
+        agent.jit_hook = None;
+        assert_eq!(
+            value, interp,
+            "the Array.reverse intrinsic splice must match the interpreter"
+        );
+        assert!(compiled >= 1, "{compiled} bodies");
+        let calls = REV_CALLS.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            calls >= 1000,
+            "the compiled loop must splice the reverse intrinsic ({calls} helper calls)"
         );
     }
 

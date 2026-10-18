@@ -68,11 +68,12 @@ pub enum Intrinsic {
     ArrayIncludes,
     ArrayPush,
     ArrayPop,
+    ArrayReverse,
 }
 
 /// The number of recognized intrinsics (a `Intrinsic` discriminant is an index
 /// into the per-run intrinsic-bit snapshot).
-pub const INTRINSIC_COUNT: usize = 14;
+pub const INTRINSIC_COUNT: usize = 15;
 
 /// Every recognized intrinsic, in discriminant order: the order that pairs an
 /// `intrinsic_bits` slot with its `Intrinsic`.
@@ -91,6 +92,7 @@ pub const INTRINSICS: [Intrinsic; INTRINSIC_COUNT] = [
     Intrinsic::ArrayIncludes,
     Intrinsic::ArrayPush,
     Intrinsic::ArrayPop,
+    Intrinsic::ArrayReverse,
 ];
 
 impl Intrinsic {
@@ -111,7 +113,14 @@ impl Intrinsic {
             Intrinsic::ArrayIncludes => "includes",
             Intrinsic::ArrayPush => "push",
             Intrinsic::ArrayPop => "pop",
+            Intrinsic::ArrayReverse => "reverse",
         }
+    }
+
+    /// Whether the intrinsic may be recognized on a zero-argument call. Most
+    /// fast paths need their first argument; `pop`/`reverse` take none.
+    pub fn allows_zero_args(self) -> bool {
+        matches!(self, Intrinsic::ArrayPop | Intrinsic::ArrayReverse)
     }
 
     /// The `%`-name the realm's intrinsic table holds for this one.
@@ -131,6 +140,7 @@ impl Intrinsic {
             Intrinsic::ArrayIncludes => "%Array.prototype.includes%",
             Intrinsic::ArrayPush => "%Array.prototype.push%",
             Intrinsic::ArrayPop => "%Array.prototype.pop%",
+            Intrinsic::ArrayReverse => "%Array.prototype.reverse%",
         }
     }
 }
@@ -13221,7 +13231,7 @@ impl Vm {
         kind: Intrinsic,
         argc: usize,
     ) -> Result<bool, JsError> {
-        if argc == 0 && kind != Intrinsic::ArrayPop {
+        if argc == 0 && !kind.allows_zero_args() {
             return Ok(false);
         }
         let n = self.stack.len();
@@ -13353,6 +13363,10 @@ impl Vm {
             }
             Intrinsic::ArrayPop => match crate::builtins::array::pop_fast(&this) {
                 Some(value) => value,
+                None => return Ok(false),
+            },
+            Intrinsic::ArrayReverse => match crate::builtins::array::reverse_fast(&this) {
+                Some(()) => this,
                 None => return Ok(false),
             },
         };
@@ -23146,7 +23160,7 @@ impl Compiler {
             || member.optional
             || call.optional
             || self.chain_depth != 0
-            || (call.args.is_empty() && kind != Intrinsic::ArrayPop)
+            || (call.args.is_empty() && !kind.allows_zero_args())
             || call.args.len() > FAST_CALL_MAX_ARGS
             || !call.args.iter().all(|a| matches!(a, Argument::Expr(_)))
             || expr_may_short_circuit(&member.object)
