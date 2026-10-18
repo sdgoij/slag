@@ -2913,6 +2913,25 @@ mod tests {
     }
 
     #[test]
+    fn fused_call_store_requires_contiguous_arg_slots() {
+        // The fused `r = f(args)` steps hand the first argument's frame slot
+        // to the call core as a contiguous base, so the callee reads
+        // `base + i`. `f(a, c)` with an unrelated binding between the two
+        // slots has no such base: fusing passed `b` as the second argument.
+        // Both variants must keep the individual `LoadLocal`s.
+        assert_eq!(
+            run("function f(x, y) { return y; } function g(a, b, c) { let r; r = f(a, c); return r; } g(1, 99, 7)")
+                .unwrap(),
+            Value::Number(7.0)
+        );
+        assert_eq!(
+            run("function g(a, b, c) { function f(x, y) { return y; } let r; r = f(a, c); return r; } g(1, 99, 7)")
+                .unwrap(),
+            Value::Number(7.0)
+        );
+    }
+
+    #[test]
     fn mid_chain_optional_member_keeps_short_circuiting() {
         // A `?.` in the middle of a chain short-circuits the WHOLE chain:
         // the links after it (plain members, calls, indexes) are skipped, not

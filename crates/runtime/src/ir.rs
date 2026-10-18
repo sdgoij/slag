@@ -16779,6 +16779,15 @@ enum BindingLoc {
     Env,
 }
 
+/// The fused call-store steps hand `arg_slots[0]` to the call core as a
+/// caller-frame base (the callee may read the arguments straight from the
+/// caller's frame), so their slots must be a contiguous run. A non-contiguous
+/// set — `f(a, c)` where `b` sits between the two — has no single base and
+/// must keep the individual `LoadLocal`s on the value stack.
+fn arg_slots_are_contiguous(arg_slots: &[usize]) -> bool {
+    arg_slots.windows(2).all(|pair| pair[1] == pair[0] + 1)
+}
+
 impl Compiler {
     /// The frame slot of a binding under this body's fast-path analysis.
     fn slot_of(&self, name: crux::AtomId) -> Option<usize> {
@@ -17081,18 +17090,26 @@ impl Compiler {
                                 };
                                 slot
                             })
-                            .collect();
+                            .collect::<Vec<_>>();
                         let name = *name;
                         let span = *span;
-                        self.steps.truncate(self.steps.len() - argc - 1);
-                        self.emit(Step::CallFastGlobalStore {
-                            name,
-                            arg_slots,
-                            store_slot,
-                            span,
-                        });
-                        self.fused_completion = true;
-                        true
+                        // The runtime passes `arg_slots[0]` to the call core
+                        // as a caller-frame base, so the args must occupy a
+                        // contiguous run. `g(a, c)` does not — keep the
+                        // individual loads on the stack (the slow path).
+                        if !arg_slots_are_contiguous(&arg_slots) {
+                            false
+                        } else {
+                            self.steps.truncate(self.steps.len() - argc - 1);
+                            self.emit(Step::CallFastGlobalStore {
+                                name,
+                                arg_slots,
+                                store_slot,
+                                span,
+                            });
+                            self.fused_completion = true;
+                            true
+                        }
                     } else if let Some(Step::CallFastSlot { slot, argc, span }) = self.steps.last()
                         && let argc = *argc as usize
                         && self.steps.len() > argc
@@ -17113,16 +17130,22 @@ impl Compiler {
                                 };
                                 slot
                             })
-                            .collect();
-                        self.steps.truncate(self.steps.len() - argc - 1);
-                        self.emit(Step::CallFastSlotStore {
-                            callee_slot,
-                            arg_slots,
-                            store_slot,
-                            span,
-                        });
-                        self.fused_completion = true;
-                        true
+                            .collect::<Vec<_>>();
+                        if !arg_slots_are_contiguous(&arg_slots) {
+                            // See the global variant above: a non-contiguous
+                            // set has no single caller-frame base.
+                            false
+                        } else {
+                            self.steps.truncate(self.steps.len() - argc - 1);
+                            self.emit(Step::CallFastSlotStore {
+                                callee_slot,
+                                arg_slots,
+                                store_slot,
+                                span,
+                            });
+                            self.fused_completion = true;
+                            true
+                        }
                     } else {
                         false
                     };
