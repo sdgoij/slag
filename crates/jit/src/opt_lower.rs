@@ -61,20 +61,6 @@ pub fn compile(
     helpers: &JitHelpers,
     max_stack: usize,
 ) -> Option<Compiled> {
-    // The opt tier is slower than the per-step tier on bodies that create
-    // functions: the prototype-method-call shape a closure exposes
-    // (`p.get(k)` with a certified leaf callee) measured 3.4 ms per-step vs
-    // 9.0 ms here (`opcost/proto_method_call`, 2026-10-18). The call lane is
-    // the suspect. Decline those bodies explicitly so the regression cannot
-    // ship on the strength of the ABI fix below.
-    if (0..ir.block_count() as BlockId).any(|b| {
-        ir.block(b)
-            .insts
-            .iter()
-            .any(|i| matches!(i.op, Op::NewClosure | Op::FunctionDecl))
-    }) {
-        return None;
-    }
     let conv = platform_call_conv(isa);
     let mut func =
         Function::with_name_signature(UserFuncName::testcase("jit_opt_body"), jit_sig(conv));
@@ -3201,6 +3187,13 @@ fn emit_intrinsic(
 
     // The fallback: the general call (a shadowed method, or a receiver/argument
     // shape the helper declines). The args sit at the working-region base.
+    //
+    // The slow path goes through the SAME leaf-call lane as `Op::Call`, not
+    // straight to `call_slow`: a method whose NAME matched an intrinsic but
+    // whose identity did not (e.g. `p.get(k)` against `%Map.prototype.get%`)
+    // is an ordinary call, and the leaf lane inlines its certified body. The
+    // direct `call_slow` here made such calls ~3x slower than the per-step
+    // tier, which withdraws to `fast_call_core` (the leaf lane) instead.
     builder.seal_block(slow);
     builder.switch_to_block(slow);
     for (k, a) in args.iter().enumerate() {
@@ -3212,15 +3205,7 @@ fn emit_intrinsic(
         );
     }
     let argc_imm = builder.ins().iconst(types::I64, args.len() as i64);
-    let dir_imm = builder.ins().iconst(types::I64, 0);
-    let res = call_helper(
-        builder,
-        helpers,
-        abi,
-        abi.sig_call_slow,
-        Helper::CallSlow,
-        &[callee, this, argc_imm, abi.work, dir_imm],
-    )?;
+    let res = emit_leaf_call(builder, helpers, abi, callee, this, abi.work, argc_imm)?;
     builder.def_var(value, res);
     builder.ins().jump(merge, &[]);
 

@@ -2014,6 +2014,42 @@ mod tests {
     }
 
     #[test]
+    fn opt_tier_intrinsic_named_method_call_matches_the_interpreter() {
+        // A user method whose NAME matches a lifted intrinsic (`get`) but whose
+        // callee is not that intrinsic takes `emit_intrinsic`'s slow path. The
+        // slow path must run the leaf-call lane (which inlines the certified
+        // callee), not fall straight to `call_slow`: the direct funnel made
+        // every such call ~3x slower than the per-step tier, which withdraws
+        // to `fast_call_core`.
+        let source = "function call(o) { \
+                        var s = 0; \
+                        for (var i = 0; i < 20; i++) { s += o.get(i); } \
+                        return s; \
+                      } \
+                      var o = { get: function (x) { return x + 1; } }; \
+                      var t = 0; \
+                      t += call(o); t += call(o); t += call(o); t += call(o); \
+                      t += call(o); t += call(o); t += call(o); t += call(o); \
+                      t;";
+        let interp = {
+            let mut agent = runtime::Agent::new();
+            agent.initialize_host_defined_realm().expect("realm");
+            agent.run_script(source).expect("interp runs")
+        };
+        let (value, compiled, opt_compiled) =
+            with_opt_jit_agent_counts(|agent| agent.run_script(source).expect("runs"));
+        assert_eq!(
+            value, interp,
+            "the intrinsic fallback must match the interpreter"
+        );
+        assert!(compiled >= 1, "{compiled} bodies compiled");
+        assert!(
+            opt_compiled >= 1,
+            "the calling body must lift so the intrinsic slow path is exercised"
+        );
+    }
+
+    #[test]
     fn opt_tier_branch_body_matches_the_interpreter() {
         // I2: a body with `if`/`else` and a ternary lowers to the multi-block
         // IR (a branch plus a join whose stack value becomes a parameter) and

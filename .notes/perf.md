@@ -13753,11 +13753,19 @@ back to the vector slot. A collection clears the derived cells
 would miss on every iteration for the rest of the run while the helper served
 the read from the slot.
 
-Bodies containing `NewClosure`/`FunctionDecl` are declined explicitly by
-`opt_lower::compile` for now: with the ABI corrected they assemble, but the
-prototype-method-call shape a closure exposes measures 3.4 ms per-step against
-9.0 ms in the opt tier (`opcost/proto_method_call`). The call lane is the
-suspect; the decline keeps that regression out until it is fixed.
+Bodies containing `NewClosure`/`FunctionDecl` are now opt-compiled. The
+earlier explicit decline was a workaround for a 3x regression on
+`opcost/proto_method_call`, but the cause was the intrinsic slow path, not
+closures: a method whose NAME matches a lifted intrinsic (`get`, `set`,
+`has`, ...) is lifted as `Intrinsic` because only the name is known at lift
+time; the runtime identity gate then declines, and `emit_intrinsic`'s fallback
+went straight to `call_slow` instead of the leaf-call lane `Op::Call` uses.
+The per-step tier withdraws to `fast_call_core`, which has that lane, so the
+opt tier was ~3x slower. With the fallback routed through `emit_leaf_call`,
+`CallSlow` on that body falls from 1.2M calls to 4 and the row measures
+8.3 -> 3.18 ms (per-step 3.17). A same-binary A/B after the fix put
+`construct_churn` at 98-103 ms opt vs 94-98 per-step and `recursive_fib` /
+`method_call` at parity, so the decline is removed.
 
 ## Map/Set key index drops SipHash (2026-10-18)
 
