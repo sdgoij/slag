@@ -226,21 +226,94 @@ fn lift_impl(body: &CompiledBody, guard_reads: bool) -> Result<Function, Unsuppo
     for bi in 0..nb {
         let mut stack: Vec<ValueId> = builder.func().block(bi as BlockId).params.clone();
         let body_end = terms[bi].unwrap_or(ends[bi]);
+        // A plain `new` argument run: `ArgsBase; <arg eval>; ArgsPush*; Construct`
+        // fuses into one `Op::ConstructArgs` (the arguments ride the working
+        // region, not the VM's argument vector). Any other shape flushes the
+        // pending boundary and pushes so the interpreter-compatible vector
+        // form is emitted instead. The run never crosses a block.
+        let mut pending_construct_args: Option<Vec<ValueId>> = None;
         for (off, step) in steps[block_starts[bi]..body_end].iter().enumerate() {
+            // The diagnostic probe resumes the INTERPRETER at this step, which
+            // needs the argument boundary and pushes a pending fusion swallowed
+            // — flush first so a deopt leaves the VM exactly as the steps do.
+            if pending_construct_args.is_some()
+                && !probed
+                && probe_depth == Some(stack.len())
+                && let Some(values) = pending_construct_args.take()
+            {
+                emit_args_ops(&mut builder, bi as BlockId, values);
+            }
             if !probed && probe_depth == Some(stack.len()) {
                 emit_opt_probe(&mut builder, bi as BlockId, &stack, block_starts[bi] + off);
                 probed = true;
             }
-            emit_step(
-                &mut builder,
-                bi as BlockId,
-                &mut stack,
-                tdz,
-                block_starts[bi] + off,
-                guard_reads,
-                step,
-                counter,
-            )?;
+            match step {
+                Step::ArgsBase if pending_construct_args.is_none() => {
+                    pending_construct_args = Some(Vec::new());
+                }
+                // A nested or spread argument run, or any step that consumes
+                // the interpreter's argument boundary/vector, needs the vector
+                // form: flush what the fusion swallowed and emit the step.
+                Step::ArgsBase
+                | Step::ArgsSpread
+                | Step::Call { .. }
+                | Step::TailCall { .. }
+                | Step::TailCallSelfVector
+                | Step::SuperCall
+                | Step::TaggedTemplate(_)
+                | Step::TailTaggedTemplate(_)
+                    if pending_construct_args.is_some() =>
+                {
+                    if let Some(values) = pending_construct_args.take() {
+                        emit_args_ops(&mut builder, bi as BlockId, values);
+                    }
+                    emit_step(
+                        &mut builder,
+                        bi as BlockId,
+                        &mut stack,
+                        tdz,
+                        block_starts[bi] + off,
+                        guard_reads,
+                        step,
+                        counter,
+                    )?;
+                }
+                Step::ArgsPush if pending_construct_args.is_some() => {
+                    let value = stack.pop().ok_or(Unsupported::Stack)?;
+                    pending_construct_args
+                        .as_mut()
+                        .expect("the guard checked it")
+                        .push(value);
+                }
+                Step::Construct { .. } if pending_construct_args.is_some() => {
+                    let callee = stack.pop().ok_or(Unsupported::Stack)?;
+                    let values = pending_construct_args.take().expect("the guard checked it");
+                    let mut args = Vec::with_capacity(values.len() + 1);
+                    args.push(callee);
+                    args.extend(values);
+                    let result = builder.emit(
+                        bi as BlockId,
+                        Op::ConstructArgs,
+                        &args,
+                        Type::Unknown,
+                        Op::ConstructArgs.default_effects(),
+                        Imm::None,
+                    );
+                    stack.push(result);
+                }
+                _ => {
+                    emit_step(
+                        &mut builder,
+                        bi as BlockId,
+                        &mut stack,
+                        tdz,
+                        block_starts[bi] + off,
+                        guard_reads,
+                        step,
+                        counter,
+                    )?;
+                }
+            }
             match step {
                 Step::FastLoopBind {
                     var: FastLoopVar::Slot(slot),
@@ -249,6 +322,9 @@ fn lift_impl(body: &CompiledBody, guard_reads: bool) -> Result<Function, Unsuppo
                 Step::FastLoopStore { .. } => counter = None,
                 _ => {}
             }
+        }
+        if let Some(values) = pending_construct_args.take() {
+            emit_args_ops(&mut builder, bi as BlockId, values);
         }
         term_rec[bi] = Some(match terms[bi] {
             Some(ti) => match &steps[ti] {
@@ -812,6 +888,28 @@ fn guard_read_value(
         Effects::pure(),
         Imm::Int(index as i32 + 1),
     )
+}
+
+/// Re-emit a flushed construct argument run in the interpreter's vector form:
+/// one `ArgsBase` boundary followed by one `ArgsPush` per already-evaluated
+/// argument (the values are consumed by the ops, not the operand stack).
+fn emit_args_ops(builder: &mut Builder, block: BlockId, values: Vec<ValueId>) {
+    builder.emit_void(
+        block,
+        Op::ArgsBase,
+        &[],
+        Op::ArgsBase.default_effects(),
+        Imm::None,
+    );
+    for value in values {
+        builder.emit_void(
+            block,
+            Op::ArgsPush,
+            &[value],
+            Op::ArgsPush.default_effects(),
+            Imm::None,
+        );
+    }
 }
 
 #[allow(clippy::too_many_arguments)]

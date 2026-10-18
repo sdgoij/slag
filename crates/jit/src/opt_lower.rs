@@ -1309,6 +1309,34 @@ fn lower_inst(
                 &[callee, abi.work],
             )?
         }
+        // The fused plain-argument construct: `args = [callee, a1..aN]`,
+        // written to the working region instead of the VM's argument vector.
+        // The construct frame carves above them (`args_ptr + argc`).
+        Op::ConstructArgs => {
+            if inst.args.is_empty() {
+                return Err(Unsupported::Step("opt:construct-args"));
+            }
+            let callee = arg!(0);
+            let argc = inst.args.len() - 1;
+            for k in 0..argc {
+                let value = arg!(1 + k);
+                builder.ins().store(
+                    MemFlagsData::new(),
+                    value,
+                    abi.work,
+                    Offset32::new((k * 8) as i32),
+                );
+            }
+            let argc_imm = builder.ins().iconst(types::I64, argc as i64);
+            call_helper(
+                builder,
+                helpers,
+                abi,
+                abi.sig_binary,
+                Helper::ConstructArgs,
+                &[callee, abi.work, argc_imm],
+            )?
+        }
         // The certified for-of/for-in heads/bind/close: opaque helpers, all
         // effect-only (the element flow never rides the SSA operand stack).
         Op::ForOfBegin => {

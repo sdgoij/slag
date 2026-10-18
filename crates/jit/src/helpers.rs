@@ -205,6 +205,9 @@ pub enum Helper {
     DeleteSuper,
     ResolveSuperRefName,
     ResolveSuperRefComputed,
+    /// The fused plain-argument construct (no `ArgsBase`/`ArgsPush` vector):
+    /// the callee and its arguments in the JIT buffer.
+    ConstructArgs,
 }
 
 // The instrument's counter array (`runtime::jit::HELPER_COUNT`) must cover every
@@ -360,12 +363,13 @@ impl Helper {
             Helper::DeleteSuper => "delete_super",
             Helper::ResolveSuperRefName => "resolve_super_ref_name",
             Helper::ResolveSuperRefComputed => "resolve_super_ref_computed",
+            Helper::ConstructArgs => "construct_args",
         }
     }
 
     /// One past the last variant; bounds the temporary helper instrument's
     /// counter array (`runtime::jit::HELPER_COUNT`).
-    pub const COUNT: usize = Helper::ResolveSuperRefComputed as usize + 1;
+    pub const COUNT: usize = Helper::ConstructArgs as usize + 1;
 
     /// Whether calling this helper can re-enter the interpreter (a getter,
     /// setter, `valueOf`/`toString`, or nested call), which is the only way
@@ -916,6 +920,11 @@ pub struct JitHelpers {
     pub resolve_super_ref_name: Option<extern "C" fn(vm: *mut c_void, name: u64) -> u64>,
     pub resolve_super_ref_computed:
         Option<extern "C" fn(vm: *mut c_void, base: u64, key: u64) -> u64>,
+    /// The fused plain-argument construct: `args` points at the JIT buffer's
+    /// argument region (`argc` slots) and the constructor runs without the
+    /// interpreter's `ArgsBase`/`ArgsPush` vector.
+    pub construct_args:
+        Option<extern "C" fn(vm: *mut c_void, callee: u64, args: *mut u64, argc: u64) -> u64>,
 }
 
 impl JitHelpers {
@@ -1068,6 +1077,7 @@ impl JitHelpers {
             delete_super: None,
             resolve_super_ref_name: None,
             resolve_super_ref_computed: None,
+            construct_args: None,
         }
     }
 
@@ -1234,6 +1244,7 @@ impl JitHelpers {
             Helper::ResolveSuperRefComputed => {
                 self.resolve_super_ref_computed.map(|f| f as usize as u64)
             }
+            Helper::ConstructArgs => self.construct_args.map(|f| f as usize as u64),
         }
     }
 }
@@ -2072,6 +2083,15 @@ pub extern "C" fn test_resolve_super_ref_name(_vm: *mut c_void, _name: u64) -> u
     Value::Undefined.bits()
 }
 
+pub extern "C" fn test_construct_args(
+    _vm: *mut c_void,
+    _callee: u64,
+    _args: *mut u64,
+    _argc: u64,
+) -> u64 {
+    Value::Undefined.bits()
+}
+
 pub extern "C" fn test_resolve_super_ref_computed(_vm: *mut c_void, _base: u64, _key: u64) -> u64 {
     Value::Undefined.bits()
 }
@@ -2251,6 +2271,7 @@ mod tests {
         );
         assert_eq!(Helper::DenseArrayAppend.name(), "dense_array_append");
         assert_eq!(Helper::TypedArrayLength.name(), "typed_array_length");
+        assert_eq!(Helper::ConstructArgs.name(), "construct_args");
     }
 
     #[test]

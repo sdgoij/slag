@@ -13147,13 +13147,36 @@ impl Vm {
                 "Construct without an argument boundary".into(),
             )
         })?;
-        // GC-2: the general construct path copies its arguments
-        // into a local Vec (the leaf path's frame copies them
-        // before any collection, so it can split freely); the
-        // copy is unrooted while the construct machinery (env
-        // records, the capture context, a rest binding's
-        // `array_from_values`) allocates, so `--gc-stress` is
-        // suppressed for the window.
+        // The interpreter keeps its arguments on the VM vector; detach them
+        // before the construct body runs (it may push onto the VM stacks). The
+        // small stack buffer covers the common arity without a Vec allocation;
+        // a longer argument list keeps `split_off`'s Vec. GC-2: the copy is
+        // unrooted while the construct machinery (env records, the capture
+        // context, a rest binding's `array_from_values`) allocates, so
+        // `--gc-stress` is suppressed for the window in the general path below.
+        let argc = self.args.len() - base;
+        let mut args_buf = [Value::Undefined; 3];
+        let args: std::borrow::Cow<'_, [Value]> = if argc <= args_buf.len() {
+            args_buf[..argc].copy_from_slice(&self.args[base..]);
+            self.args.truncate(base);
+            std::borrow::Cow::Borrowed(&args_buf[..argc])
+        } else {
+            std::borrow::Cow::Owned(self.args.split_off(base))
+        };
+        self.step_construct_from_args(agent, callee, &args, shared)
+    }
+
+    /// The construct core over an argument slice: the interpreter's
+    /// `Step::Construct` (its vector detached by `step_construct_impl`) and the
+    /// JIT's fused `construct_args` helper (the arguments in the compiled
+    /// body's working region, rooted by the native-stack scan).
+    pub(crate) fn step_construct_from_args(
+        &mut self,
+        agent: &mut Agent,
+        callee: Value,
+        args: &[Value],
+        shared: Option<(*mut std::os::raw::c_void, usize)>,
+    ) -> Result<Value, JsError> {
         if self.can_inline_leaf()
             && let ValueKind::Function(function) = callee.kind()
             && matches!(function.kind, crux::function::FunctionKind::EcmaScript)
@@ -13164,21 +13187,6 @@ impl Vm {
             // cached at ir-compile time.
             && entry.construct_inline
         {
-            // The argument slice is read in place from `self.args`
-            // into a small stack buffer (≤3 args, the common
-            // shape) instead of `split_off`'s per-construct Vec
-            // allocation; a longer argument list keeps the Vec
-            // path. The buffer is a local like the Vec was, so
-            // the rooting story is unchanged.
-            let argc = self.args.len() - base;
-            let mut args_buf = [Value::Undefined; 3];
-            let args: std::borrow::Cow<'_, [Value]> = if argc <= args_buf.len() {
-                args_buf[..argc].copy_from_slice(&self.args[base..]);
-                std::borrow::Cow::Borrowed(&args_buf[..argc])
-            } else {
-                std::borrow::Cow::Owned(self.args.split_off(base))
-            };
-            self.args.truncate(base);
             let ir = entry.ir.clone();
             let strict = entry.strict;
             // Cut 30: clone the callee's env only for a leaf
@@ -13188,8 +13196,9 @@ impl Vm {
             } else {
                 None
             };
-            self.run_leaf_construct(agent, &ir, environment, strict, &callee, &args, shared)
-        } else if let Some((ctx_ptr, _sp)) = shared
+            return self.run_leaf_construct(agent, &ir, environment, strict, &callee, args, shared);
+        }
+        if let Some((ctx_ptr, _sp)) = shared
             && agent.realm_count.get() == 1
             && let ValueKind::Function(function) = callee.kind()
             && matches!(function.kind, crux::function::FunctionKind::EcmaScript)
@@ -13200,39 +13209,36 @@ impl Vm {
             // `run_compiled_body` per construct (the construct mirror of the
             // call lane). The arguments are rooted on `vm.stack` for the
             // window (a local slice is invisible to the collector), then
-            // dropped once the lane has filled its frame; a decline (an
-            // ineligible/non-base constructor, or no room) leaves `self.args`
-            // untouched for the general path below.
-            let argc = self.args.len() - base;
+            // dropped once the lane has filled its frame.
             let push_at = self.stack.len();
             let mut lane = Ok(None);
-            if push_at + argc <= self.stack_cap {
-                self.stack.extend_from_slice(&self.args[base..]);
+            if push_at + args.len() <= self.stack_cap {
+                self.stack.extend_from_slice(args);
                 // SAFETY: the args were just pushed at `push_at`, and the
                 // caller's region reserved the stack to `stack_cap` so the
                 // lane's `resize` cannot reallocate under this pointer.
                 let args_ptr = unsafe { self.stack.as_ptr().add(push_at) } as *const u64;
                 let ctx = unsafe { &mut *(ctx_ptr as *mut crate::jit::JitCallContext) };
-                lane = crate::jit::certified_construct_lane(ctx, callee.bits(), args_ptr, argc);
+                lane =
+                    crate::jit::certified_construct_lane(ctx, callee.bits(), args_ptr, args.len());
             }
-            match lane {
+            return match lane {
                 Ok(Some(bits)) => {
-                    self.args.truncate(base);
                     self.stack.truncate(push_at);
                     Ok(Value::from_bits(bits))
                 }
                 Ok(None) => {
                     self.stack.truncate(push_at);
                     let _stress = StressSuppress::new();
-                    let args = self.args.split_off(base);
-                    crate::function::construct(agent, &callee, &args, &callee)
+                    crate::function::construct(agent, &callee, args, &callee)
                 }
                 Err(error) => {
                     self.stack.truncate(push_at);
                     Err(error)
                 }
-            }
-        } else if agent.realm_count.get() == 1
+            };
+        }
+        if agent.realm_count.get() == 1
             && let ValueKind::Function(function) = callee.kind()
             && let Some(ctor) = agent.builtin_ctor_lookup(function.id())
         {
@@ -13242,30 +13248,19 @@ impl Vm {
             // registered at `Intrinsics::define` runs it directly — no
             // per-construct `split_off` Vec, no `function::construct` crux-
             // hook round trip, no `construct_inner` realm scan +
-            // `dispatch_construct` chain walk. The args are copied out
-            // first (the handler may re-enter — a Map/Array/Date construct
-            // argument runs user code that pushes onto the Vm's stacks),
-            // and gc-stress is suppressed for the unrooted window like the
-            // general path. A registered constructor is exactly what the
-            // chain arm would have run (registration happens only for the
-            // intrinsic the chain matches by identity), and the single-
-            // realm guard preserves the cross-realm owning-realm push.
-            let argc = self.args.len() - base;
-            let mut args_buf = [Value::Undefined; 3];
-            let args: std::borrow::Cow<'_, [Value]> = if argc <= args_buf.len() {
-                args_buf[..argc].copy_from_slice(&self.args[base..]);
-                std::borrow::Cow::Borrowed(&args_buf[..argc])
-            } else {
-                std::borrow::Cow::Owned(self.args.split_off(base))
-            };
-            self.args.truncate(base);
+            // `dispatch_construct` chain walk. The handler may re-enter (a
+            // Map/Array/Date construct argument runs user code that pushes
+            // onto the Vm's stacks), and gc-stress is suppressed for the
+            // unrooted window like the general path. A registered constructor
+            // is exactly what the chain arm would have run (registration
+            // happens only for the intrinsic the chain matches by identity),
+            // and the single-realm guard preserves the cross-realm owning-
+            // realm push.
             let _stress = StressSuppress::new();
-            ctor(agent, &callee, &args, &callee)
-        } else {
-            let _stress = StressSuppress::new();
-            let args = self.args.split_off(base);
-            crate::function::construct(agent, &callee, &args, &callee)
+            return ctor(agent, &callee, args, &callee);
         }
+        let _stress = StressSuppress::new();
+        crate::function::construct(agent, &callee, args, &callee)
     }
 
     /// The fast-call path (`CallFast`): the 0-2 arguments are already on the

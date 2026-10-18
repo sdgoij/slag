@@ -1345,6 +1345,10 @@ pub struct JitSlowPaths {
     pub resolve_super_ref_name: extern "C" fn(ctx: *mut c_void, name: u64) -> u64,
     /// `Step::ResolveSuperRefComputed` (Cut 61): the computed-key form.
     pub resolve_super_ref_computed: extern "C" fn(ctx: *mut c_void, base: u64, key: u64) -> u64,
+    /// The fused plain-argument construct: the callee and its arguments in
+    /// the JIT buffer (`argc` slots), with no VM argument vector.
+    pub construct_args:
+        extern "C" fn(ctx: *mut c_void, callee: u64, args: *mut u64, argc: u64) -> u64,
 }
 
 /// The runtime's slow-path table, installed into every `JitHook`.
@@ -1495,6 +1499,7 @@ pub static JIT_SLOW_PATHS: JitSlowPaths = JitSlowPaths {
     delete_super,
     resolve_super_ref_name,
     resolve_super_ref_computed,
+    construct_args,
 };
 
 /// The slack (in slots) reserved above a compiled body's working area on the
@@ -4136,6 +4141,24 @@ extern "C" fn construct(ctx_raw: *mut c_void, callee: u64, sp: u64) -> u64 {
     // the caller's ctx with a frame carved from its buffer (no per-construct
     // ctx rebuild) — see `step_construct_shared`.
     match vm.step_construct_shared(agent, Value::from_bits(callee), ctx_raw, sp) {
+        Ok(value) => value.bits(),
+        Err(error) => slow_error(ctx, error),
+    }
+}
+
+/// The fused plain-argument construct: the callee and `argc` arguments live in
+/// the compiled body's working region (no VM argument vector). The construct
+/// frame carves above them, so `sp` is the end of the argument run.
+extern "C" fn construct_args(ctx_raw: *mut c_void, callee: u64, args: *mut u64, argc: u64) -> u64 {
+    let ctx = unsafe { ctx_of(ctx_raw) };
+    let agent = unsafe { &mut *ctx.agent };
+    let vm = unsafe { &mut *ctx.vm };
+    // SAFETY: the compiled caller writes `argc` NaN-boxed values into its
+    // working region before the call; that region is on the native stack, so
+    // the collector's conservative scan roots them for the whole construct.
+    let args = unsafe { std::slice::from_raw_parts(args as *const Value, argc as usize) };
+    let sp = args.as_ptr() as usize + argc as usize * std::mem::size_of::<Value>();
+    match vm.step_construct_from_args(agent, Value::from_bits(callee), args, Some((ctx_raw, sp))) {
         Ok(value) => value.bits(),
         Err(error) => slow_error(ctx, error),
     }

@@ -316,6 +316,9 @@ pub enum Op {
     /// an opaque call for now: the op carries no speculative premise until I4b.
     Intrinsic,
     Construct,
+    /// The fused plain-argument construct: `args = [callee, a1..aN]` in the
+    /// working region, with no `ArgsBase`/`ArgsPush` argument vector.
+    ConstructArgs,
     /// A speculation guard. When it fails the body retires and the
     /// interpreter resumes at the current step.
     Check,
@@ -437,6 +440,7 @@ impl Op {
             | Op::Call
             | Op::Intrinsic
             | Op::Construct
+            | Op::ConstructArgs
             | Op::ArrayBegin
             | Op::ArrayElement
             | Op::ArrayEnd

@@ -13753,6 +13753,34 @@ back to the vector slot. A collection clears the derived cells
 would miss on every iteration for the rest of the run while the helper served
 the read from the slot.
 
+## Fused plain-argument `new` (2026-10-18)
+
+A plain-argument `new` compiled to three helpers per construct: `ArgsBase`
+(push the argument boundary onto the VM's args vector), one `ArgsPush` per
+argument, and `Construct` (pop the boundary and run the construct). The
+optimizing tier now fuses `ArgsBase; <arg eval>; ArgsPush*; Construct` into
+one `Op::ConstructArgs`, whose arguments are written to the working region
+and handed to a `construct_args` helper. `Vm::step_construct_from_args` is
+the construct core over an arbitrary slice; the interpreter's
+`step_construct_impl` detaches its vector and calls the same core.
+
+Exactness: a pending run flushes back to the interpreter's vector form
+whenever a step can disturb it — a nested `ArgsBase` (a construct inside an
+argument), `ArgsSpread`, and every boundary-consuming call (`Call`,
+`TailCall`, `TailCallSelfVector`, `SuperCall`, tagged templates). A run never
+crosses a block (the block-end flush covers `new A(x ? 1 : 2)`), and the
+diagnostic deopt probe flushes first so an interpreter resume sees the
+boundary and the pushes. The arguments are written to the working region only
+at the fused op, after argument evaluation, so an argument's own calls cannot
+clobber them.
+
+Measured on a construct-only loop (`new Item(i)`, 2M iterations): 287.7 ->
+272.6 ms mean (5.3%, `SLAG_NO_FUSE_CONSTRUCT` A/B in one binary).
+`calls/construct_churn` is neutral within the thermal noise — the construct
+machinery, not the argument vector, dominates it. The helper census drops
+`ArgsBase`/`ArgsPush` (one per iteration each) and keeps `ConstructArgs` at
+one per iteration; the full-corpus checksums are unchanged.
+
 Bodies containing `NewClosure`/`FunctionDecl` are now opt-compiled. The
 earlier explicit decline was a workaround for a 3x regression on
 `opcost/proto_method_call`, but the cause was the intrinsic slow path, not

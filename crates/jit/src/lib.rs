@@ -521,6 +521,7 @@ fn runtime_helpers() -> JitHelpers {
         delete_super: Some(rt.delete_super),
         resolve_super_ref_name: Some(rt.resolve_super_ref_name),
         resolve_super_ref_computed: Some(rt.resolve_super_ref_computed),
+        construct_args: Some(rt.construct_args),
     }
 }
 
@@ -785,6 +786,7 @@ mod tests {
             delete_super: Some(helpers::test_delete_super),
             resolve_super_ref_name: Some(helpers::test_resolve_super_ref_name),
             resolve_super_ref_computed: Some(helpers::test_resolve_super_ref_computed),
+            construct_args: Some(helpers::test_construct_args),
         }
     }
 
@@ -2047,6 +2049,48 @@ mod tests {
             opt_compiled >= 1,
             "the calling body must lift so the intrinsic slow path is exercised"
         );
+    }
+
+    #[test]
+    fn opt_tier_construct_args_match_the_interpreter() {
+        // The lift fuses a plain `new` argument run (`ArgsBase; ArgsPush*;
+        // Construct`) into `Op::ConstructArgs`, whose arguments ride the
+        // working region. Nested constructs, spreads, and calls in the
+        // argument list flush back to the interpreter's vector form — all of
+        // them must agree with the interpreter, and the body must lift.
+        let source = "function Pair(x, y) { this.x = x; this.y = y; } \
+                      function Zero() { this.z = 7; } \
+                      function Outer(v) { this.inner = new Pair(v, v + 1); } \
+                      function Obj() { return { k: 9 }; } \
+                      function mk(a) { \
+                        var n = new Pair(a, a * 2); \
+                        var z = new Zero(); \
+                        var o = new Outer(a); \
+                        var xs = [a, a + 1]; \
+                        var s = new Pair(...xs); \
+                        var r = new Obj(); \
+                        return n.x + n.y + z.z + o.inner.y + s.y + r.k; \
+                      } \
+                      var t = 0; \
+                      t += mk(1); t += mk(2); t += mk(3); t += mk(4); \
+                      t += mk(5); t += mk(6); t += mk(7); t += mk(8); \
+                      t += mk(1); t += mk(2); t += mk(3); t += mk(4); \
+                      t += mk(5); t += mk(6); t += mk(7); t += mk(8); \
+                      t += mk(1); t += mk(2); t += mk(3); t += mk(4); \
+                      t;";
+        let interp = {
+            let mut agent = runtime::Agent::new();
+            agent.initialize_host_defined_realm().expect("realm");
+            agent.run_script(source).expect("interp runs")
+        };
+        let (value, compiled, opt_compiled) =
+            with_opt_jit_agent_counts(|agent| agent.run_script(source).expect("runs"));
+        assert_eq!(
+            value, interp,
+            "the fused construct must match the interpreter"
+        );
+        assert!(compiled >= 1, "{compiled} bodies compiled");
+        assert!(opt_compiled >= 1, "the constructing body must lift");
     }
 
     #[test]
