@@ -1008,9 +1008,13 @@ pub struct Agent {
         u64,
         std::rc::Rc<std::cell::RefCell<crate::builtins::weakref::FinalizationData>>,
     >,
-    /// [[IteratedObject]], [[ArrayIteratorNextIndex]], and [[ArrayIterationKind]]
-    /// of Array iterators, keyed by object identity (spec 23.1.5).
-    pub array_iter_data: std::collections::HashMap<u64, (Value, usize, u32)>,
+    /// [[IteratedObject]], [[ArrayIteratorNextIndex]], [[ArrayIterationKind]],
+    /// and the iterator box's address (for dead-entry reaping) of Array
+    /// iterators, keyed by object identity (spec 23.1.5). A `RefCell` so the
+    /// collection's dead-set compaction can drop entries for swept iterators;
+    /// otherwise every entry's iterated array stays a root forever.
+    pub array_iter_data:
+        std::cell::RefCell<std::collections::HashMap<u64, (Value, usize, u32, crux::heap::GcAny)>>,
     /// The `Array.fromAsync` continuation states, keyed by handler-function
     /// identity (spec 23.1.2.4.1); the bool selects the reject handler.
     pub array_from_async: std::collections::HashMap<
@@ -1466,7 +1470,7 @@ impl Agent {
             kept_during_job: std::cell::RefCell::new(Vec::new()),
             pending_cleanup_jobs: std::cell::RefCell::new(Vec::new()),
             finalization_registries: std::collections::HashMap::new(),
-            array_iter_data: std::collections::HashMap::new(),
+            array_iter_data: std::cell::RefCell::new(std::collections::HashMap::new()),
             array_from_async: std::collections::HashMap::new(),
             wait_async: std::collections::HashMap::new(),
             buffer_data: std::collections::HashMap::new(),
@@ -2200,8 +2204,10 @@ impl Agent {
                 crux::heap::note_ephemeron(target, held);
             }
         }
-        for (value, _, _) in self.array_iter_data.values() {
-            value.trace(visit);
+        if let Ok(map) = self.array_iter_data.try_borrow() {
+            for (value, _, _, _) in map.values() {
+                value.trace(visit);
+            }
         }
         for (state, _) in self.array_from_async.values() {
             state.trace(visit);
@@ -2418,15 +2424,40 @@ impl Agent {
         } else {
             &mut |_, _| {}
         };
-        let swept = crux::heap::with_heap_mut(|heap| {
+        let mut swept_addrs = crux::heap::with_heap_mut(|heap| {
             if minor {
                 heap.collect_minor_with_stack(&roots, has_weak, compact)
-                    .len()
             } else {
                 heap.collect_with_stack_compacting(&roots, has_weak, compact)
-                    .len()
             }
         });
+        let swept = swept_addrs.len();
+        // Drop Array Iterator entries whose iterator box the sweep reclaimed.
+        // The sweep is the conservative mark's result, so an iterator held only
+        // in a Rust stack local (the scan's job) is never pruned. The iterated
+        // array was marked live through the map this cycle and is reclaimed on
+        // the next one. The sweep's address list is arena order, not sorted;
+        // sort it only when an iterator table exists (the common no-iterator
+        // collection skips the work).
+        let has_iterators = self
+            .array_iter_data
+            .try_borrow()
+            .is_ok_and(|map| !map.is_empty())
+            || live.iter().any(|&agent| {
+                agent != self_ptr
+                    // SAFETY: as above.
+                    && unsafe { (&*agent).array_iter_data.try_borrow().is_ok_and(|map| !map.is_empty()) }
+            });
+        if has_iterators {
+            swept_addrs.sort_unstable();
+            self.reap_dead_iterators(&swept_addrs);
+            for &agent in &live {
+                if agent != self_ptr {
+                    // SAFETY: as above.
+                    unsafe { (&*agent).reap_dead_iterators(&swept_addrs) };
+                }
+            }
+        }
         for observer in &observers {
             observer.epilogue(generation);
         }
@@ -2709,6 +2740,24 @@ impl Agent {
             self.boolean_data.remove(&id);
             self.bigint_data.remove(&id);
         }
+    }
+
+    /// Drop the `array_iter_data` entries of Array iterators the sweep
+    /// reclaimed. `dead` is the sweep's address list (the conservative mark's
+    /// result, while no allocation can have reused a slot). Without this, every
+    /// dead iterator's entry keeps its iterated array a root forever, and the
+    /// map's trace grows with the number of iterators ever created.
+    fn reap_dead_iterators(&self, dead: &[usize]) {
+        if dead.is_empty() {
+            return;
+        }
+        let Ok(mut map) = self.array_iter_data.try_borrow_mut() else {
+            return;
+        };
+        if map.is_empty() {
+            return;
+        }
+        map.retain(|_, (_, _, _, iterator)| dead.binary_search(&iterator.addr()).is_err());
     }
 
     /// Toggle the `--gc-stress` mode: collect at every safe point instead of

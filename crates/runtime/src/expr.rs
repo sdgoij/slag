@@ -2226,8 +2226,12 @@ pub fn for_of_begin(agent: &mut Agent, value: &Value) -> Result<ForOfState, JsEr
     // index 0, in the value kind, with the intrinsic `next`.
     let stock =
         match iterator.kind() {
-            ValueKind::Object(object) => agent.array_iter_data.get(&object.id()).cloned().filter(
-                |(array, index, kind)| {
+            ValueKind::Object(object) => agent
+                .array_iter_data
+                .borrow()
+                .get(&object.id())
+                .cloned()
+                .filter(|(array, index, kind, _)| {
                     *index == 0
                         && *kind == crate::builtins::array::ArrayIterationKind::Value as u32
                         && matches!(
@@ -2243,7 +2247,7 @@ pub fn for_of_begin(agent: &mut Agent, value: &Value) -> Result<ForOfState, JsEr
         .current_realm()
         .ok()
         .and_then(|realm| realm.intrinsics.get("%ArrayIteratorPrototype.next%"));
-    if let Some((array, _, _)) = stock
+    if let Some((array, _, _, _)) = stock
         && intrinsic_next.as_ref() == Some(&next)
         && !iterator_chain_has_return(agent, &iterator)?
     {

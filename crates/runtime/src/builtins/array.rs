@@ -1097,7 +1097,8 @@ pub(crate) fn create_array_iterator(
     let iterator = JsObject::ordinary_object_create(proto);
     agent
         .array_iter_data
-        .insert(iterator.id(), (array, 0usize, kind as u32));
+        .borrow_mut()
+        .insert(iterator.id(), (array, 0usize, kind as u32, iterator.as_any()));
     Ok(Value::Object(iterator))
 }
 
@@ -2577,7 +2578,8 @@ fn array_iterator_next(agent: &mut Agent, this: &Value, _args: &[Value]) -> Resu
             "Array Iterator.prototype.next requires an Array Iterator".into(),
         ));
     };
-    let Some((array, index, kind)) = agent.array_iter_data.get(&obj.id()).cloned() else {
+    let Some((array, index, kind, _)) = agent.array_iter_data.borrow().get(&obj.id()).cloned()
+    else {
         return Err(JsError::new(
             ErrorKind::TypeError,
             "Incompatible receiver".into(),
@@ -2601,9 +2603,10 @@ fn array_iterator_next(agent: &mut Agent, this: &Value, _args: &[Value]) -> Resu
     let length = length_of_array_like(agent, &array)?;
     let next_index = index as u64;
     if next_index >= length {
-        agent
-            .array_iter_data
-            .insert(obj.id(), (Value::Undefined, index, kind));
+        agent.array_iter_data.borrow_mut().insert(
+            obj.id(),
+            (Value::Undefined, index, kind, obj.as_any()),
+        );
         return iter_result(agent, Value::Undefined, true);
     }
     let name = key(next_index);
@@ -2615,9 +2618,10 @@ fn array_iterator_next(agent: &mut Agent, this: &Value, _args: &[Value]) -> Resu
         1 => Value::Number(next_index as f64),
         _ => get_property(agent, &array, &name, array)?,
     };
-    agent
-        .array_iter_data
-        .insert(obj.id(), (array, next_index as usize + 1, kind));
+    agent.array_iter_data.borrow_mut().insert(
+        obj.id(),
+        (array, next_index as usize + 1, kind, obj.as_any()),
+    );
     iter_result(agent, value, false)
 }
 
