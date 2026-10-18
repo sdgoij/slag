@@ -284,6 +284,9 @@ impl Map {
     pub fn set_composite_child(&mut self, names: &[AtomId], child: Handle<Map>) {
         const COMPOSITE_CAP: usize = 1024;
         if self.composite.len() < COMPOSITE_CAP {
+            // The cache stores a young shape in a possibly-old map: an old->young
+            // edge the minor collector must know about.
+            crate::heap::write_barrier_handle(self, child);
             self.composite.insert(names.into(), child);
         }
     }
