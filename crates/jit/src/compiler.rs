@@ -2891,6 +2891,117 @@ impl<'a> Lowerer<'a> {
         Ok(())
     }
 
+    /// The extracted `%Array.prototype.at%` fast path for a dense Array
+    /// receiver and a Number index. Mirrors `builtins::array::at_dense`: an
+    /// out-of-range index answers `undefined` (a real result), while a hole or
+    /// an index past the materialized prefix declines to the general call,
+    /// which consults the prototype chain.
+    fn emit_array_at_inline(
+        &mut self,
+        dense_base: ClifValue,
+        index: ClifValue,
+        entry: Block,
+        slow: Block,
+        merge: Block,
+        this_ptr: ClifValue,
+    ) -> Result<(), Unsupported> {
+        let in_range = self.builder.create_block();
+        let load_blk = self.builder.create_block();
+        let hit = self.builder.create_block();
+        let out_of_range = self.builder.create_block();
+        self.builder.switch_to_block(entry);
+        let slots_ptr = self
+            .builder
+            .ins()
+            .iadd_imm_s(dense_base, crux::heap::GCBOX_DATA_OFFSET as i64);
+        let num = self
+            .builder
+            .ins()
+            .bitcast(types::F64, MemFlagsData::new(), index);
+        // ToIntegerOrInfinity of a Number: truncate toward zero, and map NaN
+        // to +0 (the saturating conversion's NaN result is not the spec's).
+        let trunc_i = self.builder.ins().fcvt_to_sint_sat(types::I64, num);
+        let trunc = self.builder.ins().fcvt_from_sint(types::F64, trunc_i);
+        let zero = self.builder.ins().f64const(0.0);
+        let nan = self.builder.ins().fcmp(FloatCC::NotEqual, num, num);
+        let trunc = self.builder.ins().select(nan, zero, trunc);
+        let length = self.builder.ins().load(
+            types::F64,
+            MemFlagsData::new(),
+            slots_ptr,
+            Offset32::new(std::mem::offset_of!(crux::object::ArraySlots, length) as i32),
+        );
+        let negative = self.builder.ins().fcmp(FloatCC::LessThan, trunc, zero);
+        let shifted = self.builder.ins().fadd(length, trunc);
+        let k = self.builder.ins().select(negative, shifted, trunc);
+        let non_negative = self
+            .builder
+            .ins()
+            .fcmp(FloatCC::GreaterThanOrEqual, k, zero);
+        let below = self.builder.ins().fcmp(FloatCC::LessThan, k, length);
+        let in_bounds = self.builder.ins().band(non_negative, below);
+        self.builder
+            .ins()
+            .brif(in_bounds, in_range, &[], out_of_range, &[]);
+        self.builder.seal_block(in_range);
+        self.builder.seal_block(out_of_range);
+
+        // `length` can exceed the materialized prefix when the tail is holes;
+        // those elements miss in `at_dense` and must reach the chain.
+        self.builder.switch_to_block(in_range);
+        let k = self.builder.ins().fcvt_to_uint_sat(types::I64, k);
+        let elem_len = self.builder.ins().load(
+            types::I64,
+            MemFlagsData::new(),
+            slots_ptr,
+            Offset32::new(std::mem::offset_of!(crux::object::ArraySlots, elem_len) as i32),
+        );
+        let materialized = self
+            .builder
+            .ins()
+            .icmp(IntCC::UnsignedLessThan, k, elem_len);
+        self.builder
+            .ins()
+            .brif(materialized, load_blk, &[], slow, &[]);
+        self.builder.seal_block(load_blk);
+
+        self.builder.switch_to_block(load_blk);
+        let elem_ptr = self.builder.ins().load(
+            types::I64,
+            MemFlagsData::new(),
+            slots_ptr,
+            Offset32::new(std::mem::offset_of!(crux::object::ArraySlots, elem_ptr) as i32),
+        );
+        let offset = self.builder.ins().ishl_imm_u(k, 3);
+        let addr = self.builder.ins().iadd(elem_ptr, offset);
+        let bits = self
+            .builder
+            .ins()
+            .load(types::I64, MemFlagsData::new(), addr, Offset32::new(0));
+        let is_hole =
+            self.builder
+                .ins()
+                .icmp_imm_u(IntCC::Equal, bits, crux::value::HOLE_BITS as i64);
+        self.builder.ins().brif(is_hole, slow, &[], hit, &[]);
+        self.builder.seal_block(hit);
+        self.builder.switch_to_block(hit);
+        self.emit_intrinsic_value(bits, merge, this_ptr);
+
+        self.builder.switch_to_block(out_of_range);
+        let undefined = self.builder.ins().iconst(types::I64, self.undef_bits);
+        self.emit_intrinsic_value(undefined, merge, this_ptr);
+        Ok(())
+    }
+
+    /// Store an intrinsic's result on the call region and continue at `merge`
+    /// (the sentinel-free half of [`Self::emit_intrinsic_hit`]).
+    fn emit_intrinsic_value(&mut self, value: ClifValue, merge: Block, this_ptr: ClifValue) {
+        let offset = self.stack_offset(this_ptr);
+        self.set_sp_offset(offset);
+        self.push(value);
+        self.builder.ins().jump(merge, &[]);
+    }
+
     /// The dense-Array OVERWRITE arm of the compiled computed store (G20): a
     /// canonical index Number below the materialized length writes an EXISTING
     /// element in place. The append arm only serves `index == length`, so
@@ -6565,15 +6676,50 @@ impl<'a> Lowerer<'a> {
                         );
                     }
                     Intrinsic::ArrayAt => {
-                        let result =
-                            self.emit_raw_call(self.sig_get_name, Helper::ArrayAt, &[this, arg1])?;
-                        self.emit_intrinsic_hit(
-                            result,
-                            Value::hole().bits() as i64,
-                            slow,
-                            merge,
-                            this_ptr,
+                        // A Number index and a dense Array receiver take the
+                        // inline read; every other shape goes to the general
+                        // call (the runtime fast path declines it too).
+                        let obj_blk = self.builder.create_block();
+                        let kind_blk = self.builder.create_block();
+                        let dense_blk = self.builder.create_block();
+                        let index_ok = self.is_double(arg1);
+                        self.builder.ins().brif(index_ok, obj_blk, &[], slow, &[]);
+                        self.builder.seal_block(obj_blk);
+                        self.builder.switch_to_block(obj_blk);
+                        let object_pattern = (crux::TAG_PREFIX >> 44) | crux::TAG_OBJECT;
+                        let tag_bits = self.builder.ins().ushr_imm_u(this, 44);
+                        let obj_ok = self.builder.ins().icmp_imm_u(
+                            IntCC::Equal,
+                            tag_bits,
+                            object_pattern as i64,
                         );
+                        self.builder.ins().brif(obj_ok, kind_blk, &[], slow, &[]);
+                        self.builder.seal_block(kind_blk);
+                        self.builder.switch_to_block(kind_blk);
+                        let obj_ptr = self
+                            .builder
+                            .ins()
+                            .band_imm_u(this, crux::PAYLOAD_MASK as i64);
+                        let obj_ptr = self.builder.ins().ishl_imm_u(obj_ptr, 4);
+                        let obj_ptr = self
+                            .builder
+                            .ins()
+                            .iadd_imm_s(obj_ptr, crux::heap::GCBOX_DATA_OFFSET as i64);
+                        let dense_base = self.builder.ins().load(
+                            types::I64,
+                            MemFlagsData::new(),
+                            obj_ptr,
+                            Offset32::new(std::mem::offset_of!(crux::JsObject, array_dense) as i32),
+                        );
+                        let is_dense =
+                            self.builder
+                                .ins()
+                                .icmp_imm_u(IntCC::NotEqual, dense_base, 0);
+                        self.builder.ins().brif(is_dense, dense_blk, &[], slow, &[]);
+                        self.builder.seal_block(dense_blk);
+                        self.emit_array_at_inline(
+                            dense_base, arg1, dense_blk, slow, merge, this_ptr,
+                        )?;
                     }
                     Intrinsic::ArrayIncludes => {
                         let from = if *argc >= 2 {

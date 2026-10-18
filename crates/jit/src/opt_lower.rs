@@ -1844,6 +1844,101 @@ fn emit_dense_element_read(
     builder.ins().jump(merge, &[]);
 }
 
+/// The extracted `%Array.prototype.at%` fast path for a dense Array receiver
+/// and a Number index: `k` is ToIntegerOrInfinity(index) (truncated toward
+/// zero; NaN is +0), shifted by `length` when negative. An out-of-range `k`
+/// answers `undefined` — a real result, not a fallback. A hole, and any index
+/// beyond the materialized prefix (where `at_dense`'s `elements.get` misses),
+/// jump to `slow`: the chain may serve a hole and only the general call can.
+fn emit_array_at_inline(
+    builder: &mut FunctionBuilder,
+    dense_base: ClifValue,
+    index: ClifValue,
+    entry: Block,
+    slow: Block,
+    merge: Block,
+    value: Variable,
+) {
+    let in_range = builder.create_block();
+    let load_blk = builder.create_block();
+    let hit = builder.create_block();
+    let out_of_range = builder.create_block();
+
+    builder.switch_to_block(entry);
+    let slots_ptr = builder
+        .ins()
+        .iadd_imm_s(dense_base, crux::heap::GCBOX_DATA_OFFSET as i64);
+    let num = builder
+        .ins()
+        .bitcast(types::F64, MemFlagsData::new(), index);
+    // ToIntegerOrInfinity of a Number: truncate toward zero, and map NaN to
+    // +0 (the saturating conversion's NaN result is not part of the spec).
+    let trunc_i = builder.ins().fcvt_to_sint_sat(types::I64, num);
+    let trunc = builder.ins().fcvt_from_sint(types::F64, trunc_i);
+    let zero = builder.ins().f64const(0.0);
+    let nan = builder.ins().fcmp(FloatCC::NotEqual, num, num);
+    let trunc = builder.ins().select(nan, zero, trunc);
+    let length = builder.ins().load(
+        types::F64,
+        MemFlagsData::new(),
+        slots_ptr,
+        Offset32::new(std::mem::offset_of!(crux::object::ArraySlots, length) as i32),
+    );
+    let negative = builder.ins().fcmp(FloatCC::LessThan, trunc, zero);
+    let shifted = builder.ins().fadd(length, trunc);
+    let k = builder.ins().select(negative, shifted, trunc);
+    let non_negative = builder.ins().fcmp(FloatCC::GreaterThanOrEqual, k, zero);
+    let below = builder.ins().fcmp(FloatCC::LessThan, k, length);
+    let in_bounds = builder.ins().band(non_negative, below);
+    builder
+        .ins()
+        .brif(in_bounds, in_range, &[], out_of_range, &[]);
+    builder.seal_block(in_range);
+    builder.seal_block(out_of_range);
+
+    // `length` can exceed the materialized prefix when the tail is holes;
+    // `at_dense` misses those in `elements`, so the chain must answer.
+    builder.switch_to_block(in_range);
+    let k = builder.ins().fcvt_to_uint_sat(types::I64, k);
+    let elem_len = builder.ins().load(
+        types::I64,
+        MemFlagsData::new(),
+        slots_ptr,
+        Offset32::new(std::mem::offset_of!(crux::object::ArraySlots, elem_len) as i32),
+    );
+    let materialized = builder.ins().icmp(IntCC::UnsignedLessThan, k, elem_len);
+    builder.ins().brif(materialized, load_blk, &[], slow, &[]);
+    builder.seal_block(load_blk);
+
+    builder.switch_to_block(load_blk);
+    let elem_ptr = builder.ins().load(
+        types::I64,
+        MemFlagsData::new(),
+        slots_ptr,
+        Offset32::new(std::mem::offset_of!(crux::object::ArraySlots, elem_ptr) as i32),
+    );
+    let offset = builder.ins().ishl_imm_u(k, 3);
+    let addr = builder.ins().iadd(elem_ptr, offset);
+    let bits = builder
+        .ins()
+        .load(types::I64, MemFlagsData::new(), addr, Offset32::new(0));
+    let is_hole = builder
+        .ins()
+        .icmp_imm_u(IntCC::Equal, bits, crux::value::HOLE_BITS as i64);
+    builder.ins().brif(is_hole, slow, &[], hit, &[]);
+    builder.seal_block(hit);
+    builder.switch_to_block(hit);
+    builder.def_var(value, bits);
+    builder.ins().jump(merge, &[]);
+
+    builder.switch_to_block(out_of_range);
+    let undefined = builder
+        .ins()
+        .iconst(types::I64, JsValue::Undefined.bits() as i64);
+    builder.def_var(value, undefined);
+    builder.ins().jump(merge, &[]);
+}
+
 /// The numeric-TypedArray arm of [`emit_element_read`], the read mirror of the
 /// per-step `emit_typed_array_read_into`. The geometry gate is a READ gate: a
 /// detached buffer covers no element (the helper returns `undefined`), a
@@ -2709,6 +2804,41 @@ fn emit_intrinsic(
             builder.def_var(value, result);
             builder.ins().jump(merge, &[]);
         }
+        Intrinsic::ArrayAt => {
+            // A Number index and a dense Array receiver take the inline read;
+            // every other shape (a non-Number index, a spilled or non-Array
+            // receiver) goes straight to the general call.
+            let obj_blk = builder.create_block();
+            let kind_blk = builder.create_block();
+            let dense_blk = builder.create_block();
+            let index_ok = is_double(builder, arg1);
+            builder.ins().brif(index_ok, obj_blk, &[], slow, &[]);
+            builder.seal_block(obj_blk);
+            builder.switch_to_block(obj_blk);
+            let object_pattern = (crux::TAG_PREFIX >> 44) | crux::TAG_OBJECT;
+            let tag_bits = builder.ins().ushr_imm_u(this, 44);
+            let obj_ok = builder
+                .ins()
+                .icmp_imm_u(IntCC::Equal, tag_bits, object_pattern as i64);
+            builder.ins().brif(obj_ok, kind_blk, &[], slow, &[]);
+            builder.seal_block(kind_blk);
+            builder.switch_to_block(kind_blk);
+            let obj_ptr = builder.ins().band_imm_u(this, crux::PAYLOAD_MASK as i64);
+            let obj_ptr = builder.ins().ishl_imm_u(obj_ptr, 4);
+            let obj_ptr = builder
+                .ins()
+                .iadd_imm_s(obj_ptr, crux::heap::GCBOX_DATA_OFFSET as i64);
+            let dense_base = builder.ins().load(
+                types::I64,
+                MemFlagsData::new(),
+                obj_ptr,
+                Offset32::new(std::mem::offset_of!(crux::JsObject, array_dense) as i32),
+            );
+            let is_dense = builder.ins().icmp_imm_u(IntCC::NotEqual, dense_base, 0);
+            builder.ins().brif(is_dense, dense_blk, &[], slow, &[]);
+            builder.seal_block(dense_blk);
+            emit_array_at_inline(builder, dense_base, arg1, dense_blk, slow, merge, value);
+        }
         _ => {
             let result = match kind {
                 Intrinsic::ArrayIndexOf => {
@@ -2741,14 +2871,6 @@ fn emit_intrinsic(
                         &[this, arg1, v],
                     )?
                 }
-                Intrinsic::ArrayAt => call_helper(
-                    builder,
-                    helpers,
-                    abi,
-                    abi.sig_unary,
-                    Helper::ArrayAt,
-                    &[this, arg1],
-                )?,
                 Intrinsic::ArrayIncludes => {
                     let from = args.get(1).copied().unwrap_or(undefined);
                     call_helper(

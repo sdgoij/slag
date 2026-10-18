@@ -13565,3 +13565,35 @@ map and fails the fresh-map guard). The cached map's all-true attributes are
 what make the adoption equivalent to two CreateDataProperty calls; a shape
 forked with any non-default flag would change the descriptors the caller
 observes.
+
+## Array.prototype.at reads a dense element inline (2026-10-18)
+
+`at` had a JIT splice, but its fast path called `Helper::ArrayAt` on every
+call: the helper re-decodes the receiver and the index in Rust
+(`to_integer_or_infinity` + `at_dense`) and returns the hole sentinel to
+decline. `opcost/array_at` issued 2.8M helper calls for its 100k-iteration
+loop.
+
+Both JIT tiers now inline the read. The gate is a Number index and an
+Object-tagged receiver with a non-null `array_dense` cursor. The index is
+ToIntegerOrInfinity'd in machine code (truncate toward zero, with NaN mapped
+to +0 explicitly — the saturating conversion's NaN result is not the spec's),
+a negative index is rebased by `ArraySlots.length`, and the load is bounded by
+`elem_len`. Those two lengths must stay separate: `length` may exceed the
+materialized prefix when the tail is holes, and those elements must reach the
+general call (the prototype chain can serve a hole), while an index outside
+`[0, length)` answers `undefined` — a result, not a decline. A hole inside the
+materialized prefix also declines.
+
+Measured: `opcost/array_at` **3.09 → 2.60 ms (1.19x)** and the `array_at`
+helper leaves the census entirely (2.8M → 0). The other 76 rows keep their
+names and checksums and the corpus median is flat (0.996).
+
+Trap: rebasing with `elem_len` instead of `length` would turn
+`new Array(5).at(-1)` into `undefined` instead of a prototype lookup at index
+4; bounding the load by `length` alone would read uninitialized buffer slots.
+
+The row is now dominated by the `small.at` member read, not the call: the
+identical loop with `small[2]` measures 0.60 ms against 2.60 ms, and
+`GetMemberName` still runs ~2.8M times. The next slice on this shape is the
+named method read, not `at` itself.

@@ -3935,6 +3935,72 @@ mod tests {
     }
 
     #[test]
+    fn installed_jit_array_at_inline_matches_the_interpreter() {
+        // The `Array.prototype.at` splice reads a dense element inline: the
+        // receiver must be a dense Array and the index a Number. The helper
+        // must never be called on that path, and every decline (a hole, a
+        // non-Number index, a non-dense or generic receiver) must fall to the
+        // general call with the interpreter's answers.
+        static AT_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        extern "C" fn counting_at(ctx: *mut c_void, this: u64, index: u64) -> u64 {
+            AT_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            (runtime::jit::JIT_SLOW_PATHS.array_at)(ctx, this, index)
+        }
+        let mut helpers = runtime_helpers();
+        helpers.array_at = Some(counting_at);
+        let source = "var out = [];\n\
+                      function t(v) { out.push(String(v)); }\n\
+                      var a = [10, 20, 30];\n\
+                      t(a.at(0)); t(a.at(2)); t(a.at(3));\n\
+                      t(a.at(-1)); t(a.at(-3)); t(a.at(-4));\n\
+                      t(a.at(1.9)); t(a.at(-1.9)); t(a.at(-0.5));\n\
+                      t(a.at(NaN)); t(a.at(undefined)); t(a.at(null));\n\
+                      t(a.at('1')); t(a.at(true)); t(a.at(false));\n\
+                      t(a.at(Infinity)); t(a.at(-Infinity)); t(a.at(-0));\n\
+                      try { a.at(0n); t('no-throw'); } catch (e) { t(e instanceof TypeError ? 'TypeError' : 'other'); }\n\
+                      var h = [1, , 4]; t(h.at(1));\n\
+                      Array.prototype[1] = 42; t(h.at(1)); delete Array.prototype[1];\n\
+                      var tl = [1, 2]; tl.length = 5; t(tl.at(3)); t(tl.at(-1));\n\
+                      t(Array.prototype.at.call({0: 'a', length: 1}, 0));\n\
+                      var sp = []; sp[1000] = 7; t(sp.at(1000)); t(sp.at(0));\n\
+                      var sh = [1, 2]; sh.at = function () { return 'shadow'; }; t(sh.at(0));\n\
+                      function loop(n) { var a2 = [10, 20, 30]; var s = 0;\n\
+                        for (var i = 0; i < n; i++) {\n\
+                          s = (s + (a2.at(i & 3) | 0) + (a2.at(-1) | 0)) | 0; }\n\
+                        return s; }\n\
+                      t(loop(4000));\n\
+                      out.join(',');";
+        let interp = {
+            let mut agent = runtime::Agent::new();
+            agent.initialize_host_defined_realm().expect("realm");
+            agent.run_script(source).expect("interp runs")
+        };
+        extern "C" fn noop_drop(_cache: *mut c_void) {}
+        let mut agent = runtime::Agent::new();
+        agent.initialize_host_defined_realm().expect("realm");
+        let mut cache = JitCache::new(helpers).expect("isa");
+        agent.jit_hook = Some(runtime::jit::JitHook {
+            cache: (&mut cache as *mut JitCache) as *mut c_void,
+            lookup: jit_cache_lookup,
+            drop_cache: noop_drop,
+            helpers: &runtime::jit::JIT_SLOW_PATHS,
+        });
+        let value = agent.run_script(source).expect("jit runs");
+        let compiled = cache.compiled_count();
+        agent.jit_hook = None;
+        assert_eq!(
+            value, interp,
+            "the Array.at inline read must match the interpreter"
+        );
+        assert!(compiled >= 1, "{compiled} bodies");
+        let calls = AT_CALLS.load(std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(
+            calls, 0,
+            "the compiled dense at path must not call the helper ({calls} calls)"
+        );
+    }
+
+    #[test]
     fn installed_jit_shared_ctx_construct_leaf_recovers_after_a_throw() {
         // The shared-ctx construct leaf: a compiled loop's `new C(i)` runs an
         // environment-free leaf body on the CALLER's ctx with a frame carved
