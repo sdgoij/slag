@@ -276,7 +276,8 @@ fn lift_impl(body: &CompiledBody, guard_reads: bool) -> Result<Function, Unsuppo
                         guard_reads,
                         step,
                         counter,
-                    )?;
+                    )
+                    .inspect_err(|e| report_refusal(step, e))?;
                 }
                 Step::ArgsPush if pending_construct_args.is_some() => {
                     let value = stack.pop().ok_or(Unsupported::Stack)?;
@@ -311,7 +312,8 @@ fn lift_impl(body: &CompiledBody, guard_reads: bool) -> Result<Function, Unsuppo
                         guard_reads,
                         step,
                         counter,
-                    )?;
+                    )
+                    .inspect_err(|e| report_refusal(step, e))?;
                 }
             }
             match step {
@@ -931,6 +933,15 @@ fn emit_args_ops(builder: &mut Builder, block: BlockId, values: Vec<ValueId>) {
             Op::ArgsPush.default_effects(),
             Imm::None,
         );
+    }
+}
+
+/// Name the step a lift refused when `JIT_DUMP_STEPS` is set. `Unsupported::
+/// Step` carries only a `&'static str`, and several variants share the
+/// `step_name` fallback, so the census cannot tell them apart.
+fn report_refusal(step: &Step, error: &Unsupported) {
+    if std::env::var("JIT_DUMP_STEPS").is_ok() {
+        eprintln!("opt-refuse: {step:?} -> {error:?}");
     }
 }
 
