@@ -207,9 +207,9 @@ fn strip_dead_literals(func: &mut Function, replaced: &HashSet<ValueId>) {
                 .iter()
                 .filter(|inst| {
                     matches!(inst.op, Op::NewObject | Op::NewArray)
-                        && inst
-                            .result
-                            .is_some_and(|result| replaced.contains(&result) && uses_of(func, result) == 0)
+                        && inst.result.is_some_and(|result| {
+                            replaced.contains(&result) && uses_of(func, result) == 0
+                        })
                 })
                 .filter_map(|inst| inst.result)
                 .collect();

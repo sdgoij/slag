@@ -2224,25 +2224,23 @@ pub fn for_of_begin(agent: &mut Agent, value: &Value) -> Result<ForOfState, JsEr
     // @@iterator resolves to the intrinsic would also create an entry — its
     // element reads must go through the traps, so it stays generic), at
     // index 0, in the value kind, with the intrinsic `next`.
-    let stock =
-        match iterator.kind() {
-            ValueKind::Object(object) => agent
-                .array_iter_data
-                .borrow()
-                .get(&object.id())
-                .cloned()
-                .filter(|(array, index, kind, _)| {
-                    *index == 0
-                        && *kind == crate::builtins::array::ArrayIterationKind::Value as u32
-                        && matches!(
-                            array.kind(),
-                            ValueKind::Object(ref array_object)
-                                if matches!(array_object.kind, crux::object::ObjectKind::Array(_))
-                        )
-                },
-            ),
-            _ => None,
-        };
+    let stock = match iterator.kind() {
+        ValueKind::Object(object) => agent
+            .array_iter_data
+            .borrow()
+            .get(&object.id())
+            .cloned()
+            .filter(|(array, index, kind, _)| {
+                *index == 0
+                    && *kind == crate::builtins::array::ArrayIterationKind::Value as u32
+                    && matches!(
+                        array.kind(),
+                        ValueKind::Object(ref array_object)
+                            if matches!(array_object.kind, crux::object::ObjectKind::Array(_))
+                    )
+            }),
+        _ => None,
+    };
     let intrinsic_next = agent
         .current_realm()
         .ok()
