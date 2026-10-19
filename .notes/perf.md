@@ -14080,3 +14080,35 @@ run of all 77 workloads, ahead of `CallSlow` 38.9M and `LoadContext` 38.8M).
 This change removes work inside the helper; inlining the chain probe into
 compiled code (the own-data cell already has `emit_member_cell_probe`) is the
 next lever.
+
+## Deferred function boilerplate: a measured regression (2026-10-19)
+
+An isolated closure creation costs ~350 ns (`var f = function(){}` 300k times
+= 97-105 ms; adding a call adds ~40 ns). A one-sample phase probe inside
+`register_function` (100 ns Windows timer) suggested `alloc` 100 ns,
+`ecma_functions insert` 100 ns and "rest" 200 ns, so the eager
+`length`/`name`/`caller`/`arguments` defines looked like the target. They were
+made lazy exactly like `prototype_pending`: a `props_pending` record flag, an
+`ensure_function_properties` materializer, the existing own-property barrier
+extended to the four atoms, and `set_function_name` recording the name on the
+pending record instead of defining it (so the hot anonymous-definition path
+does not force materialization).
+
+Measured, same binary, three alternating pairs: worse.
+
+| probe | eager (HEAD) | deferred |
+| --- | --- | --- |
+| 300k anonymous closures | 97-100 ms | 108-113 ms |
+| ...with one call each | 138-141 ms | 177-178 ms |
+
+An instrumented counter confirmed no materialization happened in either probe,
+so the deferral really was lazy. The regression is the replacement work: the
+batched adoption is four field writes plus a pre-forked map assignment, and
+the eager `SetFunctionName` lands as an in-place update of the already-created
+`name` field — both cheaper than the lazy path's `ecma_functions` lookup plus a
+`name` clone per creation. Reverted.
+
+The methodological point: a single-sample phase split on a 100 ns timer is
+noise (`rest` read 200 ns here, but the defines are a small fraction of the
+cost). Accumulate per-phase totals over at least a thousand calls before
+attributing closure-creation cost.
