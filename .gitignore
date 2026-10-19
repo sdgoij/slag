@@ -2,3 +2,4 @@ target/
 scratch/
 /v8/
 /deno/
+/docs/slag.wasm

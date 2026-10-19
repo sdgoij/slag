@@ -1,10 +1,10 @@
 name: CI
 
-# Every push and pull request runs the five gates — format + lints, the
-# workspace test suite, both conformance sweeps (the pinned test262 and waspec
-# corpora), the Deno embedding builds, and the release builds. A `v*` tag
-# additionally publishes the release archives — standard and raylib, plus the
-# Deno-on-Slag build, per platform — as a GitHub Release.
+# The gates run in dependency order. Format + lints is the root: the workspace
+# tests, the two conformance sweeps, and the Deno embedding builds all wait on
+# it. The release packages and the browser-demo build wait on the three test
+# gates, the demo deploys to GitHub Pages only from `main`, and a `v*` tag
+# publishes the archives once the packages and the Deno builds are done.
 on:
   push:
     branches: [main]
@@ -47,6 +47,7 @@ jobs:
 
   test:
     name: Workspace tests (${{ matrix.name }})
+    needs: lint
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
     strategy:
@@ -92,6 +93,7 @@ jobs:
   # so its totals differ by those four without changing any verdict.
   test262:
     name: test262 sweep (${{ matrix.area }}, ${{ matrix.os }})
+    needs: lint
     runs-on: ${{ matrix.os }}
     timeout-minutes: 180
     strategy:
@@ -140,6 +142,7 @@ jobs:
 
   wasm:
     name: WebAssembly conformance (${{ matrix.os }})
+    needs: lint
     runs-on: ${{ matrix.os }}
     timeout-minutes: 120
     strategy:
@@ -194,11 +197,70 @@ jobs:
       - name: Run the JS-API fixtures
         if: always()
         run: target/release/wasmtest jsapi waspec/test/js-api
-      # `check` is decode-only (it never validates), so it is the cheap gate
-      # that the committed browser-demo compiler output still decodes.
-      - name: Decode the committed browser-demo module
-        if: always()
-        run: target/release/wasmtest check docs/slag.wasm
+
+  # The browser demo is the `wasm_binding` example (a dependency-free wasm
+  # module) plus the hand-written glue in `docs/slag.js` and the UI in
+  # `docs/app.js`; there is no wasm-bindgen step and no bundler. Building it
+  # after the test gates keeps a broken demo out of `main` while the deploy
+  # job below publishes the exact module this job produced.
+  demo:
+    name: Build the browser demo
+    needs: [test, test262, wasm]
+    # A tag run publishes the archives; it does not need a site build, and
+    # skipping it also keeps the Pages artifact out of the release download.
+    if: ${{ !startsWith(github.ref, 'refs/tags/') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      # The pinned test262 submodule is a build input, not just test data: the
+      # `unicode` build script derives its tables from the fixtures at compile
+      # time.
+      - uses: actions/checkout@v5
+        with:
+          submodules: recursive
+      - name: Install the pinned toolchain
+        run: rustup show
+      - name: Add the wasm target
+        run: rustup target add wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      # On wasm32 the runtime's target tables leave the native Cranelift path
+      # out of the graph, so the example needs no feature flags (see the
+      # `wasm-compile` note in crates/runtime/Cargo.toml).
+      - name: Build the demo module
+        run: cargo build --locked --release -p slag --example wasm_binding --target wasm32-unknown-unknown
+      # The page fetches all four files by relative path; a missing one would
+      # deploy a site that fails on first load.
+      - name: Assemble the site
+        run: |
+          cp target/wasm32-unknown-unknown/release/examples/wasm_binding.wasm docs/slag.wasm
+          for file in index.html app.js slag.js slag.wasm; do
+            test -s "docs/$file" || { echo "docs/$file is missing or empty" >&2; exit 1; }
+          done
+      - name: Configure Pages
+        uses: actions/configure-pages@v6
+      - name: Upload the site
+        uses: actions/upload-pages-artifact@v5
+        with:
+          path: docs
+
+  deploy:
+    name: Deploy to GitHub Pages
+    # Pull requests build the demo as a gate but must not publish it, and a tag
+    # build is a release, not a deployment.
+    needs: demo
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    permissions:
+      pages: write
+      id-token: write
+    steps:
+      - name: Deploy
+        id: deployment
+        uses: actions/deploy-pages@v5
 
   # Deno built with Slag as its engine on every platform the release ships, then
   # the two tracked embedding harnesses run against each — the only job that
@@ -214,6 +276,7 @@ jobs:
   # through cmake — so space is reclaimed and those tools installed first.
   deno:
     name: Deno (${{ matrix.name }})
+    needs: lint
     runs-on: ${{ matrix.os }}
     timeout-minutes: 150
     strategy:
@@ -315,6 +378,7 @@ jobs:
   # engine embeds its assets, and the raylib variant links raylib statically.
   build:
     name: Package (${{ matrix.name }})
+    needs: [test, test262, wasm]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 90
     strategy:
@@ -452,7 +516,7 @@ jobs:
   # just build and keep the artifacts.
   release:
     name: Publish release
-    needs: [lint, test, test262, wasm, deno, build]
+    needs: [build, deno]
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     timeout-minutes: 20

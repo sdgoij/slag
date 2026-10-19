@@ -1,6 +1,7 @@
 // The wasm DOM-bridge harness, run by the Slag CLI itself:
 //
 //   cargo build -p slag --example wasm_binding --target wasm32-unknown-unknown --release
+//   cp target/wasm32-unknown-unknown/release/examples/wasm_binding.wasm docs/slag.wasm
 //   target/release/slag tools/wasm_dom_test.js      # from the repo root
 //
 // It loads `docs/slag.wasm` through the page's own glue (`docs/slag.js`),

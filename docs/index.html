@@ -599,6 +599,7 @@ new Intl.DateTimeFormat("en-GB", { dateStyle: "full", timeStyle: "short" }).form
         <details>
           <summary>Run this locally</summary>
           <pre><code>cargo build -p slag --example wasm_binding --target wasm32-unknown-unknown --release
+cp target/wasm32-unknown-unknown/release/examples/wasm_binding.wasm docs/slag.wasm
 python -m http.server    # then open the served docs/index.html</code></pre>
           <p>This page executes <code>docs/slag.wasm</code>, built from <code>crates/slag/examples/wasm_binding.rs</code>.</p>
           <p>Source: <a href="https://github.com/sdgoij/slag">github.com/sdgoij/slag</a></p>
