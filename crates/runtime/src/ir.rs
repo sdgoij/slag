@@ -3023,6 +3023,12 @@ pub struct MemberMapCell {
     /// (an in-place `in_fields` write of a written, writable field) reads it;
     /// a non-writable descriptor declines to the exact helper.
     pub writable: u32,
+    /// The map's descriptor count. Only map-described ordinals can hold a
+    /// written field (the map is immutable for its id), so every field at or
+    /// above this is still the hole `init_ordinary` left; the compiled fill
+    /// gate bounds its higher-field scan by it instead of always loading all
+    /// `INLINE_FIELDS` slots.
+    pub count: u32,
 }
 
 impl MemberMapCell {
@@ -3038,6 +3044,7 @@ impl MemberMapCell {
             proto_id: 0,
             proto_gen: 0,
             writable: 0,
+            count: 0,
         }
     }
 }
@@ -5253,6 +5260,7 @@ impl Vm {
             proto_id,
             proto_gen,
             writable: u32::from(writable),
+            count: map.descriptor_count() as u32,
         };
         agent.member_value_cells[Self::member_cell_index(object.id(), name)] = MemberValueCell {
             id: object.id(),
@@ -5848,6 +5856,7 @@ impl Vm {
                 proto_id,
                 proto_gen,
                 writable: u32::from(writable),
+                count: map.descriptor_count() as u32,
             };
         }
         if ok {
@@ -6139,6 +6148,10 @@ impl Vm {
                         proto_id,
                         proto_gen,
                         writable: 1,
+                        count: object
+                            .map
+                            .get()
+                            .map_or(0, |map| map.descriptor_count() as u32),
                     };
                 }
                 Self::refresh_global_read_cell(agent, object, name, value);
@@ -6316,6 +6329,10 @@ impl Vm {
                 proto_id,
                 proto_gen,
                 writable: 1,
+                count: object
+                    .map
+                    .get()
+                    .map_or(0, |map| map.descriptor_count() as u32),
             };
         }
         // The read-side value cell keeps the SMALL table's index.

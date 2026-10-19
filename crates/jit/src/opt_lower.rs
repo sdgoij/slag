@@ -3619,26 +3619,65 @@ fn emit_deferred_update_store(
         field_bits,
         crux::value::UNINITIALIZED_BITS as i64,
     );
-    let mut fill_ok = builder.ins().band(deferred_ok, slot_inline);
-    fill_ok = builder.ins().band(fill_ok, is_hole);
-    for i in 1..crux::object::INLINE_FIELDS {
-        let f_bits = builder.ins().load(
-            types::I64,
-            MemFlagsData::new(),
-            field_base,
-            Offset32::new((i * std::mem::size_of::<crux::Value>()) as i32),
-        );
-        let f_hole =
-            builder
-                .ins()
-                .icmp_imm_u(IntCC::Equal, f_bits, crux::value::UNINITIALIZED_BITS as i64);
-        let at_or_above =
-            builder
-                .ins()
-                .icmp_imm_u(IntCC::UnsignedGreaterThanOrEqual, field_slot, i as i64);
-        let both = builder.ins().bor(f_hole, at_or_above);
-        fill_ok = builder.ins().band(fill_ok, both);
-    }
+    let fill_ok = builder.ins().band(deferred_ok, slot_inline);
+    let fill_ok = builder.ins().band(fill_ok, is_hole);
+    // Every field ABOVE the target must still be a hole, or the vector-free
+    // layout would no longer be prefix-dense. Only map-described ordinals can
+    // hold a written field (the map is immutable for its id), so the scan is
+    // bounded by the map's descriptor count: a constructor fill, which targets
+    // the last described field, runs no loads at all instead of the serial
+    // chain of seven.
+    let cell_count = builder.ins().load(
+        types::I32,
+        MemFlagsData::new(),
+        cell,
+        Offset32::new(std::mem::offset_of!(MemberMapCell, count) as i32),
+    );
+    let count64 = builder.ins().uextend(types::I64, cell_count);
+    let inline_cap = builder
+        .ins()
+        .iconst(types::I64, crux::object::INLINE_FIELDS as i64);
+    let over_cap = builder
+        .ins()
+        .icmp(IntCC::UnsignedGreaterThanOrEqual, count64, inline_cap);
+    let end = builder.ins().select(over_cap, inline_cap, count64);
+    let first_above = builder.ins().iadd_imm_u(field_slot, 1);
+    let index_var = builder.declare_var(types::I64);
+    let hole_gate = builder.declare_var(types::I8);
+    builder.def_var(index_var, first_above);
+    builder.def_var(hole_gate, fill_ok);
+    let check = builder.create_block();
+    let after_checks = builder.create_block();
+    let no_checks = builder
+        .ins()
+        .icmp(IntCC::UnsignedGreaterThanOrEqual, first_above, end);
+    builder.ins().brif(no_checks, after_checks, &[], check, &[]);
+    builder.switch_to_block(check);
+    let above = builder.use_var(index_var);
+    let above_bytes = builder.ins().ishl_imm_u(above, 3);
+    let above_addr = builder.ins().iadd(field_base, above_bytes);
+    let above_bits = builder.ins().load(
+        types::I64,
+        MemFlagsData::new(),
+        above_addr,
+        Offset32::new(0),
+    );
+    let above_hole = builder.ins().icmp_imm_u(
+        IntCC::Equal,
+        above_bits,
+        crux::value::UNINITIALIZED_BITS as i64,
+    );
+    let gate_so_far = builder.use_var(hole_gate);
+    let next_gate = builder.ins().band(gate_so_far, above_hole);
+    builder.def_var(hole_gate, next_gate);
+    let next = builder.ins().iadd_imm_u(above, 1);
+    builder.def_var(index_var, next);
+    let more = builder.ins().icmp(IntCC::UnsignedLessThan, next, end);
+    builder.ins().brif(more, check, &[], after_checks, &[]);
+    builder.seal_block(check);
+    builder.switch_to_block(after_checks);
+    builder.seal_block(after_checks);
+    let fill_ok = builder.use_var(hole_gate);
     let proto_handle = builder.ins().load(
         types::I64,
         MemFlagsData::new(),

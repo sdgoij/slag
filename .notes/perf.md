@@ -13925,3 +13925,13 @@ The GC-5 allocation counter and the GC-2 `--gc-stress` flag sat in two thread-lo
 `canonical_empty_map`'s lookup is a TLS `RefCell` borrow plus a vector scan, 2.7 ns standalone, and object creation measured 14.1 ns on the lookup path against 12.0 with a map supplied directly — which looks like a 2 ns win. A one-entry `Cell` inline cache took the lookup to 1.98 ns (-0.7) but `ordinary_object_create` stayed at 14.3 ns: only ~0.3 ns of the saving surfaces once the 408 B payload init is in the same path.
 
 The lesson for this area: plain-object creation is store-bound on the payload init, not latency-bound on the calls around it. A latency win in a helper is invisible unless it removes stores. The layout lever that would pay is fewer bytes written per object (a smaller ordinary-object initial state or a bulk-initialized slot) — not a smaller struct (see the object-layout skill) and not a cheaper lookup.
+
+## Constructor fills scan only described fields (2026-10-19)
+
+Decomposing the construct lane on isolated probes (2M iterations each, per-call ms and ns/iter): a plain method call `p.sum()` 72 (36), `new Empty()` 94 (47), a one-store constructor whose store never executes (`if (x < 0) this.x = x`) 134 (67), one fill 172 (86), a fill plus an update of the same field 184 (92), two fills 220-226 (110-113), the same two stores out of order 227 (113). So the lane itself is ~11 ns over a plain call, the presize receiver ~19 ns, an in-place UPDATE ~1.5 ns, and a FILL ~18-20 ns each.
+
+The fill gate required every one of the seven inline slots above the target to still be a hole — a serial chain of seven loads. Only map-described ordinals can ever hold a written field (a map is immutable for its id), so the scan can stop at the map's descriptor count. `MemberMapCell` now carries `count`, recorded from the map at every cell site, and both emitters (opt and per-step) loop from `slot + 1` to `min(count, INLINE_FIELDS)`: a constructor store that targets the last described field loads nothing.
+
+Same-binary A/B (stashed baseline, three runs each): out-of-order two-field construct 227 -> 201 ms, `construct_churn` 79-80 -> 74-77, one-field construct 172-175 -> 163-169, two-field 220-226 -> 206. The empty construct and the presize-only probe are unchanged, which attributes the win to the scan rather than to thermal drift.
+
+Also tried and reverted: a constant-template memcpy for the object init. Copying the whole 408 B payload (including the 112 B uninitialized inline array and the full `Option<HashMap>`) costs more than the targeted ~30 stores; creation went 12.1 -> 19.6 ns.

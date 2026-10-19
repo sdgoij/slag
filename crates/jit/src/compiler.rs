@@ -2137,27 +2137,68 @@ impl<'a> Lowerer<'a> {
         // only constrains the fill when the fill targets a slot below i
         // (`hole_i` OR `field_slot >= i`).
         let gate = self.builder.ins().band(deferred_ok, slot_inline);
-        let mut gate = self.builder.ins().band(gate, is_hole);
-        for i in 1..crux::object::INLINE_FIELDS {
-            let f_bits = self.builder.ins().load(
-                types::I64,
-                MemFlagsData::new(),
-                field_base,
-                Offset32::new((i * std::mem::size_of::<Value>()) as i32),
-            );
-            let f_hole = self.builder.ins().icmp_imm_u(
-                IntCC::Equal,
-                f_bits,
-                crux::value::UNINITIALIZED_BITS as i64,
-            );
-            let at_or_above = self.builder.ins().icmp_imm_u(
-                IntCC::UnsignedGreaterThanOrEqual,
-                field_slot,
-                i as i64,
-            );
-            let f_ok = self.builder.ins().bor(f_hole, at_or_above);
-            gate = self.builder.ins().band(gate, f_ok);
-        }
+        let gate = self.builder.ins().band(gate, is_hole);
+        // The higher-field check: every field above `field_slot` must be an
+        // unwritten hole. Only map-described ordinals can hold a written
+        // field (the map is immutable for its id), so the scan is bounded by
+        // the map's descriptor count; a constructor fill targets the last
+        // described field and loads nothing.
+        let cell_count = self.builder.ins().load(
+            types::I32,
+            MemFlagsData::new(),
+            cell,
+            Offset32::new(std::mem::offset_of!(MemberMapCell, count) as i32),
+        );
+        let count64 = self.builder.ins().uextend(types::I64, cell_count);
+        let inline_cap = self
+            .builder
+            .ins()
+            .iconst(types::I64, crux::object::INLINE_FIELDS as i64);
+        let over_cap =
+            self.builder
+                .ins()
+                .icmp(IntCC::UnsignedGreaterThanOrEqual, count64, inline_cap);
+        let end = self.builder.ins().select(over_cap, inline_cap, count64);
+        let first_above = self.builder.ins().iadd_imm_u(field_slot, 1);
+        let above_index = self.builder.declare_var(types::I64);
+        let above_gate = self.builder.declare_var(types::I8);
+        self.builder.def_var(above_index, first_above);
+        self.builder.def_var(above_gate, gate);
+        let check = self.builder.create_block();
+        let after_checks = self.builder.create_block();
+        let no_checks =
+            self.builder
+                .ins()
+                .icmp(IntCC::UnsignedGreaterThanOrEqual, first_above, end);
+        self.builder
+            .ins()
+            .brif(no_checks, after_checks, &[], check, &[]);
+        self.builder.switch_to_block(check);
+        let above = self.builder.use_var(above_index);
+        let above_bytes = self.builder.ins().ishl_imm_u(above, 3);
+        let above_addr = self.builder.ins().iadd(field_base, above_bytes);
+        let above_bits = self.builder.ins().load(
+            types::I64,
+            MemFlagsData::new(),
+            above_addr,
+            Offset32::new(0),
+        );
+        let above_hole = self.builder.ins().icmp_imm_u(
+            IntCC::Equal,
+            above_bits,
+            crux::value::UNINITIALIZED_BITS as i64,
+        );
+        let gate_so_far = self.builder.use_var(above_gate);
+        let next_gate = self.builder.ins().band(gate_so_far, above_hole);
+        self.builder.def_var(above_gate, next_gate);
+        let next = self.builder.ins().iadd_imm_u(above, 1);
+        self.builder.def_var(above_index, next);
+        let more = self.builder.ins().icmp(IntCC::UnsignedLessThan, next, end);
+        self.builder.ins().brif(more, check, &[], after_checks, &[]);
+        self.builder.seal_block(check);
+        self.builder.switch_to_block(after_checks);
+        self.builder.seal_block(after_checks);
+        let gate = self.builder.use_var(above_gate);
         // The prototype-chain gate: the map-cell record carries chain
         // provenance only from a chain-verified fill (`clean`), and only for
         // the recording receiver's DIRECT prototype (id, generation). A
