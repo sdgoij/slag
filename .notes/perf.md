@@ -14044,6 +14044,11 @@ is 18% behind it.
 
 That last gap is the counter, not the accumulator: `arithmetic` is
 `n += i * 2`, the loop-counter pass proves `i` an int32, and each use of it in
-a float op converts (`vcvtsi2sdl`). Keeping the counter raw when its uses are
-f64 would recover it; narrowing only when every use is int-shaped is the next
-lever, deliberately not taken here.
+a float op converts (`vcvtsi2sdl`). It is still the right choice. Keeping the
+counter a raw f64 when it feeds a float expression was implemented and
+measured: `arithmetic` went 0.711-0.721 -> 0.762-0.777 ms (three runs each),
+while `bare loop` was unchanged. The generated loop is shorter either way
+(4 f64 ops), so the loss is the counter's loop-carried dependency: an int32
+back edge is one `lea` (1 cycle) and its `fcvt`+`fcmp` ride off the critical
+path, whereas an f64 back edge is a 4-cycle `vaddsd` feeding the compare. The
+int counter stays; the different rule was reverted.

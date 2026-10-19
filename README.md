@@ -412,8 +412,9 @@ rest keep the per-step body), so they are the only two whose numbers moved when
 that tier became the default. The raw-f64 pass now keeps both accumulators in
 f64 registers: `bare loop` is 0.586 ms against the per-step lane's 0.70 ms. In
 `arithmetic` the counter is an int32 (the loop-counter pass proved it) and its
-uses convert, which leaves that one row ~18% behind the per-step lane; the
-tradeoff and the next lever are in `.notes/perf.md`.
+float uses convert; that is still faster than a loop-carried f64 counter, whose
+back edge is a 4-cycle `vaddsd`, so the row sits ~18% behind the per-step lane.
+`.notes/perf.md` has the measurement.
 
 One row needs a caveat: `wide leaf call`'s interpreter column is the suite's
 noisiest (±20% run to run), and it is the single row the pinned release profile
