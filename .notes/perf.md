@@ -14155,3 +14155,8 @@ layout change across every field access, so it is a slice of its own.
 Methodology: this supersedes the earlier single-sample phase split, which read
 `rest=200 ns` from a 100 ns timer and led the boilerplate-deferral attempt
 astray.
+
+The staged follow-up (shrink the record: class-only state behind one box, the
+two inline source strings behind a shared per-site `SourceInfo`; the GC-arena
+record as the last option; and the stop rule) is
+`.notes/closure-cost-plan.md`.
