@@ -327,6 +327,10 @@ impl Trace for EcmaFunction {
         // environments (and source strings) to the old generation, where only
         // a major could reclaim them.
         self.home_object.trace(visit);
+        // `private_environment` is inline, not in `class_parts`, so it needs
+        // its own edge: a method's `#name` resolution dereferences it when the
+        // body runs.
+        self.private_environment.trace(visit);
         if let Some(parts) = &self.class_parts {
             parts.trace(visit);
         }
