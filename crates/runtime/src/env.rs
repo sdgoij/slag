@@ -751,6 +751,63 @@ impl DeclarativeEnv {
         Ok(())
     }
 
+    /// The index of `name` in the binding vector, for the global-value cell's
+    /// declarative fast path. The global env bumps its generation on every
+    /// binding mutation (create/init/set/delete), so a cached index is only
+    /// used while its cell's generation is current; a delete shifts the
+    /// vector and therefore invalidates the cell.
+    pub fn index_of(&self, name: &JsString) -> Option<usize> {
+        self.bindings.borrow().iter().position(|(n, _)| n == name)
+    }
+
+    /// Write the binding at a cached index. `None` means the shape moved (the
+    /// index now holds another name, or the binding became indirect) and the
+    /// caller must resolve; a TDZ or strict-const write returns the same error
+    /// the name-keyed path would. `Some(value)` is the binding's value after
+    /// the call — the old value when an immutable binding silently ignores a
+    /// sloppy write — so the caller mirrors its cell with what is actually
+    /// stored.
+    pub fn set_value_at(
+        &self,
+        index: usize,
+        name: &JsString,
+        value: Value,
+        strict: bool,
+    ) -> Result<Option<Value>, JsError> {
+        let mut bindings = self.bindings.borrow_mut();
+        let Some((stored_name, binding)) = bindings.get_mut(index) else {
+            return Ok(None);
+        };
+        if stored_name != name || binding.indirect.is_some() {
+            return Ok(None);
+        }
+        let strict = strict || binding.strict;
+        let Some(current) = binding.value else {
+            return Err(JsError::new(
+                ErrorKind::ReferenceError,
+                format!(
+                    "Cannot access {:?} before initialization",
+                    name.to_string_lossy()
+                ),
+            ));
+        };
+        if binding.mutable {
+            binding.value = Some(value);
+            Ok(Some(value))
+        } else {
+            if strict {
+                return Err(JsError::new(
+                    ErrorKind::TypeError,
+                    format!(
+                        "Assignment to constant variable {:?}",
+                        name.to_string_lossy()
+                    ),
+                ));
+            }
+            Ok(Some(current))
+        }
+    }
+
     fn get_binding_value(&self, name: &JsString, _strict: bool) -> Result<Value, JsError> {
         let bindings = self.bindings.borrow();
         let binding = bindings.iter().find(|(n, _)| n == name).ok_or_else(|| {
@@ -1611,6 +1668,67 @@ mod tests {
         assert_eq!(
             env.get_binding_value(&name("let_y"), true).unwrap(),
             Value::Number(3.0)
+        );
+    }
+
+    #[test]
+    fn declared_binding_value_at_a_cached_index() {
+        // The `StoreIdent` declarative fast path: the index is stable while
+        // the generation is, a moved index falls back, and const semantics
+        // match the name-keyed path.
+        let global = JsObject::ordinary_object_create(None);
+        let env = new_global_environment(global, global);
+        env.create_mutable_binding(&name("m"), false).unwrap();
+        env.initialize_binding(&name("m"), Value::Number(1.0))
+            .unwrap();
+        let EnvRecord::Global(global_env) = &*env else {
+            panic!("a global environment")
+        };
+        let index = global_env
+            .declarative
+            .index_of(&name("m"))
+            .expect("a binding index");
+        assert_eq!(
+            global_env
+                .declarative
+                .set_value_at(index, &name("m"), Value::Number(2.0), false)
+                .unwrap(),
+            Some(Value::Number(2.0))
+        );
+        assert_eq!(
+            env.get_binding_value(&name("m"), true).unwrap(),
+            Value::Number(2.0)
+        );
+        assert_eq!(
+            global_env
+                .declarative
+                .set_value_at(index + 1, &name("m"), Value::Number(3.0), false)
+                .unwrap(),
+            None,
+            "a moved index falls back"
+        );
+
+        env.create_immutable_binding(&name("c"), false).unwrap();
+        env.initialize_binding(&name("c"), Value::Number(4.0))
+            .unwrap();
+        let c_index = global_env
+            .declarative
+            .index_of(&name("c"))
+            .expect("a binding index");
+        assert_eq!(
+            global_env
+                .declarative
+                .set_value_at(c_index, &name("c"), Value::Number(5.0), false)
+                .unwrap(),
+            Some(Value::Number(4.0)),
+            "a sloppy const write is ignored and reports the stored value"
+        );
+        assert!(
+            global_env
+                .declarative
+                .set_value_at(c_index, &name("c"), Value::Number(5.0), true)
+                .is_err(),
+            "a strict const write throws"
         );
     }
 

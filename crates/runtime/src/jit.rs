@@ -582,8 +582,15 @@ pub struct GlobalValueCell {
     /// write cannot be inlined: the vector's enum layout is runtime
     /// internal). `u32::MAX` when the slot was never resolved or when the
     /// binding is declarative (no property backs it), which disables the
-    /// store fast path (a load-only cell still validates).
+    /// store fast path (a load-only cell still validates). For a declarative
+    /// binding this field holds the binding-vector index and `declarative`
+    /// is 1.
     pub slot: u32,
+    /// 1 when `slot` is an index into the global env's declarative bindings
+    /// (a top-level `let`/`const`/`class`), 0 when it is a global-object
+    /// property slot. The generation bump every declarative mutation
+    /// performs validates the index.
+    pub declarative: u32,
     /// The cached value's bits.
     pub value: crux::Value,
 }
@@ -597,6 +604,7 @@ impl GlobalValueCell {
             global_id: u64::MAX,
             generation: 0,
             slot: u32::MAX,
+            declarative: 0,
             value: crux::Value::from_bits(0),
         }
     }
@@ -3356,10 +3364,15 @@ extern "C" fn load_ident(ctx: *mut c_void, name: u64) -> u64 {
     // whose shape does not fit (an accessor, an absent property) stays
     // missing and the resolve path keeps running.
     if let ReferenceBase::Environment(env) = &reference.base
-        && let EnvRecord::Global(_) = &**env
+        && let EnvRecord::Global(global_env) = &**env
     {
-        let declarative = env.has_lexical_declaration(&name_string);
-        vm.warm_global_cell(agent, name_atom, value, declarative);
+        if env.has_lexical_declaration(&name_string) {
+            if let Some(index) = global_env.declarative.index_of(&name_string) {
+                vm.warm_global_cell(agent, name_atom, value, Some(index));
+            }
+        } else {
+            vm.warm_global_cell(agent, name_atom, value, None);
+        }
     }
     value.bits()
 }
@@ -7919,11 +7932,12 @@ mod tests {
     #[test]
     fn a_declarative_global_read_warms_the_value_cell() {
         // A top-level `let`/`const` lives in the global env's DECLARATIVE
-        // record, so no property slot describes it — but it is cacheable: the
-        // cell records the value load-only, and the global env bumps the global
-        // object's generation on every declarative mutation, which is exactly
-        // what the cell's validation reads. The interpreter warms it here; the
-        // compiled `LoadIdent` probe reads the same agent table.
+        // record; the cell records its binding-vector index (and the
+        // `declarative` bit) so a `StoreIdent` can write it in place, and the
+        // global env bumps the global object's generation on every
+        // declarative mutation, which is exactly what the cell's validation
+        // reads. The interpreter warms it here; the compiled `LoadIdent` probe
+        // reads the same agent table.
         let mut agent = Agent::new();
         agent.initialize_host_defined_realm().unwrap();
         let name = crux::string::intern_utf8("K");
@@ -7935,9 +7949,13 @@ mod tests {
         assert_eq!(warmed.name, name, "the declarative read warmed the cell");
         assert_eq!(warmed.value.as_number(), Some(3.0));
         assert_eq!(
+            warmed.declarative, 1,
+            "the cell marks the binding as declarative"
+        );
+        assert_ne!(
             warmed.slot,
             u32::MAX,
-            "a declarative cell has no property slot to write through"
+            "a declarative cell carries the binding-vector index"
         );
         // A write to the binding must move the generation the cell captured, or
         // a compiled read would keep serving the pre-write value.

@@ -8011,6 +8011,12 @@ impl<'a> Lowerer<'a> {
                     cell,
                     Offset32::new(std::mem::offset_of!(GlobalValueCell, slot) as i32),
                 );
+                let cell_declarative = self.builder.ins().load(
+                    types::I32,
+                    MemFlagsData::new(),
+                    cell,
+                    Offset32::new(std::mem::offset_of!(GlobalValueCell, declarative) as i32),
+                );
                 let name_ok = self
                     .builder
                     .ins()
@@ -8022,9 +8028,14 @@ impl<'a> Lowerer<'a> {
                     self.builder
                         .ins()
                         .icmp_imm_u(IntCC::NotEqual, cell_slot_64, u32::MAX as i64);
+                let not_declarative =
+                    self.builder
+                        .ins()
+                        .icmp_imm_u(IntCC::Equal, cell_declarative, 0);
                 let name_id_ok = self.builder.ins().band(name_ok, id_ok);
                 let name_id_gen_ok = self.builder.ins().band(name_id_ok, gen_ok);
-                let ok = self.builder.ins().band(name_id_gen_ok, slot_ok);
+                let object_ok = self.builder.ins().band(name_id_gen_ok, slot_ok);
+                let ok = self.builder.ins().band(object_ok, not_declarative);
                 self.builder.ins().brif(ok, fast, &[], slow, &[]);
                 self.builder.switch_to_block(fast);
                 self.builder.ins().store(

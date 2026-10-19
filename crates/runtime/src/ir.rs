@@ -4842,6 +4842,28 @@ impl Vm {
             global_id: global.id(),
             generation: global.generation(),
             slot: slot.map(|s| s as u32).unwrap_or(u32::MAX),
+            declarative: 0,
+            value,
+        };
+    }
+
+    /// Record a declarative binding's cell: `slot` is the index into the
+    /// global env's binding vector. The global env bumps the object's
+    /// generation on every declarative mutation, so the index stays valid
+    /// only while the cell's captured generation matches.
+    fn record_declarative_cell(
+        agent: &mut Agent,
+        name: crux::AtomId,
+        value: Value,
+        global: &Handle<crux::object::JsObject>,
+        index: usize,
+    ) {
+        agent.global_value_cells[Self::global_cell_index(name)] = crate::jit::GlobalValueCell {
+            name,
+            global_id: global.id(),
+            generation: global.generation(),
+            slot: index as u32,
+            declarative: 1,
             value,
         };
     }
@@ -4850,11 +4872,11 @@ impl Vm {
     /// resolve landed on the global environment record (the compiled
     /// `LoadIdent` probe's miss path). Two shapes record:
     ///
-    /// - a DECLARATIVE binding (a top-level `let`/`const`/`class`, reported by
-    ///   `declarative`): the value comes from the global env's declarative
-    ///   record, so the cell is load-only (`slot` = `u32::MAX`, which disables
-    ///   the compiled store fast path) and is invalidated by the generation
-    ///   bump every declarative mutation performs (`GlobalEnv`).
+    /// - a DECLARATIVE binding (a top-level `let`/`const`/`class`), when
+    ///   `declarative_index` carries its binding-vector index: the cell
+    ///   records that index (and `declarative` = 1), so a `StoreIdent` can
+    ///   write the binding in place; the global env bumps the object's
+    ///   generation on every declarative mutation, which validates it.
     /// - an own DATA property of the global object (var/function/undeclared):
     ///   the original fast path, with the property's slot so a compiled
     ///   `StoreGlobal` can write through it.
@@ -4868,13 +4890,13 @@ impl Vm {
         agent: &mut Agent,
         name: crux::AtomId,
         value: Value,
-        declarative: bool,
+        declarative_index: Option<usize>,
     ) {
         let Ok(global) = self.global_object(agent) else {
             return;
         };
-        if declarative {
-            Self::record_global_cell(agent, name, value, &global, None);
+        if let Some(index) = declarative_index {
+            Self::record_declarative_cell(agent, name, value, &global, index);
             return;
         }
         Self::resolve_global_cell(agent, name);
@@ -5029,11 +5051,11 @@ impl Vm {
 
     /// Write an environment-resolved identifier from a certified body's
     /// `StoreIdent`: the global store cell when the body's globals are
-    /// unshadowed and the cached binding is an own writable data property,
-    /// otherwise the full environment resolve. A declarative binding records
-    /// a load-only cell (slot `u32::MAX`), so it always takes the resolve
-    /// path — `store_global_value` would write a shadow property on the
-    /// global object instead of the lexical binding.
+    /// unshadowed and the cached binding is an own writable data property or
+    /// a declarative binding with a cached index, otherwise the full
+    /// environment resolve. `store_global_value` cannot serve this path: it
+    /// writes a global-object property, which for a `let` would be a shadow
+    /// property rather than the lexical binding.
     pub(crate) fn store_ident_value(
         &mut self,
         agent: &mut Agent,
@@ -5041,18 +5063,30 @@ impl Vm {
         value: Value,
         clean: bool,
     ) -> Result<(), JsError> {
-        if clean && self.try_global_cell_store(agent, name, value)? {
-            return Ok(());
+        if clean {
+            if self.try_global_cell_store(agent, name, value)? {
+                return Ok(());
+            }
+            if self.try_declarative_cell_store(agent, name, value)? {
+                return Ok(());
+            }
         }
         let reference = crate::context::resolve_binding(agent, &crux::lookup(name), self.strict)?;
         crate::context::put_value(agent, &reference, value)?;
         // Warm the cell for the next read/write: an object-record data
-        // property records its slot; a declarative binding records load-only.
+        // property records its slot; a declarative binding records its
+        // binding-vector index.
         if let crate::context::ReferenceBase::Environment(env) = &reference.base
-            && let crate::env::EnvRecord::Global(_) = &**env
+            && let crate::env::EnvRecord::Global(global_env) = &**env
         {
-            let declarative = env.has_lexical_declaration(&crux::lookup(name));
-            self.warm_global_cell(agent, name, value, declarative);
+            let name_string = crux::lookup(name);
+            if env.has_lexical_declaration(&name_string) {
+                if let Some(index) = global_env.declarative.index_of(&name_string) {
+                    self.warm_global_cell(agent, name, value, Some(index));
+                }
+            } else {
+                self.warm_global_cell(agent, name, value, None);
+            }
         }
         Ok(())
     }
@@ -5067,7 +5101,7 @@ impl Vm {
         value: Value,
     ) -> Result<bool, JsError> {
         let cell = agent.global_value_cells[Self::global_cell_index(name)];
-        if cell.name != name || cell.slot == u32::MAX {
+        if cell.name != name || cell.declarative != 0 || cell.slot == u32::MAX {
             return Ok(false);
         }
         let global = self.global_object(agent)?;
@@ -5090,6 +5124,58 @@ impl Vm {
             return Ok(true);
         }
         Ok(false)
+    }
+
+    /// The declarative half of the `StoreIdent` fast path: write the binding
+    /// at the cell's cached index when the cell is current. The global env
+    /// bumps the object's generation on every declarative mutation, so the
+    /// index can only be stale if some other binding changed, in which case
+    /// the generation check misses and the caller resolves.
+    fn try_declarative_cell_store(
+        &mut self,
+        agent: &mut Agent,
+        name: crux::AtomId,
+        value: Value,
+    ) -> Result<bool, JsError> {
+        let cell = agent.global_value_cells[Self::global_cell_index(name)];
+        if cell.name != name || cell.declarative == 0 {
+            return Ok(false);
+        }
+        let global = self.global_object(agent)?;
+        if cell.global_id != global.id() || cell.generation != global.generation() {
+            return Ok(false);
+        }
+        let Some(env) = self.global_env_record() else {
+            return Ok(false);
+        };
+        let crate::env::EnvRecord::Global(global_env) = &*env else {
+            return Ok(false);
+        };
+        let index = cell.slot as usize;
+        let name_string = crux::lookup(name);
+        let Some(stored) =
+            global_env
+                .declarative
+                .set_value_at(index, &name_string, value, self.strict)?
+        else {
+            return Ok(false);
+        };
+        Self::record_declarative_cell(agent, name, stored, &global, index);
+        Ok(true)
+    }
+
+    /// The global environment record the running chain resolves globals at,
+    /// for the declarative cell fast path. The body's `globals_unshadowed`
+    /// gate already established that the chain reaches it without a binding
+    /// for the stored name.
+    fn global_env_record(&self) -> Option<EnvRef> {
+        let mut env = self.lexical_env;
+        loop {
+            if matches!(&*env, crate::env::EnvRecord::Global(_)) {
+                return Some(env);
+            }
+            env = env.outer()?;
+        }
     }
 
     /// The `++`/`--` fast path on a declared top-level `var`: read, update,
@@ -7824,16 +7910,23 @@ impl Vm {
                     if body.env_constant
                         && self.globals_unshadowed
                         && let crate::context::ReferenceBase::Environment(env) = &reference.base
-                        && let EnvRecord::Global(_) = &**env
+                        && let EnvRecord::Global(global_env) = &**env
                     {
                         // The JIT's `load_ident` warm gate: a global-object
                         // binding (var/function/undeclared) records with its
                         // property slot; a declarative binding (a top-level
-                        // `let`/`const`/`class`) records load-only, and the
-                        // global env bumps the object's generation on every
-                        // declarative mutation, which is what invalidates it.
-                        let declarative = env.has_lexical_declaration(&crux::lookup(*name));
-                        self.warm_global_cell(agent, *name, value, declarative);
+                        // `let`/`const`/`class`) records its binding-vector
+                        // index, and the global env bumps the object's
+                        // generation on every declarative mutation, which is
+                        // what invalidates it.
+                        let name_string = crux::lookup(*name);
+                        if env.has_lexical_declaration(&name_string) {
+                            if let Some(index) = global_env.declarative.index_of(&name_string) {
+                                self.warm_global_cell(agent, *name, value, Some(index));
+                            }
+                        } else {
+                            self.warm_global_cell(agent, *name, value, None);
+                        }
                     }
                     self.stack.push(value);
                 }

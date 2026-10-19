@@ -14542,36 +14542,43 @@ RHS + `Binary` + `StoreIdent`. `ResolveIdentStore` branches on the ctx's
 `globals_unshadowed`: the clean path skips the walk entirely, and the
 shadowed path resolves the reference before the RHS, preserving spec 13.15.3
 steps 1 and 5 (a `with` binding the RHS deletes is still the PutValue
-target). `StoreIdent`'s cell fast path only writes an own writable data
-property; a declarative binding records a load-only cell (slot `u32::MAX`)
-and resolves through the environment, which is what stops a `let` write from
-creating a shadow property on the global object.
+target). `StoreIdent`'s cell fast path writes an own writable data property by
+slot, and a declarative binding by its binding-vector index (`declarative`
+= 1 in the cell); the global env bumps the global object's generation on
+every declarative mutation, which validates the index. The name-keyed
+resolve remains the fallback for a moved index, an immutable binding, or an
+undeclared name.
 
 Measured (5,000,000 iterations, min of 5, same scripts):
 
 | shape | before JIT | after JIT | before jl | after jl |
 | --- | ---: | ---: | ---: | ---: |
-| top-level `var` `+=` | 960.0 | **37.8** | 1084.8 | **182.9** |
-| top-level `var` `=` | 698.9 | **20.1** | 755.1 | **71.4** |
-| top-level `let` `+=` | 362.5 | 352.4 | 504.4 | 473.5 |
-| local `var` (control) | 3.6 | 3.6 | 114.9 | 110.7 |
-| global read (control) | 3.9 | 3.9 | 43.0 | 40.2 |
+| top-level `var` `+=` | 960.0 | **39.1** | 1084.8 | **179.7** |
+| top-level `var` `=` | 698.9 | **21.4** | 755.1 | **72.7** |
+| top-level `let` `+=` | 362.5 | **113.1** | 504.4 | **239.4** |
+| local `var` (control) | 3.6 | 3.7 | 114.9 | 108.5 |
+| global read (control) | 3.9 | 4.0 | 43.0 | 39.9 |
 
-The JIT inlines the cell probe (the `StoreGlobal` shape: name/id/generation/
-slot validation, then `set_global_slot`), so the fast path is a branch and one
-helper call for the vector write; every miss goes to `store_ident`, never to
-`set_global`, because a miss can be a declarative binding.
+The JIT inlines the object-slot cell probe (the `StoreGlobal` shape:
+name/id/generation/slot validation, then `set_global_slot`), so the fast path
+is a branch and one helper call for the vector write; every miss (a shadowed
+chain, a declarative cell, a stale cell) goes to `store_ident`, never to
+`set_global`. A declarative write is one helper call and a binding-vector
+index write, which is why `let` lands at 113 ms rather than the `var` path's
+39.
 
 Whole corpus (5 interleaved pairs): default JIT -1.1%, jitless -1.7%, value
-parity 0. The `let` shape keeps a resolve per write (the declarative record
-has no value cell), so the follow-up there is a slot on the global
-declarative record; the `var` shape is the client's case and is now close to
-the `globalThis.acc +=` member path (38 vs 149 ms).
+parity 0. The `let` shape is no longer a resolve per write: it records the
+binding index and writes it in place. The `var` shape is the client's case
+and is now close to a quarter of the `globalThis.acc +=` member path (39 vs
+152 ms).
 
 Two fixtures shaped the slice: the JIT declarative read/write test caught
 `store_global_value` creating a shadow property for a `let`, and
 `statements/with/set-mutable-binding-binding-deleted-with-typed-array-in-proto-chain-strict-mode.js`
-caught the missing pre-resolve ordering.
+caught the missing pre-resolve ordering. A `DeclarativeEnv::set_value_at`
+test pins the cached index, the moved-index fallback, and the const
+sloppy/strict split.
 
 Verified: clippy `-D warnings`; `cargo test --workspace`; corpus parity 0;
 test262 48,633 + 3,365 at 100%.
