@@ -53,6 +53,22 @@ pub trait Trace: 'static {
         self.trace(visit);
     }
 
+    /// Whether `drop` of this payload can release Rust-heap storage (a `Vec`,
+    /// `HashMap`, `Box`, `Rc`, …) in some state the type can reach. The sweep
+    /// calls the type-erased drop for every dead box; a payload that can cheaply
+    /// prove it owns nothing (a plain `JsObject`) sets this to `false` and
+    /// implements [`Trace::drop_releases_heap`], so the sweep skips the drop
+    /// glue instead of paying it per box. The default `true` always drops.
+    const DROP_MAY_RELEASE: bool = true;
+
+    /// The runtime half of [`Trace::DROP_MAY_RELEASE`]: whether this payload
+    /// *currently* owns Rust-heap storage. Consulted only for a type whose
+    /// constant is `false`. A false negative leaks; a false positive only
+    /// costs the drop it was trying to avoid.
+    fn drop_releases_heap(&self) -> bool {
+        true
+    }
+
     /// Report that the collector is about to drop this box's payload — the last
     /// moment the payload can say anything for itself (the default does
     /// nothing).
@@ -354,7 +370,9 @@ impl<T: Trace> GcBox<T> {
                 // `collect_from_work`) call this slot, so a per-dead-box step
                 // cannot be added to one generation and forgotten in the other.
                 (*payload).request_finalize();
-                std::ptr::drop_in_place(payload);
+                if T::DROP_MAY_RELEASE && (*payload).drop_releases_heap() {
+                    std::ptr::drop_in_place(payload);
+                }
             }
         },
         data_offset: std::mem::offset_of!(GcBox<T>, data) as u32,

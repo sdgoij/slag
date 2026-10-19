@@ -13907,3 +13907,11 @@ arm), interleaved 3x:
 The sweep (20-27 us, ~8.8 ns per dead box: drop glue + free-list push) is now
 the largest per-minor term; the allocator's TLS + `RefCell` path (~6 ns of
 the 14.5 ns create) is the next.
+
+## Skipping the drop for a plain object (2026-10-19)
+
+Follow-up to the cohort-scan change, where the sweep became the largest per-minor term. Isolating it in the crux bench: a 432 B box with a trivial drop costs 4.0 ns per box in a minor, a same-sized `JsObject` 12.5 ns, and `drop_in_place::<JsObject>` on a plain, never-mutated object measures 6.96 ns standalone. The cost is the chain of ownership checks the synthesized drop runs: the `ObjectKind` match (the `Host` variant holds an `Rc`), `SmallProps::heap`, `property_index`, `private_elements`. A plain object owns none of them.
+
+`Trace` gains `DROP_MAY_RELEASE` (default `true`) and `drop_releases_heap`; the vtable's `drop` slot still calls `request_finalize` first, then consults the predicate when the type opted out. `JsObject` opts out: kind is `Ordinary`, the spilled property vector has capacity 0 (up to `INLINE_FIELDS` keys live in `in_fields`, and `properties` stays empty), the key index is unbuilt, and the private-element vector has no capacity. Capacity rather than length, so a vector that spilled and was truncated still frees its buffer; a failed `try_borrow` answers "owns", so a mid-collection borrow can never turn into a skipped drop. A non-ordinary kind, a spilled vector, a built index or reserved private elements all still take the drop — a false negative would leak, which is what `drop_releases_heap_tracks_owned_storage` pins.
+
+Measured: the 4096-box cohort minor drops 12.5 -> 5.3 ns per box (a cohort whose objects hold a spilled vector stays at 9.8). End to end, the isolated `{}` probe (2M) went 57.0-58.6 -> 50.0-50.8 ms (-12%) and `new Empty()` 100.8 -> 96.2 (-5%); `construct_churn` moved 78.0-78.6 -> 77.2 because its cost is the construct lane rather than the sweep.
