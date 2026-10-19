@@ -14722,3 +14722,42 @@ Verified: `cargo fmt --all --check`; clippy `-D warnings`; `cargo test
 parity 0 (`node tools/corpus/bench.js`, mean-jitGap 12.18 on that run — the
 full-corpus mean moves by several tenths between runs on a warm machine, so it
 is quoted only with the parity row).
+
+### MEASURED (2026-10-20): one cold `new` or `try` poisons a whole function's call path
+
+The certified-callee lane (`call_slow` -> `certified_lane_inline`) refuses a
+callee whose body *contains* `Step::Construct`, the `Args*` vector steps,
+`Step::Call`, `EnterTry`, `TaggedTemplate` or `SuperCall`
+(`CompiledBody::has_shared_vm_step_hazard`). The refusal is per body, not per
+execution, so a step that never runs still sends every call to the interpreter
+funnel. Measured on 1M method calls, the callee's own body varying and nothing
+else:
+
+| callee body (called as `assert.sameValue(i, i)`) | JIT ms | ns/call |
+| --- | ---: | ---: |
+| `if (a !== b) { return 0; } return 1;` | 13.8 | 13.8 |
+| `if (a !== b) { throw a; }` | 13.8 | 13.8 |
+| `if (a !== b) { throw new Error("bad"); }` | 164.7 | 164.7 |
+| `if (a !== b) { var e = new Error("bad"); return e; }` | 171.9 | 171.9 |
+| `try { if (a !== b) { return 0; } } finally {} return 1;` | 187.6 | 187.6 |
+
+`JIT_HELPER_STATS` confirms the mechanism: the slow rows show `CallSlow` at
+1,000,000 + warm-up (`helper 18`, ~7 per harness iteration) and
+`JIT_LEAF_TRACE` reports `leaf-lookup-miss`; the fast rows inline. `throw a`
+alone is fine, so it is the *`Construct`* (`new Error(...)`) and the `EnterTry`,
+not the throw.
+
+This matters far beyond the probe: `throw new Error(...)` is the canonical
+defensive check, and a `try`/`finally` is ordinary code, so a great many real
+functions are one cold-path step away from being 12x slower to call than their
+bodies deserve. The fix is to make the hazard positional rather than existential
+— admit the body and keep the steps that need `Vm::args`/`try_stack` on the
+funnel (the compiled body can route a *step* back through the interpreter
+machinery the way `Op::Intrinsic` does, or the lane can isolate `vm.args`/
+`args_base_stack` lengths in `save_scratch` the way it already isolates
+`var_ref_stack`/`class_stack`) — but each of those touches the shared-state
+contract §20.3/§21 of the `slag-jit` skill warn about, so it needs its own
+slice with the sweep as the net, not a drive-by.
+
+Repro: `scratch/c3/{throw_call,nothrow_call,new_only,throw_plain,try_only}`,
+run with `./target/release/slag.exe --corpus scratch/c3/<name>`.
