@@ -1507,6 +1507,17 @@ pub static JIT_SLOW_PATHS: JitSlowPaths = JitSlowPaths {
 /// the JIT's own usage is bounded by `JitCompiledInfo::stack_usage`.
 pub const JIT_STACK_SLACK: usize = 16;
 
+/// Slots reserved above a compiled body's own working region for the frame of a
+/// callee it inlines. The machine leaf-inline and the shared construct leaf
+/// carve the callee's `frame + working area + JIT_STACK_SLACK` above the
+/// caller's current `sp`; without this reserve the caller's buffer has only
+/// `JIT_STACK_SLACK` free at its deepest call site and any callee with a frame
+/// of its own fails the room check. Measured: the shared construct leaf could
+/// only serve `frame + working <= 1`, so every real constructor fell back to
+/// the private-buffer path (~20 ns each). A leaf needs no headroom (it makes no
+/// calls), so only bodies that can call reserve it.
+pub const JIT_INLINE_HEADROOM: usize = 4;
+
 /// The maximum number of JIT frames nested on the native stack. Each runs
 /// its frame/working region on `vm.stack`, so unbounded JIT nesting would
 /// still consume native stack (one machine frame per level); deeper
@@ -2099,7 +2110,7 @@ fn self_call_inline(ctx: &mut JitCallContext, args: *mut u64, argc: u64) -> Opti
     // `argc` slots (the machine code is suspended for this synchronous call).
     let args = unsafe { std::slice::from_raw_parts(args as *const Value, argc) };
     let frame_len = scope.frame_size;
-    let buf_len = frame_len + ctx.self_stack_usage as usize + JIT_STACK_SLACK;
+    let buf_len = frame_len + ctx.self_stack_usage as usize + JIT_STACK_SLACK + JIT_INLINE_HEADROOM;
     // C0c: the nested frame/working region is a `vm.stack` segment above the
     // caller's own region (which reserved the stack to `stack_cap`, so the
     // `resize` below cannot reallocate under either run's baked pointers). A
@@ -2321,7 +2332,7 @@ fn certified_lane_inline(
     // SAFETY: the JIT passes a pointer into its own live stack buffer with
     // `argc` slots (the machine code is suspended for this synchronous call).
     let args = unsafe { std::slice::from_raw_parts(args as *const Value, argc) };
-    let buf_len = frame_len + stack_usage + JIT_STACK_SLACK;
+    let buf_len = frame_len + stack_usage + JIT_STACK_SLACK + JIT_INLINE_HEADROOM;
     // OrdinaryCallBindThis (spec 10.2.1.1) into the callee's `this` slot — the
     // same bind `setup_certified_frame` is handed by `ordinary_call`: strict
     // keeps the call's `this` as-is; sloppy coerces a nullish `this` to the
@@ -6899,7 +6910,7 @@ pub(crate) fn run_jit_body(
         vm.nested_frame.is_none(),
         "run_jit_body addresses `vm.frame`/`leaf_frame_base` directly, so a nested_frame pointer would disagree with the frame the entry is handed"
     );
-    let work_len = info.stack_usage + JIT_STACK_SLACK;
+    let work_len = info.stack_usage + JIT_STACK_SLACK + JIT_INLINE_HEADROOM;
     // C0a (mechanism 1): the working region is a segment of `vm.stack`, and
     // the stack is reserved to `stack_cap` here so no helper push during the
     // run can reallocate it — the baked region pointer stays valid, so the
@@ -7157,7 +7168,7 @@ pub(crate) fn run_jit_resume(
     // region for the resume value and the machine code's own usage; the entry
     // block re-enters at `vm.ip`.
     let saved = vm.stack.len();
-    let work_len = saved + 1 + info.stack_usage + JIT_STACK_SLACK;
+    let work_len = saved + 1 + info.stack_usage + JIT_STACK_SLACK + JIT_INLINE_HEADROOM;
     let work_base = 0;
     // C0a (mechanism 1): the region is a segment of `vm.stack`, reserved to
     // `stack_cap` so it cannot reallocate mid-run (see `run_jit_body`).

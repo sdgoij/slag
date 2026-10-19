@@ -13951,3 +13951,23 @@ The next real lever in this lane is reusing the caller's `JitCallContext` in pla
 The follow-up to the scoping: `try_shared_construct_leaf` was extended to accept environment-using leaves (install the closure environment for the run, restore the caller's `body_context`/`lexical_env` afterwards, refuse only a body that needs a fresh per-call capture context), so a constructor whose body reads an identifier would run on the caller's context instead of the private-buffer `run_jit_leaf` path.
 
 Measured neutral: `function Item(x) { var y = x; }` 138 -> 133 ms per 2M (-3.6%, within the noise floor), `this.x = x` 167 -> 165, `construct_churn` unchanged. Reverted. The run also showed that the 94 ms (empty body) vs 138 ms (one local) gap is not lane selection — both are leaf constructs — so the difference is inside the leaf run/frame setup and remains unattributed. The lesson from the three failed attributions in this area: instrument the specific path (`construct_inline`, `environment.is_none()`, the shared-leaf entry) before naming a cause; the compile-time verdicts (`ir.leaf`, `construct_inline`, `leaf_uses_env`) do not predict which run is taken.
+
+## Inline headroom: the shared construct leaf was room-starved (2026-10-19)
+
+A sampled diagnostic inside `try_shared_construct_leaf` (fired at construct 1,000,000, with `Instant` marks) settled the 94-vs-138 ms cliff: the shared leaf was returning `no-room`. The caller's buffer leaves `(caller_max_stack - current_depth) + JIT_STACK_SLACK` slots above `sp`, and the callee needs `frame + working + JIT_STACK_SLACK`. The slack appears on both sides and cancels, so the real condition is `callee_frame + callee_working <= caller_max_stack - current_depth`, which is **zero** at the caller's deepest call site. Only a callee with `frame + working <= 1` could ever fit; `var a;` (frame 2) and `this.x = x` (frame 2 + working 1) both fell back to `run_jit_leaf`'s private frame and per-call global resolution (~20 ns).
+
+Fix: `JIT_INLINE_HEADROOM = 4` slots, reserved in the buffers of bodies that can call (`run_jit_body`, its resume region, `certified_lane_inline`, and the shared call lane). Leaves reserve nothing (they make no calls). The headroom slots are initialized like the rest of the segment — the shared leaf carves into slots the caller already filled.
+
+Measured (three runs; `fib`, `mcall`, `p_call_only` and `p_obj_lit` also measured against a stashed baseline binary):
+
+| row | before | after |
+| --- | --- | --- |
+| `calls/construct_churn` | 72.2-74.4 ms | 61.8-64.5 (-12-15%) |
+| `new Item(x)` 2M | 165-172 | 123-133 (-25%) |
+| `new Item(x,y)` 2M | 206-225 | 163-170 (-20%) |
+| presize pattern, store skipped | 134-137 | 92.8-96.8 (-30%) |
+| `fib` (recursive calls) | 49.5-50.1 | 49.5 (neutral) |
+| `mcall` | 55.9 | 53.8 |
+| `p_call_only` / `p_obj_lit` | 71.9-72.8 / 51.2 | 72.2-74.4 / 50.8-51.4 (noise) |
+
+A 32-slot headroom measured the same on the construct rows and on `fib` (the added initialization is L1-cheap at this depth); 4 is the smallest value that serves the common shapes and is what ships. This is the first construct-side change that moved `construct_churn`; the earlier fill-scan win was in the compiled body, this one is in the call machinery around it.
