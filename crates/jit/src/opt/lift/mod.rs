@@ -2005,7 +2005,13 @@ fn emit_leaf_op(
             key,
         } => {
             let object = load(builder, *object_slot, *t);
-            let key = emit_reg_operand(builder, block, key, counter)?;
+            // An `Acc` key is the live accumulator (`a[k & MASK]`): the
+            // object load did not touch it, and `ElementLoad` consumes the
+            // SSA value before any later write.
+            let key = match key {
+                RegOperand::Acc => acc,
+                key => emit_reg_operand(builder, block, key, counter)?,
+            };
             builder.emit(
                 block,
                 Op::ElementLoad,
@@ -2057,6 +2063,21 @@ fn emit_leaf_op(
                 block,
                 Op::ElementStore,
                 &[object, key, value],
+                Op::ElementStore.default_effects(),
+                Imm::None,
+            );
+            acc
+        }
+        // The same store with the value in the accumulator (`o[k] = v` where
+        // the value expression reused the accumulator): the key is a
+        // re-readable operand (the scratch slot the lowering spills it to).
+        LeafOp::StoreMemberComputedLocal { object_slot, key } => {
+            let object = emit_frame_load(builder, block, *object_slot);
+            let key = emit_reg_operand(builder, block, key, counter)?;
+            builder.emit_void(
+                block,
+                Op::ElementStore,
+                &[object, key, acc],
                 Op::ElementStore.default_effects(),
                 Imm::None,
             );

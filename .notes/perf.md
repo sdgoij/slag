@@ -14232,3 +14232,58 @@ binary is 96.5-97.4 ms. Stage D is therefore not started.
 
 Gates: clippy `-D warnings`, `cargo test --workspace`, corpus parity 0,
 `test262` 48,633 + 3,365 at 100%.
+
+### LANDED (2026-10-19): computed-key loops register-lower (interpreter)
+
+The `--jitless` corpus column still had three large register-lane holes: a
+computed member store whose key is derived from the loop counter
+(`a[k & M] = k & N`) and its read (`s += a[k & M]`). Bytecode dumps
+(`SLAG_DUMP_FUNCS`, a temporary probe) showed both statements staying on the
+step path at ~6 ns/step. Two lowering rules were responsible:
+
+1. `Step::GetMemberComputed` rejected an `Acc` key unconditionally. With a
+   frame-slot object the object read never touches the accumulator, so the
+   fused `GetMemberComputedLocal` can consume the live `Acc` directly.
+2. A computed key held in the accumulator was overwritten by the value
+   expression (`LoadCounter`/`BinImm`), and the old `spill_live_acc` only
+   looked at the top of the shadow and pushed the value onto the value stack —
+   which no store op can consume.
+
+The fix spills a live accumulator to a **hidden scratch frame slot**
+(`alloc_scratch_slot`) and rewrites the shadow entry as a plain `Reg`, so the
+key stays re-readable by the existing `StoreMemberComputedLocal` /
+`GetMemberComputedLocal` ops. The spill scan now finds the `Acc` marker
+anywhere below virtual operands and is applied before every op that loads into
+the accumulator (`Binary`/`BinaryImm` loads, `LoadCounter`, member reads),
+which also lets nested arithmetic register-lower. The scratch grows the frame
+by one word per spill site, is unnamed, and turns `args_alias` off (the
+inline-leaf alias gate compares `argc == frame_size`, which a later frame
+growth would otherwise make admit an extra argument).
+
+No new `LeafOp` variant: the first attempt added
+`StoreMemberComputedSpilled` and measured a ~5-13% icache/layout hit on
+unrelated rows even after outlining its executor, so the scratch-slot shape
+reuses the existing ops instead.
+
+Isolated `--jitless` A/B, alternating run order (8-10 pairs, min/mean):
+
+| row | HEAD | landed | delta |
+| --- | --- | --- | --- |
+| `arrays/index_loop` | 124.1 ms | 94.6 ms | **-23.7%** |
+| `arrays/typed_array` | 188.8 ms | 159.1 ms | **-15.7%** |
+| `objects/many_objects_read` | 108.3 ms | 69.5 ms | **-35.8%** |
+
+JIT (default) on the same isolated rows: `many_objects_read` 21.5 -> 20.3 ms
+(-5.6%), `typed_array` 22.9 -> 23.6 (+2.7%), `index_loop` 16.7 -> 18.1
+(+8.6%). The CLIF for `index_loop` is nearly identical (three prologue stores
+differ), so the last two are code-placement/alignment effects of the register
+body's smaller loop.
+
+Measurement caveat: `globals/object_read` (17.4 -> 18.3) and
+`control/nested_loops` (105 -> 112) move in the wrong direction while their
+dumped IR is **byte-identical** across the two builds, and a HEAD rebuild
+reproduces the HEAD timing exactly. Those deltas are LTO/code placement, not
+the lowering; the corpus numbers carry the same caveat.
+
+Gates: clippy `-D warnings`, `cargo test --workspace`, corpus parity 0,
+`test262` 48,633 + 3,365 at 100%.

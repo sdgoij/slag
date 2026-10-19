@@ -10682,7 +10682,8 @@ impl<'a> Lowerer<'a> {
                 let index_imm = self.builder.ins().iconst(types::I64, *index as i64);
                 self.call_slow(self.sig_get_name, Helper::LoadPerIter, &[zero, index_imm])
             }
-            RegOperand::Acc | RegOperand::Spilled => Err(Unsupported::Leaf("member operand shape")),
+            RegOperand::Acc => Ok(self.acc_bits()),
+            RegOperand::Spilled => Err(Unsupported::Leaf("member operand shape")),
         }
     }
 

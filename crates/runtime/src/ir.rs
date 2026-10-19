@@ -20114,8 +20114,14 @@ impl Compiler {
                         // body into maximal straight-line runs, so a
                         // control-flow statement (an `if`, a break) keeps
                         // the surrounding statements on the register path.
-                        if let Some(scope) = self.scope.as_ref() {
-                            let runs = lower_leaf_ops_segmented(&self.steps[body_steps..], scope);
+                        if self.scope.is_some() {
+                            let runs = {
+                                let (steps, scope) = (&self.steps, &mut self.scope);
+                                lower_leaf_ops_segmented(
+                                    &steps[body_steps..],
+                                    scope.as_mut().expect("checked above"),
+                                )
+                            };
                             self.apply_register_runs(body_steps, body_fixups, runs);
                         }
                         self.acc_binding = saved;
@@ -20385,8 +20391,14 @@ impl Compiler {
         // splits the body into maximal straight-line runs, so a
         // control-flow statement (an `if`, a break/continue) keeps the
         // surrounding statements on the register path.
-        if let Some(scope) = self.scope.as_ref() {
-            let runs = lower_leaf_ops_segmented(&self.steps[body_steps..], scope);
+        if self.scope.is_some() {
+            let runs = {
+                let (steps, scope) = (&self.steps, &mut self.scope);
+                lower_leaf_ops_segmented(
+                    &steps[body_steps..],
+                    scope.as_mut().expect("checked above"),
+                )
+            };
             self.apply_register_runs(body_steps, body_fixups, runs);
         }
         self.place(continue_label);
@@ -24939,13 +24951,44 @@ fn load_operand(ops: &mut Vec<LeafOp>, operand: RegOperand) -> bool {
     }
 }
 
-/// Spill a live accumulator value (the top of the shadow stack) onto the
-/// value stack so an op can overwrite the accumulator (Cut 35 slice 10).
-fn spill_live_acc(ops: &mut Vec<LeafOp>, stack: &mut [RegOperand]) {
-    if matches!(stack.last(), Some(RegOperand::Acc)) {
-        ops.push(LeafOp::PushAcc);
-        *stack.last_mut().unwrap() = RegOperand::Spilled;
+/// A hidden frame slot beyond the named bindings, for a value the register
+/// lowering must keep across an op that reuses the accumulator (the
+/// `a[k & M] = (k & N)` key). Hidden slots are never named and never carry the
+/// TDZ marker, so writing one is unobservable; they grow the frame by one word
+/// per spill site.
+fn alloc_scratch_slot(scope: &mut ScopeInfo) -> usize {
+    let slot = scope.frame_size;
+    scope.frame_size += 1;
+    scope.tdz_store.push(false);
+    // `args_alias` was computed when the frame was exactly the params. A
+    // scratch slot makes the frame larger, and the inline-leaf alias gate
+    // (`argc == frame_size`) would then admit a call with one extra argument
+    // and let a scratch write land in the caller's argument region.
+    scope.args_alias = false;
+    slot
+}
+
+/// Spill the live accumulator value before an op loads into the accumulator:
+/// walk the shadow from the top for its `Acc` marker and move the value into a
+/// hidden scratch slot, so it is re-readable as a plain `Reg` operand. Entries
+/// above the marker are virtual (re-read at their consumption), so one store
+/// preserves the value. Returns `false` when a `Spilled` marker sits above a
+/// live `Acc` — a state the lowering must not accept, because the scratch would
+/// not be the value that entry denotes.
+fn spill_live_acc(scope: &mut ScopeInfo, ops: &mut Vec<LeafOp>, stack: &mut [RegOperand]) -> bool {
+    for entry in stack.iter_mut().rev() {
+        match entry {
+            RegOperand::Acc => {
+                let slot = alloc_scratch_slot(scope);
+                ops.push(LeafOp::StoreReg { slot, tdz: false });
+                *entry = RegOperand::Reg { slot, tdz: false };
+                return true;
+            }
+            RegOperand::Spilled => return false,
+            _ => {}
+        }
     }
+    true
 }
 
 /// Whether a computed member key operand is re-readable and stable at the
@@ -24975,17 +25018,19 @@ fn is_stable_computed_key(operand: &RegOperand) -> bool {
 /// reads of the closure bench. The `tdz` bits are precomputed from the scope
 /// layout so the executor skips the check for plain `var`/param slots.
 /// Lower one step into a register-op stream. `index`/`total` locate the
-/// step for the `Return`-is-last rule, `scope` resolves the TDZ flags.
-/// Returns `None` (the step stays on the step path) when the step has no
-/// register form. The state may be partially mutated on rejection — the
-/// callers discard it (the whole body, or the uncommitted run tail).
+/// step for the `Return`-is-last rule, `scope` resolves the TDZ flags and
+/// allocates a scratch slot when a live accumulator value must survive an op
+/// that reuses the accumulator. Returns `None` (the step stays on the step
+/// path) when the step has no register form. The state may be partially
+/// mutated on rejection — the callers discard it (the whole body, or the
+/// uncommitted run tail).
 #[allow(clippy::too_many_arguments)]
 fn lower_step(
     step: &Step,
     index: usize,
     total: usize,
     next: Option<&Step>,
-    scope: &ScopeInfo,
+    scope: &mut ScopeInfo,
     ops: &mut Vec<LeafOp>,
     stack: &mut Vec<RegOperand>,
     counter_reads: &mut usize,
@@ -25080,6 +25125,14 @@ fn lower_step(
                 // frame-slot read is safe late for a `tdz=false` slot:
                 // nothing in the straight-line run writes it between the
                 // counter load and the combine.
+                //
+                // `LoadCounter` overwrites the accumulator, so a value it
+                // still holds (an enclosing expression's left operand) must
+                // be spilled first — the `k & MASK` key followed by a
+                // counter-derived value is the shape that exposed this.
+                if !spill_live_acc(scope, ops, stack) {
+                    return None;
+                }
                 ops.push(LeafOp::LoadCounter);
                 match left {
                     RegOperand::Spilled => ops.push(LeafOp::BinAccPop { op: *op }),
@@ -25116,6 +25169,9 @@ fn lower_step(
                     // the env walk and the slot read have no side
                     // effects between them, so the order is unchanged).
                     (RegOperand::Ctx { index }, RegOperand::Reg { slot, tdz }) => {
+                        if !spill_live_acc(scope, ops, stack) {
+                            return None;
+                        }
                         ops.push(LeafOp::BinCtxReg {
                             op: *op,
                             index,
@@ -25142,6 +25198,9 @@ fn lower_step(
                         | RegOperand::Ctx { .. }
                         | RegOperand::PerIter { .. }),
                     ) => {
+                        if !spill_live_acc(scope, ops, stack) {
+                            return None;
+                        }
                         if !load_operand(ops, right) {
                             return None;
                         }
@@ -25149,6 +25208,9 @@ fn lower_step(
                         stack.push(RegOperand::Acc);
                     }
                     (left, right) => {
+                        if !spill_live_acc(scope, ops, stack) {
+                            return None;
+                        }
                         if !load_operand(ops, left) {
                             return None;
                         }
@@ -25186,7 +25248,12 @@ fn lower_step(
                 RegOperand::Reg { slot, tdz } => {
                     // Cut 35 slice 14: a frame-slot left fuses into the
                     // immediate binary (the `return x + 1` leaf: one
-                    // dispatch, skipping the load).
+                    // dispatch, skipping the load). The op writes the
+                    // accumulator, so a live value it still holds must be
+                    // spilled first.
+                    if !spill_live_acc(scope, ops, stack) {
+                        return None;
+                    }
                     ops.push(LeafOp::BinImmLocal {
                         op: *op,
                         slot,
@@ -25195,6 +25262,9 @@ fn lower_step(
                     });
                 }
                 left => {
+                    if !spill_live_acc(scope, ops, stack) {
+                        return None;
+                    }
                     if !load_operand(ops, left) {
                         return None;
                     }
@@ -25591,7 +25661,9 @@ fn lower_step(
             let object = stack.pop()?;
             match object {
                 RegOperand::Reg { slot, tdz } => {
-                    spill_live_acc(ops, stack);
+                    if !spill_live_acc(scope, ops, stack) {
+                        return None;
+                    }
                     ops.push(LeafOp::GetMemberNameLocal {
                         object_slot: slot,
                         tdz,
@@ -25599,8 +25671,8 @@ fn lower_step(
                     });
                 }
                 object => {
-                    if !matches!(object, RegOperand::Acc) {
-                        spill_live_acc(ops, stack);
+                    if !matches!(object, RegOperand::Acc) && !spill_live_acc(scope, ops, stack) {
+                        return None;
                     }
                     if !load_operand(ops, object) {
                         return None;
@@ -25616,17 +25688,27 @@ fn lower_step(
             // loads into the accumulator first, so a computed key cannot
             // be held then; a spilled key cannot be re-read; and a live
             // accumulator below the object is spilled before the load.
-            // (An `Acc` key is rejected even in the fused form: with a
-            // live accumulator below it, the spill would push the key,
-            // not the live value.)
+            //
+            // An `Acc` key with a frame-slot object is the `k & MASK` head
+            // of the typed-array loops: the key is the live accumulator and
+            // the object comes from its slot, so nothing clobbers the key.
+            // A live `Acc` below the key would mean the accumulator was
+            // reused without a spill; refuse it rather than push the key as
+            // the lower value.
             let key = stack.pop()?;
             let object = stack.pop()?;
-            if matches!(key, RegOperand::Acc | RegOperand::Spilled) {
+            if matches!(key, RegOperand::Spilled) {
                 return None;
             }
             match object {
                 RegOperand::Reg { slot, tdz } => {
-                    spill_live_acc(ops, stack);
+                    if matches!(key, RegOperand::Acc) {
+                        if stack.iter().any(|entry| matches!(entry, RegOperand::Acc)) {
+                            return None;
+                        }
+                    } else if !spill_live_acc(scope, ops, stack) {
+                        return None;
+                    }
                     ops.push(LeafOp::GetMemberComputedLocal {
                         object_slot: slot,
                         tdz,
@@ -25634,8 +25716,11 @@ fn lower_step(
                     });
                 }
                 object => {
-                    if !matches!(object, RegOperand::Acc) {
-                        spill_live_acc(ops, stack);
+                    if matches!(key, RegOperand::Acc) {
+                        return None;
+                    }
+                    if !matches!(object, RegOperand::Acc) && !spill_live_acc(scope, ops, stack) {
+                        return None;
                     }
                     if !load_operand(ops, object) {
                         return None;
@@ -25692,7 +25777,7 @@ fn lower_step(
 /// path.
 fn lower_leaf_ops_segmented(
     steps: &[Step],
-    scope: &ScopeInfo,
+    scope: &mut ScopeInfo,
 ) -> Vec<(usize, usize, Box<[LeafOp]>)> {
     let mut runs = Vec::new();
     let mut i = 0;
@@ -25802,7 +25887,7 @@ fn lower_leaf_ops_segmented(
     runs
 }
 
-fn lower_leaf_ops(steps: &[Step], scope: &ScopeInfo) -> Option<Box<[LeafOp]>> {
+fn lower_leaf_ops(steps: &[Step], scope: &mut ScopeInfo) -> Option<Box<[LeafOp]>> {
     let mut ops = Vec::new();
     let mut stack: Vec<RegOperand> = Vec::new();
     // Cut 35 slice 16/21: at most two accumulator-loop counter reads per
@@ -26022,10 +26107,8 @@ pub fn compile_body(
             )
         });
     let leaf_ops = if leaf {
-        lower_leaf_ops(
-            &compiler.steps,
-            compiler.scope.as_ref().expect("a leaf is certified"),
-        )
+        let (steps, scope) = (&compiler.steps, &mut compiler.scope);
+        lower_leaf_ops(steps, scope.as_mut().expect("a leaf is certified"))
     } else {
         None
     };
