@@ -7932,16 +7932,120 @@ impl<'a> Lowerer<'a> {
                 self.fall_through(index);
             }
             Step::StoreIdent { name } => {
-                // The certified body's environment-resolved store: one helper
-                // call that takes the global-value cell fast path when the
-                // ctx says the body's globals are unshadowed, and the dynamic
-                // resolve otherwise. The value is re-pushed as the
-                // assignment's result.
+                // The certified body's environment-resolved store. The cell
+                // probe is inlined like `StoreGlobal`, gated on the ctx's
+                // `globals_unshadowed`: a shadowed chain must use the
+                // pre-resolved reference, and a cell miss may be a
+                // declarative binding — both go to `store_ident`, never to
+                // `set_global` (which writes a global-object property).
                 let value = self.pop();
+                let ctx = self.vm();
+                let clean = self.builder.ins().load(
+                    types::I8,
+                    MemFlagsData::new(),
+                    ctx,
+                    Offset32::new(std::mem::offset_of!(JitCallContext, globals_unshadowed) as i32),
+                );
+                let global = self.builder.ins().load(
+                    types::I64,
+                    MemFlagsData::new(),
+                    ctx,
+                    Offset32::new(std::mem::offset_of!(JitCallContext, global_object) as i32),
+                );
+                let cells = self.builder.ins().load(
+                    types::I64,
+                    MemFlagsData::new(),
+                    ctx,
+                    Offset32::new(std::mem::offset_of!(JitCallContext, global_value_cells) as i32),
+                );
                 let name_imm = self.builder.ins().iconst(types::I64, *name as i64);
-                let stored =
+                let probe = self.builder.create_block();
+                let fast = self.builder.create_block();
+                let slow = self.builder.create_block();
+                let merge = self.builder.create_block();
+                let has_global = self.builder.ins().icmp_imm_u(IntCC::NotEqual, global, 0);
+                let clean_ok = self.builder.ins().icmp_imm_u(IntCC::NotEqual, clean, 0);
+                let has_global_64 = self.bint(has_global);
+                let clean_ok_64 = self.bint(clean_ok);
+                let gate = self.builder.ins().band(has_global_64, clean_ok_64);
+                self.builder.ins().brif(gate, probe, &[], slow, &[]);
+                self.builder.switch_to_block(probe);
+                let live_id = self.builder.ins().load(
+                    types::I64,
+                    MemFlagsData::new(),
+                    global,
+                    Offset32::new(std::mem::offset_of!(crux::JsObject, id) as i32),
+                );
+                let live_gen = self.builder.ins().load(
+                    types::I32,
+                    MemFlagsData::new(),
+                    global,
+                    Offset32::new(std::mem::offset_of!(crux::JsObject, generation) as i32),
+                );
+                let cell = self.builder.ins().iadd_imm_s(
+                    cells,
+                    ((*name as usize & (GLOBAL_CELLS - 1)) * std::mem::size_of::<GlobalValueCell>())
+                        as i64,
+                );
+                let cell_name = self.builder.ins().load(
+                    types::I32,
+                    MemFlagsData::new(),
+                    cell,
+                    Offset32::new(std::mem::offset_of!(GlobalValueCell, name) as i32),
+                );
+                let cell_id = self.builder.ins().load(
+                    types::I64,
+                    MemFlagsData::new(),
+                    cell,
+                    Offset32::new(std::mem::offset_of!(GlobalValueCell, global_id) as i32),
+                );
+                let cell_gen = self.builder.ins().load(
+                    types::I32,
+                    MemFlagsData::new(),
+                    cell,
+                    Offset32::new(std::mem::offset_of!(GlobalValueCell, generation) as i32),
+                );
+                let cell_slot = self.builder.ins().load(
+                    types::I32,
+                    MemFlagsData::new(),
+                    cell,
+                    Offset32::new(std::mem::offset_of!(GlobalValueCell, slot) as i32),
+                );
+                let name_ok = self
+                    .builder
+                    .ins()
+                    .icmp_imm_u(IntCC::Equal, cell_name, *name as i64);
+                let id_ok = self.builder.ins().icmp(IntCC::Equal, cell_id, live_id);
+                let gen_ok = self.builder.ins().icmp(IntCC::Equal, cell_gen, live_gen);
+                let cell_slot_64 = self.builder.ins().uextend(types::I64, cell_slot);
+                let slot_ok =
+                    self.builder
+                        .ins()
+                        .icmp_imm_u(IntCC::NotEqual, cell_slot_64, u32::MAX as i64);
+                let name_id_ok = self.builder.ins().band(name_ok, id_ok);
+                let name_id_gen_ok = self.builder.ins().band(name_id_ok, gen_ok);
+                let ok = self.builder.ins().band(name_id_gen_ok, slot_ok);
+                self.builder.ins().brif(ok, fast, &[], slow, &[]);
+                self.builder.switch_to_block(fast);
+                self.builder.ins().store(
+                    MemFlagsData::new(),
+                    value,
+                    cell,
+                    Offset32::new(std::mem::offset_of!(GlobalValueCell, value) as i32),
+                );
+                let _stored = self.call_slow(
+                    self.sig_set_name,
+                    Helper::SetGlobalSlot,
+                    &[name_imm, cell_slot_64, value],
+                )?;
+                self.builder.ins().jump(merge, &[]);
+                self.builder.switch_to_block(slow);
+                let _stored =
                     self.call_slow(self.sig_update, Helper::StoreIdent, &[name_imm, value])?;
-                self.push(stored);
+                self.builder.ins().jump(merge, &[]);
+                self.builder.seal_block(merge);
+                self.builder.switch_to_block(merge);
+                self.push(value);
                 self.fall_through(index);
             }
             Step::UpdateIdent { name, op, prefix } => {

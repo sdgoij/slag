@@ -14551,17 +14551,22 @@ Measured (5,000,000 iterations, min of 5, same scripts):
 
 | shape | before JIT | after JIT | before jl | after jl |
 | --- | ---: | ---: | ---: | ---: |
-| top-level `var` `+=` | 960.0 | **50.1** | 1084.8 | **179.4** |
-| top-level `var` `=` | 698.9 | **34.6** | 755.1 | **65.2** |
-| top-level `let` `+=` | 362.5 | 337.7 | 504.4 | 467.5 |
-| local `var` (control) | 3.6 | 3.6 | 114.9 | 110.6 |
-| global read (control) | 3.9 | 3.9 | 43.0 | 39.2 |
+| top-level `var` `+=` | 960.0 | **37.8** | 1084.8 | **182.9** |
+| top-level `var` `=` | 698.9 | **20.1** | 755.1 | **71.4** |
+| top-level `let` `+=` | 362.5 | 352.4 | 504.4 | 473.5 |
+| local `var` (control) | 3.6 | 3.6 | 114.9 | 110.7 |
+| global read (control) | 3.9 | 3.9 | 43.0 | 40.2 |
+
+The JIT inlines the cell probe (the `StoreGlobal` shape: name/id/generation/
+slot validation, then `set_global_slot`), so the fast path is a branch and one
+helper call for the vector write; every miss goes to `store_ident`, never to
+`set_global`, because a miss can be a declarative binding.
 
 Whole corpus (5 interleaved pairs): default JIT -1.1%, jitless -1.7%, value
 parity 0. The `let` shape keeps a resolve per write (the declarative record
 has no value cell), so the follow-up there is a slot on the global
 declarative record; the `var` shape is the client's case and is now close to
-the `globalThis.acc +=` member path (50 vs 148 ms).
+the `globalThis.acc +=` member path (38 vs 149 ms).
 
 Two fixtures shaped the slice: the JIT declarative read/write test caught
 `store_global_value` creating a shadow property for a `let`, and
