@@ -14582,3 +14582,45 @@ sloppy/strict split.
 
 Verified: clippy `-D warnings`; `cargo test --workspace`; corpus parity 0;
 test262 48,633 + 3,365 at 100%.
+
+### LANDED (2026-10-19): keep-jump branches in the optimizing tier
+
+`JIT_DUMP_STEPS=1` on the `language/statements/try` workload showed the
+optimizing tier refusing `completion-values` on exactly two shapes:
+
+```text
+opt-blockers: JumpIfFalseKeep,JumpIfTrueKeep
+```
+
+The baseline tier lowered them (`top()` + truthiness, no pop), but the SSA
+lifter's `TermRec::Branch` only knew the popping pair, so any body with `&&`,
+`||` or a ternary that keeps its value never reached the optimizer. The lift
+now treats the keep variants as branches on the top value with the condition
+left on both edges: the terminator record, the branch emission, `jump_target`
+(which also makes them terminators and gives `block_successors` its
+`[target, end]` shape), and the blocker diagnostic. The stack-depth fixpoint
+needed no change — its conditional-pop edge only matches the popping pair,
+so a keep conditional falls into the `out` arm as it should.
+
+Whole-corpus effect (one pass each; the change is JIT-only, so the jitless
+column is noise): JIT total 2878.4 -> 2815.7 ms (-2.2%). The rows that were
+waiting on the shape:
+
+| row | before JIT | after JIT |
+| --- | ---: | ---: |
+| `language/expressions/template-literal/evaluation-order.js` | 312.1 | **286.3** |
+| `language/statements/for-in/head-let-fresh-binding-per-iteration.js` | 669.0 | **633.8** |
+| `language/statements/try/completion-values.js` | 407.3 | **394.0** |
+
+`completion-values` now lifts, but barely moves: its cost is the completion
+record and list-stack work (`ListBegin`/`ListEnd`/`NormalizeCompletion`),
+not the blocked branch. The other two bodies in the template workload are
+still blocked by `ConcatStr`/`ConcatStrConst`/`PushStr`/`UpdateLocal` and
+`UpdateContextSlot`, and the for-in body by the per-iteration steps
+(`EnterPerIteration`, `PerIteration`, `LoadPerIteration`,
+`StorePerIteration`). The for-in row's helper stats put the real cost in the
+call path (about 9 `CertifiedCall`, 2 `CallSlow` and 21 `LeafCallProbe` per
+body iteration), not in the three per-iteration environment ops.
+
+Verified: clippy `-D warnings`; `cargo test --workspace`; corpus parity 0;
+test262 48,633 + 3,365 at 100%. A new lift test covers a `&&` body.

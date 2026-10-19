@@ -340,6 +340,11 @@ fn lift_impl(body: &CompiledBody, guard_reads: bool) -> Result<Function, Unsuppo
                 Step::JumpIfFalse(_) | Step::JumpIfTrue(_) => {
                     TermRec::Branch(stack.pop().ok_or(Unsupported::Stack)?, stack)
                 }
+                // The keep variants branch on the top value without popping
+                // it: both successors carry the condition.
+                Step::JumpIfFalseKeep(_) | Step::JumpIfTrueKeep(_) => {
+                    TermRec::Branch(*stack.last().ok_or(Unsupported::Stack)?, stack)
+                }
                 other if is_fused_test(other) => TermRec::FusedTest { counter, stack },
                 other if is_for_fetch(other) => TermRec::Fetch { stack },
                 other => return Err(Unsupported::Step(step_name(other))),
@@ -382,8 +387,8 @@ fn lift_impl(body: &CompiledBody, guard_reads: bool) -> Result<Function, Unsuppo
             TermRec::Branch(cond, stack) => {
                 let ti = terms[bi].ok_or(Unsupported::Invalid)?;
                 let (target, truthy) = match &steps[ti] {
-                    Step::JumpIfTrue(t) => (*t, true),
-                    Step::JumpIfFalse(t) => (*t, false),
+                    Step::JumpIfTrue(t) | Step::JumpIfTrueKeep(t) => (*t, true),
+                    Step::JumpIfFalse(t) | Step::JumpIfFalseKeep(t) => (*t, false),
                     _ => return Err(Unsupported::Invalid),
                 };
                 let sb = block_of[target] as BlockId;
@@ -830,7 +835,11 @@ fn for_fetch_targets(step: &Step) -> Option<(usize, usize)> {
 
 fn jump_target(step: &Step) -> Option<usize> {
     match step {
-        Step::Jump(t) | Step::JumpIfFalse(t) | Step::JumpIfTrue(t) => Some(*t),
+        Step::Jump(t)
+        | Step::JumpIfFalse(t)
+        | Step::JumpIfTrue(t)
+        | Step::JumpIfFalseKeep(t)
+        | Step::JumpIfTrueKeep(t) => Some(*t),
         Step::JumpIfLtImm { target, .. }
         | Step::JumpIfLeImm { target, .. }
         | Step::JumpIfGtImm { target, .. }
@@ -2396,7 +2405,11 @@ fn unary_type(op: Op) -> Type {
 
 fn step_name(step: &Step) -> &'static str {
     match step {
-        Step::Jump(_) | Step::JumpIfFalse(_) | Step::JumpIfTrue(_) => "control",
+        Step::Jump(_)
+        | Step::JumpIfFalse(_)
+        | Step::JumpIfTrue(_)
+        | Step::JumpIfFalseKeep(_)
+        | Step::JumpIfTrueKeep(_) => "control",
         Step::Return => "Return",
         // The allocation and string literal families name themselves, so the
         // `opt bail` diagnostic says which step blocked a body (I6) rather than
@@ -2458,7 +2471,12 @@ pub(crate) fn blocking_step_names(body: &CompiledBody) -> Vec<String> {
         .filter(|step| {
             let terminator_ok = matches!(
                 step,
-                Step::Return | Step::Jump(_) | Step::JumpIfFalse(_) | Step::JumpIfTrue(_)
+                Step::Return
+                    | Step::Jump(_)
+                    | Step::JumpIfFalse(_)
+                    | Step::JumpIfTrue(_)
+                    | Step::JumpIfFalseKeep(_)
+                    | Step::JumpIfTrueKeep(_)
             ) || is_fused_test(step);
             !terminator_ok && stack_delta(step).is_err()
         })
@@ -2616,6 +2634,33 @@ mod tests {
         assert!(matches!(func.block(3).term, Some(Term::Return(Some(_)))));
         assert!(ops(&func, 2).contains(&Op::Const));
         assert!(ops(&func, 1).contains(&Op::Const));
+    }
+
+    #[test]
+    fn lifts_a_keep_branch() {
+        // return f[0] && 1;
+        //  0 LoadLocal 0
+        //  1 JumpIfFalseKeep 4
+        //  2 Pop
+        //  3 Push 1
+        //  4 Return
+        let b = body(
+            vec![
+                Step::LoadLocal { slot: 0 },
+                Step::JumpIfFalseKeep(4),
+                Step::Pop,
+                Step::Push(Value::Number(1.0)),
+                Step::Return,
+            ],
+            1,
+        );
+        let func = lift(&b).expect("lifts");
+        // Blocks: [0,1) branch, [1,4) then, [4,5) join.
+        assert_eq!(func.block_count(), 3);
+        assert!(matches!(func.block(0).term, Some(Term::Branch { .. })));
+        // Both edges carry the kept condition, so the join has one param.
+        assert_eq!(func.block(2).params.len(), 1);
+        assert!(matches!(func.block(2).term, Some(Term::Return(Some(_)))));
     }
 
     #[test]
