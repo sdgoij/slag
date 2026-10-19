@@ -1128,6 +1128,67 @@ fn lower_inst(
                 .ins()
                 .iconst(types::I64, JsValue::Undefined.bits() as i64)
         }
+        // The template-literal literals (`PushStr`/`ConcatStr`/
+        // `ConcatStrConst`) and `TaggedTemplate`: the same helpers the
+        // per-step route calls, with the quasi payload read back from the
+        // running body by step index.
+        Op::StringPush => {
+            let Imm::Int(step) = &inst.imm else {
+                return Err(Unsupported::Step("opt:string"));
+            };
+            let step_imm = builder.ins().iconst(types::I64, *step as i64);
+            call_helper(
+                builder,
+                helpers,
+                abi,
+                abi.sig_bool,
+                Helper::PushStr,
+                &[step_imm],
+            )?
+        }
+        Op::StringConcat => {
+            let value = arg!(0);
+            let acc = arg!(1);
+            call_helper(
+                builder,
+                helpers,
+                abi,
+                abi.sig_unary,
+                Helper::ConcatStr,
+                &[value, acc],
+            )?
+        }
+        Op::StringConcatConst => {
+            let Imm::Int(step) = &inst.imm else {
+                return Err(Unsupported::Step("opt:string"));
+            };
+            let acc = arg!(0);
+            let step_imm = builder.ins().iconst(types::I64, *step as i64);
+            call_helper(
+                builder,
+                helpers,
+                abi,
+                abi.sig_unary,
+                Helper::ConcatStrConst,
+                &[acc, step_imm],
+            )?
+        }
+        Op::TaggedTemplate => {
+            let Imm::Int(step) = &inst.imm else {
+                return Err(Unsupported::Step("opt:tagged-template"));
+            };
+            let this = arg!(0);
+            let tag = arg!(1);
+            let step_imm = builder.ins().iconst(types::I64, *step as i64);
+            call_helper(
+                builder,
+                helpers,
+                abi,
+                abi.sig_binary,
+                Helper::TaggedTemplate,
+                &[tag, this, step_imm],
+            )?
+        }
         // A lifted `CreateFunction`/`FunctionDeclInit`: the closure helper
         // reads the step's payload by index (the same helpers the per-step path
         // calls) and instantiates against the current lexical environment.

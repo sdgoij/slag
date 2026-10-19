@@ -601,11 +601,15 @@ fn stack_delta(step: &Step) -> Result<i32, Unsupported> {
         | Step::LoadGlobal { .. }
         | Step::LoadIdent { .. }
         | Step::LoadContextSlot { .. }
+        | Step::UpdateLocal { .. }
+        | Step::PushStr(_)
         | Step::CreateFunction { .. } => 1,
         Step::Pop
         | Step::StoreLocal { .. }
         | Step::InitLocal { .. }
         | Step::FusedStoreLocal { .. }
+        | Step::ConcatStr
+        | Step::TaggedTemplate(_)
         | Step::Binary(_)
         | Step::GetMemberComputed
         | Step::SetCompletion
@@ -616,6 +620,7 @@ fn stack_delta(step: &Step) -> Result<i32, Unsupported> {
         Step::BinaryImm { .. }
         | Step::GetMemberName { .. }
         | Step::Unary(_)
+        | Step::ConcatStrConst(_)
         | Step::ResetCompletion
         | Step::NormalizeCompletion
         | Step::ListBegin
@@ -1145,6 +1150,29 @@ fn emit_step(
                 },
             );
         }
+        // `x++`/`x--` on a frame slot: read, update (`Op::UpdateValue` keeps
+        // the inline Number path and the BigInt-aware helper fallback), store,
+        // and push the result the operator's form asks for. The captured-slot
+        // form (`UpdateContextSlot`) stays with the per-step path: lifting it
+        // exposed a miscompile in `sweep all`
+        // (`built-ins/Iterator/zip/basic-longest.js`) that only appears with
+        // the typer's read guard on.
+        Step::UpdateLocal { slot, op, prefix } => {
+            if is_tdz(*slot) {
+                emit_tdz_check(builder, block, *slot);
+            }
+            let old = emit_frame_load(builder, block, *slot);
+            let new = builder.emit(
+                block,
+                Op::UpdateValue,
+                &[old],
+                Type::Unknown,
+                Op::UpdateValue.default_effects(),
+                Imm::Int(*op as i32),
+            );
+            emit_frame_store(builder, block, *slot, new);
+            stack.push(if *prefix { new } else { old });
+        }
         // Closure creation (`CreateFunction`): the helper reads the step's
         // payload by index and instantiates against the current environment.
         Step::CreateFunction { .. } => {
@@ -1167,6 +1195,62 @@ fn emit_step(
                 Op::FunctionDecl.default_effects(),
                 Imm::Int(index as i32),
             );
+        }
+        // Template-literal literals: `PushStr` pushes the quasi, `ConcatStr`
+        // flattens `acc + ToString(value)`, and `ConcatStrConst` appends the
+        // following quasi. The quasi payloads stay in the running body and the
+        // helpers read them back by step index.
+        Step::PushStr(_) => {
+            let v = builder.emit(
+                block,
+                Op::StringPush,
+                &[],
+                Type::Unknown,
+                Op::StringPush.default_effects(),
+                Imm::Int(index as i32),
+            );
+            stack.push(v);
+        }
+        Step::ConcatStr => {
+            let value = stack.pop().ok_or(Unsupported::Stack)?;
+            let acc = stack.pop().ok_or(Unsupported::Stack)?;
+            let v = builder.emit(
+                block,
+                Op::StringConcat,
+                &[value, acc],
+                Type::Unknown,
+                Op::StringConcat.default_effects(),
+                Imm::None,
+            );
+            stack.push(v);
+        }
+        Step::ConcatStrConst(_) => {
+            let acc = stack.pop().ok_or(Unsupported::Stack)?;
+            let v = builder.emit(
+                block,
+                Op::StringConcatConst,
+                &[acc],
+                Type::Unknown,
+                Op::StringConcatConst.default_effects(),
+                Imm::Int(index as i32),
+            );
+            stack.push(v);
+        }
+        // A tagged template: the tag and its `this` sit on the stack; the
+        // helper consumes the substitution vector built by the preceding
+        // `ArgsBase`/`ArgsPush` steps and runs the tag.
+        Step::TaggedTemplate(_) => {
+            let tag = stack.pop().ok_or(Unsupported::Stack)?;
+            let this = stack.pop().ok_or(Unsupported::Stack)?;
+            let v = builder.emit(
+                block,
+                Op::TaggedTemplate,
+                &[this, tag],
+                Type::Unknown,
+                Op::TaggedTemplate.default_effects(),
+                Imm::Int(index as i32),
+            );
+            stack.push(v);
         }
         Step::StoreLocal { slot } => {
             let value = stack.pop().ok_or(Unsupported::Stack)?;
@@ -2431,7 +2515,7 @@ fn step_name(step: &Step) -> &'static str {
         | Step::ObjectAccessorComputed { .. }
         | Step::ObjectSpread => "ObjectLiteral",
         Step::RegExpLiteral { .. } => "RegExpLiteral",
-        Step::PushStr(_) | Step::ConcatStr => "String",
+        Step::PushStr(_) | Step::ConcatStr | Step::ConcatStrConst(_) => "String",
         // I4a: name the intrinsic call (the `Math.*`/array/collection sweep),
         // so the coverage probe can count bodies gated on it.
         Step::CallIntrinsic { .. } => "CallIntrinsic",
@@ -2685,6 +2769,98 @@ mod tests {
         let func = lift(&b).expect("lifts");
         let entry = func.entry();
         assert_eq!(func.block(entry).insts[4].imm, Imm::Float(4.0));
+    }
+
+    #[test]
+    fn lifts_a_template_literal() {
+        // `$ {f[0]}x`: the quasi, the substitution, the flatten concat, then
+        // the trailing quasi.
+        let b = body(
+            vec![
+                Step::PushStr(crux::JsString::from_utf8("")),
+                Step::LoadLocal { slot: 0 },
+                Step::ConcatStr,
+                Step::ConcatStrConst(crux::JsString::from_utf8("x")),
+                Step::Return,
+            ],
+            1,
+        );
+        let func = lift(&b).expect("lifts");
+        let entry = func.entry();
+        assert_eq!(
+            ops(&func, entry),
+            vec![
+                Op::StringPush,
+                Op::FrameLoad,
+                Op::StringConcat,
+                Op::StringConcatConst
+            ]
+        );
+        // The quasi payloads stay in the body: the step index rides the imm.
+        assert_eq!(func.block(entry).insts[0].imm, Imm::Int(0));
+        assert_eq!(func.block(entry).insts[3].imm, Imm::Int(3));
+        // `ConcatStr` takes `[value, acc]`, mirroring the interpreter's pops.
+        let value = func.block(entry).insts[1].result.unwrap();
+        let acc = func.block(entry).insts[0].result.unwrap();
+        assert_eq!(func.block(entry).insts[2].args, vec![value, acc]);
+    }
+
+    #[test]
+    fn lifts_update_local() {
+        // `f[0]++` (postfix) followed by a prefix `--f[0]`.
+        let b = body(
+            vec![
+                Step::UpdateLocal {
+                    slot: 0,
+                    op: UpdateOp::Increment,
+                    prefix: false,
+                },
+                Step::UpdateLocal {
+                    slot: 0,
+                    op: UpdateOp::Decrement,
+                    prefix: true,
+                },
+                Step::Return,
+            ],
+            1,
+        );
+        let func = lift(&b).expect("lifts");
+        let entry = func.entry();
+        assert_eq!(
+            ops(&func, entry),
+            vec![
+                Op::FrameLoad,
+                Op::UpdateValue,
+                Op::FrameStore,
+                Op::FrameLoad,
+                Op::UpdateValue,
+                Op::FrameStore
+            ]
+        );
+        // Both operators push their result, so the postfix read and the prefix
+        // store each keep a live value.
+        assert!(func.block(entry).insts[1].result.is_some());
+        assert!(func.block(entry).insts[4].result.is_some());
+    }
+
+    #[test]
+    fn refuses_update_context_slot() {
+        let b = body(
+            vec![
+                Step::UpdateContextSlot {
+                    depth: 0,
+                    index: 1,
+                    op: UpdateOp::Increment,
+                    prefix: false,
+                },
+                Step::Return,
+            ],
+            1,
+        );
+        assert!(
+            lift(&b).is_err(),
+            "the captured-slot update stays on the per-step path"
+        );
     }
 
     #[test]

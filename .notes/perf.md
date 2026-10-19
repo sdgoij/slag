@@ -14658,3 +14658,67 @@ the C3 frame work, not another helper merge.
 
 Verified: clippy `-D warnings`; `cargo test --workspace`; corpus parity 0;
 test262 48,633 + 3,365 at 100%.
+
+### MEASURED (2026-10-20): the template-literal lift, and what the row is really made of
+
+The optimizing tier now lifts `PushStr`, `ConcatStr`, `ConcatStrConst`,
+`TaggedTemplate` and `UpdateLocal`, so a loop body that builds a template no
+longer falls back to the per-step path. `PushStr`/`ConcatStrConst`/
+`TaggedTemplate` keep the quasi payload in the running body and read it back by
+step index; `ConcatStr` threads the accumulator as an SSA value; `UpdateLocal`
+is `FrameLoad` + `UpdateValue` + `FrameStore`, pushing the new value for the
+prefix form and the loaded one for the postfix form (the same shape the
+baseline `emit_update` emits, including its TDZ check on lexical slots).
+
+The corpus row under change moved from 288.5 to 280.3 ms (-2.8%), but the
+honest reading is that the row is not compiler dispatch-bound at all. An
+ablation of its body (100k iterations, the real fixture minus the harness
+noise, one factor removed per run):
+
+| probe | ms | per-iter |
+| --- | ---: | ---: |
+| full body (closure + plain template + tagged template) | 199.9 | 2.0 us |
+| without the tagged template | 107.1 | 1.07 us |
+| without the plain template + its `assert.sameValue` | 104.9 | 1.05 us |
+| without the per-iteration closure (hoisted tag) | 208.7 | 2.09 us |
+| closure creation alone | 38.8 | 0.39 us |
+| tagged template alone | 150.1 | 1.50 us |
+| plain template + one `assert.sameValue` | 57.1 | 0.57 us |
+| one `assert.sameValue(0, 0)` call | 17.9 | 0.18 us |
+| `tag("x", 0, 1, 2)` (a plain 4-arg call) | 119.0 | 1.19 us |
+| `tag`abcd`` (tagged template, no substitutions) | 18.2 | 0.18 us |
+
+Two things follow. The tagged-template machinery itself is cheap: 0.18 us
+including the call, so template-object caching is not the cost. The cost is the
+ordinary JS call: `assert.sameValue(0, 0)` is 179 ns, and the tag invocation
+plus its three nested calls is 1.19 us. That is the same floor the C3 work is
+aimed at (`CertifiedCall` ~53 ns is only the non-leaf *callee* half; a
+method-call site pays the read, the guard and the binding around it). The lift
+is therefore a coverage win, not a row win, and the next real move on this row
+is the call path.
+
+A pure template loop (200k iterations of `s = `a${i}b${i + 1}c``) is unchanged
+by the lift, as expected — it is allocation-bound: 49.5-52.1 ms opt-on versus
+50.0-51.9 ms opt-off across five runs each. The first measurement suggested a
+19% regression; it was one hot-machine outlier (42.6 ms), and it did not
+reproduce.
+
+`UpdateContextSlot` was lifted in the same slice and then taken back out. With
+it supported, `built-ins/Iterator/zip/basic-longest.js` starts failing under
+`sweep all` (wrong padding function observed inside a `map` callback: a
+mis-typed `expected` array), and it passes with `SLAG_OPT=0`, with
+`SLAG_NOLIFT_CTX` (a temporary seam), with `SLAG_GUARD=0` and with
+`SLAG_TYPER=0`. Both of those switches remove or keep every `GuardType`, so the
+fault is not the helper lowering (which is byte-identical to the baseline
+`Step::UpdateContextSlot` arm): it is the typer's read guard interacting with a
+newly-lifted body. Moving `guard::run` ahead of `narrow::run`, and treating the
+narrowed int ops as type-sensitive, each failed to fix it, so neither was kept.
+The repro is `scratch/tmpl/zip.js` (the harness includes concatenated in front
+of the fixture) run through `./target/release/slag.exe`. The lift refuses the
+step, with a comment pointing here, until that guard interaction is understood.
+
+Verified: `cargo fmt --all --check`; clippy `-D warnings`; `cargo test
+--workspace`; `sweep all` 48,633 at 100%; `sweep intl402` 3,365 at 100%; corpus
+parity 0 (`node tools/corpus/bench.js`, mean-jitGap 12.18 on that run — the
+full-corpus mean moves by several tenths between runs on a warm machine, so it
+is quoted only with the parity row).

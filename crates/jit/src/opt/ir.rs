@@ -329,6 +329,22 @@ pub enum Op {
     /// the fallback — so a lifted body keeps the per-step inlining. Modelled as
     /// an opaque call for now: the op carries no speculative premise until I4b.
     Intrinsic,
+    /// A template-literal quasi (`Step::PushStr`): the helper reads the
+    /// `JsString` payload back from the running body via `imm`'s step index
+    /// and yields the value. Net stack +1.
+    StringPush,
+    /// A template substitution concat (`Step::ConcatStr`): `args = [value,
+    /// acc]`, the flattening `concat_template` path the per-step route runs.
+    /// Net stack −1.
+    StringConcat,
+    /// A template quasi append (`Step::ConcatStrConst`): `args = [acc]`, the
+    /// literal read back from the running body via `imm`'s step index. Net
+    /// stack 0.
+    StringConcatConst,
+    /// A tagged-template call (`Step::TaggedTemplate`): `args = [this, tag]`,
+    /// with the (substitution-consuming) payload read back via `imm`'s step
+    /// index. Net stack −1.
+    TaggedTemplate,
     Construct,
     /// The fused plain-argument construct: `args = [callee, a1..aN]` in the
     /// working region, with no `ArgsBase`/`ArgsPush` argument vector.
@@ -467,6 +483,10 @@ impl Op {
             | Op::ContextLoad
             | Op::ContextStore
             | Op::ContextInit
+            | Op::StringPush
+            | Op::StringConcat
+            | Op::StringConcatConst
+            | Op::TaggedTemplate
             | Op::ForOfBegin
             | Op::ForOfNextBindLocal
             | Op::ForOfClose
