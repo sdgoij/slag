@@ -73,3 +73,18 @@ cheaper allocation. Judge it against read-heavy rows
   disciplines.
 - `slag-gc-rooting` — retaining GC values in Rust locals across an allocation,
   and the arena's mark/sweep mechanics.
+
+## 5. Latency around the create is hidden by the init
+
+Shaving latency off the calls around an allocation does not move creation
+rows, even when an isolated allocation microbench says the win is large:
+
+- folding the allocation counter and the stress flag from two thread-locals
+  into one was 6.32 -> 5.20 ns per `Gc::new` in a hot ring (-18%), and moved
+  no end-to-end row at all;
+- a one-entry inline cache for `canonical_empty_map` cut its lookup 2.7 ->
+  1.98 ns, but `ordinary_object_create` stayed at 14.3 ns (~0.3 ns surfaced).
+
+The payload init's stores overlap the surrounding latency. Judge this area on
+the creation loop (or corpus rows), never on the helper in isolation, and
+prefer changes that remove *stores* over changes that remove delay.
