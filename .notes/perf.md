@@ -14395,3 +14395,57 @@ parity 0; test262 48,633 + 3,365 at 100%.
 The class-parts commit also dropped the GC edge for `EcmaFunction`'s inline
 `private_environment`; that is fixed separately and is not part of this
 measurement.
+
+### MEASURED (2026-10-19): Goats client, a real workload
+
+[Goats](https://github.com/sdgoij/goats) is an external game built on Slag.
+Its optimized dev client run — one scripted run, 7 bots and 4 mods, after
+warm-up — is the first real workload measured against this engine rather
+than a corpus row. The clean steady-state window is `n=240` frames with
+zero slow frames.
+
+The two columns are the Slag revision the client was built against:
+`f491e69` (2026-10-18) and `178f92f` (2026-10-19).
+
+| phase | `f491e69` | `178f92f` | change |
+| --- | ---: | ---: | ---: |
+| phase sum | 22.98 ms | **18.74 ms** | **-18.5%** |
+| fps | 40 | **50** | **+25%** |
+| `tufts` (largest) | 10.47 | 7.77 | -26% |
+| `mods_upd` | 1.46 | 1.29 | -12% |
+| `sky2d` | 1.65 | 1.16 | -30% |
+| `shadow_grass` | 1.65 | 1.34 | -19% |
+
+The engine loop probes in the same client (`perf loop`, ns/iteration):
+
+| kind | `f491e69` | `178f92f` | change |
+| --- | ---: | ---: | ---: |
+| `mapget` | 104.84 | 74.78 | **-29%** |
+| `maphas` | 163.68 | 102.75 | **-37%** |
+| `arith` | 13.34 | 13.75 | noise |
+| `new` | 386.19 | 406.52 | noise |
+
+`perf probe`'s pure-JS `Math.sin` loop went 7457 -> 6540 ns (-12%), while
+`callNs`, `propNs` and `pureNs` are unchanged. The native boundary is not
+faster; the win is inside the runtime and JIT for the same operations.
+
+Attribution: the Map rows line up with the key-index mixer
+(`aa57dbf perf(runtime): hash Map/Set key index words with a mixer`) —
+`has` gains more than `get` because it skips the value read. The broad
+phase movement lines up with the GC work (`edfed74 perf(gc): scan the
+young cohort by hash table`, `6a1b771 perf(gc): skip the drop for a plain
+object`): less scanning and less teardown per allocation shows up in every
+allocating phase. The rest of the range `f491e69..178f92f` is the JIT
+inline batch (dense `push`/`pop`/`reverse`/`at`, field stores,
+prototype-chain reads, direct builtin calls), the closure-record work and
+the dense default sort. Two builds many commits apart mean the attribution
+is by mechanism, not by bisection.
+
+The phase sum is the honest headline: -18.5%. The fps jump (40 -> 50) is
+part frame-budget quantization but is the number a player sees. `arith`
+and `new` staying flat are the controls: this is not a global speedup, it
+is less work in the paths a frame actually uses. `new` at +5% is within
+noise and is worth watching if allocation-heavy phases regress later.
+
+Next real-workload target: `tufts` is still the largest phase at 7.77 ms
+after -26%; a sampling profile of that phase is the useful next input.
