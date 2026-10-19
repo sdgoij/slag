@@ -5151,6 +5151,39 @@ impl Vm {
         }
     }
 
+    /// The receiver's object part for the prototype-chain cache. Broader than
+    /// [`Self::cell_object`]: an Integer-Indexed receiver is exotic only for
+    /// canonical numeric index keys (and `length`, which has its own
+    /// shortcut); every other name uses the ordinary own check and prototype
+    /// walk. The own-DATA cells stay narrower because typed-array elements
+    /// live outside the property vector.
+    fn chain_object(value: &Value) -> Option<Handle<crux::object::JsObject>> {
+        match value.kind() {
+            ValueKind::Object(object)
+                if matches!(
+                    object.kind,
+                    crux::object::ObjectKind::Ordinary
+                        | crux::object::ObjectKind::Array(_)
+                        | crux::object::ObjectKind::IntegerIndexed(_)
+                ) =>
+            {
+                Some(object)
+            }
+            ValueKind::Function(function) => {
+                let object = &function.object;
+                if matches!(
+                    object.kind,
+                    crux::object::ObjectKind::Ordinary | crux::object::ObjectKind::Array(_)
+                ) {
+                    Some(*object)
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
+    }
+
     /// The receiver's object map id for the stage-O member-read probe (`0` = a
     /// receiver with no speculatable shape: a primitive or an exotic object).
     fn member_read_map(value: &Value) -> u64 {
@@ -5389,7 +5422,7 @@ impl Vm {
     /// is always observed. `None` falls back to the full Get (which then
     /// re-resolves).
     fn member_chain_get(agent: &mut Agent, object: &Value, name: crux::AtomId) -> Option<Value> {
-        let object = Self::cell_object(object)?;
+        let object = Self::chain_object(object)?;
         // (a) Identity-keyed: the receiver itself re-reads its resolution.
         let index = Self::member_chain_index(object.id(), name);
         if let Some(cell) = agent.member_chain_cells[index].as_ref()
@@ -5550,13 +5583,22 @@ impl Vm {
     /// (the [[Get]] stops there), a non-plain link, a property deeper than
     /// two links, or a miss records nothing.
     fn resolve_chain_cell(agent: &mut Agent, object: &Value, name: crux::AtomId) {
-        let Some(object) = Self::cell_object(object) else {
+        let Some(object) = Self::chain_object(object) else {
             return;
         };
+        let key = PropertyKey::String(name);
+        // An Integer-Indexed exotic intercepts every canonical numeric index
+        // key — valid (`"0"`) or invalid (`"1.5"`) — and reads it from the
+        // buffer (or *undefined*) without consulting the prototype. Such a
+        // key must never be recorded as a chain resolution.
+        if matches!(object.kind, crux::object::ObjectKind::IntegerIndexed(_))
+            && crux::object::is_canonical_numeric_index(&key)
+        {
+            return;
+        }
         if object.has_own_property_atom(name) {
             return;
         }
-        let key = PropertyKey::String(name);
         let mut links = [(0u64, 0u32); 2];
         let mut count = 0usize;
         let mut link = object.get_prototype_of().ok().flatten();

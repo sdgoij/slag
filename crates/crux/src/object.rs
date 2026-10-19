@@ -5114,6 +5114,14 @@ fn canonical_index(key: &PropertyKey) -> Option<f64> {
     canonical_numeric_index_string(lookup(*id).as_slice())
 }
 
+/// spec 7.1.21: whether `key` is a canonical numeric index string. An
+/// Integer-Indexed exotic intercepts every such key — valid or not — so a
+/// generic resolution must not treat one as an ordinary name (`"1.5"` is
+/// index-like and reads *undefined* without consulting the prototype).
+pub fn is_canonical_numeric_index(key: &PropertyKey) -> bool {
+    canonical_index(key).is_some()
+}
+
 /// Whether `key` is a canonical numeric index string (spec 7.1.21); the
 /// Integer-Indexed exotic [[Get]]/[[Set]]/[[HasProperty]]/… intercept these,
 /// so property reads on a TypedArray must not consult the prototype chain.

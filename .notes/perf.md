@@ -14287,3 +14287,60 @@ the lowering; the corpus numbers carry the same caveat.
 
 Gates: clippy `-D warnings`, `cargo test --workspace`, corpus parity 0,
 `test262` 48,633 + 3,365 at 100%.
+
+### LANDED (2026-10-19): typed-array prototype reads hit the chain cache
+
+`opcost/typed_array_for_each` was 75 ms jitless / 63 ms JIT for 100k
+`ta.forEach(cb)` calls on a four-element view. The decomposition:
+
+| probe (100k iterations, jitless) | ms |
+| --- | --- |
+| `var f = ta.forEach` only | 33.3 |
+| `var f = ta.nope` (missing) | 41.6 |
+| `var f = a.forEach` (plain array) | 3.5 |
+| `var n = ta.length` | 3.3 |
+| four direct `cb(ta[j])` calls | 20-24 |
+| `ta.forEach(cb)` | 75.7 |
+
+A typed-array **method read** cost ~333 ns while the same read on a plain
+array cost ~35 ns. The cause is `Vm::cell_object`, which excludes
+`ObjectKind::IntegerIndexed` from the member caches, so `member_chain_get`
+never ran for a typed-array receiver and every `ta.forEach`/`ta.map` read
+paid the full `[[Get]]` prototype walk.
+
+The chain cache now takes a wider `chain_object` (Ordinary, Array, and
+Integer-Indexed; functions unchanged) while the own-DATA cells keep the old
+narrow `cell_object` (typed-array elements are not in the property vector).
+Soundness for the exotic kind: an Integer-Indexed receiver intercepts every
+**canonical numeric index** key — valid (`"0"`) or not (`"1.5"`, `"NaN"`,
+`"Infinity"`) — so `resolve_chain_cell` refuses to record one
+(`crux::object::is_canonical_numeric_index`, newly public). Own shadowing
+bumps the receiver generation; prototype mutation/setPrototypeOf miss through
+the recorded link ids/generations. Element writes do not bump the generation,
+but they cannot shadow a non-index name. Proxies stay on the exact path.
+
+Measured (isolated, alternating order, 10 pairs):
+
+| row | HEAD | landed | delta |
+| --- | --- | --- | --- |
+| `opcost/typed_array_for_each` jitless | 76.9 ms | 34.5 ms | **-55%** |
+| `opcost/typed_array_for_each` JIT | 62.7 ms | 29.6 ms | **-53%** |
+| `ta.forEach` read probe | 33.3 ms | 3.3 ms | **10x** |
+| `ta.map` read probe | 34.0 ms | 3.3 ms | **10x** |
+
+Full corpus (min of 3, interleaved): default JIT mean -0.74%, jitless mean
+-0.86%; the row is the only double-digit mover. A read of a *missing* name on
+a typed array pays a little more now (the chain probe runs before the exact
+fallback): `ta.nope` 41.6 -> 49.0 ms, a cold path.
+
+Verified: a targeted probe covers canonical index atoms (valid/invalid),
+own shadowing and deletion, prototype method reassignment, setPrototypeOf,
+symbols, Float64/BigInt arrays and proxies; `cargo test --workspace`;
+clippy `-D warnings`; corpus parity 0; test262 48,633 + 3,365 at 100%.
+
+The same probe decomposition for `opcost/array_to_sorted` shows it is not a
+read problem: `small.toSorted()` is 144 ms jitless, `small.slice()` is 26 ms,
+and `slice().sort()` is 153 ms. The sort itself costs ~1.3 us for four
+elements because `sort_indexed_properties` pays a string-keyed
+`HasProperty`/`Get`/`Set` per element. A dense-array fast path for the
+default comparator is the follow-up.
