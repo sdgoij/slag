@@ -140,7 +140,7 @@ pub fn call_async_function(
         // offsets into the text it was parsed from, so a closure created
         // inside it resolves against that text (the caller's stands in only
         // when the body has none).
-        source: data.parse_text.clone().or_else(|| {
+        source: data.parse_text().cloned().or_else(|| {
             agent
                 .running_context()
                 .ok()

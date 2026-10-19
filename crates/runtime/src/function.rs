@@ -134,6 +134,26 @@ pub(crate) struct CompiledBodyCacheEntry {
     pub this_writes: (usize, [crux::AtomId; 4]),
 }
 
+/// The source texts a function record carries, shared by every closure from the
+/// same declaration site. `slice` is the function's own definition text
+/// (Function.prototype.toString); `full` is the text its body's spans index
+/// into. Both are immutable, so sharing them is sound.
+#[derive(Debug, Clone)]
+pub struct SourceInfo {
+    pub slice: Option<JsString>,
+    pub full: Option<JsString>,
+    /// The site's source hash, shared so the body cache does not recompute it
+    /// per closure (`shared_function_body_with_key`).
+    pub(crate) key: usize,
+}
+
+impl Trace for SourceInfo {
+    fn trace(&self, visit: &mut dyn FnMut(GcAny)) {
+        self.slice.trace(visit);
+        self.full.trace(visit);
+    }
+}
+
 /// The spec 10.2.1 internal slots of an ordinary ECMAScript function,
 /// registered per function object.
 #[derive(Debug, Clone)]
@@ -201,16 +221,15 @@ pub struct EcmaFunction {
     /// Initializer" early errors (spec 19.2.1.1).
     pub class_field_initializer: bool,
     /// The exact source text of the definition (Function.prototype.toString,
-    /// spec 20.2.3.5); `None` for synthesized/native callables.
-    pub source: Option<JsString>,
-    /// The text this body's AST spans are offsets into — the script, module,
-    /// `Function`-built source or eval it was parsed from. Distinct from
-    /// `source`, which is this function's own *slice* of that text: a call
-    /// frame runs the whole thing, so a closure created inside the body
+    /// spec 20.2.3.5) and the text this body's AST spans are offsets into —
+    /// the script, module, `Function`-built source or eval it was parsed from.
+    /// The two differ: `slice` is this function's own slice of `full`, and a
+    /// call frame runs the whole thing, so a closure created inside the body
     /// resolves its span against the text the span belongs to
     /// (`enclosing_source`), and `source_hash_at` keys the body cache from it.
-    /// `None` when no text covered the creation site.
-    pub parse_text: Option<JsString>,
+    /// Shared per declaration site (`shared_source_info`): 96 bytes of text
+    /// become one `Rc`. `None` when no text covered the creation site.
+    pub source_info: Option<std::rc::Rc<SourceInfo>>,
     /// The script or module this function's source text appears in: the
     /// spec's `F.[[ScriptOrModule]]`, read one level early, because a context
     /// the engine synthesizes rather than inherits has no caller to take it
@@ -288,8 +307,12 @@ impl Trace for EcmaFunction {
         self.private_environment.trace(visit);
         self.super_constructor.trace(visit);
         self.computed_keys.trace(visit);
-        self.source.trace(visit);
-        self.parse_text.trace(visit);
+        // The `Rc` is Rust-owned, but its texts may be ropes: walk them so a
+        // non-leaf source's arena handles stay traced exactly as the inline
+        // `Option<JsString>` fields were.
+        if let Some(info) = &self.source_info {
+            info.trace(visit);
+        }
         self.declaring_script_or_module.trace(visit);
         // The compiled body embeds literal `Value`s (strings, bigints) in
         // its steps; they are heap edges.
@@ -302,6 +325,37 @@ impl Trace for EcmaFunction {
 /// read the cached bools instead of re-walking the ir/flag checks on every
 /// call.
 impl EcmaFunction {
+    /// The function's own definition text (`Function.prototype.toString`,
+    /// spec 20.2.3.5); `None` for synthesized/native callables.
+    pub fn source(&self) -> Option<&JsString> {
+        self.source_info
+            .as_ref()
+            .and_then(|info| info.slice.as_ref())
+    }
+
+    /// The text this body's AST spans are offsets into.
+    pub fn parse_text(&self) -> Option<&JsString> {
+        self.source_info
+            .as_ref()
+            .and_then(|info| info.full.as_ref())
+    }
+
+    /// Point the record at the module text its body's spans index into. The
+    /// module declaration pass registers under a frame with no text of its own
+    /// (and a function's own slice is too short for a nested closure's span).
+    pub(crate) fn set_parse_text(&mut self, text: JsString) {
+        match &mut self.source_info {
+            Some(info) => std::rc::Rc::make_mut(info).full = Some(text),
+            None => {
+                self.source_info = Some(std::rc::Rc::new(SourceInfo {
+                    slice: None,
+                    full: Some(text),
+                    key: 0,
+                }))
+            }
+        }
+    }
+
     /// The construct-inline verdict from the CURRENT record state — read
     /// again after `build_class` populates `fields`/`private_methods`
     /// (which arrive after registration, so `set_compiled` cannot see
@@ -799,8 +853,21 @@ pub fn instantiate_function_with_source(
     per_iteration_chain: Vec<(Vec<crux::AtomId>, usize)>,
     named_expression: bool,
 ) -> Result<Value, JsError> {
-    let source = source.or_else(|| capture_source(agent, f.span));
-    let body = shared_function_body(agent, f, source.as_ref());
+    let source_info = match source {
+        Some(slice) => {
+            // A caller-supplied slice (a module declaration's own text, a
+            // snapshot restore): its body spans run past the slice when it has
+            // nested closures, so the enclosing text is still the full one
+            // when a frame carries it.
+            Some(source_info_with_slice(agent, f.span, slice))
+        }
+        None => shared_source_info(agent, f as *const syntax::ast::Function as usize, f.span),
+    };
+    let source_key = source_info
+        .as_ref()
+        .map(|info| info.key)
+        .unwrap_or_else(|| source_hash_at(agent, f.span).unwrap_or(0));
+    let body = shared_function_body_with_key(agent, f, source_key);
     let params = shared_params(&body, &f.params);
     let value = register_function(
         agent,
@@ -810,8 +877,7 @@ pub fn instantiate_function_with_source(
         environment,
         enclosing_strict,
         DefinitionKind::function(f.is_async, f.is_generator),
-        source,
-        None,
+        source_info,
         None,
         outer_chain,
         named_expression,
@@ -839,13 +905,23 @@ pub fn shared_function_body(
     f: &syntax::ast::Function,
     source: Option<&JsString>,
 ) -> std::rc::Rc<Block> {
-    let realm = agent
-        .current_realm()
-        .map(|realm| crux::handle::Handle::as_ptr(realm) as usize)
-        .unwrap_or(0);
     let source_key = source
         .map(source_hash)
         .or_else(|| source_hash_at(agent, f.span))
+        .unwrap_or(0);
+    shared_function_body_with_key(agent, f, source_key)
+}
+
+/// `shared_function_body` with the site hash already known (`SourceInfo::key`),
+/// so a cached site does not hash its own slice on every closure.
+fn shared_function_body_with_key(
+    agent: &Agent,
+    f: &syntax::ast::Function,
+    source_key: usize,
+) -> std::rc::Rc<Block> {
+    let realm = agent
+        .current_realm()
+        .map(|realm| crux::handle::Handle::as_ptr(realm) as usize)
         .unwrap_or(0);
     let key = (
         f as *const syntax::ast::Function as usize,
@@ -861,6 +937,80 @@ pub fn shared_function_body(
         let body = std::rc::Rc::new(f.body.clone());
         cache.borrow_mut().insert(key, body.clone());
         body
+    })
+}
+
+/// The site's shared source texts (Stage B): the own slice
+/// (`Function.prototype.toString`) and the enclosing text the body's spans
+/// index into. Caching them per site turns the per-closure `span_slice`
+/// allocation into one allocation for the site's first closure. The key
+/// mirrors `shared_function_body`'s: raw node addresses are reused after a
+/// parse is dropped, so the span and a hash of the slice disambiguate them.
+fn shared_source_info(
+    agent: &Agent,
+    node: usize,
+    span: crux::Span,
+) -> Option<std::rc::Rc<SourceInfo>> {
+    let text = enclosing_source(agent, span)?;
+    let (start, end) = (span.start as usize, span.end as usize);
+    let realm = agent
+        .current_realm()
+        .map(|realm| crux::handle::Handle::as_ptr(realm) as usize)
+        .unwrap_or(0);
+    let key = (
+        node,
+        realm,
+        start,
+        end,
+        fnv1a_units(&text.as_slice()[start..end]),
+    );
+    let source_key = key.4;
+    // The cache outlives every record and is not traced, so a non-leaf text
+    // (`ConsString`/`Rope`/`Sliced`) would leave arena handles dangling in it.
+    // Materialise a leaf once; script and module texts are already leaves.
+    let full = match text {
+        JsString::Flat(_) | JsString::Small { .. } => (*text).clone(),
+        _ => JsString::from_utf16(text.as_slice()),
+    };
+    SOURCE_INFO_CACHE.with(|cache| {
+        if let Some(info) = cache.borrow().get(&key) {
+            return Some(info.clone());
+        }
+        let info = std::rc::Rc::new(SourceInfo {
+            slice: Some(JsString::from_utf16(&text.as_slice()[start..end])),
+            full: Some(full),
+            key: source_key,
+        });
+        cache.borrow_mut().insert(key, info.clone());
+        Some(info)
+    })
+}
+
+type SourceInfoKey = (usize, usize, usize, usize, usize);
+
+thread_local! {
+    static SOURCE_INFO_CACHE: std::cell::RefCell<
+        std::collections::HashMap<SourceInfoKey, std::rc::Rc<SourceInfo>>,
+    > = std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+/// `SourceInfo` for a caller-provided slice (a module declaration, a snapshot
+/// restore, an accessor): the enclosing text the body's spans index into when
+/// a frame carries it, else the slice itself (a body parsed from its own
+/// text). Not cached — these callers do not instantiate in loops.
+fn source_info_with_slice(
+    agent: &Agent,
+    span: crux::Span,
+    slice: JsString,
+) -> std::rc::Rc<SourceInfo> {
+    let full = enclosing_source(agent, span)
+        .cloned()
+        .or_else(|| Some(slice.clone()));
+    let key = source_hash(&slice);
+    std::rc::Rc::new(SourceInfo {
+        slice: Some(slice),
+        full,
+        key,
     })
 }
 
@@ -1064,8 +1214,12 @@ pub fn instantiate_method(
     environment: EnvRef,
     enclosing_strict: bool,
 ) -> Result<Value, JsError> {
-    let source = capture_source(agent, f.span);
-    let body = shared_function_body(agent, f, source.as_ref());
+    let source_info = shared_source_info(agent, f as *const syntax::ast::Function as usize, f.span);
+    let source_key = source_info
+        .as_ref()
+        .map(|info| info.key)
+        .unwrap_or_else(|| source_hash_at(agent, f.span).unwrap_or(0));
+    let body = shared_function_body_with_key(agent, f, source_key);
     let params = shared_params(&body, &f.params);
     register_function(
         agent,
@@ -1075,8 +1229,7 @@ pub fn instantiate_method(
         environment,
         enclosing_strict,
         DefinitionKind::method(f.is_async, f.is_generator),
-        source,
-        None,
+        source_info,
         None,
         Vec::new(),
         false,
@@ -1108,6 +1261,7 @@ pub fn instantiate_accessor(
     // instead of per instantiation.
     let body = shared_accessor_body(agent, body);
     let params = shared_params(&body, &params);
+    let source_info = source.map(|slice| source_info_with_slice(agent, body.span, slice));
     register_function(
         agent,
         None,
@@ -1116,8 +1270,7 @@ pub fn instantiate_accessor(
         environment,
         enclosing_strict,
         DefinitionKind::method(false, false),
-        source,
-        None,
+        source_info,
         None,
         Vec::new(),
         false,
@@ -1177,6 +1330,7 @@ fn instantiate_class_constructor_with(
     default_derived: bool,
     source: Option<JsString>,
 ) -> Result<Value, JsError> {
+    let source_info = source.map(|slice| source_info_with_slice(agent, body.span, slice));
     let function = register_function(
         agent,
         None,
@@ -1190,8 +1344,7 @@ fn instantiate_class_constructor_with(
             is_generator: false,
             is_class_constructor: true,
         },
-        source,
-        None,
+        source_info,
         None,
         Vec::new(),
         false,
@@ -1254,12 +1407,10 @@ fn register_function(
     environment: EnvRef,
     enclosing_strict: bool,
     kind: DefinitionKind,
-    source: Option<JsString>,
-    // The text the body's spans index into, when the caller knows it because it
-    // parsed the body from that text (CreateDynamicFunction, the restore).
-    // `None` resolves it from the creating frame — the right answer for a body
-    // parsed as part of the code that is running.
-    parse_text: Option<JsString>,
+    // The source texts this record carries: the function's own slice and the
+    // text its body's spans index into. Resolved by the creation site (see
+    // `shared_source_info` / `source_info_with_slice`).
+    source_info: Option<std::rc::Rc<SourceInfo>>,
     strict: Option<bool>,
     outer_chain: Vec<Vec<crux::AtomId>>,
     named_expression: bool,
@@ -1285,15 +1436,6 @@ fn register_function(
     // fast pointer it feeds — runs once per site instead of once per
     // closure. The pointer is captured before `body` moves into the record.
     let body_key = std::rc::Rc::as_ptr(&body) as usize;
-    // The text the body's spans index into: the caller's when it parsed the body
-    // from that text, else `capture_source`'s own walk, which is the answer for a
-    // body parsed as part of the code that is running. Not `source`, which is
-    // this function's own *slice* of such a text — a nested closure's span runs
-    // past it. The module's declaration pass, which registers under a bootstrap
-    // context with no text of its own, corrects it after registration.
-    let parse_text = parse_text
-        .or_else(|| enclosing_source(agent, body.span).cloned())
-        .or_else(|| source.clone());
     let mut data = EcmaFunction {
         name: name.clone(),
         params: params.clone(),
@@ -1316,8 +1458,7 @@ fn register_function(
         is_async: kind.is_async,
         is_generator: kind.is_generator,
         class_field_initializer: false,
-        source,
-        parse_text,
+        source_info,
         declaring_script_or_module,
         ir: None,
         leaf_inline: false,
@@ -1616,7 +1757,22 @@ pub fn instantiate_function_from_source(
     source: Option<JsString>,
     strict: bool,
 ) -> Result<Value, JsError> {
-    let body = shared_function_body(agent, f, source.as_ref());
+    // The body was parsed from this very text — `parse_function` here, the
+    // `Function` constructor's assembled string for the sibling path — so its
+    // spans index into it, not into whatever the running frame has.
+    let source_info = source.map(|full| {
+        let key = source_hash(&full);
+        std::rc::Rc::new(SourceInfo {
+            slice: Some(full.clone()),
+            full: Some(full),
+            key,
+        })
+    });
+    let source_key = source_info
+        .as_ref()
+        .map(|info| info.key)
+        .unwrap_or_else(|| source_hash_at(agent, f.span).unwrap_or(0));
+    let body = shared_function_body_with_key(agent, f, source_key);
     let params = shared_params(&body, &f.params);
     let value = register_function(
         agent,
@@ -1626,11 +1782,7 @@ pub fn instantiate_function_from_source(
         environment,
         false,
         DefinitionKind::function(f.is_async, f.is_generator),
-        source.clone(),
-        // The body was parsed from this very text — `parse_function` here, the
-        // `Function` constructor's assembled string for the sibling path — so its
-        // spans index into it, not into whatever the running frame has.
-        source,
+        source_info,
         Some(strict),
         Vec::new(),
         false,
@@ -1676,8 +1828,11 @@ pub fn instantiate_arrow(
     // creation site has no source text, which keeps the native form. The
     // enclosing text itself is the record's `parse_text` — the same walk, and
     // the one a closure created inside this arrow resolves its span against.
-    let parse_text = enclosing_source(agent, span).cloned();
-    let source = parse_text.as_ref().map(|text| span_slice(text, span));
+    let site_node = match body {
+        ArrowBody::Expr(expr) => expr.as_ref() as *const Expr as usize,
+        ArrowBody::Block(block) => block as *const Block as usize,
+    };
+    let source_info = shared_source_info(agent, site_node, span);
     // The arrow's `[[ScriptOrModule]]`, read at creation like every other
     // closure's: an async body's start and a promise reaction's callback run in
     // contexts the engine synthesizes, so the record is where the script or
@@ -1708,8 +1863,7 @@ pub fn instantiate_arrow(
         is_async,
         is_generator: false,
         class_field_initializer,
-        source,
-        parse_text,
+        source_info,
         declaring_script_or_module,
         ir: None,
         leaf_inline: false,
@@ -1897,7 +2051,7 @@ pub(crate) fn call_inner(
                     environment: data.environment,
                     realm: data.realm,
                     strict: data.strict,
-                    parse_text: data.parse_text.clone(),
+                    parse_text: data.parse_text().cloned(),
                 });
                 let saved_depth = agent.field_initializer_depth;
                 agent.field_initializer_depth = if marked { saved_depth + 1 } else { 0 };
@@ -2482,7 +2636,7 @@ fn ordinary_call(
                 record.environment,
                 record.realm,
                 record.strict,
-                record.parse_text.clone(),
+                record.parse_text().cloned(),
             )
         }
     };
@@ -2602,7 +2756,7 @@ fn ordinary_call(
             record.body.clone(),
             record.declaring_script_or_module.clone(),
             record.ir.clone(),
-            record.parse_text.clone(),
+            record.parse_text().cloned(),
         )
     };
     let function_env = new_function_environment(
@@ -3256,7 +3410,7 @@ fn ordinary_construct(
                         data.environment,
                         data.realm,
                         data.strict,
-                        data.parse_text.clone(),
+                        data.parse_text().cloned(),
                     ))
             })
         } else {
@@ -3409,7 +3563,7 @@ fn ordinary_construct(
         .or(caller_script_or_module);
     // The callee's own text; the caller's stands in only when the body has
     // none (see `ordinary_call`'s slow path).
-    let source = data.parse_text.clone().or_else(|| {
+    let source = data.parse_text().cloned().or_else(|| {
         agent
             .running_context()
             .ok()

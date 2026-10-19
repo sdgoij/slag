@@ -1414,7 +1414,7 @@ fn instantiate_module_declarations(
             {
                 record.declaring_script_or_module =
                     Some(crate::context::ScriptOrModule::Module(*module));
-                record.parse_text = Some(module.source.clone());
+                record.set_parse_text(module.source.clone());
             }
             env.initialize_binding(&name, func)?;
         }

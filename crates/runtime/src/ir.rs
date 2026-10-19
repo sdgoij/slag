@@ -7393,7 +7393,7 @@ impl Vm {
                 data.environment,
                 data.realm,
                 data.strict,
-                data.parse_text.clone(),
+                data.parse_text().cloned(),
                 semantic,
             )
         };
@@ -13871,7 +13871,7 @@ impl Vm {
                 record.realm,
                 record.strict,
                 record.class_field_initializer,
-                record.parse_text.clone(),
+                record.parse_text().cloned(),
             )
         };
         let Some(ir) = ir else {
@@ -13953,7 +13953,7 @@ impl Vm {
                 record.body.clone(),
                 record.declaring_script_or_module.clone(),
                 record.private_environment,
-                record.parse_text.clone(),
+                record.parse_text().cloned(),
             )
         };
         let function_value = function.self_value();

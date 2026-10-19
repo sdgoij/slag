@@ -578,7 +578,7 @@ fn function_to_string(agent: &mut Agent, this: &Value) -> Result<Value, JsError>
     }
     if let ValueKind::Function(function) = this.kind()
         && let Some(data) = agent.ecma_functions.get(&function.id())
-        && let Some(source) = &data.source
+        && let Some(source) = data.source()
     {
         return Ok(Value::String(Handle::new(source.clone())));
     }

@@ -2071,7 +2071,7 @@ fn callable<'a>(
                     home: data.home_object,
                 });
             }
-            let Some(source) = data.source.as_ref() else {
+            let Some(source) = data.source() else {
                 // No source is the primary fact, and it is checked before the
                 // method form because a class constructor, an accessor and an
                 // arrow all reach here with no source of their own — the engine

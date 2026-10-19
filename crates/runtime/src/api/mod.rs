@@ -152,7 +152,7 @@ impl Isolate {
         self.agent
             .ecma_functions
             .get(&function.id())
-            .and_then(|data| data.source.as_ref())
+            .and_then(|data| data.source())
             .map(|source| source.to_string_lossy())
     }
 

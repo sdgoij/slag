@@ -14160,3 +14160,38 @@ The staged follow-up (shrink the record: class-only state behind one box, the
 two inline source strings behind a shared per-site `SourceInfo`; the GC-arena
 record as the last option; and the stop rule) is
 `.notes/closure-cost-plan.md`.
+
+### LANDED (2026-10-19): share the per-site source info (closure Stage B)
+
+`EcmaFunction`'s inline `source`/`parse_text` (`Option<JsString>`, 96 B) are
+now one `Option<Rc<SourceInfo>>` (8 B) holding `{ slice, full, key }`, built
+once per declaration site and shared by every closure the site creates. The
+cache key mirrors `shared_function_body`'s `(node, realm, span start, span
+end, slice hash)` and lives on the `SourceInfo`, so the body cache no longer
+rehashes the same slice per closure. Record: **408 -> 320 bytes**.
+
+A non-leaf enclosing text (`ConsString`/`Rope`/`Sliced`, e.g. an eval of a
+concatenated string) is materialised to a leaf once before it enters the
+thread-local cache, which is not traced; records still trace through the
+`Rc` for the uncached paths.
+
+Interleaved same-binary release A/B (base = `021f80a5`, 10-12 pairs):
+
+| probe | base | Stage B | delta |
+| --- | --- | --- | --- |
+| `e7` 300k closures, no call | 104.78 ms | 99.88 ms | **-4.7%** |
+| `e5` 300k closures + one call | 153.93 ms | 142.80 ms | **-7.2%** |
+| for-in head-let row (6 pairs) | 765 ms | 708 ms | -7.4% (last 5 pairs 749 -> 673, -10%) |
+
+The first build also passed the slice to `shared_function_body`, which
+rehashed it: that measured only -1.5% on `e7`. Carrying the hash in the
+`SourceInfo` is what makes the win visible.
+
+The slice caching alone is *not* the lever — the 2026-09-08 negative probe
+already showed a no-slice build within noise. The measured win is the record
+shrink: 88 B off a value that is moved into the identity-hashed map on every
+create (and cloned on the call path, hence the larger `e5` delta). Stage A
+(the class-only fields behind one box, 320 -> ~208) is the next slice.
+
+Gates: `cargo test --workspace`, clippy `-D warnings`, corpus parity 0,
+`test262` sweeps 48,633 + 3,365 at 100%.
