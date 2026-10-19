@@ -1358,7 +1358,7 @@ pub fn get_super_constructor(agent: &Agent) -> Result<Value, JsError> {
     let derived = agent
         .ecma_functions
         .get(&function.id())
-        .is_some_and(|data| data.super_constructor.is_some());
+        .is_some_and(|data| data.super_constructor().is_some());
     if !derived {
         return Err(JsError::new(
             ErrorKind::TypeError,

@@ -14195,3 +14195,40 @@ create (and cloned on the call path, hence the larger `e5` delta). Stage A
 
 Gates: `cargo test --workspace`, clippy `-D warnings`, corpus parity 0,
 `test262` sweeps 48,633 + 3,365 at 100%.
+
+### LANDED (2026-10-19): box the class-only slots (closure Stage A)
+
+The five class-only slots — `fields`, `private_methods`,
+`decorator_initializers`, `super_constructor`, `computed_keys` — moved into
+`ClassParts`, stored as `Option<Box<ClassParts>>`. `EcmaFunction` drops from
+**320 to 216 bytes** (408 at the start of the session, so -47% total). An
+ordinary closure never allocates the box; `class_parts_mut` creates it on the
+first class write (a derived constructor's heritage, or the class definition's
+field/private-method/computed-key write).
+
+One planned deviation: `private_environment` stays **inline**. Every closure
+created inside a class body inherits it, so boxing it would allocate a
+`ClassParts` for those closures — the opposite of the goal. The record is 8 B
+larger than the plan's 208-byte estimate and avoids that allocation.
+
+Interleaved same-binary release A/B, Stage B vs Stage B+A (6-12 pairs):
+
+| probe | Stage B | + Stage A | delta |
+| --- | --- | --- | --- |
+| `e7` 300k closures | 102.38 ms | 96.51 ms | **-5.7%** |
+| `e5` 300k closures + call | 147.10 ms | 136.24 ms | **-7.4%** |
+| for-in head-let row | 788 ms | 753 ms | -4.5% |
+| `construct_churn` corpus row | 60.55 ms | 58.89 ms | -2.7% |
+
+Base (Stage B's parent) vs Stage B+A in one interleaved run: `e7` 106.65 ->
+97.39 ms (-8.7%), `e5` 143.76 -> 130.68 ms (-9.1%). Class/call rows did not
+regress (`construct_churn`, `method_call`, `recursive_fib`, `apply_call`,
+`closure_capture`, `direct_leaf` all flat or better).
+
+The stop rule in `.notes/closure-cost-plan.md` (do not start Stage D unless
+B+A take `e7` below ~85 ms from a 97-105 baseline) is **not met**: this machine
+measured 106.65 ms for the pre-Stage-B binary on the same runs, and the final
+binary is 96.5-97.4 ms. Stage D is therefore not started.
+
+Gates: clippy `-D warnings`, `cargo test --workspace`, corpus parity 0,
+`test262` 48,633 + 3,365 at 100%.

@@ -154,6 +154,47 @@ impl Trace for SourceInfo {
     }
 }
 
+/// The slots only class-related functions carry: instance fields, private
+/// methods, decorator initializers, the heritage constructor, and the class's
+/// computed element keys. Boxed on `EcmaFunction` so an ordinary closure does
+/// not pay 112 bytes for state it never uses. [[PrivateEnvironment]] stays
+/// inline: every closure created inside a class body inherits one, so boxing
+/// it would allocate a `ClassParts` for those.
+#[derive(Debug, Clone, Default)]
+pub struct ClassParts {
+    /// [[Fields]]: instance fields initialized when the constructor runs.
+    pub fields: Vec<ClassField>,
+    /// [[PrivateMethods]]: instance private methods/accessors added to each
+    /// instance by InitializeInstanceElements.
+    pub private_methods: Vec<crux::object::PrivateElement>,
+    /// Decorator `addInitializer` callbacks registered by non-static
+    /// method/get/set element decorators (proposal: initializers). Run on each
+    /// instance before the fields, in registration order.
+    pub decorator_initializers: Vec<Value>,
+    /// The heritage constructor of a derived class (GetSuperConstructor).
+    pub super_constructor: Option<Value>,
+    /// The computed public element keys `build_class` resolved, in source order
+    /// — one per computed public element, which is the order the class
+    /// evaluation indexes its `precomputed_keys` by.
+    ///
+    /// Kept because they cannot be recovered: a computed key's *expression* may
+    /// read a name that exists only in the module which defined the class, so a
+    /// snapshot has to carry the key rather than re-evaluate it. Empty for every
+    /// function that is not a class constructor, and for a class whose elements
+    /// are all static names.
+    pub computed_keys: Vec<crux::property::PropertyKey>,
+}
+
+impl Trace for ClassParts {
+    fn trace(&self, visit: &mut dyn FnMut(GcAny)) {
+        self.fields.trace(visit);
+        self.private_methods.trace(visit);
+        self.decorator_initializers.trace(visit);
+        self.super_constructor.trace(visit);
+        self.computed_keys.trace(visit);
+    }
+}
+
 /// The spec 10.2.1 internal slots of an ordinary ECMAScript function,
 /// registered per function object.
 #[derive(Debug, Clone)]
@@ -184,30 +225,15 @@ pub struct EcmaFunction {
     /// A method or accessor definition (no [[Construct]], no `prototype` own
     /// property); class constructors set this too but are constructible.
     pub is_method: bool,
-    /// [[Fields]]: instance fields initialized when the constructor runs.
-    pub fields: Vec<ClassField>,
-    /// [[PrivateMethods]]: instance private methods/accessors added to each
-    /// instance by InitializeInstanceElements.
-    pub private_methods: Vec<crux::object::PrivateElement>,
-    /// Decorator `addInitializer` callbacks registered by non-static
-    /// method/get/set element decorators (proposal: initializers). Run on each
-    /// instance before the fields, in registration order.
-    pub decorator_initializers: Vec<Value>,
+    /// The class-only slots (see `ClassParts`); `None` for every function the
+    /// class machinery never touched. Keeping them behind one optional box
+    /// cuts the record by 112 bytes, which every closure-create pays.
+    pub class_parts: Option<Box<ClassParts>>,
     /// [[PrivateEnvironment]]: the class's private names, captured so method
-    /// bodies and field initializers can resolve `#name`.
+    /// bodies and field initializers can resolve `#name`. Inline (not in
+    /// `ClassParts`) because every closure created inside a class body
+    /// inherits it, and boxing it would allocate for those.
     pub private_environment: Option<Handle<PrivateEnvironment>>,
-    /// The heritage constructor of a derived class (GetSuperConstructor).
-    pub super_constructor: Option<Value>,
-    /// The computed public element keys `build_class` resolved, in source order
-    /// — one per computed public element, which is the order the class
-    /// evaluation indexes its `precomputed_keys` by.
-    ///
-    /// Kept because they cannot be recovered: a computed key's *expression* may
-    /// read a name that exists only in the module which defined the class, so a
-    /// snapshot has to carry the key rather than re-evaluate it. Empty for every
-    /// function that is not a class constructor, and for a class whose elements
-    /// are all static names.
-    pub computed_keys: Vec<crux::property::PropertyKey>,
     /// The synthesized `constructor(...args) { super(...args); }` — its
     /// [[Construct]] passes the arguments without the iterator protocol
     /// (spec 15.7.14 step 23 note).
@@ -301,12 +327,9 @@ impl Trace for EcmaFunction {
         // environments (and source strings) to the old generation, where only
         // a major could reclaim them.
         self.home_object.trace(visit);
-        self.fields.trace(visit);
-        self.private_methods.trace(visit);
-        self.decorator_initializers.trace(visit);
-        self.private_environment.trace(visit);
-        self.super_constructor.trace(visit);
-        self.computed_keys.trace(visit);
+        if let Some(parts) = &self.class_parts {
+            parts.trace(visit);
+        }
         // The `Rc` is Rust-owned, but its texts may be ropes: walk them so a
         // non-leaf source's arena handles stay traced exactly as the inline
         // `Option<JsString>` fields were.
@@ -340,6 +363,48 @@ impl EcmaFunction {
             .and_then(|info| info.full.as_ref())
     }
 
+    /// [[Fields]]; empty for a function with no class state.
+    pub fn fields(&self) -> &[ClassField] {
+        self.class_parts
+            .as_deref()
+            .map_or(&[], |parts| parts.fields.as_slice())
+    }
+
+    /// [[PrivateMethods]]; empty for a function with no class state.
+    pub fn private_methods(&self) -> &[crux::object::PrivateElement] {
+        self.class_parts
+            .as_deref()
+            .map_or(&[], |parts| parts.private_methods.as_slice())
+    }
+
+    /// Decorator `addInitializer` callbacks; empty for a function with no
+    /// class state.
+    pub fn decorator_initializers(&self) -> &[Value] {
+        self.class_parts
+            .as_deref()
+            .map_or(&[], |parts| parts.decorator_initializers.as_slice())
+    }
+
+    /// The class's computed element keys; empty for a function with no class
+    /// state.
+    pub fn computed_keys(&self) -> &[crux::property::PropertyKey] {
+        self.class_parts
+            .as_deref()
+            .map_or(&[], |parts| parts.computed_keys.as_slice())
+    }
+
+    /// The heritage constructor of a derived class.
+    pub fn super_constructor(&self) -> Option<Value> {
+        self.class_parts
+            .as_deref()
+            .and_then(|parts| parts.super_constructor)
+    }
+
+    /// The class-only slots for writing, allocated on the first write.
+    pub fn class_parts_mut(&mut self) -> &mut ClassParts {
+        self.class_parts.get_or_insert_with(Default::default)
+    }
+
     /// Point the record at the module text its body's spans index into. The
     /// module declaration pass registers under a frame with no text of its own
     /// (and a function's own slice is too short for a nested closure's span).
@@ -366,9 +431,9 @@ impl EcmaFunction {
                 && self.this_mode != ThisMode::Lexical
                 && (!self.is_method || self.is_class_constructor)
                 && self.constructor_kind == ConstructorKind::Base
-                && self.fields.is_empty()
-                && self.private_methods.is_empty()
-                && self.decorator_initializers.is_empty()
+                && self.fields().is_empty()
+                && self.private_methods().is_empty()
+                && self.decorator_initializers().is_empty()
                 && !self.class_field_initializer
         })
     }
@@ -388,9 +453,9 @@ impl EcmaFunction {
     /// constructor that calls functions runs through the lane too).
     pub(crate) fn certified_construct_eligible(&self) -> bool {
         self.constructor_kind == ConstructorKind::Base
-            && self.fields.is_empty()
-            && self.private_methods.is_empty()
-            && self.decorator_initializers.is_empty()
+            && self.fields().is_empty()
+            && self.private_methods().is_empty()
+            && self.decorator_initializers().is_empty()
             && self.this_mode != ThisMode::Lexical
             && (!self.is_method || self.is_class_constructor)
             && !self.class_field_initializer
@@ -1447,12 +1512,8 @@ fn register_function(
         constructor_kind: ConstructorKind::Base,
         is_class_constructor: kind.is_class_constructor,
         is_method: kind.is_method,
-        fields: Vec::new(),
-        private_methods: Vec::new(),
-        decorator_initializers: Vec::new(),
+        class_parts: None,
         private_environment,
-        super_constructor: None,
-        computed_keys: Vec::new(),
         default_derived: false,
         realm,
         is_async: kind.is_async,
@@ -1852,12 +1913,8 @@ pub fn instantiate_arrow(
         constructor_kind: ConstructorKind::Base,
         is_class_constructor: false,
         is_method: false,
-        fields: Vec::new(),
-        private_methods: Vec::new(),
-        decorator_initializers: Vec::new(),
+        class_parts: None,
         private_environment,
-        super_constructor: None,
-        computed_keys: Vec::new(),
         default_derived: false,
         realm,
         is_async,
@@ -3398,8 +3455,8 @@ fn ordinary_construct(
         })?;
         if data.this_mode != ThisMode::Lexical
             && data.constructor_kind == ConstructorKind::Base
-            && data.fields.is_empty()
-            && data.private_methods.is_empty()
+            && data.fields().is_empty()
+            && data.private_methods().is_empty()
         {
             data.ir.clone().and_then(|ir| {
                 ir.scope
@@ -3585,7 +3642,7 @@ fn ordinary_construct(
             // spec 15.7.14 step 23 (derived branch): Construct the superclass
             // with the original arguments and the current newTarget — the
             // arguments are passed directly, without the iterator protocol.
-            let Some(super_ctor) = data.super_constructor else {
+            let Some(super_ctor) = data.super_constructor() else {
                 return Err(JsError::new(
                     ErrorKind::TypeError,
                     "A class extending null cannot be constructed".into(),
@@ -3757,7 +3814,7 @@ pub fn initialize_instance_elements(
     // Private methods/accessors first (spec 7.3.27 step 1); both private
     // methods and fields cannot be added to a non-extensible object (spec
     // 10.2.10 step 1 / 10.2.13).
-    for method in &data.private_methods {
+    for method in data.private_methods() {
         if !obj.is_extensible()? {
             return Err(private_add_extensible_error());
         }
@@ -3766,11 +3823,11 @@ pub fn initialize_instance_elements(
     // Decorator initializers registered by non-static method/get/set
     // decorators run before the fields (proposal: initializers), in
     // registration order, with the instance as `this`.
-    for initializer in &data.decorator_initializers {
+    for initializer in data.decorator_initializers() {
         call(agent, initializer, Value::Object(obj), &[])?;
     }
     // Fields (spec 7.3.27 step 2): private fields via PrivateFieldAdd.
-    for field in &data.fields {
+    for field in data.fields() {
         // DefineField (spec 7.3.23): the initializer runs in the class scope
         // with the current `this` (the running context already chains to the
         // class environment through the constructor's [[Environment]]). A

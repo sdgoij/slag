@@ -1,9 +1,10 @@
 # Closure creation: shrinking `EcmaFunction` (and the registry)
 
-**Status: PLAN.** Baseline, profile, and the rejected alternatives were measured
-2026-10-19. Nothing here is implemented. The measured numbers live in
-`.notes/perf.md` ("Closure creation, profiled properly" and "Deferred function
-boilerplate").
+**Status: Stages B and A LANDED (2026-10-19). Stage D not started — the
+stop rule was not met.** Baseline, profile, and the rejected alternatives were
+measured 2026-10-19; the measured numbers live in `.notes/perf.md` ("Closure
+creation, profiled properly", "share the per-site source info", and "box the
+class-only slots").
 
 ## Why this is the next target
 
@@ -170,3 +171,31 @@ warnings`; `rustfmt --edition 2024` on touched files; `sweep.exe all --timeout
 15 --recheck-timeout 15` and `sweep.exe intl402 ...` must stay 48,633 + 3,365 =
 51,998 at 100%; corpus parity 0; same-binary A/B for every claimed win; a
 `.notes/perf.md` entry per stage.
+
+## Outcome (2026-10-19)
+
+**Stage B landed.** `EcmaFunction` 408 -> 320 bytes: the two inline
+`Option<JsString>` source fields became one `Option<Rc<SourceInfo>>` (slice,
+full text, and the site hash), cached per declaration site. The hash rides in
+`SourceInfo` so the body cache does not rehash the slice per closure; without
+that, the win was ~1.5% instead of 4.7%. Non-leaf enclosing texts are
+materialised to a leaf once before entering the untraced cache.
+
+**Stage A landed with one deviation.** `fields`, `private_methods`,
+`decorator_initializers`, `super_constructor` and `computed_keys` moved into
+`ClassParts` (`Option<Box<ClassParts>>`), 320 -> **216 bytes**.
+`private_environment` stays inline: every closure created inside a class body
+inherits it, so boxing it would allocate for those closures. The record is 8 B
+larger than this plan's 208-byte estimate and avoids that allocation.
+
+Measured (interleaved same-binary A/B): `e7` 300k closures -4.7% (B) then
+-5.7% (A); `e5` (one call each) -7.2% then -7.4%; the for-in head-let corpus
+row -7.4% then -4.5% (last pairs ~749 -> ~673 ms across both stages).
+
+**Stop rule:** not met (final `e7` 96.5-97.4 ms on a machine whose pre-change
+baseline measured 106.65 ms; the plan's absolute ~85 ms gate came from a
+97-105 ms baseline). So **Stage D (the GC-arena record) is not started.**
+Stage C's remaining copy is
+`initialize_instance_elements`'s whole-record `.cloned()` (216 B now, only on
+construction of classes with field/private-element state); the normal call
+path already borrows scoped and clones only the fields it needs.

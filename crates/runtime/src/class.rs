@@ -382,7 +382,7 @@ fn build_class(
         && let Some(data) = agent.ecma_functions.get_mut(&ctor_handle.id())
     {
         data.constructor_kind = ConstructorKind::Derived;
-        data.super_constructor = super_constructor;
+        data.class_parts_mut().super_constructor = super_constructor;
     }
     // Set F.[[Prototype]] to superclass: static members of the superclass
     // (and its own statics, e.g. `Uint8Array.fromBase64`) resolve on the
@@ -890,11 +890,14 @@ fn build_class(
     // [[Fields]], [[PrivateMethods]], and the class private environment (spec
     // steps 38-40).
     if let Some(data) = agent.ecma_functions.get_mut(&ctor_handle.id()) {
-        data.fields = fields;
-        data.private_methods = instance_private_methods;
-        data.decorator_initializers = instance_decorator_initializers;
+        {
+            let parts = data.class_parts_mut();
+            parts.fields = fields;
+            parts.private_methods = instance_private_methods;
+            parts.decorator_initializers = instance_decorator_initializers;
+            parts.computed_keys = computed_keys;
+        }
         data.private_environment = Some(class_private_env);
-        data.computed_keys = computed_keys;
         // Cut 33: fields/private methods arrive after registration, so the
         // cached construct-inline verdict (computed with the empty vectors)
         // is stale — a constructor with fields/private methods must not

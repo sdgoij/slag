@@ -2099,7 +2099,7 @@ fn callable<'a>(
                 return Ok(Callable::Class {
                     source,
                     heritage: carried_heritage(agent, data),
-                    keys: &data.computed_keys,
+                    keys: data.computed_keys(),
                     private_names: carried_private_names(data),
                     // The class scope record every one of its methods closes over,
                     // with the same fall-back an arrow takes: a chain the format
@@ -2228,7 +2228,7 @@ fn class_member(
     // addressed by the Private Name's id the class declaration minted.
     let class_function = class.as_function()?;
     let class_data = agent.ecma_functions.get(&class_function.id())?;
-    for element in &class_data.private_methods {
+    for element in class_data.private_methods() {
         if let Some((name_id, form)) = private_member_form(element, id) {
             return Some((class, MemberKey::Private(name_id), form));
         }
@@ -2557,7 +2557,7 @@ fn class_of(expression: &syntax::ast::Expr) -> Option<&syntax::ast::Class> {
 /// heritage whose `prototype` *is* `%Function.prototype%` keeps itself as the
 /// super constructor.
 fn carried_heritage(agent: &Agent, data: &crate::function::EcmaFunction) -> Option<Value> {
-    let super_constructor = data.super_constructor?;
+    let super_constructor = data.super_constructor()?;
     let function_prototype = agent
         .current_realm()
         .ok()
@@ -6413,7 +6413,7 @@ impl Builder<'_> {
                     .ecma_functions
                     .get(&class_function.id())
                     .and_then(|data| {
-                        data.private_methods
+                        data.private_methods()
                             .iter()
                             .find_map(|element| private_member_value(element, *name_id, form))
                     });
