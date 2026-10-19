@@ -383,22 +383,22 @@ both paths computed the same value):
 
 | Body | Interpreter | JIT | Ratio |
 |---|---|---|---|
-| `arithmetic` | 7.92 ms | 0.608 ms | 0.08x |
-| `wide leaf call` | 20.53 ms | 1.807 ms | 0.09x |
-| `bare loop` | 7.35 ms | 0.695 ms | 0.09x |
-| `property read` | 8.17 ms | 0.721 ms | 0.09x |
-| `global read` | 10.87 ms | 1.349 ms | 0.12x |
-| `typed-array read` | 88.83 ms | 13.152 ms | 0.15x |
-| `string concat` | 1.18 ms | 0.185 ms | 0.16x |
-| `builtin call` | 4.17 ms | 0.672 ms | 0.16x |
-| `function calls` | 5.67 ms | 0.896 ms | 0.16x |
-| `typed-array length` | 12.24 ms | 2.006 ms | 0.16x |
-| `buildString shape` | 71.61 ms | 14.195 ms | 0.20x |
-| `non-leaf call` | 26.94 ms | 5.599 ms | 0.21x |
-| `typed-array write` | 26.64 ms | 6.041 ms | 0.23x |
-| `buildString full` | 62.76 ms | 16.777 ms | 0.27x |
-| `compound assign` | 3.34 ms | 1.147 ms | 0.34x |
-| `apply leaf call` | 18.96 ms | 6.627 ms | 0.35x |
+| `wide leaf call` | 23.68 ms | 1.860 ms | 0.08x |
+| `bare loop` | 7.30 ms | 0.586 ms | 0.08x |
+| `property read` | 8.84 ms | 0.731 ms | 0.08x |
+| `arithmetic` | 7.91 ms | 0.723 ms | 0.09x |
+| `global read` | 11.93 ms | 1.374 ms | 0.12x |
+| `typed-array read` | 94.40 ms | 12.567 ms | 0.13x |
+| `builtin call` | 4.69 ms | 0.712 ms | 0.15x |
+| `function calls` | 6.22 ms | 0.965 ms | 0.16x |
+| `string concat` | 1.18 ms | 0.188 ms | 0.16x |
+| `typed-array length` | 12.60 ms | 2.050 ms | 0.16x |
+| `buildString shape` | 76.51 ms | 14.173 ms | 0.19x |
+| `typed-array write` | 28.62 ms | 6.248 ms | 0.22x |
+| `non-leaf call` | 27.47 ms | 6.173 ms | 0.22x |
+| `compound assign` | 3.83 ms | 1.028 ms | 0.27x |
+| `buildString full` | 64.58 ms | 18.607 ms | 0.29x |
+| `apply leaf call` | 20.18 ms | 7.112 ms | 0.35x |
 
 `builtin call` and `non-leaf call` are the two rows that cannot inline — a body
 that contains a call is not a leaf, and a crux-native builtin is not a JS leaf —
@@ -406,6 +406,14 @@ so both engines run the general call path there and the ratio is set by that
 machinery, not by code generation. `typed-array read` is the one row this suite
 gained over `v0.1.0-preview.2`; the rest of the set is unchanged.
 `.notes/perf.md` has the per-shape probe and what each row moved.
+
+`arithmetic` and `bare loop` are the only rows the optimizing tier compiles (the
+rest keep the per-step body), so they are the only two whose numbers moved when
+that tier became the default. The raw-f64 pass now keeps both accumulators in
+f64 registers: `bare loop` is 0.586 ms against the per-step lane's 0.70 ms. In
+`arithmetic` the counter is an int32 (the loop-counter pass proved it) and its
+uses convert, which leaves that one row ~18% behind the per-step lane; the
+tradeoff and the next lever are in `.notes/perf.md`.
 
 One row needs a caveat: `wide leaf call`'s interpreter column is the suite's
 noisiest (±20% run to run), and it is the single row the pinned release profile

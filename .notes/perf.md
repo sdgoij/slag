@@ -14001,3 +14001,49 @@ with the loop-heavy rows `strings/search_slice` 21.0 -> 15.7,
 Correction to a near-miss: `opcost/baseline` reads 2.3 ms in the 2026-10-19
 dump's *second* column, which is slag jitless; its JIT column is already 0.1 ms
 before this change. The 23x "win" that number suggests is not this pass.
+
+## Arithmetic chains stay in f64 registers (2026-10-19)
+
+The optimizing tier canonicalizes every arithmetic result against the NaN-box
+tag region (`canon_double`: mask, compare, select) and keeps the word in an
+i64 SSA value, so `n += 1` round-trips through a general-purpose register every
+iteration. The per-step lane does not: its deferred numeric register keeps the
+value in an f64 register and boxes once, at the store. Measured on the two rows
+the opt tier compiles, before and after the loop-counter slice above:
+
+| row | opt tier | per-step lane (`SLAG_OPT=0`) |
+| --- | --- | --- |
+| `bare loop` | 2.28 ms | 0.71 ms |
+| `arithmetic` | 2.42 ms | 0.61 ms |
+
+`pass/unbox.rs` adds `Type::Float` (a raw f64) and `Op::Canon` (raw -> Value).
+A value is raw when it is an arithmetic result whose operands are proven
+Numbers, or a block parameter that receives a raw value on any edge; the
+fixpoint is what carries an accumulator across the back edge. Every use that
+observes the value word — a helper, a store, a return, a tag test, a branch
+condition, an edge into a non-raw parameter — gets a `Canon` inserted in front
+of it, so the canonicalization lands where the chain ends rather than on every
+iteration. `repr(Float)` is `F64`, so the register allocator keeps the chain in
+an xmm register with no `vmovq`s. `emit_bare_numeric` works in f64 and skips the
+canonicalization for a raw result.
+
+Safety: a raw float is not a canonical `Value` word (a NaN whose bits are
+`0x7FF8...` decodes as a tag), so the lowering refuses the opt body
+(`Unsupported::Step("opt:raw-float-boundary")`) if one ever reaches a path that
+is not the bare f64 op. A pass bug is therefore a fallback to the per-step body,
+never a misread value.
+
+Measured, same binary via the `SLAG_UNBOX=0` seam, three interleaved pairs over
+the 77-workload corpus: mean speedup 1.024, 1.025, 1.003. The rows that move are
+the ones with a proven-Number accumulator (`arrays/index_loop` ~1.08,
+`opcost/array_length_write` ~1.12, `control/switch_dispatch` ~1.08); per-row
+swings beyond that are thermal (a single row changed direction between pair
+orders). Micro-suite: `bare loop` 2.28 -> 0.586 ms and `arithmetic` 2.42 ->
+0.723 ms, i.e. `bare loop` is now faster than the per-step lane and `arithmetic`
+is 18% behind it.
+
+That last gap is the counter, not the accumulator: `arithmetic` is
+`n += i * 2`, the loop-counter pass proves `i` an int32, and each use of it in
+a float op converts (`vcvtsi2sdl`). Keeping the counter raw when its uses are
+f64 would recover it; narrowing only when every use is int-shaped is the next
+lever, deliberately not taken here.

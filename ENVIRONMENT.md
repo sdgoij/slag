@@ -31,6 +31,7 @@ measurement and the knobs an embedder can experiment with; `SLAG_OPT` and
 | `SLAG_FEEDBACK` | **off** | non-`0` enables the **call-site feedback probe** (`runtime/src/feedback.rs`); unset allocates nothing and changes no behavior. |
 | `SLAG_GUARD` | on | `=0` disables the read-guard **pruning pass** (`pass/guard.rs`). |
 | `SLAG_MEM2REG` | on | `=0` disables top-level **frame-slot promotion** (`pass/mem2reg.rs`). |
+| `SLAG_UNBOX` | on | `=0` disables the **raw-f64 chain pass** (`pass/unbox.rs`): arithmetic results are then NaN-box canonicalized per operation instead of where the value leaves the chain. |
 | `SLAG_WIDEN` | on | `=0` disables `narrow`'s **effect widening**. |
 
 ## JIT diagnostics

@@ -125,6 +125,7 @@ fn ty(t: Type) -> &'static str {
         Type::Bool => "bool",
         Type::Int => "int",
         Type::Number => "num",
+        Type::Float => "f64",
         Type::String => "str",
         Type::Object => "obj",
         Type::Hole => "hole",

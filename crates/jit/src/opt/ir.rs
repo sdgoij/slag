@@ -25,6 +25,11 @@ pub enum Type {
     Int,
     /// A JS number that may be a heap number.
     Number,
+    /// The f64 bits of a proven Number, held in an `I64` register without the
+    /// NaN-box canonicalization every arithmetic result normally pays. Only
+    /// an arithmetic or ordering operand may consume it; anything that
+    /// observes the value word needs an [`Op::Canon`] first.
+    Float,
     String,
     Object,
     /// The dense-array hole sentinel.
@@ -43,6 +48,11 @@ impl Type {
         match (self, other) {
             (Type::Never, t) | (t, Type::Never) => t,
             (Type::Int, Type::Number) | (Type::Number, Type::Int) => Type::Number,
+            // A canonical Number word is a valid raw f64, so any mixture of
+            // the three numeric representations can meet in one register.
+            (Type::Float, Type::Number | Type::Int)
+            | (Type::Number | Type::Int, Type::Float)
+            | (Type::Float, Type::Float) => Type::Float,
             _ => Type::Unknown,
         }
     }
@@ -213,6 +223,10 @@ pub enum Imm {
 pub enum Op {
     /// A constant; the payload is the [`Imm`].
     Const,
+    /// Turn a [`Type::Float`] value's raw f64 bits back into a canonical
+    /// Number word: `args = [value]`. Only a NaN whose bits collide with the
+    /// tag region changes, but every boundary into a `Value` word needs it.
+    Canon,
     Add,
     Sub,
     Mul,
@@ -387,6 +401,7 @@ impl Op {
         use Effects as E;
         match self {
             Op::Const
+            | Op::Canon
             | Op::IntAdd
             | Op::IntSub
             | Op::IntMul

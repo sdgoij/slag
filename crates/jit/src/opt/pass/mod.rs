@@ -38,6 +38,7 @@ pub mod loop_counter;
 pub mod mem2reg;
 pub mod narrow;
 pub mod scalar;
+pub mod unbox;
 
 /// Whether the read-guard pruning pass runs. On by default; `SLAG_GUARD=0`
 /// disables it — the same-binary seam for measuring the pass's marginal effect
@@ -52,6 +53,14 @@ fn guard_enabled() -> bool {
 /// it, mirroring `SLAG_GUARD`).
 fn mem2reg_enabled() -> bool {
     std::env::var("SLAG_MEM2REG")
+        .map(|v| v != "0")
+        .unwrap_or(true)
+}
+
+/// Whether the raw-f64 chain pass runs. On by default; `SLAG_UNBOX=0` disables
+/// it — the same-binary seam for measuring the pass's marginal effect.
+fn unbox_enabled() -> bool {
+    std::env::var("SLAG_UNBOX")
         .map(|v| v != "0")
         .unwrap_or(true)
 }
@@ -76,6 +85,7 @@ pub fn run(
     let dropped = dce::run(func);
     let counted = loop_counter::run(func);
     let retyped = normalize_param_types(func);
+    let unboxed = unbox_enabled() && unbox::run(func);
     folded
         || narrowed
         || promoted
@@ -87,6 +97,7 @@ pub fn run(
         || dropped
         || counted
         || retyped
+        || unboxed
 }
 
 /// Type every block parameter as the join of its incoming edge arguments' types.

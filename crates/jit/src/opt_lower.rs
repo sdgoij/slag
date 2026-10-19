@@ -220,11 +220,15 @@ fn lower(
                     Some(id) => {
                         let v = value_of(&values, *id)?;
                         // The return ABI is a `Value` word; an `Int` result
-                        // converts back from its i32 register.
-                        if ir.value_type(*id) == Type::Int {
-                            int_to_bits(&mut builder, v)
-                        } else {
-                            v
+                        // converts back from its i32 register and a raw float
+                        // (defensively: the unbox pass canonicalizes every
+                        // return) from its f64 register.
+                        match ir.value_type(*id) {
+                            Type::Int => int_to_bits(&mut builder, v),
+                            Type::Float => {
+                                builder.ins().bitcast(types::I64, MemFlagsData::new(), v)
+                            }
+                            _ => v,
                         }
                     }
                     None => builder.ins().iconst(types::I64, undefined),
@@ -243,10 +247,10 @@ fn lower(
                 else_args,
             }) => {
                 let c = value_of(&values, *cond)?;
-                let c = if ir.value_type(*cond) == Type::Int {
-                    int_to_bits(&mut builder, c)
-                } else {
-                    c
+                let c = match ir.value_type(*cond) {
+                    Type::Int => int_to_bits(&mut builder, c),
+                    Type::Float => builder.ins().bitcast(types::I64, MemFlagsData::new(), c),
+                    _ => c,
                 };
                 // A `Bool`-typed condition is already a canonical boolean, so
                 // the truthiness test is a compare against `false` — no helper
@@ -302,13 +306,18 @@ fn resolve(
         .enumerate()
         .map(|(i, id)| {
             let v = value_of(values, *id)?;
-            let want_int = params
-                .get(i)
-                .is_some_and(|p| ir.value_type(*p) == Type::Int);
-            let v = if ir.value_type(*id) == Type::Int && !want_int {
-                int_to_bits(builder, v)
-            } else {
-                v
+            let from = ir.value_type(*id);
+            let to = params.get(i).map(|p| ir.value_type(*p));
+            let v = match (from, to) {
+                (Type::Int, Some(Type::Int)) => v,
+                (Type::Int, Some(Type::Float)) => builder.ins().fcvt_from_sint(types::F64, v),
+                (Type::Int, _) => int_to_bits(builder, v),
+                (Type::Float, Some(Type::Float)) => v,
+                // A raw float never reaches a non-float parameter (the unbox
+                // pass canonicalizes that edge); keep the word well-formed.
+                (Type::Float, _) => builder.ins().bitcast(types::I64, MemFlagsData::new(), v),
+                (_, Some(Type::Float)) => builder.ins().bitcast(types::F64, MemFlagsData::new(), v),
+                _ => v,
             };
             Ok(v.into())
         })
@@ -341,14 +350,19 @@ fn lower_inst(
         ($i:expr) => {{
             let id = inst.args[$i];
             let v = value_of(values, id)?;
-            if types.get(id as usize) == Some(&Type::Int) {
-                int_to_bits(builder, v)
-            } else {
-                v
+            match types.get(id as usize) {
+                Some(&Type::Int) => int_to_bits(builder, v),
+                Some(&Type::Float) => builder.ins().bitcast(types::I64, MemFlagsData::new(), v),
+                _ => v,
             }
         }};
     }
     Ok(match inst.op {
+        Op::Canon => {
+            let v = value_of(values, inst.args[0])?;
+            let bits = builder.ins().bitcast(types::I64, MemFlagsData::new(), v);
+            canon_double(builder, bits)
+        }
         Op::Const => {
             if inst.ty == Type::Int {
                 let value = match &inst.imm {
@@ -421,6 +435,8 @@ fn lower_inst(
         | Op::Gt
         | Op::Ge => {
             let disc = binary_op(inst.op).ok_or(Unsupported::Step("opt:binary"))?;
+            let lhs_ty = types[inst.args[0] as usize];
+            let rhs_ty = types[inst.args[1] as usize];
             let (lhs, rhs) = (arg!(0), arg!(1));
             // `x === undefined` (either order) is a bits comparison against the
             // unique `undefined` sentinel, so it needs no helper. Sound because
@@ -448,16 +464,31 @@ fn lower_inst(
             // block and no branch — the same shape the per-step path reaches
             // with a known-number operand. When only one side is proven, the
             // checked path still skips that side's tag check.
-            let known_lhs = types
-                .get(inst.args[0] as usize)
-                .is_some_and(|t| matches!(t, Type::Number | Type::Int));
-            let known_rhs = types
-                .get(inst.args[1] as usize)
-                .is_some_and(|t| matches!(t, Type::Number | Type::Int));
+            let known_lhs = matches!(lhs_ty, Type::Number | Type::Int | Type::Float);
+            let known_rhs = matches!(rhs_ty, Type::Number | Type::Int | Type::Float);
             let both_known = known_lhs && known_rhs;
             let known = numeric && both_known;
+            // A raw float is not a canonical `Value` word; it may only feed
+            // the bare numeric path, which consumes f64s directly. The unbox
+            // pass canonicalizes every other use, so reaching here is a bug
+            // (refuse rather than hand a NaN that decodes as a tag to a
+            // helper or a tag test).
+            let raw_operand = lhs_ty == Type::Float || rhs_ty == Type::Float;
+            if raw_operand && !known {
+                return Err(Unsupported::Step("opt:raw-float-boundary"));
+            }
             if known {
-                emit_bare_numeric(builder, inst.op, lhs, rhs)
+                let lhs_native = value_of(values, inst.args[0])?;
+                let rhs_native = value_of(values, inst.args[1])?;
+                emit_bare_numeric(
+                    builder,
+                    inst.op,
+                    lhs_native,
+                    lhs_ty,
+                    rhs_native,
+                    rhs_ty,
+                    inst.ty != Type::Float,
+                )
             } else if numeric {
                 call_numeric_binary(
                     builder,
@@ -1493,13 +1524,25 @@ fn canonical_bool(builder: &mut FunctionBuilder, cond: ClifValue) -> ClifValue {
 }
 
 /// The register an IR value of type `ty` rides in: an `Int` is a signed int32
-/// (an i32 register), everything else an i64 `Value` word. This is the whole
-/// of the representation decision — every boundary conversion keys on it.
+/// (an i32 register), a `Float` a raw f64 (an f64 register, so a Number chain
+/// never round-trips through a general-purpose register), everything else an
+/// i64 `Value` word. This is the whole of the representation decision — every
+/// boundary conversion keys on it.
 fn repr(ty: Type) -> cranelift_codegen::ir::Type {
-    if ty == Type::Int {
-        types::I32
-    } else {
-        types::I64
+    match ty {
+        Type::Int => types::I32,
+        Type::Float => types::F64,
+        _ => types::I64,
+    }
+}
+
+/// Convert an operand to the f64 a bare numeric op works in: a raw float is
+/// already one, an int32 is converted, a `Value` word is bit-cast.
+fn as_f64(builder: &mut FunctionBuilder, v: ClifValue, ty: Type) -> ClifValue {
+    match ty {
+        Type::Float => v,
+        Type::Int => builder.ins().fcvt_from_sint(types::F64, v),
+        _ => builder.ins().bitcast(types::F64, MemFlagsData::new(), v),
     }
 }
 
@@ -5092,15 +5135,20 @@ fn emit_strict_eq(
 
 /// The bare f64 form of an arithmetic or ordering op whose operands are proven
 /// Numbers (the `narrow` pass): a canonical Number's bits bit-cast to its f64,
-/// so no tag check and no fallback are needed. A comparison yields a Boolean.
+/// so no tag check and no fallback are needed. A comparison yields a Boolean;
+/// arithmetic yields raw f64 bits in an f64 register when the unbox pass typed
+/// the result `Float`.
 fn emit_bare_numeric(
     builder: &mut FunctionBuilder,
     op: Op,
     lhs: ClifValue,
+    lhs_ty: Type,
     rhs: ClifValue,
+    rhs_ty: Type,
+    canonicalize: bool,
 ) -> ClifValue {
-    let l = builder.ins().bitcast(types::F64, MemFlagsData::new(), lhs);
-    let r = builder.ins().bitcast(types::F64, MemFlagsData::new(), rhs);
+    let l = as_f64(builder, lhs, lhs_ty);
+    let r = as_f64(builder, rhs, rhs_ty);
     match op {
         Op::Lt | Op::Le | Op::Gt | Op::Ge => {
             let cc = match op {
@@ -5125,6 +5173,9 @@ fn emit_bare_numeric(
                 Op::Mul => builder.ins().fmul(l, r),
                 _ => builder.ins().fdiv(l, r),
             };
+            if !canonicalize {
+                return res;
+            }
             let bits = builder.ins().bitcast(types::I64, MemFlagsData::new(), res);
             canon_double(builder, bits)
         }
