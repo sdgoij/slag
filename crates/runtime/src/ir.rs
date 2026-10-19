@@ -11157,16 +11157,20 @@ impl Vm {
                 crux::object::typed_array_effective_length(slots) as f64,
             ));
         }
+        // A prototype-chain read (a method like `f.apply`/`arr.push` — the
+        // property lives on a prototype, so the own-property cells never serve
+        // it): the chain cache re-validates the walked links instead of
+        // re-walking them. Tried BEFORE the own-property resolution because
+        // that miss path (the proto-keyed cell fallback + a vector probe) is
+        // the bulk of a prototype read's helper cost, and a chain hit proves
+        // the receiver owns no `name` (the record checks it, and the
+        // generation/link validation catches any structural change since).
+        if let Some(value) = Self::member_chain_get(agent, &object, name) {
+            return Ok(value);
+        }
         match Self::member_cell_get(agent, &object, name) {
             Some(value) => Ok(value),
             None => {
-                // A prototype-chain read (a method like `f.apply`/`arr.push`
-                // — the property lives on a prototype, so the own-property
-                // cells never serve it): the chain cache re-validates the
-                // walked links instead of re-walking them.
-                if let Some(value) = Self::member_chain_get(agent, &object, name) {
-                    return Ok(value);
-                }
                 let value =
                     if !matches!(object.kind(), ValueKind::Object(_) | ValueKind::Function(_)) {
                         Self::get_primitive_member(agent, object, &PropertyKey::String(name))?

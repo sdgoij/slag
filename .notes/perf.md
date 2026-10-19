@@ -14052,3 +14052,31 @@ while `bare loop` was unchanged. The generated loop is shorter either way
 back edge is one `lea` (1 cycle) and its `fcvt`+`fcmp` ride off the critical
 path, whereas an f64 back edge is a 4-cycle `vaddsd` feeding the compare. The
 int counter stays; the different rule was reverted.
+
+## Prototype reads: the chain cache ran after the own-field miss work (2026-10-19)
+
+`get_member_name` tried `member_cell_get` first, and its miss path does the
+proto-keyed cell lookup plus a properties-vector probe; only then did it try
+`member_chain_get`. For a prototype read (a method like `arr.push`,
+`o.method`, `s.charAt`) that miss work is pure overhead: a chain cell is
+recorded only when the receiver owns no `name`, and a hit validates the
+receiver generation and every recorded prototype link, so a hit already proves
+the own-property lookup would miss.
+
+Moving the chain probe ahead of the own-property resolution costs nothing for
+an own read (the chain lookup misses) and removes the redundant work for a
+prototype read. Isolated, 300k reads: a one-link prototype data read 5.39 ->
+3.48 ms (1.55x), an own data read 1.15 -> 1.17 (unchanged), a String-primitive
+method read unchanged (that path goes through `get_primitive_member`, not the
+chain cache). Corpus rows driven by prototype reads: `objects/proto_read` 73.1
+-> 50.2, `opcost/proto_method_call` 3.1 -> 2.2, `opcost/map_get` 4.3 -> 3.2,
+`control/for_in` 14.0 -> 10.8, `calls/apply_call` 36.8 -> 30.3,
+`builtins/map_churn` 34.1 -> 28.4, `opcost/regexp_test` 51.5 -> 40.5. The
+corpus total is flat within thermal noise: the three largest rows are language
+fixtures whose hot loops do not read members.
+
+`GetMemberName` is still the corpus's most-called helper (91.7M calls in one
+run of all 77 workloads, ahead of `CallSlow` 38.9M and `LoadContext` 38.8M).
+This change removes work inside the helper; inlining the chain probe into
+compiled code (the own-data cell already has `emit_member_cell_probe`) is the
+next lever.
