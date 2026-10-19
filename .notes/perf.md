@@ -14525,3 +14525,48 @@ global-value cell `StoreGlobal` uses and falling back to the reference path
 when the cell is stale or the property is not a writable data slot. Both
 `var` shapes (global object) and `let` shapes (declarative record) want the
 same step; the declarative record additionally needs a slot for its value.
+That slice landed below.
+
+### LANDED (2026-10-19): environment-resolved global stores
+
+A certified body's `BindingLoc::Env` write no longer goes through the
+generic reference machinery. `Step::StoreIdent` (with its
+`ResolveIdentStore` companion) now stores through the same direct-mapped
+global-value cell `LoadIdent` reads, and a declarative binding keeps the
+environment resolve.
+
+The write was three helpers per iteration (`ResolveVarIdent`,
+`GetVarReference`, `PutVarReferenceOp`) while a read was a single `LoadIdent`
+cell hit. The compiled sequence is now `ResolveIdentStore` + `LoadIdent` +
+RHS + `Binary` + `StoreIdent`. `ResolveIdentStore` branches on the ctx's
+`globals_unshadowed`: the clean path skips the walk entirely, and the
+shadowed path resolves the reference before the RHS, preserving spec 13.15.3
+steps 1 and 5 (a `with` binding the RHS deletes is still the PutValue
+target). `StoreIdent`'s cell fast path only writes an own writable data
+property; a declarative binding records a load-only cell (slot `u32::MAX`)
+and resolves through the environment, which is what stops a `let` write from
+creating a shadow property on the global object.
+
+Measured (5,000,000 iterations, min of 5, same scripts):
+
+| shape | before JIT | after JIT | before jl | after jl |
+| --- | ---: | ---: | ---: | ---: |
+| top-level `var` `+=` | 960.0 | **50.1** | 1084.8 | **179.4** |
+| top-level `var` `=` | 698.9 | **34.6** | 755.1 | **65.2** |
+| top-level `let` `+=` | 362.5 | 337.7 | 504.4 | 467.5 |
+| local `var` (control) | 3.6 | 3.6 | 114.9 | 110.6 |
+| global read (control) | 3.9 | 3.9 | 43.0 | 39.2 |
+
+Whole corpus (5 interleaved pairs): default JIT -1.1%, jitless -1.7%, value
+parity 0. The `let` shape keeps a resolve per write (the declarative record
+has no value cell), so the follow-up there is a slot on the global
+declarative record; the `var` shape is the client's case and is now close to
+the `globalThis.acc +=` member path (50 vs 148 ms).
+
+Two fixtures shaped the slice: the JIT declarative read/write test caught
+`store_global_value` creating a shadow property for a `let`, and
+`statements/with/set-mutable-binding-binding-deleted-with-typed-array-in-proto-chain-strict-mode.js`
+caught the missing pre-resolve ordering.
+
+Verified: clippy `-D warnings`; `cargo test --workspace`; corpus parity 0;
+test262 48,633 + 3,365 at 100%.

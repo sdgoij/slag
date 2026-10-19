@@ -64,6 +64,10 @@ pub enum Helper {
     SetGlobal,
     SetGlobalSlot,
     LoadIdent,
+    /// `Step::StoreIdent`: write an environment-resolved binding, using the
+    /// global store cell when the body's globals are unshadowed and the
+    /// dynamic resolve otherwise. Returns the stored value.
+    StoreIdent,
     /// `Step::TypeofIdent`: `typeof` of a name resolved through the
     /// environment chain (an unresolvable reference answers `"undefined"`).
     TypeofIdent,
@@ -244,6 +248,7 @@ impl Helper {
             Helper::SetGlobal => "set_global",
             Helper::SetGlobalSlot => "set_global_slot",
             Helper::LoadIdent => "load_ident",
+            Helper::StoreIdent => "store_ident",
             Helper::TypeofIdent => "typeof_ident",
             Helper::ResolveVarIdent => "resolve_var_ident",
             Helper::PutVarReference => "put_var_reference",
@@ -564,6 +569,10 @@ pub struct JitHelpers {
     /// The identifier read a certified body uses for an outer/global binding
     /// (`resolve_binding` + `get_value`); `name` is an `AtomId`.
     pub load_ident: Option<extern "C" fn(vm: *mut c_void, name: u64) -> u64>,
+    /// The matching write: the global store cell when the body's globals are
+    /// unshadowed, else `resolve_binding` + `put_value`. Returns the stored
+    /// value.
+    pub store_ident: Option<extern "C" fn(vm: *mut c_void, name: u64, value: u64) -> u64>,
     /// `Step::TypeofIdent`: `typeof` of a name resolved through the
     /// environment chain; returns the `typeof` string (`"undefined"` when the
     /// reference is unresolvable).
@@ -958,6 +967,7 @@ impl JitHelpers {
             set_global: None,
             set_global_slot: None,
             load_ident: None,
+            store_ident: None,
             typeof_ident: None,
             resolve_var_ident: None,
             put_var_reference: None,
@@ -1111,6 +1121,7 @@ impl JitHelpers {
             Helper::SetGlobal => self.set_global.map(|f| f as usize as u64),
             Helper::SetGlobalSlot => self.set_global_slot.map(|f| f as usize as u64),
             Helper::LoadIdent => self.load_ident.map(|f| f as usize as u64),
+            Helper::StoreIdent => self.store_ident.map(|f| f as usize as u64),
             Helper::TypeofIdent => self.typeof_ident.map(|f| f as usize as u64),
             Helper::ResolveVarIdent => self.resolve_var_ident.map(|f| f as usize as u64),
             Helper::PutVarReference => self.put_var_reference.map(|f| f as usize as u64),
@@ -1381,6 +1392,12 @@ pub extern "C" fn test_set_global_slot(
 /// Returns 42 — proves `load_ident` was called with the right ABI.
 pub extern "C" fn test_load_ident(_vm: *mut c_void, _name: u64) -> u64 {
     Value::Number(42.0).bits()
+}
+
+/// Returns the stored value — proves `store_ident` was called with the right
+/// ABI.
+pub extern "C" fn test_store_ident(_vm: *mut c_void, _name: u64, value: u64) -> u64 {
+    value
 }
 
 /// Returns the string `"undefined"` — proves `typeof_ident` was called with
@@ -2230,6 +2247,7 @@ mod tests {
             Helper::GetGlobal,
             Helper::SetGlobal,
             Helper::LoadIdent,
+            Helper::StoreIdent,
             Helper::ResolveVarIdent,
             Helper::PutVarReference,
             Helper::UpdateIdent,
@@ -2256,6 +2274,7 @@ mod tests {
         assert_eq!(Helper::GetGlobal.name(), "get_global");
         assert_eq!(Helper::SetGlobal.name(), "set_global");
         assert_eq!(Helper::LoadIdent.name(), "load_ident");
+        assert_eq!(Helper::StoreIdent.name(), "store_ident");
         assert_eq!(Helper::TypeofIdent.name(), "typeof_ident");
         assert_eq!(Helper::ResolveVarIdent.name(), "resolve_var_ident");
         assert_eq!(Helper::PutVarReference.name(), "put_var_reference");

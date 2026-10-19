@@ -858,6 +858,10 @@ pub struct JitSlowPaths {
     /// The identifier read a certified body uses for an outer/global binding
     /// (`resolve_binding` + `get_value`); `name` is an `AtomId`.
     pub load_ident: extern "C" fn(ctx: *mut c_void, name: u64) -> u64,
+    /// The matching write: the global store cell when the body's globals are
+    /// unshadowed, else `resolve_binding` + `put_value`. Returns the stored
+    /// value.
+    pub store_ident: extern "C" fn(ctx: *mut c_void, name: u64, value: u64) -> u64,
     /// `Step::TypeofIdent`: `typeof` of a name that resolves through the
     /// environment chain; `name` is an `AtomId`. Returns the `typeof` string —
     /// `"undefined"` for an unresolvable reference, per spec 13.5.3.2 step 1.
@@ -1382,6 +1386,7 @@ pub static JIT_SLOW_PATHS: JitSlowPaths = JitSlowPaths {
     set_global,
     set_global_slot,
     load_ident,
+    store_ident,
     typeof_ident,
     resolve_var_ident,
     put_var_reference,
@@ -3357,6 +3362,34 @@ extern "C" fn load_ident(ctx: *mut c_void, name: u64) -> u64 {
         vm.warm_global_cell(agent, name_atom, value, declarative);
     }
     value.bits()
+}
+
+/// `Step::StoreIdent`: the certified body's environment-resolved write.
+/// With the body's globals unshadowed the name resolves at the global
+/// environment record, so the same store cell `StoreGlobal` uses applies;
+/// otherwise resolve the producing environment and put. Returns the stored
+/// value (the assignment's result).
+extern "C" fn store_ident(ctx: *mut c_void, name: u64, value: u64) -> u64 {
+    let ctx = unsafe { ctx_of(ctx) };
+    let agent = unsafe { &mut *ctx.agent };
+    let vm = unsafe { &mut *ctx.vm };
+    let value = Value::from_bits(value);
+    let name_atom = name as crux::AtomId;
+    let result = if ctx.globals_unshadowed {
+        vm.store_ident_value(agent, name_atom, value, true)
+    } else {
+        match vm.var_ref_stack.pop() {
+            Some(reference) => crate::context::put_value(agent, &reference, value),
+            None => Err(JsError::new(
+                ErrorKind::SyntaxError,
+                "StoreIdent without a resolution".into(),
+            )),
+        }
+    };
+    match result {
+        Ok(()) => value.bits(),
+        Err(error) => slow_error(ctx, error),
+    }
 }
 
 /// `Step::TypeofIdent`: `typeof` of a name that resolves through the
@@ -7445,6 +7478,7 @@ mod tests {
         assert_ne!(JIT_SLOW_PATHS.get_global as usize, 0);
         assert_ne!(JIT_SLOW_PATHS.set_global as usize, 0);
         assert_ne!(JIT_SLOW_PATHS.load_ident as usize, 0);
+        assert_ne!(JIT_SLOW_PATHS.store_ident as usize, 0);
         assert_ne!(JIT_SLOW_PATHS.typeof_ident as usize, 0);
         assert_ne!(JIT_SLOW_PATHS.resolve_var_ident as usize, 0);
         assert_ne!(JIT_SLOW_PATHS.put_var_reference as usize, 0);

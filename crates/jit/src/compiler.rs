@@ -504,6 +504,8 @@ fn step_name(step: &Step) -> &'static str {
         | Step::TailCallSelfCheckVector => "TailCall",
         Step::Throw { .. } => "Throw",
         Step::LoadIdent { .. } => "LoadIdent",
+        Step::StoreIdent { .. } => "StoreIdent",
+        Step::ResolveIdentStore { .. } => "ResolveIdentStore",
         Step::Unary(_) => "Unary",
         Step::TypeofIdent { .. } => "TypeofIdent",
         Step::EnterTry { .. } => "EnterTry",
@@ -7897,11 +7899,48 @@ impl<'a> Lowerer<'a> {
                 let _res = self.call_slow(self.sig_bool, Helper::ResolveVarIdent, &[name_imm])?;
                 self.fall_through(index);
             }
+            Step::ResolveIdentStore { name } => {
+                // Resolve the store target before the RHS only when the
+                // runtime chain is shadowed; the clean path skips the walk
+                // entirely (the machine code branches on the ctx flag).
+                let ctx = self.vm();
+                let clean = self.builder.ins().load(
+                    types::I8,
+                    MemFlagsData::new(),
+                    ctx,
+                    Offset32::new(std::mem::offset_of!(JitCallContext, globals_unshadowed) as i32),
+                );
+                let merge = self.builder.create_block();
+                let slow = self.builder.create_block();
+                let clean_ok = self.builder.ins().icmp_imm_u(IntCC::NotEqual, clean, 0);
+                let clean_ok_64 = self.bint(clean_ok);
+                self.builder.ins().brif(clean_ok_64, merge, &[], slow, &[]);
+                self.builder.switch_to_block(slow);
+                let name_imm = self.builder.ins().iconst(types::I64, *name as i64);
+                let _res = self.call_slow(self.sig_bool, Helper::ResolveVarIdent, &[name_imm])?;
+                self.builder.ins().jump(merge, &[]);
+                self.builder.seal_block(merge);
+                self.builder.switch_to_block(merge);
+                self.fall_through(index);
+            }
             Step::PutVarReference => {
                 // The assignment's value is re-pushed after the store (the
                 // interpreter's handler pushes it back).
                 let value = self.pop();
                 let stored = self.call_slow(self.sig_bool, Helper::PutVarReference, &[value])?;
+                self.push(stored);
+                self.fall_through(index);
+            }
+            Step::StoreIdent { name } => {
+                // The certified body's environment-resolved store: one helper
+                // call that takes the global-value cell fast path when the
+                // ctx says the body's globals are unshadowed, and the dynamic
+                // resolve otherwise. The value is re-pushed as the
+                // assignment's result.
+                let value = self.pop();
+                let name_imm = self.builder.ins().iconst(types::I64, *name as i64);
+                let stored =
+                    self.call_slow(self.sig_update, Helper::StoreIdent, &[name_imm, value])?;
                 self.push(stored);
                 self.fall_through(index);
             }

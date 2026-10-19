@@ -1022,6 +1022,23 @@ pub enum Step {
     StoreGlobal {
         name: crux::AtomId,
     },
+    /// Resolve the target of a following `StoreIdent` before the RHS
+    /// evaluates (spec 13.15.3 steps 1, 5): a `with` binding the RHS deletes
+    /// must still be the PutValue target. The certified-body fast path skips
+    /// the resolve when the runtime chain is unshadowed; a shadowed body keeps
+    /// the pre-resolved reference for `StoreIdent` to pop and put.
+    ResolveIdentStore {
+        name: crux::AtomId,
+    },
+    /// Store the value on top into an environment-resolved binding, leaving
+    /// the value as the expression result. Emitted only for a certified body
+    /// (`Compiler::scope` is `Some`), where the scope analysis has excluded
+    /// `with`/eval and the pre-resolved-reference rule cannot be observed. At
+    /// run time the body's `globals_unshadowed` gate decides between the
+    /// global store cell (the fast path) and the dynamic environment resolve.
+    StoreIdent {
+        name: crux::AtomId,
+    },
     /// Apply `++`/`--` to a top-level `var`, pushing the result (old for
     /// postfix, new for prefix).
     UpdateGlobal {
@@ -5010,6 +5027,71 @@ impl Vm {
         Ok(())
     }
 
+    /// Write an environment-resolved identifier from a certified body's
+    /// `StoreIdent`: the global store cell when the body's globals are
+    /// unshadowed and the cached binding is an own writable data property,
+    /// otherwise the full environment resolve. A declarative binding records
+    /// a load-only cell (slot `u32::MAX`), so it always takes the resolve
+    /// path — `store_global_value` would write a shadow property on the
+    /// global object instead of the lexical binding.
+    pub(crate) fn store_ident_value(
+        &mut self,
+        agent: &mut Agent,
+        name: crux::AtomId,
+        value: Value,
+        clean: bool,
+    ) -> Result<(), JsError> {
+        if clean && self.try_global_cell_store(agent, name, value)? {
+            return Ok(());
+        }
+        let reference = crate::context::resolve_binding(agent, &crux::lookup(name), self.strict)?;
+        crate::context::put_value(agent, &reference, value)?;
+        // Warm the cell for the next read/write: an object-record data
+        // property records its slot; a declarative binding records load-only.
+        if let crate::context::ReferenceBase::Environment(env) = &reference.base
+            && let crate::env::EnvRecord::Global(_) = &**env
+        {
+            let declarative = env.has_lexical_declaration(&crux::lookup(name));
+            self.warm_global_cell(agent, name, value, declarative);
+        }
+        Ok(())
+    }
+
+    /// The `StoreIdent` fast path: write the JIT global-value cell's slot
+    /// when the cell is current and names an own writable data property.
+    /// Returns `false` when the caller must resolve the binding instead.
+    fn try_global_cell_store(
+        &mut self,
+        agent: &mut Agent,
+        name: crux::AtomId,
+        value: Value,
+    ) -> Result<bool, JsError> {
+        let cell = agent.global_value_cells[Self::global_cell_index(name)];
+        if cell.name != name || cell.slot == u32::MAX {
+            return Ok(false);
+        }
+        let global = self.global_object(agent)?;
+        if cell.global_id != global.id() || cell.generation != global.generation() {
+            return Ok(false);
+        }
+        let slot = cell.slot as usize;
+        let mut props = global.properties.borrow_mut();
+        if let Some((key, property)) = props.get_mut(slot)
+            && *key == crux::property::PropertyKey::String(name)
+            && let crux::object::PropertyKind::Data {
+                writable: true,
+                value: cell_value,
+            } = &mut property.kind
+        {
+            crux::heap::write_barrier(&*global, value);
+            *cell_value = value;
+            drop(props);
+            Self::record_global_cell(agent, name, value, &global, Some(slot));
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
     /// The `++`/`--` fast path on a declared top-level `var`: read, update,
     /// and write through one direct-mapped probe and one property-vector
     /// borrow — the composed load/store takes two of each. Returns the
@@ -7800,6 +7882,39 @@ impl Vm {
                 Step::StoreGlobal { name } => {
                     let value = self.pop();
                     self.store_global_value(agent, *name, value)?;
+                }
+                Step::ResolveIdentStore { name } => {
+                    // The certified store's target: resolve it before the RHS
+                    // only when the chain is not clean (a `with`/outer
+                    // binding), preserving the reference-before-RHS rule.
+                    if !(body.env_constant && self.globals_unshadowed) {
+                        let reference = crate::context::resolve_binding(
+                            agent,
+                            &crux::lookup(*name),
+                            self.strict,
+                        )?;
+                        self.var_ref_stack.push(reference);
+                    }
+                }
+                Step::StoreIdent { name } => {
+                    // The certified-body store: a clean chain lets the global
+                    // store cell apply; a shadowing/declarative binding takes
+                    // the pre-resolved reference (or the environment resolve
+                    // for a declarative cell). The value stays as the
+                    // expression result.
+                    let value = self.pop();
+                    if body.env_constant && self.globals_unshadowed {
+                        self.store_ident_value(agent, *name, value, true)?;
+                    } else {
+                        let reference = self.var_ref_stack.pop().ok_or_else(|| {
+                            JsError::new(
+                                ErrorKind::SyntaxError,
+                                "StoreIdent without a resolution".into(),
+                            )
+                        })?;
+                        crate::context::put_value(agent, &reference, value)?;
+                    }
+                    self.stack.push(value);
                 }
                 Step::InitLocal { slot } => {
                     let value = self.pop();
@@ -21859,18 +21974,32 @@ impl Compiler {
                     BindingLoc::Env => {
                         match op {
                             AssignOp::Assign => {
-                                // Resolve the reference before the RHS: PutValue
-                                // uses the initially created reference even if
-                                // the binding disappears while the RHS evaluates
-                                // (spec 13.15.3 steps 1, 5 — e.g. a `with`
-                                // scope whose binding the RHS deletes).
-                                self.emit(Step::ResolveVarIdent { name: *name });
-                                self.begin_named_initializer(*name, value);
-                                self.compile_expr(value)?;
-                                if set_name {
-                                    self.emit(Step::SetFunctionName { name: *name });
+                                if self.scope.is_some() {
+                                    // A certified body resolves the target up
+                                    // front only when the runtime chain turns
+                                    // out to be shadowed; the clean path skips
+                                    // the resolve entirely.
+                                    self.emit(Step::ResolveIdentStore { name: *name });
+                                    self.begin_named_initializer(*name, value);
+                                    self.compile_expr(value)?;
+                                    if set_name {
+                                        self.emit(Step::SetFunctionName { name: *name });
+                                    }
+                                    self.emit(Step::StoreIdent { name: *name });
+                                } else {
+                                    // Resolve the reference before the RHS: PutValue
+                                    // uses the initially created reference even if
+                                    // the binding disappears while the RHS evaluates
+                                    // (spec 13.15.3 steps 1, 5 — e.g. a `with`
+                                    // scope whose binding the RHS deletes).
+                                    self.emit(Step::ResolveVarIdent { name: *name });
+                                    self.begin_named_initializer(*name, value);
+                                    self.compile_expr(value)?;
+                                    if set_name {
+                                        self.emit(Step::SetFunctionName { name: *name });
+                                    }
+                                    self.emit(Step::PutVarReference);
                                 }
-                                self.emit(Step::PutVarReference);
                             }
                             AssignOp::AndAssign | AssignOp::OrAssign | AssignOp::NullishAssign => {
                                 self.emit(Step::LoadIdent { name: *name });
@@ -21893,10 +22022,23 @@ impl Compiler {
                                 self.place(end_label);
                             }
                             _ => {
-                                self.emit(Step::ResolveVarIdent { name: *name });
-                                self.emit(Step::GetVarReference);
-                                self.compile_expr(value)?;
-                                self.emit(Step::PutVarReferenceOp { op: *op });
+                                if self.scope.is_some() {
+                                    // The certified body's read is the
+                                    // `LoadIdent` cell fast path; the store is
+                                    // the matching `StoreIdent`. The target's
+                                    // reference resolves first (for a shadowed
+                                    // chain) as spec 13.15.3 requires.
+                                    self.emit(Step::ResolveIdentStore { name: *name });
+                                    self.emit(Step::LoadIdent { name: *name });
+                                    self.compile_expr(value)?;
+                                    self.emit(Step::Binary(crate::expr::compound_binary(*op)));
+                                    self.emit(Step::StoreIdent { name: *name });
+                                } else {
+                                    self.emit(Step::ResolveVarIdent { name: *name });
+                                    self.emit(Step::GetVarReference);
+                                    self.compile_expr(value)?;
+                                    self.emit(Step::PutVarReferenceOp { op: *op });
+                                }
                             }
                         }
                         Ok(())
@@ -23859,6 +24001,8 @@ pub fn max_stack_usage(steps: &[Step]) -> usize {
             // re-pushes (net 0); the identifier update pops and re-pushes.
             Step::TypeofIdent { .. } => depth += 1,
             Step::LoadIdent { .. } => depth += 1,
+            Step::StoreIdent { .. } => {}
+            Step::ResolveIdentStore { .. } => {}
             Step::ResolveVarIdent { .. } => {}
             Step::PutVarReference => {}
             Step::UpdateIdent { .. } => {}
@@ -24651,7 +24795,9 @@ pub(crate) fn body_has_call_intrinsic(steps: &[Step]) -> bool {
 pub(crate) fn collect_ident_names(steps: &[Step]) -> Vec<crux::AtomId> {
     let mut names: Vec<crux::AtomId> = Vec::new();
     for step in steps {
-        if let Step::LoadIdent { name } = step
+        if let Step::LoadIdent { name }
+        | Step::StoreIdent { name }
+        | Step::ResolveIdentStore { name } = step
             && !names.contains(name)
         {
             names.push(*name);
@@ -24711,6 +24857,8 @@ fn steps_are_leaf(steps: &[Step]) -> bool {
                 // the caller's env, so every reference-resolution and
                 // reference-machinery step is out.
                 | Step::LoadIdent { .. }
+                | Step::StoreIdent { .. }
+                | Step::ResolveIdentStore { .. }
                 | Step::ResolveVarIdent { .. }
                 | Step::GetVarReference
                 | Step::GetVarReferenceThis
