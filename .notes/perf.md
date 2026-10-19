@@ -14448,4 +14448,80 @@ is less work in the paths a frame actually uses. `new` at +5% is within
 noise and is worth watching if allocation-heavy phases regress later.
 
 Next real-workload target: `tufts` is still the largest phase at 7.77 ms
-after -26%; a sampling profile of that phase is the useful next input.
+after -26%; a sampling profile of that phase is the useful next input. That
+profile is below.
+
+### MEASURED (2026-10-19): Goats `tufts` — one global write, not allocation
+
+The phase-internal split (`perf on`) put almost all of `tufts` in the draw
+loop, and the draw loop's floor was a single global read-modify-write:
+
+| part | before | after |
+| --- | ---: | ---: |
+| `tuft_setup` (shader + uniforms) | 0.09 | 0.09 |
+| `tuft_field` (hash, `EATEN`, height cache) | 0.62 | 0.65 |
+| `tuft_draw` (water test + cubes) | **6.70** | **0.50** |
+| tail (`endShaderMode`) | 0.03 | 0.03 |
+| `shadow_grass` (same work) | 1.27 | **0.41** |
+
+The field is cheap: ~625 cells of `Set.has` / `Map.get` / hashing / terrain
+sampling cost 0.64 ms, matching the `mapget`/`maphas` micro-results.
+
+Ablations inside the draw loop:
+
+| ablation | `tuft_draw` ms |
+| --- | ---: |
+| none | 6.70 |
+| water check removed | 4.65 |
+| cube submissions removed | 4.96 |
+| both removed | 2.84 |
+
+The 2.84 ms floor was `perfCubes += t.d ? 2 : 1;` running once per tuft.
+Replacing it with a local accumulator and writing `perfCubes` once after the
+loop made `tuft_draw` 0.50 ms and `shadow_grass` 0.41 ms with identical
+geometry and cube count.
+
+The global **reads** are not the issue: the same loop with a local
+accumulator and `TUFT_POOL` / `waterSubmergedAt` / `rl` still reads 0.50 ms.
+The write was not just its own cost — with the global reads present it made
+the rest of the loop pathological.
+
+Frame-level, same session, clean `n=240` window:
+
+| | before | after |
+| --- | ---: | ---: |
+| CPU sum (all phases) | 16.53 ms | **9.61 ms** |
+| `boundary` (swap wait) | 0.05 ms | **6.72 ms** |
+| worst / slow frames | — | 17.9 ms / **0** |
+| fps | CPU-bound | **59-60** |
+
+About 42% less CPU per frame, and genuinely vsync-bound. The next-largest
+phases are `mods_upd` (1.13 ms), `tuft_field` (0.65 ms) and `bots` (0.48 ms).
+
+This was a client-side fix (accumulate locally, publish once), not an
+allocation-latency result.
+
+An engine-side probe isolates the write (5,000,000 iterations, min of 5):
+
+| shape | JIT ms | jitless ms |
+| --- | ---: | ---: |
+| `var acc` local to the function | 3.6 | 114.9 |
+| top-level `var acc` compound assign | **960.0** | 1084.8 |
+| top-level `let acc` compound assign | **362.5** | 504.4 |
+| top-level `var acc` simple assign | **698.9** | 755.1 |
+| read-only `g` from the global | 3.9 | 43.0 |
+| `globalThis.acc += ...` | 147.5 | 258.4 |
+
+`JIT_HELPER_STATS=1` shows one `ResolveVarIdent`, one `GetVarReference` and
+one `PutVarReferenceOp` per iteration — the generic reference machinery —
+while a global read is a single `LoadIdent` cell hit. The compiler classifies
+a function body's script-global write as `BindingLoc::Env`, and there is no
+`StoreIdent` analogue of `LoadIdent`; the inlined global-value store cell
+exists only for certified top-level script code (`StoreGlobal`).
+
+The engine-side fix is a `StoreIdent` step gated exactly like `LoadIdent`
+(env-constant body + unshadowed chain), with the JIT inlining the same
+global-value cell `StoreGlobal` uses and falling back to the reference path
+when the cell is stale or the property is not a writable data slot. Both
+`var` shapes (global object) and `let` shapes (declarative record) want the
+same step; the declarative record additionally needs a slot for its value.
