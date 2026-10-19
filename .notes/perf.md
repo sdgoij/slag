@@ -14343,4 +14343,55 @@ read problem: `small.toSorted()` is 144 ms jitless, `small.slice()` is 26 ms,
 and `slice().sort()` is 153 ms. The sort itself costs ~1.3 us for four
 elements because `sort_indexed_properties` pays a string-keyed
 `HasProperty`/`Get`/`Set` per element. A dense-array fast path for the
-default comparator is the follow-up.
+default comparator landed below.
+
+### LANDED (2026-10-19): dense-array default sort
+
+`sort_indexed_properties` now takes a direct-slot path when the comparator is
+`undefined`, the receiver is a `dense` Array whose element count equals its
+length, every element is present (no `Value::hole()`) and every element is a
+primitive that runs no user code (Number, String, Boolean, Undefined, Null,
+BigInt). The path copies the element buffer, precomputes each `ToString` once
+(pure and deterministic for those kinds, so the per-comparison reduction is
+unobservable), sorts on the text, writes back through
+`write_barrier_element`, and bumps the receiver generation. Holes, objects,
+Symbols (their `ToString` throws and the throw order is observable) and a
+supplied `comparefn` keep the generic string-keyed
+`HasProperty`/`Get`/`Set` path unchanged.
+
+The cost the path removes is the generic machinery, not the comparison: the
+old path materialised a `PropertyKey` string and did a prototype-aware
+`HasProperty`, `Get` and `Set` for each of four elements, ~1.3 us per sort.
+
+Same-source interleaved A/B (baseline built from the commit without the fast
+path, alternating order, 16 pairs, min/mean ms):
+
+| probe (100k sorts) | jit base | jit new | jitless base | jitless new |
+| --- | --- | --- | --- | --- |
+| `opcost/array_to_sorted` (`toSorted`) | 129.1/134.2 | 32.9/34.3 (-74%) | 142.7/146.6 | 44.8/46.0 (-69%) |
+| `slice().sort()` | 139.9/144.4 | 39.0/40.0 (-72%) | 152.9/154.5 | 50.1/50.8 (-67%) |
+| `[4,2,3,1].sort()` | 124.9/128.5 | 28.9/29.4 (-77%) | 136.5/138.2 | 38.2/39.1 (-72%) |
+| `["d","b","c","a"].sort()` | 117.2/118.7 | 27.1/27.7 (-77%) | 130.1/131.1 | 36.6/36.8 (-72%) |
+| control: `sort(cmp)` (generic path) | 148.5/150.2 | 148.8/150.9 (+0.5%) | 156.0/158.3 | 155.1/159.1 (+0.5%) |
+| control: `slice()` only | 18.3/18.6 | 18.1/18.6 (+0.1%) | 25.2/25.8 | 24.9/26.0 (+0.6%) |
+
+Whole corpus, 5 interleaved pairs, per-row min: default JIT total
+2891.6 -> 2784.1 ms (-3.7%, `array_to_sorted` 142.0 -> 36.3), jitless total
+5891.5 -> 5866.7 ms (-0.4%, `array_to_sorted` 144.9 -> 46.1), value parity 0.
+Two jitless rows move the wrong way consistently: `arrays/index_loop`
+89.1 -> 101.8 ms and `control/nested_loops` 102.5 -> 124.1 ms (focused
+16-pair rerun: +12% and +20% by mean). Neither calls sort; the change touches
+only `sort_indexed_properties`, so this is the usual LTO placement effect of
+adding code, recorded rather than chased.
+
+Verified: the semantic probes (numbers, string order, mixed primitives,
+holes including prototype-provided hole reads, `toSorted` copy/immutability,
+stable generic sort, Symbol TypeError, frozen array TypeError with the array
+unchanged, sealed array, `new Array(n)` tail holes, `-0`/NaN, non-writable
+element, preventExtensions) print identically on the baseline and new
+binaries in both modes; clippy `-D warnings`; `cargo test --workspace`; corpus
+parity 0; test262 48,633 + 3,365 at 100%.
+
+The class-parts commit also dropped the GC edge for `EcmaFunction`'s inline
+`private_environment`; that is fixed separately and is not part of this
+measurement.

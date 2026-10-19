@@ -2159,6 +2159,47 @@ fn sort_indexed_properties(
     // allocates) — suppress `--gc-stress` for the whole sort so the buffer
     // cannot be swept out from under the comparisons.
     let _stress = crate::ir::StressSuppress::new();
+    // Fast path: a dense Array whose every index is a present primitive and
+    // whose comparator is the default. A primitive's `ToString` runs no user
+    // code, so nothing can mutate the receiver between collection and
+    // write-back, and the generic per-element `HasProperty`/`Get`/`Set`
+    // string-key machinery is equivalent to direct slot access. Holes,
+    // object elements (their `ToString` can mutate the array), symbols (the
+    // throw order is observable) and a supplied `comparefn` keep the generic
+    // path.
+    if matches!(comparefn.kind(), ValueKind::Undefined)
+        && let ValueKind::Object(object_ref) = object.kind()
+        && let crux::object::ObjectKind::Array(slots) = &object_ref.kind
+        && slots.dense.get()
+    {
+        let direct = {
+            let elements = slots.elements();
+            (elements.len() as u64 == length
+                && elements
+                    .iter()
+                    .all(|value| !value.is_hole() && pure_default_sort_element(value)))
+            .then(|| elements.to_vec())
+        };
+        if let Some(items) = direct {
+            // Precompute the default comparator's text once per element: the
+            // spec calls ToString per comparison, but for these primitives it
+            // is pure and deterministic, so the reduction is unobservable.
+            let mut keyed: Vec<(Value, JsString)> = Vec::with_capacity(items.len());
+            for value in items {
+                let text = crate::context::to_string(agent, &value)?;
+                keyed.push((value, text));
+            }
+            keyed.sort_by(|(_, a), (_, b)| a.as_slice().cmp(b.as_slice()));
+            let mut elements = slots.elements_mut();
+            for (j, (value, _)) in keyed.iter().enumerate() {
+                crux::heap::write_barrier_element(&**slots, *value, j as u64);
+                elements[j] = *value;
+            }
+            drop(elements);
+            object_ref.bump_generation();
+            return Ok(());
+        }
+    }
     let mut items: Vec<Value> = Vec::new();
     for k in 0..length {
         let name = key(k);
@@ -2191,6 +2232,21 @@ fn sort_indexed_properties(
         delete_property_or_throw(object, &key(k))?;
     }
     Ok(())
+}
+
+/// Whether a value's default `ToString` runs no user code and cannot mutate
+/// the array being sorted: every primitive except a Symbol (whose ToString
+/// throws, and the throw order is observable, so it keeps the generic path).
+fn pure_default_sort_element(value: &Value) -> bool {
+    matches!(
+        value.kind(),
+        ValueKind::Number(_)
+            | ValueKind::String(_)
+            | ValueKind::Boolean(_)
+            | ValueKind::Undefined
+            | ValueKind::Null
+            | ValueKind::BigInt(_)
+    )
 }
 
 /// spec 23.1.3.29 Array.prototype.sort.
