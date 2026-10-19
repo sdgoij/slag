@@ -422,44 +422,45 @@ Gap = Slag ms / V8 ms, so > 1 means V8 was faster:
 
 | Family | Workloads | JIT gap | Interpreter gap |
 |---|---|---|---|
-| arrays | 6 | 18.23x | 4.10x |
-| builtins | 5 | 10.28x | 5.10x |
-| calls | 6 | 11.42x | 5.46x |
-| control | 5 | 17.89x | 5.15x |
-| globals | 4 | 2.14x | 0.75x |
-| language | 3 | 11.42x | 9.05x |
-| objects | 7 | 66.63x | 2.90x |
-| opcost | 36 | 23.20x | 4.77x |
-| strings | 5 | 23.03x | 17.53x |
-| **All** | **77** | **23.09x** | **5.43x** |
+| arrays | 6 | 11.22x | 4.26x |
+| builtins | 5 | 8.34x | 4.28x |
+| calls | 6 | 11.69x | 5.30x |
+| control | 5 | 14.84x | 4.26x |
+| globals | 4 | 2.69x | 0.70x |
+| language | 3 | 9.92x | 8.40x |
+| objects | 7 | 9.59x | 2.74x |
+| opcost | 36 | 16.14x | 4.38x |
+| strings | 5 | 14.95x | 4.90x |
+| **All** | **77** | **13.21x** | **4.28x** |
 
 A sample of the per-workload rows (the command above prints all 77), ms per
 `bench()` call:
 
 | Workload | Slag JIT | Slag interp | V8 JIT | V8 `--jitless` | JIT gap | Interp gap |
 |---|---|---|---|---|---|---|
-| `arrays/for_of_dense.js` | 7.8 | 54.7 | 1.8 | 61.2 | 4.32x | 0.89x |
-| `arrays/typed_array.js` | 31.3 | 186.4 | 1.1 | 46.0 | 29.18x | 4.06x |
-| `builtins/json_roundtrip.js` | 59.5 | 61.5 | 12.8 | 15.4 | 4.64x | 3.98x |
-| `builtins/math_intrinsics.js` | 10.1 | 64.2 | 147.9 | 177.9 | 0.07x | 0.36x |
-| `calls/direct_leaf.js` | 10.9 | 74.2 | 1.1 | 36.2 | 9.60x | 2.05x |
-| `calls/recursive_fib.js` | 57.3 | 504.7 | 7.1 | 34.0 | 8.04x | 14.86x |
-| `control/generator_loop.js` | 93.9 | 116.8 | 2.3 | 9.5 | 41.37x | 12.31x |
-| `globals/declarative_read.js` | 2.4 | 16.0 | 0.6 | 12.8 | 4.23x | 1.25x |
-| `globals/hoisted_local.js` | 2.4 | 16.2 | 0.6 | 12.0 | 4.29x | 1.35x |
-| `globals/nested_read.js` | 2.4 | 15.3 | 88.1 | 99.2 | 0.03x | 0.15x |
-| `globals/object_read.js` | 2.4 | 22.6 | 81.5 | 93.1 | 0.03x | 0.24x |
-| `objects/destructure.js` | 295.6 | 246.9 | 0.8 | 52.3 | 390.81x | 4.72x |
-| `objects/own_read.js` | 2.9 | 34.2 | 1.2 | 65.1 | 2.35x | 0.53x |
-| `objects/warm_store.js` | 57.5 | 100.9 | 2.3 | 51.3 | 25.44x | 1.97x |
-| `strings/char_ops.js` | 11.3 | 21.2 | 0.4 | 5.4 | 30.20x | 3.93x |
+| `arrays/for_of_dense.js` | 7.5 | 55.6 | 1.8 | 61.4 | 4.12x | 0.91x |
+| `arrays/typed_array.js` | 24.9 | 192.5 | 1.1 | 39.3 | 21.86x | 4.89x |
+| `builtins/json_roundtrip.js` | 61.5 | 58.1 | 13.3 | 15.3 | 4.61x | 3.79x |
+| `builtins/math_intrinsics.js` | 11.0 | 68.4 | 147.9 | 179.1 | 0.07x | 0.38x |
+| `calls/direct_leaf.js` | 12.7 | 77.2 | 1.1 | 38.1 | 11.13x | 2.03x |
+| `calls/recursive_fib.js` | 48.5 | 503.0 | 7.3 | 36.9 | 6.64x | 13.63x |
+| `control/generator_loop.js` | 63.0 | 89.9 | 2.3 | 9.3 | 27.11x | 9.69x |
+| `globals/declarative_read.js` | 2.4 | 17.0 | 0.6 | 14.9 | 4.25x | 1.14x |
+| `globals/hoisted_local.js` | 3.7 | 16.8 | 0.6 | 12.5 | 6.45x | 1.34x |
+| `globals/nested_read.js` | 2.5 | 16.0 | 87.3 | 107.8 | 0.03x | 0.15x |
+| `globals/object_read.js` | 2.4 | 16.2 | 81.3 | 101.0 | 0.03x | 0.16x |
+| `objects/destructure.js` | 4.9 | 144.8 | 0.8 | 50.0 | 6.44x | 2.89x |
+| `objects/own_read.js` | 2.9 | 32.0 | 1.2 | 50.8 | 2.35x | 0.63x |
+| `objects/warm_store.js` | 29.7 | 117.3 | 2.3 | 59.7 | 13.02x | 1.96x |
+| `strings/char_ops.js` | 12.0 | 23.5 | 0.4 | 6.8 | 32.00x | 3.47x |
 
 The `globals` family is the one family that is a controlled experiment rather
 than a workload: the same loop reading the same value as a top-level `const`
 (`declarative_read`), hoisted into a local first (`hoisted_local`), read through
 the global object (`object_read`), and read through the same global object from a
 helper nested inside another function (`nested_read` — the shape a mod's kernels
-have). All four still measure the same ~2.6 ms. Two gaps were closed there: the cell
+have). All four stay in a 2.4-3.6 ms band, with `hoisted_local` the slowest at
+~3.5 ms (reproduced across three runs). Two gaps were closed there: the cell
 was never warmed for the global env's declarative record (a top-level `const`
 cost 52.5 ms — 21x), and it was never *probed* from a body whose env chain was
 not the bare global record (a nested helper's global read cost 130.2 ms per 1M
@@ -471,8 +472,8 @@ mutation, and because an in-place member write to a global refreshes the cell
 
 Read the gaps as "where the work is", not as a verdict on the engine shape:
 the corpus's own README records the workloads V8 folds or scalar-evolves to a
-near-constant (which is why `destructure` and the other such rows have
-outsized JIT ratios), and a sub-1 gap means Slag was faster on that workload.
+near-constant, so a row's JIT ratio can measure V8's specialization as much as
+Slag's machinery; a sub-1 gap means Slag was faster on that workload.
 
 ### Against the previous release (`v0.1.0-preview.2`)
 
@@ -494,35 +495,35 @@ more while the rest are flat:
 
 The corpus moved further, but its headline needs a caveat read first. Overall
 the corpus means went from `mean-jitGap` 116.05 / `mean-jlGap` 9.19 to
-**23.09** / **5.43** — yet that is dominated by the `opcost` family (36 of the
+**13.21** / **4.28** — yet that is dominated by the `opcost` family (36 of the
 77 rows), and `tools/corpus/README.md` says a two-binary pair is a measurement
 only if each binary's own control row is stable: *"If a binary's own control
 row — `baseline` — has moved, the pair is not a measurement of anything."* It
 moved here, 2.4 ms → 0.3 ms — a real ~8x gain on the `i & MASK` / `| 0` bare
 loop — so the `opcost` per-row deltas are not a clean per-operation
 attribution. Excluding `opcost`, the remaining 41 rows went from a JIT gap of
-**34.81x to 23.00x** (≈1.5x closer to V8) and an interpreter gap of **6.31x to
-6.02x** (about flat):
+**34.81x to 10.63x** (≈3.3x closer to V8) and an interpreter gap of **6.31x to
+4.19x**:
 
 | Family | Workloads | JIT gap (preview.2 → now) | Interpreter gap (preview.2 → now) |
 |---|---|---|---|
-| arrays | 6 | 35.22x → 18.23x | 5.87x → 4.10x |
-| builtins | 5 | 15.22x → 10.28x | 6.64x → 5.10x |
-| calls | 6 | 24.25x → 11.42x | 5.00x → 5.46x |
-| control | 5 | 26.74x → 17.89x | 5.45x → 5.15x |
-| globals | 4 | 2.12x → 2.14x | 0.69x → 0.75x |
-| language | 3 | 13.16x → 11.42x | 7.03x → 9.05x |
-| objects | 7 | 90.32x → 66.63x | 3.24x → 2.90x |
-| strings | 5 | 36.04x → 23.03x | 17.32x → 17.53x |
-| opcost (see caveat) | 36 | 208.57x → 23.20x | 12.46x → 4.77x |
-| **All** | **77** | **116.05x → 23.09x** | **9.19x → 5.43x** |
-| **All, excluding `opcost`** | **41** | **34.81x → 23.00x** | **6.31x → 6.02x** |
+| arrays | 6 | 35.22x → 11.22x | 5.87x → 4.26x |
+| builtins | 5 | 15.22x → 8.34x | 6.64x → 4.28x |
+| calls | 6 | 24.25x → 11.69x | 5.00x → 5.30x |
+| control | 5 | 26.74x → 14.84x | 5.45x → 4.26x |
+| globals | 4 | 2.12x → 2.69x | 0.69x → 0.70x |
+| language | 3 | 13.16x → 9.92x | 7.03x → 8.40x |
+| objects | 7 | 90.32x → 9.59x | 3.24x → 2.74x |
+| strings | 5 | 36.04x → 14.95x | 17.32x → 4.90x |
+| opcost (see caveat) | 36 | 208.57x → 16.14x | 12.46x → 4.38x |
+| **All** | **77** | **116.05x → 13.21x** | **9.19x → 4.28x** |
+| **All, excluding `opcost`** | **41** | **34.81x → 10.63x** | **6.31x → 4.19x** |
 
 Only one round was run per binary, so per-workload cross-binary rows carry the
 ±warm-up band the corpus README describes; the family and overall means are the
-number to read. The shape: the JIT closed the most on arrays, calls and
-builtins, the interpreter is essentially unchanged outside `opcost`, and the
-`globals` family — already at parity — did not move.
+number to read. The shape: the JIT closed the most on objects, arrays, strings
+and calls, the interpreter improved most on strings and `opcost`, and the
+`globals` family — already at parity — is the one that did not move.
 
 ### Temporal and Intl dispatch (fixed)
 
