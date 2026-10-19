@@ -817,9 +817,16 @@ const fn round_up(n: usize, m: usize) -> usize {
 /// The open-addressed slot for a cohort address in the minor's stack-scan
 /// table. Box addresses are arena slot addresses (16-byte granularity), so
 /// the slot index is the cohort's natural key; the odd multiplier spreads it.
+/// The multiplier is the golden-ratio odd constant for the pointer width,
+/// because the address is already a `usize`: the 64-bit literal does not fit
+/// on wasm32.
 #[inline]
 fn young_slot(addr: usize, mask: usize) -> usize {
-    (addr >> 4).wrapping_mul(0x9E37_79B9_7F4A_7C15) & mask
+    #[cfg(target_pointer_width = "64")]
+    const MUL: usize = 0x9E37_79B9_7F4A_7C15;
+    #[cfg(target_pointer_width = "32")]
+    const MUL: usize = 0x9E37_79B9;
+    (addr >> 4).wrapping_mul(MUL) & mask
 }
 
 /// Align `n` up to the next multiple of `m` (a power of two).
