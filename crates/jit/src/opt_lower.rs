@@ -101,9 +101,6 @@ struct Abi {
     /// The `(vm, callee, this, argc, args, direct_eval)` signature of the
     /// general `call_slow` helper.
     sig_call_slow: SigRef,
-    /// The `(vm, callee, args, argc, slot)` signature of the env-lane helper
-    /// (`leaf_call_env`), which performs the whole call.
-    sig_call: SigRef,
     /// The `(frame, stack, ctx) -> value` signature of a compiled body's entry —
     /// the in-frame leaf lane calls the callee's entry with it directly.
     sig_entry: SigRef,
@@ -158,7 +155,6 @@ fn lower(
         sig_bool: builder.import_signature(helper_sig(&[types::I64; 2], conv)),
         sig_tdz: builder.import_signature(helper_sig(&[types::I64; 1], conv)),
         sig_call_slow: builder.import_signature(helper_sig(&[types::I64; 6], conv)),
-        sig_call: builder.import_signature(helper_sig(&[types::I64; 5], conv)),
         sig_entry: builder.import_signature(helper_sig(&[types::I64; 3], conv)),
     };
     let undefined = JsValue::Undefined.bits() as i64;
@@ -4798,28 +4794,17 @@ fn emit_leaf_call(
     let stack_ptr = builder.ins().iadd(frame_base, frame_bytes);
     emit_leaf_call_tail(builder, abi, filled, frame_base, stack_ptr, value, merge);
 
-    // The env lane: rebuild the frame first (one fill and one room check for
-    // both lanes), then `leaf_call_env` performs the whole call.
+    // The env lane: the helper rebuilds the frame and performs the whole
+    // call in one round trip (a separate fill would only add an FFI
+    // boundary; the non-aliased in-frame lane still uses it).
     builder.switch_to_block(env_lane);
-    let filled = call_helper(
-        builder,
-        helpers,
-        abi,
-        abi.sig_call_slow,
-        Helper::LeafCallFill,
-        &[callee, this, args_ptr, argc, slot],
-    )?;
-    let fill_hit = builder.ins().icmp_imm_u(IntCC::NotEqual, filled, 0);
-    let env_call = builder.create_block();
-    builder.ins().brif(fill_hit, env_call, &[], cert, &[]);
-    builder.switch_to_block(env_call);
     let result = call_helper(
         builder,
         helpers,
         abi,
-        abi.sig_call,
+        abi.sig_call_slow,
         Helper::LeafCallEnv,
-        &[callee, args_ptr, argc, slot],
+        &[callee, this, args_ptr, argc, slot],
     )?;
     // The helper returns `u64::MAX` (no `Value` encoding) to fall back.
     let env_failed = builder.ins().icmp_imm_u(IntCC::Equal, result, -1);

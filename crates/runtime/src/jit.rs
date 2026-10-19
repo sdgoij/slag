@@ -823,12 +823,18 @@ pub struct JitSlowPaths {
         slot: u64,
     ) -> u64,
     /// G13: run a certified leaf that reads its environment on the caller's
-    /// ctx and buffer (the frame was already built by `leaf_call_fill`),
-    /// swapping `body_context`/`lexical_env` around the compiled entry.
+    /// ctx and buffer, rebuilding the frame and swapping the
+    /// `body_context`/`lexical_env` around the compiled entry in one call.
     /// Returns the result bits, or `u64::MAX` to fall back to `call_slow`.
     /// `slot` is the compiled call site's record slot.
-    pub leaf_call_env:
-        extern "C" fn(ctx: *mut c_void, callee: u64, args: *mut u64, argc: u64, slot: u64) -> u64,
+    pub leaf_call_env: extern "C" fn(
+        ctx: *mut c_void,
+        callee: u64,
+        this: u64,
+        args: *mut u64,
+        argc: u64,
+        slot: u64,
+    ) -> u64,
     /// C1: run a certified (non-leaf) callee through the call-site record's
     /// cached verdict — the layout the probe cached — without the per-call
     /// `ecma_functions` re-derivation. Returns the result bits, or `u64::MAX`
@@ -3187,6 +3193,7 @@ extern "C" fn leaf_call_probe(
 extern "C" fn leaf_call_env(
     ctx: *mut c_void,
     callee: u64,
+    this: u64,
     args: *mut u64,
     argc: u64,
     slot: u64,
@@ -3210,6 +3217,21 @@ extern "C" fn leaf_call_env(
     let frame_size = info.frame_size as usize;
     let arity = info.arity as usize;
     if agent.jit_depth >= MAX_JIT_DEPTH {
+        return u64::MAX;
+    }
+    // The frame is rebuilt here, in the same call: the env swap has to span
+    // the invocation anyway, so a separate `leaf_call_fill` round trip would
+    // only add an FFI boundary (the non-aliased in-frame lane still uses the
+    // fill helper because its machine code calls the entry directly).
+    if !fill_leaf_frame(
+        info,
+        &TdzSource::Mask(info.tdz_mask),
+        this,
+        args,
+        argc as usize,
+        ctx.buf_end as usize,
+        ctx.global_bits,
+    ) {
         return u64::MAX;
     }
     let callee = Value::from_bits(callee);

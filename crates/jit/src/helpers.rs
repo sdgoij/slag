@@ -530,11 +530,19 @@ pub struct JitHelpers {
         ) -> u64,
     >,
     /// G13: run a certified leaf that reads its environment on the caller's ctx
-    /// and buffer (the frame was already built by `leaf_call_fill`), swapping
-    /// `body_context`/`lexical_env` around the compiled entry. Returns the
-    /// result bits, or `u64::MAX` to fall back to `call_slow`.
+    /// and buffer, rebuilding the frame and swapping
+    /// `body_context`/`lexical_env` around the compiled entry in one helper
+    /// call. Returns the result bits, or `u64::MAX` to fall back to
+    /// `call_slow`.
     pub leaf_call_env: Option<
-        extern "C" fn(vm: *mut c_void, callee: u64, args: *mut u64, argc: u64, slot: u64) -> u64,
+        extern "C" fn(
+            vm: *mut c_void,
+            callee: u64,
+            this: u64,
+            args: *mut u64,
+            argc: u64,
+            slot: u64,
+        ) -> u64,
     >,
     /// C1: run a certified (non-leaf) callee through the call-site record's
     /// cached verdict (see `certified_call`). Returns the result bits, or
@@ -2169,6 +2177,7 @@ pub(crate) extern "C" fn test_leaf_call_fill(
 pub(crate) extern "C" fn test_leaf_call_env(
     _vm: *mut c_void,
     _callee: u64,
+    _this: u64,
     _args: *mut u64,
     _argc: u64,
     _site: u64,

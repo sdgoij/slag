@@ -5322,25 +5322,15 @@ impl<'a> Lowerer<'a> {
         self.emit_leaf_call_tail(filled, frame_base, stack_ptr, pre_call_sp, merge)?;
         // The env lane (G13): the record says the leaf reads its environment,
         // which the machine code cannot call in-frame — the
-        // `body_context`/`lexical_env` swap has to span the call. The frame is
-        // rebuilt first through the same `leaf_call_fill` the in-frame
-        // non-aliased lane uses (one fill and one room check for both lanes),
-        // then `leaf_call_env` performs the whole call and the machine code
-        // only lands the result.
+        // `body_context`/`lexical_env` swap has to span the call. The helper
+        // rebuilds the frame and performs the whole call in one round trip
+        // (a separate `leaf_call_fill` would only add an FFI boundary; the
+        // non-aliased in-frame lane still uses it).
         self.builder.switch_to_block(env_lane);
-        let filled = self.emit_raw_call(
-            self.sig_call_slow,
-            Helper::LeafCallFill,
-            &[callee, this, args_ptr, argc, slot],
-        )?;
-        let fill_ok = self.builder.ins().icmp_imm_u(IntCC::NotEqual, filled, 0);
-        let env_call = self.builder.create_block();
-        self.builder.ins().brif(fill_ok, env_call, &[], miss, &[]);
-        self.builder.switch_to_block(env_call);
         let value = self.emit_raw_call(
-            self.sig_call,
+            self.sig_call_slow,
             Helper::LeafCallEnv,
-            &[callee, args_ptr, argc, slot],
+            &[callee, this, args_ptr, argc, slot],
         )?;
         // The helper returns `u64::MAX` (no `Value` encoding) to fall back.
         let env_failed = self.builder.ins().icmp_imm_u(IntCC::Equal, value, -1);

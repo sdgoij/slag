@@ -14624,3 +14624,37 @@ body iteration), not in the three per-iteration environment ops.
 
 Verified: clippy `-D warnings`; `cargo test --workspace`; corpus parity 0;
 test262 48,633 + 3,365 at 100%. A new lift test covers a `&&` body.
+
+### MEASURED (2026-10-19): the env-leaf call lane
+
+Four minimal 1M-iteration loops isolate the call shapes (`JIT_HELPER_STATS`;
+the counts include the corpus runner's warm/timed calls):
+
+| probe | JIT ms | probe | fill | env | cert | slow |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| leaf, no env | 5.9 | 20 | 0 | 0 | 0 | 4 |
+| leaf reading a captured var | 22.0 | 11 | 7.0M | 7.0M | 7 | 4 |
+| non-leaf (calls a leaf) | 53.5 | 16 | 0 | 0 | 6.0M | 1.0M |
+| two leafs, alternating | 11.2 | 22 | 0 | 0 | 0 | 8 |
+
+The probes are **cold** for monomorphic sites (20 first visits over 7M
+calls), so the probe is not a per-call cost. The for-in row's three
+probes/iteration are its `fns.a/b/c()` sites: the closures are recreated by
+every `__t262Body` call, so the callee identity changes and the per-site
+record misses by construction. The env leaf is the clear inefficiency: it
+paid two FFI calls per call (`leaf_call_fill` then `leaf_call_env`).
+
+`leaf_call_env` now rebuilds the frame itself and performs the call in one
+round trip, returning `u64::MAX` on a fit/eligibility failure so the site
+falls to `cert`/`call_slow` as before. Both lowerings (the baseline
+`compiler.rs` and the optimizing `opt_lower.rs`) pass the receiver with the
+six-parameter signature; the now-unused five-parameter `Abi::sig_call` is
+gone.
+
+Env-leaf probe: 22.0 -> 19.7 ms (-10%). The corpus is flat within noise
+(few rows call env-reading leaves), and parity is 0. The remaining call
+floor is `CertifiedCall` at ~53 ns for a non-leaf callee; moving it needs
+the C3 frame work, not another helper merge.
+
+Verified: clippy `-D warnings`; `cargo test --workspace`; corpus parity 0;
+test262 48,633 + 3,365 at 100%.
