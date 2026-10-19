@@ -180,6 +180,12 @@ const FLAG_YOUNG: u32 = 1 << 2;
 /// stored into it, so a minor collection must trace it. The bit is the
 /// set's dedup index (the barrier cannot afford a hash lookup per store).
 const FLAG_REMEMBERED: u32 = 1 << 3;
+/// The minor's seeding dedup: an OLD box already walked from this collection's
+/// roots or remembered set. Cleared on every distinct box the collection
+/// touched before it returns. A hash set here cost one insert per traced root
+/// (thousands per minor, mostly duplicates of a few boxes) and measured as the
+/// dominant fixed cost of a minor on an allocation loop.
+const FLAG_MINOR_SEEN: u32 = 1 << 4;
 
 /// The per-type entry points stored in every box header, so the arena walk
 /// can trace and drop a box it only knows by address.
@@ -269,6 +275,21 @@ impl GcHeader {
     #[inline]
     fn is_remembered(&self) -> bool {
         self.flags.get() & FLAG_REMEMBERED != 0
+    }
+
+    #[inline]
+    fn is_minor_seen(&self) -> bool {
+        self.flags.get() & FLAG_MINOR_SEEN != 0
+    }
+
+    #[inline]
+    fn set_minor_seen(&self, seen: bool) {
+        let flags = self.flags.get();
+        self.flags.set(if seen {
+            flags | FLAG_MINOR_SEEN
+        } else {
+            flags & !FLAG_MINOR_SEEN
+        });
     }
 
     #[inline]
@@ -759,15 +780,28 @@ pub struct Heap {
     /// scan examined (reset at the start of each collection, set by
     /// [`Heap::scan_stack`]). A `Cell` because `scan_stack` borrows `&self`.
     stack_words: Cell<usize>,
-    /// Scratch for the minor's stack scan: the cohort's addresses in ascending
-    /// order. Kept across collections so the scan does not allocate (and grow)
-    /// a fresh buffer on every minor.
-    young_sorted: Vec<usize>,
+    /// Scratch for the minor's stack scan: an open-addressed membership table
+    /// over the cohort's addresses (`0` = empty), with `young_table_len` its
+    /// live power-of-two capacity. Kept across collections so the scan does
+    /// not allocate. Replaced the previous sorted-array + binary-search form:
+    /// freeing the last cohort scrambles the next one's allocation order
+    /// (the free list is LIFO), which made the sort the dominant term of a
+    /// minor on an allocation loop (measured 1.6-21 us, bimodal).
+    young_table: Vec<usize>,
+    young_table_len: usize,
 }
 
 /// Round `n` up to the next multiple of `m` (a power of two).
 const fn round_up(n: usize, m: usize) -> usize {
     n.div_ceil(m) * m
+}
+
+/// The open-addressed slot for a cohort address in the minor's stack-scan
+/// table. Box addresses are arena slot addresses (16-byte granularity), so
+/// the slot index is the cohort's natural key; the odd multiplier spreads it.
+#[inline]
+fn young_slot(addr: usize, mask: usize) -> usize {
+    (addr >> 4).wrapping_mul(0x9E37_79B9_7F4A_7C15) & mask
 }
 
 /// Align `n` up to the next multiple of `m` (a power of two).
@@ -1669,7 +1703,8 @@ impl Heap {
             arena_low: usize::MAX,
             arena_high: 0,
             stack_words: Cell::new(0),
-            young_sorted: Vec::new(),
+            young_table: Vec::new(),
+            young_table_len: 0,
         }
     }
 
@@ -2052,8 +2087,7 @@ fn stack_bounds() -> Option<(usize, usize)> {
 
 /// The stack pointer recorded at module initialization (see `stack_bounds`).
 #[cfg(target_arch = "wasm32")]
-static WASM_STACK_HIGH: core::sync::atomic::AtomicUsize =
-    core::sync::atomic::AtomicUsize::new(0);
+static WASM_STACK_HIGH: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 
 #[cfg(target_arch = "wasm32")]
 #[used]
@@ -2187,45 +2221,71 @@ impl Heap {
         // whole child list. Measured 2026-09-19 on the closure shape: 6207
         // roots over just 34 distinct addresses, with one old box carrying
         // 980 children seeded 3087 times, i.e. ~3.0M child visits per minor.
-        // Dedup by address before seeding.
-        let mut seeded: AddrSet = AddrSet::default();
+        // Old roots are therefore deduped by `FLAG_MINOR_SEEN`; a young root is
+        // deduped by its mark bit in the work drain. `seeded_old` is the
+        // clearing list, one entry per distinct old box the collection walked.
+        let mut seeded_old: Vec<usize> = Vec::new();
         for &any in &roots {
-            if !seeded.insert(any.addr()) {
-                continue;
-            }
             // SAFETY: every root is a live box.
-            unsafe { self.seed_minor(any, &mut work) };
+            unsafe {
+                let header = &*any.0;
+                if header.is_minor_seen() {
+                    continue;
+                }
+                if !header.is_young() {
+                    header.set_minor_seen(true);
+                    seeded_old.push(any.addr());
+                }
+                self.seed_minor(any, &mut work);
+            }
         }
         // The conservative stack scan, restricted to young boxes: an old box on
         // the stack contributes nothing on its own, and the young cohort is far
-        // shorter than the arena walk the major's scan binary-searches.
+        // shorter than the arena walk a major's scan binary-searches.
         let probe = 0usize;
         let sp = &probe as *const usize as usize;
         if stack_scan
             && let Some((_low, high)) = stack_bounds()
             && high > sp
         {
-            let mut young_sorted = std::mem::take(&mut self.young_sorted);
-            young_sorted.clear();
-            young_sorted.extend_from_slice(&self.young);
-            young_sorted.sort_unstable();
-            self.scan_stack(sp, high, &young_sorted, &mut work);
-            self.young_sorted = young_sorted;
+            let mut young_table = std::mem::take(&mut self.young_table);
+            let cap = (self.young.len() * 2).next_power_of_two().max(16);
+            if young_table.len() < cap {
+                young_table.resize(cap, 0);
+            }
+            young_table[..cap].fill(0);
+            let mask = cap - 1;
+            for &addr in &self.young {
+                let mut index = young_slot(addr, mask);
+                while young_table[index] != 0 {
+                    index = (index + 1) & mask;
+                }
+                young_table[index] = addr;
+            }
+            self.young_table = young_table;
+            self.young_table_len = cap;
+            self.scan_stack_young(sp, high, &mut work);
         }
         // The remembered set: the old boxes a young store reached. They are old,
         // so they are stepped through but never marked — a young box's mark bit
         // is the only kind this collection sets.
         let remembered: Vec<usize> = REMEMBERED.with(|slot| slot.borrow().clone());
         for addr in remembered {
-            // A remembered box is usually also a root, and `seeded` already
-            // holds it; only a genuinely new one is worth walking.
-            if !seeded.insert(addr) {
-                continue;
-            }
+            // A remembered box is usually also a root, and the flag already
+            // holds it; only a genuinely new one is worth walking. A remembered
+            // box is old by construction.
             // SAFETY: the remembered set holds live old boxes (the barrier
             // recorded them, and every collection drains the set before one of
             // its boxes can be freed).
-            unsafe { self.seed_minor(GcAny(addr as *mut GcHeader), &mut work) };
+            unsafe {
+                let header = addr as *mut GcHeader;
+                if (*header).is_minor_seen() {
+                    continue;
+                }
+                (*header).set_minor_seen(true);
+                seeded_old.push(addr);
+                self.seed_minor(GcAny(header), &mut work);
+            }
         }
         self.mark_young(&mut work);
         // A traced `RefCell` was mutably borrowed mid-mark: the mark is
@@ -2235,6 +2295,10 @@ impl Heap {
             for &addr in &self.young {
                 // SAFETY: the young list holds live boxes.
                 unsafe { (*(addr as *mut GcHeader)).set_marked(false) };
+            }
+            for &addr in &seeded_old {
+                // SAFETY: a seeded old box stayed live through the collection.
+                unsafe { (*(addr as *mut GcHeader)).set_minor_seen(false) };
             }
             EPHEMERONS.with(|slot| slot.borrow_mut().clear());
             bump_collection_generation();
@@ -2326,6 +2390,10 @@ impl Heap {
         // edge has become old->old and the set is stale.
         self.young.clear();
         self.drain_remembered();
+        for &addr in &seeded_old {
+            // SAFETY: a seeded old box stayed live through the collection.
+            unsafe { (*(addr as *mut GcHeader)).set_minor_seen(false) };
+        }
         self.debug_assert_young_drained();
         self.verify_no_marks_left();
         bump_collection_generation();
@@ -2859,6 +2927,62 @@ impl Heap {
     /// cohort for a minor — so a membership test is a binary search and a
     /// coincidental stack word can only be marked when it is a real box
     /// (imprecise, never unsafe).
+    /// [`Heap::scan_stack`] over the minor's cohort table: the same
+    /// conservative walk, with membership answered by the open-addressed
+    /// table [`Heap::collect_minor_inner`] builds from `young` instead of a
+    /// sorted array. Exact, like the binary search it replaces.
+    fn scan_stack_young(&self, sp: usize, high: usize, work: &mut Vec<GcAny>) {
+        let capacity = self.young_table_len;
+        if capacity == 0 {
+            self.stack_words.set(0);
+            return;
+        }
+        let mask = capacity - 1;
+        let table = &self.young_table[..capacity];
+        let (live_low, live_high) = self.live_range();
+        let find = |addr: usize| {
+            let mut index = young_slot(addr, mask);
+            loop {
+                let slot = table[index];
+                if slot == 0 {
+                    return None;
+                }
+                if slot == addr {
+                    return Some(GcAny(addr as *mut GcHeader));
+                }
+                index = (index + 1) & mask;
+            }
+        };
+        // A box address can appear in many scanned words (every stored
+        // reference to it); push each box once so the work list stays bounded
+        // by the live set no matter how wide the scanned region is.
+        let mut seen: AddrSet = AddrSet::default();
+        let mut addr = sp;
+        let mut words = 0usize;
+        while addr < high {
+            // SAFETY: `[sp, high)` is the current thread's committed stack
+            // (platform stack_bounds guarantees readability); reads are
+            // unaligned so the exact frame layout does not matter.
+            let word = unsafe { std::ptr::read_unaligned::<usize>(addr as *const usize) };
+            if (live_low..=live_high).contains(&word)
+                && let Some(any) = find(word)
+            {
+                if seen.insert(any.addr()) {
+                    work.push(any);
+                }
+            } else if let Some(box_addr) = crate::value::Value::encoded_box_address(word as u64)
+                && (live_low..=live_high).contains(&box_addr)
+                && let Some(any) = find(box_addr)
+                && seen.insert(box_addr)
+            {
+                work.push(any);
+            }
+            addr += std::mem::size_of::<usize>();
+            words += 1;
+        }
+        self.stack_words.set(words);
+    }
+
     fn scan_stack(&self, sp: usize, high: usize, sorted_addrs: &[usize], work: &mut Vec<GcAny>) {
         // GC-5: most stack words are not box addresses — skip the search for
         // words outside the arena's address range.

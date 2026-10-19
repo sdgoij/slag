@@ -13862,3 +13862,48 @@ The same probes show the allocation path is NOT the bottleneck for the churn
 rows: `opcost/object_alloc` runs 100k `({ a: 1 }).a` iterations in 0.33 ms
 (~3.3 ns per allocation). The remaining gap on `construct_churn` and
 `spread_assign` is the call/builtin lane, not GC.
+
+## Minor GC: root dedup and the young-cohort scan (2026-10-19)
+
+The previous entry's `opcost/object_alloc` reading was wrong: `({ a: 1 }).a`
+in a loop is folded — `JIT_HELPER_STATS=1` shows 174 `ObjectFast` calls for
+the whole 36-row corpus, not 100k. The row does not allocate and cannot be
+used as an allocation floor.
+
+Measured properly on a `{}` probe (2M literals, one allocation per iteration):
+the bare loop costs 3.3 ns/iter, `JsObject::ordinary_object_create` measured
+hot in a crux-only bench is 14.5 ns (a 32 B box is 6.3 ns, so allocation +
+init is ~8 ns of it), and the safe-point minors cost ~16 ns per allocated
+box. `--gc-trace` on the probe reports 617 minors per call, avg 52-53 us for
+a ~3k-box cohort: half the row is GC. A temporary stage breakdown inside
+`collect_minor_inner` attributed one minor as: sort 1.6-21 us (bimodal),
+stack scan 2.5 us, sweep 20-27 us, pinned/root seeding 7-8 us, mark ~0.
+
+Two changes in `crates/crux/src/heap.rs`:
+
+- The stack scan binary-searched a sorted copy of the young cohort. The free
+  list is LIFO, so a cohort that reuses the previous sweep's slots arrives in
+  scrambled order and the sort becomes the dominant term. It is now an
+  open-addressed membership table (`Heap::young_table`: 2x next power of two,
+  linear probing on `addr >> 4`, zeroed at build, reused across collections).
+  This drops the cohort microbench (4096 hot boxes) from 43.4 us to 25.0 us
+  per collection.
+- Root dedup was an `AddrSet` insert per traced root. The root sources push
+  the same boxes once per record (the documented ~6200 roots over 34
+  addresses), so the set was pure overhead on every collection. Dedup is now
+  `FLAG_MINOR_SEEN` on each old box, with a small clearing list; a young root
+  is deduped by its mark bit in the work drain.
+
+Same-binary A/B (`SLAG_GC_SORT_SCAN` selected the sorted scan for the old
+arm), interleaved 3x:
+
+| row | sorted | table |
+| --- | --- | --- |
+| isolated `{}`, 2M | 67.0-67.3 | 57.5-58.4 (-13%) |
+| isolated `new Empty()`, 2M | 110.9 | 100.8 (-9%) |
+| `calls/construct_churn` | 82.0 | 78.0-78.6 (-4%) |
+| isolated `new Item(x,y)`, 2M | 236.5-238.6 | 228.5-230.8 (-3%) |
+
+The sweep (20-27 us, ~8.8 ns per dead box: drop glue + free-list push) is now
+the largest per-minor term; the allocator's TLS + `RefCell` path (~6 ns of
+the 14.5 ns create) is the next.
