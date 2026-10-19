@@ -14112,3 +14112,46 @@ The methodological point: a single-sample phase split on a 100 ns timer is
 noise (`rest` read 200 ns here, but the defines are a small fraction of the
 cost). Accumulate per-phase totals over at least a thousand calls before
 attributing closure-creation cost.
+
+## Closure creation, profiled properly (2026-10-19)
+
+An accumulated phase profile (means over 19,000 `instantiate_function_with_
+source` calls, `SLAG_FNPROF`, instrumented build; subtract ~16 ns of
+`Instant::now()` overhead per phase). Uninstrumented total is ~333 ns
+(300k anonymous closures in 100 ms):
+
+| phase | ns |
+| --- | --- |
+| `capture_source` (the source slice) | 27 |
+| `shared_function_body` | 56 |
+| `shared_params` | 17 |
+| setup (strict check, realm/contexts, parse_text) | 16 |
+| `Function::new_with_prototype` + env edge | 59 |
+| `shared_compiled_body` + `set_compiled` | 30 |
+| **`ecma_functions.insert` + patterns** | **97** |
+| `set_function_properties_batched` | 31 |
+
+The registry insert dominates. `EcmaFunction` is **408 bytes** (six `Vec`
+fields, 144 B, plus `Option<JsString>` `source`/`parse_text`, ~90 B, all empty
+or tiny for an ordinary closure), and the identity-hashed map still pays a
+full value copy per insert.
+
+Measured alternatives (isolated `rustc -O` bench, 300k inserts with removals,
+a 248-byte stand-in record):
+
+| shape | ns/insert |
+| --- | --- |
+| `HashMap<u64, Big>` (today's shape) | 52 (with growth: 224) |
+| `HashMap<u64, Box<Big>>` | 128 |
+| `Vec`-slab by id (value) | ~77 MB at 300k ids — not viable |
+
+So boxing the map value is a regression (the allocator costs more than the
+copy it saves), and a value slab is too much memory. The lever is the record's
+SIZE: moving the class-only fields (`fields`, `private_methods`,
+`decorator_initializers`, `computed_keys`) behind one optional box and the two
+inline source strings behind a handle would roughly halve it. That is a record
+layout change across every field access, so it is a slice of its own.
+
+Methodology: this supersedes the earlier single-sample phase split, which read
+`rest=200 ns` from a 100 ns timer and led the boilerplate-deferral attempt
+astray.
