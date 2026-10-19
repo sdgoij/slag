@@ -13971,3 +13971,33 @@ Measured (three runs; `fib`, `mcall`, `p_call_only` and `p_obj_lit` also measure
 | `p_call_only` / `p_obj_lit` | 71.9-72.8 / 51.2 | 72.2-74.4 / 50.8-51.4 (noise) |
 
 A 32-slot headroom measured the same on the construct rows and on `fib` (the added initialization is L1-cheap at this depth); 4 is the smallest value that serves the common shapes and is what ships. This is the first construct-side change that moved `construct_churn`; the earlier fill-scan win was in the compiled body, this one is in the call machinery around it.
+
+## Loop counters: a shared delta constant blocked narrowing (2026-10-19)
+
+The loop-counter pass narrowed `i + 1` only when the constant `1` had exactly
+one use. `narrow` CSEs identical literals, so in `for (i = 0; i < N; i++) {
+n += 1; }` the increment and the accumulator share that constant, the counter
+stayed a tagged-double `Add` (its range guard intact), and the loop ran at ~2.6
+ns/iter instead of the ~1 ns an int counter gets.
+
+`prove` no longer demands a private constant. `run` counts, per constant, how
+many proven increments use it, re-types it in place when *every* use is one of
+them (all of those become `IntAdd`/`IntSub`, so an `Int` constant is what they
+need), and otherwise appends a private `Const` with `imm: Imm::Int(delta)` and
+repoints that increment's arg 1. The clone is inserted immediately before its
+increment, not at the end of the constant's block — a same-block use before the
+definition fails dominance (`UseNotDominated`). Insertions are applied from the
+highest index down so they cannot shift a position still to be inserted at.
+Verified IR for `n += 1`: `v5:num = Add(v15, v4); v12:int = IntAdd(v19, v23)`.
+
+Same-binary A/B (`--jit-bench`): `bare loop` 2.664 -> 2.283 ms (-14%);
+`arithmetic` unchanged (2.476 -> 2.489), whose increment constant was already
+private. Corpus A/B, three runs each side, 77 rows: mean JIT gap 13.26 -> 12.64,
+with the loop-heavy rows `strings/search_slice` 21.0 -> 15.7,
+`strings/concat_loop` 10.7 -> 9.3, `control/generator_loop` 70.6 -> 62.2,
+`opcost/typed_array_for_each` 67.9 -> 61.1, `opcost/array_for_each` 31.1 ->
+28.1. Rows under ~0.3 ms are one timer tick and are not evidence either way.
+
+Correction to a near-miss: `opcost/baseline` reads 2.3 ms in the 2026-10-19
+dump's *second* column, which is slag jitless; its JIT column is already 0.1 ms
+before this change. The 23x "win" that number suggests is not this pass.

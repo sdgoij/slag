@@ -14,7 +14,7 @@
 
 use std::collections::HashMap;
 
-use crate::opt::ir::{BlockId, Function, Imm, Inst, Op, Term, Type, ValueId};
+use crate::opt::ir::{BlockId, Effects, Function, Imm, Inst, Op, Term, Type, ValueId};
 
 /// A proven increment: where its `Add`/`Sub` and its constant operand live, and
 /// the wrapping op to rewrite it to.
@@ -69,7 +69,7 @@ pub fn run(func: &mut Function) -> bool {
     for h in 0..n {
         let params = func.block(h).params.clone();
         for (pi, &p) in params.iter().enumerate() {
-            if let Some(inc) = prove(func, h, pi, p, &def, &uses) {
+            if let Some(inc) = prove(func, h, pi, p, &def) {
                 found.push(inc);
             }
         }
@@ -77,21 +77,59 @@ pub fn run(func: &mut Function) -> bool {
     if found.is_empty() {
         return false;
     }
+    // A delta constant is often shared by several proven increments (the
+    // CSE'd `1` of `i++` and `n += 1`). Re-typing it in place is safe when
+    // every use is one of those increments, because they all become
+    // `IntAdd`/`IntSub`; when another use exists it may expect a Number, so
+    // the increment gets a private clone and the original keeps its type.
+    let mut shared: HashMap<ValueId, u32> = HashMap::new();
+    for inc in &found {
+        *shared.entry(inc.kv).or_insert(0) += 1;
+    }
+    let mut inserts: Vec<(BlockId, usize, ValueId, i32)> = Vec::new();
     for inc in found {
         let (ab, ai) = inc.add;
+        let total = uses.get(&inc.kv).copied().unwrap_or(0);
+        let delta_value = if total == shared[&inc.kv] {
+            let (kb, ki) = inc.konst;
+            let kinst = &mut func.block_mut(kb).insts[ki];
+            kinst.imm = Imm::Int(inc.delta);
+            kinst.ty = Type::Int;
+            if let Some(r) = kinst.result {
+                func.set_value_type(r, Type::Int);
+            }
+            inc.kv
+        } else {
+            let private = func.push_value(Type::Int);
+            inserts.push((ab, ai, private, inc.delta));
+            private
+        };
         let inst = &mut func.block_mut(ab).insts[ai];
         inst.op = inc.op;
         inst.ty = Type::Int;
+        if let Some(arg) = inst.args.get_mut(1) {
+            *arg = delta_value;
+        }
         if let Some(r) = inst.result {
             func.set_value_type(r, Type::Int);
         }
-        let (kb, ki) = inc.konst;
-        let kinst = &mut func.block_mut(kb).insts[ki];
-        kinst.imm = Imm::Int(inc.delta);
-        kinst.ty = Type::Int;
-        if let Some(r) = kinst.result {
-            func.set_value_type(r, Type::Int);
-        }
+    }
+    // A clone must precede its increment or it fails dominance. Insert
+    // highest index first so an insertion cannot shift a position still to be
+    // inserted at.
+    inserts.sort_unstable_by(|a, b| b.0.cmp(&a.0).then(b.1.cmp(&a.1)));
+    for (b, i, value, delta) in inserts {
+        func.block_mut(b).insts.insert(
+            i,
+            Inst {
+                op: Op::Const,
+                args: Vec::new(),
+                result: Some(value),
+                ty: Type::Int,
+                effects: Effects::pure(),
+                imm: Imm::Int(delta),
+            },
+        );
     }
     true
 }
@@ -113,7 +151,6 @@ fn prove(
     pi: usize,
     p: ValueId,
     def: &HashMap<ValueId, (BlockId, usize)>,
-    uses: &HashMap<ValueId, u32>,
 ) -> Option<Increment> {
     let mut init: Option<i32> = None;
     let mut inc: Option<Increment> = None;
@@ -184,8 +221,7 @@ fn prove(
     let init = init?;
     let inc = inc?;
     let (limit, increasing) = bound?;
-    // The constant must be private to this increment, so re-typing it is local.
-    if inc.delta == 0 || uses.get(&inc.kv).copied().unwrap_or(0) != 1 {
+    if inc.delta == 0 {
         return None;
     }
     // Increasing `i` is bounded above (`Lt/Le(v, N)`), decreasing below.
@@ -314,6 +350,101 @@ mod tests {
             b.term(exit, Term::Return(None));
         }
         (func, header)
+    }
+
+    #[test]
+    fn a_shared_delta_constant_is_cloned_for_the_proven_counter() {
+        // `i++` and `n += 1` CSE the literal `1` into one constant. The
+        // counter must still narrow: its `IntAdd` gets a private int constant
+        // while the accumulator's use keeps the original.
+        let mut func = Function::new();
+        let e = func.entry();
+        let header;
+        let one;
+        {
+            let mut b = Builder::new(&mut func);
+            let zero = b.emit(e, Op::Const, &[], Type::Int, Effects::pure(), Imm::Int(0));
+            header = b.block();
+            let exit = b.block();
+            b.term(
+                e,
+                Term::Jump {
+                    target: header,
+                    args: vec![zero, zero],
+                },
+            );
+            let n = b.param(header, Type::Number);
+            let i = b.param(header, Type::Number);
+            one = b.emit(
+                header,
+                Op::Const,
+                &[],
+                Type::Number,
+                Effects::pure(),
+                Imm::Float(1.0),
+            );
+            let inc_n = b.emit(
+                header,
+                Op::Add,
+                &[n, one],
+                Type::Number,
+                Effects::pure(),
+                Imm::None,
+            );
+            let inc_i = b.emit(
+                header,
+                Op::Add,
+                &[i, one],
+                Type::Number,
+                Effects::pure(),
+                Imm::None,
+            );
+            let lim = b.emit(
+                header,
+                Op::Const,
+                &[],
+                Type::Number,
+                Effects::pure(),
+                Imm::Float(100.0),
+            );
+            let cond = b.emit(
+                header,
+                Op::Lt,
+                &[inc_i, lim],
+                Type::Bool,
+                Effects::pure(),
+                Imm::None,
+            );
+            b.term(
+                header,
+                Term::Branch {
+                    cond,
+                    then_block: header,
+                    then_args: vec![inc_n, inc_i],
+                    else_block: exit,
+                    else_args: vec![],
+                },
+            );
+            b.term(exit, Term::Return(None));
+        }
+        assert!(run(&mut func));
+        assert_eq!(verify(&func), Ok(()));
+        let int_add = func
+            .block(header)
+            .insts
+            .iter()
+            .find(|inst| inst.op == Op::IntAdd)
+            .expect("the bound counter narrowed");
+        let delta = int_add.args[1];
+        assert_ne!(delta, one, "the shared constant was cloned");
+        let clone = func
+            .block(header)
+            .insts
+            .iter()
+            .find(|inst| inst.result == Some(delta))
+            .expect("the private delta constant");
+        assert_eq!(clone.imm, Imm::Int(1));
+        assert_eq!(clone.ty, Type::Int);
     }
 
     #[test]
