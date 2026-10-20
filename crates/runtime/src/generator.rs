@@ -40,6 +40,11 @@ pub enum GeneratorFlag {
 #[derive(Debug)]
 pub struct GeneratorState {
     pub flag: GeneratorFlag,
+    /// The address of the generator object this state belongs to. The object
+    /// is not otherwise referenced from here, so the state outlives it; the
+    /// collection's swept-address list is compared against this to drop the
+    /// state once the object is gone (see `Agent::reap_dead_generators`).
+    pub object_addr: usize,
     pub vm: Option<Vm>,
     pub body: Option<Rc<CompiledBody>>,
     pub context: Option<ExecutionContext>,
@@ -194,35 +199,57 @@ pub fn call_generator(
     this: Value,
     args: &[Value],
 ) -> Result<Value, JsError> {
-    let data = agent
-        .ecma_functions
-        .get(&function.id())
-        .cloned()
-        .ok_or_else(|| {
+    // Fetch the record with a scoped borrow: a `.cloned()` would copy the
+    // whole `EcmaFunction` (name, source info, chains, class parts) on every
+    // generator call. Only the slots this call reads are copied.
+    let (
+        environment,
+        this_mode,
+        strict,
+        realm,
+        private_environment,
+        parse_text,
+        params,
+        body,
+        is_async,
+    ) = {
+        let data = agent.ecma_functions.get(&function.id()).ok_or_else(|| {
             JsError::new(
                 ErrorKind::TypeError,
                 "Function body is not registered".into(),
             )
         })?;
+        (
+            data.environment,
+            data.this_mode,
+            data.strict,
+            data.realm,
+            data.private_environment,
+            data.parse_text().cloned(),
+            data.params.clone(),
+            data.body.clone(),
+            data.is_async,
+        )
+    };
     let function_value = function.self_value();
     let function_env = crate::env::new_function_environment(
-        Some(data.environment),
+        Some(environment),
         function_value,
         Value::Undefined,
-        data.this_mode == ThisMode::Lexical,
+        this_mode == ThisMode::Lexical,
     );
     let context = ExecutionContext {
         function: Some(function_value),
-        realm: data.realm,
+        realm,
         script_or_module: None,
         lexical_environment: function_env,
         variable_environment: function_env,
-        private_environment: data.private_environment,
+        private_environment,
         // The callee's own text, not the caller's: this body's spans are
         // offsets into the text it was parsed from, so a closure created
         // inside it resolves against that text (the caller's stands in only
         // when the body has none).
-        source: data.parse_text().cloned().or_else(|| {
+        source: parse_text.or_else(|| {
             agent
                 .running_context()
                 .ok()
@@ -234,10 +261,10 @@ pub fn call_generator(
     agent.execution_context_stack.push(context);
     // Cut 58: capture the OrdinaryCallBindThis result — a certified body's
     // frame fills its `this` slot from it at the first `next()`.
-    let bound_this = if data.this_mode != ThisMode::Lexical {
+    let bound_this = if this_mode != ThisMode::Lexical {
         // OrdinaryCallBindThis (spec 10.2.1): sloppy functions coerce
         // undefined/null to the global object and box primitives.
-        let this = if data.this_mode == ThisMode::Sloppy {
+        let this = if this_mode == ThisMode::Sloppy {
             match this.kind() {
                 ValueKind::Undefined | ValueKind::Null => {
                     let global = agent.running_context()?.realm.global_object;
@@ -260,10 +287,10 @@ pub fn call_generator(
         crate::function::function_declaration_instantiation(
             agent,
             &function_value,
-            &data.params,
-            &data.body,
-            data.this_mode,
-            data.strict,
+            &params,
+            &body,
+            this_mode,
+            strict,
             args,
             &function_env,
         )?;
@@ -297,12 +324,12 @@ pub fn call_generator(
     let proto = match crate::context::as_object(&proto_value) {
         Some(proto) => proto,
         None => {
-            let intrinsic = if data.is_async {
+            let intrinsic = if is_async {
                 "%AsyncGenerator.prototype%"
             } else {
                 "%Generator.prototype%"
             };
-            data.realm
+            realm
                 .intrinsics
                 .get(intrinsic)
                 .and_then(|value| crate::context::as_object(&value))
@@ -313,15 +340,16 @@ pub fn call_generator(
     };
     let object = JsObject::ordinary_object_create(Some(proto));
     let object_value = Value::Object(object);
-    agent.generators.insert(
+    agent.generators.borrow_mut().insert(
         object.id(),
         Rc::new(RefCell::new(GeneratorState {
             flag: GeneratorFlag::SuspendedStart,
+            object_addr: object.as_any().addr(),
             vm: None,
             body: None,
             context: Some(instantiated_context),
             function: Value::Function(*function),
-            realm: data.realm,
+            realm,
             body_env: Some(body_env),
             args: args.to_vec(),
             this_value: bound_this.unwrap_or(Value::Undefined),
@@ -356,12 +384,17 @@ fn generator_resume(agent: &mut Agent, this: &Value, completion: Resume) -> Resu
             "GeneratorResume called on a non-object".into(),
         ));
     };
-    let state = agent.generators.get(&obj.id()).cloned().ok_or_else(|| {
-        JsError::new(
-            ErrorKind::TypeError,
-            "GeneratorResume called on a non-generator".into(),
-        )
-    })?;
+    let state = agent
+        .generators
+        .borrow()
+        .get(&obj.id())
+        .cloned()
+        .ok_or_else(|| {
+            JsError::new(
+                ErrorKind::TypeError,
+                "GeneratorResume called on a non-generator".into(),
+            )
+        })?;
     // A re-entrant `next()` during execution borrows the state mutably; the
     // spec's "already running" TypeError (27.4.3.2 step 4) must not panic.
     let flag = match state.try_borrow() {
@@ -420,12 +453,17 @@ fn generator_resume_abrupt(
             "GeneratorResumeAbrupt called on a non-object".into(),
         ));
     };
-    let state = agent.generators.get(&obj.id()).cloned().ok_or_else(|| {
-        JsError::new(
-            ErrorKind::TypeError,
-            "GeneratorResumeAbrupt called on a non-generator".into(),
-        )
-    })?;
+    let state = agent
+        .generators
+        .borrow()
+        .get(&obj.id())
+        .cloned()
+        .ok_or_else(|| {
+            JsError::new(
+                ErrorKind::TypeError,
+                "GeneratorResumeAbrupt called on a non-generator".into(),
+            )
+        })?;
     // A re-entrant `next` during execution borrows the state mutably; throw
     // the spec's "already running" TypeError instead of panicking.
     let flag = match state.try_borrow() {
@@ -467,6 +505,11 @@ fn generator_resume_abrupt(
                 }
             };
             state.flag = GeneratorFlag::Completed;
+            // The body will never resume: release the environment, the
+            // context and the arguments the suspended start carried.
+            state.context = None;
+            state.body_env = None;
+            state.args.clear();
             match completion {
                 Resume::Return(value) => iterator_result(agent, value, true),
                 Resume::Throw(value) => Err(JsError::new(
@@ -632,6 +675,9 @@ fn finish_resume(
             agent.execution_context_stack.pop();
             state.flag = GeneratorFlag::Completed;
             state.vm = None;
+            state.context = None;
+            state.body_env = None;
+            state.args.clear();
             Err(error)
         }
         Ok(outcome) => match outcome {
@@ -686,6 +732,9 @@ fn finish_resume(
                 // return), even on an abrupt completion.
                 let env = state.vm.as_ref().map(|vm| vm.lexical_env);
                 state.vm = None;
+                state.context = None;
+                state.body_env = None;
+                state.args.clear();
                 let completion = match env {
                     Some(env) => crate::eval::dispose_env_resources(agent, &env, Ok(completion))?,
                     None => completion,

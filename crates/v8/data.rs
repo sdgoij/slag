@@ -508,7 +508,9 @@ pub(crate) fn is_array_buffer_view(value: &api::Local) -> bool {
 /// of their own, and are not generator objects in the crate we stand in for
 /// either.
 pub(crate) fn is_generator_object(value: &api::Local) -> bool {
-    in_table(value, |agent, id| agent.generators.contains_key(&id))
+    in_table(value, |agent, id| {
+        agent.generators.borrow().contains_key(&id)
+    })
 }
 
 /// A native error. The engine's notion is `[[ErrorData]]`, which is the one the

@@ -15185,3 +15185,26 @@ Gates: fmt; clippy `-D warnings`; `cargo test --workspace` (38 suites, 0 fail); 
 The fold above still resolved the binding's text per closure — `AtomId -> JsString` goes through the memoised `crux::lookup` (a thread-local borrow, a scan, and a clone) — and `default_binding_display_name` built `JsString::from_utf8("*default*")`, nine encoded units, before it could reject the common case. The creation steps now carry the resolved `JsString` (resolved once per site, when the step is emitted), and the export-default check compares the slice against a `[u16; 9]` constant.
 
 Interleaved same-binary A/B, medians (8 pairs): the named declarator probe 83.8 -> 81.5 ms (-2.7%; every pair improved), `f = function () {}` -1.3% (4 pairs). The named-versus-unnamed gap is still ~4 ms per 300k (~13 ns/closure), and this change does not explain it: with the lookup and the literal gone, what remains is inside creation with a non-empty `name` — the handle and the batched adoption. Chasing it further has not paid; the fold's win is 410 -> ~13 ns of overhead.
+
+## LANDED (2026-10-20): generator states are reaped
+
+`Agent::generators` maps a generator object's id to its state and is a traced root, and nothing ever removed an entry. A generator that was called and abandoned therefore left its state — the instantiated environment, the saved execution context, the arguments, the closure function — reachable forever. The table grows with every generator the program has ever created, so every collection scans all of them, and a loop that creates and drops generators is O(n^2) in collections.
+
+Probes (interleaved same-binary A/B; `function* one() { return 1; }`):
+
+| shape (200k unless noted) | before | after |
+| --- | ---: | ---: |
+| create only (`one();`) | 21,696.6 ms | 282.2 ms (**-98.7%**) |
+| create + one `next()` | 17,806.6 ms | 458.9 ms (**-97.4%**) |
+| 20k create + next | 190.6 ms | 46.4 ms (-76%) |
+| 2k create + next | 7.18 ms | 4.67 ms (-35%) |
+
+The quadratic term is gone: 2k / 20k / 200k now scale linearly at ~2.3 us per generator (1.4 us of it is creation: a full `FunctionDeclarationInstantiation` per generator call).
+
+Both generator tables are now `RefCell<HashMap<...>>` so the collection (which only has `&self`) can prune the entries whose generator object the sweep reclaimed, using the same swept-address list as the Array-iterator table. Each state records its object's address — the object is deliberately NOT referenced from the state, which is what lets it die — and a state borrowed at collection time is a generator executing across it, kept. A completed generator also drops its saved context, environment and arguments, since its body can never resume.
+
+`call_generator` no longer `.cloned()`s the whole `EcmaFunction` record per call; it copies the fields it reads under a scoped borrow, like `ordinary_call`.
+
+Cost: the resume path pays ~4% for the map's `RefCell` lookup (`control/generator_loop` 58.7 -> 61.3 ms; the probe 55.9 -> 58.5). That row holds one long-lived generator, so this fix does not help it: its ~61 ms is the resume machinery itself (~300 ns per `next()`), which is a separate target.
+
+Gates: fmt; clippy `-D warnings`; `cargo test --workspace` (38 suites, 0 fail); test262 built-ins 23,821, language 23,726, annexB 1,086, intl402 3,365 — 0 fail.

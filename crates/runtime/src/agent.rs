@@ -700,13 +700,16 @@ pub struct Agent {
         std::rc::Rc<crate::async_await::AsyncFromSyncContinuationEntry>,
     >,
     /// The generator objects' states, keyed by object identity (spec 27.4.3).
-    pub generators:
+    pub generators: std::cell::RefCell<
         std::collections::HashMap<u64, std::rc::Rc<RefCell<crate::generator::GeneratorState>>>,
+    >,
     /// The async generator objects' states, keyed by object identity (spec
     /// 27.6.1).
-    pub async_generators: std::collections::HashMap<
-        u64,
-        std::rc::Rc<RefCell<crate::async_generator::AsyncGeneratorState>>,
+    pub async_generators: std::cell::RefCell<
+        std::collections::HashMap<
+            u64,
+            std::rc::Rc<RefCell<crate::async_generator::AsyncGeneratorState>>,
+        >,
     >,
     /// The await-resume handlers of async generator bodies, keyed by function
     /// identity.
@@ -1416,8 +1419,8 @@ impl Agent {
             wasm_streaming_handlers: std::collections::HashMap::new(),
             async_from_sync: std::collections::HashMap::new(),
             async_from_sync_continuations: std::collections::HashMap::new(),
-            generators: std::collections::HashMap::new(),
-            async_generators: std::collections::HashMap::new(),
+            generators: std::cell::RefCell::new(std::collections::HashMap::new()),
+            async_generators: std::cell::RefCell::new(std::collections::HashMap::new()),
             async_generator_awaits: std::collections::HashMap::new(),
             iterator_helpers: std::collections::HashMap::new(),
             wrapped_iterators: std::collections::HashMap::new(),
@@ -2144,8 +2147,8 @@ impl Agent {
         self.wasm_streaming_handlers.trace(visit);
         self.async_from_sync.trace(visit);
         self.async_from_sync_continuations.trace(visit);
-        self.generators.trace(visit);
-        self.async_generators.trace(visit);
+        self.generators.borrow().trace(visit);
+        self.async_generators.borrow().trace(visit);
         self.async_generator_awaits.trace(visit);
         self.iterator_helpers.trace(visit);
         self.wrapped_iterators.trace(visit);
@@ -2519,7 +2522,26 @@ impl Agent {
                     // SAFETY: as above.
                     && unsafe { (&*agent).promise_addrs.try_borrow().is_ok_and(|map| !map.is_empty()) }
             });
-        if has_iterators || has_promise_addrs {
+        let has_generators = self
+            .generators
+            .try_borrow()
+            .is_ok_and(|map| !map.is_empty())
+            || self
+                .async_generators
+                .try_borrow()
+                .is_ok_and(|map| !map.is_empty())
+            || live.iter().any(|&agent| {
+                agent != self_ptr
+                    // SAFETY: as above.
+                    && unsafe {
+                        (&*agent).generators.try_borrow().is_ok_and(|map| !map.is_empty())
+                            || (&*agent)
+                                .async_generators
+                                .try_borrow()
+                                .is_ok_and(|map| !map.is_empty())
+                    }
+            });
+        if has_iterators || has_promise_addrs || has_generators {
             swept_addrs.sort_unstable();
         }
         if has_iterators {
@@ -2537,6 +2559,15 @@ impl Agent {
                 if agent != self_ptr {
                     // SAFETY: as above.
                     unsafe { (&*agent).reap_promise_addrs(&swept_addrs) };
+                }
+            }
+        }
+        if has_generators {
+            self.reap_dead_generators(&swept_addrs);
+            for &agent in &live {
+                if agent != self_ptr {
+                    // SAFETY: as above.
+                    unsafe { (&*agent).reap_dead_generators(&swept_addrs) };
                 }
             }
         }
@@ -2811,6 +2842,39 @@ impl Agent {
                 self.leaf_cache[index] = None;
             }
         }
+    }
+
+    /// Drop the states of generators whose object the sweep reclaimed. Without
+    /// this every generator ever created leaves a rooted state in the table —
+    /// its environment, execution context, suspended VM and arguments stay
+    /// reachable — so the traced root set grows with the number of generators
+    /// the program has created and every collection scans them. The sweep's
+    /// address list is the conservative mark's result, so a generator object
+    /// held only in a Rust stack local is never pruned.
+    fn reap_dead_generators(&self, dead: &[usize]) {
+        if dead.is_empty() {
+            return;
+        }
+        let Ok(mut map) = self.generators.try_borrow_mut() else {
+            return;
+        };
+        if map.is_empty() {
+            return;
+        }
+        map.retain(|_, state| match state.try_borrow() {
+            Ok(state) => dead.binary_search(&state.object_addr).is_err(),
+            // A state borrowed here is a generator body executing across the
+            // collection: alive by definition.
+            Err(_) => true,
+        });
+        drop(map);
+        let Ok(mut map) = self.async_generators.try_borrow_mut() else {
+            return;
+        };
+        map.retain(|_, state| match state.try_borrow() {
+            Ok(state) => dead.binary_search(&state.object_addr).is_err(),
+            Err(_) => true,
+        });
     }
 
     /// Drop the per-object records of primitive-wrapper boxes a sweep

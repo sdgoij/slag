@@ -71,6 +71,9 @@ impl Trace for AsyncGeneratorRequest {
 #[derive(Debug)]
 pub struct AsyncGeneratorState {
     pub object: u64,
+    /// The address of the generator object this state belongs to; see
+    /// [`crate::generator::GeneratorState::object_addr`].
+    pub object_addr: usize,
     pub flag: AsyncGeneratorFlag,
     pub queue: VecDeque<AsyncGeneratorRequest>,
     pub current: Option<AsyncGeneratorRequest>,
@@ -359,10 +362,11 @@ pub fn call_async_generator(
     };
     let object = JsObject::ordinary_object_create(Some(proto));
     let object_value = Value::Object(object);
-    agent.async_generators.insert(
+    agent.async_generators.borrow_mut().insert(
         object.id(),
         Rc::new(RefCell::new(AsyncGeneratorState {
             object: object.id(),
+            object_addr: object.as_any().addr(),
             flag: AsyncGeneratorFlag::SuspendedStart,
             queue: VecDeque::new(),
             current: None,
@@ -386,7 +390,7 @@ fn validate(agent: &Agent, this: &Value) -> Result<u64, JsError> {
             "AsyncGeneratorResume called on a non-object".into(),
         ));
     };
-    if !agent.async_generators.contains_key(&obj.id()) {
+    if !agent.async_generators.borrow().contains_key(&obj.id()) {
         return Err(JsError::new(
             ErrorKind::TypeError,
             "AsyncGeneratorResume called on a non-async-generator".into(),
@@ -410,6 +414,7 @@ fn new_capability(agent: &mut Agent) -> Result<PromiseCapability, JsError> {
 fn state(agent: &Agent, object_id: u64) -> Result<AsyncGeneratorFlag, JsError> {
     let state = agent
         .async_generators
+        .borrow()
         .get(&object_id)
         .cloned()
         .ok_or_else(|| JsError::new(ErrorKind::TypeError, "not an async generator".into()))?;
@@ -419,6 +424,7 @@ fn state(agent: &Agent, object_id: u64) -> Result<AsyncGeneratorFlag, JsError> {
 fn set_flag(agent: &Agent, object_id: u64, flag: AsyncGeneratorFlag) -> Result<(), JsError> {
     let state = agent
         .async_generators
+        .borrow()
         .get(&object_id)
         .cloned()
         .ok_or_else(|| JsError::new(ErrorKind::TypeError, "not an async generator".into()))?;
@@ -433,6 +439,7 @@ fn set_current(
 ) -> Result<(), JsError> {
     let state = agent
         .async_generators
+        .borrow()
         .get(&object_id)
         .cloned()
         .ok_or_else(|| JsError::new(ErrorKind::TypeError, "not an async generator".into()))?;
@@ -443,6 +450,7 @@ fn set_current(
 fn take_current(agent: &Agent, object_id: u64) -> Result<Option<AsyncGeneratorRequest>, JsError> {
     let state = agent
         .async_generators
+        .borrow()
         .get(&object_id)
         .cloned()
         .ok_or_else(|| JsError::new(ErrorKind::TypeError, "not an async generator".into()))?;
@@ -452,6 +460,7 @@ fn take_current(agent: &Agent, object_id: u64) -> Result<Option<AsyncGeneratorRe
 fn save_context(agent: &Agent, object_id: u64, context: ExecutionContext) -> Result<(), JsError> {
     let state = agent
         .async_generators
+        .borrow()
         .get(&object_id)
         .cloned()
         .ok_or_else(|| JsError::new(ErrorKind::TypeError, "not an async generator".into()))?;
@@ -468,6 +477,7 @@ fn push_request(
 ) -> Result<(), JsError> {
     let state = agent
         .async_generators
+        .borrow()
         .get(&object_id)
         .cloned()
         .ok_or_else(|| JsError::new(ErrorKind::TypeError, "not an async generator".into()))?;
@@ -481,6 +491,7 @@ fn pop_front(
 ) -> Result<Option<(AsyncGeneratorRequest, Resume)>, JsError> {
     let state = agent
         .async_generators
+        .borrow()
         .get(&object_id)
         .cloned()
         .ok_or_else(|| JsError::new(ErrorKind::TypeError, "not an async generator".into()))?;
@@ -788,6 +799,7 @@ fn drive(
             // the disposals settle.
             let body_env = agent
                 .async_generators
+                .borrow()
                 .get(&object_id)
                 .cloned()
                 .ok_or_else(|| JsError::new(ErrorKind::TypeError, "not an async generator".into()))?
@@ -840,6 +852,7 @@ fn start_body(agent: &mut Agent, object_id: u64) -> Result<VmOutcome, JsError> {
     let (context, body_env) = {
         let state = agent
             .async_generators
+            .borrow()
             .get(&object_id)
             .cloned()
             .ok_or_else(|| JsError::new(ErrorKind::TypeError, "not an async generator".into()))?;
@@ -877,6 +890,7 @@ fn start_body(agent: &mut Agent, object_id: u64) -> Result<VmOutcome, JsError> {
     let outcome = vm.start(agent, &body)?;
     let state = agent
         .async_generators
+        .borrow()
         .get(&object_id)
         .cloned()
         .ok_or_else(|| JsError::new(ErrorKind::TypeError, "not an async generator".into()))?;
@@ -897,6 +911,7 @@ fn resume_body(
     let (context, body, suspended_at_delegate, mut vm) = {
         let state = agent
             .async_generators
+            .borrow()
             .get(&object_id)
             .cloned()
             .ok_or_else(|| JsError::new(ErrorKind::TypeError, "not an async generator".into()))?;
@@ -932,6 +947,7 @@ fn resume_body(
     };
     let state = agent
         .async_generators
+        .borrow()
         .get(&object_id)
         .cloned()
         .ok_or_else(|| JsError::new(ErrorKind::TypeError, "not an async generator".into()))?;
