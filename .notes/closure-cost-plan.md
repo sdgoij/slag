@@ -199,3 +199,11 @@ Stage C's remaining copy is
 `initialize_instance_elements`'s whole-record `.cloned()` (216 B now, only on
 construction of classes with field/private-element state); the normal call
 path already borrows scoped and clones only the fields it needs.
+
+## Outcome (2026-10-20)
+
+The two chain fields are now `CaptureChain<T> = Option<Rc<[T]>>`, shared per
+creation site, 216 -> **200 bytes**. `e7` reads 75.8 ms median, so this plan's
+~85 ms stop gate is met and **Stage D is eligible**. Details and the A/B
+numbers: `.notes/perf.md` ("capture chains shared per closure site").
+Eligibility is not an expectation: Stage D's arena record is still unmeasured.

@@ -50,8 +50,8 @@ pub fn eval_expr(agent: &mut Agent, expr: &Expr, strict: bool) -> Result<Value, 
                 f,
                 env,
                 strict,
-                Vec::new(),
-                Vec::new(),
+                Vec::new().into(),
+                Vec::new().into(),
             )
         }
         ExprKind::Arrow {
@@ -67,8 +67,8 @@ pub fn eval_expr(agent: &mut Agent, expr: &Expr, strict: bool) -> Result<Value, 
                 body,
                 env,
                 strict,
-                Vec::new(),
-                Vec::new(),
+                Vec::new().into(),
+                Vec::new().into(),
                 expr.span,
             )
         }

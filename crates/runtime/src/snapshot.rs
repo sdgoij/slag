@@ -6003,8 +6003,8 @@ impl Builder<'_> {
             body,
             environment,
             strict,
-            Vec::new(),
-            Vec::new(),
+            Vec::new().into(),
+            Vec::new().into(),
             span,
         );
         self.agent.execution_context_stack.pop();
@@ -6116,8 +6116,8 @@ impl Builder<'_> {
             body,
             environment,
             strict,
-            Vec::new(),
-            Vec::new(),
+            Vec::new().into(),
+            Vec::new().into(),
             span,
         );
         self.agent.execution_context_stack.pop();

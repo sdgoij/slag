@@ -1398,8 +1398,8 @@ fn instantiate_module_declarations(
                 *env,
                 true,
                 source,
-                Vec::new(),
-                Vec::new(),
+                Vec::new().into(),
+                Vec::new().into(),
                 false,
             )?;
             // The function's `import.meta` resolves lexically to this module

@@ -613,11 +613,11 @@ pub enum Step {
     CreateFunction {
         function: Box<syntax::ast::Function>,
         strict: bool,
-        outer_chain: Vec<Vec<crux::AtomId>>,
+        outer_chain: crate::function::OuterChain,
         /// Cut 28: the per-iteration head layouts of the certified loops
         /// open at this creation site (see
         /// [`crate::function::EcmaFunction::per_iteration_chain`]).
-        per_iteration_chain: Vec<(Vec<crux::AtomId>, usize)>,
+        per_iteration_chain: crate::function::PerIterationChain,
     },
     /// Create an arrow function's closure: `[[ThisMode]]` is lexical and
     /// there is no `prototype` (spec 15.3.2). `outer_chain` is as in
@@ -627,9 +627,9 @@ pub enum Step {
         params: Vec<syntax::ast::BindingElement>,
         body: syntax::ast::ArrowBody,
         strict: bool,
-        outer_chain: Vec<Vec<crux::AtomId>>,
+        outer_chain: crate::function::OuterChain,
         /// Cut 28: see [`Step::CreateFunction`].
-        per_iteration_chain: Vec<(Vec<crux::AtomId>, usize)>,
+        per_iteration_chain: crate::function::PerIterationChain,
         /// The text the arrow was parsed from, which is its `[[SourceText]]` —
         /// what `Function.prototype.toString` answers and what a snapshot
         /// rebuilds the closure from. The AST node is decomposed into the fields
@@ -765,11 +765,11 @@ pub enum Step {
         function: Box<syntax::ast::Function>,
         frame_slot: Option<usize>,
         context_slot: Option<usize>,
-        outer_chain: Vec<Vec<crux::AtomId>>,
+        outer_chain: crate::function::OuterChain,
         /// Cut 28: the inherited per-iteration chain (see
         /// [`Step::CreateFunction`]); the declaration instantiates at body
         /// entry, before this body's own loops start.
-        per_iteration_chain: Vec<(Vec<crux::AtomId>, usize)>,
+        per_iteration_chain: crate::function::PerIterationChain,
     },
     /// Reset the statement-completion register to an empty completion (spec
     /// 6.2.2.3): the current statement's completion starts empty.
@@ -17104,14 +17104,14 @@ struct Compiler {
     /// one of their captured names resolves to a static context-chain read
     /// (`LoadContextSlot { depth ≥ 1 }`) instead of the env walk. Empty when
     /// the enclosing chain is uncertified.
-    outer_chain: Vec<Vec<crux::AtomId>>,
+    outer_chain: crate::function::OuterChain,
     /// Cut 28: the inherited per-iteration head layouts — `(head names, env
     /// hop offset)` — of the certified loops open when THIS body was created
     /// (see
     /// [`crate::function::EcmaFunction::per_iteration_chain`]). A reference
     /// to one of those heads compiles to a static `LoadPerIteration` read
     /// against the body's own `lexical_env` instead of an env walk.
-    per_iteration_chain: Vec<(Vec<crux::AtomId>, usize)>,
+    per_iteration_chain: crate::function::PerIterationChain,
     /// Whether any emitted step switches the lexical environment (block/
     /// loop/catch/with envs): when false the body's env is constant for its
     /// whole run, so the dispatch loop skips the per-step context sync.
@@ -17285,7 +17285,7 @@ impl Compiler {
                 .as_ref()
                 .is_some_and(|scope| !scope.context_names.is_empty()),
         );
-        for (heads, depth) in &self.per_iteration_chain {
+        for (heads, depth) in self.per_iteration_chain.iter() {
             if let Some(index) = heads.iter().position(|head| *head == name) {
                 return Some((base + depth, index));
             }
@@ -17299,7 +17299,7 @@ impl Compiler {
     /// shifted by this body's own capture-context hop (a closure created in
     /// this body captures its running env — the capture context when it has
     /// one).
-    fn closure_per_iteration_chain(&self) -> Vec<(Vec<crux::AtomId>, usize)> {
+    fn closure_per_iteration_chain(&self) -> crate::function::PerIterationChain {
         let mut chain =
             Vec::with_capacity(self.per_iteration_heads.len() + self.per_iteration_chain.len());
         for (position, heads) in self.per_iteration_heads.iter().enumerate() {
@@ -17310,10 +17310,10 @@ impl Compiler {
                 .as_ref()
                 .is_some_and(|scope| !scope.context_names.is_empty()),
         );
-        for (heads, depth) in &self.per_iteration_chain {
+        for (heads, depth) in self.per_iteration_chain.iter() {
             chain.push((heads.clone(), depth + hop));
         }
-        chain
+        chain.into()
     }
 
     /// The block binding of an Annex B block function whose declaring block
@@ -17423,16 +17423,16 @@ impl Compiler {
     /// context contributes no runtime hop, so its entry is omitted — or
     /// empty entirely when this body is uncertified (the chain is broken,
     /// references resolve through the env walk).
-    fn closure_outer_chain(&self) -> Vec<Vec<crux::AtomId>> {
+    fn closure_outer_chain(&self) -> crate::function::OuterChain {
         let Some(scope) = self.scope.as_ref() else {
-            return Vec::new();
+            return Vec::new().into();
         };
         let mut chain = Vec::with_capacity(self.outer_chain.len() + 1);
         if !scope.context_names.is_empty() {
             chain.push(self.own_context_entry());
         }
         chain.extend(self.outer_chain.iter().cloned());
-        chain
+        chain.into()
     }
 
     /// The per-iteration env slot of a captured for-head binding (Cut 3

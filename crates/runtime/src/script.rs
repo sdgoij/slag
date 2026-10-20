@@ -647,8 +647,8 @@ pub fn global_declaration_instantiation(
             f,
             *global_env,
             strict,
-            Vec::new(),
-            Vec::new(),
+            Vec::new().into(),
+            Vec::new().into(),
             false,
         )?;
         global_env.create_global_function_binding(&name, func_obj, false)?;
@@ -1062,8 +1062,8 @@ fn eval_declaration_instantiation(
             f,
             env,
             strict,
-            Vec::new(),
-            Vec::new(),
+            Vec::new().into(),
+            Vec::new().into(),
             false,
         )?;
         if variable_env_is_global {

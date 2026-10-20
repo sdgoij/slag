@@ -15096,3 +15096,43 @@ moved inside their noise, so the isolated row is the evidence.
 
 Gates: fmt; clippy `-D warnings`; `cargo test --workspace`; test262 built-ins
 23,821, language 23,726, annexB 1,086, intl402 3,365 — 0 fail.
+
+## LANDED (2026-10-20): capture chains shared per closure site
+
+`EcmaFunction`'s `outer_chain` and `per_iteration_chain` are compile-time
+layouts of the enclosing certified bodies and of the certified loop heads open
+at a creation site. They were `Vec`s on the `CreateFunction`/`CreateArrow`/
+`FunctionDeclInit` steps, and every execution of such a step deep-cloned them
+into the new closure; for a per-iteration site that is a clone of
+`Vec<(Vec<AtomId>, usize)>` — one allocation for the outer vector plus one per
+head — per closure.
+
+The fields are now `CaptureChain<T> = Option<Rc<[T]>>`, shared between the step
+and every closure created from it. The `Option` is load-bearing: an ordinary
+closure's chains are empty, and the first attempt (an unconditional `Rc<[T]>`)
+regressed the plain-closure probe by ~10% (e7 median 79.1 -> 92.3 ms over 8
+pairs) — an `Rc` clone/drop pair costs more than copying a zeroed 24-byte
+`Vec`. With `None` the empty case is a null check. Each field went 24 -> 16
+bytes, so the record is **216 -> 200 bytes**.
+
+Interleaved same-binary A/B (medians):
+
+| probe | before | after |
+| --- | ---: | ---: |
+| `e7` 300k closures | 79.1 ms | 75.8 ms (-4%) |
+| `e5` + one call each | 116.7 ms | 114.1 ms (-2%) |
+| `cap_uncaptured` | 247.9 ms | 214.4 ms (-13%) |
+| `cap_let_drop` | 365.9 ms | 358.9 ms (-2%) |
+| for-in head-let row, 10 pairs | 543.0 ms | 485.5 ms (-11%) |
+
+Nine of the ten for-in pairs improved; that row's creation sites carry a
+non-empty per-iteration chain, so it is where the deep clone was actually
+paid. Full corpus (3 interleaved pairs, sum of the 77 jit rows): 2663.7 /
+2643.2 / 3061.2 -> 2964.0 / 2551.2 / 2614.1 ms; the corpus cannot separate the
+change.
+
+This takes `e7` below the closure plan's 85 ms stop gate, so Stage D is now
+eligible (see `.notes/closure-cost-plan.md`).
+
+Gates: fmt; clippy `-D warnings`; `cargo test --workspace`; test262 built-ins
+23,821, language 23,726, annexB 1,086, intl402 3,365 — 0 fail.

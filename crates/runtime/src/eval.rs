@@ -632,8 +632,8 @@ pub(crate) fn eval_function_declaration(
             f,
             lexical_env,
             strict,
-            Vec::new(),
-            Vec::new(),
+            Vec::new().into(),
+            Vec::new().into(),
             false,
         )?;
         variable_env.set_mutable_binding(&name, func_obj, false)?;
@@ -812,8 +812,8 @@ pub(crate) fn block_declaration_instantiation_iter<'a>(
                             f,
                             *block_env,
                             strict,
-                            Vec::new(),
-                            Vec::new(),
+                            Vec::new().into(),
+                            Vec::new().into(),
                             false,
                         )?;
                         block_env.initialize_binding(&name, func_obj)?;

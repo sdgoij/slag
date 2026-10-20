@@ -195,6 +195,46 @@ impl Trace for ClassParts {
     }
 }
 
+/// A capture-context chain, shared per declaration site: instantiating a
+/// closure from the site (and cloning a record on the slow call path) must not
+/// deep-copy it. The empty chain is the common case — an ordinary function
+/// created outside a capturing body — so it is represented as `None` and costs
+/// no allocation and no refcount traffic per closure.
+#[derive(Debug, Clone, Default)]
+pub struct CaptureChain<T>(Option<std::rc::Rc<[T]>>);
+
+impl<T> CaptureChain<T> {
+    pub fn as_slice(&self) -> &[T] {
+        self.0.as_deref().unwrap_or(&[])
+    }
+}
+
+impl<T> std::ops::Deref for CaptureChain<T> {
+    type Target = [T];
+
+    fn deref(&self) -> &[T] {
+        self.as_slice()
+    }
+}
+
+impl<T> From<Vec<T>> for CaptureChain<T> {
+    fn from(entries: Vec<T>) -> Self {
+        if entries.is_empty() {
+            Self(None)
+        } else {
+            Self(Some(entries.into()))
+        }
+    }
+}
+
+/// The capture-context layout of each enclosing certified body, innermost
+/// first. See [`CaptureChain`].
+pub type OuterChain = CaptureChain<Vec<crux::AtomId>>;
+
+/// The per-iteration head layouts of the certified loops open at a creation
+/// site. See [`CaptureChain`].
+pub type PerIterationChain = CaptureChain<(Vec<crux::AtomId>, usize)>;
+
 /// The spec 10.2.1 internal slots of an ordinary ECMAScript function,
 /// registered per function object.
 #[derive(Debug, Clone)]
@@ -280,7 +320,7 @@ pub struct EcmaFunction {
     /// references to those captured names compile to static context-chain
     /// reads instead of env walks. Empty when the enclosing chain is
     /// uncertified.
-    pub outer_chain: Vec<Vec<crux::AtomId>>,
+    pub outer_chain: OuterChain,
     /// Cut 28: the per-iteration loop-head layouts of the certified loops
     /// open at this function's creation site — `(head names, env hop
     /// offset)`, innermost first, where the offset is the number of
@@ -289,7 +329,7 @@ pub struct EcmaFunction {
     /// i...)` loop captures the per-iteration env; its references to those
     /// heads compile to static `LoadPerIteration` reads (resolved against
     /// the closure's own `lexical_env` at run time) instead of env walks.
-    pub per_iteration_chain: Vec<(Vec<crux::AtomId>, usize)>,
+    pub per_iteration_chain: PerIterationChain,
     /// Cut 46: the function is a NAMED function expression (its own name is
     /// bound by the immutable self-binding scope wrapping the body) rather
     /// than a function declaration or anonymous expression. The compiler
@@ -895,8 +935,8 @@ pub fn instantiate_function(
     f: &syntax::ast::Function,
     environment: EnvRef,
     enclosing_strict: bool,
-    outer_chain: Vec<Vec<crux::AtomId>>,
-    per_iteration_chain: Vec<(Vec<crux::AtomId>, usize)>,
+    outer_chain: OuterChain,
+    per_iteration_chain: PerIterationChain,
     named_expression: bool,
 ) -> Result<Value, JsError> {
     instantiate_function_with_source(
@@ -918,8 +958,8 @@ pub fn instantiate_function_with_source(
     environment: EnvRef,
     enclosing_strict: bool,
     source: Option<JsString>,
-    outer_chain: Vec<Vec<crux::AtomId>>,
-    per_iteration_chain: Vec<(Vec<crux::AtomId>, usize)>,
+    outer_chain: OuterChain,
+    per_iteration_chain: PerIterationChain,
     named_expression: bool,
 ) -> Result<Value, JsError> {
     let source_info = match source {
@@ -1346,7 +1386,7 @@ pub fn instantiate_method(
         DefinitionKind::method(f.is_async, f.is_generator),
         source_info,
         None,
-        Vec::new(),
+        Vec::new().into(),
         false,
     )
 }
@@ -1387,7 +1427,7 @@ pub fn instantiate_accessor(
         DefinitionKind::method(false, false),
         source_info,
         None,
-        Vec::new(),
+        Vec::new().into(),
         false,
     )
 }
@@ -1461,7 +1501,7 @@ fn instantiate_class_constructor_with(
         },
         source_info,
         None,
-        Vec::new(),
+        Vec::new().into(),
         false,
     )?;
     if default_derived
@@ -1527,7 +1567,7 @@ fn register_function(
     // `shared_source_info` / `source_info_with_slice`).
     source_info: Option<std::rc::Rc<SourceInfo>>,
     strict: Option<bool>,
-    outer_chain: Vec<Vec<crux::AtomId>>,
+    outer_chain: OuterChain,
     named_expression: bool,
 ) -> Result<Value, JsError> {
     // `strict` overrides the body-directive check (CreateDynamicFunction
@@ -1575,7 +1615,7 @@ fn register_function(
         leaf_inline: false,
         construct_inline: false,
         outer_chain,
-        per_iteration_chain: Vec::new(),
+        per_iteration_chain: Vec::new().into(),
         named_expression,
         // Plain ordinary functions defer MakeConstructor: the own
         // `prototype` property + prototype object are materialized lazily on
@@ -1787,8 +1827,8 @@ pub fn instantiate_function_expression(
     f: &syntax::ast::Function,
     environment: EnvRef,
     enclosing_strict: bool,
-    outer_chain: Vec<Vec<crux::AtomId>>,
-    per_iteration_chain: Vec<(Vec<crux::AtomId>, usize)>,
+    outer_chain: OuterChain,
+    per_iteration_chain: PerIterationChain,
 ) -> Result<Value, JsError> {
     let Some(name) = f.name else {
         return instantiate_function(
@@ -1895,7 +1935,7 @@ pub fn instantiate_function_from_source(
         DefinitionKind::function(f.is_async, f.is_generator),
         source_info,
         Some(strict),
-        Vec::new(),
+        Vec::new().into(),
         false,
     )?;
     // GetPrototypeFromConstructor wins over the default %Function.prototype%.
@@ -1916,8 +1956,8 @@ pub fn instantiate_arrow(
     body: &syntax::ast::ArrowBody,
     environment: EnvRef,
     enclosing_strict: bool,
-    outer_chain: Vec<Vec<crux::AtomId>>,
-    per_iteration_chain: Vec<(Vec<crux::AtomId>, usize)>,
+    outer_chain: OuterChain,
+    per_iteration_chain: PerIterationChain,
     span: crux::Span,
 ) -> Result<Value, JsError> {
     // Cut 43: the site's shared Block — every closure from the same arrow
@@ -4216,8 +4256,15 @@ pub(crate) fn function_declaration_instantiation(
     }
     for f in funcs {
         let name = crux::lookup(f.name.unwrap());
-        let func_obj =
-            instantiate_function(agent, f, lexical_env, strict, Vec::new(), Vec::new(), false)?;
+        let func_obj = instantiate_function(
+            agent,
+            f,
+            lexical_env,
+            strict,
+            Vec::new().into(),
+            Vec::new().into(),
+            false,
+        )?;
         variable_env.set_mutable_binding(&name, func_obj, false)?;
     }
 
