@@ -15226,3 +15226,13 @@ Isolating the pieces first: a `next()` on an *already completed* generator (disp
 The remaining 151 ns of the completed path is the `{value, done}` result object (arena allocation plus the cached-shape adoption) and the state-table lookup; the row's remaining ~247 ns per resume is the resume machinery (context save/restore around the Vm run).
 
 Gates: fmt; clippy `-D warnings`; `cargo test --workspace` (38 suites, 0 fail); test262 built-ins 23,821, language 23,726, annexB 1,086, intl402 3,365 — 0 fail.
+
+## NULL (2026-10-20): builtin call entry, the capture env lane, typed-array elements
+
+Three row-targeted investigations, each measured, none landed.
+
+**Builtin call entry** (paid by every native method call, including the generator row). A bare `b.valueOf()` on a boolean costs **32 ns/call** against **9.8 ns** for a JS method call (`o.m()`) in the same loop shape, so ~22 ns is the entry plus the primitive-receiver member read. `call_inner` still resolved a builtin through the thread-local `BUILTIN_HANDLERS` get and then the `builtin_dispatch_cache` get, while the VM already has a direct-mapped verdict cell (`Agent::builtin_call_lookup`). Routing `call_inner` through that cell measured flat: `b.valueOf()` 6.52 -> 6.54 ms/200k, `[1].values().next()` 16.5 -> 17.1, the JS method 2.02 -> 2.06; reverted. The maps are not the cost.
+
+**The capture env lane** (`calls/closure_capture`, still 30.9x). A closure that reads a captured variable is called through `leaf_call_env` (11 ns in the in-frame lane vs 30.7 ns with one context read, measured before the generator work), where the extra cost is the frame fill, the `body_context`/`lexical_env` swap and its restore around the leaf entry. `new_body_context` already returns early for a body that captures nothing and `leaf_lookup` is a direct-mapped cell, so the remaining ~19 ns is the swap protocol itself — the caller's machine code would have to install the environment inline to remove it. Not attempted.
+
+**Typed-array elements** (`arrays/typed_array`, 21.2x). 2M iterations of `ta[k & 65535] = k & 255; s += ta[k & 65535];` = 11.4 ns per store+read pair: store alone 7.5 ns, read alone 5.9 ns (constant index saves 2.4 ns of the pair). Both are already fully inline — `JIT_HELPER_STATS` shows only the GC safepoint over the whole loop — and `SLAG_OPT=0` is 23% slower, so the optimizing tier is engaged. The CLIF shows, per access, a float -> uint -> float exact-integer check (ToIndex), a bounds check, the loaded value's tag check, a detached-buffer check and a property-flag test: the general element path, not a typed-array specialisation. The fix is an inline typed-array gate that skips ToIndex's round trip and the value tag checks — JIT emission work, not a tweak.
