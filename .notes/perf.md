@@ -15136,3 +15136,21 @@ eligible (see `.notes/closure-cost-plan.md`).
 
 Gates: fmt; clippy `-D warnings`; `cargo test --workspace`; test262 built-ins
 23,821, language 23,726, annexB 1,086, intl402 3,365 — 0 fail.
+
+## NULL (2026-10-20): the function record in the GC arena
+
+Stage D of the closure plan, in its smallest form: `Agent::ecma_functions` kept its key and stored `Gc<EcmaFunction>` instead of the 200-byte record inline. The insert phase fell 100 -> 56 ns in the instrumented phase profile (same run, same timer overhead), and calls got cheaper, but the record became a GC box rooted by the map — every minor promotes it, and the root set grows with the registry.
+
+Interleaved same-binary A/B, medians (8 pairs unless noted):
+
+| probe | before | after |
+| --- | ---: | ---: |
+| `e7` 300k closures | 77.5 ms | 83.7 ms (**+8%**) |
+| `e5` + one call each | 116-120 ms | 100-104 ms (-13%) |
+| `cap_uncaptured` | ~220 ms | ~226 ms |
+| `cap_let_drop` | ~376 ms | ~380 ms |
+| for-in head-let row (4 pairs) | 540-558 ms | 916-1393 ms (**+70% and rising**) |
+
+The call-path win is real and is about footprint: `ordinary_call` already borrows the record and copies five small fields, so what the handle removes is dragging a 200-byte value through the cache on every lookup (and a 200-byte rehash copy per grow). The for-in row shows the cost: its per-iteration closures turn the arena over, and every record is rooted and promoted before it is reaped.
+
+Conclusion: the registry's value has to stay out of the GC's root set. The plan's Stage D proper (the record reachable only from its function object, no traced map) is a different measurement; it needs the record type reachable from `crux` and was not attempted. Do not retry the map-holds-a-handle form.

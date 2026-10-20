@@ -207,3 +207,5 @@ creation site, 216 -> **200 bytes**. `e7` reads 75.8 ms median, so this plan's
 ~85 ms stop gate is met and **Stage D is eligible**. Details and the A/B
 numbers: `.notes/perf.md` ("capture chains shared per closure site").
 Eligibility is not an expectation: Stage D's arena record is still unmeasured.
+
+**Stage D measured (2026-10-20), not viable in its map form.** Storing `Gc<EcmaFunction>` in `ecma_functions` cut the insert phase 100 -> 56 ns and made calls 13% faster (`e5`), but rooting every record from the map promotes each one on its first minor: `e7` +8% (77.5 -> 83.7 ms) and the for-in head-let row +70% (540-558 -> 916-1393 ms). Reverted. Details in `.notes/perf.md` ("the function record in the GC arena"). The remaining shape — the record reachable only from its function object, with no traced map — would need `EcmaFunction` (or a handle to it) reachable from `crux`, and is still unmeasured.
