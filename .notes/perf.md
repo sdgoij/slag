@@ -15354,3 +15354,30 @@ Families (5-pair interleaved same-binary A/B): `strings` mean-jitGap 12.27 -> 9.
 `opt_tier_string_member_read_follows_the_prototype` covers the invalidation: it warms the cell, reassigns `String.prototype.charCodeAt`, calls through it, restores it, and calls again. With the generation comparison disabled the test answers 101 where 111 belongs (the stale cell serves the original function).
 
 Gates: fmt; clippy `-D warnings`; `cargo test --workspace` (38 suites, 0 fail); test262 built-ins 23,821, language 23,726, annexB 1,086, intl402 3,365 — 51,998 pass / 0 fail.
+
+## NULL (2026-10-21): the property store's cost is not in its lowering
+
+`objects/warm_store` and `objects/compound_assign` are the largest remaining absolute gaps (35-48 ms against node's 2.3), so I decomposed them. 4M iterations, release, same machine:
+
+| shape | slag | node |
+| --- | ---: | ---: |
+| `for (i) s = (s + i) \| 0` (bare) | 2.06 ms | 0.86 |
+| `for (i) t = t + i` (f64 accumulator) | 2.92 ms | 2.30 |
+| `for (i) n += o.d` (one read) | 9.79 ms | 0.86 |
+| `for (i) o.d = i` (one store) | 25.0 ms | 0.92 |
+| `for (i) o.d = 1` (constant store) | 23.4 ms | 0.92 |
+| `for (i) o.d = i; o.e = i` (two stores) | 51.8 ms | — |
+| `for (i) a[0] = i` (dense element store) | 13.5 ms | 0.97 |
+
+**Correction to the earlier read figure.** A property read used in arithmetic costs ~1.9 ns, not the 6.3 ns quoted in the string-cell note: that probe's `| 0` was the cost, not the read (§ below). `s = (s + o.d) | 0` is 26.3 ms against `n += o.d`'s 9.79 in the *same* register-body lane.
+
+**The store is invariant to its own lowering.** Four ablations, each built and run:
+
+- Replacing the entire `emit_member_store` body with `is_plain_object` + one raw `store` to `in_fields` (no map probe, no deferred gate, no barrier, no cell refresh): **no change** (23.4-26.4 ms across runs).
+- Removing the update arm's four-store value-cell refresh: no change.
+- Removing the read's `MemberGuard` entirely (unsound, as a ceiling): no change (27.5 vs 27.7 ms).
+- Two stores per iteration cost exactly twice one store (51.8 vs 25.0), so the cost is per store and lives in the loop, not in the gate.
+
+A store whose emitted code is *ten instructions* and a store whose emitted code is *sixty* cost the same, so no amount of restructuring inside `emit_member_store` pays. The remaining hypotheses are outside the lowering: a Cranelift regalloc spill around the op (the disassembly reloads a spilled value before every back edge) or a micro-architectural effect on the store. Confirming either needs a profiler this host does not have, or a per-shape specialized code path that bakes the field offset in after a map check (V8's shape) — a recompilation design, not a patch.
+
+**Not landed (neutral):** threading the shape cell validated by `emit_shape_store_probe` into the update arm as block parameters, removing the duplicate map -> map_id -> cell derivation (~11 instructions, 3 dependent loads). The subset corpus summed 240.0 (HEAD) vs 242.1 ms (dedup), five interleaved pairs — unresolved. Reverted; the instruction count is not the bottleneck.
