@@ -15025,3 +15025,33 @@ Gates: fmt; clippy `-D warnings`; `cargo test --workspace`; test262 built-ins
   ~12% eval-bound; the rest is its try/finally machinery.
 - **`arrays/typed_array`** is 11 ns/iter in the JIT (two element accesses +
   arithmetic) and 81 ns/iter in the interpreter (V8 `--jitless`: 20 ns).
+
+## LANDED (2026-10-20): reuse the eval parse
+
+`perform_eval` parsed the source on every call (`parse_script_utf16_eval`) and
+only then hit the per-source compiled-body cache: the parse was the whole cost.
+A 90-char eval source measured 9.8 us/call (`eval("1+1")` 2.75 us, `eval("")`
+0.95 us), so `try/completion-values` (12 evals x 1423 iterations) was
+parse-bound, not try/finally-bound.
+
+A thread-local `EvalParseKey -> Rc<Program>` cache, keyed by the exact source
+(materialised to a `Small`/`Flat` leaf so the untraced cache holds no GC edge),
+the `EvalContext` flags (`in_function`/`in_method`/`allow_private`) and the
+caller's private-name list. Parsing is realm-independent and the AST is plain
+data (string literals are `Small`/`Flat`, BigInts have no heap edges).
+`perform_eval` still bumps the template parse generation per evaluation, so a
+cached parse presents a fresh template site exactly as a fresh parse would
+(pinned by `script::tests::repeated_eval_keeps_a_fresh_template_object`; V8
+also returns distinct template objects for two evals of the same tagged
+template source).
+
+Interleaved same-binary A/B (release, 3 pairs): `eval_try` (20k evals of the
+90-char source) 202-205 -> **29-31 ms** (-85%, 9.8 -> 1.5 us/eval); 20k
+`eval("1+1")` 53.6-55.5 -> 18.9-19.6 ms (-65%); the `try/completion-values`
+corpus row 383.8-406.3 -> **206.0-207.7 ms (-47%)**. The remaining ~1.5 us is
+the per-eval setup (env + declaration instantiation), not parsing. Corpus
+`language` family mean (single runs) jit 9.94 -> 7.66, jl 8.51 -> 7.27; the
+overall mean stays inside its usual noise band.
+
+Gates: fmt; clippy `-D warnings`; `cargo test --workspace` (runtime 1056);
+test262 built-ins 23,821, language 23,726, annexB 1,086, intl402 3,365 — 0 fail.

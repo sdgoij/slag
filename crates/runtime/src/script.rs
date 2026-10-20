@@ -4,7 +4,8 @@
 //! VarScopedDeclarations, LexicallyScopedDeclarations, BoundNames,
 //! IsConstantDeclaration, ScriptIsStrict).
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::hash::BuildHasherDefault;
 
 use crux::error::{ErrorKind, JsError};
 use crux::handle::Handle;
@@ -741,6 +742,33 @@ pub fn validate_shadow_realm_source(source: &JsString) -> Result<(), JsError> {
     Ok(())
 }
 
+/// The eval parse cache: the same source evaluated with the same caller
+/// flags parses once. The AST is realm-independent plain data (the parser
+/// builds `Small`/`Flat` strings, never GC boxes), and repeated evals
+/// already share the compiled body (`Agent::script_bodies`), so only the
+/// parse was repeating. `perform_eval` still bumps the template parse
+/// generation per evaluation, so a cached parse presents a fresh template
+/// site just as a fresh parse would. The key source is materialised to a
+/// leaf so the cache holds no arena edge. Entries live for the process, like
+/// the other site caches (a dynamic-source eval loop grows it — the same
+/// documented tradeoff as `script_bodies`).
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct EvalParseKey {
+    source: JsString,
+    in_function: bool,
+    in_method: bool,
+    allow_private: bool,
+    private_names: Vec<crux::AtomId>,
+}
+
+type EvalParseCache =
+    HashMap<EvalParseKey, std::rc::Rc<Program>, BuildHasherDefault<crate::function::SiteHasher>>;
+
+thread_local! {
+    static EVAL_PARSE_CACHE: std::cell::RefCell<EvalParseCache> =
+        std::cell::RefCell::new(EvalParseCache::default());
+}
+
 pub fn perform_eval(
     agent: &mut Agent,
     source: &JsString,
@@ -781,9 +809,34 @@ pub fn perform_eval(
     let body_string = source.clone();
     crate::host::ensure_can_compile_strings(agent, &eval_realm, &[], &body_string, direct)?;
 
-    let program =
-        parser::parse_script_utf16_eval(source.as_slice(), &eval_context, &caller_private_names)?;
-    // A fresh eval parse is a distinct site space for the template cache.
+    let key = EvalParseKey {
+        source: match source {
+            JsString::Small { .. } | JsString::Flat(_) => source.clone(),
+            _ => JsString::from_utf16(source.as_slice()),
+        },
+        in_function,
+        in_method,
+        allow_private,
+        private_names: caller_private_names.clone(),
+    };
+    let cached = EVAL_PARSE_CACHE.with(|cache| cache.borrow().get(&key).cloned());
+    let program = match cached {
+        Some(program) => program,
+        None => {
+            let program = std::rc::Rc::new(parser::parse_script_utf16_eval(
+                source.as_slice(),
+                &eval_context,
+                &caller_private_names,
+            )?);
+            EVAL_PARSE_CACHE.with(|cache| {
+                cache.borrow_mut().insert(key, program.clone());
+            });
+            program
+        }
+    };
+    // A fresh eval parse is a distinct site space for the template cache; a
+    // cached parse must present a fresh generation too, so a template object
+    // from the previous evaluation is not reused.
     crate::expr::bump_template_parse_generation();
     // A script with no body evaluates to undefined.
     if program.body.is_empty() {
@@ -1503,6 +1556,21 @@ mod tests {
     #[test]
     fn empty_eval_returns_undefined() {
         assert_eq!(evaluated("").unwrap(), Value::Undefined);
+    }
+
+    #[test]
+    fn repeated_eval_keeps_a_fresh_template_object() {
+        // The parse cache reuses the eval AST, but the template generation
+        // still bumps per evaluation, so a template object from the previous
+        // call is not observed by the next one.
+        let mut agent = Agent::new();
+        agent.initialize_host_defined_realm().unwrap();
+        let value = agent
+            .run_script(
+                "function t(s) { return s; } function f() { return eval(\"t`a`\"); } f() !== f()",
+            )
+            .expect("the eval script");
+        assert_eq!(value, Value::Boolean(true), "a fresh template per eval");
     }
 
     #[test]

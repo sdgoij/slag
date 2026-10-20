@@ -1063,7 +1063,7 @@ type SourceInfoKey = (usize, usize, usize, usize, usize);
 /// per-closure path. Unlike an identity hasher every word is folded in: the
 /// node/span/realm fields are what keep a reused address from colliding.
 #[derive(Default)]
-struct SiteHasher(u64);
+pub(crate) struct SiteHasher(u64);
 
 impl std::hash::Hasher for SiteHasher {
     fn finish(&self) -> u64 {
