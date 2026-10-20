@@ -9838,15 +9838,17 @@ impl<'a> Lowerer<'a> {
             let wide = self.builder.ins().uextend(types::I64, res);
             self.builder.ins().fcvt_from_uint(types::F64, wide)
         } else {
-            let wide = self.builder.ins().sextend(types::I64, res);
-            self.builder.ins().fcvt_from_sint(types::F64, wide)
+            self.builder.ins().fcvt_from_sint(types::F64, res)
         };
+        // The result is an integer-valued f64 in `[-2^31, 2^32)`, so its bits
+        // can never fall in the NaN-box tag-prefix space and `canon` would be
+        // the identity — skip it rather than sit three cycles on the chain.
         let bits = self
             .builder
             .ins()
             .bitcast(types::I64, MemFlagsData::new(), res);
         let range = self.builder.ins().band(l_range, r_range);
-        (self.canon(bits), range)
+        (bits, range)
     }
 
     /// Truncate an f64 toward zero to `i64` and report whether it is inside the

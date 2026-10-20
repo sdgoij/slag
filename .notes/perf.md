@@ -15381,3 +15381,15 @@ Gates: fmt; clippy `-D warnings`; `cargo test --workspace` (38 suites, 0 fail); 
 A store whose emitted code is *ten instructions* and a store whose emitted code is *sixty* cost the same, so no amount of restructuring inside `emit_member_store` pays. The remaining hypotheses are outside the lowering: a Cranelift regalloc spill around the op (the disassembly reloads a spilled value before every back edge) or a micro-architectural effect on the store. Confirming either needs a profiler this host does not have, or a per-shape specialized code path that bakes the field offset in after a map check (V8's shape) — a recompilation design, not a patch.
 
 **Not landed (neutral):** threading the shape cell validated by `emit_shape_store_probe` into the update arm as block parameters, removing the duplicate map -> map_id -> cell derivation (~11 instructions, 3 dependent loads). The subset corpus summed 240.0 (HEAD) vs 242.1 ms (dedup), five interleaved pairs — unresolved. Reverted; the instruction count is not the bottleneck.
+
+## LANDS (2026-10-21): the register lane's int op drops `canon` and `sextend`
+
+`(s + o.d) | 0` costs 27.4 ms over 4M iterations against `n += o.d`'s 9.8 — the bit op alone is ~4.1 ns. Its chain in the register lane's `emit_int_binary` was `fabs/fcmp/fcvt_to_sint_sat` -> `ireduce` -> the i32 op -> `sextend` -> `fcvt_from_sint` -> `bitcast` -> `canon`, i.e. two float<->int conversions plus a three-instruction canonicalization on the result.
+
+Both tail pieces were redundant, and the optimizing tier's `call_int_binary` already says so in a comment: an integer-valued f64 in `[-2^31, 2^32)` can never carry the NaN-box tag prefix, so `canon` is the identity, and `fcvt_from_sint` takes the i32 directly, so the `sextend` is dead. Removed both; the register lane now emits what the opt tier always did.
+
+Probes (4M iterations, 3 interleaved same-binary pairs): `s = (s + o.d) | 0` 27.4 -> **25.7 ms** (-6.5%, the three pairs disjoint: 27.1/27.3/27.8 vs 25.5/25.6/25.8) and `o.x += 1; s += o.x` 54.4 -> **52.8 ms** (-3.0%).
+
+The corpus does not resolve it: the median `mean-jitGap` moves 10.75 -> 10.70 over three pairs, and families this change cannot touch moved by more than that (`calls` 9.99 -> 10.79, `control` 13.73 -> 14.50) on a host that varied ~10% during the run. Reported as an isolated win only.
+
+**What is left of the 4.1 ns.** The remaining chain is the f64 -> i64 -> i32 -> i64 -> f64 round trip, about 11 cycles: `fcvt_to_sint_sat` and `fcvt_from_sint` are 4 cycles each and nothing on the path is redundant. Removing it needs the operand to already live in an i32 register — the int-plan (`BinStoreInt` / `IntRhs`), which currently fuses `s = (s + k) | 0` only when the RHS is an immediate, the counter, or an accumulator already proven `Int`. A member read is none of those, so `(s + o.d) | 0` cannot take the plan. Extending the plan to accept a guarded member read is the next cut, and it is a plan change rather than a lowering change. (`>>>` still does its `uextend` before `fcvt_from_uint`; same one-instruction removal, not measured.)
