@@ -309,6 +309,46 @@ impl Context {
         &mut self.agent
     }
 
+    /// Write this realm's state as a snapshot blob.
+    ///
+    /// The blob carries the realm's global bindings (`realm_global`), which is
+    /// where `eval`'s top-level `const`/`let`/function declarations live. It
+    /// carries no host callbacks: this narrow entry point passes no
+    /// `snapshot::HostCallbacks` table, so a realm holding a Rust callback
+    /// refuses the write and names it.
+    pub fn write_snapshot(&mut self) -> Result<Vec<u8>, String> {
+        let realm = self
+            .agent
+            .current_realm()
+            .map_err(|error| error.to_string())?;
+        let slots = [crate::snapshot::Slot {
+            index: 0,
+            realm,
+            items: &[],
+            realm_global: true,
+        }];
+        let agent = &mut *self.agent;
+        crux::function::with_agent(agent as *mut Agent as *mut (), || {
+            crate::snapshot::encode_slots(agent, &slots, &[], None)
+                .map_err(|error| error.to_string())
+        })
+    }
+
+    /// Restore a blob written by [`Context::write_snapshot`] onto this realm's
+    /// global. A blob for another realm's builtins or word size is refused.
+    pub fn read_snapshot(&mut self, bytes: &[u8]) -> Result<(), String> {
+        let realm = self
+            .agent
+            .current_realm()
+            .map_err(|error| error.to_string())?;
+        let agent = &mut *self.agent;
+        crux::function::with_agent(agent as *mut Agent as *mut (), || {
+            crate::snapshot::decode_slot(agent, &realm, bytes, 0, &[], None)
+                .map(|_| ())
+                .map_err(|error| error.to_string())
+        })
+    }
+
     /// Toggle `--gc-stress`: collect at every safe point (script boundary /
     /// job-queue drain) instead of only on heap growth (.notes/gc-plan.md
     /// GC-1 slice 3; GC-2 hardens the root audit under it).
@@ -3465,5 +3505,29 @@ mod tests {
                 .as_number(),
             Some(499500.0)
         );
+    }
+
+    #[test]
+    fn a_realm_round_trips_through_the_embed_snapshot() {
+        // `write_snapshot` carries no host-callback table, so the console and
+        // the timers `Context::new` installs have to be out of the realm first;
+        // the reading `Context::new` puts its own back.
+        let mut writer = Context::new().unwrap();
+        writer
+            .eval(
+                "delete globalThis.console; \
+                 delete globalThis.setTimeout; delete globalThis.setInterval; \
+                 delete globalThis.clearTimeout; delete globalThis.clearInterval;",
+            )
+            .unwrap();
+        writer
+            .eval("const answer = 41 + 1; function plusOne(n) { return n + 1; }")
+            .unwrap();
+        let blob = writer.write_snapshot().unwrap();
+
+        let mut reader = Context::new().unwrap();
+        reader.read_snapshot(&blob).unwrap();
+        assert_eq!(reader.eval("answer").unwrap().as_number(), Some(42.0));
+        assert_eq!(reader.eval("plusOne(41)").unwrap().as_number(), Some(42.0));
     }
 }
