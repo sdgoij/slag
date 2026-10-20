@@ -2465,6 +2465,13 @@ pub fn ensure_deferred_namespace_evaluation_key(
     obj: &JsObject,
     key: &crux::property::PropertyKey,
 ) -> Result<(), JsError> {
+    // Only a deferred namespace can trigger, and the key test below allocates
+    // (a `JsString` to UTF-8 conversion), so it must not run on the ordinary
+    // reads that reach this from every accessor scan (`find_ecma_accessor`)
+    // and every `put_value`.
+    if deferred_namespace_module(agent, obj).is_none() {
+        return Ok(());
+    }
     match key {
         crux::property::PropertyKey::Symbol(_) => return Ok(()),
         crux::property::PropertyKey::String(id) => {

@@ -15393,3 +15393,29 @@ Probes (4M iterations, 3 interleaved same-binary pairs): `s = (s + o.d) | 0` 27.
 The corpus does not resolve it: the median `mean-jitGap` moves 10.75 -> 10.70 over three pairs, and families this change cannot touch moved by more than that (`calls` 9.99 -> 10.79, `control` 13.73 -> 14.50) on a host that varied ~10% during the run. Reported as an isolated win only.
 
 **What is left of the 4.1 ns.** The remaining chain is the f64 -> i64 -> i32 -> i64 -> f64 round trip, about 11 cycles: `fcvt_to_sint_sat` and `fcvt_from_sint` are 4 cycles each and nothing on the path is redundant. Removing it needs the operand to already live in an i32 register — the int-plan (`BinStoreInt` / `IntRhs`), which currently fuses `s = (s + k) | 0` only when the RHS is an immediate, the counter, or an accumulator already proven `Int`. A member read is none of those, so `(s + o.d) | 0` cannot take the plan. Extending the plan to accept a guarded member read is the next cut, and it is a plan change rather than a lowering change. (`>>>` still does its `uextend` before `fcvt_from_uint`; same one-instruction removal, not measured.)
+
+## LANDED (2026-10-21): the accessor scan stops allocating a String per chain link
+
+Chasing the accessor cost turned up a per-read allocation on the hottest path in the engine. `ensure_deferred_namespace_evaluation_key` (called from `find_ecma_accessor` for **every prototype-chain link** of **every non-own-data member read**, and from `put_value`) tested the key before the cheap object-kind reject:
+
+```rust
+if crux::lookup(*id).to_string_lossy() == "then" { return Ok(()); }   // allocates
+```
+
+`to_string_lossy()` builds a UTF-8 `String` (and converts the whole key) for a comparison that only a *deferred module namespace* can care about. Reordering the existing kind test (`deferred_namespace_module(agent, obj).is_none()`) in front of the key test removes it from every ordinary read.
+
+Probes (3 interleaved same-binary pairs, disjoint):
+
+| probe | before | after |
+| --- | ---: | ---: |
+| `o.x` on a getter (1M, getter declared outside the loop) | 219.4 ms | **177.8 ms** (-18.5%) |
+| `o.nope` — a property that does not exist (100k) | 18.2 ms | **10.8 ms** (-43%) |
+| `o.a` — an own data property (control) | 5.55 ms | 5.53 ms (flat) |
+
+The corpus moves in the same direction but does not resolve it on its own: the overall `mean-jitGap` is 10.88 -> 10.78 over three pairs, while **eight of the nine families improved** (language 7.60 -> 6.78, calls 10.58 -> 10.30, control 14.91 -> 14.68, arrays 10.08 -> 9.93, objects 9.33 -> 9.13, builtins 7.36 -> 7.23, strings 9.27 -> 9.10, globals 2.27 -> 2.17; opcost flat). A change that touches every non-data member read should move every family, which is what makes the family table the stronger evidence here than the corpus mean.
+
+### Measured along the way (unchanged code, for the next reader)
+
+A member read costs, over 1M iterations: **5.6 ns** for an own data property, **88 ns** for an accessor (after this fix; 110 before), and **105 ns** for a property that does not exist (after; 184 before). The accessor is 16x a data read because the member cell caches data properties only — a getter has to run, and the read re-enters `get_member_name` → `get_property` → `find_ecma_accessor` → `function::call` every time. A compiled method call with the same body (`o.m()` where `m` reads `this.a`) is 10.8 ns, so roughly 80 ns of the accessor cost is the helper chain rather than the getter itself. `RegExp.prototype.test` on `/[a-z]+/` against an 8-unit string is 396 ns and `exec` is 994 ns; `re.source` (a native accessor) 328 ns.
+
+Two probe artifacts worth remembering: defining the getter *inside* the hot function changes what compiles and gave a bogus 683 ns figure, and `re.exec`'s 994 ns includes building the result array (`test` avoids it).
