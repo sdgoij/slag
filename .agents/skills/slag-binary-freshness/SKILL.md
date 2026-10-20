@@ -1,6 +1,6 @@
 ---
 name: slag-binary-freshness
-description: Verify a target/*.exe was built from the current source before trusting its output. Load before running any Slag binary (slag.exe, sweep.exe, leak.exe, examples) after source edits, git checkouts/stashes/resets, or when behavior contradicts the code you are reading (e.g. an error message that does not exist in crates/). Covers mapping each binary to its producing package and mtime/cargo checks.
+description: Verify a target/*.exe was built from the current source before trusting its output. Load before running any Slag binary (slag.exe, sweep.exe, leak.exe, examples) after source edits, git checkouts/stashes/resets, or when behavior contradicts the code you are reading (e.g. an error message that does not exist in crates/). Covers the tools/build.sh content-addressed binary cache, mapping each binary to its producing package, and mtime/cargo checks.
 ---
 
 # Slag binary freshness
@@ -27,6 +27,35 @@ doubt):
 
 The package `slag` is a LIBRARY (`crates/slag`); it does not produce `slag.exe`.
 Do not assume `cargo build -p slag` rebuilt the CLI.
+
+## Use the build cache, not a bare cargo build
+
+`tools/build.sh` builds `slag`/`leak` (`cli`), `sweep` (`test262`) and
+`wasmtest` (`wasmtest`) and caches the binaries under `target/build-cache`.
+
+- The key is the **content of the working tree**, not the commit: `git add -A`
+  on a throwaway index (`target/.build-cache-index`) followed by `git write-tree`,
+  hashed together with the profile, `rustc -vV`, the checkout path, `RUSTFLAGS`,
+  `RUSTC`, `CARGO_BUILD_TARGET`, and the test262 submodule's HEAD plus status
+  hash. On a clean checkout the tree hash equals `git rev-parse HEAD^{tree}`; a
+  tree assembled by `git checkout <rev> -- crates/` gets its own entry, which a
+  commit hash could not do.
+- Output is one line: `build-cache: hit <tree16>/ <profile>, HEAD <sha> clean|dirty`
+  or `miss`. A hit copies the stored binaries into `target/<profile>/` in well
+  under a second; a miss runs cargo and stores the result.
+- `--print-key` prints `tree`, `config`, `entry` and HEAD without building — use
+  it to prove whether an edit actually changed the key.
+- `-p cli` (or `-p test262`, `-p wasmtest`, repeatable) limits the build. The
+  packages resolve `runtime` with different feature sets, so they are built one
+  at a time; do not merge them into one cargo invocation, or feature unification
+  will change the binaries.
+- A hit is content-equivalent to a fresh build, so it is safe to trust. If a hit
+  still contradicts the source, inspect `target/build-cache/<entry>/meta.txt`
+  (tree, HEAD, rustc, date) and rebuild with `--force`; if that fixes it, the key
+  is missing an input and the script needs fixing.
+- `--no-cache` bypasses the cache. Entries are ~60 MB each; delete
+  `target/build-cache` to reclaim the space. `SLAG_BUILD_CACHE` relocates it;
+  keep the cache per-checkout, since binaries embed the building path.
 
 ## Freshness checks (run before trusting output)
 

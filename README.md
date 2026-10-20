@@ -78,11 +78,18 @@ instructions if the submodule is missing.
 
 ```sh
 git submodule update --init   # the pinned test262 corpus
-cargo build --release
+tools/build.sh                # cached release build: slag, sweep, wasmtest
+cargo build --release         # or a plain, uncached cargo build
 target/release/slag --version
 target/release/slag script.js [args...]   # run a script
 target/release/slag                       # REPL
 ```
+
+`tools/build.sh` keys a cache under `target/build-cache` on the content of the
+working tree, so revisiting a revision (during a bisect, an A/B run, or after
+toggling a change) restores the binaries in about a second instead of relinking
+for minutes. `tools/build.sh -p cli` builds only `slag` and `leak`;
+`--print-key` shows which entry the current tree maps to.
 
 The CLI exposes `process.argv` and a minimal `fs` (`readFileSync`/
 `readdirSync`/`statSync`) to scripts — `readFileSync` returns the raw bytes as a
