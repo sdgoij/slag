@@ -3465,10 +3465,10 @@ extern "C" fn store_ident(ctx: *mut c_void, name: u64, value: u64) -> u64 {
     } else {
         match vm.var_ref_stack.pop() {
             Some(reference) => crate::context::put_value(agent, &reference, value),
-            None => Err(JsError::new(
-                ErrorKind::SyntaxError,
-                "StoreIdent without a resolution".into(),
-            )),
+            // The pre-resolve is gated on the same flag and skipped the push
+            // when the chain was clean, so a missing reference means the
+            // global binding the resolve targeted.
+            None => vm.store_ident_value(agent, name_atom, value, true),
         }
     };
     match result {

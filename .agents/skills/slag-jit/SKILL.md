@@ -1351,3 +1351,31 @@ process) while `--jitless` was unaffected. Full write-up:
   is fine (its cohort is collected at the script boundary); the pathology needs a
   preceding allocating workload. `node tools/corpus/bench.js` at the README's
   commit vs HEAD is the check.
+
+## 34. A nested run on the caller's Vm must restore every per-activation Vm field
+
+The certified-callee lane (`run_certified_call_nested` → `run_compiled_body_on`)
+runs the callee **on the caller's `Vm`**. `run_inner` recomputes
+`Vm::globals_unshadowed` at every activation, and `VmScratch` is the contract
+that puts the caller's state back. It did not list that field, so a callee whose
+chain was shadowed (or that read no names — `global_reads_are_unshadowed`
+returns `false` for an empty list) left the caller's flag `false` for the rest
+of its run.
+
+The failure is an internal `SyntaxError: StoreIdent without a resolution` at
+the first global assignment after such a call: `ResolveIdentStore` skipped the
+reference push while the chain looked clean, then `StoreIdent` re-read the
+clobbered flag, took the dynamic path and popped an empty `var_ref_stack`.
+Goats reproduced it in `terrainMesh = rl.makeModel(...)`.
+
+- **The compiled tier hides it.** `LoadIdent`/`StoreIdent` in machine code read
+  the per-call `JitCallContext`, so a compiled caller is unaffected; an
+  *interpreted* caller reads the shared `Vm` field. `--jitless` and a warm JIT
+  therefore diverge, and a trace showing `ctx_clean=true` next to
+  `vm_clean=false` is the tell.
+- **Every field `run_inner` writes is a candidate.** When adding one, check
+  whether `save_scratch`/`restore_scratch` list it. The regression test is
+  `ir::tests::a_nested_run_restores_the_callers_globals_unshadowed`.
+- **The store sites are defensive now.** An empty reference stack falls back to
+  `store_ident_value(..., true)` (the global binding the pre-resolve targeted)
+  instead of throwing, in both the interpreter and `store_ident`.

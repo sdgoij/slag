@@ -14938,3 +14938,37 @@ Reverting `8e276655` instead was measured and rejected: an interleaved A/B on a
 at the parent versus 41.5-43.0 ms at the commit** — 20.7x. The corpus has no
 global-*store* row (its `globals/*` are read-only), which is why the corpus
 means showed the change as ~flat and why the regression hid there.
+
+## FIXED (2026-10-20): a nested run on the caller's Vm clobbered `globals_unshadowed`
+
+**Symptom.** Goats' `the_birds_mod_works` failed at `makeTerrain()` with
+`SyntaxError: StoreIdent without a resolution` (44 cases, release only). The
+standalone scene did not reproduce it; the mod-install path did.
+
+**Cause.** `run_inner` recomputes `Vm::globals_unshadowed` at every activation.
+The certified-callee lane runs a callee **on the caller's Vm**
+(`run_certified_call_nested` -> `run_compiled_body_on`), and `VmScratch` did not
+save that field. A callee with no ident names (or any shadowed chain) computes
+`false`; after it returned, the caller's flag was `false` for the rest of its
+run. The failing statement is `terrainMesh = rl.makeModel(...)`: its
+`ResolveIdentStore` saw a clean chain and skipped the reference push, then
+`StoreIdent` re-read the (now clobbered) flag, took the dynamic path and popped
+an empty `var_ref_stack`. The `SLAG_STORE_TRACE` probe made it one line:
+`resolve name=terrainMesh clean=true` immediately followed by
+`store name=terrainMesh clean=false`.
+
+This also explains the earlier `ctx_clean=true / vm_clean=false` mismatches: the
+compiled tier reads its per-call `JitCallContext`, so it was unaffected; the
+interpreter reads the shared `Vm` field and was not.
+
+**Fix.** `VmScratch` now saves and restores `globals_unshadowed` (one bool, no
+hot-path cost worth measuring), and both `StoreIdent` sites fall back to
+`store_ident_value(..., true)` when the reference stack is empty: the resolve
+skipped the push because the chain was clean then, so the global binding is the
+target it meant. The internal `SyntaxError` is gone from both tiers.
+
+**Gates.** New unit test
+`ir::tests::a_nested_run_restores_the_callers_globals_unshadowed`; Goats
+`the_birds_mod_works` 44/44 pass (release, linked to the local checkout);
+`cargo test --workspace`; clippy `-D warnings`; test262 built-ins 23,821,
+language 23,726, annexB 1,086, intl402 3,365, all at 100%.

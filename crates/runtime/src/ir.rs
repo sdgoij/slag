@@ -3597,10 +3597,10 @@ pub(crate) fn with_leaf_run<T>(vm: *mut Vm, body: *const CompiledBody, f: impl F
 
 /// The caller's per-activation `Vm` state a nested certified JIT run on the
 /// shared `Vm` must neither observe nor clobber (see [`Vm::save_scratch`]): the
-/// scratch registers (saved and reset to a fresh activation's values) and the
-/// shared value/array-index/`var`-reference/class cursors (saved, and truncated
-/// back on restore so a nested run's error path cannot leak an entry into the
-/// caller).
+/// scratch registers (saved and reset to a fresh activation's values), the
+/// caller's `globals_unshadowed` verdict, and the shared value/array-index/
+/// `var`-reference/class cursors (saved, and truncated back on restore so a
+/// nested run's error path cannot leak an entry into the caller).
 pub(crate) struct VmScratch {
     ip: usize,
     acc: Value,
@@ -3612,6 +3612,12 @@ pub(crate) struct VmScratch {
     switch_disc: Value,
     switch_disc_set: bool,
     chain_short: bool,
+    /// The caller's `globals_unshadowed` verdict. A nested run on this Vm
+    /// recomputes the field for its own body; without restoring it, every
+    /// later `LoadIdent`/`StoreIdent` in the caller would use the callee's
+    /// verdict (and a `StoreIdent` that skipped its pre-resolve would find an
+    /// empty reference stack).
+    globals_unshadowed: bool,
     stack_len: usize,
     array_index_len: usize,
     var_ref_len: usize,
@@ -4207,6 +4213,7 @@ impl Vm {
             switch_disc: self.switch_disc,
             switch_disc_set: self.switch_disc_set,
             chain_short: self.chain_short,
+            globals_unshadowed: self.globals_unshadowed,
             stack_len: self.stack.len(),
             array_index_len: self.array_index_stack.len(),
             var_ref_len: self.var_ref_stack.len(),
@@ -4413,6 +4420,7 @@ impl Vm {
         self.switch_disc = scratch.switch_disc;
         self.switch_disc_set = scratch.switch_disc_set;
         self.chain_short = scratch.chain_short;
+        self.globals_unshadowed = scratch.globals_unshadowed;
         // A nested run's pushes above these cursors are dropped (the lane
         // returns its result through the entry's return value, not the shared
         // stack), so an error path inside it cannot leave a stale entry for
@@ -8065,14 +8073,14 @@ impl Vm {
                     let value = self.pop();
                     if body.env_constant && self.globals_unshadowed {
                         self.store_ident_value(agent, *name, value, true)?;
-                    } else {
-                        let reference = self.var_ref_stack.pop().ok_or_else(|| {
-                            JsError::new(
-                                ErrorKind::SyntaxError,
-                                "StoreIdent without a resolution".into(),
-                            )
-                        })?;
+                    } else if let Some(reference) = self.var_ref_stack.pop() {
                         crate::context::put_value(agent, &reference, value)?;
+                    } else {
+                        // The resolve skipped the push because the chain was
+                        // clean when the statement started, so the binding it
+                        // targeted is the global one even if the flag has
+                        // changed since.
+                        self.store_ident_value(agent, *name, value, true)?;
                     }
                     self.stack.push(value);
                 }
@@ -31243,6 +31251,24 @@ mod tests {
         assert!(
             matches!(agent.global_cells[Vm::global_cell_index(data)], Some((name, _)) if name == data),
             "a data property records its own slot"
+        );
+    }
+
+    #[test]
+    fn a_nested_run_restores_the_callers_globals_unshadowed() {
+        // The certified-callee lane runs the callee on the caller's Vm, and
+        // `run_inner` recomputes this verdict for the callee's body. A caller
+        // whose `ResolveIdentStore` skipped its push (the chain was clean)
+        // would otherwise take the pop path at `StoreIdent` and fail with
+        // "StoreIdent without a resolution".
+        let mut vm = Vm::new(crate::env::new_declarative_environment(None), false);
+        vm.globals_unshadowed = true;
+        let scratch = vm.save_scratch();
+        vm.globals_unshadowed = false;
+        vm.restore_scratch(scratch);
+        assert!(
+            vm.globals_unshadowed,
+            "restore_scratch must return the caller's globals_unshadowed verdict"
         );
     }
 
