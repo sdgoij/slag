@@ -15055,3 +15055,44 @@ overall mean stays inside its usual noise band.
 
 Gates: fmt; clippy `-D warnings`; `cargo test --workspace` (runtime 1056);
 test262 built-ins 23,821, language 23,726, annexB 1,086, intl402 3,365 — 0 fail.
+
+## NULL (2026-10-20): typed-array register fast path
+
+Two attempts, both measured and reverted. (a) A pre-probe in the computed
+register arms (`typed_array_element_read/write` before
+`get_member_computed`/`assign_computed_plain`) duplicated the receiver checks
+on every non-typed store: dense-array `arr_both` jl 134.7-142.2 ->
+163.6-164.6 ms (**+18%**), `ta_write` +11%. (b) `#[inline]` on the crux element
+accessors alone: `arr_both` +3%, `typed_array` +1-2%, `ta_write` +2-4%. The
+shared functions already check the receiver once; a probe in front only pays
+for receivers that are not typed arrays. The remaining ~25 ns read / ~35 ns
+write over a 24 ns loop floor is the interpreter dispatch itself, so reopening
+this needs a fused op keyed on a statically known receiver kind, not another
+probe.
+
+## LANDED (2026-10-20): stack sites without copying the source
+
+The eval parse cache left `try/completion-values` at ~207 ms, and ablation
+showed the rest was not eval setup: replacing its 12 `eval(...)` arguments with
+constants left 1.35 ms, a non-throwing eval costs 1.5 us, and the `[].x.x`
+eval that throws costs 7.7 us. Each caught throw builds an Error stack eagerly
+(`define_stack`), and `frame_site` materialised
+`syntax::SourceText::from_utf8(&source.to_string_lossy())` — a full `String`
+copy of the source plus a units Vec and a line-starts Vec — for **every
+frame**. With several caller frames whose source is the whole fixture, one
+throw copied tens of KB.
+
+`frame_site` now scans the source's own UTF-16 units (`line_column_at`),
+matching `SourceText::line_column` exactly (CR, LF, CRLF, U+2028, U+2029; a
+position at a terminator stays on the line it ends), with no allocation. A
+differential test checks every offset of ten texts against `SourceText`.
+
+Interleaved same-binary A/B (3 pairs): the throwing eval probe
+112.7-122.9 -> 97.7-99.4 ms (-18%), the non-throwing probe 24.8-25.6 ->
+22.2-23.4 ms (-9%), and the `try/completion-values` row **197.1-203.6 ->
+95.9-100.5 ms (-51%)**, from ~4.8x node to ~1.2x. The corpus `language`
+family mean (single run) read 8.27 against 7.66 before: the other two rows
+moved inside their noise, so the isolated row is the evidence.
+
+Gates: fmt; clippy `-D warnings`; `cargo test --workspace`; test262 built-ins
+23,821, language 23,726, annexB 1,086, intl402 3,365 — 0 fail.

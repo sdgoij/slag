@@ -283,9 +283,38 @@ pub(crate) fn script_name(agent: &Agent, context: &ExecutionContext) -> Option<S
 pub(crate) fn frame_site(context: &ExecutionContext) -> Option<(usize, usize)> {
     let span = context.position?;
     let source = context.source.as_ref()?;
-    let text = syntax::SourceText::from_utf8(&source.to_string_lossy());
-    let location = text.line_column(span.start);
-    Some((location.line as usize, location.column as usize))
+    // Count from the source's own UTF-16 units: `SourceText::from_utf8` would
+    // copy the whole text (a `String` + a units Vec + a line-starts Vec) for
+    // one position, per frame, on every Error construction.
+    Some(line_column_at(source.as_slice(), span.start as usize))
+}
+
+/// 1-based line and column for a UTF-16 offset, with `syntax::SourceText`'s
+/// `line_column` rules (CR, LF, CRLF, U+2028, U+2029; a position AT a
+/// terminator stays on the line it ends), without materialising the text.
+pub(crate) fn line_column_at(units: &[u16], offset: usize) -> (usize, usize) {
+    let end = offset.min(units.len());
+    let mut line = 1usize;
+    let mut line_start = 0usize;
+    let mut i = 0usize;
+    while i < end {
+        let next = match units[i] {
+            0x000D if units.get(i + 1) == Some(&0x000A) => i + 2,
+            0x000D | 0x000A | 0x2028 | 0x2029 => i + 1,
+            _ => {
+                i += 1;
+                continue;
+            }
+        };
+        // A terminator at or past the offset belongs to the line it ends; a
+        // CRLF's line starts only after the pair.
+        if next <= end {
+            line += 1;
+            line_start = next;
+        }
+        i = next;
+    }
+    (line, end - line_start + 1)
 }
 
 #[cfg(test)]
@@ -338,5 +367,36 @@ mod tests {
         let _context = Context::new(&mut isolate).expect("context");
         assert!(isolate.capture_stack(0).is_none());
         assert!(isolate.capture_stack(1).is_some());
+    }
+
+    /// The allocation-free line/column scan must agree with
+    /// `syntax::SourceText` at every offset, for every terminator it knows
+    /// (CR, LF, CRLF, U+2028, U+2029), including past-the-end clamping.
+    #[test]
+    fn the_unit_scan_matches_source_text() {
+        let texts = [
+            "",
+            "abc",
+            "a\nb",
+            "a\rb",
+            "a\r\nb",
+            "a\r\n\r\nb",
+            "a\u{2028}b",
+            "a\u{2029}b",
+            "\r\n\r",
+            "a\r\n",
+        ];
+        for text in texts {
+            let expected_source = syntax::SourceText::from_utf8(text);
+            let units: Vec<u16> = text.encode_utf16().collect();
+            for offset in 0..=units.len() + 2 {
+                let expected = expected_source.line_column(offset as u32);
+                assert_eq!(
+                    super::line_column_at(&units, offset),
+                    (expected.line as usize, expected.column as usize),
+                    "{text:?} at {offset}"
+                );
+            }
+        }
     }
 }
