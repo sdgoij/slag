@@ -846,6 +846,7 @@ mod tests {
             apply_builtin_bits: 0,
             call_builtin_bits: 0,
             intrinsic_bits: [0; runtime::ir::INTRINSIC_COUNT],
+            string_prototype_bits: 0,
             dispatch_value: 0,
             suspension: None,
             suspend_sp: 0,
@@ -1277,6 +1278,7 @@ mod tests {
             apply_builtin_bits: 0,
             call_builtin_bits: 0,
             intrinsic_bits: [0; runtime::ir::INTRINSIC_COUNT],
+            string_prototype_bits: 0,
             dispatch_value: 0,
             suspension: None,
             suspend_sp: 0,
@@ -1578,6 +1580,7 @@ mod tests {
             apply_builtin_bits: 0,
             call_builtin_bits: 0,
             intrinsic_bits: [0; runtime::ir::INTRINSIC_COUNT],
+            string_prototype_bits: 0,
             dispatch_value: 0,
             suspension: None,
             suspend_sp: 0,
@@ -1672,6 +1675,7 @@ mod tests {
             apply_builtin_bits: 0,
             call_builtin_bits: 0,
             intrinsic_bits: [0; runtime::ir::INTRINSIC_COUNT],
+            string_prototype_bits: 0,
             dispatch_value: 0,
             suspension: None,
             suspend_sp: 0,
@@ -2218,6 +2222,37 @@ mod tests {
         );
         assert!(compiled >= 1, "{compiled} bodies compiled");
         assert!(lowered >= 1, "the optimizing tier lowered {lowered} bodies");
+    }
+
+    #[test]
+    fn opt_tier_string_member_read_follows_the_prototype() {
+        // A primitive string's non-index member read is served from the shared
+        // member-value cell keyed by %String.prototype% (the compiled lane in
+        // `compiler`/`opt_lower`), so the cell must track the prototype: an
+        // assignment, a delete, and a restore between compiled reads must each
+        // be observed. A stale cell would answer `97`/the old function instead.
+        let source = "function callc(s, i) { return s.charCodeAt(i); } \
+                      var warm = 0; \
+                      for (var k = 0; k < 200; k++) { warm += callc('abcdefgh', 1); } \
+                      var orig = String.prototype.charCodeAt; \
+                      var alt = function (i) { return 41 + i; }; \
+                      String.prototype.charCodeAt = alt; \
+                      var a = callc('abcdefgh', 0); \
+                      String.prototype.charCodeAt = orig; \
+                      var b = callc('abcdefgh', 1); \
+                      (warm === 19600 ? 1 : 0) + (a === 41 ? 10 : 0) \
+                        + (b === 98 ? 100 : 0);";
+        let interp = {
+            let mut agent = runtime::Agent::new();
+            agent.initialize_host_defined_realm().expect("realm");
+            agent.run_script(source).expect("interp runs")
+        };
+        let (value, compiled) = with_opt_jit_agent(|agent| agent.run_script(source).expect("runs"));
+        assert_eq!(
+            value, interp,
+            "a string member read must follow a %String.prototype% mutation"
+        );
+        assert!(compiled >= 1, "{compiled} bodies compiled");
     }
 
     #[test]

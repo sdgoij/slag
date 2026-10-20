@@ -736,9 +736,15 @@ fn lower_inst(
                 .iconst(types::I64, JsValue::Undefined.bits() as i64);
             builder.def_var(result, dummy);
             let load = builder.create_block();
+            // `length` on a string is an own virtual property (the helper serves
+            // it straight from the string), so it has no prototype cell — the
+            // lane would only add a probe before the helper.
+            let string = (*atom != crux::string::length_atom()).then(|| builder.create_block());
             let merge = builder.create_block();
             let obj_ok = crate::cells::is_plain_object(builder, object);
-            builder.ins().brif(obj_ok, load, &[], merge, &[]);
+            builder
+                .ins()
+                .brif(obj_ok, load, &[], string.unwrap_or(merge), &[]);
             builder.switch_to_block(load);
             let ptr = crate::cells::object_data_ptr(builder, object);
             let live_id = builder.ins().load(
@@ -752,6 +758,31 @@ fn lower_inst(
             builder.def_var(result, value);
             builder.ins().jump(merge, &[]);
             builder.seal_block(load);
+            // A primitive string reads its non-index members off the realm's
+            // %String.prototype% cell (see `string_proto_cell`); the value is
+            // speculative, so the covering `Op::MemberGuard` re-validates it.
+            if let Some(string) = string {
+                builder.switch_to_block(string);
+                let str_load = builder.create_block();
+                let is_str = is_string(builder, object);
+                let proto_bits = builder.ins().load(
+                    types::I64,
+                    MemFlagsData::new(),
+                    abi.vm,
+                    Offset32::new(
+                        std::mem::offset_of!(JitCallContext, string_prototype_bits) as i32
+                    ),
+                );
+                let has_proto = builder.ins().icmp_imm_u(IntCC::NotEqual, proto_bits, 0);
+                let str_gate = builder.ins().band(is_str, has_proto);
+                builder.ins().brif(str_gate, str_load, &[], merge, &[]);
+                builder.seal_block(str_load);
+                builder.switch_to_block(str_load);
+                let (str_value, _) = crate::cells::string_proto_cell(builder, abi.vm, *atom, name);
+                builder.def_var(result, str_value);
+                builder.ins().jump(merge, &[]);
+                builder.seal_block(string);
+            }
             builder.switch_to_block(merge);
             builder.seal_block(merge);
             builder.use_var(result)
@@ -775,10 +806,15 @@ fn lower_inst(
             );
             let result = builder.declare_var(types::I64);
             let check = builder.create_block();
+            // `length` on a string is an own virtual property with no prototype
+            // cell, so it keeps the direct slow path.
+            let string = (*atom != crux::string::length_atom()).then(|| builder.create_block());
             let slow = builder.create_block();
             let merge = builder.create_block();
             let obj_ok = crate::cells::is_plain_object(builder, object);
-            builder.ins().brif(obj_ok, check, &[], slow, &[]);
+            builder
+                .ins()
+                .brif(obj_ok, check, &[], string.unwrap_or(slow), &[]);
             builder.switch_to_block(check);
             let ptr = crate::cells::object_data_ptr(builder, object);
             let live_id = builder.ins().load(
@@ -802,6 +838,34 @@ fn lower_inst(
             builder.def_var(result, spec);
             builder.ins().brif(ok, merge, &[], slow, &[]);
             builder.seal_block(check);
+            // A primitive string re-validates the %String.prototype% cell the
+            // speculative load read; a still-valid cell that holds the
+            // speculative value is the read (see `string_proto_cell`).
+            if let Some(string) = string {
+                builder.switch_to_block(string);
+                let str_check = builder.create_block();
+                let is_str = is_string(builder, object);
+                let proto_bits = builder.ins().load(
+                    types::I64,
+                    MemFlagsData::new(),
+                    abi.vm,
+                    Offset32::new(
+                        std::mem::offset_of!(JitCallContext, string_prototype_bits) as i32
+                    ),
+                );
+                let has_proto = builder.ins().icmp_imm_u(IntCC::NotEqual, proto_bits, 0);
+                let str_gate = builder.ins().band(is_str, has_proto);
+                builder.ins().brif(str_gate, str_check, &[], slow, &[]);
+                builder.seal_block(str_check);
+                builder.switch_to_block(str_check);
+                let (str_value, str_cell_ok) =
+                    crate::cells::string_proto_cell(builder, abi.vm, *atom, name);
+                let str_value_ok = builder.ins().icmp(IntCC::Equal, str_value, spec);
+                let str_ok = builder.ins().band(str_cell_ok, str_value_ok);
+                builder.def_var(result, spec);
+                builder.ins().brif(str_ok, merge, &[], slow, &[]);
+                builder.seal_block(string);
+            }
             builder.switch_to_block(slow);
             // `slow` is reached both for a non-object receiver (the tag gate
             // above) and for a plain object whose value cell missed, so
@@ -4212,9 +4276,42 @@ fn emit_member_chain_read(
     name: crux::AtomId,
 ) -> Result<ClifValue, Unsupported> {
     let value = builder.declare_var(types::I64);
+    let obj_entry = builder.create_block();
     let entry = builder.create_block();
     let slow = builder.create_block();
     let merge = builder.create_block();
+    // A primitive string's non-index member resolves on the realm's
+    // `%String.prototype%` intrinsic, which is stable for the realm's life
+    // (`ToObject` of a string uses the intrinsic, not the reassignable
+    // `String.prototype` property). The shared member-value cell, keyed by that
+    // prototype's id and validated by its live generation, serves the read
+    // with no helper call. `length` is an own virtual property of the string
+    // and has its own fast path in the helper, so the lane excludes it.
+    if name != crux::string::length_atom() {
+        let name_imm = builder.ins().iconst(types::I64, name as i64);
+        let str_probe = builder.create_block();
+        let is_str = is_string(builder, object);
+        let proto_bits = builder.ins().load(
+            types::I64,
+            MemFlagsData::new(),
+            abi.vm,
+            Offset32::new(std::mem::offset_of!(JitCallContext, string_prototype_bits) as i32),
+        );
+        let has_proto = builder.ins().icmp_imm_u(IntCC::NotEqual, proto_bits, 0);
+        let gate = builder.ins().band(is_str, has_proto);
+        builder.ins().brif(gate, str_probe, &[], obj_entry, &[]);
+        builder.seal_block(str_probe);
+        builder.switch_to_block(str_probe);
+        let (cell_value, ok) = crate::cells::string_proto_cell(builder, abi.vm, name, name_imm);
+        builder.def_var(value, cell_value);
+        builder.ins().brif(ok, merge, &[], slow, &[]);
+        builder.seal_block(obj_entry);
+        builder.switch_to_block(obj_entry);
+    } else {
+        builder.ins().jump(obj_entry, &[]);
+        builder.seal_block(obj_entry);
+        builder.switch_to_block(obj_entry);
+    }
     let obj_ok = crate::cells::is_plain_object(builder, object);
     builder.ins().brif(obj_ok, entry, &[], slow, &[]);
     builder.seal_block(entry);

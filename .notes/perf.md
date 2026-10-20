@@ -15329,3 +15329,28 @@ shape; it fails on the flush-disabled build and passes on the real one.
 
 Gates: fmt; clippy `-D warnings`; `cargo test --workspace` (38 suites, 0 fail);
 test262 built-ins 23,821, language 23,726, annexB 1,086, intl402 3,365 — 0 fail.
+
+## LANDED (2026-10-20): a primitive string's member read is cell-served
+
+A member read on a *primitive string* had no inline lane: `emit_member_cell_probe` (`compiler.rs`) and the opt tier's `MemberCellLoad`/`MemberGuard` both require `TAG_OBJECT`, so every `s.charCodeAt` / `s.slice` read fell to `get_member_name`, which reaches `get_primitive_member` → `current_realm()` → `intrinsics.string_prototype()` → `primitive_proto_data_get`. Measured on 1M iterations, a bare loop costs 0.54 ms and the same loop reading `s.charCodeAt` costs 32.1 ms: **31.6 ns per read**, of which the call adds only 6.3 ns. `.length` is cheaper (7.5 ns) because the helper has its own shortcut for it.
+
+The fix is a string lane in both lowerers that consumes the same shared member-value cell the helper already populates. `JitCallContext::string_prototype_bits` snapshots the realm's `%String.prototype%`; the lane gates on `is_string(receiver)` (boxed String objects stay on the object path), loads the prototype's live `id` and `generation`, and serves `cell[(id ^ atom) & (MEMBERS-1)]` when id, name and generation match. The helper populates that cell on the first (cold) read via `primitive_proto_data_get`, and any mutation of the prototype bumps its generation, which invalidates the entry. `length` is excluded: it is an own virtual property of the string (never a prototype one), and the existing shortcut already covers it — routing it through the lane cost 2.2 ns/iteration before the exclusion.
+
+The lane must hang off the object test, not precede it. Placing it first (`is_string` + the prototype load + a branch before `is_plain_object`) made plain-object reads pay it too: `o.d = i; s += o.d` went 42.1 -> 45.6 ms and `o.x += 1; s += o.x` 52.9 -> 56.2 ms over 4M iterations, a ~0.9 ns/iteration tax on every property access in the corpus. Branching `is_plain_object ? object-probe : string-lane` restores the object path to exactly the probe it had (measured back to 43.4/53.7).
+
+`%String.prototype%` is the *intrinsic* (the value `ToObject` uses), not the reassignable `String.prototype` property, which is why a per-run snapshot is sound. Verified against node and the interpreter: `String.prototype = {}` leaves `"abc".foo` undefined in all three.
+
+| row | before | after |
+| --- | ---: | ---: |
+| `strings/char_ops` (300k `charCodeAt`) | 11.20 ms | **3.33 ms** (-70%) |
+| `opcost/string_charat` | 4.43 ms | **1.67 ms** (-62%) |
+| `strings/search_slice` | 16.30 ms | **10.87 ms** (-33%) |
+| `strings/split_join` | 65.87 ms | 63.13 ms (-4%) |
+| `strings/coercion_concat` | 63.53 ms | 61.60 ms (-3%) |
+| `opcost/prim_prop` (`.length`) | 1.73 ms | 1.73 ms (flat, by design) |
+
+Families (5-pair interleaved same-binary A/B): `strings` mean-jitGap 12.27 -> 9.50 (-23%), the object rows flat. A subset corpus of the eleven touched and control rows sums 266.79 -> 251.43 ms (median of 7 interleaved pairs; five pairs land in 244.8-251.5 against a tight 264.0-273.3 before, the other two are host-load spikes). The full-corpus mean is only -3.3% on the day (median of 8 pairs, 11.45 -> 11.07): Windows Defender was scanning at 200% CPU throughout, and `mean-jlGap` — which this change cannot touch — moved 3.87 -> 4.17, so the full-corpus figure is not resolved here. The row and subset numbers are. Isolated probes: the read alone 32.1 -> 9.3 ms/1M, read+call 38.4 -> 11.8 ms/1M; `GetMemberName` helper calls in the read probe fall from 7,001,792 to 3,074 (one per repetition, from the cold path).
+
+`opt_tier_string_member_read_follows_the_prototype` covers the invalidation: it warms the cell, reassigns `String.prototype.charCodeAt`, calls through it, restores it, and calls again. With the generation comparison disabled the test answers 101 where 111 belongs (the stale cell serves the original function).
+
+Gates: fmt; clippy `-D warnings`; `cargo test --workspace` (38 suites, 0 fail); test262 built-ins 23,821, language 23,726, annexB 1,086, intl402 3,365 — 51,998 pass / 0 fail.

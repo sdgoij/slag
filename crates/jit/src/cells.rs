@@ -119,3 +119,57 @@ pub(crate) fn member_value_cell_value(builder: &mut FunctionBuilder, cell: Value
         Offset32::new(std::mem::offset_of!(MemberValueCell, value) as i32),
     )
 }
+
+/// The shared member-value cell for a member read on a primitive string.
+///
+/// A primitive string's non-index members resolve on the realm's
+/// `%String.prototype%` intrinsic — `ToObject` of a string uses the intrinsic,
+/// not the reassignable `String.prototype` property — so the cell keyed by that
+/// prototype's id, validated by its live generation, serves the read exactly as
+/// an own-property cell does. The interpreter's primitive path populates the
+/// cell on the first (cold) read; mutating the prototype bumps its generation
+/// and invalidates the entry.
+///
+/// The caller must have established that the receiver is a string and that
+/// [`JitCallContext::string_prototype_bits`] is non-zero. Returns the cell's
+/// value bits and whether the cell validated.
+pub(crate) fn string_proto_cell(
+    builder: &mut FunctionBuilder,
+    vm: Value,
+    name: crux::AtomId,
+    name_imm: Value,
+) -> (Value, Value) {
+    let proto_bits = builder.ins().load(
+        types::I64,
+        MemFlagsData::new(),
+        vm,
+        Offset32::new(
+            std::mem::offset_of!(runtime::jit::JitCallContext, string_prototype_bits) as i32,
+        ),
+    );
+    let proto = object_data_ptr(builder, proto_bits);
+    let proto_id = builder.ins().load(
+        types::I64,
+        MemFlagsData::new(),
+        proto,
+        Offset32::new(std::mem::offset_of!(crux::JsObject, id) as i32),
+    );
+    let proto_gen = builder.ins().load(
+        types::I32,
+        MemFlagsData::new(),
+        proto,
+        Offset32::new(std::mem::offset_of!(crux::JsObject, generation) as i32),
+    );
+    let cells = builder.ins().load(
+        types::I64,
+        MemFlagsData::new(),
+        vm,
+        Offset32::new(
+            std::mem::offset_of!(runtime::jit::JitCallContext, member_value_cells) as i32,
+        ),
+    );
+    let cell = member_value_cell_addr(builder, cells, proto_id, name_imm);
+    let value = member_value_cell_value(builder, cell);
+    let ok = member_value_cell_valid(builder, cell, proto_id, name, proto_gen);
+    (value, ok)
+}

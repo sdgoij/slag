@@ -1565,8 +1565,43 @@ impl<'a> Lowerer<'a> {
             self.builder.switch_to_block(after);
             self.builder.seal_block(after);
         }
+        // A primitive string's non-index member: `%String.prototype%` is a
+        // realm intrinsic, stable for the realm's life (`ToObject` of a string
+        // uses the intrinsic, not the reassignable `String.prototype`
+        // property), so the shared member-value cell serves every string read
+        // with no helper call. The lane hangs off the object test, so a plain
+        // object's read pays exactly the probe it paid before. `length` is an
+        // own virtual property of the string rather than a prototype one, and
+        // the block above already covers it, so this lane excludes it.
         let is_plain_obj = crate::cells::is_plain_object(&mut self.builder, object);
-        self.builder.ins().brif(is_plain_obj, probe, &[], slow, &[]);
+        if name != Self::length_atom() {
+            let string = self.builder.create_block();
+            self.builder
+                .ins()
+                .brif(is_plain_obj, probe, &[], string, &[]);
+            self.builder.switch_to_block(string);
+            let str_probe = self.builder.create_block();
+            let is_str = self.is_string(object);
+            let proto_bits = self.builder.ins().load(
+                types::I64,
+                MemFlagsData::new(),
+                ctx,
+                Offset32::new(std::mem::offset_of!(JitCallContext, string_prototype_bits) as i32),
+            );
+            let has_proto = self
+                .builder
+                .ins()
+                .icmp_imm_u(IntCC::NotEqual, proto_bits, 0);
+            let gate = self.builder.ins().band(is_str, has_proto);
+            self.builder.ins().brif(gate, str_probe, &[], slow, &[]);
+            self.builder.switch_to_block(str_probe);
+            let (cell_value, ok) =
+                crate::cells::string_proto_cell(&mut self.builder, ctx, name, name_imm);
+            self.builder.def_var(value_var, cell_value);
+            self.builder.ins().brif(ok, merge, &[], slow, &[]);
+        } else {
+            self.builder.ins().brif(is_plain_obj, probe, &[], slow, &[]);
+        }
         // The probe: the cell's id/name/generation must match the
         // receiver's LIVE id and generation (a mutation anywhere bumps the
         // generation, so a match means the own data property is unchanged

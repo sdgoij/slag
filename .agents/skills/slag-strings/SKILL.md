@@ -71,3 +71,19 @@ conversions are where the flatten-cache trap lives.
   scanned); do not store an owned rope in a non-GC Rust container where
   its children could be collected from under it. Leaf copies are safe to
   store anywhere.
+
+## 4. A primitive's members come from the `%String.prototype%` *intrinsic*
+
+- `ToObject` of a string uses the realm's `%String.prototype%` intrinsic, NOT
+  the reassignable `String.prototype` property. `String.prototype = {}` does
+  not change what `"abc".foo` sees (node agrees: the intrinsic is used), so a
+  per-run snapshot of the intrinsic is a sound key and never goes stale.
+- The JIT's string member lane (`cells::string_proto_cell`) serves
+  `s.<method>` from `Agent::member_value_cells` keyed by that prototype's id,
+  validated by its live `generation`. The helper path populates the cell in
+  `primitive_proto_data_get`; a mutation of the prototype bumps the generation
+  and invalidates it. Do not key on the receiver — a string primitive has no
+  object id.
+- `s.length` is an own *virtual* property of the string (never a prototype
+  one). It must not go through the prototype cell: the probe would always miss
+  and only add work before the helper's shortcut (measured +2.2 ns/iteration).

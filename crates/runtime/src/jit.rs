@@ -511,6 +511,14 @@ pub struct JitCallContext {
     /// realm's life and a certified body's own statements never switch realms,
     /// so a per-run snapshot is sound.
     pub intrinsic_bits: [u64; INTRINSIC_COUNT],
+    /// The current realm's %String.prototype% as a NaN-boxed `Value` word (0
+    /// when no realm is current), snapshotted at ctx setup. The compiled
+    /// member read serves a primitive string's non-index members from the
+    /// shared member-value cell keyed by this prototype's id and validated by
+    /// its live generation: `ToObject` of a string uses the realm's
+    /// %String.prototype% *intrinsic*, not the reassignable `String.prototype`
+    /// property, so the value is stable for the realm's life.
+    pub string_prototype_bits: u64,
     /// Cut 55: a control-transfer dispatch that completed the body (a
     /// `return` reaching the end of the finally chain) carries the body's
     /// result value here — the dispatch helpers signal `DISPATCH_DONE` and
@@ -2539,6 +2547,7 @@ fn certified_lane_inline(
         apply_builtin_bits,
         call_builtin_bits,
         intrinsic_bits,
+        string_prototype_bits: string_prototype_bits(agent),
         dispatch_value: 0,
         suspension: None,
         suspend_sp: 0,
@@ -6960,6 +6969,18 @@ pub(crate) fn call_apply_intrinsic_bits(agent: &Agent) -> (u64, u64) {
     )
 }
 
+/// The realm's %String.prototype% as a NaN-boxed `Value` word (0 when no realm
+/// is current), the snapshot the compiled string member read keys its cell by.
+/// See [`JitCallContext::string_prototype_bits`].
+pub(crate) fn string_prototype_bits(agent: &Agent) -> u64 {
+    agent
+        .current_realm()
+        .ok()
+        .and_then(|realm| realm.intrinsics.string_prototype())
+        .map(|value| value.bits())
+        .unwrap_or(0)
+}
+
 /// The realm's identity bits for every recognized Stage-B intrinsic, indexed by
 /// `Intrinsic as usize` (all 0 when no realm is current — the identity checks
 /// then never match and the sites fall back to the general call).
@@ -7106,6 +7127,7 @@ pub(crate) fn run_jit_body(
         apply_builtin_bits,
         call_builtin_bits,
         intrinsic_bits,
+        string_prototype_bits: string_prototype_bits(agent),
         dispatch_value: 0,
         suspension: None,
         suspend_sp: 0,
@@ -7383,6 +7405,7 @@ pub(crate) fn run_jit_resume(
         apply_builtin_bits,
         call_builtin_bits,
         intrinsic_bits,
+        string_prototype_bits: string_prototype_bits(agent),
         dispatch_value: 0,
         suspension: None,
         suspend_sp: 0,

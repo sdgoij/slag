@@ -14951,6 +14951,7 @@ impl Vm {
             apply_builtin_bits,
             call_builtin_bits,
             intrinsic_bits,
+            string_prototype_bits: crate::jit::string_prototype_bits(agent),
             dispatch_value: 0,
             suspension: None,
             suspend_sp: 0,
