@@ -2578,6 +2578,47 @@ mod tests {
     }
 
     #[test]
+    fn opt_tier_flushes_a_promoted_slot_before_a_deopt() {
+        // Cut B (`.notes/opt-per-op-overhead.md` §8) keeps a numeric frame slot
+        // in a register even when the body holds guards. A guard that fails
+        // resumes the interpreter at the next step, and every later step reads
+        // the frame, so the promoted value must be materialized into its slot
+        // first. The accumulator `s` is promoted (it is loop-carried and only
+        // ever holds a Number) and read *after* the `o.x` read guard; without
+        // the flush the resumed code sees the slot's initial `undefined` and
+        // returns `"undefinedA1"` instead of `"7A1"` (verified against a build
+        // with `insert_flushes` disabled).
+        let source = "var G = 1; var reads = 0; \
+                      function f(o, n) { \
+                        var s = 0; \
+                        for (var k = 0; k < n; k = k + 1) { s = s + 1; } \
+                        var x = o.x; \
+                        return s + x + G; \
+                      } \
+                      var num = { x: 100 }; \
+                      var get = { get x() { reads = reads + 1; return 'A'; } }; \
+                      for (var j = 0; j < 40; j++) { f(num, 2); } \
+                      var r = f(get, 7); \
+                      '' + r + '|' + reads;";
+        let interp = {
+            let mut agent = runtime::Agent::new();
+            agent.initialize_host_defined_realm().expect("realm");
+            agent.run_script(source).expect("interp runs")
+        };
+        let deopts_before = runtime::jit::JIT_DEOPT_COUNT.load(Ordering::Relaxed);
+        crate::opt::lift::OPT_TYPER.store(1, Ordering::Relaxed);
+        let (value, compiled) = with_opt_jit_agent(|agent| agent.run_script(source).expect("runs"));
+        crate::opt::lift::OPT_TYPER.store(0, Ordering::Relaxed);
+        let deopts = runtime::jit::JIT_DEOPT_COUNT.load(Ordering::Relaxed) - deopts_before;
+        assert_eq!(
+            value, interp,
+            "a deopt must resume with the promoted slot's current value"
+        );
+        assert!(compiled >= 1, "{compiled} bodies compiled");
+        assert!(deopts >= 1, "the read guard must have fired ({deopts})");
+    }
+
+    #[test]
     fn opt_tier_lexical_body_matches_the_interpreter() {
         // A `let`-using body is TDZ-checked; the tier models the check
         // (`Op::TdzCheck`), so the body compiles via the IR where it was

@@ -26,7 +26,7 @@
 
 use std::collections::HashSet;
 
-use crate::opt::ir::{BlockId, Function, Heap, Imm, Op, Term, Type, ValueId};
+use crate::opt::ir::{BlockId, Function, Imm, Op, Term, Type, ValueId};
 
 pub mod cse;
 pub mod dce;
@@ -76,8 +76,12 @@ pub fn run(
 ) -> bool {
     let folded = fold::run(func);
     let narrowed = narrow::run(func);
-    let promoted = mem2reg_enabled() && promote_frame_slots(func);
+    // Guards are created by `narrow` and by `guard::run`, and a guard that
+    // fails resumes the interpreter, which reads the frame. Promotion must
+    // therefore run after both so it can materialize each promoted slot on the
+    // guard's deopt path.
     let guarded = guard_enabled() && guard::run(func);
+    let promoted = mem2reg_enabled() && promote_frame_slots(func);
     let inlined = inline::run(func, sites, resolve);
     let cse = cse::run(func);
     let licm = licm::run(func);
@@ -182,19 +186,28 @@ fn promote_frame_slots(func: &mut Function) -> bool {
     mem2reg::run_restricted(func, &allowed)
 }
 
-/// Whether no instruction other than a `FrameLoad`/`FrameStore` reads or writes
-/// frame slots, and the body holds no speculation guard — a guard deopts into
-/// the interpreter, which reads the frame.
+/// Whether the body's frame is invisible to everything but its own
+/// `FrameLoad`/`FrameStore` and guard materialization.
+///
+/// A promoted slot is flushed back to its frame slot before every guard, so a
+/// guard's deopt (which resumes the interpreter) still sees current values.
+/// What promotion cannot tolerate is an op that reads or writes a slot
+/// *implicitly*, because there is no value to flush for it: the fused
+/// declaration/loop-binding ops write a slot the pass cannot name.
+///
+/// A call cannot expose the frame — the only routes are an `arguments` object
+/// (`Step::CreateArguments` has no lowering, so such a body never lifts) and a
+/// direct `eval` (every call arm matches `direct_eval: false`) — so the
+/// conservative `Heap::Slots` effect on calls and member accesses is not a
+/// disqualifier.
 fn slots_unobserved(func: &Function) -> bool {
     for b in 0..func.block_count() as u32 {
         for inst in &func.block(b).insts {
             match inst.op {
-                Op::FrameLoad | Op::FrameStore => continue,
-                Op::Check | Op::GuardType | Op::GuardCallee => return false,
+                // Ops whose lowering reads or writes a frame slot directly
+                // without the pass being able to name the slot.
+                Op::FunctionDecl | Op::ForOfBindLocal | Op::ForOfNextBindLocal => return false,
                 _ => {}
-            }
-            if inst.effects.may_read(Heap::Slots) || inst.effects.may_write(Heap::Slots) {
-                return false;
             }
         }
     }

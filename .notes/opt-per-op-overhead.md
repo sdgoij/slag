@@ -191,10 +191,11 @@ are provably `Int`. §6.3's arithmetic-op `canon` sinking and §6.4/§6.5 remain
 ## 8. The register lane: promote slots to SSA (plan, probe-first)
 
 **Status: Cut 0 + Cut A tried 2026-10-10 and REVERTED (net ~zero); Cut B
-untouched. The result below refutes §3.1** — slot traffic is not the `opcost`
-gap. The original premise: the dominant residual on `opcost/baseline`
-(opt ~4.6x the per-step, §1) is §3.1 — the per-step tier keeps the loop's `s` and
-`i` in registers, while the opt lift round-trips every variable through its frame
+LANDED 2026-10-20 (see "Result (2026-10-20): Cut B landed" below). The
+2026-10-10 result refuted §3.1** — slot traffic is not the `opcost` gap. The
+original premise: the dominant residual on `opcost/baseline` (opt ~4.6x the
+per-step, §1) is §3.1 — the per-step tier keeps the loop's `s` and `i` in
+registers, while the opt lift round-trips every variable through its frame
 slot (`FrameLoad slot; <op>; FrameStore slot` per iteration).
 
 `pass::mem2reg` already implements the promotion this needs, including
@@ -272,6 +273,35 @@ is i32 bits, not an f64 bit pattern), not the slot promotion.
 **Redirect:** the next lever is the int-op lowering's representation (§6.3/§6.4
 re-read in this light) — and the slot promotion is at most a prerequisite for it,
 never a win alone.
+
+### Result (2026-10-20): Cut B landed
+
+Cut B is implemented as: `guard::run` moved **before** `mem2reg` in the pipeline
+(so promotion sees every guard `narrow` and `guard` produce), `slots_unobserved`
+relaxed to reject only the ops that write a slot the pass cannot name
+(`FunctionDecl`, `ForOfBindLocal`, `ForOfNextBindLocal`) instead of every
+guard and every world-effect op, and `mem2reg::insert_flushes` emitting a
+`FrameStore(slot, value)` before each guard for every promoted slot with a
+reaching definition.
+
+`opcost/baseline`'s refutation above still stands and is the limit of this cut:
+the loop floor was already register-resident, so what Cut B changes is a body
+that also does something non-numeric. The probe (`scratch/ab/l5`, 2M iterations
+of `s += k` plus a trailing `new Uint8Array`, 5 interleaved same-binary pairs):
+**5.06 -> 1.48 ms** (2.53 -> 0.74 ns/iteration), i.e. the bare-loop floor.
+
+Corpus (77 workloads, 3 interleaved same-binary pairs on an idle machine):
+`mean-jitGap` 11.73 -> 11.45 (-2.4%), `mean-jlGap` flat (3.80 -> 3.92, the
+control), parity 0. The win is concentrated: `arrays/index_loop`
+18.4 -> 13.4 ms (-27%, disjoint across the three pairs); most rows are flat.
+Earlier measurements that reported a much larger corpus delta were taken under
+heavy host load, where the mean-of-ratios compresses and wanders — do not trust
+a single pair.
+
+The flush is load-bearing, not defensive: with `insert_flushes` disabled the
+same probe returns `"undefinedA1"` instead of `"7A1"` (the resumed interpreter
+reads the slot's initial `undefined`). `opt_tier_flushes_a_promoted_slot_before_a_deopt`
+covers that shape and fails without the flush.
 
 ### Measurement
 

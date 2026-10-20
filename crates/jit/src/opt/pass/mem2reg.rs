@@ -22,7 +22,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::opt::ir::{BlockId, Function, Imm, Op, Term, Type, ValueId};
+use crate::opt::ir::{BlockId, Effects, Function, Heap, Imm, Inst, Op, Term, Type, ValueId};
 
 /// Promote every storable frame slot in `func`. Returns whether the IR changed.
 pub fn run(func: &mut Function) -> bool {
@@ -150,12 +150,54 @@ fn promote_slot(
         }
     }
 
-    let mut stack: Vec<ValueId> = Vec::new();
-    let mut repl: HashMap<ValueId, ValueId> = HashMap::new();
-    rename(func, entry, slot, &phi, children, &mut stack, &mut repl);
+    let mut state = Rename::default();
+    rename(func, entry, slot, &phi, children, &mut state);
     retype_phis(func, &phi, preds);
-    apply(func, slot, &repl);
+    let removed = apply(func, slot, &state.repl);
+    insert_flushes(func, slot, &state.flushes, &removed);
     true
+}
+
+/// Materialize the slot's promoted value into its frame slot before every
+/// guard, because a guard that fails resumes the interpreter, and the
+/// interpreter reads the frame (`.notes/opt-per-op-overhead.md` §8, Cut B).
+/// Without this a promoted slot is invisible to the resumed code.
+///
+/// `flushes` holds `(block, instruction index, value)` positions as they were
+/// before `apply` dropped the slot's loads and stores, so `removed` (the
+/// indices `apply` deleted, per block) shifts each one back into place.
+fn insert_flushes(
+    func: &mut Function,
+    slot: u32,
+    flushes: &[(BlockId, usize, ValueId)],
+    removed: &HashMap<BlockId, Vec<usize>>,
+) {
+    if flushes.is_empty() {
+        return;
+    }
+    let mut by_block: HashMap<BlockId, Vec<(usize, ValueId)>> = HashMap::new();
+    for &(b, at, value) in flushes {
+        by_block.entry(b).or_default().push((at, value));
+    }
+    for (b, mut list) in by_block {
+        list.sort_unstable_by_key(|&(at, _)| at);
+        let gone = removed.get(&b).map_or(&[][..], |v| v.as_slice());
+        for (offset, (at, value)) in list.into_iter().enumerate() {
+            let shifted = at - gone.iter().filter(|&&r| r < at).count();
+            let position = (shifted + offset).min(func.block(b).insts.len());
+            func.block_mut(b).insts.insert(
+                position,
+                Inst {
+                    op: Op::FrameStore,
+                    args: vec![value],
+                    result: None,
+                    ty: Type::Never,
+                    effects: Effects::write(Heap::Slots),
+                    imm: Imm::Slot(slot),
+                },
+            );
+        }
+    }
 }
 
 /// Re-type each promoted phi as the join of its incoming values' types.
@@ -206,6 +248,15 @@ fn edge_arg(func: &Function, from: BlockId, to: BlockId, index: usize) -> Option
     }
 }
 
+/// The mutable state the dominator-tree walk carries: the reaching-definition
+/// stack, the load rewrite map, and the guard flush positions.
+#[derive(Default)]
+struct Rename {
+    stack: Vec<ValueId>,
+    repl: HashMap<ValueId, ValueId>,
+    flushes: Vec<(BlockId, usize, ValueId)>,
+}
+
 /// The dominator-tree walk that rewrites the slot's loads to their reaching
 /// definitions and fills the phi edge arguments.
 fn rename(
@@ -214,30 +265,39 @@ fn rename(
     slot: u32,
     phi: &HashMap<BlockId, usize>,
     children: &[Vec<BlockId>],
-    stack: &mut Vec<ValueId>,
-    repl: &mut HashMap<ValueId, ValueId>,
+    state: &mut Rename,
 ) {
     let mut pushed = 0;
     if let Some(&index) = phi.get(&b) {
-        stack.push(func.block(b).params[index]);
+        state.stack.push(func.block(b).params[index]);
         pushed += 1;
     }
     let len = func.block(b).insts.len();
     for i in 0..len {
         let inst = &func.block(b).insts[i];
+        // A guard may deopt to the interpreter, which reads this slot's frame
+        // word: record the value to materialize there. A guard before the
+        // slot's first store on this path leaves the initial `undefined`,
+        // which is exactly what the frame already holds.
+        if matches!(inst.op, Op::Check | Op::GuardType | Op::GuardCallee)
+            && let Some(&current) = state.stack.last()
+        {
+            state.flushes.push((b, i, current));
+        }
         if inst.op == Op::FrameStore && inst.imm == Imm::Slot(slot) {
-            let operand = resolve(repl, inst.args[0]);
-            stack.push(operand);
+            let operand = resolve(&state.repl, inst.args[0]);
+            state.stack.push(operand);
             pushed += 1;
         } else if inst.op == Op::FrameLoad && inst.imm == Imm::Slot(slot) {
             let result = inst.result.expect("a store-reached load has a result");
-            let reaching = *stack
+            let reaching = *state
+                .stack
                 .last()
                 .expect("a store-reached load has a reaching definition");
-            repl.insert(result, reaching);
+            state.repl.insert(result, reaching);
         }
     }
-    let reach = stack.last().copied();
+    let reach = state.stack.last().copied();
     match func.block_mut(b).term.as_mut() {
         Some(Term::Jump { target, args }) => {
             if let (Some(&index), Some(r)) = (phi.get(target), reach) {
@@ -261,16 +321,28 @@ fn rename(
         _ => {}
     }
     for &c in &children[b as usize] {
-        rename(func, c, slot, phi, children, stack, repl);
+        rename(func, c, slot, phi, children, state);
     }
     for _ in 0..pushed {
-        stack.pop();
+        state.stack.pop();
     }
 }
 
 /// Redirect every use of a rewritten load and drop the slot's loads and stores.
-fn apply(func: &mut Function, slot: u32, repl: &HashMap<ValueId, ValueId>) {
+/// Returns the dropped instruction indices per block, so a flush recorded
+/// against the pre-drop layout can be placed back at the right spot.
+fn apply(
+    func: &mut Function,
+    slot: u32,
+    repl: &HashMap<ValueId, ValueId>,
+) -> HashMap<BlockId, Vec<usize>> {
+    let mut removed: HashMap<BlockId, Vec<usize>> = HashMap::new();
     for b in 0..func.block_count() as u32 {
+        for (i, inst) in func.block(b).insts.iter().enumerate() {
+            if matches!(inst.op, Op::FrameLoad | Op::FrameStore) && inst.imm == Imm::Slot(slot) {
+                removed.entry(b).or_default().push(i);
+            }
+        }
         for inst in &mut func.block_mut(b).insts {
             for a in &mut inst.args {
                 *a = resolve(repl, *a);
@@ -300,6 +372,7 @@ fn apply(func: &mut Function, slot: u32, repl: &HashMap<ValueId, ValueId>) {
             !(matches!(inst.op, Op::FrameLoad | Op::FrameStore) && inst.imm == Imm::Slot(slot))
         });
     }
+    removed
 }
 
 /// Follow load replacements to a canonical value (no chains survive the rename,

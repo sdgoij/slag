@@ -15288,3 +15288,44 @@ The gate is `pass::slots_unobserved`: promotion requires that no instruction oth
 Relaxing (1) was implemented and measured: no change, because (2) still disqualifies the body. Relaxing (1) is sound — a lifted body cannot expose its frame to a call (no `arguments` object: `Step::CreateArguments` has no lowering, so such a body never lifts; no direct `eval`: every call arm matches `direct_eval: false`) — but it is only a prerequisite.
 
 The fix is **Cut B** from `.notes/opt-per-op-overhead.md` §8, still unimplemented: `mem2reg` must publish the promoted slots, and the guard pass must store each live promoted slot back to its frame before the deopt branch (the flush splits the promoted region and the continuation reloads from the slot). Until then, every loop in a function that does anything non-numeric runs with a frame round trip per slot access — 3.5x on the same loop, and the floor under the whole `opcost` family.
+
+## LANDED (2026-10-20): Cut B — frame slots stay promoted across guards
+
+`pass::slots_unobserved` refused promotion to any body holding a guard or any
+world-effect op, so a loop in a function that did anything non-numeric kept a
+`FrameLoad`/`FrameStore` per slot access (the counter-loop analysis above).
+Cut B removes both refusals and pays for them where they matter:
+
+- `guard::run` now runs **before** `mem2reg`, so promotion sees every `GuardType`
+  (from `narrow` and from `guard`) rather than only the ones that survive after it.
+- The gate rejects only the fused declaration/loop-binding ops
+  (`FunctionDecl`, `ForOfBindLocal`, `ForOfNextBindLocal`), which write a slot the
+  pass cannot name. Calls and member accesses carry `Heap::Slots` conservatively
+  but cannot observe the frame: a lifted body builds no `arguments` object and
+  runs no direct `eval`.
+- `mem2reg::insert_flushes` stores each promoted slot's reaching value back to the
+  frame before every `Check`/`GuardType`/`GuardCallee`, because a failing guard
+  resumes the interpreter at the next step and later steps read the frame.
+
+Probe (`scratch/ab/l5`, 2M iterations of `s += k` plus a trailing
+`new Uint8Array`, 5 interleaved same-binary pairs): **5.06 -> 1.48 ms**
+(2.53 -> 0.74 ns/iteration) — the bare-loop floor, i.e. the whole frame round
+trip is gone.
+
+Corpus (77 workloads, 3 interleaved same-binary pairs, idle host):
+`mean-jitGap` 11.73 -> 11.45 (-2.4%), `mean-jlGap` 3.80 -> 3.92 (flat; the
+jitless control), parity 0 mismatches. Concentrated rather than broad:
+`arrays/index_loop` 18.4 -> 13.4 ms (-27%, the three before values 19.2/18.6/17.5
+against 13.9/13.1/13.2), `language/expressions/template-literal/evaluation-order`
+303.6 -> 295.5, and most rows flat. Runs taken while the host was at ~96% load
+put the same delta at -3.7% and made individual families swing both ways; report
+only interleaved pairs on an idle machine.
+
+The flush is load-bearing. With `insert_flushes` disabled the probe returns
+`"undefinedA1"` for `s + x + G` where `s` was promoted and `x` is a getter's
+string, because the resumed interpreter reads the slot's initial `undefined`.
+`opt_tier_flushes_a_promoted_slot_before_a_deopt` (crates/jit/src/lib.rs) is that
+shape; it fails on the flush-disabled build and passes on the real one.
+
+Gates: fmt; clippy `-D warnings`; `cargo test --workspace` (38 suites, 0 fail);
+test262 built-ins 23,821, language 23,726, annexB 1,086, intl402 3,365 — 0 fail.

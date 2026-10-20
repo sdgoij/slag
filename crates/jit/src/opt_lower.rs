@@ -401,6 +401,14 @@ fn lower_inst(
                 return Err(Unsupported::Step("opt:frame"));
             };
             let value = arg!(0);
+            // A promoted slot's flush (mem2reg's guard materialization) may
+            // carry an `Int` register; the frame holds `Value` words, so widen
+            // exactly as a guard's deopt mirror does.
+            let value = if builder.func.dfg.value_type(value) == types::I32 {
+                int_to_bits(builder, value)
+            } else {
+                value
+            };
             builder.ins().store(
                 MemFlagsData::new(),
                 value,
