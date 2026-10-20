@@ -14761,3 +14761,63 @@ slice with the sweep as the net, not a drive-by.
 
 Repro: `scratch/c3/{throw_call,nothrow_call,new_only,throw_plain,try_only}`,
 run with `./target/release/slag.exe --corpus scratch/c3/<name>`.
+
+### MEASURED (2026-10-20): the certified lane admits try bodies and argument vectors
+
+The previous entry measured a 12x call penalty for a body that merely contains
+`Construct` or `EnterTry`. The certified-callee lane now admits both, by
+isolating the two shared pieces of state they touch rather than refusing the
+body:
+
+- A callee with `handlers` (it owns a `try`) runs under the C3a control-state
+  recipe: `Vm::is_control_free()` decides between the cheap `save_scratch` and
+  `save_scratch_full` (which parks the caller's ~twenty control stacks on
+  `saved_control`), and `clear_control_state` drops whatever the callee
+  abandons on an abrupt exit before `restore_scratch` puts the caller's back.
+  That is exactly what the interpreter's nested certified call already does, so
+  the compiled lane now matches it.
+- The `Vm::args`/`args_base_stack` pair is watermarked: the lane records their
+  lengths before the run and truncates back if the callee left anything above
+  them (a balanced run leaves the length alone, so the common call pays one
+  compare). This is what admits `ArgsBase`/`ArgsPush`/`ArgsSpread`, `Call`,
+  `Construct` and a tagged template — the hazard was never the vector itself,
+  only a leak across a re-entry (a caller mid-`ArgsSpread` keeps its half-built
+  vector below the watermark).
+
+The gate is now two lists: `has_shared_vm_step_hazard` (the self-call lane,
+unchanged) and `has_certified_lane_step_hazard` (the same list minus `EnterTry`
+and the argument-vector steps). The self lane keeps the conservative gate
+deliberately: giving `self_call_inline` the same plumbing cost
+`calls/recursive_fib` 49.2 → 61-66 ms (16M self calls at ~0.7 ns each, the
+tuple/extra local in a function that is otherwise inlined into `call_slow`),
+and a self call cannot build a *fresh* vector for a different callee, so the
+coverage lost there is small. Restoring the self lane's shape while keeping the
+certified gate narrow put the row back at 48.5-53.2 ms (HEAD: 48.7-54.0).
+
+Probes (1M method calls, `assert.sameValue(i, i)`, varying only the callee body):
+
+| callee body | before | after | ns/call |
+| --- | ---: | ---: | ---: |
+| `if (a !== b) { throw new Error("bad"); }` | 164.7 | **59.0** | 59.0 |
+| `if (a !== b) { var e = new Error("bad"); return e; }` | 171.9 | **59.4** | 59.4 |
+| `try { if (a !== b) { return 0; } } finally {} return 1;` | 187.6 | **82.1** | 82.1 |
+| `if (a !== b) { throw a; }` (a leaf, unchanged) | 13.8 | 13.5 | 13.5 |
+| `if (a !== b) { return 0; } return 1;` (a leaf, unchanged) | 13.8 | 14.1 | 14.1 |
+
+The try row lands at 82 ns rather than the lane's ~60 because the body pays
+three try helpers per call (`EnterTry`/`ExitTry`/`FinallyEnd` are FFI calls with
+a pending check each); that is the try representation's cost, not the lane's.
+The remaining ~59 ns is the lane's own setup — a new `JitCallContext`, the
+`ecma_functions` record resolution, the frame fill and the `vm.stack` carve —
+and it is the C3 frame work's target (the leaf lane, which shares the caller's
+ctx, is 14 ns).
+
+Corpus: parity 0, mean-jitGap 11.99 (the full-corpus mean moves by tenths
+between runs on a warm machine; `statements/try/completion-values` measured
+377-414 ms across five runs of the same binary, so it is not a stable row).
+
+Verified: `cargo fmt --all --check`; clippy `-D warnings`; `cargo test
+--workspace`; `sweep all` 48,633 at 100%; `sweep intl402` 3,365 at 100%;
+`--gc-stress` on `statements/try` and `Iterator` matches HEAD exactly (the one
+try hang and the three zipKeyed hangs are pre-existing under the stress
+deadline). Repro probes: `scratch/c3/{throw_call,new_only,try_only,throw_plain}`.

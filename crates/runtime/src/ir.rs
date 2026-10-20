@@ -1973,16 +1973,14 @@ impl CompiledBody {
     /// - No `this` slot, `arguments` slot, or per-call capture context: the
     ///   nested run reuses the caller's environment, so a body that reads
     ///   `this`/`arguments` or builds a fresh capture context would be wrong.
-    /// - No try, for-in/for-of, destructuring, or suspension: their unwind /
-    ///   close / resume machinery spans one activation, and only the top
-    ///   frame is saved on suspension.
+    /// - No for-in/for-of, destructuring, or suspension: their unwind / close /
+    ///   resume machinery spans one activation, and only the top frame is saved
+    ///   on suspension. A `try` stays excluded too: the self lane does not
+    ///   isolate the caller's control state (the certified lane does).
     /// - No `CallApply` (a direct-eval callee must run in the caller's env).
-    /// - No step that runs user code while building caller-owned Vm state, or
-    ///   that mutates that state itself: a tail call (`tail_prepare_ordinary`
-    ///   swaps `Vm`'s frame/context and sets `ctx.tail`, which the self path
-    ///   does not resume) and the vector-call / template / construct steps
-    ///   (they build or consume `Vm::args`, which an `ArgsSpread` over a user
-    ///   iterator can leave half-built across a re-entry).
+    /// - No step that replaces the activation's frame: a tail call
+    ///   (`tail_prepare_ordinary` swaps `Vm`'s frame/context and sets
+    ///   `ctx.tail`, which the self path does not resume).
     ///
     /// Everything else falls back to `call_slow`'s interpreter path.
     pub(crate) fn self_call_eligible(&self) -> bool {
@@ -2016,7 +2014,7 @@ impl CompiledBody {
         if self.has_call_apply || !scope.context_names.is_empty() {
             return false;
         }
-        if self.has_shared_vm_step_hazard() {
+        if self.has_certified_lane_step_hazard() {
             return false;
         }
         // `arguments`: only the unmapped (strict) object, which reads just
@@ -2055,17 +2053,52 @@ impl CompiledBody {
         })
     }
 
-    /// The steps neither shared-`Vm` lane may run: they drive machinery whose
-    /// state spans one activation, or they mutate caller-owned `Vm` state the
-    /// nested run shares — a `TailCall*` calls `tail_prepare_ordinary` (swapping
-    /// `vm`'s frame/context and setting `ctx.tail`), and the vector-call and
-    /// template/construct steps build or consume `Vm::args` (an `ArgsSpread`
-    /// iterating a user iterator can re-enter with the vector half-built).
-    /// `CreateArguments` is deliberately absent: the self gate refuses it via
-    /// `arguments_slot`, and the certified-callee gate admits only the unmapped
-    /// (strict) form, whose object reads `Vm::call_args`, which the lane sets.
+    /// The steps the self-call lane may not run: they drive machinery whose
+    /// state spans one activation, or they replace the activation's frame. A
+    /// `TailCall*` calls `tail_prepare_ordinary` (swapping `vm`'s frame/context
+    /// and setting `ctx.tail`), a `try` body's frames live on the shared
+    /// `Vm::try_stack`, the argument-vector steps build or consume `Vm::args`
+    /// (an `ArgsSpread` over a user iterator can leave it half-built across a
+    /// re-entry), and `TailTaggedTemplate`/`SuperCall` are tail/constructor
+    /// forms the lane cannot install. `CreateArguments` is deliberately
+    /// absent: the self gate refuses it via `arguments_slot`, and the
+    /// certified-callee gate admits only the unmapped (strict) form, whose
+    /// object reads `Vm::call_args`, which the lane sets.
+    ///
+    /// The certified-callee lane isolates the caller's control state and its
+    /// argument vector, so it uses the narrower
+    /// [`has_certified_lane_step_hazard`](Self::has_certified_lane_step_hazard).
     fn has_shared_vm_step_hazard(&self) -> bool {
+        self.has_lane_step_hazard(false)
+    }
+
+    /// [`has_shared_vm_step_hazard`](Self::has_shared_vm_step_hazard) minus the
+    /// classes the certified lane isolates: a `try` body (its frames are
+    /// parked with the caller's control state and the leftovers cleared) and
+    /// the `Vm::args` builders/consumers (`save_scratch`'s watermark unwinds
+    /// them). Refusing these cost every function with a `try` or a cold
+    /// `throw new Error(...)` its call lane entirely — one never-taken step,
+    /// ~12x the call (`.notes/perf.md`, 2026-10-20).
+    fn has_certified_lane_step_hazard(&self) -> bool {
+        self.has_lane_step_hazard(true)
+    }
+
+    fn has_lane_step_hazard(&self, isolated: bool) -> bool {
         self.steps.iter().any(|step| {
+            if isolated
+                && matches!(
+                    step,
+                    Step::EnterTry { .. }
+                        | Step::ArgsBase
+                        | Step::ArgsPush
+                        | Step::ArgsSpread
+                        | Step::Call { .. }
+                        | Step::Construct { .. }
+                        | Step::TaggedTemplate(_)
+                )
+            {
+                return false;
+            }
             matches!(
                 step,
                 Step::EnterTry { .. }
@@ -4257,7 +4290,7 @@ impl Vm {
     /// Every field [`SavedControl`] carries is checked, so a `false` answer
     /// always means the full save captures the caller's state.
     #[inline]
-    fn is_control_free(&self) -> bool {
+    pub(crate) fn is_control_free(&self) -> bool {
         self.try_stack.is_empty()
             && self.pending.is_empty()
             && self.thrown.is_none()
@@ -4287,7 +4320,7 @@ impl Vm {
     /// stacks, used on the control-free fast path (the caller's state was empty
     /// at entry, so a clear restores it). `env_stack` is left to
     /// [`restore_scratch`](Self::restore_scratch)'s `env_swapped` reset.
-    fn clear_control_state(&mut self) {
+    pub(crate) fn clear_control_state(&mut self) {
         self.try_stack.clear();
         self.pending.clear();
         self.thrown = None;

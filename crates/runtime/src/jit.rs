@@ -2399,7 +2399,16 @@ fn certified_lane_inline(
     // `restore_scratch` puts the caller's back, so neither run sees the
     // other's. It runs before the region is carved so `restore_scratch` unwinds
     // the segment along with the other cursors.
-    let (scratch, saved, buf_base) = unsafe {
+    //
+    // A callee with `handlers` owns a `try`, whose `EnterTry` frames live on
+    // the shared `Vm::try_stack` — and an uncaught throw inside it scans that
+    // stack against *this* body's handler table. Such a run takes the C3a
+    // isolation: park the caller's control state when it holds any, and clear
+    // whatever the callee abandons on an abrupt exit. A callee without
+    // `handlers` cannot touch those stacks (the gate), so the common call keeps
+    // the one-length fast path.
+    let callee_control = !body.handlers.is_empty();
+    let (scratch, saved, control_free, buf_base, args_len, args_base_len) = unsafe {
         let vm = &mut *ctx.vm;
         let base = vm.stack.len();
         // C0c: the region is a `vm.stack` segment above the caller's own
@@ -2409,7 +2418,16 @@ fn certified_lane_inline(
         if base + buf_len > vm.stack_cap {
             return Ok(None);
         }
-        let mut scratch = vm.save_scratch();
+        let control_free = if callee_control {
+            vm.is_control_free()
+        } else {
+            true
+        };
+        let mut scratch = if control_free {
+            vm.save_scratch()
+        } else {
+            vm.save_scratch_full()
+        };
         scratch.mark_env_swapped();
         let saved = (
             vm.lexical_env,
@@ -2424,7 +2442,14 @@ fn certified_lane_inline(
         vm.current_function = Some(callee_value);
         vm.current_new_target = construct.then_some(callee_value);
         vm.strict = strict;
-        (scratch, saved, base)
+        (
+            scratch,
+            saved,
+            control_free,
+            base,
+            vm.args.len(),
+            vm.args_base_stack.len(),
+        )
     };
     unsafe {
         let vm = &mut *ctx.vm;
@@ -2547,6 +2572,19 @@ fn certified_lane_inline(
             vm.current_new_target,
             vm.strict,
         ) = saved;
+        if control_free && callee_control {
+            vm.clear_control_state();
+        }
+        // A callee building an argument vector (`ArgsBase`/`ArgsPush`, a
+        // `Call`, `Construct`, a tagged template) appends above the caller's
+        // entries and a balanced run leaves the length where it found it — so
+        // the common call pays one compare. An abrupt exit mid-build leaves
+        // entries behind (and a caller mid-`ArgsSpread` keeps its own
+        // half-built vector below them), and the watermark unwinds them.
+        if vm.args.len() != args_len {
+            vm.args.truncate(args_len);
+            vm.args_base_stack.truncate(args_base_len);
+        }
         vm.restore_scratch(scratch);
     }
     if nested.pending {
