@@ -5073,6 +5073,16 @@ impl Vm {
                 // mirror the cell would keep serving the pre-store value to
                 // the compiled `LoadGlobal` fast path.
                 Self::record_global_cell(agent, name, value, &global, Some(slot));
+                drop(props);
+                // ...and the read-side member cell, so a `globalThis.name`
+                // read after this store is not served the old value.
+                Self::refresh_member_value_cell(
+                    agent,
+                    global.id(),
+                    global.generation(),
+                    name,
+                    value,
+                );
                 return Ok(());
             }
         }
@@ -5154,6 +5164,10 @@ impl Vm {
             *cell_value = value;
             drop(props);
             Self::record_global_cell(agent, name, value, &global, Some(slot));
+            // The rewrite is in place (the generation stays put), so the
+            // read-side member cell must be refreshed or a later
+            // `realm.name` read serves the pre-store value.
+            Self::refresh_member_value_cell(agent, global.id(), global.generation(), name, value);
             return Ok(true);
         }
         Ok(false)
@@ -5287,6 +5301,26 @@ impl Vm {
     /// The direct-mapped cache index for (object id, name atom).
     fn member_cell_index(object_id: u64, name: crux::AtomId) -> usize {
         (object_id as usize ^ name as usize) & (MEMBER_CELLS - 1)
+    }
+
+    /// Refresh the read-side member-value cell after an in-place write of
+    /// `object.name`. An in-place value write does not bump the object's
+    /// generation, so leaving the cell alone makes a later `obj.name` read
+    /// serve the pre-store value; [`crux::object::JsObject::write_data_property_slot`]
+    /// keeps its callers honest the same way.
+    pub(crate) fn refresh_member_value_cell(
+        agent: &mut Agent,
+        object_id: u64,
+        generation: u32,
+        name: crux::AtomId,
+        value: Value,
+    ) {
+        agent.member_value_cells[Self::member_cell_index(object_id, name)] = MemberValueCell {
+            id: object_id,
+            name,
+            generation,
+            value,
+        };
     }
 
     /// The direct-mapped cache index for the L1a store cells (a larger

@@ -14821,3 +14821,120 @@ Verified: `cargo fmt --all --check`; clippy `-D warnings`; `cargo test
 `--gc-stress` on `statements/try` and `Iterator` matches HEAD exactly (the one
 try hang and the three zipKeyed hangs are pre-existing under the stress
 deadline). Repro probes: `scratch/c3/{throw_call,new_only,try_only,throw_plain}`.
+
+### FIXED (2026-10-20): the global store cell skipped the member-cell refresh
+
+`c1`-era global store cells wrote the global object's property in place and
+mirrored the JIT's global-value cell, but not the *read-side* member-value cell
+(`agent.member_value_cells`). An in-place write does not bump the object's
+generation (the slag-jit skill's §19 store discipline), so a later member read
+of the same name was served the pre-store value:
+
+```js
+realmA.calls = 0;                          // warms the member cell for realmA.calls
+...
+Reflect.construct(aGeneratorFunction, ["calls += 1;"], newTarget)();  // StoreIdent → global cell
+realmA.calls                               // served the stale 0 from the member cell
+```
+
+`built-ins/GeneratorFunction/proto-from-ctor-realm-prototype.js` failed with
+`Expected SameValue(«0», «1»)`, and it failed under `--jitless` too — the
+interpreter's `try_global_cell_store` has the same gap. Both in-place store
+paths (`Vm::store_global_value`, `Vm::try_global_cell_store`) and the compiled
+`set_global_slot` helper now call `Vm::refresh_member_value_cell`, the same
+discipline `JsObject::write_data_property_slot` follows.
+
+Two traps made this expensive to find, both worth remembering:
+
+- **A local `sweep all` can pass while CI's per-area sweep fails.** The fixtures
+  are batched into fresh processes; a fixture that leaks per-`Agent` state (here
+  a warmed member cell) only fails when its trigger lands in the *same batch*.
+  `sweep all` split the pair, `sweep built-ins` did not. Reproduce with
+  `--print-fixtures` to find the batch, then `--list <file>` with exactly that
+  batch — a 32-fixture, ~10 ms repro instead of a 10-minute area sweep.
+- **The failing assertion named the wrong suspect.** The value was right in the
+  property and wrong in the cache, so every "which global did it write" probe
+  came back clean; the store really did hit (`cell_store=true`). Instrument the
+  *store's* branch and the *read path* that serves the assertion, not just the
+  write target.
+
+The compiling tier was also given the interpreter's `body.env_constant` guard
+on the `LoadIdent`/`ResolveIdentStore`/`StoreIdent` cell paths (the run-entry
+`globals_unshadowed` snapshot is only valid for a whole run in an env-constant
+body), then that gate was **withdrawn**: an interleaved A/B on
+`language/statements/for-in/head-let-fresh-binding-per-iteration.js` (which is
+env-changing and reads `Object`/`assert` through `LoadIdent`) put it at 720 ms
+without and ~800 ms with, and it fixed nothing reproducible — the fixture above
+was already green from the member-cell refresh alone. The interpreter keeps the
+guard; the compiled tier's divergence (it may use the cell for a body whose
+chain could later gain a shadowing binding, where the interpreter resolves) is
+a known open item, recorded rather than paid for at 15% on the largest row.
+
+Verified: fmt; clippy `-D warnings`; `cargo test --workspace`; and every area at
+CI's batch size — `built-ins` 23,821, `language` 23,726, `annexB` 1,086,
+`intl402` 3,365, all 100%.
+
+### MEASURED (2026-10-20): re-measured after the member-cell fix
+
+The README's tables were stale (they predated the certified-lane work). Fresh
+run on the same box: micro-suite medians of five, corpus medians of two runs
+(per-row median, then the family means) because a corpus row's spread is wide.
+
+Corpus (gap = Slag / V8, ms per bench() call):
+
+| family | n | JIT gap | interp gap |
+| --- | ---: | ---: | ---: |
+| arrays | 6 | 10.80x | 3.71x |
+| builtins | 5 | 7.76x | 4.06x |
+| calls | 6 | 11.03x | 5.25x |
+| control | 5 | 15.41x | 4.52x |
+| globals | 4 | 2.46x | 0.84x |
+| language | 3 | 9.36x | 8.60x |
+| objects | 7 | 9.10x | 2.49x |
+| opcost | 36 | 14.42x | 3.81x |
+| strings | 5 | 14.69x | 4.57x |
+| **all** | **77** | **12.22x** | **3.94x** |
+
+Micro-suite moved where the call lane and the optimizer work landed:
+`apply leaf call` 7.112 -> 5.225 ms JIT (-27%), `typed-array read` 12.567 ->
+11.651 ms JIT and 94.40 -> 73.71 ms interpreted (-22%), `non-leaf call` 6.173 ->
+5.850 ms. Everything else is within the suite's noise. 13 of the 16 bodies now
+lift into the optimizing tier (the three that keep the per-step body bail on
+`CallApply` or `TypedArrayLengthHoist`), which is why the README no longer says
+"only `arithmetic` and `bare loop` compile".
+
+Two things NOT attributable to this session, recorded so they are not
+re-attributed later:
+
+- `globals/*`'s *interpreter* column is ~15% slower than the README's old
+  numbers (16.0-17.0 -> 17.8-20.5 ms) while the JIT column is flat (2.4-2.7).
+  The rows are read-only, so it is not the member-cell refresh; it predates
+  this commit. Its family interp gap reads 0.84 against the old 0.70 mostly
+  because V8's `--jitless` column also moved up (12.5-14.9 -> 12.7-13.9).
+- The member-cell refresh costs nothing measurable: the `opcost` store rows and
+  `objects/warm_store` are flat (29.7 -> 29.6 ms), and the for-in row's
+  interleaved A/B against the parent commit was 590-651 vs 603-640 ms.
+
+#### The bisect, closed
+
+The fast batch repro makes the attribution exact instead of inferred:
+
+| revision | built-ins batch 195 | 2-fixture pair |
+| --- | --- | --- |
+| `bc81db7d` (parent of `8e276655`) | 31 pass, 0 fail | 2 pass |
+| `8e276655` (fast-path global stores) | 30 pass, **1 fail** | 1 pass, **1 fail** |
+| `8e276655` + only the member-cell refresh | 31 pass, 0 fail | 2 pass |
+| `HEAD` | 31 pass, 0 fail | 2 pass |
+
+So the offending commit is `8e276655` and its *only* defect is the missing
+read-side refresh: one disciplined write added to that tree turns the batch
+green, with nothing else changed. The later commits (`c10e2f10` inlining the
+certified store cell, `1fa40bb6` caching declarative slots) inherit the same
+gap in their own in-place writers, which is why `HEAD` needs the refresh in
+three places rather than one.
+
+Reverting `8e276655` instead was measured and rejected: an interleaved A/B on a
+5M-iteration `var += 1` loop (the shape that commit exists for) is **866-903 ms
+at the parent versus 41.5-43.0 ms at the commit** — 20.7x. The corpus has no
+global-*store* row (its `globals/*` are read-only), which is why the corpus
+means showed the change as ~flat and why the regression hid there.

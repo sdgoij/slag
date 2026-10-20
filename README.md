@@ -368,7 +368,10 @@ its JIT and with it disabled — see `tools/corpus/README.md`). The optimization
 switches behind these numbers (`SLAG_OPT`, `SLAG_TYPER`, the inline/pass seams,
 and the `JIT_*` diagnostics) are documented in `ENVIRONMENT.md`. The numbers
 below are one machine (AMD Ryzen 9 7950X, Windows 11, rustc 1.96.0, node
-v24.12.0): medians of five runs for the micro-suite, one run for the corpus.
+v24.12.0): medians of five runs for the micro-suite and of two for the
+corpus (a corpus row's spread is wide — `for-in/head-let-fresh-binding` has
+measured 590-820 ms across sessions — so two runs are compared row by row and
+the median is reported).
 The release profile is part of the measurement, not an aside: `[profile.release]`
 pins `codegen-units = 1` + `lto = "thin"`, because at cargo's default 16 codegen
 units the same source built two ways is laid out differently and differs by up
@@ -383,22 +386,22 @@ both paths computed the same value):
 
 | Body | Interpreter | JIT | Ratio |
 |---|---|---|---|
-| `wide leaf call` | 23.68 ms | 1.860 ms | 0.08x |
-| `bare loop` | 7.30 ms | 0.586 ms | 0.08x |
-| `property read` | 8.84 ms | 0.731 ms | 0.08x |
-| `arithmetic` | 7.91 ms | 0.723 ms | 0.09x |
-| `global read` | 11.93 ms | 1.374 ms | 0.12x |
-| `typed-array read` | 94.40 ms | 12.567 ms | 0.13x |
-| `builtin call` | 4.69 ms | 0.712 ms | 0.15x |
-| `function calls` | 6.22 ms | 0.965 ms | 0.16x |
-| `string concat` | 1.18 ms | 0.188 ms | 0.16x |
-| `typed-array length` | 12.60 ms | 2.050 ms | 0.16x |
-| `buildString shape` | 76.51 ms | 14.173 ms | 0.19x |
-| `typed-array write` | 28.62 ms | 6.248 ms | 0.22x |
-| `non-leaf call` | 27.47 ms | 6.173 ms | 0.22x |
-| `compound assign` | 3.83 ms | 1.028 ms | 0.27x |
-| `buildString full` | 64.58 ms | 18.607 ms | 0.29x |
-| `apply leaf call` | 20.18 ms | 7.112 ms | 0.35x |
+| `wide leaf call` | 21.12 ms | 1.784 ms | 0.08x |
+| `bare loop` | 6.62 ms | 0.590 ms | 0.09x |
+| `property read` | 8.30 ms | 0.732 ms | 0.09x |
+| `arithmetic` | 7.24 ms | 0.720 ms | 0.10x |
+| `global read` | 11.30 ms | 1.456 ms | 0.13x |
+| `builtin call` | 4.70 ms | 0.716 ms | 0.15x |
+| `function calls` | 6.27 ms | 0.961 ms | 0.15x |
+| `typed-array read` | 73.71 ms | 11.651 ms | 0.16x |
+| `string concat` | 1.12 ms | 0.188 ms | 0.17x |
+| `typed-array length` | 11.49 ms | 2.030 ms | 0.18x |
+| `buildString shape` | 74.56 ms | 14.470 ms | 0.19x |
+| `typed-array write` | 28.37 ms | 6.135 ms | 0.22x |
+| `non-leaf call` | 26.23 ms | 5.850 ms | 0.22x |
+| `compound assign` | 3.87 ms | 1.054 ms | 0.27x |
+| `apply leaf call` | 18.21 ms | 5.225 ms | 0.29x |
+| `buildString full` | 63.08 ms | 18.660 ms | 0.30x |
 
 `builtin call` and `non-leaf call` are the two rows that cannot inline — a body
 that contains a call is not a leaf, and a crux-native builtin is not a JS leaf —
@@ -407,14 +410,14 @@ machinery, not by code generation. `typed-array read` is the one row this suite
 gained over `v0.1.0-preview.2`; the rest of the set is unchanged.
 `.notes/perf.md` has the per-shape probe and what each row moved.
 
-`arithmetic` and `bare loop` are the only rows the optimizing tier compiles (the
-rest keep the per-step body), so they are the only two whose numbers moved when
-that tier became the default. The raw-f64 pass now keeps both accumulators in
-f64 registers: `bare loop` is 0.586 ms against the per-step lane's 0.70 ms. In
+Most of the suite lifts into the optimizing tier now — 13 of the 16 bodies on
+this build; the three that keep the per-step body are blocked on `CallApply` or
+`TypedArrayLengthHoist`. The raw-f64 pass keeps both accumulators in f64
+registers: `bare loop` is 0.590 ms against the per-step lane's 0.70 ms. In
 `arithmetic` the counter is an int32 (the loop-counter pass proved it) and its
-float uses convert; that is still faster than a loop-carried f64 counter, whose
-back edge is a 4-cycle `vaddsd`, so the row sits ~18% behind the per-step lane.
-`.notes/perf.md` has the measurement.
+float uses convert, which was measured ~18% behind a per-step loop-carried f64
+counter (whose back edge is a 4-cycle `vaddsd`) when the tier became the
+default; `.notes/perf.md` has the measurement.
 
 One row needs a caveat: `wide leaf call`'s interpreter column is the suite's
 noisiest (±20% run to run), and it is the single row the pinned release profile
@@ -431,45 +434,45 @@ Gap = Slag ms / V8 ms, so > 1 means V8 was faster:
 
 | Family | Workloads | JIT gap | Interpreter gap |
 |---|---|---|---|
-| arrays | 6 | 11.22x | 4.26x |
-| builtins | 5 | 8.34x | 4.28x |
-| calls | 6 | 11.69x | 5.30x |
-| control | 5 | 14.84x | 4.26x |
-| globals | 4 | 2.69x | 0.70x |
-| language | 3 | 9.92x | 8.40x |
-| objects | 7 | 9.59x | 2.74x |
-| opcost | 36 | 16.14x | 4.38x |
-| strings | 5 | 14.95x | 4.90x |
-| **All** | **77** | **13.21x** | **4.28x** |
+| arrays | 6 | 10.80x | 3.71x |
+| builtins | 5 | 7.76x | 4.06x |
+| calls | 6 | 11.03x | 5.25x |
+| control | 5 | 15.41x | 4.52x |
+| globals | 4 | 2.46x | 0.84x |
+| language | 3 | 9.36x | 8.60x |
+| objects | 7 | 9.10x | 2.49x |
+| opcost | 36 | 14.42x | 3.81x |
+| strings | 5 | 14.69x | 4.57x |
+| **All** | **77** | **12.22x** | **3.94x** |
 
 A sample of the per-workload rows (the command above prints all 77), ms per
 `bench()` call:
 
 | Workload | Slag JIT | Slag interp | V8 JIT | V8 `--jitless` | JIT gap | Interp gap |
 |---|---|---|---|---|---|---|
-| `arrays/for_of_dense.js` | 7.5 | 55.6 | 1.8 | 61.4 | 4.12x | 0.91x |
-| `arrays/typed_array.js` | 24.9 | 192.5 | 1.1 | 39.3 | 21.86x | 4.89x |
-| `builtins/json_roundtrip.js` | 61.5 | 58.1 | 13.3 | 15.3 | 4.61x | 3.79x |
-| `builtins/math_intrinsics.js` | 11.0 | 68.4 | 147.9 | 179.1 | 0.07x | 0.38x |
-| `calls/direct_leaf.js` | 12.7 | 77.2 | 1.1 | 38.1 | 11.13x | 2.03x |
-| `calls/recursive_fib.js` | 48.5 | 503.0 | 7.3 | 36.9 | 6.64x | 13.63x |
-| `control/generator_loop.js` | 63.0 | 89.9 | 2.3 | 9.3 | 27.11x | 9.69x |
-| `globals/declarative_read.js` | 2.4 | 17.0 | 0.6 | 14.9 | 4.25x | 1.14x |
-| `globals/hoisted_local.js` | 3.7 | 16.8 | 0.6 | 12.5 | 6.45x | 1.34x |
-| `globals/nested_read.js` | 2.5 | 16.0 | 87.3 | 107.8 | 0.03x | 0.15x |
-| `globals/object_read.js` | 2.4 | 16.2 | 81.3 | 101.0 | 0.03x | 0.16x |
-| `objects/destructure.js` | 4.9 | 144.8 | 0.8 | 50.0 | 6.44x | 2.89x |
-| `objects/own_read.js` | 2.9 | 32.0 | 1.2 | 50.8 | 2.35x | 0.63x |
-| `objects/warm_store.js` | 29.7 | 117.3 | 2.3 | 59.7 | 13.02x | 1.96x |
-| `strings/char_ops.js` | 12.0 | 23.5 | 0.4 | 6.8 | 32.00x | 3.47x |
+| `arrays/for_of_dense.js` | 7.6 | 55.8 | 1.8 | 64.2 | 4.21x | 0.87x |
+| `arrays/typed_array.js` | 22.4 | 167.6 | 1.1 | 42.8 | 20.06x | 3.92x |
+| `builtins/json_roundtrip.js` | 55.9 | 59.0 | 13.1 | 16.1 | 4.29x | 3.65x |
+| `builtins/math_intrinsics.js` | 10.1 | 69.7 | 151.9 | 183.6 | 0.07x | 0.38x |
+| `calls/direct_leaf.js` | 12.0 | 77.6 | 1.2 | 37.7 | 10.27x | 2.06x |
+| `calls/recursive_fib.js` | 50.5 | 517.0 | 7.4 | 37.0 | 6.81x | 14.04x |
+| `control/generator_loop.js` | 63.0 | 89.8 | 2.3 | 10.5 | 26.81x | 8.58x |
+| `globals/declarative_read.js` | 2.5 | 19.8 | 0.6 | 13.4 | 4.30x | 1.48x |
+| `globals/hoisted_local.js` | 3.2 | 19.4 | 0.6 | 12.8 | 5.46x | 1.52x |
+| `globals/nested_read.js` | 2.5 | 18.5 | 90.7 | 106.0 | 0.03x | 0.17x |
+| `globals/object_read.js` | 2.5 | 20.2 | 84.6 | 103.9 | 0.03x | 0.20x |
+| `objects/destructure.js` | 4.7 | 147.9 | 0.8 | 50.8 | 6.01x | 2.92x |
+| `objects/own_read.js` | 3.0 | 32.9 | 1.2 | 49.7 | 2.42x | 0.67x |
+| `objects/warm_store.js` | 29.6 | 122.0 | 2.3 | 53.6 | 12.76x | 2.28x |
+| `strings/char_ops.js` | 12.1 | 22.8 | 0.4 | 6.2 | 31.37x | 3.71x |
 
 The `globals` family is the one family that is a controlled experiment rather
 than a workload: the same loop reading the same value as a top-level `const`
 (`declarative_read`), hoisted into a local first (`hoisted_local`), read through
 the global object (`object_read`), and read through the same global object from a
 helper nested inside another function (`nested_read` — the shape a mod's kernels
-have). All four stay in a 2.4-3.6 ms band, with `hoisted_local` the slowest at
-~3.5 ms (reproduced across three runs). Two gaps were closed there: the cell
+have). All four stay in a 2.4-3.3 ms band, with `hoisted_local` the slowest at
+~3.2 ms. Two gaps were closed there: the cell
 was never warmed for the global env's declarative record (a top-level `const`
 cost 52.5 ms — 21x), and it was never *probed* from a body whose env chain was
 not the bare global record (a nested helper's global read cost 130.2 ms per 1M
@@ -493,40 +496,40 @@ more while the rest are flat:
 
 | Micro row | preview.2 JIT | now JIT | Change |
 |---|---|---|---|
-| `builtin call` | 2.523 ms | 0.672 ms | 3.8x faster |
-| `non-leaf call` | 13.831 ms | 5.599 ms | 2.5x faster |
-| `typed-array write` | 13.418 ms | 6.041 ms | 2.2x faster |
-| `function calls` | 0.823 ms | 0.896 ms | ~flat (some slower) |
-| `wide leaf call` | 1.832 ms | 1.807 ms | ~flat |
+| `builtin call` | 2.523 ms | 0.716 ms | 3.5x faster |
+| `non-leaf call` | 13.831 ms | 5.850 ms | 2.4x faster |
+| `typed-array write` | 13.418 ms | 6.135 ms | 2.2x faster |
+| `function calls` | 0.823 ms | 0.961 ms | ~flat (some slower) |
+| `wide leaf call` | 1.832 ms | 1.784 ms | ~flat |
 | every other row | — | — | within noise |
 
 (`typed-array read` is new since preview.2: 15 rows there, 16 now.)
 
 The corpus moved further, but its headline needs a caveat read first. Overall
 the corpus means went from `mean-jitGap` 116.05 / `mean-jlGap` 9.19 to
-**13.21** / **4.28** — yet that is dominated by the `opcost` family (36 of the
+**12.22** / **3.94** — yet that is dominated by the `opcost` family (36 of the
 77 rows), and `tools/corpus/README.md` says a two-binary pair is a measurement
 only if each binary's own control row is stable: *"If a binary's own control
 row — `baseline` — has moved, the pair is not a measurement of anything."* It
 moved here, 2.4 ms → 0.3 ms — a real ~8x gain on the `i & MASK` / `| 0` bare
 loop — so the `opcost` per-row deltas are not a clean per-operation
 attribution. Excluding `opcost`, the remaining 41 rows went from a JIT gap of
-**34.81x to 10.63x** (≈3.3x closer to V8) and an interpreter gap of **6.31x to
-4.19x**:
+**34.81x to 10.29x** (≈3.4x closer to V8) and an interpreter gap of **6.31x to
+4.05x**:
 
 | Family | Workloads | JIT gap (preview.2 → now) | Interpreter gap (preview.2 → now) |
 |---|---|---|---|
-| arrays | 6 | 35.22x → 11.22x | 5.87x → 4.26x |
-| builtins | 5 | 15.22x → 8.34x | 6.64x → 4.28x |
-| calls | 6 | 24.25x → 11.69x | 5.00x → 5.30x |
-| control | 5 | 26.74x → 14.84x | 5.45x → 4.26x |
-| globals | 4 | 2.12x → 2.69x | 0.69x → 0.70x |
-| language | 3 | 13.16x → 9.92x | 7.03x → 8.40x |
-| objects | 7 | 90.32x → 9.59x | 3.24x → 2.74x |
-| strings | 5 | 36.04x → 14.95x | 17.32x → 4.90x |
-| opcost (see caveat) | 36 | 208.57x → 16.14x | 12.46x → 4.38x |
-| **All** | **77** | **116.05x → 13.21x** | **9.19x → 4.28x** |
-| **All, excluding `opcost`** | **41** | **34.81x → 10.63x** | **6.31x → 4.19x** |
+| arrays | 6 | 35.22x → 10.80x | 5.87x → 3.71x |
+| builtins | 5 | 15.22x → 7.76x | 6.64x → 4.06x |
+| calls | 6 | 24.25x → 11.03x | 5.00x → 5.25x |
+| control | 5 | 26.74x → 15.41x | 5.45x → 4.52x |
+| globals | 4 | 2.12x → 2.46x | 0.69x → 0.84x |
+| language | 3 | 13.16x → 9.36x | 7.03x → 8.60x |
+| objects | 7 | 90.32x → 9.10x | 3.24x → 2.49x |
+| strings | 5 | 36.04x → 14.69x | 17.32x → 4.57x |
+| opcost (see caveat) | 36 | 208.57x → 14.42x | 12.46x → 3.81x |
+| **All** | **77** | **116.05x → 12.22x** | **9.19x → 3.94x** |
+| **All, excluding `opcost`** | **41** | **34.81x → 10.29x** | **6.31x → 4.05x** |
 
 Only one round was run per binary, so per-workload cross-binary rows carry the
 ±warm-up band the corpus README describes; the family and overall means are the

@@ -135,6 +135,26 @@ shorter prefixes don't. Root cause unpinned (heap-state/timing dependent, consis
 with a stale pointer in the strict-unmapped `arguments` path); documented in
 .notes/conformance.md Open items. Re-run the fixture before triaging it as a regression.
 
+### 7. A green `sweep all` can hide a red per-area sweep (batch composition)
+
+Fixtures run in fresh processes, **32 per batch**, so a fixture that leaks
+per-`Agent` state only fails when its trigger lands in the same batch. CI
+sweeps per area, so the grouping differs from a local `sweep all` — the
+2026-10-20 `GeneratorFunction/proto-from-ctor-realm-prototype.js` failure
+(`realmA.calls` still 0) reproduced under `sweep built-ins` and not under
+`sweep all`, and passed alone. Reproduce a CI failure in ~10 ms with the exact
+batch instead of a 10-minute area run:
+
+```sh
+target/release/sweep <area> --print-fixtures   # find the fixture's line number
+# batch = ceil(line / --batch), then take that batch's lines
+target/release/sweep <area> --batch 32 --timeout 15 --recheck-timeout 15 --list batch.txt
+```
+
+Then bisect the batch pairwise (`[F, target]`) to find a trigger — that names
+the leaked state (here: a warmed member-value cell the global store cell never
+refreshed). A failure that also reproduces with `--jitless` is not a JIT bug.
+
 ## Relationship to the other skills
 
 - `slag-wasm` — the WebAssembly engine and its sweeps (`wasmtest run` /

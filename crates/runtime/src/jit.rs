@@ -3366,12 +3366,12 @@ extern "C" fn set_global(ctx: *mut c_void, name: u64, value: u64) -> u64 {
 extern "C" fn set_global_slot(ctx: *mut c_void, name: u64, slot: u64, value: u64) -> u64 {
     let ctx = unsafe { ctx_of(ctx) };
     let value = Value::from_bits(value);
+    let global = unsafe { &*ctx.global_object.cast::<crux::object::JsObject>() };
     // The compiled `StoreGlobal` fast path validated the cell (same global
     // identity, live generation, resolved slot), so the property at `slot`
     // is a writable data property of `name`. Defense in depth: any shape
     // mismatch falls back to the full machinery (which also mirrors the
     // cell, keeping the load fast path warm).
-    let global = unsafe { &*ctx.global_object.cast::<crux::object::JsObject>() };
     let hit = {
         let mut props = global.properties.borrow_mut();
         if let Some((key, property)) = props.get_mut(slot as usize)
@@ -3388,6 +3388,18 @@ extern "C" fn set_global_slot(ctx: *mut c_void, name: u64, slot: u64, value: u64
         }
     };
     if hit {
+        // The write is in place (the generation stays put): refresh the
+        // read-side member cell so a later `globalThis.name` read is not
+        // served the pre-store value. Same discipline as
+        // `JsObject::write_data_property_slot`.
+        let agent = unsafe { &mut *ctx.agent };
+        Vm::refresh_member_value_cell(
+            agent,
+            global.id(),
+            global.generation(),
+            name as crux::AtomId,
+            value,
+        );
         return value.bits();
     }
     let agent = unsafe { &mut *ctx.agent };
