@@ -14972,3 +14972,56 @@ target it meant. The internal `SyntaxError` is gone from both tiers.
 `the_birds_mod_works` 44/44 pass (release, linked to the local checkout);
 `cargo test --workspace`; clippy `-D warnings`; test262 built-ins 23,821,
 language 23,726, annexB 1,086, intl402 3,365, all at 100%.
+
+## LANDED (2026-10-20): function-site caches off SipHash
+
+`instantiate_function*` makes three thread-local site lookups per closure
+(`shared_source_info`, `shared_function_body`, `shared_params`) plus one agent
+lookup (`shared_compiled_body`). All four used `std::collections::HashMap`'s
+default SipHash over five-word tuple or pointer keys; a closure create is
+~310 ns, so the hashing was a visible share. The four tuple caches now use a
+combining `SiteHasher` (one rotate/xor/multiply round per word — an identity
+hasher would collapse the key to its last field), and the pointer-keyed
+`PARAMS_CACHE` and `Agent::compiled_bodies` use `MixHasher` (a splitmix64
+finalizer: identity hashing would cluster the low bits of aligned pointers).
+
+Interleaved same-binary A/B (release, 3 pairs):
+
+| probe | before | after | delta |
+| --- | --- | --- | --- |
+| `e7` 300k closures, no call | 92.0-97.0 ms | 80.5-80.9 ms | **-13%** |
+| `e5` 300k closures + one call | 130.2-138.3 ms | 117.2-118.5 ms | **-11%** |
+| `cap_uncaptured` (captures a var) | 253.5-266.6 ms | 233.1-247.5 ms | -6.5% |
+| `cap_let_drop` (fresh env per iteration) | 386.3-389.6 ms | 355.9-360.0 ms | -7.6% |
+| `calls/closure_capture` (1M calls) | 34.5-35.1 ms | 34.3-35.5 ms | flat |
+
+The for-in head-let corpus row stays inside its documented 590-820 ms band; the
+pairs that separated read 582.6 -> 559.6 and 685.3 -> 545.7, so the row's share
+is real but a single corpus run cannot price it. The full corpus could not
+separate the slice either: **12.07 jit** on the pre-change binary, then
+**11.54** and **12.52** on two runs of the final build (jl 4.07, 4.04, 4.20;
+parity 0 throughout). The run-to-run spread is larger than the effect, so the
+README's family table was left at its previous recorded run and the interleaved
+probes above are the evidence.
+
+Gates: fmt; clippy `-D warnings`; `cargo test --workspace`; test262 built-ins
+23,821, language 23,726, annexB 1,086, intl402 3,365 — all 0 fail.
+
+### Priced but not taken (2026-10-20 survey)
+
+- **Per-iteration block env** (the for-in head-let shape): `env-new` ~10 ns,
+  `block_declaration_instantiation` ~50-90 ns (two `Vec` allocations: the
+  `bound_names` scratch and the env's `bindings`), `InitContextSlot`/leave
+  ~10 ns each. Probe `Instant` pairs make exact attribution unreliable.
+  Removing the `bound_names` Vec for a plain `Ident` is a small slice
+  (~25 ns/env); an inline binding store would remove the other allocation.
+- **Closure create is ~310 ns** even after Stages B+A: the remaining terms are
+  the `ecma_functions` insert, the `Function` + `JsObject` boxes, and the
+  batched property adoption. Stage D (record in the GC arena) remains gated by
+  `.notes/closure-cost-plan.md`'s stop rule.
+- **`eval` costs ~2.75 us/call** (`eval("")` 0.95 us; each extra token ~1.3 us)
+  and the script-body cache already holds the compiled body, so the cost is the
+  per-call instantiation/env setup, not compilation. `try/completion-values` is
+  ~12% eval-bound; the rest is its try/finally machinery.
+- **`arrays/typed_array`** is 11 ns/iter in the JIT (two element accesses +
+  arithmetic) and 81 ns/iter in the interpreter (V8 `--jitless`: 20 ns).

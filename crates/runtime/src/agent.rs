@@ -628,8 +628,11 @@ pub struct Agent {
     /// (like `shared_function_body`'s cache), so a long-running process with
     /// many dynamically-created sites grows it unboundedly — consistent with
     /// the existing body-AST cache.
-    pub(crate) compiled_bodies:
-        std::collections::HashMap<usize, crate::function::CompiledBodyCacheEntry>,
+    pub(crate) compiled_bodies: std::collections::HashMap<
+        usize,
+        crate::function::CompiledBodyCacheEntry,
+        std::hash::BuildHasherDefault<MixHasher>,
+    >,
     /// Per-source compiled SCRIPT/EVAL bodies, keyed by the exact
     /// source text + (strict, fast_script, jsx). `run_script`/`perform_eval`
     /// re-parse the same source into a fresh AST each call, so without this
@@ -1401,7 +1404,7 @@ impl Agent {
             module_async_evaluation_count: 0,
             module_eval_stack: Vec::new(),
             ecma_functions: std::collections::HashMap::default(),
-            compiled_bodies: std::collections::HashMap::new(),
+            compiled_bodies: std::collections::HashMap::default(),
             script_bodies: std::collections::HashMap::new(),
             promises: std::collections::HashMap::new(),
             entered_realm: None,

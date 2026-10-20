@@ -1057,10 +1057,52 @@ fn shared_source_info(
 
 type SourceInfoKey = (usize, usize, usize, usize, usize);
 
+/// A cheap combining hasher for the function-site caches. Their keys are
+/// tuples of node pointers, spans and a source hash — all already well mixed
+/// — and the default SipHash costs more than the lookup itself on the
+/// per-closure path. Unlike an identity hasher every word is folded in: the
+/// node/span/realm fields are what keep a reused address from colliding.
+#[derive(Default)]
+struct SiteHasher(u64);
+
+impl std::hash::Hasher for SiteHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+    fn write(&mut self, bytes: &[u8]) {
+        for &byte in bytes {
+            self.mix(u64::from(byte));
+        }
+    }
+    fn write_u8(&mut self, n: u8) {
+        self.mix(u64::from(n));
+    }
+    fn write_u16(&mut self, n: u16) {
+        self.mix(u64::from(n));
+    }
+    fn write_u32(&mut self, n: u32) {
+        self.mix(u64::from(n));
+    }
+    fn write_u64(&mut self, n: u64) {
+        self.mix(n);
+    }
+    fn write_usize(&mut self, n: usize) {
+        self.mix(n as u64);
+    }
+}
+
+impl SiteHasher {
+    #[inline]
+    fn mix(&mut self, n: u64) {
+        self.0 = (self.0.rotate_left(5) ^ n).wrapping_mul(0x51_7c_c1_b7_27_22_0a_95);
+    }
+}
+
+type SiteHashMap<K, V> = std::collections::HashMap<K, V, std::hash::BuildHasherDefault<SiteHasher>>;
+
 thread_local! {
-    static SOURCE_INFO_CACHE: std::cell::RefCell<
-        std::collections::HashMap<SourceInfoKey, std::rc::Rc<SourceInfo>>,
-    > = std::cell::RefCell::new(std::collections::HashMap::new());
+    static SOURCE_INFO_CACHE: std::cell::RefCell<SiteHashMap<SourceInfoKey, std::rc::Rc<SourceInfo>>> =
+        std::cell::RefCell::new(std::collections::HashMap::default());
 }
 
 /// `SourceInfo` for a caller-provided slice (a module declaration, a snapshot
@@ -1142,11 +1184,11 @@ fn fnv1a_units(units: &[u16]) -> usize {
 
 type FunctionBodyKey = (usize, usize, usize, usize, usize);
 
-type FunctionBodyCache = std::collections::HashMap<FunctionBodyKey, std::rc::Rc<Block>>;
+type FunctionBodyCache = SiteHashMap<FunctionBodyKey, std::rc::Rc<Block>>;
 
 thread_local! {
     static FUNCTION_BODY_CACHE: std::cell::RefCell<FunctionBodyCache> =
-        std::cell::RefCell::new(std::collections::HashMap::new());
+        std::cell::RefCell::new(std::collections::HashMap::default());
 }
 
 /// The site's shared params slice (Cut 64): every closure from the same
@@ -1173,11 +1215,15 @@ pub(crate) fn shared_params(
     })
 }
 
-type ParamsCache = std::collections::HashMap<usize, std::rc::Rc<[BindingElement]>>;
+type ParamsCache = std::collections::HashMap<
+    usize,
+    std::rc::Rc<[BindingElement]>,
+    std::hash::BuildHasherDefault<crate::agent::MixHasher>,
+>;
 
 thread_local! {
     static PARAMS_CACHE: std::cell::RefCell<ParamsCache> =
-        std::cell::RefCell::new(std::collections::HashMap::new());
+        std::cell::RefCell::new(std::collections::HashMap::default());
 }
 
 /// The shared body `Rc<Block>` for an arrow site (Cut 43): the ArrowBody
@@ -1227,11 +1273,11 @@ pub fn shared_arrow_body(agent: &Agent, body: &syntax::ast::ArrowBody) -> std::r
 
 type ArrowBodyKey = (usize, usize, usize, usize, usize);
 
-type ArrowBodyCache = std::collections::HashMap<ArrowBodyKey, std::rc::Rc<Block>>;
+type ArrowBodyCache = SiteHashMap<ArrowBodyKey, std::rc::Rc<Block>>;
 
 thread_local! {
     static ARROW_BODY_CACHE: std::cell::RefCell<ArrowBodyCache> =
-        std::cell::RefCell::new(std::collections::HashMap::new());
+        std::cell::RefCell::new(std::collections::HashMap::default());
 }
 
 /// The shared body `Rc<Block>` for an accessor site (a getter/setter — the
@@ -1267,11 +1313,11 @@ pub fn shared_accessor_body(agent: &Agent, body: &Block) -> std::rc::Rc<Block> {
 
 type AccessorBodyKey = (usize, usize, usize, usize, usize);
 
-type AccessorBodyCache = std::collections::HashMap<AccessorBodyKey, std::rc::Rc<Block>>;
+type AccessorBodyCache = SiteHashMap<AccessorBodyKey, std::rc::Rc<Block>>;
 
 thread_local! {
     static ACCESSOR_BODY_CACHE: std::cell::RefCell<AccessorBodyCache> =
-        std::cell::RefCell::new(std::collections::HashMap::new());
+        std::cell::RefCell::new(std::collections::HashMap::default());
 }
 
 /// Instantiate a method definition (object literal `m() {}` and class
