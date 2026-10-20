@@ -15179,3 +15179,9 @@ The declarator regression is the price of the name it previously skipped: ~27 ns
 The ~27 ns residual is not explained by this measurement: the unnamed control pays the same property adoption (with an empty name) and is flat, so what differs is the non-empty name value — its handle allocation and the atom-to-string conversion. Caching that value per declaration site is the obvious next probe.
 
 Gates: fmt; clippy `-D warnings`; `cargo test --workspace` (38 suites, 0 fail); test262 built-ins 23,821, language 23,726, annexB 1,086, intl402 3,365 — 0 fail.
+
+### Follow-up (2026-10-20): the inferred name is resolved once per site
+
+The fold above still resolved the binding's text per closure — `AtomId -> JsString` goes through the memoised `crux::lookup` (a thread-local borrow, a scan, and a clone) — and `default_binding_display_name` built `JsString::from_utf8("*default*")`, nine encoded units, before it could reject the common case. The creation steps now carry the resolved `JsString` (resolved once per site, when the step is emitted), and the export-default check compares the slice against a `[u16; 9]` constant.
+
+Interleaved same-binary A/B, medians (8 pairs): the named declarator probe 83.8 -> 81.5 ms (-2.7%; every pair improved), `f = function () {}` -1.3% (4 pairs). The named-versus-unnamed gap is still ~4 ms per 300k (~13 ns/closure), and this change does not explain it: with the lookup and the literal gone, what remains is inside creation with a non-empty `name` — the handle and the batched adoption. Chasing it further has not paid; the fold's win is 410 -> ~13 ns of overhead.

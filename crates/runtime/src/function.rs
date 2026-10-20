@@ -682,8 +682,13 @@ pub fn is_anonymous_function_definition(expr: &syntax::ast::Expr) -> bool {
 /// InitializeBoundName renames via SetFunctionName). Other names pass
 /// through unchanged.
 pub(crate) fn default_binding_display_name(name: Option<JsString>) -> Option<JsString> {
+    // `*default*` in UTF-16. Comparing the slice rather than building the
+    // literal keeps this allocation- and encode-free: it runs once per named
+    // function creation, where the previous `JsString::from_utf8("*default*")`
+    // encoded nine units before it could reject the common case.
+    const DEFAULT_EXPORT: [u16; 9] = [42, 100, 101, 102, 97, 117, 108, 116, 42];
     name.map(|text| {
-        if text == JsString::from_utf8("*default*") {
+        if text.as_slice() == DEFAULT_EXPORT {
             JsString::from_utf8("default")
         } else {
             text
@@ -939,7 +944,7 @@ pub fn instantiate_function(
     outer_chain: OuterChain,
     per_iteration_chain: PerIterationChain,
     named_expression: bool,
-    named: Option<crux::AtomId>,
+    named: Option<JsString>,
 ) -> Result<Value, JsError> {
     instantiate_function_with_source(
         agent,
@@ -964,7 +969,7 @@ pub fn instantiate_function_with_source(
     outer_chain: OuterChain,
     per_iteration_chain: PerIterationChain,
     named_expression: bool,
-    named: Option<crux::AtomId>,
+    named: Option<JsString>,
 ) -> Result<Value, JsError> {
     let source_info = match source {
         Some(slice) => {
@@ -984,7 +989,7 @@ pub fn instantiate_function_with_source(
     let params = shared_params(&body, &f.params);
     let value = register_function(
         agent,
-        default_binding_display_name(named.map(crux::lookup).or_else(|| f.name.map(crux::lookup))),
+        default_binding_display_name(named.or_else(|| f.name.map(crux::lookup))),
         params,
         body,
         environment,
@@ -1833,7 +1838,7 @@ pub fn instantiate_function_expression(
     enclosing_strict: bool,
     outer_chain: OuterChain,
     per_iteration_chain: PerIterationChain,
-    named: Option<crux::AtomId>,
+    named: Option<JsString>,
 ) -> Result<Value, JsError> {
     let Some(name) = f.name else {
         return instantiate_function(
@@ -1966,7 +1971,7 @@ pub fn instantiate_arrow(
     outer_chain: OuterChain,
     per_iteration_chain: PerIterationChain,
     span: crux::Span,
-    named: Option<crux::AtomId>,
+    named: Option<JsString>,
 ) -> Result<Value, JsError> {
     // Cut 43: the site's shared Block — every closure from the same arrow
     // node shares it (and, via `shared_compiled_body` below, one compiled
@@ -2000,7 +2005,7 @@ pub fn instantiate_arrow(
         .running_context()
         .ok()
         .and_then(|context| context.script_or_module.clone());
-    let display = named.map(crux::lookup);
+    let display = named;
     let mut data = EcmaFunction {
         name: display.clone(),
         params,

@@ -3900,7 +3900,7 @@ extern "C" fn create_function(ctx: *mut c_void, step: u64) -> u64 {
         *strict,
         outer_chain.clone(),
         per_iteration_chain.clone(),
-        *named,
+        named.clone(),
     ) {
         Ok(value) => value.bits(),
         Err(error) => slow_error(ctx, error),
@@ -3935,7 +3935,7 @@ extern "C" fn create_arrow(ctx: *mut c_void, step: u64) -> u64 {
         outer_chain.clone(),
         per_iteration_chain.clone(),
         *span,
-        *named,
+        named.clone(),
     ) {
         Ok(value) => value.bits(),
         Err(error) => slow_error(ctx, error),

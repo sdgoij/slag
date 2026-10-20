@@ -616,8 +616,10 @@ pub enum Step {
         /// NamedEvaluation (spec 13.15.2): the binding an anonymous function
         /// expression is named after. Folded into creation so the name is
         /// defined once, by the batched property adoption, instead of a
-        /// trailing `SetFunctionName` redefining `name` on every closure.
-        named: Option<crux::AtomId>,
+        /// trailing `SetFunctionName` redefining `name` on every closure. The
+        /// text is resolved once per site (`AtomId` -> `JsString` is a memoised
+        /// lookup), not per closure.
+        named: Option<JsString>,
         outer_chain: crate::function::OuterChain,
         /// Cut 28: the per-iteration head layouts of the certified loops
         /// open at this creation site (see
@@ -633,7 +635,7 @@ pub enum Step {
         body: syntax::ast::ArrowBody,
         strict: bool,
         /// NamedEvaluation; see [`Step::CreateFunction`].
-        named: Option<crux::AtomId>,
+        named: Option<JsString>,
         outer_chain: crate::function::OuterChain,
         /// Cut 28: see [`Step::CreateFunction`].
         per_iteration_chain: crate::function::PerIterationChain,
@@ -1297,6 +1299,12 @@ impl Trace for Step {
             }
             Step::PushStr(text) => text.trace(visit),
             Step::ConcatStrConst(text) => text.trace(visit),
+            Step::CreateFunction {
+                named: Some(name), ..
+            }
+            | Step::CreateArrow {
+                named: Some(name), ..
+            } => name.trace(visit),
             Step::PerIteration { names }
             | Step::EnterIterTdzEnv { names }
             | Step::EnterPerIteration { names } => names.trace(visit),
@@ -8152,7 +8160,7 @@ impl Vm {
                         *strict,
                         outer_chain.clone(),
                         per_iteration_chain.clone(),
-                        *named,
+                        named.clone(),
                     )?;
                     self.stack.push(value);
                 }
@@ -8177,7 +8185,7 @@ impl Vm {
                         outer_chain.clone(),
                         per_iteration_chain.clone(),
                         *span,
-                        *named,
+                        named.clone(),
                     )?;
                     self.stack.push(value);
                 }
@@ -21464,7 +21472,7 @@ impl Compiler {
             ExprKind::Function(function) => {
                 let outer_chain = self.closure_outer_chain();
                 let per_iteration_chain = self.closure_per_iteration_chain();
-                let named = self.pending_function_name.take();
+                let named = self.pending_function_name.take().map(crux::lookup);
                 self.named_folded = named.is_some();
                 self.emit(Step::CreateFunction {
                     function: Box::new(function.clone()),
@@ -21482,7 +21490,7 @@ impl Compiler {
             } => {
                 let outer_chain = self.closure_outer_chain();
                 let per_iteration_chain = self.closure_per_iteration_chain();
-                let named = self.pending_function_name.take();
+                let named = self.pending_function_name.take().map(crux::lookup);
                 self.named_folded = named.is_some();
                 self.emit(Step::CreateArrow {
                     is_async: *is_async,
