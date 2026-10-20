@@ -15208,3 +15208,21 @@ Both generator tables are now `RefCell<HashMap<...>>` so the collection (which o
 Cost: the resume path pays ~4% for the map's `RefCell` lookup (`control/generator_loop` 58.7 -> 61.3 ms; the probe 55.9 -> 58.5). That row holds one long-lived generator, so this fix does not help it: its ~61 ms is the resume machinery itself (~300 ns per `next()`), which is a separate target.
 
 Gates: fmt; clippy `-D warnings`; `cargo test --workspace` (38 suites, 0 fail); test262 built-ins 23,821, language 23,726, annexB 1,086, intl402 3,365 — 0 fail.
+
+## LANDED (2026-10-20): generator method dispatch is cached per prototype generation
+
+Every `g.next()` went through `generator::dispatch_call`, which resolved `%Generator.prototype%` from the realm's intrinsic table (a RefCell borrow plus a SipHash of the name) and read `next`/`return`/`throw` off the prototype (three `JsString` conversions and three property lookups) before comparing the callee. That is per-call work to discover constants.
+
+The three method values are now cached on the Agent as `(realm, prototype, generation, next, return, throw)` and revalidated by the prototype's generation — which bumps on any own-property change, so replacing a method invalidates the cache exactly (probe: after `proto.next = function () { return { value: 99 } }`, a call answers 99). The cached values are traced, so a method removed from the prototype stays alive while the cache names it.
+
+Isolating the pieces first: a `next()` on an *already completed* generator (dispatch + result object, no resume) cost 197 ns; the body machinery added ~87. After the cache:
+
+| probe | before | after |
+| --- | ---: | ---: |
+| `control/generator_loop` row | 62.8 ms | 49.4 ms (**-21%**) |
+| completed-generator `next()` (200k) | 39.4 ms (197 ns/call) | 30.3 ms (151 ns/call) |
+| resuming `next()` (200k) | 56.8 ms (284 ns/call) | 44.6 ms (223 ns/call) |
+
+The remaining 151 ns of the completed path is the `{value, done}` result object (arena allocation plus the cached-shape adoption) and the state-table lookup; the row's remaining ~247 ns per resume is the resume machinery (context save/restore around the Vm run).
+
+Gates: fmt; clippy `-D warnings`; `cargo test --workspace` (38 suites, 0 fail); test262 built-ins 23,821, language 23,726, annexB 1,086, intl402 3,365 — 0 fail.

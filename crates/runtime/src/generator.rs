@@ -158,6 +158,31 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
     Ok(())
 }
 
+/// The `%Generator.prototype%` methods a call is dispatched against, resolved
+/// once and revalidated by the prototype's generation (any own-property change
+/// to it bumps the generation, so a stale cache is never consulted). The
+/// values are kept alive by the trace of `Agent::generator_methods` even if a
+/// script later overwrites the prototype's own slots.
+#[derive(Clone, Copy)]
+pub struct GeneratorMethods {
+    realm: crux::Handle<crate::realm::Realm>,
+    proto: crux::Handle<JsObject>,
+    generation: u32,
+    next: Option<Value>,
+    ret: Option<Value>,
+    throw: Option<Value>,
+}
+
+impl crux::heap::Trace for GeneratorMethods {
+    fn trace(&self, visit: &mut dyn FnMut(crux::heap::GcAny)) {
+        self.realm.trace(visit);
+        self.proto.trace(visit);
+        self.next.trace(visit);
+        self.ret.trace(visit);
+        self.throw.trace(visit);
+    }
+}
+
 /// Dispatch `%Generator.prototype%` methods by identity.
 pub fn dispatch_call(
     agent: &mut Agent,
@@ -166,26 +191,43 @@ pub fn dispatch_call(
     args: &[Value],
 ) -> Option<Result<Value, JsError>> {
     let realm = agent.current_realm().ok()?;
+    let methods = generator_methods(agent, realm)?;
+    if methods.next.is_some_and(|method| method == *callee) {
+        return Some(generator_next(agent, this, args));
+    }
+    if methods.ret.is_some_and(|method| method == *callee) {
+        return Some(generator_return(agent, this, args));
+    }
+    if methods.throw.is_some_and(|method| method == *callee) {
+        return Some(generator_throw(agent, this, args));
+    }
+    None
+}
+
+fn generator_methods(
+    agent: &Agent,
+    realm: crux::Handle<crate::realm::Realm>,
+) -> Option<GeneratorMethods> {
+    if let Some(cached) = agent.generator_methods.get()
+        && cached.realm.ptr_eq(realm)
+        && cached.generation == cached.proto.generation.get()
+    {
+        return Some(cached);
+    }
     let proto_value = realm.intrinsics.get(GENERATOR_PROTO)?;
     let ValueKind::Object(proto) = proto_value.kind() else {
         return None;
     };
-    for (name, handler) in [
-        (
-            NEXT,
-            generator_next as fn(&mut Agent, &Value, &[Value]) -> Result<Value, JsError>,
-        ),
-        (RETURN, generator_return),
-        (THROW, generator_throw),
-    ] {
-        let Ok(method) = proto.get(&JsString::from_utf8(name)) else {
-            continue;
-        };
-        if method == *callee {
-            return Some(handler(agent, this, args));
-        }
-    }
-    None
+    let methods = GeneratorMethods {
+        realm,
+        proto,
+        generation: proto.generation.get(),
+        next: proto.get(&JsString::from_utf8(NEXT)).ok(),
+        ret: proto.get(&JsString::from_utf8(RETURN)).ok(),
+        throw: proto.get(&JsString::from_utf8(THROW)).ok(),
+    };
+    agent.generator_methods.set(Some(methods));
+    Some(methods)
 }
 
 /// GeneratorFunctionCall: calling a generator function returns a fresh

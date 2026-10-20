@@ -1173,6 +1173,12 @@ pub struct Agent {
     /// are traced below.
     pub(crate) iter_result_realm: std::cell::Cell<Option<Handle<Realm>>>,
     pub(crate) iter_result_map: std::cell::Cell<Option<crux::Handle<crux::Map>>>,
+    /// The `%Generator.prototype%` methods `dispatch_call` compares a callee
+    /// against, resolved once per prototype generation: every `g.next()`
+    /// otherwise paid an intrinsic-table hash, three property lookups and
+    /// three string conversions before dispatching. See
+    /// [`crate::generator::GeneratorMethods`].
+    pub(crate) generator_methods: std::cell::Cell<Option<crate::generator::GeneratorMethods>>,
     /// The host's collection observers, in registration order
     /// (`crux::heap::GcObserver`). Taken out for the duration of a collection
     /// so one that runs host code cannot re-enter this list — a nested
@@ -1383,6 +1389,7 @@ impl Agent {
             function_boilerplate_maps: [None; 2],
             iter_result_realm: std::cell::Cell::new(None),
             iter_result_map: std::cell::Cell::new(None),
+            generator_methods: std::cell::Cell::new(None),
             collection_observers: RefCell::new(Vec::new()),
             microtask_queues: Vec::new(),
             vm_pool: Vec::new(),
@@ -2112,6 +2119,9 @@ impl Agent {
         }
         if let Some(map) = self.iter_result_map.get() {
             map.trace(visit);
+        }
+        if let Some(methods) = self.generator_methods.get() {
+            methods.trace(visit);
         }
         for vm in &self.vm_pool {
             vm.trace(visit);
