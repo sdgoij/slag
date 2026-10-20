@@ -15236,3 +15236,19 @@ Three row-targeted investigations, each measured, none landed.
 **The capture env lane** (`calls/closure_capture`, still 30.9x). A closure that reads a captured variable is called through `leaf_call_env` (11 ns in the in-frame lane vs 30.7 ns with one context read, measured before the generator work), where the extra cost is the frame fill, the `body_context`/`lexical_env` swap and its restore around the leaf entry. `new_body_context` already returns early for a body that captures nothing and `leaf_lookup` is a direct-mapped cell, so the remaining ~19 ns is the swap protocol itself — the caller's machine code would have to install the environment inline to remove it. Not attempted.
 
 **Typed-array elements** (`arrays/typed_array`, 21.2x). 2M iterations of `ta[k & 65535] = k & 255; s += ta[k & 65535];` = 11.4 ns per store+read pair: store alone 7.5 ns, read alone 5.9 ns (constant index saves 2.4 ns of the pair). Both are already fully inline — `JIT_HELPER_STATS` shows only the GC safepoint over the whole loop — and `SLAG_OPT=0` is 23% slower, so the optimizing tier is engaged. The CLIF shows, per access, a float -> uint -> float exact-integer check (ToIndex), a bounds check, the loaded value's tag check, a detached-buffer check and a property-flag test: the general element path, not a typed-array specialisation. The fix is an inline typed-array gate that skips ToIndex's round trip and the value tag checks — JIT emission work, not a tweak.
+
+## NULL (2026-10-20): the typed-array view cell, bounded before it was written
+
+A per-site cache of a resolved view (`data`, `byte_offset`, `array_length`, `element type`, validated by object id plus the buffer's detached/resizable flags) was the planned fix for `arrays/typed_array`. It was bounded first, and the bound is too small to justify it.
+
+The gates already exist and are inline: `emit_typed_array_read_into` (all element kinds) and `emit_typed_array_store_inline` (Uint8), both declining to the general element path through the same fallback block. For 2M iterations of `ta[k & 65535] = k & 255; s += ta[k & 65535];`: store 7.5 ns, read 5.9 ns, pair 11.9 ns.
+
+The bound comes from comparing the typed path with the **dense** one, which has the simplest geometry the engine has (an `array_dense` handle, a base pointer and a length):
+
+| probe (2M iterations) | Slag | node |
+| --- | ---: | ---: |
+| typed store + read | 23.9 ms | 1.1 ms |
+| dense store + read | 18.9 ms | 1.6 ms |
+| trivial `s += k` loop | 5.3 ms (2.65 ns/iter) | 1.2 ms (0.6 ns/iter) |
+
+So caching the typed view's geometry can recover at most the typed-versus-dense difference — ~5 ms, 21% of the row — and only because dense is 11.8x node too. The dominant costs are shared by both paths: the per-access element dispatch (~6 ns per store+read pair over the loop floor) and the loop itself (2.65 ns/iteration against node's 0.6). Not implemented: an emitter change with a use-after-free surface (the cached `data` must still be revalidated against a possible detach every access) for a fifth of one row, while the same cost is paid by every dense-array row in the corpus.
