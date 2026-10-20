@@ -15252,3 +15252,26 @@ The bound comes from comparing the typed path with the **dense** one, which has 
 | trivial `s += k` loop | 5.3 ms (2.65 ns/iter) | 1.2 ms (0.6 ns/iter) |
 
 So caching the typed view's geometry can recover at most the typed-versus-dense difference — ~5 ms, 21% of the row — and only because dense is 11.8x node too. The dominant costs are shared by both paths: the per-access element dispatch (~6 ns per store+read pair over the loop floor) and the loop itself (2.65 ns/iteration against node's 0.6). Not implemented: an emitter change with a use-after-free surface (the cached `data` must still be revalidated against a possible detach every access) for a fifth of one row, while the same cost is paid by every dense-array row in the corpus.
+
+## Analysis (2026-10-20): why the dense element path is 11.8x node
+
+The typed row is 21x node; the dense equivalent — same loop, a dense `Array` instead of a `Uint8Array` — is **11.8x** (18.9 ms against node's 1.6 for 2M store+read pairs). So the gap is in the element path itself, not in the typed-array geometry, which is what the view-cell idea would have addressed.
+
+Budget (2M iterations):
+
+| part | ms | per access |
+| --- | ---: | ---: |
+| loop floor (`s += k`) | 5.3 | 2.65 ns/iteration (node: 1.2 ms, 0.6 ns) |
+| store alone | 17.9 | 5.9 ns/store |
+| read alone | 10.9 | 2.4 ns/read |
+| both | 18.9 | 9.5 ns/pair (node: ~0.2) |
+
+The inline store gate is seven blocks: object tag, `array_dense` load, ToIndex (float -> uint -> float), `elem_len` bounds, hole probe, prototype byte, write barrier, the write, and the generation bump. Ablations, each built and measured:
+
+| ablation | store | combined loop |
+| --- | ---: | ---: |
+| hole probe removed | 17.9 -> 16.4 ms | unchanged |
+| generation bump removed | flat | flat (18.8) |
+| barrier split, so a numeric store never loads the elements box's GC header | flat | flat |
+
+No single check dominates, which is the answer: the cost is the **dependent-load chain** (object -> slots box -> its fields -> elements buffer) plus ~15 branchy checks, against V8's map check and a store. The structural lever would be folding `elem_ptr`/`elem_len` into the object to cut one dependent load — but that grows every `JsObject`, and the arena's 16-byte size classes make it a whole-layout change (`slag-object-layout`). Not attempted.
