@@ -1401,6 +1401,7 @@ fn instantiate_module_declarations(
                 Vec::new().into(),
                 Vec::new().into(),
                 false,
+                None,
             )?;
             // The function's `import.meta` resolves lexically to this module
             // (spec 13.3.7.1); instantiation runs in the harness context, so

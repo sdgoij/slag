@@ -15154,3 +15154,28 @@ Interleaved same-binary A/B, medians (8 pairs unless noted):
 The call-path win is real and is about footprint: `ordinary_call` already borrows the record and copies five small fields, so what the handle removes is dragging a 200-byte value through the cache on every lookup (and a 200-byte rehash copy per grow). The for-in row shows the cost: its per-iteration closures turn the arena over, and every record is rooted and promoted before it is reaped.
 
 Conclusion: the registry's value has to stay out of the GC's root set. The plan's Stage D proper (the record reachable only from its function object, no traced map) is a different measurement; it needs the record type reachable from `crux` and was not attempted. Do not retry the map-holds-a-handle form.
+
+## LANDED (2026-10-20): NamedEvaluation folded into function creation
+
+`f = function () {}` created the closure and then ran a `SetFunctionName` step, which redefines the fresh object's `name` through the generic define path: a `get_own_property_key` on "name", a placeholder check, and a `define_property` with a full descriptor. Measured against the same closure compiled through a comma expression (no NamedEvaluation), that step costs **~410 ns**, taking the loop from 78 to 211 ms per 300k closures.
+
+The name is a compile-time fact (the assignment/declaration target), so it now rides in `Step::CreateFunction`/`Step::CreateArrow` and `register_function`/`instantiate_arrow` define it once, through the batched property adoption the creation already pays for. `compile_expr` reports the fold (`named_folded`) and the callers skip their `SetFunctionName` step. The fold only applies when NamedEvaluation does: `begin_named_initializer` is only called when the target is an identifier reference, so `(fn) = function () {}` stays unnamed (test262 `expressions/assignment/fn-name-lhs-cover.js` pins that) and the value's own parens are transparent (`f = (function () {})` is named).
+
+**This also fixed a conformance gap.** The certified body's declarator path (frame slot or capture-context slot) never emitted `SetFunctionName`, so inside a function body `var g = function () {}` left `g.name` empty; only the uncertified and global paths did the naming. test262 has no fixture for a `var` declarator's name, so the suite stayed at 100%. V8 answers "g"; Slag now does too.
+
+Interleaved same-binary A/B, medians:
+
+| probe | before | after |
+| --- | ---: | ---: |
+| `f = function () {}` (hoisted var) | 211.5 ms | 86.6 ms (**-59%**) |
+| `cap_let_drop` (assignment capture) | 368.0 ms | 245.4 ms (**-33%**) |
+| `var f = function () {}` in a body | 78.1 ms | 86.6 ms (+11%) |
+| `e5` (declarator + one call) | 119.0 ms | 126.6 ms (+6%) |
+| unnamed control (comma expression) | 78.5 ms | 78.4 ms (flat) |
+| for-in head-let row | 521.3 ms | 525.5 ms (neutral) |
+
+The declarator regression is the price of the name it previously skipped: ~27 ns per closure, against ~410 ns for the step form. Full corpus (3 pairs, sum of the 77 jit rows): 2442.9/2371.2/2388.9 -> 2529.3/2379.8/2371.3 ms — neutral.
+
+The ~27 ns residual is not explained by this measurement: the unnamed control pays the same property adoption (with an empty name) and is flat, so what differs is the non-empty name value — its handle allocation and the atom-to-string conversion. Caching that value per declaration site is the obvious next probe.
+
+Gates: fmt; clippy `-D warnings`; `cargo test --workspace` (38 suites, 0 fail); test262 built-ins 23,821, language 23,726, annexB 1,086, intl402 3,365 — 0 fail.

@@ -3879,6 +3879,7 @@ extern "C" fn create_function(ctx: *mut c_void, step: u64) -> u64 {
     let Some(crate::ir::Step::CreateFunction {
         function,
         strict,
+        named,
         outer_chain,
         per_iteration_chain,
     }) = step_at(ctx, step)
@@ -3899,6 +3900,7 @@ extern "C" fn create_function(ctx: *mut c_void, step: u64) -> u64 {
         *strict,
         outer_chain.clone(),
         per_iteration_chain.clone(),
+        *named,
     ) {
         Ok(value) => value.bits(),
         Err(error) => slow_error(ctx, error),
@@ -3914,6 +3916,7 @@ extern "C" fn create_arrow(ctx: *mut c_void, step: u64) -> u64 {
         params,
         body,
         strict,
+        named,
         outer_chain,
         per_iteration_chain,
         span,
@@ -3932,6 +3935,7 @@ extern "C" fn create_arrow(ctx: *mut c_void, step: u64) -> u64 {
         outer_chain.clone(),
         per_iteration_chain.clone(),
         *span,
+        *named,
     ) {
         Ok(value) => value.bits(),
         Err(error) => slow_error(ctx, error),
@@ -3962,6 +3966,7 @@ extern "C" fn create_function_decl(ctx: *mut c_void, step: u64) -> u64 {
         outer_chain.clone(),
         per_iteration_chain.clone(),
         false,
+        None,
     ) {
         Ok(value) => value,
         Err(error) => return slow_error(ctx, error),

@@ -613,6 +613,11 @@ pub enum Step {
     CreateFunction {
         function: Box<syntax::ast::Function>,
         strict: bool,
+        /// NamedEvaluation (spec 13.15.2): the binding an anonymous function
+        /// expression is named after. Folded into creation so the name is
+        /// defined once, by the batched property adoption, instead of a
+        /// trailing `SetFunctionName` redefining `name` on every closure.
+        named: Option<crux::AtomId>,
         outer_chain: crate::function::OuterChain,
         /// Cut 28: the per-iteration head layouts of the certified loops
         /// open at this creation site (see
@@ -627,6 +632,8 @@ pub enum Step {
         params: Vec<syntax::ast::BindingElement>,
         body: syntax::ast::ArrowBody,
         strict: bool,
+        /// NamedEvaluation; see [`Step::CreateFunction`].
+        named: Option<crux::AtomId>,
         outer_chain: crate::function::OuterChain,
         /// Cut 28: see [`Step::CreateFunction`].
         per_iteration_chain: crate::function::PerIterationChain,
@@ -8133,6 +8140,7 @@ impl Vm {
                 Step::CreateFunction {
                     function,
                     strict,
+                    named,
                     outer_chain,
                     per_iteration_chain,
                 } => {
@@ -8144,6 +8152,7 @@ impl Vm {
                         *strict,
                         outer_chain.clone(),
                         per_iteration_chain.clone(),
+                        *named,
                     )?;
                     self.stack.push(value);
                 }
@@ -8152,6 +8161,7 @@ impl Vm {
                     params,
                     body,
                     strict,
+                    named,
                     outer_chain,
                     per_iteration_chain,
                     span,
@@ -8167,6 +8177,7 @@ impl Vm {
                         outer_chain.clone(),
                         per_iteration_chain.clone(),
                         *span,
+                        *named,
                     )?;
                     self.stack.push(value);
                 }
@@ -8225,6 +8236,7 @@ impl Vm {
                         outer_chain.clone(),
                         per_iteration_chain.clone(),
                         false,
+                        None,
                     )?;
                     if let Some(slot) = frame_slot {
                         *self.frame_get_mut(*slot) = value;
@@ -17063,6 +17075,15 @@ struct Compiler {
     /// definition so static field initializers see the final name (spec
     /// 15.7.14 step 8 with NamedEvaluation). Consumed by `compile_class`.
     pending_class_name: Option<crux::AtomId>,
+    /// The inferred name of an anonymous function expression or arrow being
+    /// compiled as a declaration/assignment initializer: NamedEvaluation
+    /// (spec 13.15.2) is folded into the creation step so the function is born
+    /// with its name, instead of paying a `SetFunctionName` define on a fresh
+    /// object. Consumed by the function/arrow arms of `compile_expr`.
+    pending_function_name: Option<crux::AtomId>,
+    /// Whether the expression just compiled consumed `pending_function_name`;
+    /// the caller then skips its trailing `SetFunctionName`.
+    named_folded: bool,
     /// The fast-path frame layout (Cut 3): when `Some`, the body's binding
     /// names resolve to frame slots (`LoadLocal`/`StoreLocal`) and blocks
     /// with no lexical declarations skip their environment. `None` compiles
@@ -17456,10 +17477,19 @@ impl Compiler {
     /// names itself before its static field initializers run (spec 15.7.14
     /// step 8 with NamedEvaluation).
     fn begin_named_initializer(&mut self, name: crux::AtomId, init: &Expr) {
-        if let ExprKind::Class(class) = &init.kind
-            && class.name.is_none()
-        {
-            self.pending_class_name = Some(name);
+        let mut init = init;
+        while let ExprKind::Paren(inner) = &init.kind {
+            init = inner;
+        }
+        match &init.kind {
+            ExprKind::Class(class) if class.name.is_none() => {
+                self.pending_class_name = Some(name);
+            }
+            ExprKind::Function(function) if function.name.is_none() => {
+                self.pending_function_name = Some(name);
+            }
+            ExprKind::Arrow { .. } => self.pending_function_name = Some(name),
+            _ => {}
         }
     }
 
@@ -18699,7 +18729,9 @@ impl Compiler {
                                 BindingLoc::Global => {
                                     self.begin_named_initializer(*name, init);
                                     self.compile_expr(init)?;
-                                    if crate::function::is_anonymous_function_definition(init) {
+                                    if crate::function::is_anonymous_function_definition(init)
+                                        && !self.named_folded
+                                    {
                                         self.emit(Step::SetFunctionName { name: *name });
                                     }
                                     self.emit(Step::StoreGlobal { name: *name });
@@ -18731,6 +18763,7 @@ impl Compiler {
                         self.compile_expr(init)?;
                         if let BindingPattern::Ident(name) = &decl.pattern
                             && crate::function::is_anonymous_function_definition(init)
+                            && !self.named_folded
                         {
                             // NamedEvaluation (spec 14.2.2 step 2.d): an
                             // anonymous function/class initializer is named
@@ -18807,9 +18840,13 @@ impl Compiler {
             StmtKind::UsingDecl { is_await, decls } => {
                 for decl in decls {
                     if let Some(init) = &decl.init {
+                        if let BindingPattern::Ident(name) = &decl.pattern {
+                            self.begin_named_initializer(*name, init);
+                        }
                         self.compile_expr(init)?;
                         if let BindingPattern::Ident(name) = &decl.pattern
                             && crate::function::is_anonymous_function_definition(init)
+                            && !self.named_folded
                         {
                             // NamedEvaluation (spec 14.2.2 step 2.d): an
                             // anonymous function/class initializer is named
@@ -21299,6 +21336,7 @@ impl Compiler {
     /// statement's own assignment (`expr_depth == 1`), never a nested
     /// assignment in an operand.
     fn compile_expr(&mut self, expr: &Expr) -> Result<(), JsError> {
+        self.named_folded = false;
         // Tail position (spec 14.2.2): only a call whose value is directly
         // the return value may replace the frame. The compound shapes below
         // forward the flag to their tail subexpression; every other shape's
@@ -21426,9 +21464,12 @@ impl Compiler {
             ExprKind::Function(function) => {
                 let outer_chain = self.closure_outer_chain();
                 let per_iteration_chain = self.closure_per_iteration_chain();
+                let named = self.pending_function_name.take();
+                self.named_folded = named.is_some();
                 self.emit(Step::CreateFunction {
                     function: Box::new(function.clone()),
                     strict: self.strict || self.class_depth > 0,
+                    named,
                     outer_chain,
                     per_iteration_chain,
                 });
@@ -21441,11 +21482,14 @@ impl Compiler {
             } => {
                 let outer_chain = self.closure_outer_chain();
                 let per_iteration_chain = self.closure_per_iteration_chain();
+                let named = self.pending_function_name.take();
+                self.named_folded = named.is_some();
                 self.emit(Step::CreateArrow {
                     is_async: *is_async,
                     params: params.clone(),
                     body: body.clone(),
                     strict: self.strict || self.class_depth > 0,
+                    named,
                     outer_chain,
                     per_iteration_chain,
                     span: expr.span,
@@ -22098,9 +22142,11 @@ impl Compiler {
                         // the assigned value as the expression's result.
                         match op {
                             AssignOp::Assign => {
-                                self.begin_named_initializer(*name, value);
-                                self.compile_expr(value)?;
                                 if set_name {
+                                    self.begin_named_initializer(*name, value);
+                                }
+                                self.compile_expr(value)?;
+                                if set_name && !self.named_folded {
                                     // NamedEvaluation (spec 13.15.3 step
                                     // 2.d): a plain assignment of an
                                     // anonymous function names it after the
@@ -22119,7 +22165,7 @@ impl Compiler {
                                 }
                                 self.emit(Step::Pop);
                                 self.compile_expr(value)?;
-                                if set_name {
+                                if set_name && !self.named_folded {
                                     // NamedEvaluation (spec 13.15.3 step 5.a)
                                     // applies on the executed path only.
                                     self.emit(Step::SetFunctionName { name: *name });
@@ -22148,9 +22194,11 @@ impl Compiler {
                                     // out to be shadowed; the clean path skips
                                     // the resolve entirely.
                                     self.emit(Step::ResolveIdentStore { name: *name });
-                                    self.begin_named_initializer(*name, value);
-                                    self.compile_expr(value)?;
                                     if set_name {
+                                        self.begin_named_initializer(*name, value);
+                                    }
+                                    self.compile_expr(value)?;
+                                    if set_name && !self.named_folded {
                                         self.emit(Step::SetFunctionName { name: *name });
                                     }
                                     self.emit(Step::StoreIdent { name: *name });
@@ -22161,9 +22209,11 @@ impl Compiler {
                                     // (spec 13.15.3 steps 1, 5 — e.g. a `with`
                                     // scope whose binding the RHS deletes).
                                     self.emit(Step::ResolveVarIdent { name: *name });
-                                    self.begin_named_initializer(*name, value);
-                                    self.compile_expr(value)?;
                                     if set_name {
+                                        self.begin_named_initializer(*name, value);
+                                    }
+                                    self.compile_expr(value)?;
+                                    if set_name && !self.named_folded {
                                         self.emit(Step::SetFunctionName { name: *name });
                                     }
                                     self.emit(Step::PutVarReference);

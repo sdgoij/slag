@@ -930,6 +930,7 @@ impl DefinitionKind {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn instantiate_function(
     agent: &mut Agent,
     f: &syntax::ast::Function,
@@ -938,6 +939,7 @@ pub fn instantiate_function(
     outer_chain: OuterChain,
     per_iteration_chain: PerIterationChain,
     named_expression: bool,
+    named: Option<crux::AtomId>,
 ) -> Result<Value, JsError> {
     instantiate_function_with_source(
         agent,
@@ -948,6 +950,7 @@ pub fn instantiate_function(
         outer_chain,
         per_iteration_chain,
         named_expression,
+        named,
     )
 }
 
@@ -961,6 +964,7 @@ pub fn instantiate_function_with_source(
     outer_chain: OuterChain,
     per_iteration_chain: PerIterationChain,
     named_expression: bool,
+    named: Option<crux::AtomId>,
 ) -> Result<Value, JsError> {
     let source_info = match source {
         Some(slice) => {
@@ -980,7 +984,7 @@ pub fn instantiate_function_with_source(
     let params = shared_params(&body, &f.params);
     let value = register_function(
         agent,
-        default_binding_display_name(f.name.map(crux::lookup)),
+        default_binding_display_name(named.map(crux::lookup).or_else(|| f.name.map(crux::lookup))),
         params,
         body,
         environment,
@@ -1829,6 +1833,7 @@ pub fn instantiate_function_expression(
     enclosing_strict: bool,
     outer_chain: OuterChain,
     per_iteration_chain: PerIterationChain,
+    named: Option<crux::AtomId>,
 ) -> Result<Value, JsError> {
     let Some(name) = f.name else {
         return instantiate_function(
@@ -1839,6 +1844,7 @@ pub fn instantiate_function_expression(
             outer_chain,
             per_iteration_chain,
             false,
+            named,
         );
     };
     let name = crux::lookup(name);
@@ -1857,6 +1863,7 @@ pub fn instantiate_function_expression(
         outer_chain,
         per_iteration_chain,
         true,
+        named,
     )?;
     // spec 15.2.5 step 6: the self-binding is a non-strict immutable binding,
     // so a sloppy-mode assignment to the function's own name is ignored.
@@ -1959,6 +1966,7 @@ pub fn instantiate_arrow(
     outer_chain: OuterChain,
     per_iteration_chain: PerIterationChain,
     span: crux::Span,
+    named: Option<crux::AtomId>,
 ) -> Result<Value, JsError> {
     // Cut 43: the site's shared Block — every closure from the same arrow
     // node shares it (and, via `shared_compiled_body` below, one compiled
@@ -1992,8 +2000,9 @@ pub fn instantiate_arrow(
         .running_context()
         .ok()
         .and_then(|context| context.script_or_module.clone());
+    let display = named.map(crux::lookup);
     let mut data = EcmaFunction {
-        name: None,
+        name: display.clone(),
         params,
         body: block,
         environment,
@@ -2026,8 +2035,10 @@ pub fn instantiate_arrow(
     // `Value`s while they are unrooted (GC-2, see `register_function`).
     // Cut 74: arrows are born with their [[Prototype]] intrinsic (%AsyncFunction
     // for async arrows), skipping the trailing set_prototype_of.
-    let function =
-        Function::new_with_prototype(None, function_kind_prototype(&realm, false, is_async));
+    let function = Function::new_with_prototype(
+        display.clone(),
+        function_kind_prototype(&realm, false, is_async),
+    );
     // The closure's [[Environment]] rides on the box as its GC edge, exactly as
     // in `register_function` (and with the same global-environment elision).
     if !environment.ptr_eq(realm.global_env) {
@@ -2040,8 +2051,8 @@ pub fn instantiate_arrow(
     agent.ecma_functions.insert(function.id(), data);
     crate::ir::store_construct_patterns(agent, function.id(), this_writes);
     // Arrows never carry restricted `caller`/`arguments` (no fallback loop).
-    if !set_function_properties_batched(agent, &function, &params, None, false) {
-        set_function_properties(&function, &params, None)?;
+    if !set_function_properties_batched(agent, &function, &params, display.as_ref(), false) {
+        set_function_properties(&function, &params, display.as_ref())?;
     }
     Ok(Value::Function(function))
 }
@@ -4264,6 +4275,7 @@ pub(crate) fn function_declaration_instantiation(
             Vec::new().into(),
             Vec::new().into(),
             false,
+            None,
         )?;
         variable_env.set_mutable_binding(&name, func_obj, false)?;
     }
