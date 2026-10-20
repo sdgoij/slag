@@ -15275,3 +15275,16 @@ The inline store gate is seven blocks: object tag, `array_dense` load, ToIndex (
 | barrier split, so a numeric store never loads the elements box's GC header | flat | flat |
 
 No single check dominates, which is the answer: the cost is the **dependent-load chain** (object -> slots box -> its fields -> elements buffer) plus ~15 branchy checks, against V8's map check and a store. The structural lever would be folding `elem_ptr`/`elem_len` into the object to cut one dependent load — but that grows every `JsObject`, and the arena's 16-byte size classes make it a whole-layout change (`slag-object-layout`). Not attempted.
+
+## Analysis (2026-10-20): the counter loop — one non-numeric operand disables slot promotion
+
+A bare `for (var k = 0; k < 2000000; k++) s += k` runs in 1.44 ms (0.72 ns/iteration, node-class: 1.2 ms), and its IR keeps both slots in registers — `b1(v18:f64, v22:int)` with `IntAdd` and no frame traffic. Add *anything else* to the function — even an unused `new Uint8Array(65536)` **after** the loop — and the same loop takes 5.2 ms (2.5 ns/iteration) with a `FrameLoad`/`FrameStore` per access. `SLAG_OPT=0` recovers 1.5 ms, so the optimizing tier is what loses it.
+
+The gate is `pass::slots_unobserved`: promotion requires that no instruction other than `FrameLoad`/`FrameStore` touches `Heap::Slots`, and that no speculation guard exists. Two independent causes disqualify real bodies:
+
+1. any op carrying the conservative world-effect set — `Call`, `Construct`, `ConstructArgs`, `MemberCellLoad`, … — i.e. any call anywhere in the body;
+2. `narrow` inserts `GuardType` for a non-numeric operand (in the probe, `s + ta.length`), and a guard deopts: `emit_guard` mirrors the operand stack into the working region and resumes the interpreter at that step, which reads the frame.
+
+Relaxing (1) was implemented and measured: no change, because (2) still disqualifies the body. Relaxing (1) is sound — a lifted body cannot expose its frame to a call (no `arguments` object: `Step::CreateArguments` has no lowering, so such a body never lifts; no direct `eval`: every call arm matches `direct_eval: false`) — but it is only a prerequisite.
+
+The fix is **Cut B** from `.notes/opt-per-op-overhead.md` §8, still unimplemented: `mem2reg` must publish the promoted slots, and the guard pass must store each live promoted slot back to its frame before the deopt branch (the flush splits the promoted region and the continuation reloads from the slot). Until then, every loop in a function that does anything non-numeric runs with a frame round trip per slot access — 3.5x on the same loop, and the floor under the whole `opcost` family.
