@@ -15419,3 +15419,28 @@ The corpus moves in the same direction but does not resolve it on its own: the o
 A member read costs, over 1M iterations: **5.6 ns** for an own data property, **88 ns** for an accessor (after this fix; 110 before), and **105 ns** for a property that does not exist (after; 184 before). The accessor is 16x a data read because the member cell caches data properties only — a getter has to run, and the read re-enters `get_member_name` → `get_property` → `find_ecma_accessor` → `function::call` every time. A compiled method call with the same body (`o.m()` where `m` reads `this.a`) is 10.8 ns, so roughly 80 ns of the accessor cost is the helper chain rather than the getter itself. `RegExp.prototype.test` on `/[a-z]+/` against an 8-unit string is 396 ns and `exec` is 994 ns; `re.source` (a native accessor) 328 ns.
 
 Two probe artifacts worth remembering: defining the getter *inside* the hot function changes what compiles and gave a bogus 683 ns figure, and `re.exec`'s 994 ns includes building the result array (`test` avoids it).
+
+## LANDED (2026-10-21): own accessors skip the chain walk, and `test` stops cloning the state
+
+Two small cuts out of the accessor/regexp investigation.
+
+**Own accessors.** `get_property`'s plain-object fast path looked the property up, accepted only a `Data` kind, and dropped the accessor case on the floor — so `find_ecma_accessor` looked the *same* property up again and then walked the chain. An own accessor is authoritative (nothing on the chain can shadow it), so the getter now dispatches straight from the descriptor the fast path already found.
+
+**`test`'s receiver.** `regexp_receiver` clones the whole `RegExpState` per call — the source `JsString` and a heap `String` of flag text — because the clone is what releases the `Agent` borrow. `test` builds no result array, so it needs only the compiled `Rc<Regex>` and the `Copy` flags: `regexp_match_parts` returns exactly those, and `regexp_builtin_match` takes them instead of the state. `exec` still takes the full state (its result array reads `source`).
+
+Medians of seven interleaved same-binary pairs:
+
+| probe | before | after |
+| --- | ---: | ---: |
+| `o.x` own accessor (1M) | 167.1 ms | **155.4 ms** (-7.1%) |
+| `re.test` on `/[a-z]+/` (100k) | 37.91 ms | 37.34 ms (-1.5%) |
+| `re.test` on `/a/` (100k) | 16.72 ms | 16.19 ms (-3.2%) |
+| `re.test` with three capture groups (100k) | 90.75 ms | 89.82 ms (-1.0%) |
+| own data property (control) | 5.53 ms | 5.60 ms (flat) |
+| missing property (control) | 10.26 ms | 10.52 ms (flat) |
+
+The regexp win is small because a flagless regex's `flags_text` is the empty `String`, and cloning an empty `String` does not allocate — the clone was cheap for exactly the shape the corpus uses. It still removes the clone for flagged regexes.
+
+Corpus: unresolved, 11.04/10.63/10.73 -> 10.93/10.64/11.08 mean-jitGap, families mixed on a host varying ~10%. Only the probe medians are quoted.
+
+**What is still open, and is the largest thing found this session.** An own accessor read is 155 ns against **10.8 ns** for a compiled method call with the same body (`o.m()` where `m` reads `this.a`). The getter itself is compiled when the body is entered from machine code, so ~140 ns is the Rust-side path: `get_member_name`'s cell probes, `get_property`, and `crate::function::call` -> `call_inner` -> `ordinary_call`. `ordinary_call` (function.rs) contains no `agent.jit_hook` reference, so a call initiated from Rust does not go through the JIT entry point the VM's own call paths use (`Vm::run_jit_leaf`, `try_shared_construct_leaf`). That would also explain `g.call(o)` at ~450 ns for the same body, and it is why accessor reads, `forEach`/`map`/`sort` callbacks, and `.call` sit an order of magnitude off a compiled call site. Making a Rust-initiated call reach the compiled entry is the next structural target; it needs a `Vm` in scope and the per-run ctx setup, so it is a design change rather than a patch.

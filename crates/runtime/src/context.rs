@@ -742,9 +742,22 @@ pub fn get_property_key(
                 obj.kind,
                 crux::object::ObjectKind::Ordinary | crux::object::ObjectKind::Array(_)
             ) && let Some(property) = obj.get_own_property_key(key)?
-                && let crux::object::PropertyKind::Data { value, .. } = property.kind
             {
-                return Ok(value);
+                match property.kind {
+                    crux::object::PropertyKind::Data { value, .. } => return Ok(value),
+                    // An own accessor is authoritative: nothing on the chain can
+                    // shadow it, so the getter runs without the
+                    // `find_ecma_accessor` walk (which would look the same
+                    // property up again). A missing or non-callable getter is
+                    // left to the general path below, which answers exactly.
+                    crux::object::PropertyKind::Accessor { get, .. } => {
+                        if let Some(getter) = get
+                            && crux::value::is_callable(&getter)
+                        {
+                            return crate::function::call(agent, &getter, receiver, &[]);
+                        }
+                    }
+                }
             }
             // Accessors whose getter is an ECMAScript function cannot be
             // invoked by the crux layer (the body lives in the agent);

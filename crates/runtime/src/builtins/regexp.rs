@@ -364,6 +364,23 @@ fn regexp_receiver(
     Ok((obj, state))
 }
 
+/// The receiver and the two fields a match needs, without the `RegExpState`
+/// clone `regexp_receiver` performs (which copies the source string and its
+/// heap-allocated flag text on every call). `test` builds no result array, so
+/// it never needs either.
+fn regexp_match_parts(
+    agent: &Agent,
+    regexp: &Value,
+) -> Result<(Handle<JsObject>, std::rc::Rc<regexp::Regex>, regexp::Flags), JsError> {
+    let ValueKind::Object(obj) = regexp.kind() else {
+        return Err(regexp_receiver_error());
+    };
+    let Some(state) = agent.regexp_data.get(&obj.id()) else {
+        return Err(regexp_receiver_error());
+    };
+    Ok((obj, std::rc::Rc::clone(&state.compiled), state.flags))
+}
+
 fn regexp_receiver_error() -> JsError {
     JsError::new(
         ErrorKind::TypeError,
@@ -387,7 +404,7 @@ fn regexp_builtin_exec(
     string: &JsString,
 ) -> Result<Option<Value>, JsError> {
     let (obj, state) = regexp_receiver(agent, regexp)?;
-    match regexp_builtin_match(agent, regexp, &obj, &state, string)? {
+    match regexp_builtin_match(agent, regexp, &obj, &state.compiled, state.flags, string)? {
         Some(matched) => Ok(Some(regexp_match_array(agent, string, &state, &matched)?)),
         None => Ok(None),
     }
@@ -405,14 +422,15 @@ fn regexp_builtin_match(
     agent: &mut Agent,
     regexp: &Value,
     obj: &Handle<JsObject>,
-    state: &RegExpState,
+    compiled: &regexp::Regex,
+    flags: regexp::Flags,
     string: &JsString,
 ) -> Result<Option<MatchSpans>, JsError> {
     let length = string.len();
     let last_index_value = get_property(agent, regexp, &JsString::from_utf8("lastIndex"), *regexp)?;
     let mut last_index = to_length(to_number(&last_index_value)?) as usize;
-    let global = state.flags.g;
-    let sticky = state.flags.y;
+    let global = flags.g;
+    let sticky = flags.y;
     if !global && !sticky {
         last_index = 0;
     }
@@ -421,7 +439,7 @@ fn regexp_builtin_match(
             obj.set(&JsString::from_utf8("lastIndex"), Value::Number(0.0), true)?;
             return Ok(None);
         }
-        match state.compiled.exec_at(string.as_slice(), last_index) {
+        match compiled.exec_at(string.as_slice(), last_index) {
             Some(m) => m,
             None => {
                 obj.set(&JsString::from_utf8("lastIndex"), Value::Number(0.0), true)?;
@@ -431,7 +449,7 @@ fn regexp_builtin_match(
     } else {
         // Leftmost search; the engine's leading-char prefilter skips
         // positions where no match can start.
-        match state.compiled.search_at(string.as_slice(), last_index) {
+        match compiled.search_at(string.as_slice(), last_index) {
             Some((index, m)) => {
                 last_index = index;
                 m
@@ -611,8 +629,8 @@ fn test(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsErro
     // properties and a substring per capture — would be built and thrown
     // away. The `lastIndex` protocol is unchanged, because it lives in the
     // match half.
-    let (obj, state) = regexp_receiver(agent, this)?;
-    let matched = regexp_builtin_match(agent, this, &obj, &state, &string)?.is_some();
+    let (obj, compiled, flags) = regexp_match_parts(agent, this)?;
+    let matched = regexp_builtin_match(agent, this, &obj, &compiled, flags, &string)?.is_some();
     Ok(Value::Boolean(matched))
 }
 
