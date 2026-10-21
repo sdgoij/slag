@@ -15584,3 +15584,28 @@ Gates: `cargo fmt --all -- --check`; `cargo clippy --workspace --all-targets -- 
 What remains in a `next()` is ~137 ns: ~20 ns dispatch (now the handler cell), ~15 ns the `agent.generators` lookup plus its `Rc` clone, ~20-30 ns the `{value, done}` object, and ~60 ns of suspend/resume — the last of which is another Rust->JIT entry per resume, i.e. the parked `.notes/rust-initiated-call-plan.md` problem.
 
 Gates: `cargo fmt --all -- --check`; `cargo clippy --workspace --all-targets -- -D warnings`; `cargo test --workspace` (38 suites, 0 failed); sweeps `built-ins` 23,821 + `language` 23,726 + `annexB` 1,086 + `intl402` 3,365 = 51,998 at 100%, which is what exercises the async-generator twins (the corpus has no async workloads); corpus parity 0.
+
+## LANDED (2026-10-21): for-in enumerates a plain object's own keys in one pass
+
+`language/statements/for-in/head-let-fresh-binding-per-iteration.js` is the corpus's largest row (~500-660 ms of a ~2.5 s total) and the first thing worth knowing about it is that **it has no dominant cost**. Measured by ablating the amplified body (100k calls, per body):
+
+| piece | per body |
+| --- | ---: |
+| empty body (the call) | 3.9 ns |
+| `var fns = {}` | 34 |
+| `Object.create(null)` | 95 |
+| 3 stores on that fresh object | 131 (44/store; a warm store is ~6) |
+| for-in enumeration of the fresh 3-key object | ~720 |
+| 3 capturing closures in the for-in | ~1480 |
+| 3 calls to those closures | ~357 |
+| the 6 `assert.sameValue` calls and their readers | ~2300 |
+
+(≈5.1 us per body; node does 0.54 us.) The closure half decomposes further: a closure costs **262 ns** with a non-captured or function-scope-`var` capture, but **~490 ns** when the captured binding is per-iteration (a body `let` is worse still, ~770 ns). A call to a *fresh* closure costs **119 ns**, to a *capturing* one ~260 ns, and to a stable one **4.5 ns** — the leaf cache is per function id, so a new closure misses it every iteration.
+
+This part fixes the enumeration. `own_property_keys` followed by `get_own_property_key` per key walks the property vector twice, and `for_in_key_levels` then hashed every key into a `HashSet` for a dedup that a single-level chain cannot need. `JsObject::own_string_props` reads the stored vector once and returns each string key with its enumerability; the runtime consumes it directly, and the duplicate list is built lazily (never for a one-level chain, linear up to 32 keys, a set past that so a wide object cannot go quadratic). The exotic-key kinds (proxy, string, index-based, host, module namespace) keep the exact per-kind loop, including the namespace live-binding read.
+
+12 interleaved rounds, order swapped each round, medians: the corpus row **-3.6%** (472.2 -> 455.2 ms; min -2.3%), and the isolated shape it is dominated by — a fresh `Object.create(null)` with three keys, enumerated 100k times — **-14.3%** (67.2 -> 57.6 ms). Controls: a 500-key object over a cached enumeration -1.4%, a three-level prototype chain -0.7%, the generator rows flat.
+
+**What this row still needs, in order.** (1) Closure creation is ~35% of it; the plan's Stage B is already implemented (`shared_source_info`), so what is left is the 408-byte record (Stage A) *and* the per-iteration capture surcharge, which is roughly twice the record's share — measure the env side first. (2) `Object.create(null)` at 95 ns and a cold property store at 44 ns are allocation costs on a fresh dictionary object. (3) A fresh-closure call at 119 ns against 4.5 ns for a stable one: the leaf cache is keyed by function id, so every iteration's new closure pays a full `ecma_functions` lookup and entry fill. None of these is a single-line fix; this note exists so the next session starts from the numbers rather than re-deriving them.
+
+Gates: `cargo fmt --all -- --check`; `cargo clippy --workspace --all-targets -- -D warnings`; `cargo test --workspace` (38 suites, 0 failed); sweeps `built-ins` 23,821 + `language` 23,726 + `annexB` 1,086 + `intl402` 3,365 = 51,998 at 100%; corpus parity 0.

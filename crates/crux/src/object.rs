@@ -4181,6 +4181,46 @@ impl JsObject {
         }
     }
 
+    /// OrdinaryOwnPropertyKeys (spec 10.1.12.1) as *for-in* consumes it: the
+    /// own string keys in key order, each with its enumerability.
+    ///
+    /// `own_property_keys` followed by a `get_own_property_key` per key walks
+    /// the same property vector twice; this walks it once, which is what a
+    /// for-in over an object with a plain property store pays per level.
+    /// `None` for a kind whose keys are not the stored vector (an
+    /// index-based kind, a proxy, a string, a host object) — those keep the
+    /// exact per-kind enumeration.
+    pub fn own_string_props(&self) -> Option<Vec<(PropertyKey, bool)>> {
+        if !matches!(self.kind, ObjectKind::Ordinary) {
+            return None;
+        }
+        // Enumeration is a structural consumer of the whole vector: rebuild a
+        // vector-free object's entries from the map first.
+        self.materialize_properties();
+        let props = self.properties.borrow();
+        let mut indices: Vec<(u64, PropertyKey, bool)> = Vec::new();
+        let mut strings: Vec<(PropertyKey, bool)> = Vec::new();
+        for (key, property) in props.iter() {
+            if !matches!(key, PropertyKey::String(_)) {
+                continue;
+            }
+            let enumerable = property.enumerable;
+            match array_index_of(key) {
+                Some(index) => indices.push((index, key.clone(), enumerable)),
+                None => strings.push((key.clone(), enumerable)),
+            }
+        }
+        indices.sort_by_key(|(index, _, _)| *index);
+        let mut keys = Vec::with_capacity(indices.len() + strings.len());
+        keys.extend(
+            indices
+                .into_iter()
+                .map(|(_, key, enumerable)| (key, enumerable)),
+        );
+        keys.extend(strings);
+        Some(keys)
+    }
+
     /// spec 7.3.11 GetMethod: `None` when the property is *undefined* or
     /// absent, a TypeError when it is present but not callable.
     pub fn get_method(&self, key: &JsString) -> Result<Option<Value>, JsError> {

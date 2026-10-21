@@ -4,8 +4,6 @@
 //! `throw` carries the thrown language value. Internal `JsError`s propagate
 //! through `Result` and are caught by `try`/`catch`.
 
-use std::collections::HashSet;
-
 use crux::convert::to_boolean;
 use crux::error::{ErrorKind, JsError};
 use crux::handle::Handle;
@@ -1098,42 +1096,95 @@ pub(crate) fn for_in_key_levels(
     for_in_key_levels_inner(agent, rhs)
 }
 
+/// The for-in key dedup list: a linear scan is fastest for the handful of
+/// keys a typical prototype chain repeats, and a set takes over past a bound
+/// so a wide object does not go quadratic.
+enum SeenKeys {
+    List(Vec<PropertyKey>),
+    Set(std::collections::HashSet<PropertyKey>),
+}
+
+impl SeenKeys {
+    /// Record `key`; true when an earlier level already enumerated it.
+    fn contains_or_insert(&mut self, key: &PropertyKey) -> bool {
+        const LIST_LIMIT: usize = 32;
+        match self {
+            SeenKeys::List(list) => {
+                if list.contains(key) {
+                    return true;
+                }
+                list.push(key.clone());
+                if list.len() > LIST_LIMIT {
+                    let set = list.iter().cloned().collect();
+                    *self = SeenKeys::Set(set);
+                }
+                false
+            }
+            SeenKeys::Set(set) => !set.insert(key.clone()),
+        }
+    }
+}
+
 fn for_in_key_levels_inner(agent: &mut Agent, rhs: &Value) -> Result<Vec<(usize, Value)>, JsError> {
-    // PropertyKey hashes are content-stable (a rope description's first hash
-    // materializes its flat cache, which never changes the hash output).
-    #[allow(clippy::mutable_key_type)]
-    let mut seen: HashSet<PropertyKey> = HashSet::new();
     let mut keys: Vec<(usize, Value)> = Vec::new();
     // ToObject of the enumerated value (spec step 2): functions box to
     // themselves, so a callable receiver enumerates its own properties too.
     if let Some(obj) = crate::context::as_object(rhs) {
         let mut current = Some(obj);
         let mut level = 0;
+        // A key can only repeat across levels (one object's own keys are
+        // unique), so the dedup list is never built for a single-level
+        // chain — the common shape, and the one a for-in over a
+        // `Object.create(null)` map takes.
+        let mut seen: Option<SeenKeys> = None;
         while let Some(obj) = current {
-            for key in obj.own_property_keys()? {
-                let PropertyKey::String(_) = key else {
-                    continue;
-                };
-                if !seen.insert(key.clone()) {
-                    continue;
-                }
-                if let Some(property) = obj.get_own_property_key(&key)? {
-                    // EnumerateObjectProperties reads each descriptor
-                    // (spec 9.4.6.4 step 4): a module namespace descriptor
-                    // reads the live binding, throwing a ReferenceError for
-                    // an uninitialized export.
-                    if matches!(obj.kind, crux::object::ObjectKind::ModuleNamespace(_))
-                        && let Some(module) = agent.module_namespaces.get(&obj.id()).cloned()
-                        && let PropertyKey::String(id) = &key
-                    {
-                        crate::module::namespace_get(agent, &module, &crux::lookup(*id))?;
+            let parent = obj.get_prototype_of()?;
+            let record_seen = parent.is_some() || seen.is_some();
+            match obj.own_string_props() {
+                Some(props) => {
+                    for (key, enumerable) in props {
+                        if record_seen {
+                            let seen = seen.get_or_insert_with(|| SeenKeys::List(Vec::new()));
+                            if seen.contains_or_insert(&key) {
+                                continue;
+                            }
+                        }
+                        if enumerable {
+                            keys.push((level, key_value(&key)));
+                        }
                     }
-                    if property.enumerable {
-                        keys.push((level, key_value(&key)));
+                }
+                None => {
+                    for key in obj.own_property_keys()? {
+                        let PropertyKey::String(_) = key else {
+                            continue;
+                        };
+                        if record_seen {
+                            let seen = seen.get_or_insert_with(|| SeenKeys::List(Vec::new()));
+                            if seen.contains_or_insert(&key) {
+                                continue;
+                            }
+                        }
+                        if let Some(property) = obj.get_own_property_key(&key)? {
+                            // EnumerateObjectProperties reads each descriptor
+                            // (spec 9.4.6.4 step 4): a module namespace
+                            // descriptor reads the live binding, throwing a
+                            // ReferenceError for an uninitialized export.
+                            if matches!(obj.kind, crux::object::ObjectKind::ModuleNamespace(_))
+                                && let Some(module) =
+                                    agent.module_namespaces.get(&obj.id()).cloned()
+                                && let PropertyKey::String(id) = &key
+                            {
+                                crate::module::namespace_get(agent, &module, &crux::lookup(*id))?;
+                            }
+                            if property.enumerable {
+                                keys.push((level, key_value(&key)));
+                            }
+                        }
                     }
                 }
             }
-            current = obj.get_prototype_of()?;
+            current = parent;
             level += 1;
         }
     } else if let Some(text) = rhs.as_string() {
