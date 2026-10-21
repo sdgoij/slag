@@ -15492,3 +15492,33 @@ Probes on `scratch/ab/re2` (8 rounds, alternating, median): `[1,2,3,4].forEach(c
 Gates: `cargo fmt --all -- --check`; `cargo clippy --workspace --all-targets -- -D warnings`; `cargo test --workspace` (38 suites, 0 failed); the four sweeps at `--batch 32 --timeout 15 --recheck-timeout 15` — `built-ins` 23,821, `language` 23,726, `annexB` 1,086, `intl402` 3,365, all 100% (51,998); corpus parity 0 mismatches; the four lane probes under `--gc-stress --gc-verify --nursery-stress` exit 0.
 
 What is left in this lane: a native callback (`forEach(Math.abs)`) is still ~400 ns per builtin invocation and never enters the leaf lane at all (the `FunctionKind::EcmaScript` gate), and a leaf callback is still ~2x a compiled call site because the JIT leaf entry builds a fresh call context per invocation — the reusable-context slice in `.notes/rust-initiated-call-plan.md`.
+
+## LANDED (2026-10-21): `RegExp.prototype.test` runs the engine capture-free
+
+`test` calls the engine's match half and keeps only `.is_some()`, but the matcher always allocated the capture buffer: `Matcher::new` -> `Caps::new(groups)` is a `Vec` per call, its undo trail grows on every capture a repeat owns, and `search` moves that `Vec` out as the `Match` the caller then drops. A counting allocator in a scratch crate priced it: `/a/` on `"a"` was 2 allocations (376 bytes) and 84 ns per `search_at`, `/(a)(b)(c)/` 4 allocations and 271 ns, while the JS-level `re.test("a")` measured 158 ns — so roughly half of `test` was engine time and half the builtin's own protocol.
+
+A pattern with no backreferences never *reads* a capture (that is the same `backref_free` condition the repeat memo already relies on), so the boolean lane runs with `Caps::disabled()`: `set`, `reset` and `clear_owned` become no-ops and the trail stays empty. `engine::exec_end`/`search_end` are the two entry points, `Regex::match_end_at`/`search_end_at` expose them, and the runtime's `regexp_exec_protocol` now owns the `lastIndex` protocol for both `test` and `exec` — the read, the sticky attempt, the leftmost search and the write — so the two callers cannot drift apart (the read is unconditional and precedes the global/sticky check; `failure-lastindex-access.js` pins it). `search`'s position loop moved into a shared `search_loop` for the same reason.
+
+The first cut of this forgot `clear_owned`, which indexes `caps.values` to clear a repeated atom's captures — with no backreferences the buffer is still *written*, and `/(a)+/.test("aaa")` panicked on the empty `Vec`. `boolean_lane_agrees_with_the_capture_lane` now cross-checks `search_end_at`/`match_end_at` against `search_at`/`exec_at` at every start position for repeated, nested, named and lookaround captures, backreferences, alternation and the `i`/`u`/`s`/`m`/`iu` flags.
+
+Engine cost with the counting allocator (same scratch crate): `/a/` **84 -> 64 ns** and 2 -> 1 allocations, `/(a)(b)(c)/` **271 -> 178** and 4 -> 1, `/(a)+/` 306 -> 256, `[a-z]+/` on 8 chars 329 -> 310 (its cost is the per-choice `Rc<[Task]>` snapshot, not the capture buffer).
+
+JS A/B on `scratch/ab/re3` + `scratch/ab/re`, 8 interleaved rounds with the order swapped every round, medians:
+
+| probe | before | after |
+| --- | ---: | ---: |
+| `/a/.test("a")` (100k) | 16.11 ms | **13.74 ms** (-14.7%) |
+| `/a/.test("b")` (no match) | 15.27 | **13.14** (-14.0%) |
+| `/a/y.test("a")` (sticky) | 19.33 | **16.39** (-15.2%) |
+| `r_a.js` (`/a/`, the size probe) | 16.28 | **13.68** (-16.0%) |
+| `/zzz/.test(8 chars)` | 15.60 | **13.40** (-14.1%) |
+| `/(a)(b)(c)/.test("abc")` | 88.88 | **83.59** (-6.0%) |
+| `/[a-z]+/.test(8 chars)` | 36.22 | **34.55** (-4.6%) |
+| `re.exec` (unchanged lane) | 95.82 | 97.35 (+1.6%) |
+| `re.lastIndex`, `re.source`, plain call, bare loop | — | flat |
+
+**Measurement trap, third time this session.** The first A/B of this change reported 0.0% and sent me looking for a phantom (a marker build proved the builtin was reached and the change was worth -13%). The script wrote each binary's output by *position* (`base`/`new` files) instead of by binary, so with the order swapped every round each file held half of each binary. Output files must be named after the binary; the round order is what alternates.
+
+Gates: `cargo fmt --all -- --check`; `cargo clippy --workspace --all-targets -- -D warnings`; `cargo test --workspace` (38 suites, 0 failed; `regexp` 39); sweeps `built-ins` 23,821 + `language` 23,726 + `annexB` 1,086 + `intl402` 3,365 = 51,998 at 100%; corpus parity 0.
+
+Left in the matcher: `tasks` is still a `Vec` allocated per call and every choice point snapshots the forward path into a fresh `Rc<[Task]>`, which is why a repeat-heavy pattern still allocates 6 times and runs at ~35 ns per character. Eliminating that needs the task stack to be reusable across calls (it borrows the program, so a caller-owned scratch cannot name its lifetime without restructuring `Task` around indices).

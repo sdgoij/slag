@@ -426,7 +426,42 @@ fn regexp_builtin_match(
     flags: regexp::Flags,
     string: &JsString,
 ) -> Result<Option<MatchSpans>, JsError> {
-    let length = string.len();
+    let input = string.as_slice();
+    let Some((index, captures)) = regexp_exec_protocol(
+        agent,
+        regexp,
+        obj,
+        flags,
+        string.len(),
+        |i| compiled.exec_at(input, i),
+        |i| compiled.search_at(input, i),
+        |start, captures| captures[0].map(|(_, end)| end).unwrap_or(start),
+    )?
+    else {
+        return Ok(None);
+    };
+    Ok(Some(MatchSpans { captures, index }))
+}
+
+/// The `lastIndex` protocol of RegExpBuiltinExec (spec 22.2.7.2 steps 1-12)
+/// around a match: the `lastIndex` read, the sticky attempt or the leftmost
+/// search, and the `lastIndex` write. `at`/`search` are the two match shapes
+/// (with captures for `exec`, end-only for `test`) and `end` reports the match
+/// end of whatever they returned, so the read-before-check order — the read is
+/// unconditional and comes *before* the global/sticky check that may then zero
+/// it (steps 4 and 8; `built-ins/RegExp/prototype/exec/failure-lastindex-
+/// access.js` pins the single read) — cannot drift between the two callers.
+#[allow(clippy::too_many_arguments)]
+fn regexp_exec_protocol<M>(
+    agent: &mut Agent,
+    regexp: &Value,
+    obj: &Handle<JsObject>,
+    flags: regexp::Flags,
+    length: usize,
+    at: impl FnOnce(usize) -> Option<M>,
+    search: impl FnOnce(usize) -> Option<(usize, M)>,
+    end: impl FnOnce(usize, &M) -> usize,
+) -> Result<Option<(usize, M)>, JsError> {
     let last_index_value = get_property(agent, regexp, &JsString::from_utf8("lastIndex"), *regexp)?;
     let mut last_index = to_length(to_number(&last_index_value)?) as usize;
     let global = flags.g;
@@ -434,12 +469,12 @@ fn regexp_builtin_match(
     if !global && !sticky {
         last_index = 0;
     }
-    let captures = if sticky {
+    let matched = if sticky {
         if last_index > length {
             obj.set(&JsString::from_utf8("lastIndex"), Value::Number(0.0), true)?;
             return Ok(None);
         }
-        match compiled.exec_at(string.as_slice(), last_index) {
+        match at(last_index) {
             Some(m) => m,
             None => {
                 obj.set(&JsString::from_utf8("lastIndex"), Value::Number(0.0), true)?;
@@ -449,7 +484,7 @@ fn regexp_builtin_match(
     } else {
         // Leftmost search; the engine's leading-char prefilter skips
         // positions where no match can start.
-        match compiled.search_at(string.as_slice(), last_index) {
+        match search(last_index) {
             Some((index, m)) => {
                 last_index = index;
                 m
@@ -462,18 +497,15 @@ fn regexp_builtin_match(
             }
         }
     };
-    let end_index = captures[0].map(|(_, e)| e).unwrap_or(last_index);
     if global || sticky {
+        let end_index = end(last_index, &matched);
         obj.set(
             &JsString::from_utf8("lastIndex"),
             Value::Number(end_index as f64),
             true,
         )?;
     }
-    Ok(Some(MatchSpans {
-        captures,
-        index: last_index,
-    }))
+    Ok(Some((last_index, matched)))
 }
 
 /// The match result array (spec 22.2.7.2 step 13 onward).
@@ -630,7 +662,22 @@ fn test(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsErro
     // away. The `lastIndex` protocol is unchanged, because it lives in the
     // match half.
     let (obj, compiled, flags) = regexp_match_parts(agent, this)?;
-    let matched = regexp_builtin_match(agent, this, &obj, &compiled, flags, &string)?.is_some();
+    // The builtin exec's match half only, on the engine's capture-free lane:
+    // `test` keeps the boolean, so neither the result array nor the engine's
+    // capture buffer is built. The `lastIndex` protocol is unchanged, because
+    // it lives in the shared match half.
+    let input = string.as_slice();
+    let matched = regexp_exec_protocol(
+        agent,
+        this,
+        &obj,
+        flags,
+        string.len(),
+        |i| compiled.match_end_at(input, i),
+        |i| compiled.search_end_at(input, i),
+        |_, end| *end,
+    )?
+    .is_some();
     Ok(Value::Boolean(matched))
 }
 

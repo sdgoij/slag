@@ -224,6 +224,17 @@ impl Caps {
         }
     }
 
+    /// A buffer-free store for a boolean match of a backref-free pattern:
+    /// nothing in the matcher reads a capture, so recording one — and its
+    /// undo entry — would only allocate. `set` becomes a no-op and the trail
+    /// stays empty, which is what `mark`/`rollback` then walk.
+    fn disabled() -> Self {
+        Caps {
+            values: Vec::new(),
+            trail: Vec::new(),
+        }
+    }
+
     fn mark(&self) -> usize {
         self.trail.len()
     }
@@ -236,8 +247,34 @@ impl Caps {
     }
 
     fn set(&mut self, index: usize, value: (usize, usize)) {
+        if self.values.is_empty() {
+            return;
+        }
         self.trail.push((index, self.values[index]));
         self.values[index] = Some(value);
+    }
+
+    /// Clear the captures owned by a repeated atom, recording the previous
+    /// values on the undo log so backtracking restores them. A disabled store
+    /// has nothing to clear.
+    fn clear_owned(&mut self, owned: &[usize]) {
+        if self.values.is_empty() {
+            return;
+        }
+        for &index in owned {
+            if let Some(old) = self.values[index] {
+                self.trail.push((index, Some(old)));
+                self.values[index] = None;
+            }
+        }
+    }
+
+    /// Clear a capture without an undo entry (`set_fast_captures`'s
+    /// wholly-unconsumed case: the enclosing choice restores the mark itself).
+    fn reset(&mut self, index: usize) {
+        if !self.values.is_empty() {
+            self.values[index] = None;
+        }
     }
 }
 
@@ -372,6 +409,23 @@ struct Matcher<'a, 'i> {
 
 impl<'a, 'i> Matcher<'a, 'i> {
     fn new(re: &'a Regex, input: &'i [u16]) -> Self {
+        Self::with_caps(re, input, Caps::new(re.capturing_groups))
+    }
+
+    /// A matcher for a caller that only asks whether a match exists. A
+    /// pattern with no backreferences never reads a capture, so the buffer
+    /// (and its undo trail) is elided; a backreference pattern keeps the real
+    /// one, because reading an empty buffer would change the answer.
+    fn new_boolean(re: &'a Regex, input: &'i [u16]) -> Self {
+        let caps = if re.backref_free {
+            Caps::disabled()
+        } else {
+            Caps::new(re.capturing_groups)
+        };
+        Self::with_caps(re, input, caps)
+    }
+
+    fn with_caps(re: &'a Regex, input: &'i [u16], caps: Caps) -> Self {
         Matcher {
             backref_free: re.backref_free,
             memo_safe: &re.memo_safe,
@@ -381,7 +435,7 @@ impl<'a, 'i> Matcher<'a, 'i> {
                 input,
                 unicode: re.flags.has_unicode(),
             },
-            caps: Caps::new(re.capturing_groups),
+            caps,
             tasks: Vec::new(),
             choices: Vec::new(),
             pos: 0,
@@ -481,7 +535,7 @@ impl<'a, 'i> Matcher<'a, 'i> {
                     // The choice is recorded before clearing the owned
                     // captures so backtracking restores them.
                     self.push_choice(Task::RepeatDone { min, count });
-                    clear_owned(&mut self.caps, owned);
+                    self.caps.clear_owned(owned);
                     self.tasks.push(Task::RepeatIterDone {
                         node,
                         owned,
@@ -516,7 +570,7 @@ impl<'a, 'i> Matcher<'a, 'i> {
                 } else if max.is_some_and(|m| count >= m) {
                     false
                 } else {
-                    clear_owned(&mut self.caps, owned);
+                    self.caps.clear_owned(owned);
                     let start = self.pos;
                     self.tasks.push(Task::RepeatIterDone {
                         node,
@@ -608,7 +662,7 @@ impl<'a, 'i> Matcher<'a, 'i> {
                 if max.is_some_and(|m| count >= m) {
                     false
                 } else {
-                    clear_owned(&mut self.caps, owned);
+                    self.caps.clear_owned(owned);
                     let start = self.pos;
                     self.tasks.push(Task::RepeatIterDone {
                         node,
@@ -938,7 +992,7 @@ impl<'a, 'i> Matcher<'a, 'i> {
         count: u32,
     ) -> bool {
         let entry_pos = self.pos;
-        clear_owned(&mut self.caps, owned);
+        self.caps.clear_owned(owned);
         // Consume iteratively, recording each iteration's start position.
         let mut consumed: Vec<usize> = Vec::new();
         let mut cur = self.pos;
@@ -1009,7 +1063,7 @@ impl<'a, 'i> Matcher<'a, 'i> {
             }
             None => {
                 for &index in owned {
-                    self.caps.values[index] = None;
+                    self.caps.reset(index);
                 }
             }
         }
@@ -1142,11 +1196,22 @@ pub(crate) fn exec(re: &Regex, input: &[u16], start: usize) -> Option<crate::Mat
     Some(matcher.caps.values)
 }
 
-/// Leftmost search with a leading-char prefilter and a single capture buffer
-/// reused across position attempts (spec RegExpBuiltinExec's loop). Returns
-/// the match and the index it started at.
-pub(crate) fn search(re: &Regex, input: &[u16], start: usize) -> Option<(usize, crate::Match)> {
-    let mut matcher = Matcher::new(re, input);
+/// The boolean half of `exec`: the match end only, from a matcher that keeps
+/// no capture buffer (see `Matcher::new_boolean`).
+pub(crate) fn exec_end(re: &Regex, input: &[u16], start: usize) -> Option<usize> {
+    let mut matcher = Matcher::new_boolean(re, input);
+    matcher.match_at(start)
+}
+
+/// The leftmost-search loop (spec RegExpBuiltinExec's AdvanceStringIndex walk
+/// with the leading-char prefilter): the match start and end of the first
+/// position that matches.
+fn search_loop(
+    matcher: &mut Matcher<'_, '_>,
+    re: &Regex,
+    input: &[u16],
+    start: usize,
+) -> Option<(usize, usize)> {
     let mut index = start;
     while index <= input.len() {
         if let Some(set) = &re.prefilter
@@ -1161,8 +1226,7 @@ pub(crate) fn search(re: &Regex, input: &[u16], start: usize) -> Option<(usize, 
             continue;
         }
         if let Some(end) = matcher.match_at(index) {
-            matcher.caps.values[0] = Some((index, end));
-            return Some((index, matcher.caps.values));
+            return Some((index, end));
         }
         if index >= input.len() {
             break;
@@ -1170,6 +1234,23 @@ pub(crate) fn search(re: &Regex, input: &[u16], start: usize) -> Option<(usize, 
         index = re.advance_string_index(input, index);
     }
     None
+}
+
+/// Leftmost search with a leading-char prefilter and a single capture buffer
+/// reused across position attempts (spec RegExpBuiltinExec's loop). Returns
+/// the match and the index it started at.
+pub(crate) fn search(re: &Regex, input: &[u16], start: usize) -> Option<(usize, crate::Match)> {
+    let mut matcher = Matcher::new(re, input);
+    let (index, end) = search_loop(&mut matcher, re, input, start)?;
+    matcher.caps.values[0] = Some((index, end));
+    Some((index, matcher.caps.values))
+}
+
+/// The boolean half of `search`: the match start and end only, from a matcher
+/// that keeps no capture buffer.
+pub(crate) fn search_end(re: &Regex, input: &[u16], start: usize) -> Option<(usize, usize)> {
+    let mut matcher = Matcher::new_boolean(re, input);
+    search_loop(&mut matcher, re, input, start)
 }
 
 /// A sound prefilter for the search loop: the UTF-16 units that any match
@@ -1341,17 +1422,6 @@ fn first_char_analysis_seq(nodes: &[Node], unicode: bool) -> (bool, Option<Vec<(
 /// A position advanced by `len` input elements in the match direction.
 fn advance(pos: usize, dir: i32, len: usize) -> usize {
     if dir > 0 { pos + len } else { pos - len }
-}
-
-/// Clear the captures owned by a repeated atom, recording the previous
-/// values on the undo log so backtracking restores them.
-fn clear_owned(caps: &mut Caps, owned: &[usize]) {
-    for &index in owned {
-        if let Some(old) = caps.values[index] {
-            caps.trail.push((index, Some(old)));
-            caps.values[index] = None;
-        }
-    }
 }
 
 /// Whether the class matches the character at `pos` (given `c` = that char);

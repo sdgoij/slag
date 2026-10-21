@@ -343,6 +343,18 @@ impl Regex {
         engine::search(self, input, start)
     }
 
+    /// The boolean half of `search_at`, for a caller that never reads a
+    /// capture (`RegExp.prototype.test`): the match start and end only, and a
+    /// backref-free pattern runs without a capture buffer or its undo trail.
+    pub fn search_end_at(&self, input: &[u16], start: usize) -> Option<(usize, usize)> {
+        engine::search_end(self, input, start)
+    }
+
+    /// The boolean half of `exec_at` (a sticky search): the match end only.
+    pub fn match_end_at(&self, input: &[u16], start: usize) -> Option<usize> {
+        engine::exec_end(self, input, start)
+    }
+
     /// Leftmost search: try `start`, advancing by one character on failure
     /// until a match is found or the input is exhausted.
     pub fn exec(&self, input: &[u16], start: usize) -> Option<Match> {
@@ -977,6 +989,63 @@ mod tests {
         let input = vec![b'a' as u16; 1_000_000];
         let m = re.exec(&input, 0).unwrap();
         assert_eq!(m[1], Some((999_999, 1_000_000)));
+    }
+
+    #[test]
+    fn boolean_lane_agrees_with_the_capture_lane() {
+        // `RegExp.prototype.test` drives `search_end_at`/`match_end_at`, which
+        // for a backref-free pattern run without a capture buffer. The
+        // elision must not change which positions match: the matcher still
+        // clears a repeated atom's captures and reads them for a
+        // backreference, so both shapes are pinned here.
+        let cases: &[(&str, &[&str])] = &[
+            ("a", &["", "a", "ba"]),
+            ("(a)+", &["b", "aaab", "aaa"]),
+            ("(a)*b", &["b", "aaab"]),
+            ("((a))+", &["aaa", "ba"]),
+            ("(?:ab)+c", &["xababc", "abc"]),
+            (r"(a)\1", &["xaa", "xab", ""]),
+            (r"(?<n>a)+b", &["aaab"]),
+            ("(?=(a))a", &["xa"]),
+            ("(?<=a)b", &["ab", "b"]),
+            ("(a)|(b)", &["zzb"]),
+            ("[a-z]+", &["123abc", ""]),
+            ("(a)?b", &["b", "ab", "x"]),
+            ("^$", &["", "a"]),
+            ("a*b", &["xxb", "b"]),
+        ];
+        for &(pattern, inputs) in cases {
+            let pattern: Vec<u16> = pattern.encode_utf16().collect();
+            for &input in inputs {
+                let re = compile(&pattern, f("")).unwrap();
+                check_boolean_lane(&re, input);
+            }
+        }
+        for flags in ["i", "u", "s", "m", "iu"] {
+            for pattern in ["[a-z]+", "(?<w>.)+", r"(\w)\1", "(a)|.(b)"] {
+                let re = compile(&pattern.encode_utf16().collect::<Vec<u16>>(), f(flags)).unwrap();
+                for input in ["", "aA", "xaxa", "\u{1F600}b"] {
+                    check_boolean_lane(&re, input);
+                }
+            }
+        }
+    }
+
+    fn check_boolean_lane(re: &Regex, input: &str) {
+        let input: Vec<u16> = input.encode_utf16().collect();
+        for start in 0..=input.len() {
+            assert_eq!(
+                re.search_end_at(&input, start),
+                re.search_at(&input, start)
+                    .map(|(index, m)| (index, m[0].unwrap().1)),
+                "search {input:?} at {start}"
+            );
+            assert_eq!(
+                re.match_end_at(&input, start),
+                re.exec_at(&input, start).map(|m| m[0].unwrap().1),
+                "exec {input:?} at {start}"
+            );
+        }
     }
 
     #[test]
