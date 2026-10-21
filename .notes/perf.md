@@ -15464,3 +15464,31 @@ Probes (3 interleaved same-binary pairs, disjoint):
 Corpus (3 interleaved pairs): median `mean-jitGap` 10.97 -> 10.72 (-2.3%), with the families that read accessors most moving furthest — builtins 8.36 -> **7.43** (-11%), strings 10.18 -> **9.28** (-8.9%), language 8.02 -> **7.29** (-9%), calls 10.90 -> 10.34 (-5%). `mean-jlGap` fell too (3.85 -> 3.80), which is expected: the interpreter's accessor dispatch went through the same `call`.
 
 An own accessor read is now 110 ns against 9.2 ns for a compiled method call with the same body. The remaining cost is `try_leaf_call`'s own `take_vm` + `do_call_fast` + `return_vm`, and the non-leaf fallback. The reusable-context slice in `.notes/rust-initiated-call-plan.md` still applies to that remainder.
+
+## LANDED (2026-10-21): a builtin's callback loop reuses one leaf Vm
+
+Every caller-supplied callback a builtin dispatches went through `function::call_callback` -> `builtins::function::try_leaf_call`, which takes a pooled `Vm` (`Agent::take_vm`), runs the leaf, and returns it (`Agent::return_vm`, whose contract is a full `Vm::reset` — ~45 field stores and ~25 stack clears — because the pooled Vm must not trace the finished run's stale state). A `forEach` over four elements therefore paid four take/reset pairs where one Vm could serve the whole loop.
+
+`builtins::function::CallbackVm` holds a Vm across the loop: `with(agent, |agent, leaf| ...)` creates the guard, `leaf.call(agent, callee, this, args)` reuses the Vm, and the Vm returns to the pool once, after the body (on the error path too). Reuse needs only `Vm::rebind` between calls because a successful leaf run already restores every persistent field it touched — `run_inline_leaf` truncates the value stack to the call site and `run_leaf_regs`/`run_leaf_body` restore `leaf_frame_base`/`offset`, `body_context`, `lexical_env`, and (on the step path) `ip`, `strict`, `chain_short`, `loop_counter`, the array-index stack and `call_args`. A Vm taken from the pool is otherwise clean, and the register lane only writes `acc`, `loop_num` and `loop_counter`, none of which a caller reads. On an error the Vm goes back through `return_vm`'s full reset, since an unwind may leave the stack past the call site.
+
+The same change also stops re-deriving the leaf entry. `try_leaf_call` resolved the entry and then called `do_call_fast`, which re-ran the whole call-site gate and did a *second* `leaf_lookup`. `Vm::run_leaf_entry` is `fast_call_core`'s leaf arm without that: the caller's entry goes straight to `try_jit_leaf` / `run_inline_leaf` (keeping `do_call_fast`'s termination check).
+
+Converted: `builtins/array.rs` (`forEach`, `map`, `filter`, `some`, `every`, the `find`/`findLast` pair, `reduce`/`reduceRight`), `builtins/typed_array.rs` (the same set), `builtins/keyed.rs` (`Map`/`Set.prototype.forEach`), `builtins/iterator.rs` (`Iterator.prototype`'s eager `every`/`some`/`find`/`forEach`/`reduce`, including `call_predicate`). `Iterator.prototype.filter`'s per-`next()` predicate and `flatMap`'s recursion stay on `call_callback` — one call per invocation, nothing to hoist.
+
+Interleaved, alternating-order A/B (10 rounds, median; order swaps every round, results written per binary):
+
+| row | base | new | delta |
+| --- | ---: | ---: | ---: |
+| `opcost/array_for_each.js` | 28.66 ms | 25.39 ms | **-11.4%** |
+| `opcost/map_for_each.js` | 26.37 | 23.43 | **-11.1%** |
+| `opcost/typed_array_for_each.js` | 29.63 | 27.48 | **-7.3%** |
+| `opcost/array_for_each_js.js` (control) | 3.60 | 3.50 | -2.6% |
+| `arrays/hof_methods.js` (6 rounds) | 24.71 | 22.50 | **-8.9%** |
+
+Probes on `scratch/ab/re2` (8 rounds, alternating, median): `[1,2,3,4].forEach(cb)` 28.36 -> **25.85 ms** (-8.8%), `map(cb)` 43.56 -> **39.68** (-8.9%), `[1].forEach(cb)` 10.94 -> 10.87 (-0.6%), `forEach(Math.abs)` 40.60 -> 41.21 (+1.5%). The one-element row and the native-callback row are flat, which is exactly the shape of the change: there is one callback per builtin invocation to amortise, and a non-leaf callee never enters the lane.
+
+**Measurement trap, twice.** A first pass ran the base binary then the new one in every round and reported -7..-11% on *every* converted row — but also on rows the change cannot touch, and the alternating-order run kept only the converted rows. A second attempt wrote both binaries' output into the same pair of files, so each file held half of each binary and every delta collapsed to ~0. The design that is evidence: one output file per *binary*, order swapped every round, median over >=6 rounds. A fixed order is not an A/B on this host.
+
+Gates: `cargo fmt --all -- --check`; `cargo clippy --workspace --all-targets -- -D warnings`; `cargo test --workspace` (38 suites, 0 failed); the four sweeps at `--batch 32 --timeout 15 --recheck-timeout 15` — `built-ins` 23,821, `language` 23,726, `annexB` 1,086, `intl402` 3,365, all 100% (51,998); corpus parity 0 mismatches; the four lane probes under `--gc-stress --gc-verify --nursery-stress` exit 0.
+
+What is left in this lane: a native callback (`forEach(Math.abs)`) is still ~400 ns per builtin invocation and never enters the leaf lane at all (the `FunctionKind::EcmaScript` gate), and a leaf callback is still ~2x a compiled call site because the JIT leaf entry builds a fresh call context per invocation — the reusable-context slice in `.notes/rust-initiated-call-plan.md`.

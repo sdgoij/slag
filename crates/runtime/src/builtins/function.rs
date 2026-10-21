@@ -435,6 +435,63 @@ fn call_method(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value,
     }
 }
 
+/// A loop-scoped leaf Vm for a builtin that dispatches a caller-supplied
+/// callback per element.
+///
+/// Every `try_leaf_call` pays two pool round trips plus `return_vm`'s full
+/// reset (~45 field stores and ~25 stack clears). A successful leaf run
+/// restores every persistent field it touched — the value stack to the call
+/// site, `leaf_frame_base`/`offset`, `body_context`, `lexical_env`, and (on
+/// the step path) `ip`, `strict`, `chain_short`, `loop_counter` and the
+/// array-index/call-args stacks — so one Vm can serve a whole callback loop
+/// and needs only [`Vm::rebind`] between calls. `forEach`/`map`-style builtins
+/// therefore hold this guard across their loop instead of taking a Vm per
+/// element.
+#[derive(Default)]
+pub(crate) struct CallbackVm {
+    vm: Option<Box<crate::ir::Vm>>,
+}
+
+impl CallbackVm {
+    /// Dispatch one callback, reusing the loop's leaf Vm. A callee that is
+    /// not leaf-inlineable takes the general `crate::function::call`,
+    /// unchanged.
+    pub(crate) fn call(
+        &mut self,
+        agent: &mut Agent,
+        callee: &Value,
+        this: Value,
+        args: &[Value],
+    ) -> Result<Value, JsError> {
+        match try_leaf_call_reusing(agent, &mut self.vm, callee, this, args) {
+            Some(result) => result,
+            None => crate::function::call(agent, callee, this, args),
+        }
+    }
+
+    /// Run `body` with a loop-scoped leaf Vm, returning the Vm to the pool on
+    /// both the completion and the error path.
+    pub(crate) fn with<R>(
+        agent: &mut Agent,
+        body: impl FnOnce(&mut Agent, &mut Self) -> Result<R, JsError>,
+    ) -> Result<R, JsError> {
+        let mut callback = Self::default();
+        let result = body(agent, &mut callback);
+        callback.finish(agent);
+        result
+    }
+
+    /// Hand the Vm back to the pool. Dropping the guard without finishing is
+    /// memory-safe and correct (the Vm is deallocated rather than pooled), so
+    /// an error path may simply unwind; this keeps the pool's capacity for
+    /// the common completion.
+    pub(crate) fn finish(&mut self, agent: &mut Agent) {
+        if let Some(vm) = self.vm.take() {
+            agent.return_vm(vm);
+        }
+    }
+}
+
 /// The apply/call builtins' leaf fast path, shared with `function::call_callback`:
 /// a certified-leaf callee runs through the leaf machinery on a pooled Vm — the
 /// register-op (or JIT) body execution with no execution-context push, mirroring
@@ -443,6 +500,25 @@ fn call_method(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value,
 /// back to the general `crate::function::call`).
 pub(crate) fn try_leaf_call(
     agent: &mut Agent,
+    func: &Value,
+    this_arg: Value,
+    arg_list: &[Value],
+) -> Option<Result<Value, JsError>> {
+    let mut slot = None;
+    let result = try_leaf_call_reusing(agent, &mut slot, func, this_arg, arg_list);
+    if let Some(vm) = slot.take() {
+        agent.return_vm(vm);
+    }
+    result
+}
+
+/// `try_leaf_call` with the Vm held by the caller: `slot` carries a Vm across
+/// calls, and a successful run leaves it in `slot` again for the next one. On
+/// an error the Vm goes back to the pool through the full reset, because an
+/// unwind may leave the value stack past the call site.
+fn try_leaf_call_reusing(
+    agent: &mut Agent,
+    slot: &mut Option<Box<crate::ir::Vm>>,
     func: &Value,
     this_arg: Value,
     arg_list: &[Value],
@@ -471,7 +547,13 @@ pub(crate) fn try_leaf_call(
         return None;
     };
     let env = context.lexical_environment;
-    let mut vm = agent.take_vm(env, entry.strict);
+    let mut vm = match slot.take() {
+        Some(mut vm) => {
+            vm.rebind(env, entry.strict);
+            vm
+        }
+        None => agent.take_vm(env, entry.strict),
+    };
     // GC-2: the leaf's arguments and result live on this pooled Vm's
     // stack, which the precise tracer cannot see — register the Vm as an
     // active run for the whole leaf window (the pushes and the body), so
@@ -481,16 +563,10 @@ pub(crate) fn try_leaf_call(
         vm.stack.push(this_arg);
         vm.stack.push(*func);
         vm.stack.extend_from_slice(arg_list);
-        vm.do_call_fast(agent, arg_list.len(), false)?;
-        // A non-leaf callee (the entry went stale between the lookup and the
-        // call) withdraws the activation; this pooled Vm's frame is small, so
-        // complete it here. An engine builtin that ran in place withdrew
-        // nothing, so the check is skipped.
-        if vm.has_pending_call() {
-            vm.complete_pending_call(agent)
-        } else {
-            Ok(())
-        }
+        // The entry is already resolved: run its leaf arm directly instead of
+        // `do_call_fast`, which would re-derive the same entry (a second
+        // `leaf_lookup`) and re-run the call-site gate on every element.
+        vm.run_leaf_entry(agent, arg_list.len(), this_arg, entry, 2)
     })
     .and_then(|()| {
         vm.stack.pop().ok_or_else(|| {
@@ -500,7 +576,10 @@ pub(crate) fn try_leaf_call(
             )
         })
     });
-    agent.return_vm(vm);
+    match &result {
+        Ok(_) => *slot = Some(vm),
+        Err(_) => agent.return_vm(vm),
+    }
     Some(result)
 }
 

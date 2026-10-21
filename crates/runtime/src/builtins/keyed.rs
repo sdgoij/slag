@@ -730,23 +730,25 @@ fn map_for_each(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value
     }
     let this_arg = args.get(1).cloned().unwrap_or(Value::Undefined);
     let mut index = 0usize;
-    loop {
-        let (entry, count) = {
-            let data = agent.map_data.get(&object.id()).unwrap().borrow();
-            (
-                data.entries.get(index).cloned().flatten(),
-                data.entries.len(),
-            )
-        };
-        if index >= count {
-            break;
+    crate::builtins::function::CallbackVm::with(agent, |agent, leaf| {
+        loop {
+            let (entry, count) = {
+                let data = agent.map_data.get(&object.id()).unwrap().borrow();
+                (
+                    data.entries.get(index).cloned().flatten(),
+                    data.entries.len(),
+                )
+            };
+            if index >= count {
+                break;
+            }
+            index += 1;
+            if let Some((key, value)) = entry {
+                leaf.call(agent, &callback, this_arg, &[value, key, *this])?;
+            }
         }
-        index += 1;
-        if let Some((key, value)) = entry {
-            crate::function::call_callback(agent, &callback, this_arg, &[value, key, *this])?;
-        }
-    }
-    Ok(Value::Undefined)
+        Ok(Value::Undefined)
+    })
 }
 
 /// CreateMapIterator (spec 24.1.6.1): an ordinary object holding the map,
@@ -911,23 +913,25 @@ fn set_for_each(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value
     }
     let this_arg = args.get(1).cloned().unwrap_or(Value::Undefined);
     let mut index = 0usize;
-    loop {
-        let (entry, count) = {
-            let data = agent.set_data.get(&object.id()).unwrap().borrow();
-            (
-                data.entries.get(index).cloned().flatten(),
-                data.entries.len(),
-            )
-        };
-        if index >= count {
-            break;
+    crate::builtins::function::CallbackVm::with(agent, |agent, leaf| {
+        loop {
+            let (entry, count) = {
+                let data = agent.set_data.get(&object.id()).unwrap().borrow();
+                (
+                    data.entries.get(index).cloned().flatten(),
+                    data.entries.len(),
+                )
+            };
+            if index >= count {
+                break;
+            }
+            index += 1;
+            if let Some(value) = entry {
+                leaf.call(agent, &callback, this_arg, &[value, value, *this])?;
+            }
         }
-        index += 1;
-        if let Some(value) = entry {
-            crate::function::call_callback(agent, &callback, this_arg, &[value, value, *this])?;
-        }
-    }
-    Ok(Value::Undefined)
+        Ok(Value::Undefined)
+    })
 }
 
 /// CreateSetIterator (spec 24.2.6.1).

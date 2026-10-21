@@ -1134,19 +1134,21 @@ fn every(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsErr
         ));
     }
     let this_arg = args.get(1).cloned().unwrap_or(Value::Undefined);
-    for k in 0..typed_array_effective_length(&slots) as u64 {
-        let k_value = element_read(this, &slots, k)?;
-        let test = crate::function::call_callback(
-            agent,
-            &callbackfn,
-            this_arg,
-            &[k_value, Value::Number(k as f64), *this],
-        )?;
-        if !to_boolean(&test) {
-            return Ok(Value::Boolean(false));
+    crate::builtins::function::CallbackVm::with(agent, |agent, callback| {
+        for k in 0..typed_array_effective_length(&slots) as u64 {
+            let k_value = element_read(this, &slots, k)?;
+            let test = callback.call(
+                agent,
+                &callbackfn,
+                this_arg,
+                &[k_value, Value::Number(k as f64), *this],
+            )?;
+            if !to_boolean(&test) {
+                return Ok(Value::Boolean(false));
+            }
         }
-    }
-    Ok(Value::Boolean(true))
+        Ok(Value::Boolean(true))
+    })
 }
 
 /// spec 25.2.3.9 TypedArray.prototype.fill.
@@ -1217,18 +1219,21 @@ fn filter(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsEr
     // result after).
     let _stress = crate::ir::StressSuppress::new();
     let mut kept = Vec::new();
-    for k in 0..typed_array_effective_length(&slots) as u64 {
-        let k_value = element_read(this, &slots, k)?;
-        let selected = crate::function::call_callback(
-            agent,
-            &callbackfn,
-            this_arg,
-            &[k_value, Value::Number(k as f64), *this],
-        )?;
-        if to_boolean(&selected) {
-            kept.push(k_value);
+    crate::builtins::function::CallbackVm::with(agent, |agent, callback| {
+        for k in 0..typed_array_effective_length(&slots) as u64 {
+            let k_value = element_read(this, &slots, k)?;
+            let selected = callback.call(
+                agent,
+                &callbackfn,
+                this_arg,
+                &[k_value, Value::Number(k as f64), *this],
+            )?;
+            if to_boolean(&selected) {
+                kept.push(k_value);
+            }
         }
-    }
+        Ok(())
+    })?;
     let result = typed_array_species_create(agent, this, kept.len())?;
     for (k, value) in kept.into_iter().enumerate() {
         set_property(&result, &key(k as u64), value)?;
@@ -1252,26 +1257,28 @@ fn find_common(
         ));
     }
     let this_arg = args.get(1).cloned().unwrap_or(Value::Undefined);
-    for k in 0..typed_array_effective_length(&slots) as u64 {
-        let k_value = element_read(this, &slots, k)?;
-        let test = crate::function::call_callback(
-            agent,
-            &predicate,
-            this_arg,
-            &[k_value, Value::Number(k as f64), *this],
-        )?;
-        if to_boolean(&test) {
-            return Ok(if want_index {
-                Value::Number(k as f64)
-            } else {
-                k_value
-            });
+    crate::builtins::function::CallbackVm::with(agent, |agent, callback| {
+        for k in 0..typed_array_effective_length(&slots) as u64 {
+            let k_value = element_read(this, &slots, k)?;
+            let test = callback.call(
+                agent,
+                &predicate,
+                this_arg,
+                &[k_value, Value::Number(k as f64), *this],
+            )?;
+            if to_boolean(&test) {
+                return Ok(if want_index {
+                    Value::Number(k as f64)
+                } else {
+                    k_value
+                });
+            }
         }
-    }
-    Ok(if want_index {
-        Value::Number(-1.0)
-    } else {
-        Value::Undefined
+        Ok(if want_index {
+            Value::Number(-1.0)
+        } else {
+            Value::Undefined
+        })
     })
 }
 
@@ -1301,28 +1308,30 @@ fn find_last_common(
         ));
     }
     let this_arg = args.get(1).cloned().unwrap_or(Value::Undefined);
-    let mut k = typed_array_effective_length(&slots) as i64 - 1;
-    while k >= 0 {
-        let k_value = element_read(this, &slots, k as u64)?;
-        let test = crate::function::call_callback(
-            agent,
-            &predicate,
-            this_arg,
-            &[k_value, Value::Number(k as f64), *this],
-        )?;
-        if to_boolean(&test) {
-            return Ok(if want_index {
-                Value::Number(k as f64)
-            } else {
-                k_value
-            });
+    crate::builtins::function::CallbackVm::with(agent, |agent, callback| {
+        let mut k = typed_array_effective_length(&slots) as i64 - 1;
+        while k >= 0 {
+            let k_value = element_read(this, &slots, k as u64)?;
+            let test = callback.call(
+                agent,
+                &predicate,
+                this_arg,
+                &[k_value, Value::Number(k as f64), *this],
+            )?;
+            if to_boolean(&test) {
+                return Ok(if want_index {
+                    Value::Number(k as f64)
+                } else {
+                    k_value
+                });
+            }
+            k -= 1;
         }
-        k -= 1;
-    }
-    Ok(if want_index {
-        Value::Number(-1.0)
-    } else {
-        Value::Undefined
+        Ok(if want_index {
+            Value::Number(-1.0)
+        } else {
+            Value::Undefined
+        })
     })
 }
 
@@ -1347,16 +1356,18 @@ fn for_each(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, Js
         ));
     }
     let this_arg = args.get(1).cloned().unwrap_or(Value::Undefined);
-    for k in 0..typed_array_effective_length(&slots) as u64 {
-        let k_value = element_read(this, &slots, k)?;
-        crate::function::call_callback(
-            agent,
-            &callbackfn,
-            this_arg,
-            &[k_value, Value::Number(k as f64), *this],
-        )?;
-    }
-    Ok(Value::Undefined)
+    crate::builtins::function::CallbackVm::with(agent, |agent, callback| {
+        for k in 0..typed_array_effective_length(&slots) as u64 {
+            let k_value = element_read(this, &slots, k)?;
+            callback.call(
+                agent,
+                &callbackfn,
+                this_arg,
+                &[k_value, Value::Number(k as f64), *this],
+            )?;
+        }
+        Ok(Value::Undefined)
+    })
 }
 
 /// spec 25.2.3.16 TypedArray.prototype.includes.
@@ -1520,16 +1531,19 @@ fn map(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsError
     // elements are visited (out-of-bounds elements read as undefined).
     let length = typed_array_effective_length(&slots) as u64;
     let result = typed_array_species_create(agent, this, length as usize)?;
-    for k in 0..length {
-        let k_value = element_read(this, &slots, k)?;
-        let mapped = crate::function::call_callback(
-            agent,
-            &callbackfn,
-            this_arg,
-            &[k_value, Value::Number(k as f64), *this],
-        )?;
-        set_property(&result, &key(k), mapped)?;
-    }
+    crate::builtins::function::CallbackVm::with(agent, |agent, callback| {
+        for k in 0..length {
+            let k_value = element_read(this, &slots, k)?;
+            let mapped = callback.call(
+                agent,
+                &callbackfn,
+                this_arg,
+                &[k_value, Value::Number(k as f64), *this],
+            )?;
+            set_property(&result, &key(k), mapped)?;
+        }
+        Ok(())
+    })?;
     Ok(result)
 }
 
@@ -1558,16 +1572,19 @@ fn reduce(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsEr
         accumulator = element_read(this, &slots, 0)?;
         k = 1;
     }
-    while k < length {
-        let k_value = element_read(this, &slots, k)?;
-        accumulator = crate::function::call_callback(
-            agent,
-            &callbackfn,
-            Value::Undefined,
-            &[accumulator, k_value, Value::Number(k as f64), *this],
-        )?;
-        k += 1;
-    }
+    crate::builtins::function::CallbackVm::with(agent, |agent, callback| {
+        while k < length {
+            let k_value = element_read(this, &slots, k)?;
+            accumulator = callback.call(
+                agent,
+                &callbackfn,
+                Value::Undefined,
+                &[accumulator, k_value, Value::Number(k as f64), *this],
+            )?;
+            k += 1;
+        }
+        Ok(())
+    })?;
     Ok(accumulator)
 }
 
@@ -1596,16 +1613,19 @@ fn reduce_right(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value
         accumulator = element_read(this, &slots, length - 1)?;
         k -= 1;
     }
-    while k >= 0 {
-        let k_value = element_read(this, &slots, k as u64)?;
-        accumulator = crate::function::call_callback(
-            agent,
-            &callbackfn,
-            Value::Undefined,
-            &[accumulator, k_value, Value::Number(k as f64), *this],
-        )?;
-        k -= 1;
-    }
+    crate::builtins::function::CallbackVm::with(agent, |agent, callback| {
+        while k >= 0 {
+            let k_value = element_read(this, &slots, k as u64)?;
+            accumulator = callback.call(
+                agent,
+                &callbackfn,
+                Value::Undefined,
+                &[accumulator, k_value, Value::Number(k as f64), *this],
+            )?;
+            k -= 1;
+        }
+        Ok(())
+    })?;
     Ok(accumulator)
 }
 
@@ -1766,19 +1786,21 @@ fn some(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsErro
         ));
     }
     let this_arg = args.get(1).cloned().unwrap_or(Value::Undefined);
-    for k in 0..typed_array_effective_length(&slots) as u64 {
-        let k_value = element_read(this, &slots, k)?;
-        let test = crate::function::call_callback(
-            agent,
-            &callbackfn,
-            this_arg,
-            &[k_value, Value::Number(k as f64), *this],
-        )?;
-        if to_boolean(&test) {
-            return Ok(Value::Boolean(true));
+    crate::builtins::function::CallbackVm::with(agent, |agent, callback| {
+        for k in 0..typed_array_effective_length(&slots) as u64 {
+            let k_value = element_read(this, &slots, k)?;
+            let test = callback.call(
+                agent,
+                &callbackfn,
+                this_arg,
+                &[k_value, Value::Number(k as f64), *this],
+            )?;
+            if to_boolean(&test) {
+                return Ok(Value::Boolean(true));
+            }
         }
-    }
-    Ok(Value::Boolean(false))
+        Ok(Value::Boolean(false))
+    })
 }
 
 /// TypedArray SortCompare (spec 25.2.3.28.2): numeric default (NaN sorts

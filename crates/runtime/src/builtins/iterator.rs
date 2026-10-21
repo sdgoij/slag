@@ -895,11 +895,12 @@ fn iterate_eager(
 
 fn call_predicate(
     agent: &mut Agent,
+    leaf: &mut crate::builtins::function::CallbackVm,
     f: &Value,
     value: &Value,
     counter: f64,
 ) -> Result<bool, JsError> {
-    let result = crate::function::call_callback(
+    let result = leaf.call(
         agent,
         f,
         Value::Undefined,
@@ -920,12 +921,14 @@ fn every_method(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value
         return close_this_on_error(agent, this, error);
     }
     let record = get_iterator_direct(agent, this)?;
-    let result = iterate_eager(agent, &record, 0.0, |agent, value, counter| {
-        if call_predicate(agent, &predicate, &value, counter)? {
-            Ok(None)
-        } else {
-            Ok(Some(Value::Boolean(false)))
-        }
+    let result = crate::builtins::function::CallbackVm::with(agent, |agent, leaf| {
+        iterate_eager(agent, &record, 0.0, |agent, value, counter| {
+            if call_predicate(agent, leaf, &predicate, &value, counter)? {
+                Ok(None)
+            } else {
+                Ok(Some(Value::Boolean(false)))
+            }
+        })
     })?;
     Ok(Value::Boolean(result.is_none()))
 }
@@ -940,12 +943,14 @@ fn some_method(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value,
         return close_this_on_error(agent, this, error);
     }
     let record = get_iterator_direct(agent, this)?;
-    let result = iterate_eager(agent, &record, 0.0, |agent, value, counter| {
-        if call_predicate(agent, &predicate, &value, counter)? {
-            Ok(Some(Value::Boolean(true)))
-        } else {
-            Ok(None)
-        }
+    let result = crate::builtins::function::CallbackVm::with(agent, |agent, leaf| {
+        iterate_eager(agent, &record, 0.0, |agent, value, counter| {
+            if call_predicate(agent, leaf, &predicate, &value, counter)? {
+                Ok(Some(Value::Boolean(true)))
+            } else {
+                Ok(None)
+            }
+        })
     })?;
     Ok(Value::Boolean(result.is_some()))
 }
@@ -960,12 +965,14 @@ fn find_method(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value,
         return close_this_on_error(agent, this, error);
     }
     let record = get_iterator_direct(agent, this)?;
-    let result = iterate_eager(agent, &record, 0.0, |agent, value, counter| {
-        if call_predicate(agent, &predicate, &value, counter)? {
-            Ok(Some(value))
-        } else {
-            Ok(None)
-        }
+    let result = crate::builtins::function::CallbackVm::with(agent, |agent, leaf| {
+        iterate_eager(agent, &record, 0.0, |agent, value, counter| {
+            if call_predicate(agent, leaf, &predicate, &value, counter)? {
+                Ok(Some(value))
+            } else {
+                Ok(None)
+            }
+        })
     })?;
     Ok(result.unwrap_or(Value::Undefined))
 }
@@ -980,16 +987,18 @@ fn for_each_method(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Va
         return close_this_on_error(agent, this, error);
     }
     let record = get_iterator_direct(agent, this)?;
-    iterate_eager(agent, &record, 0.0, |agent, value, counter| {
-        crate::function::call_callback(
-            agent,
-            &f,
-            Value::Undefined,
-            &[value, Value::Number(counter)],
-        )?;
-        Ok(None)
-    })?;
-    Ok(Value::Undefined)
+    crate::builtins::function::CallbackVm::with(agent, |agent, leaf| {
+        iterate_eager(agent, &record, 0.0, |agent, value, counter| {
+            leaf.call(
+                agent,
+                &f,
+                Value::Undefined,
+                &[value, Value::Number(counter)],
+            )?;
+            Ok(None)
+        })?;
+        Ok(Value::Undefined)
+    })
 }
 
 fn reduce_method(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsError> {
@@ -1021,15 +1030,18 @@ fn reduce_method(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Valu
     } else {
         0.0
     };
-    iterate_eager(agent, &record, start_counter, |agent, value, counter| {
-        let acc = accumulator.unwrap_or(Value::Undefined);
-        accumulator = Some(crate::function::call_callback(
-            agent,
-            &reducer,
-            Value::Undefined,
-            &[acc, value, Value::Number(counter)],
-        )?);
-        Ok(None)
+    crate::builtins::function::CallbackVm::with(agent, |agent, leaf| {
+        iterate_eager(agent, &record, start_counter, |agent, value, counter| {
+            let acc = accumulator.unwrap_or(Value::Undefined);
+            accumulator = Some(leaf.call(
+                agent,
+                &reducer,
+                Value::Undefined,
+                &[acc, value, Value::Number(counter)],
+            )?);
+            Ok(None)
+        })?;
+        Ok(())
     })?;
     Ok(accumulator.unwrap_or(Value::Undefined))
 }
@@ -1583,8 +1595,13 @@ fn step_helper(agent: &mut Agent, state: &mut HelperState) -> Result<Value, JsEr
                 };
                 let counter = state.counter;
                 state.counter += 1.0;
-                let keep = match call_predicate(agent, filterer, &value, counter) {
-                    Ok(keep) => keep,
+                let keep = match crate::function::call_callback(
+                    agent,
+                    filterer,
+                    Value::Undefined,
+                    &[value, Value::Number(counter)],
+                ) {
+                    Ok(result) => to_boolean(&result),
                     Err(e) => {
                         state.done = true;
                         close_helper_iterators(agent, state);

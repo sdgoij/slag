@@ -1123,27 +1123,29 @@ fn every(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsErr
         ));
     }
     let this_arg = args.get(1).cloned().unwrap_or(Value::Undefined);
-    for k in 0..length {
-        let k_value = match dense_own_element(&object, k) {
-            Some(value) => value,
-            None => {
-                if !has_property(&object, &key(k))? {
-                    continue;
+    crate::builtins::function::CallbackVm::with(agent, |agent, callback| {
+        for k in 0..length {
+            let k_value = match dense_own_element(&object, k) {
+                Some(value) => value,
+                None => {
+                    if !has_property(&object, &key(k))? {
+                        continue;
+                    }
+                    get(agent, &object, &key(k))?
                 }
-                get(agent, &object, &key(k))?
+            };
+            let test = callback.call(
+                agent,
+                &callbackfn,
+                this_arg,
+                &[k_value, Value::Number(k as f64), object],
+            )?;
+            if !to_boolean(&test) {
+                return Ok(Value::Boolean(false));
             }
-        };
-        let test = crate::function::call_callback(
-            agent,
-            &callbackfn,
-            this_arg,
-            &[k_value, Value::Number(k as f64), object],
-        )?;
-        if !to_boolean(&test) {
-            return Ok(Value::Boolean(false));
         }
-    }
-    Ok(Value::Boolean(true))
+        Ok(Value::Boolean(true))
+    })
 }
 
 /// spec 23.1.3.6 Array.prototype.fill.
@@ -1183,29 +1185,32 @@ fn filter(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsEr
     let this_arg = args.get(1).cloned().unwrap_or(Value::Undefined);
     let array = array_species_create(agent, &object, 0.0)?;
     let mut to_index = 0u64;
-    for k in 0..length {
-        let k_value = match dense_own_element(&object, k) {
-            Some(value) => value,
-            None => {
-                if !has_property(&object, &key(k))? {
-                    continue;
+    crate::builtins::function::CallbackVm::with(agent, |agent, callback| {
+        for k in 0..length {
+            let k_value = match dense_own_element(&object, k) {
+                Some(value) => value,
+                None => {
+                    if !has_property(&object, &key(k))? {
+                        continue;
+                    }
+                    get(agent, &object, &key(k))?
                 }
-                get(agent, &object, &key(k))?
+            };
+            let selected = callback.call(
+                agent,
+                &callbackfn,
+                this_arg,
+                &[k_value, Value::Number(k as f64), object],
+            )?;
+            if to_boolean(&selected) {
+                if !array.create_data_property_index(to_index, k_value)? {
+                    array.create_data_property_or_throw(&key(to_index), k_value)?;
+                }
+                to_index += 1;
             }
-        };
-        let selected = crate::function::call_callback(
-            agent,
-            &callbackfn,
-            this_arg,
-            &[k_value, Value::Number(k as f64), object],
-        )?;
-        if to_boolean(&selected) {
-            if !array.create_data_property_index(to_index, k_value)? {
-                array.create_data_property_or_throw(&key(to_index), k_value)?;
-            }
-            to_index += 1;
         }
-    }
+        Ok(())
+    })?;
     array.set(
         &JsString::from_utf8("length"),
         Value::Number(to_index as f64),
@@ -1228,22 +1233,24 @@ fn find(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsErro
         ));
     }
     let this_arg = args.get(1).cloned().unwrap_or(Value::Undefined);
-    for k in 0..length {
-        let k_value = match dense_own_element(&object, k) {
-            Some(value) => value,
-            None => get(agent, &object, &key(k))?,
-        };
-        let test = crate::function::call_callback(
-            agent,
-            &predicate,
-            this_arg,
-            &[k_value, Value::Number(k as f64), object],
-        )?;
-        if to_boolean(&test) {
-            return Ok(k_value);
+    crate::builtins::function::CallbackVm::with(agent, |agent, callback| {
+        for k in 0..length {
+            let k_value = match dense_own_element(&object, k) {
+                Some(value) => value,
+                None => get(agent, &object, &key(k))?,
+            };
+            let test = callback.call(
+                agent,
+                &predicate,
+                this_arg,
+                &[k_value, Value::Number(k as f64), object],
+            )?;
+            if to_boolean(&test) {
+                return Ok(k_value);
+            }
         }
-    }
-    Ok(Value::Undefined)
+        Ok(Value::Undefined)
+    })
 }
 
 /// spec 23.1.3.9 Array.prototype.findIndex.
@@ -1260,22 +1267,24 @@ fn find_index(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, 
         ));
     }
     let this_arg = args.get(1).cloned().unwrap_or(Value::Undefined);
-    for k in 0..length {
-        let k_value = match dense_own_element(&object, k) {
-            Some(value) => value,
-            None => get(agent, &object, &key(k))?,
-        };
-        let test = crate::function::call_callback(
-            agent,
-            &predicate,
-            this_arg,
-            &[k_value, Value::Number(k as f64), object],
-        )?;
-        if to_boolean(&test) {
-            return Ok(Value::Number(k as f64));
+    crate::builtins::function::CallbackVm::with(agent, |agent, callback| {
+        for k in 0..length {
+            let k_value = match dense_own_element(&object, k) {
+                Some(value) => value,
+                None => get(agent, &object, &key(k))?,
+            };
+            let test = callback.call(
+                agent,
+                &predicate,
+                this_arg,
+                &[k_value, Value::Number(k as f64), object],
+            )?;
+            if to_boolean(&test) {
+                return Ok(Value::Number(k as f64));
+            }
         }
-    }
-    Ok(Value::Number(-1.0))
+        Ok(Value::Number(-1.0))
+    })
 }
 
 /// The shared descending search of findLast/findLastIndex.
@@ -1297,31 +1306,33 @@ fn find_last_common(
         ));
     }
     let this_arg = args.get(1).cloned().unwrap_or(Value::Undefined);
-    let mut k = length as i64 - 1;
-    while k >= 0 {
-        let k_value = match dense_own_element(&object, k as u64) {
-            Some(value) => value,
-            None => get(agent, &object, &key(k as u64))?,
-        };
-        let test = crate::function::call_callback(
-            agent,
-            &predicate,
-            this_arg,
-            &[k_value, Value::Number(k as f64), object],
-        )?;
-        if to_boolean(&test) {
-            return Ok(if want_index {
-                Value::Number(k as f64)
-            } else {
-                k_value
-            });
+    crate::builtins::function::CallbackVm::with(agent, |agent, callback| {
+        let mut k = length as i64 - 1;
+        while k >= 0 {
+            let k_value = match dense_own_element(&object, k as u64) {
+                Some(value) => value,
+                None => get(agent, &object, &key(k as u64))?,
+            };
+            let test = callback.call(
+                agent,
+                &predicate,
+                this_arg,
+                &[k_value, Value::Number(k as f64), object],
+            )?;
+            if to_boolean(&test) {
+                return Ok(if want_index {
+                    Value::Number(k as f64)
+                } else {
+                    k_value
+                });
+            }
+            k -= 1;
         }
-        k -= 1;
-    }
-    Ok(if want_index {
-        Value::Number(-1.0)
-    } else {
-        Value::Undefined
+        Ok(if want_index {
+            Value::Number(-1.0)
+        } else {
+            Value::Undefined
+        })
     })
 }
 
@@ -1436,24 +1447,26 @@ fn for_each(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, Js
         ));
     }
     let this_arg = args.get(1).cloned().unwrap_or(Value::Undefined);
-    for k in 0..length {
-        let k_value = match dense_own_element(&object, k) {
-            Some(value) => value,
-            None => {
-                if !has_property(&object, &key(k))? {
-                    continue;
+    crate::builtins::function::CallbackVm::with(agent, |agent, callback| {
+        for k in 0..length {
+            let k_value = match dense_own_element(&object, k) {
+                Some(value) => value,
+                None => {
+                    if !has_property(&object, &key(k))? {
+                        continue;
+                    }
+                    get(agent, &object, &key(k))?
                 }
-                get(agent, &object, &key(k))?
-            }
-        };
-        crate::function::call_callback(
-            agent,
-            &callbackfn,
-            this_arg,
-            &[k_value, Value::Number(k as f64), object],
-        )?;
-    }
-    Ok(Value::Undefined)
+            };
+            callback.call(
+                agent,
+                &callbackfn,
+                this_arg,
+                &[k_value, Value::Number(k as f64), object],
+            )?;
+        }
+        Ok(Value::Undefined)
+    })
 }
 
 /// spec 23.1.3.15 Array.prototype.includes.
@@ -1629,27 +1642,29 @@ fn map(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsError
     }
     let this_arg = args.get(1).cloned().unwrap_or(Value::Undefined);
     let array = array_species_create(agent, &object, length as f64)?;
-    for k in 0..length {
-        let k_value = match dense_own_element(&object, k) {
-            Some(value) => value,
-            None => {
-                if !has_property(&object, &key(k))? {
-                    continue;
+    crate::builtins::function::CallbackVm::with(agent, |agent, callback| {
+        for k in 0..length {
+            let k_value = match dense_own_element(&object, k) {
+                Some(value) => value,
+                None => {
+                    if !has_property(&object, &key(k))? {
+                        continue;
+                    }
+                    get(agent, &object, &key(k))?
                 }
-                get(agent, &object, &key(k))?
+            };
+            let mapped = callback.call(
+                agent,
+                &callbackfn,
+                this_arg,
+                &[k_value, Value::Number(k as f64), object],
+            )?;
+            if !array.create_data_property_index(k, mapped)? {
+                array.create_data_property_or_throw(&key(k), mapped)?;
             }
-        };
-        let mapped = crate::function::call_callback(
-            agent,
-            &callbackfn,
-            this_arg,
-            &[k_value, Value::Number(k as f64), object],
-        )?;
-        if !array.create_data_property_index(k, mapped)? {
-            array.create_data_property_or_throw(&key(k), mapped)?;
         }
-    }
-    Ok(Value::Object(array))
+        Ok(Value::Object(array))
+    })
 }
 
 /// spec 23.1.3.21 Array.prototype.pop.
@@ -1827,26 +1842,29 @@ fn reduce(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsEr
             ));
         }
     }
-    while k < length {
-        let k_value = match dense_own_element(&object, k) {
-            Some(value) => value,
-            None => {
-                if !has_property(&object, &key(k))? {
-                    k += 1;
-                    continue;
+    crate::builtins::function::CallbackVm::with(agent, |agent, callback| {
+        while k < length {
+            let k_value = match dense_own_element(&object, k) {
+                Some(value) => value,
+                None => {
+                    if !has_property(&object, &key(k))? {
+                        k += 1;
+                        continue;
+                    }
+                    get(agent, &object, &key(k))?
                 }
-                get(agent, &object, &key(k))?
-            }
-        };
-        let current = accumulator.take().unwrap_or(Value::Undefined);
-        accumulator = Some(crate::function::call_callback(
-            agent,
-            &callbackfn,
-            Value::Undefined,
-            &[current, k_value, Value::Number(k as f64), object],
-        )?);
-        k += 1;
-    }
+            };
+            let current = accumulator.take().unwrap_or(Value::Undefined);
+            accumulator = Some(callback.call(
+                agent,
+                &callbackfn,
+                Value::Undefined,
+                &[current, k_value, Value::Number(k as f64), object],
+            )?);
+            k += 1;
+        }
+        Ok(())
+    })?;
     Ok(accumulator.unwrap_or(Value::Undefined))
 }
 
@@ -1893,26 +1911,29 @@ fn reduce_right(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value
             ));
         }
     }
-    while k >= 0 {
-        let k_value = match dense_own_element(&object, k as u64) {
-            Some(value) => value,
-            None => {
-                if !has_property(&object, &key(k as u64))? {
-                    k -= 1;
-                    continue;
+    crate::builtins::function::CallbackVm::with(agent, |agent, callback| {
+        while k >= 0 {
+            let k_value = match dense_own_element(&object, k as u64) {
+                Some(value) => value,
+                None => {
+                    if !has_property(&object, &key(k as u64))? {
+                        k -= 1;
+                        continue;
+                    }
+                    get(agent, &object, &key(k as u64))?
                 }
-                get(agent, &object, &key(k as u64))?
-            }
-        };
-        let current = accumulator.take().unwrap_or(Value::Undefined);
-        accumulator = Some(crate::function::call_callback(
-            agent,
-            &callbackfn,
-            Value::Undefined,
-            &[current, k_value, Value::Number(k as f64), object],
-        )?);
-        k -= 1;
-    }
+            };
+            let current = accumulator.take().unwrap_or(Value::Undefined);
+            accumulator = Some(callback.call(
+                agent,
+                &callbackfn,
+                Value::Undefined,
+                &[current, k_value, Value::Number(k as f64), object],
+            )?);
+            k -= 1;
+        }
+        Ok(())
+    })?;
     Ok(accumulator.unwrap_or(Value::Undefined))
 }
 
@@ -2093,27 +2114,29 @@ fn some(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsErro
         ));
     }
     let this_arg = args.get(1).cloned().unwrap_or(Value::Undefined);
-    for k in 0..length {
-        let k_value = match dense_own_element(&object, k) {
-            Some(value) => value,
-            None => {
-                if !has_property(&object, &key(k))? {
-                    continue;
+    crate::builtins::function::CallbackVm::with(agent, |agent, callback| {
+        for k in 0..length {
+            let k_value = match dense_own_element(&object, k) {
+                Some(value) => value,
+                None => {
+                    if !has_property(&object, &key(k))? {
+                        continue;
+                    }
+                    get(agent, &object, &key(k))?
                 }
-                get(agent, &object, &key(k))?
+            };
+            let test = callback.call(
+                agent,
+                &callbackfn,
+                this_arg,
+                &[k_value, Value::Number(k as f64), object],
+            )?;
+            if to_boolean(&test) {
+                return Ok(Value::Boolean(true));
             }
-        };
-        let test = crate::function::call_callback(
-            agent,
-            &callbackfn,
-            this_arg,
-            &[k_value, Value::Number(k as f64), object],
-        )?;
-        if to_boolean(&test) {
-            return Ok(Value::Boolean(true));
         }
-    }
-    Ok(Value::Boolean(false))
+        Ok(Value::Boolean(false))
+    })
 }
 
 /// SortCompare (spec 23.1.3.29.2).

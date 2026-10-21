@@ -14732,6 +14732,41 @@ impl Vm {
         Ok(())
     }
 
+    /// Run an already-resolved leaf entry at a call site whose `[this, callee,
+    /// args..]` sit on the value stack: the result replaces the call site and
+    /// `below` values under it are dropped with the arguments. This is
+    /// `fast_call_core`'s leaf arm without re-deriving the entry, for a caller
+    /// that already holds one (`try_leaf_call`).
+    pub(crate) fn run_leaf_entry(
+        &mut self,
+        agent: &mut Agent,
+        argc: usize,
+        this: Value,
+        entry: LeafEntry,
+        below: usize,
+    ) -> Result<(), JsError> {
+        // A freshly taken or freshly restored Vm has no binding state a leaf
+        // could resolve against (see `can_inline_leaf`), so the gate is a
+        // debug assertion here rather than a per-call branch.
+        debug_assert!(self.can_inline_leaf());
+        if agent.is_terminating() {
+            return Err(crate::agent::termination_error());
+        }
+        if self.try_jit_leaf(
+            agent,
+            argc,
+            this,
+            &entry.ir,
+            entry.strict,
+            below,
+            entry.environment,
+            None,
+        )? {
+            return Ok(());
+        }
+        self.run_inline_leaf(agent, argc, this, entry, below, None)
+    }
+
     /// Try the JIT leaf path at this call site, shared by every leaf entry
     /// point. `caller_arg_base` marks a fused call-store site whose
     /// arguments live in the caller's frame slots (Cut 35 slice 23) —
