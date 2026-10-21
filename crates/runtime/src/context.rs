@@ -754,7 +754,7 @@ pub fn get_property_key(
                         if let Some(getter) = get
                             && crux::value::is_callable(&getter)
                         {
-                            return crate::function::call(agent, &getter, receiver, &[]);
+                            return crate::function::call_callback(agent, &getter, receiver, &[]);
                         }
                     }
                 }
@@ -770,7 +770,7 @@ pub fn get_property_key(
             if !typed_array_index
                 && let Some(getter) = find_ecma_accessor(agent, &obj, key, AccessorKind::Get)?
             {
-                return crate::function::call(agent, &getter, receiver, &[]);
+                return crate::function::call_callback(agent, &getter, receiver, &[]);
             }
             obj.get_with_receiver_key(key, receiver)
         }
@@ -782,7 +782,7 @@ pub fn get_property_key(
             // fallback).
             crate::function::maybe_materialize_prototype_of_object(agent, &f.object, key)?;
             if let Some(getter) = find_ecma_accessor(agent, &f.object, key, AccessorKind::Get)? {
-                return crate::function::call(agent, &getter, receiver, &[]);
+                return crate::function::call_callback(agent, &getter, receiver, &[]);
             }
             f.object.get_with_receiver_key(key, receiver)
         }
@@ -1038,7 +1038,7 @@ pub fn put_value(agent: &mut Agent, reference: &Reference, value: Value) -> Resu
                         && let Some(setter) =
                             find_ecma_accessor(agent, &obj, key, AccessorKind::Set)?
                     {
-                        crate::function::call(agent, &setter, receiver, &[value])?;
+                        crate::function::call_callback(agent, &setter, receiver, &[value])?;
                         return Ok(());
                     }
                     obj.set_with_receiver_key(key, value, receiver, reference.strict)
@@ -1047,7 +1047,7 @@ pub fn put_value(agent: &mut Agent, reference: &Reference, value: Value) -> Resu
                     if let Some(setter) =
                         find_ecma_accessor(agent, &f.object, key, AccessorKind::Set)?
                     {
-                        crate::function::call(agent, &setter, receiver, &[value])?;
+                        crate::function::call_callback(agent, &setter, receiver, &[value])?;
                         return Ok(());
                     }
                     f.object
@@ -1269,7 +1269,7 @@ pub fn private_get(agent: &mut Agent, obj: &Value, name_id: u64) -> Result<Value
         | crux::object::PrivateElementKind::Method(value) => Ok(value),
         crux::object::PrivateElementKind::Accessor {
             get: Some(getter), ..
-        } => crate::function::call(agent, &getter, *obj, &[]),
+        } => crate::function::call_callback(agent, &getter, *obj, &[]),
         // spec 10.2.9 step 6.b: a private accessor with no getter throws on
         // read (e.g. a setter-only accessor, possibly shadowing a getter in
         // an outer class).
@@ -1314,7 +1314,7 @@ pub fn private_set(
         crux::object::PrivateElementKind::Accessor {
             set: Some(setter), ..
         } => {
-            crate::function::call(agent, &setter, *obj, &[value])?;
+            crate::function::call_callback(agent, &setter, *obj, &[value])?;
             Ok(())
         }
         crux::object::PrivateElementKind::Accessor { .. } => {

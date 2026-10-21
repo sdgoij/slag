@@ -117,12 +117,26 @@ no ctx either (a `forEach` running in Rust has no caller ctx).
 
 ## 5. Recommended first slice
 
+**Done (2026-10-21), as a cheaper variant of C:** the accessor sites take
+`call_callback` instead of `call`, so a leaf accessor now runs through
+`try_leaf_call` (`take_vm` + `do_call_fast`) rather than `ordinary_call`'s
+full scaffolding. A getter read went 146 -> 98 ns (constant body) and
+153 -> 110 ns (reading `this.a`); the corpus moved -2.3% with builtins -11%
+and strings -9%. Non-leaf accessors still fall back to `call` unchanged.
+
+What remains is the ~110 ns against 9.2 ns for a compiled call site, and the
+slices below still apply to it:
+
 1. **A**, measured alone: if the accessor read does not move below ~120 ns, the
    ctx build is not the dominant term and B/C need remeasuring first.
 2. **C** (accessor only) before B: it is the smallest change that reaches the
    shared lane and the easiest to validate — a getter is a single call, no
    argument list marshalling.
 3. **B** only once C is validated.
+
+Note that `try_leaf_call` now sits between the two: a further cut could give it
+the caller's context the same way, which is C applied to `call_callback`
+rather than to `function::call`.
 
 ## 6. Traps
 

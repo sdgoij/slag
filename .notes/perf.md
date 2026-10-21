@@ -15446,3 +15446,21 @@ Corpus: unresolved, 11.04/10.63/10.73 -> 10.93/10.64/11.08 mean-jitGap, families
 **What is still open, and is the largest thing found this session.** An own accessor read is 155 ns against **10.8 ns** for a compiled method call with the same body (`o.m()` where `m` reads `this.a`). A getter that returns a *constant* costs the same as one that reads `this.a` (156 vs 154 ns), so the whole gap is the invocation path, not the body.
 
 An earlier draft of this note blamed a missing JIT entry; that was wrong. `ordinary_call` holds no `agent.jit_hook` reference, but it calls `run_compiled_body`, which calls `crate::jit::run_jit_body` — machine code *is* entered. The gap is that a Rust-initiated call builds the per-call scaffolding: `take_vm` from the pool, `setup_certified_frame`, a ~40-field `JitCallContext` plus a `lookup_info` in `run_jit_body`, then `return_vm`'s full reset. A compiled call site instead reuses the caller's live context and carves the callee's frame inside the caller's own working buffer. See `.notes/rust-initiated-call-plan.md`.
+
+## LANDED (2026-10-21): accessors and setters take the leaf lane
+
+`get_property`/`put_value` dispatched an accessor through `crate::function::call`, which goes `call_inner` -> `ordinary_call` -> `run_compiled_body` and builds the whole per-call scaffolding. `call_callback` (what every builtin uses for a user callback) tries `builtins::function::try_leaf_call` first, which runs a leaf body through the pooled-Vm `do_call_fast` path, and only then falls back to the same `call`. The accessor sites used the plain `call`, so the cheap lane was never tried.
+
+All seven sites in `context.rs` (three getter dispatches, two setter dispatches, the reference-get and reference-put getter/setter) now use `call_callback`. A non-leaf accessor falls back to exactly the same `call` as before.
+
+Probes (3 interleaved same-binary pairs, disjoint):
+
+| probe | before | after |
+| --- | ---: | ---: |
+| getter returning a constant (1M) | 146.2 ms | **98.3 ms** (-31%) |
+| getter reading `this.a` (1M) | 153.2 ms | **112.0 ms** (-27%) |
+| own data property (control) | 5.55 ms | 5.42 ms (flat) |
+
+Corpus (3 interleaved pairs): median `mean-jitGap` 10.97 -> 10.72 (-2.3%), with the families that read accessors most moving furthest — builtins 8.36 -> **7.43** (-11%), strings 10.18 -> **9.28** (-8.9%), language 8.02 -> **7.29** (-9%), calls 10.90 -> 10.34 (-5%). `mean-jlGap` fell too (3.85 -> 3.80), which is expected: the interpreter's accessor dispatch went through the same `call`.
+
+An own accessor read is now 110 ns against 9.2 ns for a compiled method call with the same body. The remaining cost is `try_leaf_call`'s own `take_vm` + `do_call_fast` + `return_vm`, and the non-leaf fallback. The reusable-context slice in `.notes/rust-initiated-call-plan.md` still applies to that remainder.
