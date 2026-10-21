@@ -183,6 +183,25 @@ impl crux::heap::Trace for GeneratorMethods {
     }
 }
 
+/// The `%Generator.prototype%` methods, registered as native handlers by
+/// `Intrinsics::define`.
+///
+/// `dispatch_call` below is a pure identity match on the intrinsic, so the
+/// registration is exactly that dispatch reached one layer earlier: without
+/// it a warm `g.next()` fails `fast_call_core`'s leaf gate, misses the
+/// registered-handler probe, withdraws its call frame, and is then
+/// re-dispatched through `call_inner` — an `%eval%` intrinsic hash, two
+/// registry hashes and the pending-call round trip per `next()`. With the
+/// handler registered the same call runs in place.
+pub(crate) fn handler_for(name: &str) -> Option<crate::function::BuiltinHandler> {
+    match name {
+        "%Generator.prototype.next%" => Some(generator_next),
+        "%Generator.prototype.return%" => Some(generator_return),
+        "%Generator.prototype.throw%" => Some(generator_throw),
+        _ => None,
+    }
+}
+
 /// Dispatch `%Generator.prototype%` methods by identity.
 pub fn dispatch_call(
     agent: &mut Agent,

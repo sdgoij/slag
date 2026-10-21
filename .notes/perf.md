@@ -15561,3 +15561,26 @@ End to end that is at the noise floor (12 interleaved rounds: `[1,2,3,4].forEach
 **NULL: `Map.prototype.forEach`'s iteration body is not slow.** The `+5..9%` medians seen earlier in the session were drift — with the same JS callback and four entries it measures 24.4 ms/100k against `Array.prototype.forEach`'s 26.2, and its min moved +1.2%. The per-entry `HashMap` lookup, `borrow()` and `entries.get(i).cloned()` together cost less than one array element read plus its callback, so there is nothing to fix there.
 
 Gates: `cargo fmt --all -- --check`; `cargo clippy --workspace --all-targets -- -D warnings`; `cargo test --workspace` (38 suites, 0 failed); sweeps `built-ins` 23,821 + `language` 23,726 + `annexB` 1,086 + `intl402` 3,365 = 51,998 at 100%; corpus parity 0; the native-callback correctness probe exits 0 under `--gc-stress --gc-verify --nursery-stress`.
+
+## LANDED (2026-10-21): `generator.next()` dispatches in place
+
+`control/generator_loop.js` was the corpus's worst *relative* gap (23.4x node) and 200k `g.next()` calls cost ~200 ns each. The generator machinery itself was not the problem: an *exhausted* generator — where `next()` only builds `{value: undefined, done: true}` — cost almost as much (~170 ns), so the money was in the call dispatch.
+
+`%Generator.prototype%.{next,return,throw}` were not in any `handler_for` table, so a generator method call fell all the way through `fast_call_core`: the registered-handler probe missed, `is_eval_function` ran (an intrinsics hash of `"%eval%"` per call), and the call *withdrew* its frame (`PendingCall::Function`); the driver then re-dispatched through `call_inner` -> `builtin_handler` (another hash) -> `builtin_dispatch_cache` (a third) -> `builtin_dispatch_at` -> `generator::dispatch_call`'s identity match -> the handler.
+
+`generator::handler_for` and `async_generator::handler_for` now register those six functions (the three generator methods and their async-generator twins). That is exactly what `dispatch_call` resolved, reached one layer earlier: `fast_call_core`'s handler arm runs it in place, with no frame withdrawal, no eval-identity hash and no chain walk. Nothing changes for a shadowed `next` (the registry is keyed by the function's own id) or for a `.call`/`Reflect.apply` on the intrinsic (those still resolve through the chain).
+
+12 interleaved rounds, order swapped each round, medians:
+
+| probe | before | after |
+| --- | ---: | ---: |
+| `g.next().value` in a compiled loop (200k) | 40.57 ms | **27.49 ms** (-32.2%) |
+| `g.next()` without reading `.value` | 45.00 | **26.86** (-40.3%) |
+| `next()` on an exhausted generator | 33.85 | **16.17** (-52.2%) |
+| `yield` of a constant | 40.83 | **27.14** (-33.5%) |
+| corpus `control/generator_loop.js` | 44.65 | **30.88** (-30.8%) |
+| plain compiled call / object-literal controls | 1.13 / 0.46 | 1.12 / 0.46 (flat) |
+
+What remains in a `next()` is ~137 ns: ~20 ns dispatch (now the handler cell), ~15 ns the `agent.generators` lookup plus its `Rc` clone, ~20-30 ns the `{value, done}` object, and ~60 ns of suspend/resume — the last of which is another Rust->JIT entry per resume, i.e. the parked `.notes/rust-initiated-call-plan.md` problem.
+
+Gates: `cargo fmt --all -- --check`; `cargo clippy --workspace --all-targets -- -D warnings`; `cargo test --workspace` (38 suites, 0 failed); sweeps `built-ins` 23,821 + `language` 23,726 + `annexB` 1,086 + `intl402` 3,365 = 51,998 at 100%, which is what exercises the async-generator twins (the corpus has no async workloads); corpus parity 0.

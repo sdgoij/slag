@@ -213,6 +213,19 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
     Ok(())
 }
 
+/// The `%AsyncGenerator.prototype%` methods, registered as native handlers by
+/// `Intrinsics::define` (see the generator twin's note in `generator.rs`):
+/// `dispatch_call` below resolves them by identity, so the registration is the
+/// same dispatch reached without withdrawing the call frame first.
+pub(crate) fn handler_for(name: &str) -> Option<crate::function::BuiltinHandler> {
+    match name {
+        "%AsyncGenerator.prototype.next%" => Some(async_generator_next),
+        "%AsyncGenerator.prototype.return%" => Some(async_generator_return),
+        "%AsyncGenerator.prototype.throw%" => Some(async_generator_throw),
+        _ => None,
+    }
+}
+
 /// Dispatch `%AsyncGenerator.prototype%` methods by identity.
 pub fn dispatch_call(
     agent: &mut Agent,
