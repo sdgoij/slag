@@ -54,7 +54,7 @@ type EcmaHook = fn(
 ) -> Result<Value, JsError>;
 
 thread_local! {
-    static CURRENT_AGENT: RefCell<*mut ()> = const { RefCell::new(std::ptr::null_mut()) };
+    static CURRENT_AGENT: Cell<*mut ()> = const { Cell::new(std::ptr::null_mut()) };
 }
 
 /// The ECMAScript executor is a plain function pointer: process-global.
@@ -82,7 +82,7 @@ pub fn install_agent_enter_hook(hook: fn(*mut ())) {
 /// run in the caller's Vm) re-enters with the same pointer, so the swap is
 /// skipped when the agent is already current.
 pub fn with_agent<T>(agent: *mut (), body: impl FnOnce() -> T) -> T {
-    let already = CURRENT_AGENT.with(|slot| *slot.borrow() == agent);
+    let already = CURRENT_AGENT.with(|slot| slot.get() == agent);
     if already {
         return body();
     }
@@ -101,7 +101,7 @@ pub fn with_agent<T>(agent: *mut (), body: impl FnOnce() -> T) -> T {
 /// their closures; the pointer is only valid while the enclosing
 /// `with_agent` call is on the stack.
 pub fn current_agent() -> *mut () {
-    CURRENT_AGENT.with(|slot| *slot.borrow())
+    CURRENT_AGENT.with(|slot| slot.get())
 }
 
 /// Run an ECMAScript function through the runtime's executor, or report the
@@ -112,7 +112,7 @@ fn ecma_call(
     args: &[Value],
     new_target: Option<&Value>,
 ) -> Result<Value, JsError> {
-    let agent = CURRENT_AGENT.with(|slot| *slot.borrow());
+    let agent = CURRENT_AGENT.with(|slot| slot.get());
     let hook = ECMA_HOOK.get().copied();
     match hook {
         Some(hook) if !agent.is_null() => hook(agent, callee, this, args, new_target),
@@ -134,7 +134,7 @@ fn call_with_hook(
     args: &[Value],
     native: &NativeFn,
 ) -> Result<Value, JsError> {
-    let agent = CURRENT_AGENT.with(|slot| *slot.borrow());
+    let agent = CURRENT_AGENT.with(|slot| slot.get());
     let hook = ECMA_HOOK.get().copied();
     match hook {
         Some(hook) if !agent.is_null() => hook(agent, callee, this, args, None),
@@ -149,7 +149,7 @@ fn construct_with_hook(
     new_target: &Value,
     ctor: &NativeCtor,
 ) -> Result<Value, JsError> {
-    let agent = CURRENT_AGENT.with(|slot| *slot.borrow());
+    let agent = CURRENT_AGENT.with(|slot| slot.get());
     let hook = ECMA_HOOK.get().copied();
     match hook {
         Some(hook) if !agent.is_null() => {
