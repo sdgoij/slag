@@ -136,16 +136,32 @@ implement A.
 
 What is left, in order:
 
-1. **C**: give the accessor dispatch the caller's live context. The blocker is
-   that a helper receives only the ctx pointer and the machine code's working
-   stack pointer lives in a register — there is no `sp` field to carve a callee
-   frame above. It needs a `ctx.sp` written by machine code before each
-   re-entering helper call (one store per member read) or an equivalent way to
-   find the live top. That is the actual design work; everything else about C
-   (`try_shared_construct_leaf`'s frame carve, room check, env swap) already
-   exists.
-2. **B** once C is validated: publish the same context more widely so
-   `call_callback` sites benefit, not just accessors.
+1. **C**: give the accessor dispatch the caller's live context. The blocker turned
+   out not to be `sp` but a borrow conflict. `Vm::get_member_name` takes
+   `&self`, the JIT helper holds `let vm = unsafe { &mut *ctx.vm }` across it,
+   and the nested accessor run needs the *same* Vm mutably (`do_call_fast`,
+   `run_jit_leaf`, `stack` growth). Reaching it through an
+   `Agent::live_vm` raw pointer would create a `&mut Vm` while that `&self`
+   borrow is live — aliasing UB under stacked borrows, not a style question.
+2. So C needs `Vm::get_member_name`'s contract to change: instead of invoking
+   the accessor itself, it returns "this getter, this receiver" and the helper —
+   which owns `&mut Vm` — performs the call. That ripples through
+   `get_property`/`put_value` and `function::call`, which cannot take `&mut Vm`
+   today without every `call_callback` caller (all of `builtins/array.rs` and
+   friends) supplying one. That cascade is the work.
+
+### Where the remaining ~80 ns actually is
+
+Estimated from the pieces, for a leaf accessor: `Vm::reset`'s ~45 field stores
+and ~25 `Vec::clear`s plus the pool pop (`take_vm`/`return_vm`) is the largest
+single block, then the leaf segment's `resize`/`reserve`, `with_leaf_run`'s
+registration, `do_call_fast`, and the ~31-field context build (option A,
+worthless on its own). Reusing the caller's Vm would remove the first block —
+roughly 20-25 ns — and nothing else.
+
+That is the sizing that has to be true for C to be worth the cascade: about a
+fifth of the accessor's cost, not the whole 80 ns. Measure it before committing
+to the contract change.
 
 A cheaper intermediate exists and should be measured before either: the
 accessor is 110 ns, a `forEach` callback through the same `try_leaf_call` lane
