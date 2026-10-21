@@ -124,19 +124,35 @@ full scaffolding. A getter read went 146 -> 98 ns (constant body) and
 153 -> 110 ns (reading `this.a`); the corpus moved -2.3% with builtins -11%
 and strings -9%. Non-leaf accessors still fall back to `call` unchanged.
 
-What remains is the ~110 ns against 9.2 ns for a compiled call site, and the
-slices below still apply to it:
+What remains is the ~110 ns against 9.2 ns for a compiled call site.
 
-1. **A**, measured alone: if the accessor read does not move below ~120 ns, the
-   ctx build is not the dominant term and B/C need remeasuring first.
-2. **C** (accessor only) before B: it is the smallest change that reaches the
-   shared lane and the easiest to validate — a getter is a single call, no
-   argument list marshalling.
-3. **B** only once C is validated.
+**Option A (reuse the `JitCallContext`) is dead, measured by inspection.** The
+`run_jit_leaf` "literal" is 31 field stores, and almost every field genuinely
+changes per call (`agent`/`self` pointers, `region_ptr`/`buf_end`, `body`,
+`intrinsics`), so a reused struct would re-issue the same stores. Reuse would
+only avoid the struct's stack space, which costs nothing. The stores are fed by
+L1-hot loads off `agent`, so the whole build is a handful of cycles. Do not
+implement A.
 
-Note that `try_leaf_call` now sits between the two: a further cut could give it
-the caller's context the same way, which is C applied to `call_callback`
-rather than to `function::call`.
+What is left, in order:
+
+1. **C**: give the accessor dispatch the caller's live context. The blocker is
+   that a helper receives only the ctx pointer and the machine code's working
+   stack pointer lives in a register — there is no `sp` field to carve a callee
+   frame above. It needs a `ctx.sp` written by machine code before each
+   re-entering helper call (one store per member read) or an equivalent way to
+   find the live top. That is the actual design work; everything else about C
+   (`try_shared_construct_leaf`'s frame carve, room check, env swap) already
+   exists.
+2. **B** once C is validated: publish the same context more widely so
+   `call_callback` sites benefit, not just accessors.
+
+A cheaper intermediate exists and should be measured before either: the
+accessor is 110 ns, a `forEach` callback through the same `try_leaf_call` lane
+runs at roughly 69 ns per element *including* the iteration, and
+`Function.prototype.call` — which already uses the caller's context — is
+27.5 ns. So `try_leaf_call` itself is about 2.5x the shared-ctx lane, and that
+gap, not the context build, is the target.
 
 ## 6. Traps
 
