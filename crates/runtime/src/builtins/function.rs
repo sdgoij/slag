@@ -401,7 +401,7 @@ fn apply(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsErr
     let this_arg = args.first().cloned().unwrap_or(Value::Undefined);
     let arg_array = args.get(1).cloned().unwrap_or(Value::Undefined);
     if matches!(arg_array.kind(), ValueKind::Undefined | ValueKind::Null) {
-        return match try_leaf_call(agent, &func, this_arg, &[]) {
+        return match try_fast_call(agent, &func, this_arg, &[]) {
             Some(result) => result,
             None => crate::function::call(agent, &func, this_arg, &[]),
         };
@@ -412,7 +412,7 @@ fn apply(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsErr
     // out from under the callee's parameter binding.
     let _stress = crate::ir::StressSuppress::new();
     let arg_list = create_list_from_array_like(agent, &arg_array)?;
-    match try_leaf_call(agent, &func, this_arg, &arg_list) {
+    match try_fast_call(agent, &func, this_arg, &arg_list) {
         Some(result) => result,
         None => crate::function::call(agent, &func, this_arg, &arg_list),
     }
@@ -429,7 +429,7 @@ fn call_method(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value,
     }
     let this_arg = args.first().cloned().unwrap_or(Value::Undefined);
     let rest = args.get(1..).unwrap_or(&[]);
-    match try_leaf_call(agent, &func, this_arg, rest) {
+    match try_fast_call(agent, &func, this_arg, rest) {
         Some(result) => result,
         None => crate::function::call(agent, &func, this_arg, rest),
     }
@@ -453,9 +453,9 @@ pub(crate) struct CallbackVm {
 }
 
 impl CallbackVm {
-    /// Dispatch one callback, reusing the loop's leaf Vm. A callee that is
-    /// not leaf-inlineable takes the general `crate::function::call`,
-    /// unchanged.
+    /// Dispatch one callback: a certified leaf runs on the loop's Vm, a native
+    /// callee runs its own handler/closure, and anything else takes the general
+    /// `crate::function::call`.
     pub(crate) fn call(
         &mut self,
         agent: &mut Agent,
@@ -463,9 +463,15 @@ impl CallbackVm {
         this: Value,
         args: &[Value],
     ) -> Result<Value, JsError> {
+        // The leaf probe comes first: it is the lane every JS callback takes,
+        // so the native probe stays off that path. A builtin callee pays it
+        // once and fails on the `EcmaScript` gate.
         match try_leaf_call_reusing(agent, &mut self.vm, callee, this, args) {
             Some(result) => result,
-            None => crate::function::call(agent, callee, this, args),
+            None => match try_builtin_call(agent, callee, this, args) {
+                Some(result) => result,
+                None => crate::function::call(agent, callee, this, args),
+            },
         }
     }
 
@@ -490,6 +496,73 @@ impl CallbackVm {
             agent.return_vm(vm);
         }
     }
+}
+
+/// The callback lane's native arm: a builtin callee's registered handler (or
+/// its own crux-native closure) is the whole call, so none of `call_inner`'s
+/// scaffolding is needed — no `ecma_functions` lookup, no dispatch-chain
+/// resolution, no `with_agent` frame round trip. The warm verdict comes from
+/// the agent's direct-mapped cell (`Agent::builtin_call_lookup`), which is
+/// what makes a caller-supplied native callback (`forEach(Math.abs)`) cost a
+/// cell probe rather than the two hash lookups and the chain walk the general
+/// path pays per call.
+///
+/// `None` for anything this lane does not cover (a non-builtin callee, a
+/// builtin whose dispatch is not registered or not yet memoized, or a
+/// multi-realm run, where the callee's own realm must become current).
+/// Re-entrancy needs no special case here: a host callback marked re-entrant
+/// may run JS, and a nested run takes its own Vm through `call_inner`, which
+/// is exactly what the general path does for it today.
+pub(crate) fn try_builtin_call(
+    agent: &mut Agent,
+    callee: &Value,
+    this: Value,
+    args: &[Value],
+) -> Option<Result<Value, JsError>> {
+    if agent.realm_count.get() != 1 {
+        return None;
+    }
+    let ValueKind::Function(function) = callee.kind() else {
+        return None;
+    };
+    let crux::function::FunctionKind::Builtin { call, .. } = &function.kind else {
+        return None;
+    };
+    // A termination request stops the next call (the general path checks it in
+    // `call_inner`); a builtin dispatch must not start once it is up.
+    if agent.is_terminating() {
+        return Some(Err(crate::agent::termination_error()));
+    }
+    match agent.builtin_call_lookup(function.id(), call.is_some()) {
+        crate::function::BuiltinCall::Handler { handler, .. } => Some(crux::function::with_agent(
+            agent as *mut Agent as *mut (),
+            || handler(agent, &this, args),
+        )),
+        crate::function::BuiltinCall::Native { .. } => {
+            let native = call.as_ref()?;
+            Some(crux::function::with_agent(
+                agent as *mut Agent as *mut (),
+                || native(&this, args),
+            ))
+        }
+        crate::function::BuiltinCall::Other => None,
+    }
+}
+
+/// The cheap lane for a Rust-initiated call: a certified leaf runs on a pooled
+/// Vm, a builtin callee runs its own handler or closure, and `None` leaves the
+/// caller on the general `crate::function::call`. The leaf probe comes first
+/// so a JS callback does not pay the native probe.
+pub(crate) fn try_fast_call(
+    agent: &mut Agent,
+    callee: &Value,
+    this: Value,
+    args: &[Value],
+) -> Option<Result<Value, JsError>> {
+    if let Some(result) = try_leaf_call(agent, callee, this, args) {
+        return Some(result);
+    }
+    try_builtin_call(agent, callee, this, args)
 }
 
 /// The apply/call builtins' leaf fast path, shared with `function::call_callback`:

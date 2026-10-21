@@ -2073,7 +2073,7 @@ pub(crate) fn call_callback(
     this: Value,
     args: &[Value],
 ) -> Result<Value, JsError> {
-    match crate::builtins::function::try_leaf_call(agent, callee, this, args) {
+    match crate::builtins::function::try_fast_call(agent, callee, this, args) {
         Some(result) => result,
         None => call(agent, callee, this, args),
     }

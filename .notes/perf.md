@@ -15522,3 +15522,28 @@ JS A/B on `scratch/ab/re3` + `scratch/ab/re`, 8 interleaved rounds with the orde
 Gates: `cargo fmt --all -- --check`; `cargo clippy --workspace --all-targets -- -D warnings`; `cargo test --workspace` (38 suites, 0 failed; `regexp` 39); sweeps `built-ins` 23,821 + `language` 23,726 + `annexB` 1,086 + `intl402` 3,365 = 51,998 at 100%; corpus parity 0.
 
 Left in the matcher: `tasks` is still a `Vec` allocated per call and every choice point snapshots the forward path into a fresh `Rc<[Task]>`, which is why a repeat-heavy pattern still allocates 6 times and runs at ~35 ns per character. Eliminating that needs the task stack to be reusable across calls (it borrows the program, so a caller-owned scratch cannot name its lifetime without restructuring `Task` around indices).
+
+## LANDED (2026-10-21): a native callback runs its own closure, not the general call
+
+`forEach(Math.abs)` was 400-500 ns per builtin invocation — 1.5x a *JS* callback through the same lane — and the reason was not the callback machinery but `call_inner`: for a crux-native builtin it looks the id up in the thread-local handler registry (`builtin_handler`) and then in the agent's `builtin_dispatch_cache`, both `HashMap`s, before finally running `native(&this, args)`; `function::call` adds the `with_agent` window around all of it. A per-element callback paid that per element.
+
+`builtins::function::try_builtin_call` asks the agent's direct-mapped `builtin_call_lookup` cell instead — the same verdict `fast_call_core` already uses — and runs the registered `Handler` or the function's own crux-native closure. `Other` (an unregistered or not-yet-memoized dispatch, which the general path resolves and memoizes) and a multi-realm run both fall back to `call`, and a termination request is still observed before dispatch, as in `call_inner`. Re-entrancy needs no special case: a host callback marked re-entrant may run JS, and the nested run takes its own Vm through `call_inner`, which is what the general path does for it today.
+
+Probe order matters. The lane is tried *after* the leaf probe: with the native probe first, every JS callback paid an extra `FunctionKind` load on the callee's heap record and the JS rows moved +2..+9% while the control moved +3.5%. Leaf-first leaves the JS callback path exactly as it was and costs a native callee one failed `EcmaScript` gate.
+
+12 interleaved rounds, order swapped each round, medians:
+
+| row | before | after |
+| --- | ---: | ---: |
+| `[1].forEach(Math.abs)` (100k) | 14.77 ms | **7.10 ms** (-52.0%) |
+| `[1,2,3,4].forEach(Math.abs)` | 50.83 | **11.92** (-76.6%) |
+| `[1,2,3,4].map(Math.abs)` | 52.64 | **23.86** (-54.7%) |
+| `[1,2,3,4].forEach(cb)` (JS callback, control) | 26.11 | 26.30 (+0.7%) |
+| `Map.prototype.forEach` | 23.37 | 24.56 (+5.1% median, +1.2% min; the bare-loop control moved +4.4%) |
+| typed-array `forEach` (JS callback) | 29.77 | 28.98 (-2.7%) |
+
+That is ~127 ns -> ~30 ns per native callback. `.call`/`.apply` with a native target take the same lane (`Math.max.apply(null, xs)`).
+
+Correctness probe (`scratch/ab/natcheck.js`, exits 0 in jit, jitless and under `--gc-stress --gc-verify --nursery-stress`): a native callback that coerces runs `valueOf`; a coercion that throws propagates out of the builtin; arguments are forwarded unchanged (`["10","10","10"].map(parseInt)` gives `[10, NaN, 2]`); `reduce(Math.max)` is `NaN` because reduce passes the index and the array too; `filter(Boolean)`, `some(Number.isFinite)`, `Map`/`Set` forEach, `parseInt.call`, `"abc".charCodeAt.call`, `Array.from(arr, Math.sqrt)`.
+
+Gates: `cargo fmt --all -- --check`; `cargo clippy --workspace --all-targets -- -D warnings`; `cargo test --workspace` (38 suites, 0 failed); sweeps `built-ins` 23,821 + `language` 23,726 + `annexB` 1,086 + `intl402` 3,365 = 51,998 at 100%; corpus parity 0.
