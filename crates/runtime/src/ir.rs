@@ -27434,6 +27434,19 @@ fn collect_expr_captures(
             .exprs
             .iter()
             .all(|e| collect_expr_captures(e, bindings, captured)),
+        // A tagged template calls its tag and evaluates its substitutions
+        // where it appears, so a closure created by either one captures the
+        // body's bindings exactly like a call's callee/arguments. The prepass
+        // must agree with the main scan (`FastScopeScan::expr`), which walks
+        // both: a capture this prepass missed would be laid out as a frame
+        // slot the closure cannot reach.
+        ExprKind::TaggedTemplate { tag, quasi } => {
+            collect_expr_captures(tag, bindings, captured)
+                && quasi
+                    .exprs
+                    .iter()
+                    .all(|expr| collect_expr_captures(expr, bindings, captured))
+        }
         ExprKind::Sequence(exprs) => exprs
             .iter()
             .all(|e| collect_expr_captures(e, bindings, captured)),
@@ -27451,7 +27464,6 @@ fn collect_expr_captures(
         | ExprKind::Super
         | ExprKind::Class(_)
         | ExprKind::PrivateIn { .. }
-        | ExprKind::TaggedTemplate { .. }
         | ExprKind::MetaProperty { .. }
         | ExprKind::ImportCall { .. } => true,
     }
@@ -27797,6 +27809,24 @@ fn closure_expr_allows(
             .exprs
             .iter()
             .all(|e| closure_expr_allows(e, bindings, captured, own)),
+        // A tagged template is a call whose first argument is the template
+        // object: the tag is a callee-like reference and the substitutions are
+        // ordinary expressions, so both walk like a `Call`'s callee/arguments.
+        // A direct `eval` tag keeps the call arm's rejection (a dynamic-scope
+        // callee this walk cannot model).
+        ExprKind::TaggedTemplate { tag, quasi } => {
+            if matches!(
+                &tag.kind,
+                ExprKind::Ident(id) if crux::lookup(*id) == JsString::from_utf8("eval")
+            ) {
+                return false;
+            }
+            closure_expr_allows(tag, bindings, captured, own)
+                && quasi
+                    .exprs
+                    .iter()
+                    .all(|expr| closure_expr_allows(expr, bindings, captured, own))
+        }
         ExprKind::Sequence(exprs) => exprs
             .iter()
             .all(|e| closure_expr_allows(e, bindings, captured, own)),
@@ -27822,10 +27852,10 @@ fn closure_expr_allows(
         // body decides, in `analyze_scope`, whether it can supply `this`: a
         // non-arrow captures it into its context; an arrow reads it from its
         // own outer chain; either is absent -> env path).
-        // `super`/class/private/tagged/import constructs stay rejected even
-        // under `own` — they need machinery this walk does not model (a
-        // class body could capture body bindings through methods the walk
-        // never enters), so such closures still bail the body.
+        // `super`/class/private/import constructs stay rejected even under
+        // `own` — they need machinery this walk does not model (a class body
+        // could capture body bindings through methods the walk never enters),
+        // so such closures still bail the body.
         ExprKind::This => {
             if own {
                 true
@@ -27837,7 +27867,6 @@ fn closure_expr_allows(
         ExprKind::Super
         | ExprKind::Class(_)
         | ExprKind::PrivateIn { .. }
-        | ExprKind::TaggedTemplate { .. }
         | ExprKind::MetaProperty { .. }
         | ExprKind::ImportCall { .. } => false,
     }
@@ -31354,6 +31383,89 @@ fn script_expr_allows(expr: &Expr) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A tagged template's tag and substitution expressions are ordinary
+    /// expressions of the body being scanned, so a closure created by either
+    /// one captures its bindings. The capture prepass skipped the whole
+    /// construct, so a binding it missed was laid out as a frame slot the
+    /// closure could not reach: `(t => x)` threw a ReferenceError at the call.
+    #[test]
+    fn a_tagged_templates_tag_captures_its_bindings() {
+        let mut agent = Agent::new();
+        agent.initialize_host_defined_realm().unwrap();
+        let value = agent
+            .run_script(
+                "(function () {
+                     function f() { var x = 41; return (t => x)`a`; }
+                     return f;
+                 })()",
+            )
+            .expect("the tagged-tag script");
+        let ValueKind::Function(function) = value.kind() else {
+            panic!("the script must return the function");
+        };
+        let record = agent
+            .ecma_functions
+            .get(&function.id())
+            .expect("the function record");
+        assert!(
+            record.ir.as_ref().is_some_and(|ir| ir.scope.is_some()),
+            "a body whose tag is a capturing arrow must still certify"
+        );
+        let result = agent
+            .run_script("(function () { var x = 41; return (t => x)`a`; })()")
+            .expect("the call");
+        assert_eq!(result.as_number(), Some(41.0));
+    }
+
+    /// The same, through a substitution: the closure is created by an argument
+    /// expression, not by the tag.
+    #[test]
+    fn a_tagged_templates_substitution_captures_its_bindings() {
+        let mut agent = Agent::new();
+        agent.initialize_host_defined_realm().unwrap();
+        let result = agent
+            .run_script(
+                "(function () {
+                     var x = 41;
+                     return (function (t, v) { return v(); })`${() => x}`;
+                 })()",
+            )
+            .expect("the tagged-substitution script");
+        assert_eq!(result.as_number(), Some(41.0));
+    }
+
+    /// A tagged template inside a *nested* closure must not uncertify the
+    /// enclosing body: the closure walk bailed on the construct, which sent
+    /// every caller of the containing function down the environment path (~one
+    /// microsecond per call). Its own body compiles separately.
+    #[test]
+    fn a_nested_tagged_template_keeps_the_enclosing_body_certified() {
+        let mut agent = Agent::new();
+        agent.initialize_host_defined_realm().unwrap();
+        let value = agent
+            .run_script(
+                "(function () {
+                     function outer() {
+                         function inner() { var t = (s) => s; return t`a`; }
+                         return inner();
+                     }
+                     return outer;
+                 })()",
+            )
+            .expect("the nested script");
+        let ValueKind::Function(function) = value.kind() else {
+            panic!("the script must return the function");
+        };
+        let record = agent
+            .ecma_functions
+            .get(&function.id())
+            .expect("the function record");
+        assert!(
+            record.ir.as_ref().is_some_and(|ir| ir.scope.is_some()),
+            "a nested tagged template must not uncertify the enclosing body"
+        );
+    }
 
     /// The global slot cache is indexed by the name atom alone (`name &
     /// (GLOBAL_CELLS - 1)`), so two names can share an index. A resolve that

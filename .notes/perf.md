@@ -15665,3 +15665,74 @@ Gates: `cargo fmt --all -- --check`; `cargo clippy --workspace --all-targets -- 
 **What is left in the step, and what it is not.** Ablating `tagged_template` shows the tag call is not the whole cost: with the call replaced by a constant the isolated body still measured ~520 ns, and skipping `get_template_object` saved only ~30 ns. The body *is* compiled — a 1000-iteration loop inside the same body runs at compiled speed (1.07 us against 0.55 us for the same body without the template) — and a 6-argument call through the same argument-vector protocol (`ArgsBase`/`ArgsPush`/`Call`) costs 58 ns, so neither the step handler's own code nor the arg protocol explains it. So ~450 ns remains unaccounted for on the compiled tagged-template path; the next session should start by instrumenting the `Helper::TaggedTemplate` call (and checking whether the step deopts, which `SLAG_JIT_DEOPT_TRACE` did not show but `JIT_DEOPT_COUNT` is not surfaced by the CLI).
 
 Gates: `cargo fmt --all -- --check`; `cargo clippy --workspace --all-targets -- -D warnings`; `cargo test --workspace` (38 suites, 0 failed); sweeps `built-ins` 23,821 + `language` 23,726 + `annexB` 1,086 + `intl402` 3,365 = 51,998 at 100%; corpus parity 0; the native-callback probe exits 0.
+
+## LANDED (2026-10-22): a tagged template is scanned for closure captures
+
+The previous entry left ~450 ns unexplained on the compiled tagged-template path
+of `language/expressions/template-literal/evaluation-order.js`. Instrumenting
+`ir::tagged_template` settled that first: the step itself is cheap.
+
+| phase (per call, timer included) | ns |
+| --- | ---: |
+| `is_callable` | 24.8 |
+| `get_template_object` | 26.7 |
+| the three stack pushes | 26.6 |
+| `do_call_fast` (+ pending completion) | ~117 |
+
+Each delta carries one `Instant::now`, so the step is roughly 120 ns of real
+work, and a tagged template in a compiled loop measures **182 ns/iteration**
+against **9 ns** for a plain call of the same closure (`f`). The step is not the
+row's problem.
+
+What was: **the containing function was never certified**, so every call ran the
+AST env path. `JIT_DUMP_STEPS` diagnostics showed `bench` (the timed function)
+at 22 steps, `certified=false`, and never entering `run_jit_body` at all, while
+the same `bench` without the tagged template in its nested body was 15 steps and
+certified. The conclusion is `analyze_scope`'s closure walkers: `collect_captures`
+is the prepass that decides which bindings a closure captures (and therefore
+which get context slots), and `closure_expr_allows` walks a nested closure's
+body. Both had `ExprKind::TaggedTemplate { .. }` as a leaf — the prepass
+returned `true` (skip it), the closure walk returned `false` (bail the body).
+`FastScopeScan::expr`, the main scan, already walked the tag and the
+substitutions (Cut 78), so the two disagreed.
+
+The prepass skipping it was a **correctness bug**, not just a pessimisation: a
+binding captured only through a tagged template was left in a frame slot the
+closure cannot reach.
+
+```js
+function f() { var x = 41; return (t => x)`a`; }
+f();   // ReferenceError: "x" is not defined   (node: 41)
+```
+
+Both walkers now treat the construct as what it is — a call whose first argument
+is the template object: the tag is a callee-like reference and the substitutions
+are ordinary expressions. The closure walk keeps the `Call` arm's direct-`eval`
+rejection for a tag named `eval`.
+
+12 interleaved rounds, order swapped each round, medians:
+
+| probe | before | after |
+| --- | ---: | ---: |
+| the corpus row | 269.68 ms | **203.88 ms** (-24.4%) |
+| `bench` whose nested body contains a tagged template | 102.29 | **43.45** (-57.5%) |
+| tagged template in one compiled loop (control) | 7.65 | 7.72 (flat) |
+| the for-in row (control, no tagged template) | 481.42 | 477.25 (-0.9%) |
+
+Six interleaved rounds over the full corpus: **2270 -> 2220 ms (-2.21%)**, the
+row itself -17.2%, `calls/closure_capture` -7.6%, `for-in/head-let-fresh-binding-
+per-iteration` -4.3%; the "worst" rows (`strings/search_slice` +13.3%,
+`opcost/array_for_each` +7.8%) contain neither a tagged template nor a nested
+closure on that path and are layout noise on this host. `node
+tools/corpus/bench.js` reports `mismatches=0`, `mean-jitGap=10.43`.
+
+Three regression tests sit beside the walkers: the tag-capture case asserts both
+the value and that the body still certifies, the substitution case covers the
+same capture through an argument expression, and the nested case asserts the
+enclosing body certifies. All three fail on the previous analysis (the first with
+the ReferenceError above).
+
+Gates: `cargo fmt --all -- --check`; `cargo clippy --workspace --all-targets -- -D
+warnings`; `cargo test --workspace` (38 suites, 0 failed); sweeps `built-ins`
+23,821 + `language` 23,726 + `annexB` 1,086 + `intl402` 3,365 = 51,998 at 100%;
+corpus parity 0.
