@@ -1592,6 +1592,17 @@ impl Agent {
         }
     }
 
+    /// Return a Vm to the pool after a leaf run completed normally: the leaf
+    /// machinery has already restored its persistent state, so only the
+    /// handful of fields a leaf can leave dirty are dropped (see
+    /// [`Vm::clean_after_leaf`]) instead of the full `reset`. An error path
+    /// must keep using [`return_vm`](Self::return_vm) — an unwind can leave
+    /// the value stack past the call site.
+    pub(crate) fn return_leaf_vm(&mut self, mut vm: Box<crate::ir::Vm>) {
+        vm.clean_after_leaf();
+        self.vm_pool.push(vm);
+    }
+
     /// Return a Vm to the pool after its run finished (the next run reuses
     /// its Vec capacities and inline frame).
     pub(crate) fn return_vm(&mut self, mut vm: Box<crate::ir::Vm>) {

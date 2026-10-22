@@ -4562,6 +4562,33 @@ impl Vm {
         self.env_stack.reset(lexical_env);
     }
 
+    /// Drop the state a *successful* leaf run can leave behind.
+    ///
+    /// The leaf machinery restores every persistent field it touches — the
+    /// value stack to the call site, `leaf_frame_base`/`offset`, the env
+    /// fields, and on the step/JIT paths `ip`, `strict`, `completion`,
+    /// `chain_short`, `loop_counter`, the array-index stack and `call_args` —
+    /// so what remains is the register lane's accumulator and counters, the
+    /// frame base, the global cached for the compiled fast path, and the
+    /// short-lived stacks. A handful of stores instead of `reset`'s ~45 field
+    /// stores and ~25 clears. The pool relies on two things: a pooled Vm must
+    /// not trace a finished run's values (hence `acc`), and `take_vm` expects
+    /// everything else to already be at `reset`'s values.
+    pub(crate) fn clean_after_leaf(&mut self) {
+        self.stack.clear();
+        self.array_index_stack.clear();
+        self.call_args.clear();
+        self.pending_call = None;
+        self.leaf_frame_base = None;
+        self.leaf_frame_offset = 0;
+        self.global = None;
+        self.globals_unshadowed = false;
+        self.chain_short = false;
+        self.acc = Value::Undefined;
+        self.loop_counter = 0.0;
+        self.loop_num = 0.0;
+    }
+
     /// Reset in place for pooling when no running context is available to
     /// supply an env: keep the Vm's own env and reset everything else.
     pub fn reset_for_pool(&mut self) {

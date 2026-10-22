@@ -15619,3 +15619,29 @@ Measured first, before touching the row: a call to a closure created in the same
 The measurement also kills the premise. For a *capturing* closure the seed recovers only ~10 ns of the 243 ns cold call (`c3`: create + call 167 -> 157 ms per 300k), so the miss path is not what makes a fresh capturing call expensive — the leaf cache stores everything it needs. What remains is the per-call setup the warm path avoids: `calls/closure_capture` proves a capturing closure's *steady-state* call is 42.6 ns (that is the certified-callee lane / leaf run with the callee's env already cached), while a callee that is new every iteration re-enters the slow call with a fresh `environment`. That is the parked Rust-initiated-call problem in `.notes/rust-initiated-call-plan.md`, not a cache-hit problem, and it is worth ~730 ns of the for-in row's 5.1 us per body (three cold capturing calls) — pursue it there, not here.
 
 So the numbers to carry forward: **closure creation 262 ns** (490 when the captured binding is per-iteration), **cold call to a fresh closure 129 ns** (243 if it captures), **warm megamorphic call 42.6 ns**, **stable inlined call 4.5 ns**. The gaps between the last three are the JIT's call lanes, and none of them is a lookup that a cache would fix.
+
+## LANDED (2026-10-21): a leaf Vm returns to the pool without the full reset
+
+`.notes/rust-initiated-call-plan.md` sized the accessor/callback lane's largest single block as the `take_vm`/`return_vm` round trip, and named the *reset* half of it: `Agent::return_vm` calls `Vm::reset`, ~45 field stores and ~25 `Vec::clear`s, because the pool is a GC root and must not trace a finished run's state. That full reset is only necessary for a run that might have left the Vm dirty. A *successful* leaf run restores every persistent field it touches — the value stack to the call site, `leaf_frame_base`/`offset`, `body_context`/`lexical_env`, and on the step/JIT paths `ip`, `strict`, `completion`, `chain_short`, `loop_counter`, the array-index stack and `call_args` — so after one, only a handful of fields can still be dirty: the register lane's `acc` (a GC value) and its two counters, the frame base, the global cached for the compiled fast path, and the short-lived stacks.
+
+`Vm::clean_after_leaf` clears exactly those and `Agent::return_leaf_vm` pools the result; the error path keeps `return_vm`'s full reset, because an unwind can leave the value stack past the call site. `take_vm`'s contract is unchanged: everything it does not re-point is still at `reset`'s values.
+
+16 interleaved rounds, order swapped each round, medians:
+
+| probe | before | after |
+| --- | ---: | ---: |
+| getter read (1M) | 108.70 ms | **98.87 ms** (-9.0%) |
+| accessor, trivial body | 103.64 | **98.42** (-5.0%) |
+| `forEach(cb)` over 4 elements | 25.35 | **23.90** (-5.7%) |
+| `forEach(cb)` over 1 element | 10.81 | **9.93** (-8.1%) |
+| `map(cb)` over 4 elements | 38.95 | **36.69** (-5.8%) |
+| `forEach(Math.abs)` (native, control) | 12.48 | 12.48 (flat) |
+| data property / compiled call / missing property (controls) | — | flat |
+
+Also 12 interleaved rounds on the callback rows alone:  `array_for_each` -5.7%, `map_for_each` -4.7%, `typed_array_for_each` -7.7%. The full corpus, 6 interleaved rounds of medians: **2282 -> 2262 ms (-0.85%)**, best rows `array_for_each` -9.5%, `json_stringify` -5.4%, `closure_capture` -5.3%, `object_keys` -4.7%, `typed_array_for_each` -3.6%, `map_for_each` -3.5%; worst `template-literal/evaluation-order` +3.2%, `array_to_sorted` +3.0%, `regexp_test` +2.8%, `hof_methods` +2.5%, `for_in` +2.2%. Every "worst" row is one this change cannot reach (no leaf call on its path), so those are binary-layout noise, not a regression — the rows that *do* call the lane all move the right way.
+
+GC: `--gc-stress --gc-verify --nursery-stress` on the accessor, callback, typed-array, regexp, generator and native-callback probes exits 0; the pooled Vm's only possible GC value (`acc`) is cleared.
+
+This is not the whole of the plan's block: the remaining half is the *take* side (pop + `rebind`, and the JIT's ~31-field context build, which Option A measured as worthless on its own). Reusing the caller's live Vm would still remove the pool pop, and that is still gated behind the `get_member_name` contract change.
+
+Gates: `cargo fmt --all -- --check`; `cargo clippy --workspace --all-targets -- -D warnings`; `cargo test --workspace` (38 suites, 0 failed); sweeps `built-ins` 23,821 + `language` 23,726 + `annexB` 1,086 + `intl402` 3,365 = 51,998 at 100%; corpus parity 0.

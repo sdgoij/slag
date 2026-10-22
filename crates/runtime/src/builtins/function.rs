@@ -490,10 +490,11 @@ impl CallbackVm {
     /// Hand the Vm back to the pool. Dropping the guard without finishing is
     /// memory-safe and correct (the Vm is deallocated rather than pooled), so
     /// an error path may simply unwind; this keeps the pool's capacity for
-    /// the common completion.
+    /// the common completion. The slot only ever holds a Vm whose last leaf
+    /// run completed, so the cheap cleanup applies.
     pub(crate) fn finish(&mut self, agent: &mut Agent) {
         if let Some(vm) = self.vm.take() {
-            agent.return_vm(vm);
+            agent.return_leaf_vm(vm);
         }
     }
 }
@@ -580,7 +581,7 @@ pub(crate) fn try_leaf_call(
     let mut slot = None;
     let result = try_leaf_call_reusing(agent, &mut slot, func, this_arg, arg_list);
     if let Some(vm) = slot.take() {
-        agent.return_vm(vm);
+        agent.return_leaf_vm(vm);
     }
     result
 }
