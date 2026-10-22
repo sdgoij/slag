@@ -4054,6 +4054,7 @@ extern "C" fn tagged_template(ctx: *mut c_void, tag: u64, this: u64, step: u64) 
     let substitutions = vm.args.split_off(base);
     match crate::ir::tagged_template(
         agent,
+        vm,
         Value::from_bits(this),
         Value::from_bits(tag),
         template,

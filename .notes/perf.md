@@ -15645,3 +15645,23 @@ GC: `--gc-stress --gc-verify --nursery-stress` on the accessor, callback, typed-
 This is not the whole of the plan's block: the remaining half is the *take* side (pop + `rebind`, and the JIT's ~31-field context build, which Option A measured as worthless on its own). Reusing the caller's live Vm would still remove the pool pop, and that is still gated behind the `get_member_name` contract change.
 
 Gates: `cargo fmt --all -- --check`; `cargo clippy --workspace --all-targets -- -D warnings`; `cargo test --workspace` (38 suites, 0 failed); sweeps `built-ins` 23,821 + `language` 23,726 + `annexB` 1,086 + `intl402` 3,365 = 51,998 at 100%; corpus parity 0.
+
+## LANDED (2026-10-22): a tagged template runs its tag on the caller's Vm
+
+`language/expressions/template-literal/evaluation-order.js` is the corpus's second-largest row (294 ms) and its tagged-template step called the tag through `crate::function::call` — the general Rust-initiated path, which builds a pooled Vm, pushes an execution context and re-enters `run_compiled_body` — even though the step handler and the JIT helper both already hold the caller's `Vm`. `ir::tagged_template` now takes that Vm and runs the tag through `do_call_fast` (the compiled call-site lane: a certified leaf runs in place on the caller's stack), completing a withdrawn activation itself because no driver step follows it. `TailTaggedTemplate` already used the caller's Vm.
+
+12 interleaved rounds, order swapped each round, medians:
+
+| probe | before | after |
+| --- | ---: | ---: |
+| the corpus row | 274.16 ms | **267.37 ms** (-2.5%) |
+| `tag\`a${i++}b${i++}c${i++}d\``, tag ignores args | 90.34 | **74.15** (-17.9%) |
+| `return tag\`abcd\`` (tail form) | 71.64 | **64.56** (-9.9%) |
+| `tag\`abcd\`;` (statement form) | 72.39 | **63.67** (-12.0%) |
+| the row's shape: closure + tagged statement | 123.09 | **103.73** (-15.7%) |
+| `return tag\`a${..}b${..}c${..}d\`` | 95.07 | **75.53** (-20.6%) |
+| closure creation / asserts / empty-body controls | — | flat |
+
+**What is left in the step, and what it is not.** Ablating `tagged_template` shows the tag call is not the whole cost: with the call replaced by a constant the isolated body still measured ~520 ns, and skipping `get_template_object` saved only ~30 ns. The body *is* compiled — a 1000-iteration loop inside the same body runs at compiled speed (1.07 us against 0.55 us for the same body without the template) — and a 6-argument call through the same argument-vector protocol (`ArgsBase`/`ArgsPush`/`Call`) costs 58 ns, so neither the step handler's own code nor the arg protocol explains it. So ~450 ns remains unaccounted for on the compiled tagged-template path; the next session should start by instrumenting the `Helper::TaggedTemplate` call (and checking whether the step deopts, which `SLAG_JIT_DEOPT_TRACE` did not show but `JIT_DEOPT_COUNT` is not surfaced by the CLI).
+
+Gates: `cargo fmt --all -- --check`; `cargo clippy --workspace --all-targets -- -D warnings`; `cargo test --workspace` (38 suites, 0 failed); sweeps `built-ins` 23,821 + `language` 23,726 + `annexB` 1,086 + `intl402` 3,365 = 51,998 at 100%; corpus parity 0; the native-callback probe exits 0.

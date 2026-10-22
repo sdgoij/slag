@@ -9251,7 +9251,7 @@ impl Vm {
                     // window (see the tail-call dispatch).
                     let _stress = StressSuppress::new();
                     let substitutions = self.args.split_off(base);
-                    let value = tagged_template(agent, this, tag, template, substitutions)?;
+                    let value = tagged_template(agent, self, this, tag, template, substitutions)?;
                     self.stack.push(value);
                 }
                 Step::TailTaggedTemplate(template) => {
@@ -16472,8 +16472,16 @@ pub(crate) fn object_accessor(
 }
 
 /// TaggedTemplate evaluation (spec 13.3.6.2) for the IR step.
+///
+/// The tag runs on `vm` — the caller's own Vm — so a certified-leaf tag runs
+/// through the call-site lane (`do_call_fast` + the leaf inline) instead of
+/// paying a pooled Vm through `crate::function::call` for every substitution
+/// list. A non-leaf tag withdraws its activation there, which this handler
+/// completes because no driver step follows it (the caller is a step handler
+/// or a JIT helper).
 pub(crate) fn tagged_template(
     agent: &mut Agent,
+    vm: &mut Vm,
     this: Value,
     tag: Value,
     template: &syntax::ast::TemplateLiteral,
@@ -16488,9 +16496,23 @@ pub(crate) fn tagged_template(
     // GetTemplateObject (spec 12.2.9.3): the same parse node yields the same
     // frozen array across calls, via the shared realm/parse-generation cache.
     let template_object = crate::expr::get_template_object(agent, template)?;
-    let mut args = vec![template_object];
-    args.extend(substitutions);
-    crate::function::call(agent, &tag, this, &args)
+    let depth = vm.stack.len();
+    vm.stack.push(this);
+    vm.stack.push(tag);
+    vm.stack.push(template_object);
+    vm.stack.extend_from_slice(&substitutions);
+    vm.do_call_fast(agent, substitutions.len() + 1, false)?;
+    if vm.has_pending_call() {
+        vm.complete_pending_call(agent)?;
+    }
+    let value = vm.stack.pop().ok_or_else(|| {
+        JsError::new(
+            ErrorKind::TypeError,
+            "the template tag produced no result".into(),
+        )
+    })?;
+    debug_assert_eq!(vm.stack.len(), depth);
+    Ok(value)
 }
 
 fn iterator_result_done(agent: &mut Agent, result: &Value) -> Result<bool, JsError> {
