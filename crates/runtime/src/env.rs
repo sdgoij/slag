@@ -390,8 +390,10 @@ pub struct Binding {
     pub strict: bool,
     pub deletable: bool,
     /// Module import indirection (spec 9.2.5 CreateImportBinding): reads
-    /// resolve through to the target binding.
-    pub indirect: Option<(EnvRef, JsString)>,
+    /// resolve through to the target binding. Boxed because it is rare —
+    /// inline, its `JsString` target name made every binding 80 bytes, and a
+    /// per-iteration copy's binding vector is one entry per loop head.
+    pub indirect: Option<Box<(EnvRef, JsString)>>,
     /// A formal parameter or `arguments` binding: the Annex B block-function
     /// hoist (B.3.2.1) must not overwrite it.
     pub parameter: bool,
@@ -427,8 +429,8 @@ impl Trace for Binding {
         if let Some(value) = &self.value {
             value.trace(visit);
         }
-        if let Some((env, _)) = &self.indirect {
-            env.trace(visit);
+        if let Some(indirect) = &self.indirect {
+            indirect.0.trace(visit);
         }
     }
 }
@@ -855,8 +857,8 @@ impl DeclarativeEnv {
                 format!("{:?} is not defined", name.to_string_lossy()),
             )
         })?;
-        if let Some((target, target_name)) = &binding.1.indirect {
-            return target.get_binding_value(target_name, true);
+        if let Some(indirect) = &binding.1.indirect {
+            return indirect.0.get_binding_value(&indirect.1, true);
         }
         match &binding.1.value {
             Some(v) => Ok(*v),
@@ -905,7 +907,7 @@ impl DeclarativeEnv {
                 mutable: false,
                 strict: true,
                 deletable: false,
-                indirect: Some((target, target_name.clone())),
+                indirect: Some(Box::new((target, target_name.clone()))),
                 parameter: false,
             },
         ));

@@ -15863,3 +15863,42 @@ Gates: `cargo fmt --all -- --check`; `cargo clippy --workspace --all-targets -- 
 warnings`; `cargo test --workspace` (38 suites, 0 failed); sweeps `built-ins`
 23,821 + `language` 23,726 + `annexB` 1,086 + `intl402` 3,365 = 51,998 at 100%;
 corpus parity 0.
+
+## LANDED (2026-10-22): a binding is 32 bytes, not 80
+
+The env-record shrink above left the binding vector as the other half of a
+per-iteration copy's cost, and the entry itself was still 80 bytes: the value
+(16), four flags, and `indirect: Option<(EnvRef, JsString)>` — 64 bytes of
+module-import indirection, which a non-module program never has a single one of.
+
+`indirect` is now `Option<Box<(EnvRef, JsString)>>` (one construction site,
+seven readers):
+
+| type | before | after |
+| --- | ---: | ---: |
+| `Binding` | 80 | **32** |
+| a binding entry (name + value) | 128 | **80** |
+
+12 interleaved rounds, order swapped each round, medians:
+
+| probe | before | after |
+| --- | ---: | ---: |
+| the for-in row | 586.37 ms | **540.47** (-7.8%) |
+| per-iteration-env probe (3/body) | 473.36 | **432.93** (-8.5%) |
+| the same row without its asserts | 363.77 | 360.42 (-0.9%) |
+
+Together with the env-record change this is the first double-digit hit on this
+row: 586.37 -> 540.47 ms is -7.8% here, and the record shrink measured -2.8% on
+the same pairing before it. The absolute numbers drift with this host's load; the
+ratios come from the interleaved runs.
+
+What is left of a per-iteration copy (~200 ns after both changes): the arena box
+(`EnvRecord` 112 bytes, `Handle::new` + its collection share), the binding
+vector's one allocation, and the copy. A slot-array variant would remove the
+vector, and `JsString`'s 48 bytes per binding name is the next thing to look at
+in the vector.
+
+Gates: `cargo fmt --all -- --check`; `cargo clippy --workspace --all-targets -- -D
+warnings`; `cargo test --workspace` (38 suites, 0 failed); sweeps `built-ins`
+23,821 + `language` 23,726 + `annexB` 1,086 + `intl402` 3,365 = 51,998 at 100%;
+corpus parity 0.

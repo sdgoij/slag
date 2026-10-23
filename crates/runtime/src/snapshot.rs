@@ -1763,14 +1763,14 @@ fn visit_env(
         // A module import binding is an indirection, so what the walk owes it is
         // the pair a read resolves through: the environment that exports the name
         // and the exported name itself.
-        if let Some((target, target_name)) = &binding.indirect {
-            visit_env(agent, realm, externals, host, *target, objects, serials)?;
+        if let Some(indirect) = &binding.indirect {
+            visit_env(agent, realm, externals, host, indirect.0, objects, serials)?;
             visit(
                 agent,
                 realm,
                 externals,
                 host,
-                Value::String(Handle::new(target_name.clone())),
+                Value::String(Handle::new(indirect.1.clone())),
                 objects,
                 serials,
             )?;
@@ -3382,7 +3382,7 @@ fn write_env(
         );
         body.push(binding_flags(binding));
         match &binding.indirect {
-            Some((target, target_name)) => {
+            Some(indirect) => {
                 // The exported name goes where a value would and the environment
                 // that exports it in the reserved slot: an indirection has no value
                 // of its own, only the pair a read resolves through.
@@ -3391,10 +3391,10 @@ fn write_env(
                     serial_in(
                         realm,
                         serials,
-                        Value::String(Handle::new(target_name.clone())),
+                        Value::String(Handle::new(indirect.1.clone())),
                     ),
                 );
-                write_u32(body, env_serial(realm, *target, serials)?);
+                write_u32(body, env_serial(realm, indirect.0, serials)?);
             }
             None => {
                 write_u32(
@@ -4839,7 +4839,7 @@ impl Builder<'_> {
                         ));
                     };
                     let target = self.env_ref(binding.reserved)?;
-                    Some((target, (*exported).clone()))
+                    Some(Box::new((target, (*exported).clone())))
                 } else {
                     None
                 };
