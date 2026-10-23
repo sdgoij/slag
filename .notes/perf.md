@@ -15804,3 +15804,62 @@ Next, in order: (1) the per-iteration env's storage (above); (2) `EcmaFunction`
 Stage A from `.notes/closure-cost-plan.md` plus the capture-context setup, which
 between them are the other ~26%+; (3) the asserts, which are the largest single
 share but decompose into three fresh-closure calls that (1) and (2) also reach.
+
+## LANDED (2026-10-22): a declarative environment carries its rare state lazily
+
+The PROFILE entry above sized the per-iteration environment by reuse: copying it
+costs 315 ns per iteration, and nothing about the copy is needed beyond a slot
+array. Before writing that variant, the record sizes said something simpler was
+wrong:
+
+| type | bytes |
+| --- | ---: |
+| `EnvRecord` (the box every env allocates) | 160 |
+| `DeclarativeEnv` | 112 |
+| `Binding` (one entry) | 80 |
+| `JsString` | 48 |
+
+A per-iteration environment holding ONE binding therefore allocated a 160-byte
+arena box plus a 128-byte binding vector, both traced. Half of `DeclarativeEnv`
+was two `RefCell<Vec<..>>` that ordinary scopes never touch:
+`disposable_resources` (`using`) and `annex_b_functions` (Annex B block
+hoists). They now live behind one lazily allocated `Box<EnvExtras>`:
+
+| type | before | after |
+| --- | ---: | ---: |
+| `DeclarativeEnv` | 112 | **64** |
+| `EnvRecord` | 160 | **112** |
+| `FunctionEnv` | 152 | **104** |
+| `GlobalEnv` | 128 | **80** |
+
+`Trace for DeclarativeEnv` mirrors `RefCell`'s own rule (a cell borrowed
+mid-collection aborts the sweep rather than panicking). The public surface is
+unchanged: every outside reader already went through `add_`/`has_`/`drain_`
+methods, so only `env.rs` moved.
+
+Measured, 10-12 interleaved rounds with the order swapped each round
+(`slag-base-env.exe` = the previous commit):
+
+| probe | before | after |
+| --- | ---: | ---: |
+| the for-in row | 522.14 / 878.95 ms | 507.54 / 857.20 ms (-2.5%) |
+| per-iteration-env probe (3/body) | 389.08 ms | 366.56 (-5.8%) — flat on a later, 2x slower machine state |
+| `Object.create(null)` + 3 stores, no envs | 326.01 | 320.36 (-1.7%) |
+| 3 capturing closures, no loop (control) | 126.93 | 130.36 (+2.7%, within this host's noise) |
+
+The full corpus was inconclusive on this host at this time: -0.71% and +1.83%
+across two 6-round runs, with single rows swinging +150% in one run and reading
+flat when re-tested in isolation (24 interleaved runs each) — the disk reached
+100% mid-session and the machine's absolute times drifted ~13% between runs. The
+change is landed on the sizes above and on the two probes it can reach, not on a
+corpus total.
+
+What this does NOT do: it does not remove the binding vector, which the reuse
+ablation showed is ~148 of the 315 ns, so the slot-array variant from the PROFILE
+entry is still the way to reach the rest. It also leaves `Binding` at 80 bytes
+for a value plus four flags.
+
+Gates: `cargo fmt --all -- --check`; `cargo clippy --workspace --all-targets -- -D
+warnings`; `cargo test --workspace` (38 suites, 0 failed); sweeps `built-ins`
+23,821 + `language` 23,726 + `annexB` 1,086 + `intl402` 3,365 = 51,998 at 100%;
+corpus parity 0.

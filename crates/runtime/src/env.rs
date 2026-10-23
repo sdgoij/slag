@@ -443,7 +443,16 @@ impl Trace for DeclarativeEnv {
         // aborts the sweep instead of panicking. Tracing the whole `bindings`
         // cell also marks the binding-name keys (flat strings, no edges).
         self.bindings.trace(visit);
-        self.disposable_resources.trace(visit);
+        // Mirrors `RefCell<T>`'s own trace: a cell borrowed mid-collection
+        // (per-allocation `--gc-stress`) aborts the sweep instead of panicking.
+        match self.extras.try_borrow() {
+            Ok(extras) => {
+                if let Some(extras) = &*extras {
+                    extras.trace(visit);
+                }
+            }
+            Err(_) => crux::heap::note_aborted_trace(),
+        }
     }
 }
 
@@ -500,13 +509,11 @@ impl Trace for EnvRecord {
 pub struct DeclarativeEnv {
     pub outer: Option<EnvRef>,
     pub bindings: RefCell<Vec<(JsString, Binding)>>,
-    /// [[DisposableResourceStack]] (spec 9.2.2): populated by `using`
-    /// evaluation and drained by DisposeResources at scope exit.
-    pub disposable_resources: RefCell<Vec<DisposableResource>>,
-    /// Annex B (B.3.2.1): the block-level FunctionDeclarations this block
-    /// hoisted into the variable environment. FunctionDeclaration evaluation
-    /// copies the block binding into the var binding for these names.
-    pub annex_b_functions: RefCell<Vec<JsString>>,
+    /// `using` and Annex B state, allocated on first use. Ordinary scopes —
+    /// every block, every per-iteration copy, every function record — carry
+    /// neither, and the two vectors were half of the record's footprint; the
+    /// record's size is what every environment allocation pays for.
+    extras: RefCell<Option<Box<EnvExtras>>>,
     /// The environment of a catch parameter: direct-eval vars may share the
     /// catch parameter's name (Annex B.3.5), so the eval var-vs-lexical walk
     /// skips it.
@@ -519,43 +526,75 @@ pub struct DeclarativeEnv {
     pub context_transparent: std::cell::Cell<bool>,
 }
 
+#[derive(Debug, Default)]
+struct EnvExtras {
+    /// [[DisposableResourceStack]] (spec 9.2.2): populated by `using`
+    /// evaluation and drained by DisposeResources at scope exit.
+    disposable_resources: Vec<DisposableResource>,
+    /// Annex B (B.3.2.1): the block-level FunctionDeclarations this block
+    /// hoisted into the variable environment. FunctionDeclaration evaluation
+    /// copies the block binding into the var binding for these names.
+    annex_b_functions: Vec<JsString>,
+}
+
+impl Trace for EnvExtras {
+    fn trace(&self, visit: &mut dyn FnMut(GcAny)) {
+        self.disposable_resources.trace(visit);
+        // `annex_b_functions` holds names only — no edges.
+    }
+}
+
 impl DeclarativeEnv {
     pub fn new(outer: Option<EnvRef>) -> Self {
         Self {
             outer,
             bindings: RefCell::new(Vec::new()),
-            disposable_resources: RefCell::new(Vec::new()),
-            annex_b_functions: RefCell::new(Vec::new()),
+            extras: RefCell::new(None),
             is_catch_param: std::cell::Cell::new(false),
             context_transparent: std::cell::Cell::new(false),
         }
     }
 
+    fn with_extras<R>(&self, f: impl FnOnce(&mut EnvExtras) -> R) -> R {
+        let mut extras = self.extras.borrow_mut();
+        f(extras.get_or_insert_with(Default::default))
+    }
+
     /// Record an Annex B (B.3.2.1) var hoist performed from this block.
     pub fn add_annex_b_function(&self, name: JsString) {
-        self.annex_b_functions.borrow_mut().push(name);
+        self.with_extras(|extras| extras.annex_b_functions.push(name));
     }
 
     pub fn annex_b_hoists(&self, name: &JsString) -> bool {
-        self.annex_b_functions.borrow().contains(name)
+        self.extras
+            .borrow()
+            .as_ref()
+            .is_some_and(|extras| extras.annex_b_functions.contains(name))
     }
 
     /// AddDisposableResource (spec 9.3.1): push a `using` resource onto this
     /// environment's disposable-resource stack, drained by DisposeResources
     /// when the scope exits.
     pub fn add_disposable_resource(&self, resource: DisposableResource) {
-        self.disposable_resources.borrow_mut().push(resource);
+        self.with_extras(|extras| extras.disposable_resources.push(resource));
     }
 
     /// Whether the disposable-resource stack is non-empty — the cheap
     /// pre-check before [`Self::drain_disposable_resources`].
     pub fn has_disposable_resources(&self) -> bool {
-        !self.disposable_resources.borrow().is_empty()
+        self.extras
+            .borrow()
+            .as_ref()
+            .is_some_and(|extras| !extras.disposable_resources.is_empty())
     }
 
     /// Take the stack for disposal, leaving the environment with none.
     pub fn drain_disposable_resources(&self) -> Vec<DisposableResource> {
-        std::mem::take(&mut *self.disposable_resources.borrow_mut())
+        self.extras
+            .borrow_mut()
+            .as_mut()
+            .map(|extras| std::mem::take(&mut extras.disposable_resources))
+            .unwrap_or_default()
     }
 
     /// Mark a binding as a formal parameter or `arguments` (the Annex B
