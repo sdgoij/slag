@@ -18,6 +18,11 @@ use crate::realm::Realm;
 
 const REFLECT: &str = "%Reflect%";
 
+/// A ceiling on `CreateListFromArrayLike` results. The spec allows a length up
+/// to 2^53-1; materializing that many arguments would exhaust the host, so the
+/// list is bounded (engines likewise cap the argument count).
+const MAX_LIST_LENGTH: u64 = 1 << 20;
+
 const METHODS: &[(&str, &str, u64)] = &[
     ("apply", "apply", 3),
     ("construct", "construct", 2),
@@ -148,7 +153,13 @@ fn list_from_array_like(agent: &mut Agent, value: &Value) -> Result<Vec<Value>, 
     let length =
         crate::context::get_property(agent, value, &JsString::from_utf8("length"), *value)?;
     let length = to_length(to_number(&length)?);
-    let mut list = Vec::with_capacity(length as usize);
+    if length > MAX_LIST_LENGTH {
+        return Err(JsError::new(
+            ErrorKind::RangeError,
+            "argumentsList is too long".into(),
+        ));
+    }
+    let mut list = Vec::new();
     for index in 0..length {
         let element = crate::context::get_property(
             agent,

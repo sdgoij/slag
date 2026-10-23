@@ -1260,6 +1260,21 @@ mod tests {
     }
 
     #[test]
+    fn a_huge_repeat_over_an_empty_body_terminates() {
+        // The empty iteration consumes nothing; the repeat must not loop to
+        // `u32::MAX` (or push a choice per iteration).
+        let re = compile(
+            "(?:a?){4294967295}"
+                .encode_utf16()
+                .collect::<Vec<u16>>()
+                .as_slice(),
+            f(""),
+        )
+        .unwrap();
+        assert!(re.exec(&[], 0).is_some());
+    }
+
+    #[test]
     fn branching_atom_repeat_does_not_overflow() {
         // The explicit-stack engine iterates even branching repeats
         // (`(a|b)+`, `(a?b)+` are not simple atoms and take the general

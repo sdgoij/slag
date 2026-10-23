@@ -3586,11 +3586,10 @@ pub(crate) fn with_jit_run<T>(vm: &Vm, body: &CompiledBody, f: impl FnOnce() -> 
             body: body as *const CompiledBody,
         });
     });
-    let result = f();
-    ACTIVE_RUNS.with(|stack| {
-        stack.borrow_mut().pop();
-    });
-    result
+    // A panic escaping `f` must still remove the entry: the host may catch it
+    // (`ffi::guard`, the sweep) and collect on a body that was freed.
+    let _guard = ActiveRunGuard;
+    f()
 }
 
 /// Root a pooled Vm running a leaf body for the duration of `f` (GC-2):
@@ -3603,11 +3602,19 @@ pub(crate) fn with_leaf_run<T>(vm: *mut Vm, body: *const CompiledBody, f: impl F
     ACTIVE_RUNS.with(|stack| {
         stack.borrow_mut().push(ActiveRun { vm, body });
     });
-    let result = f();
-    ACTIVE_RUNS.with(|stack| {
-        stack.borrow_mut().pop();
-    });
-    result
+    let _guard = ActiveRunGuard;
+    f()
+}
+
+/// Pops the `ACTIVE_RUNS` entry on every exit path, including unwinding.
+struct ActiveRunGuard;
+
+impl Drop for ActiveRunGuard {
+    fn drop(&mut self) {
+        ACTIVE_RUNS.with(|stack| {
+            stack.borrow_mut().pop();
+        });
+    }
 }
 
 /// The caller's per-activation `Vm` state a nested certified JIT run on the
@@ -24287,6 +24294,12 @@ pub fn max_stack_usage(steps: &[Step]) -> usize {
             Step::PushStr(_) => depth += 1,
             Step::ConcatStr => depth = depth.saturating_sub(2).saturating_add(1),
             Step::ConcatStrConst(_) => {}
+            // A local read pushes its value; closure creation, `new.target`,
+            // and regexp literals each push one too. These are all compiled by
+            // the JIT, so omitting them undercounts the working region.
+            Step::LoadLocal { .. } => depth += 1,
+            Step::CreateFunction { .. } | Step::CreateArrow { .. } => depth += 1,
+            Step::NewTarget | Step::RegExpLiteral { .. } => depth += 1,
             // The fused slot call pops `argc` args (the callee is the
             // frame slot) and pushes the result.
             Step::CallFastSlot { argc, .. } | Step::CallFastGlobal { argc, .. } => {
@@ -24298,6 +24311,9 @@ pub fn max_stack_usage(steps: &[Step]) -> usize {
             Step::CallFastSlotStore { arg_slots, .. }
             | Step::CallFastGlobalStore { arg_slots, .. } => {
                 depth += arg_slots.len();
+                // The materialized arguments are a real peak: sample it before
+                // folding the call and the store back into one slot.
+                max = max.max(depth);
                 depth = depth
                     .saturating_sub(arg_slots.len())
                     .saturating_add(1)

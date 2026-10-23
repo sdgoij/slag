@@ -130,6 +130,10 @@ pub fn remainder(a: &BigInt, b: &BigInt) -> BigInt {
     BigInt(&a.0 % &b.0)
 }
 
+/// The largest BigInt, in bits, that an operation may produce. A larger
+/// result is a `RangeError` rather than a host allocation failure.
+pub const MAX_BIGINT_BITS: u64 = 1 << 30;
+
 /// Left shift by a non-negative count (spec 6.1.6.2.11).
 /// Exponentiation; a negative exponent is a RangeError (spec 6.1.6.2.15).
 pub fn exponentiate(base: &BigInt, exponent: &BigInt) -> Result<BigInt, JsError> {
@@ -142,6 +146,21 @@ pub fn exponentiate(base: &BigInt, exponent: &BigInt) -> Result<BigInt, JsError>
     let exp: u64 = exponent.0.to_str_radix(10).parse().unwrap_or(u64::MAX);
     let exp = u32::try_from(exp)
         .map_err(|_| JsError::new(ErrorKind::RangeError, "Exponent too large".into()))?;
+    // 0, 1, and -1 stay small for any exponent; every other base grows with
+    // the exponent, so reject before `pow` allocates the result.
+    let base_bits = base.0.bits();
+    if base_bits > 1 {
+        let estimate = base_bits
+            .saturating_sub(1)
+            .saturating_mul(u64::from(exp))
+            .saturating_add(1);
+        if estimate > MAX_BIGINT_BITS {
+            return Err(JsError::new(
+                ErrorKind::RangeError,
+                "Maximum BigInt size exceeded".into(),
+            ));
+        }
+    }
     Ok(BigInt(base.0.pow(exp)))
 }
 
@@ -269,6 +288,14 @@ mod tests {
         assert_eq!(exponentiate(&big(-2), &big(3)).unwrap(), big(-8));
         let err = exponentiate(&big(2), &big(-1)).unwrap_err();
         assert_eq!(err.kind, ErrorKind::RangeError);
+    }
+
+    #[test]
+    fn exponentiation_is_bounded() {
+        let err = exponentiate(&big(2), &big(1_500_000_000)).unwrap_err();
+        assert_eq!(err.kind, ErrorKind::RangeError);
+        // A base whose result cannot grow is still allowed.
+        assert_eq!(exponentiate(&big(1), &big(1_500_000_000)).unwrap(), big(1));
     }
 
     #[test]

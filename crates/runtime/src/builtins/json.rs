@@ -23,6 +23,10 @@ const JSON_STRINGIFY: &str = "%JSON.stringify%";
 const JSON_RAW_JSON: &str = "%JSON.rawJSON%";
 const JSON_IS_RAW_JSON: &str = "%JSON.isRawJSON%";
 
+/// A bound on JSON nesting. The recursive parser and serializer otherwise
+/// overflow the native stack on adversarial input, which aborts the host.
+const MAX_JSON_DEPTH: u32 = 1000;
+
 /// One parsed JSON value: the produced language value plus the parse-record
 /// children used by the ES2026 reviver context.
 struct ParseRecord {
@@ -84,6 +88,8 @@ struct JsonParser<'a> {
     /// primitives record no source, objects collect no entries, arrays
     /// collect no element records.
     records: bool,
+    /// Current JSONValue nesting, bounded by [`MAX_JSON_DEPTH`].
+    depth: u32,
 }
 
 impl<'a> JsonParser<'a> {
@@ -146,9 +152,23 @@ impl<'a> JsonParser<'a> {
             .and_then(|value| as_object(&value))
     }
 
+    /// Parse a JSONValue, bounding the nesting depth.
+    fn parse_value(&mut self) -> Result<ParseRecord, JsError> {
+        if self.depth >= MAX_JSON_DEPTH {
+            return Err(JsError::new(
+                ErrorKind::SyntaxError,
+                "JSON nesting is too deep".into(),
+            ));
+        }
+        self.depth += 1;
+        let result = self.parse_value_inner();
+        self.depth -= 1;
+        result
+    }
+
     /// Parse a JSONValue; primitives record the raw source range so the
     /// reviver context can reproduce it.
-    fn parse_value(&mut self) -> Result<ParseRecord, JsError> {
+    fn parse_value_inner(&mut self) -> Result<ParseRecord, JsError> {
         self.skip_ws();
         let start = self.pos;
         let value = match self.text.get(self.pos).copied() {
@@ -483,6 +503,7 @@ fn json_primitive_value(agent: &mut Agent, text: &JsString) -> Result<Option<Val
         pos: 0,
         // A primitive-only parse; the record tree is unused beyond .value.
         records: false,
+        depth: 0,
     };
     let record = match parser.parse_value() {
         Ok(record) => record,
@@ -520,6 +541,7 @@ pub(crate) fn validate_json(agent: &mut Agent, text: &str) -> Result<(), JsError
         pos: 0,
         // Validation only; the parsed value (and its record tree) is discarded.
         records: false,
+        depth: 0,
     };
     parser.parse_value()?;
     parser.skip_ws();
@@ -548,6 +570,7 @@ fn json_parse(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, 
         text: units,
         pos: 0,
         records: is_callable(&reviver),
+        depth: 0,
     };
     let record = parser.parse_value()?;
     parser.skip_ws();
@@ -687,6 +710,8 @@ struct StringifyState {
     property_list: Option<Vec<JsString>>,
     gap: String,
     indent: String,
+    /// Current object/array nesting, bounded by [`MAX_JSON_DEPTH`].
+    depth: u32,
 }
 
 /// JSON.stringify (spec 26.6.3).
@@ -746,6 +771,7 @@ fn json_stringify(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Val
         property_list,
         gap,
         indent: String::new(),
+        depth: 0,
     };
     let wrapper = JsObject::ordinary_object_create(
         agent
@@ -897,8 +923,25 @@ fn serialize_json_property(
     }
 }
 
-/// SerializeJSONObject (spec 26.6.3.4).
+/// SerializeJSONObject (spec 26.6.3.4), bounding the nesting depth.
 fn serialize_json_object(
+    agent: &mut Agent,
+    state: &mut StringifyState,
+    value: &Value,
+) -> Result<Option<JsString>, JsError> {
+    if state.depth >= MAX_JSON_DEPTH {
+        return Err(JsError::new(
+            ErrorKind::RangeError,
+            "JSON nesting is too deep".into(),
+        ));
+    }
+    state.depth += 1;
+    let result = serialize_json_object_inner(agent, state, value);
+    state.depth -= 1;
+    result
+}
+
+fn serialize_json_object_inner(
     agent: &mut Agent,
     state: &mut StringifyState,
     value: &Value,
@@ -977,8 +1020,25 @@ fn serialize_json_object(
     }
 }
 
-/// SerializeJSONArray (spec 26.6.3.5).
+/// SerializeJSONArray (spec 26.6.3.5), bounding the nesting depth.
 fn serialize_json_array(
+    agent: &mut Agent,
+    state: &mut StringifyState,
+    value: &Value,
+) -> Result<Option<JsString>, JsError> {
+    if state.depth >= MAX_JSON_DEPTH {
+        return Err(JsError::new(
+            ErrorKind::RangeError,
+            "JSON nesting is too deep".into(),
+        ));
+    }
+    state.depth += 1;
+    let result = serialize_json_array_inner(agent, state, value);
+    state.depth -= 1;
+    result
+}
+
+fn serialize_json_array_inner(
     agent: &mut Agent,
     state: &mut StringifyState,
     value: &Value,
@@ -1301,4 +1361,28 @@ pub fn dispatch_call(
         return Some(is_raw_json_method(agent, this, args));
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::agent::Agent;
+
+    fn run(source: &str) -> Result<Value, JsError> {
+        let mut agent = Agent::new();
+        agent.initialize_host_defined_realm()?;
+        agent.run_script(source)
+    }
+
+    #[test]
+    fn parse_and_stringify_bound_their_nesting() {
+        assert!(matches!(
+            run("JSON.parse('['.repeat(2000)+']'.repeat(2000))"),
+            Err(e) if e.kind == ErrorKind::SyntaxError
+        ));
+        assert!(matches!(
+            run("let o={},c=o; for(let i=0;i<2000;i++){c.n={};c=c.n} JSON.stringify(o)"),
+            Err(e) if e.kind == ErrorKind::RangeError
+        ));
+    }
 }

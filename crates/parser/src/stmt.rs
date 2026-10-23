@@ -40,7 +40,10 @@ pub(crate) fn parse_statement_with(
     allow_declaration: bool,
     annex_b_function: bool,
 ) -> Result<Stmt, JsError> {
-    let stmt = parse_statement_inner(parser, allow_declaration, annex_b_function)?;
+    parser.enter_nesting()?;
+    let stmt = parse_statement_inner(parser, allow_declaration, annex_b_function);
+    parser.leave_nesting();
+    let stmt = stmt?;
     // A statement ending in `}` (block, function/class declaration, switch,
     // or a body block) is followed by an expression start: the next `/` must
     // lex as a RegularExpressionLiteral, not division (spec 12.1).

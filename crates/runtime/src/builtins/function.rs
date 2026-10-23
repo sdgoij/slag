@@ -758,6 +758,15 @@ pub(crate) fn create_list_from_array_like(
     }
     let length = get_property_key(agent, value, &PropertyKey::from_utf8("length"), *value)?;
     let length = to_length(to_number(&length)?);
+    // The list is built before the call; a `ToLength`-sized preallocation
+    // aborts the process on allocation failure, so cap it at a host-sane
+    // count instead.
+    if length > (1 << 20) {
+        return Err(JsError::new(
+            ErrorKind::RangeError,
+            "too many arguments".into(),
+        ));
+    }
     // Fast path: a dense Array's elements are own data properties in the
     // linear property store, so per-index [[Get]] would be O(n²) (the
     // property-escape fixtures call `String.fromCodePoint.apply(null, …)`

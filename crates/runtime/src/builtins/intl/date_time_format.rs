@@ -1965,7 +1965,13 @@ fn format_field_month(local: &LocalTime, width: u32, ns: &str, calendar: &str) -
     } else {
         &MONTH_NAMES
     };
-    let index = (month - 1) as usize;
+    // Chinese/Dangi leap years have a thirteenth month; the CLDR month-name
+    // tables are the twelve named months, so render the intercalary month
+    // numerically rather than indexing past the table.
+    let index = match month {
+        1..=12 => (month - 1) as usize,
+        _ => return format_number(month, if width == 2 { 2 } else { 1 }, ns),
+    };
     match width {
         1 => format_number(month, 1, ns),
         2 => format_number(month, 2, ns),
@@ -3399,4 +3405,22 @@ fn ordinary_has_instance(agent: &mut Agent, value: &Value) -> bool {
         }
     }
     false
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::agent::Agent;
+
+    #[test]
+    fn a_thirteenth_month_does_not_index_past_the_name_table() {
+        let mut agent = Agent::new();
+        agent.initialize_host_defined_realm().unwrap();
+        let value = agent
+            .run_script(
+                "new Intl.DateTimeFormat('en',{calendar:'chinese',month:'long'}) \
+                 .format(new Date(Date.UTC(2020,5,1)))",
+            )
+            .unwrap();
+        assert!(value.is_string());
+    }
 }

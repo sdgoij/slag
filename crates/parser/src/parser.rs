@@ -66,6 +66,11 @@ pub(crate) struct Scope {
     pub(crate) is_block: bool,
 }
 
+/// The maximum recursive-descent nesting. A hostile source (`'(' * 200_000`)
+/// otherwise overflows the native stack, which aborts the host process and
+/// cannot be caught.
+pub(crate) const MAX_PARSE_DEPTH: u32 = 96;
+
 pub struct Parser<'s> {
     pub(crate) stream: TokenStream<'s>,
     /// The source text, for re-materializing raw slices (e.g. directives).
@@ -118,6 +123,8 @@ pub struct Parser<'s> {
     /// still become patterns: while positive, a pending `cover_error` is not
     /// raised by `parse_assignment` (the enclosing literal decides).
     pub(crate) suppress_cover_raise: usize,
+    /// Current recursive-descent nesting, bounded by [`MAX_PARSE_DEPTH`].
+    pub(crate) depth: u32,
     /// The last consumed token closed a statement (a `}` ending a block,
     /// function/class declaration, or switch): the next token is an
     /// expression start, so `/` must lex as a RegularExpressionLiteral. The
@@ -183,11 +190,30 @@ impl<'s> Parser<'s> {
             in_arrow_cover: false,
             cover_error: None,
             suppress_cover_raise: 0,
+            depth: 0,
             after_statement_brace: false,
             reject_arrow: false,
             scopes: vec![Scope::default()],
             list_vars: HashSet::new(),
         }
+    }
+
+    /// Enter one recursive-descent level, rejecting a source whose nesting
+    /// would overflow the native stack.
+    pub(crate) fn enter_nesting(&mut self) -> Result<(), JsError> {
+        if self.depth >= MAX_PARSE_DEPTH {
+            return Err(JsError::new(
+                crux::ErrorKind::SyntaxError,
+                "Source is nested too deeply".into(),
+            ));
+        }
+        self.depth += 1;
+        Ok(())
+    }
+
+    /// Leave one recursive-descent level.
+    pub(crate) fn leave_nesting(&mut self) {
+        self.depth = self.depth.saturating_sub(1);
     }
 
     /// The UTF-16 code units covered by `span`.

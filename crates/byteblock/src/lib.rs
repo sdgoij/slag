@@ -632,8 +632,9 @@ impl SharedBuffer {
     /// Copy `len` bytes out of the block at `offset` (a plain read; the
     /// caller synchronizes concurrent access).
     pub fn read(&self, offset: usize, len: usize) -> Result<Vec<u8>, OutOfBounds> {
+        let end = offset.checked_add(len).ok_or_else(out_of_bounds)?;
         if let Some(borrowed) = &self.borrowed {
-            if offset + len > borrowed.byte_length {
+            if end > borrowed.byte_length {
                 return Err(out_of_bounds());
             }
             let mut out = vec![0u8; len];
@@ -647,13 +648,13 @@ impl SharedBuffer {
         #[cfg(not(feature = "workers"))]
         {
             let data = self.block.borrow();
-            data.get(offset..offset + len)
+            data.get(offset..end)
                 .map(<[u8]>::to_vec)
                 .ok_or_else(out_of_bounds)
         }
         #[cfg(feature = "workers")]
         {
-            if offset + len > self.byte_length() {
+            if end > self.byte_length() {
                 return Err(out_of_bounds());
             }
             let base = self.block.as_ptr() as *const AtomicU64 as *const u8;
@@ -672,8 +673,9 @@ impl SharedBuffer {
     /// `Vec` would be pure churn). Errors like `read` when the range is out
     /// of bounds.
     pub fn read_into(&self, offset: usize, out: &mut [u8]) -> Result<(), OutOfBounds> {
+        let end = offset.checked_add(out.len()).ok_or_else(out_of_bounds)?;
         if let Some(borrowed) = &self.borrowed {
-            if offset + out.len() > borrowed.byte_length {
+            if end > borrowed.byte_length {
                 return Err(out_of_bounds());
             }
             // SAFETY: bounds-checked above, and the host promised the bytes
@@ -690,13 +692,13 @@ impl SharedBuffer {
         #[cfg(not(feature = "workers"))]
         {
             let data = self.block.borrow();
-            data.get(offset..offset + out.len())
+            data.get(offset..end)
                 .map(|slice| out.copy_from_slice(slice))
                 .ok_or_else(out_of_bounds)
         }
         #[cfg(feature = "workers")]
         {
-            if offset + out.len() > self.byte_length() {
+            if end > self.byte_length() {
                 return Err(out_of_bounds());
             }
             let base = self.block.as_ptr() as *const AtomicU64 as *const u8;
@@ -711,8 +713,9 @@ impl SharedBuffer {
     /// Copy `bytes` into the block at `offset` (a plain write; the caller
     /// synchronizes concurrent access).
     pub fn write(&self, offset: usize, bytes: &[u8]) -> Result<(), OutOfBounds> {
+        let end = offset.checked_add(bytes.len()).ok_or_else(out_of_bounds)?;
         if let Some(borrowed) = &self.borrowed {
-            if offset + bytes.len() > borrowed.byte_length {
+            if end > borrowed.byte_length {
                 return Err(out_of_bounds());
             }
             // SAFETY: bounds-checked above, and the host promised the bytes
@@ -729,7 +732,7 @@ impl SharedBuffer {
         #[cfg(not(feature = "workers"))]
         {
             let mut data = self.block.borrow_mut();
-            let Some(slot) = data.get_mut(offset..offset + bytes.len()) else {
+            let Some(slot) = data.get_mut(offset..end) else {
                 return Err(out_of_bounds());
             };
             slot.copy_from_slice(bytes);
@@ -737,7 +740,7 @@ impl SharedBuffer {
         }
         #[cfg(feature = "workers")]
         {
-            if offset + bytes.len() > self.byte_length() {
+            if end > self.byte_length() {
                 return Err(out_of_bounds());
             }
             let base = self.block.as_ptr() as *const AtomicU64 as *mut u8;
@@ -1105,6 +1108,14 @@ mod tests {
     /// is a shared atomic rather than an `Rc` because under `workers` a block is
     /// `Send` and its deleter may run on another thread; a test whose deleter
     /// contradicted that would be lying about the type it builds.
+    #[test]
+    fn a_wrapping_range_is_out_of_bounds() {
+        let block = SharedBuffer::new(8);
+        assert!(block.read(usize::MAX, 1).is_err());
+        assert!(block.write(usize::MAX, &[1]).is_err());
+        assert!(block.read_into(usize::MAX, &mut [0u8; 1]).is_err());
+    }
+
     #[test]
     fn a_borrowed_block_releases_its_memory_once() {
         let mut host = vec![0u8; 2];

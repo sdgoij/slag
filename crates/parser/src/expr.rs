@@ -47,6 +47,13 @@ pub(crate) fn parse_expression(parser: &mut Parser, allow_in: bool) -> Result<Ex
 /// `AssignmentExpression` (spec 13.15): yield, async arrows, plain arrows,
 /// conditional, and the assignment operators.
 pub(crate) fn parse_assignment(parser: &mut Parser, allow_in: bool) -> Result<Expr, JsError> {
+    parser.enter_nesting()?;
+    let result = parse_assignment_inner(parser, allow_in);
+    parser.leave_nesting();
+    result
+}
+
+fn parse_assignment_inner(parser: &mut Parser, allow_in: bool) -> Result<Expr, JsError> {
     let start = parser.peek()?.span.start;
 
     // Decorated class expressions: `@dec1 @dec2 class { … }`. The decorator

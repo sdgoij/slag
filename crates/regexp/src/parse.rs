@@ -1389,11 +1389,15 @@ impl<'a> Parser<'a> {
         match self.peek() {
             None => Err(self.error("Unterminated character class")),
             Some(0x5B) => {
-                // Nested class: parse it as its own set expression.
+                // Nested class: parse it as its own set expression. The group
+                // depth guard does not cover this recursion, so apply it here
+                // or `[[[[...` overflows the native stack.
                 self.next();
                 let negated = self.eat(0x5E);
-                let class = self.parse_class_set(negated)?;
-                Ok(class)
+                self.push_depth()?;
+                let class = self.parse_class_set(negated);
+                self.pop_depth();
+                class
             }
             Some(0x5C) => {
                 self.next();

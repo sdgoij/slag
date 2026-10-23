@@ -405,6 +405,15 @@ struct Matcher<'a, 'i> {
     /// loop reuses them across position attempts (the continuation is
     /// pattern-determined).
     memo: std::collections::HashMap<(usize, usize), ()>,
+    /// Dispatch steps taken by the current `match_at` attempt.
+    steps: u64,
+    /// Set once a budget is exhausted; the search loop must stop rather than
+    /// retry the next position (each retry would spend the budget again).
+    exhausted: bool,
+    /// Per-attempt dispatch budget. The exponential backtracking case
+    /// (`/(a|aa)+$/`) otherwise runs for hours; a budget proportional to the
+    /// input keeps normal linear scans working.
+    step_limit: u64,
 }
 
 impl<'a, 'i> Matcher<'a, 'i> {
@@ -440,7 +449,15 @@ impl<'a, 'i> Matcher<'a, 'i> {
             choices: Vec::new(),
             pos: 0,
             dir: 1,
+            steps: 0,
+            step_limit: 5_000_000 + (input.len() as u64).saturating_mul(64),
+            exhausted: false,
         }
+    }
+
+    /// Whether a budget (steps or choices) stopped the attempt.
+    fn exhausted(&self) -> bool {
+        self.exhausted
     }
 
     /// Match the whole program from `start`, resetting all matcher state
@@ -448,6 +465,7 @@ impl<'a, 'i> Matcher<'a, 'i> {
     fn match_at(&mut self, start: usize) -> Option<usize> {
         self.pos = start;
         self.dir = 1;
+        self.steps = 0;
         self.tasks.clear();
         self.choices.clear();
         // rollback(0) restores every capture to its initial None: the trail
@@ -459,6 +477,14 @@ impl<'a, 'i> Matcher<'a, 'i> {
 
     fn run(&mut self) -> Option<usize> {
         loop {
+            self.steps += 1;
+            if self.steps > self.step_limit || self.choices.len() > (1 << 22) {
+                // Refuse to spend unbounded time or memory on a pathological
+                // pattern; treat the attempt as a non-match and stop the
+                // enclosing search from retrying at every later position.
+                self.exhausted = true;
+                return None;
+            }
             let task = match self.tasks.pop() {
                 Some(task) => task,
                 None => return Some(self.pos),
@@ -607,13 +633,21 @@ impl<'a, 'i> Matcher<'a, 'i> {
                     // repeat stops here.
                     true
                 } else {
+                    // An empty iteration consumes nothing, so the remaining
+                    // minimum can be satisfied without re-running the body
+                    // up to `u32::MAX` times.
+                    let next_count = if empty {
+                        min.saturating_sub(1)
+                    } else {
+                        count + 1
+                    };
                     let next = if greedy {
                         Task::GreedyRepeat {
                             node,
                             owned,
                             min,
                             max,
-                            count: count + 1,
+                            count: next_count,
                         }
                     } else {
                         Task::LazyRepeat {
@@ -621,7 +655,7 @@ impl<'a, 'i> Matcher<'a, 'i> {
                             owned,
                             min,
                             max,
-                            count: count + 1,
+                            count: next_count,
                         }
                     };
                     self.tasks.push(next);
@@ -1227,6 +1261,9 @@ fn search_loop(
         }
         if let Some(end) = matcher.match_at(index) {
             return Some((index, end));
+        }
+        if matcher.exhausted() {
+            return None;
         }
         if index >= input.len() {
             break;

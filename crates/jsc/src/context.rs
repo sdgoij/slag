@@ -92,9 +92,14 @@ impl JscContext {
     pub fn with_current<T>(&self, body: impl FnOnce() -> T) -> T {
         let ptr = self as *const JscContext as *mut JscContext;
         let previous = CURRENT.with(|slot| slot.replace(ptr));
-        let result = body();
-        CURRENT.with(|slot| slot.replace(previous));
-        result
+        struct RestoreCurrent(*mut JscContext);
+        impl Drop for RestoreCurrent {
+            fn drop(&mut self) {
+                CURRENT.with(|slot| slot.replace(self.0));
+            }
+        }
+        let _restore = RestoreCurrent(previous);
+        body()
     }
 
     /// The current context on this thread, if inside a JSC API call.

@@ -2255,6 +2255,13 @@ mod tests {
     }
 
     #[test]
+    fn deeply_nested_source_is_rejected_not_overflowed() {
+        // 200 levels used to overflow the native stack and abort the process.
+        let source = format!("{}1{}", "(".repeat(200), ")".repeat(200));
+        assert!(parse_script(&source).is_err());
+    }
+
+    #[test]
     fn private_identifiers_require_an_enclosing_class() {
         // AllPrivateIdentifiersValid: a PrivateIdentifier outside any class
         // is a SyntaxError (spec 13.4/13.11), so dynamic function bodies

@@ -1346,6 +1346,10 @@ fn find_last_index(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Va
     find_last_common(agent, this, args, true)
 }
 
+/// A bound on `flat`/`flatMap` recursion. `flat(Infinity)` on a cyclic array
+/// otherwise recurses until the native stack overflows.
+const MAX_FLAT_DEPTH: u32 = 1000;
+
 /// FlattenIntoArray (spec 23.1.3.12.1).
 #[allow(clippy::too_many_arguments)]
 fn flatten_into_array(
@@ -1356,7 +1360,14 @@ fn flatten_into_array(
     start: u64,
     depth: u64,
     mapper: Option<(&Value, &Value)>,
+    recursion: u32,
 ) -> Result<u64, JsError> {
+    if recursion >= MAX_FLAT_DEPTH {
+        return Err(JsError::new(
+            ErrorKind::RangeError,
+            "Maximum call stack size exceeded".into(),
+        ));
+    }
     let mut target_index = start;
     for source_index in 0..source_len {
         let name = key(source_index);
@@ -1382,6 +1393,7 @@ fn flatten_into_array(
                 target_index,
                 depth - 1,
                 None,
+                recursion + 1,
             )?;
         } else {
             target.create_data_property_or_throw(&key(target_index), element)?;
@@ -1403,7 +1415,7 @@ fn flat(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsErro
     };
     let array = array_species_create(agent, &object, 0.0)?;
     let depth = depth_number.max(0.0) as u64;
-    flatten_into_array(agent, &array, &object, source_len, 0, depth, None)?;
+    flatten_into_array(agent, &array, &object, source_len, 0, depth, None, 0)?;
     Ok(Value::Object(array))
 }
 
@@ -1429,6 +1441,7 @@ fn flat_map(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, Js
         0,
         1,
         Some((&mapfn, &this_arg)),
+        0,
     )?;
     Ok(Value::Object(array))
 }
@@ -2140,6 +2153,55 @@ fn some(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsErro
 }
 
 /// SortCompare (spec 23.1.3.29.2).
+/// A stable merge sort with a fallible comparator. `slice::sort_by` panics
+/// when a JS comparator violates a total order — a legal, attacker-reachable
+/// input — so the engine cannot use it directly.
+fn stable_sort_by<T: Copy, F>(items: &mut [T], mut compare: F) -> Result<(), JsError>
+where
+    F: FnMut(&T, &T) -> Result<std::cmp::Ordering, JsError>,
+{
+    let len = items.len();
+    if len < 2 {
+        return Ok(());
+    }
+    let mut src = items.to_vec();
+    let mut dst = items.to_vec();
+    let mut width = 1usize;
+    while width < len {
+        let mut start = 0;
+        while start < len {
+            let mid = (start + width).min(len);
+            let end = (start + width.saturating_mul(2)).min(len);
+            let (mut left, mut right, mut out) = (start, mid, start);
+            while left < mid && right < end {
+                if compare(&src[left], &src[right])? == std::cmp::Ordering::Greater {
+                    dst[out] = src[right];
+                    right += 1;
+                } else {
+                    dst[out] = src[left];
+                    left += 1;
+                }
+                out += 1;
+            }
+            while left < mid {
+                dst[out] = src[left];
+                left += 1;
+                out += 1;
+            }
+            while right < end {
+                dst[out] = src[right];
+                right += 1;
+                out += 1;
+            }
+            start = end;
+        }
+        std::mem::swap(&mut src, &mut dst);
+        width = width.saturating_mul(2);
+    }
+    items.copy_from_slice(&src);
+    Ok(())
+}
+
 fn sort_compare(
     agent: &mut Agent,
     comparefn: &Value,
@@ -2230,24 +2292,12 @@ fn sort_indexed_properties(
             items.push(get(agent, object, &name)?);
         }
     }
-    let mut error: Option<JsError> = None;
-    items.sort_by(|a, b| {
+    stable_sort_by(&mut items, |a, b| {
         // comparefn-stop-after-error.js: no further calls once a comparison
         // returned an abrupt completion.
-        if error.is_some() {
-            return std::cmp::Ordering::Equal;
-        }
-        match sort_compare(agent, comparefn, a, b) {
-            Ok(v) => v.partial_cmp(&0.0).unwrap_or(std::cmp::Ordering::Equal),
-            Err(e) => {
-                error = Some(e);
-                std::cmp::Ordering::Equal
-            }
-        }
-    });
-    if let Some(e) = error {
-        return Err(e);
-    }
+        let value = sort_compare(agent, comparefn, a, b)?;
+        Ok(value.partial_cmp(&0.0).unwrap_or(std::cmp::Ordering::Equal))
+    })?;
     for (j, item) in items.iter().enumerate() {
         set_property(object, &key(j as u64), *item)?;
     }
@@ -4251,5 +4301,24 @@ mod tests {
         // find returns undefined both for a found undefined and for no match.
         assert!(bool("[undefined].find(x => x === undefined) === undefined"));
         assert!(bool("[1, 2].find(x => x > 9) === undefined"));
+    }
+
+    #[test]
+    fn an_inconsistent_comparator_does_not_panic() {
+        assert_eq!(
+            number(
+                "let a=[]; for(let i=0;i<2000;i++)a.push(i); \
+                 a.sort(()=>Math.random()-0.5); a.length"
+            ),
+            2000.0
+        );
+    }
+
+    #[test]
+    fn a_cyclic_flat_throws_instead_of_overflowing() {
+        assert!(matches!(
+            run("let a=[]; a[0]=a; a.flat(Infinity)"),
+            Err(e) if e.kind == ErrorKind::RangeError
+        ));
     }
 }

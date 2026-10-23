@@ -370,7 +370,7 @@ impl<T: Trace> GcBox<T> {
                 // `collect_from_work`) call this slot, so a per-dead-box step
                 // cannot be added to one generation and forgotten in the other.
                 (*payload).request_finalize();
-                if T::DROP_MAY_RELEASE && (*payload).drop_releases_heap() {
+                if T::DROP_MAY_RELEASE || (*payload).drop_releases_heap() {
                     std::ptr::drop_in_place(payload);
                 }
             }

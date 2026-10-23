@@ -7,7 +7,7 @@
 //! the apply/construct traps, and `is_callable`/`is_constructor`/`type_of`
 //! report them accordingly.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 
 use crate::error::{ErrorKind, JsError};
 use crate::function::call as value_call;
@@ -25,6 +25,35 @@ use crate::property::{
 };
 use crate::string::JsString;
 use crate::value::{Value, is_constructor};
+
+/// A trap-less proxy forwards by re-entering the internal method from Rust;
+/// unlike a JS activation, that path has no `stack::enter_js` guard, so a
+/// long proxy chain would overflow the native stack.
+const MAX_FORWARD_DEPTH: u32 = 1000;
+
+thread_local! {
+    static FORWARD_DEPTH: Cell<u32> = const { Cell::new(0) };
+}
+
+struct ForwardGuard;
+
+impl Drop for ForwardGuard {
+    fn drop(&mut self) {
+        FORWARD_DEPTH.with(|depth| depth.set(depth.get().saturating_sub(1)));
+    }
+}
+
+fn enter_forward() -> Result<ForwardGuard, JsError> {
+    let depth = FORWARD_DEPTH.with(Cell::get);
+    if depth >= MAX_FORWARD_DEPTH {
+        return Err(JsError::new(
+            ErrorKind::RangeError,
+            "Maximum call stack size exceeded".into(),
+        ));
+    }
+    FORWARD_DEPTH.with(|slot| slot.set(depth + 1));
+    Ok(ForwardGuard)
+}
 
 /// Creates the `argumentsList` array passed to a proxy trap (spec 7.3.15
 /// CreateArrayFromList): the runtime provides the current realm's
@@ -118,6 +147,7 @@ pub fn proxy_create(target: Value, handler: Value) -> Result<Handle<JsObject>, J
 
 /// [[GetPrototypeOf]] (spec 10.5.1).
 pub fn get_prototype_of(slots: &ProxySlots) -> Result<Option<Handle<JsObject>>, JsError> {
+    let _guard = enter_forward()?;
     let (target, handler) = resolved(slots)?;
     let Some(trap) = value_get_method(&handler, &trap_key("getPrototypeOf"))? else {
         return value_get_prototype_of(&target);
@@ -151,6 +181,7 @@ pub fn set_prototype_of(
     slots: &ProxySlots,
     proto: Option<Handle<JsObject>>,
 ) -> Result<bool, JsError> {
+    let _guard = enter_forward()?;
     let (target, handler) = resolved(slots)?;
     let Some(trap) = value_get_method(&handler, &trap_key("setPrototypeOf"))? else {
         return value_set_prototype_of(&target, proto);
@@ -182,6 +213,7 @@ pub fn set_prototype_of(
 
 /// [[IsExtensible]] (spec 10.5.3).
 pub fn is_extensible(slots: &ProxySlots) -> Result<bool, JsError> {
+    let _guard = enter_forward()?;
     let (target, handler) = resolved(slots)?;
     let Some(trap) = value_get_method(&handler, &trap_key("isExtensible"))? else {
         return value_is_extensible(&target);
@@ -200,6 +232,7 @@ pub fn is_extensible(slots: &ProxySlots) -> Result<bool, JsError> {
 
 /// [[PreventExtensions]] (spec 10.5.4).
 pub fn prevent_extensions(slots: &ProxySlots) -> Result<bool, JsError> {
+    let _guard = enter_forward()?;
     let (target, handler) = resolved(slots)?;
     let Some(trap) = value_get_method(&handler, &trap_key("preventExtensions"))? else {
         return value_prevent_extensions(&target);
@@ -220,6 +253,7 @@ pub fn get_own_property(
     slots: &ProxySlots,
     key: &PropertyKey,
 ) -> Result<Option<Property>, JsError> {
+    let _guard = enter_forward()?;
     let (target, handler) = resolved(slots)?;
     let Some(trap) = value_get_method(&handler, &trap_key("getOwnPropertyDescriptor"))? else {
         return value_get_own_property(&target, key);
@@ -299,6 +333,7 @@ pub fn define_own_property(
     key: &PropertyKey,
     desc: &PropertyDescriptor,
 ) -> Result<bool, JsError> {
+    let _guard = enter_forward()?;
     let (target, handler) = resolved(slots)?;
     let Some(trap) = value_get_method(&handler, &trap_key("defineProperty"))? else {
         return value_define_property(&target, key, desc);
@@ -362,6 +397,7 @@ pub fn define_own_property(
 
 /// [[HasProperty]] (spec 10.5.7).
 pub fn has_property(slots: &ProxySlots, key: &PropertyKey) -> Result<bool, JsError> {
+    let _guard = enter_forward()?;
     let (target, handler) = resolved(slots)?;
     let Some(trap) = value_get_method(&handler, &trap_key("has"))? else {
         return value_has_property(&target, key);
@@ -387,6 +423,7 @@ pub fn has_property(slots: &ProxySlots, key: &PropertyKey) -> Result<bool, JsErr
 
 /// [[Get]] (spec 10.5.8).
 pub fn get(slots: &ProxySlots, key: &PropertyKey, receiver: Value) -> Result<Value, JsError> {
+    let _guard = enter_forward()?;
     let (target, handler) = resolved(slots)?;
     let Some(trap) = value_get_method(&handler, &trap_key("get"))? else {
         return value_get(&target, key, receiver);
@@ -424,6 +461,7 @@ pub fn set(
     value: Value,
     receiver: Value,
 ) -> Result<bool, JsError> {
+    let _guard = enter_forward()?;
     let (target, handler) = resolved(slots)?;
     let Some(trap) = value_get_method(&handler, &trap_key("set"))? else {
         return value_set(&target, key, value, receiver, false);
@@ -456,6 +494,7 @@ pub fn set(
 
 /// [[Delete]] (spec 10.5.10).
 pub fn delete(slots: &ProxySlots, key: &PropertyKey) -> Result<bool, JsError> {
+    let _guard = enter_forward()?;
     let (target, handler) = resolved(slots)?;
     let Some(trap) = value_get_method(&handler, &trap_key("deleteProperty"))? else {
         return value_delete(&target, key);
@@ -485,6 +524,7 @@ pub fn delete(slots: &ProxySlots, key: &PropertyKey) -> Result<bool, JsError> {
 
 /// [[OwnPropertyKeys]] (spec 10.5.11).
 pub fn own_property_keys(slots: &ProxySlots) -> Result<Vec<PropertyKey>, JsError> {
+    let _guard = enter_forward()?;
     let (target, handler) = resolved(slots)?;
     let Some(trap) = value_get_method(&handler, &trap_key("ownKeys"))? else {
         return value_own_property_keys(&target);
@@ -557,6 +597,7 @@ pub fn own_property_keys(slots: &ProxySlots) -> Result<Vec<PropertyKey>, JsError
 /// [[Call]] (spec 10.5.12): only reachable for proxies whose target is
 /// callable; the apply trap receives the argument list as an Array.
 pub fn apply(slots: &ProxySlots, this: Value, args: &[Value]) -> Result<Value, JsError> {
+    let _guard = enter_forward()?;
     let (target, handler) = resolved(slots)?;
     let Some(trap) = value_get_method(&handler, &trap_key("apply"))? else {
         return value_call(&target, this, args);
@@ -568,6 +609,7 @@ pub fn apply(slots: &ProxySlots, this: Value, args: &[Value]) -> Result<Value, J
 /// [[Construct]] (spec 10.5.13): the construct trap receives the argument
 /// list as an Array and must return an object.
 pub fn construct(slots: &ProxySlots, args: &[Value], new_target: &Value) -> Result<Value, JsError> {
+    let _guard = enter_forward()?;
     let (target, handler) = resolved(slots)?;
     if !is_constructor(&target) {
         return Err(JsError::new(
@@ -602,7 +644,15 @@ fn key_value(key: &PropertyKey) -> Value {
 /// every element must be a String or Symbol (spec 7.3.18 step 6.d).
 fn create_list_from_array_like(value: &Value) -> Result<Vec<PropertyKey>, JsError> {
     let length = length_of_array_like(value)?;
-    let mut list = Vec::with_capacity(length as usize);
+    // The trap result is attacker-controlled and `ToLength` can be 2^53-1;
+    // materializing that many keys is a host-memory DoS.
+    if length > (1 << 20) {
+        return Err(JsError::new(
+            ErrorKind::RangeError,
+            "ownKeys trap returned too many keys".into(),
+        ));
+    }
+    let mut list = Vec::new();
     for index in 0..length {
         let element = value_get(value, &PropertyKey::from_utf8(&index.to_string()), *value)?;
         let key = if element.is_string() || element.is_symbol() {
@@ -711,6 +761,18 @@ mod tests {
             .map(|k| k.display_string())
             .collect();
         assert_eq!(names, ["x"]);
+    }
+
+    #[test]
+    fn a_long_trap_less_chain_is_bounded() {
+        let mut proxy = plain_object();
+        for _ in 0..2000 {
+            proxy = proxy_of(proxy, Value::Object(plain_object()));
+        }
+        assert!(matches!(
+            proxy.get(&key("x")),
+            Err(e) if e.kind == ErrorKind::RangeError
+        ));
     }
 
     #[test]

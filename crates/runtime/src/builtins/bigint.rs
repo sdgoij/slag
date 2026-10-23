@@ -109,6 +109,12 @@ fn bigint_construct(agent: &mut Agent, args: &[Value]) -> Result<Value, JsError>
 /// spec 21.2.2.3 BigInt.asIntN(bits, bigint).
 fn as_int_n(agent: &mut Agent, args: &[Value]) -> Result<Value, JsError> {
     let bits = crate::context::to_index(agent, args.first().unwrap_or(&Value::Undefined))?;
+    if bits > crux::bigint::MAX_BIGINT_BITS {
+        return Err(JsError::new(
+            ErrorKind::RangeError,
+            "Maximum BigInt size exceeded".into(),
+        ));
+    }
     let int = to_big_int(agent, args.get(1).unwrap_or(&Value::Undefined))?;
     Ok(Value::BigInt(Handle::new(crux::bigint::as_int_n(
         &int, bits,
@@ -118,6 +124,12 @@ fn as_int_n(agent: &mut Agent, args: &[Value]) -> Result<Value, JsError> {
 /// spec 21.2.2.4 BigInt.asUintN(bits, bigint).
 fn as_uint_n(agent: &mut Agent, args: &[Value]) -> Result<Value, JsError> {
     let bits = crate::context::to_index(agent, args.first().unwrap_or(&Value::Undefined))?;
+    if bits > crux::bigint::MAX_BIGINT_BITS {
+        return Err(JsError::new(
+            ErrorKind::RangeError,
+            "Maximum BigInt size exceeded".into(),
+        ));
+    }
     let int = to_big_int(agent, args.get(1).unwrap_or(&Value::Undefined))?;
     Ok(Value::BigInt(Handle::new(crux::bigint::as_uint_n(
         &int, bits,
@@ -636,5 +648,13 @@ mod tests {
             text("var o = Object(1n); o.valueOf = function () { return 2n; }; String(o != 1n)"),
             "true"
         );
+    }
+
+    #[test]
+    fn as_uint_n_is_bounded() {
+        assert!(matches!(
+            run("BigInt.asUintN(2**40, -1n)"),
+            Err(e) if e.kind == ErrorKind::RangeError
+        ));
     }
 }

@@ -1695,6 +1695,12 @@ impl JsObject {
             }
             elements.extend_from_slice(values);
         }
+        // The array is normally young here, but under a collection between
+        // the create and the extend its slots box can already be old; record
+        // every young element or a minor sweep frees it under the array.
+        for (offset, value) in values.iter().enumerate() {
+            crate::heap::write_barrier_element(&**slots, *value, (start + offset) as u64);
+        }
         let length = (start + values.len()) as f64;
         slots.length.set(length);
         self.write_length_mirror(length);

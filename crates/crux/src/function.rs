@@ -87,12 +87,17 @@ pub fn with_agent<T>(agent: *mut (), body: impl FnOnce() -> T) -> T {
         return body();
     }
     let previous = CURRENT_AGENT.with(|slot| slot.replace(agent));
+    struct RestoreCurrent(*mut ());
+    impl Drop for RestoreCurrent {
+        fn drop(&mut self) {
+            CURRENT_AGENT.with(|slot| slot.replace(self.0));
+        }
+    }
+    let _restore = RestoreCurrent(previous);
     if let Some(hook) = AGENT_ENTER_HOOK.get() {
         hook(agent);
     }
-    let result = body();
-    CURRENT_AGENT.with(|slot| slot.replace(previous));
-    result
+    body()
 }
 
 /// The agent pointer recorded by the innermost active [`with_agent`] window,

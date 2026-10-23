@@ -1687,11 +1687,17 @@ fn set(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsError
             // space is clamped to the live buffer bytes so a resized-shrunk
             // buffer fails cleanly instead of panicking.
             let start = source_slots.byte_offset;
-            let byte_count =
-                typed_array_effective_length(&source_slots) * source_slots.element_type.size();
-            let end = (start + byte_count).min(source_slots.buffer.byte_length());
-            let data = source_slots.buffer.read(start, end - start)?;
-            let dst_start = target_slots.byte_offset + offset * target_slots.element_type.size();
+            let byte_count = typed_array_effective_length(&source_slots)
+                .saturating_mul(source_slots.element_type.size());
+            // A resizable source can shrink below `byte_offset` after the
+            // length was read, so the live end can precede the start.
+            let end = start
+                .saturating_add(byte_count)
+                .min(source_slots.buffer.byte_length());
+            let data = source_slots.buffer.read(start, end.saturating_sub(start))?;
+            let dst_start = target_slots
+                .byte_offset
+                .saturating_add(offset.saturating_mul(target_slots.element_type.size()));
             let count = data
                 .len()
                 .min(target_slots.buffer.byte_length().saturating_sub(dst_start));
