@@ -148,13 +148,16 @@ Fixed and validated in the first remediation pass:
   what CI runs.
 - **M-9** — CI gained a `gc-stress` job (Array built-ins and array expressions
   under `--gc-stress --gc-verify`, the collection class that exposed C-1), a
-  `cargo audit` job pinned to `cargo-audit 0.22.2`, and a Miri job scoped to the
-  lexer and syntax crates. Miri cannot run `crux` (the collector reads the
-  native stack). The `regexp` and `parser` suites both stall in
-  `regexp::engine::fold_class`'s one-time enumeration of the code point space
-  (the parser reaches it through a regexp literal), which
-  `-Zmiri-report-progress` shows still advancing — interpreted cost, not a hang.
-  Fuzzing remains absent.
+  `cargo audit` job pinned to `cargo-audit 0.22.2`, and a Miri job over the
+  lexer and syntax crates that runs only on manual dispatch (a
+  `workflow_dispatch` input), so push/PR runs never wait on it. Miri cannot run
+  `crux` (the collector reads the native stack), and the regexp/parser suites
+  need minutes of interpreted matching per test. Fuzzing remains absent.
+- **Miri investigation (fixed)** — `regexp::fold_class` no longer scans all
+  1,114,112 code points on first use; `crates/regexp/build.rs` emits the reverse
+  fold index at compile time, so the lookup is a binary search over static data
+  with no lazy initialization or global lock, and a test recomputes the scan
+  and compares every entry.
 
 Outstanding from this report: the JSC string/value/object ref namespace, the
 `crates/v8` per-thread realm slot, the Deno build's one-time unlocked reconcile
@@ -216,7 +219,15 @@ suites were excluded from the Miri gate: `crux` needs the native stack, and a
 bounded `parser` run showed `regexp::engine::fold_class` still advancing after
 millions of basic blocks — it enumerates the whole code point space once to
 build the case-folding table, and `parses_literals_and_identifiers` reaches it
-through a regexp literal. The `regexp` suite stalls on the same table.
+through a regexp literal. The `regexp` suite stalled on the same table (since
+removed; see the fold-table entry above).
+
+Validation for the ninth pass: 41 regexp tests (including
+`generated_fold_tables_match_a_runtime_scan`) and 88 parser tests pass in
+release; the RegExp area passes 1,899/1,899 and `*replace*` 212/212; clippy
+(`-D warnings`) and rustfmt are clean. The Miri job now covers the lexer and
+syntax crates and only runs from a manual `workflow_dispatch` with its input
+set, so push/PR runs do not wait on it.
 
 ---
 

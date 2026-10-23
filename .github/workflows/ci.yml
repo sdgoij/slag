@@ -12,6 +12,11 @@ on:
   pull_request:
     branches: [main]
   workflow_dispatch:
+    inputs:
+      miri:
+        description: "Run the Miri job (slow; lexer and syntax only)"
+        type: boolean
+        default: true
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -187,15 +192,15 @@ jobs:
       - name: Audit Cargo.lock
         run: cargo audit
 
-  # Miri is scoped to the front end. `crux`'s conservative collector reads the
-  # native stack, which Miri cannot model. The larger suites are not gated
-  # because both stall in the same place, and it is not a hang:
-  # `-Zmiri-report-progress` shows `regexp::engine::fold_class`, which enumerates
-  # the whole code point space once to build the case-folding table (the parser
-  # test reaches it through a regexp literal). That fixed cost is tens of
-  # millions of interpreted basic blocks.
+  # Manual only: interpreting even the small crates takes minutes, so this is
+  # not on the push/PR path. It covers the lexer and syntax layer, which finish
+  # in seconds. `crux` cannot run under Miri at all (the collector reads the
+  # native stack), and the regexp/parser suites are minutes of interpreted
+  # matching per test — the one-time fold-class table that used to dominate both
+  # is now built at compile time, but the matcher itself is the remaining cost.
   miri:
     name: Miri (front end)
+    if: github.event_name == 'workflow_dispatch' && github.event.inputs.miri == 'true'
     needs: lint
     runs-on: ubuntu-latest
     timeout-minutes: 60
