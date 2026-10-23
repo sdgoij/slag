@@ -188,9 +188,11 @@ jobs:
         run: cargo audit
 
   # Miri is scoped to the front end. `crux`'s conservative collector reads the
-  # native stack, which Miri cannot model, and the parser/regexp suites are too
-  # slow to interpret; the lexer and syntax layers are small, pure, and finish in
-  # seconds, so they are the part that can be a gate.
+  # native stack, which Miri cannot model. The larger suites are not gated: a
+  # bounded run of `-p regexp` did not finish, and `-Zmiri-report-progress`
+  # showed it still executing after millions of basic blocks (interpretation
+  # cost, not a hang); a bounded run of `-p parser` likewise did not finish,
+  # with no diagnosis yet. The lexer and syntax layers finish in seconds.
   miri:
     name: Miri (front end)
     needs: lint

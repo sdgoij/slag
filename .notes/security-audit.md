@@ -150,8 +150,9 @@ Fixed and validated in the first remediation pass:
   under `--gc-stress --gc-verify`, the collection class that exposed C-1), a
   `cargo audit` job pinned to `cargo-audit 0.22.2`, and a Miri job scoped to the
   lexer and syntax crates. Miri cannot run `crux` (the collector reads the
-  native stack) or the parser/regexp suites (too slow to interpret); fuzzing
-  remains absent.
+  native stack); the regexp suite outlasted a bounded run and was shown by
+  `-Zmiri-report-progress` to still be executing (cost, not a hang), and the
+  parser suite outlasted its run without diagnosis. Fuzzing remains absent.
 
 Outstanding from this report: the JSC string/value/object ref namespace, the
 `crates/v8` per-thread realm slot, the Deno build's one-time unlocked reconcile
@@ -209,8 +210,10 @@ is pinned to a 40-hex commit.
 Validation for the eighth pass: `cargo audit` reports no advisories over 134
 crate dependencies (exit 0); `cargo +nightly miri test -p lexer --lib` passes 59
 tests and `-p syntax --lib` passes 11. The `crux`, `parser`, and `regexp`
-suites were measured and excluded from the Miri gate: `crux` needs the native
-stack, and the other two do not finish in a usable time under interpretation.
+suites were excluded from the Miri gate: `crux` needs the native stack; a
+bounded `regexp` run was still executing after 3M basic blocks (so it is
+interpretation cost, not a hang), and `parser` outlasted its bounded run
+without a diagnosis.
 
 ---
 
