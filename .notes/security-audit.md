@@ -143,13 +143,19 @@ Fixed and validated in the first remediation pass:
   silently trusted.
 - **Low** — `padStart`/`padEnd` fill the gap directly into the result buffer
   instead of materializing a second filler copy.
+- **M-8 (actions)** — every workflow `uses:` is pinned to a 40-hex commit with
+  the moving tag kept as a trailing comment, so a retagged action cannot change
+  what CI runs.
+- **M-9 (partial)** — CI gained a `gc-stress` job that runs the Array built-in
+  and array-expression fixtures under `--gc-stress --gc-verify`, the
+  per-allocation collection class that exposed C-1. `cargo audit`, Miri, and
+  fuzzing remain absent.
 
 Outstanding from this report: the JSC string/value/object ref namespace, the
-`crates/v8` per-thread realm slot, GitHub Actions pinned to mutable tags, the
-Deno build's one-time unlocked reconcile (now logged and followed by a locked
-build), and the remaining Medium items (`current_agent_mut` aliasing, eager
-resizable-buffer allocation under `workers`, CI coverage, worker memory
-atomics).
+`crates/v8` per-thread realm slot, the Deno build's one-time unlocked reconcile
+(now logged and followed by a locked build), the remaining Medium items
+(`current_agent_mut` aliasing, eager resizable-buffer allocation under
+`workers`, worker memory atomics), and the `cargo audit`/Miri/fuzzing gap.
 
 Validation for the first pass: `cargo clippy --workspace --all-targets -- -D
 warnings` is clean; `cargo fmt --all -- --check` is clean; 1,062 runtime unit
@@ -192,6 +198,11 @@ Validation for the sixth pass: `python -m py_compile tools/build-deno.py`
 succeeds and `--dry-run` emits `cargo ... build -p deno --locked --release`;
 clippy and rustfmt stay clean; the 24 string unit tests and all 35 `*pad*`
 fixtures pass.
+
+Validation for the seventh pass: the new `gc-stress` commands were run locally
+first — 33 Array built-in fixtures and 25 array-expression fixtures pass under
+`--gc-stress --gc-verify` inside the 15s deadline — and every workflow `uses:`
+is pinned to a 40-hex commit.
 
 ---
 

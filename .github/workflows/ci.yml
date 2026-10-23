@@ -32,14 +32,14 @@ jobs:
       # The pinned submodules are build inputs, not just test data: the
       # `unicode` build script derives the RegExp property-escape tables from
       # the test262 corpus at compile time.
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
           submodules: recursive
       # `rust-toolchain.toml` pins the channel and the clippy/rustfmt
       # components; `rustup show` materialises it and logs what was used.
       - name: Install the pinned toolchain
         run: rustup show
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       - name: Check formatting
         run: cargo fmt --all -- --check
       - name: Clippy
@@ -61,12 +61,12 @@ jobs:
           - name: linux-aarch64
             os: ubuntu-24.04-arm
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
           submodules: recursive
       - name: Install the pinned toolchain
         run: rustup show
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       # One invocation covers every crate, `jsc` included (a workspace member
       # deliberately outside `default-members`): the engine suites, the
       # vendored test262 fixtures, and the wasm decode/validation fixtures.
@@ -102,12 +102,12 @@ jobs:
         os: [ubuntu-latest, windows-latest]
         area: [language, built-ins, annexB, intl402]
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
           submodules: recursive
       - name: Install the pinned toolchain
         run: rustup show
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       # The runner re-execs `target/release/sweep` for every batch, so the
       # measurement has to be the release build of the tree under test.
       - name: Build the sweep runner
@@ -132,13 +132,43 @@ jobs:
             --timeout 30 --recheck-timeout 60 | tee target/sweep-${{ matrix.area }}.txt
       - name: Upload the sweep report
         if: always()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           # The OS belongs in the name: both matrix legs sweep the same area,
           # and an artifact name has to be unique within a workflow run.
           name: sweep-${{ matrix.area }}-${{ matrix.os }}
           path: target/sweep-${{ matrix.area }}.txt
           if-no-files-found: error
+
+  # C-1 (the JIT's working-region undercount) was a use-after-free that only a
+  # per-allocation collection exposes; the conformance sweeps above run without
+  # one. A small Array sample under `--gc-stress --gc-verify` is the regression
+  # gate for that class of bug, and it stays small so it finishes well inside
+  # the local 15s sweep discipline.
+  gc-stress:
+    name: GC stress smoke
+    needs: lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          submodules: recursive
+      - name: Install the pinned toolchain
+        run: rustup show
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+      - name: Build the sweep runner
+        run: cargo build --locked --release -p test262
+      - name: Stress the Array built-ins
+        shell: bash
+        run: |
+          target/release/sweep built-ins --filter "*Array*" --sample 4 \
+            --gc-stress --gc-verify --timeout 15 --recheck-timeout 15
+      - name: Stress the array-expression fixtures
+        shell: bash
+        run: |
+          target/release/sweep language --filter "*array*" --sample 4 \
+            --gc-stress --gc-verify --timeout 15 --recheck-timeout 15
 
   wasm:
     name: WebAssembly conformance (${{ matrix.os }})
@@ -156,12 +186,12 @@ jobs:
       run:
         shell: bash
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
           submodules: recursive
       - name: Install the pinned toolchain
         run: rustup show
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       - name: Build the wasm runner
         run: cargo build --locked --release -p wasmtest
       # The suites cannot share one invocation — duplicate `.wast` names across
@@ -215,14 +245,14 @@ jobs:
       # The pinned test262 submodule is a build input, not just test data: the
       # `unicode` build script derives its tables from the fixtures at compile
       # time.
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
           submodules: recursive
       - name: Install the pinned toolchain
         run: rustup show
       - name: Add the wasm target
         run: rustup target add wasm32-unknown-unknown
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       # On wasm32 the runtime's target tables leave the native Cranelift path
       # out of the graph, so the example needs no feature flags (see the
       # `wasm-compile` note in crates/runtime/Cargo.toml).
@@ -237,9 +267,9 @@ jobs:
             test -s "docs/$file" || { echo "docs/$file is missing or empty" >&2; exit 1; }
           done
       - name: Configure Pages
-        uses: actions/configure-pages@v6
+        uses: actions/configure-pages@45bfe0192ca1faeb007ade9deae92b16b8254a0d # v6
       - name: Upload the site
-        uses: actions/upload-pages-artifact@v5
+        uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5
         with:
           path: docs
 
@@ -260,7 +290,7 @@ jobs:
     steps:
       - name: Deploy
         id: deployment
-        uses: actions/deploy-pages@v5
+        uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5
 
   # Deno built with Slag as its engine on every platform the release ships, then
   # the two tracked embedding harnesses run against each — the only job that
@@ -301,7 +331,7 @@ jobs:
       CARGO_INCREMENTAL: "0"
       DENO_NO_UPDATE_CHECK: "1"
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
           submodules: recursive
       - name: Free disk space (Linux)
@@ -368,7 +398,7 @@ jobs:
           Copy-Item .\deno\target\release\deno.exe, .\LICENSE.md dist/deno/
           Compress-Archive -Path dist/deno/* -DestinationPath "deno-$version-${{ matrix.name }}.zip" -Force
       - name: Upload the Deno package
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: deno-${{ matrix.name }}
           path: deno-*.${{ matrix.ext }}
@@ -395,12 +425,12 @@ jobs:
             os: ubuntu-24.04-arm
             ext: tar.gz
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
           submodules: recursive
       - name: Install the pinned toolchain
         run: rustup show
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       # The CLI's default features are exactly the standard surface (`jit`,
       # `wasm`), so the standard build needs no flags.
       - name: Build the standard binary
@@ -446,7 +476,7 @@ jobs:
           cp target/release/slag README.md LICENSE.md dist/standard/
           tar -czf dist/slag-${{ env.SLAG_VERSION }}-${{ matrix.name }}.tar.gz -C dist/standard .
       - name: Upload the standard package
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           # The artifact name is the archive's name without its version, so the
           # two variants read the same way in the run's artifact list.
@@ -506,7 +536,7 @@ jobs:
           cp target/release/slag README.md LICENSE.md dist/raylib/
           tar -czf dist/slag-raylib-${{ env.SLAG_VERSION }}-${{ matrix.name }}.tar.gz -C dist/raylib .
       - name: Upload the raylib package
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: slag-raylib-${{ matrix.name }}
           path: dist/slag-raylib-${{ env.SLAG_VERSION }}-${{ matrix.name }}.${{ matrix.ext }}
@@ -523,7 +553,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/download-artifact@v8
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           path: dist
           merge-multiple: true
@@ -537,7 +567,7 @@ jobs:
         run: |
           sha256sum *.zip *.tar.gz > SHA256SUMS
           cat SHA256SUMS
-      - uses: softprops/action-gh-release@v3
+      - uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3
         with:
           files: |
             dist/*.zip
