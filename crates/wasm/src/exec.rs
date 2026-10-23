@@ -135,6 +135,12 @@ pub const NATIVE_CALL_DEPTH: usize = 64;
 /// The page size of linear memory, in bytes.
 pub const PAGE_SIZE: u64 = 65536;
 
+/// The host's memory and table allocation ceilings. A declaration beyond
+/// these is a link error at instantiation rather than an allocator abort; a
+/// grow beyond them fails (returns -1), which is the spec's host-limit rule.
+pub const MAX_MEMORY_PAGES: u64 = 1 << 14;
+pub const MAX_TABLE_ELEMENTS: u64 = 1 << 22;
+
 /// A linear memory's bytes: a handle to the shared byte block the runtime can
 /// alias (`Memory.prototype.buffer`), presented as the byte slice the engine
 /// addresses.
@@ -235,21 +241,35 @@ impl Memory {
     /// resizes it in place — every prior SharedArrayBuffer must keep aliasing
     /// the memory — while an unshared memory's block starts at its current
     /// length (a grow moves it, since the old buffer is detached then).
-    pub fn new(min_pages: u64, max_pages: Option<u64>, shared: bool) -> Self {
-        let byte_length = (min_pages * PAGE_SIZE) as usize;
+    pub fn new(min_pages: u64, max_pages: Option<u64>, shared: bool) -> Result<Self, &'static str> {
+        if min_pages > MAX_MEMORY_PAGES {
+            return Err("memory minimum exceeds the host limit");
+        }
+        if shared && max_pages.is_some_and(|max| max > MAX_MEMORY_PAGES) {
+            // A shared memory's block is allocated at the declared maximum.
+            return Err("shared memory maximum exceeds the host limit");
+        }
+        let pages_to_bytes = |pages: u64| -> Result<usize, &'static str> {
+            pages
+                .checked_mul(PAGE_SIZE)
+                .and_then(|bytes| usize::try_from(bytes).ok())
+                .ok_or("memory size overflow")
+        };
+        let byte_length = pages_to_bytes(min_pages)?;
         let capacity = if shared {
             max_pages
-                .map(|max| (max * PAGE_SIZE) as usize)
+                .map(pages_to_bytes)
+                .transpose()?
                 .unwrap_or(byte_length)
                 .max(byte_length)
         } else {
             byte_length
         };
-        Memory {
+        Ok(Memory {
             bytes: MemoryBytes::new(byte_length, capacity),
             max_pages,
             shared,
-        }
+        })
     }
 
     /// The memory's byte block, for an owner that must alias it (the JS-API's
@@ -270,9 +290,9 @@ impl Memory {
         let old = self.pages();
         let new = old.checked_add(delta)?;
         let cap = match self.max_pages {
-            Some(max) => max,
-            None if memory64 => (usize::MAX / PAGE_SIZE as usize) as u64,
-            None => 1 << 16,
+            Some(max) => max.min(MAX_MEMORY_PAGES),
+            None if memory64 => MAX_MEMORY_PAGES,
+            None => MAX_MEMORY_PAGES,
         };
         if new > cap {
             return None;
@@ -298,11 +318,14 @@ pub struct TableInst {
 }
 
 impl TableInst {
-    fn new(min: u64, max: Option<u64>, init: RefValue) -> Self {
-        TableInst {
+    fn new(min: u64, max: Option<u64>, init: RefValue) -> Result<Self, &'static str> {
+        if min > MAX_TABLE_ELEMENTS {
+            return Err("table minimum exceeds the host limit");
+        }
+        Ok(TableInst {
             elements: vec![init; min as usize],
             max,
-        }
+        })
     }
 
     /// Grow by `delta` slots, filling with `init`; returns the old size, or
@@ -311,11 +334,14 @@ impl TableInst {
     fn grow(&mut self, delta: u64, init: RefValue, table64: bool) -> Option<u64> {
         let old = self.elements.len() as u64;
         let new = old.checked_add(delta)?;
-        let cap = self.max.unwrap_or(if table64 {
-            usize::MAX as u64
-        } else {
-            u64::from(u32::MAX)
-        });
+        let cap = self
+            .max
+            .unwrap_or(if table64 {
+                usize::MAX as u64
+            } else {
+                u64::from(u32::MAX)
+            })
+            .min(MAX_TABLE_ELEMENTS);
         if new > cap {
             return None;
         }
@@ -3072,17 +3098,19 @@ impl Store {
 
     /// Register a standalone memory cell (spectest memory); returns its id.
     pub fn memory(&mut self, ty: MemType) -> Result<usize, ExecFail> {
+        let memory = Memory::new(ty.limits.min, ty.limits.max, ty.limits.shared)
+            .map_err(ExecFail::Unsupported)?;
         self.memory_types.push(ty);
-        self.memories
-            .push(Memory::new(ty.limits.min, ty.limits.max, ty.limits.shared));
+        self.memories.push(memory);
         Ok(self.memories.len() - 1)
     }
 
     /// Register a standalone table cell (spectest table); returns its id.
     pub fn table(&mut self, ty: TableType, init: RefValue) -> Result<usize, ExecFail> {
+        let table =
+            TableInst::new(ty.limits.min, ty.limits.max, init).map_err(ExecFail::Unsupported)?;
         self.table_types.push(ty);
-        self.tables
-            .push(TableInst::new(ty.limits.min, ty.limits.max, init));
+        self.tables.push(table);
         Ok(self.tables.len() - 1)
     }
 
@@ -3384,21 +3412,19 @@ impl Store {
                 RefValue::Null
             };
             self.table_types.push(table.ty);
-            self.tables.push(TableInst::new(
-                table.ty.limits.min,
-                table.ty.limits.max,
-                init,
-            ));
+            self.tables.push(
+                TableInst::new(table.ty.limits.min, table.ty.limits.max, init)
+                    .map_err(InstantiateError::Unlinkable)?,
+            );
             tables.push(self.tables.len() - 1);
         }
 
         for memory in &module.memories {
             self.memory_types.push(*memory);
-            self.memories.push(Memory::new(
-                memory.limits.min,
-                memory.limits.max,
-                memory.limits.shared,
-            ));
+            self.memories.push(
+                Memory::new(memory.limits.min, memory.limits.max, memory.limits.shared)
+                    .map_err(InstantiateError::Unlinkable)?,
+            );
             memories.push(self.memories.len() - 1);
         }
 

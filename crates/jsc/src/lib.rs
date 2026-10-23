@@ -212,4 +212,14 @@ pub type JSObjectHasInstanceCallback =
 pub type JSObjectConvertToTypeCallback =
     unsafe extern "C" fn(JSContextRef, JSObjectRef, JSType, *mut JSValueRef) -> JSValueRef;
 
-pub use ffi::guard;
+use ffi::guard as ffi_guard;
+
+/// Run an exported JSC API call with call-depth bookkeeping. A callback that
+/// releases its own context marks it dead; the teardown happens here, at the
+/// outermost boundary, rather than while the call is still using the isolate.
+pub fn guard<R: Default>(f: impl FnOnce() -> R) -> R {
+    context::enter_call();
+    let result = ffi_guard(f);
+    context::leave_call();
+    result
+}

@@ -23,6 +23,10 @@ pub struct JscContext {
     /// `JSGlobalContextCreate`. Used by `JSCallbackData` callbacks.
     #[allow(dead_code)]
     pub data: *mut std::ffi::c_void,
+    /// `JSGlobalContextRetain`/`Release` count. The context is torn down
+    /// with the last reference, deferred to the outermost API boundary when
+    /// a callback releases it while a call is still running.
+    retain_count: Cell<usize>,
 }
 
 impl JscContext {
@@ -35,6 +39,7 @@ impl JscContext {
             isolate,
             api,
             data: std::ptr::null_mut(),
+            retain_count: Cell::new(1),
         });
         let ctx_ptr = &mut *ctx as *mut JscContext;
         LIVE.with(|live| {
@@ -51,6 +56,38 @@ thread_local! {
     /// The context of the innermost JSC API call on this thread; class
     /// callbacks (HostOps) read it to reach their context.
     static CURRENT: Cell<*mut JscContext> = const { Cell::new(std::ptr::null_mut()) };
+    /// Nesting depth of exported JSC calls on this thread.
+    static CALL_DEPTH: Cell<usize> = const { Cell::new(0) };
+    /// Contexts whose last reference was released inside a call; they are
+    /// torn down when the outermost call returns.
+    static PENDING_RELEASES: RefCell<Vec<*mut JscContext>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Enter an exported JSC call.
+pub(crate) fn enter_call() {
+    CALL_DEPTH.with(|depth| depth.set(depth.get() + 1));
+}
+
+/// Leave an exported JSC call; at the outermost boundary, drop contexts whose
+/// last reference was released while a call was in flight.
+pub(crate) fn leave_call() {
+    let depth = CALL_DEPTH.with(|slot| {
+        let next = slot.get().saturating_sub(1);
+        slot.set(next);
+        next
+    });
+    if depth == 0 {
+        let pending = PENDING_RELEASES.with(|pending| std::mem::take(&mut *pending.borrow_mut()));
+        for ctx in pending {
+            remove_context(ctx);
+        }
+    }
+}
+
+fn remove_context(ctx: *mut JscContext) {
+    LIVE.with(|live| {
+        live.borrow_mut().remove(&(ctx as usize));
+    });
 }
 
 impl JscContext {
@@ -62,6 +99,7 @@ impl JscContext {
             isolate,
             api,
             data: std::ptr::null_mut(),
+            retain_count: Cell::new(1),
         });
         let ptr: *mut JscContext = &mut *ctx;
         LIVE.with(|live| live.borrow_mut().insert(ptr as usize, ctx));
@@ -76,11 +114,50 @@ impl JscContext {
         if live { Some(unsafe { &*ctx }) } else { None }
     }
 
-    /// Drop a context, tearing down its isolate.
-    pub fn release(ctx: *mut JscContext) {
+    /// Add one reference to a live context; false when it has been released.
+    pub fn retain(ctx: *mut JscContext) -> bool {
         LIVE.with(|live| {
-            live.borrow_mut().remove(&(ctx as usize));
+            let live = live.borrow();
+            match live.get(&(ctx as usize)) {
+                Some(entry) if entry.retain_count.get() > 0 => {
+                    entry.retain_count.set(entry.retain_count.get() + 1);
+                    true
+                }
+                _ => false,
+            }
+        })
+    }
+
+    /// Drop one reference; the last one tears down the isolate. A release
+    /// from inside a callback is deferred to the outermost API boundary, so
+    /// the call that is still using the context cannot be left on freed
+    /// memory.
+    pub fn release(ctx: *mut JscContext) {
+        let last = LIVE.with(|live| {
+            let live = live.borrow();
+            let Some(entry) = live.get(&(ctx as usize)) else {
+                return false;
+            };
+            let count = entry.retain_count.get();
+            if count > 1 {
+                entry.retain_count.set(count - 1);
+                false
+            } else if count == 1 {
+                // Mark it dead so a second release is a no-op.
+                entry.retain_count.set(0);
+                true
+            } else {
+                false
+            }
         });
+        if !last {
+            return;
+        }
+        if CALL_DEPTH.with(Cell::get) > 0 {
+            PENDING_RELEASES.with(|pending| pending.borrow_mut().push(ctx));
+        } else {
+            remove_context(ctx);
+        }
     }
 
     /// The isolate pointer (the boxed allocation, stable).
@@ -254,7 +331,7 @@ pub unsafe extern "C" fn JSGlobalContextCreateInGroup(
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn JSGlobalContextRetain(ctx: JSGlobalContextRef) -> JSGlobalContextRef {
     crate::guard(|| {
-        if JscContext::get(ctx as *mut JscContext).is_some() {
+        if JscContext::retain(ctx as *mut JscContext) {
             ctx
         } else {
             std::ptr::null_mut()

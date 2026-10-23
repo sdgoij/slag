@@ -77,10 +77,21 @@ Fixed and validated in the first remediation pass:
   restored by `Drop` guards.
 - **H-10** — `SharedBuffer` bounds math uses `checked_add`; the typed-array
   same-type copy uses saturating arithmetic.
+- **H-6** — `wasm::Memory::new`/`TableInst::new` reject declarations above the
+  host caps (1 GiB of memory, 4 Mi elements) with a link error, `grow` caps at
+  the same ceiling, and the JS-API `memory_limits` validates `maximum` as well
+  as `initial`.
+- **H-12** — validation precomputes rec-group ends and the function type index,
+  uses a `HashSet` for duplicate exports, caps types/exports/`array.new_fixed`,
+  and bounds per-body and module-wide local expansion.
+- **C-2 (partial)** — context teardown is deferred to the outermost API
+  boundary and reference-counted, `JSStringGetCharactersPtr` points into a
+  stable boxed string, the property-name accumulator validates its pointer, and
+  string/value retains and `JSValueUnprotect` release their entries.
 
-Outstanding from this report: the JSC C-API lifetime cluster (C-2), WASM
-allocation caps and validation complexity (H-6, H-12), the CLI capability model
-(H-11), and the Medium/Low items.
+Outstanding from this report: JSC finalizer wiring (the `finalize` callback
+still has no caller), the CLI capability model (H-11), the RegExp budget's
+`RangeError` propagation (H-2 follow-up), and the remaining Medium/Low items.
 
 Validation for the first pass: `cargo clippy --workspace --all-targets -- -D
 warnings` is clean; `cargo fmt --all -- --check` is clean; 1,062 runtime unit
@@ -89,6 +100,14 @@ tests and the parser/crux/byteblock/regexp suites pass; the full test262
 `--gc-stress` sample of 159 Array fixtures passes with the verifier on. The
 original PoCs for C-1, H-1, H-3, H-4, H-5, H-7, H-8, H-9, and H-10 no longer
 crash, hang, or trip the GC verifier.
+
+Validation for the second pass: clippy and rustfmt stay clean; the wasm core
+suites pass 64,594 assertions (top-level 20,662; gc 654; multi-memory 912; simd
+25,990; memory64 8,709; bulk-memory 7,485; exceptions 105; relaxed-simd 77),
+the JS-API suite passes 1,001 tests, and the runtime/jsc/ffi tests pass. The
+oversized-memory module now fails instantiation with a `LinkError` naming the
+host limit, `Table.grow(2**32-1)` raises `RangeError`, and growing the string
+table by 2,000 entries leaves `JSStringGetCharactersPtr` stable.
 
 ---
 
@@ -145,7 +164,7 @@ per-element barrier (or a proven young-array fast path) in
 | ID | Location | Defect |
 |---|---|---|
 | C-2.1 | `crates/jsc/src/context.rs:74-84`, `:261-263` | `JSGlobalContextRelease` drops the boxed isolate unconditionally; a callback can release the context it is executing on, and `try_call` continues on freed state. UAF. |
-| C-2.2 | `crates/ffi/src/tables.rs:66-89`, `:139-146`; `crates/crux/src/heap.rs:1497-1521` | Root tables (`VALUE_TABLE`, `STRING_TABLE`, `OBJECTS`) are thread-local while isolates/heaps are per-context. After releasing ctx A and creating ctx B on the same thread, B's mark phase dereferences A's freed boxes. UAF read **and** write. |
+| C-2.2 | `crates/ffi/src/tables.rs:66-89`, `:139-146`; `crates/crux/src/heap.rs:1497-1521` | **Withdrawn during remediation.** The crux heap is thread-local and shared by every agent on the thread, so the thread-local root tables do not outlive the heap; a released context's boxes remain live heap objects. Cross-context handle confusion is still an API-level Medium issue, not a UAF. |
 | C-2.3 | `crates/jsc/src/string.rs:69-77`; `crates/ffi/src/tables.rs:121-126` | `JSStringGetCharactersPtr` returns a pointer into a `HashMap` node. Small strings are stored inline in the value; any later insertion that rehashes/grows the map moves the node and dangles the pointer. |
 | C-2.4 | `crates/jsc/src/object.rs:669-679` | `JSPropertyNameAccumulatorAddName` reconstitutes `&'static mut Vec<JsString>` from any pointer with no registry or liveness check. A forged or stale accumulator is an arbitrary write. |
 | C-2.5 | `crates/jsc/src/context.rs:250-258`; `crates/jsc/src/refs.rs:57-73` | `Retain` is a liveness check, not a refcount; `JSValueUnprotect` never unpins. Two-owner JSC usage frees objects still referenced by the second owner, while `OBJECTS` grows forever. |

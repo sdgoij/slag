@@ -43,7 +43,7 @@ pub unsafe extern "C" fn JSStringCreateWithUTF8CString(string: *const c_char) ->
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn JSStringRetain(string: JSStringRef) -> JSStringRef {
     crate::guard(|| {
-        if string_from_ref(string).is_some() {
+        if ffi::retain_string_ref(string as usize as u64) {
             string
         } else {
             ptr::null_mut()

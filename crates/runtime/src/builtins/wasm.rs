@@ -1367,13 +1367,27 @@ fn memory_limits(
             "'maximum' is smaller than 'initial'".into(),
         ));
     }
+    let host_bytes = crate::builtins::array_buffer::MAX_BYTE_LENGTH as u64;
     if initial
         .checked_mul(wasm::exec::PAGE_SIZE)
-        .is_none_or(|bytes| bytes > crate::builtins::array_buffer::MAX_BYTE_LENGTH as u64)
+        .is_none_or(|bytes| bytes > host_bytes)
     {
         return Err(JsError::new(
             ErrorKind::RangeError,
             "memory exceeds the host's ArrayBuffer limit".into(),
+        ));
+    }
+    // A shared memory allocates its maximum up front, and an unshared grow is
+    // capped at the same ceiling; reject an impossible descriptor instead of
+    // letting the allocation fail at construction.
+    if maximum.is_some_and(|maximum| {
+        maximum
+            .checked_mul(wasm::exec::PAGE_SIZE)
+            .is_none_or(|bytes| bytes > host_bytes)
+    }) {
+        return Err(JsError::new(
+            ErrorKind::RangeError,
+            "memory maximum exceeds the host's ArrayBuffer limit".into(),
         ));
     }
     let shared_value = crate::context::get_property(
@@ -2196,7 +2210,7 @@ pub fn compile_and_instantiate_bytes(
 
 /// A JS-created table's allocation cap (the engine materializes the whole
 /// element vector up front; tables beyond this are far beyond any wasm use).
-const MAX_JS_TABLE_ELEMENTS: u64 = 1 << 28;
+const MAX_JS_TABLE_ELEMENTS: u64 = wasm::exec::MAX_TABLE_ELEMENTS;
 
 fn table_proto(agent: &Agent) -> Result<Handle<JsObject>, JsError> {
     agent
@@ -2858,12 +2872,11 @@ fn instantiate_module(
     };
     let instance_id = match instantiated {
         Ok(id) => id,
-        Err(_) => {
+        Err(error) => {
             memory_buffers_reconcile(agent)?;
             return Err(link_failure(
                 agent,
-                "module instantiation failed (only exported-wasm-function and \
-                 WebAssembly.Memory imports are supported in Cut 10 wave 3b slice 1)",
+                &format!("module instantiation failed: {error}"),
             )?);
         }
     };

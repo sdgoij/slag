@@ -12,6 +12,8 @@ use crux::value::Value;
 pub struct Table<T> {
     next: Cell<u64>,
     entries: RefCell<HashMap<u64, T>>,
+    /// Reference counts, so `Retain`/`Release` pairs behave like JSC's.
+    counts: RefCell<HashMap<u64, usize>>,
 }
 
 impl<T> Default for Table<T> {
@@ -19,6 +21,7 @@ impl<T> Default for Table<T> {
         Self {
             next: Cell::new(1),
             entries: RefCell::new(HashMap::new()),
+            counts: RefCell::new(HashMap::new()),
         }
     }
 }
@@ -29,7 +32,40 @@ impl<T> Table<T> {
         let id = self.next.get();
         self.next.set(id + 1);
         self.entries.borrow_mut().insert(id, value);
+        self.counts.borrow_mut().insert(id, 1);
         id
+    }
+
+    /// Add one reference to a live entry; false when the id is not live.
+    pub fn retain(&self, id: u64) -> bool {
+        if !self.entries.borrow().contains_key(&id) {
+            return false;
+        }
+        if let Some(count) = self.counts.borrow_mut().get_mut(&id) {
+            *count += 1;
+        }
+        true
+    }
+
+    /// Drop one reference; the entry is removed with its last reference.
+    pub fn release(&self, id: u64) {
+        let last = {
+            let mut counts = self.counts.borrow_mut();
+            match counts.get_mut(&id) {
+                Some(count) if *count > 1 => {
+                    *count -= 1;
+                    false
+                }
+                Some(_) => {
+                    counts.remove(&id);
+                    true
+                }
+                None => false,
+            }
+        };
+        if last {
+            self.entries.borrow_mut().remove(&id);
+        }
     }
 
     /// The stored value, if the id is live.
@@ -45,9 +81,10 @@ impl<T> Table<T> {
         self.entries.borrow().contains_key(&id)
     }
 
-    /// Drop the stored value.
+    /// Drop the stored value unconditionally.
     pub fn remove(&self, id: u64) {
         self.entries.borrow_mut().remove(&id);
+        self.counts.borrow_mut().remove(&id);
     }
 }
 
@@ -63,11 +100,27 @@ impl<T: Trace> Table<T> {
     }
 }
 
+/// A string kept in its own allocation, so `JSStringGetCharactersPtr` can
+/// hand out a pointer that survives table rehashing and insertion.
+struct StableString(Box<JsString>);
+
+impl Clone for StableString {
+    fn clone(&self) -> Self {
+        Self(self.0.clone())
+    }
+}
+
+impl Trace for StableString {
+    fn trace(&self, visit: &mut dyn FnMut(crux::heap::GcAny)) {
+        self.0.trace(visit);
+    }
+}
+
 thread_local! {
     /// JS values held by the host (JSValueRef).
     static VALUE_TABLE: Table<Value> = Table::default();
     /// JS strings held by the host (JSStringRef).
-    static STRING_TABLE: Table<JsString> = Table::default();
+    static STRING_TABLE: Table<StableString> = Table::default();
     /// Whether this thread has registered its tables with the collector. A
     /// thread-local because the tables are: a worker thread's refs root that
     /// thread's heap and no other.
@@ -101,33 +154,44 @@ pub fn value(id: u64) -> Option<Value> {
 
 /// Release a retained value.
 pub fn release_value(id: u64) {
-    VALUE_TABLE.with(|table| table.remove(id));
+    VALUE_TABLE.with(|table| table.release(id));
+}
+
+/// Add a reference to a live value ref, for `JSValueProtect`.
+pub fn retain_value_ref(id: u64) -> bool {
+    VALUE_TABLE.with(|table| table.retain(id))
 }
 
 /// Retain a string, returning its host-visible id.
 pub fn retain_string(string: JsString) -> u64 {
     register_tables();
-    STRING_TABLE.with(|table| table.insert(string))
+    STRING_TABLE.with(|table| table.insert(StableString(Box::new(string))))
+}
+
+/// Add a reference to a live string ref, for `JSStringRetain`.
+pub fn retain_string_ref(id: u64) -> bool {
+    STRING_TABLE.with(|table| table.retain(id))
 }
 
 /// The retained string for `id`, if live.
 pub fn string(id: u64) -> Option<JsString> {
-    STRING_TABLE.with(|table| table.get(id))
+    STRING_TABLE.with(|table| table.get(id).map(|entry| (*entry.0).clone()))
 }
 
-/// Run `f` with the retained string for `id`, without cloning it (the
+/// Run `f` with the retained string for `id`, without cloning it. The
 /// pointer returned from such a borrow stays valid while the ref is
-/// retained).
+/// retained: the string lives in its own `Box`, which a table rehash only
+/// moves as a pointer.
 pub fn with_string<R>(id: u64, f: impl FnOnce(&JsString) -> R) -> Option<R> {
     STRING_TABLE.with(|table| {
         let entries = table.entries.borrow();
-        entries.get(&id).map(f)
+        entries.get(&id).map(|entry| f(&entry.0))
     })
 }
 
 /// Release a retained string.
 pub fn release_string(id: u64) {
-    STRING_TABLE.with(|table| table.remove(id));
+    STRING_TABLE.with(|table| table.release(id));
 }
 
 /// Make this thread's tables roots for the collector, once.
@@ -165,6 +229,32 @@ mod tests {
         assert_ne!(a, b);
         release_value(a);
         release_value(b);
+    }
+
+    #[test]
+    fn refcounts_keep_an_entry_until_the_last_release() {
+        let id = retain_value(Value::Number(1.0));
+        assert!(retain_value_ref(id));
+        release_value(id);
+        assert_eq!(value(id), Some(Value::Number(1.0)));
+        release_value(id);
+        assert_eq!(value(id), None);
+    }
+
+    #[test]
+    fn a_string_pointer_survives_table_growth() {
+        let id = retain_string(JsString::from_utf8("abc"));
+        let pointer = with_string(id, |string| string.as_slice().as_ptr()).unwrap();
+        for index in 0..2000 {
+            let extra = retain_string(JsString::from_utf8(&format!("filler-{index}")));
+            release_string(extra);
+        }
+        assert_eq!(
+            with_string(id, |string| string.as_slice().as_ptr()),
+            Some(pointer),
+            "the characters pointer moved when the table grew"
+        );
+        release_string(id);
     }
 
     #[test]

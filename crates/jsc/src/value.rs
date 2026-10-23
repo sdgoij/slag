@@ -373,8 +373,8 @@ pub unsafe extern "C" fn JSValueToObject(
 /// JSValueProtect: values handed to the host are already strongly held, so
 /// this is a no-op (divergence: refs never dangle).
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn JSValueProtect(_ctx: JSContextRef, _value: JSValueRef) {
-    crate::guard(|| {})
+pub unsafe extern "C" fn JSValueProtect(_ctx: JSContextRef, value: JSValueRef) {
+    crate::guard(|| refs::protect_value_ref(value))
 }
 
 /// JSValueToStringWithContext: converts a JSValue to a string in the

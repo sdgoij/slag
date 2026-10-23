@@ -19,6 +19,12 @@ use crate::types::{
     StorageType, TableType, ValType,
 };
 
+/// Bounds on the module structures the validator walks, so a small hostile
+/// module cannot make validation superlinear.
+const MAX_TYPES: usize = 1 << 14;
+const MAX_EXPORTS: usize = 1 << 14;
+const MAX_ARRAY_NEW_FIXED: u32 = 1 << 20;
+
 /// A validation error. Messages mirror the spec's diagnostics where they are
 /// stable; the runner only needs the invalid-vs-malformed split for now.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -48,6 +54,9 @@ struct Spaces<'a> {
     /// Full function index space (imports first, then module functions),
     /// with each entry's resolved signature.
     funcs: Vec<FuncType>,
+    /// The declared type index of each function, parallel to `funcs`; a
+    /// direct index instead of a per-call import-chain walk.
+    func_types: Vec<u32>,
     /// Full global index space with the *global type* of each entry.
     globals: Vec<GlobalType>,
     /// Number of imported globals (constant exprs may only read those).
@@ -86,8 +95,34 @@ fn build_spaces(module: &Module) -> Result<Spaces<'_>, Error> {
     // A type definition may only reference types of its own rec group or of
     // earlier (already closed) groups, so the scope bound is the group end.
     let type_count = module.types.len();
+    if type_count > MAX_TYPES {
+        return Err(Error::Invalid("too many types"));
+    }
+    // A group's end, for every member, in one pass. `rec_group_end` scans the
+    // group list from the start, so calling it per type is quadratic.
+    let mut group_ends = vec![0u32; type_count];
+    if module.rec_groups.is_empty() {
+        for (index, end) in group_ends.iter_mut().enumerate() {
+            *end = index as u32 + 1;
+        }
+    } else {
+        let mut start = 0usize;
+        for &length in &module.rec_groups {
+            let end = start + length as usize;
+            if end > type_count {
+                return Err(Error::Invalid("type group length"));
+            }
+            for slot in &mut group_ends[start..end] {
+                *slot = end as u32;
+            }
+            start = end;
+        }
+        if start != type_count {
+            return Err(Error::Invalid("type group length"));
+        }
+    }
     for (index, ty) in module.types.iter().enumerate() {
-        let group_end = module.rec_group_end(index as u32) as usize;
+        let group_end = group_ends[index] as usize;
         // `sub` well-formedness (spec K-sub). The supertype list is unbounded
         // in the binary format, so the "at most one" rule lives here rather
         // than in the decoder.
@@ -131,6 +166,7 @@ fn build_spaces(module: &Module) -> Result<Spaces<'_>, Error> {
     }
 
     let mut funcs = Vec::new();
+    let mut func_types = Vec::new();
     let mut tables = Vec::new();
     let mut memories = Vec::new();
     let mut globals = Vec::new();
@@ -139,6 +175,7 @@ fn build_spaces(module: &Module) -> Result<Spaces<'_>, Error> {
         match &import.desc {
             ImportDesc::Func(type_index) => {
                 funcs.push(type_at(module, *type_index)?);
+                func_types.push(*type_index);
             }
             ImportDesc::Table(ty) => {
                 validate_table_type(ty, module.types.len())?;
@@ -162,6 +199,7 @@ fn build_spaces(module: &Module) -> Result<Spaces<'_>, Error> {
 
     for type_index in &module.functions {
         funcs.push(type_at(module, *type_index)?);
+        func_types.push(*type_index);
     }
     for table in &module.tables {
         validate_table_type(&table.ty, module.types.len())?;
@@ -211,6 +249,7 @@ fn build_spaces(module: &Module) -> Result<Spaces<'_>, Error> {
     Ok(Spaces {
         module,
         funcs,
+        func_types,
         globals,
         imported_globals,
         tables,
@@ -467,12 +506,14 @@ fn validate_tables(module: &Module, spaces: &Spaces<'_>) -> Result<(), Error> {
 }
 
 fn validate_exports(module: &Module) -> Result<(), Error> {
-    let mut names: Vec<&str> = Vec::new();
+    if module.exports.len() > MAX_EXPORTS {
+        return Err(Error::Invalid("too many exports"));
+    }
+    let mut names = std::collections::HashSet::new();
     for export in &module.exports {
-        if names.contains(&export.name.as_str()) {
+        if !names.insert(export.name.as_str()) {
             return Err(Error::Invalid("duplicate export name"));
         }
-        names.push(&export.name);
         let total = match export.kind {
             ExportKind::Func => {
                 module
@@ -1533,6 +1574,9 @@ impl<'a> Machine<'a> {
                 self.push_typed_ref(*type_index);
             }
             Instr::ArrayNewFixed { ty, n } => {
+                if *n > MAX_ARRAY_NEW_FIXED {
+                    return Err(Error::Invalid("array.new_fixed count too large"));
+                }
                 let field = array_field(spaces.module, *ty)?;
                 for _ in 0..*n {
                     self.pop_expected(field.ty.val())?;
@@ -2171,18 +2215,10 @@ fn typed_ref_of(type_index: u32) -> ValType {
 /// The function *type index* backing function index `index` (a function
 /// reference's heap type is its declared type index).
 fn func_type_of(spaces: &Spaces<'_>, index: usize) -> Result<u32, Error> {
-    let module = spaces.module;
-    let imports = module
-        .imports
-        .iter()
-        .filter_map(|import| match import.desc {
-            ImportDesc::Func(ty) => Some(ty),
-            _ => None,
-        });
-    let defined = module.functions.iter().copied();
-    imports
-        .chain(defined)
-        .nth(index)
+    spaces
+        .func_types
+        .get(index)
+        .copied()
         .ok_or(Error::Invalid("unknown function"))
 }
 
@@ -2384,6 +2420,9 @@ fn const_expr_type(expr: &[Instr], spaces: &Spaces<'_>, visible: usize) -> Resul
                 }));
             }
             Instr::ArrayNewFixed { ty, n } => {
+                if *n > MAX_ARRAY_NEW_FIXED {
+                    return Err(Error::Invalid("array.new_fixed count too large"));
+                }
                 let field = array_field(spaces.module, *ty)?;
                 for _ in 0..*n {
                     pop_const_sub(spaces.module, &mut stack, field.ty.val())?;

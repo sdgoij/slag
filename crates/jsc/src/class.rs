@@ -9,7 +9,7 @@
 //! JSC classes are effectively permanent too.
 
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::CStr;
 use std::rc::Rc;
 
@@ -29,6 +29,37 @@ use crate::{
     JSObjectFinalizeCallback, JSObjectGetPropertyCallback, JSObjectSetPropertyCallback,
     JSPropertyNameAccumulatorRef, JSStaticFunction, JSStaticValue, JSValueRef,
 };
+
+thread_local! {
+    /// Accumulator pointers whose `getPropertyNames` callback is on the
+    /// stack. `JSPropertyNameAccumulatorAddName` writes through the pointer,
+    /// so a pointer outside this set is a forged or stale ref and must not
+    /// be dereferenced.
+    static ACCUMULATORS: RefCell<HashSet<usize>> = RefCell::new(HashSet::new());
+}
+
+/// Removes an accumulator from the live set when the callback returns.
+pub(crate) struct AccumulatorGuard(usize);
+
+impl Drop for AccumulatorGuard {
+    fn drop(&mut self) {
+        ACCUMULATORS.with(|live| {
+            live.borrow_mut().remove(&self.0);
+        });
+    }
+}
+
+pub(crate) fn register_accumulator(accumulator: JSPropertyNameAccumulatorRef) -> AccumulatorGuard {
+    let key = accumulator as usize;
+    ACCUMULATORS.with(|live| {
+        live.borrow_mut().insert(key);
+    });
+    AccumulatorGuard(key)
+}
+
+pub(crate) fn is_live_accumulator(accumulator: JSPropertyNameAccumulatorRef) -> bool {
+    ACCUMULATORS.with(|live| live.borrow().contains(&(accumulator as usize)))
+}
 
 thread_local! {
     /// Finalizers keyed by object id. Populated when an object with a
@@ -215,6 +246,7 @@ impl HostOps for ClassOps {
         let ctx = self.callbacks_ctx()?;
         let mut names: Vec<JsString> = Vec::new();
         let accumulator = &mut names as *mut Vec<JsString> as JSPropertyNameAccumulatorRef;
+        let _accumulator = register_accumulator(accumulator);
         let object_ref = refs::object_id_ref(object.id());
         unsafe { callback(ctx as *const _ as JSContextRef, object_ref, accumulator) };
         Some(Ok(names

@@ -48,7 +48,10 @@ const VERSION: u32 = 1;
 
 /// Sanity bound on expanded locals per function body; generous enough for
 /// any real module while keeping hostile count fields from exhausting memory.
-const MAX_LOCALS: usize = 1 << 20;
+const MAX_LOCALS: usize = 1 << 18;
+/// Module-wide expansion bound, so many tiny bodies each declaring the
+/// per-body maximum cannot multiply into gigabytes before validation.
+const MAX_TOTAL_LOCALS: usize = 1 << 20;
 
 /// Section ids and the order the spec requires (custom sections may appear
 /// anywhere; the tag section sits between memory and global; `DataCount`
@@ -301,6 +304,7 @@ fn decode_section(id: SectionId, payload: &[u8], module: &mut Module) -> Result<
                     "function and code section have inconsistent lengths",
                 ));
             }
+            let mut total_locals = 0usize;
             for _ in 0..count {
                 let size = read_u32(payload, &mut pos)? as usize;
                 let start = pos;
@@ -311,6 +315,10 @@ fn decode_section(id: SectionId, payload: &[u8], module: &mut Module) -> Result<
                     return Err(Error::Malformed("unexpected end of section or function"));
                 }
                 let body = decode_body(&payload[start..end])?;
+                total_locals = total_locals.saturating_add(body.locals.len());
+                if total_locals > MAX_TOTAL_LOCALS {
+                    return Err(Error::Malformed("too many locals"));
+                }
                 // `memory.init`/`data.drop` are only encodable when the module
                 // carries a data count section (spec 5.4.5): without one the
                 // body is malformed, whatever validation would later say.

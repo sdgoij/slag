@@ -674,6 +674,11 @@ pub unsafe extern "C" fn JSPropertyNameAccumulatorAddName(
         let Some(name) = string_from_ref(property_name) else {
             return;
         };
+        // The accumulator is a stack `Vec` handed to a getPropertyNames
+        // callback; anything else is a forged or stale pointer.
+        if !class::is_live_accumulator(accumulator) {
+            return;
+        }
         class::property_names_of(accumulator).push(name);
     })
 }

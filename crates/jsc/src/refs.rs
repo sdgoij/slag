@@ -15,7 +15,7 @@ use std::collections::HashMap;
 use crux::handle::Handle;
 use crux::object::JsObject;
 use crux::value::Value;
-use ffi::{release_value, retain_value, value};
+use ffi::{release_value, retain_value, retain_value_ref, value};
 
 use crate::{JSObjectRef, JSValueRef};
 
@@ -110,9 +110,26 @@ pub fn value_object_ref(value: &Value) -> JSObjectRef {
     }
 }
 
-/// Release a primitive value ref (a no-op for objects).
-pub fn release_value_ref(r: JSValueRef) {
+/// Add a reference to a primitive value ref; objects are already pinned by
+/// the ref itself.
+pub fn protect_value_ref(r: JSValueRef) {
     if !r.is_null() && !is_tagged(r) {
+        retain_value_ref(untag(r));
+    }
+}
+
+/// Release a value ref. A primitive gives up its table entry; an object
+/// gives up its pin (the ref must not be used afterwards, per JSC's
+/// `JSValueUnprotect` contract).
+pub fn release_value_ref(r: JSValueRef) {
+    if r.is_null() {
+        return;
+    }
+    if is_tagged(r) {
+        OBJECTS.with(|objects| {
+            objects.borrow_mut().remove(&untag(r));
+        });
+    } else {
         release_value(untag(r));
     }
 }
