@@ -43,6 +43,38 @@ struct Parser<'a> {
 }
 
 pub(crate) fn compile_pattern(pattern: &[u16], flags: Flags) -> Result<Regex, Error> {
+    let mut parsed = parse_and_validate(pattern, flags)?;
+    coalesce_repeats(&mut parsed.program);
+    Ok(Regex {
+        prefilter: crate::engine::search_prefilter(&parsed.program, flags.has_unicode()),
+        backref_free: crate::engine::is_backref_free(&parsed.program),
+        memo_safe: crate::engine::memo_safe_atoms(&parsed.program),
+        program: parsed.program,
+        flags,
+        capturing_groups: parsed.capturing_groups,
+        named_groups: parsed.named_groups,
+        named_group_order: parsed.named_group_order,
+        has_group_names: parsed.has_group_names,
+    })
+}
+
+/// Whether `pattern` is a valid regular expression: the parse and the
+/// early-error checks, without the matcher's program analyses. This is what a
+/// regexp literal needs at parse time — the compiled program is discarded
+/// there, so building its prefilter would be wasted work.
+pub(crate) fn validate_pattern(pattern: &[u16], flags: Flags) -> Result<(), Error> {
+    parse_and_validate(pattern, flags).map(|_| ())
+}
+
+struct Parsed {
+    program: Node,
+    capturing_groups: usize,
+    named_groups: HashMap<Vec<u32>, Vec<usize>>,
+    named_group_order: Vec<Vec<u32>>,
+    has_group_names: bool,
+}
+
+fn parse_and_validate(pattern: &[u16], flags: Flags) -> Result<Parsed, Error> {
     let atoms: Vec<Atom> = if flags.has_unicode() {
         let mut atoms = Vec::with_capacity(pattern.len());
         let mut i = 0;
@@ -73,17 +105,12 @@ pub(crate) fn compile_pattern(pattern: &[u16], flags: Flags) -> Result<Regex, Er
         has_group_names,
         depth: 0,
     };
-    let mut program = parser.parse_disjunction()?;
+    let program = parser.parse_disjunction()?;
     if parser.pos != parser.atoms.len() {
         return Err(Error::syntax("Unmatched parentheses in regular expression"));
     }
-    coalesce_repeats(&mut program);
-    Ok(Regex {
-        prefilter: crate::engine::search_prefilter(&program, flags.has_unicode()),
-        backref_free: crate::engine::is_backref_free(&program),
-        memo_safe: crate::engine::memo_safe_atoms(&program),
+    Ok(Parsed {
         program,
-        flags,
         capturing_groups: parser.capturing_groups,
         named_groups: parser.named_groups,
         named_group_order: parser.named_group_order,

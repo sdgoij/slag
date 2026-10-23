@@ -1395,7 +1395,7 @@ fn parse_primary(parser: &mut Parser) -> Result<Expr, JsError> {
             // patterns are SyntaxErrors at parse time.
             let parsed_flags = regexp::Flags::parse(flags.as_slice())
                 .map_err(|e| parser.error_at(tok.span.start, &e.message))?;
-            regexp::compile(pattern.as_slice(), parsed_flags)
+            regexp::validate(pattern.as_slice(), parsed_flags)
                 .map_err(|e| parser.error_at(tok.span.start, &e.message))?;
             parser.next()?;
             Ok(Expr {

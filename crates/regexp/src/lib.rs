@@ -327,6 +327,13 @@ pub fn compile(pattern: &[u16], flags: Flags) -> Result<Regex, Error> {
     parse::compile_pattern(pattern, flags)
 }
 
+/// Whether the pattern parses and passes the early-error checks, without
+/// building the matcher's program analyses. The parser's regexp-literal check
+/// uses this: it discards the program, so a compile there is wasted work.
+pub fn validate(pattern: &[u16], flags: Flags) -> Result<(), Error> {
+    parse::validate_pattern(pattern, flags)
+}
+
 /// Compile with a flag string (used by the runtime constructor).
 pub fn compile_with_flags(pattern: &[u16], flags: &[u16]) -> Result<Regex, Error> {
     let flags = Flags::parse(flags)?;
