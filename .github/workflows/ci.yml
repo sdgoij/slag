@@ -188,11 +188,12 @@ jobs:
         run: cargo audit
 
   # Miri is scoped to the front end. `crux`'s conservative collector reads the
-  # native stack, which Miri cannot model. The larger suites are not gated: a
-  # bounded run of `-p regexp` did not finish, and `-Zmiri-report-progress`
-  # showed it still executing after millions of basic blocks (interpretation
-  # cost, not a hang); a bounded run of `-p parser` likewise did not finish,
-  # with no diagnosis yet. The lexer and syntax layers finish in seconds.
+  # native stack, which Miri cannot model. The larger suites are not gated
+  # because both stall in the same place, and it is not a hang:
+  # `-Zmiri-report-progress` shows `regexp::engine::fold_class`, which enumerates
+  # the whole code point space once to build the case-folding table (the parser
+  # test reaches it through a regexp literal). That fixed cost is tens of
+  # millions of interpreted basic blocks.
   miri:
     name: Miri (front end)
     needs: lint
