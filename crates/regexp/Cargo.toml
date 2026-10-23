@@ -7,3 +7,6 @@ license.workspace = true
 [dependencies]
 crux = { path = "../crux" }
 unicode = { path = "../unicode" }
+
+[build-dependencies]
+unicode = { path = "../unicode" }
