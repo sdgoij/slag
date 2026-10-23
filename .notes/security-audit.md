@@ -127,13 +127,23 @@ Fixed and validated in the first remediation pass:
   host-created `WebAssembly.Memory`; enforcing equality would reject the
   intentional shared bridge without enabling a conformant shared module.
   Revisit when the decoder accepts shared limits.
+- **M-4** — `Symbol.replace` now runs the single spec loop (22.2.7.3 steps
+  13a-13l): each match is replaced before the next exec instead of collecting
+  every exec result first. Memory is bounded by the output string rather than
+  by the match count, and a functional replacer's `lastIndex` write now affects
+  the next match. A regression test pins the interleaving.
+- **M-3 (deferred)** — the eager `maxByteLength` pre-allocation exists only in
+  the experimental `workers` feature: `byteblock`'s `new_with_capacity` ignores
+  the capacity in the default build. Under `workers` the block is one immutable
+  `Arc<[AtomicU64]>` shared by every view, so lazy growth needs a shared
+  indirection that the worker memory model (M-12) has to settle first.
 
 Outstanding from this report: the JSC string/value/object ref namespace, the
 `crates/v8` per-thread realm slot, GitHub Actions pinned to mutable tags, the
 Deno build's unlocked `cargo update`, and the remaining Medium items
-(`current_agent_mut` aliasing, eager resizable-buffer allocation,
-`Symbol.replace` buffering, CI coverage, worker memory atomics) plus the
-`padStart`/`padEnd` transient-allocation note.
+(`current_agent_mut` aliasing, eager resizable-buffer allocation under
+`workers`, CI coverage, worker memory atomics) plus the `padStart`/`padEnd`
+transient-allocation note.
 
 Validation for the first pass: `cargo clippy --workspace --all-targets -- -D
 warnings` is clean; `cargo fmt --all -- --check` is clean; 1,062 runtime unit
@@ -165,6 +175,12 @@ runtime --features raylib` is clean; a dense-array `--gc-stress` run (200 rounds
 of append, replace, and truncate) completes with the verifier on; and the new
 arity test proves `first(7) → 7` and `local(5, 99) → 0` (the extra argument no
 longer lands in the declared local slot).
+
+Validation for the fifth pass: clippy and rustfmt stay clean; 1,064 runtime
+lib tests pass in release; the full RegExp area passes 1,899/1,899 and every
+`*replace*` fixture passes 212/212; `"a".repeat(10_000_000).replace(/(?:)/g,
+"")` completes and prints its 10,000,000-unit result instead of materializing
+10M match arrays.
 
 ---
 

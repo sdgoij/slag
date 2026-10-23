@@ -1223,47 +1223,35 @@ fn symbol_replace(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Val
         let obj = as_object(this).unwrap();
         obj.set(&JsString::from_utf8("lastIndex"), Value::Number(0.0), true)?;
     }
-    // GC-2: the exec-result arrays accumulate in a local Vec (and the
-    // functional replacer's argument Vec is built per match) in heap
-    // buffers the stack scan cannot see while the next exec/replacer call
-    // allocates — suppress `--gc-stress` for the whole replace so those
-    // buffers cannot be swept.
+    // GC-2: the per-match replacer argument vector and capture list are heap
+    // buffers the stack scan cannot see while the next exec or replacer call
+    // allocates — suppress `--gc-stress` for the whole replace.
     let _stress = crate::ir::StressSuppress::new();
-    let mut results: Vec<Value> = Vec::new();
-    loop {
-        match regexp_exec(agent, this, &string)? {
-            None => break,
-            Some(array) => {
-                results.push(array);
-                if !global {
-                    break;
-                }
-                let match_value = get_property(agent, &array, &JsString::from_utf8("0"), array)?;
-                let match_string = crate::context::to_string(agent, &match_value)?;
-                if match_string.is_empty() {
-                    let this_index = to_length(to_number(&get_property(
-                        agent,
-                        this,
-                        &JsString::from_utf8("lastIndex"),
-                        *this,
-                    )?)?) as usize;
-                    let next_index = simple_advance(&string, this_index, full_unicode);
-                    let obj = as_object(this).unwrap();
-                    obj.set(
-                        &JsString::from_utf8("lastIndex"),
-                        Value::Number(next_index as f64),
-                        true,
-                    )?;
-                }
-            }
-        }
-    }
+    // spec 22.2.7.3 steps 13a-13l: one exec-and-replace loop. Each match's
+    // replacement is produced before the next exec, so a functional replacer's
+    // side effects (a `lastIndex` write included) are visible to the next
+    // match, and the matches are never all materialized at once.
     let mut accumulated: Vec<u16> = Vec::new();
     let mut next_source_position = 0usize;
-    for result in results {
+    while let Some(result) = regexp_exec(agent, this, &string)? {
         let matched_value = get_property(agent, &result, &JsString::from_utf8("0"), result)?;
         let matched = crate::context::to_string(agent, &matched_value)?;
         let match_length = matched.len();
+        if match_length == 0 && global {
+            let this_index = to_length(to_number(&get_property(
+                agent,
+                this,
+                &JsString::from_utf8("lastIndex"),
+                *this,
+            )?)?) as usize;
+            let next_index = simple_advance(&string, this_index, full_unicode);
+            let obj = as_object(this).unwrap();
+            obj.set(
+                &JsString::from_utf8("lastIndex"),
+                Value::Number(next_index as f64),
+                true,
+            )?;
+        }
         let position_value = to_number(&get_property(
             agent,
             &result,
@@ -1317,6 +1305,9 @@ fn symbol_replace(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Val
             append_units(&mut accumulated, gap.as_slice())?;
             append_units(&mut accumulated, replacement_string.as_slice())?;
             next_source_position = position + match_length;
+        }
+        if !global {
+            break;
         }
     }
     if next_source_position < string_length {
@@ -1941,6 +1932,20 @@ mod tests {
         // The boolean itself, and a capture group still reported by exec.
         assert!(bool("/a/.test('banana')"));
         assert_eq!(text("/a(b)/.exec('ab')[1]"), "b");
+    }
+
+    #[test]
+    fn replace_runs_the_replacer_before_the_next_match() {
+        // spec 22.2.7.3 processes each match inside the exec loop, so a
+        // functional replacer's `lastIndex` write is visible to the next exec.
+        // Collecting every match first (the previous shape) produced "bbb".
+        assert_eq!(
+            text(
+                "(function(){ var r = /a/g; \
+                 return r[Symbol.replace]('aaa', function(){ r.lastIndex = 3; return 'b'; }); })()"
+            ),
+            "baa"
+        );
     }
 
     #[test]
