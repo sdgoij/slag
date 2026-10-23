@@ -45,6 +45,10 @@ struct Options {
     /// `--allow-fs[=ROOT]`: install the host `fs` global. Without a root the
     /// script gets the whole filesystem; with one, every path is confined.
     allow_fs: Option<Option<std::path::PathBuf>>,
+    /// `--allow-rl-assets[=ROOT]`: let `rl.load*` read a path from disk (all of
+    /// it, or confined to ROOT). Embedded assets always load.
+    #[cfg(feature = "raylib")]
+    allow_rl_assets: Option<Option<std::path::PathBuf>>,
     stack_size: Option<u64>,
     max_old_space: Option<u64>,
     #[cfg(feature = "jit")]
@@ -94,6 +98,17 @@ fn parse(args: &[String]) -> Command {
                     return Command::Help;
                 }
                 options.allow_fs = Some(Some(std::path::PathBuf::from(root)));
+            }
+            #[cfg(feature = "raylib")]
+            "--allow-rl-assets" => options.allow_rl_assets = Some(None),
+            #[cfg(feature = "raylib")]
+            flag if flag.starts_with("--allow-rl-assets=") => {
+                let root = &flag["--allow-rl-assets=".len()..];
+                if root.is_empty() {
+                    eprintln!("slag: --allow-rl-assets= needs a directory");
+                    return Command::Help;
+                }
+                options.allow_rl_assets = Some(Some(std::path::PathBuf::from(root)));
             }
             "--bench" => options.bench = true,
             "--print-bytecode" => options.print_bytecode = true,
@@ -165,6 +180,10 @@ fn run(command: Command) -> Result<(), u8> {
             eprintln!("  --jsx                     parse the file/input with the JSX extension");
             eprintln!(
                 "  --allow-fs[=ROOT]         install the host fs global (confined to ROOT when given)"
+            );
+            #[cfg(feature = "raylib")]
+            eprintln!(
+                "  --allow-rl-assets[=ROOT]  let rl.load* read files from disk (confined to ROOT when given)"
             );
             eprintln!("  --bench                   interpreter micro-benchmarks");
             #[cfg(feature = "jit")]
@@ -341,9 +360,17 @@ fn run_file_inner(file: &str, args: &[String], options: &Options, source: &str) 
     }
     // A raylib-enabled build always exposes the `rl` global; the feature is
     // the gate, and installing the module opens no window until the script
-    // itself calls `rl.initWindow`.
+    // itself calls `rl.initWindow`. Only embedded assets load unless the host
+    // grants disk access with `--allow-rl-assets`.
     #[cfg(feature = "raylib")]
-    context.install_raylib().map_err(report)?;
+    {
+        let access = match &options.allow_rl_assets {
+            None => runtime::raylib::AssetAccess::EmbeddedOnly,
+            Some(None) => runtime::raylib::AssetAccess::Unrestricted,
+            Some(Some(root)) => runtime::raylib::AssetAccess::Root(root.clone()),
+        };
+        context.install_raylib_with_access(access).map_err(report)?;
+    }
     if !args.is_empty() {
         let mut argv = vec![
             std::env::current_exe()
@@ -974,9 +1001,13 @@ fn bench_once(
     // A corpus directory may exercise the host surface (`rl.*`): install it
     // when the build has it, so those workloads are timed on the same protocol
     // as everything else. Installing binds raylib's window thread and is safe
-    // without a window (a real one is opened by `rl.initWindow`).
+    // without a window (a real one is opened by `rl.initWindow`). Corpus files
+    // are trusted benchmarks, but they get embedded assets only: the corpus
+    // runner has no host-granted asset root.
     #[cfg(feature = "raylib")]
-    context.install_raylib().map_err(report)?;
+    context
+        .install_raylib_with_access(runtime::raylib::AssetAccess::EmbeddedOnly)
+        .map_err(report)?;
     // The crux heap is thread-global and shared across the suite's rows, so
     // the previous row's garbage would otherwise carry into this one's first
     // collections (allocation-heavy rows are sensitive to where the first

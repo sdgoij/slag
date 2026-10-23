@@ -158,6 +158,23 @@ Fixed and validated in the first remediation pass:
   fold index at compile time, so the lookup is a binary search over static data
   with no lazy initialization or global lock, and a test recomputes the scan
   and compares every entry.
+- **Low (JIT i-cache)** — `ExecutableCode::new` now flushes the instruction
+  cache after copying the code and raising the protection. x86-64 is coherent
+  and compiles the call away; linux-aarch64 runs the `dc cvau` / `ic ivau`
+  sequence (compiled and linted for that target).
+- **Low (snapshot decode)** — reviewed and covered: `header` validates the body
+  length and the trailing magic, every body count is checked against the bytes
+  remaining, and `Reader` is bounds-checked. A deterministic bit-flip sweep
+  over the header, context table and first record pins that a corrupted blob
+  returns an error and never panics.
+- **Raylib asset root** — `rl.load*` disk reads are capability-gated: embedded
+  assets always load, and `AssetAccess::{EmbeddedOnly, Unrestricted, Root}`
+  governs a path. The CLI defaults to `EmbeddedOnly` and takes
+  `--allow-rl-assets[=ROOT]`; a root canonicalizes the path and rejects escapes.
+- **`ffi::guard` poisoning** — a panic at the C boundary now sets a per-thread
+  poison, and later guarded calls return `R::default()` without running (the
+  isolate's state is unknown). `is_poisoned`/`unpoison` are exported and
+  re-exported by `crates/jsc` for a host that rebuilds its state.
 
 Outstanding from this report: the JSC string/value/object ref namespace, the
 `crates/v8` per-thread realm slot, the Deno build's one-time unlocked reconcile
@@ -228,6 +245,12 @@ release; the RegExp area passes 1,899/1,899 and `*replace*` 212/212; clippy
 (`-D warnings`) and rustfmt are clean. The Miri job now covers the lexer and
 syntax crates and only runs from a manual `workflow_dispatch` with its input
 set, so push/PR runs do not wait on it.
+
+Validation for the tenth pass: clippy is clean for the default workspace and
+for `-p runtime -p cli --features raylib`, and rustfmt is clean; `cargo check`
+and `clippy -p jit --target aarch64-unknown-linux-gnu` compile the flush path;
+the raylib surface test (with the new policy assertions) passes, as do the 13
+`ffi` tests (including the poison test) and 1,068 runtime lib tests.
 
 ---
 

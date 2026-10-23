@@ -151,6 +151,57 @@ static CAMERA_3D: Mutex<Option<Camera3D>> = Mutex::new(None);
 /// before falling back to the disk.
 static EMBEDDED_FILES: Mutex<Vec<(&'static str, &'static [u8])>> = Mutex::new(Vec::new());
 
+/// Filesystem access for the path arguments of `rl.load*`. Embedded assets are
+/// always available; this governs reading a name from disk. raylib's window
+/// state is process-global, so the policy is too: the last install wins.
+#[derive(Debug, Clone)]
+pub enum AssetAccess {
+    /// Only embedded assets; a disk path is an error.
+    EmbeddedOnly,
+    /// Any path the process can read (the pre-capability behaviour, for a host
+    /// that trusts its scripts).
+    Unrestricted,
+    /// The path must canonicalize inside this directory.
+    Root(std::path::PathBuf),
+}
+
+static ASSET_ACCESS: Mutex<AssetAccess> = Mutex::new(AssetAccess::EmbeddedOnly);
+
+/// The path argument to hand raylib, after applying the installed policy.
+fn allowed_asset_path(name: &CString, what: &str) -> Result<CString, JsError> {
+    match ASSET_ACCESS.lock().unwrap().clone() {
+        AssetAccess::Unrestricted => Ok(name.clone()),
+        AssetAccess::EmbeddedOnly => Err(JsError::new(
+            ErrorKind::TypeError,
+            format!(
+                "rl.{what}: loading {} from disk requires --allow-rl-assets",
+                name.to_string_lossy()
+            ),
+        )),
+        AssetAccess::Root(root) => {
+            let name_text = name.to_string_lossy();
+            let canonical = std::fs::canonicalize(name_text.as_ref()).map_err(|error| {
+                JsError::new(
+                    ErrorKind::TypeError,
+                    format!("rl.{what}: cannot open {name_text}: {error}"),
+                )
+            })?;
+            if !canonical.starts_with(&root) {
+                return Err(JsError::new(
+                    ErrorKind::TypeError,
+                    format!("rl.{what}: {name_text} is outside the asset root"),
+                ));
+            }
+            CString::new(canonical.to_string_lossy().as_bytes()).map_err(|_| {
+                JsError::new(
+                    ErrorKind::TypeError,
+                    format!("rl.{what}: path contains a NUL byte"),
+                )
+            })
+        }
+    }
+}
+
 /// Register an in-memory asset under `name` so `loadTexture`/`loadSound` can
 /// find it without touching the disk.
 pub(crate) fn register_embedded_asset(name: &'static str, data: &'static [u8]) {
@@ -881,12 +932,13 @@ impl AssetFile {
                 temp: Some(temp),
             })
         } else {
-            let path = CString::new(name).map_err(|_| {
+            let raw = CString::new(name).map_err(|_| {
                 JsError::new(
                     ErrorKind::TypeError,
                     format!("rl.{what}: path contains a NUL byte"),
                 )
             })?;
+            let path = allowed_asset_path(&raw, what)?;
             Ok(AssetFile { path, temp: None })
         }
     }
@@ -1872,8 +1924,9 @@ fn load_image(args: &[Value]) -> Result<Value, JsError> {
             raylib_sys::LoadImageFromMemory(format.as_ptr(), data.as_ptr(), data.len() as i32)
         }
     } else {
+        let allowed = allowed_asset_path(&path, "loadImage")?;
         // SAFETY: raylib reads the file during this call; window-thread guard.
-        unsafe { raylib_sys::LoadImage(path.as_ptr()) }
+        unsafe { raylib_sys::LoadImage(allowed.as_ptr()) }
     };
     if image.data.is_null() || image.width <= 0 || image.height <= 0 {
         return Ok(Value::Number(-1.0));
@@ -2447,8 +2500,9 @@ fn load_texture_from_file(args: &[Value]) -> Result<Value, JsError> {
         unsafe { raylib_sys::UnloadImage(image) };
         texture
     } else {
+        let allowed = allowed_asset_path(&path, "loadTexture")?;
         // SAFETY: raylib reads the file during this call; window-thread guard.
-        unsafe { raylib_sys::LoadTexture(path.as_ptr()) }
+        unsafe { raylib_sys::LoadTexture(allowed.as_ptr()) }
     };
     if texture.id == 0 {
         return Ok(Value::Number(-1.0));
@@ -3562,8 +3616,28 @@ mod gui {
     }
 }
 
-/// Install the `rl` namespace on the current realm's global object.
+/// Install the `rl` namespace on the current realm's global object with
+/// unrestricted asset paths (a host that trusts its scripts).
 pub(crate) fn install(agent: &mut Agent) -> Result<(), JsError> {
+    install_with_access(agent, AssetAccess::Unrestricted)
+}
+
+/// Install the `rl` namespace with an explicit filesystem policy for the
+/// `rl.load*` path arguments. Embedded assets are unaffected.
+pub(crate) fn install_with_access(agent: &mut Agent, access: AssetAccess) -> Result<(), JsError> {
+    let access = match access {
+        AssetAccess::Root(root) => {
+            let canonical = std::fs::canonicalize(&root).map_err(|error| {
+                JsError::new(
+                    ErrorKind::TypeError,
+                    format!("rl: cannot use asset root {}: {error}", root.display()),
+                )
+            })?;
+            AssetAccess::Root(canonical)
+        }
+        other => other,
+    };
+    *ASSET_ACCESS.lock().unwrap() = access;
     // Bind the window thread to the *first* installer. A later install on
     // another thread is still allowed (e.g. a second Context that never opens
     // a window) — the per-call guard keeps real raylib calls off the wrong
@@ -3834,7 +3908,9 @@ pub(crate) fn install(agent: &mut Agent) -> Result<(), JsError> {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
     use crate::embed::Context;
+    use std::ffi::CString;
 
     // raylib's process-global window state binds to the thread of the first
     // install, and the libtest harness runs every #[test] on its own thread,
@@ -4392,5 +4468,35 @@ mod tests {
                 drop(Box::from_raw(meshes));
             }
         }
+
+        // `rl.load*` disk access is capability-gated: an embedded-only install
+        // rejects a path, an unrestricted one passes it through, and a root
+        // confines it.
+        let asset = CString::new("assets/tex.png").unwrap();
+        *ASSET_ACCESS.lock().unwrap() = AssetAccess::EmbeddedOnly;
+        assert!(allowed_asset_path(&asset, "loadTexture").is_err());
+        *ASSET_ACCESS.lock().unwrap() = AssetAccess::Unrestricted;
+        assert_eq!(
+            allowed_asset_path(&asset, "loadTexture")
+                .unwrap()
+                .as_bytes(),
+            asset.as_bytes()
+        );
+        let root = std::env::temp_dir().join(format!("slag-rl-root-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let inside = root.join("inside.txt");
+        std::fs::write(&inside, b"x").unwrap();
+        let outside =
+            std::env::temp_dir().join(format!("slag-rl-outside-{}.txt", std::process::id()));
+        std::fs::write(&outside, b"x").unwrap();
+        *ASSET_ACCESS.lock().unwrap() = AssetAccess::Root(std::fs::canonicalize(&root).unwrap());
+        let inside_path = CString::new(inside.to_string_lossy().as_bytes()).unwrap();
+        assert!(allowed_asset_path(&inside_path, "loadTexture").is_ok());
+        let outside_path = CString::new(outside.to_string_lossy().as_bytes()).unwrap();
+        assert!(allowed_asset_path(&outside_path, "loadTexture").is_err());
+        std::fs::remove_file(&inside).unwrap();
+        std::fs::remove_file(&outside).unwrap();
+        std::fs::remove_dir(&root).unwrap();
+        *ASSET_ACCESS.lock().unwrap() = AssetAccess::EmbeddedOnly;
     }
 }

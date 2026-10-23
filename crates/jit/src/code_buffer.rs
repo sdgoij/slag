@@ -30,6 +30,11 @@ impl ExecutableCode {
                 allocation.len(),
                 Protection::READ_EXECUTE,
             )?;
+            // A raised protection does not invalidate the instruction cache: on
+            // a split-cache target the core may still hold lines from whatever
+            // previously occupied this address (the page is fresh, the virtual
+            // address is not). x86-64 is coherent and compiles this to nothing.
+            flush_instruction_cache(allocation.as_ptr::<u8>(), allocation.len());
         }
         Ok(Self { allocation })
     }
@@ -49,6 +54,45 @@ impl ExecutableCode {
         self.allocation.is_empty()
     }
 }
+
+/// Make freshly written machine code visible to instruction fetch.
+///
+/// AArch64 is the one shipped split-cache target (linux-aarch64); Linux leaves
+/// the user-mode cache-maintenance instructions enabled at EL0, so the standard
+/// `dc cvau` / `ic ivau` sequence is the flush. Every other shipped target
+/// (x86-64) has a coherent instruction cache and needs nothing. Windows on
+/// AArch64 would need `FlushInstructionCache` instead, but it is not a shipped
+/// target.
+#[cfg(all(target_arch = "aarch64", not(target_os = "windows")))]
+unsafe fn flush_instruction_cache(start: *const u8, len: usize) {
+    use std::arch::asm;
+    if len == 0 {
+        return;
+    }
+    // The architectural minimum line is 64 bytes; a larger line is covered by
+    // several addresses, which is harmless.
+    const LINE: usize = 64;
+    let begin = start as usize & !(LINE - 1);
+    let end = start as usize + len;
+    let mut address = begin;
+    while address < end {
+        unsafe { asm!("dc cvau, {}", in(reg) address, options(nostack, preserves_flags)) };
+        address += LINE;
+    }
+    unsafe { asm!("dsb ish", options(nostack, preserves_flags)) };
+    let mut address = begin;
+    while address < end {
+        unsafe { asm!("ic ivau, {}", in(reg) address, options(nostack, preserves_flags)) };
+        address += LINE;
+    }
+    unsafe {
+        asm!("dsb ish", options(nostack, preserves_flags));
+        asm!("isb", options(nostack, preserves_flags));
+    }
+}
+
+#[cfg(not(all(target_arch = "aarch64", not(target_os = "windows"))))]
+unsafe fn flush_instruction_cache(_start: *const u8, _len: usize) {}
 
 #[cfg(test)]
 mod tests {

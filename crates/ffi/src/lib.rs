@@ -13,7 +13,7 @@ pub mod marshal;
 pub mod tables;
 
 pub use exception::throw;
-pub use guard::guard;
+pub use guard::{guard, is_poisoned, unpoison};
 pub use tables::{
     release_string, release_value, retain_string, retain_string_ref, retain_value,
     retain_value_ref, string, value, with_string,

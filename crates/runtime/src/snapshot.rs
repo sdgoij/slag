@@ -8664,6 +8664,25 @@ mod tests {
     }
 
     #[test]
+    fn a_corrupted_blob_returns_an_error_instead_of_panicking() {
+        // `is_valid` checks only the header, so a hostile blob can pass it and
+        // still be nonsense inside. Every count is checked against the bytes
+        // that remain, so the decode must fail as an error; a panic here would
+        // take the host down. The sweep covers the header, the context table
+        // and the first record, where the counts live.
+        let (isolate, realm) = fixture();
+        let blob = encode_value(&isolate, &realm, Value::Number(1.0));
+        for offset in 0..blob.len().min(HEADER_LEN + 48) {
+            for bit in [0x01u8, 0x10, 0x80] {
+                let mut corrupted = blob.clone();
+                corrupted[offset] ^= bit;
+                // Either verdict is acceptable; returning at all is the test.
+                drop(decode(agent_mut(&isolate), &realm, &corrupted));
+            }
+        }
+    }
+
+    #[test]
     fn an_intrinsic_is_written_as_its_name() {
         let (isolate, realm) = fixture();
         let prototype = realm

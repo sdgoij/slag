@@ -214,6 +214,12 @@ pub type JSObjectConvertToTypeCallback =
 
 use ffi::guard as ffi_guard;
 
+/// Whether a guarded JSC call panicked earlier on this thread (see
+/// [`ffi::is_poisoned`]). A poisoned isolate rejects every later call.
+pub use ffi::is_poisoned;
+/// Clear the panic poison after a host has rebuilt its state.
+pub use ffi::unpoison;
+
 /// Run an exported JSC API call with call-depth bookkeeping. A callback that
 /// releases its own context marks it dead; the teardown happens here, at the
 /// outermost boundary, rather than while the call is still using the isolate.

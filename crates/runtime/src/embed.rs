@@ -1227,6 +1227,17 @@ impl Context {
         crate::raylib::install(&mut self.agent)
     }
 
+    /// Install `rl` with an explicit filesystem policy for its `load*` path
+    /// arguments (see [`crate::raylib::AssetAccess`]). Embedded assets always
+    /// work; `EmbeddedOnly` rejects every disk path.
+    #[cfg(feature = "raylib")]
+    pub fn install_raylib_with_access(
+        &mut self,
+        access: crate::raylib::AssetAccess,
+    ) -> Result<(), JsError> {
+        crate::raylib::install_with_access(&mut self.agent, access)
+    }
+
     /// Make `bytes` available to `rl.loadTexture`/`rl.loadSound`/`rl.loadModel`
     /// under `name` (used to embed assets so a raylib demo needs no files on
     /// disk). Both the name and the bytes must outlive this call (`&'static`,
