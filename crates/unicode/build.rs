@@ -49,7 +49,7 @@ fn run() -> Result<(), String> {
         if lone.is_empty() && ranges.is_empty() {
             continue;
         }
-        props.insert(file_stem(&path), merge_ranges(lone, ranges));
+        props.insert(validated_stem(&path)?, merge_ranges(lone, ranges));
     }
 
     let mut string_sets: BTreeMap<String, Vec<Vec<u32>>> = BTreeMap::new();
@@ -57,7 +57,7 @@ fn run() -> Result<(), String> {
         let src = fs::read_to_string(&path).map_err(|e| e.to_string())?;
         let seqs = parse_match_strings(&src);
         if !seqs.is_empty() {
-            string_sets.insert(file_stem(&path), seqs);
+            string_sets.insert(validated_stem(&path)?, seqs);
         }
     }
 
@@ -77,6 +77,24 @@ fn js_files(dir: &Path) -> Result<Vec<PathBuf>, String> {
     }
     out.sort();
     Ok(out)
+}
+
+/// The fixture's name, validated as safe to splice into a Rust identifier,
+/// a string literal, and a doc comment. The fixtures come from the test262
+/// submodule, so a compromised fixture name must not become generated code.
+fn validated_stem(path: &Path) -> Result<String, String> {
+    let name = file_stem(path);
+    let mut chars = name.chars();
+    let starts_ok = chars
+        .next()
+        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_');
+    let rest_ok = name
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
+    if !starts_ok || !rest_ok {
+        return Err(format!("fixture name {name:?} is not a safe Rust name"));
+    }
+    Ok(name)
 }
 
 fn file_stem(path: &Path) -> String {

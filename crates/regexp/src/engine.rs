@@ -1222,19 +1222,45 @@ fn is_linear_atom(node: &Node) -> bool {
 }
 
 /// The public entry: match the program at `start`, returning capture spans in
-/// code units.
-pub(crate) fn exec(re: &Regex, input: &[u16], start: usize) -> Option<crate::Match> {
+/// code units. A budget exhaustion is reported separately from a non-match.
+pub(crate) fn exec_checked(
+    re: &Regex,
+    input: &[u16],
+    start: usize,
+) -> Result<Option<crate::Match>, crate::BudgetExceeded> {
     let mut matcher = Matcher::new(re, input);
-    let end = matcher.match_at(start)?;
+    let end = matcher.match_at(start);
+    if matcher.exhausted() {
+        return Err(crate::BudgetExceeded);
+    }
+    let Some(end) = end else {
+        return Ok(None);
+    };
     matcher.caps.values[0] = Some((start, end));
-    Some(matcher.caps.values)
+    Ok(Some(matcher.caps.values))
+}
+
+pub(crate) fn exec(re: &Regex, input: &[u16], start: usize) -> Option<crate::Match> {
+    exec_checked(re, input, start).ok().flatten()
 }
 
 /// The boolean half of `exec`: the match end only, from a matcher that keeps
 /// no capture buffer (see `Matcher::new_boolean`).
-pub(crate) fn exec_end(re: &Regex, input: &[u16], start: usize) -> Option<usize> {
+pub(crate) fn exec_end_checked(
+    re: &Regex,
+    input: &[u16],
+    start: usize,
+) -> Result<Option<usize>, crate::BudgetExceeded> {
     let mut matcher = Matcher::new_boolean(re, input);
-    matcher.match_at(start)
+    let end = matcher.match_at(start);
+    if matcher.exhausted() {
+        return Err(crate::BudgetExceeded);
+    }
+    Ok(end)
+}
+
+pub(crate) fn exec_end(re: &Regex, input: &[u16], start: usize) -> Option<usize> {
+    exec_end_checked(re, input, start).ok().flatten()
 }
 
 /// The leftmost-search loop (spec RegExpBuiltinExec's AdvanceStringIndex walk
@@ -1276,18 +1302,44 @@ fn search_loop(
 /// Leftmost search with a leading-char prefilter and a single capture buffer
 /// reused across position attempts (spec RegExpBuiltinExec's loop). Returns
 /// the match and the index it started at.
-pub(crate) fn search(re: &Regex, input: &[u16], start: usize) -> Option<(usize, crate::Match)> {
+pub(crate) fn search_checked(
+    re: &Regex,
+    input: &[u16],
+    start: usize,
+) -> Result<Option<(usize, crate::Match)>, crate::BudgetExceeded> {
     let mut matcher = Matcher::new(re, input);
-    let (index, end) = search_loop(&mut matcher, re, input, start)?;
+    let found = search_loop(&mut matcher, re, input, start);
+    if matcher.exhausted() {
+        return Err(crate::BudgetExceeded);
+    }
+    let Some((index, end)) = found else {
+        return Ok(None);
+    };
     matcher.caps.values[0] = Some((index, end));
-    Some((index, matcher.caps.values))
+    Ok(Some((index, matcher.caps.values)))
+}
+
+pub(crate) fn search(re: &Regex, input: &[u16], start: usize) -> Option<(usize, crate::Match)> {
+    search_checked(re, input, start).ok().flatten()
 }
 
 /// The boolean half of `search`: the match start and end only, from a matcher
 /// that keeps no capture buffer.
-pub(crate) fn search_end(re: &Regex, input: &[u16], start: usize) -> Option<(usize, usize)> {
+pub(crate) fn search_end_checked(
+    re: &Regex,
+    input: &[u16],
+    start: usize,
+) -> Result<Option<(usize, usize)>, crate::BudgetExceeded> {
     let mut matcher = Matcher::new_boolean(re, input);
-    search_loop(&mut matcher, re, input, start)
+    let found = search_loop(&mut matcher, re, input, start);
+    if matcher.exhausted() {
+        return Err(crate::BudgetExceeded);
+    }
+    Ok(found)
+}
+
+pub(crate) fn search_end(re: &Regex, input: &[u16], start: usize) -> Option<(usize, usize)> {
+    search_end_checked(re, input, start).ok().flatten()
 }
 
 /// A sound prefilter for the search loop: the UTF-16 units that any match

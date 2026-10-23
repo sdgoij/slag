@@ -62,7 +62,8 @@ Fixed and validated in the first remediation pass:
   deeper legal code is rejected with a `SyntaxError` instead of aborting.
 - **H-2** — the matcher has an adaptive step budget and a choice cap; the
   empty-body repeat clamp removes the `{4294967295}` loop. Budget exhaustion
-  currently returns a non-match; propagating a `RangeError` is a follow-up.
+  now propagates through the checked exec/search API and reaches JS as
+  `RangeError: Regular expression is too complex`.
 - **H-3** — month 13 in Chinese/Dangi formats numerically instead of indexing
   past the 12-entry name table.
 - **H-4** — `CreateListFromArrayLike` (Reflect, proxy `ownKeys`, `apply`) caps
@@ -84,14 +85,29 @@ Fixed and validated in the first remediation pass:
 - **H-12** — validation precomputes rec-group ends and the function type index,
   uses a `HashSet` for duplicate exports, caps types/exports/`array.new_fixed`,
   and bounds per-body and module-wide local expansion.
-- **C-2 (partial)** — context teardown is deferred to the outermost API
-  boundary and reference-counted, `JSStringGetCharactersPtr` points into a
-  stable boxed string, the property-name accumulator validates its pointer, and
-  string/value retains and `JSValueUnprotect` release their entries.
+- **C-2** — context teardown is deferred to the outermost API boundary and
+  reference-counted, `JSStringGetCharactersPtr` points into a stable boxed
+  string, the property-name accumulator validates its pointer, string/value
+  retains and `JSValueUnprotect` release their entries, the `finalize` callback
+  is wired through `HostOps::finalize`, `JSClassRelease` clears only its own
+  class's callbacks, and a finalize ref resolves the dead object's private-data
+  id.
+- **H-11** — the CLI no longer installs `fs` by default; `--allow-fs` is the
+  explicit unrestricted opt-in and `--allow-fs=ROOT` canonicalizes every path
+  and rejects anything outside the root. Reads are capped at 256 MiB and a
+  directory listing at 2^20 entries.
+- **M-5** — externref conversions are capped at 2^20 live payloads
+  (`RangeError`), so the per-agent map cannot grow without bound.
+- **M-8 (partial)** — `crates/v8` is `publish = false`, `tools/build-deno.py`
+  requires a full 40-hex pin, and the Unicode build validates fixture stems
+  before splicing them into generated Rust.
 
-Outstanding from this report: JSC finalizer wiring (the `finalize` callback
-still has no caller), the CLI capability model (H-11), the RegExp budget's
-`RangeError` propagation (H-2 follow-up), and the remaining Medium/Low items.
+Outstanding from this report: the JSC string/value/object ref namespace, the
+`crates/v8` per-thread realm slot, GitHub Actions pinned to mutable tags, the
+Deno build's unlocked `cargo update`, and the remaining Medium/Low items
+(`current_agent_mut` aliasing, `ArraySlots::trace`, eager resizable-buffer
+allocation, `Symbol.replace` buffering, `--corpus` symlinks, raylib temp paths,
+worker memory atomics, and the Low list).
 
 Validation for the first pass: `cargo clippy --workspace --all-targets -- -D
 warnings` is clean; `cargo fmt --all -- --check` is clean; 1,062 runtime unit
@@ -108,6 +124,13 @@ the JS-API suite passes 1,001 tests, and the runtime/jsc/ffi tests pass. The
 oversized-memory module now fails instantiation with a `LinkError` naming the
 host limit, `Table.grow(2**32-1)` raises `RangeError`, and growing the string
 table by 2,000 entries leaves `JSStringGetCharactersPtr` stable.
+
+Validation for the third pass: clippy and rustfmt stay clean; 1,064 runtime
+tests (with `fs`) and 18 CLI tests pass; the full RegExp suite passes
+1,899/1,899; the WASM JS-API suite still passes 1,001 tests. `fs` is absent
+without `--allow-fs`, a rooted read inside the root succeeds, `../` and an
+absolute outside path are rejected, and the ReDoS probe now returns a
+catchable `RangeError` while a normal match still succeeds.
 
 ---
 

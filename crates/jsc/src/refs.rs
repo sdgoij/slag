@@ -110,6 +110,19 @@ pub fn value_object_ref(value: &Value) -> JSObjectRef {
     }
 }
 
+/// The object id behind a tagged ref, even after the object has been swept.
+/// A finalize callback receives such a ref and may read the private-data
+/// slot, which is keyed by id rather than by the (now dead) value.
+pub fn object_id(r: JSValueRef) -> Option<u64> {
+    if r.is_null() {
+        return None;
+    }
+    if is_tagged(r) {
+        return Some(untag(r));
+    }
+    ref_to_value(r).and_then(|value| object_handle(&value).map(|object| object.id()))
+}
+
 /// Add a reference to a primitive value ref; objects are already pinned by
 /// the ref itself.
 pub fn protect_value_ref(r: JSValueRef) {

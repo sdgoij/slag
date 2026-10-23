@@ -13,8 +13,10 @@
 //! when the `jit` feature is compiled and this flag does not exist without
 //! it), `--jit-bench` (run the JIT-vs-interpreter comparison suite), and
 //! the accepted-no-op knobs `--stack-size N`,
-//! `--max-old-space N`, `--harmony-*`. `--help` lists the features this
-//! binary was compiled with.
+//! `--max-old-space N`, `--harmony-*`, and `--allow-fs[=ROOT]` (install the
+//! host `fs` global; without a root it is unrestricted, with one every path
+//! is confined to that directory). `--help` lists the features this binary
+//! was compiled with.
 
 use std::io::{self, BufRead, Write};
 use std::process::ExitCode;
@@ -40,6 +42,9 @@ struct Options {
     nursery_stress: bool,
     nursery_threshold: Option<usize>,
     jsx: bool,
+    /// `--allow-fs[=ROOT]`: install the host `fs` global. Without a root the
+    /// script gets the whole filesystem; with one, every path is confined.
+    allow_fs: Option<Option<std::path::PathBuf>>,
     stack_size: Option<u64>,
     max_old_space: Option<u64>,
     #[cfg(feature = "jit")]
@@ -81,6 +86,15 @@ fn parse(args: &[String]) -> Command {
             "--dump-ast" => options.dump_ast = true,
             "--dump-tokens" => options.dump_tokens = true,
             "--jsx" => options.jsx = true,
+            "--allow-fs" => options.allow_fs = Some(None),
+            flag if flag.starts_with("--allow-fs=") => {
+                let root = &flag["--allow-fs=".len()..];
+                if root.is_empty() {
+                    eprintln!("slag: --allow-fs= needs a directory");
+                    return Command::Help;
+                }
+                options.allow_fs = Some(Some(std::path::PathBuf::from(root)));
+            }
             "--bench" => options.bench = true,
             "--print-bytecode" => options.print_bytecode = true,
             #[cfg(feature = "jit")]
@@ -149,6 +163,9 @@ fn run(command: Command) -> Result<(), u8> {
             eprintln!("  --help, -h");
             eprintln!("  --dump-ast, --dump-tokens");
             eprintln!("  --jsx                     parse the file/input with the JSX extension");
+            eprintln!(
+                "  --allow-fs[=ROOT]         install the host fs global (confined to ROOT when given)"
+            );
             eprintln!("  --bench                   interpreter micro-benchmarks");
             #[cfg(feature = "jit")]
             eprintln!(
@@ -314,7 +331,9 @@ fn run_file_inner(file: &str, args: &[String], options: &Options, source: &str) 
     if !options.jitless {
         jit::install(context.agent_mut()).map_err(report)?;
     }
-    context.install_fs().map_err(report)?;
+    if let Some(root) = &options.allow_fs {
+        context.install_fs_in(root.as_deref()).map_err(report)?;
+    }
     // JSX desugars to `rlx.h(...)` calls, so the declarative layer is part
     // of the `--jsx` goal.
     if options.jsx {
@@ -419,6 +438,9 @@ fn repl(options: &Options) -> Result<(), u8> {
     context.set_gc_stress(options.gc_stress);
     context.set_gc_verify(options.gc_verify || options.gc_stress);
     apply_nursery_options(&mut context, options);
+    if let Some(root) = &options.allow_fs {
+        context.install_fs_in(root.as_deref()).map_err(report)?;
+    }
     if options.jsx {
         context.install_rlx().map_err(report)?;
     }
@@ -1033,6 +1055,32 @@ mod tests {
                 file: "main.js".into(),
                 args: vec![],
                 options: Options::default(),
+            }
+        );
+    }
+
+    #[test]
+    fn allow_fs_flags_are_recognized() {
+        assert_eq!(
+            parse(&["--allow-fs".into(), "a.js".into()]),
+            Command::Run {
+                file: "a.js".into(),
+                args: vec![],
+                options: Options {
+                    allow_fs: Some(None),
+                    ..Options::default()
+                },
+            }
+        );
+        assert_eq!(
+            parse(&["--allow-fs=public".into(), "a.js".into()]),
+            Command::Run {
+                file: "a.js".into(),
+                args: vec![],
+                options: Options {
+                    allow_fs: Some(Some(std::path::PathBuf::from("public"))),
+                    ..Options::default()
+                },
             }
         );
     }

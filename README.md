@@ -91,9 +91,11 @@ toggling a change) restores the binaries in about a second instead of relinking
 for minutes. `tools/build.sh -p cli` builds only `slag` and `leak`;
 `--print-key` shows which entry the current tree maps to.
 
-The CLI exposes `process.argv` and a minimal `fs` (`readFileSync`/
-`readdirSync`/`statSync`) to scripts — `readFileSync` returns the raw bytes as a
-`Uint8Array` unless a `'utf8'` encoding is passed — and accepts `--dump-ast`,
+The CLI exposes `process.argv` and, with `--allow-fs[=ROOT]`, a minimal `fs`
+(`readFileSync`/`writeFileSync`/`readdirSync`/`statSync`) to scripts; without a
+root the global sees the whole filesystem, with one every path is canonicalized
+and must stay inside it. `readFileSync` returns the raw bytes as a `Uint8Array`
+unless a `'utf8'` encoding is passed. The CLI also accepts `--dump-ast`,
 `--dump-tokens`, `--print-bytecode` (dump the compiled `Step` stream),
 `--bench` (interpreter micro-benchmarks), and — when the JIT feature is
 compiled, the default — `--jitless` (disable the Cranelift JIT for the run;

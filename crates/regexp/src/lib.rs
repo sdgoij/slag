@@ -129,6 +129,12 @@ impl std::fmt::Display for Error {
     }
 }
 
+/// The matcher stopped because its step or choice budget was exhausted. The
+/// caller maps this to a host `RangeError`; the unchecked methods treat it as
+/// a non-match.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BudgetExceeded;
+
 /// A character-set predicate for `\d \w \s` and `\p{…}` classes that are not
 /// case-folded and not in `/v` set arithmetic (matched per character at match
 /// time instead of enumerated into ranges).
@@ -353,6 +359,43 @@ impl Regex {
     /// The boolean half of `exec_at` (a sticky search): the match end only.
     pub fn match_end_at(&self, input: &[u16], start: usize) -> Option<usize> {
         engine::exec_end(self, input, start)
+    }
+
+    /// `exec_at`, reporting a budget exhaustion as an error rather than a
+    /// non-match.
+    pub fn exec_at_checked(
+        &self,
+        input: &[u16],
+        start: usize,
+    ) -> Result<Option<Match>, BudgetExceeded> {
+        engine::exec_checked(self, input, start)
+    }
+
+    /// `search_at`, reporting a budget exhaustion as an error.
+    pub fn search_at_checked(
+        &self,
+        input: &[u16],
+        start: usize,
+    ) -> Result<Option<(usize, Match)>, BudgetExceeded> {
+        engine::search_checked(self, input, start)
+    }
+
+    /// `search_end_at`, reporting a budget exhaustion as an error.
+    pub fn search_end_at_checked(
+        &self,
+        input: &[u16],
+        start: usize,
+    ) -> Result<Option<(usize, usize)>, BudgetExceeded> {
+        engine::search_end_checked(self, input, start)
+    }
+
+    /// `match_end_at`, reporting a budget exhaustion as an error.
+    pub fn match_end_at_checked(
+        &self,
+        input: &[u16],
+        start: usize,
+    ) -> Result<Option<usize>, BudgetExceeded> {
+        engine::exec_end_checked(self, input, start)
     }
 
     /// Leftmost search: try `start`, advancing by one character on failure

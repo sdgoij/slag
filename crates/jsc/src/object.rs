@@ -427,20 +427,20 @@ pub unsafe extern "C" fn JSObjectSetPropertyAtIndex(
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn JSObjectGetPrivate(object: JSObjectRef) -> *mut c_void {
     crate::guard(|| {
-        let Some(object) = refs::ref_to_value(object).and_then(|value| value.as_object()) else {
+        let Some(id) = refs::object_id(object) else {
             return ptr::null_mut();
         };
-        class::get_private(object.id()).unwrap_or(0) as *mut c_void
+        class::get_private(id).unwrap_or(0) as *mut c_void
     })
 }
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn JSObjectSetPrivate(object: JSObjectRef, data: *mut c_void) -> bool {
     crate::guard(|| {
-        let Some(object) = refs::ref_to_value(object).and_then(|value| value.as_object()) else {
+        let Some(id) = refs::object_id(object) else {
             return false;
         };
-        class::set_private(object.id(), data as usize);
+        class::set_private(id, data as usize);
         true
     })
 }

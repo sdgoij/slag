@@ -433,8 +433,8 @@ fn regexp_builtin_match(
         obj,
         flags,
         string.len(),
-        |i| compiled.exec_at(input, i),
-        |i| compiled.search_at(input, i),
+        |i| compiled.exec_at_checked(input, i),
+        |i| compiled.search_at_checked(input, i),
         |start, captures| captures[0].map(|(_, end)| end).unwrap_or(start),
     )?
     else {
@@ -451,6 +451,13 @@ fn regexp_builtin_match(
 /// unconditional and comes *before* the global/sticky check that may then zero
 /// it (steps 4 and 8; `built-ins/RegExp/prototype/exec/failure-lastindex-
 /// access.js` pins the single read) — cannot drift between the two callers.
+fn regexp_budget_error(_: regexp::BudgetExceeded) -> JsError {
+    JsError::new(
+        ErrorKind::RangeError,
+        "Regular expression is too complex".into(),
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 fn regexp_exec_protocol<M>(
     agent: &mut Agent,
@@ -458,8 +465,8 @@ fn regexp_exec_protocol<M>(
     obj: &Handle<JsObject>,
     flags: regexp::Flags,
     length: usize,
-    at: impl FnOnce(usize) -> Option<M>,
-    search: impl FnOnce(usize) -> Option<(usize, M)>,
+    at: impl FnOnce(usize) -> Result<Option<M>, regexp::BudgetExceeded>,
+    search: impl FnOnce(usize) -> Result<Option<(usize, M)>, regexp::BudgetExceeded>,
     end: impl FnOnce(usize, &M) -> usize,
 ) -> Result<Option<(usize, M)>, JsError> {
     let last_index_value = get_property(agent, regexp, &JsString::from_utf8("lastIndex"), *regexp)?;
@@ -474,7 +481,7 @@ fn regexp_exec_protocol<M>(
             obj.set(&JsString::from_utf8("lastIndex"), Value::Number(0.0), true)?;
             return Ok(None);
         }
-        match at(last_index) {
+        match at(last_index).map_err(regexp_budget_error)? {
             Some(m) => m,
             None => {
                 obj.set(&JsString::from_utf8("lastIndex"), Value::Number(0.0), true)?;
@@ -484,7 +491,7 @@ fn regexp_exec_protocol<M>(
     } else {
         // Leftmost search; the engine's leading-char prefilter skips
         // positions where no match can start.
-        match search(last_index) {
+        match search(last_index).map_err(regexp_budget_error)? {
             Some((index, m)) => {
                 last_index = index;
                 m
@@ -673,8 +680,8 @@ fn test(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsErro
         &obj,
         flags,
         string.len(),
-        |i| compiled.match_end_at(input, i),
-        |i| compiled.search_end_at(input, i),
+        |i| compiled.match_end_at_checked(input, i),
+        |i| compiled.search_end_at_checked(input, i),
         |_, end| *end,
     )?
     .is_some();

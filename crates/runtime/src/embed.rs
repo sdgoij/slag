@@ -19,6 +19,8 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fmt;
+#[cfg(feature = "fs")]
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 use crux::error::{ErrorKind, JsError};
@@ -243,6 +245,67 @@ struct TimerState {
 }
 
 /// The embedding context: an initialized agent plus host globals.
+/// A per-file read cap for the host `fs` global.
+#[cfg(feature = "fs")]
+const MAX_FS_READ_BYTES: u64 = 1 << 28;
+/// A per-directory entry cap for `readdirSync`.
+#[cfg(feature = "fs")]
+const MAX_FS_ENTRIES: usize = 1 << 20;
+
+#[cfg(feature = "fs")]
+fn fs_error(path: &str, reason: impl std::fmt::Display) -> JsError {
+    JsError::new(ErrorKind::TypeError, format!("fs: {path}: {reason}"))
+}
+
+/// Resolve a read/stat/readdir path, requiring it to stay inside `root` when
+/// one was granted. Canonicalization resolves symlinks and `..`, so a link
+/// pointing outside the root is rejected rather than followed.
+#[cfg(feature = "fs")]
+fn resolve_fs_read(root: Option<&Path>, path: &str) -> Result<PathBuf, JsError> {
+    let Some(root) = root else {
+        return Ok(PathBuf::from(path));
+    };
+    let candidate = if Path::new(path).is_absolute() {
+        PathBuf::from(path)
+    } else {
+        root.join(path)
+    };
+    let canonical = candidate.canonicalize().map_err(|e| fs_error(path, e))?;
+    if !canonical.starts_with(root) {
+        return Err(fs_error(path, "outside the allowed root"));
+    }
+    Ok(canonical)
+}
+
+/// Resolve a write path. The parent directory must canonicalize inside the
+/// root; an existing target (including a symlink) must also resolve there.
+#[cfg(feature = "fs")]
+fn resolve_fs_write(root: Option<&Path>, path: &str) -> Result<PathBuf, JsError> {
+    let Some(root) = root else {
+        return Ok(PathBuf::from(path));
+    };
+    let candidate = if Path::new(path).is_absolute() {
+        PathBuf::from(path)
+    } else {
+        root.join(path)
+    };
+    if let Ok(existing) = candidate.canonicalize() {
+        if !existing.starts_with(root) {
+            return Err(fs_error(path, "outside the allowed root"));
+        }
+        return Ok(existing);
+    }
+    let parent = candidate.parent().unwrap_or(root);
+    let parent = parent.canonicalize().map_err(|e| fs_error(path, e))?;
+    if !parent.starts_with(root) {
+        return Err(fs_error(path, "outside the allowed root"));
+    }
+    let name = candidate
+        .file_name()
+        .ok_or_else(|| fs_error(path, "not a file path"))?;
+    Ok(parent.join(name))
+}
+
 pub struct Context {
     /// Boxed so the agent's address is stable. The GC registers a live agent
     /// by its address (see `Agent::initialize_host_defined_realm`), and this
@@ -976,6 +1039,33 @@ impl Context {
     /// returns the lossily-decoded text. Only compiled with the `fs` feature.
     #[cfg(feature = "fs")]
     pub fn install_fs(&mut self) -> Result<(), JsError> {
+        self.install_fs_in(None)
+    }
+
+    /// Install `fs` confined to `root` when one is given. Paths are
+    /// canonicalized (so `..` and symlinks cannot escape) and rejected when
+    /// they resolve outside the root.
+    #[cfg(feature = "fs")]
+    pub fn install_fs_in(&mut self, root: Option<&Path>) -> Result<(), JsError> {
+        let root = match root {
+            Some(path) => {
+                let canonical = path
+                    .canonicalize()
+                    .map_err(|e| JsError::new(ErrorKind::TypeError, format!("fs root: {e}")))?;
+                if !canonical.is_dir() {
+                    return Err(JsError::new(
+                        ErrorKind::TypeError,
+                        "fs root is not a directory".into(),
+                    ));
+                }
+                Some(canonical)
+            }
+            None => None,
+        };
+        let read_root = root.clone();
+        let write_root = root.clone();
+        let read_dir_root = root.clone();
+        let stat_root = root;
         let realm = self.agent.current_realm()?;
         let object_proto = realm
             .intrinsics
@@ -986,11 +1076,17 @@ impl Context {
         let read_file = Function::create_builtin(
             Some(JsString::from_utf8("readFileSync")),
             1,
-            Box::new(|_, args| {
-                let path = string_arg(args, 0, "readFileSync")?;
-                let bytes = std::fs::read(&path).map_err(|e| {
-                    JsError::new(ErrorKind::TypeError, format!("readFileSync: {path}: {e}"))
-                })?;
+            Box::new(move |_, args| {
+                let raw = string_arg(args, 0, "readFileSync")?;
+                let path = resolve_fs_read(read_root.as_deref(), &raw)?;
+                let metadata = std::fs::metadata(&path).map_err(|e| fs_error(&raw, e))?;
+                if metadata.len() > MAX_FS_READ_BYTES {
+                    return Err(JsError::new(
+                        ErrorKind::RangeError,
+                        format!("readFileSync: {raw}: file is too large"),
+                    ));
+                }
+                let bytes = std::fs::read(&path).map_err(|e| fs_error(&raw, e))?;
                 if read_file_wants_text(args)? {
                     let text = String::from_utf8_lossy(&bytes);
                     return Ok(Value::String(Handle::new(JsString::from_utf8(&text))));
@@ -1008,12 +1104,11 @@ impl Context {
         let write_file = Function::create_builtin(
             Some(JsString::from_utf8("writeFileSync")),
             2,
-            Box::new(|_, args| {
-                let path = string_arg(args, 0, "writeFileSync")?;
+            Box::new(move |_, args| {
+                let raw = string_arg(args, 0, "writeFileSync")?;
                 let text = string_arg(args, 1, "writeFileSync")?;
-                std::fs::write(&path, text).map_err(|e| {
-                    JsError::new(ErrorKind::TypeError, format!("writeFileSync: {path}: {e}"))
-                })?;
+                let path = resolve_fs_write(write_root.as_deref(), &raw)?;
+                std::fs::write(&path, text).map_err(|e| fs_error(&raw, e))?;
                 Ok(Value::Undefined)
             }),
             None,
@@ -1027,17 +1122,20 @@ impl Context {
         let read_dir = Function::create_builtin(
             Some(JsString::from_utf8("readdirSync")),
             1,
-            Box::new(|_, args| {
-                let path = string_arg(args, 0, "readdirSync")?;
+            Box::new(move |_, args| {
+                let raw = string_arg(args, 0, "readdirSync")?;
+                let path = resolve_fs_read(read_dir_root.as_deref(), &raw)?;
                 let agent = current_agent_mut()?;
                 let mut names = Vec::new();
-                for entry in std::fs::read_dir(&path).map_err(|e| {
-                    JsError::new(ErrorKind::TypeError, format!("readdirSync: {path}: {e}"))
-                })? {
-                    let entry = entry.map_err(|e| {
-                        JsError::new(ErrorKind::TypeError, format!("readdirSync: {path}: {e}"))
-                    })?;
+                for entry in std::fs::read_dir(&path).map_err(|e| fs_error(&raw, e))? {
+                    let entry = entry.map_err(|e| fs_error(&raw, e))?;
                     names.push(entry.file_name().to_string_lossy().into_owned());
+                    if names.len() > MAX_FS_ENTRIES {
+                        return Err(JsError::new(
+                            ErrorKind::RangeError,
+                            format!("readdirSync: {raw}: too many entries"),
+                        ));
+                    }
                 }
                 let values: Vec<Value> = names
                     .iter()
@@ -1056,11 +1154,10 @@ impl Context {
         let stat = Function::create_builtin(
             Some(JsString::from_utf8("statSync")),
             1,
-            Box::new(|_, args| {
-                let path = string_arg(args, 0, "statSync")?;
-                let meta = std::fs::metadata(&path).map_err(|e| {
-                    JsError::new(ErrorKind::TypeError, format!("statSync: {path}: {e}"))
-                })?;
+            Box::new(move |_, args| {
+                let raw = string_arg(args, 0, "statSync")?;
+                let path = resolve_fs_read(stat_root.as_deref(), &raw)?;
+                let meta = std::fs::metadata(&path).map_err(|e| fs_error(&raw, e))?;
                 let object = CruxObject::ordinary_object_create(None);
                 object.create_data_property_or_throw(
                     &JsString::from_utf8("size"),
@@ -3231,6 +3328,52 @@ mod tests {
             .unwrap();
         assert_eq!(std::fs::read_to_string(&out).unwrap(), "written back");
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    #[cfg(feature = "fs")]
+    fn fs_root_confines_paths() {
+        let dir = std::env::temp_dir().join(format!("slag_fs_root_{}", std::process::id()));
+        let outside_name = format!("slag_fs_outside_{}.txt", std::process::id());
+        let outside = std::env::temp_dir().join(&outside_name);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("inside.txt"), "in").unwrap();
+        std::fs::write(&outside, "out").unwrap();
+
+        let mut context = Context::new().unwrap();
+        context.install_fs_in(Some(&dir)).unwrap();
+        let inside = context
+            .eval("fs.readFileSync('inside.txt', 'utf8')")
+            .unwrap();
+        assert_eq!(inside.as_string().as_deref(), Some("in"));
+        context
+            .eval("fs.writeFileSync('new.txt', 'created')")
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.join("new.txt")).unwrap(),
+            "created"
+        );
+
+        let escape = format!("../{outside_name}");
+        assert!(
+            context
+                .eval(&format!("fs.readFileSync('{escape}', 'utf8')"))
+                .is_err()
+        );
+        let absolute = outside.to_str().unwrap().replace('\\', "\\\\");
+        assert!(
+            context
+                .eval(&format!("fs.readFileSync('{absolute}', 'utf8')"))
+                .is_err()
+        );
+        assert!(
+            context
+                .eval(&format!("fs.writeFileSync('{absolute}', 'x')"))
+                .is_err()
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_file(&outside).ok();
     }
 
     #[test]

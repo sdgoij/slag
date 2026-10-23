@@ -67,7 +67,7 @@ thread_local! {
     /// when the class itself is released or when JSClassRelease is
     /// called. The entry lives for the thread (it holds a C callback
     /// pointer that the host keeps alive).
-    static FINALIZERS: RefCell<HashMap<u64, JSObjectFinalizeCallback>> =
+    static FINALIZERS: RefCell<HashMap<u64, (usize, JSObjectFinalizeCallback)>> =
         RefCell::new(HashMap::new());
 }
 
@@ -331,6 +331,10 @@ impl HostOps for ClassOps {
     fn is_constructible(&self) -> bool {
         self.definition().call_as_constructor.is_some()
     }
+
+    fn finalize(&self, object_id: u64) {
+        invoke_finalize(object_id);
+    }
 }
 
 /// The `.prototype` property of the `newTarget` — the instance's prototype.
@@ -387,10 +391,10 @@ pub unsafe extern "C" fn JSClassRelease(js_class: JSClassRef) {
         CLASSES.with(|classes| {
             classes.borrow_mut().remove(&(js_class as usize));
         });
-        // Clear per-class finalize callbacks. Objects created while this
-        // class was live keep their per-object finalizer registrations
-        // (the C host keeps the callback pointer alive).
-        clear_finalizers();
+        // Clear this class's finalize callbacks. Objects created while this
+        // class was live keep their private data but no longer run a
+        // finalizer the C host may have already freed.
+        clear_finalizers(js_class);
     })
 }
 
@@ -416,19 +420,35 @@ pub(crate) fn class_ops(js_class: JSClassRef) -> Rc<dyn HostOps> {
 }
 
 /// Register a finalize callback for a specific object id.
-pub(crate) fn register_finalizer(object_id: u64, callback: JSObjectFinalizeCallback) {
-    FINALIZERS.with(|f| f.borrow_mut().insert(object_id, callback));
+pub(crate) fn register_finalizer(
+    object_id: u64,
+    js_class: JSClassRef,
+    callback: JSObjectFinalizeCallback,
+) {
+    FINALIZERS.with(|f| {
+        f.borrow_mut()
+            .insert(object_id, (js_class as usize, callback));
+    });
 }
 
-/// Clear all registered finalizers (called when a class is released).
-pub(crate) fn clear_finalizers() {
-    FINALIZERS.with(|f| f.borrow_mut().clear());
+/// Clear the finalizers registered by one class.
+pub(crate) fn clear_finalizers(js_class: JSClassRef) {
+    let class = js_class as usize;
+    FINALIZERS.with(|f| {
+        if class == 0 {
+            f.borrow_mut().clear();
+        } else {
+            f.borrow_mut().retain(|_, (owner, _)| *owner != class);
+        }
+    });
 }
 
-/// Invoke the finalize callback for an object, if registered.
+/// Invoke the finalize callback for an object, if registered. The entry is
+/// removed first, so a callback that re-enters cannot fire it twice.
 pub fn invoke_finalize(object_id: u64) {
-    if let Some(callback) = FINALIZERS.with(|f| f.borrow().get(&object_id).copied()) {
-        unsafe { callback(object_id as *mut _) };
+    let callback = FINALIZERS.with(|f| f.borrow_mut().remove(&object_id));
+    if let Some((_, callback)) = callback {
+        unsafe { callback(refs::object_id_ref(object_id)) };
     }
 }
 
@@ -466,7 +486,7 @@ pub(crate) fn make_object(
         if let Some(callback) =
             class_entry(js_class).and_then(|entry| entry.ops.finalize_callback.get())
         {
-            register_finalizer(object.id(), callback);
+            register_finalizer(object.id(), js_class, callback);
         }
     }
     object

@@ -118,6 +118,10 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
 
 
 def ensure_checkout(deno_dir: Path, pin: str, fetch: bool) -> None:
+    # A branch or short ref can be moved or repointed after review; only a
+    # full commit id is a reproducible supply-chain input.
+    if len(pin) != 40 or any(c not in "0123456789abcdef" for c in pin):
+        die(f"pin must be a full 40-hex commit, got {pin!r}")
     if not (deno_dir / ".git").is_dir():
         log(f"cloning {DENO_REPO} into {deno_dir}")
         deno_dir.parent.mkdir(parents=True, exist_ok=True)

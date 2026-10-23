@@ -4,6 +4,9 @@ name = "v8"
 # `v8 = "150.4.0"` resolves to this one. Deliberately not the workspace version.
 version = "150.4.0"
 edition.workspace = true
+# This stands in for the crates.io `v8` under a `[patch.crates-io]`, never a
+# published replacement; a private registry must not accept it as one.
+publish = false
 license.workspace = true
 
 [lib]

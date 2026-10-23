@@ -2211,6 +2211,9 @@ pub fn compile_and_instantiate_bytes(
 /// A JS-created table's allocation cap (the engine materializes the whole
 /// element vector up front; tables beyond this are far beyond any wasm use).
 const MAX_JS_TABLE_ELEMENTS: u64 = wasm::exec::MAX_TABLE_ELEMENTS;
+/// Bound on the agent's externref payload table; each conversion pins a JS
+/// value there for the life of the agent.
+const MAX_EXTERN_VALUES: usize = 1 << 20;
 
 fn table_proto(agent: &Agent) -> Result<Handle<JsObject>, JsError> {
     agent
@@ -2391,7 +2394,7 @@ fn global_construct(
         // An externref global defaults to `undefined` (the JS-API's externref
         // is a JS-value cell; a wasm null reference is not its default).
         if matches!(value_type, ValType::Ref(wasm::types::RefType::EXTERN)) {
-            WasmValue::Ref(to_externref(agent, Value::Undefined))
+            WasmValue::Ref(to_externref(agent, Value::Undefined)?)
         } else {
             default_wasm_value(&value_type)
         }
@@ -2494,11 +2497,17 @@ fn funcref_to_js(agent: &mut Agent, reference: RefValue) -> Result<Value, JsErro
 /// arbitrary JS value (null and undefined included, round-tripping
 /// distinctly), kept alive by the agent — and return the engine reference
 /// (an opaque `ExternInner::Host` payload).
-fn to_externref(agent: &mut Agent, value: Value) -> RefValue {
+fn to_externref(agent: &mut Agent, value: Value) -> Result<RefValue, JsError> {
+    if agent.wasm_extern_values.len() >= MAX_EXTERN_VALUES {
+        return Err(JsError::new(
+            ErrorKind::RangeError,
+            "too many externref values".into(),
+        ));
+    }
     let token = agent.wasm_extern_seq;
     agent.wasm_extern_seq = agent.wasm_extern_seq.wrapping_add(1);
     agent.wasm_extern_values.insert(token, value);
-    RefValue::Extern(ExternInner::Host(token))
+    Ok(RefValue::Extern(ExternInner::Host(token)))
 }
 
 /// One wasm externref → the JS value it holds (a null reference is JS null;
@@ -2596,7 +2605,7 @@ fn table_construct(
         if matches!(fill_value.kind(), ValueKind::Undefined) {
             RefValue::Null
         } else {
-            to_externref(agent, fill_value)
+            to_externref(agent, fill_value)?
         }
     } else if matches!(fill_value.kind(), ValueKind::Undefined | ValueKind::Null) {
         RefValue::Null
@@ -2713,7 +2722,7 @@ fn table_set_element(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<
     // function nor null), while externref accepts any JS value.
     let supplied = args.get(1).copied();
     let reference = if element == wasm::types::RefType::EXTERN {
-        to_externref(agent, supplied.unwrap_or(Value::Undefined))
+        to_externref(agent, supplied.unwrap_or(Value::Undefined))?
     } else {
         match supplied {
             None => RefValue::Null,
@@ -2766,7 +2775,7 @@ fn table_grow_element(agent: &mut Agent, this: &Value, args: &[Value]) -> Result
         if matches!(fill_value.kind(), ValueKind::Undefined) {
             RefValue::Null
         } else {
-            to_externref(agent, fill_value)
+            to_externref(agent, fill_value)?
         }
     } else if matches!(fill_value.kind(), ValueKind::Undefined | ValueKind::Null) {
         RefValue::Null
@@ -3210,7 +3219,7 @@ fn wasm_arg(agent: &mut Agent, param: &ValType, value: &Value) -> Result<WasmVal
         ValType::F64 => WasmValue::F64(to_number(value)?.to_bits()),
         ValType::V128 => return Err(unsupported("v128")),
         ValType::Ref(reference) if *reference == wasm::types::RefType::EXTERN => {
-            WasmValue::Ref(to_externref(agent, *value))
+            WasmValue::Ref(to_externref(agent, *value)?)
         }
         ValType::Ref(_) => return Err(unsupported("reference")),
     })
@@ -3429,7 +3438,7 @@ fn invoke_export(
                                     // Wrap the arbitrary JS value in the JS
                                     // tag as an externref payload.
                                     let cell = js_tag_cell(agent)?;
-                                    let payload = to_externref(agent, value);
+                                    let payload = to_externref(agent, value)?;
                                     let args = vec![WasmValue::Ref(payload)];
                                     let mut store = agent.wasm_store.borrow_mut();
                                     let exn = store.new_exception(cell, args);
