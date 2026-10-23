@@ -170,6 +170,44 @@ jobs:
           target/release/sweep language --filter "*array*" --sample 4 \
             --gc-stress --gc-verify --timeout 15 --recheck-timeout 15
 
+  audit:
+    name: Dependency audit
+    needs: lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - name: Install the pinned toolchain
+        run: rustup show
+      # Pinned rather than `latest`, so a new advisory-tool release cannot change
+      # the gate on its own. The advisory database itself is fetched at run time.
+      - uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2
+        with:
+          tool: cargo-audit@0.22.2
+      - name: Audit Cargo.lock
+        run: cargo audit
+
+  # Miri is scoped to the front end. `crux`'s conservative collector reads the
+  # native stack, which Miri cannot model, and the parser/regexp suites are too
+  # slow to interpret; the lexer and syntax layers are small, pure, and finish in
+  # seconds, so they are the part that can be a gate.
+  miri:
+    name: Miri (front end)
+    needs: lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - name: Install a nightly toolchain with Miri
+        run: |
+          rustup toolchain install nightly --profile minimal \
+            --component miri --component rust-src
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+      - name: Miri the lexer
+        run: cargo +nightly miri test -p lexer --lib
+      - name: Miri the syntax layer
+        run: cargo +nightly miri test -p syntax --lib
+
   wasm:
     name: WebAssembly conformance (${{ matrix.os }})
     needs: lint

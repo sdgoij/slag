@@ -146,16 +146,18 @@ Fixed and validated in the first remediation pass:
 - **M-8 (actions)** — every workflow `uses:` is pinned to a 40-hex commit with
   the moving tag kept as a trailing comment, so a retagged action cannot change
   what CI runs.
-- **M-9 (partial)** — CI gained a `gc-stress` job that runs the Array built-in
-  and array-expression fixtures under `--gc-stress --gc-verify`, the
-  per-allocation collection class that exposed C-1. `cargo audit`, Miri, and
-  fuzzing remain absent.
+- **M-9** — CI gained a `gc-stress` job (Array built-ins and array expressions
+  under `--gc-stress --gc-verify`, the collection class that exposed C-1), a
+  `cargo audit` job pinned to `cargo-audit 0.22.2`, and a Miri job scoped to the
+  lexer and syntax crates. Miri cannot run `crux` (the collector reads the
+  native stack) or the parser/regexp suites (too slow to interpret); fuzzing
+  remains absent.
 
 Outstanding from this report: the JSC string/value/object ref namespace, the
 `crates/v8` per-thread realm slot, the Deno build's one-time unlocked reconcile
 (now logged and followed by a locked build), the remaining Medium items
 (`current_agent_mut` aliasing, eager resizable-buffer allocation under
-`workers`, worker memory atomics), and the `cargo audit`/Miri/fuzzing gap.
+`workers`, worker memory atomics), and the fuzzing gap.
 
 Validation for the first pass: `cargo clippy --workspace --all-targets -- -D
 warnings` is clean; `cargo fmt --all -- --check` is clean; 1,062 runtime unit
@@ -203,6 +205,12 @@ Validation for the seventh pass: the new `gc-stress` commands were run locally
 first — 33 Array built-in fixtures and 25 array-expression fixtures pass under
 `--gc-stress --gc-verify` inside the 15s deadline — and every workflow `uses:`
 is pinned to a 40-hex commit.
+
+Validation for the eighth pass: `cargo audit` reports no advisories over 134
+crate dependencies (exit 0); `cargo +nightly miri test -p lexer --lib` passes 59
+tests and `-p syntax --lib` passes 11. The `crux`, `parser`, and `regexp`
+suites were measured and excluded from the Miri gate: `crux` needs the native
+stack, and the other two do not finish in a usable time under interpretation.
 
 ---
 
