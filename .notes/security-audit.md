@@ -571,6 +571,49 @@ few hundred KB of types/exports/locals can hang `WebAssembly.validate` for hours
 
 ---
 
+## M-1 design note: the agent aliasing model (open)
+
+M-1 is not a `current_agent_mut` defect; it is the engine's ownership model.
+
+- `crux::function::with_agent` stores a raw agent pointer in TLS, and skips the
+  store when the same *address* is already current. A nested
+  `runtime::function::call` therefore leaves the slot holding an ancestor of the
+  live `&mut Agent`s (a reborrow has the same address).
+- Retagging `&mut Agent` from that ancestor — `current_agent_mut`, or the ECMA
+  hook — pops every descendant tag under Stacked Borrows. The frames keep using
+  those `&mut`s after the call returns, and LLVM's `noalias` on them was
+  violated while the retagged reference was live.
+- The collector has the same shape: `live_agent_ptrs()` + `trace_roots` read
+  every agent on the thread during *any* allocation. That access runs through
+  the registered root pointer, an ancestor, so it invalidates the live `&mut`s
+  as well. Passing the agent explicitly to host callbacks, or refreshing TLS at
+  each dispatch, is therefore not sufficient on its own: an allocation inside
+  the callback still runs a collection.
+- The only model-sound fix is for collection-time and host-callback-time access
+  to go through interior mutability (`Cell`/`RefCell`/`UnsafeCell`), which a
+  `&mut Agent` does not assert uniqueness over. `trace_roots` touches ~100
+  fields; some are already interior-mutable (`realms`, `function_realms`, the
+  generator tables), but the hottest are plain (`execution_context_stack`,
+  `ecma_functions`, `compiled_bodies`, `microtask_queues`).
+- Miri cannot validate any candidate: the arena's address-tagged boxes are
+  int-to-pointer and fail before an aliasing check runs.
+
+Options:
+
+| Option | Scope | Verdict |
+|---|---|---|
+| A. Document as debt | none | Zero risk; the aliasing stays on paper |
+| B. Explicit agent for host callbacks | ~70 mechanical native signatures + dispatch | Removes the user-controlled re-entry, not the collector |
+| C. Interior-mutable traced state, staged | Move the fields `trace_roots` reads behind `UnsafeCell`/`RefCell` | The only complete fix; large and perf-sensitive |
+| D. Root-set GC | Roots live outside `Agent`, registered at safe points | Best long term; a GC redesign |
+
+Recommendation: B first (it deletes the `&'static mut` fabrication from the
+host surface and makes the remaining paths internal), then C in slices starting
+with the coldest containers, with `--gc-stress` and the call benchmarks as the
+gate. M-1 should not be marked fixed until C lands.
+
+---
+
 ## What was checked and found sound
 
 - **No `unsafe`** in `lexer`, `parser`, `syntax`, `regexp`, or `unicode`; span/slice
