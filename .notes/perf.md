@@ -15736,3 +15736,71 @@ Gates: `cargo fmt --all -- --check`; `cargo clippy --workspace --all-targets -- 
 warnings`; `cargo test --workspace` (38 suites, 0 failed); sweeps `built-ins`
 23,821 + `language` 23,726 + `annexB` 1,086 + `intl402` 3,365 = 51,998 at 100%;
 corpus parity 0.
+
+## PROFILE (2026-10-22): the for-in row, decomposed
+
+`language/statements/for-in/head-let-fresh-binding-per-iteration.js` is still the
+corpus's largest row: **493 ms** (4.93 us per amplified body) against node's
+54 ms. The previous session's guess — that its timed `bench` is uncertified — is
+wrong: `bench` certifies (15 steps) and `__t262Body` runs on the certified-callee
+lane (`run_certified_call_nested`), never through `ordinary_call`. The cost is
+spread over three mechanisms, measured here by ablation on one binary.
+
+Each probe is the row's own shape with one piece removed, 100k body calls,
+medians of a clean build (no in-process timers — an `Instant::now()` left in the
+hot helper cost 1 us/body and read as a 28% row regression):
+
+| probe | ns/body |
+| --- | ---: |
+| full body, the row's six `assert.sameValue` reduced to a one-line `sameValue` | 4849 |
+| same, without the six asserts | 3328 |
+| same as that, without the for-in and its closures (`Object.create(null)` + 3 stores) | 1477 |
+| for-in, 3 closures capturing a function-scope `var` | 2698 |
+| for-in, 3 closures capturing the per-iteration `let` head | 3850 |
+| `for (let i = 0; i < 3; i++)` with 3 capturing closures | 2734 |
+| `for (var i = 0; i < 3; i++)` with 3 capturing closures (control) | 1939 |
+| 3 capturing closures in one body, no loop | 1270 |
+| 3 non-capturing closures in one body, no loop | 749 |
+| 1 capturing / 1 non-capturing closure | 728 / 268 |
+
+Derived, which is what matters:
+
+| piece | cost | share of the row |
+| --- | ---: | ---: |
+| six asserts (each `sameValue` + its reader, incl. `fns.a()` calls) | 1521 ns | ~31% |
+| three per-iteration environments (for-in head) | 1152 ns (384 each) | ~24% |
+| three closures at the non-loop rate | 1270 ns (~423 each) | ~26% |
+| `Object.create(null)`, three stores, for-in enumeration | ~1477 ns | ~30% |
+| capture premium, per closure (a captured binding vs none) | ~173 ns | inside the above |
+| capture-context setup, per call of a body that captures anything | ~370 ns | inside the above |
+
+The shares overlap because the pieces nest; they are the right sizes to choose a
+target from, not a sum.
+
+**The per-iteration environment is the most concentrated fixable block.** The
+`for (let …)` and `for-in (let …)` head copies go through `per_iteration_env`
+(`crates/runtime/src/jit.rs`), which per iteration allocates an `EnvRecord`
+(a ~104-byte arena box for `DeclarativeEnv`, whose `bindings` is a
+`RefCell<Vec<(JsString, Binding)>>`), grows a heap `Vec` for one binding,
+copies the name, and fills a five-field `Binding`. The interpreter's
+`Step::PerIteration` does the same inline. Nothing about the storage is needed
+here: these envs are `context_transparent`, the loop addresses them by slot
+index (`LoadPerIteration { depth, index }`, `set_slot`), and a closure created in
+the body reads the head through its static context chain. A slot-array
+representation for this variant would remove the name clone, the `Binding`, and
+the `Vec` allocation per iteration.
+
+**Not GC.** `--nursery-threshold 262144` against 8192 moves neither the row nor
+the closure probes, so the cost is allocation and teardown, not collection.
+
+Two things to keep in mind. The per-iteration copy costs 384 ns per iteration
+for a for-in head but 265 for a `for (let i = …)` head (`g3 - g4`); the two forms
+emit the same `PerIteration` helper, so the difference is the env it copies
+*from*, and it is unexplained. And the assert share (1521 ns for six) is a
+`sameValue` call plus a reader call each — `fns.a()` on a closure created in the
+same iteration — so it moves with the closure work rather than separately.
+
+Next, in order: (1) the per-iteration env's storage (above); (2) `EcmaFunction`
+Stage A from `.notes/closure-cost-plan.md` plus the capture-context setup, which
+between them are the other ~26%+; (3) the asserts, which are the largest single
+share but decompose into three fresh-closure calls that (1) and (2) also reach.
