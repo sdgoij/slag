@@ -2168,8 +2168,16 @@ impl Agent {
         self.wasm_streaming_handlers.trace(visit);
         self.async_from_sync.trace(visit);
         self.async_from_sync_continuations.trace(visit);
-        self.generators.borrow().trace(visit);
-        self.async_generators.borrow().trace(visit);
+        // A generator's `next`/`resume` can hold the cell across an
+        // allocation; abort the sweep instead of panicking on the borrow.
+        match self.generators.try_borrow() {
+            Ok(generators) => generators.trace(visit),
+            Err(_) => crux::heap::note_aborted_trace(),
+        }
+        match self.async_generators.try_borrow() {
+            Ok(generators) => generators.trace(visit),
+            Err(_) => crux::heap::note_aborted_trace(),
+        }
         self.async_generator_awaits.trace(visit);
         self.iterator_helpers.trace(visit);
         self.wrapped_iterators.trace(visit);

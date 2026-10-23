@@ -713,11 +713,22 @@ impl Trace for ArraySlots {
         if len == 0 {
             return;
         }
-        let ptr = self.elem_ptr.get();
-        // SAFETY: `elem_ptr`/`elem_len` describe the initialized elements of
-        // the live allocation (refreshed on every realloc; the compiled
-        // append's capacity gate keeps the pointer stable). Holes are not
-        // heap references, so they trace as no-ops.
+        // Borrow instead of reading the cached cursor: a guard held across an
+        // allocation may have moved the buffer, and the cached `elem_ptr` then
+        // points at freed memory. A live mutable guard is the same condition
+        // every other container answers with an aborted sweep.
+        let elements = match self.elements.try_borrow() {
+            Ok(elements) => elements,
+            Err(_) => {
+                crate::heap::note_aborted_trace();
+                return;
+            }
+        };
+        let len = len.min(elements.capacity());
+        let ptr = elements.as_ptr();
+        // SAFETY: the borrow keeps the buffer alive, and `[0, len)` was written
+        // either through the Vec or by the compiled append under its capacity
+        // gate. Holes are not heap references, so they trace as no-ops.
         for index in 0..len {
             unsafe { (*ptr.add(index)).trace(visit) };
         }
@@ -741,7 +752,15 @@ impl Trace for ArraySlots {
     fn trace_dirty(&self, visit: &mut dyn FnMut(GcAny)) {
         let (generation, from) = self.dirty_from.get();
         let len = self.elem_len.get();
-        let ptr = self.elem_ptr.get();
+        let elements = match self.elements.try_borrow() {
+            Ok(elements) => elements,
+            Err(_) => {
+                crate::heap::note_aborted_trace();
+                return;
+            }
+        };
+        let len = len.min(elements.capacity());
+        let ptr = elements.as_ptr();
         // A5.1's own net: the bound must be a superset of this box's young
         // elements, or a minor sweeps a reachable one. `--gc-verify` turns it
         // on; it is O(below the mark) and therefore only for the verifier.
@@ -5242,7 +5261,9 @@ pub fn typed_array_effective_length(slots: &TypedArraySlots) -> usize {
 /// `slots`. A detached buffer covers none (spec 10.4.7.4 IsValidIntegerIndex
 /// is false).
 fn typed_array_element_in_bounds(slots: &TypedArraySlots, index: u64) -> bool {
-    (index as usize) < typed_array_effective_length(slots)
+    // `usize` is 32-bit on wasm32: a bare cast would wrap a large index into
+    // a small in-bounds one.
+    usize::try_from(index).is_ok_and(|index| index < typed_array_effective_length(slots))
 }
 
 /// Whether a canonical numeric index is an in-bounds TypedArray element
@@ -8372,6 +8393,36 @@ mod tests {
         // spec 10.4.6.6: deleting a non-exported key succeeds (nothing to
         // delete).
         assert!(ns.delete(&key("x")).unwrap());
+    }
+
+    #[test]
+    fn dense_trace_aborts_while_a_guard_is_live() {
+        // A guard held across an allocation invalidates the cached `elem_ptr`,
+        // so the trace must read the buffer through the cell (and abort when
+        // it cannot) instead of dereferencing the freed cursor.
+        let element = Value::Object(JsObject::array_create(None, 0.0).unwrap());
+        let array = JsObject::array_create(None, 0.0).unwrap();
+        array.array_element_write(0, element).unwrap();
+        let ObjectKind::Array(slots) = &array.kind else {
+            unreachable!("array_create builds an Array");
+        };
+        let guard = slots.elements_mut();
+        assert!(
+            slots.elements.try_borrow().is_err(),
+            "guard should hold the element cell"
+        );
+        let mut traced = 0;
+        Trace::trace(&**slots, &mut |_| traced += 1);
+        Trace::trace_dirty(&**slots, &mut |_| traced += 1);
+        assert_eq!(traced, 0, "a live mutable guard must abort the trace");
+        drop(guard);
+        Trace::trace(&**slots, &mut |_| traced += 1);
+        assert_eq!(traced, 1, "the element is visited once the guard is gone");
+        slots
+            .dirty_from
+            .set((crate::heap::collection_generation(), 0));
+        Trace::trace_dirty(&**slots, &mut |_| traced += 1);
+        assert_eq!(traced, 2, "the dirty trace visits the same element");
     }
 
     #[test]

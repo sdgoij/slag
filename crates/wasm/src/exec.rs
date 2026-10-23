@@ -3906,6 +3906,12 @@ impl Store {
             let signature = signature.ok_or(ExecFail::Trap(Trap::UnknownFunction))?;
             (signature, body.locals.clone())
         };
+        // The caller converts arguments by the declared parameter list; an
+        // internal caller that does not would let extra arguments shift every
+        // declared local (and too few underflow the frame).
+        if args.len() != signature.params.len() {
+            return Err(ExecFail::Unsupported("function arity"));
+        }
         // Cut 11: a compiled leaf entry runs synchronously (no host boundary
         // in the current subset), so it is a `Finished` run like an
         // interpreter run that never suspends. A body not yet compiled
@@ -6728,6 +6734,12 @@ fn table_matches(actual: TableType, requested: TableType) -> bool {
         && limits_match(actual.limits, requested.limits)
 }
 
+/// Whether an imported memory/table type is satisfied by a provided one. The
+/// `shared` flag is deliberately not compared: `decode_memory_limits` rejects
+/// a shared module memory type as malformed, so the only shared type the store
+/// can see is a host-created JS `WebAssembly.Memory`, and the shared bridge is
+/// intentional. Comparing it would reject every shared memory import without
+/// enabling a single conformant shared module.
 fn limits_match(actual: Limits, requested: Limits) -> bool {
     actual.min >= requested.min
         && requested

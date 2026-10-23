@@ -492,14 +492,15 @@ impl<T: Trace> Gc<T> {
         let gc = with_heap_mut(|heap| {
             let raw = heap.alloc(size, align_of::<GcBox<T>>()) as *mut GcBox<T>;
             // SAFETY: `raw` is a fresh arena slot (bumped or reused) of at
-            // least `size` bytes; the header is written here and `init`
+            // least `size` bytes; the header fields are written through raw
+            // pointers (no reference over uninitialized memory) and `init`
             // initializes the payload before any handle can see it.
             unsafe {
-                let boxed = &mut *raw;
-                boxed.header.flags = Cell::new(FLAG_LIVE | FLAG_YOUNG);
-                boxed.header.size = size as u32;
-                boxed.header.vtable = GcBox::<T>::VTABLE;
-                init(std::ptr::addr_of_mut!(boxed.data));
+                let header = std::ptr::addr_of_mut!((*raw).header);
+                std::ptr::addr_of_mut!((*header).flags).write(Cell::new(FLAG_LIVE | FLAG_YOUNG));
+                std::ptr::addr_of_mut!((*header).size).write(size as u32);
+                std::ptr::addr_of_mut!((*header).vtable).write(GcBox::<T>::VTABLE);
+                init(std::ptr::addr_of_mut!((*raw).data));
             }
             heap.note_alloc(raw as usize, size);
             Gc {
@@ -1827,7 +1828,7 @@ impl Heap {
             chunk.bump = aligned + size;
             return aligned as *mut u8;
         }
-        self.push_chunk();
+        self.push_chunk(size);
         let chunk = self.chunks.last_mut().expect("a chunk was just pushed");
         let aligned = align_up(chunk.bump, align);
         chunk.bump = aligned + size;
@@ -1836,12 +1837,17 @@ impl Heap {
 
     /// Append a fresh arena chunk. The buffer is uninitialized (no zeroing
     /// cost per chunk); the allocator writes every slot before use.
-    fn push_chunk(&mut self) {
-        let mut buffer: Vec<std::mem::MaybeUninit<u8>> = Vec::with_capacity(ARENA_CHUNK_SIZE);
+    ///
+    /// `at_least` sizes the chunk to hold one payload larger than
+    /// [`ARENA_CHUNK_SIZE`]; a bump past the chunk's `end` would hand out a
+    /// pointer outside the allocation.
+    fn push_chunk(&mut self, at_least: usize) {
+        let size = ARENA_CHUNK_SIZE.max(at_least.saturating_add(ARENA_GRANULARITY));
+        let mut buffer: Vec<std::mem::MaybeUninit<u8>> = Vec::with_capacity(size);
         // SAFETY: the capacity is exactly the chunk size and the memory is
         // never read before a box is written into it.
         unsafe {
-            buffer.set_len(ARENA_CHUNK_SIZE);
+            buffer.set_len(size);
         }
         let data = buffer.into_boxed_slice();
         // SAFETY: `MaybeUninit<u8>` and `u8` have identical layout, so the
@@ -1850,7 +1856,7 @@ impl Heap {
         let data: Box<[u8]> = unsafe { Box::from_raw(Box::into_raw(data) as *mut [u8]) };
         let raw = data.as_ptr() as usize;
         let start = align_up(raw, ARENA_GRANULARITY);
-        let end = raw + ARENA_CHUNK_SIZE;
+        let end = raw + size;
         let index = self.chunks.len();
         self.chunks.push(ArenaChunk {
             data,

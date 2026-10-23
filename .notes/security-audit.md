@@ -101,13 +101,39 @@ Fixed and validated in the first remediation pass:
 - **M-8 (partial)** — `crates/v8` is `publish = false`, `tools/build-deno.py`
   requires a full 40-hex pin, and the Unicode build validates fixture stems
   before splicing them into generated Rust.
+- **M-2** — `ArraySlots::trace`/`trace_dirty` read the element buffer through
+  the `RefCell` (`try_borrow`) and clamp the length to the buffer's capacity; a
+  live mutable guard aborts the sweep instead of dereferencing a cursor that an
+  intervening reallocation may have invalidated. A regression test holds the
+  guard across both trace paths.
+- **M-10** — `collect_workloads` uses `symlink_metadata` and skips symlinks (a
+  symlinked directory can point at an ancestor) and bounds the recursion at 32
+  levels.
+- **M-11** — embedded raylib assets are materialised with `create_new` under a
+  per-process nonce name; an existing path (a pre-planted symlink included) is
+  never truncated, and a failed write removes the partial file.
+- **Low** — `Heap::alloc` sizes an oversized payload's chunk to fit it (a >1 MiB
+  box no longer bumps past `chunk.end`); `Gc::new_in_place` writes the header
+  through `addr_of_mut!` instead of forming a reference over uninitialized
+  memory; `trace_roots` uses `try_borrow` for the generator tables; typed-array
+  index checks use `usize::try_from`; `Store::start_owned` rejects a call whose
+  argument count differs from the declared parameters, and the JS-API export
+  path converts exactly the declared parameters (missing → `undefined`, extra
+  ignored) instead of copying the JS argument vector, which shifted declared
+  locals.
+- **Low (deferred)** — import matching still ignores the `shared` flag. The
+  binary decoder rejects a shared module memory type
+  (`decode_memory_limits`), so the only shared type the store can see is a
+  host-created `WebAssembly.Memory`; enforcing equality would reject the
+  intentional shared bridge without enabling a conformant shared module.
+  Revisit when the decoder accepts shared limits.
 
 Outstanding from this report: the JSC string/value/object ref namespace, the
 `crates/v8` per-thread realm slot, GitHub Actions pinned to mutable tags, the
-Deno build's unlocked `cargo update`, and the remaining Medium/Low items
-(`current_agent_mut` aliasing, `ArraySlots::trace`, eager resizable-buffer
-allocation, `Symbol.replace` buffering, `--corpus` symlinks, raylib temp paths,
-worker memory atomics, and the Low list).
+Deno build's unlocked `cargo update`, and the remaining Medium items
+(`current_agent_mut` aliasing, eager resizable-buffer allocation,
+`Symbol.replace` buffering, CI coverage, worker memory atomics) plus the
+`padStart`/`padEnd` transient-allocation note.
 
 Validation for the first pass: `cargo clippy --workspace --all-targets -- -D
 warnings` is clean; `cargo fmt --all -- --check` is clean; 1,062 runtime unit
@@ -131,6 +157,14 @@ tests (with `fs`) and 18 CLI tests pass; the full RegExp suite passes
 without `--allow-fs`, a rooted read inside the root succeeds, `../` and an
 absolute outside path are rejected, and the ReDoS probe now returns a
 catchable `RangeError` while a normal match still succeeds.
+
+Validation for the fourth pass: clippy and rustfmt stay clean; 1,063 default-
+feature runtime tests and 264 crux tests pass in release; the wasm crate's 41
+tests and the 28 WASM JS-API runtime tests pass; `cargo check`/`clippy -p
+runtime --features raylib` is clean; a dense-array `--gc-stress` run (200 rounds
+of append, replace, and truncate) completes with the verifier on; and the new
+arity test proves `first(7) → 7` and `local(5, 99) → 0` (the extra argument no
+longer lands in the declared local slot).
 
 ---
 

@@ -876,6 +876,27 @@ fn run_corpus(dir: &std::path::Path, jit: bool) -> Result<(), u8> {
 /// Recursively collect `*.js` files under `dir`, sorted for a stable order.
 #[cfg(feature = "jit")]
 fn collect_workloads(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) -> Result<(), u8> {
+    collect_workloads_at(dir, out, 0)
+}
+
+/// Bounds the recursion so a pathological (or hostile) tree cannot exhaust the
+/// stack. Real corpora nest a handful of levels.
+#[cfg(feature = "jit")]
+const MAX_WORKLOAD_DEPTH: usize = 32;
+
+#[cfg(feature = "jit")]
+fn collect_workloads_at(
+    dir: &std::path::Path,
+    out: &mut Vec<std::path::PathBuf>,
+    depth: usize,
+) -> Result<(), u8> {
+    if depth > MAX_WORKLOAD_DEPTH {
+        eprintln!(
+            "slag: {}: corpus nesting deeper than {MAX_WORKLOAD_DEPTH}; skipped",
+            dir.display()
+        );
+        return Ok(());
+    }
     let mut entries: Vec<std::path::PathBuf> = std::fs::read_dir(dir)
         .map_err(|e| {
             eprintln!("slag: {}: {e}", dir.display());
@@ -891,8 +912,21 @@ fn collect_workloads(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) -
         .collect();
     entries.sort();
     for path in entries {
-        if path.is_dir() {
-            collect_workloads(&path, out)?;
+        // `symlink_metadata` does not follow the link: a symlinked directory
+        // can point back at an ancestor and recurse forever, and a symlinked
+        // file can escape the corpus root. Skip both.
+        let file_type = match std::fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata.file_type(),
+            Err(e) => {
+                eprintln!("slag: {}: {e}", path.display());
+                continue;
+            }
+        };
+        if file_type.is_symlink() {
+            continue;
+        }
+        if file_type.is_dir() {
+            collect_workloads_at(&path, out, depth + 1)?;
         } else if path.extension().and_then(|s| s.to_str()) == Some("js") {
             out.push(path);
         }

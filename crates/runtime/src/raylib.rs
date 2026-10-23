@@ -22,6 +22,7 @@
 //! installed on the same object as `rl.gui*` (see the gated `gui` module).
 
 use std::ffi::{CString, c_char, c_int};
+use std::io::Write;
 use std::sync::{Mutex, OnceLock};
 use std::thread::ThreadId;
 
@@ -803,6 +804,12 @@ struct AssetFile {
     temp: Option<std::path::PathBuf>,
 }
 
+/// Distinguishes concurrent materialisations of the same asset under one
+/// process.
+static NEXT_TEMP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+const MATERIALISE_ATTEMPTS: usize = 8;
+
 impl AssetFile {
     fn open(name: &str, what: &str) -> Result<AssetFile, JsError> {
         if let Some((_, data)) = embedded_asset(name) {
@@ -811,18 +818,58 @@ impl AssetFile {
                 .and_then(|extension| extension.to_str())
                 .map(|extension| format!(".{extension}"))
                 .unwrap_or_default();
-            let mut temp = std::env::temp_dir();
+            let directory = std::env::temp_dir();
             let stamp = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|elapsed| elapsed.as_nanos())
                 .unwrap_or(0);
-            temp.push(format!("slag-raylib-{stamp}{extension}"));
-            std::fs::write(&temp, data).map_err(|error| {
-                JsError::new(
+            // `create_new` refuses an existing path — a symlink included — so a
+            // link pre-planted in the shared temp directory cannot redirect
+            // the write. A collision with a stale file retries under a new
+            // name rather than truncating it.
+            let mut materialised = None;
+            for _ in 0..MATERIALISE_ATTEMPTS {
+                let nonce = NEXT_TEMP.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let candidate = directory.join(format!(
+                    "slag-raylib-{stamp}-{}-{nonce}{extension}",
+                    std::process::id()
+                ));
+                let mut file = match std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&candidate)
+                {
+                    Ok(file) => file,
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                    Err(error) => {
+                        return Err(JsError::new(
+                            ErrorKind::TypeError,
+                            format!("rl.{what}: cannot materialise embedded asset {name}: {error}"),
+                        ));
+                    }
+                };
+                if let Err(error) = file.write_all(data) {
+                    drop(file);
+                    let detail = match std::fs::remove_file(&candidate) {
+                        Ok(()) => error.to_string(),
+                        Err(cleanup) => format!("{error} (cleanup failed: {cleanup})"),
+                    };
+                    return Err(JsError::new(
+                        ErrorKind::TypeError,
+                        format!("rl.{what}: cannot materialise embedded asset {name}: {detail}"),
+                    ));
+                }
+                materialised = Some(candidate);
+                break;
+            }
+            let Some(temp) = materialised else {
+                return Err(JsError::new(
                     ErrorKind::TypeError,
-                    format!("rl.{what}: cannot materialise embedded asset {name}: {error}"),
-                )
-            })?;
+                    format!(
+                        "rl.{what}: cannot materialise embedded asset {name}: no free temp name"
+                    ),
+                ));
+            };
             let path = CString::new(temp.to_string_lossy().as_bytes()).map_err(|_| {
                 JsError::new(
                     ErrorKind::TypeError,

@@ -3361,10 +3361,14 @@ fn invoke_export(
             .ok_or_else(|| JsError::new(ErrorKind::TypeError, "unknown wasm function".into()))?;
         ty.params.clone()
     };
-    let mut wasm_args = Vec::with_capacity(args.len());
-    for (position, argument) in args.iter().enumerate() {
-        let param = params.get(position).copied().unwrap_or(ValType::I32);
-        wasm_args.push(wasm_arg(agent, &param, argument)?);
+    let mut wasm_args = Vec::with_capacity(params.len());
+    // The JS-API conversion drives the declared parameter list: extra JS
+    // arguments are ignored and missing ones convert `undefined`, which is
+    // what fixes the wasm frame's local layout (the interpreter copies `args`
+    // verbatim ahead of the declared locals).
+    for (position, param) in params.iter().enumerate() {
+        let argument = args.get(position).unwrap_or(&Value::Undefined);
+        wasm_args.push(wasm_arg(agent, param, argument)?);
     }
     let mut progress = {
         let mut store = agent.wasm_store.borrow_mut();
@@ -3896,6 +3900,37 @@ mod tests {
                 "(function(){ try {",
                 " Object.getOwnPropertyDescriptor(WebAssembly.Memory.prototype, 'buffer').get.call({});",
                 " return false; } catch (e) { return e instanceof TypeError; } })()"
+            ),
+        );
+    }
+
+    #[test]
+    fn export_calls_convert_only_the_declared_parameters() {
+        // The JS-API conversion walks the declared parameter list: a missing
+        // argument converts `undefined` and an extra one is ignored. Copying
+        // the JS argument vector instead shifts every declared local, so a
+        // two-argument call to a one-parameter body reads the extra argument
+        // as its first local.
+        let module = wat_module_bytes(concat!(
+            "(module",
+            "  (func (export \"first\") (param i32 i32) (result i32)",
+            "    local.get 0)",
+            "  (func (export \"local\") (param i32) (result i32)",
+            "    (local i32)",
+            "    local.get 1))"
+        ));
+        let mut context = Context::new().unwrap();
+        eval_true(
+            &mut context,
+            &format!(
+                concat!(
+                    "(function(){{ const i = new WebAssembly.Instance(new Uint8Array({module}));",
+                    " if (i.exports.first(7) !== 7) return false;",
+                    " if (i.exports.first(7, 9) !== 7) return false;",
+                    " if (i.exports.local(5) !== 0) return false;",
+                    " return i.exports.local(5, 99) === 0; }})()"
+                ),
+                module = module,
             ),
         );
     }
