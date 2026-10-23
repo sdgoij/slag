@@ -657,19 +657,15 @@ fn string_pad(s: &JsString, max_length: u64, fill: &JsString, start: bool) -> Js
     }
     let fill_length = (max_length - string_length) as usize;
     let fill_units = fill.as_slice();
-    let mut filler = Vec::with_capacity(fill_length);
-    let mut i = 0;
-    while filler.len() < fill_length {
-        filler.push(fill_units[i % fill_units.len()]);
-        i += 1;
+    // Fill straight into the result: a separate filler buffer would hold a
+    // second copy of the gap for no benefit.
+    let mut units: Vec<u16> = Vec::with_capacity(fill_length + s.len());
+    if !start {
+        units.extend_from_slice(s.as_slice());
     }
-    let mut units = Vec::with_capacity(fill_length + s.len());
+    units.extend((0..fill_length).map(|offset| fill_units[offset % fill_units.len()]));
     if start {
-        units.extend_from_slice(&filler);
         units.extend_from_slice(s.as_slice());
-    } else {
-        units.extend_from_slice(s.as_slice());
-        units.extend_from_slice(&filler);
     }
     JsString::from_utf16(&units)
 }

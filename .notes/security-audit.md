@@ -137,13 +137,19 @@ Fixed and validated in the first remediation pass:
   the capacity in the default build. Under `workers` the block is one immutable
   `Arc<[AtomicU64]>` shared by every view, so lazy growth needs a shared
   indirection that the worker memory model (M-12) has to settle first.
+- **M-8 (remainder)** — the Deno reconcile now logs every lock entry it moved,
+  the build runs `cargo build --locked` so nothing resolves beyond the
+  reconciled lock, and an overridden `DENO_REPO` is announced instead of being
+  silently trusted.
+- **Low** — `padStart`/`padEnd` fill the gap directly into the result buffer
+  instead of materializing a second filler copy.
 
 Outstanding from this report: the JSC string/value/object ref namespace, the
 `crates/v8` per-thread realm slot, GitHub Actions pinned to mutable tags, the
-Deno build's unlocked `cargo update`, and the remaining Medium items
-(`current_agent_mut` aliasing, eager resizable-buffer allocation under
-`workers`, CI coverage, worker memory atomics) plus the `padStart`/`padEnd`
-transient-allocation note.
+Deno build's one-time unlocked reconcile (now logged and followed by a locked
+build), and the remaining Medium items (`current_agent_mut` aliasing, eager
+resizable-buffer allocation under `workers`, CI coverage, worker memory
+atomics).
 
 Validation for the first pass: `cargo clippy --workspace --all-targets -- -D
 warnings` is clean; `cargo fmt --all -- --check` is clean; 1,062 runtime unit
@@ -181,6 +187,11 @@ lib tests pass in release; the full RegExp area passes 1,899/1,899 and every
 `*replace*` fixture passes 212/212; `"a".repeat(10_000_000).replace(/(?:)/g,
 "")` completes and prints its 10,000,000-unit result instead of materializing
 10M match arrays.
+
+Validation for the sixth pass: `python -m py_compile tools/build-deno.py`
+succeeds and `--dry-run` emits `cargo ... build -p deno --locked --release`;
+clippy and rustfmt stay clean; the 24 string unit tests and all 35 `*pad*`
+fixtures pass.
 
 ---
 

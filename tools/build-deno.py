@@ -18,7 +18,8 @@ cranelift 0.134 alongside the checkout's 0.117, and unicode-normalization
 0.1.25), and cargo will not move locked versions on its own. The full reconcile
 also bumps ``locked-tripwire`` -- a crates.io trap that ``compile_error!``s in
 every published version except the stub the lock pins -- so this script pins it
-back afterwards.
+back afterwards. The reconcile logs every lock entry it moved, and the build
+itself runs with ``--locked``, so nothing resolves beyond the reconciled lock.
 
 Requires: git, a Rust toolchain (Deno's rust-toolchain.toml pins one), and
 network access for the initial clone and the crate downloads.
@@ -40,6 +41,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 V8_CRATE = REPO_ROOT / "crates" / "v8"
 
 DENO_REPO = os.environ.get("DENO_REPO", "https://github.com/denoland/deno.git")
+DEFAULT_REPO = "https://github.com/denoland/deno.git"
 # `main` at the v2.9.7 release commit (v2.9.2-376-gabd22074e4), the revision the
 # embedding work was validated against.
 DEFAULT_PIN = "abd22074e47c6a5cd14e9e4e84743f084aa5a575"
@@ -183,6 +185,44 @@ def lock_needs_reconcile(lock_path: Path) -> bool:
     return match is None or "source = " in match.group(1)
 
 
+def lock_versions(lock_path: Path) -> dict[str, str]:
+    """Package name to version from a `Cargo.lock` (duplicates comma-joined)."""
+    if not lock_path.is_file():
+        return {}
+    versions: dict[str, list[str]] = {}
+    text = lock_path.read_text(encoding="utf-8", errors="replace")
+    for block in text.split("[[package]]"):
+        name = re.search(r'^name = "([^"]+)"', block, re.MULTILINE)
+        version = re.search(r'^version = "([^"]+)"', block, re.MULTILINE)
+        if name and version:
+            versions.setdefault(name.group(1), []).append(version.group(1))
+    return {name: ",".join(sorted(found)) for name, found in versions.items()}
+
+
+def log_lock_changes(before: dict[str, str], lock_path: Path) -> None:
+    """Report what the full reconcile moved, so the bump is reviewable."""
+    after = lock_versions(lock_path)
+    changes: list[str] = []
+    for name in sorted(set(before) | set(after)):
+        old, new = before.get(name), after.get(name)
+        if old == new:
+            continue
+        if old is None:
+            changes.append(f"+{name} {new}")
+        elif new is None:
+            changes.append(f"-{name} {old}")
+        else:
+            changes.append(f"{name} {old} -> {new}")
+    if not changes:
+        log("Cargo.lock unchanged")
+        return
+    log(f"Cargo.lock: {len(changes)} package entries changed")
+    for change in changes[:20]:
+        log(f"  {change}")
+    if len(changes) > 20:
+        log(f"  ... and {len(changes) - 20} more")
+
+
 def main() -> None:
     argv = sys.argv[1:]
     extra: list[str] = []
@@ -200,6 +240,8 @@ def main() -> None:
         die(f"missing {V8_CRATE / 'Cargo.toml'}")
 
     deno_dir = Path(args.deno_dir).resolve()
+    if DENO_REPO != DEFAULT_REPO:
+        log(f"warning: DENO_REPO overrides the default repository: {DENO_REPO}")
     ensure_checkout(deno_dir, args.pin, args.fetch)
 
     config = write_patch_config()
@@ -207,7 +249,7 @@ def main() -> None:
         log(f"engine: v8 -> {V8_CRATE}")
         log(f"deno:   {args.pin} at {deno_dir}")
 
-        build = ["build", "-p", args.bin]
+        build = ["build", "-p", args.bin, "--locked"]
         profile = "debug"
         if not args.debug:
             build.append("--release")
@@ -224,12 +266,14 @@ def main() -> None:
 
         if reconcile:
             log("reconciling Cargo.lock for the patched engine (updates transitive versions)")
+            before = lock_versions(deno_dir / "Cargo.lock")
             cargo(deno_dir, config, ["update"])
             cargo(
                 deno_dir,
                 config,
                 ["update", "-p", "locked-tripwire", "--precise", LOCKED_TRIPWIRE],
             )
+            log_lock_changes(before, deno_dir / "Cargo.lock")
 
         log(f"building {args.bin} ({profile}; first build compiles the whole workspace)")
         cargo(deno_dir, config, build)
