@@ -904,6 +904,12 @@ pub struct Agent {
     /// [[RegExpRecord]], [[RegExpMatcher]]) of RegExp instances, keyed by
     /// object identity (spec 22.2.5).
     pub regexp_data: IdMap<crate::builtins::regexp::RegExpState>,
+    /// Compiled regexp programs, keyed by source then flags. A `RegExp`
+    /// literal creates a fresh object on every evaluation (spec 13.2.8), but
+    /// its program is immutable and identical each time, so the compiled form
+    /// is shared (see `compile_regexp`).
+    pub(crate) compiled_regexps:
+        std::collections::HashMap<Vec<u16>, Vec<(regexp::Flags, std::rc::Rc<regexp::Regex>)>>,
     /// [[IteratingRegExp]], [[IteratedString]], [[Global]], [[Unicode]], and
     /// [[Done]] of RegExp String iterators (spec 22.2.6).
     pub regexp_string_iter_data:
@@ -1476,6 +1482,7 @@ impl Agent {
             temporal_data: std::collections::HashMap::new(),
             temporal_calendars: std::collections::HashMap::new(),
             regexp_data: std::collections::HashMap::default(),
+            compiled_regexps: std::collections::HashMap::new(),
             regexp_string_iter_data: std::collections::HashMap::new(),
             string_iter_data: std::collections::HashMap::new(),
             error_data: std::collections::HashSet::new(),
@@ -3059,9 +3066,96 @@ pub fn evaluate(source: &str) -> Result<Value, JsError> {
     Ok(value)
 }
 
+/// Bounds on the compiled-regexp cache. A live `RegExp` object already keeps
+/// its own program alive; the cache only extends it after the object dies, so
+/// capping the entries (and the source length, since the program's size tracks
+/// the source) keeps a script that builds many distinct patterns from pinning
+/// them.
+const MAX_CACHED_REGEXPS: usize = 64;
+const MAX_CACHED_PATTERN_LEN: usize = 1024;
+
+impl Agent {
+    /// The compiled program for `pattern` with `flags`, reusing one compiled
+    /// earlier for the same source and flags. `regexp::Regex` is immutable
+    /// after construction, so the fresh object every literal evaluation creates
+    /// can share it.
+    pub(crate) fn compile_regexp(
+        &mut self,
+        pattern: &[u16],
+        flags: regexp::Flags,
+    ) -> Result<std::rc::Rc<regexp::Regex>, JsError> {
+        if let Some(entries) = self.compiled_regexps.get(pattern)
+            && let Some((_, compiled)) = entries.iter().find(|(cached, _)| *cached == flags)
+        {
+            return Ok(compiled.clone());
+        }
+        let compiled = std::rc::Rc::new(
+            regexp::compile(pattern, flags)
+                .map_err(|error| JsError::new(ErrorKind::SyntaxError, error.message.clone()))?,
+        );
+        let already_known = self.compiled_regexps.contains_key(pattern);
+        if pattern.len() <= MAX_CACHED_PATTERN_LEN
+            && (already_known || self.compiled_regexps.len() < MAX_CACHED_REGEXPS)
+        {
+            self.compiled_regexps
+                .entry(pattern.to_vec())
+                .or_default()
+                .push((flags, compiled.clone()));
+        }
+        Ok(compiled)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn compiled_regexps_are_shared_by_source_and_flags() {
+        let mut agent = Agent::new();
+        let none = regexp::Flags::none();
+        let first = agent.compile_regexp(&[b'a' as u16], none).unwrap();
+        let second = agent.compile_regexp(&[b'a' as u16], none).unwrap();
+        assert!(std::rc::Rc::ptr_eq(&first, &second));
+
+        let mut global = none;
+        global.g = true;
+        let global = agent.compile_regexp(&[b'a' as u16], global).unwrap();
+        assert!(!std::rc::Rc::ptr_eq(&first, &global));
+
+        let other = agent.compile_regexp(&[b'b' as u16], none).unwrap();
+        assert!(!std::rc::Rc::ptr_eq(&first, &other));
+    }
+
+    #[test]
+    fn compiled_regexp_cache_is_bounded() {
+        let mut agent = Agent::new();
+        let none = regexp::Flags::none();
+        let first_source = [b'a' as u16];
+        let first = agent.compile_regexp(&first_source, none).unwrap();
+        for index in 0..MAX_CACHED_REGEXPS {
+            let pattern = vec![b'b' as u16; index + 1];
+            agent.compile_regexp(&pattern, none).unwrap();
+        }
+        // The source cap is full, so a new source is compiled but not retained.
+        let extra = [b'z' as u16, b'z' as u16];
+        let extra_first = agent.compile_regexp(&extra, none).unwrap();
+        let extra_second = agent.compile_regexp(&extra, none).unwrap();
+        assert!(!std::rc::Rc::ptr_eq(&extra_first, &extra_second));
+        // A source cached before the cap still hits.
+        let first_again = agent.compile_regexp(&first_source, none).unwrap();
+        assert!(std::rc::Rc::ptr_eq(&first, &first_again));
+    }
+
+    #[test]
+    fn long_regexp_sources_are_not_cached() {
+        let mut agent = Agent::new();
+        let none = regexp::Flags::none();
+        let pattern = vec![b'a' as u16; MAX_CACHED_PATTERN_LEN + 1];
+        let first = agent.compile_regexp(&pattern, none).unwrap();
+        let second = agent.compile_regexp(&pattern, none).unwrap();
+        assert!(!std::rc::Rc::ptr_eq(&first, &second));
+    }
 
     #[test]
     fn agent_record_fields_are_set() {

@@ -159,10 +159,7 @@ pub fn regexp_initialize(
     };
     let parsed_flags = regexp::Flags::parse(flags_text.as_slice())
         .map_err(|e| JsError::new(ErrorKind::SyntaxError, e.message.clone()))?;
-    let compiled = std::rc::Rc::new(
-        regexp::compile(pattern_text.as_slice(), parsed_flags)
-            .map_err(|e| JsError::new(ErrorKind::SyntaxError, e.message.clone()))?,
-    );
+    let compiled = agent.compile_regexp(pattern_text.as_slice(), parsed_flags)?;
     agent.regexp_data.insert(
         object.id(),
         RegExpState {
