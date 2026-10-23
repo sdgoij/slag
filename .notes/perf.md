@@ -15902,3 +15902,37 @@ Gates: `cargo fmt --all -- --check`; `cargo clippy --workspace --all-targets -- 
 warnings`; `cargo test --workspace` (38 suites, 0 failed); sweeps `built-ins`
 23,821 + `language` 23,726 + `annexB` 1,086 + `intl402` 3,365 = 51,998 at 100%;
 corpus parity 0.
+
+## PROFILE (2026-10-22): a function expression in an object literal costs ~450 ns extra
+
+Found while decomposing the for-in row's asserts and confirmed on minimal probes
+(100k body calls, medians of one binary):
+
+| probe | ns/body |
+| --- | ---: |
+| `var f = function () { return 1; };` (control) | 310 |
+| `var o = {}; o.a = function () { return 1; };` | 414 |
+| `var o = { a: 1 };` (control) | 94 |
+| `var o = { a: f };` (closure created first, then stored) | 340 |
+| `var o = { a: function b () { return 1; } };` (named, no inference) | 769 |
+| `var o = { a: function () { return 1; } };` (anonymous) | 839 |
+| `var o = { a: () => 1 };` | 593 |
+
+Two separate costs, both in the literal path (`ir::compile_object`):
+
+1. An **anonymous** function/arrow value disqualifies the whole literal from
+   `Step::ObjectFast` (`fast_object_names` bails on
+   `is_anonymous_function_definition`), so every property takes an
+   `ObjectBegin`/`ObjectInitName` step and the closure gets its name from a
+   post-hoc `set_function_name` (an own-property lookup plus a redefining
+   `define_property`). Anonymous vs named in the same literal: 839 vs 769.
+2. Even the batchable form pays ~340 ns over the control, because the closure is
+   still created through the general `CreateFunction` step and then defined
+   per-key.
+
+The fix would be named evaluation at *creation* — thread the property key into
+`CreateFunction`/`CreateArrow` (the way `pending_class_name` already threads a
+class's inferred name) so the function is created with its final `name` and the
+literal can take `ObjectFast`. Not measured; no corpus row uses the pattern
+(two files contain `: function (` and neither evaluates it in a loop), so this is
+a real-world win rather than a corpus one.
