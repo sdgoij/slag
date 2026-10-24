@@ -42,9 +42,9 @@ V8_CRATE = REPO_ROOT / "crates" / "v8"
 
 DENO_REPO = os.environ.get("DENO_REPO", "https://github.com/denoland/deno.git")
 DEFAULT_REPO = "https://github.com/denoland/deno.git"
-# `main` at the v2.9.7 release commit (v2.9.2-376-gabd22074e4), the revision the
-# embedding work was validated against.
-DEFAULT_PIN = "abd22074e47c6a5cd14e9e4e84743f084aa5a575"
+# The v2.9.8 release commit (tag `v2.9.8`), the revision the embedding work is
+# validated against.
+DEFAULT_PIN = "fe7ed012d92c642fd8e5607ac5a45d517538b5c5"
 CARGO = os.environ.get("CARGO", "cargo")
 
 # The harmless version of the `locked-tripwire` trap the lock pins; every other
