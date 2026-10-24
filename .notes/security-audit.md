@@ -832,6 +832,80 @@ The two hangs that remain under `--gc-stress` are pre-existing: the same
 fixtures hang on a binary built from `a8c90621` (Unicode table construction is
 what the stress mode multiplies), so they are not a regression from this slice.
 
+### Slice 4 in progress: the per-object side tables
+
+Slice 4 is the last one before the registry can go roots-only. It is being done
+in table families, because each family's guard discipline is different:
+
+- **4a landed** — the Map/Set tables (`map_data`, `set_data`, `weak_map_data`,
+  `weak_set_data`, `map_iter_data`, `set_iter_data`). The entries became
+  `Rc<RefCell<…>>`: a Map operation holds a collection across a user callback
+  (`forEach`, a key's `ToPropertyKey`), so an entry has to be mutable while the
+  rest of the agent runs, and the `Rc` is what lets a reader take the entry out
+  of the table and release the table's own borrow — a callback can create
+  another Map. Snapshot reads go through `Agent::map_entries`/`set_entries`,
+  in-place ones through `map_collection`/`set_collection`. The move also closed
+  two guard-across-allocation windows that predated it: both `%MapIterator%`
+  and `%SetIteratorPrototype%.next` built their result object while holding the
+  iterator record's `RefMut`.
+- **4b landed** — `regexp_data`, `symbol_data`, `bigint_data`,
+  `raw_json_data`. All four are read-mostly with cheap values, so the accessors
+  return owned copies (`regexp_state` clones a record whose compiled program is
+  already `Rc`-shared — what the per-exec clone relied on). The boolean, number
+  and date tables stay in `Agent`: they hold `bool`/`f64` and no heap edges, so
+  the collector never reads them.
+- **4c landed** — `buffer_data` and `dataview_data`. Unlike 4a these keep no
+  per-entry cell: `Agent::buffer_state` returns a `Ref` straight into the table
+  (which is what the buffer builtins' own `fn state(...)` helper already did),
+  and mutations go through `with_buffer_state`, whose `borrow_mut` panics if a
+  read guard is alive. Every caller was already written in the discipline that
+  requires — the guard closes before a `ToIndex` coercion or the species
+  constructor — and the one exception (the snapshot loader's immutable flag)
+  was restructured.
+- **4d landed** — fifteen iterator/async/disposal tables (the Array iterator
+  records, async-from-sync and async-generator awaits, the iterator-helper and
+  wrapped-iterator states, the four async-iterator-helper tables, the three
+  DisposableStack tables, `Array.fromAsync`'s continuations and
+  `Atomics.waitAsync`'s resolvers).
+- **4e landed** — the module tables (`host_modules`, the namespace tables,
+  `module_sources`, the dynamic-import resolvers, the deferred-module wait and
+  then tables, the evaluation stack) and `entered_realm`, which became a `Cell`.
+
+One near-miss is the reason the last step of each slice is a real `--gc-stress`
+sweep rather than a green unit suite: `async_from_sync_continuations` shared a
+trace block with tables that moved in 4d, and it was left behind untraced. The
+unit tests passed; 42 of the 95 `Array/fromAsync` fixtures then failed under
+`--gc-stress` with a promise that never settled, because the capability a
+pending await resumes into could be swept. The root is back, and the accounting
+that would have caught it — for every trace line removed, the table is either
+in `AgentRoots::trace` or still traced where it lives — is now done by hand at
+the end of each slice.
+
+Remaining before the registry switch: `current_task_promise`, `error_stack`,
+`finalization_registries`, `kept_during_job`, `pending_cleanup_jobs`,
+`async_from_sync_continuations`, `global_symbol_registry`, the six Intl and two
+Temporal tables that hold values, `string_iter_data`/`regexp_string_iter_data`,
+the eleven IC caches (the `*_cells` arrays, `leaf_cache`, `construct_maps`,
+`function_boilerplate_maps`, `iter_result_map`/`iter_result_realm`,
+`generator_methods`), and the wasm tables (feature-gated). `trace_active_vms`
+and `RUNNING_JOB_REGION` are thread-scoped rather than agent-scoped and stay as
+they are.
+
+Validation for 4a-4e: clippy `-D warnings` clean (workspace, all targets, all
+features) and `cargo fmt --check` clean after each; `cargo test --workspace`
+5809 pass in both profiles; under `--gc-stress --gc-verify`, `*Map*` 431/431,
+`*Set*` 859/859, `*ArrayBuffer*` 324 pass with the one pre-existing
+`sliceToImmutable/argument-coercion.js` hang, `DataView/*` 561/561, `*RegExp*`
+1793 pass / 0 fail (against 1739 pass / 160 hang on a pre-4b binary — the hangs
+are the Unicode-property fixtures), `Array/fromAsync/*` 95/95,
+`DisposableStack/*` 93/93, `AsyncDisposableStack/*` 104/104,
+`AsyncIteratorPrototype/*` 13/13, `Iterator/*` 648 pass of 654 with the
+`zip/basic-longest.js` fail reproduced on a pre-4d binary, and
+`AbstractModuleSource/*` 8/8. The crash clusters that remain under
+`--gc-stress` — three BigInt `TypedArray/prototype/set` fixtures, six
+`AsyncFromSyncIteratorPrototype` fixtures — occur more often on a pre-4 binary
+than on this tree, so they are pre-existing.
+
 ---
 
 ## What was checked and found sound
