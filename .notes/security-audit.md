@@ -85,13 +85,22 @@ Fixed and validated in the first remediation pass:
 - **H-12** — validation precomputes rec-group ends and the function type index,
   uses a `HashSet` for duplicate exports, caps types/exports/`array.new_fixed`,
   and bounds per-body and module-wide local expansion.
-- **C-2** — context teardown is deferred to the outermost API boundary and
-  reference-counted, `JSStringGetCharactersPtr` points into a stable boxed
+- **C-2 / M-6** — context teardown is deferred to the outermost API boundary
+  and reference-counted, `JSStringGetCharactersPtr` points into a stable boxed
   string, the property-name accumulator validates its pointer, string/value
   retains and `JSValueUnprotect` release their entries, the `finalize` callback
   is wired through `HostOps::finalize`, `JSClassRelease` clears only its own
   class's callbacks, and a finalize ref resolves the dead object's private-data
-  id.
+  id. The last piece was the *ref namespace*: the three kinds now carry a tag
+  in the low two bits (`00` value, `01` object, `10` string), so a ref of one
+  kind decodes to nothing in another's table. A host that passes a
+  `JSStringRef` where a `JSValueRef` is expected compiles — the C types are all
+  `void *` at the ABI level — but now reads null/undefined instead of whatever
+  occupies that id elsewhere. `JSValueProtect`/`Unprotect` are counted for
+  primitive refs; an object ref is pinned once by its hand-out and the pin is
+  not counted (a documented divergence: a second protect is a no-op, and one
+  unprotect drops the pin — the ref then resolves to nothing, never to freed
+  memory).
 - **H-11** — the CLI no longer installs `fs` by default; `--allow-fs` is the
   explicit unrestricted opt-in and `--allow-fs=ROOT` canonicalizes every path
   and rejects anything outside the root. Reads are capped at 256 MiB and a
@@ -183,11 +192,11 @@ Fixed and validated in the first remediation pass:
   isolate's state is unknown). `is_poisoned`/`unpoison` are exported and
   re-exported by `crates/jsc` for a host that rebuilds its state.
 
-Outstanding from this report: the JSC string/value/object ref namespace, the
-`crates/v8` per-thread realm slot, the Deno build's one-time unlocked reconcile
-(now logged and followed by a locked build), the remaining Medium items
-(`current_agent_mut` aliasing, eager resizable-buffer allocation under
-`workers`, worker memory atomics), and the fuzzing gap.
+Outstanding from this report: the `crates/v8` per-thread entered-realm slot,
+the two `workers`-only items (eager resizable-buffer allocation, and worker
+memory atomics, which blocks it), the deferred wasm `shared`-flag import check,
+and the fuzzing gap. Every finding not listed here is fixed and validated in
+the passes below.
 
 Validation for the first pass: `cargo clippy --workspace --all-targets -- -D
 warnings` is clean; `cargo fmt --all -- --check` is clean; 1,062 runtime unit
@@ -252,6 +261,12 @@ release; the RegExp area passes 1,899/1,899 and `*replace*` 212/212; clippy
 (`-D warnings`) and rustfmt are clean. The Miri job now covers the lexer and
 syntax crates and only runs from a manual `workflow_dispatch` with its input
 set, so push/PR runs do not wait on it.
+
+Validation for the eleventh pass: `cargo test -p jsc` passes — three ref
+namespace unit tests (a string ref never decodes as a value, a value ref never
+as a string, the low bits name the kind) plus five C compat tests compiled from
+C sources against the C API and linked against the crate; clippy `-D warnings`
+is clean; `cargo build -p cli --features jsc` links the shipping configuration.
 
 Validation for the tenth pass: clippy is clean for the default workspace and
 for `-p runtime -p cli --features raylib`, and rustfmt is clean; `cargo check`
