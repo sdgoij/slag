@@ -760,7 +760,8 @@ fn free_index(size: usize) -> Option<usize> {
         .then(|| size / ARENA_GRANULARITY - 1)
 }
 
-/// The thread-local mark-sweep heap.
+/// The mark-sweep heap. One per isolate, in a [`HeapState`]; a thread with no
+/// isolate entered owns one of its own.
 pub struct Heap {
     /// The bump arena backing every box. Boxes live at stable addresses
     /// inside these chunks.
@@ -887,17 +888,216 @@ type AddrMap = std::collections::HashMap<usize, GcAny, std::hash::BuildHasherDef
 
 type AddrSet = std::collections::HashSet<usize, std::hash::BuildHasherDefault<FxHasher>>;
 
+/// One heap's collector state: the arena and every table the collector needs
+/// while it runs.
+///
+/// The state belongs to the isolate that runs on the heap, not to the thread:
+/// an isolate entered on another thread keeps its boxes, its roots and its
+/// generation marks with it. [`enter`] installs it for a scope's life; a thread
+/// with no isolate entered — the C surfaces and this crate's own tests — uses
+/// [`OWN`].
+pub struct HeapState {
+    heap: RefCell<Heap>,
+    alloc_since_collect: Cell<u64>,
+    major_disabled: Cell<bool>,
+    minor_disabled: Cell<bool>,
+    swept_since_check: Cell<usize>,
+    gc_trace: Cell<bool>,
+    gc_trace_records: RefCell<Vec<GcTraceRecord>>,
+    stress: Cell<bool>,
+    stress_collector: RefCell<Option<StressCollector>>,
+    collecting: Cell<bool>,
+    abort_sweep: Cell<bool>,
+    ephemerons: RefCell<Vec<(GcAny, GcAny)>>,
+    remembered: RefCell<Vec<usize>>,
+    verify_barrier: Cell<bool>,
+    verify_minor: Cell<bool>,
+    collection_gen: Cell<u32>,
+    pinned: RefCell<Vec<GcAny>>,
+    root_sources: RefCell<Vec<&'static dyn RootSource>>,
+    weak_handles: RefCell<Vec<WeakEntry>>,
+    pending_weak_callbacks: RefCell<Vec<Box<dyn FnOnce()>>>,
+    next_weak_id: Cell<u64>,
+    /// The heap's side tables by type (see [`with_heap_cell`]). A `Vec` rather
+    /// than a map so the state stays `const`-constructible, and because a heap
+    /// has only a handful.
+    side: RefCell<Vec<(std::any::TypeId, Box<dyn std::any::Any>)>>,
+}
+
+impl HeapState {
+    /// A fresh collector state: an empty arena, every table at its default.
+    pub const fn new() -> Self {
+        Self {
+            heap: RefCell::new(Heap::new()),
+            alloc_since_collect: Cell::new(0),
+            major_disabled: Cell::new(false),
+            minor_disabled: Cell::new(false),
+            swept_since_check: Cell::new(0),
+            gc_trace: Cell::new(false),
+            gc_trace_records: RefCell::new(Vec::new()),
+            stress: Cell::new(false),
+            stress_collector: RefCell::new(None),
+            collecting: Cell::new(false),
+            abort_sweep: Cell::new(false),
+            ephemerons: RefCell::new(Vec::new()),
+            remembered: RefCell::new(Vec::new()),
+            verify_barrier: Cell::new(cfg!(debug_assertions)),
+            verify_minor: Cell::new(false),
+            collection_gen: Cell::new(1),
+            pinned: RefCell::new(Vec::new()),
+            root_sources: RefCell::new(Vec::new()),
+            weak_handles: RefCell::new(Vec::new()),
+            pending_weak_callbacks: RefCell::new(Vec::new()),
+            next_weak_id: Cell::new(1),
+            side: RefCell::new(Vec::new()),
+        }
+    }
+}
+
+/// Run `body` with this heap's own instance of `T`, creating it with `init` on
+/// first use.
+///
+/// A cache of handles has to live with the heap it caches for: a `Handle` names
+/// a box in one arena and means nothing in another, so a thread-local cache that
+/// outlived its arena would hand a later isolate a box the sweep already freed.
+/// `init` runs while the table is borrowed, so it must not allocate in the arena
+/// or re-enter this function.
+#[inline]
+pub fn with_heap_cell<T: 'static, R>(init: impl FnOnce() -> T, body: impl FnOnce(&T) -> R) -> R {
+    with_state(|state| {
+        let cell: *const T = {
+            let mut side = state.side.borrow_mut();
+            let id = std::any::TypeId::of::<T>();
+            let index = match side.iter().position(|(cached, _)| *cached == id) {
+                Some(index) => index,
+                None => {
+                    side.push((id, Box::new(init())));
+                    side.len() - 1
+                }
+            };
+            side[index]
+                .1
+                .downcast_ref::<T>()
+                .expect("a heap cell keeps the type it was created with") as *const T
+        };
+        // SAFETY: the box lives in the state's side table, which outlives this
+        // call, and its entries are never removed; a `Box` keeps its pointee's
+        // address when the table reallocates.
+        body(unsafe { &*cell })
+    })
+}
+
+impl Default for HeapState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 thread_local! {
-    static HEAP: RefCell<Heap> = const { RefCell::new(Heap::new()) };
+    /// The state of the heap entered on this thread, or null for none. A
+    /// pointer rather than the arena itself: the arena belongs to the isolate,
+    /// so a box allocated under it stays valid wherever that isolate is
+    /// entered.
+    static CURRENT: Cell<*const HeapState> = const { Cell::new(std::ptr::null()) };
+    /// What `CURRENT` held before each entry, so a scope's drop restores it —
+    /// scopes nest, and one isolate can be entered inside another's.
+    static PREVIOUS: RefCell<Vec<*const HeapState>> = const { RefCell::new(Vec::new()) };
+    /// The state for a thread with no isolate entered: the C surfaces and this
+    /// crate's own tests.
+    static OWN: RefCell<HeapState> = const { RefCell::new(HeapState::new()) };
+}
+
+/// Install `state` as this thread's collector state, remembering what was
+/// there.
+///
+/// # Safety
+///
+/// `state` must outlive the matching [`leave`] — the caller is a scope that
+/// owns the isolate the state belongs to.
+pub fn enter(state: *const HeapState) {
+    let previous = CURRENT.with(|current| current.replace(state));
+    PREVIOUS.with(|stack| stack.borrow_mut().push(previous));
+}
+
+/// Undo the innermost [`enter`].
+///
+/// A scope dropped during thread teardown reaches this after the stack itself
+/// has been destroyed; there is nothing left to restore then, and panicking in
+/// a drop would abort the process.
+pub fn leave() {
+    let previous = PREVIOUS
+        .try_with(|stack| stack.borrow_mut().pop())
+        .ok()
+        .flatten()
+        .unwrap_or(std::ptr::null());
+    CURRENT.with(|current| current.set(previous));
+}
+
+/// Run `body` against the entered heap's state, or this thread's own when no
+/// isolate is entered.
+///
+/// Takes no borrow of the state itself, so a body that re-enters the collector
+/// — a trace callback, a finalizer, a nested scope — is fine: the borrow rules
+/// are the individual `RefCell` fields'.
+/// [`with_state`] for a drop path, where the thread may already have
+/// destroyed its own state: `None` then, rather than the panic a TLS access
+/// after destruction raises.
+#[inline]
+fn try_with_state<R>(body: impl FnOnce(&HeapState) -> R) -> Option<R> {
+    let current = CURRENT.with(|slot| slot.get());
+    if current.is_null() {
+        OWN.try_with(|own| body(&own.borrow())).ok()
+    } else {
+        // SAFETY: as in `with_state`.
+        Some(body(unsafe { &*current }))
+    }
+}
+
+#[inline]
+fn with_state<R>(body: impl FnOnce(&HeapState) -> R) -> R {
+    let current = CURRENT.with(|slot| slot.get());
+    if current.is_null() {
+        OWN.with(|own| body(&own.borrow()))
+    } else {
+        // SAFETY: `enter` installed a pointer to state owned by the isolate
+        // whose scope called it, and `leave` removes it before that isolate can
+        // be dropped.
+        body(unsafe { &*current })
+    }
+}
+
+/// A per-heap table, named like the `thread_local!` it replaced so the
+/// collector's code reads the same.
+///
+/// `with` hands the body the field itself, so `RefCell`/`Cell` borrows behave
+/// exactly as they did against a thread-local — but the table travels with its
+/// heap instead of staying on the thread.
+macro_rules! per_heap {
+    ($(#[$doc:meta])* $name:ident = $accessor:ident => $field:ident: $ty:ty;) => {
+        $(#[$doc])*
+        static $name: $accessor = $accessor;
+
+        struct $accessor;
+
+        impl $accessor {
+            #[inline]
+            fn with<R>(&self, body: impl FnOnce(&$ty) -> R) -> R {
+                with_state(|state| body(&state.$field))
+            }
+        }
+    };
+}
+
+per_heap!(
     /// GC-5: allocations since the last safe-point check — the cheap
     /// mid-script collection trigger. Loop back-edges cannot afford a
     /// live-count read (TLS + RefCell borrow per iteration), so `Gc::new`
     /// bumps this and the back-edge check compares it against
     /// [`ALLOC_BUDGET`] (one TLS read).
-    static ALLOC_SINCE_COLLECT: Cell<u64> = const { Cell::new(0) };
-    /// GC-5: safe-point backoff — set to `u64::MAX` when a safe-point
-    /// collection swept nothing (a growing live set, e.g. a concat rope,
-    /// keeps every node reachable, so re-marking it each budget crossing is
+    ALLOC_SINCE_COLLECT = AllocSinceCollect => alloc_since_collect: Cell<u64>;
+);
+
+per_heap!(
     /// GC-5/A5: whether a major collection is suppressed at safe points. A
     /// major that swept nothing is pure overhead for a growing live set (a
     /// concat rope keeps every node reachable), so it is disabled until the
@@ -908,7 +1108,10 @@ thread_local! {
     /// costs O(young + remembered + the roots' fan-out) rather than O(live), and
     /// its job is to keep the young cohort bounded, so the two levels back off
     /// independently (see [`MINOR_DISABLED`]).
-    static MAJOR_DISABLED: Cell<bool> = const { Cell::new(false) };
+    MAJOR_DISABLED = MajorDisabled => major_disabled: Cell<bool>;
+);
+
+per_heap!(
     /// A5: whether a minor collection is suppressed at safe points. Same policy
     /// as the major, one level down: a minor whose cohort was entirely live
     /// reclaimed nothing, so re-walking the roots and re-marking that cohort
@@ -920,13 +1123,16 @@ thread_local! {
     /// This is what keeps the `string concat` row (a 100k-node rope, every node
     /// reachable) off the minor path: without it the row pays a root walk every
     /// 8192 allocations and measured ~20% slower.
-    static MINOR_DISABLED: Cell<bool> = const { Cell::new(false) };
+    MINOR_DISABLED = MinorDisabled => minor_disabled: Cell<bool>;
+);
+
+per_heap!(
     /// A6: boxes the sweeps freed since the compiled safe point last asked (see
     /// [`take_swept_since_check`]). Accumulated by both levels' bookkeeping, so
     /// a sweep from any collection path — a compiled safe point, an interpreter
     /// back edge, a job boundary, or a helper's nested call — is seen.
-    static SWEPT_SINCE_CHECK: Cell<usize> = const { Cell::new(0) };
-}
+    SWEPT_SINCE_CHECK = SweptSinceCheck => swept_since_check: Cell<usize>;
+);
 
 /// The allocation budget that paces safe-point collections (GC-5): after
 /// this many allocations since the last check, the runtime runs its real
@@ -1044,11 +1250,14 @@ pub struct GcTraceRecord {
     pub stack_words: usize,
 }
 
-thread_local! {
-    /// A5 `--gc-trace`: one TLS read per collection when off.
-    static GC_TRACE: Cell<bool> = const { Cell::new(false) };
-    static GC_TRACE_RECORDS: RefCell<Vec<GcTraceRecord>> = const { RefCell::new(Vec::new()) };
-}
+per_heap!(
+    /// A5 `--gc-trace`: one read per collection when off.
+    GC_TRACE = GcTrace => gc_trace: Cell<bool>;
+);
+
+per_heap!(
+    GC_TRACE_RECORDS = GcTraceRecords => gc_trace_records: RefCell<Vec<GcTraceRecord>>;
+);
 
 /// A5 `--gc-trace`: enable per-collection telemetry. Zero cost when off (the
 /// collectors read one TLS flag and exit).
@@ -1133,42 +1342,65 @@ impl Heap {
 // thread-local collector that finds the current agent and collects from its
 // roots; outside an agent window (bootstrap) the collector is a no-op.
 type StressCollector = Box<dyn Fn(GcAny)>;
-thread_local! {
-    static STRESS: Cell<bool> = const { Cell::new(false) };
-    static STRESS_COLLECTOR: RefCell<Option<StressCollector>> =
-        const { RefCell::new(None) };
-    static COLLECTING: Cell<bool> = const { Cell::new(false) };
+per_heap!(
+    STRESS = Stress => stress: Cell<bool>;
+);
+
+per_heap!(
+    STRESS_COLLECTOR = StressSlot => stress_collector: RefCell<Option<StressCollector>>;
+);
+
+per_heap!(
+    COLLECTING = Collecting => collecting: Cell<bool>;
+);
+
+per_heap!(
     /// A traced `RefCell` was mutably borrowed during marking: the sweep
     /// would free boxes the mark could not see, so it is aborted (retain
     /// everything) instead.
-    static ABORT_SWEEP: Cell<bool> = const { Cell::new(false) };
+    ABORT_SWEEP = AbortSweep => abort_sweep: Cell<bool>;
+);
+
+per_heap!(
     /// GC-3: the ephemeron edges (WeakMap key→value, WeakSet element→itself)
     /// registered while tracing the weak tables. A value is only reachable
     /// while its key is reachable from other roots, so the edges are
     /// deferred: the mark phase promotes a value once its key is marked,
     /// iterating to a fixpoint. Valid only during one collection.
-    static EPHEMERONS: RefCell<Vec<(GcAny, GcAny)>> = const { RefCell::new(Vec::new()) };
+    EPHEMERONS = Ephemerons => ephemerons: RefCell<Vec<(GcAny, GcAny)>>;
+);
+
+per_heap!(
     /// A2: the remembered set — the addresses of old boxes that may hold a
     /// young reference. Deduplicated by the box's `FLAG_REMEMBERED` bit, so
     /// the barrier needs no hash lookup; drained by every collection.
-    static REMEMBERED: RefCell<Vec<usize>> = const { RefCell::new(Vec::new()) };
+    REMEMBERED = Remembered => remembered: RefCell<Vec<usize>>;
+);
+
+per_heap!(
     /// A2: whether the collector verifies the write barrier's exactness on
     /// every collection (the barrier is only testable while the young bits
     /// are still meaningful, so it runs before the sweep). On by default in
     /// debug builds; the release sweep enables it explicitly.
-    static VERIFY_BARRIER: Cell<bool> = const { Cell::new(cfg!(debug_assertions)) };
+    VERIFY_BARRIER = VerifyBarrier => verify_barrier: Cell<bool>;
+);
+
+per_heap!(
     /// A3: whether a minor collection verifies its own mark with a full
     /// precise mark before sweeping (`--gc-verify`). Off by default: the
     /// verification is O(live) per minor. On, a barrier or generation-rule gap
     /// fails loudly instead of freeing a reachable box.
-    static VERIFY_MINOR: Cell<bool> = const { Cell::new(false) };
+    VERIFY_MINOR = VerifyMinor => verify_minor: Cell<bool>;
+);
+
+per_heap!(
     /// A5.1: the current collection interval's stamp. A type that bounds its
     /// dirty slots stamps a mark with it, so a mark from a previous interval
     /// reads as stale — and stale correctly means "no dirty slots", because
     /// every box that survived the last collection had its young children
     /// promoted. Bumped at the end of every collection, including the aborts.
-    static COLLECTION_GEN: Cell<u32> = const { Cell::new(1) };
-}
+    COLLECTION_GEN = CollectionGen => collection_gen: Cell<u32>;
+);
 
 /// Record that a traced `RefCell` was borrowed during marking; the sweep
 /// must be aborted.
@@ -1382,8 +1614,8 @@ fn drain_young_work(work: &mut Vec<GcAny>) {
 /// allocation roots those captures. Imprecise by design: it may retain
 /// garbage, never frees a live box.
 pub fn scan_regions(regions: &[(*const u8, usize)], visit: &mut dyn FnMut(GcAny)) {
-    HEAP.with(|heap| {
-        let heap = heap.borrow();
+    with_state(|state| {
+        let heap = state.heap.borrow();
         let mut by_addr: AddrMap = AddrMap::default();
         heap.for_each_live(|header| {
             by_addr.insert(header as usize, GcAny(header));
@@ -1408,21 +1640,23 @@ pub fn scan_regions(regions: &[(*const u8, usize)], visit: &mut dyn FnMut(GcAny)
     });
 }
 
-/// Run `f` with the current thread's heap.
+/// Run `f` with the entered heap, or this thread's own when no isolate is
+/// entered.
 pub fn with_heap<R>(f: impl FnOnce(&Heap) -> R) -> R {
-    HEAP.with(|heap| f(&heap.borrow()))
+    with_state(|state| f(&state.heap.borrow()))
 }
 
-/// Run `f` with mutable access to the current thread's heap.
+/// Run `f` with mutable access to the entered heap.
 pub fn with_heap_mut<R>(f: impl FnOnce(&mut Heap) -> R) -> R {
-    HEAP.with(|heap| f(&mut heap.borrow_mut()))
+    with_state(|state| f(&mut state.heap.borrow_mut()))
 }
 
-thread_local! {
-    /// The boxes a host pinned. The heap is thread-local, so the pins are too:
-    /// a pin is taken and released on one thread.
-    static PINNED: RefCell<Vec<GcAny>> = const { RefCell::new(Vec::new()) };
-}
+per_heap!(
+    /// The boxes a host pinned, for the heap entered when the pin was taken.
+    /// A pin is released through the heap entered when it drops, so a handle
+    /// that outlives its isolate's entry belongs to the pin-ownership slice.
+    PINNED = Pinned => pinned: RefCell<Vec<GcAny>>;
+);
 
 /// A pin: the value it names is a root of every collection until it is dropped.
 ///
@@ -1450,8 +1684,9 @@ impl Drop for Pin {
         let Some(any) = self.any else {
             return;
         };
-        PINNED.with(|pinned| {
-            let mut pinned = pinned.borrow_mut();
+        // A pin dropped during teardown has no heap left to unroot from.
+        let _ = try_with_state(|state| {
+            let mut pinned = state.pinned.borrow_mut();
             if let Some(index) = pinned.iter().position(|held| held.addr() == any.addr()) {
                 pinned.remove(index);
             }
@@ -1495,16 +1730,15 @@ pub trait RootSource {
     fn roots(&self, visit: &mut dyn FnMut(GcAny));
 }
 
-thread_local! {
-    /// The root sources registered on this thread, in registration order. A
-    /// `Value` is neither `Send` nor `Sync`, so a source's data is per-thread
-    /// and so is the registry: a worker thread's tables root that thread's
-    /// heap, and nothing else.
-    static ROOT_SOURCES: RefCell<Vec<&'static dyn RootSource>> =
-        const { RefCell::new(Vec::new()) };
-}
+per_heap!(
+    /// The root sources registered for this heap, in registration order. A
+    /// `Value` is neither `Send` nor `Sync`, so a source's data belongs to the
+    /// heap it roots, and the registry travels with that heap: a worker's
+    /// tables root the isolate they were entered under, and nothing else.
+    ROOT_SOURCES = RootSources => root_sources: RefCell<Vec<&'static dyn RootSource>>;
+);
 
-/// Register `source` as a source of precise roots for this thread.
+/// Register `source` as a source of precise roots for the entered heap.
 ///
 /// Registering the same source twice is a no-op, so a table can register at
 /// first use without having to remember whether it already did.
@@ -1570,20 +1804,25 @@ impl Default for Heap {
     }
 }
 
-thread_local! {
-    /// The weak handles this thread holds.
+per_heap!(
+    /// The weak handles this heap holds.
     ///
     /// Deliberately **not** a root source and not traced: a weak handle is the
     /// one thing that must not keep its value alive, so the table holds a `Value`
-    /// the collector cannot see (the stack scan does not read thread-locals and
-    /// nothing traces this), and the sweep is what tells the entry its value is
-    /// gone.
-    static WEAK_HANDLES: RefCell<Vec<WeakEntry>> = const { RefCell::new(Vec::new()) };
+    /// the collector cannot see (nothing traces the heap's side tables), and the
+    /// sweep is what tells the entry its value is gone.
+    WEAK_HANDLES = WeakHandles => weak_handles: RefCell<Vec<WeakEntry>>;
+);
+
+per_heap!(
     /// The death callbacks the sweeps since the last drain queued.
-    static PENDING_WEAK_CALLBACKS: RefCell<Vec<Box<dyn FnOnce()>>> =
-        const { RefCell::new(Vec::new()) };
-    static NEXT_WEAK_ID: Cell<u64> = const { Cell::new(1) };
-}
+    PENDING_WEAK_CALLBACKS = PendingWeakCallbacks =>
+        pending_weak_callbacks: RefCell<Vec<Box<dyn FnOnce()>>>;
+);
+
+per_heap!(
+    NEXT_WEAK_ID = NextWeakId => next_weak_id: Cell<u64>;
+);
 
 struct WeakEntry {
     id: u64,
@@ -1606,8 +1845,8 @@ struct WeakEntry {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WeakHandle {
     id: u64,
-    /// `!Send`/`!Sync`: the registry is per-thread, like its heap, so a handle is
-    /// valid only on the thread that made it.
+    /// `!Send`/`!Sync`: the registry lives in the heap's state, which a handle
+    /// belongs to, so a handle is valid only while that state is entered.
     _thread: std::marker::PhantomData<*const ()>,
 }
 
@@ -3477,6 +3716,138 @@ mod tests {
         assert!(matches!(value.kind(), ValueKind::String(_)));
         assert_eq!(with_heap(|heap| heap.live_count()), start + 1);
         let _ = std::hint::black_box(&value);
+    }
+    /// The collector's tables travel with the heap: a box allocated under one
+    /// state is invisible to a collection of another, and is still there when
+    /// its own state is entered again.
+    #[test]
+    fn an_entered_heap_is_the_one_the_collector_uses() {
+        let first = HeapState::new();
+        let second = HeapState::new();
+
+        enter(&first);
+        let kept = Gc::new(Node::default());
+        assert_eq!(with_heap(|heap| heap.live_count()), 1);
+
+        enter(&second);
+        assert_eq!(
+            with_heap(|heap| heap.live_count()),
+            0,
+            "a different heap must not see the first one's boxes"
+        );
+        with_heap_mut(|heap| heap.collect(&[]));
+        assert_eq!(with_heap(|heap| heap.live_count()), 0);
+        leave();
+
+        assert_eq!(
+            with_heap(|heap| heap.live_count()),
+            1,
+            "leaving restores the enclosing heap"
+        );
+        with_heap_mut(|heap| heap.collect(&[kept.as_any()]));
+        assert_eq!(
+            with_heap(|heap| heap.live_count()),
+            1,
+            "the rooted box survives"
+        );
+        leave();
+
+        let _ = std::hint::black_box((first, second, kept));
+    }
+
+    /// The safe-point pacing counter belongs to the heap: a second heap does
+    /// not inherit the first one's spent budget.
+    #[test]
+    fn the_allocation_budget_is_per_heap() {
+        let first = HeapState::new();
+        let second = HeapState::new();
+
+        enter(&first);
+        for _ in 0..ALLOC_BUDGET {
+            let _ = Gc::new(Node::default());
+        }
+        assert!(
+            allocation_budget_exceeded(),
+            "the first heap spent its budget"
+        );
+
+        enter(&second);
+        assert!(
+            !allocation_budget_exceeded(),
+            "a fresh heap starts its own budget"
+        );
+        leave();
+        leave();
+    }
+
+    /// A weak handle belongs to the heap that registered it: a collection of
+    /// another heap neither sees nor drains it.
+    #[test]
+    fn weak_handles_belong_to_the_heap_that_registered_them() {
+        use crate::handle::Handle;
+        use crate::string::JsString;
+        use crate::value::Value;
+
+        let first = HeapState::new();
+        let second = HeapState::new();
+
+        enter(&first);
+        let value = Value::String(Handle::new(JsString::from_utf8("weak in the first heap")));
+        let weak = weak_new(value);
+        leave();
+
+        enter(&second);
+        with_heap_mut(|heap| heap.collect(&[]));
+        leave();
+
+        enter(&first);
+        assert_eq!(
+            weak_get(weak),
+            Some(value),
+            "another heap's collection must not drain it"
+        );
+        let swept = with_heap_mut(|heap| heap.collect(&[]));
+        assert!(
+            swept.contains(&string_box_addr(value)),
+            "the unrooted value is swept with its own heap: {swept:?}"
+        );
+        assert_eq!(weak_get(weak), None);
+        leave();
+    }
+    /// A heap cell belongs to the heap that created it — the property a cache
+    /// of handles needs, since a `Handle` from one arena means nothing in
+    /// another.
+    #[test]
+    fn a_heap_cell_belongs_to_its_heap() {
+        let first = HeapState::new();
+        let second = HeapState::new();
+
+        enter(&first);
+        let first_value = with_heap_cell(
+            || Cell::new(0u64),
+            |cell| {
+                cell.set(cell.get() + 1);
+                cell.get()
+            },
+        );
+        assert_eq!(first_value, 1);
+        leave();
+
+        enter(&second);
+        let second_value = with_heap_cell(
+            || Cell::new(0u64),
+            |cell| {
+                cell.set(cell.get() + 1);
+                cell.get()
+            },
+        );
+        assert_eq!(second_value, 1, "a second heap starts its own cell");
+        leave();
+
+        enter(&first);
+        let kept = with_heap_cell(|| Cell::new(0u64), |cell| cell.get());
+        assert_eq!(kept, 1, "the first heap kept its own cell");
+        leave();
     }
 
     /// The box address a string value points at.

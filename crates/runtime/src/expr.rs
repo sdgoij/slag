@@ -1920,9 +1920,18 @@ fn eval_template(
 // (a freed AST reallocated for the next `eval`), so each parse also gets a
 // fresh generation: the node pointer alone would falsely cache across evals.
 type TemplateCacheKey = (usize, usize, usize, usize);
+
+/// The realm's template cache for the entered heap.
+///
+/// One per heap: the cached entries are arrays, so a `Value` that outlived its
+/// arena would hand the next isolate a swept object.
+fn with_template_object_cache<R>(
+    body: impl FnOnce(&std::cell::RefCell<Vec<(TemplateCacheKey, Value)>>) -> R,
+) -> R {
+    crux::heap::with_heap_cell(|| std::cell::RefCell::new(Vec::new()), body)
+}
+
 thread_local! {
-    static TEMPLATE_OBJECT_CACHE: std::cell::RefCell<Vec<(TemplateCacheKey, Value)>> =
-        const { std::cell::RefCell::new(Vec::new()) };
     static TEMPLATE_PARSE_GENERATION: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
@@ -1952,7 +1961,7 @@ pub(crate) fn get_template_object(
         span.start as usize,
         span.end as usize,
     );
-    let cached = TEMPLATE_OBJECT_CACHE.with(|cache| {
+    let cached = with_template_object_cache(|cache| {
         cache
             .borrow()
             .iter()
@@ -2034,7 +2043,7 @@ pub(crate) fn get_template_object(
     )?;
     obj.prevent_extensions()?;
     let value = Value::Object(obj);
-    TEMPLATE_OBJECT_CACHE.with(|cache| {
+    with_template_object_cache(|cache| {
         cache.borrow_mut().push((key, value));
     });
     Ok(value)

@@ -1052,6 +1052,48 @@ mod tests {
         );
     }
 
+    /// A well-known symbol keeps its identity across the blob: the restored
+    /// realm's `Symbol.iterator` has to be the symbol the builtins were
+    /// installed under, or nothing is iterable in the restored realm.
+    ///
+    /// The encode pass runs with no scope open, so it must still read the
+    /// *creator's* heap — a thread-local or non-entered lookup would give it a
+    /// different symbol and the blob would carry a duplicate.
+    #[test]
+    fn well_known_symbols_keep_their_identity_across_the_blob() {
+        let mut isolate = Isolate::snapshot_creator(None, None);
+        {
+            crate::scope!(let scope, &mut isolate);
+            let context = Context::new(scope, Default::default());
+            let scope = &mut crate::ContextScope::new(scope, context);
+            scope.set_default_context(context);
+            crate::test_support::eval(
+                scope,
+                "globalThis.__iterator = Symbol.iterator; globalThis.__array = [1, 2, 3];",
+            );
+        }
+        let blob = isolate
+            .create_blob(FunctionCodeHandling::Keep)
+            .expect("a blob");
+
+        let mut isolate = isolate_from(blob);
+        let context = restored_context(&mut isolate, DEFAULT_CONTEXT_SLOT)
+            .expect("the blob names the default context");
+        crate::scope!(let scope, &mut isolate);
+        let context = context.open(scope);
+        let scope = &mut crate::ContextScope::new(scope, context);
+        assert_eq!(
+            crate::test_support::eval(
+                scope,
+                "String(globalThis.__iterator === Symbol.iterator) + ',' + \
+                 String(globalThis.__array[Symbol.iterator] !== undefined) + ',' + \
+                 String([...globalThis.__array].length)",
+            )
+            .to_rust_string_lossy(scope),
+            "true,true,3"
+        );
+    }
+
     /// A realm whose global the host built from a handler-bearing template — the
     /// node:vm context the CLI's snapshot host adds as slot 0 — writes a blob and
     /// reads it back instead of ending the write. What travels is the global's

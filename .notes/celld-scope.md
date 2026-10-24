@@ -5,6 +5,18 @@ is not `deno_core`. Since the bridge now stands in for 152.1, its compile probe
 reduces to one architectural gap: celld's isolates belong to no thread and are
 entered by whichever worker takes a lock. This note records what that costs.
 
+## Status (2026-10-25)
+
+Steps 1 and 2 have landed. The premise below — that per-thread *root registries* were the blocker — was wrong: the heap itself was thread-local, and with it every table the collector reads.
+
+- `IsolateInner` owns the handle `store::Table` (step 1) and a `crux::heap::HeapState` (step 2): the arena, the pinned set, the root-source list, the weak tables, the remembered set and the collection generation.
+- `crux::heap::enter`/`leave` install that state for a scope's life, mirroring `store::enter`. A thread with no isolate entered — the C surfaces, the crate's own tests — keeps its own state, so nothing outside the bridge changed.
+- The scope-less paths install it explicitly: a global handler's callback region, `Isolate::take_heap_snapshot`, and the snapshot *encode* pass. The last one matters: a blob written without the creator's heap carried duplicate well-known symbols, which is how deno's lazy-loaded modules broke.
+- Thread-local caches that held handles moved into the heap — `map::EMPTY_MAP_CACHE` (`Handle<Map>`), `symbol::TABLE` (`Handle<Symbol>`), `expr::TEMPLATE_OBJECT_CACHE` (arrays) — through `crux::heap::with_heap_cell`. A cache that outlives its arena hands the next isolate a swept box; snapshot restore crashed on exactly that.
+- The handle arena's root-source flag is per table, not per thread, and the drop paths that can run during thread teardown use `try_with`.
+
+Still open, step 3: `SharedIsolate`/`Locker`/`try_into_shared`, `Send` globals, `Arc<AgentRoots>`, and giving `Pin` the heap it belongs to. Until that last one lands, a `Global` dropped while a *different* isolate is entered unpins nothing — one rooted box kept alive until its heap dies, never a use-after-free — and the 357 `Send`/`Sync` errors are unchanged.
+
 ## What celld needs, measured
 
 The probe (celld's own workspace, `v8` patched to `crates/v8`, Linux/WSL — its

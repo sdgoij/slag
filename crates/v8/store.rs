@@ -173,21 +173,24 @@ impl crux::heap::RootSource for CellsRoots {
 
 static CELLS_ROOTS: CellsRoots = CellsRoots;
 
-thread_local! {
-    /// Whether this thread has registered its cell arena. A thread-local because
-    /// the arena is: a worker thread's handles root that thread's heap and no
-    /// other.
-    static ROOTS_REGISTERED: Cell<bool> = const { Cell::new(false) };
-}
-
-/// Make this thread's cell arena a root source for the collector, once.
+/// Make this isolate's cell arena a root source for its collector, once.
+///
+/// The flag lives on the table, not on the thread: the arena belongs to the
+/// isolate, so a thread that enters a second isolate has to register *that*
+/// arena too. A thread-local flag would leave the second isolate's handles
+/// unrooted.
 fn register_cell_roots() {
-    ROOTS_REGISTERED.with(|registered| {
-        if registered.replace(true) {
-            return;
+    let first_use = with_table(|table| {
+        let mut table = table.borrow_mut();
+        if table.roots_registered {
+            return false;
         }
-        crux::heap::register_root_source(&CELLS_ROOTS);
+        table.roots_registered = true;
+        true
     });
+    if first_use {
+        crux::heap::register_root_source(&CELLS_ROOTS);
+    }
 }
 
 #[derive(Default)]
@@ -199,6 +202,9 @@ pub(crate) struct Table {
     /// Handed out with each script. A stale pair cannot name a later script
     /// that reused the slot unless this wraps, which takes 2^32 scripts.
     issued: u32,
+    /// Whether the collector was told this arena is a root source (see
+    /// [`register_cell_roots`]).
+    roots_registered: bool,
 }
 
 impl Table {
@@ -230,8 +236,12 @@ pub(crate) fn enter(table: *const RefCell<Table>) {
 
 /// Undo the innermost [`enter`].
 pub(crate) fn leave() {
+    // A scope dropped during thread teardown reaches this after the stack has
+    // been destroyed; panicking in a drop would abort the process.
     let previous = PREVIOUS
-        .with(|stack| stack.borrow_mut().pop())
+        .try_with(|stack| stack.borrow_mut().pop())
+        .ok()
+        .flatten()
         .unwrap_or(std::ptr::null());
     CURRENT.with(|current| current.set(previous));
 }

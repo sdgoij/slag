@@ -62,26 +62,24 @@ pub const WELL_KNOWN_SYMBOLS: &[&str] = &[
 ];
 
 /// Returns the canonical well-known symbol for `name` (the short name, e.g.
-/// "unscopables"), creating it on first use. The table is thread-local: each
-/// agent gets its own set (well-known symbols are per-realm), and a thread-
-/// local table keeps `JsString` (whose rope children are `Rc`) free of a
-/// `Send` requirement.
+/// "unscopables"), creating it on first use. The table belongs to the entered
+/// heap: each realm gets its own set (well-known symbols are per-realm), and a
+/// cache that outlived its arena would hand a later isolate a swept symbol.
 pub fn well_known(name: &str) -> Handle<Symbol> {
-    thread_local! {
-        static TABLE: std::cell::RefCell<HashMap<String, Handle<Symbol>>> =
-            std::cell::RefCell::new(HashMap::new());
-    }
-    TABLE.with(|table| {
-        table
-            .borrow_mut()
-            .entry(name.to_string())
-            .or_insert_with(|| {
-                Handle::new(Symbol::new(Some(JsString::from_utf8(&format!(
-                    "Symbol.{name}"
-                )))))
-            })
-            .to_owned()
-    })
+    crate::heap::with_heap_cell(
+        || std::cell::RefCell::new(HashMap::new()),
+        |table| {
+            table
+                .borrow_mut()
+                .entry(name.to_string())
+                .or_insert_with(|| {
+                    Handle::new(Symbol::new(Some(JsString::from_utf8(&format!(
+                        "Symbol.{name}"
+                    )))))
+                })
+                .to_owned()
+        },
+    )
 }
 
 /// %Symbol.unscopables%: consulted by `with`-statement environment records

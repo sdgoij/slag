@@ -109,6 +109,16 @@ impl Isolate {
     /// from a GC callback, which is where `setHeapSnapshotNearHeapLimit` wants
     /// one.
     pub fn take_heap_snapshot<F: FnMut(&[u8]) -> bool>(&mut self, callback: F) {
+        // The graph is this isolate's arena, and the call may arrive from a GC
+        // callback with no scope behind it, so the heap is installed here.
+        crux::heap::enter(self.heap_ptr());
+        struct Restore;
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                crux::heap::leave();
+            }
+        }
+        let _restore = Restore;
         write_document(callback);
     }
 }

@@ -299,10 +299,16 @@ impl Map {
     }
 }
 
-thread_local! {
-    static EMPTY_MAP_CACHE: std::cell::RefCell<
-        Vec<(Option<u64>, Handle<Map>)>,
-    > = const { std::cell::RefCell::new(Vec::new()) };
+/// The canonical empty maps for the entered heap.
+///
+/// One per heap, like every cache of handles: a `Handle<Map>` names a box in one
+/// arena, and the cache is pruned against that arena's mark
+/// ([`drop_unmarked_empty_maps`]), so a cache shared across arenas would hand a
+/// later isolate a map the sweep freed.
+fn with_empty_map_cache<R>(
+    body: impl FnOnce(&std::cell::RefCell<Vec<(Option<u64>, Handle<Map>)>>) -> R,
+) -> R {
+    crate::heap::with_heap_cell(|| std::cell::RefCell::new(Vec::new()), body)
 }
 
 /// Get or create a canonical empty map for the given prototype.
@@ -319,7 +325,7 @@ pub fn canonical_empty_map(prototype: Option<Handle<JsObject>>) -> Handle<Map> {
     // The cache lookup must not hold its borrow across `Map::new_empty`: a
     // `--gc-stress` collection fires inside the allocation, and the sweep's
     // cache prune (`drop_unmarked_empty_maps`) needs the borrow.
-    let cached = EMPTY_MAP_CACHE.with(|cache| {
+    let cached = with_empty_map_cache(|cache| {
         cache
             .borrow()
             .iter()
@@ -330,7 +336,7 @@ pub fn canonical_empty_map(prototype: Option<Handle<JsObject>>) -> Handle<Map> {
         return handle;
     }
     let handle = Map::new_empty(prototype);
-    EMPTY_MAP_CACHE.with(|cache| cache.borrow_mut().push((key, handle)));
+    with_empty_map_cache(|cache| cache.borrow_mut().push((key, handle)));
     handle
 }
 
@@ -343,7 +349,7 @@ pub fn canonical_empty_map(prototype: Option<Handle<JsObject>>) -> Handle<Map> {
 /// whose box survived the mark stays valid: boxes are only freed inside a
 /// collection, so a surviving entry cannot go stale before the next sweep.
 pub(crate) fn drop_unmarked_empty_maps() {
-    EMPTY_MAP_CACHE.with(|cache| {
+    with_empty_map_cache(|cache| {
         cache
             .borrow_mut()
             .retain(|(_, map)| map.as_any().is_marked());
@@ -361,7 +367,7 @@ pub(crate) fn drop_unmarked_empty_maps() {
 ///
 /// Called with the minor's final mark bits, right before its sweep.
 pub(crate) fn drop_unmarked_young_empty_maps() {
-    EMPTY_MAP_CACHE.with(|cache| {
+    with_empty_map_cache(|cache| {
         cache.borrow_mut().retain(|(_, map)| {
             let map = map.as_any();
             !map.is_young() || map.is_marked()

@@ -990,14 +990,36 @@ pub(crate) struct GlobalHandler {
     /// entry says. So the region this opens has to be opened there too, or the
     /// callback's own scope would inherit a region it cannot see.
     table: *const RefCell<crate::store::Table>,
+    /// The collector state of the same isolate. A callback may allocate, and
+    /// the heap has to be the isolate's rather than whatever the thread last
+    /// entered.
+    heap: *const crux::heap::HeapState,
+}
+
+/// Undoes [`GlobalHandler::callback_region`]'s entries, on the normal path and
+/// on a host callback's unwind — a stale heap pointer left installed would
+/// name freed state after the isolate goes.
+struct CallbackRegion;
+
+impl Drop for CallbackRegion {
+    fn drop(&mut self) {
+        crate::store::close_region();
+        crate::store::leave();
+        crux::heap::leave();
+    }
 }
 
 impl GlobalHandler {
     pub(crate) fn new(
         handlers: Rc<TemplateHandlers>,
         table: *const RefCell<crate::store::Table>,
+        heap: *const crux::heap::HeapState,
     ) -> Self {
-        Self { handlers, table }
+        Self {
+            handlers,
+            table,
+            heap,
+        }
     }
 
     fn named(&self) -> Option<&NamedPropertyHandlerConfiguration> {
@@ -1217,12 +1239,11 @@ impl GlobalHandler {
     /// so a callback that opens no scope of its own (the crate's `CallbackScope`
     /// inherits the region rather than opening one) still has cells to allocate.
     fn callback_region<T>(&self, body: impl FnOnce() -> T) -> T {
+        crux::heap::enter(self.heap);
         crate::store::enter(self.table);
         crate::store::open_region();
-        let value = body();
-        crate::store::close_region();
-        crate::store::leave();
-        value
+        let _region = CallbackRegion;
+        body()
     }
 }
 

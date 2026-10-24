@@ -210,6 +210,12 @@ pub struct IsolateInner {
     /// them, so they travel with it; a scope installs this table for its life
     /// (`store::enter`).
     pub(crate) table: RefCell<store::Table>,
+    /// The heap this isolate allocates in (see [`crux::heap::HeapState`]): the
+    /// arena, its boxes' roots and its collection state. The isolate owns them
+    /// for the same reason it owns the table above; a scope installs the state
+    /// for its life (`crux::heap::enter`), so an isolate entered on another
+    /// thread takes its heap with it.
+    pub(crate) heap: crux::heap::HeapState,
     /// The realm most recently entered through a `ContextScope`. The engine
     /// tracks its own current realm; this is the bridge's copy of it, so a
     /// scope can hand object operations the context they need.
@@ -869,6 +875,7 @@ impl Isolate {
         let mut inner = Box::new(IsolateInner {
             engine,
             table: RefCell::new(store::Table::new()),
+            heap: crux::heap::HeapState::new(),
             context: RefCell::new(None),
             continuation_data: None,
             slots: UnsafeCell::new(HashMap::new()),
@@ -1865,6 +1872,11 @@ impl Isolate {
         &self.inner().table
     }
 
+    /// The collector state this isolate owns, for the scope that installs it.
+    pub(crate) fn heap_ptr(&self) -> *const crux::heap::HeapState {
+        &self.inner().heap
+    }
+
     pub(crate) fn inner(&self) -> &IsolateInner {
         // SAFETY: the handle only exists for a live inner, which the
         // `OwnedIsolate` that made it keeps alive.
@@ -2402,7 +2414,21 @@ impl OwnedIsolate {
             .snapshot_creator
             .take()
             .expect("v8::OwnedIsolate::create_blob: this isolate was not created by Isolate::snapshot_creator");
-        Some(creator.create_blob(function_code_handling, callbacks))
+        // The encoder reads the realm through `crux` — the well-known symbol
+        // table, above all — so the creator's heap is installed for the write.
+        // A host calls this with no scope open, and an unentered encode would
+        // read a different heap and carry duplicate well-known symbols.
+        crux::heap::enter(handle.heap_ptr());
+        struct Restore;
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                crux::heap::leave();
+            }
+        }
+        let restore = Restore;
+        let blob = creator.create_blob(function_code_handling, callbacks);
+        drop(restore);
+        Some(blob)
     }
 }
 

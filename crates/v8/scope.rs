@@ -113,8 +113,9 @@ pub struct HandleScope<'i, C = Context> {
 
 impl<'i, C> HandleScope<'i, C> {
     fn new_in(isolate: Isolate, context: Option<api::Context>) -> Self {
-        // The region belongs to the isolate's table, so it goes in before the
-        // region opens.
+        // The region belongs to the isolate's heap and table, so both go in
+        // before the region opens.
+        crux::heap::enter(isolate.heap_ptr());
         store::enter(isolate.table_ptr());
         store::open_region();
         Self::with_region(isolate, context, true)
@@ -124,6 +125,7 @@ impl<'i, C> HandleScope<'i, C> {
     /// opens: a [`CallbackScope`] or an [`EscapableHandleScope`]. Its `Drop`
     /// closes nothing, and the enclosing scope closes what it opened.
     fn new_inherited(isolate: Isolate, context: Option<api::Context>) -> Self {
+        crux::heap::enter(isolate.heap_ptr());
         store::enter(isolate.table_ptr());
         Self::with_region(isolate, context, false)
     }
@@ -142,11 +144,12 @@ impl<'i, C> HandleScope<'i, C> {
 impl<C> Drop for HandleScope<'_, C> {
     fn drop(&mut self) {
         // The region closes against the isolate's table, so it goes before the
-        // table is uninstalled.
+        // table and the heap are uninstalled.
         if self.owns_region {
             store::close_region();
         }
         store::leave();
+        crux::heap::leave();
     }
 }
 

@@ -336,7 +336,9 @@ pub(crate) fn is_live_agent(agent: *const Agent) -> bool {
 
 /// Unregister a dropped agent (by its unique, never-reused signifier).
 fn unregister_live_agent(signifier: u64) {
-    LIVE_AGENTS.with(|live| {
+    // An agent dropped during thread teardown reaches this after the registry
+    // has been destroyed, and panicking in a drop would abort the process.
+    let _ = LIVE_AGENTS.try_with(|live| {
         live.borrow_mut().retain(|&(id, _)| id != signifier);
     });
 }
