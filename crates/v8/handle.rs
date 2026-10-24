@@ -5,7 +5,7 @@ use std::marker::PhantomData;
 use std::num::NonZeroI32;
 use std::ops::Deref;
 use std::ptr::NonNull;
-use std::rc::Rc;
+use std::sync::Arc;
 
 use crux::heap::Trace;
 use crux::value::ValueKind;
@@ -166,7 +166,7 @@ impl Payload {
 
     /// The text behind a `Script` payload, for a persistent handle that has to
     /// own it: a scoped reference dies with its scope.
-    pub(crate) fn as_script_source(&self) -> Option<Rc<str>> {
+    pub(crate) fn as_script_source(&self) -> Option<Arc<str>> {
         self.as_script_entry().map(|entry| entry.source)
     }
 
@@ -755,9 +755,26 @@ pub struct Global<T> {
     /// A scoped reference dies with the region its handle scope opened, so a
     /// handle that outlives that scope has to keep them itself and hand them
     /// back to the scope it is read in. `None` for every other payload.
-    script: Option<Rc<crate::store::Entry>>,
+    ///
+    /// `Arc` because a `Global` is `Send`: the last reference may be dropped on
+    /// a thread that is not running the isolate.
+    script: Option<Arc<crate::store::Entry>>,
     marker: PhantomData<fn() -> T>,
 }
+
+// SAFETY: a `Global` names a value in one isolate's heap, and the crate this
+// stands in for makes it `Send + Sync` for the same reason. *Using* it is what
+// needs the isolate: every use goes through a scope (`open`, `get`), and a host
+// may only make one while it holds the isolate — entered on this thread, or
+// locked through a `SharedIsolate`.
+//
+// Moving, cloning and dropping touch no heap: the payload is a set of
+// addresses, a script's text is shared through `Arc`, and a pin releases
+// through a mutex-protected list of addresses ([`crux::heap::Pin`]). A worker
+// that drops the last reference to a value it never opened therefore cannot
+// race the thread running the isolate.
+unsafe impl<T> Send for Global<T> {}
+unsafe impl<T> Sync for Global<T> {}
 
 impl<T> Global<T> {
     /// A persistent handle over a scoped one.
@@ -785,7 +802,7 @@ impl<T> Global<T> {
             | Payload::StackFrame { .. }
             | Payload::Poisoned => None,
         };
-        let script = payload.as_script_entry().map(Rc::new);
+        let script = payload.as_script_entry().map(Arc::new);
         Self {
             payload,
             pin,
@@ -1106,5 +1123,15 @@ mod tests {
             assert_eq!(crate::test_support::eval_number(scope, "arr.length"), 3.0);
             assert_eq!(crate::test_support::eval_number(scope, "arr[2]"), 3.0);
         });
+    }
+
+    /// A host that shares its isolates across workers shares their persistent
+    /// handles too, so the property is part of the bridge's surface.
+    #[test]
+    fn a_global_is_send_and_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<Global<crate::Object>>();
+        assert_send_sync::<Global<crate::Context>>();
+        assert_send_sync::<Global<crate::Function>>();
     }
 }

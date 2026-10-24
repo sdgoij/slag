@@ -61,6 +61,7 @@ mod scope;
 mod script;
 pub mod script_compiler;
 mod serialize;
+mod shared;
 #[cfg(feature = "simdutf")]
 pub mod simdutf;
 mod snapshot;
@@ -119,6 +120,7 @@ pub use primitives::{
 pub use promise::{PromiseRejectEvent, PromiseRejectMessage, PromiseState};
 pub use property::*;
 pub use property_descriptor::PropertyDescriptor;
+pub use shared::{Locker, SharedIsolate, SharedIsolateError};
 pub use weak::{TracedReference, Weak, WeakCallbackInfo};
 
 /// The version this bridge reports (`v8::VERSION_STRING`).

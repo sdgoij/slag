@@ -1327,9 +1327,14 @@ fn constructor_name<'s>(
 ///
 /// The crate we stand in for declares this as a raw C callback and adapts a
 /// host's function to it; this bridge takes the host-facing shape directly,
-/// which is what such a function already is.
-pub type AccessorNameGetterCallback =
-    for<'s> fn(Local<'s, Name>, PropertyCallbackArguments<'s>, ReturnValue<'s, Value>);
+/// which is what such a function already is — scope first, like every other
+/// host callback here.
+pub type AccessorNameGetterCallback = for<'s, 'i, 'a> fn(
+    &mut PinScope<'s, 'i>,
+    Local<'s, Name>,
+    PropertyCallbackArguments<'s>,
+    ReturnValue<'a, Value>,
+);
 
 /// The one getter every lazy data property shares
 /// (`v8::Object::SetLazyDataPropertyWithData`).
@@ -1380,6 +1385,7 @@ fn lazy_data_property_trampoline<'s, 'i>(
     // return slot is written last, after the answer has been cached.
     let answered = std::cell::RefCell::new(None);
     getter(
+        scope,
         key,
         PropertyCallbackArguments::for_property_get(args.this(), data),
         ReturnValue::from_slot(&answered),
@@ -2323,10 +2329,11 @@ mod tests {
         thread_local! {
             static CALLS: Cell<u32> = const { Cell::new(0) };
         }
-        fn getter<'s>(
+        fn getter<'s, 'i, 'a>(
+            _scope: &mut PinScope<'s, 'i>,
             name: Local<'s, Name>,
             args: PropertyCallbackArguments<'s>,
-            rv: ReturnValue<'s>,
+            rv: ReturnValue<'a>,
         ) {
             CALLS.with(|calls| calls.set(calls.get() + 1));
             assert_eq!(name.engine().as_string().as_deref(), Some("lazy"));

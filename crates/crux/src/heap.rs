@@ -913,7 +913,7 @@ pub struct HeapState {
     verify_barrier: Cell<bool>,
     verify_minor: Cell<bool>,
     collection_gen: Cell<u32>,
-    pinned: std::rc::Rc<RefCell<Vec<GcAny>>>,
+    pinned: std::sync::Arc<std::sync::Mutex<Vec<usize>>>,
     root_sources: RefCell<Vec<&'static dyn RootSource>>,
     weak_handles: RefCell<Vec<WeakEntry>>,
     pending_weak_callbacks: RefCell<Vec<Box<dyn FnOnce()>>>,
@@ -925,6 +925,13 @@ pub struct HeapState {
 }
 
 impl HeapState {
+    /// Whether this heap holds a weak handle. A `WeakHandle` is `!Send` by
+    /// construction, so one here means a host still holds a handle bound to
+    /// the thread that made it — and the isolate cannot move.
+    pub fn has_weak_handles(&self) -> bool {
+        !self.weak_handles.borrow().is_empty()
+    }
+
     /// A fresh collector state: an empty arena, every table at its default.
     pub fn new() -> Self {
         Self {
@@ -944,7 +951,7 @@ impl HeapState {
             verify_barrier: Cell::new(cfg!(debug_assertions)),
             verify_minor: Cell::new(false),
             collection_gen: Cell::new(1),
-            pinned: std::rc::Rc::new(RefCell::new(Vec::new())),
+            pinned: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
             root_sources: RefCell::new(Vec::new()),
             weak_handles: RefCell::new(Vec::new()),
             pending_weak_callbacks: RefCell::new(Vec::new()),
@@ -1666,7 +1673,13 @@ per_heap!(
     /// The boxes a host pinned in this heap, shared with the pins that hold
     /// them (a [`Pin`] keeps the list itself alive, so releasing a pin whose
     /// heap is already gone touches nothing freed).
-    PINNED = Pinned => pinned: std::rc::Rc<RefCell<Vec<GcAny>>>;
+    ///
+    /// Addresses rather than `GcAny`, and a mutex rather than a `RefCell`: a
+    /// `Global` is `Send`, so its pin may be dropped on a thread that is not
+    /// running the isolate while the isolate's own thread marks. Nothing here
+    /// dereferences a box — the list is a set of addresses both sides only
+    /// compare and copy.
+    PINNED = Pinned => pinned: std::sync::Arc<std::sync::Mutex<Vec<usize>>>;
 );
 
 /// A pin: the value it names is a root of every collection until it is dropped.
@@ -1687,7 +1700,7 @@ pub struct Pin {
     /// heap would leave the box rooted while its own heap never hears about the
     /// drop. Holding the list (rather than the heap that owns it) also means a
     /// pin that outlives its isolate touches nothing freed.
-    pinned: std::rc::Rc<RefCell<Vec<GcAny>>>,
+    pinned: std::sync::Arc<std::sync::Mutex<Vec<usize>>>,
 }
 
 impl std::fmt::Debug for Pin {
@@ -1704,8 +1717,8 @@ impl Drop for Pin {
         let Some(any) = self.any else {
             return;
         };
-        let mut pinned = self.pinned.borrow_mut();
-        if let Some(index) = pinned.iter().position(|held| held.addr() == any.addr()) {
+        let mut pinned = lock_pins(&self.pinned);
+        if let Some(index) = pinned.iter().position(|&held| held == any.addr()) {
             pinned.remove(index);
         }
     }
@@ -1719,11 +1732,20 @@ impl Drop for Pin {
 pub fn pin(value: crate::value::Value) -> Pin {
     let any = crate::value::Value::encoded_box_address(value.bits())
         .map(|addr| GcAny(addr as *mut GcHeader));
-    let pinned = with_state(|state| std::rc::Rc::clone(&state.pinned));
+    let pinned = with_state(|state| std::sync::Arc::clone(&state.pinned));
     if let Some(any) = any {
-        pinned.borrow_mut().push(any);
+        lock_pins(&pinned).push(any.addr());
     }
     Pin { any, pinned }
+}
+
+/// The pinned list's guard. A panic while it is held poisons it, and a pin
+/// still has to be released: the list holds addresses, so recovering the data
+/// is always sound.
+fn lock_pins(pinned: &std::sync::Mutex<Vec<usize>>) -> std::sync::MutexGuard<'_, Vec<usize>> {
+    pinned
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 /// Keep the box `handle` names, and everything it reaches, alive until the
@@ -1731,8 +1753,8 @@ pub fn pin(value: crate::value::Value) -> Pin {
 /// that no language value names (a module record).
 pub fn pin_handle<T: Trace>(handle: crate::handle::Handle<T>) -> Pin {
     let any = handle.as_any();
-    let pinned = with_state(|state| std::rc::Rc::clone(&state.pinned));
-    pinned.borrow_mut().push(any);
+    let pinned = with_state(|state| std::sync::Arc::clone(&state.pinned));
+    lock_pins(&pinned).push(any.addr());
     Pin {
         any: Some(any),
         pinned,
@@ -1811,7 +1833,13 @@ pub trait GcObserver: 'static {
 /// nor a registered table can be lost by taking a path that collects.
 fn pinned_roots(roots: &[GcAny]) -> Vec<GcAny> {
     let mut all = roots.to_vec();
-    PINNED.with(|pinned| all.extend(pinned.borrow().iter().copied()));
+    PINNED.with(|pinned| {
+        all.extend(
+            lock_pins(pinned)
+                .iter()
+                .map(|&addr| GcAny(addr as *mut GcHeader)),
+        )
+    });
     ROOT_SOURCES.with(|sources| {
         for source in sources.borrow().iter() {
             source.roots(&mut |any| all.push(any));

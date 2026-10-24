@@ -1,6 +1,7 @@
 //! Scripts (`v8::Script`) and where they came from (`v8::ScriptOrigin`).
 
 use std::rc::Rc;
+use std::sync::Arc;
 
 use runtime::api;
 
@@ -96,7 +97,8 @@ impl Script {
     ) -> Result<Local<'s, Script>, crux::error::JsError> {
         let realm = crate::realm_of(scope);
         api::Script::compile(&realm, text)?;
-        let (slot, generation) = crate::store::store(text.into(), name);
+        let (slot, generation) =
+            crate::store::store(Arc::from(text), name.map(|name| Arc::from(&*name)));
         Ok(Local::from_payload(Payload::Script { slot, generation }))
     }
 }

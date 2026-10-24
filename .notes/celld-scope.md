@@ -15,7 +15,18 @@ Steps 1 and 2 have landed. The premise below — that per-thread *root registrie
 - Thread-local caches that held handles moved into the heap — `map::EMPTY_MAP_CACHE` (`Handle<Map>`), `symbol::TABLE` (`Handle<Symbol>`), `expr::TEMPLATE_OBJECT_CACHE` (arrays) — through `crux::heap::with_heap_cell`. A cache that outlives its arena hands the next isolate a swept box; snapshot restore crashed on exactly that.
 - The handle arena's root-source flag is per table, not per thread, and the drop paths that can run during thread teardown use `try_with`.
 
-Still open, step 3: `SharedIsolate`/`Locker`/`try_into_shared`, `Send` globals, `Arc<AgentRoots>`, and giving `Pin` the heap it belongs to. Until that last one lands, a `Global` dropped while a *different* isolate is entered unpins nothing — one rooted box kept alive until its heap dies, never a use-after-free — and the 357 `Send`/`Sync` errors are unchanged.
+Step 3 has landed too. `SharedIsolate` is a `Mutex<OwnedIsolate>`; `Locker` installs the isolate's heap and handle arena for a turn and removes them on drop, and derefs to `Isolate`; `unsafe OwnedIsolate::try_into_shared` refuses a snapshot creator, an open scope, and weak handles. The probe is now **0 errors**, from 560 before the heap work and 638 after it (making the heap's `!Send` state reachable through `Global` surfaced 78 more).
+
+What that took, in the note's own numbering:
+
+- **`Global<T>` is `Send + Sync`** (the crate we stand in for's contract: using one needs the isolate entered, or locked through a `SharedIsolate`). Moving, cloning and dropping it touch no heap.
+- **`Pin` holds the pinned list, not the heap** — `Arc<Mutex<Vec<usize>>>` of addresses. A pointer-to-heap version was measured first and reproduced a release-only heap corruption in roughly one parallel run in four; holding the list means a `Global` dropped on a worker cannot touch freed state, and nothing in the list is ever dereferenced.
+- **`store::Entry` and its strings are `Arc`**, because a `Global` over a script carries one.
+- **`Arc<AgentRoots>` was not needed.** Making the registry a heap cell (step 2) and the pin thread-safe removed every off-thread path to that `Rc`; the agent is only reachable under the isolate's thread or lock.
+
+Two gaps the error list did not show, both bridge rather than celld bugs: `BackingStore` did not deref to `[Cell<u8>]` (how the crate we stand in for exposes shared bytes), and `AccessorNameGetterCallback` was not scope-first like every other host callback here.
+
+Still thread-bound: `Weak`/`TracedReference`, and the isolate's current realm — a `Locker` installs the heap and the arena only, so a host enters a context itself, which celld does. `cargo check` is the probe's ceiling on Windows: celld's native dependencies keep it from building here.
 
 ## What celld needs, measured
 

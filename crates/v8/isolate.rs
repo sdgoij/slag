@@ -2390,6 +2390,34 @@ impl AsMut<Isolate> for Isolate {
 }
 
 impl OwnedIsolate {
+    /// Move this isolate behind a lock, so any thread may enter it
+    /// (`v8::OwnedIsolate::try_into_shared`).
+    ///
+    /// # Safety
+    ///
+    /// Nothing else may reach the isolate: no scope may be open over it, it
+    /// must not be entered on any thread, and every handle over it must either
+    /// be a `Global` (which is safe to move) or be dropped first. The crate we
+    /// stand in for makes this `unsafe` for the same reason: after the move, no
+    /// type records which thread the isolate's state belongs to, and only the
+    /// lock keeps it to one thread at a time.
+    ///
+    /// The refusal cases are the ones this bridge can answer honestly — a
+    /// snapshot creator, an open scope, and weak handles, each of which names a
+    /// thread or a stack the isolate would leave behind.
+    pub unsafe fn try_into_shared(self) -> Result<crate::SharedIsolate, crate::SharedIsolateError> {
+        if self.inner.snapshot_creator.is_some() {
+            return Err(crate::SharedIsolateError::SnapshotCreator);
+        }
+        if self.inner.table.borrow().has_open_region() {
+            return Err(crate::SharedIsolateError::OpenScope);
+        }
+        if self.inner.heap.has_weak_handles() {
+            return Err(crate::SharedIsolateError::WeakHandles);
+        }
+        Ok(crate::SharedIsolate::new(self))
+    }
+
     /// Create the snapshot blob (v8::OwnedIsolate::CreateBlob).
     ///
     /// # Panics

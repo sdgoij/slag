@@ -316,6 +316,27 @@ impl BackingStore {
     }
 }
 
+impl std::ops::Deref for BackingStore {
+    type Target = [std::cell::Cell<u8>];
+
+    /// The bytes, as the crate we stand in for exposes them: a cell per byte,
+    /// because a `SharedArrayBuffer`'s bytes may be written from another agent
+    /// while this one reads.
+    fn deref(&self) -> &Self::Target {
+        if self.byte_length == 0 {
+            return &[];
+        }
+        // SAFETY: the block owns `byte_length` bytes at its live base, and the
+        // store keeps the block alive for as long as this borrow.
+        unsafe {
+            std::slice::from_raw_parts(
+                self.block.data_ptr().cast::<std::cell::Cell<u8>>(),
+                self.byte_length,
+            )
+        }
+    }
+}
+
 /// A host function value (v8's `UnitType`): a function item, or a
 /// non-capturing closure, which is zero-sized, so it can be reconstructed from
 /// nothing instead of being stored.
