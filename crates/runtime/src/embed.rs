@@ -2291,7 +2291,7 @@ mod tests {
         let context = Context::new().unwrap();
         let ptr = context.agent() as *const Agent;
         assert!(
-            crate::agent::live_agent_ptrs().contains(&ptr),
+            crate::agent::is_live_agent(ptr),
             "the context's agent must be registered at its own address"
         );
         // Moving the context (as the host does when it stores it) must not
@@ -2299,7 +2299,7 @@ mod tests {
         let moved = context;
         let moved_ptr = moved.agent() as *const Agent;
         assert_eq!(ptr, moved_ptr, "the boxed agent must not move");
-        assert!(crate::agent::live_agent_ptrs().contains(&moved_ptr));
+        assert!(crate::agent::is_live_agent(moved_ptr));
     }
 
     #[test]

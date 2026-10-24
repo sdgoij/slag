@@ -101,6 +101,7 @@ impl Context {
         let isolate_ref = unsafe { &*isolate };
         let realm = isolate_ref
             .agent
+            .roots
             .realms
             .borrow()
             .iter()

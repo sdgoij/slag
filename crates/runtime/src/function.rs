@@ -2099,16 +2099,24 @@ pub fn call(
 /// `%eval%` dispatch pattern), so a builtin of one realm called from
 /// another must run with its own realm current.
 pub fn owning_realm(agent: &mut Agent, function: &Handle<Function>) -> Option<Handle<Realm>> {
-    if let Some(cached) = agent.function_realms.borrow().get(&function.id()).cloned() {
+    if let Some(cached) = agent
+        .roots
+        .function_realms
+        .borrow()
+        .get(&function.id())
+        .cloned()
+    {
         return cached;
     }
     let found = agent
+        .roots
         .realms
         .borrow()
         .iter()
         .find(|realm| realm.intrinsics.contains(&Value::Function(*function)))
         .cloned();
     agent
+        .roots
         .function_realms
         .borrow_mut()
         .insert(function.id(), found);

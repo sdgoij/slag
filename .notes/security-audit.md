@@ -687,6 +687,31 @@ identically at the commit before this change); clippy `-D warnings` clean;
 `FinalizationRegistry/*` 47/47, `expressions/await/*` 22/22; CLI host-globals
 and async/generator scratch scripts under `--gc-stress --gc-verify`.
 
+### Slice 2 landed: the realm tables, and a roots pointer in the registry
+
+Moved to `AgentRoots`: `realms`, `function_realms`, `shadow_realms`,
+`shadow_wrapped`, `shadow_handlers`. The three ShadowRealm tables were plain
+`IdMap`s and became `RefCell`s; every read that keeps the guard over work that
+may allocate now takes what it needs out of a scoped borrow (the import
+continuation copies its export name out, the wrapped-function lookup copies its
+target and realm), for the same reason slice 1's promise reads do.
+
+`LIVE_AGENTS` entries are now `(signifier, agent, roots)`, and `collect_with`
+traces every registered agent's moved containers through its `*const AgentRoots`
+— never through `&Agent` — while the not-yet-moved state is traced separately by
+`Agent::trace_agent_state` (renamed from `trace_roots`). That split is what
+makes the remaining slices mechanical.
+
+A roots-only registry is deliberately not done yet: other agents' un-moved state
+(still most of `trace_agent_state`) would stop being traced, and a nested or
+sibling agent's only reference to a buffer or data table is that state, so the
+next collection would free it. The agent pointer leaves the registry when
+`trace_agent_state` is empty, i.e. at the end of slice 4.
+
+Gate run: clippy clean, `cargo test -p runtime --release --lib` 1068 pass,
+`ShadowRealm/*` 64/64 under `--gc-stress --gc-verify`, `Promise/*` 732/732 under
+`--gc-stress --gc-verify`, `language --filter "*realm*"` 19/19.
+
 ---
 
 ## What was checked and found sound

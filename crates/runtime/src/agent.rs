@@ -263,15 +263,22 @@ impl Trace for ConcatSpreadVerdict {
 }
 
 // Every live `Agent` on this thread that has run JavaScript, as
-// `(signifier, pointer)` pairs. The crux heap is thread-local and shared by
-// every agent on the thread, but a collection roots only the collecting
+// `(signifier, agent, roots)` triples. The crux heap is thread-local and shared
+// by every agent on the thread, but a collection roots only the collecting
 // agent's own tables, so a nested or sibling agent's boxes — reachable only
 // through its Rust-heap tables, which the conservative stack scan cannot
 // see — would be swept. An agent is registered the first time it enters a
 // `with_agent` window and removed in `Drop`; an agent that moves between
 // runs re-registers its new address under the same signifier.
+//
+// `roots` is the agent's [`AgentRoots`] allocation, kept separately so the
+// collector can trace the containers that live there without forming a
+// `&Agent` (the moved state is exactly what must not be reached through a
+// reference whose tag an interpreter frame may have invalidated). The agent
+// pointer stays until every traced field has moved: until then the remaining
+// state still has to be traced, and only the `Agent` reaches it.
 thread_local! {
-    static LIVE_AGENTS: std::cell::RefCell<Vec<(u64, *const Agent)>> =
+    static LIVE_AGENTS: std::cell::RefCell<Vec<(u64, *const Agent, *const AgentRoots)>> =
         const { std::cell::RefCell::new(Vec::new()) };
 }
 
@@ -281,25 +288,39 @@ pub(crate) fn live_agent_entered(agent: *mut ()) {
     let agent = agent as *const Agent;
     // SAFETY: the notifier runs while `with_agent` has just recorded `agent`
     // as current, so it is a live `Agent` for the whole window.
-    let signifier = unsafe { (*agent).signifier };
+    let (signifier, roots) = unsafe { ((*agent).signifier, Rc::as_ptr(&(*agent).roots)) };
     LIVE_AGENTS.with(|live| {
         let mut live = live.borrow_mut();
         // An agent that moved since its last run re-registers its new
         // address; the stale entry (same signifier, old address) goes.
-        live.retain(|&(id, _)| id != signifier);
-        live.push((signifier, agent));
+        live.retain(|&(id, _, _)| id != signifier);
+        live.push((signifier, agent, roots));
     });
 }
 
-/// The registered live agents' pointers (see [`LIVE_AGENTS`]).
-pub(crate) fn live_agent_ptrs() -> Vec<*const Agent> {
-    LIVE_AGENTS.with(|live| live.borrow().iter().map(|&(_, ptr)| ptr).collect())
+/// The registered live agents: each agent's pointer and its root containers'
+/// (see [`LIVE_AGENTS`]).
+pub(crate) fn live_agent_ptrs() -> Vec<(*const Agent, *const AgentRoots)> {
+    LIVE_AGENTS.with(|live| {
+        live.borrow()
+            .iter()
+            .map(|&(_, agent, roots)| (agent, roots))
+            .collect()
+    })
+}
+
+/// Whether `agent` is registered as a live agent (tests).
+#[cfg(test)]
+pub(crate) fn is_live_agent(agent: *const Agent) -> bool {
+    live_agent_ptrs()
+        .iter()
+        .any(|&(registered, _)| registered == agent)
 }
 
 /// Unregister a dropped agent (by its unique, never-reused signifier).
 fn unregister_live_agent(signifier: u64) {
     LIVE_AGENTS.with(|live| {
-        live.borrow_mut().retain(|&(id, _)| id != signifier);
+        live.borrow_mut().retain(|&(id, _, _)| id != signifier);
     });
 }
 
@@ -394,6 +415,22 @@ pub(crate) struct AgentRoots {
     pub(crate) async_generators: RefCell<
         std::collections::HashMap<u64, Rc<RefCell<crate::async_generator::AsyncGeneratorState>>>,
     >,
+    /// Every realm created in this agent (the bootstrap realm plus any the
+    /// host creates via `$262.createRealm`), so a realm's builtin called from
+    /// another realm can dispatch with its own realm current.
+    pub(crate) realms: RefCell<Vec<Handle<Realm>>>,
+    /// Memoized owning-realm lookup: function id → the realm whose intrinsic
+    /// table holds it (`None` for non-intrinsic functions).
+    pub(crate) function_realms: RefCell<std::collections::HashMap<u64, Option<Handle<Realm>>>>,
+    /// The [[ShadowRealm]] internal slot of each ShadowRealm instance:
+    /// object id → the inner realm it evaluates in.
+    pub(crate) shadow_realms: RefCell<IdMap<Handle<Realm>>>,
+    /// The wrapped functions the ShadowRealm callable boundary produced:
+    /// function id → the target function and the wrapper's [[Realm]].
+    pub(crate) shadow_wrapped: RefCell<IdMap<crate::builtins::shadow_realm::ShadowWrapped>>,
+    /// The `ShadowRealm.prototype.importValue` continuations, keyed by
+    /// function identity.
+    pub(crate) shadow_handlers: RefCell<IdMap<crate::builtins::shadow_realm::ShadowHandler>>,
 }
 
 impl AgentRoots {
@@ -411,6 +448,11 @@ impl AgentRoots {
             async_resume: RefCell::new(std::collections::HashMap::new()),
             generators: RefCell::new(std::collections::HashMap::new()),
             async_generators: RefCell::new(std::collections::HashMap::new()),
+            realms: RefCell::new(Vec::new()),
+            function_realms: RefCell::new(std::collections::HashMap::new()),
+            shadow_realms: RefCell::new(std::collections::HashMap::default()),
+            shadow_wrapped: RefCell::new(std::collections::HashMap::default()),
+            shadow_handlers: RefCell::new(std::collections::HashMap::default()),
         }
     }
 
@@ -476,6 +518,11 @@ impl Trace for AgentRoots {
         self.async_resume.trace(visit);
         self.generators.trace(visit);
         self.async_generators.trace(visit);
+        self.realms.trace(visit);
+        self.function_realms.trace(visit);
+        self.shadow_realms.trace(visit);
+        self.shadow_wrapped.trace(visit);
+        self.shadow_handlers.trace(visit);
     }
 }
 
@@ -897,15 +944,6 @@ pub struct Agent {
     pub module_sources: std::collections::HashMap<u64, Handle<crate::module::SourceTextModule>>,
     /// The dynamic-import namespace resolvers, keyed by function identity.
     pub import_namespace_resolvers: std::collections::HashMap<u64, (Value, Value)>,
-    /// The [[ShadowRealm]] internal slot of each ShadowRealm instance:
-    /// object id → the inner realm it evaluates in.
-    pub shadow_realms: IdMap<Handle<Realm>>,
-    /// The wrapped functions the ShadowRealm callable boundary produced:
-    /// function id → the target function and the wrapper's [[Realm]].
-    pub shadow_wrapped: IdMap<crate::builtins::shadow_realm::ShadowWrapped>,
-    /// The `ShadowRealm.prototype.importValue` continuations, keyed by
-    /// function identity.
-    pub shadow_handlers: IdMap<crate::builtins::shadow_realm::ShadowHandler>,
     /// DeferredModule `.then` continuations (import-defer): each waiter
     /// function id maps to (wait id, is-rejection); the wait state holds the
     /// remaining async-dependency countdown and the capability.
@@ -1224,10 +1262,6 @@ pub struct Agent {
     /// A direct eval inside one applies the "Eval Inside Initializer" early
     /// errors (spec 19.2.1.1): `arguments` is a SyntaxError there.
     pub field_initializer_depth: usize,
-    /// Every realm created in this agent (the bootstrap realm plus any the
-    /// host creates via `$262.createRealm`), so a realm's builtin called
-    /// from another realm can dispatch with its own realm current.
-    pub realms: RefCell<Vec<Handle<Realm>>>,
     /// The realm count as a plain `Cell` (Cut 35 slice 25): the leaf-inline
     /// eligibility checks read `realms.len()` on every call, and the
     /// RefCell borrow was measurable there; `realms` is only ever pushed
@@ -1235,9 +1269,6 @@ pub struct Agent {
     /// so a count cell stays exact, and `Cell` permits the write through
     /// the `&Agent` like `RefCell` does.
     pub realm_count: std::cell::Cell<usize>,
-    /// Memoized owning-realm lookup: function id → the realm whose
-    /// intrinsic table holds it (`None` for non-intrinsic functions).
-    pub function_realms: RefCell<std::collections::HashMap<u64, Option<Handle<Realm>>>>,
     /// GC-1 slice 3: collect at every safe point when set (the `--gc-stress`
     /// mode; .notes/gc-plan.md GC-2 hardens the root audit under it).
     pub gc_stress: Cell<bool>,
@@ -1542,9 +1573,6 @@ impl Agent {
             deferred_namespaces: std::collections::HashMap::new(),
             module_sources: std::collections::HashMap::new(),
             import_namespace_resolvers: std::collections::HashMap::new(),
-            shadow_realms: std::collections::HashMap::default(),
-            shadow_wrapped: std::collections::HashMap::default(),
-            shadow_handlers: std::collections::HashMap::default(),
             deferred_module_waiter_fns: std::collections::HashMap::new(),
             deferred_module_waits: std::collections::HashMap::new(),
             deferred_module_thens: std::collections::HashMap::new(),
@@ -1641,9 +1669,7 @@ impl Agent {
             map_iter_data: std::collections::HashMap::new(),
             set_iter_data: std::collections::HashMap::new(),
             field_initializer_depth: 0,
-            realms: RefCell::new(Vec::new()),
             realm_count: std::cell::Cell::new(0),
-            function_realms: RefCell::new(std::collections::HashMap::new()),
             gc_stress: Cell::new(false),
             nursery_threshold: Cell::new(DEFAULT_NURSERY_THRESHOLD),
             last_collected_live: Cell::new(0),
@@ -2231,7 +2257,11 @@ impl Agent {
     /// the agent's own tables (which live in heap-allocated buffers the
     /// stack scan cannot see). Index-only caches and primitive tables need
     /// no tracing.
-    pub(crate) fn trace_roots(&self, visit: &mut dyn FnMut(GcAny)) {
+    ///
+    /// This is the state that has not moved to [`AgentRoots`] yet; the
+    /// collector traces the moved containers separately, through the roots
+    /// pointer, so they are never read via `&Agent`.
+    pub(crate) fn trace_agent_state(&self, visit: &mut dyn FnMut(GcAny)) {
         self.execution_context_stack.trace(visit);
         // The IC value caches hold Values; the index-only caches re-resolve
         // from the (traced) objects and need no tracing.
@@ -2290,7 +2320,6 @@ impl Agent {
         for vm in &self.vm_pool {
             vm.trace(visit);
         }
-        self.roots.trace(visit);
         self.global_symbol_registry.trace(visit);
         self.module_eval_stack.trace(visit);
         for entry in self.compiled_bodies.values() {
@@ -2371,9 +2400,6 @@ impl Agent {
         self.deferred_namespaces.trace(visit);
         self.module_sources.trace(visit);
         self.import_namespace_resolvers.trace(visit);
-        self.shadow_realms.trace(visit);
-        self.shadow_wrapped.trace(visit);
-        self.shadow_handlers.trace(visit);
         self.deferred_module_waits.trace(visit);
         self.deferred_module_thens.trace(visit);
         self.symbol_data.trace(visit);
@@ -2489,8 +2515,6 @@ impl Agent {
             let (value, _, _) = &*guard;
             value.trace(visit);
         }
-        self.realms.trace(visit);
-        self.function_realms.trace(visit);
         // GC-2: the Vms currently running bodies (their heap-buffered value
         // stacks are invisible to the conservative stack scan). Pooled and
         // suspended Vms are covered by `vm_pool` and the generator/async
@@ -2589,17 +2613,21 @@ impl Agent {
         // swept otherwise. `self` is traced below.
         let self_ptr = self as *const Agent;
         let live = live_agent_ptrs();
-        for &agent in &live {
+        for &(agent, agent_roots) in &live {
             if agent == self_ptr {
                 continue;
             }
             // SAFETY: a registered agent is alive — registration is removed
             // only in `Drop`, which cannot run during a collection on this
-            // thread.
-            let agent = unsafe { &*agent };
-            agent.trace_roots(&mut |any| roots.push(any));
+            // thread. The roots allocation outlives the registration the same
+            // way: it is owned by the agent.
+            unsafe {
+                (&*agent_roots).trace(&mut |any| roots.push(any));
+                (&*agent).trace_agent_state(&mut |any| roots.push(any));
+            }
         }
-        self.trace_roots(&mut |any| roots.push(any));
+        self.roots.trace(&mut |any| roots.push(any));
+        self.trace_agent_state(&mut |any| roots.push(any));
         // GC-3/GC-4: the compaction hook runs between the mark and the sweep
         // (the would-be-swept boxes are still allocated), dropping dead weak
         // entries and capturing FinalizationRegistry held values into
@@ -2609,7 +2637,7 @@ impl Agent {
         // conservative mark — the scan stays the safety net for Rust-held
         // handles).
         let has_weak = self.has_weak_structures()
-            || live.iter().any(|&agent| {
+            || live.iter().any(|&(agent, _)| {
                 agent != self_ptr
                     // SAFETY: as above.
                     && unsafe { (&*agent).has_weak_structures() }
@@ -2621,7 +2649,7 @@ impl Agent {
         let compact: &mut crux::heap::CompactHook = if has_weak {
             &mut |dead, retain| {
                 self.compact_weak_tables(dead, retain);
-                for &agent in &live {
+                for &(agent, _) in &live {
                     if agent != self_ptr {
                         // SAFETY: as above.
                         unsafe { (&*agent).compact_weak_tables(dead, retain) };
@@ -2650,7 +2678,7 @@ impl Agent {
             .array_iter_data
             .try_borrow()
             .is_ok_and(|map| !map.is_empty())
-            || live.iter().any(|&agent| {
+            || live.iter().any(|&(agent, _)| {
                 agent != self_ptr
                     // SAFETY: as above.
                     && unsafe { (&*agent).array_iter_data.try_borrow().is_ok_and(|map| !map.is_empty()) }
@@ -2662,7 +2690,7 @@ impl Agent {
             .promise_addrs
             .try_borrow()
             .is_ok_and(|map| !map.is_empty())
-            || live.iter().any(|&agent| {
+            || live.iter().any(|&(agent, _)| {
                 agent != self_ptr
                     // SAFETY: as above.
                     && unsafe { (&*agent).promise_addrs.try_borrow().is_ok_and(|map| !map.is_empty()) }
@@ -2677,17 +2705,15 @@ impl Agent {
                 .async_generators
                 .try_borrow()
                 .is_ok_and(|map| !map.is_empty())
-            || live.iter().any(|&agent| {
+            || live.iter().any(|&(agent, agent_roots)| {
                 agent != self_ptr
                     // SAFETY: as above.
                     && unsafe {
-                        (&*agent)
-                            .roots
+                        (&*agent_roots)
                             .generators
                             .try_borrow()
                             .is_ok_and(|map| !map.is_empty())
-                            || (&*agent)
-                                .roots
+                            || (&*agent_roots)
                                 .async_generators
                                 .try_borrow()
                                 .is_ok_and(|map| !map.is_empty())
@@ -2698,7 +2724,7 @@ impl Agent {
         }
         if has_iterators {
             self.reap_dead_iterators(&swept_addrs);
-            for &agent in &live {
+            for &(agent, _) in &live {
                 if agent != self_ptr {
                     // SAFETY: as above.
                     unsafe { (&*agent).reap_dead_iterators(&swept_addrs) };
@@ -2707,7 +2733,7 @@ impl Agent {
         }
         if has_promise_addrs {
             self.reap_promise_addrs(&swept_addrs);
-            for &agent in &live {
+            for &(agent, _) in &live {
                 if agent != self_ptr {
                     // SAFETY: as above.
                     unsafe { (&*agent).reap_promise_addrs(&swept_addrs) };
@@ -2716,7 +2742,7 @@ impl Agent {
         }
         if has_generators {
             self.reap_dead_generators(&swept_addrs);
-            for &agent in &live {
+            for &(agent, _) in &live {
                 if agent != self_ptr {
                     // SAFETY: as above.
                     unsafe { (&*agent).reap_dead_generators(&swept_addrs) };
@@ -3426,14 +3452,14 @@ mod tests {
         // run) — otherwise a sibling's collection could sweep its realm.
         let fresh = Agent::new();
         let fresh_ptr = &fresh as *const Agent;
-        assert!(!live_agent_ptrs().contains(&fresh_ptr));
+        assert!(!is_live_agent(fresh_ptr));
         let ptr = {
             let mut agent = Agent::new();
             agent.initialize_host_defined_realm().unwrap();
             let ptr = &agent as *const Agent;
-            assert!(live_agent_ptrs().contains(&ptr));
+            assert!(is_live_agent(ptr));
             ptr
         };
-        assert!(!live_agent_ptrs().contains(&ptr), "drop must unregister");
+        assert!(!is_live_agent(ptr), "drop must unregister");
     }
 }

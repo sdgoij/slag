@@ -191,7 +191,11 @@ fn construct(agent: &mut Agent, new_target: &Value) -> Result<Value, JsError> {
     // global object. The free function does not push an execution context, so
     // the caller's context stays running.
     let inner = crate::realm::initialize_host_defined_realm(agent)?;
-    agent.shadow_realms.insert(instance.id(), inner);
+    agent
+        .roots
+        .shadow_realms
+        .borrow_mut()
+        .insert(instance.id(), inner);
     Ok(Value::Object(instance))
 }
 
@@ -226,10 +230,20 @@ pub fn dispatch_call(
     let ValueKind::Function(function) = callee.kind() else {
         return None;
     };
-    if agent.shadow_wrapped.contains_key(&function.id()) {
+    if agent
+        .roots
+        .shadow_wrapped
+        .borrow()
+        .contains_key(&function.id())
+    {
         return Some(wrapped_function_call(agent, callee, this, args));
     }
-    if agent.shadow_handlers.contains_key(&function.id()) {
+    if agent
+        .roots
+        .shadow_handlers
+        .borrow()
+        .contains_key(&function.id())
+    {
         return Some(dispatch_shadow_handler(agent, callee, args));
     }
     let realm = agent.current_realm().ok()?;
@@ -246,7 +260,9 @@ fn shadow_realm_of(agent: &Agent, this: &Value) -> Result<Handle<Realm>, JsError
     let object =
         crate::context::as_object(this).ok_or_else(|| type_error("not a ShadowRealm object"))?;
     agent
+        .roots
         .shadow_realms
+        .borrow()
         .get(&object.id())
         .cloned()
         .ok_or_else(|| type_error("this is not a ShadowRealm object"))
@@ -326,7 +342,11 @@ fn make_shadow_handler(agent: &mut Agent, handler: ShadowHandler) -> Result<Valu
         None,
         None,
     )?;
-    agent.shadow_handlers.insert(closure.id(), handler);
+    agent
+        .roots
+        .shadow_handlers
+        .borrow_mut()
+        .insert(closure.id(), handler);
     Ok(Value::Function(closure))
 }
 
@@ -342,12 +362,18 @@ fn dispatch_shadow_handler(
         Fulfilled,
         Rejected,
     }
-    let (which, caller_realm) = match agent.shadow_handlers.get(&function.id()) {
-        Some(ShadowHandler::ImportFulfilled { caller_realm, .. }) => {
-            (Which::Fulfilled, *caller_realm)
+    let (which, caller_realm, export_name) = {
+        let handlers = agent.roots.shadow_handlers.borrow();
+        match handlers.get(&function.id()) {
+            Some(ShadowHandler::ImportFulfilled {
+                caller_realm,
+                export_name,
+            }) => (Which::Fulfilled, *caller_realm, Some(export_name.clone())),
+            Some(ShadowHandler::ImportRejected { caller_realm }) => {
+                (Which::Rejected, *caller_realm, None)
+            }
+            None => return Err(type_error("shadow handler state")),
         }
-        Some(ShadowHandler::ImportRejected { caller_realm }) => (Which::Rejected, *caller_realm),
-        None => return Err(type_error("shadow handler state")),
     };
     match which {
         Which::Rejected => Err(crate::function::realm_throwable(
@@ -356,12 +382,7 @@ fn dispatch_shadow_handler(
             caller_realm,
         )?),
         Which::Fulfilled => {
-            let ShadowHandler::ImportFulfilled { export_name, .. } =
-                agent.shadow_handlers.get(&function.id()).expect("checked")
-            else {
-                unreachable!()
-            };
-            let export_name = export_name.clone();
+            let export_name = export_name.expect("checked");
             let namespace = args.first().cloned().unwrap_or(Value::Undefined);
             let has_own = crate::context::as_object(&namespace)
                 .map(|object| {
@@ -456,7 +477,7 @@ fn wrapped_function_create(
             configurable: Some(true),
         },
     )?;
-    agent.shadow_wrapped.insert(
+    agent.roots.shadow_wrapped.borrow_mut().insert(
         function.id(),
         ShadowWrapped {
             target: *target,
@@ -510,8 +531,8 @@ fn wrapped_function_call(
         return Err(type_error("wrapped callee is not a function"));
     };
     let (target, caller_realm) = {
-        let entry = agent
-            .shadow_wrapped
+        let wrapped = agent.roots.shadow_wrapped.borrow();
+        let entry = wrapped
             .get(&function.id())
             .ok_or_else(|| type_error("wrapped function state"))?;
         (entry.target, entry.caller_realm)

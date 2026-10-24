@@ -75,7 +75,7 @@ pub fn get_function_realm(agent: &mut Agent, value: &Value) -> Result<Handle<Rea
                 // A wrapped function exotic object's [[Realm]] is the realm it
                 // was created for (spec 10.2.6 GetFunctionRealm step 3); a
                 // realm builtin's is the realm whose intrinsic table holds it.
-                if let Some(wrapped) = agent.shadow_wrapped.get(&function.id()) {
+                if let Some(wrapped) = agent.roots.shadow_wrapped.borrow().get(&function.id()) {
                     return Ok(wrapped.caller_realm);
                 }
                 crate::function::owning_realm(agent, &function).ok_or_else(|| {

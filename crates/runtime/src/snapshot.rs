@@ -2618,7 +2618,7 @@ fn external_index(externals: &[usize], pointer: usize) -> Result<u32, Unsupporte
 /// Whether a realm other than the walking one knows this value as one of its
 /// intrinsics.
 fn named_by_another_realm(agent: &Agent, realm: &Handle<Realm>, value: &Value) -> bool {
-    agent.realms.borrow().iter().any(|other| {
+    agent.roots.realms.borrow().iter().any(|other| {
         !Handle::ptr_eq(*other, *realm) && other.intrinsics.name_of_value(value).is_some()
     })
 }

@@ -677,7 +677,7 @@ pub fn initialize_host_defined_realm_with_global(
     // what keeps the realm alive through `set_default_global_bindings` under an
     // allocation-collecting build, instead of a Rust local surviving the
     // conservative scan.
-    agent.realms.borrow_mut().push(realm);
+    agent.roots.realms.borrow_mut().push(realm);
     agent.realm_count.set(agent.realm_count.get() + 1);
     realm.intrinsics.set_owner(realm);
     set_default_global_bindings(&realm)?;
