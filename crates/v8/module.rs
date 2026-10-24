@@ -1045,6 +1045,9 @@ mod tests {
             assert!(keys.contains(&module));
 
             let isolate = scope.get_isolate_ptr();
+            // A `Global` hashes by the record it names; the pin's held list is
+            // not part of its identity.
+            #[allow(clippy::mutable_key_type)]
             let mut persistent = std::collections::HashSet::new();
             persistent.insert(Global::new(&isolate, module));
             persistent.insert(Global::new(&isolate, same));

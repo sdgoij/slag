@@ -913,7 +913,7 @@ pub struct HeapState {
     verify_barrier: Cell<bool>,
     verify_minor: Cell<bool>,
     collection_gen: Cell<u32>,
-    pinned: RefCell<Vec<GcAny>>,
+    pinned: std::rc::Rc<RefCell<Vec<GcAny>>>,
     root_sources: RefCell<Vec<&'static dyn RootSource>>,
     weak_handles: RefCell<Vec<WeakEntry>>,
     pending_weak_callbacks: RefCell<Vec<Box<dyn FnOnce()>>>,
@@ -926,7 +926,7 @@ pub struct HeapState {
 
 impl HeapState {
     /// A fresh collector state: an empty arena, every table at its default.
-    pub const fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             heap: RefCell::new(Heap::new()),
             alloc_since_collect: Cell::new(0),
@@ -944,7 +944,7 @@ impl HeapState {
             verify_barrier: Cell::new(cfg!(debug_assertions)),
             verify_minor: Cell::new(false),
             collection_gen: Cell::new(1),
-            pinned: RefCell::new(Vec::new()),
+            pinned: std::rc::Rc::new(RefCell::new(Vec::new())),
             root_sources: RefCell::new(Vec::new()),
             weak_handles: RefCell::new(Vec::new()),
             pending_weak_callbacks: RefCell::new(Vec::new()),
@@ -965,26 +965,51 @@ impl HeapState {
 #[inline]
 pub fn with_heap_cell<T: 'static, R>(init: impl FnOnce() -> T, body: impl FnOnce(&T) -> R) -> R {
     with_state(|state| {
-        let cell: *const T = {
-            let mut side = state.side.borrow_mut();
-            let id = std::any::TypeId::of::<T>();
-            let index = match side.iter().position(|(cached, _)| *cached == id) {
-                Some(index) => index,
-                None => {
-                    side.push((id, Box::new(init())));
-                    side.len() - 1
-                }
-            };
-            side[index]
-                .1
-                .downcast_ref::<T>()
-                .expect("a heap cell keeps the type it was created with") as *const T
-        };
+        let cell = heap_cell(state, init);
         // SAFETY: the box lives in the state's side table, which outlives this
         // call, and its entries are never removed; a `Box` keeps its pointee's
         // address when the table reallocates.
         body(unsafe { &*cell })
     })
+}
+
+/// [`with_heap_cell`] against **this thread's own** state, whatever isolate is
+/// entered — the address a drop path uses to release something it registered
+/// outside any isolate. `None` once the thread has destroyed that state.
+pub fn with_own_heap_cell<T: 'static, R>(
+    init: impl FnOnce() -> T,
+    body: impl FnOnce(&T) -> R,
+) -> Option<R> {
+    OWN.try_with(|own| {
+        let cell = heap_cell(&own.borrow(), init);
+        // SAFETY: as in `with_heap_cell`.
+        body(unsafe { &*cell })
+    })
+    .ok()
+}
+
+/// The address of `state`'s cell for `T`, creating it on first use.
+fn heap_cell<T: 'static>(state: &HeapState, init: impl FnOnce() -> T) -> *const T {
+    let mut side = state.side.borrow_mut();
+    let id = std::any::TypeId::of::<T>();
+    let index = match side.iter().position(|(cached, _)| *cached == id) {
+        Some(index) => index,
+        None => {
+            side.push((id, Box::new(init())));
+            side.len() - 1
+        }
+    };
+    side[index]
+        .1
+        .downcast_ref::<T>()
+        .expect("a heap cell keeps the type it was created with") as *const T
+}
+
+/// Whether an isolate's heap is entered on this thread, rather than this
+/// thread's own state.
+#[inline]
+pub fn isolate_entered() -> bool {
+    !CURRENT.with(|slot| slot.get()).is_null()
 }
 
 impl Default for HeapState {
@@ -1004,7 +1029,7 @@ thread_local! {
     static PREVIOUS: RefCell<Vec<*const HeapState>> = const { RefCell::new(Vec::new()) };
     /// The state for a thread with no isolate entered: the C surfaces and this
     /// crate's own tests.
-    static OWN: RefCell<HeapState> = const { RefCell::new(HeapState::new()) };
+    static OWN: RefCell<HeapState> = RefCell::new(HeapState::new());
 }
 
 /// Install `state` as this thread's collector state, remembering what was
@@ -1039,20 +1064,6 @@ pub fn leave() {
 /// Takes no borrow of the state itself, so a body that re-enters the collector
 /// — a trace callback, a finalizer, a nested scope — is fine: the borrow rules
 /// are the individual `RefCell` fields'.
-/// [`with_state`] for a drop path, where the thread may already have
-/// destroyed its own state: `None` then, rather than the panic a TLS access
-/// after destruction raises.
-#[inline]
-fn try_with_state<R>(body: impl FnOnce(&HeapState) -> R) -> Option<R> {
-    let current = CURRENT.with(|slot| slot.get());
-    if current.is_null() {
-        OWN.try_with(|own| body(&own.borrow())).ok()
-    } else {
-        // SAFETY: as in `with_state`.
-        Some(body(unsafe { &*current }))
-    }
-}
-
 #[inline]
 fn with_state<R>(body: impl FnOnce(&HeapState) -> R) -> R {
     let current = CURRENT.with(|slot| slot.get());
@@ -1652,10 +1663,10 @@ pub fn with_heap_mut<R>(f: impl FnOnce(&mut Heap) -> R) -> R {
 }
 
 per_heap!(
-    /// The boxes a host pinned, for the heap entered when the pin was taken.
-    /// A pin is released through the heap entered when it drops, so a handle
-    /// that outlives its isolate's entry belongs to the pin-ownership slice.
-    PINNED = Pinned => pinned: RefCell<Vec<GcAny>>;
+    /// The boxes a host pinned in this heap, shared with the pins that hold
+    /// them (a [`Pin`] keeps the list itself alive, so releasing a pin whose
+    /// heap is already gone touches nothing freed).
+    PINNED = Pinned => pinned: std::rc::Rc<RefCell<Vec<GcAny>>>;
 );
 
 /// A pin: the value it names is a root of every collection until it is dropped.
@@ -1668,6 +1679,15 @@ per_heap!(
 /// whatever took the slot.
 pub struct Pin {
     any: Option<GcAny>,
+    /// The pinned list this pin joined, held strongly.
+    ///
+    /// The pin is released through the list it was pushed into, not through
+    /// whichever heap is entered when it drops: a host's persistent handle
+    /// outlives the entry it was taken under, and releasing through a different
+    /// heap would leave the box rooted while its own heap never hears about the
+    /// drop. Holding the list (rather than the heap that owns it) also means a
+    /// pin that outlives its isolate touches nothing freed.
+    pinned: std::rc::Rc<RefCell<Vec<GcAny>>>,
 }
 
 impl std::fmt::Debug for Pin {
@@ -1684,13 +1704,10 @@ impl Drop for Pin {
         let Some(any) = self.any else {
             return;
         };
-        // A pin dropped during teardown has no heap left to unroot from.
-        let _ = try_with_state(|state| {
-            let mut pinned = state.pinned.borrow_mut();
-            if let Some(index) = pinned.iter().position(|held| held.addr() == any.addr()) {
-                pinned.remove(index);
-            }
-        });
+        let mut pinned = self.pinned.borrow_mut();
+        if let Some(index) = pinned.iter().position(|held| held.addr() == any.addr()) {
+            pinned.remove(index);
+        }
     }
 }
 
@@ -1702,10 +1719,11 @@ impl Drop for Pin {
 pub fn pin(value: crate::value::Value) -> Pin {
     let any = crate::value::Value::encoded_box_address(value.bits())
         .map(|addr| GcAny(addr as *mut GcHeader));
+    let pinned = with_state(|state| std::rc::Rc::clone(&state.pinned));
     if let Some(any) = any {
-        PINNED.with(|pinned| pinned.borrow_mut().push(any));
+        pinned.borrow_mut().push(any);
     }
-    Pin { any }
+    Pin { any, pinned }
 }
 
 /// Keep the box `handle` names, and everything it reaches, alive until the
@@ -1713,8 +1731,12 @@ pub fn pin(value: crate::value::Value) -> Pin {
 /// that no language value names (a module record).
 pub fn pin_handle<T: Trace>(handle: crate::handle::Handle<T>) -> Pin {
     let any = handle.as_any();
-    PINNED.with(|pinned| pinned.borrow_mut().push(any));
-    Pin { any: Some(any) }
+    let pinned = with_state(|state| std::rc::Rc::clone(&state.pinned));
+    pinned.borrow_mut().push(any);
+    Pin {
+        any: Some(any),
+        pinned,
+    }
 }
 
 /// A source of precise roots the collector consults at every collection.
@@ -3777,6 +3799,37 @@ mod tests {
             "a fresh heap starts its own budget"
         );
         leave();
+        leave();
+    }
+
+    /// A pin is released through the heap it was taken in, not through the one
+    /// entered when it drops: a host's handle can outlive that entry, and the
+    /// box would stay rooted in its own heap forever.
+    #[test]
+    fn a_pin_is_released_through_its_own_heap() {
+        use crate::handle::Handle;
+        use crate::string::JsString;
+        use crate::value::Value;
+
+        let first = HeapState::new();
+        let second = HeapState::new();
+
+        enter(&first);
+        let value = Value::String(Handle::new(JsString::from_utf8("pinned in the first")));
+        let held = pin(value);
+        leave();
+
+        enter(&second);
+        drop(held);
+        leave();
+
+        enter(&first);
+        let swept = with_heap_mut(|heap| heap.collect(&[]));
+        assert_eq!(
+            swept,
+            vec![string_box_addr(value)],
+            "the released pin no longer roots its value"
+        );
         leave();
     }
 

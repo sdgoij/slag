@@ -295,9 +295,17 @@ impl Trace for ConcatSpreadVerdict {
 // lives there, so the collector never forms a `&Agent` — the tag an
 // interpreter frame's `&mut Agent` carries is never invalidated by a
 // collection, which is what M-1 was about.
-thread_local! {
-    static LIVE_AGENTS: std::cell::RefCell<Vec<(u64, *const AgentRoots)>> =
-        const { std::cell::RefCell::new(Vec::new()) };
+/// The live agents registered for the entered heap, as `(signifier, roots)`.
+///
+/// The registry belongs to the heap, not the thread: a collection roots the
+/// agents of the heap it collects, so an isolate that moves threads takes its
+/// agents' roots with it and leaves no stale entry behind on the old one. A
+/// heap shared by several agents — this thread's own, which a bare `Agent`
+/// uses — still roots all of them, which is the whole point: an agent's state
+/// is reachable only from its own Rust-heap tables, and the conservative stack
+/// scan cannot see those.
+fn with_live_agents<R>(body: impl FnOnce(&RefCell<Vec<(u64, *const AgentRoots)>>) -> R) -> R {
+    crux::heap::with_heap_cell(|| RefCell::new(Vec::new()), body)
 }
 
 /// The `with_agent` enter notifier (installed by [`crate::function::ensure_ecma_hook`]):
@@ -307,18 +315,31 @@ pub(crate) fn live_agent_entered(agent: *mut ()) {
     // SAFETY: the notifier runs while `with_agent` has just recorded `agent`
     // as current, so it is a live `Agent` for the whole window.
     let (signifier, roots) = unsafe { ((*agent).signifier, Rc::as_ptr(&(*agent).roots)) };
-    LIVE_AGENTS.with(|live| {
-        let mut live = live.borrow_mut();
-        // An agent that moved since its last run re-registers its new
-        // address; the stale entry (same signifier, old address) goes.
+    let entered = crux::heap::isolate_entered();
+    let registry = with_live_agents(|cell| {
+        let mut live = cell.borrow_mut();
+        // An agent entered again re-registers; the entry left behind names the
+        // address it had before, which is not where it runs now.
         live.retain(|&(id, _)| id != signifier);
         live.push((signifier, roots));
+        cell as *const _
     });
+    // An isolate's heap owns the registry and outlives the agent
+    // (`IsolateInner` drops its engine before its heap), so `Drop` can release
+    // through this pointer with no heap entered. This thread's own registry
+    // dies with the thread, so that case is resolved at drop time instead.
+    // SAFETY: the agent is live for the window, and the field is a `Cell`.
+    unsafe {
+        let roots = &(*agent).roots;
+        roots
+            .live_registry
+            .set(if entered { registry } else { std::ptr::null() })
+    };
 }
 
-/// The registered live agents' root containers (see [`LIVE_AGENTS`]).
+/// The registered live agents' root containers (see [`with_live_agents`]).
 pub(crate) fn live_agent_roots() -> Vec<*const AgentRoots> {
-    LIVE_AGENTS.with(|live| live.borrow().iter().map(|&(_, roots)| roots).collect())
+    with_live_agents(|live| live.borrow().iter().map(|&(_, roots)| roots).collect())
 }
 
 /// Whether `agent`'s roots are registered as a live agent's (tests).
@@ -327,7 +348,7 @@ pub(crate) fn is_live_agent(agent: *const Agent) -> bool {
     // SAFETY: the caller passes a live agent (the embed tests check a pointer
     // they still own).
     let roots = unsafe { Rc::as_ptr(&(*agent).roots) };
-    LIVE_AGENTS.with(|live| {
+    with_live_agents(|live| {
         live.borrow()
             .iter()
             .any(|&(_, registered)| registered == roots)
@@ -335,12 +356,24 @@ pub(crate) fn is_live_agent(agent: *const Agent) -> bool {
 }
 
 /// Unregister a dropped agent (by its unique, never-reused signifier).
-fn unregister_live_agent(signifier: u64) {
-    // An agent dropped during thread teardown reaches this after the registry
-    // has been destroyed, and panicking in a drop would abort the process.
-    let _ = LIVE_AGENTS.try_with(|live| {
-        live.borrow_mut().retain(|&(id, _)| id != signifier);
-    });
+fn unregister_live_agent(roots: &Rc<AgentRoots>, signifier: u64) {
+    let registry = roots.live_registry.get();
+    if !registry.is_null() {
+        // SAFETY: the isolate's heap owns the registry and outlives the agent.
+        let live = unsafe { &*registry };
+        if let Ok(mut live) = live.try_borrow_mut() {
+            live.retain(|&(id, _)| id != signifier);
+        }
+    }
+    // An agent that ran once with no isolate entered registered in this
+    // thread's own registry first, and that entry is a raw pointer: it must not
+    // outlive the agent even though the isolate's registry is the recorded one.
+    // The registry is gone only when the thread is, and a drop during teardown
+    // must not panic.
+    let _ = crux::heap::with_own_heap_cell::<RefCell<Vec<(u64, *const AgentRoots)>>, _>(
+        || RefCell::new(Vec::new()),
+        |live| live.borrow_mut().retain(|&(id, _)| id != signifier),
+    );
 }
 
 /// The host's near-heap-limit callback
@@ -454,6 +487,10 @@ impl Trace for ContextStack {
 /// the generator tables. The rest of `Agent::trace_roots`'s fields follow in
 /// later slices.
 pub(crate) struct AgentRoots {
+    /// The registry this agent registered in, for `Drop` to release the entry
+    /// when no heap is entered. Null when it registered in this thread's own
+    /// registry (see [`live_agent_entered`]).
+    live_registry: std::cell::Cell<*const RefCell<Vec<(u64, *const AgentRoots)>>>,
     /// The execution-context stack (spec 9.4); see [`ContextStack`].
     pub(crate) execution_context_stack: ContextStack,
     pub(crate) promise_jobs: RefCell<VecDeque<Job>>,
@@ -1224,6 +1261,7 @@ impl AgentRoots {
 
     fn new() -> AgentRoots {
         AgentRoots {
+            live_registry: std::cell::Cell::new(std::ptr::null()),
             execution_context_stack: ContextStack::new(),
             promise_jobs: RefCell::new(VecDeque::new()),
             generic_jobs: RefCell::new(VecDeque::new()),
@@ -2094,7 +2132,7 @@ impl Drop for Agent {
             // dropped, so this runs exactly once with a live pointer.
             unsafe { (hook.drop_cache)(hook.cache) };
         }
-        unregister_live_agent(self.signifier);
+        unregister_live_agent(&self.roots, self.signifier);
     }
 }
 
