@@ -26,7 +26,9 @@ What that took, in the note's own numbering:
 
 Two gaps the error list did not show, both bridge rather than celld bugs: `BackingStore` did not deref to `[Cell<u8>]` (how the crate we stand in for exposes shared bytes), and `AccessorNameGetterCallback` was not scope-first like every other host callback here.
 
-Still thread-bound: `Weak`/`TracedReference`, and the isolate's current realm — a `Locker` installs the heap and the arena only, so a host enters a context itself, which celld does. `cargo check` is the probe's ceiling on Windows: celld's native dependencies keep it from building here.
+Still thread-bound: `Weak`/`TracedReference`, and the isolate's current realm — a `Locker` installs the heap and the arena only, so a host enters a context itself, which celld does.
+
+`tools/build-celld.py` is the gate now. It clones `https://github.com/denoland/celld.git` on first use and pins v0.6.3 (`8702f6d186c77698dbfb30cf29e3b1922a88f008`), refusing a short ref for the same reason `build-deno.py` does. It hands cargo a temporary `[patch.crates-io]` through `--config` (celld's sources are never edited), checks that celld's `v8` requirement admits the bridge's version instead of rewriting it, reconciles the lock when its `v8` entry is still a registry one, and runs `cargo check -p celld` — `--build` asks for the binary. On Windows it dispatches into WSL, because the checkout's native dependencies do not build there; `--native` opts out.
 
 ## What celld needs, measured
 

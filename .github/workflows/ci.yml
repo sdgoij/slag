@@ -1,10 +1,10 @@
 name: CI
 
 # The gates run in dependency order. Format + lints is the root: the workspace
-# tests, the two conformance sweeps, and the Deno embedding builds all wait on
-# it. The release packages and the browser-demo build wait on the three test
+# tests, the two conformance sweeps, and the two host builds (Deno and celld)
+# all wait on it. The release packages and the browser-demo build wait on the three test
 # gates, the demo deploys to GitHub Pages only from `main`, and a `v*` tag
-# publishes the archives once the packages and the Deno builds are done.
+# publishes the archives once the packages and the two host builds are done.
 on:
   push:
     branches: [main]
@@ -390,8 +390,8 @@ jobs:
         uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5
 
   # Deno built with Slag as its engine on every platform the release ships, then
-  # the two tracked embedding harnesses run against each — the only job that
-  # builds a host on top of the engine, and the only consumer of `crates/v8`.
+  # the two tracked embedding harnesses run against each — one of the two jobs
+  # that build a host on top of the engine, and a consumer of `crates/v8`.
   # `tools/build-deno.py` clones the pinned commit, redirects the crates.io `v8`
   # the `deno_v8` facade pulls to `crates/v8`, and builds `-p deno`; the archives
   # it produces are attached to the release by `release` below.
@@ -499,6 +499,124 @@ jobs:
         with:
           name: deno-${{ matrix.name }}
           path: deno-*.${{ matrix.ext }}
+          if-no-files-found: error
+
+  # The bridge's second host: celld built against `crates/v8`, then its two
+  # tracked examples served locally. Its archive is attached to the release the
+  # same way Deno's is, and carries celld's own `--version` — the host ships in
+  # its own right, not as a Slag artifact. The job answers the question this
+  # bridge has to keep answering: does a host that is not `deno_core` still
+  # build on it, and still run JavaScript on it?
+  #
+  # The two Linux architectures are celld's own release targets (its workflow
+  # builds `x86_64-unknown-linux-gnu` and `aarch64-unknown-linux-gnu`), so both
+  # are built natively here. Windows is absent on purpose: celld's native
+  # dependencies (the SQLite build, the TLS stack the tunnel needs) do not build
+  # there, and `tools/build-celld.py` falls back to WSL — which a CI runner has
+  # not. The script clones the pinned release, redirects the crates.io `v8` to
+  # this tree, and builds `-p celld`; `esbuild` is needed by `celld dev` to
+  # bundle the example, not by the build itself.
+  #
+  # The release profile is the one that ships: fat LTO, `codegen-units = 1`, and
+  # stripped, so the build is the slow part of this job. The examples serve the
+  # binary that is packaged rather than a debug build, so the smoke test covers
+  # the artifact.
+  celld:
+    name: celld (${{ matrix.name }})
+    needs: lint
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x86_64
+            os: ubuntu-latest
+            ext: tar.gz
+          - name: linux-aarch64
+            os: ubuntu-24.04-arm
+            ext: tar.gz
+    env:
+      CARGO_INCREMENTAL: "0"
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          submodules: recursive
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /opt/hostedtoolcache/CodeQL
+          sudo apt-get clean
+          df -h /
+      - name: Install the build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends cmake clang libclang-dev
+          sudo npm install -g esbuild
+      # `rustup show` installs the repo's pinned toolchain, which celld inherits
+      # (its checkout sits inside this one and pins none of its own).
+      - name: Install the pinned toolchain
+        run: rustup show
+      - name: Build celld against the bridge
+        run: python3 tools/build-celld.py --build --release
+      # A Worker: the engine evaluates the module and answers a request.
+      - name: Serve the Worker example
+        run: |
+          ./celld/target/release/celld dev celld/examples/hello --port 9876 --no-watch --clean &
+          echo $! > /tmp/celld-hello.pid
+          for _ in $(seq 1 120); do
+            if curl -fsS --max-time 2 http://127.0.0.1:9876/ > /tmp/hello.out 2>/dev/null; then break; fi
+            sleep 1
+          done
+          cat /tmp/hello.out
+          grep -qx 'Hello from cells! url=http://127.0.0.1:9876/' /tmp/hello.out
+          kill "$(cat /tmp/celld-hello.pid)"
+      # A Durable Object over its own SQLite: two names, one counter each, and
+      # the count has to survive between turns of the same cell.
+      - name: Serve the Durable Object example
+        run: |
+          ./celld/target/release/celld dev celld/examples/counter --port 9877 --no-watch --clean &
+          echo $! > /tmp/celld-counter.pid
+          python3 - <<'PY'
+          import json, time, urllib.request
+
+          def count(name):
+              with urllib.request.urlopen(
+                  f"http://127.0.0.1:9877/?name={name}", timeout=60
+              ) as response:
+                  return json.load(response)["n"]
+
+          deadline = time.time() + 120
+          while True:
+              try:
+                  first = count("alice")
+                  break
+              except Exception:
+                  if time.time() > deadline:
+                      raise
+                  time.sleep(1)
+
+          assert first == 1, first
+          assert count("alice") == 2
+          assert count("bob") == 1
+          print("counter: alice 1,2 and bob 1")
+          PY
+          kill "$(cat /tmp/celld-counter.pid)"
+      # The archive carries the celld build's own `--version`, the same rule the
+      # Deno package follows. celld is Apache-2.0, so its LICENSE and NOTICE are
+      # redistributed with it.
+      - name: Package the celld release
+        run: |
+          version=$(./celld/target/release/celld --version | head -1 | awk '{print $2}')
+          test -n "$version"
+          mkdir -p dist/celld
+          cp ./celld/target/release/celld celld/LICENSE celld/NOTICE dist/celld/
+          tar -czf "celld-${version}-${{ matrix.name }}.tar.gz" -C dist/celld .
+      - name: Upload the celld package
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: celld-${{ matrix.name }}
+          path: celld-*.${{ matrix.ext }}
           if-no-files-found: error
 
   # Each release is the single `slag` binary plus the readme and licence: the
@@ -643,7 +761,7 @@ jobs:
   # just build and keep the artifacts.
   release:
     name: Publish release
-    needs: [build, deno]
+    needs: [build, deno, celld]
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     timeout-minutes: 20

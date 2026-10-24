@@ -2,4 +2,5 @@ target/
 scratch/
 /v8/
 /deno/
+/celld/
 /docs/slag.wasm
