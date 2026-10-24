@@ -612,6 +612,49 @@ host surface and makes the remaining paths internal), then C in slices starting
 with the coldest containers, with `--gc-stress` and the call benchmarks as the
 gate. M-1 should not be marked fixed until C lands.
 
+### Slice 1 landed: `AgentRoots` (the job, promise and generator tables)
+
+Chosen route is D, built in slices: `AgentRoots` is a separately allocated
+struct, owned through `Rc`, holding every container the collector traverses.
+Because it is a distinct allocation, a live `&mut Agent` says nothing about
+its memory, and because every field is `RefCell`, the interpreter and the
+collector both reach it through `&AgentRoots`. `collect_with` still receives
+`&Agent` from the live-agent registry, so this slice is structural rather than
+a complete fix; the registry switch to `*const AgentRoots` is slice 2, and
+`trace_roots` keeps its remaining fields until slices 2-4 move them.
+
+Moved in this slice: `promise_jobs`, `generic_jobs`, `timeout_jobs`,
+`microtask_queues`, `kept_alive`, `promises`, `promise_resolvers`,
+`promise_compound`, `promise_finally`, `async_resume`, `generators`,
+`async_generators`.
+
+Two shape changes were needed rather than a pure move:
+
+- `promises` values became `Rc<RefCell<PromiseData>>`. A reader that held the
+  map's `Ref` across a promise hook, a job enqueue or an allocation would either
+  abort every collection (the `RefCell` trace path) or panic when the hook
+  inserted a promise into the same map. Cloning the `Rc` out of a short-lived
+  borrow removes both hazards; `Agent::promise_data` is the one place that does
+  it.
+- Reads of a table write `let rec = agent.promise_data(id);` or
+  `.borrow().get(..).cloned()` rather than `if let Some(x) = map.get(..)`, which
+  would extend the guard over the body. `if let` / `match` on a borrowed
+  `VecDeque` in the drain loop was likewise split into a binding followed by the
+  test.
+
+Measured on release builds, old binary vs new, interleaved on the same machine
+(median of 3-7 runs): a 50 000-link settled-promise chain is 20.5 s -> 21.2 s
+(~3%, the extra `Rc` allocation and the pointer chase in the traced table);
+50 000 four-step generator drains are 271 ms -> 276 ms (within noise). The
+promise path is dominated by something unrelated to this table (a settled chain
+costs ~400 us per link), so the delta is the table's own cost, not a general
+slowdown.
+
+Gate run: `cargo test -p runtime --release --lib` (1068 pass), clippy clean,
+`built-ins --filter "*Promise*"` 732/732 and `*Generator*` 157/157 pass, plus
+`--gc-stress --gc-verify` samples over `Promise/reject`, `GeneratorPrototype/
+return`, `expressions/await` and an async/generator/combinator script.
+
 ---
 
 ## What was checked and found sound
@@ -674,3 +717,10 @@ gate. M-1 should not be marked fixed until C lands.
   stack overflow aborts the host, and `catch_unwind` cannot recover it.
 - Any TLS state pushed around a fallible call must be popped by a `Drop` guard;
   panic containment exists (`ffi::guard`, sweep), so stale entries outlive the call.
+- A container `trace_roots` reads belongs in `AgentRoots`, behind `RefCell`, and is
+  reached through `&self`; adding a traced table as a plain `Agent` field
+  reintroduces the M-1 aliasing that slice 1 removed.
+- When a table's own `RefCell` guard would be held across a host hook, an
+  allocation or a call that may mutate the table, clone the `Rc`-boxed record out
+  of a short borrow instead of binding the guard (`if let Some(x) = cell.borrow()
+  .get(k)` extends it over the body).

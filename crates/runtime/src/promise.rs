@@ -216,7 +216,7 @@ pub fn is_promise(agent: &Agent, value: &Value) -> bool {
     let ValueKind::Object(obj) = value.kind() else {
         return false;
     };
-    agent.promises.contains_key(&obj.id())
+    agent.roots.promises.borrow().contains_key(&obj.id())
 }
 
 /// NewPromiseCapability (spec 27.2.1.5): construct `constructor` with an
@@ -309,7 +309,7 @@ pub fn create_resolving_functions(agent: &mut Agent, promise: &Value) -> (Value,
     // `name` property is the empty string. The two share one [[AlreadyResolved]]
     // flag, so resolve-then-throw or reject-then-resolve is a no-op.
     let already_resolved = std::rc::Rc::new(std::cell::Cell::new(false));
-    let mut make = |is_reject: bool, name: &str| -> Value {
+    let make = |is_reject: bool, name: &str| -> Value {
         let resolver = Function::create_builtin(
             Some(JsString::from_utf8(name)),
             1,
@@ -326,7 +326,7 @@ pub fn create_resolving_functions(agent: &mut Agent, promise: &Value) -> (Value,
         if let Some(promise) = crate::agent::value_box_addr(promise) {
             resolver.set_resolving_promise(promise);
         }
-        agent.promise_resolvers.insert(
+        agent.roots.promise_resolvers.borrow_mut().insert(
             resolver.id(),
             Rc::new(RefCell::new(ResolverData {
                 promise: *promise,
@@ -392,7 +392,7 @@ pub fn reject_promise(agent: &mut Agent, promise: &Value, reason: Value) -> Resu
             "reject called on a non-object promise".into(),
         ));
     };
-    let Some(data) = agent.promises.get(&obj.id()) else {
+    let Some(data) = agent.promise_data(obj.id()) else {
         return Err(JsError::new(
             ErrorKind::TypeError,
             "reject called on a non-promise object".into(),
@@ -428,7 +428,7 @@ pub fn fulfill_promise(agent: &mut Agent, promise: &Value, value: Value) -> Resu
             "fulfill called on a non-object promise".into(),
         ));
     };
-    let Some(data) = agent.promises.get(&obj.id()) else {
+    let Some(data) = agent.promise_data(obj.id()) else {
         return Err(JsError::new(
             ErrorKind::TypeError,
             "fulfill called on a non-promise object".into(),
@@ -487,8 +487,7 @@ pub fn perform_promise_then(
     // jobs are enqueued (they need `&mut agent`).
     let outcome = {
         let data = agent
-            .promises
-            .get(&id)
+            .promise_data(id)
             .ok_or_else(|| JsError::new(ErrorKind::TypeError, "promise is not a promise".into()))?;
         let mut data = data.borrow_mut();
         match &mut data.state {
@@ -512,14 +511,27 @@ pub fn perform_promise_then(
         enqueue_reaction_job(agent, promise_again, reaction, value);
     }
     // Step 7: mark the promise handled once a reaction is attached.
-    let was_handled = agent.promises[&id].borrow().is_handled;
+    let (was_handled, rejected_with) = match agent.promise_data(id) {
+        Some(data) => {
+            let data = data.borrow();
+            let rejected = match &data.state {
+                PromiseState::Rejected(value) => Some(*value),
+                _ => None,
+            };
+            (data.is_handled, rejected)
+        }
+        None => (true, None),
+    };
     if !was_handled {
-        agent.promises[&id].borrow_mut().is_handled = true;
-        let reason = match &agent.promises[&id].borrow().state {
-            PromiseState::Rejected(value) => Some(*value),
-            _ => None,
-        };
-        crate::host::promise_rejection_tracker(agent, &promise_again, reason.as_ref(), true)?;
+        if let Some(data) = agent.promise_data(id) {
+            data.borrow_mut().is_handled = true;
+        }
+        crate::host::promise_rejection_tracker(
+            agent,
+            &promise_again,
+            rejected_with.as_ref(),
+            true,
+        )?;
     }
     // The result promise, per the spec's step 9.
     Ok(result_promise.unwrap_or(Value::Undefined))
@@ -600,7 +612,12 @@ fn enqueue_reaction_job(
 fn reaction_task_promise(agent: &Agent, reaction: &PromiseReaction) -> Option<Value> {
     if let Some(callback) = &reaction.handler
         && let ValueKind::Function(function) = callback.callback.kind()
-        && let Some(resume) = agent.async_resume.get(&function.id())
+        && let Some(resume) = agent
+            .roots
+            .async_resume
+            .borrow()
+            .get(&function.id())
+            .cloned()
     {
         return Some(resume.state.borrow().promise);
     }

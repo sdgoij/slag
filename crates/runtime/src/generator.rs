@@ -401,7 +401,7 @@ pub fn call_generator(
     };
     let object = JsObject::ordinary_object_create(Some(proto));
     let object_value = Value::Object(object);
-    agent.generators.borrow_mut().insert(
+    agent.roots.generators.borrow_mut().insert(
         object.id(),
         Rc::new(RefCell::new(GeneratorState {
             flag: GeneratorFlag::SuspendedStart,
@@ -446,6 +446,7 @@ fn generator_resume(agent: &mut Agent, this: &Value, completion: Resume) -> Resu
         ));
     };
     let state = agent
+        .roots
         .generators
         .borrow()
         .get(&obj.id())
@@ -515,6 +516,7 @@ fn generator_resume_abrupt(
         ));
     };
     let state = agent
+        .roots
         .generators
         .borrow()
         .get(&obj.id())

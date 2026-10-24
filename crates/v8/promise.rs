@@ -73,7 +73,7 @@ impl<'s> LocalHandle<'s, Promise> {
             let Some(id) = self.engine().value().as_object().map(|object| object.id()) else {
                 return;
             };
-            if let Some(data) = agent.promises.get(&id) {
+            if let Some(data) = agent.promise_data(id) {
                 data.borrow_mut().is_handled = true;
             }
         });
@@ -328,7 +328,7 @@ impl<'s> LocalHandle<'s, PromiseResolver> {
     /// so a handle that names anything else answers `None`.
     fn resolver_data<T>(&self, read: impl FnOnce(&RefCell<ResolverData>) -> T) -> Option<T> {
         let id = self.engine().value().as_function()?.id();
-        crate::realm::with_agent(|agent| agent.promise_resolvers.get(&id).map(|data| read(data)))
+        crate::realm::with_agent(|agent| agent.promise_resolver_data(id).map(|data| read(&data)))
             .flatten()
     }
 }

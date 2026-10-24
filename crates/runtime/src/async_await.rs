@@ -369,7 +369,9 @@ fn make_resume_handler(
         None,
     )?;
     agent
+        .roots
         .async_resume
+        .borrow_mut()
         .insert(closure.id(), Rc::new(ResumeHandler { state, is_reject }));
     Ok(Value::Function(closure))
 }
@@ -383,7 +385,12 @@ pub fn dispatch_resume(
     let ValueKind::Function(function) = callee.kind() else {
         return None;
     };
-    let entry = agent.async_resume.get(&function.id()).cloned()?;
+    let entry = agent
+        .roots
+        .async_resume
+        .borrow()
+        .get(&function.id())
+        .cloned()?;
     Some(resume_async(agent, entry, args))
 }
 
@@ -858,7 +865,7 @@ mod tests {
         let ValueKind::Object(obj) = value.kind() else {
             return Ok(value);
         };
-        let Some(data) = agent.promises.get(&obj.id()) else {
+        let Some(data) = agent.promise_data(obj.id()) else {
             return Ok(value);
         };
         match &data.borrow().state {
@@ -995,7 +1002,7 @@ mod tests {
         let ValueKind::Object(obj) = value.kind() else {
             panic!("not a promise");
         };
-        let data = agent.promises.get(&obj.id()).unwrap();
+        let data = agent.promise_data(obj.id()).unwrap();
         let state = data.borrow();
         match &state.state {
             PromiseState::Fulfilled(v) => assert_eq!(
@@ -1091,7 +1098,7 @@ mod tests {
         let ValueKind::Object(obj) = value.kind() else {
             panic!("not a promise");
         };
-        let data = agent.promises.get(&obj.id()).unwrap();
+        let data = agent.promise_data(obj.id()).unwrap();
         let state = data.borrow();
         match &state.state {
             PromiseState::Fulfilled(v) => {

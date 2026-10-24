@@ -3507,7 +3507,7 @@ fn is_promise_value(agent: &Agent, value: &Value) -> bool {
     let ValueKind::Object(obj) = value.kind() else {
         return false;
     };
-    agent.promises.contains_key(&obj.id())
+    agent.roots.promises.borrow().contains_key(&obj.id())
 }
 
 /// A handler that resolves the import promise with the namespace.
@@ -3698,7 +3698,7 @@ mod tests {
         let ValueKind::Object(obj) = value.kind() else {
             return Ok(*value);
         };
-        let Some(data) = agent.promises.get(&obj.id()) else {
+        let Some(data) = agent.promise_data(obj.id()) else {
             return Ok(*value);
         };
         match &data.borrow().state {

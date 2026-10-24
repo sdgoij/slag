@@ -3842,7 +3842,7 @@ mod tests {
         let ValueKind::Object(obj) = value.kind() else {
             return Ok(*value);
         };
-        let Some(data) = agent.promises.get(&obj.id()) else {
+        let Some(data) = agent.promise_data(obj.id()) else {
             return Ok(*value);
         };
         match &data.borrow().state {

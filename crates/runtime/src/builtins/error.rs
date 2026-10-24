@@ -727,7 +727,7 @@ fn awaiting_body(
     let ValueKind::Object(object) = promise.kind() else {
         return None;
     };
-    let data = agent.promises.get(&object.id())?;
+    let data = agent.promise_data(object.id())?;
     let data = data.borrow();
     let crate::promise::PromiseState::Pending {
         fulfill_reactions,
@@ -762,7 +762,12 @@ fn await_continuation(
     let ValueKind::Function(function) = callback.callback.kind() else {
         return None;
     };
-    let entry = agent.async_resume.get(&function.id())?;
+    let entry = agent
+        .roots
+        .async_resume
+        .borrow()
+        .get(&function.id())
+        .cloned()?;
     Some((entry.state.clone(), entry.is_reject))
 }
 

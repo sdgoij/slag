@@ -2,7 +2,7 @@
 //! the `%AsyncGenerator.prototype%` methods, and the driver that runs the
 //! resumable-function IR to each yield/await suspension.
 //!
-//! The state lives in `agent.async_generators` as `Rc<RefCell<…>>`. Every
+//! The state lives in `agent.roots.async_generators` as `Rc<RefCell<…>>`. Every
 //! driver borrow is short-lived: the VM is taken out of the state before it
 //! runs, so re-entrant calls (a `next()` inside the body, or the await
 //! reactions firing mid-run) can always `borrow_mut` the state again.
@@ -375,7 +375,7 @@ pub fn call_async_generator(
     };
     let object = JsObject::ordinary_object_create(Some(proto));
     let object_value = Value::Object(object);
-    agent.async_generators.borrow_mut().insert(
+    agent.roots.async_generators.borrow_mut().insert(
         object.id(),
         Rc::new(RefCell::new(AsyncGeneratorState {
             object: object.id(),
@@ -403,7 +403,12 @@ fn validate(agent: &Agent, this: &Value) -> Result<u64, JsError> {
             "AsyncGeneratorResume called on a non-object".into(),
         ));
     };
-    if !agent.async_generators.borrow().contains_key(&obj.id()) {
+    if !agent
+        .roots
+        .async_generators
+        .borrow()
+        .contains_key(&obj.id())
+    {
         return Err(JsError::new(
             ErrorKind::TypeError,
             "AsyncGeneratorResume called on a non-async-generator".into(),
@@ -426,6 +431,7 @@ fn new_capability(agent: &mut Agent) -> Result<PromiseCapability, JsError> {
 
 fn state(agent: &Agent, object_id: u64) -> Result<AsyncGeneratorFlag, JsError> {
     let state = agent
+        .roots
         .async_generators
         .borrow()
         .get(&object_id)
@@ -436,6 +442,7 @@ fn state(agent: &Agent, object_id: u64) -> Result<AsyncGeneratorFlag, JsError> {
 
 fn set_flag(agent: &Agent, object_id: u64, flag: AsyncGeneratorFlag) -> Result<(), JsError> {
     let state = agent
+        .roots
         .async_generators
         .borrow()
         .get(&object_id)
@@ -451,6 +458,7 @@ fn set_current(
     request: AsyncGeneratorRequest,
 ) -> Result<(), JsError> {
     let state = agent
+        .roots
         .async_generators
         .borrow()
         .get(&object_id)
@@ -462,6 +470,7 @@ fn set_current(
 
 fn take_current(agent: &Agent, object_id: u64) -> Result<Option<AsyncGeneratorRequest>, JsError> {
     let state = agent
+        .roots
         .async_generators
         .borrow()
         .get(&object_id)
@@ -472,6 +481,7 @@ fn take_current(agent: &Agent, object_id: u64) -> Result<Option<AsyncGeneratorRe
 
 fn save_context(agent: &Agent, object_id: u64, context: ExecutionContext) -> Result<(), JsError> {
     let state = agent
+        .roots
         .async_generators
         .borrow()
         .get(&object_id)
@@ -489,6 +499,7 @@ fn push_request(
     request: AsyncGeneratorRequest,
 ) -> Result<(), JsError> {
     let state = agent
+        .roots
         .async_generators
         .borrow()
         .get(&object_id)
@@ -503,6 +514,7 @@ fn pop_front(
     object_id: u64,
 ) -> Result<Option<(AsyncGeneratorRequest, Resume)>, JsError> {
     let state = agent
+        .roots
         .async_generators
         .borrow()
         .get(&object_id)
@@ -811,6 +823,7 @@ fn drive(
             // queue, so `complete_current_request` runs from the driver once
             // the disposals settle.
             let body_env = agent
+                .roots
                 .async_generators
                 .borrow()
                 .get(&object_id)
@@ -864,6 +877,7 @@ pub fn complete_current_request(
 fn start_body(agent: &mut Agent, object_id: u64) -> Result<VmOutcome, JsError> {
     let (context, body_env) = {
         let state = agent
+            .roots
             .async_generators
             .borrow()
             .get(&object_id)
@@ -902,6 +916,7 @@ fn start_body(agent: &mut Agent, object_id: u64) -> Result<VmOutcome, JsError> {
     let mut vm = Vm::new(body_env, data.strict);
     let outcome = vm.start(agent, &body)?;
     let state = agent
+        .roots
         .async_generators
         .borrow()
         .get(&object_id)
@@ -923,6 +938,7 @@ fn resume_body(
 ) -> Result<VmOutcome, JsError> {
     let (context, body, suspended_at_delegate, mut vm) = {
         let state = agent
+            .roots
             .async_generators
             .borrow()
             .get(&object_id)
@@ -959,6 +975,7 @@ fn resume_body(
         _ => vm.run(agent, &body, completion),
     };
     let state = agent
+        .roots
         .async_generators
         .borrow()
         .get(&object_id)
@@ -1235,7 +1252,7 @@ mod tests {
         let ValueKind::Object(obj) = value.kind() else {
             return Ok(value);
         };
-        let Some(data) = agent.promises.get(&obj.id()) else {
+        let Some(data) = agent.promise_data(obj.id()) else {
             return Ok(value);
         };
         match &data.borrow().state {

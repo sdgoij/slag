@@ -7,6 +7,7 @@
 
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
+use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crux::error::{ErrorKind, JsError};
@@ -336,8 +337,152 @@ impl crux::heap::Trace for ErrorStack {
     }
 }
 
+/// The containers the collector reads.
+///
+/// They live in their own allocation, reached through `Rc`, and every field is
+/// interior-mutable, because both the interpreter and the collector reach them
+/// through `&self`: a collection can run inside any allocation — including one
+/// made by a host callback the interpreter entered through `&mut Agent` — and
+/// the collector must read these tables without that `&mut Agent` asserting
+/// exclusive access to their memory. Keeping them in `Agent` would make every
+/// collection a second access to memory a live `&mut Agent` already covers (see
+/// the M-1 note in `.notes/security-audit.md`).
+///
+/// This is slice 1 of that conversion: the job queues, the promise tables and
+/// the generator tables. The rest of `Agent::trace_roots`'s fields follow in
+/// later slices.
+pub(crate) struct AgentRoots {
+    pub(crate) promise_jobs: RefCell<VecDeque<Job>>,
+    pub(crate) generic_jobs: RefCell<VecDeque<Job>>,
+    pub(crate) timeout_jobs: RefCell<VecDeque<(u64, Job)>>,
+    /// The host's own microtask queues, one per queue it made
+    /// (`Agent::new_microtask_queue`). An entry is `None` once the host released
+    /// the queue, and the id stays valid so a stale one is a no-op rather than
+    /// somebody else's queue.
+    pub(crate) microtask_queues: RefCell<Vec<Option<MicrotaskQueue>>>,
+    /// [[KeptAlive]]: objects/symbols kept alive until the end of the current
+    /// Job (WeakRef, Phase 13).
+    pub(crate) kept_alive: RefCell<Vec<Value>>,
+    /// The Promise Records keyed by promise-object identity (spec 27.2.1).
+    /// Boxed behind an `Rc` so a reader can take the record and release the
+    /// table's borrow before running anything that may allocate.
+    pub(crate) promises:
+        RefCell<std::collections::HashMap<u64, Rc<RefCell<crate::promise::PromiseData>>>>,
+    /// The resolving functions created by CreateResolvingFunctions, keyed by
+    /// function identity (spec 27.2.1.3).
+    pub(crate) promise_resolvers:
+        RefCell<std::collections::HashMap<u64, Rc<RefCell<crate::promise::ResolverData>>>>,
+    /// Per-element handlers created by the Promise combinators (all/
+    /// allSettled/any), keyed by function identity.
+    pub(crate) promise_compound: RefCell<
+        std::collections::HashMap<u64, Rc<RefCell<crate::builtins::promise::CompoundState>>>,
+    >,
+    /// The closures created by `Promise.prototype.finally`, keyed by function
+    /// identity.
+    pub(crate) promise_finally: RefCell<
+        std::collections::HashMap<u64, Rc<RefCell<crate::builtins::promise::FinallyState>>>,
+    >,
+    /// The await-resume handlers of running async functions, keyed by function
+    /// identity.
+    pub(crate) async_resume:
+        RefCell<std::collections::HashMap<u64, Rc<crate::async_await::ResumeHandler>>>,
+    /// The generator objects' states, keyed by object identity (spec 27.4.3).
+    pub(crate) generators:
+        RefCell<std::collections::HashMap<u64, Rc<RefCell<crate::generator::GeneratorState>>>>,
+    /// The async generator objects' states, keyed by object identity (spec
+    /// 27.6.1).
+    pub(crate) async_generators: RefCell<
+        std::collections::HashMap<u64, Rc<RefCell<crate::async_generator::AsyncGeneratorState>>>,
+    >,
+}
+
+impl AgentRoots {
+    fn new() -> AgentRoots {
+        AgentRoots {
+            promise_jobs: RefCell::new(VecDeque::new()),
+            generic_jobs: RefCell::new(VecDeque::new()),
+            timeout_jobs: RefCell::new(VecDeque::new()),
+            microtask_queues: RefCell::new(Vec::new()),
+            kept_alive: RefCell::new(Vec::new()),
+            promises: RefCell::new(std::collections::HashMap::new()),
+            promise_resolvers: RefCell::new(std::collections::HashMap::new()),
+            promise_compound: RefCell::new(std::collections::HashMap::new()),
+            promise_finally: RefCell::new(std::collections::HashMap::new()),
+            async_resume: RefCell::new(std::collections::HashMap::new()),
+            generators: RefCell::new(std::collections::HashMap::new()),
+            async_generators: RefCell::new(std::collections::HashMap::new()),
+        }
+    }
+
+    /// GC-2: the closure regions of every queued job. The opaque closures hold
+    /// captured `Value`s the conservative stack scan cannot see, so the caller
+    /// scans them. `false` means a queue was borrowed mid-collection: the
+    /// caller aborts the sweep instead of tracing an incomplete root set.
+    fn collect_job_regions(&self, regions: &mut Vec<(*const u8, usize)>) -> bool {
+        let Ok(promise_jobs) = self.promise_jobs.try_borrow() else {
+            return false;
+        };
+        let Ok(generic_jobs) = self.generic_jobs.try_borrow() else {
+            return false;
+        };
+        let Ok(timeout_jobs) = self.timeout_jobs.try_borrow() else {
+            return false;
+        };
+        let Ok(queues) = self.microtask_queues.try_borrow() else {
+            return false;
+        };
+        for job in promise_jobs.iter().chain(generic_jobs.iter()) {
+            regions.push(job.closure_region());
+        }
+        for (_, job) in timeout_jobs.iter() {
+            regions.push(job.closure_region());
+        }
+        // A host's own queue holds the same opaque closures, and its jobs are
+        // as invisible to the stack scan as the default queue's — a handler
+        // queued here and waited on across an eval was swept without this, and
+        // the job then failed with "Function body is not registered".
+        for queue in queues.iter().flatten() {
+            for job in &queue.jobs {
+                regions.push(job.closure_region());
+            }
+        }
+        true
+    }
+}
+
+impl Trace for AgentRoots {
+    fn trace(&self, visit: &mut dyn FnMut(GcAny)) {
+        self.promise_jobs.trace(visit);
+        if let Ok(queues) = self.microtask_queues.try_borrow() {
+            for queue in queues.iter().flatten() {
+                queue.jobs.trace(visit);
+            }
+        } else {
+            crux::heap::note_aborted_trace();
+        }
+        self.generic_jobs.trace(visit);
+        if let Ok(jobs) = self.timeout_jobs.try_borrow() {
+            for (_, job) in jobs.iter() {
+                job.trace(visit);
+            }
+        } else {
+            crux::heap::note_aborted_trace();
+        }
+        self.kept_alive.trace(visit);
+        self.promises.trace(visit);
+        self.promise_resolvers.trace(visit);
+        self.promise_compound.trace(visit);
+        self.promise_finally.trace(visit);
+        self.async_resume.trace(visit);
+        self.generators.trace(visit);
+        self.async_generators.trace(visit);
+    }
+}
+
 pub struct Agent {
     pub execution_context_stack: Vec<ExecutionContext>,
+    /// The collector-visible root containers; see [`AgentRoots`].
+    pub(crate) roots: Rc<AgentRoots>,
     /// A termination request (v8::Isolate::TerminateExecution). The request has
     /// to reach a running isolate from another thread while the isolate itself
     /// cannot leave its own, so it is an atomic rather than agent state. It is
@@ -574,9 +719,6 @@ pub struct Agent {
     /// fixed). Zero when the platform cannot report the thread's stack
     /// bounds; the guard is disabled then.
     pub(crate) stack_guard_limit: usize,
-    pub(crate) promise_jobs: VecDeque<Job>,
-    pub(crate) generic_jobs: VecDeque<Job>,
-    pub(crate) timeout_jobs: VecDeque<(u64, Job)>,
     /// Host-defined operations (spec's host hooks); `None` uses the
     /// spec's default implementations.
     pub host_hooks: Option<Box<dyn HostHooks>>,
@@ -589,9 +731,6 @@ pub struct Agent {
     pub signifier: u64,
     /// [[IsLockFree1/2/8]]: whether atomic ops of those sizes are lock-free.
     pub is_lock_free: [bool; 3],
-    /// [[KeptAlive]]: objects/symbols kept alive until the end of the
-    /// current Job (WeakRef, Phase 13).
-    pub kept_alive: Vec<Value>,
     /// GC-2: a build-in-progress flag — native code accumulating
     /// handle-bearing values in local buffers (the class element build) sets
     /// it for the window; a `--gc-stress` collection that fires inside then
@@ -651,8 +790,6 @@ pub struct Agent {
         (crux::JsString, bool, bool, bool),
         std::rc::Rc<crate::ir::CompiledBody>,
     >,
-    /// The Promise Records keyed by promise-object identity (spec 27.2.1).
-    pub promises: std::collections::HashMap<u64, RefCell<crate::promise::PromiseData>>,
     /// The realm a job is running in, set by the drain for the job's own realm
     /// and nothing else (spec 9.5.4 hands the host a realm to run a job in).
     ///
@@ -662,26 +799,6 @@ pub struct Agent {
     /// realm carried by the queue is the only one an engine hook fired from a
     /// job can answer.
     pub entered_realm: Option<Handle<Realm>>,
-    /// The resolving functions created by CreateResolvingFunctions, keyed by
-    /// function identity (spec 27.2.1.3).
-    pub promise_resolvers:
-        std::collections::HashMap<u64, std::rc::Rc<RefCell<crate::promise::ResolverData>>>,
-    /// Per-element handlers created by the Promise combinators (all/
-    /// allSettled/any), keyed by function identity.
-    pub promise_compound: std::collections::HashMap<
-        u64,
-        std::rc::Rc<RefCell<crate::builtins::promise::CompoundState>>,
-    >,
-    /// The closures created by `Promise.prototype.finally`, keyed by function
-    /// identity.
-    pub promise_finally: std::collections::HashMap<
-        u64,
-        std::rc::Rc<RefCell<crate::builtins::promise::FinallyState>>,
-    >,
-    /// The await-resume handlers of running async functions, keyed by
-    /// function identity.
-    pub async_resume:
-        std::collections::HashMap<u64, std::rc::Rc<crate::async_await::ResumeHandler>>,
     /// The two handlers `WebAssembly.compileStreaming` attaches to the source
     /// promise, keyed by function identity: a Rust-backed builtin carries no
     /// data of its own, so the stream it settles is found here. An entry is
@@ -698,18 +815,6 @@ pub struct Agent {
     pub async_from_sync_continuations: std::collections::HashMap<
         u64,
         std::rc::Rc<crate::async_await::AsyncFromSyncContinuationEntry>,
-    >,
-    /// The generator objects' states, keyed by object identity (spec 27.4.3).
-    pub generators: std::cell::RefCell<
-        std::collections::HashMap<u64, std::rc::Rc<RefCell<crate::generator::GeneratorState>>>,
-    >,
-    /// The async generator objects' states, keyed by object identity (spec
-    /// 27.6.1).
-    pub async_generators: std::cell::RefCell<
-        std::collections::HashMap<
-            u64,
-            std::rc::Rc<RefCell<crate::async_generator::AsyncGeneratorState>>,
-        >,
     >,
     /// The await-resume handlers of async generator bodies, keyed by function
     /// identity.
@@ -1191,11 +1296,6 @@ pub struct Agent {
     /// collection then runs none, which is also V8's shape: a collection never
     /// starts inside one.
     collection_observers: RefCell<Vec<Box<dyn crux::heap::GcObserver>>>,
-    /// The host's own microtask queues, one per queue it made
-    /// (`Agent::new_microtask_queue`). An entry is `None` once the host released
-    /// the queue, and the id stays valid so a stale one is a no-op rather than
-    /// somebody else's queue.
-    microtask_queues: Vec<Option<MicrotaskQueue>>,
 }
 
 /// A microtask queue a host owns and drains itself (`v8::MicrotaskQueue`).
@@ -1206,7 +1306,7 @@ pub struct Agent {
 /// not join the outer context's turn. The policy is the queue's own: `Explicit`
 /// is drained only by the host's `PerformCheckpoint`, `Auto` also by the
 /// isolate's run.
-struct MicrotaskQueue {
+pub(crate) struct MicrotaskQueue {
     policy: crate::api::MicrotasksPolicy,
     jobs: VecDeque<Job>,
 }
@@ -1397,14 +1497,11 @@ impl Agent {
             iter_result_map: std::cell::Cell::new(None),
             generator_methods: std::cell::Cell::new(None),
             collection_observers: RefCell::new(Vec::new()),
-            microtask_queues: Vec::new(),
             vm_pool: Vec::new(),
             jit_hook: None,
             jit_depth: 0,
             stack_guard_limit: crate::stack::stack_guard_limit().unwrap_or(0),
-            promise_jobs: VecDeque::new(),
-            generic_jobs: VecDeque::new(),
-            timeout_jobs: VecDeque::new(),
+            roots: Rc::new(AgentRoots::new()),
             host_hooks: None,
             little_endian: cfg!(target_endian = "little"),
             can_block: false,
@@ -1414,7 +1511,6 @@ impl Agent {
                 is_lock_free_for_size(2),
                 is_lock_free_for_size(8),
             ],
-            kept_alive: Vec::new(),
             build_roots: std::cell::Cell::new(false),
             global_symbol_registry: RefCell::new(Vec::new()),
             module_async_evaluation_count: 0,
@@ -1422,18 +1518,11 @@ impl Agent {
             ecma_functions: std::collections::HashMap::default(),
             compiled_bodies: std::collections::HashMap::default(),
             script_bodies: std::collections::HashMap::new(),
-            promises: std::collections::HashMap::new(),
             entered_realm: None,
-            promise_resolvers: std::collections::HashMap::new(),
-            promise_compound: std::collections::HashMap::new(),
-            promise_finally: std::collections::HashMap::new(),
-            async_resume: std::collections::HashMap::new(),
             #[cfg(feature = "wasm")]
             wasm_streaming_handlers: std::collections::HashMap::new(),
             async_from_sync: std::collections::HashMap::new(),
             async_from_sync_continuations: std::collections::HashMap::new(),
-            generators: std::cell::RefCell::new(std::collections::HashMap::new()),
-            async_generators: std::cell::RefCell::new(std::collections::HashMap::new()),
             async_generator_awaits: std::collections::HashMap::new(),
             iterator_helpers: std::collections::HashMap::new(),
             wrapped_iterators: std::collections::HashMap::new(),
@@ -1797,6 +1886,33 @@ impl Agent {
         ))
     }
 
+    /// The Promise Record of `id` (spec 27.2.1), when the object is a
+    /// promise. Answers an owned handle so the caller does not hold the
+    /// table's borrow across whatever it does with the record.
+    pub fn promise_data(&self, id: u64) -> Option<Rc<RefCell<crate::promise::PromiseData>>> {
+        self.roots.promises.borrow().get(&id).cloned()
+    }
+
+    /// Whether `id` names a promise object (it has a Promise Record).
+    pub fn is_promise_object(&self, id: u64) -> bool {
+        self.roots.promises.borrow().contains_key(&id)
+    }
+
+    /// Whether `id` names a generator object (the engine keys each one's
+    /// suspended state by object identity).
+    pub fn is_generator_object(&self, id: u64) -> bool {
+        self.roots.generators.borrow().contains_key(&id)
+    }
+
+    /// The record of the resolving function `id`, when it is one
+    /// (spec 27.2.1.3).
+    pub fn promise_resolver_data(
+        &self,
+        id: u64,
+    ) -> Option<Rc<RefCell<crate::promise::ResolverData>>> {
+        self.roots.promise_resolvers.borrow().get(&id).cloned()
+    }
+
     /// HostEnqueueGenericJob (spec 9.5.3): schedule a job without additional
     /// constraints such as priority.
     pub fn enqueue_generic_job(
@@ -1804,7 +1920,10 @@ impl Agent {
         realm: Option<Handle<Realm>>,
         closure: impl FnOnce(&mut Agent) -> Result<Value, JsError> + 'static,
     ) {
-        self.generic_jobs.push_back(Job::new(realm, closure));
+        self.roots
+            .generic_jobs
+            .borrow_mut()
+            .push_back(Job::new(realm, closure));
     }
 
     /// HostEnqueuePromiseJob (spec 9.5.4): schedule a job at promise
@@ -1817,14 +1936,24 @@ impl Agent {
         // A realm the host gave its own queue sends its jobs there, so the host
         // drains them itself. A queue the host released, or an id nothing
         // knows, falls back to the default queue rather than dropping the job.
-        match realm
+        let queue_id = realm
             .and_then(|realm| realm.microtask_queue.get())
-            .and_then(|id| self.microtask_queues.get_mut(id as usize))
-            .and_then(Option::as_mut)
+            .map(|id| id as usize);
+        if let Some(queue_id) = queue_id
+            && let Some(queue) = self
+                .roots
+                .microtask_queues
+                .borrow_mut()
+                .get_mut(queue_id)
+                .and_then(Option::as_mut)
         {
-            Some(queue) => queue.jobs.push_back(Job::new(realm, closure)),
-            None => self.promise_jobs.push_back(Job::new(realm, closure)),
+            queue.jobs.push_back(Job::new(realm, closure));
+            return;
         }
+        self.roots
+            .promise_jobs
+            .borrow_mut()
+            .push_back(Job::new(realm, closure));
     }
 
     /// Make a microtask queue the host drains itself (`v8::MicrotaskQueue::new`).
@@ -1833,8 +1962,9 @@ impl Agent {
     /// (`v8::ContextOptions::microtask_queue`) and what `PerformCheckpoint`
     /// drains. Ids are never reused, so a released one stays a no-op.
     pub fn new_microtask_queue(&mut self, policy: crate::api::MicrotasksPolicy) -> u32 {
-        let id = self.microtask_queues.len() as u32;
-        self.microtask_queues.push(Some(MicrotaskQueue {
+        let mut queues = self.roots.microtask_queues.borrow_mut();
+        let id = queues.len() as u32;
+        queues.push(Some(MicrotaskQueue {
             policy,
             jobs: VecDeque::new(),
         }));
@@ -1845,7 +1975,8 @@ impl Agent {
     /// does: what the queue still holds is dropped, and its id goes quiet (its
     /// realm's later jobs then take the default queue).
     pub fn release_microtask_queue(&mut self, id: u32) {
-        if let Some(slot) = self.microtask_queues.get_mut(id as usize) {
+        let mut queues = self.roots.microtask_queues.borrow_mut();
+        if let Some(slot) = queues.get_mut(id as usize) {
             *slot = None;
         }
     }
@@ -1872,7 +2003,9 @@ impl Agent {
 
     /// The next job in queue `id`, if the host has not released it.
     fn next_microtask_queue_job(&mut self, id: u32) -> Option<Job> {
-        self.microtask_queues
+        self.roots
+            .microtask_queues
+            .borrow_mut()
             .get_mut(id as usize)
             .and_then(Option::as_mut)
             .and_then(|queue| queue.jobs.pop_front())
@@ -1884,7 +2017,8 @@ impl Agent {
     /// means; an `Explicit` queue is only ever drained by its own
     /// `PerformCheckpoint`.
     fn next_auto_microtask_queue_job(&mut self) -> Option<Job> {
-        for slot in &mut self.microtask_queues {
+        let mut queues = self.roots.microtask_queues.borrow_mut();
+        for slot in queues.iter_mut() {
             if let Some(queue) = slot
                 && queue.policy == crate::api::MicrotasksPolicy::Auto
                 && let Some(job) = queue.jobs.pop_front()
@@ -1907,7 +2041,9 @@ impl Agent {
         // scheduling works on targets whose std clock is unsupported.
         let deadline =
             crate::time::monotonic_nanos().saturating_add(milliseconds.saturating_mul(1_000_000));
-        self.timeout_jobs
+        self.roots
+            .timeout_jobs
+            .borrow_mut()
             .push_back((deadline, Job::new(realm, closure)));
     }
 
@@ -1947,30 +2083,36 @@ impl Agent {
         // GC-4: promote the FinalizationRegistry cleanup jobs enqueued by the
         // collector's compaction hook into the generic queue (the hook runs
         // with `&self` and cannot touch the queues directly).
-        self.generic_jobs
+        self.roots
+            .generic_jobs
+            .borrow_mut()
             .extend(self.pending_cleanup_jobs.borrow_mut().drain(..));
         loop {
-            if let Some(job) = self.promise_jobs.pop_front() {
+            let next = self.roots.promise_jobs.borrow_mut().pop_front();
+            if let Some(job) = next {
                 self.run_job(job)?;
                 continue;
             }
             // Only read the deadline clock when a timer is actually queued
             // (on wasm32-unknown-unknown it is a host import).
-            if !self.timeout_jobs.is_empty() {
-                let now = crate::time::monotonic_nanos();
-                if let Some(index) = self
-                    .timeout_jobs
-                    .iter()
-                    .position(|(deadline, _)| *deadline <= now)
-                {
-                    let Some((_, job)) = self.timeout_jobs.remove(index) else {
-                        continue;
-                    };
+            let due = {
+                let jobs = self.roots.timeout_jobs.borrow();
+                if jobs.is_empty() {
+                    None
+                } else {
+                    let now = crate::time::monotonic_nanos();
+                    jobs.iter().position(|(deadline, _)| *deadline <= now)
+                }
+            };
+            if let Some(index) = due {
+                let job = self.roots.timeout_jobs.borrow_mut().remove(index);
+                if let Some((_, job)) = job {
                     self.run_job(job)?;
                     continue;
                 }
             }
-            if let Some(job) = self.generic_jobs.pop_front() {
+            let next = self.roots.generic_jobs.borrow_mut().pop_front();
+            if let Some(job) = next {
                 self.run_job(job)?;
                 continue;
             }
@@ -2006,7 +2148,9 @@ impl Agent {
     }
 
     pub fn job_queues_empty(&self) -> bool {
-        self.promise_jobs.is_empty() && self.generic_jobs.is_empty() && self.timeout_jobs.is_empty()
+        self.roots.promise_jobs.borrow().is_empty()
+            && self.roots.generic_jobs.borrow().is_empty()
+            && self.roots.timeout_jobs.borrow().is_empty()
     }
 
     /// Nanoseconds until the earliest queued timeout is due (0 when a job is
@@ -2014,7 +2158,9 @@ impl Agent {
     /// to schedule the drain that lets engine timers progress.
     pub fn next_timeout_delay_ns(&self) -> Option<u64> {
         let now = crate::time::monotonic_nanos();
-        self.timeout_jobs
+        self.roots
+            .timeout_jobs
+            .borrow()
             .iter()
             .map(|(deadline, _)| *deadline)
             .min()
@@ -2144,15 +2290,7 @@ impl Agent {
         for vm in &self.vm_pool {
             vm.trace(visit);
         }
-        self.promise_jobs.trace(visit);
-        for queue in self.microtask_queues.iter().flatten() {
-            queue.jobs.trace(visit);
-        }
-        self.generic_jobs.trace(visit);
-        for (_, job) in &self.timeout_jobs {
-            job.trace(visit);
-        }
-        self.kept_alive.trace(visit);
+        self.roots.trace(visit);
         self.global_symbol_registry.trace(visit);
         self.module_eval_stack.trace(visit);
         for entry in self.compiled_bodies.values() {
@@ -2165,26 +2303,11 @@ impl Agent {
             body.trace(visit);
         }
         self.ecma_functions.trace(visit);
-        self.promises.trace(visit);
         self.entered_realm.trace(visit);
-        self.promise_resolvers.trace(visit);
-        self.promise_compound.trace(visit);
-        self.promise_finally.trace(visit);
-        self.async_resume.trace(visit);
         #[cfg(feature = "wasm")]
         self.wasm_streaming_handlers.trace(visit);
         self.async_from_sync.trace(visit);
         self.async_from_sync_continuations.trace(visit);
-        // A generator's `next`/`resume` can hold the cell across an
-        // allocation; abort the sweep instead of panicking on the borrow.
-        match self.generators.try_borrow() {
-            Ok(generators) => generators.trace(visit),
-            Err(_) => crux::heap::note_aborted_trace(),
-        }
-        match self.async_generators.try_borrow() {
-            Ok(generators) => generators.trace(visit),
-            Err(_) => crux::heap::note_aborted_trace(),
-        }
         self.async_generator_awaits.trace(visit);
         self.iterator_helpers.trace(visit);
         self.wrapped_iterators.trace(visit);
@@ -2376,23 +2499,9 @@ impl Agent {
         // GC-2: the opaque job closures hold captured Values; scan their
         // boxes conservatively (queued jobs plus the job currently running).
         let mut regions: Vec<(*const u8, usize)> = Vec::new();
-        for job in &self.promise_jobs {
-            regions.push(job.closure_region());
-        }
-        for job in &self.generic_jobs {
-            regions.push(job.closure_region());
-        }
-        for (_, job) in &self.timeout_jobs {
-            regions.push(job.closure_region());
-        }
-        // A host's own queue holds the same opaque closures, and its jobs are as
-        // invisible to the stack scan as the default queue's — a handler queued
-        // here and waited on across an eval was swept without this, and the job
-        // then failed with "Function body is not registered".
-        for queue in self.microtask_queues.iter().flatten() {
-            for job in &queue.jobs {
-                regions.push(job.closure_region());
-            }
+        if !self.roots.collect_job_regions(&mut regions) {
+            crux::heap::note_aborted_trace();
+            return;
         }
         // GC-4: the pending FinalizationRegistry cleanup jobs (captured
         // held values and callbacks) ride alongside the queued jobs.
@@ -2559,10 +2668,12 @@ impl Agent {
                     && unsafe { (&*agent).promise_addrs.try_borrow().is_ok_and(|map| !map.is_empty()) }
             });
         let has_generators = self
+            .roots
             .generators
             .try_borrow()
             .is_ok_and(|map| !map.is_empty())
             || self
+                .roots
                 .async_generators
                 .try_borrow()
                 .is_ok_and(|map| !map.is_empty())
@@ -2570,8 +2681,13 @@ impl Agent {
                 agent != self_ptr
                     // SAFETY: as above.
                     && unsafe {
-                        (&*agent).generators.try_borrow().is_ok_and(|map| !map.is_empty())
+                        (&*agent)
+                            .roots
+                            .generators
+                            .try_borrow()
+                            .is_ok_and(|map| !map.is_empty())
                             || (&*agent)
+                                .roots
                                 .async_generators
                                 .try_borrow()
                                 .is_ok_and(|map| !map.is_empty())
@@ -2866,7 +2982,7 @@ impl Agent {
             // A resolver record is keyed by the function's id and outlives the
             // function by one collection; release it here so the table does
             // not accumulate stale records.
-            self.promise_resolvers.remove(&id);
+            self.roots.promise_resolvers.borrow_mut().remove(&id);
             if self.ecma_functions.remove(&id).is_none() {
                 continue;
             }
@@ -2891,7 +3007,7 @@ impl Agent {
         if dead.is_empty() {
             return;
         }
-        let Ok(mut map) = self.generators.try_borrow_mut() else {
+        let Ok(mut map) = self.roots.generators.try_borrow_mut() else {
             return;
         };
         if map.is_empty() {
@@ -2904,7 +3020,7 @@ impl Agent {
             Err(_) => true,
         });
         drop(map);
-        let Ok(mut map) = self.async_generators.try_borrow_mut() else {
+        let Ok(mut map) = self.roots.async_generators.try_borrow_mut() else {
             return;
         };
         map.retain(|_, state| match state.try_borrow() {
@@ -2955,7 +3071,7 @@ impl Agent {
     fn reap_dead_promises(&mut self) {
         let ids = std::mem::take(&mut *self.pending_dead_promises.borrow_mut());
         for id in ids {
-            self.promises.remove(&id);
+            self.roots.promises.borrow_mut().remove(&id);
         }
     }
 

@@ -46,7 +46,7 @@ impl Promise {
     pub fn state(context: &Context, promise: &Local) -> Result<&'static str, JsError> {
         let object = promise_object(promise)?;
         context.with_agent(|agent| {
-            let Some(data) = agent.promises.get(&object.id()) else {
+            let Some(data) = agent.promise_data(object.id()) else {
                 return Err(not_a_promise());
             };
             Ok(match &data.borrow().state {
@@ -62,7 +62,7 @@ impl Promise {
     pub fn result(context: &Context, promise: &Local) -> Result<Local, JsError> {
         let object = promise_object(promise)?;
         context.with_agent(|agent| {
-            let Some(data) = agent.promises.get(&object.id()) else {
+            let Some(data) = agent.promise_data(object.id()) else {
                 return Err(not_a_promise());
             };
             let value = match &data.borrow().state {

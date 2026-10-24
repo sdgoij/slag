@@ -11305,7 +11305,7 @@ var $DONE = function (error) {
         let ValueKind::Object(obj) = promise.kind() else {
             return Ok(None);
         };
-        let Some(data) = agent.promises.get(&obj.id()) else {
+        let Some(data) = agent.promise_data(obj.id()) else {
             return Ok(None);
         };
         match &data.borrow().state {

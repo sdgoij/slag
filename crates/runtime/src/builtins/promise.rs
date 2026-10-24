@@ -387,14 +387,32 @@ pub fn dispatch_call(
     let ValueKind::Function(function) = callee.kind() else {
         return None;
     };
-    if let Some(resolver) = agent.promise_resolvers.get(&function.id()) {
-        return Some(dispatch_resolver(agent, resolver.clone(), args));
+    let resolver = agent
+        .roots
+        .promise_resolvers
+        .borrow()
+        .get(&function.id())
+        .cloned();
+    if let Some(resolver) = resolver {
+        return Some(dispatch_resolver(agent, resolver, args));
     }
-    if let Some(state) = agent.promise_compound.get(&function.id()) {
-        return Some(dispatch_compound(agent, state.clone(), args));
+    let state = agent
+        .roots
+        .promise_compound
+        .borrow()
+        .get(&function.id())
+        .cloned();
+    if let Some(state) = state {
+        return Some(dispatch_compound(agent, state, args));
     }
-    if let Some(state) = agent.promise_finally.get(&function.id()) {
-        return Some(dispatch_finally(agent, state.clone(), args));
+    let state = agent
+        .roots
+        .promise_finally
+        .borrow()
+        .get(&function.id())
+        .cloned();
+    if let Some(state) = state {
+        return Some(dispatch_finally(agent, state, args));
     }
     let realm = agent.current_realm().ok()?;
     let intrinsics = &realm.intrinsics;
@@ -504,15 +522,15 @@ fn promise_constructor(
     let promise = JsObject::ordinary_object_create(Some(proto));
     let promise_value = Value::Object(promise);
     let (resolve, reject) = crate::promise::create_resolving_functions(agent, &promise_value);
-    agent.promises.insert(
+    agent.roots.promises.borrow_mut().insert(
         promise.id(),
-        RefCell::new(PromiseData {
+        Rc::new(RefCell::new(PromiseData {
             state: PromiseState::Pending {
                 fulfill_reactions: Vec::new(),
                 reject_reactions: Vec::new(),
             },
             is_handled: false,
-        }),
+        })),
     );
     agent
         .promise_addrs
@@ -601,7 +619,7 @@ fn promise_finally_method(
     let (then_finally, catch_finally) = if is_callable(&on_finally) {
         // The thenFinally/catchFinally closures are anonymous (their `name`
         // is the empty string, spec 27.2.5.3 steps 7-8).
-        let mut make = |is_catch: bool| -> Result<Value, JsError> {
+        let make = |is_catch: bool| -> Result<Value, JsError> {
             let closure = Function::create_builtin(
                 Some(JsString::from_utf8("")),
                 1,
@@ -621,7 +639,9 @@ fn promise_finally_method(
                 }
             };
             agent
+                .roots
                 .promise_finally
+                .borrow_mut()
                 .insert(closure.id(), Rc::new(RefCell::new(state)));
             Ok(Value::Function(closure))
         };
@@ -672,7 +692,9 @@ fn dispatch_finally(
         None,
     )?;
     agent
+        .roots
         .promise_finally
+        .borrow_mut()
         .insert(thunk.id(), Rc::new(RefCell::new(thunk_state)));
     let then = crate::context::get_property(agent, &promise, &JsString::from_utf8(THEN), promise)?;
     crate::function::call(agent, &then, promise, &[Value::Function(thunk)])
@@ -851,7 +873,7 @@ fn promise_all(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value,
             None,
             fn_proto,
         )?;
-        agent.promise_compound.insert(
+        agent.roots.promise_compound.borrow_mut().insert(
             closure.id(),
             Rc::new(RefCell::new(CompoundState::All {
                 values: values.clone(),
@@ -988,7 +1010,7 @@ fn promise_all_settled(agent: &mut Agent, this: &Value, args: &[Value]) -> Resul
                 None,
                 fn_proto,
             )?;
-            agent.promise_compound.insert(
+            agent.roots.promise_compound.borrow_mut().insert(
                 closure.id(),
                 Rc::new(RefCell::new(CompoundState::AllSettled {
                     results: results.clone(),
@@ -1271,7 +1293,9 @@ fn keyed_handler(
         },
     };
     agent
+        .roots
         .promise_compound
+        .borrow_mut()
         .insert(closure.id(), Rc::new(RefCell::new(state)));
     Ok(Value::Function(closure))
 }
@@ -1440,7 +1464,7 @@ fn promise_any(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value,
             None,
             fn_proto,
         )?;
-        agent.promise_compound.insert(
+        agent.roots.promise_compound.borrow_mut().insert(
             closure.id(),
             Rc::new(RefCell::new(CompoundState::Any {
                 errors: errors.clone(),
@@ -1731,9 +1755,9 @@ mod tests {
         agent.collect_garbage();
         agent.run_script("0").unwrap();
         assert!(
-            agent.promises.len() < 500,
+            agent.roots.promises.borrow().len() < 500,
             "{} promise records survived the churn",
-            agent.promises.len()
+            agent.roots.promises.borrow().len()
         );
     }
 
@@ -1752,7 +1776,7 @@ mod tests {
         let ValueKind::Object(obj) = value.kind() else {
             return Ok(*value);
         };
-        let Some(data) = agent.promises.get(&obj.id()) else {
+        let Some(data) = agent.promise_data(obj.id()) else {
             return Ok(*value);
         };
         match &data.borrow().state {
