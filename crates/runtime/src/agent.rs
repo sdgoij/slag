@@ -771,6 +771,31 @@ pub(crate) struct AgentRoots {
     /// leaf call skips the `ecma_functions` HashMap lookup. Boxed per the
     /// Cut 27 lesson.
     pub(crate) leaf_cache: RefCell<Box<[LeafCacheCell; crate::ir::LEAF_CACHE]>>,
+    /// The IC value cells, in the roots like the rest of the traced state.
+    /// They are `Cell`s (not `RefCell`s): the payloads are `Copy`, so a read
+    /// is a load and a write a store, with no borrow flag on the hot path.
+    /// `Cell` is `#[repr(transparent)]`, which is also what keeps the compiled
+    /// lanes' addressing intact — see [`AgentRoots::member_value_cell_base`].
+    ///
+    /// `member_value_cells` is the fronting read-side cache (Cut 35 slice 11):
+    /// (id, name, generation, value), a plain `#[repr(C)]` array so the
+    /// compiled `GetMemberName` probe reads the cells at fixed offsets;
+    /// `MemberValueCell::empty()`'s impossible id never validates.
+    pub(crate) member_value_cells: [Cell<crate::ir::MemberValueCell>; crate::ir::MEMBER_CELLS],
+    /// The computed-read value cache (G8): (key Value, interned atom) for
+    /// `o[k]`, keyed by the key's identity rather than an interned atom so the
+    /// compiled probe can run before the key is converted; traced, because the
+    /// key box must outlive the cell, which is what makes the identity match
+    /// sound.
+    pub(crate) computed_read_cells:
+        [Cell<crate::ir::ComputedReadCell>; crate::ir::COMPUTED_READ_CELLS],
+    /// The JIT's direct-mapped global-VALUE cells (Cut 36): `name` + the
+    /// capturing `(global_id, generation)` validate the cached value against
+    /// the global object's LIVE identity and generation (the generation bumps
+    /// on any own-property change), so the compiled `LoadGlobal` fast path
+    /// reads the value in place and only calls `get_global` on a miss.
+    /// `load_global_value` repopulates the cell on every successful read.
+    pub(crate) global_value_cells: [Cell<crate::jit::GlobalValueCell>; crate::ir::GLOBAL_CELLS],
     /// The wasm JS-API wrapper tables (Cut 10). Their values are heap edges,
     /// so they are roots: an untraced `Value` here is freed, its object id
     /// reused, and a later lookup returns the wrong object (e.g.
@@ -924,6 +949,40 @@ pub(crate) struct AgentRoots {
 }
 
 impl AgentRoots {
+    /// The `JitCallContext` base of the member value cells.
+    ///
+    /// The compiled lanes index it as `*mut MemberValueCell` at
+    /// `index * size_of::<MemberValueCell>()`; `Cell<T>` is
+    /// `#[repr(transparent)]` over `T`, so the `Cell` array's element-0 address
+    /// and stride are the payload's, and the box's allocation is fixed for the
+    /// agent's life, so the address never moves.
+    pub(crate) fn member_value_cell_base(&self) -> *mut std::os::raw::c_void {
+        self.member_value_cells
+            .as_slice()
+            .as_ptr()
+            .cast_mut()
+            .cast()
+    }
+
+    /// The `JitCallContext` base of the computed-read cells (see
+    /// [`AgentRoots::member_value_cell_base`]).
+    pub(crate) fn computed_read_cell_base(&self) -> *mut std::os::raw::c_void {
+        self.computed_read_cells
+            .as_slice()
+            .as_ptr()
+            .cast_mut()
+            .cast()
+    }
+
+    /// The `JitCallContext` base of the global value cells (see
+    /// [`AgentRoots::member_value_cell_base`]).
+    pub(crate) fn global_value_cell_base(&self) -> *mut std::os::raw::c_void {
+        self.global_value_cells
+            .as_slice()
+            .as_ptr()
+            .cast_mut()
+            .cast()
+    }
     fn new() -> AgentRoots {
         AgentRoots {
             execution_context_stack: ContextStack::new(),
@@ -980,6 +1039,15 @@ impl AgentRoots {
             global_leaf_cells: RefCell::new(Box::new(std::array::from_fn(|_| None))),
             slot_leaf_cells: RefCell::new(Box::new(std::array::from_fn(|_| None))),
             leaf_cache: RefCell::new(Box::new(std::array::from_fn(|_| None))),
+            member_value_cells: std::array::from_fn(|_| {
+                Cell::new(crate::ir::MemberValueCell::empty())
+            }),
+            computed_read_cells: std::array::from_fn(|_| {
+                Cell::new(crate::ir::ComputedReadCell::empty())
+            }),
+            global_value_cells: std::array::from_fn(|_| {
+                Cell::new(crate::jit::GlobalValueCell::empty())
+            }),
             #[cfg(feature = "wasm")]
             wasm_streaming_handlers: RefCell::new(std::collections::HashMap::new()),
             #[cfg(feature = "wasm")]
@@ -1170,6 +1238,17 @@ impl Trace for AgentRoots {
         }
         for (_, entry) in self.leaf_cache.borrow().iter().flatten() {
             entry.trace(visit);
+        }
+        // The IC value caches hold Values; the index-only caches re-resolve
+        // from the (traced) objects and need no tracing.
+        for cell in self.member_value_cells.iter() {
+            cell.get().trace(visit);
+        }
+        for cell in self.computed_read_cells.iter() {
+            cell.get().trace(visit);
+        }
+        for cell in self.global_value_cells.iter() {
+            cell.get().trace(visit);
         }
         #[cfg(feature = "wasm")]
         {
@@ -1425,30 +1504,7 @@ pub struct Agent {
     /// vector), so sharing them across Vms — and across realms — is exact
     /// and warms a nested call to its caller's shapes.
     pub(crate) global_cells: [Option<(crux::AtomId, usize)>; crate::ir::GLOBAL_CELLS],
-    /// The JIT's direct-mapped global-VALUE cells (Cut 36): `name` + the
-    /// capturing `(global_id, generation)` validate the cached value against
-    /// the global object's LIVE identity and generation (the generation
-    /// bumps on any own-property change), so the compiled `LoadGlobal` fast
-    /// path reads the value in place and only calls `get_global` on a miss.
-    /// `load_global_value` repopulates the cell on every successful read.
-    /// Boxed per the Cut 27 lesson.
-    pub(crate) global_value_cells: Box<[crate::jit::GlobalValueCell; crate::ir::GLOBAL_CELLS]>,
     pub(crate) member_cells: [Option<(u64, crux::AtomId, usize)>; crate::ir::MEMBER_CELLS],
-    /// The fronting read-side value cache (Cut 35 slice 11): (id, name,
-    /// generation, value) — a hit returns the value with no property-vector
-    /// borrow or re-validation. Boxed so the Agent's hot-field cache
-    /// footprint stays small (the Cut 27 lesson). A plain `#[repr(C)]`
-    /// array (no `Option`) so the compiled `GetMemberName` probe reads the
-    /// cells at fixed offsets; `MemberValueCell::empty()`'s impossible id
-    /// never validates.
-    pub(crate) member_value_cells: Box<[crate::ir::MemberValueCell; crate::ir::MEMBER_CELLS]>,
-    /// The computed-read value cache (G8): (id, key Value, generation, value)
-    /// for `o[k]`, keyed by the key's identity rather than an interned atom so
-    /// the compiled probe can run before the key is converted. Boxed on the
-    /// same Cut 27 lesson; traced (the key box must outlive the cell, which is
-    /// what makes the identity match sound).
-    pub(crate) computed_read_cells:
-        Box<[crate::ir::ComputedReadCell; crate::ir::COMPUTED_READ_CELLS]>,
     /// The write-side value cache (L1a warm-store fast path): (id, name,
     /// generation, slot) — "at this generation, `name` is an own writable
     /// data property of `id` at property-vector `slot`". A store whose (id,
@@ -1918,16 +1974,7 @@ impl Agent {
             initial_heap_limit: 0,
             near_heap_limit: None,
             global_cells: [None; crate::ir::GLOBAL_CELLS],
-            global_value_cells: Box::new(std::array::from_fn(|_| {
-                crate::jit::GlobalValueCell::empty()
-            })),
             member_cells: [None; crate::ir::MEMBER_CELLS],
-            member_value_cells: Box::new(std::array::from_fn(|_| {
-                crate::ir::MemberValueCell::empty()
-            })),
-            computed_read_cells: Box::new(std::array::from_fn(|_| {
-                crate::ir::ComputedReadCell::empty()
-            })),
             member_write_cells: {
                 // The write table is larger than the other IC tables; build it
                 // on the heap directly (a `from_fn` array temporary would sit on
@@ -3032,21 +3079,11 @@ impl Agent {
     /// stack scan cannot see). Index-only caches and primitive tables need
     /// no tracing.
     ///
-    /// This is the state that has not moved to [`AgentRoots`] yet; the
-    /// collector traces the moved containers separately, through the roots
-    /// pointer, so they are never read via `&Agent`.
+    /// Every container the agent itself holds now lives in [`AgentRoots`], so
+    /// this one reads none of the agent's fields: what it adds is the
+    /// thread-scoped state (a running body's Vm stacks and the job closures'
+    /// regions), which belongs to no single agent.
     pub(crate) fn trace_agent_state(&self, visit: &mut dyn FnMut(GcAny)) {
-        // The IC value caches hold Values; the index-only caches re-resolve
-        // from the (traced) objects and need no tracing.
-        for cell in self.member_value_cells.iter() {
-            cell.trace(visit);
-        }
-        for cell in self.computed_read_cells.iter() {
-            cell.trace(visit);
-        }
-        for cell in self.global_value_cells.iter() {
-            cell.trace(visit);
-        }
         // GC-2: the Vms currently running bodies (their heap-buffered value
         // stacks are invisible to the conservative stack scan). Pooled and
         // suspended Vms are covered by `vm_pool` and the generator/async
@@ -3505,8 +3542,9 @@ impl Agent {
     /// warm-store front re-records the value cells, so nothing observes the
     /// difference beyond one cold read per site per collection.
     fn clear_derived_caches(&mut self) {
-        self.member_value_cells
-            .fill(crate::ir::MemberValueCell::empty());
+        for cell in self.roots.member_value_cells.iter() {
+            cell.set(crate::ir::MemberValueCell::empty());
+        }
         for cell in self.roots.array_element_value_cells.iter() {
             cell.set(None);
         }

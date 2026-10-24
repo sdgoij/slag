@@ -1866,13 +1866,13 @@ extern "C" fn get_member_map_slot(ctx: *mut c_void, object: u64, name: u64, slot
     if let Some(obj) = object.as_object()
         && let Some(value) = obj.map_field(slot as usize)
     {
-        agent.member_value_cells[(obj.id() as usize ^ name as usize) & (MEMBER_CELLS - 1)] =
-            MemberValueCell {
+        agent.roots.member_value_cells[(obj.id() as usize ^ name as usize) & (MEMBER_CELLS - 1)]
+            .set(MemberValueCell {
                 id: obj.id(),
                 name,
                 generation: obj.generation(),
                 value,
-            };
+            });
         return value.bits();
     }
     match vm.get_member_name(agent, object, name) {
@@ -3651,13 +3651,13 @@ extern "C" fn set_member_slot(ctx: *mut c_void, object: u64, name: u64, value: u
     if let Some(obj) = object.as_object()
         && obj.write_data_property(&key, value)
     {
-        agent.member_value_cells[(obj.id() as usize ^ name as usize) & (MEMBER_CELLS - 1)] =
-            MemberValueCell {
+        agent.roots.member_value_cells[(obj.id() as usize ^ name as usize) & (MEMBER_CELLS - 1)]
+            .set(MemberValueCell {
                 id: obj.id(),
                 name,
                 generation: obj.generation(),
                 value,
-            };
+            });
         // A GLOBAL object is additionally read through the name-keyed
         // global-value cell, which validates by this same generation — the one
         // thing this in-place store deliberately does not bump (see
@@ -7109,9 +7109,9 @@ pub(crate) fn run_jit_body(
         agent: agent as *mut Agent,
         vm: vm as *mut Vm,
         global_object: global.as_ptr() as *mut c_void,
-        global_value_cells: agent.global_value_cells.as_ptr() as *mut c_void,
-        member_value_cells: agent.member_value_cells.as_ptr() as *mut c_void,
-        computed_read_cells: agent.computed_read_cells.as_ptr() as *mut c_void,
+        global_value_cells: agent.roots.global_value_cell_base(),
+        member_value_cells: agent.roots.member_value_cell_base(),
+        computed_read_cells: agent.roots.computed_read_cell_base(),
         member_map_cells: agent.member_map_cells.as_ptr() as *mut c_void,
         member_chain_cells: agent.member_chain_map_cells.as_mut_ptr() as *mut c_void,
         globals_unshadowed,
@@ -7387,9 +7387,9 @@ pub(crate) fn run_jit_resume(
         agent: agent as *mut Agent,
         vm: vm as *mut Vm,
         global_object: global.as_ptr() as *mut c_void,
-        global_value_cells: agent.global_value_cells.as_ptr() as *mut c_void,
-        member_value_cells: agent.member_value_cells.as_ptr() as *mut c_void,
-        computed_read_cells: agent.computed_read_cells.as_ptr() as *mut c_void,
+        global_value_cells: agent.roots.global_value_cell_base(),
+        member_value_cells: agent.roots.member_value_cell_base(),
+        computed_read_cells: agent.roots.computed_read_cell_base(),
         member_map_cells: agent.member_map_cells.as_ptr() as *mut c_void,
         member_chain_cells: agent.member_chain_map_cells.as_mut_ptr() as *mut c_void,
         globals_unshadowed,
@@ -8046,7 +8046,7 @@ mod tests {
         agent
             .run_script("let K = 3; function read() { return K; } read();")
             .unwrap();
-        let warmed = agent.global_value_cells[index];
+        let warmed = agent.roots.global_value_cells[index].get();
         assert_eq!(warmed.name, name, "the declarative read warmed the cell");
         assert_eq!(warmed.value.as_number(), Some(3.0));
         assert_eq!(
@@ -8061,7 +8061,7 @@ mod tests {
         // A write to the binding must move the generation the cell captured, or
         // a compiled read would keep serving the pre-write value.
         agent.run_script("K = 4; read();").unwrap();
-        let refreshed = agent.global_value_cells[index];
+        let refreshed = agent.roots.global_value_cells[index].get();
         assert_eq!(
             refreshed.value.as_number(),
             Some(4.0),
@@ -8134,7 +8134,7 @@ mod tests {
             )
             .unwrap();
         assert!(value.as_number().is_some(), "the nested loop ran");
-        let cell = agent.global_value_cells[index];
+        let cell = agent.roots.global_value_cells[index].get();
         assert_eq!(
             cell.name, name,
             "the nested read warmed the global-value cell"

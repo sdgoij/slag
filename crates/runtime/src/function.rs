@@ -3427,7 +3427,7 @@ pub(crate) fn construct_this_object(
         let id = object.id();
         let name = prototype_atom();
         let index = (id as usize ^ name as usize) & (crate::ir::MEMBER_CELLS - 1);
-        let cell = &agent.member_value_cells[index];
+        let cell = agent.roots.member_value_cells[index].get();
         if cell.id == id && cell.name == name && cell.generation == object.generation() {
             cell.value
         } else {
@@ -3452,12 +3452,12 @@ pub(crate) fn construct_this_object(
                 None => false,
             };
             if own_data {
-                agent.member_value_cells[index] = crate::ir::MemberValueCell {
+                agent.roots.member_value_cells[index].set(crate::ir::MemberValueCell {
                     id,
                     name,
                     generation: object.generation(),
                     value,
-                };
+                });
             }
             value
         }

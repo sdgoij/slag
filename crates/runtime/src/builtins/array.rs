@@ -463,7 +463,7 @@ fn array_species_fast_probe(agent: &mut Agent, array_proto: &crux::object::JsObj
     if verdict.array_ctor_object.1 != array_ctor.object.generation() {
         return false;
     }
-    let vcell = &agent.member_value_cells[verdict.ctor_vindex];
+    let vcell = agent.roots.member_value_cells[verdict.ctor_vindex].get();
     vcell.id == array_proto.id()
         && vcell.name == species_ctor_atom()
         && vcell.generation == array_proto.generation()
@@ -515,12 +515,12 @@ fn array_species_fast_resolve(
     // (compiled member store) is caught by the probe's value compare.
     let ctor_vindex =
         (array_proto.id() as usize ^ ctor_atom as usize) & (crate::ir::MEMBER_CELLS - 1);
-    agent.member_value_cells[ctor_vindex] = crate::ir::MemberValueCell {
+    agent.roots.member_value_cells[ctor_vindex].set(crate::ir::MemberValueCell {
         id: array_proto.id(),
         name: ctor_atom,
         generation: array_proto.generation(),
         value: constructor_value,
-    };
+    });
     agent.roots.species_fast_cells[index].set(Some(crate::agent::ArraySpeciesVerdict {
         array_proto: (array_proto.id(), array_proto.generation()),
         array_ctor_object: (array_ctor.object.id(), array_ctor.object.generation()),

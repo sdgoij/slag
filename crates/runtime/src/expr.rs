@@ -2311,7 +2311,7 @@ fn for_of_fast_probe(agent: &mut Agent, array_proto: &crux::object::JsObject) ->
     {
         return false;
     }
-    let vcell = &agent.member_value_cells[verdict.aip_next_vindex];
+    let vcell = agent.roots.member_value_cells[verdict.aip_next_vindex].get();
     vcell.id == verdict.aip_handle.id()
         && vcell.name == for_of_next_atom()
         && vcell.generation == verdict.aip_handle.generation()
@@ -2368,12 +2368,12 @@ fn for_of_fast_resolve(
     };
     let next_atom = for_of_next_atom();
     let aip_next_vindex = (aip.id() as usize ^ next_atom as usize) & (crate::ir::MEMBER_CELLS - 1);
-    agent.member_value_cells[aip_next_vindex] = crate::ir::MemberValueCell {
+    agent.roots.member_value_cells[aip_next_vindex].set(crate::ir::MemberValueCell {
         id: aip.id(),
         name: next_atom,
         generation: aip.generation(),
         value: next_stock,
-    };
+    });
     agent.roots.for_of_fast_cells[index].set(Some(crate::agent::ForOfFastVerdict {
         array_proto: (array_proto.id(), array_proto.generation()),
         aip: (aip.id(), aip.generation()),

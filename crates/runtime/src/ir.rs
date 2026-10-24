@@ -2850,7 +2850,7 @@ pub(crate) type MemberStoreCell = (u64, crux::AtomId, u32, [u32; 4]);
 /// fields so the compiled `GetMemberName` probe reads them at fixed
 /// offsets (`offset_of!`).
 #[repr(C)]
-#[derive(Clone)]
+#[derive(Clone, Copy)]
 pub struct MemberValueCell {
     pub id: u64,
     pub name: crux::AtomId,
@@ -2907,7 +2907,7 @@ pub const COMPUTED_READ_INDEX_SHIFT: u32 = 40;
 /// compiled probe reads it at fixed offsets; the key box is traced so its
 /// identity stays live.
 #[repr(C)]
-#[derive(Clone)]
+#[derive(Clone, Copy)]
 pub struct ComputedReadCell {
     pub key: Value,
     pub atom: crux::AtomId,
@@ -4949,14 +4949,16 @@ impl Vm {
         global: &Handle<crux::object::JsObject>,
         slot: Option<usize>,
     ) {
-        agent.global_value_cells[Self::global_cell_index(name)] = crate::jit::GlobalValueCell {
-            name,
-            global_id: global.id(),
-            generation: global.generation(),
-            slot: slot.map(|s| s as u32).unwrap_or(u32::MAX),
-            declarative: 0,
-            value,
-        };
+        agent.roots.global_value_cells[Self::global_cell_index(name)].set(
+            crate::jit::GlobalValueCell {
+                name,
+                global_id: global.id(),
+                generation: global.generation(),
+                slot: slot.map(|s| s as u32).unwrap_or(u32::MAX),
+                declarative: 0,
+                value,
+            },
+        );
     }
 
     /// Record a declarative binding's cell: `slot` is the index into the
@@ -4970,14 +4972,16 @@ impl Vm {
         global: &Handle<crux::object::JsObject>,
         index: usize,
     ) {
-        agent.global_value_cells[Self::global_cell_index(name)] = crate::jit::GlobalValueCell {
-            name,
-            global_id: global.id(),
-            generation: global.generation(),
-            slot: index as u32,
-            declarative: 1,
-            value,
-        };
+        agent.roots.global_value_cells[Self::global_cell_index(name)].set(
+            crate::jit::GlobalValueCell {
+                name,
+                global_id: global.id(),
+                generation: global.generation(),
+                slot: index as u32,
+                declarative: 1,
+                value,
+            },
+        );
     }
 
     /// Best-effort warm of the JIT's global-value cell after an identifier
@@ -5027,7 +5031,7 @@ impl Vm {
     /// is exactly the value the env walk would produce; `None` falls back to
     /// the full resolve.
     fn try_global_cell_read(&mut self, agent: &mut Agent, name: crux::AtomId) -> Option<Value> {
-        let cell = agent.global_value_cells[Self::global_cell_index(name)];
+        let cell = agent.roots.global_value_cells[Self::global_cell_index(name)].get();
         if cell.name != name {
             return None;
         }
@@ -5222,7 +5226,7 @@ impl Vm {
         name: crux::AtomId,
         value: Value,
     ) -> Result<bool, JsError> {
-        let cell = agent.global_value_cells[Self::global_cell_index(name)];
+        let cell = agent.roots.global_value_cells[Self::global_cell_index(name)].get();
         if cell.name != name || cell.declarative != 0 || cell.slot == u32::MAX {
             return Ok(false);
         }
@@ -5263,7 +5267,7 @@ impl Vm {
         name: crux::AtomId,
         value: Value,
     ) -> Result<bool, JsError> {
-        let cell = agent.global_value_cells[Self::global_cell_index(name)];
+        let cell = agent.roots.global_value_cells[Self::global_cell_index(name)].get();
         if cell.name != name || cell.declarative == 0 {
             return Ok(false);
         }
@@ -5394,12 +5398,14 @@ impl Vm {
         name: crux::AtomId,
         value: Value,
     ) {
-        agent.member_value_cells[Self::member_cell_index(object_id, name)] = MemberValueCell {
-            id: object_id,
-            name,
-            generation,
-            value,
-        };
+        agent.roots.member_value_cells[Self::member_cell_index(object_id, name)].set(
+            MemberValueCell {
+                id: object_id,
+                name,
+                generation,
+                value,
+            },
+        );
     }
 
     /// The direct-mapped cache index for the L1a store cells (a larger
@@ -5571,13 +5577,14 @@ impl Vm {
             // own data property like the slot path's, so the compiled
             // `GetMemberName` probe (id + name + generation validation)
             // serves the next read as a native load.
-            agent.member_value_cells[Self::member_cell_index(object.id(), name)] =
+            agent.roots.member_value_cells[Self::member_cell_index(object.id(), name)].set(
                 MemberValueCell {
                     id: object.id(),
                     name,
                     generation: object.generation(),
                     value,
-                };
+                },
+            );
             return Some(value);
         }
         // Cache miss (a cold shape or an evicted entry): resolve through the
@@ -5607,12 +5614,14 @@ impl Vm {
             writable: u32::from(writable),
             count: map.descriptor_count() as u32,
         };
-        agent.member_value_cells[Self::member_cell_index(object.id(), name)] = MemberValueCell {
-            id: object.id(),
-            name,
-            generation: object.generation(),
-            value,
-        };
+        agent.roots.member_value_cells[Self::member_cell_index(object.id(), name)].set(
+            MemberValueCell {
+                id: object.id(),
+                name,
+                generation: object.generation(),
+                value,
+            },
+        );
         Some(value)
     }
 
@@ -5633,7 +5642,7 @@ impl Vm {
         name: crux::AtomId,
     ) -> Option<Value> {
         let index = Self::member_cell_index(object.id(), name);
-        let cell = &agent.member_value_cells[index];
+        let cell = agent.roots.member_value_cells[index].get();
         if cell.id == object.id() && cell.name == name && cell.generation == object.generation() {
             return Some(cell.value);
         }
@@ -5699,12 +5708,12 @@ impl Vm {
         match &property.kind {
             crux::object::PropertyKind::Data { value, .. } => {
                 let value = *value;
-                agent.member_value_cells[index] = MemberValueCell {
+                agent.roots.member_value_cells[index].set(MemberValueCell {
                     id: object.id(),
                     name,
                     generation: object.generation(),
                     value,
-                };
+                });
                 Some(value)
             }
             _ => None,
@@ -5818,7 +5827,7 @@ impl Vm {
         // vector slot directly — the slot is stable while the link's
         // generation is unchanged, which the walk just validated.
         let vindex = Self::member_cell_index(found_link.id(), name);
-        let vcell = &agent.member_value_cells[vindex];
+        let vcell = agent.roots.member_value_cells[vindex].get();
         if vcell.id == found_link.id()
             && vcell.name == name
             && vcell.generation == found_link.generation()
@@ -5843,12 +5852,12 @@ impl Vm {
         // (`Agent::clear_derived_caches`), and without this the compiled
         // chain probe would miss on every iteration for the rest of the run
         // (the helper serves the read but never re-fronts the cell).
-        agent.member_value_cells[vindex] = MemberValueCell {
+        agent.roots.member_value_cells[vindex].set(MemberValueCell {
             id: found_link.id(),
             name,
             generation: found_link.generation(),
             value,
-        };
+        });
         Some(value)
     }
 
@@ -5973,12 +5982,12 @@ impl Vm {
                         // it must be warm for the next hit to skip the
                         // vector read.
                         let vindex = Self::member_cell_index(current.id(), name);
-                        agent.member_value_cells[vindex] = MemberValueCell {
+                        agent.roots.member_value_cells[vindex].set(MemberValueCell {
                             id: current.id(),
                             name,
                             generation: current.generation(),
                             value,
-                        };
+                        });
                         return;
                     }
                     Some(_) => return,
@@ -6220,12 +6229,12 @@ impl Vm {
             // so the next `member_cell_get` returns it with no
             // property-vector borrow or proto-keyed fallback.
             let index = Self::member_cell_index(receiver.id(), *atom);
-            agent.member_value_cells[index] = MemberValueCell {
+            agent.roots.member_value_cells[index].set(MemberValueCell {
                 id: receiver.id(),
                 name: *atom,
                 generation: receiver.generation(),
                 value: *value,
-            };
+            });
         }
         Ok(ok)
     }
@@ -6245,12 +6254,12 @@ impl Vm {
             {
                 let index = Self::member_cell_index(object.id(), name);
                 agent.member_cells[index] = Some((object.id(), name, slot));
-                agent.member_value_cells[index] = MemberValueCell {
+                agent.roots.member_value_cells[index].set(MemberValueCell {
                     id: object.id(),
                     name,
                     generation: object.generation(),
                     value: *value,
-                };
+                });
                 // Cut 23: cache the slot for the prototype too — fresh
                 // instances of the same shape hit the proto-keyed fallback
                 // in `member_cell_get` (validated per access).
@@ -6311,9 +6320,11 @@ impl Vm {
         name: crux::AtomId,
         value: Value,
     ) {
-        let cell = &mut agent.global_value_cells[name as usize & (GLOBAL_CELLS - 1)];
+        let index = name as usize & (GLOBAL_CELLS - 1);
+        let cell = agent.roots.global_value_cells[index].get();
         if cell.name == name && cell.global_id == object.id() {
-            cell.value = value;
+            agent.roots.global_value_cells[index]
+                .set(crate::jit::GlobalValueCell { value, ..cell });
         }
     }
 
@@ -6381,12 +6392,12 @@ impl Vm {
         // compiled probe and every read path mask by MEMBER_CELLS - 1); only
         // the store-cell probe/record use the larger write table.
         let read_index = Self::member_cell_index(object.id(), name);
-        agent.member_value_cells[read_index] = MemberValueCell {
+        agent.roots.member_value_cells[read_index].set(MemberValueCell {
             id: object.id(),
             name,
             generation,
             value,
-        };
+        });
         Self::refresh_global_read_cell(agent, &object, name, value);
         true
     }
@@ -6434,12 +6445,12 @@ impl Vm {
         // hit without a vector access.
         let generation = object.generation();
         let read_index = Self::member_cell_index(object.id(), name);
-        agent.member_value_cells[read_index] = MemberValueCell {
+        agent.roots.member_value_cells[read_index].set(MemberValueCell {
             id: object.id(),
             name,
             generation,
             value,
-        };
+        });
         Self::refresh_global_read_cell(agent, object, name, value);
         // Re-key the (id, name) cell for this object too, so the next store
         // to the SAME instance takes the cheaper identity probe (the value
@@ -6481,12 +6492,12 @@ impl Vm {
             if object.deferred_field_write(&key, value) {
                 let generation = object.generation();
                 let read_index = Self::member_cell_index(object.id(), name);
-                agent.member_value_cells[read_index] = MemberValueCell {
+                agent.roots.member_value_cells[read_index].set(MemberValueCell {
                     id: object.id(),
                     name,
                     generation,
                     value,
-                };
+                });
                 // Warm the compiled store's map-keyed shape cell too: a hit
                 // routes the next write through the inline deferred field
                 // update instead of the helper. A map id pins the descriptor
@@ -6566,12 +6577,12 @@ impl Vm {
         // hit (valid at the unchanged generation).
         let generation = object.generation();
         let read_index = Self::member_cell_index(object.id(), name);
-        agent.member_value_cells[read_index] = MemberValueCell {
+        agent.roots.member_value_cells[read_index].set(MemberValueCell {
             id: object.id(),
             name,
             generation,
             value,
-        };
+        });
         Self::refresh_global_read_cell(agent, object, name, value);
         let write_index = Self::member_write_cell_index(object.id(), name);
         agent.member_write_cells[write_index] = Some(MemberWriteCell {
@@ -6691,12 +6702,12 @@ impl Vm {
         }
         // The read-side value cell keeps the SMALL table's index.
         let read_index = Self::member_cell_index(object.id(), name);
-        agent.member_value_cells[read_index] = MemberValueCell {
+        agent.roots.member_value_cells[read_index].set(MemberValueCell {
             id: object.id(),
             name,
             generation,
             value,
-        };
+        });
     }
 
     /// The cached read of `object[index]` — an own data element of a plain
@@ -11666,7 +11677,7 @@ impl Vm {
             return None;
         }
         let index = Self::member_cell_index(proto.id(), name);
-        let cell = &agent.member_value_cells[index];
+        let cell = agent.roots.member_value_cells[index].get();
         if cell.id == proto.id() && cell.name == name && cell.generation == proto.generation() {
             return Some(cell.value);
         }
@@ -11683,12 +11694,12 @@ impl Vm {
             return None;
         };
         let value = *value;
-        agent.member_value_cells[index] = MemberValueCell {
+        agent.roots.member_value_cells[index].set(MemberValueCell {
             id: proto.id(),
             name,
             generation: proto.generation(),
             value,
-        };
+        });
         Some(value)
     }
 
@@ -11857,8 +11868,10 @@ impl Vm {
     /// is needed (unlike a value cell).
     fn computed_read_atom_get(agent: &Agent, key: &Value) -> Option<crux::AtomId> {
         let cell = agent
+            .roots
             .computed_read_cells
-            .get(computed_read_cell_index(key.bits()))?;
+            .get(computed_read_cell_index(key.bits()))?
+            .get();
         if cell.key.bits() == key.bits() {
             return Some(cell.atom);
         }
@@ -11870,8 +11883,8 @@ impl Vm {
     /// stale).
     fn computed_read_atom_put(agent: &mut Agent, key: &Value, atom: crux::AtomId) {
         let index = computed_read_cell_index(key.bits());
-        if let Some(cell) = agent.computed_read_cells.get_mut(index) {
-            *cell = ComputedReadCell { key: *key, atom };
+        if let Some(cell) = agent.roots.computed_read_cells.get(index) {
+            cell.set(ComputedReadCell { key: *key, atom });
         }
     }
 
@@ -15026,9 +15039,9 @@ impl Vm {
             vm: self as *mut Vm,
             global_object: global.as_ptr() as *mut std::os::raw::c_void,
             global_bits: Value::Object(global).bits(),
-            global_value_cells: agent.global_value_cells.as_ptr() as *mut std::os::raw::c_void,
-            member_value_cells: agent.member_value_cells.as_ptr() as *mut std::os::raw::c_void,
-            computed_read_cells: agent.computed_read_cells.as_ptr() as *mut std::os::raw::c_void,
+            global_value_cells: agent.roots.global_value_cell_base(),
+            member_value_cells: agent.roots.member_value_cell_base(),
+            computed_read_cells: agent.roots.computed_read_cell_base(),
             member_map_cells: agent.member_map_cells.as_ptr() as *mut std::os::raw::c_void,
             member_chain_cells: agent.member_chain_map_cells.as_mut_ptr()
                 as *mut std::os::raw::c_void,
@@ -31602,7 +31615,7 @@ mod tests {
         let served = Vm::member_chain_get(&mut agent, &value, name)
             .expect("the map-keyed chain cell serves a fresh array's method read");
         assert_eq!(served, push_fn, "the chain hit re-reads the recorded slot");
-        let vcell = &agent.member_value_cells[Vm::member_cell_index(proto.id(), name)];
+        let vcell = agent.roots.member_value_cells[Vm::member_cell_index(proto.id(), name)].get();
         assert_eq!(
             (vcell.id, vcell.name, vcell.generation),
             (proto.id(), name, proto.generation()),
