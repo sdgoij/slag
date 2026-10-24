@@ -771,6 +771,38 @@ pub(crate) struct AgentRoots {
     /// leaf call skips the `ecma_functions` HashMap lookup. Boxed per the
     /// Cut 27 lesson.
     pub(crate) leaf_cache: RefCell<Box<[LeafCacheCell; crate::ir::LEAF_CACHE]>>,
+    /// The wasm JS-API wrapper tables (Cut 10). Their values are heap edges,
+    /// so they are roots: an untraced `Value` here is freed, its object id
+    /// reused, and a later lookup returns the wrong object (e.g.
+    /// `Instance.exports` yielding a Promise). The index-only wasm tables
+    /// (`wasm_exports`, `wasm_memories`, `wasm_tables`, `wasm_globals`,
+    /// `wasm_tags`, and the engine store) stay on the agent: they hold object
+    /// ids and store cells, which the collector never reads.
+    #[cfg(feature = "wasm")]
+    pub(crate) wasm_streaming_handlers: RefCell<
+        std::collections::HashMap<u64, std::rc::Rc<crate::builtins::wasm::StreamingHandler>>,
+    >,
+    #[cfg(feature = "wasm")]
+    pub(crate) wasm_instance_exports: RefCell<std::collections::HashMap<u64, Value>>,
+    #[cfg(feature = "wasm")]
+    pub(crate) wasm_func_objects: RefCell<std::collections::HashMap<wasm::FuncKey, Value>>,
+    #[cfg(feature = "wasm")]
+    pub(crate) wasm_memory_objects: RefCell<std::collections::HashMap<usize, Value>>,
+    #[cfg(feature = "wasm")]
+    pub(crate) wasm_memory_buffers: RefCell<std::collections::HashMap<usize, Value>>,
+    #[cfg(feature = "wasm")]
+    pub(crate) wasm_table_objects: RefCell<std::collections::HashMap<usize, Value>>,
+    #[cfg(feature = "wasm")]
+    pub(crate) wasm_global_objects: RefCell<std::collections::HashMap<usize, Value>>,
+    #[cfg(feature = "wasm")]
+    pub(crate) wasm_host_functions:
+        RefCell<std::collections::HashMap<u64, (Value, wasm::types::FuncType)>>,
+    #[cfg(feature = "wasm")]
+    pub(crate) wasm_tag_objects: RefCell<std::collections::HashMap<usize, Value>>,
+    #[cfg(feature = "wasm")]
+    pub(crate) wasm_js_exceptions: RefCell<std::collections::HashMap<usize, Value>>,
+    #[cfg(feature = "wasm")]
+    pub(crate) wasm_extern_values: RefCell<std::collections::HashMap<u32, Value>>,
     /// The internal state of ArrayBuffer/SharedArrayBuffer objects, keyed by
     /// object identity (spec 25.1.1: [[ArrayBufferData]],
     /// [[ArrayBufferByteLength]], [[ArrayBufferMaxByteLength]], and the
@@ -948,6 +980,28 @@ impl AgentRoots {
             global_leaf_cells: RefCell::new(Box::new(std::array::from_fn(|_| None))),
             slot_leaf_cells: RefCell::new(Box::new(std::array::from_fn(|_| None))),
             leaf_cache: RefCell::new(Box::new(std::array::from_fn(|_| None))),
+            #[cfg(feature = "wasm")]
+            wasm_streaming_handlers: RefCell::new(std::collections::HashMap::new()),
+            #[cfg(feature = "wasm")]
+            wasm_instance_exports: RefCell::new(std::collections::HashMap::new()),
+            #[cfg(feature = "wasm")]
+            wasm_func_objects: RefCell::new(std::collections::HashMap::new()),
+            #[cfg(feature = "wasm")]
+            wasm_memory_objects: RefCell::new(std::collections::HashMap::new()),
+            #[cfg(feature = "wasm")]
+            wasm_memory_buffers: RefCell::new(std::collections::HashMap::new()),
+            #[cfg(feature = "wasm")]
+            wasm_table_objects: RefCell::new(std::collections::HashMap::new()),
+            #[cfg(feature = "wasm")]
+            wasm_global_objects: RefCell::new(std::collections::HashMap::new()),
+            #[cfg(feature = "wasm")]
+            wasm_host_functions: RefCell::new(std::collections::HashMap::new()),
+            #[cfg(feature = "wasm")]
+            wasm_tag_objects: RefCell::new(std::collections::HashMap::new()),
+            #[cfg(feature = "wasm")]
+            wasm_js_exceptions: RefCell::new(std::collections::HashMap::new()),
+            #[cfg(feature = "wasm")]
+            wasm_extern_values: RefCell::new(std::collections::HashMap::new()),
             construct_maps: Box::new(std::array::from_fn(|_| Cell::new(None))),
             function_boilerplate_maps: std::array::from_fn(|_| Cell::new(None)),
             intl_number_format_data: RefCell::new(IdMap::default()),
@@ -1116,6 +1170,40 @@ impl Trace for AgentRoots {
         }
         for (_, entry) in self.leaf_cache.borrow().iter().flatten() {
             entry.trace(visit);
+        }
+        #[cfg(feature = "wasm")]
+        {
+            self.wasm_streaming_handlers.borrow().trace(visit);
+            for value in self.wasm_instance_exports.borrow().values() {
+                value.trace(visit);
+            }
+            for value in self.wasm_func_objects.borrow().values() {
+                value.trace(visit);
+            }
+            for value in self.wasm_memory_objects.borrow().values() {
+                value.trace(visit);
+            }
+            for value in self.wasm_memory_buffers.borrow().values() {
+                value.trace(visit);
+            }
+            for value in self.wasm_table_objects.borrow().values() {
+                value.trace(visit);
+            }
+            for value in self.wasm_global_objects.borrow().values() {
+                value.trace(visit);
+            }
+            for (_, (value, _)) in self.wasm_host_functions.borrow().iter() {
+                value.trace(visit);
+            }
+            for value in self.wasm_tag_objects.borrow().values() {
+                value.trace(visit);
+            }
+            for value in self.wasm_js_exceptions.borrow().values() {
+                value.trace(visit);
+            }
+            for value in self.wasm_extern_values.borrow().values() {
+                value.trace(visit);
+            }
         }
         // B5.4: the cached constructor boilerplate maps keep the shapes alive.
         for cell in self.construct_maps.iter() {
@@ -1526,9 +1614,6 @@ pub struct Agent {
     /// data of its own, so the stream it settles is found here. An entry is
     /// consumed when the handler runs, which is why the stream roots its own
     /// values (see `api::WasmStreaming`).
-    #[cfg(feature = "wasm")]
-    pub wasm_streaming_handlers:
-        std::collections::HashMap<u64, std::rc::Rc<crate::builtins::wasm::StreamingHandler>>,
     /// The `disposeAsync` continuations, keyed by function identity: the
     /// driver id and whether the awaited disposal promise rejected.
     pub disposable_async_cont: std::collections::HashMap<u64, (u64, bool)>,
@@ -1620,54 +1705,18 @@ pub struct Agent {
     /// Exported-function wrappers: function id -> engine (instance, index).
     #[cfg(feature = "wasm")]
     pub wasm_exports: std::collections::HashMap<u64, (usize, usize)>,
-    /// The prebuilt `exports` object of each Instance, keyed by instance
-    /// object identity (read by the `exports` accessor).
-    #[cfg(feature = "wasm")]
-    pub wasm_instance_exports: std::collections::HashMap<u64, Value>,
-    /// One JS wrapper per engine function, keyed by the function's canonical
-    /// engine identity ([`wasm::FuncKey`]), so a function surfaced through
-    /// several exports, table slots, or import/re-export chains keeps object
-    /// identity (JS-API [[FuncObj]] memoization; Cut 10 wave 3b).
-    #[cfg(feature = "wasm")]
-    pub wasm_func_objects: std::collections::HashMap<wasm::FuncKey, Value>,
     /// The memory-cell registry of `WebAssembly.Memory` wrapper objects:
     /// wrapper object id -> engine store cell (Cut 10 wave 3b).
     #[cfg(feature = "wasm")]
     pub wasm_memories: std::collections::HashMap<u64, usize>,
-    /// One `WebAssembly.Memory` wrapper per engine memory cell, memoized so a
-    /// memory surfaced through a constructor, an import, or several exports
-    /// keeps object identity (JS-API [[Memory]] memoization).
-    #[cfg(feature = "wasm")]
-    pub wasm_memory_objects: std::collections::HashMap<usize, Value>,
-    /// The live ArrayBuffer of each engine memory cell that has materialized
-    /// one: cell -> buffer. `Memory.prototype.buffer` returns the same object
-    /// until a grow detaches it, and the cell's bytes are bridged into it at
-    /// every JS<->wasm call boundary.
-    #[cfg(feature = "wasm")]
-    pub wasm_memory_buffers: std::collections::HashMap<usize, Value>,
     /// The table-cell registry of `WebAssembly.Table` wrapper objects: wrapper
     /// object id -> engine store cell (Cut 10 wave 3b).
     #[cfg(feature = "wasm")]
     pub wasm_tables: std::collections::HashMap<u64, usize>,
-    /// One `WebAssembly.Table` wrapper per engine table cell, memoized so a
-    /// table surfaced through a constructor, an import, or several exports
-    /// keeps object identity (JS-API [[Table]] memoization).
-    #[cfg(feature = "wasm")]
-    pub wasm_table_objects: std::collections::HashMap<usize, Value>,
     /// The global-cell registry of `WebAssembly.Global` wrapper objects:
     /// wrapper object id -> engine store cell (Cut 10 wave 3b).
     #[cfg(feature = "wasm")]
     pub wasm_globals: std::collections::HashMap<u64, usize>,
-    /// One `WebAssembly.Global` wrapper per engine global cell, memoized so a
-    /// global surfaced through a constructor, an import, or several exports
-    /// keeps object identity (JS-API [[Global]] memoization).
-    #[cfg(feature = "wasm")]
-    pub wasm_global_objects: std::collections::HashMap<usize, Value>,
-    /// The JS functions backing the agent's *external* engine host functions
-    /// (raw JS closures imported into a module), keyed by the token handed to
-    /// `Store::external_host`, with the function type the engine matched.
-    #[cfg(feature = "wasm")]
-    pub wasm_host_functions: std::collections::HashMap<u64, (Value, wasm::types::FuncType)>,
     /// The next external-host token (monotonic within the agent).
     #[cfg(feature = "wasm")]
     pub wasm_host_seq: u64,
@@ -1675,11 +1724,6 @@ pub struct Agent {
     /// object id -> engine store cell (Cut 10 wave 4).
     #[cfg(feature = "wasm")]
     pub wasm_tags: std::collections::HashMap<u64, usize>,
-    /// One `WebAssembly.Tag` wrapper per engine tag cell, memoized so a tag
-    /// surfaced through a constructor, an import, or several exports keeps
-    /// object identity (Cut 10 wave 4).
-    #[cfg(feature = "wasm")]
-    pub wasm_tag_objects: std::collections::HashMap<usize, Value>,
     /// The engine tag cell behind `WebAssembly.JSTag` (the tag arbitrary JS
     /// exception values enter wasm with), once materialized: JS throws wrap
     /// in it, a wasm `catch` for it intercepts them, and an escape unwraps
@@ -1691,17 +1735,6 @@ pub struct Agent {
     /// wave 4).
     #[cfg(feature = "wasm")]
     pub wasm_exceptions: std::collections::HashMap<u64, (usize, Vec<wasm::Value>)>,
-    /// JS exception values that entered wasm through an imported function and
-    /// escaped uncaught: engine exception id -> the original JS value, so the
-    /// boundary rethrows it with identity preserved (Cut 10 wave 4).
-    #[cfg(feature = "wasm")]
-    pub wasm_js_exceptions: std::collections::HashMap<usize, Value>,
-    /// The JS value behind each wasm *externref* host payload (the JS-API
-    /// represents an externref as an arbitrary JS value — including null and
-    /// undefined, which round-trip distinctly): host token -> the JS value.
-    /// The token is an opaque `ExternInner::Host` payload to the engine.
-    #[cfg(feature = "wasm")]
-    pub wasm_extern_values: std::collections::HashMap<u32, Value>,
     /// The next externref host token (monotonic within the agent).
     #[cfg(feature = "wasm")]
     pub wasm_extern_seq: u32,
@@ -1954,8 +1987,6 @@ impl Agent {
             ],
             build_roots: std::cell::Cell::new(false),
             module_async_evaluation_count: 0,
-            #[cfg(feature = "wasm")]
-            wasm_streaming_handlers: std::collections::HashMap::new(),
             disposable_async_cont: std::collections::HashMap::new(),
             async_body_disposal_cont: std::collections::HashMap::new(),
             builtin_dispatch_cache: std::collections::HashMap::default(),
@@ -1984,39 +2015,19 @@ impl Agent {
             #[cfg(feature = "wasm")]
             wasm_exports: std::collections::HashMap::new(),
             #[cfg(feature = "wasm")]
-            wasm_instance_exports: std::collections::HashMap::new(),
-            #[cfg(feature = "wasm")]
-            wasm_func_objects: std::collections::HashMap::new(),
-            #[cfg(feature = "wasm")]
             wasm_memories: std::collections::HashMap::new(),
-            #[cfg(feature = "wasm")]
-            wasm_memory_objects: std::collections::HashMap::new(),
-            #[cfg(feature = "wasm")]
-            wasm_memory_buffers: std::collections::HashMap::new(),
             #[cfg(feature = "wasm")]
             wasm_tables: std::collections::HashMap::new(),
             #[cfg(feature = "wasm")]
-            wasm_table_objects: std::collections::HashMap::new(),
-            #[cfg(feature = "wasm")]
             wasm_globals: std::collections::HashMap::new(),
-            #[cfg(feature = "wasm")]
-            wasm_global_objects: std::collections::HashMap::new(),
-            #[cfg(feature = "wasm")]
-            wasm_host_functions: std::collections::HashMap::new(),
             #[cfg(feature = "wasm")]
             wasm_host_seq: 0,
             #[cfg(feature = "wasm")]
             wasm_tags: std::collections::HashMap::new(),
             #[cfg(feature = "wasm")]
-            wasm_tag_objects: std::collections::HashMap::new(),
-            #[cfg(feature = "wasm")]
             wasm_js_tag_cell: None,
             #[cfg(feature = "wasm")]
             wasm_exceptions: std::collections::HashMap::new(),
-            #[cfg(feature = "wasm")]
-            wasm_js_exceptions: std::collections::HashMap::new(),
-            #[cfg(feature = "wasm")]
-            wasm_extern_values: std::collections::HashMap::new(),
             #[cfg(feature = "wasm")]
             wasm_extern_seq: 0,
             weak_ref_targets: std::cell::RefCell::new(std::collections::HashMap::new()),
@@ -3035,45 +3046,6 @@ impl Agent {
         }
         for cell in self.global_value_cells.iter() {
             cell.trace(visit);
-        }
-        #[cfg(feature = "wasm")]
-        self.wasm_streaming_handlers.trace(visit);
-        #[cfg(feature = "wasm")]
-        {
-            // The wasm JS-API wrapper tables (Cut 10): their values are heap
-            // edges and must survive a collection (an untraced `Value` here is
-            // freed and its object id reused, so a later lookup returns the wrong
-            // object — e.g. `Instance.exports` yielding a Promise).
-            for value in self.wasm_instance_exports.values() {
-                value.trace(visit);
-            }
-            for value in self.wasm_func_objects.values() {
-                value.trace(visit);
-            }
-            for value in self.wasm_memory_objects.values() {
-                value.trace(visit);
-            }
-            for value in self.wasm_memory_buffers.values() {
-                value.trace(visit);
-            }
-            for value in self.wasm_table_objects.values() {
-                value.trace(visit);
-            }
-            for value in self.wasm_global_objects.values() {
-                value.trace(visit);
-            }
-            for (_, (value, _)) in self.wasm_host_functions.iter() {
-                value.trace(visit);
-            }
-            for value in self.wasm_tag_objects.values() {
-                value.trace(visit);
-            }
-            for value in self.wasm_js_exceptions.values() {
-                value.trace(visit);
-            }
-            for value in self.wasm_extern_values.values() {
-                value.trace(visit);
-            }
         }
         // GC-2: the Vms currently running bodies (their heap-buffered value
         // stacks are invisible to the conservative stack scan). Pooled and

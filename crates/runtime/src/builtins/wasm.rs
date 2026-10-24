@@ -548,7 +548,12 @@ pub fn dispatch_call(
     }
     // The two handlers `WebAssembly.compileStreaming` attached to its source
     // promise, by identity, consumed here because each runs once.
-    if let Some(handler) = agent.wasm_streaming_handlers.remove(&export_id) {
+    let handler = agent
+        .roots
+        .wasm_streaming_handlers
+        .borrow_mut()
+        .remove(&export_id);
+    if let Some(handler) = handler {
         return Some(run_streaming_handler(agent, handler, args));
     }
     let realm = agent.current_realm().ok()?;
@@ -1130,14 +1135,19 @@ fn memory_proto(agent: &Agent) -> Result<Handle<JsObject>, JsError> {
 /// `buffer` accessor, the imports linking, and Instance exports share one
 /// registry.
 fn memory_wrapper(agent: &mut Agent, cell: usize) -> Result<Value, JsError> {
-    if let Some(existing) = agent.wasm_memory_objects.get(&cell) {
-        return Ok(*existing);
+    let existing = agent.roots.wasm_memory_objects.borrow().get(&cell).copied();
+    if let Some(existing) = existing {
+        return Ok(existing);
     }
     let proto = memory_proto(agent)?;
     let object = JsObject::ordinary_object_create(Some(proto));
     agent.wasm_memories.insert(object.id(), cell);
     let value = Value::Object(object);
-    agent.wasm_memory_objects.insert(cell, value);
+    agent
+        .roots
+        .wasm_memory_objects
+        .borrow_mut()
+        .insert(cell, value);
     Ok(value)
 }
 
@@ -1217,7 +1227,11 @@ fn materialize_memory_buffer(agent: &mut Agent, cell: usize) -> Result<Value, Js
     } else {
         array_buffer::array_buffer_from_block(agent, block, byte_length)?
     };
-    agent.wasm_memory_buffers.insert(cell, buffer);
+    agent
+        .roots
+        .wasm_memory_buffers
+        .borrow_mut()
+        .insert(cell, buffer);
     Ok(buffer)
 }
 
@@ -1438,7 +1452,11 @@ fn memory_construct(
     let object = JsObject::ordinary_object_create(proto);
     agent.wasm_memories.insert(object.id(), cell);
     let value = Value::Object(object);
-    agent.wasm_memory_objects.insert(cell, value);
+    agent
+        .roots
+        .wasm_memory_objects
+        .borrow_mut()
+        .insert(cell, value);
     Ok(value)
 }
 
@@ -1448,8 +1466,9 @@ fn memory_construct(
 /// grow returns a fresh view over the same block.
 fn memory_buffer_get(agent: &mut Agent, this: &Value) -> Result<Value, JsError> {
     let cell = memory_cell(agent, this)?;
-    if let Some(buffer) = agent.wasm_memory_buffers.get(&cell) {
-        return Ok(*buffer);
+    let buffer = agent.roots.wasm_memory_buffers.borrow().get(&cell).copied();
+    if let Some(buffer) = buffer {
+        return Ok(buffer);
     }
     materialize_memory_buffer(agent, cell)
 }
@@ -1483,7 +1502,8 @@ fn memory_grow(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value,
             "Unable to grow instance memory".into(),
         )
     })?;
-    if let Some(buffer) = agent.wasm_memory_buffers.get(&cell).copied() {
+    let existing_buffer = agent.roots.wasm_memory_buffers.borrow().get(&cell).copied();
+    if let Some(buffer) = existing_buffer {
         let ValueKind::Object(object) = buffer.kind() else {
             return Err(JsError::new(
                 ErrorKind::TypeError,
@@ -1503,9 +1523,13 @@ fn memory_grow(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value,
                 .ok_or_else(|| JsError::new(ErrorKind::TypeError, "memory cell vanished".into()))?;
             let byte_length = block.byte_length();
             let fresh = shared_memory_buffer(agent, block, byte_length)?;
-            agent.wasm_memory_buffers.insert(cell, fresh);
+            agent
+                .roots
+                .wasm_memory_buffers
+                .borrow_mut()
+                .insert(cell, fresh);
         } else {
-            agent.wasm_memory_buffers.remove(&cell);
+            agent.roots.wasm_memory_buffers.borrow_mut().remove(&cell);
             array_buffer::detach_array_buffer(agent, id);
         }
     }
@@ -1533,7 +1557,9 @@ fn memory_grow(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value,
 /// the new length. A buffer whose length already matches needs nothing.
 fn memory_buffers_reconcile(agent: &mut Agent) -> Result<(), JsError> {
     let live: Vec<(usize, Value)> = agent
+        .roots
         .wasm_memory_buffers
+        .borrow()
         .iter()
         .map(|(&cell, &buffer)| (cell, buffer))
         .collect();
@@ -1554,10 +1580,14 @@ fn memory_buffers_reconcile(agent: &mut Agent) -> Result<(), JsError> {
         }
         if memory_is_shared(agent, cell) {
             let fresh = shared_memory_buffer(agent, block, byte_length)?;
-            agent.wasm_memory_buffers.insert(cell, fresh);
+            agent
+                .roots
+                .wasm_memory_buffers
+                .borrow_mut()
+                .insert(cell, fresh);
         } else {
             array_buffer::detach_array_buffer(agent, id);
-            agent.wasm_memory_buffers.remove(&cell);
+            agent.roots.wasm_memory_buffers.borrow_mut().remove(&cell);
         }
     }
     Ok(())
@@ -1647,7 +1677,11 @@ fn js_tag_cell(agent: &mut Agent) -> Result<usize, JsError> {
         ));
     };
     agent.wasm_tags.insert(object.id(), cell);
-    agent.wasm_tag_objects.insert(cell, tag_value);
+    agent
+        .roots
+        .wasm_tag_objects
+        .borrow_mut()
+        .insert(cell, tag_value);
     agent.wasm_js_tag_cell = Some(cell);
     Ok(cell)
 }
@@ -1665,14 +1699,19 @@ fn resolve_tag_cell(agent: &mut Agent, value: &Value) -> Result<usize, JsError> 
 /// One memoized `WebAssembly.Tag` wrapper per engine tag cell: a tag surfaced
 /// through the constructor, an import, or exports keeps object identity.
 fn tag_wrapper_memo(agent: &mut Agent, cell: usize) -> Result<Value, JsError> {
-    if let Some(existing) = agent.wasm_tag_objects.get(&cell) {
-        return Ok(*existing);
+    let existing = agent.roots.wasm_tag_objects.borrow().get(&cell).copied();
+    if let Some(existing) = existing {
+        return Ok(existing);
     }
     let proto = tag_proto(agent)?;
     let object = JsObject::ordinary_object_create(Some(proto));
     let value = Value::Object(object);
     agent.wasm_tags.insert(object.id(), cell);
-    agent.wasm_tag_objects.insert(cell, value);
+    agent
+        .roots
+        .wasm_tag_objects
+        .borrow_mut()
+        .insert(cell, value);
     Ok(value)
 }
 
@@ -1765,7 +1804,12 @@ fn tag_construct(agent: &mut Agent, args: &[Value], new_target: &Value) -> Resul
     let object = JsObject::ordinary_object_create(proto);
     let value = Value::Object(object);
     agent.wasm_tags.insert(object.id(), cell);
-    agent.wasm_tag_objects.entry(cell).or_insert(value);
+    agent
+        .roots
+        .wasm_tag_objects
+        .borrow_mut()
+        .entry(cell)
+        .or_insert(value);
     Ok(value)
 }
 
@@ -2109,7 +2153,7 @@ fn make_streaming_handler(
         None,
         None,
     )?;
-    agent.wasm_streaming_handlers.insert(
+    agent.roots.wasm_streaming_handlers.borrow_mut().insert(
         function.id(),
         std::rc::Rc::new(StreamingHandler {
             streaming: streaming.clone(),
@@ -2256,27 +2300,37 @@ fn js_string_text(text: &JsString) -> String {
 /// registered (object id -> cell) so the prototype methods, imports, and
 /// Instance exports resolve it.
 fn table_wrapper(agent: &mut Agent, cell: usize) -> Result<Value, JsError> {
-    if let Some(existing) = agent.wasm_table_objects.get(&cell) {
-        return Ok(*existing);
+    let existing = agent.roots.wasm_table_objects.borrow().get(&cell).copied();
+    if let Some(existing) = existing {
+        return Ok(existing);
     }
     let proto = table_proto(agent)?;
     let object = JsObject::ordinary_object_create(Some(proto));
     agent.wasm_tables.insert(object.id(), cell);
     let value = Value::Object(object);
-    agent.wasm_table_objects.insert(cell, value);
+    agent
+        .roots
+        .wasm_table_objects
+        .borrow_mut()
+        .insert(cell, value);
     Ok(value)
 }
 
 /// A fresh `WebAssembly.Global` wrapper over engine cell `cell`.
 fn global_wrapper(agent: &mut Agent, cell: usize) -> Result<Value, JsError> {
-    if let Some(existing) = agent.wasm_global_objects.get(&cell) {
-        return Ok(*existing);
+    let existing = agent.roots.wasm_global_objects.borrow().get(&cell).copied();
+    if let Some(existing) = existing {
+        return Ok(existing);
     }
     let proto = global_proto(agent)?;
     let object = JsObject::ordinary_object_create(Some(proto));
     agent.wasm_globals.insert(object.id(), cell);
     let value = Value::Object(object);
-    agent.wasm_global_objects.insert(cell, value);
+    agent
+        .roots
+        .wasm_global_objects
+        .borrow_mut()
+        .insert(cell, value);
     Ok(value)
 }
 
@@ -2406,7 +2460,11 @@ fn global_construct(
     let object = JsObject::ordinary_object_create(proto);
     agent.wasm_globals.insert(object.id(), cell);
     let value = Value::Object(object);
-    agent.wasm_global_objects.insert(cell, value);
+    agent
+        .roots
+        .wasm_global_objects
+        .borrow_mut()
+        .insert(cell, value);
     Ok(value)
 }
 
@@ -2494,7 +2552,8 @@ fn funcref_to_js(agent: &mut Agent, reference: RefValue) -> Result<Value, JsErro
 /// distinctly), kept alive by the agent — and return the engine reference
 /// (an opaque `ExternInner::Host` payload).
 fn to_externref(agent: &mut Agent, value: Value) -> Result<RefValue, JsError> {
-    if agent.wasm_extern_values.len() >= MAX_EXTERN_VALUES {
+    let extern_count = agent.roots.wasm_extern_values.borrow().len();
+    if extern_count >= MAX_EXTERN_VALUES {
         return Err(JsError::new(
             ErrorKind::RangeError,
             "too many externref values".into(),
@@ -2502,7 +2561,11 @@ fn to_externref(agent: &mut Agent, value: Value) -> Result<RefValue, JsError> {
     }
     let token = agent.wasm_extern_seq;
     agent.wasm_extern_seq = agent.wasm_extern_seq.wrapping_add(1);
-    agent.wasm_extern_values.insert(token, value);
+    agent
+        .roots
+        .wasm_extern_values
+        .borrow_mut()
+        .insert(token, value);
     Ok(RefValue::Extern(ExternInner::Host(token)))
 }
 
@@ -2512,7 +2575,9 @@ fn externref_to_js(agent: &Agent, reference: RefValue) -> Result<Value, JsError>
     match reference {
         RefValue::Null => Ok(Value::Null),
         RefValue::Extern(ExternInner::Host(token)) => agent
+            .roots
             .wasm_extern_values
+            .borrow()
             .get(&token)
             .copied()
             .ok_or_else(|| JsError::new(ErrorKind::TypeError, "unknown externref payload".into())),
@@ -2631,7 +2696,11 @@ fn table_construct(
     let object = JsObject::ordinary_object_create(proto);
     agent.wasm_tables.insert(object.id(), cell);
     let value = Value::Object(object);
-    agent.wasm_table_objects.insert(cell, value);
+    agent
+        .roots
+        .wasm_table_objects
+        .borrow_mut()
+        .insert(cell, value);
     Ok(value)
 }
 
@@ -2929,7 +2998,9 @@ fn instantiate_module(
     exports.prevent_extensions()?;
     let exports_value = Value::Object(exports);
     agent
+        .roots
         .wasm_instance_exports
+        .borrow_mut()
         .insert(object.id(), exports_value);
 
     Ok(Value::Object(object))
@@ -2947,7 +3018,9 @@ fn instance_exports(agent: &Agent, this: &Value) -> Result<Value, JsError> {
         return Err(error());
     };
     agent
+        .roots
         .wasm_instance_exports
+        .borrow()
         .get(&object.id())
         .copied()
         .ok_or_else(error)
@@ -2977,8 +3050,9 @@ fn function_wrapper(
         .borrow()
         .func_key(instance, index)
         .ok_or_else(|| JsError::new(ErrorKind::TypeError, "unknown wasm function".into()))?;
-    if let Some(existing) = agent.wasm_func_objects.get(&key) {
-        return Ok(*existing);
+    let existing = agent.roots.wasm_func_objects.borrow().get(&key).copied();
+    if let Some(existing) = existing {
+        return Ok(existing);
     }
     // Exported functions take the module function's parameter count as
     // their `length` and chain to %Function.prototype% (the JS-API only
@@ -3007,7 +3081,11 @@ fn function_wrapper(
     let id = function.id();
     agent.wasm_exports.insert(id, (instance, index));
     let value = Value::Function(function);
-    agent.wasm_func_objects.insert(key, value);
+    agent
+        .roots
+        .wasm_func_objects
+        .borrow_mut()
+        .insert(key, value);
     Ok(value)
 }
 
@@ -3078,7 +3156,9 @@ fn build_imports(
                         let token = agent.wasm_host_seq;
                         agent.wasm_host_seq += 1;
                         agent
+                            .roots
                             .wasm_host_functions
+                            .borrow_mut()
                             .insert(token, (name_value, expected.clone()));
                         let host_id = {
                             let mut store = agent.wasm_store.borrow_mut();
@@ -3289,7 +3369,8 @@ fn run_failure(agent: &mut Agent, fail: wasm::ExecFail) -> Result<JsError, JsErr
         wasm::ExecFail::Exception(exn) => {
             // A JS exception that entered wasm and escaped uncaught rethrows
             // with its identity preserved.
-            if let Some(original) = agent.wasm_js_exceptions.remove(&exn) {
+            let original = agent.roots.wasm_js_exceptions.borrow_mut().remove(&exn);
+            if let Some(original) = original {
                 return Ok(JsError::new(
                     ErrorKind::TypeError,
                     "wasm rethrew a JS exception".into(),
@@ -3386,7 +3467,9 @@ fn invoke_export(
                 // wasm writes so far and its writes land in the cell directly.
                 let reply = {
                     let (function, fty) = agent
+                        .roots
                         .wasm_host_functions
+                        .borrow()
                         .get(&request.token)
                         .map(|(function, fty)| (*function, fty.clone()))
                         .ok_or_else(|| {
@@ -3431,7 +3514,11 @@ fn invoke_export(
                                         .expect("just checked");
                                     let mut store = agent.wasm_store.borrow_mut();
                                     let exn = store.new_exception(cell, args);
-                                    agent.wasm_js_exceptions.insert(exn, value);
+                                    agent
+                                        .roots
+                                        .wasm_js_exceptions
+                                        .borrow_mut()
+                                        .insert(exn, value);
                                     progress = store.resume_exception(exn);
                                 }
                                 _ => {
@@ -3442,7 +3529,11 @@ fn invoke_export(
                                     let args = vec![WasmValue::Ref(payload)];
                                     let mut store = agent.wasm_store.borrow_mut();
                                     let exn = store.new_exception(cell, args);
-                                    agent.wasm_js_exceptions.insert(exn, value);
+                                    agent
+                                        .roots
+                                        .wasm_js_exceptions
+                                        .borrow_mut()
+                                        .insert(exn, value);
                                     progress = store.resume_exception(exn);
                                 }
                             },
