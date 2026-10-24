@@ -141,11 +141,15 @@ Fixed and validated in the first remediation pass:
   every exec result first. Memory is bounded by the output string rather than
   by the match count, and a functional replacer's `lastIndex` write now affects
   the next match. A regression test pins the interleaving.
-- **M-3 (deferred)** — the eager `maxByteLength` pre-allocation exists only in
-  the experimental `workers` feature: `byteblock`'s `new_with_capacity` ignores
-  the capacity in the default build. Under `workers` the block is one immutable
-  `Arc<[AtomicU64]>` shared by every view, so lazy growth needs a shared
-  indirection that the worker memory model (M-12) has to settle first.
+- **M-3** — a resizable/growable buffer no longer commits its maximum up front
+  under `workers`. The block is a reserved virtual address range
+  (`VirtualAlloc(MEM_RESERVE)` on Windows, an anonymous `MAP_NORESERVE` mapping
+  elsewhere) whose pages are committed as the buffer grows, so
+  `new ArrayBuffer(0, { maxByteLength: 2**30 })` costs address space instead of
+  a gigabyte of zeroed pages. The base never moves, which is what the JIT's
+  baked element pointers and every live view rely on — so this needed no shared
+  indirection, and M-12 stays independent. The default build was already lazy
+  (`byteblock` ignores the capacity there and grows its `Vec`).
 - **M-8 (remainder)** — the Deno reconcile now logs every lock entry it moved,
   the build runs `cargo build --locked` so nothing resolves beyond the
   reconciled lock, and an overridden `DENO_REPO` is announced instead of being
@@ -204,8 +208,7 @@ Fixed and validated in the first remediation pass:
   isolate's state is unknown). `is_poisoned`/`unpoison` are exported and
   re-exported by `crates/jsc` for a host that rebuilds its state.
 
-Outstanding from this report: the two `workers`-only items (eager
-resizable-buffer allocation, and worker memory atomics, which blocks it), the
+Outstanding from this report: worker memory atomics (M-12, `workers` only), the
 deferred wasm `shared`-flag import check, and the fuzzing gap. Every finding not listed here is fixed and validated in
 the passes below.
 
@@ -272,6 +275,14 @@ release; the RegExp area passes 1,899/1,899 and `*replace*` 212/212; clippy
 (`-D warnings`) and rustfmt are clean. The Miri job now covers the lexer and
 syntax crates and only runs from a manual `workflow_dispatch` with its input
 set, so push/PR runs do not wait on it.
+
+Validation for the thirteenth pass: the reservation runs in the `workers`
+configuration — `cargo test -p byteblock --all-features` (and the workspace's
+all-feature run) passes a test asserting an empty resizable block commits
+nothing, a 64-byte grow commits less than the 1 GiB maximum, the bytes round
+trip, and the base is stable across grow/shrink/regrow; clippy `-D warnings` is
+clean for the workspace with all features and `cargo test --workspace
+--all-features` is green in debug and release.
 
 Validation for the twelfth pass: `cargo test -p v8` passes 374 tests,
 including the new two-isolate handle test (which fails when the handle's mint
