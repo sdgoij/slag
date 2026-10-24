@@ -712,6 +712,36 @@ Gate run: clippy clean, `cargo test -p runtime --release --lib` 1068 pass,
 `ShadowRealm/*` 64/64 under `--gc-stress --gc-verify`, `Promise/*` 732/732 under
 `--gc-stress --gc-verify`, `language --filter "*realm*"` 19/19.
 
+### Slice 3a landed: the pooled Vms and the compiled-body caches
+
+Moved to `AgentRoots`: `vm_pool`, `compiled_bodies`, `script_bodies` (the
+source key is a heap edge, so the script cache is traced key and value, as
+before). Unlike the earlier slices these are not just tables but buffers whose
+element stacks are traced, so the roots object now covers the pooled-Vm value
+stacks as well as tables of handles.
+
+Cost is one `RefCell` borrow on `take_vm`/`return_vm`, i.e. once per non-leaf
+call, and one on a compiled-body cache hit per closure instantiation. Neither
+borrow is held across the work they guard.
+
+Gate run: clippy clean, `cargo test -p runtime --release --lib` 1068 pass,
+`language --filter "*eval*"` 1166/1166 under `--gc-stress --gc-verify`.
+
+### Slice 3b (open): `execution_context_stack` and `ecma_functions`
+
+These two are why slice 3 is not finished. `execution_context_stack` has 86
+direct accesses plus 160 through `running_context`/`running_context_mut`
+(`running_context_mut` has 48 callers), and it is pushed and popped on every
+call; the wrapper is mechanical (`push`/`pop`/`len`/`last`/`last_mut`), but a
+`RefMut` held across a nested push/pop would panic at run time rather than fail
+to compile, so each `last_mut`/`running_context_mut` site has to be checked for
+a stack operation inside its guard window. `ecma_functions` has 17 `get` and 11
+`get_mut` sites, and several of the `get_mut` ones (`ensure_function_prototype`,
+`setup_class_scope`) do allocating work while the record is borrowed, so they
+need a read-copy-write restructure before the table can become interior
+mutable. Both are on the call path, so they also owe a call-throughput
+measurement (`--bench`, plus the corpus runs) against this commit.
+
 ---
 
 ## What was checked and found sound

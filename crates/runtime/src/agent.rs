@@ -358,6 +358,10 @@ impl crux::heap::Trace for ErrorStack {
     }
 }
 
+/// The key of a cached SCRIPT/EVAL body: the exact source text plus
+/// (strict, fast_script, jsx) — see [`AgentRoots::script_bodies`].
+pub(crate) type ScriptBodyKey = (crux::JsString, bool, bool, bool);
+
 /// The containers the collector reads.
 ///
 /// They live in their own allocation, reached through `Rc`, and every field is
@@ -415,6 +419,34 @@ pub(crate) struct AgentRoots {
     pub(crate) async_generators: RefCell<
         std::collections::HashMap<u64, Rc<RefCell<crate::async_generator::AsyncGeneratorState>>>,
     >,
+    /// The pooled Vms (idle ones; a running Vm is on the native stack and
+    /// reached by [`crate::ir::trace_active_vms`]). Their heap-buffered value
+    /// stacks are roots the conservative scan cannot see. Boxed so taking and
+    /// returning a Vm moves only the pointer: `Vm` is ~1.1KB, and by-value
+    /// pool copies dominated the non-leaf call path's profile.
+    #[allow(clippy::vec_box)]
+    pub(crate) vm_pool: RefCell<Vec<Box<crate::ir::Vm>>>,
+    /// Cut 43: per-site compiled bodies, keyed by the shared body `Rc<Block>`
+    /// pointer (the canonical site identity `shared_function_body` returns).
+    /// Closures from one declaration site share a single `Rc<CompiledBody>`,
+    /// so instantiating the site in a loop does not recompile the IR (or, via
+    /// the per-body `jit_info` fast pointer, the machine code) per closure.
+    /// Traced so the compiled bodies' literal `Value`s stay rooted between
+    /// instantiations; entries live for the agent's life.
+    pub(crate) compiled_bodies: RefCell<
+        std::collections::HashMap<
+            usize,
+            crate::function::CompiledBodyCacheEntry,
+            std::hash::BuildHasherDefault<MixHasher>,
+        >,
+    >,
+    /// Per-source compiled SCRIPT/EVAL bodies, keyed by the exact source text
+    /// plus (strict, fast_script, jsx): `run_script`/`perform_eval` re-parse
+    /// the same source into a fresh AST each call, so without this an
+    /// eval-in-a-loop recompiled the IR per iteration. The key is a heap edge
+    /// too, so it is traced here rather than by the map's values-only `Trace`.
+    pub(crate) script_bodies:
+        RefCell<std::collections::HashMap<ScriptBodyKey, std::rc::Rc<crate::ir::CompiledBody>>>,
     /// Every realm created in this agent (the bootstrap realm plus any the
     /// host creates via `$262.createRealm`), so a realm's builtin called from
     /// another realm can dispatch with its own realm current.
@@ -448,6 +480,9 @@ impl AgentRoots {
             async_resume: RefCell::new(std::collections::HashMap::new()),
             generators: RefCell::new(std::collections::HashMap::new()),
             async_generators: RefCell::new(std::collections::HashMap::new()),
+            vm_pool: RefCell::new(Vec::new()),
+            compiled_bodies: RefCell::new(std::collections::HashMap::default()),
+            script_bodies: RefCell::new(std::collections::HashMap::new()),
             realms: RefCell::new(Vec::new()),
             function_realms: RefCell::new(std::collections::HashMap::new()),
             shadow_realms: RefCell::new(std::collections::HashMap::default()),
@@ -518,6 +553,28 @@ impl Trace for AgentRoots {
         self.async_resume.trace(visit);
         self.generators.trace(visit);
         self.async_generators.trace(visit);
+        if let Ok(pool) = self.vm_pool.try_borrow() {
+            for vm in pool.iter() {
+                vm.trace(visit);
+            }
+        } else {
+            crux::heap::note_aborted_trace();
+        }
+        if let Ok(bodies) = self.compiled_bodies.try_borrow() {
+            for entry in bodies.values() {
+                entry.compiled.trace(visit);
+            }
+        } else {
+            crux::heap::note_aborted_trace();
+        }
+        if let Ok(bodies) = self.script_bodies.try_borrow() {
+            for (key, body) in bodies.iter() {
+                key.0.trace(visit);
+                body.trace(visit);
+            }
+        } else {
+            crux::heap::note_aborted_trace();
+        }
         self.realms.trace(visit);
         self.function_realms.trace(visit);
         self.shadow_realms.trace(visit);
@@ -748,9 +805,10 @@ pub struct Agent {
     /// returning a Vm moves only the pointer: `Vm` is ~1.1KB, and the
     /// by-value pool copies dominated the non-leaf call path's profile
     /// (memcpy 37.6%, non-leaf calls -38% once boxed). `vec_box` would
-    /// restore exactly that cost, so it is allowed here.
-    #[allow(clippy::vec_box)]
-    pub(crate) vm_pool: Vec<Box<crate::ir::Vm>>,
+    /// restore exactly that cost, so it is allowed on [`AgentRoots`].
+    ///
+    /// The pool itself lives in [`AgentRoots`]: its Vms' heap-buffered value
+    /// stacks are roots.
     /// The installed JIT hook (the `jit` crate's `install`), consulted by
     /// the leaf-call path before interpreting a certified body. The Drop
     /// impl frees the installed cache.
@@ -800,43 +858,8 @@ pub struct Agent {
         std::hash::BuildHasherDefault<IdentityHasher>,
     >,
     /// Cut 43: per-site compiled bodies, keyed by the shared body `Rc<Block>`
-    /// pointer (the canonical site identity `shared_function_body` returns).
-    /// Closures from the same declaration site share one `Rc<CompiledBody>`:
-    /// the IR is a pure function of the site (params/body/strict/outer_chain
-    /// are compile-time constants), so instantiating the same site repeatedly
-    /// — a function declaration inside a loop, say — would otherwise
-    /// recompile the IR (and, via the per-body `jit_info` fast pointer, the
-    /// JIT machine code) on every closure. The cache is traced so the
-    /// compiled bodies' literal `Value`s stay rooted between instantiations;
-    /// the paired `(usize, [AtomId; 4])` is the site's collected `this.*`
-    /// property-write pattern (`compile_body`'s second return), re-applied to
-    /// each fresh constructor record. Entries are held for the agent's life
-    /// (like `shared_function_body`'s cache), so a long-running process with
-    /// many dynamically-created sites grows it unboundedly — consistent with
-    /// the existing body-AST cache.
-    pub(crate) compiled_bodies: std::collections::HashMap<
-        usize,
-        crate::function::CompiledBodyCacheEntry,
-        std::hash::BuildHasherDefault<MixHasher>,
-    >,
-    /// Per-source compiled SCRIPT/EVAL bodies, keyed by the exact
-    /// source text + (strict, fast_script, jsx). `run_script`/`perform_eval`
-    /// re-parse the same source into a fresh AST each call, so without this
-    /// the `compile_statements` IR (and the JIT machine code via the
-    /// per-body `jit_info` fast pointer) recompiled on every re-evaluation —
-    /// an eval-in-a-loop recompiled per iteration. The key is exact (the
-    /// content-hashed `JsString`, not a source hash), the body is a pure
-    /// function of (source, strict, fast_script) — eval's per-call
-    /// declaration instantiation and env setup stay per-eval — and the
-    /// cache is traced like `compiled_bodies` so the literal `Value`s stay
-    /// rooted. Entries live for the agent's life (scripts/eval sites are
-    /// rare and small; consistent with the function caches). The `jsx` bit is
-    /// part of the key because JSX source desugars to a different program
-    /// than the same text parsed without the extension.
-    pub(crate) script_bodies: std::collections::HashMap<
-        (crux::JsString, bool, bool, bool),
-        std::rc::Rc<crate::ir::CompiledBody>,
-    >,
+    /// pointer (the canonical site identity `shared_function_body` returns) —
+    /// now in [`AgentRoots`], with the rationale.
     /// The realm a job is running in, set by the drain for the job's own realm
     /// and nothing else (spec 9.5.4 hands the host a realm to run a job in).
     ///
@@ -1528,7 +1551,6 @@ impl Agent {
             iter_result_map: std::cell::Cell::new(None),
             generator_methods: std::cell::Cell::new(None),
             collection_observers: RefCell::new(Vec::new()),
-            vm_pool: Vec::new(),
             jit_hook: None,
             jit_depth: 0,
             stack_guard_limit: crate::stack::stack_guard_limit().unwrap_or(0),
@@ -1547,8 +1569,6 @@ impl Agent {
             module_async_evaluation_count: 0,
             module_eval_stack: Vec::new(),
             ecma_functions: std::collections::HashMap::default(),
-            compiled_bodies: std::collections::HashMap::default(),
-            script_bodies: std::collections::HashMap::new(),
             entered_realm: None,
             #[cfg(feature = "wasm")]
             wasm_streaming_handlers: std::collections::HashMap::new(),
@@ -1703,7 +1723,7 @@ impl Agent {
         lexical_env: crate::env::EnvRef,
         strict: bool,
     ) -> Box<crate::ir::Vm> {
-        match self.vm_pool.pop() {
+        match self.roots.vm_pool.borrow_mut().pop() {
             // `return_vm` fully reset the pooled Vm before it was pooled, so
             // only the per-run env and strictness need re-pointing.
             Some(mut vm) => {
@@ -1722,7 +1742,7 @@ impl Agent {
     /// the value stack past the call site.
     pub(crate) fn return_leaf_vm(&mut self, mut vm: Box<crate::ir::Vm>) {
         vm.clean_after_leaf();
-        self.vm_pool.push(vm);
+        self.roots.vm_pool.borrow_mut().push(vm);
     }
 
     /// Return a Vm to the pool after its run finished (the next run reuses
@@ -1743,7 +1763,7 @@ impl Agent {
             // place, keeping the Vm's own env, so the pooled Vm is still clean.
             Err(_) => vm.reset_for_pool(),
         }
-        self.vm_pool.push(vm);
+        self.roots.vm_pool.borrow_mut().push(vm);
     }
 
     /// The leaf-inline record for `id` (Cut 34): a direct-mapped cache over
@@ -2317,20 +2337,8 @@ impl Agent {
         if let Some(methods) = self.generator_methods.get() {
             methods.trace(visit);
         }
-        for vm in &self.vm_pool {
-            vm.trace(visit);
-        }
         self.global_symbol_registry.trace(visit);
         self.module_eval_stack.trace(visit);
-        for entry in self.compiled_bodies.values() {
-            entry.compiled.trace(visit);
-        }
-        // Cut 63: the script/eval compiled-body cache — the source KEY is a
-        // heap edge too (the value body is traced like `compiled_bodies`).
-        for (key, body) in &self.script_bodies {
-            key.0.trace(visit);
-            body.trace(visit);
-        }
         self.ecma_functions.trace(visit);
         self.entered_realm.trace(visit);
         #[cfg(feature = "wasm")]

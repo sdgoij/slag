@@ -1593,7 +1593,11 @@ mod tests {
             perform_eval(&mut agent, &source, false, true).unwrap(),
             Value::Number(2.0)
         );
-        assert_eq!(agent.script_bodies.len(), 1, "same eval source caches once");
+        assert_eq!(
+            agent.roots.script_bodies.borrow().len(),
+            1,
+            "same eval source caches once"
+        );
         // The same text through `run_script` is a different goal (fast_script
         // = true) — a second entry, but the second run_script reuses it.
         assert_eq!(
@@ -1605,7 +1609,7 @@ mod tests {
             Value::Number(2.0)
         );
         assert_eq!(
-            agent.script_bodies.len(),
+            agent.roots.script_bodies.borrow().len(),
             2,
             "script and eval goals are separate"
         );
@@ -1616,7 +1620,7 @@ mod tests {
             Value::Number(2.0)
         );
         assert_eq!(
-            agent.script_bodies.len(),
+            agent.roots.script_bodies.borrow().len(),
             3,
             "strictness is part of the key"
         );
@@ -1631,7 +1635,7 @@ mod tests {
             .unwrap(),
             Value::Number(4.0)
         );
-        assert_eq!(agent.script_bodies.len(), 4);
+        assert_eq!(agent.roots.script_bodies.borrow().len(), 4);
     }
 
     #[test]

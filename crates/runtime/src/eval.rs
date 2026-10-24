@@ -43,15 +43,19 @@ pub fn eval_program(
     let body = match source {
         Some(source) => {
             let key = (source.clone(), strict, fast_script, jsx);
-            if let Some(body) = agent.script_bodies.get(&key) {
-                body.clone()
+            if let Some(body) = agent.roots.script_bodies.borrow().get(&key).cloned() {
+                body
             } else {
                 let body = std::rc::Rc::new(crate::ir::compile_statements(
                     &program.body,
                     strict,
                     fast_script,
                 )?);
-                agent.script_bodies.insert(key, body.clone());
+                agent
+                    .roots
+                    .script_bodies
+                    .borrow_mut()
+                    .insert(key, body.clone());
                 body
             }
         }

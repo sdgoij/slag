@@ -1550,7 +1550,7 @@ fn shared_compiled_body(
     data: &EcmaFunction,
     body_key: usize,
 ) -> Result<CompiledBodyCacheEntry, JsError> {
-    if let Some(entry) = agent.compiled_bodies.get(&body_key) {
+    if let Some(entry) = agent.roots.compiled_bodies.borrow().get(&body_key) {
         return Ok(entry.clone());
     }
     let (compiled, this_writes) = crate::ir::compile_body(data)?;
@@ -1558,7 +1558,11 @@ fn shared_compiled_body(
         compiled: std::rc::Rc::new(compiled),
         this_writes,
     };
-    agent.compiled_bodies.insert(body_key, entry.clone());
+    agent
+        .roots
+        .compiled_bodies
+        .borrow_mut()
+        .insert(body_key, entry.clone());
     Ok(entry)
 }
 
