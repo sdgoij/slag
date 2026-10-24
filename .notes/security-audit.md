@@ -925,6 +925,36 @@ in table families, because each family's guard discipline is different:
   read at JS↔wasm boundary crossings and wrapper materialization, not inside an
   engine loop; a 2M-call JS→wasm export loop lands inside the noise floor
   (same-binary control -0.4% median, this tree +0.4%).
+- **4j landed** — the three IC value-cell arrays (`member_value_cells`,
+  `computed_read_cells`, `global_value_cells`), which were the last state
+  `trace_agent_state` read through `&Agent`. They are `[Cell<T>; N]` arrays in
+  the roots, traced there; `AgentRoots::{member,computed_read,global}_value_cell_base`
+  hand the JIT the element-0 address.
+  `Cell` rather than `RefCell` because the payloads are `Copy` (a read is a load,
+  a write a store, no borrow flag), and because `Cell` is
+  `#[repr(transparent)]`: the compiled lanes index the base at
+  `index * size_of::<T>()` from `crates/jit/src/cells.rs`, and the `Cell` array's
+  element-0 address and stride are the payload's, so **no compiled addressing
+  changed** — only the pointer's provenance, which is now an `UnsafeCell`, i.e.
+  a write through it is what `Cell` is defined to permit (the old base was a
+  plain array's address cast to `*mut`, which the compiled store lanes wrote
+  through; that was the one remaining place the engine mutated a shared
+  reference's pointee without interior mutability).
+  The arrays are inline in `AgentRoots`, not `Box`ed: the boxed shape measured
+  consistently worse (see below), and the roots are a dedicated allocation whose
+  size is not on the agent's hot-field path.
+  Cost, release builds, isolated 40M-iteration interpreter loops
+  (`--jitless`, min of 9, same-binary control within 2.4%): member read
+  `n += o.a + o.b` +0.8-6.6%, member write+read +5-11%, a global-scope
+  `n += 1` +8-16%, and an all-local function-body loop +6.3%. The last row
+  touches no cell at all, so part of the spread is code layout rather than the
+  cell indirection, and the boxed variant of the same change measured +14% and
+  +25% on the first and third rows — which is why the arrays are inline. The
+  compiled side is unaffected: the base pointer is captured once per
+  `JitCallContext`, `--jit-bench`'s per-row ratios are identical to
+  `0a64a7e1` (function calls 0.14, global read 0.14, apply leaf call 0.29), and
+  a compiled global-read loop measures +0.3%. No unsafe accessor was added to
+  buy the interpreter's indirection back.
 
 One near-miss is the reason the last step of each slice is a real `--gc-stress`
 sweep rather than a green unit suite: `async_from_sync_continuations` shared a
@@ -936,10 +966,14 @@ that would have caught it — for every trace line removed, the table is either
 in `AgentRoots::trace` or still traced where it lives — is now done by hand at
 the end of each slice.
 
-Remaining before the registry switch: the three JIT-base value-cell arrays
-(`member_value_cells`, `computed_read_cells`, `global_value_cells`) and nothing
-else. `trace_active_vms` and `RUNNING_JOB_REGION` are thread-scoped rather than
-agent-scoped and stay as they are.
+`trace_agent_state` now reads no agent field (only the thread-scoped active Vms
+and job regions), so the remaining `*const Agent` users in `collect_with` are
+the three weak/trace tables it still collects through the agent —
+`stack_traces`, `weak_ref_targets`, `promise_addrs` — and `compact_weak_tables`,
+which walks them. Moving those three `RefCell` tables into the roots and making
+`compact_weak_tables` take `&AgentRoots` is what lets `LIVE_AGENTS` drop its
+`*const Agent`; `trace_active_vms` and `RUNNING_JOB_REGION` are thread-scoped
+rather than agent-scoped and stay as they are.
 
 The value-cell arrays are the one group the caches' `Cell` treatment does not
 reach. Their base pointer is handed to the JIT — `JitCallContext::
@@ -966,6 +1000,14 @@ splitting the fill path out of `leaf_lookup` behind `#[cold]` measured *worse*
 (11%) and was reverted. The remaining option is a `Cell`-table of `Copy` leaf
 records, which needs the `Rc<CompiledBody>` in `LeafEntry` replaced by a
 borrowed pointer; that is a separate change with its own lifetime argument.
+
+Validation for 4j: `cargo test --workspace --all-features` green in both
+profiles, clippy `-D warnings` clean (workspace, all targets, all features),
+`cargo fmt` clean; under `--gc-stress --gc-verify` (JIT on): `Object/*`
+3411/3411, `Reflect/*` 153/153, `*Map*` 431/431, `*Promise*` 732/732,
+`language "*for-in*"` 153/153, `language "*for-of*"` 779/779, and a
+`language --sample 3` smoke 82/82; `--jit-bench` reports `result-ok` on every
+row (its differential check that compiled results equal interpreted ones).
 
 Validation for 4i: `cargo test --workspace --all-features` green in both
 profiles, clippy `-D warnings` clean (workspace, all targets, all features) and
