@@ -870,6 +870,21 @@ in table families, because each family's guard discipline is different:
 - **4e landed** — the module tables (`host_modules`, the namespace tables,
   `module_sources`, the dynamic-import resolvers, the deferred-module wait and
   then tables, the evaluation stack) and `entered_realm`, which became a `Cell`.
+- **4f landed** — the error/weak/job tables (`error_stack`,
+  `current_task_promise`, `global_symbol_registry`,
+  `async_from_sync_continuations`, `kept_during_job`, `pending_cleanup_jobs`,
+  `finalization_registries`). `current_task_promise` is a `Value`, so it became
+  a `Cell<Option<Value>>`; the cleanup jobs' opaque closure regions are now
+  collected by `AgentRoots::collect_job_regions` with the queued jobs, because
+  the compaction hook enqueues them through `&self`.
+- **4g landed** — the six Intl record tables that hold values, the two Temporal
+  tables and the String/RegExp-string iterator tables. The Temporal builtins
+  were the interesting ones: several read a record in an
+  `if let … && let Some(record) = table.borrow().get(…)` chain and then call
+  back into the agent, holding the `Ref` across those calls; and
+  `%StringIteratorPrototype%.next` advanced the index through `get_mut` while
+  building the result object. Both now copy the record (or the index pair) out,
+  do the work, and write it back.
 
 One near-miss is the reason the last step of each slice is a real `--gc-stress`
 sweep rather than a green unit suite: `async_from_sync_continuations` shared a
@@ -881,19 +896,26 @@ that would have caught it — for every trace line removed, the table is either
 in `AgentRoots::trace` or still traced where it lives — is now done by hand at
 the end of each slice.
 
-Remaining before the registry switch: `current_task_promise`, `error_stack`,
-`finalization_registries`, `kept_during_job`, `pending_cleanup_jobs`,
-`async_from_sync_continuations`, `global_symbol_registry`, the six Intl and two
-Temporal tables that hold values, `string_iter_data`/`regexp_string_iter_data`,
-the eleven IC caches (the `*_cells` arrays, `leaf_cache`, `construct_maps`,
-`function_boilerplate_maps`, `iter_result_map`/`iter_result_realm`,
-`generator_methods`), and the wasm tables (feature-gated). `trace_active_vms`
-and `RUNNING_JOB_REGION` are thread-scoped rather than agent-scoped and stay as
-they are.
+Remaining before the registry switch: the eleven IC caches (the `*_cells`
+arrays, `leaf_cache`, `construct_maps`, `function_boilerplate_maps`,
+`iter_result_map`/`iter_result_realm`, `generator_methods`) and the wasm tables
+(feature-gated). `trace_active_vms` and `RUNNING_JOB_REGION` are thread-scoped
+rather than agent-scoped and stay as they are.
 
-Validation for 4a-4e: clippy `-D warnings` clean (workspace, all targets, all
+The caches are the one group that needs a shape change rather than a move:
+`leaf_cache` is a `Box<[Option<(u64, LeafEntry)>]>` and `leaf_lookup` hands out
+`&LeafEntry` from it, which no interior-mutable container can do. The entry is
+four cheap fields (`Rc<CompiledBody>`, a bool, `Option<EnvRef>`, a bool), so the
+plan is a `Box<[Cell<Option<…>>]>` in the roots with `leaf_lookup` returning the
+entry by value — an `Rc` bump per call instead of a borrow — and the same
+treatment for the other slot arrays that currently rely on `&mut Agent`.
+
+Validation for 4a-4g: clippy `-D warnings` clean (workspace, all targets, all
 features) and `cargo fmt --check` clean after each; `cargo test --workspace`
-5809 pass in both profiles; under `--gc-stress --gc-verify`, `*Map*` 431/431,
+5809 pass in both profiles; under `--gc-stress --gc-verify`, `*WeakRef*` 29/29,
+`*FinalizationRegistry*` 47/47, `Symbol/*` 98/98, the whole `*Promise*` set
+732/732, `*StringIterator*` 24/24, `*RegExpStringIterator*` 17/17 (and the
+Intl sample's crash cluster, below), `*Map*` 431/431,
 `*Set*` 859/859, `*ArrayBuffer*` 324 pass with the one pre-existing
 `sliceToImmutable/argument-coercion.js` hang, `DataView/*` 561/561, `*RegExp*`
 1793 pass / 0 fail (against 1739 pass / 160 hang on a pre-4b binary — the hangs
@@ -904,7 +926,12 @@ are the Unicode-property fixtures), `Array/fromAsync/*` 95/95,
 `AbstractModuleSource/*` 8/8. The crash clusters that remain under
 `--gc-stress` — three BigInt `TypedArray/prototype/set` fixtures, six
 `AsyncFromSyncIteratorPrototype` fixtures — occur more often on a pre-4 binary
-than on this tree, so they are pre-existing.
+than on this tree, so they are pre-existing. So is the Intl batch death: with
+32 fixtures to a process, 45 of a 75-fixture `intl402` sample die under
+`--gc-stress`, and the same 45 die on a binary built from `c9ccdd74`. Each of
+those fixtures passes when run alone in its own process, so it is a
+batch-process interaction rather than a lost root — worth its own investigation,
+but not one this work introduced.
 
 ---
 
