@@ -539,6 +539,18 @@ impl<'s> FunctionBuilder<'s, Function> {
 }
 
 impl Function {
+    /// A function over a callback mapped from a host function
+    /// (`v8::Function::new`).
+    ///
+    /// The plain shape of the same builder [`builder`](Self::builder) starts:
+    /// no data, no length, callable with `new`, in the scope's realm.
+    pub fn new<'s>(
+        scope: &PinScope<'s, '_, ()>,
+        callback: impl MapFnTo<FunctionCallback>,
+    ) -> Option<Local<'s, Function>> {
+        Self::builder(callback).build(scope)
+    }
+
     /// A builder over a callback mapped from a host function
     /// (`v8::Function::builder`).
     pub fn builder<'s>(callback: impl MapFnTo<FunctionCallback>) -> FunctionBuilder<'s, Self> {

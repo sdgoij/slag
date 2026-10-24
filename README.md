@@ -222,7 +222,7 @@ cargo run -p cli --features raylib -- game.js
 ### The `v8` crate and Deno
 
 `crates/v8` is a stand-in for `rusty_v8`: it is named `v8` at the API version it
-replaces (`150.4.0`), so a host that depends on the crates.io `v8` resolves to
+replaces (`152.1.0`), so a host that depends on the crates.io `v8` resolves to
 it. Where `rusty_v8` crosses into C++ through `binding.cc` and bindgen, this is a
 pure-Rust implementation of the `v8::` surface on top of the engine — handles,
 scopes, isolates, contexts, modules, promises, and the inspector's `Runtime`
@@ -610,7 +610,7 @@ time (`crates/runtime/src/builtins/array.rs` is the model) and need nothing.
 | `jit` | Experimental Cranelift JIT backend for the interpreter's certified `Step` bytecode (CLI feature `jit`, on by default) |
 | `ffi` | Shared C-ABI plumbing for the drop-in surfaces (handle tables, value/string marshaling) |
 | `jsc` | Drop-in JavaScriptCore C API (`JSContextRef` family) backed by Slag; not in the default build (`cargo build -p jsc`, or alongside the CLI with `cargo build -p cli --features jsc`) |
-| `v8` | Stand-in for `rusty_v8` (named `v8` at API version 150.4.0) that runs Deno on Slag; not in the default build (`cargo build -p v8`, or `python3 tools/build-deno.py` to build the whole Deno host) |
+| `v8` | Stand-in for `rusty_v8` (named `v8` at API version 152.1.0) that runs Deno on Slag; not in the default build (`cargo build -p v8`, or `python3 tools/build-deno.py` to build the whole Deno host) |
 | `cli` | The `slag` binary (script runner + REPL) |
 | `test262` | The pinned corpus + the sweep runner |
 

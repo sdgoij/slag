@@ -1,8 +1,8 @@
 [package]
 name = "v8"
 # The version of the crate this stands in for, so a consumer pinning
-# `v8 = "150.4.0"` resolves to this one. Deliberately not the workspace version.
-version = "150.4.0"
+# `v8 = "152.1"` resolves to this one. Deliberately not the workspace version.
+version = "152.1.0"
 edition.workspace = true
 # This stands in for the crates.io `v8` under a `[patch.crates-io]`, never a
 # published replacement; a private registry must not accept it as one.

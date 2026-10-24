@@ -95,6 +95,19 @@ impl<'s> LocalHandle<'s, Promise> {
         self.then_with(scope, Some(on_fulfilled), Some(on_rejected))
     }
 
+    /// `promise.then(on_fulfilled)` (v8::Promise::Then with one handler).
+    ///
+    /// The rejection side is left to the default handler, which is what the
+    /// crate we stand in for does when a host names only one: the derived
+    /// promise rejects with the same reason.
+    pub fn then<'a>(
+        &self,
+        scope: &PinScope<'a, '_>,
+        on_fulfilled: Local<'_, Function>,
+    ) -> Option<Local<'a, Promise>> {
+        self.then_with(scope, Some(on_fulfilled), None)
+    }
+
     /// `promise.catch(on_rejected)` (v8::Promise::Catch).
     ///
     /// The fulfilling side is *undefined*, which is what the crate we stand in

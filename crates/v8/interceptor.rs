@@ -145,6 +145,7 @@ macro_rules! keyed_info {
                 PropertyCallbackArguments {
                     holder: self.holder(),
                     throw_on_error: self.throw_on_error,
+                    data: Local::from_engine(api::Local::undefined()),
                 }
             }
         }
@@ -240,6 +241,7 @@ impl EnumeratorCallbackInfo {
         PropertyCallbackArguments {
             holder: self.holder(),
             throw_on_error: false,
+            data: Local::from_engine(api::Local::undefined()),
         }
     }
 
@@ -253,9 +255,35 @@ impl EnumeratorCallbackInfo {
 pub struct PropertyCallbackArguments<'s> {
     holder: Local<'s, Object>,
     throw_on_error: bool,
+    data: Local<'s, EngineHandleValue>,
 }
 
 impl<'s> PropertyCallbackArguments<'s> {
+    /// The arguments a *lazy data property*'s getter is given: the object the
+    /// read ran on, no throw-on-error (a get has none), and the data the
+    /// property was defined with, which is what
+    /// `v8::PropertyCallbackArguments::data` names there.
+    pub(crate) fn for_property_get(
+        holder: Local<'s, Object>,
+        data: Local<'s, EngineHandleValue>,
+    ) -> Self {
+        Self {
+            holder,
+            throw_on_error: false,
+            data,
+        }
+    }
+
+    /// The value the callback was installed with
+    /// (`v8::PropertyCallbackArguments::data`).
+    ///
+    /// `undefined` for a named-property interceptor: this bridge's handler
+    /// configuration carries no data, and a host that wants some puts it in the
+    /// handler's own captured state.
+    pub fn data(&self) -> Local<'s, EngineHandleValue> {
+        self.data
+    }
+
     /// The object the internal method ran on
     /// (`v8::PropertyCallbackArguments::holder`).
     pub fn holder(&self) -> Local<'s, Object> {

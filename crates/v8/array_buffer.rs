@@ -379,6 +379,20 @@ impl SharedArrayBuffer {
     }
 }
 
+impl SharedArrayBuffer {
+    /// A shared reference to the bytes
+    /// (`v8::SharedArrayBuffer::get_backing_store`).
+    ///
+    /// The associated-function shape the crate we stand in for uses, over the
+    /// handle method of the same name: its `SharedArrayBuffer` is an opaque
+    /// marker type, so a host reaches the bytes through a `Local<...>`.
+    pub fn get_backing_store(
+        shared_array_buffer: &Local<'_, SharedArrayBuffer>,
+    ) -> SharedRef<BackingStore> {
+        shared_array_buffer.get_backing_store()
+    }
+}
+
 impl<'s> LocalHandle<'s, SharedArrayBuffer> {
     /// The byte length (`v8::SharedArrayBuffer::byte_length`).
     ///

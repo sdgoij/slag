@@ -4,8 +4,13 @@
 use std::collections::HashSet;
 use std::num::NonZeroI32;
 
-use crate::data::{Array, DataError, Date, Map, Name, Object, Private, Proxy, Set, String, Value};
+use crate::data::{
+    Array, DataError, Date, External, Function, Map, Name, Object, Private, Proxy, Set, String,
+    Value,
+};
+use crate::function::{FunctionCallbackArguments, ReturnValue, SideEffectType};
 use crate::handle::{Local, LocalHandle};
+use crate::interceptor::PropertyCallbackArguments;
 use crate::property::{
     GetPropertyNamesArgs, IndexFilter, KeyCollectionMode, KeyConversionMode, PropertyAttribute,
     PropertyFilter,
@@ -626,6 +631,50 @@ impl<'s> LocalHandle<'s, Object> {
         self.define_property(scope, key, &data_property(value))
     }
 
+    /// Define an accessor whose getter runs once
+    /// (`v8::Object::SetLazyDataPropertyWithData`).
+    ///
+    /// The getter is called on the first read with the property's key, the
+    /// arguments (carrying `data`), and a return slot. The value it answers is
+    /// then defined as a data property with the attributes asked for, which is
+    /// what makes the read lazy: the callback does not run again, so a host can
+    /// defer an expensive definition until the name is actually used.
+    ///
+    /// Both side-effect types are accepted and change nothing: they tell V8's
+    /// optimizer what it may assume about the access, and this engine has no
+    /// optimizer — the tier [`FunctionBuilder::side_effect_type`] documents.
+    ///
+    /// [`FunctionBuilder::side_effect_type`]: crate::FunctionBuilder::side_effect_type
+    // The crate we stand in for's own parameter list, transcribed whole: the two
+    // side-effect types are part of its signature and a host passes them.
+    #[allow(clippy::too_many_arguments)]
+    pub fn set_lazy_data_property_with_data<'a>(
+        &self,
+        scope: &PinScope<'a, '_>,
+        key: Local<'_, Name>,
+        getter: AccessorNameGetterCallback,
+        data: Local<'_, Value>,
+        attr: PropertyAttribute,
+        _getter_side_effect_type: SideEffectType,
+        _setter_side_effect_type: SideEffectType,
+    ) -> Option<bool> {
+        // The function carries everything the shared trampoline needs: the key
+        // and the host's data are values already, the attributes ride as their
+        // bits so the cached data property keeps them, and the getter is the
+        // one thing that is not a value, so it travels as an `External`.
+        let attributes = Local::from_engine(api::Local::number(f64::from(attr.as_u32())));
+        let erased = External::new(scope, getter as *mut std::ffi::c_void);
+        let store = Array::new_with_elements(scope, &[key.into(), data, attributes, erased.into()]);
+        let function = Function::builder(lazy_data_property_trampoline)
+            .data(store.into())
+            .build(scope)?;
+        let undefined = Local::from_engine(api::Local::undefined());
+        let mut descriptor = V8PropertyDescriptor::new_from_get_set(function.into(), undefined);
+        descriptor.set_enumerable(!attr.is_dont_enum());
+        descriptor.set_configurable(!attr.is_dont_delete());
+        self.define_property(scope, key, &descriptor)
+    }
+
     /// DefineOwnProperty with the attributes `attr` names
     /// (`v8::Object::DefineOwnProperty`).
     ///
@@ -1003,6 +1052,26 @@ impl Set {
     }
 }
 
+impl Map {
+    /// A new empty map in the scope's realm (`v8::Map::new`).
+    ///
+    /// The `%Map%` intrinsic is constructed, so the map is the one a script
+    /// would make — the same reason [`Set::new`] goes through `%Set%`.
+    pub fn new<'s>(scope: &PinScope<'s, '_, ()>) -> Local<'s, Map> {
+        let realm = crate::realm_of(scope);
+        let constructor = realm
+            .intrinsic("%Map%")
+            .unwrap_or_else(|| panic!("bridge bug: the realm has no %Map% intrinsic"));
+        match realm.try_construct(&api::Local::from(constructor), &[]) {
+            Ok(map) => Local::from_engine(map),
+            Err(error) => {
+                crate::throw(scope, &error);
+                panic!("bridge: creating a map failed: {error}");
+            }
+        }
+    }
+}
+
 impl<'s> LocalHandle<'s, Map> {
     /// The number of live entries (`v8::Map::size`).
     ///
@@ -1254,10 +1323,80 @@ fn constructor_name<'s>(
     Some(Local::from_engine(name))
 }
 
+/// The getter a lazy data property runs (`v8::AccessorNameGetterCallback`).
+///
+/// The crate we stand in for declares this as a raw C callback and adapts a
+/// host's function to it; this bridge takes the host-facing shape directly,
+/// which is what such a function already is.
+pub type AccessorNameGetterCallback =
+    for<'s> fn(Local<'s, Name>, PropertyCallbackArguments<'s>, ReturnValue<'s, Value>);
+
+/// The one getter every lazy data property shares
+/// (`v8::Object::SetLazyDataPropertyWithData`).
+///
+/// It recovers the key, the host's data, the attributes and the host's getter
+/// from the function's own data — the shape
+/// [`set_lazy_data_property_with_data`](LocalHandle::set_lazy_data_property_with_data)
+/// installed — calls the getter, and replaces the accessor with the data
+/// property it answered, so the callback runs once.
+///
+/// The store's elements are read through the engine API: the array is a value
+/// the host never sees, so there is no handle to read it with.
+fn lazy_data_property_trampoline<'s, 'i>(
+    scope: &mut PinScope<'s, 'i>,
+    args: FunctionCallbackArguments<'s>,
+    rv: ReturnValue<'s>,
+) {
+    let realm = crate::realm_of(scope);
+    let store = args.data();
+    let element = |index: u32| api::Array::get(&realm, store.engine(), index).ok();
+    let (Some(key), Some(data)) = (element(0), element(1)) else {
+        // A store that is not this trampoline's shape means the property was
+        // built by something else; answer `undefined` and run nothing.
+        rv.set_undefined();
+        return;
+    };
+    let attr = element(2)
+        .and_then(|bits| bits.as_number())
+        .map_or(PropertyAttribute::NONE, |bits| {
+            PropertyAttribute::from_u32(bits as u32)
+        });
+    let Some(erased) = element(3) else {
+        rv.set_undefined();
+        return;
+    };
+    // SAFETY: the `External` was made from a `LazyDataPropertyGetterCallback`
+    // by the installation this property came from, and nothing else is ever
+    // stored in that slot.
+    let getter: AccessorNameGetterCallback = unsafe {
+        std::mem::transmute::<*mut std::ffi::c_void, AccessorNameGetterCallback>(
+            api::External::from(*erased.value()).value(),
+        )
+    };
+
+    let key: Local<'s, Name> = Local::from_engine(key);
+    let data: Local<'s, Value> = Local::from_engine(data);
+    // The host getter answers into a slot this frame owns: the call's own
+    // return slot is written last, after the answer has been cached.
+    let answered = std::cell::RefCell::new(None);
+    getter(
+        key,
+        PropertyCallbackArguments::for_property_get(args.this(), data),
+        ReturnValue::from_slot(&answered),
+    );
+    let value = (*answered.borrow()).unwrap_or(EngineValue::Undefined);
+    let value: Local<'s, Value> = Local::from_engine(api::Local::from(value));
+
+    // The accessor becomes a data property with the attributes it was installed
+    // with: that is what makes the callback run once.
+    let _ = args.this().define_own_property(scope, key, value, attr);
+    rv.set(value);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::data::{Number, Set};
+    use crate::data::{Integer, Number, Set};
     use crate::handle::Global;
     use crate::property::{GetPropertyNamesArgsBuilder, IndexFilter, KeyCollectionMode};
     use crate::scope::GetIsolate;
@@ -2165,6 +2304,56 @@ mod tests {
             let generator = Local::<Object>::try_from(eval(scope, "(function* () { yield 1; })()"))
                 .expect("generator");
             assert!(generator.preview_entries(scope).0.is_none());
+        });
+    }
+
+    /// A lazy data property's getter runs once, and the accessor it was
+    /// installed as becomes a data property
+    /// (`v8::Object::SetLazyDataPropertyWithData`).
+    ///
+    /// The host getter is given the key and the data the property was defined
+    /// with, and what it answers is cached: a second read must not call it
+    /// again, which is the whole reason a host defers the definition.
+    #[test]
+    fn a_lazy_data_property_runs_its_getter_once() {
+        use std::cell::Cell;
+        thread_local! {
+            static CALLS: Cell<u32> = const { Cell::new(0) };
+        }
+        fn getter<'s>(
+            name: Local<'s, Name>,
+            args: PropertyCallbackArguments<'s>,
+            rv: ReturnValue<'s>,
+        ) {
+            CALLS.with(|calls| calls.set(calls.get() + 1));
+            assert_eq!(name.engine().as_string().as_deref(), Some("lazy"));
+            assert_eq!(args.data().engine().as_number(), Some(7.0));
+            rv.set_int32(42);
+        }
+
+        in_context!(scope, {
+            let object = Object::new(scope);
+            let key = String::new(scope, "lazy").expect("key");
+            let data = Integer::new(scope, 7);
+            let defined = object.set_lazy_data_property_with_data(
+                scope,
+                key.into(),
+                getter,
+                data.into(),
+                PropertyAttribute::NONE,
+                SideEffectType::HasSideEffect,
+                SideEffectType::HasSideEffect,
+            );
+            assert_eq!(defined, Some(true), "the accessor is defined");
+            bind(scope, "lazy_obj", object.into());
+
+            assert_eq!(eval_number(scope, "lazy_obj.lazy"), 42.0);
+            assert_eq!(eval_number(scope, "lazy_obj.lazy"), 42.0);
+            assert_eq!(
+                CALLS.with(|calls| calls.get()),
+                1,
+                "the getter must run once, not on every read"
+            );
         });
     }
 }

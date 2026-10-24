@@ -85,7 +85,9 @@ pub use function::{
     FunctionCallbackInfo, FunctionCallbackInfoParts, ReturnValue, SideEffectType,
 };
 pub use handle::{Global, Handle, Local, MaybeLocal};
-pub use heap::{GCCallbackFlags, GCType, GcCallback, HeapSpaceStatistics, HeapStatistics};
+pub use heap::{
+    GCCallbackFlags, GCType, GarbageCollectionType, GcCallback, HeapSpaceStatistics, HeapStatistics,
+};
 pub use interceptor::{
     IndexedPropertyDefinerCallback, IndexedPropertyDeleterCallback,
     IndexedPropertyDescriptorCallback, IndexedPropertyEnumeratorCallback,
@@ -105,7 +107,7 @@ pub use isolate::{
 pub use json::{parse as json_parse, stringify as json_stringify};
 pub use microtask::MicrotaskQueue;
 pub use module::{ModuleImportPhase, ModuleStatus, SyntheticModuleEvaluationSteps};
-pub use object::IntegrityLevel;
+pub use object::{AccessorNameGetterCallback, IntegrityLevel};
 pub use platform::{
     IdleTask, Platform, PlatformImpl, Task, new_custom_platform, new_default_platform,
     new_single_threaded_default_platform, new_unprotected_default_platform,

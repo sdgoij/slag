@@ -156,6 +156,19 @@ impl Isolate {
     }
 }
 
+/// The kind of collection a host asks for by name
+/// (`v8::GarbageCollectionType`).
+///
+/// `GCType` below is the *filter* a host installs a callback with; this is the
+/// argument the test-only `request_garbage_collection_for_testing` takes, and
+/// the crate we stand in for gives it three names rather than a bitmask.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GarbageCollectionType {
+    Minor,
+    Major,
+    Full,
+}
+
 /// What kind of collection a callback is being told about, and what a host
 /// installs one to watch (`v8::GCType`).
 ///

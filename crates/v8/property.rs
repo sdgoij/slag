@@ -57,6 +57,12 @@ impl PropertyAttribute {
         let Self(bits) = self;
         *bits
     }
+
+    /// The attributes a raw mask names, ignoring bits this crate does not
+    /// define.
+    pub fn from_u32(bits: u32) -> Self {
+        Self(bits & (Self::READ_ONLY.0 | Self::DONT_ENUM.0 | Self::DONT_DELETE.0))
+    }
 }
 
 impl BitOr for PropertyAttribute {
