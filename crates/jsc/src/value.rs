@@ -370,8 +370,13 @@ pub unsafe extern "C" fn JSValueToObject(
     })
 }
 
-/// JSValueProtect: values handed to the host are already strongly held, so
-/// this is a no-op (divergence: refs never dangle).
+/// JSValueProtect: adds one reference to a primitive value ref's table entry
+/// (the `ffi` value table is refcounted). An object ref is already pinned by
+/// the hand-out that produced it, and that pin is not counted — a second
+/// protect of the same object is therefore a no-op, and one
+/// `JSValueUnprotect` drops the pin (a documented divergence from JSC, which
+/// counts protections). It cannot dangle: a ref whose pin is gone resolves to
+/// nothing, so the host sees null/undefined rather than freed memory.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn JSValueProtect(_ctx: JSContextRef, value: JSValueRef) {
     crate::guard(|| refs::protect_value_ref(value))
@@ -392,8 +397,9 @@ pub unsafe extern "C" fn JSValueToStringWithContext(
     unsafe { JSValueToStringCopy(ctx, value, exception) }
 }
 
-/// JSValueUnprotect: release a primitive value ref early (objects stay
-/// alive through the JS graph).
+/// JSValueUnprotect: drop one reference to a primitive value ref, or the pin
+/// of an object ref (see `JSValueProtect`; the object itself then lives or
+/// dies by reachability). A string ref's entry belongs to `JSStringRelease`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn JSValueUnprotect(_ctx: JSContextRef, value: JSValueRef) {
     crate::guard(|| refs::release_value_ref(value));

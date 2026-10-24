@@ -43,7 +43,10 @@ pub unsafe extern "C" fn JSStringCreateWithUTF8CString(string: *const c_char) ->
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn JSStringRetain(string: JSStringRef) -> JSStringRef {
     crate::guard(|| {
-        if ffi::retain_string_ref(string as usize as u64) {
+        let Some(id) = crate::refs::string_ref_id(string) else {
+            return ptr::null_mut();
+        };
+        if ffi::retain_string_ref(id) {
             string
         } else {
             ptr::null_mut()
@@ -71,7 +74,8 @@ pub unsafe extern "C" fn JSStringGetCharactersPtr(string: JSStringRef) -> *const
         // The ref holds the JsString strongly; the slice points into its
         // stable heap allocation. The pointer stays valid while the ref is
         // retained (JSC's contract).
-        ffi::with_string(string as usize as u64, |string| string.as_slice().as_ptr())
+        crate::refs::string_ref_id(string)
+            .and_then(|id| ffi::with_string(id, |string| string.as_slice().as_ptr()))
             .unwrap_or(ptr::null())
     })
 }

@@ -246,21 +246,18 @@ pub fn fill_exception(ctx: &JscContext, error: &JsError, out: *mut JSValueRef) {
 
 /// A retained `JSStringRef` from a JS string id; `None` when not a string.
 pub fn string_from_ref(r: JSStringRef) -> Option<JsString> {
-    if r.is_null() {
-        return None;
-    }
-    ffi::string(r as usize as u64)
+    ffi::string(crate::refs::string_ref_id(r)?)
 }
 
 /// Retain a string and hand out its ref.
 pub fn string_ref(string: &JsString) -> JSStringRef {
-    ffi::retain_string(string.clone()) as usize as JSStringRef
+    crate::refs::string_ref_from_id(ffi::retain_string(string.clone()))
 }
 
 /// Release a retained string ref.
 pub fn release_string_ref(r: JSStringRef) {
-    if !r.is_null() {
-        ffi::release_string(r as usize as u64);
+    if let Some(id) = crate::refs::string_ref_id(r) {
+        ffi::release_string(id);
     }
 }
 
