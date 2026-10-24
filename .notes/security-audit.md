@@ -908,6 +908,23 @@ in table families, because each family's guard discipline is different:
   re-entering an unchanged chain shares the list instead of copying it — and
   that is what lets the probe hand the keys out without allocating under its
   guard.
+- **4i landed** — the eleven traced wasm JS-API tables: the streaming
+  handlers, the per-instance `exports` objects, the memoized function wrappers
+  (`wasm_func_objects`), the Memory/Table/Global/Tag wrapper memos, the
+  external host functions, the escaped-JS-exception table and the externref
+  payload table. Each is a `RefCell<HashMap<…>>` in the roots; every site that
+  read one now copies its value out (`Value` and the cell indices are `Copy`)
+  before calling back into the agent, and the three sites that consumed an
+  entry by identity (the streaming handler, an escaped exception) take it out
+  of a one-statement borrow first, since the handler runs JavaScript.
+  `wasm_exceptions` and the index-only tables (`wasm_exports`, `wasm_memories`,
+  `wasm_tables`, `wasm_globals`, `wasm_tags`, the engine store) stay on the
+  agent: they hold object ids and store cells — `wasm::Value` carries no GC
+  edge — so the collector never reads them.
+  There was no measurement to make here beyond the sweeps: these tables are
+  read at JS↔wasm boundary crossings and wrapper materialization, not inside an
+  engine loop; a 2M-call JS→wasm export loop lands inside the noise floor
+  (same-binary control -0.4% median, this tree +0.4%).
 
 One near-miss is the reason the last step of each slice is a real `--gc-stress`
 sweep rather than a green unit suite: `async_from_sync_continuations` shared a
@@ -920,9 +937,9 @@ in `AgentRoots::trace` or still traced where it lives — is now done by hand at
 the end of each slice.
 
 Remaining before the registry switch: the three JIT-base value-cell arrays
-(`member_value_cells`, `computed_read_cells`, `global_value_cells`) and the wasm
-tables (feature-gated). `trace_active_vms` and `RUNNING_JOB_REGION` are
-thread-scoped rather than agent-scoped and stay as they are.
+(`member_value_cells`, `computed_read_cells`, `global_value_cells`) and nothing
+else. `trace_active_vms` and `RUNNING_JOB_REGION` are thread-scoped rather than
+agent-scoped and stay as they are.
 
 The value-cell arrays are the one group the caches' `Cell` treatment does not
 reach. Their base pointer is handed to the JIT — `JitCallContext::
@@ -949,6 +966,13 @@ splitting the fill path out of `leaf_lookup` behind `#[cold]` measured *worse*
 (11%) and was reverted. The remaining option is a `Cell`-table of `Copy` leaf
 records, which needs the `Rc<CompiledBody>` in `LeafEntry` replaced by a
 borrowed pointer; that is a separate change with its own lifetime argument.
+
+Validation for 4i: `cargo test --workspace --all-features` green in both
+profiles, clippy `-D warnings` clean (workspace, all targets, all features) and
+`cargo fmt` clean; the wasm sweeps at their baselines with `--strict`: core
+20 662 pass, simd 25 990, memory64 8 709, bulk-memory 7 485, multi-memory 912,
+gc 654, exceptions 105, relaxed-simd 77 (0 fail, 0 pending in each) and
+`wasmtest jsapi` 1001 tests across 61 fixture files.
 
 Validation for 4h: clippy `-D warnings` clean (workspace, all targets, all
 features) and `cargo fmt` clean, `cargo test --workspace` green in both
