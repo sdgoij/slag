@@ -1488,7 +1488,7 @@ fn visit(
                         if let Some(heritage) = heritage {
                             visit(agent, realm, externals, host, heritage, objects, serials)?;
                         }
-                        for key in keys {
+                        for key in &keys {
                             visit(
                                 agent,
                                 realm,
@@ -1855,7 +1855,7 @@ enum Callable<'a> {
     /// its [[HomeObject]].
     Body {
         grammar: Grammar,
-        source: &'a JsString,
+        source: JsString,
         strict: bool,
         home: Option<Value>,
         environment: Option<EnvRef>,
@@ -1878,9 +1878,9 @@ enum Callable<'a> {
     /// with no `extends` clause) and the computed element keys — and its
     /// [[Environment]], which is the class scope record its methods close over.
     Class {
-        source: &'a JsString,
+        source: JsString,
         heritage: Option<Value>,
-        keys: &'a [PropertyKey],
+        keys: Vec<PropertyKey>,
         private_names: Vec<(JsString, u64)>,
         environment: Option<EnvRef>,
     },
@@ -1907,7 +1907,7 @@ enum Callable<'a> {
     /// that class's own private environment (see `build_private_arrow`).
     PrivateArrow {
         class: Value,
-        source: &'a JsString,
+        source: JsString,
         strict: bool,
         environment: Option<EnvRef>,
     },
@@ -2046,13 +2046,10 @@ fn callable<'a>(
             bound_args,
         }),
         FunctionKind::EcmaScript => {
-            let data = agent
-                .ecma_functions
-                .get(&function.id())
-                .ok_or(Unsupported::new(
-                    "a function",
-                    "its body is not registered on this agent",
-                ))?;
+            let data = agent.ecma_function(&function.id()).ok_or(Unsupported::new(
+                "a function",
+                "its body is not registered on this agent",
+            ))?;
             // A method that could resolve a private name cannot be rebuilt from
             // its own text: the object literal a MethodDefinition is valid in has
             // no class body, so a `#name` has no scope in it. It is carried as a
@@ -2062,7 +2059,7 @@ fn callable<'a>(
             // property would name the class as a member of itself.
             if data.is_method
                 && !data.is_class_constructor
-                && let Some((class, key, form)) = class_member(agent, function, data)
+                && let Some((class, key, form)) = class_member(agent, function, &data)
             {
                 return Ok(Callable::ClassMember {
                     class,
@@ -2071,7 +2068,7 @@ fn callable<'a>(
                     home: data.home_object,
                 });
             }
-            let Some(source) = data.source() else {
+            let Some(source) = data.source().cloned() else {
                 // No source is the primary fact, and it is checked before the
                 // method form because a class constructor, an accessor and an
                 // arrow all reach here with no source of their own — the engine
@@ -2098,9 +2095,9 @@ fn callable<'a>(
                 // carry those inputs.
                 return Ok(Callable::Class {
                     source,
-                    heritage: carried_heritage(agent, data),
-                    keys: data.computed_keys(),
-                    private_names: carried_private_names(data),
+                    heritage: carried_heritage(agent, &data),
+                    keys: data.computed_keys().to_vec(),
+                    private_names: carried_private_names(&data),
                     // The class scope record every one of its methods closes over,
                     // with the same fall-back an arrow takes: a chain the format
                     // cannot carry leaves the class's methods resolving the
@@ -2126,7 +2123,7 @@ fn callable<'a>(
                 // expression has no class body to give `#name` a scope, so it is
                 // carried as a member of the class the name belongs to instead
                 // (see `private_arrow`).
-                if let Some(class) = private_arrow(agent, data) {
+                if let Some(class) = private_arrow(agent, &data) {
                     return Ok(Callable::PrivateArrow {
                         class,
                         source,
@@ -2227,7 +2224,7 @@ fn class_member(
     // the class constructor's brand. Both are found by identity the same way, and
     // addressed by the Private Name's id the class declaration minted.
     let class_function = class.as_function()?;
-    let class_data = agent.ecma_functions.get(&class_function.id())?;
+    let class_data = agent.ecma_function(&class_function.id())?;
     for element in class_data.private_methods() {
         if let Some((name_id, form)) = private_member_form(element, id) {
             return Some((class, MemberKey::Private(name_id), form));
@@ -2344,7 +2341,7 @@ fn private_arrow(agent: &Agent, data: &crate::function::EcmaFunction) -> Option<
         return None;
     }
     let enclosing = enclosing_function(data.environment)?;
-    let enclosing_data = agent.ecma_functions.get(&enclosing.id())?;
+    let enclosing_data = agent.ecma_function(&enclosing.id())?;
     if enclosing_data.is_class_constructor {
         return Some(Value::Function(enclosing));
     }
@@ -2595,8 +2592,7 @@ fn carried_private_names(data: &crate::function::EcmaFunction) -> Vec<(JsString,
 /// `constructor` from an ordinary function a host stored under that name.
 fn is_class_constructor(agent: &Agent, function: &Handle<Function>) -> bool {
     agent
-        .ecma_functions
-        .get(&function.id())
+        .ecma_function(&function.id())
         .is_some_and(|data| data.is_class_constructor)
 }
 
@@ -2999,7 +2995,7 @@ fn write_record(
                         realm,
                         &function,
                         grammar,
-                        source,
+                        &source,
                         strict,
                         environment,
                         carried,
@@ -3016,7 +3012,7 @@ fn write_record(
                     realm,
                     &function,
                     Grammar::Arrow,
-                    source,
+                    &source,
                     strict,
                     environment,
                     Carried::Arrow(Some(class)),
@@ -3033,7 +3029,7 @@ fn write_record(
                     realm,
                     &function,
                     Grammar::Class,
-                    source,
+                    &source,
                     true,
                     environment,
                     Carried::Class {
@@ -3289,13 +3285,13 @@ fn write_private_elements(
 /// class, which is what gives the private names in its expression a body to be
 /// declared in; or a class's definition-time inputs, which are the values the
 /// rebuild must not re-evaluate.
-enum Carried<'a> {
+enum Carried {
     None,
     Home(Option<Value>),
     Arrow(Option<Value>),
     Class {
         heritage: Option<Value>,
-        keys: &'a [PropertyKey],
+        keys: Vec<PropertyKey>,
         private_names: Vec<(JsString, u64)>,
     },
 }
@@ -3534,7 +3530,7 @@ fn write_function(
     source: &JsString,
     strict: bool,
     environment: Option<EnvRef>,
-    carried: Carried<'_>,
+    carried: Carried,
     serials: &HashMap<Identity, u32>,
     body: &mut Vec<u8>,
 ) -> Result<(), Unsupported> {
@@ -3574,7 +3570,7 @@ fn write_function(
                 heritage.map_or(NO_REF, |heritage| serial_in(realm, serials, heritage)),
             );
             write_u32(body, keys.len() as u32);
-            for key in keys {
+            for key in &keys {
                 write_u32(body, serial_in(realm, serials, key_value(key)));
             }
             write_u32(body, private_names.len() as u32);
@@ -5229,7 +5225,7 @@ impl Builder<'_> {
                     .ok()
                     .flatten()
                     .is_some()
-                    && let Some(data) = self.agent.ecma_functions.get_mut(&function.id())
+                    && let Some(mut data) = self.agent.ecma_function_mut(&function.id())
                 {
                     data.prototype_pending = false;
                 }
@@ -5279,7 +5275,7 @@ impl Builder<'_> {
                             &source,
                             &[],
                         );
-                        self.agent.execution_context_stack.pop();
+                        self.agent.roots.execution_context_stack.pop();
                         compiled.map_err(|error| {
                             DecodeError::UnrebuildableFunction(format!(
                                 "its module source could not be compiled: {error}"
@@ -5515,7 +5511,7 @@ impl Builder<'_> {
                 } else {
                     crate::function::create_unmapped_arguments_object(self.agent, &args)
                 };
-                self.agent.execution_context_stack.pop();
+                self.agent.roots.execution_context_stack.pop();
                 let value = value.map_err(|error| {
                     DecodeError::UnrebuildableObject(format!(
                         "the engine would not make the arguments object: {error}"
@@ -5993,8 +5989,9 @@ impl Builder<'_> {
         let realm = *self.realm;
         let environment = self.function_environment(environment)?;
         self.agent.push_bootstrap_context(realm);
-        if let Some(context) = self.agent.execution_context_stack.last_mut() {
-            context.source = Some(JsString::from_utf8(&wrapped));
+        let source = JsString::from_utf8(&wrapped);
+        if let Some(mut context) = self.agent.roots.execution_context_stack.last_mut() {
+            context.source = Some(source);
         }
         let value = crate::function::instantiate_arrow(
             self.agent,
@@ -6008,7 +6005,7 @@ impl Builder<'_> {
             span,
             None,
         );
-        self.agent.execution_context_stack.pop();
+        self.agent.roots.execution_context_stack.pop();
         let value = value.map_err(|error| {
             DecodeError::UnrebuildableFunction(format!(
                 "its arrow source could not be instantiated: {error}"
@@ -6067,8 +6064,7 @@ impl Builder<'_> {
         };
         let private = self
             .agent
-            .ecma_functions
-            .get(&class_function.id())
+            .ecma_function(&class_function.id())
             .and_then(|data| data.private_environment)
             .ok_or_else(|| {
                 DecodeError::UnrebuildableFunction(
@@ -6107,8 +6103,9 @@ impl Builder<'_> {
         let realm = *self.realm;
         let environment = self.function_environment(environment)?;
         self.agent.push_bootstrap_context(realm);
-        if let Some(context) = self.agent.execution_context_stack.last_mut() {
-            context.source = Some(JsString::from_utf8(&wrapped));
+        let source = JsString::from_utf8(&wrapped);
+        if let Some(mut context) = self.agent.roots.execution_context_stack.last_mut() {
+            context.source = Some(source);
         }
         let value = crate::function::instantiate_arrow(
             self.agent,
@@ -6122,7 +6119,7 @@ impl Builder<'_> {
             span,
             None,
         );
-        self.agent.execution_context_stack.pop();
+        self.agent.roots.execution_context_stack.pop();
         let value = value.map_err(|error| {
             DecodeError::UnrebuildableFunction(format!(
                 "its arrow source could not be instantiated: {error}"
@@ -6134,7 +6131,7 @@ impl Builder<'_> {
         // The re-point that makes the rebuilt arrow resolve through the carried
         // class: the wrapper's parse gave it a brand of its own, and the class's
         // is the one its instances share.
-        if let Some(data) = self.agent.ecma_functions.get_mut(&function.id()) {
+        if let Some(mut data) = self.agent.ecma_function_mut(&function.id()) {
             data.private_environment = Some(private);
         }
         function
@@ -6197,8 +6194,9 @@ impl Builder<'_> {
             home => Some(self.materialize(home)?),
         };
         self.agent.push_bootstrap_context(realm);
-        if let Some(context) = self.agent.execution_context_stack.last_mut() {
-            context.source = Some(JsString::from_utf8(&wrapped));
+        let source = JsString::from_utf8(&wrapped);
+        if let Some(mut context) = self.agent.roots.execution_context_stack.last_mut() {
+            context.source = Some(source);
         }
         let value = match definition {
             MethodDefinition::Method(function) => {
@@ -6232,7 +6230,7 @@ impl Builder<'_> {
                 Some(JsString::from_utf8(&text)),
             ),
         };
-        self.agent.execution_context_stack.pop();
+        self.agent.roots.execution_context_stack.pop();
         let value = value.map_err(|error| {
             DecodeError::UnrebuildableFunction(format!(
                 "its method source could not be instantiated: {error}"
@@ -6327,8 +6325,9 @@ impl Builder<'_> {
             DecodeError::UnrebuildableFunction("its class source is not a class".into())
         })?;
         self.agent.push_bootstrap_context(realm);
-        if let Some(context) = self.agent.execution_context_stack.last_mut() {
-            context.source = Some(JsString::from_utf8(&wrapped));
+        let source = JsString::from_utf8(&wrapped);
+        if let Some(mut context) = self.agent.roots.execution_context_stack.last_mut() {
+            context.source = Some(source);
             // `setup_class_scope` builds the class scope record's outer from the
             // running context's lexical environment, and every method the
             // evaluation makes closes over that class scope record — so this is
@@ -6356,7 +6355,7 @@ impl Builder<'_> {
             &resolved,
             &carried_names,
         );
-        self.agent.execution_context_stack.pop();
+        self.agent.roots.execution_context_stack.pop();
         let value = value.map_err(|error| {
             DecodeError::UnrebuildableFunction(format!(
                 "its class source could not be evaluated: {error}"
@@ -6410,15 +6409,14 @@ impl Builder<'_> {
                         "its class record is not a class function".into(),
                     )
                 })?;
-                let from_methods = self
-                    .agent
-                    .ecma_functions
-                    .get(&class_function.id())
-                    .and_then(|data| {
-                        data.private_methods()
-                            .iter()
-                            .find_map(|element| private_member_value(element, *name_id, form))
-                    });
+                let from_methods =
+                    self.agent
+                        .ecma_function(&class_function.id())
+                        .and_then(|data| {
+                            data.private_methods()
+                                .iter()
+                                .find_map(|element| private_member_value(element, *name_id, form))
+                        });
                 from_methods
                     .or_else(|| {
                         class_function
@@ -6533,7 +6531,7 @@ impl Builder<'_> {
             Some(JsString::from_utf16(source)),
             strict,
         );
-        self.agent.execution_context_stack.pop();
+        self.agent.roots.execution_context_stack.pop();
         let value = value.map_err(|error| {
             DecodeError::UnrebuildableFunction(format!(
                 "its source could not be instantiated: {error}"

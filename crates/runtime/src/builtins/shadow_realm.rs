@@ -285,7 +285,7 @@ fn evaluate(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, Js
     // environment is exactly GetShadowRealmContext's.
     agent.push_bootstrap_context(inner);
     let result = crate::script::perform_eval(agent, &source_text, false, false);
-    agent.execution_context_stack.pop();
+    agent.roots.execution_context_stack.pop();
     match result {
         Ok(value) => get_wrapped_value(agent, caller_realm, caller_realm, value),
         // An abrupt completion becomes a TypeError copy in the caller realm

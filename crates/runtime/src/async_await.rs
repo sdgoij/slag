@@ -112,8 +112,8 @@ pub fn call_async_function(
     args: &[Value],
 ) -> Result<Value, JsError> {
     let data = agent
-        .ecma_functions
-        .get(&function.id())
+        .ecma_function(&function.id())
+        .as_deref()
         .cloned()
         .ok_or_else(|| {
             JsError::new(
@@ -149,7 +149,7 @@ pub fn call_async_function(
         annex_b_hoistable: Default::default(),
         position: None,
     };
-    agent.execution_context_stack.push(context.clone());
+    agent.roots.execution_context_stack.push(context.clone());
     let promise_ctor = agent
         .current_realm()?
         .intrinsics
@@ -262,12 +262,12 @@ pub fn call_async_function(
             drop(state_ref);
             match outcome {
                 VmOutcome::Completed(completion) => {
-                    agent.execution_context_stack.pop();
+                    agent.roots.execution_context_stack.pop();
                     settle_async_completion(agent, &state, completion)?;
                 }
                 VmOutcome::Suspended(Suspension::Await(value)) => {
                     save_await_site(agent, &state);
-                    agent.execution_context_stack.pop();
+                    agent.roots.execution_context_stack.pop();
                     attach_await(agent, &state, value)?;
                 }
                 // `run_inner`'s driver consumes tail calls internally; an
@@ -299,7 +299,7 @@ pub fn call_async_function(
         match run() {
             Ok(value) => Ok(value),
             Err(error) => {
-                agent.execution_context_stack.pop();
+                agent.roots.execution_context_stack.pop();
                 let rejection = crate::promise::error_value(agent, &error);
                 crate::function::call(agent, &capability.reject, Value::Undefined, &[rejection])?;
                 Ok(capability.promise)
@@ -318,6 +318,7 @@ pub fn call_async_function(
 /// it is at.
 pub(crate) fn save_await_site(agent: &Agent, state: &Rc<RefCell<AsyncFunctionState>>) {
     if let Some(position) = agent
+        .roots
         .execution_context_stack
         .last()
         .and_then(|c| c.position)
@@ -408,7 +409,7 @@ fn resume_async(
         Resume::Normal(value)
     };
     let context = state.borrow().context.clone();
-    agent.execution_context_stack.push(context);
+    agent.roots.execution_context_stack.push(context);
     let body = state.borrow().body.clone();
     let outcome = {
         let mut state = state.borrow_mut();
@@ -426,7 +427,7 @@ fn resume_async(
         }
     };
     save_await_site(agent, &state);
-    agent.execution_context_stack.pop();
+    agent.roots.execution_context_stack.pop();
     let outcome = match outcome {
         Ok(outcome) => outcome,
         // A step error in a resumed body rejects the function's promise — the

@@ -215,7 +215,7 @@ mod tests {
         agent.push_bootstrap_context(realm);
         // The drain happens with nothing evaluating, which is the shape that
         // made the realm the job carries matter.
-        agent.execution_context_stack.pop();
+        agent.roots.execution_context_stack.pop();
 
         let seen: std::rc::Rc<std::cell::RefCell<Vec<&'static str>>> = Default::default();
         let seen_job = seen.clone();

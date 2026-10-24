@@ -580,7 +580,7 @@ fn function_record(value: &api::Local, question: impl Fn(&EcmaFunction) -> bool)
         return false;
     };
     let id = function.id();
-    ask(|agent| agent.ecma_functions.get(&id).is_some_and(&question)).unwrap_or(false)
+    ask(|agent| agent.ecma_function(&id).as_deref().is_some_and(&question)).unwrap_or(false)
 }
 
 pub(crate) fn is_async_function(value: &api::Local) -> bool {

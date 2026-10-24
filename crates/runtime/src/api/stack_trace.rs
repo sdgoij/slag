@@ -155,14 +155,15 @@ impl Isolate {
 /// The frame view of the agent's execution contexts: innermost first, at most
 /// `limit` of them.
 pub(crate) fn stack_frames(agent: &Agent, limit: usize) -> Vec<StackFrame> {
-    agent
-        .execution_context_stack
-        .iter()
-        .rev()
-        .filter(|context| is_frame(context))
-        .take(limit)
-        .map(|context| frame_of(agent, context))
-        .collect()
+    agent.roots.execution_context_stack.with(|stack| {
+        stack
+            .iter()
+            .rev()
+            .filter(|context| is_frame(context))
+            .take(limit)
+            .map(|context| frame_of(agent, context))
+            .collect()
+    })
 }
 
 /// Whether an execution context is a frame a host sees.
@@ -246,8 +247,7 @@ pub(crate) fn frame_code(agent: &Agent, context: &ExecutionContext) -> Option<Sc
             return None;
         };
         agent
-            .ecma_functions
-            .get(&function.id())
+            .ecma_function(&function.id())
             .and_then(|record| record.declaring_script_or_module.clone())
     })
 }

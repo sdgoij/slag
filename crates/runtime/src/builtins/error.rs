@@ -582,11 +582,14 @@ fn define_stack(
     let mut frames: Vec<crate::api::StackFrame> = Vec::new();
     // The realm's bootstrap context is not code the engine is running, so it is
     // not a frame: the same rule every other frame view uses.
-    let frame_contexts = agent
-        .execution_context_stack
-        .iter()
-        .rev()
-        .filter(|context| crate::api::stack_trace::is_frame(context));
+    let frame_contexts: Vec<_> = agent.roots.execution_context_stack.with(|stack| {
+        stack
+            .iter()
+            .rev()
+            .filter(|context| crate::api::stack_trace::is_frame(context))
+            .cloned()
+            .collect()
+    });
     // A named constructor omits the frames above it — the ones newer than it,
     // its own included — and keeps the frames older than it, which is why a
     // host passes its own builder and still reports its caller
@@ -595,7 +598,7 @@ fn define_stack(
     // a name that is not on the stack omits every frame, the same rule read to
     // its end.
     let mut up_to = until;
-    for context in frame_contexts {
+    for context in &frame_contexts {
         if let Some(named) = up_to {
             let found = context
                 .function

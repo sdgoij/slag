@@ -150,9 +150,8 @@ impl Isolate {
             return None;
         };
         self.agent
-            .ecma_functions
-            .get(&function.id())
-            .and_then(|data| data.source())
+            .ecma_function(&function.id())
+            .and_then(|data| data.source().cloned())
             .map(|source| source.to_string_lossy())
     }
 

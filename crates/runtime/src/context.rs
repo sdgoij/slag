@@ -61,8 +61,7 @@ pub fn get_function_realm(agent: &mut Agent, value: &Value) -> Result<Handle<Rea
     match value.kind() {
         ValueKind::Function(function) => match &function.kind {
             crux::function::FunctionKind::EcmaScript => agent
-                .ecma_functions
-                .get(&function.id())
+                .ecma_function(&function.id())
                 .map(|data| data.realm)
                 .ok_or_else(|| {
                     JsError::new(
@@ -1174,11 +1173,12 @@ fn undefined_error(name: &JsString) -> JsError {
 /// spec 9.4.1 GetActiveScriptOrModule: the topmost execution context whose
 /// ScriptOrModule is not null, if any.
 pub fn get_active_script_or_module(agent: &Agent) -> Option<ScriptOrModule> {
-    agent
-        .execution_context_stack
-        .iter()
-        .rev()
-        .find_map(|context| context.script_or_module.clone())
+    agent.roots.execution_context_stack.with(|stack| {
+        stack
+            .iter()
+            .rev()
+            .find_map(|context| context.script_or_module.clone())
+    })
 }
 
 /// spec 9.4.2 ResolveBinding.
@@ -1370,8 +1370,7 @@ pub fn get_super_constructor(agent: &Agent) -> Result<Value, JsError> {
         ));
     };
     let derived = agent
-        .ecma_functions
-        .get(&function.id())
+        .ecma_function(&function.id())
         .is_some_and(|data| data.super_constructor().is_some());
     if !derived {
         return Err(JsError::new(
@@ -1412,8 +1411,7 @@ pub fn get_super_base(agent: &Agent) -> Result<Value, JsError> {
         return Ok(Value::Undefined);
     };
     let Some(home) = agent
-        .ecma_functions
-        .get(&function.id())
+        .ecma_function(&function.id())
         .and_then(|data| data.home_object)
     else {
         return Ok(Value::Undefined);

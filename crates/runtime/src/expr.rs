@@ -303,7 +303,8 @@ fn eval_call_chain(
         let result = crate::function::construct(agent, &super_ctor, &args, &new_target)?;
         let this_env = crate::context::get_this_environment(agent)?;
         this_env.bind_this_value(result)?;
-        if let Some(function_value) = agent.running_context()?.function {
+        let function_value = agent.running_context()?.function;
+        if let Some(function_value) = function_value {
             crate::function::initialize_instance_elements(agent, &result, &function_value)?;
         }
         return Ok(Some(ChainResult::Value(result)));

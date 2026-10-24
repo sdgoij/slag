@@ -617,10 +617,12 @@ fn try_leaf_call_reusing(
         environment: entry.environment,
         construct_inline: false,
     };
-    let Ok(context) = agent.running_context() else {
-        return None;
+    let env = {
+        let Ok(context) = agent.running_context() else {
+            return None;
+        };
+        context.lexical_environment
     };
-    let env = context.lexical_environment;
     let mut vm = match slot.take() {
         Some(mut vm) => {
             vm.rebind(env, entry.strict);
@@ -730,7 +732,7 @@ fn function_to_string(agent: &mut Agent, this: &Value) -> Result<Value, JsError>
         ));
     }
     if let ValueKind::Function(function) = this.kind()
-        && let Some(data) = agent.ecma_functions.get(&function.id())
+        && let Some(data) = agent.ecma_function(&function.id())
         && let Some(source) = data.source()
     {
         return Ok(Value::String(Handle::new(source.clone())));

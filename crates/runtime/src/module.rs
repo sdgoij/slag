@@ -1411,7 +1411,7 @@ fn instantiate_module_declarations(
             // the function's own slice, which a nested closure's span would run
             // past.
             if let ValueKind::Function(handle) = func.kind()
-                && let Some(record) = agent.ecma_functions.get_mut(&handle.id())
+                && let Some(mut record) = agent.ecma_function_mut(&handle.id())
             {
                 record.declaring_script_or_module =
                     Some(crate::context::ScriptOrModule::Module(*module));
@@ -1787,7 +1787,7 @@ fn execute_module_body(
         annex_b_hoistable: Default::default(),
         position: None,
     };
-    agent.execution_context_stack.push(context.clone());
+    agent.roots.execution_context_stack.push(context.clone());
     let strict = true;
     let body = crate::ir::compile_statements(&stmts, strict, false)?;
     let (promise, resolve, reject) = {
@@ -1823,7 +1823,7 @@ fn execute_module_body(
     drop(state_ref);
     match outcome {
         Ok(VmOutcome::Completed(completion)) => {
-            agent.execution_context_stack.pop();
+            agent.roots.execution_context_stack.pop();
             // The module body's `using` resources are disposed at completion
             // in reverse registration order, like an async body (spec 9.4.3
             // + 16.2.2.5): drain and dispose before settling the capability.
@@ -1846,7 +1846,7 @@ fn execute_module_body(
         // contain return statements); an escaped one is an internal invariant
         // violation.
         Ok(VmOutcome::TailCall(_)) => {
-            agent.execution_context_stack.pop();
+            agent.roots.execution_context_stack.pop();
             return Err(JsError::new(
                 ErrorKind::TypeError,
                 "tail call escaped the module driver".into(),
@@ -1855,7 +1855,7 @@ fn execute_module_body(
         // `run_inner`'s driver performs a withdrawn call before the body can
         // complete; an escaped one is an internal invariant violation.
         Ok(VmOutcome::Call(_)) => {
-            agent.execution_context_stack.pop();
+            agent.roots.execution_context_stack.pop();
             return Err(JsError::new(
                 ErrorKind::TypeError,
                 "withdrawn call escaped the module driver".into(),
@@ -1867,16 +1867,17 @@ fn execute_module_body(
             // from: the suspension step published the await's own span as the
             // site, so the body context's position is it.
             let site = agent
+                .roots
                 .execution_context_stack
                 .last()
                 .and_then(|context| context.position);
             module.stalled_await.replace(site);
             crate::async_await::save_await_site(agent, &state);
-            agent.execution_context_stack.pop();
+            agent.roots.execution_context_stack.pop();
             crate::async_await::attach_await(agent, &state, value)?;
         }
         Ok(VmOutcome::Suspended(_)) => {
-            agent.execution_context_stack.pop();
+            agent.roots.execution_context_stack.pop();
             module.status.replace(ModuleStatus::Evaluated);
             return Err(JsError::new(
                 ErrorKind::TypeError,
@@ -1884,7 +1885,7 @@ fn execute_module_body(
             ));
         }
         Err(error) => {
-            agent.execution_context_stack.pop();
+            agent.roots.execution_context_stack.pop();
             // An abrupt completion that is not a statement-level `throw` — a
             // call that threw, a failed coercion — settles the module the same
             // way one that is: the value goes on the module's

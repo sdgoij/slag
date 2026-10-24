@@ -1088,8 +1088,7 @@ impl FunctionEnv {
             return false;
         };
         agent
-            .ecma_functions
-            .get(&function.id())
+            .ecma_function(&function.id())
             .is_some_and(|data| data.home_object.is_some())
     }
 

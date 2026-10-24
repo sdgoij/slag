@@ -11644,7 +11644,7 @@ var $DONE = function (error) {
                         let text = runtime::context::to_string(agent, &source)?;
                         agent.push_bootstrap_context(new_realm);
                         let result = agent.run_script(&text.to_string_lossy());
-                        agent.execution_context_stack.pop();
+                        agent.pop_bootstrap_context();
                         result
                     }),
                     None,

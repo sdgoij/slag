@@ -757,20 +757,80 @@ borrow is held across the work they guard.
 Gate run: clippy clean, `cargo test -p runtime --release --lib` 1068 pass,
 `language --filter "*eval*"` 1166/1166 under `--gc-stress --gc-verify`.
 
-### Slice 3b (open): `execution_context_stack` and `ecma_functions`
+### Slice 3b landed: the execution-context stack and the function records
 
-These two are why slice 3 is not finished. `execution_context_stack` has 86
-direct accesses plus 160 through `running_context`/`running_context_mut`
-(`running_context_mut` has 48 callers), and it is pushed and popped on every
-call; the wrapper is mechanical (`push`/`pop`/`len`/`last`/`last_mut`), but a
-`RefMut` held across a nested push/pop would panic at run time rather than fail
-to compile, so each `last_mut`/`running_context_mut` site has to be checked for
-a stack operation inside its guard window. `ecma_functions` has 17 `get` and 11
-`get_mut` sites, and several of the `get_mut` ones (`ensure_function_prototype`,
-`setup_class_scope`) do allocating work while the record is borrowed, so they
-need a read-copy-write restructure before the table can become interior
-mutable. Both are on the call path, so they also owe a call-throughput
-measurement (`--bench`, plus the corpus runs) against this commit.
+Moved to `AgentRoots`: `execution_context_stack` (now `ContextStack`, a
+`RefCell<Vec<ExecutionContext>>` with `push`/`pop`/`last`/`last_mut`) and
+`ecma_functions` (an `IdMap<EcmaFunction>` behind a `RefCell`).
+
+The stack is pushed and popped on every call and its top context's `position`
+is written by every `Step::Site`, so its two accessors hand out a guard:
+`Agent::running_context` returns `Ref<ExecutionContext>` and
+`running_context_mut` returns `RefMut<ExecutionContext>` (the interpreter
+writes `lexical_environment` through it while a class body, a per-iteration
+loop env or an eval is set up). `push_bootstrap_context` and its new
+`pop_bootstrap_context` stay public for hosts (test262's `evalScript` brackets
+a `run_script` with them).
+
+That changes what the compiler can catch. A guard is a drop type, so NLL no
+longer ends the borrow at the last use: holding one across anything that takes
+`&mut Agent` is now a compile error, which is how the remaining sites were
+found (`eval_function_declaration`, `script::eval_in_context`, `call_inner`'s
+class-constructor check). The hazard the compiler cannot see is a push or pop
+inside a guard's window — both reach the stack through `&Agent`, so they would
+panic at run time. All 160 `running_context`/`running_context_mut` sites and
+every direct `.last()`/`.last_mut()` were audited: every read guard is either a
+one-statement expression or a scoped binding whose fields are copied out
+before anything runs. Two shapes are worth naming, because a later change can
+reintroduce the problem:
+
+- `snapshot::callable` returned `&JsString`/`&[PropertyKey]` borrowed from the
+  record, which a guard cannot provide, so `Callable::Class`/`Body`/
+  `PrivateArrow` now own their `source` and `keys` and `Carried` owns its
+  `keys`. That is a clone on the snapshot-writer path only.
+- `call_inner`, `ordinary_call`, `tail_prepare_ordinary`, the JIT lanes and
+  `ir`'s fast-call probe copy the record's `ir`/`environment`/`realm`/`strict`/
+  `flags` inside one borrow and drop it before the call. `EcmaFunction` is
+  large (params, body AST, chains), so cloning the record is the thing this
+  shape exists to avoid.
+
+`ecma_functions` is reached through `Agent::ecma_function` (public: `crates/v8`
+asks whether a function is async/generator), `ecma_function_mut`,
+`register_ecma_function` and `remove_ecma_function`. Only the two registration
+paths and the sweep's `remove` mutate it, and none holds a guard.
+`ensure_function_prototype` was the one read-copy-write case: it copies `realm`
+in the same borrow that tests `prototype_pending`, materializes, then re-takes
+the record to clear the flag.
+
+Cost: no measurable call-throughput regression. `--bench`, release binaries,
+min of 15 runs, interleaved on the same machine, `a8c90621` vs this tree:
+function calls 26.85 -> 26.73 ms, per-iteration 9.99 -> 9.96 ms, closure
+capture 31.65 -> 31.16 ms, construct churn 17.05 -> 17.10 ms; the other rows
+move within +/-6% in both directions, and a row with no calls at all (`bare
+loop`) moves -1.4% min / +8.2% median, so that is the noise floor. The 77-row
+corpus (`--corpus tools/corpus/workloads`, 5 runs, min) does not resolve a
+few-percent change either: its own bare-loop control row moved +4.6% under the
+JIT while the JITless column showed 51 of 77 rows "improving" by up to 16%.
+
+The one measured cost is stack: the per-cycle frame grew by about 5%, which
+shows up as host-reentry recursion depth 409 -> 375 on the 2 MiB ladder in
+`eval::tests` (and 203 -> 191 for the unmarked arm). That assertion compared
+against exactly a half, and the ratio is structurally ~2 (the unmarked path
+keeps the dispatch frame), so it sat 0.5% from failing at `a8c90621`; it now
+asks for two thirds, which the mutation it guards against (ratio 1.0) still
+misses by a wide margin. The numbers are in the test's doc comment.
+
+Gate run: clippy `-D warnings` clean (workspace, all targets, all features),
+`cargo fmt --check` clean, `cargo test --workspace` 5809 pass in both profiles;
+`built-ins --filter "*Promise*"` 732/732, `Function/*` 509/509, `*Generator*`
+157/157, `language --filter "*eval*"` 1166/1166; under `--gc-stress --gc-verify`
+`Function/*` (509 fixtures, one pre-existing hang — see below), a 192-fixture
+`built-ins` sample, a 55-fixture `language` sample, class and function
+expression samples, and a script exercising derived classes, private methods,
+`super`, method home objects and the lazy `prototype` (jit, jitless, stressed).
+The two hangs that remain under `--gc-stress` are pre-existing: the same
+fixtures hang on a binary built from `a8c90621` (Unicode table construction is
+what the stress mode multiplies), so they are not a regression from this slice.
 
 ---
 

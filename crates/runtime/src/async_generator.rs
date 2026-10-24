@@ -266,8 +266,8 @@ pub fn call_async_generator(
     args: &[Value],
 ) -> Result<Value, JsError> {
     let data = agent
-        .ecma_functions
-        .get(&function.id())
+        .ecma_function(&function.id())
+        .as_deref()
         .cloned()
         .ok_or_else(|| {
             JsError::new(
@@ -305,7 +305,7 @@ pub fn call_async_generator(
     // EvaluateAsyncGeneratorBody runs FunctionDeclarationInstantiation at
     // call time, so parameter binding errors (e.g. a throwing @@iterator in a
     // destructuring pattern) throw synchronously (spec 15.6.2).
-    agent.execution_context_stack.push(context);
+    agent.roots.execution_context_stack.push(context);
     let instantiate = (|| -> Result<(), JsError> {
         if data.this_mode != ThisMode::Lexical {
             // OrdinaryCallBindThis (spec 10.2.1): sloppy functions coerce
@@ -337,16 +337,17 @@ pub fn call_async_generator(
         Ok(())
     })();
     if let Err(error) = instantiate {
-        agent.execution_context_stack.pop();
+        agent.roots.execution_context_stack.pop();
         return Err(error);
     }
     let instantiated_context = agent
+        .roots
         .execution_context_stack
         .last()
-        .cloned()
+        .map(|context| context.clone())
         .ok_or_else(|| JsError::new(ErrorKind::TypeError, "no context to capture".into()))?;
     let body_env = instantiated_context.lexical_environment;
-    agent.execution_context_stack.pop();
+    agent.roots.execution_context_stack.pop();
 
     // OrdinaryCreateFromConstructor (spec 10.2.4): the instance inherits the
     // function's own `prototype` property (a per-function object whose
@@ -738,7 +739,7 @@ fn drive(
     let outcome = match outcome {
         Ok(outcome) => outcome,
         Err(error) => {
-            agent.execution_context_stack.pop();
+            agent.roots.execution_context_stack.pop();
             let request = take_current(agent, object_id)?;
             set_flag(agent, object_id, AsyncGeneratorFlag::Completed)?;
             if let Some(request) = request {
@@ -769,19 +770,19 @@ fn drive(
             // already-awaited result, so AsyncGeneratorYield completes the
             // current request with it directly — it is not awaited again
             // (spec 15.5.5 normal case: AsyncGeneratorYield(IteratorValue)).
-            let context = agent
-                .execution_context_stack
-                .pop()
-                .ok_or_else(|| JsError::new(ErrorKind::TypeError, "no context to pop".into()))?;
+            let context =
+                agent.roots.execution_context_stack.pop().ok_or_else(|| {
+                    JsError::new(ErrorKind::TypeError, "no context to pop".into())
+                })?;
             save_context(agent, object_id, context)?;
             resume_from_yield(agent, object_id, value)?;
             Ok(())
         }
         VmOutcome::Suspended(Suspension::Yield { value, .. }) => {
-            let context = agent
-                .execution_context_stack
-                .pop()
-                .ok_or_else(|| JsError::new(ErrorKind::TypeError, "no context to pop".into()))?;
+            let context =
+                agent.roots.execution_context_stack.pop().ok_or_else(|| {
+                    JsError::new(ErrorKind::TypeError, "no context to pop".into())
+                })?;
             save_context(agent, object_id, context)?;
             // spec 27.8.3.7: `yield arg` awaits arg first, so the value
             // reaches AsyncGeneratorYield unwrapped. The state stays
@@ -790,10 +791,10 @@ fn drive(
             Ok(())
         }
         VmOutcome::Suspended(Suspension::Await(value)) => {
-            let context = agent
-                .execution_context_stack
-                .pop()
-                .ok_or_else(|| JsError::new(ErrorKind::TypeError, "no context to pop".into()))?;
+            let context =
+                agent.roots.execution_context_stack.pop().ok_or_else(|| {
+                    JsError::new(ErrorKind::TypeError, "no context to pop".into())
+                })?;
             save_context(agent, object_id, context)?;
             attach_await(agent, object_id, value, AwaitKind::Body)?;
             Ok(())
@@ -802,16 +803,16 @@ fn drive(
             // The `yield*` delegation has no `return` method: the received
             // value is awaited and the body is resumed with a return
             // completion of it (spec 15.5.5 return case step b).
-            let context = agent
-                .execution_context_stack
-                .pop()
-                .ok_or_else(|| JsError::new(ErrorKind::TypeError, "no context to pop".into()))?;
+            let context =
+                agent.roots.execution_context_stack.pop().ok_or_else(|| {
+                    JsError::new(ErrorKind::TypeError, "no context to pop".into())
+                })?;
             save_context(agent, object_id, context)?;
             attach_await(agent, object_id, value, AwaitKind::ReturnResume)?;
             Ok(())
         }
         VmOutcome::Completed(completion) => {
-            agent.execution_context_stack.pop();
+            agent.roots.execution_context_stack.pop();
             // spec 27.6.3.2 steps 6-7: normal and empty completions become
             // undefined; a return completion keeps its value.
             let completion = match completion {
@@ -902,8 +903,8 @@ fn start_body(agent: &mut Agent, object_id: u64) -> Result<VmOutcome, JsError> {
     };
     let function_id = function_handle.id();
     let data = agent
-        .ecma_functions
-        .get(&function_id)
+        .ecma_function(&function_id)
+        .as_deref()
         .cloned()
         .ok_or_else(|| JsError::new(ErrorKind::TypeError, "body not registered".into()))?;
     let body = data.ir.clone().ok_or_else(|| {
@@ -912,7 +913,7 @@ fn start_body(agent: &mut Agent, object_id: u64) -> Result<VmOutcome, JsError> {
             "async generator body was not compiled".into(),
         )
     })?;
-    agent.execution_context_stack.push(context);
+    agent.roots.execution_context_stack.push(context);
     let mut vm = Vm::new(body_env, data.strict);
     let outcome = vm.start(agent, &body)?;
     let state = agent
@@ -967,7 +968,7 @@ fn resume_body(
             vm,
         )
     };
-    agent.execution_context_stack.push(context);
+    agent.roots.execution_context_stack.push(context);
     let outcome = match completion {
         Resume::Throw(_) | Resume::Return(_) if !suspended_at_delegate => {
             vm.run_abrupt(agent, &body, completion)

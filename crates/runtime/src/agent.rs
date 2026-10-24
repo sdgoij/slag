@@ -5,7 +5,7 @@
 //! spec 9.7 table. Single-threaded: [[CanBlock]] is false, so
 //! AgentCanSuspend() is false.
 
-use std::cell::{Cell, RefCell};
+use std::cell::{Cell, Ref, RefCell, RefMut};
 use std::collections::VecDeque;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -362,6 +362,60 @@ impl crux::heap::Trace for ErrorStack {
 /// (strict, fast_script, jsx) — see [`AgentRoots::script_bodies`].
 pub(crate) type ScriptBodyKey = (crux::JsString, bool, bool, bool);
 
+/// The agent's execution-context stack (spec 9.4).
+///
+/// It lives in [`AgentRoots`] with the other containers the collector reads, so
+/// every operation takes `&self`: the interpreter pushes and pops contexts from
+/// frames that hold a `&mut Agent`, and a `&mut` receiver would make the
+/// collector's read the second exclusive access the M-1 note describes.
+///
+/// [`last`](Self::last) and [`last_mut`](Self::last_mut) hand out a guard rather
+/// than a reference, because a pushed or popped context cannot be pointed at
+/// from outside the cell. Holding one across a push or pop panics, so a guard's
+/// life has to stay inside one operation.
+pub(crate) struct ContextStack(RefCell<Vec<ExecutionContext>>);
+
+impl ContextStack {
+    fn new() -> ContextStack {
+        ContextStack(RefCell::new(Vec::new()))
+    }
+
+    pub(crate) fn push(&self, context: ExecutionContext) {
+        self.0.borrow_mut().push(context);
+    }
+
+    pub(crate) fn pop(&self) -> Option<ExecutionContext> {
+        self.0.borrow_mut().pop()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.0.borrow().len()
+    }
+
+    /// The running context: the top of the stack.
+    pub(crate) fn last(&self) -> Option<Ref<'_, ExecutionContext>> {
+        Ref::filter_map(self.0.borrow(), |stack| stack.last()).ok()
+    }
+
+    pub(crate) fn last_mut(&self) -> Option<RefMut<'_, ExecutionContext>> {
+        RefMut::filter_map(self.0.borrow_mut(), |stack| stack.last_mut()).ok()
+    }
+
+    /// Read the whole stack under its guard. For the walks that need every
+    /// context (a stack trace, the active script), which cannot hold a guard's
+    /// lifetime across their own work.
+    pub(crate) fn with<T>(&self, read: impl FnOnce(&[ExecutionContext]) -> T) -> T {
+        read(&self.0.borrow())
+    }
+}
+
+impl Trace for ContextStack {
+    fn trace(&self, visit: &mut dyn FnMut(GcAny)) {
+        self.0.trace(visit);
+    }
+}
+
 /// The containers the collector reads.
 ///
 /// They live in their own allocation, reached through `Rc`, and every field is
@@ -377,6 +431,8 @@ pub(crate) type ScriptBodyKey = (crux::JsString, bool, bool, bool);
 /// the generator tables. The rest of `Agent::trace_roots`'s fields follow in
 /// later slices.
 pub(crate) struct AgentRoots {
+    /// The execution-context stack (spec 9.4); see [`ContextStack`].
+    pub(crate) execution_context_stack: ContextStack,
     pub(crate) promise_jobs: RefCell<VecDeque<Job>>,
     pub(crate) generic_jobs: RefCell<VecDeque<Job>>,
     pub(crate) timeout_jobs: RefCell<VecDeque<(u64, Job)>>,
@@ -463,11 +519,23 @@ pub(crate) struct AgentRoots {
     /// The `ShadowRealm.prototype.importValue` continuations, keyed by
     /// function identity.
     pub(crate) shadow_handlers: RefCell<IdMap<crate::builtins::shadow_realm::ShadowHandler>>,
+    /// The ECMAScript-function records, keyed by function identity: the spec
+    /// 10.2.1 slots [[Environment]], [[FormalParameters]], [[ECMAScriptCode]],
+    /// [[ThisMode]], [[HomeObject]].
+    ///
+    /// A record is read on every call and written when a class, a method's
+    /// home object or a lazy `prototype` is set up, so both sides reach it
+    /// through [`Agent::ecma_function`]/[`Agent::ecma_function_mut`], which
+    /// hand out a guard. Hold one only while fields are copied out: a guard
+    /// held across an allocation aborts that collection, and one held across
+    /// an insert into the same table panics.
+    pub(crate) ecma_functions: RefCell<IdMap<crate::function::EcmaFunction>>,
 }
 
 impl AgentRoots {
     fn new() -> AgentRoots {
         AgentRoots {
+            execution_context_stack: ContextStack::new(),
             promise_jobs: RefCell::new(VecDeque::new()),
             generic_jobs: RefCell::new(VecDeque::new()),
             timeout_jobs: RefCell::new(VecDeque::new()),
@@ -488,6 +556,7 @@ impl AgentRoots {
             shadow_realms: RefCell::new(std::collections::HashMap::default()),
             shadow_wrapped: RefCell::new(std::collections::HashMap::default()),
             shadow_handlers: RefCell::new(std::collections::HashMap::default()),
+            ecma_functions: RefCell::new(IdMap::default()),
         }
     }
 
@@ -529,6 +598,7 @@ impl AgentRoots {
 
 impl Trace for AgentRoots {
     fn trace(&self, visit: &mut dyn FnMut(GcAny)) {
+        self.execution_context_stack.trace(visit);
         self.promise_jobs.trace(visit);
         if let Ok(queues) = self.microtask_queues.try_borrow() {
             for queue in queues.iter().flatten() {
@@ -580,11 +650,11 @@ impl Trace for AgentRoots {
         self.shadow_realms.trace(visit);
         self.shadow_wrapped.trace(visit);
         self.shadow_handlers.trace(visit);
+        self.ecma_functions.trace(visit);
     }
 }
 
 pub struct Agent {
-    pub execution_context_stack: Vec<ExecutionContext>,
     /// The collector-visible root containers; see [`AgentRoots`].
     pub(crate) roots: Rc<AgentRoots>,
     /// A termination request (v8::Isolate::TerminateExecution). The request has
@@ -849,14 +919,6 @@ pub struct Agent {
     /// The in-flight module evaluations (spec 16.2.2.5 InnerModuleEvaluation
     /// stack): used to detect dependency cycles and find the cycle root.
     pub module_eval_stack: Vec<crux::handle::Handle<crate::module::SourceTextModule>>,
-    /// The ECMAScript-function bodies keyed by function identity (the spec
-    /// 10.2.1 slots [[Environment]], [[FormalParameters]], [[ECMAScriptCode]],
-    /// [[ThisMode]], [[HomeObject]] live here, Phase 7).
-    pub ecma_functions: std::collections::HashMap<
-        u64,
-        crate::function::EcmaFunction,
-        std::hash::BuildHasherDefault<IdentityHasher>,
-    >,
     /// Cut 43: per-site compiled bodies, keyed by the shared body `Rc<Block>`
     /// pointer (the canonical site identity `shared_function_body` returns) —
     /// now in [`AgentRoots`], with the rationale.
@@ -1478,7 +1540,6 @@ impl Agent {
         // host's `IsolateHandle` sets: one request, two engines reading it.
         let termination = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         Self {
-            execution_context_stack: Vec::new(),
             termination: std::sync::Arc::clone(&termination),
             heap_limit: None,
             initial_heap_limit: 0,
@@ -1568,7 +1629,6 @@ impl Agent {
             global_symbol_registry: RefCell::new(Vec::new()),
             module_async_evaluation_count: 0,
             module_eval_stack: Vec::new(),
-            ecma_functions: std::collections::HashMap::default(),
             entered_realm: None,
             #[cfg(feature = "wasm")]
             wasm_streaming_handlers: std::collections::HashMap::new(),
@@ -1698,8 +1758,8 @@ impl Agent {
 
     /// The running execution context: the top of the stack. Invariant: the
     /// stack is never empty after `initialize_host_defined_realm` has run.
-    pub fn running_context(&self) -> Result<&ExecutionContext, JsError> {
-        self.execution_context_stack.last().ok_or_else(|| {
+    pub fn running_context(&self) -> Result<Ref<'_, ExecutionContext>, JsError> {
+        self.roots.execution_context_stack.last().ok_or_else(|| {
             JsError::new(
                 ErrorKind::ReferenceError,
                 "No running execution context".into(),
@@ -1707,13 +1767,16 @@ impl Agent {
         })
     }
 
-    pub fn running_context_mut(&mut self) -> Result<&mut ExecutionContext, JsError> {
-        self.execution_context_stack.last_mut().ok_or_else(|| {
-            JsError::new(
-                ErrorKind::ReferenceError,
-                "No running execution context".into(),
-            )
-        })
+    pub fn running_context_mut(&self) -> Result<RefMut<'_, ExecutionContext>, JsError> {
+        self.roots
+            .execution_context_stack
+            .last_mut()
+            .ok_or_else(|| {
+                JsError::new(
+                    ErrorKind::ReferenceError,
+                    "No running execution context".into(),
+                )
+            })
     }
 
     /// A Vm for a new run: a pooled one reset for this env/strict, or a
@@ -1766,6 +1829,44 @@ impl Agent {
         self.roots.vm_pool.borrow_mut().push(vm);
     }
 
+    /// The record of the ECMAScript function `id`, when it is registered.
+    ///
+    /// A guard, not a reference: the table is in [`AgentRoots`]. Keep it to
+    /// the statements that copy the fields out — see the field's own note.
+    pub fn ecma_function(&self, id: &u64) -> Option<Ref<'_, crate::function::EcmaFunction>> {
+        Ref::filter_map(self.roots.ecma_functions.borrow(), |table| table.get(id)).ok()
+    }
+
+    /// The mutable counterpart of [`ecma_function`](Self::ecma_function).
+    pub(crate) fn ecma_function_mut(
+        &self,
+        id: &u64,
+    ) -> Option<RefMut<'_, crate::function::EcmaFunction>> {
+        RefMut::filter_map(self.roots.ecma_functions.borrow_mut(), |table| {
+            table.get_mut(id)
+        })
+        .ok()
+    }
+
+    /// Read the whole record table. Enumeration is a test's job today — the
+    /// snapshot writer resolves records one at a time by id — so it is
+    /// test-only, like the accessors that check a table's shape.
+    #[cfg(test)]
+    pub(crate) fn with_ecma_functions<T>(
+        &self,
+        read: impl FnOnce(&IdMap<crate::function::EcmaFunction>) -> T,
+    ) -> T {
+        read(&self.roots.ecma_functions.borrow())
+    }
+
+    pub(crate) fn register_ecma_function(&self, id: u64, data: crate::function::EcmaFunction) {
+        self.roots.ecma_functions.borrow_mut().insert(id, data);
+    }
+
+    pub(crate) fn remove_ecma_function(&self, id: &u64) -> Option<crate::function::EcmaFunction> {
+        self.roots.ecma_functions.borrow_mut().remove(id)
+    }
+
     /// The leaf-inline record for `id` (Cut 34): a direct-mapped cache over
     /// the `ecma_functions` map, so a hot leaf call skips the HashMap lookup.
     /// A miss resolves from the map and caches the entry (only for a
@@ -1773,31 +1874,36 @@ impl Agent {
     /// needs no generation check.
     pub(crate) fn leaf_lookup(&mut self, id: u64) -> Option<&crate::ir::LeafEntry> {
         let index = id.wrapping_mul(0x9E37_79B9_7F4A_7C15) as usize & (crate::ir::LEAF_CACHE - 1);
-        let slot = &mut self.leaf_cache[index];
-        if let Some((cached_id, _)) = slot
+        if let Some((cached_id, _)) = &self.leaf_cache[index]
             && *cached_id == id
         {
-            return slot.as_ref().map(|(_, entry)| entry);
+            return self.leaf_cache[index].as_ref().map(|(_, entry)| entry);
         }
-        let data = self.ecma_functions.get(&id)?;
-        if !data.leaf_inline {
-            return None;
-        }
-        let ir = data.ir.clone().expect("leaf_inline implies a compiled ir");
-        let environment = if ir.leaf_uses_env {
-            Some(data.environment)
-        } else {
-            None
+        // The record guard stays inside this block: the cache write below is
+        // an allocation-free store, but a guard is never worth extending.
+        let (ir, strict, environment, construct_inline) = {
+            let data = self.ecma_function(&id)?;
+            if !data.leaf_inline {
+                return None;
+            }
+            let ir = data.ir.clone().expect("leaf_inline implies a compiled ir");
+            let environment = if ir.leaf_uses_env {
+                Some(data.environment)
+            } else {
+                None
+            };
+            (ir, data.strict, environment, data.construct_inline)
         };
+        let slot = &mut self.leaf_cache[index];
         *slot = Some((
             id,
             crate::ir::LeafEntry {
                 ir,
-                strict: data.strict,
+                strict,
                 environment,
                 // Cut 35 slice 15: the `Construct` step shares this cache,
                 // so the construct-inline verdict rides along.
-                construct_inline: data.construct_inline,
+                construct_inline,
             },
         ));
         slot.as_ref().map(|(_, entry)| entry)
@@ -1901,7 +2007,7 @@ impl Agent {
     /// InitializeHostDefinedRealm: Function and ScriptOrModule are null.
     pub fn push_bootstrap_context(&mut self, realm: Handle<Realm>) {
         let global_env = realm.global_env;
-        self.execution_context_stack.push(ExecutionContext {
+        self.roots.execution_context_stack.push(ExecutionContext {
             function: None,
             realm,
             script_or_module: None,
@@ -1914,13 +2020,20 @@ impl Agent {
         });
     }
 
+    /// Pop the context [`push_bootstrap_context`](Self::push_bootstrap_context)
+    /// pushed. A host that brackets a script evaluation with a bootstrap
+    /// context needs this to unwind it, and the stack is in `roots`.
+    pub fn pop_bootstrap_context(&self) {
+        self.roots.execution_context_stack.pop();
+    }
+
     /// The current Realm Record (the Realm component of the running context).
     pub fn current_realm(&self) -> Result<Handle<Realm>, JsError> {
         // A running execution context wins, as its own context wins in V8's
         // `GetCurrentContext`; with none running — the drain runs a job with
         // no context of its own — the realm the job was enqueued for is what
         // remains.
-        if let Some(context) = self.execution_context_stack.last() {
+        if let Some(context) = self.roots.execution_context_stack.last() {
             return Ok(context.realm);
         }
         if let Some(realm) = self.entered_realm {
@@ -2282,7 +2395,6 @@ impl Agent {
     /// collector traces the moved containers separately, through the roots
     /// pointer, so they are never read via `&Agent`.
     pub(crate) fn trace_agent_state(&self, visit: &mut dyn FnMut(GcAny)) {
-        self.execution_context_stack.trace(visit);
         // The IC value caches hold Values; the index-only caches re-resolve
         // from the (traced) objects and need no tracing.
         for cell in self.member_value_cells.iter() {
@@ -2339,7 +2451,6 @@ impl Agent {
         }
         self.global_symbol_registry.trace(visit);
         self.module_eval_stack.trace(visit);
-        self.ecma_functions.trace(visit);
         self.entered_realm.trace(visit);
         #[cfg(feature = "wasm")]
         self.wasm_streaming_handlers.trace(visit);
@@ -3017,7 +3128,7 @@ impl Agent {
             // function by one collection; release it here so the table does
             // not accumulate stale records.
             self.roots.promise_resolvers.borrow_mut().remove(&id);
-            if self.ecma_functions.remove(&id).is_none() {
+            if self.remove_ecma_function(&id).is_none() {
                 continue;
             }
             let index =

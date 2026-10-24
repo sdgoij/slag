@@ -601,9 +601,10 @@ pub(crate) fn eval_function_declaration(
         return Ok(());
     };
     let name = crux::lookup(name);
-    let running = agent.running_context()?;
-    let variable_env = running.variable_environment;
-    let lexical_env = running.lexical_environment;
+    let (variable_env, lexical_env) = {
+        let running = agent.running_context()?;
+        (running.variable_environment, running.lexical_environment)
+    };
 
     // Annex B.3.2.2 / B.3.3.3: a block-level function declaration in sloppy
     // code copies its (block-scoped) binding into the variable environment
@@ -2012,13 +2013,22 @@ mod tests {
     /// ladders have the marked shapes but are not marked, so they reach far
     /// fewer levels — the mutation-catcher for the opposite mutation
     /// (withdrawing every builtin again would make the depths equal).
+    ///
+    /// The margin is two thirds rather than a half on purpose. Keeping the
+    /// dispatch frame live costs about as much as the rest of the cycle, so
+    /// the ratio between the two ladders sits at ~2 by construction: a8c90621
+    /// reached 409 against 203, and the M-1 slices (~5% more per-cycle stack)
+    /// moved that to 375 against 191. A half sat within 0.5% of failing on the
+    /// first of those numbers. The mutation this test catches — withdrawing
+    /// every builtin, or none — makes the depths *equal*, which is still far
+    /// below two thirds.
     #[test]
     fn an_unmarked_builtin_runs_in_place_under_the_dispatch_frame() {
         let marked = host_reentry_depth(ReentryArm::MarkedNative);
         for arm in [ReentryArm::PlainNative, ReentryArm::PlainHandler] {
             let plain = host_reentry_depth(arm);
             assert!(
-                plain < marked / 2.0,
+                plain * 3.0 < marked * 2.0,
                 "an unmarked engine builtin ({arm:?}) must run in place: the marked \
                  ladder reached {marked} and the unmarked one {plain}"
             );
@@ -4598,8 +4608,7 @@ mod tests {
             panic!("{name} is not a function");
         };
         agent
-            .ecma_functions
-            .get(&function.id())
+            .ecma_function(&function.id())
             .expect("function is registered")
             .ir
             .clone()

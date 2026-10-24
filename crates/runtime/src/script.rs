@@ -106,7 +106,7 @@ pub fn script_evaluation(
         annex_b_hoistable: Default::default(),
         position: None,
     };
-    agent.execution_context_stack.push(context);
+    agent.roots.execution_context_stack.push(context);
 
     let strict = script_is_strict(&script.source, &script.code);
     let result = (|| -> Result<Value, JsError> {
@@ -121,7 +121,7 @@ pub fn script_evaluation(
         )
     })();
 
-    agent.execution_context_stack.pop();
+    agent.roots.execution_context_stack.pop();
     result
 }
 
@@ -917,6 +917,7 @@ pub fn perform_eval(
     };
 
     let script_or_module = running.script_or_module.clone();
+    drop(running);
     let eval_source = source.clone();
     let eval_context = ExecutionContext {
         function: None,
@@ -929,12 +930,12 @@ pub fn perform_eval(
         annex_b_hoistable: Default::default(),
         position: None,
     };
-    agent.execution_context_stack.push(eval_context);
+    agent.roots.execution_context_stack.push(eval_context);
     let result = (|| -> Result<Value, JsError> {
         eval_declaration_instantiation(agent, &program, &variable_env, &lexical_env, strict_eval)?;
         crate::eval::eval_program(agent, &program, strict_eval, false, false, Some(source))
     })();
-    agent.execution_context_stack.pop();
+    agent.roots.execution_context_stack.pop();
     result
 }
 
@@ -1742,7 +1743,7 @@ mod tests {
     fn eval_nests_on_the_execution_context_stack() {
         let mut agent = Agent::new();
         agent.initialize_host_defined_realm().unwrap();
-        assert_eq!(agent.execution_context_stack.len(), 1);
+        assert_eq!(agent.roots.execution_context_stack.len(), 1);
         let result = perform_eval(
             &mut agent,
             &JsString::from_utf8("var nested = 1; nested"),
@@ -1752,7 +1753,7 @@ mod tests {
         .unwrap();
         assert_eq!(result, Value::Number(1.0));
         // The eval context was pushed and popped.
-        assert_eq!(agent.execution_context_stack.len(), 1);
+        assert_eq!(agent.roots.execution_context_stack.len(), 1);
     }
 
     #[test]
@@ -1767,7 +1768,7 @@ mod tests {
                 true,
             )?;
             assert_eq!(result, Value::Number(2.0));
-            assert_eq!(agent.execution_context_stack.len(), 1);
+            assert_eq!(agent.roots.execution_context_stack.len(), 1);
             Ok(Value::Undefined)
         });
         agent.run_jobs().unwrap();

@@ -752,7 +752,7 @@ mod tests {
         force_enabled(false);
         let mut calls = 0;
         let mut reads = 0;
-        for data in agent.ecma_functions.values() {
+        for data in agent.roots.ecma_functions.borrow().values() {
             let Some(body) = data.ir.as_ref() else {
                 continue;
             };

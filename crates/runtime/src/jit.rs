@@ -2266,7 +2266,7 @@ fn certified_lane_inline(
     // all (the call gate refuses it), but a base class constructor IS what the
     // construct lane runs.
     let (body, environment, strict, realm) = {
-        let Some(data) = agent.ecma_functions.get(&function.id()) else {
+        let Some(data) = agent.ecma_function(&function.id()) else {
             return Ok(None);
         };
         if data.is_generator || data.is_async {
@@ -3001,7 +3001,7 @@ fn certified_verdict(
     // Resolve the callee-static facts in one scoped borrow. A generator/async
     // call produces an iterator or a promise rather than a run of the body, and
     // a class constructor cannot be called at all, so all three are refusals.
-    let (ir, environment, strict) = match agent.ecma_functions.get(&function.id()) {
+    let (ir, environment, strict) = match agent.ecma_function(&function.id()) {
         Some(data) if !data.is_generator && !data.is_async && !data.is_class_constructor => {
             match data.ir.clone() {
                 Some(ir) => (ir, data.environment, data.strict),
@@ -5239,7 +5239,7 @@ extern "C" fn catch_bind(ctx: *mut c_void, step: u64) -> u64 {
             // The parameter environment is the running environment while
             // the default initializers run, so a closure captures the
             // parameter (spec 15.1.7 step 7).
-            if let Ok(context) = agent.running_context_mut() {
+            if let Ok(mut context) = agent.running_context_mut() {
                 context.lexical_environment = param_env;
             }
             if let Err(error) = crate::binding::binding_initialization(
@@ -6827,7 +6827,7 @@ pub fn resolve_callee(id: u64) -> Option<ResolvedCallee> {
     // SAFETY: `with_agent` guarantees a live `&mut Agent` for the duration of
     // the enclosing run, which is where every compile happens; this only reads.
     let agent = unsafe { &*(agent as *const crate::agent::Agent) };
-    let body = agent.ecma_functions.get(&id)?.ir.clone()?;
+    let body = agent.ecma_function(&id)?.ir.clone()?;
     let scope = body.scope.as_ref()?;
     Some(ResolvedCallee {
         arity: scope.arity,

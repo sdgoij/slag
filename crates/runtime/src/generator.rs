@@ -274,7 +274,7 @@ pub fn call_generator(
         body,
         is_async,
     ) = {
-        let data = agent.ecma_functions.get(&function.id()).ok_or_else(|| {
+        let data = agent.ecma_function(&function.id()).ok_or_else(|| {
             JsError::new(
                 ErrorKind::TypeError,
                 "Function body is not registered".into(),
@@ -319,7 +319,7 @@ pub fn call_generator(
         annex_b_hoistable: Default::default(),
         position: None,
     };
-    agent.execution_context_stack.push(context);
+    agent.roots.execution_context_stack.push(context);
     // Cut 58: capture the OrdinaryCallBindThis result — a certified body's
     // frame fills its `this` slot from it at the first `next()`.
     let bound_this = if this_mode != ThisMode::Lexical {
@@ -358,19 +358,20 @@ pub fn call_generator(
         Ok(())
     })();
     if let Err(error) = instantiate {
-        agent.execution_context_stack.pop();
+        agent.roots.execution_context_stack.pop();
         return Err(error);
     }
     // The VM drives the body's lexical environment (the one
     // function_declaration_instantiation installed on the running context),
     // so body-level let/const bindings are reachable.
     let instantiated_context = agent
+        .roots
         .execution_context_stack
         .last()
-        .cloned()
+        .map(|context| context.clone())
         .ok_or_else(|| JsError::new(ErrorKind::TypeError, "no context to capture".into()))?;
     let body_env = instantiated_context.lexical_environment;
-    agent.execution_context_stack.pop();
+    agent.roots.execution_context_stack.pop();
 
     let proto_value = crate::context::get_property(
         agent,
@@ -619,8 +620,8 @@ fn start_body(
     };
     let function_id = function_handle.id();
     let data = agent
-        .ecma_functions
-        .get(&function_id)
+        .ecma_function(&function_id)
+        .as_deref()
         .cloned()
         .ok_or_else(|| JsError::new(ErrorKind::TypeError, "body not registered".into()))?;
     let body = data.ir.clone().ok_or_else(|| {
@@ -629,7 +630,7 @@ fn start_body(
             "generator body was not compiled".into(),
         )
     })?;
-    agent.execution_context_stack.push(context);
+    agent.roots.execution_context_stack.push(context);
     let mut vm = Vm::new(body_env, data.strict);
     vm.current_function = Some(Value::Function(function_handle));
     state.body = Some(body.clone());
@@ -685,7 +686,7 @@ fn resume_body(
         .body
         .clone()
         .ok_or_else(|| JsError::new(ErrorKind::TypeError, "no saved body".into()))?;
-    agent.execution_context_stack.push(context);
+    agent.roots.execution_context_stack.push(context);
     // Was the suspension a `yield*` delegation? Its continuation reads the
     // abrupt completion; a plain `yield` propagates it through the machinery.
     let suspended_at_delegate = state
@@ -735,7 +736,7 @@ fn finish_resume(
             // 4.d: the body either returned or threw): pop the pushed context
             // and mark the state completed so a later resume returns the
             // done-result instead of "already running".
-            agent.execution_context_stack.pop();
+            agent.roots.execution_context_stack.pop();
             state.flag = GeneratorFlag::Completed;
             state.vm = None;
             state.context = None;
@@ -757,7 +758,7 @@ fn finish_resume(
                 "withdrawn call escaped the generator driver".into(),
             )),
             VmOutcome::Suspended(Suspension::Yield { value, delegate }) => {
-                let context = agent.execution_context_stack.pop().ok_or_else(|| {
+                let context = agent.roots.execution_context_stack.pop().ok_or_else(|| {
                     JsError::new(ErrorKind::TypeError, "no context to pop".into())
                 })?;
                 state.context = Some(context);
@@ -772,7 +773,7 @@ fn finish_resume(
                 }
             }
             VmOutcome::Suspended(Suspension::Await(_)) => {
-                agent.execution_context_stack.pop();
+                agent.roots.execution_context_stack.pop();
                 state.flag = GeneratorFlag::Completed;
                 Err(JsError::new(
                     ErrorKind::TypeError,
@@ -780,7 +781,7 @@ fn finish_resume(
                 ))
             }
             VmOutcome::Suspended(Suspension::AwaitReturn(_)) => {
-                agent.execution_context_stack.pop();
+                agent.roots.execution_context_stack.pop();
                 state.flag = GeneratorFlag::Completed;
                 Err(JsError::new(
                     ErrorKind::TypeError,
@@ -788,7 +789,7 @@ fn finish_resume(
                 ))
             }
             VmOutcome::Completed(completion) => {
-                agent.execution_context_stack.pop();
+                agent.roots.execution_context_stack.pop();
                 state.flag = GeneratorFlag::Completed;
                 // spec 27.4.2.1 step 4.j: the generator body's `using` resources
                 // are disposed when the body completes (implicit or explicit

@@ -379,7 +379,7 @@ fn build_class(
 
     // [[ConstructorKind]] = derived when the class has a heritage.
     if super_constructor.is_some()
-        && let Some(data) = agent.ecma_functions.get_mut(&ctor_handle.id())
+        && let Some(mut data) = agent.ecma_function_mut(&ctor_handle.id())
     {
         data.constructor_kind = ConstructorKind::Derived;
         data.class_parts_mut().super_constructor = super_constructor;
@@ -889,7 +889,7 @@ fn build_class(
 
     // [[Fields]], [[PrivateMethods]], and the class private environment (spec
     // steps 38-40).
-    if let Some(data) = agent.ecma_functions.get_mut(&ctor_handle.id()) {
+    if let Some(mut data) = agent.ecma_function_mut(&ctor_handle.id()) {
         {
             let parts = data.class_parts_mut();
             parts.fields = fields;
@@ -1219,7 +1219,7 @@ pub(crate) fn set_private_environment(
     let ValueKind::Function(function) = function.kind() else {
         return Ok(());
     };
-    let Some(data) = agent.ecma_functions.get_mut(&function.id()) else {
+    let Some(mut data) = agent.ecma_function_mut(&function.id()) else {
         return Ok(());
     };
     data.private_environment = Some(*private_env);
@@ -1338,7 +1338,7 @@ fn evaluate_static_field_initializer(
     // (spec 15.7.10 step 8), so a direct eval in its body applies the "Eval
     // Inside Initializer" early errors (spec 19.2.1.1).
     if let ValueKind::Function(function) = closure.kind()
-        && let Some(data) = agent.ecma_functions.get_mut(&function.id())
+        && let Some(mut data) = agent.ecma_function_mut(&function.id())
     {
         data.class_field_initializer = true;
     }

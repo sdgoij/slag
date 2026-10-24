@@ -5510,13 +5510,11 @@ impl Vm {
             return (0, 0, Value::Undefined, false, 0);
         };
         let id = function.id();
-        match agent
-            .ecma_functions
-            .get(&id)
-            .and_then(|data| data.ir.as_ref())
-        {
+        // The body `Rc` is cloned out of the record: the guard cannot outlive
+        // the statement, and the probe only needs the pointer and the counts.
+        match agent.ecma_function(&id).and_then(|data| data.ir.clone()) {
             Some(ir) => (
-                std::rc::Rc::as_ptr(ir) as u64,
+                std::rc::Rc::as_ptr(&ir) as u64,
                 id,
                 *callee,
                 ir.scope.is_some(),
@@ -7694,7 +7692,7 @@ impl Vm {
             return Ok(None);
         }
         let (ir, old_env, realm, strict, parse_text, callee_semantic_control) = {
-            let Some(data) = agent.ecma_functions.get(&function.id()) else {
+            let Some(data) = agent.ecma_function(&function.id()) else {
                 return Ok(None);
             };
             // Resumable and class-machinery bodies keep the funnel, which owns
@@ -7763,6 +7761,7 @@ impl Vm {
                 None => old_env,
             };
         agent
+            .roots
             .execution_context_stack
             .push(crate::context::ExecutionContext {
                 function: Some(Value::Function(function)),
@@ -7886,7 +7885,7 @@ impl Vm {
             }
             other => other,
         };
-        agent.execution_context_stack.pop();
+        agent.roots.execution_context_stack.pop();
         run.map(Some)
     }
 
@@ -8007,7 +8006,7 @@ impl Vm {
             // slot, no `with`/`try`/`switch`/`for-in`/`for-of`/`using`), so
             // the whole sync is skipped for it.
             if !body.env_constant
-                && let Ok(context) = agent.running_context_mut()
+                && let Ok(mut context) = agent.running_context_mut()
                 && !Handle::ptr_eq(context.lexical_environment, self.lexical_env)
             {
                 context.lexical_environment = self.lexical_env
@@ -9229,7 +9228,8 @@ impl Vm {
                         crate::function::construct(agent, &super_ctor, &args, &new_target)?;
                     let this_env = get_this_environment(agent)?;
                     this_env.bind_this_value(result)?;
-                    if let Some(function_value) = agent.running_context()?.function {
+                    let function_value = agent.running_context()?.function;
+                    if let Some(function_value) = function_value {
                         crate::function::initialize_instance_elements(
                             agent,
                             &result,
@@ -9545,7 +9545,7 @@ impl Vm {
                             }
                         }
                     }
-                    if let Ok(context) = agent.running_context_mut() {
+                    if let Ok(mut context) = agent.running_context_mut() {
                         context.lexical_environment = class_env;
                         context.private_environment = Some(class_private_env);
                     }
@@ -9598,7 +9598,7 @@ impl Vm {
                         )
                     })?;
                     self.lexical_env = state.outer_env;
-                    if let Ok(context) = agent.running_context_mut() {
+                    if let Ok(mut context) = agent.running_context_mut() {
                         context.lexical_environment = state.outer_env;
                         context.private_environment = state.outer_private_env;
                     }
@@ -9782,7 +9782,7 @@ impl Vm {
                             // environment while the default initializers run,
                             // so a closure captures the parameter (spec
                             // 15.1.7 step 7).
-                            if let Ok(context) = agent.running_context_mut() {
+                            if let Ok(mut context) = agent.running_context_mut() {
                                 context.lexical_environment = param_env;
                             }
                             crate::binding::binding_initialization(
@@ -9992,7 +9992,7 @@ impl Vm {
                     // initialize).
                     self.lexical_env = env;
                     self.env_stack.push(env);
-                    if let Ok(context) = agent.running_context_mut() {
+                    if let Ok(mut context) = agent.running_context_mut() {
                         context.lexical_environment = env;
                     }
                     let head = (|| -> Result<(), JsError> {
@@ -12214,18 +12214,10 @@ impl Vm {
                 "No this binding".into(),
             ));
         };
-        let Some(scope) = agent
-            .ecma_functions
-            .get(&function_id)
-            .and_then(|data| data.ir.as_ref())
-            .and_then(|ir| ir.scope.as_ref())
-        else {
-            return Err(JsError::new(
-                ErrorKind::ReferenceError,
-                "No this binding".into(),
-            ));
-        };
-        let Some(slot) = scope.this_slot else {
+        let Some(slot) = agent.ecma_function(&function_id).and_then(|data| {
+            let ir = data.ir.as_ref()?;
+            ir.scope.as_ref().and_then(|scope| scope.this_slot)
+        }) else {
             return Err(JsError::new(
                 ErrorKind::ReferenceError,
                 "No this binding".into(),
@@ -12250,8 +12242,7 @@ impl Vm {
             ));
         };
         let Some(home) = agent
-            .ecma_functions
-            .get(&function_id)
+            .ecma_function(&function_id)
             .and_then(|data| data.home_object)
         else {
             return Err(JsError::new(
@@ -12279,7 +12270,7 @@ impl Vm {
     /// outer frame's is the call that entered the callee running inside it, so
     /// the write belongs to the *caller* and happens before the call.
     fn set_site(&self, agent: &mut Agent, span: crux::Span) {
-        if let Some(context) = agent.execution_context_stack.last_mut() {
+        if let Some(mut context) = agent.roots.execution_context_stack.last_mut() {
             context.position = Some(span);
         }
     }
@@ -14235,7 +14226,7 @@ impl Vm {
         args: &[Value],
     ) -> Result<Option<std::rc::Rc<CompiledBody>>, JsError> {
         let (ir, old_env, realm, strict, is_marked, parse_text) = {
-            let record = agent.ecma_functions.get(&function.id()).ok_or_else(|| {
+            let record = agent.ecma_function(&function.id()).ok_or_else(|| {
                 JsError::new(
                     ErrorKind::TypeError,
                     "Function body is not registered".into(),
@@ -14269,8 +14260,9 @@ impl Vm {
             };
             let context_function =
                 (scope.arguments_slot.is_some() && !strict).then(|| Value::Function(*function));
-            agent.execution_context_stack.pop();
+            agent.roots.execution_context_stack.pop();
             agent
+                .roots
                 .execution_context_stack
                 .push(crate::context::ExecutionContext {
                     function: context_function,
@@ -14320,7 +14312,7 @@ impl Vm {
         // Slow path (uncertified): a function environment + declaration
         // instantiation, mirroring `ordinary_call`'s slow branch.
         let (this_mode, params, body, declaring_script_or_module, private_environment, parse_text) = {
-            let record = agent.ecma_functions.get(&function.id()).ok_or_else(|| {
+            let record = agent.ecma_function(&function.id()).ok_or_else(|| {
                 JsError::new(
                     ErrorKind::TypeError,
                     "Function body is not registered".into(),
@@ -14347,7 +14339,7 @@ impl Vm {
             .ok()
             .and_then(|context| context.script_or_module.clone());
         let script_or_module = declaring_script_or_module.or(caller_script_or_module);
-        agent.execution_context_stack.pop();
+        agent.roots.execution_context_stack.pop();
         // The callee's own text; the stack is already the grandcaller's here,
         // which is never the text this body's spans belong to. See
         // `ordinary_call`'s slow path.
@@ -14358,6 +14350,7 @@ impl Vm {
                 .and_then(|context| context.source.clone())
         });
         agent
+            .roots
             .execution_context_stack
             .push(crate::context::ExecutionContext {
                 function: Some(function_value),
@@ -15508,7 +15501,7 @@ impl Vm {
                     // the mid-step destructure sees the new environment.
                     self.lexical_env = env;
                     self.env_stack.push(env);
-                    if let Ok(context) = agent.running_context_mut() {
+                    if let Ok(mut context) = agent.running_context_mut() {
                         context.lexical_environment = env;
                     }
                     crate::binding::binding_initialization(
@@ -31420,12 +31413,14 @@ mod tests {
         let ValueKind::Function(function) = value.kind() else {
             panic!("the script must return the function");
         };
-        let record = agent
-            .ecma_functions
-            .get(&function.id())
-            .expect("the function record");
+        let certified = agent
+            .ecma_function(&function.id())
+            .expect("the function record")
+            .ir
+            .as_ref()
+            .is_some_and(|ir| ir.scope.is_some());
         assert!(
-            record.ir.as_ref().is_some_and(|ir| ir.scope.is_some()),
+            certified,
             "a body whose tag is a capturing arrow must still certify"
         );
         let result = agent
@@ -31474,8 +31469,7 @@ mod tests {
             panic!("the script must return the function");
         };
         let record = agent
-            .ecma_functions
-            .get(&function.id())
+            .ecma_function(&function.id())
             .expect("the function record");
         assert!(
             record.ir.as_ref().is_some_and(|ir| ir.scope.is_some()),

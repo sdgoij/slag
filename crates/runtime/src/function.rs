@@ -806,33 +806,30 @@ pub(crate) fn ensure_function_prototype(
     agent: &mut Agent,
     function: &Handle<Function>,
 ) -> Result<(), JsError> {
-    let Some(data) = agent.ecma_functions.get_mut(&function.id()) else {
-        return Ok(());
-    };
-    if !data.prototype_pending {
-        return Ok(());
-    }
     // `prototype` must inherit the intrinsic of the function's OWN realm,
     // not the calling realm (a cross-realm construct reads
     // `new_target.prototype` through the constructor's realm —
-    // proto-from-ctor-realm-prototype.js). The realm is copied out so the
-    // mutable record borrow ends before the allocation-heavy materialize.
-    let realm = data.realm;
+    // proto-from-ctor-realm-prototype.js). The realm is copied out in the
+    // same borrow that tests the flag, so the record is free while the
+    // materialize allocates.
+    let Some(realm) = agent
+        .ecma_function(&function.id())
+        .and_then(|data| data.prototype_pending.then_some(data.realm))
+    else {
+        return Ok(());
+    };
     let proto = realm
         .intrinsics
         .object_prototype()
         .and_then(|value| crate::context::as_object(&value));
     let prototype = crux::object::JsObject::ordinary_object_create(proto);
     make_constructor(function, prototype, true, true)?;
-    let data = agent
-        .ecma_functions
-        .get_mut(&function.id())
-        .ok_or_else(|| {
-            JsError::new(
-                ErrorKind::TypeError,
-                "Function body is not registered".into(),
-            )
-        })?;
+    let Some(mut data) = agent.ecma_function_mut(&function.id()) else {
+        return Err(JsError::new(
+            ErrorKind::TypeError,
+            "Function body is not registered".into(),
+        ));
+    };
     data.prototype_pending = false;
     Ok(())
 }
@@ -1008,7 +1005,7 @@ pub fn instantiate_function_with_source(
     )?;
     if !per_iteration_chain.is_empty()
         && let Some(function) = value.as_function()
-        && let Some(data) = agent.ecma_functions.get_mut(&function.id())
+        && let Some(mut data) = agent.ecma_function_mut(&function.id())
     {
         data.per_iteration_chain = per_iteration_chain;
     }
@@ -1089,19 +1086,22 @@ fn shared_source_info(
         fnv1a_units(&text.as_slice()[start..end]),
     );
     let source_key = key.4;
-    // The cache outlives every record and is not traced, so a non-leaf text
-    // (`ConsString`/`Rope`/`Sliced`) would leave arena handles dangling in it.
-    // Materialise a leaf once; script and module texts are already leaves.
-    let full = match text {
-        JsString::Flat(_) | JsString::Small { .. } => (*text).clone(),
-        _ => JsString::from_utf16(text.as_slice()),
-    };
     SOURCE_INFO_CACHE.with(|cache| {
         if let Some(info) = cache.borrow().get(&key) {
             return Some(info.clone());
         }
+        let slice = JsString::from_utf16(&text.as_slice()[start..end]);
+        // The cache outlives every record and is not traced, so a non-leaf text
+        // (`ConsString`/`Rope`/`Sliced`) would leave arena handles dangling in
+        // it. Materialise a leaf once; script and module texts are already
+        // leaves.
+        let full = if matches!(text, JsString::Flat(_) | JsString::Small { .. }) {
+            text
+        } else {
+            JsString::from_utf16(text.as_slice())
+        };
         let info = std::rc::Rc::new(SourceInfo {
-            slice: Some(JsString::from_utf16(&text.as_slice()[start..end])),
+            slice: Some(slice),
             full: Some(full),
             key: source_key,
         });
@@ -1169,9 +1169,7 @@ fn source_info_with_slice(
     span: crux::Span,
     slice: JsString,
 ) -> std::rc::Rc<SourceInfo> {
-    let full = enclosing_source(agent, span)
-        .cloned()
-        .or_else(|| Some(slice.clone()));
+    let full = enclosing_source(agent, span).or_else(|| Some(slice.clone()));
     let key = source_hash(&slice);
     std::rc::Rc::new(SourceInfo {
         slice: Some(slice),
@@ -1199,17 +1197,19 @@ fn source_hash(source: &JsString) -> usize {
 /// closure the body creates, and the body-cache key `source_hash_at` derives.
 /// The script a node belongs to is the innermost frame whose source covers the
 /// span.
-fn enclosing_source(agent: &Agent, span: crux::Span) -> Option<&JsString> {
+fn enclosing_source(agent: &Agent, span: crux::Span) -> Option<JsString> {
     let (start, end) = (span.start as usize, span.end as usize);
     if start >= end {
         return None;
     }
-    agent
-        .execution_context_stack
-        .iter()
-        .rev()
-        .filter_map(|context| context.source.as_ref())
-        .find(|source| end <= source.len())
+    agent.roots.execution_context_stack.with(|stack| {
+        stack
+            .iter()
+            .rev()
+            .filter_map(|context| context.source.as_ref())
+            .find(|source| end <= source.len())
+            .cloned()
+    })
 }
 
 /// `source_hash` over the source slice at `span`, WITHOUT allocating the
@@ -1521,7 +1521,7 @@ fn instantiate_class_constructor_with(
     )?;
     if default_derived
         && let Some(function) = function.as_function()
-        && let Some(data) = agent.ecma_functions.get_mut(&function.id())
+        && let Some(mut data) = agent.ecma_function_mut(&function.id())
     {
         data.default_derived = true;
     }
@@ -1534,7 +1534,7 @@ pub fn make_method(agent: &mut Agent, function: &Value, home_object: Value) -> R
     let ValueKind::Function(function) = function.kind() else {
         return Ok(());
     };
-    let Some(data) = agent.ecma_functions.get_mut(&function.id()) else {
+    let Some(mut data) = agent.ecma_function_mut(&function.id()) else {
         return Err(JsError::new(
             ErrorKind::TypeError,
             "Cannot set a HomeObject on a non-ECMAScript function".into(),
@@ -1672,7 +1672,7 @@ fn register_function(
     let entry = shared_compiled_body(agent, &data, body_key)?;
     let this_writes = entry.this_writes;
     data.set_compiled(entry.compiled);
-    agent.ecma_functions.insert(function.id(), data);
+    agent.register_ecma_function(function.id(), data);
     // Cut 35 slice 30: store collected `this.*` property writes for
     // constructor store-cache pre-warming in `construct_this_object`.
     crate::ir::store_construct_patterns(agent, function.id(), this_writes);
@@ -1740,7 +1740,7 @@ fn register_function(
 /// source covering the span (synthesized/native callables).
 pub(crate) fn capture_source(agent: &Agent, span: crux::Span) -> Option<JsString> {
     let source = enclosing_source(agent, span)?;
-    Some(span_slice(source, span))
+    Some(span_slice(&source, span))
 }
 
 /// The span's own text out of the text it was parsed from. Callers reach this
@@ -2063,7 +2063,7 @@ pub fn instantiate_arrow(
     let this_writes = entry.this_writes;
     data.set_compiled(entry.compiled);
     let params = data.params.clone();
-    agent.ecma_functions.insert(function.id(), data);
+    agent.register_ecma_function(function.id(), data);
     crate::ir::store_construct_patterns(agent, function.id(), this_writes);
     // Arrows never carry restricted `caller`/`arguments` (no fallback loop).
     if !set_function_properties_batched(agent, &function, &params, display.as_ref(), false) {
@@ -2147,7 +2147,7 @@ pub(crate) fn realm_throwable(
     }
     agent.push_bootstrap_context(realm);
     let converted = crate::builtins::error::to_throwable(agent, &error);
-    agent.execution_context_stack.pop();
+    agent.roots.execution_context_stack.pop();
     match converted {
         Ok(value) => Ok(error.with_value(value)),
         Err(conversion) => Err(conversion),
@@ -2191,7 +2191,7 @@ pub(crate) fn call_inner(
             },
             other => other,
         };
-        agent.execution_context_stack.pop();
+        agent.roots.execution_context_stack.pop();
         return result;
     }
     match callee.kind() {
@@ -2200,10 +2200,46 @@ pub(crate) fn call_inner(
                 // Fetch the record once (the fast path in `ordinary_call`
                 // would otherwise re-fetch it — a HashMap hit per call);
                 // the fields the fast path reads are cloned out here.
-                let data = agent.ecma_functions.get(&function.id());
-                if let Some(data) = data
-                    && data.is_class_constructor
-                {
+                let (
+                    realm,
+                    is_class_constructor,
+                    marked,
+                    is_async_gen,
+                    is_async,
+                    is_generator,
+                    fast,
+                ) = {
+                    let data = agent.ecma_function(&function.id());
+                    (
+                        data.as_ref().map(|data| data.realm),
+                        data.as_ref().is_some_and(|data| data.is_class_constructor),
+                        // A function created inside a class field initializer
+                        // runs its body with the "Eval Inside Initializer"
+                        // context (spec 19.2.1.1:
+                        // `func.[[ClassFieldInitializerName]]`). Only arrows
+                        // carry the marker, so the body of a plain function
+                        // resets the context (its `arguments` is its own).
+                        data.as_ref()
+                            .is_some_and(|data| data.class_field_initializer),
+                        data.as_ref()
+                            .is_some_and(|data| data.is_async && data.is_generator),
+                        data.as_ref().is_some_and(|data| data.is_async),
+                        data.as_ref().is_some_and(|data| data.is_generator),
+                        // The fast path reads the record's
+                        // `ir`/`environment`/`realm`/`strict`/`parse_text`;
+                        // clone them while the borrow is live so
+                        // `ordinary_call` skips its own lookup for certified
+                        // bodies.
+                        data.as_ref().map(|data| FastCall {
+                            ir: data.ir.clone(),
+                            environment: data.environment,
+                            realm: data.realm,
+                            strict: data.strict,
+                            parse_text: data.parse_text().cloned(),
+                        }),
+                    )
+                };
+                if is_class_constructor && let Some(realm) = realm {
                     // spec 10.2.1: [[IsClassConstructor]] is true, so the
                     // function must be called with `new` (step 5). The error
                     // is the class's realm TypeError (the cross-realm
@@ -2212,28 +2248,8 @@ pub(crate) fn call_inner(
                         ErrorKind::TypeError,
                         "Class constructor cannot be invoked without 'new'".into(),
                     );
-                    return Err(realm_throwable(agent, error, data.realm)?);
+                    return Err(realm_throwable(agent, error, realm)?);
                 }
-                // A function created inside a class field initializer runs
-                // its body with the "Eval Inside Initializer" context (spec
-                // 19.2.1.1: `func.[[ClassFieldInitializerName]]`). Only
-                // arrows carry the marker, so the body of a plain function
-                // resets the context (its `arguments` is its own).
-                let marked = data.is_some_and(|data| data.class_field_initializer);
-                let is_async_gen = data.is_some_and(|data| data.is_async && data.is_generator);
-                let is_async = data.is_some_and(|data| data.is_async);
-                let is_generator = data.is_some_and(|data| data.is_generator);
-                // The fast path reads the record's `ir`/`environment`/
-                // `realm`/`strict`/`parse_text`; clone them while the borrow is
-                // live so `ordinary_call` skips its own lookup for certified
-                // bodies.
-                let fast = data.map(|data| FastCall {
-                    ir: data.ir.clone(),
-                    environment: data.environment,
-                    realm: data.realm,
-                    strict: data.strict,
-                    parse_text: data.parse_text().cloned(),
-                });
                 let saved_depth = agent.field_initializer_depth;
                 agent.field_initializer_depth = if marked { saved_depth + 1 } else { 0 };
                 let result = if is_async_gen {
@@ -2558,7 +2574,7 @@ fn construct_inner(
             },
             other => other,
         };
-        agent.execution_context_stack.pop();
+        agent.roots.execution_context_stack.pop();
         return result;
     }
     match callee.kind() {
@@ -2568,9 +2584,8 @@ fn construct_inner(
                 // [[Construct]] (spec 27.4.2/27.5.2/27.6.2 FunctionAllocate);
                 // neither do arrows (lexical this) or methods/accessors.
                 if agent
-                    .ecma_functions
-                    .get(&function.id())
-                    .is_some_and(is_constructible_data)
+                    .ecma_function(&function.id())
+                    .is_some_and(|data| is_constructible_data(&data))
                 {
                     return Err(JsError::new(
                         ErrorKind::TypeError,
@@ -2578,8 +2593,7 @@ fn construct_inner(
                     ));
                 }
                 let marked = agent
-                    .ecma_functions
-                    .get(&function.id())
+                    .ecma_function(&function.id())
                     .is_some_and(|data| data.class_field_initializer);
                 let saved_depth = agent.field_initializer_depth;
                 agent.field_initializer_depth = if marked { saved_depth + 1 } else { 0 };
@@ -2761,9 +2775,8 @@ pub fn is_constructor(agent: &Agent, value: &Value) -> bool {
     };
     match &function.kind {
         crux::function::FunctionKind::EcmaScript => agent
-            .ecma_functions
-            .get(&function.id())
-            .is_some_and(|data| !is_constructible_data(data)),
+            .ecma_function(&function.id())
+            .is_some_and(|data| !is_constructible_data(&data)),
         // A bound function is constructible iff its target is (spec 10.4.1.2).
         crux::function::FunctionKind::Bound { target, .. } => is_constructor(agent, target),
         _ => crux::value::is_constructor(value),
@@ -2812,7 +2825,7 @@ fn ordinary_call(
             fast.parse_text,
         ),
         None => {
-            let record = agent.ecma_functions.get(&function.id()).ok_or_else(|| {
+            let record = agent.ecma_function(&function.id()).ok_or_else(|| {
                 JsError::new(
                     ErrorKind::TypeError,
                     "Function body is not registered".into(),
@@ -2854,7 +2867,7 @@ fn ordinary_call(
         // not only for a sloppy body's mapped `arguments`. Filling it is one
         // `Value` store per certified call.
         let context_function = Some(Value::Function(*function));
-        agent.execution_context_stack.push(ExecutionContext {
+        agent.roots.execution_context_stack.push(ExecutionContext {
             function: context_function,
             realm,
             script_or_module: None,
@@ -2908,7 +2921,7 @@ fn ordinary_call(
             },
             other => other,
         };
-        agent.execution_context_stack.pop();
+        agent.roots.execution_context_stack.pop();
         return result;
     }
     let function_value = function.self_value();
@@ -2927,7 +2940,7 @@ fn ordinary_call(
         ir,
         parse_text,
     ) = {
-        let record = agent.ecma_functions.get(&function.id()).ok_or_else(|| {
+        let record = agent.ecma_function(&function.id()).ok_or_else(|| {
             JsError::new(
                 ErrorKind::TypeError,
                 "Function body is not registered".into(),
@@ -2973,7 +2986,7 @@ fn ordinary_call(
             .ok()
             .and_then(|context| context.source.clone())
     });
-    agent.execution_context_stack.push(ExecutionContext {
+    agent.roots.execution_context_stack.push(ExecutionContext {
         function: Some(function_value),
         realm,
         script_or_module,
@@ -3030,7 +3043,7 @@ fn ordinary_call(
         },
         other => other,
     };
-    agent.execution_context_stack.pop();
+    agent.roots.execution_context_stack.pop();
     result
 }
 
@@ -3577,7 +3590,7 @@ fn ordinary_construct(
     // path pays per construct disappear. Class constructors with instance
     // fields/private methods keep the slow path (initialize_instance_elements).
     let certified = {
-        let data = agent.ecma_functions.get(&function.id()).ok_or_else(|| {
+        let data = agent.ecma_function(&function.id()).ok_or_else(|| {
             JsError::new(
                 ErrorKind::TypeError,
                 "Function body is not registered".into(),
@@ -3622,7 +3635,7 @@ fn ordinary_construct(
             .is_some_and(|scope| scope.arguments_slot.is_some())
             && !strict)
             .then_some(function_value);
-        agent.execution_context_stack.push(ExecutionContext {
+        agent.roots.execution_context_stack.push(ExecutionContext {
             function: context_function,
             realm,
             script_or_module: None,
@@ -3710,12 +3723,12 @@ fn ordinary_construct(
                 )),
             }
         })();
-        agent.execution_context_stack.pop();
+        agent.roots.execution_context_stack.pop();
         return result;
     }
     let data = agent
-        .ecma_functions
-        .get(&function.id())
+        .ecma_function(&function.id())
+        .as_deref()
         .cloned()
         .ok_or_else(|| {
             JsError::new(
@@ -3756,7 +3769,7 @@ fn ordinary_construct(
             .ok()
             .and_then(|context| context.source.clone())
     });
-    agent.execution_context_stack.push(ExecutionContext {
+    agent.roots.execution_context_stack.push(ExecutionContext {
         function: Some(function_value),
         realm: data.realm,
         script_or_module,
@@ -3919,7 +3932,7 @@ fn ordinary_construct(
             )),
         }
     })();
-    agent.execution_context_stack.pop();
+    agent.roots.execution_context_stack.pop();
     result
 }
 
@@ -3934,7 +3947,7 @@ pub fn initialize_instance_elements(
     let ValueKind::Function(ctor) = ctor.kind() else {
         return Ok(());
     };
-    let data = agent.ecma_functions.get(&ctor.id()).cloned();
+    let data = agent.ecma_function(&ctor.id()).as_deref().cloned();
     let Some(data) = data else {
         return Ok(());
     };
@@ -4439,17 +4452,20 @@ mod tests {
         // Rc (and one compiled body); every other record (make) is its own
         // site. Find the sharing pair and assert the params Rc is shared
         // too.
-        let records: Vec<&EcmaFunction> = agent.ecma_functions.values().collect();
-        let mut pairs = 0;
-        for i in 0..records.len() {
-            for j in (i + 1)..records.len() {
-                if std::rc::Rc::ptr_eq(&records[i].body, &records[j].body) {
-                    pairs += 1;
-                    assert!(std::rc::Rc::ptr_eq(&records[i].params, &records[j].params));
-                    assert_eq!(records[i].params.len(), 2);
+        let pairs = agent.with_ecma_functions(|functions| {
+            let records: Vec<&EcmaFunction> = functions.values().collect();
+            let mut pairs = 0;
+            for i in 0..records.len() {
+                for j in (i + 1)..records.len() {
+                    if std::rc::Rc::ptr_eq(&records[i].body, &records[j].body) {
+                        pairs += 1;
+                        assert!(std::rc::Rc::ptr_eq(&records[i].params, &records[j].params));
+                        assert_eq!(records[i].params.len(), 2);
+                    }
                 }
             }
-        }
+            pairs
+        });
         assert_eq!(pairs, 1, "exactly the f1/f2 closures share a site");
     }
 
