@@ -143,6 +143,13 @@ Fixed and validated in the first remediation pass:
   silently trusted.
 - **Low** — `padStart`/`padEnd` fill the gap directly into the result buffer
   instead of materializing a second filler copy.
+- **M-1** — the agent aliasing model is closed: the live-agent registry holds
+  only each agent's `*const AgentRoots`, and every container a collection reads
+  — the traced tables, the IC caches, the three value-cell arrays, and the
+  weak/trace tables the compaction hook and the reapers walk — lives in that
+  allocation behind interior mutability. A collection never forms a `&Agent`,
+  so it can no longer retag an interpreter frame's `&mut Agent` (design note
+  and slices 1-4k).
 - **M-8 (actions)** — every workflow `uses:` is pinned to a 40-hex commit with
   the moving tag kept as a trailing comment, so a retagged action cannot change
   what CI runs.
@@ -594,7 +601,7 @@ few hundred KB of types/exports/locals can hang `WebAssembly.validate` for hours
 
 ---
 
-## M-1 design note: the agent aliasing model (open)
+## M-1 design note: the agent aliasing model (closed)
 
 M-1 is not a `current_agent_mut` defect; it is the engine's ownership model.
 
@@ -630,10 +637,17 @@ Options:
 | C. Interior-mutable traced state, staged | Move the fields `trace_roots` reads behind `UnsafeCell`/`RefCell` | The only complete fix; large and perf-sensitive |
 | D. Root-set GC | Roots live outside `Agent`, registered at safe points | Best long term; a GC redesign |
 
-Recommendation: B first (it deletes the `&'static mut` fabrication from the
-host surface and makes the remaining paths internal), then C in slices starting
-with the coldest containers, with `--gc-stress` and the call benchmarks as the
-gate. M-1 should not be marked fixed until C lands.
+Recommendation at the time: B first (it deletes the `&'static mut` fabrication
+from the host surface and makes the remaining paths internal), then C in slices
+starting with the coldest containers, with `--gc-stress` and the call benchmarks
+as the gate.
+
+What was built is **B plus D**. D reaches C's goal — every container the
+collector reads is interior-mutable — by putting that state in a separate
+allocation rather than on the `Agent`, which leaves C's staged in-place variant
+unnecessary. The price is one pointer indirection on the interpreter's cache
+reads (measured in slice 4j) and nothing in compiled code, which captures its
+cell bases once per run. M-1 is closed; the slices below record how.
 
 ### Slice 1 landed: `AgentRoots` (the job, promise and generator tables)
 
@@ -955,6 +969,23 @@ in table families, because each family's guard discipline is different:
   `0a64a7e1` (function calls 0.14, global read 0.14, apply leaf call 0.29), and
   a compiled global-read loop measures +0.3%. No unsafe accessor was added to
   buy the interpreter's indirection back.
+- **4k landed — M-1 closed.** `stack_traces`, `weak_ref_targets`,
+  `promise_addrs` and `pending_dead_promises` moved into the roots, and the six
+  collection-time reactions moved with them: `trace_active_run_state`,
+  `has_weak_structures`, `compact_weak_tables` (with the roots-only
+  `collection_realm` it needs), `reap_dead_iterators`, `reap_promise_addrs` and
+  `reap_dead_generators`. `LIVE_AGENTS` is now `Vec<(u64, *const AgentRoots)>`,
+  and `collect_with` traces, probes and reaps every registered agent through its
+  roots pointer. The only `*const Agent` left in the module is the transient
+  argument of the `with_agent` notifier — the one place an agent registers
+  itself — plus two local addresses in a test.
+
+  That is the whole of M-1: no collection-time path forms a `&Agent`, so the
+  collector can no longer pop the borrow tags an interpreter frame's `&mut
+  Agent` carries. The remaining `&self` in the design is deliberate:
+  `Agent::collect_garbage` takes `&self` so a `--gc-stress` collection can run
+  inside a frame that already holds a `&mut Agent`, and every table it touches
+  is now interior-mutable.
 
 One near-miss is the reason the last step of each slice is a real `--gc-stress`
 sweep rather than a green unit suite: `async_from_sync_continuations` shared a
@@ -1000,6 +1031,16 @@ splitting the fill path out of `leaf_lookup` behind `#[cold]` measured *worse*
 (11%) and was reverted. The remaining option is a `Cell`-table of `Copy` leaf
 records, which needs the `Rc<CompiledBody>` in `LeafEntry` replaced by a
 borrowed pointer; that is a separate change with its own lifetime argument.
+
+Validation for 4k: clippy `-D warnings` clean (workspace, all targets, all
+features), `cargo fmt` clean, `cargo test --workspace --all-features` green in
+both profiles; under `--gc-stress --gc-verify`: `*WeakRef*` 29/29,
+`*FinalizationRegistry*` 47/47, `*WeakMap*` 141/141, `*WeakSet*` 85/85,
+`ShadowRealm/*` 64/64 (the multi-agent registry path), `*Promise*` 732/732,
+`*Generator*` 157/157, `Array/*` 3082/3082, `Iterator/*` 648 pass with six
+`zip`/`zipKeyed` fixtures failing (1 fail, 5 hangs) — all six reproduce alone on
+a `d4531034` sweep binary, `language "*eval*"` 1166/1166, `"*for-of*"` 779/779,
+`"*for-in*"` 153/153, `*Symbol*` 509/509, `Object/*` 3411/3411.
 
 Validation for 4j: `cargo test --workspace --all-features` green in both
 profiles, clippy `-D warnings` clean (workspace, all targets, all features),
