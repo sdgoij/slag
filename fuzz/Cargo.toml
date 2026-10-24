@@ -1,0 +1,58 @@
+[package]
+name = "slag-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+# This crate is its own workspace: `cargo fuzz` overrides the profile with a
+# sanitizer build, and the root workspace's lint gate must not depend on a
+# nightly-only target set.
+[workspace]
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.parser]
+path = "../crates/parser"
+
+[dependencies.regexp]
+path = "../crates/regexp"
+
+[dependencies.wasm]
+path = "../crates/wasm"
+
+# `cargo fuzz` rewrites the profile for the sanitizer build; this keeps a
+# crashing input's stack trace readable.
+[profile.release]
+debug = 1
+
+[[bin]]
+name = "parse_js"
+path = "fuzz_targets/parse_js.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "parse_js_utf16"
+path = "fuzz_targets/parse_js_utf16.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "wasm_decode"
+path = "fuzz_targets/wasm_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "regexp"
+path = "fuzz_targets/regexp.rs"
+test = false
+doc = false
+bench = false

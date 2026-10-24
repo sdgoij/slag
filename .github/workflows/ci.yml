@@ -17,6 +17,10 @@ on:
         description: "Run the Miri job (slow; lexer and syntax only)"
         type: boolean
         default: true
+      fuzz:
+        description: "Run the fuzz job (five minutes per target)"
+        type: boolean
+        default: true
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -47,8 +51,13 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       - name: Check formatting
         run: cargo fmt --all -- --check
+      # `fuzz/` is its own workspace, so the root `--all` does not reach it.
+      - name: Check the fuzz targets' formatting
+        run: cargo fmt --manifest-path fuzz/Cargo.toml -- --check
       - name: Clippy
         run: cargo clippy --locked --workspace --all-targets -- -D warnings
+      - name: Clippy the fuzz targets
+        run: cargo clippy --locked --manifest-path fuzz/Cargo.toml --all-targets -- -D warnings
 
   test:
     name: Workspace tests (${{ matrix.name }})
@@ -215,6 +224,48 @@ jobs:
         run: cargo +nightly miri test -p lexer --lib
       - name: Miri the syntax layer
         run: cargo +nightly miri test -p syntax --lib
+
+  # Manual only, like the Miri job: the sanitizer build and a fuzzer's first
+  # minutes cost more than the whole lint gate, and a target keeps running for
+  # as long as it is given. `-max_total_time` bounds each one, so a run that
+  # finds nothing finishes on its own. The targets live in `fuzz/` (its own
+  # workspace) and cover the parser, the wasm decoder/validator and the RegExp
+  # compiler/matcher — the stages a host reaches with untrusted input.
+  fuzz:
+    name: Fuzz (${{ matrix.target }})
+    if: github.event_name == 'workflow_dispatch' && github.event.inputs.fuzz == 'true'
+    needs: lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [parse_js, parse_js_utf16, wasm_decode, regexp]
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - name: Install a nightly toolchain
+        run: rustup toolchain install nightly --profile minimal
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          workspaces: fuzz
+      - name: Install cargo-fuzz
+        uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2
+        with:
+          tool: cargo-fuzz
+      - name: Fuzz ${{ matrix.target }} for five minutes
+        run: >-
+          cargo +nightly fuzz run ${{ matrix.target }} --
+          -max_total_time=300
+          -max_len=65536
+          -rss_limit_mb=4096
+          -seed_inputs=fuzz/seeds/${{ matrix.target }}
+      - name: Upload the crashing input
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: fuzz-crash-${{ matrix.target }}
+          path: fuzz/artifacts/${{ matrix.target }}
+          if-no-files-found: ignore
 
   wasm:
     name: WebAssembly conformance (${{ matrix.os }})

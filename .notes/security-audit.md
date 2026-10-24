@@ -212,7 +212,33 @@ Fixed and validated in the first remediation pass:
   lexer and syntax crates that runs only on manual dispatch (a
   `workflow_dispatch` input), so push/PR runs never wait on it. Miri cannot run
   `crux` (the collector reads the native stack), and the regexp/parser suites
-  need minutes of interpreted matching per test. Fuzzing remains absent.
+  need minutes of interpreted matching per test.
+  Fuzzing is no longer absent: `fuzz/` is a `cargo-fuzz` workspace with four
+  libFuzzer targets — `parse_js` (script, module and JSX goals), `parse_js_utf16`
+  (the code-unit entry point `eval` uses), `wasm_decode` (decode then validate),
+  and `regexp` (compile then execute) — plus a seed corpus so each decoder is
+  reached on the first iteration rather than having to discover an 8-byte module
+  header. The targets build with a sanitizer and run under `-max_total_time`, so
+  they are a manual `workflow_dispatch` job like Miri and cannot stall a build;
+  the lint job checks their formatting and lints them on every push. Each of the
+  four ran clean for 150 seconds on the current tree (363k, 684k, 4.3M and 53k
+  executions).
+- **Fuzzing (new)** — the first runs found two defects, both fixed:
+  - `lexer/src/lexer.rs:678` — `code_point(hi, lo)` computed `hi - 0xD800` for an
+    *unpaired* high surrogate: the identifier-arm guard checked only that a
+    following unit existed, not that it was a low surrogate. A UTF-16 source
+    (what `eval` takes) with a lone `\uD800` panicked a build with overflow
+    checks and wrapped silently in one without. The range check now precedes the
+    pair decode, which is what the other two call sites already did, and a test
+    pins the three unpaired shapes.
+  - `parser/src/parser.rs` — the fallback stack guard was a fixed "this parse
+    may consume N bytes" budget (1 MiB with debug assertions), which is larger
+    than a Windows thread's whole stack. `\n` + 49 `[` (49 levels, under the
+    `MAX_PARSE_DEPTH` count) overflowed a 1 MiB thread once the frames were
+    sanitizer-sized. `stackprobe` now answers from the thread's real bounds
+    (`GetCurrentThreadStackLimits` / `pthread_getattr_np`) when no host probe is
+    installed, and the parser's fixed budget is gone; a test drives a 1 MiB
+    thread to exhaustion and asserts the probe refuses first.
 - **Miri investigation (fixed)** — `regexp::fold_class` no longer scans all
   1,114,112 code points on first use; `crates/regexp/build.rs` emits the reverse
   fold index at compile time, so the lookup is a binary search over static data
@@ -236,8 +262,8 @@ Fixed and validated in the first remediation pass:
   isolate's state is unknown). `is_poisoned`/`unpoison` are exported and
   re-exported by `crates/jsc` for a host that rebuilds its state.
 
-Outstanding from this report: the fuzzing gap. Every other finding is fixed and
-validated in the passes below.
+No finding from this report is outstanding; every one is fixed and validated in
+the passes below.
 
 Validation for the first pass: `cargo clippy --workspace --all-targets -- -D
 warnings` is clean; `cargo fmt --all -- --check` is clean; 1,062 runtime unit
@@ -340,6 +366,13 @@ atomic storage); the runtime's shared-bridge test now asserts the refusal under
 --workspace --all-features` is green in debug and release, clippy `-D warnings`
 and rustfmt are clean, and the wasm sweeps pass (core 20,662 assertions, JS-API
 1,001 tests) in the default build.
+
+Validation for the fifteenth pass: `fuzz/` builds all four targets and each ran
+150 seconds without a crash (363,244 / 684,088 / 4,351,878 / 52,704 executions);
+the two defects it found are fixed with regression tests (`-p lexer`, `-p
+stackprobe`, `-p parser`, `-p regexp` all green); clippy `-D warnings` and
+rustfmt are clean for the root workspace and for `fuzz/`; `cargo test
+--workspace --all-features` is green in debug and release (40 suites each).
 
 ---
 
