@@ -2229,6 +2229,7 @@ pub fn for_of_begin(agent: &mut Agent, value: &Value) -> Result<ForOfState, JsEr
     // index 0, in the value kind, with the intrinsic `next`.
     let stock = match iterator.kind() {
         ValueKind::Object(object) => agent
+            .roots
             .array_iter_data
             .borrow()
             .get(&object.id())

@@ -1095,7 +1095,7 @@ pub(crate) fn create_array_iterator(
         .get(ARRAY_ITERATOR)
         .and_then(|value| as_object(&value));
     let iterator = JsObject::ordinary_object_create(proto);
-    agent.array_iter_data.borrow_mut().insert(
+    agent.roots.array_iter_data.borrow_mut().insert(
         iterator.id(),
         (array, 0usize, kind as u32, iterator.as_any()),
     );
@@ -2721,7 +2721,8 @@ fn array_iterator_next(agent: &mut Agent, this: &Value, _args: &[Value]) -> Resu
             "Array Iterator.prototype.next requires an Array Iterator".into(),
         ));
     };
-    let Some((array, index, kind, _)) = agent.array_iter_data.borrow().get(&obj.id()).cloned()
+    let Some((array, index, kind, _)) =
+        agent.roots.array_iter_data.borrow().get(&obj.id()).cloned()
     else {
         return Err(JsError::new(
             ErrorKind::TypeError,
@@ -2747,6 +2748,7 @@ fn array_iterator_next(agent: &mut Agent, this: &Value, _args: &[Value]) -> Resu
     let next_index = index as u64;
     if next_index >= length {
         agent
+            .roots
             .array_iter_data
             .borrow_mut()
             .insert(obj.id(), (Value::Undefined, index, kind, obj.as_any()));
@@ -2761,7 +2763,7 @@ fn array_iterator_next(agent: &mut Agent, this: &Value, _args: &[Value]) -> Resu
         1 => Value::Number(next_index as f64),
         _ => get_property(agent, &array, &name, array)?,
     };
-    agent.array_iter_data.borrow_mut().insert(
+    agent.roots.array_iter_data.borrow_mut().insert(
         obj.id(),
         (array, next_index as usize + 1, kind, obj.as_any()),
     );
@@ -2855,7 +2857,9 @@ fn make_from_async_handler(
         None,
     )?;
     agent
+        .roots
         .array_from_async
+        .borrow_mut()
         .insert(closure.id(), (state, is_reject));
     Ok(Value::Function(closure))
 }
@@ -3759,10 +3763,19 @@ pub fn dispatch_call(
     if intrinsics.get(ARRAY_ITERATOR_NEXT).as_ref() == Some(callee) {
         return Some(array_iterator_next(agent, this, args));
     }
-    // The fromAsync continuations, keyed by function identity.
-    if let ValueKind::Function(function) = callee.kind()
-        && let Some((state, is_reject)) = agent.array_from_async.get(&function.id()).cloned()
-    {
+    // The fromAsync continuations, keyed by function identity. The entry is
+    // cloned out of the table first: the resume allocates, and a guard held
+    // across it would abort that collection.
+    let from_async = match callee.kind() {
+        ValueKind::Function(function) => agent
+            .roots
+            .array_from_async
+            .borrow()
+            .get(&function.id())
+            .cloned(),
+        _ => None,
+    };
+    if let Some((state, is_reject)) = from_async {
         if is_reject {
             // Reject the capability with the awaited value, closing the
             // iterator first (IfAbruptCloseAsyncIterator, spec 23.1.2.4.1).

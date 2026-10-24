@@ -1014,7 +1014,7 @@ fn attach_await(
             None,
             None,
         )?;
-        agent.async_generator_awaits.insert(
+        agent.roots.async_generator_awaits.borrow_mut().insert(
             closure.id(),
             Rc::new(AsyncGeneratorAwaitEntry {
                 object_id,
@@ -1042,7 +1042,12 @@ pub fn dispatch_await(
     let ValueKind::Function(function) = callee.kind() else {
         return None;
     };
-    let entry = agent.async_generator_awaits.get(&function.id()).cloned()?;
+    let entry = agent
+        .roots
+        .async_generator_awaits
+        .borrow()
+        .get(&function.id())
+        .cloned()?;
     Some(resume_from_await(agent, entry, args))
 }
 

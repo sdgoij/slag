@@ -1170,7 +1170,9 @@ fn create_helper(agent: &mut Agent, state: HelperState) -> Result<Value, JsError
         .and_then(|value| as_object(&value));
     let object = JsObject::ordinary_object_create(proto);
     agent
+        .roots
         .iterator_helpers
+        .borrow_mut()
         .insert(object.id(), Rc::new(RefCell::new(state)));
     Ok(Value::Object(object))
 }
@@ -1444,7 +1446,9 @@ fn helper_method(
         ));
     };
     let state = agent
+        .roots
         .iterator_helpers
+        .borrow()
         .get(&obj.id())
         .cloned()
         .ok_or_else(|| JsError::new(ErrorKind::TypeError, "not an iterator helper".into()))?;
@@ -2020,7 +2024,7 @@ fn iterator_from(agent: &mut Agent, _this: &Value, args: &[Value]) -> Result<Val
         .get(WRAP_PROTO)
         .and_then(|value| as_object(&value));
     let object = JsObject::ordinary_object_create(proto);
-    agent.wrapped_iterators.insert(
+    agent.roots.wrapped_iterators.borrow_mut().insert(
         object.id(),
         Rc::new(RefCell::new(WrappedIteratorState { record })),
     );
@@ -2041,7 +2045,9 @@ fn wrap_method(
         ));
     };
     let state = agent
+        .roots
         .wrapped_iterators
+        .borrow()
         .get(&obj.id())
         .cloned()
         .ok_or_else(|| JsError::new(ErrorKind::TypeError, "not a wrapped iterator".into()))?;

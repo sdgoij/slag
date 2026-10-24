@@ -449,8 +449,15 @@ pub fn dispatch_call(
             return Some(handler(agent, this, args));
         }
     }
-    // The await continuations of the drivers.
-    if let Some(entry) = agent.async_iterator_awaits.get(&function.id()).cloned() {
+    // The await continuations of the drivers, cloned out before the dispatch
+    // (which allocates).
+    let entry = agent
+        .roots
+        .async_iterator_awaits
+        .borrow()
+        .get(&function.id())
+        .cloned();
+    if let Some(entry) = entry {
         return Some(dispatch_await(agent, entry, args));
     }
     None
@@ -564,7 +571,9 @@ fn make_await_closure(agent: &mut Agent, entry: AwaitEntry) -> Result<Value, JsE
         None,
     )?;
     agent
+        .roots
         .async_iterator_awaits
+        .borrow_mut()
         .insert(closure.id(), Rc::new(entry));
     Ok(Value::Function(closure))
 }
@@ -634,7 +643,9 @@ fn dispatch_await(
 /// Reject the pending `next()` promise of an async-iterator helper.
 fn reject_pending(agent: &mut Agent, object_id: u64, value: Value) -> Result<(), JsError> {
     let capability = agent
+        .roots
         .async_iterator_pending
+        .borrow()
         .get(&object_id)
         .cloned()
         .ok_or_else(|| JsError::new(ErrorKind::TypeError, "no pending capability".into()))?;
@@ -647,7 +658,9 @@ fn reject_pending(agent: &mut Agent, object_id: u64, value: Value) -> Result<(),
 /// Reject the result promise of an eager helper driver.
 fn reject_eager(agent: &mut Agent, driver_id: u64, value: Value) -> Result<(), JsError> {
     let driver = agent
+        .roots
         .async_iterator_eager
+        .borrow()
         .get(&driver_id)
         .cloned()
         .ok_or_else(|| JsError::new(ErrorKind::TypeError, "no eager driver".into()))?;
@@ -662,7 +675,9 @@ fn reject_eager(agent: &mut Agent, driver_id: u64, value: Value) -> Result<(), J
 /// pending `next()` promise with `{ mapped, done: false }`.
 fn continue_mapped(agent: &mut Agent, object_id: u64, mapped: Value) -> Result<Value, JsError> {
     let capability = agent
+        .roots
         .async_iterator_pending
+        .borrow()
         .get(&object_id)
         .cloned()
         .ok_or_else(|| JsError::new(ErrorKind::TypeError, "no pending capability".into()))?;
@@ -683,7 +698,9 @@ fn continue_filter(
     keep: Value,
 ) -> Result<Value, JsError> {
     let capability = agent
+        .roots
         .async_iterator_pending
+        .borrow()
         .get(&object_id)
         .cloned()
         .ok_or_else(|| JsError::new(ErrorKind::TypeError, "no pending capability".into()))?;
@@ -700,7 +717,9 @@ fn continue_filter(
     let record =
         {
             let state = agent
+                .roots
                 .async_iterator_helpers
+                .borrow()
                 .get(&object_id)
                 .cloned()
                 .ok_or_else(|| {
@@ -747,7 +766,9 @@ fn continue_flat_inner(agent: &mut Agent, object_id: u64, result: Value) -> Resu
     let value =
         crate::context::get_property(agent, &result, &JsString::from_utf8("value"), result)?;
     let capability = agent
+        .roots
         .async_iterator_pending
+        .borrow()
         .get(&object_id)
         .cloned()
         .ok_or_else(|| JsError::new(ErrorKind::TypeError, "no pending capability".into()))?;
@@ -755,7 +776,9 @@ fn continue_flat_inner(agent: &mut Agent, object_id: u64, result: Value) -> Resu
         // The inner iterator finished: clear it and continue the outer.
         let record = {
             let state = agent
+                .roots
                 .async_iterator_helpers
+                .borrow()
                 .get(&object_id)
                 .cloned()
                 .ok_or_else(|| {
@@ -823,7 +846,9 @@ fn async_helper_method(
     let capability = new_promise_capability(agent, &promise_ctor)?;
     let result_promise = capability.promise;
     let state = agent
+        .roots
         .async_iterator_helpers
+        .borrow()
         .get(&obj.id())
         .cloned()
         .ok_or_else(|| JsError::new(ErrorKind::TypeError, "not an async iterator helper".into()))?;
@@ -939,7 +964,9 @@ fn async_helper_method(
             },
         )?;
         agent
+            .roots
             .async_iterator_pending
+            .borrow_mut()
             .insert(obj.id(), capability.clone());
         perform_promise_then(agent, &promise, Some(on_fulfilled), Some(on_rejected), None)?;
         return Ok(result_promise);
@@ -977,7 +1004,9 @@ fn async_helper_method(
     // The capability travels in a per-helper slot so the continuation can
     // resolve the right promise even across re-drives.
     agent
+        .roots
         .async_iterator_pending
+        .borrow_mut()
         .insert(obj.id(), capability.clone());
     perform_promise_then(agent, &promise, Some(on_fulfilled), Some(on_rejected), None)?;
     Ok(result_promise)
@@ -995,13 +1024,17 @@ fn continue_lazy(agent: &mut Agent, object_id: u64, result: Value) -> Result<Val
     let value =
         crate::context::get_property(agent, &result, &JsString::from_utf8("value"), result)?;
     let capability = agent
+        .roots
         .async_iterator_pending
+        .borrow()
         .get(&object_id)
         .cloned()
         .ok_or_else(|| JsError::new(ErrorKind::TypeError, "no pending capability".into()))?;
     if to_boolean(&done) {
         let state = agent
+            .roots
             .async_iterator_helpers
+            .borrow()
             .get(&object_id)
             .cloned()
             .ok_or_else(|| {
@@ -1018,7 +1051,9 @@ fn continue_lazy(agent: &mut Agent, object_id: u64, result: Value) -> Result<Val
     }
     let (mode, record) = {
         let state = agent
+            .roots
             .async_iterator_helpers
+            .borrow()
             .get(&object_id)
             .cloned()
             .ok_or_else(|| {
@@ -1108,7 +1143,9 @@ fn continue_lazy(agent: &mut Agent, object_id: u64, result: Value) -> Result<Val
         HelperMode::Take { remaining } => {
             if *remaining <= 0.0 {
                 let state = agent
+                    .roots
                     .async_iterator_helpers
+                    .borrow()
                     .get(&object_id)
                     .cloned()
                     .ok_or_else(|| {
@@ -1222,7 +1259,9 @@ fn continue_lazy(agent: &mut Agent, object_id: u64, result: Value) -> Result<Val
     // Persist mode mutations (take/drop counts, the flatMap inner iterator)
     // so later continuations see them.
     let state = agent
+        .roots
         .async_iterator_helpers
+        .borrow()
         .get(&object_id)
         .cloned()
         .ok_or_else(|| JsError::new(ErrorKind::TypeError, "not an async iterator helper".into()))?;
@@ -1272,7 +1311,9 @@ fn create_helper(agent: &mut Agent, state: HelperState) -> Result<Value, JsError
         .and_then(|value| as_object(&value));
     let object = JsObject::ordinary_object_create(proto);
     agent
+        .roots
         .async_iterator_helpers
+        .borrow_mut()
         .insert(object.id(), Rc::new(RefCell::new(state)));
     Ok(Value::Object(object))
 }
@@ -1389,7 +1430,7 @@ fn start_eager(agent: &mut Agent, this: &Value, mode: EagerMode) -> Result<Value
     let capability = new_promise_capability(agent, &promise_ctor)?;
     let promise = capability.promise;
     let driver = JsObject::ordinary_object_create(None);
-    agent.async_iterator_eager.insert(
+    agent.roots.async_iterator_eager.borrow_mut().insert(
         driver.id(),
         Rc::new(RefCell::new(EagerState {
             record,
@@ -1405,7 +1446,9 @@ fn start_eager(agent: &mut Agent, this: &Value, mode: EagerMode) -> Result<Value
 fn eager_step(agent: &mut Agent, driver_id: u64) -> Result<Value, JsError> {
     let (record, capability) = {
         let driver = agent
+            .roots
             .async_iterator_eager
+            .borrow()
             .get(&driver_id)
             .cloned()
             .ok_or_else(|| JsError::new(ErrorKind::TypeError, "no eager driver".into()))?;
@@ -1458,7 +1501,9 @@ fn continue_eager(agent: &mut Agent, driver_id: u64, result: Value) -> Result<Va
         crate::context::get_property(agent, &result, &JsString::from_utf8("value"), result)?;
     let (mut mode, capability) = {
         let driver = agent
+            .roots
             .async_iterator_eager
+            .borrow()
             .get(&driver_id)
             .cloned()
             .ok_or_else(|| JsError::new(ErrorKind::TypeError, "no eager driver".into()))?;
@@ -1598,7 +1643,9 @@ fn continue_eager(agent: &mut Agent, driver_id: u64, result: Value) -> Result<Va
 
 fn store_eager(agent: &mut Agent, driver_id: u64, mode: EagerMode) -> Result<(), JsError> {
     let driver = agent
+        .roots
         .async_iterator_eager
+        .borrow()
         .get(&driver_id)
         .cloned()
         .ok_or_else(|| JsError::new(ErrorKind::TypeError, "no eager driver".into()))?;

@@ -311,7 +311,7 @@ fn compare_exchange(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<V
 struct WaiterEvent {
     condvar: Condvar,
     notified: Mutex<bool>,
-    /// For `waitAsync` waiters: the `agent.wait_async` key of the resolve
+    /// For `waitAsync` waiters: the `agent.roots.wait_async` key of the resolve
     /// function, resolved to *"ok"* by `notify` (a blocking `wait` event has
     /// `None`).
     async_key: Option<u64>,
@@ -368,7 +368,7 @@ fn notify(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsEr
     }
     let key = (slots.buffer.block_id(), offset);
     // GC-2: the same-thread resolve functions move from the traced
-    // `agent.wait_async` root into this local Vec, whose heap buffer the
+    // `agent.roots.wait_async` root into this local Vec, whose heap buffer the
     // stack scan cannot see while each resolution call allocates —
     // suppress `--gc-stress` for the drain so the not-yet-resolved
     // entries cannot be swept.
@@ -395,7 +395,9 @@ fn notify(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsEr
                 }
                 match event.async_key {
                     Some(async_key) => {
-                        if let Some((resolve, _, _)) = agent.wait_async.remove(&async_key) {
+                        if let Some((resolve, _, _)) =
+                            agent.roots.wait_async.borrow_mut().remove(&async_key)
+                        {
                             // Same-thread waiter: resolve the promise right
                             // here (spec 26.4.15 DoWait step 20) and drop the
                             // event.
@@ -627,7 +629,9 @@ fn wait_async(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, 
     let block_id = slots.buffer.block_id();
     let key = (block_id, offset);
     agent
+        .roots
         .wait_async
+        .borrow_mut()
         .insert(resolve_id, (capability.resolve, block_id, offset));
     let event = Arc::new(WaiterEvent {
         condvar: Condvar::new(),
@@ -662,7 +666,9 @@ fn wait_async(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, 
             }
             .unwrap_or("timed-out");
             let resolve = agent
+                .roots
                 .wait_async
+                .borrow_mut()
                 .remove(&resolve_id)
                 .map(|(resolve, _, _)| resolve);
             if let Some(resolve) = resolve {
@@ -699,7 +705,7 @@ pub fn service_wait_async(agent: &mut Agent) -> Result<(), JsError> {
         let registry = registry()
             .lock()
             .map_err(|_| JsError::new(ErrorKind::TypeError, "wait registry poisoned".into()))?;
-        for (resolve_id, (resolve, block_id, offset)) in agent.wait_async.iter() {
+        for (resolve_id, (resolve, block_id, offset)) in agent.roots.wait_async.borrow().iter() {
             let Some(queue) = registry.get(&(*block_id, *offset)) else {
                 continue;
             };
@@ -716,7 +722,7 @@ pub fn service_wait_async(agent: &mut Agent) -> Result<(), JsError> {
         }
     }
     for (resolve_id, resolve, block_id, offset, outcome) in resolved {
-        agent.wait_async.remove(&resolve_id);
+        agent.roots.wait_async.borrow_mut().remove(&resolve_id);
         crate::function::call(agent, &resolve, Value::Undefined, &[str(outcome)])?;
         if let Ok(mut registry) = registry().lock()
             && let Some(queue) = registry.get_mut(&(block_id, offset))

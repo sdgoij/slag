@@ -578,7 +578,7 @@ pub fn async_from_sync_iterator(
             None,
             None,
         )?;
-        agent.async_from_sync.insert(
+        agent.roots.async_from_sync.borrow_mut().insert(
             closure.id(),
             Rc::new(AsyncFromSyncEntry {
                 sync: sync.clone(),
@@ -602,7 +602,12 @@ pub fn dispatch_async_from_sync(
     let ValueKind::Function(function) = callee.kind() else {
         return None;
     };
-    let entry = agent.async_from_sync.get(&function.id()).cloned()?;
+    let entry = agent
+        .roots
+        .async_from_sync
+        .borrow()
+        .get(&function.id())
+        .cloned()?;
     Some(run_async_from_sync(agent, entry, args))
 }
 

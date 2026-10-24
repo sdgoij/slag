@@ -399,13 +399,13 @@ fn stack_construct(
             })?,
     };
     let object = JsObject::ordinary_object_create(Some(proto));
-    agent.disposable_stacks.insert(
+    agent.register_disposable_stack(
         object.id(),
-        RefCell::new(DisposableStackData {
+        DisposableStackData {
             disposed: false,
             resources: Vec::new(),
             is_async,
-        }),
+        },
     );
     Ok(Value::Object(object))
 }
@@ -418,7 +418,7 @@ fn stack_data(agent: &Agent, this: &Value, is_async: bool) -> Result<u64, JsErro
             "Method called on a non-object".into(),
         ));
     };
-    let Some(data) = agent.disposable_stacks.get(&obj.id()) else {
+    let Some(data) = agent.disposable_stack(obj.id()) else {
         return Err(JsError::new(
             ErrorKind::TypeError,
             "Method called on a non-stack object".into(),
@@ -438,8 +438,7 @@ fn stack_data(agent: &Agent, this: &Value, is_async: bool) -> Result<u64, JsErro
 fn disposed_getter(agent: &mut Agent, this: &Value, is_async: bool) -> Result<Value, JsError> {
     let id = stack_data(agent, this, is_async)?;
     let disposed = agent
-        .disposable_stacks
-        .get(&id)
+        .disposable_stack(id)
         .map(|data| data.borrow().disposed)
         .unwrap_or(false);
     Ok(Value::Boolean(disposed))
@@ -585,8 +584,7 @@ fn use_value(
 /// step 3 and the sibling methods).
 fn check_not_disposed(agent: &Agent, id: u64) -> Result<(), JsError> {
     let data = agent
-        .disposable_stacks
-        .get(&id)
+        .disposable_stack(id)
         .ok_or_else(|| JsError::new(ErrorKind::TypeError, "not a stack".into()))?;
     if data.borrow().disposed {
         return Err(JsError::new(
@@ -611,8 +609,7 @@ fn add_resource(
 ) -> Result<(), JsError> {
     check_not_disposed(agent, id)?;
     let data = agent
-        .disposable_stacks
-        .get(&id)
+        .disposable_stack(id)
         .ok_or_else(|| JsError::new(ErrorKind::TypeError, "not a stack".into()))?;
     let mut data = data.borrow_mut();
     data.resources.push(DisposableResource {
@@ -638,8 +635,7 @@ fn move_stack(
     };
     let resources = {
         let data = agent
-            .disposable_stacks
-            .get(&id)
+            .disposable_stack(id)
             .ok_or_else(|| JsError::new(ErrorKind::TypeError, "not a stack".into()))?;
         let mut data = data.borrow_mut();
         if data.disposed {
@@ -663,13 +659,13 @@ fn move_stack(
         .and_then(|value| as_object(&value))
         .ok_or_else(|| JsError::new(ErrorKind::TypeError, format!("{proto_key} missing")))?;
     let object = JsObject::ordinary_object_create(Some(proto));
-    agent.disposable_stacks.insert(
+    agent.register_disposable_stack(
         object.id(),
-        RefCell::new(DisposableStackData {
+        DisposableStackData {
             disposed: false,
             resources,
             is_async,
-        }),
+        },
     );
     Ok(Value::Object(object))
 }
@@ -679,8 +675,7 @@ fn move_stack(
 fn dispose_resources(agent: &mut Agent, id: u64) -> Result<Option<Value>, JsError> {
     let resources = {
         let data = agent
-            .disposable_stacks
-            .get(&id)
+            .disposable_stack(id)
             .ok_or_else(|| JsError::new(ErrorKind::TypeError, "not a stack".into()))?;
         data.borrow().resources.clone()
     };
@@ -736,8 +731,7 @@ fn resource_arguments(resource: &DisposableResource) -> Vec<Value> {
 fn dispose_method(agent: &mut Agent, this: &Value) -> Result<Value, JsError> {
     let id = stack_data(agent, this, false)?;
     let data = agent
-        .disposable_stacks
-        .get(&id)
+        .disposable_stack(id)
         .ok_or_else(|| JsError::new(ErrorKind::TypeError, "not a stack".into()))?;
     {
         let mut data = data.borrow_mut();
@@ -776,8 +770,7 @@ fn dispose_async_method(agent: &mut Agent, this: &Value) -> Result<Value, JsErro
     };
     let already_disposed = {
         let data = agent
-            .disposable_stacks
-            .get(&id)
+            .disposable_stack(id)
             .ok_or_else(|| JsError::new(ErrorKind::TypeError, "not a stack".into()))?;
         let mut data = data.borrow_mut();
         let disposed = data.disposed;
@@ -796,7 +789,7 @@ fn dispose_async_method(agent: &mut Agent, this: &Value) -> Result<Value, JsErro
         return Ok(result_promise);
     }
     let driver = JsObject::ordinary_object_create(None);
-    agent.disposable_async_drivers.insert(
+    agent.roots.disposable_async_drivers.borrow_mut().insert(
         driver.id(),
         Rc::new(RefCell::new(AsyncDisposalDriver {
             stack_id: id,
@@ -808,7 +801,9 @@ fn dispose_async_method(agent: &mut Agent, this: &Value) -> Result<Value, JsErro
         })),
     );
     agent
+        .roots
         .disposable_async_caps
+        .borrow_mut()
         .insert(driver.id(), capability.clone());
     drive_async_disposal(agent, driver.id())?;
     Ok(result_promise)
@@ -820,14 +815,15 @@ fn dispose_async_method(agent: &mut Agent, this: &Value) -> Result<Value, JsErro
 fn drive_async_disposal(agent: &mut Agent, driver_id: u64) -> Result<Value, JsError> {
     let (resources, index, completion, needs_await, has_awaited, final_await) = {
         let driver = agent
+            .roots
             .disposable_async_drivers
+            .borrow()
             .get(&driver_id)
             .cloned()
             .ok_or_else(|| JsError::new(ErrorKind::TypeError, "no disposal driver".into()))?;
         let driver = driver.borrow();
         let mut resources = agent
-            .disposable_stacks
-            .get(&driver.stack_id)
+            .disposable_stack(driver.stack_id)
             .map(|data| data.borrow().resources.clone())
             .unwrap_or_default();
         // DisposeResources walks the stack in reverse (spec 27.4.1.3).
@@ -854,7 +850,9 @@ fn drive_async_disposal(agent: &mut Agent, driver_id: u64) -> Result<Value, JsEr
             let promise = crate::promise::promise_resolve(agent, &promise_ctor, Value::Undefined)?;
             {
                 let driver = agent
+                    .roots
                     .disposable_async_drivers
+                    .borrow()
                     .get(&driver_id)
                     .cloned()
                     .ok_or_else(|| {
@@ -873,7 +871,9 @@ fn drive_async_disposal(agent: &mut Agent, driver_id: u64) -> Result<Value, JsEr
             return Ok(Value::Undefined);
         }
         let capability = agent
+            .roots
             .disposable_async_caps
+            .borrow()
             .get(&driver_id)
             .cloned()
             .ok_or_else(|| JsError::new(ErrorKind::TypeError, "no disposal capability".into()))?;
@@ -902,7 +902,9 @@ fn drive_async_disposal(agent: &mut Agent, driver_id: u64) -> Result<Value, JsEr
         // Dispose with no method: a no-op, but an async hint still implies
         // the trailing await (spec 27.4.1.3 step 3.f).
         let driver = agent
+            .roots
             .disposable_async_drivers
+            .borrow()
             .get(&driver_id)
             .cloned()
             .ok_or_else(|| JsError::new(ErrorKind::TypeError, "no disposal driver".into()))?;
@@ -923,7 +925,9 @@ fn drive_async_disposal(agent: &mut Agent, driver_id: u64) -> Result<Value, JsEr
         Err(error) => {
             let new_error = crate::promise::error_value(agent, &error);
             let driver = agent
+                .roots
                 .disposable_async_drivers
+                .borrow()
                 .get(&driver_id)
                 .cloned()
                 .ok_or_else(|| JsError::new(ErrorKind::TypeError, "no disposal driver".into()))?;
@@ -942,7 +946,9 @@ fn drive_async_disposal(agent: &mut Agent, driver_id: u64) -> Result<Value, JsEr
         // async stack): DisposeResources discards its return value without an
         // Await (spec 27.4.1.3 step 3.c); only an @@asyncDispose result awaits.
         let driver = agent
+            .roots
             .disposable_async_drivers
+            .borrow()
             .get(&driver_id)
             .cloned()
             .ok_or_else(|| JsError::new(ErrorKind::TypeError, "no disposal driver".into()))?;
@@ -958,7 +964,9 @@ fn drive_async_disposal(agent: &mut Agent, driver_id: u64) -> Result<Value, JsEr
     let promise = crate::promise::promise_resolve(agent, &promise_ctor, result)?;
     {
         let driver = agent
+            .roots
             .disposable_async_drivers
+            .borrow()
             .get(&driver_id)
             .cloned()
             .ok_or_else(|| JsError::new(ErrorKind::TypeError, "no disposal driver".into()))?;
@@ -1015,7 +1023,12 @@ pub fn dispatch_continuation(
     };
     let (driver_id, is_reject) = agent.disposable_async_cont.get(&function.id()).cloned()?;
     let value = args.first().cloned().unwrap_or(Value::Undefined);
-    let driver = agent.disposable_async_drivers.get(&driver_id).cloned()?;
+    let driver = agent
+        .roots
+        .disposable_async_drivers
+        .borrow()
+        .get(&driver_id)
+        .cloned()?;
     if driver.borrow().final_await {
         // The trailing `Await(undefined)` settled: settle the capability.
         let mut driver = driver.borrow_mut();
@@ -1124,7 +1137,7 @@ pub fn dispose_async_body_resources(
     let mut resources = resources;
     resources.reverse();
     let driver = JsObject::ordinary_object_create(None);
-    agent.async_body_disposal.insert(
+    agent.roots.async_body_disposal.borrow_mut().insert(
         driver.id(),
         Rc::new(RefCell::new(AsyncBodyDisposalDriver {
             resources,
@@ -1142,7 +1155,9 @@ pub fn dispose_async_body_resources(
 fn drive_async_body_disposal(agent: &mut Agent, driver_id: u64) -> Result<Value, JsError> {
     let (resources, index, completion, settlement) = {
         let driver = agent
+            .roots
             .async_body_disposal
+            .borrow()
             .get(&driver_id)
             .cloned()
             .ok_or_else(|| JsError::new(ErrorKind::TypeError, "no disposal driver".into()))?;
@@ -1228,7 +1243,9 @@ fn drive_async_body_step(
     result: Result<Value, Value>,
 ) -> Result<Value, JsError> {
     let driver = agent
+        .roots
         .async_body_disposal
+        .borrow()
         .get(&driver_id)
         .cloned()
         .ok_or_else(|| JsError::new(ErrorKind::TypeError, "no disposal driver".into()))?;

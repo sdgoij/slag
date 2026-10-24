@@ -101,6 +101,13 @@ pub struct MapCollection {
     pub collided: bool,
 }
 
+/// The `Array.fromAsync` continuation state (spec 23.1.2.4.1): the handler's
+/// state and whether the handler is the rejection one.
+pub(crate) type FromAsyncContinuation = (
+    std::rc::Rc<RefCell<crate::builtins::array::FromAsyncState>>,
+    bool,
+);
+
 /// The record of a Map or Set iterator: the iterated collection (or `None`
 /// once iteration finished), the next index, and the iteration kind's code
 /// (spec 24.1.6.1).
@@ -551,6 +558,100 @@ pub(crate) struct AgentRoots {
     /// The [[IteratedSet]], [[SetNextIndex]], and [[SetIterationKind]] of Set
     /// iterators (spec 24.2.6).
     pub(crate) set_iter_data: RefCell<IdMap<Rc<RefCell<IterRecord>>>>,
+    /// The AsyncFromSyncIterator methods, keyed by function identity.
+    pub(crate) async_from_sync: RefCell<
+        std::collections::HashMap<u64, std::rc::Rc<crate::async_await::AsyncFromSyncEntry>>,
+    >,
+    /// The await-resume handlers of async generator bodies, keyed by function
+    /// identity.
+    pub(crate) async_generator_awaits: RefCell<
+        std::collections::HashMap<
+            u64,
+            std::rc::Rc<crate::async_generator::AsyncGeneratorAwaitEntry>,
+        >,
+    >,
+    /// The iterator-helper objects' states, keyed by object identity (spec
+    /// 27.1.3).
+    pub(crate) iterator_helpers: RefCell<
+        std::collections::HashMap<
+            u64,
+            std::rc::Rc<RefCell<crate::builtins::iterator::HelperState>>,
+        >,
+    >,
+    /// The wrapped iterators created by `Iterator.from`, keyed by object
+    /// identity (spec 27.1.3.2).
+    pub(crate) wrapped_iterators: RefCell<
+        std::collections::HashMap<
+            u64,
+            std::rc::Rc<RefCell<crate::builtins::iterator::WrappedIteratorState>>,
+        >,
+    >,
+    /// The async-iterator-helper objects' states, keyed by object identity
+    /// (spec 27.1.4).
+    pub(crate) async_iterator_helpers: RefCell<
+        std::collections::HashMap<
+            u64,
+            std::rc::Rc<RefCell<crate::builtins::async_iterator::HelperState>>,
+        >,
+    >,
+    /// The await continuations of async-iterator helper drivers, keyed by
+    /// function identity.
+    pub(crate) async_iterator_awaits: RefCell<
+        std::collections::HashMap<u64, std::rc::Rc<crate::builtins::async_iterator::AwaitEntry>>,
+    >,
+    /// The drivers of eager async-iterator helpers, keyed by driver-object
+    /// identity.
+    pub(crate) async_iterator_eager: RefCell<
+        std::collections::HashMap<
+            u64,
+            std::rc::Rc<RefCell<crate::builtins::async_iterator::EagerState>>,
+        >,
+    >,
+    /// The capability of the in-flight `next()` of each lazy async-iterator
+    /// helper, keyed by helper-object identity.
+    pub(crate) async_iterator_pending:
+        RefCell<std::collections::HashMap<u64, crate::promise::PromiseCapability>>,
+    /// The [[DisposableStackData]] of DisposableStack/AsyncDisposableStack
+    /// instances, keyed by object identity (spec 27.4.2).
+    pub(crate) disposable_stacks:
+        RefCell<IdMap<std::rc::Rc<RefCell<crate::builtins::disposable::DisposableStackData>>>>,
+    /// The in-flight `disposeAsync` drivers, keyed by driver-object identity.
+    pub(crate) disposable_async_drivers: RefCell<
+        std::collections::HashMap<
+            u64,
+            std::rc::Rc<RefCell<crate::builtins::disposable::AsyncDisposalDriver>>,
+        >,
+    >,
+    /// The capability of each in-flight `disposeAsync`, keyed by driver
+    /// identity.
+    pub(crate) disposable_async_caps:
+        RefCell<std::collections::HashMap<u64, crate::promise::PromiseCapability>>,
+    /// The in-flight disposal drivers of async bodies (`using` resources
+    /// drained at body completion), keyed by driver-object identity.
+    pub(crate) async_body_disposal: RefCell<
+        std::collections::HashMap<
+            u64,
+            std::rc::Rc<RefCell<crate::builtins::disposable::AsyncBodyDisposalDriver>>,
+        >,
+    >,
+    /// The `Array.fromAsync` continuation states, keyed by handler-function
+    /// identity (spec 23.1.2.4.1); the bool selects the reject handler.
+    pub(crate) array_from_async: RefCell<IdMap<FromAsyncContinuation>>,
+    /// The resolve functions of pending `Atomics.waitAsync` waits, keyed by
+    /// the registered waiter-event id, with the (block id, byte offset) the
+    /// event sits at in the global wait registry. A same-agent `Atomics.notify`
+    /// resolves the promise directly with *"ok"* (spec 26.4.15 DoWait step
+    /// 20); a cross-thread notify only marks the event, and the owning agent
+    /// resolves it from its own thread (`service_wait_async` or the timeout
+    /// job, whichever fires first).
+    pub(crate) wait_async: RefCell<std::collections::HashMap<u64, (Value, usize, usize)>>,
+    /// [[IteratedObject]], [[ArrayIteratorNextIndex]], [[ArrayIterationKind]],
+    /// and the iterator box's address (for dead-entry reaping) of Array
+    /// iterators, keyed by object identity (spec 23.1.5). A `RefCell` so the
+    /// collection's dead-set compaction can drop entries for swept iterators;
+    /// otherwise every entry's iterated array stays a root forever.
+    pub(crate) array_iter_data:
+        RefCell<std::collections::HashMap<u64, (Value, usize, u32, crux::heap::GcAny)>>,
     /// The internal state of ArrayBuffer/SharedArrayBuffer objects, keyed by
     /// object identity (spec 25.1.1: [[ArrayBufferData]],
     /// [[ArrayBufferByteLength]], [[ArrayBufferMaxByteLength]], and the
@@ -625,6 +726,21 @@ impl AgentRoots {
             weak_set_data: RefCell::new(IdMap::default()),
             map_iter_data: RefCell::new(IdMap::default()),
             set_iter_data: RefCell::new(IdMap::default()),
+            async_from_sync: RefCell::new(std::collections::HashMap::new()),
+            async_generator_awaits: RefCell::new(std::collections::HashMap::new()),
+            iterator_helpers: RefCell::new(std::collections::HashMap::new()),
+            wrapped_iterators: RefCell::new(std::collections::HashMap::new()),
+            async_iterator_helpers: RefCell::new(std::collections::HashMap::new()),
+            async_iterator_awaits: RefCell::new(std::collections::HashMap::new()),
+            async_iterator_eager: RefCell::new(std::collections::HashMap::new()),
+            async_iterator_pending: RefCell::new(std::collections::HashMap::new()),
+            disposable_stacks: RefCell::new(IdMap::default()),
+            disposable_async_drivers: RefCell::new(std::collections::HashMap::new()),
+            disposable_async_caps: RefCell::new(std::collections::HashMap::new()),
+            async_body_disposal: RefCell::new(std::collections::HashMap::new()),
+            array_from_async: RefCell::new(IdMap::default()),
+            wait_async: RefCell::new(std::collections::HashMap::new()),
+            array_iter_data: RefCell::new(std::collections::HashMap::new()),
             buffer_data: RefCell::new(IdMap::default()),
             dataview_data: RefCell::new(IdMap::default()),
             symbol_data: RefCell::new(IdMap::default()),
@@ -726,6 +842,29 @@ impl Trace for AgentRoots {
         self.shadow_handlers.trace(visit);
         self.ecma_functions.trace(visit);
         self.dataview_data.trace(visit);
+        self.async_from_sync.trace(visit);
+        self.async_generator_awaits.trace(visit);
+        self.iterator_helpers.trace(visit);
+        self.wrapped_iterators.trace(visit);
+        self.async_iterator_helpers.trace(visit);
+        self.async_iterator_awaits.trace(visit);
+        self.async_iterator_eager.trace(visit);
+        self.async_iterator_pending.trace(visit);
+        self.disposable_stacks.trace(visit);
+        self.disposable_async_drivers.trace(visit);
+        self.disposable_async_caps.trace(visit);
+        self.async_body_disposal.trace(visit);
+        for (state, _) in self.array_from_async.borrow().values() {
+            state.trace(visit);
+        }
+        for (value, _, _) in self.wait_async.borrow().values() {
+            value.trace(visit);
+        }
+        if let Ok(map) = self.array_iter_data.try_borrow() {
+            for (value, _, _, _) in map.values() {
+                value.trace(visit);
+            }
+        }
         // Visited because a buffer's [[ArrayBufferDetachKey]] is a GC value;
         // the state held only scalars and a refcounted block until that field
         // existed, which is why this line is newer than the table.
@@ -1088,73 +1227,15 @@ pub struct Agent {
     #[cfg(feature = "wasm")]
     pub wasm_streaming_handlers:
         std::collections::HashMap<u64, std::rc::Rc<crate::builtins::wasm::StreamingHandler>>,
-    /// The AsyncFromSyncIterator methods, keyed by function identity.
-    pub async_from_sync:
-        std::collections::HashMap<u64, std::rc::Rc<crate::async_await::AsyncFromSyncEntry>>,
     /// The AsyncFromSyncIterator value-unwrap continuations, keyed by
     /// function identity (spec 27.1.5.4).
     pub async_from_sync_continuations: std::collections::HashMap<
         u64,
         std::rc::Rc<crate::async_await::AsyncFromSyncContinuationEntry>,
     >,
-    /// The await-resume handlers of async generator bodies, keyed by function
-    /// identity.
-    pub async_generator_awaits: std::collections::HashMap<
-        u64,
-        std::rc::Rc<crate::async_generator::AsyncGeneratorAwaitEntry>,
-    >,
-    /// The iterator-helper objects' states, keyed by object identity (spec
-    /// 27.1.3).
-    pub iterator_helpers: std::collections::HashMap<
-        u64,
-        std::rc::Rc<RefCell<crate::builtins::iterator::HelperState>>,
-    >,
-    /// The wrapped iterators created by `Iterator.from`, keyed by object
-    /// identity (spec 27.1.3.2).
-    pub wrapped_iterators: std::collections::HashMap<
-        u64,
-        std::rc::Rc<RefCell<crate::builtins::iterator::WrappedIteratorState>>,
-    >,
-    /// The async-iterator-helper objects' states, keyed by object identity
-    /// (spec 27.1.4).
-    pub async_iterator_helpers: std::collections::HashMap<
-        u64,
-        std::rc::Rc<RefCell<crate::builtins::async_iterator::HelperState>>,
-    >,
-    /// The await continuations of async-iterator helper drivers, keyed by
-    /// function identity.
-    pub async_iterator_awaits:
-        std::collections::HashMap<u64, std::rc::Rc<crate::builtins::async_iterator::AwaitEntry>>,
-    /// The drivers of eager async-iterator helpers, keyed by driver-object
-    /// identity.
-    pub async_iterator_eager: std::collections::HashMap<
-        u64,
-        std::rc::Rc<RefCell<crate::builtins::async_iterator::EagerState>>,
-    >,
-    /// The capability of the in-flight `next()` of each lazy async-iterator
-    /// helper, keyed by helper-object identity.
-    pub async_iterator_pending: std::collections::HashMap<u64, crate::promise::PromiseCapability>,
-    /// The [[DisposableStackData]] of DisposableStack/AsyncDisposableStack
-    /// instances, keyed by object identity (spec 27.4.2).
-    pub disposable_stacks:
-        std::collections::HashMap<u64, RefCell<crate::builtins::disposable::DisposableStackData>>,
-    /// The in-flight `disposeAsync` drivers, keyed by driver-object identity.
-    pub disposable_async_drivers: std::collections::HashMap<
-        u64,
-        std::rc::Rc<RefCell<crate::builtins::disposable::AsyncDisposalDriver>>,
-    >,
-    /// The capability of each in-flight `disposeAsync`, keyed by driver
-    /// identity.
-    pub disposable_async_caps: std::collections::HashMap<u64, crate::promise::PromiseCapability>,
     /// The `disposeAsync` continuations, keyed by function identity: the
     /// driver id and whether the awaited disposal promise rejected.
     pub disposable_async_cont: std::collections::HashMap<u64, (u64, bool)>,
-    /// The in-flight disposal drivers of async bodies (`using` resources
-    /// drained at body completion), keyed by driver-object identity.
-    pub async_body_disposal: std::collections::HashMap<
-        u64,
-        std::rc::Rc<RefCell<crate::builtins::disposable::AsyncBodyDisposalDriver>>,
-    >,
     /// The async-body disposal continuations, keyed by function identity:
     /// the driver id and whether the awaited disposal promise rejected.
     pub async_body_disposal_cont: std::collections::HashMap<u64, (u64, bool)>,
@@ -1421,37 +1502,8 @@ pub struct Agent {
         u64,
         std::rc::Rc<std::cell::RefCell<crate::builtins::weakref::FinalizationData>>,
     >,
-    /// [[IteratedObject]], [[ArrayIteratorNextIndex]], [[ArrayIterationKind]],
-    /// and the iterator box's address (for dead-entry reaping) of Array
-    /// iterators, keyed by object identity (spec 23.1.5). A `RefCell` so the
-    /// collection's dead-set compaction can drop entries for swept iterators;
-    /// otherwise every entry's iterated array stays a root forever.
-    pub array_iter_data:
-        std::cell::RefCell<std::collections::HashMap<u64, (Value, usize, u32, crux::heap::GcAny)>>,
     pub promise_addrs: std::cell::RefCell<std::collections::HashMap<u64, crux::heap::GcAny>>,
     pending_dead_promises: std::cell::RefCell<Vec<u64>>,
-    /// The `Array.fromAsync` continuation states, keyed by handler-function
-    /// identity (spec 23.1.2.4.1); the bool selects the reject handler.
-    pub array_from_async: std::collections::HashMap<
-        u64,
-        (
-            std::rc::Rc<std::cell::RefCell<crate::builtins::array::FromAsyncState>>,
-            bool,
-        ),
-    >,
-    /// The resolve functions of pending `Atomics.waitAsync` waits, keyed by
-    /// the registered waiter-event id, with the (block id, byte offset) the
-    /// event sits at in the global wait registry. A same-agent `Atomics.notify`
-    /// resolves the promise directly with *"ok"* (spec 26.4.15 DoWait step
-    /// 20); a cross-thread notify only marks the event, and the owning agent
-    /// resolves it from its own thread (`service_wait_async` or the timeout
-    /// job, whichever fires first).
-    pub wait_async: std::collections::HashMap<u64, (Value, usize, usize)>,
-    /// The internal state of ArrayBuffer/SharedArrayBuffer objects, keyed by
-    /// object identity (spec 25.1.1: [[ArrayBufferData]], [[ArrayBufferByteLength]],
-    /// [[ArrayBufferMaxByteLength]], and the resizable/growable + shared flags).
-    /// Phase 12 created buffers as the TypedArray backing store; Phase 14 adds
-    /// the full builtins.
     /// The nesting depth of class field initializers currently evaluating.
     /// A direct eval inside one applies the "Eval Inside Initializer" early
     /// errors (spec 19.2.1.1): `arguments` is a SyntaxError there.
@@ -1741,20 +1793,8 @@ impl Agent {
             entered_realm: None,
             #[cfg(feature = "wasm")]
             wasm_streaming_handlers: std::collections::HashMap::new(),
-            async_from_sync: std::collections::HashMap::new(),
             async_from_sync_continuations: std::collections::HashMap::new(),
-            async_generator_awaits: std::collections::HashMap::new(),
-            iterator_helpers: std::collections::HashMap::new(),
-            wrapped_iterators: std::collections::HashMap::new(),
-            async_iterator_helpers: std::collections::HashMap::new(),
-            async_iterator_awaits: std::collections::HashMap::new(),
-            async_iterator_eager: std::collections::HashMap::new(),
-            async_iterator_pending: std::collections::HashMap::new(),
-            disposable_stacks: std::collections::HashMap::new(),
-            disposable_async_drivers: std::collections::HashMap::new(),
-            disposable_async_caps: std::collections::HashMap::new(),
             disposable_async_cont: std::collections::HashMap::new(),
-            async_body_disposal: std::collections::HashMap::new(),
             async_body_disposal_cont: std::collections::HashMap::new(),
             builtin_dispatch_cache: std::collections::HashMap::default(),
             host_modules: RefCell::new(std::collections::HashMap::new()),
@@ -1840,11 +1880,8 @@ impl Agent {
             kept_during_job: std::cell::RefCell::new(Vec::new()),
             pending_cleanup_jobs: std::cell::RefCell::new(Vec::new()),
             finalization_registries: std::collections::HashMap::new(),
-            array_iter_data: std::cell::RefCell::new(std::collections::HashMap::new()),
             promise_addrs: std::cell::RefCell::new(std::collections::HashMap::new()),
             pending_dead_promises: std::cell::RefCell::new(Vec::new()),
-            array_from_async: std::collections::HashMap::new(),
-            wait_async: std::collections::HashMap::new(),
             field_initializer_depth: 0,
             realm_count: std::cell::Cell::new(0),
             gc_stress: Cell::new(false),
@@ -2007,6 +2044,25 @@ impl Agent {
     /// A snapshot of a Set's [[SetData]]; see [`map_entries`](Self::map_entries).
     pub fn set_entries(&self, id: u64) -> Option<Vec<SetEntry>> {
         Some(self.set_collection(id)?.borrow().entries.clone())
+    }
+
+    /// The [[DisposableStackData]] of a DisposableStack/AsyncDisposableStack.
+    pub(crate) fn disposable_stack(
+        &self,
+        id: u64,
+    ) -> Option<Rc<RefCell<crate::builtins::disposable::DisposableStackData>>> {
+        self.roots.disposable_stacks.borrow().get(&id).cloned()
+    }
+
+    pub(crate) fn register_disposable_stack(
+        &self,
+        id: u64,
+        data: crate::builtins::disposable::DisposableStackData,
+    ) {
+        self.roots
+            .disposable_stacks
+            .borrow_mut()
+            .insert(id, Rc::new(RefCell::new(data)));
     }
 
     pub fn has_map(&self, id: u64) -> bool {
@@ -2788,19 +2844,6 @@ impl Agent {
         self.entered_realm.trace(visit);
         #[cfg(feature = "wasm")]
         self.wasm_streaming_handlers.trace(visit);
-        self.async_from_sync.trace(visit);
-        self.async_from_sync_continuations.trace(visit);
-        self.async_generator_awaits.trace(visit);
-        self.iterator_helpers.trace(visit);
-        self.wrapped_iterators.trace(visit);
-        self.async_iterator_helpers.trace(visit);
-        self.async_iterator_awaits.trace(visit);
-        self.async_iterator_eager.trace(visit);
-        self.async_iterator_pending.trace(visit);
-        self.disposable_stacks.trace(visit);
-        self.disposable_async_drivers.trace(visit);
-        self.disposable_async_caps.trace(visit);
-        self.async_body_disposal.trace(visit);
         #[cfg(feature = "wasm")]
         {
             // The wasm JS-API wrapper tables (Cut 10): their values are heap
@@ -2849,6 +2892,9 @@ impl Agent {
             key.trace(visit);
             value.trace(visit);
         }
+        // The AsyncFromSyncIterator value-unwrap continuations: their values
+        // are the capability a pending await resumes into, so they are roots.
+        self.async_from_sync_continuations.trace(visit);
         self.module_namespaces.trace(visit);
         self.deferred_namespaces.trace(visit);
         self.module_sources.trace(visit);
@@ -2900,17 +2946,6 @@ impl Agent {
                 let held = value_box_addr(&cell.held_value).unwrap_or(target);
                 crux::heap::note_ephemeron(target, held);
             }
-        }
-        if let Ok(map) = self.array_iter_data.try_borrow() {
-            for (value, _, _, _) in map.values() {
-                value.trace(visit);
-            }
-        }
-        for (state, _) in self.array_from_async.values() {
-            state.trace(visit);
-        }
-        for (value, _, _) in self.wait_async.values() {
-            value.trace(visit);
         }
         // GC-2: the Vms currently running bodies (their heap-buffered value
         // stacks are invisible to the conservative stack scan). Pooled and
@@ -3072,13 +3107,14 @@ impl Agent {
         // sort it only when an iterator table exists (the common no-iterator
         // collection skips the work).
         let has_iterators = self
+            .roots
             .array_iter_data
             .try_borrow()
             .is_ok_and(|map| !map.is_empty())
-            || live.iter().any(|&(agent, _)| {
+            || live.iter().any(|&(agent, roots)| {
                 agent != self_ptr
                     // SAFETY: as above.
-                    && unsafe { (&*agent).array_iter_data.try_borrow().is_ok_and(|map| !map.is_empty()) }
+                    && unsafe { (&*roots).array_iter_data.try_borrow().is_ok_and(|map| !map.is_empty()) }
             });
         // Every promise ever constructed has an entry in `promise_addrs`, and
         // `promises` (traced) retains each settled promise's result and
@@ -3507,7 +3543,7 @@ impl Agent {
         if dead.is_empty() {
             return;
         }
-        let Ok(mut map) = self.array_iter_data.try_borrow_mut() else {
+        let Ok(mut map) = self.roots.array_iter_data.try_borrow_mut() else {
             return;
         };
         if map.is_empty() {
