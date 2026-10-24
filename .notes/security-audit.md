@@ -152,6 +152,18 @@ Fixed and validated in the first remediation pass:
   silently trusted.
 - **Low** — `padStart`/`padEnd` fill the gap directly into the result buffer
   instead of materializing a second filler copy.
+- **M-7** — the bridge no longer resolves a handle through whichever context
+  is innermost on the thread. Each handle's cell records the realm that was
+  entered when it was minted (`store::PayloadCell`), and the scope-less entry
+  points that take a handle resolve through that realm
+  (`LocalHandle::with_agent`): the Date and Map/Set readers, promise
+  resolvers, message positions, the ArrayBuffer/DataView facts and the
+  serializer helpers. An operation with no handle to take a realm from (an
+  interceptor reached with only a `JsObject`, the `Data` predicates) still uses
+  the innermost entered context, which `realm::with_agent` now documents as
+  the unattributed form. The regression test enters two isolates on one thread
+  and reads an A-minted `Date` while B's context is innermost: NaN without the
+  mint realm, the timestamp with it.
 - **M-1** — the agent aliasing model is closed: the live-agent registry holds
   only each agent's `*const AgentRoots`, and every container a collection reads
   — the traced tables, the IC caches, the three value-cell arrays, and the
@@ -192,10 +204,9 @@ Fixed and validated in the first remediation pass:
   isolate's state is unknown). `is_poisoned`/`unpoison` are exported and
   re-exported by `crates/jsc` for a host that rebuilds its state.
 
-Outstanding from this report: the `crates/v8` per-thread entered-realm slot,
-the two `workers`-only items (eager resizable-buffer allocation, and worker
-memory atomics, which blocks it), the deferred wasm `shared`-flag import check,
-and the fuzzing gap. Every finding not listed here is fixed and validated in
+Outstanding from this report: the two `workers`-only items (eager
+resizable-buffer allocation, and worker memory atomics, which blocks it), the
+deferred wasm `shared`-flag import check, and the fuzzing gap. Every finding not listed here is fixed and validated in
 the passes below.
 
 Validation for the first pass: `cargo clippy --workspace --all-targets -- -D
@@ -261,6 +272,12 @@ release; the RegExp area passes 1,899/1,899 and `*replace*` 212/212; clippy
 (`-D warnings`) and rustfmt are clean. The Miri job now covers the lexer and
 syntax crates and only runs from a manual `workflow_dispatch` with its input
 set, so push/PR runs do not wait on it.
+
+Validation for the twelfth pass: `cargo test -p v8` passes 374 tests,
+including the new two-isolate handle test (which fails when the handle's mint
+realm is ignored); clippy `-D warnings` is clean for the crate and for the
+workspace with all features; `cargo test --workspace --all-features` is green
+in debug and release.
 
 Validation for the eleventh pass: `cargo test -p jsc` passes — three ref
 namespace unit tests (a string ref never decodes as a value, a value ref never
