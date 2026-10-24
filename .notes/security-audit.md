@@ -885,6 +885,29 @@ in table families, because each family's guard discipline is different:
   `%StringIteratorPrototype%.next` advanced the index through `get_mut` while
   building the result object. Both now copy the record (or the index pair) out,
   do the work, and write it back.
+- **4h landed** — the thirteen IC caches: the three verdict arrays
+  (`for_of_fast_cells`, `species_fast_cells`, `spread_cells`), the three value
+  cell tables (`array_element_value_cells`, `global_leaf_cells`,
+  `slot_leaf_cells`), `construct_maps`, `function_boilerplate_maps`,
+  `for_in_cells`, `leaf_cache`, and `iter_result_realm`/`iter_result_map`/
+  `generator_methods`. This is the family where the move stops being
+  mechanical: the payloads are read on every call, and `leaf_lookup` handed out
+  a `&LeafEntry` borrowed from the table, which no interior-mutable container
+  can do through a shared accessor.
+  Two shapes were used. Tables whose payload is `Copy` — the three verdicts,
+  the array-element value cells, `construct_maps` and
+  `function_boilerplate_maps` — became arrays of `Cell<Option<…>>` with
+  `get`/`set` accessors, so a hit costs no borrow flag at all and the collector
+  copies the cell out to trace it. The tables whose payload cannot be copied
+  (`leaf_cache`, `global_leaf_cells` and `slot_leaf_cells`, all holding a
+  `LeafEntry`) and `for_in_cells` stayed `RefCell`s with each guard scoped to a
+  single statement: `leaf_lookup` returns the entry by value (every caller
+  already cloned its fields out, so the `Rc` bump only moved), and the for-in
+  probe clones two `Rc`-shared lists out and closes the borrow before it walks
+  the live chain. `ForInState::keys` is that same `Rc<Vec<…>>`, so a loop
+  re-entering an unchanged chain shares the list instead of copying it — and
+  that is what lets the probe hand the keys out without allocating under its
+  guard.
 
 One near-miss is the reason the last step of each slice is a real `--gc-stress`
 sweep rather than a green unit suite: `async_from_sync_continuations` shared a
@@ -896,19 +919,47 @@ that would have caught it — for every trace line removed, the table is either
 in `AgentRoots::trace` or still traced where it lives — is now done by hand at
 the end of each slice.
 
-Remaining before the registry switch: the eleven IC caches (the `*_cells`
-arrays, `leaf_cache`, `construct_maps`, `function_boilerplate_maps`,
-`iter_result_map`/`iter_result_realm`, `generator_methods`) and the wasm tables
-(feature-gated). `trace_active_vms` and `RUNNING_JOB_REGION` are thread-scoped
-rather than agent-scoped and stay as they are.
+Remaining before the registry switch: the three JIT-base value-cell arrays
+(`member_value_cells`, `computed_read_cells`, `global_value_cells`) and the wasm
+tables (feature-gated). `trace_active_vms` and `RUNNING_JOB_REGION` are
+thread-scoped rather than agent-scoped and stay as they are.
 
-The caches are the one group that needs a shape change rather than a move:
-`leaf_cache` is a `Box<[Option<(u64, LeafEntry)>]>` and `leaf_lookup` hands out
-`&LeafEntry` from it, which no interior-mutable container can do. The entry is
-four cheap fields (`Rc<CompiledBody>`, a bool, `Option<EnvRef>`, a bool), so the
-plan is a `Box<[Cell<Option<…>>]>` in the roots with `leaf_lookup` returning the
-entry by value — an `Rc` bump per call instead of a borrow — and the same
-treatment for the other slot arrays that currently rely on `&mut Agent`.
+The value-cell arrays are the one group the caches' `Cell` treatment does not
+reach. Their base pointer is handed to the JIT — `JitCallContext::
+member_value_cells`/`global_value_cells`, addressed at fixed offsets in
+`crates/jit/src/cells.rs` and `compiler.rs` — and the compiled store and read
+lanes write those cells directly from machine code, with no call back into the
+agent. Moving the arrays behind a `RefCell` would therefore change the compiled
+addressing scheme, not just the Rust accessors: the fix is to point the JIT's
+cell base at the roots' storage, which is a separate change. Until then
+`trace_agent_state` keeps those three arrays (and the wasm tables), so the
+registry keeps the `*const Agent`.
+
+Cost of 4h, on the interpreter, min of 15 interleaved release runs against a
+`c8f99c4e` binary: `per-iteration` 9.89 ms -> 10.51 ms (+6.3%) and
+`construct churn` 16.95 ms -> 17.70 ms (+4.5%). Every other benchmark row is
+inside the run-to-run spread — the same suite moves `bare loop` and
+`string concat` by 5-10% with no code change, in both directions. Both
+regressions are the one `RefCell` borrow the leaf cache pays per call: an
+isolated 10M-iteration closure loop shows the same ~7%, while the
+global-callee loop that hits `global_leaf_cells` and never calls `leaf_lookup`
+measures 0%. Two attempts to buy it back were measured: converting the `Copy`
+tables to `Cell` recovered ~1.5 points on that loop (7.0% -> 5.5%), and
+splitting the fill path out of `leaf_lookup` behind `#[cold]` measured *worse*
+(11%) and was reverted. The remaining option is a `Cell`-table of `Copy` leaf
+records, which needs the `Rc<CompiledBody>` in `LeafEntry` replaced by a
+borrowed pointer; that is a separate change with its own lifetime argument.
+
+Validation for 4h: clippy `-D warnings` clean (workspace, all targets, all
+features) and `cargo fmt` clean, `cargo test --workspace` green in both
+profiles; under `--gc-stress --gc-verify`, `*Promise*` 732/732, `Function/*`
+508 pass with the one pre-existing hang
+`Function/prototype/toString/built-in-function-object.js` (reproduced on a
+`c8f99c4e` sweep binary, and it passes without `--gc-stress`), `*Generator*`
+157/157, `Array/*` 3082/3082, `*Map*` 431/431, `*Set*` 859/859,
+`language "*eval*"` 1166/1166, `language "*for-of*"` 779/779,
+`language "*for-in*"` 153/153, `Array/fromAsync/*` 95/95, `DisposableStack/*`
+93/93, `*WeakRef*` 29/29, `*FinalizationRegistry*` 47/47.
 
 Validation for 4a-4g: clippy `-D warnings` clean (workspace, all targets, all
 features) and `cargo fmt --check` clean after each; `cargo test --workspace`
