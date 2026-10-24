@@ -1773,11 +1773,14 @@ mod tests {
     #[test]
     #[should_panic(expected = "cannot carry a host pointer")]
     fn a_host_callback_missing_from_the_creators_table_ends_the_build() {
+        // A body of its own: an empty one shares the adapter the bridge's no-op
+        // console method compiles to, and that entry is always in the table.
         fn an_op(
-            _scope: &mut crate::scope::PinScope<'_, '_>,
+            scope: &mut crate::scope::PinScope<'_, '_>,
             _args: crate::function::FunctionCallbackArguments,
-            _rv: crate::function::ReturnValue,
+            rv: crate::function::ReturnValue,
         ) {
+            rv.set(crate::Number::new(scope, 7.0).into());
         }
         let mut isolate = Isolate::snapshot_creator(None, None);
         {
@@ -2408,11 +2411,17 @@ mod tests {
     #[test]
     #[should_panic(expected = "the pointer is not in the external-reference table")]
     fn a_function_template_outside_the_table_ends_the_build() {
+        // The body matters: `MapFnTo` maps a host function to a monomorphized
+        // adapter, and an *empty* body compiles to the same adapter the bridge's
+        // own no-op console method does. The compiler is free to merge the two,
+        // and `engine_table` always carries the console entry — so an empty
+        // callback's address looks registered and this case cannot be built.
         fn answer(
-            _scope: &mut crate::scope::PinScope<'_, '_>,
+            scope: &mut crate::scope::PinScope<'_, '_>,
             _args: crate::function::FunctionCallbackArguments,
-            _rv: crate::function::ReturnValue,
+            rv: crate::function::ReturnValue,
         ) {
+            rv.set(crate::Number::new(scope, 1.0).into());
         }
         let mut isolate = Isolate::snapshot_creator(None, None);
         {

@@ -680,12 +680,19 @@ conversion, which still goes through the `EcmaHook`; threading the agent
 through those crux entry points is separate, larger work, and the collector
 side is what slices 2-4 address.
 
-Gate run: `cargo test --workspace --release --no-fail-fast` (every target green
-except the two pre-existing `v8` snapshot `should_panic` tests, which fail
-identically at the commit before this change); clippy `-D warnings` clean;
-`*Promise*` 732/732, `Function/*` 509/509, `WeakRef/*` 29/29,
-`FinalizationRegistry/*` 47/47, `expressions/await/*` 22/22; CLI host-globals
-and async/generator scratch scripts under `--gc-stress --gc-verify`.
+Gate run: `cargo test --workspace --release` 5806 pass / 0 fail; clippy
+`-D warnings` clean; `*Promise*` 732/732, `Function/*` 509/509, `WeakRef/*`
+29/29, `FinalizationRegistry/*` 47/47, `expressions/await/*` 22/22; CLI
+host-globals and async/generator scratch scripts under `--gc-stress --gc-verify`.
+
+The two `v8` snapshot tests that were red at this point
+turned out to be testing an address-based premise the compiler may erase: an
+empty host callback's `MapFnTo` adapter compiles to the same code as the
+bridge's own no-op console method, the two may be merged, and `engine_table`
+always carries the console entry — so "a pointer the table does not hold" could
+not be built from an empty callback. Both now use a callback with a body of its
+own; the aliasing itself is harmless (only identical code merges, so the two
+callbacks behave the same).
 
 ### Slice 2 landed: the realm tables, and a roots pointer in the registry
 
