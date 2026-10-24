@@ -950,7 +950,7 @@ impl Symbol {
             .expect("bridge bug: a String handle the engine does not know"))
         .clone();
         let symbol = crate::realm_of(scope).with_agent(|agent| {
-            let mut registry = agent.global_symbol_registry.borrow_mut();
+            let mut registry = agent.symbol_registry();
             if let Some((_, symbol)) = registry.iter().find(|(name, _)| *name == key) {
                 return symbol.clone();
             }

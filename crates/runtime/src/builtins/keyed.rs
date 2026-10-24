@@ -594,7 +594,7 @@ pub(crate) fn can_be_held_weakly(agent: &Agent, value: &Value) -> bool {
     match value.kind() {
         ValueKind::Object(_) | ValueKind::Function(_) => true,
         ValueKind::Symbol(symbol) => {
-            let registry = agent.global_symbol_registry.borrow();
+            let registry = agent.roots.global_symbol_registry.borrow();
             !registry.iter().any(|(_, s)| s.id == symbol.id)
         }
         _ => false,

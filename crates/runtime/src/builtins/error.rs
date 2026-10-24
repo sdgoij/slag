@@ -620,10 +620,10 @@ fn define_stack(
     // job is the current task carries the awaiting frames of the chain that job
     // settles, so an error a host builds inside a job still names the async body
     // whose `await` it belongs to.
-    if let Some(task_promise) = agent.current_task_promise {
+    if let Some(task_promise) = agent.roots.current_task_promise.get() {
         push_async_frames(agent, task_promise, &mut lines, &mut frames);
     }
-    agent.error_stack.insert(
+    agent.roots.error_stack.borrow_mut().insert(
         object.id(),
         crate::agent::ErrorStack {
             rendered: JsString::from_utf8(&lines.join("\n")),
@@ -842,7 +842,7 @@ fn stack_getter(agent: &mut Agent, this: &Value, _args: &[Value]) -> Result<Valu
     if !is_error(agent, *this) {
         return Ok(Value::Undefined);
     }
-    let stack = agent.error_stack.get(&object.id()).cloned();
+    let stack = agent.error_stack(object.id());
     // A host with a formatter of its own decides what `.stack` is
     // (v8::Isolate::SetPrepareStackTraceCallback): it is handed the error and
     // the frames the trace was captured from, and its answer is the value.

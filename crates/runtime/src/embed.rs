@@ -846,7 +846,7 @@ impl Context {
     /// holds the thrown value; the CLI prints this for it.
     pub fn describe_thrown(&mut self, value: &JsValue) -> String {
         if let Some(object) = value.0.as_object()
-            && let Some(stack) = self.agent.error_stack.get(&object.id())
+            && let Some(stack) = self.agent.error_stack(object.id())
         {
             let text = stack.rendered.to_string_lossy();
             if !text.is_empty() {
@@ -911,7 +911,7 @@ impl Context {
     /// Symbol.for (spec 20.4.2.10): look up or create the global-registry
     /// symbol for `key`.
     pub fn symbol_for(&mut self, key: &str) -> Result<JsValue, JsError> {
-        let mut registry = self.agent.global_symbol_registry.borrow_mut();
+        let mut registry = self.agent.roots.global_symbol_registry.borrow_mut();
         let key = JsString::from_utf8(key);
         if let Some((_, symbol)) = registry.iter().find(|(k, _)| *k == key) {
             return Ok(JsValue(Value::Symbol(Handle::new(symbol.clone()))));

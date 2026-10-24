@@ -652,6 +652,36 @@ pub(crate) struct AgentRoots {
     /// otherwise every entry's iterated array stays a root forever.
     pub(crate) array_iter_data:
         RefCell<std::collections::HashMap<u64, (Value, usize, u32, crux::heap::GcAny)>>,
+    /// [[GlobalSymbolRegistry]]: `Symbol.for` entries (Phase 8).
+    pub(crate) global_symbol_registry: RefCell<Vec<(JsString, Symbol)>>,
+    /// The AsyncFromSyncIterator value-unwrap continuations, keyed by
+    /// function identity (spec 27.1.5.4).
+    pub(crate) async_from_sync_continuations:
+        RefCell<IdMap<std::rc::Rc<crate::async_await::AsyncFromSyncContinuationEntry>>>,
+    /// The captured V8-style stack trace of Error instances, keyed by object
+    /// identity (read by the `%Error.prototype.stack%` accessor; the property
+    /// itself is not an own data property, spec 20.5.3.4).
+    pub(crate) error_stack: RefCell<IdMap<ErrorStack>>,
+    /// The promise the running reaction job's task belongs to — V8's
+    /// `current_microtask` as far as an async chain needs it
+    /// (`TryGetCurrentTaskPromise`): an await chain is walked from here, so a
+    /// stack captured inside a job can report the bodies waiting on it. Set for
+    /// the duration of a reaction job and restored after it.
+    pub(crate) current_task_promise: Cell<Option<Value>>,
+    /// The KeepDuringJob set (spec 26.1.1): WeakRef targets returned by
+    /// `deref` in the current job stay alive until the job ends (the
+    /// conservative stack scan covers the common case; this covers a deref
+    /// result that is discarded immediately). Cleared at each job boundary.
+    pub(crate) kept_during_job: RefCell<Vec<Value>>,
+    /// GC-4: FinalizationRegistry cleanup jobs enqueued by the collector's
+    /// compaction hook (it cannot touch the job queues — the collector runs
+    /// with `&self`). Moved into `generic_jobs` by the next job drain; the
+    /// job closures' regions are scanned alongside the queued jobs.
+    pub(crate) pending_cleanup_jobs: RefCell<Vec<crate::job::Job>>,
+    /// [[Cells]] and [[CleanupCallback]] of FinalizationRegistry instances,
+    /// keyed by object identity (spec 26.2.1).
+    pub(crate) finalization_registries:
+        RefCell<IdMap<std::rc::Rc<std::cell::RefCell<crate::builtins::weakref::FinalizationData>>>>,
     /// The internal state of ArrayBuffer/SharedArrayBuffer objects, keyed by
     /// object identity (spec 25.1.1: [[ArrayBufferData]],
     /// [[ArrayBufferByteLength]], [[ArrayBufferMaxByteLength]], and the
@@ -774,6 +804,13 @@ impl AgentRoots {
             async_iterator_awaits: RefCell::new(std::collections::HashMap::new()),
             async_iterator_eager: RefCell::new(std::collections::HashMap::new()),
             async_iterator_pending: RefCell::new(std::collections::HashMap::new()),
+            async_from_sync_continuations: RefCell::new(IdMap::default()),
+            error_stack: RefCell::new(IdMap::default()),
+            global_symbol_registry: RefCell::new(Vec::new()),
+            current_task_promise: Cell::new(None),
+            kept_during_job: RefCell::new(Vec::new()),
+            pending_cleanup_jobs: RefCell::new(Vec::new()),
+            finalization_registries: RefCell::new(IdMap::default()),
             host_modules: RefCell::new(std::collections::HashMap::new()),
             module_namespaces: RefCell::new(std::collections::HashMap::new()),
             deferred_namespaces: RefCell::new(std::collections::HashMap::new()),
@@ -820,6 +857,14 @@ impl AgentRoots {
             regions.push(job.closure_region());
         }
         for (_, job) in timeout_jobs.iter() {
+            regions.push(job.closure_region());
+        }
+        // GC-4: the pending FinalizationRegistry cleanup jobs (captured held
+        // values and callbacks) ride alongside the queued jobs.
+        let Ok(cleanup) = self.pending_cleanup_jobs.try_borrow() else {
+            return false;
+        };
+        for job in cleanup.iter() {
             regions.push(job.closure_region());
         }
         // A host's own queue holds the same opaque closures, and its jobs are
@@ -891,6 +936,44 @@ impl Trace for AgentRoots {
         self.shadow_handlers.trace(visit);
         self.ecma_functions.trace(visit);
         self.dataview_data.trace(visit);
+        self.global_symbol_registry.trace(visit);
+        self.async_from_sync_continuations.trace(visit);
+        self.error_stack.trace(visit);
+        self.current_task_promise.trace(visit);
+        // GC-4: WeakRef targets are held weakly — the table is deliberately
+        // *not* traced, so a target dies unless reachable elsewhere (deref
+        // then returns `undefined`; the compaction clears the entry). The
+        // KeepDuringJob set (deref results of the current job) is traced.
+        if let Ok(kept) = self.kept_during_job.try_borrow() {
+            kept.trace(visit);
+        } else {
+            crux::heap::note_aborted_trace();
+            return;
+        }
+        // GC-4: FinalizationRegistry — the cleanup callback is a strong
+        // edge; each cell's held value is an ephemeron on its target (it
+        // lives while the target does and is captured into a cleanup job
+        // when the target dies); the unregister token is held weakly. The
+        // compaction drops dead-target cells and clears dead tokens.
+        if let Ok(registries) = self.finalization_registries.try_borrow() {
+            for data in registries.values() {
+                let Ok(data) = data.try_borrow() else {
+                    crux::heap::note_aborted_trace();
+                    return;
+                };
+                data.callback.trace(visit);
+                for cell in &data.cells {
+                    let Some(target) = value_box_addr(&cell.target) else {
+                        continue;
+                    };
+                    let held = value_box_addr(&cell.held_value).unwrap_or(target);
+                    crux::heap::note_ephemeron(target, held);
+                }
+            }
+        } else {
+            crux::heap::note_aborted_trace();
+            return;
+        }
         // `host_modules` is keyed by JsString: keys are heap edges too, so
         // trace the whole cell manually (the generic HashMap trace visits
         // values only).
@@ -1268,8 +1351,6 @@ pub struct Agent {
     /// aborts (retain everything), so the half-built buffers cannot be swept
     /// out from under the final record assignment.
     pub build_roots: std::cell::Cell<bool>,
-    /// [[GlobalSymbolRegistry]]: `Symbol.for` entries (Phase 8).
-    pub global_symbol_registry: RefCell<Vec<(JsString, Symbol)>>,
     /// [[ModuleAsyncEvaluationCount]]: module linking (Phase 7).
     pub module_async_evaluation_count: u32,
     /// The two handlers `WebAssembly.compileStreaming` attaches to the source
@@ -1280,12 +1361,6 @@ pub struct Agent {
     #[cfg(feature = "wasm")]
     pub wasm_streaming_handlers:
         std::collections::HashMap<u64, std::rc::Rc<crate::builtins::wasm::StreamingHandler>>,
-    /// The AsyncFromSyncIterator value-unwrap continuations, keyed by
-    /// function identity (spec 27.1.5.4).
-    pub async_from_sync_continuations: std::collections::HashMap<
-        u64,
-        std::rc::Rc<crate::async_await::AsyncFromSyncContinuationEntry>,
-    >,
     /// The `disposeAsync` continuations, keyed by function identity: the
     /// driver id and whether the awaited disposal promise rejected.
     pub disposable_async_cont: std::collections::HashMap<u64, (u64, bool)>,
@@ -1400,16 +1475,6 @@ pub struct Agent {
     /// [[ErrorData]] markers of Error instances, keyed by object identity
     /// (spec 20.5.4: `Error.isError` and the `[object Error]` tag need it).
     pub error_data: std::collections::HashSet<u64>,
-    /// The captured V8-style stack trace of Error instances, keyed by object
-    /// identity (read by the `%Error.prototype.stack%` accessor; the property
-    /// itself is not an own data property, spec 20.5.3.4).
-    pub error_stack: std::collections::HashMap<u64, ErrorStack>,
-    /// The promise the running reaction job's task belongs to — V8's
-    /// `current_microtask` as far as an async chain needs it
-    /// (`TryGetCurrentTaskPromise`): an await chain is walked from here, so a
-    /// stack captured inside a job can report the bodies waiting on it. Set for
-    /// the duration of a reaction job and restored after it.
-    pub current_task_promise: Option<Value>,
     /// The frames of each host stack-trace capture (v8::StackTrace), keyed by
     /// the *box address* of the object the capture handed back — that object
     /// exists so the entry has a liveness, and the collector's compaction hook
@@ -1518,22 +1583,6 @@ pub struct Agent {
     /// (spec 26.1.1: the target is held weakly — `deref` returns it while it
     /// is reachable, `undefined` once a collection clears it; GC-4).
     pub weak_ref_targets: std::cell::RefCell<std::collections::HashMap<u64, Value>>,
-    /// The KeepDuringJob set (spec 26.1.1): WeakRef targets returned by
-    /// `deref` in the current job stay alive until the job ends (the
-    /// conservative stack scan covers the common case; this covers a deref
-    /// result that is discarded immediately). Cleared at each job boundary.
-    pub kept_during_job: std::cell::RefCell<Vec<Value>>,
-    /// GC-4: FinalizationRegistry cleanup jobs enqueued by the collector's
-    /// compaction hook (it cannot touch the job queues — the collector runs
-    /// with `&self`). Moved into `generic_jobs` by the next job drain; the
-    /// job closures' regions are scanned alongside the queued jobs.
-    pub pending_cleanup_jobs: std::cell::RefCell<Vec<crate::job::Job>>,
-    /// [[Cells]] and [[CleanupCallback]] of FinalizationRegistry instances,
-    /// keyed by object identity (spec 26.2.1).
-    pub finalization_registries: std::collections::HashMap<
-        u64,
-        std::rc::Rc<std::cell::RefCell<crate::builtins::weakref::FinalizationData>>,
-    >,
     pub promise_addrs: std::cell::RefCell<std::collections::HashMap<u64, crux::heap::GcAny>>,
     pending_dead_promises: std::cell::RefCell<Vec<u64>>,
     /// The nesting depth of class field initializers currently evaluating.
@@ -1819,11 +1868,9 @@ impl Agent {
                 is_lock_free_for_size(8),
             ],
             build_roots: std::cell::Cell::new(false),
-            global_symbol_registry: RefCell::new(Vec::new()),
             module_async_evaluation_count: 0,
             #[cfg(feature = "wasm")]
             wasm_streaming_handlers: std::collections::HashMap::new(),
-            async_from_sync_continuations: std::collections::HashMap::new(),
             disposable_async_cont: std::collections::HashMap::new(),
             async_body_disposal_cont: std::collections::HashMap::new(),
             builtin_dispatch_cache: std::collections::HashMap::default(),
@@ -1852,8 +1899,6 @@ impl Agent {
             regexp_string_iter_data: std::collections::HashMap::new(),
             string_iter_data: std::collections::HashMap::new(),
             error_data: std::collections::HashSet::new(),
-            error_stack: std::collections::HashMap::new(),
-            current_task_promise: None,
             stack_traces: std::cell::RefCell::new(std::collections::HashMap::new()),
             #[cfg(feature = "wasm")]
             wasm_modules: std::collections::HashMap::new(),
@@ -1900,9 +1945,6 @@ impl Agent {
             #[cfg(feature = "wasm")]
             wasm_extern_seq: 0,
             weak_ref_targets: std::cell::RefCell::new(std::collections::HashMap::new()),
-            kept_during_job: std::cell::RefCell::new(Vec::new()),
-            pending_cleanup_jobs: std::cell::RefCell::new(Vec::new()),
-            finalization_registries: std::collections::HashMap::new(),
             promise_addrs: std::cell::RefCell::new(std::collections::HashMap::new()),
             pending_dead_promises: std::cell::RefCell::new(Vec::new()),
             field_initializer_depth: 0,
@@ -2086,6 +2128,43 @@ impl Agent {
             .disposable_stacks
             .borrow_mut()
             .insert(id, Rc::new(RefCell::new(data)));
+    }
+
+    /// The global symbol registry (spec 20.4.2.1) as one guard: `Symbol.for`
+    /// and the bridge both need to look a description up and insert it in the
+    /// same borrow.
+    pub fn symbol_registry(&self) -> std::cell::RefMut<'_, Vec<(JsString, crux::symbol::Symbol)>> {
+        self.roots.global_symbol_registry.borrow_mut()
+    }
+
+    /// The rendered stack of `id`, when it is an Error whose stack the engine
+    /// captured. A copy: the record is a string and a frame list.
+    pub(crate) fn error_stack(&self, id: u64) -> Option<ErrorStack> {
+        self.roots.error_stack.borrow().get(&id).cloned()
+    }
+
+    /// The AsyncFromSyncIterator value-unwrap continuation of `id`.
+    pub(crate) fn async_from_sync_continuation(
+        &self,
+        id: u64,
+    ) -> Option<std::rc::Rc<crate::async_await::AsyncFromSyncContinuationEntry>> {
+        self.roots
+            .async_from_sync_continuations
+            .borrow()
+            .get(&id)
+            .cloned()
+    }
+
+    /// The [[Cells]]/[[CleanupCallback]] record of a FinalizationRegistry.
+    pub(crate) fn finalization_registry(
+        &self,
+        id: u64,
+    ) -> Option<std::rc::Rc<RefCell<crate::builtins::weakref::FinalizationData>>> {
+        self.roots
+            .finalization_registries
+            .borrow()
+            .get(&id)
+            .cloned()
     }
 
     /// Whether a host module was registered under `specifier`.
@@ -2700,7 +2779,7 @@ impl Agent {
         self.roots
             .generic_jobs
             .borrow_mut()
-            .extend(self.pending_cleanup_jobs.borrow_mut().drain(..));
+            .extend(self.roots.pending_cleanup_jobs.borrow_mut().drain(..));
         loop {
             let next = self.roots.promise_jobs.borrow_mut().pop_front();
             if let Some(job) = next {
@@ -2757,7 +2836,7 @@ impl Agent {
         self.roots.entered_realm.set(previous);
         RUNNING_JOB_REGION.with(|slot| *slot.borrow_mut() = None);
         // GC-4: the job ended — its KeepDuringJob set is no longer needed.
-        self.kept_during_job.borrow_mut().clear();
+        self.roots.kept_during_job.borrow_mut().clear();
         result
     }
 
@@ -2904,7 +2983,6 @@ impl Agent {
         if let Some(methods) = self.generator_methods.get() {
             methods.trace(visit);
         }
-        self.global_symbol_registry.trace(visit);
         #[cfg(feature = "wasm")]
         self.wasm_streaming_handlers.trace(visit);
         #[cfg(feature = "wasm")]
@@ -2944,9 +3022,6 @@ impl Agent {
                 value.trace(visit);
             }
         }
-        // The AsyncFromSyncIterator value-unwrap continuations: their values
-        // are the capability a pending await resumes into, so they are roots.
-        self.async_from_sync_continuations.trace(visit);
         self.intl_number_format_data.trace(visit);
         self.intl_plural_rules_data.trace(visit);
         self.intl_date_time_format_data.trace(visit);
@@ -2962,37 +3037,6 @@ impl Agent {
         for (text, _) in self.string_iter_data.values() {
             text.trace(visit);
         }
-        self.error_stack.trace(visit);
-        self.current_task_promise.trace(visit);
-        // GC-4: WeakRef targets are held weakly — the table is deliberately
-        // *not* traced, so a target dies unless reachable elsewhere (deref
-        // then returns `undefined`; the compaction clears the entry). The
-        // KeepDuringJob set (deref results of the current job) is traced.
-        if let Ok(kept) = self.kept_during_job.try_borrow() {
-            kept.trace(visit);
-        } else {
-            crux::heap::note_aborted_trace();
-            return;
-        }
-        // GC-4: FinalizationRegistry — the cleanup callback is a strong
-        // edge; each cell's held value is an ephemeron on its target (it
-        // lives while the target does and is captured into a cleanup job
-        // when the target dies); the unregister token is held weakly. The
-        // compaction drops dead-target cells and clears dead tokens.
-        for data in self.finalization_registries.values() {
-            let Ok(data) = data.try_borrow() else {
-                crux::heap::note_aborted_trace();
-                return;
-            };
-            data.callback.trace(visit);
-            for cell in &data.cells {
-                let Some(target) = value_box_addr(&cell.target) else {
-                    continue;
-                };
-                let held = value_box_addr(&cell.held_value).unwrap_or(target);
-                crux::heap::note_ephemeron(target, held);
-            }
-        }
         // GC-2: the Vms currently running bodies (their heap-buffered value
         // stacks are invisible to the conservative stack scan). Pooled and
         // suspended Vms are covered by `vm_pool` and the generator/async
@@ -3002,16 +3046,6 @@ impl Agent {
         // boxes conservatively (queued jobs plus the job currently running).
         let mut regions: Vec<(*const u8, usize)> = Vec::new();
         if !self.roots.collect_job_regions(&mut regions) {
-            crux::heap::note_aborted_trace();
-            return;
-        }
-        // GC-4: the pending FinalizationRegistry cleanup jobs (captured
-        // held values and callbacks) ride alongside the queued jobs.
-        if let Ok(pending) = self.pending_cleanup_jobs.try_borrow() {
-            for job in pending.iter() {
-                regions.push(job.closure_region());
-            }
-        } else {
             crux::heap::note_aborted_trace();
             return;
         }
@@ -3267,7 +3301,7 @@ impl Agent {
     fn has_weak_structures(&self) -> bool {
         !self.roots.weak_map_data.borrow().is_empty()
             || !self.roots.weak_set_data.borrow().is_empty()
-            || !self.finalization_registries.is_empty()
+            || !self.roots.finalization_registries.borrow().is_empty()
             || self
                 .stack_traces
                 .try_borrow()
@@ -3335,7 +3369,7 @@ impl Agent {
         let Ok(realm) = self.current_realm() else {
             return;
         };
-        for data in self.finalization_registries.values() {
+        for data in self.roots.finalization_registries.borrow().values() {
             let mut data = data.borrow_mut();
             let mut cells = std::mem::take(&mut data.cells);
             let mut i = 0;
@@ -3354,7 +3388,7 @@ impl Agent {
                         crate::function::call(agent, &callback, Value::Undefined, &[held_value])
                     };
                     let job = crate::job::Job::new(Some(realm), cleanup_closure);
-                    self.pending_cleanup_jobs.borrow_mut().push(job);
+                    self.roots.pending_cleanup_jobs.borrow_mut().push(job);
                 } else {
                     // Live cell: clear a dead unregister token so the
                     // dangling handle is never compared.

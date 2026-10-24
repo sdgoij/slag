@@ -3104,6 +3104,7 @@ fn write_symbol(agent: &Agent, symbol: Handle<Symbol>, body: &mut Vec<u8>) {
         return;
     }
     if let Some((key, _)) = agent
+        .roots
         .global_symbol_registry
         .borrow()
         .iter()
@@ -6582,7 +6583,7 @@ impl Builder<'_> {
     /// has not seen the key.
     fn registry_symbol(&self, key: &[u16]) -> Handle<Symbol> {
         let key = JsString::from_utf16(key);
-        let mut registry = self.agent.global_symbol_registry.borrow_mut();
+        let mut registry = self.agent.roots.global_symbol_registry.borrow_mut();
         if let Some((_, symbol)) = registry.iter().find(|(entry, _)| *entry == key) {
             return Handle::new(symbol.clone());
         }
@@ -6979,6 +6980,7 @@ mod tests {
         let key = JsString::from_utf8("shared");
         let symbol = Handle::new(Symbol::new(Some(key.clone())));
         agent_of(&isolate)
+            .roots
             .global_symbol_registry
             .borrow_mut()
             .push((key, (*symbol).clone()));
@@ -6986,6 +6988,7 @@ mod tests {
         let back = back.as_symbol().expect("a symbol");
         assert!(
             agent_of(&isolate)
+                .roots
                 .global_symbol_registry
                 .borrow()
                 .iter()

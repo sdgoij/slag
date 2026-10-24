@@ -785,16 +785,20 @@ fn run_async_from_sync(
             None,
             None,
         )?;
-        agent.async_from_sync_continuations.insert(
-            closure.id(),
-            Rc::new(AsyncFromSyncContinuationEntry {
-                capability: capability.clone(),
-                sync: sync.clone(),
-                done,
-                is_reject,
-                close_on_rejection,
-            }),
-        );
+        agent
+            .roots
+            .async_from_sync_continuations
+            .borrow_mut()
+            .insert(
+                closure.id(),
+                Rc::new(AsyncFromSyncContinuationEntry {
+                    capability: capability.clone(),
+                    sync: sync.clone(),
+                    done,
+                    is_reject,
+                    close_on_rejection,
+                }),
+            );
         let handler = Value::Function(closure);
         let (on_fulfilled, on_rejected) = if is_reject {
             (None, Some(handler))
@@ -815,10 +819,7 @@ pub fn dispatch_async_from_sync_continuation(
     let ValueKind::Function(function) = callee.kind() else {
         return None;
     };
-    let entry = agent
-        .async_from_sync_continuations
-        .get(&function.id())
-        .cloned()?;
+    let entry = agent.async_from_sync_continuation(function.id())?;
     Some(resume_async_from_sync_continuation(agent, entry, args))
 }
 

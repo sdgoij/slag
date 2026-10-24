@@ -844,9 +844,9 @@ pub(crate) fn copy_data_properties(
     // destination, and a copied value ride in callee-saved registers that
     // the conservative stack scan cannot see. Keep them precisely reachable
     // through the KeepDuringJob set until the copy ends.
-    let root_len = agent.kept_during_job.borrow().len();
+    let root_len = agent.roots.kept_during_job.borrow().len();
     {
-        let mut kept = agent.kept_during_job.borrow_mut();
+        let mut kept = agent.roots.kept_during_job.borrow_mut();
         kept.push(Value::Object(from_obj));
         kept.push(Value::Object(*to));
     }
@@ -858,13 +858,13 @@ pub(crate) fn copy_data_properties(
                     continue;
                 }
                 let value = from_obj.get_key(&key)?;
-                agent.kept_during_job.borrow_mut().push(value);
+                agent.roots.kept_during_job.borrow_mut().push(value);
                 to.create_data_property_key(&key, value)?;
             }
         }
         Ok(())
     })();
-    agent.kept_during_job.borrow_mut().truncate(root_len);
+    agent.roots.kept_during_job.borrow_mut().truncate(root_len);
     result
 }
 

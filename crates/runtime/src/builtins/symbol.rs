@@ -335,7 +335,7 @@ fn symbol_for(agent: &mut Agent, args: &[Value]) -> Result<Value, JsError> {
         Some(value) if value.is_undefined() => JsString::from_utf8("undefined"),
         Some(value) => to_string(value)?,
     };
-    let mut registry = agent.global_symbol_registry.borrow_mut();
+    let mut registry = agent.roots.global_symbol_registry.borrow_mut();
     if let Some((_, symbol)) = registry.iter().find(|(k, _)| *k == key) {
         return Ok(Value::Symbol(Handle::new(symbol.clone())));
     }
@@ -353,7 +353,7 @@ fn symbol_key_for(agent: &mut Agent, args: &[Value]) -> Result<Value, JsError> {
             "Symbol.keyFor requires a symbol".into(),
         ));
     };
-    let registry = agent.global_symbol_registry.borrow();
+    let registry = agent.roots.global_symbol_registry.borrow();
     match registry.iter().find(|(_, s)| s.id == symbol.id) {
         Some((key, _)) => Ok(Value::String(Handle::new(key.clone()))),
         None => Ok(Value::Undefined),

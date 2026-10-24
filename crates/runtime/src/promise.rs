@@ -595,10 +595,10 @@ fn enqueue_reaction_job(
     // reaction this job carries: an async chain walk starts at this promise.
     let task_promise = reaction_task_promise(agent, &reaction);
     agent.enqueue_promise_job(realm, move |agent| {
-        let saved = agent.current_task_promise;
-        agent.current_task_promise = task_promise;
+        let saved = agent.roots.current_task_promise.get();
+        agent.roots.current_task_promise.set(task_promise);
         let result = run_reaction_job(agent, promise, &reaction, argument);
-        agent.current_task_promise = saved;
+        agent.roots.current_task_promise.set(saved);
         result
     });
 }

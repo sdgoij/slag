@@ -330,7 +330,7 @@ pub fn dispatch_call(
             // discarded immediately must still keep its target through a
             // same-job `$262.gc()`.
             if crate::agent::value_box_addr(&target).is_some() {
-                agent.kept_during_job.borrow_mut().push(target);
+                agent.roots.kept_during_job.borrow_mut().push(target);
             }
             Ok(target)
         })());
@@ -376,7 +376,7 @@ pub fn dispatch_construct(
             }
             let proto = instance_proto(agent, new_target, FINALIZATION_REGISTRY_PROTO)?;
             let object = JsObject::ordinary_object_create(Some(proto));
-            agent.finalization_registries.insert(
+            agent.roots.finalization_registries.borrow_mut().insert(
                 object.id(),
                 Rc::new(RefCell::new(FinalizationData {
                     callback,
@@ -401,7 +401,7 @@ fn finalization_register(
             "FinalizationRegistry.prototype.register requires a registry".into(),
         ));
     };
-    let Some(data) = agent.finalization_registries.get(&obj.id()).cloned() else {
+    let Some(data) = agent.finalization_registry(obj.id()) else {
         return Err(JsError::new(
             ErrorKind::TypeError,
             "FinalizationRegistry.prototype.register requires a registry".into(),
@@ -444,7 +444,7 @@ fn finalization_unregister(
             "FinalizationRegistry.prototype.unregister requires a registry".into(),
         ));
     };
-    let Some(data) = agent.finalization_registries.get(&obj.id()).cloned() else {
+    let Some(data) = agent.finalization_registry(obj.id()) else {
         return Err(JsError::new(
             ErrorKind::TypeError,
             "FinalizationRegistry.prototype.unregister requires a registry".into(),
