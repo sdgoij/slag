@@ -6,8 +6,13 @@ the ``deno_v8`` facade (``deno/libs/deno_v8``), and the facade's ``v8`` feature
 (turned on by ``deno/cli/Cargo.toml``'s default) pulls in ``rusty_v8`` -- the
 crates.io crate whose package name is literally ``v8``. This script redirects
 that crate to Slag's implementation (``crates/v8``, which declares
-``name = "v8"`` at exactly the version the facade requires) with a cargo
-``[patch.crates-io]``.
+``name = "v8"``) with a cargo ``[patch.crates-io]``.
+
+A cargo patch only applies when the patched crate's version satisfies the
+requirement, so the facade's ``rusty_v8`` requirement is rewritten to the
+bridge's own version for the duration of the build and restored afterwards.
+The rewrite is transient: the checkout goes back to its committed manifest, so
+only ``Cargo.lock`` is left modified (the reconcile below).
 
 The patch is handed to cargo through ``--config``, the same mechanism as Deno's
 own ``.cargo/local-build.toml``, so the checkout's sources are never edited.
@@ -168,11 +173,45 @@ def write_patch_config() -> Path:
     return config
 
 
-def lock_needs_reconcile(lock_path: Path) -> bool:
-    """Whether the lock still resolves `v8` from the registry.
+def bridge_version() -> str:
+    """The version `crates/v8` declares, which is what a consumer must accept."""
+    text = (V8_CRATE / "Cargo.toml").read_text(encoding="utf-8")
+    match = re.search(r'^version = "([^"]+)"', text, re.MULTILINE)
+    if match is None:
+        die(f"missing a version in {V8_CRATE / 'Cargo.toml'}")
+    return match.group(1)
+
+
+def align_engine_requirement(deno_dir: Path, version: str) -> tuple[Path, str] | None:
+    """Point the facade's `rusty_v8` requirement at `version`.
+
+    Returns the manifest and its original text when it had to change, so the
+    caller can put it back; `None` when the checkout already accepts the
+    bridge (an empty tuple would be ambiguous with a failure).
+    """
+    path = deno_dir / "libs" / "deno_v8" / "Cargo.toml"
+    if not path.is_file():
+        die(f"missing {path}")
+    text = path.read_text(encoding="utf-8")
+    pattern = re.compile(r'(rusty_v8\s*=\s*\{[^}]*?version\s*=\s*)"([^"]+)"')
+    updated, count = pattern.subn(lambda m: m.group(1) + '"' + version + '"', text)
+    if count == 0:
+        die(f"no rusty_v8 requirement found in {path}")
+    if updated == text:
+        return None
+    log(f"engine requirement: {path.relative_to(deno_dir)} accepts {version}")
+    path.write_text(updated, encoding="utf-8", newline="")
+    return path, text
+
+
+def lock_needs_reconcile(lock_path: Path, version: str) -> bool:
+    """Whether the lock still resolves `v8` from the registry, or at another
+    version than the bridge's.
 
     A patched `v8` is a path dependency, so its lock entry has no `source`
-    line; a registry one has `source = "registry+..."`.
+    line; a registry one has `source = "registry+..."`. A path entry left at
+    the previous bridge version would make `--locked` fail, because the facade
+    now requires this one.
     """
     if not lock_path.is_file():
         return True
@@ -182,7 +221,10 @@ def lock_needs_reconcile(lock_path: Path) -> bool:
         text,
         re.DOTALL,
     )
-    return match is None or "source = " in match.group(1)
+    if match is None or "source = " in match.group(1):
+        return True
+    locked = re.search(r'^version = "([^"]+)"', match.group(1), re.MULTILINE)
+    return locked is None or locked.group(1) != version
 
 
 def lock_versions(lock_path: Path) -> dict[str, str]:
@@ -244,9 +286,11 @@ def main() -> None:
         log(f"warning: DENO_REPO overrides the default repository: {DENO_REPO}")
     ensure_checkout(deno_dir, args.pin, args.fetch)
 
+    version = bridge_version()
     config = write_patch_config()
+    restored = align_engine_requirement(deno_dir, version)
     try:
-        log(f"engine: v8 -> {V8_CRATE}")
+        log(f"engine: v8 {version} -> {V8_CRATE}")
         log(f"deno:   {args.pin} at {deno_dir}")
 
         build = ["build", "-p", args.bin, "--locked"]
@@ -256,7 +300,7 @@ def main() -> None:
             profile = "release"
         build += extra
 
-        reconcile = lock_needs_reconcile(deno_dir / "Cargo.lock")
+        reconcile = lock_needs_reconcile(deno_dir / "Cargo.lock", version)
 
         if args.dry_run:
             if reconcile:
@@ -282,6 +326,9 @@ def main() -> None:
         log(f"built {deno_dir / 'target' / profile / (args.bin + executable)}")
     finally:
         config.unlink(missing_ok=True)
+        if restored is not None:
+            path, text = restored
+            path.write_text(text, encoding="utf-8", newline="")
 
 
 if __name__ == "__main__":
