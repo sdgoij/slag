@@ -233,7 +233,7 @@ fn date_time_value(value: &Local<'_, Value>) -> Option<f64> {
 fn reg_exp_text(value: &Local<'_, Value>) -> Option<(Vec<u16>, String)> {
     let id = value.engine().value().as_object()?.id();
     crate::realm::with_agent(|agent| {
-        let state = agent.regexp_data.get(&id)?;
+        let state = agent.regexp_state(id)?;
         Some((state.source.as_slice().to_vec(), state.flags_text.clone()))
     })
     .flatten()

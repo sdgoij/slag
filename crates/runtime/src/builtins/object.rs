@@ -365,7 +365,7 @@ pub fn builtin_tag(agent: &mut Agent, object: &Value) -> Result<String, JsError>
         // The [[DateValue]] slot (spec 20.1.3.6 step 12).
         return Ok("Date".to_string());
     }
-    if agent.regexp_data.contains_key(&obj.id()) {
+    if agent.has_regexp(obj.id()) {
         // RegExp is branded via its [[RegExpMatcher]] slot (its @@toStringTag
         // was removed from the spec).
         return Ok("RegExp".to_string());

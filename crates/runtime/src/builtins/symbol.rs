@@ -243,7 +243,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
 fn symbol_value(agent: &Agent, value: &Value) -> Result<Symbol, JsError> {
     match value.kind() {
         ValueKind::Symbol(symbol) => Ok(symbol.as_ref().clone()),
-        ValueKind::Object(obj) => agent.symbol_data.get(&obj.id()).cloned().ok_or_else(|| {
+        ValueKind::Object(obj) => agent.symbol(obj.id()).ok_or_else(|| {
             JsError::new(
                 ErrorKind::TypeError,
                 "Symbol.prototype requires a Symbol".into(),

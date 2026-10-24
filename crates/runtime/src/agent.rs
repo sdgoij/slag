@@ -551,6 +551,21 @@ pub(crate) struct AgentRoots {
     /// The [[IteratedSet]], [[SetNextIndex]], and [[SetIterationKind]] of Set
     /// iterators (spec 24.2.6).
     pub(crate) set_iter_data: RefCell<IdMap<Rc<RefCell<IterRecord>>>>,
+    /// [[SymbolData]] of Symbol wrapper objects, keyed by object identity
+    /// (spec 20.4.1: `Object(sym)` boxes the symbol).
+    pub(crate) symbol_data: RefCell<IdMap<crux::symbol::Symbol>>,
+    /// [[BigIntData]] of BigInt wrapper objects, keyed by object identity
+    /// (spec 21.2.1: `Object(5n)` boxes the BigInt).
+    pub(crate) bigint_data: RefCell<IdMap<crux::BigInt>>,
+    /// The RegExp internal state ([[OriginalSource]], [[OriginalFlags]],
+    /// [[RegExpRecord]], [[RegExpMatcher]]) of RegExp instances, keyed by
+    /// object identity (spec 22.2.5). The state is handed out as a clone: its
+    /// compiled program is shared through an `Rc`, so the copy is one refcount
+    /// bump, and no reader can hold a guard across an exec.
+    pub(crate) regexp_data: RefCell<IdMap<crate::builtins::regexp::RegExpState>>,
+    /// The [[RawJSON]] text of JSON.rawJSON objects, keyed by object identity
+    /// (spec 26.6.3).
+    pub(crate) raw_json_data: RefCell<IdMap<JsString>>,
     /// The ECMAScript-function records, keyed by function identity: the spec
     /// 10.2.1 slots [[Environment]], [[FormalParameters]], [[ECMAScriptCode]],
     /// [[ThisMode]], [[HomeObject]].
@@ -595,6 +610,10 @@ impl AgentRoots {
             weak_set_data: RefCell::new(IdMap::default()),
             map_iter_data: RefCell::new(IdMap::default()),
             set_iter_data: RefCell::new(IdMap::default()),
+            symbol_data: RefCell::new(IdMap::default()),
+            bigint_data: RefCell::new(IdMap::default()),
+            regexp_data: RefCell::new(IdMap::default()),
+            raw_json_data: RefCell::new(IdMap::default()),
         }
     }
 
@@ -689,6 +708,10 @@ impl Trace for AgentRoots {
         self.shadow_wrapped.trace(visit);
         self.shadow_handlers.trace(visit);
         self.ecma_functions.trace(visit);
+        self.symbol_data.trace(visit);
+        self.bigint_data.trace(visit);
+        self.regexp_data.trace(visit);
+        self.raw_json_data.trace(visit);
         self.map_data.trace(visit);
         self.set_data.trace(visit);
         // GC-3: WeakMap/WeakSet entries are ephemerons — the key (and thus
@@ -1147,15 +1170,9 @@ pub struct Agent {
     /// [[BooleanData]] of Boolean wrapper objects, keyed by object identity
     /// (spec 20.3.1: `new Boolean(v)` boxes the ToBoolean result).
     pub boolean_data: std::collections::HashMap<u64, bool>,
-    /// [[SymbolData]] of Symbol wrapper objects, keyed by object identity
-    /// (spec 20.4.1: `Object(sym)` boxes the symbol).
-    pub symbol_data: std::collections::HashMap<u64, crux::symbol::Symbol>,
     /// [[NumberData]] of Number wrapper objects, keyed by object identity
     /// (spec 21.1.1: `new Number(v)` boxes the ToNumber result).
     pub number_data: std::collections::HashMap<u64, f64>,
-    /// [[BigIntData]] of BigInt wrapper objects, keyed by object identity
-    /// (spec 21.2.1: `Object(5n)` boxes the BigInt).
-    pub bigint_data: std::collections::HashMap<u64, crux::BigInt>,
     /// [[DateValue]] of Date instances, keyed by object identity (spec
     /// 21.4.3: ms since the epoch).
     pub date_data: IdMap<f64>,
@@ -1232,10 +1249,6 @@ pub struct Agent {
     /// The [[Calendar]] internal slot of Temporal instances, keyed by object
     /// identity (the proposal-temporal calendar field; default "iso8601").
     pub temporal_calendars: std::collections::HashMap<u64, crux::string::JsString>,
-    /// The RegExp internal state ([[OriginalSource]], [[OriginalFlags]],
-    /// [[RegExpRecord]], [[RegExpMatcher]]) of RegExp instances, keyed by
-    /// object identity (spec 22.2.5).
-    pub regexp_data: IdMap<crate::builtins::regexp::RegExpState>,
     /// Compiled regexp programs, keyed by source then flags. A `RegExp`
     /// literal creates a fresh object on every evaluation (spec 13.2.8), but
     /// its program is immutable and identical each time, so the compiled form
@@ -1423,9 +1436,6 @@ pub struct Agent {
     /// DataView instances, keyed by object identity (spec 25.4.2).
     pub dataview_data:
         std::collections::HashMap<u64, RefCell<crate::builtins::dataview::DataViewState>>,
-    /// The [[RawJSON]] text of JSON.rawJSON objects, keyed by object identity
-    /// (spec 26.6.3).
-    pub raw_json_data: std::collections::HashMap<u64, JsString>,
     /// The nesting depth of class field initializers currently evaluating.
     /// A direct eval inside one applies the "Eval Inside Initializer" early
     /// errors (spec 19.2.1.1): `arguments` is a SyntaxError there.
@@ -1740,9 +1750,7 @@ impl Agent {
             deferred_module_waits: std::collections::HashMap::new(),
             deferred_module_thens: std::collections::HashMap::new(),
             boolean_data: std::collections::HashMap::new(),
-            symbol_data: std::collections::HashMap::new(),
             number_data: std::collections::HashMap::new(),
-            bigint_data: std::collections::HashMap::new(),
             date_data: std::collections::HashMap::default(),
             intl_locale_data: std::collections::HashMap::new(),
             intl_number_format_data: std::collections::HashMap::new(),
@@ -1761,7 +1769,6 @@ impl Agent {
             intl_duration_format_data: std::collections::HashMap::new(),
             temporal_data: std::collections::HashMap::new(),
             temporal_calendars: std::collections::HashMap::new(),
-            regexp_data: std::collections::HashMap::default(),
             compiled_regexps: std::collections::HashMap::new(),
             regexp_string_iter_data: std::collections::HashMap::new(),
             string_iter_data: std::collections::HashMap::new(),
@@ -1824,7 +1831,6 @@ impl Agent {
             wait_async: std::collections::HashMap::new(),
             buffer_data: std::collections::HashMap::new(),
             dataview_data: std::collections::HashMap::new(),
-            raw_json_data: std::collections::HashMap::new(),
             field_initializer_depth: 0,
             realm_count: std::cell::Cell::new(0),
             gc_stress: Cell::new(false),
@@ -2021,7 +2027,7 @@ impl Agent {
     }
 
     pub fn has_regexp(&self, id: u64) -> bool {
-        self.regexp_data.contains_key(&id)
+        self.roots.regexp_data.borrow().contains_key(&id)
     }
 
     pub fn has_boolean(&self, id: u64) -> bool {
@@ -2033,11 +2039,53 @@ impl Agent {
     }
 
     pub fn has_symbol(&self, id: u64) -> bool {
-        self.symbol_data.contains_key(&id)
+        self.roots.symbol_data.borrow().contains_key(&id)
     }
 
     pub fn has_bigint(&self, id: u64) -> bool {
-        self.bigint_data.contains_key(&id)
+        self.roots.bigint_data.borrow().contains_key(&id)
+    }
+
+    /// The [[SymbolData]] of a Symbol wrapper, when `id` is one.
+    pub(crate) fn symbol(&self, id: u64) -> Option<crux::symbol::Symbol> {
+        self.roots.symbol_data.borrow().get(&id).cloned()
+    }
+
+    pub(crate) fn register_symbol(&self, id: u64, symbol: crux::symbol::Symbol) {
+        self.roots.symbol_data.borrow_mut().insert(id, symbol);
+    }
+
+    /// The [[BigIntData]] of a BigInt wrapper, when `id` is one.
+    pub(crate) fn bigint(&self, id: u64) -> Option<crux::BigInt> {
+        self.roots.bigint_data.borrow().get(&id).cloned()
+    }
+
+    pub(crate) fn register_bigint(&self, id: u64, value: crux::BigInt) {
+        self.roots.bigint_data.borrow_mut().insert(id, value);
+    }
+
+    /// The RegExp state of `id`, when the object is a RegExp. A clone, because
+    /// the compiled program is `Rc`-shared and every reader wants an owned
+    /// copy anyway (see the table's note).
+    pub fn regexp_state(&self, id: u64) -> Option<crate::builtins::regexp::RegExpState> {
+        self.roots.regexp_data.borrow().get(&id).cloned()
+    }
+
+    pub(crate) fn register_regexp(&self, id: u64, state: crate::builtins::regexp::RegExpState) {
+        self.roots.regexp_data.borrow_mut().insert(id, state);
+    }
+
+    /// The [[RawJSON]] text of a `JSON.rawJSON` object, when `id` is one.
+    pub(crate) fn raw_json_text(&self, id: u64) -> Option<JsString> {
+        self.roots.raw_json_data.borrow().get(&id).cloned()
+    }
+
+    pub(crate) fn has_raw_json(&self, id: u64) -> bool {
+        self.roots.raw_json_data.borrow().contains_key(&id)
+    }
+
+    pub(crate) fn register_raw_json(&self, id: u64, text: JsString) {
+        self.roots.raw_json_data.borrow_mut().insert(id, text);
     }
 
     pub fn has_weak_map(&self, id: u64) -> bool {
@@ -2744,8 +2792,6 @@ impl Agent {
         self.import_namespace_resolvers.trace(visit);
         self.deferred_module_waits.trace(visit);
         self.deferred_module_thens.trace(visit);
-        self.symbol_data.trace(visit);
-        self.bigint_data.trace(visit);
         self.intl_number_format_data.trace(visit);
         self.intl_plural_rules_data.trace(visit);
         self.intl_date_time_format_data.trace(visit);
@@ -2754,7 +2800,6 @@ impl Agent {
         self.intl_segment_iterator_data.trace(visit);
         self.temporal_data.trace(visit);
         self.temporal_calendars.trace(visit);
-        self.regexp_data.trace(visit);
         for (value, text, _, _, _) in self.regexp_string_iter_data.values() {
             value.trace(visit);
             text.trace(visit);
@@ -2809,7 +2854,6 @@ impl Agent {
         // state held only scalars and a refcounted block until that field
         // existed, which is why this line is newer than the table.
         self.buffer_data.trace(visit);
-        self.raw_json_data.trace(visit);
         // GC-2: the Vms currently running bodies (their heap-buffered value
         // stacks are invisible to the conservative stack scan). Pooled and
         // suspended Vms are covered by `vm_pool` and the generator/async
@@ -3365,7 +3409,7 @@ impl Agent {
         for id in dead {
             self.number_data.remove(&id);
             self.boolean_data.remove(&id);
-            self.bigint_data.remove(&id);
+            self.roots.bigint_data.borrow_mut().remove(&id);
         }
     }
 

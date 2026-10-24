@@ -40,8 +40,8 @@ fn placeholder(name: &'static str) -> NativeFn {
 fn this_bigint_value(agent: &Agent, this: &Value) -> Result<crux::BigInt, JsError> {
     match this.kind() {
         ValueKind::BigInt(b) => Ok(b.as_ref().clone()),
-        ValueKind::Object(obj) => match agent.bigint_data.get(&obj.id()) {
-            Some(b) => Ok(b.clone()),
+        ValueKind::Object(obj) => match agent.bigint(obj.id()) {
+            Some(b) => Ok(b),
             None => Err(JsError::new(
                 ErrorKind::TypeError,
                 "BigInt.prototype method called on an incompatible receiver".into(),

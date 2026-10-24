@@ -353,9 +353,7 @@ pub fn to_object(agent: &mut Agent, value: &Value) -> Result<Value, JsError> {
                 .get("%Symbol.prototype%")
                 .and_then(|v| as_object(&v));
             let object = JsObject::ordinary_object_create(proto);
-            agent
-                .symbol_data
-                .insert(object.id(), symbol.as_ref().clone());
+            agent.register_symbol(object.id(), symbol.as_ref().clone());
             Ok(Value::Object(object))
         }
         ValueKind::Number(n) => {
@@ -381,7 +379,7 @@ pub fn to_object(agent: &mut Agent, value: &Value) -> Result<Value, JsError> {
                 .set(Some(crux::object::BoxedPrimitive::BigInt(Handle::new(
                     b.as_ref().clone(),
                 ))));
-            agent.bigint_data.insert(object.id(), b.as_ref().clone());
+            agent.register_bigint(object.id(), b.as_ref().clone());
             Ok(Value::Object(object))
         }
     }

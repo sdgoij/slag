@@ -480,7 +480,7 @@ fn strv(s: &JsString) -> Value {
 /// IsRawJSON (spec 26.6.4): an object registered in the raw-JSON table.
 fn is_raw_json(agent: &Agent, value: &Value) -> bool {
     match value.kind() {
-        ValueKind::Object(obj) => agent.raw_json_data.contains_key(&obj.id()),
+        ValueKind::Object(obj) => agent.has_raw_json(obj.id()),
         _ => false,
     }
 }
@@ -488,7 +488,7 @@ fn is_raw_json(agent: &Agent, value: &Value) -> bool {
 /// The [[RawJSON]] text of a raw-JSON object.
 fn raw_json_source(agent: &Agent, value: &Value) -> Option<JsString> {
     match value.kind() {
-        ValueKind::Object(obj) => agent.raw_json_data.get(&obj.id()).cloned(),
+        ValueKind::Object(obj) => agent.raw_json_text(obj.id()),
         _ => None,
     }
 }
@@ -890,8 +890,8 @@ fn serialize_json_property(
             value = Value::Boolean(*b);
         } else if matches!(obj.kind, crux::object::ObjectKind::String(_)) {
             value = Value::String(Handle::new(crate::context::to_string(agent, &value)?));
-        } else if let Some(big) = agent.bigint_data.get(&obj.id()) {
-            value = Value::BigInt(Handle::new(big.clone()));
+        } else if let Some(big) = agent.bigint(obj.id()) {
+            value = Value::BigInt(Handle::new(big));
         }
     }
     match value.kind() {
@@ -1251,7 +1251,7 @@ fn raw_json(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, Js
         configurable: Some(false),
     };
     object.define_property(&JsString::from_utf8("rawJSON"), &raw_json_prop)?;
-    agent.raw_json_data.insert(object.id(), text.clone());
+    agent.register_raw_json(object.id(), text.clone());
     Ok(Value::Object(object))
 }
 

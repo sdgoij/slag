@@ -1616,7 +1616,7 @@ pub(crate) fn is_regexp(agent: &mut Agent, value: &Value) -> Result<bool, JsErro
     let matcher = get_property_key(agent, value, &key, *value)?;
     if matches!(matcher.kind(), ValueKind::Undefined) {
         if let ValueKind::Object(obj) = value.kind()
-            && agent.regexp_data.contains_key(&obj.id())
+            && agent.has_regexp(obj.id())
         {
             return Ok(true);
         }

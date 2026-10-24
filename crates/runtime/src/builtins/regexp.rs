@@ -83,8 +83,8 @@ fn placeholder(name: &'static str) -> NativeFn {
 /// The RegExp state of an instance; TypeError otherwise.
 fn regexp_state(agent: &Agent, value: &Value) -> Result<RegExpState, JsError> {
     match value.kind() {
-        ValueKind::Object(obj) => match agent.regexp_data.get(&obj.id()) {
-            Some(state) => Ok(state.clone()),
+        ValueKind::Object(obj) => match agent.regexp_state(obj.id()) {
+            Some(state) => Ok(state),
             None => Err(JsError::new(
                 ErrorKind::TypeError,
                 "Method called on an incompatible receiver".into(),
@@ -160,7 +160,7 @@ pub fn regexp_initialize(
     let parsed_flags = regexp::Flags::parse(flags_text.as_slice())
         .map_err(|e| JsError::new(ErrorKind::SyntaxError, e.message.clone()))?;
     let compiled = agent.compile_regexp(pattern_text.as_slice(), parsed_flags)?;
-    agent.regexp_data.insert(
+    agent.register_regexp(
         object.id(),
         RegExpState {
             source: pattern_text,
@@ -209,9 +209,9 @@ fn regexp_construct(
             .ok_or_else(|| JsError::new(ErrorKind::TypeError, "%RegExp% is not defined".into()))?
     };
     let (pattern_source, effective_flags) = if let ValueKind::Object(obj) = pattern_or_regexp.kind()
-        && agent.regexp_data.contains_key(&obj.id())
+        && agent.has_regexp(obj.id())
     {
-        let state = agent.regexp_data.get(&obj.id()).unwrap().clone();
+        let state = agent.regexp_state(obj.id()).unwrap();
         let source = Value::String(Handle::new(state.source));
         let flags_value = if matches!(flags.kind(), ValueKind::Undefined) {
             Value::String(Handle::new(JsString::from_utf8(&state.flags_text)))
@@ -298,7 +298,7 @@ pub fn compile(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value,
             "RegExp.prototype.compile requires a RegExp receiver".into(),
         ));
     };
-    let current_state = agent.regexp_data.get(&obj.id()).cloned().ok_or_else(|| {
+    let current_state = agent.regexp_state(obj.id()).ok_or_else(|| {
         JsError::new(
             ErrorKind::TypeError,
             "RegExp.prototype.compile requires a RegExp receiver".into(),
@@ -320,7 +320,7 @@ pub fn compile(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value,
     let pattern = args.first().cloned().unwrap_or(Value::Undefined);
     let flags = args.get(1).cloned().unwrap_or(Value::Undefined);
     let (pattern_source, effective_flags) = if let ValueKind::Object(pat) = pattern.kind()
-        && agent.regexp_data.contains_key(&pat.id())
+        && agent.has_regexp(pat.id())
     {
         if !matches!(flags.kind(), ValueKind::Undefined) {
             return Err(JsError::new(
@@ -328,7 +328,7 @@ pub fn compile(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value,
                 "cannot supply flags when compiling from another RegExp".into(),
             ));
         }
-        let state = agent.regexp_data.get(&pat.id()).unwrap().clone();
+        let state = agent.regexp_state(pat.id()).unwrap();
         (
             Value::String(Handle::new(state.source)),
             Value::String(Handle::new(JsString::from_utf8(&state.flags_text))),
@@ -355,7 +355,7 @@ fn regexp_receiver(
     let ValueKind::Object(obj) = regexp.kind() else {
         return Err(regexp_receiver_error());
     };
-    let Some(state) = agent.regexp_data.get(&obj.id()).cloned() else {
+    let Some(state) = agent.regexp_state(obj.id()) else {
         return Err(regexp_receiver_error());
     };
     Ok((obj, state))
@@ -372,7 +372,7 @@ fn regexp_match_parts(
     let ValueKind::Object(obj) = regexp.kind() else {
         return Err(regexp_receiver_error());
     };
-    let Some(state) = agent.regexp_data.get(&obj.id()) else {
+    let Some(state) = agent.regexp_state(obj.id()) else {
         return Err(regexp_receiver_error());
     };
     Ok((obj, std::rc::Rc::clone(&state.compiled), state.flags))

@@ -2847,7 +2847,7 @@ fn children(agent: &Agent, object: &Handle<JsObject>) -> Result<Vec<Value>, Unsu
     // agent's table too, so the walk owes the constructor — a value the record
     // names by serial. The source is not walked: the record carries it as its own
     // field, and the load makes a fresh string from it rather than sharing one.
-    if let Some(state) = agent.regexp_data.get(&object.id()) {
+    if let Some(state) = agent.regexp_state(object.id()) {
         children.push(state.constructor);
     }
     Ok(children)
@@ -3079,7 +3079,7 @@ fn write_record(
             None if agent.date_data.contains_key(&object.id()) => {
                 write_date(agent, realm, object, serials, body)?
             }
-            None if agent.regexp_data.contains_key(&object.id()) => {
+            None if agent.has_regexp(object.id()) => {
                 write_regexp(agent, realm, object, serials, body)?
             }
             None => {
@@ -3993,7 +3993,7 @@ fn write_regexp(
     serials: &HashMap<Identity, u32>,
     body: &mut Vec<u8>,
 ) -> Result<(), Unsupported> {
-    let Some(state) = agent.regexp_data.get(&object.id()) else {
+    let Some(state) = agent.regexp_state(object.id()) else {
         return Err(Unsupported::new(
             "a RegExp",
             "the agent holds no regexp state for this object",
@@ -5671,7 +5671,7 @@ impl Builder<'_> {
                     })?,
                 );
                 let constructor = self.materialize(*constructor)?;
-                self.agent.regexp_data.insert(
+                self.agent.register_regexp(
                     object.id(),
                     crate::builtins::regexp::RegExpState {
                         source,
