@@ -103,8 +103,7 @@ fn validate_integer_typed_array(
     let buffer_id = as_object(&slots.buffer_object)
         .map(|object| object.id())
         .unwrap_or(u64::MAX);
-    if !agent.buffer_data.contains_key(&buffer_id)
-        || crate::builtins::array_buffer::is_detached(agent, buffer_id)
+    if !agent.has_buffer(buffer_id) || crate::builtins::array_buffer::is_detached(agent, buffer_id)
     {
         return Err(JsError::new(
             ErrorKind::TypeError,
@@ -115,9 +114,8 @@ fn validate_integer_typed_array(
     // throws before any argument is read (immutable-buffer.js).
     if write
         && agent
-            .buffer_data
-            .get(&buffer_id)
-            .is_some_and(|cell| cell.borrow().immutable)
+            .buffer_state(buffer_id)
+            .is_some_and(|state| state.immutable)
     {
         return Err(JsError::new(
             ErrorKind::TypeError,

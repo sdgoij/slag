@@ -555,19 +555,13 @@ table_predicates! {
 /// entry is what separates them.
 pub(crate) fn is_array_buffer(value: &api::Local) -> bool {
     in_table(value, |agent, id| {
-        agent
-            .buffer_data
-            .get(&id)
-            .is_some_and(|state| !state.borrow().is_shared)
+        agent.buffer_state(id).is_some_and(|state| !state.is_shared)
     })
 }
 
 pub(crate) fn is_shared_array_buffer(value: &api::Local) -> bool {
     in_table(value, |agent, id| {
-        agent
-            .buffer_data
-            .get(&id)
-            .is_some_and(|state| state.borrow().is_shared)
+        agent.buffer_state(id).is_some_and(|state| state.is_shared)
     })
 }
 

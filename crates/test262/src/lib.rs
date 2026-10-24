@@ -11899,13 +11899,12 @@ var $DONE = function (error) {
                         "broadcast requires a SharedArrayBuffer".into(),
                     ));
                 };
-                let state = agent.buffer_data.get(&sab_obj.id()).ok_or_else(|| {
+                let state = agent.buffer_state(sab_obj.id()).ok_or_else(|| {
                     JsError::new(
                         ErrorKind::TypeError,
                         "broadcast requires a SharedArrayBuffer".into(),
                     )
                 })?;
-                let state = state.borrow();
                 if !state.is_shared {
                     return Err(JsError::new(
                         ErrorKind::TypeError,

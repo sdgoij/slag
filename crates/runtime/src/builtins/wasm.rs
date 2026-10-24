@@ -741,8 +741,7 @@ fn buffer_source_bytes(agent: &Agent, value: &Value) -> Result<Vec<u8>, JsError>
         }
         _ => {
             let id = object.id();
-            let cell = agent.buffer_data.get(&id).ok_or_else(not_a_buffer)?;
-            let state = cell.borrow();
+            let state = agent.buffer_state(id).ok_or_else(not_a_buffer)?;
             if state.detached {
                 return Err(JsError::new(
                     ErrorKind::TypeError,
@@ -1025,10 +1024,8 @@ fn array_buffer_of(agent: &mut Agent, bytes: &[u8]) -> Result<Value, JsError> {
     let object = JsObject::ordinary_object_create(Some(proto));
     array_buffer::allocate_array_buffer(agent, &object, bytes.len(), false, None)?;
     let shared = agent
-        .buffer_data
-        .get(&object.id())
+        .buffer_state(object.id())
         .expect("fresh buffer")
-        .borrow()
         .shared
         .clone();
     shared.write(0, bytes)?;
@@ -1550,9 +1547,8 @@ fn memory_buffers_reconcile(agent: &mut Agent) -> Result<(), JsError> {
         };
         let byte_length = block.byte_length();
         let unchanged = agent
-            .buffer_data
-            .get(&id)
-            .is_some_and(|state| state.borrow().byte_length == byte_length);
+            .buffer_state(id)
+            .is_some_and(|state| state.byte_length == byte_length);
         if unchanged {
             continue;
         }

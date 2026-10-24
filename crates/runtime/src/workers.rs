@@ -72,8 +72,7 @@ mod tests {
         let ValueKind::Object(obj) = sab.kind() else {
             panic!("expected a SharedArrayBuffer object");
         };
-        let state = agent.buffer_data.get(&obj.id()).unwrap();
-        let state = state.borrow();
+        let state = agent.buffer_state(obj.id()).unwrap();
         (state.shared.clone(), state.byte_length)
     }
 

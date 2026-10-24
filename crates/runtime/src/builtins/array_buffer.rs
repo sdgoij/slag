@@ -115,9 +115,8 @@ impl BufferState {
 /// `[[ArrayBufferData]]` has been nulled.
 pub fn is_detached(agent: &Agent, id: u64) -> bool {
     agent
-        .buffer_data
-        .get(&id)
-        .map(|cell| cell.borrow().detached)
+        .buffer_state(id)
+        .map(|state| state.detached)
         .unwrap_or(true)
 }
 
@@ -125,9 +124,8 @@ pub fn is_detached(agent: &Agent, id: u64) -> bool {
 pub fn is_shared(agent: &Agent, value: &Value) -> bool {
     match value.kind() {
         ValueKind::Object(obj) => agent
-            .buffer_data
-            .get(&obj.id())
-            .map(|cell| cell.borrow().is_shared)
+            .buffer_state(obj.id())
+            .map(|state| state.is_shared)
             .unwrap_or(false),
         _ => false,
     }
@@ -142,7 +140,7 @@ fn require_buffer_object(agent: &Agent, this: &Value) -> Result<Handle<JsObject>
             "Receiver is not an ArrayBuffer object".into(),
         )
     })?;
-    if !agent.buffer_data.contains_key(&object.id()) {
+    if !agent.has_buffer(object.id()) {
         return Err(JsError::new(
             ErrorKind::TypeError,
             "Receiver is not an ArrayBuffer object".into(),
@@ -154,7 +152,7 @@ fn require_buffer_object(agent: &Agent, this: &Value) -> Result<Handle<JsObject>
 /// The current state of a buffer, re-fetched from the agent (never keep a
 /// cloned `RefCell` handle across mutations).
 fn state(agent: &Agent, id: u64) -> Option<std::cell::Ref<'_, BufferState>> {
-    agent.buffer_data.get(&id).map(|cell| cell.borrow())
+    agent.buffer_state(id)
 }
 
 /// GetArrayBufferMaxByteLengthOption (spec 25.1.2.1): the `maxByteLength`
@@ -205,9 +203,9 @@ pub(crate) fn allocate_array_buffer(
     } else {
         SharedBuffer::new(byte_length)
     };
-    agent.buffer_data.insert(
+    agent.register_buffer(
         object.id(),
-        std::cell::RefCell::new(BufferState {
+        BufferState {
             shared,
             byte_length,
             max_byte_length,
@@ -217,13 +215,13 @@ pub(crate) fn allocate_array_buffer(
             detached: false,
             immutable: false,
             detach_key: None,
-        }),
+        },
     );
     if is_resizable {
         // Mirror the flag on the crux SharedBuffer (spec 10.4.5.1: a
         // resizable-backed TypedArray cannot be frozen).
-        let cell = agent.buffer_data.get(&object.id()).expect("inserted");
-        cell.borrow().shared.mark_resizable();
+        let state = agent.buffer_state(object.id()).expect("inserted");
+        state.shared.mark_resizable();
     }
     Ok(())
 }
@@ -250,9 +248,9 @@ fn allocate_shared_array_buffer(
     } else {
         SharedBuffer::new(byte_length)
     };
-    agent.buffer_data.insert(
+    agent.register_buffer(
         object.id(),
-        std::cell::RefCell::new(BufferState {
+        BufferState {
             shared,
             byte_length,
             max_byte_length,
@@ -262,10 +260,10 @@ fn allocate_shared_array_buffer(
             detached: false,
             immutable: false,
             detach_key: None,
-        }),
+        },
     );
-    let cell = agent.buffer_data.get(&object.id()).expect("inserted");
-    cell.borrow().shared.mark_shared();
+    let state = agent.buffer_state(object.id()).expect("inserted");
+    state.shared.mark_shared();
     Ok(())
 }
 
@@ -278,12 +276,11 @@ fn allocate_shared_array_buffer(
 /// Host-facing: the only place a detach happens, and so the one a
 /// `v8::ArrayBuffer::detach` should go through.
 pub fn detach_array_buffer(agent: &mut Agent, id: u64) {
-    if let Some(cell) = agent.buffer_data.get(&id) {
-        let mut state = cell.borrow_mut();
+    agent.with_buffer_state(id, |state| {
         state.shared.mark_detached();
         state.detached = true;
         state.byte_length = 0;
-    }
+    });
 }
 
 /// Set `[[ArrayBufferDetachKey]]` (`v8::ArrayBuffer::SetDetachKey`).
@@ -292,10 +289,9 @@ pub fn detach_array_buffer(agent: &mut Agent, id: u64) {
 /// — that is what a key of `undefined` means in the spec's own words ("if key is
 /// not undefined").
 pub fn set_detach_key(agent: &mut Agent, id: u64, key: Value) {
-    if let Some(cell) = agent.buffer_data.get(&id) {
-        let mut state = cell.borrow_mut();
+    agent.with_buffer_state(id, |state| {
         state.detach_key = if key.is_undefined() { None } else { Some(key) };
-    }
+    });
 }
 
 /// Detach `id` when `key` matches its `[[ArrayBufferDetachKey]]`
@@ -308,13 +304,12 @@ pub fn set_detach_key(agent: &mut Agent, id: u64, key: Value) {
 /// it happened to arrive on. A buffer with no key takes `undefined`, as it does
 /// there.
 pub fn detach_array_buffer_with_key(agent: &mut Agent, id: u64, key: &Value) -> bool {
-    let matches = agent.buffer_data.get(&id).is_some_and(|cell| {
-        let state = cell.borrow();
-        match &state.detach_key {
+    let matches = agent
+        .buffer_state(id)
+        .is_some_and(|state| match &state.detach_key {
             None => key.is_undefined(),
             Some(stored) => crux::ops::same_value(stored, key),
-        }
-    });
+        });
     if !matches {
         return false;
     }
@@ -534,7 +529,7 @@ fn is_view(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsE
     match arg.kind() {
         ValueKind::Object(obj) => {
             let has_viewed = matches!(obj.kind, crux::object::ObjectKind::IntegerIndexed(_))
-                || agent.dataview_data.contains_key(&obj.id());
+                || agent.has_data_view(obj.id());
             Ok(Value::Boolean(has_viewed))
         }
         _ => Ok(Value::Boolean(false)),
@@ -674,12 +669,14 @@ fn slice_to_immutable(agent: &mut Agent, this: &Value, args: &[Value]) -> Result
         })?;
     let new_object = JsObject::ordinary_object_create(Some(proto));
     allocate_array_buffer(agent, &new_object, new_len, false, None)?;
-    if let Some(cell) = agent.buffer_data.get(&new_object.id()) {
-        let mut state = cell.borrow_mut();
-        state.shared.write(0, &bytes)?;
-        state.immutable = true;
-        state.shared.mark_immutable();
-    }
+    agent
+        .with_buffer_state(new_object.id(), |state| {
+            state.shared.write(0, &bytes)?;
+            state.immutable = true;
+            state.shared.mark_immutable();
+            Ok::<(), JsError>(())
+        })
+        .transpose()?;
     Ok(Value::Object(new_object))
 }
 
@@ -733,11 +730,13 @@ fn resize(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsEr
             "newLength exceeds maxByteLength".into(),
         ));
     }
-    if let Some(cell) = agent.buffer_data.get(&object.id()) {
-        let mut state = cell.borrow_mut();
-        state.shared.resize(new_length)?;
-        state.byte_length = new_length;
-    }
+    agent
+        .with_buffer_state(object.id(), |state| {
+            state.shared.resize(new_length)?;
+            state.byte_length = new_length;
+            Ok::<(), JsError>(())
+        })
+        .transpose()?;
     Ok(Value::Undefined)
 }
 
@@ -781,7 +780,7 @@ fn slice(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsErr
             "slice constructor returned the receiver".into(),
         ));
     }
-    if !agent.buffer_data.contains_key(&new_object.id()) {
+    if !agent.has_buffer(new_object.id()) {
         return Err(JsError::new(
             ErrorKind::TypeError,
             "slice constructor did not produce an ArrayBuffer".into(),
@@ -907,12 +906,11 @@ fn transfer_to_immutable(
         ));
     }
     let result = array_buffer_copy_and_detach(agent, object.id(), new_length, false)?;
-    if let ValueKind::Object(obj) = result.kind()
-        && let Some(cell) = agent.buffer_data.get(&obj.id())
-    {
-        let mut state = cell.borrow_mut();
-        state.immutable = true;
-        state.shared.mark_immutable();
+    if let ValueKind::Object(obj) = result.kind() {
+        agent.with_buffer_state(obj.id(), |state| {
+            state.immutable = true;
+            state.shared.mark_immutable();
+        });
     }
     Ok(result)
 }
@@ -978,9 +976,9 @@ pub fn shared_array_buffer_from_block(
             )
         })?;
     let object = JsObject::ordinary_object_create(Some(prototype));
-    agent.buffer_data.insert(
+    agent.register_buffer(
         object.id(),
-        std::cell::RefCell::new(BufferState {
+        BufferState {
             shared: shared.for_new_buffer(),
             byte_length,
             max_byte_length: None,
@@ -990,13 +988,13 @@ pub fn shared_array_buffer_from_block(
             detached: false,
             immutable: false,
             detach_key: None,
-        }),
+        },
     );
     // The flags are this object's now (see `array_buffer_from_block`), so the
     // shared mirror has to be set here rather than inherited from the block's
     // previous owner.
-    let cell = agent.buffer_data.get(&object.id()).expect("inserted");
-    cell.borrow().shared.mark_shared();
+    let state = agent.buffer_state(object.id()).expect("inserted");
+    state.shared.mark_shared();
     Ok(Value::Object(object))
 }
 
@@ -1027,9 +1025,9 @@ pub fn array_buffer_from_block(
             )
         })?;
     let object = JsObject::ordinary_object_create(Some(prototype));
-    agent.buffer_data.insert(
+    agent.register_buffer(
         object.id(),
-        std::cell::RefCell::new(BufferState::fixed(shared.for_new_buffer(), byte_length)),
+        BufferState::fixed(shared.for_new_buffer(), byte_length),
     );
     Ok(Value::Object(object))
 }
@@ -1125,11 +1123,13 @@ fn sab_grow(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, Js
             "newLength is smaller than the current byteLength".into(),
         ));
     }
-    if let Some(cell) = agent.buffer_data.get(&object.id()) {
-        let mut state = cell.borrow_mut();
-        state.shared.resize(new_length)?;
-        state.byte_length = new_length;
-    }
+    agent
+        .with_buffer_state(object.id(), |state| {
+            state.shared.resize(new_length)?;
+            state.byte_length = new_length;
+            Ok::<(), JsError>(())
+        })
+        .transpose()?;
     Ok(Value::Undefined)
 }
 
@@ -1731,10 +1731,8 @@ mod tests {
         // What a host store taken before the detach holds: a clone of the
         // buffer's block, which shares that buffer's flags.
         let store = agent
-            .buffer_data
-            .get(&first_id)
+            .buffer_state(first_id)
             .expect("registered")
-            .borrow()
             .shared
             .clone();
         detach_array_buffer(&mut agent, first_id);
@@ -1750,10 +1748,8 @@ mod tests {
             "the new buffer is not detached"
         );
         let second_flags = agent
-            .buffer_data
-            .get(&second_id)
+            .buffer_state(second_id)
             .expect("registered")
-            .borrow()
             .shared
             .clone();
         assert!(

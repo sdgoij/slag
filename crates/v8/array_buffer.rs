@@ -72,8 +72,8 @@ impl BufferFacts {
 /// The buffer record for an object, if it is a registered buffer.
 fn facts_for_id(id: u64) -> Option<BufferFacts> {
     crate::realm::with_agent(|agent| {
-        let cell = agent.buffer_data.get(&id)?;
-        Some(BufferFacts::of(&cell.borrow()))
+        let state = agent.buffer_state(id)?;
+        Some(BufferFacts::of(&state))
     })?
 }
 
@@ -126,8 +126,7 @@ fn view_facts(value: &api::Local) -> Option<ViewFacts> {
         _ => {
             let id = object.id();
             let (buffer_object, byte_offset, byte_length) = crate::realm::with_agent(|agent| {
-                let cell = agent.dataview_data.get(&id)?;
-                let state = cell.borrow();
+                let state = agent.dataview_state(id)?;
                 Some((state.buffer_object, state.byte_offset, state.byte_length))
             })??;
             (buffer_object, byte_offset, byte_length, None)

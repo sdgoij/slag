@@ -551,6 +551,21 @@ pub(crate) struct AgentRoots {
     /// The [[IteratedSet]], [[SetNextIndex]], and [[SetIterationKind]] of Set
     /// iterators (spec 24.2.6).
     pub(crate) set_iter_data: RefCell<IdMap<Rc<RefCell<IterRecord>>>>,
+    /// The internal state of ArrayBuffer/SharedArrayBuffer objects, keyed by
+    /// object identity (spec 25.1.1: [[ArrayBufferData]],
+    /// [[ArrayBufferByteLength]], [[ArrayBufferMaxByteLength]], and the
+    /// resizable/growable + shared flags).
+    ///
+    /// The entry is not a cell of its own: every reader takes a `Ref` into the
+    /// table and drops it before anything that can allocate (a coercion, the
+    /// species constructor), which is the discipline the buffer builtins
+    /// already followed for the per-entry cell. Inserting while one is held
+    /// therefore *panics*, so a new buffer must be allocated before the state
+    /// of an existing one is read — never in the middle of the read.
+    pub(crate) buffer_data: RefCell<IdMap<crate::builtins::array_buffer::BufferState>>,
+    /// The [[ViewedArrayBuffer]], [[ByteLength]], and [[ByteOffset]] of
+    /// DataView instances, keyed by object identity (spec 25.4.2).
+    pub(crate) dataview_data: RefCell<IdMap<crate::builtins::dataview::DataViewState>>,
     /// [[SymbolData]] of Symbol wrapper objects, keyed by object identity
     /// (spec 20.4.1: `Object(sym)` boxes the symbol).
     pub(crate) symbol_data: RefCell<IdMap<crux::symbol::Symbol>>,
@@ -610,6 +625,8 @@ impl AgentRoots {
             weak_set_data: RefCell::new(IdMap::default()),
             map_iter_data: RefCell::new(IdMap::default()),
             set_iter_data: RefCell::new(IdMap::default()),
+            buffer_data: RefCell::new(IdMap::default()),
+            dataview_data: RefCell::new(IdMap::default()),
             symbol_data: RefCell::new(IdMap::default()),
             bigint_data: RefCell::new(IdMap::default()),
             regexp_data: RefCell::new(IdMap::default()),
@@ -708,6 +725,11 @@ impl Trace for AgentRoots {
         self.shadow_wrapped.trace(visit);
         self.shadow_handlers.trace(visit);
         self.ecma_functions.trace(visit);
+        self.dataview_data.trace(visit);
+        // Visited because a buffer's [[ArrayBufferDetachKey]] is a GC value;
+        // the state held only scalars and a refcounted block until that field
+        // existed, which is why this line is newer than the table.
+        self.buffer_data.trace(visit);
         self.symbol_data.trace(visit);
         self.bigint_data.trace(visit);
         self.regexp_data.trace(visit);
@@ -1430,12 +1452,6 @@ pub struct Agent {
     /// [[ArrayBufferMaxByteLength]], and the resizable/growable + shared flags).
     /// Phase 12 created buffers as the TypedArray backing store; Phase 14 adds
     /// the full builtins.
-    pub buffer_data:
-        std::collections::HashMap<u64, RefCell<crate::builtins::array_buffer::BufferState>>,
-    /// The [[ViewedArrayBuffer]], [[ByteLength]], and [[ByteOffset]] of
-    /// DataView instances, keyed by object identity (spec 25.4.2).
-    pub dataview_data:
-        std::collections::HashMap<u64, RefCell<crate::builtins::dataview::DataViewState>>,
     /// The nesting depth of class field initializers currently evaluating.
     /// A direct eval inside one applies the "Eval Inside Initializer" early
     /// errors (spec 19.2.1.1): `arguments` is a SyntaxError there.
@@ -1829,8 +1845,6 @@ impl Agent {
             pending_dead_promises: std::cell::RefCell::new(Vec::new()),
             array_from_async: std::collections::HashMap::new(),
             wait_async: std::collections::HashMap::new(),
-            buffer_data: std::collections::HashMap::new(),
-            dataview_data: std::collections::HashMap::new(),
             field_initializer_depth: 0,
             realm_count: std::cell::Cell::new(0),
             gc_stress: Cell::new(false),
@@ -2019,7 +2033,56 @@ impl Agent {
     /// record in that table. The ones whose tables have not moved into
     /// [`AgentRoots`] read the field directly.
     pub fn has_data_view(&self, id: u64) -> bool {
-        self.dataview_data.contains_key(&id)
+        self.roots.dataview_data.borrow().contains_key(&id)
+    }
+
+    /// The state of a registered ArrayBuffer, or `None`. A guard into the
+    /// table: keep it to the statement that reads it (see the field's note).
+    pub fn buffer_state(
+        &self,
+        id: u64,
+    ) -> Option<Ref<'_, crate::builtins::array_buffer::BufferState>> {
+        Ref::filter_map(self.roots.buffer_data.borrow(), |table| table.get(&id)).ok()
+    }
+
+    /// The state of a registered DataView, or `None`.
+    pub fn dataview_state(
+        &self,
+        id: u64,
+    ) -> Option<Ref<'_, crate::builtins::dataview::DataViewState>> {
+        Ref::filter_map(self.roots.dataview_data.borrow(), |table| table.get(&id)).ok()
+    }
+
+    pub fn has_buffer(&self, id: u64) -> bool {
+        self.roots.buffer_data.borrow().contains_key(&id)
+    }
+
+    /// Insert a buffer's state. Under the table's own borrow, so callers must
+    /// have let go of any `buffer_state` guard.
+    pub(crate) fn register_buffer(
+        &self,
+        id: u64,
+        state: crate::builtins::array_buffer::BufferState,
+    ) {
+        self.roots.buffer_data.borrow_mut().insert(id, state);
+    }
+
+    /// Mutate a buffer's state in place, if it is registered.
+    pub(crate) fn with_buffer_state<T>(
+        &self,
+        id: u64,
+        write: impl FnOnce(&mut crate::builtins::array_buffer::BufferState) -> T,
+    ) -> Option<T> {
+        let mut table = self.roots.buffer_data.borrow_mut();
+        table.get_mut(&id).map(write)
+    }
+
+    pub(crate) fn register_dataview(
+        &self,
+        id: u64,
+        state: crate::builtins::dataview::DataViewState,
+    ) {
+        self.roots.dataview_data.borrow_mut().insert(id, state);
     }
 
     pub fn has_date(&self, id: u64) -> bool {
@@ -2849,11 +2912,6 @@ impl Agent {
         for (value, _, _) in self.wait_async.values() {
             value.trace(visit);
         }
-        self.dataview_data.trace(visit);
-        // Visited because a buffer's [[ArrayBufferDetachKey]] is a GC value; the
-        // state held only scalars and a refcounted block until that field
-        // existed, which is why this line is newer than the table.
-        self.buffer_data.trace(visit);
         // GC-2: the Vms currently running bodies (their heap-buffered value
         // stacks are invisible to the conservative stack scan). Pooled and
         // suspended Vms are covered by `vm_pool` and the generator/async

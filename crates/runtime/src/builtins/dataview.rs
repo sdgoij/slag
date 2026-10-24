@@ -69,7 +69,7 @@ fn require_data_view(agent: &Agent, this: &Value) -> Result<Handle<JsObject>, Js
             "Receiver is not a DataView object".into(),
         )
     })?;
-    if !agent.dataview_data.contains_key(&object.id()) {
+    if !agent.has_data_view(object.id()) {
         return Err(JsError::new(
             ErrorKind::TypeError,
             "Receiver is not a DataView object".into(),
@@ -81,7 +81,7 @@ fn require_data_view(agent: &Agent, this: &Value) -> Result<Handle<JsObject>, Js
 /// The state re-fetched from the agent (never keep a cloned `RefCell` handle
 /// across mutations).
 fn state(agent: &Agent, id: u64) -> Option<std::cell::Ref<'_, DataViewState>> {
-    agent.dataview_data.get(&id).map(|cell| cell.borrow())
+    agent.dataview_state(id)
 }
 
 fn placeholder(name: &'static str) -> NativeFn {
@@ -146,7 +146,7 @@ pub(crate) fn data_view_construct(
             "First argument is not an object".into(),
         )
     })?;
-    if !agent.buffer_data.contains_key(&buffer_object.id()) {
+    if !agent.has_buffer(buffer_object.id()) {
         return Err(JsError::new(
             ErrorKind::TypeError,
             "First argument is not an ArrayBuffer".into(),
@@ -162,9 +162,8 @@ pub(crate) fn data_view_construct(
         ));
     }
     let buffer_byte_length = agent
-        .buffer_data
-        .get(&buffer_object.id())
-        .map(|cell| cell.borrow().byte_length)
+        .buffer_state(buffer_object.id())
+        .map(|state| state.byte_length)
         .unwrap_or(0);
     let byte_length = match args.get(2) {
         None => {
@@ -218,13 +217,13 @@ pub(crate) fn data_view_construct(
         ));
     }
     let object = JsObject::ordinary_object_create(Some(prototype));
-    agent.dataview_data.insert(
+    agent.register_dataview(
         object.id(),
-        std::cell::RefCell::new(DataViewState {
+        DataViewState {
             buffer_object: buffer,
             byte_length,
             byte_offset,
-        }),
+        },
     );
     Ok(Value::Object(object))
 }
@@ -262,9 +261,8 @@ fn get_byte_length(agent: &mut Agent, this: &Value, _args: &[Value]) -> Result<V
         // step 4); the checks above guarantee no underflow.
         None => {
             let buffer_length = agent
-                .buffer_data
-                .get(&buffer_id)
-                .map(|cell| cell.borrow().byte_length)
+                .buffer_state(buffer_id)
+                .map(|state| state.byte_length)
                 .unwrap_or(0);
             buffer_length - byte_offset
         }
@@ -302,10 +300,9 @@ fn view_out_of_bounds(
     byte_offset: usize,
     byte_length: Option<usize>,
 ) -> bool {
-    let Some(buffer) = agent.buffer_data.get(&buffer_id) else {
+    let Some(buffer) = agent.buffer_state(buffer_id) else {
         return false;
     };
-    let buffer = buffer.borrow();
     match byte_length {
         None => byte_offset > buffer.byte_length,
         Some(length) => byte_offset + length > buffer.byte_length,
@@ -356,9 +353,8 @@ fn check_view(
         // step 9); the OOB check above guarantees no underflow.
         None => {
             let buffer_length = agent
-                .buffer_data
-                .get(&buffer_id)
-                .map(|cell| cell.borrow().byte_length)
+                .buffer_state(buffer_id)
+                .map(|state| state.byte_length)
                 .unwrap_or(0);
             buffer_length - byte_offset
         }
@@ -396,10 +392,10 @@ fn read_element(
         element_type.size(),
     )?;
     let mut bytes = {
-        let buffer = agent.buffer_data.get(&buffer_id).ok_or_else(|| {
+        let buffer = agent.buffer_state(buffer_id).ok_or_else(|| {
             JsError::new(ErrorKind::TypeError, "DataView buffer is detached".into())
         })?;
-        buffer.borrow().shared.read(offset, element_type.size())?
+        buffer.shared.read(offset, element_type.size())?
     };
     if little_endian(args) != agent.little_endian {
         bytes.reverse();
@@ -420,9 +416,8 @@ fn write_element(
 ) -> Result<Value, JsError> {
     let (buffer_id, byte_offset, byte_length) = view_state(agent, this)?;
     if agent
-        .buffer_data
-        .get(&buffer_id)
-        .is_some_and(|cell| cell.borrow().immutable)
+        .buffer_state(buffer_id)
+        .is_some_and(|state| state.immutable)
     {
         return Err(JsError::new(
             ErrorKind::TypeError,
@@ -450,10 +445,9 @@ fn write_element(
         bytes.reverse();
     }
     let buffer = agent
-        .buffer_data
-        .get(&buffer_id)
+        .buffer_state(buffer_id)
         .ok_or_else(|| JsError::new(ErrorKind::TypeError, "DataView buffer is detached".into()))?;
-    buffer.borrow().shared.write(offset, &bytes)?;
+    buffer.shared.write(offset, &bytes)?;
     Ok(Value::Undefined)
 }
 

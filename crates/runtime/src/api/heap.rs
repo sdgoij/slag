@@ -169,8 +169,7 @@ impl Isolate {
 /// memory rather than a negative number of bytes.
 fn external_memory(isolate: &Isolate) -> i64 {
     let mut total = isolate.external_memory_adjustment;
-    for state in isolate.agent.buffer_data.values() {
-        let state = state.borrow();
+    for state in isolate.agent.roots.buffer_data.borrow().values() {
         if state.detached || state.shared.is_borrowed() {
             continue;
         }

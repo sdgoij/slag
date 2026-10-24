@@ -285,15 +285,14 @@ fn typed_array_buffer_detached(agent: &Agent, slots: &TypedArraySlots) -> bool {
     let buffer_id = as_object(&slots.buffer_object)
         .map(|object| object.id())
         .unwrap_or(u64::MAX);
-    !agent.buffer_data.contains_key(&buffer_id)
-        || crate::builtins::array_buffer::is_detached(agent, buffer_id)
+    !agent.has_buffer(buffer_id) || crate::builtins::array_buffer::is_detached(agent, buffer_id)
 }
 
 /// IsArrayBuffer: an object registered in the buffer table (Phase 14 adds
 /// the full ArrayBuffer builtin; Phase 12 buffers back TypedArrays).
 fn is_array_buffer(agent: &Agent, value: &Value) -> bool {
     match value.kind() {
-        ValueKind::Object(obj) => agent.buffer_data.contains_key(&obj.id()),
+        ValueKind::Object(obj) => agent.has_buffer(obj.id()),
         _ => false,
     }
 }
@@ -386,12 +385,9 @@ fn allocate_typed_array_buffer(
         .get("%ArrayBuffer.prototype%")
         .and_then(|value| as_object(&value));
     let buffer_object = JsObject::ordinary_object_create(buffer_proto);
-    agent.buffer_data.insert(
+    agent.register_buffer(
         buffer_object.id(),
-        std::cell::RefCell::new(crate::builtins::array_buffer::BufferState::fixed(
-            buffer.clone(),
-            byte_length,
-        )),
+        crate::builtins::array_buffer::BufferState::fixed(buffer.clone(), byte_length),
     );
     let slots = TypedArraySlots {
         buffer_object: Value::Object(buffer_object),
@@ -859,16 +855,14 @@ pub fn typed_array_buffer_path(
     };
     let (variable_length, shared, buffer_byte_length) = {
         let state = agent
-            .buffer_data
-            .get(&buffer_object.id())
+            .buffer_state(buffer_object.id())
             .ok_or_else(|| JsError::new(ErrorKind::TypeError, "Expected an ArrayBuffer".into()))?;
-        if state.borrow().detached {
+        if state.detached {
             return Err(JsError::new(
                 ErrorKind::TypeError,
                 "ArrayBuffer is detached".into(),
             ));
         }
-        let state = state.borrow();
         // [[ArrayBufferMaxByteLength]] set ⇒ not a fixed-length buffer (spec
         // IsFixedLengthArrayBuffer 25.1.3.9), true for a resizable ArrayBuffer
         // *and* a growable SharedArrayBuffer. The `resizable` flag alone is
@@ -897,9 +891,8 @@ pub fn typed_array_buffer_path(
     // The byteOffset coercion may have detached the buffer (spec 25.2.2.1
     // step 5.b: IsDetachedBuffer throws a TypeError).
     if agent
-        .buffer_data
-        .get(&buffer_object.id())
-        .map(|state| state.borrow().detached)
+        .buffer_state(buffer_object.id())
+        .map(|state| state.detached)
         .unwrap_or(false)
     {
         return Err(JsError::new(
@@ -913,9 +906,8 @@ pub fn typed_array_buffer_path(
         // The length coercion may have detached the buffer (spec 25.2.2.1
         // step 5.b: IsDetachedBuffer throws a TypeError).
         if agent
-            .buffer_data
-            .get(&buffer_object.id())
-            .map(|state| state.borrow().detached)
+            .buffer_state(buffer_object.id())
+            .map(|state| state.detached)
             .unwrap_or(false)
         {
             return Err(JsError::new(

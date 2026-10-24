@@ -2626,16 +2626,13 @@ fn array_buffer_state<'a>(
     agent: &'a Agent,
     object: &Handle<JsObject>,
 ) -> Option<std::cell::Ref<'a, BufferState>> {
-    agent
-        .buffer_data
-        .get(&object.id())
-        .map(|state| state.borrow())
+    agent.buffer_state(object.id())
 }
 
 /// Whether this object is a DataView, whose view state the agent holds the same
 /// way it holds a buffer's.
 fn is_data_view(agent: &Agent, object: &Handle<JsObject>) -> bool {
-    agent.dataview_data.contains_key(&object.id())
+    agent.has_data_view(object.id())
 }
 
 /// Every value an object reaches: its prototype, its keys, and its values.
@@ -5332,20 +5329,22 @@ impl Builder<'_> {
                     ))
                 })?;
                 {
-                    let Some(cell) = self.agent.buffer_data.get(&object.id()) else {
+                    let Some(state) = self.agent.buffer_state(object.id()) else {
                         return Err(DecodeError::UnrebuildableBuffer(
                             "the allocation left no buffer state".into(),
                         ));
                     };
-                    let mut state = cell.borrow_mut();
                     state.shared.write(0, bytes).map_err(|_| {
                         DecodeError::UnrebuildableBuffer(
                             "its bytes do not fit the block it was allocated".into(),
                         )
                     })?;
+                    drop(state);
                     if *immutable {
-                        state.immutable = true;
-                        state.shared.mark_immutable();
+                        self.agent.with_buffer_state(object.id(), |state| {
+                            state.immutable = true;
+                            state.shared.mark_immutable();
+                        });
                     }
                 }
                 self.remember(index, Built::Object(object));

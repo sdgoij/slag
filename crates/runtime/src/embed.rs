@@ -726,7 +726,7 @@ impl Context {
                 }
                 _ => {
                     // ArrayBuffer/SharedArrayBuffer: the storage is agent-side.
-                    let state = self.agent.buffer_data.get(&obj.id())?.borrow();
+                    let state = self.agent.buffer_state(obj.id())?;
                     if state.detached {
                         return None;
                     }
@@ -762,13 +762,12 @@ impl Context {
                         .map_err(JsError::from)
                 }
                 _ => {
-                    let cell = self.agent.buffer_data.get(&obj.id()).ok_or_else(|| {
+                    let state = self.agent.buffer_state(obj.id()).ok_or_else(|| {
                         JsError::new(
                             ErrorKind::TypeError,
                             "set_bytes: not an ArrayBuffer or TypedArray".into(),
                         )
                     })?;
-                    let state = cell.borrow_mut();
                     if state.detached {
                         return Err(JsError::new(
                             ErrorKind::TypeError,
