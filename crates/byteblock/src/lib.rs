@@ -239,6 +239,296 @@ impl Drop for BorrowedBlock {
     }
 }
 
+/// A block's storage under `workers`: a reserved virtual address range whose
+/// pages are committed only as the buffer grows.
+///
+/// A resizable buffer has to hand out a base that never moves — the JIT bakes
+/// it into compiled element accesses and every view keeps reading it — so the
+/// block used to be allocated at its maximum up front, and
+/// `new ArrayBuffer(0, { maxByteLength: 2**30 })` committed a gigabyte for an
+/// empty buffer. Reserving the range and committing pages on `resize` keeps the
+/// base fixed *and* the process's footprint proportional to what the buffer
+/// actually uses.
+#[cfg(feature = "workers")]
+#[derive(Debug, Clone)]
+pub struct WorkersBlock {
+    inner: std::sync::Arc<Reservation>,
+}
+
+#[cfg(feature = "workers")]
+#[derive(Debug)]
+struct Reservation {
+    /// The reserved range's first byte (dangling for an empty block).
+    base: *mut u8,
+    /// Address space reserved, in bytes: the block's capacity.
+    reserved: usize,
+    /// Bytes committed so far, rounded up to the page size. Monotonic: a
+    /// `resize` never gives pages back, so a shrink-then-grow costs nothing.
+    committed: std::sync::atomic::AtomicUsize,
+}
+
+// SAFETY: the reservation is the block's shared storage under `workers`, which
+// exists so agents on several threads can address the same bytes. The bytes are
+// plain memory, and the atomic operations go through `AtomicU64` on addresses
+// inside it; nothing in `Reservation` is mutated without an atomic.
+#[cfg(feature = "workers")]
+unsafe impl Send for Reservation {}
+#[cfg(feature = "workers")]
+unsafe impl Sync for Reservation {}
+
+#[cfg(feature = "workers")]
+impl Drop for Reservation {
+    fn drop(&mut self) {
+        if !self.base.is_null() && self.reserved > 0 {
+            // SAFETY: `base`/`reserved` are exactly what `vm::reserve` returned
+            // for this reservation, released once.
+            unsafe { vm::release(self.base, self.reserved) };
+        }
+    }
+}
+
+#[cfg(feature = "workers")]
+impl WorkersBlock {
+    /// Reserve `capacity` bytes and commit `byte_length` of them, zero-filled.
+    fn new(byte_length: usize, capacity: usize) -> Self {
+        let capacity = capacity.max(byte_length);
+        let base = if capacity == 0 {
+            std::ptr::NonNull::<u8>::dangling().as_ptr()
+        } else {
+            // SAFETY: `reserve` owns nothing the caller holds.
+            let base = unsafe { vm::reserve(capacity) };
+            assert!(
+                !base.is_null(),
+                "byteblock: could not reserve {capacity} bytes of address space"
+            );
+            base
+        };
+        let reservation = Reservation {
+            base,
+            reserved: capacity,
+            committed: std::sync::atomic::AtomicUsize::new(0),
+        };
+        assert!(
+            byte_length == 0 || reservation.commit_to(byte_length),
+            "byteblock: could not commit {byte_length} bytes of a {capacity}-byte reservation"
+        );
+        Self {
+            inner: std::sync::Arc::new(reservation),
+        }
+    }
+
+    fn as_ptr(&self) -> *const u8 {
+        self.inner.base
+    }
+
+    fn capacity(&self) -> usize {
+        self.inner.reserved
+    }
+
+    /// Commit enough pages to cover `len` bytes; false when the range is larger
+    /// than the reservation or the platform refuses.
+    fn commit(&self, len: usize) -> bool {
+        self.inner.commit_to(len)
+    }
+
+    /// The number of bytes committed so far (page-rounded), for tests.
+    #[cfg(test)]
+    pub(crate) fn committed(&self) -> usize {
+        self.inner
+            .committed
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+#[cfg(feature = "workers")]
+impl Reservation {
+    fn commit_to(&self, len: usize) -> bool {
+        if len > self.reserved {
+            return false;
+        }
+        use std::sync::atomic::Ordering;
+        let already = self.committed.load(Ordering::Relaxed);
+        if len <= already {
+            return true;
+        }
+        // Commit whole pages, never past the reservation.
+        let page = vm::page_size();
+        let target = len.div_ceil(page).saturating_mul(page).min(self.reserved);
+        // SAFETY: `already` and `target` are page-aligned offsets inside the
+        // reservation, and the range `already..target` is not committed yet.
+        if !unsafe { vm::commit(self.base.add(already), target - already) } {
+            return false;
+        }
+        self.committed.store(target, Ordering::Relaxed);
+        true
+    }
+}
+
+/// The platform's reserve/commit/release primitives.
+///
+/// `reserve` claims address space without backing it with physical memory;
+/// `commit` makes a prefix usable; `release` gives the range back. On Unix a
+/// single `mmap` is both reserve and commit (pages are backed on first touch),
+/// so `commit` is a bookkeeping no-op there.
+#[cfg(all(feature = "workers", windows))]
+mod vm {
+    const MEM_COMMIT: u32 = 0x0000_1000;
+    const MEM_RESERVE: u32 = 0x0000_2000;
+    const MEM_RELEASE: u32 = 0x0000_8000;
+    const PAGE_READWRITE: u32 = 0x04;
+    /// The page granularity `commit` rounds to. Windows commits in pages; its
+    /// 64 KiB *allocation granularity* only applies to `MEM_RESERVE`, which
+    /// rounds internally.
+    const PAGE_SIZE: usize = 4096;
+
+    unsafe extern "system" {
+        fn VirtualAlloc(
+            address: *mut core::ffi::c_void,
+            size: usize,
+            allocation_type: u32,
+            protect: u32,
+        ) -> *mut core::ffi::c_void;
+        fn VirtualFree(address: *mut core::ffi::c_void, size: usize, free_type: u32) -> i32;
+    }
+
+    pub(crate) fn page_size() -> usize {
+        PAGE_SIZE
+    }
+
+    /// # Safety
+    /// Caller must release the returned range with [`release`] exactly once.
+    pub(crate) unsafe fn reserve(len: usize) -> *mut u8 {
+        // SAFETY: a fresh reservation, released by `release`.
+        unsafe { VirtualAlloc(std::ptr::null_mut(), len, MEM_RESERVE, PAGE_READWRITE) }.cast()
+    }
+
+    /// # Safety
+    /// `base..base + len` must be inside a reservation this module made, and
+    /// must not already be committed.
+    pub(crate) unsafe fn commit(base: *mut u8, len: usize) -> bool {
+        if len == 0 {
+            return true;
+        }
+        // SAFETY: as the contract says; committed pages come back zeroed.
+        !unsafe { VirtualAlloc(base.cast(), len, MEM_COMMIT, PAGE_READWRITE) }.is_null()
+    }
+
+    /// # Safety
+    /// `base` must be a reservation from [`reserve`]; called once.
+    pub(crate) unsafe fn release(base: *mut u8, _len: usize) {
+        // SAFETY: as the contract says.
+        unsafe { VirtualFree(base.cast(), 0, MEM_RELEASE) };
+    }
+}
+
+#[cfg(all(feature = "workers", unix))]
+mod vm {
+    use core::ffi::{c_int, c_void};
+
+    const PROT_READ: c_int = 1;
+    const PROT_WRITE: c_int = 2;
+    const MAP_PRIVATE: c_int = 2;
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    const MAP_ANONYMOUS: c_int = 0x20;
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    const MAP_ANONYMOUS: c_int = 0x1000;
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    const MAP_NORESERVE: c_int = 0x4000;
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    const MAP_NORESERVE: c_int = 0x40;
+
+    unsafe extern "C" {
+        fn mmap(
+            address: *mut c_void,
+            length: usize,
+            protect: c_int,
+            flags: c_int,
+            fd: c_int,
+            offset: i64,
+        ) -> *mut c_void;
+        fn munmap(address: *mut c_void, length: usize) -> c_int;
+    }
+
+    pub(crate) fn page_size() -> usize {
+        4096
+    }
+
+    /// # Safety
+    /// Caller must release the returned range with [`release`] exactly once.
+    pub(crate) unsafe fn reserve(len: usize) -> *mut u8 {
+        // SAFETY: an anonymous private mapping, released by `release`. The
+        // pages are backed only when touched, which is what makes the
+        // reservation cheap.
+        let base = unsafe {
+            mmap(
+                std::ptr::null_mut(),
+                len,
+                PROT_READ | PROT_WRITE,
+                MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE,
+                -1,
+                0,
+            )
+        };
+        if base as isize == -1 {
+            std::ptr::null_mut()
+        } else {
+            base.cast()
+        }
+    }
+
+    /// # Safety
+    /// `base..base + len` must be inside a reservation this module made.
+    pub(crate) unsafe fn commit(_base: *mut u8, _len: usize) -> bool {
+        // The mapping is already writable; a page is backed on first touch.
+        true
+    }
+
+    /// # Safety
+    /// `base` must be a reservation from [`reserve`]; called once.
+    pub(crate) unsafe fn release(base: *mut u8, len: usize) {
+        // SAFETY: as the contract says.
+        unsafe { munmap(base.cast(), len) };
+    }
+}
+
+/// Targets with neither `VirtualAlloc` nor `mmap` back the reservation eagerly,
+/// which is the behaviour this module had before the reservation existed.
+#[cfg(all(feature = "workers", not(any(windows, unix))))]
+mod vm {
+    pub(crate) fn page_size() -> usize {
+        4096
+    }
+
+    /// # Safety
+    /// Caller must release the returned range with [`release`] exactly once.
+    pub(crate) unsafe fn reserve(len: usize) -> *mut u8 {
+        let words = len.div_ceil(8);
+        let block: Box<[std::sync::atomic::AtomicU64]> = (0..words)
+            .map(|_| std::sync::atomic::AtomicU64::new(0))
+            .collect();
+        Box::into_raw(block).cast::<u8>()
+    }
+
+    /// # Safety
+    /// As the trait's other implementations.
+    pub(crate) unsafe fn commit(_base: *mut u8, _len: usize) -> bool {
+        true
+    }
+
+    /// # Safety
+    /// `base` must be a reservation from [`reserve`]; called once.
+    pub(crate) unsafe fn release(base: *mut u8, len: usize) {
+        let words = len.div_ceil(8);
+        // SAFETY: rebuilding the box `reserve` leaked.
+        drop(unsafe {
+            Box::from_raw(std::slice::from_raw_parts_mut(
+                base.cast::<std::sync::atomic::AtomicU64>(),
+                words,
+            ) as *mut [std::sync::atomic::AtomicU64])
+        });
+    }
+}
+
 /// The [[ArrayBufferData]] of an ArrayBuffer: a shared byte vector aliased
 /// by every TypedArray that views the buffer (spec 25.1.1).
 ///
@@ -253,7 +543,7 @@ pub struct SharedBuffer {
     #[cfg(not(feature = "workers"))]
     block: Rc<RefCell<Vec<u8>>>,
     #[cfg(feature = "workers")]
-    block: std::sync::Arc<[std::sync::atomic::AtomicU64]>,
+    block: WorkersBlock,
     #[cfg(feature = "workers")]
     byte_length: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     /// The host's bytes, when this block borrows rather than owns them.
@@ -306,10 +596,10 @@ impl SharedBuffer {
     }
 
     /// Allocate a zero-filled buffer with storage for up to `capacity` bytes.
-    /// Resizable/growable buffers pre-allocate their maximum so views created
-    /// before a resize keep a live block — under `workers` the block is a
-    /// fixed `Arc`, so a resize only updates the shared byte length in place
-    /// (the single-agent path resizes its `Vec` in place and shares it).
+    /// Resizable/growable buffers must keep one base across a resize, so views
+    /// created before it stay live: under `workers` the range is *reserved* at
+    /// its capacity and committed as the buffer grows, and the single-agent
+    /// path resizes its `Vec` in place and refreshes the shared base.
     pub fn new_with_capacity(byte_length: usize, capacity: usize) -> Self {
         #[cfg(not(feature = "workers"))]
         {
@@ -330,14 +620,8 @@ impl SharedBuffer {
         }
         #[cfg(feature = "workers")]
         {
-            let words = byte_length.max(capacity).div_ceil(8);
-            let block = (0..words)
-                .map(|_| std::sync::atomic::AtomicU64::new(0))
-                .collect::<std::sync::Arc<[_]>>();
-            let state_rc = std::sync::Arc::new(BlockState::new(block.as_ptr()
-                as *const std::sync::atomic::AtomicU64
-                as *const u8
-                as usize));
+            let block = WorkersBlock::new(byte_length, capacity);
+            let state_rc = std::sync::Arc::new(BlockState::new(block.as_ptr() as usize));
             let state = &*state_rc as *const BlockState as usize;
             let flags_rc = FlagsRc::new(BufferFlags::default());
             let flags = &*flags_rc as *const BufferFlags as usize;
@@ -419,10 +703,10 @@ impl SharedBuffer {
         let state = &*state_rc as *const BlockState as usize;
         #[cfg(not(feature = "workers"))]
         let block = Rc::new(RefCell::new(Vec::new()));
-        // No words: the bytes are the host's, and every path that would read the
-        // block's storage checks `borrowed` first.
+        // Nothing reserved: the bytes are the host's, and every path that would
+        // read the block's storage checks `borrowed` first.
         #[cfg(feature = "workers")]
-        let block = std::sync::Arc::from(Vec::new());
+        let block = WorkersBlock::new(0, 0);
         #[cfg(feature = "workers")]
         let byte_length = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(byte_length));
         let flags_rc = FlagsRc::new(BufferFlags::default());
@@ -573,6 +857,12 @@ impl SharedBuffer {
         {
             self.byte_length.load(std::sync::atomic::Ordering::Relaxed)
         }
+    }
+
+    /// The bytes committed so far, page-rounded (tests, `workers` only).
+    #[cfg(all(test, feature = "workers"))]
+    pub(crate) fn committed(&self) -> usize {
+        self.block.committed()
     }
 
     /// A stable identity for the underlying byte block (the allocation
@@ -752,11 +1042,11 @@ impl SharedBuffer {
         }
     }
 
-    /// Grow/shrink the block to `new_length`. Under `workers` the block is
-    /// pre-allocated to its capacity (resizable/growable buffers), so a
-    /// resize only updates the shared byte length — visible to every view
-    /// clone — and zero-fills the newly exposed region on a grow. The
-    /// single-agent path resizes the shared `Vec` in place.
+    /// Grow/shrink the block to `new_length`. Under `workers` the block is a
+    /// reserved range (resizable/growable buffers reserve their maximum), so a
+    /// resize commits the pages the new length needs, zero-fills the newly
+    /// exposed region — visible to every view clone — and never moves the base.
+    /// The single-agent path resizes the shared `Vec` in place.
     pub fn resize(&mut self, new_length: usize) -> Result<(), OutOfBounds> {
         if self.borrowed.is_some() {
             // Borrowed memory cannot grow: the allocation belongs to the host,
@@ -777,15 +1067,19 @@ impl SharedBuffer {
         }
         #[cfg(feature = "workers")]
         {
-            let capacity = self.block.len().saturating_mul(8);
-            if new_length > capacity {
+            if new_length > self.block.capacity() {
                 return Err(out_of_bounds());
             }
             let old_length = self.byte_length.load(std::sync::atomic::Ordering::Relaxed);
             if new_length > old_length {
-                let base = self.block.as_ptr() as *const AtomicU64 as *mut u8;
-                // SAFETY: `new_length <= capacity` and the Arc keeps the
-                // block alive.
+                // Commit before writing: the pages past the old length may not
+                // be backed yet.
+                if !self.block.commit(new_length) {
+                    return Err(out_of_bounds());
+                }
+                let base = self.block.as_ptr() as *mut u8;
+                // SAFETY: `new_length <= capacity`, the pages are committed, and
+                // the reservation keeps them mapped for the block's life.
                 unsafe {
                     std::ptr::write_bytes(base.add(old_length), 0, new_length - old_length);
                 }
@@ -1052,6 +1346,42 @@ fn bytes_from_raw(raw: u64, size: usize) -> Result<Vec<u8>, OutOfBounds> {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// A resizable block reserves its maximum but commits only what it holds
+    /// (M-3): `new ArrayBuffer(0, { maxByteLength: 2**30 })` used to commit a
+    /// gigabyte for an empty buffer. Growing commits pages; shrinking never
+    /// gives them back; the base never moves.
+    #[cfg(feature = "workers")]
+    #[test]
+    fn a_reserved_block_commits_only_what_it_uses() {
+        const MAX: usize = 1 << 30;
+        let mut block = SharedBuffer::new_with_capacity(0, MAX);
+        assert_eq!(block.committed(), 0, "an empty buffer commits no pages");
+        let base = block.data_ptr();
+
+        block.resize(64).expect("grow");
+        assert!(
+            block.committed() >= 64,
+            "growing commits the pages it needs"
+        );
+        assert!(
+            block.committed() < MAX,
+            "growing to 64 bytes must not commit the whole maximum"
+        );
+        assert_eq!(block.data_ptr(), base, "the base never moves");
+        block.write(0, &[1, 2, 3]).expect("write");
+        assert_eq!(block.read(0, 3).unwrap(), vec![1, 2, 3]);
+
+        block.resize(0).expect("shrink");
+        assert_eq!(block.byte_length(), 0);
+        block.resize(4096).expect("grow again");
+        assert_eq!(
+            block.read(0, 4096).expect("read the regrown range"),
+            vec![0u8; 4096],
+            "a regrown range reads as zeroes"
+        );
+        assert_eq!(block.data_ptr(), base);
+    }
 
     /// A borrowed block *is* the host's bytes: a write through it is a write to
     /// the host's allocation and the other way round, which is the whole reason
