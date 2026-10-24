@@ -162,7 +162,7 @@ fn module_source_to_string_tag(agent: &mut Agent, this: &Value) -> Result<Value,
     let ValueKind::Object(obj) = this.kind() else {
         return Ok(Value::Undefined);
     };
-    let Some(module) = agent.module_sources.get(&obj.id()).cloned() else {
+    let Some(module) = agent.module_source(obj.id()) else {
         return Ok(Value::Undefined);
     };
     let name = match module.kind {
@@ -181,16 +181,12 @@ fn module_source_to_string(agent: &mut Agent, this: &Value) -> Result<Value, JsE
             "AbstractModuleSource.prototype.toString requires a ModuleSource".into(),
         ));
     };
-    let module = agent
-        .module_sources
-        .get(&obj.id())
-        .cloned()
-        .ok_or_else(|| {
-            JsError::new(
-                ErrorKind::TypeError,
-                "AbstractModuleSource.prototype.toString requires a ModuleSource".into(),
-            )
-        })?;
+    let module = agent.module_source(obj.id()).ok_or_else(|| {
+        JsError::new(
+            ErrorKind::TypeError,
+            "AbstractModuleSource.prototype.toString requires a ModuleSource".into(),
+        )
+    })?;
     let realm = agent.current_realm()?;
     let specifier = realm
         .loaded_modules
@@ -199,7 +195,7 @@ fn module_source_to_string(agent: &mut Agent, this: &Value) -> Result<Value, JsE
         .find(|(_, m)| Handle::ptr_eq(**m, module))
         .map(|(specifier, _)| specifier.clone());
     let bytes = specifier
-        .and_then(|specifier| agent.host_modules.borrow().get(&specifier).cloned())
+        .and_then(|specifier| agent.roots.host_modules.borrow().get(&specifier).cloned())
         .map(|entry| entry.bytes)
         .unwrap_or_default();
     Ok(Value::String(Handle::new(JsString::from_utf8(

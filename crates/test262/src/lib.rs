@@ -11501,7 +11501,7 @@ var $DONE = function (error) {
             return Ok(());
         }
         let key = JsString::from_utf8(specifier);
-        if agent.host_modules.borrow().contains_key(&key) {
+        if agent.has_host_module(&key) {
             return Ok(());
         }
         // The test262 `<module source>` host artifact: a source-phase target

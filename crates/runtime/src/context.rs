@@ -703,10 +703,8 @@ pub fn get_property_key(
     {
         crate::module::ensure_deferred_namespace_evaluation_key(agent, &obj, key)?;
         let Some(module) = agent
-            .module_namespaces
-            .get(&obj.id())
-            .cloned()
-            .or_else(|| agent.deferred_namespaces.get(&obj.id()).cloned())
+            .module_namespace(obj.id())
+            .or_else(|| agent.deferred_namespace(obj.id()))
         else {
             return Ok(Value::Undefined);
         };
@@ -714,7 +712,12 @@ pub fn get_property_key(
         if let crux::property::PropertyKey::Symbol(symbol) = key
             && symbol.id == crux::symbol::well_known("toStringTag").id
         {
-            let tag = if agent.deferred_namespaces.contains_key(&obj.id()) {
+            let tag = if agent
+                .roots
+                .deferred_namespaces
+                .borrow()
+                .contains_key(&obj.id())
+            {
                 "Deferred Module"
             } else {
                 "Module"
@@ -973,10 +976,8 @@ pub fn put_value(agent: &mut Agent, reference: &Reference, value: Value) -> Resu
                 && matches!(obj.kind, crux::object::ObjectKind::ModuleNamespace(_))
                 && let PropertyKey::String(id) = key
                 && let Some(module) = agent
-                    .module_namespaces
-                    .get(&obj.id())
-                    .cloned()
-                    .or_else(|| agent.deferred_namespaces.get(&obj.id()).cloned())
+                    .module_namespace(obj.id())
+                    .or_else(|| agent.deferred_namespace(obj.id()))
             {
                 // A deferred namespace's [[Set]] returns false without
                 // consulting the exports (import-defer): a direct write does

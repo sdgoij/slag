@@ -1176,8 +1176,7 @@ fn for_in_key_levels_inner(agent: &mut Agent, rhs: &Value) -> Result<Vec<(usize,
                             // descriptor reads the live binding, throwing a
                             // ReferenceError for an uninitialized export.
                             if matches!(obj.kind, crux::object::ObjectKind::ModuleNamespace(_))
-                                && let Some(module) =
-                                    agent.module_namespaces.get(&obj.id()).cloned()
+                                && let Some(module) = agent.module_namespace(obj.id())
                                 && let PropertyKey::String(id) = &key
                             {
                                 crate::module::namespace_get(agent, &module, &crux::lookup(*id))?;

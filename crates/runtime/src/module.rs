@@ -249,7 +249,7 @@ impl Trace for HostModuleSource {
 impl Agent {
     /// Test/CLI hook: register a module the host can resolve by specifier.
     pub fn add_module(&mut self, specifier: &str, source: &str) {
-        self.host_modules.borrow_mut().insert(
+        self.roots.host_modules.borrow_mut().insert(
             JsString::from_utf8(specifier),
             HostModuleSource {
                 bytes: source.as_bytes().to_vec(),
@@ -260,7 +260,7 @@ impl Agent {
 
     /// Test/CLI hook: register a raw-bytes module (text/bytes modules).
     pub fn add_bytes_module(&mut self, specifier: &str, bytes: &[u8]) {
-        self.host_modules.borrow_mut().insert(
+        self.roots.host_modules.borrow_mut().insert(
             JsString::from_utf8(specifier),
             HostModuleSource {
                 bytes: bytes.to_vec(),
@@ -273,7 +273,7 @@ impl Agent {
     /// `<module source>` host artifact): a text module whose source is
     /// available to the source phase.
     pub fn add_source_module(&mut self, specifier: &str, source: &str) {
-        self.host_modules.borrow_mut().insert(
+        self.roots.host_modules.borrow_mut().insert(
             JsString::from_utf8(specifier),
             HostModuleSource {
                 bytes: source.as_bytes().to_vec(),
@@ -338,6 +338,7 @@ pub fn parse_module(
     let code = {
         let text = || {
             agent
+                .roots
                 .host_modules
                 .borrow()
                 .get(specifier)
@@ -372,6 +373,7 @@ pub fn parse_module(
                 // `buffer.immutable` is true and resize/transfer throw. The
                 // buffer is created immutable via transferToImmutable.
                 let bytes = agent
+                    .roots
                     .host_modules
                     .borrow()
                     .get(specifier)
@@ -642,7 +644,7 @@ fn module_kind(
             _ => ModuleKind::Js,
         };
     }
-    if let Some(entry) = agent.host_modules.borrow().get(specifier)
+    if let Some(entry) = agent.roots.host_modules.borrow().get(specifier)
         && entry.kind != ModuleKind::Js
     {
         return entry.kind;
@@ -698,7 +700,11 @@ pub(crate) fn module_source_object(
         });
     let object = JsObject::ordinary_object_create(prototype);
     let value = Value::Object(object);
-    agent.module_sources.insert(object.id(), *module);
+    agent
+        .roots
+        .module_sources
+        .borrow_mut()
+        .insert(object.id(), *module);
     crux::heap::write_barrier(&**module, value);
     module.module_source.replace(Some(value));
     Ok(value)
@@ -717,6 +723,7 @@ pub fn host_resolve_imported_module(
         return Ok(*module);
     }
     let source = agent
+        .roots
         .host_modules
         .borrow()
         .get(specifier)
@@ -1604,7 +1611,7 @@ pub fn module_evaluation(
     }
     module.status.replace(ModuleStatus::Evaluating);
     module_namespace(agent, module)?;
-    agent.module_eval_stack.push(*module);
+    agent.roots.module_eval_stack.borrow_mut().push(*module);
     // Evaluate the module's dependencies depth-first (spec 16.2.1.6.1.3.1
     // steps 11-12). A dependency that is already evaluating is a cycle: its
     // body finishes on the current evaluation stack, so it is skipped here.
@@ -1658,13 +1665,10 @@ pub fn module_evaluation(
                     // A dependency cycle: the imported module is the first
                     // member of the cycle on the evaluation stack, hence the
                     // [[CycleRoot]]; record it on every member above it.
-                    if let Some(index) = agent
-                        .module_eval_stack
-                        .iter()
-                        .position(|m| Handle::ptr_eq(*m, imported))
-                    {
+                    let stack = agent.roots.module_eval_stack.borrow();
+                    if let Some(index) = stack.iter().position(|m| Handle::ptr_eq(*m, imported)) {
                         let root = imported;
-                        for member in &agent.module_eval_stack[index..] {
+                        for member in &stack[index..] {
                             if member.cycle_root.borrow().is_none() {
                                 crux::heap::write_barrier_handle(&**member, root);
                                 *member.cycle_root.borrow_mut() = Some(root);
@@ -1712,7 +1716,7 @@ pub fn module_evaluation(
     })();
     if let Err(error) = dependencies_result {
         module.status.replace(ModuleStatus::Evaluated);
-        agent.module_eval_stack.pop();
+        agent.roots.module_eval_stack.borrow_mut().pop();
         return Err(error);
     }
     let capability = crate::promise::new_promise_capability(agent, &promise_ctor())?;
@@ -1728,11 +1732,11 @@ pub fn module_evaluation(
     if *module.pending_async.borrow() > 0 {
         // spec 16.2.2.5 steps 13-14: the body is deferred until the async
         // dependencies settle (AsyncModuleExecutionFulfilled/Rejected).
-        agent.module_eval_stack.pop();
+        agent.roots.module_eval_stack.borrow_mut().pop();
         return Ok(capability.promise);
     }
     let body_result = execute_module_body(agent, module);
-    agent.module_eval_stack.pop();
+    agent.roots.module_eval_stack.borrow_mut().pop();
     body_result?;
     Ok(capability.promise)
 }
@@ -2100,7 +2104,11 @@ pub(crate) fn deferred_module_object(
         None,
         None,
     )?;
-    agent.deferred_module_thens.insert(then.id(), *module);
+    agent
+        .roots
+        .deferred_module_thens
+        .borrow_mut()
+        .insert(then.id(), *module);
     object.create_data_property_or_throw(&JsString::from_utf8("then"), Value::Function(then))?;
     Ok(Value::Object(object))
 }
@@ -2119,7 +2127,7 @@ pub fn dispatch_deferred_module_then(
     let ValueKind::Function(function) = callee.kind() else {
         return None;
     };
-    let module = agent.deferred_module_thens.get(&function.id()).cloned()?;
+    let module = agent.deferred_module_then(function.id())?;
     let on_fulfilled = args.first().cloned().unwrap_or(Value::Undefined);
     let on_rejected = args.get(1).cloned().unwrap_or(Value::Undefined);
     Some(deferred_module_then(
@@ -2202,7 +2210,7 @@ fn await_async_dependencies(
 ) -> Result<(), JsError> {
     let remaining = Rc::new(RefCell::new(async_deps.len() as u32));
     let wait_id = NEXT_DEFERRED_WAIT.fetch_add(1, Ordering::Relaxed);
-    agent.deferred_module_waits.insert(
+    agent.roots.deferred_module_waits.borrow_mut().insert(
         wait_id,
         DeferredWait(
             remaining.clone(),
@@ -2356,7 +2364,7 @@ pub fn dispatch_deferred_module_wait(
         .copied()?;
     Some((|| -> Result<Value, JsError> {
         let Some(DeferredWait(remaining, on_fulfilled, on_rejected, module, resolve, reject)) =
-            agent.deferred_module_waits.get(&wait_id).cloned()
+            agent.deferred_module_wait(wait_id)
         else {
             return Ok(Value::Undefined);
         };
@@ -2435,9 +2443,17 @@ fn create_namespace(
     let namespace = JsObject::module_namespace_object_create(exports, deferred)?;
     let namespace_value = Value::Object(namespace);
     if deferred {
-        agent.deferred_namespaces.insert(namespace.id(), *module);
+        agent
+            .roots
+            .deferred_namespaces
+            .borrow_mut()
+            .insert(namespace.id(), *module);
     } else {
-        agent.module_namespaces.insert(namespace.id(), *module);
+        agent
+            .roots
+            .module_namespaces
+            .borrow_mut()
+            .insert(namespace.id(), *module);
     }
     Ok(namespace_value)
 }
@@ -2455,7 +2471,7 @@ pub fn deferred_namespace_module(
     ) {
         return None;
     }
-    agent.deferred_namespaces.get(&obj.id()).cloned()
+    agent.deferred_namespace(obj.id())
 }
 
 /// EnsureDeferredNamespaceEvaluation, keyed by the accessed property
@@ -3530,7 +3546,9 @@ fn make_namespace_resolver(
         None,
     )?;
     agent
+        .roots
         .import_namespace_resolvers
+        .borrow_mut()
         .insert(closure.id(), (*resolve, *namespace));
     Ok(Value::Function(closure))
 }
@@ -3544,10 +3562,7 @@ pub fn dispatch_import_resolver(
     let ValueKind::Function(function) = callee.kind() else {
         return None;
     };
-    let (resolve, namespace) = agent
-        .import_namespace_resolvers
-        .get(&function.id())
-        .cloned()?;
+    let (resolve, namespace) = agent.import_namespace_resolver(function.id())?;
     let _ = args;
     crate::function::call(agent, &resolve, Value::Undefined, &[namespace])
         .map(|_| Value::Undefined)

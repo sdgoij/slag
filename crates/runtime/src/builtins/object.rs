@@ -280,10 +280,8 @@ pub(crate) fn namespace_live_descriptor(
     // non-symbol-like descriptor read (import-defer).
     crate::module::ensure_deferred_namespace_evaluation_key(agent, obj, key)?;
     let Some(module) = agent
-        .module_namespaces
-        .get(&obj.id())
-        .cloned()
-        .or_else(|| agent.deferred_namespaces.get(&obj.id()).cloned())
+        .module_namespace(obj.id())
+        .or_else(|| agent.deferred_namespace(obj.id()))
     else {
         return Ok(prop.to_descriptor());
     };

@@ -667,6 +667,46 @@ pub(crate) struct AgentRoots {
     /// The [[ViewedArrayBuffer]], [[ByteLength]], and [[ByteOffset]] of
     /// DataView instances, keyed by object identity (spec 25.4.2).
     pub(crate) dataview_data: RefCell<IdMap<crate::builtins::dataview::DataViewState>>,
+    /// Host-provided module sources, keyed by specifier (HostResolveImportedModule).
+    pub(crate) host_modules:
+        RefCell<std::collections::HashMap<crux::string::JsString, crate::module::HostModuleSource>>,
+    /// The module behind each namespace object, keyed by object identity.
+    pub(crate) module_namespaces:
+        RefCell<std::collections::HashMap<u64, Handle<crate::module::SourceTextModule>>>,
+    /// The module behind each deferred namespace object ([[Deferred]] =
+    /// true), keyed by object identity.
+    pub(crate) deferred_namespaces:
+        RefCell<std::collections::HashMap<u64, Handle<crate::module::SourceTextModule>>>,
+    /// The module behind each `%AbstractModuleSource%` instance, keyed by
+    /// object identity.
+    pub(crate) module_sources:
+        RefCell<std::collections::HashMap<u64, Handle<crate::module::SourceTextModule>>>,
+    /// The dynamic-import namespace resolvers, keyed by function identity.
+    pub(crate) import_namespace_resolvers: RefCell<std::collections::HashMap<u64, (Value, Value)>>,
+    /// The wait state of an `import.defer(...).then(...)` promise: (remaining,
+    /// capability resolve, capability reject, module).
+    pub(crate) deferred_module_waits:
+        RefCell<std::collections::HashMap<u64, crate::module::DeferredWait>>,
+    /// The module behind each DeferredModule `.then` method (import-defer),
+    /// keyed by function identity.
+    pub(crate) deferred_module_thens:
+        RefCell<std::collections::HashMap<u64, Handle<crate::module::SourceTextModule>>>,
+    /// The in-flight module evaluations (spec 16.2.2.5 InnerModuleEvaluation
+    /// stack): used to detect dependency cycles and find the cycle root.
+    pub(crate) module_eval_stack:
+        RefCell<Vec<crux::handle::Handle<crate::module::SourceTextModule>>>,
+    /// Cut 43: per-site compiled bodies, keyed by the shared body `Rc<Block>`
+    /// pointer (the canonical site identity `shared_function_body` returns) —
+    /// now in [`AgentRoots`], with the rationale.
+    /// The realm a job is running in, set by the drain for the job's own realm
+    /// and nothing else (spec 9.5.4 hands the host a realm to run a job in).
+    ///
+    /// It is V8's `isolate->context()`: [`current_realm`](Self::current_realm)
+    /// prefers a running execution context and falls back to this, which before
+    /// was an error — a job runs with no execution context of its own, so the
+    /// realm carried by the queue is the only one an engine hook fired from a
+    /// job can answer.
+    pub(crate) entered_realm: Cell<Option<Handle<Realm>>>,
     /// [[SymbolData]] of Symbol wrapper objects, keyed by object identity
     /// (spec 20.4.1: `Object(sym)` boxes the symbol).
     pub(crate) symbol_data: RefCell<IdMap<crux::symbol::Symbol>>,
@@ -734,6 +774,15 @@ impl AgentRoots {
             async_iterator_awaits: RefCell::new(std::collections::HashMap::new()),
             async_iterator_eager: RefCell::new(std::collections::HashMap::new()),
             async_iterator_pending: RefCell::new(std::collections::HashMap::new()),
+            host_modules: RefCell::new(std::collections::HashMap::new()),
+            module_namespaces: RefCell::new(std::collections::HashMap::new()),
+            deferred_namespaces: RefCell::new(std::collections::HashMap::new()),
+            module_sources: RefCell::new(std::collections::HashMap::new()),
+            import_namespace_resolvers: RefCell::new(std::collections::HashMap::new()),
+            deferred_module_waits: RefCell::new(std::collections::HashMap::new()),
+            deferred_module_thens: RefCell::new(std::collections::HashMap::new()),
+            module_eval_stack: RefCell::new(Vec::new()),
+            entered_realm: Cell::new(None),
             disposable_stacks: RefCell::new(IdMap::default()),
             disposable_async_drivers: RefCell::new(std::collections::HashMap::new()),
             disposable_async_caps: RefCell::new(std::collections::HashMap::new()),
@@ -842,6 +891,25 @@ impl Trace for AgentRoots {
         self.shadow_handlers.trace(visit);
         self.ecma_functions.trace(visit);
         self.dataview_data.trace(visit);
+        // `host_modules` is keyed by JsString: keys are heap edges too, so
+        // trace the whole cell manually (the generic HashMap trace visits
+        // values only).
+        let Ok(host_modules) = self.host_modules.try_borrow() else {
+            crux::heap::note_aborted_trace();
+            return;
+        };
+        for (key, value) in host_modules.iter() {
+            key.trace(visit);
+            value.trace(visit);
+        }
+        self.module_namespaces.trace(visit);
+        self.deferred_namespaces.trace(visit);
+        self.module_sources.trace(visit);
+        self.import_namespace_resolvers.trace(visit);
+        self.deferred_module_waits.trace(visit);
+        self.deferred_module_thens.trace(visit);
+        self.module_eval_stack.trace(visit);
+        self.entered_realm.trace(visit);
         self.async_from_sync.trace(visit);
         self.async_generator_awaits.trace(visit);
         self.iterator_helpers.trace(visit);
@@ -1204,21 +1272,6 @@ pub struct Agent {
     pub global_symbol_registry: RefCell<Vec<(JsString, Symbol)>>,
     /// [[ModuleAsyncEvaluationCount]]: module linking (Phase 7).
     pub module_async_evaluation_count: u32,
-    /// The in-flight module evaluations (spec 16.2.2.5 InnerModuleEvaluation
-    /// stack): used to detect dependency cycles and find the cycle root.
-    pub module_eval_stack: Vec<crux::handle::Handle<crate::module::SourceTextModule>>,
-    /// Cut 43: per-site compiled bodies, keyed by the shared body `Rc<Block>`
-    /// pointer (the canonical site identity `shared_function_body` returns) —
-    /// now in [`AgentRoots`], with the rationale.
-    /// The realm a job is running in, set by the drain for the job's own realm
-    /// and nothing else (spec 9.5.4 hands the host a realm to run a job in).
-    ///
-    /// It is V8's `isolate->context()`: [`current_realm`](Self::current_realm)
-    /// prefers a running execution context and falls back to this, which before
-    /// was an error — a job runs with no execution context of its own, so the
-    /// realm carried by the queue is the only one an engine hook fired from a
-    /// job can answer.
-    pub entered_realm: Option<Handle<Realm>>,
     /// The two handlers `WebAssembly.compileStreaming` attaches to the source
     /// promise, keyed by function identity: a Rust-backed builtin carries no
     /// data of its own, so the stream it settles is found here. An entry is
@@ -1245,31 +1298,10 @@ pub struct Agent {
     /// per function id: `0` means no agent dispatch (a plain closure
     /// builtin), otherwise the index into the dispatch table.
     pub builtin_dispatch_cache: IdMap<u8>,
-    /// Host-provided module sources, keyed by specifier (HostResolveImportedModule).
-    pub host_modules:
-        RefCell<std::collections::HashMap<crux::string::JsString, crate::module::HostModuleSource>>,
-    /// The module behind each namespace object, keyed by object identity.
-    pub module_namespaces: std::collections::HashMap<u64, Handle<crate::module::SourceTextModule>>,
-    /// The module behind each deferred namespace object ([[Deferred]] =
-    /// true), keyed by object identity.
-    pub deferred_namespaces:
-        std::collections::HashMap<u64, Handle<crate::module::SourceTextModule>>,
-    /// The module behind each `%AbstractModuleSource%` instance, keyed by
-    /// object identity.
-    pub module_sources: std::collections::HashMap<u64, Handle<crate::module::SourceTextModule>>,
-    /// The dynamic-import namespace resolvers, keyed by function identity.
-    pub import_namespace_resolvers: std::collections::HashMap<u64, (Value, Value)>,
     /// DeferredModule `.then` continuations (import-defer): each waiter
     /// function id maps to (wait id, is-rejection); the wait state holds the
     /// remaining async-dependency countdown and the capability.
     pub deferred_module_waiter_fns: std::collections::HashMap<u64, (u64, bool)>,
-    /// The wait state of an `import.defer(...).then(...)` promise: (remaining,
-    /// capability resolve, capability reject, module).
-    pub deferred_module_waits: std::collections::HashMap<u64, crate::module::DeferredWait>,
-    /// The module behind each DeferredModule `.then` method (import-defer),
-    /// keyed by function identity.
-    pub deferred_module_thens:
-        std::collections::HashMap<u64, Handle<crate::module::SourceTextModule>>,
     /// [[BooleanData]] of Boolean wrapper objects, keyed by object identity
     /// (spec 20.3.1: `new Boolean(v)` boxes the ToBoolean result).
     pub boolean_data: std::collections::HashMap<u64, bool>,
@@ -1789,22 +1821,13 @@ impl Agent {
             build_roots: std::cell::Cell::new(false),
             global_symbol_registry: RefCell::new(Vec::new()),
             module_async_evaluation_count: 0,
-            module_eval_stack: Vec::new(),
-            entered_realm: None,
             #[cfg(feature = "wasm")]
             wasm_streaming_handlers: std::collections::HashMap::new(),
             async_from_sync_continuations: std::collections::HashMap::new(),
             disposable_async_cont: std::collections::HashMap::new(),
             async_body_disposal_cont: std::collections::HashMap::new(),
             builtin_dispatch_cache: std::collections::HashMap::default(),
-            host_modules: RefCell::new(std::collections::HashMap::new()),
-            module_namespaces: std::collections::HashMap::new(),
-            deferred_namespaces: std::collections::HashMap::new(),
-            module_sources: std::collections::HashMap::new(),
-            import_namespace_resolvers: std::collections::HashMap::new(),
             deferred_module_waiter_fns: std::collections::HashMap::new(),
-            deferred_module_waits: std::collections::HashMap::new(),
-            deferred_module_thens: std::collections::HashMap::new(),
             boolean_data: std::collections::HashMap::new(),
             number_data: std::collections::HashMap::new(),
             date_data: std::collections::HashMap::default(),
@@ -2063,6 +2086,48 @@ impl Agent {
             .disposable_stacks
             .borrow_mut()
             .insert(id, Rc::new(RefCell::new(data)));
+    }
+
+    /// Whether a host module was registered under `specifier`.
+    pub fn has_host_module(&self, specifier: &JsString) -> bool {
+        self.roots.host_modules.borrow().contains_key(specifier)
+    }
+
+    /// The module behind a namespace object, deferred or not (spec 10.4.6).
+    pub fn module_namespace(&self, id: u64) -> Option<Handle<crate::module::SourceTextModule>> {
+        self.roots.module_namespaces.borrow().get(&id).copied()
+    }
+
+    /// The module behind a deferred namespace object ([[Deferred]] = true).
+    pub fn deferred_namespace(&self, id: u64) -> Option<Handle<crate::module::SourceTextModule>> {
+        self.roots.deferred_namespaces.borrow().get(&id).copied()
+    }
+
+    /// The module behind an `%AbstractModuleSource%` instance.
+    pub fn module_source(&self, id: u64) -> Option<Handle<crate::module::SourceTextModule>> {
+        self.roots.module_sources.borrow().get(&id).copied()
+    }
+
+    /// A dynamic-import namespace resolver, when `id` names one.
+    pub(crate) fn import_namespace_resolver(&self, id: u64) -> Option<(Value, Value)> {
+        self.roots
+            .import_namespace_resolvers
+            .borrow()
+            .get(&id)
+            .copied()
+    }
+
+    /// The wait state of an `import.defer(...).then(...)` promise.
+    pub(crate) fn deferred_module_wait(&self, id: u64) -> Option<crate::module::DeferredWait> {
+        self.roots.deferred_module_waits.borrow().get(&id).cloned()
+    }
+
+    /// The module behind a DeferredModule `.then` method.
+    pub(crate) fn deferred_module_then(
+        &self,
+        id: u64,
+    ) -> Option<Handle<crate::module::SourceTextModule>> {
+        self.roots.deferred_module_thens.borrow().get(&id).copied()
     }
 
     pub fn has_map(&self, id: u64) -> bool {
@@ -2426,7 +2491,7 @@ impl Agent {
         if let Some(context) = self.roots.execution_context_stack.last() {
             return Ok(context.realm);
         }
-        if let Some(realm) = self.entered_realm {
+        if let Some(realm) = self.roots.entered_realm.get() {
             return Ok(realm);
         }
         Err(JsError::new(
@@ -2686,10 +2751,10 @@ impl Agent {
         // The job runs in its own realm (spec 9.5.4): enter it for the closure,
         // so engine hooks that ask for the current realm answer one rather than
         // failing while a job is in flight.
-        let previous = self.entered_realm;
-        self.entered_realm = job.realm;
+        let previous = self.roots.entered_realm.get();
+        self.roots.entered_realm.set(job.realm);
         let result = (job.closure)(self);
-        self.entered_realm = previous;
+        self.roots.entered_realm.set(previous);
         RUNNING_JOB_REGION.with(|slot| *slot.borrow_mut() = None);
         // GC-4: the job ended — its KeepDuringJob set is no longer needed.
         self.kept_during_job.borrow_mut().clear();
@@ -2840,8 +2905,6 @@ impl Agent {
             methods.trace(visit);
         }
         self.global_symbol_registry.trace(visit);
-        self.module_eval_stack.trace(visit);
-        self.entered_realm.trace(visit);
         #[cfg(feature = "wasm")]
         self.wasm_streaming_handlers.trace(visit);
         #[cfg(feature = "wasm")]
@@ -2881,26 +2944,9 @@ impl Agent {
                 value.trace(visit);
             }
         }
-        // `host_modules` is keyed by JsString: keys are heap edges too, so
-        // trace the whole cell manually (the generic HashMap trace visits
-        // values only).
-        let Ok(host_modules) = self.host_modules.try_borrow() else {
-            crux::heap::note_aborted_trace();
-            return;
-        };
-        for (key, value) in host_modules.iter() {
-            key.trace(visit);
-            value.trace(visit);
-        }
         // The AsyncFromSyncIterator value-unwrap continuations: their values
         // are the capability a pending await resumes into, so they are roots.
         self.async_from_sync_continuations.trace(visit);
-        self.module_namespaces.trace(visit);
-        self.deferred_namespaces.trace(visit);
-        self.module_sources.trace(visit);
-        self.import_namespace_resolvers.trace(visit);
-        self.deferred_module_waits.trace(visit);
-        self.deferred_module_thens.trace(visit);
         self.intl_number_format_data.trace(visit);
         self.intl_plural_rules_data.trace(visit);
         self.intl_date_time_format_data.trace(visit);
