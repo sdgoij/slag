@@ -150,6 +150,14 @@ Fixed and validated in the first remediation pass:
   baked element pointers and every live view rely on — so this needed no shared
   indirection, and M-12 stays independent. The default build was already lazy
   (`byteblock` ignores the capacity there and grows its `Vec`).
+  The reservation test now checks the OS's view as well as the block's own
+  count: on Windows a `VirtualQuery` probe asserts that the page holding `base`
+  is `MEM_COMMIT` while a page a megabyte into the reservation is `MEM_RESERVE`,
+  and that the probe itself answered — a silently failing probe would otherwise
+  make the assertion vacuous. On Linux the resident-set delta of a
+  `new_with_capacity(0, 1 GiB)` stays under a quarter of the maximum. The
+  bookkeeping count alone would not have caught a bridge that committed eagerly
+  and then under-reported.
 - **M-8 (remainder)** — the Deno reconcile now logs every lock entry it moved,
   the build runs `cargo build --locked` so nothing resolves beyond the
   reconciled lock, and an overridden `DENO_REPO` is announced instead of being

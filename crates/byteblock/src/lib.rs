@@ -529,6 +529,95 @@ mod vm {
     }
 }
 
+/// What the operating system says about a reserved range, for the reservation
+/// test. Absent on platforms with no probe, which skips the platform half of
+/// the assertion.
+#[cfg(all(feature = "workers", test))]
+mod probe {
+    use core::ffi::c_void;
+
+    #[cfg(windows)]
+    #[repr(C)]
+    struct MemoryBasicInformation {
+        base_address: *mut c_void,
+        allocation_base: *mut c_void,
+        allocation_protect: u32,
+        partition_id: u16,
+        _pad1: u16,
+        region_size: usize,
+        state: u32,
+        protect: u32,
+        kind: u32,
+        _pad2: u32,
+    }
+
+    /// Whether the page holding `address` is backed by physical memory, or
+    /// `None` when this platform has no way to ask.
+    #[cfg(windows)]
+    pub(crate) fn is_committed(address: *const u8) -> Option<bool> {
+        const MEM_COMMIT: u32 = 0x0000_1000;
+        const MEM_RESERVE: u32 = 0x0000_2000;
+
+        unsafe extern "system" {
+            fn VirtualQuery(
+                address: *const c_void,
+                information: *mut MemoryBasicInformation,
+                length: usize,
+            ) -> usize;
+        }
+
+        let mut info = MemoryBasicInformation {
+            base_address: std::ptr::null_mut(),
+            allocation_base: std::ptr::null_mut(),
+            allocation_protect: 0,
+            partition_id: 0,
+            _pad1: 0,
+            region_size: 0,
+            state: 0,
+            protect: 0,
+            kind: 0,
+            _pad2: 0,
+        };
+        // SAFETY: `info` is a writable `MEMORY_BASIC_INFORMATION`, which is what
+        // `VirtualQuery` fills in and what its length argument must name.
+        let written = unsafe {
+            VirtualQuery(
+                address.cast(),
+                &mut info,
+                std::mem::size_of::<MemoryBasicInformation>(),
+            )
+        };
+        if written == 0 {
+            return None;
+        }
+        match info.state {
+            MEM_COMMIT => Some(true),
+            MEM_RESERVE => Some(false),
+            _ => None,
+        }
+    }
+
+    #[cfg(not(windows))]
+    pub(crate) fn is_committed(_address: *const u8) -> Option<bool> {
+        None
+    }
+
+    /// The process's resident set size in bytes, or `None` where this platform
+    /// has no cheap way to read it.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn resident_bytes() -> Option<usize> {
+        let statm = std::fs::read_to_string("/proc/self/statm").ok()?;
+        // "size resident shared ..." in pages.
+        let resident: usize = statm.split_whitespace().nth(1)?.parse().ok()?;
+        Some(resident * 4096)
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    pub(crate) fn resident_bytes() -> Option<usize> {
+        None
+    }
+}
+
 /// The [[ArrayBufferData]] of an ArrayBuffer: a shared byte vector aliased
 /// by every TypedArray that views the buffer (spec 25.1.1).
 ///
@@ -1369,6 +1458,37 @@ mod tests {
             "growing to 64 bytes must not commit the whole maximum"
         );
         assert_eq!(block.data_ptr(), base, "the base never moves");
+
+        // The count above is the block's own bookkeeping; ask the operating
+        // system too, where it can be asked. A page far inside the reservation
+        // but past the buffer's length must still be reserved, not backed.
+        let past = probe::is_committed(unsafe { base.add(1 << 20) });
+        let inside = probe::is_committed(base);
+        if cfg!(windows) {
+            // The probe must answer here, or the assertions below would pass
+            // without having looked at anything.
+            assert_eq!(
+                past,
+                Some(false),
+                "a page past the buffer's length is reserved, not backed"
+            );
+            assert_eq!(
+                inside,
+                Some(true),
+                "a page inside the buffer's length is backed"
+            );
+        }
+        if let Some(before) = probe::resident_bytes() {
+            let big = SharedBuffer::new_with_capacity(0, MAX);
+            if let Some(after) = probe::resident_bytes() {
+                assert!(
+                    after.saturating_sub(before) < MAX / 4,
+                    "reserving {MAX} bytes grew the resident set by {} bytes",
+                    after.saturating_sub(before)
+                );
+            }
+            drop(big);
+        }
         block.write(0, &[1, 2, 3]).expect("write");
         assert_eq!(block.read(0, 3).unwrap(), vec![1, 2, 3]);
 
