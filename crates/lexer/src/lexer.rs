@@ -229,11 +229,15 @@ impl<'s> Lexer<'s> {
             0x24 | 0x5F | 0x5C => self.lex_identifier(),
             u if is_identifier_start(u as u32) => self.lex_identifier(),
             // A high surrogate starts an identifier when it pairs with a low
-            // surrogate into an astral ID_Start code point.
+            // surrogate into an astral ID_Start code point. The next unit must
+            // be a low surrogate: `code_point` is only defined for a real pair,
+            // and source text can carry an unpaired surrogate (a UTF-16 string
+            // passed to `eval`), so the range check cannot be left to the
+            // `is_identifier_start` call that follows.
             u if (0xD800..=0xDBFF).contains(&u)
-                && self
-                    .peek_n(1)
-                    .is_some_and(|lo| is_identifier_start(code_point(u, lo))) =>
+                && self.peek_n(1).is_some_and(|lo| {
+                    (0xDC00..=0xDFFF).contains(&lo) && is_identifier_start(code_point(u, lo))
+                }) =>
             {
                 self.lex_identifier()
             }
@@ -913,6 +917,28 @@ mod tests {
         let mut lexer = Lexer::new(&src, LexGoal::Div, false);
         let token = lexer.next_token().unwrap();
         assert_eq!(token.kind, TokenKind::Identifier(intern(&[0x53D8, 0x91CF])));
+    }
+
+    /// An unpaired high surrogate is not an identifier start. `code_point` is
+    /// only defined for a real pair, and `eval` can hand the lexer a UTF-16
+    /// source that contains one, so the low unit's range has to be checked
+    /// before the pair is decoded — without it `lo as u32 - 0xDC00` wraps
+    /// (and panics in a build with overflow checks).
+    #[test]
+    fn an_unpaired_high_surrogate_is_not_an_identifier_start() {
+        for units in [
+            vec![0xD800u16, 0x41],
+            vec![0xD800, 0x0000],
+            vec![0xD800, 0xD800],
+            // A real pair, the case the arm exists for.
+            vec![0xD800, 0xDC00],
+        ] {
+            let src = syntax::SourceText::from_utf16(units);
+            let mut lexer = Lexer::new(&src, LexGoal::Div, false);
+            // A token or an error; the point is that decoding the pair does
+            // not underflow.
+            let _ = lexer.next_token();
+        }
     }
 
     #[test]
