@@ -421,7 +421,7 @@ fn to_duration_record(agent: &mut Agent, input: &Value) -> Result<[f64; 10], JsE
     // are never called (taint-temporal-duration-prototype.js).
     if let ValueKind::Object(obj) = input.kind()
         && let Some(crate::builtins::temporal::TemporalRecord::Duration(fields)) =
-            agent.temporal_data.get(&obj.id())
+            agent.roots.temporal_data.borrow().get(&obj.id())
     {
         return Ok(*fields);
     }

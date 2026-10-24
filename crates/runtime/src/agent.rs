@@ -113,6 +113,10 @@ pub(crate) type FromAsyncContinuation = (
 /// (spec 24.1.6.1).
 pub type IterRecord = (Option<Value>, usize, u8);
 
+/// The record of a `%RegExpStringIterator%`: the RegExp, the string, the
+/// `global` and `fullUnicode` flags, and the done flag (spec 22.2.8).
+pub type RegexpStringIterRecord = (Value, crux::string::JsString, bool, bool, bool);
+
 /// The [[SetData]] of a Set instance (spec 24.2.1) plus its element index.
 #[derive(Default)]
 pub struct SetCollection {
@@ -737,6 +741,43 @@ pub(crate) struct AgentRoots {
     /// realm carried by the queue is the only one an engine hook fired from a
     /// job can answer.
     pub(crate) entered_realm: Cell<Option<Handle<Realm>>>,
+    /// The [[InitializedCollator]] records of Intl.Collator instances,
+    /// keyed by object identity (ECMA-402 §10).
+    pub(crate) intl_collator_data: RefCell<IdMap<crate::builtins::intl::collator::CollatorRecord>>,
+    /// The [[InitializedDateTimeFormat]] records of Intl.DateTimeFormat
+    /// instances, keyed by object identity (ECMA-402 §11).
+    pub(crate) intl_date_time_format_data:
+        RefCell<IdMap<crate::builtins::intl::date_time_format::DateTimeFormatRecord>>,
+    /// The [[InitializedNumberFormat]] records of Intl.NumberFormat
+    /// instances, keyed by object identity (ECMA-402 §16: the resolved
+    /// options).
+    pub(crate) intl_number_format_data:
+        RefCell<IdMap<crate::builtins::intl::number_format::NumberFormatRecord>>,
+    /// The [[InitializedPluralRules]] records of Intl.PluralRules
+    /// instances, keyed by object identity (ECMA-402 §17: the plural type
+    /// and the digit/notation options).
+    pub(crate) intl_plural_rules_data:
+        RefCell<IdMap<crate::builtins::intl::plural_rules::PluralRulesRecord>>,
+    /// The [[SegmentsSegmenter]]/[[SegmentsString]] slots of Intl.Segmenter
+    /// `segment()` results (ECMA-402 §19.5).
+    pub(crate) intl_segments_data: RefCell<IdMap<crate::builtins::intl::segmenter::SegmentsRecord>>,
+    /// The [[IteratingSegmenter]]/[[IteratedString]]/
+    /// [[IteratedStringNextSegmentCodeUnitIndex]] slots of segment
+    /// iterators (ECMA-402 §19.6).
+    pub(crate) intl_segment_iterator_data:
+        RefCell<IdMap<crate::builtins::intl::segmenter::SegmentIteratorRecord>>,
+    /// The [[InitializedTemporal*]] records of Temporal instances, keyed by
+    /// object identity (the proposal-temporal internal slots).
+    pub(crate) temporal_data: RefCell<IdMap<crate::builtins::temporal::TemporalRecord>>,
+    /// The [[Calendar]] internal slot of Temporal instances, keyed by object
+    /// identity (the proposal-temporal calendar field; default "iso8601").
+    pub(crate) temporal_calendars: RefCell<IdMap<crux::string::JsString>>,
+    /// [[IteratedString]] and [[StringIteratorNextIndex]] of String iterators,
+    /// keyed by object identity (spec 22.1.5: the iterator's internal slots).
+    pub(crate) string_iter_data: RefCell<IdMap<(Option<crux::string::JsString>, u64)>>,
+    /// [[IteratingRegExp]], [[IteratedString]], [[Global]], [[Unicode]], and
+    /// [[Done]] of RegExp String iterators (spec 22.2.6).
+    pub(crate) regexp_string_iter_data: RefCell<IdMap<RegexpStringIterRecord>>,
     /// [[SymbolData]] of Symbol wrapper objects, keyed by object identity
     /// (spec 20.4.1: `Object(sym)` boxes the symbol).
     pub(crate) symbol_data: RefCell<IdMap<crux::symbol::Symbol>>,
@@ -811,6 +852,16 @@ impl AgentRoots {
             kept_during_job: RefCell::new(Vec::new()),
             pending_cleanup_jobs: RefCell::new(Vec::new()),
             finalization_registries: RefCell::new(IdMap::default()),
+            intl_number_format_data: RefCell::new(IdMap::default()),
+            intl_plural_rules_data: RefCell::new(IdMap::default()),
+            intl_date_time_format_data: RefCell::new(IdMap::default()),
+            intl_collator_data: RefCell::new(IdMap::default()),
+            intl_segments_data: RefCell::new(IdMap::default()),
+            intl_segment_iterator_data: RefCell::new(IdMap::default()),
+            temporal_data: RefCell::new(IdMap::default()),
+            temporal_calendars: RefCell::new(IdMap::default()),
+            string_iter_data: RefCell::new(IdMap::default()),
+            regexp_string_iter_data: RefCell::new(IdMap::default()),
             host_modules: RefCell::new(std::collections::HashMap::new()),
             module_namespaces: RefCell::new(std::collections::HashMap::new()),
             deferred_namespaces: RefCell::new(std::collections::HashMap::new()),
@@ -936,6 +987,21 @@ impl Trace for AgentRoots {
         self.shadow_handlers.trace(visit);
         self.ecma_functions.trace(visit);
         self.dataview_data.trace(visit);
+        self.intl_number_format_data.trace(visit);
+        self.intl_plural_rules_data.trace(visit);
+        self.intl_date_time_format_data.trace(visit);
+        self.intl_collator_data.trace(visit);
+        self.intl_segments_data.trace(visit);
+        self.intl_segment_iterator_data.trace(visit);
+        self.temporal_data.trace(visit);
+        self.temporal_calendars.trace(visit);
+        for (value, text, _, _, _) in self.regexp_string_iter_data.borrow().values() {
+            value.trace(visit);
+            text.trace(visit);
+        }
+        for (text, _) in self.string_iter_data.borrow().values() {
+            text.trace(visit);
+        }
         self.global_symbol_registry.trace(visit);
         self.async_from_sync_continuations.trace(visit);
         self.error_stack.trace(visit);
@@ -1389,19 +1455,9 @@ pub struct Agent {
     /// The [[InitializedLocale]] records of Intl.Locale instances, keyed by
     /// object identity (ECMA-402 §15: the canonical locale string).
     pub intl_locale_data: std::collections::HashMap<u64, crate::builtins::intl::IntlLocaleRecord>,
-    /// The [[InitializedNumberFormat]] records of Intl.NumberFormat
-    /// instances, keyed by object identity (ECMA-402 §16: the resolved
-    /// options).
-    pub intl_number_format_data:
-        std::collections::HashMap<u64, crate::builtins::intl::number_format::NumberFormatRecord>,
     /// The per-instance bound `format` functions: function id → the
     /// NumberFormat instance's object id (ECMA-402 §16.5.2 [[NumberFormat]]).
     pub intl_format_functions: std::collections::HashMap<u64, u64>,
-    /// The [[InitializedPluralRules]] records of Intl.PluralRules
-    /// instances, keyed by object identity (ECMA-402 §17: the plural type
-    /// and the digit/notation options).
-    pub intl_plural_rules_data:
-        std::collections::HashMap<u64, crate::builtins::intl::plural_rules::PluralRulesRecord>,
     /// The [[InitializedRelativeTimeFormat]] records of
     /// Intl.RelativeTimeFormat instances, keyed by object identity
     /// (ECMA-402 §18: locale, style, numeric, numbering system).
@@ -1417,19 +1473,9 @@ pub struct Agent {
     /// instances, keyed by object identity (ECMA-402 §12).
     pub intl_display_names_data:
         std::collections::HashMap<u64, crate::builtins::intl::display_names::DisplayNamesRecord>,
-    /// The [[InitializedDateTimeFormat]] records of Intl.DateTimeFormat
-    /// instances, keyed by object identity (ECMA-402 §11).
-    pub intl_date_time_format_data: std::collections::HashMap<
-        u64,
-        crate::builtins::intl::date_time_format::DateTimeFormatRecord,
-    >,
     /// The per-instance bound `format` functions: function id → the
     /// DateTimeFormat instance's object id (ECMA-402 §11.3.3).
     pub intl_dtf_format_functions: std::collections::HashMap<u64, u64>,
-    /// The [[InitializedCollator]] records of Intl.Collator instances,
-    /// keyed by object identity (ECMA-402 §10).
-    pub intl_collator_data:
-        std::collections::HashMap<u64, crate::builtins::intl::collator::CollatorRecord>,
     /// The per-instance bound `compare` functions: function id → the
     /// Collator instance's object id (ECMA-402 §10.3.3).
     pub intl_collator_compare_functions: std::collections::HashMap<u64, u64>,
@@ -1437,15 +1483,6 @@ pub struct Agent {
     /// keyed by object identity (ECMA-402 §19: locale, granularity).
     pub intl_segmenter_data:
         std::collections::HashMap<u64, crate::builtins::intl::segmenter::SegmenterRecord>,
-    /// The [[SegmentsSegmenter]]/[[SegmentsString]] slots of Intl.Segmenter
-    /// `segment()` results (ECMA-402 §19.5).
-    pub intl_segments_data:
-        std::collections::HashMap<u64, crate::builtins::intl::segmenter::SegmentsRecord>,
-    /// The [[IteratingSegmenter]]/[[IteratedString]]/
-    /// [[IteratedStringNextSegmentCodeUnitIndex]] slots of segment
-    /// iterators (ECMA-402 §19.6).
-    pub intl_segment_iterator_data:
-        std::collections::HashMap<u64, crate::builtins::intl::segmenter::SegmentIteratorRecord>,
     /// The [[InitializedDurationFormat]] records of Intl.DurationFormat
     /// instances, keyed by object identity (ECMA-402 §13: locale,
     /// numberingSystem, style, the per-unit options, fractionalDigits).
@@ -1453,25 +1490,12 @@ pub struct Agent {
         u64,
         crate::builtins::intl::duration_format::DurationFormatRecord,
     >,
-    /// The [[InitializedTemporal*]] records of Temporal instances, keyed by
-    /// object identity (the proposal-temporal internal slots).
-    pub temporal_data: std::collections::HashMap<u64, crate::builtins::temporal::TemporalRecord>,
-    /// The [[Calendar]] internal slot of Temporal instances, keyed by object
-    /// identity (the proposal-temporal calendar field; default "iso8601").
-    pub temporal_calendars: std::collections::HashMap<u64, crux::string::JsString>,
     /// Compiled regexp programs, keyed by source then flags. A `RegExp`
     /// literal creates a fresh object on every evaluation (spec 13.2.8), but
     /// its program is immutable and identical each time, so the compiled form
     /// is shared (see `compile_regexp`).
     pub(crate) compiled_regexps:
         std::collections::HashMap<Vec<u16>, Vec<(regexp::Flags, std::rc::Rc<regexp::Regex>)>>,
-    /// [[IteratingRegExp]], [[IteratedString]], [[Global]], [[Unicode]], and
-    /// [[Done]] of RegExp String iterators (spec 22.2.6).
-    pub regexp_string_iter_data:
-        std::collections::HashMap<u64, (Value, crux::string::JsString, bool, bool, bool)>,
-    /// [[IteratedString]] and [[StringIteratorNextIndex]] of String iterators,
-    /// keyed by object identity (spec 22.1.5: the iterator's internal slots).
-    pub string_iter_data: std::collections::HashMap<u64, (Option<crux::string::JsString>, u64)>,
     /// [[ErrorData]] markers of Error instances, keyed by object identity
     /// (spec 20.5.4: `Error.isError` and the `[object Error]` tag need it).
     pub error_data: std::collections::HashSet<u64>,
@@ -1879,25 +1903,15 @@ impl Agent {
             number_data: std::collections::HashMap::new(),
             date_data: std::collections::HashMap::default(),
             intl_locale_data: std::collections::HashMap::new(),
-            intl_number_format_data: std::collections::HashMap::new(),
             intl_format_functions: std::collections::HashMap::new(),
-            intl_plural_rules_data: std::collections::HashMap::new(),
             intl_rtf_data: std::collections::HashMap::new(),
             intl_list_format_data: std::collections::HashMap::new(),
             intl_display_names_data: std::collections::HashMap::new(),
-            intl_date_time_format_data: std::collections::HashMap::new(),
             intl_dtf_format_functions: std::collections::HashMap::new(),
-            intl_collator_data: std::collections::HashMap::new(),
             intl_collator_compare_functions: std::collections::HashMap::new(),
             intl_segmenter_data: std::collections::HashMap::new(),
-            intl_segments_data: std::collections::HashMap::new(),
-            intl_segment_iterator_data: std::collections::HashMap::new(),
             intl_duration_format_data: std::collections::HashMap::new(),
-            temporal_data: std::collections::HashMap::new(),
-            temporal_calendars: std::collections::HashMap::new(),
             compiled_regexps: std::collections::HashMap::new(),
-            regexp_string_iter_data: std::collections::HashMap::new(),
-            string_iter_data: std::collections::HashMap::new(),
             error_data: std::collections::HashSet::new(),
             stack_traces: std::cell::RefCell::new(std::collections::HashMap::new()),
             #[cfg(feature = "wasm")]
@@ -2135,6 +2149,15 @@ impl Agent {
     /// same borrow.
     pub fn symbol_registry(&self) -> std::cell::RefMut<'_, Vec<(JsString, crux::symbol::Symbol)>> {
         self.roots.global_symbol_registry.borrow_mut()
+    }
+
+    /// The Temporal record of `id`, when the object is a Temporal instance.
+    /// A copy: the record is a small enum, and every reader wants it owned.
+    pub(crate) fn temporal_record(
+        &self,
+        id: u64,
+    ) -> Option<crate::builtins::temporal::TemporalRecord> {
+        self.roots.temporal_data.borrow().get(&id).cloned()
     }
 
     /// The rendered stack of `id`, when it is an Error whose stack the engine
@@ -3021,21 +3044,6 @@ impl Agent {
             for value in self.wasm_extern_values.values() {
                 value.trace(visit);
             }
-        }
-        self.intl_number_format_data.trace(visit);
-        self.intl_plural_rules_data.trace(visit);
-        self.intl_date_time_format_data.trace(visit);
-        self.intl_collator_data.trace(visit);
-        self.intl_segments_data.trace(visit);
-        self.intl_segment_iterator_data.trace(visit);
-        self.temporal_data.trace(visit);
-        self.temporal_calendars.trace(visit);
-        for (value, text, _, _, _) in self.regexp_string_iter_data.values() {
-            value.trace(visit);
-            text.trace(visit);
-        }
-        for (text, _) in self.string_iter_data.values() {
-            text.trace(visit);
         }
         // GC-2: the Vms currently running bodies (their heap-buffered value
         // stacks are invisible to the conservative stack scan). Pooled and

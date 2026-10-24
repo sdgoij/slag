@@ -2213,7 +2213,8 @@ pub fn to_plain_date_with_options(
     options: &Value,
 ) -> Result<Value, JsError> {
     if let ValueKind::Object(obj) = item.kind() {
-        if let Some(record) = agent.temporal_data.get(&obj.id()).cloned() {
+        let record = agent.roots.temporal_data.borrow().get(&obj.id()).cloned();
+        if let Some(record) = record {
             let calendar = super::temporal_calendar_id(agent, item);
             return match &record {
                 TemporalRecord::PlainDate(d) => {
@@ -2316,7 +2317,8 @@ pub fn to_plain_time_with_options(
     options: &Value,
 ) -> Result<Value, JsError> {
     if let ValueKind::Object(obj) = item.kind() {
-        if let Some(record) = agent.temporal_data.get(&obj.id()).cloned() {
+        let record = agent.roots.temporal_data.borrow().get(&obj.id()).cloned();
+        if let Some(record) = record {
             let opts = super::get_options_object(options)?;
             super::get_temporal_overflow_option(agent, &opts)?;
             return match &record {
@@ -2397,9 +2399,13 @@ pub fn to_plain_date_time(
     item: &Value,
     options: &Value,
 ) -> Result<Value, JsError> {
-    if let ValueKind::Object(obj) = item.kind()
-        && let Some(record) = agent.temporal_data.get(&obj.id()).cloned()
-    {
+    // The record is copied out first: the body below allocates, and the
+    // table's guard must not be live for that.
+    let record = match item.kind() {
+        ValueKind::Object(obj) => agent.temporal_record(obj.id()),
+        _ => None,
+    };
+    if let Some(record) = record {
         let opts = super::get_options_object(options)?;
         super::get_temporal_overflow_option(agent, &opts)?;
         let calendar = super::temporal_calendar_id(agent, item);
@@ -2843,8 +2849,7 @@ pub(super) fn offset_string_has_seconds(text: &str) -> bool {
 /// zones are supported.
 pub fn to_zoned(agent: &mut Agent, item: &Value, options: &Value) -> Result<Value, JsError> {
     if let ValueKind::Object(obj) = item.kind()
-        && let Some(TemporalRecord::ZonedDateTime(ns, tz)) =
-            agent.temporal_data.get(&obj.id()).cloned()
+        && let Some(TemporalRecord::ZonedDateTime(ns, tz)) = agent.temporal_record(obj.id())
     {
         let opts = super::get_options_object(options)?;
         let _ = super::get_temporal_disambiguation_option(agent, &opts)?;
@@ -3093,11 +3098,13 @@ fn to_compare_value(
             let value = to_plain_date(agent, &item)?;
             let cal = super::temporal_calendar_id(agent, &value);
             let record = match value.kind() {
-                ValueKind::Object(obj) => {
-                    agent.temporal_data.get(&obj.id()).cloned().ok_or_else(|| {
-                        JsError::new(ErrorKind::TypeError, "brand check failed".into())
-                    })
-                }
+                ValueKind::Object(obj) => agent
+                    .roots
+                    .temporal_data
+                    .borrow()
+                    .get(&obj.id())
+                    .cloned()
+                    .ok_or_else(|| JsError::new(ErrorKind::TypeError, "brand check failed".into())),
                 _ => unreachable!(),
             }?;
             Ok((record, cal))
@@ -3106,11 +3113,13 @@ fn to_compare_value(
             let value = to_plain_time(agent, &item)?;
             let cal = super::temporal_calendar_id(agent, &value);
             let record = match value.kind() {
-                ValueKind::Object(obj) => {
-                    agent.temporal_data.get(&obj.id()).cloned().ok_or_else(|| {
-                        JsError::new(ErrorKind::TypeError, "brand check failed".into())
-                    })
-                }
+                ValueKind::Object(obj) => agent
+                    .roots
+                    .temporal_data
+                    .borrow()
+                    .get(&obj.id())
+                    .cloned()
+                    .ok_or_else(|| JsError::new(ErrorKind::TypeError, "brand check failed".into())),
                 _ => unreachable!(),
             }?;
             Ok((record, cal))
@@ -3119,11 +3128,13 @@ fn to_compare_value(
             let value = to_plain_date_time(agent, &item, &Value::Undefined)?;
             let cal = super::temporal_calendar_id(agent, &value);
             let record = match value.kind() {
-                ValueKind::Object(obj) => {
-                    agent.temporal_data.get(&obj.id()).cloned().ok_or_else(|| {
-                        JsError::new(ErrorKind::TypeError, "brand check failed".into())
-                    })
-                }
+                ValueKind::Object(obj) => agent
+                    .roots
+                    .temporal_data
+                    .borrow()
+                    .get(&obj.id())
+                    .cloned()
+                    .ok_or_else(|| JsError::new(ErrorKind::TypeError, "brand check failed".into())),
                 _ => unreachable!(),
             }?;
             Ok((record, cal))
@@ -3132,11 +3143,13 @@ fn to_compare_value(
             let value = to_plain_year_month(agent, &item, &Value::Undefined)?;
             let cal = super::temporal_calendar_id(agent, &value);
             let record = match value.kind() {
-                ValueKind::Object(obj) => {
-                    agent.temporal_data.get(&obj.id()).cloned().ok_or_else(|| {
-                        JsError::new(ErrorKind::TypeError, "brand check failed".into())
-                    })
-                }
+                ValueKind::Object(obj) => agent
+                    .roots
+                    .temporal_data
+                    .borrow()
+                    .get(&obj.id())
+                    .cloned()
+                    .ok_or_else(|| JsError::new(ErrorKind::TypeError, "brand check failed".into())),
                 _ => unreachable!(),
             }?;
             Ok((record, cal))
@@ -3145,11 +3158,13 @@ fn to_compare_value(
             let value = to_plain_month_day(agent, &item, &Value::Undefined)?;
             let cal = super::temporal_calendar_id(agent, &value);
             let record = match value.kind() {
-                ValueKind::Object(obj) => {
-                    agent.temporal_data.get(&obj.id()).cloned().ok_or_else(|| {
-                        JsError::new(ErrorKind::TypeError, "brand check failed".into())
-                    })
-                }
+                ValueKind::Object(obj) => agent
+                    .roots
+                    .temporal_data
+                    .borrow()
+                    .get(&obj.id())
+                    .cloned()
+                    .ok_or_else(|| JsError::new(ErrorKind::TypeError, "brand check failed".into())),
                 _ => unreachable!(),
             }?;
             Ok((record, cal))
@@ -3158,11 +3173,13 @@ fn to_compare_value(
             let value = to_zoned(agent, &item, &Value::Undefined)?;
             let cal = super::temporal_calendar_id(agent, &value);
             let record = match value.kind() {
-                ValueKind::Object(obj) => {
-                    agent.temporal_data.get(&obj.id()).cloned().ok_or_else(|| {
-                        JsError::new(ErrorKind::TypeError, "brand check failed".into())
-                    })
-                }
+                ValueKind::Object(obj) => agent
+                    .roots
+                    .temporal_data
+                    .borrow()
+                    .get(&obj.id())
+                    .cloned()
+                    .ok_or_else(|| JsError::new(ErrorKind::TypeError, "brand check failed".into())),
                 _ => unreachable!(),
             }?;
             Ok((record, cal))
@@ -4929,7 +4946,7 @@ fn to_temporal_calendar_identifier(
     value: &Value,
 ) -> Result<Option<String>, JsError> {
     if let ValueKind::Object(obj) = value.kind()
-        && let Some(record) = agent.temporal_data.get(&obj.id())
+        && let Some(record) = agent.roots.temporal_data.borrow().get(&obj.id())
     {
         return match record {
             TemporalRecord::Instant(_) | TemporalRecord::Duration(_) => Err(JsError::new(
@@ -5318,7 +5335,7 @@ fn prepare_partial_date_fields(
 /// not a Temporal object.
 fn reject_temporal_like_object(agent: &mut Agent, item: &Value) -> Result<(), JsError> {
     if let ValueKind::Object(obj) = item.kind() {
-        if agent.temporal_data.contains_key(&obj.id()) {
+        if agent.roots.temporal_data.borrow().contains_key(&obj.id()) {
             return Err(JsError::new(
                 ErrorKind::TypeError,
                 "with() does not support a calendar or timeZone property".into(),
@@ -7087,9 +7104,13 @@ pub fn to_plain_year_month(
     item: &Value,
     options: &Value,
 ) -> Result<Value, JsError> {
-    if let ValueKind::Object(obj) = item.kind()
-        && let Some(record) = agent.temporal_data.get(&obj.id()).cloned()
-    {
+    // The record is copied out first: the body below allocates, and the
+    // table's guard must not be live for that.
+    let record = match item.kind() {
+        ValueKind::Object(obj) => agent.temporal_record(obj.id()),
+        _ => None,
+    };
+    if let Some(record) = record {
         let opts = super::get_options_object(options)?;
         super::get_temporal_overflow_option(agent, &opts)?;
         let calendar = super::temporal_calendar_id(agent, item);
@@ -7253,9 +7274,13 @@ pub fn to_plain_month_day(
     item: &Value,
     options: &Value,
 ) -> Result<Value, JsError> {
-    if let ValueKind::Object(obj) = item.kind()
-        && let Some(record) = agent.temporal_data.get(&obj.id()).cloned()
-    {
+    // The record is copied out first: the body below allocates, and the
+    // table's guard must not be live for that.
+    let record = match item.kind() {
+        ValueKind::Object(obj) => agent.temporal_record(obj.id()),
+        _ => None,
+    };
+    if let Some(record) = record {
         let opts = super::get_options_object(options)?;
         let constrain = super::get_temporal_overflow_option(agent, &opts)? == Overflow::Constrain;
         let calendar = super::temporal_calendar_id(agent, item);

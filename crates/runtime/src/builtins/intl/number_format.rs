@@ -2384,7 +2384,9 @@ fn number_format_record(agent: &Agent, this: &Value) -> Result<NumberFormatRecor
         ));
     };
     agent
+        .roots
         .intl_number_format_data
+        .borrow()
         .get(&obj.id())
         .cloned()
         .ok_or_else(|| type_error("Intl.NumberFormat method called on an uninitialized object"))
@@ -2424,7 +2426,11 @@ fn unwrap_number_format(agent: &mut Agent, nf: &Value) -> Result<Value, JsError>
             "Intl.NumberFormat method called on a non-object",
         ));
     };
-    if !agent.intl_number_format_data.contains_key(&obj.id())
+    if !agent
+        .roots
+        .intl_number_format_data
+        .borrow()
+        .contains_key(&obj.id())
         && ordinary_has_instance_number_format(agent, nf)
     {
         let key = PropertyKey::Symbol(fallback_symbol(agent)?);
@@ -2635,7 +2641,11 @@ fn create_instance(
             .ok_or_else(|| type_error("%Intl.NumberFormat.prototype% missing"))?,
     };
     let instance = JsObject::ordinary_object_create(Some(proto));
-    agent.intl_number_format_data.insert(instance.id(), record);
+    agent
+        .roots
+        .intl_number_format_data
+        .borrow_mut()
+        .insert(instance.id(), record);
     Ok(Value::Object(instance))
 }
 
@@ -2671,7 +2681,11 @@ fn construct_inner(
     let record = initialize(agent, &locales, &options)?;
     // ChainNumberFormat (ECMA-402 §16.1.1.1): the legacy constructor mode.
     if new_target_was_undefined && let Some(this_obj) = as_object(this) {
-        let is_instance = agent.intl_number_format_data.contains_key(&this_obj.id())
+        let is_instance = agent
+            .roots
+            .intl_number_format_data
+            .borrow()
+            .contains_key(&this_obj.id())
             || ordinary_has_instance_number_format(agent, this);
         if is_instance {
             let inner = create_instance(agent, Some(&proto), record)?;
@@ -2788,14 +2802,20 @@ fn format_getter(agent: &mut Agent, this: &Value) -> Result<Value, JsError> {
     agent.intl_format_functions.insert(func.id(), nf_id);
     let bound = Value::Function(func);
     record.bound_format = Some(bound);
-    agent.intl_number_format_data.insert(nf_id, record);
+    agent
+        .roots
+        .intl_number_format_data
+        .borrow_mut()
+        .insert(nf_id, record);
     Ok(bound)
 }
 
 /// The bound format function body: format the argument.
 fn format_bound(agent: &mut Agent, nf_id: u64, args: &[Value]) -> Result<Value, JsError> {
     let record = agent
+        .roots
         .intl_number_format_data
+        .borrow()
         .get(&nf_id)
         .cloned()
         .ok_or_else(|| type_error("Intl.NumberFormat method called on an incompatible receiver"))?;

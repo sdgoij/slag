@@ -197,7 +197,11 @@ pub fn create_temporal_object(
             JsObject::ordinary_object_create(Some(fallback))
         }
     };
-    agent.temporal_data.insert(object.id(), record);
+    agent
+        .roots
+        .temporal_data
+        .borrow_mut()
+        .insert(object.id(), record);
     Ok(Value::Object(object))
 }
 
@@ -260,12 +264,16 @@ pub fn set_temporal_calendar(agent: &mut Agent, value: &Value, calendar: Option<
         match calendar {
             Some(calendar) => {
                 agent
+                    .roots
                     .temporal_calendars
+                    .borrow_mut()
                     .insert(obj.id(), JsString::from_utf8(calendar));
             }
             None => {
                 agent
+                    .roots
                     .temporal_calendars
+                    .borrow_mut()
                     .insert(obj.id(), JsString::from_utf8("iso8601"));
             }
         }
@@ -275,7 +283,7 @@ pub fn set_temporal_calendar(agent: &mut Agent, value: &Value, calendar: Option<
 /// The [[Calendar]] of a Temporal instance (default "iso8601").
 pub fn temporal_calendar_id(agent: &Agent, this: &Value) -> JsString {
     if let ValueKind::Object(obj) = this.kind()
-        && let Some(calendar) = agent.temporal_calendars.get(&obj.id())
+        && let Some(calendar) = agent.roots.temporal_calendars.borrow().get(&obj.id())
     {
         return calendar.clone();
     }
@@ -291,13 +299,13 @@ pub fn require_record(
     let ValueKind::Object(obj) = this.kind() else {
         return Err(temporal_type_error(kind));
     };
-    let Some(record) = agent.temporal_data.get(&obj.id()) else {
+    let Some(record) = agent.temporal_record(obj.id()) else {
         return Err(temporal_type_error(kind));
     };
-    if record_kind(record) != kind {
+    if record_kind(&record) != kind {
         return Err(temporal_type_error(kind));
     }
-    Ok(record.clone())
+    Ok(record)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1113,7 +1121,8 @@ pub fn add_durations(
 /// spec 7.5.12 ToTemporalDuration.
 pub fn to_temporal_duration(agent: &mut Agent, item: &Value) -> Result<[f64; 10], JsError> {
     if let ValueKind::Object(obj) = item.kind()
-        && let Some(TemporalRecord::Duration(fields)) = agent.temporal_data.get(&obj.id())
+        && let Some(TemporalRecord::Duration(fields)) =
+            agent.roots.temporal_data.borrow().get(&obj.id())
     {
         return Ok(*fields);
     }
@@ -1265,7 +1274,7 @@ pub fn get_temporal_relative_to(agent: &mut Agent, options: &Value) -> Result<Re
         return Ok(RelativeTo::None);
     }
     if let ValueKind::Object(obj) = value.kind() {
-        if let Some(record) = agent.temporal_data.get(&obj.id()) {
+        if let Some(record) = agent.roots.temporal_data.borrow().get(&obj.id()) {
             return match record {
                 TemporalRecord::ZonedDateTime(ns, tz) => {
                     Ok(RelativeTo::Zoned(*ns, tz.to_string_lossy()))
@@ -1302,7 +1311,7 @@ fn relative_to_object(agent: &mut Agent, item: &Value) -> Result<RelativeTo, JsE
         crate::context::get_property(agent, item, &JsString::from_utf8("calendar"), *item)?;
     if !matches!(calendar.kind(), ValueKind::Undefined) {
         if let ValueKind::Object(obj) = calendar.kind()
-            && agent.temporal_data.contains_key(&obj.id())
+            && agent.roots.temporal_data.borrow().contains_key(&obj.id())
         {
             // A Temporal object's own calendar (validated elsewhere).
         } else if let ValueKind::String(text) = calendar.kind() {

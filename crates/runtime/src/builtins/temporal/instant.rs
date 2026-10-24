@@ -347,7 +347,7 @@ fn cmp(a: i128, b: i128) -> i64 {
 pub fn to_temporal_instant(agent: &mut Agent, item: &Value) -> Result<i128, JsError> {
     if matches!(item.kind(), ValueKind::Object(_) | ValueKind::Function(_)) {
         if let ValueKind::Object(obj) = item.kind()
-            && let Some(record) = agent.temporal_data.get(&obj.id())
+            && let Some(record) = agent.roots.temporal_data.borrow().get(&obj.id())
         {
             match record {
                 TemporalRecord::Instant(ns) => return Ok(*ns),
@@ -753,7 +753,8 @@ pub fn to_temporal_time_zone_identifier(
     value: &Value,
 ) -> Result<String, JsError> {
     if let ValueKind::Object(obj) = value.kind()
-        && let Some(TemporalRecord::ZonedDateTime(_, tz)) = agent.temporal_data.get(&obj.id())
+        && let Some(TemporalRecord::ZonedDateTime(_, tz)) =
+            agent.roots.temporal_data.borrow().get(&obj.id())
     {
         return Ok(tz.to_string_lossy());
     }

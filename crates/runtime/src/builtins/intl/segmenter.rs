@@ -435,7 +435,7 @@ fn create_segments_object(
     let segmenter_id = as_object(segmenter)
         .ok_or_else(|| type_error("Not a Segmenter instance"))?
         .id();
-    agent.intl_segments_data.insert(
+    agent.roots.intl_segments_data.borrow_mut().insert(
         object.id(),
         SegmentsRecord {
             segmenter_id,
@@ -451,7 +451,9 @@ fn require_segments(agent: &Agent, this: &Value) -> Result<SegmentsRecord, JsErr
         return Err(type_error("Not a Segments object"));
     };
     agent
+        .roots
         .intl_segments_data
+        .borrow()
         .get(&obj.id())
         .cloned()
         .ok_or_else(|| type_error("Not a Segments object"))
@@ -495,7 +497,7 @@ fn create_segment_iterator(
         .get(SEGMENT_ITERATOR_PROTO)
         .and_then(|value| as_object(&value));
     let object = JsObject::ordinary_object_create(proto);
-    agent.intl_segment_iterator_data.insert(
+    agent.roots.intl_segment_iterator_data.borrow_mut().insert(
         object.id(),
         SegmentIteratorRecord {
             segmenter_id,
@@ -516,7 +518,9 @@ fn segment_iterator_next(
         return Err(type_error("Not a Segment Iterator"));
     };
     let mut record = agent
+        .roots
         .intl_segment_iterator_data
+        .borrow()
         .get(&obj.id())
         .cloned()
         .ok_or_else(|| type_error("Not a Segment Iterator"))?;
@@ -530,7 +534,11 @@ fn segment_iterator_next(
     let boundaries = segment_boundaries(&segmenter_record, &string);
     let end_index = find_boundary(&boundaries, start_index, false);
     record.next_index = end_index as u64;
-    agent.intl_segment_iterator_data.insert(obj.id(), record);
+    agent
+        .roots
+        .intl_segment_iterator_data
+        .borrow_mut()
+        .insert(obj.id(), record);
     let segment_data =
         create_segment_data_object(agent, &segmenter_record, &string, start_index, end_index)?;
     iterator_result(segment_data, false)

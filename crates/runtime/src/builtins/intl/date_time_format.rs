@@ -1512,7 +1512,7 @@ pub(crate) fn handle_datetime_value(
     let ValueKind::Object(obj) = value.kind() else {
         return Ok(None);
     };
-    let Some(record) = agent.temporal_data.get(&obj.id()).cloned() else {
+    let Some(record) = agent.roots.temporal_data.borrow().get(&obj.id()).cloned() else {
         return Ok(None);
     };
     let calendar = crate::builtins::temporal::temporal_calendar_id(agent, value).to_string_lossy();
@@ -2354,7 +2354,9 @@ fn date_time_format_record(agent: &Agent, this: &Value) -> Result<DateTimeFormat
         return Err(type_error("Not a DateTimeFormat instance"));
     };
     agent
+        .roots
         .intl_date_time_format_data
+        .borrow()
         .get(&obj.id())
         .cloned()
         .ok_or_else(|| type_error("Not a DateTimeFormat instance"))
@@ -2369,7 +2371,12 @@ fn fallback_symbol(agent: &Agent) -> Result<crux::handle::Handle<crux::symbol::S
 /// The dateTimeFormat record after the legacy-constructor unwrap.
 fn unwrap_date_time_format(agent: &mut Agent, this: &Value) -> Result<Value, JsError> {
     if let Some(obj) = as_object(this) {
-        if agent.intl_date_time_format_data.contains_key(&obj.id()) {
+        if agent
+            .roots
+            .intl_date_time_format_data
+            .borrow()
+            .contains_key(&obj.id())
+        {
             return Ok(*this);
         }
         if let Ok(inner) = crate::context::get_property_key(
@@ -2411,7 +2418,9 @@ fn create_instance(
 ) -> Result<Value, JsError> {
     let instance = JsObject::ordinary_object_create(Some(proto));
     agent
+        .roots
         .intl_date_time_format_data
+        .borrow_mut()
         .insert(instance.id(), record);
     Ok(Value::Object(instance))
 }
@@ -2444,14 +2453,20 @@ fn format_getter(agent: &mut Agent, this: &Value) -> Result<Value, JsError> {
     agent.intl_dtf_format_functions.insert(func.id(), dtf_id);
     let bound = Value::Function(func);
     record.bound_format = Some(bound);
-    agent.intl_date_time_format_data.insert(dtf_id, record);
+    agent
+        .roots
+        .intl_date_time_format_data
+        .borrow_mut()
+        .insert(dtf_id, record);
     Ok(bound)
 }
 
 /// The bound format function body: format the argument.
 fn format_bound(agent: &mut Agent, dtf_id: u64, args: &[Value]) -> Result<Value, JsError> {
     let record = agent
+        .roots
         .intl_date_time_format_data
+        .borrow()
         .get(&dtf_id)
         .cloned()
         .ok_or_else(|| type_error("Not a DateTimeFormat instance"))?;
@@ -2500,7 +2515,7 @@ fn range_value_tag(agent: &mut Agent, value: &Value) -> Result<String, JsError> 
     let ValueKind::Object(obj) = value.kind() else {
         return Ok("number".to_string());
     };
-    let Some(record) = agent.temporal_data.get(&obj.id()).cloned() else {
+    let Some(record) = agent.roots.temporal_data.borrow().get(&obj.id()).cloned() else {
         return Ok("number".to_string());
     };
     Ok(match record {
@@ -2525,7 +2540,7 @@ fn range_value_tag(agent: &mut Agent, value: &Value) -> Result<String, JsError> 
 /// conversions (and any observable valueOf) run in spec order.
 fn to_datetime_formattable(agent: &mut Agent, value: &Value) -> Result<Value, JsError> {
     if let ValueKind::Object(obj) = value.kind()
-        && let Some(record) = agent.temporal_data.get(&obj.id())
+        && let Some(record) = agent.roots.temporal_data.borrow().get(&obj.id())
         && !matches!(record, TemporalRecord::Duration(_))
     {
         return Ok(*value);
@@ -3239,7 +3254,7 @@ pub(crate) fn plain_to_locale_string(
     // and month-day paths would otherwise reach the calendar-mismatch
     // RangeError first).
     let branded = match value.kind() {
-        ValueKind::Object(obj) => agent.temporal_data.get(&obj.id()).cloned(),
+        ValueKind::Object(obj) => agent.roots.temporal_data.borrow().get(&obj.id()).cloned(),
         _ => None,
     };
     let kind_matches = matches!(

@@ -933,7 +933,7 @@ fn symbol_match_all(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<V
         .get(STRING_ITERATOR)
         .and_then(|value| as_object(&value));
     let iterator = JsObject::ordinary_object_create(proto);
-    agent.regexp_string_iter_data.insert(
+    agent.roots.regexp_string_iter_data.borrow_mut().insert(
         iterator.id(),
         (matcher, string, global, full_unicode, false),
     );
@@ -1333,7 +1333,13 @@ fn string_iterator_next(
             "%RegExpStringIteratorPrototype%.next called on an incompatible receiver".into(),
         ));
     };
-    let Some(entry) = agent.regexp_string_iter_data.get(&obj.id()).cloned() else {
+    let Some(entry) = agent
+        .roots
+        .regexp_string_iter_data
+        .borrow()
+        .get(&obj.id())
+        .cloned()
+    else {
         return Err(JsError::new(
             ErrorKind::TypeError,
             "%RegExpStringIteratorPrototype%.next called on an incompatible receiver".into(),
@@ -1343,7 +1349,13 @@ fn string_iterator_next(
     if done {
         return iter_result(Value::Undefined, true);
     }
-    if !global && let Some(e) = agent.regexp_string_iter_data.get_mut(&obj.id()) {
+    if !global
+        && let Some(e) = agent
+            .roots
+            .regexp_string_iter_data
+            .borrow_mut()
+            .get_mut(&obj.id())
+    {
         e.4 = true;
     }
     // spec 22.2.8.2 steps 8-10: RegExpExec (the custom exec method wins), and
@@ -1374,7 +1386,12 @@ fn string_iterator_next(
             iter_result(array, false)
         }
         None => {
-            if let Some(e) = agent.regexp_string_iter_data.get_mut(&obj.id()) {
+            if let Some(e) = agent
+                .roots
+                .regexp_string_iter_data
+                .borrow_mut()
+                .get_mut(&obj.id())
+            {
                 e.4 = true;
             }
             iter_result(Value::Undefined, true)

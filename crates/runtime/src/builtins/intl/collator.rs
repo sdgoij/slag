@@ -878,7 +878,9 @@ fn collator_record(agent: &Agent, this: &Value) -> Result<CollatorRecord, JsErro
         return Err(type_error("Not a Collator instance"));
     };
     agent
+        .roots
         .intl_collator_data
+        .borrow()
         .get(&obj.id())
         .cloned()
         .ok_or_else(|| type_error("Not a Collator instance"))
@@ -912,14 +914,20 @@ fn compare_getter(agent: &mut Agent, this: &Value) -> Result<Value, JsError> {
         .insert(func.id(), collator_id);
     let bound = Value::Function(func);
     record.bound_compare = Some(bound);
-    agent.intl_collator_data.insert(collator_id, record);
+    agent
+        .roots
+        .intl_collator_data
+        .borrow_mut()
+        .insert(collator_id, record);
     Ok(bound)
 }
 
 /// The bound compare function body: compare the two arguments.
 fn compare_bound(agent: &mut Agent, collator_id: u64, args: &[Value]) -> Result<Value, JsError> {
     let record = agent
+        .roots
         .intl_collator_data
+        .borrow()
         .get(&collator_id)
         .cloned()
         .ok_or_else(|| type_error("Not a Collator instance"))?;
@@ -1102,7 +1110,11 @@ fn create_instance(
     record: CollatorRecord,
 ) -> Result<Value, JsError> {
     let instance = JsObject::ordinary_object_create(Some(proto));
-    agent.intl_collator_data.insert(instance.id(), record);
+    agent
+        .roots
+        .intl_collator_data
+        .borrow_mut()
+        .insert(instance.id(), record);
     Ok(Value::Object(instance))
 }
 
@@ -1111,7 +1123,12 @@ fn unwrap_collator(agent: &mut Agent, value: &Value) -> Result<Value, JsError> {
     let Some(obj) = as_object(value) else {
         return Err(type_error("Not a Collator instance"));
     };
-    if agent.intl_collator_data.contains_key(&obj.id()) {
+    if agent
+        .roots
+        .intl_collator_data
+        .borrow()
+        .contains_key(&obj.id())
+    {
         return Ok(*value);
     }
     Err(type_error("Not a Collator instance"))

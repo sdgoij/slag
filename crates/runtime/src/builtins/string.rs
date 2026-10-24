@@ -1420,7 +1420,11 @@ fn string_iterator(agent: &mut Agent, this: &Value, _args: &[Value]) -> Result<V
         .get(STRING_ITERATOR)
         .and_then(|value| as_object(&value));
     let object = JsObject::ordinary_object_create(proto);
-    agent.string_iter_data.insert(object.id(), (Some(s), 0));
+    agent
+        .roots
+        .string_iter_data
+        .borrow_mut()
+        .insert(object.id(), (Some(s), 0));
     Ok(Value::Object(object))
 }
 
@@ -1436,24 +1440,41 @@ fn string_iterator_next(
             "%StringIteratorPrototype%.next called on an incompatible receiver".into(),
         ));
     };
-    let Some((string, next_index)) = agent.string_iter_data.get_mut(&obj.id()) else {
+    // The record is copied out and written back: the result object below
+    // allocates, and a guard over the table must not be live for that.
+    let Some((mut string, mut next_index)) = agent
+        .roots
+        .string_iter_data
+        .borrow()
+        .get(&obj.id())
+        .cloned()
+    else {
         return Err(JsError::new(
             ErrorKind::TypeError,
             "%StringIteratorPrototype%.next called on an incompatible receiver".into(),
         ));
     };
-    let Some(s) = string else {
+    let Some(s) = string.take() else {
         return iter_result(Value::Undefined, true);
     };
     let len = s.len();
-    if *next_index >= len as u64 {
-        *string = None;
+    if next_index >= len as u64 {
+        agent
+            .roots
+            .string_iter_data
+            .borrow_mut()
+            .insert(obj.id(), (None, next_index));
         return iter_result(Value::Undefined, true);
     }
-    let position = *next_index as usize;
+    let position = next_index as usize;
     let (_, _, count) = s.code_point_at(position).unwrap_or((0, false, 1));
-    let result_string = substring(s, position, position + count);
-    *next_index = (position + count) as u64;
+    let result_string = substring(&s, position, position + count);
+    next_index = (position + count) as u64;
+    agent
+        .roots
+        .string_iter_data
+        .borrow_mut()
+        .insert(obj.id(), (Some(s), next_index));
     iter_result(Value::String(Handle::new(result_string)), false)
 }
 

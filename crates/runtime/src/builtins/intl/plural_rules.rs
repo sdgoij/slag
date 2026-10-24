@@ -236,7 +236,9 @@ fn plural_rules_record(agent: &Agent, this: &Value) -> Result<PluralRulesRecord,
         return Err(type_error("Not a PluralRules instance"));
     };
     agent
+        .roots
         .intl_plural_rules_data
+        .borrow()
         .get(&obj.id())
         .cloned()
         .ok_or_else(|| type_error("Not a PluralRules instance"))
@@ -358,7 +360,11 @@ fn create_instance(
     record: PluralRulesRecord,
 ) -> Result<Value, JsError> {
     let instance = JsObject::ordinary_object_create(Some(proto));
-    agent.intl_plural_rules_data.insert(instance.id(), record);
+    agent
+        .roots
+        .intl_plural_rules_data
+        .borrow_mut()
+        .insert(instance.id(), record);
     Ok(Value::Object(instance))
 }
 
