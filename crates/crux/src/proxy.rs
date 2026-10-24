@@ -27,8 +27,14 @@ use crate::string::JsString;
 use crate::value::{Value, is_constructor};
 
 /// A trap-less proxy forwards by re-entering the internal method from Rust;
-/// unlike a JS activation, that path has no `stack::enter_js` guard, so a
-/// long proxy chain would overflow the native stack.
+/// unlike a JS activation, that path passes no `stack::enter_js` guard, so a
+/// long proxy chain recurses on the native stack.
+///
+/// The bound is the host's stack probe ([`crux::stack::has_headroom`]): that is
+/// the only answer that knows what a frame costs. [`MAX_FORWARD_DEPTH`] is the
+/// fixed ceiling that applies alongside it — the whole bound in a context with
+/// no probe installed (crux's own unit tests), where nothing can report the
+/// stack, and a cheap sanity cap otherwise.
 const MAX_FORWARD_DEPTH: u32 = 1000;
 
 thread_local! {
@@ -45,7 +51,10 @@ impl Drop for ForwardGuard {
 
 fn enter_forward() -> Result<ForwardGuard, JsError> {
     let depth = FORWARD_DEPTH.with(Cell::get);
-    if depth >= MAX_FORWARD_DEPTH {
+    // `has_headroom` is the host's answer when one is installed; otherwise the
+    // count is all there is, and it is the bound the doc above describes.
+    let within_budget = crate::stack::has_headroom() && depth < MAX_FORWARD_DEPTH;
+    if !within_budget {
         return Err(JsError::new(
             ErrorKind::RangeError,
             "Maximum call stack size exceeded".into(),
@@ -772,14 +781,27 @@ mod tests {
 
     #[test]
     fn a_long_trap_less_chain_is_bounded() {
-        let mut proxy = plain_object();
-        for _ in 0..2000 {
-            proxy = proxy_of(proxy, Value::Object(plain_object()));
-        }
-        assert!(matches!(
-            proxy.get(&key("x")),
-            Err(e) if e.kind == ErrorKind::RangeError
-        ));
+        // The count is the bound here: crux's own tests install no stack probe,
+        // and 2000 nested debug frames do not fit a test thread's default
+        // 2 MiB. The chain is what the assertion is about, so give it a stack
+        // sized for the depth it walks. In the engine the runtime's probe
+        // answers instead, and "deep" means this thread's actual headroom —
+        // see the runtime's own deep-chain test.
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(|| {
+                let mut proxy = plain_object();
+                for _ in 0..2000 {
+                    proxy = proxy_of(proxy, Value::Object(plain_object()));
+                }
+                assert!(matches!(
+                    proxy.get(&key("x")),
+                    Err(e) if e.kind == ErrorKind::RangeError
+                ));
+            })
+            .expect("a test thread")
+            .join()
+            .expect("the chain is bounded before the stack runs out");
     }
 
     #[test]

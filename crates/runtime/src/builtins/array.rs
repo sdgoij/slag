@@ -1347,7 +1347,8 @@ fn find_last_index(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Va
 }
 
 /// A bound on `flat`/`flatMap` recursion. `flat(Infinity)` on a cyclic array
-/// otherwise recurses until the native stack overflows.
+/// otherwise recurses until the native stack overflows. The count is a ceiling;
+/// the stack probe is what holds, because a frame's cost is profile-dependent.
 const MAX_FLAT_DEPTH: u32 = 1000;
 
 /// FlattenIntoArray (spec 23.1.3.12.1).
@@ -1362,7 +1363,7 @@ fn flatten_into_array(
     mapper: Option<(&Value, &Value)>,
     recursion: u32,
 ) -> Result<u64, JsError> {
-    if recursion >= MAX_FLAT_DEPTH {
+    if recursion >= MAX_FLAT_DEPTH || !crux::stack::has_headroom() {
         return Err(JsError::new(
             ErrorKind::RangeError,
             "Maximum call stack size exceeded".into(),

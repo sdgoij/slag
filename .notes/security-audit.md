@@ -343,6 +343,28 @@ bound on a 1 MB main-thread stack is 96 for the paren/array path), an
 explicit-stack or depth-bounded `Drop` for the AST, and a visited/depth budget
 for proxy forwarding and `flat`.
 
+**Follow-up (fixed): the counters were not stack-bounded.** The budgets above
+were frame counts, and a count cannot bound a stack — it knows nothing about
+what a frame costs. The same counts that are safe optimized overflow an
+unoptimized build: `cargo test --workspace` (debug, 2 MiB test threads) aborted
+with `STATUS_STACK_OVERFLOW` in `crux`'s 2000-deep proxy chain, the parser's
+`'(' * 200` test, and `flat` on a cyclic array, before any counter fired. So
+none of the H-1 sites were actually crash-free in a debug build, and the parser
+could not even hold ~20 levels of legitimate nesting on a 1 MiB main thread.
+
+The bound is now the host's: `crux::stack` carries a probe (installed by
+`runtime::stack::install_probe`, which `Agent::new` and the CLI both call) and
+`has_headroom` answers from the thread's real watermark — the same reserve
+`enter_js` uses. The parser, `enter_forward`, `flat` and both JSON recursions
+consult it; each keeps its count as a ceiling. A context with no probe (the
+parser's own tests, a crate-only host) falls back to what it can measure: the
+parser records the stack it started with and refuses past a budget sized by
+profile. The headless CLI runs on a 16 MiB thread, so the guard no longer
+refuses nesting the default stack merely could not hold. `regexp`'s nested
+class parser is the one H-1 site still on a count alone; its frames are small
+enough that 190 nested classes parse on a 2 MiB debug thread and the count
+refuses before the stack does.
+
 ### H-2 — RegExp has no step budget; quantifier bounds are unbounded (reproduced)
 
 `crates/regexp/src/engine.rs:460-550,588-629`;
@@ -818,3 +840,6 @@ measurement (`--bench`, plus the corpus runs) against this commit.
   allocation or a call that may mutate the table, clone the `Rc`-boxed record out
   of a short borrow instead of binding the guard (`if let Some(x) = cell.borrow()
   .get(k)` extends it over the body).
+- A native-recursion depth budget must be paired with `crux::stack::has_headroom`;
+  a frame count cannot bound the stack, and the count that is safe optimized
+  overflows a debug build (and any small embedder thread).

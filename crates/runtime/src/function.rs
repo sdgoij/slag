@@ -66,6 +66,12 @@ pub fn ensure_ecma_hook() {
             let agent = unsafe { &mut *(agent as *mut crate::agent::Agent) };
             crate::builtins::array::array_from_values(agent, list)
         });
+        // A trap-less proxy forwards by re-entering the internal method from
+        // Rust, so it never passes a JS activation's stack guard, and the
+        // parser's recursive descent does not either; the probe is what turns
+        // nesting too deep for this thread's stack into a catchable error
+        // instead of an overflow.
+        crate::stack::install_probe();
         crux::property::install_object_proto_hook(|agent| {
             // SAFETY: the hook only runs inside a `with_agent` window, where
             // the pointer is a live `&mut Agent`.

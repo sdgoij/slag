@@ -154,7 +154,7 @@ impl<'a> JsonParser<'a> {
 
     /// Parse a JSONValue, bounding the nesting depth.
     fn parse_value(&mut self) -> Result<ParseRecord, JsError> {
-        if self.depth >= MAX_JSON_DEPTH {
+        if self.depth >= MAX_JSON_DEPTH || !crux::stack::has_headroom() {
             return Err(JsError::new(
                 ErrorKind::SyntaxError,
                 "JSON nesting is too deep".into(),
@@ -929,7 +929,7 @@ fn serialize_json_object(
     state: &mut StringifyState,
     value: &Value,
 ) -> Result<Option<JsString>, JsError> {
-    if state.depth >= MAX_JSON_DEPTH {
+    if state.depth >= MAX_JSON_DEPTH || !crux::stack::has_headroom() {
         return Err(JsError::new(
             ErrorKind::RangeError,
             "JSON nesting is too deep".into(),
@@ -1026,7 +1026,7 @@ fn serialize_json_array(
     state: &mut StringifyState,
     value: &Value,
 ) -> Result<Option<JsString>, JsError> {
-    if state.depth >= MAX_JSON_DEPTH {
+    if state.depth >= MAX_JSON_DEPTH || !crux::stack::has_headroom() {
         return Err(JsError::new(
             ErrorKind::RangeError,
             "JSON nesting is too deep".into(),

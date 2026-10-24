@@ -38,7 +38,7 @@ pub mod realm;
 mod rlx;
 pub mod script;
 pub mod snapshot;
-mod stack;
+pub mod stack;
 mod time;
 #[cfg(feature = "workers")]
 pub mod workers;

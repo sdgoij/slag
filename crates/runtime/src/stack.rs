@@ -124,6 +124,37 @@ pub(crate) fn stack_guard_limit() -> Option<usize> {
     (limit < high).then_some(limit)
 }
 
+thread_local! {
+    /// This thread's watermark, sampled once: the stack's geometry is fixed for
+    /// the thread's life and sampling it is a syscall. `0` means the platform
+    /// could not report it, so the guard is off.
+    static THREAD_GUARD_LIMIT: std::cell::OnceCell<usize> =
+        const { std::cell::OnceCell::new() };
+}
+
+/// This thread's watermark, for the paths that reach the guard without an agent
+/// (the Rust-level recursion in [`crux::proxy`]).
+fn thread_guard_limit() -> usize {
+    THREAD_GUARD_LIMIT.with(|cell| *cell.get_or_init(|| stack_guard_limit().unwrap_or(0)))
+}
+
+pub fn install_probe() {
+    crux::stack::install_probe(has_headroom);
+}
+
+/// Whether a Rust-level recursion step still has native stack: the probe crux
+/// consults ([`crux::stack`]), because the paths that recurse off the JS
+/// activation path — trap-less proxy forwarding, the parser's descent — never
+/// pass [`enter_js`].
+///
+/// Kept out of line for the same reason as [`enter_js`]: the probe must measure
+/// a frame of its own rather than be folded into the caller's frame.
+#[inline(never)]
+pub(crate) fn has_headroom() -> bool {
+    let limit = thread_guard_limit();
+    limit == 0 || current_sp() >= limit
+}
+
 /// The per-activation-entry check: refuse to start a new JS activation when
 /// the native stack has descended to within [`STACK_GUARD_RESERVE`] of the
 /// thread's reserved bottom, surfacing a catchable `RangeError` instead of

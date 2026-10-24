@@ -17,6 +17,7 @@ pub mod ops;
 pub mod property;
 pub mod proxy;
 pub mod span;
+pub mod stack;
 pub mod string;
 pub mod symbol;
 pub mod typed_array;

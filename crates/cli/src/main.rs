@@ -27,6 +27,12 @@ use runtime::embed::{Context, JsValue};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
+/// The stack the headless runner's thread gets. A debug build's parser frame is
+/// tens of kilobytes, and a JS engine's own recursion adds more, so the main
+/// thread's default (1 MiB on Windows) is smaller than any real source needs.
+#[cfg(not(feature = "raylib"))]
+const RUNNER_STACK: usize = 16 * 1024 * 1024;
+
 /// CLI knobs. The performance flags are accepted for CLI compatibility; the
 /// GC knobs (`--gc-stress` is live since GC-1 slice 3; `--max-old-space` is
 /// still a no-op) are documented in `.notes/gc-plan.md`.
@@ -158,11 +164,42 @@ fn parse(args: &[String]) -> Command {
 }
 
 fn main() -> ExitCode {
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    match run(parse(&args)) {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(code) => ExitCode::from(code),
+    // The guards bound recursion against the real stack (`runtime::stack`), so a
+    // bigger stack also stops them refusing work that only the default stack
+    // could not hold.
+    #[cfg(not(feature = "raylib"))]
+    {
+        let runner = std::thread::Builder::new()
+            .stack_size(RUNNER_STACK)
+            .spawn(execute)
+            .expect("the runner thread");
+        match runner.join() {
+            Ok(result) => match result {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(code) => ExitCode::from(code),
+            },
+            // The runner panicked; its message is already on stderr.
+            Err(_) => ExitCode::FAILURE,
+        }
     }
+    // A windowing host must create its window on the main thread, so the raylib
+    // build stays where it is.
+    #[cfg(feature = "raylib")]
+    {
+        match execute() {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(code) => ExitCode::from(code),
+        }
+    }
+}
+
+fn execute() -> Result<(), u8> {
+    // The parser bounds its recursion against the real stack, and a run that
+    // never makes an agent (`--dump-ast`) has no other chance to install the
+    // probe.
+    runtime::stack::install_probe();
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    run(parse(&args))
 }
 
 fn run(command: Command) -> Result<(), u8> {

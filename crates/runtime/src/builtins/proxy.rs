@@ -288,6 +288,24 @@ mod tests {
         assert!(run("Proxy({}, {})").is_err());
     }
 
+    /// A trap-less proxy chain forwards by re-entering the internal method from
+    /// Rust, so no JS activation's stack guard is passed on the way down. The
+    /// chain has to surface as a catchable `RangeError` rather than overflowing
+    /// the native stack — the count-based bound alone could not promise that,
+    /// because it knows nothing about what a frame costs.
+    #[test]
+    fn a_deep_trap_less_chain_throws_instead_of_overflowing_the_stack() {
+        // 4000 levels is far past what this (2 MiB) test thread's stack holds in
+        // a debug build; the run would abort the process without the probe.
+        assert_eq!(
+            run("let p = {}; \
+                 for (let i = 0; i < 4000; i++) p = new Proxy(p, {}); \
+                 try { p.x; 'read' } catch (e) { e.constructor.name }")
+            .unwrap(),
+            str("RangeError")
+        );
+    }
+
     #[test]
     fn proxy_validates_target_and_handler() {
         assert!(run("new Proxy(1, {})").is_err());
