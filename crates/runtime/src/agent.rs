@@ -290,14 +290,13 @@ impl Trace for ConcatSpreadVerdict {
 // `with_agent` window and removed in `Drop`; an agent that moves between
 // runs re-registers its new address under the same signifier.
 //
-// `roots` is the agent's [`AgentRoots`] allocation, kept separately so the
-// collector can trace the containers that live there without forming a
-// `&Agent` (the moved state is exactly what must not be reached through a
-// reference whose tag an interpreter frame may have invalidated). The agent
-// pointer stays until every traced field has moved: until then the remaining
-// state still has to be traced, and only the `Agent` reaches it.
+// `roots` is the agent's [`AgentRoots`] allocation, and it is the only thing a
+// collection reaches: every traced container and every collection-time reaper
+// lives there, so the collector never forms a `&Agent` — the tag an
+// interpreter frame's `&mut Agent` carries is never invalidated by a
+// collection, which is what M-1 was about.
 thread_local! {
-    static LIVE_AGENTS: std::cell::RefCell<Vec<(u64, *const Agent, *const AgentRoots)>> =
+    static LIVE_AGENTS: std::cell::RefCell<Vec<(u64, *const AgentRoots)>> =
         const { std::cell::RefCell::new(Vec::new()) };
 }
 
@@ -312,34 +311,33 @@ pub(crate) fn live_agent_entered(agent: *mut ()) {
         let mut live = live.borrow_mut();
         // An agent that moved since its last run re-registers its new
         // address; the stale entry (same signifier, old address) goes.
-        live.retain(|&(id, _, _)| id != signifier);
-        live.push((signifier, agent, roots));
+        live.retain(|&(id, _)| id != signifier);
+        live.push((signifier, roots));
     });
 }
 
-/// The registered live agents: each agent's pointer and its root containers'
-/// (see [`LIVE_AGENTS`]).
-pub(crate) fn live_agent_ptrs() -> Vec<(*const Agent, *const AgentRoots)> {
+/// The registered live agents' root containers (see [`LIVE_AGENTS`]).
+pub(crate) fn live_agent_roots() -> Vec<*const AgentRoots> {
+    LIVE_AGENTS.with(|live| live.borrow().iter().map(|&(_, roots)| roots).collect())
+}
+
+/// Whether `agent`'s roots are registered as a live agent's (tests).
+#[cfg(test)]
+pub(crate) fn is_live_agent(agent: *const Agent) -> bool {
+    // SAFETY: the caller passes a live agent (the embed tests check a pointer
+    // they still own).
+    let roots = unsafe { Rc::as_ptr(&(*agent).roots) };
     LIVE_AGENTS.with(|live| {
         live.borrow()
             .iter()
-            .map(|&(_, agent, roots)| (agent, roots))
-            .collect()
+            .any(|&(_, registered)| registered == roots)
     })
-}
-
-/// Whether `agent` is registered as a live agent (tests).
-#[cfg(test)]
-pub(crate) fn is_live_agent(agent: *const Agent) -> bool {
-    live_agent_ptrs()
-        .iter()
-        .any(|&(registered, _)| registered == agent)
 }
 
 /// Unregister a dropped agent (by its unique, never-reused signifier).
 fn unregister_live_agent(signifier: u64) {
     LIVE_AGENTS.with(|live| {
-        live.borrow_mut().retain(|&(id, _, _)| id != signifier);
+        live.borrow_mut().retain(|&(id, _)| id != signifier);
     });
 }
 
@@ -796,6 +794,23 @@ pub(crate) struct AgentRoots {
     /// reads the value in place and only calls `get_global` on a miss.
     /// `load_global_value` repopulates the cell on every successful read.
     pub(crate) global_value_cells: [Cell<crate::jit::GlobalValueCell>; crate::ir::GLOBAL_CELLS],
+    /// The frames of each host stack-trace capture (v8::StackTrace), keyed by
+    /// the *box address* of the object the capture handed back — that object
+    /// exists so the entry has a liveness, and [`AgentRoots::compact_weak_tables`]
+    /// drops entries whose object is dead. A leak-free version of what
+    /// `error_stack` does with an identity key, and the reason the key is an
+    /// address rather than an id.
+    pub(crate) stack_traces: RefCell<std::collections::HashMap<usize, Vec<crate::api::StackFrame>>>,
+    /// [[WeakRefTarget]] of WeakRef instances, keyed by object identity
+    /// (spec 26.1.1: the target is held weakly — `deref` returns it while it
+    /// is reachable, `undefined` once a collection clears it; GC-4).
+    pub(crate) weak_ref_targets: RefCell<std::collections::HashMap<u64, Value>>,
+    /// The box address of every promise, so a sweep can drop the entry of the
+    /// promises it reclaimed ([`AgentRoots::reap_promise_addrs`]).
+    pub(crate) promise_addrs: RefCell<std::collections::HashMap<u64, crux::heap::GcAny>>,
+    /// Promise ids whose address entry a sweep dropped, drained by
+    /// `Agent::reap_dead_promises` at the next run entry.
+    pending_dead_promises: RefCell<Vec<u64>>,
     /// The wasm JS-API wrapper tables (Cut 10). Their values are heap edges,
     /// so they are roots: an untraced `Value` here is freed, its object id
     /// reused, and a later lookup returns the wrong object (e.g.
@@ -983,6 +998,228 @@ impl AgentRoots {
             .cast_mut()
             .cast()
     }
+
+    /// GC-2: the thread-scoped roots of a collection — the Vms currently
+    /// running bodies (their heap-buffered value stacks are invisible to the
+    /// conservative stack scan) and the opaque job closures' captured regions.
+    /// Nothing here is addressed through an `Agent`: the containers are the
+    /// roots' own and the rest belongs to the thread.
+    pub(crate) fn trace_active_run_state(&self, visit: &mut dyn FnMut(GcAny)) {
+        // GC-2: the Vms currently running bodies (their heap-buffered value
+        // stacks are invisible to the conservative stack scan). Pooled and
+        // suspended Vms are covered by `vm_pool` and the generator/async
+        // tables above.
+        crate::ir::trace_active_vms(visit);
+        // GC-2: the opaque job closures hold captured Values; scan their
+        // boxes conservatively (queued jobs plus the job currently running).
+        let mut regions: Vec<(*const u8, usize)> = Vec::new();
+        if !self.collect_job_regions(&mut regions) {
+            crux::heap::note_aborted_trace();
+            return;
+        }
+        RUNNING_JOB_REGION.with(|region| {
+            if let Some(region) = &*region.borrow() {
+                regions.push(*region);
+            }
+        });
+        if !regions.is_empty() {
+            crux::heap::scan_regions(&regions, visit);
+        }
+    }
+
+    /// The realm a collection-time reaction (a FinalizationRegistry cleanup
+    /// job) belongs to: the running execution context's, else the realm the
+    /// last job was entered for. `None` before any context has run.
+    fn collection_realm(&self) -> Option<Handle<Realm>> {
+        if let Some(context) = self.execution_context_stack.last() {
+            return Some(context.realm);
+        }
+        self.entered_realm.get()
+    }
+
+    /// GC-4: whether any weak structure exists — the collector then runs a
+    /// scan-free mark so the weak tables compact against true heap
+    /// reachability instead of stale stack words. A `RefCell` mid-borrow
+    /// (the tables are read-only here) defaults to `true`: the precise pass
+    /// is harmless when the tables are empty.
+    fn has_weak_structures(&self) -> bool {
+        !self.weak_map_data.borrow().is_empty()
+            || !self.weak_set_data.borrow().is_empty()
+            || !self.finalization_registries.borrow().is_empty()
+            || self
+                .stack_traces
+                .try_borrow()
+                .is_ok_and(|traces| !traces.is_empty())
+            || self
+                .weak_ref_targets
+                .try_borrow()
+                .is_ok_and(|targets| !targets.is_empty())
+    }
+
+    /// GC-3/GC-4: the pre-sweep compaction — drop the WeakMap/WeakSet
+    /// entries and WeakRef targets whose key (or element, or target) box is
+    /// dead, and process the FinalizationRegistry cells: a dead target's
+    /// cell is removed and its held value captured into a cleanup job
+    /// (retained so the sweep does not free it); a live cell's dead
+    /// unregister token is cleared. Runs while the dead boxes are still
+    /// allocated, so the entry values are readable.
+    fn compact_weak_tables(&self, dead: &[usize], retain: &mut dyn FnMut(crux::heap::GcAny)) {
+        if dead.is_empty() {
+            return;
+        }
+        // The collector sorts the dead set before the hook runs, so a
+        // membership test is a binary search — the SipHash HashSet of every
+        // dead address was measurable per collection.
+        let is_dead = |addr: usize| dead.binary_search(&addr).is_ok();
+        // A stack-trace capture is held under the box address of the object it
+        // hands back, so a capture the host stopped holding is dropped here —
+        // the hook runs between the mark and the sweep, while the dead boxes are
+        // still allocated and their addresses cannot yet have been reused.
+        self.stack_traces
+            .borrow_mut()
+            .retain(|address, _| !is_dead(*address));
+        for cell in self.weak_map_data.borrow().values() {
+            let mut data = cell.borrow_mut();
+            data.retain(|entry| match entry {
+                Some((key, _)) => match value_box_addr(key) {
+                    Some(key) => !is_dead(key.addr()),
+                    // A non-heap key cannot have been swept.
+                    None => true,
+                },
+                None => false,
+            });
+        }
+        for cell in self.weak_set_data.borrow().values() {
+            let mut data = cell.borrow_mut();
+            data.retain(|entry| match entry {
+                Some(element) => match value_box_addr(element) {
+                    Some(element) => !is_dead(element.addr()),
+                    None => true,
+                },
+                None => false,
+            });
+        }
+        // GC-4 WeakRef: a dead target clears the entry (deref → undefined).
+        for (_, target) in self.weak_ref_targets.borrow_mut().iter_mut() {
+            if let Some(target_box) = value_box_addr(target)
+                && is_dead(target_box.addr())
+            {
+                *target = Value::Undefined;
+            }
+        }
+        // GC-4 FinalizationRegistry: dead-target cells are removed and
+        // their held values captured into a cleanup job (retained so the
+        // sweep keeps them); dead unregister tokens on live cells clear.
+        let Some(realm) = self.collection_realm() else {
+            return;
+        };
+        for data in self.finalization_registries.borrow().values() {
+            let mut data = data.borrow_mut();
+            let mut cells = std::mem::take(&mut data.cells);
+            let mut i = 0;
+            while i < cells.len() {
+                let cell = &cells[i];
+                let target_dead =
+                    value_box_addr(&cell.target).is_some_and(|target| is_dead(target.addr()));
+                if target_dead {
+                    let cell = cells.swap_remove(i);
+                    let callback = data.callback;
+                    let held_value = cell.held_value;
+                    if let Some(held) = value_box_addr(&held_value) {
+                        retain(held);
+                    }
+                    let cleanup_closure = move |agent: &mut crate::agent::Agent| {
+                        crate::function::call(agent, &callback, Value::Undefined, &[held_value])
+                    };
+                    let job = crate::job::Job::new(Some(realm), cleanup_closure);
+                    self.pending_cleanup_jobs.borrow_mut().push(job);
+                } else {
+                    // Live cell: clear a dead unregister token so the
+                    // dangling handle is never compared.
+                    if let Some(token) = &mut cells[i].unregister_token
+                        && let Some(token_box) = value_box_addr(token)
+                        && is_dead(token_box.addr())
+                    {
+                        cells[i].unregister_token = None;
+                    }
+                    i += 1;
+                }
+            }
+            data.cells = cells;
+        }
+    }
+
+    /// Drop the `array_iter_data` entries of Array iterators the sweep
+    /// reclaimed. `dead` is the sweep's address list (the conservative mark's
+    /// result, while no allocation can have reused a slot). Without this, every
+    /// dead iterator's entry keeps its iterated array a root forever, and the
+    /// map's trace grows with the number of iterators ever created.
+    fn reap_dead_iterators(&self, dead: &[usize]) {
+        if dead.is_empty() {
+            return;
+        }
+        let Ok(mut map) = self.array_iter_data.try_borrow_mut() else {
+            return;
+        };
+        if map.is_empty() {
+            return;
+        }
+        map.retain(|_, (_, _, _, iterator)| dead.binary_search(&iterator.addr()).is_err());
+    }
+
+    fn reap_promise_addrs(&self, dead: &[usize]) {
+        if dead.is_empty() {
+            return;
+        }
+        let Ok(mut pending) = self.pending_dead_promises.try_borrow_mut() else {
+            return;
+        };
+        let Ok(mut addrs) = self.promise_addrs.try_borrow_mut() else {
+            return;
+        };
+        addrs.retain(|id, addr| {
+            if dead.binary_search(&addr.addr()).is_ok() {
+                pending.push(*id);
+                false
+            } else {
+                true
+            }
+        });
+    }
+
+    /// Drop the states of generators whose object the sweep reclaimed. Without
+    /// this every generator ever created leaves a rooted state in the table —
+    /// its environment, execution context, suspended VM and arguments stay
+    /// reachable — so the traced root set grows with the number of generators
+    /// the program has created and every collection scans them. The sweep's
+    /// address list is the conservative mark's result, so a generator object
+    /// held only in a Rust stack local is never pruned.
+    fn reap_dead_generators(&self, dead: &[usize]) {
+        if dead.is_empty() {
+            return;
+        }
+        let Ok(mut map) = self.generators.try_borrow_mut() else {
+            return;
+        };
+        if map.is_empty() {
+            return;
+        }
+        map.retain(|_, state| match state.try_borrow() {
+            Ok(state) => dead.binary_search(&state.object_addr).is_err(),
+            // A state borrowed here is a generator body executing across the
+            // collection: alive by definition.
+            Err(_) => true,
+        });
+        drop(map);
+        let Ok(mut map) = self.async_generators.try_borrow_mut() else {
+            return;
+        };
+        map.retain(|_, state| match state.try_borrow() {
+            Ok(state) => dead.binary_search(&state.object_addr).is_err(),
+            Err(_) => true,
+        });
+    }
+
     fn new() -> AgentRoots {
         AgentRoots {
             execution_context_stack: ContextStack::new(),
@@ -1048,6 +1285,10 @@ impl AgentRoots {
             global_value_cells: std::array::from_fn(|_| {
                 Cell::new(crate::jit::GlobalValueCell::empty())
             }),
+            stack_traces: RefCell::new(std::collections::HashMap::new()),
+            weak_ref_targets: RefCell::new(std::collections::HashMap::new()),
+            promise_addrs: RefCell::new(std::collections::HashMap::new()),
+            pending_dead_promises: RefCell::new(Vec::new()),
             #[cfg(feature = "wasm")]
             wasm_streaming_handlers: RefCell::new(std::collections::HashMap::new()),
             #[cfg(feature = "wasm")]
@@ -1742,14 +1983,6 @@ pub struct Agent {
     /// [[ErrorData]] markers of Error instances, keyed by object identity
     /// (spec 20.5.4: `Error.isError` and the `[object Error]` tag need it).
     pub error_data: std::collections::HashSet<u64>,
-    /// The frames of each host stack-trace capture (v8::StackTrace), keyed by
-    /// the *box address* of the object the capture handed back — that object
-    /// exists so the entry has a liveness, and the collector's compaction hook
-    /// drops entries whose object is dead (`compact_weak_tables`). A leak-free
-    /// version of what `error_stack` above does with an identity key, and the
-    /// reason the key is an address rather than an id.
-    pub stack_traces:
-        std::cell::RefCell<std::collections::HashMap<usize, Vec<crate::api::StackFrame>>>,
     /// The compiled module of `WebAssembly.Module` instances, keyed by object
     /// identity (JS-API spec: the [[Module]] internal slot; Wave 2 of Cut 10).
     #[cfg(feature = "wasm")]
@@ -1794,12 +2027,6 @@ pub struct Agent {
     /// The next externref host token (monotonic within the agent).
     #[cfg(feature = "wasm")]
     pub wasm_extern_seq: u32,
-    /// [[WeakRefTarget]] of WeakRef instances, keyed by object identity
-    /// (spec 26.1.1: the target is held weakly — `deref` returns it while it
-    /// is reachable, `undefined` once a collection clears it; GC-4).
-    pub weak_ref_targets: std::cell::RefCell<std::collections::HashMap<u64, Value>>,
-    pub promise_addrs: std::cell::RefCell<std::collections::HashMap<u64, crux::heap::GcAny>>,
-    pending_dead_promises: std::cell::RefCell<Vec<u64>>,
     /// The nesting depth of class field initializers currently evaluating.
     /// A direct eval inside one applies the "Eval Inside Initializer" early
     /// errors (spec 19.2.1.1): `arguments` is a SyntaxError there.
@@ -2052,7 +2279,6 @@ impl Agent {
             intl_duration_format_data: std::collections::HashMap::new(),
             compiled_regexps: std::collections::HashMap::new(),
             error_data: std::collections::HashSet::new(),
-            stack_traces: std::cell::RefCell::new(std::collections::HashMap::new()),
             #[cfg(feature = "wasm")]
             wasm_modules: std::collections::HashMap::new(),
             #[cfg(feature = "wasm")]
@@ -2077,9 +2303,6 @@ impl Agent {
             wasm_exceptions: std::collections::HashMap::new(),
             #[cfg(feature = "wasm")]
             wasm_extern_seq: 0,
-            weak_ref_targets: std::cell::RefCell::new(std::collections::HashMap::new()),
-            promise_addrs: std::cell::RefCell::new(std::collections::HashMap::new()),
-            pending_dead_promises: std::cell::RefCell::new(Vec::new()),
             field_initializer_depth: 0,
             realm_count: std::cell::Cell::new(0),
             gc_stress: Cell::new(false),
@@ -3072,40 +3295,6 @@ impl Agent {
         })
     }
 
-    /// GC-1 slice 3: every `Value`/`Handle`/`JsString`/`Symbol` the agent
-    /// holds directly — the JS-visible roots of .notes/gc-plan.md §3. The
-    /// conservative native-stack scan covers Rust-held handles; this covers
-    /// the agent's own tables (which live in heap-allocated buffers the
-    /// stack scan cannot see). Index-only caches and primitive tables need
-    /// no tracing.
-    ///
-    /// Every container the agent itself holds now lives in [`AgentRoots`], so
-    /// this one reads none of the agent's fields: what it adds is the
-    /// thread-scoped state (a running body's Vm stacks and the job closures'
-    /// regions), which belongs to no single agent.
-    pub(crate) fn trace_agent_state(&self, visit: &mut dyn FnMut(GcAny)) {
-        // GC-2: the Vms currently running bodies (their heap-buffered value
-        // stacks are invisible to the conservative stack scan). Pooled and
-        // suspended Vms are covered by `vm_pool` and the generator/async
-        // tables above.
-        crate::ir::trace_active_vms(visit);
-        // GC-2: the opaque job closures hold captured Values; scan their
-        // boxes conservatively (queued jobs plus the job currently running).
-        let mut regions: Vec<(*const u8, usize)> = Vec::new();
-        if !self.roots.collect_job_regions(&mut regions) {
-            crux::heap::note_aborted_trace();
-            return;
-        }
-        RUNNING_JOB_REGION.with(|region| {
-            if let Some(region) = &*region.borrow() {
-                regions.push(*region);
-            }
-        });
-        if !regions.is_empty() {
-            crux::heap::scan_regions(&regions, visit);
-        }
-    }
-
     /// GC-1 slice 3: gather the precise roots and mark-sweep with the
     /// conservative native-stack scan. Must run at a quiescent point (no
     /// job closures in flight, no active RefCell borrows on the traced
@@ -3170,23 +3359,24 @@ impl Agent {
         // shared, but each agent's state is reachable only from its own
         // Rust-heap tables, so a nested or sibling agent's boxes would be
         // swept otherwise. `self` is traced below.
-        let self_ptr = self as *const Agent;
-        let live = live_agent_ptrs();
-        for &(agent, agent_roots) in &live {
-            if agent == self_ptr {
+        let self_roots = Rc::as_ptr(&self.roots);
+        let live = live_agent_roots();
+        for &agent_roots in &live {
+            if agent_roots == self_roots {
                 continue;
             }
-            // SAFETY: a registered agent is alive — registration is removed
-            // only in `Drop`, which cannot run during a collection on this
-            // thread. The roots allocation outlives the registration the same
-            // way: it is owned by the agent.
+            // SAFETY: a registered roots allocation is alive — registration is
+            // removed only in `Agent::drop`, which cannot run during a
+            // collection on this thread, and the allocation is owned by the
+            // agent.
             unsafe {
                 (&*agent_roots).trace(&mut |any| roots.push(any));
-                (&*agent).trace_agent_state(&mut |any| roots.push(any));
+                (&*agent_roots).trace_active_run_state(&mut |any| roots.push(any));
             }
         }
         self.roots.trace(&mut |any| roots.push(any));
-        self.trace_agent_state(&mut |any| roots.push(any));
+        self.roots
+            .trace_active_run_state(&mut |any| roots.push(any));
         // GC-3/GC-4: the compaction hook runs between the mark and the sweep
         // (the would-be-swept boxes are still allocated), dropping dead weak
         // entries and capturing FinalizationRegistry held values into
@@ -3195,11 +3385,11 @@ impl Agent {
         // or FinalizationRegistry target alive (the sweep still uses the
         // conservative mark — the scan stays the safety net for Rust-held
         // handles).
-        let has_weak = self.has_weak_structures()
-            || live.iter().any(|&(agent, _)| {
-                agent != self_ptr
+        let has_weak = self.roots.has_weak_structures()
+            || live.iter().any(|&agent_roots| {
+                agent_roots != self_roots
                     // SAFETY: as above.
-                    && unsafe { (&*agent).has_weak_structures() }
+                    && unsafe { (&*agent_roots).has_weak_structures() }
             });
         // Cut 35 slice 31: the compaction hook (dead-set HashSet build +
         // weak-table walks) runs only when a weak structure actually exists
@@ -3207,11 +3397,11 @@ impl Agent {
         // of every dead address was measurable per collection.
         let compact: &mut crux::heap::CompactHook = if has_weak {
             &mut |dead, retain| {
-                self.compact_weak_tables(dead, retain);
-                for &(agent, _) in &live {
-                    if agent != self_ptr {
+                self.roots.compact_weak_tables(dead, retain);
+                for &agent_roots in &live {
+                    if agent_roots != self_roots {
                         // SAFETY: as above.
-                        unsafe { (&*agent).compact_weak_tables(dead, retain) };
+                        unsafe { (&*agent_roots).compact_weak_tables(dead, retain) };
                     }
                 }
             }
@@ -3238,22 +3428,23 @@ impl Agent {
             .array_iter_data
             .try_borrow()
             .is_ok_and(|map| !map.is_empty())
-            || live.iter().any(|&(agent, roots)| {
-                agent != self_ptr
+            || live.iter().any(|&agent_roots| {
+                agent_roots != self_roots
                     // SAFETY: as above.
-                    && unsafe { (&*roots).array_iter_data.try_borrow().is_ok_and(|map| !map.is_empty()) }
+                    && unsafe { (&*agent_roots).array_iter_data.try_borrow().is_ok_and(|map| !map.is_empty()) }
             });
         // Every promise ever constructed has an entry in `promise_addrs`, and
         // `promises` (traced) retains each settled promise's result and
         // reactions until the id is reaped.
         let has_promise_addrs = self
+            .roots
             .promise_addrs
             .try_borrow()
             .is_ok_and(|map| !map.is_empty())
-            || live.iter().any(|&(agent, _)| {
-                agent != self_ptr
+            || live.iter().any(|&agent_roots| {
+                agent_roots != self_roots
                     // SAFETY: as above.
-                    && unsafe { (&*agent).promise_addrs.try_borrow().is_ok_and(|map| !map.is_empty()) }
+                    && unsafe { (&*agent_roots).promise_addrs.try_borrow().is_ok_and(|map| !map.is_empty()) }
             });
         let has_generators = self
             .roots
@@ -3265,8 +3456,8 @@ impl Agent {
                 .async_generators
                 .try_borrow()
                 .is_ok_and(|map| !map.is_empty())
-            || live.iter().any(|&(agent, agent_roots)| {
-                agent != self_ptr
+            || live.iter().any(|&agent_roots| {
+                agent_roots != self_roots
                     // SAFETY: as above.
                     && unsafe {
                         (&*agent_roots)
@@ -3283,29 +3474,29 @@ impl Agent {
             swept_addrs.sort_unstable();
         }
         if has_iterators {
-            self.reap_dead_iterators(&swept_addrs);
-            for &(agent, _) in &live {
-                if agent != self_ptr {
+            self.roots.reap_dead_iterators(&swept_addrs);
+            for &agent_roots in &live {
+                if agent_roots != self_roots {
                     // SAFETY: as above.
-                    unsafe { (&*agent).reap_dead_iterators(&swept_addrs) };
+                    unsafe { (&*agent_roots).reap_dead_iterators(&swept_addrs) };
                 }
             }
         }
         if has_promise_addrs {
-            self.reap_promise_addrs(&swept_addrs);
-            for &(agent, _) in &live {
-                if agent != self_ptr {
+            self.roots.reap_promise_addrs(&swept_addrs);
+            for &agent_roots in &live {
+                if agent_roots != self_roots {
                     // SAFETY: as above.
-                    unsafe { (&*agent).reap_promise_addrs(&swept_addrs) };
+                    unsafe { (&*agent_roots).reap_promise_addrs(&swept_addrs) };
                 }
             }
         }
         if has_generators {
-            self.reap_dead_generators(&swept_addrs);
-            for &(agent, _) in &live {
-                if agent != self_ptr {
+            self.roots.reap_dead_generators(&swept_addrs);
+            for &agent_roots in &live {
+                if agent_roots != self_roots {
                     // SAFETY: as above.
-                    unsafe { (&*agent).reap_dead_generators(&swept_addrs) };
+                    unsafe { (&*agent_roots).reap_dead_generators(&swept_addrs) };
                 }
             }
         }
@@ -3337,118 +3528,6 @@ impl Agent {
         crux::heap::set_verify_minor(enabled);
         if enabled {
             crux::heap::set_verify_barrier(true);
-        }
-    }
-
-    /// GC-4: whether any weak structure exists — the collector then runs a
-    /// scan-free mark so the weak tables compact against true heap
-    /// reachability instead of stale stack words. A `RefCell` mid-borrow
-    /// (the tables are read-only here) defaults to `true`: the precise pass
-    /// is harmless when the tables are empty.
-    fn has_weak_structures(&self) -> bool {
-        !self.roots.weak_map_data.borrow().is_empty()
-            || !self.roots.weak_set_data.borrow().is_empty()
-            || !self.roots.finalization_registries.borrow().is_empty()
-            || self
-                .stack_traces
-                .try_borrow()
-                .is_ok_and(|traces| !traces.is_empty())
-            || self
-                .weak_ref_targets
-                .try_borrow()
-                .is_ok_and(|targets| !targets.is_empty())
-    }
-
-    /// GC-3/GC-4: the pre-sweep compaction — drop the WeakMap/WeakSet
-    /// entries and WeakRef targets whose key (or element, or target) box is
-    /// dead, and process the FinalizationRegistry cells: a dead target's
-    /// cell is removed and its held value captured into a cleanup job
-    /// (retained so the sweep does not free it); a live cell's dead
-    /// unregister token is cleared. Runs while the dead boxes are still
-    /// allocated, so the entry values are readable.
-    fn compact_weak_tables(&self, dead: &[usize], retain: &mut dyn FnMut(crux::heap::GcAny)) {
-        if dead.is_empty() {
-            return;
-        }
-        // The collector sorts the dead set before the hook runs, so a
-        // membership test is a binary search — the SipHash HashSet of every
-        // dead address was measurable per collection.
-        let is_dead = |addr: usize| dead.binary_search(&addr).is_ok();
-        // A stack-trace capture is held under the box address of the object it
-        // hands back, so a capture the host stopped holding is dropped here —
-        // the hook runs between the mark and the sweep, while the dead boxes are
-        // still allocated and their addresses cannot yet have been reused.
-        self.stack_traces
-            .borrow_mut()
-            .retain(|address, _| !is_dead(*address));
-        for cell in self.roots.weak_map_data.borrow().values() {
-            let mut data = cell.borrow_mut();
-            data.retain(|entry| match entry {
-                Some((key, _)) => match value_box_addr(key) {
-                    Some(key) => !is_dead(key.addr()),
-                    // A non-heap key cannot have been swept.
-                    None => true,
-                },
-                None => false,
-            });
-        }
-        for cell in self.roots.weak_set_data.borrow().values() {
-            let mut data = cell.borrow_mut();
-            data.retain(|entry| match entry {
-                Some(element) => match value_box_addr(element) {
-                    Some(element) => !is_dead(element.addr()),
-                    None => true,
-                },
-                None => false,
-            });
-        }
-        // GC-4 WeakRef: a dead target clears the entry (deref → undefined).
-        for (_, target) in self.weak_ref_targets.borrow_mut().iter_mut() {
-            if let Some(target_box) = value_box_addr(target)
-                && is_dead(target_box.addr())
-            {
-                *target = Value::Undefined;
-            }
-        }
-        // GC-4 FinalizationRegistry: dead-target cells are removed and
-        // their held values captured into a cleanup job (retained so the
-        // sweep keeps them); dead unregister tokens on live cells clear.
-        let Ok(realm) = self.current_realm() else {
-            return;
-        };
-        for data in self.roots.finalization_registries.borrow().values() {
-            let mut data = data.borrow_mut();
-            let mut cells = std::mem::take(&mut data.cells);
-            let mut i = 0;
-            while i < cells.len() {
-                let cell = &cells[i];
-                let target_dead =
-                    value_box_addr(&cell.target).is_some_and(|target| is_dead(target.addr()));
-                if target_dead {
-                    let cell = cells.swap_remove(i);
-                    let callback = data.callback;
-                    let held_value = cell.held_value;
-                    if let Some(held) = value_box_addr(&held_value) {
-                        retain(held);
-                    }
-                    let cleanup_closure = move |agent: &mut crate::agent::Agent| {
-                        crate::function::call(agent, &callback, Value::Undefined, &[held_value])
-                    };
-                    let job = crate::job::Job::new(Some(realm), cleanup_closure);
-                    self.roots.pending_cleanup_jobs.borrow_mut().push(job);
-                } else {
-                    // Live cell: clear a dead unregister token so the
-                    // dangling handle is never compared.
-                    if let Some(token) = &mut cells[i].unregister_token
-                        && let Some(token_box) = value_box_addr(token)
-                        && is_dead(token_box.addr())
-                    {
-                        cells[i].unregister_token = None;
-                    }
-                    i += 1;
-                }
-            }
-            data.cells = cells;
         }
     }
 
@@ -3584,39 +3663,6 @@ impl Agent {
         }
     }
 
-    /// Drop the states of generators whose object the sweep reclaimed. Without
-    /// this every generator ever created leaves a rooted state in the table —
-    /// its environment, execution context, suspended VM and arguments stay
-    /// reachable — so the traced root set grows with the number of generators
-    /// the program has created and every collection scans them. The sweep's
-    /// address list is the conservative mark's result, so a generator object
-    /// held only in a Rust stack local is never pruned.
-    fn reap_dead_generators(&self, dead: &[usize]) {
-        if dead.is_empty() {
-            return;
-        }
-        let Ok(mut map) = self.roots.generators.try_borrow_mut() else {
-            return;
-        };
-        if map.is_empty() {
-            return;
-        }
-        map.retain(|_, state| match state.try_borrow() {
-            Ok(state) => dead.binary_search(&state.object_addr).is_err(),
-            // A state borrowed here is a generator body executing across the
-            // collection: alive by definition.
-            Err(_) => true,
-        });
-        drop(map);
-        let Ok(mut map) = self.roots.async_generators.try_borrow_mut() else {
-            return;
-        };
-        map.retain(|_, state| match state.try_borrow() {
-            Ok(state) => dead.binary_search(&state.object_addr).is_err(),
-            Err(_) => true,
-        });
-    }
-
     /// Drop the per-object records of primitive-wrapper boxes a sweep
     /// reclaimed (see [`crux::object::JsObject`]'s `Drop` and the dead-id
     /// queue). The `number_data`/`boolean_data`/`bigint_data` tables answer
@@ -3636,49 +3682,11 @@ impl Agent {
         }
     }
 
-    fn reap_promise_addrs(&self, dead: &[usize]) {
-        if dead.is_empty() {
-            return;
-        }
-        let Ok(mut pending) = self.pending_dead_promises.try_borrow_mut() else {
-            return;
-        };
-        let Ok(mut addrs) = self.promise_addrs.try_borrow_mut() else {
-            return;
-        };
-        addrs.retain(|id, addr| {
-            if dead.binary_search(&addr.addr()).is_ok() {
-                pending.push(*id);
-                false
-            } else {
-                true
-            }
-        });
-    }
-
     fn reap_dead_promises(&mut self) {
-        let ids = std::mem::take(&mut *self.pending_dead_promises.borrow_mut());
+        let ids = std::mem::take(&mut *self.roots.pending_dead_promises.borrow_mut());
         for id in ids {
             self.roots.promises.borrow_mut().remove(&id);
         }
-    }
-
-    /// Drop the `array_iter_data` entries of Array iterators the sweep
-    /// reclaimed. `dead` is the sweep's address list (the conservative mark's
-    /// result, while no allocation can have reused a slot). Without this, every
-    /// dead iterator's entry keeps its iterated array a root forever, and the
-    /// map's trace grows with the number of iterators ever created.
-    fn reap_dead_iterators(&self, dead: &[usize]) {
-        if dead.is_empty() {
-            return;
-        }
-        let Ok(mut map) = self.roots.array_iter_data.try_borrow_mut() else {
-            return;
-        };
-        if map.is_empty() {
-            return;
-        }
-        map.retain(|_, (_, _, _, iterator)| dead.binary_search(&iterator.addr()).is_err());
     }
 
     /// Toggle the `--gc-stress` mode: collect at every safe point instead of

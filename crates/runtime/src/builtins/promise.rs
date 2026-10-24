@@ -533,6 +533,7 @@ fn promise_constructor(
         })),
     );
     agent
+        .roots
         .promise_addrs
         .borrow_mut()
         .insert(promise.id(), promise.as_any());

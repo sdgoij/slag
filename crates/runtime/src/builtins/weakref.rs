@@ -315,6 +315,7 @@ pub fn dispatch_call(
                 ));
             };
             let target = agent
+                .roots
                 .weak_ref_targets
                 .borrow()
                 .get(&obj.id())
@@ -359,6 +360,7 @@ pub fn dispatch_construct(
             let proto = instance_proto(agent, new_target, WEAK_REF_PROTO)?;
             let object = JsObject::ordinary_object_create(Some(proto));
             agent
+                .roots
                 .weak_ref_targets
                 .borrow_mut()
                 .insert(object.id(), target);

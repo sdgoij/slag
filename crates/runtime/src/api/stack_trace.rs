@@ -122,7 +122,11 @@ impl Isolate {
         let frames = stack_frames(&self.agent, limit);
         let trace = super::Object::new(&Context::from_realm(self, realm)).ok()?;
         let address = trace.value().as_object()?.as_any().addr();
-        self.agent.stack_traces.borrow_mut().insert(address, frames);
+        self.agent
+            .roots
+            .stack_traces
+            .borrow_mut()
+            .insert(address, frames);
         Some(trace)
     }
 
@@ -145,6 +149,7 @@ impl Isolate {
     fn captured_frames(&self, trace: &Local) -> Option<Vec<StackFrame>> {
         let object = trace.value().as_object()?;
         self.agent
+            .roots
             .stack_traces
             .borrow()
             .get(&object.as_any().addr())
@@ -344,7 +349,7 @@ mod tests {
         let _context = Context::new(&mut isolate).expect("context");
         {
             let _capture = isolate.capture_stack(10).expect("a capture");
-            assert_eq!(isolate.agent.stack_traces.borrow().len(), 1);
+            assert_eq!(isolate.agent.roots.stack_traces.borrow().len(), 1);
         }
 
         // The host stopped holding it. What makes the assert below about the
@@ -354,7 +359,7 @@ mod tests {
         // on.
         isolate.agent.collect_garbage();
         assert!(
-            isolate.agent.stack_traces.borrow().is_empty(),
+            isolate.agent.roots.stack_traces.borrow().is_empty(),
             "a capture the host stopped holding is pruned"
         );
     }
