@@ -263,7 +263,9 @@ fn allocate_shared_array_buffer(
         },
     );
     let state = agent.buffer_state(object.id()).expect("inserted");
-    state.shared.mark_shared();
+    // Always succeeds: this block is fresh, so nothing can have claimed it.
+    let published = state.shared.mark_shared();
+    debug_assert!(published, "a fresh block cannot be engine-owned");
     Ok(())
 }
 
@@ -994,7 +996,12 @@ pub fn shared_array_buffer_from_block(
     // shared mirror has to be set here rather than inherited from the block's
     // previous owner.
     let state = agent.buffer_state(object.id()).expect("inserted");
-    state.shared.mark_shared();
+    if !state.shared.mark_shared() {
+        return Err(JsError::new(
+            ErrorKind::TypeError,
+            "a WebAssembly linear memory cannot be shared with another agent".into(),
+        ));
+    }
     Ok(Value::Object(object))
 }
 

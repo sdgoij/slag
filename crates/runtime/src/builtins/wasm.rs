@@ -3952,8 +3952,6 @@ mod tests {
                 " return b[0] === 5 && a[0] === 5; })()"
             ),
         );
-        // A shared memory still reads and writes through wasm (the bridge
-        // aliases the block).
         let shared_io = wat_module_bytes(concat!(
             "(module",
             "  (import \"js\" \"mem\" (memory 1))",
@@ -3965,21 +3963,36 @@ mod tests {
             "    local.get 0",
             "    i32.load))"
         ));
-        eval_true(
-            &mut context,
-            &format!(
+        // A shared memory still reads and writes through wasm when one agent
+        // owns the bytes (the bridge aliases the block). Under `workers` the
+        // block is visible to another agent thread, while the interpreter
+        // addresses it through plain slices, so binding a shared memory to a
+        // module is refused instead (M-12).
+        let shared_bridge = format!(
+            concat!(
+                "(function(){{ const mem = new WebAssembly.Memory({{ initial: 1, maximum: 2, shared: true }});",
+                " const i = new WebAssembly.Instance(new Uint8Array({shared_io}), {{ js: {{ mem }} }});",
+                " const view = new Int32Array(mem.buffer);",
+                " i.exports.store(0, 77);",
+                " if (view[0] !== 77) return false;",
+                " view[1] = 88;",
+                " return i.exports.load(4) === 88; }})()"
+            ),
+            shared_io = shared_io,
+        );
+        if crux::typed_array::WORKERS {
+            let refused = format!(
                 concat!(
                     "(function(){{ const mem = new WebAssembly.Memory({{ initial: 1, maximum: 2, shared: true }});",
-                    " const i = new WebAssembly.Instance(new Uint8Array({shared_io}), {{ js: {{ mem }} }});",
-                    " const view = new Int32Array(mem.buffer);",
-                    " i.exports.store(0, 77);",
-                    " if (view[0] !== 77) return false;",
-                    " view[1] = 88;",
-                    " return i.exports.load(4) === 88; }})()"
+                    " try {{ new WebAssembly.Instance(new Uint8Array({shared_io}), {{ js: {{ mem }} }}); return false; }}",
+                    " catch (e) {{ return e.message.includes('incompatible import type'); }} }})()"
                 ),
                 shared_io = shared_io,
-            ),
-        );
+            );
+            eval_true(&mut context, &refused);
+        } else {
+            eval_true(&mut context, &shared_bridge);
+        }
         // The `buffer` accessor brand-checks its receiver.
         eval_true(
             &mut context,

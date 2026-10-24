@@ -179,30 +179,39 @@ impl MemoryBytes {
 
     /// Grow in place to `byte_length` (never shorter: wasm grows a memory
     /// only). Only a shared memory may use this: its block is allocated at the
-    /// declared maximum, so prior SharedArrayBuffers keep aliasing it.
-    fn grow_in_place(&mut self, byte_length: usize) {
+    /// declared maximum, so prior SharedArrayBuffers keep aliasing it. Returns
+    /// `false` when the block could not be resized and the move failed too.
+    fn grow_in_place(&mut self, byte_length: usize) -> bool {
         if self.0.resize(byte_length).is_ok() {
-            return;
+            return true;
         }
-        self.move_to_new_block(byte_length);
+        self.move_to_new_block(byte_length)
     }
 
-    /// Move to a fresh block of `byte_length`, copying the live bytes.
+    /// Move to a fresh block of `byte_length`, copying the live bytes. Returns
+    /// `false` if the new block could not be claimed for the engine, which is
+    /// what keeps the memory unshareable.
     ///
     /// An unshared grow detaches the previous buffer, and that buffer's storage
     /// *is* this block — detaching it marks the block itself unreachable, so the
     /// memory must leave it behind rather than resizing it in place. This is the
     /// one copy the JS-API costs a grow, and why an unshared grow is the only
     /// place the engine moves its storage.
-    fn move_to_new_block(&mut self, byte_length: usize) {
+    fn move_to_new_block(&mut self, byte_length: usize) -> bool {
         let live = self.0.read(0, self.0.byte_length()).unwrap_or_default();
         let block = SharedBuffer::new(byte_length);
+        if !block.claim_for_engine() {
+            // A fresh block is private, so this cannot happen; refusing the
+            // grow is better than addressing a block another agent can reach.
+            return false;
+        }
         if !live.is_empty() && block.write(0, &live).is_err() {
             // Unreachable: the new block is exactly `byte_length` long and
             // `live` is the old block's length, which never exceeds it.
-            return;
+            return false;
         }
         self.0 = block;
+        true
     }
 }
 
@@ -265,8 +274,17 @@ impl Memory {
         } else {
             byte_length
         };
+        let bytes = MemoryBytes::new(byte_length, capacity);
+        // The engine addresses a linear memory through plain slices, so its
+        // storage must never become visible to another agent thread. Claiming it
+        // is what makes that so. A shared memory is not claimed: it is only ever
+        // reachable from JS (a module cannot declare one, and `memory_matches`
+        // refuses to bind one under `workers`).
+        if !shared && !bytes.block().claim_for_engine() {
+            return Err("linear memory is shared with another agent");
+        }
         Ok(Memory {
-            bytes: MemoryBytes::new(byte_length, capacity),
+            bytes,
             max_pages,
             shared,
         })
@@ -302,9 +320,11 @@ impl Memory {
             return None;
         };
         if self.shared {
-            self.bytes.grow_in_place(byte_len);
-        } else {
-            self.bytes.move_to_new_block(byte_len);
+            if !self.bytes.grow_in_place(byte_len) {
+                return None;
+            }
+        } else if !self.bytes.move_to_new_block(byte_len) {
+            return None;
         }
         Some(old)
     }
@@ -6722,7 +6742,15 @@ fn write_mem(_op: StoreOp, value: Value, bytes: &mut [u8]) {
 /// provider must have at least the requested minimum, and no larger a maximum
 /// than the request allows (spec 4.5.2 external-type subsumption).
 fn memory_matches(actual: MemType, requested: MemType) -> bool {
-    actual.memory64 == requested.memory64 && limits_match(actual.limits, requested.limits)
+    actual.memory64 == requested.memory64
+        && limits_match(actual.limits, requested.limits)
+        // Under `workers` a shared memory's storage is visible to another agent
+        // thread, while the interpreter addresses a memory through plain
+        // slices, so binding one would be a data race. `decode_memory_limits`
+        // rejects a shared module memory type, so this only refuses to bind a
+        // host's shared memory — the safe outcome, and the reason the
+        // single-agent build can keep ignoring the flag.
+        && (!byteblock::WORKERS || actual.limits.shared == requested.limits.shared)
 }
 
 /// Whether an imported table type is satisfied by a provided one: element
@@ -7147,5 +7175,64 @@ fn runtime_abs_matches(sub: HeapType, sup: HeapType) -> bool {
         Eq => sup == Any,
         I31 | Struct | Array => sup == Eq || sup == Any,
         _ => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A module memory the engine executes against cannot be published as a
+    /// SharedArrayBuffer (M-12): the interpreter addresses it through plain
+    /// slices, which cannot race with another agent's access.
+    #[test]
+    fn a_linear_memory_cannot_be_shared_with_another_agent() {
+        if !byteblock::WORKERS {
+            // The single-agent storage cannot be shared in the first place.
+            return;
+        }
+        let memory = Memory::new(1, None, false).expect("memory");
+        assert!(
+            !memory.block().mark_shared(),
+            "a claimed linear memory refuses to become shareable"
+        );
+        assert!(!memory.block().is_shared());
+    }
+
+    /// Under `workers`, a shared memory cannot satisfy an unshared import: wasm
+    /// would address its bytes plainly while another agent thread reads them.
+    /// The single-agent build keeps ignoring the flag (see `memory_matches`).
+    #[test]
+    fn a_shared_memory_does_not_match_an_unshared_import() {
+        if !byteblock::WORKERS {
+            return;
+        }
+        let shared = MemType {
+            limits: Limits {
+                min: 1,
+                max: Some(2),
+                shared: true,
+            },
+            memory64: false,
+        };
+        let unshared = MemType {
+            limits: Limits::new(1, Some(2)),
+            memory64: false,
+        };
+        assert!(!memory_matches(shared, unshared));
+        assert!(!memory_matches(unshared, shared));
+        assert!(memory_matches(shared, shared));
+        assert!(memory_matches(unshared, unshared));
+    }
+
+    /// A shared memory the engine does not execute against is still created for
+    /// the JS-API, and its block is shareable.
+    #[test]
+    fn a_shared_memory_keeps_a_shareable_block() {
+        let memory = Memory::new(1, Some(2), true).expect("shared memory");
+        assert!(
+            memory.block().mark_shared(),
+            "a shared memory's block can be published to another agent"
+        );
     }
 }

@@ -265,7 +265,25 @@ struct Reservation {
     /// Bytes committed so far, rounded up to the page size. Monotonic: a
     /// `resize` never gives pages back, so a shrink-then-grow costs nothing.
     committed: std::sync::atomic::AtomicUsize,
+    /// What the storage may be used for, as one of the `ROLE_*` values below.
+    /// The two claims are mutually exclusive and each is taken once, so a
+    /// compare-exchange is enough to make them so: a block is either visible to
+    /// another agent thread (and then every access to it must be atomic) or it
+    /// is a linear memory the wasm engine addresses through plain slices (and
+    /// then it must never become visible to one).
+    role: std::sync::atomic::AtomicU8,
 }
+
+/// Nobody has claimed the storage: one agent owns it and may address it plainly.
+#[cfg(feature = "workers")]
+const ROLE_PRIVATE: u8 = 0;
+/// A SharedArrayBuffer is (or was) handed to another agent thread, so accesses
+/// go through atomics.
+#[cfg(feature = "workers")]
+const ROLE_SHARED: u8 = 1;
+/// The wasm engine executes against this storage through plain slices.
+#[cfg(feature = "workers")]
+const ROLE_ENGINE: u8 = 2;
 
 // SAFETY: the reservation is the block's shared storage under `workers`, which
 // exists so agents on several threads can address the same bytes. The bytes are
@@ -307,6 +325,7 @@ impl WorkersBlock {
             base,
             reserved: capacity,
             committed: std::sync::atomic::AtomicUsize::new(0),
+            role: std::sync::atomic::AtomicU8::new(ROLE_PRIVATE),
         };
         assert!(
             byte_length == 0 || reservation.commit_to(byte_length),
@@ -337,6 +356,47 @@ impl WorkersBlock {
         self.inner
             .committed
             .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Whether this storage is (or was) visible to another agent thread.
+    fn is_shared(&self) -> bool {
+        self.inner.role.load(std::sync::atomic::Ordering::SeqCst) == ROLE_SHARED
+    }
+
+    /// Make the storage shareable. Refused — and the role left alone — once the
+    /// wasm engine has claimed it, because an engine-owned block is addressed
+    /// through plain slices, which cannot race with another agent.
+    fn mark_shared(&self) -> bool {
+        use std::sync::atomic::Ordering;
+        match self.inner.role.compare_exchange(
+            ROLE_PRIVATE,
+            ROLE_SHARED,
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        ) {
+            Ok(_) => true,
+            // Already shareable: a second view of one buffer is not a conflict.
+            Err(ROLE_SHARED) => true,
+            Err(_) => false,
+        }
+    }
+
+    /// Claim the storage for the wasm engine, which addresses it through plain
+    /// slices. Refused once the storage has been made shareable: the engine and
+    /// another agent thread must never see the same bytes.
+    fn claim_for_engine(&self) -> bool {
+        use std::sync::atomic::Ordering;
+        match self.inner.role.compare_exchange(
+            ROLE_PRIVATE,
+            ROLE_ENGINE,
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        ) {
+            Ok(_) => true,
+            // A second module memory over one storage: still engine-only.
+            Err(ROLE_ENGINE) => true,
+            Err(_) => false,
+        }
     }
 }
 
@@ -907,16 +967,55 @@ impl SharedBuffer {
 
     /// Mark the owning buffer as a SharedArrayBuffer (mirrors
     /// `BufferState.is_shared`).
-    pub fn mark_shared(&self) {
+    ///
+    /// Returns `false` — leaving the mirror alone — when the storage has been
+    /// claimed by the wasm engine (`claim_for_engine`). The caller must not
+    /// publish the block then: the engine addresses those bytes through plain
+    /// slices, and a second agent thread reading them atomically would still be
+    /// a data race in Rust's memory model.
+    pub fn mark_shared(&self) -> bool {
         #[cfg(not(feature = "workers"))]
         {
             self.flags_rc.is_shared.set(true);
+            true
         }
         #[cfg(feature = "workers")]
         {
+            // A borrowed block is the host's memory, not a reservation this
+            // crate controls; the host's own contract covers sharing it.
+            if self.borrowed.is_some() {
+                self.flags_rc
+                    .is_shared
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+                return true;
+            }
+            if !self.block.mark_shared() {
+                return false;
+            }
             self.flags_rc
                 .is_shared
                 .store(true, std::sync::atomic::Ordering::SeqCst);
+            true
+        }
+    }
+
+    /// Claim this storage as a WebAssembly linear memory the engine addresses
+    /// through plain slices. Returns `false` when another agent can see the
+    /// bytes, in which case the caller must refuse to make it a linear memory.
+    ///
+    /// The claim and `mark_shared` are one atomic transition on the same word,
+    /// so no interleaving leaves a block both engine-owned and shareable —
+    /// there is no window between the check and the first plain access.
+    pub fn claim_for_engine(&self) -> bool {
+        #[cfg(not(feature = "workers"))]
+        {
+            true
+        }
+        #[cfg(feature = "workers")]
+        {
+            // The host's bytes are not a reservation this crate controls, so
+            // there is nothing to claim; wasm memories are never borrowed.
+            self.borrowed.is_none() && self.block.claim_for_engine()
         }
     }
 
@@ -1009,7 +1108,9 @@ impl SharedBuffer {
     }
 
     /// Copy `len` bytes out of the block at `offset` (a plain read; the
-    /// caller synchronizes concurrent access).
+    /// caller synchronizes concurrent access). A block another agent can see is
+    /// read through relaxed atomics instead, so the copy never races with that
+    /// agent's accesses.
     pub fn read(&self, offset: usize, len: usize) -> Result<Vec<u8>, OutOfBounds> {
         let end = offset.checked_add(len).ok_or_else(out_of_bounds)?;
         if let Some(borrowed) = &self.borrowed {
@@ -1036,13 +1137,43 @@ impl SharedBuffer {
             if end > self.byte_length() {
                 return Err(out_of_bounds());
             }
-            let base = self.block.as_ptr() as *const AtomicU64 as *const u8;
             let mut out = vec![0u8; len];
+            if self.block.is_shared() {
+                self.copy_out_atomic(offset, &mut out);
+                return Ok(out);
+            }
+            let base = self.block.as_ptr() as *const AtomicU64 as *const u8;
             // SAFETY: bounds-checked above; the Arc keeps the block alive.
             unsafe {
                 std::ptr::copy_nonoverlapping(base.add(offset), out.as_mut_ptr(), len);
             }
             Ok(out)
+        }
+    }
+
+    /// A copy out of a block another agent can see: byte-at-a-time relaxed
+    /// atomics. A `copy_nonoverlapping` over shared storage races with the other
+    /// agent's accesses, and a race is undefined behaviour in Rust's memory
+    /// model even when the other side is atomic. Relaxed is enough because a
+    /// non-atomic JavaScript access carries no ordering to preserve.
+    #[cfg(feature = "workers")]
+    fn copy_out_atomic(&self, offset: usize, out: &mut [u8]) {
+        let base = self.block.as_ptr() as *const AtomicU8;
+        for (i, byte) in out.iter_mut().enumerate() {
+            // SAFETY: `offset + i` is below the byte length checked by the
+            // caller, those pages are committed, and the reservation outlives
+            // the block.
+            *byte = unsafe { &*base.add(offset + i) }.load(std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// The write counterpart of [`copy_out_atomic`](Self::copy_out_atomic).
+    #[cfg(feature = "workers")]
+    fn copy_in_atomic(&self, offset: usize, bytes: &[u8]) {
+        let base = self.block.as_ptr() as *const AtomicU8;
+        for (i, byte) in bytes.iter().enumerate() {
+            // SAFETY: as `copy_out_atomic`.
+            unsafe { &*base.add(offset + i) }.store(*byte, std::sync::atomic::Ordering::Relaxed);
         }
     }
 
@@ -1079,6 +1210,10 @@ impl SharedBuffer {
         {
             if end > self.byte_length() {
                 return Err(out_of_bounds());
+            }
+            if self.block.is_shared() {
+                self.copy_out_atomic(offset, out);
+                return Ok(());
             }
             let base = self.block.as_ptr() as *const AtomicU64 as *const u8;
             // SAFETY: bounds-checked above; the Arc keeps the block alive.
@@ -1121,6 +1256,10 @@ impl SharedBuffer {
         {
             if end > self.byte_length() {
                 return Err(out_of_bounds());
+            }
+            if self.block.is_shared() {
+                self.copy_in_atomic(offset, bytes);
+                return Ok(());
             }
             let base = self.block.as_ptr() as *const AtomicU64 as *mut u8;
             // SAFETY: bounds-checked above; the Arc keeps the block alive.
@@ -1167,10 +1306,23 @@ impl SharedBuffer {
                     return Err(out_of_bounds());
                 }
                 let base = self.block.as_ptr() as *mut u8;
-                // SAFETY: `new_length <= capacity`, the pages are committed, and
-                // the reservation keeps them mapped for the block's life.
-                unsafe {
-                    std::ptr::write_bytes(base.add(old_length), 0, new_length - old_length);
+                // A newly exposed range is reachable from a view another agent
+                // already holds, so zero it through atomics when the storage is
+                // shared; otherwise a plain fill is the whole cost.
+                if self.block.is_shared() {
+                    // SAFETY: `new_length <= capacity`, the pages are committed,
+                    // and the reservation keeps them mapped for the block's life.
+                    unsafe {
+                        for i in old_length..new_length {
+                            (&*(base.add(i) as *const AtomicU8))
+                                .store(0, std::sync::atomic::Ordering::Relaxed);
+                        }
+                    }
+                } else {
+                    // SAFETY: as above.
+                    unsafe {
+                        std::ptr::write_bytes(base.add(old_length), 0, new_length - old_length);
+                    }
                 }
             }
             self.byte_length
@@ -1596,5 +1748,73 @@ mod tests {
             1,
             "the last clone releases it, once"
         );
+    }
+
+    /// A block is either shareable or a wasm linear memory, never both (M-12):
+    /// the engine addresses a linear memory through plain slices, so another
+    /// agent thread reading the same bytes would be a data race. The two claims
+    /// are one atomic transition, which is why neither can be granted after the
+    /// other.
+    #[cfg(feature = "workers")]
+    #[test]
+    fn a_block_is_shared_or_engine_owned_but_never_both() {
+        let shared_first = SharedBuffer::new(8);
+        assert!(shared_first.mark_shared(), "a private block can be shared");
+        assert!(
+            !shared_first.claim_for_engine(),
+            "a shareable block cannot become a linear memory"
+        );
+        assert!(
+            shared_first.is_shared(),
+            "the refused claim changed nothing"
+        );
+
+        let engine_first = SharedBuffer::new(8);
+        assert!(
+            engine_first.claim_for_engine(),
+            "a private block can become a linear memory"
+        );
+        assert!(
+            !engine_first.mark_shared(),
+            "a linear memory cannot be published to another agent"
+        );
+        assert!(
+            !engine_first.is_shared(),
+            "the refused share left the mirror alone"
+        );
+
+        // Both are idempotent: a second view of one buffer, or a second module
+        // memory over one storage, is not a conflict.
+        assert!(engine_first.claim_for_engine());
+        assert!(shared_first.mark_shared());
+
+        // A block over the same storage (a buffer the engine did not create)
+        // sees the same role, so it cannot be claimed either.
+        assert!(!shared_first.for_new_buffer().claim_for_engine());
+    }
+
+    /// A shareable block still round-trips its bytes — through the atomic path
+    /// this build uses for a block another agent can see.
+    #[cfg(feature = "workers")]
+    #[test]
+    fn a_shared_block_round_trips_through_the_atomic_path() {
+        let mut block = SharedBuffer::new_with_capacity(4, 16);
+        assert!(block.mark_shared());
+
+        block.write(0, &[1, 2, 3, 4]).expect("write");
+        assert_eq!(block.read(0, 4).unwrap(), vec![1, 2, 3, 4]);
+        let mut out = [0u8; 2];
+        block.read_into(1, &mut out).expect("read_into");
+        assert_eq!(out, [2, 3]);
+
+        // A grow zero-fills the exposed range atomically, and the earlier
+        // bytes are still there.
+        block.resize(8).expect("grow");
+        assert_eq!(block.read(0, 8).unwrap(), vec![1, 2, 3, 4, 0, 0, 0, 0]);
+
+        // The block's own atomics and the plain paths see the same bytes.
+        block.atomic_store(2, 2, 0x0102).unwrap();
+        assert_eq!(block.read(2, 2).unwrap(), vec![0x02, 0x01]);
+        assert_eq!(block.atomic_load(2, 2).unwrap(), 0x0102);
     }
 }

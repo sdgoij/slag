@@ -47,7 +47,7 @@ model that omits `LoadLocal`, `CreateArrow`, and other pushing steps, so live
 write barrier was reproduced with `--gc-stress`; in production the same schedule
 is a use-after-free of young closures.
 
-## Remediation status (2026-10-23)
+## Remediation status (2026-10-24)
 
 Fixed and validated in the first remediation pass:
 
@@ -130,12 +130,10 @@ Fixed and validated in the first remediation pass:
   path converts exactly the declared parameters (missing → `undefined`, extra
   ignored) instead of copying the JS argument vector, which shifted declared
   locals.
-- **Low (deferred)** — import matching still ignores the `shared` flag. The
-  binary decoder rejects a shared module memory type
-  (`decode_memory_limits`), so the only shared type the store can see is a
-  host-created `WebAssembly.Memory`; enforcing equality would reject the
-  intentional shared bridge without enabling a conformant shared module.
-  Revisit when the decoder accepts shared limits.
+- **Low (import matching, single-agent build)** — see the M-12 entry and the
+  import-matching entry above: the flag is compared under `workers` and ignored
+  in the single-agent build, where no other thread can observe the block and the
+  shared bridge is the only way a shared memory type reaches the store.
 - **M-4** — `Symbol.replace` now runs the single spec loop (22.2.7.3 steps
   13a-13l): each match is replaced before the next exec instead of collecting
   every exec result first. Memory is bounded by the output string rather than
@@ -158,6 +156,28 @@ Fixed and validated in the first remediation pass:
   `new_with_capacity(0, 1 GiB)` stays under a quarter of the maximum. The
   bookkeeping count alone would not have caught a bridge that committed eagerly
   and then under-reported.
+- **M-12** — worker memory atomics. Two plain accesses could reach a byte block
+  another agent thread also touched, which is a data race (undefined behaviour)
+  even when the other side is atomic: the JS typed-array paths (`read`, `write`,
+  `read_into`) copied with `copy_nonoverlapping`, and the wasm interpreter
+  addressed a linear memory through `&mut [u8]` views
+  (`crates/wasm/src/exec.rs`, `MemoryBytes::deref_mut`). The storage now carries
+  one atomic *role* (`byteblock`'s `Reservation::role`): `mark_shared` and the
+  new `claim_for_engine` are the two sides of one compare-exchange, so a block is
+  either shareable or a linear memory and never both. A shareable block's plain
+  paths go byte-at-a-time through relaxed atomics; the wasm side claims every
+  memory it allocates, and `memory_matches` now requires the `shared` flag to
+  agree under `workers`, so a host's shared memory cannot be bound to a module
+  (the interpreter would address its bytes plainly). A claimed block refuses to
+  be published as a `SharedArrayBuffer`, which is how a spawned worker or the
+  JS-API's `Memory.prototype.buffer` would have handed it to another agent.
+  The single-agent build is unchanged: it cannot share a block at all.
+- **Low (import matching)** — the `shared` flag is now compared under `workers`
+  (see M-12). The single-agent build still ignores it, deliberately: the decoder
+  rejects a shared module memory type, so the only shared type the store can see
+  is a host-created `WebAssembly.Memory`, and comparing the flag there would
+  reject the intentional shared bridge without enabling a conformant shared
+  module.
 - **M-8 (remainder)** — the Deno reconcile now logs every lock entry it moved,
   the build runs `cargo build --locked` so nothing resolves beyond the
   reconciled lock, and an overridden `DENO_REPO` is announced instead of being
@@ -216,9 +236,8 @@ Fixed and validated in the first remediation pass:
   isolate's state is unknown). `is_poisoned`/`unpoison` are exported and
   re-exported by `crates/jsc` for a host that rebuilds its state.
 
-Outstanding from this report: worker memory atomics (M-12, `workers` only), the
-deferred wasm `shared`-flag import check, and the fuzzing gap. Every finding not listed here is fixed and validated in
-the passes below.
+Outstanding from this report: the fuzzing gap. Every other finding is fixed and
+validated in the passes below.
 
 Validation for the first pass: `cargo clippy --workspace --all-targets -- -D
 warnings` is clean; `cargo fmt --all -- --check` is clean; 1,062 runtime unit
@@ -309,6 +328,18 @@ for `-p runtime -p cli --features raylib`, and rustfmt is clean; `cargo check`
 and `clippy -p jit --target aarch64-unknown-linux-gnu` compile the flush path;
 the raylib surface test (with the new policy assertions) passes, as do the 13
 `ffi` tests (including the poison test) and 1,068 runtime lib tests.
+
+Validation for the fourteenth pass: the new byteblock tests pin that a block is
+shared or engine-owned but never both (and that a block over the same storage
+sees the same role), and that a shareable block round-trips its bytes through
+the atomic path; the wasm tests pin that a claimed linear memory refuses to
+become shareable and that a shared memory does not match an unshared import
+(run with `-p wasm --features byteblock/workers`, since that is what enables the
+atomic storage); the runtime's shared-bridge test now asserts the refusal under
+`workers` and the aliasing bridge in the single-agent build. `cargo test
+--workspace --all-features` is green in debug and release, clippy `-D warnings`
+and rustfmt are clean, and the wasm sweeps pass (core 20,662 assertions, JS-API
+1,001 tests) in the default build.
 
 ---
 
