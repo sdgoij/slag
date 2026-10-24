@@ -7,3 +7,4 @@
 pub use stackprobe::has_headroom;
 pub use stackprobe::install_probe;
 pub use stackprobe::probe_installed;
+pub use stackprobe::stack_bounds;

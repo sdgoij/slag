@@ -33,73 +33,10 @@ const STACK_GUARD_RESERVE: usize = 128 * 1024;
 /// The current thread's reserved stack bounds as `(low, high)` — the
 /// addresses between which the stack may grow (it grows downward from
 /// `high`). `None` when the platform cannot report them (the guard stays
-/// disabled then).
+/// disabled then). The implementation lives in `stackprobe`, which needs the
+/// same answer.
 fn stack_bounds() -> Option<(usize, usize)> {
-    #[cfg(target_os = "windows")]
-    {
-        #[link(name = "Kernel32")]
-        unsafe extern "system" {
-            fn GetCurrentThreadStackLimits(low_limit: *mut usize, high_limit: *mut usize) -> i32;
-        }
-        let mut low = 0usize;
-        let mut high = 0usize;
-        // SAFETY: both pointers reference writable locals the callee does
-        // not retain.
-        let ok = unsafe { GetCurrentThreadStackLimits(&mut low, &mut high) };
-        if ok != 0 && low != 0 && high > low {
-            Some((low, high))
-        } else {
-            None
-        }
-    }
-    #[cfg(any(target_os = "linux", target_os = "android", target_os = "freebsd"))]
-    {
-        // SAFETY: `pthread_getattr_np` fills `attr` for the calling thread
-        // and `pthread_attr_getstack` reads it back; both operate on locals.
-        unsafe {
-            let mut attr = std::mem::MaybeUninit::<libc::pthread_attr_t>::uninit();
-            if libc::pthread_getattr_np(libc::pthread_self(), attr.as_mut_ptr()) != 0 {
-                None
-            } else {
-                let mut attr = attr.assume_init();
-                let mut stackaddr: *mut libc::c_void = std::ptr::null_mut();
-                let mut stacksize: libc::size_t = 0;
-                let ok = libc::pthread_attr_getstack(&attr, &mut stackaddr, &mut stacksize) == 0;
-                let _ = libc::pthread_attr_destroy(&mut attr);
-                if ok && !stackaddr.is_null() && stacksize > 0 {
-                    let low = stackaddr as usize;
-                    Some((low, low + stacksize))
-                } else {
-                    None
-                }
-            }
-        }
-    }
-    #[cfg(any(target_os = "macos", target_os = "ios"))]
-    {
-        // SAFETY: both functions return the calling thread's own stack
-        // geometry.
-        unsafe {
-            let high = libc::pthread_get_stackaddr_np(libc::pthread_self()) as usize;
-            let size = libc::pthread_get_stacksize_np(libc::pthread_self());
-            if high != 0 && size > 0 {
-                Some((high - size, high))
-            } else {
-                None
-            }
-        }
-    }
-    #[cfg(not(any(
-        target_os = "windows",
-        target_os = "linux",
-        target_os = "android",
-        target_os = "freebsd",
-        target_os = "macos",
-        target_os = "ios"
-    )))]
-    {
-        None
-    }
+    crux::stack::stack_bounds()
 }
 
 /// The current stack pointer, sampled as the address of a local. The local

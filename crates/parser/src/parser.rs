@@ -71,32 +71,12 @@ pub(crate) struct Scope {
 /// cannot be caught.
 ///
 /// A count is only half the bound: it says nothing about what a frame costs, so
-/// a depth that is safe optimized can overflow unoptimized. [`Parser::new`]
-/// records the stack it started with and [`enter_nesting`](Parser::enter_nesting)
-/// refuses once a parse has consumed [`PARSE_STACK_BUDGET`] of it, and the host's
-/// probe ([`crux::stack::has_headroom`]) answers when one is installed.
+/// a depth that is safe optimized can overflow unoptimized. `enter_nesting`
+/// therefore also asks the stack probe ([`crux::stack::has_headroom`]), which
+/// measures the thread's remaining stack — a fixed "this parse may use N
+/// bytes" budget cannot, because what is left depends on how deep the caller
+/// already is.
 pub(crate) const MAX_PARSE_DEPTH: u32 = 96;
-
-/// How much native stack one parse may consume before it refuses.
-///
-/// A recursive descent's frame is roughly an order of magnitude larger
-/// unoptimized than optimized, so the budget scales with the profile. The
-/// release figure is above what [`MAX_PARSE_DEPTH`] frames cost, so it never
-/// shortens the nesting the count allows; the debug figure fires before a
-/// default-sized test thread's stack runs out, which the count does not.
-#[cfg(debug_assertions)]
-const PARSE_STACK_BUDGET: usize = 1024 * 1024;
-#[cfg(not(debug_assertions))]
-const PARSE_STACK_BUDGET: usize = 256 * 1024;
-
-/// The current stack pointer, sampled as the address of a local (the same probe
-/// the runtime's guard uses; the exact slot is irrelevant because only the
-/// relative distance from the parse's start matters).
-#[inline]
-fn stack_pointer() -> usize {
-    let probe = 0u8;
-    (&probe as *const u8) as usize
-}
 
 pub struct Parser<'s> {
     pub(crate) stream: TokenStream<'s>,
@@ -152,9 +132,6 @@ pub struct Parser<'s> {
     pub(crate) suppress_cover_raise: usize,
     /// Current recursive-descent nesting, bounded by [`MAX_PARSE_DEPTH`].
     pub(crate) depth: u32,
-    /// The stack pointer below which this parse refuses to descend further:
-    /// [`PARSE_STACK_BUDGET`] below where the parse started.
-    pub(crate) stack_floor: usize,
     /// The last consumed token closed a statement (a `}` ending a block,
     /// function/class declaration, or switch): the next token is an
     /// expression start, so `/` must lex as a RegularExpressionLiteral. The
@@ -221,7 +198,6 @@ impl<'s> Parser<'s> {
             cover_error: None,
             suppress_cover_raise: 0,
             depth: 0,
-            stack_floor: stack_pointer().saturating_sub(PARSE_STACK_BUDGET),
             after_statement_brace: false,
             reject_arrow: false,
             scopes: vec![Scope::default()],
@@ -232,18 +208,13 @@ impl<'s> Parser<'s> {
     /// Enter one recursive-descent level, rejecting a source whose nesting
     /// would overflow the native stack.
     ///
-    /// The count is the ceiling. Below it, the stack is checked by whichever
-    /// answer is available: the host's probe when one is installed (it measures
-    /// the real stack), else the stack this parse has already consumed. The
-    /// count alone cannot promise it — a debug frame is perhaps twenty times a
-    /// release one, so a depth that is safe optimized dies unoptimized.
+    /// The count is the ceiling. Below it, the stack probe decides: the host's
+    /// when one is installed, else the operating system's report of this
+    /// thread's remaining stack. Neither is optional — a debug frame is perhaps
+    /// twenty times a release one, so a depth that is safe optimized dies
+    /// unoptimized.
     pub(crate) fn enter_nesting(&mut self) -> Result<(), JsError> {
-        let stack_ok = if crux::stack::probe_installed() {
-            crux::stack::has_headroom()
-        } else {
-            stack_pointer() >= self.stack_floor
-        };
-        if self.depth >= MAX_PARSE_DEPTH || !stack_ok {
+        if self.depth >= MAX_PARSE_DEPTH || !crux::stack::has_headroom() {
             return Err(JsError::new(
                 crux::ErrorKind::SyntaxError,
                 "Source is nested too deeply".into(),
