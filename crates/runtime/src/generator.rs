@@ -227,7 +227,7 @@ fn generator_methods(
     agent: &Agent,
     realm: crux::Handle<crate::realm::Realm>,
 ) -> Option<GeneratorMethods> {
-    if let Some(cached) = agent.generator_methods.get()
+    if let Some(cached) = agent.roots.generator_methods.get()
         && cached.realm.ptr_eq(realm)
         && cached.generation == cached.proto.generation.get()
     {
@@ -245,7 +245,7 @@ fn generator_methods(
         ret: proto.get(&JsString::from_utf8(RETURN)).ok(),
         throw: proto.get(&JsString::from_utf8(THROW)).ok(),
     };
-    agent.generator_methods.set(Some(methods));
+    agent.roots.generator_methods.set(Some(methods));
     Some(methods)
 }
 

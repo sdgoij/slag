@@ -627,14 +627,17 @@ fn fork_function_boilerplate_map(restricted: bool) -> Option<Handle<crux::Map>> 
 }
 
 /// The per-agent cached ordinary-function boilerplate shape (Cut 73): fork
-/// once per (restricted) kind and keep the handle on the agent (traced), so
+/// once per (restricted) kind and keep the handle in the roots (traced), so
 /// every later `register_function` skips the child-chain walk.
 fn function_boilerplate_map(agent: &mut Agent, restricted: bool) -> Option<Handle<crux::Map>> {
-    let slot = &mut agent.function_boilerplate_maps[usize::from(restricted)];
-    if slot.is_none() {
-        *slot = fork_function_boilerplate_map(restricted);
+    let index = usize::from(restricted);
+    if let Some(map) = agent.roots.function_boilerplate_maps[index].get() {
+        return Some(map);
     }
-    *slot
+    // The fork allocates, so it runs with no guard on the table.
+    let map = fork_function_boilerplate_map(restricted);
+    agent.roots.function_boilerplate_maps[index].set(map);
+    map
 }
 
 /// SetFunctionLength + SetFunctionName (+ the restricted `caller`/
@@ -3517,7 +3520,8 @@ pub(crate) fn construct_this_object(
         // chain), so a conditional store cannot mask an inherited property.
         let index = crate::ir::construct_pattern_index(func.id());
         let generation = func.object.generation();
-        let map = match agent.construct_maps[index].as_ref() {
+        let cached = agent.roots.construct_maps[index].get();
+        let map = match cached {
             Some(cell)
                 if cell.id == func.id()
                     && cell.proto_id == proto_obj.id()
@@ -3553,12 +3557,12 @@ pub(crate) fn construct_this_object(
                     }
                 }
                 if complete {
-                    agent.construct_maps[index] = Some(crate::ir::ConstructMapCell {
+                    agent.roots.construct_maps[index].set(Some(crate::ir::ConstructMapCell {
                         id: func.id(),
                         proto_id: proto_obj.id(),
                         generation,
                         map,
-                    });
+                    }));
                 }
                 map
             }

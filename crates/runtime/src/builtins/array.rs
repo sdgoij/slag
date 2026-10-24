@@ -446,7 +446,7 @@ fn species_ctor_atom() -> crux::AtomId {
 /// oracle, expr.rs).
 fn array_species_fast_probe(agent: &mut Agent, array_proto: &crux::object::JsObject) -> bool {
     let index = array_proto.id() as usize & (crate::ir::MEMBER_CELLS - 1);
-    let Some(verdict) = agent.species_fast_cells[index].as_ref() else {
+    let Some(verdict) = agent.roots.species_fast_cells[index].get() else {
         return false;
     };
     if verdict.array_proto.0 != array_proto.id()
@@ -521,12 +521,12 @@ fn array_species_fast_resolve(
         generation: array_proto.generation(),
         value: constructor_value,
     };
-    agent.species_fast_cells[index] = Some(crate::agent::ArraySpeciesVerdict {
+    agent.roots.species_fast_cells[index].set(Some(crate::agent::ArraySpeciesVerdict {
         array_proto: (array_proto.id(), array_proto.generation()),
         array_ctor_object: (array_ctor.object.id(), array_ctor.object.generation()),
         array_ctor_value: constructor_value,
         ctor_vindex,
-    });
+    }));
     Ok(Some(()))
 }
 
@@ -875,7 +875,7 @@ fn is_concat_spreadable(agent: &mut Agent, value: &Value) -> Result<bool, JsErro
 /// (bump), and symbol-keyed stores never take the compiled no-bump path.
 fn concat_spread_probe(agent: &mut Agent, array_proto: &crux::object::JsObject) -> bool {
     let index = array_proto.id() as usize & (crate::ir::MEMBER_CELLS - 1);
-    let Some(verdict) = agent.spread_cells[index].as_ref() else {
+    let Some(verdict) = agent.roots.spread_cells[index].get() else {
         return false;
     };
     verdict.array_proto.0 == array_proto.id()
@@ -906,11 +906,11 @@ fn concat_spread_resolve(
         return Ok(None);
     }
     let index = array_proto.id() as usize & (crate::ir::MEMBER_CELLS - 1);
-    agent.spread_cells[index] = Some(crate::agent::ConcatSpreadVerdict {
+    agent.roots.spread_cells[index].set(Some(crate::agent::ConcatSpreadVerdict {
         array_proto: (array_proto.id(), array_proto.generation()),
         object_proto: (object_proto.id(), object_proto.generation()),
         object_proto_handle: object_proto,
-    });
+    }));
     Ok(Some(()))
 }
 

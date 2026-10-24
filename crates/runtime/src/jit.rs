@@ -5358,7 +5358,7 @@ extern "C" fn for_in_begin(ctx: *mut c_void, value: u64) -> u64 {
         let dummy = crux::object::JsObject::ordinary_object_create(None);
         vm.for_in_stack.push(crate::ir::ForInState {
             base: dummy,
-            keys: Vec::new(),
+            keys: std::rc::Rc::new(Vec::new()),
             index: 0,
             base_generation: 0,
             fast: false,
@@ -5389,13 +5389,13 @@ extern "C" fn for_in_begin(ctx: *mut c_void, value: u64) -> u64 {
                 if let Err(error) = crate::ir::for_in_cache_put(agent, &obj, &keys) {
                     return slow_error(ctx, error);
                 }
-                keys
+                std::rc::Rc::new(keys)
             }
             Err(error) => return slow_error(ctx, error),
         }
     } else {
         match crate::eval::for_in_key_levels(agent, &rhs) {
-            Ok(keys) => keys,
+            Ok(keys) => std::rc::Rc::new(keys),
             Err(error) => return slow_error(ctx, error),
         }
     };

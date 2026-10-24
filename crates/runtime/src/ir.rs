@@ -2555,6 +2555,11 @@ pub enum CtlResult {
     Done(VmOutcome),
 }
 
+/// A for-in key list: (prototype level, key) pairs. `Rc`-shared between the
+/// enumeration cache and every loop state that reuses it, so neither a cache
+/// probe nor a re-entry has to copy the list.
+pub(crate) type ForInKeys = std::rc::Rc<Vec<(usize, Value)>>;
+
 /// A for-in enumeration in progress: the base object, the
 /// (prototype-level, key) pairs, and the next index. When the base is an
 /// ordinary/array object and every collected key is an own (level-0) key,
@@ -2567,7 +2572,9 @@ pub enum CtlResult {
 #[derive(Debug)]
 pub struct ForInState {
     pub(crate) base: Handle<crux::object::JsObject>,
-    pub(crate) keys: Vec<(usize, Value)>,
+    /// Shared with the enumeration cache when the chain was reused, so
+    /// re-entering a for-in over an unchanged chain allocates nothing.
+    pub(crate) keys: ForInKeys,
     pub(crate) index: usize,
     pub(crate) base_generation: u32,
     pub(crate) fast: bool,
@@ -2607,14 +2614,16 @@ pub(crate) const FOR_IN_CELLS: usize = 64;
 /// lesson).
 pub struct ForInEnumCache {
     pub(crate) base: Handle<crux::object::JsObject>,
-    chain: Vec<(u64, u32)>,
-    keys: Vec<(usize, Value)>,
+    // `Rc`s so a probe copies the lists out of the table's borrow without
+    // allocating: a `RefCell` guard must never span an allocation.
+    chain: std::rc::Rc<Vec<(u64, u32)>>,
+    keys: ForInKeys,
 }
 
 impl Trace for ForInEnumCache {
     fn trace(&self, visit: &mut dyn FnMut(GcAny)) {
         self.base.trace(visit);
-        for (_, key) in &self.keys {
+        for (_, key) in self.keys.iter() {
             key.trace(visit);
         }
     }
@@ -2643,15 +2652,23 @@ fn for_in_chain_snapshot(
 pub(crate) fn for_in_cache_keys(
     agent: &Agent,
     obj: &Handle<crux::object::JsObject>,
-) -> Result<Option<Vec<(usize, Value)>>, JsError> {
-    let Some(entry) = agent.for_in_cells[obj.id() as usize & (FOR_IN_CELLS - 1)].as_ref() else {
-        return Ok(None);
+) -> Result<Option<ForInKeys>, JsError> {
+    let slot = obj.id() as usize & (FOR_IN_CELLS - 1);
+    // Clone the two shared lists out of the borrow: both clones are refcount
+    // bumps, so the guard closes before the probe's live-chain walk (which
+    // may allocate) and before the caller uses the keys.
+    let (base_id, chain, keys) = {
+        let cells = agent.roots.for_in_cells.borrow();
+        match cells[slot].as_ref() {
+            Some(entry) => (entry.base.id(), entry.chain.clone(), entry.keys.clone()),
+            None => return Ok(None),
+        }
     };
-    if entry.base.id() != obj.id() {
+    if base_id != obj.id() {
         return Ok(None);
     }
     let mut current = Some(*obj);
-    for &(id, generation) in &entry.chain {
+    for &(id, generation) in chain.iter() {
         let Some(link) = current else {
             return Ok(None); // the chain shortened
         };
@@ -2663,7 +2680,7 @@ pub(crate) fn for_in_cache_keys(
     if current.is_some() {
         return Ok(None); // the chain grew past the snapshot
     }
-    Ok(Some(entry.keys.clone()))
+    Ok(Some(keys))
 }
 
 /// Cache `keys` as the enumeration of `obj`'s chain (only when the whole
@@ -2677,10 +2694,13 @@ pub(crate) fn for_in_cache_put(
         return Ok(());
     };
     let slot = obj.id() as usize & (FOR_IN_CELLS - 1);
-    agent.for_in_cells[slot] = Some(ForInEnumCache {
+    // Build both lists before taking the table's borrow.
+    let chain = std::rc::Rc::new(chain);
+    let keys = std::rc::Rc::new(keys.to_vec());
+    agent.roots.for_in_cells.borrow_mut()[slot] = Some(ForInEnumCache {
         base: *obj,
         chain,
-        keys: keys.to_vec(),
+        keys,
     });
     Ok(())
 }
@@ -2748,6 +2768,7 @@ pub(crate) const MEMBER_WRITE_CELLS: usize = 4096;
 /// "prototype") member value cell when warm — the oracle the L1c record-
 /// discipline work keeps value-write-exact — not by a generation-keyed cell,
 /// which a value write to `prototype` would leave stale.)
+#[derive(Clone, Copy)]
 pub struct ConstructMapCell {
     pub id: u64,
     pub proto_id: u64,
@@ -2795,6 +2816,7 @@ pub(crate) fn store_construct_patterns(
 /// match means no own-property change since the read (slice 11 bumps every
 /// mutation, including in-place element writes), so the value is current
 /// without re-borrowing the property vector.
+#[derive(Clone, Copy)]
 pub(crate) struct ArrayElementValueCell {
     pub id: u64,
     pub index: u64,
@@ -3709,7 +3731,7 @@ impl Trace for SavedControl {
         self.resume_abrupt.trace(visit);
         for state in &self.for_in_stack {
             state.base.trace(visit);
-            for (_, key) in &state.keys {
+            for (_, key) in state.keys.iter() {
                 key.trace(visit);
             }
         }
@@ -4034,7 +4056,7 @@ impl Trace for Vm {
         // tracing an idle Vm's empty stacks is a no-op).
         for state in &self.for_in_stack {
             state.base.trace(visit);
-            for (_, key) in &state.keys {
+            for (_, key) in state.keys.iter() {
                 key.trace(visit);
             }
         }
@@ -6707,17 +6729,19 @@ impl Vm {
                 .copied();
             if let Some(value) = value {
                 let cache_index = Self::array_element_index(object.id(), index);
-                agent.array_element_value_cells[cache_index] = Some(ArrayElementValueCell {
-                    id: object.id(),
-                    index,
-                    generation: object.generation(),
-                    value,
-                });
+                agent.roots.array_element_value_cells[cache_index].set(Some(
+                    ArrayElementValueCell {
+                        id: object.id(),
+                        index,
+                        generation: object.generation(),
+                        value,
+                    },
+                ));
             }
             return value;
         }
         let cache_index = Self::array_element_index(object.id(), index);
-        if let Some(cell) = agent.array_element_value_cells[cache_index].as_ref()
+        if let Some(cell) = agent.roots.array_element_value_cells[cache_index].get()
             && cell.id == object.id()
             && cell.index == index
             && cell.generation == object.generation()
@@ -6736,12 +6760,14 @@ impl Vm {
         match &property.kind {
             crux::object::PropertyKind::Data { value, .. } => {
                 let value = *value;
-                agent.array_element_value_cells[cache_index] = Some(ArrayElementValueCell {
-                    id: object.id(),
-                    index,
-                    generation: object.generation(),
-                    value,
-                });
+                agent.roots.array_element_value_cells[cache_index].set(Some(
+                    ArrayElementValueCell {
+                        id: object.id(),
+                        index,
+                        generation: object.generation(),
+                        value,
+                    },
+                ));
                 Some(value)
             }
             _ => None,
@@ -6768,12 +6794,14 @@ impl Vm {
                 .copied();
             if let Some(value) = value {
                 let cache_index = Self::array_element_index(object.id(), index);
-                agent.array_element_value_cells[cache_index] = Some(ArrayElementValueCell {
-                    id: object.id(),
-                    index,
-                    generation: object.generation(),
-                    value,
-                });
+                agent.roots.array_element_value_cells[cache_index].set(Some(
+                    ArrayElementValueCell {
+                        id: object.id(),
+                        index,
+                        generation: object.generation(),
+                        value,
+                    },
+                ));
             }
             return;
         }
@@ -6792,12 +6820,14 @@ impl Vm {
             {
                 let cache_index = Self::array_element_index(object.id(), index);
                 agent.array_element_cells[cache_index] = Some((object.id(), index, atom, slot));
-                agent.array_element_value_cells[cache_index] = Some(ArrayElementValueCell {
-                    id: object.id(),
-                    index,
-                    generation: object.generation(),
-                    value: *value,
-                });
+                agent.roots.array_element_value_cells[cache_index].set(Some(
+                    ArrayElementValueCell {
+                        id: object.id(),
+                        index,
+                        generation: object.generation(),
+                        value: *value,
+                    },
+                ));
             }
         }
     }
@@ -10067,7 +10097,7 @@ impl Vm {
                         let dummy = crux::object::JsObject::ordinary_object_create(None);
                         self.for_in_stack.push(ForInState {
                             base: dummy,
-                            keys: Vec::new(),
+                            keys: std::rc::Rc::new(Vec::new()),
                             index: 0,
                             base_generation: 0,
                             fast: false,
@@ -10087,11 +10117,11 @@ impl Vm {
                                 None => {
                                     let keys = crate::eval::for_in_key_levels(agent, &rhs)?;
                                     for_in_cache_put(agent, &obj, &keys)?;
-                                    keys
+                                    std::rc::Rc::new(keys)
                                 }
                             }
                         } else {
-                            crate::eval::for_in_key_levels(agent, &rhs)?
+                            std::rc::Rc::new(crate::eval::for_in_key_levels(agent, &rhs)?)
                         };
                         let fast = for_in_generation_tracked(&obj)
                             && keys.iter().all(|(level, _)| *level == 0);
@@ -14500,49 +14530,46 @@ impl Vm {
         // place (no tuple) and the entry is cloned only once the global/
         // caller checks pass; the global comparison reads the cached
         // handle without cloning it.
-        if let Some(cell) = agent.global_leaf_cells[index].as_ref()
-            && cell.name == name
-        {
-            // Clone the entry while the cell borrow is live (the immutable
-            // `agent` borrow must end before the `&mut agent` checks/run);
-            // the clone is a single Rc bump for the common no-env leaf.
-            let entry = cell.entry.clone();
-            let (global_id, global_generation) = (cell.global_id, cell.global_generation);
-            if self.global_matches(agent, global_id, global_generation)?
-                && self.can_inline_leaf()
+        // Read the cell out of its borrow-scoped table: the entry clone is a
+        // single Rc bump for the common no-env leaf, and no guard is held
+        // while the checks and the run below allocate.
+        let cached = {
+            let cells = agent.roots.global_leaf_cells.borrow();
+            match cells[index].as_ref() {
+                Some(cell) if cell.name == name => {
+                    Some((cell.entry.clone(), cell.global_id, cell.global_generation))
+                }
+                _ => None,
+            }
+        };
+        if let Some((entry, global_id, global_generation)) = cached
+            && self.global_matches(agent, global_id, global_generation)?
+            && self.can_inline_leaf()
                 && agent.realm_count.get() == 1
                 // A termination request stops the next call: the cached leaf
                 // must not run, and the general core below is the one that
                 // refuses it (it checks at its own top).
                 && !agent.is_terminating()
-            {
-                if agent.jit_hook.is_some() {
-                    if self.try_jit_leaf(
-                        agent,
-                        argc,
-                        Value::Undefined,
-                        &entry.ir,
-                        entry.strict,
-                        0,
-                        entry.environment,
-                        caller_arg_base,
-                    )? {
-                        return Ok(());
-                    }
-                    // The fused args (if any) were materialized by the JIT
-                    // attempt; the interpreter fallback reads them from the
-                    // stack (no caller-frame base).
-                    return self.run_inline_leaf(agent, argc, Value::Undefined, entry, 0, None);
-                }
-                return self.run_inline_leaf(
+        {
+            if agent.jit_hook.is_some() {
+                if self.try_jit_leaf(
                     agent,
                     argc,
                     Value::Undefined,
-                    entry,
+                    &entry.ir,
+                    entry.strict,
                     0,
+                    entry.environment,
                     caller_arg_base,
-                );
+                )? {
+                    return Ok(());
+                }
+                // The fused args (if any) were materialized by the JIT
+                // attempt; the interpreter fallback reads them from the
+                // stack (no caller-frame base).
+                return self.run_inline_leaf(agent, argc, Value::Undefined, entry, 0, None);
             }
+            return self.run_inline_leaf(agent, argc, Value::Undefined, entry, 0, caller_arg_base);
         }
         // The cache missed: materialize the caller-frame arguments (the
         // fused step no longer pushed them), then the general core.
@@ -14582,16 +14609,23 @@ impl Vm {
         // holds the same closure (its heap payload matches the cached one,
         // which the held `callee` keeps alive), so the resolved entry is
         // reused without the kind check, realm check, or leaf lookup.
-        if let Some(payload) = callee.heap_payload()
-            && let Some(cell) = agent.slot_leaf_cells[slot & (SLOT_LEAF_CELLS - 1)].as_ref()
-            && cell.payload == payload
+        let cached = match callee.heap_payload() {
+            Some(payload) => {
+                let cells = agent.roots.slot_leaf_cells.borrow();
+                match cells[slot & (SLOT_LEAF_CELLS - 1)].as_ref() {
+                    Some(cell) if cell.payload == payload => Some(cell.entry.clone()),
+                    _ => None,
+                }
+            }
+            None => None,
+        };
+        if let Some(entry) = cached
             && self.can_inline_leaf()
             && agent.realm_count.get() == 1
             // A termination request stops the next call: the cached leaf must
             // not run, and the general core below is the one that refuses it.
             && !agent.is_terminating()
         {
-            let entry = cell.entry.clone();
             if agent.jit_hook.is_some() {
                 if self.try_jit_leaf(
                     agent,
@@ -15176,14 +15210,6 @@ impl Vm {
             // cache, skipping the `ecma_functions` HashMap lookup on a hit.
             && let Some(entry) = agent.leaf_lookup(function.id())
         {
-            // Clone the entry fields up front so the `leaf_lookup` borrow
-            // of the agent ends before the cache write or the run.
-            let entry = LeafEntry {
-                ir: entry.ir.clone(),
-                strict: entry.strict,
-                environment: entry.environment,
-                construct_inline: entry.construct_inline,
-            };
             match leaf_cache {
                 LeafCacheSite::Global { name } => {
                     // Cache the resolved entry for the next call (the
@@ -15192,7 +15218,7 @@ impl Vm {
                     let index = Self::global_cell_index(name);
                     let cached = entry.clone();
                     let global = self.global_object(agent)?;
-                    agent.global_leaf_cells[index] = Some(GlobalLeafCell {
+                    agent.roots.global_leaf_cells.borrow_mut()[index] = Some(GlobalLeafCell {
                         name,
                         global_id: global.id(),
                         global_generation: global.generation(),
@@ -15203,7 +15229,7 @@ impl Vm {
                     // The held `callee` keeps the closure alive, so its
                     // payload can never be reused while the entry exists.
                     let cached = entry.clone();
-                    agent.slot_leaf_cells[index] = Some(SlotLeafCell {
+                    agent.roots.slot_leaf_cells.borrow_mut()[index] = Some(SlotLeafCell {
                         payload: callee
                             .heap_payload()
                             .expect("a leaf callee is a heap function value"),

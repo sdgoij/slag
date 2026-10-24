@@ -2298,7 +2298,7 @@ fn for_of_next_atom() -> crux::AtomId {
 /// evicted cell — fails the probe and re-resolves.
 fn for_of_fast_probe(agent: &mut Agent, array_proto: &crux::object::JsObject) -> bool {
     let index = array_proto.id() as usize & (crate::ir::MEMBER_CELLS - 1);
-    let Some(verdict) = agent.for_of_fast_cells[index].as_ref() else {
+    let Some(verdict) = agent.roots.for_of_fast_cells[index].get() else {
         return false;
     };
     if verdict.array_proto.0 != array_proto.id()
@@ -2374,7 +2374,7 @@ fn for_of_fast_resolve(
         generation: aip.generation(),
         value: next_stock,
     };
-    agent.for_of_fast_cells[index] = Some(crate::agent::ForOfFastVerdict {
+    agent.roots.for_of_fast_cells[index].set(Some(crate::agent::ForOfFastVerdict {
         array_proto: (array_proto.id(), array_proto.generation()),
         aip: (aip.id(), aip.generation()),
         aip_handle: aip,
@@ -2382,7 +2382,7 @@ fn for_of_fast_resolve(
         object_proto_handle: object_proto,
         aip_next: next_stock,
         aip_next_vindex,
-    });
+    }));
     Ok(Some(()))
 }
 

@@ -206,6 +206,7 @@ pub type IdMap<V> =
 /// cell slot, which resolve warms with the stock `aip_next` and every warm
 /// store to AIP.next fronts, so a probe compares the live cell value to the
 /// recorded stock value.
+#[derive(Clone, Copy)]
 pub(crate) struct ForOfFastVerdict {
     pub array_proto: (u64, u32),
     pub aip: (u64, u32),
@@ -240,6 +241,7 @@ impl Trace for ForOfFastVerdict {
 /// value cell slot, warmed at resolve with the %Array% value and refreshed by
 /// every warm store, so a probe compares the live cell value to the recorded
 /// %Array% value.
+#[derive(Clone, Copy)]
 pub(crate) struct ArraySpeciesVerdict {
     pub array_proto: (u64, u32),
     /// The %Array% function's own data: (object-part id, generation). A
@@ -266,6 +268,7 @@ impl Trace for ArraySpeciesVerdict {
 /// shared objects' generations gate later defines/deletes (an absent own
 /// property can only appear by a define, which bumps; symbol-keyed stores
 /// never take the compiled no-bump member-store path, which is name-keyed).
+#[derive(Clone, Copy)]
 pub(crate) struct ConcatSpreadVerdict {
     pub array_proto: (u64, u32),
     pub object_proto: (u64, u32),
@@ -377,6 +380,10 @@ impl crux::heap::Trace for ErrorStack {
 /// The key of a cached SCRIPT/EVAL body: the exact source text plus
 /// (strict, fast_script, jsx) — see [`AgentRoots::script_bodies`].
 pub(crate) type ScriptBodyKey = (crux::JsString, bool, bool, bool);
+
+/// One leaf-inline cache cell: the function id it was filled for plus the
+/// record body's hot path needs.
+pub(crate) type LeafCacheCell = Option<(u64, crate::ir::LeafEntry)>;
 
 /// The agent's execution-context stack (spec 9.4).
 ///
@@ -686,6 +693,84 @@ pub(crate) struct AgentRoots {
     /// keyed by object identity (spec 26.2.1).
     pub(crate) finalization_registries:
         RefCell<IdMap<std::rc::Rc<std::cell::RefCell<crate::builtins::weakref::FinalizationData>>>>,
+    /// CreateIterResultObject's cached `{value, done}` shape and the realm it
+    /// was forked in (a realm switch refork). The two sequential
+    /// `create_data_property` calls it replaces cost ~100-140 ns each on a
+    /// fresh object; a generator `next()` spent ~160 ns there. Both handles
+    /// are traced below.
+    pub(crate) iter_result_realm: std::cell::Cell<Option<Handle<Realm>>>,
+    pub(crate) iter_result_map: std::cell::Cell<Option<crux::Handle<crux::Map>>>,
+    /// The `%Generator.prototype%` methods `dispatch_call` compares a callee
+    /// against, resolved once per prototype generation: every `g.next()`
+    /// otherwise paid an intrinsic-table hash, three property lookups and
+    /// three string conversions before dispatching. See
+    /// [`crate::generator::GeneratorMethods`].
+    pub(crate) generator_methods: std::cell::Cell<Option<crate::generator::GeneratorMethods>>,
+    /// The for-of fast-verdict cache (Cut 24): "the Array-iteration
+    /// infrastructure is stock" — %Array.prototype%'s own @@iterator is the
+    /// intrinsic, %ArrayIteratorPrototype% has the stock `next`, and no
+    /// `return` on the AIP chain. Re-validated against the three shared
+    /// objects' generations.
+    pub(crate) for_of_fast_cells: [Cell<Option<ForOfFastVerdict>>; crate::ir::MEMBER_CELLS],
+    /// The Array-species fast verdict (this landing): "the species machinery
+    /// of this %Array.prototype% is stock" — see [`ArraySpeciesVerdict`].
+    /// Direct-mapped on the %Array.prototype% id (different realms' protos
+    /// collide on an index only under the id check).
+    pub(crate) species_fast_cells: [Cell<Option<ArraySpeciesVerdict>>; crate::ir::MEMBER_CELLS],
+    /// The concat-spread verdict (this landing): "the %Array.prototype% ->
+    /// %Object.prototype% chain of this %Array.prototype% carries no own
+    /// @@isConcatSpreadable" — see [`ConcatSpreadVerdict`]. Direct-mapped on
+    /// the %Array.prototype% id.
+    pub(crate) spread_cells: [Cell<Option<ConcatSpreadVerdict>>; crate::ir::MEMBER_CELLS],
+    /// The fronting array-element value cache (Cut 35 slice 13): (id, index,
+    /// generation, value) — a hit returns the element with no
+    /// property-vector borrow. Boxed per the Cut 27 lesson.
+    pub(crate) array_element_value_cells:
+        Box<[Cell<Option<crate::ir::ArrayElementValueCell>>; crate::ir::MEMBER_CELLS]>,
+    /// The global call-site leaf cache (Cut 35 slice 12): name → the
+    /// resolved leaf entry for a stable global callee, valid while the
+    /// global object's identity and generation are unchanged. Boxed so the
+    /// Agent's hot-field cache footprint stays small (the Cut 27 lesson).
+    pub(crate) global_leaf_cells:
+        RefCell<Box<[Option<crate::ir::GlobalLeafCell>; crate::ir::GLOBAL_CELLS]>>,
+    /// The slot-callee leaf cache (Cut 35 slice 12): frame-slot index → the
+    /// resolved leaf entry for the closure held there, validated by the
+    /// callee's heap payload (the held `callee` keeps it alive). Boxed per
+    /// the Cut 27 lesson.
+    pub(crate) slot_leaf_cells:
+        RefCell<Box<[Option<crate::ir::SlotLeafCell>; crate::ir::SLOT_LEAF_CELLS]>>,
+    /// Part B, B5.4: cached constructor boilerplate maps — (function id,
+    /// prototype id, generation) → the final shape its body's `this.*`
+    /// stores transition to, so every construct after the first starts the
+    /// object on the final map (see [`crate::ir::ConstructMapCell`]).
+    pub(crate) construct_maps:
+        Box<[Cell<Option<crate::ir::ConstructMapCell>>; crate::ir::CONSTRUCT_PROTO_CELLS]>,
+    /// Cut 73: the pre-forked ordinary-function boilerplate shapes — the
+    /// 2-key `length`/`name` map (strict/async/generator/method functions)
+    /// and the 4-key map adding the restricted `caller`/`arguments` (sloppy
+    /// ordinary functions), forked ONCE per agent and reused by every
+    /// `register_function` (the (key, attrs) inputs are process constants, so
+    /// the cache never invalidates). Indexed by `restricted`; traced below so
+    /// a collection between creates cannot free the shape (`function.rs`
+    /// `function_boilerplate_map`).
+    pub(crate) function_boilerplate_maps: [Cell<Option<crux::Handle<crux::Map>>>; 2],
+    /// The for-in enumeration cache (this landing): base id -> the
+    /// enumerated (level, key) list + the full chain snapshot for a base
+    /// whose whole prototype chain is generation-tracked (see
+    /// [`crate::ir::ForInEnumCache`]). Direct-mapped on the base id and
+    /// traced (each entry retains its base — and through it the chain —
+    /// plus the key Values). A ForInBegin probe re-walks the LIVE chain
+    /// comparing (id, generation); an unchanged chain reuses the cached
+    /// list instead of re-enumerating (own_property_keys + per-key
+    /// descriptor reads + key boxing) on every re-entry. Boxed per the Cut
+    /// 27 lesson.
+    pub(crate) for_in_cells:
+        RefCell<Box<[Option<crate::ir::ForInEnumCache>; crate::ir::FOR_IN_CELLS]>>,
+    /// The leaf-inline cache (Cut 34): function id → the record data
+    /// `do_call_fast` needs (compiled ir, strictness, closure env), so a hot
+    /// leaf call skips the `ecma_functions` HashMap lookup. Boxed per the
+    /// Cut 27 lesson.
+    pub(crate) leaf_cache: RefCell<Box<[LeafCacheCell; crate::ir::LEAF_CACHE]>>,
     /// The internal state of ArrayBuffer/SharedArrayBuffer objects, keyed by
     /// object identity (spec 25.1.1: [[ArrayBufferData]],
     /// [[ArrayBufferByteLength]], [[ArrayBufferMaxByteLength]], and the
@@ -852,6 +937,19 @@ impl AgentRoots {
             kept_during_job: RefCell::new(Vec::new()),
             pending_cleanup_jobs: RefCell::new(Vec::new()),
             finalization_registries: RefCell::new(IdMap::default()),
+            iter_result_realm: Cell::new(None),
+            iter_result_map: Cell::new(None),
+            generator_methods: Cell::new(None),
+            for_of_fast_cells: std::array::from_fn(|_| Cell::new(None)),
+            species_fast_cells: std::array::from_fn(|_| Cell::new(None)),
+            spread_cells: std::array::from_fn(|_| Cell::new(None)),
+            for_in_cells: RefCell::new(Box::new(std::array::from_fn(|_| None))),
+            array_element_value_cells: Box::new(std::array::from_fn(|_| Cell::new(None))),
+            global_leaf_cells: RefCell::new(Box::new(std::array::from_fn(|_| None))),
+            slot_leaf_cells: RefCell::new(Box::new(std::array::from_fn(|_| None))),
+            leaf_cache: RefCell::new(Box::new(std::array::from_fn(|_| None))),
+            construct_maps: Box::new(std::array::from_fn(|_| Cell::new(None))),
+            function_boilerplate_maps: std::array::from_fn(|_| Cell::new(None)),
             intl_number_format_data: RefCell::new(IdMap::default()),
             intl_plural_rules_data: RefCell::new(IdMap::default()),
             intl_date_time_format_data: RefCell::new(IdMap::default()),
@@ -987,6 +1085,57 @@ impl Trace for AgentRoots {
         self.shadow_handlers.trace(visit);
         self.ecma_functions.trace(visit);
         self.dataview_data.trace(visit);
+        for cell in self.array_element_value_cells.iter() {
+            if let Some(cell) = cell.get() {
+                cell.trace(visit);
+            }
+        }
+        for cell in self.for_of_fast_cells.iter() {
+            if let Some(cell) = cell.get() {
+                cell.trace(visit);
+            }
+        }
+        for cell in self.species_fast_cells.iter() {
+            if let Some(cell) = cell.get() {
+                cell.trace(visit);
+            }
+        }
+        for cell in self.spread_cells.iter() {
+            if let Some(cell) = cell.get() {
+                cell.trace(visit);
+            }
+        }
+        for cell in self.for_in_cells.borrow().iter().flatten() {
+            cell.trace(visit);
+        }
+        for cell in self.global_leaf_cells.borrow().iter().flatten() {
+            cell.trace(visit);
+        }
+        for cell in self.slot_leaf_cells.borrow().iter().flatten() {
+            cell.trace(visit);
+        }
+        for (_, entry) in self.leaf_cache.borrow().iter().flatten() {
+            entry.trace(visit);
+        }
+        // B5.4: the cached constructor boilerplate maps keep the shapes alive.
+        for cell in self.construct_maps.iter() {
+            if let Some(cell) = cell.get() {
+                cell.trace(visit);
+            }
+        }
+        // Cut 73: the cached ordinary-function boilerplate shapes.
+        for map in self.function_boilerplate_maps.iter() {
+            map.get().trace(visit);
+        }
+        if let Some(realm) = self.iter_result_realm.get() {
+            realm.trace(visit);
+        }
+        if let Some(map) = self.iter_result_map.get() {
+            map.trace(visit);
+        }
+        if let Some(methods) = self.generator_methods.get() {
+            methods.trace(visit);
+        }
         self.intl_number_format_data.trace(visit);
         self.intl_plural_rules_data.trace(visit);
         self.intl_date_time_format_data.trace(visit);
@@ -1196,16 +1345,6 @@ pub struct Agent {
     /// `load_global_value` repopulates the cell on every successful read.
     /// Boxed per the Cut 27 lesson.
     pub(crate) global_value_cells: Box<[crate::jit::GlobalValueCell; crate::ir::GLOBAL_CELLS]>,
-    /// The global call-site leaf cache (Cut 35 slice 12): name → the
-    /// resolved leaf entry for a stable global callee, valid while the
-    /// global object's identity and generation are unchanged. Boxed so the
-    /// Agent's hot-field cache footprint stays small (the Cut 27 lesson).
-    pub(crate) global_leaf_cells: Box<[Option<crate::ir::GlobalLeafCell>; crate::ir::GLOBAL_CELLS]>,
-    /// The slot-callee leaf cache (Cut 35 slice 12): frame-slot index → the
-    /// resolved leaf entry for the closure held there, validated by the
-    /// callee's heap payload (the held `callee` keeps it alive). Boxed per
-    /// the Cut 27 lesson.
-    pub(crate) slot_leaf_cells: Box<[Option<crate::ir::SlotLeafCell>; crate::ir::SLOT_LEAF_CELLS]>,
     pub(crate) member_cells: [Option<(u64, crux::AtomId, usize)>; crate::ir::MEMBER_CELLS],
     /// The fronting read-side value cache (Cut 35 slice 11): (id, name,
     /// generation, value) — a hit returns the value with no property-vector
@@ -1262,11 +1401,6 @@ pub struct Agent {
     /// holds the map id; the hit ignores `generation`. All-scalar — no
     /// trace edges.
     pub(crate) member_chain_map_cells: Box<[crate::ir::MemberChainCell; crate::ir::MEMBER_CELLS]>,
-    /// The fronting array-element value cache (Cut 35 slice 13): (id, index,
-    /// generation, value) — a hit returns the element with no
-    /// property-vector borrow. Boxed per the Cut 27 lesson.
-    pub(crate) array_element_value_cells:
-        Box<[Option<crate::ir::ArrayElementValueCell>; crate::ir::MEMBER_CELLS]>,
     /// The array-length cache (Cut 35 slice 13): (id, generation, length) —
     /// a hit skips the borrow and number conversion the for-of fast path
     /// pays every step. Boxed per the Cut 27 lesson.
@@ -1291,12 +1425,6 @@ pub struct Agent {
     /// property is absent on the receiver, so the store defines on it
     /// directly. Re-validated against the chain links' generations.
     pub(crate) member_store_cells: [Option<crate::ir::MemberStoreCell>; crate::ir::MEMBER_CELLS],
-    /// The for-of fast-verdict cache (Cut 24): "the Array-iteration
-    /// infrastructure is stock" — %Array.prototype%'s own @@iterator is the
-    /// intrinsic, %ArrayIteratorPrototype% has the stock `next`, and no
-    /// `return` on the AIP chain. Re-validated against the three shared
-    /// objects' generations.
-    pub(crate) for_of_fast_cells: [Option<ForOfFastVerdict>; crate::ir::MEMBER_CELLS],
     /// The per-array for-of fast verdict (Cut 27): (array id, array
     /// generation, prototype id) — "this array iterates by index" (plain
     /// Array, no own @@iterator, prototype is the stock %Array.prototype%
@@ -1309,11 +1437,6 @@ pub struct Agent {
     /// does not bloat the Agent struct's hot-field cache footprint (an
     /// inline copy regressed the leaf-call path by ~10ns/call).
     pub(crate) for_of_array_cells: Box<[Option<(u64, u32, u64)>; crate::ir::MEMBER_CELLS]>,
-    /// The Array-species fast verdict (this landing): "the species machinery
-    /// of this %Array.prototype% is stock" — see [`ArraySpeciesVerdict`].
-    /// Direct-mapped on the %Array.prototype% id (different realms' protos
-    /// collide on an index only under the id check).
-    pub(crate) species_fast_cells: [Option<ArraySpeciesVerdict>; crate::ir::MEMBER_CELLS],
     /// The per-array species fast verdict: (array id, array generation,
     /// prototype id) — "this array is a plain stock Array whose chain
     /// `constructor` resolves to its realm's %Array%". The array generation
@@ -1323,27 +1446,6 @@ pub struct Agent {
     /// proto walk on every result-building call. Boxed so the 16-entry table
     /// does not bloat the Agent struct's hot-field cache footprint.
     pub(crate) species_array_cells: Box<[Option<(u64, u32, u64)>; crate::ir::MEMBER_CELLS]>,
-    /// The concat-spread verdict (this landing): "the %Array.prototype% ->
-    /// %Object.prototype% chain of this %Array.prototype% carries no own
-    /// @@isConcatSpreadable" — see [`ConcatSpreadVerdict`]. Direct-mapped on
-    /// the %Array.prototype% id.
-    pub(crate) spread_cells: [Option<ConcatSpreadVerdict>; crate::ir::MEMBER_CELLS],
-    /// The for-in enumeration cache (this landing): base id -> the
-    /// enumerated (level, key) list + the full chain snapshot for a base
-    /// whose whole prototype chain is generation-tracked (see
-    /// [`crate::ir::ForInEnumCache`]). Direct-mapped on the base id and
-    /// traced (each entry retains its base — and through it the chain —
-    /// plus the key Values). A ForInBegin probe re-walks the LIVE chain
-    /// comparing (id, generation); an unchanged chain reuses the cached
-    /// list instead of re-enumerating (own_property_keys + per-key
-    /// descriptor reads + key boxing) on every re-entry. Boxed per the Cut
-    /// 27 lesson.
-    pub(crate) for_in_cells: Box<[Option<crate::ir::ForInEnumCache>; crate::ir::FOR_IN_CELLS]>,
-    /// The leaf-inline cache (Cut 34): function id → the record data
-    /// `do_call_fast` needs (compiled ir, strictness, closure env), so a hot
-    /// leaf call skips the `ecma_functions` HashMap lookup. Boxed per the
-    /// Cut 27 lesson.
-    pub(crate) leaf_cache: Box<[Option<(u64, crate::ir::LeafEntry)>; crate::ir::LEAF_CACHE]>,
     /// G15: the per-callee leaf-call record table the compiled call sites and
     /// the slow-path helpers address (`JitCallContext::leaf_records`). It lives
     /// on the agent rather than in the per-run JIT context so a run does not
@@ -1644,34 +1746,6 @@ pub struct Agent {
     /// Cut 27 lesson.
     pub(crate) construct_property_patterns:
         Box<[Option<crate::ir::ConstructPatternCell>; crate::ir::CONSTRUCT_PATTERN_CELLS]>,
-    /// Part B, B5.4: cached constructor boilerplate maps — (function id,
-    /// prototype id, generation) → the final shape its body's `this.*`
-    /// stores transition to, so every construct after the first starts the
-    /// object on the final map (see [`crate::ir::ConstructMapCell`]).
-    pub(crate) construct_maps:
-        Box<[Option<crate::ir::ConstructMapCell>; crate::ir::CONSTRUCT_PROTO_CELLS]>,
-    /// Cut 73: the pre-forked ordinary-function boilerplate shapes — the
-    /// 2-key `length`/`name` map (strict/async/generator/method functions)
-    /// and the 4-key map adding the restricted `caller`/`arguments` (sloppy
-    /// ordinary functions), forked ONCE per agent and reused by every
-    /// `register_function` (the (key, attrs) inputs are process constants, so
-    /// the cache never invalidates). Indexed by `restricted`; traced below so
-    /// a collection between creates cannot free the shape (`function.rs`
-    /// `function_boilerplate_map`).
-    pub(crate) function_boilerplate_maps: [Option<crux::Handle<crux::Map>>; 2],
-    /// CreateIterResultObject's cached `{value, done}` shape and the realm it
-    /// was forked in (a realm switch refork). The two sequential
-    /// `create_data_property` calls it replaces cost ~100-140 ns each on a
-    /// fresh object; a generator `next()` spent ~160 ns there. Both handles
-    /// are traced below.
-    pub(crate) iter_result_realm: std::cell::Cell<Option<Handle<Realm>>>,
-    pub(crate) iter_result_map: std::cell::Cell<Option<crux::Handle<crux::Map>>>,
-    /// The `%Generator.prototype%` methods `dispatch_call` compares a callee
-    /// against, resolved once per prototype generation: every `g.next()`
-    /// otherwise paid an intrinsic-table hash, three property lookups and
-    /// three string conversions before dispatching. See
-    /// [`crate::generator::GeneratorMethods`].
-    pub(crate) generator_methods: std::cell::Cell<Option<crate::generator::GeneratorMethods>>,
     /// The host's collection observers, in registration order
     /// (`crux::heap::GcObserver`). Taken out for the duration of a collection
     /// so one that runs host code cannot re-enter this list — a nested
@@ -1814,8 +1888,6 @@ impl Agent {
             global_value_cells: Box::new(std::array::from_fn(|_| {
                 crate::jit::GlobalValueCell::empty()
             })),
-            global_leaf_cells: Box::new(std::array::from_fn(|_| None)),
-            slot_leaf_cells: Box::new(std::array::from_fn(|_| None)),
             member_cells: [None; crate::ir::MEMBER_CELLS],
             member_value_cells: Box::new(std::array::from_fn(|_| {
                 crate::ir::MemberValueCell::empty()
@@ -1851,20 +1923,14 @@ impl Agent {
             member_chain_map_cells: Box::new(
                 [const { crate::ir::MemberChainCell::empty() }; crate::ir::MEMBER_CELLS],
             ),
-            array_element_value_cells: Box::new(std::array::from_fn(|_| None)),
             array_length_cells: Box::new(std::array::from_fn(|_| None)),
             member_proto_cells: [None; crate::ir::MEMBER_CELLS],
             member_map_cells: [const { crate::ir::MemberMapCell::empty() };
                 crate::ir::MEMBER_CELLS],
             array_element_cells: [None; crate::ir::MEMBER_CELLS],
             member_store_cells: [None; crate::ir::MEMBER_CELLS],
-            for_of_fast_cells: std::array::from_fn(|_| None),
             for_of_array_cells: Box::new([None; crate::ir::MEMBER_CELLS]),
-            species_fast_cells: std::array::from_fn(|_| None),
             species_array_cells: Box::new([None; crate::ir::MEMBER_CELLS]),
-            spread_cells: std::array::from_fn(|_| None),
-            for_in_cells: Box::new(std::array::from_fn(|_| None)),
-            leaf_cache: Box::new(std::array::from_fn(|_| None)),
             leaf_records: Box::new(
                 [crate::jit::LeafCallRecord::empty(); crate::jit::LEAF_CALL_RECORDS],
             ),
@@ -1872,11 +1938,6 @@ impl Agent {
             builtin_call_cells: Box::new(std::array::from_fn(|_| None)),
             builtin_ctor_cells: Box::new(std::array::from_fn(|_| None)),
             construct_property_patterns: Box::new(std::array::from_fn(|_| None)),
-            construct_maps: Box::new(std::array::from_fn(|_| None)),
-            function_boilerplate_maps: [None; 2],
-            iter_result_realm: std::cell::Cell::new(None),
-            iter_result_map: std::cell::Cell::new(None),
-            generator_methods: std::cell::Cell::new(None),
             collection_observers: RefCell::new(Vec::new()),
             jit_hook: None,
             jit_depth: 0,
@@ -2429,12 +2490,27 @@ impl Agent {
     /// A miss resolves from the map and caches the entry (only for a
     /// leaf-inlineable function); function ids are never reused, so a hit
     /// needs no generation check.
-    pub(crate) fn leaf_lookup(&mut self, id: u64) -> Option<&crate::ir::LeafEntry> {
+    ///
+    /// The entry is handed back by value: the cache lives behind the roots'
+    /// `RefCell`, so no borrow of it may escape into the caller (which runs a
+    /// body that allocates). The clone is one `Rc` bump plus a copied handle —
+    /// the callers cloned the same fields out of the borrowed entry before.
+    ///
+    /// The hit path costs one `RefCell` borrow per leaf call. Splitting the
+    /// fill path out (and marking it cold) measured *slower* — 11% against the
+    /// baseline on a closure-call loop, versus 8% for this shape — so the
+    /// branch stays in one function.
+    pub(crate) fn leaf_lookup(&mut self, id: u64) -> Option<crate::ir::LeafEntry> {
         let index = id.wrapping_mul(0x9E37_79B9_7F4A_7C15) as usize & (crate::ir::LEAF_CACHE - 1);
-        if let Some((cached_id, _)) = &self.leaf_cache[index]
-            && *cached_id == id
-        {
-            return self.leaf_cache[index].as_ref().map(|(_, entry)| entry);
+        let cached = {
+            let cells = self.roots.leaf_cache.borrow();
+            match cells[index].as_ref() {
+                Some((cached_id, entry)) if *cached_id == id => Some(entry.clone()),
+                _ => None,
+            }
+        };
+        if let Some(entry) = cached {
+            return Some(entry);
         }
         // The record guard stays inside this block: the cache write below is
         // an allocation-free store, but a guard is never worth extending.
@@ -2451,19 +2527,16 @@ impl Agent {
             };
             (ir, data.strict, environment, data.construct_inline)
         };
-        let slot = &mut self.leaf_cache[index];
-        *slot = Some((
-            id,
-            crate::ir::LeafEntry {
-                ir,
-                strict,
-                environment,
-                // Cut 35 slice 15: the `Construct` step shares this cache,
-                // so the construct-inline verdict rides along.
-                construct_inline,
-            },
-        ));
-        slot.as_ref().map(|(_, entry)| entry)
+        let entry = crate::ir::LeafEntry {
+            ir,
+            strict,
+            environment,
+            // Cut 35 slice 15: the `Construct` step shares this cache,
+            // so the construct-inline verdict rides along.
+            construct_inline,
+        };
+        self.roots.leaf_cache.borrow_mut()[index] = Some((id, entry.clone()));
+        Some(entry)
     }
 
     /// The direct-mapped builtin-call verdict for `id`: a probe that fills from
@@ -2960,51 +3033,8 @@ impl Agent {
         for cell in self.computed_read_cells.iter() {
             cell.trace(visit);
         }
-        for cell in self.array_element_value_cells.iter() {
-            cell.trace(visit);
-        }
-        for cell in self.for_of_fast_cells.iter() {
-            cell.trace(visit);
-        }
-        for cell in self.species_fast_cells.iter() {
-            cell.trace(visit);
-        }
-        for cell in self.spread_cells.iter() {
-            cell.trace(visit);
-        }
-        for cell in self.for_in_cells.iter() {
-            cell.trace(visit);
-        }
-        for cell in self.global_leaf_cells.iter() {
-            cell.trace(visit);
-        }
         for cell in self.global_value_cells.iter() {
             cell.trace(visit);
-        }
-        for cell in self.slot_leaf_cells.iter() {
-            cell.trace(visit);
-        }
-        for (_, entry) in self.leaf_cache.iter().flatten() {
-            entry.trace(visit);
-        }
-        // The cells below are RefCells: a per-allocation `--gc-stress`
-        // collection can fire while one is mutably borrowed, so read them
-        // B5.4: the cached constructor boilerplate maps keep the shapes alive.
-        for cell in self.construct_maps.iter().flatten() {
-            cell.trace(visit);
-        }
-        // Cut 73: the cached ordinary-function boilerplate shapes.
-        for map in self.function_boilerplate_maps.iter().flatten() {
-            map.trace(visit);
-        }
-        if let Some(realm) = self.iter_result_realm.get() {
-            realm.trace(visit);
-        }
-        if let Some(map) = self.iter_result_map.get() {
-            map.trace(visit);
-        }
-        if let Some(methods) = self.generator_methods.get() {
-            methods.trace(visit);
         }
         #[cfg(feature = "wasm")]
         self.wasm_streaming_handlers.trace(visit);
@@ -3505,10 +3535,10 @@ impl Agent {
     fn clear_derived_caches(&mut self) {
         self.member_value_cells
             .fill(crate::ir::MemberValueCell::empty());
-        for cell in self.array_element_value_cells.iter_mut() {
-            *cell = None;
+        for cell in self.roots.array_element_value_cells.iter() {
+            cell.set(None);
         }
-        for cell in self.for_in_cells.iter_mut() {
+        for cell in self.roots.for_in_cells.borrow_mut().iter_mut() {
             *cell = None;
         }
     }
@@ -3535,10 +3565,11 @@ impl Agent {
             }
             let index =
                 id.wrapping_mul(0x9E37_79B9_7F4A_7C15) as usize & (crate::ir::LEAF_CACHE - 1);
-            if let Some((cached_id, _)) = &self.leaf_cache[index]
+            let mut cells = self.roots.leaf_cache.borrow_mut();
+            if let Some((cached_id, _)) = &cells[index]
                 && *cached_id == id
             {
-                self.leaf_cache[index] = None;
+                cells[index] = None;
             }
         }
     }

@@ -149,12 +149,12 @@ pub fn create_iter_result_object(
 /// (rather than the resolved prototype) keeps the intrinsic-table lookup off
 /// the hot path.
 fn iter_result_map(agent: &Agent, realm: Option<Handle<Realm>>) -> Option<Handle<Map>> {
-    let same_realm = match (agent.iter_result_realm.get(), realm) {
+    let same_realm = match (agent.roots.iter_result_realm.get(), realm) {
         (Some(cached), Some(current)) => cached.ptr_eq(current),
         (None, None) => true,
         _ => false,
     };
-    if same_realm && let Some(map) = agent.iter_result_map.get() {
+    if same_realm && let Some(map) = agent.roots.iter_result_map.get() {
         return Some(map);
     }
     let proto = realm
@@ -164,8 +164,8 @@ fn iter_result_map(agent: &Agent, realm: Option<Handle<Realm>>) -> Option<Handle
     let mut map = canonical_empty_map(proto);
     map = map.get_or_create_child(PropertyKey::String(intern_utf8("value")), attrs)?;
     map = map.get_or_create_child(PropertyKey::String(intern_utf8("done")), attrs)?;
-    agent.iter_result_realm.set(realm);
-    agent.iter_result_map.set(Some(map));
+    agent.roots.iter_result_realm.set(realm);
+    agent.roots.iter_result_map.set(Some(map));
     Some(map)
 }
 
