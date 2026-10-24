@@ -93,11 +93,14 @@ impl Context {
             .global_template
             .and_then(|template| template.template_handlers())
             .filter(|handlers| handlers.has_any());
+        // Read before the engine borrow: the handler needs the store the
+        // isolate owns, and `engine_mut` borrows it.
+        let table = isolate.table_ptr();
         let context = match handlers {
             Some(handlers) => api::Context::new_with_global_ops(
                 isolate.engine_mut(),
                 Some(std::rc::Rc::new(crate::interceptor::GlobalHandler::new(
-                    handlers,
+                    handlers, table,
                 ))),
             ),
             None => api::Context::new(isolate.engine_mut()),

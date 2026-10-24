@@ -982,11 +982,22 @@ impl IndexedPropertyHandlerConfiguration {
 #[derive(Debug)]
 pub(crate) struct GlobalHandler {
     handlers: Rc<TemplateHandlers>,
+    /// The handle store of the isolate this handler was installed on.
+    ///
+    /// The engine consults the handler in places where the host opened no scope
+    /// — the snapshot write pass, an enumeration the collector drives — and a
+    /// cell is allocated on the *isolate's* table whatever the thread-local
+    /// entry says. So the region this opens has to be opened there too, or the
+    /// callback's own scope would inherit a region it cannot see.
+    table: *const RefCell<crate::store::Table>,
 }
 
 impl GlobalHandler {
-    pub(crate) fn new(handlers: Rc<TemplateHandlers>) -> Self {
-        Self { handlers }
+    pub(crate) fn new(
+        handlers: Rc<TemplateHandlers>,
+        table: *const RefCell<crate::store::Table>,
+    ) -> Self {
+        Self { handlers, table }
     }
 
     fn named(&self) -> Option<&NamedPropertyHandlerConfiguration> {
@@ -1201,11 +1212,18 @@ fn property_of(descriptor: crux::property::PropertyDescriptor) -> crux::object::
 /// needs them: a script's own operation, where the host has a scope open, and a
 /// snapshot's write pass, where it has none. So the region is opened here rather
 /// than assumed, and everything a callback allocates is reclaimed when it returns.
-fn callback_region<T>(body: impl FnOnce() -> T) -> T {
-    crate::store::open_region();
-    let value = body();
-    crate::store::close_region();
-    value
+impl GlobalHandler {
+    /// Run `body` inside a handle region on the isolate this handler belongs to,
+    /// so a callback that opens no scope of its own (the crate's `CallbackScope`
+    /// inherits the region rather than opening one) still has cells to allocate.
+    fn callback_region<T>(&self, body: impl FnOnce() -> T) -> T {
+        crate::store::enter(self.table);
+        crate::store::open_region();
+        let value = body();
+        crate::store::close_region();
+        crate::store::leave();
+        value
+    }
 }
 
 impl crux::host::HostOps for GlobalHandler {
@@ -1214,7 +1232,7 @@ impl crux::host::HostOps for GlobalHandler {
         object: &crux::object::JsObject,
         key: &crux::property::PropertyKey,
     ) -> Option<Result<crux::object::Property, crux::error::JsError>> {
-        let (intercepted, answer) = callback_region(|| {
+        let (intercepted, answer) = self.callback_region(|| {
             self.call_value(
                 object,
                 key,
@@ -1236,7 +1254,7 @@ impl crux::host::HostOps for GlobalHandler {
         key: &crux::property::PropertyKey,
         _receiver: &crux::value::Value,
     ) -> Option<Result<crux::value::Value, crux::error::JsError>> {
-        let (intercepted, answer) = callback_region(|| {
+        let (intercepted, answer) = self.callback_region(|| {
             self.call_value(object, key, |config| config.getter, |config| config.getter)
         })?;
         Some(match intercepted {
@@ -1252,7 +1270,7 @@ impl crux::host::HostOps for GlobalHandler {
         object: &crux::object::JsObject,
         key: &crux::property::PropertyKey,
     ) -> Option<Result<bool, crux::error::JsError>> {
-        let intercepted = callback_region(|| self.call_query(object, key))?;
+        let intercepted = self.callback_region(|| self.call_query(object, key))?;
         Some(match intercepted {
             // Not intercepted: the engine's own [[HasProperty]] runs.
             Intercepted::kNo => return None,
@@ -1269,7 +1287,8 @@ impl crux::host::HostOps for GlobalHandler {
         _receiver: &crux::value::Value,
         throw_on_error: bool,
     ) -> Option<Result<bool, crux::error::JsError>> {
-        let intercepted = callback_region(|| self.call_setter(object, key, value, throw_on_error))?;
+        let intercepted =
+            self.callback_region(|| self.call_setter(object, key, value, throw_on_error))?;
         Some(match intercepted {
             // Not intercepted: the engine's own OrdinarySet runs.
             Intercepted::kNo => return None,
@@ -1285,7 +1304,7 @@ impl crux::host::HostOps for GlobalHandler {
         object: &crux::object::JsObject,
         key: &crux::property::PropertyKey,
     ) -> Option<Result<bool, crux::error::JsError>> {
-        callback_region(|| self.call_deleter(object, key))
+        self.callback_region(|| self.call_deleter(object, key))
     }
 
     fn own_property_keys(
@@ -1298,7 +1317,7 @@ impl crux::host::HostOps for GlobalHandler {
             // Neither handler enumerates: the engine's own [[OwnPropertyKeys]].
             return None;
         }
-        callback_region(|| {
+        self.callback_region(|| {
             let mut keys = Vec::new();
             // The indexed enumerator answers with the element indices, which V8
             // orders before the string keys (see this module's note on the split).
@@ -1325,7 +1344,7 @@ impl crux::host::HostOps for GlobalHandler {
         key: &crux::property::PropertyKey,
         desc: &crux::property::PropertyDescriptor,
     ) -> Option<Result<bool, crux::error::JsError>> {
-        let intercepted = callback_region(|| self.call_definer(object, key, desc))?;
+        let intercepted = self.callback_region(|| self.call_definer(object, key, desc))?;
         Some(match intercepted {
             // Not intercepted: the engine's own [[DefineOwnProperty]] runs.
             Intercepted::kNo => return None,

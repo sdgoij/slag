@@ -123,3 +123,26 @@ surface; step 4 is the payoff and the least uncertain.
 Rough size: steps 1-2 are the bulk (roughly a week, with step 2 the risky half);
 step 3 is a few days; step 4 a day or two. Nothing here changes what the engine
 *computes* — it changes where its state lives and who may touch it.
+
+## Status
+
+Step 1 landed. The handle arena (`store::Table`) is a field of `IsolateInner`,
+and `HandleScope` installs it for its life: `store::enter` sets a TLS pointer
+(over a stack, so scopes nest and one isolate can be entered inside another)
+and the scope's `Drop` restores it. A cell or a script slot is allocated on the
+table that was entered when its region opened, so the arena travels with the
+isolate instead of with the thread.
+
+One consequence surfaced that the plan did not name: the interceptor's
+`callback_region` opens a region *before* any scope exists, because the engine
+consults a host handler where the host opened no scope at all (the snapshot
+write pass). That region used to land on the thread's table and so covered the
+callback's own inheriting scope by accident; with the arena per isolate it has
+to install the handler's table, which `GlobalHandler` now carries from the
+isolate it was installed on.
+
+Deno is unchanged by construction (one isolate per thread) and its two harnesses
+are green against the rebuilt host, as is the full workspace suite, including a
+new test that two isolates entered on one thread keep separate arenas.
+
+Still open: steps 2 (residency-aware roots) and 3 (the `SharedIsolate` API).

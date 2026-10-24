@@ -167,7 +167,7 @@ struct CellsRoots;
 
 impl crux::heap::RootSource for CellsRoots {
     fn roots(&self, visit: &mut dyn FnMut(GcAny)) {
-        TABLE.with(|table| table.borrow().cells.visit(visit));
+        with_table(|table| table.borrow().cells.visit(visit));
     }
 }
 
@@ -191,7 +191,7 @@ fn register_cell_roots() {
 }
 
 #[derive(Default)]
-struct Table {
+pub(crate) struct Table {
     slots: Vec<Slot>,
     /// One mark per open handle scope: where its region begins.
     marks: Vec<Mark>,
@@ -201,14 +201,59 @@ struct Table {
     issued: u32,
 }
 
+impl Table {
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+}
+
 thread_local! {
-    static TABLE: RefCell<Table> = RefCell::new(Table::default());
+    /// The table of the isolate entered on this thread, or null for none. A
+    /// pointer rather than the table itself: the arena belongs to the isolate
+    /// (so a handle minted under it stays valid wherever that isolate is
+    /// entered), and a scope installs it for its life.
+    static CURRENT: Cell<*const RefCell<Table>> = const { Cell::new(std::ptr::null()) };
+    /// What `CURRENT` held before each entry, so a scope's drop restores it —
+    /// scopes nest, and one isolate can be entered inside another's.
+    static PREVIOUS: RefCell<Vec<*const RefCell<Table>>> = const { RefCell::new(Vec::new()) };
+    /// The table for a thread with no isolate entered: this crate's own tests,
+    /// and every path that makes a handle outside a scope (which already
+    /// asserts a region is open).
+    static OWN: RefCell<Table> = RefCell::new(Table::default());
+}
+
+/// Install `table` as this thread's handle store, remembering what was there.
+pub(crate) fn enter(table: *const RefCell<Table>) {
+    let previous = CURRENT.with(|current| current.replace(table));
+    PREVIOUS.with(|stack| stack.borrow_mut().push(previous));
+}
+
+/// Undo the innermost [`enter`].
+pub(crate) fn leave() {
+    let previous = PREVIOUS
+        .with(|stack| stack.borrow_mut().pop())
+        .unwrap_or(std::ptr::null());
+    CURRENT.with(|current| current.set(previous));
+}
+
+/// Run `body` against the entered isolate's table, or this thread's own when no
+/// isolate is entered.
+fn with_table<R>(body: impl FnOnce(&RefCell<Table>) -> R) -> R {
+    let current = CURRENT.with(|slot| slot.get());
+    if current.is_null() {
+        OWN.with(body)
+    } else {
+        // SAFETY: `enter` installed a pointer to a table owned by the isolate
+        // the caller's scope belongs to, and `leave` removes it before that
+        // isolate can be dropped.
+        body(unsafe { &*current })
+    }
 }
 
 /// Open a region, at the start of a handle scope's life.
 pub(crate) fn open_region() {
     register_cell_roots();
-    TABLE.with(|table| {
+    with_table(|table| {
         let mut table = table.borrow_mut();
         let mark = Mark {
             slots: table.slots.len(),
@@ -222,7 +267,7 @@ pub(crate) fn open_region() {
 /// cell from the region's mark on is released, so a later scope reuses them —
 /// the poison stands only until that reuse.
 pub(crate) fn close_region() {
-    TABLE.with(|table| {
+    with_table(|table| {
         let mut table = table.borrow_mut();
         let mark = table
             .marks
@@ -236,7 +281,7 @@ pub(crate) fn close_region() {
 /// Put `payload` in the innermost open region, and return the cell holding it:
 /// what a [`Local`](crate::Local) is.
 pub(crate) fn cell(payload: Payload) -> NonNull<PayloadCell> {
-    TABLE.with(|table| {
+    with_table(|table| {
         let mut table = table.borrow_mut();
         assert!(
             !table.marks.is_empty(),
@@ -249,7 +294,7 @@ pub(crate) fn cell(payload: Payload) -> NonNull<PayloadCell> {
 /// Put `source` in the innermost open region, and return what a handle carries:
 /// the slot it went into and that slot's generation.
 pub(crate) fn store(source: Rc<str>, name: Option<Rc<str>>) -> (usize, u32) {
-    TABLE.with(|table| {
+    with_table(|table| {
         let mut table = table.borrow_mut();
         assert!(
             !table.marks.is_empty(),
@@ -269,7 +314,7 @@ pub(crate) fn store(source: Rc<str>, name: Option<Rc<str>>) -> (usize, u32) {
 /// What a slot and generation name, or `None` when the region that held it is
 /// gone.
 pub(crate) fn entry(slot: usize, generation: u32) -> Option<Entry> {
-    TABLE.with(|table| {
+    with_table(|table| {
         let table = table.borrow();
         let slot = table.slots.get(slot)?;
         (slot.generation == generation).then(|| Entry {
@@ -354,7 +399,7 @@ mod tests {
             assert!(source(slot, generation).is_some());
             close_region();
         }
-        TABLE.with(|table| assert!(table.borrow().slots.is_empty()));
+        with_table(|table| assert!(table.borrow().slots.is_empty()));
     }
 
     fn undefined() -> Payload {
@@ -427,5 +472,35 @@ mod tests {
             Payload::Value(_)
         ));
         close_region();
+    }
+
+    /// A region belongs to the table entered when it opened, not to the thread:
+    /// two isolates entered on one thread keep separate arenas, and a nested
+    /// entry switches which one a cell goes to.
+    #[test]
+    fn a_region_belongs_to_the_entered_table() {
+        let outer = RefCell::new(Table::new());
+        let inner = RefCell::new(Table::new());
+
+        enter(&outer);
+        open_region();
+        let first = cell(undefined());
+
+        enter(&inner);
+        open_region();
+        let second = cell(undefined());
+        close_region();
+        leave();
+
+        assert_eq!(inner.borrow().cells.len, 0, "the inner region closed");
+        assert_eq!(
+            outer.borrow().marks.len(),
+            1,
+            "the outer region is still open"
+        );
+        assert_ne!(first, second, "two arenas, two cells");
+
+        close_region();
+        leave();
     }
 }

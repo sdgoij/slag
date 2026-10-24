@@ -24,6 +24,7 @@ use crate::position::Position;
 use crate::promise::{PromiseRejectEvent, PromiseRejectMessage};
 use crate::scope::PinScope;
 use crate::snapshot::{FunctionCodeHandling, SnapshotCreator, SnapshotRestore, StartupData};
+use crate::store;
 use crate::support::{MapFnFrom, UniqueRef, UnitType};
 use crate::wasm::WasmStreaming;
 
@@ -204,6 +205,11 @@ pub(crate) struct BuiltCallback {
 #[repr(C)]
 pub struct IsolateInner {
     pub(crate) engine: api::Isolate,
+    /// The handles minted on this isolate (see [`store`]): the regioned cells a
+    /// `Local` points at and the slots a `Script` payload names. The isolate owns
+    /// them, so they travel with it; a scope installs this table for its life
+    /// (`store::enter`).
+    pub(crate) table: RefCell<store::Table>,
     /// The realm most recently entered through a `ContextScope`. The engine
     /// tracks its own current realm; this is the bridge's copy of it, so a
     /// scope can hand object operations the context they need.
@@ -862,6 +868,7 @@ impl Isolate {
             .unwrap_or_default();
         let mut inner = Box::new(IsolateInner {
             engine,
+            table: RefCell::new(store::Table::new()),
             context: RefCell::new(None),
             continuation_data: None,
             slots: UnsafeCell::new(HashMap::new()),
@@ -1851,6 +1858,13 @@ impl Isolate {
 
     /// The inner state, for the bridge's own modules — the GC observer reads the
     /// host's collection callbacks from it.
+    /// The handle store this isolate owns, for the scope that installs it. A
+    /// pointer because the store lives inside the isolate and outlives every
+    /// scope over it.
+    pub(crate) fn table_ptr(&self) -> *const RefCell<store::Table> {
+        &self.inner().table
+    }
+
     pub(crate) fn inner(&self) -> &IsolateInner {
         // SAFETY: the handle only exists for a live inner, which the
         // `OwnedIsolate` that made it keeps alive.
