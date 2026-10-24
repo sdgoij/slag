@@ -546,7 +546,9 @@ impl<'s> LocalHandle<'s, Object> {
             return (None, false);
         };
         let id = object.id();
-        let answer = crate::realm::with_agent(|agent| preview_entries_of(agent, id)).flatten();
+        let answer = self
+            .with_agent(|agent| preview_entries_of(agent, id))
+            .flatten();
         let Some((values, is_key_value)) = answer else {
             return (None, false);
         };
@@ -1012,7 +1014,7 @@ impl<'s> LocalHandle<'s, Map> {
             return 0;
         };
         let id = object.id();
-        crate::realm::with_agent(|agent| {
+        self.with_agent(|agent| {
             agent
                 .map_entries(id)
                 .map_or(0, |entries| entries.iter().filter(|e| e.is_some()).count())
@@ -1023,7 +1025,7 @@ impl<'s> LocalHandle<'s, Map> {
     /// The map's entries as one flat array — key, value, key, value
     /// (`v8::Map::as_array`), in insertion order, with deleted keys left out.
     pub fn as_array<'a>(&self, scope: &PinScope<'a, '_>) -> Local<'a, Array> {
-        let pairs = entries(self.engine(), |agent, id| {
+        let pairs = entries(self.engine(), self.minted_realm(), |agent, id| {
             let entries: Vec<EngineValue> = agent
                 .map_entries(id)?
                 .iter()
@@ -1044,7 +1046,7 @@ impl<'s> LocalHandle<'s, Set> {
             return 0;
         };
         let id = object.id();
-        crate::realm::with_agent(|agent| {
+        self.with_agent(|agent| {
             agent
                 .set_entries(id)
                 .map_or(0, |entries| entries.iter().filter(|e| e.is_some()).count())
@@ -1078,7 +1080,7 @@ impl<'s> LocalHandle<'s, Set> {
     /// its value (`v8::Set::as_array`), in insertion order, with deleted
     /// elements left out.
     pub fn as_array<'a>(&self, scope: &PinScope<'a, '_>) -> Local<'a, Array> {
-        let doubled = entries(self.engine(), |agent, id| {
+        let doubled = entries(self.engine(), self.minted_realm(), |agent, id| {
             let entries: Vec<EngineValue> = agent
                 .set_entries(id)?
                 .iter()
@@ -1126,7 +1128,7 @@ impl<'s> LocalHandle<'s, Date> {
             return f64::NAN;
         };
         let id = object.id();
-        crate::realm::with_agent(|agent| agent.date_data.get(&id).copied())
+        self.with_agent(|agent| agent.date_data.get(&id).copied())
             .flatten()
             .unwrap_or(f64::NAN)
     }
@@ -1213,13 +1215,14 @@ fn preview_entries_of(agent: &runtime::Agent, id: u64) -> Option<(Vec<EngineValu
 /// The elements a keyed collection's table holds, read through `read`.
 fn entries(
     value: &api::Local,
+    realm: Option<api::Context>,
     read: impl FnOnce(&runtime::Agent, u64) -> Option<Vec<EngineValue>>,
 ) -> Vec<EngineValue> {
     let Some(object) = value.value().as_object() else {
         return Vec::new();
     };
     let id = object.id();
-    crate::realm::with_agent(|agent| read(agent, id))
+    crate::realm::with_agent_for(realm, |agent| read(agent, id))
         .flatten()
         .expect("bridge bug: a Map or Set handle needs the realm it came from")
 }
@@ -1262,6 +1265,26 @@ mod tests {
     use crate::test_support::{bind, eval, eval_number, in_context};
     use crate::{Intercepted, ReturnValue};
 
+    /// Two isolates entered on one thread: a handle belongs to the realm it was
+    /// minted in, so reading it must not consult the context that happens to be
+    /// innermost now (M-7). Without the mint realm recorded in the handle's
+    /// cell, `value_of` would look the date up in B's agent — which has no such
+    /// id — and answer NaN.
+    #[test]
+    fn a_handle_resolves_through_its_own_isolate() {
+        let mut isolate_a = crate::Isolate::new(crate::CreateParams::default());
+        crate::scope!(let handle_a, &mut isolate_a);
+        let context_a = crate::Context::new(handle_a, Default::default());
+        let scope_a = &mut crate::ContextScope::new(handle_a, context_a);
+        let date = Date::new(scope_a, 12345.0).expect("a date");
+
+        let mut isolate_b = crate::Isolate::new(crate::CreateParams::default());
+        crate::scope!(let handle_b, &mut isolate_b);
+        let context_b = crate::Context::new(handle_b, Default::default());
+        let _scope_b = &mut crate::ContextScope::new(handle_b, context_b);
+
+        assert_eq!(date.value_of(), 12345.0);
+    }
     /// The "real" questions skip the interceptor: a host object whose handler
     /// answers `echoed` is asked by `get`/`has` and *not* by
     /// `get_real_named_property`/`has_real_named_property`/

@@ -310,7 +310,7 @@ impl<'s> LocalHandle<'s, PromiseResolver> {
     /// function this handle names.
     fn reject_function(&self) -> Option<api::Local> {
         let id = self.engine().value().as_function()?.id();
-        let realm = crate::realm::current()?;
+        let realm = self.minted_realm().or_else(crate::realm::current)?;
         // SAFETY: as elsewhere: a realm lives in the agent of a live isolate, and
         // the engine isolate is the first field of `IsolateInner`.
         let isolate = unsafe { crate::Isolate::from_engine_ptr(realm.isolate()) };
@@ -328,7 +328,7 @@ impl<'s> LocalHandle<'s, PromiseResolver> {
     /// so a handle that names anything else answers `None`.
     fn resolver_data<T>(&self, read: impl FnOnce(&RefCell<ResolverData>) -> T) -> Option<T> {
         let id = self.engine().value().as_function()?.id();
-        crate::realm::with_agent(|agent| agent.promise_resolver_data(id).map(|data| read(&data)))
+        self.with_agent(|agent| agent.promise_resolver_data(id).map(|data| read(&data)))
             .flatten()
     }
 }

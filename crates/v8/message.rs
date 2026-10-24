@@ -107,9 +107,10 @@ impl LocalHandle<'_, Message> {
                 .map_or(0, |location| location.column.saturating_sub(1) as usize);
         }
         // The crate we stand in for declares this one without a scope, so the
-        // isolate it asks is the one whose realm this thread has entered; with
-        // none entered there is no record to find.
-        let Some(realm) = crate::realm::current() else {
+        // isolate it asks is the one the handle was minted in (and, for a
+        // handle older than any entered context, the innermost one entered);
+        // with neither there is no record to find.
+        let Some(realm) = self.minted_realm().or_else(crate::realm::current) else {
             return 0;
         };
         let isolate = crate::scope::isolate_of(realm);

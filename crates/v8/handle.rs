@@ -9,6 +9,7 @@ use std::rc::Rc;
 
 use crux::heap::Trace;
 use crux::value::ValueKind;
+use runtime::Agent;
 use runtime::api;
 
 use crate::scope::PinScope;
@@ -257,9 +258,9 @@ type Tag<'s, T> = PhantomData<(&'s (), fn() -> T)>;
 #[repr(transparent)]
 pub struct Local<'s, T> {
     /// The cell this handle names. Only ever made by [`crate::store::cell`], so
-    /// it is a live payload in a region that outlives `'s` — which is the scope
+    /// it is a live cell in a region that outlives `'s` — which is the scope
     /// reference the handle was made from, not a typestate.
-    cell: NonNull<Payload>,
+    cell: NonNull<crate::store::PayloadCell>,
     marker: Tag<'s, T>,
 }
 
@@ -288,6 +289,26 @@ impl<'s, T> LocalHandle<'s, T> {
         &self.payload
     }
 
+    /// The realm that was entered when this handle was minted, if any.
+    ///
+    /// A scope-less operation on the handle resolves ids through *this* realm,
+    /// not through whichever context is innermost on the thread: two isolates
+    /// can be entered at once, and the innermost one may belong to the other.
+    pub(crate) fn minted_realm(&self) -> Option<api::Context> {
+        // SAFETY: a `LocalHandle` reference is a view of the cell it was cast
+        // from (`Local`'s `Deref`), whose first field is this payload; the cell
+        // is a `PayloadCell`, so reading its own `realm` field through that
+        // address stays inside the same allocation.
+        unsafe { (*(self as *const Self).cast::<crate::store::PayloadCell>()).realm }
+    }
+
+    /// Run `question` against the agent of the realm this handle was minted in,
+    /// falling back to the innermost entered realm when it recorded none. This
+    /// is the attributed form of [`crate::realm::with_agent`].
+    pub(crate) fn with_agent<R>(&self, question: impl FnOnce(&mut Agent) -> R) -> Option<R> {
+        crate::realm::with_agent_for(self.minted_realm(), question)
+    }
+
     pub(crate) fn engine(&self) -> &api::Local {
         self.payload.as_value()
     }
@@ -314,8 +335,10 @@ impl<'s, T> LocalHandle<'s, T> {
     /// mostly not `Copy` either, which is why a `to_*` method taking `&self` is
     /// its shape and not a lint about the receiver.
     pub(crate) fn retag<U>(&self) -> Local<'s, U> {
+        // The payload sits at offset zero of its cell (`PayloadCell` is
+        // `repr(C)`), so its address *is* the cell the handle names.
         Local {
-            cell: NonNull::from(&self.payload),
+            cell: NonNull::from(&self.payload).cast::<crate::store::PayloadCell>(),
             marker: PhantomData,
         }
     }
@@ -401,7 +424,7 @@ impl<'s, T> Local<'s, T> {
     pub(crate) fn payload(&self) -> &Payload {
         // SAFETY: the cell is live — `from_payload` is the only constructor, and
         // it allocates one — and it is the same borrow `self` is.
-        unsafe { self.cell.as_ref() }
+        unsafe { &self.cell.as_ref().payload }
     }
 
     /// The realm behind a `Context` handle.

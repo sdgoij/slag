@@ -37,6 +37,25 @@ pub(crate) fn restore(previous: Option<api::Context>) {
 
 /// Run `question` against the agent of the realm entered on this thread. With
 /// no realm entered there is no agent to ask, and the answer is `None`.
+///
+/// This is the *unattributed* form, for an operation with no handle to take a
+/// realm from (an object reference held as a raw `JsObject`, say). It answers
+/// for the innermost entered context, which is ambiguous when two isolates are
+/// entered at once — an operation that has a handle should use
+/// [`with_agent_for`] with [`crate::handle::LocalHandle::minted_realm`]
+/// instead.
 pub(crate) fn with_agent<T>(question: impl FnOnce(&mut Agent) -> T) -> Option<T> {
     current().map(|realm| realm.with_agent(question))
+}
+
+/// Run `question` against the agent of `realm`, or of the innermost entered
+/// realm when the handle recorded none (it was minted before any context was
+/// entered, so it cannot be attributed).
+pub(crate) fn with_agent_for<T>(
+    realm: Option<api::Context>,
+    question: impl FnOnce(&mut Agent) -> T,
+) -> Option<T> {
+    realm
+        .or_else(current)
+        .map(|realm| realm.with_agent(question))
 }

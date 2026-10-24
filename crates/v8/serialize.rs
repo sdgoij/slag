@@ -226,13 +226,16 @@ fn call_intrinsic(
 /// The `[[DateValue]]` the agent records for a Date instance.
 fn date_time_value(value: &Local<'_, Value>) -> Option<f64> {
     let id = value.engine().value().as_object()?.id();
-    crate::realm::with_agent(|agent| agent.date_data.get(&id).copied()).flatten()
+    crate::realm::with_agent_for(value.minted_realm(), |agent| {
+        agent.date_data.get(&id).copied()
+    })
+    .flatten()
 }
 
 /// The source and flags the agent records for a RegExp instance.
 fn reg_exp_text(value: &Local<'_, Value>) -> Option<(Vec<u16>, String)> {
     let id = value.engine().value().as_object()?.id();
-    crate::realm::with_agent(|agent| {
+    crate::realm::with_agent_for(value.minted_realm(), |agent| {
         let state = agent.regexp_state(id)?;
         Some((state.source.as_slice().to_vec(), state.flags_text.clone()))
     })

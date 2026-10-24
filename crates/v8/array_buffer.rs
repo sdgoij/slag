@@ -69,20 +69,22 @@ impl BufferFacts {
     }
 }
 
-/// The buffer record for an object, if it is a registered buffer.
-fn facts_for_id(id: u64) -> Option<BufferFacts> {
-    crate::realm::with_agent(|agent| {
+/// The buffer record for an object, if it is a registered buffer. `realm` is
+/// the realm the handle naming it was minted in (see
+/// [`LocalHandle::minted_realm`](crate::handle::LocalHandle::minted_realm)).
+fn facts_for_id(realm: Option<api::Context>, id: u64) -> Option<BufferFacts> {
+    crate::realm::with_agent_for(realm, |agent| {
         let state = agent.buffer_state(id)?;
         Some(BufferFacts::of(&state))
     })?
 }
 
-fn buffer_facts(value: &api::Local) -> Option<BufferFacts> {
-    facts_for_id(value.value().as_object()?.id())
+fn buffer_facts(value: &api::Local, realm: Option<api::Context>) -> Option<BufferFacts> {
+    facts_for_id(realm, value.value().as_object()?.id())
 }
 
-fn facts_of_value(value: &crux::value::Value) -> Option<BufferFacts> {
-    facts_for_id(value.as_object()?.id())
+fn facts_of_value(value: &crux::value::Value, realm: Option<api::Context>) -> Option<BufferFacts> {
+    facts_for_id(realm, value.as_object()?.id())
 }
 
 /// What a view's slots say, with the buffer it looks into resolved.
@@ -114,7 +116,7 @@ impl ViewFacts {
     }
 }
 
-fn view_facts(value: &api::Local) -> Option<ViewFacts> {
+fn view_facts(value: &api::Local, realm: Option<api::Context>) -> Option<ViewFacts> {
     let object = value.value().as_object()?;
     let (buffer_object, byte_offset, byte_length, typed_array_out_of_bounds) = match &object.kind {
         ObjectKind::IntegerIndexed(slots) => (
@@ -125,14 +127,15 @@ fn view_facts(value: &api::Local) -> Option<ViewFacts> {
         ),
         _ => {
             let id = object.id();
-            let (buffer_object, byte_offset, byte_length) = crate::realm::with_agent(|agent| {
-                let state = agent.dataview_state(id)?;
-                Some((state.buffer_object, state.byte_offset, state.byte_length))
-            })??;
+            let (buffer_object, byte_offset, byte_length) =
+                crate::realm::with_agent_for(realm, |agent| {
+                    let state = agent.dataview_state(id)?;
+                    Some((state.buffer_object, state.byte_offset, state.byte_length))
+                })??;
             (buffer_object, byte_offset, byte_length, None)
         }
     };
-    let buffer = facts_of_value(&buffer_object)?;
+    let buffer = facts_of_value(&buffer_object, realm)?;
     let out_of_bounds = typed_array_out_of_bounds.unwrap_or_else(|| {
         is_data_view_out_of_bounds(byte_offset, byte_length, buffer.byte_length)
     });
@@ -274,7 +277,7 @@ impl ArrayBuffer {
 impl<'s> LocalHandle<'s, ArrayBuffer> {
     /// The byte length (`v8::ArrayBuffer::byte_length`): zero once detached.
     pub fn byte_length(&self) -> usize {
-        buffer_facts(self.engine()).map_or(0, |facts| facts.byte_length)
+        buffer_facts(self.engine(), self.minted_realm()).map_or(0, |facts| facts.byte_length)
     }
 
     /// Whether the buffer may be detached (`v8::ArrayBuffer::is_detachable`).
@@ -283,12 +286,12 @@ impl<'s> LocalHandle<'s, ArrayBuffer> {
     /// refuses for one wasm owns too; the engine's byte block does not record
     /// that, and this build has no wasm to own one.
     pub fn is_detachable(&self) -> bool {
-        buffer_facts(self.engine()).is_some_and(|facts| !facts.is_shared)
+        buffer_facts(self.engine(), self.minted_realm()).is_some_and(|facts| !facts.is_shared)
     }
 
     /// Whether the buffer was detached (`v8::ArrayBuffer::was_detached`).
     pub fn was_detached(&self) -> bool {
-        buffer_facts(self.engine()).is_some_and(|facts| facts.was_detached)
+        buffer_facts(self.engine(), self.minted_realm()).is_some_and(|facts| facts.was_detached)
     }
 
     /// Detach the buffer and every view over it (`v8::ArrayBuffer::detach`).
@@ -336,7 +339,7 @@ impl<'s> LocalHandle<'s, ArrayBuffer> {
     /// are gone from JavaScript's point of view even though the block is still
     /// allocated.
     pub fn get_backing_store(&self) -> SharedRef<BackingStore> {
-        let facts = buffer_facts(self.engine())
+        let facts = buffer_facts(self.engine(), self.minted_realm())
             .expect("bridge bug: an ArrayBuffer handle needs the realm it came from");
         SharedRef::new(facts.store())
     }
@@ -382,7 +385,7 @@ impl<'s> LocalHandle<'s, SharedArrayBuffer> {
     /// The buffer's own length: a shared buffer cannot be detached, so there is
     /// no zero-length state for this to report.
     pub fn byte_length(&self) -> usize {
-        buffer_facts(self.engine()).map_or(0, |facts| facts.byte_length)
+        buffer_facts(self.engine(), self.minted_realm()).map_or(0, |facts| facts.byte_length)
     }
 
     /// A shared reference to the bytes
@@ -392,7 +395,7 @@ impl<'s> LocalHandle<'s, SharedArrayBuffer> {
     /// table for both kinds of buffer; the store's own `is_shared` is what tells
     /// them apart.
     pub fn get_backing_store(&self) -> SharedRef<BackingStore> {
-        let facts = buffer_facts(self.engine())
+        let facts = buffer_facts(self.engine(), self.minted_realm())
             .expect("bridge bug: a SharedArrayBuffer handle needs the realm it came from");
         SharedRef::new(facts.store())
     }
@@ -421,7 +424,9 @@ impl<'s> LocalHandle<'s, TypedArray> {
 impl<'s> LocalHandle<'s, ArrayBufferView> {
     /// The buffer the view looks into (`v8::ArrayBufferView::buffer`).
     pub fn buffer<'a>(&self, _scope: &PinScope<'a, '_>) -> Option<Local<'a, ArrayBuffer>> {
-        let object = view_facts(self.engine())?.buffer_object.as_object()?;
+        let object = view_facts(self.engine(), self.minted_realm())?
+            .buffer_object
+            .as_object()?;
         Some(Local::from_engine(api::Local::from(
             crux::value::Value::Object(object),
         )))
@@ -430,13 +435,14 @@ impl<'s> LocalHandle<'s, ArrayBufferView> {
     /// Whether the view has a buffer allocated
     /// (`v8::ArrayBufferView::has_buffer`).
     pub fn has_buffer(&self) -> bool {
-        view_facts(self.engine()).is_some_and(|facts| facts.buffer_object.as_object().is_some())
+        view_facts(self.engine(), self.minted_realm())
+            .is_some_and(|facts| facts.buffer_object.as_object().is_some())
     }
 
     /// A shared reference to the viewed buffer's bytes
     /// (`v8::ArrayBufferView::get_backing_store`).
     pub fn get_backing_store(&self) -> Option<SharedRef<BackingStore>> {
-        let facts = view_facts(self.engine())?;
+        let facts = view_facts(self.engine(), self.minted_realm())?;
         Some(SharedRef::new(facts.buffer.store()))
     }
 
@@ -446,7 +452,7 @@ impl<'s> LocalHandle<'s, ArrayBufferView> {
     /// the engine keeps the block allocated across detaching, so this one stays
     /// dereferenceable where V8's would not.
     pub fn data(&self) -> *mut c_void {
-        let Some(facts) = view_facts(self.engine()) else {
+        let Some(facts) = view_facts(self.engine(), self.minted_realm()) else {
             return std::ptr::null_mut();
         };
         facts
@@ -460,13 +466,15 @@ impl<'s> LocalHandle<'s, ArrayBufferView> {
     /// The view's byte length (`v8::ArrayBufferView::byte_length`): zero once
     /// the view no longer fits its buffer.
     pub fn byte_length(&self) -> usize {
-        view_facts(self.engine()).map_or(0, |facts| facts.effective_byte_length())
+        view_facts(self.engine(), self.minted_realm())
+            .map_or(0, |facts| facts.effective_byte_length())
     }
 
     /// The view's byte offset (`v8::ArrayBufferView::byte_offset`): zero once
     /// the view no longer fits its buffer.
     pub fn byte_offset(&self) -> usize {
-        view_facts(self.engine()).map_or(0, |facts| facts.effective_byte_offset())
+        view_facts(self.engine(), self.minted_realm())
+            .map_or(0, |facts| facts.effective_byte_offset())
     }
 
     /// The view's contents as a pointer and a length

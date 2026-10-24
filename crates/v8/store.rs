@@ -34,6 +34,8 @@ use std::rc::Rc;
 
 use crux::heap::GcAny;
 
+use runtime::api;
+
 use crate::handle::Payload;
 
 struct Slot {
@@ -64,6 +66,21 @@ struct Mark {
     cells: usize,
 }
 
+/// One handle's cell: its payload, plus the realm that was entered when the
+/// handle was minted.
+///
+/// Two isolates can be entered on one thread, so "the innermost entered
+/// context" is not an answer a handle-scope-less operation can use: a handle
+/// minted under isolate A would resolve against B's agent while B is entered.
+/// Recording the minting realm in the cell is what lets such an operation ask
+/// the realm that produced the handle (see `realm::with_agent_for`). The
+/// payload stays at offset zero, which is what `Local`'s tag cast relies on.
+#[repr(C)]
+pub(crate) struct PayloadCell {
+    pub(crate) payload: Payload,
+    pub(crate) realm: Option<api::Context>,
+}
+
 /// The payload cells handles point into.
 ///
 /// Chunked rather than one `Vec` because a cell's address *is* the handle: a
@@ -72,7 +89,7 @@ struct Mark {
 /// neither does any cell in it.
 #[derive(Default)]
 struct Cells {
-    chunks: Vec<Vec<Payload>>,
+    chunks: Vec<Vec<PayloadCell>>,
     /// The total number of cells handed out, across every chunk.
     len: usize,
 }
@@ -84,7 +101,7 @@ const CELLS_PER_CHUNK: usize = 256;
 
 impl Cells {
     /// Append `payload` and return the cell holding it.
-    fn push(&mut self, payload: Payload) -> NonNull<Payload> {
+    fn push(&mut self, payload: Payload) -> NonNull<PayloadCell> {
         let index = self.len;
         let chunk_index = index / CELLS_PER_CHUNK;
         if chunk_index == self.chunks.len() {
@@ -92,7 +109,10 @@ impl Cells {
         }
         let chunk = &mut self.chunks[chunk_index];
         let offset = index % CELLS_PER_CHUNK;
-        chunk.push(payload);
+        chunk.push(PayloadCell {
+            payload,
+            realm: crate::realm::current(),
+        });
         self.len += 1;
         NonNull::from(&chunk[offset])
     }
@@ -102,7 +122,8 @@ impl Cells {
     /// whatever a later region writes into the same slot.
     fn poison_from(&mut self, base: usize) {
         for index in base..self.len {
-            self.chunks[index / CELLS_PER_CHUNK][index % CELLS_PER_CHUNK] = Payload::Poisoned;
+            self.chunks[index / CELLS_PER_CHUNK][index % CELLS_PER_CHUNK].payload =
+                Payload::Poisoned;
         }
     }
 
@@ -127,7 +148,9 @@ impl Cells {
     /// whose scope has closed is no longer a root either.
     fn visit(&self, visit: &mut dyn FnMut(GcAny)) {
         for index in 0..self.len {
-            self.chunks[index / CELLS_PER_CHUNK][index % CELLS_PER_CHUNK].trace(visit);
+            self.chunks[index / CELLS_PER_CHUNK][index % CELLS_PER_CHUNK]
+                .payload
+                .trace(visit);
         }
     }
 }
@@ -212,7 +235,7 @@ pub(crate) fn close_region() {
 
 /// Put `payload` in the innermost open region, and return the cell holding it:
 /// what a [`Local`](crate::Local) is.
-pub(crate) fn cell(payload: Payload) -> NonNull<Payload> {
+pub(crate) fn cell(payload: Payload) -> NonNull<PayloadCell> {
     TABLE.with(|table| {
         let mut table = table.borrow_mut();
         assert!(
@@ -349,7 +372,10 @@ mod tests {
             let _ = cell(undefined());
         }
         // SAFETY: the region is open, so the cell is live.
-        assert!(matches!(unsafe { first.as_ref() }, Payload::Value(_)));
+        assert!(matches!(
+            unsafe { first.as_ref().payload },
+            Payload::Value(_)
+        ));
         close_region();
     }
 
@@ -362,14 +388,20 @@ mod tests {
         close_region();
         // SAFETY: reading the stale cell is the diagnosable bug the poison
         // exists for.
-        assert!(matches!(unsafe { stale.as_ref() }, Payload::Poisoned));
+        assert!(matches!(
+            unsafe { stale.as_ref().payload },
+            Payload::Poisoned
+        ));
 
         // The next region takes the address back.
         open_region();
         let fresh = cell(undefined());
         assert_eq!(stale, fresh);
         // SAFETY: this region is open.
-        assert!(matches!(unsafe { fresh.as_ref() }, Payload::Value(_)));
+        assert!(matches!(
+            unsafe { fresh.as_ref().payload },
+            Payload::Value(_)
+        ));
         close_region();
     }
 
@@ -382,12 +414,18 @@ mod tests {
         let nested = cell(undefined());
         close_region();
         // SAFETY: as above — poison until reuse.
-        assert!(matches!(unsafe { nested.as_ref() }, Payload::Poisoned));
+        assert!(matches!(
+            unsafe { nested.as_ref().payload },
+            Payload::Poisoned
+        ));
 
         let outer = cell(undefined());
         assert_eq!(nested, outer);
         // SAFETY: the outer region is open.
-        assert!(matches!(unsafe { outer.as_ref() }, Payload::Value(_)));
+        assert!(matches!(
+            unsafe { outer.as_ref().payload },
+            Payload::Value(_)
+        ));
         close_region();
     }
 }
