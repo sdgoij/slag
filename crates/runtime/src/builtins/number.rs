@@ -28,7 +28,7 @@ const VALUE_OF: &str = "%Number.prototype.valueOf%";
 const TO_LOCALE_STRING: &str = "%Number.prototype.toLocaleString%";
 
 fn placeholder(name: &'static str) -> NativeFn {
-    Box::new(move |_, _| {
+    Box::new(move |_, _, _| {
         Err(JsError::new(
             ErrorKind::TypeError,
             format!("{name} must be called through the agent"),
@@ -468,7 +468,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
         let func = Function::create_builtin(
             Some(JsString::from_utf8(name)),
             length,
-            Box::new(body),
+            Box::new(move |_, this, args| body(this, args)),
             None,
             function_proto,
         )?;

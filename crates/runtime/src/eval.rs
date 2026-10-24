@@ -1915,7 +1915,7 @@ mod tests {
                         let op = crux::function::Function::create_builtin(
                             Some(JsString::from_utf8("op")),
                             0,
-                            Box::new(|_, _| Ok(Value::Undefined)),
+                            Box::new(|_, _, _| Ok(Value::Undefined)),
                             None,
                             None,
                         )
@@ -1939,7 +1939,7 @@ mod tests {
                         let op = crux::function::Function::create_builtin(
                             Some(JsString::from_utf8("op")),
                             0,
-                            Box::new(move |_this, _args| {
+                            Box::new(move |_, _this, _args| {
                                 let next = global.get(&JsString::from_utf8("next"))?;
                                 crux::function::call(&next, Value::Undefined, &[])
                             }),
@@ -2448,7 +2448,7 @@ mod tests {
         let add = crux::Function::create_builtin(
             Some(JsString::from_utf8("add")),
             2,
-            Box::new(|_, args| {
+            Box::new(|_, _, args| {
                 let a = match args.first().map(|v| v.kind()) {
                     Some(ValueKind::Number(n)) => n,
                     _ => 0.0,
@@ -2476,7 +2476,7 @@ mod tests {
         let getter = crux::Function::create_builtin(
             Some(JsString::from_utf8("getX")),
             0,
-            Box::new(|this, _| match this.kind() {
+            Box::new(|_, this, _| match this.kind() {
                 ValueKind::Object(obj) => obj.get(&JsString::from_utf8("x")),
                 _ => Ok(Value::Undefined),
             }),
@@ -2504,8 +2504,8 @@ mod tests {
         let ctor = crux::Function::create_builtin(
             Some(JsString::from_utf8("C")),
             0,
-            Box::new(|_, _| Ok(Value::Undefined)),
-            Some(Box::new(move |_, _| {
+            Box::new(|_, _, _| Ok(Value::Undefined)),
+            Some(Box::new(move |_, _, _| {
                 Ok(Value::Object(
                     crux::object::JsObject::ordinary_object_create(Some(proto_for_ctor)),
                 ))
@@ -2834,7 +2834,7 @@ mod tests {
         let next = crux::Function::create_builtin(
             Some(JsString::from_utf8("next")),
             0,
-            Box::new(move |_, _| {
+            Box::new(move |_, _, _| {
                 let i = counter.get();
                 counter.set(i + 1);
                 let obj = crux::object::JsObject::ordinary_object_create(None);
@@ -2867,7 +2867,7 @@ mod tests {
                     crux::Function::create_builtin(
                         Some(JsString::from_utf8("[Symbol.iterator]")),
                         0,
-                        Box::new(move |_, _| Ok(Value::Object(iterator_for_method))),
+                        Box::new(move |_, _, _| Ok(Value::Object(iterator_for_method))),
                         None,
                         None,
                     )

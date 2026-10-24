@@ -456,7 +456,7 @@ mod tests {
             let function = Function::create_builtin(
                 Some(JsString::from_utf8("")),
                 length,
-                Box::new(move |this: &Value, args: &[Value]| {
+                Box::new(move |_, this: &Value, args: &[Value]| {
                     seen.borrow_mut().push(format!(
                         "{kind}:{}:receiver={}",
                         args.len(),
@@ -508,7 +508,7 @@ mod tests {
         let resolve = Function::create_builtin(
             Some(JsString::from_utf8("")),
             1,
-            Box::new(move |_: &Value, _: &[Value]| {
+            Box::new(move |_, _: &Value, _: &[Value]| {
                 seen_hook.borrow_mut().push("resolve".to_string());
                 Ok(Value::Undefined)
             }),

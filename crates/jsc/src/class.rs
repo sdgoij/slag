@@ -618,7 +618,7 @@ fn make_static_value_function(
     let function = Function::create_builtin(
         Some(JsString::from_utf8(&name)),
         0,
-        Box::new(body),
+        Box::new(move |_, this, args| body(this, args)),
         None,
         function_prototype(ctx),
     );
@@ -689,7 +689,7 @@ pub(crate) fn make_function_with_callback(
     callback: JSObjectCallAsFunctionCallback,
 ) -> Handle<Function> {
     let ctx_ptr = ctx as *const JscContext as *mut JscContext;
-    let call: crux::function::NativeFn = Box::new(move |this, args| {
+    let call: crux::function::NativeFn = Box::new(move |_, this, args| {
         let arg_refs: Vec<JSValueRef> = args.iter().map(|arg| refs::value_to_ref(*arg)).collect();
         let this_ref = refs::value_object_ref(this);
         let mut exception: JSValueRef = std::ptr::null_mut();

@@ -242,7 +242,7 @@ pub fn new_promise_capability(
         2,
         Box::new({
             let captured = captured.clone();
-            move |_, args| {
+            move |_agent, _, args| {
                 let mut slot = captured.borrow_mut();
                 // GetCapabilitiesExecutor (spec 27.2.1.5.1 steps 1-4): a
                 // second call throws once a resolve/reject was captured; a
@@ -313,7 +313,7 @@ pub fn create_resolving_functions(agent: &mut Agent, promise: &Value) -> (Value,
         let resolver = Function::create_builtin(
             Some(JsString::from_utf8(name)),
             1,
-            Box::new(|_, _| {
+            Box::new(|_, _, _| {
                 Err(JsError::new(
                     ErrorKind::TypeError,
                     "Promise resolving functions must be called through the agent".into(),

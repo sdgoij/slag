@@ -724,7 +724,7 @@ fn set_default_global_bindings(realm: &Handle<Realm>) -> Result<(), JsError> {
     let eval_func = Function::create_builtin(
         Some(JsString::from_utf8("eval")),
         1,
-        Box::new(|_, _| {
+        Box::new(|_, _, _| {
             Err(JsError::new(
                 ErrorKind::TypeError,
                 "eval must be called through the evaluator".into(),
@@ -984,7 +984,7 @@ mod tests {
         let getter = Function::create_builtin(
             Some(JsString::from_utf8("get x")),
             0,
-            Box::new(|_, _| Ok(Value::Number(1.0))),
+            Box::new(|_, _, _| Ok(Value::Number(1.0))),
             None,
             None,
         )

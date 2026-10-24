@@ -7940,7 +7940,7 @@ impl Vm {
                     ValueKind::Function(function) => match &function.kind {
                         crux::function::FunctionKind::Builtin {
                             call: Some(native), ..
-                        } => native(&this, args)?,
+                        } => native(agent as *mut Agent as *mut (), &this, args)?,
                         _ => crate::function::call_inner(agent, &callee, this, args)?,
                     },
                     _ => crate::function::call_inner(agent, &callee, this, args)?,
@@ -15310,7 +15310,7 @@ impl Vm {
                             });
                             return Ok(());
                         }
-                        let result = native(&this, args)?;
+                        let result = native(agent as *mut Agent as *mut (), &this, args)?;
                         self.stack.truncate(arg_start - below);
                         self.stack.push(result);
                         return Ok(());

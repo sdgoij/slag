@@ -127,7 +127,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
 
 fn placeholder(name: &str) -> NativeFn {
     let name = name.to_string();
-    Box::new(move |_, _| Err(type_error(&format!("{name} must be dispatched"))))
+    Box::new(move |_, _, _| Err(type_error(&format!("{name} must be dispatched"))))
 }
 
 type CallDispatch = fn(&mut Agent, &Value, &Value, &[Value]) -> Option<Result<Value, JsError>>;

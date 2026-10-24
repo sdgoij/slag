@@ -58,7 +58,7 @@ fn add_initializer_function(
     let function = Function::create_builtin(
         Some(JsString::from_utf8("addInitializer")),
         0,
-        Box::new(move |_this, args| {
+        Box::new(move |_agent, _this, args| {
             if finished.get() {
                 return Err(JsError::new(
                     ErrorKind::TypeError,

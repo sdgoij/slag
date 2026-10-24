@@ -343,14 +343,19 @@ mod tests {
     /// hand them to a JS function as arguments — which is the shape that lowers to
     /// the fast slot call a host's `Deno.core.ops` call takes.
     fn install_termination_pair(isolate: &mut Isolate) -> (Value, Value) {
-        fn stop(_this: &Value, _args: &[Value]) -> Result<Value, JsError> {
-            let agent = crux::function::current_agent();
-            assert!(!agent.is_null(), "a builtin runs inside an agent window");
-            // SAFETY: the engine recorded this agent for the duration of the call.
-            unsafe { &*(agent as *const crate::agent::Agent) }.request_termination();
+        fn stop(
+            agent: crux::function::AgentPtr,
+            _this: &Value,
+            _args: &[Value],
+        ) -> Result<Value, JsError> {
+            crate::context::callback_agent(agent)?.request_termination();
             Ok(Value::Undefined)
         }
-        fn mark(_this: &Value, _args: &[Value]) -> Result<Value, JsError> {
+        fn mark(
+            _agent: crux::function::AgentPtr,
+            _this: &Value,
+            _args: &[Value],
+        ) -> Result<Value, JsError> {
             MARKED.with(|marked| marked.set(true));
             Ok(Value::Undefined)
         }
@@ -361,7 +366,7 @@ mod tests {
         for (name, call) in [
             (
                 "stop",
-                stop as fn(&Value, &[Value]) -> Result<Value, JsError>,
+                stop as fn(crux::function::AgentPtr, &Value, &[Value]) -> Result<Value, JsError>,
             ),
             ("mark", mark),
         ] {

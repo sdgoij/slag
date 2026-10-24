@@ -2053,7 +2053,7 @@ extern "C" fn call_slow(
                     call: Some(native), ..
                 } = &function.kind
                 {
-                    return match native(&this_value, args_slice) {
+                    return match native(agent as *mut Agent as *mut (), &this_value, args_slice) {
                         Ok(value) => value.bits(),
                         Err(error) => slow_error(ctx, error),
                     };

@@ -221,7 +221,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
     let async_iterator = Function::create_builtin(
         Some(JsString::from_utf8("[Symbol.asyncIterator]")),
         0,
-        Box::new(|this, _| Ok(*this)),
+        Box::new(|_, this, _| Ok(*this)),
         None,
         function_proto,
     )?;
@@ -320,7 +320,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
 }
 
 fn placeholder(name: &'static str) -> crux::function::NativeFn {
-    Box::new(move |_, _| {
+    Box::new(move |_, _, _| {
         Err(JsError::new(
             ErrorKind::TypeError,
             format!("{name} must be called through the agent"),
@@ -366,7 +366,7 @@ fn install_helper_prototype(realm: &Handle<Realm>) -> Result<(), JsError> {
     let async_iterator = Function::create_builtin(
         Some(JsString::from_utf8("[Symbol.asyncIterator]")),
         0,
-        Box::new(|this, _| Ok(*this)),
+        Box::new(|_, this, _| Ok(*this)),
         None,
         None,
     )?;
@@ -554,7 +554,7 @@ fn make_await_closure(agent: &mut Agent, entry: AwaitEntry) -> Result<Value, JsE
     let closure = Function::create_builtin(
         Some(JsString::from_utf8("")),
         1,
-        Box::new(|_, _| {
+        Box::new(|_, _, _| {
             Err(JsError::new(
                 ErrorKind::TypeError,
                 "async iterator await handler must be called through the agent".into(),

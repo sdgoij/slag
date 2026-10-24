@@ -11574,7 +11574,7 @@ var $DONE = function (error) {
         let eval_script = Function::create_builtin(
             Some(JsString::from_utf8("evalScript")),
             1,
-            Box::new(|_, _| {
+            Box::new(|_agent, _, _| {
                 Err(JsError::new(
                     ErrorKind::TypeError,
                     "evalScript must be called through the agent".into(),
@@ -11607,8 +11607,8 @@ var $DONE = function (error) {
         let gc = Function::create_builtin(
             Some(JsString::from_utf8("gc")),
             0,
-            Box::new(|_, _| {
-                let agent = runtime::context::current_agent_mut()?;
+            Box::new(|_agent, _, _| {
+                let agent = runtime::context::callback_agent(_agent)?;
                 agent.collect_garbage();
                 Ok(Value::Undefined)
             }),
@@ -11627,8 +11627,8 @@ var $DONE = function (error) {
         let create_realm = Function::create_builtin(
             Some(JsString::from_utf8("createRealm")),
             0,
-            Box::new(|_, _| {
-                let agent = runtime::context::current_agent_mut()?;
+            Box::new(|_agent, _, _| {
+                let agent = runtime::context::callback_agent(_agent)?;
                 let new_realm = runtime::realm::initialize_host_defined_realm(agent)?;
                 let record = JsObject::ordinary_object_create(None);
                 record.create_data_property_or_throw(
@@ -11638,8 +11638,8 @@ var $DONE = function (error) {
                 let eval_script = Function::create_builtin(
                     Some(JsString::from_utf8("evalScript")),
                     1,
-                    Box::new(move |_, args| {
-                        let agent = runtime::context::current_agent_mut()?;
+                    Box::new(move |_agent, _, args| {
+                        let agent = runtime::context::callback_agent(_agent)?;
                         let source = args.first().cloned().unwrap_or(Value::Undefined);
                         let text = runtime::context::to_string(agent, &source)?;
                         agent.push_bootstrap_context(new_realm);
@@ -11771,8 +11771,8 @@ var $DONE = function (error) {
             agent,
             "sleep",
             1,
-            Box::new(|_, args| {
-                let agent = runtime::context::current_agent_mut()?;
+            Box::new(|_agent, _, args| {
+                let agent = runtime::context::callback_agent(_agent)?;
                 let ms = sleep_ms(agent, &args.first().cloned().unwrap_or(Value::Undefined))?;
                 std::thread::sleep(std::time::Duration::from_millis(ms));
                 Ok(Value::Undefined)
@@ -11791,7 +11791,9 @@ var $DONE = function (error) {
             agent,
             "monotonicNow",
             0,
-            Box::new(move |_, _| Ok(Value::Number(hub.epoch.elapsed().as_secs_f64() * 1000.0))),
+            Box::new(move |_agent, _, _| {
+                Ok(Value::Number(hub.epoch.elapsed().as_secs_f64() * 1000.0))
+            }),
         )
     }
 
@@ -11846,8 +11848,8 @@ var $DONE = function (error) {
             agent,
             "start",
             1,
-            Box::new(move |_, args| {
-                let agent = runtime::context::current_agent_mut()?;
+            Box::new(move |_agent, _, args| {
+                let agent = runtime::context::callback_agent(_agent)?;
                 let source = args.first().cloned().unwrap_or(Value::Undefined);
                 let text = runtime::context::to_string(agent, &source)?.to_string_lossy();
                 let index = {
@@ -11883,8 +11885,8 @@ var $DONE = function (error) {
             agent,
             "broadcast",
             2,
-            Box::new(move |_, args| {
-                let agent = runtime::context::current_agent_mut()?;
+            Box::new(move |_agent, _, args| {
+                let agent = runtime::context::callback_agent(_agent)?;
                 let Some(sab) = args.first() else {
                     return Err(JsError::new(
                         ErrorKind::TypeError,
@@ -11970,7 +11972,7 @@ var $DONE = function (error) {
                 agent,
                 "getReport",
                 0,
-                Box::new(move |_, _| {
+                Box::new(move |_agent, _, _| {
                     let mut reports = get_report_hub.reports.lock().map_err(|_| {
                         JsError::new(ErrorKind::TypeError, "agent hub poisoned".into())
                     })?;
@@ -12033,8 +12035,8 @@ var $DONE = function (error) {
             agent,
             "receiveBroadcast",
             1,
-            Box::new(|_, args| {
-                let agent = runtime::context::current_agent_mut()?;
+            Box::new(|_agent, _, args| {
+                let agent = runtime::context::callback_agent(_agent)?;
                 let receiver = args.first().cloned().unwrap_or(Value::Undefined);
                 let realm = agent.current_realm()?;
                 let d262 = realm.global_object.get(&JsString::from_utf8("$262"))?;
@@ -12054,8 +12056,8 @@ var $DONE = function (error) {
             agent,
             "report",
             1,
-            Box::new(move |_, args| {
-                let agent = runtime::context::current_agent_mut()?;
+            Box::new(move |_agent, _, args| {
+                let agent = runtime::context::callback_agent(_agent)?;
                 let message = args.first().cloned().unwrap_or(Value::Undefined);
                 let text = runtime::context::to_string(agent, &message)?.to_string_lossy();
                 report_hub
@@ -12072,7 +12074,7 @@ var $DONE = function (error) {
             agent,
             "leaving",
             0,
-            Box::new(move |_, _| {
+            Box::new(move |_agent, _, _| {
                 let mut workers = leaving_hub
                     .workers
                     .lock()
@@ -12238,8 +12240,8 @@ var $DONE = function (error) {
             agent,
             "setTimeout",
             1,
-            Box::new(|_, args| {
-                let agent = runtime::context::current_agent_mut()?;
+            Box::new(|_agent, _, args| {
+                let agent = runtime::context::callback_agent(_agent)?;
                 let callback = args.first().cloned().unwrap_or(Value::Undefined);
                 if !crux::value::is_callable(&callback) {
                     return Err(JsError::new(
@@ -12275,7 +12277,7 @@ var $DONE = function (error) {
         let bare = Function::create_builtin(
             Some(JsString::from_utf8("assert")),
             1,
-            Box::new(|_, args| {
+            Box::new(|_agent, _, args| {
                 let Some(actual) = args.first() else {
                     return Err(arity_error("assert"));
                 };
@@ -12293,7 +12295,7 @@ var $DONE = function (error) {
         let same_value = Function::create_builtin(
             Some(JsString::from_utf8("sameValue")),
             2,
-            Box::new(|_, args| {
+            Box::new(|_agent, _, args| {
                 let [actual, expected, ..] = args else {
                     return Err(arity_error("assert.sameValue"));
                 };
@@ -12313,7 +12315,7 @@ var $DONE = function (error) {
         let not_same_value = Function::create_builtin(
             Some(JsString::from_utf8("notSameValue")),
             2,
-            Box::new(|_, args| {
+            Box::new(|_agent, _, args| {
                 let [actual, expected, ..] = args else {
                     return Err(arity_error("assert.notSameValue"));
                 };
@@ -12333,7 +12335,7 @@ var $DONE = function (error) {
         let assert_true = Function::create_builtin(
             Some(JsString::from_utf8("true")),
             1,
-            Box::new(|_, args| {
+            Box::new(|_agent, _, args| {
                 let Some(actual) = args.first() else {
                     return Err(arity_error("assert.true"));
                 };
@@ -12351,7 +12353,7 @@ var $DONE = function (error) {
         let assert_false = Function::create_builtin(
             Some(JsString::from_utf8("false")),
             1,
-            Box::new(|_, args| {
+            Box::new(|_agent, _, args| {
                 let Some(actual) = args.first() else {
                     return Err(arity_error("assert.false"));
                 };
@@ -12380,8 +12382,8 @@ var $DONE = function (error) {
         let test262_error = Function::create_builtin(
             Some(JsString::from_utf8("Test262Error")),
             1,
-            Box::new(|_, _| Ok(Value::Undefined)),
-            Some(Box::new(|_, _| {
+            Box::new(|_agent, _, _| Ok(Value::Undefined)),
+            Some(Box::new(|_agent, _, _| {
                 Ok(Value::Object(JsObject::ordinary_object_create(None)))
             })),
             None,
@@ -12391,7 +12393,7 @@ var $DONE = function (error) {
         let dollar_error = Function::create_builtin(
             Some(JsString::from_utf8("$ERROR")),
             1,
-            Box::new(|_, args| match args.first() {
+            Box::new(|_agent, _, args| match args.first() {
                 Some(value) => Err(assertion_error(format!("$ERROR: {value}"))),
                 None => Err(assertion_error("$ERROR".into())),
             }),
@@ -12406,7 +12408,7 @@ var $DONE = function (error) {
         let is_constructor = Function::create_builtin(
             Some(JsString::from_utf8("isConstructor")),
             1,
-            Box::new(|_, args| {
+            Box::new(|_agent, _, args| {
                 let Some(value) = args.first() else {
                     return Err(arity_error("isConstructor"));
                 };

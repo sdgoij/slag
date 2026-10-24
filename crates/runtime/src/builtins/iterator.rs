@@ -254,7 +254,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
 }
 
 fn placeholder(name: String) -> crux::function::NativeFn {
-    Box::new(move |_, _| {
+    Box::new(move |_, _, _| {
         Err(JsError::new(
             ErrorKind::TypeError,
             format!("{name} must be called through the agent"),
@@ -369,7 +369,7 @@ fn install_prototype_methods(
     let iterator_method = Function::create_builtin(
         Some(JsString::from_utf8("[Symbol.iterator]")),
         0,
-        Box::new(|this, _| Ok(*this)),
+        Box::new(|_, this, _| Ok(*this)),
         None,
         None,
     )?;
@@ -394,7 +394,7 @@ fn install_prototype_methods(
     let tag_get = Function::create_builtin(
         Some(JsString::from_utf8("get [Symbol.toStringTag]")),
         0,
-        Box::new(|_, _| Ok(Value::String(Handle::new(JsString::from_utf8("Iterator"))))),
+        Box::new(|_, _, _| Ok(Value::String(Handle::new(JsString::from_utf8("Iterator"))))),
         None,
         None,
     )?;
@@ -525,7 +525,7 @@ fn install_helper_prototype(realm: &Handle<Realm>) -> Result<(), JsError> {
     let iterator_method = Function::create_builtin(
         Some(JsString::from_utf8("[Symbol.iterator]")),
         0,
-        Box::new(|this, _| Ok(*this)),
+        Box::new(|_, this, _| Ok(*this)),
         None,
         None,
     )?;
@@ -590,7 +590,7 @@ fn install_wrap_prototype(realm: &Handle<Realm>) -> Result<(), JsError> {
     let iterator_method = Function::create_builtin(
         Some(JsString::from_utf8("[Symbol.iterator]")),
         0,
-        Box::new(|this, _| Ok(*this)),
+        Box::new(|_, this, _| Ok(*this)),
         None,
         None,
     )?;

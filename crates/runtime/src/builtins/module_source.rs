@@ -23,7 +23,7 @@ const PROTO_TO_STRING: &str = "%AbstractModuleSource.prototype.toString%";
 const PROTO_TO_STRING_TAG: &str = "%AbstractModuleSource.prototype[@@toStringTag]%";
 
 fn placeholder(name: &'static str) -> NativeFn {
-    Box::new(move |_, _| {
+    Box::new(move |_, _, _| {
         Err(JsError::new(
             ErrorKind::TypeError,
             format!("{name} must be called through the agent"),

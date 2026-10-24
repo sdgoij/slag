@@ -378,7 +378,7 @@ fn window_method(
     Function::create_builtin(
         Some(name),
         arity,
-        Box::new(move |_, args| {
+        Box::new(move |_, _, args| {
             on_window_thread()?;
             body(args)
         }),
@@ -396,7 +396,7 @@ fn plain_method(
     Function::create_builtin(
         Some(JsString::from_utf8(name)),
         arity,
-        Box::new(move |_, args| body(args)),
+        Box::new(move |_, _, args| body(args)),
         None,
         None,
     )

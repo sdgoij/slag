@@ -655,6 +655,38 @@ Gate run: `cargo test -p runtime --release --lib` (1068 pass), clippy clean,
 `--gc-stress --gc-verify` samples over `Promise/reject`, `GeneratorPrototype/
 return`, `expressions/await` and an async/generator/combinator script.
 
+### Option B landed: the callback agent is explicit
+
+`crux::function::NativeFn` and `NativeCtor` now take an `AgentPtr` (an opaque
+`*mut ()`) as their first argument, and the dispatching frame supplies its own
+live `&mut Agent` reborrow: `runtime::function::call_inner` and
+`construct_inner`, the VM's `PendingCall`/`CallBuiltin` native arms, the JIT's
+native helper, and the earlier `fast_call` lane. A body that needs the agent
+recovers it with `context::callback_agent(ptr)`, which is sound because the
+pointer's provenance is the frame that is still running — unlike the old
+`with_agent` TLS slot, which could hold an ancestor of the live `&mut Agent`s
+and whose retag popped their borrow tags.
+
+Consequences: `context::current_agent_mut` is gone (nothing derives `&mut Agent`
+from TLS any more); `embed::FunctionCall` carries the pointer and its methods
+(`to_number`, `to_string`, `call`, `construct`, `eval`, `create_object`,
+`create_array`, `create_function`, `define_accessor`) run on it; the CLI's
+globals (`parseInt`, `isFinite`, `escape`, `queueMicrotask`, console,
+`setTimeout`/`setInterval`) and test262's `$262.gc`/`createRealm`/`evalScript`
+hooks take the same route. `crux::function::current_agent` remains for reads
+(the allocation-time collector, the JIT's callee lookup) and for crux's own
+re-entry into an ECMAScript body from a proxy trap or a `ToPrimitive`
+conversion, which still goes through the `EcmaHook`; threading the agent
+through those crux entry points is separate, larger work, and the collector
+side is what slices 2-4 address.
+
+Gate run: `cargo test --workspace --release --no-fail-fast` (every target green
+except the two pre-existing `v8` snapshot `should_panic` tests, which fail
+identically at the commit before this change); clippy `-D warnings` clean;
+`*Promise*` 732/732, `Function/*` 509/509, `WeakRef/*` 29/29,
+`FinalizationRegistry/*` 47/47, `expressions/await/*` 22/22; CLI host-globals
+and async/generator scratch scripts under `--gc-stress --gc-verify`.
+
 ---
 
 ## What was checked and found sound

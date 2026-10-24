@@ -712,7 +712,14 @@ mod tests {
         f: impl Fn(&Value, &[Value]) -> Result<Value, JsError> + 'static,
     ) -> Value {
         Value::Function(
-            Function::create_builtin(Some(key(name)), 0, Box::new(f), None, None).unwrap(),
+            Function::create_builtin(
+                Some(key(name)),
+                0,
+                Box::new(move |_, this, args| f(this, args)),
+                None,
+                None,
+            )
+            .unwrap(),
         )
     }
 
@@ -933,7 +940,7 @@ mod tests {
         let target = Function::create_builtin(
             Some(key("f")),
             1,
-            Box::new(|_, _| Ok(Value::Undefined)),
+            Box::new(|_, _, _| Ok(Value::Undefined)),
             None,
             None,
         )
@@ -977,8 +984,8 @@ mod tests {
         let target = Function::create_builtin(
             Some(key("C")),
             0,
-            Box::new(|_, _| Ok(Value::Undefined)),
-            Some(Box::new(|_, _| Ok(Value::Object(plain_object())))),
+            Box::new(|_, _, _| Ok(Value::Undefined)),
+            Some(Box::new(|_, _, _| Ok(Value::Object(plain_object())))),
             None,
         )
         .unwrap();

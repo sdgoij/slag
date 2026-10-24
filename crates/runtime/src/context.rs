@@ -17,28 +17,10 @@ use crate::env::{EnvRecord, EnvRef};
 use crate::realm::Realm;
 use crate::script::ScriptRecord;
 
-/// The agent of the innermost enclosing [`crux::function::with_agent`]
-/// window — the script/eval/call currently running. Native host closures
-/// (the embedding API, the test262 harness) use this to reach the agent,
-/// which their call signature does not receive. Errors when called outside
-/// such a window.
-pub fn current_agent_mut() -> Result<&'static mut Agent, JsError> {
-    let agent = crux::function::current_agent();
-    if agent.is_null() {
-        return Err(JsError::new(
-            ErrorKind::TypeError,
-            "host global called outside an agent window".into(),
-        ));
-    }
-    // SAFETY: `with_agent` guarantees a live `&mut Agent` for the duration of
-    // the enclosing call; host closures only run inside those windows.
-    Ok(unsafe { &mut *(agent as *mut Agent) })
-}
-
-/// The current agent, immutably (GC-2): the `--gc-stress` collector reads
-/// the agent's roots through this instead of `current_agent_mut`, because a
-/// per-allocation collection fires inside code that already holds `&mut
-/// Agent` — a second mutable borrow through the TLS pointer would alias it.
+/// The current agent, immutably (GC-2): the `--gc-stress` collector reads the
+/// agent's roots through this. A mutable form does not exist: a native built-in
+/// body receives its agent from the dispatch (`callback_agent`), and a second
+/// `&mut Agent` derived from the TLS slot would alias the frame that passed it.
 pub fn current_agent() -> Result<&'static Agent, JsError> {
     let agent = crux::function::current_agent();
     if agent.is_null() {
@@ -50,6 +32,25 @@ pub fn current_agent() -> Result<&'static Agent, JsError> {
     // SAFETY: `with_agent` guarantees a live agent for the duration of the
     // enclosing call; the stress collector only reads its roots.
     Ok(unsafe { &*(agent as *const Agent) })
+}
+
+/// The agent a native built-in body was handed by the dispatch.
+///
+/// `ptr` is the runtime's own live `&mut Agent` reborrow (see
+/// `crate::function::call_inner`), never the `with_agent` TLS slot: deriving the
+/// reference from it cannot invalidate the borrow tag of the frame that passed
+/// it, which is exactly what the TLS route did. The reference is valid only for
+/// the duration of the body; nothing may store it.
+pub fn callback_agent(ptr: crux::function::AgentPtr) -> Result<&'static mut Agent, JsError> {
+    if ptr.is_null() {
+        return Err(JsError::new(
+            ErrorKind::TypeError,
+            "host global called outside an agent window".into(),
+        ));
+    }
+    // SAFETY: the pointer comes from a live `&mut Agent` in the dispatching
+    // frame, and the body runs synchronously inside that frame.
+    Ok(unsafe { &mut *(ptr as *mut Agent) })
 }
 
 /// GetFunctionRealm (spec 10.2.6): the realm the function object was

@@ -56,7 +56,7 @@ const SET_PROTO: &str = "%Object.setPrototypeOf%";
 const VALUES: &str = "%Object.values%";
 
 fn placeholder(name: &'static str) -> NativeFn {
-    Box::new(move |_, _| {
+    Box::new(move |_, _, _| {
         Err(JsError::new(
             ErrorKind::TypeError,
             format!("{name} must be called through the agent"),
@@ -1960,7 +1960,7 @@ mod tests {
         let next = Function::create_builtin(
             Some(JsString::from_utf8("next")),
             0,
-            Box::new(move |_, _| {
+            Box::new(move |_, _, _| {
                 let i = index.get();
                 let result = JsObject::ordinary_object_create(None);
                 if i < pairs.len() {
@@ -2000,7 +2000,7 @@ mod tests {
                     Function::create_builtin(
                         Some(JsString::from_utf8("[Symbol.iterator]")),
                         0,
-                        Box::new(move |_, _| Ok(Value::Object(iterator_for_method))),
+                        Box::new(move |_, _, _| Ok(Value::Object(iterator_for_method))),
                         None,
                         None,
                     )

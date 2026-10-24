@@ -281,7 +281,7 @@ fn install_stack(realm: &Handle<Realm>, name: &str, is_async: bool) -> Result<()
 }
 
 fn placeholder(name: String) -> crux::function::NativeFn {
-    Box::new(move |_, _| {
+    Box::new(move |_, _, _| {
         Err(JsError::new(
             ErrorKind::TypeError,
             format!("{name} must be called through the agent"),
@@ -986,7 +986,7 @@ fn make_async_disposal_continuations(
         let closure = Function::create_builtin(
             Some(JsString::from_utf8("")),
             1,
-            Box::new(|_, _| {
+            Box::new(|_, _, _| {
                 Err(JsError::new(
                     ErrorKind::TypeError,
                     "disposeAsync continuation must be called through the agent".into(),
@@ -1193,7 +1193,7 @@ fn drive_async_body_disposal(agent: &mut Agent, driver_id: u64) -> Result<Value,
         let closure = Function::create_builtin(
             Some(JsString::from_utf8("")),
             1,
-            Box::new(|_, _| {
+            Box::new(|_, _, _| {
                 Err(JsError::new(
                     ErrorKind::TypeError,
                     "async disposal continuation must be called through the agent".into(),

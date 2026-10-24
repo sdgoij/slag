@@ -459,7 +459,7 @@ fn sum_precise(agent: &mut Agent, args: &[Value]) -> Result<Value, JsError> {
 }
 
 fn placeholder(name: &'static str) -> NativeFn {
-    Box::new(move |_, _| {
+    Box::new(move |_, _, _| {
         Err(JsError::new(
             ErrorKind::TypeError,
             format!("{name} must be called through the agent"),
@@ -474,14 +474,14 @@ fn arg(args: &[Value], i: usize) -> Result<f64, JsError> {
 
 /// A Math method: ToNumber its arguments, run a pure computation.
 fn method(body: fn(&[f64]) -> f64) -> NativeFn {
-    Box::new(move |_, args| {
+    Box::new(move |_, _, args| {
         let values: Result<Vec<f64>, JsError> = args.iter().map(to_number).collect();
         Ok(Value::Number(body(&values?)))
     })
 }
 
 fn unary(body: fn(f64) -> f64) -> NativeFn {
-    Box::new(move |_, args| Ok(Value::Number(body(arg(args, 0)?))))
+    Box::new(move |_, _, args| Ok(Value::Number(body(arg(args, 0)?))))
 }
 
 /// Install the `Math` intrinsic and the global `Math` binding (spec 21.3.1)
@@ -539,7 +539,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
         (
             "imul",
             2,
-            Box::new(|_: &Value, args: &[Value]| {
+            Box::new(|_, _: &Value, args: &[Value]| {
                 Ok(Value::Number(imul(arg(args, 0)?, arg(args, 1)?)))
             }),
         ),
@@ -552,7 +552,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
         (
             "pow",
             2,
-            Box::new(|_: &Value, args: &[Value]| {
+            Box::new(|_, _: &Value, args: &[Value]| {
                 Ok(Value::Number(crux::number::exponentiate(
                     arg(args, 0)?,
                     arg(args, 1)?,
@@ -562,7 +562,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
         (
             "random",
             0,
-            Box::new(|_: &Value, _: &[Value]| Ok(Value::Number(default_random()))),
+            Box::new(|_, _: &Value, _: &[Value]| Ok(Value::Number(default_random()))),
         ),
         ("round", 1, unary(math_round)),
         (
@@ -589,7 +589,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
         (
             "atan2",
             2,
-            Box::new(|_: &Value, args: &[Value]| {
+            Box::new(|_, _: &Value, args: &[Value]| {
                 Ok(Value::Number(arg(args, 0)?.atan2(arg(args, 1)?)))
             }) as NativeFn,
         ),
@@ -885,7 +885,7 @@ mod tests {
             let next = Function::create_builtin(
                 Some(JsString::from_utf8("next")),
                 0,
-                Box::new(move |_, _| {
+                Box::new(move |_, _, _| {
                     let i = index.get();
                     if i < values.len() {
                         index.set(i + 1);
@@ -925,7 +925,7 @@ mod tests {
             let iterator_method = Function::create_builtin(
                 Some(JsString::from_utf8("[Symbol.iterator]")),
                 0,
-                Box::new(|this, _| Ok(*this)),
+                Box::new(|_, this, _| Ok(*this)),
                 None,
                 None,
             )

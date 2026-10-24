@@ -2295,7 +2295,13 @@ pub(crate) fn call_inner(
                     None => match &function.kind {
                         crux::function::FunctionKind::Builtin {
                             call: Some(native), ..
-                        } => native(&this, args),
+                        } => {
+                            // The pointer is this frame's own `&mut Agent`
+                            // reborrow, not the `with_agent` TLS slot: a body
+                            // that recovers `&mut Agent` from it is retagging
+                            // from a tag that is still valid.
+                            native(agent as *mut Agent as *mut (), &this, args)
+                        }
                         _ => crux::function::call(callee, this, args),
                     },
                 }
@@ -2710,7 +2716,7 @@ fn construct_inner(
                     crux::function::FunctionKind::Builtin {
                         construct: Some(ctor),
                         ..
-                    } => ctor(new_target, args),
+                    } => ctor(agent as *mut Agent as *mut (), new_target, args),
                     _ => crux::function::construct(callee, args, new_target),
                 }
             }
@@ -3257,7 +3263,7 @@ pub(crate) fn create_mapped_arguments_object(
                 Function::create_builtin(
                     None,
                     0,
-                    Box::new(move |_, _| {
+                    Box::new(move |_, _, _| {
                         let name = crux::string::lookup(name);
                         env.get_binding_value(&name, false)
                     }),
@@ -3276,7 +3282,7 @@ pub(crate) fn create_mapped_arguments_object(
                 Function::create_builtin(
                     None,
                     0,
-                    Box::new(move |_, value| {
+                    Box::new(move |_agent, _, value| {
                         let name = crux::string::lookup(name);
                         let value = value.first().cloned().unwrap_or(Value::Undefined);
                         env.set_mutable_binding(&name, value, false)?;
@@ -4460,7 +4466,7 @@ mod tests {
         let next = crux::Function::create_builtin(
             Some(JsString::from_utf8("next")),
             0,
-            Box::new(move |_, _| {
+            Box::new(move |_, _, _| {
                 let i = index.get();
                 let result = crux::object::JsObject::ordinary_object_create(None);
                 if i < len {
@@ -4501,7 +4507,7 @@ mod tests {
                     crux::Function::create_builtin(
                         Some(JsString::from_utf8("[Symbol.iterator]")),
                         0,
-                        Box::new(move |_, _| Ok(Value::Object(iterator_for_method))),
+                        Box::new(move |_, _, _| Ok(Value::Object(iterator_for_method))),
                         None,
                         None,
                     )

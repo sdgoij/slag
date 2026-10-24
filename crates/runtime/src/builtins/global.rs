@@ -1,8 +1,8 @@
 //! Global function properties (spec 19.2): `isFinite`, `isNaN`, `parseFloat`,
 //! `parseInt`, and the URI handling functions (`encodeURI[Component]` /
 //! `decodeURI[Component]`). Their ToString/ToNumber arguments can be objects,
-//! so the conversions run through the agent (recovered from the crux
-//! `with_agent` window) instead of the pure crux helpers.
+//! so the conversions run through the agent, which the dispatch hands to the
+//! body explicitly (`crux::function::NativeFn`'s first argument).
 
 use crux::error::{ErrorKind, JsError};
 use crux::function::Function;
@@ -24,31 +24,18 @@ fn uri_error() -> JsError {
     JsError::new(ErrorKind::UriError, "URI malformed".into())
 }
 
-/// The agent recorded by the innermost `crux::function::with_agent` window;
-/// the global functions are plain crux closures and cannot take it as a
-/// parameter, but they only run inside those windows.
-fn current_agent_mut() -> Result<&'static mut crate::agent::Agent, JsError> {
-    let agent = crux::function::current_agent();
-    if agent.is_null() {
-        return Err(JsError::new(
-            ErrorKind::TypeError,
-            "host global called outside an agent window".into(),
-        ));
-    }
-    // SAFETY: `with_agent` guarantees a live `&mut Agent` for the duration of
-    // the enclosing call.
-    Ok(unsafe { &mut *(agent as *mut crate::agent::Agent) })
-}
+/// The shape every global function has: the agent, `this`, and the arguments.
+type GlobalFn = fn(&mut crate::agent::Agent, &Value, &[Value]) -> Result<Value, JsError>;
 
 /// ToString with the agent's ToPrimitive dispatch (the pure crux `to_string`
 /// cannot call the %Object.prototype.toString%/valueOf builtins).
-fn to_string_agent(value: &Value) -> Result<JsString, JsError> {
-    crate::context::to_string(current_agent_mut()?, value)
+fn to_string_agent(agent: &mut crate::agent::Agent, value: &Value) -> Result<JsString, JsError> {
+    crate::context::to_string(agent, value)
 }
 
 /// ToNumber with the agent's ToPrimitive dispatch.
-fn to_number_agent(value: &Value) -> Result<f64, JsError> {
-    crate::context::to_number(current_agent_mut()?, value)
+fn to_number_agent(agent: &mut crate::agent::Agent, value: &Value) -> Result<f64, JsError> {
+    crate::context::to_number(agent, value)
 }
 
 /// Install the global function properties during SetDefaultGlobalBindings
@@ -71,28 +58,27 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
             _ => None,
         });
     for (name, intrinsic, length, call) in [
-        (
-            "isFinite",
-            "%isFinite%",
-            1,
-            is_finite as fn(&Value, &[Value]) -> Result<Value, JsError>,
-        ),
+        ("isFinite", "%isFinite%", 1, is_finite as GlobalFn),
         ("isNaN", "%isNaN%", 1, is_nan),
         ("parseFloat", "%parseFloat%", 1, parse_float),
         ("parseInt", "%parseInt%", 2, parse_int),
-        ("encodeURI", "%encodeURI%", 1, |_, args| encode(args, false)),
+        ("encodeURI", "%encodeURI%", 1, |agent, _, args| {
+            encode(agent, args, false)
+        }),
         (
             "encodeURIComponent",
             "%encodeURIComponent%",
             1,
-            |_, args| encode(args, true),
+            |agent, _, args| encode(agent, args, true),
         ),
-        ("decodeURI", "%decodeURI%", 1, |_, args| decode(args, false)),
+        ("decodeURI", "%decodeURI%", 1, |agent, _, args| {
+            decode(agent, args, false)
+        }),
         (
             "decodeURIComponent",
             "%decodeURIComponent%",
             1,
-            |_, args| decode(args, true),
+            |agent, _, args| decode(agent, args, true),
         ),
         ("escape", "%escape%", 1, escape),
         ("unescape", "%unescape%", 1, unescape),
@@ -100,13 +86,15 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
             "queueMicrotask",
             "%queueMicrotask%",
             1,
-            queue_microtask as fn(&Value, &[Value]) -> Result<Value, JsError>,
+            queue_microtask as GlobalFn,
         ),
     ] {
         let function = Function::create_builtin(
             Some(JsString::from_utf8(name)),
             length,
-            Box::new(call),
+            Box::new(move |agent, this, args| {
+                call(crate::context::callback_agent(agent)?, this, args)
+            }),
             None,
             None,
         )?;
@@ -142,7 +130,11 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
 /// `[[Realm]]`; the engine keeps no per-function realm, and one realm per
 /// isolate is what its jobs already assume, so the realm the call is in is the
 /// one the task runs in.
-fn queue_microtask(_this: &Value, args: &[Value]) -> Result<Value, JsError> {
+fn queue_microtask(
+    agent: &mut crate::agent::Agent,
+    _this: &Value,
+    args: &[Value],
+) -> Result<Value, JsError> {
     let callback = arg(args, 0);
     if !is_callable(&callback) {
         return Err(JsError::new(
@@ -150,7 +142,6 @@ fn queue_microtask(_this: &Value, args: &[Value]) -> Result<Value, JsError> {
             "queueMicrotask: callback is not a function".into(),
         ));
     }
-    let agent = current_agent_mut()?;
     let realm = agent.current_realm()?;
     agent.enqueue_promise_job(Some(realm), move |agent| {
         crate::function::call(agent, &callback, Value::Undefined, &[])?;
@@ -161,8 +152,12 @@ fn queue_microtask(_this: &Value, args: &[Value]) -> Result<Value, JsError> {
 
 /// escape (spec B.2.1.1): keep the URL-safe set verbatim, percent-encode
 /// code units below 256 as `%XX` and the rest as `%uXXXX` (uppercase hex).
-fn escape(_this: &Value, args: &[Value]) -> Result<Value, JsError> {
-    let text = to_string_agent(&arg(args, 0))?;
+fn escape(
+    agent: &mut crate::agent::Agent,
+    _this: &Value,
+    args: &[Value],
+) -> Result<Value, JsError> {
+    let text = to_string_agent(agent, &arg(args, 0))?;
     let mut out = String::new();
     for &unit in text.as_slice() {
         match unit {
@@ -188,8 +183,12 @@ fn escape(_this: &Value, args: &[Value]) -> Result<Value, JsError> {
 /// unescape (spec B.2.1.2): decode `%uXXXX` (four hex digits, case
 /// insensitive) and `%XX` (two); a `%` that does not start a valid escape is
 /// kept literally and the scan continues after it.
-fn unescape(_this: &Value, args: &[Value]) -> Result<Value, JsError> {
-    let text = to_string_agent(&arg(args, 0))?;
+fn unescape(
+    agent: &mut crate::agent::Agent,
+    _this: &Value,
+    args: &[Value],
+) -> Result<Value, JsError> {
+    let text = to_string_agent(agent, &arg(args, 0))?;
     let units = text.as_slice();
     let mut out: Vec<u16> = Vec::with_capacity(units.len());
     let mut index = 0;
@@ -232,14 +231,22 @@ fn hex4(units: &[u16]) -> Option<u16> {
 
 /// isFinite (spec 19.2.2): ToNumber (abrupt completions propagate), then
 /// false for NaN and infinities.
-fn is_finite(_this: &Value, args: &[Value]) -> Result<Value, JsError> {
-    let number = to_number_agent(&arg(args, 0))?;
+fn is_finite(
+    agent: &mut crate::agent::Agent,
+    _this: &Value,
+    args: &[Value],
+) -> Result<Value, JsError> {
+    let number = to_number_agent(agent, &arg(args, 0))?;
     Ok(Value::Boolean(number.is_finite()))
 }
 
 /// isNaN (spec 19.2.3).
-fn is_nan(_this: &Value, args: &[Value]) -> Result<Value, JsError> {
-    let number = to_number_agent(&arg(args, 0))?;
+fn is_nan(
+    agent: &mut crate::agent::Agent,
+    _this: &Value,
+    args: &[Value],
+) -> Result<Value, JsError> {
+    let number = to_number_agent(agent, &arg(args, 0))?;
     Ok(Value::Boolean(number.is_nan()))
 }
 
@@ -257,8 +264,12 @@ fn in_set(cp: u32, set: &[u8]) -> bool {
 
 /// Encode (spec 19.2.6.5): percent-encode every code point outside the
 /// unescaped set as UTF-8, rejecting lone surrogates.
-fn encode(args: &[Value], component: bool) -> Result<Value, JsError> {
-    let string = to_string_agent(&arg(args, 0))?;
+fn encode(
+    agent: &mut crate::agent::Agent,
+    args: &[Value],
+    component: bool,
+) -> Result<Value, JsError> {
+    let string = to_string_agent(agent, &arg(args, 0))?;
     let unescaped = if component {
         URI_UNESCAPED
     } else {
@@ -301,8 +312,12 @@ fn hex_value(unit: u16) -> Option<u8> {
 
 /// Decode (spec 19.2.6.6): un-percent-encode `%XX` escapes, validating the
 /// UTF-8 of multi-byte sequences; the reserved set keeps its escapes literal.
-fn decode(args: &[Value], component: bool) -> Result<Value, JsError> {
-    let string = to_string_agent(&arg(args, 0))?;
+fn decode(
+    agent: &mut crate::agent::Agent,
+    args: &[Value],
+    component: bool,
+) -> Result<Value, JsError> {
+    let string = to_string_agent(agent, &arg(args, 0))?;
     let reserved = if component { b"" } else { URI_RESERVED };
     let units = string.as_slice();
     let mut out = Vec::<u16>::new();
@@ -394,10 +409,14 @@ fn digit_value(unit: u16) -> Option<u32> {
 
 /// parseInt (spec 19.2.5): optional sign and radix, with the 0x/0o/0b
 /// inference when the radix is 0 or 16.
-pub(crate) fn parse_int(_this: &Value, args: &[Value]) -> Result<Value, JsError> {
-    let string = to_string_agent(&arg(args, 0))?;
+pub(crate) fn parse_int(
+    agent: &mut crate::agent::Agent,
+    _this: &Value,
+    args: &[Value],
+) -> Result<Value, JsError> {
+    let string = to_string_agent(agent, &arg(args, 0))?;
     // spec step 6: R = ℝ(? ToInt32(radix)); NaN and infinities map to 0.
-    let radix_value = to_number_agent(&arg(args, 1))?;
+    let radix_value = to_number_agent(agent, &arg(args, 1))?;
     let units = string.as_slice();
     let mut index = 0;
     // Leading white space and line terminators (spec step 5).
@@ -465,8 +484,12 @@ pub(crate) fn parse_int(_this: &Value, args: &[Value]) -> Result<Value, JsError>
 
 /// parseFloat (spec 19.2.4): the longest prefix matching the decimal-literal
 /// grammar, or NaN.
-pub(crate) fn parse_float(_this: &Value, args: &[Value]) -> Result<Value, JsError> {
-    let string = to_string_agent(&arg(args, 0))?;
+pub(crate) fn parse_float(
+    agent: &mut crate::agent::Agent,
+    _this: &Value,
+    args: &[Value],
+) -> Result<Value, JsError> {
+    let string = to_string_agent(agent, &arg(args, 0))?;
     let units = string.as_slice();
     let mut index = 0;
     while index < units.len() && is_whitespace(units[index]) {

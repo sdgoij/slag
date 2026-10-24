@@ -145,7 +145,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
         let method = Function::create_builtin(
             Some(JsString::from_utf8(name)),
             length,
-            Box::new(|_, _| {
+            Box::new(|_, _, _| {
                 Err(JsError::new(
                     ErrorKind::TypeError,
                     "async generator prototype method must be called through the agent".into(),
@@ -175,7 +175,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
     let async_iterator_method = Function::create_builtin(
         Some(JsString::from_utf8("[Symbol.asyncIterator]")),
         0,
-        Box::new(|this, _| Ok(*this)),
+        Box::new(|_, this, _| Ok(*this)),
         None,
         realm
             .intrinsics
@@ -1004,7 +1004,7 @@ fn attach_await(
         let closure = Function::create_builtin(
             Some(JsString::from_utf8("")),
             1,
-            Box::new(|_, _| {
+            Box::new(|_, _, _| {
                 Err(JsError::new(
                     ErrorKind::TypeError,
                     "async generator await handler must be called through the agent".into(),

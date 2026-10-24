@@ -35,7 +35,7 @@ use wasm::module::{ExportKind, ImportDesc};
 
 fn placeholder(name: &str) -> NativeFn {
     let message = format!("WebAssembly.{name} is not implemented in Cut 10 yet");
-    Box::new(move |_, _| Err(JsError::new(ErrorKind::TypeError, message.clone())))
+    Box::new(move |_, _, _| Err(JsError::new(ErrorKind::TypeError, message.clone())))
 }
 
 fn string(text: &str) -> Value {
@@ -2104,7 +2104,7 @@ fn make_streaming_handler(
     let function = Function::create_builtin(
         Some(JsString::from_utf8("")),
         1,
-        Box::new(|_, _| {
+        Box::new(|_, _, _| {
             Err(JsError::new(
                 ErrorKind::TypeError,
                 "a streaming handler must be called through the agent".into(),

@@ -459,7 +459,7 @@ fn array_buffer_copy_and_detach(
 }
 
 fn placeholder(name: &'static str) -> NativeFn {
-    Box::new(move |_, _| {
+    Box::new(move |_, _, _| {
         Err(JsError::new(
             ErrorKind::TypeError,
             format!("{name} must be called through the agent"),

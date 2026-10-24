@@ -359,7 +359,7 @@ fn make_resume_handler(
     let closure = Function::create_builtin(
         Some(JsString::from_utf8("")),
         1,
-        Box::new(|_, _| {
+        Box::new(|_, _, _| {
             Err(JsError::new(
                 ErrorKind::TypeError,
                 "async resume handler must be called through the agent".into(),
@@ -568,7 +568,7 @@ pub fn async_from_sync_iterator(
         let closure = Function::create_builtin(
             Some(JsString::from_utf8(method.name())),
             1,
-            Box::new(|_, _| {
+            Box::new(|_, _, _| {
                 Err(JsError::new(
                     ErrorKind::TypeError,
                     "AsyncFromSyncIterator method must be called through the agent".into(),
@@ -770,7 +770,7 @@ fn run_async_from_sync(
         let closure = Function::create_builtin(
             Some(JsString::from_utf8("")),
             1,
-            Box::new(|_, _| {
+            Box::new(|_, _, _| {
                 Err(JsError::new(
                     ErrorKind::TypeError,
                     "async-from-sync continuation must be called through the agent".into(),
@@ -1019,7 +1019,7 @@ mod tests {
         let next = crux::Function::create_builtin(
             Some(JsString::from_utf8("next")),
             0,
-            Box::new(move |_, _| {
+            Box::new(move |_, _, _| {
                 let i = count.get() + 1;
                 count.set(i);
                 let result = crux::object::JsObject::ordinary_object_create(None);
@@ -1062,7 +1062,7 @@ mod tests {
                     crux::Function::create_builtin(
                         Some(JsString::from_utf8("[Symbol.asyncIterator]")),
                         0,
-                        Box::new(move |_, _| Ok(Value::Object(iterator_for_method))),
+                        Box::new(move |_, _, _| Ok(Value::Object(iterator_for_method))),
                         None,
                         None,
                     )
@@ -1118,7 +1118,7 @@ mod tests {
         let next = crux::Function::create_builtin(
             Some(JsString::from_utf8("next")),
             0,
-            Box::new(move |_, _| {
+            Box::new(move |_, _, _| {
                 let i = index.get();
                 let result = crux::object::JsObject::ordinary_object_create(None);
                 if i < values_clone.len() {
@@ -1156,7 +1156,7 @@ mod tests {
                     crux::Function::create_builtin(
                         Some(JsString::from_utf8("[Symbol.iterator]")),
                         0,
-                        Box::new(move |_, _| Ok(Value::Object(iterator_for_method))),
+                        Box::new(move |_, _, _| Ok(Value::Object(iterator_for_method))),
                         None,
                         None,
                     )

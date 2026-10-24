@@ -2090,7 +2090,7 @@ pub(crate) fn deferred_module_object(
     let then = Function::create_builtin(
         Some(JsString::from_utf8("then")),
         2,
-        Box::new(|_, _| {
+        Box::new(|_, _, _| {
             Err(JsError::new(
                 ErrorKind::TypeError,
                 "DeferredModule.then must be called through the agent".into(),
@@ -2324,7 +2324,7 @@ fn make_deferred_waiter(
     let closure = Function::create_builtin(
         Some(JsString::from_utf8("")),
         1,
-        Box::new(|_, _| {
+        Box::new(|_, _, _| {
             Err(JsError::new(
                 ErrorKind::TypeError,
                 "deferred waiter must be called through the agent".into(),
@@ -3519,7 +3519,7 @@ fn make_namespace_resolver(
     let closure = crux::function::Function::create_builtin(
         Some(JsString::from_utf8("")),
         1,
-        Box::new(|_, _| {
+        Box::new(|_, _, _| {
             Err(JsError::new(
                 ErrorKind::TypeError,
                 "import resolver must be called through the agent".into(),

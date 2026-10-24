@@ -268,7 +268,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
     let species_getter = Function::create_builtin(
         Some(JsString::from_utf8("get [Symbol.species]")),
         0,
-        Box::new(|this: &Value, _args: &[Value]| Ok(*this)),
+        Box::new(|_, this: &Value, _args: &[Value]| Ok(*this)),
         None,
         realm
             .intrinsics
@@ -368,7 +368,7 @@ fn install_statics(realm: &Handle<Realm>, ctor: &Handle<Function>) -> Result<(),
 }
 
 fn placeholder(name: &'static str) -> crux::function::NativeFn {
-    Box::new(move |_, _| {
+    Box::new(move |_, _, _| {
         Err(JsError::new(
             ErrorKind::TypeError,
             format!("{name} must be called through the agent"),
@@ -1797,7 +1797,7 @@ mod tests {
         let next = crux::Function::create_builtin(
             Some(JsString::from_utf8("next")),
             0,
-            Box::new(move |_, _| {
+            Box::new(move |_, _, _| {
                 let i = index.get();
                 let result = crux::object::JsObject::ordinary_object_create(None);
                 if i < values_clone.len() {
@@ -1831,7 +1831,7 @@ mod tests {
                     crux::Function::create_builtin(
                         Some(JsString::from_utf8("[Symbol.iterator]")),
                         0,
-                        Box::new(move |_, _| Ok(Value::Object(iterator_for_method))),
+                        Box::new(move |_, _, _| Ok(Value::Object(iterator_for_method))),
                         None,
                         None,
                     )

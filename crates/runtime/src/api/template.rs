@@ -397,7 +397,7 @@ impl FunctionTemplate {
 
         let this = Rc::clone(self);
         let callback = this.callback.borrow().clone();
-        let call: NativeFn = Box::new(move |this_value, args| {
+        let call: NativeFn = Box::new(move |_agent, this_value, args| {
             let info = FunctionCallbackInfo {
                 this: *this_value,
                 args,
@@ -413,7 +413,7 @@ impl FunctionTemplate {
 
         let this = Rc::clone(self);
         let callback = this.callback.borrow().clone();
-        let construct: NativeCtor = Box::new(move |new_target, args| {
+        let construct: NativeCtor = Box::new(move |_agent, new_target, args| {
             let instance = match prototype_object_of(new_target) {
                 Some(prototype) => JsObject::ordinary_object_create(Some(prototype)),
                 None => {
@@ -1002,7 +1002,7 @@ pub(crate) fn host_function(
 ) -> Result<Handle<Function>, JsError> {
     let call: NativeFn = {
         let callback = Rc::clone(&callback);
-        Box::new(move |this, args| {
+        Box::new(move |_agent, this, args| {
             let info = FunctionCallbackInfo {
                 this: *this,
                 args,
@@ -1013,7 +1013,7 @@ pub(crate) fn host_function(
             run_callback(&callback, &info)
         })
     };
-    let construct: NativeCtor = Box::new(move |new_target, args| {
+    let construct: NativeCtor = Box::new(move |_agent, new_target, args| {
         let instance = match prototype_object_of(new_target) {
             Some(prototype) => JsObject::ordinary_object_create(Some(prototype)),
             None => {

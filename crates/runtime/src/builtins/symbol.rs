@@ -46,7 +46,7 @@ const WELL_KNOWN_STATICS: &[&str] = &[
 ];
 
 fn placeholder(name: &'static str) -> NativeFn {
-    Box::new(move |_, _| {
+    Box::new(move |_, _, _| {
         Err(JsError::new(
             ErrorKind::TypeError,
             format!("{name} must be called through the agent"),
@@ -72,7 +72,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
         Some(JsString::from_utf8("Symbol")),
         0,
         Box::new(placeholder("Symbol")),
-        Some(Box::new(|_new_target, _args| {
+        Some(Box::new(|_, _new_target, _args| {
             Err(JsError::new(
                 ErrorKind::TypeError,
                 "Symbol is not a constructor".into(),

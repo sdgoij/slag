@@ -8308,7 +8308,7 @@ mod tests {
         let callback = Function::create_builtin(
             Some(JsString::from_utf8("an_op")),
             0,
-            Box::new(|_, _| Ok(Value::Number(1.0))),
+            Box::new(|_, _, _| Ok(Value::Number(1.0))),
             None,
             Some(function_prototype),
         )
@@ -8394,7 +8394,7 @@ mod tests {
         let callback = Function::create_builtin(
             Some(JsString::from_utf8("an_op")),
             0,
-            Box::new(|_, _| Ok(Value::Undefined)),
+            Box::new(|_, _, _| Ok(Value::Undefined)),
             None,
             None,
         )
@@ -8457,7 +8457,7 @@ mod tests {
         let callback = Function::create_builtin(
             Some(JsString::from_utf8("an_op")),
             0,
-            Box::new(|_, _| Ok(Value::Undefined)),
+            Box::new(|_, _, _| Ok(Value::Undefined)),
             None,
             None,
         )
@@ -8498,8 +8498,8 @@ mod tests {
         let constructor = Function::create_builtin(
             Some(JsString::from_utf8("a_host_ctor")),
             1,
-            Box::new(|_, _| Ok(Value::Undefined)),
-            Some(Box::new(|_, _| Ok(Value::Undefined))),
+            Box::new(|_, _, _| Ok(Value::Undefined)),
+            Some(Box::new(|_, _, _| Ok(Value::Undefined))),
             Some(function_prototype),
         )
         .expect("a builtin");
@@ -8516,7 +8516,7 @@ mod tests {
         let plain = Function::create_builtin(
             Some(JsString::from_utf8("an_op")),
             0,
-            Box::new(|_, _| Ok(Value::Number(1.0))),
+            Box::new(|_, _, _| Ok(Value::Number(1.0))),
             None,
             Some(function_prototype),
         )
@@ -8586,7 +8586,7 @@ mod tests {
         let callback = Function::create_builtin(
             Some(JsString::from_utf8("an_op")),
             0,
-            Box::new(|_, _| Ok(Value::Undefined)),
+            Box::new(|_, _, _| Ok(Value::Undefined)),
             None,
             None,
         )
@@ -10662,7 +10662,7 @@ mod tests {
         let callback = Function::create_builtin(
             Some(JsString::from_utf8("an_op")),
             0,
-            Box::new(|_, _| Ok(Value::Undefined)),
+            Box::new(|_, _, _| Ok(Value::Undefined)),
             None,
             None,
         )
@@ -10838,7 +10838,7 @@ mod tests {
         let callback = Function::create_builtin(
             Some(JsString::from_utf8("an_op")),
             0,
-            Box::new(|_, _| Ok(Value::Undefined)),
+            Box::new(|_, _, _| Ok(Value::Undefined)),
             None,
             None,
         )

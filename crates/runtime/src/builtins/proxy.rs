@@ -21,7 +21,7 @@ const PROXY_PROTO: &str = "%Proxy.prototype%";
 const REVOCABLE: &str = "%Proxy.revocable%";
 
 fn placeholder(name: &'static str) -> NativeFn {
-    Box::new(move |_, _| {
+    Box::new(move |_, _, _| {
         Err(JsError::new(
             ErrorKind::TypeError,
             format!("{name} must be called through the agent"),
@@ -30,7 +30,7 @@ fn placeholder(name: &'static str) -> NativeFn {
 }
 
 fn placeholder_ctor(name: &'static str) -> NativeCtor {
-    Box::new(move |_, _| {
+    Box::new(move |_, _, _| {
         Err(JsError::new(
             ErrorKind::TypeError,
             format!("{name} must be called through the agent"),
@@ -201,7 +201,7 @@ fn proxy_revocable(agent: &mut Agent, args: &[Value]) -> Result<Value, JsError> 
         // and its [[Prototype]] is %Function.prototype%.
         Some(JsString::from_utf8("")),
         0,
-        Box::new(move |_, _| {
+        Box::new(move |_, _, _| {
             crux::proxy::revoke(&slots);
             Ok(Value::Undefined)
         }),

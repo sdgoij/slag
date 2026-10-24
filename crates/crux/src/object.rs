@@ -5836,8 +5836,14 @@ mod tests {
         f: impl Fn(&Value, &[Value]) -> Result<Value, JsError> + 'static,
     ) -> Value {
         Value::Function(
-            crate::function::Function::create_builtin(Some(key(name)), 0, Box::new(f), None, None)
-                .unwrap(),
+            crate::function::Function::create_builtin(
+                Some(key(name)),
+                0,
+                Box::new(move |_, this, args| f(this, args)),
+                None,
+                None,
+            )
+            .unwrap(),
         )
     }
 
@@ -7298,7 +7304,7 @@ mod tests {
         let getter = crate::function::Function::create_builtin(
             Some(key("get x")),
             0,
-            Box::new(move |_, _| Ok(*getter_storage.borrow())),
+            Box::new(move |_, _, _| Ok(*getter_storage.borrow())),
             None,
             None,
         )
@@ -7307,7 +7313,7 @@ mod tests {
         let setter = crate::function::Function::create_builtin(
             Some(key("set x")),
             1,
-            Box::new(move |_, args| {
+            Box::new(move |_, _, args| {
                 let value = args.first().cloned().unwrap_or(Value::Undefined);
                 *setter_storage.borrow_mut() = value;
                 Ok(Value::Undefined)
@@ -7354,7 +7360,7 @@ mod tests {
         let getter = crate::function::Function::create_builtin(
             Some(key("get r")),
             0,
-            Box::new(|this, _| {
+            Box::new(|_, this, _| {
                 // `this` is the real receiver object, not a copy: the getter
                 // must see the receiver's own "_data".
                 match this.kind() {
@@ -7386,7 +7392,7 @@ mod tests {
         let setter = crate::function::Function::create_builtin(
             Some(key("set r")),
             1,
-            Box::new(|this, args| {
+            Box::new(|_, this, args| {
                 let value = args.first().cloned().unwrap_or(Value::Undefined);
                 match this.kind() {
                     ValueKind::Object(obj) => {

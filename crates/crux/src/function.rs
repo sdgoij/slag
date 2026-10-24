@@ -101,10 +101,14 @@ pub fn with_agent<T>(agent: *mut (), body: impl FnOnce() -> T) -> T {
 }
 
 /// The agent pointer recorded by the innermost active [`with_agent`] window,
-/// or null outside any window. Built-in closures that need the runtime's
-/// agent (timers, console, host globals) cast this to `&mut Agent` inside
-/// their closures; the pointer is only valid while the enclosing
-/// `with_agent` call is on the stack.
+/// or null outside any window.
+///
+/// It is for *reads* — the allocation-time collector, the JIT's callee lookup —
+/// and for crux's own re-entry into an ECMAScript body, where no `&mut Agent`
+/// is at hand. A native built-in body never derives `&mut Agent` from it: the
+/// dispatch hands each body the live pointer it already holds, as [`NativeFn`]'s
+/// first argument, because retagging from this slot can invalidate the borrow
+/// tag of the frame that is still running.
 pub fn current_agent() -> *mut () {
     CURRENT_AGENT.with(|slot| slot.get())
 }
@@ -143,7 +147,7 @@ fn call_with_hook(
     let hook = ECMA_HOOK.get().copied();
     match hook {
         Some(hook) if !agent.is_null() => hook(agent, callee, this, args, None),
-        _ => native(&this, args),
+        _ => native(agent, &this, args),
     }
 }
 
@@ -160,16 +164,31 @@ fn construct_with_hook(
         Some(hook) if !agent.is_null() => {
             hook(agent, callee, Value::Undefined, args, Some(new_target))
         }
-        _ => ctor(new_target, args),
+        _ => ctor(agent, new_target, args),
     }
 }
 
-/// A native function body: `(this, args) -> result`. Host-provided closures
-/// implement built-in methods; the Phase 7 evaluator bridges them.
-pub type NativeFn = Box<dyn Fn(&Value, &[Value]) -> Result<Value, JsError>>;
+/// A native function body: `(agent, this, args) -> result`.
+///
+/// `agent` is the [agent pointer](AgentPtr) the caller handed down: the runtime
+/// passes its own live `&mut Agent` reborrow when it dispatches (see
+/// `runtime::function::call_inner`), and `null` when crux runs a built-in
+/// outside any agent window. A body that needs the agent must therefore receive
+/// it here rather than recovering it from [`current_agent`]: that slot can hold
+/// an ancestor of the live `&mut Agent`s, and retagging from it would pop their
+/// borrow tags.
+pub type NativeFn = Box<dyn Fn(AgentPtr, &Value, &[Value]) -> Result<Value, JsError>>;
 
-/// A native constructor body: `(newTarget, args) -> object`.
-pub type NativeCtor = Box<dyn Fn(&Value, &[Value]) -> Result<Value, JsError>>;
+/// A native constructor body: `(agent, newTarget, args) -> object`.
+pub type NativeCtor = Box<dyn Fn(AgentPtr, &Value, &[Value]) -> Result<Value, JsError>>;
+
+/// The runtime's agent, as handed to a native built-in body.
+///
+/// It is a raw pointer only because crux cannot name the runtime's `Agent`; the
+/// value is an opaque handle the body casts back. A null pointer means the
+/// built-in ran outside any agent window, where a body that needs the agent
+/// must fail rather than fabricate one.
+pub type AgentPtr = *mut ();
 
 /// What happens when the function is called or constructed (spec 10.2.1).
 pub enum FunctionKind {
@@ -633,7 +652,7 @@ pub fn throw_type_error(proto: Option<Handle<JsObject>>) -> Result<Handle<Functi
     let function = Function::create_builtin(
         Some(JsString::from_utf8("")),
         0,
-        Box::new(|_, _| {
+        Box::new(|_, _, _| {
             Err(JsError::new(
                 ErrorKind::TypeError,
                 "Invalid operation performed on a restricted property".into(),
@@ -684,7 +703,7 @@ mod tests {
         let f = Function::create_builtin(
             Some(JsString::from_utf8("add")),
             2,
-            Box::new(|_, args| {
+            Box::new(|_, _, args| {
                 let a = args.first().cloned().unwrap_or(Value::Undefined);
                 let b = args.get(1).cloned().unwrap_or(Value::Undefined);
                 match (a.kind(), b.kind()) {
@@ -724,8 +743,8 @@ mod tests {
         let ctor = Function::create_builtin(
             Some(JsString::from_utf8("C")),
             0,
-            Box::new(|_, _| Ok(Value::Undefined)),
-            Some(Box::new(|_, _| {
+            Box::new(|_, _, _| Ok(Value::Undefined)),
+            Some(Box::new(|_, _, _| {
                 Ok(Value::Object(JsObject::ordinary_object_create(None)))
             })),
             None,
@@ -744,7 +763,7 @@ mod tests {
         let target = Function::create_builtin(
             Some(JsString::from_utf8("f")),
             2,
-            Box::new(move |this, args| {
+            Box::new(move |_, this, args| {
                 recorded.borrow_mut().push((*this, args.to_vec()));
                 Ok(Value::Number(args.len() as f64))
             }),
@@ -787,7 +806,7 @@ mod tests {
         let f = Function::create_builtin(
             Some(JsString::from_utf8("f")),
             0,
-            Box::new(|_, _| Ok(Value::Undefined)),
+            Box::new(|_, _, _| Ok(Value::Undefined)),
             None,
             None,
         )

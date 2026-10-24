@@ -2611,12 +2611,12 @@ pub fn install(realm: &Handle<Realm>, intl_value: &Value) -> Result<(), JsError>
 
 fn placeholder(name: &str) -> NativeFn {
     let name = name.to_string();
-    Box::new(move |_, _| Err(type_error(&format!("{name} must be dispatched"))))
+    Box::new(move |_, _, _| Err(type_error(&format!("{name} must be dispatched"))))
 }
 
 fn placeholder_ctor(name: &str) -> NativeFn {
     let name = name.to_string();
-    Box::new(move |_, _| Err(type_error(&format!("{name} must be dispatched"))))
+    Box::new(move |_, _, _| Err(type_error(&format!("{name} must be dispatched"))))
 }
 
 /// Create the NumberFormat instance object for the record.

@@ -33,7 +33,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
     let function_proto = Function::create_builtin(
         Some(JsString::from_utf8("")),
         0,
-        Box::new(|_, _| Ok(Value::Undefined)),
+        Box::new(|_, _, _| Ok(Value::Undefined)),
         None,
         None,
     )?;
@@ -244,7 +244,7 @@ fn install_methods(
 /// runtime dispatcher intercepts calls before the closure can run.
 fn placeholder(name: &str) -> crux::function::NativeFn {
     let name = name.to_string();
-    Box::new(move |_, _| {
+    Box::new(move |_, _, _| {
         Err(JsError::new(
             ErrorKind::TypeError,
             format!("{name} must be dispatched by the runtime"),
@@ -543,7 +543,7 @@ pub(crate) fn try_builtin_call(
             let native = call.as_ref()?;
             Some(crux::function::with_agent(
                 agent as *mut Agent as *mut (),
-                || native(&this, args),
+                || native(agent as *mut Agent as *mut (), &this, args),
             ))
         }
         crate::function::BuiltinCall::Other => None,
@@ -1035,7 +1035,7 @@ mod tests {
             let method = Function::create_builtin(
                 Some(JsString::from_utf8("[Symbol.hasInstance]")),
                 1,
-                Box::new(move |_, _| Ok(Value::Boolean(result))),
+                Box::new(move |_, _, _| Ok(Value::Boolean(result))),
                 None,
                 None,
             )

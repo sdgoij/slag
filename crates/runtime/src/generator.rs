@@ -91,7 +91,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
         let method = Function::create_builtin(
             Some(JsString::from_utf8(name)),
             length,
-            Box::new(|_, _| {
+            Box::new(|_, _, _| {
                 Err(JsError::new(
                     ErrorKind::TypeError,
                     "generator prototype method must be called through the agent".into(),
@@ -128,7 +128,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
     let iterator_method = Function::create_builtin(
         Some(JsString::from_utf8("[Symbol.iterator]")),
         0,
-        Box::new(|this, _| Ok(*this)),
+        Box::new(|_, this, _| Ok(*this)),
         None,
         function_proto,
     )?;

@@ -54,6 +54,10 @@ pub type HostFn = Box<dyn Fn(&FunctionCall<'_>) -> Result<JsValue, JsError> + 's
 /// `args` is a zero-copy view over the engine's argument slice, so a host
 /// function observes the exact values the call passed without allocating.
 pub struct FunctionCall<'a> {
+    /// The live agent the dispatch handed the built-in body (see
+    /// `crux::function::NativeFn`); the methods below run on it rather than
+    /// recovering one from the `with_agent` slot.
+    agent: crux::function::AgentPtr,
     this: &'a Value,
     args: &'a [Value],
     new_target: Option<&'a Value>,
@@ -98,7 +102,7 @@ impl FunctionCall<'_> {
 
     /// ToNumber coercion (spec 7.1.3) of a value passed to the host function.
     pub fn to_number(&self, value: &JsValue) -> Result<f64, JsError> {
-        let agent = current_agent_mut()?;
+        let agent = crate::context::callback_agent(self.agent)?;
         let prim =
             crate::context::to_primitive(agent, &value.0, crux::convert::ToPrimitiveHint::Number)?;
         crux::convert::to_number(&prim)
@@ -106,7 +110,7 @@ impl FunctionCall<'_> {
 
     /// ToString coercion (spec 7.1.12) of a value passed to the host function.
     pub fn to_string(&self, value: &JsValue) -> Result<String, JsError> {
-        let agent = current_agent_mut()?;
+        let agent = crate::context::callback_agent(self.agent)?;
         Ok(crate::context::to_string(agent, &value.0)?.to_string_lossy())
     }
 
@@ -121,7 +125,7 @@ impl FunctionCall<'_> {
         args: &[JsValue],
     ) -> Result<JsValue, JsError> {
         let values: Vec<Value> = args.iter().map(|arg| arg.0).collect();
-        let agent = current_agent_mut()?;
+        let agent = crate::context::callback_agent(self.agent)?;
         let result = crate::function::call(agent, &function.0, this.0, &values)?;
         Ok(JsValue(result))
     }
@@ -130,7 +134,7 @@ impl FunctionCall<'_> {
     /// constructed instance.
     pub fn construct(&self, constructor: &JsValue, args: &[JsValue]) -> Result<JsValue, JsError> {
         let values: Vec<Value> = args.iter().map(|arg| arg.0).collect();
-        let agent = current_agent_mut()?;
+        let agent = crate::context::callback_agent(self.agent)?;
         let result = crate::function::construct(agent, &constructor.0, &values, &constructor.0)?;
         Ok(JsValue(result))
     }
@@ -139,7 +143,7 @@ impl FunctionCall<'_> {
     /// Unlike [`Context::eval`], queued jobs are not drained — the host
     /// function is itself running inside the job/script it would drain.
     pub fn eval(&self, source: &str) -> Result<JsValue, JsError> {
-        let agent = current_agent_mut()?;
+        let agent = crate::context::callback_agent(self.agent)?;
         Ok(JsValue(agent.run_script(source)?))
     }
 
@@ -147,7 +151,7 @@ impl FunctionCall<'_> {
     /// counterpart of [`Context::create_object`]).
     pub fn create_object(&self) -> Result<JsObject, JsError> {
         Ok(JsObject(CruxObject::ordinary_object_create(
-            realm_object_prototype(current_agent_mut()?)?,
+            realm_object_prototype(crate::context::callback_agent(self.agent)?)?,
         )))
     }
 
@@ -162,7 +166,7 @@ impl FunctionCall<'_> {
         let values =
             unsafe { std::slice::from_raw_parts(values.as_ptr() as *const Value, values.len()) };
         Ok(JsValue(crate::builtins::array::array_from_values(
-            current_agent_mut()?,
+            crate::context::callback_agent(self.agent)?,
             values,
         )?))
     }
@@ -177,7 +181,7 @@ impl FunctionCall<'_> {
         callback: HostFn,
     ) -> Result<JsValue, JsError> {
         let function = build_host_fn(
-            realm_function_prototype(current_agent_mut()?)?,
+            realm_function_prototype(crate::context::callback_agent(self.agent)?)?,
             Some(JsString::from_utf8(name)),
             length as u64,
             callback,
@@ -196,7 +200,7 @@ impl FunctionCall<'_> {
         set: Option<HostFn>,
     ) -> Result<(), JsError> {
         define_accessor_with(
-            realm_function_prototype(current_agent_mut()?)?,
+            realm_function_prototype(crate::context::callback_agent(self.agent)?)?,
             target,
             key,
             get,
@@ -503,8 +507,9 @@ impl Context {
 
         let callback = Rc::new(callback);
         let call_callback = Rc::clone(&callback);
-        let call: NativeFn = Box::new(move |this, args| {
+        let call: NativeFn = Box::new(move |agent, this, args| {
             call_callback(&FunctionCall {
+                agent,
                 this,
                 args,
                 new_target: None,
@@ -512,7 +517,7 @@ impl Context {
             .map(JsValue::into_value)
         });
         let construct_callback = Rc::clone(&callback);
-        let construct: NativeCtor = Box::new(move |new_target, args| {
+        let construct: NativeCtor = Box::new(move |agent, new_target, args| {
             let instance = match prototype_of(new_target) {
                 Some(prototype) => {
                     Value::Object(CruxObject::ordinary_object_create(Some(prototype)))
@@ -525,6 +530,7 @@ impl Context {
                 }
             };
             let result = construct_callback(&FunctionCall {
+                agent,
                 this: &instance,
                 args,
                 new_target: Some(new_target),
@@ -1076,7 +1082,7 @@ impl Context {
         let read_file = Function::create_builtin(
             Some(JsString::from_utf8("readFileSync")),
             1,
-            Box::new(move |_, args| {
+            Box::new(move |agent, _, args| {
                 let raw = string_arg(args, 0, "readFileSync")?;
                 let path = resolve_fs_read(read_root.as_deref(), &raw)?;
                 let metadata = std::fs::metadata(&path).map_err(|e| fs_error(&raw, e))?;
@@ -1091,7 +1097,10 @@ impl Context {
                     let text = String::from_utf8_lossy(&bytes);
                     return Ok(Value::String(Handle::new(JsString::from_utf8(&text))));
                 }
-                crate::builtins::typed_array::uint8_array_from_bytes(current_agent_mut()?, &bytes)
+                crate::builtins::typed_array::uint8_array_from_bytes(
+                    crate::context::callback_agent(agent)?,
+                    &bytes,
+                )
             }),
             None,
             None,
@@ -1104,7 +1113,7 @@ impl Context {
         let write_file = Function::create_builtin(
             Some(JsString::from_utf8("writeFileSync")),
             2,
-            Box::new(move |_, args| {
+            Box::new(move |_, _, args| {
                 let raw = string_arg(args, 0, "writeFileSync")?;
                 let text = string_arg(args, 1, "writeFileSync")?;
                 let path = resolve_fs_write(write_root.as_deref(), &raw)?;
@@ -1122,10 +1131,10 @@ impl Context {
         let read_dir = Function::create_builtin(
             Some(JsString::from_utf8("readdirSync")),
             1,
-            Box::new(move |_, args| {
+            Box::new(move |agent, _, args| {
                 let raw = string_arg(args, 0, "readdirSync")?;
                 let path = resolve_fs_read(read_dir_root.as_deref(), &raw)?;
-                let agent = current_agent_mut()?;
+                let agent = crate::context::callback_agent(agent)?;
                 let mut names = Vec::new();
                 for entry in std::fs::read_dir(&path).map_err(|e| fs_error(&raw, e))? {
                     let entry = entry.map_err(|e| fs_error(&raw, e))?;
@@ -1154,7 +1163,7 @@ impl Context {
         let stat = Function::create_builtin(
             Some(JsString::from_utf8("statSync")),
             1,
-            Box::new(move |_, args| {
+            Box::new(move |_, _, args| {
                 let raw = string_arg(args, 0, "statSync")?;
                 let path = resolve_fs_read(stat_root.as_deref(), &raw)?;
                 let meta = std::fs::metadata(&path).map_err(|e| fs_error(&raw, e))?;
@@ -1168,7 +1177,7 @@ impl Context {
                 let dir_check = Function::create_builtin(
                     Some(JsString::from_utf8("isDirectory")),
                     0,
-                    Box::new(move |_, _| Ok(Value::Boolean(is_directory))),
+                    Box::new(move |_, _, _| Ok(Value::Boolean(is_directory))),
                     None,
                     None,
                 )?;
@@ -1179,7 +1188,7 @@ impl Context {
                 let file_check = Function::create_builtin(
                     Some(JsString::from_utf8("isFile")),
                     0,
-                    Box::new(move |_, _| Ok(Value::Boolean(is_file))),
+                    Box::new(move |_, _, _| Ok(Value::Boolean(is_file))),
                     None,
                     None,
                 )?;
@@ -1266,7 +1275,7 @@ impl Context {
             let method = Function::create_builtin(
                 Some(JsString::from_utf8(name)),
                 0,
-                Box::new(move |_, args| console_output(&callbacks, slot, args)),
+                Box::new(move |agent, _, args| console_output(&callbacks, slot, args, agent)),
                 None,
                 None,
             )?;
@@ -1294,8 +1303,8 @@ impl Context {
         let set_timeout = Function::create_builtin(
             Some(JsString::from_utf8("setTimeout")),
             1,
-            Box::new(move |_, args| {
-                let agent = current_agent_mut()?;
+            Box::new(move |agent, _, args| {
+                let agent = crate::context::callback_agent(agent)?;
                 let callback = args.first().cloned().unwrap_or(Value::Undefined);
                 if !crux::value::is_callable(&callback) {
                     return Err(JsError::new(
@@ -1322,8 +1331,8 @@ impl Context {
         let set_interval = Function::create_builtin(
             Some(JsString::from_utf8("setInterval")),
             1,
-            Box::new(move |_, args| {
-                let agent = current_agent_mut()?;
+            Box::new(move |agent, _, args| {
+                let agent = crate::context::callback_agent(agent)?;
                 let callback = args.first().cloned().unwrap_or(Value::Undefined);
                 if !crux::value::is_callable(&callback) {
                     return Err(JsError::new(
@@ -1350,7 +1359,7 @@ impl Context {
         let clear_timeout = Function::create_builtin(
             Some(JsString::from_utf8("clearTimeout")),
             1,
-            Box::new(move |_, args| {
+            Box::new(move |_, _, args| {
                 if let Some(id) = args.first().and_then(|v| v.as_number()) {
                     timers_clear.borrow_mut().cancelled.insert(id as u64, true);
                 }
@@ -1367,7 +1376,7 @@ impl Context {
         let clear_interval = Function::create_builtin(
             Some(JsString::from_utf8("clearInterval")),
             1,
-            Box::new(move |_, args| {
+            Box::new(move |_, _, args| {
                 if let Some(id) = args.first().and_then(|v| v.as_number()) {
                     timers.borrow_mut().cancelled.insert(id as u64, true);
                 }
@@ -1404,7 +1413,7 @@ impl Context {
         let random = Function::create_builtin(
             Some(JsString::from_utf8("random")),
             0,
-            Box::new(move |_, _| {
+            Box::new(move |_, _, _| {
                 let value = {
                     let callbacks = callbacks.borrow();
                     match &callbacks.random {
@@ -1505,8 +1514,9 @@ fn build_host_fn(
     length: u64,
     callback: HostFn,
 ) -> Result<Handle<Function>, JsError> {
-    let call: NativeFn = Box::new(move |this, args| {
+    let call: NativeFn = Box::new(move |agent, this, args| {
         callback(&FunctionCall {
+            agent,
             this,
             args,
             new_target: None,
@@ -1522,22 +1532,6 @@ fn prototype_of(new_target: &Value) -> Option<Handle<CruxObject>> {
     let function = new_target.as_function()?;
     let value = function.get(&JsString::from_utf8("prototype")).ok()?;
     crate::context::as_object(&value)
-}
-
-/// The agent recorded by the innermost `crux::function::with_agent` window,
-/// or a clear error when a host-global builtin runs outside one.
-fn current_agent_mut() -> Result<&'static mut Agent, JsError> {
-    let agent = crux::function::current_agent();
-    if agent.is_null() {
-        return Err(JsError::new(
-            ErrorKind::TypeError,
-            "host global called outside an agent window".into(),
-        ));
-    }
-    // SAFETY: `with_agent` guarantees the pointer is a live `&mut Agent` for
-    // the duration of the enclosing call; builtin closures only run inside
-    // those windows.
-    Ok(unsafe { &mut *(agent as *mut Agent) })
 }
 
 /// Whether `readFileSync`'s optional second argument asks for text: a UTF-8
@@ -1899,16 +1893,14 @@ fn console_output(
     callbacks: &Rc<RefCell<HostCallbacks>>,
     slot: ConsoleSlot,
     args: &[Value],
+    agent: crux::function::AgentPtr,
 ) -> Result<Value, JsError> {
     let mut parts = Vec::with_capacity(args.len());
-    let agent = crux::function::current_agent();
     for arg in args {
         let text = if agent.is_null() {
             arg.to_string()
         } else {
-            // SAFETY: as in `current_agent_mut`.
-            let agent = unsafe { &mut *(agent as *mut Agent) };
-            render_console_arg(agent, arg)?
+            render_console_arg(crate::context::callback_agent(agent)?, arg)?
         };
         parts.push(text);
     }
