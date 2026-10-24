@@ -1013,9 +1013,9 @@ impl<'s> LocalHandle<'s, Map> {
         };
         let id = object.id();
         crate::realm::with_agent(|agent| {
-            agent.map_data.get(&id).map_or(0, |cell| {
-                cell.borrow().entries.iter().filter(|e| e.is_some()).count()
-            })
+            agent
+                .map_entries(id)
+                .map_or(0, |entries| entries.iter().filter(|e| e.is_some()).count())
         })
         .unwrap_or(0)
     }
@@ -1024,10 +1024,8 @@ impl<'s> LocalHandle<'s, Map> {
     /// (`v8::Map::as_array`), in insertion order, with deleted keys left out.
     pub fn as_array<'a>(&self, scope: &PinScope<'a, '_>) -> Local<'a, Array> {
         let pairs = entries(self.engine(), |agent, id| {
-            let cell = agent.map_data.get(&id)?;
-            let entries: Vec<EngineValue> = cell
-                .borrow()
-                .entries
+            let entries: Vec<EngineValue> = agent
+                .map_entries(id)?
                 .iter()
                 .flatten()
                 .flat_map(|(key, value)| [*key, *value])
@@ -1047,9 +1045,9 @@ impl<'s> LocalHandle<'s, Set> {
         };
         let id = object.id();
         crate::realm::with_agent(|agent| {
-            agent.set_data.get(&id).map_or(0, |cell| {
-                cell.borrow().entries.iter().filter(|e| e.is_some()).count()
-            })
+            agent
+                .set_entries(id)
+                .map_or(0, |entries| entries.iter().filter(|e| e.is_some()).count())
         })
         .unwrap_or(0)
     }
@@ -1081,10 +1079,8 @@ impl<'s> LocalHandle<'s, Set> {
     /// elements left out.
     pub fn as_array<'a>(&self, scope: &PinScope<'a, '_>) -> Local<'a, Array> {
         let doubled = entries(self.engine(), |agent, id| {
-            let cell = agent.set_data.get(&id)?;
-            let entries: Vec<EngineValue> = cell
-                .borrow()
-                .entries
+            let entries: Vec<EngineValue> = agent
+                .set_entries(id)?
                 .iter()
                 .flatten()
                 .flat_map(|element| [*element, *element])
@@ -1150,21 +1146,19 @@ impl<'s> LocalHandle<'s, Date> {
 /// it yields and a value-only one the values, which is what the engine's own
 /// `from_code` decides.
 fn preview_entries_of(agent: &runtime::Agent, id: u64) -> Option<(Vec<EngineValue>, bool)> {
-    if let Some(cell) = agent.map_data.get(&id) {
-        let entries = cell
-            .borrow()
-            .entries
+    if let Some(entries) = agent.map_entries(id) {
+        let entries = entries
             .iter()
             .flatten()
             .flat_map(|(key, value)| [*key, *value])
             .collect();
         return Some((entries, true));
     }
-    if let Some(cell) = agent.set_data.get(&id) {
-        let values = cell.borrow().entries.iter().flatten().copied().collect();
+    if let Some(entries) = agent.set_entries(id) {
+        let values = entries.iter().flatten().copied().collect();
         return Some((values, false));
     }
-    if let Some(cell) = agent.weak_map_data.get(&id) {
+    if let Some(cell) = agent.weak_map_entries(id) {
         let entries = cell
             .borrow()
             .iter()
@@ -1173,11 +1167,11 @@ fn preview_entries_of(agent: &runtime::Agent, id: u64) -> Option<(Vec<EngineValu
             .collect();
         return Some((entries, true));
     }
-    if let Some(cell) = agent.weak_set_data.get(&id) {
+    if let Some(cell) = agent.weak_set_entries(id) {
         let values = cell.borrow().iter().flatten().copied().collect();
         return Some((values, false));
     }
-    if let Some(cell) = agent.map_iter_data.get(&id) {
+    if let Some(cell) = agent.map_iter_record(id) {
         let (map, index, code) = *cell.borrow();
         let kind = MapIterationKind::from_code(code);
         // An exhausted iterator (or one whose Map was collected, which cannot
@@ -1185,15 +1179,11 @@ fn preview_entries_of(agent: &runtime::Agent, id: u64) -> Option<(Vec<EngineValu
         let Some(map) = map.and_then(|map| map.as_object()) else {
             return Some((Vec::new(), true));
         };
-        let Some(cell) = agent.map_data.get(&map.id()) else {
+        let Some(data) = agent.map_entries(map.id()) else {
             return Some((Vec::new(), true));
         };
-        let data = cell.borrow();
         let mut entries = Vec::new();
-        for entry in data.entries[index.min(data.entries.len())..]
-            .iter()
-            .flatten()
-        {
+        for entry in data[index.min(data.len())..].iter().flatten() {
             match kind {
                 MapIterationKind::KeyValue => entries.extend([entry.0, entry.1]),
                 MapIterationKind::Key => entries.push(entry.0),
@@ -1202,16 +1192,15 @@ fn preview_entries_of(agent: &runtime::Agent, id: u64) -> Option<(Vec<EngineValu
         }
         return Some((entries, true));
     }
-    if let Some(cell) = agent.set_iter_data.get(&id) {
+    if let Some(cell) = agent.set_iter_record(id) {
         let (set, index, _kind) = *cell.borrow();
         let Some(set) = set.and_then(|set| set.as_object()) else {
             return Some((Vec::new(), false));
         };
-        let Some(cell) = agent.set_data.get(&set.id()) else {
+        let Some(data) = agent.set_entries(set.id()) else {
             return Some((Vec::new(), false));
         };
-        let data = cell.borrow();
-        let values = data.entries[index.min(data.entries.len())..]
+        let values = data[index.min(data.len())..]
             .iter()
             .flatten()
             .copied()

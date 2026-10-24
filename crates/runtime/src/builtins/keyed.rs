@@ -6,8 +6,6 @@
 //! object identity; deleted entries stay in the List as ~empty~ (`None`)
 //! slots so suspended iterators keep working, exactly like the spec.
 
-use std::cell::RefCell;
-
 use crux::convert::{require_object_coercible, to_boolean, to_integer_or_infinity};
 use crux::error::{ErrorKind, JsError};
 use crux::function::{Function, NativeFn};
@@ -466,7 +464,7 @@ fn map_of(agent: &Agent, this: &Value) -> Result<Handle<JsObject>, JsError> {
             "Method called on an incompatible receiver".into(),
         ));
     };
-    if !agent.map_data.contains_key(&object.id()) {
+    if !agent.has_map(object.id()) {
         return Err(JsError::new(
             ErrorKind::TypeError,
             "Method called on an incompatible receiver".into(),
@@ -482,7 +480,7 @@ fn set_of(agent: &Agent, this: &Value) -> Result<Handle<JsObject>, JsError> {
             "Method called on an incompatible receiver".into(),
         ));
     };
-    if !agent.set_data.contains_key(&object.id()) {
+    if !agent.has_set(object.id()) {
         return Err(JsError::new(
             ErrorKind::TypeError,
             "Method called on an incompatible receiver".into(),
@@ -497,7 +495,8 @@ fn set_of(agent: &Agent, this: &Value) -> Result<Handle<JsObject>, JsError> {
 pub(crate) fn map_get_fast(agent: &Agent, this: &Value, key: &Value) -> Option<Value> {
     let object = map_of(agent, this).ok()?;
     let key = canonicalize_key(*key);
-    let data = agent.map_data.get(&object.id()).unwrap().borrow();
+    let data = agent.map_collection(object.id()).unwrap();
+    let data = data.borrow();
     Some(data.get_value(&key))
 }
 
@@ -506,7 +505,8 @@ pub(crate) fn map_get_fast(agent: &Agent, this: &Value, key: &Value) -> Option<V
 pub(crate) fn set_has_fast(agent: &Agent, this: &Value, value: &Value) -> Option<bool> {
     let object = set_of(agent, this).ok()?;
     let value = canonicalize_key(*value);
-    let data = agent.set_data.get(&object.id()).unwrap().borrow();
+    let data = agent.set_collection(object.id()).unwrap();
+    let data = data.borrow();
     Some(data.contains(&value))
 }
 
@@ -523,24 +523,17 @@ pub(crate) fn map_set_fast(
 ) -> Option<Value> {
     let object = map_of(agent, this).ok()?;
     let key = canonicalize_key(*key);
-    let mut data = agent.map_data.get(&object.id()).unwrap().borrow_mut();
+    let data = agent.map_collection(object.id()).unwrap();
+    let mut data = data.borrow_mut();
     data.set(key, *value);
     Some(*this)
 }
 
 /// The number of live elements of a Set's [[SetData]].
 fn set_data_count(agent: &Agent, id: u64) -> usize {
-    agent
-        .set_data
-        .get(&id)
-        .map(|cell| {
-            cell.borrow()
-                .entries
-                .iter()
-                .filter(|entry| entry.is_some())
-                .count()
-        })
-        .unwrap_or(0)
+    agent.set_entries(id).map_or(0, |entries| {
+        entries.iter().filter(|entry| entry.is_some()).count()
+    })
 }
 
 /// The element at `index` of the live [[SetData]], or `None` past the end.
@@ -548,8 +541,7 @@ fn set_data_count(agent: &Agent, id: u64) -> usize {
 /// user `has`/`keys` call can mutate the receiver (set-like-class-mutation).
 fn set_data_at(agent: &Agent, id: u64, index: usize) -> Option<Value> {
     agent
-        .set_data
-        .get(&id)?
+        .set_collection(id)?
         .borrow()
         .entries
         .get(index)
@@ -559,7 +551,8 @@ fn set_data_at(agent: &Agent, id: u64, index: usize) -> Option<Value> {
 
 /// Whether the live [[SetData]] contains `value`.
 fn set_data_contains(agent: &Agent, id: u64, value: &Value) -> bool {
-    let data = agent.set_data.get(&id).map(|cell| cell.borrow()).unwrap();
+    let data = agent.set_collection(id).unwrap();
+    let data = data.borrow();
     data.contains(value)
 }
 
@@ -570,7 +563,7 @@ fn weak_map_of(agent: &Agent, this: &Value) -> Result<Handle<JsObject>, JsError>
             "Method called on an incompatible receiver".into(),
         ));
     };
-    if !agent.weak_map_data.contains_key(&object.id()) {
+    if !agent.has_weak_map(object.id()) {
         return Err(JsError::new(
             ErrorKind::TypeError,
             "Method called on an incompatible receiver".into(),
@@ -586,7 +579,7 @@ fn weak_set_of(agent: &Agent, this: &Value) -> Result<Handle<JsObject>, JsError>
             "Method called on an incompatible receiver".into(),
         ));
     };
-    if !agent.weak_set_data.contains_key(&object.id()) {
+    if !agent.has_weak_set(object.id()) {
         return Err(JsError::new(
             ErrorKind::TypeError,
             "Method called on an incompatible receiver".into(),
@@ -618,7 +611,8 @@ fn map_set(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsE
     let object = map_of(agent, this)?;
     let key = canonicalize_key(args.first().cloned().unwrap_or(Value::Undefined));
     let value = args.get(1).cloned().unwrap_or(Value::Undefined);
-    let mut data = agent.map_data.get(&object.id()).unwrap().borrow_mut();
+    let data = agent.map_collection(object.id()).unwrap();
+    let mut data = data.borrow_mut();
     data.set(key, value);
     Ok(*this)
 }
@@ -627,7 +621,8 @@ fn map_set(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsE
 fn map_delete(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsError> {
     let object = map_of(agent, this)?;
     let key = canonicalize_key(args.first().cloned().unwrap_or(Value::Undefined));
-    let mut data = agent.map_data.get(&object.id()).unwrap().borrow_mut();
+    let data = agent.map_collection(object.id()).unwrap();
+    let mut data = data.borrow_mut();
     Ok(Value::Boolean(data.remove(&key)))
 }
 
@@ -635,7 +630,8 @@ fn map_delete(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, 
 fn map_get(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsError> {
     let object = map_of(agent, this)?;
     let key = canonicalize_key(args.first().cloned().unwrap_or(Value::Undefined));
-    let data = agent.map_data.get(&object.id()).unwrap().borrow();
+    let data = agent.map_collection(object.id()).unwrap();
+    let data = data.borrow();
     Ok(data.get_value(&key))
 }
 
@@ -643,7 +639,8 @@ fn map_get(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsE
 fn map_has(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsError> {
     let object = map_of(agent, this)?;
     let key = canonicalize_key(args.first().cloned().unwrap_or(Value::Undefined));
-    let data = agent.map_data.get(&object.id()).unwrap().borrow();
+    let data = agent.map_collection(object.id()).unwrap();
+    let data = data.borrow();
     Ok(Value::Boolean(data.contains(&key)))
 }
 
@@ -651,7 +648,8 @@ fn map_has(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsE
 /// List is preserved for suspended iterators.
 fn map_clear(agent: &mut Agent, this: &Value, _args: &[Value]) -> Result<Value, JsError> {
     let object = map_of(agent, this)?;
-    let mut data = agent.map_data.get(&object.id()).unwrap().borrow_mut();
+    let data = agent.map_collection(object.id()).unwrap();
+    let mut data = data.borrow_mut();
     data.clear();
     Ok(Value::Undefined)
 }
@@ -659,7 +657,8 @@ fn map_clear(agent: &mut Agent, this: &Value, _args: &[Value]) -> Result<Value, 
 /// get Map.prototype.size (spec 24.1.3.9).
 fn map_size(agent: &mut Agent, this: &Value, _args: &[Value]) -> Result<Value, JsError> {
     let object = map_of(agent, this)?;
-    let data = agent.map_data.get(&object.id()).unwrap().borrow();
+    let data = agent.map_collection(object.id()).unwrap();
+    let data = data.borrow();
     Ok(Value::Number(data.live_count() as f64))
 }
 
@@ -668,7 +667,8 @@ fn map_get_or_insert(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<
     let object = map_of(agent, this)?;
     let key = canonicalize_key(args.first().cloned().unwrap_or(Value::Undefined));
     let value = args.get(1).cloned().unwrap_or(Value::Undefined);
-    let mut data = agent.map_data.get(&object.id()).unwrap().borrow_mut();
+    let data = agent.map_collection(object.id()).unwrap();
+    let mut data = data.borrow_mut();
     if let Some(index) = data.slot(&key) {
         let value = data.entries[index]
             .as_ref()
@@ -697,7 +697,8 @@ fn map_get_or_insert_computed(
         ));
     }
     {
-        let data = agent.map_data.get(&object.id()).unwrap().borrow();
+        let data = agent.map_collection(object.id()).unwrap();
+        let data = data.borrow();
         if let Some(index) = data.slot(&key) {
             let value = data.entries[index]
                 .as_ref()
@@ -712,7 +713,8 @@ fn map_get_or_insert_computed(
         Value::Undefined,
         std::slice::from_ref(&key),
     )?;
-    let mut data = agent.map_data.get(&object.id()).unwrap().borrow_mut();
+    let data = agent.map_collection(object.id()).unwrap();
+    let mut data = data.borrow_mut();
     data.set(key, value);
     Ok(value)
 }
@@ -733,7 +735,8 @@ fn map_for_each(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value
     crate::builtins::function::CallbackVm::with(agent, |agent, leaf| {
         loop {
             let (entry, count) = {
-                let data = agent.map_data.get(&object.id()).unwrap().borrow();
+                let data = agent.map_collection(object.id()).unwrap();
+                let data = data.borrow();
                 (
                     data.entries.get(index).cloned().flatten(),
                     data.entries.len(),
@@ -771,10 +774,7 @@ fn create_map_iterator(
             )
         })?;
     let iterator = JsObject::ordinary_object_create(Some(proto));
-    agent.map_iter_data.insert(
-        iterator.id(),
-        RefCell::new((Some(*map), 0usize, kind.code())),
-    );
+    agent.register_map_iter(iterator.id(), (Some(*map), 0usize, kind.code()));
     Ok(Value::Object(iterator))
 }
 
@@ -789,15 +789,15 @@ fn map_iterator_next(agent: &mut Agent, this: &Value, _args: &[Value]) -> Result
         ));
     };
     let id = iterator.id();
-    if !agent.map_iter_data.contains_key(&id) {
+    if agent.map_iter_record(id).is_none() {
         return Err(JsError::new(
             ErrorKind::TypeError,
             "%MapIteratorPrototype%.next called on an incompatible receiver".into(),
         ));
     }
     let (map, mut index, kind_code) = {
-        let state = agent.map_iter_data.get(&id).unwrap().borrow();
-        *state
+        let record = agent.map_iter_record(id).unwrap();
+        *record.borrow()
     };
     let Some(map_value) = map else {
         return iter_result(agent, Value::Undefined, true);
@@ -809,12 +809,8 @@ fn map_iterator_next(agent: &mut Agent, this: &Value, _args: &[Value]) -> Result
     // A per-call snapshot: no user code runs between the read and the
     // result, so entries added after this call are seen by the next one.
     let data = agent
-        .map_data
-        .get(&map_object.id())
-        .ok_or_else(|| JsError::new(ErrorKind::TypeError, "Iterated Map is not a Map".into()))?
-        .borrow()
-        .entries
-        .clone();
+        .map_entries(map_object.id())
+        .ok_or_else(|| JsError::new(ErrorKind::TypeError, "Iterated Map is not a Map".into()))?;
     let len = data.len();
     while index < len {
         let entry = data[index];
@@ -827,14 +823,19 @@ fn map_iterator_next(agent: &mut Agent, this: &Value, _args: &[Value]) -> Result
                 MapIterationKind::Key => key,
                 MapIterationKind::Value => value,
             };
-            let mut state = agent.map_iter_data.get(&id).unwrap().borrow_mut();
-            state.0 = Some(map_value);
-            state.1 = index;
+            // The record's guard ends before the result object is built: an
+            // allocation under it would abort the collection that traces the
+            // table.
+            {
+                let record = agent.map_iter_record(id).unwrap();
+                let mut state = record.borrow_mut();
+                state.0 = Some(map_value);
+                state.1 = index;
+            }
             return iter_result(agent, result, false);
         }
     }
-    let mut state = agent.map_iter_data.get(&id).unwrap().borrow_mut();
-    state.0 = None;
+    agent.map_iter_record(id).unwrap().borrow_mut().0 = None;
     iter_result(agent, Value::Undefined, true)
 }
 
@@ -865,7 +866,8 @@ fn species_getter(_agent: &mut Agent, this: &Value, _args: &[Value]) -> Result<V
 fn set_add(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsError> {
     let object = set_of(agent, this)?;
     let value = canonicalize_key(args.first().cloned().unwrap_or(Value::Undefined));
-    let mut data = agent.set_data.get(&object.id()).unwrap().borrow_mut();
+    let data = agent.set_collection(object.id()).unwrap();
+    let mut data = data.borrow_mut();
     data.add(value);
     Ok(*this)
 }
@@ -874,7 +876,8 @@ fn set_add(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsE
 fn set_delete(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsError> {
     let object = set_of(agent, this)?;
     let value = canonicalize_key(args.first().cloned().unwrap_or(Value::Undefined));
-    let mut data = agent.set_data.get(&object.id()).unwrap().borrow_mut();
+    let data = agent.set_collection(object.id()).unwrap();
+    let mut data = data.borrow_mut();
     Ok(Value::Boolean(data.remove(&value)))
 }
 
@@ -882,14 +885,16 @@ fn set_delete(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, 
 fn set_has(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsError> {
     let object = set_of(agent, this)?;
     let value = canonicalize_key(args.first().cloned().unwrap_or(Value::Undefined));
-    let data = agent.set_data.get(&object.id()).unwrap().borrow();
+    let data = agent.set_collection(object.id()).unwrap();
+    let data = data.borrow();
     Ok(Value::Boolean(data.contains(&value)))
 }
 
 /// Set.prototype.clear (spec 24.2.3.2).
 fn set_clear(agent: &mut Agent, this: &Value, _args: &[Value]) -> Result<Value, JsError> {
     let object = set_of(agent, this)?;
-    let mut data = agent.set_data.get(&object.id()).unwrap().borrow_mut();
+    let data = agent.set_collection(object.id()).unwrap();
+    let mut data = data.borrow_mut();
     data.clear();
     Ok(Value::Undefined)
 }
@@ -897,7 +902,8 @@ fn set_clear(agent: &mut Agent, this: &Value, _args: &[Value]) -> Result<Value, 
 /// get Set.prototype.size (spec 24.2.3.9).
 fn set_size(agent: &mut Agent, this: &Value, _args: &[Value]) -> Result<Value, JsError> {
     let object = set_of(agent, this)?;
-    let data = agent.set_data.get(&object.id()).unwrap().borrow();
+    let data = agent.set_collection(object.id()).unwrap();
+    let data = data.borrow();
     Ok(Value::Number(data.live_count() as f64))
 }
 
@@ -916,7 +922,8 @@ fn set_for_each(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value
     crate::builtins::function::CallbackVm::with(agent, |agent, leaf| {
         loop {
             let (entry, count) = {
-                let data = agent.set_data.get(&object.id()).unwrap().borrow();
+                let data = agent.set_collection(object.id()).unwrap();
+                let data = data.borrow();
                 (
                     data.entries.get(index).cloned().flatten(),
                     data.entries.len(),
@@ -957,9 +964,7 @@ fn create_set_iterator(
         SetIterationKind::KeyValue => 0u8,
         SetIterationKind::Value => 1u8,
     };
-    agent
-        .set_iter_data
-        .insert(iterator.id(), RefCell::new((Some(*set), 0usize, kind_code)));
+    agent.register_set_iter(iterator.id(), (Some(*set), 0usize, kind_code));
     Ok(Value::Object(iterator))
 }
 
@@ -972,15 +977,15 @@ fn set_iterator_next(agent: &mut Agent, this: &Value, _args: &[Value]) -> Result
         ));
     };
     let id = iterator.id();
-    if !agent.set_iter_data.contains_key(&id) {
+    if agent.set_iter_record(id).is_none() {
         return Err(JsError::new(
             ErrorKind::TypeError,
             "%SetIteratorPrototype%.next called on an incompatible receiver".into(),
         ));
     }
     let (set, mut index, kind_code) = {
-        let state = agent.set_iter_data.get(&id).unwrap().borrow();
-        *state
+        let record = agent.set_iter_record(id).unwrap();
+        *record.borrow()
     };
     let Some(set_value) = set else {
         return iter_result(agent, Value::Undefined, true);
@@ -989,12 +994,8 @@ fn set_iterator_next(agent: &mut Agent, this: &Value, _args: &[Value]) -> Result
         JsError::new(ErrorKind::TypeError, "Iterated Set is not an object".into())
     })?;
     let data = agent
-        .set_data
-        .get(&set_object.id())
-        .ok_or_else(|| JsError::new(ErrorKind::TypeError, "Iterated Set is not a Set".into()))?
-        .borrow()
-        .entries
-        .clone();
+        .set_entries(set_object.id())
+        .ok_or_else(|| JsError::new(ErrorKind::TypeError, "Iterated Set is not a Set".into()))?;
     let len = data.len();
     while index < len {
         let entry = data[index];
@@ -1004,14 +1005,16 @@ fn set_iterator_next(agent: &mut Agent, this: &Value, _args: &[Value]) -> Result
                 0 => crate::builtins::array::array_from_values(agent, &[value, value])?,
                 _ => value,
             };
-            let mut state = agent.set_iter_data.get(&id).unwrap().borrow_mut();
-            state.0 = Some(set_value);
-            state.1 = index;
+            {
+                let record = agent.set_iter_record(id).unwrap();
+                let mut state = record.borrow_mut();
+                state.0 = Some(set_value);
+                state.1 = index;
+            }
             return iter_result(agent, result, false);
         }
     }
-    let mut state = agent.set_iter_data.get(&id).unwrap().borrow_mut();
-    state.0 = None;
+    agent.set_iter_record(id).unwrap().borrow_mut().0 = None;
     iter_result(agent, Value::Undefined, true)
 }
 
@@ -1117,10 +1120,7 @@ fn new_set_from_data(agent: &mut Agent, data: Vec<Option<Value>>) -> Result<Valu
         .and_then(|value| as_object(&value))
         .ok_or_else(|| JsError::new(ErrorKind::TypeError, "%Set.prototype% missing".into()))?;
     let set = JsObject::ordinary_object_create(Some(proto));
-    agent.set_data.insert(
-        set.id(),
-        RefCell::new(crate::agent::SetCollection::from_entries(data)),
-    );
+    agent.register_set(set.id(), crate::agent::SetCollection::from_entries(data));
     Ok(Value::Object(set))
 }
 
@@ -1130,13 +1130,7 @@ fn set_union(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, J
     let object = set_of(agent, this)?;
     let other = args.first().cloned().unwrap_or(Value::Undefined);
     let record = get_set_record(agent, &other)?;
-    let mut result = agent
-        .set_data
-        .get(&object.id())
-        .unwrap()
-        .borrow()
-        .entries
-        .clone();
+    let mut result = agent.set_entries(object.id()).unwrap();
     let keys = get_iterator_from_method(agent, &record.object, &record.keys)?;
     while let Some(next) = crate::expr::iterator_step(agent, &keys)? {
         let value = canonicalize_key(next);
@@ -1153,13 +1147,7 @@ fn set_intersection(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<V
     let object = set_of(agent, this)?;
     let other = args.first().cloned().unwrap_or(Value::Undefined);
     let record = get_set_record(agent, &other)?;
-    let data = agent
-        .set_data
-        .get(&object.id())
-        .unwrap()
-        .borrow()
-        .entries
-        .clone();
+    let data = agent.set_entries(object.id()).unwrap();
     let this_size = data.iter().filter(|e| e.is_some()).count();
     let mut result: Vec<Option<Value>> = Vec::new();
     if this_size <= record.size {
@@ -1193,13 +1181,7 @@ fn set_difference(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Val
     let object = set_of(agent, this)?;
     let other = args.first().cloned().unwrap_or(Value::Undefined);
     let record = get_set_record(agent, &other)?;
-    let data = agent
-        .set_data
-        .get(&object.id())
-        .unwrap()
-        .borrow()
-        .entries
-        .clone();
+    let data = agent.set_entries(object.id()).unwrap();
     let this_size = data.iter().filter(|e| e.is_some()).count();
     let mut result = data.clone();
     if this_size <= record.size {
@@ -1246,7 +1228,7 @@ fn set_symmetric_difference(
     // checked against the *live* set, because the key iterator's `next` can
     // mutate the receiver (set-like-class-mutation keeps values deleted by
     // the mutation and drops values re-added by it).
-    let mut result = agent.set_data.get(&id).unwrap().borrow().entries.clone();
+    let mut result = agent.set_entries(id).unwrap();
     let keys = get_iterator_from_method(agent, &record.object, &record.keys)?;
     while let Some(next) = crate::expr::iterator_step(agent, &keys)? {
         let value = canonicalize_key(next);
@@ -1297,13 +1279,7 @@ fn set_is_superset_of(agent: &mut Agent, this: &Value, args: &[Value]) -> Result
     let object = set_of(agent, this)?;
     let other = args.first().cloned().unwrap_or(Value::Undefined);
     let record = get_set_record(agent, &other)?;
-    let data = agent
-        .set_data
-        .get(&object.id())
-        .unwrap()
-        .borrow()
-        .entries
-        .clone();
+    let data = agent.set_entries(object.id()).unwrap();
     let this_size = data.iter().filter(|e| e.is_some()).count();
     if this_size < record.size {
         return Ok(Value::Boolean(false));
@@ -1363,7 +1339,8 @@ fn weak_map_set(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value
         ));
     }
     let value = args.get(1).cloned().unwrap_or(Value::Undefined);
-    let mut data = agent.weak_map_data.get(&object.id()).unwrap().borrow_mut();
+    let data = agent.weak_map_entries(object.id()).unwrap();
+    let mut data = data.borrow_mut();
     if let Some(index) = find_index(&data, &key) {
         if let Some(entry) = &mut data[index] {
             entry.1 = value;
@@ -1381,7 +1358,8 @@ fn weak_map_get(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value
     if !can_be_held_weakly(agent, &key) {
         return Ok(Value::Undefined);
     }
-    let data = agent.weak_map_data.get(&object.id()).unwrap().borrow();
+    let data = agent.weak_map_entries(object.id()).unwrap();
+    let data = data.borrow();
     Ok(match find_index(&data, &key) {
         Some(index) => data[index]
             .as_ref()
@@ -1398,7 +1376,8 @@ fn weak_map_has(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value
     if !can_be_held_weakly(agent, &key) {
         return Ok(Value::Boolean(false));
     }
-    let data = agent.weak_map_data.get(&object.id()).unwrap().borrow();
+    let data = agent.weak_map_entries(object.id()).unwrap();
+    let data = data.borrow();
     Ok(Value::Boolean(find_index(&data, &key).is_some()))
 }
 
@@ -1409,7 +1388,8 @@ fn weak_map_delete(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Va
     if !can_be_held_weakly(agent, &key) {
         return Ok(Value::Boolean(false));
     }
-    let mut data = agent.weak_map_data.get(&object.id()).unwrap().borrow_mut();
+    let data = agent.weak_map_entries(object.id()).unwrap();
+    let mut data = data.borrow_mut();
     if let Some(index) = find_index(&data, &key) {
         data[index] = None;
         Ok(Value::Boolean(true))
@@ -1433,7 +1413,8 @@ fn weak_map_get_or_insert(
         ));
     }
     let value = args.get(1).cloned().unwrap_or(Value::Undefined);
-    let mut data = agent.weak_map_data.get(&object.id()).unwrap().borrow_mut();
+    let data = agent.weak_map_entries(object.id()).unwrap();
+    let mut data = data.borrow_mut();
     if let Some(index) = find_index(&data, &key) {
         let value = data[index]
             .as_ref()
@@ -1467,7 +1448,8 @@ fn weak_map_get_or_insert_computed(
         ));
     }
     {
-        let data = agent.weak_map_data.get(&object.id()).unwrap().borrow();
+        let data = agent.weak_map_entries(object.id()).unwrap();
+        let data = data.borrow();
         if let Some(index) = find_index(&data, &key) {
             let value = data[index]
                 .as_ref()
@@ -1482,7 +1464,8 @@ fn weak_map_get_or_insert_computed(
         Value::Undefined,
         std::slice::from_ref(&key),
     )?;
-    let mut data = agent.weak_map_data.get(&object.id()).unwrap().borrow_mut();
+    let data = agent.weak_map_entries(object.id()).unwrap();
+    let mut data = data.borrow_mut();
     if let Some(index) = find_index(&data, &key) {
         if let Some(entry) = &mut data[index] {
             entry.1 = value;
@@ -1503,7 +1486,8 @@ fn weak_set_add(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value
             "Invalid value used in weak set".into(),
         ));
     }
-    let mut data = agent.weak_set_data.get(&object.id()).unwrap().borrow_mut();
+    let data = agent.weak_set_entries(object.id()).unwrap();
+    let mut data = data.borrow_mut();
     if find_set_index(&data, &value).is_none() {
         data.push(Some(value));
     }
@@ -1517,7 +1501,8 @@ fn weak_set_has(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value
     if !can_be_held_weakly(agent, &value) {
         return Ok(Value::Boolean(false));
     }
-    let data = agent.weak_set_data.get(&object.id()).unwrap().borrow();
+    let data = agent.weak_set_entries(object.id()).unwrap();
+    let data = data.borrow();
     Ok(Value::Boolean(find_set_index(&data, &value).is_some()))
 }
 
@@ -1528,7 +1513,8 @@ fn weak_set_delete(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Va
     if !can_be_held_weakly(agent, &value) {
         return Ok(Value::Boolean(false));
     }
-    let mut data = agent.weak_set_data.get(&object.id()).unwrap().borrow_mut();
+    let data = agent.weak_set_entries(object.id()).unwrap();
+    let mut data = data.borrow_mut();
     if let Some(index) = find_set_index(&data, &value) {
         data[index] = None;
         Ok(Value::Boolean(true))
@@ -1679,10 +1665,7 @@ fn map_group_by(agent: &mut Agent, _this: &Value, args: &[Value]) -> Result<Valu
         let array = crate::builtins::array::array_from_values(agent, &elements)?;
         data.push(Some((key, array)));
     }
-    agent.map_data.insert(
-        map.id(),
-        RefCell::new(crate::agent::MapCollection::from_entries(data)),
-    );
+    agent.register_map(map.id(), crate::agent::MapCollection::from_entries(data));
     Ok(Value::Object(map))
 }
 
@@ -1691,10 +1674,7 @@ fn map_group_by(agent: &mut Agent, _this: &Value, args: &[Value]) -> Result<Valu
 fn map_construct(agent: &mut Agent, args: &[Value], new_target: &Value) -> Result<Value, JsError> {
     let proto = get_prototype_from_constructor(agent, new_target, MAP_PROTO)?;
     let map = JsObject::ordinary_object_create(Some(proto));
-    agent.map_data.insert(
-        map.id(),
-        RefCell::new(crate::agent::MapCollection::default()),
-    );
+    agent.register_map(map.id(), crate::agent::MapCollection::default());
     let map_value = Value::Object(map);
     let iterable = args.first().cloned().unwrap_or(Value::Undefined);
     if matches!(iterable.kind(), ValueKind::Undefined | ValueKind::Null) {
@@ -1714,10 +1694,7 @@ fn map_construct(agent: &mut Agent, args: &[Value], new_target: &Value) -> Resul
 fn set_construct(agent: &mut Agent, args: &[Value], new_target: &Value) -> Result<Value, JsError> {
     let proto = get_prototype_from_constructor(agent, new_target, SET_PROTO)?;
     let set = JsObject::ordinary_object_create(Some(proto));
-    agent.set_data.insert(
-        set.id(),
-        RefCell::new(crate::agent::SetCollection::default()),
-    );
+    agent.register_set(set.id(), crate::agent::SetCollection::default());
     let set_value = Value::Object(set);
     let iterable = args.first().cloned().unwrap_or(Value::Undefined);
     if matches!(iterable.kind(), ValueKind::Undefined | ValueKind::Null) {
@@ -1751,9 +1728,7 @@ fn weak_map_construct(
 ) -> Result<Value, JsError> {
     let proto = get_prototype_from_constructor(agent, new_target, WEAK_MAP_PROTO)?;
     let map = JsObject::ordinary_object_create(Some(proto));
-    agent
-        .weak_map_data
-        .insert(map.id(), RefCell::new(Vec::new()));
+    agent.register_weak_map(map.id(), Vec::new());
     let map_value = Value::Object(map);
     let iterable = args.first().cloned().unwrap_or(Value::Undefined);
     if matches!(iterable.kind(), ValueKind::Undefined | ValueKind::Null) {
@@ -1777,9 +1752,7 @@ fn weak_set_construct(
 ) -> Result<Value, JsError> {
     let proto = get_prototype_from_constructor(agent, new_target, WEAK_SET_PROTO)?;
     let set = JsObject::ordinary_object_create(Some(proto));
-    agent
-        .weak_set_data
-        .insert(set.id(), RefCell::new(Vec::new()));
+    agent.register_weak_set(set.id(), Vec::new());
     let set_value = Value::Object(set);
     let iterable = args.first().cloned().unwrap_or(Value::Undefined);
     if matches!(iterable.kind(), ValueKind::Undefined | ValueKind::Null) {

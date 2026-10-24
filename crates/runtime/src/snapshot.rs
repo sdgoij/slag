@@ -2820,24 +2820,24 @@ fn children(agent: &Agent, object: &Handle<JsObject>) -> Result<Vec<Value>, Unsu
     // table rather than in properties, so the walk has to reach them here: a
     // record that skipped them would bring back an object whose prototype's
     // methods all refuse it (`RequireInternalSlot`).
-    if let Some(data) = agent.map_data.get(&object.id()) {
+    if let Some(data) = agent.map_collection(object.id()) {
         let data = data.borrow();
         for (key, value) in data.entries.iter().flatten() {
             children.push(*key);
             children.push(*value);
         }
-    } else if let Some(data) = agent.set_data.get(&object.id()) {
+    } else if let Some(data) = agent.set_collection(object.id()) {
         let data = data.borrow();
         for entry in data.entries.iter().flatten() {
             children.push(*entry);
         }
-    } else if let Some(data) = agent.weak_map_data.get(&object.id()) {
+    } else if let Some(data) = agent.weak_map_entries(object.id()) {
         let data = data.borrow();
         for (key, value) in data.iter().flatten() {
             children.push(*key);
             children.push(*value);
         }
-    } else if let Some(data) = agent.weak_set_data.get(&object.id()) {
+    } else if let Some(data) = agent.weak_set_entries(object.id()) {
         let data = data.borrow();
         for entry in data.iter().flatten() {
             children.push(*entry);
@@ -3147,13 +3147,13 @@ fn write_object(
 /// ordinary object it otherwise looks like, and the one place the entries live.
 fn keyed_kind(agent: &Agent, object: &Handle<JsObject>) -> Option<u8> {
     let id = object.id();
-    if agent.map_data.contains_key(&id) {
+    if agent.has_map(id) {
         Some(KEYED_MAP)
-    } else if agent.set_data.contains_key(&id) {
+    } else if agent.has_set(id) {
         Some(KEYED_SET)
-    } else if agent.weak_map_data.contains_key(&id) {
+    } else if agent.has_weak_map(id) {
         Some(KEYED_WEAK_MAP)
-    } else if agent.weak_set_data.contains_key(&id) {
+    } else if agent.has_weak_set(id) {
         Some(KEYED_WEAK_SET)
     } else {
         None
@@ -3190,7 +3190,7 @@ fn write_keyed(
     let mut elements: Vec<Value> = Vec::new();
     match kind {
         KEYED_MAP => {
-            if let Some(data) = agent.map_data.get(&id) {
+            if let Some(data) = agent.map_collection(id) {
                 let data = data.borrow();
                 for (key, value) in data.entries.iter().flatten() {
                     elements.push(*key);
@@ -3199,7 +3199,7 @@ fn write_keyed(
             }
         }
         KEYED_WEAK_MAP => {
-            if let Some(data) = agent.weak_map_data.get(&id) {
+            if let Some(data) = agent.weak_map_entries(id) {
                 let data = data.borrow();
                 for (key, value) in data.iter().flatten() {
                     elements.push(*key);
@@ -3208,13 +3208,13 @@ fn write_keyed(
             }
         }
         KEYED_SET => {
-            if let Some(data) = agent.set_data.get(&id) {
+            if let Some(data) = agent.set_collection(id) {
                 let data = data.borrow();
                 elements.extend(data.entries.iter().flatten().copied());
             }
         }
         _ => {
-            if let Some(data) = agent.weak_set_data.get(&id) {
+            if let Some(data) = agent.weak_set_entries(id) {
                 let data = data.borrow();
                 elements.extend(data.iter().flatten().copied());
             }
@@ -5595,20 +5595,14 @@ impl Builder<'_> {
                             pairs.push(Some((key, value)));
                         }
                         if *kind == KEYED_MAP {
-                            self.agent.map_data.insert(
-                                id,
-                                std::cell::RefCell::new(crate::agent::MapCollection::from_entries(
-                                    pairs,
-                                )),
-                            );
+                            self.agent
+                                .register_map(id, crate::agent::MapCollection::from_entries(pairs));
                         } else {
                             // A weak table is the plain entry list: the index the
                             // strong map keeps is an accelerator a WeakMap has no
                             // use for, and its keys are ephemerons rather than
                             // strong children.
-                            self.agent
-                                .weak_map_data
-                                .insert(id, std::cell::RefCell::new(pairs));
+                            self.agent.register_weak_map(id, pairs);
                         }
                     }
                     _ => {
@@ -5617,16 +5611,12 @@ impl Builder<'_> {
                             elements.push(Some(self.materialize(*serial)?));
                         }
                         if *kind == KEYED_SET {
-                            self.agent.set_data.insert(
+                            self.agent.register_set(
                                 id,
-                                std::cell::RefCell::new(crate::agent::SetCollection::from_entries(
-                                    elements,
-                                )),
+                                crate::agent::SetCollection::from_entries(elements),
                             );
                         } else {
-                            self.agent
-                                .weak_set_data
-                                .insert(id, std::cell::RefCell::new(elements));
+                            self.agent.register_weak_set(id, elements);
                         }
                     }
                 }

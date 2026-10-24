@@ -101,6 +101,11 @@ pub struct MapCollection {
     pub collided: bool,
 }
 
+/// The record of a Map or Set iterator: the iterated collection (or `None`
+/// once iteration finished), the next index, and the iteration kind's code
+/// (spec 24.1.6.1).
+pub type IterRecord = (Option<Value>, usize, u8);
+
 /// The [[SetData]] of a Set instance (spec 24.2.1) plus its element index.
 #[derive(Default)]
 pub struct SetCollection {
@@ -519,6 +524,33 @@ pub(crate) struct AgentRoots {
     /// The `ShadowRealm.prototype.importValue` continuations, keyed by
     /// function identity.
     pub(crate) shadow_handlers: RefCell<IdMap<crate::builtins::shadow_realm::ShadowHandler>>,
+    /// The [[MapData]] of Map instances, keyed by object identity (spec
+    /// 24.1.1: a List of entries; `None` marks a deleted ~empty~ slot that
+    /// suspended Map iterators skip). The parallel key index makes the
+    /// get/has/set/delete probes O(1) on the live entries.
+    ///
+    /// The entries are `Rc`-shared cells: a Map operation holds the
+    /// collection across a user callback (`forEach`, the key's `ToPropertyKey`
+    /// conversion), so the entry has to be a cell of its own — and reading it
+    /// out of the table must not keep the table borrowed, because another Map
+    /// can be created inside that callback.
+    pub(crate) map_data: RefCell<IdMap<Rc<RefCell<MapCollection>>>>,
+    /// The [[SetData]] of Set instances (spec 24.2.1; `None` is a deleted
+    /// ~empty~ slot) plus the element index; see `map_data` for the shape.
+    pub(crate) set_data: RefCell<IdMap<Rc<RefCell<SetCollection>>>>,
+    /// The [[WeakMapData]] of WeakMap instances, keyed by object identity
+    /// (spec 26.3.1). The entry list is a cell for the same reason, and its
+    /// keys are traced as ephemerons rather than strong edges.
+    pub(crate) weak_map_data: RefCell<IdMap<Rc<RefCell<Vec<MapEntry>>>>>,
+    /// The [[WeakSetData]] of WeakSet instances (spec 26.4.1).
+    pub(crate) weak_set_data: RefCell<IdMap<Rc<RefCell<Vec<SetEntry>>>>>,
+    /// The [[IteratedMap]], [[MapNextIndex]], and [[MapIterationKind]] of Map
+    /// iterators, keyed by iterator-object identity (spec 24.1.6). The map
+    /// value is `None` once iteration is done.
+    pub(crate) map_iter_data: RefCell<IdMap<Rc<RefCell<IterRecord>>>>,
+    /// The [[IteratedSet]], [[SetNextIndex]], and [[SetIterationKind]] of Set
+    /// iterators (spec 24.2.6).
+    pub(crate) set_iter_data: RefCell<IdMap<Rc<RefCell<IterRecord>>>>,
     /// The ECMAScript-function records, keyed by function identity: the spec
     /// 10.2.1 slots [[Environment]], [[FormalParameters]], [[ECMAScriptCode]],
     /// [[ThisMode]], [[HomeObject]].
@@ -557,6 +589,12 @@ impl AgentRoots {
             shadow_wrapped: RefCell::new(std::collections::HashMap::default()),
             shadow_handlers: RefCell::new(std::collections::HashMap::default()),
             ecma_functions: RefCell::new(IdMap::default()),
+            map_data: RefCell::new(IdMap::default()),
+            set_data: RefCell::new(IdMap::default()),
+            weak_map_data: RefCell::new(IdMap::default()),
+            weak_set_data: RefCell::new(IdMap::default()),
+            map_iter_data: RefCell::new(IdMap::default()),
+            set_iter_data: RefCell::new(IdMap::default()),
         }
     }
 
@@ -651,6 +689,72 @@ impl Trace for AgentRoots {
         self.shadow_wrapped.trace(visit);
         self.shadow_handlers.trace(visit);
         self.ecma_functions.trace(visit);
+        self.map_data.trace(visit);
+        self.set_data.trace(visit);
+        // GC-3: WeakMap/WeakSet entries are ephemerons — the key (and thus
+        // the entry) lives only while it is reachable from other roots, and
+        // the value lives only while its key does. Register the edges for
+        // the collector's fixpoint instead of tracing them strongly; the
+        // post-collection compaction drops entries whose key was swept.
+        if let Ok(table) = self.weak_map_data.try_borrow() {
+            for cell in table.values() {
+                let Ok(data) = cell.try_borrow() else {
+                    crux::heap::note_aborted_trace();
+                    return;
+                };
+                for entry in data.iter().flatten() {
+                    let Some(key) = value_box_addr(&entry.0) else {
+                        continue;
+                    };
+                    let value = value_box_addr(&entry.1).unwrap_or(key);
+                    crux::heap::note_ephemeron(key, value);
+                }
+            }
+        } else {
+            crux::heap::note_aborted_trace();
+            return;
+        }
+        if let Ok(table) = self.weak_set_data.try_borrow() {
+            for cell in table.values() {
+                let Ok(data) = cell.try_borrow() else {
+                    crux::heap::note_aborted_trace();
+                    return;
+                };
+                for element in data.iter().flatten() {
+                    if let Some(element) = value_box_addr(element) {
+                        crux::heap::note_ephemeron(element, element);
+                    }
+                }
+            }
+        } else {
+            crux::heap::note_aborted_trace();
+            return;
+        }
+        // The iterator records are plain tuples (no `Trace` impl), so their
+        // one heap value is visited by hand.
+        if let Ok(table) = self.map_iter_data.try_borrow() {
+            for record in table.values() {
+                let Ok(record) = record.try_borrow() else {
+                    crux::heap::note_aborted_trace();
+                    return;
+                };
+                record.0.trace(visit);
+            }
+        } else {
+            crux::heap::note_aborted_trace();
+            return;
+        }
+        let Ok(table) = self.set_iter_data.try_borrow() else {
+            crux::heap::note_aborted_trace();
+            return;
+        };
+        for record in table.values() {
+            let Ok(record) = record.try_borrow() else {
+                crux::heap::note_aborted_trace();
+                return;
+            };
+            record.0.trace(visit);
+        }
     }
 }
 
@@ -1322,27 +1426,6 @@ pub struct Agent {
     /// The [[RawJSON]] text of JSON.rawJSON objects, keyed by object identity
     /// (spec 26.6.3).
     pub raw_json_data: std::collections::HashMap<u64, JsString>,
-    /// The [[MapData]] of Map instances, keyed by object identity (spec
-    /// 24.1.1: a List of entries; `None` marks a deleted ~empty~ slot that
-    /// suspended Map iterators skip). The parallel key index makes the
-    /// get/has/set/delete probes O(1) on the live entries.
-    pub map_data: IdMap<RefCell<MapCollection>>,
-    /// The [[SetData]] of Set instances, keyed by object identity (spec
-    /// 24.2.1; `None` is a deleted ~empty~ slot) plus the element index.
-    pub set_data: IdMap<RefCell<SetCollection>>,
-    /// The [[WeakMapData]] of WeakMap instances, keyed by object identity
-    /// (spec 26.3.1; the Rc model never collects the keys, Phase 18).
-    pub weak_map_data: IdMap<RefCell<Vec<MapEntry>>>,
-    /// The [[WeakSetData]] of WeakSet instances, keyed by object identity
-    /// (spec 26.4.1).
-    pub weak_set_data: IdMap<RefCell<Vec<SetEntry>>>,
-    /// The [[IteratedMap]], [[MapNextIndex]], and [[MapIterationKind]] of Map
-    /// iterators, keyed by iterator-object identity (spec 24.1.6). The map
-    /// value is `None` once iteration is done.
-    pub map_iter_data: std::collections::HashMap<u64, RefCell<(Option<Value>, usize, u8)>>,
-    /// The [[IteratedSet]], [[SetNextIndex]], and [[SetIterationKind]] of Set
-    /// iterators, keyed by iterator-object identity (spec 24.2.6).
-    pub set_iter_data: std::collections::HashMap<u64, RefCell<(Option<Value>, usize, u8)>>,
     /// The nesting depth of class field initializers currently evaluating.
     /// A direct eval inside one applies the "Eval Inside Initializer" early
     /// errors (spec 19.2.1.1): `arguments` is a SyntaxError there.
@@ -1742,12 +1825,6 @@ impl Agent {
             buffer_data: std::collections::HashMap::new(),
             dataview_data: std::collections::HashMap::new(),
             raw_json_data: std::collections::HashMap::new(),
-            map_data: std::collections::HashMap::default(),
-            set_data: std::collections::HashMap::default(),
-            weak_map_data: std::collections::HashMap::default(),
-            weak_set_data: std::collections::HashMap::default(),
-            map_iter_data: std::collections::HashMap::new(),
-            set_iter_data: std::collections::HashMap::new(),
             field_initializer_depth: 0,
             realm_count: std::cell::Cell::new(0),
             gc_stress: Cell::new(false),
@@ -1865,6 +1942,152 @@ impl Agent {
 
     pub(crate) fn remove_ecma_function(&self, id: &u64) -> Option<crate::function::EcmaFunction> {
         self.roots.ecma_functions.borrow_mut().remove(id)
+    }
+
+    /// The [[MapData]] of `id`, when the object is a Map. The entry is an
+    /// `Rc`-shared cell, so this hands the collection over and leaves the
+    /// table unborrowed.
+    pub(crate) fn map_collection(&self, id: u64) -> Option<Rc<RefCell<MapCollection>>> {
+        self.roots.map_data.borrow().get(&id).cloned()
+    }
+
+    /// The [[SetData]] of `id`, when the object is a Set; see
+    /// [`map_collection`](Self::map_collection).
+    pub(crate) fn set_collection(&self, id: u64) -> Option<Rc<RefCell<SetCollection>>> {
+        self.roots.set_data.borrow().get(&id).cloned()
+    }
+
+    /// The [[WeakMapData]] entry list of `id`, when the object is a WeakMap.
+    pub fn weak_map_entries(&self, id: u64) -> Option<Rc<RefCell<Vec<MapEntry>>>> {
+        self.roots.weak_map_data.borrow().get(&id).cloned()
+    }
+
+    /// The [[WeakSetData]] entry list of `id`, when the object is a WeakSet.
+    pub fn weak_set_entries(&self, id: u64) -> Option<Rc<RefCell<Vec<SetEntry>>>> {
+        self.roots.weak_set_data.borrow().get(&id).cloned()
+    }
+
+    /// The [[IteratedMap]] record of `id`, when the object is a Map iterator.
+    pub fn map_iter_record(&self, id: u64) -> Option<Rc<RefCell<IterRecord>>> {
+        self.roots.map_iter_data.borrow().get(&id).cloned()
+    }
+
+    /// The [[IteratedSet]] record of `id`, when the object is a Set iterator.
+    pub fn set_iter_record(&self, id: u64) -> Option<Rc<RefCell<IterRecord>>> {
+        self.roots.set_iter_data.borrow().get(&id).cloned()
+    }
+
+    /// A snapshot of a Map's [[MapData]]. The set-methods and the iterators
+    /// read the list this way: no user code runs between the read and the
+    /// use, so nothing needs the collection's guard held.
+    pub fn map_entries(&self, id: u64) -> Option<Vec<MapEntry>> {
+        Some(self.map_collection(id)?.borrow().entries.clone())
+    }
+
+    /// A snapshot of a Set's [[SetData]]; see [`map_entries`](Self::map_entries).
+    pub fn set_entries(&self, id: u64) -> Option<Vec<SetEntry>> {
+        Some(self.set_collection(id)?.borrow().entries.clone())
+    }
+
+    pub fn has_map(&self, id: u64) -> bool {
+        self.roots.map_data.borrow().contains_key(&id)
+    }
+
+    pub fn has_set(&self, id: u64) -> bool {
+        self.roots.set_data.borrow().contains_key(&id)
+    }
+
+    /// Whether `id` is a registered Map iterator. A predicate of its own
+    /// because the record accessor hands out the record itself.
+    pub fn has_map_iter(&self, id: u64) -> bool {
+        self.roots.map_iter_data.borrow().contains_key(&id)
+    }
+
+    /// Whether `id` is a registered Set iterator.
+    pub fn has_set_iter(&self, id: u64) -> bool {
+        self.roots.set_iter_data.borrow().contains_key(&id)
+    }
+
+    /// The brand predicates for the per-object state tables: a value is a
+    /// `DataView`, a Date, a RegExp … exactly when its object identity has a
+    /// record in that table. The ones whose tables have not moved into
+    /// [`AgentRoots`] read the field directly.
+    pub fn has_data_view(&self, id: u64) -> bool {
+        self.dataview_data.contains_key(&id)
+    }
+
+    pub fn has_date(&self, id: u64) -> bool {
+        self.date_data.contains_key(&id)
+    }
+
+    pub fn has_regexp(&self, id: u64) -> bool {
+        self.regexp_data.contains_key(&id)
+    }
+
+    pub fn has_boolean(&self, id: u64) -> bool {
+        self.boolean_data.contains_key(&id)
+    }
+
+    pub fn has_number(&self, id: u64) -> bool {
+        self.number_data.contains_key(&id)
+    }
+
+    pub fn has_symbol(&self, id: u64) -> bool {
+        self.symbol_data.contains_key(&id)
+    }
+
+    pub fn has_bigint(&self, id: u64) -> bool {
+        self.bigint_data.contains_key(&id)
+    }
+
+    pub fn has_weak_map(&self, id: u64) -> bool {
+        self.roots.weak_map_data.borrow().contains_key(&id)
+    }
+
+    pub fn has_weak_set(&self, id: u64) -> bool {
+        self.roots.weak_set_data.borrow().contains_key(&id)
+    }
+
+    pub(crate) fn register_map(&self, id: u64, entries: MapCollection) {
+        self.roots
+            .map_data
+            .borrow_mut()
+            .insert(id, Rc::new(RefCell::new(entries)));
+    }
+
+    pub(crate) fn register_set(&self, id: u64, entries: SetCollection) {
+        self.roots
+            .set_data
+            .borrow_mut()
+            .insert(id, Rc::new(RefCell::new(entries)));
+    }
+
+    pub(crate) fn register_weak_map(&self, id: u64, entries: Vec<MapEntry>) {
+        self.roots
+            .weak_map_data
+            .borrow_mut()
+            .insert(id, Rc::new(RefCell::new(entries)));
+    }
+
+    pub(crate) fn register_weak_set(&self, id: u64, entries: Vec<SetEntry>) {
+        self.roots
+            .weak_set_data
+            .borrow_mut()
+            .insert(id, Rc::new(RefCell::new(entries)));
+    }
+
+    pub(crate) fn register_map_iter(&self, id: u64, record: IterRecord) {
+        self.roots
+            .map_iter_data
+            .borrow_mut()
+            .insert(id, Rc::new(RefCell::new(record)));
+    }
+
+    pub(crate) fn register_set_iter(&self, id: u64, record: IterRecord) {
+        self.roots
+            .set_iter_data
+            .borrow_mut()
+            .insert(id, Rc::new(RefCell::new(record)));
     }
 
     /// The leaf-inline record for `id` (Cut 34): a direct-mapped cache over
@@ -2587,53 +2810,6 @@ impl Agent {
         // existed, which is why this line is newer than the table.
         self.buffer_data.trace(visit);
         self.raw_json_data.trace(visit);
-        self.map_data.trace(visit);
-        self.set_data.trace(visit);
-        // GC-3: WeakMap/WeakSet entries are ephemerons — the key (and thus
-        // the entry) lives only while it is reachable from other roots, and
-        // the value lives only while its key does. Register the edges for
-        // the collector's fixpoint instead of tracing them strongly; the
-        // post-collection compaction drops entries whose key was swept.
-        for cell in self.weak_map_data.values() {
-            let Ok(data) = cell.try_borrow() else {
-                crux::heap::note_aborted_trace();
-                return;
-            };
-            for entry in data.iter().flatten() {
-                let Some(key) = value_box_addr(&entry.0) else {
-                    continue;
-                };
-                let value = value_box_addr(&entry.1).unwrap_or(key);
-                crux::heap::note_ephemeron(key, value);
-            }
-        }
-        for cell in self.weak_set_data.values() {
-            let Ok(data) = cell.try_borrow() else {
-                crux::heap::note_aborted_trace();
-                return;
-            };
-            for element in data.iter().flatten() {
-                if let Some(element) = value_box_addr(element) {
-                    crux::heap::note_ephemeron(element, element);
-                }
-            }
-        }
-        for iter_data in self.map_iter_data.values() {
-            let Ok(guard) = iter_data.try_borrow() else {
-                crux::heap::note_aborted_trace();
-                return;
-            };
-            let (value, _, _) = &*guard;
-            value.trace(visit);
-        }
-        for iter_data in self.set_iter_data.values() {
-            let Ok(guard) = iter_data.try_borrow() else {
-                crux::heap::note_aborted_trace();
-                return;
-            };
-            let (value, _, _) = &*guard;
-            value.trace(visit);
-        }
         // GC-2: the Vms currently running bodies (their heap-buffered value
         // stacks are invisible to the conservative stack scan). Pooled and
         // suspended Vms are covered by `vm_pool` and the generator/async
@@ -2905,8 +3081,8 @@ impl Agent {
     /// (the tables are read-only here) defaults to `true`: the precise pass
     /// is harmless when the tables are empty.
     fn has_weak_structures(&self) -> bool {
-        !self.weak_map_data.is_empty()
-            || !self.weak_set_data.is_empty()
+        !self.roots.weak_map_data.borrow().is_empty()
+            || !self.roots.weak_set_data.borrow().is_empty()
             || !self.finalization_registries.is_empty()
             || self
                 .stack_traces
@@ -2940,7 +3116,7 @@ impl Agent {
         self.stack_traces
             .borrow_mut()
             .retain(|address, _| !is_dead(*address));
-        for cell in self.weak_map_data.values() {
+        for cell in self.roots.weak_map_data.borrow().values() {
             let mut data = cell.borrow_mut();
             data.retain(|entry| match entry {
                 Some((key, _)) => match value_box_addr(key) {
@@ -2951,7 +3127,7 @@ impl Agent {
                 None => false,
             });
         }
-        for cell in self.weak_set_data.values() {
+        for cell in self.roots.weak_set_data.borrow().values() {
             let mut data = cell.borrow_mut();
             data.retain(|entry| match entry {
                 Some(element) => match value_box_addr(element) {

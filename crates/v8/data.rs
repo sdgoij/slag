@@ -529,26 +529,26 @@ macro_rules! table_predicates {
     ($($name:ident => $table:ident),* $(,)?) => {
         $(
             pub(crate) fn $name(value: &api::Local) -> bool {
-                in_table(value, |agent, id| agent.$table.contains_key(&id))
+                in_table(value, |agent, id| agent.$table(id))
             }
         )*
     };
 }
 
 table_predicates! {
-    is_data_view => dataview_data,
-    is_map => map_data,
-    is_set => set_data,
-    is_weak_map => weak_map_data,
-    is_weak_set => weak_set_data,
-    is_map_iterator => map_iter_data,
-    is_set_iterator => set_iter_data,
-    is_date => date_data,
-    is_reg_exp => regexp_data,
-    is_boolean_object => boolean_data,
-    is_number_object => number_data,
-    is_symbol_object => symbol_data,
-    is_big_int_object => bigint_data,
+    is_data_view => has_data_view,
+    is_map => has_map,
+    is_set => has_set,
+    is_weak_map => has_weak_map,
+    is_weak_set => has_weak_set,
+    is_map_iterator => has_map_iter,
+    is_set_iterator => has_set_iter,
+    is_date => has_date,
+    is_reg_exp => has_regexp,
+    is_boolean_object => has_boolean,
+    is_number_object => has_number,
+    is_symbol_object => has_symbol,
+    is_big_int_object => has_bigint,
 }
 
 /// The two buffer kinds share one table, so the `SharedArrayBuffer` flag in the
