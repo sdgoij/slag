@@ -1884,6 +1884,18 @@ mod tests {
         }
     }
 
+    /// The pattern parser recurses, so its nesting is bounded by the host's
+    /// stack probe as well as the count: a hostile pattern has to be a
+    /// catchable `SyntaxError`, never an abort.
+    #[test]
+    fn deeply_nested_character_classes_are_refused_not_overflowed() {
+        let source = format!("new RegExp('{}a{}', 'v')", "[".repeat(900), "]".repeat(900));
+        assert!(matches!(
+            run(&source),
+            Err(e) if e.kind == ErrorKind::SyntaxError
+        ));
+    }
+
     fn number(source: &str) -> f64 {
         match run(source).unwrap().kind() {
             ValueKind::Number(n) => n,

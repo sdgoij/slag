@@ -6,6 +6,9 @@ use std::collections::{HashMap, HashSet};
 
 use crate::{CharClass, Error, Flags, Node, Predicate, Regex};
 
+/// The maximum group/class nesting. The pattern parser is a recursive descent,
+/// so this is a ceiling only: a frame count cannot bound a stack whose frame
+/// cost depends on the build profile, which is what [`stackprobe`] answers.
 const MAX_DEPTH: usize = 200;
 
 /// A "character" of the pattern: a code point in unicode mode, otherwise a
@@ -152,7 +155,7 @@ impl<'a> Parser<'a> {
 
     fn push_depth(&mut self) -> Result<(), Error> {
         self.depth += 1;
-        if self.depth > MAX_DEPTH {
+        if self.depth > MAX_DEPTH || !stackprobe::has_headroom() {
             return Err(self.error("Regular expression too deeply nested"));
         }
         Ok(())

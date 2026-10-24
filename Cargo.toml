@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/unicode",
     "crates/byteblock",
+    "crates/stackprobe",
     "crates/crux",
     "crates/syntax",
     "crates/lexer",
@@ -29,6 +30,7 @@ members = [
 default-members = [
     "crates/unicode",
     "crates/byteblock",
+    "crates/stackprobe",
     "crates/crux",
     "crates/syntax",
     "crates/lexer",

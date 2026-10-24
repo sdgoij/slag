@@ -352,18 +352,19 @@ with `STATUS_STACK_OVERFLOW` in `crux`'s 2000-deep proxy chain, the parser's
 none of the H-1 sites were actually crash-free in a debug build, and the parser
 could not even hold ~20 levels of legitimate nesting on a 1 MiB main thread.
 
-The bound is now the host's: `crux::stack` carries a probe (installed by
-`runtime::stack::install_probe`, which `Agent::new` and the CLI both call) and
-`has_headroom` answers from the thread's real watermark — the same reserve
-`enter_js` uses. The parser, `enter_forward`, `flat` and both JSON recursions
-consult it; each keeps its count as a ceiling. A context with no probe (the
-parser's own tests, a crate-only host) falls back to what it can measure: the
-parser records the stack it started with and refuses past a budget sized by
-profile. The headless CLI runs on a 16 MiB thread, so the guard no longer
-refuses nesting the default stack merely could not hold. `regexp`'s nested
-class parser is the one H-1 site still on a count alone; its frames are small
-enough that 190 nested classes parse on a 2 MiB debug thread and the count
-refuses before the stack does.
+The bound is now the host's: `stackprobe` (a leaf crate, so `crux`, `parser`
+and `regexp` can all reach it without depending on each other) carries a probe,
+installed by `runtime::stack::install_probe` — which `Agent::new` and the CLI
+both call — and `has_headroom` answers from the thread's real watermark, the
+same reserve `enter_js` uses. The parser, `enter_forward`, `flat`, both JSON
+recursions and `regexp`'s group/class descent consult it; each keeps its count
+as a ceiling. A context with no probe (a crate's own tests, a host that installs
+none) falls back to what it can measure: the parser records the stack it started
+with and refuses past a budget sized by profile. The headless CLI runs on a
+16 MiB thread, so the guard no longer refuses nesting the default stack merely
+could not hold. `regexp`'s frames are small enough that 190 nested `/v` classes
+parse on a 2 MiB debug thread while 200 is refused, so its count still binds
+first there — the probe covers the case where it would not.
 
 ### H-2 — RegExp has no step budget; quantifier bounds are unbounded (reproduced)
 

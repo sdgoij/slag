@@ -6,6 +6,9 @@ license.workspace = true
 
 [dependencies]
 unicode = { path = "../unicode" }
+# The host's native-stack probe: the parser's descent is bounded by it (see
+# `stackprobe`'s docs for why a nesting count cannot bound the stack).
+stackprobe = { path = "../stackprobe" }
 
 [build-dependencies]
 unicode = { path = "../unicode" }

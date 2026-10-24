@@ -453,6 +453,23 @@ mod tests {
         Flags::parse(&flags.encode_utf16().collect::<Vec<u16>>()).unwrap()
     }
 
+    /// The parser asks the host's stack probe before descending, so a thread out
+    /// of stack refuses even a shallow group instead of overflowing. The probe
+    /// is process-global, so what it reads here is thread-local: a test running
+    /// beside this one still sees headroom.
+    #[test]
+    fn a_host_probe_without_headroom_refuses_the_pattern() {
+        thread_local! {
+            static NO_HEADROOM: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        }
+        stackprobe::install_probe(|| !NO_HEADROOM.with(|flag| flag.get()));
+        NO_HEADROOM.with(|flag| flag.set(true));
+        let refused = compile(&"(a)".encode_utf16().collect::<Vec<u16>>(), f(""));
+        NO_HEADROOM.with(|flag| flag.set(false));
+        let error = refused.expect_err("a parse with no stack headroom is refused");
+        assert!(error.to_string().contains("too deeply nested"), "{error}");
+    }
+
     #[test]
     fn flags_parse_and_reject() {
         let flags = f("gim");
