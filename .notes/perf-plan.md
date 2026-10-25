@@ -21,6 +21,13 @@ The README's published `12.22x` predates both this audit and the optimization
 work that came before it. Today's number is **10.76x JIT / 3.88x interpreter**,
 so the audit cost a few percent of a much larger, already-banked gain.
 
+**Update (2026-10-25, `ee72c0b8`)**: the corpus now reads **10.54x JIT /
+3.76x interpreter** (medians of three interleaved rounds), so the audit's JIT
+cost has been recovered and the interpreter loss is within 2% of the pre-audit
+figure; the recovery came from the leaf-cache and closure work recorded in
+`.notes/perf.md` (P1's remaining items were closed as NULLs). `README.md`
+carries the refreshed per-family and per-row tables.
+
 By family (corpus, medians of three runs; `+` is a wider gap):
 
 | family | JIT gap | interpreter gap |

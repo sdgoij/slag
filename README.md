@@ -468,45 +468,46 @@ Gap = Slag ms / V8 ms, so > 1 means V8 was faster:
 
 | Family | Workloads | JIT gap | Interpreter gap |
 |---|---|---|---|
-| arrays | 6 | 10.33x | 3.86x |
-| builtins | 5 | 7.41x | 4.20x |
-| calls | 6 | 10.92x | 5.16x |
-| control | 5 | 12.56x | 3.79x |
-| globals | 4 | 2.19x | 0.85x |
-| language | 3 | 6.50x | 5.83x |
-| objects | 7 | 9.22x | 2.64x |
-| opcost | 36 | 12.64x | 3.91x |
-| strings | 5 | 9.35x | 4.63x |
-| **All** | **77** | **10.76x** | **3.88x** |
+| arrays | 6 | 9.96x | 3.66x |
+| builtins | 5 | 7.84x | 4.33x |
+| calls | 6 | 9.57x | 5.36x |
+| control | 5 | 12.59x | 3.44x |
+| globals | 4 | 2.19x | 0.87x |
+| language | 3 | 6.09x | 5.40x |
+| objects | 7 | 9.36x | 2.62x |
+| opcost | 36 | 12.46x | 3.82x |
+| strings | 5 | 9.63x | 4.85x |
+| **All** | **77** | **10.54x** | **3.76x** |
 
-Measured 2026-10-25 at `8bc1f77b`, medians of three interleaved corpus rounds.
-The same corpus at the commit before the security audit (`883af3dd`) reads
-10.40x / 3.69x, so the audit cost ~3.5% on the JIT side and ~5% on the
-interpreter side — the JIT damage is concentrated in four callback and closure
-rows (up to +20% each) and comes from the roots indirection the aliasing work
-added to the call lane, not from new work. `.notes/perf-plan.md` records the
-measurement, the two commits the bisect blames, and the recovery plan.
+Measured 2026-10-25 at `ee72c0b8`, medians over three interleaved corpus rounds
+(host load moved one round's overall gap by ~20%, so the medians, not any single
+round, are the measurement). The commit before the security audit `883af3dd`
+reads 10.40x / 3.69x, and the audit-era measurement here was 10.76x / 3.88x; the
+recovery since then took `calls` from 10.92x to 9.57x and `language` from 6.50x
+to 6.09x, while `builtins` and `strings` drifted slightly the other way — both
+inside this host's noise. `.notes/perf-plan.md` records the measurements and
+`.notes/perf.md` the landed changes.
 
 A sample of the per-workload rows (the command above prints all 77), ms per
 `bench()` call:
 
 | Workload | Slag JIT | Slag interp | V8 JIT | V8 `--jitless` | JIT gap | Interp gap |
 |---|---|---|---|---|---|---|
-| `arrays/for_of_dense.js` | 7.8 | 55.6 | 1.8 | 62.2 | 4.33x | 0.89x |
-| `arrays/typed_array.js` | 17.2 | 171.2 | 1.1 | 40.9 | 15.64x | 4.19x |
-| `builtins/json_roundtrip.js` | 53.6 | 54.4 | 13.0 | 15.6 | 4.12x | 3.49x |
-| `builtins/math_intrinsics.js` | 9.8 | 66.2 | 151.1 | 180.3 | 0.06x | 0.37x |
-| `calls/direct_leaf.js` | 11.9 | 79.2 | 1.2 | 38.5 | 9.92x | 2.06x |
-| `calls/recursive_fib.js` | 48.5 | 510.1 | 7.9 | 38.9 | 6.14x | 13.11x |
-| `control/generator_loop.js` | 35.3 | 48.1 | 2.3 | 9.9 | 15.35x | 4.86x |
-| `globals/declarative_read.js` | 2.4 | 19.7 | 0.6 | 13.1 | 4.00x | 1.50x |
-| `globals/hoisted_local.js` | 2.5 | 19.6 | 0.6 | 12.2 | 4.17x | 1.61x |
-| `globals/nested_read.js` | 2.4 | 19.3 | 91.3 | 100.8 | 0.03x | 0.19x |
-| `globals/object_read.js` | 2.4 | 19.7 | 87.4 | 95.3 | 0.03x | 0.21x |
-| `objects/destructure.js` | 3.6 | 172.7 | 0.8 | 51.4 | 4.50x | 3.36x |
-| `objects/own_read.js` | 2.9 | 36.2 | 1.2 | 54.5 | 2.42x | 0.66x |
-| `objects/warm_store.js` | 34.6 | 121.5 | 2.3 | 53.6 | 15.04x | 2.27x |
-| `strings/char_ops.js` | 3.2 | 21.9 | 0.4 | 5.8 | 8.00x | 3.78x |
+| `arrays/for_of_dense.js` | 7.8 | 58.2 | 1.9 | 66.3 | 4.15x | 0.90x |
+| `arrays/typed_array.js` | 17.3 | 164.7 | 1.1 | 45.5 | 15.93x | 3.47x |
+| `builtins/json_roundtrip.js` | 55.1 | 57.4 | 13.1 | 15.9 | 4.20x | 3.49x |
+| `builtins/math_intrinsics.js` | 9.9 | 69.5 | 152.2 | 182.3 | 0.07x | 0.38x |
+| `calls/direct_leaf.js` | 12.0 | 82.2 | 1.1 | 39.5 | 10.47x | 2.09x |
+| `calls/recursive_fib.js` | 49.0 | 511.0 | 7.3 | 39.8 | 6.79x | 12.57x |
+| `control/generator_loop.js` | 35.4 | 49.7 | 2.3 | 10.7 | 15.15x | 4.63x |
+| `globals/declarative_read.js` | 2.4 | 19.9 | 0.6 | 13.8 | 4.28x | 1.44x |
+| `globals/hoisted_local.js` | 2.5 | 20.2 | 0.6 | 13.1 | 4.45x | 1.53x |
+| `globals/nested_read.js` | 2.5 | 19.7 | 90.1 | 107.1 | 0.03x | 0.18x |
+| `globals/object_read.js` | 2.4 | 20.1 | 86.1 | 96.5 | 0.03x | 0.21x |
+| `objects/destructure.js` | 3.7 | 168.7 | 0.8 | 49.8 | 4.85x | 3.39x |
+| `objects/own_read.js` | 3.0 | 38.7 | 1.2 | 51.4 | 2.39x | 0.75x |
+| `objects/warm_store.js` | 35.6 | 124.0 | 2.3 | 53.2 | 15.54x | 2.33x |
+| `strings/char_ops.js` | 3.3 | 23.7 | 0.4 | 5.7 | 8.67x | 4.10x |
 
 The `globals` family is the one family that is a controlled experiment rather
 than a workload: the same loop reading the same value as a top-level `const`
