@@ -27405,23 +27405,21 @@ fn collect_expr_captures(
             closure_arrow_allows(params, body, bindings, captured, false)
         }
         ExprKind::Object(object) => object.props.iter().all(|prop| match prop {
-            ObjectProperty::Method { function, .. } => {
-                closure_allows(&function.params, &function.body.stmts, bindings, captured)
+            ObjectProperty::Method { key, function } => {
+                key_captures(key, bindings, captured)
+                    && closure_allows(&function.params, &function.body.stmts, bindings, captured)
             }
-            ObjectProperty::Get { body, .. } => {
-                closure_allows(&[], &body.stmts, bindings, captured)
+            ObjectProperty::Get { key, body, .. } => {
+                key_captures(key, bindings, captured)
+                    && closure_allows(&[], &body.stmts, bindings, captured)
             }
-            ObjectProperty::Set { body, .. } => {
-                closure_allows(&[], &body.stmts, bindings, captured)
+            ObjectProperty::Set { key, body, .. } => {
+                key_captures(key, bindings, captured)
+                    && closure_allows(&[], &body.stmts, bindings, captured)
             }
             ObjectProperty::Init { key, value, .. } => {
-                let key_ok = match key {
-                    PropertyName::Ident(_) | PropertyName::Str(_) | PropertyName::Number(_) => true,
-                    PropertyName::Computed(key_expr) => {
-                        collect_expr_captures(key_expr, bindings, captured)
-                    }
-                };
-                key_ok && collect_expr_captures(value, bindings, captured)
+                key_captures(key, bindings, captured)
+                    && collect_expr_captures(value, bindings, captured)
             }
             ObjectProperty::Spread(e) => collect_expr_captures(e, bindings, captured),
         }),
@@ -27514,6 +27512,23 @@ fn collect_expr_captures(
         | ExprKind::PrivateIn { .. }
         | ExprKind::MetaProperty { .. }
         | ExprKind::ImportCall { .. } => true,
+    }
+}
+
+/// A computed property key is the enclosing code's expression (it is
+/// evaluated where the object literal is, not inside a method/accessor
+/// body), so it walks like any other expression of that code — a closure it
+/// contains captures the enclosing body's bindings. Non-computed keys are
+/// not references. Mirrors the main scan's [`FastScopeScan::property_name`]
+/// (the prepass and main scan must agree on the capture set).
+fn key_captures(
+    key: &PropertyName,
+    bindings: &HashSet<crux::AtomId>,
+    captured: &mut HashSet<crux::AtomId>,
+) -> bool {
+    match key {
+        PropertyName::Ident(_) | PropertyName::Str(_) | PropertyName::Number(_) => true,
+        PropertyName::Computed(e) => collect_expr_captures(e, bindings, captured),
     }
 }
 
@@ -28128,6 +28143,15 @@ impl FastScopeScan {
                 update,
                 body,
             } => {
+                // A `using`/`await using` head registers a disposable
+                // resource and binds immutably (spec 15.14.2), which the
+                // certified frame slot has no machinery for — the env path
+                // owns it. Matches the for-in/for-of head rejection below.
+                if let Some(ForInit::VarDecl { kind, .. }) = init
+                    && matches!(*kind, VarDeclKind::Using | VarDeclKind::AwaitUsing)
+                {
+                    return false;
+                }
                 // A lexical for-head binding is scoped to the for statement
                 // itself (its head exprs and body): a reference at the same
                 // depth after the loop would leak the flat slot, so the
@@ -28792,9 +28816,28 @@ impl FastScopeScan {
                 ArrayElement::Expr(expr) | ArrayElement::Spread(expr) => self.expr(expr, depth),
             }),
             ExprKind::Object(object) => object.props.iter().all(|prop| match prop {
-                ObjectProperty::Method { .. }
-                | ObjectProperty::Get { .. }
-                | ObjectProperty::Set { .. } => false,
+                // A method/getter/setter is a closure, like a function value
+                // in an `Init`: it can capture a body binding (recorded via
+                // `closure_allows`) and its computed key is an expression.
+                // `closure_allows` still rejects `super`/`eval`/`with` inside
+                // it, so a home-object method keeps the body on the env path.
+                ObjectProperty::Method { key, function } => {
+                    self.property_name(key, depth)
+                        && closure_allows(
+                            &function.params,
+                            &function.body.stmts,
+                            &self.bindings,
+                            &mut self.captured,
+                        )
+                }
+                ObjectProperty::Get { key, body, .. } => {
+                    self.property_name(key, depth)
+                        && closure_allows(&[], &body.stmts, &self.bindings, &mut self.captured)
+                }
+                ObjectProperty::Set { key, body, .. } => {
+                    self.property_name(key, depth)
+                        && closure_allows(&[], &body.stmts, &self.bindings, &mut self.captured)
+                }
                 ObjectProperty::Init { key, value, .. } => {
                     self.property_name(key, depth) && self.expr(value, depth)
                 }
