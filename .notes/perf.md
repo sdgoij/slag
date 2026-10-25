@@ -16078,3 +16078,24 @@ A 15-round alternating A/B against the R2 binary, with an A/A control (the R2 bi
 The control's own 4% median spread on `cb_nonleaf` is larger than the effect, so the median column resolves nothing; the min-based comparison is the usable one, and its floor is ~1%. Against that floor the restructured version (fields read in place under one plain borrow — no closure, no `Option<tuple>` return, which the first shape paid for) is -0.3% / -0.6%, i.e. flat, and the `--bench` suite measured every row inside +/-2% min (`construct churn` +0.8%, `function calls` -0.1%, `closure capture` -1.0%).
 
 So the cost is not the guard: `Ref::filter_map` on a `Ref` that is about to be dropped is a few instructions on a 77-345 ns call. The useful part of this attempt is the floor itself — an A/A control is mandatory before reading a 2-4% delta on this machine, and `cb_nonleaf`'s ~345 ns/element is where the callback lane's money is (the leaf callback row is ~260 ns/element), not in the record read. Profiling that lane is the next step, not more indirection work.
+
+## LANDED (2026-10-25): the leaf cache caches the negative verdict — the non-leaf callback lane's per-element record lookup
+
+The callback lane the corpus never shows: `Array.prototype.forEach` with a callback that is *not* a certified leaf (`sink += helper(x)`), so `call_callback` -> `try_fast_call` -> `try_leaf_call` misses and the general `function::call` runs. On 8 elements × 100k rounds that is ~334 ns/element against ~130 for the leaf callback. Instrumenting the lanes (temporary `SLAG_LANE_STATS` counters, removed) showed the miss path re-did `ecma_functions.get` — a pooled `Rc` deref, a `RefCell` borrow and an id hash — on **every element**, because `leaf_lookup` only cached positive records.
+
+The fix is the negative verdict the embedding notes named: the cache cell is now `LeafCacheCell::{Empty, NotLeaf(id), Leaf(entry)}`. A record whose `leaf_inline` is false fills `NotLeaf`, and the next probe answers from the cell. Soundness is registration order, not generation: `leaf_inline` is written once by `set_compiled`, which runs before `register_ecma_function` inserts the record, ids are never reused, and `reap_dead_functions` clears the cell (both variants) with the record. An absent record is still not cached — only an existing record's verdict is.
+
+Measured on the lane itself (7 probes × 15 alternating rounds, medians and mins, against the R2 binary; A/A control on the same probes: −4.1% median / −0.9% min on the noisiest row):
+
+| probe | before (min) | after (min) | change |
+| --- | ---: | ---: | ---: |
+| `p3` callback calls a global (`sink += helper(x)`) | 263.192 ms | **226.109 ms** | **-14.1%** |
+| `p4` same, no capture | 250.232 ms | **209.189 ms** | **-16.4%** |
+| `captured_call` callback calls a captured local closure | 256.879 ms | **216.532 ms** | **-15.7%** |
+| `member_call` callback calls `Math.abs` | 289.242 ms | **249.468 ms** | **-13.8%** |
+| `global_read` callback reads a global, no call | 259.588 ms | **218.927 ms** | **-15.7%** |
+| `p2` leaf callback (control) | 100.672 ms | **101.023 ms** | +0.3% |
+
+Results are identical on every probe (4400000 / 3600000 / 13200000), so this is not a semantic shortcut. The corpus does not move — all 36 `opcost` and 6 `calls` rows are inside ±1.1% min except `json_stringify`, whose own A/A control (two copies of the same binary) spans +1.2% min / +5.1% median, i.e. the row is unmeasurable at this sample size. That is the point: no corpus row has a non-leaf callback, which is why the lane had never been priced.
+
+Gates: `cargo fmt --all -- --check`; `cargo clippy --workspace --all-targets -- -D warnings`; `cargo test --workspace` (0 failed); sweeps `language` 23,726 + `built-ins` 23,821 + `annexB` 1,086 + `intl402` 3,365 = 51,998 at 100%; `--gc-stress --gc-verify` on `language *for-in*` (153), `language *closure*` (23), `built-ins *Generator*` (157) 0 fail; corpus parity 0 (77 rows).

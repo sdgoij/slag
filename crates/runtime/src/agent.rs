@@ -414,10 +414,36 @@ impl crux::heap::Trace for ErrorStack {
 /// (strict, fast_script, jsx) — see [`AgentRoots::script_bodies`].
 pub(crate) type ScriptBodyKey = (crux::JsString, bool, bool, bool);
 
-/// One leaf-inline cache cell: the record body's hot path needs, or `None`.
-/// The payload is `Copy`, so the table is a `Cell` array and a hit costs no
-/// borrow flag (R2 in `.notes/perf-plan.md`).
-pub(crate) type LeafCacheCell = Option<crate::ir::LeafEntry>;
+/// One leaf-inline cache cell. The payload is `Copy`, so the table is a
+/// `Cell` array and a hit costs no borrow flag (R2 in `.notes/perf-plan.md`).
+///
+/// A record that is not leaf-inlineable caches [`LeafCacheCell::NotLeaf`]
+/// instead of staying empty: the `leaf_inline` verdict is fixed when the
+/// record is registered (its `ir` is set before the record is inserted) and
+/// function ids are never reused, so a negative never becomes a hit — it only
+/// saves the per-call record lookup the callback lane paid on every element
+/// (a callee that is not a leaf re-did `ecma_functions.get` each time). Only
+/// `reap_dead_functions` clears a cell.
+#[derive(Clone, Copy)]
+pub(crate) enum LeafCacheCell {
+    /// Never filled, or cleared with its function's record.
+    Empty,
+    /// The function has no leaf record (it is not leaf-inlineable).
+    NotLeaf(u64),
+    /// The resolved leaf record.
+    Leaf(crate::ir::LeafEntry),
+}
+
+impl LeafCacheCell {
+    /// The function id the cell was filled for, if any.
+    fn id(self) -> Option<u64> {
+        match self {
+            LeafCacheCell::Empty => None,
+            LeafCacheCell::NotLeaf(id) => Some(id),
+            LeafCacheCell::Leaf(entry) => Some(entry.id),
+        }
+    }
+}
 
 /// The agent's execution-context stack (spec 9.4).
 ///
@@ -1317,7 +1343,7 @@ impl AgentRoots {
             array_element_value_cells: Box::new(std::array::from_fn(|_| Cell::new(None))),
             global_leaf_cells: RefCell::new(Box::new(std::array::from_fn(|_| None))),
             slot_leaf_cells: RefCell::new(Box::new(std::array::from_fn(|_| None))),
-            leaf_cache: Box::new(std::array::from_fn(|_| Cell::new(None))),
+            leaf_cache: Box::new(std::array::from_fn(|_| Cell::new(LeafCacheCell::Empty))),
             member_value_cells: std::array::from_fn(|_| {
                 Cell::new(crate::ir::MemberValueCell::empty())
             }),
@@ -1520,7 +1546,7 @@ impl Trace for AgentRoots {
             cell.trace(visit);
         }
         for cell in self.leaf_cache.iter() {
-            if let Some(entry) = cell.get() {
+            if let LeafCacheCell::Leaf(entry) = cell.get() {
                 entry.trace(visit);
             }
         }
@@ -2854,13 +2880,16 @@ impl Agent {
     /// run (P1 R1): the caller already owns an `Rc<AgentRoots>` clone, so the
     /// hot callback lane skips reloading `agent.roots` here and reads the
     /// record from the `Cell` table directly (R2) rather than through a
-    /// `RefCell` borrow.
+    /// `RefCell` borrow. A negative verdict is cached too, so a callee that is
+    /// not a leaf costs one cell probe per call instead of a record lookup.
     pub(crate) fn leaf_lookup_in(roots: &AgentRoots, id: u64) -> Option<crate::ir::LeafEntry> {
         let index = id.wrapping_mul(0x9E37_79B9_7F4A_7C15) as usize & (crate::ir::LEAF_CACHE - 1);
-        if let Some(entry) = roots.leaf_cache[index].get()
-            && entry.id == id
-        {
-            return Some(entry);
+        let cached = roots.leaf_cache[index].get();
+        if cached.id() == Some(id) {
+            return match cached {
+                LeafCacheCell::Leaf(entry) => Some(entry),
+                _ => None,
+            };
         }
         // The record guard stays inside this block: the cache write below is
         // an allocation-free store, but a guard is never worth extending.
@@ -2868,6 +2897,7 @@ impl Agent {
             let table = roots.ecma_functions.borrow();
             let data = table.get(&id)?;
             if !data.leaf_inline {
+                roots.leaf_cache[index].set(LeafCacheCell::NotLeaf(id));
                 return None;
             }
             // The body itself stays owned by `AgentRoots::compiled_bodies`
@@ -2896,7 +2926,7 @@ impl Agent {
             // so the construct-inline verdict rides along.
             construct_inline,
         };
-        roots.leaf_cache[index].set(Some(entry));
+        roots.leaf_cache[index].set(LeafCacheCell::Leaf(entry));
         Some(entry)
     }
 
@@ -3744,10 +3774,8 @@ impl Agent {
             let index =
                 id.wrapping_mul(0x9E37_79B9_7F4A_7C15) as usize & (crate::ir::LEAF_CACHE - 1);
             let cell = &self.roots.leaf_cache[index];
-            if let Some(cached) = cell.get()
-                && cached.id == id
-            {
-                cell.set(None);
+            if cell.get().id() == Some(id) {
+                cell.set(LeafCacheCell::Empty);
             }
         }
     }
