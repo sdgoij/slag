@@ -226,8 +226,9 @@ frontier.
 5. **Creation-site source texts** — **DONE** (2026-10-25): the resolution moved
    from per closure to per site, `e7` 92.3 -> 78.0 ms and the row -7.1%. `e7` is
    now under the closure plan's 85 ms stop rule, so **Stage D is unblocked** for
-   a session that wants the arena-allocated record. `FunctionDeclInit` still
-   resolves per creation.
+   a session that wants the arena-allocated record. `FunctionDeclInit` landed the
+   same cell afterwards (-13.9% on a body-level declaration, which instantiates
+   per call), so every step-based creation path now resolves per site.
 5. **Object-literal named evaluation**: **DONE** (2026-10-25, `ca4ee26c`).
 6. **Call lanes**: a member call to a closure created in the same iteration costs
    ~350 ns (the for-in row's asserts are three of them per body). This is the

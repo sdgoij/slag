@@ -3976,17 +3976,27 @@ extern "C" fn create_function_decl(ctx: *mut c_void, step: u64) -> u64 {
         context_slot,
         outer_chain,
         per_iteration_chain,
+        source,
         ..
     }) = step_at(ctx, step)
     else {
         unreachable!("create_function_decl on a non-FunctionDeclInit step");
     };
+    // The site's source texts: resolved once, then a refcount bump.
+    let source = crate::function::site_source_info(
+        agent,
+        source,
+        function.as_ref() as *const syntax::ast::Function as usize,
+        function.span,
+    );
     let env = vm.lexical_env;
-    let value = match crate::function::instantiate_function(
+    let value = match crate::function::instantiate_function_with_resolved_source(
         agent,
         function,
         env,
         vm.strict,
+        None,
+        source,
         outer_chain.clone(),
         per_iteration_chain.clone(),
         false,

@@ -16365,3 +16365,19 @@ Measured with two binaries, alternating order, 7 rounds, mins:
 `e7` is now **below** the 85 ms stop rule in `.notes/closure-cost-plan.md` (77.97), so that plan's arena-record stage (Stage D) is no longer blocked by it — a later session can re-open it. `Function.prototype.toString` and error stacks were diffed against node for anonymous, named, and block-bodied closures and arrows created in a loop.
 
 Gates: `cargo fmt --all -- --check`; `cargo clippy --workspace --all-targets -- -D warnings`; `cargo test --workspace` (40 suites, 0 failed); sweeps 51,998 at 100%; corpus parity 0. The corpus's own gap is not measurable on this host right now — four consecutive runs of the same binary read 7.43 / 12.67 / 10.63 / 10.73 — so `README.md` keeps its three-round medians (10.54x / 3.76x) and these landings are recorded by the interleaved probe A/Bs above.
+
+## LANDED (2026-10-25): a function declaration reuses its site's source texts too
+
+The `Step::CreateFunction`/`CreateArrow` source cell left one creation path on the old per-creation resolution: `Step::FunctionDeclInit`, which is the hot one for declarations — a body-level `function inner() {}` instantiates its closure on **every call** of the enclosing body, so the enclosing-text walk and the slice hash ran per call.
+
+The variant now carries the same `OnceCell<Option<Rc<SourceInfo>>>`, filled at the three emit sites (a block-level declaration, a statement-position one, and the hoisted body-level one) and read by both the interpreter arm and the JIT's `create_function_decl`; those go through `instantiate_function_with_resolved_source`, which already existed. That completes the pattern — every step-based creation path resolves once per site.
+
+Two binaries, alternating order, 7 rounds, mins (100k calls each):
+
+| probe | before | after | min |
+| --- | ---: | ---: | ---: |
+| body-level declaration | 37.64 ms | **32.41** | **-13.9%** |
+| the same, the closure used twice | 38.66 | **32.58** | -15.7% |
+| function expression (control, resolved per site already) | 32.53 | 31.86 | -2.1% (noise) |
+
+Gates: `cargo fmt --all -- --check`; `cargo clippy --workspace --all-targets -- -D warnings`; `cargo test --workspace` (40 suites, 0 failed); sweeps `language` 23,726 + `built-ins` 23,821 + `annexB` 1,086 + `intl402` 3,365 = 51,998 at 100%; corpus parity 0 (77 rows, `mean-jitGap=10.74`, `mean-jlGap=3.81`).

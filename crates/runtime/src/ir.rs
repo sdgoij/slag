@@ -791,6 +791,10 @@ pub enum Step {
         /// [`Step::CreateFunction`]); the declaration instantiates at body
         /// entry, before this body's own loops start.
         per_iteration_chain: crate::function::PerIterationChain,
+        /// The site's source texts (see `Step::CreateFunction`). A body-level
+        /// declaration instantiates on every call, so without this the
+        /// resolution runs per call.
+        source: std::cell::OnceCell<Option<std::rc::Rc<crate::function::SourceInfo>>>,
     },
     /// Reset the statement-completion register to an empty completion (spec
     /// 6.2.2.3): the current statement's completion starts empty.
@@ -8386,6 +8390,7 @@ impl Vm {
                     context_slot,
                     outer_chain,
                     per_iteration_chain,
+                    source,
                     ..
                 } => {
                     // A certified body's hoisted top-level function
@@ -8396,11 +8401,19 @@ impl Vm {
                     // per-iteration chain (the loops inside this body have
                     // not started).
                     let env = agent.running_context()?.lexical_environment;
-                    let value = crate::function::instantiate_function(
+                    let source = crate::function::site_source_info(
+                        agent,
+                        source,
+                        function.as_ref() as *const syntax::ast::Function as usize,
+                        function.span,
+                    );
+                    let value = crate::function::instantiate_function_with_resolved_source(
                         agent,
                         function,
                         env,
                         self.strict,
+                        None,
+                        source,
                         outer_chain.clone(),
                         per_iteration_chain.clone(),
                         false,
@@ -18837,6 +18850,7 @@ impl Compiler {
                     context_slot: None,
                     outer_chain,
                     per_iteration_chain,
+                    source: std::cell::OnceCell::new(),
                 });
             }
             self.compile_statements(&block.stmts)?;
@@ -19318,6 +19332,7 @@ impl Compiler {
                             context_slot: entry.context_slot,
                             outer_chain,
                             per_iteration_chain,
+                            source: std::cell::OnceCell::new(),
                         });
                     }
                 } else if let Some((block_slot, var_slot)) = self.annex_b_copy_target(function) {
@@ -26724,6 +26739,7 @@ pub fn compile_body(
                     // before this body's own loops start, so it inherits
                     // only the enclosing chain.
                     per_iteration_chain: compiler.per_iteration_chain.clone(),
+                    source: std::cell::OnceCell::new(),
                 });
             }
         }
