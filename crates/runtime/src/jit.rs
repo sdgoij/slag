@@ -6503,25 +6503,15 @@ extern "C" fn resolve_super_ref_computed(ctx: *mut c_void, base: u64, key: u64) 
 /// Instantiate a fresh per-iteration env whose bindings copy `names` from
 /// `source`, hanging off `outer` (both env-creation steps share the copy;
 /// the caller decides the outer and whether the env joins the stack). The
-/// env is marked context-transparent so a certified body's closures resolve
-/// captures through the static context chain past it (the
+/// record is context-transparent by construction, so a certified body's
+/// closures resolve captures through the static context chain past it (the
 /// `EnterPerIteration`/`PerIteration` interpreter handlers do the same).
 fn per_iteration_env(
     names: &[crux::JsString],
     outer: crate::env::EnvRef,
     source: crate::env::EnvRef,
 ) -> Result<crate::env::EnvRef, JsError> {
-    let env = crate::env::new_declarative_environment(Some(outer));
-    for name in names {
-        let value = source.get_binding_value(name, false)?;
-        // Fresh env: one push instead of the create_mutable_binding
-        // duplicate scan + initialize_binding re-find.
-        env.push_initialized_binding(name, value)?;
-    }
-    if let crate::env::EnvRecord::Declarative(declarative) = &*env {
-        declarative.mark_context_transparent();
-    }
-    Ok(env)
+    crate::env::new_per_iteration_environment(Some(outer), names, &source)
 }
 
 extern "C" fn enter_per_iteration(ctx: *mut c_void, step: u64) -> u64 {

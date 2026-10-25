@@ -5,6 +5,7 @@
 //! ones), so `EnvRef` is an `Rc` and mutable state lives behind `RefCell`.
 
 use std::cell::{Cell, RefCell};
+use std::rc::Rc;
 
 use crux::error::{ErrorKind, JsError};
 use crux::handle::Handle;
@@ -23,6 +24,7 @@ pub type EnvRef = Handle<EnvRecord>;
 #[derive(Debug)]
 pub enum EnvRecord {
     Declarative(DeclarativeEnv),
+    PerIteration(PerIterationEnv),
     Object(ObjectEnv),
     Function(FunctionEnv),
     Global(GlobalEnv),
@@ -34,6 +36,7 @@ impl EnvRecord {
     pub fn outer(&self) -> Option<EnvRef> {
         match self {
             EnvRecord::Declarative(e) => e.outer,
+            EnvRecord::PerIteration(e) => e.outer,
             EnvRecord::Object(e) => e.outer,
             EnvRecord::Function(e) => e.declarative.outer,
             EnvRecord::Global(e) => e.declarative.outer,
@@ -65,6 +68,7 @@ impl EnvRecord {
     pub fn is_parameter_binding(&self, name: &JsString) -> bool {
         match self {
             EnvRecord::Declarative(e) => e.is_parameter(name),
+            EnvRecord::PerIteration(e) => e.is_parameter(name),
             EnvRecord::Function(e) => e.declarative.is_parameter(name),
             _ => false,
         }
@@ -75,6 +79,7 @@ impl EnvRecord {
     pub fn mark_parameter(&self, name: &JsString) {
         match self {
             EnvRecord::Declarative(e) => e.mark_parameter(name),
+            EnvRecord::PerIteration(e) => e.mark_parameter(name),
             EnvRecord::Function(e) => e.declarative.mark_parameter(name),
             _ => {}
         }
@@ -84,6 +89,7 @@ impl EnvRecord {
     pub fn has_binding(&self, name: &JsString) -> Result<bool, JsError> {
         match self {
             EnvRecord::Declarative(e) => Ok(e.has_binding(name)),
+            EnvRecord::PerIteration(e) => Ok(e.has_binding(name)),
             EnvRecord::Object(e) => e.has_binding(name),
             EnvRecord::Function(e) => Ok(e.declarative.has_binding(name)),
             EnvRecord::Global(e) => e.has_binding(name),
@@ -95,6 +101,7 @@ impl EnvRecord {
     pub fn create_mutable_binding(&self, name: &JsString, deletable: bool) -> Result<(), JsError> {
         match self {
             EnvRecord::Declarative(e) => e.create_mutable_binding(name, deletable),
+            EnvRecord::PerIteration(e) => e.create_mutable_binding(name, deletable),
             EnvRecord::Object(e) => e.create_mutable_binding(name, deletable),
             EnvRecord::Function(e) => e.declarative.create_mutable_binding(name, deletable),
             EnvRecord::Global(e) => e.create_mutable_binding(name, deletable),
@@ -106,6 +113,7 @@ impl EnvRecord {
     pub fn create_immutable_binding(&self, name: &JsString, strict: bool) -> Result<(), JsError> {
         match self {
             EnvRecord::Declarative(e) => e.create_immutable_binding(name, strict),
+            EnvRecord::PerIteration(e) => e.create_immutable_binding(name, strict),
             EnvRecord::Object(e) => e.create_immutable_binding(name, strict),
             EnvRecord::Function(e) => e.declarative.create_immutable_binding(name, strict),
             EnvRecord::Global(e) => e.create_immutable_binding(name, strict),
@@ -123,6 +131,10 @@ impl EnvRecord {
         crux::heap::write_barrier(self, value);
         match self {
             EnvRecord::Declarative(e) => {
+                e.push_initialized_binding(name, value);
+                Ok(())
+            }
+            EnvRecord::PerIteration(e) => {
                 e.push_initialized_binding(name, value);
                 Ok(())
             }
@@ -150,6 +162,7 @@ impl EnvRecord {
         crux::heap::write_barrier(self, value);
         match self {
             EnvRecord::Declarative(e) => e.initialize_binding(name, value),
+            EnvRecord::PerIteration(e) => e.initialize_binding(name, value),
             EnvRecord::Object(e) => e.initialize_binding(name, value),
             EnvRecord::Function(e) => e.declarative.initialize_binding(name, value),
             EnvRecord::Global(e) => e.initialize_binding(name, value),
@@ -167,6 +180,7 @@ impl EnvRecord {
         crux::heap::write_barrier(self, value);
         match self {
             EnvRecord::Declarative(e) => e.set_mutable_binding(name, value, strict),
+            EnvRecord::PerIteration(e) => e.set_mutable_binding(name, value, strict),
             EnvRecord::Object(e) => e.set_mutable_binding(name, value, strict),
             EnvRecord::Function(e) => e.declarative.set_mutable_binding(name, value, strict),
             EnvRecord::Global(e) => e.set_mutable_binding(name, value, strict),
@@ -183,6 +197,7 @@ impl EnvRecord {
         crux::heap::write_barrier(self, value);
         match self {
             EnvRecord::Declarative(e) => e.set_slot(index, value),
+            EnvRecord::PerIteration(e) => e.set_slot(index, value),
             EnvRecord::Function(e) => e.declarative.set_slot(index, value),
             EnvRecord::Global(e) => e.declarative.set_slot(index, value),
             EnvRecord::Module(e) => e.declarative.set_slot(index, value),
@@ -194,6 +209,7 @@ impl EnvRecord {
     pub fn get_binding_value(&self, name: &JsString, strict: bool) -> Result<Value, JsError> {
         match self {
             EnvRecord::Declarative(e) => e.get_binding_value(name, strict),
+            EnvRecord::PerIteration(e) => e.get_binding_value(name, strict),
             EnvRecord::Object(e) => e.get_binding_value(name, strict),
             EnvRecord::Function(e) => e.declarative.get_binding_value(name, strict),
             EnvRecord::Global(e) => e.get_binding_value(name, strict),
@@ -211,7 +227,7 @@ impl EnvRecord {
             EnvRecord::Function(e) => e.declarative.add_disposable_resource(resource),
             EnvRecord::Global(e) => e.declarative.add_disposable_resource(resource),
             EnvRecord::Module(e) => e.declarative.add_disposable_resource(resource),
-            EnvRecord::Object(_) => {}
+            EnvRecord::Object(_) | EnvRecord::PerIteration(_) => {}
         }
     }
 
@@ -223,7 +239,7 @@ impl EnvRecord {
             EnvRecord::Function(e) => e.declarative.has_disposable_resources(),
             EnvRecord::Global(e) => e.declarative.has_disposable_resources(),
             EnvRecord::Module(e) => e.declarative.has_disposable_resources(),
-            EnvRecord::Object(_) => false,
+            EnvRecord::Object(_) | EnvRecord::PerIteration(_) => false,
         }
     }
 
@@ -234,7 +250,7 @@ impl EnvRecord {
             EnvRecord::Function(e) => e.declarative.drain_disposable_resources(),
             EnvRecord::Global(e) => e.declarative.drain_disposable_resources(),
             EnvRecord::Module(e) => e.declarative.drain_disposable_resources(),
-            EnvRecord::Object(_) => Vec::new(),
+            EnvRecord::Object(_) | EnvRecord::PerIteration(_) => Vec::new(),
         }
     }
 
@@ -242,6 +258,7 @@ impl EnvRecord {
     pub fn delete_binding(&self, name: &JsString) -> Result<bool, JsError> {
         match self {
             EnvRecord::Declarative(e) => e.delete_binding(name),
+            EnvRecord::PerIteration(e) => e.delete_binding(name),
             EnvRecord::Object(e) => e.delete_binding(name),
             EnvRecord::Function(e) => e.declarative.delete_binding(name),
             EnvRecord::Global(e) => e.delete_binding(name),
@@ -260,7 +277,7 @@ impl EnvRecord {
             // certification — a rest param, a non-certifiable body) created
             // inside it resolves its lexical `this` through that context.
             EnvRecord::Declarative(e) => e.has_captured_this(),
-            EnvRecord::Object(_) => false,
+            EnvRecord::Object(_) | EnvRecord::PerIteration(_) => false,
         }
     }
 
@@ -273,7 +290,7 @@ impl EnvRecord {
             // The certified body initialized the reserved binding with its
             // `this` value at entry, so it is always set here.
             EnvRecord::Declarative(e) => e.captured_this_value(),
-            EnvRecord::Object(_) => Err(JsError::new(
+            EnvRecord::Object(_) | EnvRecord::PerIteration(_) => Err(JsError::new(
                 ErrorKind::ReferenceError,
                 "No this binding in this environment".into(),
             )),
@@ -497,6 +514,7 @@ impl Trace for EnvRecord {
     fn trace(&self, visit: &mut dyn FnMut(GcAny)) {
         match self {
             EnvRecord::Declarative(e) => e.trace(visit),
+            EnvRecord::PerIteration(e) => e.trace(visit),
             EnvRecord::Object(e) => e.trace(visit),
             EnvRecord::Function(e) => e.trace(visit),
             EnvRecord::Global(e) => e.trace(visit),
@@ -913,6 +931,413 @@ impl DeclarativeEnv {
         ));
         Ok(())
     }
+}
+
+/// How many loop-head bindings a per-iteration record holds inline. A head
+/// with more declarations keeps the surplus in `extra`.
+const INLINE_PER_ITERATION_SLOTS: usize = 2;
+
+/// Where one per-iteration binding lives.
+enum SlotLoc {
+    /// Slot `0..INLINE_PER_ITERATION_SLOTS` of the head values.
+    Inline(usize),
+    /// Position in the `extra` table (the surplus heads, plus any binding a
+    /// declaration later adds).
+    Extra(usize),
+}
+
+/// A per-iteration environment record (CreatePerIterationEnvironment, spec
+/// 14.7.4.3): one loop iteration's copies of the head bindings.
+///
+/// The per-iteration copy only ever creates initialized, mutable,
+/// non-deletable bindings, so this record stores the values alone, inline in
+/// head order, and shares the names with the loop's other iterations. A copy
+/// therefore allocates nothing beyond the record itself — the point of the
+/// type, since a `for (let …)` body that captures its head makes one per
+/// iteration. Anything that does not fit that shape (more heads than the
+/// inline slots, a sloppy assignment creating a name) lives in `extra`, an
+/// ordinary name-addressed table with the declarative record's semantics.
+#[derive(Debug)]
+pub struct PerIterationEnv {
+    pub outer: Option<EnvRef>,
+    names: Rc<[JsString]>,
+    values: [Cell<Option<Value>>; INLINE_PER_ITERATION_SLOTS],
+    extra: RefCell<Vec<(JsString, Binding)>>,
+}
+
+/// The `Binding` the per-iteration copy creates (see
+/// [`DeclarativeEnv::push_initialized_binding`], whose shape this mirrors).
+fn per_iteration_binding(value: Value) -> Binding {
+    Binding {
+        value: Some(value),
+        mutable: true,
+        strict: false,
+        deletable: false,
+        indirect: None,
+        parameter: false,
+    }
+}
+
+fn binding_not_defined(name: &JsString) -> JsError {
+    JsError::new(
+        ErrorKind::ReferenceError,
+        format!("{:?} is not defined", name.to_string_lossy()),
+    )
+}
+
+fn binding_uninitialized(name: &JsString) -> JsError {
+    JsError::new(
+        ErrorKind::ReferenceError,
+        format!(
+            "Cannot access {:?} before initialization",
+            name.to_string_lossy()
+        ),
+    )
+}
+
+fn binding_is_constant(name: &JsString) -> JsError {
+    JsError::new(
+        ErrorKind::TypeError,
+        format!(
+            "Assignment to constant variable {:?}",
+            name.to_string_lossy()
+        ),
+    )
+}
+
+impl Trace for PerIterationEnv {
+    fn trace(&self, visit: &mut dyn FnMut(GcAny)) {
+        if let Some(outer) = &self.outer {
+            outer.trace(visit);
+        }
+        for name in self.names.iter() {
+            name.trace(visit);
+        }
+        for value in &self.values {
+            if let Some(value) = value.get() {
+                value.trace(visit);
+            }
+        }
+        // As `RefCell<T>`'s own trace: a cell borrowed mid-collection
+        // (per-allocation `--gc-stress`) aborts the sweep instead of panicking.
+        match self.extra.try_borrow() {
+            Ok(extra) => extra.trace(visit),
+            Err(_) => crux::heap::note_aborted_trace(),
+        }
+    }
+}
+
+impl PerIterationEnv {
+    fn inline_len(&self) -> usize {
+        self.names.len().min(INLINE_PER_ITERATION_SLOTS)
+    }
+
+    /// The loop-entry copy: `names` are the step's head list (shared from now
+    /// on) and the values come from `source`, addressed by name (the
+    /// certified body's capture context, or the loop environment on the
+    /// bytecode path).
+    fn from_named(
+        outer: Option<EnvRef>,
+        names: &[JsString],
+        source: &EnvRef,
+    ) -> Result<Self, JsError> {
+        let names: Rc<[JsString]> = Rc::from(names);
+        let values = [const { Cell::new(None) }; INLINE_PER_ITERATION_SLOTS];
+        let mut extra = Vec::new();
+        for (index, name) in names.iter().enumerate() {
+            let value = source.get_binding_value(name, false)?;
+            if index < INLINE_PER_ITERATION_SLOTS {
+                values[index].set(Some(value));
+            } else {
+                extra.push((name.clone(), per_iteration_binding(value)));
+            }
+        }
+        Ok(Self {
+            outer,
+            names,
+            values,
+            extra: RefCell::new(extra),
+        })
+    }
+
+    /// The per-iteration copy: the values come across by slot and the names
+    /// are shared, so nothing is looked up by name and nothing is allocated.
+    fn copy_of(outer: Option<EnvRef>, previous: &Self) -> Self {
+        let values = [const { Cell::new(None) }; INLINE_PER_ITERATION_SLOTS];
+        for (slot, previous) in values.iter().zip(previous.values.iter()) {
+            slot.set(previous.get());
+        }
+        Self {
+            outer,
+            names: previous.names.clone(),
+            values,
+            extra: RefCell::new(previous.extra.borrow().clone()),
+        }
+    }
+
+    /// Whether this record holds exactly `names` in order — the guard on the
+    /// slot copy, so a chain of copies can never shift a binding.
+    fn names_match(&self, names: &[JsString]) -> bool {
+        self.names.len() == names.len()
+            && self
+                .names
+                .iter()
+                .zip(names)
+                .all(|(stored, name)| stored == name)
+    }
+
+    fn locate(&self, name: &JsString) -> Option<SlotLoc> {
+        for (index, stored) in self.names.iter().enumerate() {
+            if stored == name {
+                return Some(if index < INLINE_PER_ITERATION_SLOTS {
+                    SlotLoc::Inline(index)
+                } else {
+                    SlotLoc::Extra(index - INLINE_PER_ITERATION_SLOTS)
+                });
+            }
+        }
+        self.extra
+            .borrow()
+            .iter()
+            .position(|(stored, _)| stored == name)
+            .map(SlotLoc::Extra)
+    }
+
+    /// The location of the binding at binding-order `index`, or `None` when
+    /// the index is past the last binding.
+    fn slot_loc(&self, index: usize) -> Option<SlotLoc> {
+        let inline = self.inline_len();
+        if index < inline {
+            return Some(SlotLoc::Inline(index));
+        }
+        let position = index - inline;
+        (position < self.extra.borrow().len()).then_some(SlotLoc::Extra(position))
+    }
+
+    pub(crate) fn slot_value(&self, index: usize) -> Option<Value> {
+        match self.slot_loc(index)? {
+            SlotLoc::Inline(slot) => self.values[slot].get(),
+            SlotLoc::Extra(position) => self.extra.borrow()[position].1.value,
+        }
+    }
+
+    pub(crate) fn set_slot(&self, index: usize, value: Value) {
+        match self.slot_loc(index) {
+            Some(SlotLoc::Inline(slot)) => self.values[slot].set(Some(value)),
+            Some(SlotLoc::Extra(position)) => {
+                if let Some((_, binding)) = self.extra.borrow_mut().get_mut(position) {
+                    binding.value = Some(value);
+                }
+            }
+            None => {}
+        }
+    }
+
+    pub(crate) fn slot_mutable(&self, index: usize) -> bool {
+        match self.slot_loc(index) {
+            Some(SlotLoc::Inline(_)) => true,
+            Some(SlotLoc::Extra(position)) => self.extra.borrow()[position].1.mutable,
+            None => false,
+        }
+    }
+
+    fn has_binding(&self, name: &JsString) -> bool {
+        self.locate(name).is_some()
+    }
+
+    fn get_binding_value(&self, name: &JsString, _strict: bool) -> Result<Value, JsError> {
+        match self.locate(name) {
+            Some(SlotLoc::Inline(slot)) => self.values[slot]
+                .get()
+                .ok_or_else(|| binding_uninitialized(name)),
+            Some(SlotLoc::Extra(position)) => {
+                let extra = self.extra.borrow();
+                let (_, binding) = &extra[position];
+                if let Some(indirect) = &binding.indirect {
+                    return indirect.0.get_binding_value(&indirect.1, true);
+                }
+                binding.value.ok_or_else(|| binding_uninitialized(name))
+            }
+            None => Err(binding_not_defined(name)),
+        }
+    }
+
+    fn set_mutable_binding(
+        &self,
+        name: &JsString,
+        value: Value,
+        strict: bool,
+    ) -> Result<(), JsError> {
+        match self.locate(name) {
+            Some(SlotLoc::Inline(slot)) => {
+                if self.values[slot].get().is_none() {
+                    return Err(binding_uninitialized(name));
+                }
+                self.values[slot].set(Some(value));
+                Ok(())
+            }
+            Some(SlotLoc::Extra(position)) => {
+                let mut extra = self.extra.borrow_mut();
+                let (_, binding) = &mut extra[position];
+                // spec step 2: a strict binding forces strict semantics.
+                let strict = strict || binding.strict;
+                if binding.value.is_none() {
+                    return Err(binding_uninitialized(name));
+                }
+                if binding.mutable {
+                    binding.value = Some(value);
+                    Ok(())
+                } else if strict {
+                    Err(binding_is_constant(name))
+                } else {
+                    Ok(())
+                }
+            }
+            // spec step 1: sloppy code creates the missing binding.
+            None if strict => Err(binding_not_defined(name)),
+            None => {
+                self.create_mutable_binding(name, true)?;
+                self.initialize_binding(name, value)
+            }
+        }
+    }
+
+    fn initialize_binding(&self, name: &JsString, value: Value) -> Result<(), JsError> {
+        match self.locate(name) {
+            Some(SlotLoc::Inline(slot)) => {
+                self.values[slot].set(Some(value));
+                Ok(())
+            }
+            Some(SlotLoc::Extra(position)) => {
+                self.extra.borrow_mut()[position].1.value = Some(value);
+                Ok(())
+            }
+            None => Err(JsError::new(
+                ErrorKind::ReferenceError,
+                format!("Binding {:?} does not exist", name.to_string_lossy()),
+            )),
+        }
+    }
+
+    fn push_extra(&self, name: &JsString, binding: Binding) -> Result<(), JsError> {
+        if self.has_binding(name) {
+            return Err(JsError::new(
+                ErrorKind::TypeError,
+                format!("Binding {:?} already exists", name.to_string_lossy()),
+            ));
+        }
+        self.extra.borrow_mut().push((name.clone(), binding));
+        Ok(())
+    }
+
+    fn create_mutable_binding(&self, name: &JsString, deletable: bool) -> Result<(), JsError> {
+        self.push_extra(
+            name,
+            Binding {
+                value: None,
+                mutable: true,
+                strict: false,
+                deletable,
+                indirect: None,
+                parameter: false,
+            },
+        )
+    }
+
+    fn create_immutable_binding(&self, name: &JsString, strict: bool) -> Result<(), JsError> {
+        self.push_extra(
+            name,
+            Binding {
+                value: None,
+                mutable: false,
+                strict,
+                deletable: false,
+                indirect: None,
+                parameter: false,
+            },
+        )
+    }
+
+    fn push_initialized_binding(&self, name: &JsString, value: Value) {
+        if self.has_binding(name) {
+            return;
+        }
+        self.extra
+            .borrow_mut()
+            .push((name.clone(), per_iteration_binding(value)));
+    }
+
+    fn delete_binding(&self, name: &JsString) -> Result<bool, JsError> {
+        match self.locate(name) {
+            // A loop head is a lexical binding: never deletable.
+            Some(SlotLoc::Inline(_)) => Ok(false),
+            Some(SlotLoc::Extra(position)) => {
+                let mut extra = self.extra.borrow_mut();
+                if !extra[position].1.deletable {
+                    return Ok(false);
+                }
+                extra.remove(position);
+                Ok(true)
+            }
+            None => Ok(true),
+        }
+    }
+
+    fn mark_parameter(&self, name: &JsString) {
+        if let Some(SlotLoc::Extra(position)) = self.locate(name)
+            && let Some((_, binding)) = self.extra.borrow_mut().get_mut(position)
+        {
+            binding.parameter = true;
+        }
+    }
+
+    fn is_parameter(&self, name: &JsString) -> bool {
+        match self.locate(name) {
+            Some(SlotLoc::Extra(position)) => self.extra.borrow()[position].1.parameter,
+            _ => false,
+        }
+    }
+
+    /// This record's bindings in slot order, flattened into the ordinary
+    /// name-addressed shape (what the snapshot writer carries).
+    pub fn carried_bindings(&self) -> Vec<(JsString, Binding)> {
+        let inline = self.inline_len();
+        let extra = self.extra.borrow();
+        let mut bindings = Vec::with_capacity(self.names.len() + extra.len());
+        for (index, name) in self.names.iter().enumerate() {
+            let value = if index < inline {
+                self.values[index].get()
+            } else {
+                extra[index - inline].1.value
+            };
+            let mut binding = per_iteration_binding(Value::Undefined);
+            binding.value = value;
+            bindings.push((name.clone(), binding));
+        }
+        bindings.extend(extra.iter().skip(self.names.len() - inline).cloned());
+        bindings
+    }
+}
+
+/// CreatePerIterationEnvironment (spec 14.7.4.3): a fresh record holding the
+/// loop-head bindings copied from the environment they currently live in.
+///
+/// When `source` is the loop's own previous per-iteration record (the ordinary
+/// case inside a loop) the values copy across by slot and the names are
+/// shared; otherwise they are looked up by name, which pays for itself once at
+/// loop entry.
+pub fn new_per_iteration_environment(
+    outer: Option<EnvRef>,
+    names: &[JsString],
+    source: &EnvRef,
+) -> Result<EnvRef, JsError> {
+    let env = match &**source {
+        EnvRecord::PerIteration(previous) if previous.names_match(names) => {
+            PerIterationEnv::copy_of(outer, previous)
+        }
+        _ => PerIterationEnv::from_named(outer, names, source)?,
+    };
+    Ok(Handle::new(EnvRecord::PerIteration(env)))
 }
 
 /// An Object Environment Record (spec 9.2.3).
@@ -1783,5 +2208,117 @@ mod tests {
         env.create_global_var_binding(&name("a"), false).unwrap();
         assert!(global.has_own_property(&name("a")).unwrap());
         assert_eq!(global.own_property_keys().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn per_iteration_record_fits_the_existing_arena_box() {
+        // The inline slots remove an allocation per iteration only if they do
+        // not grow the box every other environment record allocates: the
+        // per-iteration variant has to stay under the largest one.
+        assert!(std::mem::size_of::<PerIterationEnv>() <= std::mem::size_of::<FunctionEnv>());
+    }
+
+    /// A loop environment holding `names`, initialized to 1, 2, 3…
+    fn loop_env(names: &[JsString]) -> EnvRef {
+        let env = new_declarative_environment(None);
+        for (index, name) in names.iter().enumerate() {
+            env.create_mutable_binding(name, false).unwrap();
+            env.initialize_binding(name, Value::Number(index as f64 + 1.0))
+                .unwrap();
+        }
+        env
+    }
+
+    #[test]
+    fn per_iteration_copy_keeps_each_iteration_independent() {
+        // The per-iteration record stores the head values inline (and the
+        // surplus, here `k`, in its overflow table), so a copy by slot must
+        // not alias the record it copied from.
+        let names = [name("i"), name("j"), name("k")];
+        let loop_env = loop_env(&names);
+        let first = new_per_iteration_environment(Some(loop_env), &names, &loop_env).unwrap();
+        let EnvRecord::PerIteration(first_record) = &*first else {
+            panic!("a per-iteration environment")
+        };
+        assert_eq!(
+            first
+                .get_binding_value(&name("k"), false)
+                .unwrap()
+                .as_number(),
+            Some(3.0)
+        );
+        assert_eq!(
+            first_record.slot_value(0).and_then(|v| v.as_number()),
+            Some(1.0)
+        );
+        assert_eq!(
+            first_record.slot_value(2).and_then(|v| v.as_number()),
+            Some(3.0)
+        );
+        assert!(first_record.slot_mutable(0) && first_record.slot_mutable(2));
+        assert!(!first.delete_binding(&name("i")).unwrap());
+        assert!(!first.has_binding(&name("missing")).unwrap());
+
+        let second = new_per_iteration_environment(Some(loop_env), &names, &first).unwrap();
+        second
+            .set_mutable_binding(&name("j"), Value::Number(20.0), false)
+            .unwrap();
+        second.set_slot(2, Value::Number(30.0));
+        assert_eq!(
+            first
+                .get_binding_value(&name("j"), false)
+                .unwrap()
+                .as_number(),
+            Some(2.0)
+        );
+        assert_eq!(
+            first
+                .get_binding_value(&name("k"), false)
+                .unwrap()
+                .as_number(),
+            Some(3.0)
+        );
+        assert_eq!(
+            second
+                .get_binding_value(&name("j"), false)
+                .unwrap()
+                .as_number(),
+            Some(20.0)
+        );
+        assert_eq!(
+            second
+                .get_binding_value(&name("k"), false)
+                .unwrap()
+                .as_number(),
+            Some(30.0)
+        );
+    }
+
+    #[test]
+    fn per_iteration_copy_from_a_different_head_falls_back_to_names() {
+        // A `PerIteration` step whose source is not this loop's previous
+        // record must copy by name: the slot copy is guarded on the names
+        // matching, or the bindings would shift.
+        let inner = [name("i"), name("j")];
+        let outer_names = [name("j"), name("x")];
+        let loop_env = loop_env(&outer_names);
+        let previous =
+            new_per_iteration_environment(Some(loop_env), &outer_names, &loop_env).unwrap();
+        let next = new_per_iteration_environment(Some(loop_env), &inner, &previous).unwrap_err();
+        assert!(
+            next.to_string().contains("i"),
+            "the name-addressed copy reports the missing head: {next}"
+        );
+
+        // A different head order would read the wrong slot: `x` is slot 1 of
+        // `previous`, so a slot copy would produce `j`'s value.
+        let reordered = [name("x")];
+        let next = new_per_iteration_environment(Some(loop_env), &reordered, &previous).unwrap();
+        assert_eq!(
+            next.get_binding_value(&name("x"), false)
+                .unwrap()
+                .as_number(),
+            Some(2.0)
+        );
     }
 }

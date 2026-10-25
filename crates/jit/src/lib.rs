@@ -6941,6 +6941,48 @@ run(); run(); run(); run(); run(); run(); run(); run(); run();";
     }
 
     #[test]
+    fn installed_jit_per_iteration_head_surplus_names_and_writes() {
+        // Three head declarations, so the third lives in the per-iteration
+        // record's overflow table, and each closure writes its own iteration's
+        // head — the per-iteration copy must keep the iterations apart.
+        let (value, compiled) = with_jit_agent(|agent| {
+            agent
+                .run_script(
+                    "function make() { var out = []; \
+                       for (let i = 0, j = 10, k = 100; i < 3; i++, j++, k++) { \
+                         out.push(function () { i += 1000; return i + ':' + j + ':' + k; }); \
+                       } return out.map(function (f) { return f(); }).join(','); }\n\
+                     make();",
+                )
+                .expect("runs")
+        });
+        assert_eq!(
+            value.as_string().map(|s| s.to_string()),
+            Some("1000:10:100,1001:11:101,1002:12:102".to_string())
+        );
+        assert!(compiled >= 1, "{compiled} bodies");
+    }
+
+    #[test]
+    fn installed_jit_per_iteration_head_reads_by_name_through_eval() {
+        // `eval` resolves the head by name, which walks into a per-iteration
+        // record rather than its slot table.
+        let (value, _compiled) = with_jit_agent(|agent| {
+            agent
+                .run_script(
+                    "function make() { var out = ''; \
+                       for (let i = 0; i < 3; i++) { out += eval('i * 2'); } return out; }\n\
+                     make();",
+                )
+                .expect("runs")
+        });
+        assert_eq!(
+            value.as_string().map(|s| s.to_string()),
+            Some("024".to_string())
+        );
+    }
+
+    #[test]
     fn installed_jit_runs_an_async_function_with_awaits() {
         // Cut 58: a certified async function compiles — each `await`
         // suspends the machine code (`DISPATCH_SUSPEND`), the driver

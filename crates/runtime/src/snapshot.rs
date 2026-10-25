@@ -1618,9 +1618,20 @@ struct CarriedEnvironment {
 /// as the indirection it is: the environment it exports from travels like any
 /// other record, and the binding names it.
 fn carried_environment(env: &EnvRef) -> Result<CarriedEnvironment, Unsupported> {
+    // A per-iteration record carries its head bindings; the reader rebuilds
+    // an ordinary declarative record from them, so the shape is normalized
+    // here rather than given its own kind byte.
+    if let EnvRecord::PerIteration(per_iteration) = &**env {
+        return Ok(CarriedEnvironment {
+            kind: ENV_DECLARATIVE,
+            transparent: true,
+            bindings: per_iteration.carried_bindings(),
+        });
+    }
     let (kind, declarative) = match &**env {
         EnvRecord::Declarative(declarative) => (ENV_DECLARATIVE, declarative),
         EnvRecord::Function(function) => (ENV_FUNCTION, &function.declarative),
+        EnvRecord::PerIteration(_) => unreachable!("returned above"),
         EnvRecord::Object(_) => {
             return Err(Unsupported::new(
                 "an object environment",

@@ -16150,3 +16150,26 @@ After the change the literal costs create-closure + create-object: 38.6 ms again
 Correctness was diffed against node across 13 shapes — the `ObjectFast` batch, the step path forced by a computed key / a duplicate key / `__proto__`, a certified loop body, shorthand, a numeric key, a string key, a parenthesized value, anonymous class, and the `name` own-property attributes from `getOwnPropertyDescriptor` — all identical. Found while doing it, and **not** part of this change: `{ __proto__: fn }` does not set the prototype in Slag at all (the proto-setter arm matches an object/null value only, and a function value is neither), so `Object.getPrototypeOf(o) === fn` is false where node says true. The previous binary behaves identically, so it is pre-existing and unrelated.
 
 Gates: `cargo fmt --all -- --check`; `cargo clippy --workspace --all-targets -- -D warnings`; `cargo test --workspace` (40 suites, 0 failed); sweeps `language` 23,726 + `built-ins` 23,821 + `annexB` 1,086 + `intl402` 3,365 = 51,998 at 100%; corpus parity 0 (77 rows).
+
+## LANDED (2026-10-25): a per-iteration environment stores its slots inline
+
+The PROFILE entry of 2026-10-22 left the per-iteration copy at ~200 ns, of which the binding vector's allocation was ~150: the copy built a whole `DeclarativeEnv` — an arena box plus a `Vec<(JsString, Binding)>` with one 80-byte entry, its name cloned and its value read out of the previous env *by name* — for bindings that are always the same head names in the same order.
+
+`EnvRecord` now has a `PerIteration` variant (`env.rs`). It stores the head names once per loop in an `Rc<[JsString]>` and the values inline, in head order (`[Cell<Option<Value>>; 2]`), so a copy per iteration is `Rc::clone` + two `Cell::get`/`Cell::set` and allocates nothing. The values are always the `push_initialized_binding` shape (initialized, mutable, not deletable), which is why bare slots suffice. Anything outside that shape — a head with more than two declarations, a sloppy assignment creating a name — goes to an `extra` table with the declarative record's semantics, so the name-addressed surface (`has_binding`, `get_binding_value`, `set_mutable_binding`, `delete_binding`, …) is total. The record is 88 bytes, under the 104-byte `FunctionEnv` the box already sizes to, so `EnvRecord` and its arena slot are unchanged.
+
+The copy is by slot only when the source is the same loop's previous record (`names_match` guards it); otherwise it falls back to the name-addressed copy, which is the loop-entry case (the capture context) and the bytecode path's first iteration. Besides the allocation this removes the per-head name comparison, which only existed because the copy addressed the previous env by name.
+
+Because the record is context-transparent by construction, `context_env` now returns a two-variant `ContextEnv` (declarative or per-iteration) exposing `slot_value`/`slot_mutable`; `is_context_transparent` and the snapshot writer normalize the new variant (a snapshot rebuilds it as an ordinary declarative record). The Annex B function-declaration path in `eval.rs` had been asking `has_binding` only on a declarative env; it now asks on a per-iteration env too, which is where a declaration shadowed by a loop head is actually visible.
+
+Measured with two binaries built from HEAD (`scratch/ab/slag-head.exe`, a cache hit) and the working tree, alternating the order each round. The host was under load from an unrelated process, so the mins are the numbers to read; the medians drifted with it.
+
+| probe | before | after | min |
+| --- | ---: | ---: | ---: |
+| per-iteration-env probe (3 envs/body, 100k bodies) | 475.3 ms | **420.8** | **-11.5%** |
+| `language/statements/for-in/head-let-fresh-binding-per-iteration.js` | 563.4 ms | **508.4** | **-9.8%** |
+
+The ablation that prices the whole remaining machinery (skip the per-iteration env entirely) still measures ~-33% on the probe, so what is left is the arena box itself — one live record per iteration is what per-iteration bindings are. There is no second allocation left to remove.
+
+Correctness: 12 semantic shapes diffed against node (for-in and `for` heads with closures, two and three head declarations, a const for-of head, nested capturing loops, a closure writing its own iteration's head, `eval` reading the head by name, a sloppy assignment creating a name in the body, a block capture, `break`, `delete` on a head) — all identical. New tests: `env.rs` covers the slot copy's independence and the name fallback for a mismatched head (mutation-checked: forcing `names_match` to `true` fails it); `jit/src/lib.rs` covers the surplus-name/overflow path and the by-name read through `eval`.
+
+Gates: `cargo fmt --all -- --check`; `cargo clippy --workspace --all-targets -- -D warnings`; `cargo test --workspace` (40 suites, 0 failed); sweeps `language` 23,726 + `built-ins` 23,821 + `annexB` 1,086 + `intl402` 3,365 = 51,998 at 100%; corpus parity 0 (77 rows, `mean-jitGap=11.26`, `mean-jlGap=3.93`).

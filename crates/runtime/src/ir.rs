@@ -30,7 +30,10 @@ use crate::context::{
     get_new_target, get_super_base, get_super_constructor, get_this_environment,
     resolve_this_binding,
 };
-use crate::env::{DeclarativeEnv, EnvRecord, EnvRef, new_declarative_environment};
+use crate::env::{
+    DeclarativeEnv, EnvRecord, EnvRef, PerIterationEnv, new_declarative_environment,
+    new_per_iteration_environment,
+};
 use crate::eval::block_declaration_instantiation;
 use crate::expr::{get_iterator, iterator_close, iterator_step};
 use crate::flow::Completion;
@@ -9981,21 +9984,11 @@ impl Vm {
                             "No outer environment for per-iteration bindings".into(),
                         )
                     })?;
-                    let env = new_declarative_environment(Some(outer));
-                    for name in names {
-                        let value = last.get_binding_value(name, false)?;
-                        // The env is fresh: one push instead of the
-                        // create_mutable_binding duplicate scan +
-                        // initialize_binding re-find.
-                        env.push_initialized_binding(name, value)?;
-                    }
                     // The per-iteration environment replaces the lexical
                     // environment without joining the stack; the loop's exit
-                    // restores the loop environment directly.
-                    if let EnvRecord::Declarative(declarative) = &*env {
-                        declarative.mark_context_transparent();
-                    }
-                    self.lexical_env = env;
+                    // restores the loop environment directly. The copy is by
+                    // slot when `last` is this loop's previous iteration.
+                    self.lexical_env = new_per_iteration_environment(Some(outer), names, &last)?;
                 }
                 Step::EnterPerIteration { names } => {
                     // Cut 3 continuation (per-iteration loop heads): the
@@ -10006,15 +9999,8 @@ impl Vm {
                     // Later iterations re-use `PerIteration` above (the
                     // copies then come from the previous per-iteration env).
                     let source = self.body_context.unwrap_or(self.lexical_env);
-                    let env = new_declarative_environment(Some(self.lexical_env));
-                    for name in names {
-                        let value = source.get_binding_value(name, false)?;
-                        // Fresh env: one push (see `Step::PerIteration`).
-                        env.push_initialized_binding(name, value)?;
-                    }
-                    if let EnvRecord::Declarative(declarative) = &*env {
-                        declarative.mark_context_transparent();
-                    }
+                    let env =
+                        new_per_iteration_environment(Some(self.lexical_env), names, &source)?;
                     self.lexical_env = env;
                     self.env_stack.push(env);
                 }
@@ -24166,10 +24152,34 @@ fn call_site(call: &syntax::ast::CallExpr) -> crux::Span {
 
 /// The certified body's capture context (Cut 3 continuation): its lexical
 /// environment is the per-call declarative environment holding the captured
-/// bindings.
-pub(crate) fn context_env(env: &EnvRef) -> &DeclarativeEnv {
+/// bindings — or, inside a loop that captures its head, the per-iteration
+/// copy the head slots were moved into.
+pub(crate) enum ContextEnv<'a> {
+    Declarative(&'a DeclarativeEnv),
+    PerIteration(&'a PerIterationEnv),
+}
+
+impl ContextEnv<'_> {
+    pub(crate) fn slot_value(&self, index: usize) -> Option<Value> {
+        match self {
+            ContextEnv::Declarative(e) => e.slot_value(index),
+            ContextEnv::PerIteration(e) => e.slot_value(index),
+        }
+    }
+
+    pub(crate) fn slot_mutable(&self, index: usize) -> bool {
+        match self {
+            ContextEnv::Declarative(e) => e.slot_mutable(index),
+            ContextEnv::PerIteration(e) => e.slot_mutable(index),
+        }
+    }
+}
+
+/// Resolve a capture-context environment to its slot table.
+pub(crate) fn context_env(env: &EnvRef) -> ContextEnv<'_> {
     match &**env {
-        EnvRecord::Declarative(declarative) => declarative,
+        EnvRecord::Declarative(declarative) => ContextEnv::Declarative(declarative),
+        EnvRecord::PerIteration(per_iteration) => ContextEnv::PerIteration(per_iteration),
         _ => unreachable!("a context slot without a capture-context env"),
     }
 }
@@ -24180,7 +24190,11 @@ pub(crate) fn context_env(env: &EnvRef) -> &DeclarativeEnv {
 /// a reference to an enclosing body's captured binding must reach past
 /// them.
 fn is_context_transparent(env: &EnvRef) -> bool {
-    matches!(&**env, EnvRecord::Declarative(e) if e.context_transparent.get())
+    match &**env {
+        EnvRecord::Declarative(e) => e.context_transparent.get(),
+        EnvRecord::PerIteration(_) => true,
+        _ => false,
+    }
 }
 
 pub fn is_compound_assign(op: &AssignOp) -> bool {

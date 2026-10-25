@@ -611,15 +611,22 @@ pub(crate) fn eval_function_declaration(
     // when it is evaluated. When the innermost environment binds the name but
     // the block did not hoist it (a strict block, or a let/const that
     // suppressed the hoist), the declaration is dead: evaluation is empty.
-    if let EnvRecord::Declarative(block_env) = &*lexical_env {
-        if block_env.annex_b_hoists(&name) {
-            let fobj = lexical_env.get_binding_value(&name, false)?;
-            variable_env.set_mutable_binding(&name, fobj, false)?;
-            return Ok(());
+    let binds_here = match &*lexical_env {
+        EnvRecord::Declarative(block_env) => {
+            if block_env.annex_b_hoists(&name) {
+                let fobj = lexical_env.get_binding_value(&name, false)?;
+                variable_env.set_mutable_binding(&name, fobj, false)?;
+                return Ok(());
+            }
+            true
         }
-        if lexical_env.has_binding(&name)? {
-            return Ok(());
-        }
+        // A per-iteration environment binds the loop-head names: a
+        // declaration shadowed by one is dead like a block binding.
+        EnvRecord::PerIteration(_) => true,
+        _ => false,
+    };
+    if binds_here && lexical_env.has_binding(&name)? {
+        return Ok(());
     }
 
     // Annex B statement-position form: `if (x) function f(){}` binds the

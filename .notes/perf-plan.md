@@ -200,11 +200,14 @@ frontier.
    is 408 bytes and is copied on insert; the class-only fields behind one box take
    it to ~288. The plan's stop rule (300k-closure probe below ~85 ms) still
    applies.
-2. **The per-iteration environment** (`PROFILE` entry in `.notes/perf.md`): a copy
-   costs ~200 ns after the two record shrinks, of which ~150 is the binding vector
-   and ~50 the box. A slot-array variant with inline slots removes the vector;
-   `JsString` is 48 bytes of each entry, and `Binding`'s four flags want packing
-   into one byte.
+2. **The per-iteration environment** — **DONE** (2026-10-25). The record is now
+   an `EnvRecord::PerIteration` with the head values inline and the names shared
+   per loop, so a copy allocates nothing: -9.8% on the for-in row, -11.5% on the
+   probe (mins, two binaries; see the `LANDED (2026-10-25)` entry in
+   `.notes/perf.md`). An ablation still prices the whole machinery at ~-33% of
+   the probe, and what remains is the arena box per iteration — one live record
+   per iteration is what per-iteration bindings are. No P2 item is left with a
+   measured target.
 3. **Object-literal named evaluation**: a function expression as a literal's
    value costs ~450 ns over the same closure as a variable, because it
    disqualifies the literal from `ObjectFast` and pays a post-hoc
