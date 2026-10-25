@@ -16109,3 +16109,21 @@ The hot read path is `member_cell_get` -> `member_cell_warm_probe`, and its firs
 Removing that load has exactly one shape — thread a run-held `&AgentRoots` (an `Rc::clone` local, per R1) through `run_inner_inner` and every cell helper — and it buys ~0.3 ns per access (one dependent L1 load on a 32-byte-hot line). The rows that could show it are the small cell-read ones, and their own A/A control (two copies of the same binary, 11 alternating rounds) gives `obj_prop` +1.3% median on a 0.639 ms row, `element_read` +0.3% on 0.652, `dyn_key_read` +0.0% on 0.918. At 100k reads the removable work is ~5% of a 6.4 ns read, but it is a load, not work: there is nothing to delete, and the diff to make `agent.roots` resolve further up the stack is the whole dispatch. INLINING the tables back into `Agent` would remove it and is what M-1 forbids.
 
 So this is closed as structurally verified rather than measured-then-rejected: the audit's cost on the cell path is one dependent load, which is the minimum `AgentRoots`-owning-the-traced-tables permits. The stop rule's remaining instruction — profile the dispatch instead of more indirection work — is where P1 leaves off; the callback lane's next target is the general call machinery around a certified body (`with_agent`, context push/pop, `take_vm`/`return_vm`, `run_jit_body`'s per-call setup), now ~180 ns/element after the negative-verdict win.
+
+## NULL (2026-10-25): the certified-callee nested lane does not pay for a builtin-invoked callback
+
+After the negative-verdict win, a certified (non-leaf) callback still costs ~180 ns/element in the general funnel. The obvious collapse is the lane the interpreter's own call steps and the JIT's `certified_call` helper use: `Vm::run_certified_call_nested`, which runs the callee as a nested activation on the caller's Vm and skips `call_inner`'s pooled-Vm take/reset. `CallbackVm::call` was extended to try it (stage the args, `run_certified_call_nested`, truncate) before falling back to `crate::function::call`. It is **slower**, measured same-binary:
+
+| probe (min) | lane off | lane on | change |
+| --- | ---: | ---: | ---: |
+| `p3_nonleaf` (calls a global) | 232.476 ms | 238.206 ms | +2.5% |
+| `p4_nonleaf_nocapture` | 214.738 ms | 220.400 ms | +2.6% |
+| `captured_call` | 227.432 ms | 231.308 ms | +1.7% |
+| `global_call` | 233.706 ms | 237.235 ms | +1.5% |
+| `member_call` | 257.339 ms | 264.560 ms | +2.8% |
+| `global_read` | 228.956 ms | 231.984 ms | +1.3% |
+| `p2_leaf_capture` (control) | 105.243 ms | 103.025 ms | -2.1% |
+
+**The method is the durable part.** The first pass compared two binaries and read +3.3–4.8% on the non-leaf rows — but the leaf control row, whose path the patch does not touch, moved +2.3% too, so the comparison was measuring build layout, not the lane. Rebuilding one binary with an `SLAG_CB_NESTED` gate and A/B-ing the *same* binary with the env set and unset removed that confound and resolved the effect to ~2%. For a 1-3% change, that is the experiment to run first: same binary, env gate, alternating rounds. The gate and the lane are both reverted.
+
+What it rules out: the funnel's cost is not the pooled-Vm round trip. `save_scratch`/`restore_scratch`, the explicit `ExecutionContext` push and `run_compiled_body_on(frame_prepared)` cost at least what `take_vm`/`return_vm` do on a pooled Vm, and the shared body run (`run_jit_body` + the compiled code) is paid by both. So the ~180 ns is the body run plus activation bookkeeping, not the Vm lifecycle — and no further "collapse the chain" edit on this lane is worth trying.
