@@ -16425,3 +16425,34 @@ A second cost the small-value steady state hid: `IdMap` reallocates roughly thre
 **Plan-level conclusion.** Stage D cannot be "the same `IdMap`, but boxed" — that shape is strictly worse. It has to move the record onto the `Function` object as a traced field (V8's JSFunction → SharedFunctionInfo), so the record dies with its object and the table becomes only an id→function index (not an owner that promotes every record). That is a different, larger change and remains unmeasured.
 
 The experiment is reverted (`crates/runtime/src/agent.rs`, `crates/runtime/src/function.rs` restored to `82470a1d`).
+
+## PROFILE (2026-10-25): the non-leaf activation, and the inline splice's feedback starvation
+
+The last row target from the 2026-10-25 decomposition is the non-leaf activation (a call inside a body costs ~50-105 ns more per invocation than a leaf body). Measured at `82470a1d` (binary `befb0e02`), 100k iterations, min of five runs, both modes:
+
+| probe | JIT | jitless |
+| --- | ---: | ---: |
+| `o2` the loop calls a leaf body | 4.93 ms (4.9 ns/call) | — |
+| `o5` the loop calls a body that calls a leaf | 5.73 ms (**57 ns/call**) | 24.0 ms (**240 ns/call**) |
+| `o4` the loop calls a body that calls `Math.abs` | 8.94 ms (**89 ns/call**) | — |
+
+So the JIT's certified-call lane is ~52 ns above the leaf lane, and the interpreter's is ~235. The two lanes were read rather than guessed at:
+
+- **JIT** (`certified_lane_inline`, `crates/runtime/src/jit.rs:2235`): one `ecma_functions` probe and an `Rc` clone, the `CertifiedInlineInfo` validation, `save_scratch`/`restore_scratch` (~25 saved scalars plus four stack truncations each way), a 7-field env swap, a `vm.stack` carve plus a per-slot frame fill, **a whole ~430-byte nested `JitCallContext` built field by field**, `jit_depth` inc/dec, and the compiled entry.
+- **Interpreter** (`Vm::run_certified_call_nested`, `crates/runtime/src/ir.rs:7790`): the same list plus `new_body_context`, an `ExecutionContext` push/pop, and `run_compiled_body_on` -> `run_jit_body`, which builds a *second* per-run context.
+
+The lane is ~100 stores of per-activation state. The one structural idea — reuse the caller's `JitCallContext` in place instead of building a nested one — is worse: 20 fields differ (so 20 saves + 20 sets + 20 restores, 60 stores) to replace a 38-field construction. Only two fields are outright redundant (`vm.current_function`/`vm.body_context` are re-stored by `run_compiled_body_on` after the nested lane already set them), worth ~2 ns. **No single removable block; the lane is not the next lever.**
+
+### Why the call rows cannot be closed by the call lane anyway
+
+`calls/direct_leaf` (2M iterations) is 12.0 ms = **6 ns per iteration** against V8's 1.1 ms = 0.55 ns. V8 inlines the callee into the loop; Slag's leaf lane is already ~5 ns/call, so the row's gap is inlining, not the lane.
+
+`SLAG_INLINE`'s splice cannot supply it. `sites_from_feedback` (`crates/jit/src/opt/pass/inline.rs:48`) reads `CompiledBody::feedback`, which only the **interpreter's** `observe_*` steps write (`crates/runtime/src/ir.rs:2234`). Cut 69 compiles a loop body on its **first consult** (`lookup_info_compiles_loop_bodies_on_the_first_consult`), i.e. before it has run a single interpreted iteration. A call site inside any loop body therefore has no feedback, `IcState::Specialized` is never reached, and `sites_from_feedback` returns `None` for every site. Verified, not inferred:
+
+- `SLAG_FEEDBACK=1` over the whole `calls` family reports **2 sites / 6 hits** — with six workloads, that is the non-loop bodies only.
+- `SLAG_FEEDBACK=1 SLAG_INLINE=1` on `direct_leaf` reads 12.2-12.3 ms against 12.0-12.3 ms default: no movement.
+- The splice machinery is also weak where feedback *does* exist: a straight-line hot body whose call is its block's last instruction (`z3`) reports one inlinable site and moves only 11.58 -> 10.89 ms (-6%), so the pass is not yet a complete answer even with a site map. Open question, not a conclusion.
+
+A lazy-compile policy does not fix this shape either: a benchmark loop body is one activation, so there is no "next entry" at which a feedback-driven recompile could happen. Closing `calls/*` needs a call site inside a compiled loop body to be inlinable **without** feedback — either static resolution (a `CallFast` whose callee slot is written once by a `FunctionDeclInit` in the same body and never otherwise, and whose callee is a capture-free leaf, so no guard is needed) or true OSR plus compiled-code feedback. The first is the smaller change and reuses the existing `Callee`/splice machinery; it is the next session's candidate, not this one's.
+
+Probes: `scratch/ab/calllane/`, `scratch/ab/inl/`, and `scratch/ab/nullproto/{o2,o4,o5}` (git-ignored).

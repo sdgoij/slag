@@ -205,8 +205,10 @@ frontier.
 
 1. **The closure record** (`.notes/closure-cost-plan.md` Stage A): `EcmaFunction`
    is 408 bytes and is copied on insert; the class-only fields behind one box take
-   it to ~288. The plan's stop rule (300k-closure probe below ~85 ms) still
-   applies.
+   it to ~288. Stage D (the arena-allocated record) was measured twice in its
+   map-rooted forms and **rejected both times** (2026-10-20 and 2026-10-25: the
+   table then roots every record, promoting each on its first minor — the for-in
+   row +70% and +80.6%). Only the record-on-the-object shape remains, unmeasured.
 2. **The per-iteration environment** — **DONE** (2026-10-25). The record is now
    an `EnvRecord::Slot` with the head values inline and the names shared per
    loop, so a copy allocates nothing: -9.8% on the for-in row, -11.5% on the
@@ -233,7 +235,19 @@ frontier.
 6. **Call lanes**: a member call to a closure created in the same iteration costs
    ~350 ns (the for-in row's asserts are three of them per body). This is the
    parked `.notes/rust-initiated-call-plan.md` take-side work plus the
-   fresh-function-id leaf entry.
+   fresh-function-id leaf entry. The JIT's certified lane and the interpreter's
+   nested lane were then both profiled (`.notes/perf.md`, 2026-10-25): ~52 ns and
+   ~235 ns per non-leaf call, ~100 stores of necessary per-activation state with
+   no removable block. The call machinery is no longer the lever.
+7. **Static inlining for loop bodies** (new, 2026-10-25). `SLAG_INLINE`'s splice
+   is starved: it reads interpreter-only feedback, and Cut 69 compiles a loop
+   body on its first consult, so a call site inside a loop is never observed and
+   never inlined. That is why `calls/direct_leaf` is 6 ns/iteration against V8's
+   0.55 ns (V8 inlines the callee; the leaf lane itself is already ~5 ns). The
+   candidate fix is static resolution: a `CallFast` whose callee slot is written
+   once by a `FunctionDeclInit` in the same body and never otherwise, and whose
+   callee is a capture-free leaf, splices with no guard. Reuses the existing
+   `Callee`/splice machinery; measurement and evidence in `.notes/perf.md`.
 
 ## P3 — the README is a measurement, not a monument
 
