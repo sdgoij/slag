@@ -594,6 +594,9 @@ mod vm {
 /// the assertion.
 #[cfg(all(feature = "workers", test))]
 mod probe {
+    // Only the Windows probe below asks the operating system anything; the other
+    // platforms answer `None` without naming a `c_void`.
+    #[cfg(windows)]
     use core::ffi::c_void;
 
     #[cfg(windows)]
