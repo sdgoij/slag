@@ -2844,9 +2844,17 @@ impl Agent {
     /// baseline on a closure-call loop, versus 8% for this shape — so the
     /// branch stays in one function.
     pub(crate) fn leaf_lookup(&mut self, id: u64) -> Option<crate::ir::LeafEntry> {
+        Self::leaf_lookup_in(&self.roots, id)
+    }
+
+    /// The leaf-cache lookup against a roots reference the caller holds for a
+    /// run (P1 R1): the caller already owns an `Rc<AgentRoots>` clone, so the
+    /// hot callback lane skips reloading `agent.roots` here and reads the
+    /// record under a plain `borrow()` (R3) rather than `Ref::filter_map`.
+    pub(crate) fn leaf_lookup_in(roots: &AgentRoots, id: u64) -> Option<crate::ir::LeafEntry> {
         let index = id.wrapping_mul(0x9E37_79B9_7F4A_7C15) as usize & (crate::ir::LEAF_CACHE - 1);
         let cached = {
-            let cells = self.roots.leaf_cache.borrow();
+            let cells = roots.leaf_cache.borrow();
             match cells[index].as_ref() {
                 Some((cached_id, entry)) if *cached_id == id => Some(entry.clone()),
                 _ => None,
@@ -2858,7 +2866,8 @@ impl Agent {
         // The record guard stays inside this block: the cache write below is
         // an allocation-free store, but a guard is never worth extending.
         let (ir, strict, environment, construct_inline) = {
-            let data = self.ecma_function(&id)?;
+            let table = roots.ecma_functions.borrow();
+            let data = table.get(&id)?;
             if !data.leaf_inline {
                 return None;
             }
@@ -2878,7 +2887,7 @@ impl Agent {
             // so the construct-inline verdict rides along.
             construct_inline,
         };
-        self.roots.leaf_cache.borrow_mut()[index] = Some((id, entry.clone()));
+        roots.leaf_cache.borrow_mut()[index] = Some((id, entry.clone()));
         Some(entry)
     }
 

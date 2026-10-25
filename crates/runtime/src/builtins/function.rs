@@ -610,25 +610,29 @@ fn try_leaf_call_reusing(
     if !matches!(function.kind, crux::function::FunctionKind::EcmaScript) {
         return None;
     }
-    let entry = agent.leaf_lookup(function.id())?;
-    let entry = crate::ir::LeafEntry {
-        ir: entry.ir.clone(),
-        strict: entry.strict,
-        environment: entry.environment,
-        construct_inline: false,
-    };
-    let env = {
-        let Ok(context) = agent.running_context() else {
-            return None;
-        };
-        context.lexical_environment
+    // R1: hold the roots for the run instead of reloading `agent.roots` at
+    // each table access below (leaf cache, context stack, Vm pool).
+    let roots = std::rc::Rc::clone(&agent.roots);
+    let mut entry = Agent::leaf_lookup_in(&roots, function.id())?;
+    // The call lane never constructs; clear the shared cache's construct
+    // verdict so the leaf runner cannot take a construct path from a call.
+    entry.construct_inline = false;
+    let env = match roots.execution_context_stack.last() {
+        Some(context) => context.lexical_environment,
+        None => return None,
     };
     let mut vm = match slot.take() {
         Some(mut vm) => {
             vm.rebind(env, entry.strict);
             vm
         }
-        None => agent.take_vm(env, entry.strict),
+        None => match roots.vm_pool.borrow_mut().pop() {
+            Some(mut vm) => {
+                vm.rebind(env, entry.strict);
+                vm
+            }
+            None => Box::new(crate::ir::Vm::new(env, entry.strict)),
+        },
     };
     // GC-2: the leaf's arguments and result live on this pooled Vm's
     // stack, which the precise tracer cannot see — register the Vm as an
