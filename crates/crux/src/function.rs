@@ -246,6 +246,13 @@ pub struct Function {
     /// source string - alive for that extra collection, promoting them to the
     /// old generation where only a major could reclaim them.
     environment: Cell<Option<crate::heap::GcAny>>,
+    /// [[HomeObject]], as an erased heap edge, for the same reason as
+    /// `environment` but stronger: the home object roots the method (its
+    /// property value is the closure), so a traced record edge formed a cycle
+    /// the permanent record pinned forever — every method ever created
+    /// retained its object literal and closure. The edge lives on the box so
+    /// the cycle is collectable once the program drops the method.
+    home_object: Cell<Option<crate::heap::GcAny>>,
     /// The [[Promise]] edge of a promise resolving function (spec 27.2.1.3.1),
     /// as an erased heap edge. The runtime's resolver record holds the typed
     /// value and does not trace it: a record is an Agent root and outlives its
@@ -269,6 +276,10 @@ impl Trace for Function {
         // edge is on the closure rather than on the record (see the field).
         if let Some(environment) = self.environment.get() {
             visit(environment);
+        }
+        // [[HomeObject]]: same reason as the environment (see the field).
+        if let Some(home_object) = self.home_object.get() {
+            visit(home_object);
         }
         // A resolving function's [[Promise]] is reachable exactly while the
         // function is (see the field).
@@ -333,6 +344,12 @@ impl Function {
         self.environment.set(environment);
     }
 
+    /// Record the closure's [[HomeObject]] as this box's GC edge (see the
+    /// field's note). The runtime calls it from `make_method`.
+    pub fn set_home_object_edge(&self, home_object: Option<crate::heap::GcAny>) {
+        self.home_object.set(home_object);
+    }
+
     /// Attach the promise a resolving function settles (see the field).
     pub fn set_resolving_promise(&self, promise: crate::heap::GcAny) {
         self.resolving_promise.set(Some(promise));
@@ -361,6 +378,7 @@ impl Function {
             kind: FunctionKind::EcmaScript,
             self_handle: Cell::new(None),
             environment: Cell::new(None),
+            home_object: Cell::new(None),
             resolving_promise: Cell::new(None),
         });
         function.self_handle.set(Some(function));
@@ -399,6 +417,7 @@ impl Function {
             },
             self_handle: Cell::new(None),
             environment: Cell::new(None),
+            home_object: Cell::new(None),
             resolving_promise: Cell::new(None),
         });
         Self::link_self_handle(&function);
@@ -456,6 +475,7 @@ impl Function {
             },
             self_handle: Cell::new(None),
             environment: Cell::new(None),
+            home_object: Cell::new(None),
             resolving_promise: Cell::new(None),
         });
         Self::link_self_handle(&function);
