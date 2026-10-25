@@ -15936,3 +15936,36 @@ class's inferred name) so the function is created with its final `name` and the
 literal can take `ObjectFast`. Not measured; no corpus row uses the pattern
 (two files contain `: function (` and neither evaluates it in a loop), so this is
 a real-world win rather than a corpus one.
+
+## MEASURED (2026-10-25): what the security audit cost
+
+66 commits landed between `883af3dd` and `8bc1f77b` for the audit. Re-measured
+both binaries, three interleaved corpus rounds per binary and three micro-suite
+rounds per binary:
+
+| harness | `883af3dd` | `8bc1f77b` | change |
+| --- | ---: | ---: | ---: |
+| corpus mean JIT gap | 10.40x | 10.76x | +3.5% |
+| corpus mean interpreter gap | 3.69x | 3.88x | +5.1% |
+| micro-suite JIT column | — | — | flat (16/16 within 1%) |
+| micro-suite interpreter column | — | — | +8-16% on 11 of 16 |
+
+The V8 total itself drifted +3.1% between the two corpus runs, so ~+2.2% of the
+JIT number is real. The interpreter number is not drift.
+
+Bisected on four rows with eight checkpoint builds. Two commits carry the JIT
+damage: `8d0bebf2` (execution-context stack and function records into
+AgentRoots) took `opcost/map_for_each` 21.7 -> 25.4 ms, and `cbafcd42` (IC caches
+into AgentRoots) took it on to 29.9 and `calls/closure_capture` 34.6 -> 38.5.
+The interpreter damage is spread across the whole AgentRoots refactor
+(`typed-array write` 25.99 -> 29.69 in steps at `d08a165b`, `8d0bebf2`,
+`2c4e4f9b`).
+
+The mechanism is indirection: every traced table moved behind
+`Agent::roots: Rc<AgentRoots>`, so a hot read is now pointer -> large struct ->
+`RefCell` where it was one inline field, and `Agent::ecma_function` is a
+`Ref::filter_map`. On a 4-9 ns call lane that is 50-100% of the lane.
+
+The recovery plan, the family table, and the pre-existing queue are in
+`.notes/perf-plan.md`. The README's performance section now carries these
+numbers at this commit.
