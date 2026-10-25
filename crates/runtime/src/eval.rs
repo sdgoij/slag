@@ -1152,44 +1152,65 @@ fn for_in_key_levels_inner(agent: &mut Agent, rhs: &Value) -> Result<Vec<(usize,
         while let Some(obj) = current {
             let parent = obj.get_prototype_of()?;
             let record_seen = parent.is_some() || seen.is_some();
-            match obj.own_string_props() {
-                Some(props) => {
-                    for (key, enumerable) in props {
-                        if record_seen {
-                            let seen = seen.get_or_insert_with(|| SeenKeys::List(Vec::new()));
-                            if seen.contains_or_insert(&key) {
-                                continue;
-                            }
-                        }
-                        if enumerable {
-                            keys.push((level, key_value(&key)));
-                        }
+            // The ordinary fast path visits the keys in place — no staged
+            // property vector, and a vector-free object is read straight from
+            // its map instead of being materialized first.
+            let served = obj.for_each_own_string_prop(|key, enumerable| {
+                if record_seen {
+                    let seen = seen.get_or_insert_with(|| SeenKeys::List(Vec::new()));
+                    if seen.contains_or_insert(key) {
+                        return true;
                     }
                 }
-                None => {
-                    for key in obj.own_property_keys()? {
-                        let PropertyKey::String(_) = key else {
-                            continue;
-                        };
-                        if record_seen {
-                            let seen = seen.get_or_insert_with(|| SeenKeys::List(Vec::new()));
-                            if seen.contains_or_insert(&key) {
-                                continue;
+                if enumerable {
+                    keys.push((level, key_value(key)));
+                }
+                true
+            });
+            if !served {
+                match obj.own_string_props() {
+                    Some(props) => {
+                        for (key, enumerable) in props {
+                            if record_seen {
+                                let seen = seen.get_or_insert_with(|| SeenKeys::List(Vec::new()));
+                                if seen.contains_or_insert(&key) {
+                                    continue;
+                                }
+                            }
+                            if enumerable {
+                                keys.push((level, key_value(&key)));
                             }
                         }
-                        if let Some(property) = obj.get_own_property_key(&key)? {
-                            // EnumerateObjectProperties reads each descriptor
-                            // (spec 9.4.6.4 step 4): a module namespace
-                            // descriptor reads the live binding, throwing a
-                            // ReferenceError for an uninitialized export.
-                            if matches!(obj.kind, crux::object::ObjectKind::ModuleNamespace(_))
-                                && let Some(module) = agent.module_namespace(obj.id())
-                                && let PropertyKey::String(id) = &key
-                            {
-                                crate::module::namespace_get(agent, &module, &crux::lookup(*id))?;
+                    }
+                    None => {
+                        for key in obj.own_property_keys()? {
+                            let PropertyKey::String(_) = key else {
+                                continue;
+                            };
+                            if record_seen {
+                                let seen = seen.get_or_insert_with(|| SeenKeys::List(Vec::new()));
+                                if seen.contains_or_insert(&key) {
+                                    continue;
+                                }
                             }
-                            if property.enumerable {
-                                keys.push((level, key_value(&key)));
+                            if let Some(property) = obj.get_own_property_key(&key)? {
+                                // EnumerateObjectProperties reads each descriptor
+                                // (spec 9.4.6.4 step 4): a module namespace
+                                // descriptor reads the live binding, throwing a
+                                // ReferenceError for an uninitialized export.
+                                if matches!(obj.kind, crux::object::ObjectKind::ModuleNamespace(_))
+                                    && let Some(module) = agent.module_namespace(obj.id())
+                                    && let PropertyKey::String(id) = &key
+                                {
+                                    crate::module::namespace_get(
+                                        agent,
+                                        &module,
+                                        &crux::lookup(*id),
+                                    )?;
+                                }
+                                if property.enumerable {
+                                    keys.push((level, key_value(&key)));
+                                }
                             }
                         }
                     }

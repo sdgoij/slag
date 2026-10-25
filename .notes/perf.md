@@ -16381,3 +16381,23 @@ Two binaries, alternating order, 7 rounds, mins (100k calls each):
 | function expression (control, resolved per site already) | 32.53 | 31.86 | -2.1% (noise) |
 
 Gates: `cargo fmt --all -- --check`; `cargo clippy --workspace --all-targets -- -D warnings`; `cargo test --workspace` (40 suites, 0 failed); sweeps `language` 23,726 + `built-ins` 23,821 + `annexB` 1,086 + `intl402` 3,365 = 51,998 at 100%; corpus parity 0 (77 rows, `mean-jitGap=10.74`, `mean-jlGap=3.81`).
+
+## LANDED (2026-10-25): for-in enumerates a vector-free object from its map
+
+The residual in `for_in_key_levels` was `JsObject::own_string_props`: it called `materialize_properties` first — rebuilding the property vector of a **vector-free** object from its map (one allocation, a descriptor walk, and a state change that pushed later stores onto the slower `map_set` scan) — then staged the keys in a vector of its own, and `key_value` boxed each key.
+
+`JsObject::for_each_own_string_prop` visits the keys in place and reads a vector-free object straight from its map: a written descriptor is an own property (a presize hole is not), and the descriptor ordinal order is creation order, because `define_fresh` materializes before any fill that would land out of order. It serves the whole enumeration or **declines before visiting anything** (`false`), and `for_in_key_levels` then falls back to `own_string_props` (an object with an array-index key, where the map order is not the spec order, and every exotic object).
+
+That decline ordering is load-bearing and cost a regression: the first version checked each key as it visited and returned `false` when it reached an index key, so a vector-authoritative object with `p2, p4` before `0, 1, 2` had the strings visited, declined, and the fallback emitted them again — test262's `statements/for-in/order-simple-object` caught it. The vector path now scans for an index key before the first visit; the unit test pins both the order and the "no partial visit" invariant.
+
+Two binaries, alternating order, 7 rounds, mins:
+
+| probe | before | after | min |
+| --- | ---: | ---: | ---: |
+| fresh 3-key null-prototype object | 86.24 ms | **75.99** | **-11.9%** |
+| fresh 3-key plain object | 107.16 | **89.33** | **-16.6%** |
+| the for-in corpus row | 408.21 | **397.26** | -2.7% |
+
+Across this session's three for-in changes the fresh 3-key null-prototype enumeration is 97.07 -> 75.99 ms (-21.7%) and the plain-object one 129.42 -> 89.33 (-31%).
+
+Gates: `cargo fmt --all -- --check`; `cargo clippy --workspace --all-targets -- -D warnings`; `cargo test --workspace` (40 suites, 0 failed); sweeps `language` 23,726 + `built-ins` 23,821 + `annexB` 1,086 + `intl402` 3,365 = 51,998 at 100%; corpus parity 0 (`mean-jitGap=10.71`, `mean-jlGap=3.78`).

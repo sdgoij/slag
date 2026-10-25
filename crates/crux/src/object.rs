@@ -4234,6 +4234,82 @@ impl JsObject {
     /// `None` for a kind whose keys are not the stored vector (an
     /// index-based kind, a proxy, a string, a host object) — those keep the
     /// exact per-kind enumeration.
+    /// Visit the object's own enumerable string properties in spec
+    /// enumeration order — array-index keys ascending, then the rest in
+    /// insertion order — without staging them and **without materializing a
+    /// vector-free object**. Returns `false` when it cannot serve the
+    /// receiver (an exotic object, or an order it does not sort: an index key
+    /// in a vector-free object, where the map order is insertion order); the
+    /// caller then falls back to [`Self::own_string_props`].
+    ///
+    /// For a vector-free object the map's written descriptors are the own
+    /// properties (a presize hole is not one) and their ordinal order is
+    /// creation order — `define_fresh` materializes before any fill that
+    /// would land out of order.
+    pub fn for_each_own_string_prop(
+        &self,
+        mut visit: impl FnMut(&PropertyKey, bool) -> bool,
+    ) -> bool {
+        if !matches!(self.kind, ObjectKind::Ordinary) {
+            return false;
+        }
+        if self.props_deferred.get()
+            && let Some(map) = self.map.get()
+        {
+            // Only the string keys, and no index key: an index key would have
+            // to be emitted first, ascending, which the descriptor order does
+            // not provide.
+            for ord in 0..map.descriptor_count() {
+                let Some((key, offset, _)) = map.descriptor_at(ord) else {
+                    break;
+                };
+                if offset >= INLINE_FIELDS || !matches!(key, PropertyKey::String(_)) {
+                    continue;
+                }
+                if self.in_fields[offset].get().is_uninitialized() {
+                    continue;
+                }
+                if array_index_of(&key).is_some() {
+                    return false;
+                }
+            }
+            for ord in 0..map.descriptor_count() {
+                let Some((key, offset, attrs)) = map.descriptor_at(ord) else {
+                    break;
+                };
+                if offset >= INLINE_FIELDS
+                    || !matches!(key, PropertyKey::String(_))
+                    || self.in_fields[offset].get().is_uninitialized()
+                {
+                    continue;
+                }
+                if !visit(&key, attrs.enumerable()) {
+                    return true;
+                }
+            }
+            return true;
+        }
+        // Detect an index key BEFORE visiting anything: a bail-out after a
+        // partial visit would leave the caller's fallback re-emitting the keys
+        // already visited.
+        let props = self.properties.borrow();
+        if props
+            .iter()
+            .any(|(key, _)| matches!(key, PropertyKey::String(_)) && array_index_of(key).is_some())
+        {
+            return false;
+        }
+        for (key, property) in props.iter() {
+            if !matches!(key, PropertyKey::String(_)) {
+                continue;
+            }
+            if !visit(key, property.enumerable) {
+                return true;
+            }
+        }
+        true
+    }
+
     pub fn own_string_props(&self) -> Option<Vec<(PropertyKey, bool)>> {
         if !matches!(self.kind, ObjectKind::Ordinary) {
             return None;
@@ -6137,6 +6213,52 @@ mod tests {
     }
 
     // ---- Option-3 vector-free defines ----
+
+    #[test]
+    fn for_each_own_string_prop_serves_spec_order_or_declines_up_front() {
+        // The visitor either serves the whole enumeration in spec order or
+        // declines BEFORE visiting anything — a partial visit followed by a
+        // decline would make the caller's fallback emit the keys twice (that
+        // was the test262 `for-in/order-simple-object` regression).
+        let obj = JsObject::ordinary_object_create(None);
+        for name in ["b", "z", "m"] {
+            assert!(obj.fresh_data_define(&PropertyKey::from_utf8(name), Value::Number(1.0)));
+        }
+        assert!(obj.props_deferred.get(), "stores leave it vector-free");
+        let mut seen: Vec<String> = Vec::new();
+        assert!(
+            obj.for_each_own_string_prop(|key, enumerable| {
+                assert!(enumerable);
+                seen.push(key.display_string());
+                true
+            }),
+            "a vector-free object serves from its map"
+        );
+        assert_eq!(seen.join(","), "b,z,m", "insertion order");
+        assert!(
+            obj.props_deferred.get(),
+            "enumeration must not materialize the object"
+        );
+
+        // An index key anywhere in the object makes the visitor decline —
+        // and it must decline without having visited the earlier keys.
+        let indexed = JsObject::ordinary_object_create(None);
+        assert!(indexed.fresh_data_define(&PropertyKey::from_utf8("a"), Value::Number(1.0)));
+        assert!(indexed.fresh_data_define(&PropertyKey::from_utf8("b"), Value::Number(1.0)));
+        assert!(
+            indexed.fresh_data_define(&PropertyKey::from_utf8("7"), Value::Number(1.0)),
+            "an index key after the strings"
+        );
+        let mut visited = 0;
+        assert!(
+            !indexed.for_each_own_string_prop(|_, _| {
+                visited += 1;
+                true
+            }),
+            "declines when an index key is present"
+        );
+        assert_eq!(visited, 0, "declined before visiting anything");
+    }
 
     #[test]
     fn vector_free_defines_keep_the_vector_empty_while_serving_props() {
