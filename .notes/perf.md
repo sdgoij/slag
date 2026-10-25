@@ -16564,3 +16564,30 @@ node's 2.3 ms is 0.58 ns for store+read+add, which is not a cheaper store: the o
 Lifting `UpdateContextSlot` would therefore buy ~3% on this row, and it is not free: an earlier session lifted it and `built-ins/Iterator/zip/basic-longest.js` failed under `sweep all`, recoverable only by `SLAG_GUARD=0`/`SLAG_TYPER=0` — a typer read-guard bug on a newly-lifted body, unaffected by reordering the passes or widening the guard's type-sensitive set. A 3% row is not worth that class of compiler bug until the guard bug is understood.
 
 Both rows are left as they are. What they need is named: `warm_store` needs inlining/escape analysis (or a compiled store cell keyed by object id, which the interpreter already has and the JIT deliberately does not read); `generator_loop` needs a cheaper resume entry, not more lifting.
+
+## NULL (2026-10-25): a compiled object-keyed store cell buys 0.3%
+
+The `warm_store` note above says the store is ~45 instructions of gate. The obvious response is to give the compiled store the interpreter's L1a cell — an object-keyed `(id, name) -> (generation, field)` record — so a warm store skips the map probe, the `props_deferred` bit and the written/writable/ordinal checks and is one guarded field write plus the value-cell refresh. That was built: a `MemberFieldCell` table on `AgentRoots` (16 direct-mapped entries, `#[repr(C)]` for the compiled probe), a `member_field_cells` pointer in `JitCallContext`, a probe ahead of the shape probe in `emit_member_store`, and a record on the two warm arms (a value write changes none of the recorded fields, so a hit never re-records). The read ABI (`MemberValueCell`) was left untouched, and the field ordinal is re-checked against `INLINE_FIELDS` so a stale cell falls back rather than writing out of bounds.
+
+It measures **nothing**: 5-round interleaved mins against the same HEAD, the store probe 24.92 -> 24.84 ms (**-0.3%**) and the row 35.45 -> 35.26 ms (**-0.5%**) — both inside this host's A/B floor. The instruction count was not the limit: the store's ~45 instructions are several independent L1 load chains, and the CPU already overlaps them; the new probe is *also* a load chain, so removing 25 instructions and adding 10 changes nothing. Reverted rather than kept: it is a new table, a new ctx field and a new recording discipline for no measurable effect.
+
+What this leaves: the row is not instruction-bound and not gate-bound. Its 8.9 ns per iteration is a latency chain (the store's probe feeds the value-cell refresh, which feeds the next read) plus the loop's float-carried counter, and node's 0.58 ns is escape analysis. A store cell would matter only if the probe chain were shortened by more than the new probe costs — i.e. by hoisting it out of the loop, which is the guard-as-IR-op work, not a cell.
+
+## PROFILE (2026-10-25): the `UpdateContextSlot` lift's guard-pruning miscompile, narrowed
+
+The `control/generator_loop` note above prices lifting `UpdateContextSlot` at ~3% and refuses it on a known miscompile. The repro is still live and was narrowed this session.
+
+Lifting it (ContextLoad -> UpdateValue -> ContextStore, exactly the `UpdateLocal` shape over the helpers, `stack_delta` +1) makes `built-ins/Iterator/zip/basic-longest.js` fail: *"Expected arrays to contain the same values at index 1"*. Attribution, each a filtered sweep over `Iterator/zip`:
+
+| switch | result |
+| --- | --- |
+| none (lifted) | **FAIL** |
+| `SLAG_GUARD=0` (read-guard *pruning* off, guards still emitted) | pass |
+| `SLAG_TYPER=0` (no guards emitted) | pass |
+| `SLAG_UNBOX=0`, `SLAG_INLINE=0`, `SLAG_WIDEN=0`, `SLAG_MEM2REG=0` | **FAIL** |
+
+So it is `guard::run`'s pruning, not the guard's emission and not the new ops. The IR diff of the failing body (dumped with `JIT_DUMP_IR=1`, pruned vs `SLAG_GUARD=0`) shows pruning removing two `GuardType`s whose results only feed call arguments — and, with each of them, a `FrameStore(v36) slot7` that `mem2reg` had emitted *before* that guard as the promoted-slot materialization (`slot7` is never loaded by the IR, so once the guard goes the store looks dead and DCE removes it). The suspicion is therefore in the interaction, not in the lift: either a materialization that a *later* resume still needs, or `narrow`'s numeric-slot proof (which reads the guard) surviving a step whose guard is then removed. Not proven; the micro-reductions tried so far (a captured counter read through an array) compute correctly.
+
+Not landed. The lift stays refused with its comment pointing here until the interaction is understood; it is a ~3% row and a wrong-value bug is not a trade.
+
+Gates for this commit: docs only, plus the two reverted experiments; the tree's code is the commit that passed fmt/clippy/40 suites/51,998 sweeps.

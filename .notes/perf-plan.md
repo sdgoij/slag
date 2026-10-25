@@ -256,10 +256,21 @@ frontier.
    0.58 ns for the whole iteration, which is elimination, not a cheaper store —
    it needs inlining/escape analysis, or a compiled store cell keyed by object
    id. `control/generator_loop` is ~165 ns per `next()` in the resume path; the
+   is ~165 ns per `next()` in the resume path; the
    loop side is worth only ~3% (proved by moving the generator to the script
    scope so the caller lifts). Its one missing lift, `UpdateContextSlot`, carries
    a documented typer read-guard miscompile and is not worth 3%. Numbers in
    `.notes/perf.md`.
+9. **The `UpdateContextSlot` guard bug** (new, 2026-10-25): narrowed to
+   `guard::run`'s pruning — `SLAG_GUARD=0` and `SLAG_TYPER=0` both pass, every
+   other switch still fails — and the IR diff shows pruning removing guards that
+   carry `mem2reg`'s promoted-slot materialization (`FrameStore(v36) slot7`).
+   Either a materialization a later resume still needs, or `narrow`'s slot proof
+   outliving the guard it read. Not fixed; do not land the lift until it is.
+10. **A compiled object-keyed store cell** (new, 2026-10-25): built and measured
+   at -0.5% on `objects/warm_store` (the store is a latency chain, not an
+   instruction count), reverted. Only worth revisiting as part of hoisting the
+   store's guard out of a loop, i.e. a store-guard IR op.
 
 ## P3 — the README is a measurement, not a monument
 
