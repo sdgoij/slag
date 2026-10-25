@@ -219,38 +219,62 @@ cargo run -p slag --example rlx_demo --features slag/raygui              # decla
 cargo run -p cli --features raylib -- game.js
 ```
 
-### The `v8` crate and Deno
+### The `v8` crate, Deno and Celld
 
 `crates/v8` is a stand-in for `rusty_v8`: it is named `v8` at the API version it
 replaces (`152.1.0`), so a host that depends on the crates.io `v8` resolves to
 it. Where `rusty_v8` crosses into C++ through `binding.cc` and bindgen, this is a
 pure-Rust implementation of the `v8::` surface on top of the engine — handles,
 scopes, isolates, contexts, modules, promises, and the inspector's `Runtime`
-domain, enough to drive `deno repl`. It is not in the default build, like
-`crates/jsc`: `cargo build -p v8` builds it on request, and nothing in the
+domain, enough to drive `deno repl`. It also carries what a host serving from a
+thread pool needs: `SharedIsolate` (an isolate behind a lock, entered through a
+`Locker`) and `Send + Sync` `Global` handles. It is not in the default build,
+like `crates/jsc`: `cargo build -p v8` builds it on request, and nothing in the
 workspace depends on it. The engine has no interpreted mode, so the JIT is a
 dependency of this crate rather than a feature of it.
 
-The one consumer is Deno, and `tools/build-deno.py` is how it is wired up: it
-clones a pinned Deno commit, redirects the crates.io `v8` — which Deno's
-`deno_v8` facade pulls — to `crates/v8` with a `[patch.crates-io]` handed to
-cargo through `--config`, so the checkout is never edited, reconciles the lock,
-and builds `-p deno`:
+Two hosts are built on it. Both are wired the same way: a script clones a pinned
+commit and redirects the crates.io `v8` its tree resolves to `crates/v8` with a
+`[patch.crates-io]` handed to cargo through `--config`, so the checkout is never
+edited.
 
 ```sh
 python3 tools/build-deno.py            # release; also --debug, --pin, --deno-dir, --dry-run
 ./deno/target/release/deno run -A tools/deno_smoke.js
 ./deno/target/release/deno run -A tools/deno_surface.js
+
+python3 tools/build-celld.py           # cargo check -p celld; --build for the binary, --release for the shipped profile
 ```
 
-The two harnesses are the embedding checklist — `deno_smoke.js` (32 cases of
-ECMAScript and web-platform surface) and `deno_surface.js` (29 cases of what a
-host leans on: workers, `serve`/HTTP, WebSocket, `node:` builtins, streams, the
-crypto and fs subtleties) — and both pass under the built `deno`. CI builds Deno
-on Slag for linux-x86_64, linux-aarch64 and windows-x86_64 and attaches the
-archives to a release. The Linux build additionally needs `cmake` (`libz-sys`
-builds zlib-ng through it) and `libclang-dev` (bindgen for `libsqlite3-sys`);
-the Windows build, on MSVC, needs neither.
+**Deno** resolves the bridge through the `v8` its `deno_v8` facade pulls;
+`tools/build-deno.py` reconciles the lock and builds `-p deno`. The two harnesses
+are the embedding checklist — `deno_smoke.js` (32 cases of ECMAScript and
+web-platform surface) and `deno_surface.js` (29 cases of what a host leans on:
+workers, `serve`/HTTP, WebSocket, `node:` builtins, streams, the crypto and fs
+subtleties) — and both pass under the built `deno`. CI builds Deno on Slag for
+linux-x86_64, linux-aarch64 and windows-x86_64 and attaches the archives to a
+release. The Linux build additionally needs `cmake` (`libz-sys` builds zlib-ng
+through it) and `libclang-dev` (bindgen for `libsqlite3-sys`); the Windows build,
+on MSVC, needs neither.
+
+**celld** (`github.com/denoland/celld`, pinned at the `v0.6.3` commit `8702f6d`)
+is the second, and it is the one that keeps `SharedIsolate` honest: it runs the
+programmatic Workers platform — Workers, Durable Objects over SQLite, KV,
+queues, D1, R2, Workflows — and serves them from a thread pool.
+`tools/build-celld.py` checks that celld's `v8 = "152.1"` requirement admits the
+bridge (a requirement that no longer does is a decision for celld's own tree, so
+the script reports it rather than rewriting the manifest), reconciles the lock,
+and runs `cargo check -p celld` by default, since that is the question this
+bridge has to keep answering; `--build` produces the binary and `--release` the
+profile the archive ships. Its native dependencies (the SQLite build, the TLS
+stack the tunnel needs) do not build on Windows, so on Windows the script runs
+cargo inside WSL (`--native` opts out, `CELLD_WSL_DISTRO` picks the distro), and
+`celld dev` needs `esbuild` to bundle a Worker (the build does not). CI builds
+celld on linux-x86_64 and linux-aarch64 — the two Linux architectures celld's own
+releases build — serves `examples/hello` (a Worker) and `examples/counter` (a
+Durable Object over its own SQLite, one counter per name) through `celld dev`, and
+attaches `celld-<version>-<platform>.tar.gz`, carrying celld's own version with
+its `LICENSE` and `NOTICE`, to a release.
 
 ## Conformance
 
@@ -610,7 +634,7 @@ time (`crates/runtime/src/builtins/array.rs` is the model) and need nothing.
 | `jit` | Experimental Cranelift JIT backend for the interpreter's certified `Step` bytecode (CLI feature `jit`, on by default) |
 | `ffi` | Shared C-ABI plumbing for the drop-in surfaces (handle tables, value/string marshaling) |
 | `jsc` | Drop-in JavaScriptCore C API (`JSContextRef` family) backed by Slag; not in the default build (`cargo build -p jsc`, or alongside the CLI with `cargo build -p cli --features jsc`) |
-| `v8` | Stand-in for `rusty_v8` (named `v8` at API version 152.1.0) that runs Deno on Slag; not in the default build (`cargo build -p v8`, or `python3 tools/build-deno.py` to build the whole Deno host) |
+| `v8` | Stand-in for `rusty_v8` (named `v8` at API version 152.1.0) that runs Deno and celld on Slag; not in the default build (`cargo build -p v8`, or `python3 tools/build-deno.py` / `tools/build-celld.py` to build a whole host) |
 | `cli` | The `slag` binary (script runner + REPL) |
 | `test262` | The pinned corpus + the sweep runner |
 
