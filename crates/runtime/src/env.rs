@@ -24,7 +24,7 @@ pub type EnvRef = Handle<EnvRecord>;
 #[derive(Debug)]
 pub enum EnvRecord {
     Declarative(DeclarativeEnv),
-    PerIteration(PerIterationEnv),
+    Slot(SlotEnv),
     Object(ObjectEnv),
     Function(FunctionEnv),
     Global(GlobalEnv),
@@ -36,7 +36,7 @@ impl EnvRecord {
     pub fn outer(&self) -> Option<EnvRef> {
         match self {
             EnvRecord::Declarative(e) => e.outer,
-            EnvRecord::PerIteration(e) => e.outer,
+            EnvRecord::Slot(e) => e.outer,
             EnvRecord::Object(e) => e.outer,
             EnvRecord::Function(e) => e.declarative.outer,
             EnvRecord::Global(e) => e.declarative.outer,
@@ -68,7 +68,7 @@ impl EnvRecord {
     pub fn is_parameter_binding(&self, name: &JsString) -> bool {
         match self {
             EnvRecord::Declarative(e) => e.is_parameter(name),
-            EnvRecord::PerIteration(e) => e.is_parameter(name),
+            EnvRecord::Slot(e) => e.is_parameter(name),
             EnvRecord::Function(e) => e.declarative.is_parameter(name),
             _ => false,
         }
@@ -79,7 +79,7 @@ impl EnvRecord {
     pub fn mark_parameter(&self, name: &JsString) {
         match self {
             EnvRecord::Declarative(e) => e.mark_parameter(name),
-            EnvRecord::PerIteration(e) => e.mark_parameter(name),
+            EnvRecord::Slot(e) => e.mark_parameter(name),
             EnvRecord::Function(e) => e.declarative.mark_parameter(name),
             _ => {}
         }
@@ -89,7 +89,7 @@ impl EnvRecord {
     pub fn has_binding(&self, name: &JsString) -> Result<bool, JsError> {
         match self {
             EnvRecord::Declarative(e) => Ok(e.has_binding(name)),
-            EnvRecord::PerIteration(e) => Ok(e.has_binding(name)),
+            EnvRecord::Slot(e) => Ok(e.has_binding(name)),
             EnvRecord::Object(e) => e.has_binding(name),
             EnvRecord::Function(e) => Ok(e.declarative.has_binding(name)),
             EnvRecord::Global(e) => e.has_binding(name),
@@ -101,7 +101,7 @@ impl EnvRecord {
     pub fn create_mutable_binding(&self, name: &JsString, deletable: bool) -> Result<(), JsError> {
         match self {
             EnvRecord::Declarative(e) => e.create_mutable_binding(name, deletable),
-            EnvRecord::PerIteration(e) => e.create_mutable_binding(name, deletable),
+            EnvRecord::Slot(e) => e.create_mutable_binding(name, deletable),
             EnvRecord::Object(e) => e.create_mutable_binding(name, deletable),
             EnvRecord::Function(e) => e.declarative.create_mutable_binding(name, deletable),
             EnvRecord::Global(e) => e.create_mutable_binding(name, deletable),
@@ -113,7 +113,7 @@ impl EnvRecord {
     pub fn create_immutable_binding(&self, name: &JsString, strict: bool) -> Result<(), JsError> {
         match self {
             EnvRecord::Declarative(e) => e.create_immutable_binding(name, strict),
-            EnvRecord::PerIteration(e) => e.create_immutable_binding(name, strict),
+            EnvRecord::Slot(e) => e.create_immutable_binding(name, strict),
             EnvRecord::Object(e) => e.create_immutable_binding(name, strict),
             EnvRecord::Function(e) => e.declarative.create_immutable_binding(name, strict),
             EnvRecord::Global(e) => e.create_immutable_binding(name, strict),
@@ -134,7 +134,7 @@ impl EnvRecord {
                 e.push_initialized_binding(name, value);
                 Ok(())
             }
-            EnvRecord::PerIteration(e) => {
+            EnvRecord::Slot(e) => {
                 e.push_initialized_binding(name, value);
                 Ok(())
             }
@@ -162,7 +162,7 @@ impl EnvRecord {
         crux::heap::write_barrier(self, value);
         match self {
             EnvRecord::Declarative(e) => e.initialize_binding(name, value),
-            EnvRecord::PerIteration(e) => e.initialize_binding(name, value),
+            EnvRecord::Slot(e) => e.initialize_binding(name, value),
             EnvRecord::Object(e) => e.initialize_binding(name, value),
             EnvRecord::Function(e) => e.declarative.initialize_binding(name, value),
             EnvRecord::Global(e) => e.initialize_binding(name, value),
@@ -180,7 +180,7 @@ impl EnvRecord {
         crux::heap::write_barrier(self, value);
         match self {
             EnvRecord::Declarative(e) => e.set_mutable_binding(name, value, strict),
-            EnvRecord::PerIteration(e) => e.set_mutable_binding(name, value, strict),
+            EnvRecord::Slot(e) => e.set_mutable_binding(name, value, strict),
             EnvRecord::Object(e) => e.set_mutable_binding(name, value, strict),
             EnvRecord::Function(e) => e.declarative.set_mutable_binding(name, value, strict),
             EnvRecord::Global(e) => e.set_mutable_binding(name, value, strict),
@@ -197,7 +197,7 @@ impl EnvRecord {
         crux::heap::write_barrier(self, value);
         match self {
             EnvRecord::Declarative(e) => e.set_slot(index, value),
-            EnvRecord::PerIteration(e) => e.set_slot(index, value),
+            EnvRecord::Slot(e) => e.set_slot(index, value),
             EnvRecord::Function(e) => e.declarative.set_slot(index, value),
             EnvRecord::Global(e) => e.declarative.set_slot(index, value),
             EnvRecord::Module(e) => e.declarative.set_slot(index, value),
@@ -209,7 +209,7 @@ impl EnvRecord {
     pub fn get_binding_value(&self, name: &JsString, strict: bool) -> Result<Value, JsError> {
         match self {
             EnvRecord::Declarative(e) => e.get_binding_value(name, strict),
-            EnvRecord::PerIteration(e) => e.get_binding_value(name, strict),
+            EnvRecord::Slot(e) => e.get_binding_value(name, strict),
             EnvRecord::Object(e) => e.get_binding_value(name, strict),
             EnvRecord::Function(e) => e.declarative.get_binding_value(name, strict),
             EnvRecord::Global(e) => e.get_binding_value(name, strict),
@@ -227,7 +227,7 @@ impl EnvRecord {
             EnvRecord::Function(e) => e.declarative.add_disposable_resource(resource),
             EnvRecord::Global(e) => e.declarative.add_disposable_resource(resource),
             EnvRecord::Module(e) => e.declarative.add_disposable_resource(resource),
-            EnvRecord::Object(_) | EnvRecord::PerIteration(_) => {}
+            EnvRecord::Object(_) | EnvRecord::Slot(_) => {}
         }
     }
 
@@ -239,7 +239,7 @@ impl EnvRecord {
             EnvRecord::Function(e) => e.declarative.has_disposable_resources(),
             EnvRecord::Global(e) => e.declarative.has_disposable_resources(),
             EnvRecord::Module(e) => e.declarative.has_disposable_resources(),
-            EnvRecord::Object(_) | EnvRecord::PerIteration(_) => false,
+            EnvRecord::Object(_) | EnvRecord::Slot(_) => false,
         }
     }
 
@@ -250,7 +250,7 @@ impl EnvRecord {
             EnvRecord::Function(e) => e.declarative.drain_disposable_resources(),
             EnvRecord::Global(e) => e.declarative.drain_disposable_resources(),
             EnvRecord::Module(e) => e.declarative.drain_disposable_resources(),
-            EnvRecord::Object(_) | EnvRecord::PerIteration(_) => Vec::new(),
+            EnvRecord::Object(_) | EnvRecord::Slot(_) => Vec::new(),
         }
     }
 
@@ -258,7 +258,7 @@ impl EnvRecord {
     pub fn delete_binding(&self, name: &JsString) -> Result<bool, JsError> {
         match self {
             EnvRecord::Declarative(e) => e.delete_binding(name),
-            EnvRecord::PerIteration(e) => e.delete_binding(name),
+            EnvRecord::Slot(e) => e.delete_binding(name),
             EnvRecord::Object(e) => e.delete_binding(name),
             EnvRecord::Function(e) => e.declarative.delete_binding(name),
             EnvRecord::Global(e) => e.delete_binding(name),
@@ -277,7 +277,11 @@ impl EnvRecord {
             // certification — a rest param, a non-certifiable body) created
             // inside it resolves its lexical `this` through that context.
             EnvRecord::Declarative(e) => e.has_captured_this(),
-            EnvRecord::Object(_) | EnvRecord::PerIteration(_) => false,
+            // The same reserved binding, in a capture context's slot table. A
+            // per-iteration record holds only loop-head names, so it never
+            // matches and the walk continues outward.
+            EnvRecord::Slot(e) => e.has_binding(&crate::ir::captured_this_name()),
+            EnvRecord::Object(_) => false,
         }
     }
 
@@ -290,7 +294,8 @@ impl EnvRecord {
             // The certified body initialized the reserved binding with its
             // `this` value at entry, so it is always set here.
             EnvRecord::Declarative(e) => e.captured_this_value(),
-            EnvRecord::Object(_) | EnvRecord::PerIteration(_) => Err(JsError::new(
+            EnvRecord::Slot(e) => e.get_binding_value(&crate::ir::captured_this_name(), true),
+            EnvRecord::Object(_) => Err(JsError::new(
                 ErrorKind::ReferenceError,
                 "No this binding in this environment".into(),
             )),
@@ -514,7 +519,7 @@ impl Trace for EnvRecord {
     fn trace(&self, visit: &mut dyn FnMut(GcAny)) {
         match self {
             EnvRecord::Declarative(e) => e.trace(visit),
-            EnvRecord::PerIteration(e) => e.trace(visit),
+            EnvRecord::Slot(e) => e.trace(visit),
             EnvRecord::Object(e) => e.trace(visit),
             EnvRecord::Function(e) => e.trace(visit),
             EnvRecord::Global(e) => e.trace(visit),
@@ -933,40 +938,137 @@ impl DeclarativeEnv {
     }
 }
 
-/// How many loop-head bindings a per-iteration record holds inline. A head
-/// with more declarations keeps the surplus in `extra`.
-const INLINE_PER_ITERATION_SLOTS: usize = 2;
+/// How many slot values a slot record keeps inline. A record with more slots
+/// (a capture context for a body that captures many bindings) holds them in
+/// one heap array instead.
+const INLINE_SLOT_VALUES: usize = 2;
 
-/// Where one per-iteration binding lives.
+/// One slot of a slot record: the binding's name and its attributes.
+///
+/// The specs of one site — a loop's head for its iterations, a certified
+/// body's captured bindings for its calls — are built once and shared through
+/// the record's `Rc`, so creating a record copies values only. `strict` is the
+/// binding's own strictness: a captured `const` is immutable and strict, so a
+/// sloppy write to it throws too.
+#[derive(Debug, Clone)]
+pub struct SlotSpec {
+    name: JsString,
+    pub mutable: bool,
+    pub strict: bool,
+}
+
+impl SlotSpec {
+    pub(crate) fn new(name: JsString, mutable: bool, strict: bool) -> Self {
+        Self {
+            name,
+            mutable,
+            strict,
+        }
+    }
+
+    pub(crate) fn name(&self) -> &JsString {
+        &self.name
+    }
+}
+
+/// Where a slot record's values live.
+#[derive(Debug)]
+enum Slots {
+    Inline([Cell<Option<Value>>; INLINE_SLOT_VALUES]),
+    Heap(Box<[Cell<Option<Value>>]>),
+}
+
+impl Slots {
+    fn with_len(len: usize) -> Self {
+        if len <= INLINE_SLOT_VALUES {
+            Slots::Inline([const { Cell::new(None) }; INLINE_SLOT_VALUES])
+        } else {
+            Slots::Heap(vec![Cell::new(None); len].into_boxed_slice())
+        }
+    }
+
+    fn get(&self, index: usize) -> Option<Option<Value>> {
+        match self {
+            Slots::Inline(values) => values.get(index).map(Cell::get),
+            Slots::Heap(values) => values.get(index).map(Cell::get),
+        }
+    }
+
+    fn set(&self, index: usize, value: Option<Value>) {
+        match self {
+            Slots::Inline(values) => {
+                if let Some(slot) = values.get(index) {
+                    slot.set(value);
+                }
+            }
+            Slots::Heap(values) => {
+                if let Some(slot) = values.get(index) {
+                    slot.set(value);
+                }
+            }
+        }
+    }
+
+    /// Copy `source`'s values into this (same length) table. Used by the
+    /// per-iteration copy, whose source is the same site's previous record.
+    fn copy_from(&self, source: &Slots) {
+        match (self, source) {
+            (Slots::Inline(into), Slots::Inline(from)) => {
+                for (into, from) in into.iter().zip(from.iter()) {
+                    into.set(from.get());
+                }
+            }
+            (Slots::Heap(into), Slots::Heap(from)) => {
+                for (into, from) in into.iter().zip(from.iter()) {
+                    into.set(from.get());
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// A slot record's overflow table: bindings the shared layout does not
+/// describe, allocated on first use.
+type ExtraTable = Option<Box<Vec<(JsString, Binding)>>>;
+
+/// Where one binding of a slot record lives.
 enum SlotLoc {
-    /// Slot `0..INLINE_PER_ITERATION_SLOTS` of the head values.
-    Inline(usize),
-    /// Position in the `extra` table (the surplus heads, plus any binding a
-    /// declaration later adds).
+    /// `0..layout.len()`: the slot itself.
+    Values(usize),
+    /// Position in the `extra` table (a binding the layout does not
+    /// describe).
     Extra(usize),
 }
 
-/// A per-iteration environment record (CreatePerIterationEnvironment, spec
-/// 14.7.4.3): one loop iteration's copies of the head bindings.
+/// A slot-addressed environment: the bindings one site creates in lockstep,
+/// with the compiler's names and attributes shared by every record of that
+/// site.
 ///
-/// The per-iteration copy only ever creates initialized, mutable,
-/// non-deletable bindings, so this record stores the values alone, inline in
-/// head order, and shares the names with the loop's other iterations. A copy
-/// therefore allocates nothing beyond the record itself — the point of the
-/// type, since a `for (let …)` body that captures its head makes one per
-/// iteration. Anything that does not fit that shape (more heads than the
-/// inline slots, a sloppy assignment creating a name) lives in `extra`, an
-/// ordinary name-addressed table with the declarative record's semantics.
+/// Two sites use it. A **per-iteration environment** (spec 14.7.4.3) holds one
+/// loop iteration's copies of a captured `for`-head; its specs are all
+/// mutable, and it is context-transparent, so a certified body's closures
+/// resolve captures past it. A **capture context** holds one call's captured
+/// bindings (Cut 3 continuation); its specs carry the binding's
+/// mutability/strictness and it is not transparent.
+///
+/// Creating a record allocates only the record (plus the value array when the
+/// site has more slots than [`INLINE_SLOT_VALUES`]), because the names are
+/// shared rather than cloned per binding. Anything the layout does not
+/// describe — a sloppy assignment creating a name — goes to `extra`, an
+/// ordinary name-addressed table with the declarative record's semantics, so
+/// the name-addressed surface stays total.
 #[derive(Debug)]
-pub struct PerIterationEnv {
+pub struct SlotEnv {
     pub outer: Option<EnvRef>,
-    names: Rc<[JsString]>,
-    values: [Cell<Option<Value>>; INLINE_PER_ITERATION_SLOTS],
-    extra: RefCell<Vec<(JsString, Binding)>>,
+    layout: Rc<[SlotSpec]>,
+    values: Slots,
+    extra: RefCell<ExtraTable>,
+    context_transparent: bool,
 }
 
-/// The `Binding` the per-iteration copy creates (see
-/// [`DeclarativeEnv::push_initialized_binding`], whose shape this mirrors).
+/// The `Binding` shape a slot record's `extra` entry starts with (see
+/// [`DeclarativeEnv::push_initialized_binding`]).
 fn per_iteration_binding(value: Value) -> Binding {
     Binding {
         value: Some(value),
@@ -1005,127 +1107,104 @@ fn binding_is_constant(name: &JsString) -> JsError {
     )
 }
 
-impl Trace for PerIterationEnv {
+impl Trace for SlotEnv {
     fn trace(&self, visit: &mut dyn FnMut(GcAny)) {
         if let Some(outer) = &self.outer {
             outer.trace(visit);
         }
-        for name in self.names.iter() {
-            name.trace(visit);
+        for spec in self.layout.iter() {
+            spec.name.trace(visit);
         }
-        for value in &self.values {
-            if let Some(value) = value.get() {
-                value.trace(visit);
+        match &self.values {
+            Slots::Inline(values) => {
+                for value in values {
+                    if let Some(value) = value.get() {
+                        value.trace(visit);
+                    }
+                }
+            }
+            Slots::Heap(values) => {
+                for value in values.iter() {
+                    if let Some(value) = value.get() {
+                        value.trace(visit);
+                    }
+                }
             }
         }
         // As `RefCell<T>`'s own trace: a cell borrowed mid-collection
         // (per-allocation `--gc-stress`) aborts the sweep instead of panicking.
         match self.extra.try_borrow() {
-            Ok(extra) => extra.trace(visit),
+            Ok(extra) => {
+                if let Some(extra) = &*extra {
+                    extra.trace(visit);
+                }
+            }
             Err(_) => crux::heap::note_aborted_trace(),
         }
     }
 }
 
-impl PerIterationEnv {
-    fn inline_len(&self) -> usize {
-        self.names.len().min(INLINE_PER_ITERATION_SLOTS)
-    }
-
-    /// The loop-entry copy: `names` are the step's head list (shared from now
-    /// on) and the values come from `source`, addressed by name (the
-    /// certified body's capture context, or the loop environment on the
-    /// bytecode path).
-    fn from_named(
-        outer: Option<EnvRef>,
-        names: &[JsString],
-        source: &EnvRef,
-    ) -> Result<Self, JsError> {
-        let names: Rc<[JsString]> = Rc::from(names);
-        let values = [const { Cell::new(None) }; INLINE_PER_ITERATION_SLOTS];
-        let mut extra = Vec::new();
-        for (index, name) in names.iter().enumerate() {
-            let value = source.get_binding_value(name, false)?;
-            if index < INLINE_PER_ITERATION_SLOTS {
-                values[index].set(Some(value));
-            } else {
-                extra.push((name.clone(), per_iteration_binding(value)));
-            }
-        }
-        Ok(Self {
-            outer,
-            names,
-            values,
-            extra: RefCell::new(extra),
-        })
-    }
-
-    /// The per-iteration copy: the values come across by slot and the names
-    /// are shared, so nothing is looked up by name and nothing is allocated.
-    fn copy_of(outer: Option<EnvRef>, previous: &Self) -> Self {
-        let values = [const { Cell::new(None) }; INLINE_PER_ITERATION_SLOTS];
-        for (slot, previous) in values.iter().zip(previous.values.iter()) {
-            slot.set(previous.get());
-        }
+impl SlotEnv {
+    fn new(outer: Option<EnvRef>, layout: Rc<[SlotSpec]>, context_transparent: bool) -> Self {
+        let values = Slots::with_len(layout.len());
         Self {
             outer,
-            names: previous.names.clone(),
+            layout,
             values,
-            extra: RefCell::new(previous.extra.borrow().clone()),
+            extra: RefCell::new(None),
+            context_transparent,
         }
     }
 
-    /// Whether this record holds exactly `names` in order — the guard on the
-    /// slot copy, so a chain of copies can never shift a binding.
-    fn names_match(&self, names: &[JsString]) -> bool {
-        self.names.len() == names.len()
-            && self
-                .names
-                .iter()
-                .zip(names)
-                .all(|(stored, name)| stored == name)
+    pub(crate) fn context_transparent(&self) -> bool {
+        self.context_transparent
+    }
+
+    fn extra_slice(&self) -> std::cell::Ref<'_, ExtraTable> {
+        self.extra.borrow()
     }
 
     fn locate(&self, name: &JsString) -> Option<SlotLoc> {
-        for (index, stored) in self.names.iter().enumerate() {
-            if stored == name {
-                return Some(if index < INLINE_PER_ITERATION_SLOTS {
-                    SlotLoc::Inline(index)
-                } else {
-                    SlotLoc::Extra(index - INLINE_PER_ITERATION_SLOTS)
-                });
+        for (index, spec) in self.layout.iter().enumerate() {
+            if spec.name == *name {
+                return Some(SlotLoc::Values(index));
             }
         }
-        self.extra
-            .borrow()
-            .iter()
-            .position(|(stored, _)| stored == name)
+        let extra = self.extra_slice();
+        extra
+            .as_deref()
+            .and_then(|extra| extra.iter().position(|(stored, _)| stored == name))
             .map(SlotLoc::Extra)
     }
 
-    /// The location of the binding at binding-order `index`, or `None` when
-    /// the index is past the last binding.
     fn slot_loc(&self, index: usize) -> Option<SlotLoc> {
-        let inline = self.inline_len();
-        if index < inline {
-            return Some(SlotLoc::Inline(index));
+        if index < self.layout.len() {
+            return Some(SlotLoc::Values(index));
         }
-        let position = index - inline;
-        (position < self.extra.borrow().len()).then_some(SlotLoc::Extra(position))
+        let position = index - self.layout.len();
+        let extra = self.extra_slice();
+        let len = extra.as_deref().map_or(0, Vec::len);
+        (position < len).then_some(SlotLoc::Extra(position))
     }
 
     pub(crate) fn slot_value(&self, index: usize) -> Option<Value> {
         match self.slot_loc(index)? {
-            SlotLoc::Inline(slot) => self.values[slot].get(),
-            SlotLoc::Extra(position) => self.extra.borrow()[position].1.value,
+            SlotLoc::Values(slot) => self.values.get(slot).flatten(),
+            SlotLoc::Extra(position) => self
+                .extra_slice()
+                .as_deref()
+                .and_then(|extra| extra.get(position))
+                .and_then(|(_, binding)| binding.value),
         }
     }
 
     pub(crate) fn set_slot(&self, index: usize, value: Value) {
         match self.slot_loc(index) {
-            Some(SlotLoc::Inline(slot)) => self.values[slot].set(Some(value)),
+            Some(SlotLoc::Values(slot)) => self.values.set(slot, Some(value)),
             Some(SlotLoc::Extra(position)) => {
-                if let Some((_, binding)) = self.extra.borrow_mut().get_mut(position) {
+                if let Some(extra) = self.extra.borrow_mut().as_mut()
+                    && let Some((_, binding)) = extra.get_mut(position)
+                {
                     binding.value = Some(value);
                 }
             }
@@ -1135,9 +1214,42 @@ impl PerIterationEnv {
 
     pub(crate) fn slot_mutable(&self, index: usize) -> bool {
         match self.slot_loc(index) {
-            Some(SlotLoc::Inline(_)) => true,
-            Some(SlotLoc::Extra(position)) => self.extra.borrow()[position].1.mutable,
+            Some(SlotLoc::Values(slot)) => self.layout[slot].mutable,
+            Some(SlotLoc::Extra(position)) => self
+                .extra_slice()
+                .as_deref()
+                .and_then(|extra| extra.get(position))
+                .is_some_and(|(_, binding)| binding.mutable),
             None => false,
+        }
+    }
+
+    /// Whether this record holds exactly `names` in order — the guard on the
+    /// slot copy, so a chain of copies can never shift a binding.
+    fn names_match(&self, names: &[JsString]) -> bool {
+        self.layout.len() == names.len()
+            && self
+                .layout
+                .iter()
+                .zip(names)
+                .all(|(spec, name)| spec.name == *name)
+    }
+
+    /// A copy of this record for the next loop iteration: same site, its own
+    /// value array.
+    fn fresh(&self, outer: Option<EnvRef>) -> Self {
+        let values = Slots::with_len(self.layout.len());
+        values.copy_from(&self.values);
+        Self {
+            outer,
+            layout: Rc::clone(&self.layout),
+            values,
+            extra: RefCell::new(
+                self.extra_slice()
+                    .as_ref()
+                    .map(|extra| Box::new(extra.as_ref().clone())),
+            ),
+            context_transparent: self.context_transparent,
         }
     }
 
@@ -1147,12 +1259,17 @@ impl PerIterationEnv {
 
     fn get_binding_value(&self, name: &JsString, _strict: bool) -> Result<Value, JsError> {
         match self.locate(name) {
-            Some(SlotLoc::Inline(slot)) => self.values[slot]
-                .get()
+            Some(SlotLoc::Values(slot)) => self
+                .values
+                .get(slot)
+                .flatten()
                 .ok_or_else(|| binding_uninitialized(name)),
             Some(SlotLoc::Extra(position)) => {
-                let extra = self.extra.borrow();
-                let (_, binding) = &extra[position];
+                let extra = self.extra_slice();
+                let Some((_, binding)) = extra.as_deref().and_then(|extra| extra.get(position))
+                else {
+                    return Err(binding_not_defined(name));
+                };
                 if let Some(indirect) = &binding.indirect {
                     return indirect.0.get_binding_value(&indirect.1, true);
                 }
@@ -1169,17 +1286,28 @@ impl PerIterationEnv {
         strict: bool,
     ) -> Result<(), JsError> {
         match self.locate(name) {
-            Some(SlotLoc::Inline(slot)) => {
-                if self.values[slot].get().is_none() {
+            Some(SlotLoc::Values(slot)) => {
+                if self.values.get(slot).flatten().is_none() {
                     return Err(binding_uninitialized(name));
                 }
-                self.values[slot].set(Some(value));
-                Ok(())
+                let spec = &self.layout[slot];
+                // spec step 2: a strict binding forces strict semantics.
+                let strict = strict || spec.strict;
+                if spec.mutable {
+                    self.values.set(slot, Some(value));
+                    Ok(())
+                } else if strict {
+                    Err(binding_is_constant(name))
+                } else {
+                    Ok(())
+                }
             }
             Some(SlotLoc::Extra(position)) => {
                 let mut extra = self.extra.borrow_mut();
-                let (_, binding) = &mut extra[position];
-                // spec step 2: a strict binding forces strict semantics.
+                let Some((_, binding)) = extra.as_mut().and_then(|extra| extra.get_mut(position))
+                else {
+                    return Err(binding_not_defined(name));
+                };
                 let strict = strict || binding.strict;
                 if binding.value.is_none() {
                     return Err(binding_uninitialized(name));
@@ -1204,12 +1332,16 @@ impl PerIterationEnv {
 
     fn initialize_binding(&self, name: &JsString, value: Value) -> Result<(), JsError> {
         match self.locate(name) {
-            Some(SlotLoc::Inline(slot)) => {
-                self.values[slot].set(Some(value));
+            Some(SlotLoc::Values(slot)) => {
+                self.values.set(slot, Some(value));
                 Ok(())
             }
             Some(SlotLoc::Extra(position)) => {
-                self.extra.borrow_mut()[position].1.value = Some(value);
+                if let Some(extra) = self.extra.borrow_mut().as_mut()
+                    && let Some((_, binding)) = extra.get_mut(position)
+                {
+                    binding.value = Some(value);
+                }
                 Ok(())
             }
             None => Err(JsError::new(
@@ -1226,7 +1358,10 @@ impl PerIterationEnv {
                 format!("Binding {:?} already exists", name.to_string_lossy()),
             ));
         }
-        self.extra.borrow_mut().push((name.clone(), binding));
+        let mut extra = self.extra.borrow_mut();
+        extra
+            .get_or_insert_with(Box::default)
+            .push((name.clone(), binding));
         Ok(())
     }
 
@@ -1262,17 +1397,21 @@ impl PerIterationEnv {
         if self.has_binding(name) {
             return;
         }
-        self.extra
-            .borrow_mut()
+        let mut extra = self.extra.borrow_mut();
+        extra
+            .get_or_insert_with(Box::default)
             .push((name.clone(), per_iteration_binding(value)));
     }
 
     fn delete_binding(&self, name: &JsString) -> Result<bool, JsError> {
         match self.locate(name) {
-            // A loop head is a lexical binding: never deletable.
-            Some(SlotLoc::Inline(_)) => Ok(false),
+            // A slot is a lexical binding: never deletable.
+            Some(SlotLoc::Values(_)) => Ok(false),
             Some(SlotLoc::Extra(position)) => {
                 let mut extra = self.extra.borrow_mut();
+                let Some(extra) = extra.as_mut() else {
+                    return Ok(true);
+                };
                 if !extra[position].1.deletable {
                     return Ok(false);
                 }
@@ -1285,7 +1424,8 @@ impl PerIterationEnv {
 
     fn mark_parameter(&self, name: &JsString) {
         if let Some(SlotLoc::Extra(position)) = self.locate(name)
-            && let Some((_, binding)) = self.extra.borrow_mut().get_mut(position)
+            && let Some(extra) = self.extra.borrow_mut().as_mut()
+            && let Some((_, binding)) = extra.get_mut(position)
         {
             binding.parameter = true;
         }
@@ -1293,7 +1433,11 @@ impl PerIterationEnv {
 
     fn is_parameter(&self, name: &JsString) -> bool {
         match self.locate(name) {
-            Some(SlotLoc::Extra(position)) => self.extra.borrow()[position].1.parameter,
+            Some(SlotLoc::Extra(position)) => self
+                .extra_slice()
+                .as_deref()
+                .and_then(|extra| extra.get(position))
+                .is_some_and(|(_, binding)| binding.parameter),
             _ => false,
         }
     }
@@ -1301,22 +1445,33 @@ impl PerIterationEnv {
     /// This record's bindings in slot order, flattened into the ordinary
     /// name-addressed shape (what the snapshot writer carries).
     pub fn carried_bindings(&self) -> Vec<(JsString, Binding)> {
-        let inline = self.inline_len();
-        let extra = self.extra.borrow();
-        let mut bindings = Vec::with_capacity(self.names.len() + extra.len());
-        for (index, name) in self.names.iter().enumerate() {
-            let value = if index < inline {
-                self.values[index].get()
-            } else {
-                extra[index - inline].1.value
-            };
-            let mut binding = per_iteration_binding(Value::Undefined);
-            binding.value = value;
-            bindings.push((name.clone(), binding));
+        let extra = self.extra_slice();
+        let extra = extra.as_deref().map(Vec::as_slice).unwrap_or(&[]);
+        let mut bindings = Vec::with_capacity(self.layout.len() + extra.len());
+        for (index, spec) in self.layout.iter().enumerate() {
+            bindings.push((
+                spec.name.clone(),
+                Binding {
+                    value: self.values.get(index).flatten(),
+                    mutable: spec.mutable,
+                    strict: spec.strict,
+                    deletable: false,
+                    indirect: None,
+                    parameter: false,
+                },
+            ));
         }
-        bindings.extend(extra.iter().skip(self.names.len() - inline).cloned());
+        bindings.extend(extra.iter().cloned());
         bindings
     }
+}
+
+/// A capture context (Cut 3 continuation): the per-call record holding the
+/// bindings a certified body's closures capture. `layout` is the body's shared
+/// slot table, built once when the body is certified; every slot starts in the
+/// TDZ and the caller fills the initialized ones by slot.
+pub fn new_capture_context(outer: EnvRef, layout: Rc<[SlotSpec]>) -> EnvRef {
+    Handle::new(EnvRecord::Slot(SlotEnv::new(Some(outer), layout, false)))
 }
 
 /// CreatePerIterationEnvironment (spec 14.7.4.3): a fresh record holding the
@@ -1332,12 +1487,25 @@ pub fn new_per_iteration_environment(
     source: &EnvRef,
 ) -> Result<EnvRef, JsError> {
     let env = match &**source {
-        EnvRecord::PerIteration(previous) if previous.names_match(names) => {
-            PerIterationEnv::copy_of(outer, previous)
+        EnvRecord::Slot(previous) if previous.names_match(names) => previous.fresh(outer),
+        _ => {
+            let layout: Rc<[SlotSpec]> = names
+                .iter()
+                .map(|name| SlotSpec {
+                    name: name.clone(),
+                    mutable: true,
+                    strict: false,
+                })
+                .collect();
+            let env = SlotEnv::new(outer, layout, true);
+            for (index, name) in names.iter().enumerate() {
+                let value = source.get_binding_value(name, false)?;
+                env.values.set(index, Some(value));
+            }
+            env
         }
-        _ => PerIterationEnv::from_named(outer, names, source)?,
     };
-    Ok(Handle::new(EnvRecord::PerIteration(env)))
+    Ok(Handle::new(EnvRecord::Slot(env)))
 }
 
 /// An Object Environment Record (spec 9.2.3).
@@ -2215,7 +2383,7 @@ mod tests {
         // The inline slots remove an allocation per iteration only if they do
         // not grow the box every other environment record allocates: the
         // per-iteration variant has to stay under the largest one.
-        assert!(std::mem::size_of::<PerIterationEnv>() <= std::mem::size_of::<FunctionEnv>());
+        assert!(std::mem::size_of::<SlotEnv>() <= std::mem::size_of::<FunctionEnv>());
     }
 
     /// A loop environment holding `names`, initialized to 1, 2, 3…
@@ -2237,7 +2405,7 @@ mod tests {
         let names = [name("i"), name("j"), name("k")];
         let loop_env = loop_env(&names);
         let first = new_per_iteration_environment(Some(loop_env), &names, &loop_env).unwrap();
-        let EnvRecord::PerIteration(first_record) = &*first else {
+        let EnvRecord::Slot(first_record) = &*first else {
             panic!("a per-iteration environment")
         };
         assert_eq!(
@@ -2319,6 +2487,115 @@ mod tests {
                 .unwrap()
                 .as_number(),
             Some(2.0)
+        );
+    }
+
+    #[test]
+    fn capture_context_slots_carry_const_and_tdz() {
+        // A capture context is the same record with the compiler's per-slot
+        // attributes: a captured `const` rejects writes even from sloppy code
+        // (it is created strict), and a captured `let` starts in the TDZ.
+        let outer = new_declarative_environment(None);
+        let layout: std::rc::Rc<[SlotSpec]> = [
+            SlotSpec::new(name("mutable"), true, false),
+            SlotSpec::new(name("fixed"), false, true),
+            SlotSpec::new(name("pending"), true, false),
+        ]
+        .into();
+        let env = new_capture_context(outer, layout);
+        let EnvRecord::Slot(record) = &*env else {
+            panic!("a capture context")
+        };
+        env.set_slot(0, Value::Number(1.0));
+        env.set_slot(1, Value::Number(2.0));
+        // Slot 2 stays uninitialized: the TDZ.
+
+        assert_eq!(
+            env.get_binding_value(&name("mutable"), false)
+                .unwrap()
+                .as_number(),
+            Some(1.0)
+        );
+        let tdz = env.get_binding_value(&name("pending"), false).unwrap_err();
+        assert_eq!(tdz.kind, ErrorKind::ReferenceError);
+        assert!(
+            record.slot_value(2).is_none(),
+            "an uninitialized slot is TDZ"
+        );
+
+        env.set_mutable_binding(&name("mutable"), Value::Number(3.0), false)
+            .unwrap();
+        assert_eq!(
+            env.get_binding_value(&name("mutable"), false)
+                .unwrap()
+                .as_number(),
+            Some(3.0)
+        );
+        let constant = env
+            .set_mutable_binding(&name("fixed"), Value::Number(4.0), false)
+            .unwrap_err();
+        assert_eq!(constant.kind, ErrorKind::TypeError, "a const is strict too");
+        assert!(!record.slot_mutable(1));
+        assert_eq!(
+            env.get_binding_value(&name("fixed"), false)
+                .unwrap()
+                .as_number(),
+            Some(2.0),
+            "the rejected write left the value alone"
+        );
+
+        env.initialize_binding(&name("pending"), Value::Number(5.0))
+            .unwrap();
+        assert_eq!(
+            env.get_binding_value(&name("pending"), false)
+                .unwrap()
+                .as_number(),
+            Some(5.0)
+        );
+        assert!(!env.delete_binding(&name("mutable")).unwrap());
+    }
+
+    #[test]
+    fn slot_record_overflow_table_is_lazy_and_named() {
+        // More slots than the inline capacity, and a name the layout does not
+        // describe: both must stay addressable, and the layout's order must
+        // not shift.
+        let outer = new_declarative_environment(None);
+        let names: Vec<JsString> = (0..5).map(|index| name(&format!("v{index}"))).collect();
+        let source = loop_env(&names);
+        let env = new_per_iteration_environment(Some(outer), &names, &source).unwrap();
+        let EnvRecord::Slot(record) = &*env else {
+            panic!("a slot record")
+        };
+        for (index, name) in names.iter().enumerate() {
+            assert_eq!(
+                env.get_binding_value(name, false).unwrap().as_number(),
+                Some(index as f64 + 1.0),
+                "slot {index}"
+            );
+            assert_eq!(
+                record.slot_value(index).and_then(|value| value.as_number()),
+                Some(index as f64 + 1.0),
+                "slot {index} by index"
+            );
+        }
+        env.set_slot(4, Value::Number(50.0));
+        assert_eq!(
+            env.get_binding_value(&names[4], false).unwrap().as_number(),
+            Some(50.0)
+        );
+        // The name-addressed surface still creates a missing binding.
+        env.set_mutable_binding(&name("late"), Value::Number(9.0), false)
+            .unwrap();
+        assert_eq!(
+            env.get_binding_value(&name("late"), false)
+                .unwrap()
+                .as_number(),
+            Some(9.0)
+        );
+        assert_eq!(
+            env.get_binding_value(&names[0], false).unwrap().as_number(),
+            Some(1.0)
         );
     }
 }

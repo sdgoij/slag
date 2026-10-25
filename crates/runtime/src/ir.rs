@@ -11,6 +11,7 @@
 //! a pending-control slot.
 
 use std::collections::{HashMap, HashSet};
+use std::rc::Rc;
 
 use crux::error::{ErrorKind, JsError};
 use crux::handle::Handle;
@@ -31,8 +32,8 @@ use crate::context::{
     resolve_this_binding,
 };
 use crate::env::{
-    DeclarativeEnv, EnvRecord, EnvRef, PerIterationEnv, new_declarative_environment,
-    new_per_iteration_environment,
+    DeclarativeEnv, EnvRecord, EnvRef, SlotEnv, SlotSpec, new_capture_context,
+    new_declarative_environment, new_per_iteration_environment,
 };
 use crate::eval::block_declaration_instantiation;
 use crate::expr::{get_iterator, iterator_close, iterator_step};
@@ -1734,14 +1735,17 @@ pub struct ScopeInfo {
     /// `true` when the context binding starts in the TDZ (a captured
     /// `let`/`const`; a captured `var` starts `undefined`).
     pub context_tdz: Vec<bool>,
-    /// `true` for a captured `const` (the context binding is immutable).
-    pub context_const: Vec<bool>,
     /// The parameter position a captured param's value comes from (the
     /// context binding is initialized with the call argument), or `None`
     /// for a declared binding.
     pub context_param: Vec<Option<usize>>,
     /// Binding name → context slot (mirrors `context_names`).
     pub context_slots: HashMap<crux::AtomId, usize>,
+    /// The context slots' names and attributes, built once when the body is
+    /// certified and shared by every call: a call then allocates only the
+    /// value table, and the name-addressed surface (an uncertified closure, a
+    /// direct eval, a snapshot) reads the same table.
+    pub context_layout: Rc<[SlotSpec]>,
     /// The frame slot holding the body's `arguments` object (Cut 3
     /// continuation): `Some` when the body references `arguments` — the
     /// certified call fills it at entry. Arrow bodies (lexical `arguments`)
@@ -1842,27 +1846,17 @@ impl ScopeInfo {
         outer: &EnvRef,
         args: &[Value],
     ) -> Result<Option<EnvRef>, JsError> {
-        if self.context_names.is_empty() {
+        if self.context_layout.is_empty() {
             return Ok(None);
         }
-        let env = new_declarative_environment(Some(*outer));
-        for (index, name) in self.context_names.iter().enumerate() {
-            let text = crux::lookup(*name);
-            if self.context_const[index] {
-                // Const bindings are created strict unconditionally (spec
-                // 16.1.8: CreateImmutableBinding(dn, true) for const
-                // declarations), so a sloppy nested closure's write to an
-                // enclosing `const` still throws like the env path.
-                env.create_immutable_binding(&text, true)?;
-            } else {
-                env.create_mutable_binding(&text, false)?;
-            }
+        let env = new_capture_context(*outer, Rc::clone(&self.context_layout));
+        for index in 0..self.context_layout.len() {
             let value = match self.context_param[index] {
-                Some(position) => args.get(position).cloned().unwrap_or(Value::Undefined),
+                Some(position) => args.get(position).copied().unwrap_or(Value::Undefined),
                 None if !self.context_tdz[index] => Value::Undefined,
                 None => continue,
             };
-            env.initialize_binding(&text, value)?;
+            env.set_slot(index, value);
         }
         Ok(Some(env))
     }
@@ -2281,6 +2275,14 @@ impl CompiledBody {
 impl Trace for CompiledBody {
     fn trace(&self, visit: &mut dyn FnMut(GcAny)) {
         self.steps.trace(visit);
+        // The capture context's shared slot table names interned strings
+        // (`Flat`/`Small`, no edges in practice); tracing it keeps that an
+        // implementation detail rather than a rooting invariant.
+        if let Some(scope) = &self.scope {
+            for spec in scope.context_layout.iter() {
+                spec.name().trace(visit);
+            }
+        }
         // A call site retains its first callee as a `Value` so the callee
         // function (and thus its box) stays alive: compiled `Op::GuardCallee`
         // code cannot be cleared the way the leaf caches are, so the retained
@@ -24151,26 +24153,26 @@ fn call_site(call: &syntax::ast::CallExpr) -> crux::Span {
 }
 
 /// The certified body's capture context (Cut 3 continuation): its lexical
-/// environment is the per-call declarative environment holding the captured
-/// bindings — or, inside a loop that captures its head, the per-iteration
-/// copy the head slots were moved into.
+/// environment is the per-call record holding the captured bindings — or,
+/// inside a loop that captures its head, the per-iteration copy the head
+/// slots were moved into.
 pub(crate) enum ContextEnv<'a> {
     Declarative(&'a DeclarativeEnv),
-    PerIteration(&'a PerIterationEnv),
+    Slot(&'a SlotEnv),
 }
 
 impl ContextEnv<'_> {
     pub(crate) fn slot_value(&self, index: usize) -> Option<Value> {
         match self {
             ContextEnv::Declarative(e) => e.slot_value(index),
-            ContextEnv::PerIteration(e) => e.slot_value(index),
+            ContextEnv::Slot(e) => e.slot_value(index),
         }
     }
 
     pub(crate) fn slot_mutable(&self, index: usize) -> bool {
         match self {
             ContextEnv::Declarative(e) => e.slot_mutable(index),
-            ContextEnv::PerIteration(e) => e.slot_mutable(index),
+            ContextEnv::Slot(e) => e.slot_mutable(index),
         }
     }
 }
@@ -24179,7 +24181,7 @@ impl ContextEnv<'_> {
 pub(crate) fn context_env(env: &EnvRef) -> ContextEnv<'_> {
     match &**env {
         EnvRecord::Declarative(declarative) => ContextEnv::Declarative(declarative),
-        EnvRecord::PerIteration(per_iteration) => ContextEnv::PerIteration(per_iteration),
+        EnvRecord::Slot(slot) => ContextEnv::Slot(slot),
         _ => unreachable!("a context slot without a capture-context env"),
     }
 }
@@ -24192,7 +24194,7 @@ pub(crate) fn context_env(env: &EnvRef) -> ContextEnv<'_> {
 fn is_context_transparent(env: &EnvRef) -> bool {
     match &**env {
         EnvRecord::Declarative(e) => e.context_transparent.get(),
-        EnvRecord::PerIteration(_) => true,
+        EnvRecord::Slot(e) => e.context_transparent(),
         _ => false,
     }
 }
@@ -27189,9 +27191,14 @@ fn analyze_scope(function: &EcmaFunction) -> Option<ScopeInfo> {
         tdz_store: scan.tdz,
         shadow_slots: scan.shadow_slots,
         shadowed_catch_params: scan.shadowed_catch_params,
+        context_layout: scan
+            .context_names
+            .iter()
+            .zip(&scan.context_const)
+            .map(|(name, &is_const)| SlotSpec::new(crux::lookup(*name), !is_const, is_const))
+            .collect(),
         context_names: scan.context_names,
         context_tdz: scan.context_tdz,
-        context_const: scan.context_const,
         context_param: scan.context_param,
         context_slots: scan.context_slots,
         arguments_slot,
@@ -30785,9 +30792,9 @@ fn analyze_script_scope(
                 tdz_store: scan.tdz,
                 shadow_slots: HashMap::new(),
                 shadowed_catch_params: HashSet::new(),
+                context_layout: Rc::from([]),
                 context_names: Vec::new(),
                 context_tdz: Vec::new(),
-                context_const: Vec::new(),
                 context_param: Vec::new(),
                 context_slots: HashMap::new(),
                 arguments_slot: None,

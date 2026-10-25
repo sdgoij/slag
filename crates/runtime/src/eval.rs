@@ -622,7 +622,7 @@ pub(crate) fn eval_function_declaration(
         }
         // A per-iteration environment binds the loop-head names: a
         // declaration shadowed by one is dead like a block binding.
-        EnvRecord::PerIteration(_) => true,
+        EnvRecord::Slot(_) => true,
         _ => false,
     };
     if binds_here && lexical_env.has_binding(&name)? {

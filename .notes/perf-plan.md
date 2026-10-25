@@ -201,19 +201,22 @@ frontier.
    it to ~288. The plan's stop rule (300k-closure probe below ~85 ms) still
    applies.
 2. **The per-iteration environment** — **DONE** (2026-10-25). The record is now
-   an `EnvRecord::PerIteration` with the head values inline and the names shared
-   per loop, so a copy allocates nothing: -9.8% on the for-in row, -11.5% on the
-   probe (mins, two binaries; see the `LANDED (2026-10-25)` entry in
+   an `EnvRecord::Slot` with the head values inline and the names shared per
+   loop, so a copy allocates nothing: -9.8% on the for-in row, -11.5% on the
+   probe (mins, two binaries; see the `LANDED (2026-10-25)` entries in
    `.notes/perf.md`). An ablation still prices the whole machinery at ~-33% of
    the probe, and what remains is the arena box per iteration — one live record
-   per iteration is what per-iteration bindings are. No P2 item is left with a
-   measured target.
-3. **Object-literal named evaluation**: a function expression as a literal's
-   value costs ~450 ns over the same closure as a variable, because it
-   disqualifies the literal from `ObjectFast` and pays a post-hoc
-   `set_function_name`. Thread the key into `CreateFunction` the way
-   `pending_class_name` threads a class's inferred name.
-4. **Call lanes**: a member call to a closure created in the same iteration costs
+   per iteration is what per-iteration bindings are.
+3. **The capture context** — **DONE** (2026-10-25), same record type: the
+   per-call captured bindings are slots with the scope's shared layout, built
+   once at certification. -9.9% on the for-in row, -8…-9% on the probes that
+   isolate it (mins, two binaries).
+4. **Next, from the 2026-10-25 PROFILE**: the for-in enumeration itself (534
+   ns/body) and the null-prototype property store (88 ns per store against 20
+   into `{}` — `Object.create(null)` is not the cost, the stores are). Closure
+   creation stays gated by the closure plan's stop rule (`e7` = 91.4 ms).
+5. **Object-literal named evaluation**: **DONE** (2026-10-25, `ca4ee26c`).
+6. **Call lanes**: a member call to a closure created in the same iteration costs
    ~350 ns (the for-in row's asserts are three of them per body). This is the
    parked `.notes/rust-initiated-call-plan.md` take-side work plus the
    fresh-function-id leaf entry.

@@ -16223,3 +16223,28 @@ Three things changed since the 2026-10-22 entry. The per-iteration copy is 122 n
 `e7` is 91.4 ms, still above the `.notes/closure-cost-plan.md` stop rule's 85 ms, so Stage D stays off the table; closure creation is ~305 ns of the row's 486 per closure, and the difference is the capture context, which is the next target rather than the record itself.
 
 Scratch probes are under `scratch/ab/decomp/` (git-ignored).
+
+## LANDED (2026-10-25): the capture context is a slot record too
+
+The PROFILE entry above priced the capture-context setup at 310 ns per call for one captured name and 510 for three, and named the reason: `ScopeInfo::new_body_context` built a `DeclarativeEnv` per call and, per captured binding, ran `create_mutable_binding` (a duplicate scan over the binding vector, a `Vec` push, a name clone) followed by `initialize_binding` (a second scan by name). Name-addressed work for bindings the compiler addresses by index — `context_names` order, `context_const`, `context_param`, `context_tdz` are all static.
+
+`PerIterationEnv` is now `SlotEnv` (`env.rs`) and serves both sites: a shared `Rc<[SlotSpec]>` layout (the name and the mutability/strictness of each slot) plus a value table (`[Cell<Option<Value>>; 2]` inline, one heap array beyond that). The per-iteration path is unchanged in shape — its layout is built once per loop from the step's head names — and the capture context gets its layout from `ScopeInfo`, built once when the body is certified (`context_layout`), so a call is now an `Rc` clone plus the value table plus one store per initialized slot: no name clone, no vector, no scans, and nothing name-addressed on the hot path.
+
+One record type, two uses, distinguished by data rather than by variant: `context_transparent` is true for a per-iteration copy (a certified body's closures resolve past it) and false for a capture context (it *is* the context). Everything else the same code: the layout's `mutable`/`strict` carry a captured `const`'s immutability and strictness (a sloppy write to it still throws), an unset slot is the TDZ, and `extra` stays the total fallback for a name the layout does not describe. `EnvRecord::Slot` replaces `PerIteration`, `ContextEnv` gains `Slot`, `has_this_binding`/`get_this_binding` read the reserved `this` binding out of the same table, and the snapshot writer normalizes the record to a declarative one.
+
+Measured with two binaries (`scratch/ab/slag-slot.exe` = before, `slag-capture.exe` = after), alternating order, 8 rounds, mins:
+
+| probe | before | after | min |
+| --- | ---: | ---: | ---: |
+| `language/statements/for-in/head-let-fresh-binding-per-iteration.js` | 498.08 ms | **448.68** | **-9.9%** |
+| the same row, re-measured on the final tree (6 rounds) | 497.28 | **441.85** | -11.1% |
+| `p0` the row's shape, 100k bodies | 402.71 | **373.78** | -7.2% |
+| `p19` one capturing closure, uncalled | 114.89 | **105.41** | -8.3% |
+| `p20` three capturing closures, uncalled | 192.44 | **174.94** | -9.1% |
+| `p15` three capturing closures + calls | 233.55 | **221.09** | -5.3% |
+
+The row's delta is larger than the isolated setup deltas, and it is not GC pacing: the same comparison with `--nursery-threshold 262144` is -10.0%. What it is instead: in this shape the body's capture context holds the loop head, so the per-call record was a `DeclarativeEnv` *plus* a one-binding vector, and both the allocation and the two scans per call were paid 100k times per run.
+
+Correctness: 11 capture shapes diffed against node (a captured var written by a closure and observed after return, a captured `let`'s TDZ, a strict write to a captured `const`, `eval` writing a captured var, a captured param with `arguments`, an env-path arrow capturing `this`, two-level nesting, `delete` on a captured var, a loop closure capturing both the head and a body `let`, a late write, a block `let`). New tests: `env.rs` pins the capture context's const/TDZ semantics (mutation-checked: dropping the spec's strictness fails it) and the overflow table's order and laziness; the per-iteration tests and the `SlotEnv` size invariant still hold.
+
+Gates: `cargo fmt --all -- --check`; `cargo clippy --workspace --all-targets -- -D warnings`; `cargo test --workspace` (40 suites, 0 failed); sweeps `language` 23,726 + `built-ins` 23,821 + `annexB` 1,086 + `intl402` 3,365 = 51,998 at 100%; corpus parity 0 (77 rows, `mean-jitGap=10.15`, `mean-jlGap=3.86`).
