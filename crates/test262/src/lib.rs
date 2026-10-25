@@ -12687,14 +12687,36 @@ var $DONE = function (error) {
         Some(root)
     }
 
+    /// The native stack a fixture runs on. This mirrors the engine's own
+    /// runner (`RUNNER_STACK` in the CLI), because the parser, the RegExp
+    /// parser and the matcher all bound their recursion against the *real*
+    /// stack: a fixture that is fine on the stack a host gives the engine must
+    /// not fail because libtest's own thread is smaller. It is not a luxury —
+    /// test262's `S15.10.2.8_A3_T16` nests 200 groups, which costs ~8.5 KiB of
+    /// debug frames per level (~1.7 MiB), and an aarch64 debug build's larger
+    /// frames do not fit in libtest's 2 MiB thread at all.
+    #[cfg(test)]
+    const FIXTURE_STACK: usize = 16 * 1024 * 1024;
+
     /// Run one fixture as its own test. Skips print and pass; a missing
     /// submodule (fresh clone) makes every fixture pass vacuously.
+    ///
+    /// The body runs on its own thread so it gets [`FIXTURE_STACK`] rather than
+    /// libtest's; a panic inside is resumed on the test thread so the harness
+    /// still attributes it to this fixture.
     #[cfg(test)]
-    fn assert_fixture(area: Area, relative: &str) {
+    fn assert_fixture(area: Area, relative: &'static str) {
         if fixture_root(area).is_none() {
             return;
         }
-        match run_fixture(area, relative) {
+        let result = std::thread::Builder::new()
+            .name("test262-fixture".into())
+            .stack_size(FIXTURE_STACK)
+            .spawn(move || run_fixture(area, relative))
+            .expect("spawn the fixture thread")
+            .join()
+            .unwrap_or_else(|payload| std::panic::resume_unwind(payload));
+        match result {
             FixtureResult::Pass => {}
             FixtureResult::Skip(reason) => eprintln!("SKIP {relative}: {reason}"),
             FixtureResult::Fail(reason) => panic!("FAIL {relative}: {reason}"),
