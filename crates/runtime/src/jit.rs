@@ -3135,11 +3135,10 @@ extern "C" fn leaf_call_probe(
     let Some(entry) = agent.leaf_lookup(function.id()) else {
         reject!("leaf-lookup-miss");
     };
-    // Copy the fields out before `ir` is cloned: `leaf_lookup` returns a borrow
-    // of `agent`, and `strict` is needed much later (the `this` binding), so the
-    // borrow must end here.
+    // Copy the fields out before `ir` is taken: `leaf_lookup` returns a
+    // record, and `strict` is needed much later (the `this` binding).
     let strict = entry.strict;
-    let ir = entry.ir.clone();
+    let ir = entry.body();
     let Some(scope) = ir.scope.as_ref() else {
         reject!("no-scope");
     };
@@ -3154,7 +3153,7 @@ extern "C" fn leaf_call_probe(
     let Some(hook) = agent.jit_hook else {
         reject!("no-jit-hook");
     };
-    let info_ptr = crate::jit::lookup_info(hook, &ir, agent.jit_depth > 0);
+    let info_ptr = crate::jit::lookup_info_leaf(agent, hook, &entry, agent.jit_depth > 0);
     if info_ptr.is_null() {
         // Two different nulls. A body the compile threshold has not promoted
         // yet still counts the consult above toward that threshold, so a later
@@ -3294,7 +3293,7 @@ extern "C" fn leaf_call_env(
         return u64::MAX;
     };
     let strict = leaf.strict;
-    let ir = leaf.ir.clone();
+    let ir = leaf.body();
     let Some(scope) = ir.scope.as_ref() else {
         return u64::MAX;
     };
@@ -6916,6 +6915,40 @@ pub(crate) fn lookup_info(
         ptr as *const JitCompiledInfo
     } else {
         std::ptr::null()
+    }
+}
+
+/// [`lookup_info`] for a leaf record: the record carries its body as a
+/// borrowed pointer (the leaf cache cell is `Copy` — see
+/// [`crate::ir::LeafEntry::body`]), while the JIT cache pins the bodies it
+/// compiles, so the cold path (before the body's `jit_info` fast pointer is
+/// set) re-derives the record's strong handle. A warm body never reaches the
+/// cache, so it never pays the lookup.
+pub(crate) fn lookup_info_leaf(
+    agent: &Agent,
+    hook: JitHook,
+    entry: &crate::ir::LeafEntry,
+    in_flight: bool,
+) -> *const JitCompiledInfo {
+    let body = entry.body();
+    let known = body.jit_info.get();
+    if known > 1 {
+        return known as *const JitCompiledInfo;
+    }
+    // The sticky "not JIT-compilable" mark: no hook would be called, so do
+    // not pay the record lookup that only exists to hand the cache an owner.
+    if known == 1 {
+        return std::ptr::null();
+    }
+    match agent
+        .ecma_function(&entry.id)
+        .and_then(|data| data.ir.clone())
+    {
+        Some(owned) => {
+            debug_assert_eq!(std::rc::Rc::as_ptr(&owned), body as *const CompiledBody);
+            lookup_info(hook, &owned, in_flight)
+        }
+        None => std::ptr::null(),
     }
 }
 

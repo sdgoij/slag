@@ -3173,9 +3173,18 @@ pub(crate) const BUILTIN_HANDLER_CELLS: usize = 128;
 /// A cached leaf-inline record: everything the inline call path reads off
 /// the `ecma_functions` record, captured so the per-call HashMap lookup is
 /// skipped on a hit.
-#[derive(Clone)]
+///
+/// `Copy` so the leaf cache can be a `Cell` table — a hit then costs no
+/// borrow flag, which was the interpreter's largest single indirection cost
+/// (`.notes/perf-plan.md`, R2). The body is therefore a borrowed pointer;
+/// [`LeafEntry::body`] carries the lifetime argument.
+#[derive(Clone, Copy)]
 pub(crate) struct LeafEntry {
-    pub ir: std::rc::Rc<CompiledBody>,
+    /// The function id this record was captured for. Ids are never reused,
+    /// so a hit needs no generation check.
+    pub id: u64,
+    /// The compiled body. Borrowed, not owned — see [`LeafEntry::body`].
+    pub ir: *const CompiledBody,
     pub strict: bool,
     /// The function's [[Environment]], kept only when the leaf reads an
     /// environment (`CompiledBody::leaf_uses_env`).
@@ -3185,6 +3194,25 @@ pub(crate) struct LeafEntry {
     /// callee skips the `ecma_functions` HashMap lookup it paid per
     /// construct.
     pub construct_inline: bool,
+}
+
+impl LeafEntry {
+    /// The compiled body this record names.
+    ///
+    /// The pointer is borrowed rather than owned because the cache cell must
+    /// stay `Copy`. Every body a leaf record can name is owned for the agent's
+    /// life by `AgentRoots::compiled_bodies`: `shared_compiled_body` is the
+    /// only producer of `EcmaFunction::ir`, it inserts the body there, and
+    /// nothing in the engine removes or clears that table. The leaf cache is a
+    /// sibling field of that cache in the same roots allocation, a record is
+    /// keyed by a function id that is never reused, and only a live function's
+    /// record can fill one — so the body outlives the record and the roots
+    /// that hold it, including across the record's eviction.
+    #[inline(always)]
+    pub(crate) fn body(&self) -> &CompiledBody {
+        // SAFETY: the roots own the body for their whole life (see above).
+        unsafe { &*self.ir }
+    }
 }
 
 impl Trace for LeafEntry {
@@ -12377,7 +12405,7 @@ impl Vm {
     fn run_leaf_body(
         &mut self,
         agent: &mut Agent,
-        ir: &std::rc::Rc<CompiledBody>,
+        ir: &CompiledBody,
         environment: Option<EnvRef>,
         strict: bool,
         this_value: Value,
@@ -13382,13 +13410,14 @@ impl Vm {
     fn run_leaf_construct(
         &mut self,
         agent: &mut Agent,
-        ir: &std::rc::Rc<CompiledBody>,
+        entry: LeafEntry,
         environment: Option<EnvRef>,
         strict: bool,
         new_target: &Value,
         args: &[Value],
         shared: Option<(*mut std::os::raw::c_void, usize)>,
     ) -> Result<Value, JsError> {
+        let ir = entry.body();
         let this = crate::function::construct_this_object(agent, new_target)?;
         // The shared-ctx construct leaf run (the compiled caller's helper):
         // when the caller's machine code provided its ctx + current working
@@ -13400,7 +13429,7 @@ impl Vm {
         if let Some((ctx_ptr, sp)) = shared
             && environment.is_none()
             && let Some(value) =
-                self.try_shared_construct_leaf(agent, strict, this, ir, args, ctx_ptr, sp)?
+                self.try_shared_construct_leaf(agent, strict, this, entry, args, ctx_ptr, sp)?
         {
             // spec 10.2.1 [[Construct]] steps 15-21 (base): an object
             // return wins; anything else falls back to `this`.
@@ -13417,7 +13446,7 @@ impl Vm {
         if agent.jit_hook.is_some() {
             let pre_call = self.stack.len();
             self.stack.extend_from_slice(args);
-            if self.run_jit_leaf(agent, args.len(), this, ir, strict, 0, environment)? {
+            if self.run_jit_leaf(agent, args.len(), this, entry, 0)? {
                 let value = self.pop();
                 return match value.kind() {
                     ValueKind::Object(_) | ValueKind::Function(_) => Ok(value),
@@ -13462,11 +13491,12 @@ impl Vm {
         agent: &mut Agent,
         strict: bool,
         this: Value,
-        ir: &std::rc::Rc<CompiledBody>,
+        entry: LeafEntry,
         args: &[Value],
         ctx_ptr: *mut std::os::raw::c_void,
         sp: usize,
     ) -> Result<Option<Value>, JsError> {
+        let ir = entry.body();
         let Some(hook) = agent.jit_hook else {
             return Ok(None);
         };
@@ -13480,7 +13510,7 @@ impl Vm {
         // rule regardless.
         // The per-body compiled entry (see `run_jit_leaf`): null means not
         // JIT-compilable — fall back.
-        let info_ptr = crate::jit::lookup_info(hook, ir, agent.jit_depth > 0);
+        let info_ptr = crate::jit::lookup_info_leaf(agent, hook, &entry, agent.jit_depth > 0);
         if info_ptr.is_null() {
             return Ok(None);
         }
@@ -13621,16 +13651,23 @@ impl Vm {
             // cached at ir-compile time.
             && entry.construct_inline
         {
-            let ir = entry.ir.clone();
             let strict = entry.strict;
             // Cut 30: clone the callee's env only for a leaf
             // that reads one (see `do_call_fast`).
-            let environment = if ir.leaf_uses_env {
+            let environment = if entry.body().leaf_uses_env {
                 entry.environment
             } else {
                 None
             };
-            return self.run_leaf_construct(agent, &ir, environment, strict, &callee, args, shared);
+            return self.run_leaf_construct(
+                agent,
+                entry,
+                environment,
+                strict,
+                &callee,
+                args,
+                shared,
+            );
         }
         if let Some((ctx_ptr, _sp)) = shared
             && agent.realm_count.get() == 1
@@ -14178,27 +14215,11 @@ impl Vm {
             && agent.realm_count.get() == 1
             && let Some(entry) = agent.leaf_lookup(function.id())
         {
-            let entry = LeafEntry {
-                ir: entry.ir.clone(),
-                strict: entry.strict,
-                environment: entry.environment,
-                construct_inline: entry.construct_inline,
-            };
             let below = self.stack.len() - argc - keep;
             // The JIT path first: `run_jit_leaf` pushes the result exactly
             // like the interpreter's leaf-inline run (the truncate + push
             // tail), so the same pop-and-complete-return follows.
-            if agent.jit_hook.is_some()
-                && self.run_jit_leaf(
-                    agent,
-                    argc,
-                    this,
-                    &entry.ir,
-                    entry.strict,
-                    below,
-                    entry.environment,
-                )?
-            {
+            if agent.jit_hook.is_some() && self.run_jit_leaf(agent, argc, this, entry, below)? {
                 let value = self.pop();
                 return Ok(TailOutcome::Returned(
                     self.return_completion(agent, body, value)?,
@@ -14550,7 +14571,7 @@ impl Vm {
             let cells = agent.roots.global_leaf_cells.borrow();
             match cells[index].as_ref() {
                 Some(cell) if cell.name == name => {
-                    Some((cell.entry.clone(), cell.global_id, cell.global_generation))
+                    Some((cell.entry, cell.global_id, cell.global_generation))
                 }
                 _ => None,
             }
@@ -14565,16 +14586,7 @@ impl Vm {
                 && !agent.is_terminating()
         {
             if agent.jit_hook.is_some() {
-                if self.try_jit_leaf(
-                    agent,
-                    argc,
-                    Value::Undefined,
-                    &entry.ir,
-                    entry.strict,
-                    0,
-                    entry.environment,
-                    caller_arg_base,
-                )? {
+                if self.try_jit_leaf(agent, argc, Value::Undefined, entry, 0, caller_arg_base)? {
                     return Ok(());
                 }
                 // The fused args (if any) were materialized by the JIT
@@ -14626,7 +14638,7 @@ impl Vm {
             Some(payload) => {
                 let cells = agent.roots.slot_leaf_cells.borrow();
                 match cells[slot & (SLOT_LEAF_CELLS - 1)].as_ref() {
-                    Some(cell) if cell.payload == payload => Some(cell.entry.clone()),
+                    Some(cell) if cell.payload == payload => Some(cell.entry),
                     _ => None,
                 }
             }
@@ -14640,16 +14652,7 @@ impl Vm {
             && !agent.is_terminating()
         {
             if agent.jit_hook.is_some() {
-                if self.try_jit_leaf(
-                    agent,
-                    argc,
-                    Value::Undefined,
-                    &entry.ir,
-                    entry.strict,
-                    0,
-                    entry.environment,
-                    caller_arg_base,
-                )? {
+                if self.try_jit_leaf(agent, argc, Value::Undefined, entry, 0, caller_arg_base)? {
                     return Ok(());
                 }
                 // The fused args (if any) were materialized by the JIT
@@ -14703,7 +14706,7 @@ impl Vm {
         below: usize,
         caller_arg_base: Option<usize>,
     ) -> Result<(), JsError> {
-        let ir = entry.ir;
+        let ir = entry.body();
         let strict = entry.strict;
         let environment = entry.environment;
         // Cut 35 slice 1: a register leaf runs on the small dedicated
@@ -14780,7 +14783,7 @@ impl Vm {
                     LeafFrame::Pushed(args)
                 }
             };
-            self.run_leaf_regs(agent, ops, &ir, environment, this_value, frame)?
+            self.run_leaf_regs(agent, ops, ir, environment, this_value, frame)?
         } else {
             // Step-path leaf: materialize the fused site's args (if any),
             // then the step body on the copied arguments.
@@ -14798,7 +14801,7 @@ impl Vm {
                 args_owned = self.stack[arg_start..n].to_vec();
                 &args_owned[..]
             };
-            self.run_leaf_body(agent, &ir, environment, strict, this_value, args)?
+            self.run_leaf_body(agent, ir, environment, strict, this_value, args)?
         };
         let result = Self::leaf_completion_result(completion)?;
         self.stack.truncate(pre_call - below);
@@ -14826,16 +14829,7 @@ impl Vm {
         if agent.is_terminating() {
             return Err(crate::agent::termination_error());
         }
-        if self.try_jit_leaf(
-            agent,
-            argc,
-            this,
-            &entry.ir,
-            entry.strict,
-            below,
-            entry.environment,
-            None,
-        )? {
+        if self.try_jit_leaf(agent, argc, this, entry, below, None)? {
             return Ok(());
         }
         self.run_inline_leaf(agent, argc, this, entry, below, None)
@@ -14858,10 +14852,8 @@ impl Vm {
         agent: &mut Agent,
         argc: usize,
         this: Value,
-        ir: &std::rc::Rc<CompiledBody>,
-        strict: bool,
+        entry: LeafEntry,
         below: usize,
-        environment: Option<EnvRef>,
         caller_arg_base: Option<usize>,
     ) -> Result<bool, JsError> {
         if agent.jit_hook.is_none() {
@@ -14872,7 +14864,7 @@ impl Vm {
                 self.stack.push(*self.frame_get(base + i));
             }
         }
-        self.run_jit_leaf(agent, argc, this, ir, strict, below, environment)
+        self.run_jit_leaf(agent, argc, this, entry, below)
     }
 
     /// The JIT leaf path (see `crate::jit`): run `ir`'s compiled machine
@@ -14894,11 +14886,12 @@ impl Vm {
         agent: &mut Agent,
         argc: usize,
         this_value: Value,
-        ir: &std::rc::Rc<CompiledBody>,
-        strict: bool,
+        entry: LeafEntry,
         below: usize,
-        environment: Option<EnvRef>,
     ) -> Result<bool, JsError> {
+        let ir = entry.body();
+        let strict = entry.strict;
+        let environment = entry.environment;
         let Some(hook) = agent.jit_hook else {
             return Ok(false);
         };
@@ -14927,7 +14920,7 @@ impl Vm {
         // enclosing JIT depth: a nested lookup (a helper re-entering the
         // interpreter mid-run) must not let the cache evict a running
         // frame's code.
-        let info_ptr = crate::jit::lookup_info(hook, ir, agent.jit_depth > 0);
+        let info_ptr = crate::jit::lookup_info_leaf(agent, hook, &entry, agent.jit_depth > 0);
         if info_ptr.is_null() {
             return Ok(false);
         }
@@ -15051,7 +15044,7 @@ impl Vm {
             leaf_epoch: 0,
             leaf_records: agent.leaf_records.as_mut_ptr(),
             leaf_gen: agent.leaf_gen,
-            body: std::rc::Rc::as_ptr(ir),
+            body: ir as *const CompiledBody,
             tail: false,
             current_function: 0,
             self_entry: 0,
@@ -15229,7 +15222,7 @@ impl Vm {
                     // callee is stable under the compiler's guard; the
                     // generation re-validates any global mutation).
                     let index = Self::global_cell_index(name);
-                    let cached = entry.clone();
+                    let cached = entry;
                     let global = self.global_object(agent)?;
                     agent.roots.global_leaf_cells.borrow_mut()[index] = Some(GlobalLeafCell {
                         name,
@@ -15241,7 +15234,7 @@ impl Vm {
                 LeafCacheSite::Slot { index, callee } => {
                     // The held `callee` keeps the closure alive, so its
                     // payload can never be reused while the entry exists.
-                    let cached = entry.clone();
+                    let cached = entry;
                     agent.roots.slot_leaf_cells.borrow_mut()[index] = Some(SlotLeafCell {
                         payload: callee
                             .heap_payload()
@@ -15255,16 +15248,7 @@ impl Vm {
             // The JIT path (when installed) runs the certified body's
             // machine code; a body without compiled code falls through to
             // the interpreter's leaf-inline run.
-            if self.try_jit_leaf(
-                agent,
-                argc,
-                this,
-                &entry.ir,
-                entry.strict,
-                below,
-                entry.environment,
-                None,
-            )? {
+            if self.try_jit_leaf(agent, argc, this, entry, below, None)? {
                 return Ok(());
             }
             return self.run_inline_leaf(agent, argc, this, entry, below, None);

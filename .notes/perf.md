@@ -15998,3 +15998,64 @@ The fix is the pattern `environment` and `resolving_promise` already use: the re
 The probe now lands at ~585 ns/iteration — faster than the `{ m: function () {} }` control (145 ms, unchanged; it has no home object) and level with the cost of creating any closure. The two commits together are 164x on the probe (19,272.7 ms -> 117.4 ms).
 
 Gates: `cargo fmt --all -- --check`; `cargo clippy --workspace --all-targets -- -D warnings`; `cargo test --workspace` (0 failed); sweeps `built-ins` 23,821 + `language` 23,726 + `annexB` 1,086 + `intl402` 3,365 = 51,998 at 100%; `--gc-stress` sweeps of `language/expressions/object` (1,170) and `language/expressions/class` (4,059) 0 fail; corpus parity 0.
+
+## LANDED (2026-10-25): the leaf cache is a `Cell` table of `Copy` records (P1 R2)
+
+Slice 4h moved the leaf cache into `AgentRoots` behind a `RefCell`, and priced
+the borrow it added at +6.3% `per-iteration` / +4.5% `construct churn`. The
+option that slice left on the table is taken here: `LeafEntry` is `Copy`, so
+the table is `Box<[Cell<Option<LeafEntry>>; 256]>`, a hit is one load plus an
+identity compare, and there is no borrow flag and no `Rc` refcount bump.
+
+The `Rc<CompiledBody>` became a borrowed `*const CompiledBody`
+(`LeafEntry::body`). The lifetime argument is not "the function record owns it"
+— records are reaped — but the stronger one `shared_compiled_body` gives:
+every body a leaf record can name was inserted into
+`AgentRoots::compiled_bodies` when it was compiled, that table is never cleared
+or evicted, and it is the cache `EcmaFunction::ir` is cloned from. The leaf
+cache is a sibling field of it inside the same roots allocation, so the body
+outlives the record and the eviction. The JIT's cold consult is the one place
+that still needs an owner (the cache pins the bodies it compiles), so
+`lookup_info_leaf` re-derives the record's `Rc` by id — only until the body's
+`jit_info` fast pointer is set; a warm body returns before the lookup, and the
+sticky not-compilable mark returns null without one.
+
+The traced env edge is unchanged: the collector copies each cell out
+(`Cell::get`) and traces it, exactly as 4h's `Copy` verdict arrays do.
+
+Interleaved A/B against a binary from `HEAD` (`ed04170c`), order flipped each
+round, medians of 7 rounds (`--bench`, interpreter):
+
+| row | before | after | change |
+| --- | ---: | ---: | ---: |
+| `per-iteration` | 11.601 ms | **10.812 ms** | **-6.8%** |
+| `construct churn` | 20.036 ms | **19.317 ms** | **-3.6%** |
+| `function calls` | 31.539 ms | **30.812 ms** | -2.3% |
+| `closure capture` | 36.363 ms | **35.827 ms** | -1.5% |
+
+That recovers the measured 6.3% / 4.5%. The other rows are inside the
+suite's own spread (`bare loop` +5.2%, `string concat` +2.9% both ways).
+
+The callback lanes gained more than the plan predicted, because they read the
+cache per element: corpus medians of 5 alternating rounds (jit column):
+
+| row | before | after | change |
+| --- | ---: | ---: | ---: |
+| `opcost/typed_array_for_each` | 30.805 ms | **26.382 ms** | **-14.4%** |
+| `opcost/array_for_each` | 29.669 ms | **26.174 ms** | **-11.8%** |
+| `opcost/map_for_each` | 28.367 ms | **25.357 ms** | **-10.6%** |
+| `opcost/array_to_sorted` | 39.899 ms | **38.191 ms** | -4.3% |
+| `calls/direct_leaf` | 13.272 ms | **12.898 ms** | -2.8% |
+| `calls/closure_capture` | 41.888 ms | **41.548 ms** | -0.8% |
+
+`global_leaf_cells` and `slot_leaf_cells` were deliberately left as `RefCell`s:
+4h measured the global-callee lane that hits `global_leaf_cells` at 0%, and the
+`Copy` record already removed their entry clone (`calls/method_call` +1.1%,
+`opcost/method_call` +1.9% — run noise on 1.2-57 ms rows).
+
+Gates: `cargo fmt --all -- --check`; `cargo clippy --workspace --all-targets --
+-D warnings`; `cargo test --workspace` (0 failed); sweeps `language` 23,726 +
+`built-ins` 23,821 + `annexB` 1,086 + `intl402` 3,365 = 51,998 at 100%;
+`--gc-stress --gc-verify` on `language *for-in*` (153), `language *closure*`
+(23) and `built-ins *Generator*` (157) 0 fail; corpus parity 0 (77 rows,
+mean-jitGap 10.55, mean-jlGap 3.82).

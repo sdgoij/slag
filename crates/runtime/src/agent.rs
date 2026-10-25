@@ -414,9 +414,10 @@ impl crux::heap::Trace for ErrorStack {
 /// (strict, fast_script, jsx) — see [`AgentRoots::script_bodies`].
 pub(crate) type ScriptBodyKey = (crux::JsString, bool, bool, bool);
 
-/// One leaf-inline cache cell: the function id it was filled for plus the
-/// record body's hot path needs.
-pub(crate) type LeafCacheCell = Option<(u64, crate::ir::LeafEntry)>;
+/// One leaf-inline cache cell: the record body's hot path needs, or `None`.
+/// The payload is `Copy`, so the table is a `Cell` array and a hit costs no
+/// borrow flag (R2 in `.notes/perf-plan.md`).
+pub(crate) type LeafCacheCell = Option<crate::ir::LeafEntry>;
 
 /// The agent's execution-context stack (spec 9.4).
 ///
@@ -806,8 +807,9 @@ pub(crate) struct AgentRoots {
     /// The leaf-inline cache (Cut 34): function id → the record data
     /// `do_call_fast` needs (compiled ir, strictness, closure env), so a hot
     /// leaf call skips the `ecma_functions` HashMap lookup. Boxed per the
-    /// Cut 27 lesson.
-    pub(crate) leaf_cache: RefCell<Box<[LeafCacheCell; crate::ir::LEAF_CACHE]>>,
+    /// Cut 27 lesson. The payload is `Copy`, so the table is a `Cell` array:
+    /// a hit is one load and an identity compare, with no borrow flag (R2).
+    pub(crate) leaf_cache: Box<[Cell<LeafCacheCell>; crate::ir::LEAF_CACHE]>,
     /// The IC value cells, in the roots like the rest of the traced state.
     /// They are `Cell`s (not `RefCell`s): the payloads are `Copy`, so a read
     /// is a load and a write a store, with no borrow flag on the hot path.
@@ -1315,7 +1317,7 @@ impl AgentRoots {
             array_element_value_cells: Box::new(std::array::from_fn(|_| Cell::new(None))),
             global_leaf_cells: RefCell::new(Box::new(std::array::from_fn(|_| None))),
             slot_leaf_cells: RefCell::new(Box::new(std::array::from_fn(|_| None))),
-            leaf_cache: RefCell::new(Box::new(std::array::from_fn(|_| None))),
+            leaf_cache: Box::new(std::array::from_fn(|_| Cell::new(None))),
             member_value_cells: std::array::from_fn(|_| {
                 Cell::new(crate::ir::MemberValueCell::empty())
             }),
@@ -1517,8 +1519,10 @@ impl Trace for AgentRoots {
         for cell in self.slot_leaf_cells.borrow().iter().flatten() {
             cell.trace(visit);
         }
-        for (_, entry) in self.leaf_cache.borrow().iter().flatten() {
-            entry.trace(visit);
+        for cell in self.leaf_cache.iter() {
+            if let Some(entry) = cell.get() {
+                entry.trace(visit);
+            }
         }
         // The IC value caches hold Values; the index-only caches re-resolve
         // from the (traced) objects and need no tracing.
@@ -2834,15 +2838,14 @@ impl Agent {
     /// leaf-inlineable function); function ids are never reused, so a hit
     /// needs no generation check.
     ///
-    /// The entry is handed back by value: the cache lives behind the roots'
-    /// `RefCell`, so no borrow of it may escape into the caller (which runs a
-    /// body that allocates). The clone is one `Rc` bump plus a copied handle —
-    /// the callers cloned the same fields out of the borrowed entry before.
+    /// The entry is handed back by value and is `Copy`: the cache lives in
+    /// the roots as a `Cell` table, so no borrow of it may escape into the
+    /// caller (which runs a body that allocates), and a hit costs no borrow
+    /// flag and no refcount bump — one load and an identity compare.
     ///
-    /// The hit path costs one `RefCell` borrow per leaf call. Splitting the
-    /// fill path out (and marking it cold) measured *slower* — 11% against the
-    /// baseline on a closure-call loop, versus 8% for this shape — so the
-    /// branch stays in one function.
+    /// Splitting the fill path out (and marking it cold) measured *slower* —
+    /// 11% against the baseline on a closure-call loop, versus 8% for this
+    /// shape — so the branch stays in one function.
     pub(crate) fn leaf_lookup(&mut self, id: u64) -> Option<crate::ir::LeafEntry> {
         Self::leaf_lookup_in(&self.roots, id)
     }
@@ -2850,17 +2853,13 @@ impl Agent {
     /// The leaf-cache lookup against a roots reference the caller holds for a
     /// run (P1 R1): the caller already owns an `Rc<AgentRoots>` clone, so the
     /// hot callback lane skips reloading `agent.roots` here and reads the
-    /// record under a plain `borrow()` (R3) rather than `Ref::filter_map`.
+    /// record from the `Cell` table directly (R2) rather than through a
+    /// `RefCell` borrow.
     pub(crate) fn leaf_lookup_in(roots: &AgentRoots, id: u64) -> Option<crate::ir::LeafEntry> {
         let index = id.wrapping_mul(0x9E37_79B9_7F4A_7C15) as usize & (crate::ir::LEAF_CACHE - 1);
-        let cached = {
-            let cells = roots.leaf_cache.borrow();
-            match cells[index].as_ref() {
-                Some((cached_id, entry)) if *cached_id == id => Some(entry.clone()),
-                _ => None,
-            }
-        };
-        if let Some(entry) = cached {
+        if let Some(entry) = roots.leaf_cache[index].get()
+            && entry.id == id
+        {
             return Some(entry);
         }
         // The record guard stays inside this block: the cache write below is
@@ -2871,15 +2870,25 @@ impl Agent {
             if !data.leaf_inline {
                 return None;
             }
-            let ir = data.ir.clone().expect("leaf_inline implies a compiled ir");
+            // The body itself stays owned by `AgentRoots::compiled_bodies`
+            // (`shared_compiled_body` is the only producer of a record's
+            // `ir`), so the record's pointer is what the leaf cache borrows —
+            // see `LeafEntry::body` for the lifetime argument.
+            let ir = data.ir.as_ref().expect("leaf_inline implies a compiled ir");
             let environment = if ir.leaf_uses_env {
                 Some(data.environment)
             } else {
                 None
             };
-            (ir, data.strict, environment, data.construct_inline)
+            (
+                std::rc::Rc::as_ptr(ir),
+                data.strict,
+                environment,
+                data.construct_inline,
+            )
         };
         let entry = crate::ir::LeafEntry {
+            id,
             ir,
             strict,
             environment,
@@ -2887,7 +2896,7 @@ impl Agent {
             // so the construct-inline verdict rides along.
             construct_inline,
         };
-        roots.leaf_cache.borrow_mut()[index] = Some((id, entry.clone()));
+        roots.leaf_cache[index].set(Some(entry));
         Some(entry)
     }
 
@@ -3734,11 +3743,11 @@ impl Agent {
             }
             let index =
                 id.wrapping_mul(0x9E37_79B9_7F4A_7C15) as usize & (crate::ir::LEAF_CACHE - 1);
-            let mut cells = self.roots.leaf_cache.borrow_mut();
-            if let Some((cached_id, _)) = &cells[index]
-                && *cached_id == id
+            let cell = &self.roots.leaf_cache[index];
+            if let Some(cached) = cell.get()
+                && cached.id == id
             {
-                cells[index] = None;
+                cell.set(None);
             }
         }
     }

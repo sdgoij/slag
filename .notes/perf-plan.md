@@ -137,7 +137,11 @@ reference in `Vm`: the Vm pool lives inside `AgentRoots`, so a `&AgentRoots` in
 a `Vm` would be a self-reference for no gain — pass it (or clone the `Rc` into
 the run's locals) instead.
 
-**R2 — the leaf cache's borrow.** Slice 4h measured the one `RefCell` borrow the
+**R2 — the leaf cache's borrow.** *Landed 2026-10-25 (`per-iteration`
+11.601 -> 10.812 ms, -6.8%; `construct churn` 20.036 -> 19.317, -3.6%;
+`opcost/typed_array_for_each` -14.4%, `array_for_each` -11.8%,
+`map_for_each` -10.6%. See the perf.md entry for the A/B and the gates.)*
+Slice 4h measured the one `RefCell` borrow the
 leaf cache pays per call at **+6.3% `per-iteration` and +4.5% `construct churn`**,
 and two attempts to buy it back failed (`Cell` conversion 7.0% -> 5.5%; a
 `#[cold]` fill split measured *worse* at 11%). The option the slice left on the
@@ -153,7 +157,14 @@ both from the audit rather than from this plan:
   for as long as the entry is — but the entry is *evicted*, which is the part to
   argue rather than assume.
 
-This is the interpreter's largest single identified item.
+This is the interpreter's largest single identified item. **Landed as
+`Cell<Option<LeafEntry>>` with a `Copy` record whose body is a borrowed
+`*const CompiledBody`: the body is owned for the agent's life by
+`AgentRoots::compiled_bodies` (never cleared, the cache `EcmaFunction::ir` is
+cloned from), not by the record, so eviction does not end the borrow. The JIT's
+cold consult re-derives the record's `Rc` by id in `lookup_info_leaf`.
+`global_leaf_cells`/`slot_leaf_cells` stay `RefCell`s: 4h measured that lane at
+0%, and the `Copy` record already removed their clone.**
 
 **R3 — the call lane's record read.** `Agent::ecma_function` returns a
 `Ref::filter_map` for a one-field read; with R1's `&roots` the table is one hop

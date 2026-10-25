@@ -599,8 +599,8 @@ fn try_leaf_call_reusing(
 ) -> Option<Result<Value, JsError>> {
     // Mirror `fast_call_core`'s leaf gate: a single realm (the leaf runs
     // with the current realm), an EcmaScript function, and a warm leaf
-    // cache entry. `leaf_lookup` may populate the cache, so clone the
-    // entry fields before the agent is reborrowed by the run below.
+    // cache entry. `leaf_lookup` may populate the cache; the returned record
+    // is `Copy`, so it stays valid across the run below.
     if agent.realm_count.get() != 1 {
         return None;
     }
@@ -639,7 +639,7 @@ fn try_leaf_call_reusing(
     // active run for the whole leaf window (the pushes and the body), so
     // a budget collection inside the body traces it exactly like
     // `run_inner`.
-    let result = crate::ir::with_leaf_run(&mut *vm, std::rc::Rc::as_ptr(&entry.ir), || {
+    let result = crate::ir::with_leaf_run(&mut *vm, entry.ir, || {
         vm.stack.push(this_arg);
         vm.stack.push(*func);
         vm.stack.extend_from_slice(arg_list);
