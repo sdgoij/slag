@@ -16127,3 +16127,26 @@ After the negative-verdict win, a certified (non-leaf) callback still costs ~180
 **The method is the durable part.** The first pass compared two binaries and read +3.3–4.8% on the non-leaf rows — but the leaf control row, whose path the patch does not touch, moved +2.3% too, so the comparison was measuring build layout, not the lane. Rebuilding one binary with an `SLAG_CB_NESTED` gate and A/B-ing the *same* binary with the env set and unset removed that confound and resolved the effect to ~2%. For a 1-3% change, that is the experiment to run first: same binary, env gate, alternating rounds. The gate and the lane are both reverted.
 
 What it rules out: the funnel's cost is not the pooled-Vm round trip. `save_scratch`/`restore_scratch`, the explicit `ExecutionContext` push and `run_compiled_body_on(frame_prepared)` cost at least what `take_vm`/`return_vm` do on a pooled Vm, and the shared body run (`run_jit_body` + the compiled code) is paid by both. So the ~180 ns is the body run plus activation bookkeeping, not the Vm lifecycle — and no further "collapse the chain" edit on this lane is worth trying.
+
+## LANDED (2026-10-25): an anonymous function in an object literal is named at creation
+
+The 2026-10-22 PROFILE entry priced `{ a: function () {} }` at ~450-530 ns over the same closure as a plain variable, split between two costs: an anonymous function/arrow value disqualified the whole literal from `Step::ObjectFast` (so every property took an `ObjectInitName` step), and the closure was created nameless and then renamed by a post-hoc `SetFunctionName` (an own-property lookup plus a redefining define). Both are gone.
+
+`fast_object_names` now rejects only an anonymous **class** value (its name goes through `pending_class_name`, which this path does not fold); `compile_object` — in both the `ObjectFast` arm and the static-key step arm — threads the property key into `CreateFunction`/`CreateArrow` through `begin_named_initializer`, the mechanism the `var f = function () {}` form already used. The step arm's `ObjectInitName { set_name }` becomes `anonymous && !named_folded`, i.e. false exactly when the fold happened. A computed key keeps the post-hoc naming (its text is only known after `ToPropertyKey`, which must run before the value), and `__proto__` is excluded (it is not a NamedEvaluation — it sets the prototype).
+
+15 alternating rounds, medians and mins, against the previous binary:
+
+| probe (100k bodies) | before | after | change |
+| --- | ---: | ---: | ---: |
+| `{ a: function () {} }` | 81.397 / 76.053 ms | **40.361 / 38.573** | **-50.4% / -49.3%** |
+| `{ a: () => 1 }` | 66.403 / 63.452 ms | **39.133 / 37.629** | **-41.1% / -40.7%** |
+| `var f = function () {}` (control) | 33.644 / 32.325 | 33.467 / 31.863 | -1.4% min |
+| `{ a: function b () {} }` (control) | 51.566 / 48.553 | 50.478 / 48.560 | 0.0% min |
+| `var f = ...; var o = { a: f }` (control) | 40.599 / 38.899 | 40.727 / 38.776 | -0.3% min |
+| `{ a: 1 }` (control) | 4.785 / 4.684 | 4.790 / 4.587 | -2.1% min |
+
+After the change the literal costs create-closure + create-object: 38.6 ms against 31.9 + 4.6. The arrow row is now cheaper than the function-expression row, matching the control ladder.
+
+Correctness was diffed against node across 13 shapes — the `ObjectFast` batch, the step path forced by a computed key / a duplicate key / `__proto__`, a certified loop body, shorthand, a numeric key, a string key, a parenthesized value, anonymous class, and the `name` own-property attributes from `getOwnPropertyDescriptor` — all identical. Found while doing it, and **not** part of this change: `{ __proto__: fn }` does not set the prototype in Slag at all (the proto-setter arm matches an object/null value only, and a function value is neither), so `Object.getPrototypeOf(o) === fn` is false where node says true. The previous binary behaves identically, so it is pre-existing and unrelated.
+
+Gates: `cargo fmt --all -- --check`; `cargo clippy --workspace --all-targets -- -D warnings`; `cargo test --workspace` (40 suites, 0 failed); sweeps `language` 23,726 + `built-ins` 23,821 + `annexB` 1,086 + `intl402` 3,365 = 51,998 at 100%; corpus parity 0 (77 rows).

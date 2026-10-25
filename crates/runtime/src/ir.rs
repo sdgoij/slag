@@ -16237,7 +16237,15 @@ fn fast_object_names(literal: &ObjectLiteral) -> Option<Box<[crux::AtomId]>> {
         let ObjectProperty::Init { key, value, .. } = property else {
             return None;
         };
-        if crate::function::is_anonymous_function_definition(value) {
+        // An anonymous FUNCTION/ARROW value no longer disqualifies the batch:
+        // `compile_object` threads the key into `CreateFunction`/`CreateArrow`
+        // (NamedEvaluation at creation), so the closure is born with its final
+        // `name` and no post-hoc define is needed. An anonymous CLASS still
+        // does — its name is threaded through `pending_class_name`, which this
+        // path does not fold.
+        if !anonymous_function_expr(value)
+            && crate::function::is_anonymous_function_definition(value)
+        {
             return None;
         }
         let id = match key {
@@ -16272,6 +16280,19 @@ fn fast_object_names(literal: &ObjectLiteral) -> Option<Box<[crux::AtomId]>> {
         return None;
     }
     Some(names.into_boxed_slice())
+}
+
+/// Whether `expr` is an anonymous function expression or an arrow — the
+/// values a static-key object literal can name at creation. A class is
+/// excluded: its name goes through `pending_class_name`, not the function
+/// path.
+fn anonymous_function_expr(expr: &Expr) -> bool {
+    match &expr.kind {
+        ExprKind::Function(function) => function.name.is_none(),
+        ExprKind::Arrow { .. } => true,
+        ExprKind::Paren(inner) => anonymous_function_expr(inner),
+        _ => false,
+    }
 }
 
 /// Cut 72 (the shared fused create): `Step::ObjectFast`'s whole-literal
@@ -23912,10 +23933,16 @@ impl Compiler {
         // fields (no per-key define machinery). Anything else keeps the
         // per-property steps below.
         if let Some(names) = fast_object_names(literal) {
-            for property in &literal.props {
+            for (property, name) in literal.props.iter().zip(names.iter()) {
                 let ObjectProperty::Init { value, .. } = property else {
                     unreachable!("fast_object_names only passes Init props")
                 };
+                // NamedEvaluation at creation (spec 13.2.5.5 step 5): an
+                // anonymous function value inherits the property key, so the
+                // batch needs no post-hoc `SetFunctionName`.
+                if anonymous_function_expr(value) {
+                    self.begin_named_initializer(*name, value);
+                }
                 self.compile_expr(value)?;
             }
             self.emit(Step::ObjectFast { names });
@@ -23929,13 +23956,26 @@ impl Compiler {
                     value,
                     shorthand,
                 } => {
-                    let set_name = crate::function::is_anonymous_function_definition(value);
+                    // NamedEvaluation (spec 13.2.5.5 step 5) for a static,
+                    // non-`__proto__` key is threaded into closure creation, so
+                    // the function is born with its final `name` and no
+                    // post-hoc define is emitted (the create-then-rename shape
+                    // cost ~500 ns per literal). A computed key must evaluate
+                    // `ToPropertyKey` before the value, and its text is only
+                    // known at run time, so it keeps the post-hoc naming; an
+                    // anonymous class keeps it too (its name goes through
+                    // `pending_class_name`).
+                    let anonymous = crate::function::is_anonymous_function_definition(value);
+                    let fold = anonymous_function_expr(value);
                     match key {
                         PropertyName::Ident(id) => {
+                            if fold && *id != crux::proto_atom() {
+                                self.begin_named_initializer(*id, value);
+                            }
                             self.compile_expr(value)?;
                             self.emit(Step::ObjectInitName {
                                 name: *id,
-                                set_name,
+                                set_name: anonymous && !self.named_folded,
                                 shorthand: *shorthand,
                             });
                         }
@@ -23945,24 +23985,32 @@ impl Compiler {
                             // 13.2.5.5 step 1 vs 6.a).
                             self.emit(Step::ObjectKeyToPropertyKey);
                             self.compile_expr(value)?;
-                            self.emit(Step::ObjectInitComputed { set_name });
+                            self.emit(Step::ObjectInitComputed {
+                                set_name: anonymous,
+                            });
                         }
                         PropertyName::Str(text) => {
-                            self.compile_expr(value)?;
                             let id = crux::intern(text.as_slice());
+                            if fold && id != crux::proto_atom() {
+                                self.begin_named_initializer(id, value);
+                            }
+                            self.compile_expr(value)?;
                             self.emit(Step::ObjectInitName {
                                 name: id,
-                                set_name,
+                                set_name: anonymous && !self.named_folded,
                                 shorthand: false,
                             });
                         }
                         PropertyName::Number(n) => {
-                            self.compile_expr(value)?;
                             let text = crux::convert::to_string(&Value::Number(*n))?;
                             let id = crux::intern(text.as_slice());
+                            if fold {
+                                self.begin_named_initializer(id, value);
+                            }
+                            self.compile_expr(value)?;
                             self.emit(Step::ObjectInitName {
                                 name: id,
-                                set_name,
+                                set_name: anonymous && !self.named_folded,
                                 shorthand: false,
                             });
                         }
