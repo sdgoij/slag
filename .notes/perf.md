@@ -15969,3 +15969,32 @@ The mechanism is indirection: every traced table moved behind
 The recovery plan, the family table, and the pre-existing queue are in
 `.notes/perf-plan.md`. The README's performance section now carries these
 numbers at this commit.
+
+## LANDED (2026-10-25): an object-literal method no longer blocks scope certification
+
+`FastScopeScan::expr` returned `false` for every `Method`/`Get`/`Set`, so any body containing `{ m() {} }` was uncertified and ran the environment path. The capture prepass (`collect_expr_captures`) already walked those closures through `closure_allows`; the main scan did not. Walk them the same way (plus the computed key through `property_name`), and add the matching `key_captures` helper to the prepass so the two walkers agree on the capture set — a closure inside a computed key would otherwise have been laid out as a frame slot it cannot reach.
+
+The `for (using ...)`/`for (await using ...)` head also needs a bail in the `For` arm (matching `for-in`/`for-of`): a `using` binding registers a disposable resource the certified frame slot has no machinery for. The old unconditional method bail had masked it; without the fix four `statements/using` + `statements/await-using` fixtures regressed.
+
+| probe | uncertified | certified |
+| --- | ---: | ---: |
+| `{ m() { return 1; } }` in a 200k loop (corpus) | 19,272.7 ms | **8,421** |
+
+This is only the certification step. The certified body still ran interpreted (the optimizing-tier lift refuses `ObjectMethodName`; the per-step pass lowers it) and still leaked the home object, so the real win is the next entry.
+
+## LANDED (2026-10-25): a method's home object is a GC leak
+
+`EcmaFunction::trace` traced `home_object`. Every function record is a permanent Agent root (`ecma_functions`), and for a method the home object is the object literal whose method property is the closure itself — the record's root formed an uncollectable cycle. Every method ever created pinned its object literal, its closure, and the closure's properties: a 200k-iteration `{ m() {} }` loop grew `live` to 803k and every minor GC scanned all of it.
+
+The fix is the pattern `environment` and `resolving_promise` already use: the record keeps the typed `Value` for reads, the `Function` box carries an erased `GcAny` edge traced only while the box is reachable, and `EcmaFunction::trace` stops visiting it. The `home_object` field stays on the record so the super machinery reads it unchanged; only the GC edge moved.
+
+| metric | before | after |
+| --- | ---: | ---: |
+| `{ m() {} }` 200k loop (corpus) | 8,421 ms | **117.4** |
+| `live` at the end | 803,477 | **9,825** |
+| `swept` over the run | 200,001 | **996,845** |
+| minor pause | 13,981 us | **41 us** |
+
+The probe now lands at ~585 ns/iteration — faster than the `{ m: function () {} }` control (145 ms, unchanged; it has no home object) and level with the cost of creating any closure. The two commits together are 164x on the probe (19,272.7 ms -> 117.4 ms).
+
+Gates: `cargo fmt --all -- --check`; `cargo clippy --workspace --all-targets -- -D warnings`; `cargo test --workspace` (0 failed); sweeps `built-ins` 23,821 + `language` 23,726 + `annexB` 1,086 + `intl402` 3,365 = 51,998 at 100%; `--gc-stress` sweeps of `language/expressions/object` (1,170) and `language/expressions/class` (4,059) 0 fail; corpus parity 0.
