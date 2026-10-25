@@ -16535,3 +16535,32 @@ The collector now walks all of them: a `for-in` head's target and body, a `switc
 **Context-slot callees: not pursued.** Extending the proof to a *captured* declaration would allow a call whose callee lives in the capture context. Two things make it a bad trade: such a call is not fused (the compiler emits a separate `LoadContextSlot` and a generic `Call`, so the step list does not name the slot at the call), and the shape that motivated it — `fib`'s own recursion inside `bench` — resolves its declaration from an **enclosing** body, which a body-local analysis cannot see at all. That recursion is already served at run time by the G21 self-call lane. Nothing is left for a context-slot splice to buy.
 
 Gates: `cargo fmt --all -- --check`; `cargo clippy --workspace --all-targets -- -D warnings`; `cargo test --workspace` (40 suites, 5,846 passed, 0 failed); sweeps 51,998 at 100%; corpus parity 0 (77 rows, splice on and off), and `calls/direct_leaf.js` still 5.78 ms.
+
+## PROFILE (2026-10-25): the two ~15x rows — `objects/warm_store` and `control/generator_loop`
+
+Both were taken as targets because they sit at ~15x node. Both turn out to be bounded by their design, not by a missing fast path, and the measurements below are the evidence.
+
+### `objects/warm_store` — the store is the guard set, and node's number is elimination
+
+The row is `o.d = i; s += o.d;` over 4M iterations on one stable object. Ablations (JIT, 4M iterations, min of three):
+
+| probe | ms | per iteration |
+| --- | ---: | ---: |
+| bare loop (`s += i`) | 3.04 | 0.76 ns |
+| the row's read only (`s += o.d + i`) | 9.92 | **1.7 ns per read** |
+| the row's store only (`o.d = i; s += i`) | 25.40 | **5.6 ns per store** |
+| the row | 36.59 | 9.1 ns |
+
+`JIT_HELPER_STATS` shows `set_member_name` **once** and `set_member_slot` **zero** times: the store is entirely inline after the first iteration (the shape-cell hit → the deferred field-update gate), so the 5.6 ns is the generated gate itself — the `member_map_cells` probe, the `props_deferred` bit, the written/writable/inline-ordinal checks, the barrier check (young receiver or non-heap value) and the not-global check, then the field write plus the four-store value-cell refresh (the no-bump discipline). ~45 instructions with several dependent loads.
+
+One redundant step was tried and is a NULL: `emit_member_store` probes the shape cell, then `emit_deferred_update_store` re-derived the same map id and cell address. Passing the probe's cell through measured **-1.7% on the store probe (26.41 -> 25.42 ms min) and -0.2% on the row** — Cranelift was already CSE-ing the repeated loads — so it was reverted rather than kept for unmeasurable code.
+
+node's 2.3 ms is 0.58 ns for store+read+add, which is not a cheaper store: the object does not escape the function, so it eliminates the store, the read and the loop. Slag has no escape analysis, and a guarded store + a cache-served read cannot be made 10x cheaper by shaving instructions. This row moves only when the tier can eliminate the access, not when the access gets faster.
+
+### `control/generator_loop` — the resume machinery, not the loop side
+
+200k `g.next()` calls cost ~170 ns each, and the loop side is **not** where it goes. The row's shape puts `bench`'s own locals in the capture context (a nested function declaration), so its body is refused by the optimizing tier on one step, `UpdateContextSlot`. Moving the generator to the script scope makes that body lift cleanly (only the generator's own `Yield` refuses), and the row then reads **34.14 -> 33.16 ms (-2.9%)** — so the per-step member read and call dispatch are worth ~3%, and the remaining ~165 ns per `next()` is the resume path: the handler dispatch, the `agent.generators` lookup, the `{value, done}` object, and the suspend/resume (a fresh Rust -> JIT entry per resume, `.notes/rust-initiated-call-plan.md`). That matches the 2026-10-21 note's ~137 ns with drift.
+
+Lifting `UpdateContextSlot` would therefore buy ~3% on this row, and it is not free: an earlier session lifted it and `built-ins/Iterator/zip/basic-longest.js` failed under `sweep all`, recoverable only by `SLAG_GUARD=0`/`SLAG_TYPER=0` — a typer read-guard bug on a newly-lifted body, unaffected by reordering the passes or widening the guard's type-sensitive set. A 3% row is not worth that class of compiler bug until the guard bug is understood.
+
+Both rows are left as they are. What they need is named: `warm_store` needs inlining/escape analysis (or a compiled store cell keyed by object id, which the interpreter already has and the JIT deliberately does not read); `generator_loop` needs a cheaper resume entry, not more lifting.

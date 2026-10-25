@@ -250,6 +250,16 @@ frontier.
    created per invocation never matches the compile-time box, which is what the
    retracted -93.6% miscompile and the +24% rows in `.notes/perf.md` record. The
    next step for those is code patching or a recompile policy, not a guard.
+8. **The two ~15x rows** (2026-10-25, profiled and parked): `objects/warm_store`
+   is 5.6 ns per store (the full shape gate + the value-cell refresh; the probe
+   merge measured -0.2% and was reverted) plus 1.7 ns per read, against node's
+   0.58 ns for the whole iteration, which is elimination, not a cheaper store —
+   it needs inlining/escape analysis, or a compiled store cell keyed by object
+   id. `control/generator_loop` is ~165 ns per `next()` in the resume path; the
+   loop side is worth only ~3% (proved by moving the generator to the script
+   scope so the caller lifts). Its one missing lift, `UpdateContextSlot`, carries
+   a documented typer read-guard miscompile and is not worth 3%. Numbers in
+   `.notes/perf.md`.
 
 ## P3 — the README is a measurement, not a monument
 
