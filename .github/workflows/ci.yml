@@ -522,7 +522,7 @@ jobs:
   # binary that is packaged rather than a debug build, so the smoke test covers
   # the artifact.
   celld:
-    name: celld (${{ matrix.name }})
+    name: Celld (${{ matrix.name }})
     needs: lint
     runs-on: ${{ matrix.os }}
     timeout-minutes: 120
@@ -578,13 +578,19 @@ jobs:
           ./celld/target/release/celld dev celld/examples/counter --port 9877 --no-watch --clean &
           echo $! > /tmp/celld-counter.pid
           python3 - <<'PY'
-          import json, time, urllib.request
+          import json, time, urllib.error, urllib.request
 
           def count(name):
-              with urllib.request.urlopen(
-                  f"http://127.0.0.1:9877/?name={name}", timeout=60
-              ) as response:
-                  return json.load(response)["n"]
+              try:
+                  with urllib.request.urlopen(
+                      f"http://127.0.0.1:9877/?name={name}", timeout=60
+                  ) as response:
+                      return json.load(response)["n"]
+              except urllib.error.HTTPError as error:
+                  # The body carries the Worker's own failure: celld answers a
+                  # handler error with 500 and `{error:#}` in the body, and a
+                  # bare urllib traceback shows neither.
+                  raise SystemExit(f"{name}: HTTP {error.code}: {error.read()[:400]!r}")
 
           deadline = time.time() + 120
           while True:

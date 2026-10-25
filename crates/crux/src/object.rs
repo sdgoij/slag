@@ -43,10 +43,9 @@ fn is_length_key(key: &PropertyKey) -> bool {
 }
 
 thread_local! {
-    /// The next object id — thread-local (per-agent caches never mix
-    /// threads, and values never cross heaps), so allocation avoids a
-    /// locked atomic per object (GC-5: the construct hot path).
-    static NEXT_OBJECT_ID: std::cell::Cell<u64> = const { std::cell::Cell::new(1) };
+    /// The object ids this thread may still hand out: the next one and the
+    /// end of the block it reserved (see [`next_object_id`]).
+    static OBJECT_IDS: std::cell::Cell<(u64, u64)> = const { std::cell::Cell::new((0, 0)) };
     /// Primitive-wrapper boxes the arena sweep dropped since the runtime
     /// last drained the queue. Each entry is the wrapper's object id; the
     /// runtime (which keeps the id-keyed per-object data tables) removes the
@@ -63,12 +62,32 @@ pub fn take_dead_wrapper_ids() -> Vec<u64> {
     DEAD_WRAPPER_IDS.with(|queue| std::mem::take(&mut *queue.borrow_mut()))
 }
 
+/// The next unreserved block of object ids.
+static OBJECT_ID_BLOCKS: AtomicU64 = AtomicU64::new(1);
+
+/// How many ids a thread reserves at once. One atomic per block rather than one
+/// per object is what keeps the construct hot path (GC-5) to a cell update,
+/// which is why the counter was thread-local to begin with.
+const OBJECT_ID_BLOCK: u64 = 1 << 16;
+
 /// The next object identity key (see [`JsObject::id`]).
+///
+/// The ids must be unique for the whole *process*, not per thread: a
+/// `SharedIsolate` enters one heap on whichever thread takes its lock, and the
+/// id-keyed tables (promises, generators, the wrapper data) live on that heap.
+/// Two threads numbering from the same base make a plain object answer
+/// `is_promise` for another thread's promise — celld's `__readResponse returned
+/// a promise` 500, about one run in ten.
 fn next_object_id() -> u64 {
-    NEXT_OBJECT_ID.with(|id| {
-        let next = id.get();
-        id.set(next + 1);
-        next
+    OBJECT_IDS.with(|ids| {
+        let (next, end) = ids.get();
+        if next < end {
+            ids.set((next + 1, end));
+            return next;
+        }
+        let start = OBJECT_ID_BLOCKS.fetch_add(OBJECT_ID_BLOCK, Ordering::Relaxed);
+        ids.set((start + 1, start + OBJECT_ID_BLOCK));
+        start
     })
 }
 
@@ -8454,6 +8473,26 @@ mod tests {
         assert_eq!(
             array_index_of(&PropertyKey::Symbol(Handle::new(Symbol::new(None)))),
             None
+        );
+    }
+
+    /// A heap can be entered from any thread, and the per-object tables are
+    /// keyed by these ids, so a second thread must not hand out an id the first
+    /// one already used.
+    #[test]
+    fn object_ids_are_unique_across_threads() {
+        let ids: Vec<u64> = (0..8)
+            .map(|_| {
+                std::thread::spawn(|| JsObject::ordinary_object_create(None).id())
+                    .join()
+                    .expect("thread")
+            })
+            .collect();
+        let unique: std::collections::HashSet<u64> = ids.iter().copied().collect();
+        assert_eq!(
+            unique.len(),
+            ids.len(),
+            "an id was handed out on two threads: {ids:?}"
         );
     }
 }
