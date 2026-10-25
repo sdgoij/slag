@@ -366,6 +366,13 @@ pub enum Op {
     /// result is `args[0]`; on failure the body retires and the interpreter
     /// resumes at `imm`'s step.
     GuardCallee,
+    /// A callee identity comparison for a spliced call site: `args = [callee,
+    /// expected]`, the result a `Bool`. The splice branches on it instead of
+    /// deopting, because a deopt at a mid-expression call would resume the
+    /// interpreter at that call step, whose operand stack also holds every
+    /// value the enclosing expression evaluated before it — state the splice
+    /// cannot mirror. A mismatch therefore falls through to the ordinary call.
+    CalleeEq,
     /// Throw a TDZ `ReferenceError` (spec 6.2.1.6.6) when the frame slot holds
     /// the uninitialized marker. Reads the slot; has no result.
     TdzCheck,
@@ -426,7 +433,8 @@ impl Op {
             | Op::Not
             | Op::Check
             | Op::GuardType
-            | Op::GuardCallee => E::pure(),
+            | Op::GuardCallee
+            | Op::CalleeEq => E::pure(),
             Op::TdzCheck => E::read(Heap::Slots),
             Op::FrameLoad => E::read(Heap::Slots),
             Op::FrameStore => E::write(Heap::Slots),

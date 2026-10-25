@@ -663,6 +663,15 @@ fn lower_inst(
             emit_guard(builder, abi, ok, step, &inst.args[2..], values)?;
             callee
         }
+        // A callee identity comparison for a splice's mismatch branch: the same
+        // bits comparison the callee guard makes, materialized as a value so the
+        // splice can take the ordinary call instead of deopting.
+        Op::CalleeEq => {
+            let callee = arg!(0);
+            let expected = arg!(1);
+            let ok = builder.ins().icmp(IntCC::Equal, callee, expected);
+            canonical_bool(builder, ok)
+        }
         // A TDZ guard: throw when the slot holds the uninitialized marker. The
         // helper sets the pending error and the body bails with `undefined`,
         // which the runtime surfaces as the `ReferenceError` (mirrors the

@@ -16456,3 +16456,39 @@ The lane is ~100 stores of per-activation state. The one structural idea — reu
 A lazy-compile policy does not fix this shape either: a benchmark loop body is one activation, so there is no "next entry" at which a feedback-driven recompile could happen. Closing `calls/*` needs a call site inside a compiled loop body to be inlinable **without** feedback — either static resolution (a `CallFast` whose callee slot is written once by a `FunctionDeclInit` in the same body and never otherwise, and whose callee is a capture-free leaf, so no guard is needed) or true OSR plus compiled-code feedback. The first is the smaller change and reuses the existing `Callee`/splice machinery; it is the next session's candidate, not this one's.
 
 Probes: `scratch/ab/calllane/`, `scratch/ab/inl/`, and `scratch/ab/nullproto/{o2,o4,o5}` (git-ignored).
+
+## NULL (2026-10-25): mid-block splicing, a latent miscompile in the splice, and why the box guard cannot inline fresh closures
+
+The queued static-inline item was started with the piece that does not need new analysis: `try_inline` no longer requires the call to be its block's last instruction, so the ubiquitous `s += f(x)` shape can splice. The instructions after the call move to the continuation block. Unit-tested (`splices_a_call_that_is_not_its_blocks_terminator`, verified IR), and the whole-corpus measurement under `SLAG_FEEDBACK=1 SLAG_INLINE=1` first read `calls/recursive_fib.js` **49.8 -> 3.16 ms (-93.6%)**. That number is **withdrawn: it was a miscompile** (the bench value changed from 656700 to 42900).
+
+### The latent bug the shape exposed
+
+The splice guarded the assumed callee with `Op::GuardCallee`, whose failure path is a *deopt*: it mirrors `inst.args[2..]` (the call's operands) into the working region and resumes the interpreter at the call step. For a mid-block call that stack is wrong — the step's operand stack also holds every value the enclosing expression already evaluated (`fib(n-1)` in `fib(n-1) + fib(n-2)`, `s` in `s += f(x)`) — so the interpreter resumed with a truncated stack and produced a different program. Verified four ways: the deopt trace shows the guard firing (`jit-deopt step=17 depth=3`, 3,856 times), the budget bisect puts the break between 16 and 24 (the third expansion level), `SLAG_OPT=0` computes the right value (no splice), and the under-limit builds all compute it too.
+
+The guard is only sound when nothing else is live at the step, which is exactly what the old last-instruction restriction happened to guarantee. So the splice now emits **no deopt at all**: `Op::CalleeEq` (a new pure IR op, one `icmp Equal` on the bits) plus a `Term::Branch` to a fallback block that performs the ordinary call and jumps to the continuation. Correct for any shape, and a spliced body stays deopt-free, which keeps it eligible for the certified-callee lane.
+
+### Why it still does not pay
+
+With the guard sound, the corpus (5 interleaved rounds, per-row minimum, flags on vs off, parity 0 across all 77 rows):
+
+| row | off | on | |
+| --- | ---: | ---: | ---: |
+| `calls/recursive_fib.js` | 60.08 ms | 56.32 | -6.3% |
+| `calls/method_call.js` | 62.87 | 58.92 | -6.3% |
+| `calls/direct_leaf.js` | 13.33 | 12.53 | -6.0% |
+| `opcost/array_indexof.js` | 2.15 | 2.05 | -4.8% |
+| `objects/warm_store.js` | 39.30 | 37.43 | -4.7% |
+| `objects/spread_assign.js` | 137.66 | 154.82 | **+12.5%** |
+| `opcost/regexp_test.js` | 35.48 | 40.41 | **+13.9%** |
+| `strings/split_join.js` | 63.77 | 75.18 | **+17.9%** |
+| `opcost/json_stringify.js` | 90.40 | 108.86 | **+20.4%** |
+| `strings/coercion_concat.js` | 66.35 | 79.94 | **+20.5%** |
+| `opcost/object_keys.js` | 45.52 | 56.36 | **+23.8%** |
+
+The guard compares the callee against a box baked at **compile time**. A closure created per invocation of the enclosing function (the common shape — `fib` inside `bench`) never matches after the first invocation, so the site takes the fallback from then on, and the fallback is not cheaper than the leaf lane the site already had. That is the whole regression: the feature pays only where the callee identity is stable across invocations (a top-level function, a long-lived closure), and loses where it is not.
+
+So the feedback/box-guard design cannot deliver this. The sound path is the one this session queued: a call whose callee slot is written once by a `FunctionDeclInit` in the same body and never otherwise is *provably* the closure that step creates, so the splice needs no guard and no feedback. That still needs (a) the callee's `CompiledBody` at the caller's compile time, from the declaration's AST through the same `shared_function_body`/`shared_compiled_body` keys the runtime uses, and (b) a scope-aware proof that the slot is not reassigned. Both are unbuilt.
+
+State: the mid-block splice and the deopt-free fallback are landed behind the same `SLAG_INLINE` gate (off by default, so no behaviour change); the box-guard path remains measurably mixed and must not be enabled without the static analysis.
+
+Gates: `cargo fmt --all -- --check`; `cargo clippy --workspace --all-targets -- -D warnings`; `cargo test --workspace` (40 suites, 5,843 passed, 0 failed); sweeps `language` 23,726 + `built-ins` 23,821 + `annexB` 1,086 + `intl402` 3,365 = 51,998 at 100%; corpus parity 0 (77 rows, flags on and off).
