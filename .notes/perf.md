@@ -16248,3 +16248,32 @@ The row's delta is larger than the isolated setup deltas, and it is not GC pacin
 Correctness: 11 capture shapes diffed against node (a captured var written by a closure and observed after return, a captured `let`'s TDZ, a strict write to a captured `const`, `eval` writing a captured var, a captured param with `arguments`, an env-path arrow capturing `this`, two-level nesting, `delete` on a captured var, a loop closure capturing both the head and a body `let`, a late write, a block `let`). New tests: `env.rs` pins the capture context's const/TDZ semantics (mutation-checked: dropping the spec's strictness fails it) and the overflow table's order and laziness; the per-iteration tests and the `SlotEnv` size invariant still hold.
 
 Gates: `cargo fmt --all -- --check`; `cargo clippy --workspace --all-targets -- -D warnings`; `cargo test --workspace` (40 suites, 0 failed); sweeps `language` 23,726 + `built-ins` 23,821 + `annexB` 1,086 + `intl402` 3,365 = 51,998 at 100%; corpus parity 0 (77 rows, `mean-jitGap=10.15`, `mean-jlGap=3.86`).
+
+## CORRECTION (2026-10-25): the "null-prototype store" was a leaf/non-leaf artifact
+
+The PROFILE entry above reads `Object.create(null)` + 3 stores as 88 ns per store against 20 ns into `{}` (`p8 - p16`), and listed that as a target. **That delta is not the store.** `p16` (`var o = {}` + 3 stores) is a body with no calls, so it is a *leaf* and its calls run on the in-place lane; `p8` reaches `Object.create(null)`, which makes the body non-leaf. The two probes therefore differ by the whole non-leaf activation, not by the property write.
+
+Probes that hold everything else fixed (`scratch/ab/nullproto/*`, 100k bodies, min of 5-7):
+
+| probe | ns/body |
+| --- | ---: |
+| `function body() { return 1; }` — leaf | 5 |
+| `… { noop(); return 1; }` — one user call, body non-leaf | 55 |
+| `… { Math.abs(1); return 1; }` | 84 |
+| `… { Object.create(null); return 1; }` | 110 |
+| `… { var o = {}; return 1; }` — leaf, one object | 47 |
+| `… { var o = {}; o.a = 1; return 1; }` — one fresh define | 88 |
+| `… { var o = { a: 0 }; o.a = 1; return 1; }` — in-place update | 107 |
+| `… { var o = { a: 0, b: 0, c: 0 }; return 1; }` — literal batch (3 props) | 105 |
+
+So a call in a body costs **~50-105 ns more per invocation** than a leaf body's (the leaf lane skips the execution-context push, the Vm round trip and the frame re-alloc — by design), and the property write itself is ~41 ns for a fresh define, ~19 ns for an in-place update, ~19 ns per property when the literal batch defines it.
+
+The null-prototype premium does exist, but it is small and it is not in the row's favour. With both bodies non-leaf and one call each (`r1` returns `{}` from a callee, `r2` returns `Object.create(null)`): 416 vs 522 ns/body, i.e. **~35 ns per store**. And the row's actual shape prefers the null prototype, because the for-in enumeration over it skips the prototype-chain consult:
+
+| the row's body | ns/body |
+| --- | ---: |
+| `Object.create(null)` + 3 stores | **3509** |
+| `{}` + 3 stores | 4023 |
+| `{ a: 1, b: 1, c: 1 }` | 3888 |
+
+Nothing to change here: the row already uses the faster shape, and the store path it exercises is ~41 ns per fresh define, not 88. The remaining targets on this row are the ones the (now corrected) decomposition points at — closure creation (~42% of it, and already stop-rule-gated for its arena stage), the for-in enumeration, and the non-leaf activation.
