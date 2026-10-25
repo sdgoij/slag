@@ -16173,3 +16173,53 @@ The ablation that prices the whole remaining machinery (skip the per-iteration e
 Correctness: 12 semantic shapes diffed against node (for-in and `for` heads with closures, two and three head declarations, a const for-of head, nested capturing loops, a closure writing its own iteration's head, `eval` reading the head by name, a sloppy assignment creating a name in the body, a block capture, `break`, `delete` on a head) — all identical. New tests: `env.rs` covers the slot copy's independence and the name fallback for a mismatched head (mutation-checked: forcing `names_match` to `true` fails it); `jit/src/lib.rs` covers the surplus-name/overflow path and the by-name read through `eval`.
 
 Gates: `cargo fmt --all -- --check`; `cargo clippy --workspace --all-targets -- -D warnings`; `cargo test --workspace` (40 suites, 0 failed); sweeps `language` 23,726 + `built-ins` 23,821 + `annexB` 1,086 + `intl402` 3,365 = 51,998 at 100%; corpus parity 0 (77 rows, `mean-jitGap=11.26`, `mean-jlGap=3.93`).
+
+## PROFILE (2026-10-25): the for-in row, after the per-iteration slot record
+
+The same row, re-decomposed on the binary that landed `EnvRecord::PerIteration` (`scratch/ab/decomp/*`, one directory per probe, 100k bodies each, min of 5-7 isolated runs). Each probe is the row's shape with one piece changed; none is a subset sum, so read the deltas, not the levels.
+
+| probe | min ms | ns/body |
+| --- | ---: | ---: |
+| `p0` the row (six `sameValue` reduced to one boolean) | 439.46 | 4395 |
+| `p1` a 3-property literal instead of `Object.create(null)` + 3 stores | 463.77 | 4638 |
+| `p2` `for (var x in obj)` head | 333.79 | 3338 |
+| `p3` no closures (the `let` head is then not captured) | 171.75 | 1718 |
+| `p4` no loop (3 closures + 3 calls) | 195.43 | 1954 |
+| `p5` for-in + `x.length` only | 108.43 | 1084 |
+| `p6` for-in head, empty body | 99.09 | 991 |
+| `p7` closures pushed to an array instead of `fns[x]` | 424.43 | 4244 |
+| `p8` `Object.create(null)` + 3 stores + 3 reads | 45.74 | 457 |
+| `p9` `for (var i)` 3 capturing closures + 3 calls | 235.45 | 2355 |
+| `p10` `for (let i)` 3 capturing closures + 3 calls | 304.62 | 3046 |
+| `p11` `for (let i)` no capture, no closures | 2.01 | 20 |
+| `p12` `for (let i)` 3 capturing closures, uncalled | 237.52 | 2375 |
+| `p13` `for (var i)` 3 capturing closures, uncalled | 200.99 | 2010 |
+| `p14` 3 non-capturing closures + 3 pushes, no loop | 145.81 | 1458 |
+| `p15` 3 capturing closures + 3 calls, no loop | 240.79 | 2408 |
+| `p16` `{}` + 3 stores + 3 reads | 19.29 | 193 |
+| `p17` `Object.create(null)` only | 18.71 | 187 |
+| `p18` `{}` only | 20.31 | 203 |
+| `p19` 1 capturing closure, uncalled | 116.37 | 1164 |
+| `p20` 3 capturing closures, uncalled | 196.79 | 1968 |
+| `p22` 1 non-capturing closure, uncalled | 85.35 | 854 |
+| `e7` 300k `var f = function () { return 1; }` | 91.37 | 305/closure |
+| `e5` the same, called | 133.59 | +141/call |
+
+What the deltas say:
+
+| piece | cost | share of p0 |
+| --- | ---: | ---: |
+| capture-context setup, 1 captured name (`p19 - p22`) | 310 ns/call | ~7% |
+| capture-context setup, 3 captured names (`p20 - p14`) | 510 ns/call | **~12%** |
+| per-iteration env copy (`p12 - p13`, 3/body) | 365 ns/body = 122 each | ~8% |
+| call through a per-iteration capture (`p10 - p12`, 3/body) | 671 ns/body = 224 each | ~15% |
+| call through a var capture (`p9 - p13`, 3/body) | 346 ns/body = 115 each | ~8% |
+| for-in enumeration (`p6 - p8`) | 534 ns/body | ~12% |
+| `Object.create(null)` + 3 stores (`p8 - p16`) | 264 ns/body | ~6% |
+| closure creation (`p14` / 3, `e7`) | ~305-486 ns each | ~33% |
+
+Three things changed since the 2026-10-22 entry. The per-iteration copy is 122 ns, not ~200: the slot record removed the vector. The null-prototype object is not the create (`p17` = `p18`) but the **stores**: 88 ns each against 20 ns into `{}` (the shape is dictionary-mode, and `put_value` walks the slow path). And the largest single block is no longer the per-iteration env but the **capture-context setup** — `ScopeInfo::new_body_context` builds a `DeclarativeEnv` per call and, for each captured name, does `create_mutable_binding` (a duplicate scan + a `Vec` push + a name clone) followed by `initialize_binding` (a second scan by name). It is name-addressed work for bindings the compiler knows by index: `context_names` order, `context_const`, `context_param`, `context_tdz` are all static.
+
+`e7` is 91.4 ms, still above the `.notes/closure-cost-plan.md` stop rule's 85 ms, so Stage D stays off the table; closure creation is ~305 ns of the row's 486 per closure, and the difference is the capture context, which is the next target rather than the record itself.
+
+Scratch probes are under `scratch/ab/decomp/` (git-ignored).
