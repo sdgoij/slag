@@ -16401,3 +16401,27 @@ Two binaries, alternating order, 7 rounds, mins:
 Across this session's three for-in changes the fresh 3-key null-prototype enumeration is 97.07 -> 75.99 ms (-21.7%) and the plain-object one 129.42 -> 89.33 (-31%).
 
 Gates: `cargo fmt --all -- --check`; `cargo clippy --workspace --all-targets -- -D warnings`; `cargo test --workspace` (40 suites, 0 failed); sweeps `language` 23,726 + `built-ins` 23,821 + `annexB` 1,086 + `intl402` 3,365 = 51,998 at 100%; corpus parity 0 (`mean-jitGap=10.71`, `mean-jlGap=3.78`).
+
+## NULL (2026-10-25): boxing the function record into the arena is a regression
+
+A second attempt at Stage D (`.notes/closure-cost-plan.md`), this time as the minimal change the 2026-10-20 measurement left open: `AgentRoots::ecma_functions` becomes `RefCell<IdMap<Handle<EcmaFunction>>>`, `register_ecma_function` allocates the record with `Handle::new(data)` inside the mutable borrow (so a `--gc-stress` collection aborts the sweep rather than collecting the record before its entry makes it reachable), and `ecma_function`/`ecma_function_mut` return a copied handle instead of a borrow guard. The rationale was that creation becomes one bump allocation plus a small insert, and reads become a pointer dereference with no 300-byte copy.
+
+Two binaries (`slag-enum3.exe` = HEAD `82470a1d`, `slag-staged.exe`), alternating order, 7 rounds, mins:
+
+| probe | before | after | min |
+| --- | ---: | ---: | ---: |
+| the for-in corpus row | 396 ms | **715** | **+80.6%** |
+| `p14` 3 closures/body, no loop | — | — | +19.5% |
+| `d1` body-level declaration | — | — | +20.2% |
+| `e7` 300k closures | — | — | +11.8% |
+| `e5` the same, called | — | — | **-10.7%** |
+
+Only the called probe improved; everything dominated by *creation* regressed, which is the opposite of the hypothesis.
+
+`--gc-trace` on the for-in row gives the mechanism. Inline record (`before`): `live=6921`, **one** major collection, minor pauses averaging **101 µs**. Arena box (`after`): `live=307009`, **two** major collections with **9.7 ms** and **19.3 ms** pauses, minor pauses averaging **56 µs**. The box is traced from the map, so every record is promoted out of the nursery on its first minor and retained until `reap_dead_functions` removes its entry; the old generation fills and the majors are paid. The inline `IdMap` insert, by contrast, frees the replaced record synchronously — the allocator does the work the collector now has to do, and it does it at the 300k-closures scale where it is cheapest.
+
+A second cost the small-value steady state hid: `IdMap` reallocates roughly three times more often with a 304-byte value than with an 8-byte handle.
+
+**Plan-level conclusion.** Stage D cannot be "the same `IdMap`, but boxed" — that shape is strictly worse. It has to move the record onto the `Function` object as a traced field (V8's JSFunction → SharedFunctionInfo), so the record dies with its object and the table becomes only an id→function index (not an owner that promotes every record). That is a different, larger change and remains unmeasured.
+
+The experiment is reverted (`crates/runtime/src/agent.rs`, `crates/runtime/src/function.rs` restored to `82470a1d`).

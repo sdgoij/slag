@@ -1,10 +1,12 @@
 # Closure creation: shrinking `EcmaFunction` (and the registry)
 
-**Status: Stages B and A LANDED (2026-10-19). Stage D not started — the
-stop rule was not met.** Baseline, profile, and the rejected alternatives were
-measured 2026-10-19; the measured numbers live in `.notes/perf.md` ("Closure
-creation, profiled properly", "share the per-site source info", and "box the
-class-only slots").
+**Status: Stages B and A LANDED (2026-10-19). Stage D measured twice and
+rejected in both of its map-rooted forms (2026-10-20 and 2026-10-25); only the
+record-on-the-object shape remains, and it is unmeasured.** Baseline, profile,
+and the rejected alternatives were measured 2026-10-19; the measured numbers
+live in `.notes/perf.md` ("Closure creation, profiled properly", "share the
+per-site source info", "box the class-only slots", and "boxing the function
+record into the arena is a regression").
 
 ## Why this is the next target
 
@@ -209,3 +211,5 @@ numbers: `.notes/perf.md` ("capture chains shared per closure site").
 Eligibility is not an expectation: Stage D's arena record is still unmeasured.
 
 **Stage D measured (2026-10-20), not viable in its map form.** Storing `Gc<EcmaFunction>` in `ecma_functions` cut the insert phase 100 -> 56 ns and made calls 13% faster (`e5`), but rooting every record from the map promotes each one on its first minor: `e7` +8% (77.5 -> 83.7 ms) and the for-in head-let row +70% (540-558 -> 916-1393 ms). Reverted. Details in `.notes/perf.md` ("the function record in the GC arena"). The remaining shape — the record reachable only from its function object, with no traced map — would need `EcmaFunction` (or a handle to it) reachable from `crux`, and is still unmeasured.
+
+**Stage D re-measured (2026-10-25) in the minimal `Handle` form: same verdict, worse.** `ecma_functions: IdMap<Handle<EcmaFunction>>` with a copied handle out and `Handle::new` inside the insert borrow: the for-in row **+80.6%** (396 -> 715 ms), `p14` +19.5%, `d1` +20.2%, `e7` +11.8%, only `e5` -10.7%. `--gc-trace`: `live` 6,921 -> 307,009 and one major -> **two** majors of 9.7 and 19.3 ms, because every traced record is promoted on its first minor and retained until its entry is reaped. Reverted. Conclusion, now twice measured: the table must not root the record. Stage D only makes sense when the record hangs off the function object (`Gc` field, V8's JSFunction -> SharedFunctionInfo) and the table is a non-owning id -> function index; that shape is untouched and unmeasured. Numbers: `.notes/perf.md` ("boxing the function record into the arena is a regression").
