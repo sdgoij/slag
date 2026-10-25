@@ -95,9 +95,10 @@ impl Source {
     /// compile records a refusal (`CachedData::rejected_`).
     ///
     /// The two compiles that take the text as they find it pass their own;
-    /// [`compile_function`] wraps its text first and passes the wrapped form,
-    /// because that is what the function it produces is made of, which is also
-    /// what [`Function::create_code_cache`](crate::Function::create_code_cache)
+    /// [`compile_function`] wraps its text and passes the wrapper *without* the
+    /// parentheses that make it an expression — the form the function it
+    /// produces renders as, which is what
+    /// [`Function::create_code_cache`](crate::Function::create_code_cache)
     /// reads back.
     fn consume_cached_data(&self, text: &[u8]) {
         if let Some(cached_data) = &self.cached_data {
@@ -181,6 +182,14 @@ impl<'a> CachedData<'a> {
     /// Record whether `text` is what this data was made from — the compile's
     /// answer, which V8 writes the same way (`CachedData::rejected_`).
     pub(crate) fn record_consumption(&self, text: &[u8]) {
+        if self.bytes() != text {
+            eprintln!(
+                "CACHE MISMATCH cache={:?}
+text={:?}",
+                std::string::String::from_utf8_lossy(self.bytes()),
+                std::string::String::from_utf8_lossy(text)
+            );
+        }
         self.rejected.set(self.bytes() != text);
     }
 }
@@ -331,8 +340,12 @@ pub fn compile_function<'s>(
         .map(|name| to_rust_string_lossy(name))
         .collect::<Vec<_>>()
         .join(", ");
-    let text = format!("(function ({parameters}) {{\n{}\n}})", source.text);
-    source.consume_cached_data(text.as_bytes());
+    let wrapper = format!("function ({parameters}) {{\n{}\n}}", source.text);
+    // The cache a function hands back is its own rendering — this wrapper, not
+    // the parenthesized expression the engine is handed — so that is what a
+    // later compile is checked against.
+    source.consume_cached_data(wrapper.as_bytes());
+    let text = format!("({wrapper})");
     let realm = crate::realm_of(scope);
     let value = match realm.try_eval_named(
         &text,
@@ -446,6 +459,47 @@ mod tests {
             .expect("compile");
             bind(scope, "add", function.cast::<Value>());
             assert_eq!(eval_number(scope, "add(2, 3)"), 5.0);
+        });
+    }
+
+    /// What a function's own code cache carries is what the next compile of the
+    /// same body will be given, so the round trip is consumed — this is how a
+    /// host (celld's bootstrap cache) re-uses one.
+    #[test]
+    fn a_function_code_cache_round_trips_into_the_next_compile() {
+        in_context!(scope, {
+            let body = String::new(scope, "return a + b;").expect("string");
+            let a = String::new(scope, "a").expect("string");
+            let b = String::new(scope, "b").expect("string");
+            let mut first = Source::new(body, None);
+            let function = compile_function(
+                scope,
+                &mut first,
+                &[a, b],
+                &[],
+                CompileOptions::NoCompileOptions,
+                NoCacheReason::NoReason,
+            )
+            .expect("compile");
+            let cache = function.create_code_cache().expect("a cache");
+
+            let mut second = Source::new_with_cached_data(body, None, CachedData::new(&cache));
+            assert!(
+                compile_function(
+                    scope,
+                    &mut second,
+                    &[a, b],
+                    &[],
+                    CompileOptions::ConsumeCodeCache,
+                    NoCacheReason::NoReason,
+                )
+                .is_some(),
+                "the second compile runs"
+            );
+            assert!(
+                !second.get_cached_data().expect("cached data").rejected(),
+                "a cache the bridge produced must be consumed by the next compile"
+            );
         });
     }
 

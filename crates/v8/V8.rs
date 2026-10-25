@@ -5,13 +5,13 @@
 //! is not the next one. That machine *is* the behavior of these functions, so it
 //! is reproduced here in full, with the same panic message.
 //!
-//! One divergence, and it is the engine's: Slag's heap, agent and isolate are
-//! all thread-local, so this state is thread-local too, where V8's is
-//! process-global. A host that initializes V8 on one thread and asks
-//! `get_current_platform` from another finds it uninitialized, with a panic
-//! saying so, rather than a platform it cannot safely share.
+//! The state is process-global, as V8's is. The engine behind it is not: an
+//! isolate may belong to a lock rather than a thread (`SharedIsolate`), so a
+//! host initializes here on one thread and asks from whichever thread holds the
+//! isolate next.
 
 use std::cell::RefCell;
+use std::sync::Mutex;
 
 use crate::platform::Platform;
 use crate::support::SharedRef;
@@ -27,8 +27,21 @@ enum GlobalState {
 /// The handler a fatal error is reported through, once a host installs one.
 type FatalErrorHandler = Box<dyn Fn(&str, i32, &str)>;
 
+/// The one state machine a process has (`v8::V8`). A `Mutex` because a
+/// refusal is a panic, which poisons it; every access recovers the state and
+/// moves on, since the state machine's transitions are what a host must get
+/// right, not the poison.
+static GLOBAL_STATE: Mutex<GlobalState> = Mutex::new(GlobalState::Uninitialized);
+
+/// Run `body` against the process-wide state.
+fn with_state<R>(body: impl FnOnce(&mut GlobalState) -> R) -> R {
+    let mut state = GLOBAL_STATE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    body(&mut state)
+}
+
 thread_local! {
-    static GLOBAL_STATE: RefCell<GlobalState> = const { RefCell::new(GlobalState::Uninitialized) };
     static FLAGS: RefCell<Option<String>> = const { RefCell::new(None) };
     static FATAL_ERROR_HANDLER: RefCell<Option<FatalErrorHandler>> = const { RefCell::new(None) };
 }
@@ -56,7 +69,7 @@ pub(crate) fn has_fatal_error_handler() -> bool {
 
 /// Panic unless V8 is initialized (v8::V8::AssertInitialized).
 pub fn assert_initialized() {
-    GLOBAL_STATE.with(|state| match &*state.borrow() {
+    with_state(|state| match state {
         GlobalState::Initialized(_) => {}
         _ => panic!("Invalid global state"),
     });
@@ -125,9 +138,8 @@ pub fn get_version() -> &'static str {
 /// Set the platform to use (v8::V8::InitializePlatform). Must come before
 /// [`initialize`].
 pub fn initialize_platform(platform: SharedRef<Platform>) {
-    GLOBAL_STATE.with(|state| {
-        let mut state = state.borrow_mut();
-        let next = match &*state {
+    with_state(|state| {
+        let next = match state {
             GlobalState::Uninitialized => GlobalState::PlatformInitialized(platform.clone()),
             _ => panic!("Invalid global state"),
         };
@@ -138,9 +150,8 @@ pub fn initialize_platform(platform: SharedRef<Platform>) {
 /// Initialize the engine (v8::V8::Initialize). Must come after
 /// [`initialize_platform`] and before the first isolate.
 pub fn initialize() {
-    GLOBAL_STATE.with(|state| {
-        let mut state = state.borrow_mut();
-        let next = match &*state {
+    with_state(|state| {
+        let next = match state {
             GlobalState::PlatformInitialized(platform) => {
                 GlobalState::Initialized(SharedRef::clone(platform))
             }
@@ -150,9 +161,10 @@ pub fn initialize() {
     });
 }
 
-/// The platform this thread initialized V8 with (v8::V8::GetCurrentPlatform).
+/// The platform the process initialized V8 with
+/// (v8::V8::GetCurrentPlatform).
 pub fn get_current_platform() -> SharedRef<Platform> {
-    GLOBAL_STATE.with(|state| match &*state.borrow() {
+    with_state(|state| match state {
         GlobalState::Initialized(platform) => SharedRef::clone(platform),
         _ => panic!("Invalid global state"),
     })
@@ -160,8 +172,7 @@ pub fn get_current_platform() -> SharedRef<Platform> {
 
 /// Release the engine's resources (v8::V8::Dispose).
 ///
-/// Disposing is permanent, as it is there; the engine itself is thread-local, so
-/// what this releases is the state this thread recorded.
+/// Disposing is permanent, as it is there.
 ///
 /// # Safety
 ///
@@ -169,9 +180,8 @@ pub fn get_current_platform() -> SharedRef<Platform> {
 /// engine owns its own heaps, so nothing here can be dangling, but a host must
 /// still not use an isolate it created before this call.
 pub unsafe fn dispose() -> bool {
-    GLOBAL_STATE.with(|state| {
-        let mut state = state.borrow_mut();
-        let next = match &*state {
+    with_state(|state| {
+        let next = match state {
             GlobalState::Initialized(platform) => GlobalState::Disposed(SharedRef::clone(platform)),
             _ => panic!("Invalid global state"),
         };
@@ -184,9 +194,8 @@ pub unsafe fn dispose() -> bool {
 /// Disposes the platform the state has been keeping since
 /// [`dispose`] (v8::V8::DisposePlatform).
 pub fn dispose_platform() {
-    GLOBAL_STATE.with(|state| {
-        let mut state = state.borrow_mut();
-        let next = match &*state {
+    with_state(|state| {
+        let next = match state {
             // Reading the platform is what drops it: the state stops keeping it.
             GlobalState::Disposed(platform) => {
                 drop(SharedRef::clone(platform));
@@ -230,8 +239,8 @@ mod tests {
     /// as one sequence: each move is allowed only from the state before it, and
     /// a host that gets it wrong is told so rather than given a quiet success.
     ///
-    /// One sequence, because the state is per-thread and a host initializes it
-    /// once.
+    /// One sequence, because the state is process-wide and a host initializes
+    /// it once.
     #[test]
     fn the_initialization_state_machine_admits_only_the_next_move() {
         fn refused<T>(body: impl FnOnce() -> T + std::panic::UnwindSafe) -> bool {

@@ -7540,7 +7540,7 @@ impl Vm {
         // entry would descend into the reserved bottom margin, surfacing a
         // catchable RangeError instead of overflowing the native stack (the
         // JIT side checks in `run_jit_body`).
-        crate::stack::enter_js(agent)?;
+        crate::stack::enter_js()?;
         // The value-stack side of the same guard: a body's `max_stack` bounds
         // every slot it can push, so one check at entry bounds the run.
         self.check_value_stack(body.max_stack)?;

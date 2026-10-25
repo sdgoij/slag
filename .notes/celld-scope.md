@@ -28,6 +28,13 @@ Two gaps the error list did not show, both bridge rather than celld bugs: `Backi
 
 Still thread-bound: `Weak`/`TracedReference`, and the isolate's current realm — a `Locker` installs the heap and the arena only, so a host enters a context itself, which celld does.
 
+Running it found four things the compiler could not. `examples/hello` serves, and `examples/counter` — a Durable Object over its own SQLite — counts per cell:
+
+- **The stack guard's watermark was captured when the agent was created**, on the thread that built the isolate. A turn on a tokio worker compared its stack against another thread's address, so every call answered `RangeError: Maximum call stack size exceeded`. The watermark is the running thread's now (`enter_js` reads the per-thread cell).
+- **A collection driven by an agent collected whichever heap was entered.** celld collects at a job boundary with no isolate entered, so the agent's roots were marked into the thread's own, empty arena — setting mark bits in the arena that owns them, which that arena's next minor then refused. `Agent::collect_with` installs the agent's own heap (recorded by the bridge at isolate creation).
+- **`V8`'s initialization state was thread-local.** celld initializes on one thread and asks `get_current_platform` from workers who never did, which panicked. The state machine is process-global now, as V8's is.
+- **A function's code cache was refused by the next compile.** The cache carries the function's own rendering; `compile_function` compared against the parenthesized wrapper it hands the engine. `a_function_code_cache_round_trips_into_the_next_compile` pins the round trip.
+
 `tools/build-celld.py` is the gate now. It clones `https://github.com/denoland/celld.git` on first use and pins v0.6.3 (`8702f6d186c77698dbfb30cf29e3b1922a88f008`), refusing a short ref for the same reason `build-deno.py` does. It hands cargo a temporary `[patch.crates-io]` through `--config` (celld's sources are never edited), checks that celld's `v8` requirement admits the bridge's version instead of rewriting it, reconciles the lock when its `v8` entry is still a registry one, and runs `cargo check -p celld` — `--build` asks for the binary. On Windows it dispatches into WSL, because the checkout's native dependencies do not build there; `--native` opts out.
 
 ## What celld needs, measured

@@ -907,6 +907,14 @@ impl Isolate {
             gc_callbacks: RefCell::new(Vec::new()),
             gc_observer_registered: Cell::new(false),
         });
+        // The agent drives collections, and it may do so at a job boundary
+        // with no scope open, so it is told which heap is its own. The heap
+        // lives in the same box and outlives the engine (fields drop in
+        // declaration order: `engine` first).
+        let heap_state: *const crux::heap::HeapState = &inner.heap;
+        // SAFETY: the heap state lives in `inner`, which `OwnedIsolate` keeps
+        // alive for at least as long as the agent it is handed to.
+        unsafe { inner.engine.agent().set_heap_state(heap_state) };
         // SAFETY: the box's allocation is where the state lives and it outlives
         // every handle to it — `OwnedIsolate` keeps it alive.
         let handle = unsafe { Self::from_inner_ptr(&mut *inner) };

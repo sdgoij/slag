@@ -69,8 +69,10 @@ thread_local! {
         const { std::cell::OnceCell::new() };
 }
 
-/// This thread's watermark, for the paths that reach the guard without an agent
-/// (the Rust-level recursion in [`crux::proxy`]).
+/// This thread's watermark. Sampled at first use rather than at agent
+/// creation: an isolate may be entered on any thread (a `SharedIsolate`), so
+/// the watermark belongs to the thread running the activation, not to the one
+/// that built the agent.
 fn thread_guard_limit() -> usize {
     THREAD_GUARD_LIMIT.with(|cell| *cell.get_or_init(|| stack_guard_limit().unwrap_or(0)))
 }
@@ -101,8 +103,8 @@ pub(crate) fn has_headroom() -> bool {
 /// giant dispatch frame measurably reshapes it, so the check stays in its
 /// own small frame.
 #[inline(never)]
-pub(crate) fn enter_js(agent: &crate::agent::Agent) -> Result<(), JsError> {
-    let limit = agent.stack_guard_limit;
+pub(crate) fn enter_js() -> Result<(), JsError> {
+    let limit = thread_guard_limit();
     if limit != 0 && current_sp() < limit {
         return Err(JsError::new(
             ErrorKind::RangeError,

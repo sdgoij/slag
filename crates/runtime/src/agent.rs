@@ -1920,12 +1920,15 @@ pub struct Agent {
     /// buffers (`runtime::jit::MAX_JIT_DEPTH`), and the cache's in-flight
     /// signal: eviction is disabled while any frame runs.
     pub jit_depth: usize,
-    /// The JS stack-exhaustion watermark: the address below which a new JS
-    /// body activation must not start (`crate::stack::stack_guard_limit`,
-    /// sampled at agent creation — the agent is not `Send`, so its thread is
-    /// fixed). Zero when the platform cannot report the thread's stack
-    /// bounds; the guard is disabled then.
-    pub(crate) stack_guard_limit: usize,
+    /// The heap this agent allocates in, when a host owns the arena (an
+    /// isolate under the `v8` bridge). Null for a bare agent, whose heap is the
+    /// thread's own.
+    ///
+    /// A collection is driven by the agent, not by the thread: it can run at a
+    /// job boundary on a thread that has no isolate entered. Without this the
+    /// collector would pick the thread's own arena and mark the agent's roots
+    /// into it, which corrupts the arena that owns them.
+    heap_state: std::cell::Cell<*const crux::heap::HeapState>,
     /// Host-defined operations (spec's host hooks); `None` uses the
     /// spec's default implementations.
     pub host_hooks: Option<Box<dyn HostHooks>>,
@@ -2136,6 +2139,15 @@ impl Drop for Agent {
     }
 }
 
+/// Undoes the heap entry a collection installed for its agent.
+struct InstalledHeap;
+
+impl Drop for InstalledHeap {
+    fn drop(&mut self) {
+        crux::heap::leave();
+    }
+}
+
 /// A3/A5: the default young-cohort size that paces a minor collection at a safe
 /// point. Small enough that the cohort's reclamation trails allocation closely,
 /// large enough that a minor is not run for a handful of boxes. `--nursery-
@@ -2149,6 +2161,16 @@ pub fn termination_error() -> JsError {
 }
 
 impl Agent {
+    /// Tell this agent which heap it allocates in. Called by the host that
+    /// owns the arena; a bare agent keeps the thread's own.
+    ///
+    /// # Safety
+    ///
+    /// `state` must stay alive for as long as this agent does.
+    pub unsafe fn set_heap_state(&self, state: *const crux::heap::HeapState) {
+        self.heap_state.set(state);
+    }
+
     /// The flag a termination request sets, for a handle that has to cross
     /// threads to reach it (v8::IsolateHandle).
     pub fn termination_flag(&self) -> std::sync::Arc<std::sync::atomic::AtomicBool> {
@@ -2288,8 +2310,8 @@ impl Agent {
             collection_observers: RefCell::new(Vec::new()),
             jit_hook: None,
             jit_depth: 0,
-            stack_guard_limit: crate::stack::stack_guard_limit().unwrap_or(0),
             roots: Rc::new(AgentRoots::new()),
+            heap_state: std::cell::Cell::new(std::ptr::null()),
             host_hooks: None,
             little_endian: cfg!(target_endian = "little"),
             can_block: false,
@@ -3447,6 +3469,15 @@ impl Agent {
             }
         } else {
             &mut |_, _| {}
+        };
+        // Install the agent's own heap for the collection, when it has one: a
+        // collection may run with no isolate entered (see the field).
+        let installed = self.heap_state.get();
+        let _installed = if installed.is_null() {
+            None
+        } else {
+            crux::heap::enter(installed);
+            Some(InstalledHeap)
         };
         let mut swept_addrs = crux::heap::with_heap_mut(|heap| {
             if minor {
