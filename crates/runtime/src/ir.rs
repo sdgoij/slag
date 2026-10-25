@@ -16409,26 +16409,34 @@ pub(crate) fn object_init(
     if set_name {
         crate::function::set_function_name(&value, &name, None)?;
     }
+    // B.3.1/13.2.5.5: a non-computed `__proto__` key is the prototype
+    // setter, and a prototype setter gets NO NamedEvaluation (step 5), so its
+    // value is not renamed after the key.
     let name_text = name.to_string_lossy();
-    if !shorthand && name_text == "__proto__" {
-        match value.kind() {
-            ValueKind::Object(proto) => {
-                if !obj.set_prototype_of(Some(proto))? {
-                    return Err(JsError::new(
-                        ErrorKind::TypeError,
-                        "Cannot set prototype of non-extensible object".into(),
-                    ));
-                }
-            }
-            ValueKind::Null if !obj.set_prototype_of(None)? => {
+    let is_proto_setter = !shorthand && name_text == "__proto__";
+    if set_name && !is_proto_setter {
+        crate::function::set_function_name(&value, &name, None)?;
+    }
+    if is_proto_setter {
+        // B.3.1 step 6: an Object or null value becomes [[Prototype]]; any
+        // other value sets neither the prototype nor an own property — the
+        // definition is a no-op. A FUNCTION is an Object (`as_object`
+        // recovers its object part), which matching only `ValueKind::Object`
+        // silently dropped.
+        if matches!(value.kind(), ValueKind::Null) {
+            if !obj.set_prototype_of(None)? {
                 return Err(JsError::new(
                     ErrorKind::TypeError,
                     "Cannot set prototype of non-extensible object".into(),
                 ));
             }
-            // B.3.1 step 6: a non-object, non-null value sets neither the
-            // prototype nor an own property — the definition is a no-op.
-            _ => {}
+        } else if let Some(proto) = crate::context::as_object(&value)
+            && !obj.set_prototype_of(Some(proto))?
+        {
+            return Err(JsError::new(
+                ErrorKind::TypeError,
+                "Cannot set prototype of non-extensible object".into(),
+            ));
         }
     } else {
         obj.create_data_property(&name, value)?;
@@ -23969,13 +23977,16 @@ impl Compiler {
                     let fold = anonymous_function_expr(value);
                     match key {
                         PropertyName::Ident(id) => {
-                            if fold && *id != crux::proto_atom() {
+                            // A non-computed `__proto__` key is the prototype
+                            // setter: it takes no NamedEvaluation.
+                            let is_proto = *id == crux::proto_atom() && !*shorthand;
+                            if fold && !is_proto {
                                 self.begin_named_initializer(*id, value);
                             }
                             self.compile_expr(value)?;
                             self.emit(Step::ObjectInitName {
                                 name: *id,
-                                set_name: anonymous && !self.named_folded,
+                                set_name: anonymous && !self.named_folded && !is_proto,
                                 shorthand: *shorthand,
                             });
                         }
@@ -23991,13 +24002,14 @@ impl Compiler {
                         }
                         PropertyName::Str(text) => {
                             let id = crux::intern(text.as_slice());
-                            if fold && id != crux::proto_atom() {
+                            let is_proto = id == crux::proto_atom();
+                            if fold && !is_proto {
                                 self.begin_named_initializer(id, value);
                             }
                             self.compile_expr(value)?;
                             self.emit(Step::ObjectInitName {
                                 name: id,
-                                set_name: anonymous && !self.named_folded,
+                                set_name: anonymous && !self.named_folded && !is_proto,
                                 shorthand: false,
                             });
                         }

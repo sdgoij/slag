@@ -315,15 +315,17 @@ fn reflect_method(agent: &mut Agent, name: &str, args: &[Value]) -> Result<Value
         }
         "setPrototypeOf" => {
             let obj = object_of(&arg(0))?;
-            let proto = match arg(1).kind() {
-                ValueKind::Object(proto) => Some(proto),
-                ValueKind::Null => None,
-                _ => {
-                    return Err(JsError::new(
-                        ErrorKind::TypeError,
-                        "Reflect.setPrototypeOf requires an object or null prototype".into(),
-                    ));
-                }
+            // A FUNCTION is an Object (`as_object` recovers its object part).
+            let proto_value = arg(1);
+            let proto = if matches!(proto_value.kind(), ValueKind::Null) {
+                None
+            } else if let Some(proto) = crate::context::as_object(&proto_value) {
+                Some(proto)
+            } else {
+                return Err(JsError::new(
+                    ErrorKind::TypeError,
+                    "Reflect.setPrototypeOf requires an object or null prototype".into(),
+                ));
             };
             Ok(Value::Boolean(obj.set_prototype_of(proto)?))
         }

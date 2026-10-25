@@ -947,16 +947,19 @@ fn prototype_to_locale_string(
 /// Object.create (spec 20.1.2.2): an ordinary object with the given
 /// prototype, optionally with Properties defined.
 fn object_create(agent: &mut Agent, args: &[Value]) -> Result<Value, JsError> {
+    // A FUNCTION is an Object (`as_object` recovers its object part), so only
+    // a non-object, non-null argument is the TypeError spec 20.1.2.2 step 2
+    // asks for.
     let proto_value = arg(args, 0);
-    let proto = match proto_value.kind() {
-        ValueKind::Object(obj) => Some(obj),
-        ValueKind::Null => None,
-        _ => {
-            return Err(JsError::new(
-                ErrorKind::TypeError,
-                "Object prototype may only be an Object or null".into(),
-            ));
-        }
+    let proto = if matches!(proto_value.kind(), ValueKind::Null) {
+        None
+    } else if let Some(obj) = as_object(&proto_value) {
+        Some(obj)
+    } else {
+        return Err(JsError::new(
+            ErrorKind::TypeError,
+            "Object prototype may only be an Object or null".into(),
+        ));
     };
     let obj = JsObject::ordinary_object_create(proto);
     let value = Value::Object(obj);
@@ -1389,11 +1392,15 @@ fn proto_setter(this: &Value, proto_value: &Value) -> Result<Value, JsError> {
             "Cannot convert undefined or null to object".into(),
         ));
     }
-    // step 2: a prototype that is neither an Object nor null is ignored.
-    let proto = match proto_value.kind() {
-        ValueKind::Object(obj) => Some(obj),
-        ValueKind::Null => None,
-        _ => return Ok(Value::Undefined),
+    // step 2: a prototype that is neither an Object nor null is ignored. A
+    // FUNCTION is an Object — `as_object` recovers its object part — so
+    // matching only `ValueKind::Object` here silently dropped it.
+    let proto = if matches!(proto_value.kind(), ValueKind::Null) {
+        None
+    } else if let Some(obj) = as_object(proto_value) {
+        Some(obj)
+    } else {
+        return Ok(Value::Undefined);
     };
     // step 3: a non-object receiver is ignored.
     let Some(obj) = as_object(this) else {

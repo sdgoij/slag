@@ -2423,6 +2423,64 @@ mod tests {
         );
     }
 
+    /// A function is an Object, so it is a valid [[Prototype]] on every path
+    /// that takes one from a value: the object-literal `__proto__` setter (in
+    /// both engines — the test body certifies), `Object.create`, `Reflect`,
+    /// and the `%Object.prototype.__proto__%` setter. A prototype setter takes
+    /// no NamedEvaluation either (spec 13.2.5.5 step 5), so the function keeps
+    /// its anonymous name.
+    #[test]
+    fn function_values_are_valid_prototypes() {
+        assert_eq!(
+            run("var f = function () {}; \
+                 var o = { __proto__: f }; \
+                 Object.getPrototypeOf(o) === f")
+            .unwrap(),
+            Value::Boolean(true)
+        );
+        assert_eq!(
+            run("var f = function () {}; \
+                 var o = { '__proto__': f }; \
+                 Object.getPrototypeOf(o) === f")
+            .unwrap(),
+            Value::Boolean(true)
+        );
+        assert_eq!(
+            run("var f = function () {}; \
+                 Object.getPrototypeOf(Object.create(f)) === f")
+            .unwrap(),
+            Value::Boolean(true)
+        );
+        assert_eq!(
+            run("var f = function () {}; \
+                 var o = {}; \
+                 Reflect.setPrototypeOf(o, f) && Object.getPrototypeOf(o) === f")
+            .unwrap(),
+            Value::Boolean(true)
+        );
+        assert_eq!(
+            run("var f = function () {}; \
+                 var o = {}; o.__proto__ = f; \
+                 Object.getPrototypeOf(o) === f")
+            .unwrap(),
+            Value::Boolean(true)
+        );
+        // No NamedEvaluation for a prototype setter (a computed key IS an own
+        // property, so it does name the value).
+        assert_eq!(
+            run("var f = { __proto__: function () {} }; \
+                 Object.getPrototypeOf(f).name")
+            .unwrap(),
+            Value::String(Handle::new(JsString::from_utf8("")))
+        );
+        assert_eq!(
+            run("var k = '__proto__'; var o = { [k]: function () {} }; \
+                 o[k].name")
+            .unwrap(),
+            Value::String(Handle::new(JsString::from_utf8("__proto__")))
+        );
+    }
+
     #[test]
     fn template_literals() {
         assert_eq!(
