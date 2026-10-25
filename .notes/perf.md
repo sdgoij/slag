@@ -16277,3 +16277,45 @@ The null-prototype premium does exist, but it is small and it is not in the row'
 | `{ a: 1, b: 1, c: 1 }` | 3888 |
 
 Nothing to change here: the row already uses the faster shape, and the store path it exercises is ~41 ns per fresh define, not 88. The remaining targets on this row are the ones the (now corrected) decomposition points at — closure creation (~42% of it, and already stop-rule-gated for its arena stage), the for-in enumeration, and the non-leaf activation.
+
+## PROFILE (2026-10-25): closure creation and for-in begin, by phase
+
+Both blocks were profiled with a temporary per-phase accumulator (env-gated `SLAG_PROF`, `Instant` pairs accumulated and printed every 10k calls; `e7` = 300k `var f = function () { return 1; }`, for-in over a fresh 3-key `Object.create(null)` object, 100k loop entries). The timers inflate the absolute numbers — `e7` is 305 ns uninstrumented and ~470 ns under eleven `Instant` pairs — so read the shares, not the levels. The instrumentation is reverted.
+
+### Closure creation (`register_function`)
+
+| phase | ns |
+| --- | ---: |
+| `shared_source_info` (enclosing-source walk + slice hash + cache lookup) | **75** |
+| `shared_function_body_with_key` | 29 |
+| `shared_params` | 26 |
+| setup (strictness/realm/context reads) | 24 |
+| the `EcmaFunction` literal + name/params clones | 26 |
+| `Function::new_with_prototype` + `set_environment_edge` | 64 |
+| `shared_compiled_body` | 31 |
+| `agent.register_ecma_function` (the record insert) | **121** |
+| `set_compiled` | 25 |
+| `set_function_properties_batched` | 44 |
+
+`register_ecma_function` is the record copy into `Agent::ecma_functions` — the block `.notes/closure-cost-plan.md` measured at 97 ns together with `store_construct_patterns` and whose alternatives (a boxed value, a `Vec` slab) were rejected on measurement. Stage D remains gated by the plan's stop rule (`e7` = 91.4 ms for 300k, above the 85 ms threshold).
+
+`shared_source_info` is the one block here that the plan did **not** account for: it runs per closure, and per closure it walks the execution-context stack for the enclosing source, clones that text, **hashes the function's source slice**, and probes a thread-local cache. All of that is fixed per creation *site* — the node address, span and realm are the same every time — but it is recomputed 300k times for `e7`. The fix is to carry the site's `Rc<SourceInfo>` in the `CreateFunction`/`CreateArrow`/`FunctionDeclInit` step payload (built once when the body is compiled, traced from the compiled body the way `ScopeInfo::context_layout` is), so creation only clones an `Rc`. Worth ~70 ns per closure: roughly 210 ns/body on the for-in row (three closures), and it grows with the size of the function's source text, since the hash is over that slice.
+
+### for-in begin (`for_in_begin`)
+
+| phase | ns |
+| --- | ---: |
+| `ToObject` + `as_object` | 26 |
+| the enumeration-cache probe | 26 |
+| `for_in_key_levels` | **279** |
+| `for_in_cache_put` | **134** |
+
+Uninstrumented context (100k bodies, mins): a fresh 3-key null-prototype object **970** ns/body, the same object with no keys **412**, a *shared* 3-key object (cache hit) **196**, a shared empty object **188**, a fresh 3-key plain object **1308** (the extra level costs 338).
+
+So a cache miss costs ~780 ns and a hit ~8 ns; the miss is `for_in_key_levels` plus the cache build. Inside those two phases, for a 3-key object:
+
+- `JsObject::own_string_props` **materializes a vector-free object** (`materialize_properties`), then builds three `Vec`s (`indices`, `strings`, and the copied `keys`) and sorts the index keys.
+- `key_value` makes a **`Handle::new` GC box per key** (`Value::String`), plus a `crux::lookup` memo scan.
+- `for_in_cache_put` builds a chain-snapshot `Vec`, wraps it in an `Rc`, **copies the key list** (`keys.to_vec()`) and wraps the copy in a second `Rc` — although `for_in_begin` already wraps the original in an `Rc` for `ForInState`. Five allocations where three would do, and one copy of the key list that the cache and the loop could share.
+
+Next, in order: (1) share the key-list `Rc` between `ForInState` and the cache entry, and skip the chain-snapshot allocation for a single-link chain; (2) have `for_in_key_levels` push straight into its result from the object (no materialize, no `indices`/`strings` staging, sort only when an index key is present); (3) the closure `SourceInfo` in step payloads.
