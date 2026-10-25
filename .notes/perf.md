@@ -16521,3 +16521,17 @@ Measured, two binaries (same HEAD with `SLAG_INLINE=0`), 5 interleaved rounds, p
 Seams: `SLAG_INLINE` is now **on** by default (`=0` disables it, the same-binary A/B used above). The feedback-recorded (guarded) sites moved behind their own `SLAG_INLINE_FEEDBACK` switch, default **off**, because they are measured mixed — a closure created per invocation never matches the compile-time box, so those sites pay a comparison and then the fallback call (+24% on `object_keys` in the NULL above).
 
 Gates: `cargo fmt --all -- --check`; `cargo clippy --workspace --all-targets -- -D warnings`; `cargo test --workspace` (40 suites, 5,844 passed, 0 failed); sweeps `language` 23,726 + `built-ins` 23,821 + `annexB` 1,086 + `intl402` 3,365 = 51,998 at 100%; corpus parity 0 (77 rows, splice on and off).
+
+## CORRECTION (2026-10-25): the assignment collector missed `for-in`/`try`/`switch` bodies
+
+The declared-callee proof above reads `collect_script_assigned` as "the declared name is never assigned". That collector treated `ForIn`, `Try`, `Switch`, `ClassDecl`, `With` and `UsingDecl` as no-ops, so a body that reassigned its callee inside one of those statements could still be recorded as a declared site — a latent wrong-program bug in a feature that had just been enabled by default. Found by writing the refuse-shapes test: `for (var k in { a: 0 }) { f = function () {}; }` before the callee's loop still produced one site.
+
+It had not miscompiled in the shapes tried by hand (a caller with `for-in`/`try`/`switch` did not reach the splice — verified by running both the stale-body and the throwing variants), but "it did not fire" is not a proof, and the site list is a compile-time claim.
+
+The collector now walks all of them: a `for-in` head's target and body, a `switch` discriminant and every case, `try`/`catch`/`finally`, a class declaration's name, a `using` declaration's bindings, and a `with` body (conservatively). Over-approximating is always sound for a never-assigned check, and the collector also feeds the script epilogue's write-back set and the `CallFastGlobal` fuse, where a larger set is conservative in the same direction.
+
+`declared_sites_skip_a_callee_the_body_reassigns` pins it: the unassigned shape yields exactly one site, and `=`, a braced `for-in` body, a bare `for-in` head, `switch`, `try`, and a write from a nested closure each yield zero.
+
+**Context-slot callees: not pursued.** Extending the proof to a *captured* declaration would allow a call whose callee lives in the capture context. Two things make it a bad trade: such a call is not fused (the compiler emits a separate `LoadContextSlot` and a generic `Call`, so the step list does not name the slot at the call), and the shape that motivated it — `fib`'s own recursion inside `bench` — resolves its declaration from an **enclosing** body, which a body-local analysis cannot see at all. That recursion is already served at run time by the G21 self-call lane. Nothing is left for a context-slot splice to buy.
+
+Gates: `cargo fmt --all -- --check`; `cargo clippy --workspace --all-targets -- -D warnings`; `cargo test --workspace` (40 suites, 5,846 passed, 0 failed); sweeps 51,998 at 100%; corpus parity 0 (77 rows, splice on and off), and `calls/direct_leaf.js` still 5.78 ms.

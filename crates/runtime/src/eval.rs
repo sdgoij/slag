@@ -5036,6 +5036,41 @@ mod tests {
     }
 
     #[test]
+    fn declared_sites_skip_a_callee_the_body_reassigns() {
+        fn sites(src: &str) -> usize {
+            let mut agent = Agent::new();
+            agent.initialize_host_defined_realm().unwrap();
+            agent.run_script(src).unwrap();
+            compiled_body_of(&mut agent, "outer").declared_calls.len()
+        }
+        let loop_body = "var s = 0; for (var i = 0; i < 4; i++) s += f(i); return s;";
+        let plain = format!("function outer() {{ function f(x) {{ return x + 1; }} {loop_body} }}");
+        assert_eq!(sites(&plain), 1, "an unassigned declaration is a site");
+        for (what, write) in [
+            ("=", "f = function (x) { return x + 2; };"),
+            (
+                "braced for-in",
+                "for (var k in { a: 0 }) { f = function (x) { return x + 2; }; }",
+            ),
+            ("bare for-in head", "for (f in { a: 0 }) { }"),
+            (
+                "switch",
+                "switch (0) { case 0: f = function (x) { return x + 2; }; }",
+            ),
+            (
+                "try",
+                "try { f = function (x) { return x + 2; }; } catch (e) {}",
+            ),
+            ("nested closure", "var g = function () { f = 0; }; g();"),
+        ] {
+            let src = format!(
+                "function outer() {{ function f(x) {{ return x + 1; }} {write} {loop_body} }}"
+            );
+            assert_eq!(sites(&src), 0, "a {what} write must refuse the site");
+        }
+    }
+
+    #[test]
     fn slice23_args_alias_gates_read_only_params() {
         fn args_alias(agent: &mut Agent, src: &str, name: &str) -> bool {
             agent.run_script(src).unwrap();
