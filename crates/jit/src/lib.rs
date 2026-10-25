@@ -619,6 +619,7 @@ mod tests {
             steps,
             handlers: Vec::new(),
             strict: false,
+            declared_calls: Vec::new(),
             scope: Some(scope(frame_size)),
             env_constant: true,
             leaf: false,

@@ -1880,6 +1880,12 @@ pub struct CompiledBody {
     pub steps: Vec<Step>,
     pub handlers: Vec<Handler>,
     pub strict: bool,
+    /// The call steps whose callee comes from a frame slot that only one
+    /// `FunctionDeclInit` in this body writes, and whose name the body never
+    /// assigns: `(call step, declaration step)`. At every such call the slot
+    /// holds that declaration's closure, so the optimizing tier can splice the
+    /// callee with no identity check. Empty for the common body.
+    pub declared_calls: Vec<(u32, u32)>,
     /// The fast-path frame layout, when the scope analysis certified the
     /// body (see [`ScopeInfo`]). `None` = the environment-machinery path.
     pub scope: Option<ScopeInfo>,
@@ -26717,6 +26723,7 @@ pub fn compile_body(
     // A certified body's top-level function declarations are hoisted: each
     // binding is initialized with its closure at entry (spec 10.2.11), and
     // the declaration statement itself evaluates to nothing (15.2.6).
+    let mut hoisted: Vec<usize> = Vec::new();
     if compiler.scope.is_some() {
         for stmt in &function.body.stmts {
             if let StmtKind::FunctionDecl(function) = &stmt.kind
@@ -26729,6 +26736,7 @@ pub fn compile_body(
                     _ => continue,
                 };
                 let outer_chain = compiler.closure_outer_chain();
+                hoisted.push(compiler.steps.len());
                 compiler.emit(Step::FunctionDeclInit {
                     name,
                     function: Box::new(function.clone()),
@@ -26746,6 +26754,9 @@ pub fn compile_body(
     }
     compiler.compile_statements(&function.body.stmts)?;
     compiler.resolve();
+    // The call sites whose callee slot provably holds a hoisted declaration's
+    // closure (see `CompiledBody::declared_calls`).
+    let declared_calls = declared_callee_calls(&function.body.stmts, &compiler.steps, &hoisted);
     // A per-iteration loop switches the lexical environment each iteration,
     // so the per-step context sync must run (closures created in the loop
     // body capture the per-iteration env, not the capture context).
@@ -26805,6 +26816,7 @@ pub fn compile_body(
             steps: compiler.steps,
             handlers: compiler.handlers,
             strict: function.strict,
+            declared_calls,
             scope: compiler.scope,
             env_constant,
             leaf,
@@ -26890,6 +26902,7 @@ pub fn compile_statements(
         steps: compiler.steps,
         handlers: compiler.handlers,
         strict,
+        declared_calls: Vec::new(),
         scope: compiler.scope,
         env_constant: !compiler.env_changing,
         // Scripts are never the callee of a call, so the leaf-inline fast
@@ -29225,6 +29238,52 @@ struct ScriptSlots {
     /// read-only global like `Infinity` must not be written just because it
     /// was declared.
     assigned: HashSet<crux::AtomId>,
+}
+
+/// The call steps whose callee is provably the closure a hoisted function
+/// declaration in this body created (see `CompiledBody::declared_calls`).
+///
+/// `hoisted` are the step indices of the body-entry declarations `compile_body`
+/// emits before any statement, so the init dominates every call in the body.
+/// A callee slot qualifies when exactly one `FunctionDeclInit` in the body
+/// writes it (so no other declaration, block-level or reused, shares the slot)
+/// and the body never assigns the declared name, which is what could overwrite
+/// the closure after the init. Both tests are conservative: a body that does
+/// anything unusual is simply left unspliced.
+fn declared_callee_calls(stmts: &[Stmt], steps: &[Step], hoisted: &[usize]) -> Vec<(u32, u32)> {
+    if hoisted.is_empty() {
+        return Vec::new();
+    }
+    let mut declarations: Vec<(usize, usize, crux::AtomId)> = Vec::new();
+    for (ip, step) in steps.iter().enumerate() {
+        if let Step::FunctionDeclInit {
+            name,
+            frame_slot: Some(slot),
+            ..
+        } = step
+        {
+            declarations.push((ip, *slot, *name));
+        }
+    }
+    let mut assigned = HashSet::new();
+    collect_script_assigned(stmts, &mut assigned);
+    let mut sites = Vec::new();
+    for (ip, step) in steps.iter().enumerate() {
+        let slot = match step {
+            Step::CallFastSlot { slot, .. } => *slot,
+            Step::CallFastSlotStore { callee_slot, .. } => *callee_slot,
+            _ => continue,
+        };
+        let mut owners = declarations.iter().filter(|(_, owner, _)| *owner == slot);
+        let Some(&(init, _, name)) = owners.next() else {
+            continue;
+        };
+        if owners.next().is_some() || assigned.contains(&name) || !hoisted.contains(&init) {
+            continue;
+        }
+        sites.push((ip as u32, init as u32));
+    }
+    sites
 }
 
 /// Analyze a top-level script for the certified binding paths: the

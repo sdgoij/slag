@@ -16492,3 +16492,32 @@ So the feedback/box-guard design cannot deliver this. The sound path is the one 
 State: the mid-block splice and the deopt-free fallback are landed behind the same `SLAG_INLINE` gate (off by default, so no behaviour change); the box-guard path remains measurably mixed and must not be enabled without the static analysis.
 
 Gates: `cargo fmt --all -- --check`; `cargo clippy --workspace --all-targets -- -D warnings`; `cargo test --workspace` (40 suites, 5,843 passed, 0 failed); sweeps `language` 23,726 + `built-ins` 23,821 + `annexB` 1,086 + `intl402` 3,365 = 51,998 at 100%; corpus parity 0 (77 rows, flags on and off).
+
+## LANDED (2026-10-25): a declared callee splices with no check at all
+
+The NULL above ended on the blocker: the box guard cannot inline a closure created per invocation, so the splice needed the callee's identity proven at compile time. It is now proven from the body's own steps, and the splice needs **no comparison and no feedback**.
+
+`CompiledBody::declared_calls` holds `(call step, declaration step)` pairs, computed by `compile_body`. A call qualifies when all of these hold:
+
+- its callee is a frame slot (`CallFastSlot`/`CallFastSlotStore`);
+- exactly one `FunctionDeclInit` in the body writes that slot, so no other declaration — block-level or a reused slot — shares it;
+- that declaration is one of the **hoisted body-entry** ones `compile_body` emits before any statement, so it dominates every call;
+- the declared name is never assigned (`collect_script_assigned`: `var f = …`, `f = …`, `f++`, a for-of head), the only thing that could overwrite the closure after the init;
+- the callee, compiled from the declaration through the same `shared_function_body`/`shared_params` keys `register_function` uses, is a certified leaf that reads no environment (`leaf && !leaf_uses_env`).
+
+Every test is conservative — a body that does anything unusual is left unspliced. `resolve_declaration` builds the record exactly as `register_function` does (name from the atom, site-shared params/body, the declaration's own `"use strict"` OR the enclosing body's, the step's chains) and compiles it through `compile_body`, so the IR the splice clones is the IR the closure runs; `a_declared_callee_resolves_to_the_runtime_body` asserts the two bodies agree on step count and frame layout.
+
+The splice then jumps straight into the cloned body — no `Op::CalleeEq`, no fallback call — so the body stays deopt-free.
+
+Measured, two binaries (same HEAD with `SLAG_INLINE=0`), 5 interleaved rounds, per-row minimum, all 77 rows' results identical:
+
+| row | off | on | |
+| --- | ---: | ---: | ---: |
+| `calls/direct_leaf.js` | 12.29 ms | **5.87** | **-52.2%** |
+| every other row | — | — | within ±3% (this host's noise) |
+
+`node tools/corpus/bench.js` (one interleaved round, all four engine/mode combinations, `mismatches 0`): the `calls` family gap is 9.09x (the README records 9.57x) and the `direct_leaf` row is 6.70x (10.47x), on a 12.0 -> 7.7 ms row. The overall gap reads 10.45x, inside this host's noise band, so the family table is left at its recorded commit.
+
+Seams: `SLAG_INLINE` is now **on** by default (`=0` disables it, the same-binary A/B used above). The feedback-recorded (guarded) sites moved behind their own `SLAG_INLINE_FEEDBACK` switch, default **off**, because they are measured mixed — a closure created per invocation never matches the compile-time box, so those sites pay a comparison and then the fallback call (+24% on `object_keys` in the NULL above).
+
+Gates: `cargo fmt --all -- --check`; `cargo clippy --workspace --all-targets -- -D warnings`; `cargo test --workspace` (40 suites, 5,844 passed, 0 failed); sweeps `language` 23,726 + `built-ins` 23,821 + `annexB` 1,086 + `intl402` 3,365 = 51,998 at 100%; corpus parity 0 (77 rows, splice on and off).

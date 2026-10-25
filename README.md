@@ -485,8 +485,13 @@ round, are the measurement). The commit before the security audit `883af3dd`
 reads 10.40x / 3.69x, and the audit-era measurement here was 10.76x / 3.88x; the
 recovery since then took `calls` from 10.92x to 9.57x and `language` from 6.50x
 to 6.09x, while `builtins` and `strings` drifted slightly the other way — both
-inside this host's noise. `.notes/perf-plan.md` records the measurements and
-`.notes/perf.md` the landed changes.
+inside this host's noise. The declared-callee inline splice (`.notes/perf.md`,
+2026-10-25) then took `calls` to **9.09x** and the overall gap to 10.45x, and
+`calls/direct_leaf.js` from 10.47x to 6.70x — those two figures and the
+`direct_leaf` row above are one interleaved round at the landing commit, not
+medians of three, because this host's spread does not support a full refresh.
+`.notes/perf-plan.md` records the measurements and `.notes/perf.md` the landed
+changes.
 
 A sample of the per-workload rows (the command above prints all 77), ms per
 `bench()` call:
@@ -497,7 +502,7 @@ A sample of the per-workload rows (the command above prints all 77), ms per
 | `arrays/typed_array.js` | 17.3 | 164.7 | 1.1 | 45.5 | 15.93x | 3.47x |
 | `builtins/json_roundtrip.js` | 55.1 | 57.4 | 13.1 | 15.9 | 4.20x | 3.49x |
 | `builtins/math_intrinsics.js` | 9.9 | 69.5 | 152.2 | 182.3 | 0.07x | 0.38x |
-| `calls/direct_leaf.js` | 12.0 | 82.2 | 1.1 | 39.5 | 10.47x | 2.09x |
+| `calls/direct_leaf.js` | 7.7 | 110.8 | 1.2 | 55.3 | 6.70x | 2.01x |
 | `calls/recursive_fib.js` | 49.0 | 511.0 | 7.3 | 39.8 | 6.79x | 12.57x |
 | `control/generator_loop.js` | 35.4 | 49.7 | 2.3 | 10.7 | 15.15x | 4.63x |
 | `globals/declarative_read.js` | 2.4 | 19.9 | 0.6 | 13.8 | 4.28x | 1.44x |

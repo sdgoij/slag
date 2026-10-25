@@ -142,27 +142,52 @@ impl JitEngine {
                     // pass is allowed to change the IR but not to break it, so
                     // re-verify and bail to the per-step path on a violation (a
                     // pass bug is a refusal, never a wrong program).
-                    let sites = crate::opt::pass::inline::sites_from_feedback(body);
-                    // I5c-2c-ii: the splice is gated until it is measured
-                    // (`SLAG_INLINE`), so a default build never resolves a callee
-                    // and the inline pass is inert. The resolver lifts the
-                    // callee's body through the agent window a compile runs
-                    // inside, caching per id for the compile.
+                    // A feedback-derived site compares the callee against the
+                    // box baked at compile time, so a closure created per
+                    // invocation never matches after the first — measured mixed
+                    // (-6% to +24%), hence its own switch. Declared sites need
+                    // no comparison and are on with the pass.
+                    let feedback_sites = std::env::var("SLAG_INLINE_FEEDBACK").is_ok();
+                    let sites = crate::opt::pass::inline::sites_for(body, feedback_sites);
+                    // I5c-2c-ii: the splice is enabled by default; `SLAG_INLINE=0`
+                    // turns it off (the same-binary seam for measuring it). The
+                    // resolver lifts the callee's body through the agent window a
+                    // compile runs inside, caching per site for the compile.
                     let inline_enabled = std::env::var("SLAG_INLINE")
                         .map(|v| v != "0")
-                        .unwrap_or(false);
+                        .unwrap_or(true);
                     let mut lifted: std::collections::HashMap<
                         u64,
                         Option<crate::opt::pass::inline::Callee>,
                     > = std::collections::HashMap::new();
-                    let mut resolve = |id: u64| -> Option<crate::opt::pass::inline::Callee> {
+                    let mut resolve = |target: &crate::opt::pass::inline::InlineTarget| {
                         if !inline_enabled {
                             return None;
                         }
-                        if let Some(hit) = lifted.get(&id) {
+                        // A feedback site is keyed by the callee's id and a
+                        // declaration site by its init step; the init-step keys
+                        // are offset into a disjoint top-of-range space so one
+                        // cache map holds both.
+                        let key = match target {
+                            crate::opt::pass::inline::InlineTarget::Guarded {
+                                callee_id, ..
+                            } => *callee_id,
+                            crate::opt::pass::inline::InlineTarget::Declared { init_step } => {
+                                u64::MAX - *init_step as u64
+                            }
+                        };
+                        if let Some(hit) = lifted.get(&key) {
                             return hit.clone();
                         }
-                        let resolved = runtime::jit::resolve_callee(id).and_then(|callee| {
+                        let found = match target {
+                            crate::opt::pass::inline::InlineTarget::Guarded {
+                                callee_id, ..
+                            } => runtime::jit::resolve_callee(*callee_id),
+                            crate::opt::pass::inline::InlineTarget::Declared { init_step } => {
+                                runtime::jit::resolve_declaration(body, *init_step)
+                            }
+                        };
+                        let resolved = found.and_then(|callee| {
                             let mut ir = crate::opt::lift::lift(&callee.body).ok()?;
                             // I5c-2c-iii-b: a callee's `var` slots have no home
                             // in the caller's frame, so promote them to SSA
@@ -182,12 +207,13 @@ impl JitEngine {
                                 steps: callee.body.steps.len(),
                                 // I5c-2c-iv: the callee's own sites, so the
                                 // splice recurses into its calls.
-                                sites: std::rc::Rc::new(
-                                    crate::opt::pass::inline::sites_from_feedback(&callee.body),
-                                ),
+                                sites: std::rc::Rc::new(crate::opt::pass::inline::sites_for(
+                                    &callee.body,
+                                    feedback_sites,
+                                )),
                             })
                         });
-                        lifted.insert(id, resolved.clone());
+                        lifted.insert(key, resolved.clone());
                         resolved
                     };
                     crate::opt::pass::run(&mut ir, Some(body), &sites, &mut resolve);

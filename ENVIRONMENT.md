@@ -26,7 +26,8 @@ measurement and the knobs an embedder can experiment with; `SLAG_OPT` and
 |---|---|---|
 | `SLAG_OPT` | on | `=0` disables the **optimizing tier** (the SSA/opt path). The interpreter and the per-step Cranelift tier are unaffected — a body the optimizing tier declines keeps the per-step path either way. |
 | `SLAG_TYPER` | on | `=0` disables the typer's **read guard** (`Op::GuardType` on a member/element read, which lets the arithmetic consuming it lower tag-free). Measured ~perf-neutral on the corpus (both directions within noise); kept on because it is free and can help hot numeric property loops. |
-| `SLAG_INLINE` | **off** | non-`0` enables the whole-body **trial-inline splice** (`pass/inline.rs`). Needs `SLAG_FEEDBACK` for its call-site map. |
+| `SLAG_INLINE` | **on** | `0` disables the whole-body **trial-inline splice** (`pass/inline.rs`). Declared-callee sites need no feedback; feedback-recorded sites additionally need `SLAG_INLINE_FEEDBACK`. |
+| `SLAG_INLINE_FEEDBACK` | **off** | also splice call sites from `SLAG_FEEDBACK` records. Measured mixed (a closure created per invocation never matches the compile-time box), so it is off by default. |
 | `SLAG_INLINE_BUDGET` | `256` | a positive integer bounding the inliner's code-growth and self-recursion budget. |
 | `SLAG_FEEDBACK` | **off** | non-`0` enables the **call-site feedback probe** (`runtime/src/feedback.rs`); unset allocates nothing and changes no behavior. |
 | `SLAG_GUARD` | on | `=0` disables the read-guard **pruning pass** (`pass/guard.rs`). |

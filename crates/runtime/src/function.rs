@@ -1834,7 +1834,7 @@ fn function_kind_prototype(
 /// `span_source` is the source text the body's spans refer to, for bodies
 /// parsed against their own text (CreateDynamicFunction); scripts use the
 /// running context's source via capture_source.
-fn body_is_strict(agent: &Agent, body: &Block, span_source: Option<&JsString>) -> bool {
+pub(crate) fn body_is_strict(agent: &Agent, body: &Block, span_source: Option<&JsString>) -> bool {
     for stmt in &body.stmts {
         let StmtKind::Expr(expr) = &stmt.kind else {
             return false;

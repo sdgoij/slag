@@ -16,12 +16,24 @@ use std::rc::Rc;
 
 use crate::opt::ir::{BlockId, Effects, Function, Imm, Inst, Op, Term, Type, ValueId};
 
-/// A monomorphic call site's inline target: the callee's function id (the
-/// resolver's key) and its box (the `Op::CalleeEq` constant).
+/// What the splice assumes about the callee.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InlineTarget {
+    /// The callee the site was observed calling: `Op::CalleeEq` compares the
+    /// loaded callee against `callee_box` before the region runs, and a mismatch
+    /// takes the ordinary call.
+    Guarded { callee_id: u64, callee_box: u64 },
+    /// The closure a hoisted declaration in the caller writes into the callee
+    /// slot at body entry, which nothing else writes
+    /// (`CompiledBody::declared_calls`): the slot at the call is that closure by
+    /// construction, so no comparison is needed.
+    Declared { init_step: usize },
+}
+
+/// A call site's inline target.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct InlineSite {
-    pub callee_id: u64,
-    pub callee_box: u64,
+    pub target: InlineTarget,
 }
 
 /// A resolved callee: its lifted IR (its `var` slots promoted by
@@ -59,9 +71,46 @@ pub fn sites_from_feedback(body: &runtime::ir::CompiledBody) -> Vec<Option<Inlin
         };
         if call.state() == runtime::feedback::IcState::Specialized && call.first_callee_id() != 0 {
             *site = Some(InlineSite {
-                callee_id: call.first_callee_id(),
-                callee_box: call.first_callee_box(),
+                target: InlineTarget::Guarded {
+                    callee_id: call.first_callee_id(),
+                    callee_box: call.first_callee_box(),
+                },
             });
+        }
+    }
+    sites
+}
+
+/// The call sites whose callee is provably a declaration in the same body
+/// (`CompiledBody::declared_calls`), indexed by step.
+#[must_use]
+pub fn sites_from_declarations(body: &runtime::ir::CompiledBody) -> Vec<Option<InlineSite>> {
+    let mut sites = vec![None; body.steps.len()];
+    for &(call, init) in &body.declared_calls {
+        if let Some(slot) = sites.get_mut(call as usize) {
+            *slot = Some(InlineSite {
+                target: InlineTarget::Declared {
+                    init_step: init as usize,
+                },
+            });
+        }
+    }
+    sites
+}
+
+/// Every spliceable site of `body`: the ones a declaration proves, plus — when
+/// `with_feedback` — the feedback-recorded callees. A declared site wins when
+/// both apply, because it needs no comparison.
+#[must_use]
+pub fn sites_for(body: &runtime::ir::CompiledBody, with_feedback: bool) -> Vec<Option<InlineSite>> {
+    let mut sites = if with_feedback {
+        sites_from_feedback(body)
+    } else {
+        vec![None; body.steps.len()]
+    };
+    for (slot, declared) in sites.iter_mut().zip(sites_from_declarations(body)) {
+        if declared.is_some() {
+            *slot = declared;
         }
     }
     sites
@@ -86,7 +135,7 @@ fn inline_budget() -> usize {
 pub fn run(
     func: &mut Function,
     sites: &[Option<InlineSite>],
-    resolve: &mut dyn FnMut(u64) -> Option<Callee>,
+    resolve: &mut dyn FnMut(&InlineTarget) -> Option<Callee>,
 ) -> bool {
     let mut changed = false;
     let blocks = func.block_count() as u32;
@@ -110,7 +159,7 @@ fn try_inline(
     func: &mut Function,
     b: BlockId,
     sites: &[Option<InlineSite>],
-    resolve: &mut dyn FnMut(u64) -> Option<Callee>,
+    resolve: &mut dyn FnMut(&InlineTarget) -> Option<Callee>,
     budget: &mut usize,
 ) -> bool {
     // The splice is not restricted to a call that ends its block: a call whose
@@ -142,7 +191,7 @@ fn try_inline(
         };
         found
     };
-    let Some(callee) = resolve(site.callee_id) else {
+    let Some(callee) = resolve(&site.target) else {
         return false;
     };
     // Every input slot must have a call operand to bind to, the callee must be
@@ -251,52 +300,65 @@ fn try_inline(
         func.block_mut(dst).term = Some(term);
     }
 
-    // Enter the callee when the callee is the one the site was compiled for, and
-    // take the ordinary call otherwise. A deopt is *not* sound here: it would
-    // resume the interpreter at this call step, whose operand stack also holds
-    // every value the enclosing expression evaluated before the call (`fib(n-1)`
-    // in `fib(n-1) + fib(n-2)`), and the splice has no way to mirror that state.
-    // A fallback call keeps the region deopt-free as well, so the spliced body
+    // Enter the callee when the site's assumption holds, and take the ordinary
+    // call otherwise. A deopt is *not* sound here: it would resume the
+    // interpreter at this call step, whose operand stack also holds every value
+    // the enclosing expression evaluated before the call (`fib(n-1)` in
+    // `fib(n-1) + fib(n-2)`), and the splice has no way to mirror that state. A
+    // fallback call keeps the region deopt-free as well, so the spliced body
     // stays eligible for the certified-callee lane.
-    let expected = func.push_value(Type::Object);
-    func.block_mut(b).insts.push(Inst {
-        op: Op::Const,
-        args: Vec::new(),
-        result: Some(expected),
-        ty: Type::Object,
-        effects: Effects::pure(),
-        imm: Imm::U64(site.callee_box),
-    });
-    let ok = func.push_value(Type::Bool);
-    func.block_mut(b).insts.push(Inst {
-        op: Op::CalleeEq,
-        args: vec![args[1], expected],
-        result: Some(ok),
-        ty: Type::Bool,
-        effects: Effects::pure(),
-        imm: Imm::None,
-    });
-    let fallback = func.push_block();
-    let called = func.push_value(ty);
-    func.block_mut(fallback).insts.push(Inst {
-        op: Op::Call,
-        args: args.clone(),
-        result: Some(called),
-        ty,
-        effects: Effects::call(),
-        imm: Imm::Int(step),
-    });
-    func.block_mut(fallback).term = Some(Term::Jump {
-        target: cont,
-        args: vec![called],
-    });
-    func.block_mut(b).term = Some(Term::Branch {
-        cond: ok,
-        then_block: block_map[0],
-        then_args: Vec::new(),
-        else_block: fallback,
-        else_args: Vec::new(),
-    });
+    match site.target {
+        InlineTarget::Guarded { callee_box, .. } => {
+            let expected = func.push_value(Type::Object);
+            func.block_mut(b).insts.push(Inst {
+                op: Op::Const,
+                args: Vec::new(),
+                result: Some(expected),
+                ty: Type::Object,
+                effects: Effects::pure(),
+                imm: Imm::U64(callee_box),
+            });
+            let ok = func.push_value(Type::Bool);
+            func.block_mut(b).insts.push(Inst {
+                op: Op::CalleeEq,
+                args: vec![args[1], expected],
+                result: Some(ok),
+                ty: Type::Bool,
+                effects: Effects::pure(),
+                imm: Imm::None,
+            });
+            let fallback = func.push_block();
+            let called = func.push_value(ty);
+            func.block_mut(fallback).insts.push(Inst {
+                op: Op::Call,
+                args: args.clone(),
+                result: Some(called),
+                ty,
+                effects: Effects::call(),
+                imm: Imm::Int(step),
+            });
+            func.block_mut(fallback).term = Some(Term::Jump {
+                target: cont,
+                args: vec![called],
+            });
+            func.block_mut(b).term = Some(Term::Branch {
+                cond: ok,
+                then_block: block_map[0],
+                then_args: Vec::new(),
+                else_block: fallback,
+                else_args: Vec::new(),
+            });
+        }
+        // The declaration owns the slot: nothing writes it after the hoisted
+        // init, so the callee at this call IS the closure whose body was
+        // spliced and no check can fail.
+        InlineTarget::Declared { .. } => {
+            func.block_mut(b).term = Some(Term::Jump {
+                target: block_map[0],
+                args: Vec::new(),
+            });
+        }
+    }
 
     replace_uses(func, result, param);
 
@@ -512,9 +574,19 @@ mod tests {
 
     fn site() -> Vec<Option<InlineSite>> {
         vec![Some(InlineSite {
-            callee_id: 7,
-            callee_box: 0xabc,
+            target: InlineTarget::Guarded {
+                callee_id: 7,
+                callee_box: 0xabc,
+            },
         })]
+    }
+
+    /// Adapt a callee-id resolver to the site-target signature the pass takes.
+    fn by_id(f: impl Fn(u64) -> Option<Callee>) -> impl FnMut(&InlineTarget) -> Option<Callee> {
+        move |target| match target {
+            InlineTarget::Guarded { callee_id, .. } => f(*callee_id),
+            InlineTarget::Declared { .. } => None,
+        }
     }
 
     #[test]
@@ -522,7 +594,7 @@ mod tests {
         // The callee's param load becomes the call's argument, so
         // `x + 1` with `x = 10` splices to `11`.
         let mut func = caller_ir();
-        let mut resolve = |id: u64| (id == 7).then(param_callee);
+        let mut resolve = by_id(|id| (id == 7).then(param_callee));
         assert!(run(&mut func, &site(), &mut resolve), "the site inlined");
         assert_eq!(call_count(&func), 1, "only the mismatch fallback remains");
         assert!(!ops(&func).contains(&Op::FrameLoad), "the param is bound");
@@ -552,7 +624,7 @@ mod tests {
     #[test]
     fn splices_a_constant_callee() {
         let mut func = caller_ir();
-        let mut resolve = |id: u64| (id == 7).then(constant_callee);
+        let mut resolve = by_id(|id| (id == 7).then(constant_callee));
         assert!(run(&mut func, &site(), &mut resolve));
         assert_eq!(call_count(&func), 1);
         assert_eq!(verify(&func), Ok(()));
@@ -617,12 +689,30 @@ mod tests {
     }
 
     #[test]
+    fn a_declared_callee_splices_without_a_comparison() {
+        // A hoisted declaration owns the callee slot, so the splice needs no
+        // runtime check and leaves no fallback call.
+        let mut func = caller_ir_mid_block();
+        let sites = vec![Some(InlineSite {
+            target: InlineTarget::Declared { init_step: 3 },
+        })];
+        let mut resolve = |target: &InlineTarget| match target {
+            InlineTarget::Declared { init_step: 3 } => Some(param_callee()),
+            _ => None,
+        };
+        assert!(run(&mut func, &sites, &mut resolve), "the site inlined");
+        assert_eq!(call_count(&func), 0, "no fallback call");
+        assert!(!ops(&func).contains(&Op::CalleeEq), "no comparison");
+        assert_eq!(verify(&func), Ok(()), "the spliced IR verifies");
+    }
+
+    #[test]
     fn splices_a_call_that_is_not_its_blocks_terminator() {
         // `r = call(...); return r + 1`: the instruction after the call moves
         // to the continuation and its operand becomes the continuation's
         // parameter.
         let mut func = caller_ir_mid_block();
-        let mut resolve = |id: u64| (id == 7).then(param_callee);
+        let mut resolve = by_id(|id| (id == 7).then(param_callee));
         assert!(run(&mut func, &site(), &mut resolve), "the site inlined");
         assert_eq!(call_count(&func), 1, "only the mismatch fallback remains");
         assert_eq!(verify(&func), Ok(()), "the spliced IR verifies");
@@ -650,7 +740,7 @@ mod tests {
     #[test]
     fn leaves_a_site_the_resolver_declines() {
         let mut func = caller_ir();
-        let mut resolve = |_id: u64| None;
+        let mut resolve = by_id(|_id| None);
         assert!(!run(&mut func, &site(), &mut resolve));
         assert!(ops(&func).contains(&Op::Call));
     }
@@ -697,7 +787,7 @@ mod tests {
             steps: 1,
         };
         let mut func = caller_ir();
-        let mut resolve = |_id: u64| Some(var_callee.clone());
+        let mut resolve = by_id(|_id| Some(var_callee.clone()));
         assert!(!run(&mut func, &site(), &mut resolve));
         assert!(ops(&func).contains(&Op::Call));
     }
@@ -748,7 +838,7 @@ mod tests {
             steps: 1,
         };
         let mut func = caller_ir();
-        let mut resolve = |_id: u64| Some(callee.clone());
+        let mut resolve = by_id(|_id| Some(callee.clone()));
         assert!(run(&mut func, &site(), &mut resolve), "the callee spliced");
         assert_eq!(call_count(&func), 1, "only the mismatch fallback remains");
         assert_eq!(verify(&func), Ok(()), "the spliced IR verifies");
@@ -797,8 +887,10 @@ mod tests {
             arity: 1,
             this_slot: None,
             sites: Rc::new(vec![Some(InlineSite {
-                callee_id: id,
-                callee_box: box_bits,
+                target: InlineTarget::Guarded {
+                    callee_id: id,
+                    callee_box: box_bits,
+                },
             })]),
             steps: 3,
         }
@@ -809,11 +901,11 @@ mod tests {
         // The caller calls A (id 7); A's own site 0 calls B (id 8). Both splice,
         // so the region is call-free and guards twice.
         let mut func = caller_ir();
-        let mut resolve = |id: u64| match id {
+        let mut resolve = by_id(|id| match id {
             7 => Some(chain_callee(8, 0xdef)),
             8 => Some(constant_callee()),
             _ => None,
-        };
+        });
         assert!(run(&mut func, &site(), &mut resolve));
         assert_eq!(
             call_count(&func),
@@ -833,7 +925,7 @@ mod tests {
         // A's own site calls A: the recursion expands until the budget is spent,
         // then leaves the innermost call real. A hang would fail the test.
         let mut func = caller_ir();
-        let mut resolve = |id: u64| (id == 7).then(|| chain_callee(7, 0xabc));
+        let mut resolve = by_id(|id| (id == 7).then(|| chain_callee(7, 0xabc)));
         assert!(run(&mut func, &site(), &mut resolve));
         assert_eq!(verify(&func), Ok(()));
         assert!(
@@ -877,7 +969,7 @@ mod tests {
             steps: 1,
         };
         let mut func = caller_ir();
-        let mut resolve = |_id: u64| Some(guarded.clone());
+        let mut resolve = by_id(|_id| Some(guarded.clone()));
         assert!(!run(&mut func, &site(), &mut resolve));
         assert!(ops(&func).contains(&Op::Call));
     }

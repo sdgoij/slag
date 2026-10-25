@@ -239,23 +239,17 @@ frontier.
    nested lane were then both profiled (`.notes/perf.md`, 2026-10-25): ~52 ns and
    ~235 ns per non-leaf call, ~100 stores of necessary per-activation state with
    no removable block. The call machinery is no longer the lever.
-7. **Static inlining for loop bodies** (new, 2026-10-25). `SLAG_INLINE`'s splice
-   is starved: it reads interpreter-only feedback, and Cut 69 compiles a loop
-   body on its first consult, so a call site inside a loop is never observed and
-   never inlined. That is why `calls/direct_leaf` is 6 ns/iteration against V8's
-   0.55 ns (V8 inlines the callee; the leaf lane itself is already ~5 ns). The
-   mid-block splice now works (a call need not end its block) and the mismatch
-   path is a fallback call rather than a deopt — the deopt made a mid-block
-   splice **miscompile** (a resume at the call step lost the expression's earlier
-   operands; `.notes/perf.md` has the retracted -93.6% and the evidence).
-   The box guard still cannot inline a closure created per invocation, so the
-   gated feature is mixed (+24% on `object_keys`, -6% on `direct_leaf`) and must
-   stay off. The sound path is static resolution: a `CallFast` whose callee slot
-   is written once by a `FunctionDeclInit` in the same body and never otherwise,
-   with a capture-free leaf callee, splices with no guard and no feedback. It
-   needs (a) the callee's `CompiledBody` at the caller's compile time through the
-   runtime's own `shared_function_body`/`shared_compiled_body` keys, and (b) a
-   scope-aware proof the slot is never reassigned. Both are unbuilt.
+7. **Static inlining for loop bodies** — **DONE** (2026-10-25). The splice now
+   takes a callee whose identity the body itself proves: a frame slot written by
+   exactly one hoisted `FunctionDeclInit`, whose name is never assigned, and
+   whose body compiles to a capture-free certified leaf. No guard, no feedback.
+   `calls/direct_leaf.js` 12.29 -> 5.87 ms (-52.2%, per-row min over 5
+   interleaved rounds, parity identical); the other 76 rows are inside ±3%.
+   `SLAG_INLINE` is now on by default; the feedback-recorded (box-guarded) sites
+   live behind `SLAG_INLINE_FEEDBACK` (off) because they remain mixed — a closure
+   created per invocation never matches the compile-time box, which is what the
+   retracted -93.6% miscompile and the +24% rows in `.notes/perf.md` record. The
+   next step for those is code patching or a recompile policy, not a guard.
 
 ## P3 — the README is a measurement, not a monument
 

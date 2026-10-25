@@ -254,7 +254,10 @@ fn run(command: Command) -> Result<(), u8> {
                     "  SLAG_TYPER=0              disable the typer's read guard (default: on)"
                 );
                 eprintln!(
-                    "  SLAG_INLINE=1             enable the trial-inline splice (default: off)"
+                    "  SLAG_INLINE=0             disable the trial-inline splice (default: on)"
+                );
+                eprintln!(
+                    "  SLAG_INLINE_FEEDBACK=1    also splice feedback-recorded callees (default: off)"
                 );
                 eprintln!("  SLAG_INLINE_BUDGET=N      inline code-growth budget (default: 256)");
                 eprintln!(

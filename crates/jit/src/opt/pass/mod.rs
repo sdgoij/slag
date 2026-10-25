@@ -72,7 +72,7 @@ pub fn run(
     func: &mut Function,
     body: Option<&runtime::ir::CompiledBody>,
     sites: &[Option<inline::InlineSite>],
-    resolve: &mut dyn FnMut(u64) -> Option<inline::Callee>,
+    resolve: &mut dyn FnMut(&inline::InlineTarget) -> Option<inline::Callee>,
 ) -> bool {
     let folded = fold::run(func);
     let narrowed = narrow::run(func);
@@ -305,11 +305,11 @@ mod tests {
             b.term(entry, Term::Return(Some(sum)));
         }
         assert!(
-            run(&mut func, None, &[], &mut |_: u64| None),
+            run(&mut func, None, &[], &mut |_: &inline::InlineTarget| None),
             "the first round folds `1 + 2`"
         );
         assert!(
-            !run(&mut func, None, &[], &mut |_: u64| None),
+            !run(&mut func, None, &[], &mut |_: &inline::InlineTarget| None),
             "the second round finds nothing"
         );
     }

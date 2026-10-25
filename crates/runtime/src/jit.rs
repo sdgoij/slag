@@ -6855,6 +6855,91 @@ pub fn resolve_callee(id: u64) -> Option<ResolvedCallee> {
     })
 }
 
+/// Resolve a body for a call site whose callee slot is provably the closure a
+/// hoisted declaration in `body` creates (`CompiledBody::declared_calls`).
+///
+/// The record is built from the declaration site itself, exactly as
+/// `register_function` builds it — same shared body/params (so the body key is
+/// the site's), same strictness (the body's own directive or the enclosing
+/// body's) — and compiled through `compile_body`, so the IR the splice clones is
+/// the IR the closure runs. Only a certified leaf that reads no environment is
+/// accepted: a closure-free, env-free body is what a splice can bind with
+/// nothing but its arguments.
+pub fn resolve_declaration(body: &CompiledBody, init_step: usize) -> Option<ResolvedCallee> {
+    let crate::ir::Step::FunctionDeclInit {
+        name,
+        function,
+        frame_slot,
+        outer_chain,
+        per_iteration_chain,
+        ..
+    } = body.steps.get(init_step)?
+    else {
+        return None;
+    };
+    // Only a frame slot is a spliceable callee; a captured declaration lives in
+    // the capture context, which the caller's frame cannot stand in for.
+    frame_slot.as_ref()?;
+    if function.is_async || function.is_generator {
+        return None;
+    }
+    let agent = crux::function::current_agent();
+    if agent.is_null() {
+        return None;
+    }
+    // SAFETY: a compile runs inside `with_agent`, which guarantees a live
+    // `Agent` for the enclosing run; this only reads.
+    let agent = unsafe { &*(agent as *const crate::agent::Agent) };
+    let shared_body = crate::function::shared_function_body(agent, function, None);
+    let params = crate::function::shared_params(&shared_body, &function.params);
+    let strict = crate::function::body_is_strict(agent, &shared_body, None) || body.strict;
+    let realm = agent.current_realm().ok()?;
+    let environment = agent.running_context().ok()?.lexical_environment;
+    let data = crate::function::EcmaFunction {
+        name: Some(crux::lookup(*name)),
+        params,
+        body: shared_body,
+        environment,
+        this_mode: if strict {
+            crate::function::ThisMode::Strict
+        } else {
+            crate::function::ThisMode::Sloppy
+        },
+        strict,
+        home_object: None,
+        constructor_kind: crate::function::ConstructorKind::Base,
+        is_class_constructor: false,
+        is_method: false,
+        class_parts: None,
+        private_environment: None,
+        default_derived: false,
+        realm,
+        is_async: false,
+        is_generator: false,
+        class_field_initializer: false,
+        source_info: None,
+        declaring_script_or_module: None,
+        ir: None,
+        leaf_inline: false,
+        construct_inline: false,
+        outer_chain: outer_chain.clone(),
+        per_iteration_chain: per_iteration_chain.clone(),
+        named_expression: false,
+        prototype_pending: false,
+    };
+    let (compiled, _this_writes) = crate::ir::compile_body(&data).ok()?;
+    if !compiled.leaf || compiled.leaf_uses_env {
+        return None;
+    }
+    let compiled = std::rc::Rc::new(compiled);
+    let scope = compiled.scope.as_ref()?;
+    Some(ResolvedCallee {
+        arity: scope.arity,
+        this_slot: scope.this_slot,
+        body: compiled,
+    })
+}
+
 /// The body's compiled-info pointer: the per-body fast cell when set (the
 /// first successful lookup stores it; an eviction clears it, so a set
 /// pointer is always valid), else a consult of the installed hook
@@ -7989,6 +8074,7 @@ mod tests {
             steps,
             handlers: Vec::new(),
             strict: false,
+            declared_calls: Vec::new(),
             scope: None,
             env_constant: true,
             leaf: false,

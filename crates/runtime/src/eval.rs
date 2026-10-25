@@ -4962,6 +4962,80 @@ mod tests {
     }
 
     #[test]
+    fn a_declared_callee_resolves_to_the_runtime_body() {
+        // The static splice compiles a declaration's body from the site instead
+        // of resolving a registered closure. It must be the body the closure
+        // itself runs, or the inlined code would differ from the callee.
+        let mut agent = Agent::new();
+        agent.initialize_host_defined_realm().unwrap();
+        agent
+            .run_script(
+                "function outer() { \
+                   function leaf(x) { return x + 1; } \
+                   var s = 0; \
+                   for (var i = 0; i < 4; i++) s += leaf(i); \
+                   return s; \
+                 } \
+                 outer();",
+            )
+            .unwrap();
+        let outer_body = compiled_body_of(&mut agent, "outer");
+        let &(call, init) = outer_body
+            .declared_calls
+            .first()
+            .expect("the loop's call to `leaf` is a declared site");
+        assert!(
+            matches!(
+                outer_body.steps[call as usize],
+                crate::ir::Step::CallFastSlot { .. } | crate::ir::Step::CallFastSlotStore { .. }
+            ),
+            "the site is a slot callee"
+        );
+        let runtime = agent
+            .with_ecma_functions(|functions| {
+                functions
+                    .values()
+                    .find(|record| {
+                        record.name.as_ref().is_some_and(|name| {
+                            name.as_slice().iter().copied().eq("leaf".encode_utf16())
+                        })
+                    })
+                    .and_then(|record| record.ir.clone())
+            })
+            .expect("the leaf closure is registered");
+        let resolved = crux::function::with_agent(&agent as *const Agent as *mut (), || {
+            crate::jit::resolve_declaration(&outer_body, init as usize)
+        })
+        .expect("the declaration resolves");
+        assert_eq!(
+            resolved.body.steps.len(),
+            runtime.steps.len(),
+            "the static body is the closure's body"
+        );
+        let static_scope = resolved.body.scope.as_ref().expect("certified");
+        let runtime_scope = runtime.scope.as_ref().expect("certified");
+        assert_eq!(resolved.arity, runtime_scope.arity, "same arity");
+        assert_eq!(
+            static_scope.frame_size, runtime_scope.frame_size,
+            "same frame"
+        );
+        assert_eq!(
+            static_scope.tdz_store, runtime_scope.tdz_store,
+            "same TDZ slots"
+        );
+        assert_eq!(
+            static_scope.arguments_slot, runtime_scope.arguments_slot,
+            "same `arguments` slot"
+        );
+        assert_eq!(
+            static_scope.this_slot, runtime_scope.this_slot,
+            "same `this` slot"
+        );
+        assert!(resolved.body.leaf, "a spliceable callee is a leaf");
+        assert!(!resolved.body.leaf_uses_env, "and reads no environment");
+    }
+
+    #[test]
     fn slice23_args_alias_gates_read_only_params() {
         fn args_alias(agent: &mut Agent, src: &str, name: &str) -> bool {
             agent.run_script(src).unwrap();
