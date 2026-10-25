@@ -31421,25 +31421,67 @@ fn collect_assigned_stmt(stmt: &Stmt, assigned: &mut HashSet<crux::AtomId>) {
             left, right, body, ..
         }
         | StmtKind::ForIn { left, right, body } => {
-            if let ForBinding::VarDecl {
-                pattern: BindingPattern::Ident(name),
-                ..
-            } = left
-            {
-                assigned.insert(*name);
+            // The head target itself is written each iteration, and an
+            // expression target (`for (f in obj)`) writes that name.
+            match left {
+                ForBinding::Expr(expr) => {
+                    record_assign_target(expr, assigned);
+                    collect_assigned_expr(expr, assigned);
+                }
+                ForBinding::VarDecl { pattern, init, .. } => {
+                    if let BindingPattern::Ident(name) = pattern {
+                        assigned.insert(*name);
+                    }
+                    if let Some(init) = init {
+                        collect_assigned_expr(init, assigned);
+                    }
+                }
             }
             collect_assigned_expr(right, assigned);
             collect_assigned_stmt(body, assigned);
         }
-        StmtKind::Empty
-        | StmtKind::Debugger
-        | StmtKind::Break(_)
-        | StmtKind::Continue(_)
-        | StmtKind::ClassDecl(_)
-        | StmtKind::With { .. }
-        | StmtKind::Try { .. }
-        | StmtKind::Switch { .. }
-        | StmtKind::UsingDecl { .. } => {}
+        StmtKind::Switch {
+            discriminant,
+            cases,
+        } => {
+            collect_assigned_expr(discriminant, assigned);
+            for case in cases {
+                if let Some(test) = &case.test {
+                    collect_assigned_expr(test, assigned);
+                }
+                collect_assigned_stmts(&case.consequent, assigned);
+            }
+        }
+        StmtKind::Try {
+            block,
+            handler,
+            finalizer,
+        } => {
+            collect_assigned_stmts(&block.stmts, assigned);
+            if let Some(handler) = handler {
+                collect_assigned_stmts(&handler.body.stmts, assigned);
+            }
+            if let Some(finalizer) = finalizer {
+                collect_assigned_stmts(&finalizer.stmts, assigned);
+            }
+        }
+        // A class declaration initializes its binding; `with` hosts arbitrary
+        // scopes, so its body is walked conservatively (an over-approximation,
+        // which only ever refuses a site).
+        StmtKind::ClassDecl(class) => {
+            if let Some(name) = class.name {
+                assigned.insert(name);
+            }
+        }
+        StmtKind::With { body, .. } => collect_assigned_stmt(body, assigned),
+        StmtKind::UsingDecl { decls, .. } => {
+            for decl in decls {
+                if let BindingPattern::Ident(name) = &decl.pattern {
+                    assigned.insert(*name);
+                }
+            }
+        }
+        StmtKind::Empty | StmtKind::Debugger | StmtKind::Break(_) | StmtKind::Continue(_) => {}
         // A function body can assign a declared name (an uncertified
         // function's write lands on the global object) — the prepass must
         // walk it so the fused-call never-assigned check sees the write.
