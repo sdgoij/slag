@@ -4242,8 +4242,12 @@ impl JsObject {
         // vector-free object's entries from the map first.
         self.materialize_properties();
         let props = self.properties.borrow();
+        // Only the array-index keys are staged (they enumerate first, by
+        // ascending index, and an ordinary object rarely has one); the string
+        // keys already sit in insertion order, so they go straight into the
+        // result.
         let mut indices: Vec<(u64, PropertyKey, bool)> = Vec::new();
-        let mut strings: Vec<(PropertyKey, bool)> = Vec::new();
+        let mut keys: Vec<(PropertyKey, bool)> = Vec::with_capacity(props.len());
         for (key, property) in props.iter() {
             if !matches!(key, PropertyKey::String(_)) {
                 continue;
@@ -4251,18 +4255,21 @@ impl JsObject {
             let enumerable = property.enumerable;
             match array_index_of(key) {
                 Some(index) => indices.push((index, key.clone(), enumerable)),
-                None => strings.push((key.clone(), enumerable)),
+                None => keys.push((key.clone(), enumerable)),
             }
         }
+        if indices.is_empty() {
+            return Some(keys);
+        }
         indices.sort_by_key(|(index, _, _)| *index);
-        let mut keys = Vec::with_capacity(indices.len() + strings.len());
-        keys.extend(
+        let mut ordered = Vec::with_capacity(indices.len() + keys.len());
+        ordered.extend(
             indices
                 .into_iter()
                 .map(|(_, key, enumerable)| (key, enumerable)),
         );
-        keys.extend(strings);
-        Some(keys)
+        ordered.extend(keys);
+        Some(ordered)
     }
 
     /// spec 7.3.11 GetMethod: `None` when the property is *undefined* or

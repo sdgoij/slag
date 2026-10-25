@@ -218,10 +218,16 @@ frontier.
    per-call captured bindings are slots with the scope's shared layout, built
    once at certification. -9.9% on the for-in row, -8…-9% on the probes that
    isolate it (mins, two binaries).
-4. **Next, from the 2026-10-25 PROFILE**: the for-in enumeration itself (534
-   ns/body) and the null-prototype property store (88 ns per store against 20
-   into `{}` — `Object.create(null)` is not the cost, the stores are). Closure
-   creation stays gated by the closure plan's stop rule (`e7` = 91.4 ms).
+4. **The for-in enumeration** — **DONE** (2026-10-25): the cache shares the key
+   list, a short chain is snapshotted inline, and `own_string_props` stages one
+   vector instead of three. The fresh-object enumeration probes are 9-18% faster
+   (see the LANDED entry in `.notes/perf.md`). The null-prototype store is not a
+   target (the CORRECTION entry).
+5. **Creation-site source texts** — **DONE** (2026-10-25): the resolution moved
+   from per closure to per site, `e7` 92.3 -> 78.0 ms and the row -7.1%. `e7` is
+   now under the closure plan's 85 ms stop rule, so **Stage D is unblocked** for
+   a session that wants the arena-allocated record. `FunctionDeclInit` still
+   resolves per creation.
 5. **Object-literal named evaluation**: **DONE** (2026-10-25, `ca4ee26c`).
 6. **Call lanes**: a member call to a closure created in the same iteration costs
    ~350 ns (the for-in row's asserts are three of them per body). This is the

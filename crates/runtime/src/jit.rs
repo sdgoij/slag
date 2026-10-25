@@ -3890,18 +3890,26 @@ extern "C" fn create_function(ctx: *mut c_void, step: u64) -> u64 {
         named,
         outer_chain,
         per_iteration_chain,
+        source,
     }) = step_at(ctx, step)
     else {
         // The compiled code passes its own step index; a mismatch is an
         // internal invariant violation.
         unreachable!("create_function on a non-CreateFunction step");
     };
+    // The site's source texts: resolved once, then a refcount bump.
+    let source = crate::function::site_source_info(
+        agent,
+        source,
+        function.as_ref() as *const syntax::ast::Function as usize,
+        function.span,
+    );
     // The Vm's lexical env is the authoritative running environment during
     // a JIT run: the interpreter's per-step context-env sync (skipped by
     // the JIT) keeps the agent context current, so reading the context
     // here would capture a STALE env after a block/catch pushed one.
     let env = vm.lexical_env;
-    match crate::function::instantiate_function_expression(
+    match crate::function::instantiate_function_expression_with_source(
         agent,
         function,
         env,
@@ -3909,6 +3917,7 @@ extern "C" fn create_function(ctx: *mut c_void, step: u64) -> u64 {
         outer_chain.clone(),
         per_iteration_chain.clone(),
         named.clone(),
+        source,
     ) {
         Ok(value) => value.bits(),
         Err(error) => slow_error(ctx, error),
@@ -3928,12 +3937,18 @@ extern "C" fn create_arrow(ctx: *mut c_void, step: u64) -> u64 {
         outer_chain,
         per_iteration_chain,
         span,
+        source,
     }) = step_at(ctx, step)
     else {
         unreachable!("create_arrow on a non-CreateArrow step");
     };
+    let site_node = match body {
+        syntax::ast::ArrowBody::Expr(expr) => expr.as_ref() as *const _ as usize,
+        syntax::ast::ArrowBody::Block(block) => block as *const _ as usize,
+    };
+    let source = crate::function::site_source_info(agent, source, site_node, *span);
     let env = vm.lexical_env;
-    match crate::function::instantiate_arrow(
+    match crate::function::instantiate_arrow_with_source(
         agent,
         *is_async,
         params.as_slice(),
@@ -3944,6 +3959,7 @@ extern "C" fn create_arrow(ctx: *mut c_void, step: u64) -> u64 {
         per_iteration_chain.clone(),
         *span,
         named.clone(),
+        Some(source),
     ) {
         Ok(value) => value.bits(),
         Err(error) => slow_error(ctx, error),
@@ -5385,10 +5401,14 @@ extern "C" fn for_in_begin(ctx: *mut c_void, value: u64) -> u64 {
                     Ok(keys) => keys,
                     Err(error) => return slow_error(ctx, error),
                 };
-                if let Err(error) = crate::ir::for_in_cache_put(agent, &obj, &keys) {
+                let keys = std::rc::Rc::new(keys);
+                // The cache and the loop share one list.
+                if let Err(error) =
+                    crate::ir::for_in_cache_put(agent, &obj, std::rc::Rc::clone(&keys))
+                {
                     return slow_error(ctx, error);
                 }
-                std::rc::Rc::new(keys)
+                keys
             }
             Err(error) => return slow_error(ctx, error),
         }

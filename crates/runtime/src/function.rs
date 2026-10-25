@@ -986,15 +986,48 @@ pub fn instantiate_function_with_source(
     named_expression: bool,
     named: Option<JsString>,
 ) -> Result<Value, JsError> {
-    let source_info = match source {
-        Some(slice) => {
-            // A caller-supplied slice (a module declaration's own text, a
-            // snapshot restore): its body spans run past the slice when it has
-            // nested closures, so the enclosing text is still the full one
-            // when a frame carries it.
-            Some(source_info_with_slice(agent, f.span, slice))
-        }
-        None => shared_source_info(agent, f as *const syntax::ast::Function as usize, f.span),
+    instantiate_function_with_resolved_source(
+        agent,
+        f,
+        environment,
+        enclosing_strict,
+        source,
+        None,
+        outer_chain,
+        per_iteration_chain,
+        named_expression,
+        named,
+    )
+}
+
+/// `instantiate_function_with_source` with the site's source texts already
+/// resolved (`resolved` wins over `source`, which the dynamic-function and
+/// module paths still supply as text).
+#[allow(clippy::too_many_arguments)]
+pub fn instantiate_function_with_resolved_source(
+    agent: &mut Agent,
+    f: &syntax::ast::Function,
+    environment: EnvRef,
+    enclosing_strict: bool,
+    source: Option<JsString>,
+    resolved: Option<std::rc::Rc<SourceInfo>>,
+    outer_chain: OuterChain,
+    per_iteration_chain: PerIterationChain,
+    named_expression: bool,
+    named: Option<JsString>,
+) -> Result<Value, JsError> {
+    let source_info = match (resolved, source) {
+        (Some(info), _) => Some(info),
+        (None, source) => match source {
+            Some(slice) => {
+                // A caller-supplied slice (a module declaration's own text, a
+                // snapshot restore): its body spans run past the slice when it has
+                // nested closures, so the enclosing text is still the full one
+                // when a frame carries it.
+                Some(source_info_with_slice(agent, f.span, slice))
+            }
+            None => shared_source_info(agent, f as *const syntax::ast::Function as usize, f.span),
+        },
     };
     let source_key = source_info
         .as_ref()
@@ -1856,6 +1889,28 @@ fn directive_is_use_strict(
         == "use strict".encode_utf16().collect::<Vec<u16>>().as_slice()
 }
 
+/// A creation site's source texts, resolved on the first creation and
+/// remembered by the step that carries the site (see `Step::CreateFunction`).
+///
+/// The resolution walks the creating frame's contexts and hashes the
+/// function's own text; neither changes between creations from the same site,
+/// and the creating frame is the one that carries the text, so the first
+/// creation's answer is the right one for every later creation. `None` (a
+/// synthesized or source-less site) is remembered too, so it is not re-walked.
+pub fn site_source_info(
+    agent: &Agent,
+    cell: &std::cell::OnceCell<Option<std::rc::Rc<SourceInfo>>>,
+    node: usize,
+    span: crux::Span,
+) -> Option<std::rc::Rc<SourceInfo>> {
+    if let Some(info) = cell.get() {
+        return info.clone();
+    }
+    let info = shared_source_info(agent, node, span);
+    let _ = cell.set(info.clone());
+    info
+}
+
 /// InstantiateOrdinaryFunctionExpression (spec 15.2.5): a named function
 /// expression additionally binds its name immutably in a fresh scope.
 pub fn instantiate_function_expression(
@@ -1867,12 +1922,39 @@ pub fn instantiate_function_expression(
     per_iteration_chain: PerIterationChain,
     named: Option<JsString>,
 ) -> Result<Value, JsError> {
+    instantiate_function_expression_with_source(
+        agent,
+        f,
+        environment,
+        enclosing_strict,
+        outer_chain,
+        per_iteration_chain,
+        named,
+        None,
+    )
+}
+
+/// `instantiate_function_expression` with the site's source texts already
+/// resolved (the creation step carries them; see [`site_source_info`]).
+#[allow(clippy::too_many_arguments)]
+pub fn instantiate_function_expression_with_source(
+    agent: &mut Agent,
+    f: &syntax::ast::Function,
+    environment: EnvRef,
+    enclosing_strict: bool,
+    outer_chain: OuterChain,
+    per_iteration_chain: PerIterationChain,
+    named: Option<JsString>,
+    resolved: Option<std::rc::Rc<SourceInfo>>,
+) -> Result<Value, JsError> {
     let Some(name) = f.name else {
-        return instantiate_function(
+        return instantiate_function_with_resolved_source(
             agent,
             f,
             environment,
             enclosing_strict,
+            None,
+            resolved,
             outer_chain,
             per_iteration_chain,
             false,
@@ -1887,11 +1969,13 @@ pub fn instantiate_function_expression(
     if let crate::env::EnvRecord::Declarative(declarative) = &*scope {
         declarative.mark_context_transparent();
     }
-    let value = instantiate_function(
+    let value = instantiate_function_with_resolved_source(
         agent,
         f,
         scope,
         enclosing_strict,
+        None,
+        resolved,
         outer_chain,
         per_iteration_chain,
         true,
@@ -2000,6 +2084,67 @@ pub fn instantiate_arrow(
     span: crux::Span,
     named: Option<JsString>,
 ) -> Result<Value, JsError> {
+    instantiate_arrow_impl(
+        agent,
+        is_async,
+        params,
+        body,
+        environment,
+        enclosing_strict,
+        outer_chain,
+        per_iteration_chain,
+        span,
+        named,
+        None,
+    )
+}
+
+/// `instantiate_arrow` with the site's source texts already resolved (the
+/// creation step carries them; see [`site_source_info`]). `Some(None)` means
+/// the site has no source text, so the resolution must not run again.
+#[allow(clippy::too_many_arguments)]
+pub fn instantiate_arrow_with_source(
+    agent: &mut Agent,
+    is_async: bool,
+    params: &[BindingElement],
+    body: &syntax::ast::ArrowBody,
+    environment: EnvRef,
+    enclosing_strict: bool,
+    outer_chain: OuterChain,
+    per_iteration_chain: PerIterationChain,
+    span: crux::Span,
+    named: Option<JsString>,
+    resolved: Option<Option<std::rc::Rc<SourceInfo>>>,
+) -> Result<Value, JsError> {
+    instantiate_arrow_impl(
+        agent,
+        is_async,
+        params,
+        body,
+        environment,
+        enclosing_strict,
+        outer_chain,
+        per_iteration_chain,
+        span,
+        named,
+        resolved,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn instantiate_arrow_impl(
+    agent: &mut Agent,
+    is_async: bool,
+    params: &[BindingElement],
+    body: &syntax::ast::ArrowBody,
+    environment: EnvRef,
+    enclosing_strict: bool,
+    outer_chain: OuterChain,
+    per_iteration_chain: PerIterationChain,
+    span: crux::Span,
+    named: Option<JsString>,
+    resolved: Option<Option<std::rc::Rc<SourceInfo>>>,
+) -> Result<Value, JsError> {
     // Cut 43: the site's shared Block — every closure from the same arrow
     // node shares it (and, via `shared_compiled_body` below, one compiled
     // body), so a loop-created arrow does not recompile per iteration. The
@@ -2023,7 +2168,10 @@ pub fn instantiate_arrow(
         ArrowBody::Expr(expr) => expr.as_ref() as *const Expr as usize,
         ArrowBody::Block(block) => block as *const Block as usize,
     };
-    let source_info = shared_source_info(agent, site_node, span);
+    let source_info = match resolved {
+        Some(info) => info,
+        None => shared_source_info(agent, site_node, span),
+    };
     // The arrow's `[[ScriptOrModule]]`, read at creation like every other
     // closure's: an async body's start and a promise reaction's callback run in
     // contexts the engine synthesizes, so the record is where the script or

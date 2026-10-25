@@ -629,6 +629,12 @@ pub enum Step {
         /// open at this creation site (see
         /// [`crate::function::EcmaFunction::per_iteration_chain`]).
         per_iteration_chain: crate::function::PerIterationChain,
+        /// The site's source texts, resolved on the first creation: the
+        /// resolution walks the creating frame's contexts and hashes the
+        /// function's text, neither of which changes between creations here
+        /// (see `crate::function::site_source_info`). Held by the step so a
+        /// loop creating the closure pays it once.
+        source: std::cell::OnceCell<Option<std::rc::Rc<crate::function::SourceInfo>>>,
     },
     /// Create an arrow function's closure: `[[ThisMode]]` is lexical and
     /// there is no `prototype` (spec 15.3.2). `outer_chain` is as in
@@ -649,6 +655,8 @@ pub enum Step {
         /// above, so the span that names it is carried here (`CreateFunction`
         /// keeps its whole node and reads the span off that instead).
         span: crux::Span,
+        /// The site's source texts (see `Step::CreateFunction`).
+        source: std::cell::OnceCell<Option<std::rc::Rc<crate::function::SourceInfo>>>,
     },
     /// `new.target` (spec 13.3.5.3): the active constructor, or *undefined*
     /// at the script level.
@@ -2619,10 +2627,43 @@ pub(crate) const FOR_IN_CELLS: usize = 64;
 /// lesson).
 pub struct ForInEnumCache {
     pub(crate) base: Handle<crux::object::JsObject>,
-    // `Rc`s so a probe copies the lists out of the table's borrow without
-    // allocating: a `RefCell` guard must never span an allocation.
-    chain: std::rc::Rc<Vec<(u64, u32)>>,
+    // Copied out of the table's borrow without allocating (an inline copy or
+    // a refcount bump): a `RefCell` guard must never span an allocation.
+    chain: ForInChain,
     keys: ForInKeys,
+}
+
+/// One chain snapshot. The common shapes — a null-prototype object (one
+/// link) and a plain object over `Object.prototype` (two) — are held inline,
+/// so caching an enumeration allocates nothing for the chain.
+#[derive(Clone)]
+enum ForInChain {
+    Inline { len: u8, links: [(u64, u32); 2] },
+    Shared(std::rc::Rc<Vec<(u64, u32)>>),
+}
+
+impl ForInChain {
+    fn new(links: Vec<(u64, u32)>) -> Self {
+        let len = links.len();
+        if len > 2 {
+            return Self::Shared(std::rc::Rc::new(links));
+        }
+        let mut inline = [(0, 0); 2];
+        for (slot, link) in inline.iter_mut().zip(links) {
+            *slot = link;
+        }
+        Self::Inline {
+            len: len as u8,
+            links: inline,
+        }
+    }
+
+    fn links(&self) -> &[(u64, u32)] {
+        match self {
+            Self::Inline { len, links } => &links[..*len as usize],
+            Self::Shared(links) => links,
+        }
+    }
 }
 
 impl Trace for ForInEnumCache {
@@ -2673,7 +2714,7 @@ pub(crate) fn for_in_cache_keys(
         return Ok(None);
     }
     let mut current = Some(*obj);
-    for &(id, generation) in chain.iter() {
+    for &(id, generation) in chain.links().iter() {
         let Some(link) = current else {
             return Ok(None); // the chain shortened
         };
@@ -2693,18 +2734,15 @@ pub(crate) fn for_in_cache_keys(
 pub(crate) fn for_in_cache_put(
     agent: &mut Agent,
     obj: &Handle<crux::object::JsObject>,
-    keys: &[(usize, Value)],
+    keys: ForInKeys,
 ) -> Result<(), JsError> {
     let Some(chain) = for_in_chain_snapshot(obj)? else {
         return Ok(());
     };
     let slot = obj.id() as usize & (FOR_IN_CELLS - 1);
-    // Build both lists before taking the table's borrow.
-    let chain = std::rc::Rc::new(chain);
-    let keys = std::rc::Rc::new(keys.to_vec());
     agent.roots.for_in_cells.borrow_mut()[slot] = Some(ForInEnumCache {
         base: *obj,
-        chain,
+        chain: ForInChain::new(chain),
         keys,
     });
     Ok(())
@@ -8258,9 +8296,16 @@ impl Vm {
                     named,
                     outer_chain,
                     per_iteration_chain,
+                    source,
                 } => {
                     let env = agent.running_context()?.lexical_environment;
-                    let value = crate::function::instantiate_function_expression(
+                    let source = crate::function::site_source_info(
+                        agent,
+                        source,
+                        function.as_ref() as *const syntax::ast::Function as usize,
+                        function.span,
+                    );
+                    let value = crate::function::instantiate_function_expression_with_source(
                         agent,
                         function,
                         env,
@@ -8268,6 +8313,7 @@ impl Vm {
                         outer_chain.clone(),
                         per_iteration_chain.clone(),
                         named.clone(),
+                        source,
                     )?;
                     self.stack.push(value);
                 }
@@ -8280,9 +8326,15 @@ impl Vm {
                     outer_chain,
                     per_iteration_chain,
                     span,
+                    source,
                 } => {
                     let env = agent.running_context()?.lexical_environment;
-                    let value = crate::function::instantiate_arrow(
+                    let site_node = match body {
+                        syntax::ast::ArrowBody::Expr(expr) => expr.as_ref() as *const _ as usize,
+                        syntax::ast::ArrowBody::Block(block) => block as *const _ as usize,
+                    };
+                    let source = crate::function::site_source_info(agent, source, site_node, *span);
+                    let value = crate::function::instantiate_arrow_with_source(
                         agent,
                         *is_async,
                         params.as_slice(),
@@ -8293,6 +8345,7 @@ impl Vm {
                         per_iteration_chain.clone(),
                         *span,
                         named.clone(),
+                        Some(source),
                     )?;
                     self.stack.push(value);
                 }
@@ -10142,9 +10195,12 @@ impl Vm {
                             match for_in_cache_keys(agent, &obj)? {
                                 Some(keys) => keys,
                                 None => {
-                                    let keys = crate::eval::for_in_key_levels(agent, &rhs)?;
-                                    for_in_cache_put(agent, &obj, &keys)?;
-                                    std::rc::Rc::new(keys)
+                                    let keys = std::rc::Rc::new(crate::eval::for_in_key_levels(
+                                        agent, &rhs,
+                                    )?);
+                                    // The cache and the loop share one list.
+                                    for_in_cache_put(agent, &obj, std::rc::Rc::clone(&keys))?;
+                                    keys
                                 }
                             }
                         } else {
@@ -21605,6 +21661,7 @@ impl Compiler {
                     named,
                     outer_chain,
                     per_iteration_chain,
+                    source: std::cell::OnceCell::new(),
                 });
                 Ok(())
             }
@@ -21626,6 +21683,7 @@ impl Compiler {
                     outer_chain,
                     per_iteration_chain,
                     span: expr.span,
+                    source: std::cell::OnceCell::new(),
                 });
                 Ok(())
             }

@@ -16319,3 +16319,49 @@ So a cache miss costs ~780 ns and a hit ~8 ns; the miss is `for_in_key_levels` p
 - `for_in_cache_put` builds a chain-snapshot `Vec`, wraps it in an `Rc`, **copies the key list** (`keys.to_vec()`) and wraps the copy in a second `Rc` — although `for_in_begin` already wraps the original in an `Rc` for `ForInState`. Five allocations where three would do, and one copy of the key list that the cache and the loop could share.
 
 Next, in order: (1) share the key-list `Rc` between `ForInState` and the cache entry, and skip the chain-snapshot allocation for a single-link chain; (2) have `for_in_key_levels` push straight into its result from the object (no materialize, no `indices`/`strings` staging, sort only when an index key is present); (3) the closure `SourceInfo` in step payloads.
+
+## LANDED (2026-10-25): a for-in begin caches one key list, and a short chain inline
+
+The PROFILE entry above put `for_in_key_levels` at 279 ns and `for_in_cache_put` at 134 ns per loop entry over a fresh 3-key null-prototype object, and named the reason: the miss path built the key list, then **copied** it into the cache (`keys.to_vec()`), wrapped the copy in a second `Rc` while `for_in_begin` was already wrapping the original, and snapshotted the prototype chain into a `Vec` behind another `Rc`.
+
+Three changes:
+
+- `for_in_cache_put` now takes the shared `ForInKeys` and stores it, so the cache and the running `ForInState` hold one list (the JIT helper, the interpreter's `ForInBegin`, and the bytecode path all construct it once).
+- The chain snapshot is a `ForInChain`: up to two links inline (a null-prototype object is one, a plain object over `Object.prototype` two), one `Rc` beyond that. Probing copies the inline pair, so no allocation on either side.
+- `JsObject::own_string_props` builds one result vector instead of three: only array-index keys are staged (they enumerate first, ascending, and an ordinary object rarely has one); the string keys already sit in insertion order and go straight in.
+
+Measured with two binaries, alternating order, 7 rounds, mins:
+
+| probe | before | after | min |
+| --- | ---: | ---: | ---: |
+| fresh 3-key null-prototype object | 97.07 ms | **88.22** | **-9.1%** |
+| fresh 0-key null-prototype object | 42.86 | **38.67** | -9.8% |
+| fresh 3-key plain object (two links) | 129.42 | **106.55** | **-17.7%** |
+| shared 3-key object (cache hit) | 20.41 | 20.65 | +1.2% (noise) |
+| the for-in corpus row | 450.88 | 465.77 | +3.3% min / -0.6% median — noise |
+
+The row does not move because it is dominated by closure creation and calls, not enumeration; the probes that isolate the enumeration are 9-18% faster, and the plain-object shape (the one ordinary code enumerates) benefits most because its two-link chain is now inline.
+
+Enumeration order was diffed against node across eight shapes (index keys before strings, literal order, non-enumerable and symbol keys skipped, prototype chains, a shadowed prototype key, delete during enumeration, null prototype).
+
+Gates: `cargo fmt --all -- --check`; `cargo clippy --workspace --all-targets -- -D warnings`; `cargo test --workspace` (40 suites, 0 failed); sweeps `language` 23,726 + `built-ins` 23,821 + `annexB` 1,086 + `intl402` 3,365 = 51,998 at 100%; corpus parity 0.
+
+## LANDED (2026-10-25): a creation site resolves its source texts once
+
+The phase profile above measured `shared_source_info` at 75 ns per closure — per closure it walked the execution-context stack for the enclosing text, cloned that text, **hashed the function's own source slice**, and probed a thread-local cache, all of which are fixed for a creation site.
+
+`Step::CreateFunction` and `Step::CreateArrow` now carry an `OnceCell<Option<Rc<SourceInfo>>>`. The first creation resolves it (in the creating frame's context — the same context the old per-creation resolution used, and the frame that carries the text) and stores it; every later creation from that site is a `OnceCell::get` plus an `Rc` clone. `Some(None)` is stored too, so a source-less site is not re-walked. `instantiate_function_expression_with_source` / `instantiate_arrow_with_source` take the resolved value; the old entry points delegate with `None`, so every non-step caller (the tree-walker, modules, snapshots, `new Function`, class members) is unchanged. `Step::FunctionDeclInit` still resolves per creation — a declaration is created once per evaluation, not per loop iteration, and it was left for a follow-up.
+
+Measured with two binaries, alternating order, 7 rounds, mins:
+
+| probe | before | after | min |
+| --- | ---: | ---: | ---: |
+| `e7` 300k closures | 92.31 ms | **77.97** | **-15.5%** (305 → 260 ns each) |
+| `e5` the same, called | 134.56 | **119.27** | -11.4% |
+| `p14` 3 closures/body, no loop | 147.90 | **128.26** | -13.3% |
+| `p19` one capturing closure | 110.91 | **101.69** | -8.3% |
+| the for-in corpus row | 459.61 | **427.16** | **-7.1%** |
+
+`e7` is now **below** the 85 ms stop rule in `.notes/closure-cost-plan.md` (77.97), so that plan's arena-record stage (Stage D) is no longer blocked by it — a later session can re-open it. `Function.prototype.toString` and error stacks were diffed against node for anonymous, named, and block-bodied closures and arrows created in a loop.
+
+Gates: `cargo fmt --all -- --check`; `cargo clippy --workspace --all-targets -- -D warnings`; `cargo test --workspace` (40 suites, 0 failed); sweeps 51,998 at 100%; corpus parity 0. The corpus's own gap is not measurable on this host right now — four consecutive runs of the same binary read 7.43 / 12.67 / 10.63 / 10.73 — so `README.md` keeps its three-round medians (10.54x / 3.76x) and these landings are recorded by the interleaved probe A/Bs above.
