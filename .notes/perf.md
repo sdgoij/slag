@@ -16059,3 +16059,22 @@ Gates: `cargo fmt --all -- --check`; `cargo clippy --workspace --all-targets --
 `--gc-stress --gc-verify` on `language *for-in*` (153), `language *closure*`
 (23) and `built-ins *Generator*` (157) 0 fail; corpus parity 0 (77 rows,
 mean-jitGap 10.55, mean-jlGap 3.82).
+
+## NULL (2026-10-25): the call lanes' `Ref::filter_map` record read is below the noise floor (P1 R3)
+
+R3's premise was that `Agent::ecma_function`'s `Ref::filter_map` remap is a per-call cost on the lanes the corpus blames. It is not: reading the record under a plain `table.borrow()` — and, in a second shape, merging `construct_inner`'s two record reads into one — measures inside the noise floor on every lane that touches it. Reverted.
+
+The lanes were probed directly rather than inferred. `fn_call` — a non-leaf ordinary call (`function callee(o) { try { return o.x + 1; } catch (e) { return 0; } }`, 300k iterations, ~77 ns/call) — and `cb_nonleaf` — a builtin-invoked JS callback whose body calls a helper, so it is not a certified leaf and every element goes through `function::call` -> `call_inner` (8-element `forEach`, 100k rounds, ~345 ns/element). Both are in `scratch/ab/r3/`.
+
+A 15-round alternating A/B against the R2 binary, with an A/A control (the R2 binary against a copy of itself) for the floor:
+
+| lane | statistic | R2 -> R3 | A/A control |
+| --- | --- | ---: | ---: |
+| `cb_nonleaf` | median | +2.0% | -4.1% |
+| `cb_nonleaf` | min | +1.6% | -0.9% |
+| `fn_call` | median | -3.6% | -2.2% |
+| `fn_call` | min | -1.6% | -1.0% |
+
+The control's own 4% median spread on `cb_nonleaf` is larger than the effect, so the median column resolves nothing; the min-based comparison is the usable one, and its floor is ~1%. Against that floor the restructured version (fields read in place under one plain borrow — no closure, no `Option<tuple>` return, which the first shape paid for) is -0.3% / -0.6%, i.e. flat, and the `--bench` suite measured every row inside +/-2% min (`construct churn` +0.8%, `function calls` -0.1%, `closure capture` -1.0%).
+
+So the cost is not the guard: `Ref::filter_map` on a `Ref` that is about to be dropped is a few instructions on a 77-345 ns call. The useful part of this attempt is the floor itself — an A/A control is mandatory before reading a 2-4% delta on this machine, and `cb_nonleaf`'s ~345 ns/element is where the callback lane's money is (the leaf callback row is ~260 ns/element), not in the record read. Profiling that lane is the next step, not more indirection work.

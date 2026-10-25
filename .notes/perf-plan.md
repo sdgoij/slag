@@ -166,7 +166,13 @@ cold consult re-derives the record's `Rc` by id in `lookup_info_leaf`.
 `global_leaf_cells`/`slot_leaf_cells` stay `RefCell`s: 4h measured that lane at
 0%, and the `Copy` record already removed their clone.**
 
-**R3 — the call lane's record read.** `Agent::ecma_function` returns a
+**R3 — the call lane's record read.** *Attempted 2026-10-25 and rejected as a
+NULL: reading the record under a plain `borrow()` (and merging
+`construct_inner`'s two reads into one) is inside the noise floor on every lane
+that touches it — `cb_nonleaf` -0.3% min, `fn_call` -0.6% min against a 1%
+min-based A/A floor, all `--bench` rows within +/-2%. See the perf.md entry.
+The guard is not the cost on a 77-345 ns call; the callback lane's ~345
+ns/element is.* `Agent::ecma_function` returns a
 `Ref::filter_map` for a one-field read; with R1's `&roots` the table is one hop
 away, so read the fields under a plain `borrow()` and drop it before the call
 (slice 3b's discipline). Verify the builtin-to-JS callback lane actually hits
