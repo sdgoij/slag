@@ -57,6 +57,31 @@ Do not assume `cargo build -p slag` rebuilt the CLI.
   `target/build-cache` to reclaim the space. `SLAG_BUILD_CACHE` relocates it;
   keep the cache per-checkout, since binaries embed the building path.
 
+## Never leave an artifact built from source you have since reverted
+
+The cache key is the tree content, so a dirty entry is *correct for that content*.
+The hazard is the fixed-name copy: `tools/build.sh` writes
+`target/<profile>/{slag,sweep,leak,wasmtest}.exe`, and nothing rewrites them when
+the tree moves. Build an experiment, revert it, and `target/release/sweep.exe`
+keeps running the experiment — a gate run then reports the experiment's failures
+against the reverted source. This has already happened: an experimental
+`UpdateContextSlot` lift was built, reverted, and left in `target/release`; a
+sweep afterwards reported `Iterator/zip/basic-longest.js` failing on a tree whose
+source refuses that lift (`refuses_update_context_slot` pins it).
+
+So, when abandoning an experiment:
+
+1. Delete the binaries built from it — rebuild from the reverted tree
+   (`./tools/build.sh`) rather than leaving the old copies.
+2. Delete its cache entry: `target/build-cache/<entry>` holds the artifacts and a
+   `meta.txt` whose `state dirty` (or a `tree`/`head` that no longer matches) is
+   the tell. Leaving it wastes ~60 MB and invites a future `--force` mix-up.
+3. Only then run a gate, and say which tree the binary came from. A green sweep
+   from a `state dirty` entry is not evidence about the committed source.
+
+Conversely, a *legitimate* same-tree rebuild is cheap: a hit copies in well under
+a second, so there is never a reason to skip a rebuild before reporting results.
+
 ## Freshness checks (run before trusting output)
 
 1. Confirm the build is up to date and note whether it relinks:
