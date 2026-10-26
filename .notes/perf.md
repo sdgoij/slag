@@ -16643,3 +16643,130 @@ Corpus: `control/generator_loop.js` 33.09 -> 31.42 ms (-5.0%); every other `cont
 Gates: fmt; clippy `-D warnings`; `cargo test --workspace` (40 suites, 5,847 passed, 0 failed); sweeps 51,998 at 100%; corpus parity 0 (77 rows).
 
 What is left in the row, from the profile: the resume (~55 ns), the remaining table lookup and the `Rc` clone per call, and the `{value, done}` allocation. The next step is the state on the object (a new `ObjectKind` variant with its own trace arm), which removes the lookup and the clone together.
+
+## LANDED (2026-10-26): the engine reports why bodies are not compiled, and PGO measured
+
+Two of the pillars in `.notes/bottleneck-method.md` are now real.
+
+### The counters
+
+`JIT_HELPER_STATS` printed `helper <index> <count>`, which is unreadable without
+the enum order to hand. The compiler now records `Helper::name()` beside the
+increment it emits, so the dump is `helper <index> <count> <name>`. The name
+array lives in `HelperCounts` beside the counts, is written only when the
+instrument is on, and is filled by both emitters (`compiler.rs` and
+`opt_lower.rs`).
+
+`SLAG_JIT_REPORT` is a new census: every body the compiler refuses, one row per
+`(tier, reason)` with body and step counts, then the compiled and deopt totals.
+`tier=opt` means the optimizing tier refused and the baseline tier compiled it
+anyway; `tier=none` means no tier produced code. A lift refusal is named from
+the body's blocker census, so a row reads `SwitchTest` rather than `step`.
+
+`tools/opcount.sh` runs every workload in its own process (a `--corpus` run
+sums all rows into one process, so it cannot attribute) and prints the rows as
+TSV, ready to sort or diff between builds.
+
+Reading it turned up three placeholder names in `step_name`: the compound
+member stores and the two LICM hoist guards were all reported as the generic
+`step`, so five rows came out with an empty reason. They are named now. Those
+five are the hoist guard, which the lift refuses on purpose (it models the
+guard as an always-miss, a measured pessimization), so the census now says that
+instead of leaving a blank.
+
+### What the sweep says
+
+20 of 77 rows have at least one body the optimizing tier refuses:
+
+| row | blocker | steps |
+| --- | --- | ---: |
+| statements/for-in/head-let-fresh-binding-per-iteration | EnterPerIteration,LeaveBlock,LoadPerIteration,PerIteration,StorePerIteration,TypeofTop | 101 |
+| control/switch_dispatch | Break,SwitchDisc,SwitchTest | 74 |
+| objects/proto_read | HoistGuard | 60 |
+| objects/own_read | HoistGuard | 52 |
+| globals/declarative_read | HoistGuard | 48 |
+| globals/nested_read | HoistGuard | 48 |
+| globals/object_read | HoistGuard | 48 |
+| strings/search_slice | FusedLoop | 48 |
+| builtins/json_roundtrip | RunRegBody | 42 |
+| opcost/regexp_test | RegExpLiteral | 41 |
+| control/try_catch_loop | CatchBind,EnterTry,Exit,LeaveBlock | 38 |
+| objects/many_objects_read | RunRegBody | 38 |
+| opcost/obj_prop | HoistGuard | 34 |
+| calls/apply_call | CallApply | 30 |
+| template-literal/evaluation-order | Binary | 30 |
+| statements/try/completion-values | Binary | 30 |
+| (for-in/head-let, a second body) | Binary | 30 |
+| opcost/prim_prop | RunRegBody | 23 |
+| control/generator_loop | Yield | 12 |
+| calls/method_call | AssignMemberName(compound) | 9 |
+
+Each of these rows runs its hot body on the baseline tier. That is the class of
+gap the note predicted: not a slow op, a body that was never optimized. The
+blockers are now grouped: per-iteration bindings (for-in), switch, try/catch,
+RegExpLiteral, CallApply, the fused-loop family, the hoist guard, compound
+member stores, and `Yield` (generators, by design).
+
+### The generator row, by count
+
+`JIT_HELPER_STATS` on the 200k `next()` probe, per iteration:
+
+| helper | per iteration |
+| --- | ---: |
+| `get_member_name` | 1.0 |
+| `call_slow` | 1.0 |
+| `load_context` | 2.0 |
+| `store_context` | 1.0 |
+| `yield_suspend` | 1.0 |
+| `gc_safepoint` | 0.001 |
+
+So a `next()` is one member-name read, one general call, two context loads, one
+context store and one suspension. The context traffic is the interesting part:
+`bench`'s own locals are context slots, not frame slots, so the loop pays two
+`LoadContextSlot` and one `StoreContextSlot` per iteration. A change that
+certifies that body should drop those counts to zero, which is now a testable
+claim rather than a timing inference.
+
+### PGO: measured, and large
+
+Method: `-Cprofile-generate`, train by running the 77-row corpus plus the
+scratch probes once, `llvm-profdata merge` (the copy bundled with the
+toolchain), rebuild with `-Cprofile-use`. Both builds are the release profile
+(`lto = "thin"`, `codegen-units = 1`); the only difference is the profile.
+
+7 interleaved rounds over the full corpus, per-row minima:
+
+| | ms | |
+| --- | ---: | --- |
+| no PGO | 2114.2 | |
+| PGO | 1697.3 | **-19.72%** |
+
+- mean per-row ratio **0.8905**, median **0.9246**;
+- twelve rows improve 24-36% (`hof_methods` -35.8, `typed_array_for_each` -35.0,
+  `map_for_each` -33.0, `spread_assign` -31.5, `num_valueof` -31.3,
+  `array_for_each` -30.1, `construct_churn` -28.8, `generator_loop` -28.4,
+  `for-in/head-let` -26.8, `array_slice` -26.3, `json_stringify` -24.7);
+- the worst row is +0.5% (`nested_loops`); seven rows are within +0.2%.
+
+The A/A control is what makes this a measurement rather than a layout wobble:
+two non-PGO builds of the same source, same 7 rounds, give total **+0.33%**,
+mean ratio 0.9969, worst row +2.8%. Build-to-build noise is an order of
+magnitude smaller than the PGO delta at the total, and a third of it per row.
+
+Two honest limits:
+
+- the profile was trained on the corpus, so part of the gain is fitting the
+  benchmark. The next measurement is to train on Goats (and one tsc run) and
+  evaluate *there*, before this is wired into the release build;
+- PGO changes layout, so it cannot be mixed into an A/B of another change. It
+  lands as its own change, with its own before and after, and the profile
+  becomes a build input that is regenerated when the corpus changes.
+
+Not wired in yet. The experiment is reproducible in about ten minutes: two
+builds and one training pass.
+
+Gates for the counters: `cargo fmt --all -- --check`; `cargo clippy
+--workspace --all-targets -- -D warnings`; `cargo test --workspace` (40 suites,
+5,847 passed, 0 failed); sweeps `language` 23,726 + `built-ins` 23,821 +
+`annexB` 1,086 + `intl402` 3,365 = 51,998 at 100%; corpus parity 0 (77 rows,
+mean-jitGap 10.66).

@@ -58,6 +58,20 @@ pub enum Unsupported {
     Invalid,
 }
 
+impl Unsupported {
+    /// A stable label for the `SLAG_JIT_REPORT` census: the bailing step's name
+    /// when the variant carries one, otherwise the variant's own name.
+    pub fn label(&self) -> &'static str {
+        match self {
+            Unsupported::Step(name) | Unsupported::Malformed(name) => name,
+            Unsupported::Uncertified => "uncertified",
+            Unsupported::NoReturn => "no return",
+            Unsupported::Stack => "stack underflow",
+            Unsupported::Invalid => "lift produced an invalid graph",
+        }
+    }
+}
+
 /// A diagnostic guard depth (tests only). When non-zero, [`lift`] emits a
 /// constant-false `Op::Check` at the first step whose incoming operand stack has
 /// this depth, so the body deopts there and the interpreter resumes. It
@@ -2568,6 +2582,15 @@ fn step_name(step: &Step) -> &'static str {
         | Step::PopAcc
         | Step::IncAcc
         | Step::DecAcc => "FusedLoop",
+        // The compound member stores (the plain forms lift; these are the
+        // read-modify-write ones the lift does not model yet), named so the
+        // refusal census says which store blocked a body.
+        Step::AssignMemberName { .. } => "AssignMemberName(compound)",
+        Step::AssignMemberComputed { .. } => "AssignMemberComputed(compound)",
+        // The LICM hoist guards are refused on purpose (see `lift_block`: the
+        // lift models the guard as always-miss, a measured pessimization), so a
+        // body blocked here is a known gap rather than an unhandled step.
+        Step::HoistMemberGuard { .. } | Step::HoistGlobalGuard { .. } => "HoistGuard",
         _ => "step",
     }
 }

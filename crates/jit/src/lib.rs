@@ -527,19 +527,40 @@ fn runtime_helpers() -> JitHelpers {
 }
 
 /// Print the temporary helper-call instrument's histogram (`JIT_HELPER_STATS`),
-/// one line per helper that ran: `helper <index> <count>`. The index is
-/// `Helper as usize`; `crates/jit/src/helpers.rs` defines the order. A no-op
-/// when the instrument was not enabled at compile time (the counters stay zero).
+/// one line per helper that ran: `helper <index> <count> <name>`. The index is
+/// `Helper as usize`; the name is what the compiler recorded beside the
+/// increment it emitted, so the row is readable without the enum order to hand.
+/// A no-op when the instrument was not enabled at compile time (the counters
+/// stay zero).
 pub fn dump_helper_counts() {
     if std::env::var("JIT_HELPER_STATS").is_err() {
         return;
     }
     let counts = runtime::jit::JIT_HELPER_COUNTS.snapshot();
+    let names = runtime::jit::JIT_HELPER_COUNTS.names();
     for (index, count) in counts.iter().enumerate() {
         if *count > 0 {
-            println!("helper\t{index}\t{count}");
+            let name = names[index];
+            let name = if name.is_empty() { "?" } else { name };
+            println!("helper\t{index}\t{count}\t{name}");
         }
     }
+}
+
+/// Print the `SLAG_JIT_REPORT` refusal census: why bodies did not get compiled
+/// code, largest step count first, then the totals. One `jit refused <tier>
+/// <reason> <bodies> <steps>` line per row and a `jit compiled <bodies>` line, so
+/// a sweep can parse it. A no-op unless the switch is set, which is also what
+/// gates the recording.
+pub fn dump_refusal_census() {
+    if !runtime::jit::refusal_census_on() {
+        return;
+    }
+    for (tier, reason, bodies, steps) in runtime::jit::refusal_rows() {
+        println!("jit\trefused\t{tier}\t{reason}\t{bodies}\t{steps}");
+    }
+    println!("jit\tcompiled\t{}", runtime::jit::compiled_bodies());
+    println!("jit\tdeopts\t{}", runtime::jit::deopt_count());
 }
 
 /// Print the I5a feedback call-site probe summary (`.notes/optimizing-tier-impl.md`)

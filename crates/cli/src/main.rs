@@ -283,6 +283,7 @@ fn run(command: Command) -> Result<(), u8> {
                     "  JIT_DUMP_STEPS=1          dump blocking steps and shapes on a lift refusal"
                 );
                 eprintln!("  JIT_HELPER_STATS=1        print per-helper call counts at exit");
+                eprintln!("  SLAG_JIT_REPORT=1         print why bodies were refused at exit");
                 eprintln!("  JIT_LEAF_TRACE=1          trace leaf-probe rejections");
                 eprintln!("  SLAG_JIT_DEOPT_PROBE=N    force a deopt guard at step N");
                 eprintln!("  SLAG_JIT_DEOPT_TRACE=1    trace each deopt");
@@ -430,6 +431,13 @@ fn run_file_inner(file: &str, args: &[String], options: &Options, source: &str) 
         context.eval(source)
     };
     finish_gc_trace();
+    // Both are inert unless their switch was set, and both describe work the
+    // run just did, so the script path dumps them too (not only `--corpus`).
+    #[cfg(feature = "jit")]
+    if !options.jitless {
+        jit::dump_helper_counts();
+        jit::dump_refusal_census();
+    }
     match result {
         // A script file's completion value is not printed (matching node et
         // al.); the REPL prints its own results.
@@ -936,6 +944,7 @@ fn run_corpus(dir: &std::path::Path, jit: bool) -> Result<(), u8> {
     // `JIT_HELPER_STATS` was set when they were compiled.
     if jit {
         jit::dump_helper_counts();
+        jit::dump_refusal_census();
     }
     // The I5a call-site probe runs in the INTERPRETER (`--jitless`), so it dumps
     // in either mode; inert unless `SLAG_FEEDBACK` is set.

@@ -1,7 +1,9 @@
 # Finding bottlenecks at a useful rate
 
-**Status: PROPOSAL.** Written 2026-10-26, after the sampling-profiler detour was
-reverted. Nothing here is implemented.
+**Status: PARTLY IMPLEMENTED.** Written 2026-10-26, after the sampling-profiler
+detour was reverted. 1.1 (helper names) and 1.2 (the refusal census) landed, with
+the sweep script; pillar 4 (PGO) is measured at -19.7% on the corpus and not yet
+wired into the build. See the perf journal for the numbers.
 
 ## The loop we are in
 

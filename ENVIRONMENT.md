@@ -44,7 +44,8 @@ All write to **stderr**. They are for debugging a workload, not for production.
 | `JIT_DUMP_IR` | dump the optimizing tier's SSA IR for every lifted body (`--- IR ---`). |
 | `JIT_DUMP_CLIF` | dump the Cranelift CLIF **and its disassembly** for every lowered body, plus the bail reasons: `opt bail:`, `jit bail:`, `jit skip:` (too large), `jit codegen error:`. |
 | `JIT_DUMP_STEPS` | on a lift refusal, dump the blocking step names (`opt-blockers:`) and a shape census (`opt-shapes:`). |
-| `JIT_HELPER_STATS` | the `slag` CLI prints per-helper call counts at exit (`helper <index> <count>`). |
+| `JIT_HELPER_STATS` | the `slag` CLI prints per-helper call counts at exit (`helper <index> <count> <name>`). |
+| `SLAG_JIT_REPORT` | the `slag` CLI prints why bodies got no compiled code at exit (`jit refused <tier> <reason> <bodies> <steps>`, then compiled and deopt totals). `tier=opt` means the optimizing tier refused the body and the baseline tier compiled it; `tier=none` means no tier did. |
 | `JIT_LEAF_TRACE` | trace the first few leaf-probe rejections (`leaf-probe reject: <why>`). |
 | `SLAG_JIT_DEOPT_PROBE=<step>` | force a deopt guard at that step in every eligible body — exercises the spill/resume path deterministically. |
 | `SLAG_JIT_DEOPT_TRACE` | trace each deopt (`jit-deopt step=<n> depth=<n>`). |

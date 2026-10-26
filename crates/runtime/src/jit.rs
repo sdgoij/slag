@@ -646,31 +646,160 @@ pub const HELPER_COUNT: usize = 160;
 /// running several agents on several threads can lose increments — it measures,
 /// it does not synchronize. Off unless `JIT_HELPER_STATS` is set when the body
 /// is compiled.
-pub struct HelperCounts(core::cell::UnsafeCell<[u64; HELPER_COUNT]>);
+///
+/// The `names` array beside the counts is filled by the compiler when it emits
+/// the increment, so the dump can label a row without a second table to keep in
+/// sync with `Helper::name()`.
+pub struct HelperCounts {
+    counts: core::cell::UnsafeCell<[u64; HELPER_COUNT]>,
+    names: core::cell::UnsafeCell<[&'static str; HELPER_COUNT]>,
+}
 
-// SAFETY: the array is only touched by compiled code (which does not run
-// concurrently with the dumper for a one-shot measurement) and by the dumper.
+// SAFETY: the arrays are only touched by compiled code and the compiler (which
+// do not run concurrently with the dumper for a one-shot measurement) and by
+// the dumper.
 unsafe impl Sync for HelperCounts {}
 
 impl HelperCounts {
     const fn new() -> Self {
-        Self(core::cell::UnsafeCell::new([0; HELPER_COUNT]))
+        Self {
+            counts: core::cell::UnsafeCell::new([0; HELPER_COUNT]),
+            names: core::cell::UnsafeCell::new([""; HELPER_COUNT]),
+        }
     }
 
     /// The base address compiled code bakes in as its increment target.
     pub fn base(&self) -> *mut u64 {
-        self.0.get() as *mut u64
+        self.counts.get() as *mut u64
+    }
+
+    /// Record which helper a counter slot belongs to. Called by the compiler
+    /// beside the increment it emits (so only when the instrument is on);
+    /// idempotent, and a no-op for an out-of-range index.
+    pub fn set_name(&self, index: usize, name: &'static str) {
+        if index >= HELPER_COUNT {
+            return;
+        }
+        // SAFETY: a write to the instrument's own array (see the type's doc).
+        unsafe { (*self.names.get())[index] = name };
     }
 
     /// A copy of the counters, for the dumper.
     pub fn snapshot(&self) -> [u64; HELPER_COUNT] {
         // SAFETY: a read of the instrument's own array (see the type's doc).
-        unsafe { *self.0.get() }
+        unsafe { *self.counts.get() }
+    }
+
+    /// A copy of the labels, for the dumper.
+    pub fn names(&self) -> [&'static str; HELPER_COUNT] {
+        // SAFETY: a read of the instrument's own array (see the type's doc).
+        unsafe { *self.names.get() }
     }
 }
 
 /// The single instrument counter array (see [`HelperCounts`]).
 pub static JIT_HELPER_COUNTS: HelperCounts = HelperCounts::new();
+
+/// One row of the `SLAG_JIT_REPORT` refusal census.
+struct RefusalRow {
+    /// `opt` when the optimizing tier refused the body and the baseline tier
+    /// compiled it anyway; `none` when no tier produced code for it.
+    tier: &'static str,
+    /// The bailing step, helper or constant (`Unsupported`'s payload), or one of
+    /// the runtime's own labels (`body too large`, `cranelift codegen error`).
+    /// Owned because a lift refusal is named from the body's blocker census,
+    /// which is a joined list rather than one static string.
+    reason: String,
+    bodies: u64,
+    steps: u64,
+}
+
+/// The `SLAG_JIT_REPORT` census: why bodies were refused, one row per
+/// `(tier, reason)`. Recording happens once per body, on the path that already
+/// decided the refusal, so it costs a mutex and a short scan; it is still gated
+/// on the switch so a shipping run does not pay even that.
+pub struct RefusalCensus {
+    rows: std::sync::Mutex<Vec<RefusalRow>>,
+    compiled: std::sync::atomic::AtomicU64,
+}
+
+impl RefusalCensus {
+    const fn new() -> Self {
+        Self {
+            rows: std::sync::Mutex::new(Vec::new()),
+            compiled: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+}
+
+/// The single refusal census (see [`RefusalCensus`]).
+pub static JIT_REFUSALS: RefusalCensus = RefusalCensus::new();
+
+/// Whether the census is collecting (`SLAG_JIT_REPORT`), read once.
+pub fn refusal_census_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("SLAG_JIT_REPORT").is_some())
+}
+
+/// Count one refused body. `tier` is `opt` or `none` (see [`RefusalRow`]).
+pub fn record_refusal(tier: &'static str, reason: &str, steps: usize) {
+    if !refusal_census_on() {
+        return;
+    }
+    let Ok(mut rows) = JIT_REFUSALS.rows.lock() else {
+        return;
+    };
+    if let Some(row) = rows
+        .iter_mut()
+        .find(|row| row.tier == tier && row.reason == reason)
+    {
+        row.bodies += 1;
+        row.steps += steps as u64;
+    } else {
+        rows.push(RefusalRow {
+            tier,
+            reason: reason.to_owned(),
+            bodies: 1,
+            steps: steps as u64,
+        });
+    }
+}
+
+/// Count one body that got compiled code (either tier).
+pub fn record_compiled() {
+    if !refusal_census_on() {
+        return;
+    }
+    JIT_REFUSALS
+        .compiled
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The census rows, sorted for a stable report: `(tier, reason, bodies, steps)`.
+pub fn refusal_rows() -> Vec<(&'static str, String, u64, u64)> {
+    let Ok(rows) = JIT_REFUSALS.rows.lock() else {
+        return Vec::new();
+    };
+    let mut out: Vec<_> = rows
+        .iter()
+        .map(|row| (row.tier, row.reason.clone(), row.bodies, row.steps))
+        .collect();
+    out.sort_unstable_by(|a, b| b.3.cmp(&a.3).then(a.0.cmp(b.0)));
+    out
+}
+
+/// How many bodies got compiled code.
+pub fn compiled_bodies() -> u64 {
+    JIT_REFUSALS
+        .compiled
+        .load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// How many compiled bodies deopted back to the interpreter (`SLAG_JIT_REPORT`
+/// reports it beside the refusals).
+pub fn deopt_count() -> u64 {
+    JIT_DEOPT_COUNT.load(std::sync::atomic::Ordering::Relaxed)
+}
 
 /// Stage O diagnostic (see [`DISPATCH_DEOPT`]): when non-negative, the
 /// compiler emits a deopt guard at that step in every eligible body, so the
@@ -7004,6 +7133,7 @@ pub(crate) fn lookup_info(
             if std::env::var("JIT_DUMP_CLIF").is_ok() {
                 eprintln!("jit skip: body too large ({} steps)", ir.steps.len());
             }
+            record_refusal("none", "body too large", ir.steps.len());
             ir.jit_info.set(1);
             return std::ptr::null();
         }

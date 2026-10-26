@@ -224,10 +224,23 @@ impl JitEngine {
                         && let Some(compiled) =
                             crate::opt_lower::compile(&*self.isa, &ir, helpers, body.max_stack)
                     {
+                        runtime::jit::record_compiled();
                         return (Some(compiled), true);
                     }
                 }
                 Err(reason) => {
+                    // The optimizing tier refused this body; the baseline tier
+                    // below may still compile it, which is a different outcome
+                    // from `none` in the census. A lift refusal of the catch-all
+                    // `Step("step")` kind is named from the body's blocker
+                    // census instead, which names the exact variants.
+                    let label = match &reason {
+                        crate::opt::lift::Unsupported::Step("step") => {
+                            crate::opt::lift::blocking_step_names(body).join(",")
+                        }
+                        other => other.label().to_string(),
+                    };
+                    runtime::jit::record_refusal("opt", &label, body.steps.len());
                     if std::env::var("JIT_DUMP_CLIF").is_ok() {
                         eprintln!("opt bail: {reason:?} ({} steps)", body.steps.len());
                     }
@@ -250,23 +263,30 @@ impl JitEngine {
             // `Unsupported`'s payload is the bailing step's name; the caller
             // only sees `None` (the body falls back to the interpreter), so the
             // reason only surfaces under the debug switch.
+            runtime::jit::record_refusal("none", reason.label(), body.steps.len());
             if std::env::var("JIT_DUMP_CLIF").is_ok() {
                 eprintln!("jit bail: {reason:?} ({} steps)", body.steps.len());
             }
             return (None, false);
         }
-        (
-            assemble(
-                &*self.isa,
-                func,
-                body.max_stack,
-                // A conservative over-approximation: the Stage O diagnostic can make
-                // any body deopt when it names a step, and a deopt-bearing body must
-                // not be inlined by a compiled caller.
-                JIT_DEOPT_PROBE.load(std::sync::atomic::Ordering::Relaxed) >= 0,
-            ),
-            false,
-        )
+        let assembled = assemble(
+            &*self.isa,
+            func,
+            body.max_stack,
+            // A conservative over-approximation: the Stage O diagnostic can make
+            // any body deopt when it names a step, and a deopt-bearing body must
+            // not be inlined by a compiled caller.
+            JIT_DEOPT_PROBE.load(std::sync::atomic::Ordering::Relaxed) >= 0,
+        );
+        match &assembled {
+            Some(_) => runtime::jit::record_compiled(),
+            // A Cranelift rejection is an emit bug, not a step the compiler
+            // chose to skip, so it gets its own census label.
+            None => {
+                runtime::jit::record_refusal("none", "cranelift codegen error", body.steps.len())
+            }
+        }
+        (assembled, false)
     }
 }
 
@@ -426,6 +446,19 @@ pub(crate) enum Unsupported {
     Leaf(&'static str),
     Helper(&'static str),
     Const(&'static str),
+}
+
+impl Unsupported {
+    /// The bailing step, helper or constant, for the `SLAG_JIT_REPORT` census
+    /// and the debug logs. Every variant carries the string already.
+    pub(crate) fn label(&self) -> &'static str {
+        match self {
+            Unsupported::Step(name)
+            | Unsupported::Leaf(name)
+            | Unsupported::Helper(name)
+            | Unsupported::Const(name) => name,
+        }
+    }
 }
 
 /// The arithmetic ops the JIT inlines for two numbers. `Rem` and `Exp` are
@@ -4695,6 +4728,7 @@ impl<'a> Lowerer<'a> {
         // instructions, emitted only when `JIT_HELPER_STATS` is set.
         debug_assert!((helper as usize) < HELPER_COUNT);
         if self.helper_stats {
+            JIT_HELPER_COUNTS.set_name(helper as usize, helper.name());
             let base = self
                 .builder
                 .ins()

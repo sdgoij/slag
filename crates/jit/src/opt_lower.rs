@@ -4539,6 +4539,7 @@ fn call_helper(
     // CLI's `run_corpus` histogram print it like the per-step path's).
     if helper_stats() {
         debug_assert!((helper as usize) < HELPER_COUNT);
+        JIT_HELPER_COUNTS.set_name(helper as usize, helper.name());
         let base = builder
             .ins()
             .iconst(types::I64, JIT_HELPER_COUNTS.base() as i64);
