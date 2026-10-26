@@ -16607,3 +16607,20 @@ Gates: fmt; clippy `-D warnings`; `cargo test --workspace` (40 suites, 5,847 pas
 ### Measured (2026-10-26): the lift, and the id check
 
 Two release binaries (`68c54706` and this tree), 7 interleaved rounds per family, per-row minimum: `control/generator_loop.js` **34.08 -> 33.00 ms (-3.2%)**, the parked estimate. The other `control` rows are flat (for_in +1.0%, nested_loops +0.1%, switch -0.3%, try_catch +1.2%). The `calls` family read -0.4% to +3.6% across two 7-round passes, so the check itself was measured with a same-binary gate (a temporary `SLAG_LEAF_NO_ID` switch, since removed): `direct_leaf.js` +0.0%, `method_call.js` +1.6%, `closure_capture.js` +1.4%, `construct_churn.js` +0.5%, `apply_call.js` -0.9%, against an A/A floor of +-1.4% on those rows. The larger two-binary deltas are code layout, not the check.
+
+### AUDIT (2026-10-26): no second instance of the box-identity class
+
+The guarded feedback splice looks like the same trap: `Op::CalleeEq` compares the callee against a compile-time box constant (`InlineTarget::Guarded::callee_box`). It is sound, because the feedback store retains the first callee as a `Value` and `CompiledBody::trace` traces that store, so the box cannot be recycled while the code that names it exists (I5c-2c-ii in `.notes/optimizing-tier-impl.md`). Everything else keys on something stable: the certified and leaf lookups on `Function::id`, the member/global cells on object ids and generations, the call-site monomorphism log on the permanent shared-body pointer, and the self-call gate on two live values. `LeafCallRecord` was the only instance.
+
+### PROFILE (2026-10-26): the generator loop, after the lift
+
+200k `g.next()` in `control/generator_loop`'s shape, per-row minimum of 7 `--corpus` runs (the row itself batches to a 20 ms floor):
+
+| probe | ns per `next()` |
+| --- | ---: |
+| `g.next()` on a suspended generator (the row) | **166.3** |
+| `g.next()` on a completed generator (same call lane, driver and `{value, done}` object, no resume) | **111.0** |
+| `Object.is(s, s)` in the same loop (a builtin call from compiled code) | 28.9 |
+| `o.m()` on a JS method (the compiled call lane) | 9.7 |
+
+So the resume is ~55 ns and the driver scaffolding another ~82 ns over the builtin lane. The larger half is not the machine-code resume: it is the per-`next()` driver, the `generators` map lookup, the `Rc` clone, the `RefCell` borrows and the `{value, done}` allocation. That is the next slice, because it needs no JIT-entry work and every `next()` pays it.
