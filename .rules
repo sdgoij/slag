@@ -32,6 +32,7 @@ See the following skills for full details:
 - **Testing requirements**: `minix-testing` skill
 - **Commit message format**: `git-commit-messages` skill
 - **GC rooting of GC values held in runtime/builtin locals**: `slag-gc-rooting` skill
+- **Performance measurement, gates and the perf archive index**: `slag-performance` skill
 
 ## Sweep timeouts
 

@@ -1,5 +1,9 @@
 # Performance
 
+Method, current measured state, the NULL register and the archive index live
+in `.agents/skills/slag-performance/SKILL.md`. This file is the dated evidence:
+every landed change, probe and A/B below.
+
 Current performance state of the slag runtime and the PLAN Phase 18
 performance milestones, each behind a benchmark gate rather than a
 correctness gate.
@@ -16988,3 +16992,111 @@ Two things follow.
 
 Reverted to the pre-change tree; `target/release` was rebuilt from it, and the
 `Binary` refusals are back in the census.
+
+
+## NULL (2026-10-26): lifting the LICM hoist guard does not pay
+
+The refusal census named `HoistGuard` on six corpus rows, and the skill's
+section on the guard said the lift was the follow-up that would recover the
+hoist. It was implemented behind `SLAG_OPT_HOIST=1` (default off), measured,
+and reverted. It is correct: the probe runs the interpreter's own code, and
+`SLAG_HOIST_TRACE=1` reports `hit=1` on all 1628 entries of both probes on
+`objects/own_read`. `JIT_HELPER_STATS` shows no per-iteration helper call in
+the guarded loop.
+
+It is slower. Same binary, flag on vs unset, one process per row, 7 interleaved
+rounds, per-row minima:
+
+| row | off (ms) | on (ms) | change |
+| --- | ---: | ---: | ---: |
+| objects/own_read | 3.191 | 10.686 | **+235%** |
+| globals/nested_read | 2.663 | 3.707 | +39% |
+| globals/object_read | 2.696 | 3.644 | +35% |
+| globals/declarative_read | 2.687 | 3.616 | +35% |
+| objects/proto_read | 52.99 | 55.66 | +5% |
+| opcost/obj_prop | 0.6514 | 0.6312 | -3% |
+| opcost/baseline (control) | 0.0842 | 0.0874 | +4% |
+| objects/warm_store (control, no guard in the body) | 40.07 | 38.49 | -4% |
+
+The two control rows bound the run-to-run floor at about 4%, so only `obj_prop`
+is flat and the rest are real regressions. `warm_store`'s code cannot change
+with the flag, which is what makes that 4% a noise reading rather than a win.
+
+### Why: the optimizing tier's scalar loop, not the guard
+
+`JIT_DUMP_IR` on `objects/own_read` shows the guarded copy exactly as
+intended: the guard hoists `o.a` and `o.b`, the preheader computes their sum
+once into a hidden slot, and the loop body is `s += hoisted`. The loop is six
+IR ops, no calls, no member reads.
+
+The baseline tier's fused loop for the same body keeps BOTH the counter and the
+accumulator in f64 registers (the raw-f64 pass), so its per-iteration body is
+two `vaddsd` plus a compare and a branch. The optimizing tier keeps `s` in a
+frame slot (a load and a store per iteration) and lowers `Add` on two untyped
+`Value`s to the generic tag-checked sequence, because the hoisted value is only
+proven to be a non-object primitive, not a Number. `own_read` is 0.8 ns per
+iteration on the baseline tier and 2.7 ns on the optimizing tier.
+
+The emitted fast path, counted from `JIT_DUMP_CLIF`'s disassembly:
+
+| per iteration | baseline tier | optimizing tier |
+| --- | --- | --- |
+| instructions | 7 | 32 |
+| accumulator | f64 register | frame load + frame store |
+| operand typing | proven Number (raw-f64 pass) | two tag checks, NaN canonicalisation, select |
+| loop test | `vucomisd` + branch | tagged Bool materialised, then compared to `false` |
+| fallback | none | `call_indirect` to the generic binary helper |
+
+That is the 3.3x, and it is not a defect in the guard: the guarded copy IS the
+six-IR-op loop above, and its lowering is what costs 25 extra instructions.
+The same conversion is even emitted twice in the lowered test
+(`fcvt_from_sint` of the counter at two separate value ids).
+
+So the guard works and the hoist is real; what it exposes is that the
+optimizing tier's loop is the slower of the two for this shape. That is the
+same conclusion the `!==` null reached from the other side: a body promoted to
+the optimizing tier got slower.
+
+### The corpus-wide tier map
+
+Same binary, `SLAG_OPT=0` (baseline tier only) vs default, 5 interleaved
+rounds, whole corpus in one process, per-row minima. Total 3257.9 (opt) vs
+3480.1 (base), so the optimizing tier is a net **-6.4%**, but the win is
+concentrated and several rows go the other way:
+
+| row | opt | base | |
+| --- | ---: | ---: | ---: |
+| objects/destructure | 4.64 | 171.17 | -97% |
+| arrays/typed_array | 18.83 | 29.88 | -37% |
+| objects/warm_store | 43.79 | 50.52 | -13% |
+| calls/closure_capture | 51.55 | 56.87 | -9% |
+| strings/coercion_concat | 105.24 | 87.27 | **+21%** |
+| objects/proto_read | 71.08 | 62.01 | +15% |
+| opcost/array_for_each | 40.25 | 35.48 | +13% |
+| control/generator_loop | 47.80 | 42.64 | +12% |
+| opcost/json_stringify | 137.06 | 124.99 | +10% |
+
+Roughly a third of the 77 rows are 5% or more faster on the baseline tier. The
+tier is chosen statically (the optimizing tier whenever the lift accepts), so
+those rows pay the wrong choice.
+
+### What this makes the next target
+
+Not the hoist, and not a tier heuristic guessed from row names. The measured
+difference is inside the optimizing tier's loop: a loop-carried JS binding
+stays in a frame slot and its arithmetic stays generic, while the baseline
+tier's fused loop registers and types both accumulators. Making the optimizing
+tier's loop do the same is the change that would pay on `own_read`, the four
+`globals` rows, `proto_read`, and the rows above that lose to the baseline.
+
+The experimental code was reverted, so the tree carries no 3.3x path. Gating
+the switch to a safe subset does not rescue it: the only rows whose guard could
+be admitted under `numbers=true` are refused first by an outer `numbers=false`
+guard, so the subset is a no-op. This note is the specification for
+re-deriving the lift once the loop is competitive.
+
+The type proof the loop needs is already available: `own_read`'s step-14 guard
+is `numbers=true` and establishes the invariant operand's type at loop entry,
+and the optimizing tier ignores it. Consuming that proof (typing the hoisted
+slot, then letting the slot fixpoint type the accumulator) is the next slice to
+price; typed loops in the same tier already run at 0.8 ns per iteration.
