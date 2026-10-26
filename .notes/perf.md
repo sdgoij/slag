@@ -16939,3 +16939,52 @@ The rule for the next reading of this table: never rank a function by
 `sum(blocks)`. Divide by the entry block first. A ratio near 1 is a hot straight
 line; a large ratio is a loop, and then the question is whether that loop is
 where the time goes, which counts cannot answer.
+
+### REVERTED (2026-10-26): lifting `!=`/`!==` promotes two bodies into a slower tier
+
+The refusal census listed `Binary` as the blocker on three rows. `binary_op`
+refused `NotEqual`/`StrictNotEqual`, so a body containing one `!==` (for example
+`x !== 0` in a test262 helper) lost the optimizing tier entirely. Implemented
+`!=`/`!==` as the equality op plus `Op::Not` (both equality ops answer a
+canonical Boolean, and `Op::Not` on a `Bool` is a bit flip), inside
+`emit_binary`, which covers both `Step::Binary` and `Step::BinaryImm` (`x !== 0`
+arrives as the immediate form). **Reverted.**
+
+It works: `Binary` disappears from the census for
+`template-literal/evaluation-order` and `statements/try/completion-values`, and
+both bodies compile.
+
+It is slower. Corpus total 2287.4 -> 2306.9 ms (+0.85%), and the two rows that
+changed are the two worst rows in the run:
+
+| row | before | after |
+| --- | ---: | ---: |
+| `statements/try/completion-values` | 116.23 | 121.41 (+4.5%) |
+| `statements/for-in/head-let-fresh-binding-per-iteration` | 456.06 | 471.48 (+3.4%) |
+
+Those are exactly the rows whose bodies moved tier, so the attribution is not in
+doubt.
+
+The negated comparison is not the cause. `JIT_DUMP_IR` shows `v10:bool =
+Not(v9)` over `v9:bool = StrictEq(...)`, which takes the bit-flip path. Nor is
+the body's own `if (!compareArray(...)) throw ...`: both builds report 17,060
+`unary_slow` calls for this row, one per invocation and equal to its
+`load_context` count, so the optimizing tier and the per-step tier materialise the
+same Boolean there. What makes the optimized body slower is therefore elsewhere
+in the tier, and it is not determined here.
+
+Two things follow.
+
+1. **"Refused" is not automatically a problem.** The census names bodies that did
+   not get compiled; it cannot say whether a body is faster compiled, and these
+   bodies are not: two of the three are 3-5% slower optimized, and the third is
+   flat. Ranking refusals by weight is fine as a way to pick candidates, but the
+   tier choice needs its own measurement per row.
+
+2. **`unary_slow` has no breadth.** Only three rows in the corpus call it at all
+   (`for-in/head-let` 600k, `template-literal` 500k, `try/completion-values`
+   17k), so the boolean-materialisation theory that started this thread is not a
+   lever, whatever the tier does.
+
+Reverted to the pre-change tree; `target/release` was rebuilt from it, and the
+`Binary` refusals are back in the census.
