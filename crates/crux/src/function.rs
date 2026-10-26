@@ -331,6 +331,14 @@ impl fmt::Debug for Function {
 }
 
 impl Function {
+    /// The byte offset of the stable `id` field from the box pointer a
+    /// `Value::Function`'s payload encodes (the box header precedes the value).
+    /// The JIT's callee-identity check loads this field: a `Value`'s payload is
+    /// the box address, and the GC recycles boxes, so the address alone is not
+    /// a stable function identity.
+    pub const ID_OFFSET: usize =
+        crate::heap::box_payload_offset::<Function>() + std::mem::offset_of!(Function, id);
+
     /// The stable identity of this function (used by the runtime to look up
     /// the ECMAScript body, spec 10.2.1 slots).
     pub fn id(&self) -> u64 {

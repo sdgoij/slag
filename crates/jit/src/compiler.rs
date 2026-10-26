@@ -5282,6 +5282,29 @@ impl<'a> Lowerer<'a> {
         // eligibility checks, which is what a non-aliased site paid on every
         // call before.
         self.builder.switch_to_block(fast);
+        // The box address (`payload`) is recycled by the GC, so the record also
+        // carries the callee's stable function id. A nonzero cached entry names
+        // a compiled ECMAScript leaf, so the live callee (same prefix and
+        // payload) is a function box and its id is safe to load here.
+        let callee_ptr = self.builder.ins().imul_imm_s(payload, 16);
+        let live_id = self.builder.ins().load(
+            types::I64,
+            MemFlagsData::new(),
+            callee_ptr,
+            Offset32::new(crux::function::Function::ID_OFFSET as i32),
+        );
+        let cached_id = self.builder.ins().load(
+            types::I64,
+            MemFlagsData::new(),
+            cache,
+            Offset32::new(std::mem::offset_of!(LeafCallRecord, callee_id) as i32),
+        );
+        let id_ok = self.builder.ins().icmp(IntCC::Equal, live_id, cached_id);
+        let id_good = self.builder.create_block();
+        self.builder
+            .ins()
+            .brif(id_ok, id_good, &[], probe_block, &[]);
+        self.builder.switch_to_block(id_good);
         let frame_size = self.builder.ins().load(
             types::I32,
             MemFlagsData::new(),

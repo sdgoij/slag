@@ -266,6 +266,9 @@ fn run(command: Command) -> Result<(), u8> {
                 eprintln!(
                     "  SLAG_GUARD=0              disable the read-guard pruning pass (default: on)"
                 );
+                eprintln!(
+                    "  SLAG_DCE=0                disable dead-code elimination (default: on)"
+                );
                 eprintln!("  SLAG_MEM2REG=0            disable frame-slot promotion (default: on)");
                 eprintln!(
                     "  SLAG_WIDEN=0              disable narrow's effect widening (default: on)"

@@ -57,6 +57,13 @@ fn mem2reg_enabled() -> bool {
         .unwrap_or(true)
 }
 
+/// Whether dead-code elimination runs. On by default; `SLAG_DCE=0` disables it,
+/// the same-binary seam for attributing a wrong value to DCE's keep-set rather
+/// than to a pass that produced the removal.
+fn dce_enabled() -> bool {
+    std::env::var("SLAG_DCE").map(|v| v != "0").unwrap_or(true)
+}
+
 /// Whether the raw-f64 chain pass runs. On by default; `SLAG_UNBOX=0` disables
 /// it — the same-binary seam for measuring the pass's marginal effect.
 fn unbox_enabled() -> bool {
@@ -86,7 +93,7 @@ pub fn run(
     let cse = cse::run(func);
     let licm = licm::run(func);
     let scalarized = body.is_some_and(|body| scalar::run(func, body));
-    let dropped = dce::run(func);
+    let dropped = dce_enabled() && dce::run(func);
     let counted = loop_counter::run(func);
     let retyped = normalize_param_types(func);
     let unboxed = unbox_enabled() && unbox::run(func);
@@ -257,7 +264,9 @@ pub fn optimize(func: &mut Function) {
     }
     cse::run(func);
     licm::run(func);
-    dce::run(func);
+    if dce_enabled() {
+        dce::run(func);
+    }
     loop_counter::run(func);
     normalize_param_types(func);
 }

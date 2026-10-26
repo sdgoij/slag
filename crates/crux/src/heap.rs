@@ -345,6 +345,13 @@ struct GcBox<T: ?Sized + Trace> {
     data: T,
 }
 
+/// The byte offset of a boxed value's payload `T` from the box pointer a
+/// `Value`'s payload encodes. Machine code reaches a boxed value's fields at
+/// `box_ptr + box_payload_offset::<T>() + offset_of!(T, field)`.
+pub const fn box_payload_offset<T: Trace>() -> usize {
+    std::mem::offset_of!(GcBox<T>, data)
+}
+
 impl<T: Trace> GcBox<T> {
     /// The type's vtable: how the erased walk traces and drops this box.
     const VTABLE: &'static VTable = &VTable {

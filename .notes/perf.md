@@ -16591,3 +16591,17 @@ So it is `guard::run`'s pruning, not the guard's emission and not the new ops. T
 Not landed. The lift stays refused with its comment pointing here until the interaction is understood; it is a ~3% row and a wrong-value bug is not a trade.
 
 Gates for this commit: docs only, plus the two reverted experiments; the tree's code is the commit that passed fmt/clippy/40 suites/51,998 sweeps.
+
+## FIX (2026-10-26): the `UpdateContextSlot` lift, and a leaf record keyed on a recycled box
+
+The lift is landed. The `built-ins/Iterator/zip/basic-longest.js` failure it exposed is not the guard-pruning / DCE interaction the earlier profile suspected: `SLAG_GUARD=0` and `SLAG_TYPER=0` only decided whether the body stayed compiled. With the optimizing tier off (`SLAG_OPT=0`) the failure persisted, and `--jitless` passed, so the per-step JIT's call lane had it too.
+
+Root cause: `LeafCallRecord` identified a callee by its NaN-boxed `Value` bits, i.e. the `Function` box address. The GC recycles boxes. A probe recorded the numbers padding closure's compiled entry at an address, that closure died, a different padding closure (`function () { return undefined; }`) was allocated at the same address, and the machine-code gate matched on the prefix, the payload, `code_gen` and the epoch, so the call ran the dead callee's entry. The fixture's `expected` array then held `100 + j` where it should have held `undefined`. The closure-creation trace showed one box-bits value with two different function ids over a short run.
+
+Fix: the record carries the callee's stable `Function::id`, and the in-frame hit path, the only machine-code path that jumps straight to a cached entry, loads the id from the box and compares it. The load is safe there because a nonzero cached entry names a compiled ECMAScript leaf, never a builtin or a non-function. The fill and env helpers (`record_matches`) and the certified lane already keyed on the function id, so they were not the hole.
+
+Tests: `a_leaf_record_rejects_a_recycled_box` (runtime) pins the identity discriminator; `lifts_update_context_slot` replaces the refusal test; the three `installed_jit_*` cache-reuse tests still count a handful of probes, so the extra check does not defeat the cache.
+
+Gates: fmt; clippy `-D warnings`; `cargo test --workspace` (40 suites, 5,847 passed, 0 failed); sweeps 23,726 + 23,821 + 1,086 + 3,365 = 51,998 at 100%; corpus parity 0 (77 rows, mismatches 0).
+
+No perf claim: the added work is one load from the callee's live box plus a compare and a predicted branch on the in-frame leaf hit, which was not measured as a row change.

@@ -247,6 +247,11 @@ const TDZ_MASK_SLOTS: usize = u64::BITS as usize;
 pub struct LeafCallRecord {
     /// The callee's `bits & PAYLOAD_MASK` (the box address >> 4) at probe time.
     pub callee_payload: u64,
+    /// The callee's stable function id at probe time. The payload alone is not
+    /// an identity: the GC recycles `Function` boxes, so a later closure can
+    /// occupy the same address and would otherwise reuse the earlier callee's
+    /// compiled entry.
+    pub callee_id: u64,
     /// The probe's verdict (see `LeafInlineInfo`).
     pub leaf_inline: LeafInlineInfo,
     /// C1: the probe's certified-callee verdict (see `CertifiedInlineInfo`),
@@ -267,6 +272,7 @@ impl LeafCallRecord {
     pub const fn empty() -> Self {
         Self {
             callee_payload: 0,
+            callee_id: 0,
             leaf_inline: LeafInlineInfo::empty(),
             certified: CertifiedInlineInfo::empty(),
             epoch: 0,
@@ -2942,9 +2948,27 @@ fn record_slot_of(callee: u64, slot: u64) -> usize {
 /// rejected rather than applied.
 #[inline]
 fn record_matches(ctx: &JitCallContext, record: &LeafCallRecord, callee: u64) -> bool {
-    record.code_gen == ctx.leaf_gen
-        && record.callee_hi == (callee >> 44) as u32
+    record.code_gen == ctx.leaf_gen && record_identity_matches(record, callee)
+}
+
+/// The callee-identity half of [`record_matches`]: the NaN-box prefix, the
+/// payload, and the stable function id. The payload is a box address, which the
+/// GC recycles, so the id is what makes the identity exact.
+#[inline]
+fn record_identity_matches(record: &LeafCallRecord, callee: u64) -> bool {
+    record.callee_hi == (callee >> 44) as u32
         && record.callee_payload == callee & crux::PAYLOAD_MASK
+        && record.callee_id == callee_function_id(callee)
+}
+
+/// The stable function id encoded in a `Value::Function`'s bits, or 0 for any
+/// other value. The record compares this because a box address is recycled.
+#[inline]
+fn callee_function_id(callee: u64) -> u64 {
+    Value::from_bits(callee)
+        .as_function()
+        .map(|f| f.id())
+        .unwrap_or(0)
 }
 
 /// G14: the compiled leaf-call *hit* path for a non-aliased frame. The
@@ -3104,6 +3128,7 @@ extern "C" fn leaf_call_probe(
     // `lookup_info`'s null arm below), so the next visit re-probes.
     *cache_entry = LeafCallRecord {
         callee_payload: callee & crux::PAYLOAD_MASK,
+        callee_id: callee_function_id(callee),
         leaf_inline: LeafInlineInfo::empty(),
         certified: CertifiedInlineInfo::empty(),
         epoch: ctx.leaf_epoch,
@@ -3907,7 +3932,7 @@ extern "C" fn create_function(ctx: *mut c_void, step: u64) -> u64 {
     // The Vm's lexical env is the authoritative running environment during
     // a JIT run: the interpreter's per-step context-env sync (skipped by
     // the JIT) keeps the agent context current, so reading the context
-    // here would capture a STALE env after a block/catch pushed one.
+    // capture a STALE env after a block/catch pushed one.
     let env = vm.lexical_env;
     match crate::function::instantiate_function_expression_with_source(
         agent,
@@ -8406,5 +8431,32 @@ mod tests {
         // A self-tail-call re-enters the body's own entry (the interpreter's
         // TCO loop never re-consults the JIT), so it is a loop too.
         assert!(crate::ir::body_has_loop(&[Step::TailCallSelf { argc: 1 }]));
+    }
+
+    /// A leaf-call record carries the callee's stable function id, not just the
+    /// NaN-box payload. The payload is a box address, and the GC recycles
+    /// boxes: two different closures can occupy one address, and the payload
+    /// check alone would then let a call run the earlier callee's compiled
+    /// entry at the wrong arity and body.
+    #[test]
+    fn a_leaf_record_rejects_a_recycled_box() {
+        let one = crate::agent::evaluate("(function one() { return 1; })").expect("one");
+        let two = crate::agent::evaluate("(function two() { return 2; })").expect("two");
+        let id = |v: Value| v.as_function().expect("a function").id();
+        assert_ne!(id(one), id(two));
+        let mut record = LeafCallRecord::empty();
+        record.callee_hi = (one.bits() >> 44) as u32;
+        record.callee_payload = one.bits() & crux::PAYLOAD_MASK;
+        record.callee_id = id(one);
+        assert!(record_identity_matches(&record, one.bits()));
+        // `two`'s address with `one`'s id is the shape a recycled box produces.
+        record.callee_hi = (two.bits() >> 44) as u32;
+        record.callee_payload = two.bits() & crux::PAYLOAD_MASK;
+        assert!(
+            !record_identity_matches(&record, two.bits()),
+            "the stale id must reject the record"
+        );
+        record.callee_id = id(two);
+        assert!(record_identity_matches(&record, two.bits()));
     }
 }

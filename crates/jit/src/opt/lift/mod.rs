@@ -602,6 +602,7 @@ fn stack_delta(step: &Step) -> Result<i32, Unsupported> {
         | Step::LoadIdent { .. }
         | Step::LoadContextSlot { .. }
         | Step::UpdateLocal { .. }
+        | Step::UpdateContextSlot { .. }
         | Step::PushStr(_)
         | Step::CreateFunction { .. } => 1,
         Step::Pop
@@ -1152,11 +1153,7 @@ fn emit_step(
         }
         // `x++`/`x--` on a frame slot: read, update (`Op::UpdateValue` keeps
         // the inline Number path and the BigInt-aware helper fallback), store,
-        // and push the result the operator's form asks for. The captured-slot
-        // form (`UpdateContextSlot`) stays with the per-step path: lifting it
-        // exposed a miscompile in `sweep all`
-        // (`built-ins/Iterator/zip/basic-longest.js`) that only appears with
-        // the typer's read guard on.
+        // and push the result the operator's form asks for.
         Step::UpdateLocal { slot, op, prefix } => {
             if is_tdz(*slot) {
                 emit_tdz_check(builder, block, *slot);
@@ -1171,6 +1168,45 @@ fn emit_step(
                 Imm::Int(*op as i32),
             );
             emit_frame_store(builder, block, *slot, new);
+            stack.push(if *prefix { new } else { old });
+        }
+        // The captured-slot form is the same read/update/store shape over the
+        // context helpers.
+        Step::UpdateContextSlot {
+            depth,
+            index: slot,
+            op,
+            prefix,
+        } => {
+            let old = builder.emit(
+                block,
+                Op::ContextLoad,
+                &[],
+                Type::Unknown,
+                Op::ContextLoad.default_effects(),
+                Imm::Context {
+                    depth: *depth as u32,
+                    index: *slot as u32,
+                },
+            );
+            let new = builder.emit(
+                block,
+                Op::UpdateValue,
+                &[old],
+                Type::Unknown,
+                Op::UpdateValue.default_effects(),
+                Imm::Int(*op as i32),
+            );
+            builder.emit_void(
+                block,
+                Op::ContextStore,
+                &[new],
+                Op::ContextStore.default_effects(),
+                Imm::Context {
+                    depth: *depth as u32,
+                    index: *slot as u32,
+                },
+            );
             stack.push(if *prefix { new } else { old });
         }
         // Closure creation (`CreateFunction`): the helper reads the step's
@@ -2845,7 +2881,7 @@ mod tests {
     }
 
     #[test]
-    fn refuses_update_context_slot() {
+    fn lifts_update_context_slot() {
         let b = body(
             vec![
                 Step::UpdateContextSlot {
@@ -2858,10 +2894,16 @@ mod tests {
             ],
             1,
         );
-        assert!(
-            lift(&b).is_err(),
-            "the captured-slot update stays on the per-step path"
+        let func = lift(&b).expect("lifts");
+        let entry = func.entry();
+        assert_eq!(
+            ops(&func, entry),
+            vec![Op::ContextLoad, Op::UpdateValue, Op::ContextStore]
         );
+        // The postfix form keeps the read value live; the store is void.
+        assert!(func.block(entry).insts[0].result.is_some());
+        assert!(func.block(entry).insts[1].result.is_some());
+        assert!(func.block(entry).insts[2].result.is_none());
     }
 
     #[test]
