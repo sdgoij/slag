@@ -16798,3 +16798,94 @@ Not made the default. PGO moves layout, so it cannot be mixed into an A/B of
 another change; it roughly doubles the build; and the profile is a build input
 that has to be regenerated when the corpus moves. Adopting it is a decision
 about the project's reported numbers, not only about speed.
+
+## PROFILE (2026-10-26): PGO is a diagnostic, and it says 71% of our hot code never runs
+
+PGO stays off by default (decided: a customer build, not the shipped one). But
+its size is itself information: `-Cprofile-use` only changes branch weights,
+layout and inlining choices, so a 17-20% win means the static shape of the hot
+code disagrees with the dynamic path.
+
+The profile that `tools/pgo.sh --train` already produces can be interrogated
+directly, with no new build and no sampler:
+
+```
+llvm-profdata show --all-functions --counts target/pgo.profdata
+```
+
+Per function it prints the instrumented block counters. A block whose count is
+zero is code that is laid out inside a function the workload *does* enter, and
+never runs.
+
+**Headline, over the whole corpus: of 155,677 static blocks in the 17,106
+functions the workload enters, 110,341 never execute (70.9%).** That is the
+mismatch PGO is paid to fix.
+
+Read the table as "hot static code", not as call counts: a block's count is its
+entries, so a loop's blocks count once per iteration. That matters below, where
+it is what exposes the finding.
+
+| entries | blocks | never run | function |
+| ---: | ---: | ---: | --- |
+| 987,910,221 | 4 | 0% | `Vec::resize` |
+| 765,549,553 | 11 | 27% | `Value::kind` |
+| 549,830,384 | 19 | 26% | `Vm::chain_cell_read` |
+| 462,436,650 | 39 | 56% | **`crux::string::lookup`** |
+| 459,553,639 | 54 | 44% | **`crux::string::intern`** |
+| 433,601,239 | 13 | 46% | `JsString::from_utf8` |
+| 429,178,417 | 76 | 61% | `jit::call_slow` |
+| 396,186,576 | 62 | 35% | `Vm::get_member_name` |
+| 362,378,618 | 54 | 46% | `JsObject::ordinary_property_lookup` |
+| 307,521,852 | 245 | 78% | `Heap::collect_minor_inner` |
+| 265,488,602 | 129 | 77% | `jit::certified_lane_inline` |
+| 185,137,525 | 21 | 57% | `heap::with_heap_cell` closure |
+| 136,139,354 | 32 | **94%** | `heap::maybe_stress_collect` |
+| 109,775,244 | 29 | 83% | `Vm::context_chain_env` |
+| 104,306,192 | 49 | 82% | `CompiledBody::has_lane_step_hazard` |
+
+### Finding 1: the atom memo is a 64-entry linear scan on the hottest path
+
+`crux::string::lookup` (AtomId to JsString) and `crux::string::intern` (the
+reverse) are the second and third hottest engine functions by block entries, and
+44-56% of their blocks never run. The blocks that do run are a loop:
+`memo.iter().rev().find(...)` over a per-thread `Vec` with `MEMO_CAP = 64`,
+under a `RefCell` borrow, cloning the `JsString` on every hit.
+
+Block entries are iteration counts, which is exactly the evidence this table
+gives: 462M entries in `lookup` is not 462M calls, it is calls times the scan
+length. The memo was added because the interner takes a global lock and
+copies; it converted that into a linear search of up to 64 entries, and the
+search is now one of the three hottest code paths in the engine.
+
+The fix is small and local: a direct-mapped cell keyed by the atom id
+(`id % N`, validated by comparing the id) for `lookup`, which turns the hit path
+into one compare and a refcount bump, and a keyed direct-mapped cell for
+`intern` (hash the units, compare the candidate). Both keep the existing
+fallback, so a miss costs what it costs today. This is the single change the
+profile argues for most strongly.
+
+### Finding 2: the cold half of hot functions can be outlined by hand
+
+The functions with the worst cold share are not big dispatch functions where
+cold code is expected; they are small predicates and accessors on the hot path:
+
+- `heap::maybe_stress_collect` at **94% cold**, 136M entries. Its fast path is
+  one TLS flag read; everything else (the collector call, the TLS accessor
+  internals) is inline in it, and is entered for every allocation in a stress
+  run and never otherwise.
+- `Vm::context_chain_env` 83%, `CompiledBody::has_lane_step_hazard` 82%,
+  `jit::certified_lane_inline` 77%, `collect_minor_inner` 78%, `call_slow` 61%.
+
+Outlining those arms into `#[cold] #[inline(never)]` helpers is the hand
+version of the transformation PGO chooses, and unlike PGO it needs no profile at
+build time. It is a batch job, not a single change: one outlined branch will not
+move a corpus total, so it should be judged on the sum of a set, with the
+block-count table in this entry as the work list.
+
+### What this changes about the plan
+
+PGO is priced now and stays on the shelf. The method it justified (counters,
+then this) produced two candidate changes that are structural rather than
+incremental: the memo scan, and a cold-outlining pass over a named list. Both
+are measurable without a stopwatch, the first by the memo's own hit path and the
+second by the block counts in this table moving.
