@@ -16604,4 +16604,6 @@ Tests: `a_leaf_record_rejects_a_recycled_box` (runtime) pins the identity discri
 
 Gates: fmt; clippy `-D warnings`; `cargo test --workspace` (40 suites, 5,847 passed, 0 failed); sweeps 23,726 + 23,821 + 1,086 + 3,365 = 51,998 at 100%; corpus parity 0 (77 rows, mismatches 0).
 
-No perf claim: the added work is one load from the callee's live box plus a compare and a predicted branch on the in-frame leaf hit, which was not measured as a row change.
+### Measured (2026-10-26): the lift, and the id check
+
+Two release binaries (`68c54706` and this tree), 7 interleaved rounds per family, per-row minimum: `control/generator_loop.js` **34.08 -> 33.00 ms (-3.2%)**, the parked estimate. The other `control` rows are flat (for_in +1.0%, nested_loops +0.1%, switch -0.3%, try_catch +1.2%). The `calls` family read -0.4% to +3.6% across two 7-round passes, so the check itself was measured with a same-binary gate (a temporary `SLAG_LEAF_NO_ID` switch, since removed): `direct_leaf.js` +0.0%, `method_call.js` +1.6%, `closure_capture.js` +1.4%, `construct_churn.js` +0.5%, `apply_call.js` -0.9%, against an A/A floor of +-1.4% on those rows. The larger two-binary deltas are code layout, not the check.
