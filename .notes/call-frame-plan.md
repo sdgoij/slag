@@ -4,7 +4,7 @@ Plan of record for architectural opportunity 1+4 in the perf survey: the
 non-leaf call and the construct both pay a per-call `Vm` allocation and a
 `JitCallContext` rebuild because the engine has **two disjoint frame
 models**. This document is the plan to collapse them into one frame that
-the interpreter and the JIT both address — the thing V8 and SpiderMonkey
+the interpreter and the JIT both address, the thing V8 and SpiderMonkey
 have had since their bytecode VMs.
 
 No code lands from this document until a stage is written up and probed;
@@ -23,7 +23,7 @@ From `.notes/perf.md` (release, isolated probes):
 
 `recursive_fib` is 3.44 M non-tail calls; every callee that itself calls or
 recurses (the common real shape) pays the non-leaf path. The boxed-pool fix
-landed (−38%), but it only made the copy cheaper — the model is unchanged:
+landed (−38%), but it only made the copy cheaper, the model is unchanged:
 `ordinary_call → run_compiled_body → take_vm + execution-context push +
 per-run JitCallContext rebuild`, plus, for a construct, a one-FFI
 `step_construct` that re-derives eligibility and rebuilds the ctx again.
@@ -45,28 +45,28 @@ an interpreted function; whenever the interpreter would have stored a
 register value, Sparkplug stores one too"), so OSR and stack walking are
 free. TurboFan/Maglev use a *different* optimized frame, and deopt rebuilds
 the interpreter frame from a translation opcode stream
-(`docs/runtime/deoptimization.md`) — the machinery we get almost for free
+(`docs/runtime/deoptimization.md`), the machinery we get almost for free
 because our compiled stack already mirrors `Vm::stack`. Tiering is an
 interrupt budget on the `FeedbackCell` decremented at back-edges and
 returns; code swaps go through a `JSDispatchTable` handle. V8 **deleted the
 arguments adaptor frame in 2020** ("we now have a simpler translated inlined
-frame arguments", `59b4dd7a5fa`) — argc lives in the frame, not a trampoline.
+frame arguments", `59b4dd7a5fa`), argc lives in the frame, not a trampoline.
 
 **SpiderMonkey.** `JitFrameLayout` (shared by Baseline and Ion) is
 `{ callerFramePtr, returnAddress, FrameDescriptor }`, then a `calleeToken`,
 then **`this` and the actual args by offset** (`offsetOfThis`,
 `offsetOfActualArg`). `FrameDescriptor` packs the frame type **and
-`numActualArgs`** — the callee reads the caller's argc from the frame, so
+`numActualArgs`**, the callee reads the caller's argc from the frame, so
 there is no adaptor (the `RectifierFrameLayout` handles the mismatched-`this`
 cases inline). ICs run as `BaselineStubFrameLayout` **on the same stack**,
 with a stub pointer and up to 255 locally traced values for the GC, and
 `InlinedICScript` for trial-inlined scripts. Bailout is
 `InvalidationBailoutStack` (saved regs + fp + return address) +
 `ResumeFromException` (framePointer, stackPointer, target, kind, exception).
-JIT→C++ is an `ExitFrameLayout` with a typed footer (VMFunctionId) — the
+JIT→C++ is an `ExitFrameLayout` with a typed footer (VMFunctionId), the
 native boundary is a **frame**, not a struct reboot per call.
 
-**SpiderMonkey's wasm adds a sharper target** (`.notes/spidermonkey-wasm.md`). Its `Instance` (= `TlsData`) is one **register-held pointer per module**, with the hot fields first in an asserted compact-offset region, **globals inlined into it**, and the GC state (nursery position, store buffer, incremental-barrier address, alloc sites) reachable from it — so a call switches a pointer instead of rebuilding a context, and compiled code allocates and runs barriers inline. Compiled frames are traced through per-code-range `StackMaps` (`Instance::traceFrame`), not a conservative scan. Tiering is per *function*: a `jumpTable_` for calls, `requestTierUpStub`, and patchable far-jump call sites (`CallFarJump`), with one shared stub block across tiers (`prepareTier1`). That is the shape §3.4 should aim at.
+**SpiderMonkey's wasm adds a sharper target** (`.notes/spidermonkey-wasm.md`). Its `Instance` (= `TlsData`) is one **register-held pointer per module**, with the hot fields first in an asserted compact-offset region, **globals inlined into it**, and the GC state (nursery position, store buffer, incremental-barrier address, alloc sites) reachable from it, so a call switches a pointer instead of rebuilding a context, and compiled code allocates and runs barriers inline. Compiled frames are traced through per-code-range `StackMaps` (`Instance::traceFrame`), not a conservative scan. Tiering is per *function*: a `jumpTable_` for calls, `requestTierUpStub`, and patchable far-jump call sites (`CallFarJump`), with one shared stub block across tiers (`prepareTier1`). That is the shape §3.4 should aim at.
 
 **The convergent lesson.** The frame is the tier interface. Args, `this`,
 the callee, the return address, the saved parent, and the per-activation
@@ -92,7 +92,7 @@ The only reason a compiled body does not reuse the caller's frame is that
 these two regions disagree. So a nested call must swap to a fresh `Vm` (and
 its fresh private buffer) and re-derive everything the ctx carries. That is
 the ~126–255 ns, and it is why the leaf-inline path (which *does* run the
-callee on the caller's region) is 20× cheaper — it is the one case where a
+callee on the caller's region) is 20× cheaper, it is the one case where a
 frame is shared.
 
 The object/construct cost is the same fact one level down: a construct adds
@@ -105,7 +105,7 @@ in the frame.
 identically by the interpreter and the JIT.**
 
 1. **Frame descriptor.** A frame header on the value stack: `{ callee,
-   this, argc, flags, saved_base, saved_ip, saved_scratch }` — the
+   this, argc, flags, saved_base, saved_ip, saved_scratch }`, the
    `JitFrameLayout`/`FrameDescriptor` shape. `argc` in the descriptor retires
    the `Vm::args` vector and the Cow/truncate adaptor (SM's `numActualArgs`,
    V8's removed adaptor). `this` and args live at fixed offsets above the
@@ -113,13 +113,13 @@ identically by the interpreter and the JIT.**
 2. **Frames are carved from `Vm::stack`, not allocated.** A call pushes a
    header + args region and sets the base; a return pops to `saved_base`. The
    `frame: Frame::Inline(buf)` fixed buffer becomes "the current frame's slot
-   region" addressed by `base + slot` — exactly the flat segment the leaf lane
+   region" addressed by `base + slot`, exactly the flat segment the leaf lane
    already uses (`leaf_frame_base`). The private JIT buffer disappears: the
    JIT's operand stack **is** `vm.stack` (which `DISPATCH_DEOPT` already
    assumes, and which removes the ctx rebuild).
 3. **Per-activation state becomes frame-bounded watermarks.** The `Vm`'s
    state stacks stay shared, but each frame records the watermarks at entry
-   and truncates on exit — the discipline `save_scratch`/`restore_scratch`
+   and truncates on exit, the discipline `save_scratch`/`restore_scratch`
    already implements for the nested lanes. A frame owns `try_stack[..]`,
    `env_stack[..]`, the completion/list stacks, etc. up to its watermark. This
    is the hard half of the plan and the reason the current design allocates a
@@ -130,10 +130,10 @@ identically by the interpreter and the JIT.**
    slot base) are read from the frame descriptor. A nested compiled call
    inherits the running ctx. The layout follows SM's `Instance`: the hot
    fields first, at small fixed offsets (an asserted compact-offset head), and
-   whatever state the compiled code needs per activation — not reallocated per
+   whatever state the compiled code needs per activation, not reallocated per
    call.
 5. **Both engines emit against this frame.** The interpreter already does.
-   The JIT's `emit_call` leaf-inline (`emit_leaf_call_tail` — the callee on
+   The JIT's `emit_call` leaf-inline (`emit_leaf_call_tail`, the callee on
    the caller's frame region) becomes the *general* call lowering: a non-leaf
    callee is the same push plus a recursive body, not a new `Vm`. The
    construct adds the receiver creation and the base-return rule to the same
@@ -180,7 +180,7 @@ removed the private JIT frame/working buffer, and the certified-callee lane
 *different* certified body as a nested frame on the caller's `vm.stack` region,
 with its own `JitCallContext`, skipping
 `do_call_fast`/`ordinary_call`/`run_compiled_body`/`run_jit_body`. So the C1
-row is already half done at *runtime* — the frame push exists. What C1 adds is
+row is already half done at *runtime*, the frame push exists. What C1 adds is
 the **emit-side** recognition, so a certified non-leaf call site stops paying
 `call_slow`'s per-call re-derivation.
 
@@ -204,22 +204,22 @@ reuse exactly as the leaf verdict does.
 
 **C1 emit-side lane (the measured win).** In `emit_call`, after the leaf gate
 misses, consult the record's certified verdict. On a hit, call a new helper
-`Helper::CertifiedCall` — a `certified_call_inline` keyed by the record, so it
+`Helper::CertifiedCall`, a `certified_call_inline` keyed by the record, so it
 does no decode / HashMap lookup / eligibility scan / `lookup_info` / globals
 walk, only the frame fill, `save_scratch`, env swap, nested-ctx build and entry
-call — and land the result through `emit_leaf_result_tail`. The entry call stays
+call, and land the result through `emit_leaf_result_tail`. The entry call stays
 inside the helper (the nested `JitCallContext` is a Rust local with a
 synchronous lifetime), so the split-ctx lifetime problem is avoided; the win is
 the re-derivation, not the FFI hop.
 
 **C1 slices** (each independently landable, probe-first):
-- **C1a** — extend `LeafCallRecord` with `CertifiedInlineInfo` and fill it in
+- **C1a**: extend `LeafCallRecord` with `CertifiedInlineInfo` and fill it in
   `leaf_call_probe`; no behavior change (the emit lane ignores it). Measure
   the probe's added cost is below noise.
-- **C1b** — add `Helper::CertifiedCall` + the emit lane gated on the record's
+- **C1b**: add `Helper::CertifiedCall` + the emit lane gated on the record's
   certified verdict; land the result through `emit_leaf_result_tail`. Probe the
   `non-leaf call` row and `recursive_fib`.
-- **C1c** — the per-frame watermark audit: nested `try`/`finally`, for-of,
+- **C1c**: the per-frame watermark audit: nested `try`/`finally`, for-of,
   destructure, generator/async bodies called through the lane, under
   `--gc-stress`/`--nursery-stress` and the six sweeps.
 
@@ -227,11 +227,11 @@ the re-derivation, not the FFI hop.
 the certified info MUST carry the code generation like the leaf info (a stale
 entry after an eviction is a jump into freed code) and be cleared by
 `gc_safepoint`. (2) `environment` is a `GcAny` held across calls while the
-record lives on the `Agent` and is not traced — the same sweeping-collection
+record lives on the `Agent` and is not traced, the same sweeping-collection
 clear that protects the leaf identity must clear it. (3) The lane keeps
 `certified_call_inline`'s gate exactly, the cross-realm unmapped-`arguments`
 refusal in particular, or the arguments object is built in the wrong realm.
-(4) `global_value`/`realm_ptr` are raw bits/pointers — do not add a traced
+(4) `global_value`/`realm_ptr` are raw bits/pointers, do not add a traced
 handle to the record.
 
 **Status (2026-10-05): C1a + C1b + C1c landed.** The callee-keyed record now
@@ -251,7 +251,7 @@ The isolation C1c actually needs is narrow. A lane callee is always a compiled
 body, and the compiled model runs the statement-list wrappers
 (`ListBegin`/`ListEnd`) and the completion saves as no-ops, while the lane gate
 (`has_shared_vm_step_hazard`) excludes every producer of the other control
-stacks — so the only shared stack a nested run can grow is `env_stack`. The lane
+stacks, so the only shared stack a nested run can grow is `env_stack`. The lane
 thus save/restores `env_stack` and leaves the caller's other stacks in place: the
 callee cannot touch them, and its throw reaches the caller's handler through the
 returned pending error. `has_control_state` is therefore just
@@ -262,7 +262,7 @@ caller deeper than its body env; the at-rest fast path only resets the shared
 
 **The measured C1c trap was code size, not the fast path.** The `SavedControl`
 push/restore blocks inlined into `save_scratch`/`restore_scratch` made them too
-large to inline, and every call — branch taken or not — paid for it (`non-leaf
+large to inline, and every call, branch taken or not, paid for it (`non-leaf
 call` 5.5 → 6.3 ms, `recursive_fib` 54 → 87 ms). Outlining both into
 `#[cold] #[inline(never)]` helpers restored the rows (`non-leaf call` ~6.1 ms,
 `recursive_fib` ~56 ms; the residual is the lane's env swap). Verified: normal
@@ -278,9 +278,9 @@ mirror of C1. Today a compiled `new C()` emits one `Helper::Construct` FFI
 (`crates/jit/src/compiler.rs`, the `Construct` arm: pop the callee, call the
 helper with the caller's `sp`). `step_construct_impl`
 (`crates/runtime/src/ir.rs`) pops the argument boundary and runs the certified
-base-constructor LEAF path — `run_leaf_construct` (`construct_this_object` + the
+base-constructor LEAF path, `run_leaf_construct` (`construct_this_object` + the
 base-return rule, and a `try_shared_construct_leaf` run on the caller's ctx when
-the callee is an env-free leaf) — when `Vm::can_inline_leaf` and the leaf
+the callee is an env-free leaf), when `Vm::can_inline_leaf` and the leaf
 cache's `construct_inline` verdict hold; otherwise it falls to
 `function::construct` → `ordinary_construct`'s certified path, which pushes an
 `ExecutionContext`, `take_vm`s a pooled `Vm`, `setup_frame`s, and `vm.start`s the
@@ -291,7 +291,7 @@ re-derives per construct what is a pure function of the callee (the `leaf_lookup
 HashMap probe + `construct_inline` verdict + the `lookup_info` consult inside
 `try_shared_construct_leaf`).
 
-**C2a — a non-leaf certified base constructor on the caller's frame
+**C2a: a non-leaf certified base constructor on the caller's frame
 (runtime-only).** Generalize the certified-callee lane (`certified_call_inline`)
 to construct: when the `shared` ctx + `sp` are present (a compiled caller) and
 the callee is a certified base constructor, carve the nested frame from
@@ -306,7 +306,7 @@ gate), capture-free (`context_names` empty), single realm, and the C1 lane's
 (the lane uses the callee as the receiver's prototype source).
 
 **Hazards (construct adds over call).** The base-return rule (a returned object
-overrides the receiver); `new.target` — the body's `Step::NewTarget` reads
+overrides the receiver); `new.target`, the body's `Step::NewTarget` reads
 `Vm::current_new_target`, which the call lane sets to `None` and the construct
 lane must set to the callee; derived constructors / `super()` (the this-TDZ
 before super: refused by the base-kind gate); class instance fields/private
@@ -314,12 +314,12 @@ methods (`initialize_instance_elements`: refused, they keep `ordinary_construct`
 a sloppy body's mapped `arguments` (refused like the call lane; the unmapped
 form reads `Vm::call_args`).
 
-**C2b — the construct-site verdict cache (emit-side): probed and declined
+**C2b, the construct-site verdict cache (emit-side): probed and declined
 (2026-10-05).** A `Construct` site emits one `Helper::Construct` FFI with no
 site record; C2b would add a construct-site record (`ConstructInlineInfo`, keyed
 by the callee's `id` + site, with the leaf record's identity/`code_gen`/`epoch`
 gate) and a `Helper::CertifiedConstruct` that skips the per-construct
-re-derivation — the construct mirror of C1a/C1b. The probe says it is not worth
+re-derivation, the construct mirror of C1a/C1b. The probe says it is not worth
 it. The one *re-derivation* in the construct lane was a **double eligibility
 scan**: `certified_construct_eligible` scans the body, then `certified_lane_inline`
 re-ran `certified_callee_eligible` on the same body. That was removed for
@@ -328,7 +328,7 @@ ns/construct residual (non-leaf ~111 ms vs leaf ~87 ms) is *not* the
 re-derivation a record can cache:
 
 - `CertifiedInlineInfo` carries only the *verdict* (entry, frame layout,
-  `globals_unshadowed`, `has_call_*`, `tdz_mask`, `callee_id`) — **not** the
+  `globals_unshadowed`, `has_call_*`, `tdz_mask`, `callee_id`), **not** the
   `body`/`environment`/`realm`. So the lane's resolve
   (`agent.ecma_functions.get(&id)` + `data.ir.clone()`) runs even on the cached
   path. C1b has the same property; its win came from skipping the
@@ -350,8 +350,8 @@ Probes: a non-leaf certified base constructor row and the bare-construct probe
 regress. C2a landed (the measured win); C2b was probed and declined (above).
 
 **Status (2026-10-05): C2a landed.** `certified_call_inline` is now
-`certified_lane_inline(ctx, callee, this, args, argc, cached, construct)` — one
-frame-carve/run/restore core shared by the call and construct lanes — and
+`certified_lane_inline(ctx, callee, this, args, argc, cached, construct)`, one
+frame-carve/run/restore core shared by the call and construct lanes, and
 `step_construct_impl` runs a certified base constructor as a nested frame on the
 caller's `Vm` (the construct args rooted on `vm.stack` for the window). Measured
 on a non-leaf base constructor (a body that calls a function), 500k constructs:
@@ -375,11 +375,11 @@ and `complete_call` → `crate::function::call_inner` → `ordinary_call` (the
 certified path) → `run_compiled_body`, which `take_vm`s a POOLED `Vm` (a full
 reset), pushes an `ExecutionContext`, `setup_certified_frame`s, runs
 (`run_jit_body` for compiled code, `vm.start` for a below-threshold body), and
-`return_vm`s. So the interpreter pays a whole second `Vm` per call — the frame
+`return_vm`s. So the interpreter pays a whole second `Vm` per call, the frame
 the JIT lane does not.
 
 **Mechanism.** `complete_call` owns `&mut Vm` (the driver's), so a certified
-callee can run as a nested frame on the SAME `Vm` — the shape
+callee can run as a nested frame on the SAME `Vm`, the shape
 `certified_lane_inline`/`self_call_inline` use, but driven from `ir.rs` and
 serving the interpreter's run (`run_jit_body` on `self` for compiled code, a
 nested `vm.start` for a below-threshold body). Isolation is
@@ -394,7 +394,7 @@ completion contract, unchanged).
 NOT gate-excluded the way the JIT lane's callee is: a certified body may itself
 contain a `try`/for-of/destructure/`yield`, so (a) the control-state isolation
 must be the FULL watermark (`Vm::saved_control`, C1c), not C1c's narrowed
-`env_stack`-only fast path — the callee pushes `try_stack`/`for_of_stack`/
+`env_stack`-only fast path, the callee pushes `try_stack`/`for_of_stack`/
 `env_stack` and a throw/return must unwind them against the callee's frame, not
 the caller's; (b) the nested `run_inner` pushes its own `ExecutionContext`, and
 `dispose_env_resources` runs on the body env on every exit (return and abrupt).
@@ -403,7 +403,7 @@ the caller's; (b) the nested `run_inner` pushes its own `ExecutionContext`, and
 through the single `Vm::frame` (`Frame::Inline([Value; 8])` or `Frame::Heap`):
 `frame_get`/`frame_get_mut`, `setup_certified_frame`/`setup_frame` and
 `run_jit_body` all read/write it directly. So a nested call cannot reuse the JIT
-lane's `nested_frame` carve as-is — `run_jit_body` `debug_assert!`s
+lane's `nested_frame` carve as-is, `run_jit_body` `debug_assert!`s
 `nested_frame.is_none()` and reads `vm.frame`, and `setup_frame` writes
 `vm.frame`. The caller's frame must therefore be SAVED across the nested run,
 and saved on the traced `Vm` (a `Vec<Frame>` stack, like `saved_control`): a
@@ -416,7 +416,7 @@ and is deferred.
 
 **Slices** (each independently landable; the corpus `jitless` column + the
 sweeps are the gate):
-- **C3a** — the certified nested frame for the withdrawn interpreter call:
+- **C3a**: the certified nested frame for the withdrawn interpreter call:
   `complete_call` runs a certified `PendingCall::Function` on `self` instead of
   `call_inner`/`run_compiled_body`. The args were left at `arg_start` by the
   withdrawal, so the callee's frame is built from that `self.stack` slice (the
@@ -425,10 +425,10 @@ sweeps are the gate):
   interpreter call rows (`function calls`, `method_call`, `construct churn`) and
   the corpus `jitless` column (`function calls`, `direct_leaf`, `recursive_fib`,
   `construct_churn`).
-- **C3b** — the in-place non-leaf arm: `fast_call_core` runs a certified
+- **C3b**: the in-place non-leaf arm: `fast_call_core` runs a certified
   NON-leaf callee in place (today only the leaf lane inlines; a certified
   non-leaf withdraws). Shares C3a's nested-frame primitive.
-- **C3c** — the interpreter tail path (`tail_call_shared`) onto the same frame
+- **C3c**: the interpreter tail path (`tail_call_shared`) onto the same frame
   push (the interpreter's TCO already loops on one `Vm`, so the frame rebind is
   the natural extension).
 
@@ -438,7 +438,7 @@ first (smaller diff; the interpreted callee keeps `take_vm`). The interpreter-ro
 target wants both: Cut 69's compile threshold means many one-shot bodies never
 compile, so the interpreted nested `start` is where most of the row lives.
 
-**C3a probe (2026-10-05): negative — do not land as-is; the premise does not
+**C3a probe (2026-10-05): negative, do not land as-is; the premise does not
 hold.** A full C3a was implemented and measured (uniform nested frame for the
 withdrawn interpreter call: `save_scratch`/`saved_frames` park of the caller
 frame + full control watermark, `new_body_context` + `setup_certified_frame` +
@@ -457,7 +457,7 @@ neutral elsewhere:
 - `--bench` interpreter rows, min-of-8: `function calls` 29.68 → 28.64 (≈+3%,
   noise), `closure capture`/`construct churn` flat.
 
-**Why.** The premise — "the interpreter pays a whole second `Vm` per call" —
+**Why.** The premise, "the interpreter pays a whole second `Vm` per call",
 was already not the bottleneck. The pool reuses Vms (`take_vm`/`return_vm` is a
 `Box` pop/push + `reset`, and only ~recursion-depth Vms are ever allocated), so
 `reset`'s ~20 `Vec::clear`s are cheaper than C3a's *inherent* bookkeeping: the
@@ -467,8 +467,8 @@ close it: a full `clear_control_state` (control-free caller) vs a one-line
 `list_stack.clear()` (a `nested_call_eligible`/`touches_semantic_control` split)
 moved `recursive_fib` from ~-15% to ~-10% at best, and the residual (scratch
 save/restore + frame park + gate scan) still exceeds `reset`. The win this arc
-is after is the *fuller* "one frame" design of §3 — per-frame scratch/control
-with watermarks, so there is nothing to save per call — not the C3a half-step,
+is after is the *fuller* "one frame" design of §3, per-frame scratch/control
+with watermarks, so there is nothing to save per call, not the C3a half-step,
 which pays a save/restore to avoid an allocation that was never the cost.
 Implementation preserved at `scratch/c3a/` (gitignored) for re-landing if the
 substrate is wanted for C3b/C3c.
@@ -482,10 +482,10 @@ per-activation is copied. A control-free caller is the proof: for
 `mem::replace` + the per-call gate. Those are exactly §3 points 2 and 2/6, so C3
 adopts the three substrates together rather than the C3a shortcut.
 
-**Substrate 1 — frame carve (point 2).** A non-leaf interpreter callee's frame
+**Substrate 1: frame carve (point 2).** A non-leaf interpreter callee's frame
 slots become a `vm.stack` segment addressed by `leaf_frame_base`, the mechanism
 the leaf lane already uses (`Vm::frame_get`/`frame_get_mut`, `run_leaf_body`
-pushes the slots and sets the base). The caller's `vm.frame` is then untouched —
+pushes the slots and sets the base). The caller's `vm.frame` is then untouched,
 the frame park (`saved_frames` + `mem::replace` + push/pop) disappears. Nested
 calls stack naturally: `leaf_frame_base`/`leaf_frame_offset` are saved as two
 `usize`s per activation (the native stack holds them) and truncated on exit. The
@@ -494,18 +494,18 @@ one JIT-visible change: `run_jit_body` must derive `frame_ptr` from
 reads `vm.frame` unconditionally), so a *compiled* callee runs on the same carve;
 gated on `leaf_frame_base.is_some()`, the top-level path is unchanged.
 
-**Substrate 2 — per-frame scratch (points 2/6).** The per-activation registers
+**Substrate 2: per-frame scratch (points 2/6).** The per-activation registers
 (`ip`, `acc`, `loop_counter`, `loop_num`, `builder`, `completion`,
 `completion_is_empty`, `switch_disc`, `switch_disc_set`, `chain_short`) move into
 the frame region; the interpreter addresses them at `frame_base + k`. This is
 what removes `save_scratch`/`restore_scratch` (~40 ops/call). It is the invasive
-part — every `self.ip`/`self.acc`/… in `run_inner_inner` (and the JIT helpers
+part, every `self.ip`/`self.acc`/… in `run_inner_inner` (and the JIT helpers
 that share them) becomes a frame access. Slice it behind accessors
 (`Vm::ip()`/`Vm::set_ip()`, …) that read the frame when a nested carve is active
 and the existing field at the top level, so the loop migrates incrementally and
 the top level pays nothing.
 
-**Substrate 3 — control watermarks (point 3).** The semantically scanned state
+**Substrate 3: control watermarks (point 3).** The semantically scanned state
 stacks gain a per-activation base, zero at the top level and at every pooled run:
 `try_base`, `pending_base`, `for_in_base`, `for_of_base`, `async_for_of_base`,
 `destructure_base`, `yield_star_base` (plain `usize`s; not GC). Every *read* is
@@ -513,7 +513,7 @@ bounded to `[base..]`, which is what makes a shared stack equivalent to the fres
 `Vm` the pooled path hands out; a frame exit truncates each to its base. A
 watermark is sound for every one of these because the callee only ever reads its
 own LIFO top: the audited read sites are ~20, all `.last()`/`.iter()` on the
-active tail — `route_step_error`'s `covered` scan (`ir.rs:6847`), `ForInNext`
+active tail, `route_step_error`'s `covered` scan (`ir.rs:6847`), `ForInNext`
 (`:9018`), `AsyncForOfNext` (`:9127`), the `yield*` sites (`:9687`–`:10098`),
 `for_of_advance` (`:14185`/`:14212`/`:14217`), `control_transfer`'s
 `pending.last()` (`:14483`), and the `find_finally_frame`/`throw_machinery`
@@ -523,27 +523,27 @@ LIFO-only and need no base (truncate on exit suffices). The bulk of the ~160
 With bases at 0 this refactor is a behavior-preserving no-op for every path that
 exists today.
 
-**Slice sequence** (each probe-first, full gate). **C3.1** — watermark bases +
+**Slice sequence** (each probe-first, full gate). **C3.1**, watermark bases +
 bounded reads (substrate 3), bases 0 at the top level; a no-op refactor plus the
 nested-call switch from `save_control_state` to `set-bases`/`truncate-bases`.
 Probe: a caller *with* a live `try`/for-of around a certified call (the case the
-C3a clear paid for), `--gc-stress`/`--nursery-stress`, the six sweeps. **C3.2** —
+C3a clear paid for), `--gc-stress`/`--nursery-stress`, the six sweeps. **C3.2**,
 frame carve for the nested interpreter callee via `leaf_frame_base` (substrate 1)
 + the `run_jit_body` frame derivation; probe `recursive_fib` and the corpus
-`jitless` column. **C3.3** — per-frame scratch accessors (substrate 2), migrating
-`run_inner_inner` incrementally; probe the same rows. **C3.4** — retire `take_vm`
+`jitless` column. **C3.3**, per-frame scratch accessors (substrate 2), migrating
+`run_inner_inner` incrementally; probe the same rows. **C3.4**, retire `take_vm`
 from `complete_call` entirely once 1–3 hold, and fold C3b (the in-place non-leaf
 `fast_call_core` arm) onto the same carve. The `nested_call_eligible` gate's step
 scans (`nested_call_eligible`/`touches_semantic_control`) should be cached on the
 `CompiledBody` (a `Cell`) so C3.3's residual gate cost is one load.
 
-**C3.2 result (2026-10-05): landed, correct, marginal on its own — keep as the
+**C3.2 result (2026-10-05): landed, correct, marginal on its own, keep as the
 carve substrate, C3.3 is the lever.** The nested interpreter call now carves
 its frame as a flat `vm.stack` segment and installs it as `leaf_frame_base`;
 `run_jit_body` derives `frame_ptr` from that base when set (the top level still
 reads `vm.frame`), so a compiled callee shares the carve. The one real hazard
 found: `Vm::frame_get` checks `leaf_frame_base` before `nested_frame`, so a JIT
-lane running *inside* a carve read the wrong frame through helpers — fixed by
+lane running *inside* a carve read the wrong frame through helpers, fixed by
 having the lanes take `leaf_frame_base` off for their run
 (`Vm::install_nested_frame`/`restore_nested_frame`; two `#[ignore]`-worthy
 regressions, `installed_jit_a_certified_callee_matches_the_interpreter` and
@@ -554,9 +554,9 @@ normal sweep at baseline 48622 / 48464 / 0 / 158 / 0 / 0; clippy `-D warnings`;
 
 Perf was marginal at first, because the carve removed only the *frame park*:
 the scratch `save_scratch`/`restore_scratch` and the per-call gate scans
-remained. **Caching the gate** — `nested_call_eligible`/
+remained. **Caching the gate**, `nested_call_eligible`/
 `touches_semantic_control` are pure functions of the step list, so they became a
-`Cell<Option<(bool, bool)>>` on `CompiledBody` — flipped it to a small net win
+`Cell<Option<(bool, bool)>>` on `CompiledBody`, flipped it to a small net win
 (the two scans were ~5.5% of `recursive_fib`). Final, min-of-N, same machine:
 
 - corpus `jitless`: `closure capture` ~158 → ~146 ms (~8%), `apply_call` ~116 →
@@ -570,12 +570,12 @@ So C3.2+gate-cache is a small, broad win on the interpreter and neutral on the
 JIT. What remains is the *scratch* (`save_scratch`/`restore_scratch` ~ per call)
 and `is_control_free` (C3.1/C3.3): the accessor-indirection route (C3.3) adds a
 load per `ip`/`acc` access across ~300 sites, which for an ip-heavy loop is
-likely to exceed the ~58 ops/call it saves — so C3.3 should be attempted only if
+likely to exceed the ~58 ops/call it saves, so C3.3 should be attempted only if
 a per-access-cost-free framing is found (e.g. the dispatch loop keeping the
 registers in Rust locals and syncing only around helper calls), not the
 `Vec`/pointer accessor route.
 
-**C3.1 result (2026-10-05): probed and declined — the watermark costs more than
+**C3.1 result (2026-10-05): probed and declined, the watermark costs more than
 it saves.** A full watermark landing (a `ControlBase` of 13 stack lengths, every
 error/abrupt-path read bounded to `[base..]`, the close loops stopping at the
 base, the carve setting the base at entry and truncating on exit, and
@@ -584,18 +584,18 @@ implemented and measured: correct (clippy, `994`/`262`, the six sweeps at
 baseline) but **~2.6% slower on `recursive_fib`** than C3.2+gate-cache
 (`--corpus …/calls --jitless`, median-of-6: ~620 ms vs ~604 ms). The reason is
 structural: `ControlBase::capture` + `truncate` touch 13 stacks (~26 ops plus a
-104-byte struct copy each way) — *more* than `is_control_free`'s 23 field reads
+104-byte struct copy each way), *more* than `is_control_free`'s 23 field reads
 plus the one-line clear it replaced. So `is_control_free` was already the cheap
 decision, and the take only ran for callers with live control state (rare);
 watermarks cannot beat it. Reverted; C3.1 as a *cost* lever is closed. Its one
 lasting value would be admitting callers-with-control-state to the carve without
-a take, which the corpus does not exercise — not worth the 13-stack bookkeeping
+a take, which the corpus does not exercise, not worth the 13-stack bookkeeping
 on every call.
 
 **C3.3 detail (the real lever, and it is a rewrite, not a rename).** The
 residual per-call cost after C3.2+gate-cache is `save_scratch`/`restore_scratch`:
 the nested run copies the 10 per-activation registers (plus the ~60-byte
-`Builder`) off the `Vm` and writes fresh defaults, then copies them back — ~60–75
+`Builder`) off the `Vm` and writes fresh defaults, then copies them back, ~60–75
 word-ops/call, which the pooled path gets for free from `reset` on a throwaway
 `Vm`. The accessor-indirection route (make `ip`/`acc`/… fields of a
 `Vec<FrameScratch>` addressed through a pointer) replaces that copy with a *load
@@ -619,7 +619,7 @@ need them:
   (its owner/cursor check already scopes it), so only `ip`/`acc`/the scalars
   need the local treatment.
 - A nested call then costs **no** register save/restore at all: the callee's own
-  `run_inner_inner` has its own locals, and the caller's stay in its frames — the
+  `run_inner_inner` has its own locals, and the caller's stay in its frames, the
   `save_scratch`/`restore_scratch` block is deleted from the carve.
 
 The work is mechanical but wide (the ~300 `self.ip`/`self.acc`/… sites in
@@ -630,17 +630,17 @@ the scalar flags only, sync at the existing `self.ip =`/`self.ip +=` sites plus
 the helper boundaries, and drop the `save_scratch` register save for those; (2)
 batch it behind the six sweeps plus `--gc-stress`/`--nursery-stress` and the
 `--bench` rows; (3) add `acc` and the loop counters the same way. Probe after each
-step — this is the one C3 slice that can move `recursive_fib` below the pooled
+step, this is the one C3 slice that can move `recursive_fib` below the pooled
 floor (`function calls` ~1.4× the leaf lane is the ceiling).
 
-**C3.3 result (2026-10-05): declined — the register block is already at noise
+**C3.3 result (2026-10-05): declined, the register block is already at noise
 after C3.2 (~0–2% ceiling, measured); do not attempt the locals rewrite or the
 per-body clobber mask.** Reading the code settled the framing the detail left
 optimistic:
 
 - The step path never touches `self.acc` at all (only the register/leaf executor
-  reads it — the leaf lane states the invariant at `ir.rs:11707`), so `acc`'s
-  save/restore is the one *unconditionally* removable field — and it is a single
+  reads it, the leaf lane states the invariant at `ir.rs:11707`), so `acc`'s
+  save/restore is the one *unconditionally* removable field, and it is a single
   field (three word-ops).
 - Every other register is entangled with a helper the step arms call, so a locals
   hoist cannot delete its save/restore without either syncing around the helper
@@ -648,15 +648,15 @@ optimistic:
   via `fast_loop_bind`/`fast_loop_test`/`fast_loop_inc`/`fast_loop_store` (called
   from `Step::FastLoop*`), `completion` via `start_scope_disposal`, and `ip` via
   `route_step_error`/`throw_machinery` (the error path reads `self.ip` to pick
-  the handler, so a local `ip` would need a per-step `self.ip = ip` store —
+  the handler, so a local `ip` would need a per-step `self.ip = ip` store,
   negating the hoist for the hottest register).
 - `completion` and `switch_disc` are `Value`s; a Rust local is rooted only by the
   conservative stack scan (see the `slag-gc-rooting` trap), so hoisting them is
   a soundness risk under `--gc-stress`.
 
 So the cleanly-hoistable set is three bools (`completion_is_empty`,
-`switch_disc_set`, `chain_short`) plus at most `switch_disc` — under a fifth of
-the block — and **the block is not where the call time goes**: a throwaway build
+`switch_disc_set`, `chain_short`) plus at most `switch_disc`, under a fifth of
+the block, and **the block is not where the call time goes**: a throwaway build
 that skipped seven of the ten register default/save/restore slots (keeping `ip`,
 `completion`, `completion_is_empty`) measured a median *within noise* on jitless
 `recursive_fib` (interleaved min 554→543 ms of ~560; a lone ~5% reading did not
@@ -665,13 +665,13 @@ after C3.2, and there is no larger move hiding here.
 
 The "per-body clobber mask" is the only sound way to shave what remains, and it
 is worth ~0–2% at best: default, save, and restore only the registers the
-callee's steps can *read or write* — `ip` and the fall-off-end `completion`/
+callee's steps can *read or write*, `ip` and the fall-off-end `completion`/
 `completion_is_empty` always; `acc`/`loop_*`/`builder` only with a `Step::Leaf`
 or `FastLoop*`/`Builder*` step; `switch_*`/`chain_short` only with their steps.
 Skipping the *default* write too is essential: keeping the default but dropping
 the restore lets the callee zero the caller's live `loop_counter` and
 `recursive_fib` hangs. Given the payoff, do not attempt either this or the
-locals rewrite — the interpreter call frame is at its floor.
+locals rewrite, the interpreter call frame is at its floor.
 
 **Stage C0 detail (the substrate).** C0 makes the compiled body's working
 region *be* `vm.stack`, so the frame and the operand stack are one described
@@ -682,7 +682,7 @@ buffer (`crates/runtime/src/jit.rs:6363`, rooted by `with_jit_run` through
 buffer is the reallocation hazard: a helper gets `&mut Vm` and may
 push/realloc `vm.stack`, so a raw pointer into `vm.stack` held across a
 helper call would dangle. The frame slots already prove the pattern is
-viable — the interpreter leaf addresses a flat `vm.stack` segment through
+viable, the interpreter leaf addresses a flat `vm.stack` segment through
 `leaf_frame_base` (`Vm::frame_get`, `crates/runtime/src/ir.rs:4037`), and
 `DISPATCH_DEOPT` already spills the working region into `vm.stack`.
 
@@ -691,8 +691,8 @@ realloc. This is the decision the stage turns on:
 
 1. **Stable region (recommended).** Cap `vm.stack` so it never reallocates and
    a baked pointer stays valid, as the entry ABI assumes today. The cap is not
-   enforced per push — `vm.stack.push` is scattered across the interpreter and
-   the builtins, so a per-push bound is invasive — but at *activation*
+   enforced per push, `vm.stack.push` is scattered across the interpreter and
+   the builtins, so a per-push bound is invasive, but at *activation*
    granularity: at each call entry, the current depth plus the frame's maximum
    value-stack use must fit under the cap, else the entry throws the same
    `RangeError` the native-stack guard does. That is a handful of check sites
@@ -701,7 +701,7 @@ realloc. This is the decision the stage turns on:
    body's maximum value-stack use known to the interpreter too, which today
    only `max_stack_usage` computes, for the JIT.
 2. **Base as an index.** Keep `vm.stack` a growing `Vec` and re-derive the
-   working base from `(vm.stack.as_ptr(), work_base)` at each use — the shape
+   working base from `(vm.stack.as_ptr(), work_base)` at each use, the shape
    `frame_get` already uses for the leaf frame. Robust, but every stack access
    pays a reload, so it is a codegen-wide change.
 
@@ -709,7 +709,7 @@ realloc. This is the decision the stage turns on:
 sufficient. The call helpers push onto `vm.stack` for the duration of the call
 and then truncate: `call_slow` (`crates/runtime/src/jit.rs:1863`) and
 `call_apply` by `argc + 2`, and `call_vector` (`jit.rs:3654`) by
-`vm.stack.extend(args)` where `args` is the spread vector — unbounded
+`vm.stack.extend(args)` where `args` is the spread vector, unbounded
 (`f(...bigArray)`), so no compile-time reserve can cover it. A baked
 `work_ptr` therefore dangles on the realloc however generous the reserve. The
 region needs both halves: the cap/reserve (which bounds the non-call helper
@@ -723,14 +723,14 @@ vm.stack.as_ptr() + work_base * 8` (and `buf_end`) after
 compiler's stack model is absolute-pointer based. `Lowerer::sp_var`
 (`crates/jit/src/compiler.rs:494`) is the working top, `entry_sp_var`
 (`:516`) is the run's base (used to reset a self-tail-call back edge), and the
-per-handler `handler_sp_vars` (`:497`) are sp snapshots for error resume — all
+per-handler `handler_sp_vars` (`:497`) are sp snapshots for error resume, all
 absolute addresses. One realloc at a call boundary therefore dangles *every*
 held pointer, not just `sp_var`, and a `try` can span a call, so the handler
 snapshots cannot be rebased by a fixed few instructions. The clean fix is to
 make the compiled stack model **base+offset** throughout (the shape mechanism 2
 describes): carry a stable base and treat `sp_var`/`entry_sp_var`/
 `handler_sp_vars` as offsets, so a moved allocation rebases with one add. That
-is a codegen-wide change, not a localized reload — C0a's real cost is that
+is a codegen-wide change, not a localized reload, C0a's real cost is that
 refactor, and the decision is whether to commit to it.
 
 **Status (2026-10-04): C0a-ii landed via mechanism 1 (non-moving
@@ -747,20 +747,20 @@ runs on the *caller's* ctx: the leaf's own re-base advances the cursor, so the
 caller's subsequent re-base sees delta 0 and never corrects its (now stale)
 base. A per-body slot index (`vm.stack.as_ptr() + base_slot * 8`, preserved by
 a realloc) fixes that, but
-2. **even the slot-index re-base was not sufficient** — a rare move-triggered
+2. **even the slot-index re-base was not sufficient**: a rare move-triggered
 dangling write remained (it vanished when a `reserve` stopped the region
 moving). So re-basing sites is the wrong axis.
 
 The re-try removes the move instead of handling it. `run_jit_body`/
 `run_jit_resume` place the region on `vm.stack` and `reserve` it to
-`stack_cap`, so no helper push during the run can reallocate it — the baked
+`stack_cap`, so no helper push during the run can reallocate it, the baked
 region pointer stays valid and **no re-base machinery exists at all**. The
 `stack_cap` ceiling (C0a-i) is exactly the size the fixed, non-reallocating
 stack is sized to. `with_jit_run` drops its buffer argument (the region is
 traced with the Vm); `call_slow`/`call_apply` push straight from the region
 again (a realloc can no longer dangle it). Residual bound: a same-`Vm` push
 beyond the 1M-slot cap would still realloc (the activation guard bounds
-regions, not transients) — pathological, and not observed. Verified:
+regions, not transients), pathological, and not observed. Verified:
 `cargo clippy --workspace --all-targets -- -D warnings` clean; full workspace
 suite green; `jit` lib 260/260 across 15 consecutive parallel runs (where the
 re-base version aborted); full test262 sweep at baseline (48622 total, 48464
@@ -770,11 +770,11 @@ pass, 0 fail/crash/hang, 158 skip).
 (`vm.stack.truncate(work_base)` in `run_jit_body`/`run_jit_resume`): a
 tail-replacement loop recalls `run_jit_body` on the same `Vm`, so a region left
 in `vm.stack` would accumulate across iterations. `MAX_VALUE_STACK` is lowered
-from 1M to 64K slots, so the per-`Vm` reservation drops from ~8 MB to ~512 KB
-— still far beyond any body's operand depth. Stress gates: `jit` lib 260/260
+from 1M to 64K slots, so the per-`Vm` reservation drops from ~8 MB to ~512 KB,
+still far beyond any body's operand depth. Stress gates: `jit` lib 260/260
 across 10 consecutive parallel runs; full workspace green; normal sweep at
 baseline; `--gc-verify` sweep 0 fail/0 crash (its 3 `copyWithin/*detached*
-hangs are borderline-slow — 8s normal, 14s under verify — and PASS when re-run
+hangs are borderline-slow, 8s normal, 14s under verify, and PASS when re-run
 individually); the `--gc-stress` sweep's 59 failures are ALL
 `Promise/allSettled` and reproduce byte-for-byte under `--jitless`, i.e. a
 pre-existing gc×async interaction, not the region; the CLI `--gc-stress` and
@@ -783,21 +783,21 @@ pre-existing gc×async interaction, not the region; the CLI `--gc-stress` and
 Sub-steps, each independently landable and gated on corpus equivalence plus
 `--gc-stress`/`--nursery-stress`/the six sweeps with no row regress:
 
-- **C0a — the working region moves onto `vm.stack` at the top level.**
+- **C0a, the working region moves onto `vm.stack` at the top level.**
   `run_jit_body` reserves the body's `stack_usage + slack` above the caller's
   `sp` and hands the entry that base (per the mechanism above); the compiled
   frame becomes a `vm.stack` segment, so `frame_get`'s `Frame::Inline/Heap`
   arm serves only the interpreter's own active body. Behavior-neutral.
-- **C0b — the leaf lane unifies (landed 2026-10-04).** `run_jit_leaf` runs
+- **C0b, the leaf lane unifies (landed 2026-10-04).** `run_jit_leaf` runs
   the leaf's frame/working area as a `vm.stack` segment and sets
   `leaf_frame_base` for the run, so a helper's `frame_get` reads the leaf's own
   frame and the working base and `leaf_frame_base` are one offset.
-- **C0c — the buffer and its root retire (landed 2026-10-04).** The self-call
+- **C0c, the buffer and its root retire (landed 2026-10-04).** The self-call
   and certified-callee lanes carve their nested frame/working region from
   `vm.stack` too, so `INLINE_JIT_BUF`, the private per-call buffers,
   `Vm::jit_roots`, and `ActiveRun::jit_buffer` all retire: every region is
   `vm.stack`, traced with the Vm.
-- **C0d — suspension/resume (landed 2026-10-04).** A suspended body's live
+- **C0d, suspension/resume (landed 2026-10-04).** A suspended body's live
   working region stays on `vm.stack`, normalized to the stack bottom (the
   DEOPT shape) on `DISPATCH_SUSPEND`; `run_jit_resume` re-derives the base as
   the bottom and the live depth as `vm.stack.len()` and extends the region for
@@ -827,7 +827,7 @@ remains at any lane (body, leaf, self-call, certified-callee, or suspension).
   guard, and the guard must account for frame bytes, not `Vm`s.
 - **`Vm` pooling semantics.** Once a call no longer takes a `Vm`, the pool is
   only for *roots*; `return_vm`'s GC reset (`Vm::reset`) no longer runs per
-  call — the per-frame watermarks must do that work, or stale roots survive.
+  call, the per-frame watermarks must do that work, or stale roots survive.
 - **Tier boundary identity.** A call must resolve to leaf / non-leaf /
   interpreted / builtin with the existing cells; the caches that key on the
   body must not assume one `Vm` per activation.
@@ -848,7 +848,7 @@ remains at any lane (body, leaf, self-call, certified-callee, or suspension).
 ## 7. Open decisions
 
 1. **Frame header in `vm.stack` vs a parallel frame array.** SM/V8 use the
-   native stack; we have `Vec<Value>`. Carving from `vm.stack` (recommended —
+   native stack; we have `Vec<Value>`. Carving from `vm.stack` (recommended,
    `DISPATCH_DEOPT` and the leaf lane already assume it) vs a separate
    `Vec<Frame>`. The former makes GC tracing free.
 2. **Whether the interpreter's `Vm` becomes the frame or the frame becomes
@@ -857,6 +857,6 @@ remains at any lane (body, leaf, self-call, certified-callee, or suspension).
 3. **Stage C2 in the same change as C1 or after.** C2 is the same protocol
    plus receiver creation; separate landings keep the gates small.
 4. **Whether to add a baseline tier** (Sparkplug/SM-Baseline analog) once the
-   frame is shared — deferred until C1–C3 land, and only on a measured
+   frame is shared, deferred until C1–C3 land, and only on a measured
    compile-time or coverage constraint (the general-path compile was probed
    and de-scoped once already, `perf.md:120`).

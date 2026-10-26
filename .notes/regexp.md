@@ -1,4 +1,4 @@
-# Slag RegExp engine — performance report & implementation plan
+# Slag RegExp engine: performance report & implementation plan
 
 Status: optimization rounds 1–5 implemented and measured (2026-08-31),
 plus the runtime-dispatch + sweep-runner round (§5D) that cleared the
@@ -25,7 +25,7 @@ before this round of work:
   atom** (`Char`/`Any`/`Class`), consuming iteratively to avoid one stack
   frame per consumed character.
 - The runtime (`regexp_builtin_exec`) drove its own search loop with
-  `exec_at`, calling the engine once per input position — each call
+  `exec_at`, calling the engine once per input position, each call
   allocating a fresh capture buffer.
 
 The hot-path costs measured before this round (release build):
@@ -35,7 +35,7 @@ The hot-path costs measured before this round (release build):
 - per consumed character in a repeat: one heap-allocated `Vec` endpoint
   list (`atom_match_ends`);
 - capture repeats (`(a)+`) fell off the fast path entirely and recursed one
-  stack frame per character — an O(n) recursion depth that **overflowed the
+  stack frame per character, an O(n) recursion depth that **overflowed the
   stack on multi-megabyte inputs**;
 - no literal/prefilter guidance for the search loop: `/abc/` scanned every
   position with a full matcher attempt.
@@ -64,11 +64,11 @@ non-BMP code points become their high surrogate range, and a legacy-mode
 range beyond the BMP refuses the prefilter (the mapping would be
 incomplete). The set is computed **once at compile time** and stored on the
 `Regex` struct (`Regex::prefilter`, built in `parse.rs::compile_pattern`),
-so `search` reads it without per-call work — the first version computed it
+so `search` reads it without per-call work, the first version computed it
 on every `search_at` call and cost ~90 ns/call on an ~47 ns baseline.
 
 The new `Regex::search_at` (`lib.rs`) is a leftmost search that skips
-positions whose first unit is not in the set (false positives are fine —
+positions whose first unit is not in the set (false positives are fine,
 the matcher re-verifies; false negatives would be bugs) and **reuses one
 `Caps` buffer across position attempts**, resetting with `rollback(0)`
 after each failure (the trail entries chain back to the untouched state).
@@ -94,7 +94,7 @@ fast path. This required two fixes:
 
 - **The peel is mandatory**: a group's disjunction always wraps its body in
   `Node::Sequence` (`parse_disjunction`), so `(a)+` parses as
-  `Repeat { Capture { Sequence([Char]) } }` — the first version missed it
+  `Repeat { Capture { Sequence([Char]) } }`, the first version missed it
   and silently kept the recursive path.
 - Capture semantics: the repeat's owned captures are cleared once at entry
   (`clear_owned`), and `set_repeat_captures` derives the **last iteration's
@@ -119,7 +119,7 @@ previously recursed ~2M frames and crashed; it now consumes iteratively.
 
 ### 2.5 Benchmark harness
 
-`crates/regexp/tests/perf.rs` — an ignored test (criterion would need a
+`crates/regexp/tests/perf.rs`, an ignored test (criterion would need a
 network fetch):
 
 ```
@@ -153,7 +153,7 @@ old `exec_at`-loop.
 Interpretation:
 
 - The prefilter turns *search* from O(n) full matcher attempts into O(n)
-  unit-range tests + attempts only at candidate positions — the reason the
+  unit-range tests + attempts only at candidate positions, the reason the
   literal and alternation cases drop ~50–100×.
 - The repeat cases improve 3–4× from removing the per-character
   allocation and, for `(a+)`, the per-character recursion.
@@ -178,17 +178,17 @@ Interpretation:
 ## 5. Optimization round 2 (implemented)
 
 Four more items from the plan below, plus the R0 sweep that validated them
-(and caught two bugs — see 5.5).
+(and caught two bugs, see 5.5).
 
-### 5.1 R1 — stop cloning the compiled `Regex` per exec
+### 5.1 R1: stop cloning the compiled `Regex` per exec
 
 `RegExpState.compiled` is now `Rc<regexp::Regex>` (`regexp.rs`): the
 per-exec `regexp_data` clone is two refcount bumps instead of a full `Node`
-AST copy. The invariant holds — `compiled` is never mutated in place
+AST copy. The invariant holds, `compiled` is never mutated in place
 (`RegExp.prototype.compile` re-runs `regexp_initialize`, which inserts a
 fresh state). All deref through the `Rc` unchanged.
 
-### 5.2 R3 — predicate-class prefilter
+### 5.2 R3: predicate-class prefilter
 
 `Predicate` is now `Hash`; `engine::predicate_ranges` caches each unique
 predicate's explicit code-point ranges in a process-wide
@@ -199,7 +199,7 @@ consults the cache for non-folded, non-negated, string-free predicate
 classes and refuses a full-space predicate (`\p{Any}`). Search over
 non-digit text with `\d{6}` is now ~47× (68 µs vs 3.2 ms).
 
-### 5.3 R4 — linear-sequence capture repeats
+### 5.3 R4: linear-sequence capture repeats
 
 `single_atom` now also admits a **non-empty linear sequence** of string-free
 single atoms, so `(ab)+`/`(?:ab)+` take the iterative fast path
@@ -208,21 +208,21 @@ unit input no longer recurses per iteration (stack overflow fixed);
 measured 2.3 ms for 200k units. Branching inner atoms (`(a|b)+`) still need
 R2.
 
-### 5.4 R5.1 — repeat coalescing
+### 5.4 R5.1: repeat coalescing
 
 `parse.rs::coalesce_repeats` merges adjacent greedy capture-free repeats of
-structurally-identical atoms (`a*a*` → `a*`, `a{2}a{3}` → `a{5}`) — the
+structurally-identical atoms (`a*a*` → `a*`, `a{2}a{3}` → `a{5}`), the
 split between two identical greedy atoms is never observable, so the merge
 preserves results while removing redundant backtracking states. The
 pathological bench `a*a*a*a*b` collapsed to linear: 5.8 µs/iter (was
 ~2.6 ms). Lazy quantifiers and capture-owning atoms are untouched.
 
-### 5.5 R0 — the test262 RegExp sweep
+### 5.5 R0: the test262 RegExp sweep
 
 `built-ins/RegExp` (1879 fixtures) and `language/literals/regexp` (238):
 **1506 + 238 pass, 0 fail, 0 crash**. The 373 `built-ins` "hangs" are all
 `property-escapes/generated/*` fixtures whose `buildString` (constructing
-~2M-unit strings via `String.fromCodePoint`) takes ~6.5 s — verified
+~2M-unit strings via `String.fromCodePoint`) takes ~6.5 s, verified
 independent of the regexp engine by running a build-only copy (no regexps)
 at the same speed. The sweep caught two real regressions, both fixed with
 tests:
@@ -237,7 +237,7 @@ tests:
    `start > cur`. `set_repeat_captures` now records `(min, max)`
    (`lookbehind_capture_repeat_spans`).
 
-## 5A. Optimization round 3 — R2, the explicit backtracking stack
+## 5A. Optimization round 3: R2, the explicit backtracking stack
 
 `engine.rs` is rewritten from CPS recursion (closures per node) to a single
 loop over two explicit stacks, deleting `match_node`/`match_sequence`/
@@ -250,11 +250,11 @@ loop over two explicit stacks, deleting `match_node`/`match_sequence`/
   point. The loop dispatches tasks; an atomic failure pops choices.
 - **Continuation snapshots**: each choice stores the task-stack content at
   its push (shared via `Rc`), because the forward path consumes continuation
-  frames below a choice before it is popped — a bare stack length cannot
+  frames below a choice before it is popped, a bare stack length cannot
   reconstruct them (this was the first design's bug).
 - **Zero recursion**: repeats, alternations, and lookarounds all iterate on
   the stacks, so recursion depth tracks pattern structure, never input
-  length — no pattern can overflow the stack (`(a|b)+` on 1M units now
+  length, no pattern can overflow the stack (`(a|b)+` on 1M units now
   passes; it would have overflowed before).
 - **Simple-atom repeat fast path** (`greedy_simple`): a greedy repeat of a
   literal/dot/class/linear-sequence atom consumes iteratively into a
@@ -283,7 +283,7 @@ loop over two explicit stacks, deleting `match_node`/`match_sequence`/
 Repeats are ~1.8× faster than round 1 (no per-node indirect calls, no
 per-iteration allocation). The remaining regressions are the per-position
 search-attempt overhead on prefilter-less patterns (empty-match 1.65×,
-ignore-case 2.5× — absolute cost ~30 ns/position) and the quadratic
+ignore-case 2.5×, absolute cost ~30 ns/position) and the quadratic
 backref path (2×, from the shrink choice re-arm per backtrack step). All
 are dwarfed by the runtime's per-exec overhead in real code.
 
@@ -295,7 +295,7 @@ engine: `built-ins/RegExp` 1515 pass / 0 fail / 0 crash,
 `language/literals/regexp` 238/238. The property fixtures run at the same
 speed (their cost is `buildString`, engine-independent).
 
-## 5B. Optimization round 4 — R5.2, failure memoization
+## 5B. Optimization round 4: R5.2, failure memoization
 
 `Matcher` gains a per-(atom, position) failure memo that kills the classic
 exponential nested-repeat blowups (`(a+)+b`, `(?:a*)*b`). The probe measured
@@ -306,21 +306,21 @@ exponential nested-repeat blowups (`(a+)+b`, `(?:a*)*b`). The probe measured
 - **Min-unsatisfiable** (recorded in `greedy_simple` when the atom cannot
   reach `min` consumptions from a position): the simple atom's consumption is
   deterministic, so "can't reach the minimum here" is a pure position
-  property — sound unconditionally, backrefs or not.
-- **Exhausted** (recorded when the `FastShrink` chain bottoms out — every
+  property, sound unconditionally, backrefs or not.
+- **Exhausted** (recorded when the `FastShrink` chain bottoms out, every
   shrink level dead): "the repeat at (atom, pos) can never succeed" is only
   sound when the continuation below the repeat is *acceptance-equivalent* at
   every re-entry, so recording is gated on:
-  - **no backrefs anywhere in the pattern** — the continuation never reads
+  - **no backrefs anywhere in the pattern**: the continuation never reads
     captures, so acceptance is capture-independent; and
-  - **every enclosing repeat has `min <= 1`** (`*`, `+`, `{0,m}`, `{1,m}`) —
+  - **every enclosing repeat has `min <= 1`** (`*`, `+`, `{0,m}`, `{1,m}`),
     such a repeat can stop at any iteration count (its stop choice always
     passes the minimum), so the continuation does not depend on its own
     iteration count, which the (atom, position) key does not carry.
 
 The second gate is the soundness fix found while implementing: a naive
 ungated memo misses `(a+){3,}b` on `"aaab"` (the match stops the `{3,}`
-repeat after group 3 — a continuation that a `{2,}`-or-tighter ancestor
+repeat after group 3, a continuation that a `{2,}`-or-tighter ancestor
 makes count-dependent). `memo_safe_atoms` walks the AST to find the eligible
 atoms; the memo persists across `match_at` calls in the search loop (the
 continuation is pattern-determined, so entries stay valid across position
@@ -340,12 +340,12 @@ Exponential becomes polynomial: the residual is O(n²) for an a-run of length
 n, from the first exploration of each position re-consuming the remaining
 run greedily (70 µs → 240 µs → 884 µs at n=25/50/100 matches the quadratic
 shape). `{2,}`-nested catastrophes stay exponential (R5.3 territory). The
-quadratic backref bench (`/(a+)b\1/` on 10k, ~2 s) is unchanged — that path
+quadratic backref bench (`/(a+)b\1/` on 10k, ~2 s) is unchanged, that path
 is capture-dependent and correctly never memoized.
 
 ### R5.2 validation
 
-36 regexp tests (new: memoized-nested-repeat timing, soundness gates —
+36 regexp tests (new: memoized-nested-repeat timing, soundness gates,
 `(a+){3,}b` still matches `"aaab"` and a backref pattern still matches,
 the enclosing-stop choice is still found, the memo survives search-loop
 position attempts), 3323 runtime tests, workspace clippy clean, R0 sweep
@@ -355,7 +355,7 @@ per-`Matcher::new` AST walk had regressed the worst-case per-attempt
 search (empty-match `/a*/` over 200k: 16.5 ms → 29 ms), now back to
 17.7 ms.
 
-## 5C. Optimization round 5 — case-insensitive leading-char prefilter
+## 5C. Optimization round 5: case-insensitive leading-char prefilter
 
 The search prefilter previously refused `i`-folded literals and classes
 (`first_char_analysis` returned "unconstrained"), so `/abcdefghij/i` scanned
@@ -367,7 +367,7 @@ round 1 (1.48 ms on 50k).
 code-point ranges folding to it`, built once by enumerating the code point
 space (same pattern as the predicate cache). The leading-char set of a
 folded literal is now the **fold equivalence class** of its
-(pre-canonicalized) pattern char — the *preimage* of the canonical form,
+(pre-canonicalized) pattern char, the *preimage* of the canonical form,
 which the forward-closure helpers would get wrong: `/k/iu` matches U+212A
 KELVIN SIGN, so the prefilter must include it. Folded classes union their
 members' classes (bounded at 4096 members to keep compile fast; bigger
@@ -379,7 +379,7 @@ Measured (release, per iteration):
 |---|---|---|
 | `/abcdefghij/i` search, 50k | 1.57 ms | **50 µs** (31×) |
 
-Validation: 38 regexp tests (new: fold-class prefilter soundness — Kelvin
+Validation: 38 regexp tests (new: fold-class prefilter soundness, Kelvin
 sign under `/iu`, `ß`/`ẞ`, legacy `é`/`É`, non-BMP Deseret pair;
 skip-to-match for a folded literal and a folded class), workspace clippy
 clean, R0 sweep re-run green.
@@ -388,7 +388,7 @@ clean, R0 sweep re-run green.
 
 Profiling the `\S+` / `\p{...}` matching (the residual sweep-hang
 fixtures after the R0-R5.2 engine work) found the ENGINE was already
-fast — `exec_at` on `\S+` against a 1-char input measures ~125 ns —
+fast, `exec_at` on `\S+` against a 1-char input measures ~125 ns,
 and the per-`replace` cost was in the runtime wrappers and the sweep
 runner, not the matcher:
 
@@ -408,26 +408,26 @@ runner, not the matcher:
    0 fail, 0 crash, 0 hang** at `--batch 4 --recheck-timeout 15`.
 2. **The sweep runner's verdict wobble** (`test262-sweep`): the hang
    count was inflated and load-dependent because (a) the recheck
-   deadline (5 s) was inconsistent with the batch budget (15 s) — a
+   deadline (5 s) was inconsistent with the batch budget (15 s), a
    fixture that fits its own 15 s batch was classified a hang whenever
    its 32-fixture batch was killed by composition; and (b) full-core
    parallelism ran every batch under contention, skewing the marginal
    timings. The defaults now use a **15 s recheck (matching the batch
    budget)** with full-core jobs, plus `--fast` (full-core jobs, 5 s
-   recheck — a quick smoke whose verdicts wobble on 5-15 s fixtures)
-   and `--accurate` (half-core jobs, 15 s recheck — steadier timings).
+   recheck, a quick smoke whose verdicts wobble on 5-15 s fixtures)
+   and `--accurate` (half-core jobs, 15 s recheck, steadier timings).
    Measured on the full 48,622-fixture sweep: old defaults 334-374
    hangs → default (full cores, recheck 15) ~240 → `--accurate` ~136,
    with 0 fail / 0 crash throughout.
 
-## 6. Remaining opportunities — implementation plan
+## 6. Remaining opportunities: implementation plan
 
-Completed: **R0–R5.2**, plus the round-5 i-fold prefilter (§5C) — see
+Completed: **R0–R5.2**, plus the round-5 i-fold prefilter (§5C), see
 §5/§5A/§5B/§5C. Remaining: R5.3 only.
 
 ### R5.3. Step budget (last resort)
 
-V8-style interrupt/limit on backtracking steps — a spec deviation, so only
+V8-style interrupt/limit on backtracking steps, a spec deviation, so only
 a last resort if real-world hangs remain after R2/R5.2. `{2,}`-nested
 catastrophic patterns (the R5.2 gate deliberately leaves them exponential)
 are the remaining hang risk.
@@ -438,7 +438,7 @@ Validated this session; proposed for the repo root rules (or
 `crates/regexp/.rules`):
 
 > In `crates/regexp`, a group body is always wrapped in `Node::Sequence` by
-> `parse_disjunction`, even for a single atom — `(a)+` parses as
+> `parse_disjunction`, even for a single atom, `(a)+` parses as
 > `Repeat { Capture { Sequence([Char]) } }`. Any AST-peeling logic (the
 > repeat fast path, leading-char analysis) must peel one-element sequences
 > and captures, or it silently misses common patterns (a missed fast path

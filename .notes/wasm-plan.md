@@ -1,23 +1,23 @@
 # WebAssembly (wasm) engine: implementation plan
 
 This is the engineering spec for implementing a WebAssembly runtime *inside*
-Slag — so JavaScript can compile and execute wasm modules through a
+Slag, so JavaScript can compile and execute wasm modules through a
 `WebAssembly` global, the way V8 embeds wasm next to its JS engine.
 
 The **primary reference is the pinned `waspec` submodule** (the official
 WebAssembly specification repository):
 
-- `waspec/document/core/` — the core spec (structure, validation,
+- `waspec/document/core/`: the core spec (structure, validation,
   execution, binary, text) as Sphinx source under `syntax/`, `valid/`,
   `exec/`, `binary/`, `text/`; `index.bs` is the same document in the
   new spectec tooling.
-- `waspec/document/js-api/` — the `WebAssembly.*` JavaScript API spec.
-- `waspec/test/core/` — the conformance corpus: **97 top-level `.wast`
+- `waspec/document/js-api/`: the `WebAssembly.*` JavaScript API spec.
+- `waspec/test/core/`: the conformance corpus: **97 top-level `.wast`
   files** (the core suite) plus feature suites in subdirectories.
-- `waspec/test/js-api/` — the JS-API test suite (WPT-style `.js`).
-- `waspec/interpreter/` — the reference interpreter (OCaml), the
+- `waspec/test/js-api/`: the JS-API test suite (WPT-style `.js`).
+- `waspec/interpreter/`: the reference interpreter (OCaml), the
   authoritative semantic oracle for debugging mismatches.
-- `waspec/spectec/` — the new formal-spec toolchain; the hand-supplied
+- `waspec/spectec/`: the new formal-spec toolchain; the hand-supplied
   `WebAssembly.md` is its rendered snapshot of the core spec (convenient
   for offline reading; the `document/core` tree stays authoritative).
 
@@ -35,7 +35,7 @@ decodes end to end). `wasmtest run` now converts suites with wabt's
 `wast2json` (env `WAST2JSON`, then PATH) and executes commands, classifying
 outcomes by what the current engine can judge (decode/`assert_malformed`
 now; `assert_invalid` pending validation in Cut 2; invocations pending
-execution in Cut 3) — `utf8-invalid-encoding.wast` is 176/176 pass. Files
+execution in Cut 3), `utf8-invalid-encoding.wast` is 176/176 pass. Files
 wabt cannot parse (GC type bags and element items, module-linking/`instance`
 syntax) are tracked in the runner's exclusion manifest rather than failing
 the gate.
@@ -61,18 +61,18 @@ the gate.
 
 The core tests are written in the S-expression **script format** (text
 modules + `assert_*` commands), and the engine will **not parse text
-format** (ch. 6 is out of scope for the runtime — the JS API only consumes
+format** (ch. 6 is out of scope for the runtime, the JS API only consumes
 bytes). Conformance therefore needs a compile step, exactly like the
 `unicode` build script and the `wat2wasm` step in the browser demo:
 
 - **`wast`** (the maintained bytecodealliance/wasm-tools text parser, a
-  *test/dev* dependency — never a runtime dependency) converts each `.wast`
+  *test/dev* dependency, never a runtime dependency) converts each `.wast`
   in-process into one `.wasm` per module plus a `.json` of commands
   (`module`, `assert_return`, `assert_trap`, `assert_invalid`,
   `assert_malformed`, `assert_unlinkable`, `assert_exhaustion`,
   `register`, `action`), matching the wast2json JSON shape.
-- A Rust runner executes the JSON commands against the engine — decode →
-  validate → instantiate → invoke — and reports failures per file/command.
+- A Rust runner executes the JSON commands against the engine, decode →
+  validate → instantiate → invoke, and reports failures per file/command.
   This mirrors the test262 sweep (`crates/test262`) and can live in a new
   `crates/wasmtest` crate (pinned corpus = `waspec/test/core`).
 - Tests import a **`spectest`** host module (`print`, `print_i32`, ...);
@@ -91,9 +91,9 @@ files are the milestone that defines "the baseline engine works", and each
 feature suite turns on behind its own cut.
 
 The top-level suite already exercises the post-MVP features that merged
-into the core spec and appear there directly — multi-value, sign
+into the core spec and appear there directly, multi-value, sign
 extension, saturating conversions, reference types (`ref.*`, table
-instructions), tail calls (`return_call*`), extended-const initializers —
+instructions), tail calls (`return_call*`), extended-const initializers,
 so "baseline" means MVP plus those merged semantics, *not* the raw 1.0
 feature set.
 
@@ -101,28 +101,28 @@ feature set.
 
 Following the crate-per-subsystem layout:
 
-- **`crates/wasm`** (new, pure Rust, no third-party deps) — the core
+- **`crates/wasm`** (new, pure Rust, no third-party deps): the core
   engine, laid out against the spec chapters:
-  - `values.rs` — the value space: `i32/i64/f32/f64`, references, vectors
+  - `values.rs`: the value space: `i32/i64/f32/f64`, references, vectors
     later; bits-level f32/f64 with the IEEE helper ops the spec defines by
     hand (ch. 2.2 / 4.3).
-  - `types.rs` + `module.rs` — the type system (ch. 2.3) and module
+  - `types.rs` + `module.rs`, the type system (ch. 2.3) and module
     structure (ch. 2.5): types, funcs, tables, memories, globals, tags,
     element/data segments, imports/exports.
-  - `binary.rs` — the decoder (ch. 5): LEB128, sections, instruction
+  - `binary.rs`: the decoder (ch. 5): LEB128, sections, instruction
     stream, name/custom sections tolerated.
-  - `valid.rs` — validation (ch. 3): the type-checking algorithm over
+  - `valid.rs`: validation (ch. 3): the type-checking algorithm over
     decoded bodies; the compile pipeline is decode → validate → instantiate.
-  - `exec/` — the runtime (ch. 4): the store (module/function/table/
+  - `exec/`: the runtime (ch. 4): the store (module/function/table/
     memory/global instances), an explicit-frame operand-stack machine
     (labels, frames, exception handlers), numeric semantics, traps.
-- **`crates/runtime/src/wasm.rs`** + a `wasm` feature — the JS API
+- **`crates/runtime/src/wasm.rs`** + a `wasm` feature, the JS API
   (document/js-api): `WebAssembly.Module/Instance/Memory/Table/Global/Tag/
   Exception`, the error constructors, compile/validate/instantiate, and
   JS↔wasm bridging. Installed as `Context::install_wasm()`, following the
   `raylib`/`rlx`/`fs` host-module pattern; the CLI enables the feature so
   scripts get `WebAssembly` like V8 gives it to a page.
-- **`crates/wasmtest`** (new) — the conformance runner + a JS-API harness
+- **`crates/wasmtest`** (new): the conformance runner + a JS-API harness
   (see Cut 10).
 
 ### Reused engine machinery
@@ -131,7 +131,7 @@ Following the crate-per-subsystem layout:
   (`JsValue::number`, `bigint_from_latin1`/`bigint_sum` for i64, and the
   `Context` conversion helpers).
 - `Memory` buffers are exposed through the existing ArrayBuffer helpers
-  (`Context::array_buffer_from_bytes`, `as_bytes`, `set_bytes`) — the
+  (`Context::array_buffer_from_bytes`, `as_bytes`, `set_bytes`), the
   `memory.buffer` getter and the copy-in/out paths sit directly on them.
 - JS function imports/exports become builtins via `Function::create_builtin`
   (the pattern already used by the DOM bridge in
@@ -148,7 +148,7 @@ Following the crate-per-subsystem layout:
   payload (`copysign`, `min`/`max` zero rules, pmin/pmax later). Tests only
   assert `nan:canonical`/`nan:arithmetic`, so this is conformance-neutral.
 - **`fmin`/`fmax`/`nearest`** are *not* Rust's `f32::min/max` (sign-of-zero
-  and NaN differ) — implement per spec 4.3.3 (signed zero rules,
+  and NaN differ), implement per spec 4.3.3 (signed zero rules,
   ties-to-even for `nearest`).
 - **Traps** are an internal error kind that becomes `WebAssembly.RuntimeError`
   only at the JS boundary; inside the interpreter they unwind the operand
@@ -166,7 +166,7 @@ Each cut ends with its `.wast` gate green (via the runner) and a
 `Definition of done`. Suggested `.rules`/test additions land in each cut's
 review, per repo rules hygiene.
 
-### Cut 0 — Scaffolding and harness plumbing
+### Cut 0: Scaffolding and harness plumbing
 
 - Add `crates/wasm` (empty lib), `crates/wasmtest` (runner skeleton), wire
   both into `Cargo.toml` members; document the `wast2json` requirement and
@@ -178,7 +178,7 @@ review, per repo rules hygiene.
 - DoD: `cargo test -p wasm` passes a decode+instantiate smoke; the runner
   prints per-file status for one converted file.
 
-### Cut 1 — Decoder: types, modules, instructions
+### Cut 1, Decoder: types, modules, instructions
 
 - Full module decoding (ch. 5.2-5.5): type/import/function/table/memory/
   global/export/start/element/data/data-count/code/custom sections;
@@ -195,10 +195,10 @@ review, per repo rules hygiene.
   `names.wast`. (Text-format files such as `comments.wast`, `token.wast`,
   `id.wast`, `annotations.wast`, `inline-module.wast`,
   `obsolete-keywords.wast` still emit modules through `wast2json`, but their
-  assertions are mostly text-parser concerns — low decoder value, kept in
+  assertions are mostly text-parser concerns, low decoder value, kept in
   the gate as regression noise only once the suite runs.)
 
-### Cut 2 — Validation (ch. 3)
+### Cut 2: Validation (ch. 3)
 
 - The type-checking algorithm: value/result/block typing, instruction
   typing for the baseline opcode space, const-expr rules for
@@ -213,7 +213,7 @@ review, per repo rules hygiene.
   `type-canon.wast`, `global.wast` (invalid cases), `elem.wast`,
   `data.wast`, `imports.wast` (invalid cases) validate/dispatch correctly.
 
-### Cut 3 — Execution core: values, numerics, locals, control flow
+### Cut 3, Execution core: values, numerics, locals, control flow
 
 - The operand-stack machine: frames, labels, values (ch. 4.2, 4.6).
 - Numeric semantics (ch. 4.3): every i32/i64/f32/f64 instruction with the
@@ -233,7 +233,7 @@ review, per repo rules hygiene.
   `local_get.wast`, `local_set.wast`, `local_tee.wast`, `local_init.wast`,
   `traps.wast`, `skip-stack-guard-page.wast`.
 
-### Cut 4 — Functions, calls, globals, memory, instantiation
+### Cut 4: Functions, calls, globals, memory, instantiation
 
 - Store and instance allocation (ch. 4.2, 4.7): function/global/memory/
   table instances; module instantiation with imports; start function;
@@ -250,7 +250,7 @@ review, per repo rules hygiene.
   `imports.wast`, `linking.wast`, `instance.wast`, `return_call.wast`,
   `return_call_indirect.wast` (function half once tables land in Cut 5).
 
-### Cut 5 — Tables, reference types, call_indirect, bulk memory
+### Cut 5: Tables, reference types, call_indirect, bulk memory
 
 - Tables + element segments (active/passive/declarative); `call_indirect`,
   `return_call_indirect`; `table.get/set/size/grow/fill/copy/init`,
@@ -261,7 +261,7 @@ review, per repo rules hygiene.
   top-level files, so func-ref typing is in the baseline (not deferred to
   Cut 9).
 - Bulk memory: `memory.copy/fill/init`, `data.drop`.
-- **Milestone: the top-level 97-file core suite is green** — this is the
+- **Milestone: the top-level 97-file core suite is green**, this is the
   "baseline engine" definition of done.
 - DoD: `call_indirect.wast`, `func_ptrs.wast`, `table.wast`,
   `table_get.wast`, `table_set.wast`, `table_size.wast`, `table_grow.wast`,
@@ -270,14 +270,14 @@ review, per repo rules hygiene.
   `br_on_non_null.wast`, `call_ref.wast`, `return_call_ref.wast`,
   plus `bulk-memory/` (8).
 
-### Cut 6 — Exceptions
+### Cut 6: Exceptions
 
 - `tag` types/instances, `throw`, `try_table` (and legacy `try/catch` if
   the corpus still exercises it), exception references, unwind rules.
 - DoD: `exceptions/` (4) and the `Tag`/`Exception` half of the JS API
   (can land with Cut 10's API work or standalone via the runner).
 
-### Cut 7 — SIMD and relaxed SIMD
+### Cut 7: SIMD and relaxed SIMD
 
 - v128 value type; the full vector instruction set (constants, loads/
   stores incl. lane and zero-extend forms, lane ops, shuffles, splats,
@@ -286,7 +286,7 @@ review, per repo rules hygiene.
   results nondeterministic; pick one legal interpretation and document it).
 - DoD: `simd/` (59) then `relaxed-simd/` (7).
 
-### Cut 8 — Memory64 and multi-memory
+### Cut 8: Memory64 and multi-memory
 
 - Index type `i32|i64` on memories; 64-bit address arithmetic on loads/
   stores; `memory.size/grow` with i64; limits encoding.
@@ -296,7 +296,7 @@ review, per repo rules hygiene.
   `binary.rs`, `valid.rs`, and the memory instructions together.
 - DoD: `memory64/` (25) and `multi-memory/` (41).
 
-### Cut 9 — GC (structs, arrays, ref casts)
+### Cut 9: GC (structs, arrays, ref casts)
 
 - Heap types (`any/eq/struct/array/i31`), recursive types and type
   canonicalization, `struct.*`/`array.*` instructions, `ref.cast`/
@@ -306,9 +306,9 @@ review, per repo rules hygiene.
 - DoD: `gc/` (17).
 
 Status (Cut 9 waves 1-3 landed): type model + decoder (wave 1), GC
-instruction typing (wave 2), and the GC object runtime — struct/array/i31
+instruction typing (wave 2), and the GC object runtime, struct/array/i31
 extern values, `struct.*`/`array.*`, `ref.cast/test`/`br_on_cast*` with
-canonical (structural) type matching — land the corpus. `gc/` runs 653
+canonical (structural) type matching, land the corpus. `gc/` runs 653
 pass / 0 fail with 16 of 17 files green under the default exclusions
 (`struct.wast` keeps one harness `assert_malformed` quote-text command
 pending; `type-subtyping.wast` stays excluded because its multi-supertype
@@ -316,7 +316,7 @@ fixtures exceed both the `wast` grammar and the decoder's single-supertype
 model). `type-canon.wast` and the bulk-memory/`memory64` `table_init`
 files were un-excluded with the wave.
 
-### Cut 10 — The JavaScript API (document/js-api)
+### Cut 10: The JavaScript API (document/js-api)
 
 - `WebAssembly` namespace object and constructors:
   - `Module` (compile/validate/customSections/exports/imports),
@@ -359,9 +359,9 @@ intrinsic identity like every other agent-dependent builtin.
   numeric argument/result conversion). Function imports, non-function
   export wrappers, and the memory buffer bridge remain in wave 3b.
 - Wave 3b slice 1 (landed): `WebAssembly.Memory` over engine store
-  cells — constructor with `[EnforceRange]` page descriptors, a
+  cells, constructor with `[EnforceRange]` page descriptors, a
   `buffer` getter whose ArrayBuffer keeps object identity until a grow
-  detaches it, and `grow` — plus the shared memory-buffer bridge: each
+  detaches it, and `grow`, plus the shared memory-buffer bridge: each
   memory's ArrayBuffer is a cache of its engine cell, flushed in before
   and refreshed after every wasm run (instantiation start functions
   included), so JS typed-array writes reach wasm and wasm writes reach
@@ -376,7 +376,7 @@ intrinsic identity like every other agent-dependent builtin.
   surface table/global exports as their wrapper objects; imports
   resolve `Memory`/`Table`/`Global` wrapper objects and tag imports
   fail cleanly (wave 4).
-- Wave 3b slice 3 (landed): the engine host-function bridge — external
+- Wave 3b slice 3 (landed): the engine host-function bridge, external
   engine host functions with an embedder token, and a resumable run
   driver (`Store::start`/`Store::resume`/`Store::abandon`) that parks
   the interpreter at each external-host call so the runtime can run the
@@ -394,10 +394,10 @@ intrinsic identity like every other agent-dependent builtin.
 - Wave 4 slice 1 (landed): promise-returning `WebAssembly.compile` and
   `WebAssembly.instantiate`. Both never throw synchronously: an
   `async_operation` helper settles a fresh promise from the result of a
-  synchronous body (rejecting with the error's throwable — CompileError,
+  synchronous body (rejecting with the error's throwable, CompileError,
   LinkError, RuntimeError, or TypeError). `compile(bytes)` resolves with
   a `Module` (shared compile helper with the `Module` constructor);
-  `instantiate` supports both overloads — a BufferSource compiles then
+  `instantiate` supports both overloads, a BufferSource compiles then
   instantiates and resolves with `{ module, instance }`, and a
   `WebAssembly.Module` instantiates directly, resolving with the
   `Instance`. The shared instantiation body was split out of the
@@ -419,10 +419,10 @@ intrinsic identity like every other agent-dependent builtin.
   (`Store::resume_exception`), so a matching `try_table` catches it with
   the payload as branch values, while an uncaught one rethrows the
   original JS value with identity preserved. The streaming entry points
-  (`compileStreaming`/`instantiateStreaming`) are Web API — they need a
-  fetch `Response` — and are deliberately out of scope (see Future
+  (`compileStreaming`/`instantiateStreaming`) are Web API, they need a
+  fetch `Response`, and are deliberately out of scope (see Future
   work); the namespace does not install them.
-- Wave 5 slice 1 (landed): the JS-API harness — `wasmtest jsapi <file|dir>`
+- Wave 5 slice 1 (landed): the JS-API harness, `wasmtest jsapi <file|dir>`
   drives the `waspec/test/js-api` testharness-style fixtures through the
   Slag embed. A compact embedded shim implements the testharness surface
   the corpus uses (`test`/`promise_test`/`async_test`/`setup`/`done`, the
@@ -442,11 +442,11 @@ intrinsic identity like every other agent-dependent builtin.
   overflow when the built modules exercise it (an interpreter/JIT bug the
   next slice fixes). Note: tc39/test262 no longer vendors WebAssembly
   fixtures (they moved to the js-api suite), so the plan's "vendored
-  test262 built-ins/WebAssembly" arm is obsolete — the js-api suite is the
+  test262 built-ins/WebAssembly" arm is obsolete, the js-api suite is the
   whole JS-API gate.
 - Wave 5 slice 2 (measured): the full 61-file corpus, each fixture in its
   own process so a crash cannot abort the sweep (the crash-class root
-  cause is now precise and branch-independent — see the decision note in
+  cause is now precise and branch-independent, see the decision note in
   section 8). Of the 61 files: 7 helpers report `skip` (the builder,
   `assertions.js`, `bad-imports.js`, `instanceTestFactory.js`, the per-dir
   `assertions.js`), `js-string/polyfill.js` is a harness-error helper
@@ -460,7 +460,7 @@ intrinsic identity like every other agent-dependent builtin.
   - **BigInt/memory64 conversions** (the deferred wave-3b/4 item):
     `Global` i64 value/descriptor conversions, `Memory`/`Table` i64
     (memory64) `initial`/`maximum` and grow arguments, `Exception` i64
-    `getArg` parameters — the constructor/`grow` bodies reject with the
+    `getArg` parameters, the constructor/`grow` bodies reject with the
     staged "not supported" TypeError, and the "exceeds maximum"
     order-of-checks tests see that TypeError instead of RangeError
     (`global/constructor.any.js`, `global/value-get-set.any.js`,
@@ -469,7 +469,7 @@ intrinsic identity like every other agent-dependent builtin.
     `exception/constructor.tentative.any.js` i64 tag).
   - **Immutable/descriptor order-of-evaluation bugs**: setting an
     immutable `Global.value` must throw before any ToNumber of the
-    argument — instead the engine reads a null somewhere and throws
+    argument, instead the engine reads a null somewhere and throws
     "Cannot read properties of null" (all `Immutable * with ToNumber
     side-effects` cases in `global/value-get-set.any.js`); the `Global`
     descriptor reads `mutable` before `value` and the `Memory` descriptor
@@ -484,7 +484,7 @@ intrinsic identity like every other agent-dependent builtin.
   - `js-string/` (the WebAssembly.JSString JS proposal, out of scope) and
     `gc/` (its JS-API surface needs `WebAssembly.Function` typed-function
     wrappers, a later cut) crash today and will fail cleanly once the
-    stack fix lands — written taxonomy entries for both.
+    stack fix lands, written taxonomy entries for both.
   The next slice fixes the small engine gaps above, then the BigInt
   conversion wave, then re-measures after the upstream stack fix lands.
 - Wave 5 slice 3 (landed): the small engine/harness gaps from slice 2's
@@ -493,7 +493,7 @@ intrinsic identity like every other agent-dependent builtin.
   `Exception.prototype.is` type-checks its argument (a missing or non-Tag
   value is a TypeError; a different Tag is false); the `Global.value`
   setter rejects an immutable cell *before* converting the argument (the
-  spec's order — the argument's `valueOf` must not run); and the `Global`
+  spec's order, the argument's `valueOf` must not run); and the `Global`
   descriptor is read in spec order (`mutable` first, then `value`, then
   the initial value). Harness fix in `crates/wasmtest/src/jsapi.rs`: the
   shim's `test`/`promise_test` now pass a WPT-style test object
@@ -510,7 +510,7 @@ intrinsic identity like every other agent-dependent builtin.
 - Wave 5 slice 4 (landed): the harness runs the whole corpus. Each fixture
   runs on a dedicated 64 MiB-stack thread (the `run_deep` budget in
   `crates/runtime/src/eval.rs`) so the debug interpreter's ~160 KB/frame
-  cost no longer kills the sweep at the first deep fixture — the engine
+  cost no longer kills the sweep at the first deep fixture, the engine
   stack workaround lives in the harness (`crates/wasmtest/src/jsapi.rs`),
   and a fixture that still exhausts the budget surfaces as that file's
   error instead of aborting the run. The js-api runner now honors the
@@ -529,7 +529,7 @@ intrinsic identity like every other agent-dependent builtin.
 - Wave 5 slice 5 (landed): the i64 value-conversion half of the BigInt
   wave. JS↔wasm `i64` now converts through ToBigInt (wrapping modulo
   2^64; `crux::BigInt::to_i64_wrapping`) for value results, and BigInt
-  results convert back — unlocking `WebAssembly.Global` i64 (default 0n,
+  results convert back, unlocking `WebAssembly.Global` i64 (default 0n,
   value get/set, ToBigInt constructor conversions incl. objects),
   `WebAssembly.Tag`/`Exception` i64 parameters and payloads, and i64
   function-import/export arguments. Corpus: 793 tests pass / 297 fail
@@ -546,7 +546,7 @@ intrinsic identity like every other agent-dependent builtin.
 - Wave 5 slice 6 (landed): the memory64/table64 half of the BigInt wave.
   `Memory`/`Table` descriptors now read the `address` member ("i32"/"i64",
   default i32) first and convert `initial`/`maximum`/grow/indices in the
-  address's index domain — EnforceRange u32 Numbers for i32, WebIDL-`bigint`
+  address's index domain, EnforceRange u32 Numbers for i32, WebIDL-`bigint`
   u64 for i64 (`crux::BigInt::to_u64`; an unparseable string is a TypeError,
   matching WebIDL rather than ToBigInt's SyntaxError). Memory64/table64
   cells carry the engine's `memory64`/`table64` flags (new `Store::memory_type`/
@@ -569,7 +569,7 @@ intrinsic identity like every other agent-dependent builtin.
   null-prototype, non-extensible object with non-writable,
   non-configurable, enumerable data properties (the JS-API module-exports
   shape). Global imports accept a `WebAssembly.Global` wrapper (the engine
-  type-checks it) or — for an immutable import only — a value of the exact
+  type-checks it) or, for an immutable import only, a value of the exact
   JS kind for the type (Number for i32/f32/f64, BigInt for i64), any other
   value being a LinkError (not a TypeError). Exported-function wrappers now
   chain to `%Function.prototype%` (they only use WebAssembly.Function's
@@ -579,7 +579,7 @@ intrinsic identity like every other agent-dependent builtin.
   `module/customSections.any.js`. Newly green: `instance/constructor.any.js`
   (29/29), `module/customSections.any.js` (9/9); `instance/exports`,
   `module/exports`, `module/imports` stay green. `constructor/instantiate.any.js`
-  (30/63 — the remaining fails are the instantiate result-object overload
+  (30/63, the remaining fails are the instantiate result-object overload
   checks and option handling). Corpus: 898 tests pass / 192 fail (was
   849/241), 32 fixture-files green of 53.
 - Wave 5 slice 8 (landed): the `instantiate` overloads and a GC liveness
@@ -629,14 +629,14 @@ intrinsic identity like every other agent-dependent builtin.
   green of 53.
 - Wave 5 slice 11 (landed): wasm-exception reification and wrapper-identity
   caching. An escaping tagged wasm exception now always reifies as a
-  `WebAssembly.Exception` — JS needs no `WebAssembly.Tag` wrapper for the
+  `WebAssembly.Exception`, JS needs no `WebAssembly.Tag` wrapper for the
   tag, so an internal tag that was neither imported nor exported surfaces
   as one too (previously RuntimeError). `exception/basic.tentative.any.js`
   is fully green (6/6). The JS-API wrapper memos now key on the underlying
   engine identity rather than the surface: exported-function wrappers key
   by the canonical engine function (`Store::func_key` resolves imported
   aliases to their defining instance), and memory/table/global wrappers get
-  a per-cell memo registered by the constructors too — so a module
+  a per-cell memo registered by the constructors too, so a module
   re-exporting a function/global/memory/table it imported surfaces the very
   same JS objects the importer passed in. `instance/constructor-caching`
   is green (1/1). Corpus: 994 tests pass / 96 fail (was 990/100), 40
@@ -651,7 +651,7 @@ intrinsic identity like every other agent-dependent builtin.
   observer ordering holds exactly). `constructor/multi-value.any.js` is
   green (3/3). The jsapi runner gained a fixture-source patch table for
   defects in the pinned spec snapshot (`grow-memory64.any.js` uses
-  `nulls(n)` but the commit that split it — `2929f4497` — never moved the
+  `nulls(n)` but the commit that split it, `2929f4497`, never moved the
   helper out of `grow.any.js`); that file is green (6/6). The `js-string`
   and `gc` JS-API suites are now listed in `wasm-exclusions.txt` as out
   of scope (no later cut owns them). Corpus: 997 tests pass / 4 fail (was
@@ -664,19 +664,19 @@ intrinsic identity like every other agent-dependent builtin.
   taxonomy. `WebAssembly.JSTag` (JS-API 4.13): a Tag-shaped object whose
   externref-payload cell materializes on first use; an arbitrary JS value
   thrown by an imported function is now wrapped in the JS tag (so a wasm
-  `try_table` catch for it — or `catch_all` — intercepts the value, whose
-  externref payload reaches wasm), and a JS-tag exception that escapes —
+  `try_table` catch for it, or `catch_all`, intercepts the value, whose
+  externref payload reaches wasm), and a JS-tag exception that escapes,
   whether wasm-originated (a `throw` of the tag) or a rethrow of an
-  injected one — surfaces as the original JS value, never a
+  injected one, surfaces as the original JS value, never a
   `WebAssembly.Exception`. Constructing an exception with the JSTag stays
   a TypeError, and the Tag constructor accepts an `externref` parameter.
   `exception/jsTag.tentative.any.js` is green (3/3). `table/get-set`
   (41/41): a funcref `Table.prototype.set` distinguishes an omitted value
   (clears to null) from an explicit `undefined` (TypeError, since it is
-  neither callable nor null). `memory/grow.any.js` (18/19 — its one
+  neither callable nor null). `memory/grow.any.js` (18/19, its one
   failing test is the shared-memory grow-detach rule) joins
   `wasm-exclusions.txt` as a not-planned proposal, like `js-string`/`gc`.
-  Corpus: the sweep is fully green — 44 fixture-files pass / 0 fail, 982
+  Corpus: the sweep is fully green, 44 fixture-files pass / 0 fail, 982
   tests pass / 0 fail (the excluded proposals and `limits.any.js` run on
   demand). Runtime suite: 728 tests pass.
 - Wave 5 slice 14 (landed): shared-memory JS-API semantics. A
@@ -685,7 +685,7 @@ intrinsic identity like every other agent-dependent builtin.
   SharedArrayBuffer over a per-cell byte block; `Memory.prototype.grow` on
   a shared memory keeps the previous buffer attached and pointing `buffer`
   at a fresh SAB over the same resized block, so old and new buffers keep
-  aliasing the memory (the JS-API shared grow-detach rule — only an
+  aliasing the memory (the JS-API shared grow-detach rule, only an
   unshared grow detaches). The wasm-side refresh path (a shared memory
   that grew inside a run) does the same instead of detaching. This also
   fixed a general spec gap: SharedArrayBuffer instances are now
@@ -695,20 +695,20 @@ intrinsic identity like every other agent-dependent builtin.
   set (`limits.any.js` stays excluded: embedder-limit conformance whose
   `maxMemories = 1` subtest conflicts with the landed multi-memory
   support). Runtime suite: 729 tests pass.
-- **Cut 10 exit — standalone WebAssembly smoke (landed 2026-09-06):** the
+- **Cut 10 exit, standalone WebAssembly smoke (landed 2026-09-06):** the
   `wasm_smoke` example's default self-test compiles, instantiates, and
   calls a wasm module from JS (`add(20, 22)` → 42) and reads a
   `WebAssembly.Memory`/`Global`; `cargo run -p slag --example wasm_smoke`
   asserts the output and exits non-zero on any mismatch. The browser demo
-  pages were intentionally left untouched — wasm correctness is gated by
+  pages were intentionally left untouched, wasm correctness is gated by
   the `wasmtest` CLI corpora, not by the dogfood UI.
 
-### Cut 11 — Compilation: wasm-to-native via Cranelift (complete 2026-09-09)
+### Cut 11, Compilation: wasm-to-native via Cranelift (complete 2026-09-09)
 
 Not a conformance cut: the interpreter is green against the full corpus and
-stays the correctness oracle. Cut 11 is a performance path — a wasm-to-
+stays the correctness oracle. Cut 11 is a performance path, a wasm-to-
 native compiler over the existing Cranelift dependency, reusing the Slag
-JIT's `Step`-lowering lessons — that must not change observable behavior.
+JIT's `Step`-lowering lessons, that must not change observable behavior.
 
 Scope:
 - A compile stage after `validate` succeeds: lower each function body to a
@@ -752,7 +752,7 @@ to the JS `Step` VM and is not reused; the wasm compiler lives in
 `crates/wasm` behind an optional `compile` feature pulling
 cranelift-codegen/frontend 0.134.3 (the pinned workspace version).
 
-- **Wave 0 — substrate + equivalence gate.** Compile pass after
+- **Wave 0, substrate + equivalence gate.** Compile pass after
   `validate`: per-module, per-defined-function compiled entries held by
   the `Instance`/`Store`. `wasmtest` gains a compile-forced mode that runs
   corpus actions through compiled bodies (supported modules) and
@@ -760,7 +760,7 @@ cranelift-codegen/frontend 0.134.3 (the pinned workspace version).
   bit-for-bit equality on every action where the path was compiled.
   Gate: equality holds on the supported subset and the interpreter's
   corpus totals are reproduced.
-- **Wave 1 — numeric leaf core.** Lower `const`/`Num`/`local.*`/`drop`/
+- **Wave 1, numeric leaf core.** Lower `const`/`Num`/`local.*`/`drop`/
   `select`/`block`/`loop`/`if`/`else`/`br`/`br_if`/`br_table`/`return`/
   `nop`/`unreachable`; no memory, globals, calls, refs. Leaf functions
   only (callee-free), so no host boundary yet. Value model: params and
@@ -770,18 +770,18 @@ cranelift-codegen/frontend 0.134.3 (the pinned workspace version).
   after ops via an explicit mask/or or a helper. Trap-raising ops
   (`unreachable`, integer div-by-zero/overflow) lower to trap-code
   returns, not Cranelift `trap`.
-- **Wave 2 — memory, globals, tables.** Loads/stores with OOB traps,
+- **Wave 2, memory, globals, tables.** Loads/stores with OOB traps,
   `memory.size`/`grow`, memory64/multi-memory, `global.*`, and the
   `table.*`/`call_indirect`/`ref.func` family. Compiled code gets a
   context pointer (store + instance + memory/table cells) and calls
   helpers for the operations that cannot inline safely.
-- **Wave 3 — calls and the host boundary.** Direct wasm-to-wasm calls
+- **Wave 3, calls and the host boundary.** Direct wasm-to-wasm calls
   stay native when both sides compile (trampolines marshal args/results
   where a compiled/interpreter boundary is crossed). Functions whose
   callee graph can reach a resumable external host import are not
   compiled (fall back to the interpreter's parked-run protocol), keeping
   one host-call mechanism.
-- **Wave 4 — traps, exceptions, refs, GC, SIMD.** `throw`/`try_table`
+- **Wave 4, traps, exceptions, refs, GC, SIMD.** `throw`/`try_table`
   unwinding across compiled frames (compiled frames return a trap/exn
   status to their caller; only frames enclosing a `catch` stay
   interpreter-side initially), then pool-id ref values, GC struct/array
@@ -816,15 +816,15 @@ module/function compile threshold, and whether compiled bodies keep the
   sole execution path.
 - **Threads/shared memory**: `atomic.*` ops wired into the existing
   workers/`Atomics` machinery once multi-agent memory is in place (shared
-  memories themselves already work — Cut 10).
+  memories themselves already work, Cut 10).
 - **Web API** (`WebAssembly.instantiateStreaming`/fetch integration,
-  `document/web-api`) — a host concern for the browser demo, not the core
+  `document/web-api`), a host concern for the browser demo, not the core
   engine.
 
 ## 8. Decisions (ratified)
 
 1. **The in-process `wast` crate is the conformance compiler** (wast-tools'
-   `wast`, dev/test-only — never a runtime dependency; ratifying the switch
+   `wast`, dev/test-only, never a runtime dependency; ratifying the switch
    from wabt 2026-09-05). wabt 1.0.41 cannot parse the pinned corpus's modern
    GC text (rec/sub type defs, packed `i8/i16` storage, `i31ref`, `array
    .init_elem`), and the `wast2json-rs` CLI was unmaintained/problematic;
@@ -866,14 +866,14 @@ module/function compile threshold, and whether compiled bodies keep the
    resizing the scratch per call is deferred until a real module needs it.
 7. **Resumable external-host imports stay out of the compiled subset**
    (2026-09-09): a body whose direct callee graph reaches a token'd host
-   import (a JS-API closure) is kept interpreted — `host_reachable_bodies`
-   — because a native run cannot park at an external-host boundary; the
+   import (a JS-API closure) is kept interpreted, `host_reachable_bodies`,
+   because a native run cannot park at an external-host boundary; the
    interpreter's parked-run/resume protocol is the one host-call mechanism.
    No corpus presence; the wasm crate's JS-API tests cover the boundary.
 
 ## 9. Status
 
-**2026-09-06 — baseline decoder-strictness gaps closed.** The last 18 red
+**2026-09-06: baseline decoder-strictness gaps closed.** The last 18 red
 assertions in the top-level `core/` corpus were `assert_malformed` cases the
 decoder accepted (`crates/wasm/src/binary.rs`): section payloads that
 outlive their declared item count (the `binary.wast` "section size
@@ -886,14 +886,14 @@ regressions across `exceptions`/`simd`/`multi-memory`/`memory64`/`gc`/
 `bulk-memory`. The remaining baseline pendings (600) are `quote text`
 converter limitations.
 
-**2026-09-06 — relaxed-SIMD wave lands.** The `relaxed-simd/` corpus (7
+**2026-09-06: relaxed-SIMD wave lands.** The `relaxed-simd/` corpus (7
 files) went from all-pending to **77 pass / 0 fail / 0 pending**: the
 relaxed `0xfd` ops (0x100-0x113) decode/validate/execute with one
 deterministic legal interpretation each (`simd::exec_relaxed`), and the
 runner accepts the `(either …)` result sets. `simd/` stays 25 479 / 0
 and the baseline stays 19 969 / 0.
 
-**2026-09-05 — Cut 4 + import follow-up landed, and Cut 5's reference/table
+**2026-09-05: Cut 4 + import follow-up landed, and Cut 5's reference/table
 runtime is in** (tables, reference values, `call_indirect`, `call_ref`, bulk
 memory). `imports.wast`/`start`/`exports`/`memory_grow` and now
 `func_ptrs`/`elem`/`table*`/`call_indirect`/`br_on_null`/`ref_is_null` and
@@ -902,7 +902,7 @@ Remaining: the typed-function-reference *validation* rules (see the Cut 5
 entry below), plus converter gaps (`instance.wast`, `ref_null.wast`,
 `table_init.wast` GC text).
 
-**2026-09-05 — Cut 2 (validation) green on its gate, plus the module-level
+**2026-09-05: Cut 2 (validation) green on its gate, plus the module-level
 validity files.**
 
 - `crates/wasm/src/valid.rs` implements the spec's algorithmic validator:
@@ -935,7 +935,7 @@ validity files.**
 
 Ran the whole convertible top-level corpus (91 of 97 files) through the
 runner: **3987 pass / 73 fail / 17683 pending** (pending = execution,
-linking, and JS-boundary commands — later cuts). Converters cannot parse
+linking, and JS-boundary commands, later cuts). Converters cannot parse
 6 files (`annotations` text-only, `instance` module-linking-style
 instantiation syntax, `ref_null`/`type-*` GC/`(rec)` text).
 
@@ -949,10 +949,10 @@ Systemic fixes landed during the survey:
 Failures by owner:
 - **Cut 1 backlog (decoder structural checks):** `binary.wast` (22),
   `binary-leb128.wast` (4), `align.wast` (4), `custom.wast` (1),
-  `address.wast` (1) — mostly `assert_malformed` fixtures our decoder
+  `address.wast` (1), mostly `assert_malformed` fixtures our decoder
   accepts.
 - **Memory/table limits validation:** `memory.wast` (13, limits ≤ 2¹⁶,
-  u64/LEB bounds), `table.wast` (9) — Cuts 4/5/8.
+  u64/LEB bounds), `table.wast` (9), Cuts 4/5/8.
 - **Typed function references / non-defaultable locals (Cut 5):**
   `br_on_non_null` (3 module bodies), `ref` (5), `ref_func` (2),
   `call_ref` (1), `local_init` (3), `func.wast` uninitialized-typed-local
@@ -961,11 +961,11 @@ Failures by owner:
 
 All Cut-3 gate families (`block`, `loop`, `if`, `br`, `br_if`, `br_table`,
 `switch`, `return`, `labels`, `nop`, `unreachable`, `local_get/set/tee`)
-validate their module bodies — the validator is ready for Cut 3.
+validate their module bodies, the validator is ready for Cut 3.
 
-### Cut 3 — execution core green (2026-09-05)
+### Cut 3: execution core green (2026-09-05)
 
-- `values.rs`: the value space plus the full ch. 4.3 numeric semantics —
+- `values.rs`: the value space plus the full ch. 4.3 numeric semantics,
   wrapping integer arithmetic, masked shifts/rotates, div/rem traps,
   truncating and saturating conversions, float ops with spec `min`/`max`
   signed-zero rules, `nearest` ties-to-even, and the canonical-quiet-NaN
@@ -990,7 +990,7 @@ validate their module bodies — the validator is ready for Cut 3.
   non-defaultable locals are Cut 5); `traps`' remaining memory cases and
   the `call_indirect`/memory "as-argument" assertions pend on Cuts 4-5.
 
-### Cut 4 — functions, calls, globals, memory, instantiation (2026-09-05)
+### Cut 4: functions, calls, globals, memory, instantiation (2026-09-05)
 
 - `exec.rs` grows linear memory: `Memory { bytes, max_pages }` with
   `memory.size`/`memory.grow` (wasm32 capped at 2¹⁶ pages even without a
@@ -1006,15 +1006,15 @@ validate their module bodies — the validator is ready for Cut 3.
     `type-funcref`).
   - Memory limits decode as **u64 LEB** (wabt encodes page counts beyond
     2³² for the `assert_invalid` fixtures) and validation bounds memory32
-    at 2¹⁶ pages — imported memory types too (`memory.wast` size limits).
+    at 2¹⁶ pages, imported memory types too (`memory.wast` size limits).
   - Memargs are the post-memory64 form: a single flags byte (low 6 bits
     alignment exponent, bit 6 = explicit memory index, >= 0x80 malformed)
     then a u64 LEB offset; validation rejects offsets > 2³²-1 as "offset
     out of range" and keeps alignment <= natural. `Load`/`Store` offsets
     are `u64` in the instruction model (`align.wast` malformed-flags and
     `offset=2⁶⁴-1` fixtures).
-- Runner: quote-based (`.wat`) modules are reported *pending* — the engine
-  has no text parser, so those cannot be judged — instead of the previous
+- Runner: quote-based (`.wat`) modules are reported *pending*, the engine
+  has no text parser, so those cannot be judged, instead of the previous
   accidental decode-misclassification.
 - Gate after the import follow-up below (0 fail unless noted; pending =
   later cuts):
@@ -1054,7 +1054,7 @@ follow-up, unlocking `imports.wast`, the import halves of `linking.wast`,
 
 - `exec.rs` now centers on a [`Store`]: instances share store pools for
   globals and memories, so imported (even mutable) globals and memories
-  *alias* the exporter's cells — `linking.wast`'s Mg/Ng shared-mutable-global
+  *alias* the exporter's cells, `linking.wast`'s Mg/Ng shared-mutable-global
   and Mm/Om/Pm shared-memory cases (including growth across instances and
   data-write persistence through failed instantiations) run exactly. Function
   imports flatten to a defined body in some instance or a no-op host
@@ -1080,7 +1080,7 @@ follow-up, unlocking `imports.wast`, the import halves of `linking.wast`,
   `instance.wast` cannot be converted: its `(module instance …)` syntax is
   beyond wabt 1.0.41 (module-linking, tracked in the exclusion manifest).
 
-### Cut 5 — runtime: tables, reference values, indirect/ref calls, bulk memory (2026-09-05)
+### Cut 5, runtime: tables, reference values, indirect/ref calls, bulk memory (2026-09-05)
 
 The reference/table runtime landed: `ref` values (`ref.null/func`, host
 `ref.extern` payloads, `ref.is_null`, `ref.as_non_null`, `br_on_null/…`),
@@ -1120,7 +1120,7 @@ is fully green. New rules:
   param/local (`validate_code` per-local check). `ref.wast` 13/0.
 - **`ref.func` requires a *declared* function**: the validator computes
   the module's declared set (elem items of any mode, global/table
-  initializers, exports — bodies and `start` declare nothing, matching
+  initializers, exports, bodies and `start` declare nothing, matching
   the reference interpreter's `Free.module_` over `funcs = []`, `start =
   None`) and rejects `ref.func` of an undeclared function inside a body.
   `ref_func.wast` 17/0.
@@ -1146,7 +1146,7 @@ is fully green. New rules:
 text (`any`/`anyref`, `array.new_default`) is beyond wabt 1.0.41 (and
 `instance.wast` needs `(module instance …)`).
 
-### Cut 6 — exceptions: tags, throw, try_table, throw_ref (2026-09-05)
+### Cut 6, exceptions: tags, throw, try_table, throw_ref (2026-09-05)
 
 The exception-handling runtime landed. Tags are store cells carrying the
 payload function type; `throw` pops a tag's parameters and raises an
@@ -1156,7 +1156,7 @@ matching `try_table` clause (or the invocation edge, where the runner's
 `run` delivers exceptions to catch clauses by scanning each frame's
 active labels (try scopes are labels over `TryTable` instructions),
 dropping inner labels and branching to the clause's target label with
-the payload — `catch`/`catch_ref` (payload + exception ref),
+the payload, `catch`/`catch_ref` (payload + exception ref),
 `catch_all`/`catch_all_ref`. `exnref` values (`RefValue::Exn`) reference
 exception cells in the store; `throw_ref` re-raises one.
 
@@ -1176,7 +1176,7 @@ fixtures moved out of pending; still 0 fail). No regressions in the Cut
 Two non-obvious points from the runtime: a catch clause's tag immediate
 is an *index into the try's instance tag space*, so matching resolves it
 to the store cell the thrown exception carries (a naive index-vs-cell
-compare only works while cells happen to equal indices — the first
+compare only works while cells happen to equal indices, the first
 fixture module masks it); and exceptions caught at the *function label*
 return the payload as the frame's results, which required the unwind
 path to place results exactly like a normal `finish_top`.
@@ -1197,7 +1197,7 @@ corpus fixture exercises the rejected shape. A later cleanup should
 propagate the unreachable flag outward at `End` instead of faking the
 ended frame's result types.
 
-### Cut 7a — SIMD wave 1: substrate + const/lane/memory/bitwise/compare (2026-09-05)
+### Cut 7a, SIMD wave 1: substrate + const/lane/memory/bitwise/compare (2026-09-05)
 
 The v128 substrate landed: `Value::V128(u128)` (little-endian lanes, lane
 0 low), the runner's v128 const parsing/compare (per-lane, with
@@ -1229,7 +1229,7 @@ decode as unsupported today (honest pending); a few `assert_invalid`
 modules whose assertions need decoding count as fails until the opcodes
 land.
 
-### Cut 7b — SIMD wave 2: arithmetic + conversions (2026-09-05)
+### Cut 7b, SIMD wave 2: arithmetic + conversions (2026-09-05)
 
 The rest of the non-relaxed 0xfd register surface landed in `simd.rs`:
 integer arithmetic (wrapping add/sub for all four shapes, i8x16/i16x8
@@ -1248,7 +1248,7 @@ demote/promote), and the load forms (extend 8×8/16×4/32×2, splat
 load-form reader.
 
 Green across the whole `simd/` corpus (59 files): **25 478 pass,
-0 fail, 512 pending** — the pending are the `assert_malformed`
+0 fail, 512 pending**, the pending are the `assert_malformed`
 `(module quote …)` fixtures plus the single `multi-memory` module,
 which the runner now counts as pending: a plain `module` action whose
 decode hits `Error::Unsupported` (a behind-a-cut feature such as
@@ -1264,7 +1264,7 @@ f64x2 185.
 
 Traps fixed this wave:
 - **`narrow` loop bounds**: the kernel iterated `16/out_size` times
-  over each input but read `in_size`-wide lanes — a 2-byte-input
+  over each input but read `in_size`-wide lanes, a 2-byte-input
   narrowing read past the register and shifted a `u128` by ≥128 bits
   (debug panic). It must iterate `16/in_size` input lanes per operand,
   writing output lanes `i` and `i + 16/in_size`.
@@ -1283,7 +1283,7 @@ Traps fixed this wave:
   splats, 4 for `load32_zero`, 8 for the widen/`I64Splat`/`I64Zero`
   forms.
 
-### Cut 7c — relaxed SIMD wave (2026-09-06)
+### Cut 7c: relaxed SIMD wave (2026-09-06)
 
 The `relaxed-simd/` corpus (7 files) is green: **77 pass, 0 fail, 0
 pending**. The relaxed `0xfd` subopcodes (0x100-0x113) decode (added to
@@ -1299,12 +1299,12 @@ regressions: `simd/` 25 479 pass / 0 fail, the baseline stays 19 969 / 0,
 runtime 729.
 
 Still failing (pre-existing, out of Cut 7 scope): the three
-GC-`rec`-bag modules — `type-canon` (2), `exceptions/tag` (3), and one
-module in `bulk-memory/table_init` (1) — decode the `rec`/subtype
+GC-`rec`-bag modules, `type-canon` (2), `exceptions/tag` (3), and one
+module in `bulk-memory/table_init` (1), decode the `rec`/subtype
 type-section encoding (0x4e/0x50) that the GC binary format (Cut 9)
 introduces; today the decoder reports those as malformed functypes.
 
-### Cut 8 — memory64, multi-memory, and table64 (2026-09-05)
+### Cut 8: memory64, multi-memory, and table64 (2026-09-05)
 
 The address model landed: every memory instruction now carries its
 memory index, memories and tables select an i32 or i64 address type,
@@ -1313,7 +1313,7 @@ and modules may declare any number of memories. The whole `memory64/`
 converter cannot handle.
 
 - **Decoder** (`binary.rs`): memory/table limits flags take bit 0 (max)
-  and bit 2 (`i64` address type — memory64/table64); any other flag bit
+  and bit 2 (`i64` address type, memory64/table64); any other flag bit
   is malformed, and the limit values are u64 LEBs. `memarg` returns the
   memory index (the flags byte's bit 6 makes an explicit `memidx`
   follow), threaded through every scalar/vector load/store, lane
@@ -1321,7 +1321,7 @@ converter cannot handle.
   src), and `memory.fill`. `read_leb` rejects a 10-byte u64 LEB whose
   final byte sets any bit past bit 63.
 - **Validation** (`valid.rs`): each memory instruction resolves its
-  index to the memory's address type — the address operand and
+  index to the memory's address type, the address operand and
   `memory.size/grow` are i64 for a memory64, and memarg offsets must fit
   the address type (memory32 offsets are capped at 2^32-1).
   `memory.copy`'s length is the smaller of the two memories' address
@@ -1344,27 +1344,27 @@ converter cannot handle.
 - **Runner**: `spectest` gained the spec's `table64` export (a funcref
   table64, 10..20) that `table64.wast` imports.
 
-Green: `multi-memory/` 41/41, and `memory64/` 24/25 — `table_init64`
+Green: `multi-memory/` 41/41, and `memory64/` 24/25, `table_init64`
 never converts because wabt 1.0.41 cannot parse the GC `array.new_default`
 element items in it (Cut 9, written exclusion). `simd_memory-multi`
 (which exercises multi-memory lane forms) flipped from pending to green.
 Combined simd + memory64 + multi-memory: 34 153 pass, 0 fail, 570
 pending (the pending are `assert_malformed` `(module quote …)`
 fixtures). Full sweep of the six convert-with-wabt suites (core root,
-exceptions, bulk-memory, simd, memory64, multi-memory — 234 files):
+exceptions, bulk-memory, simd, memory64, multi-memory, 234 files):
 224 run, 61 309 pass, 20 fail, 1 168 pending; the 20 fails are
 pre-existing decode gaps outside this cut (`binary.wast` 15 structural
 malformed checks, `binary-leb128.wast` 4 `i64.const` canonicality,
 `custom.wast` 1 data-count decode check). Ten files never convert under
 wabt (annotations/instance/ref_null/`type-*`/tag/try_table/table_init/
-table_init64 — GC rec bags, GC elem items, or new module-linking
+table_init64, GC rec bags, GC elem items, or new module-linking
 syntax); each is listed in the runner's exclusion manifest.
 
 #### Cut 8 taxonomy and CI gate
 
 `wasmtest run` now accepts several paths and walks directories
 recursively for `.wast`/`.json`, converting on the fly and exiting
-nonzero when any suite reports a fail — the CI-style gate. Files the
+nonzero when any suite reports a fail, the CI-style gate. Files the
 pinned converter cannot parse live in `crates/wasmtest/wasm-exclusions.txt`
 (`path :: reason`, overridable via `$WASM_EXCLUSIONS`); they print as
 `skip` and are not failures. The gate for this cut:
@@ -1398,7 +1398,7 @@ wasmtest run waspec/test/core/multi-memory waspec/test/core/memory64
 | memory64 | table_fill64 | 80 / 0 / 0 |
 | memory64 | table_get64 | 11 / 0 / 0 |
 | memory64 | table_grow64 | 22 / 0 / 0 |
-| memory64 | table_init64 | skip — GC `arrayref` element items (Cut 9) |
+| memory64 | table_init64 | skip, GC `arrayref` element items (Cut 9) |
 | memory64 | table_set64 | 19 / 0 / 0 |
 | memory64 | table_size64 | 37 / 0 / 0 |
 | multi-memory | address0 | 92 / 0 / 0 |
@@ -1449,7 +1449,7 @@ documented `table_init64` converter exclusion. The exit code is nonzero
 the moment any suite reports a fail, so the command doubles as the cut's
 CI check.
 
-### Cut 9 — GC: converter switch + engine (in progress, 2026-09-05)
+### Cut 9, GC: converter switch + engine (in progress, 2026-09-05)
 
 The converter switch (ratified above) landed first and is complete: the
 in-process `wast`/`wat` crates (default-features off, `wast` with
@@ -1460,7 +1460,7 @@ still forces wabt; the converter is exercised as the default in every
 suite run. The `wast` tokenizer's NaN-bit resolution matches wabt's, so
 converted float/v128 values keep bit parity.
 
-#### Cut 9 Wave 1 — GC type model + decoder (landed)
+#### Cut 9 Wave 1: GC type model + decoder (landed)
 
 - `types.rs`: full heap-type hierarchy (`any`/`eq`/`i31`/`struct`/`array`
   and bottoms `none`/`nofunc`/`noextern`/`noexn`), storage types (packed
@@ -1482,7 +1482,7 @@ converted float/v128 values keep bit parity.
   engine (only genuine GC typing gaps remain as failures). No regression
   elsewhere: the non-GC suites keep their prior totals.
 
-#### Cut 9 Wave 2 — GC instruction decode + validation typing (landed)
+#### Cut 9 Wave 2: GC instruction decode + validation typing (landed)
 
 - `instr.rs`: the full GC aggregate/cast instruction surface (`0xfb`
   prefix): `struct.*`, `array.*` (incl. `new_fixed`/`new_data`/`new_elem`,
@@ -1509,7 +1509,7 @@ converted float/v128 values keep bit parity.
 Remaining Cut 9 engine wave: a GC object runtime in the store
 (struct/array/i31 objects, extern wrappers), the executor for the
 `0xfb` instructions (incl. data/elem segment access and cast
-semantics), and the `gc/` file sweep — against `gc/` (17).
+semantics), and the `gc/` file sweep, against `gc/` (17).
 
 ### Quote-text converter + reserved-opcode decode (2026-09-06)
 
@@ -1560,7 +1560,7 @@ one runner gap:
 - `valid.rs`: hierarchy bottoms now subsume every concrete type of
   their hierarchy (`nofunc` under any defined function type, `none`
   under any defined struct/array type, spec 3.3.3), and `none` is
-  below `i31` — it is the bottom of the whole aggregate hierarchy
+  below `i31`, it is the bottom of the whole aggregate hierarchy
   (spec: "common subtype of all forms of aggregate types"). The unit
   test that asserted `none` and `i31` are siblings was spec-wrong and
   is corrected.
@@ -1584,7 +1584,7 @@ rec groups have equal length and are structurally identical
 member-for-member, with in-group references mapping by offset and
 references to earlier (closed) groups comparing the referenced types
 (`crates/wasm/src/module.rs`). This makes two *separate* but isomorphic
-rec groups — including cross-module ones at link time — denote the same
+rec groups, including cross-module ones at link time, denote the same
 type, while non-isomorphic groups (same shape, different member count
 or alignment) stay distinct.
 
@@ -1612,7 +1612,7 @@ JS-API corpus is unchanged at 1001 / 0.
 
 The in-scope conformance surface is done: the core suite (baseline +
 all proposal dirs) and the JS-API corpus report zero failures and zero
-pendings, and no engine-gap exclusions remain — the exclusions file now
+pendings, and no engine-gap exclusions remain, the exclusions file now
 holds only harness tooling, out-of-scope proposals, and the one
 `wast`-grammar limit. Housekeeping: the stale `exec.rs` module header
 (GC no longer unimplemented) and the `wasm-exclusions.txt` header were
@@ -1629,7 +1629,7 @@ and calls a wasm module from JS (`add(20, 22)` → 42) and reads a
 `WebAssembly.Memory`/`Global`; `cargo run -p slag --example wasm_smoke`
 asserts the output and exits non-zero on any mismatch. The browser demo
 pages (`browser/demo.html`, `docs/index.html`) and `wasm_binding` were
-left untouched — wasm correctness is already verified by the `wasmtest`
+left untouched, wasm correctness is already verified by the `wasmtest`
 CLI corpora, and the dogfood UI is for the JS engine, not a wasm
 showcase.
 
@@ -1660,13 +1660,13 @@ off by default):
   `drop`, `select`, `unreachable`, `return`, and the i32/i64 `Num`
   arithmetic/comparison/shift/popcnt ops plus `i64.wrap_i32`. Traps
   (`unreachable`, integer div-by-zero, `MIN/-1` overflow) return codes
-  through guarded branches — no Cranelift `trap`. `MIN % -1` is 0 per
+  through guarded branches, no Cranelift `trap`. `MIN % -1` is 0 per
   spec (the divisor is masked to 1 for `srem`). Floats, structured
   control, memory, globals, tables, calls, refs, SIMD, and GC are not
   lowered yet (whole body bails to the interpreter).
 - `exec.rs`: `Instance` carries `compiled: Vec<Option<CompiledFunc>>`
   (parallel to `Module::bodies`, populated at instantiation), and
-  `start_owned` runs the compiled entry when present — synchronous and
+  `start_owned` runs the compiled entry when present, synchronous and
   never resumable in this subset, so it returns `Finished` directly.
 - Gate so far: six unit tests drive modules through the store and check
   results and trap kinds (add, select, div traps, rem `MIN%-1`, and a
@@ -1682,7 +1682,7 @@ interpreter outcomes bit-for-bit, values and trap kinds, over the same
 store path). Coverage now sweeps every lowered op over edge input sets:
 all i32/i64 binary arithmetic/comparison/shift ops (shifts and rotations
 mask their count explicitly, never trusting the backend), `popcnt`,
-`eqz`, `i64.wrap_i32`, `select`, and locals/tee — 10 compile tests, 46
+`eqz`, `i64.wrap_i32`, `select`, and locals/tee, 10 compile tests, 46
 total
 with the feature, clippy clean in both configurations. Remaining Wave 1
 work: structured control flow (`block`/`loop`/`if`/`br*`), then floats
@@ -1701,14 +1701,14 @@ structure depth, and continuations with live branch predecessors are
 filled on close. Locals/operand stacks stay SSA-correct across joins via
 block params. Equivalence tests now cover blocks with values, `br_if`
 exits, if/else results, a back-edge loop, a loop that falls out of its
-`end`, and a nested if/else-in-loop (Collatz) — 16 compile tests, 52
+`end`, and a nested if/else-in-loop (Collatz), 16 compile tests, 52
 total with the feature, clippy clean in both configurations. Not yet
 lowered: `br_table`, parameterized/multi-value block types, and floats
 (next, with exact canonical-quiet-NaN semantics).
 
 Floats landed: `clif_type` now covers `f32`/`f64`, so float
 params/results/locals ride the same SSA value model (arguments still
-arrive as u64 slots — low 32 bits for f32, full 64 for f64 — bitcast to
+arrive as u64 slots, low 32 bits for f32, full 64 for f64, bitcast to
 IEEE Cranelift values). `lower_float` handles the f32/f64 unops, binops,
 comparisons, and int→float conversions; arithmetic/rounding/sqrt results
 are NaN-canonicalized to the engine's QNAN32/QNAN64 (`fcmp != self`
@@ -1721,9 +1721,9 @@ The equivalence harness is now honest: `assert_equiv` first asserts the
 module actually compiled (`Engine::compile` degrades to the interpreter
 silently on any lowering error), so a test can no longer compare the
 interpreter against itself. That gate exposed three previously vacuous
-modules — two declared `i64`-producing ops (arithmetic, `popcnt`) with
+modules, two declared `i64`-producing ops (arithmetic, `popcnt`) with
 an `i32` result type and one `select`/locals module whose stack
-underflowed — now corrected to valid wasm. New coverage sweeps f32/f64
+underflowed, now corrected to valid wasm. New coverage sweeps f32/f64
 binary ops, comparisons, unary ops (incl. rounding/sqrt), and int→float
 conversions over signed-zero, subnormal, ∞, and quiet/signaling-NaN
 inputs, plus float values flowing through block and if/else results and
@@ -1733,9 +1733,9 @@ clippy clean in both configurations.
 `br_table` and the remaining bit-counting ops landed, closing out the
 Wave 1 numeric/control list: `do_br_table` pops the `i32` index and
 emits a chain of `index == k` guards, each branching to its label's
-target with the shared payload — block/if labels jump to the
+target with the shared payload, block/if labels jump to the
 continuation carrying the construct's result, loop labels jump to the
-(until-then-unsealed) header — ending in an unconditional jump to the
+(until-then-unsealed) header, ending in an unconditional jump to the
 default. The interpreter's negative-index rule (any index < 0 selects
 the default) falls out of the signed equality guards. `I32Clz`/`I32Ctz`
 and `I64Clz`/`I64Ctz` lower to Cranelift's `clz`/`ctz` (defined at
@@ -1755,7 +1755,7 @@ numeric/control leaf list. Block types now resolve through the module's
 type section (`block_sig`, so `BlockType::Type(i)` carries any numeric
 parameter/result list), and constructs model the wasm discipline
 exactly: a block type `[t1*] -> [t2*]` enters with `t1*` already on the
-operand stack — the label base (`height`) moves below them and the body
+operand stack, the label base (`height`) moves below them and the body
 starts from them; a `loop` jumps to a header whose block parameters ARE
 the first iteration's `t1*`, and `br` to its label carries `t1*` back
 (its label arity is the parameter count); block/if labels keep their
@@ -1767,15 +1767,15 @@ loop labels and multi-value block results lowers too. Equivalence
 coverage adds a parameterized block (body adds 2 to its input), a
 multi-result `(i32 i32)` block, an `if` whose parameter feeds both
 branches, single- and two-parameter loops, and a loop whose `br_if`
-back-edge carries its parameter until the exit condition — all matched
+back-edge carries its parameter until the exit condition, all matched
 bit-for-bit against the interpreter. 24 compile tests, 60 total with
 the feature, clippy clean in both configurations. Wave 1's leaf list is
 done; the next step is the Wave 0 gate: the corpus-wide compile-forced
 equivalence harness in `wasmtest`.
 
 Wave 0's equivalence gate landed in `wasmtest`: `wasmtest equiv
-<wast|json|dir>` runs each suite twice — once through compiled bodies,
-once with the interpreter forced (`Store::set_compile(false)`) — and
+<wast|json|dir>` runs each suite twice, once through compiled bodies,
+once with the interpreter forced (`Store::set_compile(false)`), and
 fails on the first command whose verdict (or command type) diverges.
 `run_json` was parameterized into `run_json_mode(path, compiled,
 verbose)`, returning a per-command (command type, verdict) log for the
@@ -1798,7 +1798,7 @@ Wave 2's first slice landed: numeric loads/stores and `memory.size`
 over a module's single 32-bit memory (index 0). The compiled-entry ABI
 grew a memory data pointer + byte length pair (`fn(args, nargs, mem,
 mem_len, out, nout) -> i32`), fetched per call from the instance's
-memory cell — no store access from generated code, and safe because the
+memory cell, no store access from generated code, and safe because the
 leaf subset never grows memory mid-call (growth stays interpreted).
 `mem_ea` bounds-checks `addr + offset + width` against the length and
 traps (`TRAP_MEMORY_OOB` → `OutOfBoundsMemoryAccess`) inline, then
@@ -1808,7 +1808,7 @@ byte/half stores), float loads/stores as raw bits, and `memory.size` as
 pages. Functions touching other memory indices, memory64, or growth
 still fall back to the interpreter. The equivalence harness caught a
 real bug immediately: `mem_ea` returned `base + addr` and dropped the
-static offset, so offset loads read the wrong bytes — the corpus
+static offset, so offset loads read the wrong bytes, the corpus
 divergence (`address.wast`) localized it to the missing offset, and the
 unit test now uses offset-vs-offset-0 cross-checks that cannot hide a
 dropped offset. Unit coverage sweeps every store/load width over the
@@ -1826,7 +1826,7 @@ globals lower through a caller-owned `gvals` buffer (one u64 slot per
 used global, entry ABI param 4, slot order = sorted used indices). The
 compiled body loads and stores slots in place, so a write is visible to
 the store even when a later instruction traps (the caller copies the
-buffer back to the store's cells after the call, success or trap) —
+buffer back to the store's cells after the call, success or trap),
 wasm traps do not roll back prior writes. Only module-defined globals
 compile: an imported global's cell can alias another import (the same
 provider global imported twice), which the buffer model cannot express;
@@ -1856,7 +1856,7 @@ and memory64 addressing stays interpreter-side. Unit coverage adds a
 module with a 1-page and a 2-page memory storing/loading distinct
 values into each and summing the `memory.size`s, so a descriptor mixup
 diverges. `wasmtest equiv` is green over the whole `multi-memory` suite
-(41 suites) and `memory64` (25 suites, 0 diverged there as expected —
+(41 suites) and `memory64` (25 suites, 0 diverged there as expected,
 memory64 bodies stay interpreted). 27 compile tests, 63 total with the
 feature, clippy clean in both configurations. Wave 2 remaining:
 `memory.grow` (needs a store-side realloc helper + descriptor
@@ -1875,7 +1875,7 @@ store/instance/memory-index/delta/desc-slot; the helper resolves the
 module memory index to the instance's store cell, grows the backing
 `Vec` through `Store::grow_memory` (enforcing the cell's declared max
 and the memory32 2^16 cap), and on success rewrites the descriptor
-entry's data pointer + byte length in place — a `Vec` data pointer is
+entry's data pointer + byte length in place, a `Vec` data pointer is
 unstable across a resize, and every later `mem_ea`/`memory.size` reloads
 the descriptor, so the growth is visible to subsequent compiled
 accesses. The helper returns the old page count or all-ones (-1); the
@@ -1885,7 +1885,7 @@ exactly (32-bit growth caps far below 2^32). `lowerable` now admits
 too); memory64 stays interpreter-side. Unit coverage grows both an
 unbounded memory (pre-grow store, grow to 2 pages, stores on the new
 page and its last aligned slot, cross-call reads back all three values
-via `run_seq` — a stale descriptor after the `Vec` realloc would write
+via `run_seq`, a stale descriptor after the `Vec` realloc would write
 through freed memory) and a `(1 2)`-bounded memory (grow-to-max returns
 old pages × new size, the next grow fails with -1, and a page-boundary
 store/load after the successful grow lands). `wasmtest equiv` is green
@@ -1901,7 +1901,7 @@ per its memory index, so one function can touch a memory32 and a
 memory64 side by side. `mem_ea` keeps the memory's index type: a memory32
 address is zero-extended from the i32 operand; a memory64 address is the
 i64 operand as-is, with the offset/width adds wrapping mod 2^64 and each
-carry trapping as OOB — the interpreter's `checked_add` semantics
+carry trapping as OOB, the interpreter's `checked_add` semantics
 (an access whose end passes 2^64 is out of bounds whatever the wrapped
 bits look like). `memory.size`/`memory.grow` return the memory's index
 type too (i64 for a memory64: i64 delta in, old-pages-or-i64-(-1) out),
@@ -1909,13 +1909,13 @@ and growth caps follow the cell's address type through the store helper.
 The equivalence gate immediately caught a real bug in this slice: the
 refactored `mem_ea` returned the access's *end* (`base + ea + width`)
 as the pointer instead of its start, so every store/load landed one
-access-width past its address — symmetric store-then-load unit tests
+access-width past its address, symmetric store-then-load unit tests
 masked it (both shifted together), while the `memory64` corpus exposed
 it (wrong values, out-of-bounds reads). Unit coverage adds a memory64
 store/load/size module over in-bounds and huge addresses (including
 i64::MAX, i64::MIN, and −8 whose 8-byte width carries past 2^64), a
 bounded memory64 grow sequence, and a mixed memory32+memory64 module.
-`wasmtest equiv` is green over `memory64/` (25 suites, 0 diverged — now
+`wasmtest equiv` is green over `memory64/` (25 suites, 0 diverged, now
 exercising compiled memory64 bodies, not interpreter-vs-interpreter) and
 the memory + `multi-memory` regressions. 32 compile tests, 68 total with
 the feature, clippy clean in both configurations. Wave 2 remaining: the
@@ -1923,7 +1923,7 @@ table/`call_indirect`/`ref.func` family (needs the compiled value model
 extended to refs and native↔interpreter function re-entry).
 
 Compiled `call`/`call_indirect`/`return_call`/`return_call_indirect`
-landed — the native↔interpreter function-boundary re-entry that
+landed, the native↔interpreter function-boundary re-entry that
 unlocks non-leaf bodies. The entry ABI grew to `(args, nargs, mems,
 ncount, gvals, out, nout, store, instance, grow, call, scratch)`: params
 10-11 carry the call helper's address and a caller-owned u64 scratch
@@ -1936,7 +1936,7 @@ target exactly as the interpreter would (direct: the instance's func
 index space; indirect: table element with bounds/null checks and the
 `IndirectCallTypeMismatch` type check), decodes args by the declared
 type, and runs the callee to completion *through the interpreter* with
-`compile_off` forced — identical semantics, a bounded native stack (no
+`compile_off` forced, identical semantics, a bounded native stack (no
 compiled-to-compiled native recursion), and the interpreter's own
 frame-depth/host-boundary behavior. Non-trap errors park the exact
 `ExecFail` on the store and return a `TRAP_PENDING_ERROR` sentinel that
@@ -1958,25 +1958,25 @@ indices. `wasmtest equiv` is green over `call.wast`, `call_indirect.wast`,
 numeric/control and memory regressions. 34 compile tests, 70 total with
 the feature, clippy clean in both configurations. Wave 2 remaining: the
 table/`ref.func` value family whose refs must flow *through* compiled
-code (`table.get/set`, `call_ref`, `ref.func` results) — that needs an
+code (`table.get/set`, `call_ref`, `ref.func` results), that needs an
 opaque ref representation on the compiled operand stack.
 
-Function references flow through compiled code — the last Wave 2 piece.
+Function references flow through compiled code, the last Wave 2 piece.
 The compiled value model now carries a (nullable or not) function
 reference as an opaque u64 token (`values`: 0 is the null reference; a
 function reference is tagged at bit 63 and packs its address's instance
 and full function-index-space index), so `ref.func`, `ref.null func`,
 `ref.is_null`, `table.get`/`table.set` over 32-bit funcref tables, and
 `call_ref`/`return_call_ref` all lower. `clif_type` maps a funcref to
-`I64` (a new `num_type` keeps the genuinely numeric gates — globals, the
-call scratch — from accidentally accepting refs), params/locals/blocks
+`I64` (a new `num_type` keeps the genuinely numeric gates, globals, the
+call scratch, from accidentally accepting refs), params/locals/blocks
 carry the tokens, and the store boundary marshals them (`run_compiled`
 and the call helper encode/decode tokens; a ref param/result crosses to
 an interpreted callee or back as its token). The runtime call helper
 gained three modes: `call_ref` on a function token (null →
 `NullFunctionReference`), and `table.get`/`table.set` with bounds
 checking (the element is read/written as its token). The token model
-needs no store-side registry — tokens encode the address directly, so a
+needs no store-side registry, tokens encode the address directly, so a
 compiled loop calling `ref.func` never allocates. Unit coverage drives a
 funcref-parameter `apply` through `call_ref` (including a null
 reference trap) and a module that `table.set`s `ref.func $add`, reads it
@@ -1996,13 +1996,13 @@ module-defined function **natively** (`run_native_callee`), instead of
 running every callee through an interpreter subtree. Each native level
 allocates fresh caller-owned buffers for the callee's own memories
 (descriptors from its instance's cells), its used globals (a `gvals`
-buffer seeded from — and flushed back to — its cells, surviving traps),
+buffer seeded from, and flushed back to, its cells, surviving traps),
 and its internal-call scratch; arguments already spilled in the caller's
 scratch double as the result buffer (`CompiledFunc::call_raw` invokes the
 entry with raw pointers). After the callee returns, its global writes are
 flushed to the store and the caller's memory descriptors are refreshed in
 case a shared memory grew. A `native_depth` budget (`NATIVE_CALL_DEPTH`,
-64 — sized for a 1 MB host main-thread stack even in debug builds)
+64, sized for a 1 MB host main-thread stack even in debug builds)
 bounds the native frames: past it the callee runs through the
 interpreter, whose own frame budget then applies, so runaway recursion
 still ends in a clean `CallStackExhausted` instead of a native stack
@@ -2020,13 +2020,13 @@ rule), so the host-boundary arm is already satisfied by exclusion; a
 future perf wave can tune `NATIVE_CALL_DEPTH` (or make it release-only).
 
 Whole-corpus equivalence gate: `wasmtest equiv waspec/test/core` now
-compares **254 suites — the full core corpus (top level plus
+compares **254 suites, the full core corpus (top level plus
 `bulk-memory`, `exceptions`, `gc`, `memory64`, `multi-memory`,
-`relaxed-simd`, and `simd`)** — through the compiled path against the
+`relaxed-simd`, and `simd`)**, through the compiled path against the
 interpreter-forced oracle with **0 diverged**. Bodies the compiler cannot
 lower yet run interpreted on both sides and cannot diverge, so this
 proves every lowered instruction reproduces the interpreter exactly
-across the entire corpus at once — no residual divergence in any
+across the entire corpus at once, no residual divergence in any
 combination of the numeric/control/memory/global/call/ref subset the
 waves have enabled.
 
@@ -2050,9 +2050,9 @@ corpus stays at 254 suites / 0 diverged. 40 compile tests, 76 total with
 the feature, clippy clean in both configurations.
 
 Externrefs ride the compiled token model (the extern/GC half of Wave
-4's reference types). The token space gains an extern region — bit 62
+4's reference types). The token space gains an extern region, bit 62
 marks an external reference, bits 60-61 select its payload kind
-(host/i31/struct/array), and 60 bits carry the payload — so `RefValue::
+(host/i31/struct/array), and 60 bits carry the payload, so `RefValue::
 Extern` encodes into the same zero-allocation u64 token as function
 references (no store-side registry needed: tokens encode the value
 directly, so compiled externrefs never allocate). The value model's
@@ -2104,7 +2104,7 @@ type (`table.grow` returns the old length, or all-ones read at the
 table's width for a failed grow). Both address models lower: a table64's
 dst/len operands and `table.size`/`grow` results are i64, `table.copy`'s
 length is i64 only when both tables are table64, and `table.init`'s
-element offset and length stay i32 — exactly the interpreter's width
+element offset and length stay i32, exactly the interpreter's width
 model. The gate admits any table whose element type the compiled value
 model carries (funcref/externref/typed function ref) at either width.
 Unit coverage drives a passive element segment through init, overlapping
@@ -2157,7 +2157,7 @@ Exception references complete the carried token model: `exnref` (bit 61
 with bits 60/62/63 clear) packs the exception's store-pool id, so
 `ref.null exn`/`ref.is_null` work over the token, an `exnref` parameter
 crosses the compiled boundary and back, and a compiled `throw_ref`
-(mode 16) re-raises a non-null token's exception — the id is masked out
+(mode 16) re-raises a non-null token's exception, the id is masked out
 of the token and passed to a helper that parks `ExecFail::Exception`
 exactly like a fresh `throw`, while a null token traps
 `NullExceptionReference` inline. This is the last reference kind the
@@ -2177,13 +2177,13 @@ runtime GC helper (modes 30-38) that mirrors the interpreter exactly:
 `struct.new`/`struct.new_default`, `struct.get`/`_s`/`_u`/`struct.set`
 (with packed i8/i16 cells wrapped on write and sign-/zero-extended on
 read), `array.new`/`array.new_default`, `array.get`/`_s`/`_u`,
-`array.set`, and `array.len` — a null struct/array operand traps its
+`array.set`, and `array.len`, a null struct/array operand traps its
 null-reference trap, an index past the end traps the array out-of-
 bounds access, and oversized array allocations report the same trap the
 interpreter's allocation guard does. The carrier gate now admits
 type-indexed heaps that resolve to struct/array types plus the abstract
-`any`/`eq`/`struct`/`array` heaps (the values they can hold — i31 or
-pool-id objects — are all carried), so `(ref $t)` object refs flow
+`any`/`eq`/`struct`/`array` heaps (the values they can hold, i31 or
+pool-id objects, are all carried), so `(ref $t)` object refs flow
 through params/locals/results/block types and `ref.eq` compares object
 identity by token. The non-object GC surface (`array.new_fixed/data/
 elem`, `array.fill/copy/init*`, `ref.test`/`ref.cast`/`br_on_cast*`,
@@ -2202,7 +2202,7 @@ lets `extern.convert_any`/`any.convert_extern` lower for every carried
 i31/struct/array/host (or a null) into its `extern` token and unbox an
 `extern` back to the internal token, exactly like the interpreter's
 `wrap`/`unwrap_extern`. This closes the last gap the reference model
-had for `any`-typed values crossing compiled code — a host external
+had for `any`-typed values crossing compiled code, a host external
 unwraps to a host `any` that can be boxed again, be compared, or ride a
 param/local/result. Unit coverage drives i31 and struct box/unbox
 round-trips, a null box, and host-value box/unbox through both paths.
@@ -2234,7 +2234,7 @@ before the `br_on_cast*` labels: the reference token, a nullable flag,
 and the target heap (a positive type index or an abstract heap's
 negative code) produce whether the value matches, landing a 0/1 in the
 caller-owned scratch. The helper mirrors the interpreter's
-`Engine::ref_matches` exactly — a null matches only a nullable target;
+`Engine::ref_matches` exactly, a null matches only a nullable target;
 i31/host/extern/exn values and function references that do not resolve
 to an owner-module type index match by their abstract heap; struct/
 array objects and resolved function references match by subtype
@@ -2258,19 +2258,19 @@ token, like `br_on_null`) and the v128 SIMD/relaxed-SIMD wave.
 `br_on_cast`/`br_on_cast_fail` landed, closing out the typed-branch GC
 surface. Each pops the reference, runs the same mode-60 match check
 against the target reftype, and pushes it back; then it branches to the
-label when the check selects that path — `br_on_cast` on a match,
-`br_on_cast_fail` on a miss — carrying the label payload with the
+label when the check selects that path, `br_on_cast` on a match,
+`br_on_cast_fail` on a miss, carrying the label payload with the
 (unchanged) reference token on top, exactly like the interpreter (the
 branch carries the value the label's top type accepts; the fall-through
 continues with the reference still on the stack). The match-check
 helper is shared with `ref.test`/`ref.cast` (the pop was refactored out
 of `emit_cast_check`), and the lowering admits both instructions
-unconditionally — a body whose `br_on_cast*` targets the function label
+unconditionally, a body whose `br_on_cast*` targets the function label
 (no control frame exists for it in the lowering) fails to lower and
 stays interpreted. Unit coverage drives a `br_on_cast` exiting a block
 with a matching struct, a `br_on_cast_fail` exiting with a null (which
 misses the non-null target), and a nullable-param function falling
-through `br_on_cast` for null and i31 arguments — the fall-through
+through `br_on_cast` for null and i31 arguments, the fall-through
 regions add a conflicting block result so an inverted branch condition
 would diverge. `wasmtest equiv` is green over the whole core corpus:
 254 suites, 0 diverged. 56 compile tests, 92 total with the feature,
@@ -2278,7 +2278,7 @@ clippy clean in both configurations. Remaining Cut 11 surface: the
 v128 SIMD/relaxed-SIMD wave (the interpreter's `simd`/`relaxed-simd`
 corpus suites are still interpreter-on-both-sides).
 
-### Cut 11 Wave 5: v128 substrate — carrier, boundary, register ops (2026-09-07)
+### Cut 11 Wave 5: v128 substrate, carrier, boundary, register ops (2026-09-07)
 
 The SIMD wave starts with the compiled v128 value model and its
 function boundary. A v128 rides the compiled operand stack, locals,
@@ -2289,7 +2289,7 @@ args/out buffers carry each v128 param/result as **two** u64 words
 compile and cross the boundary: `lower()` loads v128 params at their
 word offsets, `emit_return` stores v128 results the same way, and
 `run_compiled` marshals `Value::V128` in/out. The v128 *call* machinery
-is untouched — spilling a v128 call argument through `slot_from` still
+is untouched, spilling a v128 call argument through `slot_from` still
 errors, so bodies that call v128-typed functions stay interpreted (the
 corpus SIMD functions are leaves).
 
@@ -2298,8 +2298,8 @@ that reproduces the interpreter's `simd_exec` dispatch exactly, over
 operands the body spills to the caller-owned scratch in interpreter pop
 order (a v128 is two words, a scalar one word): `v128.const` builds the
 `I128` from its halves, and `Vec`/`VecLane` cover every `simd::sig`
-family — unop/not/binop/ternop (bitselect)/shift/splat/extract/replace
-lane/test/bitmask — plus the relaxed-SIMD opcodes (executed through
+family, unop/not/binop/ternop (bitselect)/shift/splat/extract/replace
+lane/test/bitmask, plus the relaxed-SIMD opcodes (executed through
 `simd::exec_relaxed`, before the category match, exactly like the
 interpreter). Scalar operands ride scratch in their u64 slot form and
 the helper rebuilds the interpreter value from the lane kind;
@@ -2335,7 +2335,7 @@ index, so the `simd` load/address/lane/shuffle corpus suites' leaf
 functions now run compiled. Unit coverage stores and re-loads v128
 patterns through the compiled boundary, sign-extends a `load8x8_s`
 read, merges a `load8_lane`, overwrites bytes with a `store32_lane`,
-and interleaves two vectors with a shuffle — each asserted bit-for-bit
+and interleaves two vectors with a shuffle, each asserted bit-for-bit
 against the interpreter over shared memory. `wasmtest equiv` is green
 over the whole core corpus: 254 suites, 0 diverged. 58 compile tests,
 94 total with the feature, clippy clean in both configurations.
@@ -2345,7 +2345,7 @@ interpreted.
 
 v128-typed calls landed, removing the last SIMD coverage gap: a
 compiled body can now call functions whose signatures carry v128. The
-call scratch is word-indexed everywhere a signature is involved —
+call scratch is word-indexed everywhere a signature is involved,
 `lower_call` spills each param at its cumulative word offset (a v128
 occupies two u64 words, so numeric params after one shift accordingly)
 and reads results back at their word offsets (an `I128` load for a
@@ -2358,7 +2358,7 @@ sides). `callable_type` now sizes its scratch guard in words, so a
 v128-heavy signature cannot silently overflow the buffer. Unit coverage
 calls a numeric identity leaf, an `i32x4.neg` leaf, a neg leaf from a
 compiled caller, an add leaf with a const argument, and a negate-then-
-extract chain — the caller/callee pairs exercise the native re-entry
+extract chain, the caller/callee pairs exercise the native re-entry
 path in the compiled store and the interpreted path in the oracle
 store, agreeing bit-for-bit. `wasmtest equiv` is green over the whole
 core corpus: 254 suites, 0 diverged. 59 compile tests, 95 total with
@@ -2367,7 +2367,7 @@ the feature, clippy clean in both configurations.
 v128 globals landed: module-defined mutable/immutable v128 globals ride
 the `gvals` buffer as two u64 words per global, next to numeric ones,
 so `global.get`/`global.set` lower for them and the layout stays
-word-indexed — the lowering's used-global map now stores each global's
+word-indexed, the lowering's used-global map now stores each global's
 cumulative word offset, `do_global_get` loads a v128 global as a raw
 `I128` (and `do_global_set` stores it back), and the store-side
 seed/flush loops became shared helpers (`seed_globals`/`flush_globals`)
@@ -2387,8 +2387,8 @@ surface: `f32`/`f64` `.min`/`.max` lower natively with the wasm
 signed-zero and NaN rules (`lower_fminmax`: canonical quiet NaN when
 either operand is NaN, else the ordered pick, with `min(-0,+0) = -0`
 and `max(-0,-0) = -0` decided from the operands' sign bits), and the
-promote/demote conversions use Cranelift's `fpromote`/`fdemote`
-— `f32.demote_f64` canonicalizes a NaN result to `QNAN32` while
+promote/demote conversions use Cranelift's `fpromote`/`fdemote`,
+`f32.demote_f64` canonicalizes a NaN result to `QNAN32` while
 `f64.promote_f32` preserves the promoted bits, exactly like the
 interpreter's `values.rs` (promote/demote run on the same host
 instruction as the Rust `as` cast, so the raw NaN bits agree).
@@ -2400,16 +2400,16 @@ infinity, agreeing bit-for-bit with the interpreter. `wasmtest equiv`
 is green over the whole core corpus: 254 suites, 0 diverged. 61 compile
 tests, 97 total with the feature, clippy clean in both configurations.
 
-## Cut 11 — compiled coverage: completion checklist (2026-09-07)
+## Cut 11, compiled coverage: completion checklist (2026-09-07)
 
 **Definition of done: every runnable, valid module-defined function in
-`waspec/test/core` compiles natively (8264/8264 — reached when Wave E closed
-the `try_table` carve-out).** Coverage is measured — the equiv gate alone
+`waspec/test/core` compiles natively (8264/8264, reached when Wave E closed
+the `try_table` carve-out).** Coverage is measured, the equiv gate alone
 cannot detect a fallback (an uncompiled body is compared
 interpreter-vs-interpreter), so Gate 0 below is the tracking source of
 truth. The interpreter stays the correctness oracle throughout.
 
-### Gate 0 — measure coverage (prerequisite for the DoD)
+### Gate 0: measure coverage (prerequisite for the DoD)
 
 - [x] `wasmtest coverage` (or `equiv --report-compiled`): per suite and in
 total, report how many module-defined functions compiled vs. fell back,
@@ -2421,15 +2421,15 @@ compiled-function fraction.
 - [x] Triage sweep: run the report over the whole core corpus, classify every
 non-compiling body by cause, and record the baseline numbers here.
 
-#### Gate 0 — status (2026-09-07)
+#### Gate 0: status (2026-09-07)
 
 Coverage is now measured directly on the equiv path. `exec.rs` gained
-`Store::compile_coverage` (feature-gated; interpreter-forced stores skip it
-— their instances carry no `compiled` entries), backed by
+`Store::compile_coverage` (feature-gated; interpreter-forced stores skip it,
+their instances carry no `compiled` entries), backed by
 `compile::body_compile_reason`, which classifies each module-defined body's
 first blocking gate: structural (non-carried signature/local type,
 `try_table` body, call-bearing body that uses globals, imported global) or
-the lowering fall-through (`lowerable` returns true but `lower` errored —
+the lowering fall-through (`lowerable` returns true but `lower` errored,
 mostly function-label branches and parameterized `if` without an `else`).
 `wasmtest` collects these per suite and prints, after each equiv suite line
 and again in the aggregate, `coverage N/M functions compiled (P%)`, plus a
@@ -2459,7 +2459,7 @@ per-index reasons if a wave needs to pinpoint stragglers.
 Gates: wasm lib tests 36 (no feature) / 97 (compile feature), and clippy
 `-D warnings` on both `wasm` configs plus `wasmtest` are clean.
 
-### Wave A — branches to the implicit function label (largest known gap)
+### Wave A: branches to the implicit function label (largest known gap)
 
 The lowering has no function-level control frame, so a branch whose target
 is the implicit function label (depth = number of open constructs) fails to
@@ -2479,7 +2479,7 @@ function label.
 `br_if`, `br_table`, `block`, `if`, `switch`, `labels`, `fac`; coverage on
 the control-flow suites rises toward 100%.
 
-#### Wave A — status (2026-09-07)
+#### Wave A: status (2026-09-07)
 
 `lower_body` now opens the implicit function label as a real control frame
 (a block whose continuation receives the function results and returns
@@ -2487,7 +2487,7 @@ them) before the first instruction, and closes it once the instruction
 stream is exhausted. The frame sits at index 0, so the existing
 `controls.len() - 1 - depth` indexing maps every structured branch to its
 construct and the depth-equal-to-nesting branch (the function label) to
-the new frame with no change to the branch lowerers — `br`, `br_if`,
+the new frame with no change to the branch lowerers, `br`, `br_if`,
 `br_table`, and the `br_on_*` family all branch to it through
 `frame_target`, and a dead body whose only exit was such a branch still
 closes the frame and emits the return (code after the branch is skipped as
@@ -2508,9 +2508,9 @@ function-label machinery itself: a branch to the function label now lowers
 whenever the rest of the body does, so each residual either has no such
 branch or fails to lower for an independent reason. They belong under
 Wave D's latent-mismatch audit. The reason classifier is deliberately
-coarse there — it reports no per-function `lower()` message yet.
+coarse there, it reports no per-function `lower()` message yet.
 
-### Wave B — globals and calls
+### Wave B: globals and calls
 
 - [x] Imported globals: `global.get`/`set` over imported cells, including
   the aliasing case (one imported global reached through two import slots).
@@ -2518,7 +2518,7 @@ coarse there — it reports no per-function `lower()` message yet.
   the caller-owned `gvals` buffer; imported indices (whose cells can alias)
   and every global of a call-bearing body access the store cell directly
   through a runtime helper (`wasm_call_helper` modes 17/18), which is exactly
-  the interpreter's model — an aliased import slot or a callee sees each
+  the interpreter's model, an aliased import slot or a callee sees each
   access immediately.
 - [x] Call-bearing bodies that use globals: drop the `has_call &&
   uses_globals` gate. Their `global.get`/`set` lower through the store-cell
@@ -2529,21 +2529,21 @@ coarse there — it reports no per-function `lower()` message yet.
 - [x] Unit tests: imported global read/write, an aliased i32 and v128 import
   (same call and across calls), a compiled caller whose global is bumped by
   a native-re-entry callee, and one whose bump runs through an interpreted
-  callee — all interpreter-equivalent (`compile.rs` tests).
+  callee, all interpreter-equivalent (`compile.rs` tests).
 - [x] equiv over `global`, `linking`, `imports`, and `memory_grow`: green.
   Release `wasmtest equiv` over the whole `waspec/test/core` corpus (with the
-  shipped exclusions; `gc/array.wast` additionally excluded — see below) is
+  shipped exclusions; `gc/array.wast` additionally excluded, see below) is
   **253 suites, 0 diverged**, coverage 7865/8225 (95%), and the "imported
 global" / "call-bearing body uses globals" buckets are gone from the
   fallback histogram. On the four Wave B suites alone coverage rose 145/166
   (87%, HEAD) → 161/166 (96%) with both runs 0 diverged.
 
-#### Wave B — status (2026-09-09)
+#### Wave B: status (2026-09-09)
 
 Imported globals and call-bearing-global bodies now compile. A module-defined
 numeric/v128 global of a call-free body still rides the `gvals` buffer (fast,
 and writes reach the store even when the body traps); every other `global.get`/
-`set` — any imported index, or any index in a body that contains a call —
+`set`, any imported index, or any index in a body that contains a call,
 spills to the scratch and runs `wasm_call_helper` mode 17 (read) / 18
 (write), which resolves the index-space entry to its store cell and moves the
 value's words with the same per-type layout `seed_globals`/`flush_globals`
@@ -2559,14 +2559,14 @@ global, imports first); `body_globals` filters to defined indices and
 configurations.
 
 Corpus note (fixed 2026-09-09): `waspec/test/core/gc/array.wast` used to
-abort the whole process — the compiled `array.new_data`/`new_elem` helper
+abort the whole process, the compiled `array.new_data`/`new_elem` helper
 reserved `length` elements *before* its segment bounds check, so a 2^31
 request over a short segment tried to allocate 64 GiB (`memory allocation of
 68719476736 bytes failed`) and died instead of trapping. The segment-backed
 builders now bounds-check first and reserve with `try_reserve_exact`, so the
 suite runs green and the corpus needs no engine-gap exclusion.
 
-### Wave C — exception handling (`try_table`)
+### Wave C: exception handling (`try_table`)
 
 Compiled bodies can `throw`/`throw_ref`; bodies containing a `try_table`
 catch were originally kept on the interpreter by the boundary decision below,
@@ -2578,7 +2578,7 @@ then the Wave E slices replaced that boundary with native catch regions.
   compiled/interpreted boundary already runs a *whole* interpreter engine
   per interpreted subtree, so `try_table` catching, `throw`/`throw_ref`
   unwinding, `catch_ref` payloads, and the label/frame bookkeeping all live
-  where the interpreter already implements them — no native frame ever
+  where the interpreter already implements them, no native frame ever
   needs to take part in an unwind. That was semantics-preserving while the
   boundary held: a compiled body never sits under an interpreted frame
   (interpreters never dispatch compiled entries), so an uncaught exception
@@ -2589,14 +2589,14 @@ then the Wave E slices replaced that boundary with native catch regions.
   bodies now lower natively. A catch is exactly a branch to an enclosing
   label carrying the clause payload, and an exception no native frame
   catches keeps propagating as data through the call-helper pending-error
-  sentinel — so no Cranelift stack unwinding is ever needed. Static
+  sentinel, so no Cranelift stack unwinding is ever needed. Static
   same-function throws branch at compile time; callee-escaped exceptions,
   `throw_ref`, `_ref` clauses, and imported-tag clauses dispatch at runtime
   against the parked exception. The 44-body carve-out is gone.
 - [x] equiv over the `exceptions` suites: green (they run in the full
   8264-function, 0-diverged core sweep; `try_table.wast` compiles 43/43).
 
-#### Wave C/E — status (2026-09-09)
+#### Wave C/E: status (2026-09-09)
 
 The interpreter boundary held through the type-model waves, keeping the 44
 corpus `try_table` bodies interpreted (the interpreter path was and stays the
@@ -2607,7 +2607,7 @@ oracle). The native-EH wave then replaced it in three slices:
   matches (`catch` of the identical module-defined tag, or `catch_all`)
   becomes a direct branch to the clause's target label carrying the payload.
   Coverage 8220 → 8236 (`try_table.wast` 7/43 → 23/43).
-- E2 (`1b7e92b`): a call inside a region runs a catch dispatch — when the
+- E2 (`1b7e92b`): a call inside a region runs a catch dispatch, when the
   callee parks an exception, each open clause is tested innermost-first
   against its tag cell (helper mode 19; `catch_all` first verifies the
   parked error is an exception, so a trap from an interpreted callee still
@@ -2619,7 +2619,7 @@ oracle). The native-EH wave then replaced it in three slices:
   region parks and dispatches (its tag is only known at runtime), and
   `do_throw` uses the park-then-dispatch path whenever the open chain has a
   `_ref` clause or an imported-tag aliasing ambiguity. The body-level EH
-  gate is deleted — every clause form lowers, leaving the per-instruction
+  gate is deleted, every clause form lowers, leaving the per-instruction
   subset as the only admission. Coverage 8244 → **8264/8264 (100%)**: the
   fallback histogram is empty.
 
@@ -2634,14 +2634,14 @@ Re-check of the `crates/runtime` JS-API surface once the wave landed on
 failing against the compiled path (`function_imports_run_js_closures`,
 `compile_and_instantiate_return_promises`,
 `multi_value_results_cross_the_js_boundary`, and
-`wasm_exceptions_surface_as_js_and_pass_through` — "external host function
+`wasm_exceptions_surface_as_js_and_pass_through`, "external host function
 needs a resumable run" and promise-resolution mismatches) now pass. All 20
 `builtins::wasm` tests are green and the full runtime lib suite is 737/0
 under `--features wasm/compile`.
 
-### Wave D — remaining type-model gaps
+### Wave D: remaining type-model gaps
 
-- [x] v128 GC storage: struct/array fields of `StorageType::V128` —
+- [x] v128 GC storage: struct/array fields of `StorageType::V128`,
   the GC helpers' field slots are word-indexed (`storage_slot_words`/
   `storage_from_slot_words`), a v128 field/element value spans two u64 words
   and defaults to all-zero bits; `struct.new`/`_default`/`get`/`set`, and
@@ -2653,26 +2653,26 @@ under `--features wasm/compile`.
   (`gc_v128_struct_fields_match_the_interpreter` and
   `gc_v128_array_elements_match_the_interpreter`), not a corpus gate.
 - [x] Non-carried abstract-bottom signatures: params/results/locals of
-  `(ref null none)`/`nofunc`/`noextern`/`noexn` — `heap_is_carried` admits
+  `(ref null none)`/`nofunc`/`noextern`/`noexn`, `heap_is_carried` admits
   the four abstract-bottom heaps, since a bottom value has no non-null
   inhabitant and rides the token model as the constant null token.
 - [x] Parameterized `if` without an `else` (valid wasm; an else-less `if` is
-  identity-typed — the validator requires its block parameters to equal its
+  identity-typed, the validator requires its block parameters to equal its
   results, and the false path leaves the parameters on the stack as the
   results). The lowerer's no-else path now restarts from the saved parameters
   on the false branch instead of erroring, so those bodies compile.
 - [x] Latent-mismatch audit: every `Instr` variant `lowerable` admits must
-  lower without error — eliminate silent `lower()` fallbacks (the Gate 0
+  lower without error, eliminate silent `lower()` fallbacks (the Gate 0
   report is the detector). `Engine::compile` surfaces the concrete error
   and the audit found every residual body shared one cause (a `return`
   carrying junk beneath its operands), fixed below.
 - [x] Oversized call sites: the `SCRATCH_SLOTS` bound stays as-is,
-  documented out of scope for the DoD (decision 6) — no corpus body
+  documented out of scope for the DoD (decision 6), no corpus body
   exceeds it.
 - [x] Resumable external-host imports (JS-API): decided out of scope
-  (decision 7) — such bodies stay interpreted via `host_reachable_bodies`.
+  (decision 7), such bodies stay interpreted via `host_reachable_bodies`.
 
-#### Wave D — status (2026-09-09)
+#### Wave D: status (2026-09-09)
 
 The else-less-parameterized-`if` slice landed: `close_construct`'s no-else
 path forwards the saved parameters to the continuation on the false branch
@@ -2680,7 +2680,7 @@ path forwards the saved parameters to the continuation on the false branch
 the interpreter's skip), guarded by an identity check so a non-identity shape
 still bails to the interpreter. Corpus effect (release equiv over the whole
 core, 253 suites, 0 diverged): coverage 7865 → 7869 (95%), "lowering error"
-52 → 48 — four corpus bodies were identity else-less `if`s. Unit coverage in
+52 → 48, four corpus bodies were identity else-less `if`s. Unit coverage in
 `parameterized_and_multi_value_blocks_match_the_interpreter` (an
 else-less `(param i32) (result i32)` `if` whose false path returns the
 parameter).
@@ -2697,7 +2697,7 @@ call_indirect).
 The reinterpretation and sign-extension slice landed off that triage:
 `i32.reinterpret_f32`/`i64.reinterpret_f64`/`f32.reinterpret_i32`/
 `f64.reinterpret_i64` lower as pure `bitcast`s, and the `*_extendN_s` forms
-(narrow-then-sign-extend) plus `i64.extend_i32_s/u` lower natively — the
+(narrow-then-sign-extend) plus `i64.extend_i32_s/u` lower natively, the
 biggest single corpus blocker. Corpus effect: coverage 7869 → 7998 (97%),
 "outside the lowering subset" 260 → 131 (the `Num` share 176 → 47, now
 entirely `trunc*`). Unit coverage in
@@ -2723,7 +2723,7 @@ v128 still takes two words), and the `gvals` buffer stays numeric/v128-only,
 so a ref global of a call-free body routes through the store-cell helper too.
 `lowerable` admits a `GlobalGet`/`Set` when the global's type is carried.
 Corpus effect: coverage 8045 → 8105 (98%), "outside the lowering subset"
-84 → 24 — `GlobalSet` 7 → 0 and `GlobalGet` 58 → 5. The residual 24 are
+84 → 24, `GlobalSet` 7 → 0 and `GlobalGet` 58 → 5. The residual 24 are
 ref-table ops over non-carried tables (TableGet 8, TableSet 4), CallIndirect
 5 (non-carried signatures), GlobalGet 5 (bottom-heap globals), and RefNull 2
 (bottom heaps). Unit coverage in `ref_globals_match_the_interpreter`
@@ -2736,7 +2736,7 @@ non-null inhabitant and rides the token model as the constant null token.
 That compiles bottom-typed params/results/locals, `ref.null` of a bottom,
 bottom-typed globals, and bottom-element tables. Corpus effect: coverage
 8105 → 8116 (98%), the "non-carried parameter/result/local type" bucket
-drops to zero, and "outside the lowering subset" falls to 17 — the
+drops to zero, and "outside the lowering subset" falls to 17, the
 residuals are 64-bit-addressed ref-table shapes (`TableGet`/`TableSet` over
 `table64` and `CallIndirect` through 64-bit tables). Unit coverage in
 `bottom_refs_ride_the_null_token` (bottom param, result, global, and table).
@@ -2745,7 +2745,7 @@ The latent-mismatch audit slice landed on top of that triage (2026-09-09):
 `Engine::compile` returns the concrete lowering/codegen error instead of
 swallowing it, and `body_compile_reason` runs the pipeline so the coverage
 report names each gate-passing body's real failure. The audit was
-conclusive: all 48 residual "lowering error" bodies shared one cause —
+conclusive: all 48 residual "lowering error" bodies shared one cause,
 `emit_return` required the operand stack to hold exactly the results, but an
 explicit `return` is typed `[t1* t2*] -> [t2*]`, so values beneath its
 operands are legal and drop with the frame. `emit_return` now reads only the
@@ -2766,7 +2766,7 @@ coverage in `table64_get_set_and_call_indirect_match_the_interpreter` (an
 i64-addressed dispatcher/getter/setter over a funcref table, incl.
 out-of-range and negative-index traps).
 
-The fallback histogram is now empty — the Wave E slices (see Wave C's
+The fallback histogram is now empty, the Wave E slices (see Wave C's
 status) closed the `try_table` carve-out, so every runnable, valid
 module-defined function in the corpus compiles natively.
 
@@ -2777,7 +2777,7 @@ request over a short segment) aborted the process with a 64 GiB allocation
 instead of trapping. The reserve now follows the bounds checks and uses
 `try_reserve_exact` (the `alloc_array_filled` rule); the interpreter's two
 segment builders match. Full corpus, *no exclusions*: **254 suites, 0
-diverged; coverage 8220/8264** — `array.wast` compiles 39/39 and the totals
+diverged; coverage 8220/8264**, `array.wast` compiles 39/39 and the totals
 return to the Gate-0 baseline's 8264-defined count. wasm lib tests 108
 (compile feature) / 36 (no feature). Unit coverage in
 `oversized_array_new_from_segments_traps_not_aborts` (data and elem overflow
@@ -2804,7 +2804,7 @@ offsets, and the lowering spills/loads at the same word-indexed layout
 words, `array.fill`'s length behind them). The value-free bulk ops needed no
 change: `array.copy` moves cells verbatim and `new_data`/`init_data` already
 read 16-byte elements through `data_element`. The interpreter handled v128
-cells all along, so the slice's gate is an equivalence pair —
+cells all along, so the slice's gate is an equivalence pair,
 `gc_v128_struct_fields_match_the_interpreter` and
 `gc_v128_array_elements_match_the_interpreter` (defaults, mixed v128/i32
 field layouts at nonzero word offsets, set/get round trips, `new_fixed`,
@@ -2816,7 +2816,7 @@ both configurations.
 
 - [x] Gate 0 report exists and is the tracking source of truth.
 - [x] Coverage: 100% of runnable module-defined functions in
-`waspec/test/core` compile (8264/8264 — no fallback bodies) with equiv 0
+`waspec/test/core` compile (8264/8264, no fallback bodies) with equiv 0
 diverged.
 - [x] `cargo test -p wasm --features compile --lib`, the no-feature lib
 tests, and `cargo clippy -p wasm --all-targets -- -D warnings` in both

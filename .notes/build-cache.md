@@ -63,7 +63,7 @@ timestamp, and the binaries present.
 The 8 minutes are three `runtime` builds, not one repeated by mistake: `cli`,
 `test262` and `wasmtest` resolve `runtime` with different feature sets, so cargo
 compiles it once per package. They are built as separate `cargo build -p`
-invocations on purpose — selecting all three in one invocation unifies their
+invocations on purpose, selecting all three in one invocation unifies their
 features and changes the binaries from what CI publishes.
 
 Entries are partial by design. Building `-p cli` at tree T stores `slag` and

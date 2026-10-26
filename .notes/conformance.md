@@ -75,7 +75,7 @@ A dedicated sweep of the whole TypedArray fixture tree (`sweep.exe built-ins
 the standard taxonomy (module/async flags and unsupported harness
 includes). This closed the cluster from 891 pass / 202 fail. The
 work also removed the `TypedArray/prototype/copyWithin/coerced-values-*`
-"hangs" seen with short timeouts — those fixtures allocate 10,000-element
+"hangs" seen with short timeouts, those fixtures allocate 10,000-element
 arrays and need the long timeout config, not a bug.
 
 The fixes clustered into spec-order and feature work:
@@ -159,7 +159,7 @@ pass. Fixes:
   absent, and throws when a proxy's `defineProperty`/`set` trap reports
   false. The accessor carries the required `get stack`/`set stack` names and
   lengths.
-- **BigInt(Number) — NumberToBigInt (spec 7.1.16):** `BigInt(0)` and
+- **BigInt(Number): NumberToBigInt (spec 7.1.16):** `BigInt(0)` and
   `BigInt(1.5)` were both rejected with a TypeError; integral doubles now
   convert exactly (mantissa/exponent decomposition, so `BigInt(1e23)` is the
   exact double value) and NaN/±Infinity/non-integral throw a RangeError. The
@@ -321,10 +321,10 @@ Fixes across `crates/crux` and `crates/runtime`:
   `{ writable: true, enumerable: false, configurable: true }`.
 - **`getOwnPropertyDescriptors` includes symbol keys** (its loop skipped
   `PropertyKey::Symbol`), and **array own-property keys no longer list
-  holes** (ArrayOwnPropertyKeys only returns stored index keys — the
+  holes** (ArrayOwnPropertyKeys only returns stored index keys, the
   ES5-era "append holes descending" behavior was removed and its test
   updated).
-- **Parser: multi-declarator `for` heads** — `parse_for_declarators`
+- **Parser: multi-declarator `for` heads**, `parse_for_declarators`
   parsed exactly one declarator, so `for (var i = 0, len = n; …)` was a
   SyntaxError; it now loops over comma-separated declarators (keeping the
   `[~In]` initializer restriction).
@@ -339,7 +339,7 @@ of the session. The 4 skips are the standard taxonomy (`compareIterator.js`/`reg
 
 - **UTF-16-unit string `+` concatenation (`expr.rs`):** the string branch of
   the `+` operator formatted through `JsString`'s lossy `Display`, which
-  replaced lone surrogates with U+FFFD — `'\uD83D' + '\uDCA9'` produced
+  replaced lone surrogates with U+FFFD, `'\uD83D' + '\uDCA9'` produced
   `\uFFFD\uFFFD`, so `wholePoo.slice(0, 1).isWellFormed()` was `true`.
   Concatenation now extends the UTF-16 unit slices directly.
 - **`ToPrimitive` GetMethod semantics (`context.rs`, `crux/convert.rs`):** a
@@ -348,7 +348,7 @@ of the session. The 4 skips are the standard taxonomy (`compareIterator.js`/`reg
   skipped it, so the `indexOf` position/searchString top-primitive fixtures'
   `assert.throws(TypeError)` cases failed.
 - **OrdinaryToPrimitive hint order:** hint `default` is grouped with
-  `number` (valueOf first) — only the `string` hint prefers toString. The
+  `number` (valueOf first), only the `string` hint prefers toString. The
   old grouping made `'str' + { valueOf: String.prototype.valueOf }` succeed
   (toString first) instead of throwing the thisStringValue TypeError.
 - **Final_Sigma casing (`string.rs`):** the lookahead only skipped `Mn`, so
@@ -356,7 +356,7 @@ of the session. The 4 skips are the standard taxonomy (`compareIterator.js`/`reg
   `is_cased` (via the case mappings) missed `𝒢` because Rust's tables omit
   the mathematical alphanumerics. Cased is now the general category
   `Lu`/`Ll`/`Lt`; the ignorable set is `Mn`/`Me`/`Cf`/`Lm`/`Sk` plus the
-  hangul fillers and — per the spec's Final_Sigma note — FULL STOP and
+  hangul fillers and, per the spec's Final_Sigma note, FULL STOP and
   MIDDLE DOT.
 - **Agent-aware `normalize`/`repeat`:** the form and count were coerced
   through the non-agent crux path, so an object form/`count` with a
@@ -466,7 +466,7 @@ the tree passes, including the `Date/prototype/toTemporalInstant` cluster
 implementation below). Fixes in
 `crates/runtime/src/builtins/date.rs` and the harness:
 
-- **`Date.prototype[@@toPrimitive]` was missing** — unary `+`/binary `+`/
+- **`Date.prototype[@@toPrimitive]` was missing**: unary `+`/binary `+`/
   comparisons on dates fell through to a placeholder. Implemented per spec
   21.4.3.5: the hint is compared as a String value (anything else,
   including a missing argument, throws a TypeError), `"default"` prefers
@@ -507,7 +507,7 @@ implementation below). Fixes in
   (GetPrototypeFromConstructor, spec 10.1.8).
 - **`Date.prototype.toTemporalInstant`** (spec 21.4.3.28, proposal-temporal):
   `RequireInternalSlot` ([[DateValue]]), then
-  `NumberToBigInt(t) × 10⁶` — an invalid date throws `RangeError` — then
+  `NumberToBigInt(t) × 10⁶`, an invalid date throws `RangeError`, then
   `CreateTemporalInstant`. The 8-fixture cluster passes (length/name/
   prop-desc/not-a-constructor/branding/invalid-date/boundary ns).
 
@@ -520,22 +520,22 @@ Sweeps of the six global-function trees (`isFinite*`, `isNaN*`,
 includes `decimalToHexString.js`/`nans.js`, plus the host-dependent
 cross-realm fixtures, which now run and pass). Fixes in `crates/runtime/src/builtins/global.rs`:
 
-- **The global functions had a null [[Prototype]]** — `create_builtin` is
+- **The global functions had a null [[Prototype]]**: `create_builtin` is
   called with `None` and the realm's post-pass only re-parents
   *intrinsic*-registered functions, so `encodeURI.hasOwnProperty` and
   `parseInt.call` were undefined. The install now links
   `%Function.prototype%` explicitly (CreateBuiltinFunction, spec 10.2.3);
   after `delete encodeURI.length` the lookup resolves to
   `%Function.prototype%`'s own length (0), as the Sputnik fixtures expect.
-- **Coercions ran the pure crux conversions** — object arguments hit the
+- **Coercions ran the pure crux conversions**: object arguments hit the
   `%Object.prototype.valueOf%`/`toString` placeholders. All ToString and
   ToNumber now run through the agent recovered from the `with_agent`
   window (`isFinite([1])`, `parseFloat({ toString: () => "3.5" })`,
   `parseInt({ toString: ... }, { valueOf: ... })`, `encodeURI(...)`).
-- **`isFinite`/`isNaN` swallowed ToNumber errors** — spec 19.2.2/19.2.3
+- **`isFinite`/`isNaN` swallowed ToNumber errors**: spec 19.2.2/19.2.3
   use `? ToNumber`, so `isFinite(Symbol())` and a throwing `valueOf` now
   propagate instead of collapsing to false/true.
-- **`parseInt` radix used `f64 as i32`** — ±Infinity saturated to
+- **`parseInt` radix used `f64 as i32`**: ±Infinity saturated to
   `i32::MAX`/`MIN` instead of ToInt32's 0, and out-of-range values did not
   wrap. The radix now goes through `crux::convert::to_int32`
   (`parseInt("11", Infinity)` → 11, `parseInt("11", 4294967298)` → 3).
@@ -550,7 +550,7 @@ the cross-realm fixture, which now runs and passes. Fixes in
 `crates/runtime/src/expr.rs`, `crates/crux/src/convert.rs`, and
 `crates/parser/src/stmt.rs`:
 
-- **`BigInt.asIntN`/`asUintN` argument coercion** — `bits` went through a
+- **`BigInt.asIntN`/`asUintN` argument coercion**: `bits` went through a
   non-agent `ToIndex` (object bits hit `%Object.prototype.valueOf%`
   placeholders) and `bigint` through a lenient NumberToBigInt that
   converted Numbers; strict `ToBigInt` (spec 7.1.17) rejects Numbers with
@@ -560,7 +560,7 @@ the cross-realm fixture, which now runs and passes. Fixes in
   `crux::bigint::as_int_n`/`as_uint_n` take a `u64` width (ToIndex can
   exceed `u32`) with a magnitude guard that skips allocating `2^bits` when
   the value fits.
-- **StringToBigInt sign rule** — a sign is only part of a decimal
+- **StringToBigInt sign rule**: a sign is only part of a decimal
   StringIntegerLiteral: `BigInt("-0x1")`/`BigInt("+0b10")` are
   SyntaxErrors (spec 7.1.17.1), not -1/2. `BigInt("0b1111")` and long
   0b/0B strings still convert exactly.
@@ -571,17 +571,17 @@ the cross-realm fixture, which now runs and passes. Fixes in
   SyntaxError (its toString is "[object Object]").
 - **`BigInt.prototype.toString.length` was 1; the spec says 0** (the radix
   is read from the arguments list, not a declared parameter).
-- **`Number(bigint)`** — the Number constructor used the non-agent
+- **`Number(bigint)`**: the Number constructor used the non-agent
   `ToNumber`, which rejects BigInt; it now converts BigInt through ℝ
   (`Number(1n)` → 1) and keeps Symbol's TypeError, with `ToPrimitive`
   through the agent for object arguments.
-- **`==`/`!=` bypassed the agent** — `IsLooselyEqual` ran the pure crux
+- **`==`/`!=` bypassed the agent**: `IsLooselyEqual` ran the pure crux
   conversion, whose boxed-wrapper fast path read the wrapped value directly
   and skipped an overridden `valueOf`/`toString`. `expr.rs` now routes
   object operands through the agent's `ToPrimitive` first, so `Object(1n)`
   with a `valueOf` override compares through it
   (`BigInt/wrapper-object-ordinary-toprimitive.js`).
-- **Classic `for (let …)` head scope** — the parser re-declared a classic
+- **Classic `for (let …)` head scope**: the parser re-declared a classic
   for-head's lexical names in the *enclosing* statement list, so two
   sibling `for (let i …)` loops (or a later `let i`) raised "Identifier has
   already been declared". The head names stay in the loop scope, while the
@@ -599,35 +599,35 @@ plus the host-dependent cross-realm fixtures, which now run and pass). Fixes in
 `crates/runtime/src/expr.rs`, `crates/parser/src/expr.rs`, and the test262
 harness:
 
-- **Restricted `caller`/`arguments` properties** — sloppy ordinary
+- **Restricted `caller`/`arguments` properties**: sloppy ordinary
   functions now carry own `caller`/`arguments` data properties (value
   null, non-writable, non-configurable) per AddRestrictedFunctionProperties,
   and `%Function.prototype%` defines own `caller`/`arguments` accessors
   whose get and set are the same thrower (20.2.3.1). Strict, bound, async,
   and generator functions have no own properties, so reads and writes
-  fall through to the accessors and throw a TypeError — covering the
+  fall through to the accessors and throw a TypeError, covering the
   `15.3.5*`/`15.3.5.4_2-*gs` and StrictFunction/BoundFunction
   restricted-properties fixtures.
-- **Sloppy `[[Call]]` `this` boxing** — OrdinaryCallBindThis coerced only
+- **Sloppy `[[Call]]` `this` boxing**: OrdinaryCallBindThis coerced only
   null/undefined to the global object; primitives are now ToObject'd, so
   `Function("this.x = 1; return this;").apply(5)` sees a Number wrapper
   (apply/call pass `thisArg` through unchanged per spec 20.2.3.2/20.2.3.4,
   so a strict callee still sees the raw value).
-- **Function-valued construct prototypes** — OrdinaryCreateFromConstructor
+- **Function-valued construct prototypes**: OrdinaryCreateFromConstructor
   only accepted `Value::Object`; a function-valued `prototype`
   (`F.prototype = Function()`) left the new object null-prototyped. It now
   goes through `as_object`, and a revoked-Proxy `newTarget` throws via
   GetFunctionRealm (spec 10.2.5).
-- **`instanceof` with a bound right-hand side** — OrdinaryHasInstance now
+- **`instanceof` with a bound right-hand side**: OrdinaryHasInstance now
   unwraps a bound function to its target (spec 7.3.19 step 2).
-- **`Function` constructor ToString** — `new Function({})` failed at the
+- **`Function` constructor ToString**: `new Function({})` failed at the
   pure ToString placeholder; params and body now convert through the
   agent, and the "[object Object]" body throws a SyntaxError.
-- **Private identifiers outside classes** — the parser accepted `o.#f`
+- **Private identifiers outside classes**: the parser accepted `o.#f`
   (and `#f in o`) outside any class; AllPrivateIdentifiersValid now makes
   them a SyntaxError, so `new Function("o.#f")` throws at
   CreateDynamicFunction (spec 20.2.1.1 step 30).
-- **Harness CR-only frontmatter** — `parse_fixture` split on `\n` only, so
+- **Harness CR-only frontmatter**: `parse_fixture` split on `\n` only, so
   CR-only fixtures (the toString line-terminator tests) missed their
   `includes:` and ran without the helper. It now splits on CR and LF,
   filtering the empty segments CRLF produces.
@@ -640,21 +640,21 @@ A sweep of `%Iterator.prototype%` and its helpers (`sweep.exe built-ins
 `crates/runtime/src/builtins/iterator.rs` and
 `crates/runtime/src/builtins/object.rs`:
 
-- **`Object.freeze`/`seal` corrupted accessor properties** —
+- **`Object.freeze`/`seal` corrupted accessor properties**,
   SetIntegrityLevel rebuilt every configurable property as a data property
   (dropping `get`/`set`), so freezing `%Iterator.prototype%` silently
   deleted its `constructor`/`@@toStringTag` accessors and made
   `Fake[Symbol.toStringTag] = v` a no-op. Accessors now keep their
   getter/setter (spec 7.3.15 steps 2.c-2.d); only data properties gain the
   writable: false constraint.
-- **`new Iterator()` no longer threw** — `dispatch_construct` created the
+- **`new Iterator()` no longer threw**: `dispatch_construct` created the
   object unconditionally, but spec 27.1.1.1 throws when NewTarget is the
   active function object; subclass `super()` calls still construct via
   GetPrototypeFromConstructor.
-- **`chunks` yielded an empty chunk on closure** — closing the underlying
+- **`chunks` yielded an empty chunk on closure**: closing the underlying
   iterator before the first `next()` returned `{ value: [], done: true }`;
   it now returns `{ value: undefined, done: true }` (spec step 8.a.ii.2).
-- **Helper plumbing** — `%Iterator%` construct, `define_method` prototype
+- **Helper plumbing**: `%Iterator%` construct, `define_method` prototype
   wiring, `HelperState.counter`, `includes` `fromIndex`, `flatMap` flat
   iterators, `windows` `allow-partial`, `join` separator coercion, and
   `reduce` counter-start were brought in line with Node v24 behavior as the
@@ -663,7 +663,7 @@ A sweep of `%Iterator.prototype%` and its helpers (`sweep.exe built-ins
 ### Iterator statics cluster sweep (Phase 18 conformance)
 
 A sweep of the `Iterator/*` statics (`Iterator.concat`, `Iterator.from`,
-`Iterator.zip`, `Iterator.zipKeyed`, plus the constructor fixtures —
+`Iterator.zip`, `Iterator.zipKeyed`, plus the constructor fixtures,
 `sweep.exe built-ins --filter 'Iterator/*'`) reports **637 pass, 0 fail,
 0 crash, 17 skip** of 654 fixtures: every runnable fixture passes (the
 statics went from 62 fail / 0 crash to 0 fail; the full tree went from
@@ -671,41 +671,41 @@ statics went from 62 fail / 0 crash to 0 fail; the full tree went from
 `length`/`remainder` and supported only a longest flag; the clusters were
 rebuilt around the spec algorithms:
 
-- **`Iterator.concat` lazy opening** — the methods were called during
+- **`Iterator.concat` lazy opening**: the methods were called during
   validation, so `@@iterator` getters ran early and inner iterators were
   created up front. Concat now validates each item is an Object with a
   callable `@@iterator` (in order) and opens each iterable only as iteration
   reaches it; `return()` forwards only to the currently active inner
   iterator, and natural exhaustion never closes (spec 27.1.4.3).
-- **`Iterator.from` primitives and flat fallback** — non-string primitives
+- **`Iterator.from` primitives and flat fallback**: non-string primitives
   now throw a TypeError (spec 7.4.3 REJECT_STRINGS for concat/zip,
   ACCEPT_STRINGS for from), and the flat-iterator `next` callability check
   is deferred to the first `next()` call.
-- **Primitive receivers** — property reads on primitives boxed the value
+- **Primitive receivers**: property reads on primitives boxed the value
   for the read but passed the *box* as the accessor receiver; getters now
   see the primitive as `this` (`Iterator.from('')` reports `typeof this
   === 'string'`, spec 10.4.3.4).
-- **`Iterator.zip`/`zipKeyed` modes** — `options.mode` (shortest/longest/
+- **`Iterator.zip`/`zipKeyed` modes**: `options.mode` (shortest/longest/
   strict) and the longest-mode padding were reimplemented: strict mode
   throws on uneven lengths (closing the open columns), and the closure
   tracks the open columns so every terminating path runs
   IteratorCloseAll in reverse (fixture-verified close orders and trap
   sequences).
-- **Padding is per-cluster** — zip pads from an eagerly iterated padding
+- **Padding is per-cluster**: zip pads from an eagerly iterated padding
   iterable (index-aligned to the columns, spec 27.1.4.4.1 step 14);
   zipKeyed pads by reading the padding object's property per column key
   (spec 27.1.4.5.1 step 14).
-- **zipKeyed input** — the first argument is an object whose own
+- **zipKeyed input**: the first argument is an object whose own
   enumerable properties are the columns (spec 27.1.4.5.1), not an iterable
   of pairs; result objects are null-prototyped.
-- **Helper state machine** — `HelperState` now tracks `started`/`executing`
+- **Helper state machine**: `HelperState` now tracks `started`/`executing`
   so a return before the first `next()` closes with the helper already
   completed (recursive calls short-circuit) while a mid-iteration return
   closes with it executing (recursive calls throw a TypeError, spec
   27.1.3.8/27.5.3.2); the state is no longer removed from the registry
   during a close, and `try_borrow_mut` turns callback re-entrancy into a
   TypeError instead of a panic.
-- **Helper `return()` value** — the result is always `{ value: undefined,
+- **Helper `return()` value**: the result is always `{ value: undefined,
   done: true }` (spec 27.1.3.8 step 7), and abrupt paths now close the
   right records (collected columns reverse, the outer iterables iterator
   only for the flattenable-abrupt case, never for the step-abrupt case).
@@ -718,7 +718,7 @@ passes (up from 76 pass / 5 fail). Fixes in
 `crates/runtime/src/builtins/symbol.rs`,
 `crates/runtime/src/builtins/promise.rs`, and `crates/runtime/src/context.rs`:
 
-- **Strict writes to primitives** — `PutValue` boxed a primitive base and
+- **Strict writes to primitives**: `PutValue` boxed a primitive base and
   used the *wrapper* as the receiver, so `"use strict"; sym.a = 0` (and
   `(5).a = 1`, `"abc".a = 1`) silently created a property on the ephemeral
   wrapper instead of throwing. The receiver now stays the primitive: an
@@ -726,7 +726,7 @@ passes (up from 76 pass / 5 fail). Fixes in
   write fails with a TypeError (spec 7.3.6 step 5.b).
 - **`Symbol.prototype[@@toStringTag]`** was defined with all attributes
   false; the spec requires `configurable: true` (spec 20.4.3.6).
-- **`IsConstructor(Symbol)`** — Symbol was created with no [[Construct]],
+- **`IsConstructor(Symbol)`**: Symbol was created with no [[Construct]],
   so `isConstructor(Symbol)` (via the proxy construct trap) was false.
   Symbol now carries a throwing construct body: `new Symbol()` still
   throws, but the proxy trap fires and subclass `extends` semantics hold
@@ -742,7 +742,7 @@ report **50 pass, 0 fail** and **339 pass, 0 fail** respectively (up from
 `crates/runtime/src/builtins/number.rs`, and
 `crates/runtime/src/builtins/object.rs`:
 
-- **`%Boolean.prototype%` / `%Number.prototype%` are wrappers** — per spec
+- **`%Boolean.prototype%` / `%Number.prototype%` are wrappers**: per spec
   (20.3.3/21.1.3) the prototypes are Boolean/Number objects wrapping
   *false*/*+0*; both now carry the boxed-primitive marker, so
   `Boolean.prototype == false`, `Boolean.prototype.toString()` is
@@ -751,17 +751,17 @@ report **50 pass, 0 fail** and **339 pass, 0 fail** respectively (up from
 - **`%Object.prototype.toString%` tags** now come from the boxed marker
   (Boolean/Number/BigInt wrappers) before falling back to the agent brand
   slots and the object kind (spec 20.1.3.6 steps 6-14).
-- **Number method receivers** — the Sputnik `S15.7.4*` fixtures call the
+- **Number method receivers**: the Sputnik `S15.7.4*` fixtures call the
   prototype methods directly and on foreign objects; ThisNumberValue
   rejects the foreign receivers with a TypeError as spec'd, while the
   `fractionDigits`/`precision`/`radix` arguments now coerce through the
   agent (object arguments with `valueOf`/`toString` work).
-- **`-0` formatting** — `toExponential`/`toPrecision` printed a leading
+- **`-0` formatting**: `toExponential`/`toPrecision` printed a leading
   "-" for `-0`; the sign is present only when `x < 0` (spec 21.1.3.3/6).
-- **`toExponential()` shortest digits** — the mantissa kept trailing zeros
+- **`toExponential()` shortest digits**: the mantissa kept trailing zeros
   (`(100).toExponential()` → "1.00e+2"); the round-trip digits are now
   trimmed to the shortest form ("1e+2").
-- **`Number.parseInt`/`parseFloat`** — the statics were fresh functions;
+- **`Number.parseInt`/`parseFloat`**: the statics were fresh functions;
   they are now the same built-in function objects as the global
   `parseInt`/`parseFloat` (spec 21.1.2.9/13).
 
@@ -773,7 +773,7 @@ implementation was rebuilt around spec 20.1.3.6 in
 `crates/runtime/src/builtins/object.rs` plus the related installs:
 
 - **The value is ToObject'd first and the `@@toStringTag` string always
-  overrides** (steps 3/15-16) — previously the override applied only to
+  overrides** (steps 3/15-16), previously the override applied only to
   plain objects, so own/inherited tags on arrays, functions, arguments,
   errors, boxed wrappers, and primitives were ignored.
 - **Built-in tags from slots/kinds** (steps 4-14): IsArray recurses through
@@ -781,11 +781,11 @@ implementation was rebuilt around spec 20.1.3.6 in
   marker, and the error/RegExp/Date brands. BigInt wrappers have no
   built-in tag ("Object"), and a proxy over a plain object is "Object".
 - **`%Function.prototype%`/`%Number.prototype%`/`%Date.prototype%` lost
-  their `@@toStringTag`** — the spec brands those kinds through the
+  their `@@toStringTag`**, the spec brands those kinds through the
   [[Call]]/[[NumberData]]/[[DateValue]] slots (V8 confirms); their presence
   made the override fixtures' assignments silently fail against the
   non-writable tags. Symbol/BigInt/Promise keep their spec'd tags.
-- **Generator/async function tags** — `%Generator.prototype%[@@toStringTag]`
+- **Generator/async function tags**: `%Generator.prototype%[@@toStringTag]`
   = "Generator" was added, `%AsyncFunction.prototype%`'s tag is now
   "AsyncFunction" (was "Async Function"), and the generator object's
   [[Prototype]] is the generator function's `prototype` property (an
@@ -805,7 +805,7 @@ accessor surface plus two `__proto__`/prototype-set bugs. Fixes in
 `crates/crux/src/object.rs`, `crates/runtime/src/builtins/object.rs`, and
 `crates/runtime/src/context.rs`:
 
-- **The four legacy accessor methods were missing entirely** — Annex B
+- **The four legacy accessor methods were missing entirely**: Annex B
   defines `__defineGetter__`/`__defineSetter__` (spec B.2.2.2/B.2.2.3) and
   `__lookupGetter__`/`__lookupSetter__` (spec B.2.2.4/B.2.2.5) on
   `%Object.prototype%`. All four are now installed (length 2/2/1/1,
@@ -817,7 +817,7 @@ accessor surface plus two `__proto__`/prototype-set bugs. Fixes in
   `[[GetOwnProperty]]`/`[[GetPrototypeOf]]` (proxy traps propagate) and
   return the first accessor's getter/setter, or undefined for a data
   property or a miss.
-- **The `__proto__` setter ran `Object.setPrototypeOf` semantics** — a
+- **The `__proto__` setter ran `Object.setPrototypeOf` semantics**: a
   non-object prototype or receiver now returns undefined silently (spec
   B.2.2.1.3 steps 2-3), only a failed `[[SetPrototypeOf]]` throws, and
   `RequireObjectCoercible` still rejects null/undefined receivers.
@@ -826,15 +826,15 @@ accessor surface plus two `__proto__`/prototype-set bugs. Fixes in
   `[[SetPrototypeOf]]` accepts only a SameValue prototype
   (`SetImmutablePrototype`). `Object.setPrototypeOf(Object.prototype, …)`
   now throws and `Reflect.setPrototypeOf` returns false for any
-  non-identical value, even though the object is extensible — previously
+  non-identical value, even though the object is extensible, previously
   only the cycle check caught `{}` (which inherits Object.prototype), so
   `{ __proto__: null }` wrongly succeeded.
-- **The `[[SetPrototypeOf]]` cycle scan walked through proxies** — spec
+- **The `[[SetPrototypeOf]]` cycle scan walked through proxies**: spec
   9.1.2.2 step 8c stops the scan at any object whose `[[GetPrototypeOf]]`
   is not the ordinary internal method (proxies, module namespace objects),
   since a proxy's prototype can change at any time. `root.__proto__ =
   leaf` with a proxy in the chain now succeeds (`set-cycle-shadowed.js`).
-- **Proxy receivers bypassed the agent accessor path** — the runtime's
+- **Proxy receivers bypassed the agent accessor path**: the runtime's
   `find_ecma_accessor` bailed at any proxy, so `proxy.__proto__` reads and
   `proxy.__proto__ = v` writes fell to the crux `[[Get]]`/`[[Set]]`, which
   invoked the builtin getter/setter closures directly and threw "must be
@@ -861,7 +861,7 @@ the 37 host-dependent cross-realm fixtures now run and pass. Fixes in `crates/cr
 object,proxy,value}.rs`, `crates/runtime/src/{function,builtins/object,
 builtins/proxy}.rs`:
 
-- **Nested-proxy forwarding bypassed the agent dispatcher** — with no
+- **Nested-proxy forwarding bypassed the agent dispatcher**: with no
   get/set/apply/construct trap a proxy forwards to its target, and a
   proxy-over-proxy chain ends on an agent-dispatched built-in (e.g.
   `new Proxy(Object.prototype.hasOwnProperty, {})`); the crux-level call
@@ -872,33 +872,33 @@ builtins/proxy}.rs`:
   runs the closure directly to avoid re-entering the hook. `%eval%`
   reached as a value (indirect eval, or forwarded through a proxy) is
   dispatched before the built-in chain.
-- **The ordinary prototype-chain get skipped proxies** — `ordinary_get`
+- **The ordinary prototype-chain get skipped proxies**: `ordinary_get`
   recursed with the ordinary walk, so a proxy anywhere in the chain never
   ran its get trap (`Object.create(proxy).foo` was undefined). It now
   recurses through the parent's own `[[Get]]`
   (`parent.get_with_receiver_key`), matching `ordinary_set`.
-- **The chain-end set skipped the receiver's own-descriptor check** —
+- **The chain-end set skipped the receiver's own-descriptor check**,
   writing past the end of the chain called CreateDataProperty directly,
   so a proxy receiver's getOwnPropertyDescriptor trap never fired for the
   first write to a new key. The chain end now goes through the full
   step-2 receiver write (spec 10.1.3.3 steps 1c-2e).
-- **`Object.preventExtensions` ignored a failed `[[PreventExtensions]]`** —
+- **`Object.preventExtensions` ignored a failed `[[PreventExtensions]]`**,
   a proxy trap returning false was a silent no-op; it now throws a
   TypeError (spec 20.1.2.18 step 4).
-- **The `ownKeys` trap result was not type-checked** —
+- **The `ownKeys` trap result was not type-checked**,
   `CreateListFromArrayLike` with element kind «String, Symbol» accepted
   booleans/numbers/null/undefined by converting them to strings; it now
   throws a TypeError (spec 7.3.18 step 6.d).
-- **Callability followed the live target** — `typeof`/`IsConstructor` on a
+- **Callability followed the live target**: `typeof`/`IsConstructor` on a
   revoked proxy over a function reported "object"; ProxyCreate now
   records the target's callability in the slots (spec 10.5.15 steps
   10-11), so revocation does not remove the proxy's `[[Call]]`/`[[Construct]]`.
-- **The Proxy constructor had a `prototype` property** — spec 26.2.1
+- **The Proxy constructor had a `prototype` property**: spec 26.2.1
   gives %Proxy% none; the intrinsic `%Proxy.prototype%` still exists (with
   its `@@toStringTag`) but is no longer linked from the constructor. The
   `Proxy.revocable` revocation function also links `%Function.prototype%`
   instead of a null prototype (spec 28.2.2.1.1).
-- **The String-exotic `[[Delete]]` ignored virtual indices** — deleting
+- **The String-exotic `[[Delete]]` ignored virtual indices**: deleting
   `"0"` of `new String("str")` succeeded; in-range code-unit index
   properties are non-configurable (spec 10.4.3.7), so `delete
   stringProxy[0]` in strict mode now throws, and `DataView` setters with
@@ -919,10 +919,10 @@ A sweep of the whole `Reflect/*` tree (153 fixtures) reports **153 pass, 0
 fail, 0 skip** of 153 fixtures: every fixture passes (up from 151 pass /
 2 fail). Fixes in `crates/runtime/src/builtins/reflect.rs`:
 
-- **`Reflect` was missing its `@@toStringTag`** — spec 28.1.3.2 gives the
+- **`Reflect` was missing its `@@toStringTag`**: spec 28.1.3.2 gives the
   Reflect object `[Symbol.toStringTag] = "Reflect"` (`{ writable: false,
   enumerable: false, configurable: true }`); it is now defined at install.
-- **`Reflect.apply`/`construct` rejected a function `argumentsList`** —
+- **`Reflect.apply`/`construct` rejected a function `argumentsList`**,
   `CreateListFromArrayLike` (spec 7.3.18 step 1) throws only for
   primitives; a Function value is an Object, so `Reflect.apply(fn, null,
   new Function())` now reads its array-like indices from the function
@@ -931,14 +931,14 @@ fail, 0 skip** of 153 fixtures: every fixture passes (up from 151 pass /
 Validation: `cargo test --workspace` **4085 pass, 0 failures**;
 `cargo clippy --workspace --all-targets -- -D warnings` and
 `cargo fmt --all --check` clean. A full `built-ins` re-sweep shows **16,702
-pass / 571 fail / 0 crash / 3 hang** — exactly the 2 cluster fixtures
+pass / 571 fail / 0 crash / 3 hang**, exactly the 2 cluster fixtures
 fixed and 0 new failures across all 23,812 fixtures.
 
 ### Object.groupBy cluster sweep (Phase 18 conformance)
 
 A sweep of the `Object/groupBy/*` tree (14 fixtures) reports **14 pass, 0
 fail, 0 skip** of 14 fixtures: every fixture passes (up from 2 pass / 12
-fail — the method was not implemented at all). `Object.groupBy`
+fail, the method was not implemented at all). `Object.groupBy`
 (ES2024, spec 20.1.2.9) is now installed (length 2, name `groupBy`) and
 shares the GroupBy abstract operation (spec 7.3.38) with the existing
 `Map.groupBy` in `crates/runtime/src/builtins/keyed.rs`:
@@ -948,14 +948,14 @@ shares the GroupBy abstract operation (spec 7.3.38) with the existing
   `callback(value, k)` per element, closes the iterator on any abrupt
   completion (IfAbruptCloseIterator, including the key coercion), and
   closes it with a TypeError on the 2^53-1 step-count overflow.
-- **`Object.groupBy` uses ~property~ key coercion** — each callback
+- **`Object.groupBy` uses ~property~ key coercion**: each callback
   result goes through the agent-aware `ToPropertyKey`, so a Symbol key
   stays a Symbol, a Number/String/object key becomes its string, a
   throwing `toString` propagates, and `1`/`"1"`/`{toString: () => 1}`
   all group under `"1"` (`toPropertyKey.js`, `invalid-property-key.js`).
   `Map.groupBy` keeps ~collection~ coercion (`CanonicalizeKeyedCollectionKey`).
 - **The result is `OrdinaryObjectCreate(null)`** with one
-  `CreateDataPropertyOrThrow` per group — `Object.getPrototypeOf(obj) ===
+  `CreateDataPropertyOrThrow` per group, `Object.getPrototypeOf(obj) ===
   null` and `obj.hasOwnProperty === undefined` (`null-prototype.js`), with
   the group arrays in first-seen key order.
 
@@ -963,7 +963,7 @@ Validation: `cargo test --workspace` **4085 pass, 0 failures**;
 `cargo clippy --workspace --all-targets -- -D warnings` and
 `cargo fmt --all --check` clean. The `Map/groupBy` tree re-sweeps 14/0
 (the shared helper did not regress it), and a full `built-ins` re-sweep
-shows **16,714 pass / 559 fail / 0 crash / 3 hang** — exactly the 12
+shows **16,714 pass / 559 fail / 0 crash / 3 hang**, exactly the 12
 cluster fixtures fixed and 0 new failures across all 23,812 fixtures.
 
 ### Object freeze/seal/isFrozen/isSealed cluster sweeps (Phase 18 conformance)
@@ -974,20 +974,20 @@ Sweeps of the four integrity trees (`Object/freeze/*`, `Object/seal/*`,
 seal was already green): every runnable fixture passes. `SetIntegrityLevel`
 (spec 7.3.15) in `crates/runtime/src/builtins/object.rs` was rebuilt:
 
-- **Non-configurable properties were skipped** — the loop only touched
+- **Non-configurable properties were skipped**: the loop only touched
   configurable properties, so `Object.freeze` left a non-configurable
   writable data property writable. The freeze/seal descriptors now apply
   to every own property (`15.2.3.9-2-b-i-1.js`).
-- **Full descriptors were passed where the spec wants partial ones** — a
+- **Full descriptors were passed where the spec wants partial ones**: a
   proxy `defineProperty` trap saw `value`/`enumerable`/`get`/`set`
   populated; it now receives only `{ configurable: false, writable:
   false }` (data, freeze) or `{ configurable: false }` (accessors and
   seal), per spec steps 4-5 (`proxy-with-defineProperty-handler.js`).
 - **`[[PreventExtensions]]` ran after the defines and its `false` was
-  ignored** — it now runs first (spec step 1), a `false` status returns
+  ignored**, it now runs first (spec step 1), a `false` status returns
   `false`, and `Object.freeze`/`seal` throw the TypeError
   (`throws-when-false.js`).
-- **Primitive receivers** — `Object.freeze(0)` returned the boxed
+- **Primitive receivers**: `Object.freeze(0)` returned the boxed
   wrapper (and threw for null/undefined) instead of the primitive, and
   `Object.isFrozen(0)`/`Object.isSealed(0)` returned `false` instead of
   `true`. Both now take the spec's `Type(O) is not Object` shortcut and
@@ -1010,7 +1010,7 @@ findLastIndex 21/0 (up from 10-17 fails per method). Fixes in
 `crates/runtime/src/builtins/array.rs` plus two shared-correctness bugs in
 `crates/runtime/src/eval.rs` and `crates/runtime/src/module.rs`:
 
-- **`ArraySpeciesCreate` (spec 9.4.2.3) mishandled the constructor** — a
+- **`ArraySpeciesCreate` (spec 9.4.2.3) mishandled the constructor**: a
   `null` or primitive `constructor` was treated as undefined (throwing
   only on non-constructible species) instead of a TypeError, and a
   `null`/`undefined` `@@species` fell back to the *constructor* instead of
@@ -1019,27 +1019,27 @@ findLastIndex 21/0 (up from 10-17 fails per method). Fixes in
   null/primitive constructor or non-constructible species → TypeError
   (`create-ctor-non-object.js`, `create-species-null.js`,
   `create-species-undef.js`).
-- **`IsArray` (spec 7.2.2) did not recurse through proxies** — a proxy
+- **`IsArray` (spec 7.2.2) did not recurse through proxies**: a proxy
   over an array fell back to ArrayCreate, ignoring the species
   constructor. It now follows `[[ProxyTarget]]` recursively
   (`create-proxy.js`).
-- **The iteration methods read `length` after checking the callback** —
+- **The iteration methods read `length` after checking the callback**,
   spec order reads `LengthOfArrayLike` (step 3) before `IsCallable`
   (step 4), so a length getter's side effects/errors were invisible when
   the callback was missing or non-callable. All eleven methods now read
   the length first (`15.4.4.19-4-8/9/10/11/15` and the sibling
   `15.4.4.20-4-*`/`15.4.4.21-*` fixtures).
-- **A function declaration statement re-created the hoisted function** —
+- **A function declaration statement re-created the hoisted function**,
   `eval_function_declaration` instantiated and re-bound the function at
   statement evaluation, so `foo.prototype = new Array(1,2,3); function
   foo() {}` discarded the prototype assignment (the declaration statement
   evaluates to empty per spec 15.2.6; only the Annex B statement-position
-  forms — if/while bodies — create at evaluation). It now skips
+  forms, if/while bodies, create at evaluation). It now skips
   re-creation when the variable environment already holds the binding
   (`15.4.4.19-9-3.js`).
 - **Module functions carried the whole module as their `source`** and the
   synthesized `*default*` binding was clobbered to `undefined` after a
-  default function/class declaration was bound — the module instantiation
+  default function/class declaration was bound, the module instantiation
   now slices the function's own source span, and the `export default
   <expr>` binding initializer only runs when no default declaration exists
   (module `Function.prototype.toString` and default-export tests).
@@ -1049,8 +1049,8 @@ Validation: `cargo test --workspace` **4085 pass, 0 failures**;
 `cargo fmt --all --check` clean. A full `built-ins` sweep before/after
 (`git stash` baseline) shows **0 new failures and 0 new crashes** across
 all 23,812 fixtures, with **131 fixtures fixed** (the iteration clusters
-plus every species-using Array method — splice, concat, flat, toReversed,
-toSorted, with — and hoisted-function users).
+plus every species-using Array method, splice, concat, flat, toReversed,
+toSorted, with, and hoisted-function users).
 
 ### Array.of and Math cluster sweeps (Phase 18 conformance)
 
@@ -1059,7 +1059,7 @@ Sweeps report **Array/of 15 pass / 0 fail** (up from 7 pass / 8 fail) and
 `crates/runtime/src/builtins/array.rs` and
 `crates/runtime/src/builtins/math.rs`:
 
-- **`Array.of` used `ArraySpeciesCreate`** — spec 23.2.2.2 constructs the
+- **`Array.of` used `ArraySpeciesCreate`**: spec 23.2.2.2 constructs the
   *receiver* (`Construct(C, « len »)` when `IsConstructor(C)`) and only
   falls back to ArrayCreate for non-constructors, so a custom `this`
   constructor was never invoked (`Array.of.call(Pack, …)` missed the
@@ -1067,15 +1067,15 @@ Sweeps report **Array/of 15 pass / 0 fail** (up from 7 pass / 8 fail) and
   the items). The species machinery is not involved
   (`construct-this-with-the-number-of-arguments.js`, `sets-length.js`,
   `return-abrupt-from-data-property.js`).
-- **`Math` method functions had a null `[[Prototype]]`** — they were
+- **`Math` method functions had a null `[[Prototype]]`**: they were
   plain closure builtins never registered as intrinsics, so the realm's
   re-parenting post-pass skipped them and `Math.cos.bind` was undefined.
   The install now links `%Function.prototype%` explicitly
   (CreateBuiltinFunction, spec 10.2.3 step 1).
-- **`Math.sign` returned ±Infinity instead of ±1** — the infinite input
+- **`Math.sign` returned ±Infinity instead of ±1**: the infinite input
   short-circuit returned the input; it now falls through to the sign
   comparison (`Math.sign(-Infinity)` is -1).
-- **`ExactSum::to_f64` never negated negative sums** — the sign flag was
+- **`ExactSum::to_f64` never negated negative sums**: the sign flag was
   `-0.0`, and `-0.0 != 0.0` is false in IEEE 754, so every negative
   `Math.sumPrecise` result came out positive (the spec's maximally
   precise summation cases with negative exact sums). The magnitude is
@@ -1094,12 +1094,12 @@ A sweep of the `Object/fromEntries/*` tree (25 fixtures) reports **25 pass,
 `Object.fromEntries` in `crates/runtime/src/builtins/object.rs` now follows
 AddEntriesFromIterable (spec 10.1.4.3):
 
-- **Non-object entries were accepted** — a `null`/`undefined`/string/…
+- **Non-object entries were accepted**: a `null`/`undefined`/string/…
   entry was boxed and read for `"0"`/`"1"` instead of throwing. The loop
   now closes the iterator with a TypeError for any entry whose type is
   not Object (spec step 4.d; `iterator-closed-for-null-entry.js`,
   `string-entry-primitive-throws.js`).
-- **Abrupt entry steps left the iterator open** — a throwing `"0"`/`"1"`
+- **Abrupt entry steps left the iterator open**: a throwing `"0"`/`"1"`
   accessor and a throwing key `toString` propagated without closing the
   iterator. Each step now IfAbruptCloseIterators (`iterator-closed-for-
   throwing-entry-*-*.js`).
@@ -1116,24 +1116,24 @@ fail, 2 skip** of 66 fixtures: every runnable fixture passes (up from 58
 pass / 6 fail). Fixes in `crates/runtime/src/builtins/json.rs`:
 
 - **Boxed Number/String values used their stored primitive instead of the
-  conversion** — SerializeJSONProperty (spec 26.6.3.2 steps 4.a/4.d)
+  conversion**, SerializeJSONProperty (spec 26.6.3.2 steps 4.a/4.d)
   converts wrappers via `ToNumber`/`ToString`, which must invoke an
   overridden `valueOf`/`toString` (`new Number(42)` with `valueOf: () =>
   2` serialized as `42`, not `2`, and a throwing `toString` was never
   reached). The conversion now runs through the agent; Boolean/BigInt
   wrappers keep their stored primitive per the fixtures (`value-number-
   object.js`, `value-string-object.js`).
-- **The replacer array coerced every object** — only values with a
+- **The replacer array coerced every object**: only values with a
   [[StringData]]/[[NumberData]] slot are converted (via ToString, honoring
   overrides); `true`/`false`/`null`/Symbols/plain objects are ignored
   (spec 26.6.3.1 step 5; `replacer-array-wrong-type.js`,
   `replacer-array-number-object.js`).
-- **The `space` argument ToPrimitive'd every object** — a plain `{}`
+- **The `space` argument ToPrimitive'd every object**: a plain `{}`
   became `"[object Ob"` (the first ten chars of its `toString`) instead
   of the empty gap. Only objects with [[NumberData]]/[[StringData]] are
   converted (spec 26.6.3.1 steps 8-10); everything else is ignored
   (`space-wrong-type.js`, `space-string-object.js`).
-- **A revoked-proxy replacer array was treated as empty** — `IsArray` on
+- **A revoked-proxy replacer array was treated as empty**: `IsArray` on
   a revoked proxy throws a TypeError (spec 7.2.2 step 3.a); the replacer
   handling now rejects it before the property-list walk
   (`replacer-array-proxy-revoked.js`).
@@ -1151,7 +1151,7 @@ runnable fixture passes (up from 463 pass / 86 fail). The remaining skips
 are the `byteConversionValues.js` harness includes; the 2 cross-realm
 fixtures now run and pass. Fixes in `crates/runtime/src/builtins/dataview.rs`:
 
-- **Check ordering in the get/set paths** — `GetViewValue`/`SetViewValue`
+- **Check ordering in the get/set paths**: `GetViewValue`/`SetViewValue`
   ran the detached and bounds checks before coercing the arguments. The
   sequences now follow spec 25.4.2.2/25.4.2.3: an immutable buffer throws
   before `ToIndex(requestIndex)` (so no user code runs, `immutable-
@@ -1159,17 +1159,17 @@ fixtures now run and pass. Fixes in `crates/runtime/src/builtins/dataview.rs`:
   bounds checks (`detached-buffer-after-number-value.js`,
   `range-check-after-value-conversion.js`), and `ToIndex` runs before the
   detached check (`detached-buffer-after-toindex-byteoffset.js`).
-- **`IsViewOutOfBounds` was missing** — a fixed-length view whose range no
+- **`IsViewOutOfBounds` was missing**: a fixed-length view whose range no
   longer fits the shrunken buffer kept reading/writing stale memory; the
   get/set paths and the `byteLength`/`byteOffset` accessors now throw a
   TypeError for an out-of-bounds view (spec 25.4.1.5, `resizable-
   buffer.js`).
-- **Auto byte length** — a DataView created without a `length` argument on
+- **Auto byte length**: a DataView created without a `length` argument on
   a resizable buffer records `auto` [[ByteLength]] (spec 25.4.2.1 step
   8.b) and the accessors compute it from the current buffer length, so
   `new DataView(ab, 1)` on a 4-byte buffer reports 3 and follows
   `resize` (`resizable-array-buffer-auto.js`).
-- **Constructor argument-order and final checks** — the first detached
+- **Constructor argument-order and final checks**: the first detached
   check ran before `ToIndex(byteOffset)` (the offset's `valueOf` must run
   first, `DataView/detached-buffer.js`), and after
   `OrdinaryCreateFromConstructor` (whose prototype getter can run user
@@ -1191,31 +1191,31 @@ fail, 13 skip** of 3,411 fixtures: every runnable fixture passes (up from
 3,382 pass / 16 fail). Fixes in `crates/runtime/src/builtins/object.rs`
 and `crates/crux/src/object.rs`:
 
-- **`Object.isExtensible`/`Object.preventExtensions` on primitives** —
+- **`Object.isExtensible`/`Object.preventExtensions` on primitives**,
   both coerced the argument with `ToObject` first, so `undefined`/`null`
   threw and boxed primitives reported extensible. Per spec 20.1.2.13 /
   20.1.2.18 the argument is not coerced: `isExtensible` returns `false`
   and `preventExtensions` returns the value unchanged for any non-object
   (`15.2.3.13-1-*.js`, `15.2.3.10-1-*.js`).
-- **`Object.assign` ignored a failed `[[Set]]`** —
+- **`Object.assign` ignored a failed `[[Set]]`**,
   `receiver_create_data_property` discarded the `CreateDataProperty`
   status, so assigning onto a non-extensible or sealed target was silent.
   With Throw true the failure is now a TypeError per
   OrdinarySetWithOwnDescriptor step 3.e.ii
   (`target-is-non-extensible/sealed-property-creation-throws.js`).
-- **`Object.entries`/`Object.values` precomputed the key list** —
+- **`Object.entries`/`Object.values` precomputed the key list**,
   `EnumerableOwnProperties` re-reads each key's descriptor during
   iteration, so a getter hit for an earlier key can hide a later one
   (make it non-enumerable or delete it). The loops now check
   enumerability per key after the previous value was read
   (`getter-making-future-key-nonenumerable.js`,
   `getter-removing-future-key.js`).
-- **`Object.setPrototypeOf` boxed primitive targets** — step 3 of spec
+- **`Object.setPrototypeOf` boxed primitive targets**: step 3 of spec
   20.1.2.22 returns a non-object `O` unchanged (after
   `RequireObjectCoercible` and the prototype-type check), so
   `setPrototypeOf(true, null)` is `true`, not a boxed Boolean
   (`o-not-obj.js`, `bigint.js`).
-- **`Object` constructor ignored a derived NewTarget** — `new
+- **`Object` constructor ignored a derived NewTarget**: `new
   O({a:1})`/`Reflect.construct(Object, [x], O)` for a subclass `O` must
   build an empty object with `O.prototype` and ignore the value argument
   (spec 20.1.1.1 step 1); the constructor now compares NewTarget against
@@ -1240,14 +1240,14 @@ the runtime's own async suites) and the 33 `Promise/allKeyed`+
 `crates/runtime/src/builtins/promise.rs`, `crates/runtime/src/promise.rs`,
 and the harness:
 
-- **Combinator loop ordering and guards** — `Promise.all`/`allSettled`/
+- **Combinator loop ordering and guards**: `Promise.all`/`allSettled`/
   `any` incremented the remaining-counter *after* `then` ran, so a
   synchronously-fulfilled element double-resolved; the counter now bumps
   before `Invoke(then)` (spec 27.2.4.1.1 step 6.m precedes 6.n) and each
   element closure carries the spec's [[AlreadyCalled]] guard, so repeated
   calls from a thenable are no-ops (`call-resolve-element-after-return.js`,
   `reject-element-function-multiple-calls.js`).
-- **Iterator-close semantics** — an `IteratorStepValue` abrupt completion
+- **Iterator-close semantics**: an `IteratorStepValue` abrupt completion
   marks `[[Done]]` and must *not* close the iterator (`iter-*-err-no-
   close.js`), while an error from the `promiseResolve` call or `then`
   invocation closes it with the throw completion winning
@@ -1255,18 +1255,18 @@ and the harness:
   not-callable.js`). The `resolve` capability call on the done path is now
   caught and rejected (IfAbruptRejectPromise, `capability-resolve-throws-
   no-close.js`).
-- **`GetCapabilitiesExecutor` twice-call guard** — the executor captured
+- **`GetCapabilitiesExecutor` twice-call guard**: the executor captured
   by `NewPromiseCapability` silently overwrote on a second call; per spec
   27.2.1.5.1 a second call with a captured resolve/reject throws a
   TypeError while a prior `(undefined, undefined)` call leaves the slot
   free (`capability-executor-called-twice.js`).
-- **Species resolution read the wrong symbol** — `SpeciesConstructor`
+- **Species resolution read the wrong symbol**: `SpeciesConstructor`
   looked up `%Symbol.species%` in the intrinsic table (never registered),
   silently falling back to the constructor, so custom `@@species`
   overrides were ignored (`then/ctor-custom.js`, `then/ctor-throws.js`,
   `then/ctor-null.js`); it now reads the well-known symbol directly and
   TypeErrors on a non-constructor species.
-- **Builtin closures had null prototypes** — the combinator element
+- **Builtin closures had null prototypes**: the combinator element
   functions, the promise resolving functions, the executor, the finally
   closures, and the `%Promise%[@@species]` getter were created with a
   null [[Prototype]], so `resolveElement.call(...)` / `desc.get.call(...)`
@@ -1275,15 +1275,15 @@ and the harness:
   functions' `name` is the empty string per spec 27.2.1.3.1
   (`*-function-prototype.js`, `*-function-name.js`,
   `Symbol.species/return-value.js`).
-- **`finally` required a real promise** — spec 27.2.5.3 only requires an
+- **`finally` required a real promise**: spec 27.2.5.3 only requires an
   object receiver: thenables and proxies are accepted and their own
   `then` is invoked (`this-value-thenable.js`, `this-value-proxy.js`); the
   thenFinally/catchFinally closures are anonymous (`invokes-then-with-
   function.js`).
-- **`Promise.try` wrapped promise values** — per spec 27.2.4.11 step 6.b
+- **`Promise.try` wrapped promise values**: per spec 27.2.4.11 step 6.b
   a promise return value is returned unwrapped, including for subclass
   receivers (`avoids-wrap.js`, `avoids-wrap-for-subclass.js`).
-- **Harness** — `Test262Error.thrower` (the `sta.js` helper used as the
+- **Harness**: `Test262Error.thrower` (the `sta.js` helper used as the
   reject function across the capability fixtures) was missing, and the
   `await-dictionary` feature gate (out of scope) was added.
 
@@ -1300,29 +1300,29 @@ A sweep of the entire Atomics tree (`sweep.exe built-ins --filter
 every runnable fixture passes (up from ~208 pass / 35 fail). Fixes in
 `crates/runtime/src/builtins/atomics.rs`:
 
-- **Ops now run on non-shared buffers** — the RMW/read/write methods
+- **Ops now run on non-shared buffers**: the RMW/read/write methods
   (`add`/`and`/`compareExchange`/`exchange`/`load`/`or`/`store`/`sub`/
   `xor`) rejected plain `ArrayBuffer` views; per the modern spec they
   operate on them, and only `wait`/`waitAsync` (TypeError) and `notify`
   (returns 0) check sharing (`non-shared-bufferdata.js`).
-- **Write access rejects immutable buffers before any coercion** —
+- **Write access rejects immutable buffers before any coercion**,
   `ValidateTypedArray` with the ~write~ access mode throws a TypeError for
   an immutable buffer with no user code running (`immutable-buffer.js`);
   `load` (a read) still works on immutable buffers.
 - **`notify` accepts `BigInt64Array`** (ValidateIntegerTypedArray with
   waitable=true) and performs the index/count coercions before the
   non-shared 0-return (`bad-range.js`, `non-shared-bufferdata-*.js`).
-- **`wait` argument order** — the shared-buffer TypeError fires before any
+- **`wait` argument order**: the shared-buffer TypeError fires before any
   argument coercion (`non-shared-bufferdata-throws.js`), the timeout is
   coerced before the `[[CanBlock]]` check (`poisoned/symbol-for-timeout-
   throws.js`), and a non-suspending agent throws even for a zero timeout
   (`cannot-suspend-throws.js`).
-- **`waitAsync` immediate results** — a value mismatch or a zero-timeout
+- **`waitAsync` immediate results**: a value mismatch or a zero-timeout
   match returns `{ async: false, value: "not-equal" | "timed-out" }` per
   the pinned test262 semantics (`returns-result-object-value-is-string-
   *.js`, `null-for-timeout.js`); a positive-timeout match returns
   `{ async: true, value: promise }` left pending.
-- **`store` return values** — the returned Number is `ToIntegerOrInfinity`
+- **`store` return values**: the returned Number is `ToIntegerOrInfinity`
   of the input (normalizing `-0` to `+0`, `expected-return-value-negative-
   zero.js`, `good-views.js`) and the returned BigInt is the unwrapped
   `ToBigInt` (`store/bigint/good-views.js`).
@@ -1332,7 +1332,7 @@ every runnable fixture passes (up from ~208 pass / 35 fail). Fixes in
 Harness gates: the `$262.agent` host API now runs the `atomicsHelper`
 fixtures on real worker threads (the 112-fixture cluster) and the
 `CanBlockIsTrue` fixtures run with the main agent's `[[CanBlock]]` set
-(the 7 timeout-coercion waits) — both are un-skipped. The `ShadowRealm`
+(the 7 timeout-coercion waits), both are un-skipped. The `ShadowRealm`
 stage-3 proposal fixtures (64) are skipped like Temporal and
 await-dictionary.
 
@@ -1346,11 +1346,11 @@ Validation: `cargo test --workspace` **4099 pass, 0 failures**;
 
 The last 65 failing built-ins are closed: a full `built-ins` re-sweep
 (`--jobs 8 --batch 32 --timeout 120 --recheck-timeout 120`) reports
-**17,179 pass, 0 fail, 6,633 skip, 0 crash, 0 hang** of 23,812 fixtures
-— **100% of runnable** (up from 17,111 pass / 65 fail / 3 hang). Fixes
+**17,179 pass, 0 fail, 6,633 skip, 0 crash, 0 hang** of 23,812 fixtures,
+**100% of runnable** (up from 17,111 pass / 65 fail / 3 hang). Fixes
 across the VM, the parser, and the built-ins:
 
-- **Generator/async-generator try/finally (`ir.rs`, `generator.rs`)** —
+- **Generator/async-generator try/finally (`ir.rs`, `generator.rs`)**,
   `find_finally_frame` skipped a try region's own `Exit` step (the ip is
   advanced before dispatch), so the `finally` never ran on the normal
   path: `GeneratorPrototype/throw/try-finally*` (within-finally,
@@ -1359,22 +1359,22 @@ across the VM, the parser, and the built-ins:
   check admits the boundary step (`ip > covered_end + 1`).
   `generator_resume_abrupt` propagates a throw from a completed
   generator; iterator-result objects inherit `%Object.prototype%`.
-- **Async-generator prototype identity (`async_generator.rs`)** — the
+- **Async-generator prototype identity (`async_generator.rs`)**: the
   instance inherits the function's own `prototype` (OrdinaryCreateFrom-
   Constructor), not `%AsyncGenerator.prototype%` directly, and
   `%AsyncGenerator.prototype%` carries the own
   `@@toStringTag = "AsyncGenerator"` descriptor (the
   `%AsyncIterator.prototype%` tag stays "Async Iterator"), fixing
   `AsyncGeneratorPrototype/constructor` and `Symbol.toStringTag`.
-- **GeneratorFunction parameters (`parser/`)** — generator parameters
+- **GeneratorFunction parameters (`parser/`)**: generator parameters
   parse with the `[Yield]` grammar and a `YieldExpression` in them is a
   SyntaxError, so `GeneratorFunction('x = yield', '')` throws in the
   dynamic-constructor and in-generator call forms.
-- **`%ThrowTypeError%`** — one per realm, with `%Function.prototype%` as
+- **`%ThrowTypeError%`**: one per realm, with `%Function.prototype%` as
   its prototype, shared by `Function.prototype.caller`/`arguments` (get
   and set) and unmapped arguments objects' `callee`; registered
   (`Symbol.for`) symbols are rejected by `CanBeHeldWeakly`.
-- **Array residuals** — toSpliced deleteCount (no args deletes 0,
+- **Array residuals**: toSpliced deleteCount (no args deletes 0,
   start-only deletes the rest), `toReversed`/`toSorted`/`toSpliced`/`with`
   ignore @@species, revoked-proxy `isArray`, `toLocaleString` primitive
   receivers, sort stops at a comparefn error, the array-length
@@ -1382,30 +1382,30 @@ across the VM, the parser, and the built-ins:
   negative fromIndex, `push` 2^53-1 limit, splice clamp, the
   `Symbol.unscopables` change-array-by-copy removal, and the
   array-iterator detach check.
-- **WeakRef/FinalizationRegistry** — symbol targets and unregister tokens
+- **WeakRef/FinalizationRegistry**: symbol targets and unregister tokens
   (ES2023 `symbols-as-weakmap-keys`), GetPrototypeFromConstructor
   fallback, `deref` on a non-WeakRef receiver, `register.length` 2, and
   the spec `@@toStringTag` descriptors.
-- **Uint8Array base64/hex** — `toBase64`/`setFromBase64` run their option
+- **Uint8Array base64/hex**: `toBase64`/`setFromBase64` run their option
   getters before the spec's detached check, write-mode validation rejects
   immutable destinations before any argument is read, and the write
   re-checks detached/immutable after the options (a getter can detach).
-- **TypedArray `ToBigInt`** — `.set()`/`[[Set]]`/`fill`/`with`/DataView
+- **TypedArray `ToBigInt`**: `.set()`/`[[Set]]`/`fill`/`with`/DataView
   convert Numbers with strict `ToBigInt` (TypeError); only `BigInt()` and
-  the typed-array *constructor* use `NumberToBigInt` — so
+  the typed-array *constructor* use `NumberToBigInt`, so
   `BigInt64Array.prototype.set([1])` and `ta[0] = 1` throw.
-- **Set set-methods** — `isSubsetOf`/`isDisjointFrom`/`symmetricDiffer-
+- **Set set-methods**: `isSubsetOf`/`isDisjointFrom`/`symmetricDiffer-
   ence` walk the *live* `[[SetData]]`: a user `has`/`keys` can mutate the
   receiver mid-iteration, and deleted entries must not be visited.
-- **JSON.parse reviver** — CreateDataProperty failures are silent (a
+- **JSON.parse reviver**: CreateDataProperty failures are silent (a
   reviver that non-configurifies a property keeps the old value), and the
   strict-mode duplicate top-level function declarations of
   `reviver-forward-modifies-object.js` are legal (function declarations
   are var-scoped in both modes, spec 16.1.2).
-- **String and eval** — `eval()` with no argument ToStrings `undefined`
+- **String and eval**: `eval()` with no argument ToStrings `undefined`
   and parses it; `new String(Symbol)` throws (only the call form returns
   `SymbolDescriptiveString`).
-- **SuppressedError** — own properties are created in the spec order
+- **SuppressedError**: own properties are created in the spec order
   (message, error, suppressed).
 
 ### Temporal cluster sweep (Phase 18 conformance)
@@ -1419,7 +1419,7 @@ Instant, Now, the root-level namespace, the `toStringTag` fixtures,
 the PlainDate / PlainTime / PlainDateTime / PlainYearMonth /
 PlainMonthDay clusters, and ZonedDateTime** (PlainDate 652, PlainTime
 493, PlainDateTime 773, PlainYearMonth 509, PlainMonthDay 199,
-ZonedDateTime 901, Duration 540, and the root-level namespace 3 —
+ZonedDateTime 901, Duration 540, and the root-level namespace 3,
 all 0 skip). The last skip, `Duration/prototype/total/relativeto-date-
 limits.js`, was a real engine bug: a zero duration supplied sign 0 to
 `ComputeNudgeWindow`, collapsing the window before its out-of-range end could
@@ -1429,7 +1429,7 @@ integration, and the 16 Duration `relativeTo` content-skips with the
 zoned day-boundary range check below. Fixes in
 `crates/runtime/src/builtins/temporal/`:
 
-- **ZonedDateTime (`shell.rs`, `mod.rs`)** — the full cluster for
+- **ZonedDateTime (`shell.rs`, `mod.rs`)**: the full cluster for
   UTC and fixed-offset zones: `from` (records, ZonedDateTimeString
   strings, and property bags with the twelve-field read in ascending
   code point order and the disambiguation/offset/overflow options),
@@ -1456,13 +1456,13 @@ zoned day-boundary range check below. Fixes in
   given offset, use/exact balance the wall minus the offset, and
   ignore/wall use the zone's single possible instant.
 
-- **PlainDateTime (`shell.rs`)** — the full cluster: `with` (the
+- **PlainDateTime (`shell.rs`)**: the full cluster: `with` (the
   ten-field partial read in ascending code point order, then
   CalendarMergeFields with the iso8601 month/monthCode dedup),
   `withPlainTime` / `withCalendar`, `add`/`subtract`
   (AddDurationToDateTime: the 24-hour-day duration balances against the
   wall time and its day overflow joins the calendar date),
-  `round`/`toString` (RoundISODateTime — the rounded unit replaces its
+  `round`/`toString` (RoundISODateTime, the rounded unit replaces its
   field and the day overflow folds back into the date;
   `smallestUnit: "day"` is valid with a rounding increment capped at 1),
   `until`/`since` (GetDifferenceSettings with the datetime group,
@@ -1470,11 +1470,11 @@ zoned day-boundary range check below. Fixes in
   `toZonedDateTime` (fixed-offset/UTC `GetEpochNanosecondsFor`), and
   `from`/`equals` with property-bag support. Calendar getters reuse the
   PlainDate date-part helpers.
-- **PlainYearMonth / PlainMonthDay (`shell.rs`)** — the remaining
+- **PlainYearMonth / PlainMonthDay (`shell.rs`)**: the remaining
   methods: `with` (the partial month/monthCode/day/year reads in code-point
   order, then CalendarMergeFields and CalendarYearMonthFromFields /
   CalendarMonthDayFromFields), `add`/`subtract` (AddDurationToYearMonth:
-  only years and months — weeks/days/time throw; the first-of-month
+  only years and months, weeks/days/time throw; the first-of-month
   reference date passes RejectDateRange), `until`/`since`
   (DifferenceTemporalPlainYearMonth: week/day disallowed, smallestUnit
   defaults to month, the day fields zeroed, rounding at midnight),
@@ -1484,7 +1484,7 @@ zoned day-boundary range check below. Fixes in
   optional reference day/year (RejectISODate + RejectYearMonthRange /
   RejectDateRange), and `from` gains the property-bag branch with the
   calendar read first.
-- **String parsing (`iso.rs`, `shell.rs`)** — the `MonthDayString`
+- **String parsing (`iso.rs`, `shell.rs`)**: the `MonthDayString`
   format now accepts all RFC 9557 short forms (`MM-DD`, `MMDD`,
   `--MM-DD`, `--MMDD`); the previous branch was unreachable (a leading
   digit parsed as a year and a leading `-` as a sign).
@@ -1493,7 +1493,7 @@ zoned day-boundary range check below. Fixes in
   outside 01-12 at the parser, and the YearMonth/MonthDay conversions
   reject the Z designator and check the year-month range.
 
-- **ISO parsing (`iso.rs`)** — duplicate `u-ca` annotations are allowed
+- **ISO parsing (`iso.rs`)**: duplicate `u-ca` annotations are allowed
   (first wins) unless any is critical; lowercase duration designators
   (`p1y1m1dt1h1m1s`) parse; fractions are only valid after seconds in
   date-times (`05:07.123` is a RangeError); `[+Zoned]` requires an
@@ -1502,25 +1502,25 @@ zoned day-boundary range check below. Fixes in
   `parse_time_zone_identifier` IANA names must start with an
   alpha/`.`/`_` character; and 1000-digit duration strings use checked
   arithmetic.
-- **Options and units (`mod.rs`)** — `GetOptionsObject` rejects every
+- **Options and units (`mod.rs`)**: `GetOptionsObject` rejects every
   non-object; `get_temporal_unit` accepts all units plus `auto` with the
   unit-group validation moved to call sites *after* all options are
   read, fixing the order-of-operations fixtures (including the double
   `largestUnit` read in `GetDifferenceSettings`).
-- **Instant/duration math (`instant.rs`, `duration.rs`)** —
+- **Instant/duration math (`instant.rs`, `duration.rs`)**,
   `ToTemporalInstant` handles functions via ToPrimitive;
   `Instant.prototype.equals` brand-checks `this`; `is_valid_duration`
   uses saturating u128; `divide_rounded` normalizes to 54 bits and
   rounds half-even with a sticky bit (4 precision fixtures); and the
   nudge-to-calendar-unit total is a single correctly-rounded integer
   division with the sign as num XOR den.
-- **relativeTo limits** — `Duration.compare` resolves relativeTo before
+- **relativeTo limits**: `Duration.compare` resolves relativeTo before
   the equal-durations early return; the plain relativeTo checks
   ISODateWithinLimits at noon and the zoned path CheckISODaysRange on
   the wall date + instant epoch range; `total()` validates its plain
   date-time and the ±1-day zoned day-total boundary; the relativeTo
   offset converts via ToPrimitive (non-string TypeError).
-- **Duration round/total content-skips closed (16 fixtures)** — the
+- **Duration round/total content-skips closed (16 fixtures)**: the
   remaining `relativeTo`-dependent round/total fixtures and the
   `getOwnPropertyNames` key-set fixture now run: `round`/`total` with a
   zoned relativeTo at the instant-range edge throws RangeError when the
@@ -1528,11 +1528,11 @@ zoned day-boundary range check below. Fixes in
   (`next-day-out-of-range.js`), and the zero-sign day-boundary direction
   is +1 per GetDurationUnitLength (so a zero duration at the edge still
   probes the boundary).
-- **Harness** — failure messages name the thrown value (was "Uncaught
+- **Harness**: failure messages name the thrown value (was "Uncaught
   Object(Object#N)"); `temporalHelpers.js` is an allowed include; and
   the 16 content-skips above are mirrored exactly in
   `tools/skip_tally.js`.
-- **Intl era fields (`Intl.Era-monthcode` gate)** — the era-field
+- **Intl era fields (`Intl.Era-monthcode` gate)**: the era-field
   machinery for Temporal: `era`/`eraYear` read only on
   era-supporting calendars (ethioaa `"aa"` with the Amete Alem year,
   ethiopic year < 1 → `"aa"`/year + 5500, islamic year < 1 → `"bh"`/
@@ -1544,7 +1544,7 @@ zoned day-boundary range check below. Fixes in
   the supported set (`SUPPORTED_CALENDARS` trimmed to the 16 that
   `supportedValuesOf` reports; `islamic`/`islamic-rgsa` reject for
   Temporal while DateTimeFormat falls back to `islamic-civil`).
-- **Solar calendar arithmetic (`calendar.rs`)** — buddhist, coptic,
+- **Solar calendar arithmetic (`calendar.rs`)**: buddhist, coptic,
   ethiopic, ethioaa, indian (Saka), persian, roc, and
   islamic-umalqura: coptic/ethiopic use the 13-month structure
   (12 × 30 + 5/6-day epagomenal, leap iff year mod 4 == 3; the
@@ -1575,7 +1575,7 @@ The campaign surfaced and fixed the following conformance bugs (each now
 has a regression test):
 
 - **Destructuring assignment (interpreter):** array/object assignment
-  targets were unsupported — `[a, b] = rhs`, `({x, y} = obj)`, defaults,
+  targets were unsupported, `[a, b] = rhs`, `({x, y} = obj)`, defaults,
   rest, and nested patterns all failed at parse time or threw "Invalid
   left-hand side". `binding.rs` now implements
   DestructuringAssignmentEvaluation (13.15.5): reference evaluation runs
@@ -1593,9 +1593,9 @@ has a regression test):
   call time, so a destructuring parameter with a throwing `@@iterator`
   throws synchronously from the call (V8 does the same).
 - **Cover grammar:** `{x = 1}` shorthand-initializers are now accepted
-  where the object literal is (or may become) an assignment pattern —
+  where the object literal is (or may become) an assignment pattern,
   `result = {x = 1} = vals`, `[{x = 1}] = arr`, `for ({x = 1} of …)`,
-  arrow params — and rejected everywhere else, via a deferred
+  arrow params, and rejected everywhere else, via a deferred
   `cover_error` cleared by pattern contexts (`parse_assignment`,
   for-in/of heads, array/object/arrow-cover nesting).
 - **Pattern early errors:** reserved words (incl. escaped, incl.
@@ -1610,7 +1610,7 @@ has a regression test):
   escape branch now validates with the full IdentifierStart/Part predicate.
 - **Parser:** rest-element-must-be-last was not enforced in assignment
   targets, array arrow parameters, or `for-of` heads (`[...a, b] = c`); the
-  catch-parameter redeclaration rules were wrong — `catch (e) { var e; }`
+  catch-parameter redeclaration rules were wrong, `catch (e) { var e; }`
   and `var e; … catch (e)` were rejected while `catch (e) { let e; }` was
   accepted. Both directions now follow spec 15.1.8.
 - **For-head declarations:** `let`/`const` for-heads were instantiated as
@@ -1639,9 +1639,9 @@ The harness's skip taxonomy (also used by the sweep):
 | Skip category | Reason |
 |---|---|
 | `features: [Temporal]` (unimplemented clusters) | Temporal is a stage-4 proposal; the whole `Temporal/*` tree now runs (4,605 of 4,605 fixtures), including the `Intl.Era-monthcode`-gated era/eraYear getters, the solar calendars, and the Intl `toLocaleString` integration. |
-| `includes: [tcoHelper]` | (closed: proper tail calls now pass all 34 `tco-*` fixtures — see the Full-suite sweep section.) |
+| `includes: [tcoHelper]` | (closed: proper tail calls now pass all 34 `tco-*` fixtures, see the Full-suite sweep section.) |
 | Unsupported `includes:` | Fixtures needing harness helpers beyond `assert.js`, `compareArray.js`, `detachArrayBuffer.js`, `isConstructor.js`, `propertyHelper.js`, `testAtomics.js`, `testTypedArray.js` are not run. |
-| CRLF checkout artifact | On a Windows checkout with `core.autocrlf`, git rewrites the pinned test262 submodule's LF text files to CRLF, so the byte-exact fixtures (`import/import-bytes/bytes-from-{js,json,txt}` and `Function/prototype/toString/line-terminator-normalisation-LF`) read `\r\n` where the corpus asserts `\n`. They are skipped in `run_fixture` only when the working tree is actually CRLF — a clean LF checkout runs them. |
+| CRLF checkout artifact | On a Windows checkout with `core.autocrlf`, git rewrites the pinned test262 submodule's LF text files to CRLF, so the byte-exact fixtures (`import/import-bytes/bytes-from-{js,json,txt}` and `Function/prototype/toString/line-terminator-normalisation-LF`) read `\r\n` where the corpus asserts `\n`. They are skipped in `run_fixture` only when the working tree is actually CRLF, a clean LF checkout runs them. |
 | `staging/sm` (SpiderMonkey shell suite) | SpiderMonkey's own shell test suite, imported into the staging tier; not ECMAScript conformance. It needs SM-only harness helpers (`sm/non262-*-shell.js`, `sm/assertThrowsValue.js`) and asserts SM-shell-specific semantics. Skipped in `run_fixture` for the staging area only. |
 
 ## Expected non-runnable tests
@@ -1649,13 +1649,13 @@ The harness's skip taxonomy (also used by the sweep):
 These categories are expected to stay non-runnable and are not counted
 against the runnable pass-rate target:
 
-- **Unimplemented ECMA-402 pieces** — none remain: the `intl402/` area is
+- **Unimplemented ECMA-402 pieces**: none remain: the `intl402/` area is
   fully runnable (3,365/0/0 of 3,365).
-- **`dynamic import` specifier resolution** — `import(specifier)` resolves
+- **`dynamic import` specifier resolution**: `import(specifier)` resolves
   through host hooks (`HostResolveImportedModule`); the test262 harness
   registers the `_FIXTURE` siblings, so fixtures run, but no general
   filesystem loader ships with the CLI.
-- **Host-dependent behavior** — e.g. `Atomics.wait` on the main thread
+- **Host-dependent behavior**: e.g. `Atomics.wait` on the main thread
   (throws, per spec `[[CanBlock]] = false`), timers (host globals, provided
   by the embedding API), `SharedArrayBuffer` worker creation (host hook).
 
@@ -1698,18 +1698,18 @@ at the 15s deadline.)
 instead of re-reading `@@asyncIterator`, the `/v` parser rejects string
 members (`\q{…}` or a strings property escape) inside a negated character
 class as a SyntaxError, and the `Intl.Era-monthcode` gate is flipped (the
-era-field getters and the solar-calendar arithmetic — buddhist, coptic,
-ethiopic, ethioaa, indian, persian, roc, islamic-umalqura — pass). The 234
+era-field getters and the solar-calendar arithmetic, buddhist, coptic,
+ethiopic, ethioaa, indian, persian, roc, islamic-umalqura, pass). The 234
 hangs are slow-but-correct fixtures, not bugs: ~222
 `RegExp/property-escapes/generated/*` fixtures (each runs a
 ~1.1M-code-point `regex.test` loop) and 3
 `TypedArray/prototype/copyWithin` 10,000-element allocations pass with the
-long config — batches containing several of them exceed the 120s deadline
+long config, batches containing several of them exceed the 120s deadline
 under 8-job load and the recheck misclassifies them; none are Temporal (the
 `Temporal/*` filter sweep is 4,605 pass / 0 fail / 0 skip / 0 hang).
-The Temporal clusters implemented so far — Duration, Instant, Now, the
+The Temporal clusters implemented so far, Duration, Instant, Now, the
 root-level namespace, toStringTag, the five Plain clusters, ZonedDateTime,
-and `Date.prototype.toTemporalInstant` — moved 4,569 of the 4,611
+and `Date.prototype.toTemporalInstant`, moved 4,569 of the 4,611
 Temporal-featured fixtures from skip to pass (the 16 Duration
 `relativeTo` content-skips closed last); the
 remaining 42 `toLocaleString` (Intl) content-skips closed with the
@@ -1717,21 +1717,21 @@ ECMA-402 integration, and the final date-limits skip closed with the
 nudge-sign fix.)
 
 (Runnable = pass + fail + hang; no skips remain.) The
-TCO cluster closed last (34/34 — proper tail calls, the one spec feature
+TCO cluster closed last (34/34, proper tail calls, the one spec feature
 V8 and JSC still skip: a return in the innermost try's own
 catch-without-finally or finally clause replaces the frame, with the
 try's handler already consumed and the pending control discarded by the
 frame reset; a return in a try Block or under any enclosing try stays a
 normal call so the catch/finally still runs). The
 module loader was un-skipped (the `flags: [module]`
-fixtures now run through the real source-text-module machinery — parse,
+fixtures now run through the real source-text-module machinery, parse,
 link, DFS evaluation, top-level await, dynamic import, and `import.meta`),
 then the source-phase-imports (`import.source()`), import-defer
 (`import.defer()`), import-bytes, and import-text proposal clusters were
-un-skipped too: the language row went from 23,184/540 to 23,724/0 — the
+un-skipped too: the language row went from 23,184/540 to 23,724/0, the
 last skips were the 34 TCO fixtures, closed by the proper-tail-call
 implementation (frame replacement in `Vm::run_inner`, returns in the
-innermost try's catch/finally clause eligible — see below), and the
+innermost try's catch/finally clause eligible, see below), and the
 built-ins row from 18,323/5,489 to 18,331/5,481. The import-defer work closed last (114/114 in the cluster): deferred
 namespaces trigger synchronous evaluation on export access with
 `PerformPromiseThen`-based async dependency aggregation,
@@ -1741,7 +1741,7 @@ propagation. The `byteConversionValues` (19: Float16) and
 (185: resizable-buffer TypedArray semantics) clusters were un-skipped
 before that, taking the totals from 41,838 to 42,042 pass. The regExpUtils
 cluster closed next (586/586, taking the totals from 43,107 to 43,693):
-the `/v`-flag unicodeSets machinery was completed — the full binary-property
+the `/v`-flag unicodeSets machinery was completed, the full binary-property
 and property-of-strings tables are now derived at build time from the pinned
 test262 fixtures (`crates/unicode/build.rs` → `derived_regexp_tables.rs`),
 the `gc=`/binary/script
@@ -1769,7 +1769,7 @@ the main agent's `[[CanBlock]]` set, and the harness installs a real
 stale view blocks) was fixed by pre-allocating resizable/growable buffers
 at their capacity and updating the shared byte length in place. The last 39
 failures closed with the async-test engine work: `Array.fromAsync` was
-rewritten to spec 23.1.2.4.1 — 0-length array-likes skip the loop
+rewritten to spec 23.1.2.4.1, 0-length array-likes skip the loop
 entirely, array-like elements are awaited before the mapper runs, the
 result's `length` is set on completion (a read-only length or throwing
 setter rejects), mapper rejections close the iterator, unmapped iterator
@@ -1792,13 +1792,13 @@ with the async-body disposal driver: an async function/generator body's
 `using` resources are drained at completion and disposed in reverse
 registration order (spec 9.4.3 DisposeResources), awaiting async-dispose
 hints through the job queue and folding a throwing disposal into the
-completion — a second throw nests a `SuppressedError`, and the body's
+completion, a second throw nests a `SuppressedError`, and the body's
 promise (or generator request) settles only after the disposals finish.
 Scopes inside resumable bodies dispose the same way: `await using`
 statements and their enclosing blocks compile to VM steps
 (`UsingInit`/`SetFunctionName`), `LeaveBlock` folds sync disposals and
 suspends on async ones, and a caught throw disposes the discarded try-block
-envs at `CatchBind` (delivering the folded value to the catch) — the
+envs at `CatchBind` (delivering the folded value to the catch), the
 `await using _ = null` microtask semantics and the `break`-before-`await
 using` case included. A statement containing a `break`/`continue` is
 compiled (not batched to the tree walker) so exits resolve across the
@@ -1871,7 +1871,7 @@ Object.fromEntries, JSON.stringify, DataView, Object statics/
 constructor, Promise, Atomics, and the final Array/generator, Throw-
 TypeError, WeakRef/FinalizationRegistry, Uint8Array base64/hex, Set
 set-methods, JSON/parse, TypedArray BigInt, String, and SuppressedError
-closures (all 0 fail). The built-ins area has no skips — the Temporal tree (including
+closures (all 0 fail). The built-ins area has no skips, the Temporal tree (including
 `Date.prototype.toTemporalInstant`, the 16 Duration `relativeTo`
 content-skips, and the `Intl.Era-monthcode`-gated era/eraYear
 getters and solar calendars), atomicsHelper
@@ -1909,7 +1909,7 @@ allowed in sloppy mode (B.3.3.4).
 The first sweep in a debug build reported 27 hangs and 92 crashes. Both are
 resolved:
 
-- **Slow builtin calls (the "decodeURI hangs")** — every builtin call walked a
+- **Slow builtin calls (the "decodeURI hangs")**: every builtin call walked a
   34-entry linear dispatch chain (`function::call_inner`), each entry doing an
   `intrinsics.get` (a `JsString` allocation + hash lookup). The dispatch
   resolution is now memoized per function id
@@ -1917,7 +1917,7 @@ resolved:
   after the first call. Builtin calls dropped from ~100-400µs to ~2µs, making
   the Sputnik stress fixtures (57-65k throw/catch iterations) 40-80× faster;
   the reported hangs were simply slow fixtures, not infinite loops.
-- **`Array.prototype.splice` integer limit** — the spec's step-8 check
+- **`Array.prototype.splice` integer limit**: the spec's step-8 check
   (`len + insertCount - actualDeleteCount > 2^53-1` → TypeError) was missing,
   so a splice on a `2^53`-length array-like entered a 2^53-iteration tail
   shift. The check now throws before any shifting
@@ -1926,10 +1926,10 @@ resolved:
   build runs them cleanly.
 
 The original 7,314 failures triaged into (the language area has since
-closed to 0 fail — see the language-row note above):
+closed to 0 fail, see the language-row note above):
 
 - **Missing built-ins (excluded from runnable):** Temporal (~3,100
-  fixtures across `Temporal/*` — not implemented), ShadowRealm (47, now
+  fixtures across `Temporal/*`, not implemented), ShadowRealm (47, now
   skipped as out of scope), and Intl (never collected). Excluding them,
   the runnable pass rate is ~80%.
 - **Systematic bug clusters (runnable, fix targets):**
@@ -1945,7 +1945,7 @@ closed to 0 fail — see the language-row note above):
     `GetIterator` also now caches a non-callable `next` without throwing, so
     a `yield` between GetIterator and the first step suspends first
   - `TypedArray/prototype` (944→183) and `TypedArrayConstructors/internals`
-    (119→7): the Integer-Indexed exotic methods (spec 10.4.7) were fixed —
+    (119→7): the Integer-Indexed exotic methods (spec 10.4.7) were fixed,
     `CanonicalNumericIndexString` now implements the ToNumber↔ToString
     round-trip (so `-1` and `1.1` are canonical index strings); `-0` is not
     a valid index; a detached buffer reads *undefined*, ignores writes, and
@@ -1963,12 +1963,12 @@ closed to 0 fail — see the language-row note above):
   - `Iterator/prototype` (278)
   - `dynamic-import/syntax/valid` (137), class-element `delete` early
     errors (192), `eval-code/direct` (103), `identifiers` (58),
-    `arguments-object` — all closed by the eval-caller-context and
+    `arguments-object`, all closed by the eval-caller-context and
     field-initializer work above (the direct-eval cluster was the last to
     fall, via the `new.target`/`super`/PrivateIdentifier eval rules)
   - Annex B: the sloppy `eval`/`function`/`global` function-declaration
     semantics (410), `RegExp` (57), `escape`/`unescape` (35), and the
-    assignment-target and `for-in` initializer clusters are all closed now —
+    assignment-target and `for-in` initializer clusters are all closed now,
     see the Annex B section below (0 fail).
 
 ## Annex B
@@ -1985,7 +1985,7 @@ build; the previously-skipped async-flagged `$DONE` fixture runs now that
 the async harness is provided). This closed the
 area from 327 pass / 663 fail. The clusters:
 
-- **Sloppy block-level function declarations (B.3.2 / B.3.3)** — the ~410
+- **Sloppy block-level function declarations (B.3.2 / B.3.3)**: the ~410
   `eval-code`/`function-code`/`global-code` fixtures. A block-level
   FunctionDeclaration in sloppy code now hoists a var-scoped binding
   (initialized to *undefined*) at declaration instantiation
@@ -1993,7 +1993,7 @@ area from 327 pass / 663 fail. The clusters:
   EvalDeclarationInstantiation), resets it at block entry
   (BlockDeclarationInstantiation), and copies the block-scoped binding
   into the variable environment when the declaration statement is
-  evaluated — unless the hoist would produce an early error (a lexical
+  evaluated, unless the hoist would produce an early error (a lexical
   conflict in an enclosing scope, a formal parameter/`arguments`, or a
   non-simple catch parameter). Statement-position forms (`if (x)
   function f(){}`) behave as if wrapped in a block, and direct evals
@@ -2001,26 +2001,26 @@ area from 327 pass / 663 fail. The clusters:
   The parser now accepts `let f; { function f(){} }`-style shadowing and
   `catch (f) { function f(){} }` in sloppy mode, with the Annex B
   relaxations tracked per scope.
-- **RegExp legacy escapes (B.1.4)** — `\c` + non-ASCII letter is a literal
+- **RegExp legacy escapes (B.1.4)**: `\c` + non-ASCII letter is a literal
   `\c`; inside a class, `\c` + digit/`_` is a control escape and decimal
   escapes are legacy octal (`[\12-\14]` = `\n`-`\f`); `\8`/`\9` are
   identity escapes; the octal grammar caps at two digits for `\4`-`\7`
   (`\400` = `\40` + `0`). Lone surrogates survive the regexp source
   getter and the `eval` path (eval now parses UTF-16 source directly).
-- **`escape`/`unescape` and `Date.prototype.setYear`** — implemented per
+- **`escape`/`unescape` and `Date.prototype.setYear`**: implemented per
   B.2.1.1/B.2.1.2 and B.2.5, plus `toGMTString`/`trimLeft`/`trimRight` as
   same-function aliases.
-- **`RegExp` legacy statics and `compile` (B.2.5)** — the `$1`-`$9` and
+- **`RegExp` legacy statics and `compile` (B.2.5)**: the `$1`-`$9` and
   `input`/`$_`/`lastMatch`/`$&`/`lastParen`/`$+`/`leftContext`/
   `rightContext` accessors with the `%RegExp%`-receiver TypeError, and
   `RegExp.prototype.compile` (returns the receiver, brand-checks
   `[[RegExpConstructor]]`, resets `lastIndex`).
-- **Assignment targets and `for-in` initializers** — a call-expression
+- **Assignment targets and `for-in` initializers**: a call-expression
   assignment target (`f() = g()`, postfix `++`, `for (f() in …)`) parses
   in sloppy mode and throws a ReferenceError at runtime with the callee
   and arguments evaluated first (B.3.x web-compat); `for (var a = init in
   …)` evaluates `init` once before the RHS.
-- **Harness** — `$262.evalScript` now evaluates as a Script (global
+- **Harness**: `$262.evalScript` now evaluates as a Script (global
   declaration instantiation) via a new `%evalScript%` runtime intrinsic,
   and JS-thrown negative values are matched by `constructor.name`.
 
@@ -2040,7 +2040,7 @@ and deliberately kept out of `all`, so the documented three-area baseline is
 unaffected.
 
 The `staging/sm` subtree is SpiderMonkey's own shell test suite, imported into
-test262's staging tier — not ECMAScript conformance. It needs SM-only harness
+test262's staging tier, not ECMAScript conformance. It needs SM-only harness
 helpers (`sm/non262-*-shell.js`, `sm/assertThrowsValue.js`) and asserts
 SM-shell-specific semantics, so `run_fixture` skips it whole (mirrored in
 `tools/skip_tally.js`); it was left in the `fail` bucket in the first pass and
@@ -2049,7 +2049,7 @@ signal.
 
 With `sm/` skipped, the tier measures **77 pass, 0 fail, 1,406 skip, 0 crash, 0
 hang of 1,483 fixtures** (`--jobs 8 --batch 32 --timeout 15 --recheck-timeout
-15`, release) — every runnable staging fixture passes (the 1,406 skips are all
+15`, release), every runnable staging fixture passes (the 1,406 skips are all
 `sm`). Six fixes came out of this tier:
 
 - **The variable-length-typed-array `preventExtensions`/`seal` trio now
@@ -2078,20 +2078,20 @@ hang of 1,483 fixtures** (`--jobs 8 --batch 32 --timeout 15 --recheck-timeout
   the env stack and runs disposal, the thrown-value twin of
   `route_step_error`. Separately, an async context that fell back to a sync
   `@@dispose` method took the async-dispose hint and awaited the method's
-  return value — GetDisposeMethod keeps the async hint only for an actual
+  return value, GetDisposeMethod keeps the async hint only for an actual
   `@@asyncDispose`, so the fallback is now sync-hint and its result is not
   awaited (both `eval.rs::create_disposable_resource` for `await using` and
   `get_dispose_method`/`drive_async_disposal` for `AsyncDisposableStack`).
 - **The two source-phase-import failures now pass.** A static `import source x
   from './mod.js'` of a module with no source representation (a Source Text
-  Module) must throw a SyntaxError — its `[[ModuleSource]]` is *empty*;
+  Module) must throw a SyntaxError, its `[[ModuleSource]]` is *empty*;
   `module_source_object` now rejects a `ModuleKind::Js` module, so the static
   and dynamic paths both reject. The dynamic `import.source(…)` also resolved
   the raw source *text*; it now resolves the Module Source *object* (proposal
   ContinueDynamicImport), whose `[[Prototype]]` is a host subclass prototype
   (`%ModuleSource.prototype%`) whose own prototype is
   `%AbstractModuleSource%.prototype`. The harness registers the test262
-  `<module source>` host artifact for every module fixture — it is referenced
+  `<module source>` host artifact for every module fixture, it is referenced
   only dynamically, so the static-request walk never saw it.
 - **The public auto-accessor failure now passes (the tier is fully green).**
   The parser parsed `accessor name …` as a plain class field ("the accessor
@@ -2124,7 +2124,7 @@ hang of 1,483 fixtures** (`--jobs 8 --batch 32 --timeout 15 --recheck-timeout
 
 - The pinned corpus is at **100% of runnable**: **51,998 pass / 0 fail /
   0 crash / 0 hang / 0 skip** of 51,998 fixtures (release build, 15s
-  deadlines) — language 23,726 / built-ins 23,821 of 23,821 / annexB 1,086 /
+  deadlines), language 23,726 / built-ins 23,821 of 23,821 / annexB 1,086 /
   intl402 3,365. No skips remain: the last one,
   `relativeto-date-limits.js`, was a real engine bug (a zero duration
   supplied sign 0 to `ComputeNudgeWindow`), fixed by normalising the sign to
@@ -2138,28 +2138,28 @@ hang of 1,483 fixtures** (`--jobs 8 --batch 32 --timeout 15 --recheck-timeout
   gaps (`Array.fromAsync`, `for await`, and the dynamic-import cycle)
   closed last; the `byteConversionValues` (Float16) and
   `resizableArrayBufferUtils` (resizable-buffer TypedArray) clusters
-  un-skipped after them; and the module loader un-skipped last — the 817
+  un-skipped after them; and the module loader un-skipped last, the 817
   language + 13 built-ins `flags: [module]` fixtures now run through the
   source-text-module machinery (parse, link, DFS evaluation, top-level
   await, dynamic import, `import.meta`), with `verify-dfs.js` closing the
   final failure via the async dynamic-import load. The source-phase,
   import-defer, import-bytes, and import-text proposal clusters were then
   un-skipped too (the import-defer cluster closed last, 114/114), the
-  regExpUtils cluster closed after them (586/586 — the full /v unicodeSets
+  regExpUtils cluster closed after them (586/586, the full /v unicodeSets
   machinery, see the Full-suite sweep section), and the atomics cluster
-  closed last (119/119 — the `$262.agent` worker-thread host API, the
+  closed last (119/119, the `$262.agent` worker-thread host API, the
   *"ok"* notify semantics for `Atomics.wait`, and the cross-thread
-  `waitAsync` resolution), closing the TCO cluster last (34/34 — proper
+  `waitAsync` resolution), closing the TCO cluster last (34/34, proper
   tail calls, the one spec feature V8 and JSC still skip: returns in the
   innermost try's catch-without-finally or finally clause frame-replace,
   with the try's handler already consumed and the pending control
   discarded by the frame reset; a return in a try Block or under any
   enclosing try stays a normal call so the catch/finally still runs)
   (48,234 pass / 154 skip / 234 slow-but-correct hang
-at that point; the Temporal clusters — Duration, Instant, Now, the namespace,
-toStringTag, the five Plain clusters, and ZonedDateTime — and
+at that point; the Temporal clusters, Duration, Instant, Now, the namespace,
+toStringTag, the five Plain clusters, and ZonedDateTime, and
 `Date.prototype.toTemporalInstant` were all un-skipped after, and the
-`Intl.Era-monthcode` gate flipped last — the era-field getters and the
+`Intl.Era-monthcode` gate flipped last, the era-field getters and the
 solar-calendar arithmetic (buddhist, coptic, ethiopic, ethioaa, indian,
 persian, roc, islamic-umalqura) pass; the `await-dictionary` and `ShadowRealm`
 gates below closed too; the final date-limits skip closed with the
@@ -2172,9 +2172,9 @@ nudge-sign fix.)
   cache) plus one real `Array.prototype.splice` infinite loop (fixed); the
   only hangs now are the slow-but-correct RegExp property-escape and
   TypedArray `copyWithin` fixtures above. Use a release build
-  (`cargo run --release -p test262 --bin sweep`) — the debug build's deep
+  (`cargo run --release -p test262 --bin sweep`), the debug build's deep
   recursion can overflow the stack on heavy fixtures.
-- The `intl402/` area is swept too (3,365 pass / 0 fail / 0 skip of 3,365 —
+- The `intl402/` area is swept too (3,365 pass / 0 fail / 0 skip of 3,365,
   the area is fully runnable; the corpus grew by 8 in the 2026-09 pull). The
   Temporal gate no longer skips a
   `features: [Temporal]` fixture just for living outside the `Temporal/<Type>/`
@@ -2191,7 +2191,7 @@ nudge-sign fix.)
   weekdays (`german-weekday-no-year`). No intl402 fixtures are skipped now. The
   harness prelude also
   now sets `assert._formatIdentityFreeValue`, which `deepEqual.js`'s failure
-  formatter calls — without it a failing `deepEqual` reported as "undefined is not
+  formatter calls, without it a failing `deepEqual` reported as "undefined is not
   a function". Anything else that fails the sweep should be triaged into bug /
   host-dependent / missing-hook categories and either fixed or documented here.
 - `Intl.Locale-info` is implemented (it was the other 60 `intl402` skips): the
@@ -2257,19 +2257,19 @@ nudge-sign fix.)
   initializer; a class returns a replacement; an accessor returns
   `{ get, set, init }`), and running `addInitializer` callbacks in their
   phases (instance before fields; static before static fields; class last).
-  `access` is synthesized as real JS closures over the key — or over `#name`
-  with the class PrivateEnvironment — so it runs the full
+  `access` is synthesized as real JS closures over the key, or over `#name`
+  with the class PrivateEnvironment, so it runs the full
   Get/Set/HasProperty protocol (getters, proxies, brand checks). Decorators on
   a static block are a SyntaxError, and a private auto-accessor (`accessor #x`)
   presents `kind:"accessor"` over its private getter/setter pair. Validated by
   26 hand-written unit tests in the module; `all` (48632/0/1) and `staging`
   (77/0/1406) are unchanged.
 - Known flaky fixture: `TypedArray/prototype/reduce/callbackfn-arguments-default-accumulator.js`
-  (Strict) intermittently fails with `Expected SameValue(«43», «41») to be true` — the second
+  (Strict) intermittently fails with `Expected SameValue(«43», «41») to be true`, the second
   reduce callback's `arguments[0]` reads 43 (iteration 1's `kValue`) instead of 41 (iteration
   0's callback return). ~1-2% flake: passes in isolation, under `--gc-stress`, and in most
   full-area sweeps; reproduces only when the fixture runs in a batch worker process after the
   17 preceding `TypedArray/prototype/reduce/*` fixtures (the 16 BigInt ones plus
-  `callbackfn-arguments-custom-accumulator`). Root cause unpinned — heap-state/timing
+  `callbackfn-arguments-custom-accumulator`). Root cause unpinned, heap-state/timing
   dependent, consistent with a stale-pointer / GC-compaction misread in the strict-unmapped
   `arguments` path. Treat a lone failure here as a re-run, not a regression.

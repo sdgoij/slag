@@ -1,6 +1,6 @@
-# Registering native functions through the public embedding API — proposal
+# Registering native functions through the public embedding API: proposal
 
-> **Status:** all four slices landed — `HostFn`, `FunctionCall` (including the
+> **Status:** all four slices landed, `HostFn`, `FunctionCall` (including the
 > re-entrant `call`/`construct`/`eval` and `create_object`/`create_function`/
 > `define_accessor`, `is_construct`, and `new_target`),
 > `Context::{create_function, create_constructor, create_object, register_fn,
@@ -55,7 +55,7 @@ globals.
 | `embed.rs` `install_fs`/`install_timers`/`install_console` | same; `current_agent_mut()` (TLS) inside the closure to reach the agent |
 | `runtime::api::FunctionTemplate` (`api/template.rs`) | host functions + accessors + constructors, but this is the **V8-shaped** API, not part of the `slag` facade |
 | `crates/jsc/src/object.rs` `JSObjectMakeFunctionWithCallback` | the same `Function::create_builtin`, proving the capability is not runtime-internal |
-| `crates/slag/examples/wasm_binding/dom.rs` | registers `el.*`/`dom.*` native methods — but only by depending on `crux` directly, which the facade deliberately hides |
+| `crates/slag/examples/wasm_binding/dom.rs` | registers `el.*`/`dom.*` native methods, but only by depending on `crux` directly, which the facade deliberately hides |
 
 The core primitive is `crux::function::Function::create_builtin`
 (`crates/crux/src/function.rs`):
@@ -103,12 +103,12 @@ thrown Error object (`builtins::error::to_throwable`, e.g. `runtime/src/eval.rs`
 
 **Non-goals (this proposal)**
 
-- The V8-shaped `runtime::api` surface — it already covers templates/accessors
+- The V8-shaped `runtime::api` surface, it already covers templates/accessors
   and is not the facade.
 - Host *classes* / `new`-able constructors and accessor properties on
   `JsObject`. Both are natural Phase B/C follow-ups (sections 9.3, 9.4), out of
   scope for the first cut.
-- WASM/JSC drop-ins — they have their own bindings.
+- WASM/JSC drop-ins, they have their own bindings.
 
 ## 4. Proposed API
 
@@ -157,7 +157,7 @@ impl Context {
         callback: HostFn,
     ) -> Result<JsValue, JsError>;
 
-    /// A plain object inheriting %Object.prototype% — a namespace to hang
+    /// A plain object inheriting %Object.prototype%, a namespace to hang
     /// functions on, without the `eval("({})")` workaround.
     pub fn create_object(&self) -> Result<JsObject, JsError>;
 
@@ -202,7 +202,7 @@ impl JsValue {
 `to_throwable` returns `error.value` directly when present, so `thrown()`
 produces an exact-value throw while `JsError::new(ErrorKind::TypeError, …)`
 produces a real `TypeError` object. Optional ergonomics: `JsError::type_error`,
-`range_error`, `syntax_error` constructors — cheap, but deferrable.
+`range_error`, `syntax_error` constructors, cheap, but deferrable.
 
 ### 4.4 Worked example
 
@@ -274,7 +274,7 @@ Alternatives considered:
 Handles are `Gc<T>`; a live handle must be reachable from a root at sweep
 (`crates/crux/src/heap.rs` module docs). `register_fn`/`set_global` root the
 value through the global object. `create_function` returns a value rooted only
-by the host's own stack frame (conservative stack scan) — a `JsValue` stashed in
+by the host's own stack frame (conservative stack scan), a `JsValue` stashed in
 native heap (e.g. a `Vec` field) across an `eval` may be swept. The rustdoc must
 say so and point at "define it on a reachable object" as the rooting rule;
 `create_function` is the low-level escape hatch, `register_fn` the safe default.
@@ -307,28 +307,28 @@ was rejected: a re-entrant call into the same native function would panic on
 
 Files:
 
-- `crates/runtime/src/embed.rs` — `HostFn`, `FunctionCall`, `JsValue::thrown`,
+- `crates/runtime/src/embed.rs`: `HostFn`, `FunctionCall`, `JsValue::thrown`,
   `Context::create_function`/`create_object`/`register_fn`; reuse
   `current_agent_mut`; wire `%Function.prototype%` via `realm.intrinsics`.
-- `crates/slag/src/lib.rs` — re-export `HostFn`, `FunctionCall`, `ErrorKind`.
-- `crates/slag/examples/embed.rs` — show registration, a global, a namespace, a
+- `crates/slag/src/lib.rs`: re-export `HostFn`, `FunctionCall`, `ErrorKind`.
+- `crates/slag/examples/embed.rs`: show registration, a global, a namespace, a
   re-entrant callback, and a value throw.
-- `README.md` (§Embedding) and `PLAN.md` (§Phase 18 embedding bullet) — one
+- `README.md` (§Embedding) and `PLAN.md` (§Phase 18 embedding bullet), one
   paragraph and a minimal snippet.
 
 Suggested slices, each independently landable and testable:
 
-1. **Facade core** — `HostFn` with the `FunctionCall` shape, `create_function`,
+1. **Facade core**: `HostFn` with the `FunctionCall` shape, `create_function`,
    `create_object`, `register_fn`, `ErrorKind` re-export, `JsValue::thrown`,
    `FunctionCall::{this,length,arg,args,to_number,to_string}`. Rooting + error
    rustdoc.
-2. **Re-entrancy** — `FunctionCall::{call,construct,eval}` via the TLS agent;
+2. **Re-entrancy**: `FunctionCall::{call,construct,eval}` via the TLS agent;
    tests that a host function calls a JS callback synchronously and that a JS
    callback throws through it.
-3. **Constructors (Phase B)** — `Context::create_constructor(name, length,
+3. **Constructors (Phase B)**: `Context::create_constructor(name, length,
    construct_cb)` mapping to a `NativeCtor`, with a `.prototype` object and
    `is_construct` in `FunctionCall`.
-4. **Accessors (Phase C)** — `JsObject::define_accessor(get, set)` for host
+4. **Accessors (Phase C)**: `JsObject::define_accessor(get, set)` for host
    objects (today only data properties exist on the facade), which would also
    let `wasm_binding/dom.rs` drop its direct `crux` dependency.
 
@@ -359,7 +359,7 @@ Suggested slices, each independently landable and testable:
    rustdoc and `register_fn` default are the mitigation.
 3. **Aliasing `&mut Agent` in re-entrant methods** repeats a pattern the engine
    already relies on globally. If we want to remove the `unsafe`, the internal
-   `with_agent` API would need to hand out a scoped `&mut Agent` — a larger
+   `with_agent` API would need to hand out a scoped `&mut Agent`, a larger
    change to `crux` with broad blast radius; not proposed here.
 4. **Naming**: `FunctionCall` vs `HostCall`/`CallInfo`; `register_fn` vs
    `register_function`. Bikeshed; pick one before slice 1 to avoid churn.
@@ -370,6 +370,6 @@ Suggested slices, each independently landable and testable:
 
 ## 10. Suggested `.rules` additions
 
-None — this is a feature proposal, not a discovered trap. If the `unsafe` args
+None, this is a feature proposal, not a discovered trap. If the `unsafe` args
 cast or the rooting rule surprise a future session more than once, they should
 graduate to a rule then.

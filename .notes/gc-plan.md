@@ -3,8 +3,8 @@
 **The collector below is superseded (2026-09-18).** The mark-sweep described
 here is now *generational*: a per-box young bit, a write barrier + remembered
 set, a minor collection paced by the young cohort, and per-level triggers that
-both engines share. The authoritative spec — design, the A0-A7 cut log, the
-locked measurements and the list of what did not pay — is
+both engines share. The authoritative spec, design, the A0-A7 cut log, the
+locked measurements and the list of what did not pay, is
 **`.notes/nursery-gc-plan.md`**. This file stays as the record of how the
 mark-sweep itself was built (GC-0 … GC-5).
 
@@ -15,7 +15,7 @@ every milestone uses: `cargo clippy --workspace --all-targets -- -D warnings`
 clean, `cargo test --workspace` green, and the full release test262 sweep at
 zero regressions on the previously-passing union, at every cut.
 
-Status: GC-0 (spike + baseline) done — `--gc-stress` no-op, leak harness,
+Status: GC-0 (spike + baseline) done, `--gc-stress` no-op, leak harness,
 and the Weak-* fixture enumeration are landed with the measured baseline
 (see GC-0). The observable spec surface (`WeakRef`, `FinalizationRegistry`,
 `keptAlive`, `WeakMap`/`WeakSet` keying) is implemented and tested; only the
@@ -23,33 +23,33 @@ collector is missing.
 
 ## 1. What the milestone buys
 
-- **Correctness** — closes the documented `Rc` cycle leaks (long-running
+- **Correctness**: closes the documented `Rc` cycle leaks (long-running
   processes leak; `WeakRef.deref()` never returns `undefined`;
   FinalizationRegistry cleanup never fires; WeakMap/WeakSet entries are
   never collected).
-- **Performance** — `Value` becomes `Copy` (a plain NaN-boxed `u64`), the
+- **Performance**: `Value` becomes `Copy` (a plain NaN-boxed `u64`), the
   stated prerequisite for the three remaining allocation-bound benchmark
   rows (construct churn ~12.9x, string concat ~8.6x, per-iteration closures
   ~6.8x behind V8 `--jitless`; the `.notes/perf.md` 2–4x target for those rows
   is explicitly "after GC").
-- **Fidelity** — the Weak-* fixtures that currently pass *because nothing
+- **Fidelity**: the Weak-* fixtures that currently pass *because nothing
   dies* become real assertions.
 
 ## 2. The current model (what is being replaced)
 
-- `Handle<T> = std::rc::Rc<T>` (`crates/crux/src/handle.rs`) — the documented
+- `Handle<T> = std::rc::Rc<T>` (`crates/crux/src/handle.rs`): the documented
   seam; the arena swap is supposed to happen behind this alias.
-- `Value(u64, PhantomData<Rc<()>>)` (`crates/crux/src/value.rs`) — NaN-boxed;
+- `Value(u64, PhantomData<Rc<()>>)` (`crates/crux/src/value.rs`): NaN-boxed;
   the box holds a raw `Rc` pointer; the `PhantomData` makes it `!Copy`,
   `!Send`, `!Sync` (agent-local by construction).
 - `ValueKind` holds `Handle<BigInt>` / `Handle<JsString>` / `Handle<Symbol>` /
   `Handle<JsObject>` / `Handle<Function>`; objects, realms, and environments
   are all `Handle<T>` everywhere in `crux` + `runtime`.
 - `JsString` is `Flat(Arc<[u16]>)` or `Rope { left/right: Handle<JsString>, …
-  , flat: OnceLock<Arc<[u16]>> }` — rope children are handles; the flat cache
+  , flat: OnceLock<Arc<[u16]>> }`, rope children are handles; the flat cache
   is an external `Arc`.
 - `SharedBuffer` is deliberately `Rc<RefCell<Vec<u8>>>` (single agent) or
-  `Arc<[AtomicU64]>` (`workers` feature) — shared-memory buffers stay
+  `Arc<[AtomicU64]>` (`workers` feature), shared-memory buffers stay
   refcounted, never GC-managed.
 - Weak semantics are stubs: the agent's `weak_ref_targets` map is *strong*
   (nothing dies), `finalization_registries` cells never enqueue, WeakMap/
@@ -62,13 +62,13 @@ Precise (JS-visible) roots, per PLAN §4.3 plus the code:
 - `Agent::execution_context_stack` (each `ExecutionContext`'s realm,
   lexical/variable/private environments, function, source)
 - Realm, global environment, intrinsics table, global object
-- Job queues (`promise_jobs`, `generic_jobs`, `timeout_jobs` — the closures
+- Job queues (`promise_jobs`, `generic_jobs`, `timeout_jobs`, the closures
   capture `Value`s)
 - Module records and pending Promise reactions
 - Every live `Vm`: `stack: Vec<Value>`, `frame: Frame`, `leaf_frame_base`
   leaf segments, the destructure stacks (the VM holds raw `Value`s)
 - The agent's IC value caches (`member_value_cells`,
-  `array_element_value_cells`, `array_length_value_cells`, …) — trace or
+  `array_element_value_cells`, `array_length_value_cells`, …), trace or
   invalidate on collection; the index-only caches (`global_cells`,
   `member_cells`, …) need no tracing
 - `weak_ref_targets` / `finalization_registries` (as weak tables after
@@ -81,18 +81,18 @@ rooting strategy below, not by precise tracing.
 
 ## 4. Preflight decisions
 
-### D1 — Collector: custom arena + mark-sweep (recommended)
+### D1, Collector: custom arena + mark-sweep (recommended)
 
 PLAN §4.3 step 3 says to evaluate existing crates (`gc`, `broom`) before
 committing. Recommendation: a **custom arena (`Vec<Slot>` + free list) and a
 mark-sweep collector**, modeled on the `gc` crate's design (thread-local
 heap, conservative stack scan), because the codebase needs ephemeron-aware
 WeakMap/WeakSet, a `--gc-stress` mode, and precise tracing of the VM value
-stacks — none of which a general crate provides off the shelf, and the
+stacks, none of which a general crate provides off the shelf, and the
 project's self-contained ethos rules out a large dependency. Final decision
 is made at the end of GC-0.
 
-### D2 — Rooting: conservative native-stack scan (recommended)
+### D2, Rooting: conservative native-stack scan (recommended)
 
 A precise collector cannot see the thousands of Rust locals and closure
 captures that hold handles. Explicit Ruffle-style `root()`/`unroot()` would
@@ -104,7 +104,7 @@ recognizable to the scanner (decided in GC-1).
 
 ## 5. Cuts (each ends clippy-clean + workspace-green + zero sweep regressions)
 
-### GC-0 — spike and baseline (no engine change) — DONE
+### GC-0: spike and baseline (no engine change), DONE
 
 - `--gc-stress` plumbed as a documented no-op (`crates/cli`, accepted
   alongside `--stack-size` / `--max-old-space` / `--harmony-*`), with a
@@ -116,35 +116,35 @@ recognizable to the scanner (decided in GC-1).
 
   | workload | start | end | growth |
   |---|---|---|---|
-  | `cycle` (`o.self = o`) | 8,676 KB | 146,812 KB | **+138,136 KB** (linear, ~0.69 KB/iter — one leaked object graph per iteration) |
-  | `chain` (8-node acyclic list) | 8,400 KB | 8,612 KB | +212 KB (flat — Rc frees acyclic memory) |
+  | `cycle` (`o.self = o`) | 8,676 KB | 146,812 KB | **+138,136 KB** (linear, ~0.69 KB/iter, one leaked object graph per iteration) |
+  | `chain` (8-node acyclic list) | 8,400 KB | 8,612 KB | +212 KB (flat, Rc frees acyclic memory) |
 
 - **Weak-* fixture enumeration:** the pinned corpus has **no
-  collection-forcing fixtures** — all 302 (29 `WeakRef` + 47
+  collection-forcing fixtures**, all 302 (29 `WeakRef` + 47
   `FinalizationRegistry` + 141 `WeakMap` + 85 `WeakSet`) are API-surface
   tests and pass today; zero use a `$262.gc()`-style hook and none assert
   `deref() === undefined` or cleanup firing. GC-3/GC-4 validation is
   therefore: existing tests stay green, new runtime unit tests exercise
   collection through a force-gc test hook, and the `--gc-stress` sweep gate
-  passes — there is no corpus fixture set to un-skip.
-- **Decisions recorded:** D1 — custom arena + mark-sweep, modeled on the
-  `gc` crate (thread-local heap, conservative stack scan); D2 — precise
+  passes, there is no corpus fixture set to un-skip.
+- **Decisions recorded:** D1, custom arena + mark-sweep, modeled on the
+  `gc` crate (thread-local heap, conservative stack scan); D2, precise
   tracing of the JS-visible roots plus a conservative native-stack scan
   for Rust-held handles.
-- Gate: harness runs, baseline recorded — met (above).
+- Gate: harness runs, baseline recorded, met (above).
 
-### GC-1 — arena heap, `Handle` as index, `Value` becomes `Copy`, first collector (the big cut)
+### GC-1: arena heap, `Handle` as index, `Value` becomes `Copy`, first collector (the big cut)
 
-**Slice 1 — the crux heap module (landed).** `crates/crux/src/heap.rs`:
+**Slice 1, the crux heap module (landed).** `crates/crux/src/heap.rs`:
 `Trace` trait, `Gc<T>` (`Copy`, `!Send`/`!Sync`, derefs straight to its box),
 `GcCell<T>` interior mutability, and a thread-local mark-sweep `Heap`
 (cells are `GcBox<T>` with a mark bit, registered in the live set; collect
 marks from the passed roots and sweeps the rest). Cycle collection, root
 retention, idempotence, and acyclic reclamation are unit-tested. Precise
-roots only for now — the runtime roots and the conservative native-stack
+roots only for now, the runtime roots and the conservative native-stack
 scan land in the following slices.
 
-**Remaining slices (after slice 3).** Thread-local arena refinement — `Handle<T>`
+**Remaining slices (after slice 3).** Thread-local arena refinement, `Handle<T>`
   as a `Copy` index with `Deref` through a thread-local accessor (handles are
   still direct box pointers today); `RefCell` fields move to a GC-cell
 equivalent; the sweep pushes dead cells to a free list instead of `Box`-
@@ -154,7 +154,7 @@ freed allocations.
 - Ropes: children are GC handles already (slice 2); the `OnceLock<Arc<[u16]>>`
   flat cache stays an external `Arc`. `SharedBuffer` stays `Rc`/`Arc`.
 
-**Slice 2 — the `Handle` flip (landed).** `Handle<T>` is now `Gc<T>`: a `Copy`
+**Slice 2, the `Handle` flip (landed).** `Handle<T>` is now `Gc<T>`: a `Copy`
 pointer into the (still-unwired) GC heap, behind the same alias so call sites
 barely changed. Scope measured:
 
@@ -171,7 +171,7 @@ barely changed. Scope measured:
   `!Send` marker; the `Copy` upgrade is the GC-5 perf unlock (see the note
   in `crates/crux/src/value.rs`).
 - **`Rc::ptr_eq` (17 sites: module.rs/ir.rs/module_source.rs)** → `Gc::ptr_eq`.
-- **No `try_unwrap`/`make_mut`/`downgrade`/`strong_count` anywhere** — the
+- **No `try_unwrap`/`make_mut`/`downgrade`/`strong_count` anywhere**: the
   feared semantic reworks don't exist; interior mutability is already
   `RefCell`-based. `SharedBuffer` and the agent's `FinalizationData` stay
   `Rc`/`Arc` deliberately.
@@ -184,15 +184,15 @@ pass), clippy `-D warnings` clean, and the full release sweep is
 458; the hang→pass delta is load-dependent classification wobble, see the
 `slag-conformance` skill). The leak harness confirms the leaky-but-safe
 state: `cycle` grows unboundedly (≈690 MB @ 200k iters, as under `Rc`), and
-`chain` now grows too (≈2.4 GB @ 200k iters) — the tracing heap reclaims
+`chain` now grows too (≈2.4 GB @ 200k iters), the tracing heap reclaims
 nothing until slice 3 wires collection, so the old `Rc`-era "acyclic
 structures free on drop" property is gone until then.
 
-**Slice 3 — collector wiring (landed).** The heap now collects from the
+**Slice 3: collector wiring (landed).** The heap now collects from the
 precise JS-visible roots plus a conservative native-stack scan:
 
 - **`Agent::trace_roots`** (`crates/runtime/src/agent.rs`) visits every
-  `Value`/`Handle`/`JsString`/`Symbol` the agent holds directly — the
+  `Value`/`Handle`/`JsString`/`Symbol` the agent holds directly, the
   execution-context stack, the realm/module tables, the promise/async/
   generator/iterator/disposable auxiliary states, the IC value caches, the
   pooled `Vm`s, `kept_alive`, the Weak-* tables (strong until GC-3/4), and
@@ -203,34 +203,34 @@ precise JS-visible roots plus a conservative native-stack scan:
   reachable graph.
 - **Conservative native-stack scan** (`Heap::collect_with_stack`): every
   word in the current thread's committed stack region is matched against the
-  live box set — a raw `Gc<T>` word or a NaN-boxed `Value` payload
-  (`Value::encoded_box_address`) — so Rust locals and closure captures
+  live box set, a raw `Gc<T>` word or a NaN-boxed `Value` payload
+  (`Value::encoded_box_address`), so Rust locals and closure captures
   survive. Stack bounds come from `GetCurrentThreadStackLimits` (Windows)
   or `/proc/self/maps` (Linux); wasm stops at the module-initial stack top (GC-7); other
   platforms run precise-roots-only.
 - **Marking is iterative** (an explicit worklist): a deep rope or prototype
   chain cannot overflow the native stack (the recursive first cut crashed
   the `String.prototype.repeat`/`replace` sweep fixtures).
-- **Trigger**: `Agent::maybe_collect` fires at safe points — script
+- **Trigger**: `Agent::maybe_collect` fires at safe points, script
   boundaries and job-queue drains with no pending jobs (job closures are
-  opaque to tracing) — when the live count doubles past the post-collection
+  opaque to tracing), when the live count doubles past the post-collection
   baseline, and at every safe point under `--gc-stress` (wired through the
   CLI, no longer a no-op).
 
 **Status.** All three gates met: `cargo test --workspace` green (~4,325
 pass incl. the 3,324 test262 fixture tests), clippy `-D warnings` clean,
 and the full release sweep is 48,023 pass / 0 fail / 158 skip / 441 hang
-with **0 failures and 0 crashes** (baseline 48,006 / 0 / 158 / 458 — the
+with **0 failures and 0 crashes** (baseline 48,006 / 0 / 158 / 458, the
 hang→pass delta is the documented load-dependent wobble). The leak harness
 now bounds both workloads: `cycle` oscillates ~9–13 MB @ 200k iters
-(previously +690 MB linear) and `chain` ~9–13 MB (previously +2.4 GB) —
+(previously +690 MB linear) and `chain` ~9–13 MB (previously +2.4 GB),
 the cycle leaks are closed, the headline correctness win. The root set was
 hardened during bring-up: the compiled-body literal `Value`s in
 `EcmaFunction.ir` and the `Vm` suspended stacks were the gaps the first
 sweeps caught. GC-2 (`--gc-stress` across the sweep) is the remaining net
 for missed roots.
 
-### GC-2 — root audit and `--gc-stress` hardening
+### GC-2: root audit and `--gc-stress` hardening
 
 **Increment 1 (landed).** The per-allocation stress net is wired and already
 caught three real root gaps:
@@ -245,11 +245,11 @@ caught three real root gaps:
   execution collection must trace the running Vm (its heap-buffered value
   stacks are invisible to the stack scan) and the body it is executing (a
   script body is a per-evaluation `Rc<CompiledBody>` whose steps embed
-  literal `Value`s — the gap that corrupted `str += "."` loops). Nested
+  literal `Value`s, the gap that corrupted `str += "."` loops). Nested
   calls and tail calls are tracked through a thread-local run stack.
 - **Fail-safe tracing under in-flight borrows**: a traced `RefCell` that is
   mutably borrowed mid-collection aborts the sweep (retain everything)
-  instead of panicking — imprecise, never a use-after-free.
+  instead of panicking, imprecise, never a use-after-free.
 - **Opaque job closures**: queued (and the running) `Box<dyn FnOnce>` job
   closures hold captured `Value`s no precise `Trace` can reach; their
   allocations are scanned conservatively (`Layout::for_value`), the same
@@ -263,27 +263,27 @@ must be verified against the stress sweep). Gate: `--gc-stress` clean
 across the sweep; leak harness bounded (the harness is already bounded).
 
 **Increment 2 (landed).** The built-ins and language crash clusters are
-closed — the full `all` sweep is `--gc-stress` clean: **0 fail / 0 crash /
+closed, the full `all` sweep is `--gc-stress` clean: **0 fail / 0 crash /
 158 skip** across 48,622 fixtures. The remaining ~539 hangs are all
 pre-existing stress-cost artifacts (the RegExp property-escape table
 builds, the decodeURI/encodeURI/parseInt/parseFloat families, and a few
-allocation-heavy intrinsic-graph walks — each passes standalone under a
+allocation-heavy intrinsic-graph walks, each passes standalone under a
 long deadline; the live set stays bounded). Root gaps closed:
 
 - **Native buffers across allocating loops**: `Atomics.notify`'s
   same-thread resolve drain, `Function.prototype.apply`'s argument list
   (build *and* the callee call), `TypedArray` filter/from element
   collection, `Object`/`Map.groupBy` (the shared `group_by` loop *and* the
-  result-object/map build — the guard must span both or the gap between
+  result-object/map build, the guard must span both or the gap between
   them is sweepable), `DisposableStack` move/dispose resource Vecs, and
   `JSON.parse`'s ParseRecord tree all get `StressSuppress` windows so
   half-built `Vec<Value>` buffers cannot be swept.
 - **`new_promise_capability`'s captured resolving functions**: the
   executor writes them into a native `Rc<RefCell>` while the user
-  constructor body still runs — suppress the construct window.
+  constructor body still runs, suppress the construct window.
 - **Mapped-arguments accessors hold GC handles**: the MakeArgGetter/
   MakeArgSetter closures captured the parameter `JsString` and
-  `EnvRef` — both sweepable. The name is now interned (immortal) and the
+  `EnvRef`, both sweepable. The name is now interned (immortal) and the
   environment is rooted from `ArgumentsSlots::env` (an opaque `GcAny`
   edge), so the closure captures stay valid exactly as long as the
   arguments object; no per-call agent table (an earlier design retained
@@ -298,7 +298,7 @@ long deadline; the live set stays bounded). Root gaps closed:
 
 Gate status: `--gc-stress` clean across the sweep; leak harness bounded.
 
-### GC-3 — ephemeron-aware WeakMap / WeakSet
+### GC-3: ephemeron-aware WeakMap / WeakSet
 
 **Landed.** The weak tables now have true ephemeron semantics instead of
 strong entry storage:
@@ -312,34 +312,34 @@ strong entry storage:
   WeakMap key→value and WeakSet element→element edges instead of tracing
   the tables strongly; `collect_garbage_with` compacts the weak tables
   after each collection, dropping entries whose key (or element) box was
-  swept — a dead key's handle can never dangle on the next access.
+  swept, a dead key's handle can never dangle on the next access.
 - **`$262.gc()`**: the test262 host hook forces a full collection, making
   the ephemeron semantics observable to fixtures.
 - Tests: `weak_map_ephemeron_lifetime` / `weak_set_ephemeron_lifetime`
   (live keys keep their values across a collection; an unreferenced key's
-  entry — key and value — is swept; the live entry still works after).
+  entry, key and value, is swept; the live entry still works after).
 - Gate: the 226 pinned WeakMap/WeakSet fixtures pass under `--gc-stress`;
   the full `all` sweep stays 0 fail / 0 crash; the leak harness stays
   bounded. (The pinned corpus never calls `$262.gc()`, so the visible gate
-  is the API surface + no regression — the ephemeron machinery is verified
+  is the API surface + no regression, the ephemeron machinery is verified
   by the unit tests and `$262.gc`-driven fixtures on a corpus that forces
   collection.)
 
-### GC-4 — WeakRef and FinalizationRegistry activation
+### GC-4: WeakRef and FinalizationRegistry activation
 
 **Landed.** WeakRef targets are held weakly and FinalizationRegistry
 cleanup jobs actually fire:
 
 - **Weak table** (`runtime/agent.rs`, `runtime/builtins/weakref.rs`):
-  `weak_ref_targets` is no longer traced — a collection clears a dead
-  target (`deref` returns `undefined`) — and `deref` pushes its result
+  `weak_ref_targets` is no longer traced, a collection clears a dead
+  target (`deref` returns `undefined`), and `deref` pushes its result
   to the `kept_during_job` set (spec 26.1.1 KeepDuringJob), cleared at
   each job boundary.
 - **Precise weak compaction** (`crux/heap.rs`): the collector runs a
   second, scan-free mark (from the precise roots) when weak structures
   exist and the conservative scan found boxes; the compaction's dead set
   comes from it, so a stale stack word cannot keep a WeakRef or FR
-  target alive. The sweep still uses the conservative mark — the scan
+  target alive. The sweep still uses the conservative mark, the scan
   stays the safety net for Rust-held handles, and clearing a weak entry
   never frees a box.
 - **Cleanup jobs**: a dead-target cell is removed pre-sweep (the boxes
@@ -349,12 +349,12 @@ cleanup jobs actually fire:
   moves it into `generic_jobs`. Dead unregister tokens on live cells are
   cleared.
 - **Pooled-Vm hygiene** (`runtime/ir.rs`): `return_vm` fully resets the
-  Vm — a stale frame slot or value-stack entry from the last run would
+  Vm, a stale frame slot or value-stack entry from the last run would
   otherwise be traced by `vm_pool` and keep a frame-local weak target
   alive forever.
 - **Ephemeron fix**: promoted values are pushed unmarked in the fixpoint
   so the drain marks *and traces* them (a pre-mark made the drain skip
-  the value, leaving its children sweepable — a latent GC-3 bug when a
+  the value, leaving its children sweepable, a latent GC-3 bug when a
   WeakMap value holds heap children).
 - Tests: `weak_ref_target_dies_after_collection`,
   `weak_ref_keep_during_job`, `finalization_registry_cleanup_job_runs`,
@@ -366,12 +366,12 @@ cleanup jobs actually fire:
   full `all` sweep stays 0 fail / 0 crash (48,015 pass, 0 fail, 0 crash,
   449 hang of 48,622); the leak harness stays bounded. (The pinned
   corpus never calls `$262.gc()`, so the visible gate is the API surface
-  + no regression — the collection semantics are verified by the unit
+  + no regression, the collection semantics are verified by the unit
   tests, which drive the collector directly.)
 
-### GC-5 — the perf payoff
+### GC-5: the perf payoff
 
-**Measured — partially landed, gate open.** Re-measured the eight `--bench`
+**Measured: partially landed, gate open.** Re-measured the eight `--bench`
 rows against the pre-GC Rc model on the same machine (a temp worktree at the
 last pre-GC commit `b54af4a`), interleaved medians:
 
@@ -387,27 +387,27 @@ last pre-GC commit `b54af4a`), interleaved medians:
 | construct churn | ~36ms | ~74ms | ~2.1x slower |
 
 `Copy` values + arena handles delivered the predicted ~2x on the closure and
-call machinery (per-iteration 1.9x, closure capture 2.1x — those rows are in
+call machinery (per-iteration 1.9x, closure capture 2.1x, those rows are in
 the 2–4x band), but the two allocation-bound rows regressed: `Gc::new`
-(~150ns vs `Rc::new` ~60ns — the live-set registration + stress checks) and
+(~150ns vs `Rc::new` ~60ns, the live-set registration + stress checks) and
 the batched mark-sweep reclamation (the sweep of a loop's garbage runs at the
 script boundary, inside the timed window; the Rc model freed per iteration and
 reused hot memory). A swept-box free-list (direct-mapped size-class cache)
 was prototyped and measured net-neutral (within the machine's ±10% load
 noise) and reverted. A per-box intrusive live list (the registry link stored
 in each box, so registration is one store) was also prototyped and measured a
-clear regression: the fat link grows every box (+16B — the string box goes
+clear regression: the fat link grows every box (+16B, the string box goes
 32→48B), which costs more in the allocation-bound loops than the Vec push it
 removes (construct churn 72→95ms, string concat 20→28ms on the same
 machine) and was reverted. The registration Vec is not the bottleneck.
 
 **Mid-script safe-point collection was then prototyped and kept.** A
-thread-local allocation budget (`Gc::new` bumps a counter; loop back-edges —
-the fused `FastLoopHead` and backward `Step::Jump` — do one TLS read +
+thread-local allocation budget (`Gc::new` bumps a counter; loop back-edges,
+the fused `FastLoopHead` and backward `Step::Jump`, do one TLS read +
 compare) calls `Agent::maybe_collect` when the budget is exceeded, so a
 loop's garbage is reclaimed incrementally instead of in one script-boundary
 sweep. Measured on the same machine: construct churn 74→62.9ms (−15%),
-string concat 20.7→20.0ms (back to baseline — the check + counter
+string concat 20.7→20.0ms (back to baseline, the check + counter
 overhead is recovered by the collection-side cuts below), and the six
 machinery rows unchanged (the back-edge check is invisible when a loop
 never allocates). A collection that swept nothing disables mid-loop
@@ -415,14 +415,14 @@ collections until the next script boundary (a growing live set would
 otherwise be re-marked every budget crossing), and the budget resets at
 script/job boundaries so it never drifts across scripts. The new collection
 point surfaced one test-helper rooting gap (the `iterable()` helper's
-`next` closure captured a plain `Vec<Value>` — opaque to tracing, now
+`next` closure captured a plain `Vec<Value>`, opaque to tracing, now
 rooted through a holder object on the iterator); the engine itself is clean
 (WeakRef 29/29, FinalizationRegistry 47/47, and a 134-fixture `language`
 sample pass under `--gc-stress`).
 
 The remaining collection-side costs were then cut: the conservative stack
 scan now pre-filters each word against the live boxes' address range
-(tracked by `register` and refreshed by the sweep — most stack words are
+(tracked by `register` and refreshed by the sweep, most stack words are
 not box addresses, so two compares replace a HashMap lookup per word), and
 the address maps (`by_addr` and the precise dead set) switched from
 SipHash to FxHash (addresses are word-aligned and not attacker-controlled).
@@ -430,34 +430,34 @@ A `Gc::new` vs `Rc::new` microbenchmark confirmed the registration path is
 already near its floor (~11ns/alloc of TLS + borrow + push), so the box
 itself is not the remaining lever; the mid-loop and boundary sweeps were.
 
-**The engine hot paths, not the collector, now bound the rows** — measured
+**The engine hot paths, not the collector, now bound the rows**, measured
 against `node --jitless` (V8's interpreter, same architecture): construct
 churn 63ms vs 2.75ms (~23x), string concat 20ms vs 1.26ms (~16x). A
 construct-churn decomposition (per 100k-iteration bench) pinned the cost:
 `new C()` with an empty body is ~240ns/iter, the first `this.x = x` store
-adds ~110ns (the properties-`Vec` buffer allocation dominates — a second
+adds ~110ns (the properties-`Vec` buffer allocation dominates, a second
 store is only +15ns), and loop/add/property-read are ~15ns. Wins landed:
 the constructor-`prototype` cache (Cut 26) switched from a SipHash
 `HashMap` + RefCell borrow to a direct-mapped array (per construct); object
 ids moved from a global locked `fetch_add` to a thread-local counter (per
 object; ids key per-agent caches that never cross threads); and the
-properties vector became `SmallProps` — V8's in-object properties — with
+properties vector became `SmallProps`, V8's in-object properties, with
 the first two entries stored inline in the object (no per-construct
 buffer allocation for the common small object, spilling to a heap `Vec`
 past that, with the slice interface preserved via `Deref`). Construct
 churn: 74 → ~45ms (normalized vs the arithmetic row, ~5x → ~3.5x).
 Remaining structural gap to V8: bump/semi-space allocation and register-
-style bytecode — each a follow-up of its own.
+style bytecode, each a follow-up of its own.
 
 Gate status: the plan's predicted 2–4x on allocation-bound code is **not
-met** — per-iteration/closure rows yes, construct/string rows no (construct
+met**, per-iteration/closure rows yes, construct/string rows no (construct
 is now ~1.7x vs the Rc model after the safe-point + collection-side + hot-
 path work, concat ~1.9x). The remaining lever is the plan's original
 slot-arena design (bump/segment allocation + a per-size free list instead
 of one malloc per box), which removes both the per-box malloc and the
 sweep's allocator round-trips; it is deferred as a follow-up (note the
 free-list half measured net-neutral, so the arena alone is unlikely to
-close the remaining gap — the measured 16-23x gap to V8's interpreter is
+close the remaining gap, the measured 16-23x gap to V8's interpreter is
 engine-hot-path, not collector, cost).
 
 **Bonus fix (GC-4 machinery, found while measuring):** the FinalizationRegistry
@@ -467,26 +467,26 @@ the size for a multi-capture closure (16 bytes reported as 8), and the
 cleanup caller double-boxed its closure (`Job::new(_, Box::new(closure))`
 where `Job::new` boxes again), so the region covered the outer box rather
 than the captures. The conservative region scan then missed the captured
-heldValue and a later collection swept it — `finalization_registry_cleanup_job_runs`
+heldValue and a later collection swept it, `finalization_registry_cleanup_job_runs`
 flaked (~1-in-8). `Job::new` now records the region at construction from the
 concrete closure's size (reliable before the box erases it), and the cleanup
 caller passes the raw closure. The test is deterministic (0/50 failures);
 full sweeps stay 0 fail / 0 crash.
 
-### GC-6 — threads, workers, and the C-API surface
+### GC-6: threads, workers, and the C-API surface
 
 - Confirm `Value` stays `!Send` (agent-local), the `workers` feature
   (SharedArrayBuffer `Arc<[AtomicU64]>`) still compiles, and the `jsc`/`ffi`
   handle tables root host-held refs correctly.
 - Gate: workers tests green.
 
-### GC-7 — scan-free platforms (wasm) and the conservative-scan dependency
+### GC-7: scan-free platforms (wasm) and the conservative-scan dependency
 
 **Context.** The embed core now compiles to `wasm32-unknown-unknown` /
 `wasm32-wasip1` (the `wasm` port; see the feature commit). Long heap-backed
 JS strings corrupted nondeterministically on both wasm targets while native
-x64 looked clean. GC-1 slice 3's note — "other platforms run
-precise-roots-only" — was the cause: `stack_bounds()` returns `None`
+x64 looked clean. GC-1 slice 3's note, "other platforms run
+precise-roots-only", was the cause: `stack_bounds()` returns `None`
 outside Windows/Linux, so the conservative native-stack scan silently never
 runs, and the sweep frees boxes reachable **only from Rust locals** at a
 safe point. The interpreter's values live in traced `Vm` stacks, but the
@@ -498,20 +498,20 @@ exactly (`wasm_smoke::evaluate` → `JsValue::fmt` → `Gc<T>::fmt` →
 
 **Poison-sweep proof it is a root gap, not a 32-bit/wasm bug.** Overwriting
 each swept box's payload with `0xDB` (and skipping the drop/free) turns the
-wasm garbage into immediate out-of-bounds traps — and the **same build
+wasm garbage into immediate out-of-bounds traps, and the **same build
 segfaults natively with the scan disabled**. Native only masks the bug: the
 system heap leaves a freed string buffer's bytes intact until reuse, so
 reads of a swept-but-intact box return correct data, and a pipe-`tail`
 exit-code check can read as clean. The wasm/dlmalloc allocator reuses freed
 buffers promptly, exposing the read-after-sweep. GC off entirely is clean.
 Conclusion: this is a genuine, platform-masked precise-root gap of exactly
-the class the conservative scan exists to protect — D2 stays load-bearing,
+the class the conservative scan exists to protect, D2 stays load-bearing,
 and the wasm port needs a working scan, not (only) a rooting audit.
 
 **Precise-only exploration (option-3 direction).** Running precise-roots-only
-(scan disabled) on native looked clean on production workloads — the
+(scan disabled) on native looked clean on production workloads, the
 interpreter values live in traced stacks and GC-2 already `StressSuppress`-s
-native `Vec<Value>` buffers — but the poison build proved that was allocator
+native `Vec<Value>` buffers, but the poison build proved that was allocator
 slack, not completeness. The residual `--gc-stress` flakes (the documented
 debug-concat path) also mean the per-allocation net is not yet a trustworthy
 precise-only gate. Fully removing the scan (rooting every Rust local held
@@ -537,10 +537,10 @@ that does not run constructors falls back to the memory-end bound (over-retains,
 never frees a live box).
 `scan_stack` now dedups scanned boxes (an `AddrSet` per scan), bounding the
 work list by the live set instead of by every stored reference in the
-scanned region — this removed the `capacity overflow` the earlier
+scanned region, this removed the `capacity overflow` the earlier
 full-region prototype hit in `scan_stack` after ~10 eval cycles.
 
-Validation: wasm32-unknown-unknown and wasm32-wasip1 both clean — 120
+Validation: wasm32-unknown-unknown and wasm32-wasip1 both clean, 120
 consecutive fresh-context evals (the previous corruption + overflow
 workload) with 0 mismatches / 0 panics, the 13-feature smoke harness green,
 and 4-round wasip1 string checks exact. Native: `cargo clippy --workspace
@@ -560,7 +560,7 @@ detector.
    load-bearing across the VM, and moving from `Rc` ownership to arena
    indices changes what "holding a handle" means in job closures and IC
    caches. This is why GC-2 (`--gc-stress`) must land immediately after
-   GC-1 — it is the net that catches missed roots.
+   GC-1, it is the net that catches missed roots.
 2. **Job-queue closures capture `Value`s.** The `FnOnce(&mut Agent)` closures
    are opaque to a precise collector; they must either stay rooted (kept
    alive for the job's short lifetime) or be converted to carry traceable
@@ -580,7 +580,7 @@ detector.
    not assume the scan can simply be deleted.
 7. **Rust-held transients at safe points are load-bearing.** The poison-sweep
    experiment proved the embed boundary (a `Context::eval` completion value)
-   is swept without the scan on every platform — native only masks it via
+   is swept without the scan on every platform, native only masks it via
    allocator slack. Any scan-free build needs a root audit (scan-off
    `--gc-stress` + poison) before it can claim correctness.
 

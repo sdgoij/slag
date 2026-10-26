@@ -1,6 +1,6 @@
 # The optimizing tier: specialize and retire, never deopt
 
-SpiderMonkey is the primary source. The organizing principle is that Slag does **not** build a deoptimizer: it compiles specialized bodies under premises the engine already validates, and when a premise dies the body is **retired** and execution continues in the interpreter. The compiled frame *is* the interpreter frame, so there is nothing to reconstruct. This is the one thing V8, SpiderMonkey and JavaScriptCore cannot do — their optimized frame is not their baseline frame — and it is what makes the rest of the machinery smaller for us than for them.
+SpiderMonkey is the primary source. The organizing principle is that Slag does **not** build a deoptimizer: it compiles specialized bodies under premises the engine already validates, and when a premise dies the body is **retired** and execution continues in the interpreter. The compiled frame *is* the interpreter frame, so there is nothing to reconstruct. This is the one thing V8, SpiderMonkey and JavaScriptCore cannot do, their optimized frame is not their baseline frame, and it is what makes the rest of the machinery smaller for us than for them.
 
 `optimizing-tier-impl.md` is the engineering companion: where the code goes and what proves each step. This document is the design and the strategy.
 
@@ -25,7 +25,7 @@ The 2026-10-03 re-baseline against the SpiderMonkey js shell (`tools/corpus/sm-a
 
 `array_at`'s 139x is a constant-fold artifact, not a structural target: the varying probe below shows SM leaves `Array.prototype.at` a generic call (1.06x), exactly like us. The structural rows are the rest of the column.
 
-### It is not folding — it is specialization
+### It is not folding: it is specialization
 
 The obvious hypothesis, that SM merely constant-folds the toy rows, is wrong, and the probe that shows it is the point of this section. Const/varying pairs:
 
@@ -38,23 +38,23 @@ The obvious hypothesis, that SM merely constant-folds the toy rows, is wrong, an
 | `a.slice(1,3).length` const | 0.98 ms | 29.6 ms | 30x |
 | `a.slice(k & 3,3).length` varying | 0.90 ms | 27.9 ms | **31x** |
 
-`indexOf` and `slice` pay the *same* gap whether the operand is constant or not — so the win is not the fold, it is that SM specializes the operation. `Array.prototype.at` is the lone 1.06x because SM leaves it as a generic call, exactly like ours. The gap is **specialization machinery**, uniformly.
+`indexOf` and `slice` pay the *same* gap whether the operand is constant or not, so the win is not the fold, it is that SM specializes the operation. `Array.prototype.at` is the lone 1.06x because SM leaves it as a generic call, exactly like ours. The gap is **specialization machinery**, uniformly.
 
 ### Front end, not back end
 
 This is the reason the plan is ordered the way it is. Cranelift's generated code is, by its own account, roughly 2–3x slower than LLVM. Our gaps are 10–230x. So at most ~2–3x of any row is the backend and **90–95% is the front end**.
 
-It is starker than the ratio: `Math.abs(k)` costs Slag 28.5 ns/op. A `fabs` is sub-nanosecond, and a poor one is 1–2 ns — **none** of that 28 ns is codegen, it is the call and the boxing. `({a:1}).a` is an allocation and a lookup that SM folds to `1`. No backend recovers a call we should not have emitted or an allocation that should not exist. The 2–3x is the *last* thing, and the lever there is a top tier (SM's FTL adds LLVM only for the hottest functions), not a backend swap — LLVM's compile time is precisely why V8, SM and JSC all wrote their own backends.
+It is starker than the ratio: `Math.abs(k)` costs Slag 28.5 ns/op. A `fabs` is sub-nanosecond, and a poor one is 1–2 ns, **none** of that 28 ns is codegen, it is the call and the boxing. `({a:1}).a` is an allocation and a lookup that SM folds to `1`. No backend recovers a call we should not have emitted or an allocation that should not exist. The 2–3x is the *last* thing, and the lever there is a top tier (SM's FTL adds LLVM only for the hottest functions), not a backend swap, LLVM's compile time is precisely why V8, SM and JSC all wrote their own backends.
 
 ## 2. Our way: specialize, then retire
 
 Every engine's optimizer is built on **speculate → guard → deopt**, and deopt is the expensive half: V8's translation opcode stream (`deoptimizer/translation-opcode.h`), SM's resume points and `Recover_*` (`Snapshots.h`), JSC's `ExitTimeObjectMaterialization`. All of it exists for one reason: their optimized frame is not their baseline frame, so the optimizer's eliminated state must be *reconstructed*.
 
-Ours does not have to be. The compiled body already addresses the same `vm.stack` the interpreter does — `DISPATCH_DEOPT` assumes exactly that today, and `call-frame-plan.md` makes it literally one frame. So we replace deopt with **retirement**:
+Ours does not have to be. The compiled body already addresses the same `vm.stack` the interpreter does, `DISPATCH_DEOPT` assumes exactly that today, and `call-frame-plan.md` makes it literally one frame. So we replace deopt with **retirement**:
 
 - **Premise, not guess.** A specialized body is compiled under premises that are *checked where the engine already checks them*: callee identity through the property cell, receiver shape through the member/element cells, builtin semantics through the builtin registry, non-escape as a static property of a wholly-compiled body. These are not speculative type feedback; they are facts the engine maintains.
 - **Retire, don't reconstruct.** When a premise is contradicted, the body is retired (the same generation/epoch invalidation the cells already perform) and the next entry recompiles or falls back to the interpreter. An activation already running completes on the old code (single-threaded; the contradiction can only arise from a nested call, which happens at a step boundary anyway).
-- **Exit, don't deopt.** Where a runtime check is cheaper than coarse invalidation (a polymorphic shape), a failed check exits to the interpreter via the existing `DISPATCH_DEOPT` path. That path spills the working region into `vm.stack` and resumes at `vm.ip` — a *resume*, not a reconstruction, because the frame is already the interpreter's.
+- **Exit, don't deopt.** Where a runtime check is cheaper than coarse invalidation (a polymorphic shape), a failed check exits to the interpreter via the existing `DISPATCH_DEOPT` path. That path spills the working region into `vm.stack` and resumes at `vm.ip`, a *resume*, not a reconstruction, because the frame is already the interpreter's.
 
 The invariant that keeps this true, and the plan's central constraint:
 
@@ -70,9 +70,9 @@ Read from the tree (`js/src/jit/*`, `js/src/doc/*`, the `[SMDOC]` comments). Ful
 
 ### 3.1 Feedback is a program, not a hint (CacheIR)
 
-CacheIR (`CacheIR.h`, `[SMDOC] CacheIR`) is a per-site *guard+op data IR* — `GuardToObject`, `GuardShape`, `LoadFixedSlotResult` — whose operands are small typed IDs and whose references are stub-data offsets, so many sites share one compiled stub. `WarpCacheIRTranspiler` lowers it to MIR *mechanically* (`emitGuardShape` is about five lines). V8's `FeedbackVector` is closer to a bag of hints the optimizer re-derives; SM makes the feedback a program the optimizer **transpiles**.
+CacheIR (`CacheIR.h`, `[SMDOC] CacheIR`) is a per-site *guard+op data IR*, `GuardToObject`, `GuardShape`, `LoadFixedSlotResult`, whose operands are small typed IDs and whose references are stub-data offsets, so many sites share one compiled stub. `WarpCacheIRTranspiler` lowers it to MIR *mechanically* (`emitGuardShape` is about five lines). V8's `FeedbackVector` is closer to a bag of hints the optimizer re-derives; SM makes the feedback a program the optimizer **transpiles**.
 
-This is the single most important borrow. We already have the two hard halves — one shared code representation (the `Step` stream) and an invalidation substrate (the member/global/leaf cells and their generations) — and we lack only the per-site record *as data*. SM proves that the record should be data, shared by both tiers, and mechanically consumable.
+This is the single most important borrow. We already have the two hard halves, one shared code representation (the `Step` stream) and an invalidation substrate (the member/global/leaf cells and their generations), and we lack only the per-site record *as data*. SM proves that the record should be data, shared by both tiers, and mechanically consumable.
 
 ### 3.2 `ICState`: the polymorphism valve, already designed
 
@@ -84,7 +84,7 @@ It also reframes a journal result: `perf.md` closed "per-site read ICs" as flat 
 
 `js/src/jit/TrialInlining.h` (the `[SMDOC] Trial Inlining` block) is the mechanism we have nothing like. A function with several callers may be polymorphic overall but monomorphic per caller; so baseline execution allocates a **fresh `ICScript` per call site** and replaces that one call IC with a specialized one, while other callers keep the default. Warp then compiles the callee using the caller-private IC data, recursing.
 
-The lesson: **specialize feedback per caller, not just per callee.** This is the concrete shape of our inlining stage, and it pairs exactly with retirement — specialize per caller, invalidate to re-specialize, never bail.
+The lesson: **specialize feedback per caller, not just per callee.** This is the concrete shape of our inlining stage, and it pairs exactly with retirement, specialize per caller, invalidate to re-specialize, never bail.
 
 ### 3.4 Warp: main-thread snapshot, off-thread build
 
@@ -92,11 +92,11 @@ The lesson: **specialize feedback per caller, not just per callee.** This is the
 
 ### 3.5 Bailout reconstructs the *Baseline Interpreter* frame
 
-The docs say it plainly: a bailout "reconstructs the native machine stack frame to match the layout used by the Baseline Interpreter." This is `DISPATCH_DEOPT`, and it is *cheaper* for us because there is no side table to consult — our compiled frame already mirrors the interpreter stack. SM validates the design **and names the exact condition under which we would need their machinery**: the day the compiled frame diverges (deep inlining, escape analysis). Hence the §2 invariant.
+The docs say it plainly: a bailout "reconstructs the native machine stack frame to match the layout used by the Baseline Interpreter." This is `DISPATCH_DEOPT`, and it is *cheaper* for us because there is no side table to consult, our compiled frame already mirrors the interpreter stack. SM validates the design **and names the exact condition under which we would need their machinery**: the day the compiled frame diverges (deep inlining, escape analysis). Hence the §2 invariant.
 
 ### 3.6 The wasm `Instance`
 
-`spidermonkey-wasm.md`: one **register-held pointer per module** (`TlsData`), hot fields first in an asserted compact-offset region, globals inlined into it, GC state (nursery position, store buffer, barrier address, alloc sites) reachable, compiled frames traced by per-code-range `StackMaps`. This is the antidote to our worst measured cost — we rebuild a ~40-field `JitCallContext` every call. `call-frame-plan.md` §3.4 already aims at this shape; this document adopts it as the context target.
+`spidermonkey-wasm.md`: one **register-held pointer per module** (`TlsData`), hot fields first in an asserted compact-offset region, globals inlined into it, GC state (nursery position, store buffer, barrier address, alloc sites) reachable, compiled frames traced by per-code-range `StackMaps`. This is the antidote to our worst measured cost, we rebuild a ~40-field `JitCallContext` every call. `call-frame-plan.md` §3.4 already aims at this shape; this document adopts it as the context target.
 
 ### 3.7 SM deletes
 
@@ -133,30 +133,30 @@ Design decisions, each grounded above:
 
 Each stage is probe-first, lands on both engines where applicable, and owes the full gate. Order matters: O gates B, I, E, L; B is the first measured win; C0/C1 (`call-frame-plan.md`) gate I and E.
 
-**Ratified 2026-10-04.** C0/C1 are pulled ahead of I and E — they gate the 20x–234x cluster and C1 is itself a ~18x call win — with the IR lift (S1/S2) in parallel. Stage B is largely landed already, as the per-step `CallIntrinsic` sweep rather than an IR increment, so the B row below is the residual plus lowering `CallIntrinsic` into the IR.
+**Ratified 2026-10-04.** C0/C1 are pulled ahead of I and E, they gate the 20x–234x cluster and C1 is itself a ~18x call win, with the IR lift (S1/S2) in parallel. Stage B is largely landed already, as the per-step `CallIntrinsic` sweep rather than an IR increment, so the B row below is the residual plus lowering `CallIntrinsic` into the IR.
 
 | stage | content | measured targets (2026-10-03) | needs |
 |---|---|---|---|
-| **O** | per-site feedback records (CacheIR-shaped data) + `ICState` valve + the retire hook | none (enabling) | — |
-| **B** | builtin intrinsic inlining (scalar intrinsics first, then array/collection) — the per-step `CallIntrinsic` sweep landed `math_abs`, `string_charat`, `set_has`/`map_get`, `array_indexof`; residual moves into the IR | `regexp_test` 31x, `array_slice` 33x, `string_indexof` | O |
+| **O** | per-site feedback records (CacheIR-shaped data) + `ICState` valve + the retire hook | none (enabling) |, |
+| **B** | builtin intrinsic inlining (scalar intrinsics first, then array/collection), the per-step `CallIntrinsic` sweep landed `math_abs`, `string_charat`, `set_has`/`map_get`, `array_indexof`; residual moves into the IR | `regexp_test` 31x, `array_slice` 33x, `string_indexof` | O |
 | **I** | trial inlining: caller-specialized records, inline a monomorphic callee's Steps under a size budget, recursing | `method_call` 6x, `js_call` 3.6x, `proto_method_call`, `own_builtin_call`, hof rows | O, C1 |
 | **E** | escape analysis + scalar replacement (non-speculative: no `Recover_*` needed) | `object_keys` 234x, `typed_array_for_each` 46x, `array_alloc`/`object_alloc` 20x, `destructure`, `construct_churn`, `json_*` | I |
 | **L** | GVN + LICM + load elimination over the SSA IR, with a `clobberize`-style effect oracle | `obj_prop` 23x, `prim_prop` 24x, `element_read/write`, `array_at` | O |
 | **T** | coarse typer to drive guard elision | across I/E/L | L |
 
-**Stage O — the substrate and the retire hook.** A per-site record keyed by `(body, step)`: a small typed log of what the site has seen (shape / element kind / callee identity / operand hint) plus the mode and budget. The interpreter's member, global, call and arithmetic handlers write it; the compiled tier's slow paths update it on a miss. Invalidation reuses the generations and epochs that already exist (member/global value cells, `leaf_gen`). Retirement is a hook on that invalidation: a compiled body lists its premises, and a hit retires the body. Probe: count records written, and count retirements that would fire on the corpus, before any transform consumes them. Gate: everything, with no perf claim.
+**Stage O, the substrate and the retire hook.** A per-site record keyed by `(body, step)`: a small typed log of what the site has seen (shape / element kind / callee identity / operand hint) plus the mode and budget. The interpreter's member, global, call and arithmetic handlers write it; the compiled tier's slow paths update it on a miss. Invalidation reuses the generations and epochs that already exist (member/global value cells, `leaf_gen`). Retirement is a hook on that invalidation: a compiled body lists its premises, and a hit retires the body. Probe: count records written, and count retirements that would fire on the corpus, before any transform consumes them. Gate: everything, with no perf claim.
 
-**Stage B — builtin intrinsics.** At a call site whose callee cell resolves to a known builtin, splice the intrinsic in place of the call; a write to that cell retires the body. Scalar intrinsics first (`Math.*`, `charCodeAt`, numeric conversions) because the splice is trivial and they validate the retire mechanism; array/collection intrinsics next. Probe: the `math_abs`/`string_charat`/`indexof` rows isolated A/B, plus the retirement count under a workload that reassigns a builtin.
+**Stage B, builtin intrinsics.** At a call site whose callee cell resolves to a known builtin, splice the intrinsic in place of the call; a write to that cell retires the body. Scalar intrinsics first (`Math.*`, `charCodeAt`, numeric conversions) because the splice is trivial and they validate the retire mechanism; array/collection intrinsics next. Probe: the `math_abs`/`string_charat`/`indexof` rows isolated A/B, plus the retirement count under a workload that reassigns a builtin.
 
-**Stage I — trial inlining.** Build a caller-private feedback record at a call site, then inline the callee's `Step`s under a size budget (start from SM's/V8's numbers: ~30 B "small", a few hundred B total). Probe: how many corpus call sites are monomorphic and under the budget — **answered 2026-10-08** (`optimizing-tier-impl.md` I5a): ~80% of corpus call traffic, with the callee identity taken as the shared `CompiledBody` pointer rather than the function box. Gate: the call rows fall, corpus parity 0, and the differential tests for a callee with captures, `this`, `arguments`, a tail call and a throw.
+**Stage I, trial inlining.** Build a caller-private feedback record at a call site, then inline the callee's `Step`s under a size budget (start from SM's/V8's numbers: ~30 B "small", a few hundred B total). Probe: how many corpus call sites are monomorphic and under the budget, **answered 2026-10-08** (`optimizing-tier-impl.md` I5a): ~80% of corpus call traffic, with the callee identity taken as the shared `CompiledBody` pointer rather than the function box. Gate: the call rows fall, corpus parity 0, and the differential tests for a callee with captures, `this`, `arguments`, a tail call and a throw.
 
-**Stage E — escape analysis + scalar replacement.** An object that does not escape a wholly-compiled body becomes SSA values; field loads/stores fold. Because there is no deopt, there is no `Recover_*` materialization to build. Probe: the allocation count per corpus row (`--gc-trace`) before and after. Gate: the alloc and `object_keys` rows fall, and no row regresses on the jit-loss gate.
+**Stage E, escape analysis + scalar replacement.** An object that does not escape a wholly-compiled body becomes SSA values; field loads/stores fold. Because there is no deopt, there is no `Recover_*` materialization to build. Probe: the allocation count per corpus row (`--gc-trace`) before and after. Gate: the alloc and `object_keys` rows fall, and no row regresses on the jit-loss gate.
 
-**Stage L — GVN/LICM/load elimination.** Needs the effect oracle first; without it, hoisting is unsound. Probe: the invariant-load count per corpus row. Gate: the read rows fall.
+**Stage L, GVN/LICM/load elimination.** Needs the effect oracle first; without it, hoisting is unsound. Probe: the invariant-load count per corpus row. Gate: the read rows fall.
 
-**Stage T — the typer.** A small lattice on SSA values to eliminate redundant guards and pick representations. Probe: the guard count per site.
+**Stage T, the typer.** A small lattice on SSA values to eliminate redundant guards and pick representations. Probe: the guard count per site.
 
-**Outside this plan: the baseline numeric lowering.** `perf-findings.md` §2 covers a hole the stages do not. The int32 gap is **not** a missing operator — G9 already inlined the six integer ops; it is that the fast register lane (`plan_loop_num`/`rhs_recipe`/`NumRhs`) is f64-only, so a bitwise-wrapped RMW never enters it and the inline's per-op range guard plus the `Value` round-trip are paid every iteration. **A1 landed 2026-10-03**: `plan_loop_int` runs `s = (s <arith> rhs) | 0` / `& mask` as wrapping i32 in the shared `loop_num` register (7.1 → 2.75 ns), guarded-free because the plan proves the rhs int32. A2 (a guarded rhs for a slot or an unbounded counter) remains. `%` is not inlined by design (cranelift 0.134 has no `frem`); a faster `%` needs a direct helper and, for SM parity, an integer `srem` path.
+**Outside this plan: the baseline numeric lowering.** `perf-findings.md` §2 covers a hole the stages do not. The int32 gap is **not** a missing operator, G9 already inlined the six integer ops; it is that the fast register lane (`plan_loop_num`/`rhs_recipe`/`NumRhs`) is f64-only, so a bitwise-wrapped RMW never enters it and the inline's per-op range guard plus the `Value` round-trip are paid every iteration. **A1 landed 2026-10-03**: `plan_loop_int` runs `s = (s <arith> rhs) | 0` / `& mask` as wrapping i32 in the shared `loop_num` register (7.1 → 2.75 ns), guarded-free because the plan proves the rhs int32. A2 (a guarded rhs for a slot or an unbounded counter) remains. `%` is not inlined by design (cranelift 0.134 has no `frem`); a faster `%` needs a direct helper and, for SM parity, an integer `srem` path.
 
 **Deferred, deliberately:** off-thread compilation (SM §3.4) and OSR *entry* until a function-level tier is at its ceiling; a mid-tier until compile time is the constraint; any engine-global type inference (SM deleted it); and the backend work (a top tier, not a swap) until the front end is closed.
 
@@ -177,7 +177,7 @@ Each stage is probe-first, lands on both engines where applicable, and owes the 
 - A specialized body retires correctly when a premise cell is written, under `--gc-stress`, and the interpreter resumes at the right step.
 - Builtin intrinsics, trial inlining, escape analysis and LICM each move their target rows on the corpus, with the jit-loss gate green and test262 (language + built-ins) and the wasm suites at baseline. A perf change that costs a fixture is reverted.
 - Retirement did not thrash: the corpus retirement count is small and the megamorphic valve demonstrably engages.
-- A written statement of what remains between this tier and a V8/SM-class JIT — the 2–3x backend and the top-tier question.
+- A written statement of what remains between this tier and a V8/SM-class JIT, the 2–3x backend and the top-tier question.
 
 ## 9. Open decisions
 

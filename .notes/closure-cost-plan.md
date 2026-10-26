@@ -20,13 +20,13 @@ Creating a closure costs **~333 ns**:
 That is the dominant cost of the corpus's largest row
 (`language/statements/for-in/head-let-fresh-binding-per-iteration.js`, ~550 ms
 of a ~3.1 s corpus total), and it is paid by real code: closures in loops are
-ordinary. It is also paid twice — the call path copies the whole
+ordinary. It is also paid twice, the call path copies the whole
 `EcmaFunction` record (`ordinary_call` reads a copy; `function.rs` has a
 `.cloned()`), so the record's size shows up at creation and per call.
 
 ## Measured budget (per closure, ~333 ns)
 
-Accumulated means over 19,000 instantiations (not single samples — the 100 ns
+Accumulated means over 19,000 instantiations (not single samples, the 100 ns
 Windows timer made a one-sample split misleading; see the perf note):
 
 | phase | ns |
@@ -46,12 +46,12 @@ Windows timer made a one-sample split misleading; see the perf note):
 
 | group | bytes |
 | --- | --- |
-| 3 × `Option<JsString>` — `name`, `source`, `parse_text` (48 each) | 144 |
-| 6 × `Vec` — `fields`, `private_methods`, `decorator_initializers`, `computed_keys`, `outer_chain`, `per_iteration_chain` (24 each) | 144 |
-| 2 × `Option<Value>` — `home_object`, `super_constructor` | 32 |
+| 3 × `Option<JsString>`, `name`, `source`, `parse_text` (48 each) | 144 |
+| 6 × `Vec`, `fields`, `private_methods`, `decorator_initializers`, `computed_keys`, `outer_chain`, `per_iteration_chain` (24 each) | 144 |
+| 2 × `Option<Value>`, `home_object`, `super_constructor` | 32 |
 | `Option<ScriptOrModule>` | 16 |
 | `Rc<[BindingElement]>` (params) | 16 |
-| 5 × 8-byte handles/Rcs — `body`, `environment`, `private_environment`, `realm`, `ir` | 40 |
+| 5 × 8-byte handles/Rcs, `body`, `environment`, `private_environment`, `realm`, `ir` | 40 |
 | flags/enums + padding | 16 |
 | **total** | **408** |
 
@@ -59,7 +59,7 @@ For an ordinary closure (no class state, no capture chain) **~324 of the 408
 bytes are empty or trivial**, and the identity-hashed map still copies all of
 it on every insert.
 
-## Rejected alternatives (measured — do not redo)
+## Rejected alternatives (measured, do not redo)
 
 | attempt | result |
 | --- | --- |
@@ -68,7 +68,7 @@ it on every insert.
 | `Vec` slab indexed by function id | ~77 MB at 300k ids (ids are permanent, entries 408 B). |
 | Single-sample phase profiling | Not evidence on a 100 ns timer. Accumulate. |
 
-## Stage A — class-only state behind one box (recommended first)
+## Stage A: class-only state behind one box (recommended first)
 
 Move `fields`, `private_methods`, `decorator_initializers`, `computed_keys`,
 `super_constructor`, `private_environment` into
@@ -90,7 +90,7 @@ record.
 - **Netting:** `calls/construct_churn` and the class fixtures must not regress
   (the box adds one allocation and one indirection per class constructor).
 
-## Stage B — share the source info (also removes 27 ns)
+## Stage B: share the source info (also removes 27 ns)
 
 `source` and `parse_text` are 96 bytes inline and are re-created per closure:
 `capture_source` walks to the enclosing text and `span_slice` allocates a new
@@ -98,25 +98,25 @@ record.
 
 - Cache `SourceInfo { slice: JsString, full: JsString }` **per site**, keyed
   like `shared_function_body` (function node address, realm, span, source
-  hash — the body cache already computes that tuple), or store it in that
+  hash, the body cache already computes that tuple), or store it in that
   cache's entry. The record then holds `Option<Rc<SourceInfo>>` (**8 bytes**,
   96 → 8) and `capture_source`'s 27 ns per closure disappears after the first.
 - **Soundness:** source texts are immutable. `Flat`/`Small` are self-contained;
   confirm the texts are leaves (if a `ConsString`/`Rope` ever arrives, it holds
-  arena pointers and must not live in a non-GC `Rc` — the existing body cache
+  arena pointers and must not live in a non-GC `Rc`, the existing body cache
   already holds a non-GC `Rc<Block>` of AST nodes, which is the same class of
   decision). `Function.prototype.toString` reads `source`; snapshots must
   reproduce it.
 - **Expected:** ~35-45 ns per closure (96 B of copy + the slice allocation).
 
-## Stage C — the call-path copy
+## Stage C: the call-path copy
 
 After A+B the record is ~290 bytes and `ordinary_call` still copies it per
 call. Measure `--jit-bench` `function calls`, `calls/recursive_fib`, and
 `calls/method_call` before/after A+B; if the copy still matters, it is removed
 by Stage D rather than by an unsafe borrow split.
 
-## Stage D — move the record into the GC arena (biggest, last)
+## Stage D: move the record into the GC arena (biggest, last)
 
 Store a `Gc<EcmaFunction>` on the function's object part (the
 `function_self` pattern), so creation is an arena allocation (~5-6 ns per the
@@ -210,6 +210,6 @@ creation site, 216 -> **200 bytes**. `e7` reads 75.8 ms median, so this plan's
 numbers: `.notes/perf.md` ("capture chains shared per closure site").
 Eligibility is not an expectation: Stage D's arena record is still unmeasured.
 
-**Stage D measured (2026-10-20), not viable in its map form.** Storing `Gc<EcmaFunction>` in `ecma_functions` cut the insert phase 100 -> 56 ns and made calls 13% faster (`e5`), but rooting every record from the map promotes each one on its first minor: `e7` +8% (77.5 -> 83.7 ms) and the for-in head-let row +70% (540-558 -> 916-1393 ms). Reverted. Details in `.notes/perf.md` ("the function record in the GC arena"). The remaining shape — the record reachable only from its function object, with no traced map — would need `EcmaFunction` (or a handle to it) reachable from `crux`, and is still unmeasured.
+**Stage D measured (2026-10-20), not viable in its map form.** Storing `Gc<EcmaFunction>` in `ecma_functions` cut the insert phase 100 -> 56 ns and made calls 13% faster (`e5`), but rooting every record from the map promotes each one on its first minor: `e7` +8% (77.5 -> 83.7 ms) and the for-in head-let row +70% (540-558 -> 916-1393 ms). Reverted. Details in `.notes/perf.md` ("the function record in the GC arena"). The remaining shape, the record reachable only from its function object, with no traced map, would need `EcmaFunction` (or a handle to it) reachable from `crux`, and is still unmeasured.
 
 **Stage D re-measured (2026-10-25) in the minimal `Handle` form: same verdict, worse.** `ecma_functions: IdMap<Handle<EcmaFunction>>` with a copied handle out and `Handle::new` inside the insert borrow: the for-in row **+80.6%** (396 -> 715 ms), `p14` +19.5%, `d1` +20.2%, `e7` +11.8%, only `e5` -10.7%. `--gc-trace`: `live` 6,921 -> 307,009 and one major -> **two** majors of 9.7 and 19.3 ms, because every traced record is promoted on its first minor and retained until its entry is reaped. Reverted. Conclusion, now twice measured: the table must not root the record. Stage D only makes sense when the record hangs off the function object (`Gc` field, V8's JSFunction -> SharedFunctionInfo) and the table is a non-owning id -> function index; that shape is untouched and unmeasured. Numbers: `.notes/perf.md` ("boxing the function record into the arena is a regression").

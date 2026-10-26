@@ -23,11 +23,11 @@ Non-goal: **parity.** Our `Value` is NaN-boxed with no Smi, so a computed
 index key must be validated with an `f64 -> u32 -> f64` round trip; V8's key
 is already a Smi and its check is one compare. Removing that is a
 `Value`-representation change (integer values as Smis) that touches every
-consumer in the engine — out of scope here.
+consumer in the engine, out of scope here.
 
 Realistic target, from the measured budget below: `buildString shape`
 **15.5 ms -> ~11-13 ms (1.5-1.8x node)**, not the ~2.5 ns/iter parity line.
-If that target is not worth the risk, stop before Stage 1 — stages are
+If that target is not worth the risk, stop before Stage 1, stages are
 ordered by payoff so the first one can be kept alone.
 
 ## Measured budget (per `buildString shape` iteration; ~5.2 ns, node ~2.5)
@@ -41,9 +41,9 @@ its loads (see the perf.md follow-up):
 | tag + `array_dense` + length + `[[Extensible]]` + capacity checks | ~0.5 ns | Stage 2 |
 | key round-trip + `< 2^32` bound | ~0.25 ns | Stage 3 (partially) |
 | element + `elem_len` + `length` + `generation` stores | ~0.5 ns | Stage 4 (partially) |
-| loop + `l === 10000` + counter (same order as node's) | ~1.0 ns | — |
+| loop + `l === 10000` + counter (same order as node's) | ~1.0 ns |, |
 
-## Stage 1 — prototype registry + elements protector — LANDED
+## Stage 1: prototype registry + elements protector, LANDED
 
 Measured (`buildString shape`): 15.5 → ~13.4 ms; `full` ~17.2 → ~15.7 ms.
 The epoch compare replaced the four chain blocks in
@@ -108,16 +108,16 @@ child then has no verdict until a walk re-verifies it).
 
 **JIT address-of-static note.** `crux::PROTOTYPE_EPOCH` is a plain
 (non-TLS) `static`, so the JIT can materialise `addr_of!(...)` with an
-`iconst` and emit an ordinary load — same mechanism as the embedded helper
+`iconst` and emit an ordinary load, same mechanism as the embedded helper
 pointers. A per-agent epoch would need the Agent pointer inside crux, which
 crux does not have; a process-global epoch over-invalidates across agents,
 which is sound.
 
-**Risk:** moderate-high — a missed bump is a silent wrong result (a
+**Risk:** moderate-high, a missed bump is a silent wrong result (a
 bypassed prototype setter). Mitigated by the enumerated bump sites, the
 exact `store_chain_walk` remaining as the recorder, and the fixtures below.
 
-## Stage 2 — elements-kind byte (~0.2 ns)
+## Stage 2: elements-kind byte (~0.2 ns)
 
 Fold `array_dense` (dense-ness), `dense`, `[[Extensible]]`, and
 `is_prototype` into one `kind: Cell<u8>` on `ArraySlots` (PACKED / HOLEY /
@@ -129,26 +129,26 @@ dense-mode transition; landed only if Stage 1's fixtures stay green.
 per-object, not per-`ArraySlots`, so the realistic form is one combined
 `JsObject` byte, not an `ArraySlots` kind. Forcing both guard predicates
 true so Cranelift DCEs their loads moved `buildString shape` only 13.43 →
-13.23 ms — the entire ceiling is ~1.5%, and a combined-byte variant captures
+13.23 ms, the entire ceiling is ~1.5%, and a combined-byte variant captures
 roughly half of that. Not worth duplicating per-object `[[Extensible]]` /
 `is_prototype` state, whose desync silently bypasses a prototype setter.
 Revisit only alongside the V8-shaped elements-kind redesign (Stage 3 / O3).
 
-## Stage 3 — integer-index key path (~0.1-0.25 ns)
+## Stage 3: integer-index key path (~0.1-0.25 ns)
 
 The gate's `f64 -> u32 -> f64` round trip is inherent to the NaN-boxed
 `Value`. Shave what is left: drop the separate `< 2^32` compare by folding it
 into the round-trip result, and skip the second conversion where the index is
-already integer. **Do not** attempt more — the real fix is Smi integers
+already integer. **Do not** attempt more, the real fix is Smi integers
 (non-goal).
 
-## Stage 4 — cursor/length stores (~0.2 ns)
+## Stage 4: cursor/length stores (~0.2 ns)
 
 Two of the four fast-path stores are bookkeeping the design added:
 `elem_len` (the compiled-append cursor for the `Vec`) and `generation` (the
 read-cell invalidation). `generation` is load-bearing (see the
 `slag-dense-arrays` skill) and measured ~free. `elem_len` could be dropped by
-making the `Vec` header authoritative — but the toolchain's `Vec` layout must
+making the `Vec` header authoritative, but the toolchain's `Vec` layout must
 not be read from compiled code, so this means hand-rolling the element buffer
 (`#[repr(C)] { ptr, len, cap }`) and teaching `Trace`/the accessors to it.
 Largest risk for the smallest gain; land last, or never.
@@ -160,7 +160,7 @@ Largest risk for the smallest gain; land last, or never.
   the interpreter/slow path exact and unchanged, and the reference walk
   (`store_chain_walk`) intact.
 - **Sweep-wide regressions**: Stages 1-2 touch crux object construction,
-  `set_prototype_of`, and the index-define funnels — all shared. Every stage
+  `set_prototype_of`, and the index-define funnels, all shared. Every stage
   must run all three sweeps, not just the array clusters.
 - **Rollback**: each stage is self-contained behind the epoch/kind; reverting
   it restores the previous check. Keep each stage a separate commit.
@@ -185,7 +185,7 @@ Largest risk for the smallest gain; land last, or never.
 
 Representing integer values as Smis (so an element key needs no `f64` round
 trip), an `f64`-free length field, and elements kinds with a dictionary
-fallback — i.e. adopting V8's object model for arrays. That is a
+fallback, i.e. adopting V8's object model for arrays. That is a
 Value-representation change touching every consumer, not an array-store
 change. Do not start it for one `--jit-bench` row. Scoped as its own project
 in `.notes/v8-shaped-arrays.md` (WS1-WS5, migration surface, increment order,

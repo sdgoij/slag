@@ -11,12 +11,12 @@ magnitude:
 
 | probe (1M iterations) | ns per call |
 | --- | ---: |
-| `o.m()` — method call from compiled code, body `return 1` | **9.2** |
-| `o.m()` — method call, body `return this.a + 1` | 10.8 |
-| `o.x` — **getter**, body `return 1` | **156** |
-| `o.x` — getter, body `return this.a + 1` | 154 |
-| `g.call(o)` — `Function.prototype.call` from compiled code, same body | 27.5 |
-| `o.nope` — property that does not exist (no call at all) | 105 |
+| `o.m()`, method call from compiled code, body `return 1` | **9.2** |
+| `o.m()`, method call, body `return this.a + 1` | 10.8 |
+| `o.x`, **getter**, body `return 1` | **156** |
+| `o.x`, getter, body `return this.a + 1` | 154 |
+| `g.call(o)`, `Function.prototype.call` from compiled code, same body | 27.5 |
+| `o.nope`, property that does not exist (no call at all) | 105 |
 | own data property `o.a` (control) | 5.6 |
 
 The getter's body is irrelevant: a constant and a member read cost the same.
@@ -43,15 +43,15 @@ from the same compiled loop, is dispatched through `do_call_apply` →
 that the accessor route takes 154 ns to run. The difference is the lane, not
 the callee.
 
-1. `agent.take_vm(env, strict)` — pop a pooled `Box<Vm>`, `rebind`.
+1. `agent.take_vm(env, strict)`: pop a pooled `Box<Vm>`, `rebind`.
 2. `push ExecutionContext` (a struct with two `EnvRef` clones).
 3. `scope.new_body_context` / capture-context setup.
-4. `OrdinaryCallBindThis` (`this_slot` present) — sloppy coercion can box.
-5. `vm.setup_certified_frame(scope, args, this_value)` — slot-by-slot fill.
-6. `crate::jit::run_jit_body` — depth guard, `lookup_info` (a HashMap on the
+4. `OrdinaryCallBindThis` (`this_slot` present): sloppy coercion can box.
+5. `vm.setup_certified_frame(scope, args, this_value)`: slot-by-slot fill.
+6. `crate::jit::run_jit_body`: depth guard, `lookup_info` (a HashMap on the
    body pointer), a **~40-field `JitCallContext` literal**, the entry call,
    then outcome dispatch.
-7. `agent.return_vm(vm)` — `vm.reset(...)`, which clears the working stack and
+7. `agent.return_vm(vm)`: `vm.reset(...)`, which clears the working stack and
    resets every run field (deliberately: GC-4 requires the pooled Vm not to
    trace a finished run's state).
 8. `dispose_env_resources`.
@@ -62,10 +62,10 @@ the callee.
 
 ## 3. Who pays it
 
-- **Accessor getters/setters** — `get_property`/`put_value` →
+- **Accessor getters/setters**: `get_property`/`put_value` →
   `crate::function::call`. Every `re.source`, every typed-array `length`, every
   user getter.
-- **Builtin callbacks** — `forEach`/`map`/`filter`/`some`/`every`/`reduce`,
+- **Builtin callbacks**: `forEach`/`map`/`filter`/`some`/`every`/`reduce`,
   `sort` comparators, `replace` callbacks, promise reactions
   (`call_callback` → `try_leaf_call`).
 - Any host or builtin that calls back into JS.
@@ -87,7 +87,7 @@ Cheap to land and independently valuable, but it cannot get near 9 ns.
 ### B. Publish the live context so a Rust call can use the shared lane (the real fix)
 
 When the accessor is invoked **from compiled code**, a `JitCallContext` is
-already live — the helper that reached `get_property` was called by machine
+already live, the helper that reached `get_property` was called by machine
 code with it. So the machinery to run the getter cheaply is already in scope;
 nothing publishes it.
 
@@ -100,7 +100,7 @@ Sketch:
   callee is leaf-eligible (`steps_are_leaf`), environment-free (or the
   `LeafCallEnv` env-swap variant), its frame fits above `sp`, and
   `agent.jit_depth` is under the cap. Then run its compiled entry on the live
-  ctx with the frame carved from the caller's buffer — exactly
+  ctx with the frame carved from the caller's buffer, exactly
   `try_shared_construct_leaf`, generalized from construct to call.
 - Fall back to today's path for a non-leaf callee, a non-certified body, an
   environment-reading leaf, no room, or no live ctx.
@@ -142,10 +142,10 @@ What is left, in order:
    and the nested accessor run needs the *same* Vm mutably (`do_call_fast`,
    `run_jit_leaf`, `stack` growth). Reaching it through an
    `Agent::live_vm` raw pointer would create a `&mut Vm` while that `&self`
-   borrow is live — aliasing UB under stacked borrows, not a style question.
+   borrow is live, aliasing UB under stacked borrows, not a style question.
 2. So C needs `Vm::get_member_name`'s contract to change: instead of invoking
-   the accessor itself, it returns "this getter, this receiver" and the helper —
-   which owns `&mut Vm` — performs the call. That ripples through
+   the accessor itself, it returns "this getter, this receiver" and the helper,
+   which owns `&mut Vm`, performs the call. That ripples through
    `get_property`/`put_value` and `function::call`, which cannot take `&mut Vm`
    today without every `call_callback` caller (all of `builtins/array.rs` and
    friends) supplying one. That cascade is the work.
@@ -156,8 +156,8 @@ Estimated from the pieces, for a leaf accessor: `Vm::reset`'s ~45 field stores
 and ~25 `Vec::clear`s plus the pool pop (`take_vm`/`return_vm`) is the largest
 single block, then the leaf segment's `resize`/`reserve`, `with_leaf_run`'s
 registration, `do_call_fast`, and the ~31-field context build (option A,
-worthless on its own). Reusing the caller's Vm would remove the first block —
-roughly 20-25 ns — and nothing else.
+worthless on its own). Reusing the caller's Vm would remove the first block,
+roughly 20-25 ns, and nothing else.
 
 That is the sizing that has to be true for C to be worth the cascade: about a
 fifth of the accessor's cost, not the whole 80 ns. Measure it before committing
@@ -166,7 +166,7 @@ to the contract change.
 A cheaper intermediate exists and should be measured before either: the
 accessor is 110 ns, a `forEach` callback through the same `try_leaf_call` lane
 runs at roughly 69 ns per element *including* the iteration, and
-`Function.prototype.call` — which already uses the caller's context — is
+`Function.prototype.call`, which already uses the caller's context, is
 27.5 ns. So `try_leaf_call` itself is about 2.5x the shared-ctx lane, and that
 gap, not the context build, is the target.
 
@@ -184,7 +184,7 @@ gap, not the context build, is the target.
   fit and the caller falls back. The same guard is mandatory here, and a
   too-small buffer must be a fallback, never a write past `buf_end`.
 - **GC rooting.** The caller's whole buffer is rooted for its run (that is what
-  makes the shared lane safe). A Rust-side private buffer is not — which is
+  makes the shared lane safe). A Rust-side private buffer is not, which is
   exactly why `try_leaf_call` registers `with_leaf_run`. The shared lane
   inherits the caller's rooting, so it must not allocate into anywhere else.
 - **Re-entrancy.** A getter that calls back into JS needs its own context; the
@@ -209,5 +209,5 @@ Per slice: `cargo fmt --all --check`; `cargo clippy --workspace --all-targets
 -- -D warnings`; `cargo test --workspace`; four sweeps at `--timeout 15`
 (51,998 fixtures, 0 fail); the probe set in `scratch/ab/re2` (accessor, data,
 missing, `re.test`) as medians of ≥7 interleaved same-binary pairs; and the
-corpus differential — remembering that this host moves ±10% and that the family
+corpus differential, remembering that this host moves ±10% and that the family
 table is the stronger signal for a cross-cutting change.

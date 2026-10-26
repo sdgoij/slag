@@ -1,7 +1,7 @@
 # The inspector: scoping the Runtime domain the REPL needs
 
 **Status:** the Runtime subset the REPL drives is **landed** in
-`crates/v8/inspector.rs` — `Runtime.enable`, `Runtime.evaluate` and
+`crates/v8/inspector.rs`, `Runtime.enable`, `Runtime.evaluate` and
 `Runtime.callFunctionOn`, evaluated on the running isolate. `deno repl` works on
 a Deno built with `tools/build-deno.py` (verified 2026-10-02). Everything past
 the Runtime domain is still refused.
@@ -21,13 +21,13 @@ That is `crates/v8/inspector.rs`'s `NO_INSPECTOR` (line 55) doing what its
 module doc says it does: creation, the context lifecycle and a connection are
 **inert** (`create`, `connect`, `context_created`, `context_destroyed`,
 `create_stack_trace`, `exception_thrown` all succeed and record nothing), and
-every **protocol** method refuses — `can_dispatch_method` answers `false` and
+every **protocol** method refuses, `can_dispatch_method` answers `false` and
 `dispatch_protocol_message` / `schedule_pause_on_next_statement` /
 `cancel_pause_on_next_statement` panic. The refusal is deliberate: a host that
 boots an inspector for every runtime (deno_core does) must be able to *connect*,
 so the loud failure is at the first message a debugger sends.
 
-This was not a regression — nothing was implemented then. It is now: see §7.
+This was not a regression, nothing was implemented then. It is now: see §7.
 
 ## 2. Where the message goes
 
@@ -39,7 +39,7 @@ This was not a regression — nothing was implemented then. It is now: see §7.
   `Page.waitForDebugger` (the last two at `:1640-1655`). Those are answered in
   Rust, no V8 involved.
 - Anything else falls through to `InspectorSession::dispatch_message`
-  (`:1923`), which calls `self.v8_session.dispatch_protocol_message(msg)` — the
+  (`:1923`), which calls `self.v8_session.dispatch_protocol_message(msg)`, the
   bridge, and the panic.
 - The REPL reaches it through `LocalInspectorSession` (`:2311`), whose
   `dispatch` (`:2324`) calls `dispatch_message_from_frontend` directly. That call
@@ -63,17 +63,17 @@ So the Runtime domain lands in the one place that has no way to run JS.
 
 Notably **absent**: the REPL never sends `Runtime.getProperties` or
 `Runtime.releaseObject` (they were looked for, no sites). So the common
-object-inspection protocol is not on the critical path — but a `RemoteObject`
+object-inspection protocol is not on the critical path, but a `RemoteObject`
 returned by `evaluate`/`callFunctionOn` still needs an `objectId` the front end
 can pass back as a receiver.
 
 ## 4. Options
 
-**A — implement the Runtime domain in the bridge (`crates/v8/inspector.rs`).**
+**A: implement the Runtime domain in the bridge (`crates/v8/inspector.rs`).**
 V8's inspector lives inside the engine and evaluates on the isolate; the bridge
 can do the same. `V8Inspector::create(isolate, client)` already receives
 `&mut crate::Isolate` and discards it (`:312`, `let _ = isolate`); it can hold
-the raw handle — `Isolate::as_raw_isolate_ptr` exists (`crates/v8/isolate.rs:983`),
+the raw handle, `Isolate::as_raw_isolate_ptr` exists (`crates/v8/isolate.rs:983`),
 exactly the pattern `deno_core`'s own `JsRuntimeInspectorState.isolate_ptr`
 uses. `connect` then threads it into the session, and `dispatch_protocol_message`
 parses CDP, enters a scope, and evaluates. The bridge already has the raw
@@ -84,11 +84,11 @@ material: `test_support::eval` (`:22`), `module.rs:424`, `script.rs`,
 *Pros:* faithful (one place owns the protocol), no `deno_core` change, no new
 host API. *Cons:* the bridge grows a real CDP agent.
 
-**B — intercept `Runtime.*` in `deno_core`'s `dispatch_custom_domain`.**
+**B: intercept `Runtime.*` in `deno_core`'s `dispatch_custom_domain`.**
 `Runtime.enable` and the `executionContextCreated` notification could be served
 here cheaply. `Runtime.evaluate`/`callFunctionOn` cannot: the dispatcher has no
 isolate and no eval entry, so this needs a *new* host hook (a
-`Fn(&mut PinScope, script) -> RemoteObject` the runtime supplies) — more moving
+`Fn(&mut PinScope, script) -> RemoteObject` the runtime supplies), more moving
 parts across `deno_core` + `cli`, and it splits the protocol across two owners.
 
 **Recommendation: A**, scoped to the Runtime subset the REPL uses.
@@ -114,7 +114,7 @@ same sentence pointing at what *is* missing once the REPL subset is served.
   objects/arrays/functions. This is most of the surface area.
 - **Object handles.** A `RemoteObjectId` ↔ `Global` table per session, released
   on context teardown and (if added later) `Runtime.releaseObject`. Must not
-  dangle across a GC — the handles are roots, so they keep the objects alive,
+  dangle across a GC, the handles are roots, so they keep the objects alive,
   which is V8's semantics too.
 - **`replMode` semantics.** Deno's REPL wraps input (`cli/tools/repl/session.rs`
   around `:448`) and expects V8's `replMode` behavior for top-level `let`/`await`
@@ -149,7 +149,7 @@ Verified from `deno repl` on a Deno built by `tools/build-deno.py`: `1 + 1` →
 
 **Remaining.**
 
-4. **The async-throw notification — landed; `preview` — deliberately not.**
+4. **The async-throw notification, landed; `preview`, deliberately not.**
    `Runtime.exceptionThrown` is now broadcast to every connected session from
    `V8Inspector::exception_thrown`, which `deno_core` calls for an uncaught
    exception (unit-tested: a connected recorder receives the event). A
@@ -193,12 +193,12 @@ Verified from `deno repl` on a Deno built by `tools/build-deno.py`: `1 + 1` →
 
 Fixing the microtask drain (§7) prompted a scan for the same shape elsewhere: a
 bridge entry point the engine or `deno_core` invokes *outside* any handle scope,
-which then runs a job or a host callback that builds handles — a panic in
+which then runs a job or a host callback that builds handles, a panic in
 `store::cell` ("a handle was made with no handle scope open"). Found and fixed:
 
-- `Isolate::run_microtasks` / `perform_microtask_checkpoint` (`crates/v8/isolate.rs`) — the original, exercised from `deno repl`.
-- `MicrotaskQueue::perform_checkpoint` (`crates/v8/microtask.rs`) — the host-owned queue deno's `vm` drains; the same drain, with no scope.
-- `BridgeHooks::promise_rejection_tracker` (`crates/v8/isolate.rs`) — invoked the host's reject callback with no scope, unlike its sibling `prepare_stack_trace`, which opens a `callback_scope!`.
+- `Isolate::run_microtasks` / `perform_microtask_checkpoint` (`crates/v8/isolate.rs`), the original, exercised from `deno repl`.
+- `MicrotaskQueue::perform_checkpoint` (`crates/v8/microtask.rs`): the host-owned queue deno's `vm` drains; the same drain, with no scope.
+- `BridgeHooks::promise_rejection_tracker` (`crates/v8/isolate.rs`): invoked the host's reject callback with no scope, unlike its sibling `prepare_stack_trace`, which opens a `callback_scope!`.
 
 Already correct, checked: the other `HostHooks` callbacks (`prepare_stack_trace`, `wasm_streaming`, `import_module_dynamically`, `initialize_import_meta_object`, `allow_wasm_code_generation`), the module resolver/loader callbacks, the interceptor callbacks, `Function::call`, and `Platform::run_idle_tasks` all open a scope. `IsolateGcObserver::run` (`crates/v8/heap.rs`) invokes GC callbacks with no scope, but V8's contract is that a GC callback allocates no JS, so it is left as is.
 

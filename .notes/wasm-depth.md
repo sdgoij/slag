@@ -24,7 +24,7 @@ bridge). Native driver JS reads the binary as a hex text file (the CLI's `fs.rea
 returns a *lossy string*, so raw bytes must be hex-encoded; the engine's JS has no
 `atob`/`TextEncoder`/`fetch` and cannot view its own linear memory).
 
-Driver recipe (harness kept in `tools/depth1.js`, `tools/depth4.js`, `tools/depth5.js` —
+Driver recipe (harness kept in `tools/depth1.js`, `tools/depth4.js`, `tools/depth5.js`,
 untracked by design):
 1. Eval a driver in `slag.exe` that hex-decodes the engine binary, then
    `new WebAssembly.Module(bytes)` + `new WebAssembly.Instance(mod, env)`.
@@ -48,12 +48,12 @@ Cost structure: per wasm-interpretation layer ≈ **60–100×** slower than nat
 minutes and a third in hours. Byte hand-off to inner layers requires decoding the engine
 binary in-band (E1's JS hex-decode of 7.5 MB did not finish in 30 min).
 
-## Bug leads (nested execution only — NOT reproducible natively)
+## Bug leads (nested execution only, NOT reproducible natively)
 
 Two anomalies appeared only when the engine itself runs interpreted (inside E1).
 `scratch/multi.js` runs the same instance patterns natively and passes.
 
-### Anomaly 1 — later instance's exports become no-ops
+### Anomaly 1: later instance's exports become no-ops
 
 Inside E1's JS: **create instance A, call an export of A, create instance B, then call
 an export of B.** B's `i32`-returning exports return `undefined` immediately (body never
@@ -61,13 +61,13 @@ executes); B's `i64` export throws `TypeError: Cannot read properties of null`.
 
 Working pattern (used in the L2 compute proof): instantiate a module and exercise it
 *before* creating any further instance. Creating A, exercising A, creating B, then
-exercising A again also works — only exercising the *newest* instance after a
+exercising A again also works, only exercising the *newest* instance after a
 create/call/create sequence misbehaves.
 
 Smells like instance/store state: exports of the second instance resolving against a
 stale or null store/instance pointer (i32 path silently defaults, i64 path derefs null).
 
-### Anomaly 2 — sustained depth-2 compute never returns
+### Anomaly 2: sustained depth-2 compute never returns
 
 Inside E1, running `fib(24)`, `work(100000,1000)`, `hash(100000)`, `lcg(200000n)` on one
 bench-module instance produced no output within 15 minutes (killed). Small calls
@@ -87,7 +87,7 @@ outer interpreter, or the same instance-state corruption as Anomaly 1.
 Harness: `tools/depth1.js` (+ `scratch/e1.hex`) = L1 proof, `tools/depth4.js` =
 working L2 compute, `tools/depth5.js` = Anomaly 2, `scratch/multi.js` = native
 negative control. The depth scripts are untracked in `tools/`; `e1.hex` (hex of the
-7.5 MB engine binary) and `bench.dec` are scratch-only — regenerate `e1.hex` from the
+7.5 MB engine binary) and `bench.dec` are scratch-only, regenerate `e1.hex` from the
 target binary with `python -c "open('e1.hex','w').write(open('<wasm>','rb').read().hex())"`.
 `scratch/` is gitignored; the depth drivers in `tools/` are intentionally left
 uncommitted.

@@ -21,22 +21,22 @@ lifting `Step::LoadIdent` (which makes a body non-leaf, so it runs through
   `return DISPATCH_DEOPT`; `cont` continues the block, so a guard sits mid-block
   with the CFG intact. This is plan §4's "brif into a per-body deopt block", with
   the condition from `args[0]`.
-- `run_jit_body` (`jit.rs`) then truncates `vm.stack` to `work_base + depth` —
-  **the fix below** — and `run_compiled_body_on` runs `vm.start` from `vm.ip`.
+- `run_jit_body` (`jit.rs`) then truncates `vm.stack` to `work_base + depth`,
+  **the fix below**, and `run_compiled_body_on` runs `vm.start` from `vm.ip`.
 
 ## The blocker, and how it was resolved
 
 Every body the lift previously accepted was leaf-eligible (`steps_are_leaf`
 excludes exactly the call and reference steps the lift also refused), so a lifted
-body ran through `run_jit_leaf`, which has no `DISPATCH_DEOPT` handling — the
+body ran through `run_jit_leaf`, which has no `DISPATCH_DEOPT` handling, the
 sentinel surfaced as a runaway recursion. The per-step probe never hit this
 because it is gated `deopt_probe_ok = !body.leaf && !has_suspension`
 (`compiler.rs:911`).
 
-**Resolution: lift `Step::LoadIdent`** (`BindingLoc::Env` — a global read from a
+**Resolution: lift `Step::LoadIdent`** (`BindingLoc::Env`, a global read from a
 function body). It is a real read the tier wants, it lowers through the same
 `load_ident` helper the per-step path uses on its slow path (a global-value-cell
-fast path is a later slice), and it makes the body **non-leaf** — so it runs
+fast path is a later slice), and it makes the body **non-leaf**, so it runs
 through `run_jit_body`, the entry where the guard resume works. `stack_delta` in
 the lift needed `LoadIdent => +1` (the stack-depth fixpoint) in the same change.
 
@@ -46,7 +46,7 @@ the lift needed `LoadIdent => +1` (the stack-depth fixpoint) in the same change.
 bottom (`copy_within(work_base.., 0); truncate(depth)`). That is a no-op only
 when `work_base == 0` (the top-level driver). A **nested certified call**
 (`run_certified_call_nested`) carves the callee's frame as a `vm.stack` segment
-and sets `leaf_frame_base`, with the working region above it — so the shift
+and sets `leaf_frame_base`, with the working region above it, so the shift
 destroyed the frame and `vm.start` then panicked in `frame_get_mut` (empty
 frame). The arm now just `truncate(work_base + depth)`: the machine code already
 mirrored the operands at `work_base` (right above the frame), and the frame stays
@@ -66,7 +66,7 @@ replaces it with the feedback-driven guarded read.
   `opt_tier_deopt_probe_resumes_the_interpreter`).
 - `cargo clippy --workspace --all-targets -- -D warnings` clean.
 - test262 with the tier on by default: `language` 23,726 / 0, `built-ins`
-  23,820 / 0 / 1, `annexB` 1,086 / 0 — all at baseline.
+  23,820 / 0 / 1, `annexB` 1,086 / 0, all at baseline.
 
 ## Next
 

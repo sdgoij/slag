@@ -15,13 +15,13 @@ Fix status (2026-09-14): §6.2.1-6.2.3 are landed in
 second half of §6.2.3 ("missing features reported as malformed") was
 deliberately left unchanged, and §6.2.4 remains open. The §3 sweeps pass with
 0 fail and 0 pendings, and the core total matches the documented 64,594 to the
-test — so **the corpus does not exercise any of the three fixes**. They are
+test, so **the corpus does not exercise any of the three fixes**. They are
 hardening changes (a reserved encoding or an oversized body can no longer be
 misclassified as pending, and an untrusted field count can no longer
 allocate), not a pass-count improvement: the pending tally was already 0
 before them. The `file:line` anchors in §6.2 are pre-fix and drift by the ~86
-lines that change added. Separately, §3's JS-API failure — a real gap, not a
-§6.2 item — is fixed in `builtins/wasm.rs::shared_memory_buffer`.
+lines that change added. Separately, §3's JS-API failure, a real gap, not a
+§6.2 item, is fixed in `builtins/wasm.rs::shared_memory_buffer`.
 
 ## 1. Where it stands
 
@@ -69,14 +69,14 @@ Not implemented (whole features):
 - **Threads / atomics.** `0xfe` is rejected as *malformed* (`binary.rs:1064-1077`),
   the shared-limits flag as malformed (`binary.rs:553`), and shared-everything
   types as `Unsupported("shared type")` (`binary.rs:392`). No atomic op exists
-  in `instr.rs`. (Shared *memory* itself works at the JS-API level — Cut 10
-  wave 5 — but nothing can issue an atomic access.)
-- **Stack switching / continuations** — `Unsupported("continuation type")`
+  in `instr.rs`. (Shared *memory* itself works at the JS-API level, Cut 10
+  wave 5, but nothing can issue an atomic access.)
+- **Stack switching / continuations**: `Unsupported("continuation type")`
   (`binary.rs:420`).
-- **`WebAssembly.Function`** (typed function wrappers) — absent, so raw JS
+- **`WebAssembly.Function`** (typed function wrappers): absent, so raw JS
   closures cannot be funcref table elements (`runtime/.../wasm.rs:2252-2260`,
   `2505-2510`).
-- **`compileStreaming` / `instantiateStreaming`** — **installed since** (both,
+- **`compileStreaming` / `instantiateStreaming`**: **installed since** (both,
   over the host streaming hook; `.notes/embedding.md` §7's records and §9's
   `WebAssembly`-operation bullet). The wasm-plan note this used to cite
 described the state before the hook existed.
@@ -90,7 +90,7 @@ described the state before the hook existed.
 | baseline `core/*.wast` | 20,662 / 0 / 0 (3 skipped) |
 | proposals (simd, relaxed-simd, bulk-memory, exceptions, gc, memory64, multi-memory) | 43,932 / 0 / 0 (1 skipped) |
 | **core total** | **64,594 / 0 / 0** |
-| JS-API (`wasmtest jsapi`) | 1,001 / 0 / — (16 skipped) |
+| JS-API (`wasmtest jsapi`) | 1,001 / 0 /, (16 skipped) |
 
 The core total matches the documented figure to the test, so the earlier
 "not reproducible here" caveat was purely the uninitialised submodule. The four
@@ -106,8 +106,8 @@ failed `Growing shared memory does not detach old buffer` on
 (`js-api/memory/assertions.js:26`). That was a real gap, now fixed. The cause
 was scope, not a missing rule: `array_buffer::shared_array_buffer_from_block`
 never sealed its result, and `builtins/wasm.rs`'s own test even pinned the wrong
-behaviour (`if (Object.isFrozen(sab) || !Object.isExtensible(sab)) return false`
-— contradicting the comment directly above it). The wasm JS-API path now seals
+behaviour (`if (Object.isFrozen(sab) || !Object.isExtensible(sab)) return false`,
+contradicting the comment directly above it). The wasm JS-API path now seals
 its buffer in `shared_memory_buffer`, while `new SharedArrayBuffer(...)` and the
 worker path stay extensible, which is exactly what V8 does:
 
@@ -121,7 +121,7 @@ new WebAssembly.Memory({}).buffer               -> frozen false, extensible true
 Sealing globally would also have broken the pinned test262 SAB species fixtures
 (`test/built-ins/SharedArrayBuffer/prototype/slice/species-*.js` assign
 `constructor` on an instance), which is presumably why an earlier attempt was
-backed out — so the seal is scoped to the wasm path and pinned by
+backed out, so the seal is scoped to the wasm path and pinned by
 `wasm::tests::shared_memory_buffers_are_sealed_but_plain_sabs_are_not`. Re-verified
 for the fix: JS-API 1,001 / 0, `built-ins` SAB 104/104, ArrayBuffer 221/221,
 Atomics 389/389, `cargo test -p runtime --lib` 759 pass, workspace clippy clean.
@@ -134,18 +134,18 @@ correct tail-call frame replacement, and a real unwinding path for exceptions.
 Per-instruction costs that matter (all **(verified)**):
 
 1. **Every instruction is cloned.** `let instr = self.body(frame_index)[pc].clone();`
-   (`exec.rs:4216`) — a 32-byte copy per step, plus a heap allocation for the
+   (`exec.rs:4216`), a 32-byte copy per step, plus a heap allocation for the
    `Vec`-carrying variants (`BrTable`, `SelectTyped`, `TryTable`). `enter_structured`
    clones the same instruction again (`exec.rs:5647`) and `catch_in_top_frame`
    clones the `TryTable` again (`exec.rs:4123`).
-   **Partly fixed 2026-09-14:** both double clones are gone — `enter_structured`
+   **Partly fixed 2026-09-14:** both double clones are gone, `enter_structured`
    takes the instruction `step` already owns, and `catch_in_top_frame` decides
    its clause under an immutable borrow instead of cloning the `TryTable` and
    building a per-clause cell `Vec`. The per-step clone itself remains: see
    §7's landing note.
 2. **The body map is rebuilt per branch.** `map_for` calls `precompute`, which
    allocates two `Vec`s sized to the whole body and rescans it (`exec.rs:5746`,
-   `3936-3959`) — on every `br`/`br_if`/`br_table`, `if`, `else`, and catch
+   `3936-3959`), on every `br`/`br_if`/`br_table`, `if`, `else`, and catch
    dispatch. **Fixed 2026-09-14:** computed once per body and cached on the
    instance (`Instance::body_maps`, filled lazily on the first branch into the
    body).
@@ -159,7 +159,7 @@ Per-instruction costs that matter (all **(verified)**):
    are still allocated, once per invocation.
 5. **`Value` is 24 bytes** (`values.rs:261-268`). It was 32: `V128(u128)` forced
    16-byte alignment. **Fixed 2026-09-14:** `V128` is now `[u64; 2]` (the compiled
-   path's lo/hi word pair), 8-byte aligned. 16 needs the v128 payload ≤8 bytes —
+   path's lo/hi word pair), 8-byte aligned. 16 needs the v128 payload ≤8 bytes,
    an indirection, and both suggested mechanisms are unsound here: `Box<u128>`
    breaks `Value: Copy` (relied on by the `seed_globals_into`/`ref_to_token`
    matches), and a side v128 stack dangles because v128 values escape into
@@ -195,7 +195,7 @@ Policy and gaps:
 - **Lazy since 2026-09-14 (item 14).** `instantiate` compiles nothing; a body
   compiles the first time execution reaches it (`Store::ensure_compiled`),
   which installs the entry in `Instance.compiled` and in the instance's
-  direct-call table. Until then it runs interpreted — every compiled call site
+  direct-call table. Until then it runs interpreted, every compiled call site
   already treats a zero entry as "not compiled" and falls back, so that state
   needed no new plumbing. The call helper's native re-entry compiles on demand
   too, so a callee the tier has not reached still ends up native there (that
@@ -203,7 +203,7 @@ Policy and gaps:
   is written only there; nothing recompiles and nothing invalidates.
   Measured on `fixtures/many-bodies.wast` (1,001 bodies of 24 ops, of which
   only two are reached): **0.25 s → 0.054 s**, level with the interpreter's
-  0.053 s — the ~0.2 s of eager per-body compile cost is gone. The coverage
+  0.053 s, the ~0.2 s of eager per-body compile cost is gone. The coverage
   report stays a *static* measure, so `Store::compile_coverage` forces every
   body through the tier; `wasmtest run --compiled` no longer asks for it
   (`equiv`, which prints it, does), which is what let the probe path measure
@@ -213,16 +213,16 @@ Policy and gaps:
   one host-call mechanism is kept (plan decision 7).
 - **Calls go through a store-side helper.** Direct, indirect, `call_ref`, and
   tail forms spill their arguments into a scratch region and call the helper
-  (`compile.rs:3069-3187`, `exec.rs:492-755`), which resolves the target and —
-  within `NATIVE_CALL_DEPTH = 64` (`exec.rs:119`) — re-enters the callee's
+  (`compile.rs:3069-3187`, `exec.rs:492-755`), which resolves the target and,
+  within `NATIVE_CALL_DEPTH = 64` (`exec.rs:119`), re-enters the callee's
   compiled entry natively. (The earlier note here said "calls are never
-  native"; that misread the helper, which does re-enter — it just does the
+  native"; that misread the helper, which does re-enter, it just does the
   resolution and the per-call buffer setup in Rust first.) Past the cap, or for
   an interpreted or host callee, the helper runs the callee through the
   interpreter instead.
-  **Fixed 2026-09-14, in three slices.** (1) The per-call buffers — memory
+  **Fixed 2026-09-14, in three slices.** (1) The per-call buffers, memory
   descriptors, the used-global cells and `gvals`, and a 2 KiB `SCRATCH_SLOTS`
-  scratch, five `Vec`s per call — are cached per native depth on the store and
+  scratch, five `Vec`s per call, are cached per native depth on the store and
   reused (`Store::native_frames`). (2) The callee's declared type is resolved by
   reference (`Store::func_type_ref`, with `func_type` now a one-line wrapper
   over it), so only the interpreted fallback materializes a `FuncType`, which
@@ -230,22 +230,22 @@ Policy and gaps:
   function of the caller's own module now calls it **directly**: the instance's
   compiled-entry table rides the scratch region's metadata slot
   (`compile::ENTRIES_SLOT`), the callee's entry is loaded from it and invoked
-  with the same ABI, and a zero entry — the callee stayed interpreted, or the
-  store forced the interpreter — falls back to the helper, byte-for-byte the
+  with the same ABI, and a zero entry, the callee stayed interpreted, or the
+  store forced the interpreter, falls back to the helper, byte-for-byte the
   old path. The caller's scratch is shared, which is safe because the entry
   prologue reads its arguments out before any call site reuses those slots.
 
   Two conditions gate the direct form, both derived from predicates the
   compiler already computes rather than from a maintained allowlist: the callee
   must need no `gvals` buffer (the caller lends its scratch but not its global
-  slots — the same `body_has_calls`/`body_globals` pair `Engine::compile` sizes
+  slots, the same `body_has_calls`/`body_globals` pair `Engine::compile` sizes
   the buffer by), and it must make **no call at all**. The second is the
   native-stack bound: a direct call adds a frame with no depth accounting in the
   shared scratch, so only a body that cannot recurse may be reached that way;
   call-bearing callees keep going through the helper, whose `NATIVE_CALL_DEPTH`
   budget is what bounds the stack. The corpus caught exactly that: the first cut
   allowed call-bearing callees and core root overflowed the native stack
-  (`thread 'main' has overflowed its stack`) — the suites without deep recursion
+  (`thread 'main' has overflowed its stack`), the suites without deep recursion
   were all green, which is why the whole-corpus run is the gate.
 
   Together the three slices took the call-per-iteration probe from 2.6× to
@@ -263,7 +263,7 @@ Policy and gaps:
   **Fixed 2026-09-14:** the descriptor now rides a cached `Variable` pair seeded
   in the entry block, re-read only after a call or `memory.grow`
   (`Lowerer::mem_vars` / `reload_mem_vars`). The per-access bounds check itself
-  remains — its address is loop-varying, so it is not hoistable without range
+  remains, its address is loop-varying, so it is not hoistable without range
   analysis.
 - **Caps:** params+results ≤ `SCRATCH_SLOTS = 256` u64 words
   (`compile.rs:996-1005`), ratified as out of scope (plan decision 6).
@@ -274,12 +274,12 @@ table, so `cli`, `slag`, and every native embed get the compiled path without a
 feature flag. It is **native-only by construction**: cranelift's `region`
 dependency (executable-page allocation) has no wasm32 backend, so the `wasm`
 crate scopes those dependencies off wasm32 and rejects the combination with a
-`compile_error!` naming the reason — a wasm embed always runs the interpreter,
+`compile_error!` naming the reason, a wasm embed always runs the interpreter,
 exactly like the JIT (`jit` fails the same way, in the same crate). The target
 table is what keeps that honest without changing any build command: the
 documented `--target wasm32-unknown-unknown` example build never sees the
 feature, so the browser demo is untouched. There is deliberately **no
-build-time opt-out on native** (a target table cannot be feature-gated) —
+build-time opt-out on native** (a target table cannot be feature-gated),
 `Store::set_compile(false)` is the per-store way back, and the `wasm-compile`
 feature remains an explicit request (on wasm32, a hard error). A marker feature
 that the target table keys off, so a native embed could drop cranelift, was
@@ -304,7 +304,7 @@ All are medians of three runs of the committed probes, which isolate execution
 expected values are V8-verified. Whole-suite timings are **not** a usable
 per-path measure: a suite run is dominated by converting, decoding, validating,
 and instantiating, and the single-run figures previously quoted here (1.42× on
-`bulk-memory`, 0.93× on `gc`) did not reproduce — re-measured, both land inside
+`bulk-memory`, 0.93× on `gc`) did not reproduce, re-measured, both land inside
 the run-to-run noise, with the interpreter's own number moving as much as the
 difference. What the whole corpus does establish is correctness, and there both
 paths report identical totals (§3).
@@ -316,7 +316,7 @@ bodies at a wash against the interpreter, which would have made item 6 and item
 interpreter's heavy per-access cost, and the two regimes where that could have
 gone the other way are ~37× (memory) and ~8.9× (GC aggregates) ahead. Register
 SIMD is the narrowest margin at ~4.8×, where item 10's helper round-trip is
-indeed most of the compiled time — a further win, not a correction.
+indeed most of the compiled time, a further win, not a correction.
 
 Verified for the landing: `equiv` over the control-flow files, `exceptions`,
 `bulk-memory`, and `gc` reports **36 suites, 0 diverged**, 1,986/1,986 module
@@ -347,7 +347,7 @@ Threads/atomics and stack switching (§3) are the two whole proposals missing.
 ### 6.2 Correctness and robustness defects (actionable)
 
 1. **Function-body trailing bytes are accepted.** `decode_body` decodes the
-   locals and the expression, then discards `pos` — it never checks that the
+   locals and the expression, then discards `pos`, it never checks that the
    expression consumed the declared body size (`binary.rs:838-859`
    **(verified)**), so `0b 41 00 0b <garbage>` decodes with the garbage
    silently ignored, even though the section-level equivalent is rejected
@@ -357,7 +357,7 @@ Threads/atomics and stack switching (§3) are the two whole proposals missing.
    body")`).
 2. **Untrusted pre-allocation.** `decode_comptype`'s struct case does
    `Vec::with_capacity(count as usize)` from an attacker-controlled field
-   count (`binary.rs:413-414` **(verified)**) — a ~2^32 count attempts a
+   count (`binary.rs:413-414` **(verified)**), a ~2^32 count attempts a
    multi-GB allocation before any bounds check. The same file explicitly caps
    the analogous local-group expansion against hostile counts
    (`MAX_LOCALS`, `binary.rs:845-852`), so the struct path is inconsistent with
@@ -378,12 +378,12 @@ Threads/atomics and stack switching (§3) are the two whole proposals missing.
    threads proposal, `Limits::shared` is never populated, and `0xfe` is already
    `Malformed` for the same stated reason, so the atomics prefix and the
    shared-memory flag stay `Malformed`. Revisit only if a threads cut lands.
-   The corpus does not exercise the flipped arms — the core total is 64,594 / 0
-   with 0 pendings, unchanged (§3) — so this is hardening against inputs the
+   The corpus does not exercise the flipped arms, the core total is 64,594 / 0
+   with 0 pendings, unchanged (§3), so this is hardening against inputs the
    corpus lacks, not a counted fix.
 4. **The validator's `Unsupported` path is dead.** `valid::Error::Unsupported`
    (`valid.rs:28-31`) is never constructed, so any validator gap surfaces as a
-   *failure* rather than *pending* — the honesty mechanism the crate documents
+   *failure* rather than *pending*, the honesty mechanism the crate documents
    is inert in phase 2. **Deferred:** out of scope for the 2026-09-14 decoder
    cleanup; wiring it moves validator verdicts corpus-wide and needs its own
    sweep.
@@ -391,7 +391,7 @@ Threads/atomics and stack switching (§3) are the two whole proposals missing.
    supertype index but checked neither composite-kind compatibility, supertype
    finality, nor field/parameter variance (`valid.rs:89-108`), and
    `decode_subtype` rejected a supertype **count** above 1 as
-   `Malformed("malformed subtype")` — a *validation* rule (spec K-sub's
+   `Malformed("malformed subtype")`, a *validation* rule (spec K-sub's
    `|x*| <= 1`) enforced in the decoder, which would have turned the corpus's
    `assert_invalid` for that case into a failure. **Fixed 2026-09-14, both
    halves.** The decoder now accepts the list (the binary grammar bounds it not
@@ -400,7 +400,7 @@ Threads/atomics and stack switching (§3) are the two whole proposals missing.
    conditions: at most one supertype, a supertype that strictly precedes the
    subtype (the old group-end bound admitted a *later* member of the same rec
    group, and `x < x_0` is also what keeps the supertype walk acyclic), a
-   non-final supertype, and `Comptype_sub` — kind agreement, a struct's fields
+   non-final supertype, and `Comptype_sub`, kind agreement, a struct's fields
    as a prefix, constant fields covariant, mutable fields invariant, and
    function parameters contravariant with results covariant, over a new
    `heap_matches` that covers the abstract lattice, the bottom types, and the
@@ -411,7 +411,7 @@ Threads/atomics and stack switching (§3) are the two whole proposals missing.
    text rule is `x*:Tlist(Ttypeidx)`, so this is a tooling lag, not a spec
    limit; the local registry has no newer `wast`, and wabt is not on PATH).
    `crates/wasmtest/fixtures/type-subtyping.wast` therefore pins the same rules
-   in a parseable form — the multi-supertype case encoded as bytes — and
+   in a parseable form, the multi-supertype case encoded as bytes, and
    `tests/type_subtyping.rs` gates it. Every module in it is cross-checked
    against V8 (node v24.12.0), which accepts the valid module and rejects all
    ten `assert_invalid` cases.
@@ -421,25 +421,25 @@ Threads/atomics and stack switching (§3) are the two whole proposals missing.
    `6012-6013` **(verified)**). Real (token'd) host functions are unaffected;
    this is the `spectest`-stub path only.
 7. **A dropped return value.** `write_memory`'s `bool` (a length-mismatch
-   signal) is discarded (`runtime/.../wasm.rs:1457`) — a silent no-op if the
+   signal) is discarded (`runtime/.../wasm.rs:1457`), a silent no-op if the
    invariant ever breaks.
 
 ### 6.3 Operational and harness honesty
 
 - `wasmtest run` exits non-zero on `fail`, and on `pending` once `--strict` is
-  passed — which is what the documented sweeps pass, so "0 pendings" is
+  passed, which is what the documented sweeps pass, so "0 pendings" is
   enforced by the gate rather than by documentation. A `skip` is a written
   taxonomy entry in `wasm-exclusions.txt` and never fails either way.
   **Fixed 2026-09-14:** `--strict` added; all 16 documented sweeps (eight suites
   × both paths) exit 0 under it. `equiv` (the compile-vs-interpreter equivalence
   gate) and the coverage report are still not part of the default sweep; the
   runner's `compile` feature is on by default, so reaching them needs no flag.
-  The decoder's malformed/unsupported boundary — encodings the corpus never
-  reaches — is *additionally* pinned by
+  The decoder's malformed/unsupported boundary, encodings the corpus never
+  reaches, is *additionally* pinned by
   `crates/wasmtest/tests/decoder_classification.rs` driving
   `fixtures/decoder-classification.wast`.
 - `valid.rs`'s cost is quadratic on hostile input: `push_frame` clones the
-  whole `init: Vec<bool>` per structured construct (`valid.rs:693`) — O(n·depth)
+  whole `init: Vec<bool>` per structured construct (`valid.rs:693`), O(n·depth)
   for many locals and deep nesting. Not measured; severity speculative.
 - `type_indices_equivalent` has no cycle guard beyond the aligned-rec-group
   assumption; only safe because decoding always populates `rec_groups`
@@ -453,7 +453,7 @@ reproducible natively**:
 
 1. After create-instance-A → call-A → create-instance-B, B's `i32` exports
    return `undefined` without executing and its `i64` export throws
-   (`Cannot read properties of null`) — smells like stale/null store-instance
+   (`Cannot read properties of null`), smells like stale/null store-instance
    state.
 2. Sustained depth-2 compute (`fib(24)`, `work(100000,1000)`, …) never
    returned within 15 minutes, while small calls finish in seconds.
@@ -494,18 +494,18 @@ were the same move one level up, ending in skipping the helper outright for an
 eligible direct call: the native call path had been allocating seven `Vec`s per
 call (five buffers plus the callee's declared type) and paying two Rust frames
 plus an indirect call for every call. The call-per-iteration probe went 2.6× →
-7.2× → 14.3× — see §5.
+7.2× → 14.3×, see §5.
 
 Item 14 landed 2026-09-14 as a lazy tier rather than a hotness threshold:
 `instantiate` compiles nothing and `Store::ensure_compiled` compiles a body on
 first reach, reusing the null-entry fallback every call site already had. It is
 the instantiate half of the same "stop paying for work that is not executed"
-move; the probe is `fixtures/many-bodies.wast` (0.25 s → 0.054 s) — see §5.
+move; the probe is `fixtures/many-bodies.wast` (0.25 s → 0.054 s), see §5.
 
 Item 5 landed 2026-09-14 as the 32→24 slice only: `V128(u128)` became
 `V128([u64; 2])` (the compiled path's lo/hi word pair), dropping the enum from
 32/align-16 to 24/align-8. The full 16-byte target needs the v128 payload ≤8
-bytes — an indirection — and both mechanisms the item proposed are unsound here:
+bytes, an indirection, and both mechanisms the item proposed are unsound here:
 `Box<u128>` breaks `Value: Copy` (the `seed_globals_into`/`ref_to_token` sites
 match a `Value` out of a place), and a side v128 stack leaves a dangling index
 because v128 values escape into store-lifetime containers (`store.globals`,
@@ -524,12 +524,12 @@ entry block and re-read only after a call or `memory.grow` (`Lowerer::mem_vars`
 / `reload_mem_vars`), so a memory loop's per-iteration descriptor loads are
 gone. The per-access bounds check stays: its address is loop-varying, so it is
 not hoistable without range analysis, which the compiled path deliberately
-does not do. The committed probe cannot show the win — `mem-loop.wast`'s 2M
+does not do. The committed probe cannot show the win, `mem-loop.wast`'s 2M
 iterations are ~1-2 ms against ~20 ms of process startup, so the compiled
 column reads 0.021 s before and after.
 
 Item 9 landed 2026-09-14. Call setup was doing three heap allocations per
-call — a `body.locals.clone()`, the args `Vec` (which becomes the frame's
+call, a `body.locals.clone()`, the args `Vec` (which becomes the frame's
 `locals`), and a one-element `labels` `Vec`. The clone is gone (the declared
 locals are re-borrowed, not copied), and popped frames' `locals`/`labels`
 buffers now recycle through per-invocation pools on the `Engine`
@@ -543,19 +543,19 @@ load/store/vec access path resolved the memory cell twice (`mem_cell` then
 size) per access. `pop_mem_addr_cell` now resolves the cell and pops the
 address in one pass, and `mem_start` collapses the two adds into one
 (`offset + size` is a static constant), so each access is one cell lookup, one
-add, and one compare. `mem-loop` is unchanged at 0.79 s — the removed work was
-~1% of the access cost, below the probe's noise — so this closes the item as a
+add, and one compare. `mem-loop` is unchanged at 0.79 s, the removed work was
+~1% of the access cost, below the probe's noise, so this closes the item as a
 code simplification, not a measured win.
 
 Item 10 landed 2026-09-14 as its highest-value slice: the register-SIMD ops
 that map one-to-one onto Cranelift vector/bitwise instructions. `v128.not`,
 `v128.and`/`andnot`/`or`/`xor`, the integer `*.add`/`*.sub` family, and
 `*.extract_lane` now lower natively (bitcast to the lane vector type, one
-vector/bitwise op, bitcast back — with an explicit little-endian byte order on
+vector/bitwise op, bitcast back, with an explicit little-endian byte order on
 the bitcast, which changing lane count requires), and plain `v128.load` is a
 native 16-byte load. The runtime helper stays the fallback for everything else.
 `simd-loop`'s compiled column went 0.087 -> 0.023 s, moving the margin from
-~4.8× to ~18× — the one item this session that delivered its rating.
+~4.8× to ~18×, the one item this session that delivered its rating.
 
 Item 15 landed 2026-09-14 as its FuncType half only. `invoke_export` cloned the
 whole `FuncType` per call even though only `ty.params` is used (`ty.results`
@@ -567,8 +567,8 @@ refactor for the call path alone.
 
 Item 13 landed 2026-09-14 as the body-slice half only (the `&mut Frame` half is
 blocked by the same borrow that forces the per-step clone). `step` now resolves
-the body slice once instead of twice. It is ~0 at the probe scale — `leaf-loop`
-is unchanged at ~2.0 s — so the remaining per-step cost is the `Instr` clone
+the body slice once instead of twice. It is ~0 at the probe scale, `leaf-loop`
+is unchanged at ~2.0 s, so the remaining per-step cost is the `Instr` clone
 (item 2's leftover) and the dispatch itself, not the double lookup.
 
 **Item 8 measured 2026-09-14, and it is the largest boundary cost by orders of
@@ -576,7 +576,7 @@ magnitude.** `WebAssembly.Memory.prototype.buffer` is a *copy*: the JS-API keeps
 it in sync by copying the whole buffer into the engine cell before a run and the
 whole cell back out after (`wasm.rs:1467-1550`), at six sites that include every
 host call in both directions (`3155-3258`). That is ~3 full copies of the linear
-memory per JS↔wasm call, ~5.4 ms each on a 16 MiB (256-page) memory — **360×
+memory per JS↔wasm call, ~5.4 ms each on a 16 MiB (256-page) memory, **360×
 the call it is attached to** (a 200-call loop: 3 ms with `.buffer` never touched,
 1080 ms once it is), and it scales linearly, so a 1 GiB memory would be ~340 ms
 per call. Anything that reads a string out of wasm memory makes every later call
@@ -589,19 +589,19 @@ in the same refcounted block the JS side uses (`crux::typed_array::SharedBuffer`
 the JS half exists). Two blockers decide the design:
 
 1. `crates/wasm` currently has **no dependencies at all**, and `crux` pulls
-   `num-bigint`/`ryu`/`half`/`libc` — so `wasm` → `crux` would tax the
+   `num-bigint`/`ryu`/`half`/`libc`, so `wasm` → `crux` would tax the
    nested-engine/wasm32 story (`.notes/wasm-depth.md`) for a byte block. A leaf
    `byteblock` crate (no dependencies, one `workers` feature) re-exported by
    `crux` keeps the engine dependency-free, at the cost of a new crate.
 2. Under the `workers` feature `SharedBuffer` is an `Arc<[AtomicU64]>`, which is
    right for a *shared* memory (cross-agent atomics) and wrong for an unshared
-   one on the engine's hot path — and `SharedBuffer`'s layout is JIT-visible
+   one on the engine's hot path, and `SharedBuffer`'s layout is JIT-visible
    (`crates/crux/src/typed_array.rs:195-201`), so whatever moves, the offsets
    must not.
 
-Slices: (1) storage — `Memory.bytes: Vec<u8>` becomes the shared block behind
+Slices: (1) storage, `Memory.bytes: Vec<u8>` becomes the shared block behind
 `memory_bytes`/`write_memory` adapters (48 `.bytes` sites in `exec.rs`), behaviour
-unchanged and corpus-verified; (2) alias — materialise `buffer` over that same
+unchanged and corpus-verified; (2) alias, materialise `buffer` over that same
 block and delete the six copy sites, keeping only the grow/detach reconciliation
 (the JS-API's detach-on-unshared-grow rule is unchanged, and `memory.grow` then
 moves the live bytes into a fresh block, which is where the one remaining copy
@@ -610,14 +610,14 @@ belongs).
 **Slice 1a landed 2026-09-14:** the block type now lives in the new
 `crates/byteblock` leaf crate (no dependencies, one `workers` feature), and
 `crux` re-exports `SharedBuffer`/`BlockState`/`AtomicOp`/`WORKERS` under their
-historical paths, so every user — the JIT's `offset_of!` reads included — is
+historical paths, so every user, the JIT's `offset_of!` reads included, is
 source-compatible. The block's out-of-bounds error is the leaf crate's own type
 with a `From` impl in `crux`, so only the six *tail-expression* returns needed
 `.map_err(JsError::from)` and every `?` site is untouched.
 
 **Slice 1b landed 2026-09-14:** the engine's storage is now the block.
 `Memory.bytes: Vec<u8>` became a `MemoryBytes` handle that derefs to `[u8]`, so
-all 48 `.bytes` sites in `exec.rs` are unchanged — the interpreter's loads/stores,
+all 48 `.bytes` sites in `exec.rs` are unchanged, the interpreter's loads/stores,
 `memory.copy`/`fill`/`init`, the data-segment paths, and the compiled path's
 descriptors (`as_ptr()`/`len()` re-read the live base). A handle rather than an
 explicit byte-copy API because the slice-level code is what the engine already
@@ -626,28 +626,28 @@ invariant (every deref rebuilds from `SharedBuffer::data_ptr()` and
 `byte_length()`; no borrow held across a resize) is written down once, on the
 type. `Memory::resize` keeps the single-agent block resizing its `Vec` in place
 and, under `workers` where the storage is a fixed atomic array, falls back to
-replacing the block and copying — the old block stays alive for any view still
+replacing the block and copying, the old block stays alive for any view still
 holding it, which an unshared grow detaches anyway. The `workers` build takes
 design (a): the engine addresses bytes through the raw pointer, sound only while
 no other agent observes the block, and that assumption is recorded on
 `SharedBuffer::data_ptr`.
 
-**Slice 2 landed 2026-09-14 — this is the one that pays.** `buffer` is now a
+**Slice 2 landed 2026-09-14: this is the one that pays.** `buffer` is now a
 view: `materialize_memory_buffer` wraps the cell's own block
 (`Store::memory_block`, via `array_buffer_from_block` for an unshared memory and
 `shared_array_buffer_from_block` for a shared one) and the six copy sites are
-gone — the two per-run flush/refresh passes, the mid-run pair around each host
+gone, the two per-run flush/refresh passes, the mid-run pair around each host
 call, and the post-grow snapshot/copy. Reconciling survives only as
 `memory_buffers_reconcile`, which touches a buffer only when its length no longer
 matches the memory. Measured on the same probe: **5,225 µs/call → under the
 timer's resolution** (200 calls on a 16 MiB memory now complete in <1 ms, against
 1,048 ms), and a host call mid-run reads the live memory instead of costing two
-more full copies — which the old design needed for correctness, not just speed.
+more full copies, which the old design needed for correctness, not just speed.
 
 One design point the corpus's JS-API suite caught, worth recording: an unshared
 grow must **move the memory to a fresh block**, not resize in place. Detaching
 the previous buffer marks the *block* unreachable (that flag is what views and
-the JIT's inline stores read), and under aliasing that block *is* the memory — so
+the JIT's inline stores read), and under aliasing that block *is* the memory, so
 resizing in place leaves the next `buffer` born detached (`memory/grow.any.js`
 failed 10 assertions with `expected 0 but got undefined`). A shared grow still
 resizes in place, which is exactly why a shared memory's block is allocated at
@@ -662,20 +662,20 @@ over it throws), a JS-side and a wasm-side grow, and the mid-run host read.
 
 **Landed 2026-09-14 (items 1, 3, 4 and item 2's double clones).** Measured on a
 hot-loop probe (1M iterations; a call plus a `br_if` plus three numeric ops per
-iteration — `crates/wasmtest/fixtures/interp-hot-loop.wast`, timed as
+iteration, `crates/wasmtest/fixtures/interp-hot-loop.wast`, timed as
 `target/release/wasmtest run crates/wasmtest/fixtures/interp-hot-loop.wast`):
 **0.60 s → 0.32 s**
 (~1.87×), item 3 + 4 first (0.60 → 0.41) then item 1 (→ 0.32). Item 2's double
 clones do not move that loop (it enters no block and raises no exception), so
 they are unmeasured but strictly less work.
 
-The remaining half of item 2 — the per-step `Instr` clone — is deliberately
+The remaining half of item 2, the per-step `Instr` clone, is deliberately
 still in place. `step` matches an owned value because its arms call `&mut self`
 methods while the instruction is live, so removing the clone needs either an
 `Rc`'d module handle held outside `self` or a split between fetch and execute (a
 `Copy` decode-op enum). At ~32 bytes per step that is a few percent, and the two
 heap-carrying variants (`BrTable`, `SelectTyped`) still clone their `Vec` on
-every execution — the targeted follow-up if `br_table`-heavy code matters.
+every execution, the targeted follow-up if `br_table`-heavy code matters.
 
 Verified for the landing: core `20,662` + proposals `43,932` = **64,594 pass,
 0 fail, 0 pending** and JS-API **1,001 pass / 0 fail** (both unchanged from
@@ -691,10 +691,10 @@ before the change); `wasmtest equiv` over `block`/`br`/`br_if`/`br_table`/
    These affect the trustworthiness of every conformance number.
    **Landed 2026-09-14:** 6.2.1-6.2.3, except 6.2.3's second half (see 6.2).
    6.2.4 is still open.
-2. **Interpreter wins 1-4** — the highest impact/effort ratio in the engine,
+2. **Interpreter wins 1-4**: the highest impact/effort ratio in the engine,
    verify covered by `wasmtest equiv`.
    **Landed 2026-09-14:** items 1, 3, and 4, plus item 2's double clones (the
-   per-step clone remains — see §7). Measured 0.60 s → 0.32 s on the hot-loop
+   per-step clone remains, see §7). Measured 0.60 s → 0.32 s on the hot-loop
    probe; corpus totals unchanged, `equiv` clean.
 3. **Make the compiler shippable or shelve it explicitly:** as it stands Cut 11
    is a large, default-off artifact with no native call linkage, so its
@@ -709,7 +709,7 @@ before the change); `wasmtest equiv` over `block`/`br`/`br_if`/`br_table`/
    dependency table in `runtime`, which leaves the wasm32 browser build
    untouched. Measured envelope and the remaining refinements (§7 items 6 and
    10) are in §5.
-4. **JS-API memory bridge** (item 8) — the only boundary cost that was a whole
+4. **JS-API memory bridge** (item 8): the only boundary cost that was a whole
    linear-memory copy per call once a `buffer` had been materialised.
    **Landed 2026-09-14:** `buffer` is a view over the memory's own block (the
    `byteblock` leaf crate, engine storage, then aliasing), so the copies are
@@ -741,7 +741,7 @@ measure of how much of a module can compile.
   builds: `runtime` activates it from a `cfg(not(target_arch = "wasm32"))`
   dependency table, so `cli`/`slag`/native embeds get it and a wasm32 build
   never does. There is no build-time opt-out on native (a target table cannot
-  be feature-gated) — `Store::set_compile(false)` is the per-store way back.
+  be feature-gated), `Store::set_compile(false)` is the per-store way back.
   Compilation is lazy (a body compiles on first reach, `Store::ensure_compiled`)
   but `Store::compile_coverage` force-compiles every body, because it reports
   static eligibility rather than what ran: a timing measurement must not ask

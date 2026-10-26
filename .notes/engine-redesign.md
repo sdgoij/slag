@@ -2,7 +2,7 @@
 
 **Part A is superseded (2026-09-18).** Only the bump arena + mark-sweep half of
 "bump-pointer generational GC" landed here (`.notes/gc-plan.md`); the
-generational half is **`.notes/nursery-gc-plan.md`** — young bit, write barrier
+generational half is **`.notes/nursery-gc-plan.md`**, young bit, write barrier
 + remembered set, minor collection paced by the young cohort, per-level
 triggers, JIT participation (A0-A7 landed). Part B (maps) is unaffected and its
 record below still stands.
@@ -21,28 +21,28 @@ bigger win on property-access rows. They compose: maps shrink the object,
 the nursery makes object allocation cheap, and the constructor's property
 patterns (already collected) pre-build the object's final map.
 
-## Status (2026-08-27 — GC + map model landed, construct churn 53 → ~17ms)
+## Status (2026-08-27, GC + map model landed, construct churn 53 → ~17ms)
 
 Landed and committed (in order):
 
-- `a1c8bd1` — construct-churn pre-work (property-pattern tracking, store-cache
+- `a1c8bd1`: construct-churn pre-work (property-pattern tracking, store-cache
   pre-warm, lock-free `prototype` Cell, empty-props shortcut, GC compaction
-  hook skip) — see its commit body.
-- `42438e3` — **A5.1**: chunked bump arena + `GcBox.size` header +
+  hook skip), see its commit body.
+- `42438e3`: **A5.1**: chunked bump arena + `GcBox.size` header +
   size-classed free-list reuse + in-place payload drop on sweep.
-- `2ca8cab` — **A5.1b (first half)**: sorted-`live` binary-search stack scan
+- `2ca8cab`: **A5.1b (first half)**: sorted-`live` binary-search stack scan
   (replaces the per-collection `by_addr` HashMap rebuild) + store-then-read
   value-cache fronting in `fast_fresh_store`.
-- `6baab46` — **A5.1b (second half)**: direct-mapped free list — the
+- `6baab46`: **A5.1b (second half)**: direct-mapped free list, the
   size-classed free list is now `[Vec<*mut GcBox>; 256]` indexed by `size >>
   4` (sizes 16..=4096) instead of an FxHash HashMap.
-- `9c06ce0` — **B5.2**: inline field storage (`in_fields`) + map-based read
+- `9c06ce0`: **B5.2**: inline field storage (`in_fields`) + map-based read
   fast path; `Value` became `Copy`; `member_cell_get_map` in the runtime
   cache layer.
-- `7ae9f74` — **B5.3**: map transitions wired from `define_property`;
+- `7ae9f74`: **B5.3**: map transitions wired from `define_property`;
   child maps inherit parent descriptors (cumulative offsets); store IC
   re-keyed to `(map_id, name) → offset`; delete/accessor/dictionary forks.
-- `cf80952` — **B5.4**: constructor boilerplate + in-place object
+- `cf80952`: **B5.4**: constructor boilerplate + in-place object
   allocation. `construct_this_object` pre-builds the constructor's final
   map from `construct_property_patterns`, so the body's `this.x =` stores
   are in-place field writes (no per-store transition, stable (map_id, name)
@@ -51,7 +51,7 @@ Landed and committed (in order):
   write the 528B `JsObject` directly in the arena slot, skipping the
   stack-temp build + memcpy that measured ~80ns of the ~134ns per-alloc.
   Measured: construct churn ~23.6ms → ~21.7ms median.
-- `b8f4bc1` — **write-once `Copy` fields → `Cell`**: the handle
+- `b8f4bc1`: **write-once `Copy` fields → `Cell`**: the handle
   back-references (`JsObject.self_handle`, `JsObject.function_self`,
   `Function.self_handle`) and the wrapper mirror `boxed` drop `RefCell` for
   lock-free `Cell`s, removing the borrow bookkeeping from the hot
@@ -60,25 +60,25 @@ Landed and committed (in order):
   handle instead of an owned integer, so `ordinary_to_primitive` returns it
   without a per-read clone + fresh box, and `boxed` became a trace edge
   (plus a `Trace for Cell<T>` impl). Measured: noise-neutral.
-- `67f39a2` — **`PropertyKey::Symbol` by value → `Handle<Symbol>`**: the key
+- `67f39a2`: **`PropertyKey::Symbol` by value → `Handle<Symbol>`**: the key
   never owns a Symbol (with its by-value `JsString` description) any more,
   so `PropertyKey` drops 64B → 16B and `JsObject` 488B → 392B (~20%
   smaller; `SmallProps` 240B → 144B). `Gc<T>` gained a pointee-forwarding
   `Hash` impl, `Map::trace` now visits its descriptor/transition keys (real
-  arena edges — the by-value form had none), and the ~50 call sites that
+  arena edges, the by-value form had none), and the ~50 call sites that
   cloned `well_known(...).as_ref().clone()` into keys pass the handle
   directly. Plus a per-allocation-collection smoke test in the embed suite
   (runs in ~0.04s, the fast in-suite stand-in for `--gc-stress` sweeps).
   Measured: construct churn ~22.4ms → ~20.4ms median (-9%).
-- `36e803e` — **object-literal fast path**: `create_data_property_key`
+- `36e803e`: **object-literal fast path**: `create_data_property_key`
   routes absent-key defines on ordinary extensible objects through
   `fresh_data_define`, and `object_init`'s Ident case defines plain data
-  properties directly through the already-interned atom — no
+  properties directly through the already-interned atom, no
   JsString/Rust-String materialization, with `__proto__` detected by an
   atom compare against the cached canonical (`crux::proto_atom`). Measured:
   object literal churn `{x: i}` ~18.2ms → ~10.9ms median (-40%), spread
   ~66ms → ~50ms.
-- `611e410` — **construct arg slice in place**: the `Construct` step's leaf
+- `611e410`: **construct arg slice in place**: the `Construct` step's leaf
   branch reads its arguments from `self.args` into a small stack buffer
   (≤3 args) instead of `split_off`'s per-construct `Vec` allocation
   (longer lists keep the Vec path). Measured: construct churn ~19.9ms →
@@ -87,7 +87,7 @@ Landed and committed (in order):
 Session wrap-up: the plan's structural items (A5.1/A5.1b, B1–B4) are all
 landed. Construct churn ~53ms → ~17ms, literals ~11ms, collections
 ~2.5ms of the gate. The remaining gate cost is real work (alloc
-~4.2ms, store ~4.8ms, read ~3ms, construct machinery ~4ms — the leaf
+~4.2ms, store ~4.8ms, read ~3ms, construct machinery ~4ms, the leaf
 call protocol, caches, and dispatch, per the bytecode-vm skill's
 slice-15/25 analysis that the leaf core is real work; further changes
 would be sub-0.5ms grinds with regression risk).
@@ -105,7 +105,7 @@ targets the ~19ms of allocation/init + store/read that dominate now. See
 
 ## 0. Measured baselines
 
-Pre-session baseline (this worktree, release build — the rows the plan
+Pre-session baseline (this worktree, release build, the rows the plan
 started from):
 
 | Row | before | after (session end) | node --jitless |
@@ -122,14 +122,14 @@ started from):
 Post-session decomposition of construct churn (per 100k iterations,
 allocation-budget-disabled floor):
 
-- Allocation + `JsObject` init: ~11ms (~110ns/box — `Gc::new` TLS/borrow/
+- Allocation + `JsObject` init: ~11ms (~110ns/box, `Gc::new` TLS/borrow/
   free-list-index/write/register ≈ 40-60ns, `basic_object_create` ≈ 40-60ns
   of RefCell/SmallProps struct init).
 - Store `this.x =` + read `o.x` + accumulate: ~8ms (the value-cache
   fronting from `2ca8cab` made the read a cache hit; the store's probe walk
   + `fresh_data_define` borrows are near the floor for the current model).
 - Construct machinery (construct_this_object, leaf-body setup): ~2ms.
-- GC collections: ~2.5ms (was ~24ms — the arena + free list + sorted scan
+- GC collections: ~2.5ms (was ~24ms, the arena + free list + sorted scan
   made them nearly free).
 
 Why the current model is capped: `JsObject` is ~230B of RefCells + SmallProps
@@ -145,12 +145,12 @@ box. The map model (Part B) attacks all three at once.
   (3-4 accesses) + the ~230B `JsObject` init. The object-init half is a
   Part B win (a map-shaped object drops most of the RefCells).
 - **Young churn**: construct churn from ~53ms to ~20-25ms. **Met** (~20ms)
-  without a generational collector — the arena + free-list reclamation + a
+  without a generational collector, the arena + free-list reclamation + a
   sorted-live scan made the existing mark-sweep collections nearly free for
   this workload. The generational young GC (A5.2-A5.4) is deferred as low
   ROI (see the status block).
 - **Property access on fresh objects**: `o.x` after `new C(i)` becomes a map
-  check + offset read. **Not started** — Part B. Store+read is ~8ms of the
+  check + offset read. **Not started**, Part B. Store+read is ~8ms of the
   construct-churn run; property-access row ~26ms vs node 0.3ms.
 - **String concat**: ~6.6ms → **~4.3ms** (the arena + free list cut the
   rope-node allocation cost; the rope is still re-marked per collection but
@@ -159,10 +159,10 @@ box. The map model (Part B) attacks all three at once.
   weak-* fixtures, `--gc-stress` clean, leak harness flat (cycle ~3MB growth
   over 200k evals), at every landed cut.
 
-## 2. Part A — bump-pointer nursery + generational GC
+## 2. Part A: bump-pointer nursery + generational GC
 
 > **What actually landed (session 1):** A5.1/A5.1b took the *non-moving*
-> route — a chunked bump arena + size-classed free-list reclamation + the
+> route, a chunked bump arena + size-classed free-list reclamation + the
 > existing mark-sweep, which reached the ~20ms construct-churn target without
 > a generational split (collections became nearly free once allocation was
 > cheap and the sweep was a free-list push). A1-A4 below are the *deferred*
@@ -171,21 +171,21 @@ box. The map model (Part B) attacks all three at once.
 
 ### A0. Design decisions
 
-- **A-D1 — Copying semi-space nursery (not non-moving).** A non-moving bump
+- **A-D1: Copying semi-space nursery (not non-moving).** A non-moving bump
   arena cannot reclaim the holes dead objects leave without a free list
   (measured net-neutral in GC-5) or copying. Copying is the V8 model and the
   only one that reaches the ~20ns allocation target with O(survivors)
   collection. **Session-1 amendment:** the free-list route (A5.1) hit the
   target without copying; the semi-space is only worth revisiting if
   collections re-grow as a cost.
-- **A-D2 — In-box forwarding pointers, not a side-table.** During a
+- **A-D2: In-box forwarding pointers, not a side-table.** During a
   scavenge the mark slot becomes a forwarding pointer to the new location
   (V8 does exactly this: `mark` is either unmarked, marked, or a
   forwarded-to address). Object-field updates flow through the normal trace
   (visit returns the new address). The conservative stack scan reads the
   forwarding pointer out of the box for any word inside the nursery's
-  address range — no old→new `HashMap` is needed for stack words.
-- **A-D3 — Promotion by age, then old-gen mark-sweep.** Objects survive a
+  address range, no old→new `HashMap` is needed for stack words.
+- **A-D3: Promotion by age, then old-gen mark-sweep.** Objects survive a
   scavenge by being copied; a survivor counter (or the nursery-generation
   bit) decides when an object promotes to the old gen. The old gen keeps a
   mark-sweep, now rare and incremental. This preserves the existing weak
@@ -207,7 +207,7 @@ needed on the young path (the scavenge is triggered by the bump pointer
 reaching the chunk end). The `ALLOC_SINCE_COLLECT` budget stays for the old
 gen.
 
-**`Value` and `Handle` stay raw pointers** — copying is internal; handles
+**`Value` and `Handle` stay raw pointers**, copying is internal; handles
 deref through the forwarding pointer only inside the collector (V8's
 pointer-compression-era design is not required; correctness comes from the
 scavenge updating every reference before the collector returns).
@@ -246,9 +246,9 @@ the old object in a remembered set (a `Vec<Handle<JsObject>>`/box addresses,
 deduplicated). The places a Value can be stored into a heap object:
 
 - `JsObject::set_key` / `fresh_data_define` / `define_property_key`
-  (property values) — the hot path.
+  (property values), the hot path.
 - `SmallProps` array/`Vec` element writes.
-- ConsString `left`/`right` (rope children) — the string-concat hot path.
+- ConsString `left`/`right` (rope children), the string-concat hot path.
 - Env slot writes (`DeclarativeEnv::set_value` etc.), FunctionEnv captures.
 - Array backing stores.
 - `private_elements`, boxed wrappers, function `self`/`prototype` links.
@@ -263,7 +263,7 @@ highest-risk piece (see risk register).
 
 The old gen keeps the current mark-sweep (Box-based or a second arena with a
 free list). Triggered by old-gen growth past a threshold, never by young
-churn. The `by_addr` map rebuild now covers only the old gen — and the old
+churn. The `by_addr` map rebuild now covers only the old gen, and the old
 gen is stable, so either (a) keep the per-collection rebuild (cheap because
 old gen is small) or (b) revisit an incrementally maintained map now that
 the young-registration churn is gone. The realm (~3000 builtins) lives in
@@ -271,27 +271,27 @@ the old gen and is re-marked only by rare old-gen collections.
 
 ### A5. Cuts
 
-- **A5.1 — Bump arena, collections still full mark-sweep. — LANDED**
+- **A5.1: Bump arena, collections still full mark-sweep., LANDED**
   (`42438e3`). Chunked 1 MiB bump arena (address-stable `Box<[u8]>`
   chunks), `GcBox` gains a `size: u32` header (mark+size is still an 8-byte
   header, so boxes do not grow), swept boxes are **dropped in place**
   (`drop_in_place` of the payload) and their slots reclaimed on a
   size-classed free list. The in-place drop is the critical correctness
   piece: without it the free list reused slots whose payloads (Vecs,
-  HashMaps, Arc buffers) leaked — the leak harness showed 526MB growth
+  HashMaps, Arc buffers) leaked, the leak harness showed 526MB growth
   before the fix, flat afterwards. Construct churn ~53ms → ~35ms.
-- **A5.1b (adopted as part of A5.1) — cheap scan + cheap free list.**
+- **A5.1b (adopted as part of A5.1), cheap scan + cheap free list.**
   First half (`2ca8cab`): the conservative stack scan resolves a stack word
   by binary-searching `live` sorted by box address once per collection,
-  replacing the per-collection `by_addr` HashMap rebuild (exact — a random
+  replacing the per-collection `by_addr` HashMap rebuild (exact, a random
   word can never be mistaken for a box). `fast_fresh_store` also fronts the
   just-defined property in `member_value_cells` so a constructor's
   `this.x =` followed by `o.x` hits without a property-vector borrow
   (isolated store-then-read ~45ms → ~39ms). Second half (uncommitted): the
   free list became `[Vec<_>; 256]` indexed by `size >> 4` instead of an
-  FxHash HashMap — the per-alloc `get_mut` cost ~8ms total on construct
+  FxHash HashMap, the per-alloc `get_mut` cost ~8ms total on construct
   churn. Construct churn ~35ms → ~20ms, concat ~4.8ms → ~4.3ms.
-- **A5.2 — Semi-space + scavenge with in-box forwarding. — DEFERRED (low
+- **A5.2: Semi-space + scavenge with in-box forwarding., DEFERRED (low
   ROI).** A scavenge with promotion disabled re-copies the realm (~3000
   builtins) every collection, which is *worse* than mark-sweep for this
   workload; it only pays off with A5.3. Collections now cost ~2.5ms total
@@ -302,27 +302,27 @@ the old gen and is re-marked only by rare old-gen collections.
   hooking the barrier cheaply needs a design pass (e.g. a box-header
   mutation bit written from the store sites that already hold the box, or a
   per-agent dirty set threaded through crux).
-- **A5.3 — Promotion + old-gen. — DEFERRED with A5.2.**
-- **A5.4 — Write barrier + remembered set. — DEFERRED with A5.2.** The
+- **A5.3: Promotion + old-gen., DEFERRED with A5.2.**
+- **A5.4: Write barrier + remembered set., DEFERRED with A5.2.** The
   store-site list in A3 stays accurate.
-- **A5.5 — Tunables + measurement. — DEFERRED.**
+- **A5.5: Tunables + measurement., DEFERRED.**
 
-### B5.2 — LANDED
+### B5.2: LANDED
 
-`Map` type + empty-map creation. Land the map as a parallel shape —
+`Map` type + empty-map creation. Land the map as a parallel shape,
 `JsObject.map` exists; reads still go through `SmallProps`. 6 new tests
 in `crates/crux/src/map.rs`; all 173 crux tests green, full workspace
 green, clippy clean. No behavior change.
 
 ### B0. Design decisions
 
-- **B-D1 — `Map` is a heap object** (arena/old-gen allocated, identity
+- **B-D1, `Map` is a heap object** (arena/old-gen allocated, identity
   compared), holding the ordered descriptor array, the prototype, and the
   transition tree links. Two objects with the same shape share one Map.
-- **B-D2 — In-object fields.** `JsObject` gains `map: Handle<Map>` and a
+- **B-D2: In-object fields.** `JsObject` gains `map: Handle<Map>` and a
   small `in_fields: [Value; N]` (V8 uses a handful of in-object slots). The
   `SmallProps` Vec stays as the dictionary-mode / overflow store.
-- **B-D3 — Maps are immutable shapes; mutations fork.** Adding a property
+- **B-D3: Maps are immutable shapes; mutations fork.** Adding a property
   transitions to a child map (cached in the transition tree); attribute
   changes (`defineProperty`) and deletions fork to a new map or drop to
   dictionary mode. The existing `generation` counter keeps the runtime ICs'
@@ -341,14 +341,14 @@ green, clippy clean. No behavior change.
   store. No RefCell borrow, no property-vector scan.
 - Property add: find/create the child map for `(name)` in the transition
   tree (one hash lookup), write the value at the new offset. The `generation`
-  bumps only on the object whose map changed shape — but since maps are
+  bumps only on the object whose map changed shape, but since maps are
   shared, a *shape change is one map transition*, and every object on the
   old map is unaffected.
 
 ### B2. ICs re-keyed to maps
 
 The current caches (`member_cells`, `member_proto_cells`,
-`member_value_cells`) are keyed by object id — cold for every fresh object.
+`member_value_cells`) are keyed by object id, cold for every fresh object.
 Re-key to `(map_id, name) → offset`:
 
 - **Read IC**: fresh object → map check (one pointer compare) → offset →
@@ -362,14 +362,14 @@ Re-key to `(map_id, name) → offset`:
 
 ### B3. Constructor integration (boilerplate)
 
-The existing `construct_property_patterns` (Cut 35 slice 30 — the compiler
+The existing `construct_property_patterns` (Cut 35 slice 30, the compiler
 already records `this.*` writes per constructor) pre-builds the
 constructor's *final* map:
 
 - First construct: create the object with the empty map; the body's stores
   transition to the final map; cache the final map on the constructor.
 - Subsequent constructs: `construct_this_object` creates the object with the
-  final map and `in_fields` pre-sized — every `this.x =` is an in-place
+  final map and `in_fields` pre-sized, every `this.x =` is an in-place
   field store (V8's FastNewObject + boilerplate). No map transitions, no
   property-vector work, no store-cache walk.
 
@@ -392,8 +392,8 @@ constructor's *final* map:
 ### B5. Cuts
 ### B5. Cuts
 
-- **B5.1** — LANDED. Map type + empty-map creation, storage still Vec.
-- **B5.2 — LANDED.** In-object fields + map-based read path. Added
+- **B5.1**: LANDED. Map type + empty-map creation, storage still Vec.
+- **B5.2: LANDED.** In-object fields + map-based read path. Added
   `in_fields: [Cell<Option<Value>>; 4]` to `JsObject`, `INLINE_FIELDS`
   constant, `map_get`/`map_set` for map-based read/write. `Value` gained
   `Copy` (with `clone()` calls updated across workspace). `Map::field_offset`
@@ -403,7 +403,7 @@ constructor's *final* map:
   `member_map_cells` array added to Agent. Maps transitioned shape
   infrastructure ready; actual map transition wiring from `define_property`
   comes next.
-- **B5.3 — LANDED.** Map-based store + transitions. Add-property transitions
+- **B5.3: LANDED.** Map-based store + transitions. Add-property transitions
   wired from `define_property`: `fresh_data_define` transitions the map and
   writes the value into the assigned `in_fields` slot; the full
   `validate_and_apply` path does the same for fresh w/e/c data properties
@@ -415,14 +415,14 @@ constructor's *final* map:
   Store IC re-keyed: `MemberMapCell` is now `(map_id, name) → field offset`;
   the read path probes it and reads `in_fields` directly, re-resolving on a
   miss. Gate met: `defineProperty`/`delete` tests green.
-- **B5.4 — LANDED.** Constructor boilerplate. `construct_this_object`
+- **B5.4: LANDED.** Constructor boilerplate. `construct_this_object`
   pre-builds the final map from `construct_property_patterns` and starts
   every construct on it, so the body's `this.x =` stores are in-place field
   writes (no per-store transition, stable (map_id, name) cache keys). The
   cache is re-validated against the function object's generation and the
   prototype's identity. Soundness: a pre-sized field the body never writes
   stays unset, which the map read path treats as absent (falls through to
-  the property vector / prototype chain) — a conditional store cannot mask
+  the property vector / prototype chain), a conditional store cannot mask
   an inherited property. Store micro-opts: the own-property check for
   map-shaped objects reads the field state (written ⟺ in the property
   vector) instead of scanning the vector; the redundant second `map_set`
@@ -430,14 +430,14 @@ constructor's *final* map:
 
   **In-place allocation**: `Gc::new_in_place` initializes the `JsObject`
   directly in the arena slot (a single `init_ordinary` that mirrors the
-  stack literal), skipping the 528B stack-temp build + memcpy — measured
+  stack literal), skipping the 528B stack-temp build + memcpy, measured
   ~80ns of the ~134ns per-allocation cost. `ordinary_object_create` and
   `ordinary_object_create_with_map` use it (every ordinary object: literals,
   construct churn). Measured: construct churn ~23.6ms → **~21.7ms** (median,
   interleaved vs the B5.3 commit); the boilerplate store-side savings were
   within noise (the per-store transitions were already cached), the alloc
   change is the real gate win.
-- **B5.5 — Dictionary fallback + attribute forks.** Land delete/
+- **B5.5: Dictionary fallback + attribute forks.** Land delete/
   defineProperty/overflow semantics. Gate: full suite + sweep green.
 
 ## 4. Ordering and dependencies
@@ -452,10 +452,10 @@ constructor's *final* map:
   B5.4 (constructor boilerplate via `construct_property_patterns`).
 - B5 scope warning: crux's property machinery (`ordinary_get_own_property`,
   `define_own_property`, `validate_and_apply`, `property_slot`, iteration,
-  `[[OwnPropertyKeys]]` order, proxies, descriptors — ~2000 lines in
+  `[[OwnPropertyKeys]]` order, proxies, descriptors, ~2000 lines in
   `crates/crux/src/object.rs` + the runtime's member-cell caches) all assume
   `SmallProps` is the one store. A split store (map fields + SmallProps
-  overflow) is a correctness minefield — the safest shape is B5.1 landing
+  overflow) is a correctness minefield, the safest shape is B5.1 landing
   the `Map` type with **no storage change**, then B5.2 switching the read
   path, keeping `SmallProps` authoritative until the fast path is proven.
 - A5.4 (write barrier) is the only cut with a hard cross-part dependency:
@@ -468,7 +468,7 @@ constructor's *final* map:
 
 0. **Free-list reuse without a payload drop leaks every swept box's
    internals.** The arena owns the slot, but `drop_in_place((*ptr).data)`
-   must still run before the slot is reused — the leak harness showed 526MB
+   must still run before the slot is reused, the leak harness showed 526MB
    growth until it was added. Any future free-list/arena reclamation must
    keep the payload drop.
 1. **HashMap lookups on per-alloc / per-collection hot paths are expensive
@@ -478,7 +478,7 @@ constructor's *final* map:
    a bounded integer (box address range, rounded size class), prefer a
    direct-mapped structure over a hash map.
 2. **Collections became nearly free** (~2.5ms of the construct run) once
-   allocation was cheap and the sweep was a free-list push — re-measure
+   allocation was cheap and the sweep was a free-list push, re-measure
    before investing in a generational collector; the ROI moved down sharply.
 
 **Open risks (unchanged / Part B):**
@@ -489,7 +489,7 @@ constructor's *final* map:
    mutation sites (`JsObject::bump_generation`) have no cheap box/heap
    handle, so the barrier hook needs a design pass.
 4. **Copying collector + the conservative scan.** A stack word inside the
-   nursery range that is not actually a pointer gets "rewritten" — safe (it
+   nursery range that is not actually a pointer gets "rewritten", safe (it
    was going to retain garbage either way), but the rewrite must be
    idempotent across a single scavenge.
 5. **Job closures / opaque regions.** The FinalizationRegistry cleanup

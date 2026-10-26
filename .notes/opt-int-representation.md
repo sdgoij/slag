@@ -10,7 +10,7 @@ The optimizing tier carries `Int`-typed values as f64 bit patterns (the 64-bit
 register lane carries the accumulator as an **i32 register** and folds a whole
 `k = i & MASK; s = (s + k) | 0` loop into ~3 i32 instructions. Measured
 (`.notes/corpus-regression.md` §7): `opcost/baseline` opt 1.354 ms vs per-step
-0.264, `object_alloc` 1.372 vs 0.272, `compound_assign` 55.6 vs 43.9 — while the
+0.264, `object_alloc` 1.372 vs 0.272, `compound_assign` 55.6 vs 43.9, while the
 opt tier *wins* on element bodies (`element_write` 0.699 vs 1.134). Refusing the
 lift is a wash; the fix is the representation.
 
@@ -32,12 +32,12 @@ Boundaries convert Int <-> I64:
 - `call_helper` args / results and `Term::Return`: the same to-I64.
 - Block parameters: I32 for an Int phi, I64 otherwise (`Type::join` decides).
 
-## 3. The prerequisite — this is one arc, not a cut of its own
+## 3. The prerequisite: this is one arc, not a cut of its own
 
 `baseline`'s accumulator and counter live in **frame slots** (the CLIF's
 `store v69, v0+24` / `load v0+24`), so every int op already round-trips through
 the frame *and* through f64. Keeping Int as i32 pays only once those slots are
-SSA (`mem2reg`), which needs the body **sealed** — no slot-observer, no guard —
+SSA (`mem2reg`), which needs the body **sealed**, no slot-observer, no guard,
 which needs the bit-op and comparison effects widened from `Effects::call()` to
 `pure()`. Those two (the reverted "Cut 0"/"Cut A") measured only ~3.5% alone,
 because the values become SSA block parameters that are still I64/f64; with the
@@ -84,7 +84,7 @@ b1(v27:?, v31:?):
 
 The loop is **pure SSA**: 0 frame-slot crossings and 0 helper crossings for an
 `Int` value, so the representation's boundary conversions (§2) will not cap the
-win — Cut A/B can proceed. The timing is unchanged (1.39 ms), confirming the
+win, Cut A/B can proceed. The timing is unchanged (1.39 ms), confirming the
 residual is the per-op f64 round trip, not the boundary. Two preconditions
 surfaced, both now part of the arc:
 
@@ -105,7 +105,7 @@ the artifact.
 ## 5. Measurement and gates
 
 Target: the register-lane rows reach parity with the per-step lane (`opt/per`
-within noise — `baseline` <= ~0.28 ms). Companion rows must not regress:
+within noise, `baseline` <= ~0.28 ms). Companion rows must not regress:
 `element_write`, `array_alloc`, `array_at`, the `opcost/*` family mean, and the
 full `node tools/corpus/bench.js` table. Gates as usual: clippy, 38 suites, both
 test262 sweeps, the corpus differential, `--gc-stress` on the int rows.
@@ -116,7 +116,7 @@ test262 sweeps, the corpus differential, `--gc-stress` on the int rows.
   converts; a plan that ignores that cost measures worse. Cut P exists for this.
 - **Block parameters and phis.** `lower` appends an I64 param for every IR param
   (`append_block_param(block, types::I64)`); an Int phi needs I32, but a phi
-  mixing Int and non-Int cannot — keep I64 where `Type::join` is not Int. The
+  mixing Int and non-Int cannot, keep I64 where `Type::join` is not Int. The
   `mem2reg` phis (`append_edge_arg`) must carry the representation.
 - **`Type::Int` is a value type, not a bit pattern.** An Int value at the ABI is
   still f64 bits; the conversion is `sextend`/`fcvt_from_sint`/`bitcast`. `-0`
@@ -124,7 +124,7 @@ test262 sweeps, the corpus differential, `--gc-stress` on the int rows.
 - **Do not change the ABI.** Compiled entries, helper signatures and the
   completion register stay I64; only the *within-body* representation changes.
   A helper argument list is untyped at the call site (`emit_raw_call`), so an
-  arity/representation slip is silent — check every `call_helper`/`emit_raw_call`
+  arity/representation slip is silent, check every `call_helper`/`emit_raw_call`
   for an Int argument.
 - **The register lane is the reference, not a rival.** Where its i32 path is
   simpler than the opt lowering can express, port its shape rather than invent
@@ -153,12 +153,12 @@ the representation is a property of a value, so it is global or absent):
   `opt_lower::resolve` widens an `Int` edge argument when the parameter is not
   an int32.
 - **The guard mirror** (`emit_guard`) widens an `Int` live value back to its
-  `Value` word before mirroring the operand stack into the working region — a
+  `Value` word before mirroring the operand stack into the working region, a
   raw i32 store would corrupt the slot the interpreter resumes from (found via
   a parallel-test failure; regression test
   `opt_tier_int_value_survives_a_guard_deopt`).
 
-Measured two ways. **Isolated, min-of-5, HEAD build vs this build** (`scratch/row-after-ab.sh`, the only reliable instrument — the corpus `mean-jitGap` moves ±0.7 run-to-run on the *same* binary and its big rows ±60 ms, which is what made the first corpus diff of this change look like a wash):
+Measured two ways. **Isolated, min-of-5, HEAD build vs this build** (`scratch/row-after-ab.sh`, the only reliable instrument, the corpus `mean-jitGap` moves ±0.7 run-to-run on the *same* binary and its big rows ±60 ms, which is what made the first corpus diff of this change look like a wash):
 
 | row | HEAD | this | delta |
 | --- | --- | --- | --- |
@@ -174,7 +174,7 @@ Measured two ways. **Isolated, min-of-5, HEAD build vs this build** (`scratch/ro
 | `calls/construct_churn` | 94.1 | 95.8 | +2% |
 | `opcost/array_to_sorted` | 148.6 | 147.6 | -1% |
 
-The rows a single corpus run flagged as regressions (`destructure`, `generator_loop`, `construct_churn`, `array_to_sorted`) are **flat** under the isolated harness — do not trust a one-shot corpus diff for this.
+The rows a single corpus run flagged as regressions (`destructure`, `generator_loop`, `construct_churn`, `array_to_sorted`) are **flat** under the isolated harness, do not trust a one-shot corpus diff for this.
 
 The opt-vs-`SLAG_OPT=0` view (min-of-3) of the same rows:
 
@@ -196,7 +196,7 @@ and the load.
 **Fixed by consumer-driven typing** (`narrow::restrict_int_to_arith_use`): the
 representation is worth carrying only inside an int chain, so a value whose uses
 are all boundaries (a frame store, a helper arg, an element key) stays a
-`Number` — the store/load then cost nothing. A value is kept `Int` when it has an
+`Number`, the store/load then cost nothing. A value is kept `Int` when it has an
 arithmetic/bit use, or is the store of a slot read into one (the register body's
 accumulator), and `IntAdd`/`IntSub`/`IntMul` results are always kept (their
 lowering *is* an i32 op). This is safe by construction: a fusion operand is by
@@ -206,7 +206,7 @@ definition an arith use, so no `ToInt32(a + b)` fusion is ever lost, and no
 slower) and `element_write` 0.77 -> 0.60 ms.
 
 `baseline` is ~+12% off the per-step lane: its counter `i` is a `Number`, so
-`i & MASK` keeps the f64 range guard — a separate range proof on the loop
+`i & MASK` keeps the f64 range guard, a separate range proof on the loop
 counter, not the representation.
 
 Gates: clippy clean; `cargo test --workspace` green (parallel; the serial-only
@@ -214,7 +214,7 @@ Gates: clippy clean; `cargo test --workspace` green (parallel; the serial-only
 23726/0/0/0 and `built-ins` 23820/0/1/0 at `--timeout 15`; corpus differential
 0 mismatches; `--gc-stress` values exact on the int rows.
 
-Measurement note: the corpus `mean-jitGap` is not trustworthy at this grain —
+Measurement note: the corpus `mean-jitGap` is not trustworthy at this grain,
 it is dominated by rows with a near-zero `node` denominator and by two
 ~400 ms outliers, and it moves ±0.7 on a *fixed* binary. Use the isolated
 min-of-N row A/B (`corpus-row-ab.sh` for opt-vs-per-step, `row-after-ab.sh` for
@@ -232,12 +232,12 @@ reachable value; its increment is then exactly `IntAdd`/`IntSub` and the
 parameter joins to `Int` via `normalize_param_types`.
 
 Measured (min-of-3, opt vs `SLAG_OPT=0`): `opcost/baseline` **0.290 -> 0.098 ms**
-(was +12% off the per-step lane, now **62% faster** — the guard and its `brif`
+(was +12% off the per-step lane, now **62% faster**, the guard and its `brif`
 were a large part of the loop). No other sampled row moved, and the differential
 stays exact.
 
 Soundness is the whole of this pass, so it is deliberately strict: **every**
-edge into the header must classify (an unrecognised incoming value refuses — an
+edge into the header must classify (an unrecognised incoming value refuses, an
 edge that was merely *ignored* could carry a value outside the proven range); a
 `Jump` back edge (no guard) refuses; the guard is negated when the header is the
 branch's *false* side; the constant must be private to the increment (one use)

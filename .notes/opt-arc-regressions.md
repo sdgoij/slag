@@ -16,7 +16,7 @@ measurement artifact.
 | `mean-jitGap` | 23.09 | 23.31 | 23.38 | 23.51 |
 | `mean-jlGap` | 5.43 | 5.48 | 5.30 | 5.48 |
 
-`mismatches 0` in every run. Overall flat — the arc did not move the headline.
+`mismatches 0` in every run. Overall flat, the arc did not move the headline.
 
 ## 2. Whole-corpus A/B (pre-arc vs HEAD)
 
@@ -55,7 +55,7 @@ source difference, not build layout.
 
 **Localization:**
 
-- **S1 (`014b3d41`, `Int` as i32) is the whole lever** — the 14x `baseline` win
+- **S1 (`014b3d41`, `Int` as i32) is the whole lever**: the 14x `baseline` win
   (1.34 → 0.286) and the 5x `object_alloc` win are both here.
 - **S1's losses:** `control/nested_loops` +11% (26.95 → 29.82, never recovered)
   and `opcost/element_read` +29% (0.680 → 0.877).
@@ -64,14 +64,14 @@ source difference, not build layout.
 - **S3 (`d612ce0c`, the bounded-counter proof)** takes `baseline` 0.286 → 0.096
   and does nothing else.
 - **`arrays/typed_array` improves** (41.7 → 38.2). The earlier "+34%" was the
-  full-corpus pollution of §2 — **retracted**; the arc does not regress it.
+  full-corpus pollution of §2, **retracted**; the arc does not regress it.
 - `spread_assign`, `warm_store`, `destructure` are flat isolated → their
   corpus deltas were also pollution.
 
 ## 4. The one real, localized regression: `nested_loops`
 
 The `nested_loops` IR is **identical** between `P` and `S1` except the effects
-annotation on the two `Lt` guards (`[segw/segw]` → pure) — no typing change
+annotation on the two `Lt` guards (`[segw/segw]` → pure), no typing change
 (the loop is all `num`/`?`; it has no bit ops, so neither `restrict` nor the
 counter proof touch it). Yet S1 is +11%. So the loss is in the *lowering* of
 that effects change (or the CLIF S1 emits for it), not the pass IR.

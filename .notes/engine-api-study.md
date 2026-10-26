@@ -21,7 +21,7 @@ Everything below is verified against those sources except where marked
 
 - **The boundary is Rust, not C++.** Deno consumes V8 as the `v8` crate. There is
   no FFI language gap between that boundary and Slag, so "Deno on Slag" reduces to
-  "implement the `v8` crate's Rust API over Slag's engine" — bounded and testable.
+  "implement the `v8` crate's Rust API over Slag's engine", bounded and testable.
 - **It already solved our layering problem.** `rusty_v8` is the engine boundary;
   `deno_core` is everything a host builds above it. That is the `slag-api` → host
   split, done against a real engine for years.
@@ -42,7 +42,7 @@ Everything below is verified against those sources except where marked
   host memory, module machinery, structured serialization, platform, and
   structured errors. None of those are facade details.
 
-**Caveat — the trap of learning from Deno.** Deno inherits the hard half of GC
+**Caveat: the trap of learning from Deno.** Deno inherits the hard half of GC
 integration from V8 (`TracedReference`, `cppgc`). It teaches us the *requirement*
 but not the *implementation*; for that the local `v8/include/cppgc/`,
 `v8-embedder-heap.h` and `v8-traced-handle.h` are the reference. Also
@@ -90,7 +90,7 @@ found in this repository.
 
 | Requirement | rusty_v8 evidence | Slag status |
 |---|---|---|
-| Scoped local handles tied to a lifetime | `Local<'s, T>(NonNull<T>, PhantomData<&'s ()>)`, `SealedLocal` | `api::Local` is a bare `Value`, documented as needing no rooting (`api/handle.rs:9-14`) — stale since the arena GC |
+| Scoped local handles tied to a lifetime | `Local<'s, T>(NonNull<T>, PhantomData<&'s ()>)`, `SealedLocal` | `api::Local` is a bare `Value`, documented as needing no rooting (`api/handle.rs:9-14`), stale since the arena GC |
 | Scope objects that own handle storage | `HandleScope<'s, C>`, `EscapableHandleScope::escape`, `PinnedRef`, `ScopeStorage` | markers only (`api/handle.rs:196-219`) |
 | Persistent handles across calls | `Global<T>::new(isolate, handle)`, `into_raw`, `Handle` trait | `Global` holds a `Value` with no collector registration |
 | **Weak** handles with GC callbacks | `Weak<T>::new`, `with_finalizer`, `with_guaranteed_finalizer`, `clone_with_finalizer`, `to_global`, `WeakData<T>` | none. Host-object finalization is `Rc`-drop driven (`crates/jsc/src/lib.rs:21-23`), so cycles never finalize |
@@ -117,7 +117,7 @@ snapshot**), `get_heap_statistics`, `set_idle`, `memory_pressure_notification`,
 `perform_microtask_checkpoint`, `set_promise_hook`, `set_promise_reject_callback`,
 `request_garbage_collection_for_testing`, `take_heap_snapshot`.
 
-Slag has GC knobs (`set_nursery_threshold`, `set_gc_stress`, `set_gc_trace` —
+Slag has GC knobs (`set_nursery_threshold`, `set_gc_stress`, `set_gc_trace`,
 `crates/runtime/src/embed.rs:289-321`) but no heap cap, no near-limit callback, no
 memory-pressure signal, no external-memory accounting, and no host data slots.
 
@@ -134,7 +134,7 @@ A server-style host needs termination for timeouts, not just for `eval` policy.
 
 ### 3.4 Platform, tasks and microtasks
 
-- `PlatformImpl: Send + Sync` with `new_custom_platform` — the host implements it;
+- `PlatformImpl: Send + Sync` with `new_custom_platform`, the host implements it;
   plus `new_default_platform`, `new_single_threaded_default_platform`,
   `pump_message_loop`, `run_idle_tasks`, `Task::run`, `IdleTask::run`,
   `Isolate::has_pending_background_tasks`. Slag has nothing: all work runs inline
@@ -160,7 +160,7 @@ wrapping host memory and detach semantics do not exist.
 
 ### 3.6 Compilation, script identity and code cache
 
-`ScriptCompiler::Source`, `CachedData` (with `rejected()` — the host can reject a
+`ScriptCompiler::Source`, `CachedData` (with `rejected()`, the host can reject a
 stale cache), `NoCacheReason`, `CompileOptions`, `compile`, `compile_module`,
 `compile_module2`, `compile_function`, `compile_unbound_script`, and a
 `cached_data_version_tag()`. `UnboundScript` and `UnboundModuleScript` then bind to
@@ -222,7 +222,7 @@ both impossible on that representation.
   `Visitor::trace`, `Traced`, `GarbageCollected`, `Member` / `Ref` / `UnsafePtr` /
   `GcCell`, `HeapCreateParams`, `EmbedderStackState`, `MarkingType`, `SweepingType`.
   This is the host *participating* in GC, and Deno uses it (`core/cppgc.rs`).
-- **Fast calls:** `fast_api.rs` (`v8::CFunction`) — the op fast path. Performance
+- **Fast calls:** `fast_api.rs` (`v8::CFunction`), the op fast path. Performance
   only, not correctness.
 - **Locking:** `SharedIsolate::lock` → `Locker`, `thread_safe_handle` →
   `IsolateHandle` (cross-thread terminate/interrupt).
@@ -242,10 +242,10 @@ both impossible on that representation.
 
 ## 5. Build order this implies for Slag
 
-1. **Roots and handles** — handle scopes, `Global`, `Weak` (+ finalizer), `Traced`.
+1. **Roots and handles**: handle scopes, `Global`, `Weak` (+ finalizer), `Traced`.
    This is `L1`/`L2` and everything else is untestable without it.
-2. **Platform + microtask policy + task runner** — the host must own scheduling.
-3. **Snapshot + external references + per-isolate/context data slots** — without
+2. **Platform + microtask policy + task runner**: the host must own scheduling.
+3. **Snapshot + external references + per-isolate/context data slots**: without
    these, every isolate re-parses and re-runs the host's JS bootstrap.
 4. **Module resolver as a host trait**, plus unbound scripts, code cache and
    script origins (`ScriptCompiler` / `Source` / `CachedData` equivalents).
@@ -256,12 +256,12 @@ both impossible on that representation.
 7. **Inspector + source maps.**
 8. **Traced host objects** (a cppgc-equivalent or a simpler traced-handle model).
 9. **Structured clone** (`ValueSerializer` equivalent).
-10. **Fast-call ops** — performance, last.
+10. **Fast-call ops**: performance, last.
 
 One asymmetry worth banking: V8's handle scopes exist largely because its collector
 *moves* objects and must rewrite handles. Slag's arena keeps stable addresses and
 reuses swept slots, so a handle scope for Slag needs **rooting but no update
-machinery** — `L1` is materially cheaper for us than it was for V8. The corollary
+machinery**, `L1` is materially cheaper for us than it was for V8. The corollary
 is that slot reuse makes an unrooted handle *silently alias* a different object
 rather than crash, which is why (1) must land before any host-facing surface ships.
 

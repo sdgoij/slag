@@ -1,7 +1,7 @@
 # slag memory model (ECMAScript ch. 28) and the thread-per-agent design
 
 Phase 17's scope decision (PLAN): ES2026's memory model only becomes
-observable with multi-agent execution — workers sharing a
+observable with multi-agent execution, workers sharing a
 `SharedArrayBuffer`. The base engine runs one agent, so this document maps
 ch. 28 onto the thread-per-agent design that the experimental `workers`
 cargo feature implements, and records what the single-agent build guarantees
@@ -20,7 +20,7 @@ is `crux::typed_array::SharedBuffer`:
   behavior unchanged" exit criterion: nothing in this mode is observable
   across threads because there is only one thread.
 - **Workers build** (`workers` feature on): the block is an
-  `Arc<[AtomicU64]>` plus an `Arc<AtomicUsize>` length — 8-byte-aligned,
+  `Arc<[AtomicU64]>` plus an `Arc<AtomicUsize>` length, 8-byte-aligned,
   `Send + Sync`. Byte access goes through the data pointer; the Atomics
   operations go through real `AtomicU8/16/32/64` accesses at naturally
   aligned offsets (Int32Array elements are 4-aligned, BigInt64Array 8-aligned
@@ -45,7 +45,7 @@ exposed); they exist so the model can reason about which agent wrote a byte.
 
 ## 3. Executions: Read, Write, Read-Modify-Write (ch. 28.4)
 
-An execution is a set of events — Read/Write/ReadModifyWrite — plus the
+An execution is a set of events, Read/Write/ReadModifyWrite, plus the
 partial orders `SynchronizesWith`, `HappensBefore` and `ChronologicalOrder`.
 slag maps the shared-memory operations onto events as follows:
 
@@ -83,7 +83,7 @@ A synchronization edge (`sw`) is created by:
    subsumed: every Atomics operation is itself SeqCst.
 
 The wait/notify registry (`builtins::atomics::WAIT_REGISTRY`) is keyed by
-`(block_id, byte_offset)` — the byte block address, not the JS object — so
+`(block_id, byte_offset)`, the byte block address, not the JS object, so
 two agents holding different `SharedArrayBuffer` objects over the same block
 wake each other correctly.
 
@@ -124,7 +124,7 @@ the ordering arguments used.
 `Atomics.wait` suspends the calling agent. `[[CanBlock]]` is false on the
 main agent, so `wait` throws `TypeError` there (matching the spec:
 "AgentCanSuspend() is false" → TypeError) and `waitAsync` is the only
-non-blocking path — it returns `{ async: true, value: promise }` and the
+non-blocking path, it returns `{ async: true, value: promise }` and the
 runtime resolves the promise immediately (the main agent never actually
 suspends, so there is no later notify to await).
 
@@ -132,21 +132,21 @@ On a worker agent (`can_block = true`), `wait` runs the ch. 28.11 loop:
 
 1. Read the location (SeqCst). If it differs from the expected value, return
    `"not-equal"` (this also closes the race where a `notify` fired before the
-   waiter registered — the value check catches it).
+   waiter registered, the value check catches it).
 2. If the timeout expired, return `"timed-out"`.
 3. Register a `WaiterEvent` under `(block_id, byte_offset)` in the global
    registry, then block on its `Condvar` (with the remaining timeout).
 4. On wake (notify or timeout), remove the event and loop.
 
 The notifier pops up to `count` events under the registry lock, sets each
-event's `notified` flag, and `notify_one`s each — the count returned by
+event's `notified` flag, and `notify_one`s each, the count returned by
 `Atomics.notify` is the number of events popped. Registration happens before
 each suspension (not once), so a wake-up that raced with registration is
 harmless: the flag forces a value re-check, and a later notify reaches the
 freshly re-registered event.
 
 `HostResolveJobQueue`-level interaction: `Atomics.wait` blocks the OS thread
-that runs the worker's job queue. That is the intent — a worker executing
+that runs the worker's job queue. That is the intent, a worker executing
 `wait` has no runnable jobs until it is notified. The main agent's `wait`
 throws rather than blocking, so the host's event loop (which drives the main
 agent) never stalls.

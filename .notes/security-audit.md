@@ -1,4 +1,4 @@
-# Security Audit — Slag JavaScript Engine
+# Security Audit: Slag JavaScript Engine
 
 **Audit date:** 2026-10-23
 **Commit:** `883af3dd` (main), clean working tree at audit start
@@ -22,13 +22,13 @@ untrusted-input hardening is uneven.
 
 Severity scale used below:
 
-- **Critical** — memory unsafety (UAF, OOB, type confusion, arbitrary write), RCE,
+- **Critical**: memory unsafety (UAF, OOB, type confusion, arbitrary write), RCE,
   or sandbox escape.
-- **High** — reliable process abort/hang from small untrusted input in the
+- **High**: reliable process abort/hang from small untrusted input in the
   default build, or memory safety reachable under a supported configuration.
-- **Medium** — resource amplification, latent UB, capability leakage, supply-chain
+- **Medium**: resource amplification, latent UB, capability leakage, supply-chain
   weakness.
-- **Low** — defense-in-depth and hardening.
+- **Low**: defense-in-depth and hardening.
 
 ---
 
@@ -51,41 +51,41 @@ is a use-after-free of young closures.
 
 Fixed and validated in the first remediation pass:
 
-- **C-1** — added the missing `max_stack_usage` arms (`LoadLocal`,
+- **C-1**: added the missing `max_stack_usage` arms (`LoadLocal`,
   `CreateFunction`, `CreateArrow`, `NewTarget`, `RegExpLiteral`), sampled the
   transient `CallFastSlotStore`/`CallFastGlobalStore` peak, and added the
   write barrier to `array_extend_dense`. The `--gc-stress` PoC no longer trips
   the barrier verifier.
-- **H-1** — parser, `JSON.parse`, `JSON.stringify`, proxy forwarding,
+- **H-1**: parser, `JSON.parse`, `JSON.stringify`, proxy forwarding,
   `Array.prototype.flat`, and `/v` nested classes now have depth budgets. The
   measured safe parser bound on the 1 MB Windows main-thread stack is **96**;
   deeper legal code is rejected with a `SyntaxError` instead of aborting.
-- **H-2** — the matcher has an adaptive step budget and a choice cap; the
+- **H-2**: the matcher has an adaptive step budget and a choice cap; the
   empty-body repeat clamp removes the `{4294967295}` loop. Budget exhaustion
   now propagates through the checked exec/search API and reaches JS as
   `RangeError: Regular expression is too complex`.
-- **H-3** — month 13 in Chinese/Dangi formats numerically instead of indexing
+- **H-3**: month 13 in Chinese/Dangi formats numerically instead of indexing
   past the 12-entry name table.
-- **H-4** — `CreateListFromArrayLike` (Reflect, proxy `ownKeys`, `apply`) caps
+- **H-4**: `CreateListFromArrayLike` (Reflect, proxy `ownKeys`, `apply`) caps
   its length at 2^20 and no longer preallocates from `ToLength`.
-- **H-5** — BigInt exponentiation and `asUintN`/`asIntN` are capped at 2^30
+- **H-5**: BigInt exponentiation and `asUintN`/`asIntN` are capped at 2^30
   bits and throw `RangeError`.
-- **H-7** — `Array.prototype.sort` uses a stable merge sort driven by a
+- **H-7**: `Array.prototype.sort` uses a stable merge sort driven by a
   fallible comparator; an inconsistent JS comparator no longer panics.
-- **H-8** — the GC drop condition is `||`, so spilled `JsObject` storage and the
+- **H-8**: the GC drop condition is `||`, so spilled `JsObject` storage and the
   wrapper-table entries are released.
-- **H-9** — `ACTIVE_RUNS`, `with_agent`, and the JSC current-context slot are
+- **H-9**: `ACTIVE_RUNS`, `with_agent`, and the JSC current-context slot are
   restored by `Drop` guards.
-- **H-10** — `SharedBuffer` bounds math uses `checked_add`; the typed-array
+- **H-10**: `SharedBuffer` bounds math uses `checked_add`; the typed-array
   same-type copy uses saturating arithmetic.
-- **H-6** — `wasm::Memory::new`/`TableInst::new` reject declarations above the
+- **H-6**: `wasm::Memory::new`/`TableInst::new` reject declarations above the
   host caps (1 GiB of memory, 4 Mi elements) with a link error, `grow` caps at
   the same ceiling, and the JS-API `memory_limits` validates `maximum` as well
   as `initial`.
-- **H-12** — validation precomputes rec-group ends and the function type index,
+- **H-12**: validation precomputes rec-group ends and the function type index,
   uses a `HashSet` for duplicate exports, caps types/exports/`array.new_fixed`,
   and bounds per-body and module-wide local expansion.
-- **C-2 / M-6** — context teardown is deferred to the outermost API boundary
+- **C-2 / M-6**: context teardown is deferred to the outermost API boundary
   and reference-counted, `JSStringGetCharactersPtr` points into a stable boxed
   string, the property-name accumulator validates its pointer, string/value
   retains and `JSValueUnprotect` release their entries, the `finalize` callback
@@ -94,34 +94,34 @@ Fixed and validated in the first remediation pass:
   id. The last piece was the *ref namespace*: the three kinds now carry a tag
   in the low two bits (`00` value, `01` object, `10` string), so a ref of one
   kind decodes to nothing in another's table. A host that passes a
-  `JSStringRef` where a `JSValueRef` is expected compiles — the C types are all
-  `void *` at the ABI level — but now reads null/undefined instead of whatever
+  `JSStringRef` where a `JSValueRef` is expected compiles, the C types are all
+  `void *` at the ABI level, but now reads null/undefined instead of whatever
   occupies that id elsewhere. `JSValueProtect`/`Unprotect` are counted for
   primitive refs; an object ref is pinned once by its hand-out and the pin is
   not counted (a documented divergence: a second protect is a no-op, and one
-  unprotect drops the pin — the ref then resolves to nothing, never to freed
+  unprotect drops the pin, the ref then resolves to nothing, never to freed
   memory).
-- **H-11** — the CLI no longer installs `fs` by default; `--allow-fs` is the
+- **H-11**: the CLI no longer installs `fs` by default; `--allow-fs` is the
   explicit unrestricted opt-in and `--allow-fs=ROOT` canonicalizes every path
   and rejects anything outside the root. Reads are capped at 256 MiB and a
   directory listing at 2^20 entries.
-- **M-5** — externref conversions are capped at 2^20 live payloads
+- **M-5**: externref conversions are capped at 2^20 live payloads
   (`RangeError`), so the per-agent map cannot grow without bound.
-- **M-8 (partial)** — `crates/v8` is `publish = false`, `tools/build-deno.py`
+- **M-8 (partial)**: `crates/v8` is `publish = false`, `tools/build-deno.py`
   requires a full 40-hex pin, and the Unicode build validates fixture stems
   before splicing them into generated Rust.
-- **M-2** — `ArraySlots::trace`/`trace_dirty` read the element buffer through
+- **M-2**: `ArraySlots::trace`/`trace_dirty` read the element buffer through
   the `RefCell` (`try_borrow`) and clamp the length to the buffer's capacity; a
   live mutable guard aborts the sweep instead of dereferencing a cursor that an
   intervening reallocation may have invalidated. A regression test holds the
   guard across both trace paths.
-- **M-10** — `collect_workloads` uses `symlink_metadata` and skips symlinks (a
+- **M-10**: `collect_workloads` uses `symlink_metadata` and skips symlinks (a
   symlinked directory can point at an ancestor) and bounds the recursion at 32
   levels.
-- **M-11** — embedded raylib assets are materialised with `create_new` under a
+- **M-11**: embedded raylib assets are materialised with `create_new` under a
   per-process nonce name; an existing path (a pre-planted symlink included) is
   never truncated, and a failed write removes the partial file.
-- **Low** — `Heap::alloc` sizes an oversized payload's chunk to fit it (a >1 MiB
+- **Low**: `Heap::alloc` sizes an oversized payload's chunk to fit it (a >1 MiB
   box no longer bumps past `chunk.end`); `Gc::new_in_place` writes the header
   through `addr_of_mut!` instead of forming a reference over uninitialized
   memory; `trace_roots` uses `try_borrow` for the generator tables; typed-array
@@ -130,33 +130,33 @@ Fixed and validated in the first remediation pass:
   path converts exactly the declared parameters (missing → `undefined`, extra
   ignored) instead of copying the JS argument vector, which shifted declared
   locals.
-- **Low (import matching, single-agent build)** — see the M-12 entry and the
+- **Low (import matching, single-agent build)**: see the M-12 entry and the
   import-matching entry above: the flag is compared under `workers` and ignored
   in the single-agent build, where no other thread can observe the block and the
   shared bridge is the only way a shared memory type reaches the store.
-- **M-4** — `Symbol.replace` now runs the single spec loop (22.2.7.3 steps
+- **M-4**: `Symbol.replace` now runs the single spec loop (22.2.7.3 steps
   13a-13l): each match is replaced before the next exec instead of collecting
   every exec result first. Memory is bounded by the output string rather than
   by the match count, and a functional replacer's `lastIndex` write now affects
   the next match. A regression test pins the interleaving.
-- **M-3** — a resizable/growable buffer no longer commits its maximum up front
+- **M-3**: a resizable/growable buffer no longer commits its maximum up front
   under `workers`. The block is a reserved virtual address range
   (`VirtualAlloc(MEM_RESERVE)` on Windows, an anonymous `MAP_NORESERVE` mapping
   elsewhere) whose pages are committed as the buffer grows, so
   `new ArrayBuffer(0, { maxByteLength: 2**30 })` costs address space instead of
   a gigabyte of zeroed pages. The base never moves, which is what the JIT's
-  baked element pointers and every live view rely on — so this needed no shared
+  baked element pointers and every live view rely on, so this needed no shared
   indirection, and M-12 stays independent. The default build was already lazy
   (`byteblock` ignores the capacity there and grows its `Vec`).
   The reservation test now checks the OS's view as well as the block's own
   count: on Windows a `VirtualQuery` probe asserts that the page holding `base`
   is `MEM_COMMIT` while a page a megabyte into the reservation is `MEM_RESERVE`,
-  and that the probe itself answered — a silently failing probe would otherwise
+  and that the probe itself answered, a silently failing probe would otherwise
   make the assertion vacuous. On Linux the resident-set delta of a
   `new_with_capacity(0, 1 GiB)` stays under a quarter of the maximum. The
   bookkeeping count alone would not have caught a bridge that committed eagerly
   and then under-reported.
-- **M-12** — worker memory atomics. Two plain accesses could reach a byte block
+- **M-12**: worker memory atomics. Two plain accesses could reach a byte block
   another agent thread also touched, which is a data race (undefined behaviour)
   even when the other side is atomic: the JS typed-array paths (`read`, `write`,
   `read_into`) copied with `copy_nonoverlapping`, and the wasm interpreter
@@ -172,19 +172,19 @@ Fixed and validated in the first remediation pass:
   be published as a `SharedArrayBuffer`, which is how a spawned worker or the
   JS-API's `Memory.prototype.buffer` would have handed it to another agent.
   The single-agent build is unchanged: it cannot share a block at all.
-- **Low (import matching)** — the `shared` flag is now compared under `workers`
+- **Low (import matching)**: the `shared` flag is now compared under `workers`
   (see M-12). The single-agent build still ignores it, deliberately: the decoder
   rejects a shared module memory type, so the only shared type the store can see
   is a host-created `WebAssembly.Memory`, and comparing the flag there would
   reject the intentional shared bridge without enabling a conformant shared
   module.
-- **M-8 (remainder)** — the Deno reconcile now logs every lock entry it moved,
+- **M-8 (remainder)**: the Deno reconcile now logs every lock entry it moved,
   the build runs `cargo build --locked` so nothing resolves beyond the
   reconciled lock, and an overridden `DENO_REPO` is announced instead of being
   silently trusted.
-- **Low** — `padStart`/`padEnd` fill the gap directly into the result buffer
+- **Low**: `padStart`/`padEnd` fill the gap directly into the result buffer
   instead of materializing a second filler copy.
-- **M-7** — the bridge no longer resolves a handle through whichever context
+- **M-7**: the bridge no longer resolves a handle through whichever context
   is innermost on the thread. Each handle's cell records the realm that was
   entered when it was minted (`store::PayloadCell`), and the scope-less entry
   points that take a handle resolve through that realm
@@ -196,17 +196,17 @@ Fixed and validated in the first remediation pass:
   the unattributed form. The regression test enters two isolates on one thread
   and reads an A-minted `Date` while B's context is innermost: NaN without the
   mint realm, the timestamp with it.
-- **M-1** — the agent aliasing model is closed: the live-agent registry holds
-  only each agent's `*const AgentRoots`, and every container a collection reads
-  — the traced tables, the IC caches, the three value-cell arrays, and the
-  weak/trace tables the compaction hook and the reapers walk — lives in that
+- **M-1**: the agent aliasing model is closed: the live-agent registry holds
+  only each agent's `*const AgentRoots`, and every container a collection reads,
+  the traced tables, the IC caches, the three value-cell arrays, and the
+  weak/trace tables the compaction hook and the reapers walk, lives in that
   allocation behind interior mutability. A collection never forms a `&Agent`,
   so it can no longer retag an interpreter frame's `&mut Agent` (design note
   and slices 1-4k).
-- **M-8 (actions)** — every workflow `uses:` is pinned to a 40-hex commit with
+- **M-8 (actions)**: every workflow `uses:` is pinned to a 40-hex commit with
   the moving tag kept as a trailing comment, so a retagged action cannot change
   what CI runs.
-- **M-9** — CI gained a `gc-stress` job (Array built-ins and array expressions
+- **M-9**: CI gained a `gc-stress` job (Array built-ins and array expressions
   under `--gc-stress --gc-verify`, the collection class that exposed C-1), a
   `cargo audit` job pinned to `cargo-audit 0.22.2`, and a Miri job over the
   lexer and syntax crates that runs only on manual dispatch (a
@@ -214,24 +214,24 @@ Fixed and validated in the first remediation pass:
   `crux` (the collector reads the native stack), and the regexp/parser suites
   need minutes of interpreted matching per test.
   Fuzzing is no longer absent: `fuzz/` is a `cargo-fuzz` workspace with four
-  libFuzzer targets — `parse_js` (script, module and JSX goals), `parse_js_utf16`
+  libFuzzer targets, `parse_js` (script, module and JSX goals), `parse_js_utf16`
   (the code-unit entry point `eval` uses), `wasm_decode` (decode then validate),
-  and `regexp` (compile then execute) — plus a seed corpus so each decoder is
+  and `regexp` (compile then execute), plus a seed corpus so each decoder is
   reached on the first iteration rather than having to discover an 8-byte module
   header. The targets build with a sanitizer and run under `-max_total_time`, so
   they are a manual `workflow_dispatch` job like Miri and cannot stall a build;
   the lint job checks their formatting and lints them on every push. Each of the
   four ran clean for 150 seconds on the current tree (363k, 684k, 4.3M and 53k
   executions).
-- **Fuzzing (new)** — the first runs found two defects, both fixed:
-  - `lexer/src/lexer.rs:678` — `code_point(hi, lo)` computed `hi - 0xD800` for an
+- **Fuzzing (new)**: the first runs found two defects, both fixed:
+  - `lexer/src/lexer.rs:678`: `code_point(hi, lo)` computed `hi - 0xD800` for an
     *unpaired* high surrogate: the identifier-arm guard checked only that a
     following unit existed, not that it was a low surrogate. A UTF-16 source
     (what `eval` takes) with a lone `\uD800` panicked a build with overflow
     checks and wrapped silently in one without. The range check now precedes the
     pair decode, which is what the other two call sites already did, and a test
     pins the three unpaired shapes.
-  - `parser/src/parser.rs` — the fallback stack guard was a fixed "this parse
+  - `parser/src/parser.rs`: the fallback stack guard was a fixed "this parse
     may consume N bytes" budget (1 MiB with debug assertions), which is larger
     than a Windows thread's whole stack. `\n` + 49 `[` (49 levels, under the
     `MAX_PARSE_DEPTH` count) overflowed a 1 MiB thread once the frames were
@@ -239,25 +239,25 @@ Fixed and validated in the first remediation pass:
     (`GetCurrentThreadStackLimits` / `pthread_getattr_np`) when no host probe is
     installed, and the parser's fixed budget is gone; a test drives a 1 MiB
     thread to exhaustion and asserts the probe refuses first.
-- **Miri investigation (fixed)** — `regexp::fold_class` no longer scans all
+- **Miri investigation (fixed)**: `regexp::fold_class` no longer scans all
   1,114,112 code points on first use; `crates/regexp/build.rs` emits the reverse
   fold index at compile time, so the lookup is a binary search over static data
   with no lazy initialization or global lock, and a test recomputes the scan
   and compares every entry.
-- **Low (JIT i-cache)** — `ExecutableCode::new` now flushes the instruction
+- **Low (JIT i-cache)**: `ExecutableCode::new` now flushes the instruction
   cache after copying the code and raising the protection. x86-64 is coherent
   and compiles the call away; linux-aarch64 runs the `dc cvau` / `ic ivau`
   sequence (compiled and linted for that target).
-- **Low (snapshot decode)** — reviewed and covered: `header` validates the body
+- **Low (snapshot decode)**: reviewed and covered: `header` validates the body
   length and the trailing magic, every body count is checked against the bytes
   remaining, and `Reader` is bounds-checked. A deterministic bit-flip sweep
   over the header, context table and first record pins that a corrupted blob
   returns an error and never panics.
-- **Raylib asset root** — `rl.load*` disk reads are capability-gated: embedded
+- **Raylib asset root**: `rl.load*` disk reads are capability-gated: embedded
   assets always load, and `AssetAccess::{EmbeddedOnly, Unrestricted, Root}`
   governs a path. The CLI defaults to `EmbeddedOnly` and takes
   `--allow-rl-assets[=ROOT]`; a root canonicalizes the path and rejects escapes.
-- **`ffi::guard` poisoning** — a panic at the C boundary now sets a per-thread
+- **`ffi::guard` poisoning**: a panic at the C boundary now sets a per-thread
   poison, and later guarded calls return `R::default()` without running (the
   isolate's state is unknown). `is_poisoned`/`unpoison` are exported and
   re-exported by `crates/jsc` for a host that rebuilds its state.
@@ -308,8 +308,8 @@ clippy and rustfmt stay clean; the 24 string unit tests and all 35 `*pad*`
 fixtures pass.
 
 Validation for the seventh pass: the new `gc-stress` commands were run locally
-first — 33 Array built-in fixtures and 25 array-expression fixtures pass under
-`--gc-stress --gc-verify` inside the 15s deadline — and every workflow `uses:`
+first, 33 Array built-in fixtures and 25 array-expression fixtures pass under
+`--gc-stress --gc-verify` inside the 15s deadline, and every workflow `uses:`
 is pinned to a 40-hex commit.
 
 Validation for the eighth pass: `cargo audit` reports no advisories over 134
@@ -317,7 +317,7 @@ crate dependencies (exit 0); `cargo +nightly miri test -p lexer --lib` passes 59
 tests and `-p syntax --lib` passes 11. The `crux`, `parser`, and `regexp`
 suites were excluded from the Miri gate: `crux` needs the native stack, and a
 bounded `parser` run showed `regexp::engine::fold_class` still advancing after
-millions of basic blocks — it enumerates the whole code point space once to
+millions of basic blocks, it enumerates the whole code point space once to
 build the case-folding table, and `parses_literals_and_identifiers` reaches it
 through a regexp literal. The `regexp` suite stalled on the same table (since
 removed; see the fold-table entry above).
@@ -330,7 +330,7 @@ syntax crates and only runs from a manual `workflow_dispatch` with its input
 set, so push/PR runs do not wait on it.
 
 Validation for the thirteenth pass: the reservation runs in the `workers`
-configuration — `cargo test -p byteblock --all-features` (and the workspace's
+configuration, `cargo test -p byteblock --all-features` (and the workspace's
 all-feature run) passes a test asserting an empty resizable block commits
 nothing, a 64-byte grow commits less than the 1 GiB maximum, the bytes round
 trip, and the base is stable across grow/shrink/regrow; clippy `-D warnings` is
@@ -343,7 +343,7 @@ realm is ignored); clippy `-D warnings` is clean for the crate and for the
 workspace with all features; `cargo test --workspace --all-features` is green
 in debug and release.
 
-Validation for the eleventh pass: `cargo test -p jsc` passes — three ref
+Validation for the eleventh pass: `cargo test -p jsc` passes, three ref
 namespace unit tests (a string ref never decodes as a value, a value ref never
 as a string, the low bits name the kind) plus five C compat tests compiled from
 C sources against the C API and linked against the crate; clippy `-D warnings`
@@ -378,7 +378,7 @@ rustfmt are clean for the root workspace and for `fuzz/`; `cargo test
 
 ## Critical findings
 
-### C-1 — JIT working-region undercount leaves live GC values untraced (reproduced)
+### C-1: JIT working-region undercount leaves live GC values untraced (reproduced)
 
 **Locations:** `crates/runtime/src/ir.rs:24136` (`max_stack_usage`),
 `crates/runtime/src/jit.rs:7058` (`run_jit_body`),
@@ -412,7 +412,7 @@ The array/slots box is promoted while the closure values remain young because
 they were above the traced stack length; `array_extend_dense` bulk-extends
 without a write barrier, so the young closure is never recorded. In a
 non-`--gc-stress` run the verifier is off and the young function can be swept
-while the array still references it — a use-after-free/type-confusion primitive,
+while the array still references it, a use-after-free/type-confusion primitive,
 not merely a verifier complaint.
 
 **Fix:** add every pushing step to `max_stack_usage`, sample `max` inside
@@ -421,7 +421,7 @@ transient-raising arms, add a `debug_assert` in `emit_step`/`opt_lower` that
 per-element barrier (or a proven young-array fast path) in
 `array_extend_dense`.
 
-### C-2 — JSC C API lifetime cluster
+### C-2: JSC C API lifetime cluster
 
 `crates/jsc` is not in the default workspace build, but
 `cargo build -p cli --features jsc` ships it as a drop-in JavaScriptCore C API.
@@ -443,7 +443,7 @@ and implement real retain/release counts.
 
 ## High-severity findings
 
-### H-1 — Unbounded native recursion from untrusted input (reproduced)
+### H-1: Unbounded native recursion from untrusted input (reproduced)
 
 Every one of these aborts the process with
 `thread 'main' has overflowed its stack` (uncatchable) from a tiny input:
@@ -466,7 +466,7 @@ explicit-stack or depth-bounded `Drop` for the AST, and a visited/depth budget
 for proxy forwarding and `flat`.
 
 **Follow-up (fixed): the counters were not stack-bounded.** The budgets above
-were frame counts, and a count cannot bound a stack — it knows nothing about
+were frame counts, and a count cannot bound a stack, it knows nothing about
 what a frame costs. The same counts that are safe optimized overflow an
 unoptimized build: `cargo test --workspace` (debug, 2 MiB test threads) aborted
 with `STATUS_STACK_OVERFLOW` in `crux`'s 2000-deep proxy chain, the parser's
@@ -476,8 +476,8 @@ could not even hold ~20 levels of legitimate nesting on a 1 MiB main thread.
 
 The bound is now the host's: `stackprobe` (a leaf crate, so `crux`, `parser`
 and `regexp` can all reach it without depending on each other) carries a probe,
-installed by `runtime::stack::install_probe` — which `Agent::new` and the CLI
-both call — and `has_headroom` answers from the thread's real watermark, the
+installed by `runtime::stack::install_probe`, which `Agent::new` and the CLI
+both call, and `has_headroom` answers from the thread's real watermark, the
 same reserve `enter_js` uses. The parser, `enter_forward`, `flat`, both JSON
 recursions and `regexp`'s group/class descent consult it; each keeps its count
 as a ceiling. A context with no probe (a crate's own tests, a host that installs
@@ -486,9 +486,9 @@ with and refuses past a budget sized by profile. The headless CLI runs on a
 16 MiB thread, so the guard no longer refuses nesting the default stack merely
 could not hold. `regexp`'s frames are small enough that 190 nested `/v` classes
 parse on a 2 MiB debug thread while 200 is refused, so its count still binds
-first there — the probe covers the case where it would not.
+first there, the probe covers the case where it would not.
 
-### H-2 — RegExp has no step budget; quantifier bounds are unbounded (reproduced)
+### H-2: RegExp has no step budget; quantifier bounds are unbounded (reproduced)
 
 `crates/regexp/src/engine.rs:460-550,588-629`;
 `crates/regexp/src/parse.rs:354-371`.
@@ -504,7 +504,7 @@ empty-matching body to 1. **Status:** the budget and the empty-body clamp are
 implemented; the budget currently returns a non-match, so threading a
 `RangeError` through the exec protocol remains.
 
-### H-3 — `Intl.DateTimeFormat` indexes a 12-entry table with month 13 (reproduced)
+### H-3: `Intl.DateTimeFormat` indexes a 12-entry table with month 13 (reproduced)
 
 `crates/runtime/src/builtins/intl/date_time_format.rs:1973`.
 
@@ -519,7 +519,7 @@ numeric widths.
 **Fix:** select by `calendar_months_in_year` or fall back to the numeric form for
 months > 12.
 
-### H-4 — `ToLength`-sized `Vec::with_capacity` aborts the process (reproduced)
+### H-4: `ToLength`-sized `Vec::with_capacity` aborts the process (reproduced)
 
 `crates/runtime/src/builtins/reflect.rs:151`, `crates/crux/src/proxy.rs:605`,
 `crates/runtime/src/builtins/function.rs:776`.
@@ -535,7 +535,7 @@ proxy `ownKeys` and `Function.prototype.apply` paths share the pattern.
 **Fix:** never pre-size from a JS length; use growth or `try_reserve` mapped to a
 `RangeError`.
 
-### H-5 — BigInt exponentiation is unbounded (reproduced)
+### H-5: BigInt exponentiation is unbounded (reproduced)
 
 `crates/crux/src/bigint.rs:135-152`.
 
@@ -550,7 +550,7 @@ proxy `ownKeys` and `Function.prototype.apply` paths share the pattern.
 **Fix:** impose a BigInt bit-length limit (V8 throws `RangeError`) before the
 shift/pow.
 
-### H-6 — WASM memory/table sizes are not host-bounded (code-confirmed; table hang reproduced)
+### H-6: WASM memory/table sizes are not host-bounded (code-confirmed; table hang reproduced)
 
 `crates/wasm/src/exec.rs:238` (`min_pages * PAGE_SIZE` unchecked), `:303`
 (`vec![init; min as usize]`), `:322` (`grow`); `crates/wasm/src/valid.rs:410`
@@ -569,7 +569,7 @@ new WebAssembly.Table({element:"externref", initial:0}).grow(2**32-1); // >20s, 
 `checked_mul`/`try_reserve`, and surface `LinkError`/`RangeError` instead of
 aborting.
 
-### H-7 — A JS comparator violating total order panics the engine (reproduced)
+### H-7: A JS comparator violating total order panics the engine (reproduced)
 
 `crates/runtime/src/builtins/array.rs:2234` (and `typed_array.rs:1850`).
 
@@ -583,7 +583,7 @@ A comparator is allowed by the spec to be inconsistent; Rust's stable sort is no
 
 **Fix:** implement the merge internally or catch the panic and throw a JS error.
 
-### H-8 — GC drop short-circuit leaks every non-trivial `JsObject`
+### H-8: GC drop short-circuit leaks every non-trivial `JsObject`
 
 `crates/crux/src/heap.rs:373` vs the documented contract at `heap.rs:60`:
 
@@ -598,7 +598,7 @@ for its only implementor. Spilled property vectors, `property_index`, and
 `DEAD_WRAPPER_IDS`, so the wrapper tables never evict. The operator should be
 `||`. Long-running hosts grow without bound.
 
-### H-9 — Non-RAII TLS state across caught panics
+### H-9: Non-RAII TLS state across caught panics
 
 `crates/runtime/src/ir.rs:3582-3611` (`with_jit_run`/`with_leaf_run` push a raw
 `*const Vm`/`*const CompiledBody` and pop only on the normal path),
@@ -613,7 +613,7 @@ collection then traces a freed body/Vm or attributes callbacks to a stale realm.
 **Fix:** make every push a `Drop` guard, pop by identity, and poison the context
 after a caught panic.
 
-### H-10 — `SharedBuffer` bounds checks wrap; `TypedArray.set` can underflow
+### H-10: `SharedBuffer` bounds checks wrap; `TypedArray.set` can underflow
 
 `crates/byteblock/src/lib.rs:636,676,715` use `offset + len > byte_length`;
 release builds wrap. `crates/runtime/src/builtins/typed_array.rs:1692` computes
@@ -625,7 +625,7 @@ public API and the only guard.
 **Fix:** `offset.checked_add(len)`, `saturating_sub`, and a `try_reserve` for the
 copy.
 
-### H-11 — CLI grants unrestricted filesystem access by default
+### H-11: CLI grants unrestricted filesystem access by default
 
 `crates/cli/src/main.rs:317` calls `context.install_fs()` for every script;
 `crates/runtime/src/embed.rs:978-1101` exposes
@@ -640,7 +640,7 @@ but it is a capability leak for an engine advertised as embeddable.
 **Fix:** `--allow-fs[=ROOT]` (deny by default), canonicalize under the root, cap
 read sizes, and put raylib asset loads/screenshot/clipboard behind the same grant.
 
-### H-12 — WASM validation/decoding is superlinear
+### H-12: WASM validation/decoding is superlinear
 
 `crates/wasm/src/valid.rs:97` (`rec_group_end` per type with a linear
 `rec_group_of` at `module.rs:236`), `:2188` (`func_type_of` uses `.nth`), `:469`
@@ -657,58 +657,58 @@ few hundred KB of types/exports/locals can hang `WebAssembly.validate` for hours
 
 **Medium**
 
-- **M-1** `runtime/src/context.rs:25-36` — `current_agent_mut` fabricates
+- **M-1** `runtime/src/context.rs:25-36`, `current_agent_mut` fabricates
   `&'static mut Agent` from TLS; nested host closures can alias the engine's own
   `&mut Agent` (UB under `noalias`).
-- **M-2** `crux/src/object.rs:710-770` — `ArraySlots::trace` reads
+- **M-2** `crux/src/object.rs:710-770`, `ArraySlots::trace` reads
   `elem_ptr`/`elem_len` without borrowing the `RefCell`; a guard held across an
   allocation can leave the cursor on freed memory (suspected, no reachable call
   site found).
-- **M-3** `runtime/src/builtins/array_buffer.rs:204,249` — resizable/growable
+- **M-3** `runtime/src/builtins/array_buffer.rs:204,249`, resizable/growable
   buffers eagerly allocate `maxByteLength`; `new ArrayBuffer(0,{maxByteLength:2**30})`
   commits 1 GiB.
-- **M-4** `runtime/src/builtins/regexp.rs:1225` — `Symbol.replace` accumulates
+- **M-4** `runtime/src/builtins/regexp.rs:1225`, `Symbol.replace` accumulates
   every match array; `"a".repeat(1e8).replace(/(?:)/g,"")` allocates tens of GB.
-- **M-5** `runtime/src/builtins/wasm.rs:2483` — externref conversions grow
+- **M-5** `runtime/src/builtins/wasm.rs:2483`, externref conversions grow
   `wasm_extern_values` forever; the `u32` token wraps after 2^32 conversions
   (identity confusion).
-- **M-6** `crates/jsc` — object refs are pinned forever, `invoke_finalize` has no
+- **M-6** `crates/jsc`, object refs are pinned forever, `invoke_finalize` has no
   caller, `JSClassRelease` clears all classes' finalizers, and
   string/value/object refs share one untagged numeric namespace.
-- **M-7** `crates/v8` — the entered-realm slot is per thread, not per isolate; two
+- **M-7** `crates/v8`, the entered-realm slot is per thread, not per isolate; two
   isolates on one thread can resolve ids in the wrong realm (suspected).
-- **M-8** Supply chain — GitHub Actions pinned to mutable tags in the
+- **M-8** Supply chain: GitHub Actions pinned to mutable tags in the
   release/deploy jobs (`ci.yml:35,42,135,240,242,263,526,540`);
   `tools/build-deno.py:223` runs `cargo update` (no `--locked`) on an env-supplied
   repo/pin; `crates/v8` declares `name="v8"` at `150.4.0` without
   `publish = false`; `crates/unicode/build.rs:52,284-299` splices test262 fixture
   stems unescaped into generated Rust.
-- **M-9** Process — CI runs clippy and conformance sweeps but no `cargo audit`,
+- **M-9** Process: CI runs clippy and conformance sweeps but no `cargo audit`,
   Miri, fuzzing, or `--gc-stress` smoke test. The JIT bug in C-1 would have been
   caught by a stress smoke test.
-- **M-10** `cli/src/main.rs:856-878` — `--corpus` follows directory symlinks with
+- **M-10** `cli/src/main.rs:856-878`, `--corpus` follows directory symlinks with
   no depth/visited bound.
-- **M-11** `runtime/src/raylib.rs:814-825` — embedded assets are written to a
+- **M-11** `runtime/src/raylib.rs:814-825`, embedded assets are written to a
   predictable temp path with truncation, not `create_new` (symlink clobber).
-- **M-12** `crates/wasm/src/exec.rs:211-219` + `byteblock` — under `workers`,
+- **M-12** `crates/wasm/src/exec.rs:211-219` + `byteblock`, under `workers`,
   plain `&mut [u8]` views over `Arc<[AtomicU64]>` race with JS `Atomics` (UB in
   the memory model).
 
 **Low**
 
-- `crux/src/heap.rs:1830` — `Heap::alloc` can advance the bump past `chunk.end`
+- `crux/src/heap.rs:1830`: `Heap::alloc` can advance the bump past `chunk.end`
   for a >1 MiB payload (latent).
-- `crux/src/heap.rs:498` — `Gc::new_in_place` forms `&mut *raw` over uninitialized
+- `crux/src/heap.rs:498`: `Gc::new_in_place` forms `&mut *raw` over uninitialized
   memory (Miri UB).
-- `crux/src/object.rs:5238` — `u64 → usize` truncation in typed-array index checks
+- `crux/src/object.rs:5238`: `u64 → usize` truncation in typed-array index checks
   on wasm32.
-- `runtime/src/agent.rs:2171` — `trace_roots` uses `borrow()` where neighbours use
+- `runtime/src/agent.rs:2171`: `trace_roots` uses `borrow()` where neighbours use
   `try_borrow`; a stress collection during a mutable borrow panics.
-- `wasm/exec.rs:6692` — import matching ignores the `shared` flag.
-- `wasm/exec.rs:3191,3949` — the public `Store` API assumes a validated module and
+- `wasm/exec.rs:6692`: import matching ignores the `shared` flag.
+- `wasm/exec.rs:3191,3949`: the public `Store` API assumes a validated module and
   exact call arity; violations panic rather than trap.
-- `string.rs:660` — `padStart`/`padEnd` transiently allocate ~2× the result.
-- `runtime/src/embed.rs:339` — `Context::read_snapshot`'s `is_valid` checks only
+- `string.rs:660`: `padStart`/`padEnd` transiently allocate ~2× the result.
+- `runtime/src/embed.rs:339`: `Context::read_snapshot`'s `is_valid` checks only
   the header; a hostile snapshot cache can still fail deep in decode.
 - JIT code pages are W^X-correct, but `crates/jit/src/code_buffer.rs:20-33` never
   flushes the instruction cache; harmless on x86-64, potentially stale on the
@@ -724,8 +724,8 @@ M-1 is not a `current_agent_mut` defect; it is the engine's ownership model.
   store when the same *address* is already current. A nested
   `runtime::function::call` therefore leaves the slot holding an ancestor of the
   live `&mut Agent`s (a reborrow has the same address).
-- Retagging `&mut Agent` from that ancestor — `current_agent_mut`, or the ECMA
-  hook — pops every descendant tag under Stacked Borrows. The frames keep using
+- Retagging `&mut Agent` from that ancestor, `current_agent_mut`, or the ECMA
+  hook, pops every descendant tag under Stacked Borrows. The frames keep using
   those `&mut`s after the call returns, and LLVM's `noalias` on them was
   violated while the retagged reference was live.
 - The collector has the same shape: `live_agent_ptrs()` + `trace_roots` read
@@ -757,8 +757,8 @@ from the host surface and makes the remaining paths internal), then C in slices
 starting with the coldest containers, with `--gc-stress` and the call benchmarks
 as the gate.
 
-What was built is **B plus D**. D reaches C's goal — every container the
-collector reads is interior-mutable — by putting that state in a separate
+What was built is **B plus D**. D reaches C's goal, every container the
+collector reads is interior-mutable, by putting that state in a separate
 allocation rather than on the `Agent`, which leaves C's staged in-place variant
 unnecessary. The price is one pointer indirection on the interpreter's cache
 reads (measured in slice 4j) and nothing in compiled code, which captures its
@@ -815,7 +815,7 @@ live `&mut Agent` reborrow: `runtime::function::call_inner` and
 `construct_inner`, the VM's `PendingCall`/`CallBuiltin` native arms, the JIT's
 native helper, and the earlier `fast_call` lane. A body that needs the agent
 recovers it with `context::callback_agent(ptr)`, which is sound because the
-pointer's provenance is the frame that is still running — unlike the old
+pointer's provenance is the frame that is still running, unlike the old
 `with_agent` TLS slot, which could hold an ancestor of the live `&mut Agent`s
 and whose retag popped their borrow tags.
 
@@ -841,7 +841,7 @@ The two `v8` snapshot tests that were red at this point
 turned out to be testing an address-based premise the compiler may erase: an
 empty host callback's `MapFnTo` adapter compiles to the same code as the
 bridge's own no-op console method, the two may be merged, and `engine_table`
-always carries the console entry — so "a pointer the table does not hold" could
+always carries the console entry, so "a pointer the table does not hold" could
 not be built from an empty callback. Both now use a callback with a body of its
 own; the aliasing itself is harmless (only identical code merges, so the two
 callbacks behave the same).
@@ -856,8 +856,8 @@ continuation copies its export name out, the wrapped-function lookup copies its
 target and realm), for the same reason slice 1's promise reads do.
 
 `LIVE_AGENTS` entries are now `(signifier, agent, roots)`, and `collect_with`
-traces every registered agent's moved containers through its `*const AgentRoots`
-— never through `&Agent` — while the not-yet-moved state is traced separately by
+traces every registered agent's moved containers through its `*const AgentRoots`,
+never through `&Agent`, while the not-yet-moved state is traced separately by
 `Agent::trace_agent_state` (renamed from `trace_roots`). That split is what
 makes the remaining slices mechanical.
 
@@ -906,7 +906,7 @@ longer ends the borrow at the last use: holding one across anything that takes
 `&mut Agent` is now a compile error, which is how the remaining sites were
 found (`eval_function_declaration`, `script::eval_in_context`, `call_inner`'s
 class-constructor check). The hazard the compiler cannot see is a push or pop
-inside a guard's window — both reach the stack through `&Agent`, so they would
+inside a guard's window, both reach the stack through `&Agent`, so they would
 panic at run time. All 160 `running_context`/`running_context_mut` sites and
 every direct `.last()`/`.last_mut()` were audited: every read guard is either a
 one-statement expression or a scoped binding whose fields are copied out
@@ -953,7 +953,7 @@ Gate run: clippy `-D warnings` clean (workspace, all targets, all features),
 `cargo fmt --check` clean, `cargo test --workspace` 5809 pass in both profiles;
 `built-ins --filter "*Promise*"` 732/732, `Function/*` 509/509, `*Generator*`
 157/157, `language --filter "*eval*"` 1166/1166; under `--gc-stress --gc-verify`
-`Function/*` (509 fixtures, one pre-existing hang — see below), a 192-fixture
+`Function/*` (509 fixtures, one pre-existing hang, see below), a 192-fixture
 `built-ins` sample, a 55-fixture `language` sample, class and function
 expression samples, and a script exercising derived classes, private methods,
 `super`, method home objects and the lazy `prototype` (jit, jitless, stressed).
@@ -966,47 +966,47 @@ what the stress mode multiplies), so they are not a regression from this slice.
 Slice 4 is the last one before the registry can go roots-only. It is being done
 in table families, because each family's guard discipline is different:
 
-- **4a landed** — the Map/Set tables (`map_data`, `set_data`, `weak_map_data`,
+- **4a landed**: the Map/Set tables (`map_data`, `set_data`, `weak_map_data`,
   `weak_set_data`, `map_iter_data`, `set_iter_data`). The entries became
   `Rc<RefCell<…>>`: a Map operation holds a collection across a user callback
   (`forEach`, a key's `ToPropertyKey`), so an entry has to be mutable while the
   rest of the agent runs, and the `Rc` is what lets a reader take the entry out
-  of the table and release the table's own borrow — a callback can create
+  of the table and release the table's own borrow, a callback can create
   another Map. Snapshot reads go through `Agent::map_entries`/`set_entries`,
   in-place ones through `map_collection`/`set_collection`. The move also closed
   two guard-across-allocation windows that predated it: both `%MapIterator%`
   and `%SetIteratorPrototype%.next` built their result object while holding the
   iterator record's `RefMut`.
-- **4b landed** — `regexp_data`, `symbol_data`, `bigint_data`,
+- **4b landed**: `regexp_data`, `symbol_data`, `bigint_data`,
   `raw_json_data`. All four are read-mostly with cheap values, so the accessors
   return owned copies (`regexp_state` clones a record whose compiled program is
-  already `Rc`-shared — what the per-exec clone relied on). The boolean, number
+  already `Rc`-shared, what the per-exec clone relied on). The boolean, number
   and date tables stay in `Agent`: they hold `bool`/`f64` and no heap edges, so
   the collector never reads them.
-- **4c landed** — `buffer_data` and `dataview_data`. Unlike 4a these keep no
+- **4c landed**: `buffer_data` and `dataview_data`. Unlike 4a these keep no
   per-entry cell: `Agent::buffer_state` returns a `Ref` straight into the table
   (which is what the buffer builtins' own `fn state(...)` helper already did),
   and mutations go through `with_buffer_state`, whose `borrow_mut` panics if a
   read guard is alive. Every caller was already written in the discipline that
-  requires — the guard closes before a `ToIndex` coercion or the species
-  constructor — and the one exception (the snapshot loader's immutable flag)
+  requires, the guard closes before a `ToIndex` coercion or the species
+  constructor, and the one exception (the snapshot loader's immutable flag)
   was restructured.
-- **4d landed** — fifteen iterator/async/disposal tables (the Array iterator
+- **4d landed**: fifteen iterator/async/disposal tables (the Array iterator
   records, async-from-sync and async-generator awaits, the iterator-helper and
   wrapped-iterator states, the four async-iterator-helper tables, the three
   DisposableStack tables, `Array.fromAsync`'s continuations and
   `Atomics.waitAsync`'s resolvers).
-- **4e landed** — the module tables (`host_modules`, the namespace tables,
+- **4e landed**: the module tables (`host_modules`, the namespace tables,
   `module_sources`, the dynamic-import resolvers, the deferred-module wait and
   then tables, the evaluation stack) and `entered_realm`, which became a `Cell`.
-- **4f landed** — the error/weak/job tables (`error_stack`,
+- **4f landed**: the error/weak/job tables (`error_stack`,
   `current_task_promise`, `global_symbol_registry`,
   `async_from_sync_continuations`, `kept_during_job`, `pending_cleanup_jobs`,
   `finalization_registries`). `current_task_promise` is a `Value`, so it became
   a `Cell<Option<Value>>`; the cleanup jobs' opaque closure regions are now
   collected by `AgentRoots::collect_job_regions` with the queued jobs, because
   the compaction hook enqueues them through `&self`.
-- **4g landed** — the six Intl record tables that hold values, the two Temporal
+- **4g landed**: the six Intl record tables that hold values, the two Temporal
   tables and the String/RegExp-string iterator tables. The Temporal builtins
   were the interesting ones: several read a record in an
   `if let … && let Some(record) = table.borrow().get(…)` chain and then call
@@ -1014,7 +1014,7 @@ in table families, because each family's guard discipline is different:
   `%StringIteratorPrototype%.next` advanced the index through `get_mut` while
   building the result object. Both now copy the record (or the index pair) out,
   do the work, and write it back.
-- **4h landed** — the thirteen IC caches: the three verdict arrays
+- **4h landed**: the thirteen IC caches: the three verdict arrays
   (`for_of_fast_cells`, `species_fast_cells`, `spread_cells`), the three value
   cell tables (`array_element_value_cells`, `global_leaf_cells`,
   `slot_leaf_cells`), `construct_maps`, `function_boilerplate_maps`,
@@ -1023,9 +1023,9 @@ in table families, because each family's guard discipline is different:
   mechanical: the payloads are read on every call, and `leaf_lookup` handed out
   a `&LeafEntry` borrowed from the table, which no interior-mutable container
   can do through a shared accessor.
-  Two shapes were used. Tables whose payload is `Copy` — the three verdicts,
+  Two shapes were used. Tables whose payload is `Copy`, the three verdicts,
   the array-element value cells, `construct_maps` and
-  `function_boilerplate_maps` — became arrays of `Cell<Option<…>>` with
+  `function_boilerplate_maps`, became arrays of `Cell<Option<…>>` with
   `get`/`set` accessors, so a hit costs no borrow flag at all and the collector
   copies the cell out to trace it. The tables whose payload cannot be copied
   (`leaf_cache`, `global_leaf_cells` and `slot_leaf_cells`, all holding a
@@ -1034,10 +1034,10 @@ in table families, because each family's guard discipline is different:
   already cloned its fields out, so the `Rc` bump only moved), and the for-in
   probe clones two `Rc`-shared lists out and closes the borrow before it walks
   the live chain. `ForInState::keys` is that same `Rc<Vec<…>>`, so a loop
-  re-entering an unchanged chain shares the list instead of copying it — and
+  re-entering an unchanged chain shares the list instead of copying it, and
   that is what lets the probe hand the keys out without allocating under its
   guard.
-- **4i landed** — the eleven traced wasm JS-API tables: the streaming
+- **4i landed**: the eleven traced wasm JS-API tables: the streaming
   handlers, the per-instance `exports` objects, the memoized function wrappers
   (`wasm_func_objects`), the Memory/Table/Global/Tag wrapper memos, the
   external host functions, the escaped-JS-exception table and the externref
@@ -1048,13 +1048,13 @@ in table families, because each family's guard discipline is different:
   of a one-statement borrow first, since the handler runs JavaScript.
   `wasm_exceptions` and the index-only tables (`wasm_exports`, `wasm_memories`,
   `wasm_tables`, `wasm_globals`, `wasm_tags`, the engine store) stay on the
-  agent: they hold object ids and store cells — `wasm::Value` carries no GC
-  edge — so the collector never reads them.
+  agent: they hold object ids and store cells, `wasm::Value` carries no GC
+  edge, so the collector never reads them.
   There was no measurement to make here beyond the sweeps: these tables are
   read at JS↔wasm boundary crossings and wrapper materialization, not inside an
   engine loop; a 2M-call JS→wasm export loop lands inside the noise floor
   (same-binary control -0.4% median, this tree +0.4%).
-- **4j landed** — the three IC value-cell arrays (`member_value_cells`,
+- **4j landed**: the three IC value-cell arrays (`member_value_cells`,
   `computed_read_cells`, `global_value_cells`), which were the last state
   `trace_agent_state` read through `&Agent`. They are `[Cell<T>; N]` arrays in
   the roots, traced there; `AgentRoots::{member,computed_read,global}_value_cell_base`
@@ -1064,7 +1064,7 @@ in table families, because each family's guard discipline is different:
   `#[repr(transparent)]`: the compiled lanes index the base at
   `index * size_of::<T>()` from `crates/jit/src/cells.rs`, and the `Cell` array's
   element-0 address and stride are the payload's, so **no compiled addressing
-  changed** — only the pointer's provenance, which is now an `UnsafeCell`, i.e.
+  changed**, only the pointer's provenance, which is now an `UnsafeCell`, i.e.
   a write through it is what `Cell` is defined to permit (the old base was a
   plain array's address cast to `*mut`, which the compiled store lanes wrote
   through; that was the one remaining place the engine mutated a shared
@@ -1078,13 +1078,13 @@ in table families, because each family's guard discipline is different:
   `n += 1` +8-16%, and an all-local function-body loop +6.3%. The last row
   touches no cell at all, so part of the spread is code layout rather than the
   cell indirection, and the boxed variant of the same change measured +14% and
-  +25% on the first and third rows — which is why the arrays are inline. The
+  +25% on the first and third rows, which is why the arrays are inline. The
   compiled side is unaffected: the base pointer is captured once per
   `JitCallContext`, `--jit-bench`'s per-row ratios are identical to
   `0a64a7e1` (function calls 0.14, global read 0.14, apply leaf call 0.29), and
   a compiled global-read loop measures +0.3%. No unsafe accessor was added to
   buy the interpreter's indirection back.
-- **4k landed — M-1 closed.** `stack_traces`, `weak_ref_targets`,
+- **4k landed: M-1 closed.** `stack_traces`, `weak_ref_targets`,
   `promise_addrs` and `pending_dead_promises` moved into the roots, and the six
   collection-time reactions moved with them: `trace_active_run_state`,
   `has_weak_structures`, `compact_weak_tables` (with the roots-only
@@ -1092,8 +1092,8 @@ in table families, because each family's guard discipline is different:
   `reap_dead_generators`. `LIVE_AGENTS` is now `Vec<(u64, *const AgentRoots)>`,
   and `collect_with` traces, probes and reaps every registered agent through its
   roots pointer. The only `*const Agent` left in the module is the transient
-  argument of the `with_agent` notifier — the one place an agent registers
-  itself — plus two local addresses in a test.
+  argument of the `with_agent` notifier, the one place an agent registers
+  itself, plus two local addresses in a test.
 
   That is the whole of M-1: no collection-time path forms a `&Agent`, so the
   collector can no longer pop the borrow tags an interpreter frame's `&mut
@@ -1108,23 +1108,23 @@ trace block with tables that moved in 4d, and it was left behind untraced. The
 unit tests passed; 42 of the 95 `Array/fromAsync` fixtures then failed under
 `--gc-stress` with a promise that never settled, because the capability a
 pending await resumes into could be swept. The root is back, and the accounting
-that would have caught it — for every trace line removed, the table is either
-in `AgentRoots::trace` or still traced where it lives — is now done by hand at
+that would have caught it, for every trace line removed, the table is either
+in `AgentRoots::trace` or still traced where it lives, is now done by hand at
 the end of each slice.
 
 `trace_agent_state` now reads no agent field (only the thread-scoped active Vms
 and job regions), so the remaining `*const Agent` users in `collect_with` are
-the three weak/trace tables it still collects through the agent —
-`stack_traces`, `weak_ref_targets`, `promise_addrs` — and `compact_weak_tables`,
+the three weak/trace tables it still collects through the agent,
+`stack_traces`, `weak_ref_targets`, `promise_addrs`, and `compact_weak_tables`,
 which walks them. Moving those three `RefCell` tables into the roots and making
 `compact_weak_tables` take `&AgentRoots` is what lets `LIVE_AGENTS` drop its
 `*const Agent`; `trace_active_vms` and `RUNNING_JOB_REGION` are thread-scoped
 rather than agent-scoped and stay as they are.
 
 The value-cell arrays are the one group the caches' `Cell` treatment does not
-reach. Their base pointer is handed to the JIT — `JitCallContext::
+reach. Their base pointer is handed to the JIT, `JitCallContext::
 member_value_cells`/`global_value_cells`, addressed at fixed offsets in
-`crates/jit/src/cells.rs` and `compiler.rs` — and the compiled store and read
+`crates/jit/src/cells.rs` and `compiler.rs`, and the compiled store and read
 lanes write those cells directly from machine code, with no call back into the
 agent. Moving the arrays behind a `RefCell` would therefore change the compiled
 addressing scheme, not just the Rust accessors: the fix is to point the JIT's
@@ -1135,7 +1135,7 @@ registry keeps the `*const Agent`.
 Cost of 4h, on the interpreter, min of 15 interleaved release runs against a
 `c8f99c4e` binary: `per-iteration` 9.89 ms -> 10.51 ms (+6.3%) and
 `construct churn` 16.95 ms -> 17.70 ms (+4.5%). Every other benchmark row is
-inside the run-to-run spread — the same suite moves `bare loop` and
+inside the run-to-run spread, the same suite moves `bare loop` and
 `string concat` by 5-10% with no code change, in both directions. Both
 regressions are the one `RefCell` borrow the leaf cache pays per call: an
 isolated 10M-iteration closure loop shows the same ~7%, while the
@@ -1153,7 +1153,7 @@ both profiles; under `--gc-stress --gc-verify`: `*WeakRef*` 29/29,
 `*FinalizationRegistry*` 47/47, `*WeakMap*` 141/141, `*WeakSet*` 85/85,
 `ShadowRealm/*` 64/64 (the multi-agent registry path), `*Promise*` 732/732,
 `*Generator*` 157/157, `Array/*` 3082/3082, `Iterator/*` 648 pass with six
-`zip`/`zipKeyed` fixtures failing (1 fail, 5 hangs) — all six reproduce alone on
+`zip`/`zipKeyed` fixtures failing (1 fail, 5 hangs), all six reproduce alone on
 a `d4531034` sweep binary, `language "*eval*"` 1166/1166, `"*for-of*"` 779/779,
 `"*for-in*"` 153/153, `*Symbol*` 509/509, `Object/*` 3411/3411.
 
@@ -1191,19 +1191,19 @@ features) and `cargo fmt --check` clean after each; `cargo test --workspace`
 Intl sample's crash cluster, below), `*Map*` 431/431,
 `*Set*` 859/859, `*ArrayBuffer*` 324 pass with the one pre-existing
 `sliceToImmutable/argument-coercion.js` hang, `DataView/*` 561/561, `*RegExp*`
-1793 pass / 0 fail (against 1739 pass / 160 hang on a pre-4b binary — the hangs
+1793 pass / 0 fail (against 1739 pass / 160 hang on a pre-4b binary, the hangs
 are the Unicode-property fixtures), `Array/fromAsync/*` 95/95,
 `DisposableStack/*` 93/93, `AsyncDisposableStack/*` 104/104,
 `AsyncIteratorPrototype/*` 13/13, `Iterator/*` 648 pass of 654 with the
 `zip/basic-longest.js` fail reproduced on a pre-4d binary, and
 `AbstractModuleSource/*` 8/8. The crash clusters that remain under
-`--gc-stress` — three BigInt `TypedArray/prototype/set` fixtures, six
-`AsyncFromSyncIteratorPrototype` fixtures — occur more often on a pre-4 binary
+`--gc-stress`, three BigInt `TypedArray/prototype/set` fixtures, six
+`AsyncFromSyncIteratorPrototype` fixtures, occur more often on a pre-4 binary
 than on this tree, so they are pre-existing. So is the Intl batch death: with
 32 fixtures to a process, 45 of a 75-fixture `intl402` sample die under
 `--gc-stress`, and the same 45 die on a binary built from `c9ccdd74`. Each of
 those fixtures passes when run alone in its own process, so it is a
-batch-process interaction rather than a lost root — worth its own investigation,
+batch-process interaction rather than a lost root, worth its own investigation,
 but not one this work introduced.
 
 ---
@@ -1230,7 +1230,7 @@ but not one this work introduced.
   `libc 0.2.189`, `num-bigint 0.4.8`, `ryu 1.0.23`).
 - **Tooling**: `clippy -- -D warnings`, `--gc-verify`, `--gc-stress`,
   `--nursery-stress`, and a conformance sweep are in place. The GC verifier is
-  genuinely effective — it caught C-1.
+  genuinely effective, it caught C-1.
 
 ---
 

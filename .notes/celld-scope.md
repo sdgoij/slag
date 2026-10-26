@@ -7,12 +7,12 @@ entered by whichever worker takes a lock. This note records what that costs.
 
 ## Status (2026-10-25)
 
-Steps 1 and 2 have landed. The premise below — that per-thread *root registries* were the blocker — was wrong: the heap itself was thread-local, and with it every table the collector reads.
+Steps 1 and 2 have landed. The premise below, that per-thread *root registries* were the blocker, was wrong: the heap itself was thread-local, and with it every table the collector reads.
 
 - `IsolateInner` owns the handle `store::Table` (step 1) and a `crux::heap::HeapState` (step 2): the arena, the pinned set, the root-source list, the weak tables, the remembered set and the collection generation.
-- `crux::heap::enter`/`leave` install that state for a scope's life, mirroring `store::enter`. A thread with no isolate entered — the C surfaces, the crate's own tests — keeps its own state, so nothing outside the bridge changed.
+- `crux::heap::enter`/`leave` install that state for a scope's life, mirroring `store::enter`. A thread with no isolate entered, the C surfaces, the crate's own tests, keeps its own state, so nothing outside the bridge changed.
 - The scope-less paths install it explicitly: a global handler's callback region, `Isolate::take_heap_snapshot`, and the snapshot *encode* pass. The last one matters: a blob written without the creator's heap carried duplicate well-known symbols, which is how deno's lazy-loaded modules broke.
-- Thread-local caches that held handles moved into the heap — `map::EMPTY_MAP_CACHE` (`Handle<Map>`), `symbol::TABLE` (`Handle<Symbol>`), `expr::TEMPLATE_OBJECT_CACHE` (arrays) — through `crux::heap::with_heap_cell`. A cache that outlives its arena hands the next isolate a swept box; snapshot restore crashed on exactly that.
+- Thread-local caches that held handles moved into the heap, `map::EMPTY_MAP_CACHE` (`Handle<Map>`), `symbol::TABLE` (`Handle<Symbol>`), `expr::TEMPLATE_OBJECT_CACHE` (arrays), through `crux::heap::with_heap_cell`. A cache that outlives its arena hands the next isolate a swept box; snapshot restore crashed on exactly that.
 - The handle arena's root-source flag is per table, not per thread, and the drop paths that can run during thread teardown use `try_with`.
 
 Step 3 has landed too. `SharedIsolate` is a `Mutex<OwnedIsolate>`; `Locker` installs the isolate's heap and handle arena for a turn and removes them on drop, and derefs to `Isolate`; `unsafe OwnedIsolate::try_into_shared` refuses a snapshot creator, an open scope, and weak handles. The probe is now **0 errors**, from 560 before the heap work and 638 after it (making the heap's `!Send` state reachable through `Global` surfaced 78 more).
@@ -20,26 +20,26 @@ Step 3 has landed too. `SharedIsolate` is a `Mutex<OwnedIsolate>`; `Locker` inst
 What that took, in the note's own numbering:
 
 - **`Global<T>` is `Send + Sync`** (the crate we stand in for's contract: using one needs the isolate entered, or locked through a `SharedIsolate`). Moving, cloning and dropping it touch no heap.
-- **`Pin` holds the pinned list, not the heap** — `Arc<Mutex<Vec<usize>>>` of addresses. A pointer-to-heap version was measured first and reproduced a release-only heap corruption in roughly one parallel run in four; holding the list means a `Global` dropped on a worker cannot touch freed state, and nothing in the list is ever dereferenced.
+- **`Pin` holds the pinned list, not the heap**: `Arc<Mutex<Vec<usize>>>` of addresses. A pointer-to-heap version was measured first and reproduced a release-only heap corruption in roughly one parallel run in four; holding the list means a `Global` dropped on a worker cannot touch freed state, and nothing in the list is ever dereferenced.
 - **`store::Entry` and its strings are `Arc`**, because a `Global` over a script carries one.
 - **`Arc<AgentRoots>` was not needed.** Making the registry a heap cell (step 2) and the pin thread-safe removed every off-thread path to that `Rc`; the agent is only reachable under the isolate's thread or lock.
 
 Two gaps the error list did not show, both bridge rather than celld bugs: `BackingStore` did not deref to `[Cell<u8>]` (how the crate we stand in for exposes shared bytes), and `AccessorNameGetterCallback` was not scope-first like every other host callback here.
 
-Still thread-bound: `Weak`/`TracedReference`, and the isolate's current realm — a `Locker` installs the heap and the arena only, so a host enters a context itself, which celld does.
+Still thread-bound: `Weak`/`TracedReference`, and the isolate's current realm, a `Locker` installs the heap and the arena only, so a host enters a context itself, which celld does.
 
-Running it found four things the compiler could not. `examples/hello` serves, and `examples/counter` — a Durable Object over its own SQLite — counts per cell:
+Running it found four things the compiler could not. `examples/hello` serves, and `examples/counter`, a Durable Object over its own SQLite, counts per cell:
 
 - **The stack guard's watermark was captured when the agent was created**, on the thread that built the isolate. A turn on a tokio worker compared its stack against another thread's address, so every call answered `RangeError: Maximum call stack size exceeded`. The watermark is the running thread's now (`enter_js` reads the per-thread cell).
-- **A collection driven by an agent collected whichever heap was entered.** celld collects at a job boundary with no isolate entered, so the agent's roots were marked into the thread's own, empty arena — setting mark bits in the arena that owns them, which that arena's next minor then refused. `Agent::collect_with` installs the agent's own heap (recorded by the bridge at isolate creation).
+- **A collection driven by an agent collected whichever heap was entered.** celld collects at a job boundary with no isolate entered, so the agent's roots were marked into the thread's own, empty arena, setting mark bits in the arena that owns them, which that arena's next minor then refused. `Agent::collect_with` installs the agent's own heap (recorded by the bridge at isolate creation).
 - **`V8`'s initialization state was thread-local.** celld initializes on one thread and asks `get_current_platform` from workers who never did, which panicked. The state machine is process-global now, as V8's is.
 - **A function's code cache was refused by the next compile.** The cache carries the function's own rendering; `compile_function` compared against the parenthesized wrapper it hands the engine. `a_function_code_cache_round_trips_into_the_next_compile` pins the round trip.
 
-`tools/build-celld.py` is the gate now. It clones `https://github.com/denoland/celld.git` on first use and pins v0.6.3 (`8702f6d186c77698dbfb30cf29e3b1922a88f008`), refusing a short ref for the same reason `build-deno.py` does. It hands cargo a temporary `[patch.crates-io]` through `--config` (celld's sources are never edited), checks that celld's `v8` requirement admits the bridge's version instead of rewriting it, reconciles the lock when its `v8` entry is still a registry one, and runs `cargo check -p celld` — `--build` asks for the binary. On Windows it dispatches into WSL, because the checkout's native dependencies do not build there; `--native` opts out.
+`tools/build-celld.py` is the gate now. It clones `https://github.com/denoland/celld.git` on first use and pins v0.6.3 (`8702f6d186c77698dbfb30cf29e3b1922a88f008`), refusing a short ref for the same reason `build-deno.py` does. It hands cargo a temporary `[patch.crates-io]` through `--config` (celld's sources are never edited), checks that celld's `v8` requirement admits the bridge's version instead of rewriting it, reconciles the lock when its `v8` entry is still a registry one, and runs `cargo check -p celld`, `--build` asks for the binary. On Windows it dispatches into WSL, because the checkout's native dependencies do not build there; `--native` opts out.
 
 ## What celld needs, measured
 
-The probe (celld's own workspace, `v8` patched to `crates/v8`, Linux/WSL — its
+The probe (celld's own workspace, `v8` patched to `crates/v8`, Linux/WSL, its
 native dependencies do not build on Windows) went from 564 errors to 560 after
 the 152.1 API additions. What remains, by kind:
 
@@ -51,7 +51,7 @@ the 152.1 API additions. What remains, by kind:
 
 Its architecture (`crates/celld/pool.rs`, `js.rs:2194-2328`) is: one
 `v8::SharedIsolate` per isolate, a tokio permit taken before locking, and every
-turn runs as `let (locker, cells) = isolate.lock();` — `Locker` derefs to the
+turn runs as `let (locker, cells) = isolate.lock();`, `Locker` derefs to the
 isolate (the heap-limit callbacks and `get_slot` are called on it), and
 `Global<Context>`/`Global<Function>` live in a struct shared across workers.
 
@@ -63,7 +63,7 @@ isolate (the heap-limit callbacks and `get_slot` are called on it), and
   transition, and `live_agent_entered` **re-registers an agent that moved**,
   replacing the stale address by signifier (`agent.rs:305-317`). The per-agent
   precise roots (M-1) are in `AgentRoots`, not on the stack.
-- The conservative stack scan binds to the thread that is running — which is the
+- The conservative stack scan binds to the thread that is running, which is the
   correct thread after a locked entry.
 
 ## The four blockers
@@ -79,7 +79,7 @@ invisible from the error list: it is a correctness issue, not a type one.
 `ROOT_SOURCES` (`heap.rs:1498`) and `LIVE_AGENTS` (`agent.rs:298`) are
 thread-local. `live_agent_entered` adds the agent to the *new* thread's list but
 cannot remove it from the old one. A collection on the old thread would then
-trace an agent that is running on another thread — a cross-thread read of
+trace an agent that is running on another thread, a cross-thread read of
 `AgentRoots`, which is UB before any API work is done. Fixing this is not
 optional cleanup; it is a precondition.
 
@@ -93,7 +93,7 @@ runs races. The store entry `Option<Rc<store::Entry>>` in `Global`
 **4. `try_into_shared` is an ownership move with a pointer invariant.** `Isolate`
 is `NonNull<IsolateInner>` and every `PinScope` carries a copy; the state must
 move into the shared wrapper *without moving the allocation* (a `Box` inside the
-`Mutex` does that), and every entry must install the TLS the engine reads —
+`Mutex` does that), and every entry must install the TLS the engine reads,
 current agent, current realm, and (after blocker 1) the current store.
 
 ## Proposed design
@@ -120,17 +120,17 @@ current agent, current realm, and (after blocker 1) the current store.
 
 ## Staged plan
 
-1. **Handle-arena ownership** — per-isolate store behind `CURRENT_STORE`,
+1. **Handle-arena ownership**: per-isolate store behind `CURRENT_STORE`,
    installed by `PinScope`/context entry; no API change. Gate: the full
    workspace suite plus the Deno harnesses (Deno is one isolate per thread and
    must be unaffected).
-2. **Residency-aware roots** — thread-tagged registries, stale-entry removal on
+2. **Residency-aware roots**: thread-tagged registries, stale-entry removal on
    move, a test that moves an isolate and collects on both threads with the
    verifier on.
-3. **`SharedIsolate` / `Locker` / `try_into_shared` / `thread_safe_handle`** —
+3. **`SharedIsolate` / `Locker` / `try_into_shared` / `thread_safe_handle`**,
    plus `Send` impls. Tests: create on A, lock on B, evaluate a script, drop on
    B; two threads taking turns on one isolate under the lock.
-4. **Celld** — compile, then run its own gates (`cargo test`, `clippy -- -D
+4. **Celld**: compile, then run its own gates (`cargo test`, `clippy -- -D
    warnings`, as its Dockerfile does), then a build script mirroring
    `tools/build-deno.py`.
 
@@ -149,12 +149,12 @@ surface; step 4 is the payoff and the least uncertain.
   script handle that crosses threads needs the store it names.
 - Microtask queues and the inspector session are per-isolate state celld drives
   from several threads; they follow the store's rule, not a separate one.
-- Deno must keep working unchanged — it never shares an isolate, so steps 1-3
+- Deno must keep working unchanged, it never shares an isolate, so steps 1-3
   should be invisible to it; the harnesses are the gate.
 
 Rough size: steps 1-2 are the bulk (roughly a week, with step 2 the risky half);
 step 3 is a few days; step 4 a day or two. Nothing here changes what the engine
-*computes* — it changes where its state lives and who may touch it.
+*computes*, it changes where its state lives and who may touch it.
 
 ## Status
 

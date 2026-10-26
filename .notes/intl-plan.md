@@ -2,23 +2,23 @@
 
 This is the engineering spec for implementing the ECMA-402 Intl API. The
 reference is the vendored `ecma402.html` (the rendered spec from
-https://tc39.es/ecma402/ — the current ECMAScript 2027 draft era, which
+https://tc39.es/ecma402/, the current ECMAScript 2027 draft era, which
 matches the proposal-stage features the corpus tests; the live URL is
 the fallback reference). The vendored `spec.html` is ECMA-262 only. The
 regression net is the `intl402` fixture area of the pinned test262
-submodule — the corpus encodes the exact locale data this implementation
+submodule, the corpus encodes the exact locale data this implementation
 must match.
 
 Status: Cuts 1-9 are committed and green (NumberFormat, Locale, PluralRules,
 RelativeTimeFormat, ListFormat, DisplayNames, DateTimeFormat, Collator,
 Segmenter, DurationFormat, and Cut 9, the intl402/Temporal integration:
 format/toLocaleString on Temporal values, the [[Calendar]] slots, the
-un-skipped intl402 gate, the corpus-derived time-zone tables — see
-`.notes/tz-data-decision.md` — and the non-iso calendar data). The DST-aware
+un-skipped intl402 gate, the corpus-derived time-zone tables, see
+`.notes/tz-data-decision.md`, and the non-iso calendar data). The DST-aware
 Temporal algorithms are done (the wall→instant resolver + disambiguation in
 `temporal/shell.rs`, AddZonedDateTime/AddInstant, zoned round/with/until/
 since, getTimeZoneTransition with strictly-before previous semantics, and
-the Duration `relativeTo`/difference/total machinery — the 116-fixture tz
+the Duration `relativeTo`/difference/total machinery, the 116-fixture tz
 cluster is 116/116), and the `Intl.Era-monthcode` gate flipped last: the
 solar-calendar arithmetic (buddhist, coptic, ethiopic, ethioaa, indian,
 persian, roc, islamic-umalqura) and the era-field getters pass, so the
@@ -57,30 +57,30 @@ non-Temporal dirs), `Intl.NumberFormat-unified` (68), `Intl.Locale-info`
 (60), `Intl.DisplayNames` (47), `Intl.DateTimeFormat-formatRange` (37).
 
 **Locale surface** (data scope bound): the fixtures concentrate on a
-small real-locale set — en (≈287), en-US (127), de (43), lt (32), ja-JP
+small real-locale set, en (≈287), en-US (127), de (43), lt (32), ja-JP
 (29), de-DE (25), zh-TW (25), ar (20), fr (20), ko-KR (19), ja (18), tr
 (17), az (16), zh (15), en-GB (14), sv (11), th (10), ab (10), no-bok
-(8), kn (7) — roughly **40 real locales**, plus the arbitrary-tag tests
+(8), kn (7), roughly **40 real locales**, plus the arbitrary-tag tests
 (`foo`, `abc-abcdefghi`) that exercise parsing only. The data tables need
 to cover the fixture locales, not the world.
 
 ## 2. The data-strategy decision (the crux)
 
-The corpus asserts **exact, locale-data-dependent strings** — e.g.
+The corpus asserts **exact, locale-data-dependent strings**, e.g.
 `format-significant-digits.js` checks `new Intl.NumberFormat("ar",
 {numberingSystem:"arab"}).format(0)` against Arabic-Indic digits, and the
 same table for `de`/`th`/`ja` with `latn`/`thai`/`hanidec`. The expected
 values encode a specific CLDR era plus ICU-specific behavior in places.
 This drives the strategy:
 
-- **ICU4C via bindings** (what V8 does) — a C++ build dependency and
+- **ICU4C via bindings** (what V8 does): a C++ build dependency and
   ~30MB of data, plus pinning the exact ICU version the corpus was
   generated against. Foreign to this codebase's self-contained Rust ethos.
-- **ICU4X** — pure Rust, but a large workspace (locale, decimal,
+- **ICU4X**: pure Rust, but a large workspace (locale, decimal,
   plurals, datetime, collator, list, segmenter, displaynames + the
   datagen pipeline), and its output is not guaranteed to byte-match the
   corpus's ICU-era expectations.
-- **Corpus-derived data** — the established Slag pattern
+- **Corpus-derived data**: the established Slag pattern
   (`crates/unicode/build.rs` derives the `\p{...}` tables *from the pinned
   fixtures at build time* because the fixtures ARE the data spec; it errors
   if the test262 submodule is missing). Intl is the same
@@ -91,7 +91,7 @@ This drives the strategy:
   ~40 fixture locales.
 
 **Recommendation: real algorithms + corpus/CLDR-derived data tables.**
-A generator (following the `crates/unicode/build.rs` precedent — a build
+A generator (following the `crates/unicode/build.rs` precedent, a build
 script that derives tables from the pinned fixtures at build time) extracts
 the data from (a) the fixtures' expected outputs and (b) a vendored minimal
 CLDR subset pinned to the era the fixtures encode. The decision is
@@ -103,7 +103,7 @@ allowed external data dependency.
 
 ## 3. Architecture
 
-- `crates/runtime/src/builtins/intl/` — one module per component
+- `crates/runtime/src/builtins/intl/`: one module per component
   (`locale.rs`, `number_format.rs`, `plural_rules.rs`,
   `date_time_format.rs`, `collator.rs`, `list_format.rs`,
   `relative_time_format.rs`, `segmenter.rs`, `display_names.rs`,
@@ -123,7 +123,7 @@ allowed external data dependency.
 ## 4. Cut order (each cut ends clippy-clean + workspace-green + a
 sweep diff at zero regressions on the previously-passing union)
 
-**Cut 0 — measurement infrastructure (no engine code).** Add
+**Cut 0: measurement infrastructure (no engine code).** Add
 `intl402` as a sweep area; allow `testIntl.js`/`testIntlNumberFormat.js`
 in the include set; add the feature-gate table to `run_fixture` /
 `tools/skip_tally.js` (all Intl features initially unimplemented →
@@ -131,17 +131,17 @@ everything skips with an explicit reason). Baseline the area: the
 fail+crash union is the comparison from here on. The 2,029 Temporal
 fixtures stay skipped until Cut 9.
 
-**Cut 1 — `%Intl%` namespace + BCP 47 locale machinery (data-free).**
+**Cut 1: `%Intl%` namespace + BCP 47 locale machinery (data-free).**
 `Intl.getCanonicalLocales`, the internal `CanonicalizeLocaleList` /
 `CanonicalizeUnicodeLocaleId` / `IsStructurallyValidLanguageTag` (all
-syntactic + case folding — no registry data), `Intl[@@toStringTag]`, the
+syntactic + case folding, no registry data), `Intl[@@toStringTag]`, the
 FallbackSymbol wiring, and `Intl.Locale` (constructor + prototype:
 maximize/minimize, `toString`, getters, `Intl.Locale-info` deferral).
 Fixtures: ~66 Intl + ~168 Locale + 2 FallbackSymbol. This cut is pure
-ECMA-402 + BCP 47 — the fastest way to prove the module plumbing and the
+ECMA-402 + BCP 47, the fastest way to prove the module plumbing and the
 sweep loop end-to-end.
 
-**Cut 2 — NumberFormat** (+ Number/BigInt/Array/TypedArray
+**Cut 2: NumberFormat** (+ Number/BigInt/Array/TypedArray
 `toLocaleString`). The full algorithm: `InitializeNumberFormat` (locale
 resolution, options coercion, pattern generation), `ToRawFixed` /
 `ToRawPrecision` / rounding, grouping, then `formatToParts`, then the
@@ -152,40 +152,40 @@ symbols for the tested currencies. **The data-strategy spike lives
 here**: 6 locales by hand → generator → CLDR subset. Fixtures: 249 + 21
 integration.
 
-**Cut 3 — PluralRules + RelativeTimeFormat.** Plural categories
+**Cut 3: PluralRules + RelativeTimeFormat.** Plural categories
 (cardinal + ordinal) per locale (the `one/few/lt`-style fixture strings
 are real data), unit strings for the tested units. Fixtures: 53 + 80.
 
-**Cut 4 — ListFormat + DisplayNames.** List patterns (the
+**Cut 4: ListFormat + DisplayNames.** List patterns (the
 `conjunction/disjunction/unit` templates per locale) and display-name
 data (language/region/script/currency names for the tested locales).
 Fixtures: 81 + 57.
 
-**Cut 5 — DateTimeFormat** (+ String/Date `toLocale*`, the largest data
+**Cut 5: DateTimeFormat** (+ String/Date `toLocale*`, the largest data
 surface). Calendar machinery (gregory first; the tested alternate
 calendars as needed), month/weekday/day-period/era names, hour cycles,
-date/time patterns, and **time zones** — the IANA tz data question was
+date/time patterns, and **time zones**, the IANA tz data question was
 deferred to Cut 9 and **decided in favor of corpus-derived tables**
 (`.notes/tz-data-decision.md`): a generator over a vendored IANA subset
 (chrono-tz/jiff lack the transition API the corpus's getTimeZoneTransition
 and hoursInDay fixtures require). `formatToParts` + `formatRange`.
 Fixtures: 244 + 37 formatRange + 31 String/Date.
 
-**Cut 6 — Collator.** The hard data problem: real collation
+**Cut 6, Collator.** The hard data problem: real collation
 (DUCET-level) for the tested locales, including `de-u-co-phonebk` (9
 fixtures). Decide: derived DUCET subset vs the `icu_collator` fallback.
 Fixtures: 65 + the String `localeCompare` portion of the 19.
 
-**Cut 7 — Segmenter.** Grapheme/word/sentence segmentation — the
+**Cut 7: Segmenter.** Grapheme/word/sentence segmentation, the
 `unicode-segmentation` crate covers grapheme+word but not sentence;
 sentence boundaries need generated tables + the algorithm (the corpus
 asserts exact boundaries). Fixtures: 79.
 
-**Cut 8 — DurationFormat.** Builds on Temporal.Duration internals
+**Cut 8: DurationFormat.** Builds on Temporal.Duration internals
 (already implemented) + NumberFormat composition, units data.
 Fixtures: 110.
 
-**Cut 9 — the intl402/Temporal area (2,029).** DateTimeFormat.format on
+**Cut 9: the intl402/Temporal area (2,029).** DateTimeFormat.format on
 Temporal types (Instant, ZonedDateTime, PlainDate/Time/DateTime),
 `toLocaleString` on the Temporal prototypes, Temporal.Instant/PlainDate
 etc. integration. Un-skip via the feature table. Depends on Cut 5 + the
@@ -213,14 +213,14 @@ months), sub-minute offset matching, and a few edge singles.
 
 ## 5. Risk register (investigate before implementing)
 
-1. **CLDR-version exactness** — the corpus pins a CLDR era; derived data
+1. **CLDR-version exactness**: the corpus pins a CLDR era; derived data
    must match its expected strings. The corpus IS the net; the generator
    extracts from fixtures + a vendored CLDR subset pinned to that era.
    The Cut 2 spike measures the risk.
-2. **Collation depth** — `de-u-co-phonebk`, `sv` (å sorts after z), `tr`,
+2. **Collation depth**: `de-u-co-phonebk`, `sv` (å sorts after z), `tr`,
    `no-bok` require real collation rules. Highest-risk data surface;
    `icu_collator` is the escape hatch.
-3. **Time zones** — DST-correct offsets for specific zones. **DECIDED in
+3. **Time zones**: DST-correct offsets for specific zones. **DECIDED in
    Cut 9: corpus-derived tables** (the derived-data precedent), validated
    by the spike: the generator parses a vendored IANA TZif blob
    (`tools/tzdata/`, from jiff-tzdb) + evaluates the POSIX footer rules
@@ -229,19 +229,19 @@ months), sub-minute offset matching, and a few edge singles.
    arithmetic fixtures require. The spike's 47-fixture gain on the tz
    cluster + the pinned unit tests confirm the era/data shape; the final
    generator should vendor the exact tzdata 2023a-era pin.
-4. **ICU quirks the corpus encodes** — some fixtures assert
+4. **ICU quirks the corpus encodes**: some fixtures assert
    ICU-specific behavior (number rounding edges, pattern details); the
    derived-tables approach bakes them in by construction.
-5. **`formatToParts`/`formatRange` exactness** — part boundaries are
+5. **`formatToParts`/`formatRange` exactness**: part boundaries are
    asserted as exact arrays; the parts model must match.
-6. **`Intl.Locale-info` and `supportedValuesOf`** — data-driven lists
+6. **`Intl.Locale-info` and `supportedValuesOf`**: data-driven lists
    (calendars, collations, currencies, numbering systems, time zones)
    whose contents the fixtures assert; the lists must be complete for
    the tested entries.
-7. **Harness surface** — `testIntl.js` exercises the engine through
+7. **Harness surface**: `testIntl.js` exercises the engine through
    helper assertions; its expectations (e.g. resolvedOptions shapes)
    are part of the contract.
-8. **Perf** — Intl is not in the `--bench` gates; correctness-first.
+8. **Perf**: Intl is not in the `--bench` gates; correctness-first.
    `NumberFormat.format` in a loop is a future bench candidate, not a
    gate.
 

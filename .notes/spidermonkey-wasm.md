@@ -4,7 +4,7 @@ We had skimmed SM (§2.3 of `optimizing-tier-plan.md`). This is the real
 look, from `js/src/wasm/{WasmBaselineCompile.h,WasmGenerator.h,WasmCompile.h,
 WasmInstance.h}` and `js/src/jit/JitFrames.h`. It matters because SM's wasm
 tiering is cleaner than V8's, and because its `Instance` is the register-held
-context our call/frame plan is trying to invent — better than we had planned.
+context our call/frame plan is trying to invent, better than we had planned.
 
 ## 1. The tier model: baseline + Ion, one frame, shared stubs
 
@@ -26,9 +26,9 @@ and the call protocol. There is no per-tier ABI.
 `startPartialTier(funcIndex)` / `CompilePartialTier2(code, funcIndex)` tier
 up **a single function**, not the module. The mechanism is in the generator:
 `CallFarJumpVector callFarJumps_`, `CallSiteTargetVector callSiteTargets_`,
-`startOfUnpatchedCallsites_`, `lastPatchedCallSite_` — call sites are emitted
+`startOfUnpatchedCallsites_`, `lastPatchedCallSite_`, call sites are emitted
 as patchable far jumps, and tier-up rewrites the target. On the instance:
-`jumpTable_` ("one entry for each baseline-compiled function" — the indirect
+`jumpTable_` ("one entry for each baseline-compiled function", the indirect
 call table), `requestTierUpStub_`, and `callRefMetrics_`/`updateCallRefMetricsStub_`
 ("used with lazy tiering for collecting speculative inlining information").
 
@@ -51,7 +51,7 @@ stop-the-world compile.
 
 This is the piece our call/frame plan should copy. An `Instance` is ~one per
 module, held in a register by compiled code, with **the hot fields first and
-an asserted compact-offset region** (`offsetOfLastCommonJitField()` — "the
+an asserted compact-offset region** (`offsetOfLastCommonJitField()`, "the
 first fields … are reserved for commonly accessed data from the JIT, such
 that they have as small an offset as possible"):
 
@@ -60,7 +60,7 @@ that they have as small an offset as possible"):
   `stackLimit_`, `interrupt_`, `onSuspendableStack_`,
   `addressOfNeedsIncrementalBarrier_`, `allocSites_`;
 - then `jumpTable_`, 4 `baselineScratchWords_`, `storeBuffer_`,
-  `addressOfNurseryPosition_` — **GC state the compiled code needs to
+  `addressOfNurseryPosition_`, **GC state the compiled code needs to
   allocate and to run barriers inline**;
 - and `MOZ_ALIGNED_DECL(16, char data_)` last, where **globals are inline in
   the instance** ("Globals for the module start here and are inline in this
@@ -127,7 +127,7 @@ there is no per-boundary context object.
    (for JS) the frame itself carrying what was per-call. This strengthens
    §3.4 of the call/frame plan ("the context is the frame, not a struct"):
    the ctx should be a *layout*, held across the activation, with an asserted
-   compact-offset head — not allocated again per call.
+   compact-offset head, not allocated again per call.
 6. **Per-function tiering with patch points, not a body count.** The
    `JIT_COMPILE_THRESHOLD`/`jit_calls` counter is the analog of "tier up by
    count"; SM's `jumpTable_` + `requestTierUpStub` + `callRefMetrics` is the
@@ -136,7 +136,7 @@ there is no per-boundary context object.
 ## 8. First probe-gated step
 
 The cheapest piece that pays and that we can measure today: **a bytecode
-fetch/decode split in the wasm interpreter** is *not* it — the SM lesson is
+fetch/decode split in the wasm interpreter** is *not* it, the SM lesson is
 architectural. The first step is the one the call/frame plan already
 requires: make the wasm interpreter's frame the shared frame, then a baseline
 that mirrors it. Probe: `wasmtest equiv` (already 12 suites, 0 diverged) plus

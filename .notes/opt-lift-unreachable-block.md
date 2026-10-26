@@ -28,7 +28,7 @@ reachability fixpoint refused the whole body.
 
 ## Fix
 
-Mint `i + 1` only when control actually falls through — the conditionals
+Mint `i + 1` only when control actually falls through, the conditionals
 (`JumpIfFalse`/`JumpIfTrue` and the fused tests, whose `block_successors` shape
 is `[target, end]`):
 
@@ -45,7 +45,7 @@ are ignored.
 
 ## The soundness bug this exposed (and its interim fix)
 
-Removing the spurious block made a `return` inside a `for…of` **lift** — and it
+Removing the spurious block made a `return` inside a `for…of` **lift**, and it
 miscompiled: the opt lift lowers a `Return` to a bare machine-code return, with
 **no iterator close**. The interpreter routes such a return through
 `return_control` → `control_transfer`, which closes the iterator and lets a
@@ -56,7 +56,7 @@ bail had been *accidentally* preventing this lift.
 errors swallowed), so it is not the correct close for a return. A correct fix
 needs the error-escaping `close_for_of_return` (via a `return_control`-style
 dispatch). Until then the lift **refuses** a `Return` that can run with an open
-for-of — any return but the body's final step:
+for-of, any return but the body's final step:
 
 ```rust
 Step::Return => {
@@ -79,5 +79,5 @@ mid-body return keep falling back to the per-step tier.
 ## Still to do
 
 Emit the spec-correct close (`close_for_of_return`) on an opt `Return` so
-for-of bodies with a mid-body return lift again — then the refusal above comes
+for-of bodies with a mid-body return lift again, then the refusal above comes
 out.

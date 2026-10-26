@@ -15,7 +15,7 @@ initialize / write / delete of its declarative record). The probe's existing
 `(name, global_id, generation)` validation therefore covers both records with no
 new cell field, no new ctx field and no codegen change. A declarative cell is
 load-only (`slot = u32::MAX`), which also disables the compiled `StoreGlobal`
-fast path — a `const`'s cell can never be written through a property slot.
+fast path, a `const`'s cell can never be written through a property slot.
 
 Measured with the corpus runner (1M iterations, same machine and binary):
 
@@ -25,7 +25,7 @@ Measured with the corpus runner (1M iterations, same machine and binary):
 | `hoisted_local.js` | 2.48 | 2.47 | 16.9 | 17.0 |
 | `object_read.js` | 2.46 | 2.52 | 17.3 | 16.5 |
 
-The three binding kinds are now the same speed — the 21x/25x gap this note
+The three binding kinds are now the same speed, the 21x/25x gap this note
 opens with is closed. The `globals` family gap went 30.94x -> 2.82x and the
 corpus overall 34.05x -> 31.21x with 0 mismatches.
 
@@ -34,7 +34,7 @@ behaviours beyond this note's scope are pinned by new tests:
 
 - a later script's `const K` invalidating a cell warmed from an earlier
   `globalThis.K` property
-  (`installed_jit_declarative_binding_invalidates_a_warmed_object_cell`) — this
+  (`installed_jit_declarative_binding_invalidates_a_warmed_object_cell`), this
   one was a real hole before the fix;
 - a `let` written by a called function mid-loop
   (`installed_jit_declarative_read_sees_a_callees_write`).
@@ -45,8 +45,8 @@ including the audit of every mutation path into the global record, is in
 
 ## The finding
 
-A read of a global binding that lives in the global env's **declarative record** —
-any top-level `const`, `let`, `class`, or function-declaration *name* — costs
+A read of a global binding that lives in the global env's **declarative record**,
+any top-level `const`, `let`, `class`, or function-declaration *name*, costs
 **~63 ns per read inside a compiled loop**, while the same loop reading the same
 value from a local, or from a global **object-record** property, costs **~2.5 ns**.
 That is a 25× gap, inside machine code, on one of the most common operations in
@@ -57,9 +57,9 @@ four engine/modes (`1500001500000`):
 
 | workload | slag jit | slag jitless | node |
 | --- | ---: | ---: | ---: |
-| `declarative_read.js` — top-level `const K`, read in the loop | **63.5 ms** | 96.6 | 0.58 |
-| `hoisted_local.js` — same value read once into a local | **2.48 ms** | 17.2 | 0.59 |
-| `object_read.js` — `globalThis.K`, an object-record property | **2.46 ms** | 17.3 | 86.5 |
+| `declarative_read.js`, top-level `const K`, read in the loop | **63.5 ms** | 96.6 | 0.58 |
+| `hoisted_local.js`, same value read once into a local | **2.48 ms** | 17.2 | 0.59 |
+| `object_read.js`, `globalThis.K`, an object-record property | **2.46 ms** | 17.3 | 86.5 |
 
 workload, 1M iterations | slag jit | slag jitless | node |
 | --- | ---: | ---: | ---: |
@@ -75,14 +75,14 @@ load; node pays an unfolded property read) and loses 100× on the declarative ro
 (node folds a top-level `const` away entirely). The scratch set the rows came from
 also showed the effect is about the *read*, not the loop head: the same `const`
 read in the loop **body** (`13_body_scriptconst.js`) measures 18.08 ms against
-18.35 ms for the same read as the loop **bound** — and both are ~17× the same loop
+18.35 ms for the same read as the loop **bound**, and both are ~17× the same loop
 with a literal bound (1.06 ms).
 
 ## Why, from the code
 
-`crates/runtime/src/jit.rs::load_ident` warms the JIT's `GlobalValueCell` — the
+`crates/runtime/src/jit.rs::load_ident` warms the JIT's `GlobalValueCell`, the
 direct-mapped cell the compiled `LoadIdent` probe checks before falling back to
-the full resolve — **only** for object-record bindings (the code below is the
+the full resolve, **only** for object-record bindings (the code below is the
 pre-fix shape; the Landed section above records what replaced it):
 
 ```rust
@@ -103,7 +103,7 @@ cell's name and the **global object's** generation. A declarative binding can be
 shadowed later (a *later script* may delete the binding when no longer referenced
 and re-declare the name), and that event does not disturb the global object, so a
 validated cell could serve a stale value. Warming for declarative bindings needs
-something the probe can check that a script-level re-declaration *does* disturb —
+something the probe can check that a script-level re-declaration *does* disturb,
 a declarative-record generation/epoch on the global env, carried in the cell and
 compared in `LoadIdent`'s compiled probe. Once the cell warms, the existing
 `HoistGlobalGuard` should pull invariant reads out of loops for free.
@@ -114,7 +114,7 @@ This section began as the design for closing the gap; it is kept as the record,
 with the corrections the implementation forced.
 
 Landed result on `globals/nested_read.js` (a helper that CAPTURES a binding from
-the function it is nested in — the mod-kernel shape; see the correction below):
+the function it is nested in, the mod-kernel shape; see the correction below):
 
 | row | before | after |
 | --- | ---: | ---: |
@@ -135,7 +135,7 @@ What landed:
 - One more thing the design did not foresee, which the relaxation EXPOSED and
   this change also fixes: an in-place VALUE write deliberately does not bump the
   receiver's generation (the L1c no-bump discipline), but the name-keyed global
-  cell is validated BY that generation — so `globalThis.value = ''`, written by
+  cell is validated BY that generation, so `globalThis.value = ''`, written by
   compiled or interpreted in-place store code, left a global read serving the
   pre-write value. `Vm::refresh_global_read_cell` now fronts the new value at the
   unchanged generation from every in-place store path
@@ -148,9 +148,9 @@ What landed:
 
 **Why a chain-shape gate is unsound: the cell is shared by name.**
 `agent.global_value_cells` is ONE direct-mapped table, keyed by the name, and the
-probe checks only `(name, global_id, generation)` — nothing body-specific. So
+probe checks only `(name, global_id, generation)`, nothing body-specific. So
 "this body's chain is closed" is not enough. The reachable form of the hazard is
-a DYNAMICALLY bound name in the chain — an eval-injected `var`, or a `with`
+a DYNAMICALLY bound name in the chain, an eval-injected `var`, or a `with`
 object's property:
 
 ```js
@@ -165,7 +165,7 @@ function outer() {
 A **declared** enclosing binding is NOT this hazard: the compiler resolves it as
 a capture (a context slot), so it never becomes a `LoadIdent` and never consults
 a cell. The first cut of the regression test used `const x = 2` in the wrapper and
-passed under a chain-shape-only gate precisely because of that — the shipped test
+passed under a chain-shape-only gate precisely because of that, the shipped test
 uses the `eval` form, which fails under that gate (verified). The verdict has to
 be **per name and per run** either way.
 
@@ -173,24 +173,24 @@ be **per name and per run** either way.
 read and (b) whose running env is not itself the global record, walk the chain
 from the body's env outward once per distinct read name:
 
-- a `with` record anywhere ⇒ not clean — its object can gain the property later,
+- a `with` record anywhere ⇒ not clean, its object can gain the property later,
   and gaining it does not move the global's generation (this is exactly the
   `installed_jit_ident_read_with_scope_shadow_is_respected` case);
-- a record *before* the global record that `has_binding(name)` ⇒ not clean — the
+- a record *before* the global record that `has_binding(name)` ⇒ not clean, the
   resolve would stop there;
 - the walk must reach a `Global` record ⇒ otherwise not clean (a module's chain,
   or a host function whose chain ends at null).
 
 If ANY name is not clean, the flag goes off for the whole run: every `LoadIdent`
 probe and the LICM guard degrade to today's behaviour. That is the conservative
-degradation — a body that shadows one global name and reads another loses the
-fast path for the second, i.e. behaves as it does now — and it is what keeps the
+degradation, a body that shadows one global name and reads another loses the
+fast path for the second, i.e. behaves as it does now, and it is what keeps the
 mechanism to a single bool.
 
 **Why the verdict holds for the whole run.** A body's own statements cannot add a
 record to its chain: a certified body never creates an env (`env_constant`;
 `with`, `catch` and eval are scanner rejects), and it cannot run an owner body
-that could — an owner of a chain record is a suspended caller while this body
+that could, an owner of a chain record is a suspended caller while this body
 runs, and a suspended caller cannot execute. So a direct eval in an owner body
 can only inject a `var` into that env *before* this run entry, which the walk
 sees. A `with` object gaining a property mid-run is the one live hazard, and the
@@ -200,7 +200,7 @@ cell's own generation check (now including the declarative record, above).
 
 **What changes.**
 
-1. `CompiledBody` gains `ident_names` — the distinct `LoadIdent` atoms, computed
+1. `CompiledBody` gains `ident_names`, the distinct `LoadIdent` atoms, computed
    in the same scan as `body_has_loop` in `compile_body`/`compile_statements`.
    Empty means nothing to check, and it is also what keeps the common case free:
    a body on the bare global record never walks at all, the existing check
@@ -209,7 +209,7 @@ cell's own generation check (now including the declarative record, above).
    interpreter's `run_inner` becomes one call to a `Vm` helper
    (`global_reads_are_clean(env, &body.ident_names)`); `run_jit_leaf` keeps its
    uniform value (a leaf never contains `LoadIdent`).
-3. The flag keeps its shape — one bool in `Vm` and `JitCallContext` — so the
+3. The flag keeps its shape, one bool in `Vm` and `JitCallContext`, so the
    compiled `LoadIdent` arm, the LICM guard and `warm_global_cell`'s gate need no
    new machinery. It should be RENAMED (`chain_globals_ok`), because "clean
    chain" is no longer what is being tested.
@@ -225,16 +225,16 @@ resolve on every iteration of a hot loop.
 **Tests a wrong implementation fails** (the first two are the point of the
 design):
 
-- a dynamically bound name in the chain is never served from another body's cell
-  — the `eval` shape above (`installed_jit_nested_ident_read_is_not_served_from_
+- a dynamically bound name in the chain is never served from another body's cell,
+  the `eval` shape above (`installed_jit_nested_ident_read_is_not_served_from_
   a_shadowing_chain`), verified to fail under a chain-shape-only gate;
 - a statically declared enclosing binding stays a capture and is served from the
   slot, not the cell (`installed_jit_enclosing_declarations_are_captures_not_
-  global_reads`) — it pins the shape that must NOT start consulting a cell;
+  global_reads`), it pins the shape that must NOT start consulting a cell;
 - a nested helper reading a global property in a loop returns what the top-level
   reader of the same name returns (`a_nested_global_read_warms_the_value_cell`);
 - a nested read still sees a callee's write (the invalidation survives the
-  relaxed gate) — `installed_jit_nested_global_read_sees_a_callees_write`;
+  relaxed gate), `installed_jit_nested_global_read_sees_a_callees_write`;
 - the walk itself, name by name, including the `with` and no-global-record cases
   (`global_reads_are_unshadowed_checks_each_name_against_the_chain`);
 - an in-place member store to a global refreshes the read cell
@@ -244,14 +244,14 @@ design):
 The existing `with`-closure e2e test
 (`installed_jit_ident_read_with_scope_shadow_is_respected`) stays green.
 
-**Alternatives rejected.** (a) A per-name poison table in the ctx — finer, keeps
+**Alternatives rejected.** (a) A per-name poison table in the ctx, finer, keeps
 the fast path for the clean names of a mixed body, but a direct-mapped fold can
 collide, and a collision is silently UNSOUND; if it is ever wanted the fold must
 be exact or the overflow must degrade to the single flag anyway, so it buys
-little over this. (b) Telling the loader that a wrapper's bindings cannot shadow
-— the same knowledge moved to a different site, and it does not cover a closure
+little over this. (b) Telling the loader that a wrapper's bindings cannot shadow,
+the same knowledge moved to a different site, and it does not cover a closure
 created inside a `with`. (c) Recording the resolving record's identity in the
-cell and validating it per read — that needs the chain walk per read, which is
+cell and validating it per read, that needs the chain walk per read, which is
 the cost being removed.
 
 ## Reproducing
@@ -266,4 +266,4 @@ node tools/corpus/run_node.js tools/corpus/workloads/globals
 The scratch set the rows were derived from (12 shapes: locals, script `const` and
 `let`, `Math.PI`, `globalThis.G`, a function-declaration read, a script-function
 call, `** 0.5` vs `Math.sqrt`, a kernel called 1000×, and the hoisted-local
-control) lives in `scratch/jitprobe/` — gitignored, kept for re-measurement.
+control) lives in `scratch/jitprobe/`, gitignored, kept for re-measurement.

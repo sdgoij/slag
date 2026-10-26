@@ -2,7 +2,7 @@
 
 **Status: SCOPE (not started).** This is the large-risky-change option, scoped
 as a project of its own. It is the successor to `.notes/dense-store-redesign.md`
-(Stage 1 — the prototype-elements protector — landed; Stages 2-4 were shelved).
+(Stage 1, the prototype-elements protector, landed; Stages 2-4 were shelved).
 It is *not* a shortcut for the `buildString shape` row, and it does not inherit
 that row's validation-only risk profile: it changes the representation of every
 JS value.
@@ -25,13 +25,13 @@ scaffolding*, which is f64 in Slag and Smi in V8:
   `fcmp`), because Slag has no integer representation.
 
 Stage 2 (a one-byte kind that folds the `[[Extensible]]`/`is_prototype` guard)
-was probed at a **~1.5% ceiling** and shelved — see the redesign note. So the
+was probed at a **~1.5% ceiling** and shelved, see the redesign note. So the
 remaining levers are the ones below, and they are large because they change
 `Value`.
 
 ## Honest target
 
-**~8-11 ms (`buildString shape`), i.e. ~1.1-1.4x node** — every identified
+**~8-11 ms (`buildString shape`), i.e. ~1.1-1.4x node**, every identified
 piece is addressable, but parity is *not* guaranteed: the loop scaffolding, the
 NaN-boxed-double fallback for non-integers, and cache/branch overhead outside
 the redesign's reach leave a floor. Treat "match node" as a stretch goal that
@@ -39,7 +39,7 @@ this project makes *possible*, not as its acceptance criterion.
 
 ## Workstreams
 
-### WS1 — Smi integers (the Value-representation change)
+### WS1: Smi integers (the Value-representation change)
 
 Add a tag (tag 11 in the reserved range, currently free) holding a signed
 44-bit integer in the payload, with values outside `[-2^43, 2^43)` staying as
@@ -47,7 +47,7 @@ doubles. Tag 11 is already safe for the conservative stack scan:
 `Value::encoded_box_address` accepts only tags `TAG_BIGINT..=TAG_FUNCTION`
 (4..=8), so a Smi payload is never chased as a pointer.
 
-The work is not the encoding — it is making integer *producers* emit Smis and
+The work is not the encoding, it is making integer *producers* emit Smis and
 every integer consumer handle them:
 
 - Arithmetic fast paths, interpreter and JIT: `Vm::binary_inline`, the
@@ -62,7 +62,7 @@ every integer consumer handle them:
   compare.
 - `Value::kind()` / `is_number` / `as_number` / `to_number` / `ValueKind`.
 
-### WS2 — Smi array keys
+### WS2: Smi array keys
 
 With WS1, the compiled append's key gate becomes a tag check + payload read
 instead of the f64 round trip (`emit_dense_array_append_inline`'s
@@ -70,7 +70,7 @@ instead of the f64 round trip (`emit_dense_array_append_inline`'s
 `dense_index_define` accept an integer key without re-parsing. This is where
 the ~0.25 ns/iter key cost goes.
 
-### WS3 — Elements kinds (the one-byte gate)
+### WS3: Elements kinds (the one-byte gate)
 
 Give `ArraySlots` a `kind: Cell<u8>` (PACKED / HOLEY x SMI / DOUBLE / ELEMENTS,
 plus DICTIONARY and SPILLED) replacing the `dense: Cell<bool>` flag and
@@ -86,22 +86,22 @@ The trap is transitions: every dense-mode transition (spill, hole creation,
 miss is a silent wrong element. `spill_dense_array`, `array_element_write(_dense)`,
 `dense_index_define`, `array_set_length`, `array_pop_dense`, `delete_key`.
 
-### WS4 — Remove the per-store generation bump
+### WS4: Remove the per-store generation bump
 
 The compiled append writes `generation += 1` to invalidate the generation-keyed
 read caches (`array_element_value_cells`, `array_length_cells`, the
 `member_value_cells` entry for `length`, the for-of verdicts). It measures
-~0.06 ns/iter — small on its own, but it is the reason the length read cannot
+~0.06 ns/iter, small on its own, but it is the reason the length read cannot
 be cached. A realm/epic epoch invalidation (the Stage 1 protector is a working
 precedent) could remove both the store and the cache-miss on `length`.
 
-### WS5 — (optional) loop-guard hoisting / versioning
+### WS5: (optional) loop-guard hoisting / versioning
 
 The f64 loop scaffolding is the other half of the gap. Smi counters (WS1)
 shrink it; hoisting or versioning the loop guard for call-free bodies would
 shrink it further, without a global invariant. Scoped separately because the
 `readonly` route was rejected (the compiled body's own helper fallback writes
-the cells it would read — see the skill).
+the cells it would read, see the skill).
 
 ## Measured migration surface
 
@@ -124,19 +124,19 @@ with it.
 
 ## Increment order (each lands green and measured)
 
-1. **WS1a — additive Smi, double still authoritative.** Add the tag,
+1. **WS1a, additive Smi, double still authoritative.** Add the tag,
    constructors, `kind()`/`is_number`, and tracing/scanning. No producer emits
    Smis yet; the row does not move. Gate: all three sweeps + the battery.
-2. **WS1b — integer literals and `++`/compound counters emit Smis**, with
+2. **WS1b, integer literals and `++`/compound counters emit Smis**, with
    overflow promotion. First measurable win on the loop scaffolding. Gate:
    new Smi-range/overflow fixtures + the battery + the sweeps.
-3. **WS2 — the array key path takes a Smi** (compiled gate + interpreter).
+3. **WS2, the array key path takes a Smi** (compiled gate + interpreter).
    Gate: the dense-store fixture suite + the sweeps.
-4. **WS3 — elements kinds**, one kind compare for the gate. Gate: the Stage 1
+4. **WS3, elements kinds**, one kind compare for the gate. Gate: the Stage 1
    invalidation fixtures (the guard bits move into the kind) + the sweeps.
-5. **WS4 — epoch invalidation of the read caches**, drop the per-store bump.
+5. **WS4, epoch invalidation of the read caches**, drop the per-store bump.
    Gate: the mirror/length readers, `--gc-stress`, the sweeps.
-6. **WS5 — loop-guard hoisting** (separate decision after WS4's number).
+6. **WS5, loop-guard hoisting** (separate decision after WS4's number).
 
 Each increment is independently revertible; the benchmark is reported after
 each and the project stops when the payoff flattens (the Stage 1-2 precedent).
@@ -178,5 +178,5 @@ each and the project stops when the payoff flattens (the Stage 1-2 precedent).
 - Parity as a hard requirement (see "Honest target").
 - A dictionary/elements-kind fallback redesign beyond what WS3's transitions
   need; the existing spill-to-properties path stays the correctness backstop.
-- Changing the NaN-boxing *layout* beyond adding the Smi tag — the frozen-ABI
+- Changing the NaN-boxing *layout* beyond adding the Smi tag, the frozen-ABI
   constants stay stable.

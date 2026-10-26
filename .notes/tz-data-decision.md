@@ -34,8 +34,8 @@ bucket is non-iso calendar data, ~90).
     Antarctica/McMurdo→Auckland, Pacific/Enderbury→Kanton, America/St_Barthelemy→
     Guadeloupe, Asia/Harbin/Chongqing/Kashgar→Shanghai/Urumqi, ...
   - 9 Etc/GMT forms (+4 invalid rejection-only forms like `Etc/GMT+24`,
-    `Etc/GMT-0N` — the fixtures test rejection, no data needed).
-  - case-variant tests (`ASIA/calcutta`, `africa/cairo`) — the lookup must
+    `Etc/GMT-0N`, the fixtures test rejection, no data needed).
+  - case-variant tests (`ASIA/calcutta`, `africa/cairo`), the lookup must
     case-fold.
 - The heavy-DST set is small: America/Vancouver (42 fixtures),
   America/New_York (13), Pacific/Apia (12), Europe/Vienna (12),
@@ -44,7 +44,7 @@ bucket is non-iso calendar data, ~90).
   America/Sao_Paulo (3), America/Noronha (3), Australia/Lord_Howe (2),
   America/St_Johns (2), plus ~20 others used at one or two instants.
 - **Era pin**: the corpus canonicalizes Europe/Kiev→Europe/Kyiv (tzdata
-  2022b+) and America/Godthab→America/Nuuk (2023a+) — a tzdata 2023a-era
+  2022b+) and America/Godthab→America/Nuuk (2023a+), a tzdata 2023a-era
   snapshot, the same era the test262 submodule pins.
 
 ## 2. The two options
@@ -62,12 +62,12 @@ next/previous transition instants.** `chrono_tz::TimeZone` has only
 transition API. The corpus's `getTimeZoneTransition` (9), `hoursInDay` (6)
 and the DST arithmetic (~30) need the transition table. Workarounds:
 
-- reach into jiff's internal TZif tables (not public API — fragile);
+- reach into jiff's internal TZif tables (not public API, fragile);
 - write a TZif parser over the embedded bytes (`jiff::tz::TimeZone::tzif`
   parses one, but still hides transitions).
 
 Either workaround reimplements the table + binary search the derived
-approach generates anyway — but with a dependency and an implicit data
+approach generates anyway, but with a dependency and an implicit data
 version you don't control.
 
 ### B. Corpus-derived tables (the established Slag pattern)
@@ -76,8 +76,8 @@ The `crates/unicode/build.rs` precedent: the fixtures ARE the data spec;
 a build script derives the tables at build time from the pinned corpus
 (erroring if the submodule is missing).
 
-- **Data source**: a vendored minimal IANA subset — the ~160 zone files +
-  the `backward` link file from tzdata 2023a — pinned alongside the test262
+- **Data source**: a vendored minimal IANA subset, the ~160 zone files +
+  the `backward` link file from tzdata 2023a, pinned alongside the test262
   submodule (the same era the corpus encodes).
 - **Generator**: `tools/gen_tz_tables.py` (following the
   `crates/unicode/build.rs` corpus-derivation pattern) parses the tzdata
@@ -86,7 +86,7 @@ a build script derives the tables at build time from the pinned corpus
   `crates/unicode/src/tz_data.rs`.
 - **Runtime table**: per-zone sorted transition array
   `(at_ns, offset_secs, is_dst, abbreviation)`. Binary search serves all
-  four operations natively — offset at an instant, next transition,
+  four operations natively, offset at an instant, next transition,
   previous transition, and the alias/canonicalization table.
 - **Sub-minute and pre-1970 offsets come free**: the tzdata text format
   carries the full history (LMT from ~1880, Monrovia's -00:44:30 until
@@ -111,15 +111,15 @@ pub fn primary_identifiers() -> &'static [&'static str];
 
 Consumers:
 
-- `crates/runtime/src/builtins/temporal/` — `offset_time_zone_offset_ns`
+- `crates/runtime/src/builtins/temporal/`: `offset_time_zone_offset_ns`
   (currently UTC + fixed offsets only), the ZonedDateTime machinery
   (local time, transitions, disambiguation), `getTimeZoneTransition`.
-- `crates/runtime/src/builtins/intl/date_time_format.rs` —
+- `crates/runtime/src/builtins/intl/date_time_format.rs`,
   `named_zone_offset` (currently falls back to UTC) and `format_time_zone`,
   so the ZDT named-zone `toLocaleString` fixtures
   (`options-timeZoneName-affects-instance-time-zone`, `time-zone-canonicalized`)
   and the canonical `resolvedOptions().timeZone` work.
-- `Intl.supportedValuesOf("timeZone")` — the generated primary list
+- `Intl.supportedValuesOf("timeZone")`: the generated primary list
   reconciles with the existing 446-entry `SUPPORTED_TIME_ZONES`
   (the `Temporal/ZonedDateTime/supported-values-of.js` fixture iterates it
   and constructs every entry).
@@ -129,10 +129,10 @@ Consumers:
 Before committing to the generator, hand-write the tables for the four
 hardest zones and measure:
 
-1. **America/Vancouver** — DST rules + pre-1883 LMT (`offset-before-1883`).
-2. **Africa/Monrovia** — sub-minute offset until 1972 (`sub-minute-offset`).
-3. **Pacific/Apia** — the 2011-12-30 dateline jump (`dst-skipped-cross-midnight`).
-4. **Australia/Lord_Howe** — the 30-minute DST offset (`dst-less-than-hour`).
+1. **America/Vancouver**: DST rules + pre-1883 LMT (`offset-before-1883`).
+2. **Africa/Monrovia**: sub-minute offset until 1972 (`sub-minute-offset`).
+3. **Pacific/Apia**: the 2011-12-30 dateline jump (`dst-skipped-cross-midnight`).
+4. **Australia/Lord_Howe**: the 30-minute DST offset (`dst-less-than-hour`).
 
 Wire the four operations into `temporal/instant.rs` + `date_time_format.rs`,
 then sweep the DST/transition cluster (~45 fixtures). Success = the cluster
@@ -157,7 +157,7 @@ flattened blob already in the cargo cache (`tools/tzdata/` now vendors the
   transitions (NY ends 2007, London 1996) and relies on the footer rules
   string. The generator evaluates the POSIX TZ rules (the Mm.w.d/Jn/n
   forms, local-time interpretation, southern-hemisphere wrapping) and
-  extends the tables through 2050 — the corpus's post-1996 instants need
+  extends the tables through 2050, the corpus's post-1996 instants need
   it (London 2020-03-29T01:00Z, NY 2019-11-03T06:00Z).
 - **Blob dedup means same-offset zones share data but stay distinct
   primaries** (Africa/Abidjan != Africa/Accra): the generator emits one
@@ -169,7 +169,7 @@ flattened blob already in the cargo cache (`tools/tzdata/` now vendors the
   now resolves + canonicalizes through the generated tables.
 - **Operations wired**: case-folded lookup, offset-at-instant,
   next/previous offset-changing transitions (abbreviation-only transitions
-  are skipped — the corpus pins Paris's 1891 LMT->PMT switch is not a
+  are skipped, the corpus pins Paris's 1891 LMT->PMT switch is not a
   transition), per-midnight start-of-day (hoursInDay/startOfDay with a
   midnight gap/overlap), the offset/offsetNanoseconds getters, toString,
   the string/property-bag ZonedDateTime.from wall-clock conversion
@@ -207,21 +207,21 @@ following the `crates/unicode/build.rs` corpus-derivation pattern, tables in
 the era pin and the table format against the corpus's exact offsets before
 generating the rest. The external-crate route is now effectively a data
 SOURCE at best (its TZif bytes still need a parser of your own for
-transitions) — strictly worse than derived on every axis that matters here.
+transitions), strictly worse than derived on every axis that matters here.
 
 ## 7. Risks
 
-1. **Era exactness** — the corpus pins a 2023a-era snapshot; a vendored
+1. **Era exactness**: the corpus pins a 2023a-era snapshot; a vendored
    subset must match Monrovia's sub-minute end date, the Apia jump, the
    Kyiv/Nuuk renames, etc. The corpus is the net; the spike measures this
    before the generator commits to a full extraction.
-2. **The Etc/GMT±N forms** — the valid fixed offsets (`Etc/GMT-14`..+12)
+2. **The Etc/GMT±N forms**: the valid fixed offsets (`Etc/GMT-14`..+12)
    and the rejection-only forms; the engine's offset parsing already
    handles the valid ones, the generator must not emit data for the
    invalid forms.
-3. **Case folding** — the corpus tests `ASIA/calcutta`/`africa/cairo`;
+3. **Case folding**: the corpus tests `ASIA/calcutta`/`africa/cairo`;
    the lookup must fold case before the alias table (the engine already
    uppercases in `lookup_named_time_zone`).
-4. **The generator's zic-format parser** — tzdata text format is stable
+4. **The generator's zic-format parser**: tzdata text format is stable
    but has corners (rule continuations, `S` suffix, TZif-vs-text
    discrepancies); the dogfooded `.js` sweep is the regression net.

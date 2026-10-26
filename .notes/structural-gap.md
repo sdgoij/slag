@@ -1,7 +1,7 @@
 # The structural gap: the object model, not codegen
 
 **Status: open (probe, 2026-10-10).** The 23x JIT gap to V8 is not Cranelift and
-not arithmetic — it is that Slag's compiled code emits a **runtime helper call
+not arithmetic, it is that Slag's compiled code emits a **runtime helper call
 per object-model operation** (property read, element store, object literal)
 with no inline cache and no inline allocation, while V8's TurboFan inlines
 those. Arithmetic is compiled inline.
@@ -10,8 +10,8 @@ those. Arithmetic is compiled inline.
 
 The corpus's `opcost` rows cannot measure this: V8 *folds* them (a
 loop-invariant `o.x` is hoisted, `({a:1}).a` is escape-analyzed to a constant),
-so their "gap" is V8 doing zero work. Built a **fold-resistant** set instead —
-values retained/escaped so neither engine can eliminate the work —
+so their "gap" is V8 doing zero work. Built a **fold-resistant** set instead,
+values retained/escaped so neither engine can eliminate the work,
 `scratch/struct/*.js`, run through the corpus protocol in all four modes
 (`slag --corpus`, `slag --jitless --corpus`, `node run_node.js`,
 `node --jitless run_node.js`).
@@ -35,7 +35,7 @@ call anomalously slow, so neither is a clean comparison.)
   (Cranelift ≈ TurboFan) is directionally right; the 23x is not here.
 - **Allocation is 40.8x and the JIT does nothing for it** (Slag-jit/Slag-jl =
   **1.07x**). Slag allocates at ~193 ns/object; V8's JIT at ~4.7 ns. V8's JIT
-  is 13.7x faster than its own interpreter here; Slag's is 1.07x — allocation
+  is 13.7x faster than its own interpreter here; Slag's is 1.07x, allocation
   is a runtime call, never inlined.
 - **Property read 27.5x; element read 22.9x.** V8's JIT is 20–29x faster than
   its interpreter on these; Slag's is only 3.5x / 5.7x.
@@ -52,10 +52,10 @@ Counts are per `bench()` call (the harness makes ~7 calls):
 - `alloc_obj`: `object_fast` 2M + `get_member_name` 2M + `set_member_computed`
   2M → three helper calls per iteration (literal create, field read, element
   store). No inlined allocation; the object literal is a helper.
-- `elem_read`: **no per-read helper** — the dense element read is inlined, yet
+- `elem_read`: **no per-read helper**, the dense element read is inlined, yet
   it is still 22.9x V8 (9.4 ns/read vs 0.4). So the inline element path itself
   is slow (guard/bounds/conversion chain), a second, separate lever.
-- (Contrast: foldable `opcost/obj_prop` shows `get_member_name` × 1 — Slag's
+- (Contrast: foldable `opcost/obj_prop` shows `get_member_name` × 1, Slag's
   LICM hoists the invariant read out. LICM works; the per-op IC does not.)
 
 ## 3b. Allocation split out (it is GC, not the alloc instruction)
@@ -75,7 +75,7 @@ allocation, and alloc+read. All compile (no bail). Per 2M iterations:
 Subtracting: **element store ≈ 16 ns**, **property read ≈ 3.6 ns**, **allocation
 ≈ 337 ms / 2M ≈ 168 ns/object**. Allocation is ~88% of the row.
 
-But 168 ns/object is not the allocation instruction — it is GC. `--gc-trace` on
+But 168 ns/object is not the allocation instruction, it is GC. `--gc-trace` on
 the same row:
 
 ```
@@ -93,18 +93,18 @@ fast path itself, after the 16 ns store) is ~7x V8's ~6 ns.
 
 So the allocation axis splits:
 
-1. **Nursery/GC (≈70% of the row, the dominant cost)** — the young set is not
+1. **Nursery/GC (≈70% of the row, the dominant cost)**: the young set is not
    bounded or drained, so a minor scans the entire live young set at ~70 ns per
    object, and the sweep is ~52 ns per object. V8 does the identical 2M retained
    allocations *including* its GC in ~8 ns/object all-in.
-2. **The allocation fast path (~41 ns/object, ~7x V8)** — the `object_fast`
+2. **The allocation fast path (~41 ns/object, ~7x V8)**: the `object_fast`
    helper call, not inlined.
 
 ## 4. The lever
 
 Not codegen, not arithmetic. Two structural arcs:
 
-1. **Inline caches for the object model in compiled code** — a monomorphic
+1. **Inline caches for the object model in compiled code**: a monomorphic
    shape-slot fast path in the emitted code for named reads/writes (so
    `get_member_name`/`set_member_computed` are the slow miss, not the norm),
    and an **inline allocation fast path** (bump pointer + the young-gen check
@@ -117,7 +117,7 @@ Both are large but well-defined; measure each with the `scratch/struct/` rows
 
 ## 5. Churn baseline (record to track progress/regression)
 
-Real corpus churn rows — objects allocated and *dropped* immediately — run
+Real corpus churn rows, objects allocated and *dropped* immediately, run
 isolated, min-of-5, at HEAD `d612ce0c`:
 
 ```
@@ -136,17 +136,17 @@ Observations:
 - **Real churn fires only *major* collections, and often.** `destructure` does a
   full collection every ~4k allocations (489 for 2M objects). The adaptive
   nursery that grew to 2M in the retained synthetic (`alloc_only`) does not
-  appear when the garbage dies — there is no effective young generation here,
+  appear when the garbage dies, there is no effective young generation here,
   so young garbage is not collected cheaply.
 - GC is **~35%** of the heaviest churn row (`destructure`), ~16–18% of the
   others; per-object GC ~30–57 ns.
 - So for real churn the object model (alloc + property ops) is still the larger
-  half, with GC a consistent ~third — versus the retained synthetic where GC
+  half, with GC a consistent ~third, versus the retained synthetic where GC
   was ~70%.
 - **Track the *isolated* number.** The isolated `destructure` (167 ms) differs
-  from the full-corpus one (`bench.js`, ~337 ms) by 2x — corpus pollution.
+  from the full-corpus one (`bench.js`, ~337 ms) by 2x, corpus pollution.
 
-## 5b. The GC trigger policy (why churn majors — probed)
+## 5b. The GC trigger policy (why churn majors, probed)
 
 Policy (`crates/runtime/src/agent.rs::maybe_collect`, `crates/crux/src/heap.rs`):
 
@@ -163,9 +163,9 @@ Policy (`crates/runtime/src/agent.rs::maybe_collect`, `crates/crux/src/heap.rs`)
 Consequences:
 
 - **Churn** (garbage dies): old live is small/stable (~3179), so the major
-  threshold is ~6358, which the accumulating *young* crosses at ~4096 — before
+  threshold is ~6358, which the accumulating *young* crosses at ~4096, before
   `young` reaches 8192. So a **full major fires every ~4k allocations and the
-  minor never runs** — the trace's `major live=7275->3179 swept=4096 young=4096`
+  minor never runs**, the trace's `major live=7275->3179 swept=4096 young=4096`
   on repeat, 489 times.
 - **Retained** (nothing dies): the first collections sweep 0 → both levels back
   off → the loop runs collection-free and the nursery grows to 2M, then one big
@@ -225,7 +225,7 @@ win is broad (most rows allocate), not just the churn rows.
 23820/0/1/0.
 
 **Measurement trap:** `run_corpus` never calls `apply_nursery_options`, so
-`--nursery-*` and `--gc-stress` are **silently ignored in `--corpus` mode** — a
+`--nursery-*` and `--gc-stress` are **silently ignored in `--corpus` mode**, a
 corpus run always uses the default policy. GC knobs must be measured in plain
 (`run_file_inner`) / `--bench` mode.
 

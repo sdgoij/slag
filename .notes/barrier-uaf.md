@@ -1,6 +1,6 @@
 # Write-barrier miss in the promise/arguments path
 
-**Status: resolved 2026-10-05 — the miss was a symptom, not the defect.** The
+**Status: resolved 2026-10-05, the miss was a symptom, not the defect.** The
 true root cause is a swept-while-live closure in `promise_all_settled` (see
 §9); the A2 verifier's "old box holds an unrecorded young reference" was it
 reading a dangling `Value` whose slot had been freed and recycled. Independent
@@ -24,7 +24,7 @@ recorded (0 imprecise entries); offenders:
 ```
 
 The `allSettled` tree under `--gc-stress` reports 10 `CRASH` (this panic
-aborting a batch) + 19 `fail` (mostly `$DONE` deadlines — a `--gc-stress`
+aborting a batch) + 19 `fail` (mostly `$DONE` deadlines, a `--gc-stress`
 slowdown artifact, not a correctness failure) of 148 fixtures.
 
 ## 2. The two edges, narrowed
@@ -35,16 +35,16 @@ field and dumped the offending `JsObject`:
 - `runtime::env::EnvRecord` → child `Function` via `decl_bindings` (a
   `DeclarativeEnv` binding holds a young `Function`).
 - `crux::object::JsObject` → child `Function` via `properties`, and it is
-  `id=… kind=Arguments props=[0:young=true, 1:young=false, length:young=false]`
-  — a **mapped `arguments` object** whose index property `"0"` holds a young
+  `id=… kind=Arguments props=[0:young=true, 1:young=false, length:young=false]`,
+  a **mapped `arguments` object** whose index property `"0"` holds a young
   `Function` (the call's first argument).
 
 An `eprintln!` in the define path shows `arguments["0"]` is defined through the
-normal path —
+normal path
 
 `arguments_define_own_property` (empty parameter map → `ordinary_define_own_
 _property`) → `validate_and_apply` new-property arm → `barrier_property(obj,
-&property)` —
+&property)`
 
 and at that moment:
 
@@ -94,7 +94,7 @@ The collector under `--gc-stress` is the **major** (`Agent::collect_with` →
 conservative native-stack scan (plus the fresh box). During
 `create_mapped_arguments_object` the `arguments` object and its argument values
 are held in Rust locals / `Value`s; if a transient handle is not on the scanned
-stack at a collection instant, H1 becomes reachable — but the object itself
+stack at a collection instant, H1 becomes reachable, but the object itself
 stays live into the verifier, which is the inconsistency to explain.
 
 Next probes (all temporary, `--gc-stress`, the single fixture above):
@@ -107,9 +107,9 @@ Next probes (all temporary, `--gc-stress`, the single fixture above):
    define and in the sweep's dead set; confirm free-then-reuse (H1) vs a
    different box written later (H2).
 3. **Who writes `arguments["0"]` after creation?** Instrument every
-   `properties` mutation for an `Arguments` object — the mapped-arguments
+   `properties` mutation for an `Arguments` object, the mapped-arguments
    `[[Set]]` arm (`set_with_receiver_key` → `map.set_key` → `ordinary_set`), the
-   in-field mirror, and the reference machinery — and the env-binding writers,
+   in-field mirror, and the reference machinery, and the env-binding writers,
    to catch H2.
 
 ## 6. A deterministic unit test first
@@ -145,12 +145,12 @@ live hypothesis and the collector is the target; if a variant fails, the store i
   `cargo test --workspace` green; the CLI `--gc-stress` and `--nursery-stress`
   benches 12/12 `ok=true`.
 
-## 9. Resolution — a swept-while-live handler, not a missing barrier
+## 9. Resolution: a swept-while-live handler, not a missing barrier
 
 The probes here were the wrong shape for the actual defect. Re-running the
 single fixture with (a) a reachability mark at the miss and (b) a registry of
 every freed box address settled it: the young child's slot had
-`freed_before=true` at the miss — it was **freed and recycled**, i.e. H1, and
+`freed_before=true` at the miss, it was **freed and recycled**, i.e. H1, and
 the registering container (a reachable `EnvRecord`) held stale bits.
 
 Free/alloc logging around the offending address showed the order exactly:
@@ -170,15 +170,15 @@ keep their single closure in a stack local (scan-visible), which is why only
 
 **The fix, two parts:**
 
-1. `crates/runtime/src/builtins/promise.rs` — `promise_all_settled` now opens a
+1. `crates/runtime/src/builtins/promise.rs`: `promise_all_settled` now opens a
    `StressSuppress` window (the established idiom for a local buffer holding
    unrooted handles across allocations), so no per-allocation collection can
    free a handler mid-loop.
-2. `crates/runtime/src/agent.rs` — `Agent::maybe_collect` now honours
+2. `crates/runtime/src/agent.rs`: `Agent::maybe_collect` now honours
    `crux::ir::is_compiling()` (the `StressSuppress`/compile signal) before
    either of its safe-point collections. A `StressSuppress` window suppresses
    every collection inside it by construction, but the safe-point trigger was
-   not checking the signal — so a `then`/iterator call with a loop inside any
+   not checking the signal, so a `then`/iterator call with a loop inside any
    such window could still sweep the window's unrooted buffers. This closes
    the whole class, not just `allSettled`.
 

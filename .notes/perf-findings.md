@@ -20,13 +20,13 @@ cover, because it is not about specialization at all.
 
 The strategic read: where the engine has already done targeted work (`globals`,
 `for_of_dense` at 1.2×) the gap is small; every untouched surface is 10–100×.
-The deficit is real but **per-surface** — the mechanism is uniform, the work is a
+The deficit is real but **per-surface**, the mechanism is uniform, the work is a
 portfolio of slices, which is what O/B/I/E/L/T builds.
 
 ## 2. The numeric hole
 
-`nested_loops` is pure integer arithmetic — no calls, no allocation, no
-properties — and it is 10× off. Probe (1M iterations unless noted; ns/iter):
+`nested_loops` is pure integer arithmetic, no calls, no allocation, no
+properties, and it is 10× off. Probe (1M iterations unless noted; ns/iter):
 
 | body | slag jit | SM | note |
 |---|---|---|---|
@@ -43,7 +43,7 @@ properties — and it is 10× off. Probe (1M iterations unless noted; ns/iter):
 
 So the coercion in isolation is ~1.9 ns and an int store in isolation ~0.9 ns,
 but an int32 **loop-carried accumulator** costs ~7 ns/iter, 9× its own double
-equivalent and ~20× SM. It is not the coercion and not the store — it is the
+equivalent and ~20× SM. It is not the coercion and not the store, it is the
 carried slot's representation.
 
 ### Root cause 1: the fast loop lane is f64-only
@@ -62,7 +62,7 @@ the shape does not match and the loop never enters the lane.
 It is *not* that the operator is missing, which is what this note first said:
 G9 (`jit-quality-plan.md` §3) already inlined the six integer operators as a
 guarded i32 op (`emit_int_binary`, `compiler.rs` :8657). What remains is that
-the inline is not raw — every execution runs the per-op range guard (`trunc_i32`:
+the inline is not raw, every execution runs the per-op range guard (`trunc_i32`:
 `fabs` + `fcmp` + a slow-block branch, :8698) and round-trips the accumulator
 through `Value` bits, because the loop is on the generic step/leaf path instead
 of the register lane. That round-trip is the 7 ns.
@@ -75,12 +75,12 @@ register (an int32-valued f64), so no new `Vm` field, register, or bind/store pa
 was needed; the trailing truncation folds into an AND mask (`|0` = `-1`). Sound
 only for a rhs the plan proves int32 (an int32 immediate, or the counter of an
 ascending loop to an int32-immediate limit from an int32 seed). Measured (1M iters, release): `s=(s+i)|0` 7.08 → **0.74** ns, `s=(s+1)|0` 7.21 → **0.82**
-ns, `s=(s+i)&mask` 7.24 → **0.83** ns — **parity with the f64 Number lane (0.78
+ns, `s=(s+i)&mask` 7.24 → **0.83** ns, **parity with the f64 Number lane (0.78
 ns)**, ~2.4× SM's ~0.30 ns. The first cut (A1.0) kept the accumulator in the
 shared `Vm::loop_num` / f64 register and only reached 2.75 ns; the finish (A1.1)
 moved it to a dedicated **i32 register** (the JIT detects the int slots from the
 body's `BinStoreInt` ops, so no `Step`/`Vm` field was needed) and dropped the
-per-iteration f64↔i32 round trip — 2.75 → 0.74. Values match the interpreter,
+per-iteration f64↔i32 round trip, 2.75 → 0.74. Values match the interpreter,
 corpus parity holds (36/36), 5566 workspace tests pass.
 
 **Why the proof is required (and what A2 adds).** The wrapping op equals `ToInt32`
@@ -91,7 +91,7 @@ lane gets this for free (a Number has no truncation); the int lane needs an int3
 proof. A1 gets it at plan time and omits the guard; a rhs it cannot prove (a slot,
 or an unbounded counter) still takes the step path. A2 covers those with a
 per-iteration exactness guard plus a bail (the JIT has `DISPATCH_DEOPT`; the
-register executor does not) on the same `BinStoreInt` op — which is why A1 was
+register executor does not) on the same `BinStoreInt` op, which is why A1 was
 built with an `IntRhs` enum rather than a hardcoded immediate.
 
 ### Root cause 2: `%` is not inlined, by design
@@ -103,20 +103,20 @@ built with an `IntRhs` enum rather than a hardcoded immediate.
 This is deliberate, not an oversight: cranelift 0.134 has no `frem`/`fpow`, and a
 formula reimplementation would not match Rust's `%` bit for bit (`compiler.rs`
 :475). So the fix is not an `frem` arm. Two options, in order of effort:
-(a) a direct, untagged f64 remainder helper — on the register lane both operands
+(a) a direct, untagged f64 remainder helper, on the register lane both operands
 are already known Numbers, so this skips `apply_binary`'s dispatch and tag
 checks, ~8 → ~3 ns; (b) to reach SM's ~1 ns, an integer `srem` behind an
 integrality + int32-range + `rhs != 0` guard.
 
 Both are **local fixes**, not new subsystems, and neither is covered by stages
 O/B/I/E/L/T (which are all about specialization). Slag proves the machinery can
-be fast — the double path is at parity — so this is a hole in the baseline
+be fast, the double path is at parity, so this is a hole in the baseline
 numeric lowering, and it is the largest single term in the map.
 
 ## 3. Call-site findings
 
 - **Method-call resolution.** `method_call` is **57 ns/call** while `direct_leaf`
-  is **6.5 ns/call** — 9× apart; on SM the same pair is 4.1 vs 2.9 ns (1.4×). So
+  is **6.5 ns/call**, 9× apart; on SM the same pair is 4.1 vs 2.9 ns (1.4×). So
   the cost is resolving `counter.inc` through the member machinery, not the call.
   A monomorphic method-call IC that caches the resolved callee at the site closes
   most of it, independent of inlining.
@@ -137,15 +137,15 @@ numeric lowering, and it is the largest single term in the map.
 
 ## 5. Ranking
 
-1. **Int32 register lane** (`s = (s + x) | 0`) — **A1 landed 2026-10-03**
+1. **Int32 register lane** (`s = (s + x) | 0`), **A1 landed 2026-10-03**
    (7.1 → 2.75 ns, shared `loop_num` register, proof-based rhs). Remaining: the
    A2 guarded rhs (a slot / unbounded counter), and an i32-register accumulator
    to drop the f64↔i32 round trip.
-2. **`%` via a direct f64 helper** — 6.7× on the modulo rows, and a mechanical
+2. **`%` via a direct f64 helper**: 6.7× on the modulo rows, and a mechanical
    helper-mirror job; the integer `srem` fast path is a later refinement.
-3. **Builtin intrinsic inlining (stage B)** — widest row count (10–72×).
-4. **Method-call IC + computed-callee dispatch** — 9–21× on the call families.
-5. **Escape analysis (stage E)** — the biggest ratios (`destructure` 112×).
-6. **Store inlining, proto-chain read, typed-array store** — 9–25× each, one
+3. **Builtin intrinsic inlining (stage B)**: widest row count (10–72×).
+4. **Method-call IC + computed-callee dispatch**: 9–21× on the call families.
+5. **Escape analysis (stage E)**: the biggest ratios (`destructure` 112×).
+6. **Store inlining, proto-chain read, typed-array store**: 9–25× each, one
    surface at a time.
-7. **Generator resume** — 42×, but its own subsystem.
+7. **Generator resume**: 42×, but its own subsystem.

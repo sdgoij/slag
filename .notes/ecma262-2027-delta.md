@@ -3,7 +3,7 @@
 **Status: audited 2026-10-06.** The edition bump is nomenclature. The vendored
 `spec.html` refresh (`cced75e`) plus one engine-side rename are the entire
 change; no 2027 clause adds a conformance requirement the engine does not
-already meet. The pinned test262 — updated upstream to the current era — passes
+already meet. The pinned test262, updated upstream to the current era, passes
 100% (`sweep all` 48,632 pass / 0 fail / 1 stale skip of 48,633; `sweep intl402`
 3,365 / 0), which is the empirical confirmation.
 
@@ -41,21 +41,21 @@ The normalized text diff is 1,458 changed lines; the clause map shows 2,213 →
 
 **Added (6):**
 
-- `sec-iterator.prototype.join` — `Iterator.prototype.join ( _separator_ )`, a
+- `sec-iterator.prototype.join`: `Iterator.prototype.join ( _separator_ )`, a
   built-in function. Already implemented (`crates/runtime/src/builtins/iterator.rs`,
   `JOIN`) and green on its `builtins/Iterator/prototype/join` fixtures; the old
   vendored draft was simply behind the test262 corpus.
-- `sec-epoch-nanoseconds` — `Epoch Nanoseconds and Range`, a `<dfn>` for the
+- `sec-epoch-nanoseconds`: `Epoch Nanoseconds and Range`, a `<dfn>` for the
   epoch-nanosecond count type.
-- `sec-minutefromtime` / `sec-secondfromtime` / `sec-millisecondfromtime` — the
+- `sec-minutefromtime` / `sec-secondfromtime` / `sec-millisecondfromtime`, the
   renamed Date AOs (below).
-- `sec-snaptointeger` — `SnapToInteger` (below).
+- `sec-snaptointeger`: `SnapToInteger` (below).
 
 **Removed (4):**
 
-- `sec-daysinyear` — `DaysInYear` is inlined into `InLeapYear` (which now does
+- `sec-daysinyear`: `DaysInYear` is inlined into `InLeapYear` (which now does
   `Let y be YearFromTime(tv)` and tests the leap rule directly).
-- `sec-minfromtime` / `sec-secfromtime` / `sec-msfromtime` — renamed.
+- `sec-minfromtime` / `sec-secfromtime` / `sec-msfromtime`, renamed.
 
 **Retitled (35):** every one is a Date parameter rename (`_date_` → `_day_`,
 `_min_` → `_minute_`, `_sec_` → `_second_`, `_ms_` → `_millisecond_`) or an
@@ -66,7 +66,7 @@ Three are neither: `SetViewValue` returns `~unused~` instead of `*undefined*`,
 has a [[StringData]] internal slot", and `TemplateString(s)` takes
 `_escapes_: ~raw~ or ~cooked~` instead of `_raw_: a Boolean`.
 
-## 3. The classes of change — all non-behavioral
+## 3. The classes of change: all non-behavioral
 
 1. **Terminology.** "finite **Number**"; abstract operations now return
    mathematical *integers* rather than `an integral Number`, with callers
