@@ -16889,3 +16889,53 @@ then this) produced two candidate changes that are structural rather than
 incremental: the memo scan, and a cold-outlining pass over a named list. Both
 are measurable without a stopwatch, the first by the memo's own hit path and the
 second by the block counts in this table moving.
+
+### REVERTED (2026-10-26): the atom memo is not the cost
+
+The entry above named the atom memo as the change the profile argued for most
+strongly: `crux::string::lookup` scanning a 64-entry `Vec` in reverse per
+identifier read. Implemented it as a direct-mapped table (one slot per atom id,
+and one per FNV hash of the units for the other direction), probed and
+overwritten. **Reverted.**
+
+7 interleaved rounds, corpus per-row minima: total 2110.9 -> 2090.7 ms (-0.96%).
+Re-run at 11 rounds: -1.12%. Nothing of it came from the paths the memo serves:
+
+| row | before | after |
+| --- | ---: | ---: |
+| `opcost/obj_prop` (member read) | 0.61 | 0.61 (+0.4%) |
+| `globals/declarative_read` (identifier reads) | 2.44 | 2.44 (+0.2%) |
+| `globals/nested_read` | 2.44 | 2.45 (+0.3%) |
+| `calls/method_call` | 54.56 | 54.51 (-0.1%) |
+
+The rows that did move are unrelated to interning and reproduced across both
+runs: `array_fill` -11.8%, `object_keys` -4.3%, `json_stringify` +9.5%. That is
+the binary's layout shifting under a small code change, and with a reproduced
+9.5% regression on one row it is not worth its risk.
+
+### The inference was wrong, and the profile said so all along
+
+The claim was: a block count is an entry count, so 462M entries in `lookup` means
+calls times scan length, therefore the scan is a top-three cost. The premise is
+right; the conclusion is not, because nothing in `sum(blocks)` separates "many
+calls" from "a deep loop".
+
+The profile carries the entry block's count, which is the call count. Dividing
+gives blocks per call:
+
+| function | entries | entry-block | blocks/call |
+| --- | ---: | ---: | ---: |
+| `crux::string::lookup` | 462,436,650 | 36,116,894 | 12.8 |
+| `crux::string::intern` | 459,553,639 | 17,939,370 | 25.6 |
+| `Vm::chain_cell_read` | 549,830,384 | 69,296,259 | 7.9 |
+
+So the memo scan is real (about five and ten iterations per call, not one), but
+it is also only ~2% of the work once the surrounding call is counted, and the
+measurement above says replacing it moves nothing. 36M calls across the training
+set also says most of that path is identifier binding at compile time rather than
+the runtime read loop, where the cost is amortised.
+
+The rule for the next reading of this table: never rank a function by
+`sum(blocks)`. Divide by the entry block first. A ratio near 1 is a hot straight
+line; a large ratio is a loop, and then the question is whether that loop is
+where the time goes, which counts cannot answer.
