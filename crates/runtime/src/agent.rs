@@ -513,6 +513,15 @@ impl Trace for ContextStack {
 /// This is slice 1 of that conversion: the job queues, the promise tables and
 /// the generator tables. The rest of `Agent::trace_roots`'s fields follow in
 /// later slices.
+/// The generator-state table: object id to state, hashed with the crate's
+/// multiply-shift site hasher (`function::SiteHasher`). Every `next()` pays
+/// this lookup, and the key is a single `u64`.
+type GeneratorStateMap = std::collections::HashMap<
+    u64,
+    Rc<RefCell<crate::generator::GeneratorState>>,
+    std::hash::BuildHasherDefault<crate::function::SiteHasher>,
+>;
+
 pub(crate) struct AgentRoots {
     /// The registry this agent registered in, for `Drop` to release the entry
     /// when no heap is entered. Null when it registered in this thread's own
@@ -555,8 +564,10 @@ pub(crate) struct AgentRoots {
     pub(crate) async_resume:
         RefCell<std::collections::HashMap<u64, Rc<crate::async_await::ResumeHandler>>>,
     /// The generator objects' states, keyed by object identity (spec 27.4.3).
-    pub(crate) generators:
-        RefCell<std::collections::HashMap<u64, Rc<RefCell<crate::generator::GeneratorState>>>>,
+    /// The key is a single `u64` id and the map is consulted on every
+    /// `next()`, so it uses the crate's multiply-shift site hasher rather than
+    /// SipHash: `control/generator_loop` pays one lookup per resume.
+    pub(crate) generators: RefCell<GeneratorStateMap>,
     /// The async generator objects' states, keyed by object identity (spec
     /// 27.6.1).
     pub(crate) async_generators: RefCell<
@@ -1301,7 +1312,7 @@ impl AgentRoots {
             promise_compound: RefCell::new(std::collections::HashMap::new()),
             promise_finally: RefCell::new(std::collections::HashMap::new()),
             async_resume: RefCell::new(std::collections::HashMap::new()),
-            generators: RefCell::new(std::collections::HashMap::new()),
+            generators: RefCell::new(GeneratorStateMap::default()),
             async_generators: RefCell::new(std::collections::HashMap::new()),
             vm_pool: RefCell::new(Vec::new()),
             compiled_bodies: RefCell::new(std::collections::HashMap::default()),

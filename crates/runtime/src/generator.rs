@@ -458,10 +458,12 @@ fn generator_resume(agent: &mut Agent, this: &Value, completion: Resume) -> Resu
                 "GeneratorResume called on a non-generator".into(),
             )
         })?;
-    // A re-entrant `next()` during execution borrows the state mutably; the
-    // spec's "already running" TypeError (27.4.3.2 step 4) must not panic.
-    let flag = match state.try_borrow() {
-        Ok(state) => state.flag,
+    // The state borrow covers the flag read and the run. A re-entrant
+    // `next()` during execution cannot borrow it, which is exactly the spec's
+    // "already running" TypeError (27.4.3.2 step 4), so one fallible borrow
+    // replaces the read-then-borrow pair.
+    let mut state = match state.try_borrow_mut() {
+        Ok(state) => state,
         Err(_) => {
             return Err(JsError::new(
                 ErrorKind::TypeError,
@@ -469,35 +471,24 @@ fn generator_resume(agent: &mut Agent, this: &Value, completion: Resume) -> Resu
             ));
         }
     };
-    match flag {
-        GeneratorFlag::Completed => iterator_result(agent, Value::Undefined, true),
-        GeneratorFlag::Executing => Err(JsError::new(
-            ErrorKind::TypeError,
-            "Generator is already running".into(),
-        )),
+    match state.flag {
+        GeneratorFlag::Completed => {
+            // Release the borrow before allocating the result object.
+            drop(state);
+            iterator_result(agent, Value::Undefined, true)
+        }
+        GeneratorFlag::Executing => {
+            drop(state);
+            Err(JsError::new(
+                ErrorKind::TypeError,
+                "Generator is already running".into(),
+            ))
+        }
         GeneratorFlag::SuspendedStart => {
-            let mut state = match state.try_borrow_mut() {
-                Ok(state) => state,
-                Err(_) => {
-                    return Err(JsError::new(
-                        ErrorKind::TypeError,
-                        "Generator is already running".into(),
-                    ));
-                }
-            };
             state.flag = GeneratorFlag::Executing;
             start_body(agent, &mut state, completion)
         }
         GeneratorFlag::SuspendedYield => {
-            let mut state = match state.try_borrow_mut() {
-                Ok(state) => state,
-                Err(_) => {
-                    return Err(JsError::new(
-                        ErrorKind::TypeError,
-                        "Generator is already running".into(),
-                    ));
-                }
-            };
             state.flag = GeneratorFlag::Executing;
             resume_body(agent, &mut state, completion)
         }

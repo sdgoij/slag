@@ -16624,3 +16624,22 @@ The guarded feedback splice looks like the same trap: `Op::CalleeEq` compares th
 | `o.m()` on a JS method (the compiled call lane) | 9.7 |
 
 So the resume is ~55 ns and the driver scaffolding another ~82 ns over the builtin lane. The larger half is not the machine-code resume: it is the per-`next()` driver, the `generators` map lookup, the `Rc` clone, the `RefCell` borrows and the `{value, done}` allocation. That is the next slice, because it needs no JIT-entry work and every `next()` pays it.
+
+### LANDED (2026-10-26): the generator driver's lookup
+
+The profile above put ~82 ns of every `next()` in the driver, not the resume, so the first slice took the cheapest part of it: the `AgentRoots::generators` table used the default `HashMap` (SipHash) for a single-`u64` key, and `GeneratorResume` read the flag under one borrow and then took a second for the run. The table now uses the crate's multiply-shift site hasher, and the two borrows are one fallible mutable borrow (a re-entrant `next()` still fails it, which is the spec's "already running" TypeError).
+
+Same-binary A/B against the previous build, 7 interleaved rounds, per-row minima:
+
+| probe | before | after | |
+| --- | ---: | ---: | ---: |
+| `g.next()` on a completed generator | 109.8 ns | **100.6 ns** | **-8.3%** |
+| `g.next()` on a suspended generator (the row) | 165.6 ns | **156.4 ns** | **-5.5%** |
+| `Object.is` control | 29.3 ns | 29.1 ns | -0.6% |
+| member call control | 9.8 ns | 9.7 ns | -0.5% |
+
+Corpus: `control/generator_loop.js` 33.09 -> 31.42 ms (-5.0%); every other `control` and `calls` row within noise.
+
+Gates: fmt; clippy `-D warnings`; `cargo test --workspace` (40 suites, 5,847 passed, 0 failed); sweeps 51,998 at 100%; corpus parity 0 (77 rows).
+
+What is left in the row, from the profile: the resume (~55 ns), the remaining table lookup and the `Rc` clone per call, and the `{value, done}` allocation. The next step is the state on the object (a new `ObjectKind` variant with its own trace arm), which removes the lookup and the clone together.
