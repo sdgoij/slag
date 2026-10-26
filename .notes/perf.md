@@ -16770,3 +16770,31 @@ Gates for the counters: `cargo fmt --all -- --check`; `cargo clippy
 5,847 passed, 0 failed); sweeps `language` 23,726 + `built-ins` 23,821 +
 `annexB` 1,086 + `intl402` 3,365 = 51,998 at 100%; corpus parity 0 (77 rows,
 mean-jitGap 10.66).
+
+### PGO: validated off the training set
+
+The -19.7% above was trained on the corpus it was measured on. Retrained with
+`opcost` (36 of the 77 rows) held out entirely, then measured:
+
+| rows | total | mean ratio |
+| --- | --- | ---: |
+| held out (36 `opcost` rows) | 356.8 -> 315.5 ms, **-11.56%** | 0.9598 |
+| trained on (41 rows) | 1725.5 -> 1411.3 ms, -18.20% | 0.8993 |
+| all 77 | 2082.2 -> 1726.9 ms, -17.07% | 0.9276 |
+
+Roughly two thirds of the effect survives on code the profiler never saw, which
+is what branch layout doing its job looks like; the rest is the profile being
+tuned to the rows it was gathered from. Three held-out micro rows get worse
+(`array_indexof` +19%, `array_fill` +11%, `array_reverse` +11%), all of them
+~2 ms rows where layout is close to a coin flip.
+
+`tools/pgo.sh --train` reproduces the whole thing: instrumented build, training
+over the given workloads, `llvm-profdata merge`, optimized build. It writes the
+profile to `target/pgo.profdata` and the binary to `target/pgo/release/`, and
+leaves `target/release` alone. A second run reproduced -19.67%, so the recipe is
+stable.
+
+Not made the default. PGO moves layout, so it cannot be mixed into an A/B of
+another change; it roughly doubles the build; and the profile is a build input
+that has to be regenerated when the corpus moves. Adopting it is a decision
+about the project's reported numbers, not only about speed.
