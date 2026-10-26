@@ -7,6 +7,21 @@ description: Write proper Git commit messages with subject line and descriptive 
 
 When asked to write a commit message, produce the entire message (subject + body) in your response. **Do not ask for clarification** — read the staged files or the diff and write the message yourself.
 
+## Style rules
+
+- **No em dashes.** Use commas, periods, colons or parentheses. An em dash reads
+  as a typographic flourish in prose and as noise in a subject; plain punctuation
+  is what people type. This applies to commit messages and to everything under
+  `.notes/`.
+- **No internal plan identifiers.** Phase, stage, slice, task and item numbers
+  (`phase4`, `4d-2`, `slice 3`, `item 7`) name a step in a planning document, not
+  a change in the tree. A reader of `git log` later cannot search for them,
+  cannot tell what they touched, and (outside the one document that numbers
+  them) they mean nothing. Say what the change does in the project's own terms
+  (`feat: serve a stock Wayland client from smithay`). If the number matters, it
+  belongs in the body, anchored to the document that defines it
+  (`.notes/wayland.md` 6.13).
+
 ## Format
 
 ```
