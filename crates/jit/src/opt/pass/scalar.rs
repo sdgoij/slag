@@ -89,8 +89,28 @@ fn one_pass(func: &mut Function, body: &CompiledBody) -> bool {
     // Array `.length` reads need a fresh `Const` in the (dominating) block; the
     // instruction cannot be inserted while the block is borrowed for the scan.
     let mut length_reads: Vec<(u32, ValueId, usize)> = Vec::new();
+    // Fields a `MemberStore` writes anywhere: a read of one must forward from a
+    // preceding store in its own block (the literal's value is stale), and a
+    // read with no such store bails.
+    let mut mutable: HashSet<(ValueId, u32)> = HashSet::new();
     for b in 0..func.block_count() as u32 {
         for inst in &func.block(b).insts {
+            let (Op::MemberStore, Imm::Atom(atom)) = (inst.op, &inst.imm) else {
+                continue;
+            };
+            if inst.args.len() != 2 {
+                continue;
+            }
+            let Some((root, false)) = root_of_any(inst.args[0], &objects, &arrays, &aliases) else {
+                continue;
+            };
+            mutable.insert((root, *atom));
+        }
+    }
+    for b in 0..func.block_count() as u32 {
+        let block_len = func.block(b).insts.len();
+        for i in 0..block_len {
+            let inst = &func.block(b).insts[i];
             let (Op::MemberGuard, Some(guard), Imm::Atom(atom)) = (inst.op, inst.result, &inst.imm)
             else {
                 continue;
@@ -132,8 +152,28 @@ fn one_pass(func: &mut Function, body: &CompiledBody) -> bool {
             let Some(entries) = objects.get(&object) else {
                 continue;
             };
-            let Some(&(_, value)) = entries.iter().find(|(key, _)| *key == *atom) else {
-                continue;
+            // A store earlier in this block is the field's live value; without
+            // one, the literal's value is right only when nothing writes the
+            // field.
+            let forwarded = func.block(b).insts[..i]
+                .iter()
+                .rposition(|x| x.result == Some(load) && x.op == Op::MemberCellLoad)
+                .and_then(|load_index| {
+                    forward_store_in_block(
+                        func, b, load_index, object, *atom, &objects, &arrays, &aliases,
+                    )
+                });
+            let value = match forwarded {
+                Some(value) => value,
+                None => {
+                    if mutable.contains(&(object, *atom)) {
+                        continue;
+                    }
+                    let Some(&(_, value)) = entries.iter().find(|(key, _)| *key == *atom) else {
+                        continue;
+                    };
+                    value
+                }
             };
             REPLACED.fetch_add(1, Ordering::Relaxed);
             subst[guard as usize] = Some(value);
@@ -186,8 +226,9 @@ fn one_pass(func: &mut Function, body: &CompiledBody) -> bool {
     }
     rewrite_uses(func, &subst);
     strip_instructions(func, &remove);
-    // The allocation is dead only when every read of it was replaced: then the
-    // slot stores that keep it alive can go too.
+    // The allocation is dead only when every read of it was replaced: then its
+    // field stores and the slot stores that keep it alive can go too.
+    drop_dead_member_stores(func, &replaced_objects, &objects, &arrays, &aliases);
     drop_dead_stores(func, &replaced_objects);
     strip_dead_literals(func, &replaced_objects);
     true
@@ -321,6 +362,40 @@ fn slot_aliases(func: &Function, roots: &HashSet<ValueId>) -> HashMap<ValueId, V
             }
         }
     }
+    // A slot stored exactly once, in the entry block, holds that value on every
+    // path to any load (the entry dominates every reached block), so a load
+    // anywhere aliases it. This is the `var o = {..}; for (...) { o.x }` shape:
+    // the store is in the preheader, every read in the loop body. A slot stored
+    // more than once, or outside the entry, keeps only the block-local aliases.
+    let entry = func.entry();
+    let mut single: HashMap<u32, Option<ValueId>> = HashMap::new();
+    for b in 0..func.block_count() as u32 {
+        for inst in &func.block(b).insts {
+            let (Op::FrameStore, Imm::Slot(slot), Some(value)) =
+                (inst.op, &inst.imm, inst.args.first().copied())
+            else {
+                continue;
+            };
+            let candidate = (b == entry && roots.contains(&value)).then_some(value);
+            single
+                .entry(*slot)
+                .and_modify(|slot_value| *slot_value = None)
+                .or_insert(candidate);
+        }
+    }
+    for (&slot, value) in &single {
+        let Some(object) = *value else { continue };
+        for b in 0..func.block_count() as u32 {
+            for inst in &func.block(b).insts {
+                if let (Op::FrameLoad, Imm::Slot(load_slot), Some(result)) =
+                    (inst.op, &inst.imm, inst.result)
+                    && *load_slot == slot
+                {
+                    aliases.insert(result, object);
+                }
+            }
+        }
+    }
     aliases
 }
 
@@ -354,6 +429,12 @@ fn escaping_literals(
                     Op::MemberCellLoad => inst.args.len() == 1 && inst.args[0] == arg,
                     Op::MemberGuard => inst.args.len() == 2 && inst.args[0] == arg,
                     Op::ElementLoad => inst.args.len() == 2 && inst.args[0] == arg,
+                    // A write to the object's own named field is not an escape
+                    // (the rewrite forwards the stored value); a store that uses
+                    // the object as the *value* escapes through its receiver.
+                    Op::MemberStore => {
+                        inst.args.len() == 2 && inst.args[0] == arg && objects.contains_key(&object)
+                    }
                     _ => false,
                 };
                 if !allowed {
@@ -450,6 +531,89 @@ fn load_for(func: &Function, value: ValueId) -> Option<(ValueId, u32, ValueId)> 
         }
     }
     None
+}
+
+/// The value a `MemberStore(root, atom, v)` earlier in the same block gave the
+/// field, for a read of `atom` on `root`. A computed store (an `ElementStore`)
+/// to the same object between the store and the read could write any field, so
+/// it bails; a store to a different named field does not clobber this one.
+#[allow(clippy::too_many_arguments)]
+fn forward_store_in_block(
+    func: &Function,
+    b: u32,
+    before_index: usize,
+    root: ValueId,
+    atom: u32,
+    objects: &HashMap<ValueId, Vec<(u32, ValueId)>>,
+    arrays: &HashMap<ValueId, Vec<ValueId>>,
+    aliases: &HashMap<ValueId, ValueId>,
+) -> Option<ValueId> {
+    for inst in func.block(b).insts[..before_index].iter().rev() {
+        if inst.args.len() < 2 {
+            continue;
+        }
+        match inst.op {
+            Op::MemberStore => {
+                if root_of_any(inst.args[0], objects, arrays, aliases) != Some((root, false)) {
+                    continue;
+                }
+                match &inst.imm {
+                    Imm::Atom(store_atom) if *store_atom == atom => return Some(inst.args[1]),
+                    _ => {}
+                }
+            }
+            Op::ElementStore
+                if root_of_any(inst.args[0], objects, arrays, aliases) == Some((root, false)) =>
+            {
+                return None;
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Remove the named field stores of a fully-replaced object. When every read of
+/// the object was replaced it is unobservable, so writing its fields is too;
+/// dropping the stores lets [`drop_dead_stores`] and [`strip_dead_literals`]
+/// remove the allocation. An object with any live member read keeps its stores.
+fn drop_dead_member_stores(
+    func: &mut Function,
+    replaced: &HashSet<ValueId>,
+    objects: &HashMap<ValueId, Vec<(u32, ValueId)>>,
+    arrays: &HashMap<ValueId, Vec<ValueId>>,
+    aliases: &HashMap<ValueId, ValueId>,
+) {
+    if replaced.is_empty() {
+        return;
+    }
+    let mut read_roots: HashSet<ValueId> = HashSet::new();
+    for b in 0..func.block_count() as u32 {
+        for inst in &func.block(b).insts {
+            if !matches!(
+                inst.op,
+                Op::MemberCellLoad | Op::MemberGuard | Op::ElementLoad
+            ) {
+                continue;
+            }
+            if let Some(arg) = inst.args.first().copied()
+                && let Some((root, _)) = root_of_any(arg, objects, arrays, aliases)
+            {
+                read_roots.insert(root);
+            }
+        }
+    }
+    for b in 0..func.block_count() as u32 {
+        func.block_mut(b).insts.retain(|inst| {
+            if inst.op != Op::MemberStore || inst.args.len() != 2 {
+                return true;
+            }
+            let Some((root, false)) = root_of_any(inst.args[0], objects, arrays, aliases) else {
+                return true;
+            };
+            !replaced.contains(&root) || read_roots.contains(&root)
+        });
+    }
 }
 
 /// Remove the slot stores that keep a fully-replaced object alive. A store is

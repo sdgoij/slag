@@ -2325,6 +2325,31 @@ mod tests {
     }
 
     #[test]
+    fn opt_tier_scalar_replaces_a_mutated_literal_field() {
+        // The `warm_store` shape: an object created before the loop, a field
+        // written and read inside it. The read must forward from the store (its
+        // literal value is stale), the slot aliases across the preheader into
+        // the loop, and the allocation disappears. A refactor that drops the
+        // cross-block alias or the store forward leaves this row 15x slower
+        // while staying correct, so the `REPLACED` delta pins the pass fired.
+        let source = "function f(n) { var s = 0; var o = { a: 0, b: 0 }; var i = 0;                       while (i < n) { o.b = i; s += o.b; i = i + 1; }                       return s; }                       f(1000);";
+        let interp = {
+            let mut agent = runtime::Agent::new();
+            agent.initialize_host_defined_realm().expect("realm");
+            agent.run_script(source).expect("interp runs")
+        };
+        let before = crate::opt::pass::scalar::REPLACED.load(Ordering::Relaxed);
+        let (value, compiled) = with_opt_jit_agent(|agent| agent.run_script(source).expect("runs"));
+        let replaced = crate::opt::pass::scalar::REPLACED.load(Ordering::Relaxed) - before;
+        assert_eq!(
+            value, interp,
+            "the optimizing tier must match the interpreter"
+        );
+        assert!(compiled >= 1, "{compiled} bodies compiled");
+        assert!(replaced >= 1, "the scalar pass replaced {replaced} reads");
+    }
+
+    #[test]
     fn opt_tier_call_body_matches_the_interpreter() {
         // I5c-0: a body with a `CallFast` now lifts to `Op::Call` and lowers
         // through the general `call_slow` helper, so a calling body enters the

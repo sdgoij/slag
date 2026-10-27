@@ -1,9 +1,12 @@
 # Scoping the next escape-analysis slice: a non-escaping object's mutable field
 
-**Status: design + probe, no code.** The first probe is the `SLAG_SCALAR` seam and
-a `JIT_DUMP_IR` of `objects/warm_store` (2026-10-27). The scalar-replacement pass
-it measures is `crates/jit/src/opt/pass/scalar.rs` (I6a in
-`optimizing-tier-impl.md` 6).
+**Status: landed 2026-10-27.** Measured: `objects/warm_store` 34.7 -> 9.3 ms
+(-73%), `objects/compound_assign` 43.9 -> 28.1 (-36%), `objects/destructure`
+3.6 -> 2.6 (-28%), corpus -1.85%; `.notes/perf.md` has the entry. The probe
+below is the pre-implementation record, kept because it names the shape and the
+falsifier. The pipeline also re-runs `narrow`/`mem2reg` after `scalar`, without
+which the elided object leaves a guard-poisoned `Unknown` accumulator as a
+generic tagged `Add`; that re-type is where most of the win is.
 
 ## What already exists
 

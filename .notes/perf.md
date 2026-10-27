@@ -17298,3 +17298,46 @@ forwarding, store-to-load forwarding for a virtual member, dead-object removal)
 is in `.notes/escape-scope.md`, with its falsifier. `construct_churn`
 (construct/method inline first) and `array_slice` (builtin inline first) are out
 of its reach by mechanism, not by effort.
+
+## LANDED (2026-10-27): the scalar pass elides a non-escaping object's mutable field, and re-types its accumulator
+
+The `.notes/escape-scope.md` slice, implemented. `opt/pass/scalar.rs` gains
+cross-block slot forwarding (a slot stored once in the entry block aliases the
+object at every load; the entry dominates every reached block), store-to-load
+forwarding for a virtual object's named field in its own block (a preceding
+`MemberStore(root, atom, v)` is the value; a computed `ElementStore` to the
+root bails), and dead-member-store removal. `escaping_literals` now allows a
+`MemberStore` whose *receiver* is the object (a write to its own field is not an
+escape; a store that uses the object as the value still escapes).
+
+The second half was the bigger win, and it is a pipeline fact the module doc
+missed: `narrow` and `mem2reg` run *before* `scalar`, so a guard whose result is
+`Unknown` poisons the accumulator's `Add` and the store that feeds the
+accumulator's slot, and `mem2reg` refuses to promote a slot with an `Unknown`
+store. Once `scalar` substitutes a typed value for the guard's result, the body
+can be typed, so the pipeline now re-runs `narrow` and `promote_frame_slots`
+after `scalar`, but only when scalar actually changed the body. The result is
+that `s += o.x` becomes a raw f64 `vaddsd` (`JIT_DUMP_CLIF`) instead of a generic
+tagged `Add`.
+
+Measured, 5 interleaved corpus rounds, per-row minima, against the previous
+commit: total 2053.3 -> 2015.4 ms (**-1.85%**); `objects/warm_store` 34.7 -> 9.3
+(**-73.1%**), `objects/compound_assign` 43.9 -> 28.1 (**-36.0%**),
+`objects/destructure` 3.6 -> 2.6 (**-28.0%**); controls flat (`opcost/baseline`
+-0.07%). The same-binary seams agree: `SLAG_SCALAR=0` vs on is 34.6 -> 9.3
+(-73.1%) on `warm_store` and 44.1 -> 27.9 (-36.6%) on `compound_assign`. Corpus
+parity 0 (77 rows), `mean-jitGap` 10.26 -> 10.12, the `objects` family 8.99 ->
+6.26.
+
+A new test, `opt_tier_scalar_replaces_a_mutated_literal_field`, pins the
+`warm_store` shape: the object created before the loop, a field written and read
+inside it, the tier matching the interpreter, and `REPLACED` advancing.
+
+Gates: fmt, `clippy -D warnings`, `cargo test --workspace`; test262 language
+23,726 + built-ins 23,821 + annexB 1,086 + intl402 3,365 at 100%.
+
+The `compound_assign` win is the re-type, not elision: its IR keeps the object
+(the `MemberStore` keeps it alive) but the arithmetic becomes f64. That says the
+re-type (typing an accumulator a guard poisoned) is a broad lever independent of
+the object, and is the mechanism the "consume the `numbers=true` proof" note was
+reaching for.

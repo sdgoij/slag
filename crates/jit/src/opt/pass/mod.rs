@@ -93,6 +93,16 @@ pub fn run(
     let cse = cse::run(func);
     let licm = licm::run(func);
     let scalarized = body.is_some_and(|body| scalar::run(func, body));
+    // `scalar` removes a read guard and substitutes a typed value for its result,
+    // which can newly prove a loop-carried accumulator numeric and promote a
+    // frame slot that the earlier `narrow`/`mem2reg` declined (its store read
+    // the guard, whose result is `Unknown`). Re-run them, but only when scalar
+    // actually changed the body, so no other row is disturbed.
+    let retyped_after_scalar = scalarized && {
+        let narrowed_again = narrow::run(func);
+        let promoted_again = mem2reg_enabled() && promote_frame_slots(func);
+        narrowed_again || promoted_again
+    };
     let dropped = dce_enabled() && dce::run(func);
     let counted = loop_counter::run(func);
     let retyped = normalize_param_types(func);
@@ -105,6 +115,7 @@ pub fn run(
         || cse
         || licm
         || scalarized
+        || retyped_after_scalar
         || dropped
         || counted
         || retyped
