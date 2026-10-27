@@ -468,28 +468,25 @@ Gap = Slag ms / V8 ms, so > 1 means V8 was faster:
 
 | Family | Workloads | JIT gap | Interpreter gap |
 |---|---|---|---|
-| arrays | 6 | 9.96x | 3.66x |
-| builtins | 5 | 7.84x | 4.33x |
-| calls | 6 | 9.57x | 5.36x |
-| control | 5 | 12.59x | 3.44x |
-| globals | 4 | 2.19x | 0.87x |
-| language | 3 | 6.09x | 5.40x |
-| objects | 7 | 9.36x | 2.62x |
-| opcost | 36 | 12.46x | 3.82x |
-| strings | 5 | 9.63x | 4.85x |
-| **All** | **77** | **10.54x** | **3.76x** |
+| arrays | 6 | 9.71x | 3.63x |
+| builtins | 5 | 7.62x | 4.23x |
+| calls | 6 | 8.62x | 5.10x |
+| control | 5 | 12.50x | 3.78x |
+| globals | 4 | 2.20x | 2.53x |
+| language | 3 | 5.53x | 5.26x |
+| objects | 7 | 8.99x | 2.42x |
+| opcost | 36 | 12.34x | 3.81x |
+| strings | 5 | 9.42x | 4.68x |
+| **All** | **77** | **10.26x** | **3.84x** |
 
-Measured 2026-10-25 at `ee72c0b8`, medians over three interleaved corpus rounds
-(host load moved one round's overall gap by ~20%, so the medians, not any single
-round, are the measurement). The commit before the security audit `883af3dd`
-reads 10.40x / 3.69x, and the audit-era measurement here was 10.76x / 3.88x; the
-recovery since then took `calls` from 10.92x to 9.57x and `language` from 6.50x
-to 6.09x, while `builtins` and `strings` drifted slightly the other way — both
-inside this host's noise. The declared-callee inline splice (`.notes/perf.md`,
-2026-10-25) then took `calls` to **9.09x** and the overall gap to 10.45x, and
-`calls/direct_leaf.js` from 10.47x to 6.70x — those two figures and the
-`direct_leaf` row above are one interleaved round at the landing commit, not
-medians of three, because this host's spread does not support a full refresh.
+Measured 2026-10-27 at the `Object.assign`/spread copy landing (uncommitted on
+`eb441c00`), one `bench.js` run after the change's interleaved A/B; the row
+that moved is `objects/spread_assign`, 117.3 -> 90.1 ms (the `objects` family
+9.36x -> 8.99x), and the `globals` interpreter column was load-sensitive in
+this run, which is why it reads 2.53x where earlier rounds read 0.87x. The
+previous table measured 2026-10-25 at `ee72c0b8` (10.54x / 3.76x); the commit
+before the security audit `883af3dd` reads 10.40x / 3.69x, and the audit-era
+measurement here was 10.76x / 3.88x.
 `.notes/perf-plan.md` records the measurements and `.notes/perf.md` the landed
 changes.
 

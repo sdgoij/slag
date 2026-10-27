@@ -852,16 +852,33 @@ pub(crate) fn copy_data_properties(
         kept.push(Value::Object(*to));
     }
     let result = (|| -> Result<(), JsError> {
-        for key in from_obj.own_property_keys()? {
-            let property = from_obj.get_own_property_key(&key)?;
-            if let Some(property) = property {
-                if !property.enumerable {
-                    continue;
-                }
-                let value = from_obj.get_key(&key)?;
-                agent.roots.kept_during_job.borrow_mut().push(value);
-                to.create_data_property_key(&key, value)?;
+        // A vector-free ordinary source reads its keys straight from the map,
+        // skipping `materialize_properties` and its three `Vec`s.
+        let ordinary_source = matches!(from_obj.kind, crux::object::ObjectKind::Ordinary);
+        let keys = match from_obj.own_string_data_keys() {
+            Some(keys) => keys,
+            None => from_obj.own_property_keys()?,
+        };
+        for key in keys {
+            let Some(property) = from_obj.get_own_property_key(&key)? else {
+                continue;
+            };
+            if !property.enumerable {
+                continue;
             }
+            let value = if ordinary_source {
+                match property.kind {
+                    crux::object::PropertyKind::Data { value, .. } => value,
+                    crux::object::PropertyKind::Accessor { get: Some(_), .. } => {
+                        from_obj.get_key(&key)?
+                    }
+                    crux::object::PropertyKind::Accessor { get: None, .. } => Value::Undefined,
+                }
+            } else {
+                from_obj.get_key(&key)?
+            };
+            agent.roots.kept_during_job.borrow_mut().push(value);
+            to.create_data_property_key(&key, value)?;
         }
         Ok(())
     })();

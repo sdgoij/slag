@@ -1209,6 +1209,93 @@ fn lower_inst(
                 .ins()
                 .iconst(types::I64, JsValue::Undefined.bits() as i64)
         }
+        // The per-iteration env machinery: the shared `load_per_iter`/
+        // `store_per_iter` helpers and the step-index env helpers.
+        Op::LoadPerIteration => {
+            let Imm::Context { depth, index } = &inst.imm else {
+                return Err(Unsupported::Step("opt:per-iter"));
+            };
+            let depth = builder.ins().iconst(types::I64, *depth as i64);
+            let slot = builder.ins().iconst(types::I64, *index as i64);
+            call_helper(
+                builder,
+                helpers,
+                abi,
+                abi.sig_unary,
+                Helper::LoadPerIter,
+                &[depth, slot],
+            )?
+        }
+        Op::StorePerIteration => {
+            let Imm::Context { depth, index } = &inst.imm else {
+                return Err(Unsupported::Step("opt:per-iter"));
+            };
+            let value = arg!(0);
+            let depth = builder.ins().iconst(types::I64, *depth as i64);
+            let slot = builder.ins().iconst(types::I64, *index as i64);
+            call_helper(
+                builder,
+                helpers,
+                abi,
+                abi.sig_binary,
+                Helper::StorePerIter,
+                &[depth, slot, value],
+            )?;
+            builder
+                .ins()
+                .iconst(types::I64, JsValue::Undefined.bits() as i64)
+        }
+        Op::EnterPerIteration => {
+            let Imm::Int(step) = inst.imm else {
+                return Err(Unsupported::Step("opt:per-iter"));
+            };
+            let step_imm = builder.ins().iconst(types::I64, step as i64);
+            call_helper(
+                builder,
+                helpers,
+                abi,
+                abi.sig_bool,
+                Helper::EnterPerIteration,
+                &[step_imm],
+            )?;
+            builder
+                .ins()
+                .iconst(types::I64, JsValue::Undefined.bits() as i64)
+        }
+        Op::PerIteration => {
+            let Imm::Int(step) = inst.imm else {
+                return Err(Unsupported::Step("opt:per-iter"));
+            };
+            let step_imm = builder.ins().iconst(types::I64, step as i64);
+            call_helper(
+                builder,
+                helpers,
+                abi,
+                abi.sig_bool,
+                Helper::PerIteration,
+                &[step_imm],
+            )?;
+            builder
+                .ins()
+                .iconst(types::I64, JsValue::Undefined.bits() as i64)
+        }
+        Op::LeaveBlock => {
+            call_helper(builder, helpers, abi, abi.sig_tdz, Helper::LeaveBlock, &[])?;
+            builder
+                .ins()
+                .iconst(types::I64, JsValue::Undefined.bits() as i64)
+        }
+        Op::TypeofTop => {
+            let value = arg!(0);
+            call_helper(
+                builder,
+                helpers,
+                abi,
+                abi.sig_bool,
+                Helper::TypeofTop,
+                &[value],
+            )?
+        }
         // The template-literal literals (`PushStr`/`ConcatStr`/
         // `ConcatStrConst`) and `TaggedTemplate`: the same helpers the
         // per-step route calls, with the quasi payload read back from the

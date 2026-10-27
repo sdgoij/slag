@@ -1557,16 +1557,42 @@ fn object_assign(agent: &mut Agent, args: &[Value]) -> Result<Value, JsError> {
         let Some(source) = as_object(&source_value) else {
             continue;
         };
-        for key in source.own_property_keys()? {
-            if let Some(prop) = source.get_own_property_key(&key)?
-                && prop.enumerable
-            {
-                // The receiver is the coerced source, so a getter sees the
-                // function rather than its object part.
-                let value =
-                    crate::context::get_property_key(agent, &source_value, &key, source_value)?;
-                target.set_key(&key, value, true)?;
+        // A vector-free ordinary source reads its keys straight from the map,
+        // skipping `materialize_properties` and its three `Vec`s; the snapshot
+        // is exactly what `own_property_keys` returns, so a destination `[[Set]]
+        // that runs user code cannot invalidate the iteration. Any shape the
+        // fast path cannot describe (a symbol or index key, an accessor-bearing
+        // vector) falls back to the generic enumeration.
+        let keys = match source.own_string_data_keys() {
+            Some(keys) => keys,
+            None => source.own_property_keys()?,
+        };
+        let ordinary_source = matches!(source.kind, crux::object::ObjectKind::Ordinary);
+        for key in keys {
+            let Some(prop) = source.get_own_property_key(&key)? else {
+                continue;
+            };
+            if !prop.enumerable {
+                continue;
             }
+            // Spec 20.1.2.1 step 4.c.ii invokes `[[Get]]` with the coerced
+            // source as receiver, which matters only for an accessor. An
+            // ordinary source's own data property already carries its value in
+            // the descriptor, so the common case skips the generic get (and its
+            // second lookup); a proxy, namespace, or host source always takes
+            // the generic path.
+            let value = if ordinary_source {
+                match prop.kind {
+                    crux::object::PropertyKind::Data { value, .. } => value,
+                    crux::object::PropertyKind::Accessor { get: Some(_), .. } => {
+                        crate::context::get_property_key(agent, &source_value, &key, source_value)?
+                    }
+                    crux::object::PropertyKind::Accessor { get: None, .. } => Value::Undefined,
+                }
+            } else {
+                crate::context::get_property_key(agent, &source_value, &key, source_value)?
+            };
+            target.set_key(&key, value, true)?;
         }
     }
     Ok(target_value)

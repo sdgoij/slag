@@ -2197,6 +2197,23 @@ extern "C" fn call_slow(
             _ => {}
         }
     }
+    call_slow_funnel(ctx, callee, this, argc, args, direct_eval)
+}
+
+/// The interpreter funnel for a call none of [`call_slow`]'s lanes inlined.
+/// Outlined and marked cold so a call the self/certified/builtin lanes handle
+/// keeps the `vm.stack` round trip and `do_call_fast` off its icache path (PGO:
+/// 61% of `call_slow`'s blocks never run under the corpus).
+#[cold]
+#[inline(never)]
+fn call_slow_funnel(
+    ctx: &mut JitCallContext,
+    callee: u64,
+    this: u64,
+    argc: u64,
+    args: *mut u64,
+    direct_eval: u64,
+) -> u64 {
     let argc = argc as usize;
     let agent = unsafe { &mut *ctx.agent };
     let vm = unsafe { &mut *ctx.vm };
@@ -2350,6 +2367,38 @@ fn self_call_inline(ctx: &mut JitCallContext, args: *mut u64, argc: u64) -> Opti
     Some(result)
 }
 
+/// The cold half of [`certified_lane_inline`]: a call site without a cached
+/// verdict compiles (or promotes) the callee through the shared choke point.
+/// Outlined and marked cold so the cached lane's hot path does not carry the
+/// compile path's blocks (PGO: 77% of `certified_lane_inline` never runs).
+#[cold]
+#[inline(never)]
+fn certified_lane_compile(
+    hook: JitHook,
+    body: &std::rc::Rc<CompiledBody>,
+    frame_size: usize,
+) -> Option<(JitEntry, usize, usize)> {
+    let info_ptr = lookup_info(hook, body, true);
+    if info_ptr.is_null() {
+        return None;
+    }
+    // SAFETY: `lookup_info` just returned the cache's live entry, and no frame
+    // is in flight to evict it (`in_flight` was true).
+    let info = unsafe { &*info_ptr };
+    // A deopt-bearing callee must not run in this lane: unlike the probe path
+    // (`certified_verdict`) and `leaf_call_probe`, this derived fallback has no
+    // deopt path of its own, so a `DISPATCH_DEOPT` from the callee would be
+    // returned to the caller as if it were the call's result. Refuse, and let
+    // the caller funnel through the interpreter, which resumes the deopt
+    // (`run_jit_body`).
+    if info.deopts {
+        return None;
+    }
+    // SAFETY: `info.entry` is a code pointer the cache owns.
+    let entry: JitEntry = unsafe { std::mem::transmute(info.entry) };
+    Some((entry, info.stack_usage, frame_size))
+}
+
 /// The shared certified-body lane: a call (`construct == false`) or a base
 /// constructor (`construct == true`) to a *different* certified body runs its
 /// machine code directly on this ctx, with a nested frame carved from
@@ -2470,25 +2519,12 @@ fn certified_lane_inline(
     } else {
         // Compile (or promote) through the same choke point every other JIT
         // site uses; a below-threshold or sticky-refused body falls back here.
-        let info_ptr = lookup_info(hook, &body, true);
-        if info_ptr.is_null() {
+        // Outlined and cold: a hot call whose site cached the verdict never
+        // reaches it (PGO: 77% of this function's blocks never run).
+        let Some(triple) = certified_lane_compile(hook, &body, scope.frame_size) else {
             return Ok(None);
-        }
-        // SAFETY: `lookup_info` just returned the cache's live entry, and no
-        // frame is in flight to evict it (`in_flight` was true).
-        let info = unsafe { &*info_ptr };
-        // A deopt-bearing callee must not run in this lane: unlike the probe
-        // path (`certified_verdict`) and `leaf_call_probe`, this derived
-        // fallback has no deopt path of its own, so a `DISPATCH_DEOPT` from the
-        // callee would be returned to the caller as if it were the call's
-        // result. Refuse, and let the caller funnel through the interpreter,
-        // which resumes the deopt (`run_jit_body`).
-        if info.deopts {
-            return Ok(None);
-        }
-        // SAFETY: `info.entry` is a code pointer the cache owns.
-        let entry: JitEntry = unsafe { std::mem::transmute(info.entry) };
-        (entry, info.stack_usage, scope.frame_size)
+        };
+        triple
     };
     let argc = argc as usize;
     // SAFETY: the JIT passes a pointer into its own live stack buffer with

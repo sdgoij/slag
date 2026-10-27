@@ -81,10 +81,18 @@ fn is_numeric_inst(inst: &Inst, values: &[bool], slot_numeric: &[bool]) -> bool 
         // A guard asserts its value's type, so a `Number` guard produces a
         // Number (and lets a slot stored only guarded reads stay numeric).
         Op::GuardType => inst.ty.is_numeric(),
-        Op::FrameLoad => matches!(
-            inst.imm,
-            Imm::Slot(s) if slot_numeric.get(s as usize).copied().unwrap_or(false)
-        ),
+        // A frame load is numeric either when the slot fixpoint proves the slot
+        // holds a Number, or when the lift declared it Number because a runtime
+        // proof (the LICM hoist guard's `numbers=true` arm) establishes it at
+        // loop entry. The declared type is the hoist guard's proof reaching the
+        // value lattice; the lift must only declare it when it has such a proof.
+        Op::FrameLoad => {
+            inst.ty.is_numeric()
+                || matches!(
+                    inst.imm,
+                    Imm::Slot(s) if slot_numeric.get(s as usize).copied().unwrap_or(false)
+                )
+        }
         Op::Add | Op::Sub | Op::Mul | Op::Div | Op::Mod | Op::Pow | Op::Neg | Op::ToNumber => {
             !inst.args.is_empty() && inst.args.iter().all(arg_numeric)
         }
@@ -661,6 +669,73 @@ mod tests {
                 entry,
                 Op::Add,
                 &[s, guarded],
+                Type::Unknown,
+                Effects::call(),
+                Imm::None,
+            );
+            b.emit_void(
+                entry,
+                Op::FrameStore,
+                &[add],
+                Effects::write(crate::opt::ir::Heap::Slots),
+                Imm::Slot(0),
+            );
+            b.term(entry, Term::Return(Some(add)));
+        }
+        run(&mut func);
+        assert!(op_effects(&func, Op::Add).expect("add").is_pure());
+    }
+
+    #[test]
+    fn a_number_declared_frame_load_makes_its_consumer_numeric() {
+        // The LICM hoist guard's `numbers=true` arm proves a hoisted RHS result
+        // slot holds a Number at loop entry, so the fast copy's `FrameLoad` of
+        // that slot is declared `Number` even though the slot's store (an `Add`
+        // of untyped member reads) is not provably numeric. The declared type is
+        // the proof reaching the value lattice: the consuming `Add` must narrow
+        // so `unbox` keeps the accumulator in an f64 register.
+        let mut func = Function::new();
+        let entry = func.entry();
+        let add;
+        {
+            let mut b = Builder::new(&mut func);
+            let zero = b.emit(
+                entry,
+                Op::Const,
+                &[],
+                Type::Number,
+                Effects::pure(),
+                Imm::Float(0.0),
+            );
+            b.emit_void(
+                entry,
+                Op::FrameStore,
+                &[zero],
+                Effects::write(crate::opt::ir::Heap::Slots),
+                Imm::Slot(0),
+            );
+            let s = b.emit(
+                entry,
+                Op::FrameLoad,
+                &[],
+                Type::Unknown,
+                Effects::read(crate::opt::ir::Heap::Slots),
+                Imm::Slot(0),
+            );
+            // The number-guarded hoisted RHS result slot: declared Number by
+            // the lift on the guard's hit path.
+            let hoisted = b.emit(
+                entry,
+                Op::FrameLoad,
+                &[],
+                Type::Number,
+                Effects::read(crate::opt::ir::Heap::Slots),
+                Imm::Slot(1),
+            );
+            add = b.emit(
+                entry,
+                Op::Add,
+                &[s, hoisted],
                 Type::Unknown,
                 Effects::call(),
                 Imm::None,

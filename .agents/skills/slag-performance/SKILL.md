@@ -147,15 +147,15 @@ trade-off.** Report the failing fixture and revert; do not commit around it.
 
 ### 4.1 Headline
 
-77 corpus rows, all four modes agree: **JIT gap 10.55x, interpreter gap
-3.79x**. The second number is the important one: Slag's interpreter is within
-3.8x of V8's, while its compiled code is 10.5x off. V8's tier-on-tier gain is
+77 corpus rows, all four modes agree: **JIT gap 10.26x, interpreter gap 3.84x**
+(2026-10-27; was 10.55 / 3.79 the day before). The second number is the important one: Slag's interpreter is within
+3.8x of V8's, while its compiled code is 10.3x off. V8's tier-on-tier gain is
 therefore about 2.8x larger than Slag's. The deficit is in what the optimizing
 tier does with a body, not in the cost of a single runtime operation.
 
-Per family (README, 2026-10-25): globals 2.19x, language 6.09x, builtins
-7.84x, objects 9.36x, calls 9.57x, strings 9.63x, arrays 9.96x, control
-12.59x, opcost 12.46x.
+Per family (README, 2026-10-27): globals 2.18x, language 5.40x, builtins 7.60x,
+objects 9.10x, calls 8.75x, strings 9.65x, arrays 9.79x, control 12.23x,
+opcost 12.56x.
 
 ### 4.2 Per-operation cost (ns per operation, one process per row, minima)
 
@@ -227,6 +227,7 @@ the proof. The proof is the priced next slice; see section 7.
 | Closure record 408 -> 200 bytes (per-site source, `ClassParts`, shared capture chains) | 300k-closure probe 106.65 -> 75.8 ms; for-in head-let row about -11% across the stages |
 | Generator `next()` driver | 155 ns per `next()` (about 55 resume, 70 driver, 49 result object) |
 | Dense array store (`buildString` shape) | 600-700 ms -> 42-52 ms JIT |
+| `Object.assign`/spread own-data copy: read the descriptor value, and enumerate a vector-free ordinary source from its map (`own_string_data_keys`) instead of `materialize_properties` + three `Vec`s | `objects/spread_assign` 117.3 -> 90.1 ms (-23%), `Object.assign` 101 -> 78 ms; corpus mean-jitGap 10.51 -> 10.26 |
 | Global read cells (declarative record, nested bodies) | top-level `const` 52.5 -> about 2.4 ms per 1M; nested helper 130.2 -> 2.5 ms |
 | Map key-index mixer (Goats) | `mapget` -29%, `maphas` -37% |
 | Optimizing-tier GC safe point | a lifted allocating loop had no safepoint and a 46 ms pause; fixed |

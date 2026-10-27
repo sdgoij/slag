@@ -4310,6 +4310,40 @@ impl JsObject {
         true
     }
 
+    /// The own string data keys of a vector-free ordinary object, read
+    /// straight from its map descriptors with no `materialize_properties` and
+    /// only the one result allocation. `None` when the object is not this
+    /// shape: any other kind, an already-materialized object, an array-index or
+    /// symbol key (both must enumerate in their own positions, which the
+    /// descriptor order does not provide), or an out-of-line field. The caller
+    /// then falls back to [`Self::own_property_keys`].
+    ///
+    /// This exists for the own-data-property copy (`Object.assign`, object
+    /// spread), which otherwise pays `materialize_properties` plus three `Vec`s
+    /// for an object it only reads. The list is a snapshot, exactly as
+    /// `own_property_keys` is, so a `[[Set]]` on the destination that runs user
+    /// code cannot invalidate the iteration.
+    pub fn own_string_data_keys(&self) -> Option<Vec<PropertyKey>> {
+        if !matches!(self.kind, ObjectKind::Ordinary) || !self.props_deferred.get() {
+            return None;
+        }
+        let map = self.map.get()?;
+        let mut keys = Vec::with_capacity(map.descriptor_count());
+        for ord in 0..map.descriptor_count() {
+            let Some((key, offset, _)) = map.descriptor_at(ord) else {
+                break;
+            };
+            if offset >= INLINE_FIELDS
+                || !matches!(key, PropertyKey::String(_))
+                || array_index_of(&key).is_some()
+            {
+                return None;
+            }
+            keys.push(key.clone());
+        }
+        Some(keys)
+    }
+
     pub fn own_string_props(&self) -> Option<Vec<(PropertyKey, bool)>> {
         if !matches!(self.kind, ObjectKind::Ordinary) {
             return None;

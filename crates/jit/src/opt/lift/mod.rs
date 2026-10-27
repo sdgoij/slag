@@ -711,6 +711,14 @@ fn stack_delta(step: &Step) -> Result<i32, Unsupported> {
         | Step::ForOfNext { .. }
         | Step::ForInNext { .. }
         | Step::ForOfNextBindLocal { .. } => 0,
+        // The per-iteration env machinery: the env steps are value-neutral,
+        // the slot read/write push/pop a value.
+        Step::EnterPerIteration { .. }
+        | Step::PerIteration { .. }
+        | Step::LeaveBlock
+        | Step::TypeofTop => 0,
+        Step::LoadPerIteration { .. } => 1,
+        Step::StorePerIteration { .. } => -1,
         other => return Err(Unsupported::Step(step_name(other))),
     })
 }
@@ -1164,6 +1172,75 @@ fn emit_step(
                     index: *index as u32,
                 },
             );
+        }
+        // The per-iteration env machinery (a captured for-head binding): the
+        // env steps are step-index helpers (no value), the slot read/write go
+        // through the shared `load_per_iter`/`store_per_iter` helpers.
+        Step::LoadPerIteration { depth, index } => {
+            let v = builder.emit(
+                block,
+                Op::LoadPerIteration,
+                &[],
+                Type::Unknown,
+                Op::LoadPerIteration.default_effects(),
+                Imm::Context {
+                    depth: *depth as u32,
+                    index: *index as u32,
+                },
+            );
+            stack.push(v);
+        }
+        Step::StorePerIteration { depth, index } => {
+            let value = stack.pop().ok_or(Unsupported::Stack)?;
+            builder.emit_void(
+                block,
+                Op::StorePerIteration,
+                &[value],
+                Op::StorePerIteration.default_effects(),
+                Imm::Context {
+                    depth: *depth as u32,
+                    index: *index as u32,
+                },
+            );
+        }
+        Step::EnterPerIteration { .. } => {
+            builder.emit_void(
+                block,
+                Op::EnterPerIteration,
+                &[],
+                Op::EnterPerIteration.default_effects(),
+                Imm::Int(index as i32),
+            );
+        }
+        Step::PerIteration { .. } => {
+            builder.emit_void(
+                block,
+                Op::PerIteration,
+                &[],
+                Op::PerIteration.default_effects(),
+                Imm::Int(index as i32),
+            );
+        }
+        Step::LeaveBlock => {
+            builder.emit_void(
+                block,
+                Op::LeaveBlock,
+                &[],
+                Op::LeaveBlock.default_effects(),
+                Imm::None,
+            );
+        }
+        Step::TypeofTop => {
+            let value = stack.pop().ok_or(Unsupported::Stack)?;
+            let v = builder.emit(
+                block,
+                Op::TypeofTop,
+                &[value],
+                Type::Unknown,
+                Op::TypeofTop.default_effects(),
+                Imm::None,
+            );
+            stack.push(v);
         }
         // `x++`/`x--` on a frame slot: read, update (`Op::UpdateValue` keeps
         // the inline Number path and the BigInt-aware helper fallback), store,

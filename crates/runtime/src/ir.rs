@@ -15664,33 +15664,16 @@ impl Vm {
     /// bodies' contexts. Per-iteration environments are skipped — they hold
     /// only the loop-head names, so a capture-free closure created inside a
     /// loop still reaches its enclosing body's context.
+    ///
+    /// The hot shape is a depth-0 read of a non-transparent env (one check);
+    /// the transparent-env walk and the depth walk are outlined (the PGO block
+    /// census puts this function at 83% cold).
     pub(crate) fn context_chain_env(&self, depth: usize) -> Result<EnvRef, JsError> {
-        let mut env = self.body_context_env();
-        loop {
-            if !is_context_transparent(&env) {
-                break;
-            }
-            env = env.outer().ok_or_else(|| {
-                JsError::new(
-                    ErrorKind::ReferenceError,
-                    "No outer environment for a capture-context binding".into(),
-                )
-            })?;
+        let env = self.body_context_env();
+        if depth == 0 && !is_context_transparent(&env) {
+            return Ok(env);
         }
-        for _ in 0..depth {
-            loop {
-                env = env.outer().ok_or_else(|| {
-                    JsError::new(
-                        ErrorKind::ReferenceError,
-                        "No outer environment for a capture-context binding".into(),
-                    )
-                })?;
-                if !is_context_transparent(&env) {
-                    break;
-                }
-            }
-        }
-        Ok(env)
+        context_chain_env_cold(env, depth)
     }
 
     /// Enter `frame`'s `finally` for the deferred `ctl`: the frame is already
@@ -24276,6 +24259,39 @@ fn is_context_transparent(env: &EnvRef) -> bool {
         EnvRecord::Slot(e) => e.context_transparent(),
         _ => false,
     }
+}
+
+/// The cold half of [`Vm::context_chain_env`]: the transparent-env walk and the
+/// `depth` walk. Outlined so a depth-0 read of a non-transparent env (the hot
+/// shape) does not carry the walk's blocks on its per-read path.
+#[cold]
+#[inline(never)]
+fn context_chain_env_cold(mut env: EnvRef, depth: usize) -> Result<EnvRef, JsError> {
+    loop {
+        if !is_context_transparent(&env) {
+            break;
+        }
+        env = env.outer().ok_or_else(|| {
+            JsError::new(
+                ErrorKind::ReferenceError,
+                "No outer environment for a capture-context binding".into(),
+            )
+        })?;
+    }
+    for _ in 0..depth {
+        loop {
+            env = env.outer().ok_or_else(|| {
+                JsError::new(
+                    ErrorKind::ReferenceError,
+                    "No outer environment for a capture-context binding".into(),
+                )
+            })?;
+            if !is_context_transparent(&env) {
+                break;
+            }
+        }
+    }
+    Ok(env)
 }
 
 pub fn is_compound_assign(op: &AssignOp) -> bool {

@@ -1596,8 +1596,22 @@ pub fn disable_stress_collector() {
 /// Run the stress collector after an allocation (GC-2). No-op when stress is
 /// off, when no collector is registered (outside an agent window), or when a
 /// collection is already running (the mark/sweep must not re-enter itself).
+///
+/// The hot path is the single stress-flag read; the collector body is outlined
+/// so a normal (non-stress) run keeps it out of the per-allocation path
+/// (`.notes/perf.md`, the PGO block census: this function is 94% cold).
+#[inline]
 fn maybe_stress_collect(fresh: GcAny) {
-    if !STRESS.with(|stress| stress.get()) || COLLECTING.with(|collecting| collecting.get()) {
+    if !STRESS.with(|stress| stress.get()) {
+        return;
+    }
+    stress_collect_cold(fresh);
+}
+
+#[cold]
+#[inline(never)]
+fn stress_collect_cold(fresh: GcAny) {
+    if COLLECTING.with(|collecting| collecting.get()) {
         return;
     }
     COLLECTING.with(|collecting| collecting.set(true));

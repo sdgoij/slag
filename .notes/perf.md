@@ -17100,3 +17100,108 @@ is `numbers=true` and establishes the invariant operand's type at loop entry,
 and the optimizing tier ignores it. Consuming that proof (typing the hoisted
 slot, then letting the slot fixpoint type the accumulator) is the next slice to
 price; typed loops in the same tier already run at 0.8 ns per iteration.
+
+## NULL (2026-10-26): re-derived the hoist guard with `numbers=true` typing — correct, still does not pay
+
+Re-derived the reverted `SLAG_OPT_HOIST` faithfully (an `Op::HoistGuard` helper,
+the three-copy lift, and a `narrow` change that trusts a `Number`-declared
+`FrameLoad`), measured it, and reverted the guard modelling again. The
+`numbers=true` typing works — the fast copy's `FrameLoad` of the RHS-result slot
+is now `Number` (`v12:num = FrameLoad() slot5`) — but `own_read` reads 9.16 ms vs
+2.92 ms default (+213%), the same pessimization.
+
+The root cause is one layer deeper than the note above assumes. The three-copy
+hoist shares the accumulator frame slot `slot1` across the fast/read-only/general
+copies; the read-only and general copies store non-Number values to it, so
+`narrow`'s global per-slot fixpoint types `slot1` Unknown and `mem2reg`'s global
+`non_heap_slots` refuses to promote it. The fast copy's accumulator stays
+`v11:? = FrameLoad() slot1` + a generic `Add`, whatever the RHS slot's type is.
+
+"Type the hoisted-slot `FrameLoad`" is therefore necessary but NOT sufficient:
+it types the RHS sum, not the loop-carried accumulator. A distinct fast-copy
+accumulator slot does not rescue it either — its copy-in `s_fast = s` reads the
+contaminated `slot1`, so `s_fast` stays Unknown. The fix needs a per-block type
+lattice (the accumulator is Number only on the fast-copy path) feeding a
+per-block `mem2reg`, or a bytecode change that tracks the accumulator's pre-loop
+value as a Number.
+
+Kept: the `narrow` change (`is_numeric_inst(FrameLoad)` trusts a
+`Number`-declared `FrameLoad`) plus its regression test, as the named
+prerequisite.
+
+## NULL (2026-10-27): the per-iteration env lift compiles the hot body and does not pay
+
+Finished the in-flight lift of the per-iteration env machinery
+(`EnterPerIteration`/`PerIteration`/`LoadPerIteration`/`StorePerIteration`/
+`LeaveBlock`/`TypeofTop`) into the optimizing tier. It works: the `for-in`
+head-let row's hot body (`__t262Body`) now lifts (`JIT_DUMP_IR` shows its
+`ForInBegin`/`ForInNext`/`EnterPerIteration`/`StorePerIteration`/
+`LoadPerIteration`/`PerIteration`/`TypeofTop` ops); the only body still refused
+is the cold `is` helper, on `BinaryImm { StrictNotEqual }`.
+
+It does not pay. The same-binary seam (`SLAG_OPT=0`, 7 interleaved rounds on
+`scratch/one`), per-row minima: optimizing **390.9 ms** against the per-step
+tier's **385.7 ms**, so promoting the hot body is 1.3-2.1% *slower*. The row is
+allocation-bound (a per-iteration env record plus a capturing closure plus six
+`assert.sameValue` calls per body), so compiling the loop does not remove the
+cost, which is the `jit-quality-plan.md` prediction; the corpus total is
+neutral. The lift is kept as correct infrastructure for the day the
+optimizing tier's scalar loop is competitive, and is recorded here so the next
+reader does not re-derive it as a win.
+
+## NULL (2026-10-27): outlining `call_slow` and `certified_lane_inline`'s cold halves
+
+The PGO census (2026-10-26) named these two call-lane functions as 61% and 77%
+cold by static block. Extracted `call_slow`'s interpreter funnel into a `#[cold]
+call_slow_funnel` and `certified_lane_inline`'s compile path into a `#[cold]
+certified_lane_compile`. Measured against the two-function-outline tree, 5
+interleaved corpus rounds, per-row minima: total **-0.13%** (2089.6 -> 2086.9 ms),
+inside the 0.3% corpus noise floor, with the controls flat. Corroborates the
+census's own caveat that one outlined branch does not move a corpus total; the
+outlines are kept because the cold halves are genuinely cold and the hot
+functions are tighter, but the change is a NULL by the wall-clock bar.
+
+## LANDED (2026-10-27): `Object.assign`/spread copy own string data properties without materializing
+
+The second-largest absolute-excess row, `objects/spread_assign` (119.6 ms
+against node's 23.2), is almost entirely `Object.assign({}, o)` over a
+3-property fresh object literal. Probes (200k iterations, one row per
+`--corpus`): a manual `p.x=o.x; p.y=o.y; p.z=o.z` is **35 ms**, `Object.assign`
+is **101 ms**, so the builtin copy costs ~500 ns/call against ~175 ns for the
+same three defines. `Object.keys` on the same object is 104 ms, so the shared
+cost is the enumeration.
+
+Two changes, both in the own-property copy:
+
+- **The descriptor's value.** For an ordinary source, `get_own_property_key`
+already returned `PropertyKind::Data { value, .. }`; the loop re-read the value
+with a generic `[[Get]]` (`get_property_key`/`get_key`), a second lookup. Use
+the descriptor value for a data property, keep the generic get for an accessor
+(the receiver matters) and for every non-ordinary source (a proxy, module
+namespace, or host object's `[[Get]]` is not its descriptor). -5.8% on the row.
+- **The key list.** `own_property_keys` -> `ordinary_own_property_keys` calls
+`materialize_properties` (a vector-free object becomes a `properties` vector)
+and builds three `Vec`s plus a clone per key. `JsObject::own_string_data_keys`
+returns the keys straight from the map descriptors when the object is a
+vector-free ordinary object with only string, non-index keys, and `None`
+otherwise (a symbol or index key must enumerate in its own position, and an
+accessor-bearing vector is not this shape) so the caller falls back to the
+generic list. The result is still a snapshot, so a destination `[[Set]]` that
+runs user code cannot invalidate the iteration. `object_assign` and
+`copy_data_properties` (object spread) both take it.
+
+Measured, 5 interleaved corpus rounds, per-row minima, against the
+descriptor-value-only tree: total **-0.61%**, `objects/spread_assign`
+**-19.90%** (112.5 -> 90.1 ms); controls flat (`opcost/baseline` -0.30%,
+`objects/warm_store` +0.09%). Cumulative on the row from before the pair:
+117.3 -> 90.1 ms (**-23%**), and `Object.assign` itself 101 -> 78 ms.
+
+Corpus after both: `mean-jitGap` **10.51 -> 10.26**, `mean-jlGap` 3.74 -> 3.84
+(the jitless column is load-sensitive; the change is on the shared builtin, so
+it serves both tiers), `mismatches=0`. Gates: fmt, `clippy -D warnings`,
+`cargo test --workspace` all green.
+
+Lead for the next slice: `Object.keys` still pays the same
+`own_property_keys`/materialize path (104 ms for 3 keys), and
+`ordinary_own_property_keys` still builds three `Vec`s. `own_string_data_keys`
+is the non-materializing enumeration it could share.

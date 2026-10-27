@@ -277,6 +277,23 @@ pub enum Op {
     /// A context slot init (`Step::InitContextSlot`), lowered through
     /// `init_context`; `args = [value]`.
     ContextInit,
+    /// A per-iteration env read (`Step::LoadPerIteration`): `imm` is the
+    /// `(depth, index)` into the captured for-head binding's env chain.
+    LoadPerIteration,
+    /// A per-iteration env write (`Step::StorePerIteration`): `args = [value]`,
+    /// `imm` the `(depth, index)`.
+    StorePerIteration,
+    /// A fresh per-iteration env is pushed (`Step::EnterPerIteration`): `imm` is
+    /// the step index (the helper reads the head names back from the body).
+    EnterPerIteration,
+    /// The per-iteration env is replaced with a fresh copy
+    /// (`Step::PerIteration`): `imm` is the step index.
+    PerIteration,
+    /// Pop a block environment (`Step::LeaveBlock`): no value, no payload.
+    LeaveBlock,
+    /// `typeof` of a value operand (`Step::TypeofTop`): `args = [value]`, the
+    /// result the `typeof` string.
+    TypeofTop,
     MemberLoad,
     MemberStore,
     /// A speculative member-value cell load: `object`'s `atom` data-property
@@ -434,7 +451,8 @@ impl Op {
             | Op::Check
             | Op::GuardType
             | Op::GuardCallee
-            | Op::CalleeEq => E::pure(),
+            | Op::CalleeEq
+            | Op::TypeofTop => E::pure(),
             Op::TdzCheck => E::read(Heap::Slots),
             Op::FrameLoad => E::read(Heap::Slots),
             Op::FrameStore => E::write(Heap::Slots),
@@ -491,6 +509,11 @@ impl Op {
             | Op::ContextLoad
             | Op::ContextStore
             | Op::ContextInit
+            | Op::LoadPerIteration
+            | Op::StorePerIteration
+            | Op::EnterPerIteration
+            | Op::PerIteration
+            | Op::LeaveBlock
             | Op::StringPush
             | Op::StringConcat
             | Op::StringConcatConst
