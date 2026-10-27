@@ -1050,6 +1050,7 @@ fn object_entries(agent: &mut Agent, args: &[Value]) -> Result<Value, JsError> {
     // makes a count-first pass unsound: getters may hide later keys).
     let _stress = crate::ir::StressSuppress::new();
     let mut entries = Vec::new();
+    let ordinary = matches!(obj.kind, crux::object::ObjectKind::Ordinary);
     for key in obj.own_property_keys()? {
         // EnumerableOwnProperties (spec 7.3.26): the descriptor's
         // enumerability is re-read for every key, so a getter hit for
@@ -1059,14 +1060,28 @@ fn object_entries(agent: &mut Agent, args: &[Value]) -> Result<Value, JsError> {
             continue;
         };
         let key = PropertyKey::String(id);
-        if !obj
-            .get_own_property_key(&key)?
-            .is_some_and(|prop| prop.enumerable)
-        {
+        let Some(prop) = obj.get_own_property_key(&key)? else {
+            continue;
+        };
+        if !prop.enumerable {
             continue;
         }
         let text = crux::lookup(id);
-        let value = crate::context::get_property(agent, &object, &text, object)?;
+        // An ordinary object's own data property already carries its value in
+        // the descriptor just read, so it needs no second lookup through
+        // `Get`; an accessor still runs the getter, and a namespace, proxy or
+        // host source always takes `Get` (its `[[Get]]` is not its descriptor).
+        let value = if ordinary {
+            match prop.kind {
+                crux::object::PropertyKind::Data { value, .. } => value,
+                crux::object::PropertyKind::Accessor { get: Some(_), .. } => {
+                    crate::context::get_property(agent, &object, &text, object)?
+                }
+                crux::object::PropertyKind::Accessor { get: None, .. } => Value::Undefined,
+            }
+        } else {
+            crate::context::get_property(agent, &object, &text, object)?
+        };
         let pair = crate::builtins::array::array_create(agent, 2.0)?;
         pair.create_data_property_index(0, Value::String(Handle::new(text)))?;
         pair.create_data_property_index(1, value)?;
@@ -1086,6 +1101,7 @@ fn object_values(agent: &mut Agent, args: &[Value]) -> Result<Value, JsError> {
     // next property read allocates — suppress `--gc-stress` for the
     // build so the half-built Vec cannot be swept.
     let _stress = crate::ir::StressSuppress::new();
+    let ordinary = matches!(obj.kind, crux::object::ObjectKind::Ordinary);
     for key in obj.own_property_keys()? {
         // EnumerableOwnProperties re-reads each descriptor, so a
         // getter for an earlier key can hide a later one.
@@ -1093,14 +1109,26 @@ fn object_values(agent: &mut Agent, args: &[Value]) -> Result<Value, JsError> {
             continue;
         };
         let key = PropertyKey::String(id);
-        if !obj
-            .get_own_property_key(&key)?
-            .is_some_and(|prop| prop.enumerable)
-        {
+        let Some(prop) = obj.get_own_property_key(&key)? else {
+            continue;
+        };
+        if !prop.enumerable {
             continue;
         }
         let text = crux::lookup(id);
-        let value = crate::context::get_property(agent, &object, &text, object)?;
+        // The descriptor already carries an ordinary object's data value; only
+        // an accessor (or a non-ordinary source) needs the generic `Get`.
+        let value = if ordinary {
+            match prop.kind {
+                crux::object::PropertyKind::Data { value, .. } => value,
+                crux::object::PropertyKind::Accessor { get: Some(_), .. } => {
+                    crate::context::get_property(agent, &object, &text, object)?
+                }
+                crux::object::PropertyKind::Accessor { get: None, .. } => Value::Undefined,
+            }
+        } else {
+            crate::context::get_property(agent, &object, &text, object)?
+        };
         values.push(value);
     }
     array_of(agent, &values)

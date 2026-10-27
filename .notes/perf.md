@@ -17235,3 +17235,25 @@ Gates: fmt, `clippy -D warnings`, `cargo test --workspace`; test262 language
 0. `Object.keys` semantics diffed against node across index order, symbols,
 non-enumerable, getters (which `Object.keys` does not invoke), primitives,
 arrays, `Map`, and a proxy.
+
+## LANDED (2026-10-27): `Object.values`/`entries` read the descriptor value, not a second `Get`
+
+`object_values` and `object_entries` re-read each key's descriptor (required:
+`EnumerableOwnProperties` re-reads enumerability so an earlier key's getter can
+hide a later one) and then called the generic `Get` for the value, a second
+lookup. An ordinary object's own data property already carries its value in the
+descriptor `get_own_property_key` returned, so it is used directly; an accessor
+still runs `get_property`, and a namespace, proxy or host source always takes it
+(its `[[Get]]` is not its descriptor). The per-key descriptor re-read is
+unchanged, so the getter-mutates-a-later-key cases still see the mutation.
+
+Measured one row per process, 7 interleaved rounds, minima: `builtins/object_keys`
+(keys+values+entries) **51.7 -> 45.1 ms (-12.7%)**. Cumulative on that row from
+before the enumeration work: 58.7 -> 45.1 ms (-23%).
+
+Gates: fmt, `clippy -D warnings`, `cargo test --workspace`; test262 language
+23,726 + built-ins 23,821 + annexB 1,086 + intl402 3,365 at 100%; corpus parity
+0. `values`/`entries` diffed against node across index order, symbols,
+non-enumerable, a getter that deletes a later key, a getter that makes a later
+key non-enumerable, a setter-only property, primitives, arrays, `Map` and a
+proxy.
