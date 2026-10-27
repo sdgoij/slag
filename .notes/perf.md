@@ -17341,3 +17341,15 @@ The `compound_assign` win is the re-type, not elision: its IR keeps the object
 re-type (typing an accumulator a guard poisoned) is a broad lever independent of
 the object, and is the mechanism the "consume the `numbers=true` proof" note was
 reaching for.
+
+## NULL (2026-10-27): re-typing after inlining is a wash
+
+The re-type above is enabler-driven: `scalar` substitutes a typed value for a
+guard's `Unknown` result, which is what lets `narrow`/`mem2reg` type the
+accumulator. `inline` clones typed callee IR but leaves the *call result*
+`Unknown`, so extending the re-type's gate to `scalarized || inlined` was
+measured (5 interleaved corpus rounds, per-row minima) at **+0.71%** on the
+corpus total, with mixed per-row movement (`calls/closure_capture` -3.5%,
+`calls/direct_leaf` -5.7%, `builtins/json_roundtrip` +4.7%, the for-in row
++3.1%), i.e. layout. Reverted; the gate stays `scalarized`, and the reason is in
+a comment at the gate.
