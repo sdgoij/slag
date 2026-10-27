@@ -228,7 +228,7 @@ the proof. The proof is the priced next slice; see section 7.
 | Generator `next()` driver | 155 ns per `next()` (about 55 resume, 70 driver, 49 result object) |
 | Dense array store (`buildString` shape) | 600-700 ms -> 42-52 ms JIT |
 | `Object.assign`/spread own-data copy: read the descriptor value, and enumerate a vector-free ordinary source from its map (`own_string_data_keys`) instead of `materialize_properties` + three `Vec`s | `objects/spread_assign` 117.3 -> 90.1 ms (-23%), `Object.assign` 101 -> 78 ms; corpus mean-jitGap 10.51 -> 10.26 |
-| `Object.keys` ordinary enumeration: `own_string_props` (no per-key lookup, sound because `keys` never calls `Get`) + an `ordinary_own_property_keys` one-vector fast path for the no-index/no-symbol shape; `Object.values`/`entries` read the descriptor value instead of a second `Get` | `opcost/object_keys` 43.8 -> 36.0 ms (-17.7%), `builtins/object_keys` 58.7 -> 45.1 ms (-23%), `opcost/json_stringify` ~-5% |
+| `Object.keys` ordinary enumeration: `own_string_props` (no per-key lookup, sound because `keys` never calls `Get`) + an `ordinary_own_property_keys` one-vector fast path for the no-index/no-symbol shape; `Object.values`/`entries` read the descriptor value instead of a second `Get`; `Object.keys` boxes during enumeration (no second pass) | `opcost/object_keys` 43.8 -> 31.0 ms (-29%), `builtins/object_keys` 58.7 -> 42.3 ms (-28%), `opcost/json_stringify` ~-5% |
 | Global read cells (declarative record, nested bodies) | top-level `const` 52.5 -> about 2.4 ms per 1M; nested helper 130.2 -> 2.5 ms |
 | Map key-index mixer (Goats) | `mapget` -29%, `maphas` -37% |
 | Optimizing-tier GC safe point | a lifted allocating loop had no safepoint and a 46 ms pause; fixed |

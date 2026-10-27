@@ -17257,3 +17257,19 @@ Gates: fmt, `clippy -D warnings`, `cargo test --workspace`; test262 language
 non-enumerable, a getter that deletes a later key, a getter that makes a later
 key non-enumerable, a setter-only property, primitives, arrays, `Map` and a
 proxy.
+
+## LANDED (2026-10-27): `Object.keys` boxes its keys in the enumeration, not a second pass
+
+`enumerable_string_keys` returned `Vec<JsString>` and `object_keys` re-mapped it
+into a `Vec<Value>` with a `Handle::new` per key, an intermediate allocation and
+a second pass. The helper now boxes as it enumerates and returns the
+`Vec<Value>` directly (`Object.keys` is its only caller), under the same
+stress-suppression window, renamed `enumerable_string_key_values` to match.
+
+Measured one row per process, 7 interleaved rounds, minima: `opcost/object_keys`
+**35.8 -> 31.0 ms (-13.4%)**, `builtins/object_keys` 45.0 -> 42.3 ms (-6.1%).
+Cumulative on `opcost/object_keys` from before the enumeration work: 43.8 ->
+31.0 ms (-29%).
+
+Gates: fmt, clippy, workspace tests; test262 51,998 at 100%; corpus parity 0;
+the `Object.keys` semantics diff still passes.

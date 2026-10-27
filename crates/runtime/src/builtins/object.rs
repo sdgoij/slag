@@ -396,10 +396,19 @@ fn is_array_for_to_string(value: &Value) -> Result<bool, JsError> {
 }
 
 /// EnumerableOwnPropertyNames (spec 7.3.23) restricted to string keys.
-fn enumerable_string_keys(agent: &mut Agent, value: &Value) -> Result<Vec<JsString>, JsError> {
+fn enumerable_string_key_values(agent: &mut Agent, value: &Value) -> Result<Vec<Value>, JsError> {
     let object = to_object(agent, value)?;
     let obj = as_object(&object)
         .ok_or_else(|| JsError::new(ErrorKind::TypeError, "value is not an object".into()))?;
+    // `Object.keys` is the only caller, and it wants boxed values; boxing here
+    // (rather than returning `JsString`s and re-mapping into a second `Vec`)
+    // drops an intermediate allocation and a pass.
+    //
+    // GC-2: the freshly-boxed key strings accumulate in a local Vec the stack
+    // scan cannot see while the next `Handle::new` fires a stress collection,
+    // so suppress that window (the array is built by the caller after).
+    let _stress = crate::ir::StressSuppress::new();
+    let boxed = |id| Value::String(Handle::new(crux::lookup(id)));
     // An ordinary object's enumerability is on the stored property, and a
     // module namespace (the only kind whose descriptor reads a live binding) is
     // not ordinary, so this path skips the per-key `[[GetOwnProperty]]` lookup
@@ -417,7 +426,7 @@ fn enumerable_string_keys(agent: &mut Agent, value: &Value) -> Result<Vec<JsStri
                 let PropertyKey::String(id) = key else {
                     return None;
                 };
-                enumerable.then(|| crux::lookup(id))
+                enumerable.then(|| boxed(id))
             })
             .collect());
     }
@@ -434,7 +443,7 @@ fn enumerable_string_keys(agent: &mut Agent, value: &Value) -> Result<Vec<JsStri
         // ReferenceError (spec 9.4.6.4 step 4).
         let desc = namespace_live_descriptor(agent, &obj, &key, &prop)?;
         if desc.enumerable.unwrap_or(false) {
-            out.push(crux::lookup(id));
+            out.push(boxed(id));
         }
     }
     Ok(out)
@@ -1136,16 +1145,7 @@ fn object_values(agent: &mut Agent, args: &[Value]) -> Result<Value, JsError> {
 
 /// Object.keys (spec 20.1.2.18): the enumerable own string keys.
 fn object_keys(agent: &mut Agent, args: &[Value]) -> Result<Value, JsError> {
-    let keys = enumerable_string_keys(agent, &arg(args, 0))?;
-    // GC-2: the freshly-boxed key strings accumulate in a local Vec
-    // the stack scan cannot see while the next `Handle::new` fires a
-    // stress collection — suppress the window so the half-built Vec
-    // cannot be swept (the array is built by `array_of` after).
-    let _stress = crate::ir::StressSuppress::new();
-    let values: Vec<Value> = keys
-        .into_iter()
-        .map(|key| Value::String(Handle::new(key)))
-        .collect();
+    let values = enumerable_string_key_values(agent, &arg(args, 0))?;
     array_of(agent, &values)
 }
 
