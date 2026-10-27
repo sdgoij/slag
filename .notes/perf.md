@@ -17205,3 +17205,33 @@ Lead for the next slice: `Object.keys` still pays the same
 `own_property_keys`/materialize path (104 ms for 3 keys), and
 `ordinary_own_property_keys` still builds three `Vec`s. `own_string_data_keys`
 is the non-materializing enumeration it could share.
+
+## LANDED (2026-10-27): `Object.keys` enumerates an ordinary object without the per-key lookup
+
+`Object.keys`'s `enumerable_string_keys` called `own_property_keys` (the
+`materialize_properties` + three-`Vec` path) and then re-read each key's
+descriptor for its enumerability. An ordinary object's enumerability is already
+on the stored property, and `Object.keys` never calls `Get` (its
+`EnumerableOwnProperties` kind is `key`), so no user code can run between keys to
+change a later one: the snapshot is sound. It now takes `own_string_props`,
+which yields `(key, enumerable)` for the string keys in spec order from one
+vector. `Object.values`/`entries` keep their per-key re-read, because they do
+call `Get`.
+
+Separately, `ordinary_own_property_keys` gained a fast path for the common shape
+(no array-index, no symbol key), where the stored order is already the spec
+order: one pass builds the answer instead of staging `indices`/`strings`/
+`symbols` and merging. The exotic order keeps the general path.
+
+Measured one row per process, 7 interleaved rounds, minima: `opcost/object_keys`
+**43.8 -> 36.0 ms (-17.7%)**, `builtins/object_keys` (keys+values+entries)
+**58.7 -> 52.8 ms (-9.9%)**, and `opcost/json_stringify` -4 to -5% on the
+whole-corpus pass. A whole-corpus run moved its controls (`objects/warm_store`
++3.9%, the 0.1 ms `baseline` +5% on a 0.005 ms absolute), so the corpus-total
+delta is not separable from layout; the isolated rows are the measurement.
+
+Gates: fmt, `clippy -D warnings`, `cargo test --workspace`; test262 language
+23,726 + built-ins 23,821 + annexB 1,086 + intl402 3,365 at 100%; corpus parity
+0. `Object.keys` semantics diffed against node across index order, symbols,
+non-enumerable, getters (which `Object.keys` does not invoke), primitives,
+arrays, `Map`, and a proxy.

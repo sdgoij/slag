@@ -4406,6 +4406,17 @@ fn ordinary_own_property_keys(obj: &JsObject) -> Vec<PropertyKey> {
     // exist only as descriptors + fields).
     obj.materialize_properties();
     let props = obj.properties.borrow();
+    // Fast path: with no array-index and no symbol key, the stored order is
+    // already the spec order (strings in insertion order), so one pass builds
+    // the answer directly instead of staging `indices`/`strings`/`symbols` and
+    // merging them. This is the common object shape (and the one `Object.keys`,
+    // `values` and `entries` walk); the exotic order keeps the general path.
+    if props
+        .iter()
+        .all(|(key, _)| matches!(key, PropertyKey::String(_)) && array_index_of(key).is_none())
+    {
+        return props.iter().map(|(key, _)| key.clone()).collect();
+    }
     let mut indices: Vec<(u64, PropertyKey)> = Vec::new();
     let mut strings = Vec::new();
     let mut symbols = Vec::new();

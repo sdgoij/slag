@@ -400,6 +400,27 @@ fn enumerable_string_keys(agent: &mut Agent, value: &Value) -> Result<Vec<JsStri
     let object = to_object(agent, value)?;
     let obj = as_object(&object)
         .ok_or_else(|| JsError::new(ErrorKind::TypeError, "value is not an object".into()))?;
+    // An ordinary object's enumerability is on the stored property, and a
+    // module namespace (the only kind whose descriptor reads a live binding) is
+    // not ordinary, so this path skips the per-key `[[GetOwnProperty]]` lookup
+    // and the live-descriptor call. That snapshot is sound for `Object.keys`
+    // specifically: its EnumerableOwnProperties kind is `key`, which never
+    // calls `Get`, so no user code runs between keys to change a later one.
+    // (`Object.values`/`entries` do call `Get` and keep their per-key re-read.)
+    // `own_string_props` also yields just the string keys, which is exactly
+    // what `Object.keys` wants (it drops symbols), in spec order from one
+    // vector.
+    if let Some(props) = obj.own_string_props() {
+        return Ok(props
+            .into_iter()
+            .filter_map(|(key, enumerable)| {
+                let PropertyKey::String(id) = key else {
+                    return None;
+                };
+                enumerable.then(|| crux::lookup(id))
+            })
+            .collect());
+    }
     let mut out = Vec::new();
     for key in obj.own_property_keys()? {
         let PropertyKey::String(id) = key else {
