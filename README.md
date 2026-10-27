@@ -468,25 +468,27 @@ Gap = Slag ms / V8 ms, so > 1 means V8 was faster:
 
 | Family | Workloads | JIT gap | Interpreter gap |
 |---|---|---|---|
-| arrays | 6 | 9.71x | 3.63x |
-| builtins | 5 | 7.62x | 4.23x |
-| calls | 6 | 8.62x | 5.10x |
-| control | 5 | 12.50x | 3.78x |
-| globals | 4 | 2.20x | 2.53x |
-| language | 3 | 5.53x | 5.26x |
-| objects | 7 | 8.99x | 2.42x |
-| opcost | 36 | 12.34x | 3.81x |
-| strings | 5 | 9.42x | 4.68x |
-| **All** | **77** | **10.26x** | **3.84x** |
+| arrays | 6 | 9.88x | 3.52x |
+| builtins | 5 | 7.29x | 3.78x |
+| calls | 6 | 8.96x | 5.29x |
+| control | 5 | 12.08x | 3.62x |
+| globals | 4 | 2.10x | 0.74x |
+| language | 3 | 5.70x | 5.23x |
+| objects | 7 | 6.26x | 2.39x |
+| opcost | 36 | 12.56x | 3.75x |
+| strings | 5 | 9.52x | 4.84x |
+| **All** | **77** | **10.12x** | **3.69x** |
 
-Measured 2026-10-27 at the `Object.assign`/spread copy landing (uncommitted on
-`eb441c00`), one `bench.js` run after the change's interleaved A/B; the row
-that moved is `objects/spread_assign`, 117.3 -> 90.1 ms (the `objects` family
-9.36x -> 8.99x), and the `globals` interpreter column was load-sensitive in
-this run, which is why it reads 2.53x where earlier rounds read 0.87x. The
-previous table measured 2026-10-25 at `ee72c0b8` (10.54x / 3.76x); the commit
-before the security audit `883af3dd` reads 10.40x / 3.69x, and the audit-era
-measurement here was 10.76x / 3.88x.
+Measured 2026-10-27 at the scalar-replacement landing (`7685ef95`), one
+`bench.js` run after the change's interleaved A/B; the `objects` family fell
+8.99x -> 6.26x from three rows, `objects/warm_store` 34.7 -> 9.3 ms (-73%),
+`objects/compound_assign` 43.9 -> 28.1 (-36%) and `objects/destructure` 3.6 ->
+2.6 (-28%), and the earlier sessions' `Object.assign`/`Object.keys` work moved
+`objects/spread_assign` 117.3 -> 90.1 ms and `opcost/object_keys` 43.8 -> 31.0.
+The `globals` interpreter column is load-sensitive (0.74x here against 2.53x in
+an adjacent run). The previous table measured 2026-10-25 at `ee72c0b8` (10.54x /
+3.76x); the commit before the security audit `883af3dd` reads 10.40x / 3.69x,
+and the audit-era measurement here was 10.76x / 3.88x.
 `.notes/perf-plan.md` records the measurements and `.notes/perf.md` the landed
 changes.
 

@@ -147,15 +147,16 @@ trade-off.** Report the failing fixture and revert; do not commit around it.
 
 ### 4.1 Headline
 
-77 corpus rows, all four modes agree: **JIT gap 10.26x, interpreter gap 3.84x**
-(2026-10-27; was 10.55 / 3.79 the day before). The second number is the important one: Slag's interpreter is within
-3.8x of V8's, while its compiled code is 10.3x off. V8's tier-on-tier gain is
+77 corpus rows, all four modes agree: **JIT gap 10.12x, interpreter gap 3.69x**
+(2026-10-27; was 10.55 / 3.79 at the start of the session). The second number is the important one: Slag's interpreter is within
+3.7x of V8's, while its compiled code is 10.1x off. V8's tier-on-tier gain is
 therefore about 2.8x larger than Slag's. The deficit is in what the optimizing
 tier does with a body, not in the cost of a single runtime operation.
 
-Per family (README, 2026-10-27): globals 2.18x, language 5.40x, builtins 7.60x,
-objects 9.10x, calls 8.75x, strings 9.65x, arrays 9.79x, control 12.23x,
-opcost 12.56x.
+Per family (README, 2026-10-27): globals 2.10x, language 5.70x, builtins 7.29x,
+objects 6.26x, calls 8.96x, strings 9.52x, arrays 9.88x, control 12.08x,
+opcost 12.56x. The `objects` family's drop from 9.29x is the scalar-replacement
+work (`warm_store` -73%, `compound_assign` -36%, `destructure` -28%).
 
 ### 4.2 Per-operation cost (ns per operation, one process per row, minima)
 
