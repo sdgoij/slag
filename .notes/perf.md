@@ -17273,3 +17273,28 @@ Cumulative on `opcost/object_keys` from before the enumeration work: 43.8 ->
 
 Gates: fmt, clippy, workspace tests; test262 51,998 at 100%; corpus parity 0;
 the `Object.keys` semantics diff still passes.
+
+## PROBE + SCOPE (2026-10-27): the scalar pass is worth 5.8% (all `destructure`); the next slice is a mutable field
+
+Before scoping the escape-analysis frontier, the existing pass's reach, same
+binary, `SLAG_SCALAR=0` vs on, 5 interleaved rounds, per-row minima: corpus total
+2118.4 -> 1995.2 ms (-5.81%), `objects/destructure` 120.5 -> 3.6 (-97.0%), and the
+other allocation rows flat (`object_alloc` and `array_alloc` both ~0, `construct_churn` +0.65%,
+`array_slice` +0.37%, `warm_store` +0.06%).
+
+The refusal census is no longer allocation: 11 first-blocker steps across the
+corpus (`Yield`, `RunRegBody`, `RegExpLiteral`, `no return`, `HoistGuard`,
+`FusedLoop`, `CatchBind/EnterTry/Exit`, `CallApply`,
+`Break/SwitchDisc/SwitchTest`, `Binary`, `AssignMemberName(compound)`), 106 bodies
+compiled.
+
+`JIT_DUMP_IR` on `objects/warm_store` shows a provably non-escaping `NewObject`
+in a frame slot, read and written across the loop through
+`MemberStore`/`MemberCellLoad`/`MemberGuard`. Two exact reasons the pass misses
+it: the slot forwarding is block-local (the store is in the preheader, the loads
+in the loop body), and it only replaces a field read with the literal's
+*constant*, not with a later store's value. The scoped slice (cross-block slot
+forwarding, store-to-load forwarding for a virtual member, dead-object removal)
+is in `.notes/escape-scope.md`, with its falsifier. `construct_churn`
+(construct/method inline first) and `array_slice` (builtin inline first) are out
+of its reach by mechanism, not by effort.

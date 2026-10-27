@@ -299,6 +299,12 @@ needs its own per-row measurement.
   refusal artifact worth understanding.
 - **`generator_loop` and `array_for_each`** lose to the baseline tier by 12 to
   13%; determine whether they share the scalar-loop cause or have their own.
+- **The escape-analysis frontier.** `opt/pass/scalar.rs` already replaces a
+  non-escaping literal's constant-field reads (worth -5.8% on the corpus, all via
+  `destructure`). The next slice, scoped in `.notes/escape-scope.md` with its
+  probe, extends it to a non-escaping object's *mutable* field: cross-block
+  slot forwarding plus store-to-load forwarding, target `objects/warm_store`
+  (34 ms, 15x). `construct_churn` and `array_slice` need inline first, not this.
 
 ## 8. The archive
 
@@ -326,6 +332,7 @@ tail for the current session; the heading list is the fastest index.
 | `jit-compile-threshold.md` | landed | the compile threshold and the four consult sites |
 | `non-leaf-jit.md` | historical | the non-leaf coverage plan and its census |
 | `structural-gap.md` | open conclusion | the gap is the object model, not codegen |
+| `escape-scope.md` | design + probe, not started | the next scalar-replacement slice: a non-escaping object's mutable field (`warm_store`) |
 | `closure-cost-plan.md` | landed, Stage D rejected | 408 -> 200 bytes and the measured Stage D regressions |
 | `array-store-plan.md` | landed | the dense element store that fixed `buildString` |
 | `dense-store-redesign.md` | Stage 1 landed | elements kinds and the prototype-elements protector |
