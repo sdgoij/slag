@@ -17488,3 +17488,74 @@ keeps a tag check and a `Canon` per iteration, and both `n` and the counter make
 the loop test the only tagged work left. A function's parameter types are the
 next broad lever: `Type::Int`/`Number` seeds exist now, but nothing types an
 argument at the call site.
+
+## PROBE (2026-10-28): the inline splice is starved by the tier-up policy, not by its sites
+
+`opcost/method_call` runs `s = (s + obj.m(k)) | 0` for 100k iterations at 1.3 ms
+and V8 does it in ~0.03 ms. The IR shows why the body cannot be fixed by typing:
+
+```
+b1(v28:int):
+  v8:num = BitAnd(v28, v7)          ; k = i & MASK
+  v9:? = FrameLoad() slot2          ; s, a frame slot
+  v11:? = MemberCellLoad(v10) atom644
+  v12:? = MemberGuard(v10, v11)
+  v15:? = Call(v10, v12, v8) 19     ; not spliced, so `call_slow`
+  v16:? = Add(v9, v15)              ; Unknown, tag-checked
+  v18:? = BitOr(v16, 0)             ; Unknown
+  FrameStore(v18) slot2
+  CompletionStore(v18)              ; a write per iteration
+```
+
+The callee is a closure literal in the same body (`var obj = { m: function (x)
+{ return x + 1; } }`), so a splice would turn the whole loop into
+`s = (s + k + 1) | 0` in registers. It does not splice, and `SLAG_INLINE=0` moves
+this row by only 2%, so the pass is not attempting it.
+
+**Why the site is missing.** `sites_from_feedback` needs a recorded call site, and
+`SLAG_INLINE_TRACE` (new, see below) shows the store holds NO `Call` record for
+this body at all. The recorder (`Vm::record_call_site`) is only reached from the
+interpreter's step dispatch, and `JitEngine::consult` compiles a body with a loop
+on its **first** consult, deliberately: *"a loop body compiles on the first
+consult - it runs once with many internal iterations, so a pure count would
+never promote it"* (`runtime/src/jit.rs`). So a loop body never executes an
+interpreted step, so it never records a call site, so the splice never fires for
+exactly the bodies where it would pay.
+
+That also explains the 2026-10-25 note "`SLAG_INLINE_FEEDBACK=1` helps nothing in
+the corpus": the feedback store is empty by construction, not because the splice
+is unprofitable. Measured here: `SLAG_FEEDBACK=1 SLAG_INLINE_FEEDBACK=1` on this
+row is 1.29 ms against the default's 1.28 ms, and the IR is unchanged.
+
+The recording mechanism is fine elsewhere: sweeping the corpus with the probe on,
+a 144-step row records ~9,961 calls per site, so the interpreter path works; only
+loop bodies starve.
+
+**And where it can fire, it does not pay.** The same sweep with
+`SLAG_FEEDBACK=1 SLAG_INLINE_FEEDBACK=1` changes the IR of exactly ONE of the 77
+rows, `calls/recursive_fib` (the guard-split splice the pass emits for a
+recursive callee: `CalleeEq` then either the spliced body or the real call). That
+row measures 55.1/56.1/56.7/58.4/67.9 ms against the default's
+51.0/51.8/52.0/53.6/59.4, i.e. it loses. So the earlier "`SLAG_INLINE_FEEDBACK=1`
+helps nothing in the corpus" is right for the rows it reaches and wrong about the
+reason: the rows that would profit never get a site.
+
+**Cost of the naive fix.** Letting a loop body run interpreted once before
+compiling would feed the splice, and the corpus harness would not notice (it
+times the minimum of several calls). But a program whose main loop is in a
+function called once pays a whole interpreted run: this row's interpreter column is
+9.7 ms per call for 100k iterations (~97 ns/iteration), so a 10M-iteration loop
+would pay about a second. That is not a trade to make blindly, so it is left as a
+design decision rather than landed here.
+
+**A static alternative.** The callee is a closure literal in the caller's own
+body, so the splice could be proved instead of measured: forward the member read
+`v11` to the literal's field value, guarded by `CalleeEq` against that value.
+`one_pass` declines today because the object escapes as the call's *receiver*,
+which is correct (the callee can write `this.m`), so the proof needs the callee
+body: no store to that atom, then the forwarding is sound. That is the next
+slice, and it needs no feedback at all.
+
+Instrument added: `SLAG_INLINE_TRACE=1` prints the site count per compiled body,
+each recorded site's state/hits/first id, and each resolver lookup's outcome.
+Compile-time only, so it costs nothing when unset.

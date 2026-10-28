@@ -76,6 +76,7 @@ Never measure a binary you cannot tie to the source you are reading. See
 | `JIT_HELPER_STATS=1` | per-helper call histogram with names (instrumented build) |
 | `JIT_LEAF_TRACE=1` | the first leaf-probe rejection reasons |
 | `SLAG_JIT_DEOPT_PROBE=<step>` | forces a deopt at that step in every eligible body |
+| `SLAG_INLINE_TRACE=1` | per compiled body: the splice-site count, each recorded site's state/hits/first id, and each resolver lookup's outcome |
 
 Instrumentation changes the code under test (the helper counter costs four
 instructions per call site), so never measure wall time with it enabled.
@@ -306,6 +307,17 @@ needs its own per-row measurement.
 
 ## 7. Open leads (2026-10-28)
 
+- **The inline splice cannot fire on a loop-bodied caller, and that is the
+  headline's biggest single ceiling.** `JitEngine::consult` compiles a loop body
+  on its FIRST consult, so it never runs an interpreted step, so
+  `record_call_site` never runs, so `sites_from_feedback` is empty. Every
+  monomorphic-callee loop (`opcost/method_call` 45x, `opcost/js_call` 29x,
+  `opcost/own_builtin_call`) pays a `call_slow` per iteration because of it. Two
+  routes: let a loop body run interpreted once (costs a whole interpreted run for
+  a single-call program), or prove the callee statically (the callee is a closure
+  literal in the caller's own body; `CalleeEq` against it, plus a scan of the
+  callee body for a store to that atom). The second needs no feedback - see the
+  2026-10-28 PROBE entry.
 - **Type a function's parameters at the call site.** The row that is left keeps a
   tag check and a `Canon` per iteration only because the loop bound is a
   parameter typed `Unknown`; the lattice now honours a declared numeric type, so

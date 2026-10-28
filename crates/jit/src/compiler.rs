@@ -149,6 +149,18 @@ impl JitEngine {
                     // no comparison and are on with the pass.
                     let feedback_sites = std::env::var("SLAG_INLINE_FEEDBACK").is_ok();
                     let sites = crate::opt::pass::inline::sites_for(body, feedback_sites);
+                    if std::env::var("SLAG_INLINE_TRACE").is_ok() {
+                        let found = sites.iter().filter(|s| s.is_some()).count();
+                        eprintln!(
+                            "inline-trace: {found} site(s) of {} step(s), feedback={feedback_sites}",
+                            sites.len()
+                        );
+                        for (ip, site) in sites.iter().enumerate() {
+                            if let Some(site) = site {
+                                eprintln!("  step {ip}: {:?}", site.target);
+                            }
+                        }
+                    }
                     // I5c-2c-ii: the splice is enabled by default; `SLAG_INLINE=0`
                     // turns it off (the same-binary seam for measuring it). The
                     // resolver lifts the callee's body through the agent window a
@@ -187,6 +199,12 @@ impl JitEngine {
                                 runtime::jit::resolve_declaration(body, *init_step)
                             }
                         };
+                        if std::env::var("SLAG_INLINE_TRACE").is_ok() {
+                            eprintln!(
+                                "inline-trace: resolve {target:?} -> {}",
+                                if found.is_some() { "ok" } else { "none" }
+                            );
+                        }
                         let resolved = found.and_then(|callee| {
                             let mut ir = crate::opt::lift::lift(&callee.body).ok()?;
                             // I5c-2c-iii-b: a callee's `var` slots have no home

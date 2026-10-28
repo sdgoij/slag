@@ -69,6 +69,14 @@ pub fn sites_from_feedback(body: &runtime::ir::CompiledBody) -> Vec<Option<Inlin
         let Some(runtime::feedback::SiteRecord::Call(call)) = store.site(ip) else {
             continue;
         };
+        if std::env::var("SLAG_INLINE_TRACE").is_ok() {
+            eprintln!(
+                "inline-trace: step {ip} = {:?}, hits {}, first id {}",
+                call.state(),
+                call.hits(),
+                call.first_callee_id()
+            );
+        }
         if call.state() == runtime::feedback::IcState::Specialized && call.first_callee_id() != 0 {
             *site = Some(InlineSite {
                 target: InlineTarget::Guarded {
