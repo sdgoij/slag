@@ -98,9 +98,17 @@ slag-jit, slag-jitless, node-jit and node-jitless.
 - **Noise floor**: about 0.3% on the corpus total, up to about 2.8% on a row,
   and about 4% on a 40 ms row. Anything under those is layout until a
   same-binary switch proves otherwise.
-- **Keep two controls** in every run: `opcost/baseline` (a bare integer loop)
-  and `objects/warm_store` (a row whose code cannot change under most seams).
-  If a control moves, the pair is not a measurement.
+- **Keep two controls** in every run: `opcost/baseline` (a bare integer loop,
+  flat at 0.083 ms across every seam so far) and one row the change cannot touch.
+  `objects/warm_store` used to be the second and no longer is: two changes moved
+  it 34.7 -> 9.3 -> 3.1 ms, so pick the second control per change and prove it
+  with the IR diff below. If a control moves, the pair is not a measurement.
+- **A before/after build pair cannot attribute a per-row move**: layout alone
+  moved `calls/direct_leaf` +6.7% and `template-literal/evaluation-order` +5.9%
+  between two builds whose IR for those rows is byte-identical. Diff the whole
+  corpus's `JIT_DUMP_IR` between the two binaries (normalising the interned
+  string addresses, `0x[0-9a-f]+`) and treat only a row whose IR differs as
+  attributable.
 - **V8 is not a fair per-operation reference on the `opcost` rows**: its JIT
   folds the affine loops and scalar-evolves the constants, so its time is near
   zero. Read Slag's absolute ns per operation; use the ratio only for ranking.
@@ -149,20 +157,21 @@ trade-off.** Report the failing fixture and revert; do not commit around it.
 
 ### 4.1 Headline
 
-77 corpus rows, all four modes agree: **JIT gap about 10.1x, interpreter gap
+77 corpus rows, all four modes agree: **JIT gap about 10.0x, interpreter gap
 about 3.7x** (2026-10-28; was 10.12 / 3.69 at `7685ef95`). The metric's own
 run-to-run spread is wide: three `bench.js` runs of ONE binary read 9.73 / 10.25
-/ 10.53, so the second decimal of a single run is not a result, and a row-level
-change under 1% is invisible in the headline. The interpreter number is the
-important one: Slag's interpreter is within 3.7x of V8's, while its compiled
-code is 10.1x off. V8's tier-on-tier gain is therefore about 2.8x larger than
-Slag's. The deficit is in what the optimizing tier does with a body, not in the
-cost of a single runtime operation.
+/ 10.53 before the last change, so the second decimal of a single run is not a
+result, and a row-level change under 1% is invisible in the headline. The
+interpreter number is the important one: Slag's interpreter is within 3.7x of
+V8's, while its compiled code is 10.0x off. V8's tier-on-tier gain is therefore
+about 2.7x larger than Slag's. The deficit is in what the optimizing tier does
+with a body, not in the cost of a single runtime operation.
 
-Per family (README, 2026-10-27): globals 2.10x, language 5.70x, builtins 7.29x,
-objects 6.26x, calls 8.96x, strings 9.52x, arrays 9.88x, control 12.08x,
-opcost 12.56x. The `objects` family's drop from 9.29x is the scalar-replacement
-work (`warm_store` -73%, `compound_assign` -36%, `destructure` -28%).
+Per family (README, 2026-10-28): globals 2.33x, objects 4.18x, language 6.95x,
+builtins 8.17x, calls 8.67x, arrays 10.06x, strings 10.64x, control 11.79x,
+opcost 12.36x. The `objects` family fell 9.29x -> 4.18x on four rows: the
+scalar-replacement work (`warm_store` 34.7 -> 3.1 ms, `compound_assign` 30.4 ->
+3.1, `destructure` 3.6 -> 1.0) and the loop-carried-field typing.
 
 ### 4.2 Per-operation cost (ns per operation, one process per row, minima)
 
@@ -238,6 +247,7 @@ the proof. The proof is the priced next slice; see section 7.
 | `Object.keys` ordinary enumeration: `own_string_props` (no per-key lookup, sound because `keys` never calls `Get`) + an `ordinary_own_property_keys` one-vector fast path for the no-index/no-symbol shape; `Object.values`/`entries` read the descriptor value instead of a second `Get`; `Object.keys` boxes during enumeration (no second pass) | `opcost/object_keys` 43.8 -> 31.0 ms (-29%), `builtins/object_keys` 58.7 -> 42.3 ms (-28%), `opcost/json_stringify` ~-5% |
 | Scalar replacement extends to a non-escaping object's mutable field (cross-block slot alias + store-to-load), and the pipeline re-runs `narrow`/`mem2reg` after `scalar` so a guard-poisoned accumulator types to a raw f64 add | `objects/warm_store` 34.7 -> 9.3 ms (-73%), `objects/compound_assign` 43.9 -> 28.1 (-36%), `objects/destructure` 3.6 -> 2.6 (-28%); corpus -1.85%, mean-jitGap 10.26 -> 10.12 |
 | `promote_loop_carried_field`: a field read before its store in the loop header becomes a header phi (literal on the entry edge, stored value on the back-edge) and the object is elided | `objects/compound_assign` 30.4 -> 12.1 ms (-60%), total separation over 7 interleaved rounds and over the `SLAG_SCALAR_LOOP=0` seam (-61%); the `objects` family 6.26 -> 5.3x, headline unchanged inside its spread |
+| The carried field is typed `Number` by induction (numeric entry value, numeric-preserving arithmetic on the back-edge), and `narrow` seeds its lattice from a block parameter's declared type | `objects/compound_assign` 12.1 -> 3.0 ms (-75%), `objects/warm_store` 9.6 -> 3.1 (-68%), `objects/destructure` 2.8 -> 1.0 (-63%); corpus flat (+0.07%: 3 rows of 77), `objects` family 5.27 -> 4.18x, headline 10.12 -> 10.00 |
 | Global read cells (declarative record, nested bodies) | top-level `const` 52.5 -> about 2.4 ms per 1M; nested helper 130.2 -> 2.5 ms |
 | Map key-index mixer (Goats) | `mapget` -29%, `maphas` -37% |
 | Optimizing-tier GC safe point | a lifted allocating loop had no safepoint and a 46 ms pause; fixed |
@@ -296,14 +306,16 @@ needs its own per-row measurement.
 
 ## 7. Open leads (2026-10-28)
 
-- **Type the loop-carried field Number.** `promote_loop_carried_field` leaves the
-  header phi `Unknown`, so the row keeps three tag-checked `Add`s and a frame
-  slot for the accumulator (12 ms against a ~3 ms floor). The induction is
-  available: the entry value is a numeric literal and the back-edge value is a
-  numeric-preserving arithmetic op over the carried value, so the carried value
-  is a Number on every iteration. Seeding `narrow`'s numeric lattice from a
-  block parameter's declared type is what lets the re-type reach it. Falsifier:
-  the row not reaching the f64 num-slot lane.
+- **Type a function's parameters at the call site.** The row that is left keeps a
+  tag check and a `Canon` per iteration only because the loop bound is a
+  parameter typed `Unknown`; the lattice now honours a declared numeric type, so
+  the missing half is proving one at entry. This is the widest remaining lever:
+  every loop with a numeric bound pays it, and no row can currently be read as
+  "the body is slow" without that term.
+- **Type a loop-carried field whose arithmetic reaches outside the loop.** The
+  promotion types the field when its arithmetic operand is a constant or a
+  literally-typed value; an operand that is itself a loop param of undeclared
+  type leaves it `Unknown`. Falls out of the first lead.
 - **Consume the `numbers=true` hoist proof.** The step already establishes the
   invariant operand's type at loop entry; the optimizing tier ignores it. Type
   the hoisted-slot `FrameLoad`, let the slot fixpoint type the accumulator.

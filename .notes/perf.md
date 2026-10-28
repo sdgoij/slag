@@ -17420,3 +17420,71 @@ value `Number`: the entry value is a numeric literal and the back-edge value is 
 numeric-preserving arithmetic op over the carried value, so by induction it is a
 Number on every iteration (a Number op Number cannot produce a String). That is
 the same lever the `warm_store` re-type used, one level up.
+
+## LANDED (2026-10-28): the carried field is typed Number, and `narrow` learns a block parameter's type
+
+The promotion above left the header parameter `Unknown`, so the row kept three
+tag-checked `Add`s and a frame slot for the accumulator: 12.1 ms against a ~3 ms
+floor. Two changes close it.
+
+**The carried type is proved, not guessed.** `carried_type` types the parameter
+`Number` when the value entering the loop is numeric and the back-edge value is
+a numeric-preserving arithmetic op (`+ - * / % ** unary- ToNumber`) whose other
+operands are numeric. That is an induction: a Number op Number is a Number, so no
+String can appear through the cycle, whatever the op would do to a non-Number.
+
+**`narrow` seeds its numeric lattice from a block parameter's declared type.**
+A parameter has no defining instruction, so the sweep in `value_numerics` could
+never give it a flag and every operand reaching a loop through a parameter was
+non-numeric. The declared type is the claim the IR already makes and every
+lowering already reads it as the operand's register class, so the lattice adding
+it is not a new claim.
+
+The lowered body is three pure f64 adds with the accumulator as a parameter and
+no frame traffic at all:
+
+```
+b1(v25:f64, v29:f64, v30:f64):
+  v9:f64 = Add(v29, v8)       ; the field
+  v15:f64 = Add(v30, v9)      ; s
+  v22:f64 = Add(v25, v8)      ; the counter
+  v34:num = Canon(v22)
+  v24:bool = Lt(v34, v23)     ; v23 is `n`, still Unknown (a function parameter)
+  branch v24, b1(v22, v9, v15), b2(v22, v15)
+```
+
+Measured, 7 interleaved corpus rounds, per-row minima, against the previous
+commit: `objects/compound_assign` 12.05 -> 3.02 ms (**-74.9%**, and 30.4 -> 3.0
+over the session, 10x), `objects/warm_store` 9.56 -> 3.06 (**-68.0%**),
+`objects/destructure` 2.77 -> 1.04 (**-62.6%**). Corpus total 2328.8 -> 2330.5 ms
+(+0.07%, flat: three rows out of 77). `bench.js` gap: `compound_assign` 1.22x,
+`warm_store` 1.24x, `destructure` 1.29x, the `objects` family 5.27x -> 4.18x,
+overall `mean-jitGap` 10.12 -> 10.00 (two runs of the one binary: 10.04 and
+10.00), `mean-jlGap` 3.76, parity 0/77.
+
+**The seeding is the broader half.** `warm_store` and `destructure` were not
+touched by the promotion at all; their accumulators were already in the loop. The
+operand that kept their `Add` non-numeric was the loop counter, a `Type::Int`
+block parameter. This is the mechanism the 2026-10-20 note "the counter loop, one
+non-numeric operand disables slot promotion" was measuring.
+
+**Attribution.** An IR diff of all 77 rows between the two binaries leaves
+exactly three rows whose IR differs (`compound_assign`, `warm_store`,
+`destructure`). So the movers the timing A/B also showed on `template-literal/
+evaluation-order` (+5.9%) and `try/completion-values` (+5.4%) have byte-identical
+IR and are build layout, not this change.
+
+**Discipline note: `objects/warm_store` is no longer a usable control row.** It
+was the second control in the protocol; two successive changes have moved it
+(34.7 -> 9.3 -> 3.1). Choose the second control per change and prove it was not
+touched with the IR diff, keeping `opcost/baseline` (flat at 0.083 ms here) as
+the invariant one.
+
+Gates: fmt, `clippy --workspace -D warnings`, `cargo test --workspace`; test262
+language 23,726 + built-ins 23,821 + annexB 1,086 + intl402 3,365 at 100%.
+
+**What is left in the row.** `n` is a function parameter, so `Lt(Canon(i), n)`
+keeps a tag check and a `Canon` per iteration, and both `n` and the counter make
+the loop test the only tagged work left. A function's parameter types are the
+next broad lever: `Type::Int`/`Number` seeds exist now, but nothing types an
+argument at the call site.

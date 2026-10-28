@@ -63,6 +63,16 @@ fn slot_count(func: &Function) -> usize {
 /// Each value's "is a Number" flag, given the current per-slot flags.
 fn value_numerics(func: &Function, slot_numeric: &[bool]) -> Vec<bool> {
     let mut numeric = vec![false; func.value_count() as usize];
+    // A block parameter has no defining instruction, so nothing in the sweep
+    // below can ever give it a flag. Its declared type is the claim the IR
+    // already makes about it, and every lowering reads that type as the
+    // operand's register class, so seeding the lattice from it adds no claim of
+    // its own. A loop-carried field promoted by `scalar` is typed this way.
+    for b in 0..func.block_count() as u32 {
+        for &param in &func.block(b).params {
+            numeric[param as usize] = func.value_type(param).is_numeric();
+        }
+    }
     for b in 0..func.block_count() as u32 {
         for inst in &func.block(b).insts {
             if let Some(r) = inst.result {

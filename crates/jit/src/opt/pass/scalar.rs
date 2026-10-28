@@ -141,6 +141,10 @@ fn promote_loop_carried_field(func: &mut Function, body: &CompiledBody) -> bool 
                     continue;
                 }
                 let param = func.push_value(Type::Unknown);
+                // The guard's result is the value the parameter replaces, so the
+                // back-edge arithmetic still reads the guard at this point.
+                let carried = carried_type(func, init, guard, store_value);
+                func.set_value_type(param, carried);
                 func.block_mut(h).params.push(param);
                 append_edge_arg(func, entry, h, init);
                 append_edge_arg(func, h, h, store_value);
@@ -158,6 +162,47 @@ fn promote_loop_carried_field(func: &mut Function, body: &CompiledBody) -> bool 
         }
     }
     false
+}
+
+/// The type of a loop-carried field: `Number` when the value entering the loop
+/// is numeric and the back-edge value is a numeric-preserving arithmetic op over
+/// the carried value and numeric operands.
+///
+/// The proof is an induction. The value entering the loop is numeric, and every
+/// arithmetic op returns a Number when all of its operands are Numbers, so a
+/// Number can never become a String through the cycle. Typing it is what lets
+/// the lowering drop the per-iteration tag checks, and it lets the slot fixpoint
+/// type the accumulator the field feeds.
+fn carried_type(func: &Function, init: ValueId, carried: ValueId, store_value: ValueId) -> Type {
+    if !func.value_type(init).is_numeric() {
+        return Type::Unknown;
+    }
+    let Some((op, args)) = defining_op(func, store_value) else {
+        return Type::Unknown;
+    };
+    if !matches!(
+        op,
+        Op::Add | Op::Sub | Op::Mul | Op::Div | Op::Mod | Op::Pow | Op::Neg | Op::ToNumber
+    ) || args.is_empty()
+        || !args
+            .iter()
+            .all(|&arg| arg == carried || func.value_type(arg).is_numeric())
+    {
+        return Type::Unknown;
+    }
+    Type::Number
+}
+
+/// The op and arguments of the instruction that produced `value`.
+fn defining_op(func: &Function, value: ValueId) -> Option<(Op, Vec<ValueId>)> {
+    for b in 0..func.block_count() as u32 {
+        for inst in &func.block(b).insts {
+            if inst.result == Some(value) {
+                return Some((inst.op, inst.args.clone()));
+            }
+        }
+    }
+    None
 }
 
 /// Whether promoting `object`'s `atom` field may elide the object: the whole body
