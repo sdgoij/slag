@@ -479,20 +479,24 @@ Gap = Slag ms / V8 ms, so > 1 means V8 was faster:
 | strings | 5 | 10.64x | 4.95x |
 | **All** | **77** | **10.00x** | **3.76x** |
 
-Measured 2026-10-28 at the loop-carried-field typing, one `bench.js` run (the
-run before it read 10.04x / 3.72x; the metric's own spread is wider than that
-and is discussed below). The `objects` family fell 6.26x -> 4.18x from three
-rows, all of them loop accumulators that now stay in raw f64 registers with the
-objects they read gone from the loop: `objects/compound_assign` 30.4 -> 3.1 ms
-(-90% over the session), `objects/warm_store` 34.7 -> 3.1 (-91%) and
-`objects/destructure` 3.6 -> 1.0 (-72%); the earlier work on the same pass had
-already moved the first two to 12.1 and 9.3. `objects/spread_assign` is 107.6 ms
-and `opcost/object_keys` 37.0, from 117.3 and 43.8 before the `Object.assign` and
-`Object.keys` slices. The `globals` interpreter column is load-sensitive (0.73x
-here against 0.84x and 0.87x in adjacent runs). The previous table measured
-2026-10-27 at `7685ef95` (10.12x / 3.69x), before that 2026-10-25 at `ee72c0b8`
-(10.54x / 3.76x); the commit before the security audit `883af3dd` reads 10.40x /
-3.69x, and the audit-era measurement here was 10.76x / 3.88x.
+Measured 2026-10-28 at the loop-carried-field typing, one `bench.js` run. Read
+this table as "about 10x" and nothing finer: six runs of the two binaries around
+this change read 9.00, 9.73, 10.00, 10.04, 10.27 and 10.53 for the JIT gap, and
+the family means swing with it (`calls` 8.67x to 10.88x, `strings` 8.44x to
+10.64x) because V8's side of each ratio is a single unbounded run. The row-level
+numbers are the ones to trust, and they come from interleaved A/B rounds. The
+`objects` family fell 6.26x -> 4.18x from three rows, all of them loop
+accumulators that now stay in raw f64 registers with the objects they read gone
+from the loop: `objects/compound_assign` 30.4 -> 3.1 ms (-90% over the session),
+`objects/warm_store` 34.7 -> 3.1 (-91%) and `objects/destructure` 3.6 -> 1.0
+(-72%); the earlier work on the same pass had already moved the first two to 12.1
+and 9.3. `objects/spread_assign` is 107.6 ms and `opcost/object_keys` 37.0, from
+117.3 and 43.8 before the `Object.assign` and `Object.keys` slices. The `globals`
+interpreter column is load-sensitive (0.73x here against 0.84x and 0.87x in
+adjacent runs). The previous table measured 2026-10-27 at `7685ef95` (10.12x /
+3.69x), before that 2026-10-25 at `ee72c0b8` (10.54x / 3.76x); the commit before
+the security audit `883af3dd` reads 10.40x / 3.69x, and the audit-era measurement
+here was 10.76x / 3.88x.
 `.notes/perf-plan.md` records the measurements and `.notes/perf.md` the landed
 changes.
 

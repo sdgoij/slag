@@ -158,15 +158,17 @@ trade-off.** Report the failing fixture and revert; do not commit around it.
 
 ### 4.1 Headline
 
-77 corpus rows, all four modes agree: **JIT gap about 10.0x, interpreter gap
-about 3.7x** (2026-10-28; was 10.12 / 3.69 at `7685ef95`). The metric's own
-run-to-run spread is wide: three `bench.js` runs of ONE binary read 9.73 / 10.25
-/ 10.53 before the last change, so the second decimal of a single run is not a
-result, and a row-level change under 1% is invisible in the headline. The
-interpreter number is the important one: Slag's interpreter is within 3.7x of
-V8's, while its compiled code is 10.0x off. V8's tier-on-tier gain is therefore
-about 2.7x larger than Slag's. The deficit is in what the optimizing tier does
-with a body, not in the cost of a single runtime operation.
+77 corpus rows, all four modes agree: **JIT gap about 10x, interpreter gap
+about 3.8x** (2026-10-28; was 10.12 / 3.69 at `7685ef95`). Do not quote the
+second decimal of a single run: six runs of the two binaries around the last
+change read 9.00 / 9.73 / 10.00 / 10.04 / 10.27 / 10.53, and the family means
+swing with them (`calls` 8.67x to 10.88x) because V8's side of each ratio is a
+single unbounded run. A row-level change is the only resolvable unit, and only
+when it is backed by a same-binary seam or an IR diff. The interpreter number is
+the important one: Slag's interpreter is within about 3.8x of V8's, while its
+compiled code is 10x off. V8's tier-on-tier gain is therefore about 2.6x larger
+than Slag's. The deficit is in what the optimizing tier does with a body, not in
+the cost of a single runtime operation.
 
 Per family (README, 2026-10-28): globals 2.33x, objects 4.18x, language 6.95x,
 builtins 8.17x, calls 8.67x, arrays 10.06x, strings 10.64x, control 11.79x,
