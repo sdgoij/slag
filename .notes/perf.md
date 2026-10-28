@@ -17353,3 +17353,70 @@ corpus total, with mixed per-row movement (`calls/closure_capture` -3.5%,
 `calls/direct_leaf` -5.7%, `builtins/json_roundtrip` +4.7%, the for-in row
 +3.1%), i.e. layout. Reverted; the gate stays `scalarized`, and the reason is in
 a comment at the gate.
+
+## LANDED (2026-10-28): a loop-carried field becomes a header phi, and the object is elided
+
+`objects/compound_assign` (`o.x += 1; s += o.x` in a loop header) read the field
+before storing it, so the scalar pass had no preceding store to forward, declined,
+and left the object allocated: 30.4 ms against a ~3 ms floor.
+
+`promote_loop_carried_field` (`opt/pass/scalar.rs`) now runs after `one_pass` in
+the same fixed point. For a non-escaping literal object, a header that is its own
+back-edge with exactly one entry predecessor, and the field's `MemberCellLoad`
+followed by a `MemberGuard` then a `MemberStore` in that header, it pushes a block
+parameter, appends the literal on the entry edge and the stored value on the
+back-edge, substitutes the guard's result with the parameter, and drops the store,
+the load, the guard, the slot store and the literal. The lowered body is:
+
+```
+b1(v25:f64, v29:?):
+  v9 = Add(v29, v8)          ; the field, no cell probe, no guard
+  v15 = Add(v14, v9)         ; s += field
+  FrameStore(v15) slot2
+  v22 = Add(v25, 1)          ; the counter
+  branch v24, b1(v22, v9), b2(v22)
+```
+
+Measured on the row, 7 interleaved rounds, per-row minima: 30.86/30.92/30.92/
+31.95/31.57/33.34/31.07 -> 12.93/12.42/13.00/13.05/13.13/13.22/12.80, i.e. 30.40
+-> 12.11 ms (**-60.2%**). The same-binary seam (`SLAG_SCALAR_LOOP=0`, 5 rounds)
+agrees: 30.86 -> 11.98 (**-61.2%**), every off round 30.86-32.38 and every on
+round 11.98-13.01, a total separation. Corpus parity 0/77. Three `bench.js` runs
+of the one binary read `mean-jitGap` 9.73 / 10.25 / 10.53 (the metric's own
+run-to-run spread is that wide; the previous commit measured 10.12), the
+`objects` family 5.64 / 5.33 / 5.27 against 6.26.
+
+**Attribution.** A same-binary seam is the only honest A/B here, and it needed a
+new one: `SLAG_SCALAR=0` disables the whole pass. With `SLAG_SCALAR_LOOP=0`, an
+IR-diff of all 77 rows (per row, one process, `JIT_DUMP_IR=1`, interned-string
+addresses normalised) leaves exactly ONE row whose IR differs, `compound_assign`.
+Everything else the seam "moved" (up to -9.6% on `slice_concat`) is noise: the
+same row spanned 20.14-22.78 ms across rounds. A before/after *build* comparison
+had suggested +6.7% on `calls/direct_leaf` and +5.6% on
+`language/expressions/template-literal/evaluation-order`; those rows' IR is
+byte-identical, so that was layout, not the pass.
+
+**Two bugs the gate caught.** (1) The refusal "no guard op in the body" was
+checked before, and then the promotion looked for a `MemberGuard` to strip, so it
+could never fire. Corrected: `only_these_sites` requires the body's ONLY guard op
+to be the `MemberGuard` being removed (a surviving guard is a deopt point, and a
+deopt resumes the interpreter with the frame, where the elided object no longer
+is) and every other reference to the object to be a frame access of the three
+sites. (2) `find_member_store_after` used `bool::then_some((i, inst.args[1]))`,
+which evaluates its argument eagerly and indexed `args[1]` on instructions with no
+args; the workspace test suite panicked on it (`installed_jit_hoists_invariant_
+member_reads_...`). Now `then`.
+
+A new test, `opt_tier_scalar_promotes_a_loop_carried_field`, pins the shape (note:
+the same field update in a `while` body does not lift at all, `AssignMemberName
+(compound)`, so the test uses the `for` form).
+
+Gates: fmt, `clippy --workspace -D warnings`, `cargo test --workspace`; test262
+language 23,726 + built-ins 23,821 + annexB 1,086 + intl402 3,365 at 100%.
+
+**What is left in the row.** The header parameter is `Unknown`, so the three `Add`s
+keep their tag checks and `s` stays a frame slot. The next slice types the carried
+value `Number`: the entry value is a numeric literal and the back-edge value is a
+numeric-preserving arithmetic op over the carried value, so by induction it is a
+Number on every iteration (a Number op Number cannot produce a String). That is
+the same lever the `warm_store` re-type used, one level up.

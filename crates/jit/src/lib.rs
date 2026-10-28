@@ -2350,6 +2350,35 @@ mod tests {
     }
 
     #[test]
+    fn opt_tier_scalar_promotes_a_loop_carried_field() {
+        // The `compound_assign` shape: the field is read before its store in the
+        // loop header, so there is no preceding store to forward and the read's
+        // value is the previous iteration's. It becomes a header parameter (the
+        // literal on the entry edge, the stored value on the back-edge) and the
+        // object is elided. A refactor that loses this leaves the row ~10x
+        // slower while staying correct, so the `REPLACED` delta pins the pass
+        // fired.
+        let source = "function f(n) { var o = { x: 0 }; var s = 0; \
+                      for (var i = 0; i < n; i++) { o.x += 1; s += o.x; } \
+                      return s; } \
+                      f(1000);";
+        let interp = {
+            let mut agent = runtime::Agent::new();
+            agent.initialize_host_defined_realm().expect("realm");
+            agent.run_script(source).expect("interp runs")
+        };
+        let before = crate::opt::pass::scalar::REPLACED.load(Ordering::Relaxed);
+        let (value, compiled) = with_opt_jit_agent(|agent| agent.run_script(source).expect("runs"));
+        let replaced = crate::opt::pass::scalar::REPLACED.load(Ordering::Relaxed) - before;
+        assert_eq!(
+            value, interp,
+            "the optimizing tier must match the interpreter"
+        );
+        assert!(compiled >= 1, "{compiled} bodies compiled");
+        assert!(replaced >= 1, "the scalar pass replaced {replaced} reads");
+    }
+
+    #[test]
     fn opt_tier_call_body_matches_the_interpreter() {
         // I5c-0: a body with a `CallFast` now lifts to `Op::Call` and lowers
         // through the general `call_slow` helper, so a calling body enters the

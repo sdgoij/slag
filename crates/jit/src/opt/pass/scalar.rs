@@ -48,6 +48,15 @@ fn enabled() -> bool {
         .unwrap_or(true)
 }
 
+/// Whether [`promote_loop_carried_field`] runs. On by default;
+/// `SLAG_SCALAR_LOOP=0` disables only this half  -  the seam that isolates a
+/// change to it from the pass's other rewrites and from the build's layout.
+fn loop_carried_enabled() -> bool {
+    std::env::var("SLAG_SCALAR_LOOP")
+        .map(|value| value != "0")
+        .unwrap_or(true)
+}
+
 /// Replace non-escaping object literals with their field values. Returns
 /// whether the IR changed.
 pub fn run(func: &mut Function, body: &CompiledBody) -> bool {
@@ -57,13 +66,249 @@ pub fn run(func: &mut Function, body: &CompiledBody) -> bool {
     // A replaced read can expose the next literal (an inner object read back
     // through a slot), so iterate to a small fixed point.
     let mut changed = false;
+    let loop_carried = loop_carried_enabled();
     for _ in 0..4 {
-        if !one_pass(func, body) {
+        if !(one_pass(func, body) || (loop_carried && promote_loop_carried_field(func, body))) {
             break;
         }
         changed = true;
     }
     changed
+}
+
+/// Promote a non-escaping object's loop-carried field to a loop phi, then elide
+/// the object. The `compound_assign` shape (`o.x += 1; s += o.x` across loop
+/// iterations) reads the field before its store, so `one_pass` has no preceding
+/// store to forward and declines, leaving the object allocated. The field's
+/// value at the loop header is a phi (the initial literal on the entry edge, the
+/// stored value on the back-edge).
+///
+/// The gate is deliberately narrow: a header that is its own only back-edge with
+/// exactly one entry predecessor, the field's load and store both in the header
+/// with the load first, and [`only_these_sites`] admitting the elision. It
+/// returns after one promotion; `run` iterates.
+fn promote_loop_carried_field(func: &mut Function, body: &CompiledBody) -> bool {
+    let mut objects = literal_objects(func, body);
+    if objects.is_empty() {
+        return false;
+    }
+    let arrays = literal_arrays(func, body);
+    let roots: HashSet<ValueId> = objects.keys().chain(arrays.keys()).copied().collect();
+    let aliases = slot_aliases(func, &roots);
+    let escaping = escaping_literals(func, &objects, &arrays, &aliases);
+    objects.retain(|object, _| !escaping.contains(object));
+    if objects.is_empty() {
+        return false;
+    }
+    let n = func.block_count() as u32;
+    let mut preds: Vec<Vec<u32>> = vec![Vec::new(); n as usize];
+    for b in 0..n {
+        for p in edge_targets(func, b) {
+            preds[p as usize].push(b);
+        }
+    }
+    for h in 0..n {
+        // The header must be its own back-edge with exactly one other
+        // predecessor (the entry edge from outside the loop).
+        if preds[h as usize].len() != 2 || !preds[h as usize].contains(&h) {
+            continue;
+        }
+        let Some(entry) = preds[h as usize].iter().copied().find(|&p| p != h) else {
+            continue;
+        };
+        for (&object, entries) in &objects {
+            for &(atom, init) in entries {
+                let Some((load, load_at)) =
+                    find_member_load(func, h, object, atom, &objects, &arrays, &aliases)
+                else {
+                    continue;
+                };
+                let Some((store_at, store_value)) = find_member_store_after(
+                    func, h, load_at, object, atom, &objects, &arrays, &aliases,
+                ) else {
+                    continue;
+                };
+                let Some(guard) = func.block(h).insts.iter().find_map(|inst| {
+                    (inst.op == Op::MemberGuard && inst.args.len() == 2 && inst.args[1] == load)
+                        .then_some(inst.result)
+                        .flatten()
+                }) else {
+                    continue;
+                };
+                if !only_these_sites(
+                    func, object, atom, h, load, guard, store_at, &objects, &arrays, &aliases,
+                ) {
+                    continue;
+                }
+                let param = func.push_value(Type::Unknown);
+                func.block_mut(h).params.push(param);
+                append_edge_arg(func, entry, h, init);
+                append_edge_arg(func, h, h, store_value);
+                let mut subst = vec![None; func.value_count() as usize];
+                subst[guard as usize] = Some(param);
+                rewrite_uses(func, &subst);
+                func.block_mut(h).insts.remove(store_at);
+                strip_instructions(func, &[guard, load]);
+                let replaced: HashSet<ValueId> = std::iter::once(object).collect();
+                drop_dead_stores(func, &replaced);
+                strip_dead_literals(func, &replaced);
+                REPLACED.fetch_add(1, Ordering::Relaxed);
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Whether promoting `object`'s `atom` field may elide the object: the whole body
+/// may hold no reference to it other than the `load`, `guard` and `store` the
+/// promotion removes, and no guard op other than that `guard`.
+///
+/// A guard is a deopt point, and a deopt resumes the interpreter with the frame,
+/// where an elided object no longer is. A read that survives the promotion would
+/// read a field the removed store left at its old value, so the object could only
+/// be elided if every such read were also removed.
+#[allow(clippy::too_many_arguments)]
+fn only_these_sites(
+    func: &Function,
+    object: ValueId,
+    atom: u32,
+    header: u32,
+    load: ValueId,
+    guard: ValueId,
+    store_at: usize,
+    objects: &HashMap<ValueId, Vec<(u32, ValueId)>>,
+    arrays: &HashMap<ValueId, Vec<ValueId>>,
+    aliases: &HashMap<ValueId, ValueId>,
+) -> bool {
+    if uses_of(func, load) != 1 {
+        return false;
+    }
+    for b in 0..func.block_count() as u32 {
+        for (i, inst) in func.block(b).insts.iter().enumerate() {
+            if matches!(
+                inst.op,
+                Op::GuardType | Op::Check | Op::GuardCallee | Op::CalleeEq
+            ) {
+                return false;
+            }
+            let touches = inst
+                .args
+                .iter()
+                .any(|&arg| root_of_any(arg, objects, arrays, aliases) == Some((object, false)));
+            if !touches {
+                continue;
+            }
+            let is_site = match inst.op {
+                Op::FrameStore | Op::FrameLoad => true,
+                Op::MemberCellLoad => inst.imm == Imm::Atom(atom) && inst.result == Some(load),
+                Op::MemberGuard => inst.result == Some(guard),
+                Op::MemberStore => b == header && i == store_at,
+                _ => false,
+            };
+            if !is_site {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+/// The successor blocks of `b` (a self-loop listed once).
+fn edge_targets(func: &Function, b: u32) -> Vec<u32> {
+    match func.block(b).term.as_ref() {
+        Some(Term::Jump { target, .. }) => vec![*target],
+        Some(Term::Branch {
+            then_block,
+            else_block,
+            ..
+        }) => {
+            if then_block == else_block {
+                vec![*then_block]
+            } else {
+                vec![*then_block, *else_block]
+            }
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// Append one argument to every edge `from -> to`.
+fn append_edge_arg(func: &mut Function, from: u32, to: u32, v: ValueId) {
+    match func.block_mut(from).term.as_mut() {
+        Some(Term::Jump { target, args }) => {
+            if *target == to {
+                args.push(v);
+            }
+        }
+        Some(Term::Branch {
+            then_block,
+            then_args,
+            else_block,
+            else_args,
+            ..
+        }) => {
+            if *then_block == to {
+                then_args.push(v);
+            }
+            if *else_block == to {
+                else_args.push(v);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// The `MemberCellLoad` of `atom` on `object` in block `b`, with its index.
+fn find_member_load(
+    func: &Function,
+    b: u32,
+    object: ValueId,
+    atom: u32,
+    objects: &HashMap<ValueId, Vec<(u32, ValueId)>>,
+    arrays: &HashMap<ValueId, Vec<ValueId>>,
+    aliases: &HashMap<ValueId, ValueId>,
+) -> Option<(ValueId, usize)> {
+    func.block(b)
+        .insts
+        .iter()
+        .enumerate()
+        .find_map(|(i, inst)| {
+            (inst.op == Op::MemberCellLoad
+                && inst.imm == Imm::Atom(atom)
+                && inst.args.len() == 1
+                && root_of_any(inst.args[0], objects, arrays, aliases) == Some((object, false)))
+            .then_some(inst.result)
+            .flatten()
+            .map(|load| (load, i))
+        })
+}
+
+/// The `MemberStore` of `atom` on `object` in block `b` after `after`, with its
+/// index and stored value.
+#[allow(clippy::too_many_arguments)]
+fn find_member_store_after(
+    func: &Function,
+    b: u32,
+    after: usize,
+    object: ValueId,
+    atom: u32,
+    objects: &HashMap<ValueId, Vec<(u32, ValueId)>>,
+    arrays: &HashMap<ValueId, Vec<ValueId>>,
+    aliases: &HashMap<ValueId, ValueId>,
+) -> Option<(usize, ValueId)> {
+    func.block(b)
+        .insts
+        .iter()
+        .enumerate()
+        .skip(after + 1)
+        .find_map(|(i, inst)| {
+            (inst.op == Op::MemberStore
+                && inst.imm == Imm::Atom(atom)
+                && inst.args.len() == 2
+                && root_of_any(inst.args[0], objects, arrays, aliases) == Some((object, false)))
+            .then(|| (i, inst.args[1]))
+        })
 }
 
 fn one_pass(func: &mut Function, body: &CompiledBody) -> bool {

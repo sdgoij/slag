@@ -64,6 +64,8 @@ Never measure a binary you cannot tie to the source you are reading. See
 | `SLAG_TYPER=0` | the typer's read guard (`Op::GuardType` on a read) |
 | `SLAG_GUARD=0` | the guard-pruning pass (`opt/pass/guard.rs`) |
 | `SLAG_INLINE=0` | the trial-inline splice (on by default) |
+| `SLAG_SCALAR=0` | the scalar-replacement pass (`opt/pass/scalar.rs`) |
+| `SLAG_SCALAR_LOOP=0` | only the loop-carried field promotion (`promote_loop_carried_field`) |
 | `SLAG_INLINE_FEEDBACK=1` | additionally splices feedback-recorded callees |
 | `SLAG_INLINE_BUDGET=N` | inline code-growth budget |
 | `--jitless` | no compiled code; the interpreter only |
@@ -147,11 +149,15 @@ trade-off.** Report the failing fixture and revert; do not commit around it.
 
 ### 4.1 Headline
 
-77 corpus rows, all four modes agree: **JIT gap 10.12x, interpreter gap 3.69x**
-(2026-10-27; was 10.55 / 3.79 at the start of the session). The second number is the important one: Slag's interpreter is within
-3.7x of V8's, while its compiled code is 10.1x off. V8's tier-on-tier gain is
-therefore about 2.8x larger than Slag's. The deficit is in what the optimizing
-tier does with a body, not in the cost of a single runtime operation.
+77 corpus rows, all four modes agree: **JIT gap about 10.1x, interpreter gap
+about 3.7x** (2026-10-28; was 10.12 / 3.69 at `7685ef95`). The metric's own
+run-to-run spread is wide: three `bench.js` runs of ONE binary read 9.73 / 10.25
+/ 10.53, so the second decimal of a single run is not a result, and a row-level
+change under 1% is invisible in the headline. The interpreter number is the
+important one: Slag's interpreter is within 3.7x of V8's, while its compiled
+code is 10.1x off. V8's tier-on-tier gain is therefore about 2.8x larger than
+Slag's. The deficit is in what the optimizing tier does with a body, not in the
+cost of a single runtime operation.
 
 Per family (README, 2026-10-27): globals 2.10x, language 5.70x, builtins 7.29x,
 objects 6.26x, calls 8.96x, strings 9.52x, arrays 9.88x, control 12.08x,
@@ -231,6 +237,7 @@ the proof. The proof is the priced next slice; see section 7.
 | `Object.assign`/spread own-data copy: read the descriptor value, and enumerate a vector-free ordinary source from its map (`own_string_data_keys`) instead of `materialize_properties` + three `Vec`s | `objects/spread_assign` 117.3 -> 90.1 ms (-23%), `Object.assign` 101 -> 78 ms; corpus mean-jitGap 10.51 -> 10.26 |
 | `Object.keys` ordinary enumeration: `own_string_props` (no per-key lookup, sound because `keys` never calls `Get`) + an `ordinary_own_property_keys` one-vector fast path for the no-index/no-symbol shape; `Object.values`/`entries` read the descriptor value instead of a second `Get`; `Object.keys` boxes during enumeration (no second pass) | `opcost/object_keys` 43.8 -> 31.0 ms (-29%), `builtins/object_keys` 58.7 -> 42.3 ms (-28%), `opcost/json_stringify` ~-5% |
 | Scalar replacement extends to a non-escaping object's mutable field (cross-block slot alias + store-to-load), and the pipeline re-runs `narrow`/`mem2reg` after `scalar` so a guard-poisoned accumulator types to a raw f64 add | `objects/warm_store` 34.7 -> 9.3 ms (-73%), `objects/compound_assign` 43.9 -> 28.1 (-36%), `objects/destructure` 3.6 -> 2.6 (-28%); corpus -1.85%, mean-jitGap 10.26 -> 10.12 |
+| `promote_loop_carried_field`: a field read before its store in the loop header becomes a header phi (literal on the entry edge, stored value on the back-edge) and the object is elided | `objects/compound_assign` 30.4 -> 12.1 ms (-60%), total separation over 7 interleaved rounds and over the `SLAG_SCALAR_LOOP=0` seam (-61%); the `objects` family 6.26 -> 5.3x, headline unchanged inside its spread |
 | Global read cells (declarative record, nested bodies) | top-level `const` 52.5 -> about 2.4 ms per 1M; nested helper 130.2 -> 2.5 ms |
 | Map key-index mixer (Goats) | `mapget` -29%, `maphas` -37% |
 | Optimizing-tier GC safe point | a lifted allocating loop had no safepoint and a 46 ms pause; fixed |
@@ -287,8 +294,16 @@ Corollary: "refused by the optimizing tier" does not mean slow. Three bodies
 that left the refusal census were 3 to 5% **slower** compiled. Tier choice
 needs its own per-row measurement.
 
-## 7. Open leads (2026-10-26)
+## 7. Open leads (2026-10-28)
 
+- **Type the loop-carried field Number.** `promote_loop_carried_field` leaves the
+  header phi `Unknown`, so the row keeps three tag-checked `Add`s and a frame
+  slot for the accumulator (12 ms against a ~3 ms floor). The induction is
+  available: the entry value is a numeric literal and the back-edge value is a
+  numeric-preserving arithmetic op over the carried value, so the carried value
+  is a Number on every iteration. Seeding `narrow`'s numeric lattice from a
+  block parameter's declared type is what lets the re-type reach it. Falsifier:
+  the row not reaching the f64 num-slot lane.
 - **Consume the `numbers=true` hoist proof.** The step already establishes the
   invariant operand's type at loop entry; the optimizing tier ignores it. Type
   the hoisted-slot `FrameLoad`, let the slot fixpoint type the accumulator.

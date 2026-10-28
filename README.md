@@ -468,27 +468,33 @@ Gap = Slag ms / V8 ms, so > 1 means V8 was faster:
 
 | Family | Workloads | JIT gap | Interpreter gap |
 |---|---|---|---|
-| arrays | 6 | 9.88x | 3.52x |
-| builtins | 5 | 7.29x | 3.78x |
-| calls | 6 | 8.96x | 5.29x |
-| control | 5 | 12.08x | 3.62x |
-| globals | 4 | 2.10x | 0.74x |
-| language | 3 | 5.70x | 5.23x |
-| objects | 7 | 6.26x | 2.39x |
-| opcost | 36 | 12.56x | 3.75x |
-| strings | 5 | 9.52x | 4.84x |
-| **All** | **77** | **10.12x** | **3.69x** |
+| arrays | 6 | 9.93x | 3.75x |
+| builtins | 5 | 7.65x | 4.03x |
+| calls | 6 | 9.03x | 5.35x |
+| control | 5 | 11.68x | 3.69x |
+| globals | 4 | 2.12x | 0.81x |
+| language | 3 | 6.78x | 5.50x |
+| objects | 7 | 5.27x | 2.68x |
+| opcost | 36 | 12.88x | 3.75x |
+| strings | 5 | 9.89x | 4.99x |
+| **All** | **77** | **10.25x** | **3.79x** |
 
-Measured 2026-10-27 at the scalar-replacement landing (`7685ef95`), one
-`bench.js` run after the change's interleaved A/B; the `objects` family fell
-8.99x -> 6.26x from three rows, `objects/warm_store` 34.7 -> 9.3 ms (-73%),
-`objects/compound_assign` 43.9 -> 28.1 (-36%) and `objects/destructure` 3.6 ->
-2.6 (-28%), and the earlier sessions' `Object.assign`/`Object.keys` work moved
-`objects/spread_assign` 117.3 -> 90.1 ms and `opcost/object_keys` 43.8 -> 31.0.
-The `globals` interpreter column is load-sensitive (0.74x here against 2.53x in
-an adjacent run). The previous table measured 2026-10-25 at `ee72c0b8` (10.54x /
-3.76x); the commit before the security audit `883af3dd` reads 10.40x / 3.69x,
-and the audit-era measurement here was 10.76x / 3.88x.
+Measured 2026-10-28 at the loop-carried-field promotion (`scalar.rs`), the
+middle of three `bench.js` runs of that one binary. Read the headline with its
+spread: the three runs read 9.73x / 10.25x / 10.53x for the JIT gap and 3.83x /
+3.79x / 3.86x for the interpreter, which is the metric's own run-to-run noise
+(no interpreter code changed), so a single run cannot resolve a change smaller
+than about half a point. The row-level numbers are the ones to trust, and they
+come from interleaved A/B rounds: `objects/compound_assign` 30.4 -> 12.1 ms
+(-60%) in this change, and before it `objects/warm_store` 34.7 -> 9.3 ms (-73%),
+`objects/destructure` 3.6 -> 2.6 (-28%), with the earlier sessions'
+`Object.assign`/`Object.keys` work moving `objects/spread_assign` 117.3 ->
+90.1 ms and `opcost/object_keys` 43.8 -> 31.0. Those four rows took the `objects`
+family from 8.99x to 5.27x. The `globals` interpreter column is load-sensitive
+(0.81x here against 0.74x and 0.87x in the adjacent runs). The previous table
+measured 2026-10-27 at `7685ef95` (10.12x / 3.69x), before that 2026-10-25 at
+`ee72c0b8` (10.54x / 3.76x); the commit before the security audit `883af3dd`
+reads 10.40x / 3.69x, and the audit-era measurement here was 10.76x / 3.88x.
 `.notes/perf-plan.md` records the measurements and `.notes/perf.md` the landed
 changes.
 
@@ -497,21 +503,22 @@ A sample of the per-workload rows (the command above prints all 77), ms per
 
 | Workload | Slag JIT | Slag interp | V8 JIT | V8 `--jitless` | JIT gap | Interp gap |
 |---|---|---|---|---|---|---|
-| `arrays/for_of_dense.js` | 7.8 | 58.2 | 1.9 | 66.3 | 4.15x | 0.90x |
-| `arrays/typed_array.js` | 17.3 | 164.7 | 1.1 | 45.5 | 15.93x | 3.47x |
-| `builtins/json_roundtrip.js` | 55.1 | 57.4 | 13.1 | 15.9 | 4.20x | 3.49x |
-| `builtins/math_intrinsics.js` | 9.9 | 69.5 | 152.2 | 182.3 | 0.07x | 0.38x |
-| `calls/direct_leaf.js` | 7.7 | 110.8 | 1.2 | 55.3 | 6.70x | 2.01x |
-| `calls/recursive_fib.js` | 49.0 | 511.0 | 7.3 | 39.8 | 6.79x | 12.57x |
-| `control/generator_loop.js` | 35.4 | 49.7 | 2.3 | 10.7 | 15.15x | 4.63x |
-| `globals/declarative_read.js` | 2.4 | 19.9 | 0.6 | 13.8 | 4.28x | 1.44x |
-| `globals/hoisted_local.js` | 2.5 | 20.2 | 0.6 | 13.1 | 4.45x | 1.53x |
-| `globals/nested_read.js` | 2.5 | 19.7 | 90.1 | 107.1 | 0.03x | 0.18x |
-| `globals/object_read.js` | 2.4 | 20.1 | 86.1 | 96.5 | 0.03x | 0.21x |
-| `objects/destructure.js` | 3.7 | 168.7 | 0.8 | 49.8 | 4.85x | 3.39x |
-| `objects/own_read.js` | 3.0 | 38.7 | 1.2 | 51.4 | 2.39x | 0.75x |
-| `objects/warm_store.js` | 35.6 | 124.0 | 2.3 | 53.2 | 15.54x | 2.33x |
-| `strings/char_ops.js` | 3.3 | 23.7 | 0.4 | 5.7 | 8.67x | 4.10x |
+| `arrays/for_of_dense.js` | 8.6 | 65.3 | 1.9 | 68.5 | 4.54x | 0.95x |
+| `arrays/typed_array.js` | 18.6 | 191.1 | 1.2 | 49.9 | 15.66x | 3.83x |
+| `builtins/json_roundtrip.js` | 76.8 | 63.2 | 14.3 | 17.0 | 5.38x | 3.71x |
+| `builtins/math_intrinsics.js` | 10.9 | 76.9 | 165.6 | 206.9 | 0.07x | 0.37x |
+| `calls/direct_leaf.js` | 6.1 | 91.6 | 1.2 | 41.5 | 5.06x | 2.21x |
+| `calls/recursive_fib.js` | 52.3 | 587.5 | 8.1 | 41.0 | 6.46x | 14.34x |
+| `control/generator_loop.js` | 34.9 | 51.4 | 2.8 | 10.8 | 12.41x | 4.74x |
+| `globals/declarative_read.js` | 2.6 | 20.1 | 0.6 | 13.7 | 4.22x | 1.47x |
+| `globals/hoisted_local.js` | 2.7 | 21.4 | 0.6 | 15.0 | 4.22x | 1.42x |
+| `globals/nested_read.js` | 2.8 | 19.6 | 102.1 | 113.6 | 0.03x | 0.17x |
+| `globals/object_read.js` | 2.6 | 19.6 | 101.8 | 106.8 | 0.03x | 0.18x |
+| `objects/compound_assign.js` | 12.9 | 158.4 | 2.5 | 67.0 | 5.10x | 2.36x |
+| `objects/destructure.js` | 2.8 | 205.4 | 0.9 | 57.5 | 3.23x | 3.57x |
+| `objects/own_read.js` | 3.1 | 39.6 | 1.3 | 56.3 | 2.35x | 0.70x |
+| `objects/warm_store.js` | 9.7 | 140.7 | 2.4 | 58.2 | 4.04x | 2.42x |
+| `strings/char_ops.js` | 3.5 | 24.8 | 0.4 | 6.5 | 8.43x | 3.82x |
 
 The `globals` family is the one family that is a controlled experiment rather
 than a workload: the same loop reading the same value as a top-level `const`
