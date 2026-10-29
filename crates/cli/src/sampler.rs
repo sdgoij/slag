@@ -90,7 +90,17 @@ mod imp {
         fn GetModuleHandleW(name: *const u16) -> Handle;
     }
 
+    // With raylib linked these two resolve to its winmm shim instead
+    // (`runtime::raylib`), which is what keeps `winmm.lib` out of the link: its
+    // plain `PlaySound` collides with raylib's. Nothing else here needs winmm.
+    #[cfg(not(feature = "raylib"))]
     #[link(name = "winmm")]
+    unsafe extern "system" {
+        fn timeBeginPeriod(period: u32) -> u32;
+        fn timeEndPeriod(period: u32) -> u32;
+    }
+
+    #[cfg(feature = "raylib")]
     unsafe extern "system" {
         fn timeBeginPeriod(period: u32) -> u32;
         fn timeEndPeriod(period: u32) -> u32;
