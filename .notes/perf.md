@@ -18389,3 +18389,188 @@ project; the env lane is runtime work and is the cheaper half.
 Also worth recording: `a-named-leaf` at 7.6 ns/call against node's 41 ns means
 the *leaf call lane itself* is already 5x faster than node's compiled call. The
 gap on `calls/*` is concentrated in the capturing shape, not in calls as such.
+
+## INSTRUMENT (2026-10-29): a RIP sampler, and what it says the gap is made of
+
+Every ranking instrument this project had was an *external* one: total time
+per row, a tier seam, or a hand-instrumented phase timer. None of them could
+answer "which function is the engine running", which is why the last sessions
+priced components one at a time and still could not see the whole. This adds
+the missing one.
+
+### The sampler
+
+`SLAG_SAMPLE=<interval-µs>` starts a watchdog thread in the CLI
+(`crates/cli/src/sampler.rs`). It suspends the engine thread on the interval,
+reads `Rip` from the thread `CONTEXT`, resumes, and records
+`rip - module_base`. At exit it prints to stderr:
+
+    profile samples <n> outside <m> (<pct>%)
+    profile 0x<rva> <count> <share>
+    profile end
+
+The binary does no symbol handling. `tools/profile.py` turns the offsets into
+functions with the artifacts the release build already writes: the PE unwind
+directory (`llvm-readobj --unwind`) for exact `[start, end)` ranges and the
+PBD's publics (`llvm-pdbutil dump -publics`) for names. It caches the table
+next to the binary. `--group` aggregates by `crate::module`, `--top N` by
+function.
+
+Two attribution traps, both hit and fixed while building it:
+
+1. **A public symbol has no size.** Letting `llvm-symbolizer` resolve an
+   address directly attributes every address after the last public symbol to
+   that symbol: `Vm::setup_frame` (a 4.4 KB function) swallowed 5 MB of code
+   and appeared as the engine's #1 cost at 7.27%. Resolve the address to its
+   unwind range first, then name the range by the public at its start. That
+   moved `setup_frame` to 1.24% and deleted a phantom 2.1% entry
+   (`assign_super_computed`, a helper no workload calls).
+2. **Build with `debug = false` has publics for about half the functions.**
+   327 unnamed ranges remain (33% of samples); each is labelled `local near
+   <nearest preceding named function>`, which is honest but only a hint.
+
+Validated against rows whose profile is obvious: `opcost/baseline` is 90%
+outside the image (compiled code), `opcost/regexp_test` is topped by
+`regexp::engine::Matcher::match_at`, `opcost/json_stringify` by
+`builtins::json::dispatch_call`, `builtins/map_churn` by
+`builtins::keyed::dispatch_construct`.
+
+### The measurement that reframes the goal
+
+Same binary, one `--corpus` pass, 77 rows, all four modes agreeing
+(`mismatches=0`):
+
+| | total ms |
+| --- | ---: |
+| slag jit | 2085.4 |
+| slag jitless | 5320.4 |
+| node jit | 727.0 |
+| node jitless | 1758.7 |
+
+So the **total-time gap is 2.87x**, and each engine's optimizer is worth the
+same: slag's jit/jitless ratio is **2.55x**, node's is **2.42x**. The 9.7x
+`mean-jitGap` headline is a mean of per-row ratios, so it is dominated by rows
+where V8 folds the loop to nothing; it is not a statement about the engine.
+**The deficit is the runtime, at about 3x, and it is inherited equally by both
+tiers.** Optimizer work (inlining, escape analysis, better IR) cannot close
+it: at parity per tier, a perfect optimizer would only reach node's *current*
+number by fixing the primitives.
+
+### Where the 2085 ms goes (self time, corpus-wide, 63332 samples)
+
+| share | subsystem |
+| ---: | --- |
+| 37.8% | [jit/native code] (outside the image; our own compiled bodies) |
+| 9.0% | `runtime::jit` (the helper mirror) |
+| 8.2% | `runtime::builtins` |
+| 8.1% | `runtime::ir` (VM, frames, dispatch) |
+| 6.1% | `crux::object` |
+| 5.8% | `crux::heap` (allocation + GC) |
+| 4.8% | `crux::string` |
+| 3.7% | `runtime::function` (closure creation) |
+| 2.2% | `core::slice` (sort) |
+| 1.7% | `crux::map` (shapes) |
+
+It is **flat**: no function exceeds 2.2%, and the top ten together are under
+15%. There is no hot spot to fix; there is a uniform tax. That is the single
+most important thing this instrument says, and it is why every "find the one
+big win" session has ended in a NULL.
+
+Top named functions: `Heap::collect_minor_inner` 1.99,
+`jit::call_slow` 1.98, `string::lookup` 1.51, `Heap::alloc` 0.95,
+`JsString::from_utf8` 0.91, `map::Map::find` 0.85, `dense_index_define` 0.84,
+`string::intern` 0.70, `JsString::as_slice` 0.70.
+
+### Per row, where time concentrates
+
+The aggregate is flat but individual rows are not, and that is where a slice
+can be proven:
+
+`objects/spread_assign` (115 ms) is **40% property machinery**:
+`Map::find` 8.10, `JsObject::set_with_receiver_key` 7.99,
+`define_property_or_throw` 7.16, `Map::get_or_create_child` 5.07,
+`get_own_property_key` 3.79, `define_fresh` 2.20, `canonical_numeric_index`
+2.13, `string::lookup` 3.90. The define path per new key is a linear
+`Map::find` over the current shape's descriptors plus an FxHash transition
+lookup keyed on `(PropertyKey, MapAttrs)`, which is where the 45 ns measured
+for a fresh-object define (`.notes` 2026-10-29, `scratch/storecost`) comes
+from.
+
+`calls/recursive_fib` is 67% `jit::call_slow` and 29% compiled code, i.e. the
+self-call lane plus the callee's work and nothing else.
+
+`calls/method_call` is **85% compiled code**: the splice removed the runtime
+entirely. A row like that has no runtime slice to take, which is the target
+state for the others.
+
+`builtins/object_keys` is 28% native / 24% `crux::object` / 21% `crux::heap`.
+
+`language/.../head-let-fresh-binding-per-iteration` (477 ms, the #1 row) is
+`runtime::jit` 14.9, native 14.6, `runtime::ir` 10.9, **`runtime::function`
+10.8**, `crux::object` 6.7, `crux::string` 6.6. The 10.8% in
+`runtime::function` is closure creation, consistent with the 12% the ablation
+found, and it is the largest named term on the row.
+
+### Why "make one thing faster" is not the plan
+
+At 2.87x total and a uniform tax, a 10% corpus move needs roughly 200 ms, which
+is more than the entire `crux::string` family. The realistic shape is three to
+five slices of 30-60 ms each, each verified on the row it touches with a
+same-binary seam, and each recorded here.
+
+### Negative: `-C target-cpu=native`
+
+The bottleneck note lists it as an untried, knowledge-free lever. Measured:
+two builds of the same tree with and without it, 5 interleaved whole-corpus
+rounds, per-row minima: **base 2251.1 ms, native 2328.9 ms (+3.46%)**. Row
+deltas ranged from -21% to +44% on rows the flag cannot plausibly affect.
+Even if the flag helps somewhere, this machine cannot resolve it against the
+build-to-build layout effect, so it is not shippable on this evidence. Keep
+the generic target.
+
+### Negative: two builds of identical source differ by 3.5%
+
+The same run is also the cleanest measurement yet of the layout confound:
+`b-named` style row-level swings of -21..+44% and a 3.46% whole-corpus move
+between two binaries whose *source is identical* (only the codegen target
+differed). Any slice landing under ~4% must be proven with a **same-binary**
+seam, not a before/after build pair. This raises the bar for the "small
+slices" strategy and is why the sampler exists: it picks targets by share, and
+the seam proves them.
+
+### SCOPED (not started): the compiled define takes a shape-cell path
+
+The define probe (`scratch/def/three.js`, 600k defines, 46.5 ms) is the
+clearest concentrated profile in the corpus:
+
+| share | function |
+| ---: | --- |
+| 11.2% | the general `[[Set]]` routine (anonymous, calls `put_value`, `get_prototype_of`, `define_fresh`, `Map::find`, `field_offset`) |
+| 10.6% | `Map::get_or_create_child` (FxHash transition lookup) |
+| 9.9% | `Map::find` (linear descriptor scan) |
+| 4.9% | `Map::field_offset` (a **second** linear scan of the same vector) |
+| 3.1% | `JsObject::define_fresh` |
+| 2.4% | `get_own_property_key` |
+| 2.2% | `with_heap_cell` |
+
+So one new-key define performs two full descriptor scans plus a hashed
+transition lookup, and the batch literal path already proves a cheaper define
+exists: `{a:1,b:1,c:1}` costs 22 ns/field against 44 for three incremental
+defines.
+
+The slice is to let a compiled named store take the shape-cell path for a
+**missing** key as well as a present one: probe `(map id, name)` for a
+`(child map, offset)` pair, and write through `in_fields` with a map bump,
+guarded by (1) the receiver is extensible, (2) it is a plain ordinary object
+(no proxy/indexed/arguments kind), (3) the prototype chain is clean (no setter
+for the key, the same chain-clean gate the constructor fill already needs),
+and (4) the shape cell's `count` still matches the map. Any guard failure
+declines to today's path. The cell already exists for present keys
+(`emit_shape_store_probe` / `emit_deferred_field_store`), so the work is the
+decline logic and the guard set, not a new mechanism.
+
+Expected: 46 -> ~20-25 ns per define, which is 20-25 ms on
+`objects/spread_assign`, ~25 ms on the #1 row's three stores, and part of
+`calls/construct_churn`. Correctness surface is the whole [[Set]] semantics,
+so it must land behind the full four-sweep gate, with fixtures for a prototype
+setter, a non-extensible target, a frozen field, and an accessor on the chain.

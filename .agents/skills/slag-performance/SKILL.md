@@ -80,6 +80,7 @@ Never measure a binary you cannot tie to the source you are reading. See
 | `JIT_LEAF_TRACE=1` | the first leaf-probe rejection reasons |
 | `SLAG_JIT_DEOPT_PROBE=<step>` | forces a deopt at that step in every eligible body |
 | `SLAG_INLINE_TRACE=1` | per compiled body: the splice-site count, each recorded site's state/hits/first id, and each resolver lookup's outcome |
+| `SLAG_SAMPLE=<µs>` | a flat self-time profile: a watchdog samples the engine thread's `Rip` and prints image offsets to stderr; `tools/profile.py` symbolizes them. Use it to *choose* a target, never during a timed A/B |
 | `SLAG_CLOSURE_PROFILE=1` | per-phase mean of closure instantiation (`closure <phase> <raw> <net>`): `register_function`'s phases plus the instantiation prelude and the interpreter's creation step. Cycle-counter based, inert when unset |
 | `SLAG_CLOSURE_SKIP=props` | skips `set_function_properties_batched` at closure creation, so `ablate.sh` prices that component in the same binary |
 
@@ -129,6 +130,39 @@ slag-jit, slag-jitless, node-jit and node-jitless.
   (`SLAG_CLOSURE_SKIP=props`), price it with `ablate.sh`, and rescale the phase
   table by that ratio. In the closure case the timer under-read by **2.4x**.
 
+### 2.6 Self-time attribution (`SLAG_SAMPLE`)
+
+The corpus table says *which row* is expensive; the sampler says *which
+function* is running. Run it on the whole corpus for the map, or on one row to
+prove a slice:
+
+```sh
+SLAG_SAMPLE=300 ./target/release/slag.exe --corpus tools/corpus/workloads \
+    2> scratch/prof.txt          # stdout is the bench table, keep them apart
+python tools/profile.py scratch/prof.txt --group   # by crate::module
+python tools/profile.py scratch/prof.txt --top 30  # by function
+```
+
+Reading it:
+
+- **Samples outside the executable's image are compiled bodies.** A row that
+  is mostly `[jit/native code]` has no runtime slice to take (the splice
+  already removed it).
+- **Flat profile means uniform tax, not a hidden hot spot.** If the top
+  function is under ~2%, no single slice can move the corpus and the work is a
+  portfolio.
+- **Only time ranks cost.** The share is a share of *self* time; it does not
+  say what a fix would save. Price the fix with a same-binary seam before
+  believing it.
+
+Instrumenting a running engine means trusting the attribution: a public
+symbol has no size, so an address resolved directly against the PDB lands on
+whichever public symbol precedes it. That artifact showed `Vm::setup_frame`
+(a 4.4 KB function) as 7.3% of the corpus. `profile.py` resolves through the
+PE unwind directory first and names a range by the public at its start; if you
+touch it, re-validate on `opcost/baseline` (90% outside the image) and
+`opcost/regexp_test` (topped by the regexp matcher).
+
 A one-row A/B, per-process:
 
 ```sh
@@ -173,17 +207,22 @@ trade-off.** Report the failing fixture and revert; do not commit around it.
 
 ### 4.1 Headline
 
-77 corpus rows, all four modes agree: **JIT gap about 9.5x, interpreter gap
-about 3.7x** (2026-10-28; was 10.12 / 3.69 at `7685ef95`). Do not quote the
-second decimal of a single run: runs of the binaries around the last changes read
-9.00 / 9.52 / 9.73 / 10.00 / 10.04 / 10.27 / 10.53, and the family means swing
-with them (`calls` 8.51x to 10.88x) because V8's side of each ratio is a single
-unbounded run. A row-level change is the only resolvable unit, and only when it
-is backed by a same-binary seam or an IR diff. The interpreter number is the
-important one: Slag's interpreter is within about 3.7x of V8's, while its
-compiled code is 9.5x off. V8's tier-on-tier gain is therefore about 2.6x larger
-than Slag's. The deficit is in what the optimizing tier does with a body, not in
-the cost of a single runtime operation.
+**Read the total-time gap, not the mean-of-ratios headline.** Same binary, one
+corpus pass, 77 rows (2026-10-29): slag jit and node jit totals are
+**2085.4 ms against 727.0 ms, so the gap is 2.87x**, and each engine's
+optimizer buys the same factor (slag jit/jitless **2.55x**, node **2.42x**).
+The `mean-jitGap` line (9.7x) averages per-row ratios and is dominated by rows
+V8 folds to nothing; it ranks nothing and overstates the gap threefold.
+
+The reading that follows from the tiers being equal: **the deficit is the
+runtime (about 3x on every primitive), not the optimizer.** Inlining, escape
+analysis and better IR cannot close it, because slag's compiled code is
+already as much better than its interpreter as V8's is.
+
+Corpus self time, 63k samples (`SLAG_SAMPLE`, 2026-10-29): 37.8% compiled code,
+9.0% `runtime::jit` helpers, 8.2% `runtime::builtins`, 8.1% `runtime::ir`,
+6.1% `crux::object`, 5.8% `crux::heap`, 4.8% `crux::string`, 3.7%
+`runtime::function`, 2.2% sorting. It is **flat**: no function exceeds 2.2%.
 
 Per family (README, 2026-10-28): globals 2.20x, objects 3.94x, language 5.72x,
 builtins 7.18x, calls 8.51x, strings 9.60x, arrays 9.83x, opcost 11.80x, control
@@ -294,6 +333,8 @@ in the corpus.
 
 | attempt | result |
 | --- | --- |
+| `-C target-cpu=native` | two builds, 5 interleaved corpus rounds, per-row minima: 2251.1 -> 2328.9 ms (**+3.46%**, i.e. worse), with row deltas from -21% to +44% on rows the flag cannot reach. Unresolvable against the layout confound on this machine; keep the generic target |
+| Ranking a slice by a before/after **build** pair | two binaries built from *identical source* with only the codegen target differing moved the corpus total 3.46% and single rows up to 44%. A slice landing under ~4% must be proven with a same-binary seam |
 | Atom memo direct-mapped table | corpus -0.96% (re-run -1.12%), served rows flat, unrelated rows swung; reverted |
 | Lift `!=`/`!==` into the optimizing tier | corpus +0.85%; the two rows that moved tier +4.5% and +3.4%; reverted |
 | Model the LICM hoist as "always miss" | `own_read` +571%, the `globals` rows about +60%; refused by design |
@@ -320,6 +361,11 @@ in the corpus.
 | Rank a function by `sum(blocks)` | method error, not a change; divide by the entry block first |
 
 ## 6. How to choose the next target
+
+-1. **Start from `SLAG_SAMPLE` self time (section 2.6).** It names the functions
+   the engine actually runs and their share of the whole corpus, which is what
+   the row tables cannot say. A flat map (top function under ~2%) means the
+   work is a portfolio of 30-60 ms slices and no single slice can be big.
 
 0. **Rank by absolute recoverable time, not by `mean-jitGap`.** The headline gives
    a row where V8 does 0.02 ms the same weight as one where it does 80 ms, so it
@@ -356,9 +402,35 @@ Corollary: "refused by the optimizing tier" does not mean slow. Three bodies
 that left the refusal census were 3 to 5% **slower** compiled. Tier choice
 needs its own per-row measurement.
 
-## 7. Open leads (2026-10-28)
+## 7. Open leads (2026-10-29)
 
-- **The env-carrying leaf lane is the next priced target** (2026-10-29). Per call, minima: a named global leaf is 7.6 ns, a computed callee 13.5, but a leaf that reads a captured binding is **26.6** (31.4 with two captures), against node's 1.2-1.4. Every callee in `calls/closure_capture` captures, so that lane is what the row pays. The interpreter shows the same step (85 -> 127 ns), so it is the lane and not an interpreter artifact. Node's number is inlining (the optimizer project); the env lane is runtime work and the cheaper half. Note the leaf call lane itself is already 5x faster than node's compiled call (7.6 vs 41 ns), so "calls are slow" is wrong as a general statement.
+- **The property define path is the largest coherent runtime block.**
+  `objects/spread_assign` is 40% property machinery (`Map::find` 8.1%,
+  `set_with_receiver_key` 8.0%, `define_property_or_throw` 7.2%,
+  `Map::get_or_create_child` 5.1%, `get_own_property_key` 3.8%). A define of a
+  new key on a fresh object costs **45 ns** against 3.5 ns for a warm store
+  (`scratch/storecost`: `{}`+`o.a=1` 91.8 ns/body against `{}` 45.4, six
+  defines 333.6). The work is a linear `Map::find` over the current shape's
+  descriptors plus an FxHash transition lookup keyed on
+  `(PropertyKey, MapAttrs)`; both are per define and neither is warmed by a
+  fresh receiver. `crux::object` + `crux::map` is 7.8% of the corpus.
+- **`runtime::function` (closure creation) is 10.8% of the #1 row and 12.9% of
+  the #2 row**, and 3.7% corpus-wide. The mechanism is known and priced
+  (280-300 ns against node's 9); every structural attempt so far is a measured
+  regression (see the NULL register). This is the largest named term on the
+  two rows that are 30% of the recoverable time.
+- **Strings are 4.8% and entirely in three functions** — `string::lookup`
+  1.51, `JsString::from_utf8` 0.91, `string::intern` 0.70 (plus `as_slice`
+  0.70, `concat` 0.63). `lookup(id)` clones a `JsString` per call, and its
+  callers are property-key boxing (`Object.keys`/`values`/`entries`, JSON, the
+  proxy traps). The atom memo itself is already a measured NULL; the open
+  question is why these callers need a `JsString` at all on their hot path.
+- **Allocation + GC is 5.8%**: `collect_minor_inner` 1.99, `Heap::alloc` 0.95,
+  the `scan_regions` closure 1.19, `collect_with_stack_compacting` 0.64,
+  `with_heap_cell` 0.44. `with_heap_cell` is a per-allocation cell access; the
+  nursery plan (`.notes/nursery-gc-plan.md`) is the owner.
+
+- **The env-carrying leaf lane** (2026-10-29). Per call, minima: a named global leaf is 7.6 ns, a computed callee 13.5, but a leaf that reads a captured binding is **26.6** (31.4 with two captures), against node's 1.2-1.4. Every callee in `calls/closure_capture` captures, so that lane is what the row pays. The interpreter shows the same step (85 -> 127 ns), so it is the lane and not an interpreter artifact. Node's number is inlining (the optimizer project); the env lane is runtime work and the cheaper half. Note the leaf call lane itself is already 5x faster than node's compiled call (7.6 vs 41 ns), so "calls are slow" is wrong as a general statement.
 - **A call site inside a loop body records no feedback at all**, confirmed 2026-10-29: `SLAG_FEEDBACK=1` reports 0 sites / 0 hits for a named leaf, an 8-way computed callee and a monomorphic computed callee, and `SLAG_INLINE_TRACE=1` prints `0 site(s) of 21 step(s), feedback=false`. So the feedback splice cannot reach any loop body, named or computed — that is the ceiling to keep in mind, not a per-row diagnosis.
 
 - **The corpus's #1 row is 62% calls, and a branching leaf body is a step-path leaf** (2026-10-29). `add(a,b){return a+b}` costs 92 ns/call interpreted; add `if (a===b) throw ...` and it costs 301 ns, because a branching body has no register run and falls to the step-path leaf. The other half of the same shape is fixed: the optimizing tier now lifts `throw` (it was the only refused terminator), so such a body gets machine code. What remains is item 2, giving a branching leaf a register run. Decomposition and the per-call table are in `.notes/perf.md` (2026-10-29); closure creation, the two sessions before this one, is only 12% of that row.
@@ -479,11 +551,12 @@ are referenced from the code.
 
 ## 9. One-paragraph summary
 
-Slag's interpreter is within 3.8x of V8's, but its compiled code is 10.5x off,
-and the optimizing tier is not uniformly better than the baseline tier. A heap
-access costs about 5 to 6 ns in both tiers; V8 removes the access instead. The
-optimizing tier's scalar loop costs 32 instructions against the baseline tier's
-7 because it keeps a loop-carried binding in a frame slot and does not consume
-the type proofs the front end already emits. The next change is to consume
-those proofs, measured per row, with a stated falsifier. Everything else in
-this skill exists to stop the next change from being a guess.
+Slag's total corpus time is 2.87x node's, and both engines' optimizer tiers buy
+the same factor (2.55x for slag, 2.42x for node), so the deficit is the
+runtime, not codegen: about 3x on every primitive, spread evenly enough that
+no function exceeds 2.2% of self time (37.8% is compiled code, 9% the JIT
+helpers, 8% builtins, 8% the VM, 6% objects, 6% heap, 5% strings). A heap
+access costs about 5 to 6 ns in both tiers; V8 removes the access instead.
+The work is therefore a portfolio of 30-60 ms slices, each chosen from the
+sampler's share and proven with a same-binary seam, not a search for one big
+win.
