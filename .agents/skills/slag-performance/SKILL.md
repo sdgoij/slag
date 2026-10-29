@@ -296,6 +296,8 @@ in the corpus.
 | Re-type after inlining (`scalarized || inlined`) | +0.71% when measured (2026-10-27); SUPERSEDED — inlining fired on almost no body then, so it measured noise. Landed 2026-10-28 with the static splice, where it is -17% on the row it reaches |
 | i32 element key (keep the index's int32 proof, skip the `ToUint64Sat` gate) | sound and implemented, but inside the noise on every row it touches (`element_read`, `element_write`, `dyn_key_read`, `array_at`); the ladder's dependent-load chain dominates, not the gate |
 | Typer read guard on a leaf body (`SLAG_TYPER_LEAF`) | `calls/construct_churn` 58 -> 110 ms: a guard marks the body `deopts` and the leaf-inline lane refuses it |
+| `loop_counter` typing the counter cycle it proved int32 | works, but the use rule it needs rejects a previously-correct fusion: `opcost/element_write` 0.375 -> 0.45 ms. `Type::Int` on a block parameter is not an i32 register (params are `i64` in CLIF), so a type cannot move a counter into an i32 register at all |
+| In-place splicing (a single-block callee copied into the caller's block) | `opcost/js_call` 0.577 vs 0.510 with the block-splitting splice. The continuation block is load bearing: it is what lets `narrow`/`mem2reg` derive a parameter's type from one incoming value, and without it the accumulator and the `|0` stay `Number` words with a `Canon` per iteration |
 | Rank a function by `sum(blocks)` | method error, not a change; divide by the entry block first |
 
 ## 6. How to choose the next target
@@ -334,6 +336,15 @@ needs its own per-row measurement.
 - **The spliced region's block split.** A splice at a call inside a loop leaves
   the callee in its own block pair and canonicalizes the raw-f64 result per
   iteration (`Canon`), which is most of the remaining 5.3 ns on `js_call`.
+- **`Type::Int` is an annotation, not a register.** A block parameter is `i64` in
+  CLIF whatever its IR type; only a producing instruction (`IntAdd`, an int
+  result bit op, `Const` with `Imm::Int`) yields an i32 CLIF value. So a lowering
+  decision must read `builder.func.dfg.value_type(v)`, and no pass can move a
+  value into an i32 register by setting types.
+- **The splice rows' remaining cost is the continuation block's `Canon` and the
+  guard's `CalleeEq`.** In-place splicing loses (see the NULL register); the
+  route left is a versioned loop (hoist the callee check to the preheader and
+  keep one copy of the body), which is a loop transformation, not a slice.
 - **The element rows need a hoisted array descriptor, not a cheaper gate.** The
   `opcost` element/property rows decompose to 5.5 ns of 6.5 in
   `emit_dense_element_read`'s ladder (four dependent L1 loads: `array_dense` ->
