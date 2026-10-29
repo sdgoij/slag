@@ -1953,6 +1953,17 @@ pub struct CompiledBody {
     /// recompiled on every frame once a program's working set exceeds the
     /// cache, and a small body compiles in ~0.4ms, which is a frame's budget.
     pub jit_evictions: std::cell::Cell<u32>,
+    /// How many times this body's compiled code has been entered since its
+    /// cache entry was last considered for eviction (saturating). The cache
+    /// cannot observe a compiled call on its own: once `jit_info` holds a
+    /// pointer the call path never consults the cache again, so an eviction
+    /// policy keyed on the cache's own last-touch clock would order entries
+    /// by *last compiled* and evict exactly the bodies that have been running
+    /// longest. The compiled path bumps this counter instead, and the cache
+    /// ages every live entry's counter on each eviction, so the victim is the
+    /// entry nothing has entered since the previous eviction (see
+    /// `JitCache::evict_if_needed`).
+    pub jit_used: std::cell::Cell<u32>,
     /// The distinct names this body reads through the env chain
     /// (`Step::LoadIdent`), in first-use order. [`Vm::global_reads_are_
     /// unshadowed`] walks the body's chain once per run to check that none of
@@ -26876,6 +26887,7 @@ pub fn compile_body(
             jit_info: std::cell::Cell::new(0),
             jit_calls: std::cell::Cell::new(0),
             jit_evictions: std::cell::Cell::new(0),
+            jit_used: std::cell::Cell::new(0),
             ident_names,
             has_loop,
             has_call_apply,
@@ -26964,6 +26976,7 @@ pub fn compile_statements(
         jit_info: std::cell::Cell::new(0),
         jit_calls: std::cell::Cell::new(0),
         jit_evictions: std::cell::Cell::new(0),
+        jit_used: std::cell::Cell::new(0),
         ident_names,
         has_loop,
         has_call_apply,

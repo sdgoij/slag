@@ -721,6 +721,7 @@ struct RefusalRow {
 pub struct RefusalCensus {
     rows: std::sync::Mutex<Vec<RefusalRow>>,
     compiled: std::sync::atomic::AtomicU64,
+    evicted: std::sync::atomic::AtomicU64,
 }
 
 impl RefusalCensus {
@@ -728,6 +729,7 @@ impl RefusalCensus {
         Self {
             rows: std::sync::Mutex::new(Vec::new()),
             compiled: std::sync::atomic::AtomicU64::new(0),
+            evicted: std::sync::atomic::AtomicU64::new(0),
         }
     }
 }
@@ -792,6 +794,26 @@ pub fn refusal_rows() -> Vec<(&'static str, String, u64, u64)> {
 pub fn compiled_bodies() -> u64 {
     JIT_REFUSALS
         .compiled
+        .load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Count one body evicted from the JIT cache. Reported beside the compile
+/// count: `compiled - evicted` is roughly the live entry count, so a run whose
+/// compile count is a multiple of its body set is recompiling what it had
+/// already built (see [`CompiledBody::jit_used`]).
+pub fn record_evicted() {
+    if !refusal_census_on() {
+        return;
+    }
+    JIT_REFUSALS
+        .evicted
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// How many bodies the JIT cache evicted.
+pub fn evicted_bodies() -> u64 {
+    JIT_REFUSALS
+        .evicted
         .load(std::sync::atomic::Ordering::Relaxed)
 }
 
@@ -7211,6 +7233,21 @@ pub fn resolve_created(body: &CompiledBody, step: usize) -> Option<ResolvedCalle
     })
 }
 
+/// Record one entry into a compiled body, for the JIT cache's eviction policy
+/// (see [`CompiledBody::jit_used`]). The cache never sees a warm call — a set
+/// `jit_info` pointer short-circuits every consult — so the call path is the
+/// only place that can say which bodies are still in use. The counter lives
+/// in the body record, on the cache line the `jit_info` read has already
+/// touched, and saturates rather than wrapping (the cache halves every
+/// counter on each eviction, so saturation is not reachable in practice).
+#[inline(always)]
+fn note_body_use(body: &CompiledBody) {
+    let used = body.jit_used.get();
+    if used < u32::MAX {
+        body.jit_used.set(used + 1);
+    }
+}
+
 /// The body's compiled-info pointer: the per-body fast cell when set (the
 /// first successful lookup stores it; an eviction clears it, so a set
 /// pointer is always valid), else a consult of the installed hook
@@ -7225,6 +7262,7 @@ pub(crate) fn lookup_info(
 ) -> *const JitCompiledInfo {
     let known = ir.jit_info.get();
     if known > 1 {
+        note_body_use(ir);
         known as *const JitCompiledInfo
     } else if known == 0 {
         // The compile-size cap (Cut 92): a body this large is never compiled.
@@ -7310,6 +7348,7 @@ pub(crate) fn lookup_info_leaf(
     let body = entry.body();
     let known = body.jit_info.get();
     if known > 1 {
+        note_body_use(body);
         return known as *const JitCompiledInfo;
     }
     // The sticky "not JIT-compilable" mark: no hook would be called, so do
@@ -8357,6 +8396,7 @@ mod tests {
             jit_info: std::cell::Cell::new(0),
             jit_calls: std::cell::Cell::new(0),
             jit_evictions: std::cell::Cell::new(0),
+            jit_used: std::cell::Cell::new(0),
             ident_names: Vec::new(),
             has_loop,
             has_call_apply: false,

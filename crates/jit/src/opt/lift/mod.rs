@@ -2815,6 +2815,7 @@ mod tests {
             jit_info: std::cell::Cell::new(0),
             jit_calls: std::cell::Cell::new(0),
             jit_evictions: std::cell::Cell::new(0),
+            jit_used: std::cell::Cell::new(0),
             ident_names: Vec::new(),
             has_loop: false,
             has_call_apply: false,

@@ -212,28 +212,36 @@ impl Compiled {
 /// leaf: keyed on the `Rc<CompiledBody>` identity, compiled on first use.
 /// Each entry holds the body's `Rc` strongly, so the key can never be reused
 /// by a different body while its compiled code is cached. The cache is
-/// bounded: once it holds `MAX_CACHE_ENTRIES`, inserting a new body evicts
-/// the least-recently-used entries (down to `EVICT_TO_ENTRIES`), freeing
-/// their executable code and clearing the per-body fast pointer so the next
-/// call recompiles. Eviction only runs when no compiled frame is executing
-/// (the runtime passes `in_flight` to [`JitCache::lookup`]): a running
-/// body's entry pointer stays valid for the call, and the recursion guard
-/// (`runtime::jit::MAX_JIT_DEPTH`) bounds how far the cache can overgrow in
-/// that window. A body that fails to compile is remembered as a miss so the
-/// (expensive) compile attempt happens once, not on every call.
+/// bounded: once it holds `MAX_CACHE_ENTRIES`, inserting a new body evicts the
+/// least-recently-*used* entry, freeing its executable code and clearing the
+/// per-body fast pointer so the next call recompiles. Eviction only runs when
+/// no compiled frame is executing (the runtime passes `in_flight` to
+/// [`JitCache::lookup`]): a running body's entry pointer stays valid for the
+/// call, and the recursion guard (`runtime::jit::MAX_JIT_DEPTH`) bounds how
+/// far the cache can overgrow in that window. A body that fails to compile is
+/// remembered as a miss so the (expensive) compile attempt happens once, not
+/// on every call.
 pub struct JitCache {
     engine: JitEngine,
     helpers: JitHelpers,
     entries: HashMap<usize, Entry>,
-    /// A monotonic last-use clock (bumped per lookup); the eviction policy
-    /// evicts the smallest `last_used` entries.
+    /// A monotonic insert clock (bumped per cache lookup); the eviction policy
+    /// breaks ties between equally-used entries with the smallest `last_used`,
+    /// which is then the compile order. It is deliberately *not* the primary
+    /// recency signal: a compiled body is entered through its own fast pointer
+    /// and never reaches this cache again, so `last_used` only advances on a
+    /// (re)compile (see [`Entry::body`]'s `jit_used` counter).
     clock: u64,
     /// The entry count beyond which an insert (with no frame in flight)
-    /// evicts the least-recently-used entries.
+    /// evicts the least-used entry.
     cap: usize,
-    /// The entry count an eviction leaves behind (a floor below the cap, so
-    /// a burst of new bodies does not thrash the cache one entry at a time).
-    evict_to: usize,
+    /// Evictions since the last decay of the per-body use counters. The
+    /// counters are halved once per `cap` evictions, i.e. once per full cache
+    /// turnover, so heat is retired on a time scale of turns rather than of
+    /// individual inserts (halving on every eviction erases a hot body's
+    /// count within a handful of inserts and the policy collapses back to the
+    /// compile order).
+    evictions_since_decay: usize,
     /// How many bodies this cache compiled through the optimizing tier. A
     /// per-cache signal for the opt-tier tests: the process-global
     /// `OPT_COMPILED` counter is bumped by every parallel test's cache, so a
@@ -243,28 +251,38 @@ pub struct JitCache {
 
 /// One cached body: the strong `Rc` (pins the body so its identity cannot
 /// be reused while cached), the compiled code (or a remembered miss), and
-/// the last-use clock for eviction.
+/// the insert clock for eviction tie-breaks.
 struct Entry {
     body: Rc<CompiledBody>,
     compiled: Option<Rc<Compiled>>,
     last_used: u64,
 }
 
-/// The cache's capacity: beyond this many entries the least-recently-used
-/// bodies are evicted. Sized for a whole application's body set — a scene with
-/// more bodies than the cap recompiles its LRU tail (a small body compiles in
-/// ~0.4ms, which is a frame's budget), and the entries are bounded machine code
-/// rather than heap objects, so the cap is generous on purpose.
+/// The cache's capacity: beyond this many entries the least-used body is
+/// evicted. Sized for a whole application's body set — a scene with more bodies
+/// than the cap keeps its hot set resident and cycles its cold tail (a small
+/// body compiles in ~0.4ms, which is a frame's budget), and the entries are
+/// bounded machine code rather than heap objects, so the cap is generous on
+/// purpose. `SLAG_JIT_CACHE_CAP` overrides it, so a client can price the
+/// eviction policy in one binary.
 pub const MAX_CACHE_ENTRIES: usize = 1024;
 
-/// Eviction removes entries down to this floor (half the capacity), so a
-/// burst of new bodies does not thrash the cache entry by entry.
-pub const EVICT_TO_ENTRIES: usize = 512;
+/// The capacity [`JitCache::new`] uses: `MAX_CACHE_ENTRIES`, or
+/// `SLAG_JIT_CACHE_CAP` when set. Read once (one agent builds one cache).
+fn cache_capacity() -> usize {
+    static CAP: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *CAP.get_or_init(|| {
+        std::env::var("SLAG_JIT_CACHE_CAP")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(MAX_CACHE_ENTRIES)
+    })
+}
 
 impl JitCache {
     /// A cache whose compile step uses `helpers` as the slow-path table.
     pub fn new(helpers: JitHelpers) -> Result<Self, String> {
-        Self::with_capacity(helpers, MAX_CACHE_ENTRIES, EVICT_TO_ENTRIES)
+        Self::with_capacity(helpers, cache_capacity())
     }
 
     /// A cache whose engine forces the optimizing-tier lowering on — the I1
@@ -276,15 +294,15 @@ impl JitCache {
         Ok(cache)
     }
 
-    /// A cache with a custom capacity/eviction floor (test introspection).
-    fn with_capacity(helpers: JitHelpers, cap: usize, evict_to: usize) -> Result<Self, String> {
+    /// A cache with a custom capacity (test introspection).
+    fn with_capacity(helpers: JitHelpers, cap: usize) -> Result<Self, String> {
         Ok(Self {
             engine: JitEngine::new()?,
             helpers,
             entries: HashMap::new(),
             clock: 0,
             cap,
-            evict_to,
+            evictions_since_decay: 0,
             opt_compiled: 0,
         })
     }
@@ -323,21 +341,37 @@ impl JitCache {
         }
     }
 
-    /// Evict the least-recently-used entries down to the floor, unless a
-    /// compiled frame is executing (its entry pointer is live on the native
-    /// stack) or the cache is under capacity.
+    /// Evict the least-recently-*used* entry, unless a compiled frame is
+    /// executing (its entry pointer is live on the native stack) or the cache
+    /// is under capacity. Only the overflow is removed, so a working set one
+    /// body over the cap costs one recompile, not half the cache.
+    ///
+    /// The victim is chosen by the body's own `jit_used` counter, not by
+    /// `last_used`: a warm body is entered through its fast pointer and never
+    /// returns to this cache, so this map's clock only advances on a
+    /// (re)compile and would order entries by *last compiled* — evicting
+    /// exactly the bodies that have been running longest. Every counter is
+    /// halved once per full cache turnover, so a body that stops being called
+    /// still ages out and the ordering never saturates; entries with nothing
+    /// recorded since the last decay tie at zero and fall back to the compile
+    /// order.
     fn evict_if_needed(&mut self, in_flight: bool) {
         if in_flight || self.entries.len() < self.cap {
             return;
         }
-        let mut keys: Vec<(usize, u64)> = self
+        let remove = self.entries.len() - self.cap + 1;
+        let mut keys: Vec<(u32, u64, usize)> = self
             .entries
             .iter()
-            .map(|(key, entry)| (*key, entry.last_used))
+            .map(|(key, entry)| (entry.body.jit_used.get(), entry.last_used, *key))
             .collect();
-        keys.sort_unstable_by_key(|(_, used)| *used);
-        let remove = self.entries.len() - self.evict_to;
-        for (key, _) in keys.into_iter().take(remove) {
+        keys.sort_unstable();
+        let victims: Vec<usize> = keys
+            .into_iter()
+            .take(remove)
+            .map(|(_, _, key)| key)
+            .collect();
+        for key in victims {
             if let Some(entry) = self.entries.remove(&key) {
                 // Clear the per-body fast pointer: the compiled info it
                 // points at is freed with the entry, so the next call must
@@ -350,6 +384,14 @@ impl JitCache {
                     .body
                     .jit_evictions
                     .set(entry.body.jit_evictions.get().saturating_add(1));
+                runtime::jit::record_evicted();
+                self.evictions_since_decay += 1;
+            }
+        }
+        if self.evictions_since_decay >= self.cap {
+            self.evictions_since_decay = 0;
+            for entry in self.entries.values() {
+                entry.body.jit_used.set(entry.body.jit_used.get() / 2);
             }
         }
     }
@@ -560,6 +602,7 @@ pub fn dump_refusal_census() {
         println!("jit\trefused\t{tier}\t{reason}\t{bodies}\t{steps}");
     }
     println!("jit\tcompiled\t{}", runtime::jit::compiled_bodies());
+    println!("jit\tevicted\t{}", runtime::jit::evicted_bodies());
     println!("jit\tdeopts\t{}", runtime::jit::deopt_count());
 }
 
@@ -651,6 +694,7 @@ mod tests {
             jit_info: std::cell::Cell::new(0),
             jit_calls: std::cell::Cell::new(0),
             jit_evictions: std::cell::Cell::new(0),
+            jit_used: std::cell::Cell::new(0),
             ident_names: Vec::new(),
             has_loop: false,
             has_call_apply: false,
@@ -1795,10 +1839,10 @@ mod tests {
 
     #[test]
     fn cache_evicts_least_recently_used_bodies() {
-        // cap 2, floor 1: A, B, then A again (hot), then C — B is the LRU
-        // and must go; A stays; C lands. The evicted body's per-body fast
-        // pointer is cleared, so a later call recompiles it.
-        let mut cache = JitCache::with_capacity(helpers_all(), 2, 1).expect("isa");
+        // cap 2: A, B, then A again (hot), then C — B is the LRU and must go;
+        // A stays; C lands. The evicted body's per-body fast pointer is
+        // cleared, so a later call recompiles it.
+        let mut cache = JitCache::with_capacity(helpers_all(), 2).expect("isa");
         let body = |n: f64| {
             std::rc::Rc::new(make_body(
                 vec![Step::Push(Value::Number(n)), Step::Return],
@@ -1827,12 +1871,89 @@ mod tests {
     }
 
     #[test]
+    fn cache_evicts_an_unused_body_not_a_warm_one() {
+        // The policy must not order entries by compile time. A warm body is
+        // entered through its own fast pointer and never returns to this
+        // cache, so `lookup`'s clock only advances on a (re)compile; the call
+        // path bumps the body's `jit_used` instead (`runtime::jit::
+        // lookup_info`), and this test stands in for it. With A used and B
+        // idle, the insert that overflows the cap must take B even though A
+        // was compiled first — the inversion this counter exists to fix.
+        let mut cache = JitCache::with_capacity(helpers_all(), 2).expect("isa");
+        let body = |n: f64| {
+            std::rc::Rc::new(make_body(
+                vec![Step::Push(Value::Number(n)), Step::Return],
+                0,
+            ))
+        };
+        let a = body(1.0);
+        let b = body(2.0);
+        let c = body(3.0);
+        assert!(!cache.lookup(&a, false).is_null());
+        assert!(!cache.lookup(&b, false).is_null());
+        // The runtime sets the per-body fast pointer after a successful
+        // lookup; the cache only ever clears it. Emulate both.
+        a.jit_info.set(0x1000);
+        b.jit_info.set(0x2000);
+        a.jit_used.set(5);
+        assert!(!cache.lookup(&c, false).is_null());
+        assert_eq!(a.jit_info.get(), 0x1000, "the warm body keeps its slot");
+        assert_eq!(b.jit_info.get(), 0, "the idle body is the victim");
+        assert_eq!(b.jit_evictions.get(), 1);
+        // One eviction is far from a full cache turnover, so the warm count is
+        // untouched; it is halved once per `cap` evictions instead.
+        assert_eq!(a.jit_used.get(), 5);
+    }
+
+    #[test]
+    fn cache_keeps_a_warm_core_when_new_bodies_arrive() {
+        // The scene shape: a body set that fits, a core called every frame,
+        // then a burst of bodies that only exist while something is
+        // exploding. With the capacity reached, the burst must take cold
+        // slots, not the core's: the old policy removed half the cache in one
+        // insert, ordered by *compile* time, so it took exactly the bodies
+        // that had been running longest and every one of them then had to
+        // re-earn the compile threshold.
+        let mut cache = JitCache::with_capacity(helpers_all(), 64).expect("isa");
+        let body = |n: f64| {
+            std::rc::Rc::new(make_body(
+                vec![Step::Push(Value::Number(n)), Step::Return],
+                0,
+            ))
+        };
+        let mut core = Vec::new();
+        for i in 0..16 {
+            let b = body(i as f64);
+            assert!(!cache.lookup(&b, false).is_null());
+            b.jit_info.set(0x1000 + i);
+            b.jit_used.set(10);
+            core.push(b);
+        }
+        let mut cold = Vec::new();
+        for i in 0..60 {
+            let b = body(100.0 + i as f64);
+            assert!(!cache.lookup(&b, false).is_null());
+            b.jit_info.set(0x2000 + i);
+            cold.push(b);
+        }
+        assert_eq!(cache.compiled_count(), 64, "the cache is at capacity");
+        for (i, b) in core.iter().enumerate() {
+            assert_eq!(b.jit_info.get(), 0x1000 + i, "the warm core keeps its slot");
+            assert_eq!(b.jit_evictions.get(), 0, "the warm core is never evicted");
+        }
+        assert!(
+            cold.iter().any(|b| b.jit_evictions.get() > 0),
+            "the burst is paid for out of the cold slots"
+        );
+    }
+
+    #[test]
     fn cache_skips_eviction_while_a_frame_is_in_flight() {
         // While a compiled body is executing, `lookup` must not evict: the
         // running body's entry pointer stays live on the native stack.
-        // cap 2, floor 1; the in-flight insert overflows, and the eviction
-        // happens only once the frame leaves.
-        let mut cache = JitCache::with_capacity(helpers_all(), 2, 1).expect("isa");
+        // cap 2; the in-flight insert overflows, and the eviction happens
+        // only once the frame leaves.
+        let mut cache = JitCache::with_capacity(helpers_all(), 2).expect("isa");
         let body = |n: f64| {
             std::rc::Rc::new(make_body(
                 vec![Step::Push(Value::Number(n)), Step::Return],

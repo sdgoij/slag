@@ -19299,3 +19299,88 @@ added to the differential tests), `-p wasm --lib` (44), workspace clippy and
 With this, every SIMD op the interpreter supports in the compiled subset now
 has a native lowering; the helper remains only as the `SLAG_WASM_SIMD_NATIVE=0`
 fallback and for the relaxed dot product.
+
+## LANDED (2026-10-29): the JIT cache evicts by use, and only the overflow
+
+The client's remaining complaint is a latency outlier, not a throughput gap:
+average frame time is vsync-bound at 60, but an explosion drops it to 40-45 for
+a while, and after the program has been running a while the drops stop. A
+warm-up signature. This is the third visit to the JIT body cache
+(`.notes/frame-cost-profile.md` §4b/§7.1 item 2 is the first, 2026-09-16), and
+this time the defect is in the policy rather than its size.
+
+**Two defects, both in `crates/jit/src/lib.rs`.**
+
+1. *The recency signal was dead.* `JitCache::lookup` bumped an entry's
+   `last_used`, and eviction ordered by it. But `lookup` is only reached while
+   `CompiledBody::jit_info` is unset: as soon as a body compiles, the runtime
+   stores the info pointer in the body and every later call returns it
+   directly (`runtime::jit::lookup_info`'s `known > 1` arm), so the cache never
+   sees a warm call again. `last_used` therefore ordered entries by *last
+   compiled*, and "least recently used" was really "least recently built" —
+   it evicted exactly the bodies that had been running longest.
+2. *Eviction removed half the cache in one insert.* A single new body at the
+   cap removed `len - evict_to` entries, i.e. 512 of 1024. One body arriving
+   during an explosion cost the program 512 bodies' compiled code, each of
+   which then had to re-earn the 16-consult threshold (Cut 69's anti-thrash
+   rule), so the next ~16 frames ran an eighth of the scene interpreted.
+
+Together they read exactly as the client reports: a burst of new bodies (the
+explosion) crosses the cap, the FIFO-ordered mass eviction takes the startup
+scene bodies, those bodies run interpreted for the threshold window, fps falls,
+and once the core set has recompiled nothing overflows again until the next
+novel body appears.
+
+**The change.**
+
+- `CompiledBody::jit_used` (`Cell<u32>`, saturating) is bumped by the compiled
+  call path (`note_body_use` in `runtime::jit`, called from both
+  `lookup_info` and `lookup_info_leaf` warm arms) — the only place that can see
+  a warm call. The cache reads it as the eviction key.
+- Eviction removes `len - cap + 1` entries, the overflow only.
+- Counters are halved once per `cap` evictions (one full cache turnover), not
+  per eviction. Halving per eviction was the first cut and it was wrong: a
+  count of 10 lost to the compile-order tie-break after four inserts, which
+  `cache_keeps_a_warm_core_when_new_bodies_arrive` caught.
+- Ties (nothing recorded since the last decay) fall back to compile order,
+  which is the old behaviour and is the right one when there is no evidence
+  either way.
+- `SLAG_JIT_CACHE_CAP` overrides the capacity in one binary, so a client can
+  price the policy in its own scene; `SLAG_JIT_REPORT` now prints
+  `jit evicted N` beside `jit compiled N`, and `compiled >> evicted` is the
+  signature of a working set that does not fit.
+
+**Measurement.** Four new unit tests pin the policy (`cache_evicts_an_unused_
+body_not_a_warm_one`, `cache_keeps_a_warm_core_when_new_bodies_arrive`, plus
+the two existing ones re-expressed for the overflow-only rule); the old
+`cache_evicts_least_recently_used_bodies` still passes unchanged, which is the
+check that the fallback ordering is intact.
+
+The counter's cost, priced on the thinnest compiled rows (isolated rows, one
+process each, 7 interleaved rounds, before/after binaries, per-row minima):
+
+| row | before | after | |
+|---|---:|---:|---:|
+| `opcost/baseline` (control) | 0.077822 | 0.077909 | +0.11% |
+| `opcost/js_call` | 0.499879 | 0.498497 | -0.28% |
+| `opcost/method_call` | 0.662969 | 0.665134 | +0.33% |
+| `opcost/obj_prop` | 0.602842 | 0.601984 | -0.14% |
+| `opcost/element_read` | 0.619358 | 0.612937 | -1.04% |
+| `opcost/element_write` | 0.375457 | 0.379098 | +0.97% |
+| `opcost/prim_prop` | 1.553183 | 1.576633 | +1.50% |
+| `calls/direct_leaf` | 5.701800 | 5.729990 | +0.49% |
+
+Every row is inside its own noise and the signs disagree, so the extra Cell
+update is not measurable even on the 0.5 ms call row. Corpus total, 3
+interleaved rounds: 1958.3 vs 1969.1 ms minima (-0.55%, and the change cannot
+make the corpus faster — eviction never runs with 77 rows). `node
+tools/corpus/bench.js`: `n=77 mean-jitGap 10.16 mean-jlGap 3.78 mismatches=0`.
+Sweeps 23,726 / 23,821 / 1,086 / 3,365 = 51,998 at 100%.
+
+**Not established.** The client's frame-level win needs a client run: on for a
+while, watch `SLAG_JIT_REPORT=1`'s `jit evicted` line (a steady-state ring of
+compiles and evictions means the body set genuinely exceeds the cap, and
+`SLAG_JIT_CACHE_CAP=4096` is the one-line test), and read `rl.getTime()` across
+an explosion. If `evicted` stays at zero, the drop is not the cache and the
+next suspects are the first-compile burst (an explosion body compiling at depth
+0 in the frame it first runs) and the GC's reaction to the particle burst.

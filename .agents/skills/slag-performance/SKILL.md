@@ -318,6 +318,7 @@ the proof. The proof is the priced next slice; see section 7.
 | Map key-index mixer (Goats) | `mapget` -29%, `maphas` -37% |
 | Optimizing-tier GC safe point | a lifted allocating loop had no safepoint and a 46 ms pause; fixed |
 | wasm stack bound (GC root scan) | the scan no longer covers the linear-memory heap; the 560-780 ms pauses and the `live` climb are gone |
+| JIT body cache: the compiled call path records `CompiledBody::jit_used`, eviction removes only the overflow and orders by that count (decayed once per cache turnover), not by last-compile | latency, not corpus: the old policy ordered by *last compiled* (a warm body never returns to the cache) and removed half the cache per insert, which is the client's explosion warm-up drop (60 to 40-45 fps for the threshold window). Seams: `SLAG_JIT_CACHE_CAP`, `SLAG_JIT_REPORT`'s `jit evicted` line. Corpus flat; the counter's store is inside row noise. |
 
 PGO is measured at **-19.7%** on the corpus (-11.6% on held-out rows, A/A
 control +0.33%) and is **not** the default: it moves layout, so it cannot be
