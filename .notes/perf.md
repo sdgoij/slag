@@ -18574,3 +18574,60 @@ Expected: 46 -> ~20-25 ns per define, which is 20-25 ms on
 `calls/construct_churn`. Correctness surface is the whole [[Set]] semantics,
 so it must land behind the full four-sweep gate, with fixtures for a prototype
 setter, a non-extensible target, a frozen field, and an accessor on the chain.
+
+## LANDED (2026-10-29): the fresh-object define drops one transition hash and two descriptor scans
+
+The scoped slice above, implemented in three parts, all inside the define path
+`fast_fresh_store` -> `define_fresh`:
+
+1. **A one-entry transition hint on the map.** `Map::get_or_create_child`
+   hashed `(PropertyKey, MapAttrs)` on every fork. A shape gains the same next
+   key on every object that carries it (a constructor's fields, a literal's
+   keys), so `Map::last_transition` caches the last `(key, attrs) -> child` and
+   the steady state is two compares. The `transitions` map stays
+   authoritative; the hint is only a memo.
+2. **`define_fresh` writes the field at the ordinal it already knows.** The
+   transition appends the descriptor at the parent's descriptor count, so the
+   fresh key's offset is known before the fork. The old code then called
+   `map_set`, which re-resolved the key in the child map with another scan.
+3. **`fast_fresh_store`'s post-define cache fill scans once.** It called
+   `field_offset` (scan) and then `find` + `descriptor_at` (a second scan) on
+   the same map for the same key. One `find` answers both.
+
+Measured, 7 interleaved rounds, per-row minima, pre-change binary against
+post-change binary:
+
+| probe | pre | post | |
+| --- | ---: | ---: | --- |
+| `scratch/def/three.js` (`{}` + 3 defines, 200k bodies) | 35.85 ms | **31.58 ms** | **-11.9%** |
+| `objects/spread_assign` | 95.64 | **90.74** | **-5.1%** |
+| whole corpus (77 rows) | 1963.7 | **1952.0** | **-0.60%** |
+
+The hint alone, same-binary seam (`SLAG_DEFINE_HINT=0`), same protocol: 32.92
+-> 31.93 ms on the define probe (**-3.0%**), so parts 2 and 3 are the other
+~9%. Re-profiled after the change, `Map::get_or_create_child` falls from 10.6%
+to 2.9% of the probe and `field_offset` from 4.9% to 2.8%.
+
+The corpus number is small because most rows do not define incrementally: the
+defining rows are `spread_assign` (-5.1%), `json_roundtrip` (-2.2%) and
+`array_slice` (-2.5%), and the rest is inside the layout noise. The define is
+still 3 scans and a helper call away from the batch literal's 22 ns/field, so
+another slice exists, but it needs the ordinal threaded from the pre-check
+through `define_fresh` and back (this change stopped at the two provably
+redundant scans).
+
+**Soundness of the untraced hint (the non-obvious part).** `last_transition`
+holds a `Handle<Map>` and is not visited by `Map::trace`. That is sound for two
+reasons, both checked rather than assumed: the heap is a **non-moving**
+mark-sweep (`Gc<T>` derefs straight to an individually boxed payload, and
+`JsObject::map` is a `Cell<Option<Handle<Map>>>`, which the collector could not
+rewrite), and the child is **reachable anyway** through `transitions`, which is
+traced and which no code ever removes an entry from. The GC's invariant is
+reachability, not uniqueness. If a future change ever removes a transition
+entry, it must clear the hint.
+
+Gates: `cargo fmt --all -- --check`; `cargo clippy --workspace --all-targets
+-- -D warnings`; `cargo test --workspace` (40 suites, 0 failed); test262
+`language` 23,726 + `built-ins` 23,821 + `annexB` 1,086 + `intl402` 3,365 =
+51,998 at 100% (`--timeout 15 --recheck-timeout 15`); corpus 77 rows
+`mismatches=0`.

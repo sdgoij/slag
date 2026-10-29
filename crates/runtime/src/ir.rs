@@ -6279,15 +6279,17 @@ impl Vm {
         // read path. A dictionary-mode define (map full) has no field.
         if ok
             && let Some(map) = receiver.map.get()
-            && let Some(slot) = map.field_offset(&property_key)
+            // One descriptor scan answers both questions: the offset the
+            // fresh define assigned and whether the descriptor is writable.
+            // (`field_offset` + `find` walked the same vector twice.)
+            && let Some((slot, writable)) = map.find(&property_key).and_then(|ord| {
+                let (_, offset, attrs) = map.descriptor_at(ord)?;
+                Some((offset, attrs.writable()))
+            })
         {
             let map_id = map.id();
             let index = Self::member_map_cell_index(map_id, *atom);
             let (proto_id, proto_gen) = Self::member_map_proto(&receiver);
-            let writable = map
-                .find(&property_key)
-                .and_then(|ord| map.descriptor_at(ord))
-                .is_some_and(|(_, _, attrs)| attrs.writable());
             // `clean` 1: this fill only succeeded because the chain-verified
             // verdict (the probe above) held, so the cell records the
             // receiver's direct prototype for the compiled vector-free fill

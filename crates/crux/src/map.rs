@@ -90,12 +90,36 @@ pub struct Map {
     composite: HashMap<Box<[AtomId]>, Handle<Map>, BuildHasherDefault<FxHasher>>,
     /// Back-pointer to the parent map in the transition tree.
     back_pointer: Option<Handle<Map>>,
+    /// One-entry hint for the most recent `get_or_create_child`: the map and
+    /// key that produced `child`. A shape usually gains the same next key on
+    /// every object that carries it (a constructor's fields, a literal's
+    /// keys), so this turns the `(key, attrs)` hash into two compares on the
+    /// steady-state path.
+    ///
+    /// Untraced on purpose: `child` is a duplicate reference to a value
+    /// `transitions` already holds, and no code ever removes a transition
+    /// entry, so the child is alive exactly as long as this map is. The heap
+    /// never moves an object (a `Handle` lives in a `Cell` all over the
+    /// object model), so a stale address is not a hazard either.
+    last_transition: Option<(PropertyKey, MapAttrs, Handle<Map>)>,
     /// Generation counter: bumped when this map's shape changes.
     generation: Cell<u32>,
 }
 
 /// Global monotonic counter for map identities.
 static MAP_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
+
+/// Whether the one-entry transition hint is consulted (`SLAG_DEFINE_HINT=0`
+/// turns it off). A same-binary seam for pricing the hint: the env read is
+/// cached because `std::env::var_os` costs ~140 ns and this is the hottest
+/// shape-transition path in the engine.
+fn transition_hint_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| match std::env::var_os("SLAG_DEFINE_HINT") {
+        Some(value) => value != "0",
+        None => true,
+    })
+}
 
 /// The byte offset of `Map::id` inside the map box's data region. The JIT's
 /// inline shape read loads a `Handle<Map>` from the object's `map` cell,
@@ -152,6 +176,7 @@ impl Map {
             transitions: HashMap::default(),
             composite: HashMap::default(),
             back_pointer,
+            last_transition: None,
             generation: Cell::new(0),
         })
     }
@@ -254,7 +279,17 @@ impl Map {
         key: PropertyKey,
         attrs: MapAttrs,
     ) -> Option<Handle<Map>> {
+        if transition_hint_enabled()
+            && let Some((hint_key, hint_attrs, child)) = &self.last_transition
+            && *hint_attrs == attrs
+            && *hint_key == key
+        {
+            return Some(*child);
+        }
         if let Some(child) = self.transitions.get(&(key.clone(), attrs)) {
+            if transition_hint_enabled() {
+                self.last_transition = Some((key, attrs, *child));
+            }
             return Some(*child);
         }
         // The offset must come from the box layout, never a literal.
@@ -268,7 +303,10 @@ impl Map {
         // The transition table stores a young child map in a possibly-old
         // parent: an old->young edge the minor collector must know about.
         crate::heap::write_barrier_handle(self, child);
-        self.transitions.insert((key, attrs), child);
+        self.transitions.insert((key.clone(), attrs), child);
+        if transition_hint_enabled() {
+            self.last_transition = Some((key, attrs, child));
+        }
         Some(child)
     }
 

@@ -3966,10 +3966,15 @@ impl JsObject {
                 }
                 self.materialize_properties();
             } else if map.descriptor_count() < INLINE_FIELDS {
+                // The transition appends the descriptor at the parent's
+                // count, so the fresh key's field offset is known before the
+                // fork: write it directly instead of re-resolving the key in
+                // the child map (`map_set` scans the descriptors again).
+                let ordinal = map.descriptor_count();
                 if self.map_add_property_cell(key.clone(), attrs).is_some() {
-                    // Transition to the fresh descriptor and write the field.
                     self.props_deferred.set(true);
-                    let _ = self.map_set(key, value);
+                    crate::heap::write_barrier(self, value);
+                    self.in_fields[ordinal].set(value);
                     self.bump_generation();
                     return true;
                 }

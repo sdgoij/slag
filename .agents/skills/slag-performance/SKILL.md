@@ -81,6 +81,7 @@ Never measure a binary you cannot tie to the source you are reading. See
 | `SLAG_JIT_DEOPT_PROBE=<step>` | forces a deopt at that step in every eligible body |
 | `SLAG_INLINE_TRACE=1` | per compiled body: the splice-site count, each recorded site's state/hits/first id, and each resolver lookup's outcome |
 | `SLAG_SAMPLE=<µs>` | a flat self-time profile: a watchdog samples the engine thread's `Rip` and prints image offsets to stderr; `tools/profile.py` symbolizes them. Use it to *choose* a target, never during a timed A/B |
+| `SLAG_DEFINE_HINT=0` | disables the one-entry per-map transition hint in `Map::get_or_create_child`, so `ablate.sh` prices it in the same binary |
 | `SLAG_CLOSURE_PROFILE=1` | per-phase mean of closure instantiation (`closure <phase> <raw> <net>`): `register_function`'s phases plus the instantiation prelude and the interpreter's creation step. Cycle-counter based, inert when unset |
 | `SLAG_CLOSURE_SKIP=props` | skips `set_function_properties_batched` at closure creation, so `ablate.sh` prices that component in the same binary |
 
@@ -310,6 +311,7 @@ the proof. The proof is the priced next slice; see section 7.
 | The splice's static route: a call whose callee operand is a `NewClosure` (directly, or through a frame slot stored once in the entry block) splices with no comparison and no feedback, plus the `normalize`/`narrow`/`mem2reg` re-run after `inline` | `opcost/js_call` 0.88 -> 0.53 ms (-40%), `opcost/array_for_each_js` -9%; corpus flat (-0.16%: 2 rows of 77), IR diff confirms exactly those 2 rows |
 | The member-call splice: a member read of a literal object's field that holds a closure splices behind `CalleeEq(operand, literal_value)`, the literal being the body's own `NewClosure` SSA value (so a per-call closure still matches, and a field written since falls back) | `opcost/method_call` 1.19 -> 0.68 ms (-43%), `opcost/js_call` 0.778 -> 0.588, corpus -0.74%; IR diff confirms exactly 3 rows |
 | The canonical empty map a function kind's `[[Prototype]]` implies is cached per kind in the agent roots, and `Function::new_with_prototype_and_map` builds the object on it | closure probe 94.87 -> 91.52 ms min (-3.5%), for-in head-let 755.3 -> 746.0 ms min (-1.2%, every paired run), corpus mean-jitGap 9.46 -> 9.36 |
+| A one-entry transition hint on `Map` (`SLAG_DEFINE_HINT`), the define writing the ordinal it already knows instead of re-scanning the child map, and one `find` where the define cache fill ran `field_offset` + `find` over the same vector | define probe 35.85 -> 31.58 ms (-11.9%), `objects/spread_assign` 95.64 -> 90.74 (-5.1%), corpus 1963.7 -> 1952.0 (-0.60%); the hint alone (same-binary seam) is -3.0% and `Map::get_or_create_child` falls from 10.6% to 2.9% of the probe |
 | The optimizing tier lifts `Term::Throw` (was its only refused terminator); `throw_control` is the lowering, so iterator close and `using` disposal still run | `opt-blockers: Throw` gone; for-in head-let jit 377.7 -> 368.8 ms (-2.4%), corpus flat (-0.35%, inside the noise floor) |
 | Global read cells (declarative record, nested bodies) | top-level `const` 52.5 -> about 2.4 ms per 1M; nested helper 130.2 -> 2.5 ms |
 | Map key-index mixer (Goats) | `mapget` -29%, `maphas` -37% |
@@ -408,12 +410,14 @@ needs its own per-row measurement.
   `objects/spread_assign` is 40% property machinery (`Map::find` 8.1%,
   `set_with_receiver_key` 8.0%, `define_property_or_throw` 7.2%,
   `Map::get_or_create_child` 5.1%, `get_own_property_key` 3.8%). A define of a
-  new key on a fresh object costs **45 ns** against 3.5 ns for a warm store
-  (`scratch/storecost`: `{}`+`o.a=1` 91.8 ns/body against `{}` 45.4, six
-  defines 333.6). The work is a linear `Map::find` over the current shape's
-  descriptors plus an FxHash transition lookup keyed on
-  `(PropertyKey, MapAttrs)`; both are per define and neither is warmed by a
-  fresh receiver. `crux::object` + `crux::map` is 7.8% of the corpus.
+  new key on a fresh object cost **45 ns** against 3.5 ns for a warm store
+  (`scratch/storecost`); the transition hint, the known-ordinal write and the
+  merged cache-fill scan landed 2026-10-29 and took the define probe to 31.58 ms
+  (-11.9%, `spread_assign` -5.1%). **The remaining half is the ordinal**: the
+  pre-check proves the key absent with a scan, `define_fresh` proves it again,
+  and the cache fill resolves it a third time. Threading the pre-check's
+  ordinal into `define_fresh` (and its result back out) removes two scans; the
+  measured cost is ~3.3% of the probe per scan.
 - **`runtime::function` (closure creation) is 10.8% of the #1 row and 12.9% of
   the #2 row**, and 3.7% corpus-wide. The mechanism is known and priced
   (280-300 ns against node's 9); every structural attempt so far is a measured

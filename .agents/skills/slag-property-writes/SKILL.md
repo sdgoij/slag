@@ -145,6 +145,15 @@ following read — and the compiled probe — hits without a vector access).
   write cells (only `member_value_cells`), so its layout is free to
   extend. The value cells stay the `#[repr(C)]`-visible ABI; do not touch
   those.
+- **`Map::last_transition` is an untraced memo, and it is sound only while
+  two things hold.** It caches the last `(key, attrs) -> child` from
+  `get_or_create_child` and is NOT visited by `Map::trace`. That is safe
+  because (a) the heap never moves an object (a mark-sweep over individually
+  boxed payloads, which is also why `JsObject::map` can sit in a plain
+  `Cell`), and (b) the child stays reachable through `Map::transitions`,
+  which is traced and from which nothing is ever removed. The hint needs no
+  invalidation because it memoizes a lookup in an append-only table — but a
+  future change that removes a transition entry MUST clear it.
 
 ## 3. Adding a path that mutates the property vector
 
