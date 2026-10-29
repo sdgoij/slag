@@ -302,16 +302,34 @@ in the corpus.
 
 ## 6. How to choose the next target
 
-1. Start from a **measured** gap: a family in the corpus table, a row in the
-   tier map, or a phase decomposition of one row. Not a count table.
-2. Confirm the row **alone**, one process, with its control rows.
-3. State the prediction and the falsifier before writing code. Example: "the
+0. **Rank by absolute recoverable time, not by `mean-jitGap`.** The headline gives
+   a row where V8 does 0.02 ms the same weight as one where it does 80 ms, so it
+   puts 0.6 ms rows at 55x ahead of 452 ms rows at 8.6x, and three sessions of
+   work went into the 0.6 ms rows. Run `python tools/corpus/where.py bench.txt
+   tier.tsv` (see its header for producing the inputs) and take the top of the
+   *recoverable* column. Two of the columns decide what kind of work it is:
+   - `tier` (`SLAG_OPT=0` vs default, in ms): a row the optimizing tier is
+     slower on is a tier-selection bug. Twenty corpus rows are, for 14.3 ms.
+   - `jl` (the interpreter gap): both engines interpret the same work, so V8's
+     optimizer cannot flatter it. `jl` near `gap` means shared runtime machinery
+     (the fixable kind); `jl` far below it means V8 removes work we do
+     (inlining, escape analysis) and the row's ceiling may not be reachable.
+1. Start from a **measured** time, not a count table: the corpus table, the tier
+   map, or a component cost from step 2.
+2. **Put a time on each component before touching the engine.** Write the row's
+   shape as ablation variants (one component removed per file), run
+   `tools/corpus/ablate.sh <dir>`, and read the `jl` deltas. That is how the
+   2026-10-28 work order was found: closure creation 460 ns against V8's 65
+   (7x), member read/call 194 against 12 (17x), calls and frames 1.5x, i.e. fine.
+   Guessing from IR shapes and count censuses produced a day of NULLs instead.
+3. Confirm the row **alone**, one process, with its control rows.
+4. State the prediction and the falsifier before writing code. Example: "the
    guarded loop drops from 32 to about 10 instructions and from 2.7 to
    0.9 ns; falsified if `own_read` and the `globals` rows do not reach the
    baseline tier".
-4. Price the mechanism on the micro-suite first, then the product on the
+5. Price the mechanism on the micro-suite first, then the product on the
    corpus.
-5. Land only with the gates and a journal entry. A NULL is a valid outcome and
+6. Land only with the gates and a journal entry. A NULL is a valid outcome and
    must be recorded with its numbers, because it is what stops the next person
    from repeating it.
 

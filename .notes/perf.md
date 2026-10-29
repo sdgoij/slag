@@ -17864,3 +17864,85 @@ boundary is what gives `narrow`/`mem2reg` a parameter whose declared type it can
 derive from a single incoming value. Removing the block removes that, and the
 `Canon` per iteration comes back. Reverted; the continuation block is load
 bearing, not overhead.
+
+## METHOD (2026-10-28): rank by recoverable time, cross with tier and interpreter, then ablate
+
+Everything the last three sessions chased was chosen from `mean-jitGap`, and that
+metric gives a row where V8 does 0.02 ms the same weight as a row where it does
+80 ms. So a 0.6 ms `opcost` row at 55x outranked a 452 ms row at 8.6x, and the
+work went into the 0.6 ms row. `tools/corpus/where.py` replaces the ranking with
+absolute recoverable time (`slag - node`) and adds the two discriminators the
+ratio table cannot show:
+
+- **tier**: what `SLAG_OPT=0` (the baseline tier) does with the same row. A row
+  the optimizing tier is *slower* on is a tier-selection bug, and it is visible
+  in ms. Twenty rows are, totalling **-14.29 ms** of corpus time
+  (`try/completion-values` -4.6, `spread_assign` -3.5, `template-literal -1.6`,
+  `closure_capture` -1.0). For scale: the best win of the last session, splicing
+  a member call, was worth 0.5 ms of absolute time.
+- **jl**: the *interpreter* gap. Both engines interpret the same work, so V8's
+  optimizer cannot flatter it. `gap_jl` near `gap_jit` means the deficit is in
+  shared runtime machinery; `gap_jl` far below it means V8's optimizer removes
+  work we do.
+
+The ranked head (one `bench.js` run, 3 interleaved tier rounds):
+
+| recover | share | slag | node | gap | jl gap | tier | verdict | row |
+|---:|---:|---:|---:|---:|---:|---:|---|---|
+| 400.0 | 22.0% | 452.6 | 52.6 | 8.6 | 7.5 | -0.47 | runtime | `language/.../for-in/head-let-fresh-binding-per-iteration` |
+| 173.0 | 9.8% | 200.8 | 27.8 | 7.2 | 6.5 | -1.64 | runtime | `language/.../template-literal/evaluation-order` |
+| 67.6 | 4.4% | 91.4 | 23.8 | 3.8 | 3.0 | -3.49 | runtime | `objects/spread_assign` |
+| 64.8 | 4.0% | 83.0 | 18.2 | 4.6 | 4.8 | +0.58 | runtime | `opcost/json_stringify` |
+| 62.5 | 3.4% | 70.8 | 8.3 | 8.5 | 7.3 | +0.94 | runtime | `strings/split_join` |
+
+The two biggest rows are **28% of the corpus**, both `runtime`, and both
+indifferent to the tier (0.5% and 0.8%): their cost is not in the optimizing
+tier, and no amount of opt-tier specialization moves them.
+
+**Then ablate the row's own workload**, per component, on both engines and both
+modes, one process per variant (`tools/corpus/ablate.sh`). Components are read
+off as deltas, and the `jl` columns are the ones to trust. For the head-let row
+(simplified asserts, 100k body calls, closures over a `for (let x in obj)` head):
+
+| variant | slag jit | slag jl | node jit | node jl | jl gap |
+|---|---:|---:|---:|---:|---:|
+| as written | 337.5 | 476.0 | 26.0 | 65.5 | 7.3 |
+| no assert/read/call block | 278.2 | 301.4 | 25.0 | 55.0 | 5.5 |
+| no closures (`fns[x] = x`) | 147.3 | 163.1 | 24.4 | 35.4 | 4.6 |
+| no `for`-in (unrolled) | 188.2 | 324.8 | 12.8 | 37.8 | 8.6 |
+| empty body, 100k calls | 0.41 | 2.26 | 0.02 | 1.49 | **1.5** |
+
+Per-component cost in our *interpreter*, and against V8's interpreter:
+
+| component | slag | node | |
+|---|---:|---:|---|
+| 300k closures (`for`-let capture) | 138 ms (460 ns each) | 19.6 ms (65 ns) | **7.0x** |
+| 900k member reads + calls | 175 ms (194 ns) | 10.5 ms (12 ns) | **16.7x** |
+| fresh object + 6 stores + 3-iteration `for`-in | ~160 ms | ~5 ms | ~10x (residual) |
+| 100k calls to an empty body (frame machinery) | 2.26 ms | 1.49 ms | **1.5x** |
+
+So: **calls and frames are near V8 (1.5x). Closure creation is 7x. Property
+reads, calls, and fresh-object defines are 10-17x.** The corpus' largest rows are
+made of exactly those three, and the `jl` column says the gap is in the runtime,
+not in what the optimizing tier does with it. V8 then gets a further 2.6x on
+these rows from inlining and escape analysis (`node_jl / node_jit` = 2.5-4.3),
+which is the second-order prize and the reason a jit-only comparison overstates
+how far ahead V8's *runtime* is.
+
+**Work order (absolute recoverable time, `jl`-verified):**
+
+1. **Closure creation with a per-iteration capture**: 460 ns against V8's 65 ns,
+   and the component of 28% of the corpus. `register_function`'s phase split was
+   measured in 2026-10-25 as "diffuse, at its architectural floor" — that
+   conclusion was reached when the row was ranked by ratio. At 250 ms it is the
+   largest single item in the project and the floor claim needs re-deriving
+   against V8's 65 ns, not against our own previous version.
+2. **Property read/call on a fresh ordinary object**: 194 ns against 12 ns. The
+   member-value cell is per-shape and a fresh object pays its fill; V8's IC is
+   per-site and pays a map compare.
+3. **Fresh-object property defines and `for`-in enumeration**: ~160 ms of the
+   same row.
+4. **Tier selection**: 14.29 ms, free, twenty rows where the baseline tier wins.
+
+Numbers 1-3 also explain the second row (`template-literal/evaluation-order`:
+70k closures + calls) and the third (`spread_assign`: defines).
