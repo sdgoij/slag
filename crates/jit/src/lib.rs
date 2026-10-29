@@ -2350,6 +2350,39 @@ mod tests {
     }
 
     #[test]
+    fn opt_tier_splices_a_member_closure_with_a_callee_guard() {
+        // `var o = { m: function (x) { return x + 1; } }; ... o.m(i)`: the callee
+        // operand is a member read of a literal object the body built, so the
+        // splice compares the operand against that closure and takes the
+        // ordinary call when the field was written since. `flip` writes it
+        // mid-loop, which makes the guard's fallback observable; `flip` -1
+        // never fires, and every invocation creates its own closure.
+        let source = "function g(n, flip) { \
+                        var o = { m: function (x) { return x + 1; } }; \
+                        var s = 0; \
+                        for (var i = 0; i < n; i++) { \
+                          if (i === flip) { o.m = function (x) { return x + 2; }; } \
+                          s = (s + o.m(i)) | 0; \
+                        } \
+                        return s; } \
+                      g(1000, 500) + g(1000, -1) + g(10, 3);";
+        let interp = {
+            let mut agent = runtime::Agent::new();
+            agent.initialize_host_defined_realm().expect("realm");
+            agent.run_script(source).expect("interp runs")
+        };
+        let before = crate::opt::pass::inline::CREATED.load(Ordering::Relaxed);
+        let (value, compiled) = with_opt_jit_agent(|agent| agent.run_script(source).expect("runs"));
+        let created = crate::opt::pass::inline::CREATED.load(Ordering::Relaxed) - before;
+        assert_eq!(
+            value, interp,
+            "the guard's fallback must run the replaced callee"
+        );
+        assert!(compiled >= 1, "{compiled} bodies compiled");
+        assert!(created >= 1, "the creation-site splice did not fire");
+    }
+
+    #[test]
     fn opt_tier_splices_a_closure_the_body_creates() {
         // A loop-bodied caller never records call-site feedback (`JitEngine::
         // consult` compiles a body with a loop on its first consult, so it runs

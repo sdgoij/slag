@@ -254,6 +254,7 @@ the proof. The proof is the priced next slice; see section 7.
 | `promote_loop_carried_field`: a field read before its store in the loop header becomes a header phi (literal on the entry edge, stored value on the back-edge) and the object is elided | `objects/compound_assign` 30.4 -> 12.1 ms (-60%), total separation over 7 interleaved rounds and over the `SLAG_SCALAR_LOOP=0` seam (-61%); the `objects` family 6.26 -> 5.3x, headline unchanged inside its spread |
 | The carried field is typed `Number` by induction (numeric entry value, numeric-preserving arithmetic on the back-edge), and `narrow` seeds its lattice from a block parameter's declared type | `objects/compound_assign` 12.1 -> 3.0 ms (-75%), `objects/warm_store` 9.6 -> 3.1 (-68%), `objects/destructure` 2.8 -> 1.0 (-63%); corpus flat (+0.07%: 3 rows of 77), `objects` family 5.27 -> 4.18x, headline 10.12 -> 10.00 |
 | The splice's static route: a call whose callee operand is a `NewClosure` (directly, or through a frame slot stored once in the entry block) splices with no comparison and no feedback, plus the `normalize`/`narrow`/`mem2reg` re-run after `inline` | `opcost/js_call` 0.88 -> 0.53 ms (-40%), `opcost/array_for_each_js` -9%; corpus flat (-0.16%: 2 rows of 77), IR diff confirms exactly those 2 rows |
+| The member-call splice: a member read of a literal object's field that holds a closure splices behind `CalleeEq(operand, literal_value)`, the literal being the body's own `NewClosure` SSA value (so a per-call closure still matches, and a field written since falls back) | `opcost/method_call` 1.19 -> 0.68 ms (-43%), `opcost/js_call` 0.778 -> 0.588, corpus -0.74%; IR diff confirms exactly 3 rows |
 | Global read cells (declarative record, nested bodies) | top-level `const` 52.5 -> about 2.4 ms per 1M; nested helper 130.2 -> 2.5 ms |
 | Map key-index mixer (Goats) | `mapget` -29%, `maphas` -37% |
 | Optimizing-tier GC safe point | a lifted allocating loop had no safepoint and a 46 ms pause; fixed |
@@ -316,11 +317,15 @@ needs its own per-row measurement.
 - **The inline splice cannot fire on a loop-bodied caller, and that is the
   headline's biggest single ceiling.** `JitEngine::consult` compiles a loop body
   on its FIRST consult (see the 2026-10-28 PROBE), so `record_call_site` never
-  runs and `sites_from_feedback` is empty for exactly those bodies. The static
-  route (a callee the body itself creates) now lands; the *member-call* shape
-  (`obj.m(k)` with `obj` a literal the body built) is still unspliced, because
-  forwarding its callee needs the receiver's escape analysis relaxed and that
-  needs a proof about the callee's body. That is the next slice.
+  runs and `sites_from_feedback` is empty for exactly those bodies. Both static
+  routes now land (a callee the body creates, and a member read of a literal
+  field holding one), so the remaining gap is the *feedback* class: a computed
+  or megamorphic callee (`calls/closure_capture`, `fns[i & 63](i)`), which no
+  static proof reaches.
+- **Type a splice's result.** The continuation parameter takes the call's
+  result type (`Unknown`), so a spliced region's arithmetic does not promote the
+  accumulator unless the guard's fallback path is absent. Typing it from the
+  callee's return value is the same missing piece as typing parameters.
 - **The spliced region's block split.** A splice at a call inside a loop leaves
   the callee in its own block pair and canonicalizes the raw-f64 result per
   iteration (`Canon`), which is most of the remaining 5.3 ns on `js_call`.

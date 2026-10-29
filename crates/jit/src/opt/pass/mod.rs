@@ -100,7 +100,7 @@ pub fn run(
     // guard's deopt path.
     let guarded = guard_enabled() && guard::run(func);
     let promoted = mem2reg_enabled() && promote_frame_slots(func);
-    let inlined = inline::run(func, sites, resolve);
+    let inlined = inline::run(func, body, sites, resolve);
     let cse = cse::run(func);
     let licm = licm::run(func);
     let scalarized = body.is_some_and(|body| scalar::run(func, body));

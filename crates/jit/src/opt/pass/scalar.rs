@@ -560,7 +560,10 @@ fn strip_dead_literals(func: &mut Function, replaced: &HashSet<ValueId>) {
 
 /// The whole-literal objects this pass may replace: value -> (atom, value)
 /// pairs in source order. `Imm::Int(step)` points at the `ObjectFast` payload.
-fn literal_objects(func: &Function, body: &CompiledBody) -> HashMap<ValueId, Vec<(u32, ValueId)>> {
+pub(crate) fn literal_objects(
+    func: &Function,
+    body: &CompiledBody,
+) -> HashMap<ValueId, Vec<(u32, ValueId)>> {
     let mut objects = HashMap::new();
     for b in 0..func.block_count() as u32 {
         for inst in &func.block(b).insts {
@@ -618,7 +621,7 @@ fn literal_arrays(func: &Function, body: &CompiledBody) -> HashMap<ValueId, Vec<
 /// slot-writing effect in between (a call may observe the slot through a
 /// closure created earlier only if it was captured, which makes it a context
 /// slot, not a frame slot  -  so a read here is the stored value).
-fn slot_aliases(func: &Function, roots: &HashSet<ValueId>) -> HashMap<ValueId, ValueId> {
+pub(crate) fn slot_aliases(func: &Function, roots: &HashSet<ValueId>) -> HashMap<ValueId, ValueId> {
     let mut aliases: HashMap<ValueId, ValueId> = HashMap::new();
     for b in 0..func.block_count() as u32 {
         let mut slot_value: HashMap<u32, ValueId> = HashMap::new();
@@ -768,7 +771,7 @@ fn push_number_const(func: &mut Function, block: u32, value: f64) -> ValueId {
 }
 
 /// The literal a value denotes and whether it is an array literal.
-fn root_of_any(
+pub(crate) fn root_of_any(
     value: ValueId,
     objects: &HashMap<ValueId, Vec<(u32, ValueId)>>,
     arrays: &HashMap<ValueId, Vec<ValueId>>,

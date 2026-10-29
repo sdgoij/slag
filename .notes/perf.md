@@ -17633,3 +17633,60 @@ continuation's raw-f64 result is canonicalized back with a `Canon` per iteration
 word). Merging the callee's single block into the caller's, or teaching `unbox`
 that a raw value may feed a raw operand, is the next slice; the block split also
 shows up as the loop's only remaining branches.
+
+## LANDED (2026-10-28): the member-call splice, guarded by a callee comparison
+
+`opcost/method_call` is the shape the PROBE above could not reach: the callee is
+a member read of an object the body built (`var obj = { m: function (x) { return
+x + 1; } }; obj.m(k)`), so `closure_of_callee` cannot say the operand *is* a
+`NewClosure` value, and the object escapes as the call's receiver (the callee may
+write `this.m`), which is what stops the scalar pass from forwarding the read.
+
+The splice does not need the forwarding. The site is proved by a runtime
+comparison instead: `CalleeEq(callee_operand, literal_value)`, where the literal
+value is the closure the body's own `NewClosure` created. The `MemberGuard`
+before it has already established that the cell's value is the receiver's field,
+so the comparison asks exactly "is this still the closure we created?" and a
+field written since takes the ordinary call. That is sound with no escape
+analysis and no feedback, and it is invocation-local: comparing against the
+SSA `NewClosure` value rather than a baked box is what makes it work for a
+closure created per call (a `Guarded` site's baked box never matches a fresh
+closure, which is what the 2026-10-25 note on that site class was seeing).
+
+The lowered loop:
+
+```
+b1(v28:int):
+  v8:int = BitAnd(v28, v0)         ; k
+  v9:? = FrameLoad() slot2         ; s
+  v11:? = MemberCellLoad(v10) atom644
+  v12:? = MemberGuard(v10, v11)
+  v35:bool = CalleeEq(v12, v1)     ; is obj.m still the closure we created?
+  branch v35, b4(), b5()
+b4():
+  v34:f64 = Add(v8, 1)             ; the callee body, inlined
+  v37:num = Canon(v34)
+  jump b3(v37)
+```
+
+Measured on the row, one process, 7 interleaved rounds, minima: 1.19 -> 0.68 ms
+(**-43.0%**). Corpus, 5 interleaved rounds, per-row minima, `SLAG_INLINE_CREATED=0`
+vs default: total 2170.1 -> 2154.1 ms (**-0.74%**), `opcost/method_call` 1.172 ->
+0.668 (-43.0%), `opcost/js_call` 0.778 -> 0.588 (-24.4%), `opcost/
+array_for_each_js` 3.650 -> 3.304 (-9.5%). An IR diff of all 77 rows leaves
+exactly those three changed, so the +10.4% the same A/B showed on
+`calls/closure_capture` is noise: its IR is byte-identical.
+
+New test, `opt_tier_splices_a_member_closure_with_a_callee_guard`, writes the
+field mid-loop so the guard's fallback is observable, and checks the tier
+against the interpreter across three invocations (each with its own closure).
+
+Gates: fmt, `clippy --workspace -D warnings`, `cargo test --workspace`; test262
+language 23,726 + built-ins 23,821 + annexB 1,086 + intl402 3,365 at 100%.
+
+**Still open in these rows.** The spliced region sits in its own block pair and
+its raw-f64 result crosses the continuation as `Canon`; the continuation's
+parameter joins with the fallback call's `Unknown`, so the accumulator only
+promotes when the fallback path is absent (`js_call` it does, `method_call` it
+does not). Typing a splice's result from the callee's return value would close
+that, and it is the same missing piece as typing a function's parameters.

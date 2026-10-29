@@ -116,19 +116,33 @@ pub fn sites_from_declarations(body: &runtime::ir::CompiledBody) -> Vec<Option<I
 }
 
 /// The call sites whose callee operand is provably a closure `func` creates,
-/// indexed by step: a call whose callee is a `NewClosure` value, directly or
-/// through a frame slot stored once in the entry block with it.
+/// with the value to compare that operand against. Two shapes:
+///
+/// - the callee operand *is* the `NewClosure` value, directly or through a frame
+///   slot stored once in the entry block with it: no comparison is needed;
+/// - the operand is a member read of a literal object the body builds, whose
+///   field holds such a closure: the comparison against that literal value is
+///   what makes the splice sound (the field may have been written, and then the
+///   ordinary call runs).
 ///
 /// This is the static route to the splice, and the only one available to a loop
 /// body: such a body is compiled on its first consult, so it never runs an
 /// interpreted step and `sites_from_feedback` is always empty for it
 /// (`.notes/perf.md`, 2026-10-28).
 #[must_use]
-pub fn sites_from_creations(func: &Function, steps: usize) -> Vec<Option<InlineSite>> {
+pub fn sites_from_creations(
+    func: &Function,
+    body: &runtime::ir::CompiledBody,
+    steps: usize,
+) -> (Vec<Option<InlineSite>>, Vec<Option<ValueId>>) {
     let mut sites = vec![None; steps];
+    let mut expected = vec![None; steps];
     let Some(slots) = single_closure_slots(func) else {
-        return sites;
+        return (sites, expected);
     };
+    let objects = super::scalar::literal_objects(func, body);
+    let roots: std::collections::HashSet<ValueId> = objects.keys().copied().collect();
+    let aliases = super::scalar::slot_aliases(func, &roots);
     for b in 0..func.block_count() as u32 {
         for inst in &func.block(b).insts {
             let (Op::Call, Imm::Int(step)) = (inst.op, &inst.imm) else {
@@ -143,15 +157,69 @@ pub fn sites_from_creations(func: &Function, steps: usize) -> Vec<Option<InlineS
             if site.is_some() {
                 continue;
             }
-            let Some(create_step) = closure_step(func, inst.args[1], &slots) else {
+            let Some((closure, create_step)) =
+                closure_of_callee(func, inst.args[1], &slots, &objects, &aliases)
+            else {
                 continue;
             };
             *site = Some(InlineSite {
                 target: InlineTarget::Created { create_step },
             });
+            expected[*step as usize] = Some(closure);
         }
     }
-    sites
+    (sites, expected)
+}
+
+/// The closure a call's callee operand is, and the `CreateFunction` step that
+/// creates it: the `NewClosure` value itself, a slot load of one, or a member
+/// read of a literal object's field that holds one.
+fn closure_of_callee(
+    func: &Function,
+    callee: ValueId,
+    slots: &std::collections::HashMap<u32, ValueId>,
+    objects: &std::collections::HashMap<ValueId, Vec<(u32, ValueId)>>,
+    aliases: &std::collections::HashMap<ValueId, ValueId>,
+) -> Option<(ValueId, usize)> {
+    let closure = match defining_inst(func, callee) {
+        Some(inst) if inst.op == Op::NewClosure => callee,
+        Some(inst) if inst.op == Op::FrameLoad => match inst.imm {
+            Imm::Slot(slot) => *slots.get(&slot)?,
+            _ => return None,
+        },
+        Some(inst) if matches!(inst.op, Op::MemberGuard | Op::MemberCellLoad) => {
+            // The cell's value is the receiver's field, and the literal's own
+            // value for that atom is the closure the body created. The caller
+            // compares the operand against it, so a written field takes the
+            // ordinary call.
+            let load = if inst.op == Op::MemberGuard {
+                *inst.args.get(1)?
+            } else {
+                callee
+            };
+            let load = defining_inst(func, load)?;
+            if load.op != Op::MemberCellLoad {
+                return None;
+            }
+            let Imm::Atom(atom) = load.imm else {
+                return None;
+            };
+            let receiver = *load.args.first()?;
+            let (object, false) =
+                super::scalar::root_of_any(receiver, objects, &Default::default(), aliases)?
+            else {
+                return None;
+            };
+            let &(_, value) = objects.get(&object)?.iter().find(|(key, _)| *key == atom)?;
+            value
+        }
+        _ => return None,
+    };
+    let step = match defining_inst(func, closure)?.imm {
+        Imm::Int(step) if defines_closure(func, closure) => step as usize,
+        _ => return None,
+    };
+    Some((closure, step))
 }
 
 /// The frame slots that hold a closure on every path: stored exactly once, in the
@@ -191,27 +259,10 @@ fn single_closure_slots(func: &Function) -> Option<std::collections::HashMap<u32
     )
 }
 
-/// The `Step::CreateFunction` index behind a callee operand: a `NewClosure`
-/// value, or a load of a frame slot that holds one.
-fn closure_step(
-    func: &Function,
-    value: ValueId,
-    slots: &std::collections::HashMap<u32, ValueId>,
-) -> Option<usize> {
-    let value = match defining_inst(func, value) {
-        Some(inst) if inst.op == Op::NewClosure => value,
-        Some(inst) => match inst.imm {
-            Imm::Slot(slot) if inst.op == Op::FrameLoad => *slots.get(&slot)?,
-            _ => return None,
-        },
-        None => return None,
-    };
-    match defining_inst(func, value)?.imm {
-        Imm::Int(step) => Some(step as usize),
-        _ => None,
-    }
-}
-
+/// The frame slots that hold a closure on every path: stored exactly once, in the
+/// entry block (which dominates every reached block), with a `NewClosure`. `None`
+/// when the body writes a slot without naming it (the fused declaration and
+/// loop-binding steps), which makes no slot provable.
 /// Whether `value` is produced by a `NewClosure`.
 fn defines_closure(func: &Function, value: ValueId) -> bool {
     defining_inst(func, value).is_some_and(|inst| inst.op == Op::NewClosure)
@@ -276,6 +327,7 @@ fn created_sites_enabled() -> bool {
 /// `Imm::Int`); `resolve` yields the callee. Returns whether the IR changed.
 pub fn run(
     func: &mut Function,
+    body: Option<&runtime::ir::CompiledBody>,
     sites: &[Option<InlineSite>],
     resolve: &mut dyn FnMut(&InlineTarget) -> Option<Callee>,
 ) -> bool {
@@ -284,10 +336,9 @@ pub fn run(
     // IR, so they do not depend on feedback. They are merged only here: a
     // spliced-in callee's IR names the callee's own step list, so its sites are
     // the ones the resolver computed for it.
-    let created = if created_sites_enabled() {
-        sites_from_creations(func, sites.len())
-    } else {
-        vec![None; sites.len()]
+    let (created, expected) = match (created_sites_enabled(), body) {
+        (true, Some(body)) => sites_from_creations(func, body, sites.len()),
+        _ => (vec![None; sites.len()], vec![None; sites.len()]),
     };
     let sites: Vec<Option<InlineSite>> = sites
         .iter()
@@ -299,7 +350,7 @@ pub fn run(
         // The budget is per top-level site; the recursion shares it, so a
         // self-recursive callee stops expanding and leaves a real call.
         let mut budget = inline_budget();
-        if try_inline(func, b, &sites, resolve, &mut budget) {
+        if try_inline(func, b, &sites, &expected, resolve, &mut budget) {
             changed = true;
         }
     }
@@ -315,6 +366,7 @@ fn try_inline(
     func: &mut Function,
     b: BlockId,
     sites: &[Option<InlineSite>],
+    expected: &[Option<ValueId>],
     resolve: &mut dyn FnMut(&InlineTarget) -> Option<Callee>,
     budget: &mut usize,
 ) -> bool {
@@ -507,26 +559,85 @@ fn try_inline(
         }
         // The declaration owns the slot: nothing writes it after the hoisted
         // init, so the callee at this call IS the closure whose body was
-        // spliced and no check can fail. The creation site's callee operand is
-        // that closure by construction, for the same reason.
-        InlineTarget::Declared { .. } | InlineTarget::Created { .. } => {
-            if matches!(site.target, InlineTarget::Created { .. }) {
-                CREATED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            }
+        // spliced and no check can fail. A creation site's operand is that
+        // closure too when it is the `NewClosure` value (or its slot load); a
+        // member read of the same field may have been written since, so it is
+        // compared against the literal value and falls back to the call.
+        InlineTarget::Declared { .. } => {
             func.block_mut(b).term = Some(Term::Jump {
                 target: block_map[0],
                 args: Vec::new(),
             });
+        }
+        InlineTarget::Created { .. } => {
+            CREATED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            match expected.get(step as usize).copied().flatten() {
+                Some(value) if value != args[1] => {
+                    emit_callee_guard(func, b, &args, ty, step, cont, block_map[0], value);
+                }
+                _ => {
+                    func.block_mut(b).term = Some(Term::Jump {
+                        target: block_map[0],
+                        args: Vec::new(),
+                    });
+                }
+            }
         }
     }
 
     replace_uses(func, result, param);
 
     // I5c-2c-iv: recurse into the callee's own calls, under the shared budget.
+    // The spliced-in IR names the callee's step list, so only the sites the
+    // resolver computed for it apply, and no creation site is derived here.
     for &dst in &block_map {
-        try_inline(func, dst, callee.sites.as_slice(), resolve, budget);
+        try_inline(func, dst, callee.sites.as_slice(), &[], resolve, budget);
     }
     true
+}
+
+/// Branch to the spliced region when `args[1]` is `expected`, else run the call.
+#[allow(clippy::too_many_arguments)]
+fn emit_callee_guard(
+    func: &mut Function,
+    b: BlockId,
+    args: &[ValueId],
+    ty: Type,
+    step: i32,
+    cont: BlockId,
+    entry: BlockId,
+    expected: ValueId,
+) {
+    let ok = func.push_value(Type::Bool);
+    func.block_mut(b).insts.push(Inst {
+        op: Op::CalleeEq,
+        args: vec![args[1], expected],
+        result: Some(ok),
+        ty: Type::Bool,
+        effects: Effects::pure(),
+        imm: Imm::None,
+    });
+    let fallback = func.push_block();
+    let called = func.push_value(ty);
+    func.block_mut(fallback).insts.push(Inst {
+        op: Op::Call,
+        args: args.to_vec(),
+        result: Some(called),
+        ty,
+        effects: Effects::call(),
+        imm: Imm::Int(step),
+    });
+    func.block_mut(fallback).term = Some(Term::Jump {
+        target: cont,
+        args: vec![called],
+    });
+    func.block_mut(b).term = Some(Term::Branch {
+        cond: ok,
+        then_block: entry,
+        then_args: Vec::new(),
+        else_block: fallback,
+        else_args: Vec::new(),
+    });
 }
 
 /// Whether this cut can splice `callee`: every remaining slot access is a load
@@ -755,7 +866,10 @@ mod tests {
         // `x + 1` with `x = 10` splices to `11`.
         let mut func = caller_ir();
         let mut resolve = by_id(|id| (id == 7).then(param_callee));
-        assert!(run(&mut func, &site(), &mut resolve), "the site inlined");
+        assert!(
+            run(&mut func, None, &site(), &mut resolve),
+            "the site inlined"
+        );
         assert_eq!(call_count(&func), 1, "only the mismatch fallback remains");
         assert!(!ops(&func).contains(&Op::FrameLoad), "the param is bound");
         assert!(ops(&func).contains(&Op::CalleeEq), "the callee is compared");
@@ -785,7 +899,7 @@ mod tests {
     fn splices_a_constant_callee() {
         let mut func = caller_ir();
         let mut resolve = by_id(|id| (id == 7).then(constant_callee));
-        assert!(run(&mut func, &site(), &mut resolve));
+        assert!(run(&mut func, None, &site(), &mut resolve));
         assert_eq!(call_count(&func), 1);
         assert_eq!(verify(&func), Ok(()));
     }
@@ -860,7 +974,10 @@ mod tests {
             InlineTarget::Declared { init_step: 3 } => Some(param_callee()),
             _ => None,
         };
-        assert!(run(&mut func, &sites, &mut resolve), "the site inlined");
+        assert!(
+            run(&mut func, None, &sites, &mut resolve),
+            "the site inlined"
+        );
         assert_eq!(call_count(&func), 0, "no fallback call");
         assert!(!ops(&func).contains(&Op::CalleeEq), "no comparison");
         assert_eq!(verify(&func), Ok(()), "the spliced IR verifies");
@@ -873,7 +990,10 @@ mod tests {
         // parameter.
         let mut func = caller_ir_mid_block();
         let mut resolve = by_id(|id| (id == 7).then(param_callee));
-        assert!(run(&mut func, &site(), &mut resolve), "the site inlined");
+        assert!(
+            run(&mut func, None, &site(), &mut resolve),
+            "the site inlined"
+        );
         assert_eq!(call_count(&func), 1, "only the mismatch fallback remains");
         assert_eq!(verify(&func), Ok(()), "the spliced IR verifies");
         let cont = (0..func.block_count() as u32)
@@ -901,7 +1021,7 @@ mod tests {
     fn leaves_a_site_the_resolver_declines() {
         let mut func = caller_ir();
         let mut resolve = by_id(|_id| None);
-        assert!(!run(&mut func, &site(), &mut resolve));
+        assert!(!run(&mut func, None, &site(), &mut resolve));
         assert!(ops(&func).contains(&Op::Call));
     }
 
@@ -948,7 +1068,7 @@ mod tests {
         };
         let mut func = caller_ir();
         let mut resolve = by_id(|_id| Some(var_callee.clone()));
-        assert!(!run(&mut func, &site(), &mut resolve));
+        assert!(!run(&mut func, None, &site(), &mut resolve));
         assert!(ops(&func).contains(&Op::Call));
     }
 
@@ -999,7 +1119,10 @@ mod tests {
         };
         let mut func = caller_ir();
         let mut resolve = by_id(|_id| Some(callee.clone()));
-        assert!(run(&mut func, &site(), &mut resolve), "the callee spliced");
+        assert!(
+            run(&mut func, None, &site(), &mut resolve),
+            "the callee spliced"
+        );
         assert_eq!(call_count(&func), 1, "only the mismatch fallback remains");
         assert_eq!(verify(&func), Ok(()), "the spliced IR verifies");
     }
@@ -1066,7 +1189,7 @@ mod tests {
             8 => Some(constant_callee()),
             _ => None,
         });
-        assert!(run(&mut func, &site(), &mut resolve));
+        assert!(run(&mut func, None, &site(), &mut resolve));
         assert_eq!(
             call_count(&func),
             2,
@@ -1086,7 +1209,7 @@ mod tests {
         // then leaves the innermost call real. A hang would fail the test.
         let mut func = caller_ir();
         let mut resolve = by_id(|id| (id == 7).then(|| chain_callee(7, 0xabc)));
-        assert!(run(&mut func, &site(), &mut resolve));
+        assert!(run(&mut func, None, &site(), &mut resolve));
         assert_eq!(verify(&func), Ok(()));
         assert!(
             ops(&func).contains(&Op::Call),
@@ -1130,7 +1253,7 @@ mod tests {
         };
         let mut func = caller_ir();
         let mut resolve = by_id(|_id| Some(guarded.clone()));
-        assert!(!run(&mut func, &site(), &mut resolve));
+        assert!(!run(&mut func, None, &site(), &mut resolve));
         assert!(ops(&func).contains(&Op::Call));
     }
 }
