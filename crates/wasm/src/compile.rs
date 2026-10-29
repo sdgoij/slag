@@ -5388,6 +5388,8 @@ impl<'a> Lowerer<'a> {
             0x86 => return self.native_narrow(types::I16X8, false, a, b),
             // `extmul_{low,high}_{s,u}` for the three widening shapes.
             0x9c..=0x9f | 0xbc..=0xbf | 0xdc..=0xdf => return self.native_extmul(sub, a, b),
+            // `i32x4.dot_i16x8_s`.
+            0xba => return Some(self.native_dot(a, b)),
             _ => return None,
         };
         let a = self.bitcast_lanes(ty, a);
@@ -5476,6 +5478,39 @@ impl<'a> Lowerer<'a> {
         };
         let v = self.bitcast_lanes(in_ty, v);
         let out = self.widen_half(v, signed, high);
+        Some(self.bitcast_lanes(types::I128, out))
+    }
+
+    /// `i32x4.dot_i16x8_s`: pairwise sums of the widened products, which the
+    /// x64 backend recognises as `pmaddwd`.
+    fn native_dot(&mut self, a: ClifValue, b: ClifValue) -> ClifValue {
+        let a = self.bitcast_lanes(types::I16X8, a);
+        let b = self.bitcast_lanes(types::I16X8, b);
+        let al = self.widen_half(a, true, false);
+        let bl = self.widen_half(b, true, false);
+        let ah = self.widen_half(a, true, true);
+        let bh = self.widen_half(b, true, true);
+        let low = self.builder.ins().imul(al, bl);
+        let high = self.builder.ins().imul(ah, bh);
+        let out = self.builder.ins().iadd_pairwise(low, high);
+        self.bitcast_lanes(types::I128, out)
+    }
+
+    /// `extadd_pairwise_*`: pairwise sums of the widened halves, which is
+    /// Cranelift's `iadd_pairwise` over `swiden_*`/`uwiden_*`. The x64 backend
+    /// has a special case for exactly this shape (`pmaddubsw`, `pmaddwd`).
+    fn native_extadd_pairwise(&mut self, sub: u16, v: ClifValue) -> Option<ClifValue> {
+        let (in_ty, signed) = match sub {
+            0x7c => (types::I8X16, true),
+            0x7d => (types::I8X16, false),
+            0x7e => (types::I16X8, true),
+            0x7f => (types::I16X8, false),
+            _ => return None,
+        };
+        let v = self.bitcast_lanes(in_ty, v);
+        let low = self.widen_half(v, signed, false);
+        let high = self.widen_half(v, signed, true);
+        let out = self.builder.ins().iadd_pairwise(low, high);
         Some(self.bitcast_lanes(types::I128, out))
     }
 
@@ -6124,6 +6159,7 @@ impl<'a> Lowerer<'a> {
                 let v = self.pop().ok_or("operand stack underflow")?;
                 let native = if simd_native() {
                     self.native_int_unop(sub, v)
+                        .or_else(|| self.native_extadd_pairwise(sub, v))
                         .or_else(|| self.native_extend(sub, v))
                         .or_else(|| self.native_float_unop(sub, v))
                         .or_else(|| self.native_conversion(sub, v))
@@ -13566,20 +13602,22 @@ mod tests {
     #[test]
     fn v128_native_int_lane_ops_match_the_interpreter() {
         // Integer min/max, saturating add/sub, the unsigned rounding average,
-        // the two narrow forms, extmul, the widening extends, and
-        // `i8x16.popcnt`. The operand
+        // the two narrow forms, extmul, the pairwise-adds, the dot product,
+        // the widening extends, and `i8x16.popcnt`. The operand
         // pairs deliberately differ in their two halves so a wrong low/high
-        // choice in `extmul`/`extend` changes the result.
+        // choice in `extmul`/`extend`/`extadd_pairwise` changes the result.
         let v128 = ValType::V128;
-        let binops: [u16; 38] = [
+        let binops: [u16; 39] = [
             0x6f, 0x70, 0x72, 0x73, 0x76, 0x77, 0x78, 0x79, 0x7b, // i8x16
             0x8f, 0x90, 0x92, 0x93, 0x96, 0x97, 0x98, 0x99, 0x9b, // i16x8
             0xb6, 0xb7, 0xb8, 0xb9, // i32x4
             0x65, 0x66, 0x85, 0x86, // narrow
             0x9c, 0x9d, 0x9e, 0x9f, 0xbc, 0xbd, 0xbe, 0xbf, 0xdc, 0xdd, 0xde, 0xdf, // extmul
+            0xba, // dot
         ];
-        let unops: [u16; 13] = [
-            0x62, 0x87, 0x88, 0x89, 0x8a, 0xa7, 0xa8, 0xa9, 0xaa, 0xc7, 0xc8, 0xc9, 0xca,
+        let unops: [u16; 17] = [
+            0x62, 0x7c, 0x7d, 0x7e, 0x7f, 0x87, 0x88, 0x89, 0x8a, 0xa7, 0xa8, 0xa9, 0xaa, 0xc7,
+            0xc8, 0xc9, 0xca,
         ];
         let mut functions: Vec<u32> = vec![0; binops.len()];
         functions.extend(std::iter::repeat_n(1, unops.len()));

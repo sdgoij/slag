@@ -19210,3 +19210,49 @@ and `cargo fmt --check` clean.
 The remaining six (`q15mulr_sat_s`, `dot_i16x8_s`, three `extadd_pairwise`
 forms, relaxed q15mulr, relaxed dot) are the ones with no Cranelift
 instruction, so they would need hand-built sequences.
+
+## MEASURED (2026-10-29, same day): pairwise adds and the dot product, 17.8x
+
+**Second correction to the same claim.** `iadd_pairwise` exists, and the x64
+backend carries special cases for **exactly** the four `extadd_pairwise`
+shapes and for `i32x4.dot_i16x8_s`, so all five lower from ordinary CLIF that
+the backend recognises:
+
+| wasm | CLIF | x64 |
+|---|---|---|
+| `extadd_pairwise_i8x16_s` | `iadd_pairwise(swiden_low, swiden_high)` | `pmaddubsw` |
+| `extadd_pairwise_i8x16_u` | `iadd_pairwise(uwiden_low, uwiden_high)` | `pmaddubsw` |
+| `extadd_pairwise_i16x8_s` | `iadd_pairwise(swiden_low, swiden_high)` | `pmaddwd` |
+| `extadd_pairwise_i16x8_u` | `iadd_pairwise(uwiden_low, uwiden_high)` | `pmaddwd` + fixup |
+| `dot_i16x8_s` | `iadd_pairwise(imul(widen, widen), imul(widen, widen))` | `pmaddwd` |
+
+The operand order matters for the pattern to match: `iadd_pairwise` fills the
+low half of its result from its first operand, and the wasm op's lanes are in
+that same order, so the widened low half is passed first.
+
+**Fixture.** `crates/wasmtest/fixtures/simd-native-pairwise.wast`, 2M
+iterations cycling through all five ops, with each stage narrowed back with
+saturation so the lanes stay bounded. Expected `89195929` from Node v24.12.0.
+
+| row | compiled | helper | interpreter |
+|---|---|---|---|
+| simd-pairwise | **24.82** | 442.06 | 1485.42 |
+| simd-popcnt (re-run) | 30.64 | 418.34 | 1267.26 |
+| simd-loop control | 11.89 | - | - |
+| leaf-loop control | 14.01 | - | - |
+
+Same-binary A/B: **24.82 vs 442.06 ms, 17.8x**, and the compiled row is 59.9x
+the interpreter row, the widest interpreter gap of the ten probes. That is
+consistent with what the helper does here: each of these ops loops lanes and
+performs a widening multiply or a saturated add per lane, which is exactly the
+texture `pmaddwd` replaces.
+
+**Gates.** `equiv waspec/test/core` → 254 suites, 0 diverged, 8264/8264
+functions compiled; `relaxed-simd` → 7 suites, 0 diverged. `cargo test -p wasm
+--features compile --lib` (130, with the five ops added to the integer lane
+differential test), `-p wasm --lib` (44), workspace clippy and `cargo fmt
+--check` clean.
+
+What is left: `i16x8.q15mulr_sat_s` and its relaxed form (relaxed 0x111),
+which have no pattern-recognised CLIF shape and would need a hand-built
+widen/multiply/shift/narrow sequence.
