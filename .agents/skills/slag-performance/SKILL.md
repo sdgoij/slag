@@ -358,6 +358,9 @@ needs its own per-row measurement.
 
 ## 7. Open leads (2026-10-28)
 
+- **The env-carrying leaf lane is the next priced target** (2026-10-29). Per call, minima: a named global leaf is 7.6 ns, a computed callee 13.5, but a leaf that reads a captured binding is **26.6** (31.4 with two captures), against node's 1.2-1.4. Every callee in `calls/closure_capture` captures, so that lane is what the row pays. The interpreter shows the same step (85 -> 127 ns), so it is the lane and not an interpreter artifact. Node's number is inlining (the optimizer project); the env lane is runtime work and the cheaper half. Note the leaf call lane itself is already 5x faster than node's compiled call (7.6 vs 41 ns), so "calls are slow" is wrong as a general statement.
+- **A call site inside a loop body records no feedback at all**, confirmed 2026-10-29: `SLAG_FEEDBACK=1` reports 0 sites / 0 hits for a named leaf, an 8-way computed callee and a monomorphic computed callee, and `SLAG_INLINE_TRACE=1` prints `0 site(s) of 21 step(s), feedback=false`. So the feedback splice cannot reach any loop body, named or computed — that is the ceiling to keep in mind, not a per-row diagnosis.
+
 - **The corpus's #1 row is 62% calls, and a branching leaf body is a step-path leaf** (2026-10-29). `add(a,b){return a+b}` costs 92 ns/call interpreted; add `if (a===b) throw ...` and it costs 301 ns, because a branching body has no register run and falls to the step-path leaf. The other half of the same shape is fixed: the optimizing tier now lifts `throw` (it was the only refused terminator), so such a body gets machine code. What remains is item 2, giving a branching leaf a register run. Decomposition and the per-call table are in `.notes/perf.md` (2026-10-29); closure creation, the two sessions before this one, is only 12% of that row.
 - **Closure creation is 280-300 ns against node-jitless's 9 ns, and the
   registry insert and the fresh `JsObject` are the two biggest phases**

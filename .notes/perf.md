@@ -18349,3 +18349,43 @@ optimizing tier is 13.7% faster overall. A per-row oracle could still recover th
 
 Both were worth the twenty minutes: they remove the two largest remaining
 candidates from the board with numbers rather than impressions.
+
+## PROBE (2026-10-29): the empty-feedback claim holds, and the real cost is the env-carrying leaf
+
+Ran the confirmation the previous note asked for. `SLAG_FEEDBACK=1` over three
+single-row corpus dirs (a named global leaf called in a loop, an
+8-way computed callee, a monomorphic computed callee) reports **0 sites, 0
+hits on all three**, and `SLAG_INLINE_TRACE=1` reports
+`0 site(s) of 21 step(s), feedback=false` for the loop bodies. So the claim is
+stronger than the earlier note: a call site inside a loop body records no
+feedback at all, named or computed.
+
+That is not what makes those rows slow, though. Per call (ablate minima, count
+divided out):
+
+| probe | jit ms | per call | node jit | per call |
+| --- | ---: | ---: | ---: | ---: |
+| named global leaf `inc(i)`, 2M | 15.28 | **7.6 ns** | 82.0 | 41 |
+| `fns[3](i)`, monomorphic computed, 2M | 19.88 | 9.9 | 84.6 | 42 |
+| `fns[i&7](i)`, poly computed, no capture, 2M | 27.07 | 13.5 | 86.8 | 43 |
+| `fns[i&7](i)`, **capturing** callee, 1M | 26.58 | **26.6** | 1.18 | **1.2** |
+| the same with `base` captured too, 1M | 31.38 | **31.4** | 1.44 | 1.4 |
+
+Two readings:
+
+1. **The computed-callee penalty is small** (13.5 vs 7.6 ns). It is not what
+   `calls/closure_capture` pays.
+2. **A leaf that reads a captured binding costs 2x a plain leaf** (26.6 against
+   13.5 ns), and that is exactly the row's shape: every callee captures. In the
+   interpreter the same step is 85 -> 127 ns, so the lane is not an interpreter
+   artifact either.
+
+So the scoped target is the *env-carrying leaf lane* (`leaf_uses_env`, the
+`leaf_call_env` helper and the `body_context`/`lexical_env` swap), where 13-18 ns
+per call is paid to install an environment that is almost always the same one the
+callee was created with. Node's 1.2 ns is inlining, which is the optimizer
+project; the env lane is runtime work and is the cheaper half.
+
+Also worth recording: `a-named-leaf` at 7.6 ns/call against node's 41 ns means
+the *leaf call lane itself* is already 5x faster than node's compiled call. The
+gap on `calls/*` is concentrated in the capturing shape, not in calls as such.
