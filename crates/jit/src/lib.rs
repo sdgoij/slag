@@ -2372,14 +2372,17 @@ mod tests {
             agent.run_script(source).expect("interp runs")
         };
         let before = crate::opt::pass::inline::CREATED.load(Ordering::Relaxed);
+        let lowered_before = crate::opt_lower::OPT_COMPILED.load(Ordering::Relaxed);
         let (value, compiled) = with_opt_jit_agent(|agent| agent.run_script(source).expect("runs"));
         let created = crate::opt::pass::inline::CREATED.load(Ordering::Relaxed) - before;
+        let lowered = crate::opt_lower::OPT_COMPILED.load(Ordering::Relaxed) - lowered_before;
         assert_eq!(
             value, interp,
             "the guard's fallback must run the replaced callee"
         );
         assert!(compiled >= 1, "{compiled} bodies compiled");
         assert!(created >= 1, "the creation-site splice did not fire");
+        assert!(lowered >= 1, "the optimizing tier lowered {lowered} bodies");
     }
 
     #[test]
@@ -2402,14 +2405,17 @@ mod tests {
             agent.run_script(source).expect("interp runs")
         };
         let before = crate::opt::pass::inline::CREATED.load(Ordering::Relaxed);
+        let lowered_before = crate::opt_lower::OPT_COMPILED.load(Ordering::Relaxed);
         let (value, compiled) = with_opt_jit_agent(|agent| agent.run_script(source).expect("runs"));
         let created = crate::opt::pass::inline::CREATED.load(Ordering::Relaxed) - before;
+        let lowered = crate::opt_lower::OPT_COMPILED.load(Ordering::Relaxed) - lowered_before;
         assert_eq!(
             value, interp,
             "the optimizing tier must match the interpreter"
         );
         assert!(compiled >= 1, "{compiled} bodies compiled");
         assert!(created >= 1, "the creation-site splice did not fire");
+        assert!(lowered >= 1, "the optimizing tier lowered {lowered} bodies");
     }
 
     #[test]
@@ -2431,6 +2437,7 @@ mod tests {
             agent.run_script(source).expect("interp runs")
         };
         let before = crate::opt::pass::scalar::REPLACED.load(Ordering::Relaxed);
+        let lowered_before = crate::opt_lower::OPT_COMPILED.load(Ordering::Relaxed);
         let (value, compiled) = with_opt_jit_agent(|agent| agent.run_script(source).expect("runs"));
         let replaced = crate::opt::pass::scalar::REPLACED.load(Ordering::Relaxed) - before;
         assert_eq!(
@@ -2438,7 +2445,12 @@ mod tests {
             "the optimizing tier must match the interpreter"
         );
         assert!(compiled >= 1, "{compiled} bodies compiled");
+        let lowered = crate::opt_lower::OPT_COMPILED.load(Ordering::Relaxed) - lowered_before;
         assert!(replaced >= 1, "the scalar pass replaced {replaced} reads");
+        // The pass firing is not enough: a pipeline stage that leaves an operand
+        // in the wrong representation makes the lowering refuse the body, which
+        // is a silent 15-100x fall back to the baseline tier.
+        assert!(lowered >= 1, "the optimizing tier lowered {lowered} bodies");
     }
 
     #[test]
