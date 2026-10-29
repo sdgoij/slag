@@ -18985,3 +18985,60 @@ new `v128_native_float_unop_and_swizzle_match_the_interpreter`, which covers
 payload-preserving `abs`/`neg`, ties-to-even `nearest`, the sign of a rounded
 zero, and swizzle indices of 16, 127, 128 and 255), `-p wasm --lib` (44),
 workspace clippy, `cargo fmt --check` clean.
+
+## LANDED (2026-10-29, same day): native v128 conversions, 16.5x
+
+Fourth and last cut of the SIMD lowering work: the ten conversion opcodes
+(`i32x4.trunc_sat_f32x4_s/u`, `f32x4.convert_i32x4_s/u`,
+`i32x4.trunc_sat_f64x2_s/u_zero`, `f64x2.convert_low_i32x4_s/u`,
+`f32x4.demote_f64x2_zero`, `f64x2.promote_low_f32x4`).
+
+These do not share one shape, because the Cranelift primitives do not line up
+with the wasm lane counts:
+
+- The four-lane pairs are direct: `fcvt_to_sint_sat`/`fcvt_to_uint_sat` into
+  `i32x4`, and `fcvt_from_sint`/`fcvt_from_uint` out of it. The x64 backend
+  accepts `fcvt_to_*_sat` **only** at 32-bit lanes, which is why the f64 forms
+  cannot use it.
+- `f64x2.convert_low_i32x4_s/u` widens the low two lanes with
+  `swiden_low`/`uwiden_low` and converts the i64 lanes; x64 fuses that pair
+  into `cvtdq2pd` (signed) and an `unpcklps`/`subpd` pair (unsigned).
+- `i32x4.trunc_sat_f64x2_s/u_zero` and demote/promote go per lane
+  (`extractlane`, scalar op, `insertlane` into a zeroed result), because
+  Cranelift's `fpromote`/`fdemote` require the same lane count and there is no
+  `f32x2` type to bridge 128-bit to 64-bit float vectors.
+- The NaN asymmetry in the interpreter decided the canonicalization:
+  `F32DemoteF64` returns `canon32`, so demote canonicalizes, but
+  `F64PromoteF32` returns the widened payload untouched, so promote must not.
+  The differential test carries a payload NaN through both to pin it.
+
+**Fixture.** `crates/wasmtest/fixtures/simd-native-convert.wast`, 2M
+iterations of three closed round trips (`f32x4` through
+`trunc_sat`/`convert`, `f64x2` through `trunc_sat_*_zero`/`convert_low`, and a
+demote/promote pair), all integral and bounded so the expected value `-913309696`
+from Node v24.12.0 is exact.
+
+| row | compiled | helper | interpreter |
+|---|---|---|---|
+| simd-convert | **48.49** | 802.18 | 1843.48 |
+| simd-unop (re-run) | 63.14 | 1347.87 | 2987.99 |
+| simd-float (re-run) | 55.28 | 1019.45 | 2542.43 |
+| simd-native integer (re-run) | 32.06 | 219.78 | 1038.35 |
+| simd-loop control | 12.08 | - | - |
+| leaf-loop control | 13.37 | - | - |
+
+Same-binary A/B: **48.49 vs 802.18 ms, 16.5x**; the compiled row is 38.0x the
+interpreter row. All three earlier probes reproduced in the same run (6.9x,
+18.4x, 21.3x) and the controls sat on the 11.70/13.60 baseline, so the machine
+was at nominal speed.
+
+**Gates.** `equiv waspec/test/core` → 254 suites, 0 diverged, 8264/8264
+functions compiled; `simd` → 59 suites, 0 diverged; `relaxed-simd` → 7 suites,
+0 diverged. `cargo test -p wasm --features compile --lib` (128, including the
+new `v128_native_conversion_matches_the_interpreter` over quiet and signaling
+NaN, the i32/u32 saturation boundaries, truncation toward zero, subnormals,
+overflow, and raw integer lane patterns), `-p wasm --lib` (44), workspace
+clippy, `cargo fmt --check` clean.
+
+What is still on the helper: the saturating/narrow/extmul/dot integer groups
+and `relaxed_*`.

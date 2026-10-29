@@ -5585,6 +5585,98 @@ impl<'a> Lowerer<'a> {
         Some(self.bitcast_lanes(types::I128, out))
     }
 
+    /// Shape and lane conversions: the four-lane `trunc_sat`/`convert` pairs,
+    /// the two-lane `_low` forms, and float demote/promote. The per-lane forms
+    /// exist because Cranelift has no vector instruction that changes the lane
+    /// count for float types, and the x64 backend accepts `fcvt_to_*_sat` only
+    /// at 32-bit lanes.
+    fn native_conversion(&mut self, sub: u16, v: ClifValue) -> Option<ClifValue> {
+        match sub {
+            // `i32x4.trunc_sat_f32x4_s/u`.
+            0xf8 | 0xf9 => {
+                let x = self.bitcast_lanes(types::F32X4, v);
+                let out = if sub == 0xf8 {
+                    self.builder.ins().fcvt_to_sint_sat(types::I32X4, x)
+                } else {
+                    self.builder.ins().fcvt_to_uint_sat(types::I32X4, x)
+                };
+                Some(self.bitcast_lanes(types::I128, out))
+            }
+            // `f32x4.convert_i32x4_s/u`. An integer cannot be a NaN, so the
+            // interpreter's canonicalization is a no-op on this path.
+            0xfa | 0xfb => {
+                let x = self.bitcast_lanes(types::I32X4, v);
+                let out = if sub == 0xfa {
+                    self.builder.ins().fcvt_from_sint(types::F32X4, x)
+                } else {
+                    self.builder.ins().fcvt_from_uint(types::F32X4, x)
+                };
+                Some(self.bitcast_lanes(types::I128, out))
+            }
+            // `f64x2.convert_low_i32x4_s/u`: widen the low two lanes to i64 and
+            // convert. x64 fuses the pair into `cvtdq2pd` (signed) and an
+            // unpack/subtract pair (unsigned).
+            0xfe | 0xff => {
+                let x = self.bitcast_lanes(types::I32X4, v);
+                let out = if sub == 0xfe {
+                    let wide = self.builder.ins().swiden_low(x);
+                    self.builder.ins().fcvt_from_sint(types::F64X2, wide)
+                } else {
+                    let wide = self.builder.ins().uwiden_low(x);
+                    self.builder.ins().fcvt_from_uint(types::F64X2, wide)
+                };
+                Some(self.bitcast_lanes(types::I128, out))
+            }
+            // `i32x4.trunc_sat_f64x2_s/u_zero`: the backend has no f64x2 to
+            // i32x4 saturating convert, so convert lane by lane into a zeroed
+            // result (the `_zero` half is what the second lane pair needs).
+            0xfc | 0xfd => {
+                let x = self.bitcast_lanes(types::F64X2, v);
+                let zero = self.v128_const(0);
+                let mut out = self.bitcast_lanes(types::I32X4, zero);
+                for lane in 0..2u8 {
+                    let scalar = self.builder.ins().extractlane(x, lane);
+                    let converted = if sub == 0xfc {
+                        self.builder.ins().fcvt_to_sint_sat(types::I32, scalar)
+                    } else {
+                        self.builder.ins().fcvt_to_uint_sat(types::I32, scalar)
+                    };
+                    out = self.builder.ins().insertlane(out, converted, lane);
+                }
+                Some(self.bitcast_lanes(types::I128, out))
+            }
+            // `f32x4.demote_f64x2_zero`. The interpreter's `F32DemoteF64` goes
+            // through `canon32`, so the demoted lanes are canonicalized.
+            0x5e => {
+                let x = self.bitcast_lanes(types::F64X2, v);
+                let zero = self.v128_const(0);
+                let mut out = self.bitcast_lanes(types::F32X4, zero);
+                for lane in 0..2u8 {
+                    let scalar = self.builder.ins().extractlane(x, lane);
+                    let demoted = self.builder.ins().fdemote(types::F32, scalar);
+                    out = self.builder.ins().insertlane(out, demoted, lane);
+                }
+                let out = self.canonical_float(types::F32X4, out);
+                Some(self.bitcast_lanes(types::I128, out))
+            }
+            // `f64x2.promote_low_f32x4`. `F64PromoteF32` is the one conversion
+            // the interpreter does NOT canonicalize, so the payload `cvtss2sd`
+            // widens must survive.
+            0x5f => {
+                let x = self.bitcast_lanes(types::F32X4, v);
+                let zero = self.v128_const(0);
+                let mut out = self.bitcast_lanes(types::F64X2, zero);
+                for lane in 0..2u8 {
+                    let scalar = self.builder.ins().extractlane(x, lane);
+                    let promoted = self.builder.ins().fpromote(types::F64, scalar);
+                    out = self.builder.ins().insertlane(out, promoted, lane);
+                }
+                Some(self.bitcast_lanes(types::I128, out))
+            }
+            _ => None,
+        }
+    }
+
     /// `fmin`/`fmax` with the spec's rules: either NaN operand gives the
     /// canonical NaN, and a tie between `-0` and `+0` takes the sign the
     /// interpreter's `fmin32`/`fmax32` take. Cranelift's own `fmin`/`fmax` are
@@ -5806,10 +5898,9 @@ impl<'a> Lowerer<'a> {
             VecSig::Unop => {
                 let v = self.pop().ok_or("operand stack underflow")?;
                 let native = if simd_native() {
-                    match self.native_int_unop(sub, v) {
-                        Some(out) => Some(out),
-                        None => self.native_float_unop(sub, v),
-                    }
+                    self.native_int_unop(sub, v)
+                        .or_else(|| self.native_float_unop(sub, v))
+                        .or_else(|| self.native_conversion(sub, v))
                 } else {
                     None
                 };
@@ -13178,6 +13269,72 @@ mod tests {
             .map(|(a, b)| vec![Value::v128(*a), Value::v128(*b)])
             .collect();
         assert_equiv(&module, unops.len(), &cases);
+    }
+
+    #[test]
+    fn v128_native_conversion_matches_the_interpreter() {
+        // `trunc_sat`, int/float conversion, and demote/promote. The NaN cases
+        // are the load-bearing ones: `trunc_sat` maps NaN to 0, `demote`
+        // canonicalizes (the interpreter's `F32DemoteF64` goes through
+        // `canon32`), and `promote` does not (its `F64PromoteF32` returns the
+        // widened payload untouched), so a payload-preserving NaN separates the
+        // two.
+        let v128 = ValType::V128;
+        let ops: [u16; 10] = [0x5e, 0x5f, 0xf8, 0xf9, 0xfa, 0xfb, 0xfc, 0xfd, 0xfe, 0xff];
+        let module = Module {
+            types: vec![SubType::func(vec![v128], vec![v128])],
+            functions: vec![0; ops.len()],
+            bodies: ops
+                .iter()
+                .map(|sub| FuncBody {
+                    locals: vec![],
+                    body: vec![Instr::LocalGet(0), Instr::Vec(*sub)],
+                })
+                .collect(),
+            ..Module::default()
+        };
+        assert!(
+            compile_module(&module).iter().all(|entry| entry.is_some()),
+            "conversion module did not compile: {:?}",
+            (0..module.bodies.len())
+                .map(|index| body_compile_reason(&module, index))
+                .collect::<Vec<_>>()
+        );
+
+        let f32_nan = f32::from_bits(0x7fa0_0001);
+        let f32_snan = f32::from_bits(0x7f80_0001);
+        let f64_nan = f64::from_bits(0x7ff4_0000_0000_0001);
+        let f64_snan = f64::from_bits(0x7ff0_0000_0000_0001);
+        let values = [
+            // NaN, both quiet payloads and signaling ones.
+            lanes_f32x4([f32::NAN, f32_nan, f32_snan, f32::INFINITY]),
+            lanes_f64x2([f64::NAN, f64_nan]),
+            lanes_f64x2([f64_snan, f64::NEG_INFINITY]),
+            // `i32` and `u32` saturation boundaries.
+            lanes_f32x4([2147483647.0, -2147483648.0, 2147483648.0, -2147483649.0]),
+            lanes_f32x4([4294967295.0, 4294967296.0, -1.0, -0.5]),
+            lanes_f64x2([2147483647.0, -2147483648.0]),
+            lanes_f64x2([4294967295.0, -1.0]),
+            // Truncation toward zero and the sign of a rounded zero.
+            lanes_f32x4([0.5, -0.5, 1.5, -1.5]),
+            lanes_f64x2([-0.0, 0.0]),
+            // Subnormals and overflow, both of which demote has to handle.
+            lanes_f64x2([f64::MIN_POSITIVE / 4.0, -1e-320]),
+            lanes_f64x2([1e300, -1e300]),
+            // Integer lane patterns: i32 extremes and u32's top half.
+            lanes_f32x4([
+                f32::from_bits(0x8000_0000),
+                f32::from_bits(0x7fff_ffff),
+                f32::from_bits(0xffff_ffff),
+                f32::from_bits(0x0000_0001),
+            ]),
+            0,
+            u128::MAX,
+        ];
+        let cases: Vec<Vec<Value>> = values.iter().map(|v| vec![Value::v128(*v)]).collect();
+        for index in 0..ops.len() {
+            assert_equiv(&module, index, &cases);
+        }
     }
 
     #[test]

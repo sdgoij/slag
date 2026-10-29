@@ -2898,20 +2898,23 @@ V8, where the op itself is one instruction. Consequences:
 per shape (plus a separate 6-entry `i64x2` table), shifts, `abs`/`neg`,
 splat/replace, `any_true`/`all_true`, `bitmask`, and `bitselect`, plus the
 whole `f32x4`/`f64x2` family (add/sub/mul/div, min/max, pmin/pmax, and the
-unary `abs`/`neg`/`sqrt`/rounding forms) and `i8x16.swizzle`, with
+unary `abs`/`neg`/`sqrt`/rounding forms), `i8x16.swizzle`, and the ten
+conversion opcodes, with
 the interpreter's canonical-NaN policy reproduced explicitly. Measured on
-`crates/wasmtest/fixtures/simd-native-loop.wast`, `simd-native-float.wast`
-and `simd-native-unop.wast`, same binary, seven interleaved rounds:
-**32.40 ms against 221.10 ms on the helper path (6.8x)** for the integer mix,
-**55.64 ms against 1012.95 ms (18.2x)** for the float arithmetic mix, and
-**63.74 ms against 1358.30 ms (21.3x)** for the unop/swizzle mix, with
+`crates/wasmtest/fixtures/simd-native-loop.wast`, `simd-native-float.wast`,
+`simd-native-unop.wast` and `simd-native-convert.wast`, same binary, seven
+interleaved rounds:
+**32.06 ms against 219.78 ms on the helper path (6.9x)** for the integer mix,
+**55.28 ms against 1019.45 ms (18.4x)** for the float arithmetic mix,
+**63.14 ms against 1347.87 ms (21.3x)** for the unop/swizzle mix, and
+**48.49 ms against 802.18 ms (16.5x)** for the conversion mix, with
 `simd-loop` and `leaf-loop` controls flat. The carrier stays `I128` as point 2
 predicted; the win is entirely per-op instructions. Details, including the
-`shr_s`/`shr_u` table swap the corpus caught and the NaN-canonicalization
-rules, are in `.notes/perf.md`.
+`shr_s`/`shr_u` table swap the corpus caught, the NaN-canonicalization rules,
+and the demote/promote asymmetry, are in `.notes/perf.md`.
 
-Still on the helper after this cut: the conversion family, the
-saturating/narrow/extmul/dot groups, and `relaxed_*`.
+Still on the helper after this cut: the saturating/narrow/extmul/dot integer
+groups and `relaxed_*`.
 
 ### 10.4 Outside wasm (for completeness)
 
