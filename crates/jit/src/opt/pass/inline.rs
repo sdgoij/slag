@@ -157,7 +157,7 @@ pub fn sites_from_creations(
             if site.is_some() {
                 continue;
             }
-            let Some((closure, create_step)) =
+            let Some((expected_value, create_step)) =
                 closure_of_callee(func, inst.args[1], &slots, &objects, &aliases)
             else {
                 continue;
@@ -165,7 +165,7 @@ pub fn sites_from_creations(
             *site = Some(InlineSite {
                 target: InlineTarget::Created { create_step },
             });
-            expected[*step as usize] = Some(closure);
+            expected[*step as usize] = Some(expected_value);
         }
     }
     (sites, expected)
@@ -181,10 +181,12 @@ fn closure_of_callee(
     objects: &std::collections::HashMap<ValueId, Vec<(u32, ValueId)>>,
     aliases: &std::collections::HashMap<ValueId, ValueId>,
 ) -> Option<(ValueId, usize)> {
-    let closure = match defining_inst(func, callee) {
-        Some(inst) if inst.op == Op::NewClosure => callee,
+    let (expected, closure) = match defining_inst(func, callee) {
+        Some(inst) if inst.op == Op::NewClosure => (callee, callee),
         Some(inst) if inst.op == Op::FrameLoad => match inst.imm {
-            Imm::Slot(slot) => *slots.get(&slot)?,
+            // The slot holds the closure on every path, so the operand needs no
+            // comparison; the expected value is the operand itself.
+            Imm::Slot(slot) => (callee, *slots.get(&slot)?),
             _ => return None,
         },
         Some(inst) if matches!(inst.op, Op::MemberGuard | Op::MemberCellLoad) => {
@@ -211,7 +213,7 @@ fn closure_of_callee(
                 return None;
             };
             let &(_, value) = objects.get(&object)?.iter().find(|(key, _)| *key == atom)?;
-            value
+            (value, value)
         }
         _ => return None,
     };
@@ -219,7 +221,7 @@ fn closure_of_callee(
         Imm::Int(step) if defines_closure(func, closure) => step as usize,
         _ => return None,
     };
-    Some((closure, step))
+    Some((expected, step))
 }
 
 /// The frame slots that hold a closure on every path: stored exactly once, in the

@@ -17724,3 +17724,45 @@ The re-type is now two paths: a `scalar`-only body keeps exactly the historical
 The lesson for the protocol: a same-binary seam only attributes the code it
 actually gates. A change to a *shared* pipeline stage needs its own switch, and
 here the two `objects` rows that `opcost/baseline` cannot see were the evidence.
+
+## LANDED + NULL (2026-10-28): the exact creation site needs no comparison, and in-place splicing loses
+
+Two changes to the creation-site splice, one landed and one not.
+
+**LANDED: the expected value is the operand when the operand is the closure.** The
+member route compares the callee operand against the literal's value, and that was
+being applied to the *exact* routes too: a `var g = function () {}` call's operand
+is a `FrameLoad` of the slot that holds the closure, so the recorded expectation
+(the closure) never equalled the operand (the load) and the splice emitted a
+`CalleeEq` that can never fail, on top of splitting the block. `closure_of_callee`
+now returns the *operand* when the operand is the closure or the slot's single
+store (no comparison at all, the slot proves it) and the literal's value only for
+the member route. `opcost/js_call` 0.53 -> **0.49 ms**, `opcost/method_call`
+unchanged at 0.67, `objects/compound_assign` unchanged at 2.90.
+
+**NULL: splicing a single-block callee in place.** The continuation block is what
+forces the call result's `Unknown` type onto a parameter and then a `Canon` at the
+representation boundary, so the obvious next step was to skip it: a callee whose
+IR is one block with no parameters and a value return can be copied into the
+caller's block at the call site, with its return value substituted for the call's
+result. Measured on `opcost/js_call`: **0.93 ms against 0.49**, i.e. worse than
+not splicing at all.
+
+The cause is a latent fragility that the block-splitting splice happened to
+dodge. Removing the continuation changes which values `normalize_param_types`
+joins, `narrow` demotes the counter's entry `Const 0` to `Number`, `loop_counter`
+still fuses the increment into `IntAdd`, and the body's CLIF then mixes an
+`i64` `Value` word with an `i32` constant: `JIT_DUMP_CLIF` reports "opt assemble
+failed", the optimizing tier refuses the body, and it runs on the baseline tier.
+That is the same failure mode as the re-type regression above, from the other
+direction: **`loop_counter` can emit a body the Cranelift verifier rejects**
+whenever the counter parameter is not typed `Int`, and nothing checks it.
+
+So in-place splicing is not landed. The fix that makes it (and any future
+pipeline reordering) safe is for `loop_counter` to type the counter cycle itself:
+it has already proved the counter is int32 (an int32 entry constant, `i ± c`
+increments, an int32 bound), so it can set the parameter, the entry constant and
+the increment to `Int` rather than relying on `normalize_param_types` to derive
+that from a seed `narrow` may have demoted. That is its own slice, with the
+`js_call` row as its falsifier (expect the in-place splice to then reach about
+0.3 ms, and `opt assemble failed` to disappear from `JIT_DUMP_CLIF`).
