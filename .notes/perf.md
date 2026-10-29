@@ -19256,3 +19256,46 @@ differential test), `-p wasm --lib` (44), workspace clippy and `cargo fmt
 What is left: `i16x8.q15mulr_sat_s` and its relaxed form (relaxed 0x111),
 which have no pattern-recognised CLIF shape and would need a hand-built
 widen/multiply/shift/narrow sequence.
+
+## MEASURED (2026-10-29, same day): `q15mulr_sat_s` by hand, 2.4x
+
+The last op, and the first one that really is a hand-built sequence. The
+interpreter computes `sat_i16((a*b + 0x4000) >> 15)` per lane in i64; there is
+no CLIF shape the backend recognises, so the lowering widens both operands
+(`swiden_low`/`swiden_high`), multiplies, adds the `0x4000` rounding constant,
+arithmetic-shifts by 15, and lets `snarrow` perform the saturation. Nine
+vector ops. The relaxed form (0x111) aliases the same kernel, which is also
+what the interpreter does.
+
+The saturation edge is the interesting one and it lands correctly:
+`a = b = -32768` gives `(2^30 + 0x4000) >> 15 = 32768`, which `snarrow`
+clamps to `32767`, matching the interpreter's `clamp(-32768, 32767)`.
+
+**Fixture.** `crates/wasmtest/fixtures/simd-native-q15.wast`, 2M iterations of
+the multiply-and-add pair, which converges to a small fixed point. Expected
+`-70185836` from Node v24.12.0.
+
+| row | compiled | helper | interpreter |
+|---|---|---|---|
+| simd-q15 | **18.29** | 43.74 | 436.32 |
+| simd-pairwise (re-run) | 24.82 | 442.06 | 1478.49 |
+| simd-loop control | 11.29 | - | - |
+| leaf-loop control | 13.06 | - | - |
+
+Same-binary A/B: **18.29 vs 43.74 ms, 2.4x**. The lowest ratio of the eleven
+probes by a wide margin, and the reason is legible: the helper does eight lane
+iterations of a cheap i64 multiply, add, shift and clamp, so there is little
+per-op work to remove, while the native form costs nine instructions. It is
+still a win, and it removes the last integer op from the helper, but a hand-built
+sequence does not buy what a single instruction does. The compiled row is still
+23.8x the interpreter row, so the difference is real rather than noise.
+
+**Gates.** `equiv waspec/test/core` → 254 suites, 0 diverged, 8264/8264
+functions compiled; `relaxed-simd` → 7 suites, 0 diverged. `cargo test -p wasm
+--features compile --lib` (130, with `q15mulr_sat_s` and the relaxed form
+added to the differential tests), `-p wasm --lib` (44), workspace clippy and
+`cargo fmt --check` clean.
+
+With this, every SIMD op the interpreter supports in the compiled subset now
+has a native lowering; the helper remains only as the `SLAG_WASM_SIMD_NATIVE=0`
+fallback and for the relaxed dot product.

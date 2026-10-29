@@ -2923,13 +2923,11 @@ predicted; the win is entirely per-op instructions. Details, including the
 `shr_s`/`shr_u` table swap the corpus caught, the NaN-canonicalization rules,
 and the demote/promote asymmetry, are in `.notes/perf.md`.
 
-Still on the helper after this cut: `i16x8.q15mulr_sat_s` and relaxed q15mulr
-(relaxed 0x111). Both need a hand-built widen/multiply/shift/narrow sequence,
-because no CLIF shape is recognised by the backend for them.
-
-(`i8x16.popcnt`, the four `extadd_pairwise` forms and `i32x4.dot_i16x8_s`
-turned out to have Cranelift lowerings or backend-recognised patterns and are
-all lowered; see `.notes/perf.md`.)
+Still on the helper after this cut: only the relaxed dot products
+(`relaxed_dot_i8x16_i7x16_s` and its accumulate form). `i16x8.q15mulr_sat_s`
+and its relaxed alias are now lowered by a hand-built widen, multiply, round,
+shift and saturating narrow sequence, measured at 2.4x (see
+`.notes/perf.md`).
 
 ### 10.4 Outside wasm (for completeness)
 

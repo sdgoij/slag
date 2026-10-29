@@ -5390,6 +5390,8 @@ impl<'a> Lowerer<'a> {
             0x9c..=0x9f | 0xbc..=0xbf | 0xdc..=0xdf => return self.native_extmul(sub, a, b),
             // `i32x4.dot_i16x8_s`.
             0xba => return Some(self.native_dot(a, b)),
+            // `i16x8.q15mulr_sat_s`.
+            0x82 => return Some(self.native_q15mulr(a, b)),
             _ => return None,
         };
         let a = self.bitcast_lanes(ty, a);
@@ -5512,6 +5514,32 @@ impl<'a> Lowerer<'a> {
         let high = self.widen_half(v, signed, true);
         let out = self.builder.ins().iadd_pairwise(low, high);
         Some(self.bitcast_lanes(types::I128, out))
+    }
+
+    /// `i16x8.q15mulr_sat_s`: `sat_i16((a*b + 0x4000) >> 15)`. No CLIF shape is
+    /// recognised by the backend, so widen both operands, multiply, round, shift,
+    /// and let `snarrow` do the saturation.
+    fn native_q15mulr(&mut self, a: ClifValue, b: ClifValue) -> ClifValue {
+        let a = self.bitcast_lanes(types::I16X8, a);
+        let b = self.bitcast_lanes(types::I16X8, b);
+        let al = self.widen_half(a, true, false);
+        let bl = self.widen_half(b, true, false);
+        let ah = self.widen_half(a, true, true);
+        let bh = self.widen_half(b, true, true);
+        let low = self.builder.ins().imul(al, bl);
+        let high = self.builder.ins().imul(ah, bh);
+        // The 0x4000 rounding constant and the 15-bit shift are immediates; the
+        // shift amount is a scalar, which is how the lane shifts already feed
+        // Cranelift's vector shift.
+        let round = self.iconst(types::I32, 0x4000);
+        let round = self.builder.ins().splat(types::I32X4, round);
+        let low = self.builder.ins().iadd(low, round);
+        let high = self.builder.ins().iadd(high, round);
+        let shift = self.iconst(types::I32, 15);
+        let low = self.builder.ins().sshr(low, shift);
+        let high = self.builder.ins().sshr(high, shift);
+        let out = self.builder.ins().snarrow(low, high);
+        self.bitcast_lanes(types::I128, out)
     }
 
     /// The low or high half of `value`, sign- or zero-extended one lane width.
@@ -5874,8 +5902,7 @@ impl<'a> Lowerer<'a> {
     }
 
     /// The relaxed ops whose deterministic choice is one of the lowerings this
-    /// file already has. The rest stay on the helper: q15mulr and the dot
-    /// products have no Cranelift instruction.
+    /// file already has. Only the relaxed dot product stays on the helper.
     fn native_relaxed(&mut self, sub: u16, slots: &[ClifValue]) -> Option<ClifValue> {
         // `slots` is top-of-stack first: c, b, a for arity 3; b, a for 2; a for 1.
         match sub {
@@ -5903,6 +5930,8 @@ impl<'a> Lowerer<'a> {
             0x10e => self.native_float_arith(0xe9, *slots.get(1)?, *slots.first()?),
             0x10f => self.native_float_arith(0xf4, *slots.get(1)?, *slots.first()?),
             0x110 => self.native_float_arith(0xf5, *slots.get(1)?, *slots.first()?),
+            // relaxed_q15mulr_s: the interpreter aliases the MVP kernel.
+            0x111 => Some(self.native_q15mulr(*slots.get(1)?, *slots.first()?)),
             // relaxed_madd/nmadd: two-rounding multiply-then-add, which is the
             // interpreter's chosen behaviour (the spec allows either that or a
             // fused multiply-add).
@@ -13607,13 +13636,14 @@ mod tests {
         // pairs deliberately differ in their two halves so a wrong low/high
         // choice in `extmul`/`extend`/`extadd_pairwise` changes the result.
         let v128 = ValType::V128;
-        let binops: [u16; 39] = [
+        let binops: [u16; 40] = [
             0x6f, 0x70, 0x72, 0x73, 0x76, 0x77, 0x78, 0x79, 0x7b, // i8x16
             0x8f, 0x90, 0x92, 0x93, 0x96, 0x97, 0x98, 0x99, 0x9b, // i16x8
             0xb6, 0xb7, 0xb8, 0xb9, // i32x4
             0x65, 0x66, 0x85, 0x86, // narrow
             0x9c, 0x9d, 0x9e, 0x9f, 0xbc, 0xbd, 0xbe, 0xbf, 0xdc, 0xdd, 0xde, 0xdf, // extmul
             0xba, // dot
+            0x82, // q15mulr_sat_s
         ];
         let unops: [u16; 17] = [
             0x62, 0x7c, 0x7d, 0x7e, 0x7f, 0x87, 0x88, 0x89, 0x8a, 0xa7, 0xa8, 0xa9, 0xaa, 0xc7,
@@ -13709,7 +13739,7 @@ mod tests {
         // products stay on the helper.
         let v128 = ValType::V128;
         let unops: [u16; 4] = [0x101, 0x102, 0x103, 0x104];
-        let binops: [u16; 5] = [0x100, 0x10d, 0x10e, 0x10f, 0x110];
+        let binops: [u16; 6] = [0x100, 0x10d, 0x10e, 0x10f, 0x110, 0x111];
         let ternops: [u16; 8] = [0x105, 0x106, 0x107, 0x108, 0x109, 0x10a, 0x10b, 0x10c];
         let mut functions: Vec<u32> = vec![0; unops.len()];
         functions.extend(std::iter::repeat_n(1, binops.len()));
