@@ -5243,6 +5243,15 @@ impl<'a> Lowerer<'a> {
             0xae | 0xb1 => self.native_iaddsub(types::I32X4, a, b, sub == 0xae),
             0xce | 0xd1 => self.native_iaddsub(types::I64X2, a, b, sub == 0xce),
             _ if simd_native() => {
+                if sub == 0x0e {
+                    // `i8x16.swizzle`: Cranelift's portable `swizzle` has
+                    // exactly the spec's semantics, including reading zero for
+                    // an index past 15 (x64 spells it `paddusb` + `pshufb`).
+                    let a = self.bitcast_lanes(types::I8X16, a);
+                    let b = self.bitcast_lanes(types::I8X16, b);
+                    let out = self.builder.ins().swizzle(a, b);
+                    return Some(self.bitcast_lanes(types::I128, out));
+                }
                 if let Some(out) = self.native_compare(sub, a, b) {
                     return Some(out);
                 }
@@ -5537,6 +5546,45 @@ impl<'a> Lowerer<'a> {
         Some(self.bitcast_lanes(types::I128, out))
     }
 
+    /// Native float lane unops. `abs`/`neg` are pure bit masks on the raw
+    /// pattern (the interpreter's `f32_bitop`, which preserves a NaN payload),
+    /// while `sqrt` and the rounding forms go through `f32_unop` and therefore
+    /// canonicalize.
+    fn native_float_unop(&mut self, sub: u16, v: ClifValue) -> Option<ClifValue> {
+        // abs clears the sign bit of each lane, neg flips it; both act on the
+        // 128-bit pattern, so no shape bitcast is needed.
+        let mask = match sub {
+            0xe0 => Some(0x7fff_ffff_7fff_ffff_7fff_ffff_7fff_ffffu128),
+            0xec => Some(0x7fff_ffff_ffff_ffff_7fff_ffff_ffff_ffffu128),
+            0xe1 => Some(0x8000_0000_8000_0000_8000_0000_8000_0000u128),
+            0xed => Some(0x8000_0000_0000_0000_8000_0000_0000_0000u128),
+            _ => None,
+        };
+        if let Some(mask) = mask {
+            let mask = self.v128_const(mask);
+            return Some(if matches!(sub, 0xe0 | 0xec) {
+                self.builder.ins().band(v, mask)
+            } else {
+                self.builder.ins().bxor(v, mask)
+            });
+        }
+        let ty = match sub {
+            0xe3 | 0x67 | 0x68 | 0x69 | 0x6a => types::F32X4,
+            0xef | 0x74 | 0x75 | 0x7a | 0x94 => types::F64X2,
+            _ => return None,
+        };
+        let v = self.bitcast_lanes(ty, v);
+        let out = match sub {
+            0xe3 | 0xef => self.builder.ins().sqrt(v),
+            0x67 | 0x74 => self.builder.ins().ceil(v),
+            0x68 | 0x75 => self.builder.ins().floor(v),
+            0x69 | 0x7a => self.builder.ins().trunc(v),
+            _ => self.builder.ins().nearest(v),
+        };
+        let out = self.canonical_float(ty, out);
+        Some(self.bitcast_lanes(types::I128, out))
+    }
+
     /// `fmin`/`fmax` with the spec's rules: either NaN operand gives the
     /// canonical NaN, and a tie between `-0` and `+0` takes the sign the
     /// interpreter's `fmin32`/`fmax32` take. Cranelift's own `fmin`/`fmax` are
@@ -5758,7 +5806,10 @@ impl<'a> Lowerer<'a> {
             VecSig::Unop => {
                 let v = self.pop().ok_or("operand stack underflow")?;
                 let native = if simd_native() {
-                    self.native_int_unop(sub, v)
+                    match self.native_int_unop(sub, v) {
+                        Some(out) => Some(out),
+                        None => self.native_float_unop(sub, v),
+                    }
                 } else {
                     None
                 };
@@ -6396,6 +6447,20 @@ mod tests {
             [Value::I32(value)] => Ok(*value),
             _ => Err(ExecFail::Unsupported("expected one i32 result")),
         }
+    }
+
+    /// The bits of an `f32x4` lane vector, lanes from least significant.
+    fn lanes_f32x4(values: [f32; 4]) -> u128 {
+        values.iter().enumerate().fold(0u128, |bits, (i, v)| {
+            bits | (u128::from(v.to_bits()) << (32 * i))
+        })
+    }
+
+    /// The bits of an `f64x2` lane vector, lanes from least significant.
+    fn lanes_f64x2(values: [f64; 2]) -> u128 {
+        values.iter().enumerate().fold(0u128, |bits, (i, v)| {
+            bits | (u128::from(v.to_bits()) << (64 * i))
+        })
     }
 
     /// Run `module`'s function `index` through both paths (compiled and the
@@ -12962,14 +13027,10 @@ mod tests {
         );
 
         fn f32x4(values: [f32; 4]) -> u128 {
-            values.iter().enumerate().fold(0u128, |bits, (i, v)| {
-                bits | (u128::from(v.to_bits()) << (32 * i))
-            })
+            lanes_f32x4(values)
         }
         fn f64x2(values: [f64; 2]) -> u128 {
-            values.iter().enumerate().fold(0u128, |bits, (i, v)| {
-                bits | (u128::from(v.to_bits()) << (64 * i))
-            })
+            lanes_f64x2(values)
         }
         let f32_nan = f32::from_bits(0x7fa0_0001);
         let f32_canon = f32::from_bits(0x7fc0_0000);
@@ -13027,6 +13088,96 @@ mod tests {
                 .collect();
             assert_equiv(&module, index, &cases);
         }
+    }
+
+    #[test]
+    fn v128_native_float_unop_and_swizzle_match_the_interpreter() {
+        // The float `abs`/`neg` forms are bit masks that keep a NaN payload,
+        // while `sqrt` and the rounding forms canonicalize; the cases below
+        // cover both, plus tie-to-even rounding and the sign of a rounded zero.
+        // `i8x16.swizzle` must read zero for an index past 15 and for any
+        // index with the high bit set.
+        let v128 = ValType::V128;
+        let unops: [u16; 14] = [
+            0xe0, 0xe1, 0xe3, 0x67, 0x68, 0x69, 0x6a, // f32x4
+            0xec, 0xed, 0xef, 0x74, 0x75, 0x7a, 0x94, // f64x2
+        ];
+        let mut functions = vec![0u32; unops.len()];
+        functions.push(1);
+        let mut bodies: Vec<FuncBody> = unops
+            .iter()
+            .map(|sub| FuncBody {
+                locals: vec![],
+                body: vec![Instr::LocalGet(0), Instr::Vec(*sub)],
+            })
+            .collect();
+        bodies.push(FuncBody {
+            locals: vec![],
+            body: vec![Instr::LocalGet(0), Instr::LocalGet(1), Instr::Vec(0x0e)],
+        });
+        let module = Module {
+            types: vec![
+                SubType::func(vec![v128], vec![v128]),
+                SubType::func(vec![v128, v128], vec![v128]),
+            ],
+            functions,
+            bodies,
+            ..Module::default()
+        };
+        assert!(
+            compile_module(&module).iter().all(|entry| entry.is_some()),
+            "float unop module did not compile: {:?}",
+            (0..module.bodies.len())
+                .map(|index| body_compile_reason(&module, index))
+                .collect::<Vec<_>>()
+        );
+
+        let f32_nan = f32::from_bits(0x7fa0_0001);
+        let f32_canon = f32::from_bits(0x7fc0_0000);
+        let f64_nan = f64::from_bits(0x7ff4_0000_0000_0001);
+        let f64_canon = f64::from_bits(0x7ff8_0000_0000_0000);
+        // Every op reads its own shape out of these bits, so one list serves
+        // the f32x4 and f64x2 forms alike.
+        let values = [
+            lanes_f32x4([1.5, -2.25, 0.0, -0.0]),
+            lanes_f32x4([f32_canon, f32_nan, f32::INFINITY, f32::NEG_INFINITY]),
+            lanes_f32x4([-0.5, -1.5, 2.5, 3.5]),
+            lanes_f64x2([1.5, -2.25]),
+            lanes_f64x2([f64_canon, f64_nan]),
+            lanes_f64x2([-0.5, 3.5]),
+            0,
+            u128::MAX,
+        ];
+        let cases: Vec<Vec<Value>> = values.iter().map(|v| vec![Value::v128(*v)]).collect();
+        for index in 0..unops.len() {
+            assert_equiv(&module, index, &cases);
+        }
+
+        // Source bytes 0..=15 so the selected index is visible in the result.
+        let source = (0..16u32).fold(0u128, |bits, i| bits | (u128::from(i) << (8 * i)));
+        // 16 and 127 are in range but past 15, and 128 and 255 have the high
+        // bit set; all four must read as zero.
+        let out_of_range = [16u8, 127, 128, 255, 0, 15, 16, 1, 2, 3, 4, 5, 6, 7, 8, 9]
+            .iter()
+            .enumerate()
+            .fold(0u128, |bits, (i, v)| bits | (u128::from(*v) << (8 * i)));
+        let swizzle_cases = [
+            (
+                source,
+                (0..16u32)
+                    .rev()
+                    .fold(0u128, |b, i| b | (u128::from(i) << (8 * i))),
+            ),
+            (source, 0u128),
+            (source, u128::MAX),
+            (source, out_of_range),
+            (u128::MAX, source),
+        ];
+        let cases: Vec<Vec<Value>> = swizzle_cases
+            .iter()
+            .map(|(a, b)| vec![Value::v128(*a), Value::v128(*b)])
+            .collect();
+        assert_equiv(&module, unops.len(), &cases);
     }
 
     #[test]

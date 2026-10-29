@@ -18830,7 +18830,7 @@ instruction (`i8x16.add` → `Add(V16B)` on NEON, `paddb` on x64). On x64 the
 helper costs a call, two spill stores, a load, and a dispatch back into the
 interpreter's lane loop, per op.
 
-**Fixture.** `crates/wasmtest/fixtures/simd-native-loop.wast` — 2M
+**Fixture.** `crates/wasmtest/fixtures/simd-native-loop.wast`: 2M
 iterations over exactly the ops that had no native arm: `i32x4.mul`,
 `i16x8.splat`+`i16x8.add`, `i32x4.shl`, `i32x4.gt_s`, `v128.bitselect`,
 `i32x4.replace_lane`, `i8x16.bitmask`, plus an extract to consume the
@@ -18839,7 +18839,7 @@ result. Expected value `-1857128295` cross-checked against Node v24.12.0
 which were already native, so it cannot see this work.
 
 **Method.** Same-binary seam, `SLAG_WASM_SIMD_NATIVE=0` restores the helper
-path (`compile.rs::simd_native()`, cached in a `OnceLock` — the raw
+path (`compile.rs::simd_native()`, cached in a `OnceLock`, because the raw
 `var_os` read is ~140 ns and cannot sit on the per-op path). Seven
 interleaved rounds, alternating order, per-row minimum and median. Two
 controls (`simd-loop`, `leaf-loop`) run in the same driver so a machine-wide
@@ -18849,13 +18849,13 @@ drift cannot be read as a win.
 |---|---|---|---|
 | simd-native, before any lowering | 219.17 | 217.65 | 1031.41 |
 | simd-native, after | **35.74** | 235.58 | 1142.09 |
-| simd-loop control | 11.70 → 13.31 | — | — |
-| leaf-loop control | 13.60 → 15.61 | — | — |
+| simd-loop control | 11.70 → 13.31 | - | - |
+| leaf-loop control | 13.60 → 15.61 | - | - |
 
 Same-session A/B: **35.74 vs 235.58 ms, 6.59x**. The compiled row is now
 31x the interpreter row (1142.09 / 35.74). Both controls moved +14% between
 the two sessions, and the helper row moved +8% with them, which is why the
-before/after columns above are not directly comparable — only the A/B row
+before/after columns above are not directly comparable; only the A/B row
 is. This is the NULL register's lesson repeating: layout and machine state
 move a row more than most optimisations do.
 
@@ -18882,11 +18882,11 @@ Plan reference: `.notes/wasm-plan.md` §10.3.
 ## LANDED (2026-10-29, same day): native float v128 arithmetic, 18x on a float loop
 
 Follow-up to the entry above. The integer set left the `f32x4`/`f64x2`
-family on the helper — sixteen opcodes in one interpreter dispatch
+family on the helper: sixteen opcodes in one interpreter dispatch
 (`fp_arith_binop`, which calls `values::exec_num` once per lane). All sixteen
 now lower: add/sub/mul/div, min/max, and pmin/pmax.
 
-**Fixture.** `crates/wasmtest/fixtures/simd-native-float.wast` — 2M
+**Fixture.** `crates/wasmtest/fixtures/simd-native-float.wast`: 2M
 iterations of eight `f32x4` and eight `f64x2` ops over two loop-carried
 accumulators, clamped by `min`/`max` so the sequence can never reach a NaN or
 an infinity (a NaN result would make the expected value engine-specific).
@@ -18896,8 +18896,8 @@ Expected value `-1996488704` cross-checked against Node v24.12.0.
 |---|---|---|---|
 | simd-float | **56.13** | 1017.18 | 2508.56 |
 | simd-native (integer probe, re-run) | 32.87 | 221.90 | 1050.07 |
-| simd-loop control | 12.51 | — | — |
-| leaf-loop control | 13.99 | — | — |
+| simd-loop control | 12.51 | - | - |
+| leaf-loop control | 13.99 | - | - |
 
 Same-binary A/B: **56.13 vs 1017.18 ms, 18.1x**; the compiled row is 44.7x
 the interpreter row. The integer probe re-measured at 6.75x, consistent with
@@ -18917,12 +18917,12 @@ canonicalization, while the helper pays the full per-op dispatch plus a
 - add/sub/mul/div mask on `isnan(result)`; min/max mask on
   `isnan(a) || isnan(b)`, because the ordered pick would otherwise return the
   non-NaN operand (which is Cranelift's own `fmin`/`fmax`, i.e. IEEE 754-2019
-  `minimum`/`maximum` — not wasm).
+  `minimum`/`maximum`, not wasm).
 - min/max tie-breaking is the OR of the bit patterns for min and the AND for
   max: an equal pair differs only for `-0`/`+0`, and the OR keeps the negative
   sign for min while the AND keeps the positive one for max.
 - pmin/pmax take a plain ordered comparison and return `a` in the unordered
-  case, with no canonicalization at all — the interpreter returns the raw
+  case, with no canonicalization at all: the interpreter returns the raw
   operand bits there.
 - `fcmp` on a vector yields an **integer** vector (`i32x4`/`i64x2`), so every
   mask needs a `bitcast` to the lane type before the bitwise select; the
@@ -18935,3 +18935,53 @@ canonicalization, while the helper pays the full per-op dispatch plus a
 `v128_native_float_arith_matches_the_interpreter` runs all sixteen opcodes
 over canonical/payload/signaling NaN, `±0` pairs, infinities, and
 overflow/underflow shapes.
+
+## LANDED (2026-10-29, same day): native float unops and `i8x16.swizzle`, 21x
+
+Third cut of the same work. This closes the rest of the unary float family
+(`abs`, `neg`, `sqrt`, `ceil`, `floor`, `trunc`, `nearest` for both shapes)
+and `i8x16.swizzle`.
+
+The NaN split matters more here than anywhere else in the family: the
+interpreter routes `abs`/`neg` through `f32_bitop`, a pure mask on the pattern
+that **preserves a NaN payload**, but routes `sqrt` and all four rounding
+forms through `f32_unop`, which canonicalizes. The lowering matches that
+split exactly: `band`/`bxor` against a sign-bit mask for `abs`/`neg` (straight
+on the raw 128-bit pattern, no lane bitcast needed), and
+`sqrt`/`ceil`/`floor`/`trunc`/`nearest` followed by `canonical_float`.
+
+`i8x16.swizzle` uses Cranelift's portable `swizzle`, whose semantics are the
+spec's, including reading zero for an index past 15. On x64 it lowers to
+`paddusb` with `0x70` plus `pshufb` (so `16..=127` saturates into the
+zeroing region); without SSSE3 Cranelift falls back to a libcall. The same
+caveat applies to the rounding forms: they are `roundps`/`roundpd` only with
+SSE4.1, and a per-lane libcall otherwise, so on a target without SSE4.1 the
+helper would win. `native_isa` uses `cranelift_native::builder()`, which
+enables the host's features, so the measured path is the good one.
+
+**Fixture.** `crates/wasmtest/fixtures/simd-native-unop.wast`, 2M iterations
+of a non-negative, finite chain (`abs` before every `sqrt`, clamp after), so
+no NaN can appear and the expected value is exact: `2139095055` from Node
+v24.12.0. It looks like a NaN bit pattern only because the result sums raw
+lane bits; the loop itself never produces one.
+
+| row | compiled | helper | interpreter |
+|---|---|---|---|
+| simd-unop | **63.74** | 1358.30 | 2956.54 |
+| simd-float (re-run) | 55.64 | 1012.95 | 2547.40 |
+| simd-native (integer, re-run) | 32.40 | 221.10 | 1048.25 |
+| simd-loop control | 11.96 | - | - |
+| leaf-loop control | 13.43 | - | - |
+
+Same-binary A/B: **63.74 vs 1358.30 ms, 21.3x**; the compiled row is 46.4x the
+interpreter row. The two earlier probes re-measured at 18.2x and 6.8x with the
+controls at 11.96/13.43 against the 11.70/13.60 baseline, so the machine was at
+nominal speed and the numbers are comparable across the three entries.
+
+**Gates.** `equiv waspec/test/core` → 254 suites, 0 diverged, 8264/8264
+functions compiled; `simd` → 59 suites, 0 diverged; `relaxed-simd` → 7 suites,
+0 diverged. `cargo test -p wasm --features compile --lib` (127, including the
+new `v128_native_float_unop_and_swizzle_match_the_interpreter`, which covers
+payload-preserving `abs`/`neg`, ties-to-even `nearest`, the sign of a rounded
+zero, and swizzle indices of 16, 127, 128 and 255), `-p wasm --lib` (44),
+workspace clippy, `cargo fmt --check` clean.
