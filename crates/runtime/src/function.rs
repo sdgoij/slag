@@ -1015,7 +1015,7 @@ pub fn instantiate_function_with_resolved_source(
     named: Option<JsString>,
 ) -> Result<Value, JsError> {
     let prof = profiling_on();
-    let start = stamp();
+    let start = if prof { stamp() } else { 0 };
     let mut mark = start;
     macro_rules! phase {
         ($slot:expr) => {
@@ -1671,6 +1671,12 @@ fn shared_compiled_body(
 /// here (`QueryPerformanceCounter`), more than most of the phases below, so the
 /// profile reads the cycle counter instead (~3 ns) and converts with a
 /// one-time calibration. Only ever called when `SLAG_CLOSURE_PROFILE` is set.
+///
+/// `wasm32` has no `std::time` clock at all (its sys time module is
+/// `unsupported`, see `crate::time`), and the browser demo creates closures on
+/// every script that declares a function, so the profile reads zero there. The
+/// phase table is an x86-64 tool; a wasm run must not acquire a clock to read
+/// it.
 fn stamp() -> u64 {
     #[cfg(target_arch = "x86_64")]
     {
@@ -1683,7 +1689,11 @@ fn stamp() -> u64 {
             std::arch::x86_64::_rdtsc()
         }
     }
-    #[cfg(not(target_arch = "x86_64"))]
+    #[cfg(all(not(target_arch = "x86_64"), target_arch = "wasm32"))]
+    {
+        0
+    }
+    #[cfg(all(not(target_arch = "x86_64"), not(target_arch = "wasm32")))]
     {
         static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
         START
@@ -1869,7 +1879,7 @@ fn register_function(
     // single item in the corpus (`.notes/perf.md`, 2026-10-28), and "diffuse"
     // is not an answer.
     let prof = profiling_on();
-    let start = stamp();
+    let start = if prof { stamp() } else { 0 };
     if prof {
         CLOSURE_ENTRY.store(start, std::sync::atomic::Ordering::Relaxed);
     }
