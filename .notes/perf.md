@@ -17690,3 +17690,37 @@ parameter joins with the fallback call's `Unknown`, so the accumulator only
 promotes when the fallback path is absent (`js_call` it does, `method_call` it
 does not). Typing a splice's result from the callee's return value would close
 that, and it is the same missing piece as typing a function's parameters.
+
+## FIXED (2026-10-28): the inline-path re-type must not run on a scalar-only body
+
+The two commits above share one regression that their own same-binary seams could
+not see, because the seam (`SLAG_INLINE_CREATED`) disabled the splice and not the
+re-type: `objects/compound_assign` 3.0 -> 45.9 ms, `objects/warm_store` 3.1 ->
+34.9, `objects/destructure` 1.0 -> 116.4. Those are the three rows the earlier
+scalar work had just fixed, and the cause was the re-type block, not the splice.
+
+Running `normalize_param_types` *before* `narrow` demotes the loop counter's
+`Int`: the enum join over the entry seed and the back-edge widens it to
+`Number`, `loop_counter` still fuses the increment into `IntAdd`, and `IntAdd`
+then has a `Value`-word operand. The lowering refuses that, so the whole body
+falls back to the baseline tier, which is the 15-100x in the numbers. With
+`SLAG_UNBOX=0` the malformed IR is visible directly (`b1(v25:num)` feeding
+`v22:int = IntAdd(v25, v34)`).
+
+The re-type is now two paths: a `scalar`-only body keeps exactly the historical
+`narrow` then `mem2reg` round, and only an `inline`-only body gets the
+`normalize` -> `narrow` -> `promote` loop twice. Re-measured, same binary,
+5 interleaved rounds, per-row minima:
+
+| row | seam off | seam on | |
+|---|---:|---:|---|
+| `objects/compound_assign` | 2.884 | 2.887 | restored (was 45.9) |
+| `objects/warm_store` | 2.921 | 2.921 | restored (was 34.9) |
+| `objects/destructure` | 0.986 | 0.984 | restored (was 116.4) |
+| `opcost/method_call` | 1.175 | **0.666** | -43% |
+| `opcost/js_call` | 0.770 | **0.587** | -24% |
+| `opcost/array_for_each_js` | 3.638 | **3.291** | -10% |
+
+The lesson for the protocol: a same-binary seam only attributes the code it
+actually gates. A change to a *shared* pipeline stage needs its own switch, and
+here the two `objects` rows that `opcost/baseline` cannot see were the evidence.

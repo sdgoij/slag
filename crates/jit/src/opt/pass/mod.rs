@@ -112,21 +112,36 @@ pub fn run(
     // result was `Unknown` and the spliced body's value is not. Re-run them, but
     // only when one of the two actually changed the body, so no other row is
     // disturbed.
-    let retyped_after_scalar = (scalarized || (inlined && retype_inlined_enabled())) && {
-        // Type every block parameter from its incoming arguments and narrow
-        // again, twice: a merge or continuation parameter is `Unknown` when the
-        // splice creates it (it takes the call's result type) and the numeric
-        // lattice reads a parameter's declared type, so a value that crosses a
-        // block boundary is only proven numeric on a round after the one that
-        // typed its edge argument.
+    let retyped_after_scalar = if scalarized {
+        // The historical path, and it must stay exactly this: `scalar`
+        // substitutes a typed value for a guard's `Unknown` result, and one
+        // `narrow` then `mem2reg` round is what promotes the accumulator.
+        // Running `normalize_param_types` before `narrow` here demotes the
+        // loop counter's `Int` (the entry seed loses its int proof because the
+        // enum join widens it to `Number`), `loop_counter` still fuses its
+        // increment into `IntAdd`, and the body is then refused by the
+        // lowering: measured 3.0 -> 44 ms on `objects/compound_assign` and
+        // 1.0 -> 116 ms on `objects/destructure` before this was split out.
+        let narrowed_again = narrow::run(func);
+        let promoted_again = mem2reg_enabled() && promote_frame_slots(func);
+        narrowed_again || promoted_again
+    } else if inlined && retype_inlined_enabled() {
+        // A splice replaces a call whose result was `Unknown` with the callee's
+        // arithmetic, but it also creates a continuation parameter typed with
+        // the call's result type, and the numeric lattice reads a parameter's
+        // *declared* type. So a value that crosses the splice's block split is
+        // only proven numeric on a round after the one that typed its edge
+        // argument: normalize, narrow, and promote twice.
         let mut changed = false;
         for _ in 0..2 {
-            let narrowed = narrow::run(func);
             let normalized = normalize_param_types(func);
+            let narrowed = narrow::run(func);
             let promoted = mem2reg_enabled() && promote_frame_slots(func);
-            changed |= narrowed || normalized || promoted;
+            changed |= normalized || narrowed || promoted;
         }
         changed
+    } else {
+        false
     };
     let dropped = dce_enabled() && dce::run(func);
     let counted = loop_counter::run(func);
