@@ -18820,3 +18820,118 @@ stale stack word may keep alive), not a slice — and the minor path's own skip
 **Correction to the note above:** the suggestion that `heapsort` is "a sort plus
 binary search per allocation" was wrong and is replaced by what is written
 here: it is the collector's dead-set sort, at most once per collection.
+
+## LANDED (2026-10-29): the wasm compiler emits native v128 instructions, 6.6x on a SIMD loop
+
+Wave 5 carried `V128` as a Cranelift `I128` and lowered every vector op by
+calling runtime helper mode 70, which re-enters the interpreter's
+`simd_exec`. V8 does the opposite in both wasm tiers: the op *is* the machine
+instruction (`i8x16.add` → `Add(V16B)` on NEON, `paddb` on x64). On x64 the
+helper costs a call, two spill stores, a load, and a dispatch back into the
+interpreter's lane loop, per op.
+
+**Fixture.** `crates/wasmtest/fixtures/simd-native-loop.wast` — 2M
+iterations over exactly the ops that had no native arm: `i32x4.mul`,
+`i16x8.splat`+`i16x8.add`, `i32x4.shl`, `i32x4.gt_s`, `v128.bitselect`,
+`i32x4.replace_lane`, `i8x16.bitmask`, plus an extract to consume the
+result. Expected value `-1857128295` cross-checked against Node v24.12.0
+(V8). The older `simd-loop.wast` covers only `i32x4.add` + `v128.xor`,
+which were already native, so it cannot see this work.
+
+**Method.** Same-binary seam, `SLAG_WASM_SIMD_NATIVE=0` restores the helper
+path (`compile.rs::simd_native()`, cached in a `OnceLock` — the raw
+`var_os` read is ~140 ns and cannot sit on the per-op path). Seven
+interleaved rounds, alternating order, per-row minimum and median. Two
+controls (`simd-loop`, `leaf-loop`) run in the same driver so a machine-wide
+drift cannot be read as a win.
+
+| row | compiled | helper | interpreter |
+|---|---|---|---|
+| simd-native, before any lowering | 219.17 | 217.65 | 1031.41 |
+| simd-native, after | **35.74** | 235.58 | 1142.09 |
+| simd-loop control | 11.70 → 13.31 | — | — |
+| leaf-loop control | 13.60 → 15.61 | — | — |
+
+Same-session A/B: **35.74 vs 235.58 ms, 6.59x**. The compiled row is now
+31x the interpreter row (1142.09 / 35.74). Both controls moved +14% between
+the two sessions, and the helper row moved +8% with them, which is why the
+before/after columns above are not directly comparable — only the A/B row
+is. This is the NULL register's lesson repeating: layout and machine state
+move a row more than most optimisations do.
+
+**What the corpus caught that the unit test did not.** The first cut mapped
+the shift opcodes through `sub - 0x6b` as `0 => shl, 1 => ushr, 2 => sshr`,
+but the wasm block order is `shl, shr_s, shr_u`, so arithmetic and logical
+right shift were swapped. The differential test passed because it only used
+shift count 5 on a value whose bytes were all small enough that `shr_s` and
+`shr_u` agree; `simd_bit_shift.wast` failed 31 commands, and `simd_splat`
+2 (the `…_operand` shapes that splat then shift). The test now runs counts
+0, 1, 4, 5, 7, 8, 9, 15, 16, 17, 32, 33 over a `0xAA…` pattern for all four
+shapes. Treat every per-shape opcode table as needing its own arity check:
+the same class of bug hit the `i64x2` comparison table earlier in this work.
+
+**Gates.** `wasmtest equiv waspec/test/core` → 254 suites, 0 diverged,
+8264/8264 functions compiled; `equiv waspec/test/core/relaxed-simd` → 7
+suites, 0 diverged; `cargo test -p wasm --features compile --lib` (125),
+`cargo test -p wasm --lib` (44), `cargo test -p wasmtest`,
+`cargo test -p runtime --lib` (1079); workspace clippy and `cargo fmt
+--check` clean.
+
+Plan reference: `.notes/wasm-plan.md` §10.3.
+
+## LANDED (2026-10-29, same day): native float v128 arithmetic, 18x on a float loop
+
+Follow-up to the entry above. The integer set left the `f32x4`/`f64x2`
+family on the helper — sixteen opcodes in one interpreter dispatch
+(`fp_arith_binop`, which calls `values::exec_num` once per lane). All sixteen
+now lower: add/sub/mul/div, min/max, and pmin/pmax.
+
+**Fixture.** `crates/wasmtest/fixtures/simd-native-float.wast` — 2M
+iterations of eight `f32x4` and eight `f64x2` ops over two loop-carried
+accumulators, clamped by `min`/`max` so the sequence can never reach a NaN or
+an infinity (a NaN result would make the expected value engine-specific).
+Expected value `-1996488704` cross-checked against Node v24.12.0.
+
+| row | compiled | helper | interpreter |
+|---|---|---|---|
+| simd-float | **56.13** | 1017.18 | 2508.56 |
+| simd-native (integer probe, re-run) | 32.87 | 221.90 | 1050.07 |
+| simd-loop control | 12.51 | — | — |
+| leaf-loop control | 13.99 | — | — |
+
+Same-binary A/B: **56.13 vs 1017.18 ms, 18.1x**; the compiled row is 44.7x
+the interpreter row. The integer probe re-measured at 6.75x, consistent with
+the 6.59x recorded above, and both controls stayed flat, so the float ratio is
+not a machine-state artifact. The 18x is larger than the integer 6.75x because
+each op here is a serially dependent FP instruction with a five-instruction
+canonicalization, while the helper pays the full per-op dispatch plus a
+`exec_num` call per lane.
+
+**What the float work needed that the integer work did not.**
+
+- `values::exec_num` canonicalizes every float result (`canon32`), so the
+  native path must too. `0 * inf`, `inf - inf` and `0 / 0` produce a NaN from
+  non-NaN operands, and x86's default quiet NaN for those has the **sign bit
+  set** (`0xFFC00000`), while the canonical one is `0x7FC00000`. The test
+  covers all three shapes for exactly this reason.
+- add/sub/mul/div mask on `isnan(result)`; min/max mask on
+  `isnan(a) || isnan(b)`, because the ordered pick would otherwise return the
+  non-NaN operand (which is Cranelift's own `fmin`/`fmax`, i.e. IEEE 754-2019
+  `minimum`/`maximum` — not wasm).
+- min/max tie-breaking is the OR of the bit patterns for min and the AND for
+  max: an equal pair differs only for `-0`/`+0`, and the OR keeps the negative
+  sign for min while the AND keeps the positive one for max.
+- pmin/pmax take a plain ordered comparison and return `a` in the unordered
+  case, with no canonicalization at all — the interpreter returns the raw
+  operand bits there.
+- `fcmp` on a vector yields an **integer** vector (`i32x4`/`i64x2`), so every
+  mask needs a `bitcast` to the lane type before the bitwise select; the
+  verifier rejects the mix.
+
+**Gates.** `wasmtest equiv waspec/test/core` → 254 suites, 0 diverged,
+8264/8264 functions compiled; `simd` → 59 suites, 0 diverged; `relaxed-simd`
+→ 7 suites, 0 diverged. `cargo test -p wasm --features compile --lib` (126),
+`-p wasm --lib` (44), workspace clippy, `cargo fmt --check` clean. The new
+`v128_native_float_arith_matches_the_interpreter` runs all sixteen opcodes
+over canonical/payload/signaling NaN, `±0` pairs, infinities, and
+overflow/underflow shapes.

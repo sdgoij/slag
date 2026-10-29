@@ -547,6 +547,105 @@ fn native_isa() -> Result<Arc<dyn TargetIsa>, String> {
     .clone()
 }
 
+/// Whether the compiled v128 path takes the new native lane lowerings.
+/// `SLAG_WASM_SIMD_NATIVE=0` keeps the runtime-helper path in the same binary,
+/// so an A/B attributes the lowering rather than a build/layout difference.
+/// The pre-existing native add/sub, bitwise, and extract paths stay enabled.
+fn simd_native() -> bool {
+    static NATIVE: OnceLock<bool> = OnceLock::new();
+    *NATIVE.get_or_init(|| {
+        !matches!(
+            std::env::var_os("SLAG_WASM_SIMD_NATIVE")
+                .as_deref()
+                .and_then(|value| value.to_str()),
+            Some("0") | Some("false")
+        )
+    })
+}
+
+/// The lane vector type and condition code for an integer vector comparison.
+fn simd_int_cmp(sub: u16) -> Option<(Type, IntCC)> {
+    // i64x2 has no unsigned comparisons: eq/ne/lt_s/gt_s/le_s/ge_s only, so
+    // its condition table is shorter than the other shapes' 10-entry one.
+    if (0xd6..=0xdb).contains(&sub) {
+        let cc = match sub - 0xd6 {
+            0 => IntCC::Equal,
+            1 => IntCC::NotEqual,
+            2 => IntCC::SignedLessThan,
+            3 => IntCC::SignedGreaterThan,
+            4 => IntCC::SignedLessThanOrEqual,
+            5 => IntCC::SignedGreaterThanOrEqual,
+            _ => return None,
+        };
+        return Some((types::I64X2, cc));
+    }
+    let (ty, base) = match sub {
+        0x23..=0x2c => (types::I8X16, 0x23),
+        0x2d..=0x36 => (types::I16X8, 0x2d),
+        0x37..=0x40 => (types::I32X4, 0x37),
+        _ => return None,
+    };
+    let cc = match sub - base {
+        0 => IntCC::Equal,
+        1 => IntCC::NotEqual,
+        2 => IntCC::SignedLessThan,
+        3 => IntCC::UnsignedLessThan,
+        4 => IntCC::SignedGreaterThan,
+        5 => IntCC::UnsignedGreaterThan,
+        6 => IntCC::SignedLessThanOrEqual,
+        7 => IntCC::UnsignedLessThanOrEqual,
+        8 => IntCC::SignedGreaterThanOrEqual,
+        9 => IntCC::UnsignedGreaterThanOrEqual,
+        _ => return None,
+    };
+    Some((ty, cc))
+}
+
+/// The lane vector type and condition code for a float vector comparison.
+/// Cranelift's `Equal`/`LessThan`/... are ordered and `NotEqual` is unordered,
+/// which is exactly the wasm NaN behavior.
+fn simd_float_cmp(sub: u16) -> Option<(Type, FloatCC)> {
+    let (ty, base) = match sub {
+        0x41..=0x46 => (types::F32X4, 0x41),
+        0x47..=0x4c => (types::F64X2, 0x47),
+        _ => return None,
+    };
+    let cc = match sub - base {
+        0 => FloatCC::Equal,
+        1 => FloatCC::NotEqual,
+        2 => FloatCC::LessThan,
+        3 => FloatCC::GreaterThan,
+        4 => FloatCC::LessThanOrEqual,
+        5 => FloatCC::GreaterThanOrEqual,
+        _ => return None,
+    };
+    Some((ty, cc))
+}
+
+/// The form behind a float lane arithmetic opcode, for
+/// `Lowerer::native_float_arith`.
+#[derive(Clone, Copy)]
+enum FloatArith {
+    Add,
+    Sub,
+    Mul,
+    Div,
+    Min,
+    Max,
+    PMin,
+    PMax,
+}
+
+/// The canonical quiet NaN of `ty`, replicated into every lane. Mirrors
+/// `values::QNAN32`/`QNAN64`.
+fn canonical_nan_bits(ty: Type) -> u128 {
+    if ty == types::F32X4 {
+        0x7fc0_0000_7fc0_0000_7fc0_0000_7fc0_0000
+    } else {
+        0x7ff8_0000_0000_0000_7ff8_0000_0000_0000
+    }
+}
+
 /// The native-code generation engine over a process-wide cached `TargetIsa`
 /// (building one is expensive; corpus runs compile per module instantiation).
 struct Engine {
@@ -5093,11 +5192,16 @@ impl<'a> Lowerer<'a> {
     /// A `v128.const`: push the 128-bit pattern as an `I128` (assembled from
     /// its low and high u64 halves).
     fn do_v128_const(&mut self, bits: u128) -> Result<(), String> {
-        let lo = self.iconst(types::I64, bits as u64 as i64);
-        let hi = self.iconst(types::I64, (bits >> 64) as u64 as i64);
-        let value = self.builder.ins().iconcat(lo, hi);
+        let value = self.v128_const(bits);
         self.stack.push(value);
         Ok(())
+    }
+
+    /// The 128-bit pattern as an `I128` SSA value.
+    fn v128_const(&mut self, bits: u128) -> ClifValue {
+        let lo = self.iconst(types::I64, bits as u64 as i64);
+        let hi = self.iconst(types::I64, (bits >> 64) as u64 as i64);
+        self.builder.ins().iconcat(lo, hi)
     }
 
     /// Store a v128 (an `I128` SSA value) at `scratch[word]` (two u64 words).
@@ -5116,6 +5220,14 @@ impl<'a> Lowerer<'a> {
             .load(types::I128, MemFlagsData::new(), address, Offset32::new(0))
     }
 
+    /// Reinterpret a 128-bit value as `ty` (or a vector result back to the raw
+    /// `I128`), with the explicit little-endian order the interpreter's lane
+    /// layout assumes.
+    fn bitcast_lanes(&mut self, ty: Type, value: ClifValue) -> ClifValue {
+        let flags = MemFlagsData::new().with_endianness(Endianness::Little);
+        self.builder.ins().bitcast(ty, flags, value)
+    }
+
     /// Lower a v128 binop natively when it maps to a single Cranelift vector
     /// or bitwise instruction; `None` keeps the runtime helper. Bitwise ops act
     /// on the raw `I128` pattern (shape-independent); integer add/sub bitcast
@@ -5130,6 +5242,15 @@ impl<'a> Lowerer<'a> {
             0x8e | 0x91 => self.native_iaddsub(types::I16X8, a, b, sub == 0x8e),
             0xae | 0xb1 => self.native_iaddsub(types::I32X4, a, b, sub == 0xae),
             0xce | 0xd1 => self.native_iaddsub(types::I64X2, a, b, sub == 0xce),
+            _ if simd_native() => {
+                if let Some(out) = self.native_compare(sub, a, b) {
+                    return Some(out);
+                }
+                if let Some(out) = self.native_float_arith(sub, a, b) {
+                    return Some(out);
+                }
+                self.native_imul(sub, a, b)
+            }
             _ => None,
         }
     }
@@ -5145,15 +5266,14 @@ impl<'a> Lowerer<'a> {
         b: ClifValue,
         add: bool,
     ) -> Option<ClifValue> {
-        let flags = MemFlagsData::new().with_endianness(Endianness::Little);
-        let a = self.builder.ins().bitcast(ty, flags, a);
-        let b = self.builder.ins().bitcast(ty, flags, b);
+        let a = self.bitcast_lanes(ty, a);
+        let b = self.bitcast_lanes(ty, b);
         let out = if add {
             self.builder.ins().iadd(a, b)
         } else {
             self.builder.ins().isub(a, b)
         };
-        Some(self.builder.ins().bitcast(types::I128, flags, out))
+        Some(self.bitcast_lanes(types::I128, out))
     }
 
     /// Native `*.extract_lane`: bitcast to the lane vector type, extract the
@@ -5169,14 +5289,283 @@ impl<'a> Lowerer<'a> {
             0x21 => types::F64X2,
             _ => return None,
         };
-        let flags = MemFlagsData::new().with_endianness(Endianness::Little);
-        let v = self.builder.ins().bitcast(ty, flags, v);
+        let v = self.bitcast_lanes(ty, v);
         let lane = self.builder.ins().extractlane(v, lane);
         Some(match sub {
             0x15 | 0x18 => self.builder.ins().sextend(types::I32, lane),
             0x16 | 0x19 => self.builder.ins().uextend(types::I32, lane),
             _ => lane,
         })
+    }
+
+    /// Native integer/float lane comparison: bitcast to the lane vector type,
+    /// compare, and bitcast the all-ones lane mask back to the raw pattern.
+    fn native_compare(&mut self, sub: u16, a: ClifValue, b: ClifValue) -> Option<ClifValue> {
+        if let Some((ty, cc)) = simd_int_cmp(sub) {
+            let a = self.bitcast_lanes(ty, a);
+            let b = self.bitcast_lanes(ty, b);
+            let out = self.builder.ins().icmp(cc, a, b);
+            return Some(self.bitcast_lanes(types::I128, out));
+        }
+        let (ty, cc) = simd_float_cmp(sub)?;
+        let a = self.bitcast_lanes(ty, a);
+        let b = self.bitcast_lanes(ty, b);
+        let out = self.builder.ins().fcmp(cc, a, b);
+        Some(self.bitcast_lanes(types::I128, out))
+    }
+
+    /// Native lane-wise wrapping multiply.
+    fn native_imul(&mut self, sub: u16, a: ClifValue, b: ClifValue) -> Option<ClifValue> {
+        let ty = match sub {
+            0x95 => types::I16X8,
+            0xb5 => types::I32X4,
+            0xd5 => types::I64X2,
+            _ => return None,
+        };
+        let a = self.bitcast_lanes(ty, a);
+        let b = self.bitcast_lanes(ty, b);
+        let out = self.builder.ins().imul(a, b);
+        Some(self.bitcast_lanes(types::I128, out))
+    }
+
+    /// Native integer `abs`/`neg` unops (both wrap within the lane width).
+    fn native_int_unop(&mut self, sub: u16, v: ClifValue) -> Option<ClifValue> {
+        let (ty, abs) = match sub {
+            0x60 => (types::I8X16, true),
+            0x61 => (types::I8X16, false),
+            0x80 => (types::I16X8, true),
+            0x81 => (types::I16X8, false),
+            0xa0 => (types::I32X4, true),
+            0xa1 => (types::I32X4, false),
+            0xc0 => (types::I64X2, true),
+            0xc1 => (types::I64X2, false),
+            _ => return None,
+        };
+        let v = self.bitcast_lanes(ty, v);
+        let out = if abs {
+            self.builder.ins().iabs(v)
+        } else {
+            self.builder.ins().ineg(v)
+        };
+        Some(self.bitcast_lanes(types::I128, out))
+    }
+
+    /// Native integer lane shift. Cranelift masks the count to the lane width
+    /// (the `i8x16` forms even carry a mask table), which is exactly
+    /// `simd::exec_shift`'s `count % lane_bits`.
+    fn native_shift(&mut self, sub: u16, v: ClifValue, count: ClifValue) -> Option<ClifValue> {
+        // Opcode order is `shl`, `shr_s`, `shr_u` within each shape's block.
+        let (ty, kind) = match sub {
+            0x6b..=0x6d => (types::I8X16, sub - 0x6b),
+            0x8b..=0x8d => (types::I16X8, sub - 0x8b),
+            0xab..=0xad => (types::I32X4, sub - 0xab),
+            0xcb..=0xcd => (types::I64X2, sub - 0xcb),
+            _ => return None,
+        };
+        let v = self.bitcast_lanes(ty, v);
+        let out = match kind {
+            0 => self.builder.ins().ishl(v, count),
+            1 => self.builder.ins().sshr(v, count),
+            _ => self.builder.ins().ushr(v, count),
+        };
+        Some(self.bitcast_lanes(types::I128, out))
+    }
+
+    /// Native lane splat: narrow the scalar to the lane width when needed,
+    /// replicate it, and bitcast to the raw pattern.
+    fn native_splat(&mut self, sub: u16, scalar: ClifValue) -> Option<ClifValue> {
+        let (ty, lane_ty, narrow) = match sub {
+            0x0f => (types::I8X16, types::I8, true),
+            0x10 => (types::I16X8, types::I16, true),
+            0x11 => (types::I32X4, types::I32, false),
+            0x12 => (types::I64X2, types::I64, false),
+            0x13 => (types::F32X4, types::F32, false),
+            0x14 => (types::F64X2, types::F64, false),
+            _ => return None,
+        };
+        let lane = if narrow {
+            self.builder.ins().ireduce(lane_ty, scalar)
+        } else {
+            scalar
+        };
+        let out = self.builder.ins().splat(ty, lane);
+        Some(self.bitcast_lanes(types::I128, out))
+    }
+
+    /// Native lane replace.
+    fn native_replace(
+        &mut self,
+        sub: u16,
+        v: ClifValue,
+        scalar: ClifValue,
+        lane: u8,
+    ) -> Option<ClifValue> {
+        let (ty, lane_ty, narrow) = match sub {
+            0x17 => (types::I8X16, types::I8, true),
+            0x1a => (types::I16X8, types::I16, true),
+            0x1c => (types::I32X4, types::I32, false),
+            0x1e => (types::I64X2, types::I64, false),
+            0x20 => (types::F32X4, types::F32, false),
+            0x22 => (types::F64X2, types::F64, false),
+            _ => return None,
+        };
+        let v = self.bitcast_lanes(ty, v);
+        let value = if narrow {
+            self.builder.ins().ireduce(lane_ty, scalar)
+        } else {
+            scalar
+        };
+        let out = self.builder.ins().insertlane(v, value, lane);
+        Some(self.bitcast_lanes(types::I128, out))
+    }
+
+    /// Native `v128.any_true` / `*.all_true`.
+    fn native_test(&mut self, sub: u16, v: ClifValue) -> Option<ClifValue> {
+        let (ty, all) = match sub {
+            0x53 => (types::I8X16, false),
+            0x63 => (types::I8X16, true),
+            0x83 => (types::I16X8, true),
+            0xa3 => (types::I32X4, true),
+            0xc3 => (types::I64X2, true),
+            _ => return None,
+        };
+        let v = self.bitcast_lanes(ty, v);
+        let bit = if all {
+            self.builder.ins().vall_true(v)
+        } else {
+            self.builder.ins().vany_true(v)
+        };
+        Some(self.builder.ins().uextend(types::I32, bit))
+    }
+
+    /// Native `*.bitmask` via the lane-MSB reduction.
+    fn native_bitmask(&mut self, sub: u16, v: ClifValue) -> Option<ClifValue> {
+        let (ty, bits_ty) = match sub {
+            0x64 => (types::I8X16, types::I16),
+            0x84 => (types::I16X8, types::I8),
+            0xa4 => (types::I32X4, types::I8),
+            0xc4 => (types::I64X2, types::I8),
+            _ => return None,
+        };
+        let v = self.bitcast_lanes(ty, v);
+        let bits = self.builder.ins().vhigh_bits(bits_ty, v);
+        Some(self.builder.ins().uextend(types::I32, bits))
+    }
+
+    /// `v128.bitselect`: `(a & c) | (b & !c)` on the raw pattern.
+    fn native_bitselect(&mut self, a: ClifValue, b: ClifValue, c: ClifValue) -> ClifValue {
+        let hit = self.builder.ins().band(a, c);
+        let miss = self.builder.ins().band_not(b, c);
+        self.builder.ins().bor(hit, miss)
+    }
+
+    /// The canonical quiet NaN of `ty`, as a vector value.
+    fn canonical_nan(&mut self, ty: Type) -> ClifValue {
+        let raw = self.v128_const(canonical_nan_bits(ty));
+        self.bitcast_lanes(ty, raw)
+    }
+
+    /// Replace every NaN lane with the canonical quiet NaN. The interpreter
+    /// canonicalizes every float arithmetic result (`values::canon32`), so the
+    /// native path must too; hardware would propagate the input payload or, for
+    /// `0 * inf` and friends, the default quiet NaN of the operation.
+    fn canonical_float(&mut self, ty: Type, value: ClifValue) -> ClifValue {
+        let nan = self.builder.ins().fcmp(FloatCC::Unordered, value, value);
+        let nan = self.bitcast_lanes(ty, nan);
+        let qnan = self.canonical_nan(ty);
+        self.native_bitselect(qnan, value, nan)
+    }
+
+    /// `f32x4`/`f64x2` arithmetic, including the min/max and pseudo-min/max
+    /// forms.
+    fn native_float_arith(&mut self, sub: u16, a: ClifValue, b: ClifValue) -> Option<ClifValue> {
+        use FloatArith::*;
+        let (ty, op) = match sub {
+            0xe4 => (types::F32X4, Add),
+            0xe5 => (types::F32X4, Sub),
+            0xe6 => (types::F32X4, Mul),
+            0xe7 => (types::F32X4, Div),
+            0xe8 => (types::F32X4, Min),
+            0xe9 => (types::F32X4, Max),
+            0xea => (types::F32X4, PMin),
+            0xeb => (types::F32X4, PMax),
+            0xf0 => (types::F64X2, Add),
+            0xf1 => (types::F64X2, Sub),
+            0xf2 => (types::F64X2, Mul),
+            0xf3 => (types::F64X2, Div),
+            0xf4 => (types::F64X2, Min),
+            0xf5 => (types::F64X2, Max),
+            0xf6 => (types::F64X2, PMin),
+            0xf7 => (types::F64X2, PMax),
+            _ => return None,
+        };
+        let a = self.bitcast_lanes(ty, a);
+        let b = self.bitcast_lanes(ty, b);
+        let out = match op {
+            Add => {
+                let sum = self.builder.ins().fadd(a, b);
+                self.canonical_float(ty, sum)
+            }
+            Sub => {
+                let diff = self.builder.ins().fsub(a, b);
+                self.canonical_float(ty, diff)
+            }
+            Mul => {
+                let product = self.builder.ins().fmul(a, b);
+                self.canonical_float(ty, product)
+            }
+            Div => {
+                let quotient = self.builder.ins().fdiv(a, b);
+                self.canonical_float(ty, quotient)
+            }
+            Min => self.native_float_minmax(ty, a, b, true),
+            Max => self.native_float_minmax(ty, a, b, false),
+            // `pmin = (b < a) ? b : a`, `pmax = (a < b) ? b : a`: a plain
+            // ordered comparison with no canonicalization, so an unordered
+            // pair returns `a`'s bits untouched.
+            PMin => {
+                let lt = self.builder.ins().fcmp(FloatCC::LessThan, b, a);
+                let lt = self.bitcast_lanes(ty, lt);
+                self.native_bitselect(b, a, lt)
+            }
+            PMax => {
+                let lt = self.builder.ins().fcmp(FloatCC::LessThan, a, b);
+                let lt = self.bitcast_lanes(ty, lt);
+                self.native_bitselect(b, a, lt)
+            }
+        };
+        Some(self.bitcast_lanes(types::I128, out))
+    }
+
+    /// `fmin`/`fmax` with the spec's rules: either NaN operand gives the
+    /// canonical NaN, and a tie between `-0` and `+0` takes the sign the
+    /// interpreter's `fmin32`/`fmax32` take. Cranelift's own `fmin`/`fmax` are
+    /// IEEE 754-2019 `minimum`/`maximum`, which ignore a NaN operand.
+    fn native_float_minmax(
+        &mut self,
+        ty: Type,
+        a: ClifValue,
+        b: ClifValue,
+        min: bool,
+    ) -> ClifValue {
+        // The tie result is `a | b` for min and `a & b` for max: the two bit
+        // patterns of an equal pair differ only for `-0`/`+0`, and the OR/AND
+        // picks the negative sign for min and the positive one for max.
+        let (cc, tie) = if min {
+            (FloatCC::LessThan, self.builder.ins().bor(a, b))
+        } else {
+            (FloatCC::GreaterThan, self.builder.ins().band(a, b))
+        };
+        let ordered = self.builder.ins().fcmp(cc, a, b);
+        let ordered = self.bitcast_lanes(ty, ordered);
+        let pick = self.native_bitselect(a, b, ordered);
+        let equal = self.builder.ins().fcmp(FloatCC::Equal, a, b);
+        let equal = self.bitcast_lanes(ty, equal);
+        let picked = self.native_bitselect(tie, pick, equal);
+        let nan = self.builder.ins().fcmp(FloatCC::Unordered, a, b);
+        let nan = self.bitcast_lanes(ty, nan);
+        let qnan = self.canonical_nan(ty);
+        self.native_bitselect(qnan, picked, nan)
     }
 
     /// Run the runtime simd helper (mode 70) over operands already spilled to
@@ -5368,10 +5757,19 @@ impl<'a> Lowerer<'a> {
             }
             VecSig::Unop => {
                 let v = self.pop().ok_or("operand stack underflow")?;
-                self.spill_v128(0, v);
-                self.simd_helper_call(sub, lane.unwrap_or(0))?;
-                let out = self.load_v128(0);
-                self.stack.push(out);
+                let native = if simd_native() {
+                    self.native_int_unop(sub, v)
+                } else {
+                    None
+                };
+                if let Some(out) = native {
+                    self.stack.push(out);
+                } else {
+                    self.spill_v128(0, v);
+                    self.simd_helper_call(sub, lane.unwrap_or(0))?;
+                    let out = self.load_v128(0);
+                    self.stack.push(out);
+                }
             }
             VecSig::Binop => {
                 let b = self.pop().ok_or("operand stack underflow")?;
@@ -5390,30 +5788,53 @@ impl<'a> Lowerer<'a> {
                 let c = self.pop().ok_or("operand stack underflow")?;
                 let b = self.pop().ok_or("operand stack underflow")?;
                 let a = self.pop().ok_or("operand stack underflow")?;
-                self.spill_v128(0, c);
-                self.spill_v128(2, b);
-                self.spill_v128(4, a);
-                self.simd_helper_call(sub, lane.unwrap_or(0))?;
-                let out = self.load_v128(0);
-                self.stack.push(out);
+                if sub == 0x52 && simd_native() {
+                    let out = self.native_bitselect(a, b, c);
+                    self.stack.push(out);
+                } else {
+                    self.spill_v128(0, c);
+                    self.spill_v128(2, b);
+                    self.spill_v128(4, a);
+                    self.simd_helper_call(sub, lane.unwrap_or(0))?;
+                    let out = self.load_v128(0);
+                    self.stack.push(out);
+                }
             }
             VecSig::Shift => {
                 let count = self.pop().ok_or("operand stack underflow")?;
                 let v = self.pop().ok_or("operand stack underflow")?;
-                let wide = self.builder.ins().uextend(types::I64, count);
-                self.spill_u64(0, wide);
-                self.spill_v128(1, v);
-                self.simd_helper_call(sub, lane.unwrap_or(0))?;
-                let out = self.load_v128(0);
-                self.stack.push(out);
+                let native = if simd_native() {
+                    self.native_shift(sub, v, count)
+                } else {
+                    None
+                };
+                if let Some(out) = native {
+                    self.stack.push(out);
+                } else {
+                    let wide = self.builder.ins().uextend(types::I64, count);
+                    self.spill_u64(0, wide);
+                    self.spill_v128(1, v);
+                    self.simd_helper_call(sub, lane.unwrap_or(0))?;
+                    let out = self.load_v128(0);
+                    self.stack.push(out);
+                }
             }
             VecSig::Splat(kind) => {
                 let scalar = self.pop().ok_or("operand stack underflow")?;
-                let wide = self.slot_from(lane_valtype(kind), scalar)?;
-                self.spill_u64(0, wide);
-                self.simd_helper_call(sub, lane.unwrap_or(0))?;
-                let out = self.load_v128(0);
-                self.stack.push(out);
+                let native = if simd_native() {
+                    self.native_splat(sub, scalar)
+                } else {
+                    None
+                };
+                if let Some(out) = native {
+                    self.stack.push(out);
+                } else {
+                    let wide = self.slot_from(lane_valtype(kind), scalar)?;
+                    self.spill_u64(0, wide);
+                    self.simd_helper_call(sub, lane.unwrap_or(0))?;
+                    let out = self.load_v128(0);
+                    self.stack.push(out);
+                }
             }
             VecSig::ExtractS(kind) | VecSig::ExtractU(kind) | VecSig::Extract(kind) => {
                 let v = self.pop().ok_or("operand stack underflow")?;
@@ -5431,20 +5852,58 @@ impl<'a> Lowerer<'a> {
             VecSig::Replace(kind) => {
                 let scalar = self.pop().ok_or("operand stack underflow")?;
                 let v = self.pop().ok_or("operand stack underflow")?;
-                let wide = self.slot_from(lane_valtype(kind), scalar)?;
-                self.spill_u64(0, wide);
-                self.spill_v128(1, v);
-                self.simd_helper_call(sub, lane.ok_or("missing replace lane")?)?;
-                let out = self.load_v128(0);
-                self.stack.push(out);
+                let native = if simd_native() {
+                    match lane {
+                        Some(lane) => self.native_replace(sub, v, scalar, lane),
+                        None => None,
+                    }
+                } else {
+                    None
+                };
+                if let Some(out) = native {
+                    self.stack.push(out);
+                } else {
+                    let wide = self.slot_from(lane_valtype(kind), scalar)?;
+                    self.spill_u64(0, wide);
+                    self.spill_v128(1, v);
+                    self.simd_helper_call(sub, lane.ok_or("missing replace lane")?)?;
+                    let out = self.load_v128(0);
+                    self.stack.push(out);
+                }
             }
-            VecSig::Test | VecSig::Bitmask => {
+            VecSig::Test => {
                 let v = self.pop().ok_or("operand stack underflow")?;
-                self.spill_v128(0, v);
-                self.simd_helper_call(sub, lane.unwrap_or(0))?;
-                let wide = self.read_scratch(types::I64);
-                let value = self.value_from_slot(ValType::I32, wide)?;
-                self.stack.push(value);
+                let native = if simd_native() {
+                    self.native_test(sub, v)
+                } else {
+                    None
+                };
+                if let Some(out) = native {
+                    self.stack.push(out);
+                } else {
+                    self.spill_v128(0, v);
+                    self.simd_helper_call(sub, lane.unwrap_or(0))?;
+                    let wide = self.read_scratch(types::I64);
+                    let value = self.value_from_slot(ValType::I32, wide)?;
+                    self.stack.push(value);
+                }
+            }
+            VecSig::Bitmask => {
+                let v = self.pop().ok_or("operand stack underflow")?;
+                let native = if simd_native() {
+                    self.native_bitmask(sub, v)
+                } else {
+                    None
+                };
+                if let Some(out) = native {
+                    self.stack.push(out);
+                } else {
+                    self.spill_v128(0, v);
+                    self.simd_helper_call(sub, lane.unwrap_or(0))?;
+                    let wide = self.read_scratch(types::I64);
+                    let value = self.value_from_slot(ValType::I32, wide)?;
+                    self.stack.push(value);
+                }
             }
         }
         Ok(())
@@ -12274,6 +12733,300 @@ mod tests {
         assert_equiv(&module, 5, &[vec![Value::v128(a), Value::v128(b)]]);
         assert_equiv(&module, 6, &[vec![Value::v128(a)]]);
         assert_equiv(&module, 7, &[vec![Value::v128(a), Value::v128(b)]]);
+    }
+
+    #[test]
+    fn v128_native_lane_ops_match_the_interpreter() {
+        // Lane-wise ops the lowering now emits natively: wrapping multiply,
+        // integer and float compares, shifts, splat/replace, bitselect,
+        // any/all, bitmask, and integer abs/neg. Each runs on both paths and
+        // must agree bit-for-bit with the interpreter.
+        let v128 = ValType::V128;
+        let i32t = ValType::I32;
+        let module = Module {
+            types: vec![
+                // 0: binary v128 op.
+                SubType::func(vec![v128, v128], vec![v128]),
+                // 1: v128 + i32 (shift count / lane value).
+                SubType::func(vec![v128, i32t], vec![v128]),
+                // 2: v128 -> i32 (test / bitmask).
+                SubType::func(vec![v128], vec![i32t]),
+                // 3: unary v128 op.
+                SubType::func(vec![v128], vec![v128]),
+                // 4: i32 -> v128 (splat).
+                SubType::func(vec![i32t], vec![v128]),
+                // 5: v128.bitselect.
+                SubType::func(vec![v128, v128, v128], vec![v128]),
+            ],
+            functions: vec![0, 0, 0, 0, 0, 1, 1, 1, 5, 1, 2, 2, 3, 3, 4, 0, 0, 0, 0, 0],
+            bodies: vec![
+                // 0: i32x4.mul.
+                FuncBody {
+                    locals: vec![],
+                    body: vec![Instr::LocalGet(0), Instr::LocalGet(1), Instr::Vec(0xb5)],
+                },
+                // 1: i8x16.eq.
+                FuncBody {
+                    locals: vec![],
+                    body: vec![Instr::LocalGet(0), Instr::LocalGet(1), Instr::Vec(0x23)],
+                },
+                // 2: i16x8.lt_u (unsigned, so a sign-flip lowering runs).
+                FuncBody {
+                    locals: vec![],
+                    body: vec![Instr::LocalGet(0), Instr::LocalGet(1), Instr::Vec(0x30)],
+                },
+                // 3: i64x2.le_s.
+                FuncBody {
+                    locals: vec![],
+                    body: vec![Instr::LocalGet(0), Instr::LocalGet(1), Instr::Vec(0xda)],
+                },
+                // 4: f64x2.lt.
+                FuncBody {
+                    locals: vec![],
+                    body: vec![Instr::LocalGet(0), Instr::LocalGet(1), Instr::Vec(0x49)],
+                },
+                // 5: i32x4.shl.
+                FuncBody {
+                    locals: vec![],
+                    body: vec![Instr::LocalGet(0), Instr::LocalGet(1), Instr::Vec(0xab)],
+                },
+                // 6: i16x8.shr_s.
+                FuncBody {
+                    locals: vec![],
+                    body: vec![Instr::LocalGet(0), Instr::LocalGet(1), Instr::Vec(0x8c)],
+                },
+                // 7: i8x16.shr_u.
+                FuncBody {
+                    locals: vec![],
+                    body: vec![Instr::LocalGet(0), Instr::LocalGet(1), Instr::Vec(0x6d)],
+                },
+                // 8: v128.bitselect.
+                FuncBody {
+                    locals: vec![],
+                    body: vec![
+                        Instr::LocalGet(0),
+                        Instr::LocalGet(1),
+                        Instr::LocalGet(2),
+                        Instr::Vec(0x52),
+                    ],
+                },
+                // 9: i32x4.replace_lane 1.
+                FuncBody {
+                    locals: vec![],
+                    body: vec![
+                        Instr::LocalGet(0),
+                        Instr::LocalGet(1),
+                        Instr::VecLane { op: 0x1c, lane: 1 },
+                    ],
+                },
+                // 10: i8x16.bitmask.
+                FuncBody {
+                    locals: vec![],
+                    body: vec![Instr::LocalGet(0), Instr::Vec(0x64)],
+                },
+                // 11: i16x8.all_true.
+                FuncBody {
+                    locals: vec![],
+                    body: vec![Instr::LocalGet(0), Instr::Vec(0x83)],
+                },
+                // 12: i32x4.abs.
+                FuncBody {
+                    locals: vec![],
+                    body: vec![Instr::LocalGet(0), Instr::Vec(0xa0)],
+                },
+                // 13: i64x2.neg.
+                FuncBody {
+                    locals: vec![],
+                    body: vec![Instr::LocalGet(0), Instr::Vec(0xc1)],
+                },
+                // 14: i8x16.splat.
+                FuncBody {
+                    locals: vec![],
+                    body: vec![Instr::LocalGet(0), Instr::Vec(0x0f)],
+                },
+                // 15: i64x2.mul (the 64-bit-lane multiply fallback).
+                FuncBody {
+                    locals: vec![],
+                    body: vec![Instr::LocalGet(0), Instr::LocalGet(1), Instr::Vec(0xd5)],
+                },
+                // 16: i64x2.gt_s (the short-table forms after lt_s).
+                FuncBody {
+                    locals: vec![],
+                    body: vec![Instr::LocalGet(0), Instr::LocalGet(1), Instr::Vec(0xd9)],
+                },
+                // 17: i64x2.ge_s.
+                FuncBody {
+                    locals: vec![],
+                    body: vec![Instr::LocalGet(0), Instr::LocalGet(1), Instr::Vec(0xdb)],
+                },
+                // 18: i16x8.le_u (the unsigned tail of the 10-op table).
+                FuncBody {
+                    locals: vec![],
+                    body: vec![Instr::LocalGet(0), Instr::LocalGet(1), Instr::Vec(0x34)],
+                },
+                // 19: i32x4.ge_u.
+                FuncBody {
+                    locals: vec![],
+                    body: vec![Instr::LocalGet(0), Instr::LocalGet(1), Instr::Vec(0x40)],
+                },
+            ],
+            ..Module::default()
+        };
+        assert!(
+            compile_module(&module).iter().all(|entry| entry.is_some()),
+            "v128 native-lane module did not compile"
+        );
+        let a = 0x0001_0002_0003_0004_0005_0006_0007_0008u128;
+        let b = 0x0100_0200_0300_0400_0500_0600_0700_0800u128;
+        let c = 0x0f0f_0f0f_3333_3333_5555_5555_7fff_ffffu128;
+        for index in 0..=4 {
+            assert_equiv(&module, index, &[vec![Value::v128(a), Value::v128(b)]]);
+        }
+        // Shift counts exercise the lane-width masking: 0 and the lane width
+        // must be identity, one past it must wrap to 1, the wide counts must
+        // not leak bits between lanes, and a negative i32 (a large u32 per the
+        // spec's unsigned count) must mask to its low lane bits.
+        let wide = 0xaabb_ccdd_eeff_a0b0_c0d0_e0f0_0a0b_0c0du128;
+        for index in 5..=7 {
+            for count in [0, 1, 4, 5, 7, 8, 9, 15, 16, 17, 32, 33, -1, -8] {
+                assert_equiv(
+                    &module,
+                    index,
+                    &[
+                        vec![Value::v128(a), Value::I32(count)],
+                        vec![Value::v128(wide), Value::I32(count)],
+                    ],
+                );
+            }
+        }
+        assert_equiv(
+            &module,
+            8,
+            &[vec![Value::v128(a), Value::v128(b), Value::v128(c)]],
+        );
+        assert_equiv(&module, 9, &[vec![Value::v128(a), Value::I32(-7)]]);
+        assert_equiv(&module, 10, &[vec![Value::v128(a)]]);
+        assert_equiv(&module, 11, &[vec![Value::v128(a)], vec![Value::v128(0)]]);
+        for index in 12..=13 {
+            assert_equiv(
+                &module,
+                index,
+                &[vec![Value::v128(b)], vec![Value::v128(a)]],
+            );
+        }
+        assert_equiv(&module, 14, &[vec![Value::I32(-7)]]);
+        assert_equiv(&module, 15, &[vec![Value::v128(a), Value::v128(b)]]);
+        for index in 16..=19 {
+            assert_equiv(
+                &module,
+                index,
+                &[
+                    vec![Value::v128(a), Value::v128(b)],
+                    vec![Value::v128(b), Value::v128(a)],
+                ],
+            );
+        }
+    }
+
+    #[test]
+    fn v128_native_float_arith_matches_the_interpreter() {
+        // `f32x4`/`f64x2` add/sub/mul/div/min/max/pmin/pmax. The interesting
+        // inputs are the NaN-producing ones: `inf - inf` and `0 * inf` make a
+        // NaN from non-NaN operands, where the hardware's default quiet NaN has
+        // the sign bit set and the interpreter's canonical NaN does not.
+        let v128 = ValType::V128;
+        let body = |sub: u8| FuncBody {
+            locals: vec![],
+            body: vec![
+                Instr::LocalGet(0),
+                Instr::LocalGet(1),
+                Instr::Vec(sub as u16),
+            ],
+        };
+        let ops: [u8; 16] = [
+            0xe4, 0xe5, 0xe6, 0xe7, 0xe8, 0xe9, 0xea, 0xeb, // f32x4
+            0xf0, 0xf1, 0xf2, 0xf3, 0xf4, 0xf5, 0xf6, 0xf7, // f64x2
+        ];
+        let module = Module {
+            types: vec![SubType::func(vec![v128, v128], vec![v128])],
+            functions: vec![0; ops.len()],
+            bodies: ops.iter().map(|sub| body(*sub)).collect(),
+            ..Module::default()
+        };
+        assert!(
+            compile_module(&module).iter().all(|entry| entry.is_some()),
+            "float arith module did not compile: {:?}",
+            (0..module.bodies.len())
+                .map(|index| body_compile_reason(&module, index))
+                .collect::<Vec<_>>()
+        );
+
+        fn f32x4(values: [f32; 4]) -> u128 {
+            values.iter().enumerate().fold(0u128, |bits, (i, v)| {
+                bits | (u128::from(v.to_bits()) << (32 * i))
+            })
+        }
+        fn f64x2(values: [f64; 2]) -> u128 {
+            values.iter().enumerate().fold(0u128, |bits, (i, v)| {
+                bits | (u128::from(v.to_bits()) << (64 * i))
+            })
+        }
+        let f32_nan = f32::from_bits(0x7fa0_0001);
+        let f32_canon = f32::from_bits(0x7fc0_0000);
+        let f32_snan = f32::from_bits(0x7f80_0001);
+        let f64_nan = f64::from_bits(0x7ff4_0000_0000_0001);
+        let f64_canon = f64::from_bits(0x7ff8_0000_0000_0000);
+
+        let f32_cases = [
+            (
+                f32x4([1.5, -2.25, 0.0, 1024.0]),
+                f32x4([2.0, 0.5, -0.0, 3.0]),
+            ),
+            (f32x4([-0.0, 0.0, -0.0, 0.0]), f32x4([0.0, -0.0, -0.0, 0.0])),
+            (
+                f32x4([f32_canon, f32_nan, f32_snan, 1.0]),
+                f32x4([1.0, 2.0, 3.0, 4.0]),
+            ),
+            (
+                f32x4([f32::INFINITY, f32::NEG_INFINITY, 0.0, 1.0]),
+                f32x4([f32::INFINITY, f32::NEG_INFINITY, 0.0, 0.0]),
+            ),
+            (
+                f32x4([f32::INFINITY, 0.0, 1e30, -1e30]),
+                f32x4([0.0, f32::INFINITY, 1e-30, 1e30]),
+            ),
+            (f32x4([-0.0, -0.0, 0.0, 0.0]), f32x4([-0.0, 0.0, -0.0, 0.0])),
+            (
+                f32x4([3.0, 3.0, 3.0, 3.0]),
+                f32x4([3.0, -3.0, 1.0 / 3.0, 0.0]),
+            ),
+        ];
+        let f64_cases = [
+            (f64x2([1.5, -2.25]), f64x2([2.0, 0.5])),
+            (f64x2([-0.0, 0.0]), f64x2([0.0, -0.0])),
+            (f64x2([f64_canon, f64_nan]), f64x2([1.0, 2.0])),
+            (
+                f64x2([f64::INFINITY, f64::NEG_INFINITY]),
+                f64x2([f64::INFINITY, f64::NEG_INFINITY]),
+            ),
+            (f64x2([f64::INFINITY, 0.0]), f64x2([0.0, f64::INFINITY])),
+            (f64x2([-0.0, 3.0]), f64x2([-0.0, 3.0])),
+        ];
+
+        for index in 0..8 {
+            let cases: Vec<Vec<Value>> = f32_cases
+                .iter()
+                .map(|(a, b)| vec![Value::v128(*a), Value::v128(*b)])
+                .collect();
+            assert_equiv(&module, index, &cases);
+        }
+        for index in 8..16 {
+            let cases: Vec<Vec<Value>> = f64_cases
+                .iter()
+                .map(|(a, b)| vec![Value::v128(*a), Value::v128(*b)])
+                .collect();
+            assert_equiv(&module, index, &cases);
+        }
     }
 
     #[test]

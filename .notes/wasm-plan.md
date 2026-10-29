@@ -285,6 +285,8 @@ review, per repo rules hygiene.
 - Relaxed ops under the relaxed-simd deterministic subset (spec marks
   results nondeterministic; pick one legal interpretation and document it).
 - DoD: `simd/` (59) then `relaxed-simd/` (7).
+- Reference: §10 surveys V8's lowering (two native tiers, x64
+  SSE4.1/SSSE3, ARM64 NEON) and the implications for our compiled path.
 
 ### Cut 8: Memory64 and multi-memory
 
@@ -814,6 +816,10 @@ module/function compile threshold, and whether compiled bodies keep the
 
 - **Compilation**: now Cut 11 above; until it lands the interpreter is the
   sole execution path.
+- **Native v128 lowering**: every compiled vector op currently routes
+  through interpreter helper mode 70 (Wave 5). A later pass should map
+  the hot ops onto Cranelift's vector types; §10 records V8's instruction
+  mapping and the recommended ordering.
 - **Threads/shared memory**: `atomic.*` ops wired into the existing
   workers/`Atomics` machinery once multi-agent memory is in place (shared
   memories themselves already work, Cut 10).
@@ -2821,3 +2827,108 @@ diverged.
 - [x] `cargo test -p wasm --features compile --lib`, the no-feature lib
 tests, and `cargo clippy -p wasm --all-targets -- -D warnings` in both
 configurations are clean.
+
+## 10. Reference: how V8 uses SIMD (survey, 2026-10-29)
+
+Surveyed V8 `main` while planning native v128 codegen. Two findings shape
+this plan: V8 has no SIMD surface for JavaScript (`v128` is wasm-only), and
+neither wasm tier routes vector ops through a helper — the op becomes the
+machine instruction. That is the main structural difference from our
+current lowering.
+
+### 10.1 Feature status
+
+- Fixed-width 128-bit SIMD shipped in Chrome 91 (V8 9.1), phase 4.
+- In current `main`, `simd` and `relaxed_simd` are listed in
+  `FOREACH_WASM_NON_FLAG_FEATURE` (`src/wasm/wasm-features.h`): always on,
+  no flag. Relaxed opcodes occupy `0xfd100`–`0xfd113`.
+- 128→256-bit re-vectorization is staged, not shipped: the internal
+  feature `wasm_revectorize` ("Staged in 15.4") exists only when the build
+  flag `V8_ENABLE_WASM_SIMD256_REVEC` is set. The machine IR already has
+  `Simd256*` ops and `V128`/`V256` entries in the x64 binop table.
+
+### 10.2 Two tiers, both native
+
+| Tier | File | v128 lowering |
+|---|---|---|
+| Liftoff | `src/wasm/baseline/<arch>/liftoff-assembler-<arch>-inl.h` | direct |
+| TurboFan/Turboshaft | `src/wasm/turboshaft-graph-interface.cc` + backend | direct |
+
+`kS128` is added only when `CpuFeatures::SupportsSimd128()`
+(`liftoff-compiler.cc`), and the SIMD lowering `CHECK`s it.
+
+x64 baseline is **SSE4.1 + SSSE3**, with AVX/AVX2 paths when present:
+
+- `i8x16.swizzle` → `Pshufb` (SSSE3); relaxed swizzle reuses it.
+- dot products → `vpmaddubsw` (SSSE3/AVX).
+- several SIMD ops use `Ptest`/`Pmovzx*`/`Pblendvb` (SSE4.1).
+- AVX supplies VEX/3-operand forms; AVX2 supplies `vpbroadcastw` +
+  `vcvtph2ps` on f16 loads.
+
+ARM64 is plain NEON: `i8x16.add` → `Add(V16B)`, saturating forms →
+`Sqadd`/`Uqadd`. AArch64 always has NEON; 32-bit ARM is gated by
+`SupportsSimd128()`.
+
+### 10.3 What this implies for Slag
+
+Wave 5 carries `V128` as a Cranelift `I128` and lowers every vector op
+through runtime helper mode 70 (which calls the interpreter's `simd_exec`);
+only `v128.const`, the memory forms, and shuffle have special native cases.
+That is correct and reached the coverage DoD, but it is the opposite of
+V8, where the op itself is one instruction. Consequences:
+
+1. **Cranelift is the right target.** `I8x16`…`F64x2` already lower to
+   SSE4.1/AVX on x64 and NEON on AArch64, so native lowering is an
+   opcode-by-opcode table, not a new backend. Keep the helper as the
+   fallback for shapes Cranelift cannot express cheaply.
+2. **Don't switch carriers first.** `I128` is fine for memory, globals,
+   and the word-offset ABI; the win comes from per-op vector
+   instructions, not from changing the carrier.
+3. **Match V8's feature gate.** Advertise `v128` only when the host has
+   the baseline ISA (SSE4.1/SSSE3 on x64, NEON on ARM), with the
+   interpreter as the fallback, mirroring `SupportsSimd128`.
+4. **Order by value.** Native integer/float add/sub/mul, bitwise,
+   comparisons, splats, and shifts first; leave narrow/extmul/dot and f16
+   on the helper until measured.
+5. **Re-vectorization is post-coverage.** V8 staged 256-bit fusion only
+   in 15.4, years after 128-bit shipped; it is not part of Cut 7.
+
+**Landed (2026-10-29):** the helper-only ops now lower natively, behind the
+`SLAG_WASM_SIMD_NATIVE=0` seam: integer `mul`, the 10-entry comparison tables
+per shape (plus a separate 6-entry `i64x2` table), shifts, `abs`/`neg`,
+splat/replace, `any_true`/`all_true`, `bitmask`, and `bitselect`, plus the
+whole `f32x4`/`f64x2` family — add/sub/mul/div, min/max and pmin/pmax — with
+the interpreter's canonical-NaN policy reproduced explicitly. Measured on
+`crates/wasmtest/fixtures/simd-native-loop.wast` and
+`simd-native-float.wast`, same binary, seven interleaved rounds:
+**35.74 ms against 235.58 ms on the helper path (6.6x)** for the integer mix,
+and **56.13 ms against 1017.18 ms (18.1x)** for the float mix, with
+`simd-loop` and `leaf-loop` controls flat. The carrier stays `I128` as point 2
+predicted; the win is entirely per-op instructions. Details, including the
+`shr_s`/`shr_u` table swap the corpus caught and the NaN-canonicalization
+rules, are in `.notes/perf.md`.
+
+Still on the helper after this cut: float `sqrt` and the rounding forms
+(`ceil`/`floor`/`trunc`/`nearest`), float `abs`/`neg`, the conversion family,
+the saturating/narrow/extmul/dot groups, `relaxed_*`, and `i8x16.swizzle`.
+
+### 10.4 Outside wasm (for completeness)
+
+V8 vendors `simdutf` (`DEPS`, `third_party/simdutf`) and uses it for
+`simdutf::validate_utf8` (`unibrow::Utf8::ValidateEncoding`, also used by
+wasm name-section validation) and `simdutf::to_well_formed_utf16`
+(`String.prototype.toWellFormed`), plus Google Highway (`hwy`) for the
+ASCII-prefix copy in `Utf8::WriteLeadingAscii`. Regexp has a separate
+`--regexp-simd` scan path (`SkipUntil*Simd`). simdutf transcoding is a
+Chromium/Node use, not a V8 `src/` one. Rust analogues: `simdutf8` for
+validation, `memchr`/`wide` for scans.
+
+Sources: `v8.dev/features/simd`; V8 `main`: `DEPS`,
+`src/strings/unicode.cc`, `src/runtime/runtime-strings.cc`,
+`src/wasm/wasm-features.h`, `src/wasm/wasm-opcodes.h`,
+`src/wasm/baseline/x64/liftoff-assembler-x64-inl.h`,
+`src/wasm/baseline/arm64/liftoff-assembler-arm64-inl.h`,
+`src/codegen/x64/macro-assembler-x64.cc`,
+`src/compiler/backend/x64/instruction-selector-x64.cc`,
+`src/flags/flag-definitions.h`, `src/flags/feature-flags.h`,
+`src/regexp/x64/regexp-macro-assembler-x64.cc`.
