@@ -364,6 +364,16 @@ fn lift_impl(body: &CompiledBody, guard_reads: bool) -> Result<Function, Unsuppo
                     }
                     TermRec::Ret(stack.pop().ok_or(Unsupported::Stack)?)
                 }
+                // A throw inside a for-of body must close the iterator before
+                // the body completes (spec 14.7.5.6 step 7), which the
+                // compiled for-of steps own; only a trailing throw is lifted,
+                // on the same rule as `Return`.
+                Step::Throw { .. } => {
+                    if has_for_of && ti + 1 != n {
+                        return Err(Unsupported::Step("Throw"));
+                    }
+                    TermRec::Throw(stack.pop().ok_or(Unsupported::Stack)?)
+                }
                 Step::Jump(_) => TermRec::Jump(stack),
                 Step::JumpIfFalse(_) | Step::JumpIfTrue(_) => {
                     TermRec::Branch(stack.pop().ok_or(Unsupported::Stack)?, stack)
@@ -392,6 +402,7 @@ fn lift_impl(body: &CompiledBody, guard_reads: bool) -> Result<Function, Unsuppo
         let rec = term_rec[bi].as_ref().ok_or(Unsupported::Invalid)?;
         match rec {
             TermRec::Ret(v) => builder.term(bi as BlockId, Term::Return(Some(*v))),
+            TermRec::Throw(v) => builder.term(bi as BlockId, Term::Throw(*v)),
             TermRec::FallOff => {
                 let undefined = builder.emit(
                     bi as BlockId,
@@ -740,6 +751,9 @@ fn stack_delta(step: &Step) -> Result<i32, Unsupported> {
 /// The edge payload a block leaves on each successor.
 enum TermRec {
     Ret(ValueId),
+    /// An escaping `throw`: the value popped at the terminator, raised by the
+    /// lowerer through `throw_control` (see [`Term::Throw`]).
+    Throw(ValueId),
     /// A body that falls off the end (a constructor, a function with no
     /// explicit `return`, a script): the entry answers `undefined`.
     FallOff,
@@ -821,7 +835,12 @@ fn block_successors(
     }
     match &steps[last] {
         Step::Return => Ok(Vec::new()),
-        Step::Throw { .. } => Err(Unsupported::Step("Throw")),
+        // A `throw` block has no successor either: the throw escapes the body.
+        // A lifted body carries no handler (`Step::EnterTry` has no lowering),
+        // so `throw_machinery` takes its escaping arm, which closes an active
+        // for-of iterator and disposes `using` resources, and completes with
+        // the throw.
+        Step::Throw { .. } => Ok(Vec::new()),
         _ => Err(Unsupported::Invalid),
     }
 }
@@ -3245,7 +3264,11 @@ mod tests {
     }
 
     #[test]
-    fn a_throw_is_unsupported() {
+    fn a_throw_lifts_as_an_escaping_terminator() {
+        // A lifted body has no handler (`EnterTry` has no lowering), so a
+        // `throw` always escapes: the block ends there and the value it pops is
+        // the terminator's operand (the lowerer raises it through
+        // `throw_control`).
         let b = body(
             vec![
                 Step::Push(Value::Number(1.0)),
@@ -3255,7 +3278,17 @@ mod tests {
             ],
             0,
         );
-        assert_eq!(lift(&b).unwrap_err(), Unsupported::Step("Throw"));
+        let func = lift(&b).expect("a throwing body lifts");
+        let block = func.block(func.entry());
+        let Some(Term::Throw(value)) = block.term else {
+            panic!("the entry throws: {:?}", block.term);
+        };
+        let inst = block
+            .insts
+            .iter()
+            .find(|inst| inst.result == Some(value))
+            .expect("the thrown value is defined in the block");
+        assert_eq!(inst.op, Op::Const);
     }
 
     #[test]

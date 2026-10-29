@@ -235,6 +235,36 @@ fn lower(
                 let vals = resolve(&mut builder, ir, *target, args, &values)?;
                 builder.ins().jump(clif[*target as usize], &vals);
             }
+            Some(Term::Throw(value)) => {
+                // An escaping throw. A lifted body has no handler
+                // (`Step::EnterTry` has no lowering), so `throw_machinery`
+                // takes its escaping arm, which closes an active for-of
+                // iterator, disposes `using` resources and completes with the
+                // throw; `dispatch_result` then sets the ctx's pending error.
+                // The helper-call ABI's error path has already returned
+                // `undefined`, so the fall-through below is unreachable, but
+                // the block needs a terminator.
+                let id = *value;
+                let v = value_of(&values, id)?;
+                let v = match ir.value_type(id) {
+                    Type::Int => int_to_bits(&mut builder, v),
+                    Type::Float => builder.ins().bitcast(types::I64, MemFlagsData::new(), v),
+                    _ => v,
+                };
+                let ip = builder.ins().iconst(types::I64, 0);
+                call_helper(
+                    &mut builder,
+                    helpers,
+                    &abi,
+                    abi.sig_unary,
+                    Helper::ThrowControl,
+                    &[ip, v],
+                )?;
+                let undefined = builder
+                    .ins()
+                    .iconst(types::I64, JsValue::Undefined.bits() as i64);
+                builder.ins().return_(&[undefined]);
+            }
             Some(Term::Branch {
                 cond,
                 then_block,
@@ -322,6 +352,9 @@ fn resolve(
 
 /// Whether the lowered IR contains a speculation guard, so the machine code can
 /// return `DISPATCH_DEOPT` (and must not be inlined by a compiled caller).
+/// A `Term::Throw` does NOT set this: the in-frame leaf tail checks the ctx's
+/// pending byte after the call (`emit_leaf_result_tail`), so a throwing callee
+/// propagates through an inlined caller exactly like a throwing slow path.
 fn ir_has_deopt(ir: &IrFunction) -> bool {
     (0..ir.block_count() as BlockId).any(|b| {
         ir.block(b)

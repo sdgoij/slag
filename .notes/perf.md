@@ -18135,3 +18135,49 @@ object is ~790 ns/iteration (`l-leaf-forin` 1.345 µs against `j-leaf` 0.554 for
 the same six calls); a `throw` in a callee costs +209 ns/call even though it
 never executes (`h-throw` 3.10 µs against `i-nothrow` 2.14 over 9 calls); and a
 member read costs ~14 ns on top of a leaf call (`o-method-num`).
+
+### LANDED (2026-10-29): the optimizing tier lifts `throw`
+
+A lifted body has no handler (`Step::EnterTry` has no lowering), so a `throw`
+in one always escapes. That makes it the simplest terminator in the tier, and
+the lift had it as the *only* refused terminator: `block_successors` gave a
+`throw` block no successor. Now it lifts as `Term::Throw(value)` (which the IR
+already had, and which `cse`/`dce` already walked), and the lowerer raises the
+value through `Helper::ThrowControl` and returns.
+
+`throw_control` is the right entry point rather than a new "set the pending
+error" helper, for two reasons learned by reading rather than guessing.
+`throw_machinery`'s escaping arm is what closes an active for-of iterator
+(spec 14.7.5.6) and disposes the scopes' `using` resources (spec 9.4.3,
+nesting a SuppressedError on a throwing disposal); a bare pending-error write
+would skip both. And it scans `try_stack` against the *current* body's handler
+table, which for a lifted body is empty, so every enclosing frame is skipped and
+the throw escapes exactly as it must. The `ip` argument is 0: with no handlers
+there is nothing for `throw_machinery` to match it against.
+
+Measured, same-binary interleaved, minima:
+
+| probe | before | after |
+| --- | ---: | ---: |
+| for-in head-let row, jit | 377.7 ms | **368.8 ms** (-2.4%) |
+| whole corpus, jit | 1970.7 ms | 1963.8 ms (-0.35%, inside the noise floor) |
+| `control` family | 98.9 ms | 98.8 ms (flat) |
+
+`SLAG_JIT_REPORT` no longer prints `opt-blockers: Throw`. A probe of the shape
+(`add(a,b){ if (a===b) throw ...; return a+b }`, 6 calls per body) reads
+0.438 -> 0.393 ms compiled. That is a 10% move and not the 4x the per-call
+interpreter figure suggested, because the *baseline* tier already ran such a
+body well; the gain is in the tier the body now lands in, not in a broken lane.
+
+One thing this deliberately does NOT do: mark the body `deopts` so the
+machine-code inline lanes refuse it. That looks necessary and is not: the
+in-frame leaf tail already checks the ctx's pending byte after the call
+(`emit_leaf_result_tail`), so a throwing callee propagates through an inlined
+caller exactly like a throwing slow path. Making it `deopts` instead measured
+0.393 -> **1.246** ms, worse than not compiling the body at all.
+
+Gates: `cargo fmt --all -- --check`; `cargo clippy --workspace --all-targets -- -D warnings`; `cargo test --workspace` (40 suites); test262 `language` 23,726 + `built-ins` 23,821 + `annexB` 1,086 + `intl402` 3,365 = 51,998 at 100% (`--timeout 15 --recheck-timeout 15`); corpus 77 rows `mismatches=0`.
+
+**Item 2 of the previous note stands and is now the larger half:** a branching
+leaf body is a *step-path* leaf, not a register leaf, which is the 92 -> 301 ns
+per-call figure in the interpreter. That is untouched here.

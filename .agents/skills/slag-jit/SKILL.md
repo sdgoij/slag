@@ -78,6 +78,20 @@ count must `bump_leaf_epoch` after the call (via `emit_dispatch_call` or
 the `disturbs_leaf_eligibility` classification) or a cached leaf-call
 verdict goes stale.
 
+**The optimizing tier's `Term::Throw` is `throw_control`, and it must not
+mark the body `deopts`.** A lifted body has no handler (`EnterTry` has no
+lowering), so `throw_machinery` takes its escaping arm, which is what
+closes an active for-of iterator (spec 14.7.5.6) and disposes `using`
+resources (spec 9.4.3) — a bare pending-error write would skip both. It
+scans `try_stack` against the current body's (empty) handler table, so
+every enclosing frame is skipped and the throw escapes as it must; the
+`ip` argument is 0 because nothing can match it. And the body stays
+inlineable: `emit_leaf_result_tail` checks the ctx's pending byte after
+an in-frame call, so a throwing callee propagates through an inlined
+caller like any throwing slow path. Marking it `deopts` instead makes
+every call take `call_slow` — measured 0.393 -> 1.246 ms on a six-call
+probe, worse than not compiling the body at all.
+
 ## 4. The sealed-block rules (Cranelift)
 
 - Every transfer target block must exist BEFORE `seal_all_blocks` runs:
