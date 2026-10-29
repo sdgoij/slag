@@ -18216,3 +18216,59 @@ describes and costs the full seven-place `LeafOp` mirror; the first is cheaper
 only if the invariant holds, which is what this attempt assumed and did not
 prove. Measure before building either: the win is interpreter-only
 (`leaf_ops` feeds the interpreter's leaf lanes; the JIT compiles steps).
+
+## PRICED (2026-10-29): per-call cost, all four shapes
+
+Before building anything on the "calls are 62% of the row" finding, the four
+call shapes were priced against node on the same harness (per call, `ablate.sh`
+minima, 6000 calls per run):
+
+| shape | slag jl | node jl | slag jit | node jit |
+| --- | ---: | ---: | ---: | ---: |
+| register leaf `add(a,b){return a+b}` | **99** | 70 | **16** | 50 |
+| branch leaf `if (a===b) return 0; return a+b` | **146** | 75 | 19 | 57 |
+| non-leaf `mid(a,b){return add(a,b)}` | **304** | 124 | **80** | 88 |
+| method read + register leaf `o.mid(a,b)` | **107** | 73 | 19 | 49 |
+
+Two conclusions that change the plan, and both were cheap to get:
+
+1. **The JIT is at or ahead of node on every one of these shapes** (16 vs 50,
+   19 vs 57, 80 vs 88, 19 vs 49). The per-call cost in the ranked column is
+   not where the corpus gap lives.
+2. **Both of the remaining "call" items are interpreter-only.** The branch-leaf
+   penalty is +47 ns jl and +3 ns jit; the non-leaf penalty is +205 ns jl and
+   +64 ns jit. So the 62%-of-row finding is a description of the *interpreter*,
+   which matters for `--jitless` and as the machinery diagnostic, not for the
+   headline.
+
+That reorders the remaining work: the 8.6x on the row under the JIT is not
+per-call, it is that the fixture makes ~3 non-leaf activations per assertion
+statement, and both we and node pay real per-activation cost for those.
+
+### NULL (2026-10-29): branch-capable register leaves, blocked by the completion wrappers
+
+The design was built and works up to one step: `LeafOp::Jump`/`JumpIfFalse`/
+`JumpIfTrue` over op indices, patched from a step->op map, accepted only when
+the shadow stack is empty at the branch, the target step emits an op, and the
+executor turned from `for op in ops` into an index loop. It compiles and the
+engine runs.
+
+It never fires, and the reason is the step list. `function add(a,b){ if (a===b)
+return 0; return a+b; }` compiles to
+
+    ResetCompletion, LoadLocal 0, LoadLocal 1, StrictEqual, JumpIfFalse(8),
+    Push(0), Return, Jump(8), NormalizeCompletion, LoadLocal 0, LoadLocal 1,
+    Add, Return
+
+so a guard clause is *bracketed* by `ResetCompletion` and `NormalizeCompletion`,
+and the branch target IS the `NormalizeCompletion` step. Braces around the
+`if` body add a `ListBegin`/`ListEnd` pair on top. None of those lower to a
+register op, so `lower_leaf_ops` still returns `None` and the body stays a
+step-path leaf. Making it fire means deciding that statement-completion
+machinery is a no-op inside a register leaf body, which is a semantic claim
+about completion values, not a mechanical change - exactly the "when in doubt,
+a body stays on the step path" rule in the bytecode-vm skill.
+
+The step lists above are the artifact: the next attempt starts from them, not
+from re-deriving what a guard clause compiles to. Reverted; `crates/` is
+unchanged.
