@@ -157,6 +157,13 @@ following read — and the compiled probe — hits without a vector access).
 
 ## 3. Adding a path that mutates the property vector
 
+- **A computed `Key(PropertyKey::String(atom))` and a `Name(atom)` are the same
+  store.** `member_reference` maps both to `PropertyKey::String(atom)`, so a
+  fast path that accepts only `Name` silently excludes every `o[k] = v` whose
+  key converted to an atom, which is the shape of spread copies, `Object.keys`
+  built results and the corpus's largest workload. Use `name_atom` to normalize
+  before declining.
+
 - **`Map::field_offset` returning `None` means "not map-served", never
   "not present".** The map describes exactly the keys whose field mirrors the
   value; a non-default-attributes define, a dictionary-mode object and a key

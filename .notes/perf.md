@@ -18672,3 +18672,51 @@ fallback to `get_own_property_key` is load-bearing.
 
 Gates: same four as above, all at 100%, plus `--gc-stress --gc-verify` on the
 define probe.
+
+### LANDED (2026-10-29, same day): a computed string key takes the fresh-store path too
+
+Both slices above were invisible to the corpus's biggest defining shape,
+because `fast_fresh_store` began with
+
+    let PropertyKeyName::Name(atom) = key else { return Ok(false) };
+
+and a computed store arrives as `Key(PropertyKey)` — the key already converted
+by `assign_computed_plain`'s `to_property_key`. But `member_reference` maps
+*both* forms to `PropertyKey::String(atom)`, so the acceptance test was pure
+conservatism: a computed key that converted to a string atom is the same store
+as the named form. It now goes through `name_atom`, which already existed for
+exactly this normalization.
+
+That one test change is the session's largest win, because the corpus's #1 row
+is `fns[x] = function () { return x; }` — three computed-key stores per body,
+100k bodies:
+
+| row | before | after | |
+| --- | ---: | ---: | --- |
+| `language/.../head-let-fresh-binding-per-iteration` | 408.67 ms | **365.24 ms** | **-10.6%** |
+| `opcost/object_keys` | 32.74 | 31.45 | -3.9% |
+| `strings/concat_loop` | 9.99 | 9.46 | -5.3% |
+| whole corpus | 1957.9 | **1916.3** | **-2.12%** |
+
+(7 interleaved rounds, per-row minima; re-run 1947.6 -> 1903.2, -2.28%.) The
+#1 row is now 365 ms against node's 54.8, i.e. the row that was 21% of the
+recoverable time has moved 10.6% in one change.
+
+**Two rows that "regressed" are the layout noise, and the workload says so.**
+`control/generator_loop` read +6.9% in the first pass and +5.8% in the second,
+but its source contains no computed property store at all (`s += g.next().value`
+is a *read*), so the change cannot reach it. `calls/closure_capture` likewise
+(+1.1%, no stores). This is the +-44% single-row build-to-build swing the
+sampler commit measured, and it is why a row-level claim needs the workload's
+shape as well as the number.
+
+Gates: the four sweeps at 100% (51,998), `cargo test --workspace` 40 suites,
+corpus `mismatches=0`.
+
+Cumulative for the three define-path slices, 7 interleaved rounds, per-row
+minima, against the binary the session started from: **corpus 2057.6 ->
+1986.4 ms (-3.46%)**, with the #1 row **-13.2%** (458.26 -> 397.65, run-to-run
+absolute levels vary; the paired delta is the reading) and `spread_assign`
+-8.2%. The define probe is -15.5% over the same range. Nothing is left to
+reclaim here by trimming: the remaining define cost is the runtime helper round
+trip, so the next step in this area is a machine-code define, not another scan.

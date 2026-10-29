@@ -6229,7 +6229,10 @@ impl Vm {
         value: &Value,
     ) -> Result<bool, JsError> {
         use crux::object::{FreshDefine, FreshKey};
-        let PropertyKeyName::Name(atom) = key else {
+        // A computed key that already converted to a string atom is the same
+        // store as the named form (`member_reference` maps both to
+        // `PropertyKey::String`), so the fresh-define path serves it too.
+        let Some(atom) = name_atom(key) else {
             return Ok(false);
         };
         let receiver = match object.kind() {
@@ -6240,7 +6243,7 @@ impl Vm {
         if !matches!(receiver.kind, crux::object::ObjectKind::Ordinary) {
             return Ok(false);
         }
-        let property_key = PropertyKey::String(*atom);
+        let property_key = PropertyKey::String(atom);
         // Lazy `prototype`: writing a pending function's `prototype`
         // property must materialize it first — the fresh define below would
         // otherwise create a w/e/c property instead of updating the fixed
@@ -6279,8 +6282,8 @@ impl Vm {
             return Ok(false);
         }
         let defined = if let Some(proto) = receiver.get_prototype_of()? {
-            if !Self::member_store_cell_probe(agent, &proto, *atom)
-                && !Self::member_store_cell_resolve(agent, &receiver, &property_key, *atom)
+            if !Self::member_store_cell_probe(agent, &proto, atom)
+                && !Self::member_store_cell_resolve(agent, &receiver, &property_key, atom)
             {
                 return Ok(false);
             }
@@ -6297,7 +6300,7 @@ impl Vm {
         // needed here; a dictionary-mode define (map full) has no field.
         if let (FreshDefine::At { slot, writable }, Some(map)) = (defined, receiver.map.get()) {
             let map_id = map.id();
-            let index = Self::member_map_cell_index(map_id, *atom);
+            let index = Self::member_map_cell_index(map_id, atom);
             let (proto_id, proto_gen) = Self::member_map_proto(&receiver);
             // `clean` 1: this fill only succeeded because the chain-verified
             // verdict (the probe above) held, so the cell records the
@@ -6305,7 +6308,7 @@ impl Vm {
             // gate to re-check.
             agent.member_map_cells[index] = crate::ir::MemberMapCell {
                 map_id,
-                name: *atom,
+                name: atom,
                 slot,
                 clean: 1,
                 proto_id,
@@ -6320,10 +6323,10 @@ impl Vm {
             // front the just-defined property in the read-side value cache
             // so the next `member_cell_get` returns it with no
             // property-vector borrow or proto-keyed fallback.
-            let index = Self::member_cell_index(receiver.id(), *atom);
+            let index = Self::member_cell_index(receiver.id(), atom);
             agent.roots.member_value_cells[index].set(MemberValueCell {
                 id: receiver.id(),
-                name: *atom,
+                name: atom,
                 generation: receiver.generation(),
                 value: *value,
             });
