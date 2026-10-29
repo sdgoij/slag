@@ -379,10 +379,31 @@ impl Function {
         name: Option<JsString>,
         prototype: Option<Handle<JsObject>>,
     ) -> Handle<Function> {
+        Self::finish(name, JsObject::ordinary_object_create(prototype))
+    }
+
+    /// [`Function::new_with_prototype`] on an already-resolved empty map. A
+    /// function's `[[Prototype]]` is one of six realm intrinsics, so the
+    /// runtime caches each one's canonical empty map and the per-create
+    /// `canonical_empty_map` resolution — a thread-local heap-cell access, a
+    /// `mark_prototype` flag test and a linear scan of the empty-map cache —
+    /// never runs again.
+    pub fn new_with_prototype_and_map(
+        name: Option<JsString>,
+        prototype: Option<Handle<JsObject>>,
+        map: Handle<crate::Map>,
+    ) -> Handle<Function> {
+        Self::finish(
+            name,
+            JsObject::ordinary_object_create_with_map(prototype, map),
+        )
+    }
+
+    fn finish(name: Option<JsString>, object: Handle<JsObject>) -> Handle<Function> {
         let function = Handle::new(Self {
             id: NEXT_FUNCTION_ID.fetch_add(1, Ordering::Relaxed),
             name,
-            object: JsObject::ordinary_object_create(prototype),
+            object,
             kind: FunctionKind::EcmaScript,
             self_handle: Cell::new(None),
             environment: Cell::new(None),

@@ -829,6 +829,14 @@ pub(crate) struct AgentRoots {
     /// a collection between creates cannot free the shape (`function.rs`
     /// `function_boilerplate_map`).
     pub(crate) function_boilerplate_maps: [Cell<Option<crux::Handle<crux::Map>>>; 2],
+    /// The canonical empty map each function-kind `[[Prototype]]` intrinsic
+    /// puts a fresh function object on (indexed like
+    /// `Realm::function_prototype_index`). `Function::new_with_prototype`
+    /// otherwise re-resolves it per closure through a thread-local heap-cell
+    /// access and a linear scan of the empty-map cache; the prototype is a
+    /// fixed intrinsic, so the answer is constant per kind. Traced, so a
+    /// collection between creates cannot free the shape.
+    pub(crate) function_empty_maps: [Cell<Option<crux::Handle<crux::Map>>>; 6],
     /// The for-in enumeration cache (this landing): base id -> the
     /// enumerated (level, key) list + the full chain snapshot for a base
     /// whose whole prototype chain is generation-tracked (see
@@ -1392,6 +1400,7 @@ impl AgentRoots {
             wasm_extern_values: RefCell::new(std::collections::HashMap::new()),
             construct_maps: Box::new(std::array::from_fn(|_| Cell::new(None))),
             function_boilerplate_maps: std::array::from_fn(|_| Cell::new(None)),
+            function_empty_maps: std::array::from_fn(|_| Cell::new(None)),
             intl_number_format_data: RefCell::new(IdMap::default()),
             intl_plural_rules_data: RefCell::new(IdMap::default()),
             intl_date_time_format_data: RefCell::new(IdMap::default()),
@@ -1614,6 +1623,11 @@ impl Trace for AgentRoots {
         }
         // Cut 73: the cached ordinary-function boilerplate shapes.
         for map in self.function_boilerplate_maps.iter() {
+            map.get().trace(visit);
+        }
+        // The cached empty maps the function-kind prototypes put fresh
+        // function objects on.
+        for map in self.function_empty_maps.iter() {
             map.get().trace(visit);
         }
         if let Some(realm) = self.iter_result_realm.get() {

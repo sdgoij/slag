@@ -1948,11 +1948,18 @@ fn register_function(
     // Cut 74: the function is born with its kind's [[Prototype]] intrinsic
     // (resolved from the realm cache), so the trailing `set_prototype_of` —
     // a generic cycle scan + generation bump on an object nothing can have
-    // observed yet — disappears.
-    let function = Function::new_with_prototype(
-        name.clone(),
-        function_kind_prototype(&realm, kind.is_generator, kind.is_async),
-    );
+    // observed yet — disappears. The empty map that prototype implies is
+    // cached per kind too, so the canonical-map resolution does not run per
+    // closure.
+    let (prototype, empty_map) =
+        match function_kind_prototype_and_map(&realm, agent, kind.is_generator, kind.is_async) {
+            Some(pair) => (Some(pair.0), Some(pair.1)),
+            None => (None, None),
+        };
+    let function = match empty_map {
+        Some(map) => Function::new_with_prototype_and_map(name.clone(), prototype, map),
+        None => Function::new_with_prototype(name.clone(), prototype),
+    };
     // The closure's [[Environment]] rides on the box as a GC edge (the record
     // below keeps the typed handle for the call machinery). It is set before
     // the compile, so a collection in that window - `Function::new` fires one
@@ -2094,6 +2101,33 @@ fn function_kind_prototype(
         .intrinsics
         .function_prototype(function_kind_prototype_intrinsic(is_generator, is_async))
         .and_then(|value| crate::context::as_object(&value))
+}
+
+/// The [[Prototype]] intrinsic and the canonical empty map a fresh function
+/// object starts on, both cached per kind. `Function::new_with_prototype`
+/// re-resolved the map on every closure through `canonical_empty_map`, which
+/// costs a thread-local heap-cell access and a linear scan of the empty-map
+/// cache even on a hit; the prototype set is six fixed intrinsics, so the
+/// answer is constant once resolved. The first resolution still runs
+/// `mark_prototype` through `canonical_empty_map`, so the elements protector
+/// sees the link before any object can record a clean-chain verdict against it.
+fn function_kind_prototype_and_map(
+    realm: &crate::realm::Realm,
+    agent: &Agent,
+    is_generator: bool,
+    is_async: bool,
+) -> Option<(Handle<crux::JsObject>, Handle<crux::Map>)> {
+    let name = function_kind_prototype_intrinsic(is_generator, is_async);
+    let index = crate::realm::function_prototype_index(name);
+    if let Some(map) = agent.roots.function_empty_maps[index].get() {
+        let prototype = function_kind_prototype(realm, is_generator, is_async)?;
+        return Some((prototype, map));
+    }
+    let prototype = function_kind_prototype(realm, is_generator, is_async)?;
+    // Allocates, so it runs with no borrow of the roots held.
+    let map = crux::canonical_empty_map(Some(prototype));
+    agent.roots.function_empty_maps[index].set(Some(map));
+    Some((prototype, map))
 }
 
 /// FunctionBodyContainsUseStrict for a body block (spec 15.2.1).
@@ -2479,11 +2513,17 @@ fn instantiate_arrow_impl(
     // collection at `Function::new` cannot sweep the compiled body's literal
     // `Value`s while they are unrooted (GC-2, see `register_function`).
     // Cut 74: arrows are born with their [[Prototype]] intrinsic (%AsyncFunction
-    // for async arrows), skipping the trailing set_prototype_of.
-    let function = Function::new_with_prototype(
-        display.clone(),
-        function_kind_prototype(&realm, false, is_async),
-    );
+    // for async arrows), skipping the trailing set_prototype_of. The empty map
+    // is cached per kind, as in `register_function`.
+    let (prototype, empty_map) =
+        match function_kind_prototype_and_map(&realm, agent, false, is_async) {
+            Some(pair) => (Some(pair.0), Some(pair.1)),
+            None => (None, None),
+        };
+    let function = match empty_map {
+        Some(map) => Function::new_with_prototype_and_map(display.clone(), prototype, map),
+        None => Function::new_with_prototype(display.clone(), prototype),
+    };
     // The closure's [[Environment]] rides on the box as its GC edge, exactly as
     // in `register_function` (and with the same global-environment elision).
     if !environment.ptr_eq(realm.global_env) {

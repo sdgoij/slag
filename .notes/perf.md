@@ -18037,3 +18037,32 @@ the canonical empty map through a thread-local `Vec` scan per create
 `%Function.prototype%`, used with the existing
 `ordinary_object_create_with_map`, removes the TLS access, the `mark_prototype`
 call and the scan from every closure.
+
+### LANDED (2026-10-29): the function-kind empty map is cached per kind
+
+`Function::new_with_prototype` called `canonical_empty_map(Some(proto))` on
+every closure. Even on a cache hit that is a thread-local heap-cell access, a
+`mark_prototype` flag test and a linear scan of the empty-map `Vec`. A
+function's `[[Prototype]]` is one of six realm intrinsics, so the map the
+`ordinary_object_create` implied is constant per kind: it is now cached in
+`AgentRoots::function_empty_maps` (traced, so a collection between creates
+cannot free the shape) and the object is built on it with the existing
+`ordinary_object_create_with_map`. The first resolution still runs
+`mark_prototype` through `canonical_empty_map`, so the elements protector sees
+the link before any object can record a clean-chain verdict against it.
+
+Same-binary A/B, 7 (probe) and 5 (row) interleaved pairs, minima:
+
+| probe | before | after |
+| --- | ---: | ---: |
+| 300k closures, `--jitless` | 94.87 ms | **91.52 ms** (-3.5%) |
+| for-in head-let row | 755.3 ms | **746.0 ms** (-1.2%, faster in all 5 pairs) |
+
+Per closure that is about 11 ns of a ~290 ns create. Corpus `mean-jitGap`
+9.46 -> 9.36 over 77 rows, `mismatches=0`. The in-engine phase read
+(`function-object`) went 55.2 -> 49.4 raw ticks, i.e. the timer sees about 40%
+of the real move, consistent with its 2.4x compression.
+
+The remaining half of that phase is the allocation itself: `init_ordinary`
+writes every field of a ~528-byte `JsObject`, and the `Function` box is a
+second arena allocation. That is the structural item, not a scan.
