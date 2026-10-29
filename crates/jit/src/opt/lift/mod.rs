@@ -96,6 +96,17 @@ fn typer_reads_enabled() -> bool {
     }
 }
 
+/// Whether the typer's read guard also reaches a leaf body
+/// (`SLAG_TYPER_LEAF=1`). Off by default: a guard marks a body `deopts`, and
+/// every machine-code inline lane refuses such a callee, so the exemption is the
+/// price of leaf inlining. The seam exists because a leaf body whose only caller
+/// invokes it once pays that price for nothing.
+fn typer_reads_leaf_enabled() -> bool {
+    std::env::var("SLAG_TYPER_LEAF")
+        .map(|v| v != "0")
+        .unwrap_or(false)
+}
+
 /// Lift a certified body into the SSA IR (straight line and control flow,
 /// including loops).
 pub fn lift(body: &CompiledBody) -> Result<Function, Unsupported> {
@@ -106,7 +117,10 @@ pub fn lift(body: &CompiledBody) -> Result<Function, Unsupported> {
     // `s += new Item(i).sum()` is 1.5x slower in the opt tier with the guard,
     // the leaf lane falling to `call_slow`). Only a non-leaf body, which no
     // caller inlines, takes the guard.
-    lift_impl(body, typer_reads_enabled() && !body.leaf)
+    lift_impl(
+        body,
+        typer_reads_enabled() && (!body.leaf || typer_reads_leaf_enabled()),
+    )
 }
 
 /// [`lift`] with the typer's read guard forced on or off (tests).

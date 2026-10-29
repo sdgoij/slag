@@ -17766,3 +17766,62 @@ the increment to `Int` rather than relying on `normalize_param_types` to derive
 that from a seed `narrow` may have demoted. That is its own slice, with the
 `js_call` row as its falsifier (expect the in-place splice to then reach about
 0.3 ms, and `opt assemble failed` to disappear from `JIT_DUMP_CLIF`).
+
+## PROBE + NULL (2026-10-28): the element-read rows are a dependent-load chain, not a gate
+
+Attacking the `opcost` element/intrinsic rows (element_read 15.9x, element_write
+10.4x, obj_prop 28.3x, prim_prop 30.1x, array_at 55.1x) needed a decomposition
+first, so a scratch copy of the `element_read` workload was split three ways
+(100k iterations, one row per process):
+
+| loop body | ms | |
+|---|---:|---|
+| `s = (s + arr[k]) \| 0` (the row) | 0.655 | |
+| `s = (s + k) \| 0` (no element read) | 0.102 | arithmetic + counter + frame slot |
+| `s = (s + 1) \| 0` (a constant) | 0.063 | counter + frame slot only |
+
+So the arithmetic and the loop's own machinery are 0.06-0.10 ms of 0.655: **the
+`Op::ElementLoad` ladder is 5.5 ns of the 6.5 ns per iteration.** The ladder is
+`emit_dense_element_read` (`opt_lower.rs`): object tag test, `obj_ptr` compute,
+load `array_dense`, then the key gate, load `elem_len`, bounds, load `elem_ptr`,
+address, load the element, hole test. Four dependent L1 loads
+(`array_dense` -> `elem_ptr` -> element) plus a length load, 4-5 branches.
+V8 with PACKED_DOUBLE elements does elements-pointer -> element: 3 levels, no
+hole test and no element tag test, because elements-kind feedback supplies what
+we re-check per access. That is the whole gap, and none of it is a slicing
+target: matching it means hoisting the array descriptor (which is loop-invariant
+for a `var arr` read in a loop) and an element-kind proof.
+
+**NULL: the i32 element key.** The one part that looked removable was the
+canonical-index gate (`fcvt_to_uint_sat` + `fcvt_from_uint` + 2 `fcmp` + `band`),
+which exists because a key arrives as a `Value` word. `narrow` drops an int32's
+proof when its only use is a key (`restrict_int_to_arith_use` treats a key as a
+"boundary" use), so the index is always a double. Keeping the proof and taking
+the raw i32 in the dense arms (an unsigned widening makes a negative index out of
+range, so the bound check still rejects it) is sound and was implemented both
+halves. Measured with `SLAG_INT_KEY=0` as the seam, 5 rounds each:
+`element_read` 0.628-0.654 on vs 0.622-0.655 off, `element_write` 0.377-0.399 vs
+0.377-0.399, `dyn_key_read` 0.865-0.903 vs 0.863-0.910, `array_at` 1.070-1.122 vs
+1.073-1.134. Every row is inside its own noise: **the gate is not where the time
+is.** Reverted.
+
+Two findings worth keeping from the attempt:
+
+- `Type::Int` in this IR is ambiguous — sometimes an i32 register, sometimes a
+  `Value` word merely *known* to hold an int32 (the `narrow` slot proof types a
+  `FrameLoad` that way). Keying a lowering decision on it produced
+  `uextend.i64 <i64>` and "jit codegen error: Verifier(...)" on every
+  typed-array fill. The register class must be read from the CLIF value
+  (`builder.func.dfg.value_type(v) == types::I32`), which is exact.
+- The register body's member-read arms (`LeafOp::GetMemberNameLocal`,
+  `LeafOp::GetMemberComputedLocal`) never apply the typer's read guard, and
+  cannot: a deopt inside a register run resumes at the run's start step, so the
+  guard would re-execute the run's side effects. So the register-lane rows
+  (`obj_prop`, `prim_prop`, `element_write`) get no value typing at all, which is
+  why they sit at 28-30x.
+
+**The leaf exemption is worth keeping, measured.** `SLAG_TYPER_LEAF=1` (the new
+seam that lets the typer's read guard reach a leaf body) changes the IR of
+exactly one corpus row and costs `calls/construct_churn` **58 -> 110 ms**: a
+guard marks a body `deopts`, and every machine-code inline lane refuses such a
+callee. The exemption stays; the seam stays as its test.

@@ -63,6 +63,8 @@ Never measure a binary you cannot tie to the source you are reading. See
 | `SLAG_OPT=0` | the optimizing tier; the body runs the per-step (baseline) tier |
 | `SLAG_TYPER=0` | the typer's read guard (`Op::GuardType` on a read) |
 | `SLAG_GUARD=0` | the guard-pruning pass (`opt/pass/guard.rs`) |
+| `SLAG_INT_KEY=0` | an element key keeping its int32 proof (a wash; kept as a seam) |
+| `SLAG_TYPER_LEAF=1` | the typer's read guard reaching a leaf body (off: it costs leaf inlining) |
 | `SLAG_INLINE=0` | the trial-inline splice (on by default) |
 | `SLAG_INLINE_CREATED=0` | only the static route (a callee the body itself creates) |
 | `SLAG_RETYPE_INLINED=0` | the `normalize`/`narrow`/`mem2reg` re-run after `inline` |
@@ -293,6 +295,8 @@ in the corpus.
 | Inline prototype-chain probe | 5-10% slower than the helper; reverted |
 | Inline `LeafCallFill` | null; reverted |
 | Re-type after inlining (`scalarized || inlined`) | +0.71% when measured (2026-10-27); SUPERSEDED — inlining fired on almost no body then, so it measured noise. Landed 2026-10-28 with the static splice, where it is -17% on the row it reaches |
+| i32 element key (keep the index's int32 proof, skip the `ToUint64Sat` gate) | sound and implemented, but inside the noise on every row it touches (`element_read`, `element_write`, `dyn_key_read`, `array_at`); the ladder's dependent-load chain dominates, not the gate |
+| Typer read guard on a leaf body (`SLAG_TYPER_LEAF`) | `calls/construct_churn` 58 -> 110 ms: a guard marks the body `deopts` and the leaf-inline lane refuses it |
 | Rank a function by `sum(blocks)` | method error, not a change; divide by the entry block first |
 
 ## 6. How to choose the next target
@@ -331,7 +335,17 @@ needs its own per-row measurement.
 - **The spliced region's block split.** A splice at a call inside a loop leaves
   the callee in its own block pair and canonicalizes the raw-f64 result per
   iteration (`Canon`), which is most of the remaining 5.3 ns on `js_call`.
-- **Type a function's parameters at the call site.** The row that is left keeps a
+- **The element rows need a hoisted array descriptor, not a cheaper gate.** The
+  `opcost` element/property rows decompose to 5.5 ns of 6.5 in
+  `emit_dense_element_read`'s ladder (four dependent L1 loads: `array_dense` ->
+  `elem_ptr` -> element). The key gate is a wash to remove (2026-10-28). Matching
+  V8 needs the descriptor hoisted out of the loop and an element-kind proof, both
+  of which are subsystems.
+- **The register-lane rows cannot be typed at all.** A deopt inside a register run
+  resumes at the run's start, so the typer's read guard cannot be used in
+  `LeafOp::GetMemberNameLocal`/`GetMemberComputedLocal`; that is why `obj_prop`,
+  `prim_prop` and `element_write` sit at 28-30x with no value typing.
+- **A function's parameters at the call site.** The row that is left keeps a
   tag check and a `Canon` per iteration only because the loop bound is a
   parameter typed `Unknown`; the lattice now honours a declared numeric type, so
   the missing half is proving one at entry. This is the widest remaining lever:
