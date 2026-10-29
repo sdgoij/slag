@@ -17825,3 +17825,42 @@ seam that lets the typer's read guard reach a leaf body) changes the IR of
 exactly one corpus row and costs `calls/construct_churn` **58 -> 110 ms**: a
 guard marks a body `deopts`, and every machine-code inline lane refuses such a
 callee. The exemption stays; the seam stays as its test.
+
+## NULL (2026-10-28): "type the counter cycle" is not expressible, and in-place splicing loses twice
+
+Two attempts from the same follow-up.
+
+**NULL 1: `loop_counter` typing the cycle it proved.** The idea: after proving the
+counter int32, set the parameter and the seed constant to `Type::Int` so
+`normalize_param_types` could not widen them back to `Number`, and refuse the
+fusion when a use needs a `Value` word (a key, a call argument, a return). It
+works structurally — the typed-array `fill` body that produced "jit codegen
+error: Verifier(...)" now assembles — but the use rule rejects a fusion that was
+previously *correct*: `opcost/element_write` (`arr[k] = i`, the counter stored as
+an element value) went **0.375 -> 0.45 ms (+20%)**, in every round of both
+binaries, because the counter lost its int cycle and `unbox` put it in a raw f64
+register with two `Canon`s per iteration. Corpus total otherwise flat. Reverted.
+
+**The finding behind it.** `Type::Int` on a *block parameter* does not make it an
+i32 register: block parameters are `i64` in CLIF, so the annotation only means
+"the `Value` word is known to hold an int32". That is why `uextend.i64 <i64>`
+fired when I read the type to decide the key register class, and why typing a
+param or a seed cannot move a counter into an i32 register at all. Only a
+*producing instruction* (`IntAdd`, a bit op with an int result, `Const` with an
+`Imm::Int`) yields an i32 CLIF value. So the counter's int cycle is decided by
+which instructions produce it, not by the types on it — and the only lever that
+changes the producers is `loop_counter` itself, which is already fusing them.
+The remaining risk (the seed's `Const` staying `Number` while the param gets
+`Int`) is what the "narrow then promote, once" ordering avoids, which is why the
+re-type split in `pass/mod.rs` is the actual guard.
+
+**NULL 2: in-place splicing, for a second reason.** Re-tried on top of the
+`loop_counter` change (so the counter cycle was valid): `opcost/js_call`
+**0.577 ms against 0.510** for the block-splitting splice, with no codegen
+error. The in-place IR keeps the accumulator and the `|0` in `Number` words
+(`b1(v25:int, v31:num)`, `v15:num = BitOr(...)`) where the block-splitting CFG
+promotes them to i32 in the continuation (`v32:int`, `v15:int`) — the block
+boundary is what gives `narrow`/`mem2reg` a parameter whose declared type it can
+derive from a single incoming value. Removing the block removes that, and the
+`Canon` per iteration comes back. Reverted; the continuation block is load
+bearing, not overhead.
