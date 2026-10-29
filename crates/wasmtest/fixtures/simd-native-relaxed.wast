@@ -19,6 +19,12 @@
     (local $hi v128)
     (local $kd v128)
     (local $dhi v128)
+    (local $m2 v128)
+    (local $mh v128)
+    (local $mk v128)
+    (local $m2d v128)
+    (local $mhd v128)
+    (local $mkd v128)
     (local.set $f (v128.const f32x4 1.5 2.5 3.5 4.5))
     (local.set $d (v128.const f64x2 1.5 2.5))
     (local.set $s (v128.const i8x16 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15))
@@ -28,10 +34,22 @@
     (local.set $hi (v128.const f32x4 1024.0 1024.0 1024.0 1024.0))
     (local.set $kd (v128.const f64x2 1.0 2.0))
     (local.set $dhi (v128.const f64x2 1024.0 1024.0))
+    (local.set $m2 (v128.const f32x4 2.0 2.0 2.0 2.0))
+    (local.set $mh (v128.const f32x4 0.5 0.5 0.5 0.5))
+    (local.set $mk (v128.const f32x4 1024.0 1024.0 1024.0 1024.0))
+    (local.set $m2d (v128.const f64x2 2.0 2.0))
+    (local.set $mhd (v128.const f64x2 0.5 0.5))
+    (local.set $mkd (v128.const f64x2 1024.0 1024.0))
     (loop $l
       (local.set $f
         (f32x4.add (local.get $f) (f32x4.splat (f32.const 0.5))))
       (local.set $f (f32x4.min (local.get $f) (local.get $hi)))
+      ;; madd/nmadd: every product and sum here is exact, so the fused and
+      ;; two-rounding behaviours coincide and the value is engine-independent.
+      (local.set $f
+        (f32x4.relaxed_madd (local.get $f) (local.get $m2) (local.get $mh)))
+      (local.set $f
+        (f32x4.relaxed_nmadd (local.get $f) (local.get $mh) (local.get $mk)))
       (local.set $f (i32x4.relaxed_trunc_f32x4_s (local.get $f)))
       (local.set $f (f32x4.convert_i32x4_s (local.get $f)))
       (local.set $f (i32x4.relaxed_trunc_f32x4_u (local.get $f)))
@@ -43,6 +61,10 @@
       (local.set $d
         (f64x2.add (local.get $d) (f64x2.splat (f64.const 0.5))))
       (local.set $d (f64x2.min (local.get $d) (local.get $dhi)))
+      (local.set $d
+        (f64x2.relaxed_madd (local.get $d) (local.get $m2d) (local.get $mhd)))
+      (local.set $d
+        (f64x2.relaxed_nmadd (local.get $d) (local.get $mhd) (local.get $mkd)))
       (local.set $d (i32x4.relaxed_trunc_f64x2_s_zero (local.get $d)))
       (local.set $d (f64x2.convert_low_i32x4_s (local.get $d)))
       (local.set $d (i32x4.relaxed_trunc_f64x2_u_zero (local.get $d)))

@@ -220,6 +220,7 @@ pub fn relaxed_arity(sub: u16) -> u8 {
 /// two-rounding multiply-then-add, and the dot products multiply signed
 /// i8 lanes (accumulating to i16 with saturation / wrapping i32).
 pub fn exec_relaxed(sub: u16, a: u128, b: Option<u128>, c: Option<u128>) -> Option<u128> {
+    use crate::values::{canon32, canon64};
     match sub {
         0x100 => exec_binop(0x0e, a, b?),
         0x101 => exec_conversion(0xf8, a),
@@ -237,24 +238,24 @@ pub fn exec_relaxed(sub: u16, a: u128, b: Option<u128>, c: Option<u128>) -> Opti
             let c = c?;
             let mut out = 0u128;
             for i in 0..(16 / size) {
-                let lane = |v: u128| -> (u64, f64) {
-                    if size == 4 {
-                        let bits = lane_bits(v, i, size) as u32;
-                        (u64::from(bits), f64::from(f32::from_bits(bits)))
-                    } else {
-                        let bits = lane_bits(v, i, size);
-                        (bits, f64::from_bits(bits))
-                    }
-                };
-                let (_, x) = lane(a);
-                let (_, y) = lane(b);
-                let (_, z) = lane(c);
-                let product = x * y;
-                let result = if nmadd { z - product } else { product + z };
+                // Two roundings: the product is rounded to the lane width
+                // before the add. The spec allows this instead of a fused
+                // multiply-add, and it is what the compiled path's `fmul` then
+                // `fadd` produces, so both paths agree bit for bit.
                 let bits = if size == 4 {
-                    u64::from((result as f32).to_bits())
+                    let x = f32::from_bits(lane_bits(a, i, size) as u32);
+                    let y = f32::from_bits(lane_bits(b, i, size) as u32);
+                    let z = f32::from_bits(lane_bits(c, i, size) as u32);
+                    let product = x * y;
+                    let result = if nmadd { z - product } else { product + z };
+                    u64::from(canon32(result.to_bits()))
                 } else {
-                    result.to_bits()
+                    let x = f64::from_bits(lane_bits(a, i, size));
+                    let y = f64::from_bits(lane_bits(b, i, size));
+                    let z = f64::from_bits(lane_bits(c, i, size));
+                    let product = x * y;
+                    let result = if nmadd { z - product } else { product + z };
+                    canon64(result.to_bits())
                 };
                 out = set_lane(out, i, size, bits);
             }

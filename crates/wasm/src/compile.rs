@@ -5830,9 +5830,8 @@ impl<'a> Lowerer<'a> {
     }
 
     /// The relaxed ops whose deterministic choice is one of the lowerings this
-    /// file already has. The rest stay on the helper: the interpreter computes
-    /// madd/nmadd in f64 and rounds once (not `fmul` then `fadd`), and q15mulr
-    /// and the dot products have no Cranelift instruction.
+    /// file already has. The rest stay on the helper: q15mulr and the dot
+    /// products have no Cranelift instruction.
     fn native_relaxed(&mut self, sub: u16, slots: &[ClifValue]) -> Option<ClifValue> {
         // `slots` is top-of-stack first: c, b, a for arity 3; b, a for 2; a for 1.
         match sub {
@@ -5860,6 +5859,27 @@ impl<'a> Lowerer<'a> {
             0x10e => self.native_float_arith(0xe9, *slots.get(1)?, *slots.first()?),
             0x10f => self.native_float_arith(0xf4, *slots.get(1)?, *slots.first()?),
             0x110 => self.native_float_arith(0xf5, *slots.get(1)?, *slots.first()?),
+            // relaxed_madd/nmadd: two-rounding multiply-then-add, which is the
+            // interpreter's chosen behaviour (the spec allows either that or a
+            // fused multiply-add).
+            0x105..=0x108 => {
+                let ty = if matches!(sub, 0x105 | 0x106) {
+                    types::F32X4
+                } else {
+                    types::F64X2
+                };
+                let a = self.bitcast_lanes(ty, *slots.get(2)?);
+                let b = self.bitcast_lanes(ty, *slots.get(1)?);
+                let c = self.bitcast_lanes(ty, *slots.first()?);
+                let product = self.builder.ins().fmul(a, b);
+                let sum = if matches!(sub, 0x106 | 0x108) {
+                    self.builder.ins().fsub(c, product)
+                } else {
+                    self.builder.ins().fadd(product, c)
+                };
+                let out = self.canonical_float(ty, sum);
+                Some(self.bitcast_lanes(types::I128, out))
+            }
             _ => None,
         }
     }
@@ -13636,12 +13656,13 @@ mod tests {
     #[test]
     fn v128_native_relaxed_matches_the_interpreter() {
         // The relaxed ops whose deterministic interpreter choice is one of the
-        // lowerings above: swizzle, the four trunc forms, laneselect, and
-        // min/max. madd/nmadd, q15mulr and the dot products stay on the helper.
+        // lowerings above: swizzle, the four trunc forms, madd/nmadd (the
+        // two-rounding choice), laneselect, and min/max. q15mulr and the dot
+        // products stay on the helper.
         let v128 = ValType::V128;
         let unops: [u16; 4] = [0x101, 0x102, 0x103, 0x104];
         let binops: [u16; 5] = [0x100, 0x10d, 0x10e, 0x10f, 0x110];
-        let ternops: [u16; 4] = [0x109, 0x10a, 0x10b, 0x10c];
+        let ternops: [u16; 8] = [0x105, 0x106, 0x107, 0x108, 0x109, 0x10a, 0x10b, 0x10c];
         let mut functions: Vec<u32> = vec![0; unops.len()];
         functions.extend(std::iter::repeat_n(1, binops.len()));
         functions.extend(std::iter::repeat_n(2, ternops.len()));
@@ -13738,6 +13759,28 @@ mod tests {
             (source, reverse, u128::MAX),
             (source, reverse, 0u128),
             (u128::MAX, 0u128, lanes_f32x4([1.0, -1.0, 0.0, -0.0])),
+            // madd/nmadd operands, including the pair whose two-rounding and
+            // fused results differ, plus NaN and infinities.
+            (
+                lanes_f32x4([f32::from_bits(0x3f80_0002), 1.5, -2.0, 0.0]),
+                lanes_f32x4([f32::from_bits(0x3f80_0100), 2.0, 0.5, -0.0]),
+                lanes_f32x4([f32::from_bits(0xbf80_0102), 0.5, -0.5, 0.0]),
+            ),
+            (
+                lanes_f64x2([f64::from_bits(0x3ff0_0000_0040_0000), 1.5]),
+                lanes_f64x2([f64::from_bits(0x3ff0_0000_2000_0000), 2.0]),
+                lanes_f64x2([f64::from_bits(0xbff0_0000_2040_0000), 0.5]),
+            ),
+            (
+                lanes_f32x4([f32::NAN, f32::INFINITY, f32::NEG_INFINITY, 1.0]),
+                lanes_f32x4([1.0, 2.0, 3.0, 4.0]),
+                lanes_f32x4([0.5, 0.5, 0.5, 0.5]),
+            ),
+            (
+                lanes_f64x2([f64::NAN, f64::INFINITY]),
+                lanes_f64x2([2.0, 2.0]),
+                lanes_f64x2([0.5, f64::NEG_INFINITY]),
+            ),
         ];
         let cases: Vec<Vec<Value>> = tern_cases
             .iter()
@@ -13746,6 +13789,46 @@ mod tests {
         for index in unops.len() + binops.len()..unops.len() + binops.len() + ternops.len() {
             assert_equiv(&module, index, &cases);
         }
+
+        // Pin the chosen behaviour: two roundings, not a fused multiply-add.
+        // This operands triple gives 0 unfused and 2^-37 fused, so the bit
+        // pattern records which way the interpreter and the lowerer both go.
+        let pinned = Module {
+            types: vec![SubType::func(vec![v128, v128, v128], vec![v128])],
+            functions: vec![0],
+            bodies: vec![FuncBody {
+                locals: vec![],
+                body: vec![
+                    Instr::LocalGet(0),
+                    Instr::LocalGet(1),
+                    Instr::LocalGet(2),
+                    Instr::Vec(0x105),
+                ],
+            }],
+            ..Module::default()
+        };
+        let args = [
+            Value::v128(lanes_f32x4([
+                f32::from_bits(0x3f80_0002),
+                f32::from_bits(0x3f80_0002),
+                f32::from_bits(0x3f80_0002),
+                f32::from_bits(0x3f80_0002),
+            ])),
+            Value::v128(lanes_f32x4([
+                f32::from_bits(0x3f80_0100),
+                f32::from_bits(0x3f80_0100),
+                f32::from_bits(0x3f80_0100),
+                f32::from_bits(0x3f80_0100),
+            ])),
+            Value::v128(lanes_f32x4([
+                f32::from_bits(0xbf80_0102),
+                f32::from_bits(0xbf80_0102),
+                f32::from_bits(0xbf80_0102),
+                f32::from_bits(0xbf80_0102),
+            ])),
+        ];
+        let results = invoke(&pinned, &args).expect("madd invokes");
+        assert_eq!(results, vec![Value::v128(0)]);
     }
 
     #[test]

@@ -19110,3 +19110,69 @@ clippy, `cargo fmt --check` clean.
 What is still on the helper: `i8x16.popcnt`, `i16x8.q15mulr_sat_s`,
 `i32x4.dot_i16x8_s`, the `extadd_pairwise` forms, and the relaxed
 madd/nmadd/q15mulr/dot set.
+
+## DECIDED + LANDED (2026-10-29, same day): relaxed madd/nmadd go two-rounding, 8.2x
+
+`relaxed_madd`/`relaxed_nmadd` may be computed fused or with two roundings; the
+spec accepts either. The interpreter computed them in **f64** and rounded once,
+which is neither: for `f32` lanes it behaves like a fused multiply-add with an
+extra-wide intermediate. No `fmul` then `fadd` can match that bit for bit, so a
+native lowering and the interpreter could not agree without a decision.
+
+**The decision:** two roundings, meaning the product is rounded to the lane
+width before the add. That is an allowed result, it matches what the hardware
+`mul` plus `add` produce, and it lets both paths be the same two instructions.
+The interpreter (`simd.rs::exec_relaxed`) now does the arithmetic in the lane's
+own width and canonicalizes with `canon32`/`canon64`; the compiled path emits
+`fmul` then `fadd` (or `fsub` for nmadd) and canonicalizes with the same
+helper as the rest of the float family.
+
+The corpus cannot tell the two choices apart: `relaxed_madd_nmadd.wast` wraps
+its expectations in `either(...)` and its `_cmp` cases only check determinism.
+So the choice is pinned in a unit test instead:
+`v128_native_relaxed_matches_the_interpreter` asserts the exact bits for the
+classic distinguishing triple (`x = 1 + 2^-22`, `y = 1 + 2^-15`,
+`z = -(1 + 2^-15 + 2^-22)`), which is `0` with two roundings and `2^-37`
+when fused. That assertion is what stops a future tightening from silently
+changing the answer.
+
+**Fixtures.** `simd-native-madd.wast`, added to the relaxed probe as well, and
+parameterised so every product and sum is exact (a factor of two, a half, or a
+quarter) and therefore identical under either behaviour. That keeps the Node
+comparison meaningful even though V8 may choose fused: expected `-2142240768`
+from Node v24.12.0, and the combined relaxed probe keeps its `-2147483633`.
+
+| row | compiled | helper | interpreter |
+|---|---|---|---|
+| simd-madd (isolated) | **28.34** | 231.65 | 887.88 |
+| simd-relaxed (all 14 ops) | **73.55** | 788.39 | 2416.29 |
+| simd-int (re-run) | 58.15 | 1851.17 | 3720.82 |
+| simd-convert (re-run) | 49.10 | 768.15 | 1810.69 |
+| simd-unop (re-run) | 63.21 | 1353.64 | 2949.12 |
+| simd-float (re-run) | 55.50 | 1036.07 | 2511.85 |
+| simd-native integer (re-run) | 32.53 | 216.57 | 1037.40 |
+| simd-loop control | 12.22 | - | - |
+| leaf-loop control | 13.69 | - | - |
+
+Same-binary A/B: **28.34 vs 231.65 ms, 8.2x** for the isolated madd pair, and
+the combined relaxed row at 10.7x. The smallest of the seven ratios, which is
+what the dependency chain predicts: the four madd ops sit on a serial
+accumulator, so the native form adds `fmul`, `fadd` and a compare/select of
+latency where the helper added a call.
+
+**A caveat worth recording:** adding the four madd ops to the relaxed probe
+moved that row from ~60 ms to ~74 ms compiled (helper ~718 to ~788). The
+compiled path grew more than the helper because the row is latency-bound, not
+throughput-bound; the isolated row is the per-op number and it is 8.2x ahead.
+Reading the mixed row as a per-op cost would understate the win.
+
+**Gates.** `equiv waspec/test/core` → 254 suites, 0 diverged, 8264/8264
+functions compiled; `simd` → 59 suites, 0 diverged; `relaxed-simd` → 7 suites,
+0 diverged with the new interpreter behaviour. `cargo test -p wasm --features
+compile --lib` (130), `-p wasm --lib` (44), workspace clippy, `cargo fmt
+--check` clean.
+
+What is still on the helper: `i8x16.popcnt`, `i16x8.q15mulr_sat_s`,
+`i32x4.dot_i16x8_s`, the `extadd_pairwise` forms, and relaxed q15mulr and the
+dot products. Each of those has no Cranelift instruction, so closing them means
+hand-built sequences rather than a lowering.

@@ -838,11 +838,11 @@ fn f64_binop(operands: &[Value], f: impl Fn(f64, f64) -> f64) -> Result<Value, T
 
 // ---- NaN policy ----
 
-fn canon32(bits: u32) -> u32 {
+pub(crate) fn canon32(bits: u32) -> u32 {
     if is_nan32(bits) { QNAN32 } else { bits }
 }
 
-fn canon64(bits: u64) -> u64 {
+pub(crate) fn canon64(bits: u64) -> u64 {
     if is_nan64(bits) { QNAN64 } else { bits }
 }
 

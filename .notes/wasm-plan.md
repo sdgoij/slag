@@ -2900,26 +2900,33 @@ splat/replace, `any_true`/`all_true`, `bitmask`, and `bitselect`, plus the
 whole `f32x4`/`f64x2` family (add/sub/mul/div, min/max, pmin/pmax, and the
 unary `abs`/`neg`/`sqrt`/rounding forms), `i8x16.swizzle`, the ten
 conversion opcodes, the integer min/max, saturating add/sub, average, narrow,
-extend and extmul families, and the relaxed ops whose deterministic choice is
-one of those, with
-the interpreter's canonical-NaN policy reproduced explicitly. Measured on
+extend and extmul families, and relaxed swizzle, trunc, laneselect, min/max and
+madd/nmadd, with
+the interpreter's canonical-NaN policy reproduced explicitly. The relaxed
+multiply-adds needed a semantic decision first: the interpreter computed them
+in `f64` and rounded once, which no native `fmul`+`fadd` can match, so it now
+uses the spec's two-rounding choice and both paths are the same two
+instructions. Measured on
 `crates/wasmtest/fixtures/simd-native-loop.wast`, `simd-native-float.wast`,
-`simd-native-unop.wast`, `simd-native-convert.wast`, `simd-native-int.wast`
-and `simd-native-relaxed.wast`, same binary, seven interleaved rounds:
-**32.98 ms against 220.64 ms on the helper path (6.7x)** for the integer mix,
-**56.27 ms against 1002.58 ms (17.8x)** for the float arithmetic mix,
-**63.90 ms against 1353.41 ms (21.2x)** for the unop/swizzle mix,
-**49.49 ms against 815.51 ms (16.5x)** for the conversion mix,
-**58.64 ms against 1858.00 ms (31.7x)** for the integer group mix, and
-**60.08 ms against 717.94 ms (11.9x)** for the relaxed mix, with
+`simd-native-unop.wast`, `simd-native-convert.wast`, `simd-native-int.wast`,
+`simd-native-relaxed.wast` and `simd-native-madd.wast`, same binary, seven
+interleaved rounds:
+**32.53 ms against 216.57 ms on the helper path (6.7x)** for the integer mix,
+**55.50 ms against 1036.07 ms (18.7x)** for the float arithmetic mix,
+**63.21 ms against 1353.64 ms (21.4x)** for the unop/swizzle mix,
+**49.10 ms against 768.15 ms (15.6x)** for the conversion mix,
+**58.15 ms against 1851.17 ms (31.8x)** for the integer group mix,
+**73.55 ms against 788.39 ms (10.7x)** for the relaxed mix, and
+**28.34 ms against 231.65 ms (8.2x)** for the isolated madd pair, with
 `simd-loop` and `leaf-loop` controls flat. The carrier stays `I128` as point 2
 predicted; the win is entirely per-op instructions. Details, including the
 `shr_s`/`shr_u` table swap the corpus caught, the NaN-canonicalization rules,
 and the demote/promote asymmetry, are in `.notes/perf.md`.
 
 Still on the helper after this cut: `i8x16.popcnt`, `i16x8.q15mulr_sat_s`,
-`i32x4.dot_i16x8_s`, the `extadd_pairwise` forms, and the relaxed
-madd/nmadd/q15mulr/dot set.
+`i32x4.dot_i16x8_s`, the `extadd_pairwise` forms, and relaxed q15mulr and the
+dot products. Each has no Cranelift instruction, so closing them means
+hand-built sequences rather than a lowering.
 
 ### 10.4 Outside wasm (for completeness)
 
