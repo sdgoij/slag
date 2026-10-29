@@ -18181,3 +18181,38 @@ Gates: `cargo fmt --all -- --check`; `cargo clippy --workspace --all-targets -- 
 **Item 2 of the previous note stands and is now the larger half:** a branching
 leaf body is a *step-path* leaf, not a register leaf, which is the 92 -> 301 ns
 per-call figure in the interpreter. That is untouched here.
+
+## NULL (2026-10-29): whole-body register segmentation is not a drop-in
+
+A branching leaf body (`add(a,b){ if (a===b) throw ...; return a+b }`) is a
+*step-path* leaf, not a register leaf, because `lower_leaf_ops` accepts only
+left-leaning straight-line shapes. That is the 92 -> 301 ns per-call figure in
+the interpreter (see the 2026-10-29 row decomposition above).
+
+The tempting shortcut is to reuse the machinery that already exists:
+`lower_leaf_ops_segmented` + `apply_register_runs` split a *loop body* into
+maximal straight-line runs, each replaced by one `Step::RunRegBody`. Extending
+that to the whole body when `leaf_ops` is `None` looked additive (compute
+`leaf_ops` first, so a body that already has the whole-body form keeps it, and
+move `declared_calls` after the collapse so its step indices are the final
+ones; the per-loop call already runs during `compile_statements`, before
+`declared_calls` is computed).
+
+It compiles and it is **wrong**: the corpus probe dies with
+`TypeError: Uncaught exception`, i.e. a step read a stack slot the run never
+left. `lower_leaf_ops_segmented`'s accept rules are written for a loop body,
+where the runs are bracketed by loop machinery; over a whole function body a
+run can absorb steps whose value-stack effect the surrounding step-path code
+still depends on (a statement completion, a `Push` feeding a non-lowerable
+step). Reverted; the tree is unchanged.
+
+**What the next attempt needs.** Either restate the run invariant for a whole
+body — a run may only absorb a step sequence that leaves the value stack
+exactly as those steps would — or teach the register *leaf* executor to branch
+(`LeafOp::Jump`/`JumpIfFalse` with op-index targets, patched from a
+step->op map, only when the shadow stack is empty at the branch and the target
+step emits an op). The second is the design the skill's mirror list already
+describes and costs the full seven-place `LeafOp` mirror; the first is cheaper
+only if the invariant holds, which is what this attempt assumed and did not
+prove. Measure before building either: the win is interpreter-only
+(`leaf_ops` feeds the interpreter's leaf lanes; the JIT compiles steps).
