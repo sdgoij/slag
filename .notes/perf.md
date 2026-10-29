@@ -18720,3 +18720,103 @@ absolute levels vary; the paired delta is the reading) and `spread_assign`
 -8.2%. The define probe is -15.5% over the same range. Nothing is left to
 reclaim here by trimming: the remaining define cost is the runtime helper round
 trip, so the next step in this area is a machine-code define, not another scan.
+
+## PROFILE (2026-10-29): the two remaining big blocks, priced and reasoned
+
+Both were followed up as asked; the answer for both is "the mechanism is known
+and it is not a cheap slice". Numbers first, then the reasoning, because the
+reasoning is what saves the next session.
+
+### `runtime::function` on the #1 row (12.3% of the row)
+
+`SLAG_SAMPLE=50`, the row alone (544 ms under the sampler, so shares are
+slightly inflated toward sampling overhead):
+
+| share | entry | what it is |
+| ---: | --- | --- |
+| 7.23% | `local near runtime::function::is_constructor` (0x140a3fa70, 4232 B) | **`register_function`** |
+| 2.31% | `instantiate_function_with_resolved_source` | the statement/expression form's prelude |
+| 1.32% | `local near instantiate_dynamic_function` | its prelude |
+| 0.73% | `owning_realm` | per-create realm resolution |
+| 0.37% | `shared_accessor_body` | |
+
+The 4232-byte anonymous function was identified by its callees
+(`Gc::new`, `JsObject::define_fresh`, four `Rc::drop_slow` sites,
+`drop_in_place<JsString>`, `raw_vec::handle_error`), which is the closure
+record build: allocate the function object, define the boilerplate
+properties, drop the shared inputs.
+
+**Reachable? No new lever.** This is the same mechanism the project has
+attacked four times: record size 200 -> 152 (flat), boxing the record into the
+arena (+70%, then +80.6%), `IdMap<Handle<EcmaFunction>>` (+80.6%), Stage D
+twice. The profile shows *what* it spends the time on (a `Gc::new` plus the
+boilerplate defines) and nothing about *how* to make it cheaper that the
+earlier measurements did not already rule out. The four `Rc::drop_slow` call
+sites in its callee list are not evidence of churn: the sampler recorded no
+samples in `drop_slow`, so those are cold arms, not per-create frees.
+
+### `runtime::jit::call_slow` (56.6% of `calls/recursive_fib`)
+
+`SLAG_SAMPLE=50`, the row alone: **56.6% `call_slow`, 9.7% `load_context`**,
+29.1% compiled code, and essentially nothing else. The row is ~1.3M recursive
+calls in 60 ms, so **~46 ns per call**, of which ~26 ns is the self-call lane
+and ~4 ns is a second helper (`load_context`, because `fib` reads its own name
+from the enclosing function's scope) — against node's ~5 ns per call.
+
+`self_call_inline` per call does, in order: four guards; `save_scratch` (a
+17-field `VmScratch`); `vm.stack.resize(base + buf_len, Undefined)` (a ~25-slot
+memset, `JIT_STACK_SLACK` 16 + `JIT_INLINE_HEADROOM` 4 + frame);
+`vm.stack.reserve`; the frame fill; `install_nested_frame`; `jit_depth += 1`;
+the indirect entry call; and the same restores. Every one of those is
+load-bearing: the scratch fields are what a caller mid-`switch`, mid-append or
+mid-deopt would have read by the nested body, the memset is what keeps
+`vm.stack` a valid root array for the conservative scan, and the nested frame
+is what a helper's `frame_get` addresses.
+
+**So the only real lever is to stop calling a helper at all** — a native
+self-call: the compiled body calls its own entry with a freshly carved frame
+and a depth guard, exactly as V8 does. That needs `vm.stack`'s ptr/len/cap in
+the ctx so machine code can bump the length, plus an inline frame fill, the
+depth check, and the write-back. It is a frame-protocol change, not a slice,
+and its ceiling is `recursive_fib`'s 41.7 ms of recoverable time — about **1%
+of the corpus**. Priced at that, it is the wrong next investment.
+
+### What this says to do instead
+
+The corpus self-time map is flat (no function over 2.2%), the two biggest
+recoverable rows are 30% of the total, and after today's define work the #1
+row's remaining mass is: 16.9% compiled code, 14.5% JIT helpers, 13.1%
+`runtime::ir`, 12.3% closure creation, 7.4% heap (of which 4.8% is
+`core::slice::sort` — the GC's sorted live-set search, not user sorting).
+Four of those five need structural work. The one that does not is the GC's
+live-set lookup, which is a *sort plus binary search per allocation* and shows
+up as `heapsort` in every allocation-heavy row; that is the next thing to
+price.
+
+### NULL (2026-10-29): skipping the major GC's dead set does not pay, and that is the finding
+
+The `heapsort` in the #1 row (4.78%) is `dead.sort_unstable()` in the
+collector. The sweep itself never reads that list — it re-walks the arena on
+mark bits — so the list exists only for the GC-4 compaction hook, and the major
+path built it (a full `for_each_live` walk plus a sort) even when the hook was
+the no-op the agent passes when `has_weak_structures()` is false. Gating it on
+`precise`, which is exactly the caller's request for the set, looked like free
+money.
+
+Measured: **corpus 1887.5 -> 1906.5 (+1.01%)**, re-run **1892.8 -> 1896.6
+(+0.20%)** — a wash at best, and the #1 row (where the 4.78% lived) moved only
+-1.91% on its own. Reverted.
+
+**Why it could not have worked: `precise` is effectively always true.** The
+agent passes `has_weak` for it, and `has_weak_structures()` counts
+`stack_traces` — which any `Error` construction populates. So the dead set is
+built on essentially every major collection of a real run, the gate never
+fires, and the flat measurement is the gate not firing rather than the work not
+mattering. The lead that remains is upstream of this: make a transient stack
+trace not force a precise dead set, which is a GC-semantics question (what a
+stale stack word may keep alive), not a slice — and the minor path's own skip
+(31% of a pause, recorded in its comment) suggests it is worth asking.
+
+**Correction to the note above:** the suggestion that `heapsort` is "a sort plus
+binary search per allocation" was wrong and is replaced by what is written
+here: it is the collector's dead-set sort, at most once per collection.
