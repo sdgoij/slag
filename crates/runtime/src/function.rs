@@ -245,7 +245,6 @@ pub type PerIterationChain = CaptureChain<(Vec<crux::AtomId>, usize)>;
 /// registered per function object.
 #[derive(Debug, Clone)]
 pub struct EcmaFunction {
-    pub name: Option<JsString>,
     /// Cut 64: the site's params, shared across every closure from the same
     /// declaration site (`shared_params`, keyed by the shared body `Rc`)
     /// — instantiating a closure in a loop no longer deep-clones the param
@@ -359,7 +358,6 @@ pub struct EcmaFunction {
 
 impl Trace for EcmaFunction {
     fn trace(&self, visit: &mut dyn FnMut(GcAny)) {
-        self.name.trace(visit);
         // The realm box needs no edge here: `Agent::realms` holds every realm
         // the agent ever created and is never popped, so the realm is always a
         // root, and `Realm::trace` walks its `global_env`. A record whose
@@ -1016,6 +1014,21 @@ pub fn instantiate_function_with_resolved_source(
     named_expression: bool,
     named: Option<JsString>,
 ) -> Result<Value, JsError> {
+    let prof = profiling_on();
+    let start = stamp();
+    let mut mark = start;
+    macro_rules! phase {
+        ($slot:expr) => {
+            if prof {
+                let now = stamp();
+                CLOSURE_NS[$slot].fetch_add(
+                    now.saturating_sub(mark),
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+                mark = now;
+            }
+        };
+    }
     let source_info = match (resolved, source) {
         (Some(info), _) => Some(info),
         (None, source) => match source {
@@ -1029,12 +1042,16 @@ pub fn instantiate_function_with_resolved_source(
             None => shared_source_info(agent, f as *const syntax::ast::Function as usize, f.span),
         },
     };
+    phase!(8);
     let source_key = source_info
         .as_ref()
         .map(|info| info.key)
         .unwrap_or_else(|| source_hash_at(agent, f.span).unwrap_or(0));
     let body = shared_function_body_with_key(agent, f, source_key);
+    phase!(9);
     let params = shared_params(&body, &f.params);
+    phase!(10);
+    let call_stamp = if prof { stamp() } else { 0 };
     let value = register_function(
         agent,
         default_binding_display_name(named.or_else(|| f.name.map(crux::lookup))),
@@ -1048,11 +1065,38 @@ pub fn instantiate_function_with_resolved_source(
         outer_chain,
         named_expression,
     )?;
+    if prof {
+        // Split the call: the prologue (argument marshalling + frame setup) and
+        // the body measured from OUTSIDE (`register-total` measures it from
+        // inside, so the two agreeing rules out an instrument artifact).
+        let entry = CLOSURE_ENTRY.load(std::sync::atomic::Ordering::Relaxed);
+        let after = stamp();
+        CLOSURE_NS[14].fetch_add(
+            entry.saturating_sub(call_stamp),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        CLOSURE_NS[15].fetch_add(
+            after.saturating_sub(entry),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
+    phase!(11);
     if !per_iteration_chain.is_empty()
         && let Some(function) = value.as_function()
         && let Some(mut data) = agent.ecma_function_mut(&function.id())
     {
         data.per_iteration_chain = per_iteration_chain;
+    }
+    phase!(12);
+    if prof {
+        // Two back-to-back marks measure this block's own read penalty (see
+        // `dump_closure_profile`).
+        phase!(13);
+        phase!(13);
+        CLOSURE_PRELUDE_NS.fetch_add(
+            mark.saturating_sub(start),
+            std::sync::atomic::Ordering::Relaxed,
+        );
     }
     Ok(value)
 }
@@ -1605,11 +1649,12 @@ fn shared_compiled_body(
     agent: &mut Agent,
     data: &EcmaFunction,
     body_key: usize,
+    name: Option<&JsString>,
 ) -> Result<CompiledBodyCacheEntry, JsError> {
     if let Some(entry) = agent.roots.compiled_bodies.borrow().get(&body_key) {
         return Ok(entry.clone());
     }
-    let (compiled, this_writes) = crate::ir::compile_body(data)?;
+    let (compiled, this_writes) = crate::ir::compile_body(data, name)?;
     let entry = CompiledBodyCacheEntry {
         compiled: std::rc::Rc::new(compiled),
         this_writes,
@@ -1620,6 +1665,187 @@ fn shared_compiled_body(
         .borrow_mut()
         .insert(body_key, entry.clone());
     Ok(entry)
+}
+
+/// A clock cheap enough to bracket ~50 ns phases. `Instant::now()` costs ~30 ns
+/// here (`QueryPerformanceCounter`), more than most of the phases below, so the
+/// profile reads the cycle counter instead (~3 ns) and converts with a
+/// one-time calibration. Only ever called when `SLAG_CLOSURE_PROFILE` is set.
+fn stamp() -> u64 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        // SAFETY: `_mm_lfence` and `_rdtsc` are plain register reads available
+        // in user mode on every x86-64 target this engine builds for. The
+        // fence is required: a bare `rdtsc` is not ordered against the
+        // surrounding loads, so back-to-back reads bracket the wrong work.
+        unsafe {
+            std::arch::x86_64::_mm_lfence();
+            std::arch::x86_64::_rdtsc()
+        }
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+        START
+            .get_or_init(std::time::Instant::now)
+            .elapsed()
+            .as_nanos() as u64
+    }
+}
+
+/// Ticks per nanosecond, measured once over a ~2 ms busy wait.
+fn ticks_per_ns() -> f64 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        static RATE: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+        *RATE.get_or_init(|| {
+            let wall = std::time::Instant::now();
+            let start = stamp();
+            while wall.elapsed() < std::time::Duration::from_millis(2) {
+                std::hint::spin_loop();
+            }
+            let elapsed = wall.elapsed().as_nanos() as f64;
+            let ticks = stamp().saturating_sub(start) as f64;
+            if elapsed > 0.0 && ticks > 0.0 {
+                ticks / elapsed
+            } else {
+                1.0
+            }
+        })
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        1.0
+    }
+}
+
+/// Accumulated ticks per phase of [`register_function`] (slots 0-6) and its
+/// instantiation prelude (slots 8-12); slot 7 and 13 are the per-mark clock
+/// overhead of each group. Lazily read by [`dump_closure_profile`], so a
+/// shipping run never touches them.
+static CLOSURE_NS: [std::sync::atomic::AtomicU64; 20] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 20];
+static CLOSURE_TOTAL_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static CLOSURE_PRELUDE_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static CLOSURE_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// `register_function`'s entry stamp, so its caller can split the call into
+/// prologue / body / epilogue (see the prelude's `pre_*` phases).
+static CLOSURE_ENTRY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// `SLAG_CLOSURE_SKIP` (diagnostic, same-binary ablation): the closure-creation
+/// components that may be skipped, so `ablate.sh` can put a real nanosecond
+/// figure on each instead of trusting a phase timer's absolute scale.
+pub(crate) fn skip(slot: Skip) -> bool {
+    static MASK: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    let mask = *MASK.get_or_init(|| {
+        let Ok(text) = std::env::var("SLAG_CLOSURE_SKIP") else {
+            return 0;
+        };
+        let mut mask = 0;
+        for part in text.split(',') {
+            if part.trim() == "props" {
+                mask |= Skip::Props as u32;
+            }
+        }
+        mask
+    });
+    mask & slot as u32 != 0
+}
+
+/// The skippable components (see [`skip`]).
+#[derive(Clone, Copy)]
+pub(crate) enum Skip {
+    Props = 1,
+}
+
+/// Whether the phase timers are on (`SLAG_CLOSURE_PROFILE`), read once: an
+/// uncached `std::env::var_os` costs ~140 ns on Windows, which is most of the
+/// work being measured.
+pub(crate) fn profiling_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("SLAG_CLOSURE_PROFILE").is_some())
+}
+
+/// A phase boundary owned by another module (the interpreter's creation step),
+/// which cannot reach the private clock here.
+pub(crate) fn profile_mark(slot: usize, mark: &mut u64) {
+    let now = stamp();
+    CLOSURE_NS[slot].fetch_add(
+        now.saturating_sub(*mark),
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    *mark = now;
+}
+
+/// The clock reading a caller pairs with [`profile_mark`].
+pub(crate) fn profile_now() -> u64 {
+    stamp()
+}
+
+/// Print the `SLAG_CLOSURE_PROFILE` phase means, one TSV row per phase, with
+/// the mean per-mark clock overhead subtracted from every interval. Closure
+/// creation is the largest single item in the corpus, so a phase it is not in
+/// is as useful as one it is. Read the `raw` column when the phases sum to the
+/// total but the total does not match wall clock: the cycle counter under-reads
+/// under a fence that does not order stores (see `.notes/perf.md`, 2026-10-29).
+pub fn dump_closure_profile() {
+    if !profiling_on() {
+        return;
+    }
+    let calls = CLOSURE_CALLS.load(std::sync::atomic::Ordering::Relaxed);
+    if calls == 0 {
+        return;
+    }
+    let rate = ticks_per_ns();
+    let per = |slot: usize| {
+        CLOSURE_NS[slot].load(std::sync::atomic::Ordering::Relaxed) as f64 / calls as f64 / rate
+    };
+    let overhead = per(7);
+    const NAMES: [(usize, &str); 18] = [
+        (0, "setup"),
+        (1, "record-init"),
+        (2, "function-object"),
+        (3, "compiled-body"),
+        (4, "registry-insert"),
+        (5, "props-batch"),
+        (6, "trailing"),
+        (8, "pre-source-info"),
+        (9, "pre-shared-body"),
+        (10, "pre-shared-params"),
+        (11, "pre-epilogue"),
+        (12, "pre-chain-patch"),
+        (14, "call-prologue"),
+        (15, "call-body-external"),
+        (16, "step-env"),
+        (17, "step-source-info"),
+        (18, "step-instantiate"),
+        (19, "step-push"),
+    ];
+    println!("closure\tcalls\t{calls}");
+    println!(
+        "closure\tsizes\tEcmaFunction={}\tname={}\tsom={}\tsrc={}\tkept={}",
+        std::mem::size_of::<EcmaFunction>(),
+        std::mem::size_of::<Option<JsString>>(),
+        std::mem::size_of::<Option<crate::context::ScriptOrModule>>(),
+        std::mem::size_of::<Option<std::rc::Rc<SourceInfo>>>(),
+        std::mem::size_of::<JsString>(),
+    );
+    // `clock-overhead` is slot 7: two back-to-back marks, i.e. TWO reads. A
+    // phase interval pays one, so half of it is what to subtract per phase.
+    let per_mark = overhead / 2.0;
+    for (slot, name) in NAMES {
+        let raw = per(slot);
+        println!("closure\t{name}\t{raw:.1}\t{:.1}", raw - per_mark);
+    }
+    println!("closure\tclock-overhead\t{overhead:.1}");
+    println!(
+        "closure\tregister-total\t{:.1}",
+        CLOSURE_TOTAL_NS.load(std::sync::atomic::Ordering::Relaxed) as f64 / calls as f64 / rate
+    );
+    println!(
+        "closure\tinstantiate-total\t{:.1}",
+        CLOSURE_PRELUDE_NS.load(std::sync::atomic::Ordering::Relaxed) as f64 / calls as f64 / rate
+    );
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1639,6 +1865,27 @@ fn register_function(
     outer_chain: OuterChain,
     named_expression: bool,
 ) -> Result<Value, JsError> {
+    // Phase timing (`SLAG_CLOSURE_PROFILE=1`): closure creation is the largest
+    // single item in the corpus (`.notes/perf.md`, 2026-10-28), and "diffuse"
+    // is not an answer.
+    let prof = profiling_on();
+    let start = stamp();
+    if prof {
+        CLOSURE_ENTRY.store(start, std::sync::atomic::Ordering::Relaxed);
+    }
+    let mut mark = start;
+    macro_rules! phase {
+        ($slot:expr) => {
+            if prof {
+                let now = stamp();
+                CLOSURE_NS[$slot].fetch_add(
+                    now.saturating_sub(mark),
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+                mark = now;
+            }
+        };
+    }
     // `strict` overrides the body-directive check (CreateDynamicFunction
     // computes it against its assembled source, which the running context
     // cannot provide); `enclosing_strict` still forces strictness.
@@ -1654,6 +1901,7 @@ fn register_function(
         .running_context()
         .ok()
         .and_then(|context| context.script_or_module.clone());
+    phase!(0);
     // Cut 43: closures from the same declaration site share one compiled
     // body (the `body` Rc is the canonical site identity — see
     // `shared_function_body`), so the IR compile — and the per-body JIT
@@ -1661,7 +1909,6 @@ fn register_function(
     // closure. The pointer is captured before `body` moves into the record.
     let body_key = std::rc::Rc::as_ptr(&body) as usize;
     let mut data = EcmaFunction {
-        name: name.clone(),
         params: params.clone(),
         body,
         environment,
@@ -1691,6 +1938,7 @@ fn register_function(
         // first observation (see `ensure_function_prototype`).
         prototype_pending: !kind.is_generator && !kind.is_method && !kind.is_async,
     };
+    phase!(1);
     // Every body compiles to the step IR; the VM executes ordinary bodies
     // the same way it runs the resumable kinds. The Function is created
     // before the compile: `Function::new` fires a `--gc-stress` collection,
@@ -1716,16 +1964,19 @@ fn register_function(
     if !environment.ptr_eq(realm.global_env) {
         function.set_environment_edge(Some(environment.as_any()));
     }
+    phase!(2);
     // The paired `this_writes` pattern is re-applied to each fresh
     // constructor record below (Cut 43: the compiled body is shared per
     // site, so the pattern is computed once and copied).
-    let entry = shared_compiled_body(agent, &data, body_key)?;
+    let entry = shared_compiled_body(agent, &data, body_key, name.as_ref())?;
     let this_writes = entry.this_writes;
     data.set_compiled(entry.compiled);
+    phase!(3);
     agent.register_ecma_function(function.id(), data);
     // Cut 35 slice 30: store collected `this.*` property writes for
     // constructor store-cache pre-warming in `construct_this_object`.
     crate::ir::store_construct_patterns(agent, function.id(), this_writes);
+    phase!(4);
     // Cut 67: SetFunctionLength + SetFunctionName + (for sloppy ordinary
     // functions) AddRestrictedFunctionProperties as ONE pre-forked-shape
     // adoption instead of 2-4 sequential boilerplate defines (the shape's
@@ -1740,7 +1991,9 @@ fn register_function(
     // (spec 10.2.4: own caller/arguments are created only for ordinary
     // non-method functions).
     let restricted = !strict && !kind.is_method && !kind.is_async && !kind.is_generator;
-    if !set_function_properties_batched(agent, &function, &params, name.as_ref(), restricted) {
+    if !crate::function::skip(Skip::Props)
+        && !set_function_properties_batched(agent, &function, &params, name.as_ref(), restricted)
+    {
         set_function_properties(&function, &params, name.as_ref())?;
         if restricted {
             for name in ["caller", "arguments"] {
@@ -1755,6 +2008,7 @@ fn register_function(
             }
         }
     }
+    phase!(5);
     // Plain async functions are never constructors and have no `prototype`;
     // generator and async-generator functions *and methods* get a `prototype`
     // that inherits %Generator.prototype% / %AsyncGenerator.prototype%,
@@ -1781,6 +2035,18 @@ fn register_function(
     }
     // Cut 74: no trailing set_function_prototype — the object was born with
     // its [[Prototype]] (see above).
+    phase!(6);
+    if prof {
+        // Two back-to-back marks: the interval between them is one clock
+        // read plus one add, i.e. exactly what every phase above overpays.
+        phase!(7);
+        phase!(7);
+        CLOSURE_TOTAL_NS.fetch_add(
+            mark.saturating_sub(start),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        CLOSURE_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
     Ok(Value::Function(function))
 }
 
@@ -2182,7 +2448,6 @@ fn instantiate_arrow_impl(
         .and_then(|context| context.script_or_module.clone());
     let display = named;
     let mut data = EcmaFunction {
-        name: display.clone(),
         params,
         body: block,
         environment,
@@ -2224,7 +2489,7 @@ fn instantiate_arrow_impl(
     if !environment.ptr_eq(realm.global_env) {
         function.set_environment_edge(Some(environment.as_any()));
     }
-    let entry = shared_compiled_body(agent, &data, body_key)?;
+    let entry = shared_compiled_body(agent, &data, body_key, display.as_ref())?;
     let this_writes = entry.this_writes;
     data.set_compiled(entry.compiled);
     let params = data.params.clone();

@@ -8308,13 +8308,24 @@ impl Vm {
                     per_iteration_chain,
                     source,
                 } => {
+                    let prof = crate::function::profiling_on();
+                    let mut mark = 0u64;
+                    if prof {
+                        mark = crate::function::profile_now();
+                    }
                     let env = agent.running_context()?.lexical_environment;
+                    if prof {
+                        crate::function::profile_mark(16, &mut mark);
+                    }
                     let source = crate::function::site_source_info(
                         agent,
                         source,
                         function.as_ref() as *const syntax::ast::Function as usize,
                         function.span,
                     );
+                    if prof {
+                        crate::function::profile_mark(17, &mut mark);
+                    }
                     let value = crate::function::instantiate_function_expression_with_source(
                         agent,
                         function,
@@ -8325,7 +8336,13 @@ impl Vm {
                         named.clone(),
                         source,
                     )?;
+                    if prof {
+                        crate::function::profile_mark(18, &mut mark);
+                    }
                     self.stack.push(value);
+                    if prof {
+                        crate::function::profile_mark(19, &mut mark);
+                    }
                 }
                 Step::CreateArrow {
                     is_async,
@@ -26696,6 +26713,11 @@ fn leaf_op_reads_context(op: &LeafOp) -> bool {
 /// doesn't use lexical `this` or is not a constructor).
 pub fn compile_body(
     function: &EcmaFunction,
+    // The function's own name, when it has one. It is a property of the
+    // declaration SITE, not of the closure, so it is passed in rather than
+    // stored on the record (48 bytes the 200-byte record's insert and every
+    // call's clone used to carry).
+    name: Option<&JsString>,
 ) -> Result<(CompiledBody, (usize, [crux::AtomId; 4])), JsError> {
     let _guard = CompilingGuard::new();
     let scope = analyze_scope(function);
@@ -26705,10 +26727,7 @@ pub fn compile_body(
         strict: function.strict,
         outer_chain: function.outer_chain.clone(),
         per_iteration_chain: function.per_iteration_chain.clone(),
-        function_name: function
-            .name
-            .as_ref()
-            .map(|name| crux::intern(name.as_slice())),
+        function_name: name.map(|name| crux::intern(name.as_slice())),
         named_expression: function.named_expression,
         ..Compiler::default()
     };

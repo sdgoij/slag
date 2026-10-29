@@ -49,6 +49,8 @@ All write to **stderr**. They are for debugging a workload, not for production.
 | `JIT_LEAF_TRACE` | trace the first few leaf-probe rejections (`leaf-probe reject: <why>`). |
 | `SLAG_JIT_DEOPT_PROBE=<step>` | force a deopt guard at that step in every eligible body — exercises the spill/resume path deterministically. |
 | `SLAG_JIT_DEOPT_TRACE` | trace each deopt (`jit-deopt step=<n> depth=<n>`). |
+| `SLAG_CLOSURE_PROFILE` | the `slag` CLI prints the mean nanoseconds of every phase of closure instantiation at exit (`closure <phase> <raw> <net>`), read off the cycle counter. See `.notes/perf.md` (2026-10-29) for why the raw column exists and why the numbers under-read. |
+| `SLAG_CLOSURE_SKIP=props` | skip `set_function_properties_batched` at closure creation, so `tools/corpus/ablate.sh` can put a real nanosecond figure on it in the *same binary* (the phase timers' absolute scale is not trustworthy on their own). Semantically wrong; measurement only. |
 
 A quick recipe for a body that runs slower than expected:
 

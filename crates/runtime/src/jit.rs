@@ -7086,7 +7086,6 @@ pub fn resolve_declaration(body: &CompiledBody, init_step: usize) -> Option<Reso
     let realm = agent.current_realm().ok()?;
     let environment = agent.running_context().ok()?.lexical_environment;
     let data = crate::function::EcmaFunction {
-        name: Some(crux::lookup(*name)),
         params,
         body: shared_body,
         environment,
@@ -7117,7 +7116,8 @@ pub fn resolve_declaration(body: &CompiledBody, init_step: usize) -> Option<Reso
         named_expression: false,
         prototype_pending: false,
     };
-    let (compiled, _this_writes) = crate::ir::compile_body(&data).ok()?;
+    let (compiled, _this_writes) =
+        crate::ir::compile_body(&data, Some(crux::lookup(*name)).as_ref()).ok()?;
     if !compiled.leaf || compiled.leaf_uses_env {
         return None;
     }
@@ -7167,7 +7167,6 @@ pub fn resolve_created(body: &CompiledBody, step: usize) -> Option<ResolvedCalle
     let realm = agent.current_realm().ok()?;
     let environment = agent.running_context().ok()?.lexical_environment;
     let data = crate::function::EcmaFunction {
-        name: function.name.map(crux::lookup),
         params,
         body: shared_body,
         environment,
@@ -7198,7 +7197,8 @@ pub fn resolve_created(body: &CompiledBody, step: usize) -> Option<ResolvedCalle
         named_expression: false,
         prototype_pending: false,
     };
-    let (compiled, _this_writes) = crate::ir::compile_body(&data).ok()?;
+    let (compiled, _this_writes) =
+        crate::ir::compile_body(&data, function.name.map(crux::lookup).as_ref()).ok()?;
     if !compiled.leaf || compiled.leaf_uses_env {
         return None;
     }

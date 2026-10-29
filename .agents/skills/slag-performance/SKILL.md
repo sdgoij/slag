@@ -80,6 +80,8 @@ Never measure a binary you cannot tie to the source you are reading. See
 | `JIT_LEAF_TRACE=1` | the first leaf-probe rejection reasons |
 | `SLAG_JIT_DEOPT_PROBE=<step>` | forces a deopt at that step in every eligible body |
 | `SLAG_INLINE_TRACE=1` | per compiled body: the splice-site count, each recorded site's state/hits/first id, and each resolver lookup's outcome |
+| `SLAG_CLOSURE_PROFILE=1` | per-phase mean of closure instantiation (`closure <phase> <raw> <net>`): `register_function`'s phases plus the instantiation prelude and the interpreter's creation step. Cycle-counter based, inert when unset |
+| `SLAG_CLOSURE_SKIP=props` | skips `set_function_properties_batched` at closure creation, so `ablate.sh` prices that component in the same binary |
 
 Instrumentation changes the code under test (the helper counter costs four
 instructions per call site), so never measure wall time with it enabled.
@@ -116,6 +118,16 @@ slag-jit, slag-jitless, node-jit and node-jitless.
 - **V8 is not a fair per-operation reference on the `opcost` rows**: its JIT
   folds the affine loops and scalar-evolves the constants, so its time is near
   zero. Read Slag's absolute ns per operation; use the ratio only for ranking.
+- **A phase timer's absolute scale is not evidence on its own.** Two traps cost
+  a session on 2026-10-29. (1) `std::env::var_os` costs **~140 ns** on Windows,
+  so an env-gated instrument that reads its switch *per call* is itself the
+  largest term it measures; cache the gate in a `OnceLock`. (2)
+  `Instant::now()` costs ~30 ns here, so it cannot split a 300 ns function, and
+  a bare `_rdtsc` is not ordered against surrounding loads, so its intervals
+  come out compressed and non-uniformly so. Use `_mm_lfence(); _rdtsc()` and
+  **calibrate with an ablation**: add a switch that skips the component
+  (`SLAG_CLOSURE_SKIP=props`), price it with `ablate.sh`, and rescale the phase
+  table by that ratio. In the closure case the timer under-read by **2.4x**.
 
 A one-row A/B, per-process:
 
@@ -296,6 +308,8 @@ in the corpus.
 | Re-type after inlining (`scalarized || inlined`) | +0.71% when measured (2026-10-27); SUPERSEDED — inlining fired on almost no body then, so it measured noise. Landed 2026-10-28 with the static splice, where it is -17% on the row it reaches |
 | i32 element key (keep the index's int32 proof, skip the `ToUint64Sat` gate) | sound and implemented, but inside the noise on every row it touches (`element_read`, `element_write`, `dyn_key_read`, `array_at`); the ladder's dependent-load chain dominates, not the gate |
 | Typer read guard on a leaf body (`SLAG_TYPER_LEAF`) | `calls/construct_churn` 58 -> 110 ms: a guard marks the body `deopts` and the leaf-inline lane refuses it |
+| `EcmaFunction` 200 -> 152 bytes (drop `name`, pass it to `compile_body`) | a-var-closure and for-in head-let both flat (7 interleaved pairs, minima 94.4 -> 93.4 ms and 741.4 -> 748.3 ms). Record size is NOT what the registry insert pays at 200 bytes: the map machinery does. Kept only as a simplification |
+| `std::env::var_os` on a per-closure diagnostic path | the switch read itself was **142 ns** of a 300 ns closure; cache it in a `OnceLock` |
 | `loop_counter` typing the counter cycle it proved int32 | works, but the use rule it needs rejects a previously-correct fusion: `opcost/element_write` 0.375 -> 0.45 ms. `Type::Int` on a block parameter is not an i32 register (params are `i64` in CLIF), so a type cannot move a counter into an i32 register at all |
 | In-place splicing (a single-block callee copied into the caller's block) | `opcost/js_call` 0.577 vs 0.510 with the block-splitting splice. The continuation block is load bearing: it is what lets `narrow`/`mem2reg` derive a parameter's type from one incoming value, and without it the accumulator and the `|0` stay `Number` words with a `Canon` per iteration |
 | Rank a function by `sum(blocks)` | method error, not a change; divide by the entry block first |
@@ -339,6 +353,14 @@ needs its own per-row measurement.
 
 ## 7. Open leads (2026-10-28)
 
+- **Closure creation is 280-300 ns against node-jitless's 9 ns, and the
+  registry insert and the fresh `JsObject` are the two biggest phases**
+  (2026-10-29, `SLAG_CLOSURE_PROFILE` + `SLAG_CLOSURE_SKIP=props`). The record
+  import is NOT size-bound at 200 bytes: see the NULL register. The remaining
+  structural option is the V8 shape — the record reachable from its function
+  object, with the table a non-owning id -> function index — since every
+  `IdMap<EcmaFunction>` form that roots the record is measured worse (Stage D,
+  twice).
 - **The inline splice cannot fire on a loop-bodied caller, and that is the
   headline's biggest single ceiling.** `JitEngine::consult` compiles a loop body
   on its FIRST consult (see the 2026-10-28 PROBE), so `record_call_site` never

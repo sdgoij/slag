@@ -4970,10 +4970,12 @@ mod tests {
         agent.initialize_host_defined_realm().unwrap();
         agent
             .run_script(
-                "function outer() { \
+                "var captured; \
+                 function outer() { \
                    function leaf(x) { return x + 1; } \
                    var s = 0; \
                    for (var i = 0; i < 4; i++) s += leaf(i); \
+                   captured = leaf; \
                    return s; \
                  } \
                  outer();",
@@ -4991,18 +4993,17 @@ mod tests {
             ),
             "the site is a slot callee"
         );
+        let global = agent.running_context().unwrap().realm.global_object;
+        let leaf = global.get(&JsString::from_utf8("captured")).unwrap();
+        let ValueKind::Function(leaf) = leaf.kind() else {
+            panic!("the closure was captured");
+        };
         let runtime = agent
-            .with_ecma_functions(|functions| {
-                functions
-                    .values()
-                    .find(|record| {
-                        record.name.as_ref().is_some_and(|name| {
-                            name.as_slice().iter().copied().eq("leaf".encode_utf16())
-                        })
-                    })
-                    .and_then(|record| record.ir.clone())
-            })
-            .expect("the leaf closure is registered");
+            .ecma_function(&leaf.id())
+            .expect("the leaf closure is registered")
+            .ir
+            .clone()
+            .expect("the leaf closure has compiled IR");
         let resolved = crux::function::with_agent(&agent as *const Agent as *mut (), || {
             crate::jit::resolve_declaration(&outer_body, init as usize)
         })

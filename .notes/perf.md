@@ -17946,3 +17946,94 @@ how far ahead V8's *runtime* is.
 
 Numbers 1-3 also explain the second row (`template-literal/evaluation-order`:
 70k closures + calls) and the third (`spread_assign`: defines).
+
+## PROFILE (2026-10-29): closure creation, by phase, on a clock that can see it
+
+`register_function` plus its instantiation prelude is **280-300 ns per closure**
+against node-jitless's **9 ns** on the same shape (30x). Three `scratch/lcf/clo`
+probes, one process each, `--corpus` minima:
+
+| variant | slag jl | node jl | per closure |
+|---|---:|---:|---:|
+| `e-closure-nostore` (`g = function(){return i;}` in a 300k loop) | 85.5 ms | 4.57 ms | **280 ns** vs 9 |
+| `a-var-closure` (+ `fns.x = g`) | 94.0 | 6.55 | 313 vs 22 |
+| `c-closure-free` (the loop alone) | 5.2 | 1.72 | 17 |
+
+Not GC: at 3,000 and 30,000 iterations the per-closure figure is 301 and 313 ns,
+the same as at 300,000.
+
+`SLAG_CLOSURE_PROFILE=1` (new, permanent, cycle-counter based) splits it. Two
+things had to be fixed before the split was worth reading, and both are now in
+the skill's measurement protocol:
+
+- `std::env::var_os` costs **142 ns** on Windows. An env-gated instrument that
+  reads its switch per call is the largest term it measures: the first version
+  reported a 142 ns "call prologue" that was entirely the switch read. Cache the
+  gate.
+- `Instant::now()` costs ~30 ns here, more than most phases. The cycle counter
+  (`_mm_lfence(); _rdtsc()`) costs ~13 ns per mark. Even so its *absolute* scale
+  under-reads, non-uniformly.
+
+So the phase table is calibrated against an ablation, not trusted as seconds.
+`SLAG_CLOSURE_SKIP=props` (same binary) skips `set_function_properties_batched`:
+the row goes 99.5 -> 85.9 ms, i.e. **45 ns**, where the timer read 19 ns. The
+timer under-reads by **2.4x** on this path; the ratios below are rescaled by it.
+
+| phase | timer | calibrated |
+|---|---:|---:|
+| registry insert (`ecma_functions`) + `store_construct_patterns` | 46 | **~112** |
+| `Function::new_with_prototype` + the `[[Environment]]` edge | 40 | **~97** |
+| `set_function_properties_batched` | 19 | **45** (ablation) |
+| instantiation prelude (source-info, body cache, params cache) | 13 | ~31 |
+| `shared_compiled_body` + `set_compiled` | 10 | ~25 |
+| `EcmaFunction` construction, setup, trailing | 4 | ~10 |
+
+The interpreter's own creation step (`running_context` + `site_source_info` +
+`stack.push`) rounds to zero on every clock tried, so the cost is inside the
+instantiation, not around it.
+
+**Two thirds of a closure is the record insert and the object allocation.** For
+reference V8 does neither: one bump allocation of a ~40-byte `JSFunction` whose
+`SharedFunctionInfo` is per-site and already on the AST node, and `length`/`name`
+live on the SFI rather than being defined per closure.
+
+### NULL (2026-10-29): the record is not size-bound at 200 bytes
+
+`EcmaFunction`'s `name: Option<JsString>` was 48 of its 200 bytes, and `JsString`
+is 48 bytes because of its inline small-string form. It is a property of the
+declaration SITE, not of the closure: the only reader is `compile_body`'s
+`function_name` (Cut 46 self-tail-call recognition), once per site. So the field
+was dropped and the name passed into `compile_body` instead (record 200 -> 152,
+and one fewer 48-byte clone per closure and per call).
+
+Measured on two interleaved binaries, 7 pairs, minima:
+
+| probe | before | after |
+|---|---:|---:|
+| `a-var-closure` | 94.4 ms | 93.4 ms |
+| for-in head-let row | 741.4 ms | 748.3 ms |
+
+Flat. That is a useful answer rather than a disappointment: the insert's cost is
+the `HashMap` probe/growth machinery and the allocation churn around it, not the
+value copy. The earlier `Box<EcmaFunction>` regression (52 -> 128 ns/insert) reads
+the same way from the other side. The change is kept because it is a strict
+simplification, and recorded here so nobody re-runs the size experiment.
+
+### What this redirects
+
+The next closure slice is not "shrink the record further". It is to stop paying a
+map insert per closure: the record reachable from its function object, with the
+table a non-owning id -> function index. Every `IdMap`-roots-the-record form is
+measured worse (Stage D, twice: +70% and +80.6% on the head-let row from
+promoting each record on its first minor), so the shape that remains untested is
+exactly the one `closure-cost-plan.md` names. That is a larger change than a
+slice: it needs the record traced from `crux`'s function object and an id ->
+function path for the API, stack traces, snapshots and feedback.
+
+The cheaper half is the allocation: `Function::new_with_prototype` makes TWO
+arena allocations (the `JsObject`, ~528 B, and the `Function` box) and resolves
+the canonical empty map through a thread-local `Vec` scan per create
+(`canonical_empty_map`). A per-realm cached empty map for
+`%Function.prototype%`, used with the existing
+`ordinary_object_create_with_map`, removes the TLS access, the `mark_prototype`
+call and the scan from every closure.
