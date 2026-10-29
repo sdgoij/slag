@@ -63,7 +63,6 @@ Never measure a binary you cannot tie to the source you are reading. See
 | `SLAG_OPT=0` | the optimizing tier; the body runs the per-step (baseline) tier |
 | `SLAG_TYPER=0` | the typer's read guard (`Op::GuardType` on a read) |
 | `SLAG_GUARD=0` | the guard-pruning pass (`opt/pass/guard.rs`) |
-| `SLAG_INT_KEY=0` | an element key keeping its int32 proof (a wash; kept as a seam) |
 | `SLAG_TYPER_LEAF=1` | the typer's read guard reaching a leaf body (off: it costs leaf inlining) |
 | `SLAG_INLINE=0` | the trial-inline splice (on by default) |
 | `SLAG_INLINE_CREATED=0` | only the static route (a callee the body itself creates) |
