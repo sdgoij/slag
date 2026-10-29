@@ -2898,23 +2898,28 @@ V8, where the op itself is one instruction. Consequences:
 per shape (plus a separate 6-entry `i64x2` table), shifts, `abs`/`neg`,
 splat/replace, `any_true`/`all_true`, `bitmask`, and `bitselect`, plus the
 whole `f32x4`/`f64x2` family (add/sub/mul/div, min/max, pmin/pmax, and the
-unary `abs`/`neg`/`sqrt`/rounding forms), `i8x16.swizzle`, and the ten
-conversion opcodes, with
+unary `abs`/`neg`/`sqrt`/rounding forms), `i8x16.swizzle`, the ten
+conversion opcodes, the integer min/max, saturating add/sub, average, narrow,
+extend and extmul families, and the relaxed ops whose deterministic choice is
+one of those, with
 the interpreter's canonical-NaN policy reproduced explicitly. Measured on
 `crates/wasmtest/fixtures/simd-native-loop.wast`, `simd-native-float.wast`,
-`simd-native-unop.wast` and `simd-native-convert.wast`, same binary, seven
-interleaved rounds:
-**32.06 ms against 219.78 ms on the helper path (6.9x)** for the integer mix,
-**55.28 ms against 1019.45 ms (18.4x)** for the float arithmetic mix,
-**63.14 ms against 1347.87 ms (21.3x)** for the unop/swizzle mix, and
-**48.49 ms against 802.18 ms (16.5x)** for the conversion mix, with
+`simd-native-unop.wast`, `simd-native-convert.wast`, `simd-native-int.wast`
+and `simd-native-relaxed.wast`, same binary, seven interleaved rounds:
+**32.98 ms against 220.64 ms on the helper path (6.7x)** for the integer mix,
+**56.27 ms against 1002.58 ms (17.8x)** for the float arithmetic mix,
+**63.90 ms against 1353.41 ms (21.2x)** for the unop/swizzle mix,
+**49.49 ms against 815.51 ms (16.5x)** for the conversion mix,
+**58.64 ms against 1858.00 ms (31.7x)** for the integer group mix, and
+**60.08 ms against 717.94 ms (11.9x)** for the relaxed mix, with
 `simd-loop` and `leaf-loop` controls flat. The carrier stays `I128` as point 2
 predicted; the win is entirely per-op instructions. Details, including the
 `shr_s`/`shr_u` table swap the corpus caught, the NaN-canonicalization rules,
 and the demote/promote asymmetry, are in `.notes/perf.md`.
 
-Still on the helper after this cut: the saturating/narrow/extmul/dot integer
-groups and `relaxed_*`.
+Still on the helper after this cut: `i8x16.popcnt`, `i16x8.q15mulr_sat_s`,
+`i32x4.dot_i16x8_s`, the `extadd_pairwise` forms, and the relaxed
+madd/nmadd/q15mulr/dot set.
 
 ### 10.4 Outside wasm (for completeness)
 

@@ -636,6 +636,20 @@ enum FloatArith {
     PMax,
 }
 
+/// The form behind an integer lane binop, for `Lowerer::native_int_binop`.
+#[derive(Clone, Copy)]
+enum IntOp {
+    MinS,
+    MinU,
+    MaxS,
+    MaxU,
+    AddSatS,
+    AddSatU,
+    SubSatS,
+    SubSatU,
+    AvgRound,
+}
+
 /// The canonical quiet NaN of `ty`, replicated into every lane. Mirrors
 /// `values::QNAN32`/`QNAN64`.
 fn canonical_nan_bits(ty: Type) -> u128 {
@@ -5255,6 +5269,9 @@ impl<'a> Lowerer<'a> {
                 if let Some(out) = self.native_compare(sub, a, b) {
                     return Some(out);
                 }
+                if let Some(out) = self.native_int_binop(sub, a, b) {
+                    return Some(out);
+                }
                 if let Some(out) = self.native_float_arith(sub, a, b) {
                     return Some(out);
                 }
@@ -5335,6 +5352,141 @@ impl<'a> Lowerer<'a> {
         let b = self.bitcast_lanes(ty, b);
         let out = self.builder.ins().imul(a, b);
         Some(self.bitcast_lanes(types::I128, out))
+    }
+
+    /// Integer min/max, saturating add/sub, the unsigned rounding average, the
+    /// narrowing forms, and the widening multiplies.
+    fn native_int_binop(&mut self, sub: u16, a: ClifValue, b: ClifValue) -> Option<ClifValue> {
+        use IntOp::*;
+        let (ty, op) = match sub {
+            0x76 => (types::I8X16, MinS),
+            0x77 => (types::I8X16, MinU),
+            0x78 => (types::I8X16, MaxS),
+            0x79 => (types::I8X16, MaxU),
+            0x6f => (types::I8X16, AddSatS),
+            0x70 => (types::I8X16, AddSatU),
+            0x72 => (types::I8X16, SubSatS),
+            0x73 => (types::I8X16, SubSatU),
+            0x7b => (types::I8X16, AvgRound),
+            0x96 => (types::I16X8, MinS),
+            0x97 => (types::I16X8, MinU),
+            0x98 => (types::I16X8, MaxS),
+            0x99 => (types::I16X8, MaxU),
+            0x8f => (types::I16X8, AddSatS),
+            0x90 => (types::I16X8, AddSatU),
+            0x92 => (types::I16X8, SubSatS),
+            0x93 => (types::I16X8, SubSatU),
+            0x9b => (types::I16X8, AvgRound),
+            0xb6 => (types::I32X4, MinS),
+            0xb7 => (types::I32X4, MinU),
+            0xb8 => (types::I32X4, MaxS),
+            0xb9 => (types::I32X4, MaxU),
+            // `i8x16.narrow_i16x8_s/u`, `i16x8.narrow_i32x4_s/u`.
+            0x65 => return self.native_narrow(types::I8X16, true, a, b),
+            0x66 => return self.native_narrow(types::I8X16, false, a, b),
+            0x85 => return self.native_narrow(types::I16X8, true, a, b),
+            0x86 => return self.native_narrow(types::I16X8, false, a, b),
+            // `extmul_{low,high}_{s,u}` for the three widening shapes.
+            0x9c..=0x9f | 0xbc..=0xbf | 0xdc..=0xdf => return self.native_extmul(sub, a, b),
+            _ => return None,
+        };
+        let a = self.bitcast_lanes(ty, a);
+        let b = self.bitcast_lanes(ty, b);
+        let out = match op {
+            MinS => self.builder.ins().smin(a, b),
+            MinU => self.builder.ins().umin(a, b),
+            MaxS => self.builder.ins().smax(a, b),
+            MaxU => self.builder.ins().umax(a, b),
+            AddSatS => self.builder.ins().sadd_sat(a, b),
+            AddSatU => self.builder.ins().uadd_sat(a, b),
+            SubSatS => self.builder.ins().ssub_sat(a, b),
+            SubSatU => self.builder.ins().usub_sat(a, b),
+            AvgRound => self.builder.ins().avg_round(a, b),
+        };
+        Some(self.bitcast_lanes(types::I128, out))
+    }
+
+    /// `narrow_*_s/u`: Cranelift's `snarrow`/`unarrow` concatenate both
+    /// operands, putting the first in the low lanes, which is the wasm order.
+    fn native_narrow(
+        &mut self,
+        out_ty: Type,
+        signed: bool,
+        a: ClifValue,
+        b: ClifValue,
+    ) -> Option<ClifValue> {
+        let src_ty = if out_ty == types::I8X16 {
+            types::I16X8
+        } else {
+            types::I32X4
+        };
+        let a = self.bitcast_lanes(src_ty, a);
+        let b = self.bitcast_lanes(src_ty, b);
+        let out = if signed {
+            self.builder.ins().snarrow(a, b)
+        } else {
+            self.builder.ins().unarrow(a, b)
+        };
+        Some(self.bitcast_lanes(types::I128, out))
+    }
+
+    /// `extmul_{low,high}_{s,u}`: widen that half of both operands, then
+    /// multiply. Cranelift has no single extending multiply, but the widen
+    /// forms infer their result type from the operand, so each is one CLIF op.
+    fn native_extmul(&mut self, sub: u16, a: ClifValue, b: ClifValue) -> Option<ClifValue> {
+        let (in_ty, high, signed) = match sub {
+            0x9c => (types::I8X16, false, true),
+            0x9d => (types::I8X16, true, true),
+            0x9e => (types::I8X16, false, false),
+            0x9f => (types::I8X16, true, false),
+            0xbc => (types::I16X8, false, true),
+            0xbd => (types::I16X8, true, true),
+            0xbe => (types::I16X8, false, false),
+            0xbf => (types::I16X8, true, false),
+            0xdc => (types::I32X4, false, true),
+            0xdd => (types::I32X4, true, true),
+            0xde => (types::I32X4, false, false),
+            0xdf => (types::I32X4, true, false),
+            _ => return None,
+        };
+        let a = self.bitcast_lanes(in_ty, a);
+        let b = self.bitcast_lanes(in_ty, b);
+        let wa = self.widen_half(a, signed, high);
+        let wb = self.widen_half(b, signed, high);
+        let out = self.builder.ins().imul(wa, wb);
+        Some(self.bitcast_lanes(types::I128, out))
+    }
+
+    /// `extend_{low,high}_*_s/u`: one widening instruction each.
+    fn native_extend(&mut self, sub: u16, v: ClifValue) -> Option<ClifValue> {
+        let (in_ty, high, signed) = match sub {
+            0x87 => (types::I8X16, false, true),
+            0x88 => (types::I8X16, true, true),
+            0x89 => (types::I8X16, false, false),
+            0x8a => (types::I8X16, true, false),
+            0xa7 => (types::I16X8, false, true),
+            0xa8 => (types::I16X8, true, true),
+            0xa9 => (types::I16X8, false, false),
+            0xaa => (types::I16X8, true, false),
+            0xc7 => (types::I32X4, false, true),
+            0xc8 => (types::I32X4, true, true),
+            0xc9 => (types::I32X4, false, false),
+            0xca => (types::I32X4, true, false),
+            _ => return None,
+        };
+        let v = self.bitcast_lanes(in_ty, v);
+        let out = self.widen_half(v, signed, high);
+        Some(self.bitcast_lanes(types::I128, out))
+    }
+
+    /// The low or high half of `value`, sign- or zero-extended one lane width.
+    fn widen_half(&mut self, value: ClifValue, signed: bool, high: bool) -> ClifValue {
+        match (signed, high) {
+            (true, false) => self.builder.ins().swiden_low(value),
+            (true, true) => self.builder.ins().swiden_high(value),
+            (false, false) => self.builder.ins().uwiden_low(value),
+            (false, true) => self.builder.ins().uwiden_high(value),
+        }
     }
 
     /// Native integer `abs`/`neg` unops (both wrap within the lane width).
@@ -5677,6 +5829,41 @@ impl<'a> Lowerer<'a> {
         }
     }
 
+    /// The relaxed ops whose deterministic choice is one of the lowerings this
+    /// file already has. The rest stay on the helper: the interpreter computes
+    /// madd/nmadd in f64 and rounds once (not `fmul` then `fadd`), and q15mulr
+    /// and the dot products have no Cranelift instruction.
+    fn native_relaxed(&mut self, sub: u16, slots: &[ClifValue]) -> Option<ClifValue> {
+        // `slots` is top-of-stack first: c, b, a for arity 3; b, a for 2; a for 1.
+        match sub {
+            // relaxed_swizzle: the MVP kernel is the interpreter's choice.
+            0x100 => {
+                let b = *slots.first()?;
+                let a = *slots.get(1)?;
+                let a = self.bitcast_lanes(types::I8X16, a);
+                let b = self.bitcast_lanes(types::I8X16, b);
+                let out = self.builder.ins().swizzle(a, b);
+                Some(self.bitcast_lanes(types::I128, out))
+            }
+            // relaxed_trunc_*: the interpreter aliases the saturating forms.
+            0x101 => self.native_conversion(0xf8, *slots.first()?),
+            0x102 => self.native_conversion(0xf9, *slots.first()?),
+            0x103 => self.native_conversion(0xfc, *slots.first()?),
+            0x104 => self.native_conversion(0xfd, *slots.first()?),
+            // laneselect is bitselect.
+            0x109..=0x10c => {
+                let c = *slots.first()?;
+                Some(self.native_bitselect(*slots.get(2)?, *slots.get(1)?, c))
+            }
+            // relaxed_min/max alias the spec min/max.
+            0x10d => self.native_float_arith(0xe8, *slots.get(1)?, *slots.first()?),
+            0x10e => self.native_float_arith(0xe9, *slots.get(1)?, *slots.first()?),
+            0x10f => self.native_float_arith(0xf4, *slots.get(1)?, *slots.first()?),
+            0x110 => self.native_float_arith(0xf5, *slots.get(1)?, *slots.first()?),
+            _ => None,
+        }
+    }
+
     /// `fmin`/`fmax` with the spec's rules: either NaN operand gives the
     /// canonical NaN, and a tie between `-0` and `+0` takes the sign the
     /// interpreter's `fmin32`/`fmax32` take. Cranelift's own `fmin`/`fmax` are
@@ -5879,6 +6066,15 @@ impl<'a> Lowerer<'a> {
             for _ in 0..arity {
                 slots.push(self.pop().ok_or("operand stack underflow")?);
             }
+            let native = if simd_native() {
+                self.native_relaxed(sub, &slots)
+            } else {
+                None
+            };
+            if let Some(out) = native {
+                self.stack.push(out);
+                return Ok(());
+            }
             for (k, value) in slots.iter().enumerate() {
                 self.spill_v128(2 * k, *value);
             }
@@ -5899,6 +6095,7 @@ impl<'a> Lowerer<'a> {
                 let v = self.pop().ok_or("operand stack underflow")?;
                 let native = if simd_native() {
                     self.native_int_unop(sub, v)
+                        .or_else(|| self.native_extend(sub, v))
                         .or_else(|| self.native_float_unop(sub, v))
                         .or_else(|| self.native_conversion(sub, v))
                 } else {
@@ -13333,6 +13530,220 @@ mod tests {
         ];
         let cases: Vec<Vec<Value>> = values.iter().map(|v| vec![Value::v128(*v)]).collect();
         for index in 0..ops.len() {
+            assert_equiv(&module, index, &cases);
+        }
+    }
+
+    #[test]
+    fn v128_native_int_lane_ops_match_the_interpreter() {
+        // Integer min/max, saturating add/sub, the unsigned rounding average,
+        // the two narrow forms, extmul and the widening extends. The operand
+        // pairs deliberately differ in their two halves so a wrong low/high
+        // choice in `extmul`/`extend` changes the result.
+        let v128 = ValType::V128;
+        let binops: [u16; 38] = [
+            0x6f, 0x70, 0x72, 0x73, 0x76, 0x77, 0x78, 0x79, 0x7b, // i8x16
+            0x8f, 0x90, 0x92, 0x93, 0x96, 0x97, 0x98, 0x99, 0x9b, // i16x8
+            0xb6, 0xb7, 0xb8, 0xb9, // i32x4
+            0x65, 0x66, 0x85, 0x86, // narrow
+            0x9c, 0x9d, 0x9e, 0x9f, 0xbc, 0xbd, 0xbe, 0xbf, 0xdc, 0xdd, 0xde, 0xdf, // extmul
+        ];
+        let unops: [u16; 12] = [
+            0x87, 0x88, 0x89, 0x8a, 0xa7, 0xa8, 0xa9, 0xaa, 0xc7, 0xc8, 0xc9, 0xca,
+        ];
+        let mut functions: Vec<u32> = vec![0; binops.len()];
+        functions.extend(std::iter::repeat_n(1, unops.len()));
+        let mut bodies: Vec<FuncBody> = binops
+            .iter()
+            .map(|sub| FuncBody {
+                locals: vec![],
+                body: vec![Instr::LocalGet(0), Instr::LocalGet(1), Instr::Vec(*sub)],
+            })
+            .collect();
+        bodies.extend(unops.iter().map(|sub| FuncBody {
+            locals: vec![],
+            body: vec![Instr::LocalGet(0), Instr::Vec(*sub)],
+        }));
+        let module = Module {
+            types: vec![
+                SubType::func(vec![v128, v128], vec![v128]),
+                SubType::func(vec![v128], vec![v128]),
+            ],
+            functions,
+            bodies,
+            ..Module::default()
+        };
+        assert!(
+            compile_module(&module).iter().all(|entry| entry.is_some()),
+            "integer lane module did not compile: {:?}",
+            (0..module.bodies.len())
+                .map(|index| body_compile_reason(&module, index))
+                .collect::<Vec<_>>()
+        );
+
+        let bytes = |lanes: [u8; 16]| {
+            lanes
+                .iter()
+                .enumerate()
+                .fold(0u128, |bits, (i, b)| bits | (u128::from(*b) << (8 * i)))
+        };
+        let ascending = bytes([0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]);
+        let descending = bytes([15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0]);
+        let pairs = [
+            (ascending, descending),
+            (u128::MAX, u128::MAX),
+            (0, u128::MAX),
+            (u128::MAX, 0),
+            // Saturation boundaries: i8, i16 and i32 signed extremes.
+            (bytes([0x7f; 16]), bytes([0x7f; 16])),
+            (bytes([0x80; 16]), bytes([0x80; 16])),
+            (bytes([0x7f; 16]), bytes([0x01; 16])),
+            (bytes([0x80; 16]), bytes([0xff; 16])),
+            (
+                bytes([
+                    0, 0x80, 0, 0x80, 0, 0x80, 0, 0x80, 0, 0x80, 0, 0x80, 0, 0x80, 0, 0x80,
+                ]),
+                bytes([
+                    0xff, 0x7f, 0xff, 0x7f, 0xff, 0x7f, 0xff, 0x7f, 0xff, 0x7f, 0xff, 0x7f, 0xff,
+                    0x7f, 0xff, 0x7f,
+                ]),
+            ),
+            (
+                bytes([0, 0, 0, 0x80, 0, 0, 0, 0x80, 0, 0, 0, 0x80, 0, 0, 0, 0x80]),
+                bytes([
+                    0xff, 0xff, 0xff, 0x7f, 0xff, 0xff, 0xff, 0x7f, 0xff, 0xff, 0xff, 0x7f, 0xff,
+                    0xff, 0xff, 0x7f,
+                ]),
+            ),
+        ];
+        for index in 0..binops.len() {
+            let cases: Vec<Vec<Value>> = pairs
+                .iter()
+                .map(|(a, b)| vec![Value::v128(*a), Value::v128(*b)])
+                .collect();
+            assert_equiv(&module, index, &cases);
+        }
+        let values: Vec<Vec<Value>> = pairs
+            .iter()
+            .map(|(a, _)| vec![Value::v128(*a)])
+            .chain(pairs.iter().map(|(_, b)| vec![Value::v128(*b)]))
+            .collect();
+        for index in binops.len()..binops.len() + unops.len() {
+            assert_equiv(&module, index, &values);
+        }
+    }
+
+    #[test]
+    fn v128_native_relaxed_matches_the_interpreter() {
+        // The relaxed ops whose deterministic interpreter choice is one of the
+        // lowerings above: swizzle, the four trunc forms, laneselect, and
+        // min/max. madd/nmadd, q15mulr and the dot products stay on the helper.
+        let v128 = ValType::V128;
+        let unops: [u16; 4] = [0x101, 0x102, 0x103, 0x104];
+        let binops: [u16; 5] = [0x100, 0x10d, 0x10e, 0x10f, 0x110];
+        let ternops: [u16; 4] = [0x109, 0x10a, 0x10b, 0x10c];
+        let mut functions: Vec<u32> = vec![0; unops.len()];
+        functions.extend(std::iter::repeat_n(1, binops.len()));
+        functions.extend(std::iter::repeat_n(2, ternops.len()));
+        let mut bodies: Vec<FuncBody> = unops
+            .iter()
+            .map(|sub| FuncBody {
+                locals: vec![],
+                body: vec![Instr::LocalGet(0), Instr::Vec(*sub)],
+            })
+            .collect();
+        bodies.extend(binops.iter().map(|sub| FuncBody {
+            locals: vec![],
+            body: vec![Instr::LocalGet(0), Instr::LocalGet(1), Instr::Vec(*sub)],
+        }));
+        bodies.extend(ternops.iter().map(|sub| FuncBody {
+            locals: vec![],
+            body: vec![
+                Instr::LocalGet(0),
+                Instr::LocalGet(1),
+                Instr::LocalGet(2),
+                Instr::Vec(*sub),
+            ],
+        }));
+        let module = Module {
+            types: vec![
+                SubType::func(vec![v128], vec![v128]),
+                SubType::func(vec![v128, v128], vec![v128]),
+                SubType::func(vec![v128, v128, v128], vec![v128]),
+            ],
+            functions,
+            bodies,
+            ..Module::default()
+        };
+        assert!(
+            compile_module(&module).iter().all(|entry| entry.is_some()),
+            "relaxed module did not compile: {:?}",
+            (0..module.bodies.len())
+                .map(|index| body_compile_reason(&module, index))
+                .collect::<Vec<_>>()
+        );
+
+        let source = (0..16u32).fold(0u128, |bits, i| bits | (u128::from(i) << (8 * i)));
+        let reverse = (0..16u32)
+            .rev()
+            .fold(0u128, |bits, i| bits | (u128::from(i) << (8 * i)));
+        let trunc_cases = [
+            lanes_f32x4([f32::NAN, f32::INFINITY, -1.5, 3.7]),
+            lanes_f64x2([f64::NAN, f64::NEG_INFINITY]),
+            lanes_f32x4([2147483648.0, -2147483649.0, 4294967296.0, -0.5]),
+            lanes_f64x2([4294967295.0, -1.0]),
+        ];
+        let trunc_cases: Vec<Vec<Value>> =
+            trunc_cases.iter().map(|v| vec![Value::v128(*v)]).collect();
+        for index in 0..unops.len() {
+            assert_equiv(&module, index, &trunc_cases);
+        }
+
+        let float_pairs = [
+            (
+                lanes_f32x4([1.5, -2.25, 0.0, -0.0]),
+                lanes_f32x4([2.0, 0.5, -0.0, 3.0]),
+            ),
+            (
+                lanes_f32x4([f32::NAN, f32::from_bits(0x7fa0_0001), f32::INFINITY, -1.0]),
+                lanes_f32x4([1.0, 2.0, 3.0, 4.0]),
+            ),
+            (lanes_f64x2([1.5, -0.0]), lanes_f64x2([0.0, -2.5])),
+            (
+                lanes_f64x2([f64::NAN, f64::INFINITY]),
+                lanes_f64x2([1.0, 2.0]),
+            ),
+        ];
+        let swizzle_pairs = [
+            (source, reverse),
+            (source, 0u128),
+            (source, u128::MAX),
+            (u128::MAX, source),
+        ];
+        // Function order is unops, then binops (0x100 first, then min/max).
+        let mut cases: Vec<Vec<Value>> = Vec::new();
+        for (a, b) in swizzle_pairs {
+            cases.push(vec![Value::v128(a), Value::v128(b)]);
+        }
+        assert_equiv(&module, unops.len(), &cases);
+        for (offset, _) in binops.iter().enumerate().skip(1) {
+            let cases: Vec<Vec<Value>> = float_pairs
+                .iter()
+                .map(|(a, b)| vec![Value::v128(*a), Value::v128(*b)])
+                .collect();
+            assert_equiv(&module, unops.len() + offset, &cases);
+        }
+
+        let tern_cases = [
+            (source, reverse, u128::MAX),
+            (source, reverse, 0u128),
+            (u128::MAX, 0u128, lanes_f32x4([1.0, -1.0, 0.0, -0.0])),
+        ];
+        let cases: Vec<Vec<Value>> = tern_cases
+            .iter()
+            .map(|(a, b, c)| vec![Value::v128(*a), Value::v128(*b), Value::v128(*c)])
+            .collect();
+        for index in unops.len() + binops.len()..unops.len() + binops.len() + ternops.len() {
             assert_equiv(&module, index, &cases);
         }
     }

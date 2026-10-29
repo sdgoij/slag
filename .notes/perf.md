@@ -19042,3 +19042,71 @@ clippy, `cargo fmt --check` clean.
 
 What is still on the helper: the saturating/narrow/extmul/dot integer groups
 and `relaxed_*`.
+
+## LANDED (2026-10-29, same day): native integer lane groups and relaxed ops, 31.7x
+
+Fifth cut. This closes the integer families and the half of relaxed SIMD whose
+deterministic choice is a lowering that already existed.
+
+Integer side:
+
+- `min_s`/`min_u`/`max_s`/`max_u` at 8, 16 and 32 bits map to Cranelift's
+  `smin`/`umin`/`smax`/`umax`, which accept vectors.
+- Saturating add/sub map to `sadd_sat`/`uadd_sat`/`ssub_sat`/`usub_sat`, and
+  `avgr_u` to `avg_round` (`(x + y + 1) // 2`).
+- `narrow_i16x8_s/u` and `narrow_i32x4_s/u` map to `snarrow`/`unarrow`. Both
+  concatenate their two operands with the first in the **low** lanes, which is
+  exactly the wasm order, so no swap is needed. `unarrow` is the signed-input,
+  unsigned-target form (`narrow_*_u`), not `uunarrow`.
+- `extmul_{low,high}_{s,u}` widen that half of both operands and multiply, so
+  each is three CLIF ops (`swiden_*`/`uwiden_*` plus `imul`). The opcode block
+  starts at `0x9c`, not `0x9b`: `0x9b` is `i16x8.avgr_u`. That is why the
+  tables were checked against `simd.rs::exec_int_binop` rather than against a
+  remembered spec list.
+- The 12 `extend_{low,high}_*_s/u` forms are one widening instruction each.
+
+Relaxed side, all reusing existing lowerings: `relaxed_swizzle` (the MVP
+`swizzle`), the four `relaxed_trunc` forms (the saturating conversions),
+`relaxed_laneselect` (bitselect), and `relaxed_min`/`relaxed_max` (the spec
+min/max). Left on the helper: `relaxed_madd`/`relaxed_nmadd`, whose interpreter
+choice computes the product and sum in f64 and rounds **once**, which is not
+`fmul` then `fadd`; and `relaxed_q15mulr`/the dot products, which have no
+Cranelift instruction.
+
+**Fixtures.** `simd-native-int.wast` and `simd-native-relaxed.wast`, 2M
+iterations each. The integer probe chains saturating adds, min/max, the
+average, the narrows, the extends and extmul at all three widths, with the
+i64x2 lane free to wrap; expected `13244365` from Node v24.12.0. The relaxed
+probe keeps every input inside the region where all *allowed* behaviours of
+each relaxed op agree (swizzle indices in 0..15, whole-lane laneselect masks,
+non-negative bounded floats), so both the Node comparison and the compiled vs
+interpreter comparison are meaningful; expected `-2147483633`.
+
+| row | compiled | helper | interpreter |
+|---|---|---|---|
+| simd-int | **58.64** | 1858.00 | 3627.11 |
+| simd-relaxed | **60.08** | 717.94 | 2051.21 |
+| simd-convert (re-run) | 49.49 | 815.51 | 1891.26 |
+| simd-unop (re-run) | 63.90 | 1353.41 | 3048.64 |
+| simd-float (re-run) | 56.27 | 1002.58 | 2609.40 |
+| simd-native integer (re-run) | 32.98 | 220.64 | 1046.53 |
+| simd-loop control | 11.92 | - | - |
+| leaf-loop control | 14.48 | - | - |
+
+Same-binary A/B: **58.64 vs 1858.00 ms, 31.7x** for the integer groups and
+**60.08 vs 717.94 ms, 11.9x** for relaxed. The integer ratio is the largest of
+the five because each of those helper ops loops lanes in Rust; the relaxed
+ratio is the smallest because the helper's per-op cost is amortized over
+fewer, simpler lanes. All five earlier probes reproduced in the same run.
+
+**Gates.** `equiv waspec/test/core` → 254 suites, 0 diverged, 8264/8264
+functions compiled; `simd` → 59 suites, 0 diverged; `relaxed-simd` → 7 suites,
+0 diverged. `cargo test -p wasm --features compile --lib` (130, including the
+new `v128_native_int_lane_ops_match_the_interpreter` over saturation
+boundaries and differing halves, and
+`v128_native_relaxed_matches_the_interpreter`), `-p wasm --lib` (44), workspace
+clippy, `cargo fmt --check` clean.
+
+What is still on the helper: `i8x16.popcnt`, `i16x8.q15mulr_sat_s`,
+`i32x4.dot_i16x8_s`, the `extadd_pairwise` forms, and the relaxed
+madd/nmadd/q15mulr/dot set.
