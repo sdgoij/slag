@@ -18066,3 +18066,72 @@ of the real move, consistent with its 2.4x compression.
 The remaining half of that phase is the allocation itself: `init_ordinary`
 writes every field of a ~528-byte `JsObject`, and the `Function` box is a
 second arena allocation. That is the structural item, not a scan.
+
+## PROFILE (2026-10-29): the corpus's #1 row decomposed, and it is calls
+
+Closure creation was the assumed headline of the for-in head-let row. It is
+not: it is 12% of the row. The row's body (`__t262Body`, 100k iterations per
+`bench()` call) decomposes as follows, `ablate.sh` on amplified one-component
+variants (`scratch/lcf/hl2`, 1000 bodies per call, `--jitless` column, per
+body):
+
+| variant | jl µs/body | delta | per operation |
+|---|---:|---:|---:|
+| `e-empty` (`Object.create(null)` + 3 defines + a 3-key for-in) | 0.83 | | |
+| `c-noclos` (+ 3 `fns[x] = 1` stores) | 1.41 | 0.60 | **199 ns/store** |
+| `b-nostore` (closures instead of stores) | 2.14 | 0.73 | **245 ns/closure** |
+| `d-noassert` (the real body minus the 6 `assert.sameValue` calls) | 2.74 | | |
+| `a-full` (the real body) | **7.18** | **4.44** | **740 ns/assert** |
+
+So the six assertion statements are **62% of the row** and calls are its single
+largest term. Everything the last two sessions optimised here (closure creation,
+defines, stores) is 30% combined.
+
+The calls are also 3-8x node wherever they are. Per-call, same harness:
+
+| call shape | jl ns/call | jit ms |
+|---|---:|---:|
+| `add(1,2)` where `add(a,b){return a+b}` | **92** | 0.097 |
+| `o.m(1,2)`, `m` the same body, read off a literal object | 106 | 0.115 |
+| `add(1,2)` where `add` also has `if (a===b) throw ...` | **301** | 0.438 |
+| `A.same(x, y)` with the same throw, called as a method | 358 | 1.176 |
+| 3 string args to the same `add` | 166 | 0.357 |
+
+Two mechanisms, both verified in the engine rather than inferred:
+
+1. **The optimizing tier refuses any body containing `throw`.**
+   `SLAG_JIT_REPORT=1 JIT_DUMP_STEPS=1` on the two `add` shapes prints
+   `opt-blockers: Throw` for the throwing one and nothing for the plain one.
+   The blocker is one line, `block_successors` in
+   `crates/jit/src/opt/lift/mod.rs` (`Step::Throw { .. } => Err(Unsupported::Step("Throw"))`):
+   a `throw` block has no successor because the lift has no throwing terminator.
+   The interpreter still treats the body as a leaf (`steps_are_leaf` does not
+   exclude `Throw`), which is why the jl cost is 3x rather than 30x, but it
+   falls to the **step-path** leaf instead of a register leaf.
+2. **A leaf body with a branch is a step-path leaf**, so each call dispatches
+   its steps instead of running one register run. That is the 92 -> 301 ns
+   jump in the interpreter, and it is the same shape: `return a + b` is one
+   register run, `if (...) throw ...; return a + b` is not.
+
+For real code this matters more than the fixture: every validation helper,
+parser and assertion path in the wild is "compare, throw on failure, return".
+The engine makes each of those callers pay 3x in the interpreter and refuses
+their callees entirely in the optimizing tier.
+
+**The next slice, in order of value:**
+
+1. Lift `Step::Throw` in the optimizing tier (`Term::Throw` + the lowerer's
+   throw control, mirroring the baseline compiler's `throw_control`). It is one
+   `block_successors` arm plus a terminator, and it un-refuses a whole class of
+   bodies. Verify with `SLAG_JIT_REPORT` that the `Throw` blocker disappears and
+   with the throw/unwind fixtures.
+2. Make a branching leaf lower to register ops with a branch (`if` + `throw` is
+   the minimal case), or at least stop marking such a body a leaf so it takes
+   the general lane rather than the step-path leaf.
+3. Only then revisit closure creation, which is 12% of this row.
+
+Measured along the way, for the next reader: a `for...in` over a 3-key literal
+object is ~790 ns/iteration (`l-leaf-forin` 1.345 µs against `j-leaf` 0.554 for
+the same six calls); a `throw` in a callee costs +209 ns/call even though it
+never executes (`h-throw` 3.10 µs against `i-nothrow` 2.14 over 9 calls); and a
+member read costs ~14 ns on top of a leaf call (`o-method-num`).

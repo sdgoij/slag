@@ -354,6 +354,7 @@ needs its own per-row measurement.
 
 ## 7. Open leads (2026-10-28)
 
+- **The corpus's #1 row is 62% calls, and the optimizing tier refuses every body that contains a `throw`** (2026-10-29). `SLAG_JIT_REPORT` names the blocker: `Throw`, from a single arm in `block_successors` (`crates/jit/src/opt/lift/mod.rs`). `add(a,b){return a+b}` costs 92 ns/call interpreted; add `if (a===b) throw ...` and it costs 301 ns (step-path leaf, because a branching body has no register run) and gets no machine code. Every assertion helper, validator and parser in the wild has that shape. Decomposition and the per-call table are in `.notes/perf.md` (2026-10-29); closure creation, the last two sessions' target, is only 12% of that row.
 - **Closure creation is 280-300 ns against node-jitless's 9 ns, and the
   registry insert and the fresh `JsObject` are the two biggest phases**
   (2026-10-29, `SLAG_CLOSURE_PROFILE` + `SLAG_CLOSURE_SKIP=props`). The record
