@@ -18307,3 +18307,45 @@ The design that is now known to work up to that point, for the next attempt:
 index loop, targets resolved after the array is built to the first step that
 emits an op (skipping the completion wrappers `lower_step` already treats as
 no-ops), gated on an empty shadow at the branch, and the `Return` guard relaxed.
+
+## NULL (2026-10-29): the "tier-selection cluster" and the `calls/*` pessimization are both mirages
+
+`where.py` reports `gap` (slag_jit/node_jit) and `jl_gap` (slag_jl/node_jl), and
+three rows looked like the optimizing tier was hurting:
+
+    gap 28.3, jl_gap 4.4   calls/closure_capture
+    gap  7.4, jl_gap 2.6   calls/method_call
+    gap 13.2, jl_gap 6.6   control/generator_loop
+
+`jl_gap` is not "jitless versus jit". It is slag-jitless over NODE-jitless. So a
+low `jl_gap` next to a high `gap` says the *interpreter* is closer to node's
+interpreter than the compiled engine is to node's compiled engine: it is a
+statement about node's optimizer, not about our tier choice. Measured directly
+(`--corpus` minima over three runs, whole `calls` family):
+
+| row | jit | jitless | ratio |
+| --- | ---: | ---: | ---: |
+| `closure_capture` | 38.4 ms | 123.1 ms | **3.2x faster compiled** |
+| `method_call` | 53.6 | 172.8 | 3.2x |
+| `apply_call` | 30.3 | 100.4 | 3.3x |
+| `recursive_fib` | 46.0 | 496.2 | 10.8x |
+| `direct_leaf` | 5.75 | 78.8 | 13.7x |
+| `construct_churn` | 55.1 | 134.0 | 2.4x |
+
+There is no JIT pessimization on any of them, and `SLAG_OPT=0` changes
+`closure_capture` by 6% and `method_call` by nothing. The 28.3x is node's
+optimizer inlining `fns[i & 63](i)` (node_jit 1.4 ms against its own
+node_jitless ~28 ms, a 20x optimizer win); no tier switch reaches it. The item
+that would is the one the notes already name: a callee resolved *inside a
+compiled loop body*, which needs either a call-site IC for a computed callee or
+OSR plus compiled-code feedback, because `sites_from_feedback` is empty for
+exactly those bodies.
+
+**Tier selection is not a lever either.** Corpus-wide, three interleaved runs:
+the optimizing tier is **1966.7 ms** and `SLAG_OPT=0` is **2236.6 ms**, so the
+optimizing tier is 13.7% faster overall. A per-row oracle could still recover the
+~14 ms the earlier note measured across 20 rows, but no static rule finds it, and
+0.7% does not pay for the machinery.
+
+Both were worth the twenty minutes: they remove the two largest remaining
+candidates from the board with numbers rather than impressions.
