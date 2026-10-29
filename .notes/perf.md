@@ -18631,3 +18631,44 @@ Gates: `cargo fmt --all -- --check`; `cargo clippy --workspace --all-targets
 `language` 23,726 + `built-ins` 23,821 + `annexB` 1,086 + `intl402` 3,365 =
 51,998 at 100% (`--timeout 15 --recheck-timeout 15`); corpus 77 rows
 `mismatches=0`.
+
+### LANDED (2026-10-29, same day): the ordinal threaded through the define
+
+The note above stopped at the two provably redundant scans. The third was a
+*double proof* of the same fact: `fast_fresh_store` proved the key absent by
+scanning (`field_offset`), `define_fresh` proved it again (`map.find`), and the
+cache fill resolved it a third time (`find`).
+
+Now the caller hands the define what it already resolved
+(`FreshKey::{Absent, At(ordinal), Unknown}`) and the define hands back where
+the value landed (`FreshDefine::{Declined, NoMapSlot, At { slot, writable }}`),
+so:
+
+- an undescribed key skips `define_fresh`'s scan entirely (`Absent`);
+- a presize hole fills at the ordinal the caller already found (`At`);
+- the cache fill takes the reported ordinal and writability instead of
+  scanning, and a vector-only define reports `NoMapSlot` so the caller has no
+  slot to cache (the three-state result is why the return type is not a bool:
+  "declined" and "defined without a map slot" must not be conflated).
+
+Measured the same way (7 interleaved rounds, per-row minima, pre-change
+binary): the define probe **36.07 -> 30.47 ms (-15.5%)** for both slices
+together (the hint and the two scan merges alone were -11.9%, so this half is
+about -4%), `objects/spread_assign` 94.68 -> 89.59 (-5.4%),
+`builtins/json_roundtrip` -3.0%, `control/generator_loop` -5.4%. The corpus is
+**1960.7 -> 1953.5 (-0.37% for this half, -0.97% against the pre-change
+binary)**, which is honest: only the rows that define incrementally move, and
+the rest of the swing is the layout noise the sampler commit measured.
+
+**The trap this half walked into, and the test that caught it.** Treating
+`Map::field_offset == None` as "the key is absent" is wrong: a
+non-default-attributes define, a dictionary-mode object, and a key past
+`INLINE_FIELDS` are all *undescribed but present* — they live only in the
+property vector. `installed_jit_member_store_respects_non_writable` failed
+(50 instead of 10) because a `writable: false` property was redefined as a
+fresh writable field. The map describes exactly the keys whose field mirrors
+the value; undescribed means "not map-served", never "not present". The
+fallback to `get_own_property_key` is load-bearing.
+
+Gates: same four as above, all at 100%, plus `--gc-stress --gc-verify` on the
+define probe.

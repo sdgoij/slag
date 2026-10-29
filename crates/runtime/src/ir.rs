@@ -6228,6 +6228,7 @@ impl Vm {
         key: &PropertyKeyName,
         value: &Value,
     ) -> Result<bool, JsError> {
+        use crux::object::{FreshDefine, FreshKey};
         let PropertyKeyName::Name(atom) = key else {
             return Ok(false);
         };
@@ -6251,42 +6252,50 @@ impl Vm {
         // the authoritative own-property signal — the field is written iff
         // the property vector holds the key (every mapped write mirrors
         // both, and a delete drops the object to dictionary mode), so the
-        // property-vector scan is skipped.
-        let existing = if let Some(map) = receiver.map.get()
-            && let Some(offset) = map.field_offset(&property_key)
-        {
-            receiver.map_field(offset).is_some()
+        // property-vector scan is skipped. The same scan answers the define
+        // below: a mapped-but-unwritten descriptor is a presize hole it can
+        // fill without resolving the key again, and an undescribed key is
+        // provably absent.
+        let (existing, fresh) = if let Some(map) = receiver.map.get() {
+            match map.field_offset(&property_key) {
+                Some(offset) if receiver.map_field(offset).is_some() => (true, FreshKey::Unknown),
+                Some(offset) => (false, FreshKey::At(offset)),
+                // Undescribed is NOT absent: a non-default-attributes define,
+                // a dictionary-mode object, or a key past `INLINE_FIELDS`
+                // lives only in the property vector. The map describes only
+                // keys whose field mirrors the value.
+                None => (
+                    receiver.get_own_property_key(&property_key)?.is_some(),
+                    FreshKey::Absent,
+                ),
+            }
         } else {
-            receiver.get_own_property_key(&property_key)?.is_some()
+            (
+                receiver.get_own_property_key(&property_key)?.is_some(),
+                FreshKey::Unknown,
+            )
         };
         if existing {
             return Ok(false);
         }
-        let ok = if let Some(proto) = receiver.get_prototype_of()? {
+        let defined = if let Some(proto) = receiver.get_prototype_of()? {
             if !Self::member_store_cell_probe(agent, &proto, *atom)
                 && !Self::member_store_cell_resolve(agent, &receiver, &property_key, *atom)
             {
                 return Ok(false);
             }
-            receiver.fresh_data_define(&property_key, *value)
+            receiver.fresh_data_define_at(&property_key, *value, fresh)
         } else {
             // No chain: [[Set]] always defines on the receiver.
-            receiver.fresh_data_define(&property_key, *value)
+            receiver.fresh_data_define_at(&property_key, *value, fresh)
         };
+        let ok = defined.is_defined();
         // Part B, B5.2/B5.4: `fresh_data_define` wrote the value into the
         // field the map assigned (a fresh transition or a boilerplate
         // pre-sized field) — cache the (map_id, name) → offset entry for the
-        // read path. A dictionary-mode define (map full) has no field.
-        if ok
-            && let Some(map) = receiver.map.get()
-            // One descriptor scan answers both questions: the offset the
-            // fresh define assigned and whether the descriptor is writable.
-            // (`field_offset` + `find` walked the same vector twice.)
-            && let Some((slot, writable)) = map.find(&property_key).and_then(|ord| {
-                let (_, offset, attrs) = map.descriptor_at(ord)?;
-                Some((offset, attrs.writable()))
-            })
-        {
+        // read path. It reports the offset it used, so no descriptor scan is
+        // needed here; a dictionary-mode define (map full) has no field.
+        if let (FreshDefine::At { slot, writable }, Some(map)) = (defined, receiver.map.get()) {
             let map_id = map.id();
             let index = Self::member_map_cell_index(map_id, *atom);
             let (proto_id, proto_gen) = Self::member_map_proto(&receiver);

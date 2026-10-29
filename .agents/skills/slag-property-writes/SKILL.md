@@ -157,6 +157,22 @@ following read — and the compiled probe — hits without a vector access).
 
 ## 3. Adding a path that mutates the property vector
 
+- **`Map::field_offset` returning `None` means "not map-served", never
+  "not present".** The map describes exactly the keys whose field mirrors the
+  value; a non-default-attributes define, a dictionary-mode object and a key
+  past `INLINE_FIELDS` are present in the property vector only. A fresh-define
+  path that treats `None` as absence skips the property-vector presence check
+  and redefines a `writable: false` property as a new writable field (the
+  `installed_jit_member_store_respects_non_writable` regression). The
+  `get_own_property_key` fallback is load-bearing.
+- **A define that resolves the key once can pass the verdict on.**
+  `JsObject::fresh_data_define_at` takes a `FreshKey` (`Absent` / `At(ordinal)`
+  / `Unknown`) and returns a `FreshDefine` (`Declined` / `NoMapSlot` /
+  `At { slot, writable }`). Only a caller that resolved the key against the
+  same map with no user code in between may pass anything but `Unknown`; the
+  three-state result exists because "declined" and "defined with no map slot"
+  must not be conflated (a vector-only define returns `NoMapSlot`).
+
 - A new interpreter path that writes a property-vector entry in place
   (`*slot = value` on `props`) or defines an own property MUST bump the
   generation, and should mirror the inline field when the key is mapped

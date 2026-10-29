@@ -311,7 +311,7 @@ the proof. The proof is the priced next slice; see section 7.
 | The splice's static route: a call whose callee operand is a `NewClosure` (directly, or through a frame slot stored once in the entry block) splices with no comparison and no feedback, plus the `normalize`/`narrow`/`mem2reg` re-run after `inline` | `opcost/js_call` 0.88 -> 0.53 ms (-40%), `opcost/array_for_each_js` -9%; corpus flat (-0.16%: 2 rows of 77), IR diff confirms exactly those 2 rows |
 | The member-call splice: a member read of a literal object's field that holds a closure splices behind `CalleeEq(operand, literal_value)`, the literal being the body's own `NewClosure` SSA value (so a per-call closure still matches, and a field written since falls back) | `opcost/method_call` 1.19 -> 0.68 ms (-43%), `opcost/js_call` 0.778 -> 0.588, corpus -0.74%; IR diff confirms exactly 3 rows |
 | The canonical empty map a function kind's `[[Prototype]]` implies is cached per kind in the agent roots, and `Function::new_with_prototype_and_map` builds the object on it | closure probe 94.87 -> 91.52 ms min (-3.5%), for-in head-let 755.3 -> 746.0 ms min (-1.2%, every paired run), corpus mean-jitGap 9.46 -> 9.36 |
-| A one-entry transition hint on `Map` (`SLAG_DEFINE_HINT`), the define writing the ordinal it already knows instead of re-scanning the child map, and one `find` where the define cache fill ran `field_offset` + `find` over the same vector | define probe 35.85 -> 31.58 ms (-11.9%), `objects/spread_assign` 95.64 -> 90.74 (-5.1%), corpus 1963.7 -> 1952.0 (-0.60%); the hint alone (same-binary seam) is -3.0% and `Map::get_or_create_child` falls from 10.6% to 2.9% of the probe |
+| A one-entry transition hint on `Map` (`SLAG_DEFINE_HINT`), the define writing the ordinal it already knows instead of re-scanning the child map, and the caller's resolved key handed into the define (`FreshKey`/`FreshDefine`) so one scan serves all three consumers | define probe 36.07 -> 30.47 ms (-15.5%), `objects/spread_assign` 94.68 -> 89.59 (-5.4%), `json_roundtrip` -3.0%, `control/generator_loop` -5.4%, corpus 1960.7 -> 1953.5 (-0.37% this half, -0.97% against the pre-change binary); the hint alone (same-binary seam) is -3.0% and `Map::get_or_create_child` falls from 10.6% to 2.9% of the probe |
 | The optimizing tier lifts `Term::Throw` (was its only refused terminator); `throw_control` is the lowering, so iterator close and `using` disposal still run | `opt-blockers: Throw` gone; for-in head-let jit 377.7 -> 368.8 ms (-2.4%), corpus flat (-0.35%, inside the noise floor) |
 | Global read cells (declarative record, nested bodies) | top-level `const` 52.5 -> about 2.4 ms per 1M; nested helper 130.2 -> 2.5 ms |
 | Map key-index mixer (Goats) | `mapget` -29%, `maphas` -37% |
@@ -412,12 +412,20 @@ needs its own per-row measurement.
   `Map::get_or_create_child` 5.1%, `get_own_property_key` 3.8%). A define of a
   new key on a fresh object cost **45 ns** against 3.5 ns for a warm store
   (`scratch/storecost`); the transition hint, the known-ordinal write and the
-  merged cache-fill scan landed 2026-10-29 and took the define probe to 31.58 ms
-  (-11.9%, `spread_assign` -5.1%). **The remaining half is the ordinal**: the
-  pre-check proves the key absent with a scan, `define_fresh` proves it again,
-  and the cache fill resolves it a third time. Threading the pre-check's
-  ordinal into `define_fresh` (and its result back out) removes two scans; the
-  measured cost is ~3.3% of the probe per scan.
+  threaded ordinal landed 2026-10-29 and took the define probe to 30.47 ms
+  (-15.5%, `spread_assign` -5.4%). **The scans are now one per define** (the
+  caller's, handed in); what is left is the helper round trip itself — 23% of
+  the probe is the `assign_member`/`fast_fresh_store` body, i.e. calls and
+  branch plumbing, not descriptor walks. Going further means taking the
+  define into machine code (the scoped shape-cell slice above), not more
+  trimming.
+- **`Map::field_offset` returning `None` never means "absent".** It means
+  "not map-served": a non-default-attributes define, a dictionary-mode object
+  and a key past `INLINE_FIELDS` are present in the property vector only, and
+  the map describes exactly the keys whose field mirrors the value. A define
+  path that skips the `get_own_property_key` fallback on `None` redefines a
+  `writable: false` property (caught by
+  `installed_jit_member_store_respects_non_writable`).
 - **`runtime::function` (closure creation) is 10.8% of the #1 row and 12.9% of
   the #2 row**, and 3.7% corpus-wide. The mechanism is known and priced
   (280-300 ns against node's 9); every structural attempt so far is a measured

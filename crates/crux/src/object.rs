@@ -1173,6 +1173,40 @@ impl fmt::Debug for JsObject {
     }
 }
 
+/// What a caller already knows about a key in the receiver's current map (see
+/// [`JsObject::fresh_data_define_at`]). A define that trusted a stale or wrong
+/// claim would write the wrong field, so only a caller that resolved the key
+/// against the same map, with no user code in between, may pass anything but
+/// [`FreshKey::Unknown`].
+#[derive(Debug, Clone, Copy)]
+pub enum FreshKey {
+    /// The map holds no descriptor for the key.
+    Absent,
+    /// The map describes the key at this descriptor ordinal.
+    At(usize),
+    /// Nothing is known; resolve it in the define.
+    Unknown,
+}
+
+/// The outcome of a fresh define (see [`JsObject::fresh_data_define_at`]).
+#[derive(Debug, Clone, Copy)]
+pub enum FreshDefine {
+    /// Not a fresh define: the caller must take the full `[[Set]]`.
+    Declined,
+    /// Defined, but the map does not describe the key (vector-only storage),
+    /// so there is no `(map id, offset)` pair to cache.
+    NoMapSlot,
+    /// Defined at a map descriptor: the storage offset the map assigned and
+    /// whether that descriptor is writable.
+    At { slot: usize, writable: bool },
+}
+
+impl FreshDefine {
+    pub fn is_defined(self) -> bool {
+        !matches!(self, Self::Declined)
+    }
+}
+
 impl JsObject {
     /// When this object is a function's object part, the function as a
     /// language value (so a prototype link like `Object.getPrototypeOf(f)`
@@ -3797,7 +3831,21 @@ impl JsObject {
     /// machinery. Returns false when the receiver is not extensible (the
     /// caller then falls back to the full [[Set]]).
     pub fn fresh_data_define(&self, key: &PropertyKey, value: Value) -> bool {
-        self.define_fresh(key, value, true, true, true)
+        self.define_fresh(key, value, true, true, true, FreshKey::Unknown)
+            .is_defined()
+    }
+
+    /// [`Self::fresh_data_define`] for a caller that already resolved the key
+    /// against the receiver's current map, and that wants the storage offset
+    /// the define used (the map-served read cache) without scanning the
+    /// descriptors a second time.
+    pub fn fresh_data_define_at(
+        &self,
+        key: &PropertyKey,
+        value: Value,
+        fresh: FreshKey,
+    ) -> FreshDefine {
+        self.define_fresh(key, value, true, true, true, fresh)
     }
 
     /// Append a fresh data property with EXPLICIT attributes on an ordinary,
@@ -3817,7 +3865,15 @@ impl JsObject {
         enumerable: bool,
         configurable: bool,
     ) -> bool {
-        self.define_fresh(key, value, writable, enumerable, configurable)
+        self.define_fresh(
+            key,
+            value,
+            writable,
+            enumerable,
+            configurable,
+            FreshKey::Unknown,
+        )
+        .is_defined()
     }
 
     /// Cut 67 batch entry: adopt a pre-forked vector-free shape in one step.
@@ -3926,9 +3982,10 @@ impl JsObject {
         writable: bool,
         enumerable: bool,
         configurable: bool,
-    ) -> bool {
+        fresh: FreshKey,
+    ) -> FreshDefine {
         if !matches!(self.kind, ObjectKind::Ordinary) || !self.extensible.get() {
-            return false;
+            return FreshDefine::Declined;
         }
         if matches!(key, PropertyKey::String(_)) {
             self.bump_named_version();
@@ -3947,7 +4004,13 @@ impl JsObject {
         if let Some(map) = self.map.get()
             && (self.props_deferred.get() || self.properties.borrow().is_empty())
         {
-            if let Some(ord) = map.find(key) {
+            // A caller that already resolved the key against this map
+            // (`FreshKey`) saves the scan; `Unknown` is the general form.
+            if let Some(ord) = match fresh {
+                FreshKey::Absent => None,
+                FreshKey::At(ord) => Some(ord),
+                FreshKey::Unknown => map.find(key),
+            } {
                 // A map-described key. On the presize entry path the
                 // descriptor may still be an unwritten hole — filling it is
                 // a fresh define, not a duplicate update. Vector-free
@@ -3957,12 +4020,19 @@ impl JsObject {
                 // lands BELOW an already-written descriptor materializes
                 // first (the rebuild preserves creation order so far) and
                 // appends through the standard path in execution order.
+                let descriptor_writable = map
+                    .descriptor_at(ord)
+                    .map(|(_, _, attrs)| attrs.writable())
+                    .unwrap_or(writable);
                 let written = self.field_written(ord);
                 if written || !self.higher_field_written(&map, ord) {
                     self.props_deferred.set(true);
                     let _ = self.map_set(key, value);
                     self.bump_generation();
-                    return true;
+                    return FreshDefine::At {
+                        slot: ord,
+                        writable: descriptor_writable,
+                    };
                 }
                 self.materialize_properties();
             } else if map.descriptor_count() < INLINE_FIELDS {
@@ -3976,7 +4046,10 @@ impl JsObject {
                     crate::heap::write_barrier(self, value);
                     self.in_fields[ordinal].set(value);
                     self.bump_generation();
-                    return true;
+                    return FreshDefine::At {
+                        slot: ordinal,
+                        writable,
+                    };
                 }
                 // The map could not fork (a shared-handle mutation limit):
                 // fall through to the standard append with the flag clear.
@@ -4025,7 +4098,25 @@ impl JsObject {
             index.insert(key.clone(), position);
         }
         self.bump_generation();
-        true
+        // The standard append stored the value in the vector, and (when the
+        // map describes the key) mirrored it into the field. Report where so
+        // the caller can cache the map-served read.
+        match self.map.get().and_then(|m| m.find(key)) {
+            Some(ord) => {
+                let (slot, descriptor_writable) = self
+                    .map
+                    .get()
+                    .and_then(|m| m.descriptor_at(ord))
+                    .map_or((ord, writable), |(_, offset, attrs)| {
+                        (offset, attrs.writable())
+                    });
+                FreshDefine::At {
+                    slot,
+                    writable: descriptor_writable,
+                }
+            }
+            None => FreshDefine::NoMapSlot,
+        }
     }
 
     /// PrivateFieldAdd/PrivateMethodOrAccessorAdd storage (spec 10.2.10,
