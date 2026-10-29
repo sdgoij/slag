@@ -18272,3 +18272,38 @@ a body stays on the step path" rule in the bytecode-vm skill.
 The step lists above are the artifact: the next attempt starts from them, not
 from re-deriving what a guard clause compiles to. Reverted; `crates/` is
 unchanged.
+
+### NULL (2026-10-29, second attempt): the register form cannot carry a branch yet
+
+Re-attempted the branch-capable register leaf, this time with the completion
+wrappers understood. Two findings, one of them load-bearing.
+
+**The `Return` rule was the first blocker, and relaxing it is sound and ready.**
+`lower_step`'s `Step::Return` arm refused any return that was not the body's last
+step, which is every multi-path body. `ReturnAcc` ends the register run, so the
+ops emitted for the steps after it are reachable only through a jump that targets
+them; dropping the `index + 1 != total` guard is correct on its own.
+
+**The real blocker is the shadow stack at the branch.** With the branch ops in,
+the wrapper skipping in and the target resolution working, `lower_leaf_ops` still
+returns `None` - and tracing every other return point in the function left the
+branch guard as the only one that can fire. So at
+
+    LoadLocal 0, LoadLocal 1, Binary(StrictEqual), JumpIfFalse(8)
+
+the compile-time operand stack is NOT empty when the branch is reached: the
+register binary consumes its right operand and leaves the left one as a re-readable
+shadow entry (the op re-reads it from the frame). A branch with a live shadow would
+need the two paths to agree about that entry, which the flat op array has no phi
+to express - the guard is right to refuse.
+
+Fixing it means changing the binary lowering so a condition leaves the shadow
+empty, which is a change to the register op contracts (`BinReg`/`BinImmLocal` and
+the operands' re-read semantics), not a slice on top of them. Reverted again;
+`crates/` is unchanged.
+
+The design that is now known to work up to that point, for the next attempt:
+`LeafOp::Jump`/`JumpIfFalse`/`JumpIfTrue` over op indices, the executor as an
+index loop, targets resolved after the array is built to the first step that
+emits an op (skipping the completion wrappers `lower_step` already treats as
+no-ops), gated on an empty shadow at the branch, and the `Return` guard relaxed.
