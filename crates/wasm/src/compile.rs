@@ -5489,8 +5489,17 @@ impl<'a> Lowerer<'a> {
         }
     }
 
-    /// Native integer `abs`/`neg` unops (both wrap within the lane width).
+    /// Native integer `abs`/`neg` unops (both wrap within the lane width), and
+    /// `i8x16.popcnt`.
     fn native_int_unop(&mut self, sub: u16, v: ClifValue) -> Option<ClifValue> {
+        if sub == 0x62 {
+            // Cranelift lowers a vector `popcnt` to `vpopcntb` (AVX512 BITALG),
+            // a `pshufb` nibble lookup (SSSE3), or a shift/mask sequence, so the
+            // backend picks the best one the host has.
+            let v = self.bitcast_lanes(types::I8X16, v);
+            let out = self.builder.ins().popcnt(v);
+            return Some(self.bitcast_lanes(types::I128, out));
+        }
         let (ty, abs) = match sub {
             0x60 => (types::I8X16, true),
             0x61 => (types::I8X16, false),
@@ -13557,7 +13566,8 @@ mod tests {
     #[test]
     fn v128_native_int_lane_ops_match_the_interpreter() {
         // Integer min/max, saturating add/sub, the unsigned rounding average,
-        // the two narrow forms, extmul and the widening extends. The operand
+        // the two narrow forms, extmul, the widening extends, and
+        // `i8x16.popcnt`. The operand
         // pairs deliberately differ in their two halves so a wrong low/high
         // choice in `extmul`/`extend` changes the result.
         let v128 = ValType::V128;
@@ -13568,8 +13578,8 @@ mod tests {
             0x65, 0x66, 0x85, 0x86, // narrow
             0x9c, 0x9d, 0x9e, 0x9f, 0xbc, 0xbd, 0xbe, 0xbf, 0xdc, 0xdd, 0xde, 0xdf, // extmul
         ];
-        let unops: [u16; 12] = [
-            0x87, 0x88, 0x89, 0x8a, 0xa7, 0xa8, 0xa9, 0xaa, 0xc7, 0xc8, 0xc9, 0xca,
+        let unops: [u16; 13] = [
+            0x62, 0x87, 0x88, 0x89, 0x8a, 0xa7, 0xa8, 0xa9, 0xaa, 0xc7, 0xc8, 0xc9, 0xca,
         ];
         let mut functions: Vec<u32> = vec![0; binops.len()];
         functions.extend(std::iter::repeat_n(1, unops.len()));

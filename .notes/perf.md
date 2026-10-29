@@ -19172,7 +19172,41 @@ functions compiled; `simd` → 59 suites, 0 diverged; `relaxed-simd` → 7 suite
 compile --lib` (130), `-p wasm --lib` (44), workspace clippy, `cargo fmt
 --check` clean.
 
-What is still on the helper: `i8x16.popcnt`, `i16x8.q15mulr_sat_s`,
-`i32x4.dot_i16x8_s`, the `extadd_pairwise` forms, and relaxed q15mulr and the
-dot products. Each of those has no Cranelift instruction, so closing them means
-hand-built sequences rather than a lowering.
+What is still on the helper: `i16x8.q15mulr_sat_s`, `i32x4.dot_i16x8_s`, the
+`extadd_pairwise` forms, and relaxed q15mulr and the dot products.
+
+## MEASURED (2026-10-29, same day): `i8x16.popcnt` lowers, 13.7x
+
+One attempt at the leftovers. **Correction to the entry above:** `popcnt` does
+have a Cranelift lowering for `I8X16`, so the "no Cranelift instruction"
+claim covered only the six ops that remain. The x64 backend picks between
+`vpopcntb` (AVX512 VL + BITALG), a `pshufb` nibble lookup (SSSE3, 7 ops), and a
+shift/mask sequence, so the lowering is one CLIF instruction and the backend
+chooses.
+
+**Fixture.** `crates/wasmtest/fixtures/simd-native-popcnt.wast`, 2M
+iterations with three `popcnt`s each, cycling the bytes back up between them so
+the input stays varied. Expected `168298504` from Node v24.12.0.
+
+| row | compiled | helper | interpreter |
+|---|---|---|---|
+| simd-popcnt | **30.64** | 418.34 | 1272.73 |
+| simd-madd (re-run) | 28.27 | 233.46 | 873.74 |
+| simd-relaxed (re-run) | 74.21 | 789.56 | 2449.18 |
+| simd-loop control | 12.10 | - | - |
+| leaf-loop control | 14.01 | - | - |
+
+Same-binary A/B: **30.64 vs 418.34 ms, 13.7x**; the compiled row is 41.5x the
+interpreter row. The helper side of this row is the cheapest of the eight
+(418 ms for 6M popcounts), which is why the *ratio* is mid-pack while the
+absolute compiled time is among the lowest: a per-byte `count_ones()` loop is
+already cheap, so there is less to win.
+
+**Gates.** `equiv waspec/test/core` → 254 suites, 0 diverged, 8264/8264
+functions compiled. `cargo test -p wasm --features compile --lib` (130, with
+`i8x16.popcnt` added to the integer lane differential test), workspace clippy
+and `cargo fmt --check` clean.
+
+The remaining six (`q15mulr_sat_s`, `dot_i16x8_s`, three `extadd_pairwise`
+forms, relaxed q15mulr, relaxed dot) are the ones with no Cranelift
+instruction, so they would need hand-built sequences.

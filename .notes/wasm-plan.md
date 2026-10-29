@@ -2923,10 +2923,11 @@ predicted; the win is entirely per-op instructions. Details, including the
 `shr_s`/`shr_u` table swap the corpus caught, the NaN-canonicalization rules,
 and the demote/promote asymmetry, are in `.notes/perf.md`.
 
-Still on the helper after this cut: `i8x16.popcnt`, `i16x8.q15mulr_sat_s`,
+Still on the helper after this cut: `i16x8.q15mulr_sat_s`,
 `i32x4.dot_i16x8_s`, the `extadd_pairwise` forms, and relaxed q15mulr and the
 dot products. Each has no Cranelift instruction, so closing them means
-hand-built sequences rather than a lowering.
+hand-built sequences rather than a lowering. (`i8x16.popcnt` turned out to
+have one and is lowered.)
 
 ### 10.4 Outside wasm (for completeness)
 
