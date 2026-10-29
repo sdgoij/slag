@@ -187,6 +187,9 @@ impl JitEngine {
                             crate::opt::pass::inline::InlineTarget::Declared { init_step } => {
                                 u64::MAX - *init_step as u64
                             }
+                            crate::opt::pass::inline::InlineTarget::Created { create_step } => {
+                                u64::MAX / 2 - *create_step as u64
+                            }
                         };
                         if let Some(hit) = lifted.get(&key) {
                             return hit.clone();
@@ -197,6 +200,9 @@ impl JitEngine {
                             } => runtime::jit::resolve_callee(*callee_id),
                             crate::opt::pass::inline::InlineTarget::Declared { init_step } => {
                                 runtime::jit::resolve_declaration(body, *init_step)
+                            }
+                            crate::opt::pass::inline::InlineTarget::Created { create_step } => {
+                                runtime::jit::resolve_created(body, *create_step)
                             }
                         };
                         if std::env::var("SLAG_INLINE_TRACE").is_ok() {

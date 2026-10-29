@@ -16,6 +16,11 @@ use std::rc::Rc;
 
 use crate::opt::ir::{BlockId, Effects, Function, Imm, Inst, Op, Term, Type, ValueId};
 
+/// The creation-site splices this process has performed (the opt-tier tests
+/// assert the static route fired, since no feedback-derived site exists for a
+/// loop-bodied caller).
+pub(crate) static CREATED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// What the splice assumes about the callee.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum InlineTarget {
@@ -28,6 +33,10 @@ pub enum InlineTarget {
     /// (`CompiledBody::declared_calls`): the slot at the call is that closure by
     /// construction, so no comparison is needed.
     Declared { init_step: usize },
+    /// The closure a `Step::CreateFunction` in the caller creates, which the
+    /// call's callee operand provably is (the `NewClosure` itself, or a frame
+    /// slot stored once in the entry block with it): no comparison is needed.
+    Created { create_step: usize },
 }
 
 /// A call site's inline target.
@@ -106,6 +115,123 @@ pub fn sites_from_declarations(body: &runtime::ir::CompiledBody) -> Vec<Option<I
     sites
 }
 
+/// The call sites whose callee operand is provably a closure `func` creates,
+/// indexed by step: a call whose callee is a `NewClosure` value, directly or
+/// through a frame slot stored once in the entry block with it.
+///
+/// This is the static route to the splice, and the only one available to a loop
+/// body: such a body is compiled on its first consult, so it never runs an
+/// interpreted step and `sites_from_feedback` is always empty for it
+/// (`.notes/perf.md`, 2026-10-28).
+#[must_use]
+pub fn sites_from_creations(func: &Function, steps: usize) -> Vec<Option<InlineSite>> {
+    let mut sites = vec![None; steps];
+    let Some(slots) = single_closure_slots(func) else {
+        return sites;
+    };
+    for b in 0..func.block_count() as u32 {
+        for inst in &func.block(b).insts {
+            let (Op::Call, Imm::Int(step)) = (inst.op, &inst.imm) else {
+                continue;
+            };
+            if inst.args.len() < 2 {
+                continue;
+            }
+            let Some(site) = sites.get_mut(*step as usize) else {
+                continue;
+            };
+            if site.is_some() {
+                continue;
+            }
+            let Some(create_step) = closure_step(func, inst.args[1], &slots) else {
+                continue;
+            };
+            *site = Some(InlineSite {
+                target: InlineTarget::Created { create_step },
+            });
+        }
+    }
+    sites
+}
+
+/// The frame slots that hold a closure on every path: stored exactly once, in the
+/// entry block (which dominates every reached block), with a `NewClosure`. `None`
+/// when the body writes a slot without naming it (the fused declaration and
+/// loop-binding steps), which makes no slot provable.
+fn single_closure_slots(func: &Function) -> Option<std::collections::HashMap<u32, ValueId>> {
+    let mut slots: std::collections::HashMap<u32, Option<ValueId>> =
+        std::collections::HashMap::new();
+    for b in 0..func.block_count() as u32 {
+        for inst in &func.block(b).insts {
+            if matches!(
+                inst.op,
+                Op::FunctionDecl | Op::ForOfBindLocal | Op::ForOfNextBindLocal
+            ) {
+                return None;
+            }
+            let (Op::FrameStore, Imm::Slot(slot)) = (inst.op, &inst.imm) else {
+                continue;
+            };
+            let candidate = inst
+                .args
+                .first()
+                .copied()
+                .filter(|&value| b == func.entry() && defines_closure(func, value));
+            slots
+                .entry(*slot)
+                .and_modify(|value| *value = None)
+                .or_insert(candidate);
+        }
+    }
+    Some(
+        slots
+            .into_iter()
+            .filter_map(|(slot, value)| value.map(|value| (slot, value)))
+            .collect(),
+    )
+}
+
+/// The `Step::CreateFunction` index behind a callee operand: a `NewClosure`
+/// value, or a load of a frame slot that holds one.
+fn closure_step(
+    func: &Function,
+    value: ValueId,
+    slots: &std::collections::HashMap<u32, ValueId>,
+) -> Option<usize> {
+    let value = match defining_inst(func, value) {
+        Some(inst) if inst.op == Op::NewClosure => value,
+        Some(inst) => match inst.imm {
+            Imm::Slot(slot) if inst.op == Op::FrameLoad => *slots.get(&slot)?,
+            _ => return None,
+        },
+        None => return None,
+    };
+    match defining_inst(func, value)?.imm {
+        Imm::Int(step) => Some(step as usize),
+        _ => None,
+    }
+}
+
+/// Whether `value` is produced by a `NewClosure`.
+fn defines_closure(func: &Function, value: ValueId) -> bool {
+    defining_inst(func, value).is_some_and(|inst| inst.op == Op::NewClosure)
+}
+
+/// The instruction that produced `value`.
+fn defining_inst(func: &Function, value: ValueId) -> Option<&Inst> {
+    for b in 0..func.block_count() as u32 {
+        if let Some(inst) = func
+            .block(b)
+            .insts
+            .iter()
+            .find(|inst| inst.result == Some(value))
+        {
+            return Some(inst);
+        }
+    }
+    None
+}
+
 /// Every spliceable site of `body`: the ones a declaration proves, plus — when
 /// `with_feedback` — the feedback-recorded callees. A declared site wins when
 /// both apply, because it needs no comparison.
@@ -137,6 +263,14 @@ fn inline_budget() -> usize {
         .unwrap_or(DEFAULT_INLINE_BUDGET)
 }
 
+/// Whether the static creation sites are derived (`SLAG_INLINE_CREATED=0`
+/// disables them) — the same-binary seam for measuring this route alone.
+fn created_sites_enabled() -> bool {
+    std::env::var("SLAG_INLINE_CREATED")
+        .map(|value| value != "0")
+        .unwrap_or(true)
+}
+
 /// Inline every spliceable monomorphic call site, recursing into a callee's own
 /// sites under a step budget. `sites` is indexed by step (the `Op::Call`'s
 /// `Imm::Int`); `resolve` yields the callee. Returns whether the IR changed.
@@ -146,12 +280,26 @@ pub fn run(
     resolve: &mut dyn FnMut(&InlineTarget) -> Option<Callee>,
 ) -> bool {
     let mut changed = false;
+    // The static sites (a callee the body itself creates) are derived from the
+    // IR, so they do not depend on feedback. They are merged only here: a
+    // spliced-in callee's IR names the callee's own step list, so its sites are
+    // the ones the resolver computed for it.
+    let created = if created_sites_enabled() {
+        sites_from_creations(func, sites.len())
+    } else {
+        vec![None; sites.len()]
+    };
+    let sites: Vec<Option<InlineSite>> = sites
+        .iter()
+        .zip(created)
+        .map(|(site, created)| site.or(created))
+        .collect();
     let blocks = func.block_count() as u32;
     for b in 0..blocks {
         // The budget is per top-level site; the recursion shares it, so a
         // self-recursive callee stops expanding and leaves a real call.
         let mut budget = inline_budget();
-        if try_inline(func, b, sites, resolve, &mut budget) {
+        if try_inline(func, b, &sites, resolve, &mut budget) {
             changed = true;
         }
     }
@@ -359,8 +507,12 @@ fn try_inline(
         }
         // The declaration owns the slot: nothing writes it after the hoisted
         // init, so the callee at this call IS the closure whose body was
-        // spliced and no check can fail.
-        InlineTarget::Declared { .. } => {
+        // spliced and no check can fail. The creation site's callee operand is
+        // that closure by construction, for the same reason.
+        InlineTarget::Declared { .. } | InlineTarget::Created { .. } => {
+            if matches!(site.target, InlineTarget::Created { .. }) {
+                CREATED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
             func.block_mut(b).term = Some(Term::Jump {
                 target: block_map[0],
                 args: Vec::new(),
@@ -593,7 +745,7 @@ mod tests {
     fn by_id(f: impl Fn(u64) -> Option<Callee>) -> impl FnMut(&InlineTarget) -> Option<Callee> {
         move |target| match target {
             InlineTarget::Guarded { callee_id, .. } => f(*callee_id),
-            InlineTarget::Declared { .. } => None,
+            InlineTarget::Declared { .. } | InlineTarget::Created { .. } => None,
         }
     }
 

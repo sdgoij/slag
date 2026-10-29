@@ -72,6 +72,17 @@ fn unbox_enabled() -> bool {
         .unwrap_or(true)
 }
 
+/// Whether the pipeline re-runs `normalize`/`narrow`/`mem2reg` after `inline` as
+/// well as after `scalar` (`SLAG_RETYPE_INLINED=0` disables the inline half).
+/// On because the static-creation splice replaces a call whose result was
+/// `Unknown` with typed arithmetic, which is what the earlier flat measurement
+/// was missing (`.notes/perf.md`, 2026-10-28).
+fn retype_inlined_enabled() -> bool {
+    std::env::var("SLAG_RETYPE_INLINED")
+        .map(|v| v != "0")
+        .unwrap_or(true)
+}
+
 /// Run the pass pipeline over `func`. Returns whether the IR changed. `sites`
 /// is the caller's monomorphic call-site map and `resolve` yields a callee's
 /// lifted IR (I5c-2c); an empty map makes the inline pass a no-op.
@@ -96,14 +107,26 @@ pub fn run(
     // `scalar` removes a read guard and substitutes a typed value for its
     // result, which can newly prove a loop-carried accumulator numeric and
     // promote a frame slot that the earlier `narrow`/`mem2reg` declined (its
-    // store read the guard, whose result is `Unknown`). Re-run them, but only
-    // when scalar actually changed the body, so no other row is disturbed.
-    // (Gating on `inlined` too was measured and does not pay: inlining does not
-    // substitute a typed value for the call result, so the re-type is a wash.)
-    let retyped_after_scalar = scalarized && {
-        let narrowed_again = narrow::run(func);
-        let promoted_again = mem2reg_enabled() && promote_frame_slots(func);
-        narrowed_again || promoted_again
+    // store read the guard, whose result is `Unknown`). `inline` does the same
+    // thing when the splice replaces a call with typed arithmetic: the call's
+    // result was `Unknown` and the spliced body's value is not. Re-run them, but
+    // only when one of the two actually changed the body, so no other row is
+    // disturbed.
+    let retyped_after_scalar = (scalarized || (inlined && retype_inlined_enabled())) && {
+        // Type every block parameter from its incoming arguments and narrow
+        // again, twice: a merge or continuation parameter is `Unknown` when the
+        // splice creates it (it takes the call's result type) and the numeric
+        // lattice reads a parameter's declared type, so a value that crosses a
+        // block boundary is only proven numeric on a round after the one that
+        // typed its edge argument.
+        let mut changed = false;
+        for _ in 0..2 {
+            let narrowed = narrow::run(func);
+            let normalized = normalize_param_types(func);
+            let promoted = mem2reg_enabled() && promote_frame_slots(func);
+            changed |= narrowed || normalized || promoted;
+        }
+        changed
     };
     let dropped = dce_enabled() && dce::run(func);
     let counted = loop_counter::run(func);

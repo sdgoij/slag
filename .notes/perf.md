@@ -17559,3 +17559,77 @@ slice, and it needs no feedback at all.
 Instrument added: `SLAG_INLINE_TRACE=1` prints the site count per compiled body,
 each recorded site's state/hits/first id, and each resolver lookup's outcome.
 Compile-time only, so it costs nothing when unset.
+
+## LANDED (2026-10-28): the splice's static route, and the re-type after inlining
+
+The PROBE above found the splice starved: a loop-bodied caller is compiled on its
+first consult, so it never runs an interpreted step, so it never records a call
+site, so `sites_from_feedback` is empty for exactly the bodies where the splice
+would pay. This lands the route that needs no feedback.
+
+**`sites_from_creations`** derives a splice target from the IR: a `Op::Call`
+whose callee operand is a `NewClosure` value, directly or through a frame slot
+stored exactly once in the entry block. The slot argument is the one
+`slot_aliases` already makes (an entry-block store dominates every reached
+block, and a captured binding lives in a context slot, not a frame slot); a body
+that writes a slot without naming it (`FunctionDecl`, `ForOfBindLocal`,
+`ForOfNextBindLocal`) refuses every slot. The site is `InlineTarget::Created`,
+which splices with no comparison at all: the call's callee operand is provably
+the closure being spliced.
+
+**`resolve_created`** builds the closure exactly as `register_function` builds it
+for that step (shared body/params, `body_is_strict(..) || step.strict`,
+`ThisMode`), compiles it, and accepts it only if `leaf && !leaf_uses_env`, the
+same gate `resolve_declaration` uses. `spliceable` then requires a value-returning
+body whose only slot reads are its inputs.
+
+**The re-type after inlining now pays, and is on.** `narrow`/`mem2reg` were
+gated on `scalarized` because a 2026-10-27 measurement found the `inlined` half
+a wash (+0.71%). That measurement was vacuous for the same reason the feedback
+splice was: inlining fired on almost no body, so the gate was measuring noise.
+A splice replaces a call whose result was `Unknown` with the callee's arithmetic,
+which is exactly the value the re-type needs. Two things had to be fixed to make
+it land:
+
+- The continuation parameter is created with the call's result type (`Unknown`)
+  and `narrow` reads a parameter's *declared* type, so a value crossing the
+  splice's block split stayed untyped. The re-type now runs
+  `normalize_param_types` -> `narrow` -> `mem2reg` twice, because the edge
+  argument is only typed by the `narrow` in the round before the one that reads
+  the parameter.
+- With that, `objects/warm_store`-style promotion happens through a spliced call:
+  the accumulator leaves its frame slot and the loop is f64 registers.
+
+Measured on `opcost/js_call` (`var g = function (x) { return x + 1; }; s = (s +
+g(i)) | 0`), one row per process, 7 interleaved rounds, per-row minima, all three
+configurations of ONE binary:
+
+| config | ms | |
+|---|---:|---|
+| `SLAG_INLINE_CREATED=0 SLAG_RETYPE_INLINED=0` | 0.88 | before |
+| splice only (`SLAG_RETYPE_INLINED=0`) | 0.63 | -28.6% |
+| both (default) | 0.53 | **-40.1%** |
+
+Corpus, 7 interleaved rounds, per-row minima, `SLAG_INLINE_CREATED=0` vs default:
+total 2190.8 -> 2187.4 ms (-0.16%, i.e. flat: two rows of 77),
+`opcost/js_call` 0.788 -> 0.514 (**-34.9%**), `opcost/array_for_each_js` 3.686 ->
+3.348 (**-9.2%**). An IR diff of all 77 rows between the two modes leaves
+exactly those two rows changed. The re-type's own marginal, `SLAG_RETYPE_INLINED`
+0 vs 1, is -17.4% on `js_call`, about -5% on `array_for_each_js` and -3% on
+`calls/direct_leaf` (the third row its IR reaches), and its corpus-wide effect is
+inside the noise floor.
+
+New test, `opt_tier_splices_a_closure_the_body_creates`, pins the route with the
+`inline::CREATED` delta (a global counter, like `scalar::REPLACED`).
+
+Gates: fmt, `clippy --workspace -D warnings`, `cargo test --workspace`; test262
+language 23,726 + built-ins 23,821 + annexB 1,086 + intl402 3,365 at 100%.
+
+**What is left in the row.** 5.3 ns/iteration against node's ~0.3 (which is V8
+having made the loop nearly free). The spliced region is its own block pair
+(`b1 -> b4 -> b3`) because the splice splits the block at the call, and the
+continuation's raw-f64 result is canonicalized back with a `Canon` per iteration
+(`unbox` put `v31` in an f64 register while `s`'s add still reads a `Value`
+word). Merging the callee's single block into the caller's, or teaching `unbox`
+that a raw value may feed a raw operand, is the next slice; the block split also
+shows up as the loop's only remaining branches.

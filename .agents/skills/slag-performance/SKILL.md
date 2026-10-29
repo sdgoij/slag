@@ -64,6 +64,8 @@ Never measure a binary you cannot tie to the source you are reading. See
 | `SLAG_TYPER=0` | the typer's read guard (`Op::GuardType` on a read) |
 | `SLAG_GUARD=0` | the guard-pruning pass (`opt/pass/guard.rs`) |
 | `SLAG_INLINE=0` | the trial-inline splice (on by default) |
+| `SLAG_INLINE_CREATED=0` | only the static route (a callee the body itself creates) |
+| `SLAG_RETYPE_INLINED=0` | the `normalize`/`narrow`/`mem2reg` re-run after `inline` |
 | `SLAG_SCALAR=0` | the scalar-replacement pass (`opt/pass/scalar.rs`) |
 | `SLAG_SCALAR_LOOP=0` | only the loop-carried field promotion (`promote_loop_carried_field`) |
 | `SLAG_INLINE_FEEDBACK=1` | additionally splices feedback-recorded callees |
@@ -251,6 +253,7 @@ the proof. The proof is the priced next slice; see section 7.
 | Scalar replacement extends to a non-escaping object's mutable field (cross-block slot alias + store-to-load), and the pipeline re-runs `narrow`/`mem2reg` after `scalar` so a guard-poisoned accumulator types to a raw f64 add | `objects/warm_store` 34.7 -> 9.3 ms (-73%), `objects/compound_assign` 43.9 -> 28.1 (-36%), `objects/destructure` 3.6 -> 2.6 (-28%); corpus -1.85%, mean-jitGap 10.26 -> 10.12 |
 | `promote_loop_carried_field`: a field read before its store in the loop header becomes a header phi (literal on the entry edge, stored value on the back-edge) and the object is elided | `objects/compound_assign` 30.4 -> 12.1 ms (-60%), total separation over 7 interleaved rounds and over the `SLAG_SCALAR_LOOP=0` seam (-61%); the `objects` family 6.26 -> 5.3x, headline unchanged inside its spread |
 | The carried field is typed `Number` by induction (numeric entry value, numeric-preserving arithmetic on the back-edge), and `narrow` seeds its lattice from a block parameter's declared type | `objects/compound_assign` 12.1 -> 3.0 ms (-75%), `objects/warm_store` 9.6 -> 3.1 (-68%), `objects/destructure` 2.8 -> 1.0 (-63%); corpus flat (+0.07%: 3 rows of 77), `objects` family 5.27 -> 4.18x, headline 10.12 -> 10.00 |
+| The splice's static route: a call whose callee operand is a `NewClosure` (directly, or through a frame slot stored once in the entry block) splices with no comparison and no feedback, plus the `normalize`/`narrow`/`mem2reg` re-run after `inline` | `opcost/js_call` 0.88 -> 0.53 ms (-40%), `opcost/array_for_each_js` -9%; corpus flat (-0.16%: 2 rows of 77), IR diff confirms exactly those 2 rows |
 | Global read cells (declarative record, nested bodies) | top-level `const` 52.5 -> about 2.4 ms per 1M; nested helper 130.2 -> 2.5 ms |
 | Map key-index mixer (Goats) | `mapget` -29%, `maphas` -37% |
 | Optimizing-tier GC safe point | a lifted allocating loop had no safepoint and a 46 ms pause; fixed |
@@ -286,6 +289,7 @@ in the corpus.
 | Refine the FrameStore guard exception (T5b) | negative; the stored value is read once after the loop |
 | Inline prototype-chain probe | 5-10% slower than the helper; reverted |
 | Inline `LeafCallFill` | null; reverted |
+| Re-type after inlining (`scalarized || inlined`) | +0.71% when measured (2026-10-27); SUPERSEDED — inlining fired on almost no body then, so it measured noise. Landed 2026-10-28 with the static splice, where it is -17% on the row it reaches |
 | Rank a function by `sum(blocks)` | method error, not a change; divide by the entry block first |
 
 ## 6. How to choose the next target
@@ -311,15 +315,15 @@ needs its own per-row measurement.
 
 - **The inline splice cannot fire on a loop-bodied caller, and that is the
   headline's biggest single ceiling.** `JitEngine::consult` compiles a loop body
-  on its FIRST consult, so it never runs an interpreted step, so
-  `record_call_site` never runs, so `sites_from_feedback` is empty. Every
-  monomorphic-callee loop (`opcost/method_call` 45x, `opcost/js_call` 29x,
-  `opcost/own_builtin_call`) pays a `call_slow` per iteration because of it. Two
-  routes: let a loop body run interpreted once (costs a whole interpreted run for
-  a single-call program), or prove the callee statically (the callee is a closure
-  literal in the caller's own body; `CalleeEq` against it, plus a scan of the
-  callee body for a store to that atom). The second needs no feedback - see the
-  2026-10-28 PROBE entry.
+  on its FIRST consult (see the 2026-10-28 PROBE), so `record_call_site` never
+  runs and `sites_from_feedback` is empty for exactly those bodies. The static
+  route (a callee the body itself creates) now lands; the *member-call* shape
+  (`obj.m(k)` with `obj` a literal the body built) is still unspliced, because
+  forwarding its callee needs the receiver's escape analysis relaxed and that
+  needs a proof about the callee's body. That is the next slice.
+- **The spliced region's block split.** A splice at a call inside a loop leaves
+  the callee in its own block pair and canonicalizes the raw-f64 result per
+  iteration (`Canon`), which is most of the remaining 5.3 ns on `js_call`.
 - **Type a function's parameters at the call site.** The row that is left keeps a
   tag check and a `Canon` per iteration only because the loop bound is a
   parameter typed `Unknown`; the lattice now honours a declared numeric type, so

@@ -2350,6 +2350,36 @@ mod tests {
     }
 
     #[test]
+    fn opt_tier_splices_a_closure_the_body_creates() {
+        // A loop-bodied caller never records call-site feedback (`JitEngine::
+        // consult` compiles a body with a loop on its first consult, so it runs
+        // no interpreted step), so `sites_from_feedback` is always empty for
+        // it. The splice's static route is the callee the body itself creates:
+        // `var g = function (x) { return x + 1; }` in a frame slot stored once
+        // in the entry block, called in the loop. No site, no comparison, and
+        // the call disappears; the tier must agree with the interpreter.
+        let source = "function f(n) { var g = function (x) { return x + 1; }; \
+                      var s = 0; \
+                      for (var i = 0; i < n; i++) { s = (s + g(i)) | 0; } \
+                      return s; } \
+                      f(1000);";
+        let interp = {
+            let mut agent = runtime::Agent::new();
+            agent.initialize_host_defined_realm().expect("realm");
+            agent.run_script(source).expect("interp runs")
+        };
+        let before = crate::opt::pass::inline::CREATED.load(Ordering::Relaxed);
+        let (value, compiled) = with_opt_jit_agent(|agent| agent.run_script(source).expect("runs"));
+        let created = crate::opt::pass::inline::CREATED.load(Ordering::Relaxed) - before;
+        assert_eq!(
+            value, interp,
+            "the optimizing tier must match the interpreter"
+        );
+        assert!(compiled >= 1, "{compiled} bodies compiled");
+        assert!(created >= 1, "the creation-site splice did not fire");
+    }
+
+    #[test]
     fn opt_tier_scalar_promotes_a_loop_carried_field() {
         // The `compound_assign` shape: the field is read before its store in the
         // loop header, so there is no preceding store to forward and the read's
