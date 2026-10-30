@@ -1225,11 +1225,23 @@ fn lower_inst(
                 reads,
                 prim_slots,
                 numbers,
+                env,
             } = &inst.imm
             else {
                 return Err(Unsupported::Step("opt:hoist"));
             };
             let mut ok = builder.ins().iconst(types::I8, 1);
+            if *env {
+                // An environment-resolved read is only loop-invariant when the
+                // chain cannot shadow the name (the `LoadIdent` fast-path gate).
+                let unshadowed = builder.ins().load(
+                    types::I8,
+                    MemFlagsData::new(),
+                    abi.vm,
+                    Offset32::new(std::mem::offset_of!(JitCallContext, globals_unshadowed) as i32),
+                );
+                ok = builder.ins().band(ok, unshadowed);
+            }
             for &slot in prim_slots.iter() {
                 let value = builder.ins().load(
                     types::I64,
@@ -1249,24 +1261,36 @@ fn lower_inst(
                     .ins()
                     .iconst(types::I64, JsValue::Undefined.bits() as i64);
                 for read in reads.iter() {
-                    let object = builder.ins().load(
-                        types::I64,
-                        MemFlagsData::new(),
-                        abi.frame,
-                        Offset32::new((read.recv_slot as i32) * 8),
-                    );
                     let name = builder.ins().iconst(types::I64, read.name as i64);
-                    // The data-only probe (the interpreter's `member_cell_warm_probe`):
-                    // the value, or the dense-hole sentinel when the read is not a
+                    // The data-only probe (the interpreter's own
+                    // `member_cell_warm_probe`/`try_global_cell_read`): the
+                    // value, or the dense-hole sentinel when the read is not a
                     // plain own data property. No user code runs either way.
-                    let found = call_helper(
-                        builder,
-                        helpers,
-                        abi,
-                        abi.sig_unary,
-                        Helper::HoistMemberProbe,
-                        &[object, name],
-                    )?;
+                    let found = if read.recv_slot == u32::MAX {
+                        call_helper(
+                            builder,
+                            helpers,
+                            abi,
+                            abi.sig_tdz,
+                            Helper::HoistGlobalProbe,
+                            &[name],
+                        )?
+                    } else {
+                        let object = builder.ins().load(
+                            types::I64,
+                            MemFlagsData::new(),
+                            abi.frame,
+                            Offset32::new((read.recv_slot as i32) * 8),
+                        );
+                        call_helper(
+                            builder,
+                            helpers,
+                            abi,
+                            abi.sig_unary,
+                            Helper::HoistMemberProbe,
+                            &[object, name],
+                        )?
+                    };
                     let miss = builder.ins().icmp_imm_u(
                         IntCC::Equal,
                         found,

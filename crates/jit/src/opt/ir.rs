@@ -187,10 +187,10 @@ impl Effects {
     }
 }
 
-/// One hoisted loop-invariant read: the receiver's frame slot, the property
-/// name, the hidden slot its value is materialized into, and whether the value
-/// must be an exact int32 (the guarded copy's register body carries it in an i32
-/// register).
+/// One hoisted loop-invariant read: the receiver's frame slot (`u32::MAX` for a
+/// global name), the property/binding name, the hidden slot its value is
+/// materialized into, and whether the value must be an exact int32 (the guarded
+/// copy's register body carries it in an i32 register).
 #[derive(Clone, PartialEq, Eq, Debug, Default)]
 pub struct HoistRead {
     pub recv_slot: u32,
@@ -247,6 +247,10 @@ pub enum Imm {
         reads: Box<[HoistRead]>,
         prim_slots: Box<[u32]>,
         numbers: bool,
+        /// The reads resolve through the environment chain
+        /// (`Step::HoistGlobalGuard`'s `env`), so the guard also needs the
+        /// context's `globals_unshadowed` verdict.
+        env: bool,
     },
     /// Raw 64 bits (a NaN-boxed `Value` or an identity).
     U64(u64),

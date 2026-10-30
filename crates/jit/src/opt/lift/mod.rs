@@ -2100,6 +2100,57 @@ fn truncated_before_store(ops: &[LeafOp], from: usize) -> bool {
     false
 }
 
+/// Emit the hoist probe and answer its `Bool`.
+fn hoist_probe(
+    builder: &mut Builder,
+    block: BlockId,
+    reads: Vec<HoistRead>,
+    prim_slots: &[usize],
+    numbers: bool,
+    env: bool,
+) -> ValueId {
+    builder.emit(
+        block,
+        Op::HoistProbe,
+        &[],
+        Type::Bool,
+        Op::HoistProbe.default_effects(),
+        Imm::Hoist {
+            reads: reads.into_boxed_slice(),
+            prim_slots: prim_slots
+                .iter()
+                .map(|&s| s as u32)
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+            numbers,
+            env,
+        },
+    )
+}
+
+/// Whether any register body in the step range `from..to` runs the per-step
+/// tier's fused lane (`BinStoreNum`/`BinStoreInt`, the loop-carried accumulator
+/// in the dedicated `Vm` register, or the string builder's append). Those lanes
+/// are the one shape the per-step tier beats this tier on, so a hoist guard whose
+/// guarded copy would replace them is refused rather than compiled: measured,
+/// `objects/own_read` 0.73 ns/iter per-step against ~3.8 ns compiled.
+fn region_uses_fused_lane(steps: &[Step], from: usize, to: usize) -> bool {
+    let to = to.min(steps.len());
+    steps.get(from.min(to)..to).is_some_and(|region| {
+        region.iter().any(|step| match step {
+            Step::RunRegBody { ops } => ops.iter().any(|op| {
+                matches!(
+                    op,
+                    LeafOp::BinStoreNum { .. }
+                        | LeafOp::BinStoreInt { .. }
+                        | LeafOp::BuilderAppend { .. }
+                )
+            }),
+            _ => false,
+        })
+    })
+}
+
 /// Whether a register body's raw slot read is one the int32 hoist proved: the
 /// read's value feeds the body's arithmetic and its write-back is truncated, so
 /// the whole read-modify-write can collapse into an i32 add.
@@ -2127,13 +2178,24 @@ fn region_reads_as_int(steps: &[Step], from: usize, to: usize, slot: u32) -> boo
 /// guard at `index` (empty outside a guarded copy).
 fn hoist_int_slots(steps: &[Step], index: usize) -> Vec<u32> {
     for i in (0..index).rev() {
-        if let Step::HoistMemberGuard { reads, target, .. } = &steps[i]
-            && index < *target
-        {
+        let (reads, target) = match &steps[i] {
+            Step::HoistMemberGuard { reads, target, .. } => (
+                reads
+                    .iter()
+                    .map(|&(_, _, hoist_slot, _)| hoist_slot as u32)
+                    .collect::<Vec<_>>(),
+                *target,
+            ),
+            Step::HoistGlobalGuard { reads, target, .. } => (
+                reads.iter().map(|&(_, slot)| slot as u32).collect(),
+                *target,
+            ),
+            _ => continue,
+        };
+        if index < target {
             return reads
-                .iter()
-                .map(|&(_, _, hoist_slot, _)| hoist_slot as u32)
-                .filter(|&hoist_slot| region_reads_as_int(steps, i + 1, *target, hoist_slot))
+                .into_iter()
+                .filter(|&slot| region_reads_as_int(steps, i + 1, target, slot))
                 .collect();
         }
     }
@@ -2991,35 +3053,28 @@ fn emit_fused_test(
                     require_int: region_reads_as_int(steps, index + 1, *target, hoist_slot as u32),
                 })
                 .collect::<Vec<_>>();
-            // Only a guarded copy whose reads all feed a truncated int32 RMW pays
-            // in this tier. Otherwise the copy drops the per-step tier's fused
-            // int lane (a `s += o.a + o.b` loop is 0.73 ns there and ~3.8 ns as a
-            // generic f64 read-modify-write here), so the body keeps the per-step
-            // path, which is what the refusal did before the probe was modelled.
-            if spec.iter().any(|read| !read.require_int) {
+            (
+                hoist_probe(builder, block, spec, prim_slots, *numbers, false),
+                false,
+            )
+        }
+        // The global counterpart: the same probe over the global-value cell, and
+        // the `globals_unshadowed` gate its `env` reads need.
+        Step::HoistGlobalGuard { reads, env, target } => {
+            let spec = reads
+                .iter()
+                .map(|&(name, hoist_slot)| HoistRead {
+                    recv_slot: u32::MAX,
+                    name,
+                    hoist_slot: hoist_slot as u32,
+                    require_int: region_reads_as_int(steps, index + 1, *target, hoist_slot as u32),
+                })
+                .collect::<Vec<_>>();
+            if region_uses_fused_lane(steps, index + 1, *target) {
                 return Err(Unsupported::Step(step_name(step)));
             }
-            let code = builder.emit(
-                block,
-                Op::HoistProbe,
-                &[],
-                Type::Bool,
-                Op::HoistProbe.default_effects(),
-                Imm::Hoist {
-                    reads: spec.into_boxed_slice(),
-                    prim_slots: prim_slots
-                        .iter()
-                        .map(|&s| s as u32)
-                        .collect::<Vec<_>>()
-                        .into_boxed_slice(),
-                    numbers: *numbers,
-                },
-            );
-            (code, false)
+            (hoist_probe(builder, block, spec, &[], false, *env), false)
         }
-        // The global counterpart needs the global-value cell probe; until it is
-        // modelled the body keeps the per-step tier, which implements it.
-        Step::HoistGlobalGuard { .. } => return Err(Unsupported::Step(step_name(step))),
         other => return Err(Unsupported::Step(step_name(other))),
     })
 }
@@ -3032,6 +3087,12 @@ fn emit_binary(
     left: ValueId,
     right: ValueId,
 ) -> Result<(), Unsupported> {
+    // The negated comparisons would be `StrictEq`/`Eq` plus `Not`, but lifting
+    // them alone is a REGRESSION: it lets a body whose loop runs the per-step
+    // tier's fused lane compile into a generic `Value`-word loop (`globals/
+    // hoisted_local`, a `s += i * 3 + k` loop the plan keeps in `Vm::loop_num`:
+    // 2.64 -> 3.55 ms). Until the optimizer can match that lane, refuse so the
+    // body keeps the faster tier.
     let op = binary_op(op)?;
     let v = builder.emit(
         block,

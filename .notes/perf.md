@@ -19590,3 +19590,45 @@ counterpart: the same probe over the global-value cell, which is the
 `opcost/obj_prop` shape with a *non*-int32 invariant (the read then stays a
 `Value` word and the probe gate declines it). The typed key insight from the read
 guard carries over: the payload that pays is int32, not `Number`.
+
+## The global hoist guard, modelled: neutral, because the read is not the cost (measured 2026-10-30)
+
+`Step::HoistGlobalGuard` is now modelled like the member one: the same
+`Op::HoistProbe`, one helper (`hoist_global_probe`, exactly the interpreter's
+`try_global_cell_read`), plus the `globals_unshadowed` gate an env-resolved read
+needs, and the same fused-lane gate that refuses a guarded copy which would
+replace the per-step tier's `BinStoreNum`/`BinStoreInt` lane.
+
+It is a **NULL**: `globals/declarative_read` 2.50 -> 2.46 ms, `nested_read` 2.53
+-> 2.50, `object_read` 2.45 -> 2.46, `hoisted_local` 2.54 (still refused, see
+below), each isolated and repeated. Keeping it anyway: it removes a refusal
+without a regression, so real code reading a warm global in a loop compiles.
+
+The reason there is nothing to win is the useful part. All four rows sit at the
+same 2.5 ns/iter, including `hoisted_local`, which deliberately reads the value
+into a local *before* the loop and so has no global read in its body at all. The
+read is already free in `declarative_read` (its declarative binding misses the
+global-value cell, so the guard takes the general loop, and the row's number is
+identical to the hoisted control). **The globals family is floor-bound on the
+loop body itself**, `s += i * 3 + k` at 2.5 ns/iter against node's 0.6, not on the
+binding.
+
+Measured NULL, and a reverted one: lifting the negated comparisons
+(`StrictNotEqual` -> `StrictEq` + `Not`, `NotEqual` -> `Eq` + `Not`) is correct
+and unblocks bodies that hold a `!==`, but it also lets a body whose loop runs
+the per-step tier's fused lane compile into a generic `Value`-word loop:
+`globals/hoisted_local` (`s += i * 3 + k`, which the plan keeps in `Vm::loop_num`)
+goes 2.54 -> 3.55 ms. Reverted, with the reason at `emit_binary`. The lesson is
+the same one the member hoist taught: **this tier must not take a body from the
+fused lane**, and today the only defense is refusing the steps that would let it.
+
+Gates: fmt, clippy, workspace tests, four sweeps 51,998 at 100%, corpus parity 0
+(`n=77 mean-jitGap 8.97 mean-jlGap 3.31`).
+
+**Next.** The globals rows need the arithmetic loop, not the read: `s += i * 3 + k`
+should be `f64` in registers with the `i * 3` folded into a strength-reduced
+induction variable, which is a real loop-optimization slice (and the same shape
+shows up in `control/nested_loops`). The cheaper approach is to teach the
+optimizing tier the Route-B `BinStoreNum` recipe (`rhs_recipe`'s counter-imm
+forms) so a compiled body can keep the fused lane's accumulator instead of
+losing it.

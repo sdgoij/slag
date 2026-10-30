@@ -5756,6 +5756,18 @@ impl Vm {
         Self::member_cell_warm_probe(agent, &object, name)
     }
 
+    /// The loop-invariant read hoist's data-only probe for a global name: the
+    /// global-value cell, exactly the interpreter's `try_global_cell_read`. A
+    /// name the cell does not hold (a cold cell, a declarative binding) answers
+    /// `None` and the guard takes the general loop. Never runs user code.
+    pub(crate) fn hoist_global_probe(
+        &mut self,
+        agent: &mut Agent,
+        name: crux::AtomId,
+    ) -> Option<Value> {
+        self.try_global_cell_read(agent, name)
+    }
+
     /// The cached read of `object.name` — an own data property on a plain
     /// object at the direct-mapped slot, re-validated against the stored key
     /// and property kind. `None` falls back to the full Get (which then

@@ -101,10 +101,14 @@ fn imm_suffix(imm: &Imm) -> String {
             reads,
             prim_slots,
             numbers,
+            env,
         } => {
             let mut text = format!(" prim{prim_slots:?}");
             if *numbers {
                 text.push_str(" numbers");
+            }
+            if *env {
+                text.push_str(" env");
             }
             for read in reads.iter() {
                 text.push_str(&format!(

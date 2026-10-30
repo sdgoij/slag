@@ -40,6 +40,9 @@ pub enum Helper {
     /// dense-hole sentinel when the read is not a plain own data property (so
     /// the hoist guard misses and the general loop runs). Never runs user code.
     HoistMemberProbe,
+    /// The same probe for a global read (`Step::HoistGlobalGuard`): the
+    /// global-value cell, or the dense-hole sentinel. Never runs user code.
+    HoistGlobalProbe,
     GetMemberMapSlot,
     GetMemberComputed,
     SetMemberName,
@@ -239,6 +242,7 @@ impl Helper {
             Helper::GcSafepoint => "gc_safepoint",
             Helper::GetMemberName => "get_member_name",
             Helper::HoistMemberProbe => "hoist_member_probe",
+            Helper::HoistGlobalProbe => "hoist_global_probe",
             Helper::GetMemberMapSlot => "get_member_map_slot",
             Helper::GetMemberComputed => "get_member_computed",
             Helper::SetMemberName => "set_member_name",
@@ -468,6 +472,8 @@ pub struct JitHelpers {
     pub get_member_name: Option<extern "C" fn(vm: *mut c_void, object: u64, name: u64) -> u64>,
     /// The hoist guard's data-only member probe (see `Helper::HoistMemberProbe`).
     pub hoist_member_probe: Option<extern "C" fn(vm: *mut c_void, object: u64, name: u64) -> u64>,
+    /// The hoist guard's data-only global probe (see `Helper::HoistGlobalProbe`).
+    pub hoist_global_probe: Option<extern "C" fn(vm: *mut c_void, name: u64) -> u64>,
     /// A compiled member read whose map-cell hit recorded an ordinal at or
     /// above `INLINE_FIELDS` (Slice 3): the machine validated the shape, so
     /// read the map-described vector slot live; a hole or a divergent shape
@@ -969,6 +975,7 @@ impl JitHelpers {
             gc_safepoint: None,
             get_member_name: None,
             hoist_member_probe: None,
+            hoist_global_probe: None,
             get_member_map_slot: None,
             get_member_computed: None,
             set_member_name: None,
@@ -1124,6 +1131,7 @@ impl JitHelpers {
             Helper::GcSafepoint => self.gc_safepoint.map(|f| f as usize as u64),
             Helper::GetMemberName => self.get_member_name.map(|f| f as usize as u64),
             Helper::HoistMemberProbe => self.hoist_member_probe.map(|f| f as usize as u64),
+            Helper::HoistGlobalProbe => self.hoist_global_probe.map(|f| f as usize as u64),
             Helper::GetMemberMapSlot => self.get_member_map_slot.map(|f| f as usize as u64),
             Helper::GetMemberComputed => self.get_member_computed.map(|f| f as usize as u64),
             Helper::SetMemberName => self.set_member_name.map(|f| f as usize as u64),
@@ -1340,6 +1348,10 @@ pub extern "C" fn test_get_member_name(_vm: *mut c_void, _object: u64, _name: u6
 }
 
 pub extern "C" fn test_hoist_member_probe(_vm: *mut c_void, _object: u64, _name: u64) -> u64 {
+    crux::value::HOLE_BITS
+}
+
+pub extern "C" fn test_hoist_global_probe(_vm: *mut c_void, _name: u64) -> u64 {
     crux::value::HOLE_BITS
 }
 
