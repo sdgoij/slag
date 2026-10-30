@@ -19697,3 +19697,73 @@ Gates: fmt, `clippy --workspace --all-targets -D warnings`, `cargo test
 --workspace`, four sweeps 51,998 at 100%, corpus parity 0, deopt probes agree with
 node. Corpus `mean-jitGap` 8.73 / 9.12 / 8.83 across three runs (the spread is the
 known machine-state noise; the row numbers above are the measurement).
+
+## LANDED (2026-10-30): a `++` counter is a Number, and a loop slot is promotable
+
+`control/nested_loops` was 29.2 ms against node's 3.1 (9.4x). It was not the `%`:
+three of its four defects were about how the body *types*, and only one was about
+the remainder.
+
+The IR showed the inner loop entirely in `Value` words:
+
+```
+b2():  v8:? = FrameLoad slot2 ; v9:? = Add(v30, v8) ; v11:? = Mod(v9, v10)
+```
+
+1. **`Op::UpdateValue` was absent from the numeric lattice** (`narrow`). `j++`
+   lifts to `Op::UpdateValue` (`ToNumeric(x) ± 1`), which is the generic form for
+   any loop whose head the `for`-fusion does not recognize, so the slot stored it
+   was never proven a Number, so every read of `j` was `Unknown`, so `i * 31 + j`
+   and the accumulator were too. Typing it (operand numeric -> result numeric, and
+   the same in `rewrite`) is what made the chain numeric.
+2. **`mem2reg`'s "definitely assigned" analysis computed the least fixpoint.**
+   `store_reach` initialized `reach_out` to `false` and iterated upward, so a loop
+   header with a back edge stayed "not store-reached" forever: the back edge's
+   `out` depends on the header's own `in`, and the cycle never receives a `true`.
+   Every loop-carried accumulator in the corpus was therefore unpromotable. It is
+   a forward must analysis, so it now starts from `true` and shrinks (the greatest
+   fixpoint), over reachable blocks only (an unreachable block has no definition
+   for `rename` to substitute, and `apply` would drop its loads).
+3. **`retype_phis` needed a fixpoint.** A promoted loop has several phis feeding
+   each other (the header and the latch both carry the accumulator), all created
+   `Unknown`, and `join(Unknown, t)` is `Unknown` — so one round left the cycle
+   untyped and the newly promoted accumulator was *worse* than the frame slot it
+   replaced (21.4 vs 20.4 ms). It now joins from `Never` (the identity of `join`)
+   and iterates.
+4. **`loop_counter::prove` only knew `Add`/`Sub`.** The inner counter's
+   `UpdateValue` was refused, so `j` stayed a Number word with a `Canon` and an
+   `is_double` branch per iteration. It now admits `UpdateValue` (delta 1/-1),
+   synthesizing the wrapping op's constant. `x--` rewrites to `IntAdd(x, -1)`.
+
+`%` itself: `unbox` now feeds a raw f64 into `Mod` (the lowering reads the bits as
+f64 and canonicalizes a raw operand only on its helper fallback, which runs once
+rather than the `Canon` it replaced running every iteration), and
+`opt_lower::call_mod_int` skips an operand's integrality and i32-range guards when
+the IR already types it `Int`. Two traps: the raw-operand guard in the binary arm
+is keyed on `known`, which is false for `Mod` by construction, so it bailed
+`opt:raw-float-boundary` and the row silently ran the baseline tier; and the
+`IntAdd` rewrite must *append* the delta operand when the instruction being
+rewritten (`UpdateValue`) had only one.
+
+Measured, isolated (`scratch/nl`, one row per process, minima of 3):
+
+| | before | after |
+|---|---:|---:|
+| `control/nested_loops` | 29.18 ms | **13.92 ms** (-52%) |
+| the same loop with `+ 7` in place of `% 7` | 16.66 | **4.89** |
+| the same loop with `& 7` | 16.71 | 9.39 |
+
+So the body itself went from 4.1 to 1.2 ns/iteration (node is 0.76), and the
+remainder is now the single largest term at ~2.2 ns: `srem` is Cranelift's
+`checked_srem_seq` (an `idiv` plus its overflow checks). Strength-reducing a
+`% <constant>` to a reciprocal multiply is the next lever for it, and it is a
+codegen feature rather than a typing one.
+
+Corpus: total 2085.4 -> **1910.9 ms** against node 722.2, so the headline gap is
+2.87x -> 2.65x; `mean-jitGap` 8.45 / 8.52 across two runs, parity 0, `control`
+family 12.19x -> 11.39x. The promotion alone is worth -4.3% (same-binary seam:
+`SLAG_MEM2REG=0` totals 1997.2 ms). `SLAG_MEM2REG_TRACE=1` prints each slot's
+allow/promote verdict, which is how the analysis fix was found.
+
+Gates: fmt, `clippy --workspace --all-targets -D warnings`, `cargo test
+--workspace`, four sweeps 51,998 at 100%, corpus parity 0.

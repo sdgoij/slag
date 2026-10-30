@@ -26,12 +26,13 @@ fn is_arith(op: Op) -> bool {
 
 /// Whether an instruction can consume a raw f64 without canonicalizing first:
 /// the bare-f64 lowering works in f64 registers, but it is only taken when
-/// both operands are known numerics.
+/// both operands are known numerics. `%` consumes the raw bits directly and
+/// canonicalizes only on its helper fallback (`opt_lower::call_mod_int`).
 fn accepts_raw(func: &Function, inst: &Inst, raw: &[bool]) -> bool {
     inst.args.len() == 2
         && matches!(
             inst.op,
-            Op::Add | Op::Sub | Op::Mul | Op::Div | Op::Lt | Op::Le | Op::Gt | Op::Ge
+            Op::Add | Op::Sub | Op::Mul | Op::Div | Op::Mod | Op::Lt | Op::Le | Op::Gt | Op::Ge
         )
         && inst.args.iter().all(|&a| raw_operand(func, a, raw))
 }

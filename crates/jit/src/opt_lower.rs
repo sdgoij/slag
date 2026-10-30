@@ -510,13 +510,15 @@ fn lower_inst(
             let known_rhs = matches!(rhs_ty, Type::Number | Type::Int | Type::Float);
             let both_known = known_lhs && known_rhs;
             let known = numeric && both_known;
-            // A raw float is not a canonical `Value` word; it may only feed
-            // the bare numeric path, which consumes f64s directly. The unbox
-            // pass canonicalizes every other use, so reaching here is a bug
-            // (refuse rather than hand a NaN that decodes as a tag to a
-            // helper or a tag test).
+            // A raw float is not a canonical `Value` word; it may only feed the
+            // bare numeric path, which consumes f64s directly. The unbox pass
+            // canonicalizes every other use, so reaching here is a bug (refuse
+            // rather than hand a NaN that decodes as a tag to a helper or a tag
+            // test). `%` is exempt: it is never `known` (it has no bare form)
+            // but its lowering reads the bits as f64 and canonicalizes a raw
+            // operand on its helper fallback.
             let raw_operand = lhs_ty == Type::Float || rhs_ty == Type::Float;
-            if raw_operand && !known {
+            if raw_operand && !known && inst.op != Op::Mod {
                 return Err(Unsupported::Step("opt:raw-float-boundary"));
             }
             if known {
@@ -544,7 +546,32 @@ fn lower_inst(
                 // `%` needs the integer fast path the arithmetic ops do not: a
                 // proven Number still has to satisfy the integrality, i32-range
                 // and nonzero-divisor guards before `srem` is the spec's `fmod`.
-                call_mod_int(builder, helpers, abi, disc as i64, lhs, rhs, both_known)?
+                let int_operand = |builder: &mut FunctionBuilder, id: ValueId| {
+                    if types.get(id as usize) != Some(&Type::Int) {
+                        return None;
+                    }
+                    let v = value_of(values, id).ok()?;
+                    Some(if builder.func.dfg.value_type(v) == types::I32 {
+                        v
+                    } else {
+                        bits_to_int(builder, v)
+                    })
+                };
+                let lhs_int = int_operand(builder, inst.args[0]);
+                let rhs_int = int_operand(builder, inst.args[1]);
+                call_mod_int(
+                    builder,
+                    helpers,
+                    abi,
+                    disc as i64,
+                    lhs,
+                    rhs,
+                    both_known,
+                    lhs_int,
+                    rhs_int,
+                    lhs_ty == Type::Float,
+                    rhs_ty == Type::Float,
+                )?
             } else if matches!(
                 inst.op,
                 Op::BitAnd | Op::BitOr | Op::BitXor | Op::Shl | Op::Shr | Op::UShr
@@ -6008,6 +6035,15 @@ fn int_operand(
 /// `fmod` equals the integer remainder — compute `srem`; otherwise fall through
 /// to `BinarySlow`. Mirrors the per-step lowerer's `emit_mod_int` (Cranelift has
 /// no `frem`, and `fmod` is a libm call while `srem` is an instruction).
+///
+/// An operand the IR types `Int` (`lhs_int`/`rhs_int`) is already an i32 CLIF
+/// value that is integral and in range by construction, so its two guards are
+/// the constant true and no conversion runs; that is the `% <small constant>`
+/// shape, where the divisor's guards were most of the instruction count. A
+/// `Type::Float` operand (`lhs_raw`/`rhs_raw`) is a raw f64 rather than a
+/// canonical `Value` word, so the slow path canonicalizes it — the fallback runs
+/// once, where the `Canon` it replaces ran every iteration.
+#[allow(clippy::too_many_arguments)]
 fn call_mod_int(
     builder: &mut FunctionBuilder,
     helpers: &JitHelpers,
@@ -6016,42 +6052,55 @@ fn call_mod_int(
     lhs: ClifValue,
     rhs: ClifValue,
     operands_known: bool,
+    lhs_int: Option<ClifValue>,
+    rhs_int: Option<ClifValue>,
+    lhs_raw: bool,
+    rhs_raw: bool,
 ) -> Result<ClifValue, Unsupported> {
     let lhs_num = builder.ins().bitcast(types::F64, MemFlagsData::new(), lhs);
     let rhs_num = builder.ins().bitcast(types::F64, MemFlagsData::new(), rhs);
-    let (l_wide, _) = trunc_i32(builder, lhs_num, false);
-    let (r_wide, _) = trunc_i32(builder, rhs_num, false);
-    let l_back = builder.ins().fcvt_from_sint(types::F64, l_wide);
-    let r_back = builder.ins().fcvt_from_sint(types::F64, r_wide);
-    // The truncation is only exact for integral values, so a fractional operand
-    // takes the slow path.
-    let l_int = builder.ins().fcmp(FloatCC::Equal, l_back, lhs_num);
-    let r_int = builder.ins().fcmp(FloatCC::Equal, r_back, rhs_num);
-    // `srem` on the i32 reduction is `a % b` only for |x| <= 2^31-1; a larger
-    // integer would take the low 32 bits of the *rounded* value.
-    let bound = builder.ins().f64const(2147483647.0);
-    let l_abs = builder.ins().fabs(lhs_num);
-    let r_abs = builder.ins().fabs(rhs_num);
-    let l_in_i32 = builder.ins().fcmp(FloatCC::LessThanOrEqual, l_abs, bound);
-    let r_in_i32 = builder.ins().fcmp(FloatCC::LessThanOrEqual, r_abs, bound);
-    let l = builder.ins().ireduce(types::I32, l_wide);
-    let r = builder.ins().ireduce(types::I32, r_wide);
+    let one = builder.ins().iconst(types::I8, 1);
+    // Each side's i32 value and its two "is exact" guards.
+    let (l, l_int, l_range) = match lhs_int {
+        Some(v) => (v, one, one),
+        None => {
+            let (wide, _) = trunc_i32(builder, lhs_num, false);
+            let back = builder.ins().fcvt_from_sint(types::F64, wide);
+            let exact = builder.ins().fcmp(FloatCC::Equal, back, lhs_num);
+            let bound = builder.ins().f64const(2147483647.0);
+            let abs = builder.ins().fabs(lhs_num);
+            let in_i32 = builder.ins().fcmp(FloatCC::LessThanOrEqual, abs, bound);
+            (builder.ins().ireduce(types::I32, wide), exact, in_i32)
+        }
+    };
+    let (r, r_int, r_range) = match rhs_int {
+        Some(v) => (v, one, one),
+        None => {
+            let (wide, _) = trunc_i32(builder, rhs_num, false);
+            let back = builder.ins().fcvt_from_sint(types::F64, wide);
+            let exact = builder.ins().fcmp(FloatCC::Equal, back, rhs_num);
+            let bound = builder.ins().f64const(2147483647.0);
+            let abs = builder.ins().fabs(rhs_num);
+            let in_i32 = builder.ins().fcmp(FloatCC::LessThanOrEqual, abs, bound);
+            (builder.ins().ireduce(types::I32, wide), exact, in_i32)
+        }
+    };
     let r_nonzero = builder.ins().icmp_imm_u(IntCC::NotEqual, r, 0);
-    let lhs_dbl = if operands_known {
-        builder.ins().iconst(types::I8, 1)
+    let lhs_dbl = if operands_known || lhs_int.is_some() {
+        one
     } else {
         is_double(builder, lhs)
     };
-    let rhs_dbl = if operands_known {
-        builder.ins().iconst(types::I8, 1)
+    let rhs_dbl = if operands_known || rhs_int.is_some() {
+        one
     } else {
         is_double(builder, rhs)
     };
     let mut guard = builder.ins().band(lhs_dbl, rhs_dbl);
     guard = builder.ins().band(guard, l_int);
     guard = builder.ins().band(guard, r_int);
-    guard = builder.ins().band(guard, l_in_i32);
-    guard = builder.ins().band(guard, r_in_i32);
+    guard = builder.ins().band(guard, l_range);
+    guard = builder.ins().band(guard, r_range);
     guard = builder.ins().band(guard, r_nonzero);
     let result = builder.declare_var(types::I64);
     let merge = builder.create_block();
@@ -6074,6 +6123,20 @@ fn call_mod_int(
     builder.def_var(result, fast_res);
     builder.ins().jump(merge, &[]);
     builder.switch_to_block(slow);
+    // A raw-f64 operand reaches here as its float bits, which are not a valid
+    // `Value` word when they land in the tag region, so canonicalize it for the
+    // generic helper. This replaces the `Canon` the unbox pass would have put on
+    // the every-iteration path.
+    let lhs_slow = if lhs_raw {
+        canon_double(builder, lhs)
+    } else {
+        lhs
+    };
+    let rhs_slow = if rhs_raw {
+        canon_double(builder, rhs)
+    } else {
+        rhs
+    };
     let op_imm = builder.ins().iconst(types::I64, disc);
     let slow_res = call_helper(
         builder,
@@ -6081,7 +6144,7 @@ fn call_mod_int(
         abi,
         abi.sig_binary,
         Helper::BinarySlow,
-        &[op_imm, lhs, rhs],
+        &[op_imm, lhs_slow, rhs_slow],
     )?;
     builder.def_var(result, slow_res);
     builder.ins().jump(merge, &[]);

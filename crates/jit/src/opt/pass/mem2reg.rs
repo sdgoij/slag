@@ -48,21 +48,27 @@ fn promote(func: &mut Function, allow: Option<&HashSet<u32>>) -> bool {
     let df = dominance_frontiers(&preds, &idom, n);
 
     let (candidates, tdz) = slots_with_stores(func);
+    let trace = trace_mem2reg();
     let mut changed = false;
     for slot in candidates {
         if tdz.contains(&slot) {
             continue;
         }
-        if let Some(allow) = allow
-            && !allow.contains(&slot)
-        {
-            continue;
+        let allowed = allow.is_none_or(|a| a.contains(&slot));
+        let promoted = allowed && promote_slot(func, slot, &preds, &df, &children);
+        if trace {
+            eprintln!("mem2reg slot {slot} allowed {allowed} promoted {promoted}");
         }
-        if promote_slot(func, slot, &preds, &df, &children) {
+        if promoted {
             changed = true;
         }
     }
     changed
+}
+
+fn trace_mem2reg() -> bool {
+    static TRACE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *TRACE.get_or_init(|| std::env::var_os("SLAG_MEM2REG_TRACE").is_some())
 }
 
 /// Every slot with a `FrameStore`, sorted, and the set of slots a `TdzCheck`
@@ -207,32 +213,61 @@ fn insert_flushes(
 /// promotion and never sees the new parameter, so without this the lowering
 /// cannot recognize a loop-carried value (an `Int` accumulator) as `Int` — the
 /// representation work depends on it.
+///
+/// A promoted loop can have several phis feeding each other (a `for` header and
+/// its latch both carry the accumulator), and `join(Unknown, t)` is `Unknown`, so
+/// a single round would leave every phi of that cycle untyped — which then
+/// un-types the arithmetic consuming it. Join from `Never` (the identity of
+/// `join`) and iterate instead: the phis of one promotion are a finite lattice
+/// chain, so this converges in at most one round per phi.
 fn retype_phis(func: &mut Function, phi: &HashMap<BlockId, usize>, preds: &[Vec<BlockId>]) {
-    let mut retype: Vec<(ValueId, Type)> = Vec::new();
-    for (&m, &index) in phi {
-        let mut ty = Type::Never;
-        // Whether every incoming value is an int32: an `Int`-typed one, or a
-        // constant whose value is integral and inside the i32 range. A loop
-        // counter's preheader init is the usual `Const 0`, which `narrow` types
-        // `Number` (its only uses are a comparison and this edge), so the plain
-        // join kept the counter in a `Value` word and `loop_counter`'s `IntAdd`
-        // increment then round-tripped i32 -> i64 -> i32 every iteration.
-        let mut all_int = true;
-        for &p in &preds[m as usize] {
-            if let Some(v) = edge_arg(func, p, m, index) {
-                ty = ty.join(func.value_type(v));
-                all_int &= matches!(func.value_type(v), Type::Int) || is_int32_const(func, v);
+    let mut params: Vec<(BlockId, usize, ValueId)> = phi
+        .iter()
+        .map(|(&m, &index)| (m, index, func.block(m).params[index]))
+        .collect();
+    params.sort_unstable_by_key(|&(m, index, _)| (m, index));
+    let mut types: HashMap<ValueId, Type> =
+        params.iter().map(|&(_, _, v)| (v, Type::Never)).collect();
+    for _ in 0..=params.len() {
+        let mut changed = false;
+        for &(m, index, param) in &params {
+            let mut ty = Type::Never;
+            // Whether every incoming value is an int32: an `Int`-typed one, or a
+            // constant whose value is integral and inside the i32 range. A loop
+            // counter's preheader init is the usual `Const 0`, which `narrow`
+            // types `Number` (its only uses are a comparison and this edge), so
+            // the plain join kept the counter in a `Value` word and
+            // `loop_counter`'s `IntAdd` increment then round-tripped i32 -> i64
+            // -> i32 every iteration. A phi that is not resolved yet (`Never`)
+            // must not break the claim for the phi it feeds.
+            let mut all_int = true;
+            for &p in &preds[m as usize] {
+                let Some(v) = edge_arg(func, p, m, index) else {
+                    continue;
+                };
+                let incoming = types.get(&v).copied().unwrap_or_else(|| func.value_type(v));
+                ty = ty.join(incoming);
+                all_int &= matches!(incoming, Type::Int | Type::Never) || is_int32_const(func, v);
             }
-        }
-        if ty != Type::Never {
+            if ty == Type::Never {
+                continue;
+            }
             if all_int {
                 ty = Type::Int;
             }
-            retype.push((func.block(m).params[index], ty));
+            if types[&param] != ty {
+                types.insert(param, ty);
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
         }
     }
-    for (v, ty) in retype {
-        func.set_value_type(v, ty);
+    for &(_, _, param) in &params {
+        if let Some(&ty) = types.get(&param) {
+            func.set_value_type(param, ty);
+        }
     }
 }
 
@@ -436,16 +471,31 @@ fn block_stores(func: &Function, b: BlockId, slot: u32) -> bool {
 
 /// The "assigned on every path" dataflow: `reach_in[b]` is true when every path
 /// from the entry to `b` passed a store of `slot`.
+///
+/// This is a forward *must* analysis, so it is the GREATEST fixpoint of
+/// "in = AND over predecessors' out". Iterating upward from `out = false` (the
+/// least fixpoint) reports every block of a loop as not store-reached whenever
+/// the header has a back edge, because the back edge's `out` depends on the
+/// header's own `in`: a counting loop's accumulator, stored once before the
+/// loop and reloaded inside it, is never promoted. Starting from `out = true`
+/// and shrinking converges to the same answer the discarded-least version gives
+/// for a store-dominated chain, plus the loop case the semantics allow.
 fn store_reach(func: &Function, slot: u32, preds: &[Vec<BlockId>]) -> Vec<bool> {
     let n = func.block_count();
     let entry = func.entry() as usize;
+    let reachable = reachable_blocks(func, n);
     let mut reach_in = vec![true; n];
-    let mut reach_out = vec![false; n];
-    reach_in[entry] = false;
+    let mut reach_out = vec![true; n];
+    for b in 0..n {
+        if !reachable[b] {
+            reach_in[b] = false;
+            reach_out[b] = false;
+        }
+    }
     loop {
         let mut changed = false;
         for b in 0..n {
-            let rin = if b == entry || preds[b].is_empty() {
+            let rin = if b == entry || !reachable[b] {
                 false
             } else {
                 preds[b].iter().all(|&p| reach_out[p as usize])
@@ -461,6 +511,28 @@ fn store_reach(func: &Function, slot: u32, preds: &[Vec<BlockId>]) -> Vec<bool> 
             return reach_in;
         }
     }
+}
+
+/// The blocks reachable from the entry over terminator edges. A block outside
+/// this set has no definition to promote: `rename` walks the dominator tree
+/// from the entry, so it never assigns one, and `apply` would drop the block's
+/// loads without a replacement.
+fn reachable_blocks(func: &Function, n: usize) -> Vec<bool> {
+    let mut seen = vec![false; n];
+    let mut work = vec![func.entry()];
+    seen[func.entry() as usize] = true;
+    while let Some(b) = work.pop() {
+        let Some(term) = func.block(b).term.as_ref() else {
+            continue;
+        };
+        for to in term_successors(term) {
+            if (to as usize) < n && !seen[to as usize] {
+                seen[to as usize] = true;
+                work.push(to);
+            }
+        }
+    }
+    seen
 }
 
 /// Whether every load of `slot` is store-reached, and each store/load has the

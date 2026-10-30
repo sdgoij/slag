@@ -105,9 +105,19 @@ fn is_numeric_inst(inst: &Inst, values: &[bool], slot_numeric: &[bool]) -> bool 
                     Imm::Slot(s) if slot_numeric.get(s as usize).copied().unwrap_or(false)
                 )
         }
-        Op::Add | Op::Sub | Op::Mul | Op::Div | Op::Mod | Op::Pow | Op::Neg | Op::ToNumber => {
-            !inst.args.is_empty() && inst.args.iter().all(arg_numeric)
-        }
+        // `x++`/`x--` is `ToNumeric(x) ± 1`, so a Number operand yields a Number.
+        // A slot updated by `++` is otherwise never proven numeric, which keeps
+        // every read of it (and the arithmetic it feeds) a `Value`-word op: a
+        // nested counting loop's inner counter is exactly that shape.
+        Op::Add
+        | Op::Sub
+        | Op::Mul
+        | Op::Div
+        | Op::Mod
+        | Op::Pow
+        | Op::Neg
+        | Op::ToNumber
+        | Op::UpdateValue => !inst.args.is_empty() && inst.args.iter().all(arg_numeric),
         // A bit op on genuine Numbers is a Number (`ToInt32`/`ToUint32` of a
         // Number is an integral Number). The arg-numeric guard is required: a
         // BigInt operand makes the result a BigInt, not a Number. This is a
@@ -439,7 +449,15 @@ fn rewrite(
             }
             if !matches!(
                 inst.op,
-                Op::Add | Op::Sub | Op::Mul | Op::Div | Op::Mod | Op::Pow | Op::Neg | Op::ToNumber
+                Op::Add
+                    | Op::Sub
+                    | Op::Mul
+                    | Op::Div
+                    | Op::Mod
+                    | Op::Pow
+                    | Op::Neg
+                    | Op::ToNumber
+                    | Op::UpdateValue
             ) {
                 continue;
             }

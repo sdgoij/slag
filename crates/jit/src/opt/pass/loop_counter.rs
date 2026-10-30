@@ -15,15 +15,44 @@
 use std::collections::HashMap;
 
 use crate::opt::ir::{BlockId, Effects, Function, Imm, Inst, Op, Term, Type, ValueId};
+use syntax::ast::UpdateOp;
 
-/// A proven increment: where its `Add`/`Sub` and its constant operand live, and
+/// A proven increment: where its arithmetic and its constant operand live, and
 /// the wrapping op to rewrite it to.
 struct Increment {
     add: (BlockId, usize),
     op: Op,
-    kv: ValueId,
-    konst: (BlockId, usize),
+    /// The increment's constant operand and its defining `Const`. A `%`-style
+    /// `Add`/`Sub` has one; an `UpdateValue` carries its delta in `imm`, so the
+    /// rewrite synthesizes a private constant instead.
+    konst: Option<(ValueId, (BlockId, usize))>,
     delta: i32,
+}
+
+/// The `(wrapping op, delta)` an increment instruction denotes, and its constant
+/// operand when it has one.
+///
+/// `x++`/`x--` lifts to `Op::UpdateValue` (`ToNumeric(x) ± 1`), which is the
+/// generic form for any loop the `for`-head fusion does not recognize. Proving
+/// the counter int32 and replacing it with a wrapping add is exact: the operand
+/// is an int32 by induction, and `ToNumeric`/`ToPrimitive` cannot run for one.
+fn increment_of(d: &Inst) -> Option<(Op, Option<ValueId>, i32)> {
+    match d.op {
+        Op::Add => Some((Op::IntAdd, d.args.get(1).copied(), 0)),
+        Op::Sub => Some((Op::IntSub, d.args.get(1).copied(), 0)),
+        Op::UpdateValue => {
+            let Imm::Int(update) = d.imm else {
+                return None;
+            };
+            let delta = if update == UpdateOp::Increment as i32 {
+                1
+            } else {
+                -1
+            };
+            Some((Op::IntAdd, None, delta))
+        }
+        _ => None,
+    }
 }
 
 /// Run the pass over `func`. Returns whether the IR changed.
@@ -84,31 +113,37 @@ pub fn run(func: &mut Function) -> bool {
     // the increment gets a private clone and the original keeps its type.
     let mut shared: HashMap<ValueId, u32> = HashMap::new();
     for inc in &found {
-        *shared.entry(inc.kv).or_insert(0) += 1;
+        if let Some((kv, _)) = inc.konst {
+            *shared.entry(kv).or_insert(0) += 1;
+        }
     }
     let mut inserts: Vec<(BlockId, usize, ValueId, i32)> = Vec::new();
     for inc in found {
         let (ab, ai) = inc.add;
-        let total = uses.get(&inc.kv).copied().unwrap_or(0);
-        let delta_value = if total == shared[&inc.kv] {
-            let (kb, ki) = inc.konst;
-            let kinst = &mut func.block_mut(kb).insts[ki];
-            kinst.imm = Imm::Int(inc.delta);
-            kinst.ty = Type::Int;
-            if let Some(r) = kinst.result {
-                func.set_value_type(r, Type::Int);
+        let delta_value = match inc.konst {
+            Some((kv, (kb, ki))) if uses.get(&kv).copied().unwrap_or(0) == shared[&kv] => {
+                let kinst = &mut func.block_mut(kb).insts[ki];
+                kinst.imm = Imm::Int(inc.delta);
+                kinst.ty = Type::Int;
+                if let Some(r) = kinst.result {
+                    func.set_value_type(r, Type::Int);
+                }
+                kv
             }
-            inc.kv
-        } else {
-            let private = func.push_value(Type::Int);
-            inserts.push((ab, ai, private, inc.delta));
-            private
+            _ => {
+                let private = func.push_value(Type::Int);
+                inserts.push((ab, ai, private, inc.delta));
+                private
+            }
         };
         let inst = &mut func.block_mut(ab).insts[ai];
         inst.op = inc.op;
         inst.ty = Type::Int;
-        if let Some(arg) = inst.args.get_mut(1) {
-            *arg = delta_value;
+        // `UpdateValue` carries its delta in `imm` and has a single operand, so
+        // the wrapping op's constant may need appending rather than replacing.
+        match inst.args.get_mut(1) {
+            Some(arg) => *arg = delta_value,
+            None => inst.args.push(delta_value),
         }
         if let Some(r) = inst.result {
             func.set_value_type(r, Type::Int);
@@ -191,17 +226,17 @@ fn prove(
             }
             continue;
         }
-        let (op, konst) = match d.op {
-            Op::Add => (Op::IntAdd, d.args.get(1)),
-            Op::Sub => (Op::IntSub, d.args.get(1)),
-            _ => return None,
-        };
+        let (op, konst, imm_delta) = increment_of(d)?;
         if d.args.first() != Some(&p) {
             return None;
         }
-        let &cv = konst?;
-        let &(kb, ki) = def.get(&cv)?;
-        let delta = const_int(&func.block(kb).insts[ki])?;
+        let (delta, konst) = match konst {
+            Some(cv) => {
+                let &(kb, ki) = def.get(&cv)?;
+                (const_int(&func.block(kb).insts[ki])?, Some((cv, (kb, ki))))
+            }
+            None => (imm_delta, None),
+        };
         // The bound comes from the guard on *this* edge (an unconditional
         // back-edge has none, so it cannot be bounded).
         let (cond, negate) = guard?;
@@ -212,8 +247,7 @@ fn prove(
         inc = Some(Increment {
             add: (db, di),
             op,
-            kv: cv,
-            konst: (kb, ki),
+            konst,
             delta,
         });
         bound = Some((limit, increasing));
