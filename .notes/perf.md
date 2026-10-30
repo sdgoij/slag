@@ -20020,3 +20020,51 @@ a two-field constructor, and it is the largest single per-operation cost measure
 today. The journal already prices the pieces (the fresh-receiver chain read, the
 defines, the FFI construct cascade), so the next step there is a decomposition, not
 a guess.
+
+## MEASURED (2026-10-30): the ninth property
+
+The construct decomposition asked for. Field count is the dose, one row per
+process (the corpus runner shares an allocation context inside a directory), 500k
+iterations, minima of 2-3, object escaping into `arr[i & 63]` so nothing is
+scalar-replaced:
+
+| properties | literal, ms | per object | `new F()`, ms | per object |
+|---:|---:|---:|---:|---:|
+| 7 | 59.4 | 119 ns | 183 | 366 ns |
+| 8 | 63.1 | 126 | 213 | 426 |
+| 9 | **211.1** | **422** | **405** | **810** |
+| 10 | 238.1 | 476 | 482 | 964 |
+| 12 | 328.3 | 657 | | |
+
+Two cliffs, and only one of them is expected:
+
+- The step from 8 to 9 properties is **+296 ns for a literal and +384 ns for a
+  construct**, then ~40 ns per further property. It is not the literal lowering:
+  both lengths take the same `object_fast` helper and the same helpers per
+  iteration, so the cost is inside the shared create.
+- `object_fast_create` adopts `INLINE_FIELDS` (8) keys into the in-object field
+  region and then defines the tail through `create_data_property_key`. The 9th
+  key's descriptor ordinal is 8, so its property-vector position is 8, and the
+  vector must be positionally aligned with the descriptor ordinals (the L1c
+  transition discipline), which materializes the vector and copies the eight
+  in-object fields into it. That transition, once per object, is the ~115 ns;
+  each key past it is one generic define at ~40 ns.
+
+Priced and rejected on the spot: the composite shape cache was keyed on the WHOLE
+key list, so a literal longer than `INLINE_FIELDS` re-forked its 8-key head with
+one `get_or_create_child` per key on every evaluation. Keying it on the
+vector-free head instead changed nothing (211.1 before, 223.9 after), because the
+one-entry transition hint already makes each fork step a hit; reverted.
+
+The obvious lever, raising `INLINE_FIELDS` to 16, is already in the journal as a
+measured loss on box size. The remaining option is to let the tail define pad the
+vector with holes instead of copying the in-object fields, since every reader of
+an ordinal below `INLINE_FIELDS` reads `in_fields` (`JsObject::write_data_property_slot`
+branches on exactly that). That changes what `properties` means for its other
+consumers (`materialize_properties`, the key enumerators), which is why it is a
+project and not a slice.
+
+Also recorded here because it is the same row family: a bare construct with no
+fields is 98 ns against an empty literal's 62, so the construct machinery alone is
+~36 ns, and `new Item(i)` with two fields plus a prototype method call is 126 ns
+(`calls/construct_churn`'s per-iteration cost at that window).
