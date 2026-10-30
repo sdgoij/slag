@@ -138,6 +138,32 @@ INLINE_FIELDS` cannot contradict.
 
 **Decision: no change. Verify by reading, not by editing.**
 
+### 4.5 `property_slot` and its consumers (the sharp edge)
+
+`JsObject::property_slot` (`object.rs:2525`) answers with a **vector position**,
+not a descriptor ordinal, and it says so: "a slot is a vector position: a
+vector-free object must materialize first (its own properties exist, so reporting
+None would read as absent to the chain-cache walkers and slot recorders)".
+
+The suffix store breaks that identity for an in-field property: under a base of
+`INLINE_FIELDS` an in-field ordinal has no vector position at all. So
+`property_slot` MUST keep materializing (it may also need to map an ordinal to
+`ordinal - base` for the tail). Its consumers are the ones that make this the
+sharp edge, because they cache the position and re-read the vector with it:
+
+- the chain-cache walkers (they test whether a *prototype* link holds an
+  accessor, and a wrong position reads a different property),
+- the member-cell and shape probes in the JIT (`set_member_slot`,
+  `emit_shape_store_probe`), where the position is compiled into a store offset,
+- the interpreter's slot recorders (`runtime/src/ir.rs`).
+
+**Decision: slice 2 does not touch `property_slot`; it keeps materializing, so
+any object a chain walk or a slot probe looks at is already a base-0 vector.**
+The suffix store is only visible to the paths that read the vector by ordinal
+(§4.1) and to `materialize_properties`. If a later slice wants to avoid the
+materialization there too, the position/ordinal distinction has to be resolved
+first, and that is a bigger change than this note covers.
+
 ### 4.6 Tracing and the sweep
 
 `Trace for JsObject` visits `in_fields` and the vector. Fewer entries in the
