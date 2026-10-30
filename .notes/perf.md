@@ -19767,3 +19767,71 @@ allow/promote verdict, which is how the analysis fix was found.
 
 Gates: fmt, `clippy --workspace --all-targets -D warnings`, `cargo test
 --workspace`, four sweeps 51,998 at 100%, corpus parity 0.
+
+## PRICED, NOT TAKEN (2026-10-30): constant-divisor `%`, and the env-leaf lane
+
+Two candidates that were queued as "the next lever" turned out to be worth about
+0.2% each once priced, so neither was taken. The numbers, because the next reader
+will propose both again.
+
+**Constant-divisor `%` strength reduction.** Nearly free to measure: keep the
+4M-iteration `nested_loops` shape and swap only the operator.
+
+| body | ms | ns/iter |
+|---|---:|---:|
+| `s += (i * 31 + j) + 7` | 4.79 | 1.20 |
+| `s += (i * 31 + j) & 7` | 9.06 | 2.27 |
+| `s += (i * 31 + j) % 7` | 13.87 | 3.47 |
+
+So the entire remainder is 1.2 ns/iter above a bit op, and a perfect magic-multiply
+reduction (Cranelift's `srem` is a `checked_srem_seq`, an `idiv` plus its overflow
+tests) saves at most 4.8 ms on the row and nothing else in the corpus. That is
+0.25% of the total for a hand-rolled signed division with an `INT_MIN` correction,
+so it stays in the queue behind anything that moves a family.
+
+**The env-leaf lane.** The lane is 26.6 ns per call against 7.6 for a named global
+leaf, and the obvious suspect is `leaf_lookup` plus `new_body_context`. It is not:
+`leaf_lookup` is a direct-mapped `Cell` hit (hash, one load, one id compare) and
+`new_body_context` returns `None` immediately for a leaf. Caching the closure's
+`[[Environment]]` in `LeafCallRecord` would save that comparison and nothing else,
+at the cost of holding an untraced GC handle in a record whose identity check is
+the only thing keeping it live. The 19 ns is the two-field `body_context` /
+`lexical_env` swap plus the per-capture `load_context` call (a second capture adds
+4.8 ns), and neither is removable without giving compiled code an inline context
+slot read, which is a storage decision, not a slice.
+
+## NULL (2026-10-30): `new_in_place` for the `Small` string concat
+
+`JsString::concat`'s tiny-result path built the `Small` value on the stack and
+passed it to `Gc::new`, which copies the (enum-sized) value through another stack
+temp into the arena. The `Rope` and `ConsString` paths below it already use
+`Handle::new_in_place` for exactly that reason, so converting the `Small` path
+looked like free money on the most frequent allocation in the engine.
+
+Measured on a 300k-iteration `s += (q + q).length` loop and on the isolated
+`strings/coercion_concat` row: 11.52 / 11.27 / 10.47 ms against 12.33 / 11.52
+before, and 66.32 / 65.90 against 66.4. Inside the row noise, and the loop's three
+control probes (`t = q`, `q.substring`, `q.repeat`) all moved UP, which is a layout
+shift. Reverted. `Gc::new`'s self time is the heap borrow, the RefCell flag and the
+`young` push, not the copy.
+
+### What that loop's profile does say
+
+`SLAG_SAMPLE=200` on a 10M-iteration `s += (q + q).length` script:
+
+| share | function |
+|---:|---|
+| 20.3% | `JsString::concat` |
+| 15.4% | `Gc::new` |
+| 11.5% | `collect_minor_inner` + `scan_regions` |
+| 2.2% | `Heap::alloc` |
+| 2.0% | `as_slice` |
+
+Per operation, same loop: `q + q` 32 ns, `q.substring(0, 2)` 51, `q.repeat(1)` 88,
+`q.charCodeAt(0)` 10, `q.length` 7. `--gc-trace` puts the whole minor cost at
+1.6 ms of the 11.4 (74 minors, 22 us each), so allocation is ~25 ns and GC ~5 ns
+of the 32. A bump allocation of 48 bytes is not inherently 25 ns, but nothing in
+the allocator is individually large: `Heap::alloc` is 2.2% and `Gc::new` is the
+borrow plus bookkeeping. The gap to node's ~10 ns is spread across five terms,
+which is the same "portfolio, not a big win" conclusion the corpus-wide profile
+gives.
