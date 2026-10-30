@@ -20182,3 +20182,44 @@ exactly and fills it.
 
 Gates: fmt, `clippy --workspace --all-targets -D warnings`, 5861 tests, four
 sweeps 51,998 at 100%, corpus parity 0 (`mean-jitGap` 8.57 in a slow window).
+
+## LANDED (2026-10-30): a concat chain builds one string, not one per `+`
+
+With a number's spelling going straight into the concat (the previous entry),
+what is left in `"value=" + i + ":" + (i * 2)` is the ALLOCATION COUNT: one box per
+`Add`, where node builds one string. The optimizing tier now folds a left-leaning
+`Add` spine into a single `ConcatChain` helper call, so the chain is assembled
+into one box.
+
+The peephole is in the lowering, not the IR: `opt_lower` defers an `Add` whose
+left operand the typer proved a `Type::String` (the only way the lattice assigns
+it is a string constant) and keeps folding `Add`es on its pending result, up to
+eight pieces. Every such `Add` is a concatenation by definition (one operand is a
+string, so the result is one) and the intermediate strings are unobservable, so
+the fused call is exact: `crates/runtime/src/expr.rs::concat_chain` spells the
+integral numbers into a stack buffer, sizes the result exactly, and writes one
+`Small` (no buffer allocation at all when it fits) or one `Flat`; a piece that is
+an object, a Symbol or a fractional number takes the general per-piece
+`ToPrimitive`/`ToString` path. The pieces ride in a `stack_slot` array in the
+JIT frame, which the conservative scan already covers, and the helper is
+classified as disturbing the leaf-eligibility epoch (its general path can run
+user code).
+
+| same-binary pair, one row per process, minima | before | after |
+| --- | ---: | ---: |
+| `strings/coercion_concat` | 49.0 | **38.9 (-21%)** |
+| the other four `strings` rows | | -0.7% to +0.4% |
+
+Against the window before the number spelling landed, `coercion_concat` is 61 ->
+38.9, so the row is ~5.1x node where it was ~8.0x.
+
+Measured, not assumed: the fusion is worth less than the box it removes. Folding
+three boxes into one saved 37 ns/iteration, not the ~60 the box price predicted,
+so the helper's own cost (the call, the per-piece tag dispatch, the exact-size
+fill) is ~20 ns of it. Two shapes are outside it: a body the lift refuses (the
+same chain in an interpreter-run body still pays per-`Add` boxes), and a piece
+that is not an integral number.
+
+Gates: fmt, `clippy --workspace --all-targets -D warnings`, 5861 tests, four
+sweeps 51,998 at 100% (plus `built-ins --filter String/* --gc-stress`, 1223
+fixtures), corpus parity 0.

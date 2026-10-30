@@ -220,6 +220,9 @@ pub enum Helper {
     /// The fused plain-argument construct (no `ArgsBase`/`ArgsPush` vector):
     /// the callee and its arguments in the JIT buffer.
     ConstructArgs,
+    /// A fused string concat chain: `pieces` is a stack array of `count` value
+    /// words whose first element the typer proved a string.
+    ConcatChain,
 }
 
 // The instrument's counter array (`runtime::jit::HELPER_COUNT`) must cover every
@@ -379,12 +382,13 @@ impl Helper {
             Helper::ResolveSuperRefName => "resolve_super_ref_name",
             Helper::ResolveSuperRefComputed => "resolve_super_ref_computed",
             Helper::ConstructArgs => "construct_args",
+            Helper::ConcatChain => "concat_chain",
         }
     }
 
     /// One past the last variant; bounds the temporary helper instrument's
     /// counter array (`runtime::jit::HELPER_COUNT`).
-    pub const COUNT: usize = Helper::ConstructArgs as usize + 1;
+    pub const COUNT: usize = Helper::ConcatChain as usize + 1;
 
     /// Whether calling this helper can re-enter the interpreter (a getter,
     /// setter, `valueOf`/`toString`, or nested call), which is the only way
@@ -444,6 +448,9 @@ pub struct JitHelpers {
     /// Returns the concatenated value (0 when either operand is not a
     /// string).
     pub concat_strings: Option<extern "C" fn(vm: *mut c_void, a: u64, b: u64) -> u64>,
+    /// The fused string concat chain (`Op::Add` spine folding): `pieces` is a
+    /// stack array of `count` value words. Returns the result value.
+    pub concat_chain: Option<extern "C" fn(vm: *mut c_void, pieces: u64, count: u64) -> u64>,
     /// Seed the string builder for a planned append loop.
     pub builder_bind: Option<extern "C" fn(vm: *mut c_void, slot: u64) -> u64>,
     /// Materialize the string builder back into its slot.
@@ -965,6 +972,7 @@ impl JitHelpers {
             binary_slow: None,
             unary_slow: None,
             concat_strings: None,
+            concat_chain: None,
             builder_bind: None,
             builder_store: None,
             builder_append: None,
@@ -1121,6 +1129,7 @@ impl JitHelpers {
             Helper::BinarySlow => self.binary_slow.map(|f| f as usize as u64),
             Helper::UnarySlow => self.unary_slow.map(|f| f as usize as u64),
             Helper::ConcatStrings => self.concat_strings.map(|f| f as usize as u64),
+            Helper::ConcatChain => self.concat_chain.map(|f| f as usize as u64),
             Helper::BuilderBind => self.builder_bind.map(|f| f as usize as u64),
             Helper::BuilderStore => self.builder_store.map(|f| f as usize as u64),
             Helper::BuilderAppend => self.builder_append.map(|f| f as usize as u64),
@@ -1797,6 +1806,17 @@ pub extern "C" fn test_object_accessor_computed(
 
 pub extern "C" fn test_object_spread(_vm: *mut c_void, object: u64, _from: u64) -> u64 {
     object
+}
+
+/// The concat-chain double: the scaffold's lowering tests assert the chain was
+/// folded into one call by counting these, so it echoes the FIRST piece (the
+/// string seed) and ignores the rest.
+pub extern "C" fn test_concat_chain(_vm: *mut c_void, pieces: u64, count: u64) -> u64 {
+    if count == 0 {
+        return 0;
+    }
+    // SAFETY: the lowering stores `count` value words at `pieces`.
+    unsafe { std::ptr::read_volatile(pieces as *const u64) }
 }
 
 /// `push_str` double: returns 80 (the literal value the concat steps echo).

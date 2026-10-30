@@ -1300,16 +1300,19 @@ pub(crate) fn concat_primitive(left: &Value, right: &Value) -> Option<Value> {
         && let Some(text) = left.as_string()
     {
         let mut buf = [0u16; 22];
-        if let Some(units) = crux::number::integer_units(number, &mut buf) {
-            return Some(Value::String(JsString::concat_units(&text, units)));
+        if let Some(len) = crux::number::write_integer_units(number, &mut buf) {
+            return Some(Value::String(JsString::concat_units(&text, &buf[..len])));
         }
     }
     if let (ValueKind::Number(number), ValueKind::String(_)) = (left.kind(), right.kind())
         && let Some(text) = right.as_string()
     {
         let mut buf = [0u16; 22];
-        if let Some(units) = crux::number::integer_units(number, &mut buf) {
-            return Some(Value::String(JsString::concat_units_left(units, &text)));
+        if let Some(len) = crux::number::write_integer_units(number, &mut buf) {
+            return Some(Value::String(JsString::concat_units_left(
+                &buf[..len],
+                &text,
+            )));
         }
     }
     let (a, b) = match (left.kind(), right.kind()) {
@@ -1336,6 +1339,106 @@ fn primitive_to_string(value: &Value) -> Option<Value> {
         ValueKind::Undefined => Some(Value::String(Handle::new(JsString::from_utf8("undefined")))),
         _ => None,
     }
+}
+
+/// The most pieces a fused concat chain carries (the lowering's stack array).
+pub const MAX_CONCAT_CHAIN: usize = 8;
+
+/// `"a" + x + y + ...` where the leftmost ADDEND is provably a string, built as
+/// ONE string instead of one box per `+`. Each piece is converted exactly as the
+/// chained `Add`s would (`ToPrimitive`, then `ToString`), in order, and the
+/// result is assembled in a stack buffer when it fits the inline form.
+pub(crate) fn concat_chain(agent: &mut Agent, pieces: &[u64]) -> Result<Value, JsError> {
+    // Pass 1: spell the integral numbers and measure. A piece that is neither a
+    // string nor an integral number (an object, a Symbol, a fractional number)
+    // takes the general path, which converts with the full machinery.
+    let mut spellings = [[0u16; 22]; MAX_CONCAT_CHAIN];
+    let mut lengths = [0usize; MAX_CONCAT_CHAIN];
+    let mut texts: [Option<Handle<JsString>>; MAX_CONCAT_CHAIN] = [None; MAX_CONCAT_CHAIN];
+    let mut total = 0usize;
+    let mut all_simple = pieces.len() <= MAX_CONCAT_CHAIN;
+    if all_simple {
+        for (index, bits) in pieces.iter().enumerate() {
+            match Value::from_bits(*bits).kind() {
+                ValueKind::String(string) => {
+                    total += string.len();
+                    texts[index] = Some(string);
+                }
+                ValueKind::Number(number) => {
+                    match crux::number::write_integer_units(number, &mut spellings[index]) {
+                        Some(len) => {
+                            lengths[index] = len;
+                            total += len;
+                        }
+                        None => {
+                            all_simple = false;
+                            break;
+                        }
+                    }
+                }
+                _ => {
+                    all_simple = false;
+                    break;
+                }
+            }
+        }
+    }
+    if !all_simple {
+        return concat_chain_general(agent, pieces);
+    }
+    // Pass 2: fill. A result inside the inline form costs one allocation (the
+    // box) and no buffer at all.
+    let mut inline = [0u16; crux::string::SMALL_STRING_CAP];
+    if total <= inline.len() {
+        let mut at = 0usize;
+        for index in 0..pieces.len() {
+            if let Some(text) = texts[index].as_ref() {
+                let slice = text.as_slice();
+                inline[at..at + slice.len()].copy_from_slice(slice);
+                at += slice.len();
+            } else {
+                let len = lengths[index];
+                inline[at..at + len].copy_from_slice(&spellings[index][..len]);
+                at += len;
+            }
+        }
+        return Ok(Value::String(Handle::new(JsString::Small {
+            len: at as u8,
+            units: inline,
+        })));
+    }
+    let mut units: Vec<u16> = Vec::with_capacity(total);
+    for index in 0..pieces.len() {
+        if let Some(text) = texts[index].as_ref() {
+            units.extend_from_slice(text.as_slice());
+        } else {
+            units.extend_from_slice(&spellings[index][..lengths[index]]);
+        }
+    }
+    Ok(Value::String(Handle::new(JsString::from_units_vec(units))))
+}
+
+/// The chain's exact per-piece conversion (spec `+` left to right), for a piece
+/// the stack-buffer path cannot spell.
+fn concat_chain_general(agent: &mut Agent, pieces: &[u64]) -> Result<Value, JsError> {
+    let mut builder: Option<Handle<JsString>> = None;
+    for bits in pieces {
+        let piece = Value::from_bits(*bits);
+        let primitive = match piece.kind() {
+            ValueKind::Object(_) | ValueKind::Function(_) => {
+                crate::context::to_primitive(agent, &piece, ToPrimitiveHint::Default)?
+            }
+            _ => piece,
+        };
+        let text = crate::context::to_string(agent, &primitive)?;
+        builder = Some(match builder {
+            Some(acc) => JsString::concat(&acc, &Handle::new(text)),
+            None => Handle::new(text),
+        });
+    }
+    Ok(Value::String(
+        builder.unwrap_or_else(|| Handle::new(JsString::from_utf8(""))),
+    ))
 }
 
 pub(crate) fn apply_binary(

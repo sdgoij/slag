@@ -879,6 +879,9 @@ pub struct JitSlowPaths {
     /// string value's bits are never 0 — the sentinel is unreachable from
     /// the compiled path's tag check).
     pub concat_strings: extern "C" fn(ctx: *mut c_void, a: u64, b: u64) -> u64,
+    /// A fused string concat chain: `pieces` points at `count` `Value` words on
+    /// the caller's stack, the first of which the typer proved a string.
+    pub concat_chain: extern "C" fn(ctx: *mut c_void, pieces: u64, count: u64) -> u64,
     /// Seed the string builder for a planned append loop.
     pub builder_bind: extern "C" fn(ctx: *mut c_void, slot: u64) -> u64,
     /// Materialize the string builder back into its slot.
@@ -1547,6 +1550,7 @@ pub static JIT_SLOW_PATHS: JitSlowPaths = JitSlowPaths {
     binary_slow,
     unary_slow,
     concat_strings,
+    concat_chain,
     builder_bind,
     builder_store,
     builder_append,
@@ -1885,6 +1889,28 @@ extern "C" fn concat_strings(_ctx: *mut c_void, a: u64, b: u64) -> u64 {
     match (a.as_string(), b.as_string()) {
         (Some(a), Some(b)) => Value::String(crux::string::JsString::concat(&a, &b)).bits(),
         _ => 0,
+    }
+}
+
+/// A fused string concat chain (see `Op::Add` spine folding): the pieces are
+/// `Value` words in the caller's stack array, which the conservative scan keeps
+/// reachable across the helpers' allocations.
+extern "C" fn concat_chain(ctx: *mut c_void, pieces: u64, count: u64) -> u64 {
+    let ctx = unsafe { ctx_of(ctx) };
+    let agent = unsafe { &mut *ctx.agent };
+    let count = count as usize;
+    if count == 0 || count > crate::expr::MAX_CONCAT_CHAIN {
+        return slow_error(
+            ctx,
+            JsError::new(ErrorKind::TypeError, "concat_chain: bad piece count".into()),
+        );
+    }
+    // SAFETY: the compiled code passed the address of its own `count`-word
+    // stack array, live for this call.
+    let values = unsafe { std::slice::from_raw_parts(pieces as *const u64, count) };
+    match crate::expr::concat_chain(agent, values) {
+        Ok(value) => value.bits(),
+        Err(error) => slow_error(ctx, error),
     }
 }
 

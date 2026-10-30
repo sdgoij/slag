@@ -210,6 +210,21 @@ impl JsString {
         Handle::new(JsString::Flat(units.into()))
     }
 
+    /// Adopt `units` as the result's storage: an inline `Small` when it fits,
+    /// else the `Flat`'s shared buffer (the `Vec`'s allocation moves into the
+    /// `Arc`, so a caller that already built a `Vec` pays no second copy).
+    pub fn from_units_vec(units: Vec<u16>) -> Self {
+        if units.len() <= SMALL_STRING_CAP {
+            let mut buf = [0u16; SMALL_STRING_CAP];
+            buf[..units.len()].copy_from_slice(&units);
+            return JsString::Small {
+                len: units.len() as u8,
+                units: buf,
+            };
+        }
+        JsString::Flat(units.into())
+    }
+
     pub fn from_utf16(units: &[u16]) -> Self {
         // Cut 67: a small input's units live inline in the box — one
         // allocation instead of the Arc's own. Larger inputs keep the

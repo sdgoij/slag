@@ -9,8 +9,8 @@
 use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
 use cranelift_codegen::ir::immediates::Offset32;
 use cranelift_codegen::ir::{
-    Block, BlockArg, Function, InstBuilder, MemFlagsData, SigRef, UserFuncName, Value as ClifValue,
-    types,
+    Block, BlockArg, Function, InstBuilder, MemFlagsData, SigRef, StackSlotData, StackSlotKind,
+    UserFuncName, Value as ClifValue, types,
 };
 use cranelift_codegen::isa::{CallConv, TargetIsa};
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Variable};
@@ -165,6 +165,9 @@ fn lower(
 
     let mut values: Vec<Option<ClifValue>> = vec![None; ir.value_count() as usize];
     let types = ir.value_types();
+    // The open fused concat chain, if the previous instruction was one (see the
+    // per-instruction folding below).
+    let mut concat: Option<ConcatChain> = None;
     // A loop header is the target of a back edge (an edge to a block at or
     // before its own index). Each one carries a GC safe point: the optimizing
     // tier lowered none before 2026-10-10, so a lifted allocating loop never
@@ -206,10 +209,32 @@ fn lower(
             values[*p as usize] = Some(params[i]);
         }
         for inst in &block.insts {
+            // Fold a left-leaning `"str" + a + b + ...` spine into ONE concat
+            // helper call. Every `Add` on a proven-string operand is a concat,
+            // so the whole chain can be assembled into a single string box
+            // instead of one box per `+` (the intermediate results are
+            // unobservable, and each piece still converts in order).
+            if let Some(open) = concat.as_mut() {
+                if open.extends(&mut builder, ir, types, &values, inst) {
+                    open.pending = inst.result.expect("an Add result");
+                    continue;
+                }
+                let open = concat.take().expect("an open chain");
+                let value = emit_concat_chain(&mut builder, helpers, &abi, &open)?;
+                values[open.pending as usize] = Some(value);
+            }
+            if let Some(open) = ConcatChain::start(&mut builder, ir, types, &values, inst)? {
+                concat = Some(open);
+                continue;
+            }
             let result = lower_inst(&mut builder, inst, &abi, helpers, &values, types)?;
             if let Some(id) = inst.result {
                 values[id as usize] = Some(result);
             }
+        }
+        if let Some(open) = concat.take() {
+            let value = emit_concat_chain(&mut builder, helpers, &abi, &open)?;
+            values[open.pending as usize] = Some(value);
         }
         match &block.term {
             Some(Term::Return(value)) => {
@@ -6190,6 +6215,129 @@ fn value_of(values: &[Option<ClifValue>], id: ValueId) -> Result<ClifValue, Unsu
         .copied()
         .flatten()
         .ok_or(Unsupported::Step("opt:use-before-def"))
+}
+
+/// The most pieces one fused concat chain carries (the helper's stack array).
+const MAX_CONCAT_PIECES: usize = runtime::expr::MAX_CONCAT_CHAIN;
+
+/// A concat chain being lowered: the `Add` spine's pieces, plus the value id of
+/// the last `Add` folded (which `values` does not hold yet, since the chain is
+/// emitted as one helper call when the spine ends).
+struct ConcatChain {
+    pending: ValueId,
+    pieces: Vec<ClifValue>,
+}
+
+impl ConcatChain {
+    /// Whether `inst` continues the open chain: an `Add` whose LEFT operand is
+    /// the pending (already-proven-string) result.
+    fn extends(
+        &mut self,
+        builder: &mut FunctionBuilder,
+        ir: &IrFunction,
+        types: &[Type],
+        values: &[Option<ClifValue>],
+        inst: &Inst,
+    ) -> bool {
+        if inst.op != Op::Add || inst.result.is_none() || self.pieces.len() >= MAX_CONCAT_PIECES {
+            return false;
+        }
+        let [left, right, ..] = inst.args[..] else {
+            return false;
+        };
+        if left != self.pending {
+            return false;
+        }
+        match concat_piece(builder, ir, types, values, right) {
+            Some(piece) => {
+                self.pieces.push(piece);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Whether `inst` STARTS a chain: an `Add` whose left operand the typer
+    /// proves a string, so the `Add` (and every `Add` chained on its result) is
+    /// a string concatenation.
+    fn start(
+        builder: &mut FunctionBuilder,
+        ir: &IrFunction,
+        types: &[Type],
+        values: &[Option<ClifValue>],
+        inst: &Inst,
+    ) -> Result<Option<Self>, Unsupported> {
+        let Some(result) = inst.result else {
+            return Ok(None);
+        };
+        if inst.op != Op::Add {
+            return Ok(None);
+        }
+        let [left, right, ..] = inst.args[..] else {
+            return Ok(None);
+        };
+        if types.get(left as usize) != Some(&Type::String) {
+            return Ok(None);
+        }
+        let (Some(first), Some(second)) = (
+            concat_piece(builder, ir, types, values, left),
+            concat_piece(builder, ir, types, values, right),
+        ) else {
+            return Ok(None);
+        };
+        Ok(Some(ConcatChain {
+            pending: result,
+            pieces: vec![first, second],
+        }))
+    }
+}
+
+/// An operand as a `Value` word for the chain's stack array: an `Int` register
+/// converts to a canonical Number, a raw `Float` does not qualify (it is not a
+/// `Value`, and the unbox pass canonicalizes every non-numeric consumer).
+fn concat_piece(
+    builder: &mut FunctionBuilder,
+    ir: &IrFunction,
+    types: &[Type],
+    values: &[Option<ClifValue>],
+    id: ValueId,
+) -> Option<ClifValue> {
+    let value = (*values.get(id as usize)?)?;
+    let _ = types;
+    Some(match ir.value_type(id) {
+        Type::Int => int_to_bits(builder, value),
+        Type::Float => return None,
+        _ => value,
+    })
+}
+
+fn emit_concat_chain(
+    builder: &mut FunctionBuilder,
+    helpers: &JitHelpers,
+    abi: &Abi,
+    chain: &ConcatChain,
+) -> Result<ClifValue, Unsupported> {
+    let size = (chain.pieces.len() * std::mem::size_of::<u64>()) as u32;
+    let slot =
+        builder.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, size, 3));
+    let addr = builder.ins().stack_addr(types::I64, slot, 0);
+    for (index, piece) in chain.pieces.iter().enumerate() {
+        builder.ins().store(
+            MemFlagsData::new(),
+            *piece,
+            addr,
+            Offset32::new((index * std::mem::size_of::<u64>()) as i32),
+        );
+    }
+    let count = builder.ins().iconst(types::I64, chain.pieces.len() as i64);
+    call_helper(
+        builder,
+        helpers,
+        abi,
+        abi.sig_unary,
+        Helper::ConcatChain,
+        &[addr, count],
+    )
 }
 
 fn binary_op(op: Op) -> Option<BinaryOp> {

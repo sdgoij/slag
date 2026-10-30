@@ -93,30 +93,37 @@ pub fn to_string(x: f64) -> JsString {
     JsString::from_utf8(&out)
 }
 
-/// The decimal units of an exactly-representable integer (`|x| <= 2^53`),
-/// right-aligned in `buf`. `None` when the form does not apply, so the caller
-/// takes the general `to_string` path. Exposed so a string coercion can spell
-/// the number straight into the concat buffer instead of boxing it first.
-pub fn integer_units(x: f64, buf: &mut [u16; 22]) -> Option<&[u16]> {
+/// Write the decimal units of an exactly-representable integer (`|x| <= 2^53`)
+/// at the START of `dst` and answer their count. `None` when the form does not
+/// apply, so the caller takes the general `to_string` path. Exposed so a string
+/// coercion can spell the number straight into the concat buffer instead of
+/// boxing it first.
+pub fn write_integer_units(x: f64, dst: &mut [u16; 22]) -> Option<usize> {
     if x.fract() != 0.0 || x.abs() > 9007199254740992.0 {
         return None;
     }
     let negative = x < 0.0;
     let mut digits = x.abs() as u64;
-    let mut i = buf.len();
+    // Digits come out least-significant first, so they land from the end of a
+    // 22-unit scratch (sign + 20 digits + one spare) and move forward once.
+    let mut scratch = [0u16; 22];
+    let mut i = scratch.len();
     loop {
         i -= 1;
-        buf[i] = u16::from(b'0') + (digits % 10) as u16;
+        scratch[i] = u16::from(b'0') + (digits % 10) as u16;
         digits /= 10;
         if digits == 0 {
             break;
         }
     }
+    let len = scratch.len() - i;
     if negative {
-        i -= 1;
-        buf[i] = u16::from(b'-');
+        dst[0] = u16::from(b'-');
+        dst[1..=len].copy_from_slice(&scratch[i..]);
+        return Some(len + 1);
     }
-    Some(&buf[i..])
+    dst[..len].copy_from_slice(&scratch[i..]);
+    Some(len)
 }
 
 /// The decimal string of an exactly-representable integer (`|x| <= 2^53`,
@@ -124,8 +131,8 @@ pub fn integer_units(x: f64, buf: &mut [u16; 22]) -> Option<&[u16]> {
 fn small_integer_string(x: f64) -> JsString {
     let mut buf = [0u16; 22];
     // The caller proved the integer form.
-    let units = integer_units(x, &mut buf).unwrap_or(&[]);
-    JsString::from_utf16(units)
+    let len = write_integer_units(x, &mut buf).unwrap_or(0);
+    JsString::from_utf16(&buf[..len])
 }
 
 /// spec 6.1.6.1.1 Number::add.
