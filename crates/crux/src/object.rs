@@ -145,6 +145,11 @@ pub struct SmallProps {
     inline: [MaybeUninit<(PropertyKey, Property)>; INLINE_PROPS],
     len: usize,
     heap: Vec<(PropertyKey, Property)>,
+    /// The descriptor ordinal of the entry at vector position 0. `0` for a
+    /// fully materialized vector; `INLINE_FIELDS` for a **suffix store**, whose
+    /// in-field head is served from `in_fields` and whose vector holds only the
+    /// ordinals at or above the cap (see `.notes/property-vector-base.md`).
+    base: usize,
 }
 
 const INLINE_PROPS: usize = 2;
@@ -181,7 +186,26 @@ impl SmallProps {
             inline: [const { MaybeUninit::uninit() }; INLINE_PROPS],
             len: 0,
             heap: Vec::new(),
+            base: 0,
         }
+    }
+
+    /// The descriptor ordinal one past the last entry: the vector's length in
+    /// the positional sense, where `Deref::len` is the entry count. With
+    /// `base == 0` (every object today) the two are equal.
+    pub fn ordinal_len(&self) -> usize {
+        self.base + self.len
+    }
+
+    /// The entry at descriptor ordinal `ordinal`, or `None` when it is below
+    /// `base` (its value lives in the object's in-object fields) or past the
+    /// end. `None` means "not in the vector", never "absent": the caller must
+    /// consult `in_fields` for an ordinal below `base`, exactly as it already
+    /// does for an ordinal below `INLINE_FIELDS`.
+    pub fn get_ordinal(&self, ordinal: usize) -> Option<&(PropertyKey, Property)> {
+        ordinal
+            .checked_sub(self.base)
+            .and_then(|i| self.slice().get(i))
     }
 
     fn slice(&self) -> &[(PropertyKey, Property)] {
@@ -1393,7 +1417,7 @@ impl JsObject {
             };
         }
         let props = self.properties.borrow();
-        match props.get(slot) {
+        match props.get_ordinal(slot) {
             Some((_, property)) => property.value(),
             None => None,
         }
@@ -1424,7 +1448,10 @@ impl JsObject {
     /// describing only keys whose ordinal equals their vector slot.
     fn map_transition_aligned(&self) -> bool {
         match self.map.get() {
-            Some(map) => self.properties.borrow().len() == map.descriptor_count(),
+            // The positional question is "does the vector cover every descriptor
+            // ordinal", not "does it hold that many entries": a suffix store
+            // holds only the ordinals from its base on.
+            Some(map) => self.properties.borrow().ordinal_len() == map.descriptor_count(),
             None => false,
         }
     }
@@ -6010,6 +6037,48 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["d", "e", "x", "x", "x", "x"]
         );
+    }
+
+    #[test]
+    fn small_props_ordinals_shift_by_the_base() {
+        // A suffix store: `base` is the descriptor ordinal of vector position 0,
+        // so an ordinal below it is NOT in the vector (its value lives in the
+        // object's in-object fields) and the ordinals at or above it are indexed
+        // from `base`. With `base == 0` this is the identity every object uses
+        // today.
+        let data = |n: f64| Property::data(Value::Number(n), true, true, true);
+        let mut props = SmallProps::new();
+        props.push((PropertyKey::from_utf8("a"), data(1.0)));
+        props.push((PropertyKey::from_utf8("b"), data(2.0)));
+        assert_eq!(props.ordinal_len(), 2);
+        assert_eq!(props.get_ordinal(1).unwrap().0.display_string(), "b");
+        assert!(props.get_ordinal(2).is_none());
+
+        // The same two entries as the tail of a nine-descriptor object: ordinal
+        // 8 is the first entry in the vector, 7 is the in-field head.
+        props.base = INLINE_FIELDS;
+        assert_eq!(props.ordinal_len(), INLINE_FIELDS + 2);
+        assert_eq!(props.get_ordinal(0), None);
+        assert_eq!(
+            props
+                .get_ordinal(INLINE_FIELDS)
+                .expect("the first tail entry")
+                .0
+                .display_string(),
+            "a"
+        );
+        assert_eq!(
+            props
+                .get_ordinal(INLINE_FIELDS + 1)
+                .expect("the second tail entry")
+                .0
+                .display_string(),
+            "b"
+        );
+        assert!(props.get_ordinal(INLINE_FIELDS + 2).is_none());
+        // The entry count and the suffix iteration are unchanged by the base:
+        // a consumer that wants the whole object walks the map for the head.
+        assert_eq!(props.len(), 2);
     }
 
     #[test]

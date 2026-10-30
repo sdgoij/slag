@@ -20068,3 +20068,29 @@ Also recorded here because it is the same row family: a bare construct with no
 fields is 98 ns against an empty literal's 62, so the construct machinery alone is
 ~36 ns, and `new Item(i)` with two fields plus a prototype method call is 126 ns
 (`calls/construct_churn`'s per-iteration cost at that window).
+
+## LANDED (2026-10-30): `SmallProps` gains a `base` (inert), the first step of the suffix store
+
+`.notes/property-vector-base.md` scopes the ninth-property cliff: the property
+vector must be positionally aligned with the descriptor ordinals, so an object
+growing past `INLINE_FIELDS` materializes its in-field head into the vector once
+(measured +296 ns for a literal, +384 for a construct).
+
+This lands the plumbing only: `SmallProps` carries the descriptor ordinal of its
+first entry, plus `ordinal_len()` (the positional length, which differs from the
+entry count once a base exists) and `get_ordinal()`. Two call sites move to them,
+both identities while `base` is 0: `map_field`'s above-cap arm and
+`map_transition_aligned`, whose question is "does the vector cover every
+descriptor ordinal", not "does it hold that many entries".
+
+The change is inert by construction, so the evidence is the invariants rather than
+a time delta: `base` is 0 at every construction site, `get_ordinal(o)` is then
+`slice().get(o)` and `ordinal_len()` is `len`. A unit test
+(`small_props_ordinals_shift_by_the_base`) drives a non-zero base through both
+accessors so the semantics are pinned before the define path uses them. The
+9-key probe keeps its cliff with the same ratio (lit9/lit8 3.17 against 3.34;
+the absolute milliseconds of that run are a faster window than the entry above).
+
+Gates: fmt, `clippy --workspace --all-targets -D warnings`, `cargo test
+--workspace` 5861 pass, four sweeps 51,998 at 100%, corpus parity 0
+(`mean-jitGap` 8.31).
