@@ -211,18 +211,42 @@ fn retype_phis(func: &mut Function, phi: &HashMap<BlockId, usize>, preds: &[Vec<
     let mut retype: Vec<(ValueId, Type)> = Vec::new();
     for (&m, &index) in phi {
         let mut ty = Type::Never;
+        // Whether every incoming value is an int32: an `Int`-typed one, or a
+        // constant whose value is integral and inside the i32 range. A loop
+        // counter's preheader init is the usual `Const 0`, which `narrow` types
+        // `Number` (its only uses are a comparison and this edge), so the plain
+        // join kept the counter in a `Value` word and `loop_counter`'s `IntAdd`
+        // increment then round-tripped i32 -> i64 -> i32 every iteration.
+        let mut all_int = true;
         for &p in &preds[m as usize] {
             if let Some(v) = edge_arg(func, p, m, index) {
                 ty = ty.join(func.value_type(v));
+                all_int &= matches!(func.value_type(v), Type::Int) || is_int32_const(func, v);
             }
         }
         if ty != Type::Never {
+            if all_int {
+                ty = Type::Int;
+            }
             retype.push((func.block(m).params[index], ty));
         }
     }
     for (v, ty) in retype {
         func.set_value_type(v, ty);
     }
+}
+
+/// Whether `v` is a constant instruction holding an integral value inside the
+/// i32 range.
+fn is_int32_const(func: &Function, v: ValueId) -> bool {
+    for b in 0..func.block_count() as u32 {
+        for inst in &func.block(b).insts {
+            if inst.result == Some(v) {
+                return inst.op == Op::Const && crate::opt::pass::narrow::is_int_const(&inst.imm);
+            }
+        }
+    }
+    false
 }
 
 /// The argument a `from -> to` edge passes for the target's parameter `index`.

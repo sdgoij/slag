@@ -28,7 +28,7 @@
 use std::sync::atomic::{AtomicU8, Ordering};
 
 use crate::opt::builder::Builder;
-use crate::opt::ir::{BlockId, Effects, Function, Heap, Imm, Op, Term, Type, ValueId};
+use crate::opt::ir::{BlockId, Effects, Function, Heap, HoistRead, Imm, Op, Term, Type, ValueId};
 use syntax::ast::{AssignOp, BinaryOp, UnaryOp, UpdateOp};
 
 use runtime::ir::{
@@ -305,6 +305,7 @@ fn lift_impl(body: &CompiledBody, guard_reads: bool) -> Result<Function, Unsuppo
                         &mut stack,
                         tdz,
                         block_starts[bi] + off,
+                        steps,
                         guard_reads,
                         step,
                         counter,
@@ -342,6 +343,7 @@ fn lift_impl(body: &CompiledBody, guard_reads: bool) -> Result<Function, Unsuppo
                         &mut stack,
                         tdz,
                         block_starts[bi] + off,
+                        steps,
                         guard_reads,
                         step,
                         counter,
@@ -470,8 +472,15 @@ fn lift_impl(body: &CompiledBody, guard_reads: bool) -> Result<Function, Unsuppo
                         "FastLoopHead after is not the fall-through",
                     ));
                 }
-                let (cond, jump_when_true) =
-                    emit_fused_test(&mut builder, bi as BlockId, &steps[ti], tdz, *counter)?;
+                let (cond, jump_when_true) = emit_fused_test(
+                    &mut builder,
+                    bi as BlockId,
+                    &steps[ti],
+                    ti,
+                    steps,
+                    tdz,
+                    *counter,
+                )?;
                 let target = jump_target(&steps[ti]).ok_or(Unsupported::Invalid)?;
                 let sb = block_of[target] as BlockId;
                 let fb = block_of[end] as BlockId;
@@ -1035,6 +1044,7 @@ fn emit_step(
     stack: &mut Vec<ValueId>,
     tdz: &[bool],
     index: usize,
+    steps: &[Step],
     guard_reads: bool,
     step: &Step,
     counter: Option<usize>,
@@ -1703,9 +1713,13 @@ fn emit_step(
             // shape that keeps a whole loop's accumulator in a `Value` word,
             // paying an f64 -> i32 -> f64 round trip for a trailing `| 0`. The
             // guard asserts the read is an exact int32 and the types then let
-            // `narrow` fuse the whole RMW into an `IntAdd`.
+            // `narrow` fuse the whole RMW into an `IntAdd`. A read the enclosing
+            // int32 hoist already proved needs no check (`Op::AssumeInt`).
             let guard = guard_reads
-                .then(|| reg_body_guard(ops, index, stack, counter, num))
+                .then(|| {
+                    let int_slots = hoist_int_slots(steps, index);
+                    reg_body_guard(ops, index, stack, counter, num, &int_slots)
+                })
                 .flatten();
             emit_reg_body(builder, block, ops, counter, guard)?;
         }
@@ -1993,6 +2007,9 @@ fn emit_const(builder: &mut Builder, block: BlockId, imm: Imm, ty: Type) -> Valu
 struct RegGuard {
     /// The index of the leaf op whose result the guard asserts.
     at: usize,
+    /// Emit `AssumeInt` (no check: an enclosing probe proved it) instead of a
+    /// `GuardType` that deopts.
+    assume: bool,
     step: u32,
     counter: u32,
     num: u32,
@@ -2083,37 +2100,97 @@ fn truncated_before_store(ops: &[LeafOp], from: usize) -> bool {
     false
 }
 
+/// Whether a register body's raw slot read is one the int32 hoist proved: the
+/// read's value feeds the body's arithmetic and its write-back is truncated, so
+/// the whole read-modify-write can collapse into an i32 add.
+fn reads_as_int(ops: &[LeafOp], at: usize, slot: u32) -> bool {
+    matches!(ops.get(at), Some(LeafOp::LoadReg { slot: s, .. }) if *s as u32 == slot)
+        && ops.get(at + 1).is_some_and(leaf_op_is_arithmetic)
+        && truncated_before_store(ops, at + 2)
+}
+
+/// Whether any register body in the step range `from..to` carries `slot` in an
+/// i32 register (`reads_as_int`). The hoist probe requires such a read's value
+/// to be an exact int32, which is what its hidden slot then holds for the
+/// guarded copy.
+fn region_reads_as_int(steps: &[Step], from: usize, to: usize, slot: u32) -> bool {
+    let to = to.min(steps.len());
+    steps.get(from.min(to)..to).is_some_and(|region| {
+        region.iter().any(|step| match step {
+            Step::RunRegBody { ops } => (0..ops.len()).any(|at| reads_as_int(ops, at, slot)),
+            _ => false,
+        })
+    })
+}
+
+/// The hidden slots the int32 hoist proved for the innermost enclosing hoist
+/// guard at `index` (empty outside a guarded copy).
+fn hoist_int_slots(steps: &[Step], index: usize) -> Vec<u32> {
+    for i in (0..index).rev() {
+        if let Step::HoistMemberGuard { reads, target, .. } = &steps[i]
+            && index < *target
+        {
+            return reads
+                .iter()
+                .map(|&(_, _, hoist_slot, _)| hoist_slot as u32)
+                .filter(|&hoist_slot| region_reads_as_int(steps, i + 1, *target, hoist_slot))
+                .collect();
+        }
+    }
+    Vec::new()
+}
+
 /// Choose the read a register body guards, if any: the first element read whose
-/// value feeds the next op's arithmetic and whose preceding ops can be replayed.
+/// value feeds the next op's arithmetic and whose preceding ops can be replayed,
+/// or a raw slot read the enclosing int32 hoist proved.
 fn reg_body_guard(
     ops: &[LeafOp],
     index: usize,
     stack: &[ValueId],
     counter: Option<usize>,
     num: Option<usize>,
+    int_slots: &[u32],
 ) -> Option<RegGuard> {
-    let at = ops.iter().position(|op| {
+    let element = ops.iter().position(|op| {
         matches!(
             op,
             LeafOp::GetMemberComputedLocal { .. } | LeafOp::GetMemberComputed { .. }
         )
+    });
+    if let Some(at) = element {
+        if at + 1 >= ops.len() || !leaf_op_is_arithmetic(&ops[at + 1]) {
+            return None;
+        }
+        if !truncated_before_store(ops, at + 2) {
+            return None;
+        }
+        if !ops[..at].iter().all(leaf_op_replayable) {
+            return None;
+        }
+        let slot = |s: Option<usize>| s.map_or(u32::MAX, |s| s as u32);
+        return Some(RegGuard {
+            at,
+            assume: false,
+            step: index as u32,
+            counter: slot(counter),
+            num: slot(num),
+            live: stack.to_vec(),
+        });
+    }
+    // A read the hoist probe proved an exact int32 needs no check at all: the
+    // hidden slot holds that value for the whole loop, so `AssumeInt` is just
+    // the representation conversion.
+    let at = (0..ops.len()).find(|&at| {
+        int_slots.iter().any(|&slot| reads_as_int(ops, at, slot))
+            && ops[..at].iter().all(leaf_op_replayable)
     })?;
-    if at + 1 >= ops.len() || !leaf_op_is_arithmetic(&ops[at + 1]) {
-        return None;
-    }
-    if !truncated_before_store(ops, at + 2) {
-        return None;
-    }
-    if !ops[..at].iter().all(leaf_op_replayable) {
-        return None;
-    }
-    let slot = |s: Option<usize>| s.map_or(u32::MAX, |s| s as u32);
     Some(RegGuard {
         at,
+        assume: true,
         step: index as u32,
-        counter: slot(counter),
-        num: slot(num),
-        live: stack.to_vec(),
+        counter: u32::MAX,
+        num: u32::MAX,
+        live: Vec::new(),
     })
 }
 
@@ -2149,21 +2226,32 @@ fn emit_reg_body(
         if let Some(guard) = &guard
             && guard.at == i
         {
-            let mut args = Vec::with_capacity(1 + guard.live.len());
-            args.push(acc);
-            args.extend_from_slice(&guard.live);
-            acc = builder.emit(
-                block,
-                Op::GuardType,
-                &args,
-                Type::Int,
-                Effects::pure(),
-                Imm::Guard {
-                    step: guard.step,
-                    counter: guard.counter,
-                    num: guard.num,
-                },
-            );
+            if guard.assume {
+                acc = builder.emit(
+                    block,
+                    Op::AssumeInt,
+                    &[acc],
+                    Type::Int,
+                    Effects::pure(),
+                    Imm::None,
+                );
+            } else {
+                let mut args = Vec::with_capacity(1 + guard.live.len());
+                args.push(acc);
+                args.extend_from_slice(&guard.live);
+                acc = builder.emit(
+                    block,
+                    Op::GuardType,
+                    &args,
+                    Type::Int,
+                    Effects::pure(),
+                    Imm::Guard {
+                        step: guard.step,
+                        counter: guard.counter,
+                        num: guard.num,
+                    },
+                );
+            }
         }
     }
     Ok(())
@@ -2713,6 +2801,8 @@ fn emit_fused_test(
     builder: &mut Builder,
     block: BlockId,
     step: &Step,
+    index: usize,
+    steps: &[Step],
     tdz: &[bool],
     counter: Option<usize>,
 ) -> Result<(ValueId, bool), Unsupported> {
@@ -2879,18 +2969,57 @@ fn emit_fused_test(
             (cmp(builder, binary_op(*op)?, next, limit_v), true)
         }
         // A LICM hoist guard: the compiler's pre-loop probe that hoists the
-        // loop's invariant member/global reads into hidden slots. On a hit the
-        // GUARDED copy (the fall-through) runs with the reads done once; on a
-        // miss the general copy. The lift models "always miss", which is a
-        // PESSIMIZATION, not a neutral choice: the per-step tier takes the hit
-        // and reads once, so an always-miss opt body runs every read per
-        // iteration. Measured (min-of-3, opt vs `SLAG_OPT=0`): `objects/own_read`
-        // +571%, and the `globals/declarative_read`/`nested_read`/`object_read`
-        // rows ~+60% each. Absent a modelled probe, refuse so those bodies run
-        // the per-step tier, which implements the guard (the parity contract).
-        Step::HoistMemberGuard { .. } | Step::HoistGlobalGuard { .. } => {
-            return Err(Unsupported::Step(step_name(step)));
+        // loop's invariant member read into a hidden slot. On a hit the GUARDED
+        // copy (the fall-through) runs with the reads done once; on a miss the
+        // general copy runs. The probe is `Op::HoistProbe`: the machine twin of
+        // the interpreter step (the same member-value cell validation), which
+        // also materializes the hit's values into the hidden slots. A read the
+        // guarded copy's register body carries in an i32 register additionally
+        // requires an exact int32, which is what `Op::AssumeInt` then relies on.
+        Step::HoistMemberGuard {
+            reads,
+            prim_slots,
+            numbers,
+            target,
+        } => {
+            let spec = reads
+                .iter()
+                .map(|&(recv_slot, name, hoist_slot, _strict)| HoistRead {
+                    recv_slot: recv_slot as u32,
+                    name,
+                    hoist_slot: hoist_slot as u32,
+                    require_int: region_reads_as_int(steps, index + 1, *target, hoist_slot as u32),
+                })
+                .collect::<Vec<_>>();
+            // Only a guarded copy whose reads all feed a truncated int32 RMW pays
+            // in this tier. Otherwise the copy drops the per-step tier's fused
+            // int lane (a `s += o.a + o.b` loop is 0.73 ns there and ~3.8 ns as a
+            // generic f64 read-modify-write here), so the body keeps the per-step
+            // path, which is what the refusal did before the probe was modelled.
+            if spec.iter().any(|read| !read.require_int) {
+                return Err(Unsupported::Step(step_name(step)));
+            }
+            let code = builder.emit(
+                block,
+                Op::HoistProbe,
+                &[],
+                Type::Bool,
+                Op::HoistProbe.default_effects(),
+                Imm::Hoist {
+                    reads: spec.into_boxed_slice(),
+                    prim_slots: prim_slots
+                        .iter()
+                        .map(|&s| s as u32)
+                        .collect::<Vec<_>>()
+                        .into_boxed_slice(),
+                    numbers: *numbers,
+                },
+            );
+            (code, false)
         }
+        // The global counterpart needs the global-value cell probe; until it is
+        // modelled the body keeps the per-step tier, which implements it.
+        Step::HoistGlobalGuard { .. } => return Err(Unsupported::Step(step_name(step))),
         other => return Err(Unsupported::Step(step_name(other))),
     })
 }

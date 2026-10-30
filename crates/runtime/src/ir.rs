@@ -5741,6 +5741,21 @@ impl Vm {
         Self::member_cell_get_map(agent, object, name)
     }
 
+    /// The loop-invariant read hoist's data-only probe: the warm member cell,
+    /// filling it from the map-keyed path on a cold miss. `None` when the read
+    /// is not a plain own data property (an accessor, or a receiver on the
+    /// prototype chain), so the hoist guard misses and the general loop runs.
+    /// Never runs user code, which is what makes the hoist sound.
+    pub(crate) fn hoist_member_probe(
+        &self,
+        agent: &mut Agent,
+        object: Value,
+        name: crux::AtomId,
+    ) -> Option<Value> {
+        let object = Self::cell_object(&object)?;
+        Self::member_cell_warm_probe(agent, &object, name)
+    }
+
     /// The cached read of `object.name` — an own data property on a plain
     /// object at the direct-mapped slot, re-validated against the stored key
     /// and property kind. `None` falls back to the full Get (which then

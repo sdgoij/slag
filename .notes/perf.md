@@ -19518,3 +19518,75 @@ validation the interpreter step runs, feeding the existing fused-test terminator
 which unblocks 6 rows and would let the int32 guard reach `obj_prop`'s shape; then
 the same guard on the *named* read; then Route B's int lane admitting a guarded
 read (`IntRhs::Element`), which is where V8's `i32` accumulator actually lives.
+
+## The hoist guard, modelled: `opcost/obj_prop` 0.61 -> 0.043 ms (measured 2026-10-30)
+
+The optimizing tier refused every body with a loop-invariant read hoist
+(`Step::HoistMemberGuard`), so six rows ran the per-step tier. The reason for the
+refusal was honest: the lift modelled the guard as always-miss, which runs every
+read per iteration (+571% on `own_read` when measured). The fix is to model the
+probe, but the interesting part is what the probe has to be.
+
+**The probe.** `Op::HoistProbe` (`Imm::Hoist`) validates the value-operand slots
+and every hoisted read, materializes the hit's values into the hidden slots, and
+answers a bool; the existing fused-test terminator branches on it (a miss jumps to
+the compiler's general loop, unchanged semantics). The reads go through one new
+helper, `hoist_member_probe`, which runs the interpreter's own
+`member_cell_warm_probe`.
+
+That the probe must *warm* is not incidental: the warm probe falls back to the
+map-keyed read, and the value cell is cold on the first pass because this is the
+program's first read of the property (a synthetic row reads `o.x` only inside the
+loop). A version that only validated the id-keyed cell missed every time and
+`obj_prop` stayed at 0.61 ms. Being *stricter* than the interpreter is safe
+(a miss takes the general loop); being *looser* would hoist a non-invariant read,
+so the probe never runs user code and never accepts a value the interpreter's
+guard would reject.
+
+**The gate.** A guarded copy pays only where the body's accumulator becomes an
+int32. The probe therefore requires a read to be an exact int32
+(`f64(i32(x)) == x`) iff a register body in the guarded region loads its hidden
+slot into a truncated read-modify-write, and the lift accepts the body only when
+*every* hoisted read meets that test. Without the gate `own_read`
+(`s += o.a + o.b`) goes 2.9 -> 15.2 ms: the copy is a generic `Value`-word
+read-modify-write, where the per-step tier's fused int lane was 0.73 ns/iter.
+
+**The counter's type, and why it mattered more than the read.** With the probe
+hitting, `obj_prop` was 0.61 -> 0.367 ms and then stalled: at 10M iterations it
+was still 36.6 ms (3.7 ns/iter) with a three-op IR loop. The loop counter's phi
+was typed `Number`, so `loop_counter`'s fused `IntAdd` increment round-tripped
+`i32 -> i64 -> i32` every iteration (and the lowering had to convert it, or the
+verifier rejected the `iadd` widths). The cause is in `normalize_param_types`'s
+join, which is the *last* word on a promoted parameter's type: a counter's
+preheader init is `Const 0`, `narrow` demotes it to `Number` (its only uses are
+the loop test and the header edge), and the join of `Number` and `Int` is
+`Number`. The join now answers `Int` when *every* incoming value is an `Int` or
+an integral in-range constant, `resolve` converts a `Value` word into an `Int`
+parameter, and `IntAdd`/`IntSub`/`IntMul` convert a `Value`-word operand rather
+than emitting a mismatched `iadd`. `obj_prop` at 10M: 36.6 -> 4.3 ms (0.43
+ns/iter, which is the fused lane's own floor).
+
+Measured, isolated rows, repeated:
+
+| row | before | after | |
+|---|---:|---:|---|
+| `opcost/obj_prop` | 0.610 | 0.043 | -93% (jitGap 27.8 -> ~2.0) |
+| `opcost/obj_prop`, 10M iterations | 62.9 | 4.3 | -93% |
+| `opcost/element_read` (read guard) | 0.613 | 0.292 | unchanged by this pass |
+| `objects/own_read` (gated out) | 2.90 | 2.96 | flat |
+
+Corpus, 3 interleaved rounds against the previous binary: `mean-jitGap` 9.56 /
+10.96 / 9.47 vs 9.11 / 9.23 / 7.18, `mismatches=0`. The whole-directory run is
+not usable for row-level attribution here (one run showed `head-let` +79 ms and
+`spread_assign` +22 ms; isolated, both overlap their own spread), which is the
+same allocation-context artifact the corpus note above records.
+
+Gates: fmt, `clippy --workspace --all-targets -D warnings`, `cargo test
+--workspace`, four sweeps 51,998 at 100%, corpus parity 0.
+
+**Still refused, in order of value.** `Step::HoistGlobalGuard` (the global/`Env`
+counterpart: the same probe over the global-value cell, which is the
+`globals/declarative_read`/`nested_read`/`object_read` family) and the
+`opcost/obj_prop` shape with a *non*-int32 invariant (the read then stays a
+`Value` word and the probe gate declines it). The typed key insight from the read
+guard carries over: the payload that pays is int32, not `Number`.

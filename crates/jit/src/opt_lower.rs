@@ -339,6 +339,10 @@ fn resolve(
                 (Type::Int, Some(Type::Int)) => v,
                 (Type::Int, Some(Type::Float)) => builder.ins().fcvt_from_sint(types::F64, v),
                 (Type::Int, _) => int_to_bits(builder, v),
+                // A parameter typed `Int` is an i32 register; a `Value` word on
+                // its edge is an int32-valued Number (that is the parameter's
+                // claim), so the saturating conversion is exact.
+                (_, Some(Type::Int)) => bits_to_int(builder, v),
                 (Type::Float, Some(Type::Float)) => v,
                 // A raw float never reaches a non-float parameter (the unbox
                 // pass canonicalizes that edge); keep the word well-formed.
@@ -587,8 +591,24 @@ fn lower_inst(
         // the op is exactly the spec's `ToInt32` of the f64 arithmetic, so it
         // stays in i32 with no conversion.
         Op::IntAdd | Op::IntSub | Op::IntMul => {
-            let lhs = value_of(values, inst.args[0])?;
-            let rhs = value_of(values, inst.args[1])?;
+            // The IR contract is that both operands are int32, but a promoted
+            // loop-counter phi can still carry the `Number` type (its preheader
+            // edge is a `Const 0` the int lattice demotes, so the phi's join is
+            // `Number` while the increment `loop_counter` rewrote is `IntAdd`).
+            // Convert an operand that is not already an i32 register: a Number
+            // the IR feeds here is int32-valued, so the saturating conversion is
+            // exact, exactly as `arg!` converts at the helper boundary.
+            let int_arg =
+                |builder: &mut FunctionBuilder, id: ValueId| -> Result<ClifValue, Unsupported> {
+                    let v = value_of(values, id)?;
+                    if builder.func.dfg.value_type(v) == types::I32 {
+                        Ok(v)
+                    } else {
+                        Ok(bits_to_int(builder, v))
+                    }
+                };
+            let lhs = int_arg(builder, inst.args[0])?;
+            let rhs = int_arg(builder, inst.args[1])?;
             match inst.op {
                 Op::IntAdd => builder.ins().iadd(lhs, rhs),
                 Op::IntSub => builder.ins().isub(lhs, rhs),
@@ -1193,6 +1213,98 @@ fn lower_inst(
         // A lifted `o[k]`: the inline dense element read (the read mirror of
         // the append), falling back to `get_member_computed` for every other
         // receiver, key, or a hole.
+        // The loop-invariant read hoist's probe (`Step::HoistMemberGuard`): the
+        // machine twin of the interpreter step. Every value operand must be a
+        // non-object primitive (the only operands whose coercion cannot re-enter
+        // user code and mutate a hoisted receiver), and every read must be a
+        // validated own-data hit whose value is likewise a non-object, landing in
+        // its hidden slot. A miss answers false and the body takes the general
+        // per-iteration loop, so being stricter than the interpreter is safe.
+        Op::HoistProbe => {
+            let Imm::Hoist {
+                reads,
+                prim_slots,
+                numbers,
+            } = &inst.imm
+            else {
+                return Err(Unsupported::Step("opt:hoist"));
+            };
+            let mut ok = builder.ins().iconst(types::I8, 1);
+            for &slot in prim_slots.iter() {
+                let value = builder.ins().load(
+                    types::I64,
+                    MemFlagsData::new(),
+                    abi.frame,
+                    Offset32::new((slot as i32) * 8),
+                );
+                let flag = if *numbers {
+                    is_double(builder, value)
+                } else {
+                    is_non_object(builder, value)
+                };
+                ok = builder.ins().band(ok, flag);
+            }
+            if !reads.is_empty() {
+                let undef = builder
+                    .ins()
+                    .iconst(types::I64, JsValue::Undefined.bits() as i64);
+                for read in reads.iter() {
+                    let object = builder.ins().load(
+                        types::I64,
+                        MemFlagsData::new(),
+                        abi.frame,
+                        Offset32::new((read.recv_slot as i32) * 8),
+                    );
+                    let name = builder.ins().iconst(types::I64, read.name as i64);
+                    // The data-only probe (the interpreter's `member_cell_warm_probe`):
+                    // the value, or the dense-hole sentinel when the read is not a
+                    // plain own data property. No user code runs either way.
+                    let found = call_helper(
+                        builder,
+                        helpers,
+                        abi,
+                        abi.sig_unary,
+                        Helper::HoistMemberProbe,
+                        &[object, name],
+                    )?;
+                    let miss = builder.ins().icmp_imm_u(
+                        IntCC::Equal,
+                        found,
+                        crux::value::HOLE_BITS as i64,
+                    );
+                    let hit = builder.ins().bxor_imm_u(miss, 1);
+                    let non_object = is_non_object(builder, found);
+                    let mut value_ok = builder.ins().band(hit, non_object);
+                    if read.require_int {
+                        // The guarded copy carries this value in an i32
+                        // register, so its hidden slot must hold an exact
+                        // int32 (see `Op::AssumeInt`).
+                        let raw = builder
+                            .ins()
+                            .bitcast(types::F64, MemFlagsData::new(), found);
+                        let int = builder.ins().fcvt_to_sint_sat(types::I32, raw);
+                        let back = builder.ins().fcvt_from_sint(types::F64, int);
+                        let exact = builder.ins().fcmp(FloatCC::Equal, back, raw);
+                        value_ok = builder.ins().band(value_ok, exact);
+                    }
+                    ok = builder.ins().band(ok, value_ok);
+                    // A miss stores `undefined` (the slot is only read by the
+                    // guarded copy, which a miss abandons).
+                    let stored = builder.ins().select(miss, undef, found);
+                    builder.ins().store(
+                        MemFlagsData::new(),
+                        stored,
+                        abi.frame,
+                        Offset32::new((read.hoist_slot as i32) * 8),
+                    );
+                }
+            }
+            ok
+        }
+        Op::AssumeInt => {
+            let value = arg!(0);
+            bits_to_int(builder, value)
+        }
         Op::ElementLoad => {
             let object = arg!(0);
             // An `Int` key is already an exact i32 in a register, so the dense
@@ -5696,6 +5808,28 @@ fn is_double(builder: &mut FunctionBuilder, bits: ClifValue) -> ClifValue {
     builder
         .ins()
         .icmp_imm_u(IntCC::NotEqual, masked, crux::TAG_PREFIX as i64)
+}
+
+/// Whether a NaN-boxed `Value` is neither an Object nor a Function, the operand
+/// shape whose coercion cannot re-enter user code (a `valueOf`/`toString` hook
+/// could mutate a hoisted receiver).
+fn is_non_object(builder: &mut FunctionBuilder, bits: ClifValue) -> ClifValue {
+    let heap = builder.ins().band_imm_u(bits, crux::TAG_MASK as i64);
+    let is_heap = builder
+        .ins()
+        .icmp_imm_u(IntCC::Equal, heap, crux::TAG_PREFIX as i64);
+    let tag = builder.ins().ushr_imm_u(bits, 44);
+    let tag = builder.ins().band_imm_u(tag, 0xF);
+    let is_obj = builder
+        .ins()
+        .icmp_imm_u(IntCC::Equal, tag, crux::TAG_OBJECT as i64);
+    let is_fn = builder
+        .ins()
+        .icmp_imm_u(IntCC::Equal, tag, crux::TAG_FUNCTION as i64);
+    let heap_obj = builder.ins().band(is_heap, is_obj);
+    let heap_fn = builder.ins().band(is_heap, is_fn);
+    let excluded = builder.ins().bor(heap_obj, heap_fn);
+    builder.ins().bxor_imm_u(excluded, 1)
 }
 
 /// Canonicalize a computed double's bits: a NaN whose top bits collide with the

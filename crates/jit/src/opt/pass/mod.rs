@@ -178,6 +178,14 @@ fn normalize_param_types(func: &mut Function) -> bool {
             continue;
         }
         let mut joined = vec![None::<Type>; params.len()];
+        // Per parameter: whether every incoming value is an int32 (`Int`, or an
+        // integral in-range constant). `narrow` types a loop's preheader init
+        // `Number` (its only uses are a comparison and the header edge), so the
+        // plain join keeps an `IntAdd` counter in a `Value` word and the
+        // increment round-trips i32 -> i64 -> i32 every iteration. All-int
+        // incoming values make the parameter an int32, which `resolve` converts
+        // at the edge.
+        let mut all_int = vec![true; params.len()];
         for p in 0..n {
             for (to, args) in edge_args(func, p) {
                 if to != b {
@@ -192,14 +200,16 @@ fn normalize_param_types(func: &mut Function) -> bool {
                         Some(j) => j.join(t),
                         None => t,
                     });
+                    all_int[i] &= matches!(t, Type::Int) || int32_const(func, *a);
                 }
             }
         }
         for (i, j) in joined.into_iter().enumerate() {
-            if let Some(j) = j
-                && func.value_type(params[i]) != j
-            {
-                retype.push((params[i], j));
+            if let Some(j) = j {
+                let j = if all_int[i] { Type::Int } else { j };
+                if func.value_type(params[i]) != j {
+                    retype.push((params[i], j));
+                }
             }
         }
     }
@@ -212,6 +222,19 @@ fn normalize_param_types(func: &mut Function) -> bool {
 
 /// The `(target, args)` edges leaving `from` (empty for a non-branching
 /// terminator).
+/// Whether `v` is a constant instruction holding an integral value inside the
+/// i32 range.
+fn int32_const(func: &Function, v: ValueId) -> bool {
+    for b in 0..func.block_count() as u32 {
+        for inst in &func.block(b).insts {
+            if inst.result == Some(v) {
+                return inst.op == Op::Const && narrow::is_int_const(&inst.imm);
+            }
+        }
+    }
+    false
+}
+
 fn edge_args(func: &Function, from: BlockId) -> Vec<(BlockId, Vec<ValueId>)> {
     match &func.block(from).term {
         Some(Term::Jump { target, args }) => vec![(*target, args.clone())],

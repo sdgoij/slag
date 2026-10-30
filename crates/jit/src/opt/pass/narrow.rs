@@ -91,6 +91,8 @@ fn is_numeric_inst(inst: &Inst, values: &[bool], slot_numeric: &[bool]) -> bool 
         // A guard asserts its value's type, so a `Number` guard produces a
         // Number (and lets a slot stored only guarded reads stay numeric).
         Op::GuardType => inst.ty.is_numeric(),
+        // An int32 the hoist proved: a Number by construction.
+        Op::AssumeInt => true,
         // A frame load is numeric either when the slot fixpoint proves the slot
         // holds a Number, or when the lift declared it Number because a runtime
         // proof (the LICM hoist guard's `numbers=true` arm) establishes it at
@@ -170,7 +172,7 @@ fn value_ints(func: &Function, values: &[bool], slot_int: &[bool]) -> Vec<bool> 
 
 /// Whether `imm` is an int32 — an `Imm::Int`, or an integral `f64` inside the
 /// i32 range. These are the constants whose `|x| < 2^63` guard can be skipped.
-fn is_int_const(imm: &Imm) -> bool {
+pub(crate) fn is_int_const(imm: &Imm) -> bool {
     match imm {
         Imm::Int(_) => true,
         Imm::Float(f) => f.fract() == 0.0 && f.abs() < 2_147_483_648.0,
@@ -186,8 +188,9 @@ fn is_int_inst(inst: &Inst, values: &[bool], slot_int: &[bool]) -> bool {
         Op::Const => is_int_const(&inst.imm),
         // An `Int` guard asserted the value is an integral double inside the
         // int32 range, so its result *is* an int32 (the lowering deopts
-        // otherwise).
+        // otherwise). `AssumeInt` relies on the hoist probe's proof.
         Op::GuardType => inst.ty == Type::Int,
+        Op::AssumeInt => true,
         Op::FrameLoad => matches!(
             inst.imm,
             Imm::Slot(s) if slot_int.get(s as usize).copied().unwrap_or(false)

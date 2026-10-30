@@ -903,6 +903,7 @@ pub struct JitSlowPaths {
     pub gc_safepoint: extern "C" fn(ctx: *mut c_void) -> u64,
     /// `Get(o, name)`; `name` is an `AtomId`.
     pub get_member_name: extern "C" fn(ctx: *mut c_void, object: u64, name: u64) -> u64,
+    pub hoist_member_probe: extern "C" fn(ctx: *mut c_void, object: u64, name: u64) -> u64,
     /// A compiled member read whose map-cell hit recorded an ordinal at or
     /// above `INLINE_FIELDS` (Slice 3): the machine validated the shape, so
     /// read the map-described vector slot live (skipping the full-Get
@@ -1554,6 +1555,7 @@ pub static JIT_SLOW_PATHS: JitSlowPaths = JitSlowPaths {
     tdz_error,
     gc_safepoint,
     get_member_name,
+    hoist_member_probe,
     get_member_map_slot,
     get_member_computed,
     set_member_name,
@@ -2008,6 +2010,16 @@ extern "C" fn get_member_name(ctx: *mut c_void, object: u64, name: u64) -> u64 {
     match vm.get_member_name(agent, object, name as crux::AtomId) {
         Ok(value) => value.bits(),
         Err(error) => slow_error(ctx, error),
+    }
+}
+
+extern "C" fn hoist_member_probe(ctx: *mut c_void, object: u64, name: u64) -> u64 {
+    let ctx = unsafe { ctx_of(ctx) };
+    let agent = unsafe { &mut *ctx.agent };
+    let vm = unsafe { &mut *ctx.vm };
+    match vm.hoist_member_probe(agent, Value::from_bits(object), name as crux::AtomId) {
+        Some(value) => value.bits(),
+        None => crux::value::HOLE_BITS,
     }
 }
 

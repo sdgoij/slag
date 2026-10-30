@@ -187,6 +187,18 @@ impl Effects {
     }
 }
 
+/// One hoisted loop-invariant read: the receiver's frame slot, the property
+/// name, the hidden slot its value is materialized into, and whether the value
+/// must be an exact int32 (the guarded copy's register body carries it in an i32
+/// register).
+#[derive(Clone, PartialEq, Eq, Debug, Default)]
+pub struct HoistRead {
+    pub recv_slot: u32,
+    pub name: u32,
+    pub hoist_slot: u32,
+    pub require_int: bool,
+}
+
 /// A constant or slot payload carried by an instruction.
 #[derive(Clone, PartialEq, Debug, Default)]
 pub enum Imm {
@@ -224,6 +236,17 @@ pub enum Imm {
         step: u32,
         counter: u32,
         num: u32,
+    },
+    /// A loop-invariant read hoist's probe spec (`Step::HoistMemberGuard`): the
+    /// hidden slots to fill from each `(receiver slot, name atom, hidden slot)`
+    /// read, the value-operand slots that must hold a non-object primitive (a
+    /// Number when `numbers`), and whether a read's value must also be an exact
+    /// int32 (the guarded copy's register body then carries it in an i32
+    /// register).
+    Hoist {
+        reads: Box<[HoistRead]>,
+        prim_slots: Box<[u32]>,
+        numbers: bool,
     },
     /// Raw 64 bits (a NaN-boxed `Value` or an identity).
     U64(u64),
@@ -317,6 +340,19 @@ pub enum Op {
     /// name and generation AND holds the speculative value, that value is the
     /// read; otherwise the full `get_member_name` helper serves it. Never traps.
     MemberGuard,
+    /// The loop-invariant read hoist's probe (`Step::HoistMemberGuard`):
+    /// validates the value operand slots and every hoisted read through the
+    /// member-value cell, materializing a hit's values into the hidden slots,
+    /// and answers whether the guard held. A false answer takes the compiler's
+    /// general per-iteration loop (the unchanged semantics); the payload is
+    /// [`Imm::Hoist`]. Writes `Heap::Slots` (the hidden slots).
+    HoistProbe,
+    /// Assert `args[0]` is an exact int32 and yield it in the i32
+    /// representation. Sound only where the value is already proven (the int32
+    /// hoist probe's contract, which is checked once before the loop); it emits
+    /// one conversion and no check, so a loop can carry the value in an i32
+    /// register instead of round-tripping through f64.
+    AssumeInt,
     ElementLoad,
     ElementStore,
     NewObject,
@@ -476,6 +512,10 @@ impl Op {
                 .union(E::write(Heap::Members)),
             Op::MemberCellLoad => E::read(Heap::Slots).union(E::read(Heap::Members)),
             Op::MemberGuard => E::call(),
+            Op::HoistProbe => E::read(Heap::Slots)
+                .union(E::write(Heap::Slots))
+                .union(E::read(Heap::Members)),
+            Op::AssumeInt => E::pure(),
             Op::ElementLoad => E::read(Heap::Elements),
             Op::ElementStore => E::write(Heap::Elements).union(E::write(Heap::Members)),
             Op::CompletionReset | Op::CompletionStore => E::write(Heap::World),

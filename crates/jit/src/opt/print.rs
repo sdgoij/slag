@@ -97,6 +97,26 @@ fn imm_suffix(imm: &Imm) -> String {
             };
             format!(" step{step} counter{} num{}", slot(counter), slot(num))
         }
+        Imm::Hoist {
+            reads,
+            prim_slots,
+            numbers,
+        } => {
+            let mut text = format!(" prim{prim_slots:?}");
+            if *numbers {
+                text.push_str(" numbers");
+            }
+            for read in reads.iter() {
+                text.push_str(&format!(
+                    " slot{}:atom{}->slot{}{}",
+                    read.recv_slot,
+                    read.name,
+                    read.hoist_slot,
+                    if read.require_int { " int" } else { "" }
+                ));
+            }
+            text
+        }
         Imm::U64(v) => format!(" {v:#x}"),
     }
 }
