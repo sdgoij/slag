@@ -1135,26 +1135,49 @@ fn emit_step(
             stack.push(value);
         }
         // A plain member-name assignment (`o.x = v`, stack `[object, value]`)
-        // and a plain computed assignment (`o[k] = v`, stack
-        // `[object, key, value]`): the validated `Op::MemberStore` and the
-        // `Op::ElementStore` (via `set_member_computed`). The compound forms
-        // (a read-modify-write) are refused — their own slice.
+        // and a compound one (`o.x op= v`, stack `[object, old, value]`): the
+        // validated `Op::MemberStore`, with the compound applied to the old
+        // value the parser left on the stack. The logical assignments
+        // (`&&=`, `||=`, `??=`) are refused: their store is conditional on the
+        // old value, and the step carries no flag for which arm ran.
         Step::AssignMemberName { name, op } => {
-            if *op != AssignOp::Assign {
+            if matches!(
+                op,
+                AssignOp::AndAssign | AssignOp::OrAssign | AssignOp::NullishAssign
+            ) {
                 return Err(Unsupported::Step(step_name(step)));
             }
             let value = stack.pop().ok_or(Unsupported::Stack)?;
+            let old = if is_compound_assign(op) {
+                Some(stack.pop().ok_or(Unsupported::Stack)?)
+            } else {
+                None
+            };
             let object = stack.pop().ok_or(Unsupported::Stack)?;
+            let stored = match old {
+                Some(old) => {
+                    let bop = binary_op(runtime::expr::compound_binary(*op))?;
+                    builder.emit(
+                        block,
+                        bop,
+                        &[old, value],
+                        Type::Unknown,
+                        bop.default_effects(),
+                        Imm::None,
+                    )
+                }
+                None => value,
+            };
             builder.emit_void(
                 block,
                 Op::MemberStore,
-                &[object, value],
+                &[object, stored],
                 Op::MemberStore.default_effects(),
                 Imm::Atom(*name),
             );
             // The stored value is the expression result (the per-step arm
             // pushes it).
-            stack.push(value);
+            stack.push(stored);
         }
         // A plain computed assignment (`o[k] = v`, stack `[object, key, value]`),
         // the inline element store. The compound form is refused.
@@ -3393,10 +3416,11 @@ fn step_name(step: &Step) -> &'static str {
         | Step::PopAcc
         | Step::IncAcc
         | Step::DecAcc => "FusedLoop",
-        // The compound member stores (the plain forms lift; these are the
-        // read-modify-write ones the lift does not model yet), named so the
-        // refusal census says which store blocked a body.
-        Step::AssignMemberName { .. } => "AssignMemberName(compound)",
+        // The member stores the lift does not model, named so the refusal
+        // census says which store blocked a body: the logical assignments (the
+        // store is conditional on the old value) and the computed
+        // read-modify-write (its key must be converted once for both halves).
+        Step::AssignMemberName { .. } => "AssignMemberName(logical)",
         Step::AssignMemberComputed { .. } => "AssignMemberComputed(compound)",
         // The LICM hoist guards are refused on purpose (see `lift_block`: the
         // lift models the guard as always-miss, a measured pessimization), so a

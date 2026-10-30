@@ -19928,3 +19928,40 @@ this change cannot touch, so the pair is inside the documented noise. Parity 0.
 
 Gates: fmt, `clippy --workspace --all-targets -D warnings`, `cargo test
 --workspace` 5860 pass, four sweeps 51,998 at 100%.
+
+## LANDED (2026-10-30): the compound member store lifts, and that is what unblocks the call splice
+
+`calls/method_call` was 55.2 ms and the helper census showed `leaf_call_fill` once
+per call: `counter.inc(i)` never spliced. The interesting part is why, and it was
+not the splice. `inc` is `this.value += x`, and `Step::AssignMemberName` with a
+compound op was the last refused member store in the lift, so the CALLEE body could
+not lift at all. A callee with no lifted IR is not a splice candidate, so the only
+route left for the call site was the leaf-call fill lane at 28 ns/call.
+`SLAG_INLINE_TRACE=1` showed `resolve Created { create_step: 1 } -> ok` next to an
+IR dump that still contained `Call`, which is what pointed at the callee.
+
+The lift now models the read-modify-write: the parser leaves `[object, old, value]`
+on the stack, the step applies `compound_binary(op)` to `old` and `value`, and the
+result goes through `Op::MemberStore` (the same validated store the plain form
+uses, so a setter still fires and the helper's nullish check is unchanged). The
+logical assignments stay refused: their store is conditional on the old value and
+the step carries no flag for which arm ran, so a faithful lift needs a new step
+field, not a lowering. The computed compound store stays refused too: the step
+converts the key once for both halves and `Op::ElementStore` would convert it
+again, which is observable for an object key.
+
+| | before | after |
+|---|---:|---:|
+| `calls/method_call` | 55.2 ms | **27.4 ms** (-50%) |
+| its gap to node | 6.87x | 3.46x |
+| `leaf_call_fill` per run | 14,000,000 | 0 |
+
+Corpus total 1910.9 -> **1880.4 ms** against node 730.6, so 2.65x -> **2.57x**
+(session start 2085.4 / 722.2 = 2.87x). Parity 0.
+
+The general lesson, worth checking first next time a call row will not splice: the
+splice needs the CALLEE to lift, and a refusal inside the callee presents as "no
+site" in the caller. The refusal census names it.
+
+Gates: fmt, `clippy --workspace --all-targets -D warnings`, `cargo test
+--workspace` 5860 pass, four sweeps 51,998 at 100%.
