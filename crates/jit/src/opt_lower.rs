@@ -26,7 +26,8 @@ use runtime::jit::{
     LeafCallRecord, LeafInlineInfo, VM_ASYNC_FOR_OF_STACK_LEN_OFFSET,
     VM_COMPLETION_IS_EMPTY_OFFSET, VM_COMPLETION_OFFSET, VM_DESTRUCTURE_STACK_LEN_OFFSET,
     VM_ENV_STACK_LEN_OFFSET, VM_FOR_IN_STACK_LEN_OFFSET, VM_FOR_OF_BOUNDARIES_LEN_OFFSET,
-    VM_FOR_OF_STACK_LEN_OFFSET, VM_IP_OFFSET, VM_PENDING_LEN_OFFSET, VM_TRY_STACK_LEN_OFFSET,
+    VM_FOR_OF_STACK_LEN_OFFSET, VM_IP_OFFSET, VM_LOOP_COUNTER_OFFSET, VM_LOOP_NUM_OFFSET,
+    VM_PENDING_LEN_OFFSET, VM_TRY_STACK_LEN_OFFSET,
 };
 use syntax::ast::{BinaryOp, UnaryOp, UpdateOp};
 
@@ -657,7 +658,14 @@ fn lower_inst(
                 )?;
                 builder.ins().icmp_imm_u(IntCC::NotEqual, t, 0)
             };
-            emit_guard(builder, abi, truthy, step, &inst.args[1..], values)?;
+            emit_guard(
+                builder,
+                abi,
+                truthy,
+                (step, u32::MAX, u32::MAX),
+                &inst.args[1..],
+                values,
+            )?;
             builder
                 .ins()
                 .iconst(types::I64, JsValue::Undefined.bits() as i64)
@@ -665,19 +673,48 @@ fn lower_inst(
         // A type guard (`.notes/tier-typer.md` T1): `args[0]`'s runtime value
         // is asserted to have the result type, so a dominated op on it may
         // lower tag-free; the guarded value is the same bits re-typed, so the
-        // success path emits no work. Only `Number` is checked for now — the
-        // type the bare arithmetic path (`emit_bare_numeric`) keys on; any
-        // other type is a refusal (the per-step path), never a silent guess.
+        // success path emits no work. `Number` checks the tag the bare
+        // arithmetic path (`emit_bare_numeric`) keys on. `Int` additionally
+        // requires the value to be an integral double inside the int32 range:
+        // the exactness test is one round trip (`f64(i32(x)) == x`), which is
+        // false for a fraction, a NaN, and every value the saturating
+        // conversion clamps. That is what lets a reader-fed accumulator stay in
+        // an i32 register (`narrow` fuses `(s + x) | 0` into an `IntAdd`).
+        // Any other declared type is a refusal, never a silent guess.
         Op::GuardType => {
-            let Imm::Int(step) = inst.imm else {
-                return Err(Unsupported::Step("opt:guard"));
-            };
+            let (step, counter, num) = guard_resume(&inst.imm)?;
             let value = arg!(0);
             let ok = match inst.ty {
                 Type::Number => is_double(builder, value),
+                Type::Int => {
+                    let raw = builder
+                        .ins()
+                        .bitcast(types::F64, MemFlagsData::new(), value);
+                    let int = builder.ins().fcvt_to_sint_sat(types::I32, raw);
+                    let back = builder.ins().fcvt_from_sint(types::F64, int);
+                    let exact = builder.ins().fcmp(FloatCC::Equal, back, raw);
+                    let dbl = is_double(builder, value);
+                    let ok = builder.ins().band(exact, dbl);
+                    emit_guard(
+                        builder,
+                        abi,
+                        ok,
+                        (step, counter, num),
+                        &inst.args[1..],
+                        values,
+                    )?;
+                    return Ok(int);
+                }
                 _ => return Err(Unsupported::Step("opt:guard-type")),
             };
-            emit_guard(builder, abi, ok, step, &inst.args[1..], values)?;
+            emit_guard(
+                builder,
+                abi,
+                ok,
+                (step, counter, num),
+                &inst.args[1..],
+                values,
+            )?;
             value
         }
         // A callee guard (I5c-2b): the success path is the callee value
@@ -693,7 +730,14 @@ fn lower_inst(
             let callee = arg!(0);
             let expected = arg!(1);
             let ok = builder.ins().icmp(IntCC::Equal, callee, expected);
-            emit_guard(builder, abi, ok, step, &inst.args[2..], values)?;
+            emit_guard(
+                builder,
+                abi,
+                ok,
+                (step, u32::MAX, u32::MAX),
+                &inst.args[2..],
+                values,
+            )?;
             callee
         }
         // A callee identity comparison for a splice's mismatch branch: the same
@@ -1151,8 +1195,27 @@ fn lower_inst(
         // receiver, key, or a hole.
         Op::ElementLoad => {
             let object = arg!(0);
-            let key = arg!(1);
-            emit_element_read(builder, helpers, abi, object, key)?
+            // An `Int` key is already an exact i32 in a register, so the dense
+            // lane may bounds-check it with one unsigned compare. The `Value`
+            // word form first proves it a canonical index with an f64 round trip.
+            let key_ty = types.get(inst.args[1] as usize).copied();
+            let key_native = value_of(values, inst.args[1])?;
+            let (key, key_int) = if key_ty == Some(Type::Int) {
+                (int_to_bits(builder, key_native), Some(key_native))
+            } else {
+                (key_native, None)
+            };
+            // A guarded read declines to the interpreter instead of running the
+            // general helper: the guard's deopt re-executes the read, so the
+            // helper's user-visible work (an accessor, a proxy trap) must not
+            // happen first. `args[2..]` mirrors the resume's operand stack.
+            let decline = match &inst.imm {
+                Imm::Guard { step, counter, num } => {
+                    Some(((*step as i32, *counter, *num), &inst.args[2..]))
+                }
+                _ => None,
+            };
+            emit_element_read(builder, helpers, abi, object, key, key_int, decline, values)?
         }
         // A lifted `a[k] = v`: the inline dense-Array element store (the write
         // mirror of `emit_element_read`), falling back to `set_member_computed`
@@ -1995,12 +2058,21 @@ fn emit_for_of_bind(
 /// or an Array through the computed-read key cache, declining to
 /// `get_member_computed` for every other shape. Ports the per-step
 /// `emit_element_read` (`.agents/skills/slag-dense-arrays` §8).
+/// The deopt state a guarded element read declines with: the resume step plus
+/// the enclosing fused loop's hidden registers, and the live operand stack to
+/// mirror.
+type ElementDecline<'a> = Option<((i32, u32, u32), &'a [ValueId])>;
+
+#[allow(clippy::too_many_arguments)]
 fn emit_element_read(
     builder: &mut FunctionBuilder,
     helpers: &JitHelpers,
     abi: &Abi,
     object: ClifValue,
     key: ClifValue,
+    key_int: Option<ClifValue>,
+    decline: ElementDecline<'_>,
+    values: &[Option<ClifValue>],
 ) -> Result<ClifValue, Unsupported> {
     let value = builder.declare_var(types::I64);
     let kind = builder.create_block();
@@ -2042,7 +2114,7 @@ fn emit_element_read(
     builder.ins().brif(is_dense, dense, &[], typed, &[]);
     builder.seal_block(dense);
     builder.seal_block(typed);
-    emit_dense_element_read(builder, dense_base, key, dense, value, cell, merge);
+    emit_dense_element_read(builder, dense_base, key, key_int, dense, value, cell, merge);
     emit_typed_element_read(builder, obj_ptr, key, typed, value, cell, merge);
 
     // G8: the computed-read key cache (the machine twin of the interpreter's
@@ -2144,19 +2216,32 @@ fn emit_element_read(
     builder.ins().brif(ok, merge, &[], slow, &[]);
 
     // The helper: the full `[[Get]]` interns the key, serves a prototype
-    // element or accessor, and every other shape.
+    // element or accessor, and every other shape. A guarded read deopts here
+    // instead, before any user-visible work runs.
     builder.seal_block(slow);
     builder.switch_to_block(slow);
-    let res = call_helper(
-        builder,
-        helpers,
-        abi,
-        abi.sig_unary,
-        Helper::GetMemberComputed,
-        &[object, key],
-    )?;
-    builder.def_var(value, res);
-    builder.ins().jump(merge, &[]);
+    if let Some((resume, live)) = decline {
+        let ok = builder.ins().iconst(types::I8, 0);
+        emit_guard(builder, abi, ok, resume, live, values)?;
+        // Unreachable: the guard always deopts, but the block needs a value for
+        // the merge it can no longer reach.
+        let never = builder
+            .ins()
+            .iconst(types::I64, JsValue::Undefined.bits() as i64);
+        builder.def_var(value, never);
+        builder.ins().jump(merge, &[]);
+    } else {
+        let res = call_helper(
+            builder,
+            helpers,
+            abi,
+            abi.sig_unary,
+            Helper::GetMemberComputed,
+            &[object, key],
+        )?;
+        builder.def_var(value, res);
+        builder.ins().jump(merge, &[]);
+    }
 
     builder.seal_block(merge);
     builder.switch_to_block(merge);
@@ -2183,39 +2268,50 @@ fn emit_computed_read_slot(builder: &mut FunctionBuilder, key: ClifValue) -> Cli
 /// `idx < elem_len` bound, and the hole decline to `slow`. A hole is
 /// spec-absent, so the chain may serve it — it must never be returned; a stored
 /// `undefined` IS a real value and is served.
+///
+/// `key_int` is the key in its i32 representation when `narrow` proved it an
+/// int32: it is an exact integer, so the canonical-index gate collapses to the
+/// bounds check (a negative key extends to a huge unsigned index and fails).
+#[allow(clippy::too_many_arguments)]
 fn emit_dense_element_read(
     builder: &mut FunctionBuilder,
     dense_base: ClifValue,
     key: ClifValue,
+    key_int: Option<ClifValue>,
     entry: Block,
     value: Variable,
     slow: Block,
     merge: Block,
 ) {
-    let in_len = builder.create_block();
     let load_blk = builder.create_block();
     let hit = builder.create_block();
 
-    // The canonical-index gate: `idx = ToUint64Sat(num)` round-trips exactly
-    // when `num` is an integral double below 2^32-1, rejecting fractional,
-    // negative, huge and non-double keys (a NaN-boxed heap value bitcasts to a
-    // NaN, whose compare fails).
     builder.switch_to_block(entry);
-    let num = builder.ins().bitcast(types::F64, MemFlagsData::new(), key);
-    let max = builder.ins().f64const(4294967295.0);
-    let lt_max = builder.ins().fcmp(FloatCC::LessThan, num, max);
-    let idx = builder.ins().fcvt_to_uint_sat(types::I64, num);
-    let back = builder.ins().fcvt_from_uint(types::F64, idx);
-    let integral = builder.ins().fcmp(FloatCC::Equal, back, num);
-    let key_ok = builder.ins().band(integral, lt_max);
-    builder.ins().brif(key_ok, in_len, &[], slow, &[]);
-    builder.seal_block(in_len);
-
-    // The bounds gate: `elem_len` is the authoritative materialized length.
-    builder.switch_to_block(in_len);
     let slots_ptr = builder
         .ins()
         .iadd_imm_s(dense_base, crux::heap::GCBOX_DATA_OFFSET as i64);
+    let idx = if let Some(key_int) = key_int {
+        builder.ins().uextend(types::I64, key_int)
+    } else {
+        let in_len = builder.create_block();
+        // The canonical-index gate: `idx = ToUint64Sat(num)` round-trips exactly
+        // when `num` is an integral double below 2^32-1, rejecting fractional,
+        // negative, huge and non-double keys (a NaN-boxed heap value bitcasts to
+        // a NaN, whose compare fails).
+        let num = builder.ins().bitcast(types::F64, MemFlagsData::new(), key);
+        let max = builder.ins().f64const(4294967295.0);
+        let lt_max = builder.ins().fcmp(FloatCC::LessThan, num, max);
+        let idx = builder.ins().fcvt_to_uint_sat(types::I64, num);
+        let back = builder.ins().fcvt_from_uint(types::F64, idx);
+        let integral = builder.ins().fcmp(FloatCC::Equal, back, num);
+        let key_ok = builder.ins().band(integral, lt_max);
+        builder.ins().brif(key_ok, in_len, &[], slow, &[]);
+        builder.seal_block(in_len);
+        builder.switch_to_block(in_len);
+        idx
+    };
+
+    // The bounds gate: `elem_len` is the authoritative materialized length.
     let elem_len = builder.ins().load(
         types::I64,
         MemFlagsData::new(),
@@ -5223,23 +5319,36 @@ fn emit_leaf_call(
     Ok(builder.use_var(value))
 }
 
-/// Emit the shared tail of a speculation guard: branch on `ok`; on failure
-/// mirror the live operand stack (`live`, bottom to top) into the working
-/// region, point the context and `vm.ip` at the resume step, and return
-/// `DISPATCH_DEOPT`; on success continue in a fresh block. The caller returns
-/// its own result from the continuation block.
+/// The resume state a guard carries: the step to resume at plus the enclosing
+/// fused loop's hidden registers (`u32::MAX` = none). [`Imm::Int`] is the plain
+/// step-only form.
+fn guard_resume(imm: &Imm) -> Result<(i32, u32, u32), Unsupported> {
+    match imm {
+        Imm::Int(step) => Ok((*step, u32::MAX, u32::MAX)),
+        Imm::Guard { step, counter, num } => Ok((*step as i32, *counter, *num)),
+        _ => Err(Unsupported::Step("opt:guard")),
+    }
+}
+
+/// The shared tail of a speculation guard: branch on `ok`; on failure mirror
+/// the live operand stack (`live`, bottom to top) into the working region, point
+/// the context and `vm.ip` at the resume step, and return `DISPATCH_DEOPT`; on
+/// success continue in a fresh block. The caller returns its own result from the
+/// continuation block.
 ///
 /// The `vm.ip` write is skipped when the ctx's `vm` pointer is null, matching
-/// `emit_completion_store` — the scaffold's bare-ctx test harness runs a
-/// guard's deopt with a null `vm`.
+/// `emit_completion_store` — the scaffold's bare-ctx test harness runs a guard's
+/// deopt with a null `vm`.
+#[allow(clippy::too_many_arguments)]
 fn emit_guard(
     builder: &mut FunctionBuilder,
     abi: &Abi,
     ok: ClifValue,
-    step: i32,
+    resume: (i32, u32, u32),
     live: &[ValueId],
     values: &[Option<ClifValue>],
 ) -> Result<(), Unsupported> {
+    let (step, counter, num) = resume;
     let deopt = builder.create_block();
     let cont = builder.create_block();
     builder.ins().brif(ok, cont, &[], deopt, &[]);
@@ -5287,6 +5396,23 @@ fn emit_guard(
         vm,
         Offset32::new(VM_IP_OFFSET as i32),
     );
+    // Re-publish the fused loop's hidden registers from the frame slots the
+    // compiled run maintained, so the interpreter resumes with the same loop
+    // state (`u32::MAX` = this body's loop has none).
+    for (slot, offset) in [(counter, VM_LOOP_COUNTER_OFFSET), (num, VM_LOOP_NUM_OFFSET)] {
+        if slot == u32::MAX {
+            continue;
+        }
+        let bits = builder.ins().load(
+            types::I64,
+            MemFlagsData::new(),
+            abi.frame,
+            Offset32::new((slot as i32) * 8),
+        );
+        builder
+            .ins()
+            .store(MemFlagsData::new(), bits, vm, Offset32::new(offset as i32));
+    }
     builder.ins().jump(ret, &[]);
     builder.seal_block(store);
     builder.switch_to_block(ret);

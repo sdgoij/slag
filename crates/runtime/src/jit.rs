@@ -368,6 +368,12 @@ pub const VM_TRY_STACK_PTR_OFFSET: usize = std::mem::offset_of!(Vm, try_stack) +
 pub const VM_TRY_STACK_CAP_OFFSET: usize = std::mem::offset_of!(Vm, try_stack) + VEC_CAP_OFFSET;
 pub const VM_LEXICAL_ENV_OFFSET: usize = std::mem::offset_of!(Vm, lexical_env);
 pub const VM_IP_OFFSET: usize = std::mem::offset_of!(Vm, ip);
+/// The fused loop's two hidden registers, which a deopt out of a compiled loop
+/// must re-publish: the compiled run keeps the counter and the Route-B
+/// accumulator in frame slots, while the interpreter's register executor and
+/// its `PushAcc`/`PopAcc`/`BinStoreNum` steps read these `Vm` fields.
+pub const VM_LOOP_COUNTER_OFFSET: usize = std::mem::offset_of!(Vm, loop_counter);
+pub const VM_LOOP_NUM_OFFSET: usize = std::mem::offset_of!(Vm, loop_num);
 /// G19: the pending `switch` discriminant (a raw `Value` `u64`) and its
 /// presence flag — the compiled `SwitchDisc`/`SwitchTest` read and write them
 /// in machine code.

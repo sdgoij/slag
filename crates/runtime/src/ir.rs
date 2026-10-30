@@ -4093,13 +4093,13 @@ pub struct Vm {
     /// body's statement-position `counter = expr` (`expr_is_number`) must
     /// be provably Number — so the head's test and increment are plain
     /// float ops, never the Value round-trip.
-    loop_counter: f64,
+    pub(crate) loop_counter: f64,
     /// Route B: the loop-carried Number slot (see `LeafOp::BinStoreNum`): a
     /// single f64 scratch, seeded by `Step::FastLoopBind` and written back by
     /// `Step::FastLoopStore`. Raw f64 is sound for the same reason
     /// `loop_counter` is — the compile-time plan admits only proven-Number
     /// slots with proven-Number RMWs.
-    loop_num: f64,
+    pub(crate) loop_num: f64,
     /// The active string builder for a planned `s += e` append loop (see
     /// [`Builder`]). `owner == usize::MAX` outside such a loop.
     pub(crate) builder: Builder,
@@ -12877,29 +12877,10 @@ impl Vm {
                     self.acc = Self::binary_inline(agent, *op, &self.acc, &right)?;
                 }
                 LeafOp::BinImm { op, imm } => {
-                    // The number-number arithmetic shape inlines
-                    // `apply_binary` (two tag checks + a direct op) — the
-                    // general evaluator adds a call and the RHS tag check
-                    // for no semantic gain (mirrors `Step::BinaryImm`).
-                    let value = if let Some(num) = self.acc.as_number() {
-                        match op {
-                            BinaryOp::Add => Value::Number(num + imm),
-                            BinaryOp::Sub => Value::Number(num - imm),
-                            BinaryOp::Mul => Value::Number(num * imm),
-                            BinaryOp::Div => Value::Number(num / imm),
-                            BinaryOp::Rem => Value::Number(num % imm),
-                            BinaryOp::Exp => Value::Number(num.powf(*imm)),
-                            _ => crate::expr::apply_binary(
-                                agent,
-                                *op,
-                                &self.acc,
-                                &Value::Number(*imm),
-                            )?,
-                        }
-                    } else {
-                        crate::expr::apply_binary(agent, *op, &self.acc, &Value::Number(*imm))?
-                    };
-                    self.acc = value;
+                    // The number-number inline is `binary_inline`'s first arm; a
+                    // non-Number accumulator (a string `+`, a BigInt) falls
+                    // through it to the general evaluator.
+                    self.acc = Self::binary_inline(agent, *op, &self.acc, &Value::Number(*imm))?;
                 }
                 LeafOp::BinConst { op, value } => {
                     // `x + (1)` compiles to Push(1)/Binary, not BinaryImm;
@@ -13310,15 +13291,45 @@ impl Vm {
         right: &Value,
     ) -> Result<Value, JsError> {
         if let (Some(left), Some(right)) = (left.as_number(), right.as_number()) {
-            match op {
-                BinaryOp::Add => return Ok(Value::Number(left + right)),
-                BinaryOp::Sub => return Ok(Value::Number(left - right)),
-                BinaryOp::Mul => return Ok(Value::Number(left * right)),
-                BinaryOp::Div => return Ok(Value::Number(left / right)),
-                BinaryOp::Rem => return Ok(Value::Number(left % right)),
-                BinaryOp::Exp => return Ok(Value::Number(left.powf(right))),
-                _ => {}
-            }
+            let result = match op {
+                BinaryOp::Add => left + right,
+                BinaryOp::Sub => left - right,
+                BinaryOp::Mul => left * right,
+                BinaryOp::Div => left / right,
+                BinaryOp::Rem => left % right,
+                BinaryOp::Exp => left.powf(right),
+                // The bitwise operators on two Numbers are the ToInt32 /
+                // ToUint32 reduction `expr::bitwise_binary` runs, minus its
+                // dispatch (the register body's `x | 0`, `x & m`, `x << n`
+                // shapes were paying a call to the general evaluator).
+                BinaryOp::BitAnd => {
+                    (crate::expr::to_int32(left) & crate::expr::to_int32(right)) as f64
+                }
+                BinaryOp::BitXor => {
+                    (crate::expr::to_int32(left) ^ crate::expr::to_int32(right)) as f64
+                }
+                BinaryOp::BitOr => {
+                    (crate::expr::to_int32(left) | crate::expr::to_int32(right)) as f64
+                }
+                BinaryOp::LeftShift => {
+                    (crate::expr::to_int32(left) << (crate::expr::to_uint32(right) & 0x1F)) as f64
+                }
+                BinaryOp::RightShift => {
+                    (crate::expr::to_int32(left) >> (crate::expr::to_uint32(right) & 0x1F)) as f64
+                }
+                BinaryOp::UnsignedRightShift => {
+                    (crate::expr::to_uint32(left) >> (crate::expr::to_uint32(right) & 0x1F)) as f64
+                }
+                _ => {
+                    return crate::expr::apply_binary(
+                        agent,
+                        op,
+                        &Value::Number(left),
+                        &Value::Number(right),
+                    );
+                }
+            };
+            return Ok(Value::Number(result));
         }
         if op == BinaryOp::Add {
             if let Some(value) = Self::concat_strings(left, right) {

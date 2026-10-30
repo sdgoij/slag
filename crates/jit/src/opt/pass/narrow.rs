@@ -112,6 +112,13 @@ fn is_numeric_inst(inst: &Inst, values: &[bool], slot_numeric: &[bool]) -> bool 
         // *type* fact only — `rewrite` widens the arithmetic ops, not these —
         // but it lets a slot stored a `&`/`|`/`<<` be proven numeric, so its
         // later reads lower tag-free.
+        //
+        // Relaxing this to "any operand is a Number" (sound: a Number mixed with
+        // a BigInt throws, so only a Number can flow on) measured as a ~2x
+        // REGRESSION on the `opcost/js_call`-shaped rows: it types the `| 0` of
+        // `s = (s + f()) | 0` Number, which makes the `+` a raw-f64 op whose
+        // canonicalization then sits on the loop-carried path. Do not relax it
+        // without fixing that interaction first.
         Op::BitAnd | Op::BitOr | Op::BitXor | Op::Shl | Op::Shr | Op::UShr | Op::BitNot => {
             !inst.args.is_empty() && inst.args.iter().all(arg_numeric)
         }
@@ -177,6 +184,10 @@ fn is_int_inst(inst: &Inst, values: &[bool], slot_int: &[bool]) -> bool {
     let arg_numeric = |a: &ValueId| values.get(*a as usize).copied().unwrap_or(false);
     match inst.op {
         Op::Const => is_int_const(&inst.imm),
+        // An `Int` guard asserted the value is an integral double inside the
+        // int32 range, so its result *is* an int32 (the lowering deopts
+        // otherwise).
+        Op::GuardType => inst.ty == Type::Int,
         Op::FrameLoad => matches!(
             inst.imm,
             Imm::Slot(s) if slot_int.get(s as usize).copied().unwrap_or(false)
@@ -198,13 +209,14 @@ fn is_int_inst(inst: &Inst, values: &[bool], slot_int: &[bool]) -> bool {
 /// representation.
 ///
 /// A value that is an int32 but whose only uses are boundaries — a frame store,
-/// a helper argument, an element key — need not carry the representation: the
-/// lowering would convert it at every crossing, and the frame slot it feeds is
-/// a `Value` word the interpreter and the deopt resume read regardless. Keep
-/// `Int` only for a value with an arithmetic/bit use, or for the store of a slot
-/// that is read into such a use (the register body's accumulator slot, whose
-/// loads feed its own `IntAdd`). `IntAdd`/`IntSub`/`IntMul` results are
-/// inherently i32 — their lowering emits an i32 op — and are always kept.
+/// a helper argument — need not carry the representation: the lowering would
+/// convert it at every crossing, and the frame slot it feeds is a `Value` word
+/// the interpreter and the deopt resume read regardless. Keep `Int` only for a
+/// value with an arithmetic/bit use, an element-key use (the dense lanes
+/// bounds-check it directly), or for the store of a slot that is read into such
+/// a use (the register body's accumulator slot, whose loads feed its own
+/// `IntAdd`). `IntAdd`/`IntSub`/`IntMul` results are inherently i32 — their
+/// lowering emits an i32 op — and are always kept.
 fn restrict_int_to_arith_use(func: &Function, mut ints: Vec<bool>, slots: usize) -> Vec<bool> {
     let is_arith = |op: Op| {
         matches!(
@@ -237,6 +249,16 @@ fn restrict_int_to_arith_use(func: &Function, mut ints: Vec<bool>, slots: usize)
                         *flag = true;
                     }
                 }
+            }
+            // An element key benefits from the i32 representation too: the dense
+            // element lanes bounds-check an `Int` key with one unsigned compare,
+            // where a `Value` word first proves it a canonical index with an f64
+            // round trip.
+            if matches!(inst.op, Op::ElementLoad | Op::ElementStore)
+                && let Some(&key) = inst.args.get(1)
+                && let Some(flag) = arith.get_mut(key as usize)
+            {
+                *flag = true;
             }
         }
     }

@@ -214,6 +214,17 @@ pub enum Imm {
         slot: u32,
         cursor: (u32, u32),
     },
+    /// A deopt guard's resume state: the step to resume at plus the enclosing
+    /// fused loop's hidden registers, which the compiled code keeps in frame
+    /// slots (`u32::MAX` = the loop has none). A deopt inside a loop must
+    /// re-publish them, because the interpreter's register executor and its
+    /// `PushAcc`/`PopAcc` steps read `Vm::loop_counter`/`Vm::loop_num` rather
+    /// than the slots the compiled run maintained.
+    Guard {
+        step: u32,
+        counter: u32,
+        num: u32,
+    },
     /// Raw 64 bits (a NaN-boxed `Value` or an identity).
     U64(u64),
 }

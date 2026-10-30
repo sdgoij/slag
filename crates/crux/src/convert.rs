@@ -656,6 +656,12 @@ pub fn to_index(value: &Value) -> Result<u64, JsError> {
 
 /// ToUint32 (spec 7.1.7) on an already-converted Number.
 pub fn to_uint32(number: f64) -> u32 {
+    // The hot case: an in-range integer truncates directly. `-0.0` and the
+    // non-integers inside the range are exact too (the cast truncates toward
+    // zero, which is the spec's truncation).
+    if number > -1.0 && number < 4294967296.0 {
+        return number as u32;
+    }
     if !number.is_finite() || number == 0.0 {
         return 0;
     }
@@ -664,6 +670,11 @@ pub fn to_uint32(number: f64) -> u32 {
 
 /// ToInt32 (spec 7.1.6) on an already-converted Number.
 pub fn to_int32(number: f64) -> i32 {
+    // The hot case: an int32-range double truncates exactly. Anything else
+    // (a NaN fails both comparisons) takes the modulo path below.
+    if (-2147483648.0..2147483648.0).contains(&number) {
+        return number as i32;
+    }
     if !number.is_finite() || number == 0.0 {
         return 0;
     }

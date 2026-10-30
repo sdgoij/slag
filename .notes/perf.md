@@ -19384,3 +19384,137 @@ compiles and evictions means the body set genuinely exceeds the cap, and
 an explosion. If `evicted` stays at zero, the drop is not the cache and the
 next suspects are the first-compile burst (an explosion body compiling at depth
 0 in the frame it first runs) and the GC's reaction to the particle burst.
+
+## The loop-carried accumulator is the cost, not the read (measured 2026-10-30)
+
+The corpus's op rows are `s = f(<read>) | 0` in a bare loop, and they sit at
+10-30x node. A probe of the three shapes that make one up (100k iterations,
+isolated rows, 3 runs each, per-row min) localises the gap precisely, and it is
+not the read machinery:
+
+| shape | slag | node |
+|---|---:|---:|
+| `s = (s + k) | 0` (fused int lane, no read) | 0.77 ns | 0.21 ns |
+| `s = s + o.x` (read through the L1a cell, untagged add) | 2.90 ns | 0.30 ns |
+| `s = (s + o.x) | 0` | 6.00 ns | 0.21 ns |
+
+The fused int lane proves the ceiling: when the accumulator lives in an i32
+register the whole iteration is one add plus the loop test (0.77 ns). The read
+adds 2.1 ns because its result is `Unknown`, so the slot it is stored into is
+not promotable (`non_heap_slots` refuses an `Unknown` store: a promoted slot
+leaves the frame and the GC would lose a live heap value) and the accumulator
+round-trips the frame slot every iteration. The `| 0` alone costs 3.1 ns, and it
+is **loop-carried latency**, not throughput: `fadd` -> `cvttsd2si i64` ->
+`ireduce` -> `bor` -> `cvtsi2sd` -> next `fadd` is ~16 cycles in a chain that no
+amount of ILP can overlap. V8's number is not a better read; it is that `s`
+never leaves an i32 register.
+
+So the lever is a *type* on the read, and the payload that pays is **int32**, not
+`Number`: an exact int32 read makes `narrow` type the whole RMW `Int`, the slot
+becomes promotable, `fuse_wrapping_arith` collapses `(s + x) | 0` into one
+`IntAdd`, and the loop becomes the 0.77 ns shape above.
+
+**Landed: an int32 read guard on a register body's element read.** A register
+body lifts its reads through `emit_reg_body`, which bypasses the step-path typer
+guard entirely, so the guard is emitted there: the first element read whose value
+feeds the same body's arithmetic combine and whose write-back is truncated
+(`(s + a[k]) | 0`, `(s + a[k]) & mask`) becomes `Op::GuardType` typed `Int`. Its
+lowering checks `f64(i32(x)) == x` (one round trip, and false for a fraction, a
+NaN, and every value the saturating conversion clamps) and deopts otherwise. The
+IR on `opcost/element_read` becomes:
+
+```
+b3(v41:int, v49:int):            ;; i, s
+  v15:int = BitAnd(v41, v14)     ;; k = i & MASK
+  FrameStore(v41) slot2          ;; the deopt materialization
+  FrameStore(v49) slot3
+  FrameStore(v15) slot4
+  v18:? = ElementLoad(v16, v15) step33 counter2   ;; arr[k], guarded
+  v19:int = GuardType(v18) step33 counter2
+  v23:int = IntAdd(v49, v19)     ;; the whole (s + arr[k]) | 0
+  v38:int = IntAdd(v41, v37)
+  v40:bool = Lt(v38, v39)
+```
+
+`opcost/element_read` 0.613 -> 0.292 ms (-52%, jitGap 15.8 -> 7.6), repeated on
+three isolated runs. `s = s + a[k]` without the truncation is unchanged (0.259 ->
+0.263): the guard is gated on the truncation precisely because there the loop
+still carries a `Number` and the guard only buys a deopt branch plus the flush
+(+19% when the gate was absent).
+
+Three traps this cost, all now in the code as comments:
+
+- **A guarded read must not run the general helper.** The guard is after the
+  merged read value, so a receiver the inline lanes decline would run
+  `get_member_computed` and *then* deopt, firing a getter twice when the
+  interpreter re-runs the body. `Op::ElementLoad` therefore carries the guard's
+  resume state (`Imm::Guard`) and its `slow` arm deopts instead of calling the
+  helper. Only the dense, typed-array and validated-cell lanes reach the value.
+- **A deopt out of a compiled fused loop must re-publish `Vm::loop_counter` and
+  `Vm::loop_num`.** The compiled run keeps the counter in its frame slot (the
+  `FastLoopHead` stores it) and Route B's accumulator in another, while the
+  interpreter's register executor and its `PushAcc`/`PopAcc`/`BinStoreNum` steps
+  read the `Vm` fields. `emit_guard` now writes both from the frame slots on the
+  deopt path (`Imm::Guard` carries the two slot indices, `u32::MAX` = none).
+  Without it a deopt inside a fused loop resumes with a stale counter and the
+  loop runs zero times (found by probe: `Object.create(arrayProto)` with own
+  elements, which declines every iteration).
+- **The in-lowering deopt needs a frame-materialization point.** `mem2reg`
+  flushes a promoted slot into its frame word before every guard so the resumed
+  interpreter sees it; a deopt hidden inside `Op::ElementLoad`'s lowering has no
+  IR op boundary, so `mem2reg` now treats a guarded `ElementLoad` as a deopt
+  point too, and dedups a flush run (the read and its following `GuardType` are
+  two adjacent deopt points over one frame, which cost a second triplet of stores
+  until the dedup).
+
+`deopt_probe.js` (scratch, not committed) covers fractional elements, strings,
+holes, a getter counting its calls, a prototype element, i32 overflow,
+`2^32`-scale doubles, NaN/Infinity, a loop starting at 7, and a fresh-array
+literal receiver; all ten agree across jit, jitless and node.
+
+**Measured NULLs this pass.**
+
+- Type a slot's `x | 0` as `Number` when at least one operand is a Number (sound
+  by spec: mixing a Number with a BigInt throws, so only a Number can flow on and
+  the result of a bit op on Numbers is integral). `opcost/js_call` 0.507 ->
+  0.930 ms, `opcost/method_call` 0.66 -> 1.36: the claim makes the `+` a raw-f64
+  op and the unbox pass then inserts a `Canon` on the loop-carried path. Reverted
+  with the reason recorded at `narrow::is_numeric_inst`.
+- Guarding a read that feeds an untruncated `s + a[k]`: +19% (see above).
+
+**Also landed in the same pass, each measured on isolated rows.**
+
+- `to_int32`/`to_uint32` take an in-range fast path: the interpreter's `| 0` was
+  doing two `fmod` calls (`rem_euclid`) per operand. `mean-jlGap` 3.79 -> 3.45.
+- `binary_inline` handles the bitwise/shift operators on two Numbers, so a
+  register body's `x | 0`/`x & m` no longer calls the general evaluator.
+- The optimizing lift accepts the remaining register-body leaf ops that are
+  read-only arithmetic: `GetMemberName`/`GetMemberComputed` with the accumulator
+  as receiver (`os[i & 1023].w`, `strs[k & 3].length`), `UpdateAcc`, `UpdateReg`,
+  `BinRemConst`, the depth-0 context and per-iteration reads and combines, and
+  the accumulator-receiver computed store. `objects/many_objects_read` 19.3 ->
+  13.5 ms (-30%), `opcost/prim_prop` 1.61 -> 0.88 ms (-45%), and the 42 bodies
+  of `builtins/json_roundtrip` that refused on `RunRegBody` now compile.
+- An int-key dense element read: `narrow` keeps a proven-int32 element key `Int`,
+  so the dense lane bounds-checks it with one unsigned compare instead of the
+  f64 canonicalization. `s = s + a[k]` 0.406 -> 0.259 ms (-36%).
+
+Gates: fmt, `clippy --workspace --all-targets -D warnings`, `cargo test
+--workspace`, four sweeps 23,726 / 23,821 / 1,086 / 3,365 = 51,998 at 100%,
+corpus parity 0.
+
+**Not established.** The corpus mean does not resolve this work: two runs of the
+same binary gave `mean-jitGap` 8.18 and 9.58 in this session, because the mean is
+a mean of 77 ratios against node times that round to 0.0 ms on the op rows. The
+row-level numbers above are the measurement; the mean is reported only as
+`n=77 mean-jitGap 8.98 mean-jlGap 3.46 mismatches=0`. The guard reaches exactly
+one corpus row (`opcost/element_read`) because the other truncated-RMW rows are
+refused by the hoist guard (`opcost/obj_prop` and the `1.7x`-shape `own_read`
+family), and the hoisted read lowers as a plain slot load.
+
+**Next, in order.** Model `Step::HoistMemberGuard`/`HoistGlobalGuard` in the
+optimizing lift (a probe op returning a bool, lowered to the same member-cell
+validation the interpreter step runs, feeding the existing fused-test terminator),
+which unblocks 6 rows and would let the int32 guard reach `obj_prop`'s shape; then
+the same guard on the *named* read; then Route B's int lane admitting a guarded
+read (`IntRhs::Element`), which is where V8's `i32` accumulator actually lives.

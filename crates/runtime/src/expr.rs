@@ -1632,7 +1632,14 @@ fn number_exponentiate(base: f64, exponent: f64) -> f64 {
 
 /// ToInt32 (spec 7.1.6): truncate toward zero, reduce modulo 2^32; NaN and
 /// the infinities map to 0 (Rust's `as` casts saturate instead).
-fn to_int32(n: f64) -> i32 {
+pub(crate) fn to_int32(n: f64) -> i32 {
+    // The hot case by far: a double already inside the int32 range truncates
+    // exactly with one cast (toward zero, which is the spec's truncation), so
+    // the modulo below — an `fmod`, i.e. a libm call — never runs. A NaN fails
+    // both comparisons and falls through to the `is_finite` check.
+    if (-2_147_483_648.0..2_147_483_648.0).contains(&n) {
+        return n as i32;
+    }
     if !n.is_finite() {
         return 0;
     }
@@ -1645,7 +1652,7 @@ fn to_int32(n: f64) -> i32 {
 }
 
 /// ToUint32 (spec 7.1.7): like ToInt32, reinterpreting the low 32 bits.
-fn to_uint32(n: f64) -> u32 {
+pub(crate) fn to_uint32(n: f64) -> u32 {
     to_int32(n) as u32
 }
 

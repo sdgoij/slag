@@ -251,6 +251,10 @@ fn lift_impl(body: &CompiledBody, guard_reads: bool) -> Result<Function, Unsuppo
     // gate), and every in-loop counter access is redirected to the Acc steps,
     // so the lift models the counter as that slot (see `emit_step`).
     let mut counter: Option<usize> = None;
+    // The Route-B loop-carried Number slot (`FastLoopBind.num`), which the
+    // compiled run keeps in a register and the interpreter in `Vm::loop_num`: a
+    // deopt out of the loop must re-publish it (see `Op::Guard`).
+    let mut num_slot: Option<usize> = None;
     for bi in 0..nb {
         let mut stack: Vec<ValueId> = builder.func().block(bi as BlockId).params.clone();
         let body_end = terms[bi].unwrap_or(ends[bi]);
@@ -304,6 +308,7 @@ fn lift_impl(body: &CompiledBody, guard_reads: bool) -> Result<Function, Unsuppo
                         guard_reads,
                         step,
                         counter,
+                        num_slot,
                     )
                     .inspect_err(|e| report_refusal(step, e))?;
                 }
@@ -340,6 +345,7 @@ fn lift_impl(body: &CompiledBody, guard_reads: bool) -> Result<Function, Unsuppo
                         guard_reads,
                         step,
                         counter,
+                        num_slot,
                     )
                     .inspect_err(|e| report_refusal(step, e))?;
                 }
@@ -347,9 +353,16 @@ fn lift_impl(body: &CompiledBody, guard_reads: bool) -> Result<Function, Unsuppo
             match step {
                 Step::FastLoopBind {
                     var: FastLoopVar::Slot(slot),
+                    num,
                     ..
-                } => counter = Some(*slot),
-                Step::FastLoopStore { .. } => counter = None,
+                } => {
+                    counter = Some(*slot);
+                    num_slot = *num;
+                }
+                Step::FastLoopStore { .. } => {
+                    counter = None;
+                    num_slot = None;
+                }
                 _ => {}
             }
         }
@@ -1025,6 +1038,7 @@ fn emit_step(
     guard_reads: bool,
     step: &Step,
     counter: Option<usize>,
+    num: Option<usize>,
 ) -> Result<(), Unsupported> {
     let is_tdz = |slot: usize| tdz.get(slot).copied().unwrap_or(false);
     match step {
@@ -1684,7 +1698,16 @@ fn emit_step(
             emit_frame_store(builder, block, slot, next);
         }
         Step::RunRegBody { ops } => {
-            emit_reg_body(builder, block, ops, counter)?;
+            // The typer's read guard reaches a register body too: an element
+            // read whose value feeds an arithmetic op in the same body is the
+            // shape that keeps a whole loop's accumulator in a `Value` word,
+            // paying an f64 -> i32 -> f64 round trip for a trailing `| 0`. The
+            // guard asserts the read is an exact int32 and the types then let
+            // `narrow` fuse the whole RMW into an `IntAdd`.
+            let guard = guard_reads
+                .then(|| reg_body_guard(ops, index, stack, counter, num))
+                .flatten();
+            emit_reg_body(builder, block, ops, counter, guard)?;
         }
         // The whole-literal fused creates (I6-0a): the N value expressions are
         // already on the operand stack (in source order), so the lift pops them
@@ -1965,11 +1988,141 @@ fn emit_const(builder: &mut Builder, block: BlockId, imm: Imm, ty: Type) -> Valu
 /// lowered to the *generic* IR op — the register path's Number-provenance
 /// inline is an optimization, and the generic op computes the same
 /// `apply_binary`/`apply_unary`, so the result is exact.
+/// The int32 read guard a register body may take: where to emit it, and the
+/// resume state a deopt needs.
+struct RegGuard {
+    /// The index of the leaf op whose result the guard asserts.
+    at: usize,
+    step: u32,
+    counter: u32,
+    num: u32,
+    /// The live operand stack at the enclosing step, mirrored for the resume.
+    live: Vec<ValueId>,
+}
+
+/// Whether a leaf op's re-execution is unobservable, which is what makes a
+/// deopt legal: the interpreter re-runs the whole `RunRegBody` step from its
+/// start, so every op before the guarded read must produce the same values
+/// again with no side effect. A member or element read is excluded (an accessor
+/// or a proxy trap would fire twice), as is anything that stores or coerces
+/// (a `valueOf` could re-enter user code).
+fn leaf_op_replayable(op: &LeafOp) -> bool {
+    matches!(
+        op,
+        LeafOp::LoadReg { .. }
+            | LeafOp::LoadCounter
+            | LeafOp::LoadConst(_)
+            | LeafOp::BinReg { .. }
+            | LeafOp::BinImm { .. }
+            | LeafOp::BinConst { .. }
+            | LeafOp::BinImmLocal { .. }
+            | LeafOp::BinLeftReg { .. }
+            | LeafOp::BinAccPop { .. }
+            | LeafOp::PushAcc
+            | LeafOp::StoreReg { .. }
+    )
+}
+
+/// Whether a leaf op is a binary arithmetic combine, the consumer that makes a
+/// read's value worth guarding (the ops whose lowering reads the operand type to
+/// pick the bare path).
+fn leaf_op_is_arithmetic(op: &LeafOp) -> bool {
+    let op = match op {
+        LeafOp::BinReg { op, .. }
+        | LeafOp::BinImm { op, .. }
+        | LeafOp::BinConst { op, .. }
+        | LeafOp::BinImmLocal { op, .. }
+        | LeafOp::BinLeftReg { op, .. }
+        | LeafOp::BinStoreReg { op, .. }
+        | LeafOp::BinAccPop { op } => *op,
+        _ => return false,
+    };
+    matches!(
+        op,
+        syntax::ast::BinaryOp::Add
+            | syntax::ast::BinaryOp::Sub
+            | syntax::ast::BinaryOp::Mul
+            | syntax::ast::BinaryOp::Div
+    )
+}
+
+/// Whether the register body's arithmetic combine is truncated before it is
+/// stored (`(s + x) | 0`, `(s + x) & mask`). That is the shape the guard pays
+/// on: the truncation makes the stored value an int32, so `narrow` fuses the
+/// whole read-modify-write into an `IntAdd` and the accumulator stops
+/// round-tripping f64 -> i32 -> f64. Without the truncation the loop still
+/// carries a `Number` and the guard only adds a deopt branch and the promoted
+/// slots' flush (measured: `s = s + a[k]` +19%).
+fn truncated_before_store(ops: &[LeafOp], from: usize) -> bool {
+    for op in &ops[from..] {
+        match op {
+            LeafOp::BinImm {
+                op: syntax::ast::BinaryOp::BitOr | syntax::ast::BinaryOp::BitXor,
+                imm,
+            } => {
+                if *imm == 0.0 {
+                    return true;
+                }
+            }
+            LeafOp::BinImm {
+                op: syntax::ast::BinaryOp::BitAnd,
+                ..
+            } => return true,
+            LeafOp::StoreReg { .. }
+            | LeafOp::StoreMemberName { .. }
+            | LeafOp::StoreMemberNameLocal { .. }
+            | LeafOp::StoreMemberComputed { .. }
+            | LeafOp::StoreMemberComputedSlot { .. }
+            | LeafOp::StoreMemberComputedLocal { .. }
+            | LeafOp::BinStoreReg { .. }
+            | LeafOp::BinStoreNum { .. }
+            | LeafOp::BinStoreInt { .. } => return false,
+            _ => {}
+        }
+    }
+    false
+}
+
+/// Choose the read a register body guards, if any: the first element read whose
+/// value feeds the next op's arithmetic and whose preceding ops can be replayed.
+fn reg_body_guard(
+    ops: &[LeafOp],
+    index: usize,
+    stack: &[ValueId],
+    counter: Option<usize>,
+    num: Option<usize>,
+) -> Option<RegGuard> {
+    let at = ops.iter().position(|op| {
+        matches!(
+            op,
+            LeafOp::GetMemberComputedLocal { .. } | LeafOp::GetMemberComputed { .. }
+        )
+    })?;
+    if at + 1 >= ops.len() || !leaf_op_is_arithmetic(&ops[at + 1]) {
+        return None;
+    }
+    if !truncated_before_store(ops, at + 2) {
+        return None;
+    }
+    if !ops[..at].iter().all(leaf_op_replayable) {
+        return None;
+    }
+    let slot = |s: Option<usize>| s.map_or(u32::MAX, |s| s as u32);
+    Some(RegGuard {
+        at,
+        step: index as u32,
+        counter: slot(counter),
+        num: slot(num),
+        live: stack.to_vec(),
+    })
+}
+
 fn emit_reg_body(
     builder: &mut Builder,
     block: BlockId,
     ops: &[LeafOp],
     counter: Option<usize>,
+    guard: Option<RegGuard>,
 ) -> Result<(), Unsupported> {
     let mut acc = builder.emit(
         block,
@@ -1983,8 +2136,35 @@ fn emit_reg_body(
     // the accumulator (`PushAcc`) and pops it back into a binary (`BinAccPop`);
     // the pairs balance inside the body.
     let mut spill: Vec<ValueId> = Vec::new();
-    for op in ops {
-        acc = emit_leaf_op(builder, block, op, acc, counter, &mut spill)?;
+    for (i, op) in ops.iter().enumerate() {
+        acc = emit_leaf_op(
+            builder,
+            block,
+            op,
+            acc,
+            counter,
+            &mut spill,
+            guard.as_ref().filter(|g| g.at == i),
+        )?;
+        if let Some(guard) = &guard
+            && guard.at == i
+        {
+            let mut args = Vec::with_capacity(1 + guard.live.len());
+            args.push(acc);
+            args.extend_from_slice(&guard.live);
+            acc = builder.emit(
+                block,
+                Op::GuardType,
+                &args,
+                Type::Int,
+                Effects::pure(),
+                Imm::Guard {
+                    step: guard.step,
+                    counter: guard.counter,
+                    num: guard.num,
+                },
+            );
+        }
     }
     Ok(())
 }
@@ -2052,6 +2232,7 @@ fn emit_leaf_op(
     acc: ValueId,
     counter: Option<usize>,
     spill: &mut Vec<ValueId>,
+    guard: Option<&RegGuard>,
 ) -> Result<ValueId, Unsupported> {
     let load = |b: &mut Builder, slot: usize, t: bool| -> ValueId {
         if t {
@@ -2265,13 +2446,29 @@ fn emit_leaf_op(
                 RegOperand::Acc => acc,
                 key => emit_reg_operand(builder, block, key, counter)?,
             };
+            // A guarded read carries its deopt state, so the lowering can
+            // decline a non-data lane *before* running the helper (a getter
+            // must not fire twice when the interpreter re-runs the body).
+            // `args[2..]` is that deopt's live operand stack.
+            let mut args = vec![object, key];
+            let imm = match guard {
+                Some(g) => {
+                    args.extend_from_slice(&g.live);
+                    Imm::Guard {
+                        step: g.step,
+                        counter: g.counter,
+                        num: g.num,
+                    }
+                }
+                None => Imm::None,
+            };
             builder.emit(
                 block,
                 Op::ElementLoad,
-                &[object, key],
+                &args,
                 Type::Unknown,
                 Effects::call(),
-                Imm::None,
+                imm,
             )
         }
         // The register-body member stores (`o.name = v`): the object is the
@@ -2346,9 +2543,163 @@ fn emit_leaf_op(
             let left = spill.pop().ok_or(Unsupported::Stack)?;
             bin(builder, binary_op(*op)?, left, acc)
         }
-        // The remaining leaf ops (the member/frame-vector stores, the `UpdateAcc`
-        // BigInt case, the Route-B int form, and the context/per-iteration reads)
-        // need their own slice; refuse so the body keeps the per-step path.
+        // `acc = acc.name` / `acc = acc[key]`: the receiver is the accumulator
+        // (`os[i & 1023].w`, `strs[k & 3].length`), so the read is the same
+        // inline member/element probe the fused frame-slot forms use, against
+        // the accumulator instead of a slot. The computed form's key may not be
+        // the accumulator (`acc[key]` cannot keep both in one register).
+        LeafOp::GetMemberName { name } => emit_named_read(builder, block, acc, *name),
+        LeafOp::GetMemberComputed { key } => {
+            if matches!(key, RegOperand::Acc) {
+                return Err(Unsupported::Step("RunRegBody"));
+            }
+            let key = emit_reg_operand(builder, block, key, counter)?;
+            let mut args = vec![acc, key];
+            let imm = match guard {
+                Some(g) => {
+                    args.extend_from_slice(&g.live);
+                    Imm::Guard {
+                        step: g.step,
+                        counter: g.counter,
+                        num: g.num,
+                    }
+                }
+                None => Imm::None,
+            };
+            builder.emit(
+                block,
+                Op::ElementLoad,
+                &args,
+                Type::Unknown,
+                Effects::call(),
+                imm,
+            )
+        }
+        // The accumulator's own `++`/`--` (`o.x++` in a statement): the
+        // ToNumeric update, not a binary `+` (a string would concatenate).
+        LeafOp::UpdateAcc { op } => builder.emit(
+            block,
+            Op::UpdateValue,
+            &[acc],
+            Type::Unknown,
+            Op::UpdateValue.default_effects(),
+            Imm::Int(*op as i32),
+        ),
+        // A statement-position local update (`l++` as a statement, result
+        // discarded): read the slot, apply the ToNumeric update, write back.
+        LeafOp::UpdateReg { slot, tdz: t, op } => {
+            let cur = load(builder, *slot, *t);
+            let next = builder.emit(
+                block,
+                Op::UpdateValue,
+                &[cur],
+                Type::Unknown,
+                Op::UpdateValue.default_effects(),
+                Imm::Int(*op as i32),
+            );
+            emit_frame_store(builder, block, *slot, next);
+            acc
+        }
+        // `acc % const`: the dedicated `%` lowering (an integrality and range
+        // guarded `srem`) is `Op::Mod`'s own, so the constant is just the
+        // right operand. `BinRemConst` names the same arithmetic.
+        LeafOp::BinRemConst { divisor } => {
+            let divisor = emit_number(builder, block, f64::from(*divisor));
+            bin(builder, Op::Mod, acc, divisor)
+        }
+        // The accumulator-receiver computed store (`o[k] = v` where the object
+        // expression's value stayed in the accumulator): neither operand may
+        // be `Acc`, which the lowering guarantees.
+        LeafOp::StoreMemberComputed { key, value } => {
+            let key = emit_reg_operand(builder, block, key, counter)?;
+            let value = emit_reg_operand(builder, block, value, counter)?;
+            builder.emit_void(
+                block,
+                Op::ElementStore,
+                &[acc, key, value],
+                Op::ElementStore.default_effects(),
+                Imm::None,
+            );
+            acc
+        }
+        // Depth-0 capture-context reads: the body's own capture context, the
+        // same `Op::ContextLoad` the `LoadContextSlot` step lowers to.
+        LeafOp::LoadContext { index } => builder.emit(
+            block,
+            Op::ContextLoad,
+            &[],
+            Type::Unknown,
+            Op::ContextLoad.default_effects(),
+            Imm::Context {
+                depth: 0,
+                index: *index as u32,
+            },
+        ),
+        LeafOp::BinContext { op, index } => {
+            let ctx = builder.emit(
+                block,
+                Op::ContextLoad,
+                &[],
+                Type::Unknown,
+                Op::ContextLoad.default_effects(),
+                Imm::Context {
+                    depth: 0,
+                    index: *index as u32,
+                },
+            );
+            bin(builder, binary_op(*op)?, acc, ctx)
+        }
+        LeafOp::BinCtxReg {
+            op,
+            index,
+            slot,
+            tdz: t,
+        } => {
+            let ctx = builder.emit(
+                block,
+                Op::ContextLoad,
+                &[],
+                Type::Unknown,
+                Op::ContextLoad.default_effects(),
+                Imm::Context {
+                    depth: 0,
+                    index: *index as u32,
+                },
+            );
+            let right = load(builder, *slot, *t);
+            bin(builder, binary_op(*op)?, ctx, right)
+        }
+        // The per-iteration bindings are the body's own captured
+        // `LoadPerIteration`, exactly as the step path lowers it.
+        LeafOp::LoadPerIter { index } => builder.emit(
+            block,
+            Op::LoadPerIteration,
+            &[],
+            Type::Unknown,
+            Op::LoadPerIteration.default_effects(),
+            Imm::Context {
+                depth: 0,
+                index: *index as u32,
+            },
+        ),
+        LeafOp::BinPerIter { op, index } => {
+            let right = builder.emit(
+                block,
+                Op::LoadPerIteration,
+                &[],
+                Type::Unknown,
+                Op::LoadPerIteration.default_effects(),
+                Imm::Context {
+                    depth: 0,
+                    index: *index as u32,
+                },
+            );
+            bin(builder, binary_op(*op)?, acc, right)
+        }
+        // The remaining leaf ops (the compound/update computed member forms,
+        // `UpdateAcc`'s BigInt case, the string builder's append, and the
+        // in-body `return acc`) need their own slice; refuse so the body keeps
+        // the per-step path.
         _ => return Err(Unsupported::Step("RunRegBody")),
     })
 }

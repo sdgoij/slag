@@ -87,6 +87,16 @@ fn imm_suffix(imm: &Imm) -> String {
         Imm::ForOfBind { slot, cursor } => {
             format!(" slot{slot} cursor({},{})", cursor.0, cursor.1)
         }
+        Imm::Guard { step, counter, num } => {
+            let slot = |s: &u32| {
+                if *s == u32::MAX {
+                    "-".to_string()
+                } else {
+                    s.to_string()
+                }
+            };
+            format!(" step{step} counter{} num{}", slot(counter), slot(num))
+        }
         Imm::U64(v) => format!(" {v:#x}"),
     }
 }

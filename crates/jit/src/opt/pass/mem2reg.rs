@@ -273,20 +273,32 @@ fn rename(
         pushed += 1;
     }
     let len = func.block(b).insts.len();
+    // The value this block last flushed for the slot: a run of guards needs one
+    // materialization, not one each (a guarded element read deopts from inside
+    // its own lowering, so a read followed by its type guard is two adjacent
+    // deopt points over the same frame).
+    let mut flushed: Option<ValueId> = None;
     for i in 0..len {
         let inst = &func.block(b).insts[i];
         // A guard may deopt to the interpreter, which reads this slot's frame
         // word: record the value to materialize there. A guard before the
         // slot's first store on this path leaves the initial `undefined`,
-        // which is exactly what the frame already holds.
-        if matches!(inst.op, Op::Check | Op::GuardType | Op::GuardCallee)
+        // which is exactly what the frame already holds. A guarded element read
+        // (`Imm::Guard`) deopts from inside its own lowering, so it is a
+        // materialization point too.
+        let is_deopt_point = matches!(inst.op, Op::Check | Op::GuardType | Op::GuardCallee)
+            || (inst.op == Op::ElementLoad && matches!(inst.imm, Imm::Guard { .. }));
+        if is_deopt_point
             && let Some(&current) = state.stack.last()
+            && flushed != Some(current)
         {
             state.flushes.push((b, i, current));
+            flushed = Some(current);
         }
         if inst.op == Op::FrameStore && inst.imm == Imm::Slot(slot) {
             let operand = resolve(&state.repl, inst.args[0]);
             state.stack.push(operand);
+            flushed = None;
             pushed += 1;
         } else if inst.op == Op::FrameLoad && inst.imm == Imm::Slot(slot) {
             let result = inst.result.expect("a store-reached load has a result");
