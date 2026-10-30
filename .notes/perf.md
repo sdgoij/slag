@@ -19632,3 +19632,23 @@ shows up in `control/nested_loops`). The cheaper approach is to teach the
 optimizing tier the Route-B `BinStoreNum` recipe (`rhs_recipe`'s counter-imm
 forms) so a compiled body can keep the fused lane's accumulator instead of
 losing it.
+
+## FIXED (2026-10-30): the member hoist lost its fused-lane gate, `own_read` 3.0 -> 9.4 ms
+
+Refactoring the hoist arm into the shared `hoist_probe` emitter dropped the
+fused-lane refusal from the *member* arm (only the global one kept it), so
+`objects/own_read` compiled into a generic `Value`-word copy of
+`s += o.a + o.b`. Its loop runs the per-step tier's `BinStoreNum` lane at 0.73
+ns/iter, and the compiled copy costs 2.5: 2.99 -> 9.44 ms isolated, repeated,
+`mismatches=0` throughout (it is a slowdown, not a miscompile). Both arms now
+refuse a guarded copy whose region runs `BinStoreNum`/`BinStoreInt`/
+`BuilderAppend`; `obj_prop` keeps its win because its body has no fused lane.
+
+The way this was caught is worth recording: the row was measured "flat" in the
+commit that introduced it, because that measurement compared against a binary
+from the *previous* commit rather than a rebuild of the current tree. Build the
+binary from the tree you are about to commit, then measure.
+
+Measured after the fix, isolated: `own_read` 2.99 ms, `obj_prop` 0.042 ms,
+`hoisted_local` 2.60 ms. Corpus `n=77 mean-jitGap 8.90 mean-jlGap 3.47`,
+parity 0. Sweeps 51,998 at 100%.

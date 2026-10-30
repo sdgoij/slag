@@ -3053,6 +3053,12 @@ fn emit_fused_test(
                     require_int: region_reads_as_int(steps, index + 1, *target, hoist_slot as u32),
                 })
                 .collect::<Vec<_>>();
+            // A guarded copy must not take a body away from the per-step tier's
+            // fused lane: `objects/own_read` (`s += o.a + o.b`, whose loop runs
+            // `BinStoreNum`) measured 3.0 -> 9.4 ms when it did.
+            if region_uses_fused_lane(steps, index + 1, *target) {
+                return Err(Unsupported::Step(step_name(step)));
+            }
             (
                 hoist_probe(builder, block, spec, prim_slots, *numbers, false),
                 false,
