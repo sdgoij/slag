@@ -235,3 +235,51 @@ other is its complement.
   the head copy, not the number of tail keys.
 - **Key the composite shape cache on the head.** Measured: no change (the
   one-entry transition hint already serves each fork step). Reverted.
+
+## 6. Slice 2, measured and reverted (2026-10-30)
+
+Implemented, then reverted. The mechanism works and the cliff it targets is real;
+the corpus says it is not free, and that is the finding.
+
+What was built: `SmallProps::start_at_inline_fields`, the `define_fresh` `else`
+arm starting the vector at the cap instead of materializing, a
+`materialize_properties` that folds a suffix in front of the in-field head, and a
+`complete_vector()` guard on the readers that want the whole vector (the eight
+from the audit). Two invariant tests changed with it, because both asserted the
+old behaviour: one asserted the vector materializes at the cap, the other that a
+nine-key object owns a heap buffer. The second is exactly the win (a one-entry
+vector still fits the two inline slots), so its expectation moved rather than its
+intent.
+
+The label says it works:
+
+| | before | after |
+|---|---:|---:|
+| 8-key literal | 49.5 ms | 49.5 |
+| 9-key literal | **160.2** | **68.3** |
+| 9/8 ratio | 3.17 | **1.38** |
+| 8-field construct | 173.0 | 173.0 |
+| 9-field construct | **405.5** | **211.7** |
+| 9/8 ratio | 2.34 | 1.22 |
+
+It costs the corpus more than that is worth, because no corpus row contains a
+nine-key literal loop while several rows enumerate many-key objects:
+`builtins/json_roundtrip` +16.5% (node +2.3% in the same window),
+`builtins/object_keys` +9.7% (node +0.0%), `opcost/object_keys` +5.6%,
+`opcost/json_stringify` +6.5%. Serving a tail ordinal straight from the vector in
+`ordinary_property_lookup` (instead of completing it) did not remove them, and by
+then the machine had drifted 23% (node's own total 714.2 -> 881.5 ms), so nothing
+further was measurable.
+
+Two prerequisites, in order, before this lands:
+
+1. **Enumeration must not rebuild.** §4.4 option 2: walk the map for the head
+   (reading `in_fields`) and then the suffix, instead of folding the head into the
+   vector. Until then every enumerating consumer of a many-key object pays the
+   same copy the change removes from the define, so the work merely moves to where
+   the corpus does more of it.
+2. **A quiet machine and a corpus row that exercises the win.** The microbench is
+   the evidence today; nothing in `tools/corpus` builds a nine-key object in a
+   loop, so the corpus can only show the cost.
+
+Reverted to the inert slice. The numbers above are the case for doing it properly.
