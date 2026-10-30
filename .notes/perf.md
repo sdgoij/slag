@@ -20278,3 +20278,35 @@ per element, which is a change to the leaf-call entry rather than a trim.
 
 Gates: fmt, `clippy --workspace --all-targets -D warnings`, 5861 tests, four
 sweeps 51,998 at 100%, corpus parity 0 (`mean-jitGap` 8.32).
+
+## NULL (2026-10-30): gating the `%String.prototype%` snapshot, and where the leaf prologue actually runs
+
+Following the callback-lane decomposition, the same argument the file already
+makes for `has_call_apply`/`has_call_intrinsic` applies to
+`JitCallContext::string_prototype_bits`: only a `Step::GetMemberName` site loads
+it, yet every compiled run snapshotted it (a realm read plus a handle clone). The
+gate was built (`CompiledBody::has_member_name`, the `CertifiedInlineInfo` mirror,
+three ctx sites) and measured:
+
+| row | before | after |
+| --- | ---: | ---: |
+| `small.forEach(cb)` (4 elements) | 23.82 | 23.44 (-1.6%) |
+| the same, second pairing | 22.89 | 22.63 (-1.1%) |
+| `calls/direct_leaf` | 5.77 | 5.72 (-0.8%) |
+| `calls/recursive_fib` | 46.26 | 46.26 (0) |
+
+Reverted: a field, a mirror entry and five gated sites for under one nanosecond
+per element is not a trade worth carrying. The useful part is what the two
+unchanged rows prove: **a compiled-to-compiled leaf call never enters
+`run_jit_leaf`**. The caller's machine code invokes the callee's entry directly
+(the in-frame lane), so `run_jit_leaf` and its ~35-field `JitCallContext` build
+are on the RUST-initiated call path only: a builtin's callback loop, a native
+handler, `apply`/`call`, an argument-vector call.
+
+That bounds the callback-lane work precisely. The ~19 ns per element left in
+`forEach` cannot be shaved by moving the prologue's pieces around; it needs a
+callback entry that keeps one context and one frame segment for the whole loop.
+Until then the lane pays for a full activation per element, which is also why
+`--jitless` and the JIT cost the same on that row.
+
+Measured and reverted, so the tree carries no gate.
