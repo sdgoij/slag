@@ -925,19 +925,42 @@ fn split(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsErr
     if string.is_empty() {
         return array_from_list(agent, &[string]);
     }
-    let mut substrings: Vec<JsString> = Vec::new();
+    // Build the result array as the scan goes: each piece is boxed once and
+    // defined immediately into the (stack-rooted) array, so no
+    // `Vec<JsString>` intermediate holds 48-byte copies of the pieces, and no
+    // second pass copies them out again. The array is the root the scan's
+    // allocations need, exactly as `array_from_list` relied on.
+    let array = crate::builtins::array::array_create(agent, 0.0)?;
+    let mut count = 0u64;
     let mut search_start = 0usize;
     let mut match_index = string_index_of(&string, &separator_string, 0);
     while let Some(match_position) = match_index {
-        substrings.push(substring(&string, search_start, match_position));
-        if substrings.len() == lim as usize {
-            return array_from_list(agent, &substrings);
+        let piece = substring(&string, search_start, match_position);
+        define_piece(&array, count, piece)?;
+        count += 1;
+        if count == lim as u64 {
+            return Ok(Value::Object(array));
         }
         search_start = match_position + separator_len;
         match_index = string_index_of(&string, &separator_string, search_start);
     }
-    substrings.push(substring(&string, search_start, string.len()));
-    array_from_list(agent, &substrings)
+    define_piece(
+        &array,
+        count,
+        substring(&string, search_start, string.len()),
+    )?;
+    Ok(Value::Object(array))
+}
+
+/// Box `piece` and define it as the next dense element of a freshly created
+/// result array, falling back to the exact string-key CreateDataProperty when
+/// the receiver declines the dense path.
+fn define_piece(array: &Handle<JsObject>, index: u64, piece: JsString) -> Result<(), JsError> {
+    let value = Value::String(Handle::new(piece));
+    if !array.create_data_property_index(index, value)? {
+        array.create_data_property(&JsString::from_utf8(&index.to_string()), value)?;
+    }
+    Ok(())
 }
 
 /// spec 22.1.3.27 String.prototype.startsWith.

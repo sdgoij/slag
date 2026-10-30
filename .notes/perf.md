@@ -19897,3 +19897,34 @@ deliberate `region_uses_fused_lane` refusal), `AssignMemberName(compound)`,
 200-iteration builder loop, and four unnamed `Step("step")` bodies whose blockers
 the `opt-blockers` listing does not separate. Tier coverage is not where the
 remaining time is either.
+
+## LANDED (2026-10-30): `split` boxes each piece once, straight into the result array
+
+The split path built a `Vec<JsString>` of pieces and then handed it to
+`array_from_list`, which called `items.iter()` and `item.clone()` for each one:
+every piece was copied into the vector, copied back out of it, and boxed with a
+third copy, plus a `Vec` growth and a second pass. The pieces are boxed once and
+defined into the (stack-rooted) result array as the scan produces them, which is
+what the existing GC argument already required, so the intermediate vector was
+pure overhead.
+
+Measured on `s.split(",")` at 200k iterations, 2 / 4 / 8 / 16 pieces (before
+peeled from the landed commit's binary, after from this one):
+
+| pieces | before ms | after ms |
+|---:|---:|---:|
+| 2 | 65.8 | 47.1 |
+| 4 | 96.3 | 59.9 |
+| 8 | 166.0 | 96.0 |
+| 16 | 264.2 | 172.2 |
+
+Linear fit: **71 -> 45 ns per piece, 187 -> 147 ns fixed** per call. The isolated
+`strings/split_join` row (one process, minima of 3) goes 61.9 -> 55.4 ms (-10.6%,
+gap 7.70 -> 7.03), and a split + assign + join microbench 78 -> 55 ms.
+
+The corpus total cannot resolve this: a re-run minutes later moved node's own
+total 722.2 -> 740.5 ms (+2.5%), and per-row node deltas of +9.5% and -10% on rows
+this change cannot touch, so the pair is inside the documented noise. Parity 0.
+
+Gates: fmt, `clippy --workspace --all-targets -D warnings`, `cargo test
+--workspace` 5860 pass, four sweeps 51,998 at 100%.
