@@ -19652,3 +19652,48 @@ binary from the tree you are about to commit, then measure.
 Measured after the fix, isolated: `own_read` 2.99 ms, `obj_prop` 0.042 ms,
 `hoisted_local` 2.60 ms. Corpus `n=77 mean-jitGap 8.90 mean-jlGap 3.47`,
 parity 0. Sweeps 51,998 at 100%.
+
+## Speculative Number guards on a register body's slot operands (measured 2026-10-30)
+
+`globals/hoisted_local` (`s += i * 3 + k`, with `k` a local copied from a global
+`const`) sat at 2.5 ns/iter against node's 0.6, and the read was not the cost.
+The cost was one unknown operand: `k`'s slot has no type proof, so
+`Add(i * 3, k)` stayed a `Value` word, which kept the loop-carried accumulator
+unknown too. Nothing downstream could lower to f64, and the accumulator stayed in
+the frame instead of a register.
+
+A register body now asserts `Number` on the slot operand of an arithmetic combine
+(`Op::GuardType` typed `Number`, deopting on a non-Number) when every op before it
+in the body is numeric-shaped (`numeric_chain`: the counter, a numeric constant,
+a slot read, or an arithmetic combine of those). The guarded value types the
+chain, the chain types the accumulator's store, and the loop becomes:
+
+```
+b1(v20:int):
+  v6:f64 = Mul(v20, v5)          ;; i * 3
+  v8:num = GuardType(v7)         ;; k, one tag check per iteration
+  v9:f64 = Add(v6, v8)
+  v11:f64 = Add(v21, v9)         ;; s, loop-carried in a register
+  v18:int = IntAdd(v20, v17)
+```
+
+Measured, isolated, repeated: `globals/hoisted_local` 2.60 -> 1.23 ms (-53%,
+jitGap 4.4 -> ~2.1); `globals/declarative_read`/`nested_read`/`object_read`
+unchanged (2.5-2.6); `objects/own_read` 2.99 (the fused-lane refusal keeps it in
+the per-step tier, where it is faster); `opcost/obj_prop` 0.042 unchanged.
+
+Why the gate matters, and why the guard is *not* applied to the loop-carried
+accumulator: an accumulator guard must re-run every iteration (`s` changes), which
+measured as no better than the fused lane it replaced; the operand guard runs on a
+value that is loop-invariant, and typing *it* is what unlocks the rest. A
+pre-loop guard on the accumulator is the cleaner form of the same idea and is the
+next step.
+
+Also landed with it: the negated comparisons (`!==`/`!=` as `StrictEq`/`Eq` plus
+`Not`), which the lift had refused outright - that refusal was what kept these
+bodies (the parser desugars some loop shapes into one) in the per-step tier.
+
+Gates: fmt, `clippy --workspace --all-targets -D warnings`, `cargo test
+--workspace`, four sweeps 51,998 at 100%, corpus parity 0, deopt probes agree with
+node. Corpus `mean-jitGap` 8.73 / 9.12 / 8.83 across three runs (the spread is the
+known machine-state noise; the row numbers above are the measurement).

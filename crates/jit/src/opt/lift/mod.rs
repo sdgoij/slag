@@ -1715,13 +1715,16 @@ fn emit_step(
             // guard asserts the read is an exact int32 and the types then let
             // `narrow` fuse the whole RMW into an `IntAdd`. A read the enclosing
             // int32 hoist already proved needs no check (`Op::AssumeInt`).
-            let guard = guard_reads
-                .then(|| {
-                    let int_slots = hoist_int_slots(steps, index);
-                    reg_body_guard(ops, index, stack, counter, num, &int_slots)
-                })
-                .flatten();
-            emit_reg_body(builder, block, ops, counter, guard)?;
+            let mut guards: Vec<RegGuard> = Vec::new();
+            if guard_reads {
+                let int_slots = hoist_int_slots(steps, index);
+                if let Some(g) = reg_body_guard(ops, index, stack, counter, num, &int_slots) {
+                    guards.push(g);
+                } else {
+                    guards.extend(reg_body_number_guards(ops, index, stack, counter, num));
+                }
+            }
+            emit_reg_body(builder, block, ops, counter, &guards)?;
         }
         // The whole-literal fused creates (I6-0a): the N value expressions are
         // already on the operand stack (in source order), so the lift pops them
@@ -2005,8 +2008,13 @@ fn emit_const(builder: &mut Builder, block: BlockId, imm: Imm, ty: Type) -> Valu
 /// The int32 read guard a register body may take: where to emit it, and the
 /// resume state a deopt needs.
 struct RegGuard {
-    /// The index of the leaf op whose result the guard asserts.
+    /// The index of the leaf op the guard belongs to.
     at: usize,
+    /// What the guard asserts.
+    on: GuardOn,
+    /// The asserted type: `Int` for a read the loop can carry in an i32
+    /// register, `Number` for an operand the arithmetic chain can stay in f64.
+    ty: Type,
     /// Emit `AssumeInt` (no check: an enclosing probe proved it) instead of a
     /// `GuardType` that deopts.
     assume: bool,
@@ -2015,6 +2023,15 @@ struct RegGuard {
     num: u32,
     /// The live operand stack at the enclosing step, mirrored for the resume.
     live: Vec<ValueId>,
+}
+
+/// What a register-body guard asserts.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum GuardOn {
+    /// The op's result (after it runs).
+    Result,
+    /// The frame-slot value the op loads as its operand.
+    Slot,
 }
 
 /// Whether a leaf op's re-execution is unobservable, which is what makes a
@@ -2232,6 +2249,8 @@ fn reg_body_guard(
         let slot = |s: Option<usize>| s.map_or(u32::MAX, |s| s as u32);
         return Some(RegGuard {
             at,
+            on: GuardOn::Result,
+            ty: Type::Int,
             assume: false,
             step: index as u32,
             counter: slot(counter),
@@ -2248,6 +2267,8 @@ fn reg_body_guard(
     })?;
     Some(RegGuard {
         at,
+        on: GuardOn::Result,
+        ty: Type::Int,
         assume: true,
         step: index as u32,
         counter: u32::MAX,
@@ -2256,12 +2277,127 @@ fn reg_body_guard(
     })
 }
 
+/// The guards that type an otherwise-unknown operand of a numeric arithmetic
+/// chain: a register body's `s += i * 3 + k` reads `k` from a slot whose value no
+/// analysis proved, and one unknown operand keeps the whole statement - and the
+/// loop-carried accumulator it stores - in a `Value` word. Asserting `Number` on
+/// the slot operand (a tag check, deopting on a non-Number) lets the chain lower
+/// to bare f64 with the accumulator in a register.
+fn reg_body_number_guards(
+    ops: &[LeafOp],
+    index: usize,
+    stack: &[ValueId],
+    counter: Option<usize>,
+    num: Option<usize>,
+) -> Vec<RegGuard> {
+    let slot = |s: Option<usize>| s.map_or(u32::MAX, |s| s as u32);
+    let mut guards: Vec<RegGuard> = Vec::new();
+    for (at, op) in ops.iter().enumerate() {
+        if !matches!(
+            op,
+            // Only a body whose every operand is a slot, a constant or the
+            // counter qualifies (`numeric_chain`). A member or element read is
+            // not typed by this guard, and a string operand would deopt on every
+            // iteration, so those bodies keep the per-step tier.
+            LeafOp::BinReg {
+                op: BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div,
+                ..
+            } | LeafOp::BinLeftReg {
+                op: BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div,
+                ..
+            }
+        ) {
+            continue;
+        }
+        if !numeric_chain(&ops[..at]) {
+            continue;
+        }
+        guards.push(RegGuard {
+            at,
+            on: GuardOn::Slot,
+            ty: Type::Number,
+            assume: false,
+            step: index as u32,
+            counter: slot(counter),
+            num: slot(num),
+            live: stack.to_vec(),
+        });
+    }
+    guards
+}
+
+/// Whether a run of leaf ops computes a numeric value from Numbers only: the
+/// counter, a numeric constant, or an arithmetic combine of those. A string
+/// constant, a member read, or anything that coerces disqualifies it, which is
+/// what makes the guards above safe to speculate.
+fn numeric_chain(ops: &[LeafOp]) -> bool {
+    let mut numeric_seen = false;
+    for op in ops {
+        match op {
+            LeafOp::LoadCounter | LeafOp::LoadReg { .. } => numeric_seen = true,
+            LeafOp::LoadConst(value) => {
+                if value.as_number().is_none() {
+                    return false;
+                }
+                numeric_seen = true;
+            }
+            LeafOp::BinImm {
+                op: BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div | BinaryOp::Rem,
+                ..
+            }
+            | LeafOp::BinConst {
+                op: BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div | BinaryOp::Rem,
+                ..
+            }
+            | LeafOp::BinReg {
+                op: BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div | BinaryOp::Rem,
+                ..
+            }
+            | LeafOp::BinLeftReg {
+                op: BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div | BinaryOp::Rem,
+                ..
+            }
+            | LeafOp::BinImmLocal {
+                op: BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div | BinaryOp::Rem,
+                ..
+            } => numeric_seen = true,
+            LeafOp::PushAcc | LeafOp::StoreReg { .. } => {}
+            _ => return false,
+        }
+    }
+    numeric_seen
+}
+
+/// Emit a register body's type guard on `value` and answer the guarded value.
+fn emit_reg_guard(
+    builder: &mut Builder,
+    block: BlockId,
+    value: ValueId,
+    guard: &RegGuard,
+) -> ValueId {
+    let mut args = Vec::with_capacity(1 + guard.live.len());
+    args.push(value);
+    args.extend_from_slice(&guard.live);
+    builder.emit(
+        block,
+        Op::GuardType,
+        &args,
+        guard.ty,
+        Effects::pure(),
+        Imm::Guard {
+            step: guard.step,
+            counter: guard.counter,
+            num: guard.num,
+        },
+    )
+}
+
 fn emit_reg_body(
     builder: &mut Builder,
     block: BlockId,
     ops: &[LeafOp],
     counter: Option<usize>,
-    guard: Option<RegGuard>,
+    guards: &[RegGuard],
 ) -> Result<(), Unsupported> {
     let mut acc = builder.emit(
         block,
@@ -2276,19 +2412,12 @@ fn emit_reg_body(
     // the pairs balance inside the body.
     let mut spill: Vec<ValueId> = Vec::new();
     for (i, op) in ops.iter().enumerate() {
-        acc = emit_leaf_op(
-            builder,
-            block,
-            op,
-            acc,
-            counter,
-            &mut spill,
-            guard.as_ref().filter(|g| g.at == i),
-        )?;
-        if let Some(guard) = &guard
-            && guard.at == i
+        acc = emit_leaf_op(builder, block, op, acc, counter, &mut spill, guards, i)?;
+        for g in guards
+            .iter()
+            .filter(|g| g.at == i && g.on == GuardOn::Result)
         {
-            if guard.assume {
+            if g.assume {
                 acc = builder.emit(
                     block,
                     Op::AssumeInt,
@@ -2298,21 +2427,7 @@ fn emit_reg_body(
                     Imm::None,
                 );
             } else {
-                let mut args = Vec::with_capacity(1 + guard.live.len());
-                args.push(acc);
-                args.extend_from_slice(&guard.live);
-                acc = builder.emit(
-                    block,
-                    Op::GuardType,
-                    &args,
-                    Type::Int,
-                    Effects::pure(),
-                    Imm::Guard {
-                        step: guard.step,
-                        counter: guard.counter,
-                        num: guard.num,
-                    },
-                );
+                acc = emit_reg_guard(builder, block, acc, g);
             }
         }
     }
@@ -2375,6 +2490,7 @@ fn emit_reg_operand(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn emit_leaf_op(
     builder: &mut Builder,
     block: BlockId,
@@ -2382,7 +2498,8 @@ fn emit_leaf_op(
     acc: ValueId,
     counter: Option<usize>,
     spill: &mut Vec<ValueId>,
-    guard: Option<&RegGuard>,
+    guards: &[RegGuard],
+    at: usize,
 ) -> Result<ValueId, Unsupported> {
     let load = |b: &mut Builder, slot: usize, t: bool| -> ValueId {
         if t {
@@ -2411,11 +2528,23 @@ fn emit_leaf_op(
             builder.emit(block, Op::Const, &[], ty, Effects::pure(), imm)
         }
         LeafOp::BinReg { op, slot, tdz: t } => {
-            let right = load(builder, *slot, *t);
+            let mut right = load(builder, *slot, *t);
+            for g in guards
+                .iter()
+                .filter(|g| g.at == at && g.on == GuardOn::Slot)
+            {
+                right = emit_reg_guard(builder, block, right, g);
+            }
             bin(builder, binary_op(*op)?, acc, right)
         }
         LeafOp::BinLeftReg { op, slot } => {
-            let left = emit_frame_load(builder, block, *slot);
+            let mut left = emit_frame_load(builder, block, *slot);
+            for g in guards
+                .iter()
+                .filter(|g| g.at == at && g.on == GuardOn::Slot)
+            {
+                left = emit_reg_guard(builder, block, left, g);
+            }
             bin(builder, binary_op(*op)?, left, acc)
         }
         LeafOp::BinImm { op, imm } => {
@@ -2601,7 +2730,10 @@ fn emit_leaf_op(
             // must not fire twice when the interpreter re-runs the body).
             // `args[2..]` is that deopt's live operand stack.
             let mut args = vec![object, key];
-            let imm = match guard {
+            let imm = match guards
+                .iter()
+                .find(|g| g.at == at && g.on == GuardOn::Result)
+            {
                 Some(g) => {
                     args.extend_from_slice(&g.live);
                     Imm::Guard {
@@ -2705,7 +2837,10 @@ fn emit_leaf_op(
             }
             let key = emit_reg_operand(builder, block, key, counter)?;
             let mut args = vec![acc, key];
-            let imm = match guard {
+            let imm = match guards
+                .iter()
+                .find(|g| g.at == at && g.on == GuardOn::Result)
+            {
                 Some(g) => {
                     args.extend_from_slice(&g.live);
                     Imm::Guard {
@@ -3099,7 +3234,14 @@ fn emit_binary(
     // hoisted_local`, a `s += i * 3 + k` loop the plan keeps in `Vm::loop_num`:
     // 2.64 -> 3.55 ms). Until the optimizer can match that lane, refuse so the
     // body keeps the faster tier.
-    let op = binary_op(op)?;
+    // The negated comparisons are the positive one inverted (`a !== b` is
+    // `!(a === b)`); without this the lift refused every body holding one, which
+    // kept such bodies in the per-step tier.
+    let (op, negate) = match op {
+        BinaryOp::StrictNotEqual => (Op::StrictEq, true),
+        BinaryOp::NotEqual => (Op::Eq, true),
+        op => (binary_op(op)?, false),
+    };
     let v = builder.emit(
         block,
         op,
@@ -3108,6 +3250,18 @@ fn emit_binary(
         op.default_effects(),
         Imm::None,
     );
+    let v = if negate {
+        builder.emit(
+            block,
+            Op::Not,
+            &[v],
+            Type::Bool,
+            Op::Not.default_effects(),
+            Imm::None,
+        )
+    } else {
+        v
+    };
     stack.push(v);
     Ok(())
 }
