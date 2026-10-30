@@ -1292,6 +1292,26 @@ fn plain_stringable(kind: &ValueKind) -> bool {
 /// ToPrimitive/ToString agent round-trips. `None` for any other shape
 /// (objects, symbols, BigInt, both non-string) falls to the exact machinery.
 pub(crate) fn concat_primitive(left: &Value, right: &Value) -> Option<Value> {
+    // A Number next to a string spells straight into the result: boxing the
+    // spelling and then the concat costs two allocations (the `"..." + n`
+    // shape, and every template substitution). The integer form covers loop
+    // counters and indices; anything else falls through to the boxed path.
+    if let (ValueKind::String(_), ValueKind::Number(number)) = (left.kind(), right.kind())
+        && let Some(text) = left.as_string()
+    {
+        let mut buf = [0u16; 22];
+        if let Some(units) = crux::number::integer_units(number, &mut buf) {
+            return Some(Value::String(JsString::concat_units(&text, units)));
+        }
+    }
+    if let (ValueKind::Number(number), ValueKind::String(_)) = (left.kind(), right.kind())
+        && let Some(text) = right.as_string()
+    {
+        let mut buf = [0u16; 22];
+        if let Some(units) = crux::number::integer_units(number, &mut buf) {
+            return Some(Value::String(JsString::concat_units_left(units, &text)));
+        }
+    }
     let (a, b) = match (left.kind(), right.kind()) {
         (ValueKind::String(_), r) if plain_stringable(&r) => {
             (left.as_string()?, primitive_to_string(right)?.as_string()?)

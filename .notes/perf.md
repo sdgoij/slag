@@ -20147,3 +20147,38 @@ reads.
 
 Gates: fmt, `clippy --workspace --all-targets -D warnings`, `cargo test
 --workspace` 5861 pass, four sweeps 51,998 at 100%, corpus parity 0.
+
+## LANDED (2026-10-30): a number's spelling goes into the concat, not through a box
+
+`concat_primitive`, the `Add` fast path for a string next to a plain primitive,
+boxed the primitive's spelling and then boxed the concat, so `"value=" + i` paid
+two allocations and a template substitution paid one per operand. The integer
+spelling now goes straight into the result buffer:
+`crux::number::integer_units` writes the decimal into a caller's stack buffer
+(the same fast path `small_integer_string` used, now shared by both), and
+`JsString::concat_units` / `concat_units_left` build the result once, as an inline
+`Small` when it fits.
+
+| shape (300k iterations, one row per process, minima of 3) | before | after |
+| --- | ---: | ---: |
+| `"value=" + i` | 28.5 ms (94.9 ns) | 18.2 (60.8) |
+| `"value=" + i + ":" + (i * 2)` | 64.8 (216) | 51.2 (171) |
+| `strings/coercion_concat` | 60.8 | 48.4 (**-20%**) |
+
+The other four `strings` rows are flat in the same window (-1.4% to +1.5%).
+Node's `"value=" + i + ":" + (i * 2)` is 25.9 ns, so that row is ~6.6x where it
+was ~8.3x. Both tiers gain: `binary_slow` (the JIT's non-numeric `Add`) and the
+interpreter funnel through `apply_binary`, which shows in the corpus jitless gap
+(3.40 -> 3.36 in the same run).
+
+What is left in the shape is the ALLOCATION COUNT. The chain still builds one box
+per `Add` (three here) and node builds one string. Measured: a `Small` box is
+~30 ns (`q + q` is 27.6 ns over the loop floor, `i + ""` 40 ns, of which the
+spelling itself is well under 10), so fusing the chain into a single box is worth
+another ~90 ns per iteration on this row. That is the next slice: the pieces are
+already `Value`s in registers, so it is a lowering peephole (an `Add` spine whose
+seed the typer proves a string) plus one runtime helper that sizes the buffer
+exactly and fills it.
+
+Gates: fmt, `clippy --workspace --all-targets -D warnings`, 5861 tests, four
+sweeps 51,998 at 100%, corpus parity 0 (`mean-jitGap` 8.57 in a slow window).

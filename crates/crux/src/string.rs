@@ -161,6 +161,55 @@ impl Trace for JsString {
 }
 
 impl JsString {
+    /// `left ++ right` where `right` is a short ASCII spelling already in a
+    /// caller-owned stack buffer (a number's or a keyword's units). Building
+    /// the result directly is one allocation instead of boxing the spelling
+    /// and then the concat, which is what `"..." + n` pays otherwise. Same
+    /// shape as [`Self::concat`]: inline `Small` when the result fits, else a
+    /// flat `Flat`.
+    pub fn concat_units(left: &Handle<JsString>, right: &[u16]) -> Handle<JsString> {
+        if right.is_empty() {
+            return *left;
+        }
+        let l = left.as_slice();
+        let len = l.len() + right.len();
+        if len <= CONCAT_FLAT_THRESHOLD {
+            let mut buf = [0u16; SMALL_STRING_CAP];
+            buf[..l.len()].copy_from_slice(l);
+            buf[l.len()..len].copy_from_slice(right);
+            return Handle::new(JsString::Small {
+                len: len as u8,
+                units: buf,
+            });
+        }
+        let mut units = Vec::with_capacity(len);
+        units.extend_from_slice(l);
+        units.extend_from_slice(right);
+        Handle::new(JsString::Flat(units.into()))
+    }
+
+    /// `left ++ right` for a short spelling on the LEFT (`n + "..."`).
+    pub fn concat_units_left(left: &[u16], right: &Handle<JsString>) -> Handle<JsString> {
+        if left.is_empty() {
+            return *right;
+        }
+        let r = right.as_slice();
+        let len = left.len() + r.len();
+        if len <= CONCAT_FLAT_THRESHOLD {
+            let mut buf = [0u16; SMALL_STRING_CAP];
+            buf[..left.len()].copy_from_slice(left);
+            buf[left.len()..len].copy_from_slice(r);
+            return Handle::new(JsString::Small {
+                len: len as u8,
+                units: buf,
+            });
+        }
+        let mut units = Vec::with_capacity(len);
+        units.extend_from_slice(left);
+        units.extend_from_slice(r);
+        Handle::new(JsString::Flat(units.into()))
+    }
+
     pub fn from_utf16(units: &[u16]) -> Self {
         // Cut 67: a small input's units live inline in the box — one
         // allocation instead of the Arc's own. Larger inputs keep the
