@@ -19835,3 +19835,65 @@ the allocator is individually large: `Heap::alloc` is 2.2% and `Gc::new` is the
 borrow plus bookkeeping. The gap to node's ~10 ns is spread across five terms,
 which is the same "portfolio, not a big win" conclusion the corpus-wide profile
 gives.
+
+## MEASURED (2026-10-30): the string builtins are allocation-bound, and two censuses come back clean
+
+Chasing the `strings` family, and the two censuses that would have found another
+systemic defect like the `UpdateValue` / `store_ref` pair. Neither census found
+one, which is the useful part.
+
+### The per-operation costs
+
+300k-iteration loops, isolated, one row per process:
+
+| operation | ns/iter | note |
+|---|---:|---|
+| `s += 1` | 0.6 | the loop floor |
+| `s += q.length` | 7.4 | a member read |
+| `s += q.charCodeAt(0)` | 10.3 | a builtin call, no allocation |
+| `s += (q + q).length` | 39 | one small-string box |
+| `s += q.substring(0, 2).length` | 51 | one `Sliced` node |
+| `s += q.repeat(1).length` | 88 | one `Flat` node |
+
+`q.substring` against `q.charCodeAt` is the same dispatch, a `to_number` on two
+arguments, and one allocation. So the allocation is ~30 ns of it, and the family's
+gap to node is not in any builtin's code.
+
+`String.prototype.split` of a comma string, linear fit over 2 / 4 / 8 / 16 pieces
+at 200k iterations each (329 / 481 / 830 / 1321 ns): **187 ns fixed per call plus
+71 ns per piece**. The fixed part is two `to_string` calls, `array_create` and the
+`Vec<JsString>`; the per-piece part is one box plus one `dense_index_define`
+(15.6% of the isolated split profile) plus a 48-byte copy into and out of the
+`Vec<JsString>` intermediate. `join` on the same array is 487 ns.
+
+### Why it is ~30 ns
+
+`size_of::<JsString>()` is 48 bytes (`SLAG_CLOSURE_PROFILE=1` prints it), so with
+the 16-byte `GcHeader` a one-character string is a **64-byte box, exactly one cache
+line**. The arena is streamed, so essentially every allocation is a cold-line miss
+on top of the bookkeeping. The 10M-iteration concat profile splits the cost as
+`JsString::concat` 20.3%, `Gc::new` 15.4%, minor GC 11.5%, `Heap::alloc` 2.2%; no
+single term is dominant, and `--gc-trace` puts the collector at only 1.6 ms of the
+11.4 (74 minors at 22 us). So the lever is box *density*, not the allocator, the
+collector, or any builtin: the enum's size is set by the four `flat:
+OnceCell<Arc<[u16]>>` variants (48 bytes with a 24-byte `OnceCell`), not by
+`SMALL_STRING_CAP`.
+
+### Census 1: untyped arithmetic in the optimizing tier
+
+`JIT_DUMP_IR` for every corpus row, counting `v?:? = <arith>(`. Eleven rows have
+any left, the worst being `opcost/array_alloc` (45 across 40 bodies, all cold), and
+the two biggest rows (`head-let` 363.7 ms and `template-literal` 190.8 ms) have 8
+each in their `assert` helper bodies. The lattice now types the hot loops, so there
+is no second `UpdateValue`-sized typing gap to find.
+
+### Census 2: bodies that do not reach the optimizing tier
+
+`JIT_DUMP_CLIF` for every corpus row: **zero `opt-lower bail`** (the silent
+fallback into the baseline tier that cost 21 -> 28 ms on `nested_loops` before it
+was noticed), and ten lift refusals total, all accounted for: two `HoistGuard` (the
+deliberate `region_uses_fused_lane` refusal), `AssignMemberName(compound)`,
+`RegExpLiteral`, `NoReturn` (an empty body), a `FusedLoop` in `search_slice`'s cold
+200-iteration builder loop, and four unnamed `Step("step")` bodies whose blockers
+the `opt-blockers` listing does not separate. Tier coverage is not where the
+remaining time is either.
