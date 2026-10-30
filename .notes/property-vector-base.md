@@ -178,20 +178,13 @@ stops being traced is collected and shows up as a wrong value).**
 1. **Inert `base`.** Landed (`object.rs`: the field, `ordinal_len`, `get_ordinal`,
 the two positional call sites, and `small_props_ordinals_shift_by_the_base`).
 Gate was: inert by construction, every test and sweep green.
-2. **The tail define stops materializing.** Not started. The trigger is exact:
-   `define_fresh`'s `else` arm ("Deferred/presize with a full map and a fresh
-   key") calls `materialize_properties()` and then appends at
-   `props.len()` = vector position. It becomes "ensure the vector is a suffix
-   store at `INLINE_FIELDS`" (idempotent, so the 10th key takes it too), the
-   append keeps using the vector position, and `materialize_properties` learns
-   to rebuild a `base == 0` vector from the map head plus the suffix.
-
-   **The blocker found by the audit below**: eight ordinary-object readers use
-   the vector without materializing, so slice 2 also needs either a
-   `materialize_properties()` at their entry or a base-aware lookup. Prefer the
-   materialize call for the first cut: it cannot be wrong, and none of them is
-   on the measured path.
-3. **Map-walk enumeration** (option 2 of §4.4) only if a row shows the copy.
+2. **The tail define stops materializing.** Landed (§6). `define_fresh`'s `else`
+   arm reports the suffix store and takes the ordinary append at the vector
+   position; `materialize_properties` rebuilds a `base == 0` vector from the map
+   head plus the suffix.
+3. **Map-walk enumeration** (option 2 of §4.4). Landed with slice 2 rather than
+   after it: without it, every enumerating consumer of a many-key object paid the
+   copy the define no longer pays, which is what sank the first attempt.
 
 ## 5b. The audit of non-materializing readers
 
@@ -236,50 +229,61 @@ other is its complement.
 - **Key the composite shape cache on the head.** Measured: no change (the
   one-entry transition hint already serves each fork step). Reverted.
 
-## 6. Slice 2, measured and reverted (2026-10-30)
+## 6. Slice 2, landed (2026-10-30)
 
-Implemented, then reverted. The mechanism works and the cliff it targets is real;
-the corpus says it is not free, and that is the finding.
-
-What was built: `SmallProps::start_at_inline_fields`, the `define_fresh` `else`
-arm starting the vector at the cap instead of materializing, a
-`materialize_properties` that folds a suffix in front of the in-field head, and a
-`complete_vector()` guard on the readers that want the whole vector (the eight
-from the audit). Two invariant tests changed with it, because both asserted the
-old behaviour: one asserted the vector materializes at the cap, the other that a
-nine-key object owns a heap buffer. The second is exactly the win (a one-entry
-vector still fits the two inline slots), so its expectation moved rather than its
-intent.
-
-The label says it works:
+The first attempt (recorded here as reverted, the day it was reverted) paid for
+its head copy in every enumerating consumer and lost the corpus. The second
+attempt lands with the enumeration walk from §4.4 option 2, and the label holds:
 
 | | before | after |
 |---|---:|---:|
-| 8-key literal | 49.5 ms | 49.5 |
-| 9-key literal | **160.2** | **68.3** |
-| 9/8 ratio | 3.17 | **1.38** |
-| 8-field construct | 173.0 | 173.0 |
-| 9-field construct | **405.5** | **211.7** |
-| 9/8 ratio | 2.34 | 1.22 |
+| 8-key literal | 51.6 ms | 49.4 |
+| 9-key literal | **154.9** | **68.0** |
+| 9/8 ratio | 3.00 | **1.38** |
+| 8-field construct | 195.5 | 189.5 |
+| 9-field construct | **343.7** | **228.1** |
+| 9/8 ratio | 1.76 | 1.20 |
 
-It costs the corpus more than that is worth, because no corpus row contains a
-nine-key literal loop while several rows enumerate many-key objects:
-`builtins/json_roundtrip` +16.5% (node +2.3% in the same window),
-`builtins/object_keys` +9.7% (node +0.0%), `opcost/object_keys` +5.6%,
-`opcost/json_stringify` +6.5%. Serving a tail ordinal straight from the vector in
-`ordinary_property_lookup` (instead of completing it) did not remove them, and by
-then the machine had drifted 23% (node's own total 714.2 -> 881.5 ms), so nothing
-further was measurable.
+Corpus `mean-jitGap` 8.21 -> 8.18 over 78 rows (the 78th is the new
+`objects/wide_literal`, which is the row that exercises the win: 86.2 -> 74.7 ms
+against node's 10.6).
 
-Two prerequisites, in order, before this lands:
+What the landed shape looks like, so this file stops describing a project:
 
-1. **Enumeration must not rebuild.** §4.4 option 2: walk the map for the head
-   (reading `in_fields`) and then the suffix, instead of folding the head into the
-   vector. Until then every enumerating consumer of a many-key object pays the
-   same copy the change removes from the define, so the work merely moves to where
-   the corpus does more of it.
-2. **A quiet machine and a corpus row that exercises the win.** The microbench is
-   the evidence today; nothing in `tools/corpus` builds a nine-key object in a
-   loop, so the corpus can only show the cost.
+- `SmallProps::start_at_inline_fields` is idempotent; `define_fresh`'s `else` arm
+  calls it and then takes the ordinary append, which pushes at vector position
+  (`ordinal_len() == descriptor_count()` is what `map_transition_aligned` checks,
+  so the transition stays aligned).
+- `base == INLINE_FIELDS` while `props_deferred` is set. Both bits mean "the
+  vector is not the whole story", and the second is not derived from the first:
+  an ordinary deferred object has `base == 0` and an EMPTY vector (the presize
+  state), a suffix store has `base == 8` and a populated tail. `complete_vector`
+  therefore tests `base`, not the entry count.
+- `complete_vector()` at the entry of every reader that wants a vector POSITION
+  or a mutable vector (§5b's "add `materialize_properties()` at entry" list, now
+  landed as the cheaper `complete_vector`), and `own_entry_walk` for the one
+  reader that only wants the entries (enumeration).
 
-Reverted to the inert slice. The numbers above are the case for doing it properly.
+Three defects the sweeps found, all fixed, all worth knowing before touching this
+state again:
+
+1. `for_each_own_string_prop`'s vector-free arm skipped `offset >= INLINE_FIELDS`,
+   which was sound only while a deferred object could not describe a tail ordinal.
+   This is what failed `Array/prototype/Symbol.unscopables/array-find-from-last`
+   (its `for-in` in `isEnumerable` saw eight of twenty-eight keys).
+2. `define_fresh`'s duplicate-of-a-mapped-key arm wrote through `map_set`, which
+   mirrors nothing at or above the cap, so redefining a tail key lost the value.
+3. `drop_map` (three call sites clearing the map for dictionary mode) must
+   complete the vector first: the head is described only by the map, and
+   `own_entry_walk`'s map-less arm treats the vector as authoritative.
+
+One near-miss worth pinning: `sync_map_after_define` compared
+`properties.get(descriptor_count())`, a vector POSITION, against the key it
+wanted to transition. With a base the position and the ordinal differ, so this is
+`get_ordinal` now.
+
+## 7. Slice 3, if a row shows the copy
+
+Nothing does. The rows that enumerate many-key objects are neutral (see §6), so
+the map walk stays as it is: `own_entry_walk` synthesizes the head from the map
+and hands the caller `(key, enumerable)`, and no consumer needs a `Property`.

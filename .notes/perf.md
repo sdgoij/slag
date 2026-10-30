@@ -20094,3 +20094,56 @@ the absolute milliseconds of that run are a faster window than the entry above).
 Gates: fmt, `clippy --workspace --all-targets -D warnings`, `cargo test
 --workspace` 5861 pass, four sweeps 51,998 at 100%, corpus parity 0
 (`mean-jitGap` 8.31).
+
+## LANDED (2026-10-30): the property vector is a suffix store, the ninth property stops copying the head
+
+`define_fresh`'s "fresh key on a full map" arm now starts the vector at ordinal
+`INLINE_FIELDS` instead of materializing it, so an object that grows past the
+in-object field cap keeps its head in `in_fields` and puts only the tail in the
+vector. `SmallProps` needed no new field (`base` landed inert earlier today), and
+`materialize_properties` folds a suffix in front of the head it rebuilds from the
+map.
+
+The label, in the journal's probe shape (500k iterations, one row per process,
+objects escaping into `arr[i & 63]`, minima of 3, base and new interleaved):
+
+| row | before | after | |
+| --- | ---: | ---: | ---: |
+| 8-key literal | 51.6 ms (103 ns) | 49.4 (99) | -4% |
+| 9-key literal | 154.9 (310) | **68.0 (136)** | **-56%** |
+| 9/8 ratio | 3.00 | **1.38** | |
+| 8-field construct | 195.5 (391) | 189.5 (379) | -3% |
+| 9-field construct | 343.7 (687) | **228.1 (456)** | **-34%** |
+| 9/8 ratio | 1.76 | **1.20** | |
+
+A new corpus row carries it: `objects/wide_literal` (a 12-key literal loop,
+86.2 -> 74.7 ms, node 10.6 in the same window). Corpus-wide the change is free,
+`mean-jitGap` 8.21 for the base binary against 8.18 and 8.23 in two after-windows
+(78 rows, parity 0, so the two after-values are the spread), and every other row
+is inside its own window's noise: `builtins/object_keys` +2.4% in one pairing and -1% in the next
+(the row alone spans 41-47 ms on this machine), the five `control` rows and
+`calls/construct_churn` (-1.4%) within a couple of percent either way.
+
+The first cut failed two fixtures, both for-in enumeration of a many-key object,
+and both were the same defect: `for_each_own_string_prop`'s vector-free arm
+skipped `offset >= INLINE_FIELDS` outright, which was sound only while a deferred
+object could not describe a tail ordinal. It now serves the tail from the vector.
+Three more sites needed the same treatment, and they are the audit's answer for
+the next reader of this state:
+
+- `define_fresh`'s duplicate-of-a-mapped-key arm wrote the value through
+  `map_set`, which mirrors nothing at or above the cap, so an in-place redefine of
+  a tail key silently dropped the write (`get_ordinal_mut` now serves it).
+- `drop_map`, the three paths that clear the map to enter dictionary mode, must
+  complete the vector first: a suffix store's head is described only by the map.
+- `sync_map_after_define`'s alignment probe read a vector POSITION
+  (`properties.get(descriptor_count())`) where the invariant is about an ORDINAL;
+  with a base the two differ, so it could transition a map onto the wrong entry.
+
+Serving enumeration from the map is what keeps the cost out of the rows that
+enumerate a deferred object repeatedly: the walk originally built a `Property` per
+key, and it now hands the caller `(key, enumerable)`, which is all an enumerator
+reads.
+
+Gates: fmt, `clippy --workspace --all-targets -D warnings`, `cargo test
+--workspace` 5861 pass, four sweeps 51,998 at 100%, corpus parity 0.

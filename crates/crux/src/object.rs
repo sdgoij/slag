@@ -208,6 +208,25 @@ impl SmallProps {
             .and_then(|i| self.slice().get(i))
     }
 
+    /// The mutable entry at descriptor ordinal `ordinal`; see [`Self::get_ordinal`].
+    pub fn get_ordinal_mut(&mut self, ordinal: usize) -> Option<&mut (PropertyKey, Property)> {
+        let index = ordinal.checked_sub(self.base)?;
+        self.slice_mut().get_mut(index)
+    }
+
+    /// Start the vector at `INLINE_FIELDS`: an empty suffix store whose head is
+    /// still in the object's in-object fields. Idempotent, so the second and
+    /// later tail defines take it too. The head stays readable by ordinal (the
+    /// positional readers below the cap already read `in_fields`); a consumer
+    /// that wants every entry walks the map for the head (`JsObject::
+    /// own_entry_walk`) and never copies it into the vector.
+    pub fn start_at_inline_fields(&mut self) {
+        if self.base == 0 {
+            debug_assert_eq!(self.len, 0, "the in-field head must not be in the vector");
+            self.base = INLINE_FIELDS;
+        }
+    }
+
     fn slice(&self) -> &[(PropertyKey, Property)] {
         if self.len <= INLINE_PROPS {
             // SAFETY: entries `[0, len)` are initialized.
@@ -1473,7 +1492,7 @@ impl JsObject {
             return;
         };
         if !property.is_data() {
-            self.map.set(None);
+            self.drop_map();
             return;
         }
         let value = property.value().unwrap_or(Value::Undefined);
@@ -1493,7 +1512,7 @@ impl JsObject {
                 && self
                     .properties
                     .borrow()
-                    .get(map.descriptor_count())
+                    .get_ordinal(map.descriptor_count())
                     .is_some_and(|(name, _)| name == key)
                 && self
                     .map_add_property_cell(key.clone(), MapAttrs::new(true, true, true))
@@ -1517,7 +1536,7 @@ impl JsObject {
                 && property.configurable == attrs.configurable()
         });
         if !attrs_match {
-            self.map.set(None);
+            self.drop_map();
             return;
         }
         let _ = self.map_set(key, value);
@@ -1528,8 +1547,16 @@ impl JsObject {
     /// map's shape no longer matches the property vector).
     fn drop_map_if_mapped(&self, key: &PropertyKey) {
         if self.map.get().is_some_and(|m| m.find(key).is_some()) {
-            self.map.set(None);
+            self.drop_map();
         }
+    }
+
+    /// Drop the object to dictionary mode. A suffix store's in-field head is
+    /// described only by the map, so the vector has to be completed while the
+    /// map can still supply it.
+    fn drop_map(&self) {
+        self.complete_vector();
+        self.map.set(None);
     }
 
     /// OrdinaryObjectCreate (spec 10.1.13). The object is initialized in
@@ -2466,7 +2493,14 @@ impl JsObject {
             let index = map.find(key)?;
             let (_, offset, attrs) = map.descriptor_at(index)?;
             if offset >= INLINE_FIELDS {
-                return None;
+                // A tail ordinal's storage is the property vector, which a
+                // suffix store holds from its base on (a plain deferred object,
+                // whose vector is empty, does not hold it yet).
+                return self
+                    .properties
+                    .borrow()
+                    .get_ordinal(offset)
+                    .map(|(_, property)| property.clone());
             }
             let value = self.in_fields[offset].get();
             if value.is_uninitialized() {
@@ -2996,6 +3030,9 @@ impl JsObject {
     /// lookup — `from_index` returns the same memoized canonical atom the
     /// caller's key holds.
     fn has_own_index_property(&self, index: u64) -> bool {
+        // A vector POSITION (or a mutable vector) needs the whole vector:
+        // complete it when it is a suffix store (a no-op otherwise).
+        self.complete_vector();
         if let ObjectKind::Array(slots) = &self.kind {
             let length = if slots.dense.get() {
                 slots.length.get()
@@ -3106,6 +3143,9 @@ impl JsObject {
     /// large to scan cheaply: the caller then skips caching, and the walk
     /// stays the (correct) fallback.
     fn has_index_keyed_own_property(&self) -> bool {
+        // A vector POSITION (or a mutable vector) needs the whole vector:
+        // complete it when it is a suffix store (a no-op otherwise).
+        self.complete_vector();
         // A dense Array's index properties live in the buffer, not props
         // (the scan below would miss them and wrongly certify the chain).
         if let ObjectKind::Array(slots) = &self.kind
@@ -3268,6 +3308,9 @@ impl JsObject {
     }
 
     pub fn set_key(&self, key: &PropertyKey, value: Value, throw: bool) -> Result<bool, JsError> {
+        // A vector POSITION (or a mutable vector) needs the whole vector:
+        // complete it when it is a suffix store (a no-op otherwise).
+        self.complete_vector();
         // Fast path: an existing writable data property on a plain object
         // writes in place — no receiver, no descriptor machinery (spec
         // 10.1.9.3 steps 3-4). Array `length` is excluded: its define
@@ -3335,6 +3378,9 @@ impl JsObject {
     /// scheme — see `set_global_slot`). A false return means the caller
     /// falls back to the full [[Set]].
     pub fn write_data_property(&self, key: &PropertyKey, value: Value) -> bool {
+        // A vector POSITION (or a mutable vector) needs the whole vector:
+        // complete it when it is a suffix store (a no-op otherwise).
+        self.complete_vector();
         if !matches!(self.kind, ObjectKind::Ordinary | ObjectKind::Array(_))
             || (matches!(self.kind, ObjectKind::Array(_)) && is_length_key(key))
         {
@@ -3426,6 +3472,9 @@ impl JsObject {
         value: Value,
         pinned_field: Option<(u64, usize)>,
     ) -> bool {
+        // A vector POSITION (or a mutable vector) needs the whole vector:
+        // complete it when it is a suffix store (a no-op otherwise).
+        self.complete_vector();
         if !matches!(self.kind, ObjectKind::Ordinary) {
             return false;
         }
@@ -3553,21 +3602,85 @@ impl JsObject {
         true
     }
 
+    /// Complete the property vector when it is a SUFFIX store, whose in-field
+    /// head is not in it (see `materialize_properties`). Only a consumer that
+    /// needs a vector POSITION (or a mutable vector) calls this; a reader that
+    /// walks own properties goes through `own_entry_walk` and never copies the
+    /// head. One `Cell` read for every object whose vector is already whole,
+    /// which is why it is safe on the define and set paths.
+    fn complete_vector(&self) {
+        // A non-deferred object's vector is complete, so it cannot be a suffix
+        // store: test the flag first, because that is a `Cell` read and this is
+        // on the define and set paths.
+        if !self.props_deferred.get() {
+            return;
+        }
+        let suffix = self.properties.borrow().base != 0;
+        if suffix {
+            self.materialize_properties();
+        }
+    }
+
+    /// Every own property in descriptor order WITHOUT materializing a suffix
+    /// store: the in-field head is served from the map (the same data
+    /// `materialize_properties` would fold in), and the vector's entries follow,
+    /// skipping the ones the map already described. A vector-only tail (a key
+    /// appended while the transition was unaligned) sits at an ordinal at or
+    /// past the map's descriptor count, so it is still emitted exactly once.
+    fn own_entry_walk(&self, mut f: impl FnMut(&PropertyKey, bool)) {
+        // A complete vector is the authoritative list: walk it directly, with no
+        // key clones and no descriptor scan. This is every object whose vector
+        // was never left short, which is the common case on the read paths.
+        if !self.props_deferred.get() {
+            for (key, property) in self.properties.borrow().iter() {
+                f(key, property.enumerable);
+            }
+            return;
+        }
+        let Some(map) = self.map.get() else {
+            // Dictionary mode: the vector is authoritative and complete.
+            for (key, property) in self.properties.borrow().iter() {
+                f(key, property.enumerable);
+            }
+            return;
+        };
+        let props = self.properties.borrow();
+        for ord in 0..map.descriptor_count() {
+            let Some((key, offset, attrs)) = map.descriptor_at(ord) else {
+                break;
+            };
+            if offset >= INLINE_FIELDS {
+                if let Some((_, property)) = props.get_ordinal(offset) {
+                    f(&key, property.enumerable);
+                }
+                continue;
+            }
+            if self.in_fields[offset].get().is_uninitialized() {
+                // A presize hole the body never wrote: not an own property.
+                continue;
+            }
+            f(&key, attrs.enumerable());
+        }
+        let base = props.base;
+        let described = map.descriptor_count();
+        for (position, (key, property)) in props.iter().enumerate() {
+            if base + position >= described {
+                f(key, property.enumerable);
+            }
+        }
+    }
+
     /// Rebuild `properties` from the map descriptors and clear the
-    /// `props_deferred` bit (Option-3 vector-free exit). While the bit is
-    /// set the vector is empty and NOT authoritative: every own property is
-    /// a map descriptor (with the descriptor's own attrs at an ordinal <
-    /// `INLINE_FIELDS`) whose value is live in `in_fields[ordinal]`.
-    /// Materializing reproduces
-    /// exactly the vector the defines would have pushed — the written
-    /// descriptors in order (the map forked down its transition chain in
-    /// define order; a constructor-presize descriptor the body never wrote
-    /// is a hole and contributes nothing) with the field values — so every
-    /// structural consumer that reads the vector
-    /// (enumeration, delete, redefinition, slot resolution) sees the same
-    /// object a never-deferred build would have. The map is unchanged (it
+    /// `props_deferred` bit (Option-3 vector-free exit). While the bit is set
+    /// the vector is NOT authoritative: every own property is a map descriptor
+    /// whose value lives in `in_fields` (below `INLINE_FIELDS`) or, for a
+    /// suffix store, in the vector at the descriptor ordinal. Materializing
+    /// reproduces exactly the vector the defines would have pushed, the
+    /// written descriptors in order, so every structural consumer that reads
+    /// the vector (enumeration, delete, redefinition, slot resolution) sees the
+    /// same object a never-deferred build would have. The map is unchanged (it
     /// keeps describing the same shape, now aligned with the vector), so the
-    /// read-side map cells stay valid; the value change nothing, so no
+    /// read-side map cells stay valid; the values do not change, so no
     /// generation bump is needed. No-op when the bit is clear.
     fn materialize_properties(&self) {
         if !self.props_deferred.get() {
@@ -3581,14 +3694,23 @@ impl JsObject {
             return;
         };
         let mut props = self.properties.borrow_mut();
-        debug_assert!(props.is_empty());
+        // A suffix store already holds the ordinals from its base on, so take
+        // it out and fold the in-field head in front of it. The ordinary
+        // deferred state has an empty vector here, so this is a move of
+        // nothing.
+        let suffix = std::mem::take(&mut *props);
         let mut rebuilt = SmallProps::new();
         for i in 0..map.descriptor_count() {
             let Some((key, offset, attrs)) = map.descriptor_at(i) else {
                 break;
             };
             if offset >= INLINE_FIELDS {
-                break;
+                // A tail ordinal's storage is the vector: a suffix store holds
+                // it, anything else has none.
+                if let Some((_, property)) = suffix.get_ordinal(offset) {
+                    rebuilt.push((key, property.clone()));
+                }
+                continue;
             }
             let value = self.in_fields[offset].get();
             if value.is_uninitialized() {
@@ -4052,7 +4174,30 @@ impl JsObject {
                     .map(|(_, _, attrs)| attrs.writable())
                     .unwrap_or(writable);
                 let written = self.field_written(ord);
-                if written || !self.higher_field_written(&map, ord) {
+                // A tail ordinal's storage is the property vector: a suffix
+                // store holds it, and a duplicate define rewrites it in place
+                // (a map write mirrors nothing at or above the cap).
+                let tail_written =
+                    ord >= INLINE_FIELDS && self.properties.borrow().get_ordinal(ord).is_some();
+                if written || tail_written {
+                    self.props_deferred.set(true);
+                    if tail_written {
+                        crate::heap::write_barrier(self, value);
+                        if let Some((_, property)) =
+                            self.properties.borrow_mut().get_ordinal_mut(ord)
+                            && let PropertyKind::Data { value: cell, .. } = &mut property.kind
+                        {
+                            *cell = value;
+                        }
+                    }
+                    let _ = self.map_set(key, value);
+                    self.bump_generation();
+                    return FreshDefine::At {
+                        slot: ord,
+                        writable: descriptor_writable,
+                    };
+                }
+                if ord < INLINE_FIELDS && !self.higher_field_written(&map, ord) {
                     self.props_deferred.set(true);
                     let _ = self.map_set(key, value);
                     self.bump_generation();
@@ -4082,10 +4227,14 @@ impl JsObject {
                 // fall through to the standard append with the flag clear.
             } else {
                 // Deferred/presize with a full map and a fresh key: the next
-                // descriptor would address the vector at ordinal
-                // `INLINE_FIELDS`, which the vector-free state has never
-                // pushed — materialize and append normally below.
-                self.materialize_properties();
+                // descriptor addresses the vector at ordinal `INLINE_FIELDS`.
+                // Start the vector AT that ordinal instead of copying the
+                // in-field head into it: the head keeps being served from
+                // `in_fields` (every positional reader below the cap reads
+                // there), the append writes the tail at its vector position,
+                // and a consumer that needs the whole object walks the map
+                // (`own_entry_walk`) rather than paying for a copy.
+                self.properties.borrow_mut().start_at_inline_fields();
             }
         }
         // Part B, B5.3/B5.4: transition the map for the fresh data
@@ -4379,6 +4528,17 @@ impl JsObject {
         if self.props_deferred.get()
             && let Some(map) = self.map.get()
         {
+            // A descriptor's storage: an in-field hole the body never wrote is
+            // not an own property, and a tail ordinal's entry lives in the
+            // property vector (a suffix store holds it; a presize map never
+            // describes a tail ordinal).
+            let stored = |offset: usize| -> bool {
+                if offset >= INLINE_FIELDS {
+                    self.properties.borrow().get_ordinal(offset).is_some()
+                } else {
+                    !self.in_fields[offset].get().is_uninitialized()
+                }
+            };
             // Only the string keys, and no index key: an index key would have
             // to be emitted first, ascending, which the descriptor order does
             // not provide.
@@ -4386,10 +4546,7 @@ impl JsObject {
                 let Some((key, offset, _)) = map.descriptor_at(ord) else {
                     break;
                 };
-                if offset >= INLINE_FIELDS || !matches!(key, PropertyKey::String(_)) {
-                    continue;
-                }
-                if self.in_fields[offset].get().is_uninitialized() {
+                if !matches!(key, PropertyKey::String(_)) || !stored(offset) {
                     continue;
                 }
                 if array_index_of(&key).is_some() {
@@ -4400,10 +4557,7 @@ impl JsObject {
                 let Some((key, offset, attrs)) = map.descriptor_at(ord) else {
                     break;
                 };
-                if offset >= INLINE_FIELDS
-                    || !matches!(key, PropertyKey::String(_))
-                    || self.in_fields[offset].get().is_uninitialized()
-                {
+                if !matches!(key, PropertyKey::String(_)) || !stored(offset) {
                     continue;
                 }
                 if !visit(&key, attrs.enumerable()) {
@@ -4456,13 +4610,20 @@ impl JsObject {
             let Some((key, offset, _)) = map.descriptor_at(ord) else {
                 break;
             };
-            if offset >= INLINE_FIELDS
-                || !matches!(key, PropertyKey::String(_))
-                || array_index_of(&key).is_some()
-            {
+            if !matches!(key, PropertyKey::String(_)) || array_index_of(&key).is_some() {
                 return None;
             }
-            keys.push(key.clone());
+            let stored = if offset >= INLINE_FIELDS {
+                // A tail ordinal's storage is the property vector (a suffix
+                // store has it); a deferred object with no such entry cannot
+                // describe the shape this list promises.
+                self.properties.borrow().get_ordinal(offset).is_some()
+            } else {
+                !self.in_fields[offset].get().is_uninitialized()
+            };
+            if stored {
+                keys.push(key.clone());
+            }
         }
         Some(keys)
     }
@@ -4471,26 +4632,27 @@ impl JsObject {
         if !matches!(self.kind, ObjectKind::Ordinary) {
             return None;
         }
-        // Enumeration is a structural consumer of the whole vector: rebuild a
-        // vector-free object's entries from the map first.
-        self.materialize_properties();
-        let props = self.properties.borrow();
-        // Only the array-index keys are staged (they enumerate first, by
-        // ascending index, and an ordinary object rarely has one); the string
-        // keys already sit in insertion order, so they go straight into the
-        // result.
+        // Enumeration is the one consumer that walks a suffix store directly:
+        // the in-field head comes from the map and `in_fields`, the tail from
+        // the vector, and nothing is copied into the vector for it.
+        let capacity = if self.props_deferred.get() {
+            // The map's descriptor count bounds the head; the tail adds at most
+            // its own length.
+            self.map.get().map_or(0, |map| map.descriptor_count())
+        } else {
+            self.properties.borrow().len()
+        };
         let mut indices: Vec<(u64, PropertyKey, bool)> = Vec::new();
-        let mut keys: Vec<(PropertyKey, bool)> = Vec::with_capacity(props.len());
-        for (key, property) in props.iter() {
+        let mut keys: Vec<(PropertyKey, bool)> = Vec::with_capacity(capacity);
+        self.own_entry_walk(|key, enumerable| {
             if !matches!(key, PropertyKey::String(_)) {
-                continue;
+                return;
             }
-            let enumerable = property.enumerable;
             match array_index_of(key) {
                 Some(index) => indices.push((index, key.clone(), enumerable)),
                 None => keys.push((key.clone(), enumerable)),
             }
-        }
+        });
         if indices.is_empty() {
             return Some(keys);
         }
@@ -4705,6 +4867,11 @@ fn validate_and_apply(
     desc: &PropertyDescriptor,
     current: Option<Property>,
 ) -> Result<bool, JsError> {
+    // A vector POSITION (or a mutable vector) needs the whole vector:
+    // complete it when it is a suffix store (a no-op otherwise).
+    if let Some(object) = obj {
+        object.complete_vector();
+    }
     let Some(current) = current else {
         // spec steps 2a-2e: a new property requires an extensible object.
         if !extensible {
@@ -6178,6 +6345,10 @@ mod tests {
                 .unwrap();
             assert_eq!(value.as_number(), Some(i as f64));
         }
+        // The vector is a suffix store until a consumer needs a vector
+        // POSITION, and the lazy index belongs to the whole vector, so the
+        // slot query is what builds it.
+        assert!(obj.property_slot(&PropertyKey::from_utf8("k20")).is_some());
         assert!(obj.property_index.borrow().is_some());
         // An in-place value update keeps the index valid.
         obj.set_key(&PropertyKey::from_utf8("k5"), Value::Number(500.0), false)
@@ -6679,6 +6850,18 @@ mod tests {
                 .expect("define");
         }
         assert!(
+            !(*object).drop_releases_heap(),
+            "one key past the field cap is a ONE-entry vector, still inline"
+        );
+        for i in INLINE_FIELDS + 1..INLINE_FIELDS + INLINE_PROPS + 2 {
+            object
+                .create_data_property_key(
+                    &PropertyKey::from_utf8(&format!("k{i}")),
+                    Value::Number(1.0),
+                )
+                .expect("define");
+        }
+        assert!(
             (*object).drop_releases_heap(),
             "a spilled property vector owns its buffer"
         );
@@ -6936,12 +7119,13 @@ mod tests {
     }
 
     #[test]
-    fn fifth_fresh_key_materializes_and_appends_at_the_vector_address() {
-        // The deferred state is bounded to ordinals below INLINE_FIELDS: a
-        // fifth fresh key would address the property vector at ordinal 4,
-        // which an empty vector has never pushed, so the define materializes
-        // first and appends through the standard path (the map then
-        // describes 5 keys, the 5th at offset == slot 4).
+    fn the_key_past_the_cap_starts_the_vector_at_the_cap() {
+        // The deferred state is bounded to ordinals below INLINE_FIELDS: the
+        // key at the cap addresses the property vector at that ordinal, so the
+        // vector STARTS there rather than taking a copy of the in-field head.
+        // The head stays in `in_fields`, where every positional reader below
+        // the cap already reads; a consumer that wants the whole object walks
+        // the map (`own_entry_walk`) instead.
         let obj = JsObject::ordinary_object_create(None);
         for i in 0..INLINE_FIELDS {
             assert!(obj.fresh_data_define(
@@ -6954,10 +7138,14 @@ mod tests {
         let fifth = PropertyKey::from_utf8(&format!("k{INLINE_FIELDS}"));
         assert!(obj.fresh_data_define(&fifth, Value::Number(INLINE_FIELDS as f64)));
         assert!(
-            !obj.props_deferred.get(),
-            "the overflow define materializes"
+            obj.props_deferred.get(),
+            "the in-field head is still not in the vector"
         );
-        assert_eq!(obj.properties.borrow().len(), INLINE_FIELDS + 1);
+        {
+            let props = obj.properties.borrow();
+            assert_eq!(props.base, INLINE_FIELDS, "the vector starts at the cap");
+            assert_eq!(props.len(), 1, "and holds exactly the tail");
+        }
         let (_, field) = obj.map_store_field(&fifth).unwrap();
         assert_eq!(field, INLINE_FIELDS);
         assert_eq!(obj.property_slot(&fifth), Some(INLINE_FIELDS));
@@ -7068,12 +7256,11 @@ mod tests {
     }
 
     #[test]
-    fn presize_fresh_keys_transition_then_overflow_materializes_and_appends() {
-        // A body may write keys the pattern did not record: while the map
-        // has room below INLINE_FIELDS they transition (still vector-free);
-        // a fresh key on a full map materializes the written prefix
-        // (skipping the unwritten presize holes) and appends through the
-        // standard path (its storage is the vector).
+    fn presize_fresh_keys_transition_then_overflow_starts_the_vector_at_the_cap() {
+        // A body may write keys the pattern did not record: while the map has
+        // room below INLINE_FIELDS they transition (still vector-free); a fresh
+        // key on a full map starts the vector at the cap (the tail's storage),
+        // leaving the written prefix where it is.
         let map = canonical_empty_map(None);
         let mut map = map;
         for name in ["k0", "k1"] {
@@ -7101,11 +7288,12 @@ mod tests {
             !obj.has_own_property_key(&PropertyKey::from_utf8("k1"))
                 .unwrap()
         );
-        // The map is now full (k0..k{cap-1}); a fresh key at the cap
-        // materializes the written prefix and appends vector-only.
+        // The map is now full (k0..k{cap-1}); a fresh key at the cap starts the
+        // vector there and appends the tail into it.
         let overflow = format!("k{INLINE_FIELDS}");
         assert!(obj.fresh_data_define(&PropertyKey::from_utf8(&overflow), Value::Number(99.0)));
-        assert!(!obj.props_deferred.get());
+        assert!(obj.props_deferred.get());
+        assert_eq!(obj.properties.borrow().base, INLINE_FIELDS);
         let mut expected = Vec::new();
         expected.push(PropertyKey::from_utf8("k0"));
         for i in 2..INLINE_FIELDS {
