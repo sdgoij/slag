@@ -1,0 +1,185 @@
+# The property vector becomes a suffix store (`base`)
+
+Scoped 2026-10-30, not started. Motivation, the invariant change, every reader
+that has to be decided, and the slice order. The measurement that opened this is
+in `.notes/perf.md` (the ninth property).
+
+## 1. The measurement
+
+500k iterations, one row per process, object escaping into `arr[i & 63]`:
+
+| properties | literal | per object | `new F()` | per object |
+|---:|---:|---:|---:|---:|
+| 8 | 63.1 ms | 126 ns | 213 ms | 426 ns |
+| 9 | 211.1 | 422 | 405 | 810 |
+| 10 | 238.1 | 476 | 482 | 964 |
+| 12 | 328.3 | 657 | | |
+
+The 8 -> 9 step is +296 ns for a literal, +384 for a construct; each key past it
+is ~40 ns. Both paths use the same helper, so this is the object, not the
+lowering.
+
+## 2. Why the ninth key pays
+
+`INLINE_FIELDS` is 8 (`crates/crux/src/object.rs:170`). A fresh literal adopts its
+first eight values into `in_fields` and leaves the property vector **deferred**
+(`materialize_properties`, `object.rs:3545`, rebuilds it on demand from the map
+descriptors plus `in_fields`).
+
+The ninth key's descriptor ordinal is 8, so its storage is the property vector at
+position 8, and the L1c transition discipline requires the vector position to
+equal the descriptor ordinal. The vector therefore cannot hold only the tail: it
+must be length 9 with eight entries that duplicate `in_fields`. Producing them is
+`materialize_properties`, and *every* object that grows past eight properties pays
+that copy once. It is the whole 115 ns step; the per-key ~40 ns after it is the
+ordinary generic define.
+
+So the vector is doing two jobs: it is the storage for ordinals at or above
+`INLINE_FIELDS`, and it is a **materialized cache** of the in-field head for the
+consumers that want "every own property in ordinal order".
+
+## 3. The change
+
+Give `SmallProps` a **base**: the descriptor ordinal of its first entry.
+
+```rust
+pub struct SmallProps {
+    /// The descriptor ordinal of `inline[0]`/`heap[0]`. 0 for the classic
+    /// fully-materialized vector; `INLINE_FIELDS` for an object whose in-field
+    /// head is served from `in_fields` and whose vector holds only the tail.
+    base: usize,
+    inline: [MaybeUninit<(PropertyKey, Property)>; INLINE_PROPS],
+    heap: Vec<(PropertyKey, Property)>,
+}
+```
+
+`base` is only ever 0 or `INLINE_FIELDS`. That keeps every existing branch on
+`INLINE_FIELDS` valid: a positional reader asks for an ordinal, and
+`ordinal >= INLINE_FIELDS` implies `ordinal >= base`, so the suffix lookup is the
+same arithmetic.
+
+The accessors:
+
+- `get(ordinal)` returns `None` for `ordinal < base` (the value is in
+  `in_fields`) and `heap[ordinal - base]` above it.
+- `len()` returns `base + heap.len()`, i.e. "highest ordinal + 1", so
+  `map_transition_aligned` (`object.rs:1425`, `properties.len() ==
+  map.descriptor_count()`) keeps exactly its current meaning.
+- `push(entry)` appends at `base + heap.len()`.
+- `iter()` yields `(ordinal, entry)` for the suffix only. Every caller that wants
+  the *whole* object must go through §4.4.
+
+`props_deferred` becomes derived (`base == INLINE_FIELDS && heap.is_empty()`),
+not a separate bit: one state, not two.
+
+## 4. The readers, and a decision for each
+
+### 4.1 Positional readers (no behaviour change)
+
+`map_field` (`object.rs:1385`), `map_set` (`1364`), `write_data_property_slot`,
+`map_store_field`, `set_member_slot`, `property_slot`.
+
+Each already branches on `ordinal < INLINE_FIELDS` to read `in_fields`. They route
+the other arm through `SmallProps::get`, which now honours `base`. For the shape
+this change is about, `ordinal >= 8 == base`, so the arm is unchanged; for a
+classic `base == 0` object it is also unchanged.
+
+**Decision: mechanical, no semantic change.** The one rule to write down: `None`
+from `get` means "not in the vector", never "absent": the same trap the rules
+already record for `Map::field_offset`. A caller that treats `None` as absent
+without consulting `in_fields` returns a wrong value, not a slower one.
+
+### 4.2 The Array length mirror (`object.rs:2400`, `2470`, `2750`, `2975`, `5128`)
+
+`properties.first()` / `first_mut()` is the array's length mirror at ordinal 0. An
+Array's vector always starts at 0 (the mirror is pushed by `array_create`, and
+elements never go through the vector), so these sites are unaffected.
+
+**Decision: `first()`/`first_mut()` are defined as ordinal accessors (`get(0)`)
+and the five sites gain a `debug_assert` that the receiver is an Array.** A
+non-Array reaching them would silently no-op today too, so the assert is
+information, not new behaviour.
+
+### 4.3 `map_transition_aligned` (`object.rs:1425`)
+
+Unchanged, because `len()` is defined as the highest ordinal + 1.
+
+### 4.4 Enumeration and iteration (the refactor's real surface)
+
+The sites that need "every own property, in ordinal order, with attrs": the
+`props.iter()` loops in `object.rs` (26 of them), `own_string_props`,
+`own_property_keys`, `own_string_data_keys`, `materialize_properties` itself, and
+the 18 `properties.borrow()` sites in `runtime/src/ir.rs` (`for-in` levels, the
+key/values/entries builtins, spread/assign).
+
+With `base`, the head is no longer in the vector, so these have two options:
+
+1. **Rebuild the head into a `base == 0` vector at that point.** This is what
+   `materialize_properties` does today; it becomes "rebuild, even if a tail is
+   present" (it must build a fresh `SmallProps` with `base` 0, so it cannot
+   prepend in place). The cost is the copy that is paid today, but only by a
+   consumer that enumerates, not by every define.
+2. **Walk the map for ordinals `0..base` reading `in_fields`, then the vector
+   tail.** No copy at all. `materialize_properties` already computes exactly this
+   for the head, so it is a matter of making the walk yield entries instead of
+   storing them.
+
+**Decision for the first slice: option 1.** It is a one-function change and it is
+what today's code already does, so the enumeration consumers need no edits. A
+literal that never enumerates (the measured loop, and most records) stops paying
+the copy entirely. Option 2 is a follow-up if enumeration shows up hot.
+
+### 4.5 The JIT's shape gates
+
+`INLINE_FIELDS` appears in `compiler.rs` (7), `opt_lower.rs` (3), `lib.rs` (2),
+`helpers.rs` (1), `ir.rs` (12), `jit.rs` (2), `eval.rs` (1), `function.rs` (3).
+Every one is an *in-field* gate (`offset < INLINE_FIELDS`), which `base >=
+INLINE_FIELDS` cannot contradict.
+
+**Decision: no change. Verify by reading, not by editing.**
+
+### 4.6 Tracing and the sweep
+
+`Trace for JsObject` visits `in_fields` and the vector. Fewer entries in the
+vector is still a subset of what is traced, and the head is traced through
+`in_fields`.
+
+**Decision: no change; the GC sweep is the net for a mistake here (a value that
+stops being traced is collected and shows up as a wrong value).**
+
+## 5. Slices
+
+1. **Inert `base`.** Add the field and the accessors, keep `base` always 0. Gate:
+   the corpus is byte-identical in behaviour (parity 0) and every row flat. This
+   slice is pure plumbing and must be provably inert.
+2. **The tail define stops materializing.** When a define would append an ordinal
+   at exactly `INLINE_FIELDS` on a deferred object, set `base = INLINE_FIELDS` and
+   append instead of rebuilding. `materialize_properties` learns to rebuild a
+   `base == 0` vector from any state (map head ++ suffix). Measure the 9-key
+   literal and `new F()` at 9 keys; falsifier: the literal does not reach
+   <= 300 ns/object, or `objects/spread_assign` (which enumerates) moves.
+3. **Map-walk enumeration** (option 2 of §4.4) only if a row shows the copy.
+
+## 6. Hazards
+
+- **`None` from the vector is not "absent".** Every `get` caller must fall back to
+  `in_fields` below `base`. This is the one failure mode that produces wrong
+  values rather than slow ones, and the sweeps may not catch it: a wrong-value path
+  needs a fixture that reads a 9-key literal's ordinal below 8.
+  Net it with a differential test that builds literals of 8, 9 and 16 keys and
+  reads every key back, in both tiers.
+- **`materialize_properties` cannot prepend.** A rebuild must construct a fresh
+  `SmallProps`; `debug_assert!(props.is_empty())` at `object.rs:3557` becomes
+  "empty, or a suffix that is being folded in".
+- **The length mirror** is the only ordinal-0 consumer; assert it is an Array.
+- **`props_deferred` is read in 6 places**; deriving it from `base` must keep
+  `own_string_data_keys`'s `None` contract (it declines a non-deferred object).
+
+## 7. Why not the alternatives
+
+- **Raise `INLINE_FIELDS` to 16.** Already measured as a loss on box size
+  (`.notes/perf.md`); it makes every object bigger to help the minority past 8.
+- **Batch the tail defines.** The tail is 1 key for a 9-key literal; the cost is
+  the head copy, not the number of tail keys.
+- **Key the composite shape cache on the head.** Measured: no change (the
+  one-entry transition hint already serves each fork step). Reverted.
