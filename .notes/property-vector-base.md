@@ -175,16 +175,42 @@ stops being traced is collected and shows up as a wrong value).**
 
 ## 5. Slices
 
-1. **Inert `base`.** Add the field and the accessors, keep `base` always 0. Gate:
-   the corpus is byte-identical in behaviour (parity 0) and every row flat. This
-   slice is pure plumbing and must be provably inert.
-2. **The tail define stops materializing.** When a define would append an ordinal
-   at exactly `INLINE_FIELDS` on a deferred object, set `base = INLINE_FIELDS` and
-   append instead of rebuilding. `materialize_properties` learns to rebuild a
-   `base == 0` vector from any state (map head ++ suffix). Measure the 9-key
-   literal and `new F()` at 9 keys; falsifier: the literal does not reach
-   <= 300 ns/object, or `objects/spread_assign` (which enumerates) moves.
+1. **Inert `base`.** Landed (`object.rs`: the field, `ordinal_len`, `get_ordinal`,
+the two positional call sites, and `small_props_ordinals_shift_by_the_base`).
+Gate was: inert by construction, every test and sweep green.
+2. **The tail define stops materializing.** Not started. The trigger is exact:
+   `define_fresh`'s `else` arm ("Deferred/presize with a full map and a fresh
+   key") calls `materialize_properties()` and then appends at
+   `props.len()` = vector position. It becomes "ensure the vector is a suffix
+   store at `INLINE_FIELDS`" (idempotent, so the 10th key takes it too), the
+   append keeps using the vector position, and `materialize_properties` learns
+   to rebuild a `base == 0` vector from the map head plus the suffix.
+
+   **The blocker found by the audit below**: eight ordinary-object readers use
+   the vector without materializing, so slice 2 also needs either a
+   `materialize_properties()` at their entry or a base-aware lookup. Prefer the
+   materialize call for the first cut: it cannot be wrong, and none of them is
+   on the measured path.
 3. **Map-walk enumeration** (option 2 of §4.4) only if a row shows the copy.
+
+## 5b. The audit of non-materializing readers
+
+Every `properties` access in `crux/src/object.rs` grouped by enclosing function,
+checked for a `materialize_properties()` call:
+
+| reader | sees only the tail? | disposition for slice 2 |
+|---|---|---|
+| `map_field`, `map_transition_aligned` | no | already base-aware via `get_ordinal`/`ordinal_len` |
+| `property_slot`, `delete_key`, `own_string_props`, `ordinary_own_property_keys`, `define_fresh` | no (they materialize) | unchanged |
+| `ordinary_get_own_property`, `ordinary_property_lookup`, `set_key`, `validate_and_apply`, `write_data_property`, `has_index_keyed_own_property`, `has_own_index_property`, `for_each_own_string_prop` | **yes** | add `materialize_properties()` at entry |
+| `array_define_own_property`, `array_element_write`, `array_own_property_keys`, `string_own_property_keys`, `typed_array_own_property_keys`, `typed_array_delete`, `spill_dense_array` | no | Arrays and typed arrays never reach `define_fresh`, so their vector base is always 0; assert it rather than branch |
+| `adopt_vector_free_fields`, `enter_vector_free` | no | the adopt/enter paths install the vector-free state; they must assert `base == 0` (a suffix store is not adoptable) |
+| `props_deferred` | overlapping state | derive it from `base` (deferred = `base == INLINE_FIELDS && len == 0`) or set it false on entering the suffix store; leaving both is two sources of truth for the same fact |
+
+That last row is the one that decides whether slice 2 is a 30-line change or a
+refactor: `props_deferred` and the suffix store both mean "the vector is not the
+whole story", and every consumer that tests one of them currently assumes the
+other is its complement.
 
 ## 6. Hazards
 
