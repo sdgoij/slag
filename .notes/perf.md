@@ -19965,3 +19965,58 @@ site" in the caller. The refusal census names it.
 
 Gates: fmt, `clippy --workspace --all-targets -D warnings`, `cargo test
 --workspace` 5860 pass, four sweeps 51,998 at 100%.
+
+## NULL (2026-10-30): the prototype-method splice route, and where `construct_churn` actually goes
+
+`calls/construct_churn` lifts all three bodies and still reported `0 site(s)`,
+because `sites_from_creations` bails on any body holding a `FunctionDecl`
+(`single_closure_slots` returns `None`, since a declaration writes a frame slot
+the IR does not name). So `function Item() {}` plus `Item.prototype.sum =
+function () {}` disabled EVERY creation route, including the ones that never read
+a slot.
+
+A route was built and measured: an atom the body installs a closure at in its
+entry block, matched against a call whose callee is a member read of that atom,
+behind the existing `CalleeEq` guard (sound without any proof of the chain: a
+shadowing instance property or a later prototype write makes the guard miss). It
+works. `resolve Created { create_step: 3 } -> ok`, the `Call` disappears from the
+IR, and `leaf_call_fill` goes from 1 per iteration to 0.
+
+It does not pay, because the row is construct-bound, not call-bound. Same window,
+500k iterations, four ablations:
+
+| shape | ms | per iteration |
+|---|---:|---:|
+| `s += new Item(i).sum()` | 63.9 / 62.9 | 126 ns |
+| `s += new Item(i).x` | 46.5 / 48.2 | **94 ns, all construct** |
+| `s += one.sum()` (spliced) | 17.0 / 16.6 | 33 ns, all call |
+| `var o = new Item(i); s += o.x + o.y` | 47.4 / 47.8 | 95 ns |
+
+So the construct is 94 of the 126 ns and the call is 32. Removing the call
+entirely is worth at most 25%, and in practice nothing: the leaf-call lane was
+already rebuilding the frame and calling the entry, and the spliced body pays the
+same two member reads. Route-firing against route-blocked in adjacent windows was
+57.1 against 57.9 ms median. Corpus-wide the route adds exactly ONE site (11
+`resolve` lines in total, 4 of them `-> none`), so it was reverted rather than
+landed as a heuristic in the inliner.
+
+**Machine-state caveat.** The corpus run in the same window moved node's own total
+730.6 -> 889.3 ms (+21.7%) and the same reverted source measured
+`construct_churn` at 71-75 ms where it had measured 57-59 minutes earlier. Every
+number above is a within-window pair; the absolute milliseconds in this entry are
+not comparable with other entries.
+
+**`calls/closure_capture` is not a splice target either.** `fns[i & 63](i)`
+selects among 64 closures, so no static proof names the callee, and the site is
+correctly megamorphic. It runs the env-leaf lane at 30 ns/call: the bodies capture
+`base` and `k`, so each call pays the two-field `body_context`/`lexical_env` swap
+plus a `load_context` helper per capture, whose real cost is the cache miss on the
+closure's env box. That is the lane priced at 26.6 ns earlier today; making it
+cheaper needs an inline context-slot read in machine code (env layout offsets as
+compile-time constants), which is a storage project, not a slice.
+
+**The lead this leaves.** A fresh-object construct is 94 ns against node's ~20 for
+a two-field constructor, and it is the largest single per-operation cost measured
+today. The journal already prices the pieces (the fresh-receiver chain read, the
+defines, the FFI construct cascade), so the next step there is a decomposition, not
+a guess.
