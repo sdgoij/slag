@@ -20223,3 +20223,58 @@ that is not an integral number.
 Gates: fmt, `clippy --workspace --all-targets -D warnings`, 5861 tests, four
 sweeps 51,998 at 100% (plus `built-ins --filter String/* --gc-stress`, 1223
 fixtures), corpus parity 0.
+
+## MEASURED (2026-10-30): the builtin callback lane, decomposed
+
+The four HOF rows (`opcost/array_for_each`, `map_for_each`, `typed_array_for_each`,
+`arrays/hof_methods`) are one mechanism at ~20 to 26 ms each: a builtin iterating
+a collection and calling a JS callback per element. The corpus already carries the
+control: `opcost/array_for_each_js` performs the same four calls directly from JS
+and runs at 7 ns per element, while `array_for_each` runs the same four through
+`Array.prototype.forEach` at 60 ns.
+
+Split by collection length (100k calls per row, `small.forEach(cb)`):
+
+| length | ns/call | slope |
+| ---: | ---: | ---: |
+| 1 | 107 | |
+| 2 | 151 | +44 per element |
+| 4 | 240 | +44 |
+| 8 | 461 | +55 |
+| 16 | 782 | +40 |
+
+So roughly **65 ns per `forEach` call plus 42 ns per element**. The per-element
+figure is the one that matters: a JS loop calling the same closure with the same
+three arguments (`myEach(small, cb)`, the JS equivalent) is 20.5 ns per element
+compiled, so ~22 ns of the 42 is the Rust lane's own scaffolding.
+
+Ablation (throwaway build, `SLAG_CB_SKIP` bitmask, bit set = that work skipped;
+minima of 2, baseline 69.0 ns per element):
+
+| skipped | ns/element | |
+| --- | ---: | ---: |
+| nothing | 69.0 | |
+| `globals_unshadowed` (context read + name scan) | 64.7 | **-4.3** |
+| the `global` field's per-call clear in `clean_after_leaf` | 69.2 | 0 |
+| `with_leaf_run`'s TLS push/pop | 67.2 | -1.8 |
+| the `stack.reserve` up to `stack_cap` | 68.5 | -0.5 |
+| all four | 62.1 | -6.9 |
+
+Landed from it: `globals_unshadowed` is now computed only when the body names an
+identifier, which a leaf body never does (the check existed "for uniformity only"
+because `steps_are_leaf` excludes the reference machinery). That is -3.5% on
+`forEach(cb)` and `forEach` over four elements in a same-binary pair, both rows
+under a JS loop that pays the same call.
+
+**The named next slice** is the remaining ~19 ns/element, and it is all
+`run_jit_leaf`'s per-call setup: the `stack.resize` of the frame plus working area,
+the per-slot frame-init loop, `bind_this_value`, `lookup_info_leaf`, the region
+pointer, and `clean_after_leaf`'s twelve stores. The TLS registration and the
+`reserve` are not it (measured above), and neither is the body: `--jitless` costs
+the same as the JIT on this row (25.2 against 24.0 ms), because the scaffolding,
+not the body's tier, is what dominates. The structural fix is a callback lane that
+reserves the frame segment once for the loop and rewrites only the parameter slots
+per element, which is a change to the leaf-call entry rather than a trim.
+
+Gates: fmt, `clippy --workspace --all-targets -D warnings`, 5861 tests, four
+sweeps 51,998 at 100%, corpus parity 0 (`mean-jitGap` 8.32).
