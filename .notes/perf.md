@@ -20563,3 +20563,48 @@ spread cannot separate, so treat it as an upper bound of ~2 ns).
 Verified: clippy `-D warnings`; `cargo test --workspace` 5864 pass / 0 fail;
 four sweeps at 100% (language 23726, built-ins 23821, annexB 1086, intl402
 3365); corpus parity 0.
+
+## LANDED (2026-10-31): the certified call lane, profiled by phase
+
+`SLAG_CERT_PROFILE=1` instruments `certified_lane_inline` (ten `rdtsc` marks,
+the closure profiler's shape: per-phase means with one mark pair's overhead
+subtracted, printed by the CLI after a run). On a 1M-call row (`g(x){ return
+h(x) }`, `h` a leaf, ~53 ns/call unprofiled), the shares are:
+
+| phase | ns/call | what it is |
+| --- | ---: | --- |
+| scratch+env | 19.8 | `save_scratch` (18 fields, incl. the 72-byte `Builder`), the env swap, the `Vm` field writes |
+| restore | 18.4 | the same in reverse plus the stack-cursor truncates |
+| ctx-build | 12.6 | the 28-field `JitCallContext` literal |
+| resolve | 11.5 | `ecma_function`, the body `Rc` clone, the realm read, the gates |
+| frame-fill | 11.4 | `vm.stack.resize` plus the per-slot fill |
+| callee-run | 11.2 | the callee's own machine code, including its leaf call |
+| nested-frame | 9.9 | `install_nested_frame` and the `call_args` swap |
+| this-bind | 7.8 | `OrdinaryCallBindThis` into the slot |
+| entry | 6.0 | the value decode and the depth/hook reads |
+
+The marks themselves cost ~6.6 ns each, so the column sums (108) exceed the
+unprofiled 53; the RANKING is the finding, and it says the callee's own run is
+about a fifth of a non-leaf call. The lane is memory-op bound: roughly 150
+field writes across the scratch struct, the `vm.stack` segment and the ctx.
+
+One local reduction was attempted and measured FLAT with an interleaved
+same-row A/B (old/new binaries, three rounds each, min): saving the `Builder`
+only when it is enabled (it is idle outside a planned append loop, so the
+common save moves no 72-byte struct) gave `nl3` 57.5 -> 56.5 and the head-let
+row 341.2 -> 341.1. Reverted: the struct is returned by value and spilled
+anyway, so the copy was never the cost.
+
+What this says about the frame work: emitting the carve, the ctx fill and the
+scratch save/restore in the caller's machine code would replace the struct
+traffic (a 150-byte scratch struct in, a 140-byte ctx literal, then both back)
+with ~10 register spills and ~15 direct stores, i.e. roughly half the memory
+operations. That is the ~53 -> ~30 ns estimate, and on
+`language/.../for-in/head-let-fresh-binding-per-iteration` (nine such calls per
+body, 348 ms now) it is ~100 ms of the row. It is a two-file emit change plus
+the per-depth context array, and it wants its own session: a half-emitted
+ladder would sit in the tree as a silent miscompile risk.
+
+Verified: clippy `-D warnings`; `cargo test --workspace` 5864 pass / 0 fail;
+four sweeps at 100% (language 23726, built-ins 23821, annexB 1086, intl402
+3365); corpus parity 0.

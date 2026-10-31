@@ -444,6 +444,7 @@ fn run_file_inner(file: &str, args: &[String], options: &Options, source: &str) 
         jit::dump_refusal_census();
     }
     runtime::function::dump_closure_profile();
+    runtime::jit::dump_cert_profile();
     match result {
         // A script file's completion value is not printed (matching node et
         // al.); the REPL prints its own results.
@@ -953,6 +954,7 @@ fn run_corpus(dir: &std::path::Path, jit: bool) -> Result<(), u8> {
         jit::dump_refusal_census();
     }
     runtime::function::dump_closure_profile();
+    runtime::jit::dump_cert_profile();
     // The I5a call-site probe runs in the INTERPRETER (`--jitless`), so it dumps
     // in either mode; inert unless `SLAG_FEEDBACK` is set.
     jit::dump_feedback_summary();

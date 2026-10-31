@@ -1704,7 +1704,7 @@ fn stamp() -> u64 {
 }
 
 /// Ticks per nanosecond, measured once over a ~2 ms busy wait.
-fn ticks_per_ns() -> f64 {
+pub(crate) fn ticks_per_ns() -> f64 {
     #[cfg(target_arch = "x86_64")]
     {
         static RATE: std::sync::OnceLock<f64> = std::sync::OnceLock::new();

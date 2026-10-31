@@ -2498,6 +2498,73 @@ fn certified_lane_compile(
     Some((entry, info.stack_usage, frame_size))
 }
 
+/// Whether the certified-lane phase profiler (`SLAG_CERT_PROFILE=1`) is on,
+/// read once per process.
+fn cert_profile_on() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("SLAG_CERT_PROFILE").is_ok())
+}
+
+/// The per-phase nanosecond totals of the certified lane, indexed by the slots
+/// [`dump_cert_profile`] names. A `Cell`-free atomic array: the lane can run on
+/// any thread's call stack (the engine is single-threaded per agent, but the
+/// statics are process-wide).
+static CERT_NS: [std::sync::atomic::AtomicU64; 10] = [
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+];
+static CERT_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static CERT_TOTAL_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static CERT_MARK_OVERHEAD: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Print the `SLAG_CERT_PROFILE` phase means (ns per certified call), one line
+/// per phase. The clock reads themselves cost a few ns each, so the phase
+/// totals overshoot; `mark-overhead` is the measured cost of one mark pair and
+/// is subtracted per phase.
+pub fn dump_cert_profile() {
+    let calls = CERT_CALLS.load(std::sync::atomic::Ordering::Relaxed);
+    if calls == 0 || !cert_profile_on() {
+        return;
+    }
+    let rate = crate::function::ticks_per_ns();
+    let per = |slot: usize| {
+        CERT_NS[slot].load(std::sync::atomic::Ordering::Relaxed) as f64 / calls as f64 / rate
+    };
+    let per_mark = CERT_MARK_OVERHEAD.load(std::sync::atomic::Ordering::Relaxed) as f64
+        / calls as f64
+        / rate
+        / 2.0;
+    const NAMES: [(usize, &str); 9] = [
+        (0, "entry"),
+        (1, "resolve"),
+        (2, "this-bind"),
+        (3, "scratch+env"),
+        (4, "frame-fill"),
+        (5, "nested-frame"),
+        (6, "ctx-build"),
+        (7, "callee-run"),
+        (8, "restore"),
+    ];
+    println!("cert\tcalls\t{calls}");
+    for (slot, name) in NAMES {
+        println!("cert\t{name}\t{:.1}", per(slot) - per_mark);
+    }
+    println!(
+        "cert\ttotal\t{:.1}",
+        CERT_TOTAL_NS.load(std::sync::atomic::Ordering::Relaxed) as f64 / calls as f64 / rate
+    );
+    println!("cert\tmark-overhead\t{:.1}", per_mark * 2.0);
+}
+
 /// The shared certified-body lane: a call (`construct == false`) or a base
 /// constructor (`construct == true`) to a *different* certified body runs its
 /// machine code directly on this ctx, with a nested frame carved from
@@ -2529,6 +2596,29 @@ fn certified_lane_inline(
     // the cheapest discriminator, so it comes before the depth/hook reads: the
     // lane probe runs on *every* `call_slow`, and a builtin call (a `Math`/
     // `Map`/`String` method) is the common one to reach here.
+    // Phase timing (`SLAG_CERT_PROFILE=1`): the lane is the largest single
+    // item left in the call path, and the profile is what tells the frame work
+    // where to cut. Two back-to-back marks at the end measure one mark pair,
+    // which every phase below overpays.
+    let prof = cert_profile_on();
+    let start = if prof {
+        crate::function::profile_now()
+    } else {
+        0
+    };
+    let mut mark = start;
+    macro_rules! phase {
+        ($slot:expr) => {
+            if prof {
+                let now = crate::function::profile_now();
+                CERT_NS[$slot].fetch_add(
+                    now.saturating_sub(mark),
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+                mark = now;
+            }
+        };
+    }
     let callee_value = Value::from_bits(callee);
     let ValueKind::Function(function) = callee_value.kind() else {
         return Ok(None);
@@ -2543,6 +2633,7 @@ fn certified_lane_inline(
     let Some(hook) = agent.jit_hook else {
         return Ok(None);
     };
+    phase!(0);
     // Resolve the callee's registered record in one scoped borrow: a
     // generator/async body's call/construct produces an iterator or a promise
     // rather than a run of the body. A class constructor cannot be CALLED at
@@ -2595,6 +2686,7 @@ fn certified_lane_inline(
     {
         return Ok(None);
     }
+    phase!(1);
     let Some(scope) = body.scope.as_ref() else {
         return Ok(None);
     };
@@ -2669,6 +2761,7 @@ fn certified_lane_inline(
     } else {
         None
     };
+    phase!(2);
     // The nested run reads the callee's environment, function and strictness
     // from the shared `Vm`, and a *different* body may use the shared scratch
     // registers (the `switch` discriminant, the statement-completion register,
@@ -2729,6 +2822,7 @@ fn certified_lane_inline(
             vm.args_base_stack.len(),
         )
     };
+    phase!(3);
     unsafe {
         let vm = &mut *ctx.vm;
         vm.stack.resize(buf_base + buf_len, Value::Undefined);
@@ -2758,6 +2852,7 @@ fn certified_lane_inline(
     if let (Some(slot), Some(value)) = (this_slot, this_value) {
         unsafe { *buf_ptr.add(slot) = value };
     }
+    phase!(4);
     let frame_ptr = buf_ptr as *mut c_void;
     let stack_ptr = unsafe { buf_ptr.add(frame_len) } as *mut c_void;
     let (apply_builtin_bits, call_builtin_bits) =
@@ -2788,6 +2883,7 @@ fn certified_lane_inline(
         };
         (saved, call_args)
     };
+    phase!(5);
     let global_bits = Value::Object(global).bits();
     let mut nested = JitCallContext {
         pending: false,
@@ -2828,6 +2924,7 @@ fn certified_lane_inline(
         resume_value: 0,
         gc_ticks: JIT_GC_PROBE_INTERVAL,
     };
+    phase!(6);
     agent.jit_depth += 1;
     // SAFETY: `nested` is the live per-call context the entry expects.
     let result = unsafe {
@@ -2838,6 +2935,7 @@ fn certified_lane_inline(
         )
     };
     agent.jit_depth -= 1;
+    phase!(7);
     unsafe {
         let vm = &mut *ctx.vm;
         vm.restore_nested_frame(saved_nested);
@@ -2865,6 +2963,19 @@ fn certified_lane_inline(
             vm.args_base_stack.truncate(args_base_len);
         }
         vm.restore_scratch(scratch);
+    }
+    phase!(8);
+    if prof {
+        // Two back-to-back marks measure one mark pair (see
+        // `dump_cert_profile`).
+        let a = mark;
+        let b = crate::function::profile_now();
+        CERT_MARK_OVERHEAD.fetch_add(b.saturating_sub(a), std::sync::atomic::Ordering::Relaxed);
+        CERT_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        CERT_TOTAL_NS.fetch_add(
+            b.saturating_sub(start),
+            std::sync::atomic::Ordering::Relaxed,
+        );
     }
     if nested.pending {
         return Ok(Some(slow_error(
