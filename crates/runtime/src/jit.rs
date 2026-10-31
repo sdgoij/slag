@@ -131,8 +131,21 @@ pub struct LeafInlineInfo {
     /// G13: 1 when the leaf reads its environment (context or per-iteration
     /// slots), so the compiled hit path cannot call it in-frame — the
     /// `body_context`/`lexical_env` swap has to span the call. The site takes
-    /// the env lane (`leaf_call_env`) instead.
+    /// the env lane instead.
     pub uses_env: u32,
+    /// G22: 1 when the env lane can swap the environment in machine code
+    /// (`env` holds the closure's `[[Environment]]` and the body needs no
+    /// per-call capture context or per-iteration env), so the call runs
+    /// in-frame like a plain leaf instead of through the `leaf_call_env`
+    /// round trip. 0 keeps the helper: a body that builds its own capture
+    /// context allocates, which the compiled lane cannot do.
+    pub env_inline: u32,
+    /// G22: the box address of the closure environment the in-frame swap
+    /// installs (the same representation `Vm::body_context` stores). Live
+    /// whenever the record's callee identity matches: the callee box holds
+    /// the environment edge (`Function`'s `[[Environment]]`), or the realm
+    /// roots the shared global environment.
+    pub env: u64,
 }
 
 impl LeafInlineInfo {
@@ -149,6 +162,8 @@ impl LeafInlineInfo {
             tdz_mask: 0,
             fill_ok: 0,
             uses_env: 0,
+            env_inline: 0,
+            env: 0,
         }
     }
 }
@@ -367,6 +382,11 @@ pub const VM_TRY_STACK_LEN_OFFSET: usize = std::mem::offset_of!(Vm, try_stack) +
 pub const VM_TRY_STACK_PTR_OFFSET: usize = std::mem::offset_of!(Vm, try_stack) + VEC_PTR_OFFSET;
 pub const VM_TRY_STACK_CAP_OFFSET: usize = std::mem::offset_of!(Vm, try_stack) + VEC_CAP_OFFSET;
 pub const VM_LEXICAL_ENV_OFFSET: usize = std::mem::offset_of!(Vm, lexical_env);
+/// G22: the callee activation's environment, which the compiled leaf env lane
+/// swaps around an in-frame call (the closure's `[[Environment]]` for a body
+/// that captures nothing itself). `Option<EnvRef>` is a null-optimized handle,
+/// so a copy of the field is the whole save/restore.
+pub const VM_BODY_CONTEXT_OFFSET: usize = std::mem::offset_of!(Vm, body_context);
 pub const VM_IP_OFFSET: usize = std::mem::offset_of!(Vm, ip);
 /// The fused loop's two hidden registers, which a deopt out of a compiled loop
 /// must re-publish: the compiled run keeps the counter and the Route-B
@@ -3066,6 +3086,8 @@ fn leaf_fill_info(
     entry: u64,
     stack_usage: usize,
     uses_env: bool,
+    environment: Option<crate::env::EnvRef>,
+    needs_lexical_env: bool,
 ) -> LeafInlineInfo {
     let this_slot = scope.this_slot.map_or(NO_THIS_SLOT, |slot| slot as u32);
     let (tdz_mask, fill_ok) = if scope.frame_size > TDZ_MASK_SLOTS {
@@ -3079,6 +3101,13 @@ fn leaf_fill_info(
         }
         (tdz_mask, 1)
     };
+    // A body that captures nothing itself needs no per-call activation: its
+    // `body_context` IS the closure environment, so the machine code can swap
+    // the two fields itself. A body that does capture allocates the context in
+    // `new_body_context`, and one that reads per-iteration bindings needs the
+    // `lexical_env` swap too; both stay on the helper.
+    let env = environment.map_or(0, |env| env.as_any().addr() as u64);
+    let env_inline = uses_env && env != 0 && scope.context_layout.is_empty() && !needs_lexical_env;
     LeafInlineInfo {
         entry,
         stack_usage: stack_usage as u64,
@@ -3089,6 +3118,8 @@ fn leaf_fill_info(
         tdz_mask,
         fill_ok,
         uses_env: u32::from(uses_env),
+        env_inline: u32::from(env_inline),
+        env,
     }
 }
 
@@ -3450,11 +3481,12 @@ extern "C" fn leaf_call_probe(
     // G13: a body that reads its environment (context-slot steps, or the
     // per-iteration reads) is a certified leaf like any other — the
     // interpreter's own leaf gate (`fast_call_core`) has no env condition, and
-    // `run_jit_leaf` performs the swap. The MACHINE code cannot: the
-    // `body_context`/`lexical_env` swap would have to span the in-frame call,
-    // including its error exit. So the probe records the descriptor with
-    // `uses_env` set and refuses, and the compiled hit path's env lane
-    // (`leaf_call_env`) owns the whole call.
+    // `run_jit_leaf` performs the swap. G22: when the body captures nothing
+    // itself, the swap is a pair of field stores the compiled env lane emits
+    // around the in-frame call, so the descriptor carries the environment and
+    // the site is admitted. A body that builds its own capture context has to
+    // allocate one per call, which only `leaf_call_env` can do, so that shape
+    // still records `env_inline == 0` and is rejected below.
     let uses_env = ir.leaf_uses_env;
     let info = leaf_fill_info(
         scope,
@@ -3462,6 +3494,8 @@ extern "C" fn leaf_call_probe(
         compiled.entry as u64,
         compiled.stack_usage,
         uses_env,
+        entry.environment,
+        ir.leaf_needs_env,
     );
     // The frame fill (bind `this`, room check, write slots) is identical to
     // the compiled hit path's (G14) — see `fill_leaf_frame`; a rejection there
@@ -3487,7 +3521,7 @@ extern "C" fn leaf_call_probe(
         reject!("fill-frame-failed");
     }
     cache_entry.leaf_inline = info;
-    if uses_env {
+    if uses_env && info.env_inline == 0 {
         reject!("uses-env");
     }
     compiled.entry as u64
@@ -8045,7 +8079,7 @@ mod tests {
         scope.arity = 1;
         scope.tdz_store = vec![false, true, false];
         scope.this_slot = Some(2);
-        let info = leaf_fill_info(&scope, false, 0x1234, 7, false);
+        let info = leaf_fill_info(&scope, false, 0x1234, 7, false, None, false);
         assert_eq!(info.entry, 0x1234);
         assert_eq!(info.stack_usage, 7);
         assert_eq!(info.frame_size, 3);
@@ -8056,25 +8090,64 @@ mod tests {
         assert_eq!(info.fill_ok, 1);
         assert_eq!(info.uses_env, 0);
 
-        assert_eq!(leaf_fill_info(&scope, true, 0, 0, true).strict, 1);
         assert_eq!(
-            leaf_fill_info(&scope, false, 0, 0, true).uses_env,
+            leaf_fill_info(&scope, true, 0, 0, true, None, false).strict,
+            1
+        );
+        assert_eq!(
+            leaf_fill_info(&scope, false, 0, 0, true, None, false).uses_env,
             1,
             "an env leaf must be recorded as such"
         );
         scope.this_slot = None;
         assert_eq!(
-            leaf_fill_info(&scope, false, 0, 0, false).this_slot,
+            leaf_fill_info(&scope, false, 0, 0, false, None, false).this_slot,
             NO_THIS_SLOT
         );
 
         let wide = scope_info(TDZ_MASK_SLOTS + 1);
-        let info = leaf_fill_info(&wide, false, 0, 0, false);
+        let info = leaf_fill_info(&wide, false, 0, 0, false, None, false);
         assert_eq!(
             info.fill_ok, 0,
             "a frame wider than the mask must fall back"
         );
         assert_eq!(info.tdz_mask, 0);
+    }
+
+    /// G22: the in-frame env lane is admitted only when the body needs no
+    /// per-call capture context; a body that captures allocates its own
+    /// activation, which the compiled lane cannot do, so it stays on the
+    /// `leaf_call_env` helper.
+    #[test]
+    fn an_inline_env_needs_no_per_call_context() {
+        let env = crate::env::new_declarative_environment(None);
+        let mut scope = scope_info(2);
+        let info = leaf_fill_info(&scope, false, 0, 0, true, Some(env), false);
+        assert_eq!(info.env_inline, 1, "a capture-free body swaps in-frame");
+        assert_ne!(info.env, 0);
+        assert_eq!(info.env, env.as_any().addr() as u64);
+
+        assert_eq!(
+            leaf_fill_info(&scope, false, 0, 0, true, Some(env), true).env_inline,
+            0,
+            "a per-iteration body needs the lexical_env swap"
+        );
+
+        scope.context_layout = std::rc::Rc::from([crate::env::SlotSpec::new(
+            crux::JsString::from_utf8("k"),
+            true,
+            false,
+        )]);
+        let info = leaf_fill_info(&scope, false, 0, 0, true, Some(env), false);
+        assert_eq!(
+            info.env_inline, 0,
+            "a body that captures builds a context per call"
+        );
+        assert_eq!(
+            leaf_fill_info(&scope, false, 0, 0, true, None, false).env_inline,
+            0,
+            "without an environment there is nothing to install"
+        );
     }
 
     #[test]

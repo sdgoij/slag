@@ -20440,3 +20440,47 @@ on `(map_id, name)` with the link generation gate), which is a redesign of the
 cell, not a slice, and it would pay on every method call in the corpus.
 
 Not started; recorded so the next session does not re-derive the 10 ns split.
+
+## LANDED (2026-10-31): an env-reading leaf swaps its environment in machine code
+
+A certified leaf that reads a captured binding was the one call shape the
+compiled call site could not run in-frame. The probe recorded `uses_env` and
+refused, so the site fell to the certified lane on its first visit and to
+`leaf_call_env` on every later one: a full Rust round trip per call that
+re-validated the record, rebuilt the frame, re-ran `leaf_lookup` (a `RefCell`
+borrow of `ecma_functions` plus the map lookup), built the body context and
+swapped two `Vm` fields. Measured cost, 1M calls:
+
+| probe | before | after |
+| --- | ---: | ---: |
+| leaf, no env (control) | 5.9 ms | 5.9 ms |
+| leaf writing a captured binding | 23.7 ms | 13.4 ms |
+| leaf reading a captured binding | 19.8 ms | 8.6 ms |
+
+`leaf_fill_info` now records the closure environment and an `env_inline`
+verdict: the body captures nothing itself (`context_layout` empty) and reads no
+per-iteration head, so `new_body_context` would return the closure environment
+unchanged and the whole activation is two field stores. The env lane splits on
+that verdict: `env_inline` calls the entry directly exactly like the plain
+in-frame lane, wrapping the call in a save/store/call/restore of
+`Vm::body_context`; everything else (a body that builds a capture context, or
+one that reads per-iteration bindings) keeps `leaf_call_env`.
+
+Two details the slice depends on. The probe path must take the same tail: the
+first call at a site is `LeafCallProbe`'s return, not a cached record hit, and
+emitting a plain call there ran the leaf against the caller's environment
+(found as an `unreachable!("a context slot without a capture-context env")` on
+`calls/closure_capture`; the probe now branches on the verdict it just
+recorded). And the saved handle rides a Cranelift spill slot across the call,
+which the collector's conservative native-stack scan covers, exactly like the
+helper's Rust local; `--gc-stress` over four env-call shapes returns the same
+values as the plain run.
+
+Corpus: `calls/closure_capture` 34.5 -> 19.4 ms. `opcost/js_call` and every
+env-free call row are unchanged, as is the builtin callback lane
+(`opcost/array_for_each` 23.7), which is Rust-initiated and does not use this
+path.
+
+Verified: clippy `-D warnings` clean; `cargo test --workspace` 5864 pass / 0
+fail; four sweeps at 100% (language 23726, built-ins 23821, annexB 1086,
+intl402 3365); corpus parity 0, `mean-jitGap` 8.14.

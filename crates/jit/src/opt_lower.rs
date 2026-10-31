@@ -23,7 +23,7 @@ use runtime::ir::{
 use runtime::jit::{
     AGENT_REALM_COUNT_OFFSET, CertifiedInlineInfo, DISPATCH_DEOPT, GlobalValueCell, HELPER_COUNT,
     JIT_GC_PROBE_INTERVAL, JIT_HELPER_COUNTS, JitCallContext, LEAF_CALL_RECORD_SHIFT,
-    LeafCallRecord, LeafInlineInfo, VM_ASYNC_FOR_OF_STACK_LEN_OFFSET,
+    LeafCallRecord, LeafInlineInfo, VM_ASYNC_FOR_OF_STACK_LEN_OFFSET, VM_BODY_CONTEXT_OFFSET,
     VM_COMPLETION_IS_EMPTY_OFFSET, VM_COMPLETION_OFFSET, VM_DESTRUCTURE_STACK_LEN_OFFSET,
     VM_ENV_STACK_LEN_OFFSET, VM_FOR_IN_STACK_LEN_OFFSET, VM_FOR_OF_BOUNDARIES_LEN_OFFSET,
     VM_FOR_OF_STACK_LEN_OFFSET, VM_IP_OFFSET, VM_LOOP_COUNTER_OFFSET, VM_LOOP_NUM_OFFSET,
@@ -5116,6 +5116,51 @@ fn emit_leaf_call_tail(
     emit_leaf_result_tail(builder, abi, result, value, merge);
 }
 
+/// G22: the same in-frame call as [`emit_leaf_call_tail`], with the callee's
+/// environment swapped into `Vm::body_context` for its duration. The record's
+/// environment is the closure's `[[Environment]]` (a body that captures
+/// nothing itself needs no activation of its own), so the swap is a copy of
+/// one null-optimized handle: read the caller's, store the callee's, call, and
+/// put the caller's back before the result tail runs (the tail's error exit is
+/// after the restore). The saved handle sits in a Cranelift spill slot across
+/// the call, which the collector's conservative native-stack scan covers,
+/// exactly like the helper's Rust local.
+#[allow(clippy::too_many_arguments)]
+fn emit_leaf_env_call_tail(
+    builder: &mut FunctionBuilder,
+    abi: &Abi,
+    entry: ClifValue,
+    frame_ptr: ClifValue,
+    stack_ptr: ClifValue,
+    cache: ClifValue,
+    value: Variable,
+    merge: Block,
+) {
+    let vm = builder.ins().load(
+        types::I64,
+        MemFlagsData::new(),
+        abi.vm,
+        Offset32::new(std::mem::offset_of!(JitCallContext, vm) as i32),
+    );
+    let env = builder.ins().load(
+        types::I64,
+        MemFlagsData::new(),
+        cache,
+        Offset32::new(leaf_inline_offset(std::mem::offset_of!(LeafInlineInfo, env)) as i32),
+    );
+    let context = Offset32::new(VM_BODY_CONTEXT_OFFSET as i32);
+    let saved = builder
+        .ins()
+        .load(types::I64, MemFlagsData::new(), vm, context);
+    builder.ins().store(MemFlagsData::new(), env, vm, context);
+    let inst = builder
+        .ins()
+        .call_indirect(abi.sig_entry, entry, &[frame_ptr, stack_ptr, abi.vm]);
+    let result = builder.func.dfg.inst_results(inst)[0];
+    builder.ins().store(MemFlagsData::new(), saved, vm, context);
+    emit_leaf_result_tail(builder, abi, result, value, merge);
+}
+
 /// Land a leaf call's result: check the pending byte (a throwing leaf slow path
 /// bails the whole body), then bind the result to `value` and jump to `merge`.
 /// The opt IR has no sp to restore, so this is the per-step result tail minus
@@ -5395,10 +5440,26 @@ fn emit_leaf_call(
     let stack_ptr = builder.ins().iadd(frame_base, frame_bytes);
     emit_leaf_call_tail(builder, abi, filled, frame_base, stack_ptr, value, merge);
 
-    // The env lane: the helper rebuilds the frame and performs the whole
-    // call in one round trip (a separate fill would only add an FFI
-    // boundary; the non-aliased in-frame lane still uses it).
+    // The env lane. G22: a leaf whose body builds no per-call capture context
+    // swaps the record's environment into the ctx in machine code around the
+    // in-frame call, so it pays the plain call's cost plus two field stores.
+    // Anything else (a body that builds a capture context, or one that reads
+    // per-iteration bindings) keeps the helper, which rebuilds the frame and
+    // performs the whole call in one round trip.
     builder.switch_to_block(env_lane);
+    let env_inline = builder.ins().load(
+        types::I32,
+        MemFlagsData::new(),
+        cache,
+        Offset32::new(leaf_inline_offset(std::mem::offset_of!(LeafInlineInfo, env_inline)) as i32),
+    );
+    let env_inline = builder.ins().icmp_imm_u(IntCC::NotEqual, env_inline, 0);
+    let env_swap = builder.create_block();
+    let env_helper = builder.create_block();
+    builder
+        .ins()
+        .brif(env_inline, env_swap, &[], env_helper, &[]);
+    builder.switch_to_block(env_helper);
     let result = call_helper(
         builder,
         helpers,
@@ -5413,6 +5474,105 @@ fn emit_leaf_call(
     builder.ins().brif(env_failed, cert, &[], env_done, &[]);
     builder.switch_to_block(env_done);
     emit_leaf_result_tail(builder, abi, result, value, merge);
+
+    // The in-frame env lane: the plain lane's aliased/fill split, with the env
+    // swap around the entry call. The record's environment is read only after
+    // the callee-id check (`leaf_swap_env_tail` loads it), exactly like the
+    // plain lane guards its cached entry.
+    builder.switch_to_block(env_swap);
+    let callee_ptr = builder.ins().imul_imm_s(payload, 16);
+    let live_id = builder.ins().load(
+        types::I64,
+        MemFlagsData::new(),
+        callee_ptr,
+        Offset32::new(crux::function::Function::ID_OFFSET as i32),
+    );
+    let cached_id = builder.ins().load(
+        types::I64,
+        MemFlagsData::new(),
+        cache,
+        Offset32::new(std::mem::offset_of!(LeafCallRecord, callee_id) as i32),
+    );
+    let id_ok = builder.ins().icmp(IntCC::Equal, live_id, cached_id);
+    let env_id_ok = builder.create_block();
+    builder.ins().brif(id_ok, env_id_ok, &[], probe_block, &[]);
+    builder.switch_to_block(env_id_ok);
+    let frame_size = builder.ins().load(
+        types::I32,
+        MemFlagsData::new(),
+        cache,
+        Offset32::new(leaf_inline_offset(std::mem::offset_of!(LeafInlineInfo, frame_size)) as i32),
+    );
+    let arity = builder.ins().load(
+        types::I32,
+        MemFlagsData::new(),
+        cache,
+        Offset32::new(leaf_inline_offset(std::mem::offset_of!(LeafInlineInfo, arity)) as i32),
+    );
+    let fs_eq_ar = builder.ins().icmp(IntCC::Equal, frame_size, arity);
+    let frame_size_64 = builder.ins().uextend(types::I64, frame_size);
+    let argc_ge_fs = builder
+        .ins()
+        .icmp(IntCC::UnsignedLessThanOrEqual, frame_size_64, argc);
+    let aliased = builder.ins().band(fs_eq_ar, argc_ge_fs);
+    let env_room = builder.create_block();
+    let env_not_aliased = builder.create_block();
+    builder
+        .ins()
+        .brif(aliased, env_room, &[], env_not_aliased, &[]);
+    builder.switch_to_block(env_room);
+    let stack_usage = builder.ins().load(
+        types::I64,
+        MemFlagsData::new(),
+        cache,
+        Offset32::new(leaf_inline_offset(std::mem::offset_of!(LeafInlineInfo, stack_usage)) as i32),
+    );
+    let fits = emit_leaf_room_check(builder, abi, args_ptr, argc, stack_usage);
+    let env_inline_call = builder.create_block();
+    builder.ins().brif(fits, env_inline_call, &[], cert, &[]);
+    builder.switch_to_block(env_inline_call);
+    let frame_bytes = builder.ins().imul_imm_s(frame_size_64, 8);
+    let stack_ptr = builder.ins().iadd(args_ptr, frame_bytes);
+    emit_leaf_env_call_tail(
+        builder,
+        abi,
+        cached_entry,
+        args_ptr,
+        stack_ptr,
+        cache,
+        value,
+        merge,
+    );
+    builder.switch_to_block(env_not_aliased);
+    let fill_ok = builder.ins().load(
+        types::I32,
+        MemFlagsData::new(),
+        cache,
+        Offset32::new(leaf_inline_offset(std::mem::offset_of!(LeafInlineInfo, fill_ok)) as i32),
+    );
+    let fill_ok = builder.ins().icmp_imm_u(IntCC::NotEqual, fill_ok, 0);
+    let env_fill = builder.create_block();
+    builder.ins().brif(fill_ok, env_fill, &[], cert, &[]);
+    builder.switch_to_block(env_fill);
+    let filled = call_helper(
+        builder,
+        helpers,
+        abi,
+        abi.sig_call_slow,
+        Helper::LeafCallFill,
+        &[callee, this, args_ptr, argc, slot],
+    )?;
+    let fill_hit = builder.ins().icmp_imm_u(IntCC::NotEqual, filled, 0);
+    let env_filled = builder.create_block();
+    builder.ins().brif(fill_hit, env_filled, &[], cert, &[]);
+    builder.switch_to_block(env_filled);
+    let argc_bytes = builder.ins().imul_imm_s(argc, 8);
+    let frame_base = builder.ins().iadd(args_ptr, argc_bytes);
+    let frame_bytes = builder.ins().imul_imm_s(frame_size_64, 8);
+    let stack_ptr = builder.ins().iadd(frame_base, frame_bytes);
+    emit_leaf_env_call_tail(
+        builder, abi, filled, frame_base, stack_ptr, cache, value, merge,
+    );
 
     // The probe: the full validation, lookups and frame fill; it records the
     // cache identity so repeat visits skip it.
@@ -5458,7 +5618,27 @@ fn emit_leaf_call(
     let frame_ptr = builder.ins().select(aliased, args_ptr, args_top);
     let frame_bytes = builder.ins().imul_imm_s(frame_size_64, 8);
     let stack_ptr = builder.ins().iadd(frame_ptr, frame_bytes);
+    // The probe just recorded the verdict, so the first call takes the lane
+    // the cached hit path would: an env-inline leaf needs the same env swap
+    // here, or its captured reads would resolve against the caller.
+    let probe_env = builder.ins().load(
+        types::I32,
+        MemFlagsData::new(),
+        cache,
+        Offset32::new(leaf_inline_offset(std::mem::offset_of!(LeafInlineInfo, env_inline)) as i32),
+    );
+    let probe_env = builder.ins().icmp_imm_u(IntCC::NotEqual, probe_env, 0);
+    let probe_swap = builder.create_block();
+    let probe_plain = builder.create_block();
+    builder
+        .ins()
+        .brif(probe_env, probe_swap, &[], probe_plain, &[]);
+    builder.switch_to_block(probe_plain);
     emit_leaf_call_tail(builder, abi, probe, frame_ptr, stack_ptr, value, merge);
+    builder.switch_to_block(probe_swap);
+    emit_leaf_env_call_tail(
+        builder, abi, probe, frame_ptr, stack_ptr, cache, value, merge,
+    );
 
     // C1: the certified-callee lane. It runs only when the record carries a
     // certified verdict (a nonzero entry); the helper re-validates the record
