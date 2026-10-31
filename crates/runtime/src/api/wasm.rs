@@ -34,6 +34,12 @@ impl CompiledWasmModule {
     pub fn module(&self) -> &Module {
         &self.module
     }
+
+    /// Wrap a decoded module, which is the engine's table form of one: what a
+    /// module object's `[[Module]]` slot holds.
+    pub(crate) fn from_module(module: Module) -> Self {
+        Self { module }
+    }
 }
 
 /// A module object (`v8::WasmModuleObject`).
@@ -79,7 +85,7 @@ impl WasmModuleObject {
                 .wasm_modules
                 .get(&object.id())
                 .cloned()
-                .map(|module| CompiledWasmModule { module })
+                .map(CompiledWasmModule::from_module)
                 .ok_or_else(not_a_module)
         })
     }

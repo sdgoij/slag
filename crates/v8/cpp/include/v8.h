@@ -410,6 +410,75 @@ class Object : public Value {
   }
 };
 
+/* A contiguous run of memory (`v8::MemorySpan`), the shape
+ * `WasmModuleObject::Compile` takes. */
+template <class T>
+class MemorySpan {
+ public:
+  MemorySpan() = default;
+  MemorySpan(T* data, size_t size) : data_(data), size_(size) {}
+
+  T* data() const { return data_; }
+  size_t size() const { return size_; }
+  T* begin() const { return data_; }
+  T* end() const { return data_ + size_; }
+  T& operator[](size_t index) const { return data_[index]; }
+
+ private:
+  T* data_ = nullptr;
+  size_t size_ = 0;
+};
+
+/* A decoded WebAssembly module (`v8::CompiledWasmModule`). The engine's compiled
+ * form is plain data, so this owns a box the facade frees; it is move-only. */
+class CompiledWasmModule {
+ public:
+  CompiledWasmModule() = default;
+  CompiledWasmModule(CompiledWasmModule&& other) noexcept
+      : module_(other.module_) {
+    other.module_ = nullptr;
+  }
+  CompiledWasmModule& operator=(CompiledWasmModule&& other) noexcept {
+    if (this != &other) {
+      Reset();
+      module_ = other.module_;
+      other.module_ = nullptr;
+    }
+    return *this;
+  }
+  ~CompiledWasmModule() { Reset(); }
+
+  CompiledWasmModule(const CompiledWasmModule&) = delete;
+  CompiledWasmModule& operator=(const CompiledWasmModule&) = delete;
+
+  bool is_null() const { return module_ == nullptr; }
+
+ private:
+  friend class WasmModuleObject;
+  explicit CompiledWasmModule(SlagWasmModule* module) : module_(module) {}
+
+  void Reset() {
+    if (module_ != nullptr) {
+      slag_wasm_module_free(module_);
+      module_ = nullptr;
+    }
+  }
+
+  SlagWasmModule* module_ = nullptr;
+};
+
+/* A WebAssembly module object (`v8::WasmModuleObject`): the object
+ * `WebAssembly.Module` answers, compiled here or made from a decoded module. */
+class WasmModuleObject : public Object {
+ public:
+  static MaybeLocal<WasmModuleObject> Compile(
+      Isolate* isolate, MemorySpan<const uint8_t> wire_bytes);
+  static MaybeLocal<WasmModuleObject> FromCompiledModule(
+      Isolate* isolate, const CompiledWasmModule& module);
+
+  CompiledWasmModule GetCompiledModule();
+};
+
 /* A block of buffer bytes (`v8::BackingStore`). The facade's store is a handle
  * to the engine's refcounted block, so a store taken from a buffer keeps the
  * bytes alive after the object that named them is gone. A new store is owned by

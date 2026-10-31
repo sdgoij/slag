@@ -937,6 +937,24 @@ has the compiler and the interpreter, and `hello-world` already runs WebAssembly
 through `WebAssembly.instantiate`, so the work is the C++ shape over
 `runtime::wasm`, not a new compiler.
 
+*WebAssembly (2026-10-31).* The module half landed. The engine's
+`builtins::wasm::compile_module_value` already answers the object
+`WebAssembly.Module` constructs, so `WasmModuleObject::Compile` is a thin wrap
+and the harness proves the result is the JS-API's object by instantiating it
+from a script and calling `add(3, 4)`. `CompiledWasmModule` is a move-only owner
+of a `SlagWasmModule` box; the box holds `api::CompiledWasmModule`, which is
+plain data, so `GetCompiledModule` clones it out of the agent's table and
+`FromCompiledModule` wraps it back into a fresh module object. `MemorySpan`
+needed a local definition (`v8-sandbox.h`'s is a template the facade does not
+otherwise need), and it is the shape Blink's `base::as_bytes(...)` produces.
+
+The absence worth stating is the wire bytes: the engine decodes into structures
+and keeps none, so `CompiledWasmModule` has no `GetWireBytesRef`, the same
+divergence `.notes/embedding.md` §12 item 10 records for the Rust bridge.
+`WasmInstanceObject`, `WasmMemoryObject`, and `WasmStreaming` are the rest of
+`v8-wasm.h` and are not in this slice; a script instantiates through the JS API,
+which is what the harness and `hello-world` both do.
+
 The ABI shape is roughly a struct of up to seven C function pointers, the data
 pointer, and the flags, handed over once per template, with the return codes
 `Intercepted` already defines; the callbacks receive a `PropertyCallbackInfo`

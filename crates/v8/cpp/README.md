@@ -360,6 +360,17 @@ the run drains the job queues so a synchronous body is `kEvaluated` when it
 returns. Modules are pinned records and are never freed, like scripts and
 templates.
 
+### WebAssembly
+
+`WasmModuleObject::Compile(isolate, MemorySpan<const uint8_t>)` decodes and
+validates wire bytes into the object `WebAssembly.Module` answers, so a script's
+`new WebAssembly.Instance(module)` accepts what the host compiled.
+`GetCompiledModule` answers the decoded module as a `CompiledWasmModule` (a
+move-only owner of the engine's plain-data module, `is_null()` until read), and
+`FromCompiledModule` makes another module object from it, so a host can carry a
+compiled module between objects or isolates. `MemorySpan<T>` is the minimal
+`v8::MemorySpan` shape.
+
 ### Buffers and typed arrays
 
 `BackingStore` is a handle to the engine's refcounted byte block, so a store
@@ -469,6 +480,9 @@ not a claim that gin itself links.
 - `Source`/`ScriptCompiler::CompileModule` and the `Module` surface: status,
   exception, namespace, requests, identity hash, kind predicates, the host
   resolver through `InstantiateModule`, `Evaluate`, and `SourceOffsetToLocation`.
+  - `WasmModuleObject::Compile`, `GetCompiledModule`, `FromCompiledModule`, and
+    `CompiledWasmModule`, over `MemorySpan<const uint8_t>` and the engine's
+    WebAssembly decoder.
 - Handles and persistents as engine roots: a handle slot or a `Global` over an
   engine value retains it for that object's lifetime, and a facade pointer is
   never registered.
@@ -526,6 +540,10 @@ not a claim that gin itself links.
   `NoCacheReason` are accepted and ignored (there is no code cache), and
   `Module::GetModuleRequests` as a `FixedArray` is not exposed; the length and
   index forms are.
+- `WasmInstanceObject`, `WasmMemoryObject`, and `WasmStreaming` are absent: the
+  module object and its compiled form are the whole C++ surface so far, while a
+  script instantiates through the JS API. `CompiledWasmModule` carries no wire
+  bytes, so `GetWireBytesRef` is absent rather than wrong.
 - `Platform` is a handle plus a message pump: `PumpMessageLoop` runs the
   isolate's queued jobs (microtasks, promise reactions, due timers) and answers
   whether it ran any. There are no host-posted platform tasks or task runners
@@ -604,4 +622,6 @@ value alive without calling back; it then checks the GC hooks around requested
 collections and their removal, and the heap statistics against a live buffer.
 The module block compiles a dependency and a main module, resolves the import
 through a file-scope callback, checks the request list, links, evaluates, and
-reads the export from the namespace.
+reads the export from the namespace. The WebAssembly block compiles the sample's
+`add` module, reads its decoded module back, makes a second module object from
+it, binds it, and calls the export through a script's `WebAssembly.Instance`.

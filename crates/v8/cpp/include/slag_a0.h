@@ -324,6 +324,17 @@ int32_t slag_module_evaluate(SlagContext* context, const SlagModule* module,
 int32_t slag_module_namespace(SlagContext* context, const SlagModule* module,
                               uint64_t* out);
 
+/* WebAssembly module objects and their decoded modules (`v8::WasmModuleObject`
+ * and `v8::CompiledWasmModule`). */
+typedef struct SlagWasmModule SlagWasmModule;
+int32_t slag_wasm_compile(SlagContext* context, const uint8_t* wire_bytes,
+                          size_t wire_len, uint64_t* out);
+int32_t slag_wasm_get_compiled(SlagContext* context, uint64_t object,
+                               SlagWasmModule** out);
+int32_t slag_wasm_from_compiled(SlagContext* context,
+                                const SlagWasmModule* compiled, uint64_t* out);
+void slag_wasm_module_free(SlagWasmModule* compiled);
+
 int32_t slag_collect(SlagContext* context);
 int64_t slag_value_to_utf8(uint64_t value, char* buffer, size_t len);
 int64_t slag_value_to_utf8_context(SlagContext* context, uint64_t value,

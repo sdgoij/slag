@@ -35,6 +35,7 @@ use crux::typed_array::SharedBuffer;
 use crux::value::{Value, ValueKind};
 
 use crate::agent::Agent;
+use crate::api::CompiledWasmModule;
 use crate::context::to_string as js_to_string;
 use crate::host::HostHooks;
 use crate::module::SourceTextModule;
@@ -1307,6 +1308,35 @@ impl Context {
     /// The module's namespace object (spec 16.2.1.10).
     pub fn module_namespace(&mut self, module: &JsModule) -> Result<JsValue, JsError> {
         crate::module::module_namespace(&mut self.agent, &module.module).map(JsValue)
+    }
+
+    /// Compile `wire_bytes` into a `WebAssembly.Module` object
+    /// (`v8::WasmModuleObject::Compile`): decode, validate, and answer the
+    /// object the JS-API's own constructor answers.
+    pub fn compile_wasm_module(&mut self, wire_bytes: &[u8]) -> Result<JsValue, JsError> {
+        crate::builtins::wasm::compile_module_value(&mut self.agent, wire_bytes).map(JsValue)
+    }
+
+    /// The decoded module a `WebAssembly.Module` object carries
+    /// (`WasmModuleObject::GetCompiledModule`).
+    pub fn wasm_compiled_module(&mut self, value: &JsValue) -> Result<CompiledWasmModule, JsError> {
+        let object = value.0.as_object().ok_or_else(wasm_not_a_module)?;
+        self.agent
+            .wasm_modules
+            .get(&object.id())
+            .cloned()
+            .map(CompiledWasmModule::from_module)
+            .ok_or_else(wasm_not_a_module)
+    }
+
+    /// A module object for an already decoded module
+    /// (`WasmModuleObject::FromCompiledModule`).
+    pub fn wasm_module_object(
+        &mut self,
+        compiled: &CompiledWasmModule,
+    ) -> Result<JsValue, JsError> {
+        crate::builtins::wasm::module_object(&mut self.agent, compiled.module().clone())
+            .map(JsValue)
     }
 
     /// A typed array over `buffer` (`v8::Uint8Array::New` and its siblings).
@@ -3026,6 +3056,15 @@ impl JsModule {
     }
 }
 
+/// The failure a compiled-module read reports for a value that is not a
+/// `WebAssembly.Module` object, which is V8's own `ApiCheck` reason.
+fn wasm_not_a_module() -> JsError {
+    JsError::new(
+        ErrorKind::TypeError,
+        "a value that is not a WebAssembly.Module object".into(),
+    )
+}
+
 /// The geometry of a typed array view, or `None` when the value is not one.
 /// Reads only the object's own slots, so it needs no agent and answers inside a
 /// host callback.
@@ -3499,6 +3538,36 @@ mod tests {
         context.set_global("ns", namespace).unwrap();
         assert_eq!(context.eval("ns.doubled").unwrap().as_number(), Some(84.0));
         assert!(main.identity_hash() != 0);
+    }
+
+    #[test]
+    fn wasm_modules_compile_and_round_trip() {
+        // (func (export "add") (param i32 i32) (result i32) local.get 0
+        //   local.get 1 i32.add), the module V8's own sample carries.
+        const ADD: &[u8] = &[
+            0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00, 0x01, 0x07, 0x01, 0x60, 0x02, 0x7f,
+            0x7f, 0x01, 0x7f, 0x03, 0x02, 0x01, 0x00, 0x07, 0x07, 0x01, 0x03, 0x61, 0x64, 0x64,
+            0x00, 0x00, 0x0a, 0x09, 0x01, 0x07, 0x00, 0x20, 0x00, 0x20, 0x01, 0x6a, 0x0b,
+        ];
+        let mut context = Context::new().unwrap();
+        let module = context.compile_wasm_module(ADD).unwrap();
+        assert!(context.value_type_mask(&module) & VALUE_OBJECT != 0);
+
+        let compiled = context.wasm_compiled_module(&module).unwrap();
+        let again = context.wasm_module_object(&compiled).unwrap();
+        context.set_global("m", again).unwrap();
+        assert_eq!(
+            context
+                .eval("new WebAssembly.Instance(m).exports.add(3, 4)")
+                .unwrap()
+                .as_number(),
+            Some(7.0)
+        );
+
+        // A value that is not a module object is the engine's TypeError, not a
+        // panic.
+        let not_a_module = context.eval("({})").unwrap();
+        assert!(context.wasm_compiled_module(&not_a_module).is_err());
     }
 
     #[test]

@@ -1628,6 +1628,40 @@ Location Module::SourceOffsetToLocation(int offset) const {
   return location;
 }
 
+MaybeLocal<WasmModuleObject> WasmModuleObject::Compile(
+    Isolate*, MemorySpan<const uint8_t> wire_bytes) {
+  SlagContext* slag = CurrentSlagContext();
+  if (slag == nullptr) return MaybeLocal<WasmModuleObject>();
+  uint64_t out = 0;
+  if (slag_wasm_compile(slag, wire_bytes.data(), wire_bytes.size(), &out) != 0) {
+    return MaybeLocal<WasmModuleObject>();
+  }
+  return MaybeLocal<WasmModuleObject>(Local<WasmModuleObject>::New(out));
+}
+
+MaybeLocal<WasmModuleObject> WasmModuleObject::FromCompiledModule(
+    Isolate*, const CompiledWasmModule& module) {
+  SlagContext* slag = CurrentSlagContext();
+  if (slag == nullptr || module.module_ == nullptr) {
+    return MaybeLocal<WasmModuleObject>();
+  }
+  uint64_t out = 0;
+  if (slag_wasm_from_compiled(slag, module.module_, &out) != 0) {
+    return MaybeLocal<WasmModuleObject>();
+  }
+  return MaybeLocal<WasmModuleObject>(Local<WasmModuleObject>::New(out));
+}
+
+CompiledWasmModule WasmModuleObject::GetCompiledModule() {
+  SlagContext* slag = CurrentSlagContext();
+  SlagWasmModule* compiled = nullptr;
+  if (slag == nullptr ||
+      slag_wasm_get_compiled(slag, Raw(this), &compiled) != 0) {
+    return CompiledWasmModule();
+  }
+  return CompiledWasmModule(compiled);
+}
+
 bool TryCatch::HasCaught() const {
   auto* context = reinterpret_cast<Context*>(
       static_cast<uintptr_t>(g_current_context));

@@ -1886,6 +1886,70 @@ int main() {
            "an offset maps to a 0-based location");
   }
 
+  // WebAssembly: compile wire bytes into a module object, read its decoded
+  // module back, and instantiate it from a script.
+  {
+    v8::HandleScope scope(isolate);
+    v8::Local<v8::Context> current = context.Get(isolate);
+    v8::Context::Scope context_scope(current);
+    const auto expect = [&](bool condition, const char* what) {
+      if (!condition) {
+        fprintf(stderr, "wasm: %s\n", what);
+        ++failures;
+      }
+    };
+    const auto bind = [&](const char* name, v8::Local<v8::Value> value) {
+      current->Global()
+          ->Set(current, v8::String::NewFromUtf8Literal(isolate, name), value)
+          .ToChecked();
+    };
+    const auto number_at = [&](const char* name) {
+      return current->Global()
+          ->Get(current, v8::String::NewFromUtf8Literal(isolate, name))
+          .ToLocalChecked()
+          ->Int32Value(current)
+          .FromMaybe(-1);
+    };
+
+    // (func (export "add") (param i32 i32) (result i32) local.get 0
+    //   local.get 1 i32.add), the module V8's own sample carries.
+    const uint8_t wasm[] = {
+        0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00, 0x01, 0x07, 0x01,
+        0x60, 0x02, 0x7f, 0x7f, 0x01, 0x7f, 0x03, 0x02, 0x01, 0x00, 0x07,
+        0x07, 0x01, 0x03, 0x61, 0x64, 0x64, 0x00, 0x00, 0x0a, 0x09, 0x01,
+        0x07, 0x00, 0x20, 0x00, 0x20, 0x01, 0x6a, 0x0b};
+    v8::Local<v8::WasmModuleObject> module;
+    expect(v8::WasmModuleObject::Compile(
+               isolate, v8::MemorySpan<const uint8_t>(wasm, sizeof(wasm)))
+               .ToLocal(&module),
+           "a wasm module compiled");
+    expect(module->IsObject() &&
+               module.As<v8::Object>()
+                   ->Get(current,
+                         v8::String::NewFromUtf8Literal(isolate, "toString"))
+                   .ToLocalChecked()
+                   ->IsFunction(),
+           "a wasm module object is an object");
+
+    v8::CompiledWasmModule compiled = module->GetCompiledModule();
+    expect(!compiled.is_null(), "a module object answers its compiled module");
+    v8::Local<v8::WasmModuleObject> again;
+    expect(v8::WasmModuleObject::FromCompiledModule(isolate, compiled)
+                   .ToLocal(&again) &&
+               again->IsObject(),
+           "a decoded module makes another module object");
+
+    bind("wasmModule", module);
+    v8::Script::Compile(
+        current, v8::String::NewFromUtf8Literal(
+                     isolate,
+                     "globalThis.wasmAnswer ="
+                     " new WebAssembly.Instance(wasmModule).exports.add(3, 4);"))
+        .ToLocalChecked()
+        ->Run(current);
+    expect(number_at("wasmAnswer") == 7, "the instantiated export ran");
+  }
+
   // A host-traced reference: a root the C++ side owns and releases. Once it
   // handle scope pops, the object is reachable only through the reference.
   {

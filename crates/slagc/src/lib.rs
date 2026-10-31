@@ -96,6 +96,12 @@ pub struct SlagModule {
     module: JsModule,
 }
 
+/// A decoded WebAssembly module (`v8::CompiledWasmModule`): plain data the host
+/// can carry between module objects.
+pub struct SlagWasmModule {
+    compiled: slag::api::CompiledWasmModule,
+}
+
 /// A host-traced root (`v8::TracedReference<T>`): the engine keeps the value
 /// alive until the host frees this box, which is what the C++ handle's `Reset`
 /// and destructor do.
@@ -1340,6 +1346,115 @@ pub unsafe extern "C" fn slag_module_evaluate(
             record(context, error);
             1
         }
+    }
+}
+
+/// Compile `wire_bytes` into a `WebAssembly.Module` object
+/// (`v8::WasmModuleObject::Compile`). A decode or validation failure records
+/// the `CompileError` the JS-API would report and answers 1.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn slag_wasm_compile(
+    context: *mut SlagContext,
+    wire_bytes: *const u8,
+    wire_len: usize,
+    out: *mut u64,
+) -> i32 {
+    let Some(context) = context.as_mut() else {
+        return 2;
+    };
+    let compiled = {
+        let Ok(mut engine) = context.context.try_borrow_mut() else {
+            reentrant(context);
+            return 1;
+        };
+        engine.compile_wasm_module(bytes(wire_bytes, wire_len))
+    };
+    match compiled {
+        Ok(value) => {
+            if !out.is_null() {
+                *out = value.to_bits();
+            }
+            0
+        }
+        Err(error) => {
+            record(context, error);
+            1
+        }
+    }
+}
+
+/// The decoded module behind a module object
+/// (`WasmModuleObject::GetCompiledModule`), boxed for the host to hold.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn slag_wasm_get_compiled(
+    context: *mut SlagContext,
+    object: u64,
+    out: *mut *mut SlagWasmModule,
+) -> i32 {
+    let Some(context) = context.as_mut() else {
+        return 2;
+    };
+    let compiled = {
+        let Ok(mut engine) = context.context.try_borrow_mut() else {
+            reentrant(context);
+            return 1;
+        };
+        engine.wasm_compiled_module(&JsValue::from_bits(object))
+    };
+    match compiled {
+        Ok(compiled) => {
+            if !out.is_null() {
+                *out = Box::into_raw(Box::new(SlagWasmModule { compiled }));
+            }
+            0
+        }
+        Err(error) => {
+            record(context, error);
+            1
+        }
+    }
+}
+
+/// A module object carrying `compiled`
+/// (`WasmModuleObject::FromCompiledModule`).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn slag_wasm_from_compiled(
+    context: *mut SlagContext,
+    compiled: *const SlagWasmModule,
+    out: *mut u64,
+) -> i32 {
+    let Some(context) = context.as_mut() else {
+        return 2;
+    };
+    let Some(compiled) = compiled.as_ref() else {
+        return 2;
+    };
+    let created = {
+        let Ok(mut engine) = context.context.try_borrow_mut() else {
+            reentrant(context);
+            return 1;
+        };
+        engine.wasm_module_object(&compiled.compiled)
+    };
+    match created {
+        Ok(value) => {
+            if !out.is_null() {
+                *out = value.to_bits();
+            }
+            0
+        }
+        Err(error) => {
+            record(context, error);
+            1
+        }
+    }
+}
+
+/// Release a compiled-module box (`v8::CompiledWasmModule`'s destructor).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn slag_wasm_module_free(compiled: *mut SlagWasmModule) {
+    if !compiled.is_null() {
+        drop(Box::from_raw(compiled));
     }
 }
 
