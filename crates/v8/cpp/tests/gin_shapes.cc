@@ -450,6 +450,22 @@ void Sum(const v8::FunctionCallbackInfo<v8::Value>& info) {
   info.GetReturnValue().Set(v8::Integer::New(info.GetIsolate(), total));
 }
 
+// A host function that builds and settles a capability from inside the call,
+// which is what a binding's promise-returning accessor does: the resolver and
+// the promise operations all run through the callback's window there.
+void MakePromise(const v8::FunctionCallbackInfo<v8::Value>& info) {
+  v8::Isolate* isolate = info.GetIsolate();
+  v8::Local<v8::Context> context = isolate->GetCurrentContext();
+  v8::Local<v8::Promise::Resolver> resolver;
+  if (!v8::Promise::Resolver::New(context).ToLocal(&resolver)) return;
+  const int32_t value = NumberArg(info, 0);
+  if (!resolver->Resolve(context, v8::Integer::New(isolate, value))
+           .FromMaybe(false)) {
+    return;
+  }
+  info.GetReturnValue().Set(resolver->GetPromise());
+}
+
 }  // namespace
 
 int main() {
@@ -1512,6 +1528,120 @@ int main() {
              "a throwing valueOf left the conversion empty");
       expect(throwing.HasCaught(), "the throw reached the host");
     }
+  }
+
+  // Promises: the resolver pair, the derived promise, and the state and result a
+  // host reads.
+  {
+    v8::HandleScope scope(isolate);
+    v8::Local<v8::Context> current = context.Get(isolate);
+    v8::Context::Scope context_scope(current);
+    const auto expect = [&](bool condition, const char* what) {
+      if (!condition) {
+        fprintf(stderr, "promises: %s\n", what);
+        ++failures;
+      }
+    };
+    const auto run = [&](const char* source) {
+      return v8::Script::Compile(
+                 current, v8::String::NewFromUtf8Literal(isolate, source))
+          .ToLocalChecked()
+          ->Run(current)
+          .ToLocalChecked();
+    };
+    const auto number_at = [&](const char* name) {
+      return current->Global()
+          ->Get(current, v8::String::NewFromUtf8Literal(isolate, name))
+          .ToLocalChecked()
+          ->Int32Value(current)
+          .FromMaybe(-1);
+    };
+
+    v8::Local<v8::Promise::Resolver> resolver =
+        v8::Promise::Resolver::New(current).ToLocalChecked();
+    v8::Local<v8::Promise> promise = resolver->GetPromise();
+    expect(!promise.IsEmpty() && promise->State() == v8::Promise::kPending,
+           "a fresh resolver's promise is pending");
+    expect(promise->Result()->IsUndefined(),
+           "a pending promise's result is undefined");
+
+    expect(resolver->Resolve(current, v8::Integer::New(isolate, 7))
+               .FromMaybe(false),
+           "Resolve settled the promise");
+    expect(promise->State() == v8::Promise::kFulfilled,
+           "the promise is fulfilled");
+    expect(promise->Result()->Int32Value(current).FromMaybe(-1) == 7,
+           "Result answered the settled value");
+
+    // The pair shares one flag, so neither side settles it twice, and V8's
+    // answer says which call did the work.
+    expect(!resolver->Resolve(current, v8::Integer::New(isolate, 8))
+                .FromMaybe(true),
+           "a second Resolve did not settle it again");
+    expect(!resolver->Reject(current, v8::String::NewFromUtf8Literal(isolate, "no"))
+                .FromMaybe(true),
+           "Reject after Resolve did not settle it either");
+    expect(promise->Result()->Int32Value(current).FromMaybe(-1) == 7,
+           "the first settlement is the one that stands");
+
+    // A rejection keeps its reason, and marking it handled is what a host does
+    // with a rejection it is not reacting to.
+    v8::Local<v8::Promise::Resolver> rejecter =
+        v8::Promise::Resolver::New(current).ToLocalChecked();
+    expect(rejecter->Reject(current, v8::String::NewFromUtf8Literal(isolate, "no"))
+               .FromMaybe(false),
+           "Reject settled the promise");
+    v8::Local<v8::Promise> rejected_promise = rejecter->GetPromise();
+    expect(rejected_promise->State() == v8::Promise::kRejected,
+           "the promise is rejected");
+    expect(!rejected_promise->MarkAsHandled().IsNothing(),
+           "MarkAsHandled answered");
+
+    // Then2 derives a promise through the engine's own PerformPromiseThen.
+    v8::Local<v8::Promise::Resolver> source =
+        v8::Promise::Resolver::New(current).ToLocalChecked();
+    v8::Local<v8::Function> on_fulfilled =
+        run("(function (value) { globalThis.promiseSaw = value; return value + 1; })")
+            .As<v8::Function>();
+    v8::Local<v8::Promise> derived =
+        source->GetPromise()
+            ->Then2(current, on_fulfilled, v8::Local<v8::Function>())
+            .ToLocalChecked();
+    expect(source->Resolve(current, v8::Integer::New(isolate, 41))
+               .FromMaybe(false),
+           "the source resolved");
+    isolate->PerformMicrotaskCheckpoint();
+    expect(number_at("promiseSaw") == 41, "the host handler ran");
+    expect(derived->State() == v8::Promise::kFulfilled,
+           "the derived promise fulfilled");
+    expect(derived->Result()->Int32Value(current).FromMaybe(-1) == 42,
+           "the derived promise carries the handler's answer");
+
+    // Catch is the same call with the fulfilling side left to the default.
+    v8::Local<v8::Function> on_rejected =
+        run("(function (reason) { return 5; })").As<v8::Function>();
+    v8::Local<v8::Promise> caught =
+        rejected_promise->Catch(current, on_rejected).ToLocalChecked();
+    isolate->PerformMicrotaskCheckpoint();
+    expect(caught->State() == v8::Promise::kFulfilled,
+           "Catch settled the derived promise");
+    expect(caught->Result()->Int32Value(current).FromMaybe(-1) == 5,
+           "the rejection handler ran");
+
+    // A host function that builds and settles a capability inside the call, which
+    // is what a promise-returning accessor does.
+    v8::Local<v8::ObjectTemplate> tmpl = v8::ObjectTemplate::New(isolate);
+    tmpl->Set(isolate, "makePromise",
+              v8::FunctionTemplate::New(isolate, MakePromise));
+    v8::Local<v8::Object> host = tmpl->NewInstance(current).ToLocalChecked();
+    current->Global()
+        ->Set(current, v8::String::NewFromUtf8Literal(isolate, "host"), host)
+        .ToChecked();
+    run("host.makePromise(99).then(function (value) {"
+        " globalThis.callbackPromise = value; });");
+    isolate->PerformMicrotaskCheckpoint();
+    expect(number_at("callbackPromise") == 99,
+           "a callback made and settled a promise");
   }
 
   // Errors, private names, and the data-property forms: the values a host

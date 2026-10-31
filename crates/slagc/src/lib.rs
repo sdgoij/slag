@@ -32,7 +32,7 @@ use crux::value::{Value, ValueKind};
 use slag::api::{Local as EngineLocal, Traced};
 use slag::{
     CallbackWindow, CompiledScript, Context, ErrorKind, FunctionCall, HostFn, JsError, JsModule,
-    JsValue, OwnProperty,
+    JsValue, OwnProperty, PromiseHandles, PromiseState,
 };
 
 /// The isolate a host enters. The engine's contexts are the state; this token
@@ -61,6 +61,32 @@ pub struct SlagContext {
     /// A host callback publishes it as its token so it can allocate through the
     /// operation that is running (see [`slag_callback_token`]).
     agent: crux::function::AgentPtr,
+    /// The capabilities a host holds a resolving function for
+    /// (`v8::Promise::Resolver`), keyed by that function's identity. The engine's
+    /// own record names the pair by the same identity but keeps no value for the
+    /// rejecting function, so this is where a handle names it back. The promise
+    /// and the resolving function are roots for as long as an entry exists, which
+    /// is what keeps the key from ever naming another function.
+    resolvers: RefCell<std::collections::HashMap<u64, Resolver>>,
+}
+
+/// One capability a `v8::Promise::Resolver` handle names: the promise it settles
+/// and the pair's rejecting function (`0` once the pair has fired, which is when
+/// neither function can run again).
+struct Resolver {
+    promise: u64,
+    reject: u64,
+}
+
+impl Drop for SlagContext {
+    fn drop(&mut self) {
+        for (_, resolver) in self.resolvers.get_mut().drain() {
+            slag_root_release(resolver.promise);
+            if resolver.reject != 0 {
+                slag_root_release(resolver.reject);
+            }
+        }
+    }
 }
 
 /// Where a pending error came from, when a compile could name it: the host's
@@ -1021,6 +1047,7 @@ pub extern "C" fn slag_context_new(_isolate: *mut SlagIsolate) -> *mut SlagConte
                 context: RefCell::new(context),
                 pending_error: Rc::new(RefCell::new(None)),
                 agent,
+                resolvers: RefCell::new(std::collections::HashMap::new()),
             }))
         }
         Err(_) => std::ptr::null_mut(),
@@ -2826,6 +2853,427 @@ pub unsafe extern "C" fn slag_callback_value_to_integer(
     convert_to_integer(context, token, value, out)
 }
 
+/// The promise operations, on whichever route a call takes: the ordinary engine
+/// borrow, or the running callback's window (a host callback holds the engine
+/// mutably, so only its window can run one).
+trait PromiseOps {
+    fn capability(&mut self) -> Result<PromiseHandles, JsError>;
+    fn then(
+        &mut self,
+        promise: JsValue,
+        on_fulfilled: JsValue,
+        on_rejected: JsValue,
+    ) -> Result<JsValue, JsError>;
+    fn settle(&mut self, function: JsValue, value: JsValue) -> Result<bool, JsError>;
+    fn state(&mut self, promise: JsValue) -> Result<PromiseState, JsError>;
+    fn result(&mut self, promise: JsValue) -> Result<JsValue, JsError>;
+    fn mark_handled(&mut self, promise: JsValue) -> Result<(), JsError>;
+}
+
+impl PromiseOps for Context {
+    fn capability(&mut self) -> Result<PromiseHandles, JsError> {
+        Context::promise_capability(self)
+    }
+
+    fn then(
+        &mut self,
+        promise: JsValue,
+        on_fulfilled: JsValue,
+        on_rejected: JsValue,
+    ) -> Result<JsValue, JsError> {
+        Context::promise_then(self, promise, on_fulfilled, on_rejected)
+    }
+
+    fn settle(&mut self, function: JsValue, value: JsValue) -> Result<bool, JsError> {
+        Context::promise_settle(self, function, value)
+    }
+
+    fn state(&mut self, promise: JsValue) -> Result<PromiseState, JsError> {
+        Context::promise_state(self, promise)
+    }
+
+    fn result(&mut self, promise: JsValue) -> Result<JsValue, JsError> {
+        Context::promise_result(self, promise)
+    }
+
+    fn mark_handled(&mut self, promise: JsValue) -> Result<(), JsError> {
+        Context::promise_mark_handled(self, promise)
+    }
+}
+
+impl PromiseOps for CallbackWindow {
+    fn capability(&mut self) -> Result<PromiseHandles, JsError> {
+        CallbackWindow::promise_capability(self)
+    }
+
+    fn then(
+        &mut self,
+        promise: JsValue,
+        on_fulfilled: JsValue,
+        on_rejected: JsValue,
+    ) -> Result<JsValue, JsError> {
+        CallbackWindow::promise_then(self, promise, on_fulfilled, on_rejected)
+    }
+
+    fn settle(&mut self, function: JsValue, value: JsValue) -> Result<bool, JsError> {
+        CallbackWindow::promise_settle(self, function, value)
+    }
+
+    fn state(&mut self, promise: JsValue) -> Result<PromiseState, JsError> {
+        CallbackWindow::promise_state(self, promise)
+    }
+
+    fn result(&mut self, promise: JsValue) -> Result<JsValue, JsError> {
+        CallbackWindow::promise_result(self, promise)
+    }
+
+    fn mark_handled(&mut self, promise: JsValue) -> Result<(), JsError> {
+        CallbackWindow::promise_mark_handled(self, promise)
+    }
+}
+
+/// Run one promise operation on the route `token` names: a running callback's
+/// window when there is one, the engine otherwise. `Err` is an ABI status, with
+/// the error already recorded.
+unsafe fn promise_call<T>(
+    context: *mut SlagContext,
+    token: *const c_void,
+    body: impl FnOnce(&mut dyn PromiseOps) -> Result<T, JsError>,
+) -> Result<T, i32> {
+    let Some(current) = context.as_ref() else {
+        return Err(2);
+    };
+    if token.is_null() {
+        let Ok(mut engine) = current.context.try_borrow_mut() else {
+            reentrant(current);
+            return Err(1);
+        };
+        body(&mut *engine).map_err(|error| {
+            record(current, error);
+            1
+        })
+    } else {
+        let Some(mut window) = CallbackWindow::admit(token) else {
+            return Err(2);
+        };
+        body(&mut window).map_err(|error| {
+            record(current, error);
+            1
+        })
+    }
+}
+
+/// The identity of a JS function value, which is what a resolver is keyed by.
+fn function_id(bits: u64) -> Option<u64> {
+    Value::from_bits(bits)
+        .as_function()
+        .map(|function| function.id())
+}
+
+unsafe fn new_resolver(
+    context: *mut SlagContext,
+    token: *const c_void,
+    out_resolver: *mut u64,
+    out_promise: *mut u64,
+) -> i32 {
+    let handles = match promise_call(context, token, |ops| ops.capability()) {
+        Ok(handles) => handles,
+        Err(status) => return status,
+    };
+    let promise = handles.promise.to_bits();
+    let resolve = handles.resolve.to_bits();
+    let reject = handles.reject.to_bits();
+    if let Some(id) = function_id(resolve) {
+        slag_root_retain(promise);
+        slag_root_retain(resolve);
+        slag_root_retain(reject);
+        (*context)
+            .resolvers
+            .borrow_mut()
+            .insert(id, Resolver { promise, reject });
+    }
+    if !out_resolver.is_null() {
+        *out_resolver = resolve;
+    }
+    if !out_promise.is_null() {
+        *out_promise = promise;
+    }
+    0
+}
+
+unsafe fn resolver_settle(
+    context: *mut SlagContext,
+    token: *const c_void,
+    resolver: u64,
+    value: u64,
+    reject: i32,
+    settled: *mut i32,
+) -> i32 {
+    let Some(current) = context.as_ref() else {
+        return 2;
+    };
+    let Some(id) = function_id(resolver) else {
+        return 2;
+    };
+    let function = match current.resolvers.borrow().get(&id) {
+        Some(entry) if reject != 0 => entry.reject,
+        Some(_) => resolver,
+        None => return 2,
+    };
+    if function == 0 {
+        // The pair has already fired, so neither function can run again.
+        if !settled.is_null() {
+            *settled = 0;
+        }
+        return 0;
+    }
+    match promise_call(context, token, |ops| {
+        ops.settle(JsValue::from_bits(function), JsValue::from_bits(value))
+    }) {
+        Ok(answer) => {
+            if answer {
+                let released = (*context)
+                    .resolvers
+                    .borrow_mut()
+                    .get_mut(&id)
+                    .map(|entry| std::mem::replace(&mut entry.reject, 0))
+                    .unwrap_or(0);
+                if released != 0 {
+                    slag_root_release(released);
+                }
+            }
+            if !settled.is_null() {
+                *settled = i32::from(answer);
+            }
+            0
+        }
+        Err(status) => status,
+    }
+}
+
+unsafe fn promise_state_of(context: *mut SlagContext, token: *const c_void, promise: u64) -> i32 {
+    match promise_call(context, token, |ops| ops.state(JsValue::from_bits(promise))) {
+        Ok(PromiseState::Pending) => 0,
+        Ok(PromiseState::Fulfilled) => 1,
+        Ok(PromiseState::Rejected) => 2,
+        Err(status) => -status,
+    }
+}
+
+unsafe fn promise_result_of(
+    context: *mut SlagContext,
+    token: *const c_void,
+    promise: u64,
+    out: *mut u64,
+) -> i32 {
+    match promise_call(context, token, |ops| {
+        ops.result(JsValue::from_bits(promise))
+    }) {
+        Ok(value) => {
+            if !out.is_null() {
+                *out = value.to_bits();
+            }
+            0
+        }
+        Err(status) => status,
+    }
+}
+
+unsafe fn promise_mark(context: *mut SlagContext, token: *const c_void, promise: u64) -> i32 {
+    match promise_call(context, token, |ops| {
+        ops.mark_handled(JsValue::from_bits(promise))
+    }) {
+        Ok(()) => 0,
+        Err(status) => status,
+    }
+}
+
+unsafe fn promise_then_of(
+    context: *mut SlagContext,
+    token: *const c_void,
+    promise: u64,
+    on_fulfilled: u64,
+    on_rejected: u64,
+    out: *mut u64,
+) -> i32 {
+    let derived = match promise_call(context, token, |ops| {
+        ops.then(
+            JsValue::from_bits(promise),
+            JsValue::from_bits(on_fulfilled),
+            JsValue::from_bits(on_rejected),
+        )
+    }) {
+        Ok(derived) => derived,
+        Err(status) => return status,
+    };
+    if !out.is_null() {
+        *out = derived.to_bits();
+    }
+    0
+}
+
+/// `v8::Promise::Resolver::New`: the pair's resolving function (which is the
+/// resolver handle) and the promise it settles.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn slag_promise_new_resolver(
+    context: *mut SlagContext,
+    out_resolver: *mut u64,
+    out_promise: *mut u64,
+) -> i32 {
+    new_resolver(context, std::ptr::null(), out_resolver, out_promise)
+}
+
+/// [`slag_promise_new_resolver`] inside a running callback.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn slag_callback_promise_new_resolver(
+    context: *mut SlagContext,
+    token: *const c_void,
+    out_resolver: *mut u64,
+    out_promise: *mut u64,
+) -> i32 {
+    new_resolver(context, token, out_resolver, out_promise)
+}
+
+/// The promise a resolver settles (`v8::Promise::Resolver::GetPromise`). Returns
+/// 2 when the value is not a resolver this facade minted.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn slag_promise_resolver_promise(
+    context: *mut SlagContext,
+    resolver: u64,
+    out: *mut u64,
+) -> i32 {
+    let Some(current) = context.as_ref() else {
+        return 2;
+    };
+    let Some(id) = function_id(resolver) else {
+        return 2;
+    };
+    let promise = match current.resolvers.borrow().get(&id) {
+        Some(entry) => entry.promise,
+        None => return 2,
+    };
+    if !out.is_null() {
+        *out = promise;
+    }
+    0
+}
+
+/// `v8::Promise::Resolver::Resolve` (`reject` 0) or `Reject` (`reject` 1),
+/// answering through `settled` whether this call settled the promise: a pair
+/// that already fired is a no-op, which is what V8's answer reports.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn slag_promise_resolver_settle(
+    context: *mut SlagContext,
+    resolver: u64,
+    value: u64,
+    reject: i32,
+    settled: *mut i32,
+) -> i32 {
+    resolver_settle(context, std::ptr::null(), resolver, value, reject, settled)
+}
+
+/// [`slag_promise_resolver_settle`] inside a running callback.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn slag_callback_promise_resolver_settle(
+    context: *mut SlagContext,
+    token: *const c_void,
+    resolver: u64,
+    value: u64,
+    reject: i32,
+    settled: *mut i32,
+) -> i32 {
+    resolver_settle(context, token, resolver, value, reject, settled)
+}
+
+/// A promise's state (`v8::Promise::State`): 0 pending, 1 fulfilled, 2 rejected,
+/// -1 when the value is not a promise (with a pending error), -2 for a bad
+/// argument.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn slag_promise_state(context: *mut SlagContext, promise: u64) -> i32 {
+    promise_state_of(context, std::ptr::null(), promise)
+}
+
+/// [`slag_promise_state`] inside a running callback.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn slag_callback_promise_state(
+    context: *mut SlagContext,
+    token: *const c_void,
+    promise: u64,
+) -> i32 {
+    promise_state_of(context, token, promise)
+}
+
+/// A promise's result (`v8::Promise::Result`), *undefined* while pending.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn slag_promise_result(
+    context: *mut SlagContext,
+    promise: u64,
+    out: *mut u64,
+) -> i32 {
+    promise_result_of(context, std::ptr::null(), promise, out)
+}
+
+/// [`slag_promise_result`] inside a running callback.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn slag_callback_promise_result(
+    context: *mut SlagContext,
+    token: *const c_void,
+    promise: u64,
+    out: *mut u64,
+) -> i32 {
+    promise_result_of(context, token, promise, out)
+}
+
+/// `v8::Promise::MarkAsHandled`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn slag_promise_mark_handled(context: *mut SlagContext, promise: u64) -> i32 {
+    promise_mark(context, std::ptr::null(), promise)
+}
+
+/// [`slag_promise_mark_handled`] inside a running callback.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn slag_callback_promise_mark_handled(
+    context: *mut SlagContext,
+    token: *const c_void,
+    promise: u64,
+) -> i32 {
+    promise_mark(context, token, promise)
+}
+
+/// The derived promise of `promise.then(on_fulfilled, on_rejected)`
+/// (`v8::Promise::Then2`). A side the host did not give is *undefined*, which the
+/// engine reads as "no handler".
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn slag_promise_then(
+    context: *mut SlagContext,
+    promise: u64,
+    on_fulfilled: u64,
+    on_rejected: u64,
+    out: *mut u64,
+) -> i32 {
+    promise_then_of(
+        context,
+        std::ptr::null(),
+        promise,
+        on_fulfilled,
+        on_rejected,
+        out,
+    )
+}
+
+/// [`slag_promise_then`] inside a running callback.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn slag_callback_promise_then(
+    context: *mut SlagContext,
+    token: *const c_void,
+    promise: u64,
+    on_fulfilled: u64,
+    on_rejected: u64,
+    out: *mut u64,
+) -> i32 {
+    promise_then_of(context, token, promise, on_fulfilled, on_rejected, out)
+}
+
 /// A symbol's description (`v8::Private::Name`), or `undefined` when it has
 /// none. Answers 2 when the value is not a symbol.
 #[unsafe(no_mangle)]
@@ -4120,6 +4568,167 @@ mod tests {
                 "the surrogate's own three bytes and the A"
             );
             assert_eq!(utf8[..4], [0xED, 0xA0, 0x80, b'A']);
+        }
+    }
+
+    #[test]
+    fn a_promise_resolver_settles_once_through_the_abi() {
+        unsafe {
+            let isolate = slag_isolate_new();
+            let context = slag_context_new(isolate);
+            assert!(!context.is_null());
+
+            let mut resolver = 0;
+            let mut promise = 0;
+            assert_eq!(
+                slag_promise_new_resolver(context, &mut resolver, &mut promise),
+                0
+            );
+            assert_ne!(resolver, 0);
+            assert_ne!(promise, 0);
+            assert_eq!(slag_promise_state(context, promise), 0);
+
+            let mut read_back = 0;
+            assert_eq!(
+                slag_promise_resolver_promise(context, resolver, &mut read_back),
+                0
+            );
+            assert_eq!(read_back, promise);
+
+            // A pending promise's result is undefined.
+            let mut result = 0;
+            assert_eq!(slag_promise_result(context, promise, &mut result), 0);
+            assert_eq!(slag_value_is_undefined(result), 1);
+
+            let mut settled = -1;
+            assert_eq!(
+                slag_promise_resolver_settle(
+                    context,
+                    resolver,
+                    slag_number_new(7.0),
+                    0,
+                    &mut settled
+                ),
+                0
+            );
+            assert_eq!(settled, 1, "the first call settles it");
+            assert_eq!(slag_promise_state(context, promise), 1);
+            assert_eq!(slag_promise_result(context, promise, &mut result), 0);
+            assert_eq!(slag_value_to_number(result), 7.0);
+
+            // The pair shares one flag, so neither side settles it again.
+            assert_eq!(
+                slag_promise_resolver_settle(
+                    context,
+                    resolver,
+                    slag_number_new(8.0),
+                    0,
+                    &mut settled
+                ),
+                0
+            );
+            assert_eq!(settled, 0);
+            assert_eq!(
+                slag_promise_resolver_settle(
+                    context,
+                    resolver,
+                    slag_number_new(9.0),
+                    1,
+                    &mut settled
+                ),
+                0
+            );
+            assert_eq!(settled, 0);
+            assert_eq!(slag_promise_state(context, promise), 1);
+            assert_eq!(slag_promise_result(context, promise, &mut result), 0);
+            assert_eq!(slag_value_to_number(result), 7.0);
+
+            slag_context_free(context);
+            slag_isolate_free(isolate);
+        }
+    }
+
+    #[test]
+    fn a_then_derives_a_promise_and_mark_handled_keeps_a_rejection_quiet() {
+        unsafe {
+            let isolate = slag_isolate_new();
+            let context = slag_context_new(isolate);
+            assert!(!context.is_null());
+
+            let source = b"(function (value) { return value * 2; })";
+            let mut handler = 0;
+            assert_eq!(
+                slag_eval(context, source.as_ptr(), source.len(), &mut handler),
+                0
+            );
+
+            let mut resolver = 0;
+            let mut promise = 0;
+            assert_eq!(
+                slag_promise_new_resolver(context, &mut resolver, &mut promise),
+                0
+            );
+            let mut derived = 0;
+            assert_eq!(
+                slag_promise_then(context, promise, handler, slag_undefined(), &mut derived),
+                0
+            );
+
+            let mut settled = 0;
+            assert_eq!(
+                slag_promise_resolver_settle(
+                    context,
+                    resolver,
+                    slag_number_new(21.0),
+                    0,
+                    &mut settled
+                ),
+                0
+            );
+            assert_eq!(settled, 1);
+            assert_ne!(slag_drain_jobs(context), -1);
+
+            let mut result = 0;
+            assert_eq!(slag_promise_state(context, derived), 1);
+            assert_eq!(slag_promise_result(context, derived, &mut result), 0);
+            assert_eq!(slag_value_to_number(result), 42.0);
+
+            // A rejection keeps its reason, and marking it handled succeeds.
+            let mut rejected = 0;
+            let mut reason = 0;
+            assert_eq!(
+                slag_promise_new_resolver(context, &mut rejected, &mut reason),
+                0
+            );
+            let mut settled = 0;
+            assert_eq!(
+                slag_promise_resolver_settle(
+                    context,
+                    rejected,
+                    slag_string_new(b"no".as_ptr(), 2),
+                    1,
+                    &mut settled
+                ),
+                0
+            );
+            assert_eq!(settled, 1);
+            assert_eq!(slag_promise_state(context, reason), 2);
+            assert_eq!(slag_promise_mark_handled(context, reason), 0);
+
+            // A value that is not a promise is refused with a pending error.
+            assert_eq!(slag_promise_state(context, slag_number_new(1.0)), -1);
+            let mut message = [0 as std::ffi::c_char; 64];
+            assert!(slag_pending_error(context, message.as_mut_ptr(), message.len()) > 0);
+            assert!(
+                std::ffi::CStr::from_ptr(message.as_ptr())
+                    .to_str()
+                    .expect("utf8")
+                    .contains("promise")
+            );
+            slag_clear_error(context);
+
+            slag_context_free(context);
+            slag_isolate_free(isolate);
         }
     }
 

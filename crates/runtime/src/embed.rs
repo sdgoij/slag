@@ -397,6 +397,187 @@ impl CallbackWindow {
     ) -> Result<Option<OwnProperty>, JsError> {
         own_property_kind_with(crate::context::callback_agent(self.agent)?, object, key)
     }
+
+    /// A fresh capability in the running realm (the re-entrant counterpart of
+    /// [`Context::promise_capability`]).
+    pub fn promise_capability(&self) -> Result<PromiseHandles, JsError> {
+        promise_capability(crate::context::callback_agent(self.agent)?)
+    }
+
+    /// A derived promise (the re-entrant counterpart of
+    /// [`Context::promise_then`]).
+    pub fn promise_then(
+        &self,
+        promise: JsValue,
+        on_fulfilled: JsValue,
+        on_rejected: JsValue,
+    ) -> Result<JsValue, JsError> {
+        promise_then(
+            crate::context::callback_agent(self.agent)?,
+            promise,
+            on_fulfilled,
+            on_rejected,
+        )
+    }
+
+    /// Settle a resolver (the re-entrant counterpart of
+    /// [`Context::promise_settle`]).
+    pub fn promise_settle(&self, function: JsValue, value: JsValue) -> Result<bool, JsError> {
+        promise_settle(crate::context::callback_agent(self.agent)?, function, value)
+    }
+
+    /// A promise's state (the re-entrant counterpart of
+    /// [`Context::promise_state`]).
+    pub fn promise_state(&self, promise: JsValue) -> Result<PromiseState, JsError> {
+        promise_state(crate::context::callback_agent(self.agent)?, promise)
+    }
+
+    /// A promise's result (the re-entrant counterpart of
+    /// [`Context::promise_result`]).
+    pub fn promise_result(&self, promise: JsValue) -> Result<JsValue, JsError> {
+        promise_result(crate::context::callback_agent(self.agent)?, promise)
+    }
+
+    /// Mark a promise handled (the re-entrant counterpart of
+    /// [`Context::promise_mark_handled`]).
+    pub fn promise_mark_handled(&self, promise: JsValue) -> Result<(), JsError> {
+        promise_mark_handled(crate::context::callback_agent(self.agent)?, promise)
+    }
+}
+
+/// The three values a capability is made of (`v8::Promise::Resolver`): the
+/// promise and the two resolving functions. The engine keys a pair by the
+/// functions' identity, so a host that holds only the resolving one can still
+/// name the other through this.
+pub struct PromiseHandles {
+    pub promise: JsValue,
+    pub resolve: JsValue,
+    pub reject: JsValue,
+}
+
+/// A promise's state (`v8::PromiseState`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PromiseState {
+    Pending,
+    Fulfilled,
+    Rejected,
+}
+
+/// NewPromiseCapability (spec 27.2.1.5) over the realm's `%Promise%`, which is
+/// what `v8::Promise::Resolver::New` builds: the engine's own constructor makes
+/// the promise and the pair that settles it.
+pub fn promise_capability(agent: &mut Agent) -> Result<PromiseHandles, JsError> {
+    let constructor = agent
+        .current_realm()?
+        .intrinsics
+        .get("%Promise%")
+        .ok_or_else(no_promise)?;
+    let capability = crate::promise::new_promise_capability(agent, &constructor)?;
+    Ok(PromiseHandles {
+        promise: JsValue(capability.promise),
+        resolve: JsValue(capability.resolve),
+        reject: JsValue(capability.reject),
+    })
+}
+
+/// A derived promise (`v8::Promise::Then2`) through the engine's
+/// PerformPromiseThen (spec 27.2.5.4), so a script that replaced
+/// `Promise.prototype.then` cannot change what a host's call does.
+pub fn promise_then(
+    agent: &mut Agent,
+    promise: JsValue,
+    on_fulfilled: JsValue,
+    on_rejected: JsValue,
+) -> Result<JsValue, JsError> {
+    let constructor = agent
+        .current_realm()?
+        .intrinsics
+        .get("%Promise%")
+        .ok_or_else(no_promise)?;
+    let capability = crate::promise::new_promise_capability(agent, &constructor)?;
+    let derived = crate::promise::perform_promise_then(
+        agent,
+        &promise.into_value(),
+        Some(on_fulfilled.into_value()),
+        Some(on_rejected.into_value()),
+        Some(capability),
+    )?;
+    Ok(JsValue(derived))
+}
+
+/// Call a resolving function, answering whether *this* call settled the promise:
+/// the pair shares one [[AlreadyResolved]] flag (spec 27.2.1.3.1), so a second
+/// call is a no-op.
+pub fn promise_settle(
+    agent: &mut Agent,
+    function: JsValue,
+    value: JsValue,
+) -> Result<bool, JsError> {
+    let id = function
+        .value()
+        .as_function()
+        .map(|function| function.id())
+        .ok_or_else(|| {
+            JsError::new(
+                ErrorKind::TypeError,
+                "a promise resolver is a function".into(),
+            )
+        })?;
+    let fired_before = agent
+        .promise_resolver_data(id)
+        .map(|data| data.borrow().already_resolved.get())
+        .unwrap_or(false);
+    let args = [value.into_value()];
+    crate::function::call(agent, function.value(), Value::Undefined, &args)?;
+    Ok(!fired_before)
+}
+
+/// The promise's [[PromiseState]] (`v8::Promise::State`).
+pub fn promise_state(agent: &Agent, promise: JsValue) -> Result<PromiseState, JsError> {
+    let data = promise_data(agent, promise)?;
+    Ok(match &data.borrow().state {
+        crate::promise::PromiseState::Pending { .. } => PromiseState::Pending,
+        crate::promise::PromiseState::Fulfilled(_) => PromiseState::Fulfilled,
+        crate::promise::PromiseState::Rejected(_) => PromiseState::Rejected,
+    })
+}
+
+/// The promise's [[PromiseResult]] (`v8::Promise::Result`), *undefined* while
+/// pending.
+pub fn promise_result(agent: &Agent, promise: JsValue) -> Result<JsValue, JsError> {
+    let data = promise_data(agent, promise)?;
+    Ok(match &data.borrow().state {
+        crate::promise::PromiseState::Fulfilled(value)
+        | crate::promise::PromiseState::Rejected(value) => JsValue(*value),
+        crate::promise::PromiseState::Pending { .. } => JsValue::undefined(),
+    })
+}
+
+/// [[IsHandled]] (`v8::Promise::MarkAsHandled`): the bookkeeping a host does
+/// when it takes a rejection it is not reacting to.
+pub fn promise_mark_handled(agent: &Agent, promise: JsValue) -> Result<(), JsError> {
+    promise_data(agent, promise)?.borrow_mut().is_handled = true;
+    Ok(())
+}
+
+/// The agent's Promise Record for `promise`.
+fn promise_data(
+    agent: &Agent,
+    promise: JsValue,
+) -> Result<Rc<RefCell<crate::promise::PromiseData>>, JsError> {
+    let object = promise.as_object().ok_or_else(not_a_promise)?;
+    agent.promise_data(object.id()).ok_or_else(not_a_promise)
+}
+
+fn no_promise() -> JsError {
+    JsError::new(
+        ErrorKind::Error,
+        "the realm has no Promise constructor".into(),
+    )
+}
+
+fn not_a_promise() -> JsError {
+    JsError::new(ErrorKind::TypeError, "value is not a promise".into())
 }
 
 /// Host-defined behavior the embedding API exposes. Each callback is
@@ -907,6 +1088,47 @@ impl Context {
             ops,
             realm_object_prototype(&self.agent)?,
         )))
+    }
+
+    /// A capability in this realm (`v8::Promise::Resolver::New`): the promise
+    /// plus the resolving and rejecting functions the engine keeps a pair for.
+    pub fn promise_capability(&mut self) -> Result<PromiseHandles, JsError> {
+        promise_capability(self.agent_mut())
+    }
+
+    /// `promise.then(on_fulfilled, on_rejected)` through the engine's own
+    /// PerformPromiseThen, answering the derived promise (`v8::Promise::Then2`).
+    /// A side the host did not give is *undefined*, which the engine reads as
+    /// "no handler".
+    pub fn promise_then(
+        &mut self,
+        promise: JsValue,
+        on_fulfilled: JsValue,
+        on_rejected: JsValue,
+    ) -> Result<JsValue, JsError> {
+        promise_then(self.agent_mut(), promise, on_fulfilled, on_rejected)
+    }
+
+    /// Call a resolving function (`v8::Promise::Resolver::Resolve`/`Reject`),
+    /// answering whether this call settled the promise.
+    pub fn promise_settle(&mut self, function: JsValue, value: JsValue) -> Result<bool, JsError> {
+        promise_settle(self.agent_mut(), function, value)
+    }
+
+    /// The promise's state (`v8::Promise::State`).
+    pub fn promise_state(&self, promise: JsValue) -> Result<PromiseState, JsError> {
+        promise_state(&self.agent, promise)
+    }
+
+    /// The promise's result value (`v8::Promise::Result`): the settled value,
+    /// or *undefined* while pending.
+    pub fn promise_result(&self, promise: JsValue) -> Result<JsValue, JsError> {
+        promise_result(&self.agent, promise)
+    }
+
+    /// Mark the promise handled (`v8::Promise::MarkAsHandled`).
+    pub fn promise_mark_handled(&self, promise: JsValue) -> Result<(), JsError> {
+        promise_mark_handled(&self.agent, promise)
     }
 
     /// [[Get]] a property by the key value a host built (`v8::Object::Get`):
@@ -4884,6 +5106,69 @@ mod tests {
         );
         // The guarded window is gone, so its token names nothing.
         assert!(CallbackWindow::admit(token).is_none());
+    }
+
+    #[test]
+    fn a_promise_capability_settles_once() {
+        let mut context = Context::new().unwrap();
+        let handles = context.promise_capability().unwrap();
+        let promise = handles.promise.clone();
+        assert_eq!(
+            context.promise_state(promise.clone()).unwrap(),
+            PromiseState::Pending
+        );
+        assert_eq!(
+            context.promise_result(promise.clone()).unwrap().as_number(),
+            None
+        );
+
+        assert!(
+            context
+                .promise_settle(handles.resolve, JsValue::number(7.0))
+                .unwrap()
+        );
+        assert_eq!(
+            context.promise_state(promise.clone()).unwrap(),
+            PromiseState::Fulfilled
+        );
+        assert_eq!(
+            context.promise_result(promise.clone()).unwrap().as_number(),
+            Some(7.0)
+        );
+
+        // The pair shares one [[AlreadyResolved]] flag, so the rejecting side
+        // can no longer settle what the resolving side already did.
+        assert!(
+            !context
+                .promise_settle(handles.reject, JsValue::string("no"))
+                .unwrap()
+        );
+        assert_eq!(
+            context.promise_state(promise).unwrap(),
+            PromiseState::Fulfilled
+        );
+    }
+
+    #[test]
+    fn a_host_then_derives_a_promise() {
+        let mut context = Context::new().unwrap();
+        let handler = context.eval("(value) => value * 2").unwrap();
+        let handles = context.promise_capability().unwrap();
+        let derived = context
+            .promise_then(handles.promise, handler, JsValue::undefined())
+            .unwrap();
+        context
+            .promise_settle(handles.resolve, JsValue::number(21.0))
+            .unwrap();
+        assert!(context.drain_jobs().unwrap());
+        assert_eq!(
+            context.promise_state(derived.clone()).unwrap(),
+            PromiseState::Fulfilled
+        );
+        assert_eq!(
+            context.promise_result(derived).unwrap().as_number(),
+            Some(42.0)
+        );
     }
 
     #[test]

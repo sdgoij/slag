@@ -1043,6 +1043,25 @@ published the facade's callback token (unlike `HostTrampoline`), so a conversion
 inside such a getter or setter recorded a re-entrancy refusal; both now hold a
 `CallbackToken` for the call.
 
+*Promises (2026-11-01).* The `v8::Promise` surface landed next, on the `embed`
+API rather than in the ABI: `promise_capability`, `promise_then`,
+`promise_settle`, `promise_state`, `promise_result`, and `promise_mark_handled`
+are free functions in `crates/runtime/src/embed.rs`, each with a method on
+`Context` and a re-entrant method on `CallbackWindow`, so a binding can build and
+settle a capability from inside an accessor. `Then`/`Then2`/`Catch` run the
+engine's PerformPromiseThen and `Resolver::New` runs NewPromiseCapability over
+`%Promise%`, not the `then`/`Promise` properties, so a script cannot change what
+a host's call does.
+
+The one piece of state the engine does not keep is the rejecting function: its
+resolver record names the pair by function identity and holds only the promise,
+so `slagc` keeps the promise and the rejecting function against the resolving
+function's id, roots them, and drops the rejecting root on the first settlement
+(the pair can never fire again). `GetPromise` and `Reject` then name them back.
+The cost is a resolver that never settles: its pair lives until the context is
+freed, where V8 collects it with the promise. `Resolver::New(context, promise)`
+and the `Promise::Resolve`/`Reject` statics are left out for now.
+
 ## 15. Sources
 
 Verified on 2026-10-31:

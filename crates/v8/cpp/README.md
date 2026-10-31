@@ -290,6 +290,28 @@ code point (not valid UTF-8); `Utf8Length` counts it as three.
 `String::Utf8Value` runs ToString, so it converts an object through its own
 `toString` and reads the form that fits in one byte when it does.
 
+### Promises
+
+`Promise::State`, `Result`, `MarkAsHandled`, `Then`, `Then2`, and `Catch` are the
+host side of a promise, and `Promise::Resolver::New`, `GetPromise`, `Resolve`, and
+`Reject` are the settling side. `Then`/`Then2`/`Catch` run the engine's own
+PerformPromiseThen and `Resolver::New` runs NewPromiseCapability over the realm's
+`%Promise%`, so a script that replaced `Promise.prototype.then` or the `Promise`
+binding cannot change what a host's call does. A handler a host did not give is
+*undefined*, which the engine reads as "no handler".
+
+`Resolve`/`Reject` answer whether *that* call settled the promise: the pair
+shares one `[[AlreadyResolved]]` flag, so a second call is a no-op and answers
+false. `State` and `Result` read the engine's Promise Record, and a pending
+promise's `Result` is *undefined*. V8 gives those three no context, so the facade
+reads the entered one, as V8 does.
+
+The resolver handle *is* the pair's resolving function, as in V8, and the facade
+keeps the rejecting one against it: the engine names the pair by function
+identity but holds no reference to the rejecting value. A host callback can do
+all of it (`Promise::Resolver::New` and `Resolve` from an accessor), because the
+operations take the callback's window when one is running.
+
 ### Errors, private names, and data properties
 
 `Exception::Error`, `TypeError`, `RangeError`, `ReferenceError`,
@@ -530,6 +552,8 @@ not a claim that gin itself links.
   `Object::IsCallable`/`IsConstructor`, `BooleanValue`, `TypeOf`, `ToString`,
   `ToNumber`, `ToObject`, `Int32Value`, `Uint32Value`, `IntegerValue`,
   `StrictEquals`, `SameValue`, and `Local::operator==`.
+- `Promise` (`State`, `Result`, `MarkAsHandled`, `Then`, `Then2`, `Catch`) and
+  `Promise::Resolver` (`New`, `GetPromise`, `Resolve`, `Reject`).
 - `ArrayBuffer` and `SharedArrayBuffer` (creation, `ByteLength`, `Data`,
   `GetBackingStore`, and the detach protocol), `BackingStore` (fresh and
   host-owned, with a deleter), and the `ArrayBufferView`/`TypedArray` hierarchy
@@ -640,6 +664,12 @@ not a claim that gin itself links.
   isolate's queued jobs (microtasks, promise reactions, due timers) and answers
   whether it ran any. There are no host-posted platform tasks or task runners
   yet, so `PostTask`/`CallOnForegroundThread` are absent rather than ignored.
+- A `Promise::Resolver` keeps its promise and rejecting function for the
+  context's life, so a resolver that never settles is never released (V8
+  collects the capability with the promise). `Resolver::New(context, promise)`,
+  `Promise::WithResolvers`, the `Promise::Resolve`/`Reject` statics, and
+  `Isolate::SetPromiseRejectCallback` with `PromiseRejectMessage` are absent; the
+  engine reports unhandled rejections to the embedder callback instead.
 - Microtasks follow `Isolate::SetMicrotasksPolicy`: `kAuto` (the default) drains
   after a successful `Script::Run`, `kExplicit` leaves the queues for
   `PerformMicrotaskCheckpoint` or `PumpMessageLoop`, and `kScoped` is accepted
@@ -728,4 +758,7 @@ a length window, `NO_NULL_TERMINATION`, and a buffer too small for the
 character), checks `Utf8Length` and the lone surrogate's own three bytes against
 `REPLACE_INVALID_UTF8`'s U+FFFD, and checks that `Int32Value`/`Uint32Value`/
 `IntegerValue` wrap, truncate, run `valueOf`, saturate, and leave a throwing
-conversion empty.
+conversion empty. The promise block settles and re-settles a resolver, reads the
+state and result, rejects and marks handled, derives a promise through `Then2`
+and one through `Catch` (draining the jobs between), and makes and settles one
+from inside a host callback.

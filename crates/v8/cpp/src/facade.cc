@@ -1580,6 +1580,140 @@ Local<Array> Array::New(Isolate* isolate, Local<Value>* elements,
   return New(isolate->GetCurrentContext(), elements, length);
 }
 
+namespace {
+
+/* The promise operations that V8 gives no context to (`State`, `Result`,
+ * `MarkAsHandled`) read the isolate's entered context, as there. Every one of
+ * them takes the running callback's window when a host callback holds the
+ * engine, and the ordinary entry point otherwise. */
+Promise::PromiseState StateOf(uint64_t promise) {
+  const int state =
+      g_callback_token != nullptr
+          ? slag_callback_promise_state(CurrentSlagContext(), g_callback_token,
+                                        promise)
+          : slag_promise_state(CurrentSlagContext(), promise);
+  if (state == 1) return Promise::kFulfilled;
+  if (state == 2) return Promise::kRejected;
+  return Promise::kPending;
+}
+
+Local<Value> ResultOf(uint64_t promise) {
+  uint64_t out = 0;
+  const int status =
+      g_callback_token != nullptr
+          ? slag_callback_promise_result(CurrentSlagContext(), g_callback_token,
+                                         promise, &out)
+          : slag_promise_result(CurrentSlagContext(), promise, &out);
+  if (status != 0) return Local<Value>();
+  return Local<Value>::New(out);
+}
+
+Maybe<bool> MarkHandledOf(uint64_t promise) {
+  const int status =
+      g_callback_token != nullptr
+          ? slag_callback_promise_mark_handled(CurrentSlagContext(),
+                                               g_callback_token, promise)
+          : slag_promise_mark_handled(CurrentSlagContext(), promise);
+  if (status != 0) return Maybe<bool>();
+  return Maybe<bool>(true);
+}
+
+MaybeLocal<Promise> ThenOf(uint64_t promise, uint64_t on_fulfilled,
+                           uint64_t on_rejected) {
+  uint64_t out = 0;
+  const int status =
+      g_callback_token != nullptr
+          ? slag_callback_promise_then(CurrentSlagContext(), g_callback_token,
+                                       promise, on_fulfilled, on_rejected, &out)
+          : slag_promise_then(CurrentSlagContext(), promise, on_fulfilled,
+                              on_rejected, &out);
+  if (status != 0) return MaybeLocal<Promise>();
+  return MaybeLocal<Promise>(Local<Promise>::New(out));
+}
+
+Maybe<bool> SettleResolver(uint64_t resolver, uint64_t value, int reject) {
+  int32_t settled = 0;
+  const int status =
+      g_callback_token != nullptr
+          ? slag_callback_promise_resolver_settle(
+                CurrentSlagContext(), g_callback_token, resolver, value, reject,
+                &settled)
+          : slag_promise_resolver_settle(CurrentSlagContext(), resolver, value,
+                                         reject, &settled);
+  if (status != 0) return Maybe<bool>();
+  return Maybe<bool>(settled != 0);
+}
+
+}  // namespace
+
+Promise::PromiseState Promise::State() { return StateOf(Raw(this)); }
+
+Local<Value> Promise::Result() { return ResultOf(Raw(this)); }
+
+Maybe<bool> Promise::MarkAsHandled() { return MarkHandledOf(Raw(this)); }
+
+MaybeLocal<Promise> Promise::Then(Local<Context> context,
+                                  Local<Function> handler) {
+  if (context.IsEmpty()) return MaybeLocal<Promise>();
+  const uint64_t missing = slag_undefined();
+  return ThenOf(Raw(this), handler.IsEmpty() ? missing : handler.raw(), missing);
+}
+
+MaybeLocal<Promise> Promise::Then2(Local<Context> context,
+                                   Local<Function> on_fulfilled,
+                                   Local<Function> on_rejected) {
+  if (context.IsEmpty()) return MaybeLocal<Promise>();
+  const uint64_t missing = slag_undefined();
+  return ThenOf(Raw(this),
+                on_fulfilled.IsEmpty() ? missing : on_fulfilled.raw(),
+                on_rejected.IsEmpty() ? missing : on_rejected.raw());
+}
+
+MaybeLocal<Promise> Promise::Catch(Local<Context> context,
+                                   Local<Function> handler) {
+  if (context.IsEmpty()) return MaybeLocal<Promise>();
+  const uint64_t missing = slag_undefined();
+  return ThenOf(Raw(this), missing,
+                handler.IsEmpty() ? missing : handler.raw());
+}
+
+MaybeLocal<Promise::Resolver> Promise::Resolver::New(Local<Context> context) {
+  if (context.IsEmpty()) return MaybeLocal<Resolver>();
+  auto* current = reinterpret_cast<Context*>(
+      static_cast<uintptr_t>(context.raw()));
+  uint64_t resolver = 0;
+  uint64_t promise = 0;
+  const int status =
+      g_callback_token != nullptr
+          ? slag_callback_promise_new_resolver(current->slag(),
+                                               g_callback_token, &resolver,
+                                               &promise)
+          : slag_promise_new_resolver(current->slag(), &resolver, &promise);
+  if (status != 0) return MaybeLocal<Resolver>();
+  return Local<Resolver>::New(resolver);
+}
+
+Local<Promise> Promise::Resolver::GetPromise() {
+  uint64_t out = 0;
+  if (slag_promise_resolver_promise(CurrentSlagContext(), Raw(this), &out) !=
+      0) {
+    return Local<Promise>();
+  }
+  return Local<Promise>::New(out);
+}
+
+Maybe<bool> Promise::Resolver::Resolve(Local<Context> context,
+                                       Local<Value> value) {
+  if (context.IsEmpty() || value.IsEmpty()) return Maybe<bool>();
+  return SettleResolver(Raw(this), value.raw(), 0);
+}
+
+Maybe<bool> Promise::Resolver::Reject(Local<Context> context,
+                                      Local<Value> value) {
+  if (context.IsEmpty() || value.IsEmpty()) return Maybe<bool>();
+  return SettleResolver(Raw(this), value.raw(), 1);
+}
+
 bool Object::Delete(Local<Context> context, Local<Value> key) {
   if (context.IsEmpty() || key.IsEmpty()) return false;
   auto* current = reinterpret_cast<Context*>(

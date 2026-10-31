@@ -212,6 +212,41 @@ int64_t slag_string_write_utf8(uint64_t value, int64_t start, int64_t capacity,
                                uint8_t* out, int64_t* written);
 /* The UTF-8 byte count (`v8::String::Utf8Length`), or -1 for a non-string. */
 int64_t slag_string_utf8_length(uint64_t value);
+/* Promises (`v8::Promise`, `v8::Promise::Resolver`). A resolver handle is the
+ * pair's resolving function, as in V8; the rejecting one and the promise are
+ * kept against it for the context's life, so `GetPromise` and `Reject` can name
+ * them back. Each entry the engine has to run has a callback form for use inside
+ * a host callback, where the engine is borrowed. `slag_promise_state` answers 0
+ * pending, 1 fulfilled, or 2 rejected, and a negated status otherwise. */
+int32_t slag_promise_new_resolver(SlagContext* context, uint64_t* out_resolver,
+                                  uint64_t* out_promise);
+int32_t slag_promise_resolver_promise(SlagContext* context, uint64_t resolver,
+                                      uint64_t* out);
+int32_t slag_promise_resolver_settle(SlagContext* context, uint64_t resolver,
+                                     uint64_t value, int32_t reject,
+                                     int32_t* settled);
+int32_t slag_promise_state(SlagContext* context, uint64_t promise);
+int32_t slag_promise_result(SlagContext* context, uint64_t promise, uint64_t* out);
+int32_t slag_promise_mark_handled(SlagContext* context, uint64_t promise);
+int32_t slag_promise_then(SlagContext* context, uint64_t promise,
+                          uint64_t on_fulfilled, uint64_t on_rejected,
+                          uint64_t* out);
+int32_t slag_callback_promise_new_resolver(SlagContext* context, const void* token,
+                                           uint64_t* out_resolver,
+                                           uint64_t* out_promise);
+int32_t slag_callback_promise_resolver_settle(SlagContext* context,
+                                              const void* token, uint64_t resolver,
+                                              uint64_t value, int32_t reject,
+                                              int32_t* settled);
+int32_t slag_callback_promise_state(SlagContext* context, const void* token,
+                                    uint64_t promise);
+int32_t slag_callback_promise_result(SlagContext* context, const void* token,
+                                     uint64_t promise, uint64_t* out);
+int32_t slag_callback_promise_mark_handled(SlagContext* context, const void* token,
+                                           uint64_t promise);
+int32_t slag_callback_promise_then(SlagContext* context, const void* token,
+                                   uint64_t promise, uint64_t on_fulfilled,
+                                   uint64_t on_rejected, uint64_t* out);
 uint64_t slag_number_new(double value);
 void slag_root_retain(uint64_t value);
 void slag_root_release(uint64_t value);

@@ -38,6 +38,8 @@ class TryCatch;
 class ArrayBuffer;
 class Private;
 class Exception;
+class Function;
+class Promise;
 
 template <class T>
 class FunctionCallbackInfo;
@@ -685,6 +687,43 @@ class Array : public Object {
   static Local<Array> New(Local<Context> context, int length = 0);
   static Local<Array> New(Local<Context> context, Local<Value>* elements,
                           size_t length);
+};
+
+/* A JavaScript promise (`v8::Promise`). `State`/`Result` read the engine's
+ * promise record; `Then`/`Then2`/`Catch` and the resolver go through the
+ * engine's own PerformPromiseThen and NewPromiseCapability, so a script that
+ * replaced `Promise.prototype.then` cannot change what a host's call does. */
+class Promise : public Object {
+ public:
+  /* A promise's state (`v8::Promise::PromiseState`). */
+  enum PromiseState { kPending, kFulfilled, kRejected };
+
+  /* The state the engine recorded. A value that is not a promise answers
+   * `kPending`, which is what a pending one answers too; V8 does not offer a
+   * way to ask the question, and the handle's type already says it. */
+  PromiseState State();
+  /* The settled value, or an empty handle while pending. */
+  Local<Value> Result();
+  /* [[IsHandled]], the bookkeeping a host does when it takes a rejection it is
+   * not reacting to. */
+  Maybe<bool> MarkAsHandled();
+
+  MaybeLocal<Promise> Then(Local<Context> context, Local<Function> handler);
+  MaybeLocal<Promise> Then2(Local<Context> context, Local<Function> on_fulfilled,
+                            Local<Function> on_rejected);
+  MaybeLocal<Promise> Catch(Local<Context> context, Local<Function> handler);
+
+  /* The pair that settles a promise (`v8::Promise::Resolver`). The facade's
+   * resolver *is* the pair's resolving function, as in V8, so
+   * `GetPromise`/`Reject` name the rest of the capability back through it. */
+  class Resolver : public Object {
+   public:
+    static MaybeLocal<Resolver> New(Local<Context> context);
+
+    Local<Promise> GetPromise();
+    Maybe<bool> Resolve(Local<Context> context, Local<Value> value);
+    Maybe<bool> Reject(Local<Context> context, Local<Value> value);
+  };
 };
 
 class Number : public Value {
