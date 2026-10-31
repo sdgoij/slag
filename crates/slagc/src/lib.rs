@@ -2400,6 +2400,432 @@ pub unsafe extern "C" fn slag_symbol_new(text_ptr: *const u8, len: usize, out: *
     0
 }
 
+/// A string from Latin-1 bytes (`v8::String::NewFromOneByte`): each byte is one
+/// code unit, so 0xE9 is U+00E9.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn slag_string_new_one_byte(text_ptr: *const u8, len: usize) -> u64 {
+    let utf16: Vec<u16> = bytes(text_ptr, len)
+        .iter()
+        .map(|&byte| u16::from(byte))
+        .collect();
+    Value::String(Handle::new(JsString::from_utf16(&utf16))).bits()
+}
+
+/// A string from UTF-16 code units (`v8::String::NewExternalTwoByte` over an
+/// internal copy).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn slag_string_new_two_byte(units: *const u16, len: usize) -> u64 {
+    let units = slice_of::<u16>(units, len);
+    Value::String(Handle::new(JsString::from_utf16(units))).bits()
+}
+
+/// The string's UTF-16 length, or -1 for a non-string (`v8::String::Length`).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn slag_string_length(value: u64) -> i64 {
+    match Value::from_bits(value).as_string() {
+        Some(text) => text.as_slice().len() as i64,
+        None => -1,
+    }
+}
+
+/// Whether every code unit fits in one byte
+/// (`v8::String::ContainsOnlyOneByte`).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn slag_string_contains_only_one_byte(value: u64) -> i32 {
+    match Value::from_bits(value).as_string() {
+        Some(text) => i32::from(
+            text.as_slice()
+                .iter()
+                .all(|&unit| unit <= u16::from(u8::MAX)),
+        ),
+        None => 0,
+    }
+}
+
+/// The code units a `v8::String::Write` call addresses: `start` is a code unit
+/// index, `length` a code unit count, and a negative length means the rest of
+/// the string. A start past the end is an empty window, not an error.
+fn code_unit_window(units: &[u16], start: i64, length: i64) -> &[u16] {
+    let start = if start < 0 {
+        0
+    } else {
+        (start as usize).min(units.len())
+    };
+    let rest = &units[start..];
+    if length < 0 {
+        rest
+    } else {
+        &rest[..rest.len().min(length as usize)]
+    }
+}
+
+/// Copy a window of code units into `out` (`v8::String::Write`). Answers the
+/// number copied, or -1 for a non-string.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn slag_string_code_units(
+    value: u64,
+    start: i64,
+    length: i64,
+    out: *mut u16,
+) -> i64 {
+    let Some(text) = Value::from_bits(value).as_string() else {
+        return -1;
+    };
+    let units = code_unit_window(text.as_slice(), start, length);
+    if !out.is_null() {
+        std::ptr::copy_nonoverlapping(units.as_ptr(), out, units.len());
+    }
+    units.len() as i64
+}
+
+/// Copy a window of code units as one byte each
+/// (`v8::String::WriteOneByte`), the form a host uses when it knows the string
+/// is Latin-1.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn slag_string_write_one_byte(
+    value: u64,
+    start: i64,
+    length: i64,
+    out: *mut u8,
+) -> i64 {
+    let Some(text) = Value::from_bits(value).as_string() else {
+        return -1;
+    };
+    let units = code_unit_window(text.as_slice(), start, length);
+    if !out.is_null() {
+        for (index, unit) in units.iter().enumerate() {
+            *out.add(index) = *unit as u8;
+        }
+    }
+    units.len() as i64
+}
+
+/// Whether `unit` continues the surrogate pair `previous` began.
+fn is_trail_of_pair(previous: Option<u16>, unit: u16) -> bool {
+    previous
+        .is_some_and(|lead| (0xD800..0xDC00).contains(&lead) && (0xDC00..0xE000).contains(&unit))
+}
+
+/// The UTF-8 byte count of one code unit, given the one before it
+/// (`unibrow::Utf8::Length`): the trail of a pair adds the one byte the pair
+/// had left to count, and a lone surrogate counts as much as any three-byte
+/// character.
+fn encoded_length(unit: u16, previous: Option<u16>) -> usize {
+    if unit <= 0x7F || is_trail_of_pair(previous, unit) {
+        1
+    } else if unit <= 0x7FF {
+        2
+    } else {
+        3
+    }
+}
+
+/// The UTF-8 bytes of a code point. A lone surrogate goes through the
+/// three-byte path unchanged, which is the encoding V8 writes for one.
+fn utf8_bytes(point: u32) -> ([u8; 4], usize) {
+    if point <= 0x7F {
+        ([point as u8, 0, 0, 0], 1)
+    } else if point <= 0x7FF {
+        (
+            [0xC0 | (point >> 6) as u8, 0x80 | (point & 0x3F) as u8, 0, 0],
+            2,
+        )
+    } else if point <= 0xFFFF {
+        (
+            [
+                0xE0 | (point >> 12) as u8,
+                0x80 | ((point >> 6) & 0x3F) as u8,
+                0x80 | (point & 0x3F) as u8,
+                0,
+            ],
+            3,
+        )
+    } else {
+        (
+            [
+                0xF0 | (point >> 18) as u8,
+                0x80 | ((point >> 12) & 0x3F) as u8,
+                0x80 | ((point >> 6) & 0x3F) as u8,
+                0x80 | (point & 0x3F) as u8,
+            ],
+            4,
+        )
+    }
+}
+
+/// The code point a surrogate pair encodes.
+fn combined_point(lead: u16, trail: u16) -> u32 {
+    0x1_0000 + ((u32::from(lead) - 0xD800) << 10) + (u32::from(trail) - 0xDC00)
+}
+
+/// Encode a window of the string as UTF-8 (`v8::String::WriteUtf8`), stopping
+/// before a character that does not fit rather than write part of one.
+///
+/// Without `replace_invalid` a lone surrogate is written as the three bytes of
+/// its own code point, which is the encoding V8 writes for one and is not valid
+/// UTF-8. `null_terminate` needs room for the terminator inside `capacity`; the
+/// answer counts it, which is what V8's byte count includes. `written` receives
+/// the number of code units covered, which is V8's `nchars_ref`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn slag_string_write_utf8(
+    value: u64,
+    start: i64,
+    capacity: i64,
+    replace_invalid: i32,
+    null_terminate: i32,
+    out: *mut u8,
+    written: *mut i64,
+) -> i64 {
+    let Some(text) = Value::from_bits(value).as_string() else {
+        return -1;
+    };
+    let units = code_unit_window(text.as_slice(), start, -1);
+    let terminate = null_terminate != 0;
+    let content_capacity = if capacity < 0 {
+        usize::MAX
+    } else {
+        (capacity as usize).saturating_sub(usize::from(terminate))
+    };
+    let mut encoded: Vec<u8> = Vec::new();
+    let mut read = 0;
+    let mut previous: Option<u16> = None;
+    while read < units.len() {
+        let unit = units[read];
+        if content_capacity - encoded.len() < encoded_length(unit, previous) {
+            if is_trail_of_pair(previous, unit) {
+                // Half a pair fits and the whole one does not: give back the
+                // bytes the lead reserved and leave the trail unread.
+                encoded.truncate(encoded.len() - 3);
+                read -= 1;
+            }
+            break;
+        }
+        if units
+            .get(read + 1)
+            .is_some_and(|&next| is_trail_of_pair(Some(unit), next))
+        {
+            encoded.extend_from_slice(&[0, 0, 0]);
+        } else if let Some(lead) = previous.filter(|&lead| is_trail_of_pair(Some(lead), unit)) {
+            let (bytes, _) = utf8_bytes(combined_point(lead, unit));
+            encoded.resize(encoded.len() + 1, 0);
+            let at = encoded.len() - 4;
+            encoded[at..at + 4].copy_from_slice(&bytes);
+        } else {
+            let point = if replace_invalid != 0 && (0xD800..0xE000).contains(&unit) {
+                0xFFFD
+            } else {
+                u32::from(unit)
+            };
+            let (bytes, length) = utf8_bytes(point);
+            encoded.extend_from_slice(&bytes[..length]);
+        }
+        previous = Some(unit);
+        read += 1;
+    }
+    if terminate && capacity != 0 {
+        encoded.push(0);
+    }
+    if !out.is_null() {
+        std::ptr::copy_nonoverlapping(encoded.as_ptr(), out, encoded.len());
+    }
+    if !written.is_null() {
+        *written = read as i64;
+    }
+    encoded.len() as i64
+}
+
+/// The byte count of the UTF-8 encoding (`v8::String::Utf8Length`); a lone
+/// surrogate counts as the three bytes the encoder writes for it.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn slag_string_utf8_length(value: u64) -> i64 {
+    let Some(text) = Value::from_bits(value).as_string() else {
+        return -1;
+    };
+    let mut total = 0usize;
+    let mut previous = None;
+    for &unit in text.as_slice() {
+        total += encoded_length(unit, previous);
+        previous = Some(unit);
+    }
+    total as i64
+}
+
+/// ToNumber for a conversion: the engine when it is free to borrow, and the
+/// running callback's window when the call came from inside a host callback
+/// (the engine is borrowed there, so only the window can run it). `None` means
+/// neither route is available and the caller records the re-entry refusal.
+unsafe fn conversion_number(
+    context: &SlagContext,
+    token: *const c_void,
+    value: u64,
+) -> Option<Result<f64, JsError>> {
+    let value = JsValue::from_bits(value);
+    if let Ok(mut engine) = context.context.try_borrow_mut() {
+        return Some(engine.to_number(&value));
+    }
+    CallbackWindow::admit(token).map(|window| window.to_number(value))
+}
+
+unsafe fn convert_to_int32(
+    context: *mut SlagContext,
+    token: *const c_void,
+    value: u64,
+    out: *mut i32,
+) -> i32 {
+    let Some(context) = context.as_ref() else {
+        return 2;
+    };
+    let Some(number) = conversion_number(context, token, value) else {
+        reentrant(context);
+        return 1;
+    };
+    match number {
+        Ok(number) => {
+            if !out.is_null() {
+                *out = crux::convert::to_int32(number);
+            }
+            0
+        }
+        Err(error) => {
+            record(context, error);
+            1
+        }
+    }
+}
+
+unsafe fn convert_to_uint32(
+    context: *mut SlagContext,
+    token: *const c_void,
+    value: u64,
+    out: *mut u32,
+) -> i32 {
+    let Some(context) = context.as_ref() else {
+        return 2;
+    };
+    let Some(number) = conversion_number(context, token, value) else {
+        reentrant(context);
+        return 1;
+    };
+    match number {
+        Ok(number) => {
+            if !out.is_null() {
+                *out = crux::convert::to_uint32(number);
+            }
+            0
+        }
+        Err(error) => {
+            record(context, error);
+            1
+        }
+    }
+}
+
+unsafe fn convert_to_integer(
+    context: *mut SlagContext,
+    token: *const c_void,
+    value: u64,
+    out: *mut i64,
+) -> i32 {
+    let Some(context) = context.as_ref() else {
+        return 2;
+    };
+    let Some(number) = conversion_number(context, token, value) else {
+        reentrant(context);
+        return 1;
+    };
+    match number {
+        Ok(number) => {
+            if !out.is_null() {
+                let integer = crux::convert::to_integer_or_infinity(number);
+                *out = integer.clamp(i64::MIN as f64, i64::MAX as f64) as i64;
+            }
+            0
+        }
+        Err(error) => {
+            record(context, error);
+            1
+        }
+    }
+}
+
+/// ToInt32 with ToNumber first (`v8::Value::Int32Value`), so a fractional or
+/// out-of-range number wraps rather than failing.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn slag_value_to_int32(
+    context: *mut SlagContext,
+    value: u64,
+    out: *mut i32,
+) -> i32 {
+    convert_to_int32(context, std::ptr::null(), value, out)
+}
+
+/// [`slag_value_to_int32`] inside a running callback (`v8::Value::Int32Value` in
+/// a host function). Returns 2 when `token` names no running callback.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn slag_callback_value_to_int32(
+    context: *mut SlagContext,
+    token: *const c_void,
+    value: u64,
+    out: *mut i32,
+) -> i32 {
+    if CallbackWindow::admit(token).is_none() {
+        return 2;
+    }
+    convert_to_int32(context, token, value, out)
+}
+
+/// ToUint32 with ToNumber first (`v8::Value::Uint32Value`).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn slag_value_to_uint32(
+    context: *mut SlagContext,
+    value: u64,
+    out: *mut u32,
+) -> i32 {
+    convert_to_uint32(context, std::ptr::null(), value, out)
+}
+
+/// [`slag_value_to_uint32`] inside a running callback. Returns 2 when `token`
+/// names no running callback.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn slag_callback_value_to_uint32(
+    context: *mut SlagContext,
+    token: *const c_void,
+    value: u64,
+    out: *mut u32,
+) -> i32 {
+    if CallbackWindow::admit(token).is_none() {
+        return 2;
+    }
+    convert_to_uint32(context, token, value, out)
+}
+
+/// ToIntegerOrInfinity with ToNumber first (`v8::Value::IntegerValue`). The
+/// infinities saturate at the `i64` ends, which is the width V8's `Maybe`
+/// answers with.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn slag_value_to_integer(
+    context: *mut SlagContext,
+    value: u64,
+    out: *mut i64,
+) -> i32 {
+    convert_to_integer(context, std::ptr::null(), value, out)
+}
+
+/// [`slag_value_to_integer`] inside a running callback. Returns 2 when `token`
+/// names no running callback.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn slag_callback_value_to_integer(
+    context: *mut SlagContext,
+    token: *const c_void,
+    value: u64,
+    out: *mut i64,
+) -> i32 {
+    if CallbackWindow::admit(token).is_none() {
+        return 2;
+    }
+    convert_to_integer(context, token, value, out)
+}
+
 /// A symbol's description (`v8::Private::Name`), or `undefined` when it has
 /// none. Answers 2 when the value is not a symbol.
 #[unsafe(no_mangle)]
@@ -3632,6 +4058,110 @@ mod tests {
             assert_eq!(slag_object_internal_field_count(plain), 0);
             assert_eq!(slag_object_is_api_wrapper(plain), 0);
             assert_eq!(slag_object_internal_field(plain, 0), std::ptr::null_mut());
+
+            slag_context_free(context);
+            slag_isolate_free(isolate);
+        }
+    }
+
+    #[test]
+    fn strings_round_trip_through_the_write_forms() {
+        unsafe {
+            let latin1 = [b'a', b'b', 0xE9];
+            let text = slag_string_new_one_byte(latin1.as_ptr(), latin1.len());
+            assert_eq!(slag_string_length(text), 3);
+            assert_eq!(slag_string_contains_only_one_byte(text), 1);
+            assert_eq!(slag_string_utf8_length(text), 4);
+
+            let mut units = [0u16; 8];
+            assert_eq!(slag_string_code_units(text, 0, -1, units.as_mut_ptr()), 3);
+            assert_eq!(units[..3], [u16::from(b'a'), u16::from(b'b'), 0xE9]);
+
+            let mut window = [0u16; 8];
+            assert_eq!(slag_string_code_units(text, 1, 1, window.as_mut_ptr()), 1);
+            assert_eq!(window[0], u16::from(b'b'));
+
+            let mut bytes = [0u8; 8];
+            assert_eq!(
+                slag_string_write_one_byte(text, 0, -1, bytes.as_mut_ptr()),
+                3
+            );
+            assert_eq!(bytes[..3], [b'a', b'b', 0xE9]);
+
+            let pair = [0xD83Du16, 0xDE00];
+            let astral = slag_string_new_two_byte(pair.as_ptr(), pair.len());
+            assert_eq!(slag_string_length(astral), 2);
+            assert_eq!(slag_string_contains_only_one_byte(astral), 0);
+            assert_eq!(slag_string_utf8_length(astral), 4);
+
+            let mut utf8 = [0u8; 8];
+            let mut covered = 0i64;
+            assert_eq!(
+                slag_string_write_utf8(astral, 0, 8, 0, 1, utf8.as_mut_ptr(), &mut covered),
+                5,
+                "four bytes and the terminator"
+            );
+            assert_eq!(covered, 2, "a pair covers two code units");
+            assert_eq!(utf8[..5], [0xF0, 0x9F, 0x98, 0x80, 0]);
+
+            assert_eq!(
+                slag_string_write_utf8(astral, 0, 3, 0, 1, utf8.as_mut_ptr(), &mut covered),
+                1,
+                "only the terminator fits"
+            );
+            assert_eq!(covered, 0);
+
+            let lone = [0xD800u16, u16::from(b'A')];
+            let surrogate = slag_string_new_two_byte(lone.as_ptr(), lone.len());
+            assert_eq!(slag_string_utf8_length(surrogate), 4);
+            assert_eq!(
+                slag_string_write_utf8(surrogate, 0, 8, 0, 0, utf8.as_mut_ptr(), &mut covered),
+                4,
+                "the surrogate's own three bytes and the A"
+            );
+            assert_eq!(utf8[..4], [0xED, 0xA0, 0x80, b'A']);
+        }
+    }
+
+    #[test]
+    fn the_integer_conversions_convert_then_wrap() {
+        unsafe {
+            let isolate = slag_isolate_new();
+            let context = slag_context_new(isolate);
+            assert!(!context.is_null());
+
+            let mut out = 0i32;
+            let also = slag_number_new(4294967297.0);
+            assert_eq!(slag_value_to_int32(context, also, &mut out), 0);
+            assert_eq!(out, 1);
+
+            let negative = slag_number_new(-1.9);
+            assert_eq!(slag_value_to_int32(context, negative, &mut out), 0);
+            assert_eq!(out, -1);
+
+            let mut unsigned = 0u32;
+            assert_eq!(slag_value_to_uint32(context, negative, &mut unsigned), 0);
+            assert_eq!(unsigned, u32::MAX);
+
+            let mut integer = 0i64;
+            let fraction = slag_number_new(2.9);
+            assert_eq!(slag_value_to_integer(context, fraction, &mut integer), 0);
+            assert_eq!(integer, 2);
+
+            let infinity = slag_number_new(f64::INFINITY);
+            assert_eq!(slag_value_to_integer(context, infinity, &mut integer), 0);
+            assert_eq!(integer, i64::MAX);
+
+            // The conversions go through ToNumber, so the engine's own string
+            // parsing is what a host sees.
+            let source = b"'0x10'";
+            let mut text = 0;
+            assert_eq!(
+                slag_eval(context, source.as_ptr(), source.len(), &mut text),
+                0
+            );
+            assert_eq!(slag_value_to_int32(context, text, &mut out), 0);
+            assert_eq!(out, 16);
 
             slag_context_free(context);
             slag_isolate_free(isolate);

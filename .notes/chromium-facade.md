@@ -1012,6 +1012,37 @@ The trap on the C++ side is the callback's `ReturnValue` and the value handles
 it hands back: they must be rooted by the caller's handle scope, or the
 interceptor's own temporaries die before the engine reads them.
 
+*Strings and the integer conversions (2026-11-01).* The string surface landed
+next: `NewFromOneByte` (Latin-1, one code unit per byte), `NewFromTwoByte`,
+`ContainsOnlyOneByte`, `Utf8Length`, and the `Write`/`WriteOneByte`/`WriteUtf8`
+family with `start` (negative counting from the end), `length` (`-1` for the
+rest), `NO_NULL_TERMINATION`, and `REPLACE_INVALID_UTF8`. The encoding is the
+one `crates/v8/primitives.rs` already pins: a lone surrogate is written as the
+three bytes of its own code point unless replacement is asked for, `nchars_ref`
+counts the code units covered, and the answer includes the terminator, so the
+C++ side passes its buffer capacity straight through instead of re-deriving
+V8's byte accounting. `String::Length` was wrong before this slice and is now
+the code unit count V8 promises rather than the UTF-8 byte count it was measured
+in. `Int32Value`/`Uint32Value` also changed meaning: they were a range check
+that failed outside the type's bounds, and are now ToInt32/ToUint32 through
+ToNumber, joined by `IntegerValue` (ToIntegerOrInfinity, saturating at the
+`i64` ends).
+
+Two traps surfaced while wiring them. A conversion inside a host callback cannot
+borrow the engine, so it needs the same window route allocation does:
+`CallbackWindow::to_number` and `slag_callback_value_to_{int32,uint32,integer}`
+now carry it, and `Value::Int32Value` picks the token route while
+`g_callback_token` is set. The second is a facade divergence fixed rather than
+worked around: `Isolate::GetCurrentContext()` answered a *non-empty* handle over
+address zero when no context was entered, so a host that converted with it
+dereferenced null; it answers an empty handle now, which is what V8 does and
+what makes `IsEmpty` usable. The harness then had to enter the context its
+`bump` callback asks for, which is what a real host does anyway. Fixing that
+exposed a third: the `SetAccessorProperty` `FunctionTemplate` trampolines never
+published the facade's callback token (unlike `HostTrampoline`), so a conversion
+inside such a getter or setter recorded a re-entrancy refusal; both now hold a
+`CallbackToken` for the call.
+
 ## 15. Sources
 
 Verified on 2026-10-31:

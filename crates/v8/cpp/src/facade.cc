@@ -300,6 +300,10 @@ int32_t TemplateAccessorGetter(void* data, uint64_t holder, uint64_t,
   *out = slag_undefined();
   v8::FunctionCallbackInfo<v8::Value> info(v8::g_current_isolate, nullptr,
                                            holder, nullptr, 0);
+  // The getter runs inside the engine's callback window, so the conversion and
+  // allocation entry points have to see the token the way a host function's
+  // `HostTrampoline` publishes it.
+  CallbackToken token;
   accessor->getter(info);
   *out = info.return_value();
   return 0;
@@ -312,6 +316,7 @@ int32_t TemplateAccessorSetter(void* data, uint64_t holder, uint64_t,
   uint64_t args[1] = {value};
   v8::FunctionCallbackInfo<v8::Value> info(v8::g_current_isolate, nullptr,
                                            holder, args, 1);
+  CallbackToken token;
   accessor->setter(info);
   return 0;
 }
@@ -1655,18 +1660,46 @@ Local<Integer> Integer::New(Isolate*, int32_t value) {
   return Local<Integer>::New(slag_number_new(static_cast<double>(value)));
 }
 
-Maybe<uint32_t> Value::Uint32Value(Local<Context>) const {
-  double number = slag_value_to_number(Raw(this));
-  if (!(number >= 0.0) || number > 4294967295.0) return Maybe<uint32_t>();
-  return Maybe<uint32_t>(static_cast<uint32_t>(number));
+Maybe<uint32_t> Value::Uint32Value(Local<Context> context) const {
+  if (context.IsEmpty()) return Maybe<uint32_t>();
+  auto* current = reinterpret_cast<Context*>(
+      static_cast<uintptr_t>(context.raw()));
+  uint32_t out = 0;
+  const int status =
+      g_callback_token != nullptr
+          ? slag_callback_value_to_uint32(current->slag(), g_callback_token,
+                                          Raw(this), &out)
+          : slag_value_to_uint32(current->slag(), Raw(this), &out);
+  if (status != 0) return Maybe<uint32_t>();
+  return Maybe<uint32_t>(out);
 }
 
-Maybe<int32_t> Value::Int32Value(Local<Context>) const {
-  double number = slag_value_to_number(Raw(this));
-  if (!(number >= -2147483648.0) || number > 2147483647.0) {
-    return Maybe<int32_t>();
-  }
-  return Maybe<int32_t>(static_cast<int32_t>(number));
+Maybe<int32_t> Value::Int32Value(Local<Context> context) const {
+  if (context.IsEmpty()) return Maybe<int32_t>();
+  auto* current = reinterpret_cast<Context*>(
+      static_cast<uintptr_t>(context.raw()));
+  int32_t out = 0;
+  const int status =
+      g_callback_token != nullptr
+          ? slag_callback_value_to_int32(current->slag(), g_callback_token,
+                                         Raw(this), &out)
+          : slag_value_to_int32(current->slag(), Raw(this), &out);
+  if (status != 0) return Maybe<int32_t>();
+  return Maybe<int32_t>(out);
+}
+
+Maybe<int64_t> Value::IntegerValue(Local<Context> context) const {
+  if (context.IsEmpty()) return Maybe<int64_t>();
+  auto* current = reinterpret_cast<Context*>(
+      static_cast<uintptr_t>(context.raw()));
+  int64_t out = 0;
+  const int status =
+      g_callback_token != nullptr
+          ? slag_callback_value_to_integer(current->slag(), g_callback_token,
+                                           Raw(this), &out)
+          : slag_value_to_integer(current->slag(), Raw(this), &out);
+  if (status != 0) return Maybe<int64_t>();
+  return Maybe<int64_t>(out);
 }
 
 Local<String> String::NewFromUtf8Literal(Isolate*, const char* literal) {
@@ -1682,8 +1715,99 @@ MaybeLocal<String> String::NewFromUtf8(Isolate*, const char* str,
       slag_string_new(reinterpret_cast<const uint8_t*>(str), len));
 }
 
+MaybeLocal<String> String::NewFromOneByte(Isolate*, const uint8_t* data,
+                                          NewStringType, int length) {
+  if (data == nullptr) return MaybeLocal<String>();
+  size_t len = length < 0 ? std::strlen(reinterpret_cast<const char*>(data))
+                          : static_cast<size_t>(length);
+  return Local<String>::New(slag_string_new_one_byte(data, len));
+}
+
+MaybeLocal<String> String::NewFromTwoByte(Isolate*, const uint16_t* data,
+                                          NewStringType, int length) {
+  if (data == nullptr) return MaybeLocal<String>();
+  size_t len = 0;
+  if (length < 0) {
+    while (data[len] != 0) ++len;
+  } else {
+    len = static_cast<size_t>(length);
+  }
+  return Local<String>::New(slag_string_new_two_byte(data, len));
+}
+
 int String::Length() const {
-  return static_cast<int>(slag_value_to_utf8(Raw(this), nullptr, 0));
+  return static_cast<int>(slag_string_length(Raw(this)));
+}
+
+int String::Utf8Length(Isolate*) const {
+  return static_cast<int>(slag_string_utf8_length(Raw(this)));
+}
+
+bool String::ContainsOnlyOneByte() const {
+  return slag_string_contains_only_one_byte(Raw(this)) != 0;
+}
+
+namespace {
+
+/* V8 reads a negative `start` as an offset from the end and clamps a start past
+ * the end to it. */
+int ResolveWriteStart(uint64_t value, int start) {
+  const int len = static_cast<int>(slag_string_length(value));
+  if (len < 0) return -1;
+  if (start < 0) start = len + start;
+  if (start < 0) return 0;
+  return start > len ? len : start;
+}
+
+}  // namespace
+
+int String::Write(uint16_t* buffer, int start, int length, int options) const {
+  const uint64_t value = Raw(this);
+  const int resolved = ResolveWriteStart(value, start);
+  if (resolved < 0) return 0;
+  const int64_t written =
+      slag_string_code_units(value, resolved, length, buffer);
+  if (written < 0) return 0;
+  if (buffer != nullptr && (options & NO_NULL_TERMINATION) == 0) {
+    buffer[written] = 0;
+  }
+  return static_cast<int>(written);
+}
+
+int String::Write(Isolate* isolate, uint16_t* buffer, int start, int length,
+                  int options) const {
+  return Write(buffer, start, length, options);
+}
+
+int String::WriteOneByte(uint8_t* buffer, int start, int length,
+                         int options) const {
+  const uint64_t value = Raw(this);
+  const int resolved = ResolveWriteStart(value, start);
+  if (resolved < 0) return 0;
+  const int64_t written =
+      slag_string_write_one_byte(value, resolved, length, buffer);
+  if (written < 0) return 0;
+  if (buffer != nullptr && (options & NO_NULL_TERMINATION) == 0) {
+    buffer[written] = 0;
+  }
+  return static_cast<int>(written);
+}
+
+int String::WriteOneByte(Isolate* isolate, uint8_t* buffer, int start,
+                         int length, int options) const {
+  return WriteOneByte(buffer, start, length, options);
+}
+
+int String::WriteUtf8(Isolate*, char* buffer, int length, int* nchars_ref,
+                      int options) const {
+  int64_t covered = 0;
+  const int64_t written = slag_string_write_utf8(
+      Raw(this), 0, length, (options & REPLACE_INVALID_UTF8) != 0,
+      (options & NO_NULL_TERMINATION) == 0, reinterpret_cast<uint8_t*>(buffer),
+      &covered);
+  if (written < 0) return 0;
+  if (nchars_ref != nullptr) *nchars_ref = static_cast<int>(covered);
+  return static_cast<int>(written);
 }
 
 String::Utf8Value::Utf8Value(uint64_t value) {
@@ -2233,6 +2357,10 @@ void Isolate::ThrowError(const char* message) {
 }
 
 Local<Context> Isolate::GetCurrentContext() {
+  // No context entered is an empty handle, not a handle over address zero: a
+  // caller that checks `IsEmpty` has to see the difference (V8 answers the same
+  // way, and a zero handle dereferences to null).
+  if (g_current_context == 0) return Local<Context>();
   return Local<Context>::New(g_current_context);
 }
 

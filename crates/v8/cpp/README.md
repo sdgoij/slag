@@ -261,6 +261,35 @@ answers a string value (`typeof null` is `"object"`). `StrictEquals` is `===`
 (NaN differs from itself) and `SameValue` is `Object.is` (NaN equals itself,
 `+0` and `-0` differ).
 
+`Int32Value`, `Uint32Value`, and `IntegerValue` convert with ToNumber first and
+then wrap the number the way ToInt32/ToUint32/ToIntegerOrInfinity do, so
+`4294967297` is `1`, `-1.9` is `-1`, and `Infinity` saturates at the `int64`
+ends. Inside a host callback the engine is borrowed, so they take the same
+route `Object::New` does: the callback's window runs the ToNumber (see the
+README's `CallbackToken` note under accessors).
+
+### Strings
+
+String construction is `NewFromUtf8`, `NewFromUtf8Literal`, `NewFromOneByte`
+(Latin-1: each byte is one code unit, so `0xE9` is U+00E9), and `NewFromTwoByte`.
+The façade copies two-byte input; there is no external-string store to keep a
+host buffer alive, unlike V8's `NewExternalTwoByte`.
+
+`Length` is the UTF-16 code unit count, so an astral character counts two, and
+`Utf8Length` is the UTF-8 byte count. `ContainsOnlyOneByte` says whether every
+unit fits in one byte. The `Write`/`WriteOneByte`/`WriteUtf8` family copies a
+window of the string into a host buffer: `start` is a code unit index (negative
+counts from the end), `length` a unit or byte count (`-1` for the rest), and the
+answer is the number of units written. A NUL is appended unless
+`NO_NULL_TERMINATION` is passed, and `WriteUtf8` counts the terminator in its
+answer the way the Rust bridge does, reporting the covered code units through
+`nchars_ref`. `WriteUtf8` writes whole characters only, and without
+`REPLACE_INVALID_UTF8` a lone surrogate is written as the three bytes of its own
+code point (not valid UTF-8); `Utf8Length` counts it as three.
+
+`String::Utf8Value` runs ToString, so it converts an object through its own
+`toString` and reads the form that fits in one byte when it does.
+
 ### Errors, private names, and data properties
 
 `Exception::Error`, `TypeError`, `RangeError`, `ReferenceError`,
@@ -467,7 +496,9 @@ not a claim that gin itself links.
 ## What A0/A1 cover
 
 - `Isolate`/`Context`/`HandleScope`/`Context::Scope` as the samples use them.
-- `String::NewFromUtf8Literal`, `String::NewFromUtf8`, `String::Utf8Value`.
+- `String::NewFromUtf8Literal`, `String::NewFromUtf8`, `String::NewFromOneByte`,
+  `String::NewFromTwoByte`, `String::Utf8Value`, `Length`, `Utf8Length`,
+  `ContainsOnlyOneByte`, and the `Write`/`WriteOneByte`/`WriteUtf8` forms.
 - `Number::New`, `Integer::New`.
 - `Script::Compile` (parse only) and `Script::Run`.
 - `TryCatch`, `Isolate::ThrowError`, `Message` (a compile error's position), and
@@ -497,7 +528,8 @@ not a claim that gin itself links.
   releases it, and the destructor releases it like any persistent.
 - The `Value` predicates and conversions: `IsUndefined` through `IsNativeError`,
   `Object::IsCallable`/`IsConstructor`, `BooleanValue`, `TypeOf`, `ToString`,
-  `ToNumber`, `ToObject`, `StrictEquals`, `SameValue`, and `Local::operator==`.
+  `ToNumber`, `ToObject`, `Int32Value`, `Uint32Value`, `IntegerValue`,
+  `StrictEquals`, `SameValue`, and `Local::operator==`.
 - `ArrayBuffer` and `SharedArrayBuffer` (creation, `ByteLength`, `Data`,
   `GetBackingStore`, and the detach protocol), `BackingStore` (fresh and
   host-owned, with a deleter), and the `ArrayBufferView`/`TypedArray` hierarchy
@@ -689,4 +721,11 @@ The snapshot block writes a realm with the console and timers removed, then
 restores the blob in a fresh isolate and reads the global back. The template
 block materializes a child template that inherits a parent's prototype method,
 checks the data, argument, and instance checks, a `kThrow` template that cannot
-be constructed, prototype get/set, and a `MicrotasksScope` draining on exit.
+be constructed, prototype get/set, and a `MicrotasksScope` draining on exit. The
+string block builds a Latin-1 string from one-byte input and an astral string
+from UTF-16 units, round-trips the three write forms (including a negative start,
+a length window, `NO_NULL_TERMINATION`, and a buffer too small for the
+character), checks `Utf8Length` and the lone surrogate's own three bytes against
+`REPLACE_INVALID_UTF8`'s U+FFFD, and checks that `Int32Value`/`Uint32Value`/
+`IntegerValue` wrap, truncate, run `valueOf`, saturate, and leave a throwing
+conversion empty.

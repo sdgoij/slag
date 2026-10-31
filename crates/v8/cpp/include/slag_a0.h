@@ -186,6 +186,32 @@ uint64_t slag_undefined(void);
 uint64_t slag_null(void);
 uint64_t slag_boolean_new(int32_t value);
 uint64_t slag_string_new(const uint8_t* text, size_t len);
+/* A string from Latin-1 bytes: each byte is one code unit, so 0xE9 is U+00E9
+ * (`v8::String::NewFromOneByte`). */
+uint64_t slag_string_new_one_byte(const uint8_t* text, size_t len);
+/* A string from UTF-16 code units (`v8::String::NewFromTwoByte`). */
+uint64_t slag_string_new_two_byte(const uint16_t* units, size_t len);
+/* The UTF-16 code unit count (`v8::String::Length`), or -1 for a non-string. */
+int64_t slag_string_length(uint64_t value);
+/* Whether every code unit fits in one byte
+ * (`v8::String::ContainsOnlyOneByte`). */
+int32_t slag_string_contains_only_one_byte(uint64_t value);
+/* The `v8::String::Write` family: `start` is a code unit index, `length` a code
+ * unit (or, for the UTF-8 form, byte) count, and a negative length means the
+ * rest of the string. Each answers the number of units written (-1 for a
+ * non-string). `slag_string_write_utf8` takes the buffer's capacity including
+ * the terminator, writes one when `null_terminate` asks for it, counts it in
+ * its answer, and reports the code units it covered through `written`, which
+ * is V8's `nchars_ref`. */
+int64_t slag_string_code_units(uint64_t value, int64_t start, int64_t length,
+                               uint16_t* out);
+int64_t slag_string_write_one_byte(uint64_t value, int64_t start, int64_t length,
+                                   uint8_t* out);
+int64_t slag_string_write_utf8(uint64_t value, int64_t start, int64_t capacity,
+                               int32_t replace_invalid, int32_t null_terminate,
+                               uint8_t* out, int64_t* written);
+/* The UTF-8 byte count (`v8::String::Utf8Length`), or -1 for a non-string. */
+int64_t slag_string_utf8_length(uint64_t value);
 uint64_t slag_number_new(double value);
 void slag_root_retain(uint64_t value);
 void slag_root_release(uint64_t value);
@@ -363,6 +389,21 @@ int32_t slag_value_is_constructor(SlagContext* context, uint64_t value);
 int32_t slag_value_to_string(SlagContext* context, uint64_t value, uint64_t* out);
 int32_t slag_value_to_number_context(SlagContext* context, uint64_t value, double* out);
 int32_t slag_value_to_object(SlagContext* context, uint64_t value, uint64_t* out);
+/* The ToInt32/ToUint32/ToIntegerOrInfinity forms, which convert with ToNumber
+ * first (`v8::Value::Int32Value`, `Uint32Value`, `IntegerValue`). A failed
+ * conversion leaves its error pending and answers 1. */
+int32_t slag_value_to_int32(SlagContext* context, uint64_t value, int32_t* out);
+int32_t slag_value_to_uint32(SlagContext* context, uint64_t value, uint32_t* out);
+int32_t slag_value_to_integer(SlagContext* context, uint64_t value, int64_t* out);
+/* The same conversions inside a running host callback, where the engine is
+ * borrowed and only the callback's window can run ToNumber. Returns 2 when
+ * `token` names no running callback. */
+int32_t slag_callback_value_to_int32(SlagContext* context, const void* token,
+                                     uint64_t value, int32_t* out);
+int32_t slag_callback_value_to_uint32(SlagContext* context, const void* token,
+                                      uint64_t value, uint32_t* out);
+int32_t slag_callback_value_to_integer(SlagContext* context, const void* token,
+                                       uint64_t value, int64_t* out);
 /* The built-in error constructors (`v8::Exception`) and an arbitrary throw
  * (`Isolate::ThrowException`). */
 int32_t slag_exception_new(SlagContext* context, int32_t kind, const uint8_t* text,

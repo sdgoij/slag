@@ -582,6 +582,9 @@ int main() {
   {
     v8::HandleScope scope(isolate);
     v8::Local<v8::Context> current = context.Get(isolate);
+    // The method below runs as a script callback, which asks the isolate for the
+    // entered context the way gin does, so the harness enters one.
+    v8::Context::Scope context_scope(current);
 
     v8::Local<v8::ObjectTemplate> tmpl = v8::ObjectTemplate::New(isolate);
     tmpl->SetInternalFieldCount(1);
@@ -1365,6 +1368,150 @@ int main() {
         run("'abc'")->ToObject(current).ToLocalChecked();
     expect(boxed->IsObject() && !boxed->IsString(),
            "ToObject boxes a primitive");
+  }
+
+  // Strings and the integer conversions: the Latin-1 and UTF-16 constructors,
+  // the three write forms, and the ToInt32/ToUint32/ToInteger wrappers.
+  {
+    v8::HandleScope scope(isolate);
+    v8::Local<v8::Context> current = context.Get(isolate);
+    v8::Context::Scope context_scope(current);
+    const auto expect = [&](bool condition, const char* what) {
+      if (!condition) {
+        fprintf(stderr, "strings: %s\n", what);
+        ++failures;
+      }
+    };
+    const auto run = [&](const char* source) {
+      return v8::Script::Compile(
+                 current, v8::String::NewFromUtf8Literal(isolate, source))
+          .ToLocalChecked()
+          ->Run(current)
+          .ToLocalChecked();
+    };
+
+    // NewFromOneByte takes Latin-1: 0xE9 is U+00E9, not the first byte of a
+    // UTF-8 sequence.
+    const uint8_t latin1[] = {'a', 'b', 0xE9};
+    v8::Local<v8::String> one_byte =
+        v8::String::NewFromOneByte(isolate, latin1, v8::NewStringType::kNormal,
+                                   3)
+            .ToLocalChecked();
+    expect(one_byte->Length() == 3, "a Latin-1 string is three code units");
+    expect(one_byte->ContainsOnlyOneByte(), "a Latin-1 string is one-byte");
+    expect(one_byte->Utf8Length(isolate) == 4, "0xE9 takes two UTF-8 bytes");
+
+    // Length is a code unit count, which for an astral character is two, and
+    // its UTF-8 encoding is four bytes.
+    expect(run("'\\u{1F600}'").As<v8::String>()->Length() == 2,
+           "Length counts code units rather than bytes");
+    expect(run("'\\u{1F600}'").As<v8::String>()->Utf8Length(isolate) == 4,
+           "an astral character is four UTF-8 bytes");
+
+    uint16_t units[8] = {};
+    expect(one_byte->Write(units) == 3 && units[0] == 'a' && units[1] == 'b' &&
+               units[2] == 0xE9,
+           "Write copied the code units");
+    expect(units[3] == 0, "Write NUL-terminated the buffer");
+
+    uint16_t window[8] = {};
+    expect(one_byte->Write(window, 1, 1) == 1 && window[0] == 'b' &&
+               window[1] == 0,
+           "Write honoured the start and length window");
+
+    uint16_t tail[8] = {};
+    expect(one_byte->Write(tail, -1) == 1 && tail[0] == 0xE9,
+           "a negative start counts from the end");
+
+    uint16_t unterminated[8];
+    for (uint16_t& unit : unterminated) unit = 0xFFFF;
+    expect(one_byte->Write(unterminated, 0, -1, v8::NO_NULL_TERMINATION) == 3 &&
+               unterminated[3] == 0xFFFF,
+           "NO_NULL_TERMINATION left the buffer unterminated");
+
+    uint8_t bytes[8] = {};
+    expect(one_byte->WriteOneByte(bytes) == 3 && bytes[2] == 0xE9 &&
+               bytes[3] == 0,
+           "WriteOneByte narrowed the code units");
+
+    // A surrogate pair is two code units and one four-byte UTF-8 character.
+    const uint16_t pair[] = {0xD83D, 0xDE00};
+    v8::Local<v8::String> astral =
+        v8::String::NewFromTwoByte(isolate, pair, v8::NewStringType::kNormal, 2)
+            .ToLocalChecked();
+    expect(astral->Length() == 2 && !astral->ContainsOnlyOneByte(),
+           "a surrogate pair is two code units and not one-byte");
+    char utf8[16] = {};
+    int covered = 0;
+    expect(astral->WriteUtf8(isolate, utf8, -1, &covered) == 5 && covered == 2,
+           "WriteUtf8 wrote four bytes and a terminator for two code units");
+    expect(static_cast<unsigned char>(utf8[0]) == 0xF0 &&
+               static_cast<unsigned char>(utf8[2]) == 0x98 &&
+               static_cast<unsigned char>(utf8[3]) == 0x80 && utf8[4] == '\0',
+           "WriteUtf8 encoded the pair as one four-byte character");
+
+    // A lone surrogate has no encoding of its own, so the default write is its
+    // own three bytes and only REPLACE_INVALID_UTF8 substitutes U+FFFD.
+    const uint16_t lone[] = {0xD800, 'A'};
+    v8::Local<v8::String> surrogate =
+        v8::String::NewFromTwoByte(isolate, lone, v8::NewStringType::kNormal, 2)
+            .ToLocalChecked();
+    expect(surrogate->Utf8Length(isolate) == 4,
+           "a lone surrogate counts three UTF-8 bytes");
+    char lone_utf8[16] = {};
+    int lone_covered = 0;
+    expect(surrogate->WriteUtf8(isolate, lone_utf8, -1, &lone_covered) == 5 &&
+               lone_covered == 2 &&
+               static_cast<unsigned char>(lone_utf8[0]) == 0xED &&
+               static_cast<unsigned char>(lone_utf8[1]) == 0xA0 &&
+               static_cast<unsigned char>(lone_utf8[2]) == 0x80 &&
+               lone_utf8[3] == 'A',
+           "WriteUtf8 wrote the lone surrogate as its own three bytes");
+
+    char replaced[16] = {};
+    expect(surrogate->WriteUtf8(isolate, replaced, -1, nullptr,
+                               v8::REPLACE_INVALID_UTF8) == 5 &&
+               static_cast<unsigned char>(replaced[0]) == 0xEF &&
+               static_cast<unsigned char>(replaced[2]) == 0xBD,
+           "REPLACE_INVALID_UTF8 substituted U+FFFD");
+
+    // A buffer that cannot hold the whole character gets nothing of it, only
+    // the terminator.
+    char limited[4];
+    for (char& byte : limited) byte = 0x7F;
+    expect(astral->WriteUtf8(isolate, limited, 3) == 1 && limited[0] == '\0' &&
+               limited[1] == 0x7F,
+           "a buffer too small for the character was left alone");
+
+    // The integer conversions convert with ToNumber first, so an object's own
+    // valueOf takes part, and then wrap the way ToInt32/ToUint32 do.
+    expect(run("4294967297")->Int32Value(current).FromMaybe(-99) == 1,
+           "Int32Value wrapped past 2^32");
+    expect(run("-1.9")->Int32Value(current).FromMaybe(-99) == -1,
+           "Int32Value truncated toward zero");
+    expect(run("'-1'")->Int32Value(current).FromMaybe(-99) == -1,
+           "Int32Value ran ToNumber on a string");
+    expect(run("({ valueOf: function () { return 7.9; } })")
+                   ->Int32Value(current)
+                   .FromMaybe(-99) == 7,
+           "Int32Value ran the object's valueOf");
+    expect(run("-1")->Uint32Value(current).FromMaybe(0) == 4294967295u,
+           "Uint32Value wrapped a negative number");
+    expect(run("2.9")->IntegerValue(current).FromMaybe(-99) == 2,
+           "IntegerValue truncated");
+    expect(run("-2.9")->IntegerValue(current).FromMaybe(-99) == -2,
+           "IntegerValue truncated toward zero for a negative number");
+    expect(run("Infinity")->IntegerValue(current).FromMaybe(0) ==
+               9223372036854775807LL,
+           "IntegerValue saturated at the int64 end");
+    {
+      v8::TryCatch throwing(isolate);
+      expect(run("({ valueOf: function () { throw new RangeError('no'); } })")
+                 ->IntegerValue(current)
+                 .IsNothing(),
+             "a throwing valueOf left the conversion empty");
+      expect(throwing.HasCaught(), "the throw reached the host");
+    }
   }
 
   // Errors, private names, and the data-property forms: the values a host

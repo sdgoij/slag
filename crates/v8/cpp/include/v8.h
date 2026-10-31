@@ -56,6 +56,16 @@ class Maybe;
 
 enum class NewStringType { kNormal, kInternalized };
 
+/* How `String::Write` behaves about the trailing NUL (`v8::WriteOptions`). The
+ * facade honours `NO_NULL_TERMINATION` and treats the rest as the default. */
+enum WriteOptions {
+  NO_OPTIONS = 0,
+  HINT_MANY_WRITES_EXPECTED = 1,
+  NO_NULL_TERMINATION = 2,
+  PRESERVE_ONE_BYTE_NULL = 4,
+  REPLACE_INVALID_UTF8 = 8
+};
+
 /* When the job queues drain (`v8::MicrotasksPolicy`).
  *
  * `kAuto`, the default, drains after a successful `Script::Run` returns, so the
@@ -285,8 +295,13 @@ class Value {
   bool StrictEquals(Local<Value> that) const;
   bool SameValue(Local<Value> that) const;
 
+  /* The integer conversions. Each runs ToNumber first, so an object's `valueOf`
+   * is what a host sees, and each wraps rather than failing on a converted
+   * number that does not fit, which is what ToInt32/ToUint32 do. An empty
+   * answer means the conversion threw and the error is pending. */
   Maybe<uint32_t> Uint32Value(Local<Context> context) const;
   Maybe<int32_t> Int32Value(Local<Context> context) const;
+  Maybe<int64_t> IntegerValue(Local<Context> context) const;
 };
 
 /* An accessor's callbacks (`v8::AccessorNameGetterCallback` and its setter):
@@ -693,8 +708,39 @@ class String : public Name {
   static MaybeLocal<String> NewFromUtf8(
       Isolate* isolate, const char* str,
       NewStringType type = NewStringType::kNormal, int length = -1);
+  /* Latin-1 input: each byte is one code unit, so 0xE9 is U+00E9. */
+  static MaybeLocal<String> NewFromOneByte(
+      Isolate* isolate, const uint8_t* data,
+      NewStringType type = NewStringType::kNormal, int length = -1);
+  /* UTF-16 input. The facade copies the code units; there is no external-string
+   * store a host handle could keep alive. */
+  static MaybeLocal<String> NewFromTwoByte(
+      Isolate* isolate, const uint16_t* data,
+      NewStringType type = NewStringType::kNormal, int length = -1);
 
+  /* The UTF-16 code unit count, not the UTF-8 byte count (that is
+   * `Utf8Length`). */
   int Length() const;
+  int Utf8Length(Isolate* isolate) const;
+  bool ContainsOnlyOneByte() const;
+
+  /* Write a window of the string into a host buffer. `start` is a code unit
+   * index (negative counts from the end), `length` a unit or byte count (-1 for
+   * the rest), and the answer is the number written. The buffer must have room
+   * for one more unit, because a NUL is appended unless `NO_NULL_TERMINATION`
+   * is passed. `WriteUtf8` writes whole characters only and reports their count
+   * through `nchars_ref`. */
+  int Write(Isolate* isolate, uint16_t* buffer, int start = 0, int length = -1,
+            int options = NO_OPTIONS) const;
+  int Write(uint16_t* buffer, int start = 0, int length = -1,
+            int options = NO_OPTIONS) const;
+  int WriteOneByte(Isolate* isolate, uint8_t* buffer, int start = 0,
+                   int length = -1, int options = NO_OPTIONS) const;
+  int WriteOneByte(uint8_t* buffer, int start = 0, int length = -1,
+                   int options = NO_OPTIONS) const;
+  int WriteUtf8(Isolate* isolate, char* buffer, int length = -1,
+                int* nchars_ref = nullptr,
+                int options = NO_OPTIONS) const;
 
   class Utf8Value {
    public:

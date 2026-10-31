@@ -330,6 +330,14 @@ impl CallbackWindow {
         Ok(())
     }
 
+    /// ToNumber (the re-entrant counterpart of [`Context::to_number`]).
+    pub fn to_number(&self, value: JsValue) -> Result<f64, JsError> {
+        crate::context::to_number(
+            crate::context::callback_agent(self.agent)?,
+            &value.into_value(),
+        )
+    }
+
     /// [[Get]] a property by the key value a host built (the re-entrant
     /// counterpart of [`Context::get_property`]).
     pub fn get_property(&self, object: JsValue, key: JsValue) -> Result<JsValue, JsError> {
@@ -4876,6 +4884,25 @@ mod tests {
         );
         // The guarded window is gone, so its token names nothing.
         assert!(CallbackWindow::admit(token).is_none());
+    }
+
+    #[test]
+    fn a_callback_window_converts_through_its_token() {
+        let mut context = Context::new().unwrap();
+        // An object whose valueOf runs host code needs the window's agent, which
+        // is exactly what a host conversion inside a getter goes through.
+        let object = context
+            .eval("({ valueOf: function () { return 7.5; } })")
+            .unwrap();
+        let agent = context.agent_mut() as *mut Agent as crux::function::AgentPtr;
+        {
+            let _guard = CallbackWindow::enter(agent);
+            let window = CallbackWindow::admit(CallbackWindow::token()).expect("the window");
+            assert_eq!(window.to_number(JsValue::string("0x10")).unwrap(), 16.0);
+            assert_eq!(window.to_number(JsValue::boolean(true)).unwrap(), 1.0);
+            assert!(window.to_number(JsValue::undefined()).unwrap().is_nan());
+            assert_eq!(window.to_number(object).unwrap(), 7.5);
+        }
     }
 
     #[test]
