@@ -598,8 +598,7 @@ What is deliberately absent, and why:
   through the context, which the operation that called the handler holds
   borrowed. A handler callback cannot allocate an object or an array until there
   is a re-entrant allocation path (the shape `FunctionCall` has for host
-  functions);
-- `definer` and `descriptor` need a property-descriptor ABI.
+  functions).
 
 Because the C struct does not carry them, a host that needs one does not compile
 rather than having it silently ignored.
@@ -624,13 +623,27 @@ otherwise. That is V8's rule and the rule the crate's bridge already documents.
 While wiring the enumerator the reason it cannot be useful yet became concrete:
 `Object.keys` reads each key's own descriptor, and a host object whose
 `get_own_property` is not implemented falls through to the ordinary method, which
-reports the key absent — so the enumerator's keys are dropped before a caller
-sees them. The crate's interceptor answers `get_own_property` through its
-`descriptor` callback for exactly this reason. So the order is now: a
-property-descriptor ABI (which carries `descriptor` and `definer`), then the
-re-entrant allocation path a callback needs to build the enumerator's array, then
-the enumerator itself. `SetAccessor` is a separate surface: it needs an accessor
-callback whose getter runs as a function with the property's key in hand.
+reports the key absent — so the enumerator's keys would be dropped before a
+caller sees them. The crate's interceptor answers `get_own_property` through its
+`descriptor` callback for exactly this reason.
+
+*Property descriptors (2026-10-31).* The descriptor ABI landed next, in the order
+that finding implied. A `SlagPropertyDescriptor` carries value, get, set, and the
+three attributes as present-or-absent fields, because a descriptor distinguishes
+"not mentioned" from "mentioned and false". The named handler gains `descriptor`
+(answering a descriptor object, which the Rust side reads with the engine's own
+`to_property_descriptor`) and `definer` (receiving the marshalled descriptor);
+`Object::defineProperty` and `Object.getOwnPropertyDescriptor` now reach a host.
+The `gin-shapes` handler answers a descriptor it built before installing itself,
+because a callback still cannot allocate, and checks that a define arrives at the
+`definer` with value and writable set.
+
+That leaves the order unchanged for what remains: the re-entrant allocation path
+(a callback cannot allocate an object or an array while the calling operation
+holds the context), then the enumerator, which needs both it and the
+descriptor callback that just landed. `SetAccessor` is a separate surface: it
+needs an accessor callback whose getter runs as a function with the property's
+key in hand.
 
 The ABI shape is roughly a struct of up to seven C function pointers, the data
 pointer, and the flags, handed over once per template, with the return codes

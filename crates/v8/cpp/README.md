@@ -160,17 +160,12 @@ behaviour per template, with the configuration's `data` value pinned for as long
 as an instance can call it. A handler is consulted *before* the object's own
 lookup, which is V8's masking default; there is no non-masking mode.
 
-Three callbacks are absent on purpose:
-
-- the enumerator, because it builds the array it answers with and allocating one
-  through the facade needs the context that the calling operation holds
-  borrowed. It also needs a `descriptor` callback to be observable at all:
-  `Object.keys` reads each key's own descriptor, and a host object whose
-  descriptor lookup falls through to the ordinary method reports the key as
-  absent. The descriptor ABI therefore comes before the enumerator;
-- `definer` and `descriptor`, which need a property-descriptor ABI.
-
-A host that needs them does not compile, which is the only honest failure mode.
+**One callback is absent on purpose:** the enumerator. It builds the array it
+answers with, and allocating one through the facade needs the context that the
+calling operation holds borrowed. `Object.keys` needs a `descriptor` callback as
+well, which now exists, so the enumerator waits only on the re-entrant
+allocation path. A host that needs it does not compile, which is the only honest
+failure mode.
 
 `SetHandler` also takes an `IndexedPropertyHandlerConfiguration`: a key that is
 an array index goes to those callbacks when they are installed, and to the named
@@ -179,8 +174,11 @@ callbacks (getter, setter, query, deleter) and no enumerator, for the same
 reason.
 
 `gin-shapes` installs a handler that owns three names through its query, answers
-one through its getter and declines the rest, and takes a set and a delete; it
-checks the same answers through C++ (`Get`/`Has`/`Set`/`Delete`) and through a
+one through its getter and declines the rest, takes a set and a delete, and
+answers `Object.getOwnPropertyDescriptor` from a `descriptor` callback whose
+object it built before installing the handler. A define reaches the `definer`,
+which sees the descriptor marshalled back into `v8::PropertyDescriptor`. The same
+answers are repeated through C++ (`Get`/`Has`/`Set`/`Delete`) and through a
 script, where `in` and a member read both reach the handler.
 
 ## The gin target
@@ -228,8 +226,9 @@ not a claim that gin itself links.
   own-property predicates `HasRealNamedProperty`,
   `HasRealIndexedProperty`, and `HasRealNamedCallbackProperty`.
 - `ObjectTemplate::SetHandler` with the named and indexed property handlers:
-  getter, setter, query, and deleter in each, and `Intercepted` /
-  `PropertyCallbackInfo<T>`.
+  getter, setter, query, deleter, and (for the named one) descriptor and
+  definer, plus `Intercepted`, `PropertyCallbackInfo<T>`, and
+  `PropertyDescriptor`.
 - `TracedReference<T>` as a host-owned root: copy is a second reference, `Reset`
   releases it, and the destructor releases it like any persistent.
 - Handles and persistents as engine roots: a handle slot or a `Global` over an
@@ -256,11 +255,13 @@ not a claim that gin itself links.
 - `Isolate::Dispose` frees the contexts the facade created; templates are not
   freed.
 - Host callbacks receive `this` now (`FunctionCallbackInfo::This`), but the
-  `Object` surface is still narrow: `SetAccessor`, `GetIdentityHash`'s siblings,
-  and the indexed handler are absent. A handler has no enumerator, `definer`, or
-  `descriptor` (see the named-property-handler section), and a handler callback
-  cannot allocate an object or an array, because the context is borrowed by the
-  operation that called it.
+  `Object` surface is still narrow: `SetAccessor` and `GetIdentityHash`'s
+  siblings are absent. A handler has no enumerator (see above), and a handler
+  callback cannot allocate an object or an array, because the context is borrowed
+  by the operation that called it. A callback that needs to answer with an object
+  therefore has to have built it beforehand. The indexed `descriptor` and
+  `definer` callbacks are in the ABI but nothing in `gin-shapes` exercises them
+  yet.
 - `load()` is compiled but refused at run time. The sample re-enters through
   `ExecuteString`, and the safe engine path for a host callback is
   `FunctionCall::eval` (`slag_call_eval`), which the sample does not call. The

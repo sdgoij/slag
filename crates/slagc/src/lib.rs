@@ -22,7 +22,7 @@ use std::rc::Rc;
 mod handler;
 
 use handler::CxxHandler;
-pub use handler::SlagPropertyHandler;
+pub use handler::{SlagPropertyDescriptor, SlagPropertyHandler};
 
 use crux::heap::{GcAny, RootSource, Trace, register_root_source};
 use crux::value::Value;

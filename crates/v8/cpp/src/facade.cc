@@ -183,6 +183,88 @@ int32_t DeleterTrampoline(void* state, uint64_t data, uint64_t holder,
       configuration->deleter(v8::Local<v8::Name>::New(key), info));
 }
 
+/* The descriptor a definer is handed: built from the ABI's present-or-absent
+ * fields, into the `v8::PropertyDescriptor` the callback takes. */
+v8::PropertyDescriptor DescriptorOf(const SlagPropertyDescriptor& source) {
+  v8::PropertyDescriptor descriptor;
+  if (source.has_value != 0) {
+    descriptor = v8::PropertyDescriptor(
+        v8::Local<v8::Value>::New(source.value));
+    if (source.has_writable != 0) {
+      descriptor = v8::PropertyDescriptor(
+          v8::Local<v8::Value>::New(source.value), source.writable != 0);
+    }
+  } else if (source.has_get != 0 || source.has_set != 0) {
+    descriptor = v8::PropertyDescriptor(
+        v8::Local<v8::Value>::New(source.get),
+        v8::Local<v8::Value>::New(source.set));
+  }
+  if (source.has_enumerable != 0) descriptor.set_enumerable(source.enumerable != 0);
+  if (source.has_configurable != 0) {
+    descriptor.set_configurable(source.configurable != 0);
+  }
+  return descriptor;
+}
+
+int32_t DescriptorTrampoline(void* state, uint64_t data, uint64_t holder,
+                             uint64_t key, uint64_t* out) {
+  auto* configuration = Configuration(state);
+  if (configuration == nullptr || configuration->descriptor == nullptr ||
+      out == nullptr) {
+    return 0;
+  }
+  *out = slag_undefined();
+  v8::PropertyCallbackInfo<v8::Value> info(v8::g_current_isolate, holder, data,
+                                           out);
+  return static_cast<int32_t>(
+      configuration->descriptor(v8::Local<v8::Name>::New(key), info));
+}
+
+int32_t DefinerTrampoline(void* state, uint64_t data, uint64_t holder,
+                          uint64_t key, const SlagPropertyDescriptor* source,
+                          uint64_t* out) {
+  auto* configuration = Configuration(state);
+  if (configuration == nullptr || configuration->definer == nullptr ||
+      source == nullptr || out == nullptr) {
+    return 0;
+  }
+  *out = slag_undefined();
+  v8::PropertyCallbackInfo<v8::Boolean> info(v8::g_current_isolate, holder,
+                                             data, out);
+  return static_cast<int32_t>(configuration->definer(
+      v8::Local<v8::Name>::New(key), DescriptorOf(*source), info));
+}
+
+int32_t IndexedDescriptorTrampoline(void* state, uint64_t data,
+                                    uint64_t holder, uint32_t index,
+                                    uint64_t* out) {
+  auto* configuration = IndexedConfiguration(state);
+  if (configuration == nullptr || configuration->descriptor == nullptr ||
+      out == nullptr) {
+    return 0;
+  }
+  *out = slag_undefined();
+  v8::PropertyCallbackInfo<v8::Value> info(v8::g_current_isolate, holder, data,
+                                           out);
+  return static_cast<int32_t>(configuration->descriptor(index, info));
+}
+
+int32_t IndexedDefinerTrampoline(void* state, uint64_t data, uint64_t holder,
+                                 uint32_t index,
+                                 const SlagPropertyDescriptor* source,
+                                 uint64_t* out) {
+  auto* configuration = IndexedConfiguration(state);
+  if (configuration == nullptr || configuration->definer == nullptr ||
+      source == nullptr || out == nullptr) {
+    return 0;
+  }
+  *out = slag_undefined();
+  v8::PropertyCallbackInfo<v8::Boolean> info(v8::g_current_isolate, holder,
+                                             data, out);
+  return static_cast<int32_t>(
+      configuration->definer(index, DescriptorOf(*source), info));
+}
+
 }  // namespace
 
 namespace v8 {
@@ -491,10 +573,14 @@ MaybeLocal<Object> ObjectTemplate::NewInstance(Local<Context> context) {
     handler.setter = SetterTrampoline;
     handler.query = QueryTrampoline;
     handler.deleter = DeleterTrampoline;
+    handler.descriptor = DescriptorTrampoline;
+    handler.definer = DefinerTrampoline;
     handler.indexed_getter = IndexedGetterTrampoline;
     handler.indexed_setter = IndexedSetterTrampoline;
     handler.indexed_query = IndexedQueryTrampoline;
     handler.indexed_deleter = IndexedDeleterTrampoline;
+    handler.indexed_descriptor = IndexedDescriptorTrampoline;
+    handler.indexed_definer = IndexedDefinerTrampoline;
     handler.data = named_handler_.data.IsEmpty()
                        ? slag_undefined()
                        : named_handler_.data.raw();

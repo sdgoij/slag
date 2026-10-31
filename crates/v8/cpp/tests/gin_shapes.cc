@@ -46,6 +46,9 @@ struct HostNames {
   int indexed_getters = 0;
   int indexed_setters = 0;
   int indexed_deleters = 0;
+  int descriptors = 0;
+  int definers = 0;
+  int definer_descriptors = 0;
 };
 
 HostNames host_names;
@@ -134,6 +137,38 @@ v8::Intercepted HostDeleteIndex(
     uint32_t index, const v8::PropertyCallbackInfo<v8::Boolean>& info) {
   if (index >= 3) return v8::Intercepted::kNo;
   ++host_names.indexed_deleters;
+  info.GetReturnValue().Set(v8::Boolean::New(info.GetIsolate(), true));
+  return v8::Intercepted::kYes;
+}
+
+// A descriptor callback cannot build the descriptor object it answers with: that
+// allocates, and the operation that called the handler holds the context. So the
+// answer is built once, at the top level, and handed back from here.
+v8::Global<v8::Value> descriptor_answer;
+
+v8::Intercepted HostDescriptor(
+    v8::Local<v8::Name> property,
+    const v8::PropertyCallbackInfo<v8::Value>& info) {
+  v8::String::Utf8Value text(info.GetIsolate(), property);
+  if (!*text || !IsHostName(*text)) return v8::Intercepted::kNo;
+  ++host_names.descriptors;
+  if (descriptor_answer.IsEmpty()) return v8::Intercepted::kNo;
+  info.GetReturnValue().Set(
+      descriptor_answer.Get(info.GetIsolate()).As<v8::Value>());
+  return v8::Intercepted::kYes;
+}
+
+// The definer receives the descriptor V8 built, so the facade has to marshal it
+// back into the C++ shape.
+v8::Intercepted HostDefiner(
+    v8::Local<v8::Name> property, const v8::PropertyDescriptor& descriptor,
+    const v8::PropertyCallbackInfo<v8::Boolean>& info) {
+  v8::String::Utf8Value text(info.GetIsolate(), property);
+  if (!*text || !IsHostName(*text)) return v8::Intercepted::kNo;
+  ++host_names.definers;
+  if (descriptor.has_value() && descriptor.has_writable()) {
+    ++host_names.definer_descriptors;
+  }
   info.GetReturnValue().Set(v8::Boolean::New(info.GetIsolate(), true));
   return v8::Intercepted::kYes;
 }
@@ -465,8 +500,24 @@ int main() {
     v8::HandleScope scope(isolate);
     v8::Local<v8::Context> current = context.Get(isolate);
 
+    // The descriptor callback answers with this object, built here because a
+    // callback cannot allocate.
+    {
+      v8::Local<v8::Object> answer =
+          v8::ObjectTemplate::New(isolate)->NewInstance(current).ToLocalChecked();
+      answer->Set(current, v8::String::NewFromUtf8Literal(isolate, "value"),
+                  v8::Integer::New(isolate, 42));
+      answer->Set(current,
+                  v8::String::NewFromUtf8Literal(isolate, "enumerable"),
+                  v8::Boolean::New(isolate, true));
+      answer->Set(current,
+                  v8::String::NewFromUtf8Literal(isolate, "configurable"),
+                  v8::Boolean::New(isolate, true));
+      descriptor_answer.Reset(isolate, answer);
+    }
+
     v8::NamedPropertyHandlerConfiguration configuration(
-        HostGet, HostSet, HostQuery, HostDelete,
+        HostGet, HostSet, HostQuery, HostDelete, HostDescriptor, HostDefiner,
         v8::Integer::New(isolate, 7));
     v8::Local<v8::ObjectTemplate> tmpl = v8::ObjectTemplate::New(isolate);
     tmpl->SetHandler(configuration);
@@ -538,6 +589,45 @@ int main() {
     if (host_names.data_misses != 0) {
       ++failures;
     }
+
+    // The handler's own descriptor answers `Object.getOwnPropertyDescriptor`, and
+    // a define reaches the definer with the descriptor marshalled back into C++.
+    v8::Local<v8::Value> described;
+    bool read_descriptor =
+        v8::Script::Compile(
+            current,
+            v8::String::NewFromUtf8Literal(
+                isolate,
+                "Object.getOwnPropertyDescriptor(handled, 'alpha').value"))
+            .ToLocalChecked()
+            ->Run(current)
+            .ToLocal(&described) &&
+        described->Int32Value(current).FromMaybe(-1) == 42;
+    if (!read_descriptor) {
+      fprintf(stderr, "the handler's descriptor did not answer\n");
+      ++failures;
+    }
+    v8::Local<v8::Value> define_result;
+    bool defined =
+        v8::Script::Compile(
+            current,
+            v8::String::NewFromUtf8Literal(
+                isolate,
+                "Object.defineProperty(handled, 'gamma', { value: 5, writable: true }); 1"))
+            .ToLocalChecked()
+            ->Run(current)
+            .ToLocal(&define_result) &&
+        define_result->Int32Value(current).FromMaybe(-1) == 1;
+    if (!defined) {
+      fprintf(stderr, "the define did not reach the handler's definer\n");
+      ++failures;
+    }
+    if (host_names.descriptors == 0 || host_names.definers == 0 ||
+        host_names.definer_descriptors == 0) {
+      fprintf(stderr, "the descriptor or definer callback was never asked\n");
+      ++failures;
+    }
+    descriptor_answer.Reset();
 
     // The indexed handler owns elements 0..2; a higher index falls back.
     v8::IndexedPropertyHandlerConfiguration indexed(HostGetIndex, HostSetIndex,

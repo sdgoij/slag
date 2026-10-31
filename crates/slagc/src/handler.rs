@@ -22,6 +22,45 @@ use crux::object::JsObject;
 use crux::property::PropertyKey;
 use crux::value::{Value, ValueKind};
 
+/// A property descriptor as the definer callback receives it
+/// (`v8::PropertyDescriptor`): each field present-or-absent, because V8's
+/// descriptor distinguishes "not mentioned" from "mentioned and false".
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SlagPropertyDescriptor {
+    pub has_value: i32,
+    pub value: u64,
+    pub has_writable: i32,
+    pub writable: i32,
+    pub has_get: i32,
+    pub get: u64,
+    pub has_set: i32,
+    pub set: u64,
+    pub has_enumerable: i32,
+    pub enumerable: i32,
+    pub has_configurable: i32,
+    pub configurable: i32,
+}
+
+impl SlagPropertyDescriptor {
+    fn of(desc: &crux::property::PropertyDescriptor) -> Self {
+        Self {
+            has_value: i32::from(desc.value.is_some()),
+            value: desc.value.map_or(0, |value| value.bits()),
+            has_writable: i32::from(desc.writable.is_some()),
+            writable: i32::from(desc.writable.unwrap_or(false)),
+            has_get: i32::from(desc.get.is_some()),
+            get: desc.get.map_or(0, |value| value.bits()),
+            has_set: i32::from(desc.set.is_some()),
+            set: desc.set.map_or(0, |value| value.bits()),
+            has_enumerable: i32::from(desc.enumerable.is_some()),
+            enumerable: i32::from(desc.enumerable.unwrap_or(false)),
+            has_configurable: i32::from(desc.configurable.is_some()),
+            configurable: i32::from(desc.configurable.unwrap_or(false)),
+        }
+    }
+}
+
 /// V8's `Intercepted`, as the flat ABI carries it.
 const INTERCEPTED_NO: i32 = 0;
 const INTERCEPTED_THROW: i32 = 3;
@@ -53,6 +92,20 @@ pub struct SlagPropertyHandler {
     pub query: Option<unsafe extern "C" fn(*mut c_void, u64, u64, u64, *mut u64) -> i32>,
     /// `(state, data, holder, key, out)`: the out slot holds a boolean.
     pub deleter: Option<unsafe extern "C" fn(*mut c_void, u64, u64, u64, *mut u64) -> i32>,
+    /// `(state, data, holder, key, out)`: [[GetOwnProperty]], where the out slot
+    /// receives the descriptor object.
+    pub descriptor: Option<unsafe extern "C" fn(*mut c_void, u64, u64, u64, *mut u64) -> i32>,
+    /// `(state, data, holder, key, descriptor, out)`: [[DefineOwnProperty]].
+    pub definer: Option<
+        unsafe extern "C" fn(
+            *mut c_void,
+            u64,
+            u64,
+            u64,
+            *const SlagPropertyDescriptor,
+            *mut u64,
+        ) -> i32,
+    >,
     /// The indexed twins, for a key that is an array index: `(state, data,
     /// holder, index, receiver, out)` and so on. V8 routes a key by its shape,
     /// and so does this handler: an array index goes to the indexed callback
@@ -63,6 +116,19 @@ pub struct SlagPropertyHandler {
         Option<unsafe extern "C" fn(*mut c_void, u64, u64, u32, u64, u64, i32) -> i32>,
     pub indexed_query: Option<unsafe extern "C" fn(*mut c_void, u64, u64, u32, *mut u64) -> i32>,
     pub indexed_deleter: Option<unsafe extern "C" fn(*mut c_void, u64, u64, u32, *mut u64) -> i32>,
+    /// The indexed twins of `descriptor` and `definer`.
+    pub indexed_descriptor:
+        Option<unsafe extern "C" fn(*mut c_void, u64, u64, u32, *mut u64) -> i32>,
+    pub indexed_definer: Option<
+        unsafe extern "C" fn(
+            *mut c_void,
+            u64,
+            u64,
+            u32,
+            *const SlagPropertyDescriptor,
+            *mut u64,
+        ) -> i32,
+    >,
     /// The configuration's `data`, as tagged `Value` bits.
     pub data: u64,
     /// The C++ side's trampoline context for the named callbacks.
@@ -82,6 +148,10 @@ impl fmt::Debug for SlagPropertyHandler {
             .field("indexed_setter", &self.indexed_setter.is_some())
             .field("indexed_query", &self.indexed_query.is_some())
             .field("indexed_deleter", &self.indexed_deleter.is_some())
+            .field("descriptor", &self.descriptor.is_some())
+            .field("definer", &self.definer.is_some())
+            .field("indexed_descriptor", &self.indexed_descriptor.is_some())
+            .field("indexed_definer", &self.indexed_definer.is_some())
             .finish()
     }
 }
@@ -123,6 +193,22 @@ fn thrown() -> JsError {
     )
 }
 
+/// The engine `Property` a descriptor answer describes: the engine's own
+/// ToPropertyDescriptor, then the record the internal method answers with.
+fn property_of(descriptor: crux::property::PropertyDescriptor) -> crux::object::Property {
+    let enumerable = descriptor.enumerable.unwrap_or(false);
+    let configurable = descriptor.configurable.unwrap_or(false);
+    match (descriptor.value, descriptor.get, descriptor.set) {
+        (Some(value), None, None) => crux::object::Property::data(
+            value,
+            descriptor.writable.unwrap_or(false),
+            enumerable,
+            configurable,
+        ),
+        (_, get, set) => crux::object::Property::accessor(get, set, enumerable, configurable),
+    }
+}
+
 /// The boolean a deleter wrote into its slot: anything but `true` is a refused
 /// delete, which is what an unset slot means.
 fn deleted(answer: u64) -> bool {
@@ -130,6 +216,102 @@ fn deleted(answer: u64) -> bool {
 }
 
 impl HostOps for CxxHandler {
+    fn get_own_property(
+        &self,
+        object: &JsObject,
+        key: &PropertyKey,
+    ) -> Option<Result<crux::object::Property, JsError>> {
+        // The indexed twin first, the same routing as `get`.
+        let intercepted = if let Some(index) = crux::object::array_index_of(key)
+            && let Some(callback) = self.handler.indexed_descriptor
+        {
+            let mut answer = 0;
+            // SAFETY: as in `get`.
+            let code = unsafe {
+                callback(
+                    self.handler.indexed_state,
+                    self.handler.data,
+                    object.self_value().bits(),
+                    index as u32,
+                    &mut answer,
+                )
+            };
+            (code, answer)
+        } else {
+            let callback = self.handler.descriptor?;
+            let key = key_value(key);
+            let mut answer = 0;
+            // SAFETY: as in `get`.
+            let code = unsafe {
+                callback(
+                    self.handler.state,
+                    self.handler.data,
+                    object.self_value().bits(),
+                    key.bits(),
+                    &mut answer,
+                )
+            };
+            (code, answer)
+        };
+        Some(match intercepted {
+            // Not intercepted: the engine's own [[GetOwnProperty]] runs, which
+            // is what makes an enumerated key fall through to absence.
+            (INTERCEPTED_NO, _) => return None,
+            (INTERCEPTED_THROW, _) => Err(thrown()),
+            (_, answer) => {
+                crux::property::to_property_descriptor(&Value::from_bits(answer)).map(property_of)
+            }
+        })
+    }
+
+    fn define_property(
+        &self,
+        object: &JsObject,
+        key: &PropertyKey,
+        desc: &crux::property::PropertyDescriptor,
+    ) -> Option<Result<bool, JsError>> {
+        let descriptor = SlagPropertyDescriptor::of(desc);
+        let intercepted = if let Some(index) = crux::object::array_index_of(key)
+            && let Some(callback) = self.handler.indexed_definer
+        {
+            let mut answer = 0;
+            // SAFETY: as in `get`.
+            let code = unsafe {
+                callback(
+                    self.handler.indexed_state,
+                    self.handler.data,
+                    object.self_value().bits(),
+                    index as u32,
+                    &descriptor,
+                    &mut answer,
+                )
+            };
+            (code, answer)
+        } else {
+            let callback = self.handler.definer?;
+            let key = key_value(key);
+            let mut answer = 0;
+            // SAFETY: as in `get`.
+            let code = unsafe {
+                callback(
+                    self.handler.state,
+                    self.handler.data,
+                    object.self_value().bits(),
+                    key.bits(),
+                    &descriptor,
+                    &mut answer,
+                )
+            };
+            (code, answer)
+        };
+        match intercepted {
+            // Not intercepted: the engine's own [[DefineOwnProperty]] runs.
+            (INTERCEPTED_NO, _) => None,
+            (INTERCEPTED_THROW, _) => Some(Err(thrown())),
+            (_, answer) => Some(Ok(deleted(answer))),
+        }
+    }
+
     fn get(
         &self,
         object: &JsObject,

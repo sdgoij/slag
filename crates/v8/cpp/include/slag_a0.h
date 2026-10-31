@@ -18,6 +18,24 @@ typedef struct SlagTraced SlagTraced;
 typedef uint64_t (*slag_host_fn)(void* data, const void* call, uint64_t this_value,
                                  const uint64_t* args, size_t len);
 
+/* A property descriptor as the definer callback receives it
+ * (v8::PropertyDescriptor). Each field is present-or-absent, because V8's
+ * descriptor distinguishes "not mentioned" from "mentioned and false". */
+typedef struct SlagPropertyDescriptor {
+  int32_t has_value;
+  uint64_t value;
+  int32_t has_writable;
+  int32_t writable;
+  int32_t has_get;
+  uint64_t get;
+  int32_t has_set;
+  uint64_t set;
+  int32_t has_enumerable;
+  int32_t enumerable;
+  int32_t has_configurable;
+  int32_t configurable;
+} SlagPropertyDescriptor;
+
 /* The C callbacks of a v8::NamedPropertyHandlerConfiguration. Each returns V8's
  * Intercepted (0 kNo, 1 kYes, 2 kYesKeepExisting, 3 kThrow) and writes its
  * answer through its out parameter; a null pointer is a callback the host did
@@ -32,6 +50,14 @@ typedef struct SlagPropertyHandler {
                    uint64_t* out);
   int32_t (*deleter)(void* state, uint64_t data, uint64_t holder, uint64_t key,
                      uint64_t* out);
+  /* [[GetOwnProperty]]: the out slot receives a descriptor object, which the
+   * Rust side reads with the engine's own ToPropertyDescriptor. */
+  int32_t (*descriptor)(void* state, uint64_t data, uint64_t holder,
+                        uint64_t key, uint64_t* out);
+  /* [[DefineOwnProperty]]: the descriptor is handed in, and the out slot
+   * receives a boolean. */
+  int32_t (*definer)(void* state, uint64_t data, uint64_t holder, uint64_t key,
+                     const SlagPropertyDescriptor* descriptor, uint64_t* out);
   int32_t (*indexed_getter)(void* state, uint64_t data, uint64_t holder,
                             uint32_t index, uint64_t receiver, uint64_t* out);
   int32_t (*indexed_setter)(void* state, uint64_t data, uint64_t holder,
@@ -41,6 +67,12 @@ typedef struct SlagPropertyHandler {
                            uint32_t index, uint64_t* out);
   int32_t (*indexed_deleter)(void* state, uint64_t data, uint64_t holder,
                              uint32_t index, uint64_t* out);
+  int32_t (*indexed_descriptor)(void* state, uint64_t data, uint64_t holder,
+                                uint32_t index, uint64_t* out);
+  int32_t (*indexed_definer)(void* state, uint64_t data, uint64_t holder,
+                             uint32_t index,
+                             const SlagPropertyDescriptor* descriptor,
+                             uint64_t* out);
   uint64_t data;
   void* state;
   void* indexed_state;

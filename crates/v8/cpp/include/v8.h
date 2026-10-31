@@ -331,6 +331,57 @@ class Boolean : public Value {
   static Local<Boolean> New(Isolate* isolate, bool value);
 };
 
+/* A property descriptor (`v8::PropertyDescriptor`): what a definer callback
+ * receives. Each field is present-or-absent, because a descriptor distinguishes
+ * "not mentioned" from "mentioned and false". */
+class PropertyDescriptor {
+ public:
+  PropertyDescriptor() = default;
+  explicit PropertyDescriptor(Local<Value> value)
+      : value_(value), has_value_(true), has_writable_(true), writable_(false) {}
+  PropertyDescriptor(Local<Value> value, bool writable)
+      : value_(value), has_value_(true), has_writable_(true), writable_(writable) {}
+  PropertyDescriptor(Local<Value> get, Local<Value> set)
+      : get_(get), set_(set), has_get_(true), has_set_(true) {}
+
+  bool has_value() const { return has_value_; }
+  Local<Value> value() const { return value_; }
+  bool has_writable() const { return has_writable_; }
+  bool writable() const { return writable_; }
+  bool has_get() const { return has_get_; }
+  Local<Value> get() const { return get_; }
+  bool has_set() const { return has_set_; }
+  Local<Value> set() const { return set_; }
+
+  void set_enumerable(bool enumerable) {
+    has_enumerable_ = true;
+    enumerable_ = enumerable;
+  }
+  bool has_enumerable() const { return has_enumerable_; }
+  bool enumerable() const { return enumerable_; }
+
+  void set_configurable(bool configurable) {
+    has_configurable_ = true;
+    configurable_ = configurable;
+  }
+  bool has_configurable() const { return has_configurable_; }
+  bool configurable() const { return configurable_; }
+
+ private:
+  Local<Value> value_;
+  Local<Value> get_;
+  Local<Value> set_;
+  bool has_value_ = false;
+  bool has_writable_ = false;
+  bool writable_ = false;
+  bool has_get_ = false;
+  bool has_set_ = false;
+  bool has_enumerable_ = false;
+  bool enumerable_ = false;
+  bool has_configurable_ = false;
+  bool configurable_ = false;
+};
+
 class ScriptOrigin {
  public:
   explicit ScriptOrigin(Local<Value> name) : name_(name) {}
@@ -460,6 +511,11 @@ using NamedPropertyQueryCallback = Intercepted (*)(
     Local<Name> property, const PropertyCallbackInfo<Integer>& info);
 using NamedPropertyDeleterCallback = Intercepted (*)(
     Local<Name> property, const PropertyCallbackInfo<Boolean>& info);
+using NamedPropertyDescriptorCallback = Intercepted (*)(
+    Local<Name> property, const PropertyCallbackInfo<Value>& info);
+using NamedPropertyDefinerCallback = Intercepted (*)(
+    Local<Name> property, const PropertyDescriptor& descriptor,
+    const PropertyCallbackInfo<Boolean>& info);
 
 /* The indexed twins (`v8::IndexedProperty*Callback`): the key is an array
  * index, not a name. */
@@ -471,6 +527,11 @@ using IndexedPropertyQueryCallback = Intercepted (*)(
     uint32_t index, const PropertyCallbackInfo<Integer>& info);
 using IndexedPropertyDeleterCallback = Intercepted (*)(
     uint32_t index, const PropertyCallbackInfo<Boolean>& info);
+using IndexedPropertyDescriptorCallback = Intercepted (*)(
+    uint32_t index, const PropertyCallbackInfo<Value>& info);
+using IndexedPropertyDefinerCallback = Intercepted (*)(
+    uint32_t index, const PropertyDescriptor& descriptor,
+    const PropertyCallbackInfo<Boolean>& info);
 
 /* How a handler is consulted (`v8::PropertyHandlerFlags`). Accepted and not
  * honoured: the engine's seam consults the host before its own lookup, so there
@@ -495,12 +556,16 @@ struct NamedPropertyHandlerConfiguration {
       NamedPropertySetterCallback setter = nullptr,
       NamedPropertyQueryCallback query = nullptr,
       NamedPropertyDeleterCallback deleter = nullptr,
+      NamedPropertyDescriptorCallback descriptor = nullptr,
+      NamedPropertyDefinerCallback definer = nullptr,
       Local<Value> data = Local<Value>(),
       PropertyHandlerFlags flags = PropertyHandlerFlags::kNone)
       : getter(getter),
         setter(setter),
         query(query),
         deleter(deleter),
+        descriptor(descriptor),
+        definer(definer),
         data(data),
         flags(flags) {}
 
@@ -508,6 +573,8 @@ struct NamedPropertyHandlerConfiguration {
   NamedPropertySetterCallback setter;
   NamedPropertyQueryCallback query;
   NamedPropertyDeleterCallback deleter;
+  NamedPropertyDescriptorCallback descriptor;
+  NamedPropertyDefinerCallback definer;
   Local<Value> data;
   PropertyHandlerFlags flags;
 };
@@ -521,12 +588,16 @@ struct IndexedPropertyHandlerConfiguration {
       IndexedPropertySetterCallback setter = nullptr,
       IndexedPropertyQueryCallback query = nullptr,
       IndexedPropertyDeleterCallback deleter = nullptr,
+      IndexedPropertyDescriptorCallback descriptor = nullptr,
+      IndexedPropertyDefinerCallback definer = nullptr,
       Local<Value> data = Local<Value>(),
       PropertyHandlerFlags flags = PropertyHandlerFlags::kNone)
       : getter(getter),
         setter(setter),
         query(query),
         deleter(deleter),
+        descriptor(descriptor),
+        definer(definer),
         data(data),
         flags(flags) {}
 
@@ -534,6 +605,8 @@ struct IndexedPropertyHandlerConfiguration {
   IndexedPropertySetterCallback setter;
   IndexedPropertyQueryCallback query;
   IndexedPropertyDeleterCallback deleter;
+  IndexedPropertyDescriptorCallback descriptor;
+  IndexedPropertyDefinerCallback definer;
   Local<Value> data;
   PropertyHandlerFlags flags;
 };
