@@ -915,6 +915,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "slagc"
+version = "0.2.0"
+dependencies = [
+ "slag",
+]
+
+[[package]]
 name = "smallvec"
 version = "1.15.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"

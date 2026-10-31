@@ -19,6 +19,7 @@ members = [
     "crates/v8",
     "crates/cli",
     "crates/test262",
+    "crates/slagc",
 ]
 
 # A bare `cargo build`/`cargo test` at the root builds these; `crates/jsc`

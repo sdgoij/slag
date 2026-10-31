@@ -3384,10 +3384,21 @@ impl Agent {
     /// is covered too: an outermost [`crate::api::Context`] entry drains here as
     /// well as doing so at the top of every job drain.
     pub(crate) fn run_host_finalizers(&mut self) {
+        // `EmbedderRootsHandler::ResetRoot` first: the engine has already
+        // dropped these roots, and the host clears the C++ handle that owned
+        // each one before any weak callback observes the world.
+        for callback in crux::heap::take_pending_traced_resets() {
+            callback();
+        }
         for (behaviour, object_id) in crux::host::take_pending_finalizers() {
             behaviour.finalize(object_id);
         }
         for callback in crux::heap::take_pending_weak_callbacks() {
+            callback();
+        }
+        // The guaranteed pass, after every first pass: a first pass that cleared
+        // its handle cannot cancel it (`SetSecondPassCallback`).
+        for callback in crux::heap::take_pending_weak_second_pass_callbacks() {
             callback();
         }
     }

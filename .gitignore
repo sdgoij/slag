@@ -1,5 +1,6 @@
 target/
 scratch/
+crates/v8/cpp/build/
 /v8/
 /deno/
 /celld/

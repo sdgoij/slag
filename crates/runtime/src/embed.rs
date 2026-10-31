@@ -653,6 +653,25 @@ impl Context {
         Ok(JsValue(self.agent.run_script(source)?))
     }
 
+    /// Parse `source` without running it (`v8::Script::Compile`). A syntax error
+    /// is returned here, which is what lets a host report a compile failure
+    /// separately from a runtime one.
+    pub fn compile_script(&self, source: &str) -> Result<CompiledScript, JsError> {
+        let realm = self.agent.current_realm()?;
+        crate::script::parse_script(source, realm, None)?;
+        Ok(CompiledScript {
+            source: source.to_string(),
+        })
+    }
+
+    /// Run a script [`compile_script`](Self::compile_script) parsed
+    /// (`v8::Script::Run`). The source is re-parsed by the engine's eval path;
+    /// the compile made the syntax failure a separate event, which is the
+    /// property a host's `TryCatch` needs.
+    pub fn run_compiled_script(&mut self, script: &CompiledScript) -> Result<JsValue, JsError> {
+        self.eval_script(&script.source)
+    }
+
     /// Like [`Context::eval`], parsing with the JSX extension enabled: JSX
     /// elements desugar to `rlx.h(...)` calls at parse time.
     pub fn eval_jsx(&mut self, source: &str) -> Result<JsValue, JsError> {
@@ -2046,6 +2065,19 @@ fn describe_value(value: &Value) -> String {
     value.to_string()
 }
 
+/// A script that parsed and did not run (`v8::Script::Compile`).
+#[derive(Debug, Clone)]
+pub struct CompiledScript {
+    source: String,
+}
+
+impl CompiledScript {
+    /// The source the script was compiled from.
+    pub fn source(&self) -> &str {
+        &self.source
+    }
+}
+
 /// A host-facing handle over an ECMAScript language value.
 #[repr(transparent)]
 #[derive(Debug, Clone, PartialEq)]
@@ -2161,6 +2193,16 @@ impl JsValue {
 
     pub fn into_value(self) -> Value {
         self.0
+    }
+
+    /// The tagged word, for a host boundary that carries values as `u64`.
+    pub fn to_bits(&self) -> u64 {
+        self.0.bits()
+    }
+
+    /// Rebuild a value from the word [`to_bits`](Self::to_bits) produced.
+    pub fn from_bits(bits: u64) -> Self {
+        Self(Value::from_bits(bits))
     }
 
     /// An error that throws this value verbatim (spec `throw`), for

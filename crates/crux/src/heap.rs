@@ -1017,7 +1017,12 @@ pub struct HeapState {
     root_sources: RefCell<Vec<&'static dyn RootSource>>,
     weak_handles: RefCell<Vec<WeakEntry>>,
     pending_weak_callbacks: RefCell<Vec<Box<dyn FnOnce()>>>,
+    pending_weak_second_pass: RefCell<Vec<Box<dyn FnOnce()>>>,
     next_weak_id: Cell<u64>,
+    traced_handles: RefCell<Vec<TracedEntry>>,
+    next_traced_id: Cell<u64>,
+    traced_root_policy: RefCell<Option<&'static dyn TracedRootPolicy>>,
+    pending_traced_resets: RefCell<Vec<Box<dyn FnOnce()>>>,
     /// The heap's side tables by type (see [`with_heap_cell`]). A `Vec` rather
     /// than a map so the state stays `const`-constructible, and because a heap
     /// has only a handful.
@@ -1055,7 +1060,12 @@ impl HeapState {
             root_sources: RefCell::new(Vec::new()),
             weak_handles: RefCell::new(Vec::new()),
             pending_weak_callbacks: RefCell::new(Vec::new()),
+            pending_weak_second_pass: RefCell::new(Vec::new()),
             next_weak_id: Cell::new(1),
+            traced_handles: RefCell::new(Vec::new()),
+            next_traced_id: Cell::new(1),
+            traced_root_policy: RefCell::new(None),
+            pending_traced_resets: RefCell::new(Vec::new()),
             side: RefCell::new(Vec::new()),
         }
     }
@@ -1932,6 +1942,9 @@ pub trait GcObserver: 'static {
 /// Every collection entry point seeds its mark through this, so neither a pin
 /// nor a registered table can be lost by taking a path that collects.
 fn pinned_roots(roots: &[GcAny]) -> Vec<GcAny> {
+    // The host may disown a traced reference between collections. Ask before
+    // marking, so a disowned reference cannot root its value in this one.
+    prune_unrooted_traced_handles();
     let mut all = roots.to_vec();
     PINNED.with(|pinned| {
         all.extend(
@@ -1979,6 +1992,10 @@ struct WeakEntry {
     /// The softly-held value; `None` once a sweep has taken its box.
     value: Option<crate::value::Value>,
     callback: Option<Box<dyn FnOnce()>>,
+    /// The guaranteed pass: V8's `SetSecondPassCallback`, queued by the same
+    /// sweep and drained after every first pass. It runs even if the first pass
+    /// cleared the handle, which is the whole point of a guaranteed finalizer.
+    second_pass: Option<Box<dyn FnOnce()>>,
 }
 
 /// A weak handle: it does not keep its value alive, and the collector decides
@@ -2020,6 +2037,7 @@ pub fn weak_new(value: crate::value::Value) -> WeakHandle {
             id,
             value: Some(value),
             callback: None,
+            second_pass: None,
         });
     });
     WeakHandle {
@@ -2061,6 +2079,21 @@ pub fn weak_set_callback(handle: WeakHandle, callback: Box<dyn FnOnce()>) {
     });
 }
 
+/// Be told once, after the first pass and after the collection that took the
+/// value, even if the first pass cleared the handle
+/// (`v8::WeakCallbackInfo::SetSecondPassCallback`). Registering twice replaces
+/// the first, as the first pass does.
+pub fn weak_set_second_pass_callback(handle: WeakHandle, callback: Box<dyn FnOnce()>) {
+    WEAK_HANDLES.with(|handles| {
+        for entry in handles.borrow_mut().iter_mut() {
+            if entry.id == handle.id {
+                entry.second_pass = Some(callback);
+                return;
+            }
+        }
+    });
+}
+
 /// Whether any handle on this thread still holds a value — read by the entry
 /// points the way the weak-structure flags are, so an eager answer is not paid
 /// for by every collection of a program that holds no handles.
@@ -2096,6 +2129,9 @@ pub(crate) fn sweep_weak_handles(swept: &[usize]) {
             if let Some(callback) = entry.callback.take() {
                 PENDING_WEAK_CALLBACKS.with(|pending| pending.borrow_mut().push(callback));
             }
+            if let Some(callback) = entry.second_pass.take() {
+                PENDING_WEAK_SECOND_PASS.with(|pending| pending.borrow_mut().push(callback));
+            }
         }
     });
 }
@@ -2104,6 +2140,258 @@ pub(crate) fn sweep_weak_handles(swept: &[usize]) {
 /// the boxes were swept. Called outside a collection.
 pub fn take_pending_weak_callbacks() -> Vec<Box<dyn FnOnce()>> {
     PENDING_WEAK_CALLBACKS.with(|pending| std::mem::take(&mut *pending.borrow_mut()))
+}
+
+per_heap!(
+    /// The second-pass callbacks the sweeps since the last drain queued. Drained
+    /// after every first pass.
+    PENDING_WEAK_SECOND_PASS = PendingWeakSecondPass =>
+        pending_weak_second_pass: RefCell<Vec<Box<dyn FnOnce()>>>;
+);
+
+/// Take the guaranteed second-pass callbacks, in the order their boxes were
+/// swept. The isolate drains [`take_pending_weak_callbacks`] first, so a second
+/// pass never runs before the first pass of the same death.
+pub fn take_pending_weak_second_pass_callbacks() -> Vec<Box<dyn FnOnce()>> {
+    PENDING_WEAK_SECOND_PASS.with(|pending| std::mem::take(&mut *pending.borrow_mut()))
+}
+
+struct TracedEntry {
+    id: u64,
+    /// The value this host reference keeps reachable; `None` once the host reset
+    /// the handle, which is the host's "my C++ object is gone" signal.
+    value: Option<crate::value::Value>,
+}
+
+per_heap!(
+    /// The host's traced references, each a conditional root. An entry roots its
+    /// value while `value` is `Some`; the host clears it through [`traced_reset`]
+    /// when its own collector frees the C++ object that owns the reference. This
+    /// is the registry a tracing collector asks about, and the set an
+    /// `EmbedderGraph` would walk.
+    TRACED_HANDLES = TracedHandles => traced_handles: RefCell<Vec<TracedEntry>>;
+);
+
+per_heap!(
+    NEXT_TRACED_ID = NextTracedId => next_traced_id: Cell<u64>;
+);
+
+/// A strong reference from a host's own heap into this one, clearable by the
+/// host (`v8::TracedReference<T>`).
+///
+/// The difference from a [`Pin`] is who owns the lifetime. A pin is the engine's
+/// own RAII root: it lives exactly as long as the Rust value. A traced handle is
+/// what a *foreign* collector uses: the C++ object holding it is traced by that
+/// collector, and when the collector decides the object is dead, the host calls
+/// [`traced_reset`]. Until then the value is a root here, which is the strong
+/// half V8's `TracedReference` has and the bridge's current weak shape does not.
+///
+/// A clone is a second reference to the same value, not a copy of the identity:
+/// dropping or resetting one does not clear the other, which is the crate we
+/// stand in for's copy semantics.
+pub struct TracedHandle {
+    id: u64,
+    /// `!Send`/`!Sync`: the registry belongs to one heap, entered on one thread.
+    _thread: std::marker::PhantomData<*const ()>,
+}
+
+impl TracedHandle {
+    /// The handle's identity, stable for its lifetime. Zero is the empty handle
+    /// a clone of a reset reference produces.
+    pub fn id(&self) -> u64 {
+        self.id
+    }
+}
+
+impl std::fmt::Debug for TracedHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TracedHandle")
+            .field("id", &self.id)
+            .field("empty", &traced_get(self).is_none())
+            .finish()
+    }
+}
+
+/// The roots the host's traced references contribute while they are live.
+struct TracedRoots;
+
+impl RootSource for TracedRoots {
+    fn roots(&self, visit: &mut dyn FnMut(GcAny)) {
+        TRACED_HANDLES.with(|handles| {
+            for entry in handles.borrow().iter() {
+                let Some(value) = entry.value else {
+                    continue;
+                };
+                if let Some(addr) = crate::value::Value::encoded_box_address(value.bits()) {
+                    visit(GcAny(addr as *mut GcHeader));
+                }
+            }
+        });
+    }
+}
+
+static TRACED_ROOTS: TracedRoots = TracedRoots;
+
+/// Make `value` reachable from the host's own heap
+/// (`v8::TracedReference<T>::new`). The root lasts until [`traced_reset`] or the
+/// handle's drop, whichever comes first.
+pub fn traced_new(value: crate::value::Value) -> TracedHandle {
+    register_root_source(&TRACED_ROOTS);
+    let id = NEXT_TRACED_ID.with(|next| {
+        let id = next.get();
+        next.set(id.wrapping_add(1));
+        id
+    });
+    TRACED_HANDLES.with(|handles| {
+        handles.borrow_mut().push(TracedEntry {
+            id,
+            value: Some(value),
+        });
+    });
+    TracedHandle {
+        id,
+        _thread: std::marker::PhantomData,
+    }
+}
+
+/// The value this reference keeps reachable, or `None` after the host reset it
+/// (`v8::TracedReference<T>::Get`).
+pub fn traced_get(handle: &TracedHandle) -> Option<crate::value::Value> {
+    if handle.id == 0 {
+        return None;
+    }
+    TRACED_HANDLES.with(|handles| {
+        handles
+            .borrow()
+            .iter()
+            .find(|entry| entry.id == handle.id)
+            .and_then(|entry| entry.value)
+    })
+}
+
+/// The host's collector says the C++ object that owned this reference is gone
+/// (`v8::internal::DisposeTracedReference`, `EmbedderRootsHandler::ResetRoot`).
+/// The value stops being a root at the next collection; the handle is empty from
+/// here on, and resetting twice is a no-op.
+pub fn traced_reset(handle: &TracedHandle) {
+    if handle.id == 0 {
+        return;
+    }
+    TRACED_HANDLES.with(|handles| {
+        handles.borrow_mut().retain(|entry| entry.id != handle.id);
+    });
+}
+
+impl Clone for TracedHandle {
+    /// A new reference to the same value, not another handle to the same entry:
+    /// the crate we stand in for's `TracedReference` copy is a second reference,
+    /// so resetting one must not clear the other.
+    fn clone(&self) -> Self {
+        match traced_get(self) {
+            Some(value) => traced_new(value),
+            None => Self {
+                id: 0,
+                _thread: std::marker::PhantomData,
+            },
+        }
+    }
+}
+
+impl Drop for TracedHandle {
+    /// Dropping the handle is the host releasing its reference, so the value
+    /// stops being rooted. A `Clone` is independent, so this cannot clear a
+    /// sibling reference.
+    fn drop(&mut self) {
+        if self.id == 0 {
+            return;
+        }
+        let id = self.id;
+        TRACED_HANDLES.with(|handles| {
+            handles.borrow_mut().retain(|entry| entry.id != id);
+        });
+    }
+}
+
+/// The host's answer to "is this traced reference still a root?"
+/// (`v8::EmbedderRootsHandler`).
+///
+/// The engine asks once per traced reference on every collection, before
+/// marking, and drops the root of every reference the host says it no longer
+/// holds. Dropping the root is the engine's side of `ResetRoot`; the host's
+/// side arrives as a deferred [`reset_root`](Self::reset_root) call, after the
+/// collection, so it can clear the C++ handle safely.
+///
+/// The predicate runs while a collection is starting, with the heap borrowed.
+/// It must not allocate in the arena, run JavaScript, or call back into the
+/// collector (`traced_new`, `traced_reset`, and a nested collection are all
+/// re-entrant and will panic). Read-only host state is the intended use.
+pub trait TracedRootPolicy {
+    /// Whether the host still considers reference `id` a root
+    /// (`v8::EmbedderRootsHandler::IsRoot`).
+    fn is_root(&self, id: u64) -> bool;
+
+    /// The engine dropped reference `id`'s root status; clear the host side
+    /// (`v8::EmbedderRootsHandler::ResetRoot`). Deferred like every other host
+    /// callback, and called once per dropped reference.
+    fn reset_root(&self, _id: u64) {}
+}
+
+per_heap!(
+    /// The host policy consulted for traced references, if one was installed.
+    TRACED_ROOT_POLICY = TracedRootPolicySlot =>
+        traced_root_policy: RefCell<Option<&'static dyn TracedRootPolicy>>;
+);
+
+per_heap!(
+    /// The `ResetRoot` calls the collections since the last drain queued.
+    PENDING_TRACED_RESETS = PendingTracedResets =>
+        pending_traced_resets: RefCell<Vec<Box<dyn FnOnce()>>>;
+);
+
+/// Install the host's traced-reference policy (`EmbedderRootsHandler`).
+/// Registering twice replaces the first; an existing traced reference is asked
+/// about at the next collection.
+pub fn set_traced_root_policy(policy: &'static dyn TracedRootPolicy) {
+    TRACED_ROOT_POLICY.with(|slot| *slot.borrow_mut() = Some(policy));
+}
+
+/// Ask the host about every traced reference and drop the roots it disowns.
+/// Called by [`pinned_roots`] before marking, so a reference the host no longer
+/// holds cannot keep its value alive in this collection.
+fn prune_unrooted_traced_handles() {
+    let Some(policy) = TRACED_ROOT_POLICY.with(|slot| *slot.borrow()) else {
+        return;
+    };
+    let dropped: Vec<u64> = TRACED_HANDLES.with(|handles| {
+        handles
+            .borrow()
+            .iter()
+            .filter(|entry| !policy.is_root(entry.id))
+            .map(|entry| entry.id)
+            .collect()
+    });
+    if dropped.is_empty() {
+        return;
+    }
+    TRACED_HANDLES.with(|handles| {
+        handles
+            .borrow_mut()
+            .retain(|entry| !dropped.contains(&entry.id));
+    });
+    PENDING_TRACED_RESETS.with(|pending| {
+        for id in dropped {
+            pending
+                .borrow_mut()
+                .push(Box::new(move || policy.reset_root(id)));
+        }
+    });
+}
+
+/// Take the `ResetRoot` calls the collections since the last drain queued, in
+/// the order the references were dropped. Called outside a collection, before
+/// the weak callbacks.
+pub fn take_pending_traced_resets() -> Vec<Box<dyn FnOnce()>> {
+    PENDING_TRACED_RESETS.with(|pending| std::mem::take(&mut *pending.borrow_mut()))
 }
 
 impl Heap {
@@ -4187,6 +4475,167 @@ mod tests {
             "the minor sweep did not tell the handle"
         );
         weak_clear(handle);
+    }
+
+    /// A traced reference is the strong half of the host bridge: the value it
+    /// names survives a collection with no other root, and the host's reset is
+    /// what lets it die (`v8::TracedReference<T>` plus `ResetRoot`).
+    #[test]
+    fn a_traced_reference_roots_until_the_host_resets_it() {
+        use crate::handle::Handle;
+        use crate::string::JsString;
+        use crate::value::Value;
+
+        let value = Value::String(Handle::new(JsString::from_utf8("traced")));
+        let addr = string_box_addr(value);
+        let traced = traced_new(value);
+
+        let swept = with_heap_mut(|heap| heap.collect(&[]));
+        assert!(
+            !swept.contains(&addr),
+            "the traced value was swept: {swept:?}"
+        );
+        assert_eq!(traced_get(&traced), Some(value));
+
+        // The host's collector frees the C++ object that owned the reference.
+        traced_reset(&traced);
+        assert_eq!(traced_get(&traced), None);
+        let swept = with_heap_mut(|heap| heap.collect(&[]));
+        assert!(
+            swept.contains(&addr),
+            "the reset reference still rooted its value: {swept:?}"
+        );
+    }
+
+    thread_local! {
+        /// Whether the test policy is installed (so other tests on this thread
+        /// see an inactive policy that says "still a root").
+        static POLICY_ACTIVE: Cell<bool> = const { Cell::new(false) };
+        /// The host's answer to `IsRoot`.
+        static POLICY_ROOTED: Cell<bool> = const { Cell::new(true) };
+        /// The ids the deferred `ResetRoot` drain reported.
+        static POLICY_RESETS: RefCell<Vec<u64>> = const { RefCell::new(Vec::new()) };
+    }
+
+    struct TestPolicy;
+
+    impl TracedRootPolicy for TestPolicy {
+        fn is_root(&self, _id: u64) -> bool {
+            if !POLICY_ACTIVE.with(Cell::get) {
+                return true;
+            }
+            POLICY_ROOTED.with(Cell::get)
+        }
+
+        fn reset_root(&self, id: u64) {
+            POLICY_RESETS.with(|resets| resets.borrow_mut().push(id));
+        }
+    }
+
+    static TEST_POLICY: TestPolicy = TestPolicy;
+
+    /// E1's reverse direction, engine-driven: the host says a traced reference
+    /// is no longer a root, the engine drops it before marking, and the host is
+    /// told through the deferred `ResetRoot` drain.
+    #[test]
+    fn the_engine_asks_the_host_whether_a_traced_reference_is_still_a_root() {
+        use crate::handle::Handle;
+        use crate::string::JsString;
+        use crate::value::Value;
+
+        struct ActiveGuard;
+        impl Drop for ActiveGuard {
+            fn drop(&mut self) {
+                POLICY_ACTIVE.with(|active| active.set(false));
+            }
+        }
+
+        POLICY_ACTIVE.with(|active| active.set(true));
+        POLICY_ROOTED.with(|rooted| rooted.set(true));
+        POLICY_RESETS.with(|resets| resets.borrow_mut().clear());
+        let _guard = ActiveGuard;
+        set_traced_root_policy(&TEST_POLICY);
+
+        let value = Value::String(Handle::new(JsString::from_utf8("disowned")));
+        let addr = string_box_addr(value);
+        let traced = traced_new(value);
+
+        // The host still holds it: it roots.
+        let swept = with_heap_mut(|heap| heap.collect(&[]));
+        assert!(
+            !swept.contains(&addr),
+            "the rooted value was swept: {swept:?}"
+        );
+        assert!(POLICY_RESETS.with(|resets| resets.borrow().is_empty()));
+
+        // The host's collector frees the owning object and says so.
+        POLICY_ROOTED.with(|rooted| rooted.set(false));
+        let swept = with_heap_mut(|heap| heap.collect(&[]));
+        assert!(
+            swept.contains(&addr),
+            "the disowned value survived: {swept:?}"
+        );
+        assert_eq!(traced_get(&traced), None, "the disowned root still reads");
+        assert!(
+            POLICY_RESETS.with(|resets| resets.borrow().is_empty()),
+            "the sweep ran the host's ResetRoot itself"
+        );
+        for callback in take_pending_traced_resets() {
+            callback();
+        }
+        assert_eq!(
+            POLICY_RESETS.with(|resets| resets.borrow().clone()),
+            vec![traced.id()]
+        );
+    }
+
+    /// The guaranteed pass: it runs after the first pass, and even when the
+    /// first pass clears the handle (`SetSecondPassCallback`).
+    #[test]
+    fn a_second_pass_runs_after_the_first_and_even_if_the_handle_is_cleared() {
+        thread_local! {
+            static ORDER: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
+        }
+
+        use crate::handle::Handle;
+        use crate::string::JsString;
+        use crate::value::Value;
+
+        ORDER.with(|order| order.borrow_mut().clear());
+        let value = Value::String(Handle::new(JsString::from_utf8("doomed")));
+        let handle = weak_new(value);
+        weak_set_callback(
+            handle,
+            Box::new(move || {
+                ORDER.with(|order| order.borrow_mut().push(1));
+                weak_clear(handle);
+            }),
+        );
+        weak_set_second_pass_callback(
+            handle,
+            Box::new(|| ORDER.with(|order| order.borrow_mut().push(2))),
+        );
+
+        with_heap_mut(|heap| heap.collect(&[]));
+        assert!(
+            ORDER.with(|order| order.borrow().is_empty()),
+            "the sweep ran host code"
+        );
+
+        for callback in take_pending_weak_callbacks() {
+            callback();
+        }
+        assert_eq!(ORDER.with(|order| order.borrow().clone()), vec![1]);
+
+        for callback in take_pending_weak_second_pass_callbacks() {
+            callback();
+        }
+        assert_eq!(ORDER.with(|order| order.borrow().clone()), vec![1, 2]);
+
+        // Spent: a second collection queues neither pass.
+        with_heap_mut(|heap| heap.collect(&[]));
+        assert!(take_pending_weak_callbacks().is_empty());
+        assert!(take_pending_weak_second_pass_callbacks().is_empty());
     }
 
     /// A registered root source keeps its boxes alive exactly as a pin does.

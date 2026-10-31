@@ -556,4 +556,109 @@ mod tests {
         );
         assert!(Rc::ptr_eq(&mine[0].0, &behaviour));
     }
+
+    /// E1 (`.notes/chromium-facade.md` §13): the two-heap fixpoint at the
+    /// interface Slag actually offers. A foreign collector owns the host object
+    /// and reports it through a [`RootSource`](crate::heap::RootSource) while it
+    /// is reachable; the host object retains the JS half of the cycle. This is
+    /// the forward direction a `v8.h` facade needs (host mark -> JS mark). The
+    /// reverse direction, the engine telling the host to drop an object, is not
+    /// modeled here and is the part still missing (`EmbedderRootsHandler`).
+    #[test]
+    fn a_host_rooted_cross_heap_cycle_collects_when_the_host_drops_its_root() {
+        use crate::handle::Handle;
+        use crate::heap::{GcAny, RootSource, register_root_source};
+        use std::cell::Cell;
+
+        thread_local! {
+            /// The host heap's root, `Some` while the foreign collector can
+            /// reach the host object.
+            static EXTERNAL_ROOT: Cell<Option<Handle<JsObject>>> = const { Cell::new(None) };
+        }
+
+        struct ExternalHeapRoot;
+        impl RootSource for ExternalHeapRoot {
+            fn roots(&self, visit: &mut dyn FnMut(GcAny)) {
+                if let Some(host) = EXTERNAL_ROOT.with(Cell::get) {
+                    visit(host.as_any());
+                }
+            }
+        }
+        static EXTERNAL_HEAP_ROOT: ExternalHeapRoot = ExternalHeapRoot;
+
+        /// Clear the external root even if an assertion panics, so a later test
+        /// on this thread cannot root a freed box.
+        struct RootGuard;
+        impl Drop for RootGuard {
+            fn drop(&mut self) {
+                EXTERNAL_ROOT.with(|root| root.set(None));
+            }
+        }
+
+        let _ = take_pending_finalizers();
+        register_root_source(&EXTERNAL_HEAP_ROOT);
+        let _guard = RootGuard;
+
+        let behaviour: std::rc::Rc<dyn HostOps> = std::rc::Rc::new(InterceptGet);
+        let host = JsObject::host_object_create(std::rc::Rc::clone(&behaviour), None);
+        let host_id = host.id();
+        let host_addr = host.as_any().addr();
+
+        // The JS half: an ordinary object pointing back at the host object.
+        let holder = JsObject::ordinary_object_create(None);
+        holder
+            .define_property_or_throw(
+                &JsString::from_utf8("host"),
+                &crate::property::PropertyDescriptor {
+                    value: Some(Value::Object(host)),
+                    writable: Some(true),
+                    get: None,
+                    set: None,
+                    enumerable: Some(true),
+                    configurable: Some(true),
+                },
+            )
+            .expect("defined");
+        let holder_addr = holder.as_any().addr();
+
+        // The host half of the cycle. Only the foreign collector names it.
+        host.host_object_retain(Value::Object(holder));
+        EXTERNAL_ROOT.with(|root| root.set(Some(host)));
+
+        // While the foreign heap holds its root, the JS graph is reachable only
+        // through the host edge; `Heap::collect` does not scan the stack.
+        let swept = crate::heap::with_heap_mut(|heap| heap.collect(&[]));
+        assert!(
+            !swept.contains(&host_addr) && !swept.contains(&holder_addr),
+            "the host-rooted graph was swept: {swept:?}"
+        );
+        assert!(
+            !take_pending_finalizers()
+                .iter()
+                .any(|(_, queued)| *queued == host_id),
+            "a reachable host object finalized"
+        );
+
+        // The foreign heap drops its root. Nothing names either half now.
+        EXTERNAL_ROOT.with(|root| root.set(None));
+        let swept = crate::heap::with_heap_mut(|heap| heap.collect(&[]));
+        assert!(
+            swept.contains(&host_addr),
+            "the host object survived its unrooted cycle: {swept:?}"
+        );
+        assert!(
+            swept.contains(&holder_addr),
+            "the JS half survived its unrooted cycle: {swept:?}"
+        );
+        let finalized: Vec<u64> = take_pending_finalizers()
+            .into_iter()
+            .filter(|(_, queued)| *queued == host_id)
+            .map(|(_, queued)| queued)
+            .collect();
+        assert_eq!(
+            finalized,
+            vec![host_id],
+            "an unrooted cross-heap cycle finalizes its host object exactly once"
+        );
+    }
 }

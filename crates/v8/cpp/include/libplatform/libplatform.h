@@ -1,0 +1,4 @@
+#ifndef INCLUDE_LIBPLATFORM_LIBPLATFORM_H_
+#define INCLUDE_LIBPLATFORM_LIBPLATFORM_H_
+#include "../v8.h"
+#endif

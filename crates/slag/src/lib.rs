@@ -16,7 +16,9 @@
 pub use crux::error::{ErrorKind, JsError};
 pub use runtime::HostHooks;
 pub use runtime::dump;
-pub use runtime::embed::{Context, FunctionCall, HostCallbacks, HostFn, JsObject, JsValue};
+pub use runtime::embed::{
+    CompiledScript, Context, FunctionCall, HostCallbacks, HostFn, JsObject, JsValue,
+};
 pub use runtime::embed::{OutputFn, RandomFn};
 
 /// The V8-shaped Rust surface — [`Isolate`](api::Isolate), [`Context`](api::Context),

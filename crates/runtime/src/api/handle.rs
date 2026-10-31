@@ -276,6 +276,57 @@ impl Weak {
     pub fn set_callback(&self, callback: Box<dyn FnOnce()>) {
         crux::heap::weak_set_callback(self.handle, callback);
     }
+
+    /// Be told a second time, after every first pass and after the collection
+    /// (`v8::WeakCallbackInfo::SetSecondPassCallback`). It runs even if the
+    /// first pass cleared the handle, which is what makes it the guaranteed
+    /// finalizer a host's teardown can rely on.
+    pub fn set_second_pass_callback(&self, callback: Box<dyn FnOnce()>) {
+        crux::heap::weak_set_second_pass_callback(self.handle, callback);
+    }
+}
+
+/// A strong reference from a host's own heap into the engine's
+/// (`v8::TracedReference<T>`), released by the host.
+///
+/// Unlike [`Weak`], this keeps the value alive. The lifetime that decides is the
+/// C++ object's, tracked by the host's collector, and the host calls
+/// [`reset`](Self::reset) when that collector frees the object. That is the
+/// strong half a browser's `TraceWrapperV8Reference` needs: the engine roots the
+/// value while the C++ object owns the reference, and stops when the host says
+/// the object is gone. A clone is a second reference, not the same identity, so
+/// resetting one does not clear the other.
+#[derive(Debug, Clone)]
+pub struct Traced {
+    handle: crux::heap::TracedHandle,
+}
+
+impl Traced {
+    /// Keep `value` reachable from the host's structures
+    /// (`v8::TracedReference<T>::new`).
+    pub fn new(value: Local) -> Self {
+        Self {
+            handle: crux::heap::traced_new(value.into_value()),
+        }
+    }
+
+    /// The value, while the host has not released the reference
+    /// (`v8::TracedReference<T>::Get`).
+    pub fn to_local(&self) -> Option<Local> {
+        crux::heap::traced_get(&self.handle).map(Local)
+    }
+
+    /// Whether the host has released the reference
+    /// (`v8::TracedReference<T>::IsEmpty`).
+    pub fn is_empty(&self) -> bool {
+        crux::heap::traced_get(&self.handle).is_none()
+    }
+
+    /// Release the reference (`v8::TracedReference<T>::Reset`, the embedder's
+    /// `ResetRoot`). The value stops being rooted at the next collection.
+    pub fn reset(&mut self) {
+        crux::heap::traced_reset(&self.handle);
+    }
 }
 
 /// RAII marker grouping a set of local handles. A [`Local`] is a value, so

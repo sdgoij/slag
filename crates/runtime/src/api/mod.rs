@@ -38,7 +38,7 @@ pub use context::{Context, ContextScope};
 /// a host object it owned was swept.
 pub use crux::host::HostOps;
 pub use external::External;
-pub use handle::{EscapableHandleScope, Global, HandleScope, Local, MaybeLocal, Weak};
+pub use handle::{EscapableHandleScope, Global, HandleScope, Local, MaybeLocal, Traced, Weak};
 pub use heap::HeapStatistics;
 pub use json::Json;
 pub use microtask::MicrotasksPolicy;
@@ -1645,5 +1645,137 @@ mod tests {
 
         assert!(weak.is_empty(), "the collector's verdict is the handle's");
         assert_eq!(WEAK_SAW.with(|saw| saw.borrow().clone()), vec![true]);
+    }
+
+    thread_local! {
+        /// The phase order each death callback observed.
+        static PHASES: std::cell::RefCell<Vec<u8>> =
+            const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    /// The second pass is the guaranteed one: the isolate drains it after every
+    /// first pass, and it arrives even when the first pass cleared the handle.
+    #[test]
+    fn a_second_pass_arrives_after_the_first_through_the_isolate() {
+        let mut isolate = isolate();
+        let _context = context(&mut isolate);
+        PHASES.with(|phases| phases.borrow_mut().clear());
+
+        let weak = an_unrooted_weak_handle();
+        weak.set_callback(Box::new(move || {
+            PHASES.with(|phases| phases.borrow_mut().push(1));
+            // The first pass releases the handle; the guaranteed pass must still
+            // arrive.
+            let mut weak = weak;
+            weak.clear();
+        }));
+        weak.set_second_pass_callback(Box::new(|| {
+            PHASES.with(|phases| phases.borrow_mut().push(2));
+        }));
+
+        scrub_stack(32);
+        isolate.agent().collect_garbage();
+        // The sweep queues both passes; the drain runs them in order.
+        assert!(PHASES.with(|phases| phases.borrow().is_empty()));
+        isolate.run_finalizers();
+
+        assert_eq!(PHASES.with(|phases| phases.borrow().clone()), vec![1, 2]);
+    }
+
+    /// A traced reference over a value nothing else names, made in a frame that
+    /// returns only the handle, so the conservative scan cannot root the value.
+    #[inline(never)]
+    fn a_traced_reference_over_an_otherwise_unrooted_value() -> Traced {
+        Traced::new(Local::string("traced"))
+    }
+
+    /// The strong half: a traced reference roots its value across a collection,
+    /// and the host's reset is what lets the value die.
+    #[test]
+    fn a_traced_reference_roots_until_the_host_resets_it_through_the_isolate() {
+        let mut isolate = isolate();
+        let _context = context(&mut isolate);
+
+        let mut traced = a_traced_reference_over_an_otherwise_unrooted_value();
+        assert!(!traced.is_empty(), "the reference starts out live");
+        scrub_stack(32);
+        isolate.agent().collect_garbage();
+        assert!(
+            traced.to_local().is_some(),
+            "the traced reference did not root its value"
+        );
+
+        traced.reset();
+        assert!(traced.is_empty(), "the host's reset emptied the reference");
+        scrub_stack(32);
+        isolate.agent().collect_garbage();
+        assert!(
+            traced.to_local().is_none(),
+            "the reset reference still rooted its value"
+        );
+    }
+
+    thread_local! {
+        /// Whether the reset policy is active (other tests see a permissive
+        /// one).
+        static RESET_POLICY_ACTIVE: std::cell::Cell<bool> =
+            const { std::cell::Cell::new(false) };
+        /// Whether the host still calls the reference a root.
+        static RESET_POLICY_ROOTED: std::cell::Cell<bool> =
+            const { std::cell::Cell::new(true) };
+        /// The ids the deferred `ResetRoot` drain reported.
+        static RESET_POLICY_IDS: std::cell::RefCell<Vec<u64>> =
+            const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    struct ResetPolicy;
+
+    impl crux::heap::TracedRootPolicy for ResetPolicy {
+        fn is_root(&self, _id: u64) -> bool {
+            if !RESET_POLICY_ACTIVE.with(|active| active.get()) {
+                return true;
+            }
+            RESET_POLICY_ROOTED.with(|rooted| rooted.get())
+        }
+
+        fn reset_root(&self, id: u64) {
+            RESET_POLICY_IDS.with(|ids| ids.borrow_mut().push(id));
+        }
+    }
+
+    static RESET_POLICY: ResetPolicy = ResetPolicy;
+
+    /// The engine-driven reverse direction through the isolate's drain: the host
+    /// disowns a traced reference, the collector stops rooting it, and
+    /// `ResetRoot` arrives before the weak callbacks.
+    #[test]
+    fn a_disowned_traced_reference_resets_through_the_isolate() {
+        struct ActiveGuard;
+        impl Drop for ActiveGuard {
+            fn drop(&mut self) {
+                RESET_POLICY_ACTIVE.with(|active| active.set(false));
+            }
+        }
+
+        let mut isolate = isolate();
+        let _context = context(&mut isolate);
+        RESET_POLICY_ACTIVE.with(|active| active.set(true));
+        RESET_POLICY_ROOTED.with(|rooted| rooted.set(true));
+        RESET_POLICY_IDS.with(|ids| ids.borrow_mut().clear());
+        let _guard = ActiveGuard;
+        crux::heap::set_traced_root_policy(&RESET_POLICY);
+
+        let traced = a_traced_reference_over_an_otherwise_unrooted_value();
+        scrub_stack(32);
+        isolate.agent().collect_garbage();
+        assert!(traced.to_local().is_some(), "the rooted value was taken");
+        assert!(RESET_POLICY_IDS.with(|ids| ids.borrow().is_empty()));
+
+        RESET_POLICY_ROOTED.with(|rooted| rooted.set(false));
+        scrub_stack(32);
+        isolate.agent().collect_garbage();
+        isolate.run_finalizers();
+        assert!(traced.is_empty(), "the disowned reference still reads");
+        assert_eq!(RESET_POLICY_IDS.with(|ids| ids.borrow().len()), 1);
     }
 }

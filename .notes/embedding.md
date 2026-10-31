@@ -5341,6 +5341,11 @@ and then removed: it forces a C++ toolchain into this workspace's build and
 serves no host we have. It returns when a C++ host actually needs it, generated
 if that proves possible.
 
+`.notes/browser.md` is the analysis for the one C++ host that would justify it:
+what replacing V8 in Chromium actually requires, why `cxx.rs` does not bridge
+`v8.h`, where the two-heap GC contract is the wall, and the cheaper routes that
+reach a browser running Slag without `v8.h` compatibility.
+
 ## 9. Scope decisions
 
 - **Node is out; Deno is the realistic target; Bun is the follow-on.**
