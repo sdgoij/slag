@@ -326,6 +326,46 @@ impl CallbackWindow {
         object.0.set_key(&key, value.into_value(), true)?;
         Ok(())
     }
+
+    /// [[Get]] a property by the key value a host built (the re-entrant
+    /// counterpart of [`Context::get_property`]).
+    pub fn get_property(&self, object: JsValue, key: JsValue) -> Result<JsValue, JsError> {
+        let base = object.into_value();
+        let key_value = key.into_value();
+        let agent = crate::context::callback_agent(self.agent)?;
+        let key = crate::context::to_property_key(agent, &key_value)?;
+        crate::context::get_property_key(agent, &base, &key, base).map(JsValue)
+    }
+
+    /// [[HasProperty]] by the key value a host built (the re-entrant counterpart
+    /// of [`Context::has_property`]).
+    pub fn has_property(&self, object: JsValue, key: JsValue) -> Result<bool, JsError> {
+        let key_value = key.into_value();
+        let agent = crate::context::callback_agent(self.agent)?;
+        let key = crate::context::to_property_key(agent, &key_value)?;
+        let Some(object) = object.as_object() else {
+            return Err(JsError::new(
+                ErrorKind::TypeError,
+                "value is not an object".into(),
+            ));
+        };
+        object.0.has_property_key(&key)
+    }
+
+    /// [[Delete]] by the key value a host built (the re-entrant counterpart of
+    /// [`Context::delete_property`]).
+    pub fn delete_property(&self, object: JsValue, key: JsValue) -> Result<bool, JsError> {
+        let key_value = key.into_value();
+        let agent = crate::context::callback_agent(self.agent)?;
+        let key = crate::context::to_property_key(agent, &key_value)?;
+        let Some(object) = object.as_object() else {
+            return Err(JsError::new(
+                ErrorKind::TypeError,
+                "value is not an object".into(),
+            ));
+        };
+        object.0.delete_key(&key)
+    }
 }
 
 /// Host-defined behavior the embedding API exposes. Each callback is
@@ -3639,6 +3679,37 @@ mod tests {
                     JsValue::number(5.0),
                 )
                 .unwrap();
+            // The window covers the reads and the delete too, which is what a
+            // callback that inspects its holder needs.
+            window
+                .set_property(
+                    object.as_value(),
+                    JsValue::string("nested"),
+                    JsValue::number(6.0),
+                )
+                .unwrap();
+            assert_eq!(
+                window
+                    .get_property(object.as_value(), JsValue::string("nested"))
+                    .unwrap()
+                    .as_number(),
+                Some(6.0)
+            );
+            assert!(
+                window
+                    .has_property(object.as_value(), JsValue::string("nested"))
+                    .unwrap()
+            );
+            assert!(
+                window
+                    .delete_property(object.as_value(), JsValue::string("nested"))
+                    .unwrap()
+            );
+            assert!(
+                !window
+                    .has_property(object.as_value(), JsValue::string("nested"))
+                    .unwrap()
+            );
             let array = window.create_array_with_length(3).unwrap();
             (token, object, array)
         };

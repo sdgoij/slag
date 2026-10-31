@@ -148,6 +148,12 @@ int32_t slag_callback_array_new(SlagContext* context, const void* token,
                                 const uint64_t* values, size_t len, uint64_t* out);
 int32_t slag_callback_object_set_key(SlagContext* context, const void* token,
                                      uint64_t object, uint64_t key, uint64_t value);
+int32_t slag_callback_object_get_key(SlagContext* context, const void* token,
+                                     uint64_t object, uint64_t key, uint64_t* out);
+int32_t slag_callback_object_has_key(SlagContext* context, const void* token,
+                                     uint64_t object, uint64_t key, int32_t* out);
+int32_t slag_callback_object_delete_key(SlagContext* context, const void* token,
+                                        uint64_t object, uint64_t key, int32_t* out);
 size_t slag_object_internal_field_count(uint64_t object);
 int32_t slag_object_is_api_wrapper(uint64_t object);
 int32_t slag_object_set_internal_field(uint64_t object, size_t index, void* pointer);

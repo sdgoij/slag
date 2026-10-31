@@ -883,6 +883,96 @@ pub unsafe extern "C" fn slag_callback_object_set_key(
     }
 }
 
+/// [[Get]] a property through a running callback (`v8::Object::Get` inside a
+/// handler).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn slag_callback_object_get_key(
+    context: *mut SlagContext,
+    token: *const c_void,
+    object: u64,
+    key: u64,
+    out: *mut u64,
+) -> i32 {
+    let Some(context) = context.as_ref() else {
+        return 2;
+    };
+    let Some(window) = CallbackWindow::admit(token) else {
+        return 2;
+    };
+    match window.get_property(JsValue::from_bits(object), JsValue::from_bits(key)) {
+        Ok(value) => {
+            if !out.is_null() {
+                *out = value.to_bits();
+            }
+            0
+        }
+        Err(error) => {
+            record(context, error);
+            1
+        }
+    }
+}
+
+/// [[HasProperty]] through a running callback (`v8::Object::Has` inside a
+/// handler).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn slag_callback_object_has_key(
+    context: *mut SlagContext,
+    token: *const c_void,
+    object: u64,
+    key: u64,
+    out: *mut i32,
+) -> i32 {
+    let Some(context) = context.as_ref() else {
+        return 2;
+    };
+    let Some(window) = CallbackWindow::admit(token) else {
+        return 2;
+    };
+    match window.has_property(JsValue::from_bits(object), JsValue::from_bits(key)) {
+        Ok(found) => {
+            if !out.is_null() {
+                *out = i32::from(found);
+            }
+            0
+        }
+        Err(error) => {
+            record(context, error);
+            1
+        }
+    }
+}
+
+/// [[Delete]] through a running callback (`v8::Object::Delete` inside a
+/// handler).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn slag_callback_object_delete_key(
+    context: *mut SlagContext,
+    token: *const c_void,
+    object: u64,
+    key: u64,
+    out: *mut i32,
+) -> i32 {
+    let Some(context) = context.as_ref() else {
+        return 2;
+    };
+    let Some(window) = CallbackWindow::admit(token) else {
+        return 2;
+    };
+    match window.delete_property(JsValue::from_bits(object), JsValue::from_bits(key)) {
+        Ok(deleted) => {
+            if !out.is_null() {
+                *out = i32::from(deleted);
+            }
+            0
+        }
+        Err(error) => {
+            record(context, error);
+            1
+        }
+    }
+}
+
 /// How many internal fields `object` carries
 /// (`v8::Object::InternalFieldCount`); 0 for a non-object and for an object no
 /// template made.

@@ -449,7 +449,14 @@ MaybeLocal<Value> Object::Get(Local<Context> context, Local<Value> key) {
   auto* current = reinterpret_cast<Context*>(
       static_cast<uintptr_t>(context.raw()));
   uint64_t out = 0;
-  if (slag_object_get_key(current->slag(), Raw(this), key.raw(), &out) != 0) {
+  // Inside a handler the ordinary path cannot be re-entered, so a read goes
+  // through the running callback's window instead.
+  const int status =
+      g_callback_token != nullptr
+          ? slag_callback_object_get_key(current->slag(), g_callback_token,
+                                         Raw(this), key.raw(), &out)
+          : slag_object_get_key(current->slag(), Raw(this), key.raw(), &out);
+  if (status != 0) {
     return MaybeLocal<Value>();
   }
   return Local<Value>::New(out);
@@ -491,7 +498,12 @@ Maybe<bool> Object::Has(Local<Context> context, Local<Value> key) {
   auto* current = reinterpret_cast<Context*>(
       static_cast<uintptr_t>(context.raw()));
   int32_t found = 0;
-  if (slag_object_has_key(current->slag(), Raw(this), key.raw(), &found) != 0) {
+  const int status =
+      g_callback_token != nullptr
+          ? slag_callback_object_has_key(current->slag(), g_callback_token,
+                                         Raw(this), key.raw(), &found)
+          : slag_object_has_key(current->slag(), Raw(this), key.raw(), &found);
+  if (status != 0) {
     return Maybe<bool>();
   }
   return Maybe<bool>(found != 0);
@@ -573,9 +585,13 @@ bool Object::Delete(Local<Context> context, Local<Value> key) {
   auto* current = reinterpret_cast<Context*>(
       static_cast<uintptr_t>(context.raw()));
   int32_t deleted = 0;
-  return slag_object_delete_key(current->slag(), Raw(this), key.raw(),
-                                &deleted) == 0 &&
-         deleted != 0;
+  const int status =
+      g_callback_token != nullptr
+          ? slag_callback_object_delete_key(current->slag(), g_callback_token,
+                                            Raw(this), key.raw(), &deleted)
+          : slag_object_delete_key(current->slag(), Raw(this), key.raw(),
+                                   &deleted);
+  return status == 0 && deleted != 0;
 }
 
 bool Object::Delete(Local<Context> context, uint32_t index) {

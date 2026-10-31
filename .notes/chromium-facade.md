@@ -670,10 +670,21 @@ the header. `gin-shapes` reads the accessor from script (the getter builds the
 object it answers with), writes it from script, and checks the object form
 through C++.
 
+*The callback window reaches the reads (2026-10-31).* The last gap in the
+window was that a callback could allocate and set but not read: `Object::Get`,
+`Object::Has`, and `Object::Delete` took the ordinary entry points, which refuse
+re-entry. They now route through the token like `Object::Set`, over
+`CallbackWindow::get_property`, `has_property`, and `delete_property`, so an
+accessor can read another property of its holder, ask whether it has one, and
+delete one, all while the operation that called it holds the context. The
+real-property reads (`GetRealNamedProperty` and the predicates) still take the
+ordinary path, which is the only caveat left on the `Object` surface besides
+`GetIdentityHash`'s siblings. `gin-shapes` reads `tag` with `Get` and `Has`
+inside the accessor getter and deletes `scratch` inside the setter, and the
+script check sees the value the nested read returned.
+
 With that, every callback a `NamedPropertyHandlerConfiguration` or an accessor
-carries is wired. What the facade still does not offer is the rest of the
-`Object` surface (`GetIdentityHash`'s siblings) and the reads a callback cannot
-make (`Object::Get`, `Object::Has` take no window).
+carries is wired, and the window covers allocation, reads, writes, and deletes.
 
 The ABI shape is roughly a struct of up to seven C function pointers, the data
 pointer, and the flags, handed over once per template, with the return codes

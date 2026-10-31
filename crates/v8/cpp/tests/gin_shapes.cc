@@ -193,11 +193,15 @@ v8::Intercepted HostEnumerateIndex(
 }
 
 // An accessor installed with `SetAccessor`: the getter allocates the object it
-// answers with and reports the property's key and the accessor's data, and the
-// setter records the value it was given.
+// answers with, reads the holder through the callback window, and reports the
+// property's key and the accessor's data; the setter records the value and
+// deletes a scratch property, also through the window.
 struct HostAccessor {
   int gets = 0;
   int sets = 0;
+  int reads = 0;
+  int hits = 0;
+  int deleted = 0;
   int last = 0;
 };
 
@@ -212,14 +216,27 @@ void HostAccessGet(v8::Local<v8::Name> property,
   if (answer.IsEmpty()) return;
   answer->Set(context, v8::String::NewFromUtf8Literal(isolate, "name"), property);
   answer->Set(context, v8::String::NewFromUtf8Literal(isolate, "data"), info.Data());
+  // A read of another property of the holder goes through the same window.
+  v8::Local<v8::Name> tag = v8::String::NewFromUtf8Literal(isolate, "tag");
+  ++host_accessor.reads;
+  if (info.Holder()->Has(context, tag).FromMaybe(false)) {
+    ++host_accessor.hits;
+    answer->Set(context, tag, info.Holder()->Get(context, tag).ToLocalChecked());
+  }
   info.GetReturnValue().Set(answer);
 }
 
 void HostAccessSet(v8::Local<v8::Name>, v8::Local<v8::Value> value,
                    const v8::PropertyCallbackInfo<void>& info) {
   ++host_accessor.sets;
-  host_accessor.last =
-      value->Int32Value(info.GetIsolate()->GetCurrentContext()).FromMaybe(-1);
+  v8::Isolate* isolate = info.GetIsolate();
+  v8::Local<v8::Context> context = isolate->GetCurrentContext();
+  host_accessor.last = value->Int32Value(context).FromMaybe(-1);
+  host_accessor.deleted =
+      info.Holder()
+          ->Delete(context, v8::String::NewFromUtf8Literal(isolate, "scratch"))
+      ? 1
+      : 0;
 }
 
 // A descriptor callback answers with an object, so it builds one inside the
@@ -809,6 +826,10 @@ int main() {
                       HostAccessGet, HostAccessSet,
                       v8::Integer::New(isolate, 3));
     v8::Local<v8::Object> object = tmpl->NewInstance(current).ToLocalChecked();
+    object->Set(current, v8::String::NewFromUtf8Literal(isolate, "tag"),
+                v8::Integer::New(isolate, 7));
+    object->Set(current, v8::String::NewFromUtf8Literal(isolate, "scratch"),
+                v8::Integer::New(isolate, 1));
 
     const char kAccessorObject[] = "accessor_obj";
     if (slag_object_set(slag_global(current->slag()),
@@ -826,12 +847,14 @@ int main() {
                 isolate,
                 "(accessor_obj.lazy.name === 'lazy' &&"
                 " accessor_obj.lazy.data === 3 &&"
+                " accessor_obj.lazy.tag === 7 &&"
                 " Object.keys(accessor_obj).indexOf('lazy') >= 0) ? 1 : 0"))
             .ToLocalChecked()
             ->Run(current)
             .ToLocal(&read) &&
         read->Int32Value(current).FromMaybe(-1) == 1;
-    if (!accessor_read || host_accessor.gets == 0) {
+    if (!accessor_read || host_accessor.gets == 0 || host_accessor.reads == 0 ||
+        host_accessor.hits == 0) {
       fprintf(stderr, "the accessor getter did not answer\n");
       ++failures;
     }
@@ -847,6 +870,10 @@ int main() {
         wrote->Int32Value(current).FromMaybe(-1) == 1;
     if (!accessor_write || host_accessor.sets == 0 || host_accessor.last != 9) {
       fprintf(stderr, "the accessor setter did not take the write\n");
+      ++failures;
+    }
+    if (host_accessor.deleted == 0) {
+      fprintf(stderr, "the accessor setter could not delete through the window\n");
       ++failures;
     }
 
