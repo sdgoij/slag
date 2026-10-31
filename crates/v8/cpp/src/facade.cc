@@ -1180,6 +1180,42 @@ void Isolate::ThrowException(Local<Value> exception) {
   slag_throw_exception(CurrentSlagContext(), exception.raw());
 }
 
+SnapshotCreator::SnapshotCreator(const intptr_t*) {
+  Isolate::CreateParams params;
+  isolate_ = Isolate::New(params);
+}
+
+SnapshotCreator::~SnapshotCreator() {
+  if (isolate_ != nullptr) {
+    isolate_->Dispose();
+    isolate_ = nullptr;
+  }
+}
+
+void SnapshotCreator::SetDefaultContext(Local<Context> context) {
+  if (!context.IsEmpty()) default_context_ = context.raw();
+}
+
+StartupData SnapshotCreator::CreateBlob() {
+  StartupData blob;
+  if (default_context_ == 0) return blob;
+  auto* context = reinterpret_cast<Context*>(
+      static_cast<uintptr_t>(default_context_));
+  SlagContext* slag = context->slag();
+  const int64_t length = slag_context_write_snapshot(slag, nullptr, 0);
+  if (length <= 0) return blob;
+  char* data = new char[static_cast<size_t>(length)];
+  const int64_t written = slag_context_write_snapshot(
+      slag, reinterpret_cast<uint8_t*>(data), static_cast<size_t>(length));
+  if (written != length) {
+    delete[] data;
+    return blob;
+  }
+  blob.data = data;
+  blob.raw_size = static_cast<int>(length);
+  return blob;
+}
+
 void Isolate::GetHeapStatistics(HeapStatistics* statistics) {
   if (statistics == nullptr) return;
   const int64_t account = slag_isolate_adjust_external_memory(slag_, 0);
@@ -1911,6 +1947,14 @@ Local<Context> Context::New(Isolate* isolate, std::nullptr_t,
   }
 
   isolate->contexts_.push_back(context);
+  // The first context an isolate with a startup blob creates is its default
+  // one: the realm's globals are what the blob carries, so that is where it is
+  // restored.
+  if (!isolate->snapshot_blob_.empty() && !isolate->snapshot_consumed_) {
+    slag_context_read_snapshot(slag, isolate->snapshot_blob_.data(),
+                               isolate->snapshot_blob_.size());
+    isolate->snapshot_consumed_ = true;
+  }
   return Local<Context>::New(reinterpret_cast<uint64_t>(context));
 }
 
@@ -1924,12 +1968,21 @@ Local<Object> Context::Global() const {
   return Local<Object>::New(slag_global(slag_));
 }
 
-Isolate* Isolate::New(const CreateParams&) {
+Isolate* Isolate::New(const CreateParams& params) {
   auto* isolate = new Isolate();
   isolate->slag_ = slag_isolate_new();
   if (isolate->slag_ == nullptr) {
     delete isolate;
     return nullptr;
+  }
+  // The blob is copied: V8's contract lets the caller free its `StartupData`
+  // once `New` returns, and the first context restores from this copy.
+  if (params.snapshot_blob != nullptr &&
+      params.snapshot_blob->is_valid()) {
+    const auto* begin =
+        reinterpret_cast<const uint8_t*>(params.snapshot_blob->data);
+    isolate->snapshot_blob_.assign(
+        begin, begin + static_cast<size_t>(params.snapshot_blob->raw_size));
   }
   return isolate;
 }

@@ -268,6 +268,12 @@ typedef struct SlagHeapStatistics {
 int32_t slag_heap_statistics(SlagContext* context, int64_t host_account,
                              SlagHeapStatistics* out);
 
+/* A realm's snapshot (`v8::StartupData`, written by `SnapshotCreator::CreateBlob`).
+ * A null or too-small buffer answers the required length; -1 is a failed
+ * write. */
+int64_t slag_context_write_snapshot(SlagContext* context, uint8_t* buffer, size_t len);
+int32_t slag_context_read_snapshot(SlagContext* context, const uint8_t* data, size_t len);
+
 /* Weak persistent handles (`v8::Global<T>::SetWeak`). The value is not kept
  * alive, and the callback runs after the collection that took it. */
 typedef void (*SlagWeakCallback)(void* data);

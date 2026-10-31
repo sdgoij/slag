@@ -1344,10 +1344,25 @@ struct HeapStatistics {
   size_t embedded_blob_size = 0;
 };
 
+/* A startup snapshot (`v8::StartupData`): the bytes `SnapshotCreator::CreateBlob`
+ * produced, which the caller frees with `delete[]`. The rehash flag is always
+ * true and validity is "has bytes", because the engine's blob has no weaker
+ * form than that. */
+struct StartupData {
+  const char* data = nullptr;
+  int raw_size = 0;
+
+  bool can_be_rehashed() const { return true; }
+  bool is_valid() const { return data != nullptr && raw_size > 0; }
+};
+
 class Isolate {
  public:
   struct CreateParams {
     ArrayBuffer::Allocator* array_buffer_allocator = nullptr;
+    /* A blob from `SnapshotCreator::CreateBlob`: the first context this isolate
+     * creates has it restored onto its global (`v8::CreateParams`). */
+    const StartupData* snapshot_blob = nullptr;
   };
 
   static Isolate* New(const CreateParams& params);
@@ -1427,6 +1442,10 @@ class Isolate {
   /* The default security token, minted on the first ask and shared by every
    * context without one of its own. Retained until `Dispose`. */
   uint64_t default_security_token_ = 0;
+  /* The startup blob `CreateParams::snapshot_blob` named, and whether the first
+   * context has consumed it. */
+  std::vector<uint8_t> snapshot_blob_;
+  bool snapshot_consumed_ = false;
 
   friend class Context;
   friend class Private;
@@ -1453,6 +1472,29 @@ class ExternalMemoryAccounter {
  private:
   Isolate* isolate_ = nullptr;
   size_t size_ = 0;
+};
+
+/* A host that writes a startup snapshot (`v8::SnapshotCreator`). It owns an
+ * isolate, the host builds the default context in it, and `CreateBlob`
+ * serializes the realm's global bindings. Disposing the creator disposes the
+ * isolate. */
+class SnapshotCreator {
+ public:
+  explicit SnapshotCreator(const intptr_t* external_references = nullptr);
+  ~SnapshotCreator();
+
+  SnapshotCreator(const SnapshotCreator&) = delete;
+  SnapshotCreator& operator=(const SnapshotCreator&) = delete;
+
+  Isolate* GetIsolate() const { return isolate_; }
+  void SetDefaultContext(Local<Context> context);
+
+  /* The blob for the default context, which the caller frees with `delete[]`. */
+  StartupData CreateBlob();
+
+ private:
+  Isolate* isolate_ = nullptr;
+  uint64_t default_context_ = 0;
 };
 
 /*

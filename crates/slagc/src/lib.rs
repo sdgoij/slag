@@ -746,6 +746,62 @@ pub unsafe extern "C" fn slag_context_external_memory(context: *mut SlagContext)
     }
 }
 
+/// Write this realm's snapshot into `buffer` (`SnapshotCreator::CreateBlob`).
+/// A null buffer, or one too small, answers the required byte length without
+/// writing; -1 is a failed write, with the error recorded.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn slag_context_write_snapshot(
+    context: *mut SlagContext,
+    buffer: *mut u8,
+    len: usize,
+) -> i64 {
+    let Some(context) = context.as_mut() else {
+        return -1;
+    };
+    let Ok(mut engine) = context.context.try_borrow_mut() else {
+        reentrant(context);
+        return -1;
+    };
+    match engine.write_snapshot() {
+        Ok(bytes) => {
+            if buffer.is_null() || len < bytes.len() {
+                return bytes.len() as i64;
+            }
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), buffer, bytes.len());
+            bytes.len() as i64
+        }
+        Err(text) => {
+            record(context, JsError::new(ErrorKind::Error, text));
+            -1
+        }
+    }
+}
+
+/// Restore a blob onto this realm's global (`Isolate::CreateParams`'s
+/// `snapshot_blob`). Answers 0 on success, 1 with the error recorded, 2 for a
+/// bad argument.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn slag_context_read_snapshot(
+    context: *mut SlagContext,
+    data: *const u8,
+    len: usize,
+) -> i32 {
+    let Some(context) = context.as_mut() else {
+        return 2;
+    };
+    let Ok(mut engine) = context.context.try_borrow_mut() else {
+        reentrant(context);
+        return 1;
+    };
+    match engine.read_snapshot(bytes(data, len)) {
+        Ok(()) => 0,
+        Err(text) => {
+            record(context, JsError::new(ErrorKind::Error, text));
+            1
+        }
+    }
+}
+
 /// Fill `out` with the heap's numbers (`v8::Isolate::GetHeapStatistics`).
 /// `host_account` is the isolate's external-memory account, which is added to
 /// the engine's own buffer walk.

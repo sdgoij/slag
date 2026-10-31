@@ -360,6 +360,22 @@ the run drains the job queues so a synchronous body is `kEvaluated` when it
 returns. Modules are pinned records and are never freed, like scripts and
 templates.
 
+### Snapshots
+
+`SnapshotCreator` owns an isolate, the host builds the default context in it and
+calls `SetDefaultContext`, and `CreateBlob` serializes the realm's globals into a
+`StartupData` the caller frees with `delete[]`. An `Isolate::CreateParams`
+`snapshot_blob` makes the new isolate's first `Context::New` restore that blob
+onto its global, which is V8's default-context rule mapped onto this engine's
+one-realm-per-context model.
+
+A blob carries the realm's global bindings and nothing else, and the writer
+refuses a realm that still holds host callbacks: `Context::New` installs
+`console` and the timers, so a host that wants a snapshot deletes them first
+(the reading context puts its own back). That is the same limitation the Rust
+bridge's `write_snapshot` documents, and the harness exercises exactly that
+sequence.
+
 ### WebAssembly
 
 `WasmModuleObject::Compile(isolate, MemorySpan<const uint8_t>)` decodes and
@@ -483,6 +499,8 @@ not a claim that gin itself links.
   - `WasmModuleObject::Compile`, `GetCompiledModule`, `FromCompiledModule`, and
     `CompiledWasmModule`, over `MemorySpan<const uint8_t>` and the engine's
     WebAssembly decoder.
+  - `SnapshotCreator` with `SetDefaultContext` and `CreateBlob`, `StartupData`,
+    and `Isolate::CreateParams::snapshot_blob` restoring onto the first context.
 - Handles and persistents as engine roots: a handle slot or a `Global` over an
   engine value retains it for that object's lifetime, and a facade pointer is
   never registered.
@@ -544,6 +562,11 @@ not a claim that gin itself links.
   module object and its compiled form are the whole C++ surface so far, while a
   script instantiates through the JS API. `CompiledWasmModule` carries no wire
   bytes, so `GetWireBytesRef` is absent rather than wrong.
+- A snapshot carries the realm's globals only, and writing one refuses a realm
+  that still holds host callbacks (delete `console` and the timers first).
+  `SnapshotCreator::AddContext`, `SetDataBlob`, `AddData`, the external
+  references, and the code cache are absent; a cached compile would need the
+  engine to serialize its compiled program, which it does not yet do.
 - `Platform` is a handle plus a message pump: `PumpMessageLoop` runs the
   isolate's queued jobs (microtasks, promise reactions, due timers) and answers
   whether it ran any. There are no host-posted platform tasks or task runners
@@ -625,3 +648,5 @@ through a file-scope callback, checks the request list, links, evaluates, and
 reads the export from the namespace. The WebAssembly block compiles the sample's
 `add` module, reads its decoded module back, makes a second module object from
 it, binds it, and calls the export through a script's `WebAssembly.Instance`.
+The snapshot block writes a realm with the console and timers removed, then
+restores the blob in a fresh isolate and reads the global back.

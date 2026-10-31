@@ -1950,6 +1950,79 @@ int main() {
     expect(number_at("wasmAnswer") == 7, "the instantiated export ran");
   }
 
+  // Snapshots: write a realm's globals into a blob, then restore the blob in a
+  // fresh isolate's first context.
+  {
+    const auto expect = [&](bool condition, const char* what) {
+      if (!condition) {
+        fprintf(stderr, "snapshots: %s\n", what);
+        ++failures;
+      }
+    };
+
+    v8::StartupData blob;
+    {
+      v8::SnapshotCreator creator;
+      v8::Isolate* snapshot_isolate = creator.GetIsolate();
+      {
+        v8::Isolate::Scope isolate_scope(snapshot_isolate);
+        v8::HandleScope scope(snapshot_isolate);
+        v8::Local<v8::Context> snapshot_context =
+            v8::Context::New(snapshot_isolate);
+        v8::Context::Scope context_scope(snapshot_context);
+        // `write_snapshot` carries no host-callback table, so the console and
+        // timers `Context::New` installs have to be out of the realm first (the
+        // reading context puts its own back).
+        v8::Script::Compile(
+            snapshot_context,
+            v8::String::NewFromUtf8Literal(
+                snapshot_isolate,
+                "delete globalThis.console; delete globalThis.setTimeout;"
+                " delete globalThis.setInterval; delete globalThis.clearTimeout;"
+                " delete globalThis.clearInterval;"))
+            .ToLocalChecked()
+            ->Run(snapshot_context);
+        v8::Script::Compile(
+            snapshot_context,
+            v8::String::NewFromUtf8Literal(snapshot_isolate,
+                                           "var snapshotValue = 123;"))
+            .ToLocalChecked()
+            ->Run(snapshot_context);
+        creator.SetDefaultContext(snapshot_context);
+      }
+      blob = creator.CreateBlob();
+      expect(blob.is_valid(), "the snapshot blob was written");
+    }
+
+    {
+      v8::Isolate::CreateParams params;
+      params.array_buffer_allocator =
+          v8::ArrayBuffer::Allocator::NewDefaultAllocator();
+      params.snapshot_blob = &blob;
+      v8::Isolate* restored_isolate = v8::Isolate::New(params);
+      {
+        v8::Isolate::Scope isolate_scope(restored_isolate);
+        v8::HandleScope scope(restored_isolate);
+        v8::Local<v8::Context> restored_context =
+            v8::Context::New(restored_isolate);
+        v8::Context::Scope context_scope(restored_context);
+        v8::Local<v8::Value> value =
+            v8::Script::Compile(
+                restored_context,
+                v8::String::NewFromUtf8Literal(restored_isolate,
+                                               "snapshotValue"))
+                .ToLocalChecked()
+                ->Run(restored_context)
+                .ToLocalChecked();
+        expect(value->Int32Value(restored_context).FromMaybe(-1) == 123,
+               "the restored realm carries the global");
+      }
+      restored_isolate->Dispose();
+      delete params.array_buffer_allocator;
+    }
+    delete[] blob.data;
+  }
+
   // A host-traced reference: a root the C++ side owns and releases. Once it
   // handle scope pops, the object is reachable only through the reference.
   {

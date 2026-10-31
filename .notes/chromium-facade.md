@@ -955,6 +955,28 @@ divergence `.notes/embedding.md` §12 item 10 records for the Rust bridge.
 `v8-wasm.h` and are not in this slice; a script instantiates through the JS API,
 which is what the harness and `hello-world` both do.
 
+*Snapshots (2026-10-31).* The blob format was already there: `embed::Context` has
+`write_snapshot`/`read_snapshot` over the crate's snapshot codec, and the
+facade needed the V8 shape around it. `SnapshotCreator` owns an isolate and
+serializes its default context; `CreateBlob` asks for the length, allocates with
+`new char[]`, and writes, so the host's `delete[]` matches. `CreateParams`'s
+`snapshot_blob` is copied into the isolate at `New` (V8 lets the caller free its
+`StartupData` as soon as `New` returns) and the first `Context::New` restores it,
+which is V8's default-context rule in this engine's one-realm-per-context model.
+
+The trap is the writer's refusal: a realm holding host callbacks cannot be
+serialized, and `Context::New` installs `console` and the timers. The harness
+had to delete them before the write, exactly as the embed test's comment says;
+the first run of the snapshot block failed on that and is why the code is
+written out rather than assumed. The reading context keeps its own callbacks
+because it creates them after the restore.
+
+What is not in this slice is the rest of `v8-snapshot.h` (`AddContext`,
+`SetDataBlob`, `AddData`, the external-reference table) and the code cache. A
+cached compile needs the engine to serialize its compiled program; the Rust
+bridge's `CachedData` is a copy of the source and checks it rather than trusting
+it, and that is the honest ceiling until the engine has a cache format.
+
 The ABI shape is roughly a struct of up to seven C function pointers, the data
 pointer, and the flags, handed over once per template, with the return codes
 `Intercepted` already defines; the callbacks receive a `PropertyCallbackInfo`
