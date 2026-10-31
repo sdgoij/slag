@@ -814,6 +814,109 @@ pub unsafe extern "C" fn slag_object_set_key(
     }
 }
 
+/// [[HasProperty]] by a key value (`v8::Object::Has`). 0 on success with `out`
+/// written, 1 with a pending error, 2 for a bad argument.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn slag_object_has_key(
+    context: *mut SlagContext,
+    object: u64,
+    key: u64,
+    out: *mut i32,
+) -> i32 {
+    let Some(context) = context.as_mut() else {
+        return 2;
+    };
+    let result = {
+        let Ok(mut engine) = context.context.try_borrow_mut() else {
+            reentrant(context);
+            return 1;
+        };
+        engine.has_property(JsValue::from_bits(object), JsValue::from_bits(key))
+    };
+    match result {
+        Ok(found) => {
+            if !out.is_null() {
+                *out = i32::from(found);
+            }
+            0
+        }
+        Err(error) => {
+            record(context, error);
+            1
+        }
+    }
+}
+
+/// [[Delete]] by a key value (`v8::Object::Delete`). 0 on success with `out`
+/// written (true once the property is gone), 1 with a pending error, 2 for a
+/// bad argument.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn slag_object_delete_key(
+    context: *mut SlagContext,
+    object: u64,
+    key: u64,
+    out: *mut i32,
+) -> i32 {
+    let Some(context) = context.as_mut() else {
+        return 2;
+    };
+    let result = {
+        let Ok(mut engine) = context.context.try_borrow_mut() else {
+            reentrant(context);
+            return 1;
+        };
+        engine.delete_property(JsValue::from_bits(object), JsValue::from_bits(key))
+    };
+    match result {
+        Ok(deleted) => {
+            if !out.is_null() {
+                *out = i32::from(deleted);
+            }
+            0
+        }
+        Err(error) => {
+            record(context, error);
+            1
+        }
+    }
+}
+
+/// The object's own named property (`v8::Object::GetRealNamedProperty`). 0 on
+/// success with `out` and `found` written, 1 with a pending error, 2 for a bad
+/// argument.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn slag_object_get_own_key(
+    context: *mut SlagContext,
+    object: u64,
+    key: u64,
+    out: *mut u64,
+    found: *mut i32,
+) -> i32 {
+    let Some(context) = context.as_mut() else {
+        return 2;
+    };
+    let result = {
+        let Ok(mut engine) = context.context.try_borrow_mut() else {
+            reentrant(context);
+            return 1;
+        };
+        engine.get_own_property(JsValue::from_bits(object), JsValue::from_bits(key))
+    };
+    match result {
+        Ok(value) => {
+            if !out.is_null() && !found.is_null() {
+                *found = i32::from(value.is_some());
+                *out = value.map_or(0, |value| value.to_bits());
+            }
+            0
+        }
+        Err(error) => {
+            record(context, error);
+            1
+        }
+    }
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn slag_version() -> *const c_char {
     c"slag-a0".as_ptr()

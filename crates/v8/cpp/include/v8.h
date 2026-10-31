@@ -28,6 +28,7 @@ class ObjectTemplate;
 class FunctionTemplate;
 class Value;
 class String;
+class Name;
 class Object;
 class Script;
 class Message;
@@ -237,6 +238,26 @@ class Object : public Value {
   MaybeLocal<Value> Get(Local<Context> context, Local<Value> key);
   Maybe<bool> Set(Local<Context> context, Local<Value> key, Local<Value> value);
 
+  /* The index forms. An index is a property key spelled as a number, so these
+   * are the key-value forms with the number built for the caller. */
+  MaybeLocal<Value> Get(Local<Context> context, uint32_t index);
+  Maybe<bool> Set(Local<Context> context, uint32_t index, Local<Value> value);
+
+  /* [[HasProperty]]: the own property, then the chain (`Object::Has`). */
+  Maybe<bool> Has(Local<Context> context, Local<Value> key);
+  Maybe<bool> Has(Local<Context> context, uint32_t index);
+
+  /* [[Delete]]: `true` once the property is gone, including when it was never
+   * there (`Object::Delete`). */
+  bool Delete(Local<Context> context, Local<Value> key);
+  bool Delete(Local<Context> context, uint32_t index);
+
+  /* The object's own named property, with no interceptor and no prototype walk,
+   * and an own accessor's getter run on this object
+   * (`Object::GetRealNamedProperty`). Empty when the object has no such own
+   * property. */
+  MaybeLocal<Value> GetRealNamedProperty(Local<Context> context, Local<Name> key);
+
   /* The C++ object this wrapper names. V8 requires its `T` to be a cppgc
    * `GarbageCollectedMixin`; the facade has no cppgc, so there is no such
    * constraint and nothing is checked. */
@@ -252,12 +273,17 @@ class Number : public Value {
   static Local<Number> New(Isolate* isolate, double value);
 };
 
+/* A property key: a `String` or a `Symbol` (`v8::Name`). Nothing here makes a
+ * symbol yet, but the type is what `GetRealNamedProperty` takes, and a string
+ * is a name, so the hierarchy is the one a host's code assumes. */
+class Name : public Value {};
+
 class Integer : public Number {
  public:
   static Local<Integer> New(Isolate* isolate, int32_t value);
 };
 
-class String : public Value {
+class String : public Name {
  public:
   static Local<String> NewFromUtf8Literal(Isolate* isolate, const char* literal);
   static MaybeLocal<String> NewFromUtf8(

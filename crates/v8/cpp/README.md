@@ -186,7 +186,9 @@ not a claim that gin itself links.
 - `ObjectTemplate::SetInternalFieldCount`/`NewInstance`, internal fields, and
   `Object::Wrappable<T>`, `IsApiWrapper`, `This()`.
 - `Object::Get`/`Set` by a key value, through the engine's ToPropertyKey (so a
-  numeric or object key names the property the language would).
+  numeric or object key names the property the language would), with the
+  `uint32_t` index forms built on them. `Has` (own property plus the chain),
+  `Delete`, and `GetRealNamedProperty` (own property only, no chain).
 - `TracedReference<T>` as a host-owned root: copy is a second reference, `Reset`
   releases it, and the destructor releases it like any persistent.
 - Handles and persistents as engine roots: a handle slot or a `Global` over an
@@ -213,8 +215,10 @@ not a claim that gin itself links.
 - `Isolate::Dispose` frees the contexts the facade created; templates are not
   freed.
 - Host callbacks receive `this` now (`FunctionCallbackInfo::This`), but the
-  `Object` surface is only `Get`/`Set` by key: the index forms (`Get(context,
-  uint32_t)`), `Has`, `Delete`, and `GetRealNamedProperty` are still absent.
+  `Object` surface is narrow: the other own-property predicates
+  (`HasRealNamedProperty`, `HasRealIndexedProperty`, `HasRealNamedCallbackProperty`),
+  the accessor/internal-field `SetAccessor`, and `GetIdentityHash`'s siblings are
+  absent.
 - `load()` is compiled but refused at run time. The sample re-enters through
   `ExecuteString`, and the safe engine path for a host callback is
   `FunctionCall::eval` (`slag_call_eval`), which the sample does not call. The

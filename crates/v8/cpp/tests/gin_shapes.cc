@@ -273,6 +273,57 @@ int main() {
       ++failures;
     }
 
+    // The index forms are the key-value forms with the number built.
+    if (!wrapper->Set(current, 0, v8::Integer::New(isolate, 5)).FromMaybe(
+            false) ||
+        wrapper->Get(current, 0).ToLocalChecked()->Int32Value(current)
+                .FromMaybe(-1) != 5) {
+      fprintf(stderr, "the index forms did not reach the element\n");
+      ++failures;
+    }
+
+    // Has walks the chain: the own method, Object.prototype's, and a key that
+    // is on neither.
+    v8::Local<v8::String> mark_key =
+        v8::String::NewFromUtf8Literal(isolate, "mark");
+    if (!wrapper->Has(current, v8::String::NewFromUtf8Literal(isolate, "bump"))
+             .FromMaybe(false) ||
+        !wrapper->Has(current, v8::String::NewFromUtf8Literal(isolate,
+                                                              "toString"))
+             .FromMaybe(false) ||
+        wrapper->Has(current, v8::String::NewFromUtf8Literal(isolate, "nope"))
+            .FromMaybe(true) ||
+        !wrapper->Has(current, 0).FromMaybe(false) ||
+        wrapper->Has(current, 99).FromMaybe(true)) {
+      fprintf(stderr, "Has answered the wrong way\n");
+      ++failures;
+    }
+
+    // GetRealNamedProperty sees the own property and not the chain's.
+    wrapper->Set(current, mark_key, v8::Integer::New(isolate, 3));
+    v8::Local<v8::Value> own;
+    if (!wrapper->GetRealNamedProperty(current, mark_key).ToLocal(&own) ||
+        own->Int32Value(current).FromMaybe(-1) != 3) {
+      fprintf(stderr, "GetRealNamedProperty missed the own property\n");
+      ++failures;
+    }
+    if (!wrapper
+             ->GetRealNamedProperty(
+                 current, v8::String::NewFromUtf8Literal(isolate, "toString"))
+             .IsEmpty()) {
+      fprintf(stderr, "GetRealNamedProperty walked the chain\n");
+      ++failures;
+    }
+
+    // Delete removes the own property, and deleting an absent one is true
+    // (there is nothing left to delete).
+    if (!wrapper->Delete(current, mark_key) ||
+        wrapper->Has(current, mark_key).FromMaybe(true) ||
+        !wrapper->Delete(current, mark_key) || !wrapper->Delete(current, 1)) {
+      fprintf(stderr, "Delete did not remove the property\n");
+      ++failures;
+    }
+
     v8::Local<v8::Value> result =
         v8::Script::Compile(current, v8::String::NewFromUtf8Literal(
                                          isolate, "counter.bump(10)"))

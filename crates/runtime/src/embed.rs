@@ -26,7 +26,9 @@ use std::rc::Rc;
 use crux::error::{ErrorKind, JsError};
 use crux::function::{Function, NativeCtor, NativeFn};
 use crux::handle::Handle;
-use crux::object::{JsObject as CruxObject, ObjectKind, typed_array_effective_length};
+use crux::object::{
+    JsObject as CruxObject, ObjectKind, PropertyKind, typed_array_effective_length,
+};
 use crux::property::{PropertyDescriptor, PropertyKey};
 use crux::string::JsString;
 use crux::typed_array::SharedBuffer;
@@ -613,6 +615,69 @@ impl Context {
         };
         object.0.set_key(&key, value.into_value(), true)?;
         Ok(())
+    }
+
+    /// [[HasProperty]] by the key value a host built (`v8::Object::Has`): the
+    /// own property, then the prototype chain.
+    pub fn has_property(&mut self, object: JsValue, key: JsValue) -> Result<bool, JsError> {
+        let key_value = key.into_value();
+        let key = crate::context::to_property_key(self.agent_mut(), &key_value)?;
+        let Some(object) = object.as_object() else {
+            return Err(JsError::new(
+                ErrorKind::TypeError,
+                "value is not an object".into(),
+            ));
+        };
+        object.0.has_property_key(&key)
+    }
+
+    /// [[Delete]] by the key value a host built (`v8::Object::Delete`): `true`
+    /// once the property is gone, including when it was never there.
+    pub fn delete_property(&mut self, object: JsValue, key: JsValue) -> Result<bool, JsError> {
+        let key_value = key.into_value();
+        let key = crate::context::to_property_key(self.agent_mut(), &key_value)?;
+        let Some(object) = object.as_object() else {
+            return Err(JsError::new(
+                ErrorKind::TypeError,
+                "value is not an object".into(),
+            ));
+        };
+        object.0.delete_key(&key)
+    }
+
+    /// The object's own named property, with no interceptor and no prototype
+    /// walk, and an own accessor's getter run on this object
+    /// (`v8::Object::GetRealNamedProperty`). `None` when the object has no such
+    /// own property.
+    pub fn get_own_property(
+        &mut self,
+        object: JsValue,
+        key: JsValue,
+    ) -> Result<Option<JsValue>, JsError> {
+        let key_value = key.into_value();
+        let key = crate::context::to_property_key(self.agent_mut(), &key_value)?;
+        let Some(object) = object.as_object() else {
+            return Err(JsError::new(
+                ErrorKind::TypeError,
+                "value is not an object".into(),
+            ));
+        };
+        let Some(property) = object.0.get_own_property_key(&key)? else {
+            return Ok(None);
+        };
+        match property.kind {
+            PropertyKind::Data { value, .. } => Ok(Some(JsValue(value))),
+            // An own accessor is authoritative, so the getter runs without a
+            // chain walk (`get_property_key` makes the same choice).
+            PropertyKind::Accessor {
+                get: Some(getter), ..
+            } if crux::value::is_callable(&getter) => {
+                let receiver = object.as_value().into_value();
+                crate::function::call_callback(self.agent_mut(), &getter, receiver, &[])
+                    .map(|value| Some(JsValue(value)))
+            }
+            PropertyKind::Accessor { .. } => Ok(Some(JsValue::undefined())),
+        }
     }
 
     /// A fresh dense array inheriting `%Array.prototype%` with one own data
@@ -2564,6 +2629,56 @@ mod tests {
                 .as_number(),
             Some(4.0)
         );
+    }
+
+    #[test]
+    fn has_delete_and_own_property_follow_the_language() {
+        let mut context = Context::new().unwrap();
+        let object = context.create_object().unwrap();
+        let key = JsValue::string("mark");
+
+        assert!(
+            !context
+                .has_property(object.as_value(), key.clone())
+                .unwrap()
+        );
+        context
+            .set_property(object.as_value(), key.clone(), JsValue::number(3.0))
+            .unwrap();
+        assert!(
+            context
+                .has_property(object.as_value(), key.clone())
+                .unwrap()
+        );
+        // The chain counts: %Object.prototype% has `toString`.
+        assert!(
+            context
+                .has_property(object.as_value(), JsValue::string("toString"))
+                .unwrap()
+        );
+
+        // An own property is visible to the own-property read; an inherited one
+        // is not.
+        assert_eq!(
+            context
+                .get_own_property(object.as_value(), key.clone())
+                .unwrap()
+                .and_then(|value| value.as_number()),
+            Some(3.0)
+        );
+        assert!(
+            context
+                .get_own_property(object.as_value(), JsValue::string("toString"))
+                .unwrap()
+                .is_none()
+        );
+
+        assert!(
+            context
+                .delete_property(object.as_value(), key.clone())
+                .unwrap()
+        );
+        assert!(!context.has_property(object.as_value(), key).unwrap());
     }
 
     #[test]

@@ -141,6 +141,64 @@ Maybe<bool> Object::Set(Local<Context> context, Local<Value> key,
   return Maybe<bool>(true);
 }
 
+MaybeLocal<Value> Object::Get(Local<Context> context, uint32_t index) {
+  return Get(context,
+             Local<Value>::New(slag_number_new(static_cast<double>(index))));
+}
+
+Maybe<bool> Object::Set(Local<Context> context, uint32_t index,
+                        Local<Value> value) {
+  return Set(context,
+             Local<Value>::New(slag_number_new(static_cast<double>(index))),
+             value);
+}
+
+Maybe<bool> Object::Has(Local<Context> context, Local<Value> key) {
+  if (context.IsEmpty() || key.IsEmpty()) return Maybe<bool>();
+  auto* current = reinterpret_cast<Context*>(
+      static_cast<uintptr_t>(context.raw()));
+  int32_t found = 0;
+  if (slag_object_has_key(current->slag(), Raw(this), key.raw(), &found) != 0) {
+    return Maybe<bool>();
+  }
+  return Maybe<bool>(found != 0);
+}
+
+Maybe<bool> Object::Has(Local<Context> context, uint32_t index) {
+  return Has(context,
+             Local<Value>::New(slag_number_new(static_cast<double>(index))));
+}
+
+bool Object::Delete(Local<Context> context, Local<Value> key) {
+  if (context.IsEmpty() || key.IsEmpty()) return false;
+  auto* current = reinterpret_cast<Context*>(
+      static_cast<uintptr_t>(context.raw()));
+  int32_t deleted = 0;
+  return slag_object_delete_key(current->slag(), Raw(this), key.raw(),
+                                &deleted) == 0 &&
+         deleted != 0;
+}
+
+bool Object::Delete(Local<Context> context, uint32_t index) {
+  return Delete(context,
+                Local<Value>::New(slag_number_new(static_cast<double>(index))));
+}
+
+MaybeLocal<Value> Object::GetRealNamedProperty(Local<Context> context,
+                                               Local<Name> key) {
+  if (context.IsEmpty() || key.IsEmpty()) return MaybeLocal<Value>();
+  auto* current = reinterpret_cast<Context*>(
+      static_cast<uintptr_t>(context.raw()));
+  uint64_t out = 0;
+  int32_t found = 0;
+  if (slag_object_get_own_key(current->slag(), Raw(this), key.raw(), &out,
+                              &found) != 0) {
+    return MaybeLocal<Value>();
+  }
+  if (found == 0) return MaybeLocal<Value>();
+  return Local<Value>::New(out);
+}
+
 Local<Number> Number::New(Isolate*, double value) {
   return Local<Number>::New(slag_number_new(value));
 }
