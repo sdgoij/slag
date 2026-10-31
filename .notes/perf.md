@@ -20820,3 +20820,40 @@ since the extra test repeats what `adopt_literal_properties` checks anyway.
 
 Verified: clippy `-D warnings`; `cargo test --workspace` 5866 pass / 0 fail;
 four sweeps at 100%; corpus parity 0 (`spread_assign` 76.2 ms).
+
+## SCOPED (not started): the plain-object chain read needs an own-key completeness bit
+
+`objects/construct_churn` (78 ms) is not a size cliff — the instances have two
+fields. Its census is `construct_args` once, `get_member_name` **once per
+iteration** (the `.sum` read) and `leaf_call_fill` once per call. The first is
+the interesting one: the compiled prototype-chain probe (`opt_lower::emit_chain_probe`)
+is gated on "dense Array AND `named_version == 0`", so a plain object or class
+instance reading a prototype method always falls back to the `get_member_name`
+helper.
+
+Dropping the dense half of the gate is sound (`named_version == 0` alone proves
+no own STRING key can shadow a string-name read: index keys and symbols cannot
+shadow one) but it does not help an instance with fields, which bumps
+`named_version` on its first define. Serving those needs the map-keyed chain
+cell (`Agent::member_chain_map_cells`, keyed `(map_id, name)`, already recorded)
+plus one extra fact: **the receiver's own keys are exactly its map's
+descriptors**. A map id pins the descriptor set, so a cell hit then proves
+own-absence for every instance of the map; what it does not rule out is the
+vector-only store state (an append whose ordinal is misaligned with the map, so
+the object owns a key the map does not describe), which `named_version` cannot
+distinguish because it is already non-zero.
+
+So the slice is a per-object `own_keys_mapped: Cell<bool>` (true unless a define
+wrote a vector entry without a map transition) that the probe reads in one load
+beside the map id. It must be cleared on every such define and on the
+dictionary-mode drop. The failure mode of a missed site is a stale read, so it
+wants its own audit of `define_fresh`'s non-map arms, `define_property`,
+`set_key`, the array paths and the presize/adoption paths — a dedicated block,
+not a squeeze.
+
+The second census line is cheaper and more contained: `leaf_call_fill` runs
+because the aliased fast path requires `frame_size == arity`, and a method with
+a `this` slot has `frame_size == arity + 1`. Emitting the receiver write plus
+the `OrdinaryCallBindThis` choice (strict / object / nullish→global) in the
+caller's machine code — bailing only for a primitive receiver, which boxes —
+removes the helper round trip from every method call.
