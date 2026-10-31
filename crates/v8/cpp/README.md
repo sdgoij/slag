@@ -312,6 +312,23 @@ identity but holds no reference to the rejecting value. A host callback can do
 all of it (`Promise::Resolver::New` and `Resolve` from an accessor), because the
 operations take the callback's window when one is running.
 
+### Maps and sets
+
+`Map` (`New`, `Set`, `Get`, `Has`, `Delete`, `Clear`, `Size`, `AsArray`) and `Set`
+(`New`, `Add`, `Has`, `Delete`, `Clear`, `Size`, `AsArray`) run the engine's own
+`%Map.prototype.*%` and `%Set.prototype.*%` intrinsics, so a script that replaced
+`Map.prototype.set` cannot change what a host's call does. `Size` and `AsArray`
+read the internal `[[MapData]]`/`[[SetData]]` lists directly: `Size` counts the
+live slots, and `AsArray` answers V8's flat form, `[key, value, ...]` for a map
+and the elements for a set. A host's map is an ordinary JS `Map`, so a script
+sees the same entries (`hostMap.size`, `hostMap.get(k)`), which the harness
+checks.
+
+These take the ordinary route only: a `Map`/`Set` call runs an engine intrinsic,
+which a host callback cannot do while it holds the engine, so the surface refuses
+the re-entry rather than racing it. `Size` on a handle that is not a map answers
+-1, as V8's does.
+
 ### Errors, private names, and data properties
 
 `Exception::Error`, `TypeError`, `RangeError`, `ReferenceError`,
@@ -554,6 +571,7 @@ not a claim that gin itself links.
   `StrictEquals`, `SameValue`, and `Local::operator==`.
 - `Promise` (`State`, `Result`, `MarkAsHandled`, `Then`, `Then2`, `Catch`) and
   `Promise::Resolver` (`New`, `GetPromise`, `Resolve`, `Reject`).
+- `Map` and `Set`: `New`, the keyed operations, `Clear`, `Size`, and `AsArray`.
 - `ArrayBuffer` and `SharedArrayBuffer` (creation, `ByteLength`, `Data`,
   `GetBackingStore`, and the detach protocol), `BackingStore` (fresh and
   host-owned, with a deleter), and the `ArrayBufferView`/`TypedArray` hierarchy
@@ -664,6 +682,10 @@ not a claim that gin itself links.
   isolate's queued jobs (microtasks, promise reactions, due timers) and answers
   whether it ran any. There are no host-posted platform tasks or task runners
   yet, so `PostTask`/`CallOnForegroundThread` are absent rather than ignored.
+- A `Map`/`Set` operation runs an engine intrinsic, so the container surface has
+  no callback form yet: calling one from a host callback records a re-entrancy
+  error instead of running. `WeakMap`/`WeakSet` and the `Map`/`Set` iterators as
+  C++ objects are absent; a script has them, and `AsArray` covers the host side.
 - A `Promise::Resolver` keeps its promise and rejecting function for the
   context's life, so a resolver that never settles is never released (V8
   collects the capability with the promise). `Resolver::New(context, promise)`,
@@ -761,4 +783,7 @@ character), checks `Utf8Length` and the lone surrogate's own three bytes against
 conversion empty. The promise block settles and re-settles a resolver, reads the
 state and result, rejects and marks handled, derives a promise through `Then2`
 and one through `Catch` (draining the jobs between), and makes and settles one
-from inside a host callback.
+from inside a host callback. The container block rounds a map and a set through
+`Set`/`Get`/`Has`/`Delete`/`Clear`/`Add`, reads both `Size`s and both `AsArray`s,
+checks that a script reads the same entries the host wrote, and checks that
+`Size` refuses a handle that is not a map.

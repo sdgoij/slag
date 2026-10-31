@@ -1062,6 +1062,23 @@ The cost is a resolver that never settles: its pair lives until the context is
 freed, where V8 collects it with the promise. `Resolver::New(context, promise)`
 and the `Promise::Resolve`/`Reject` statics are left out for now.
 
+*Maps and sets (2026-11-01).* `v8::Map` and `v8::Set` landed next, and the
+interesting decision was where the semantics live: the engine already has the
+`%Map.prototype.*%` and `%Set.prototype.*%` intrinsics and the internal
+`[[MapData]]`/`[[SetData]]` lists, so the facade runs the intrinsics by name
+(not the `Map.prototype` properties, which a script can replace) and reads the
+lists directly for `Size` and `AsArray`. `agent.map_entries(id)` and
+`agent.set_entries(id)` were already public for the set-methods, so no engine
+change was needed. `AsArray` answers V8's flat form: `[key, value, ...]` for a
+map.
+
+The container surface is deliberately ordinary-route only. Every operation needs
+`&mut Agent` and the engine's intrinsics, which means the callback window's route
+would have to be threaded through as it was for promises; nothing in the gin
+shape needs it, so the facade refuses a re-entry with the existing pending error
+instead of growing twelve more entry points. That is the first thing to revisit
+if a binding turns out to call `Map::Set` from a getter.
+
 ## 15. Sources
 
 Verified on 2026-10-31:

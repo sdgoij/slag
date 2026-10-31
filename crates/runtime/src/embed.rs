@@ -580,6 +580,168 @@ fn not_a_promise() -> JsError {
     JsError::new(ErrorKind::TypeError, "value is not a promise".into())
 }
 
+fn missing_intrinsic(name: &str) -> JsError {
+    JsError::new(
+        ErrorKind::Error,
+        format!("the realm has no {name} intrinsic"),
+    )
+}
+
+/// A fresh `Map` (`v8::Map::New`) from the realm's `%Map%`.
+pub fn new_map(agent: &mut Agent) -> Result<JsValue, JsError> {
+    construct_intrinsic(agent, "%Map%", &[])
+}
+
+/// `map.set(key, value)` through the engine's own intrinsic, so a script cannot
+/// intercept what a host's call does (`v8::Map::Set`).
+pub fn map_set(
+    agent: &mut Agent,
+    map: JsValue,
+    key: JsValue,
+    value: JsValue,
+) -> Result<(), JsError> {
+    call_intrinsic(agent, "%Map.prototype.set%", map, &[key, value]).map(|_| ())
+}
+
+/// `map.get(key)` (`v8::Map::Get`).
+pub fn map_get(agent: &mut Agent, map: JsValue, key: JsValue) -> Result<JsValue, JsError> {
+    call_intrinsic(agent, "%Map.prototype.get%", map, &[key])
+}
+
+/// `map.has(key)` (`v8::Map::Has`).
+pub fn map_has(agent: &mut Agent, map: JsValue, key: JsValue) -> Result<bool, JsError> {
+    let answer = call_intrinsic(agent, "%Map.prototype.has%", map, &[key])?;
+    Ok(answer.as_boolean().unwrap_or(false))
+}
+
+/// `map.delete(key)` (`v8::Map::Delete`).
+pub fn map_delete(agent: &mut Agent, map: JsValue, key: JsValue) -> Result<bool, JsError> {
+    let answer = call_intrinsic(agent, "%Map.prototype.delete%", map, &[key])?;
+    Ok(answer.as_boolean().unwrap_or(false))
+}
+
+/// `map.clear()` (`v8::Map::Clear`).
+pub fn map_clear(agent: &mut Agent, map: JsValue) -> Result<(), JsError> {
+    call_intrinsic(agent, "%Map.prototype.clear%", map, &[]).map(|_| ())
+}
+
+/// The live entry count of the map's `[[MapData]]` (`v8::Map::Size`).
+pub fn map_size(agent: &Agent, map: JsValue) -> Result<u32, JsError> {
+    let entries = map_entries(agent, map)?;
+    Ok(entries.iter().filter(|entry| entry.is_some()).count() as u32)
+}
+
+/// The map's entries flattened to `[key, value, ...]` (`v8::Map::AsArray`).
+pub fn map_as_array(agent: &mut Agent, map: JsValue) -> Result<JsValue, JsError> {
+    let entries = map_entries(agent, map)?;
+    let mut flat = Vec::with_capacity(entries.len() * 2);
+    for (key, value) in entries.iter().flatten() {
+        flat.push(*key);
+        flat.push(*value);
+    }
+    // The map's own list is what keeps these alive across the allocation below.
+    Ok(JsValue(crate::builtins::array::array_from_values(
+        agent, &flat,
+    )?))
+}
+
+/// A fresh `Set` (`v8::Set::New`) from the realm's `%Set%`.
+pub fn new_set(agent: &mut Agent) -> Result<JsValue, JsError> {
+    construct_intrinsic(agent, "%Set%", &[])
+}
+
+/// `set.add(value)` through the engine's own intrinsic (`v8::Set::Add`).
+pub fn set_add(agent: &mut Agent, set: JsValue, value: JsValue) -> Result<(), JsError> {
+    call_intrinsic(agent, "%Set.prototype.add%", set, &[value]).map(|_| ())
+}
+
+/// `set.has(value)` (`v8::Set::Has`).
+pub fn set_has(agent: &mut Agent, set: JsValue, value: JsValue) -> Result<bool, JsError> {
+    let answer = call_intrinsic(agent, "%Set.prototype.has%", set, &[value])?;
+    Ok(answer.as_boolean().unwrap_or(false))
+}
+
+/// `set.delete(value)` (`v8::Set::Delete`).
+pub fn set_delete(agent: &mut Agent, set: JsValue, value: JsValue) -> Result<bool, JsError> {
+    let answer = call_intrinsic(agent, "%Set.prototype.delete%", set, &[value])?;
+    Ok(answer.as_boolean().unwrap_or(false))
+}
+
+/// `set.clear()` (`v8::Set::Clear`).
+pub fn set_clear(agent: &mut Agent, set: JsValue) -> Result<(), JsError> {
+    call_intrinsic(agent, "%Set.prototype.clear%", set, &[]).map(|_| ())
+}
+
+/// The live element count of the set's `[[SetData]]` (`v8::Set::Size`).
+pub fn set_size(agent: &Agent, set: JsValue) -> Result<u32, JsError> {
+    let entries = set_entries(agent, set)?;
+    Ok(entries.iter().filter(|entry| entry.is_some()).count() as u32)
+}
+
+/// The set's elements as an array (`v8::Set::AsArray`).
+pub fn set_as_array(agent: &mut Agent, set: JsValue) -> Result<JsValue, JsError> {
+    let entries = set_entries(agent, set)?;
+    let values: Vec<Value> = entries.iter().flatten().copied().collect();
+    // As in `map_as_array`: the set's own list is what keeps these alive.
+    Ok(JsValue(crate::builtins::array::array_from_values(
+        agent, &values,
+    )?))
+}
+
+/// `name` constructed with `args` in the current realm.
+fn construct_intrinsic(
+    agent: &mut Agent,
+    name: &str,
+    args: &[JsValue],
+) -> Result<JsValue, JsError> {
+    let constructor = agent
+        .current_realm()?
+        .intrinsics
+        .get(name)
+        .ok_or_else(|| missing_intrinsic(name))?;
+    let values: Vec<Value> = args.iter().map(|arg| *arg.value()).collect();
+    let constructed = crate::function::construct(agent, &constructor, &values, &constructor)?;
+    Ok(JsValue(constructed))
+}
+
+/// `name` called with `this` and `args`: the engine's own method, not the
+/// property a script could replace.
+fn call_intrinsic(
+    agent: &mut Agent,
+    name: &str,
+    this: JsValue,
+    args: &[JsValue],
+) -> Result<JsValue, JsError> {
+    let function = agent
+        .current_realm()?
+        .intrinsics
+        .get(name)
+        .ok_or_else(|| missing_intrinsic(name))?;
+    let values: Vec<Value> = args.iter().map(|arg| *arg.value()).collect();
+    let computed = crate::function::call(agent, &function, this.into_value(), &values)?;
+    Ok(JsValue(computed))
+}
+
+/// The map's `[[MapData]]`, and the refusal V8's Map surface makes for a value
+/// that is not a map.
+fn map_entries(agent: &Agent, map: JsValue) -> Result<Vec<crate::agent::MapEntry>, JsError> {
+    let object = map.as_object().ok_or_else(not_a_map)?;
+    agent.map_entries(object.id()).ok_or_else(not_a_map)
+}
+
+fn set_entries(agent: &Agent, set: JsValue) -> Result<Vec<crate::agent::SetEntry>, JsError> {
+    let object = set.as_object().ok_or_else(not_a_set)?;
+    agent.set_entries(object.id()).ok_or_else(not_a_set)
+}
+
+fn not_a_map() -> JsError {
+    JsError::new(ErrorKind::TypeError, "value is not a Map".into())
+}
+
+fn not_a_set() -> JsError {
+    JsError::new(ErrorKind::TypeError, "value is not a Set".into())
+}
+
 /// Host-defined behavior the embedding API exposes. Each callback is
 /// optional; `None` falls back to a sensible default (console output to
 /// stdout/stderr, the built-in PRNG, no rejection reporting).
@@ -1129,6 +1291,81 @@ impl Context {
     /// Mark the promise handled (`v8::Promise::MarkAsHandled`).
     pub fn promise_mark_handled(&self, promise: JsValue) -> Result<(), JsError> {
         promise_mark_handled(&self.agent, promise)
+    }
+
+    /// A fresh `Map` in this realm (`v8::Map::New`).
+    pub fn new_map(&mut self) -> Result<JsValue, JsError> {
+        new_map(self.agent_mut())
+    }
+
+    /// `map.set(key, value)` (`v8::Map::Set`).
+    pub fn map_set(&mut self, map: JsValue, key: JsValue, value: JsValue) -> Result<(), JsError> {
+        map_set(self.agent_mut(), map, key, value)
+    }
+
+    /// `map.get(key)` (`v8::Map::Get`).
+    pub fn map_get(&mut self, map: JsValue, key: JsValue) -> Result<JsValue, JsError> {
+        map_get(self.agent_mut(), map, key)
+    }
+
+    /// `map.has(key)` (`v8::Map::Has`).
+    pub fn map_has(&mut self, map: JsValue, key: JsValue) -> Result<bool, JsError> {
+        map_has(self.agent_mut(), map, key)
+    }
+
+    /// `map.delete(key)` (`v8::Map::Delete`).
+    pub fn map_delete(&mut self, map: JsValue, key: JsValue) -> Result<bool, JsError> {
+        map_delete(self.agent_mut(), map, key)
+    }
+
+    /// `map.clear()` (`v8::Map::Clear`).
+    pub fn map_clear(&mut self, map: JsValue) -> Result<(), JsError> {
+        map_clear(self.agent_mut(), map)
+    }
+
+    /// The map's live entry count (`v8::Map::Size`).
+    pub fn map_size(&self, map: JsValue) -> Result<u32, JsError> {
+        map_size(&self.agent, map)
+    }
+
+    /// The map's entries flattened to `[key, value, ...]` (`v8::Map::AsArray`).
+    pub fn map_as_array(&mut self, map: JsValue) -> Result<JsValue, JsError> {
+        map_as_array(self.agent_mut(), map)
+    }
+
+    /// A fresh `Set` in this realm (`v8::Set::New`).
+    pub fn new_set(&mut self) -> Result<JsValue, JsError> {
+        new_set(self.agent_mut())
+    }
+
+    /// `set.add(value)` (`v8::Set::Add`).
+    pub fn set_add(&mut self, set: JsValue, value: JsValue) -> Result<(), JsError> {
+        set_add(self.agent_mut(), set, value)
+    }
+
+    /// `set.has(value)` (`v8::Set::Has`).
+    pub fn set_has(&mut self, set: JsValue, value: JsValue) -> Result<bool, JsError> {
+        set_has(self.agent_mut(), set, value)
+    }
+
+    /// `set.delete(value)` (`v8::Set::Delete`).
+    pub fn set_delete(&mut self, set: JsValue, value: JsValue) -> Result<bool, JsError> {
+        set_delete(self.agent_mut(), set, value)
+    }
+
+    /// `set.clear()` (`v8::Set::Clear`).
+    pub fn set_clear(&mut self, set: JsValue) -> Result<(), JsError> {
+        set_clear(self.agent_mut(), set)
+    }
+
+    /// The set's live element count (`v8::Set::Size`).
+    pub fn set_size(&self, set: JsValue) -> Result<u32, JsError> {
+        set_size(&self.agent, set)
+    }
+
+    /// The set's elements as an array (`v8::Set::AsArray`).
+    pub fn set_as_array(&mut self, set: JsValue) -> Result<JsValue, JsError> {
+        set_as_array(self.agent_mut(), set)
     }
 
     /// [[Get]] a property by the key value a host built (`v8::Object::Get`):
@@ -5169,6 +5406,74 @@ mod tests {
             context.promise_result(derived).unwrap().as_number(),
             Some(42.0)
         );
+    }
+
+    #[test]
+    fn a_host_map_and_set_round_trip_through_their_slots() {
+        let mut context = Context::new().unwrap();
+        let map = context.new_map().unwrap();
+        assert_eq!(context.map_size(map.clone()).unwrap(), 0);
+        context
+            .map_set(map.clone(), JsValue::string("a"), JsValue::number(1.0))
+            .unwrap();
+        context
+            .map_set(map.clone(), JsValue::string("b"), JsValue::number(2.0))
+            .unwrap();
+        assert_eq!(context.map_size(map.clone()).unwrap(), 2);
+        assert_eq!(
+            context
+                .map_get(map.clone(), JsValue::string("b"))
+                .unwrap()
+                .as_number(),
+            Some(2.0)
+        );
+        assert!(context.map_has(map.clone(), JsValue::string("a")).unwrap());
+        assert!(
+            context
+                .map_delete(map.clone(), JsValue::string("a"))
+                .unwrap()
+        );
+        assert_eq!(context.map_size(map.clone()).unwrap(), 1);
+
+        // AsArray is the flat key-value form, and the engine's own internal
+        // slots are what it reads.
+        let pairs = context.map_as_array(map.clone()).unwrap();
+        assert_eq!(
+            context
+                .get_property(pairs.clone(), JsValue::number(0.0))
+                .unwrap()
+                .as_string()
+                .as_deref(),
+            Some("b")
+        );
+        context.map_clear(map.clone()).unwrap();
+        assert_eq!(context.map_size(map.clone()).unwrap(), 0);
+
+        let set = context.new_set().unwrap();
+        context.set_add(set.clone(), JsValue::number(3.0)).unwrap();
+        context.set_add(set.clone(), JsValue::string("x")).unwrap();
+        assert_eq!(context.set_size(set.clone()).unwrap(), 2);
+        assert!(context.set_has(set.clone(), JsValue::number(3.0)).unwrap());
+        let elements = context.set_as_array(set.clone()).unwrap();
+        assert_eq!(
+            context
+                .get_property(elements, JsValue::number(1.0))
+                .unwrap()
+                .as_string()
+                .as_deref(),
+            Some("x")
+        );
+        assert!(
+            context
+                .set_delete(set.clone(), JsValue::number(3.0))
+                .unwrap()
+        );
+        assert_eq!(context.set_size(set).unwrap(), 1);
+
+        // A value that is not a collection is refused.
+        let plain = context.eval("({})").unwrap();
+        assert!(context.map_size(plain.clone()).is_err());
+        assert!(context.set_size(plain).is_err());
     }
 
     #[test]

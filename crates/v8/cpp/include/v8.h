@@ -689,6 +689,40 @@ class Array : public Object {
                           size_t length);
 };
 
+/* A JavaScript Map (`v8::Map`). The mutators run the engine's own
+ * `%Map.prototype.*%` intrinsics and `Size`/`AsArray` read its internal
+ * `[[MapData]]`, so a script cannot change what a host's call does. */
+class Map : public Object {
+ public:
+  static Local<Map> New(Isolate* isolate);
+  static Local<Map> New(Local<Context> context);
+
+  MaybeLocal<Value> Get(Local<Context> context, Local<Value> key);
+  MaybeLocal<Map> Set(Local<Context> context, Local<Value> key,
+                      Local<Value> value);
+  Maybe<bool> Has(Local<Context> context, Local<Value> key);
+  Maybe<bool> Delete(Local<Context> context, Local<Value> key);
+  /* The entries flattened to `[key, value, ...]`, as V8 answers. */
+  MaybeLocal<Array> AsArray(Local<Context> context);
+  /* The live entry count, or -1 when the handle is not a map. */
+  int Size(Local<Context> context);
+  void Clear();
+};
+
+/* A JavaScript Set (`v8::Set`), built the same way as `Map`. */
+class Set : public Object {
+ public:
+  static Local<Set> New(Isolate* isolate);
+  static Local<Set> New(Local<Context> context);
+
+  MaybeLocal<Set> Add(Local<Context> context, Local<Value> value);
+  Maybe<bool> Has(Local<Context> context, Local<Value> value);
+  Maybe<bool> Delete(Local<Context> context, Local<Value> value);
+  MaybeLocal<Array> AsArray(Local<Context> context);
+  int Size(Local<Context> context);
+  void Clear();
+};
+
 /* A JavaScript promise (`v8::Promise`). `State`/`Result` read the engine's
  * promise record; `Then`/`Then2`/`Catch` and the resolver go through the
  * engine's own PerformPromiseThen and NewPromiseCapability, so a script that

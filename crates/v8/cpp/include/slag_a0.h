@@ -247,6 +247,32 @@ int32_t slag_callback_promise_mark_handled(SlagContext* context, const void* tok
 int32_t slag_callback_promise_then(SlagContext* context, const void* token,
                                    uint64_t promise, uint64_t on_fulfilled,
                                    uint64_t on_rejected, uint64_t* out);
+/* Containers (`v8::Map`, `v8::Set`). Each operation runs the engine's own
+ * `%Map.prototype.*%`/`%Set.prototype.*%` intrinsic and `Size` reads the
+ * internal [[MapData]]/[[SetData]], so a script cannot change what a host's call
+ * does. These take the ordinary route only: a host callback that calls one is
+ * refused with a re-entrancy error rather than racing the engine's borrow. */
+int32_t slag_map_new(SlagContext* context, uint64_t* out);
+int32_t slag_map_set(SlagContext* context, uint64_t map, uint64_t key,
+                     uint64_t value);
+int32_t slag_map_get(SlagContext* context, uint64_t map, uint64_t key,
+                     uint64_t* out);
+int32_t slag_map_has(SlagContext* context, uint64_t map, uint64_t key,
+                     int32_t* out);
+int32_t slag_map_delete(SlagContext* context, uint64_t map, uint64_t key,
+                        int32_t* out);
+int32_t slag_map_clear(SlagContext* context, uint64_t map);
+int32_t slag_map_size(SlagContext* context, uint64_t map);
+int32_t slag_map_as_array(SlagContext* context, uint64_t map, uint64_t* out);
+int32_t slag_set_new(SlagContext* context, uint64_t* out);
+int32_t slag_set_add(SlagContext* context, uint64_t set, uint64_t value);
+int32_t slag_set_has(SlagContext* context, uint64_t set, uint64_t value,
+                     int32_t* out);
+int32_t slag_set_delete(SlagContext* context, uint64_t set, uint64_t value,
+                        int32_t* out);
+int32_t slag_set_clear(SlagContext* context, uint64_t set);
+int32_t slag_set_size(SlagContext* context, uint64_t set);
+int32_t slag_set_as_array(SlagContext* context, uint64_t set, uint64_t* out);
 uint64_t slag_number_new(double value);
 void slag_root_retain(uint64_t value);
 void slag_root_release(uint64_t value);

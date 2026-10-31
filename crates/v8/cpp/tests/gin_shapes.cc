@@ -1644,6 +1644,111 @@ int main() {
            "a callback made and settled a promise");
   }
 
+  // Maps and Sets: the internal-slot operations a host calls, and the script's
+  // own view of the same object.
+  {
+    v8::HandleScope scope(isolate);
+    v8::Local<v8::Context> current = context.Get(isolate);
+    v8::Context::Scope context_scope(current);
+    const auto expect = [&](bool condition, const char* what) {
+      if (!condition) {
+        fprintf(stderr, "containers: %s\n", what);
+        ++failures;
+      }
+    };
+    const auto run = [&](const char* source) {
+      return v8::Script::Compile(
+                 current, v8::String::NewFromUtf8Literal(isolate, source))
+          .ToLocalChecked()
+          ->Run(current)
+          .ToLocalChecked();
+    };
+    const auto bind = [&](const char* name, v8::Local<v8::Value> value) {
+      current->Global()
+          ->Set(current, v8::String::NewFromUtf8Literal(isolate, name), value)
+          .ToChecked();
+    };
+    const auto number_at = [&](const char* name) {
+      return current->Global()
+          ->Get(current, v8::String::NewFromUtf8Literal(isolate, name))
+          .ToLocalChecked()
+          ->Int32Value(current)
+          .FromMaybe(-1);
+    };
+
+    v8::Local<v8::Map> map = v8::Map::New(current);
+    expect(!map.IsEmpty() && map->Size(current) == 0, "a fresh map is empty");
+
+    v8::Local<v8::Value> key = v8::String::NewFromUtf8Literal(isolate, "a");
+    expect(!map->Set(current, key, v8::Integer::New(isolate, 1)).IsEmpty(),
+           "Set answered the map");
+    map->Set(current, v8::Integer::New(isolate, 2), v8::Integer::New(isolate, 4));
+    expect(map->Size(current) == 2, "the map holds two entries");
+    expect(map->Get(current, key)
+                   .ToLocalChecked()
+                   ->Int32Value(current)
+                   .FromMaybe(-1) == 1,
+           "Get answered the stored value");
+    expect(map->Get(current, v8::String::NewFromUtf8Literal(isolate, "none"))
+               .ToLocalChecked()
+               ->IsUndefined(),
+           "a missing key answers undefined");
+    expect(map->Has(current, key).FromMaybe(false), "Has sees the key");
+    expect(!map->Has(current, v8::String::NewFromUtf8Literal(isolate, "none"))
+                .FromMaybe(true),
+           "Has does not see a missing key");
+
+    // A host map is an ordinary JS Map, so a script reads the same entries.
+    bind("hostMap", map);
+    run("globalThis.mapSize = hostMap.size;"
+        " globalThis.mapValue = hostMap.get('a');");
+    expect(number_at("mapSize") == 2 && number_at("mapValue") == 1,
+           "a script reads the host's map");
+
+    // AsArray is the flat key-value form.
+    v8::Local<v8::Array> pairs = map->AsArray(current).ToLocalChecked();
+    v8::Local<v8::Value> flat;
+    expect(pairs->Get(current, 1).ToLocal(&flat) &&
+               flat->Int32Value(current).FromMaybe(-1) == 1,
+           "AsArray flattened the entries");
+
+    expect(map->Delete(current, key).FromMaybe(false), "Delete removed the key");
+    expect(map->Size(current) == 1, "the map shrank");
+    map->Clear();
+    expect(map->Size(current) == 0, "Clear emptied the map");
+
+    // A Set is the same surface with add instead of set.
+    v8::Local<v8::Set> set = v8::Set::New(current);
+    expect(!set.IsEmpty() && set->Size(current) == 0, "a fresh set is empty");
+    expect(!set->Add(current, v8::Integer::New(isolate, 3)).IsEmpty(),
+           "Add answered the set");
+    set->Add(current, v8::String::NewFromUtf8Literal(isolate, "x"));
+    expect(set->Size(current) == 2, "the set holds two elements");
+    expect(set->Has(current, v8::Integer::New(isolate, 3)).FromMaybe(false),
+           "Has sees the element");
+    bind("hostSet", set);
+    run("globalThis.setSize = hostSet.size;"
+        " globalThis.setHas = hostSet.has('x');");
+    expect(number_at("setSize") == 2 && number_at("setHas") == 1,
+           "a script reads the host's set");
+
+    v8::Local<v8::Array> elements = set->AsArray(current).ToLocalChecked();
+    expect(elements->Get(current, 1).ToLocal(&flat),
+           "AsArray answered an element");
+    v8::String::Utf8Value listed(isolate, flat);
+    expect(*listed != nullptr && strcmp(*listed, "x") == 0,
+           "AsArray listed the elements");
+    expect(set->Delete(current, v8::Integer::New(isolate, 3)).FromMaybe(false),
+           "Delete removed the element");
+    set->Clear();
+    expect(set->Size(current) == 0, "Clear emptied the set");
+
+    // A handle that is not a map answers -1 rather than guessing.
+    v8::Local<v8::Map> not_a_map = v8::Object::New(isolate).As<v8::Map>();
+    expect(not_a_map->Size(current) == -1, "Size refuses a non-map");
+    slag_clear_error(current->slag());
+  }
+
   // Errors, private names, and the data-property forms: the values a host
   // throws, the keys it hides, and the accessors a template installs.
   {

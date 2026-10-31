@@ -1714,6 +1714,163 @@ Maybe<bool> Promise::Resolver::Reject(Local<Context> context,
   return SettleResolver(Raw(this), value.raw(), 1);
 }
 
+namespace {
+
+/* The context a container operation needs, from the handle V8 passes. */
+Context* ContainerContext(Local<Context> context) {
+  if (context.IsEmpty()) return nullptr;
+  return reinterpret_cast<Context*>(static_cast<uintptr_t>(context.raw()));
+}
+
+MaybeLocal<Value> ContainerValue(SlagContext* slag, int status, uint64_t value) {
+  if (status != 0) return MaybeLocal<Value>();
+  (void)slag;
+  return MaybeLocal<Value>(Local<Value>::New(value));
+}
+
+Maybe<bool> ContainerFlag(int status, int32_t flag) {
+  if (status != 0) return Maybe<bool>();
+  return Maybe<bool>(flag != 0);
+}
+
+}  // namespace
+
+Local<Map> Map::New(Local<Context> context) {
+  Context* current = ContainerContext(context);
+  if (current == nullptr) return Local<Map>();
+  uint64_t out = 0;
+  if (slag_map_new(current->slag(), &out) != 0) return Local<Map>();
+  return Local<Map>::New(out);
+}
+
+Local<Map> Map::New(Isolate* isolate) {
+  if (isolate == nullptr) return Local<Map>();
+  return New(isolate->GetCurrentContext());
+}
+
+MaybeLocal<Value> Map::Get(Local<Context> context, Local<Value> key) {
+  Context* current = ContainerContext(context);
+  if (current == nullptr || key.IsEmpty()) return MaybeLocal<Value>();
+  uint64_t out = 0;
+  const int status =
+      slag_map_get(current->slag(), Raw(this), key.raw(), &out);
+  return ContainerValue(current->slag(), status, out);
+}
+
+MaybeLocal<Map> Map::Set(Local<Context> context, Local<Value> key,
+                         Local<Value> value) {
+  Context* current = ContainerContext(context);
+  if (current == nullptr || key.IsEmpty() || value.IsEmpty()) {
+    return MaybeLocal<Map>();
+  }
+  if (slag_map_set(current->slag(), Raw(this), key.raw(), value.raw()) != 0) {
+    return MaybeLocal<Map>();
+  }
+  return MaybeLocal<Map>(Local<Map>::New(Raw(this)));
+}
+
+Maybe<bool> Map::Has(Local<Context> context, Local<Value> key) {
+  Context* current = ContainerContext(context);
+  if (current == nullptr || key.IsEmpty()) return Maybe<bool>();
+  int32_t flag = 0;
+  const int status =
+      slag_map_has(current->slag(), Raw(this), key.raw(), &flag);
+  return ContainerFlag(status, flag);
+}
+
+Maybe<bool> Map::Delete(Local<Context> context, Local<Value> key) {
+  Context* current = ContainerContext(context);
+  if (current == nullptr || key.IsEmpty()) return Maybe<bool>();
+  int32_t flag = 0;
+  const int status =
+      slag_map_delete(current->slag(), Raw(this), key.raw(), &flag);
+  return ContainerFlag(status, flag);
+}
+
+MaybeLocal<Array> Map::AsArray(Local<Context> context) {
+  Context* current = ContainerContext(context);
+  if (current == nullptr) return MaybeLocal<Array>();
+  uint64_t out = 0;
+  if (slag_map_as_array(current->slag(), Raw(this), &out) != 0) {
+    return MaybeLocal<Array>();
+  }
+  return MaybeLocal<Array>(Local<Array>::New(out));
+}
+
+int Map::Size(Local<Context> context) {
+  Context* current = ContainerContext(context);
+  if (current == nullptr) return -1;
+  return slag_map_size(current->slag(), Raw(this));
+}
+
+void Map::Clear() {
+  SlagContext* slag = CurrentSlagContext();
+  if (slag == nullptr) return;
+  slag_map_clear(slag, Raw(this));
+}
+
+Local<Set> Set::New(Local<Context> context) {
+  Context* current = ContainerContext(context);
+  if (current == nullptr) return Local<Set>();
+  uint64_t out = 0;
+  if (slag_set_new(current->slag(), &out) != 0) return Local<Set>();
+  return Local<Set>::New(out);
+}
+
+Local<Set> Set::New(Isolate* isolate) {
+  if (isolate == nullptr) return Local<Set>();
+  return New(isolate->GetCurrentContext());
+}
+
+MaybeLocal<Set> Set::Add(Local<Context> context, Local<Value> value) {
+  Context* current = ContainerContext(context);
+  if (current == nullptr || value.IsEmpty()) return MaybeLocal<Set>();
+  if (slag_set_add(current->slag(), Raw(this), value.raw()) != 0) {
+    return MaybeLocal<Set>();
+  }
+  return MaybeLocal<Set>(Local<Set>::New(Raw(this)));
+}
+
+Maybe<bool> Set::Has(Local<Context> context, Local<Value> value) {
+  Context* current = ContainerContext(context);
+  if (current == nullptr || value.IsEmpty()) return Maybe<bool>();
+  int32_t flag = 0;
+  const int status =
+      slag_set_has(current->slag(), Raw(this), value.raw(), &flag);
+  return ContainerFlag(status, flag);
+}
+
+Maybe<bool> Set::Delete(Local<Context> context, Local<Value> value) {
+  Context* current = ContainerContext(context);
+  if (current == nullptr || value.IsEmpty()) return Maybe<bool>();
+  int32_t flag = 0;
+  const int status =
+      slag_set_delete(current->slag(), Raw(this), value.raw(), &flag);
+  return ContainerFlag(status, flag);
+}
+
+MaybeLocal<Array> Set::AsArray(Local<Context> context) {
+  Context* current = ContainerContext(context);
+  if (current == nullptr) return MaybeLocal<Array>();
+  uint64_t out = 0;
+  if (slag_set_as_array(current->slag(), Raw(this), &out) != 0) {
+    return MaybeLocal<Array>();
+  }
+  return MaybeLocal<Array>(Local<Array>::New(out));
+}
+
+int Set::Size(Local<Context> context) {
+  Context* current = ContainerContext(context);
+  if (current == nullptr) return -1;
+  return slag_set_size(current->slag(), Raw(this));
+}
+
+void Set::Clear() {
+  SlagContext* slag = CurrentSlagContext();
+  if (slag == nullptr) return;
+  slag_set_clear(slag, Raw(this));
+}
+
 bool Object::Delete(Local<Context> context, Local<Value> key) {
   if (context.IsEmpty() || key.IsEmpty()) return false;
   auto* current = reinterpret_cast<Context*>(

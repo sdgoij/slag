@@ -3274,6 +3274,229 @@ pub unsafe extern "C" fn slag_callback_promise_then(
     promise_then_of(context, token, promise, on_fulfilled, on_rejected, out)
 }
 
+/// Run one container operation on the engine, recording its error. The engine is
+/// borrowed outright: a `Map`/`Set` call runs the engine's own intrinsic method,
+/// which a host callback cannot do without the window route (the facade's
+/// container surface therefore refuses a re-entry rather than risking it).
+unsafe fn container_call<T>(
+    context: *mut SlagContext,
+    body: impl FnOnce(&mut Context) -> Result<T, JsError>,
+) -> Result<T, i32> {
+    let Some(current) = context.as_ref() else {
+        return Err(2);
+    };
+    let Ok(mut engine) = current.context.try_borrow_mut() else {
+        reentrant(current);
+        return Err(1);
+    };
+    body(&mut engine).map_err(|error| {
+        record(current, error);
+        1
+    })
+}
+
+unsafe fn container_value(
+    context: *mut SlagContext,
+    out: *mut u64,
+    body: impl FnOnce(&mut Context) -> Result<JsValue, JsError>,
+) -> i32 {
+    match container_call(context, body) {
+        Ok(value) => {
+            if !out.is_null() {
+                *out = value.to_bits();
+            }
+            0
+        }
+        Err(status) => status,
+    }
+}
+
+unsafe fn container_flag(
+    context: *mut SlagContext,
+    out: *mut i32,
+    body: impl FnOnce(&mut Context) -> Result<bool, JsError>,
+) -> i32 {
+    match container_call(context, body) {
+        Ok(flag) => {
+            if !out.is_null() {
+                *out = i32::from(flag);
+            }
+            0
+        }
+        Err(status) => status,
+    }
+}
+
+/// A new `Map` (`v8::Map::New`).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn slag_map_new(context: *mut SlagContext, out: *mut u64) -> i32 {
+    container_value(context, out, |engine| engine.new_map())
+}
+
+/// `map.set(key, value)` through the engine's own intrinsic (`v8::Map::Set`).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn slag_map_set(
+    context: *mut SlagContext,
+    map: u64,
+    key: u64,
+    value: u64,
+) -> i32 {
+    match container_call(context, |engine| {
+        engine.map_set(
+            JsValue::from_bits(map),
+            JsValue::from_bits(key),
+            JsValue::from_bits(value),
+        )
+    }) {
+        Ok(()) => 0,
+        Err(status) => status,
+    }
+}
+
+/// `map.get(key)` (`v8::Map::Get`).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn slag_map_get(
+    context: *mut SlagContext,
+    map: u64,
+    key: u64,
+    out: *mut u64,
+) -> i32 {
+    container_value(context, out, |engine| {
+        engine.map_get(JsValue::from_bits(map), JsValue::from_bits(key))
+    })
+}
+
+/// `map.has(key)` (`v8::Map::Has`).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn slag_map_has(
+    context: *mut SlagContext,
+    map: u64,
+    key: u64,
+    out: *mut i32,
+) -> i32 {
+    container_flag(context, out, |engine| {
+        engine.map_has(JsValue::from_bits(map), JsValue::from_bits(key))
+    })
+}
+
+/// `map.delete(key)` (`v8::Map::Delete`).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn slag_map_delete(
+    context: *mut SlagContext,
+    map: u64,
+    key: u64,
+    out: *mut i32,
+) -> i32 {
+    container_flag(context, out, |engine| {
+        engine.map_delete(JsValue::from_bits(map), JsValue::from_bits(key))
+    })
+}
+
+/// `map.clear()` (`v8::Map::Clear`).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn slag_map_clear(context: *mut SlagContext, map: u64) -> i32 {
+    match container_call(context, |engine| engine.map_clear(JsValue::from_bits(map))) {
+        Ok(()) => 0,
+        Err(status) => status,
+    }
+}
+
+/// The map's live entry count (`v8::Map::Size`), or a negated status when the
+/// value is not a map.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn slag_map_size(context: *mut SlagContext, map: u64) -> i32 {
+    match container_call(context, |engine| engine.map_size(JsValue::from_bits(map))) {
+        Ok(size) => i32::try_from(size).unwrap_or(i32::MAX),
+        Err(status) => -status,
+    }
+}
+
+/// The map's entries flattened to `[key, value, ...]` (`v8::Map::AsArray`).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn slag_map_as_array(
+    context: *mut SlagContext,
+    map: u64,
+    out: *mut u64,
+) -> i32 {
+    container_value(context, out, |engine| {
+        engine.map_as_array(JsValue::from_bits(map))
+    })
+}
+
+/// A new `Set` (`v8::Set::New`).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn slag_set_new(context: *mut SlagContext, out: *mut u64) -> i32 {
+    container_value(context, out, |engine| engine.new_set())
+}
+
+/// `set.add(value)` through the engine's own intrinsic (`v8::Set::Add`).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn slag_set_add(context: *mut SlagContext, set: u64, value: u64) -> i32 {
+    match container_call(context, |engine| {
+        engine.set_add(JsValue::from_bits(set), JsValue::from_bits(value))
+    }) {
+        Ok(()) => 0,
+        Err(status) => status,
+    }
+}
+
+/// `set.has(value)` (`v8::Set::Has`).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn slag_set_has(
+    context: *mut SlagContext,
+    set: u64,
+    value: u64,
+    out: *mut i32,
+) -> i32 {
+    container_flag(context, out, |engine| {
+        engine.set_has(JsValue::from_bits(set), JsValue::from_bits(value))
+    })
+}
+
+/// `set.delete(value)` (`v8::Set::Delete`).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn slag_set_delete(
+    context: *mut SlagContext,
+    set: u64,
+    value: u64,
+    out: *mut i32,
+) -> i32 {
+    container_flag(context, out, |engine| {
+        engine.set_delete(JsValue::from_bits(set), JsValue::from_bits(value))
+    })
+}
+
+/// `set.clear()` (`v8::Set::Clear`).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn slag_set_clear(context: *mut SlagContext, set: u64) -> i32 {
+    match container_call(context, |engine| engine.set_clear(JsValue::from_bits(set))) {
+        Ok(()) => 0,
+        Err(status) => status,
+    }
+}
+
+/// The set's live element count (`v8::Set::Size`), or a negated status when the
+/// value is not a set.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn slag_set_size(context: *mut SlagContext, set: u64) -> i32 {
+    match container_call(context, |engine| engine.set_size(JsValue::from_bits(set))) {
+        Ok(size) => i32::try_from(size).unwrap_or(i32::MAX),
+        Err(status) => -status,
+    }
+}
+
+/// The set's elements as an array (`v8::Set::AsArray`).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn slag_set_as_array(
+    context: *mut SlagContext,
+    set: u64,
+    out: *mut u64,
+) -> i32 {
+    container_value(context, out, |engine| {
+        engine.set_as_array(JsValue::from_bits(set))
+    })
+}
+
 /// A symbol's description (`v8::Private::Name`), or `undefined` when it has
 /// none. Answers 2 when the value is not a symbol.
 #[unsafe(no_mangle)]
@@ -4725,6 +4948,62 @@ mod tests {
                     .expect("utf8")
                     .contains("promise")
             );
+            slag_clear_error(context);
+
+            slag_context_free(context);
+            slag_isolate_free(isolate);
+        }
+    }
+
+    #[test]
+    fn a_map_and_set_round_trip_through_the_abi() {
+        unsafe {
+            let isolate = slag_isolate_new();
+            let context = slag_context_new(isolate);
+            assert!(!context.is_null());
+
+            let mut map = 0;
+            assert_eq!(slag_map_new(context, &mut map), 0);
+            assert_eq!(slag_map_size(context, map), 0);
+
+            let key = slag_string_new(b"k".as_ptr(), 1);
+            assert_eq!(slag_map_set(context, map, key, slag_number_new(5.0)), 0);
+            assert_eq!(slag_map_size(context, map), 1);
+
+            let mut read = 0;
+            assert_eq!(slag_map_get(context, map, key, &mut read), 0);
+            assert_eq!(slag_value_to_number(read), 5.0);
+
+            let mut flag = 0;
+            assert_eq!(slag_map_has(context, map, key, &mut flag), 0);
+            assert_eq!(flag, 1);
+
+            // AsArray is the flat key-value form, so the value is at index 1.
+            let mut pairs = 0;
+            assert_eq!(slag_map_as_array(context, map, &mut pairs), 0);
+            let index = slag_number_new(1.0);
+            assert_eq!(slag_object_get_key(context, pairs, index, &mut read), 0);
+            assert_eq!(slag_value_to_number(read), 5.0);
+
+            assert_eq!(slag_map_delete(context, map, key, &mut flag), 0);
+            assert_eq!(flag, 1);
+            assert_eq!(slag_map_size(context, map), 0);
+
+            let mut set = 0;
+            assert_eq!(slag_set_new(context, &mut set), 0);
+            assert_eq!(slag_set_add(context, set, slag_number_new(3.0)), 0);
+            assert_eq!(slag_set_size(context, set), 1);
+            assert_eq!(
+                slag_set_has(context, set, slag_number_new(3.0), &mut flag),
+                0
+            );
+            assert_eq!(flag, 1);
+            assert_eq!(slag_set_clear(context, set), 0);
+            assert_eq!(slag_set_size(context, set), 0);
+
+            // A value that is not a collection is refused with a pending error.
+            assert_eq!(slag_map_size(context, slag_number_new(0.0)), -1);
+            assert_eq!(slag_set_size(context, slag_number_new(0.0)), -1);
             slag_clear_error(context);
 
             slag_context_free(context);
