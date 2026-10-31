@@ -439,10 +439,12 @@ standalone: `gin/BUILD.gn` public-deps `//base`,
 handle change and a gin-shaped harness (`crates/v8/cpp/tests/gin_shapes.cc`,
 prints `30`, exit 0). The real `gin` link gate belongs in a Chromium checkout
 with `//v8` swapped, and it is the first place the wrappable/cppgc surface is
-required. One gap is named rather than hidden: the facade's handle stack is not
-registered as an engine root source, so a value held only by a slot is not
-protected across a collection; the samples read before the next allocation, but
-A2 must add the pin/root-source ABI entry point.
+required. The handle stack is now a real root: `Local<T>` slots over engine
+values are retained in `slagc`'s `RootSource` and released by `HandleScope`,
+and `gin-shapes` forces a collection and reads a slot-held string back. The
+remaining persistence gap is `Global<T>` over a heap value, which stores the
+tagged value but does not pin it; that and the wrappable/internal-field/cppgc
+surface are the next pieces.
 
 ## 12. Cost model
 

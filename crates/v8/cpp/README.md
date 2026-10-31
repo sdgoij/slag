@@ -56,19 +56,27 @@ crates/v8/cpp/build/Release/gin-shapes.exe
 `Local<T>` is now the word-sized indirect handle from V8's
 `v8-handle-base.h`:
 
-- a `Local<T>` is an `Address*` into a thread-local handle stack;
+- a `Local<T>` is a `HandleSlot*` into a thread-local handle stack;
+- an engine-value slot is retained in the C ABI's root registry, and a facade-pointer slot is not;
 - a `HandleScope` records the stack's size and restores it on exit, so nested
   scopes release exactly the slots they allocated;
 - `Global<T>` stores the tagged value itself and `Get` allocates a fresh slot;
 - `Local<T>::As` reinterprets the same slot, so it does not copy the value;
 - `FunctionCallbackInfo::operator[]` allocates a slot for each argument.
 
-This is the shape V8 uses and the shape the design note argues for. It is not
-yet complete: the slot stack is a `std::deque` in the facade, and the engine
-does not see it as a root source. The samples and the harness read each value
-before the next allocation, so they do not depend on a slot surviving a
-collection, but a real host will. Registering the slot stack with the engine is
-the next ABI addition (A2), not part of A1.
+This is the shape V8 uses and the shape the design note argues for. A slot for
+an engine value is now a real root: `Local<String>`, `Local<Value>`,
+`Local<Number>`, and `Local<Object>` retain their value in `slagc`'s root
+registry, and `HandleScope` releases it on exit. A slot for a facade pointer
+(`Context`, `Script`, `ObjectTemplate`, `FunctionTemplate`) is not retained,
+because those are C++ allocations, not engine values; registering them would
+make the collector trace a pointer as a `Value`.
+
+`gin-shapes` forces a collection (`slag_collect`) while a string is held only by
+a handle slot and reads it back, so the root path is exercised through the real
+boundary. The remaining persistence gap is `Global<T>` over a heap value: it
+stores the tagged value and allocates a slot on `Get`, but it does not retain
+the value for its own lifetime. That is the next ABI addition.
 
 ## The gin target
 
@@ -106,6 +114,7 @@ not a claim that gin itself links.
 - `ObjectTemplate`/`FunctionTemplate` and host callbacks with arguments and a
   return value.
 - `Global<T>`, `Maybe<T>`, `MaybeLocal<T>`.
+- The handle stack as an engine root source: engine-value slots are retained and released with their scope.
 - WebAssembly through the engine's own `wasm` feature, which `hello-world`
   exercises.
 
@@ -114,7 +123,7 @@ not a claim that gin itself links.
 - It is not source-compatible with the rest of `v8.h`. There are no interceptors,
   no internal fields, no `Wrappable`, no `TracedReference`, no platform tasks,
   no snapshots, no inspector.
-- The handle stack is not an engine root source yet (see A1 above).
+- `Global<T>` over a heap value is not pinned; only handle slots are rooted.
 - `Message` is always empty and `StackTrace` is always empty, so the sample's
   rich error path (source line, caret) is compiled but not taken. An uncaught
   `Error` therefore prints the engine's generic `TypeError: Uncaught exception`

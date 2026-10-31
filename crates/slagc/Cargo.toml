@@ -12,3 +12,4 @@ crate-type = ["staticlib", "rlib"]
 
 [dependencies]
 slag = { path = "../slag", default-features = false, features = ["wasm"] }
+crux = { path = "../crux" }

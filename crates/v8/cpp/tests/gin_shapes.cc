@@ -8,7 +8,9 @@
 // Chromium's base library.
 
 #include <stdio.h>
+#include <string.h>
 
+#include "include/slag_a0.h"
 #include "include/v8-context.h"
 #include "include/v8-initialization.h"
 #include "include/v8-isolate.h"
@@ -98,6 +100,22 @@ int main() {
             v8::String::NewFromUtf8Literal(isolate, "print(sum(10, 20))"))
             .ToLocalChecked();
     print_script->Run(context.Get(isolate)).ToLocalChecked();
+
+    {
+      // The value below lives only in a handle slot (the C++ heap); the C++
+      // stack holds the slot pointer. Force a collection and read it back.
+      v8::Local<v8::String> held =
+          v8::String::NewFromUtf8Literal(isolate, "survives");
+      if (slag_collect(context.Get(isolate)->slag()) != 0) {
+        fprintf(stderr, "collection failed\n");
+        ++failures;
+      }
+      v8::String::Utf8Value text(isolate, held);
+      if (!*text || strcmp(*text, "survives") != 0) {
+        fprintf(stderr, "handle did not survive the collection\n");
+        ++failures;
+      }
+    }
   }
 
   isolate->Dispose();

@@ -90,6 +90,13 @@ inline thread_local Isolate* g_current_isolate = nullptr;
 
 using Address = uint64_t;
 
+/* One handle slot. `rooted` says whether `value` is an engine value the C ABI
+ * must retain; facade-owned pointers (Context, Script, templates) are not. */
+struct HandleSlot {
+  Address value;
+  bool rooted;
+};
+
 template <class T>
 class Local {
  public:
@@ -112,21 +119,21 @@ class Local {
   T* operator*() const { return operator->(); }
 
   // The tagged word this handle names. Only meaningful on a non-empty handle.
-  uint64_t raw() const { return location_ != nullptr ? *location_ : 0; }
+  uint64_t raw() const { return location_ != nullptr ? location_->value : 0; }
 
   // A handle for `value`, allocated in the current handle scope.
   static Local<T> New(uint64_t value);
 
  private:
-  explicit Local(Address* location) : location_(location) {}
+  explicit Local(HandleSlot* location) : location_(location) {}
 
-  static Local<T> FromSlot(Address* location) {
+  static Local<T> FromSlot(HandleSlot* location) {
     return Local<T>(location);
   }
 
-  Address* slot() const { return location_; }
+  HandleSlot* slot() const { return location_; }
 
-  Address* location_ = nullptr;
+  HandleSlot* location_ = nullptr;
 
   template <class>
   friend class Local;
@@ -413,7 +420,7 @@ class HandleScope {
   HandleScope(const HandleScope&) = delete;
   HandleScope& operator=(const HandleScope&) = delete;
 
-  static Address* CreateHandle(uint64_t value);
+  static HandleSlot* CreateHandle(uint64_t value, bool rooted);
 
  private:
   std::size_t mark_;
@@ -421,7 +428,8 @@ class HandleScope {
 
 template <class T>
 Local<T> Local<T>::New(uint64_t value) {
-  return Local<T>(HandleScope::CreateHandle(value));
+  return Local<T>(
+      HandleScope::CreateHandle(value, std::is_base_of_v<Value, T>));
 }
 
 template <class T>

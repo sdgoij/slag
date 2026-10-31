@@ -9,18 +9,24 @@
 namespace {
 
 /* The one handle stack for this process. `HandleScope` marks it and restores
- * the mark; `Local<T>::New` allocates from it. */
-thread_local std::deque<v8::Address> g_handles;
+ * the mark; `Local<T>::New` allocates from it. A rooted slot retains its value
+ * in the C ABI's root registry; a facade pointer slot does not. */
+thread_local std::deque<v8::HandleSlot> g_handles;
 
 std::size_t HandleMark() { return g_handles.size(); }
 
-v8::Address* HandleCreate(uint64_t value) {
-  g_handles.push_back(value);
+v8::HandleSlot* HandleCreate(uint64_t value, bool rooted) {
+  if (rooted) slag_root_retain(value);
+  g_handles.push_back(v8::HandleSlot{value, rooted});
   return &g_handles.back();
 }
 
 void HandleRestore(std::size_t mark) {
-  if (mark <= g_handles.size()) g_handles.resize(mark);
+  if (mark > g_handles.size()) return;
+  for (std::size_t i = mark; i < g_handles.size(); ++i) {
+    if (g_handles[i].rooted) slag_root_release(g_handles[i].value);
+  }
+  g_handles.resize(mark);
 }
 
 std::string ValueText(uint64_t value) {
@@ -49,8 +55,8 @@ HandleScope::HandleScope(Isolate*) : mark_(HandleMark()) {}
 
 HandleScope::~HandleScope() { HandleRestore(mark_); }
 
-Address* HandleScope::CreateHandle(uint64_t value) {
-  return HandleCreate(value);
+HandleSlot* HandleScope::CreateHandle(uint64_t value, bool rooted) {
+  return HandleCreate(value, rooted);
 }
 
 bool V8::InitializeICUDefaultLocation(const char*) { return true; }

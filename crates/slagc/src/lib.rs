@@ -19,6 +19,8 @@ use std::cell::RefCell;
 use std::ffi::{c_char, c_void};
 use std::rc::Rc;
 
+use crux::heap::{GcAny, RootSource, Trace, register_root_source};
+use crux::value::Value;
 use slag::{CompiledScript, Context, ErrorKind, FunctionCall, HostFn, JsError, JsValue};
 
 /// The isolate a host enters. The engine's contexts are the state; this token
@@ -72,6 +74,67 @@ fn reentrant(context: &SlagContext) {
             "re-entrant evaluation is not supported; use FunctionCall::eval".to_string(),
         ),
     );
+}
+
+thread_local! {
+    /// The values the facade's handle slots still hold. The engine consults
+    /// this as a root source, so a `Local<T>` is a precise root rather than a
+    /// word the conservative stack scan has to guess about.
+    static ROOTS: RefCell<Vec<Value>> = const { RefCell::new(Vec::new()) };
+}
+
+struct HandleRoots;
+
+impl RootSource for HandleRoots {
+    fn roots(&self, visit: &mut dyn FnMut(GcAny)) {
+        ROOTS.with(|roots| {
+            for value in roots.borrow().iter() {
+                value.trace(visit);
+            }
+        });
+    }
+}
+
+static HANDLE_ROOTS: HandleRoots = HandleRoots;
+
+fn register_roots() {
+    register_root_source(&HANDLE_ROOTS);
+}
+
+/// Retain one engine value for a facade handle slot. The facade calls this only
+/// for `Local<T>` where `T` is an engine value; a `Context*`, `Script*`, or
+/// template pointer must never enter the registry.
+#[unsafe(no_mangle)]
+pub extern "C" fn slag_root_retain(value: u64) {
+    register_roots();
+    ROOTS.with(|roots| roots.borrow_mut().push(Value::from_bits(value)));
+}
+
+/// Release one retention, matching [`slag_root_retain`]. A duplicate value in
+/// two slots has two entries, so this removes one.
+#[unsafe(no_mangle)]
+pub extern "C" fn slag_root_release(value: u64) {
+    ROOTS.with(|roots| {
+        let mut roots = roots.borrow_mut();
+        if let Some(index) = roots.iter().rposition(|held| held.bits() == value) {
+            roots.remove(index);
+        }
+    });
+}
+
+/// Run a full collection now, with the facade's roots in place. The C++ harness
+/// uses this to prove a value held only by a handle slot survives.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn slag_collect(context: *mut SlagContext) -> i32 {
+    let Some(context) = context.as_mut() else {
+        return 2;
+    };
+    let Ok(mut engine) = context.context.try_borrow_mut() else {
+        reentrant(context);
+        return 1;
+    };
+    engine.agent_mut().collect_garbage();
+    0
 }
 
 #[unsafe(no_mangle)]
@@ -506,6 +569,35 @@ mod tests {
     fn numbers_round_trip_through_the_abi() {
         let value = slag_number_new(2.5);
         assert_eq!(slag_value_to_number(value), 2.5);
+    }
+
+    #[test]
+    fn the_root_registry_keeps_a_value_the_heap_would_otherwise_sweep() {
+        use crux::handle::Handle;
+        use crux::string::JsString;
+
+        let value = Value::String(Handle::new(JsString::from_utf8("rooted")));
+        let peer = Value::String(Handle::new(JsString::from_utf8("peer")));
+        let rooted = value.as_string().expect("string").as_any().addr();
+        let peer_box = peer.as_string().expect("string").as_any().addr();
+
+        slag_root_retain(value.bits());
+        let swept = crux::heap::with_heap_mut(|heap| heap.collect(&[]));
+        assert!(
+            !swept.contains(&rooted),
+            "a retained value was swept: {swept:?}"
+        );
+        assert!(
+            swept.contains(&peer_box),
+            "an unretained peer survived: {swept:?}"
+        );
+
+        slag_root_release(value.bits());
+        let swept = crux::heap::with_heap_mut(|heap| heap.collect(&[]));
+        assert!(
+            swept.contains(&rooted),
+            "the released value was still rooted: {swept:?}"
+        );
     }
 
     #[test]
