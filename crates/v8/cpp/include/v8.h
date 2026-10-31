@@ -432,19 +432,73 @@ Local<T> Local<T>::New(uint64_t value) {
       HandleScope::CreateHandle(value, std::is_base_of_v<Value, T>));
 }
 
+/* A persistent handle. It outlives every `HandleScope`, so the C ABI's root
+ * registry has to hold what it names for exactly as long as this object exists;
+ * a handle slot cannot do that, because the scope that allocated it pops.
+ *
+ * A host must reset or destroy a `Global` before disposing its isolate, the
+ * rule V8 states for persistents: the registry is thread-local, not owned by
+ * an isolate, so a leaked `Global` keeps naming a box the freed heap reused. */
 template <class T>
 class Global {
  public:
   Global() = default;
-  Global(Isolate*, Local<T> local)
-      : value_(local.IsEmpty() ? 0 : local.raw()), empty_(local.IsEmpty()) {}
+
+  // V8's persistent handles are not copyable. A `Global` owns one retention
+  // and must release it exactly once, so a copy would either double-release or
+  // silently alias the same retention.
+  Global(const Global&) = delete;
+  Global& operator=(const Global&) = delete;
+
+  Global(Global&& other) noexcept { Adopt(other); }
+  Global& operator=(Global&& other) noexcept {
+    if (this != &other) {
+      Release();
+      Adopt(other);
+    }
+    return *this;
+  }
+
+  Global(Isolate*, Local<T> local) { Hold(local); }
+  ~Global() { Release(); }
 
   bool IsEmpty() const { return empty_; }
   Local<T> Get(Isolate*) const {
     return empty_ ? Local<T>() : Local<T>::New(value_);
   }
 
+  void Reset() { Release(); }
+  void Reset(Isolate*, Local<T> local) {
+    Release();
+    Hold(local);
+  }
+
  private:
+  // A `T` that derives from `Value` is an engine value and the registry must
+  // hold it. A facade pointer (`Context`, `Script`, template) is a C++
+  // allocation, and tracing it as a `Value` would be unsound.
+  static constexpr bool kEngineValue = std::is_base_of_v<Value, T>;
+
+  void Hold(Local<T> local) {
+    empty_ = local.IsEmpty();
+    value_ = empty_ ? 0 : local.raw();
+    if (!empty_ && kEngineValue) slag_root_retain(value_);
+  }
+
+  // Ownership transfers, so this retains nothing and releases nothing.
+  void Adopt(Global& other) noexcept {
+    value_ = other.value_;
+    empty_ = other.empty_;
+    other.value_ = 0;
+    other.empty_ = true;
+  }
+
+  void Release() {
+    if (!empty_ && kEngineValue) slag_root_release(value_);
+    value_ = 0;
+    empty_ = true;
+  }
+
   uint64_t value_ = 0;
   bool empty_ = true;
 };

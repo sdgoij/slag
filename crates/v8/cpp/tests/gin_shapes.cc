@@ -118,6 +118,55 @@ int main() {
     }
   }
 
+  // A `Global` outlives every handle scope. The retention count is the
+  // assertion rather than the read-back: a collection cannot show that the
+  // retention is what kept the string alive, because a stale word in a dead
+  // C++ frame sits inside the conservative scan's range and would do it alone.
+  {
+    const size_t before = slag_root_count();
+    auto* pinned = new v8::Global<v8::String>();
+    {
+      v8::HandleScope scope(isolate);
+      v8::Local<v8::String> text =
+          v8::String::NewFromUtf8Literal(isolate, "pinned");
+      *pinned = v8::Global<v8::String>(isolate, text);
+    }
+    if (slag_root_count() != before + 1) {
+      fprintf(stderr, "a Global retained %lld values, expected 1\n",
+              static_cast<long long>(slag_root_count()) -
+                  static_cast<long long>(before));
+      ++failures;
+    }
+
+    bool survived = false;
+    {
+      v8::HandleScope scope(isolate);
+      if (slag_collect(context.Get(isolate)->slag()) != 0) {
+        fprintf(stderr, "collection failed\n");
+        ++failures;
+      }
+      v8::String::Utf8Value text(isolate, pinned->Get(isolate));
+      survived = *text && strcmp(*text, "pinned") == 0;
+    }
+    if (!survived) {
+      fprintf(stderr, "a Global did not survive the collection\n");
+      ++failures;
+    }
+
+    pinned->Reset();
+    if (!pinned->IsEmpty()) {
+      fprintf(stderr, "Reset left the Global non-empty\n");
+      ++failures;
+    }
+    if (slag_root_count() != before) {
+      fprintf(stderr, "Reset retained %lld values, expected 0\n",
+              static_cast<long long>(slag_root_count()) -
+                  static_cast<long long>(before));
+      ++failures;
+    }
+    delete pinned;
+  }
+
   isolate->Dispose();
   delete params.array_buffer_allocator;
   return failures == 0 ? 0 : 1;

@@ -122,6 +122,15 @@ pub extern "C" fn slag_root_release(value: u64) {
     });
 }
 
+/// The number of retentions the facade's registry holds. A diagnostic for the
+/// C++ harness: a collection cannot show that a `Global<T>` retained its value,
+/// because a stale word in a dead C++ frame keeps the value alive by itself, so
+/// the harness asserts this count moves by exactly one instead.
+#[unsafe(no_mangle)]
+pub extern "C" fn slag_root_count() -> usize {
+    ROOTS.with(|roots| roots.borrow().len())
+}
+
 /// Run a full collection now, with the facade's roots in place. The C++ harness
 /// uses this to prove a value held only by a handle slot survives.
 #[unsafe(no_mangle)]
@@ -597,6 +606,35 @@ mod tests {
         assert!(
             swept.contains(&rooted),
             "the released value was still rooted: {swept:?}"
+        );
+    }
+
+    #[test]
+    fn the_root_registry_counts_each_retention_separately() {
+        use crux::handle::Handle;
+        use crux::string::JsString;
+
+        // A `Global<T>` retains its value once, and a `HandleScope` slot for the
+        // same value retains it again, so the registry has to keep one entry per
+        // retention rather than remember that a value is rooted.
+        let value = Value::String(Handle::new(JsString::from_utf8("held twice")));
+        let rooted = value.as_string().expect("string").as_any().addr();
+
+        slag_root_retain(value.bits());
+        slag_root_retain(value.bits());
+
+        slag_root_release(value.bits());
+        let swept = crux::heap::with_heap_mut(|heap| heap.collect(&[]));
+        assert!(
+            !swept.contains(&rooted),
+            "one release dropped both retentions: {swept:?}"
+        );
+
+        slag_root_release(value.bits());
+        let swept = crux::heap::with_heap_mut(|heap| heap.collect(&[]));
+        assert!(
+            swept.contains(&rooted),
+            "the second release left the value rooted: {swept:?}"
         );
     }
 

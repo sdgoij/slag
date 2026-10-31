@@ -60,7 +60,8 @@ crates/v8/cpp/build/Release/gin-shapes.exe
 - an engine-value slot is retained in the C ABI's root registry, and a facade-pointer slot is not;
 - a `HandleScope` records the stack's size and restores it on exit, so nested
   scopes release exactly the slots they allocated;
-- `Global<T>` stores the tagged value itself and `Get` allocates a fresh slot;
+- `Global<T>` over an engine value retains it for the `Global`'s own lifetime,
+  and is neither copyable nor assignable, matching V8's persistent handles;
 - `Local<T>::As` reinterprets the same slot, so it does not copy the value;
 - `FunctionCallbackInfo::operator[]` allocates a slot for each argument.
 
@@ -74,9 +75,36 @@ make the collector trace a pointer as a `Value`.
 
 `gin-shapes` forces a collection (`slag_collect`) while a string is held only by
 a handle slot and reads it back, so the root path is exercised through the real
-boundary. The remaining persistence gap is `Global<T>` over a heap value: it
-stores the tagged value and allocates a slot on `Get`, but it does not retain
-the value for its own lifetime. That is the next ABI addition.
+boundary.
+
+### Persistent handles
+
+`Global<T>` is the same rule one level up: it outlives every `HandleScope`, so
+the slot a scope would otherwise release cannot be what keeps its value alive.
+It retains the value in `slagc`'s root registry on construction (and on
+`Reset(isolate, local)`) and releases it on `Reset()` or destruction, so the
+retention lives exactly as long as the `Global`.
+
+Two consequences follow the V8 rules:
+
+- a `Global` must be reset or destroyed before its isolate is disposed. The
+  registry is thread-local, not owned by an isolate, so a leaked `Global` keeps
+  naming a box that the freed heap will reuse;
+- `Global<T>` is not copyable, because a copy would either release one
+  retention twice or alias it. It is movable, and the move transfers the
+  retention rather than taking a second one.
+
+`Global<Context>` and `Global<Script>` hold facade pointers, not engine values,
+and are not retained for the same reason those slots are not: tracing a C++
+pointer as a `Value` would be unsound.
+
+A collection cannot demonstrate this retention on its own. The conservative
+stack scan reads the whole live stack region, including words left in dead C++
+frames by the call that allocated the value, so a value under test can survive a
+collection with nothing retaining it. The harness therefore asserts
+`slag_root_count()`, a diagnostic that reports how many retentions the registry
+holds: constructing the `Global` moves it by exactly one, the scope's own slot
+by another, and `Reset()` back to the original count.
 
 ## The gin target
 
@@ -114,7 +142,9 @@ not a claim that gin itself links.
 - `ObjectTemplate`/`FunctionTemplate` and host callbacks with arguments and a
   return value.
 - `Global<T>`, `Maybe<T>`, `MaybeLocal<T>`.
-- The handle stack as an engine root source: engine-value slots are retained and released with their scope.
+- Handles and persistents as engine roots: a handle slot or a `Global` over an
+  engine value retains it for that object's lifetime, and a facade pointer is
+  never registered.
 - WebAssembly through the engine's own `wasm` feature, which `hello-world`
   exercises.
 
@@ -123,7 +153,8 @@ not a claim that gin itself links.
 - It is not source-compatible with the rest of `v8.h`. There are no interceptors,
   no internal fields, no `Wrappable`, no `TracedReference`, no platform tasks,
   no snapshots, no inspector.
-- `Global<T>` over a heap value is not pinned; only handle slots are rooted.
+- `Global<T>` keeps a value alive, but a `Global` leaked past `Isolate::Dispose`
+  is not detected and leaves a dangling retention in the thread-local registry.
 - `Message` is always empty and `StackTrace` is always empty, so the sample's
   rich error path (source line, caret) is compiled but not taken. An uncaught
   `Error` therefore prints the engine's generic `TypeError: Uncaught exception`

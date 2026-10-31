@@ -41,6 +41,7 @@ uint64_t slag_string_new(const uint8_t* text, size_t len);
 uint64_t slag_number_new(double value);
 void slag_root_retain(uint64_t value);
 void slag_root_release(uint64_t value);
+size_t slag_root_count(void);
 int32_t slag_collect(SlagContext* context);
 int64_t slag_value_to_utf8(uint64_t value, char* buffer, size_t len);
 double slag_value_to_number(uint64_t value);

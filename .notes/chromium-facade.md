@@ -441,10 +441,11 @@ prints `30`, exit 0). The real `gin` link gate belongs in a Chromium checkout
 with `//v8` swapped, and it is the first place the wrappable/cppgc surface is
 required. The handle stack is now a real root: `Local<T>` slots over engine
 values are retained in `slagc`'s `RootSource` and released by `HandleScope`,
-and `gin-shapes` forces a collection and reads a slot-held string back. The
-remaining persistence gap is `Global<T>` over a heap value, which stores the
-tagged value but does not pin it; that and the wrappable/internal-field/cppgc
-surface are the next pieces.
+and `gin-shapes` forces a collection and reads a slot-held string back.
+
+*Persistent handles (2026-10-31).* `Global<T>` now retains its value in the same registry for the `Global`'s own lifetime, which is the case a `HandleScope` slot cannot cover. Construction and `Reset(isolate, local)` retain, `Reset()` and the destructor release, copy construction and copy assignment are deleted, and a move transfers the retention instead of taking a second one. `Global<Context>` and `Global<Script>` name facade pointers, so they are not registered for the same reason a facade-pointer slot is not. A `Global` must still be reset or destroyed before `Isolate::Dispose`, because the registry is thread-local and a leaked `Global` leaves a retention naming a box the freed heap reuses.
+
+The check is a retention count rather than a survival test, because survival cannot demonstrate the retention: the conservative stack scan reads the whole live stack region, including the words a dead C++ frame leaves behind, so a value can survive a collection with nothing retaining it. `gin-shapes` therefore asserts that `slag_root_count()` moves by exactly one when the `Global` is built and returns to its starting value after `Reset()`, and that assertion was verified to fail when the retain call is disabled. The wrappable, internal-field, and cppgc surface is the next piece.
 
 ## 12. Cost model
 
