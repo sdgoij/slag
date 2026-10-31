@@ -16491,35 +16491,35 @@ pub(crate) fn object_fast_create(
         .map
         .get()
         .ok_or_else(|| JsError::new(ErrorKind::TypeError, "fresh object without a map".into()))?;
-    // The composite cache covers the whole vector-free head only: a literal
-    // longer than `INLINE_FIELDS` sends its tail keys through the property
-    // vector, which the cached shape does not describe.
+    // The composite cache covers the whole key list, in-object head and
+    // vector tail alike: one lookup serves every literal of this shape. A
+    // duplicate key resolves to an existing descriptor, so the shape then
+    // describes fewer keys than the literal and is neither cached nor
+    // adopted (the sequential fallback applies the redefinition).
     let shape = match base.composite_child(names) {
-        Some(shape) if head == names.len() => shape,
+        Some(shape) => shape,
         _ => {
             let attrs = crux::MapAttrs::new(true, true, true);
             let mut shape = base;
-            for name in names.iter().take(head) {
+            for name in names.iter() {
                 shape = shape
                     .get_or_create_child(crux::PropertyKey::String(*name), attrs)
                     .ok_or_else(|| {
                         JsError::new(ErrorKind::TypeError, "cannot fork the literal shape".into())
                     })?;
             }
-            if head == names.len() {
+            if shape.descriptor_count() == names.len() {
                 base.set_composite_child(names, shape);
             }
             shape
         }
     };
-    if object.adopt_vector_free_fields(shape, &values[..head]) {
-        for (name, value) in names[head..].iter().zip(values[head..].iter()) {
-            object.create_data_property_key(&crux::PropertyKey::String(*name), *value)?;
-        }
-    } else {
-        // Defensive fallback (the fresh-object guards hold, so this is
-        // unreachable): define sequentially — the same result, one key at
-        // a time.
+    if object.adopt_literal_properties(shape, &values[..head], &values[head..]) {
+        return Ok(Value::Object(object));
+    }
+    {
+        // The batch declined (a duplicate key's shape is short, or a guard
+        // failed): define sequentially — the same result, one key at a time.
         for (name, value) in names.iter().zip(values.iter()) {
             object.create_data_property_key(&crux::PropertyKey::String(*name), *value)?;
         }

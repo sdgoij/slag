@@ -20694,3 +20694,49 @@ four sweeps at 100% (language 23726, built-ins 23821, annexB 1086, intl402
 3365); corpus parity 0, `mean-jitGap` 8.21; `concat_loop`, `coercion_concat`,
 head-let, an env-closure probe and a for-in closure probe under `--gc-stress`
 all return their plain-run values.
+
+## LANDED (2026-10-31): a whole-literal create adopts its vector tail too
+
+An object literal past `INLINE_FIELDS` (8) sent every tail key through
+`create_data_property_key` → `define_fresh`, which pays per key: a
+`has_own_property_key` scan, a `map.find`, a map transition, a `map_set`
+descriptor scan, a `name`/`generation` bump and the lazy-index probe. Measured
+on a fresh literal, that is ~110 ns per tail key: a 200k-create sweep of one
+literal gave 8 keys 121 ns, 12 keys 490 ns, 16 keys 927 ns, 20 keys 1290 ns.
+
+`JsObject::adopt_literal_properties` is the `adopt_vector_free_fields` idea
+extended past the cap: the caller forks the whole shape (now composite-cached
+for the full key list, not just the in-object head) and hands the batch the
+in-field values and the vector tail. The batch verifies each descriptor's
+offset equals its ordinal, writes the fields, starts the vector at the cap and
+pushes the tail entries in ordinal order (`SmallProps::reserve_tail` sizes the
+heap once), then sets the map, the deferred bit and one name/generation bump.
+A duplicate key makes the forked shape shorter than the literal, so the batch
+declines and the sequential path applies the redefinition.
+
+| probe (200k creates) | before | after |
+| --- | ---: | ---: |
+| 8 keys (control, no tail) | 24.1 ms | 25.7 ms |
+| 12 keys | 98.1 | **46.8** |
+| 16 keys | 185.4 | **54.6** |
+| 20 keys | 258.1 | **63.1** |
+| `objects/wide_literal` (isolated, same-binary A/B, 3 rounds) | 110.8 | **49.5** |
+
+Per-object, 12 keys goes 490 → 234 ns and each tail key ~110 → ~10 ns. The
+sweep at 20 keys shows the batch also removes the per-key growth of the vector
+heap (258 → 63 ms).
+
+Correctness: two new crux tests (the batch against twelve sequential defines —
+same map id, values, attrs, enumeration order, vector ordinals, deferred bit —
+and the guard set: shape shorter than the literal, non-fresh receiver, a second
+adopt). `--gc-stress` over the 12/20-key and wide-literal probes returns the
+plain run's values. A byte-identical-vs-node battery covers duplicate keys, a
+14-key literal, for-in copies, spread, `Object.assign`, `JSON.stringify`,
+descriptor reads, `delete`, and post-creation growth.
+
+Verified: clippy `-D warnings`; `cargo test --workspace` 5866 pass / 0 fail; four
+sweeps at 100% (language 23726, built-ins 23821, annexB 1086, intl402 3365);
+corpus parity 0. (A first sweep run reported four hangs on unrelated fixtures —
+two TypedArray `copyWithin` and two regexp-literal files — and the immediate
+re-run reported none; those fixtures pass in isolation too, so it was machine
+load, not the batch.)

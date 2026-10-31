@@ -245,6 +245,15 @@ impl SmallProps {
         }
     }
 
+    /// Make room for `n` more entries in one allocation: the literal batch
+    /// knows its whole tail, so it can size the heap instead of paying
+    /// `push`'s inline→heap spill and then a growth realloc.
+    pub fn reserve_tail(&mut self, n: usize) {
+        if self.len < INLINE_PROPS && self.len + n > INLINE_PROPS {
+            self.heap.reserve(n);
+        }
+    }
+
     pub fn push(&mut self, entry: (PropertyKey, Property)) {
         if self.len < INLINE_PROPS {
             self.inline[self.len].write(entry);
@@ -4072,6 +4081,89 @@ impl JsObject {
         true
     }
 
+    /// The whole-literal batch, tail included: adopt a pre-forked shape that
+    /// describes `head.len()` in-object fields (ordinals `0..`) and
+    /// `tail.len()` vector entries (ordinals `INLINE_FIELDS..`), writing every
+    /// value in one step. The freshness guards match
+    /// [`Self::adopt_vector_free_fields`], and each descriptor's offset must
+    /// equal its ordinal (the shape a child-fork chain produces, and the
+    /// suffix-store discipline the vector relies on).
+    ///
+    /// This exists because the general per-key define pays, per key past the
+    /// in-object cap: a `has_own_property_key` scan, a `map.find`, a map
+    /// transition, a `map_set` descriptor scan, a generation bump and the
+    /// lazy-index probe — ~110 ns on a fresh literal (see `.notes/perf.md`,
+    /// 2026-10-31). The batch pays one shape lookup for all of them, so a
+    /// 12-key literal costs its allocations and the value writes instead.
+    /// Returns false when a guard fails (the caller falls back to the
+    /// sequential defines).
+    pub fn adopt_literal_properties(
+        &self,
+        map: Handle<Map>,
+        head: &[Value],
+        tail: &[Value],
+    ) -> bool {
+        if !matches!(self.kind, ObjectKind::Ordinary) || !self.extensible.get() {
+            return false;
+        }
+        if head.len() > INLINE_FIELDS || map.descriptor_count() != head.len() + tail.len() {
+            return false;
+        }
+        // Fresh-only guard: the canonical empty map and an empty vector.
+        if self.map.get().is_some_and(|map| !map.is_empty()) || !self.properties.borrow().is_empty()
+        {
+            return false;
+        }
+        for (ord, value) in head.iter().enumerate() {
+            match map.descriptor_at(ord) {
+                Some((_, offset, _)) if offset == ord => {
+                    crate::heap::write_barrier(self, *value);
+                    self.in_fields[ord].set(*value);
+                }
+                _ => return false,
+            }
+        }
+        if !tail.is_empty() {
+            // The vector holds the ordinals at and above the cap, position
+            // `ord - INLINE_FIELDS`, so every tail descriptor must address its
+            // own ordinal before anything is written.
+            for index in 0..tail.len() {
+                let ord = INLINE_FIELDS + index;
+                match map.descriptor_at(ord) {
+                    Some((_, offset, _)) if offset == ord => {}
+                    _ => return false,
+                }
+            }
+            let mut props = self.properties.borrow_mut();
+            props.start_at_inline_fields();
+            props.reserve_tail(tail.len());
+            for (index, value) in tail.iter().enumerate() {
+                let ord = INLINE_FIELDS + index;
+                let Some((key, _, attrs)) = map.descriptor_at(ord) else {
+                    return false;
+                };
+                crate::heap::write_barrier(self, *value);
+                barrier_key(self, &key);
+                props.push((
+                    key,
+                    Property::data(
+                        *value,
+                        attrs.writable(),
+                        attrs.enumerable(),
+                        attrs.configurable(),
+                    ),
+                ));
+            }
+            drop(props);
+        }
+        self.bump_named_version();
+        crate::heap::write_barrier_handle(self, map);
+        self.map.set(Some(map));
+        self.props_deferred.set(true);
+        self.bump_generation();
+        true
+    }
+
     /// Whether a map-described key (whose descriptor `ord` `Map::find`
     /// returned) is an own property in the vector-free state: its field must
     /// be written. A constructor-presize descriptor the body never wrote is
@@ -6994,6 +7086,113 @@ mod tests {
                 .get_key(&PropertyKey::from_utf8("extra"))
                 .unwrap()
         );
+    }
+
+    #[test]
+    fn adopt_literal_properties_matches_sequential_defines() {
+        // The whole-literal batch covers the vector tail as well as the
+        // in-object head, so a 12-key literal takes one shape lookup. It must
+        // leave exactly what twelve `fresh_data_define` calls would: the same
+        // map, values, attrs, enumeration order and vector state.
+        let keys = ["a", "b", "c", "d", "e", "f", "g", "h", "j", "k", "l", "m"];
+        let mut shape = crate::map::canonical_empty_map(None);
+        for key in keys {
+            shape = shape
+                .get_or_create_child(PropertyKey::from_utf8(key), this_attrs())
+                .unwrap();
+        }
+        let values: Vec<Value> = (0..keys.len()).map(|i| Value::Number(i as f64)).collect();
+        let batched = JsObject::ordinary_object_create(None);
+        assert!(batched.adopt_literal_properties(
+            shape,
+            &values[..INLINE_FIELDS],
+            &values[INLINE_FIELDS..]
+        ));
+        let sequential = JsObject::ordinary_object_create(None);
+        for (key, value) in keys.iter().zip(values.iter()) {
+            assert!(sequential.fresh_data_define(&PropertyKey::from_utf8(key), *value));
+        }
+        assert_eq!(
+            batched.map.get().unwrap().id(),
+            sequential.map.get().unwrap().id(),
+            "the batch adopts the shape the defines forked"
+        );
+        for (i, key) in keys.iter().enumerate() {
+            let prop_key = PropertyKey::from_utf8(key);
+            assert_eq!(
+                batched
+                    .get_own_property_key(&prop_key)
+                    .unwrap()
+                    .map(|p| p.value()),
+                sequential
+                    .get_own_property_key(&prop_key)
+                    .unwrap()
+                    .map(|p| p.value()),
+                "{key} value"
+            );
+            assert_eq!(
+                batched.map_get(&prop_key),
+                Some(Value::Number(i as f64)),
+                "{key} map-served"
+            );
+        }
+        assert!(batched.props_deferred.get());
+        assert!(sequential.props_deferred.get());
+        assert_eq!(
+            batched.own_property_keys().unwrap(),
+            sequential.own_property_keys().unwrap(),
+            "enumeration order"
+        );
+        // The tail lives in the vector at its ordinal's position.
+        assert_eq!(
+            batched.properties.borrow().get_ordinal(INLINE_FIELDS + 1),
+            sequential
+                .properties
+                .borrow()
+                .get_ordinal(INLINE_FIELDS + 1)
+        );
+    }
+
+    #[test]
+    fn adopt_literal_properties_guards() {
+        let full = ["a", "b", "c", "d", "e", "f", "g", "h", "j", "k", "l", "m"];
+        let fork = |keys: &[&str]| {
+            let mut shape = crate::map::canonical_empty_map(None);
+            for key in keys {
+                shape = shape
+                    .get_or_create_child(PropertyKey::from_utf8(key), this_attrs())
+                    .unwrap();
+            }
+            shape
+        };
+        let values: Vec<Value> = (0..full.len()).map(|i| Value::Number(i as f64)).collect();
+        // A short shape (10 keys) against a 12-key literal's values declines.
+        let short = fork(&full[..10]);
+        let obj = JsObject::ordinary_object_create(None);
+        assert!(!obj.adopt_literal_properties(
+            short,
+            &values[..INLINE_FIELDS],
+            &values[INLINE_FIELDS..]
+        ));
+        // A fresh object with the matching shape adopts.
+        let shape = fork(&full);
+        let fresh = JsObject::ordinary_object_create(None);
+        assert!(fresh.adopt_literal_properties(
+            shape,
+            &values[..INLINE_FIELDS],
+            &values[INLINE_FIELDS..]
+        ));
+        // A second adopt on the same object declines (no longer fresh).
+        assert!(!fresh.adopt_literal_properties(
+            shape,
+            &values[..INLINE_FIELDS],
+            &values[INLINE_FIELDS..]
+        ));
+    }
+
+    /// The CreateDataProperty attributes a whole-literal batch adopts.
+    fn this_attrs() -> MapAttrs {
+        MapAttrs::new(true, true, true)
     }
 
     #[test]
