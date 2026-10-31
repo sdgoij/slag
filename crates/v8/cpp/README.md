@@ -147,6 +147,32 @@ lets the scope pop, forces a collection and reads the mark back through the
 reference, then releases the original and checks the copy still keeps the value
 alive. The copy check was verified to fail when the copy is made empty instead.
 
+### Named-property handlers
+
+`ObjectTemplate::SetHandler` installs a `NamedPropertyHandlerConfiguration` on a
+template, and `NewInstance` then makes an object whose property access is offered
+to the handler first. Four callbacks are carried: `getter`, `setter`, `query`,
+and `deleter`. Each returns V8's `Intercepted`, and `kNo` runs the engine's own
+internal method, so a handler can answer one name and let the rest through.
+
+A template's handler makes its instances `crux::host::HostOps` objects, one
+behaviour per template, with the configuration's `data` value pinned for as long
+as an instance can call it. A handler is consulted *before* the object's own
+lookup, which is V8's masking default; there is no non-masking mode.
+
+Three callbacks are absent on purpose:
+
+- the enumerator, because it builds an array and allocating through the
+  facade needs the context the calling operation holds borrowed;
+- `definer` and `descriptor`, which need a property-descriptor ABI.
+
+A host that needs them does not compile, which is the only honest failure mode.
+
+`gin-shapes` installs a handler that owns three names through its query, answers
+one through its getter and declines the rest, and takes a set and a delete; it
+checks the same answers through C++ (`Get`/`Has`/`Set`/`Delete`) and through a
+script, where `in` and a member read both reach the handler.
+
 ## The gin target
 
 Actual `gin` cannot be built standalone. `gin/BUILD.gn` has public deps
@@ -191,6 +217,8 @@ not a claim that gin itself links.
   `Delete`, `GetRealNamedProperty` (own property only, no chain), and the
   own-property predicates `HasRealNamedProperty`,
   `HasRealIndexedProperty`, and `HasRealNamedCallbackProperty`.
+- `ObjectTemplate::SetHandler` with the named-property getter, setter, query and
+  deleter callbacks, and `Intercepted` / `PropertyCallbackInfo<T>`.
 - `TracedReference<T>` as a host-owned root: copy is a second reference, `Reset`
   releases it, and the destructor releases it like any persistent.
 - Handles and persistents as engine roots: a handle slot or a `Global` over an
@@ -217,10 +245,11 @@ not a claim that gin itself links.
 - `Isolate::Dispose` frees the contexts the facade created; templates are not
   freed.
 - Host callbacks receive `this` now (`FunctionCallbackInfo::This`), but the
-  `Object` surface is still narrow: `SetAccessor`, the interceptor
-  (`SetHandler`) surface, and `GetIdentityHash`'s siblings are absent. See
-  `.notes/chromium-facade.md` section 14.1 for why interceptors need a decision
-  before code.
+  `Object` surface is still narrow: `SetAccessor`, `GetIdentityHash`'s siblings,
+  and the indexed handler are absent. A handler has no enumerator, `definer`, or
+  `descriptor` (see the named-property-handler section), and a handler callback
+  cannot allocate an object or an array, because the context is borrowed by the
+  operation that called it.
 - `load()` is compiled but refused at run time. The sample re-enters through
   `ExecuteString`, and the safe engine path for a host callback is
   `FunctionCall::eval` (`slag_call_eval`), which the sample does not call. The

@@ -461,6 +461,8 @@ The facade side is the gin shape: `ObjectTemplate::SetInternalFieldCount` and `N
 
 *The real-property predicates (2026-10-31).* `HasRealNamedProperty`, `HasRealIndexedProperty`, and `HasRealNamedCallbackProperty` are in, over one ABI call that reports which kind the own property is (absent, data named, data indexed, callback named, callback indexed). The named/indexed split is a divergence with a reason: V8 keeps a named dictionary and an elements store and the predicates ask one of them, while this engine has a single own-property store, so the split follows the key. An array index (`crux::object::array_index_of`, the spec's 0 to 2^32-2) is the indexed kind, and a canonical numeric index that is not an array index ("1.5") stays named, which is what V8's named store would answer. `gin-shapes` checks the own name is found, the inherited `toString` is not, the index key "0" is indexed and not named, and a data property is not a callback property; forcing the kind to always read "data named" was verified to fail the check. Interceptors are scoped in section 14.1, where the finding is that this is a design decision rather than plumbing: the engine's handler seam builds a `HostOps` object for the realm global, and a `NewInstance` object has no `HostOps`, so gin's and Blink's instance handlers have nowhere to run yet.
 
+*Named-property handlers (2026-10-31).* The decision above was taken and the first slice landed. `ObjectTemplate::SetHandler` installs a `v8::NamedPropertyHandlerConfiguration`, and `NewInstance` on that template makes a crux host object (`Context::create_host_object`) whose getter, setter, query, and deleter are consulted before the engine's own internal method; `Intercepted::kNo` falls back, so masking is the only mode. The configuration's `data` value is pinned for as long as an instance can call it. The enumerator and the descriptor/definer pair are absent from the ABI and the C++ struct, each for a stated reason (a callback cannot yet allocate through the borrowed context; there is no descriptor ABI), so a host that needs one does not compile. Two engine-side findings came out of it and are fixed: `in` now delegates host objects to crux's [[HasProperty]] (`module.rs`), which it previously did only for proxies and typed arrays, and the real-property reads now use `ordinary_get_own_property` because V8 defines them to skip interceptors. `gin-shapes` checks the handler through `Get`/`Has`/`Set`/`Delete` and through a script, and the runtime test covers the `in` path plus its fallback to the prototype chain.
+
 ## 12. Cost model
 
 These are order-of-magnitude inferences, not commitments. Basis: 66 headers and
@@ -582,6 +584,36 @@ So the milestone needs a decision before code:
    taken with the limitation stated loudly.
 3. **Defer until a real consumer exists.** Keep it out of the facade until the
    Blink bindings milestone reaches the named-property tests.
+
+**Decided (2026-10-31): option 1, and the first slice is in.** `NewInstance` on a
+template with a handler now makes a `crux::host::HostOps` object
+(`Context::create_host_object`), one behaviour per template, and four callbacks
+are carried: getter, setter, query, deleter. The configuration's `data` value is
+pinned for as long as an instance can call it, and `kNo` falls back to the
+engine's own internal method, so masking is the only mode.
+
+What is deliberately absent, and why:
+
+- the **enumerator** builds the array it answers with, and allocating one goes
+  through the context, which the operation that called the handler holds
+  borrowed. A handler callback cannot allocate an object or an array until there
+  is a re-entrant allocation path (the shape `FunctionCall` has for host
+  functions);
+- `definer` and `descriptor` need a property-descriptor ABI.
+
+Because the C struct does not carry them, a host that needs one does not compile
+rather than having it silently ignored.
+
+The work also exposed an engine gap worth recording: the `in` operator's
+`has_property_with_deferred_trigger` delegated to crux only for proxies and
+typed arrays, so a host object's `has_property` was never asked by script. It now
+delegates `ObjectKind::Host` too (`crates/runtime/src/module.rs`), and a runtime
+test covers both the host answer and the fallback to the prototype chain.
+
+One more fidelity point the handler made visible: `GetRealNamedProperty` and the
+real-property predicates are defined to *skip* interceptors, and crux's
+`ordinary_get_own_property` is exactly that question, so the embed helpers use it
+rather than the interceptor-consulting `get_own_property_key`.
 
 The ABI shape is roughly a struct of up to seven C function pointers, the data
 pointer, and the flags, handed over once per template, with the return codes

@@ -2519,12 +2519,14 @@ pub fn has_property_with_deferred_trigger(
             Some(handle) => handle,
         };
         // A proxy's [[HasProperty]] runs its `has` trap (or forwards to the
-        // target); the typed-array exotic intercepts canonical index keys.
-        // Delegate the rest of the walk to the crux HasProperty, which
-        // handles both and continues through the chain.
+        // target), the typed-array exotic intercepts canonical index keys, and a
+        // host object asks its embedder first. Delegate all three to the crux
+        // HasProperty, which handles them and continues through the chain.
         if matches!(
             obj.kind,
-            crux::object::ObjectKind::Proxy(_) | crux::object::ObjectKind::IntegerIndexed(_)
+            crux::object::ObjectKind::Proxy(_)
+                | crux::object::ObjectKind::IntegerIndexed(_)
+                | crux::object::ObjectKind::Host(_)
         ) {
             return obj.has_property_key(key);
         }

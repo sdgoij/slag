@@ -587,6 +587,22 @@ impl Context {
         )))
     }
 
+    /// An object whose internal methods go to `ops` with ordinary fallback
+    /// (`v8::ObjectTemplate::NewInstance` for a template with a handler): a
+    /// property read, a `Has`, a set, a delete, or a key walk consults the host
+    /// first and runs the ordinary method when it answers "not intercepted".
+    /// The object inherits `%Object.prototype%`, and `ops` is shared with any
+    /// other object built from it.
+    pub fn create_host_object(
+        &self,
+        ops: Rc<dyn crux::host::HostOps>,
+    ) -> Result<JsObject, JsError> {
+        Ok(JsObject(CruxObject::host_object_create(
+            ops,
+            realm_object_prototype(&self.agent)?,
+        )))
+    }
+
     /// [[Get]] a property by the key value a host built (`v8::Object::Get`):
     /// ToPropertyKey runs through the agent, so a numeric or object key reads the
     /// property the language would.
@@ -662,7 +678,7 @@ impl Context {
                 "value is not an object".into(),
             ));
         };
-        let Some(property) = object.0.get_own_property_key(&key)? else {
+        let Some(property) = object.0.ordinary_get_own_property(&key)? else {
             return Ok(None);
         };
         match property.kind {
@@ -698,7 +714,7 @@ impl Context {
                 "value is not an object".into(),
             ));
         };
-        let Some(property) = object.0.get_own_property_key(&key)? else {
+        let Some(property) = object.0.ordinary_get_own_property(&key)? else {
             return Ok(None);
         };
         let indexed = crux::object::array_index_of(&key).is_some();
@@ -2795,6 +2811,94 @@ mod tests {
                 .unwrap()
                 .and_then(|value| value.as_number()),
             Some(7.0)
+        );
+    }
+
+    #[test]
+    fn the_in_operator_asks_a_host_object_first() {
+        // Non-masking by default: the engine offers the key to the host before
+        // its own own-property walk, and `kNo` (here, `None`) falls back.
+        struct OnlyBeta;
+        impl crux::host::HostOps for OnlyBeta {
+            fn has_property(
+                &self,
+                _object: &crux::object::JsObject,
+                key: &crux::property::PropertyKey,
+            ) -> Option<Result<bool, JsError>> {
+                let crux::property::PropertyKey::String(id) = key else {
+                    return None;
+                };
+                // `None` is `kNo`: the engine's own [[HasProperty]] must still
+                // run, which is how an inherited `toString` is found.
+                if crux::lookup(*id).to_string_lossy() == "beta" {
+                    Some(Ok(true))
+                } else {
+                    None
+                }
+            }
+        }
+        impl std::fmt::Debug for OnlyBeta {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("OnlyBeta")
+            }
+        }
+
+        let mut context = Context::new().unwrap();
+        let object = context
+            .create_host_object(std::rc::Rc::new(OnlyBeta))
+            .unwrap();
+        context.set_global("hosted", object.as_value()).unwrap();
+
+        // The seam itself, before the operator: the host answers `beta`.
+        assert!(
+            object
+                .0
+                .has_property_key(&crux::property::PropertyKey::from_utf8("beta"))
+                .unwrap(),
+            "the host object's own [[HasProperty]] did not reach the host"
+        );
+        assert!(
+            crate::module::has_property_with_deferred_trigger(
+                context.agent_mut(),
+                &object.0,
+                &crux::property::PropertyKey::from_utf8("beta"),
+            )
+            .unwrap(),
+            "the operator's HasProperty did not reach the host"
+        );
+        // A key the host declines falls through to the engine's own walk.
+        assert!(
+            crate::module::has_property_with_deferred_trigger(
+                context.agent_mut(),
+                &object.0,
+                &crux::property::PropertyKey::from_utf8("toString"),
+            )
+            .unwrap(),
+            "a declined key did not reach the prototype chain"
+        );
+
+        assert_eq!(
+            context
+                .eval("'beta' in hosted ? 1 : 0")
+                .unwrap()
+                .as_number(),
+            Some(1.0)
+        );
+        // A key the host declines still answers from the engine, which is the
+        // fallback the seam documents.
+        assert_eq!(
+            context
+                .eval("'toString' in hosted ? 1 : 0")
+                .unwrap()
+                .as_number(),
+            Some(1.0)
+        );
+        assert_eq!(
+            context
+                .eval("'gamma' in hosted ? 1 : 0")
+                .unwrap()
+                .as_number(),
+            Some(0.0)
         );
     }
 

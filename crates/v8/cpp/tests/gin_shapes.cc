@@ -34,6 +34,73 @@ struct HostCounter {
   int value;
 };
 
+// A gin-shaped named-property handler: three names it owns, a getter that answers
+// one of them and declines the rest, a query that claims all three, and a setter
+// and deleter that record what they were asked. The counters are the host's own
+// state, which a real host would keep behind the configuration's `data` value.
+struct HostNames {
+  int getters = 0;
+  int setters = 0;
+  int deleters = 0;
+  int data_misses = 0;
+};
+
+HostNames host_names;
+const char* const kHostNames[] = {"alpha", "beta", "gamma"};
+
+bool IsHostName(const char* text) {
+  if (text == nullptr) return false;
+  for (const char* name : kHostNames) {
+    if (strcmp(text, name) == 0) return true;
+  }
+  return false;
+}
+
+v8::Intercepted HostGet(v8::Local<v8::Name> property,
+                        const v8::PropertyCallbackInfo<v8::Value>& info) {
+  v8::Isolate* isolate = info.GetIsolate();
+  v8::String::Utf8Value text(isolate, property);
+  if (!*text) return v8::Intercepted::kNo;
+  ++host_names.getters;
+  // A configuration's data is a language value in V8, and it arrives here.
+  if (info.Data()->Int32Value(isolate->GetCurrentContext()).FromMaybe(-1) != 7) {
+    fprintf(stderr, "handler data did not reach the callback\n");
+    ++host_names.data_misses;
+  }
+  if (strcmp(*text, "alpha") == 0) {
+    info.GetReturnValue().Set(v8::Integer::New(isolate, 42));
+    return v8::Intercepted::kYes;
+  }
+  // Declining lets the engine's own property run, which is what kNo means.
+  return v8::Intercepted::kNo;
+}
+
+v8::Intercepted HostSet(v8::Local<v8::Name> property, v8::Local<v8::Value>,
+                        const v8::PropertyCallbackInfo<void>& info) {
+  v8::String::Utf8Value text(info.GetIsolate(), property);
+  if (!*text || !IsHostName(*text)) return v8::Intercepted::kNo;
+  ++host_names.setters;
+  return v8::Intercepted::kYes;
+}
+
+v8::Intercepted HostQuery(v8::Local<v8::Name> property,
+                          const v8::PropertyCallbackInfo<v8::Integer>& info) {
+  v8::String::Utf8Value text(info.GetIsolate(), property);
+  if (!*text || !IsHostName(*text)) return v8::Intercepted::kNo;
+  // V8's query answers a PropertyAttribute; None (0) means "present".
+  info.GetReturnValue().Set(v8::Integer::New(info.GetIsolate(), 0));
+  return v8::Intercepted::kYes;
+}
+
+v8::Intercepted HostDelete(v8::Local<v8::Name> property,
+                           const v8::PropertyCallbackInfo<v8::Boolean>& info) {
+  v8::String::Utf8Value text(info.GetIsolate(), property);
+  if (!*text || !IsHostName(*text)) return v8::Intercepted::kNo;
+  ++host_names.deleters;
+  info.GetReturnValue().Set(v8::Boolean::New(info.GetIsolate(), true));
+  return v8::Intercepted::kYes;
+}
+
 void Bump(const v8::FunctionCallbackInfo<v8::Value>& info) {
   auto* counter = info.This().As<v8::Object>()->Wrappable<HostCounter>();
   if (counter == nullptr) {
@@ -353,6 +420,87 @@ int main() {
     }
 
     delete counter;
+  }
+
+  // A named-property handler on an instance template: the handler answers before
+  // the engine's own lookup, and `kNo` runs the ordinary method.
+  {
+    v8::HandleScope scope(isolate);
+    v8::Local<v8::Context> current = context.Get(isolate);
+
+    v8::NamedPropertyHandlerConfiguration configuration(
+        HostGet, HostSet, HostQuery, HostDelete,
+        v8::Integer::New(isolate, 7));
+    v8::Local<v8::ObjectTemplate> tmpl = v8::ObjectTemplate::New(isolate);
+    tmpl->SetHandler(configuration);
+    v8::Local<v8::Object> instance = tmpl->NewInstance(current).ToLocalChecked();
+
+    v8::Local<v8::String> alpha =
+        v8::String::NewFromUtf8Literal(isolate, "alpha");
+    v8::Local<v8::String> beta =
+        v8::String::NewFromUtf8Literal(isolate, "beta");
+
+    // The getter answers `alpha`, and the query claims all three names.
+    if (instance->Get(current, alpha)
+            .ToLocalChecked()
+            ->Int32Value(current)
+            .FromMaybe(-1) != 42) {
+      fprintf(stderr, "the handler getter did not answer\n");
+      ++failures;
+    }
+    if (!instance->Has(current, beta).FromMaybe(false)) {
+      fprintf(stderr, "the handler query did not claim a name\n");
+      ++failures;
+    }
+
+    // `kNo` for a name the handler does not own: the engine's own property wins.
+    v8::Local<v8::String> own =
+        v8::String::NewFromUtf8Literal(isolate, "own");
+    if (!instance->Set(current, own, v8::Integer::New(isolate, 9))
+             .FromMaybe(false) ||
+        instance->Get(current, own)
+                .ToLocalChecked()
+                ->Int32Value(current)
+                .FromMaybe(-1) != 9) {
+      fprintf(stderr, "a declined name did not reach the own property\n");
+      ++failures;
+    }
+
+    // A set and a delete the handler claims are its own.
+    if (!instance->Set(current, beta, v8::Integer::New(isolate, 1))
+             .FromMaybe(false) ||
+        !instance->Delete(current, beta) || host_names.setters == 0 ||
+        host_names.deleters == 0) {
+      fprintf(stderr, "the handler did not take the set or the delete\n");
+      ++failures;
+    }
+
+    // The same answers through script: a read and the `in` operator.
+    const char kHandled[] = "handled";
+    if (slag_object_set(
+            slag_global(current->slag()),
+            reinterpret_cast<const uint8_t*>(kHandled), sizeof(kHandled) - 1,
+            instance.raw()) != 0) {
+      fprintf(stderr, "the handler instance could not be installed\n");
+      ++failures;
+    }
+    v8::Local<v8::Value> from_script =
+        v8::Script::Compile(
+            current,
+            v8::String::NewFromUtf8Literal(
+                isolate,
+                "handled.alpha + (('beta' in handled) ? 1 : 0)"))
+            .ToLocalChecked()
+            ->Run(current)
+            .ToLocalChecked();
+    if (from_script->Int32Value(current).FromMaybe(-1) != 43) {
+      fprintf(stderr, "script did not reach the handler (got %d)\n",
+              from_script->Int32Value(current).FromMaybe(-1));
+      ++failures;
+    }
+    if (host_names.data_misses != 0) {
+      ++failures;
+    }
   }
 
   // A host-traced reference: a root the C++ side owns and releases. Once the

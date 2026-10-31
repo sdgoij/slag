@@ -19,6 +19,11 @@ use std::cell::RefCell;
 use std::ffi::{c_char, c_void};
 use std::rc::Rc;
 
+mod handler;
+
+use handler::CxxHandler;
+pub use handler::SlagPropertyHandler;
+
 use crux::heap::{GcAny, RootSource, Trace, register_root_source};
 use crux::value::Value;
 use slag::api::{Local as EngineLocal, Traced};
@@ -491,6 +496,11 @@ pub extern "C" fn slag_undefined() -> u64 {
 }
 
 #[unsafe(no_mangle)]
+pub extern "C" fn slag_boolean_new(value: i32) -> u64 {
+    JsValue::from_bits(Value::Boolean(value != 0).bits()).to_bits()
+}
+
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn slag_string_new(text: *const u8, len: usize) -> u64 {
     JsValue::string(str_of_unchecked(text, len)).to_bits()
 }
@@ -642,6 +652,48 @@ pub unsafe extern "C" fn slag_object_new(
             }
         };
         engine.create_object()
+    };
+    let object = match created {
+        Ok(object) => object,
+        Err(error) => {
+            record(context, error);
+            return 1;
+        }
+    };
+    object.set_internal_fields(count, api_wrapper != 0);
+    if !out.is_null() {
+        *out = object.as_value().to_bits();
+    }
+    0
+}
+
+/// Create an object whose property access goes to `handler`: the object
+/// `v8::ObjectTemplate::NewInstance` makes for a template with a handler. The
+/// handler's callbacks are copied; its `data` value is pinned for as long as
+/// the object can call it.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn slag_object_new_handler(
+    context: *mut SlagContext,
+    count: usize,
+    api_wrapper: i32,
+    handler: *const SlagPropertyHandler,
+    out: *mut u64,
+) -> i32 {
+    let Some(context) = context.as_ref() else {
+        return 2;
+    };
+    let Some(handler) = handler.as_ref() else {
+        return 2;
+    };
+    let created = {
+        let engine = match context.context.try_borrow() {
+            Ok(engine) => engine,
+            Err(_) => {
+                reentrant(context);
+                return 1;
+            }
+        };
+        engine.create_host_object(Rc::new(CxxHandler::new(*handler)))
     };
     let object = match created {
         Ok(object) => object,

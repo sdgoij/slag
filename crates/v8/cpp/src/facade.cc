@@ -62,6 +62,68 @@ uint64_t HostTrampoline(void* data, const void* call, uint64_t this_value,
   return info.return_value();
 }
 
+/* The property-handler callbacks, adapted from the flat ABI to the C++ shapes.
+ * `state` is the configuration the template installed, so the trampoline can
+ * reach the host's own callback; the answer slot is where the host writes. */
+v8::NamedPropertyHandlerConfiguration* Configuration(void* state) {
+  return static_cast<v8::NamedPropertyHandlerConfiguration*>(state);
+}
+
+int32_t GetterTrampoline(void* state, uint64_t data, uint64_t holder,
+                         uint64_t key, uint64_t receiver, uint64_t* out) {
+  auto* configuration = Configuration(state);
+  if (configuration == nullptr || configuration->getter == nullptr ||
+      out == nullptr) {
+    return 0;
+  }
+  *out = slag_undefined();
+  v8::PropertyCallbackInfo<v8::Value> info(v8::g_current_isolate, holder, data,
+                                           out);
+  return static_cast<int32_t>(
+      configuration->getter(v8::Local<v8::Name>::New(key), info));
+}
+
+int32_t SetterTrampoline(void* state, uint64_t data, uint64_t holder,
+                         uint64_t key, uint64_t value, uint64_t receiver,
+                         int32_t throw_on_error) {
+  auto* configuration = Configuration(state);
+  if (configuration == nullptr || configuration->setter == nullptr) return 0;
+  (void)throw_on_error;
+  uint64_t answer = slag_undefined();
+  v8::PropertyCallbackInfo<void> info(v8::g_current_isolate, holder, data,
+                                      &answer);
+  return static_cast<int32_t>(configuration->setter(
+      v8::Local<v8::Name>::New(key), v8::Local<v8::Value>::New(value), info));
+}
+
+int32_t QueryTrampoline(void* state, uint64_t data, uint64_t holder,
+                        uint64_t key, uint64_t* out) {
+  auto* configuration = Configuration(state);
+  if (configuration == nullptr || configuration->query == nullptr ||
+      out == nullptr) {
+    return 0;
+  }
+  *out = slag_undefined();
+  v8::PropertyCallbackInfo<v8::Integer> info(v8::g_current_isolate, holder,
+                                             data, out);
+  return static_cast<int32_t>(
+      configuration->query(v8::Local<v8::Name>::New(key), info));
+}
+
+int32_t DeleterTrampoline(void* state, uint64_t data, uint64_t holder,
+                          uint64_t key, uint64_t* out) {
+  auto* configuration = Configuration(state);
+  if (configuration == nullptr || configuration->deleter == nullptr ||
+      out == nullptr) {
+    return 0;
+  }
+  *out = slag_undefined();
+  v8::PropertyCallbackInfo<v8::Boolean> info(v8::g_current_isolate, holder,
+                                             data, out);
+  return static_cast<int32_t>(
+      configuration->deleter(v8::Local<v8::Name>::New(key), info));
+}
+
 }  // namespace
 
 namespace v8 {
@@ -243,6 +305,10 @@ Local<Number> Number::New(Isolate*, double value) {
   return Local<Number>::New(slag_number_new(value));
 }
 
+Local<Boolean> Boolean::New(Isolate*, bool value) {
+  return Local<Boolean>::New(slag_boolean_new(value ? 1 : 0));
+}
+
 Local<Integer> Integer::New(Isolate*, int32_t value) {
   return Local<Integer>::New(slag_number_new(static_cast<double>(value)));
 }
@@ -356,8 +422,25 @@ MaybeLocal<Object> ObjectTemplate::NewInstance(Local<Context> context) {
   SlagContext* slag = current->slag();
 
   uint64_t object = 0;
-  if (slag_object_new(slag, static_cast<size_t>(internal_fields_), 1, &object) !=
-      0) {
+  int status = 0;
+  if (has_handler_) {
+    // The handler struct carries the templates's callbacks plus the address of
+    // the configuration the trampolines read them from. The configuration lives
+    // as long as this template, like the template itself.
+    SlagPropertyHandler handler{};
+    handler.getter = GetterTrampoline;
+    handler.setter = SetterTrampoline;
+    handler.query = QueryTrampoline;
+    handler.deleter = DeleterTrampoline;
+    handler.data = handler_.data.IsEmpty() ? slag_undefined() : handler_.data.raw();
+    handler.state = &handler_;
+    status = slag_object_new_handler(slag, static_cast<size_t>(internal_fields_),
+                                     1, &handler, &object);
+  } else {
+    status = slag_object_new(slag, static_cast<size_t>(internal_fields_), 1,
+                             &object);
+  }
+  if (status != 0) {
     return MaybeLocal<Object>();
   }
   // The functions below allocate, so the instance has to be a root first.
@@ -371,6 +454,12 @@ MaybeLocal<Object> ObjectTemplate::NewInstance(Local<Context> context) {
     }
   }
   return instance;
+}
+
+void ObjectTemplate::SetHandler(
+    const NamedPropertyHandlerConfiguration& configuration) {
+  handler_ = configuration;
+  has_handler_ = true;
 }
 
 Local<Context> Context::New(Isolate* isolate, std::nullptr_t,

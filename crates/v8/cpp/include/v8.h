@@ -201,6 +201,15 @@ enum class CppHeapPointerTag : uint16_t {
   kAnyCppHeapPointer = 0xffff,
 };
 
+/* Whether a property-handler callback answered, and how (`v8::Intercepted`).
+ * `kNo` runs the ordinary internal method. */
+enum class Intercepted {
+  kNo = 0,
+  kYes = 1,
+  kYesKeepExisting = 2,
+  kThrow = 3,
+};
+
 class Value {
  public:
   bool IsUndefined() const;
@@ -316,6 +325,12 @@ class String : public Name {
   };
 };
 
+/* A boolean value (`v8::Boolean`): the info a deleter answers through. */
+class Boolean : public Value {
+ public:
+  static Local<Boolean> New(Isolate* isolate, bool value);
+};
+
 class ScriptOrigin {
  public:
   explicit ScriptOrigin(Local<Value> name) : name_(name) {}
@@ -403,6 +418,89 @@ class FunctionCallbackInfo {
 
 using FunctionCallback = void (*)(const FunctionCallbackInfo<Value>&);
 
+/* What a property-handler callback receives (`v8::PropertyCallbackInfo`): the
+ * object the internal method ran on, the configuration's data, and the slot its
+ * answer goes in. */
+template <class T>
+class PropertyCallbackInfo {
+ public:
+  PropertyCallbackInfo(Isolate* isolate, uint64_t holder, uint64_t data,
+                       uint64_t* return_value)
+      : isolate_(isolate),
+        holder_(holder),
+        data_(data),
+        return_value_(return_value) {}
+
+  Isolate* GetIsolate() const { return isolate_; }
+  Local<Object> This() const { return Local<Object>::New(holder_); }
+  Local<Object> Holder() const { return Local<Object>::New(holder_); }
+  Local<Value> Data() const { return Local<Value>::New(data_); }
+  ReturnValue<T> GetReturnValue() const { return ReturnValue<T>(return_value_); }
+
+ private:
+  Isolate* isolate_;
+  uint64_t holder_;
+  uint64_t data_;
+  uint64_t* return_value_;
+};
+
+/* The handler callbacks (`v8::NamedProperty*Callback`).
+ *
+ * The enumerator is absent: a `v8::NamedPropertyEnumeratorCallback` builds the
+ * array it answers with, and allocating one goes through the context, which the
+ * operation that called the handler holds borrowed. Until a callback can
+ * allocate through the live borrow, the callback is not offered, so a host that
+ * needs it does not compile. */
+using NamedPropertyGetterCallback =
+    Intercepted (*)(Local<Name> property, const PropertyCallbackInfo<Value>& info);
+using NamedPropertySetterCallback =
+    Intercepted (*)(Local<Name> property, Local<Value> value,
+                    const PropertyCallbackInfo<void>& info);
+using NamedPropertyQueryCallback = Intercepted (*)(
+    Local<Name> property, const PropertyCallbackInfo<Integer>& info);
+using NamedPropertyDeleterCallback = Intercepted (*)(
+    Local<Name> property, const PropertyCallbackInfo<Boolean>& info);
+
+/* How a handler is consulted (`v8::PropertyHandlerFlags`). Accepted and not
+ * honoured: the engine's seam consults the host before its own lookup, so there
+ * is no non-masking mode and no string-only mode to select. */
+enum class PropertyHandlerFlags : int {
+  kNone = 0,
+  kAllCanRead = 1 << 0,
+  kNonMasking = 1 << 1,
+  kOnlyInterceptStrings = 1 << 2,
+};
+
+/* What a host installs on an object template
+ * (`v8::NamedPropertyHandlerConfiguration`).
+ *
+ * The `descriptor`, `definer`, and `enumerator` callbacks are absent on
+ * purpose: they need a property-descriptor ABI and a re-entrant allocation path
+ * that do not exist yet, so a host that needs them does not compile rather than
+ * having them silently ignored. */
+struct NamedPropertyHandlerConfiguration {
+  NamedPropertyHandlerConfiguration(
+      NamedPropertyGetterCallback getter = nullptr,
+      NamedPropertySetterCallback setter = nullptr,
+      NamedPropertyQueryCallback query = nullptr,
+      NamedPropertyDeleterCallback deleter = nullptr,
+      Local<Value> data = Local<Value>(),
+      PropertyHandlerFlags flags = PropertyHandlerFlags::kNone)
+      : getter(getter),
+        setter(setter),
+        query(query),
+        deleter(deleter),
+        data(data),
+        flags(flags) {}
+
+  NamedPropertyGetterCallback getter;
+  NamedPropertySetterCallback setter;
+  NamedPropertyQueryCallback query;
+  NamedPropertyDeleterCallback deleter;
+  Local<Value> data;
+  PropertyHandlerFlags flags;
+};
+
 class FunctionTemplate {
  public:
   static Local<FunctionTemplate> New(Isolate* isolate,
@@ -432,13 +530,20 @@ class ObjectTemplate {
   void SetInternalFieldCount(int count) { internal_fields_ = count; }
   int InternalFieldCount() const { return internal_fields_; }
 
+  /* Install a named-property handler (`v8::ObjectTemplate::SetHandler`): every
+   * instance's property access is offered to the handler first. */
+  void SetHandler(const NamedPropertyHandlerConfiguration& configuration);
+
   /* Create an instance of this template: an ordinary object with the template's
-   * internal fields, its host functions, and `IsApiWrapper` set. */
+   * internal fields, its host functions, and `IsApiWrapper` set. A template with
+   * a handler makes an object whose property access goes to it. */
   MaybeLocal<Object> NewInstance(Local<Context> context);
 
  private:
   std::vector<Entry> entries_;
   int internal_fields_ = 0;
+  NamedPropertyHandlerConfiguration handler_;
+  bool has_handler_ = false;
 };
 
 class Context {

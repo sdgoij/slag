@@ -18,6 +18,24 @@ typedef struct SlagTraced SlagTraced;
 typedef uint64_t (*slag_host_fn)(void* data, const void* call, uint64_t this_value,
                                  const uint64_t* args, size_t len);
 
+/* The C callbacks of a v8::NamedPropertyHandlerConfiguration. Each returns V8's
+ * Intercepted (0 kNo, 1 kYes, 2 kYesKeepExisting, 3 kThrow) and writes its
+ * answer through its out parameter; a null pointer is a callback the host did
+ * not install. `data` is the configuration's data as tagged value bits, and
+ * `state` is the facade's trampoline context. */
+typedef struct SlagPropertyHandler {
+  int32_t (*getter)(void* state, uint64_t data, uint64_t holder, uint64_t key,
+                    uint64_t receiver, uint64_t* out);
+  int32_t (*setter)(void* state, uint64_t data, uint64_t holder, uint64_t key,
+                    uint64_t value, uint64_t receiver, int32_t throw_on_error);
+  int32_t (*query)(void* state, uint64_t data, uint64_t holder, uint64_t key,
+                   uint64_t* out);
+  int32_t (*deleter)(void* state, uint64_t data, uint64_t holder, uint64_t key,
+                     uint64_t* out);
+  uint64_t data;
+  void* state;
+} SlagPropertyHandler;
+
 SlagIsolate* slag_isolate_new(void);
 void slag_isolate_free(SlagIsolate* isolate);
 SlagContext* slag_context_new(SlagIsolate* isolate);
@@ -38,6 +56,7 @@ int32_t slag_has_error(SlagContext* context);
 int64_t slag_take_error(SlagContext* context, char* buffer, size_t len);
 
 uint64_t slag_undefined(void);
+uint64_t slag_boolean_new(int32_t value);
 uint64_t slag_string_new(const uint8_t* text, size_t len);
 uint64_t slag_number_new(double value);
 void slag_root_retain(uint64_t value);
@@ -57,6 +76,9 @@ int32_t slag_value_is_undefined(uint64_t value);
 uint64_t slag_global(SlagContext* context);
 int32_t slag_object_new(SlagContext* context, size_t internal_fields,
                         int32_t api_wrapper, uint64_t* out);
+int32_t slag_object_new_handler(SlagContext* context, size_t internal_fields,
+                                int32_t api_wrapper, const SlagPropertyHandler* handler,
+                                uint64_t* out);
 size_t slag_object_internal_field_count(uint64_t object);
 int32_t slag_object_is_api_wrapper(uint64_t object);
 int32_t slag_object_set_internal_field(uint64_t object, size_t index, void* pointer);
