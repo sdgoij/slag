@@ -433,39 +433,77 @@ class ScriptOrigin {
   Local<Value> name_;
 };
 
+/* The details a host prints about a caught exception (`v8::Message`).
+ *
+ * A message exists only when the engine recorded a position for the error, and
+ * it records one only for a failed compile: a runtime error's span may index
+ * another script, so a position would be a guess (the same narrowing the Rust
+ * bridge documents). `TryCatch::Message()` is therefore empty for a runtime
+ * error, and a host prints the exception alone.
+ *
+ * The three values are roots the message holds: the resource name, the line's
+ * text, and the message text. */
 class Message {
  public:
-  bool IsEmpty() const { return true; }
-  ScriptOrigin GetScriptOrigin() const { return ScriptOrigin(Local<Value>()); }
-  Maybe<int> GetLineNumber(Local<Context>) const { return Maybe<int>(); }
-  MaybeLocal<String> GetSourceLine(Local<Context>) const {
-    return MaybeLocal<String>();
+  Message(uint64_t resource_name, uint64_t source_line, uint64_t text,
+          int line, int start, int end);
+  ~Message();
+
+  Message(const Message&) = delete;
+  Message& operator=(const Message&) = delete;
+
+  bool IsEmpty() const { return false; }
+  Local<String> Get() const { return Local<String>::New(text_); }
+  ScriptOrigin GetScriptOrigin() const {
+    return ScriptOrigin(Local<Value>::New(resource_name_));
   }
-  Maybe<int> GetStartColumn(Local<Context>) const { return Maybe<int>(); }
-  Maybe<int> GetEndColumn(Local<Context>) const { return Maybe<int>(); }
+  Maybe<int> GetLineNumber(Local<Context>) const { return Maybe<int>(line_); }
+  Maybe<int> GetStartColumn(Local<Context>) const { return Maybe<int>(start_); }
+  Maybe<int> GetEndColumn(Local<Context>) const { return Maybe<int>(end_); }
+  MaybeLocal<String> GetSourceLine(Local<Context>) const {
+    return MaybeLocal<String>(Local<String>::New(source_line_));
+  }
+
+ private:
+  uint64_t resource_name_;
+  uint64_t source_line_;
+  uint64_t text_;
+  int line_;
+  int start_;
+  int end_;
 };
 
 class Script {
- public:
+  public:
   static MaybeLocal<Script> Compile(Local<Context> context,
                                     Local<String> source,
                                     ScriptOrigin* origin = nullptr);
   MaybeLocal<Value> Run(Local<Context> context);
 };
 
+/* The exceptions a host catches around a compile or a run (`v8::TryCatch`).
+ *
+ * The committed state is the context's pending error, and the destructor clears
+ * it, which is what makes the next operation start clean (V8's TryCatch does
+ * the same to the isolate). `Exception`, `Message`, and `StackTrace` all read
+ * the same pending error without consuming it. */
 class TryCatch {
  public:
   explicit TryCatch(Isolate* isolate) : isolate_(isolate) {}
+  ~TryCatch();
+
+  TryCatch(const TryCatch&) = delete;
+  TryCatch& operator=(const TryCatch&) = delete;
 
   bool HasCaught() const;
   Local<Value> Exception() const;
-  Local<v8::Message> Message() const { return Local<v8::Message>(); }
-  MaybeLocal<Value> StackTrace(Local<Context>) const {
-    return MaybeLocal<Value>();
-  }
+  Local<v8::Message> Message() const;
+  MaybeLocal<Value> StackTrace(Local<Context>) const;
 
  private:
   Isolate* isolate_;
+  /* Qualified because the member function `Message()` hides the class name. */
+  mutable v8::Message* message_ = nullptr;
 };
 
 template <class T>

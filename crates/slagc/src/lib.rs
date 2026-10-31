@@ -48,13 +48,35 @@ pub struct SlagIsolate {
 pub struct SlagContext {
     context: RefCell<Context>,
     /// The error the last failed operation left: its message is what
-    /// `slag_take_error` reports, and the thrown value, when there is one, is
-    /// what `TryCatch::Exception` returns.
-    pending_error: Rc<RefCell<Option<JsError>>>,
+    /// `slag_take_error` reports, the thrown value is what `TryCatch::Exception`
+    /// returns, and a compile's position is what `TryCatch::Message` answers.
+    pending_error: Rc<RefCell<Option<PendingError>>>,
     /// The context's agent address, which is stable because the context boxes it.
     /// A host callback publishes it as its token so it can allocate through the
     /// operation that is running (see [`slag_callback_token`]).
     agent: crux::function::AgentPtr,
+}
+
+/// Where a pending error came from, when a compile could name it: the host's
+/// script name, the position, and the line's text.
+///
+/// Only a failed compile records one. A `JsError::span` indexes whichever source
+/// the failing code was parsed from and does not say which one that was, so a
+/// runtime error's span could name another script; a compile's necessarily came
+/// from the text in hand. A runtime error therefore answers "no position".
+struct ErrorPosition {
+    name: Option<String>,
+    /// 1-based.
+    line: u32,
+    /// 0-based, as V8's `Message::GetStartColumn` counts.
+    column: u32,
+    line_text: String,
+}
+
+/// The pending error and the position a compile recorded for it.
+pub(crate) struct PendingError {
+    pub(crate) error: JsError,
+    position: Option<ErrorPosition>,
 }
 
 /// A parsed, not-yet-run script (`v8::Script`).
@@ -101,7 +123,11 @@ unsafe fn slice_of<'a, T>(ptr: *const T, len: usize) -> &'a [T] {
 }
 
 fn record(context: &SlagContext, error: JsError) {
-    *context.pending_error.borrow_mut() = Some(error);
+    record_at(context, error, None);
+}
+
+fn record_at(context: &SlagContext, error: JsError, position: Option<ErrorPosition>) {
+    *context.pending_error.borrow_mut() = Some(PendingError { error, position });
 }
 
 fn reentrant(context: &SlagContext) {
@@ -133,8 +159,8 @@ fn host_fn(context: &SlagContext, callback: SlagHostFn, data: *mut c_void) -> Ho
             },
             None => JsValue::undefined().to_bits(),
         };
-        if let Some(error) = pending.borrow_mut().take() {
-            return Err(error);
+        if let Some(pending) = pending.borrow_mut().take() {
+            return Err(pending.error);
         }
         Ok(JsValue::from_bits(produced))
     })
@@ -349,12 +375,17 @@ pub unsafe extern "C" fn slag_compile(
     context: *mut SlagContext,
     source: *const u8,
     len: usize,
+    name: *const u8,
+    name_len: usize,
     out: *mut *mut SlagScript,
 ) -> i32 {
     let Some(context) = context.as_mut() else {
         return 2;
     };
     let Ok(source) = text(source, len) else {
+        return 2;
+    };
+    let Ok(name) = text(name, name_len) else {
         return 2;
     };
     let Ok(engine) = context.context.try_borrow() else {
@@ -369,7 +400,20 @@ pub unsafe extern "C" fn slag_compile(
             0
         }
         Err(error) => {
-            record(context, error);
+            // A compile error's span indexes the text in hand, so this is the one
+            // place a position is honest (see `ErrorPosition`).
+            let position = error.span.map(|span| {
+                let text = syntax::SourceText::from_utf8(source);
+                let location = text.line_column(span.start);
+                ErrorPosition {
+                    name: (!name.is_empty()).then(|| name.to_string()),
+                    line: location.line,
+                    // The parser counts columns from one, V8's message from zero.
+                    column: location.column.saturating_sub(1),
+                    line_text: text.line_text(span.start).to_string_lossy(),
+                }
+            });
+            record_at(context, error, position);
             1
         }
     }
@@ -482,7 +526,7 @@ pub unsafe extern "C" fn slag_throw_error(
         return;
     };
     let message = text(message, len).unwrap_or("error");
-    *context.pending_error.borrow_mut() = Some(JsError::new(ErrorKind::Error, message.to_string()));
+    record(context, JsError::new(ErrorKind::Error, message.to_string()));
 }
 
 #[unsafe(no_mangle)]
@@ -493,21 +537,23 @@ pub unsafe extern "C" fn slag_has_error(context: *mut SlagContext) -> i32 {
     }
 }
 
-/// Copy the pending error into `buffer` (NUL terminated) and clear it. Returns
-/// the message's byte length, or -1 when there was none.
+/// Copy the pending error's message into `buffer` (NUL terminated). Returns the
+/// message's byte length, or -1 when there was none. The pending error is left
+/// in place: `TryCatch` reads it more than once and its destructor clears it.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn slag_take_error(
+pub unsafe extern "C" fn slag_pending_error(
     context: *mut SlagContext,
     buffer: *mut c_char,
     len: usize,
 ) -> i64 {
-    let Some(context) = context.as_mut() else {
+    let Some(context) = context.as_ref() else {
         return -1;
     };
-    let Some(message) = context.pending_error.borrow_mut().take() else {
+    let message = context.pending_error.borrow();
+    let Some(message) = message.as_ref() else {
         return -1;
     };
-    let bytes = message.message.as_bytes();
+    let bytes = message.error.message.as_bytes();
     if buffer.is_null() || len == 0 {
         return 0;
     }
@@ -517,25 +563,129 @@ pub unsafe extern "C" fn slag_take_error(
     copy as i64
 }
 
-/// Take the thrown value of the pending exception, when it has one
-/// (`v8::TryCatch::Exception`), writing its tagged bits to `out` and clearing
-/// the pending error. Returns 0 when nothing is pending or the error carries no
-/// language value, which leaves the message for [`slag_take_error`].
+/// The thrown value of the pending exception, when it has one
+/// (`v8::TryCatch::Exception`), written to `out`. Unlike [`slag_take_error`] this
+/// does not clear the slot: a host asks for the exception, the message, and the
+/// stack of the same error, and the `TryCatch` destructor is what clears it.
+/// Returns 0 when nothing is pending or the error carries no language value.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn slag_take_exception(context: *mut SlagContext, out: *mut u64) -> i32 {
+pub unsafe extern "C" fn slag_pending_exception(context: *mut SlagContext, out: *mut u64) -> i32 {
     let Some(context) = context.as_ref() else {
         return 0;
     };
-    let mut pending = context.pending_error.borrow_mut();
-    match pending.as_ref().and_then(|error| error.value) {
+    let pending = context.pending_error.borrow();
+    match pending.as_ref().and_then(|pending| pending.error.value) {
         Some(value) => {
-            *pending = None;
             if !out.is_null() {
                 *out = value.bits();
             }
             1
         }
         None => 0,
+    }
+}
+
+/// The V8-style stack the engine captured for the pending exception's object,
+/// when it has one (`v8::TryCatch::StackTrace`), copied into `buffer` and
+/// NUL-terminated. Returns the byte length, or -1 when the pending error has no
+/// value or that value has no recorded stack.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn slag_pending_stack(
+    context: *mut SlagContext,
+    buffer: *mut c_char,
+    len: usize,
+) -> i64 {
+    let Some(context) = context.as_ref() else {
+        return -1;
+    };
+    let stack = {
+        let pending = context.pending_error.borrow();
+        let Some(value) = pending.as_ref().and_then(|pending| pending.error.value) else {
+            return -1;
+        };
+        let engine = match context.context.try_borrow() {
+            Ok(engine) => engine,
+            Err(_) => return -1,
+        };
+        engine.stack_trace_of(&JsValue::from_bits(value.bits()))
+    };
+    let Some(stack) = stack else {
+        return -1;
+    };
+    let bytes = stack.as_bytes();
+    if buffer.is_null() || len == 0 {
+        return 0;
+    }
+    let copy = bytes.len().min(len - 1);
+    std::ptr::copy_nonoverlapping(bytes.as_ptr(), buffer.cast::<u8>(), copy);
+    *buffer.add(copy) = 0;
+    copy as i64
+}
+
+/// The position a compile recorded for the pending error (`v8::Message`):
+/// `out` receives the line and column, and the buffers receive the script's name
+/// and the line's text (each NUL-terminated and truncated to its length).
+/// Returns 1 when there is a position, 0 when the error has none (a runtime
+/// error), and 2 for a bad argument.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn slag_pending_message(
+    context: *mut SlagContext,
+    out: *mut SlagMessage,
+    name: *mut c_char,
+    name_len: usize,
+    source_line: *mut c_char,
+    source_line_len: usize,
+) -> i32 {
+    let Some(context) = context.as_ref() else {
+        return 2;
+    };
+    let pending = context.pending_error.borrow();
+    let Some(position) = pending
+        .as_ref()
+        .and_then(|pending| pending.position.as_ref())
+    else {
+        return 0;
+    };
+    if !out.is_null() {
+        *out = SlagMessage {
+            line: i32::try_from(position.line).unwrap_or(i32::MAX),
+            column: i32::try_from(position.column).unwrap_or(i32::MAX),
+        };
+    }
+    copy_text(position.name.as_deref(), name, name_len);
+    copy_text(Some(&position.line_text), source_line, source_line_len);
+    1
+}
+
+/// Clear the pending error and its position (`v8::TryCatch`'s destructor).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn slag_clear_error(context: *mut SlagContext) {
+    if let Some(context) = context.as_ref() {
+        *context.pending_error.borrow_mut() = None;
+    }
+}
+
+/// The position a [`slag_pending_message`] reports (`v8::Message`): the 1-based
+/// line and the 0-based column.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SlagMessage {
+    pub line: i32,
+    pub column: i32,
+}
+
+/// Copy `text` into `buffer` as a NUL-terminated UTF-8 string, truncated to
+/// `len`. A missing text writes the empty string.
+fn copy_text(text: Option<&str>, buffer: *mut c_char, len: usize) {
+    if buffer.is_null() || len == 0 {
+        return;
+    }
+    let bytes = text.unwrap_or_default().as_bytes();
+    let copy = bytes.len().min(len - 1);
+    // SAFETY: the caller promised `buffer` covers `len` bytes.
+    unsafe {
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), buffer.cast::<u8>(), copy);
+        *buffer.add(copy) = 0;
     }
 }
 
@@ -605,6 +755,38 @@ fn render(value: &JsValue) -> String {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn slag_value_to_utf8(value: u64, buffer: *mut c_char, len: usize) -> i64 {
     let text = render(&JsValue::from_bits(value));
+    let bytes = text.as_bytes();
+    if !buffer.is_null() && len > 0 {
+        let copy = bytes.len().min(len - 1);
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), buffer.cast::<u8>(), copy);
+        *buffer.add(copy) = 0;
+    }
+    bytes.len() as i64
+}
+
+/// Write a value's UTF-8 rendering, running ToString through the engine when the
+/// value needs it (a host's `String::Utf8Value`). Returns the required byte
+/// length, or -1 when the conversion threw (a symbol, or an object whose
+/// `toString` throws).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn slag_value_to_utf8_context(
+    context: *mut SlagContext,
+    value: u64,
+    buffer: *mut c_char,
+    len: usize,
+) -> i64 {
+    let Some(context) = context.as_mut() else {
+        return -1;
+    };
+    let text = match context.context.try_borrow_mut() {
+        Ok(mut engine) => engine.to_string(&JsValue::from_bits(value)),
+        // A callback already holds the context, so no host code can run here.
+        // The primitive rendering is what a name or source reads anyway.
+        Err(_) => Ok(render(&JsValue::from_bits(value))),
+    };
+    let Ok(text) = text else {
+        return -1;
+    };
     let bytes = text.as_bytes();
     if !buffer.is_null() && len > 0 {
         let copy = bytes.len().min(len - 1);
@@ -1139,9 +1321,9 @@ fn property_key_of(value: Value) -> Option<PropertyKey> {
 
 /// Turn an accessor callback's report into the host function's result: an error
 /// the callback recorded fails the access, and so does a report without one.
-fn accessor_result(pending: Option<JsError>, code: i32, message: &str) -> Result<(), JsError> {
-    if let Some(error) = pending {
-        return Err(error);
+fn accessor_result(pending: Option<PendingError>, code: i32, message: &str) -> Result<(), JsError> {
+    if let Some(pending) = pending {
+        return Err(pending.error);
     }
     if code != 0 {
         return Err(JsError::new(ErrorKind::Error, message.into()));
@@ -1150,7 +1332,7 @@ fn accessor_result(pending: Option<JsError>, code: i32, message: &str) -> Result
 }
 
 fn accessor_getter(
-    pending: Rc<RefCell<Option<JsError>>>,
+    pending: Rc<RefCell<Option<PendingError>>>,
     callback: unsafe extern "C" fn(*mut c_void, u64, u64, *mut u64) -> i32,
     data: *mut c_void,
     key: u64,
@@ -1173,7 +1355,7 @@ fn accessor_getter(
 }
 
 fn accessor_setter(
-    pending: Rc<RefCell<Option<JsError>>>,
+    pending: Rc<RefCell<Option<PendingError>>>,
     callback: unsafe extern "C" fn(*mut c_void, u64, u64, u64) -> i32,
     data: *mut c_void,
     key: u64,
@@ -1655,21 +1837,71 @@ mod tests {
 
             let bad = b"function (";
             let mut script = std::ptr::null_mut();
+            let name = b"broken.js";
             assert_eq!(
-                slag_compile(context, bad.as_ptr(), bad.len(), &mut script),
+                slag_compile(
+                    context,
+                    bad.as_ptr(),
+                    bad.len(),
+                    name.as_ptr(),
+                    name.len(),
+                    &mut script,
+                ),
                 1
             );
             assert!(script.is_null());
             assert_eq!(slag_has_error(context), 1);
 
             let mut message = [0i8; 256];
-            let len = slag_take_error(context, message.as_mut_ptr(), message.len());
+            let len = slag_pending_error(context, message.as_mut_ptr(), message.len());
             assert!(len > 0);
+            // Reading the message does not consume it: the TryCatch reads the
+            // exception, the message, and the stack of one error.
+            assert_eq!(slag_has_error(context), 1);
+
+            // A compile error records a position, so a message can name it.
+            let mut position = SlagMessage::default();
+            let mut script_name = [0i8; 64];
+            let mut source_line = [0i8; 64];
+            assert_eq!(
+                slag_pending_message(
+                    context,
+                    &mut position,
+                    script_name.as_mut_ptr(),
+                    script_name.len(),
+                    source_line.as_mut_ptr(),
+                    source_line.len(),
+                ),
+                1
+            );
+            assert_eq!(position.line, 1);
+            assert!(position.column >= 0);
+            assert_eq!(
+                std::ffi::CStr::from_ptr(script_name.as_ptr())
+                    .to_str()
+                    .unwrap(),
+                "broken.js"
+            );
+            assert_eq!(
+                std::ffi::CStr::from_ptr(source_line.as_ptr())
+                    .to_str()
+                    .unwrap(),
+                "function ("
+            );
+
+            slag_clear_error(context);
             assert_eq!(slag_has_error(context), 0);
 
             let good = b"1 + 2";
             assert_eq!(
-                slag_compile(context, good.as_ptr(), good.len(), &mut script),
+                slag_compile(
+                    context,
+                    good.as_ptr(),
+                    good.len(),
+                    std::ptr::null(),
+                    0,
+                    &mut script,
+                ),
                 0
             );
             let mut value = 0;

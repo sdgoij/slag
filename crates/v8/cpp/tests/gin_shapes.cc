@@ -979,6 +979,68 @@ int main() {
       fprintf(stderr, "the thrown value did not come back\n");
       ++failures;
     }
+
+    // A thrown Error carries the stack the engine captured, and StackTrace hands
+    // it back as a string.
+    {
+      v8::TryCatch error_catch(isolate);
+      v8::Script::Compile(
+          current,
+          v8::String::NewFromUtf8Literal(isolate, "throw new Error('boom')"))
+          .ToLocalChecked()
+          ->Run(current);
+      v8::Local<v8::Value> stack;
+      bool has_stack =
+          error_catch.HasCaught() &&
+          error_catch.StackTrace(current).ToLocal(&stack) &&
+          stack->IsString();
+      if (has_stack) {
+        v8::String::Utf8Value text(isolate, stack);
+        has_stack = *text != nullptr && strstr(*text, "boom") != nullptr;
+      }
+      if (!has_stack) {
+        fprintf(stderr, "the thrown Error's stack did not come back\n");
+        ++failures;
+      }
+    }
+
+    // A compile error records a position, so Message answers the script's name,
+    // the line, and the line's text.
+    {
+      v8::TryCatch compile_catch(isolate);
+      v8::Local<v8::Value> name =
+          v8::String::NewFromUtf8Literal(isolate, "broken.js");
+      v8::ScriptOrigin origin(name);
+      v8::Local<v8::Script> script;
+      const bool compiled =
+          v8::Script::Compile(
+              current, v8::String::NewFromUtf8Literal(isolate, "let = ;"),
+              &origin)
+              .ToLocal(&script);
+      if (compiled || !compile_catch.HasCaught()) {
+        fprintf(stderr, "the syntax error compiled or was not caught\n");
+        ++failures;
+      }
+      v8::Local<v8::Message> message = compile_catch.Message();
+      if (message.IsEmpty()) {
+        fprintf(stderr, "the compile error had no message\n");
+        ++failures;
+      } else {
+        v8::String::Utf8Value filename(
+            isolate, message->GetScriptOrigin().ResourceName());
+        v8::String::Utf8Value source_line(
+            isolate, message->GetSourceLine(current).ToLocalChecked());
+        const int line = message->GetLineNumber(current).FromJust();
+        const int start = message->GetStartColumn(current).FromJust();
+        const int end = message->GetEndColumn(current).FromJust();
+        if (*filename == nullptr || strcmp(*filename, "broken.js") != 0 ||
+            line != 1 || *source_line == nullptr ||
+            strcmp(*source_line, "let = ;") != 0 || start < 0 || end < start) {
+          fprintf(stderr, "the compile error's message was wrong\n");
+          ++failures;
+        }
+      }
+    }
   }
 
   // A host-traced reference: a root the C++ side owns and releases. Once it

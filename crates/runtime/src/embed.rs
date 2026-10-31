@@ -1159,6 +1159,19 @@ impl Context {
         }
     }
 
+    /// The V8-style stack the engine captured for `value`, when it is an object
+    /// that has one (an `Error`) — what `v8::TryCatch::StackTrace` reports for a
+    /// caught exception.
+    pub fn stack_trace_of(&self, value: &JsValue) -> Option<String> {
+        let object = value.0.as_object()?;
+        Some(
+            self.agent
+                .error_stack(object.id())?
+                .rendered
+                .to_string_lossy(),
+        )
+    }
+
     /// Render a thrown value the way a host reports it: an `Error`'s `stack`
     /// when it has one (the shape Node's uncaught handler prints), else the
     /// `console.log` rendering of the value. A script's escaping throw arrives

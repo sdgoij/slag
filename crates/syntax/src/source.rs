@@ -73,6 +73,24 @@ impl SourceText {
         let column = offset - self.line_starts[line_idx] + 1;
         SourceLocation::new(line, column)
     }
+
+    /// The text of the line `offset` is on, without its line terminator — the
+    /// answer `v8::Message::GetSourceLine` gives.
+    pub fn line_text(&self, offset: u32) -> JsString {
+        let offset = (offset as usize).min(self.units.len()) as u32;
+        let line_idx = self.line_starts.partition_point(|&s| s <= offset) - 1;
+        let start = self.line_starts[line_idx] as usize;
+        let mut end = start;
+        while end < self.units.len() && !ends_line(self.units[end]) {
+            end += 1;
+        }
+        JsString::from_utf16(&self.units[start..end])
+    }
+}
+
+/// Whether `unit` terminates a line (spec 11.3).
+fn ends_line(unit: u16) -> bool {
+    matches!(unit, 0x000A | 0x000D | 0x2028 | 0x2029)
 }
 
 #[cfg(test)]
@@ -106,6 +124,15 @@ mod tests {
         assert_eq!(s.line_column(10), SourceLocation::new(4, 1)); // g starts line 4
         assert_eq!(s.line_column(11), SourceLocation::new(4, 2)); // U+2028 ends line 4
         assert_eq!(s.line_column(12), SourceLocation::new(5, 1)); // h starts line 5
+    }
+
+    #[test]
+    fn line_text_stops_at_the_terminator() {
+        let s = SourceText::from_utf8("ab\ncd\r\nef");
+        assert_eq!(s.line_text(0).to_string_lossy(), "ab");
+        assert_eq!(s.line_text(3).to_string_lossy(), "cd");
+        assert_eq!(s.line_text(7).to_string_lossy(), "ef");
+        assert_eq!(s.line_text(100).to_string_lossy(), "ef");
     }
 
     #[test]

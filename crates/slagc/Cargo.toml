@@ -13,3 +13,6 @@ crate-type = ["staticlib", "rlib"]
 [dependencies]
 slag = { path = "../slag", default-features = false, features = ["wasm"] }
 crux = { path = "../crux" }
+# The parser's own source-position view, for the position a `v8::Message`
+# reports (a compile error's span indexes the text that was compiled).
+syntax = { path = "../syntax" }

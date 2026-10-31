@@ -27,6 +27,13 @@ typedef int32_t (*slag_accessor_getter)(void* data, uint64_t holder, uint64_t ke
 typedef int32_t (*slag_accessor_setter)(void* data, uint64_t holder, uint64_t key,
                                         uint64_t value);
 
+/* The position a `v8::Message` reports: the 1-based line and the 0-based
+ * column of a compile error. */
+typedef struct SlagMessage {
+  int32_t line;
+  int32_t column;
+} SlagMessage;
+
 /* A property descriptor as the definer callback receives it
  * (v8::PropertyDescriptor). Each field is present-or-absent, because V8's
  * descriptor distinguishes "not mentioned" from "mentioned and false". */
@@ -99,7 +106,7 @@ void slag_context_free(SlagContext* context);
 
 int32_t slag_eval(SlagContext* context, const uint8_t* source, size_t len, uint64_t* out);
 int32_t slag_compile(SlagContext* context, const uint8_t* source, size_t len,
-                     SlagScript** out);
+                     const uint8_t* name, size_t name_len, SlagScript** out);
 int32_t slag_script_run(SlagContext* context, SlagScript* script, uint64_t* out);
 void slag_script_free(SlagScript* script);
 int32_t slag_register_fn(SlagContext* context, const uint8_t* name, size_t name_len,
@@ -109,8 +116,15 @@ int32_t slag_call_eval(const void* call, const uint8_t* source, size_t len,
 
 void slag_throw_error(SlagContext* context, const uint8_t* message, size_t len);
 int32_t slag_has_error(SlagContext* context);
-int64_t slag_take_error(SlagContext* context, char* buffer, size_t len);
-int32_t slag_take_exception(SlagContext* context, uint64_t* out);
+/* Copy the pending error's message into the buffer (NUL terminated). Returns the
+ * byte length, or -1 when nothing is pending. */
+int64_t slag_pending_error(SlagContext* context, char* buffer, size_t len);
+int32_t slag_pending_exception(SlagContext* context, uint64_t* out);
+int64_t slag_pending_stack(SlagContext* context, char* buffer, size_t len);
+int32_t slag_pending_message(SlagContext* context, SlagMessage* out, char* name,
+                             size_t name_len, char* source_line,
+                             size_t source_line_len);
+void slag_clear_error(SlagContext* context);
 
 uint64_t slag_undefined(void);
 uint64_t slag_boolean_new(int32_t value);
@@ -127,6 +141,8 @@ void slag_traced_reset(SlagTraced* traced);
 void slag_traced_free(SlagTraced* traced);
 int32_t slag_collect(SlagContext* context);
 int64_t slag_value_to_utf8(uint64_t value, char* buffer, size_t len);
+int64_t slag_value_to_utf8_context(SlagContext* context, uint64_t value,
+                                   char* buffer, size_t len);
 double slag_value_to_number(uint64_t value);
 int32_t slag_value_is_string(uint64_t value);
 int32_t slag_value_is_undefined(uint64_t value);

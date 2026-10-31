@@ -700,21 +700,41 @@ int String::Length() const {
 }
 
 String::Utf8Value::Utf8Value(uint64_t value) {
-  int64_t len = slag_value_to_utf8(value, nullptr, 0);
+  // `String::Utf8Value` runs ToString, so an object's own `toString` is what a
+  // host reads. That needs an agent, which needs an entered context; with none
+  // there is no host code to run and the primitive rendering is all there is.
+  auto* context = reinterpret_cast<Context*>(
+      static_cast<uintptr_t>(g_current_context));
+  int64_t len = context != nullptr
+                    ? slag_value_to_utf8_context(context->slag(), value, nullptr, 0)
+                    : slag_value_to_utf8(value, nullptr, 0);
   if (len < 0) return;
   data_ = new char[static_cast<size_t>(len) + 1];
-  slag_value_to_utf8(value, data_, static_cast<size_t>(len) + 1);
+  if (context != nullptr) {
+    slag_value_to_utf8_context(context->slag(), value, data_,
+                               static_cast<size_t>(len) + 1);
+  } else {
+    slag_value_to_utf8(value, data_, static_cast<size_t>(len) + 1);
+  }
 }
 
 MaybeLocal<Script> Script::Compile(Local<Context> context,
-                                   Local<String> source, ScriptOrigin*) {
+                                   Local<String> source, ScriptOrigin* origin) {
   if (context.IsEmpty() || source.IsEmpty()) return MaybeLocal<Script>();
   auto* current = reinterpret_cast<Context*>(
       static_cast<uintptr_t>(context.raw()));
   std::string text = ValueText(source.raw());
+  // The origin's name is what a `v8::Message` reports as the script's name; the
+  // engine never sees it, so it travels with the compile.
+  std::string name;
+  if (origin != nullptr) {
+    uint64_t resource = origin->ResourceName().raw();
+    if (slag_value_is_string(resource) != 0) name = ValueText(resource);
+  }
   SlagScript* script = nullptr;
   if (slag_compile(current->slag(),
                    reinterpret_cast<const uint8_t*>(text.data()), text.size(),
+                   reinterpret_cast<const uint8_t*>(name.data()), name.size(),
                    &script) != 0) {
     return MaybeLocal<Script>();
   }
@@ -740,22 +760,92 @@ bool TryCatch::HasCaught() const {
   return context != nullptr && slag_has_error(context->slag()) != 0;
 }
 
+TryCatch::~TryCatch() {
+  delete message_;
+  // V8's TryCatch resets the isolate's pending exception when it goes out of
+  // scope, so the next operation starts clean.
+  auto* context = reinterpret_cast<Context*>(
+      static_cast<uintptr_t>(g_current_context));
+  if (context != nullptr) slag_clear_error(context->slag());
+}
+
+Message::Message(uint64_t resource_name, uint64_t source_line, uint64_t text,
+                 int line, int start, int end)
+    : resource_name_(resource_name),
+      source_line_(source_line),
+      text_(text),
+      line_(line),
+      start_(start),
+      end_(end) {
+  // The three values outlive the handle scope their strings were made in.
+  slag_root_retain(resource_name_);
+  slag_root_retain(source_line_);
+  slag_root_retain(text_);
+}
+
+Message::~Message() {
+  slag_root_release(resource_name_);
+  slag_root_release(source_line_);
+  slag_root_release(text_);
+}
+
+Local<v8::Message> TryCatch::Message() const {
+  if (message_ != nullptr) {
+    return Local<v8::Message>::New(reinterpret_cast<uint64_t>(message_));
+  }
+  auto* context = reinterpret_cast<Context*>(
+      static_cast<uintptr_t>(g_current_context));
+  if (context == nullptr) return Local<v8::Message>();
+  SlagMessage position{};
+  char name[256];
+  char source_line[1024];
+  // Only a compile records a position, so a runtime error has no message to
+  // report and the host prints the exception alone.
+  if (slag_pending_message(context->slag(), &position, name, sizeof(name),
+                           source_line, sizeof(source_line)) != 1) {
+    return Local<v8::Message>();
+  }
+  char text[1024];
+  int64_t len = slag_pending_error(context->slag(), text, sizeof(text));
+  if (len < 0) return Local<v8::Message>();
+  message_ = new v8::Message(
+      slag_string_new(reinterpret_cast<const uint8_t*>(name), strlen(name)),
+      slag_string_new(reinterpret_cast<const uint8_t*>(source_line),
+                      strlen(source_line)),
+      slag_string_new(reinterpret_cast<const uint8_t*>(text),
+                      static_cast<size_t>(len)),
+      position.line, position.column, position.column);
+  return Local<v8::Message>::New(reinterpret_cast<uint64_t>(message_));
+}
+
 Local<Value> TryCatch::Exception() const {
   auto* context = reinterpret_cast<Context*>(
       static_cast<uintptr_t>(g_current_context));
   if (context == nullptr) return Local<Value>();
   // The thrown value first: a script's `throw` carries one, and that is what V8
   // hands back. A host `ThrowError` records a message only, so its text is the
-  // fallback.
+  // fallback. Neither consumes the pending error: the message and the stack
+  // read the same one, and the destructor clears it.
   uint64_t thrown = 0;
-  if (slag_take_exception(context->slag(), &thrown) != 0) {
+  if (slag_pending_exception(context->slag(), &thrown) != 0) {
     return Local<Value>::New(thrown);
   }
   char buffer[1024];
-  int64_t len = slag_take_error(context->slag(), buffer, sizeof(buffer));
+  int64_t len = slag_pending_error(context->slag(), buffer, sizeof(buffer));
   if (len < 0) return Local<Value>();
   return Local<Value>::New(slag_string_new(
       reinterpret_cast<const uint8_t*>(buffer), static_cast<size_t>(len)));
+}
+
+MaybeLocal<Value> TryCatch::StackTrace(Local<Context> context) const {
+  if (context.IsEmpty()) return MaybeLocal<Value>();
+  auto* current = reinterpret_cast<Context*>(
+      static_cast<uintptr_t>(context.raw()));
+  char buffer[8192];
+  int64_t len = slag_pending_stack(current->slag(), buffer, sizeof(buffer));
+  if (len <= 0) return MaybeLocal<Value>();
+  return MaybeLocal<Value>(Local<Value>::New(slag_string_new(
+      reinterpret_cast<const uint8_t*>(buffer), static_cast<size_t>(len))));
 }
 
 Local<FunctionTemplate> FunctionTemplate::New(Isolate*,

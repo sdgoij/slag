@@ -216,8 +216,23 @@ are rooted in the ABI's registry, which is what a `Global` does for a host.
 `TryCatch::Exception` returns the thrown language value when there is one: a
 script's `throw` keeps its value across the boundary, so `catch`-style host code
 sees the object that was thrown rather than a message rebuilt from it. A host
-`ThrowError` records a message, so its text is what comes back. `Message` and
-`StackTrace` are still empty (see the limits below).
+`ThrowError` records a message, so its text is what comes back.
+
+`TryCatch::Message` answers the position a **compile** error was found at: the
+script's name (the `ScriptOrigin` the host passed to `Script::Compile`), the
+1-based line, the 0-based start column, the line's text, and the message text.
+That is what makes the sample take its rich path for a syntax error. A runtime
+error has no position, so its message is empty and the host prints the exception
+alone: `JsError::span` indexes whichever source the failing code was parsed from
+and does not say which, so recording it against the running script would put a
+wrong position on the error. This is the narrowing the Rust bridge documents in
+its own `position` module.
+
+`TryCatch::StackTrace` returns the V8-style stack the engine captured for a
+thrown `Error`, when it has one, as a string. `String::Utf8Value` runs ToString,
+so a host that prints `Exception()` reads `Error: boom` rather than a tag. The
+three reads (`Exception`, `Message`, `StackTrace`) do not consume the pending
+error; the `TryCatch` destructor clears it, as V8's resets the isolate's.
 
 `Object::GetIdentityHash` answers the engine's id for the object, mixed so
 neighbouring objects do not collide and never zero. The Rust bridge's
@@ -255,9 +270,9 @@ not a claim that gin itself links.
 - `String::NewFromUtf8Literal`, `String::NewFromUtf8`, `String::Utf8Value`.
 - `Number::New`, `Integer::New`.
 - `Script::Compile` (parse only) and `Script::Run`.
-- `TryCatch`, `Isolate::ThrowError`, and a minimal `Message` (empty, so the
-  sample prints the exception rather than a source line). `TryCatch::Exception`
-  returns the thrown language value.
+- `TryCatch`, `Isolate::ThrowError`, `Message` (a compile error's position), and
+  `TryCatch::StackTrace` (the captured stack of a thrown `Error`).
+  `TryCatch::Exception` returns the thrown language value.
 - `ObjectTemplate`/`FunctionTemplate` and host callbacks with arguments and a
   return value.
 - `Global<T>`, `Maybe<T>`, `MaybeLocal<T>`.
@@ -294,12 +309,13 @@ not a claim that gin itself links.
   require a cppgc mixin: the facade has no pointer tags and no cppgc.
 - `Global<T>` keeps a value alive, but a `Global` leaked past `Isolate::Dispose`
   is not detected and leaves a dangling retention in the thread-local registry.
-- `Message` is always empty and `StackTrace` is always empty. `TryCatch::Exception`
-  does return the thrown value, though: a script's `throw` carries one, so the
-  object comes back as it was thrown instead of being rebuilt from a message. A
-  host `ThrowError` records only a message, so its text is the fallback. The
-  sample's rich path (source line, caret) is still not taken, because the message
-  and stack are what it reads.
+- `Message` and `StackTrace` answer what the engine recorded, which is narrower
+  than V8: a message exists only for a compile error (see above), and the stack
+  is a string rather than an array of call sites. The sample's rich path is
+  therefore taken for a syntax error and not for a runtime error.
+- `String::Utf8Value` runs ToString through the engine, so an object's own
+  `toString` runs; it falls back to a primitive rendering when a callback already
+  holds the context (a property name is a string in that case anyway).
 - `PumpMessageLoop` always returns false; the engine drains jobs inline.
 - `Isolate::Dispose` frees the contexts the facade created; templates are not
   freed.

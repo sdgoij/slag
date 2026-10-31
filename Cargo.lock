@@ -920,6 +920,7 @@ version = "0.2.0"
 dependencies = [
  "crux",
  "slag",
+ "syntax",
 ]
 
 [[package]]

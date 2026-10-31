@@ -707,6 +707,34 @@ eight objects give at least four distinct answers (a hash may collide, a table
 should not be linear). `TryCatch` also gains a clean-run check and a `throw
 { code: 99 }` whose value comes back intact.
 
+*The error message and stack (2026-10-31).* `TryCatch::Message` and
+`TryCatch::StackTrace` were the last of the error path. A message now exists when
+a **compile** recorded a position: `slag_compile` takes the host's `ScriptOrigin`
+name, and on a parse error it records the 1-based line, the 0-based column, the
+line's text, and the name (computed with `syntax::SourceText::line_column` and
+the new `line_text`, which live in the syntax crate where the parser's spans
+belong). A runtime error keeps no position, which is the Rust bridge's own rule:
+`JsError::span` indexes whichever source the failing code came from, so recording
+it against the running script would put a wrong position on the error. The
+sample's rich path (name:line, source line, caret) is therefore taken for a
+syntax error and not for a runtime one, and the caret is empty because the
+parser's error span is zero-length.
+
+`TryCatch::StackTrace` returns the V8-style stack the engine already captures for
+an `Error` (`Agent::error_stack`, exposed as `Context::stack_trace_of`), as a
+string. The sample only asks for it when it has a message, so a runtime throw
+prints its exception alone, as V8's sample would for an error with no source
+position.
+
+The three reads (exception, message, stack) had to stop consuming the pending
+error: `slag_pending_exception`, `slag_pending_error`, `slag_pending_stack`, and
+`slag_pending_message` peek, and `slag_clear_error` is what the `TryCatch`
+destructor calls (V8's TryCatch resets the isolate's pending exception the same
+way). `String::Utf8Value` also had to start running ToString through the engine,
+which is why the runner prints `Error: boom` instead of a tag; it falls back to
+the primitive rendering while a callback holds the context, because no host code
+can run there.
+
 The ABI shape is roughly a struct of up to seven C function pointers, the data
 pointer, and the flags, handed over once per template, with the return codes
 `Intercepted` already defines; the callbacks receive a `PropertyCallbackInfo`
