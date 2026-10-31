@@ -279,6 +279,22 @@ void ScrubStack(int depth) {
   (void)pad[0];
 }
 
+// The dependency a module resolver hands back. V8's resolver is a plain
+// function pointer, so the module it answers with lives at file scope.
+v8::Global<v8::Module> module_dependency;
+
+v8::MaybeLocal<v8::Module> ResolveModule(v8::Local<v8::Context>,
+                                        v8::Local<v8::String> specifier,
+                                        v8::Local<v8::Module>) {
+  v8::String::Utf8Value text(nullptr, specifier);
+  if (*text != nullptr && strcmp(*text, "dep.js") == 0 &&
+      !module_dependency.IsEmpty()) {
+    return v8::MaybeLocal<v8::Module>(
+        module_dependency.Get(v8::g_current_isolate));
+  }
+  return v8::MaybeLocal<v8::Module>();
+}
+
 void HostLazyGet(v8::Local<v8::Name>,
                  const v8::PropertyCallbackInfo<v8::Value>& info) {
   ++host_properties.lazy_reads;
@@ -1789,6 +1805,85 @@ int main() {
                stats.external_memory >= 64 &&
                stats.number_of_native_contexts >= 1 && !stats.does_zap_garbage,
            "the heap statistics report the arena");
+  }
+
+  // Modules: compile, resolve a dependency through the host callback, link,
+  // evaluate, and read the namespace.
+  {
+    v8::HandleScope scope(isolate);
+    v8::Local<v8::Context> current = context.Get(isolate);
+    v8::Context::Scope context_scope(current);
+    const auto expect = [&](bool condition, const char* what) {
+      if (!condition) {
+        fprintf(stderr, "modules: %s\n", what);
+        ++failures;
+      }
+    };
+
+    {
+      v8::HandleScope inner(isolate);
+      v8::Local<v8::String> source = v8::String::NewFromUtf8Literal(
+          isolate, "export const answer = 42;");
+      v8::Local<v8::Value> name =
+          v8::String::NewFromUtf8Literal(isolate, "dep.js");
+      v8::ScriptOrigin origin(name);
+      v8::Source origin_source(source, origin);
+      v8::Local<v8::Module> module;
+      expect(v8::ScriptCompiler::CompileModule(isolate, &origin_source)
+                 .ToLocal(&module),
+             "a dependency compiled");
+      expect(module->GetStatus() == v8::ModuleStatus::kUninstantiated,
+             "a fresh module is uninstantiated");
+      expect(module->IsSourceTextModule().FromMaybe(false) &&
+                 !module->IsSyntheticModule().FromMaybe(true) &&
+                 module->GetIdentityHash()->Int32Value(current).FromMaybe(0) !=
+                     0,
+             "a source text module reports its kind and identity");
+      module_dependency.Reset(isolate, module);
+    }
+
+    v8::Local<v8::String> source = v8::String::NewFromUtf8Literal(
+        isolate,
+        "import { answer } from 'dep.js';\nexport const doubled = answer * 2;");
+    v8::Local<v8::Value> name =
+        v8::String::NewFromUtf8Literal(isolate, "main.js");
+    v8::ScriptOrigin origin(name);
+    v8::Source main_source(source, origin);
+    v8::Local<v8::Module> main;
+    expect(v8::ScriptCompiler::CompileModule(isolate, &main_source)
+               .ToLocal(&main),
+           "the main module compiled");
+    expect(main->GetModuleRequestsLength() == 1,
+           "the main module declares one import");
+    v8::String::Utf8Value request(isolate, main->GetModuleRequest(0));
+    expect(*request != nullptr && strcmp(*request, "dep.js") == 0,
+           "GetModuleRequest answers the specifier");
+
+    expect(main->InstantiateModule(current, &ResolveModule).FromMaybe(false),
+           "the module graph linked");
+    expect(main->GetStatus() == v8::ModuleStatus::kInstantiated,
+           "a linked module is instantiated");
+
+    v8::TryCatch module_catch(isolate);
+    v8::Local<v8::Value> evaluated;
+    expect(main->Evaluate(current).ToLocal(&evaluated) &&
+               evaluated->IsPromise() && !module_catch.HasCaught(),
+           "Evaluate answered the evaluation promise");
+    expect(main->GetStatus() == v8::ModuleStatus::kEvaluated,
+           "the module evaluated");
+
+    v8::Local<v8::Value> namespace_object = main->GetModuleNamespace();
+    expect(!namespace_object.IsEmpty() && namespace_object->IsObject() &&
+               namespace_object.As<v8::Object>()
+                       ->Get(current,
+                             v8::String::NewFromUtf8Literal(isolate,
+                                                            "doubled"))
+                       .ToLocalChecked()
+                       ->Int32Value(current)
+                       .FromMaybe(-1) == 84,
+           "the namespace exposes the export");
+    expect(main->SourceOffsetToLocation(0).GetLineNumber() == 0,
+           "an offset maps to a 0-based location");
   }
 
   // A host-traced reference: a root the C++ side owns and releases. Once it

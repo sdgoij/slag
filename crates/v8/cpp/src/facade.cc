@@ -1483,6 +1483,151 @@ MaybeLocal<Value> Script::Run(Local<Context> context) {
   return Local<Value>::New(out);
 }
 
+namespace {
+
+/* A `Module` facade object is a handle over the engine's `SlagModule` box. */
+SlagModule* ModuleOf(const Module* module) {
+  return reinterpret_cast<SlagModule*>(static_cast<uintptr_t>(Raw(module)));
+}
+
+std::string TextOf(Local<Value> value) {
+  if (value.IsEmpty()) return {};
+  return ValueText(value.raw());
+}
+
+}  // namespace
+
+MaybeLocal<Module> ScriptCompiler::CompileModule(Isolate* isolate,
+                                                 Source* source,
+                                                 CompileOptions,
+                                                 NoCacheReason) {
+  if (isolate == nullptr || source == nullptr) return MaybeLocal<Module>();
+  SlagContext* slag = CurrentSlagContext();
+  if (slag == nullptr) return MaybeLocal<Module>();
+  const std::string text = TextOf(source->source_string());
+  const std::string specifier = TextOf(source->resource_name());
+  SlagModule* module = nullptr;
+  if (slag_module_compile(
+          slag, reinterpret_cast<const uint8_t*>(specifier.data()),
+          specifier.size(), nullptr, 0,
+          reinterpret_cast<const uint8_t*>(text.data()), text.size(),
+          &module) != 0) {
+    return MaybeLocal<Module>();
+  }
+  return MaybeLocal<Module>(Local<Module>::New(reinterpret_cast<uint64_t>(module)));
+}
+
+ModuleStatus Module::GetStatus() const {
+  switch (slag_module_status(ModuleOf(this))) {
+    case SLAG_MODULE_INSTANTIATING:
+      return ModuleStatus::kInstantiating;
+    case SLAG_MODULE_INSTANTIATED:
+      return ModuleStatus::kInstantiated;
+    case SLAG_MODULE_EVALUATING:
+      return ModuleStatus::kEvaluating;
+    case SLAG_MODULE_EVALUATED:
+      return ModuleStatus::kEvaluated;
+    case SLAG_MODULE_ERRORED:
+      return ModuleStatus::kErrored;
+    default:
+      return ModuleStatus::kUninstantiated;
+  }
+}
+
+Local<Value> Module::GetException() const {
+  uint64_t out = 0;
+  if (slag_module_exception(ModuleOf(this), &out) != 0) return Local<Value>();
+  return Local<Value>::New(out);
+}
+
+Local<Value> Module::GetModuleNamespace() {
+  SlagContext* slag = CurrentSlagContext();
+  uint64_t out = 0;
+  if (slag == nullptr || slag_module_namespace(slag, ModuleOf(this), &out) != 0) {
+    return Local<Value>();
+  }
+  return Local<Value>::New(out);
+}
+
+int Module::GetModuleRequestsLength() const {
+  return static_cast<int>(slag_module_request_count(ModuleOf(this)));
+}
+
+Local<String> Module::GetModuleRequest(int index) const {
+  if (index < 0) return Local<String>();
+  uint64_t out = 0;
+  if (slag_module_request(ModuleOf(this), static_cast<size_t>(index), &out) != 0) {
+    return Local<String>();
+  }
+  return Local<String>::New(out);
+}
+
+Local<Integer> Module::GetIdentityHash() const {
+  Isolate* isolate = g_current_isolate;
+  return Integer::New(isolate, slag_module_identity_hash(ModuleOf(this)));
+}
+
+Maybe<bool> Module::IsSourceTextModule() const {
+  return Maybe<bool>(slag_module_is_source_text(ModuleOf(this)) != 0);
+}
+
+Maybe<bool> Module::IsSyntheticModule() const {
+  return Maybe<bool>(slag_module_is_synthetic(ModuleOf(this)) != 0);
+}
+
+Maybe<bool> Module::InstantiateModule(Local<Context> context,
+                                      ResolveModuleCallback callback) {
+  if (context.IsEmpty() || callback == nullptr) return Maybe<bool>();
+  auto* current = reinterpret_cast<Context*>(
+      static_cast<uintptr_t>(context.raw()));
+  // The engine links from its own registry, so every module in the graph has
+  // to be reached: the resolver is asked for each request, including the ones
+  // a resolved dependency declares.
+  std::vector<Module*> work{this};
+  for (size_t i = 0; i < work.size(); ++i) {
+    Module* module = work[i];
+    const int count = module->GetModuleRequestsLength();
+    for (int request = 0; request < count; ++request) {
+      Local<String> specifier = module->GetModuleRequest(request);
+      if (specifier.IsEmpty()) return Maybe<bool>();
+      Local<Module> resolved;
+      if (!callback(context, specifier,
+                    Local<Module>::New(reinterpret_cast<uint64_t>(module)))
+               .ToLocal(&resolved)) {
+        return Maybe<bool>();
+      }
+      if (resolved.IsEmpty()) return Maybe<bool>();
+      auto* dependency = reinterpret_cast<Module*>(
+          static_cast<uintptr_t>(resolved.raw()));
+      if (slag_module_register(current->slag(), ModuleOf(dependency),
+                               specifier.raw()) != 0) {
+        return Maybe<bool>(false);
+      }
+      work.push_back(dependency);
+    }
+  }
+  return Maybe<bool>(slag_module_instantiate(current->slag(), ModuleOf(this)) == 0);
+}
+
+MaybeLocal<Value> Module::Evaluate(Local<Context> context) {
+  if (context.IsEmpty()) return MaybeLocal<Value>();
+  auto* current = reinterpret_cast<Context*>(
+      static_cast<uintptr_t>(context.raw()));
+  uint64_t out = 0;
+  if (slag_module_evaluate(current->slag(), ModuleOf(this), &out) != 0) {
+    return MaybeLocal<Value>();
+  }
+  return Local<Value>::New(out);
+}
+
+Location Module::SourceOffsetToLocation(int offset) const {
+  Location location;
+  slag_module_source_offset_to_location(ModuleOf(this), offset,
+                                        &location.line_number,
+                                        &location.column_number);
+  return location;
+}
+
 bool TryCatch::HasCaught() const {
   auto* context = reinterpret_cast<Context*>(
       static_cast<uintptr_t>(g_current_context));

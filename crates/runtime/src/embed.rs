@@ -37,6 +37,7 @@ use crux::value::{Value, ValueKind};
 use crate::agent::Agent;
 use crate::context::to_string as js_to_string;
 use crate::host::HostHooks;
+use crate::module::SourceTextModule;
 use crate::realm::Realm;
 
 /// A console or rejection callback: receives the rendered text.
@@ -1256,6 +1257,56 @@ impl Context {
         if let Some(object) = value.0.as_object() {
             crate::builtins::array_buffer::set_detach_key(&mut self.agent, object.id(), key.0);
         }
+    }
+
+    /// Parse `source` as a module in this realm
+    /// (`v8::ScriptCompiler::CompileModule`). `specifier` is the name importers
+    /// resolve the module by, and `name` is what a stack frame reports for its
+    /// code; a host may choose them differently.
+    pub fn compile_module(
+        &mut self,
+        specifier: &str,
+        name: Option<&str>,
+        source: &str,
+    ) -> Result<JsModule, JsError> {
+        let specifier = JsString::from_utf8(specifier);
+        let name = name.map(JsString::from_utf8);
+        let source = JsString::from_utf8(source);
+        let module =
+            crate::module::parse_module(&mut self.agent, &specifier, name.as_ref(), &source, &[])?;
+        Ok(JsModule::new(module))
+    }
+
+    /// Name `module` for later resolutions of `specifier`, which is what
+    /// `Module::InstantiateModule`'s host callback does with what it returns.
+    pub fn register_module(&mut self, specifier: &str, module: &JsModule) -> Result<(), JsError> {
+        let realm = self.agent.current_realm()?;
+        crux::heap::write_barrier_handle(&*realm, module.module);
+        realm
+            .loaded_modules
+            .borrow_mut()
+            .insert(JsString::from_utf8(specifier), module.module);
+        Ok(())
+    }
+
+    /// Link the module and everything the registry resolves for it
+    /// (spec 16.2.1.6.1.2).
+    pub fn instantiate_module(&mut self, module: &JsModule) -> Result<(), JsError> {
+        crate::module::module_declaration_instantiation(&mut self.agent, &module.module)
+    }
+
+    /// Evaluate the module (spec 16.2.1.6.2.1); the value is a promise, and the
+    /// job queues are drained so a settled synchronous body is `Evaluated` when
+    /// this returns.
+    pub fn evaluate_module(&mut self, module: &JsModule) -> Result<JsValue, JsError> {
+        let value = crate::module::module_evaluation(&mut self.agent, &module.module)?;
+        self.agent.run_jobs()?;
+        Ok(JsValue(value))
+    }
+
+    /// The module's namespace object (spec 16.2.1.10).
+    pub fn module_namespace(&mut self, module: &JsModule) -> Result<JsValue, JsError> {
+        crate::module::module_namespace(&mut self.agent, &module.module).map(JsValue)
     }
 
     /// A typed array over `buffer` (`v8::Uint8Array::New` and its siblings).
@@ -2891,6 +2942,90 @@ impl TypedArrayKind {
     }
 }
 
+/// A module record (`v8::Module`). The record is not a language value, so this
+/// box holds a pin: a host handle over the record has nothing else rooting it.
+pub struct JsModule {
+    module: Handle<SourceTextModule>,
+    _pin: crux::heap::Pin,
+}
+
+impl JsModule {
+    fn new(module: Handle<SourceTextModule>) -> Self {
+        Self {
+            _pin: crux::heap::pin_handle(module),
+            module,
+        }
+    }
+
+    /// Whether this is a source text module (`Module::IsSourceTextModule`).
+    pub fn is_source_text(&self) -> bool {
+        self.module.synthetic.is_none()
+    }
+
+    /// Whether this is a synthetic module (`Module::IsSyntheticModule`).
+    pub fn is_synthetic(&self) -> bool {
+        self.module.synthetic.is_some()
+    }
+
+    /// The module's state (`Module::GetStatus`). An errored record reports
+    /// `Errored` whatever its body reached, which is how a host detects a
+    /// failed evaluation. The mapping is the Rust bridge's; see
+    /// `api::module::ModuleStatus` for the reasoning behind the async arm.
+    pub fn status(&self) -> crate::api::ModuleStatus {
+        use crate::api::ModuleStatus as Out;
+        use crate::module::ModuleStatus as In;
+        if self.module.evaluation_error.borrow().is_some() {
+            return Out::Errored;
+        }
+        match *self.module.status.borrow() {
+            In::Unlinked => Out::Uninstantiated,
+            In::Linking => Out::Instantiating,
+            In::Linked => Out::Instantiated,
+            In::Evaluating => Out::Evaluating,
+            In::EvaluatingAsync | In::Evaluated => Out::Evaluated,
+        }
+    }
+
+    /// The error the module failed with, if it has failed
+    /// (`Module::GetException`).
+    pub fn exception(&self) -> Option<Value> {
+        *self.module.evaluation_error.borrow()
+    }
+
+    /// The record's identity hash (`Module::GetIdentityHash`): the address its
+    /// box lives at, folded and forced odd, the same function the Rust bridge
+    /// uses.
+    pub fn identity_hash(&self) -> i32 {
+        let address = self.module.as_any().addr();
+        (address as u32 | 1) as i32
+    }
+
+    /// How many imports the module declares (`Module::GetModuleRequestsLength`).
+    pub fn request_count(&self) -> usize {
+        self.module.requested_modules.len()
+    }
+
+    /// The `index`-th request's specifier (`Module::GetModuleRequest`).
+    pub fn request_specifier(&self, index: usize) -> Option<JsString> {
+        self.module
+            .requested_modules
+            .get(index)
+            .map(|request| request.specifier.clone())
+    }
+
+    /// Where `offset` into the module's source is
+    /// (`Module::SourceOffsetToLocation`). The engine reports 1-based line and
+    /// column; V8's `Location` is 0-based in both, which is the bridge's rule.
+    pub fn source_offset_to_location(&self, offset: u32) -> crux::SourceLocation {
+        let text = syntax::SourceText::from_utf16(self.module.source.as_slice().to_vec());
+        let location = text.line_column(offset);
+        crux::SourceLocation {
+            line: location.line.saturating_sub(1),
+            column: location.column.saturating_sub(1),
+        }
+    }
+}
+
 /// The geometry of a typed array view, or `None` when the value is not one.
 /// Reads only the object's own slots, so it needs no agent and answers inside a
 /// host callback.
@@ -3327,6 +3462,43 @@ mod tests {
         context.eval("host.hidden = 1;").unwrap();
         assert_eq!(set_calls.get(), 0);
         assert_eq!(context.eval("host.hidden").unwrap().as_number(), Some(7.0));
+    }
+
+    #[test]
+    fn modules_compile_link_evaluate_and_expose_a_namespace() {
+        let mut context = Context::new().unwrap();
+        let dependency = context
+            .compile_module("dep", None, "export const answer = 42;")
+            .unwrap();
+        context.register_module("dep", &dependency).unwrap();
+        let main = context
+            .compile_module(
+                "main",
+                Some("main.js"),
+                "import { answer } from 'dep'; export const doubled = answer * 2;",
+            )
+            .unwrap();
+
+        assert!(main.is_source_text() && !main.is_synthetic());
+        assert_eq!(main.request_count(), 1);
+        assert_eq!(
+            main.request_specifier(0).map(|text| text.to_string_lossy()),
+            Some("dep".to_string())
+        );
+        assert_eq!(main.status(), crate::api::ModuleStatus::Uninstantiated);
+        assert_eq!(main.source_offset_to_location(0).line, 0);
+
+        context.instantiate_module(&main).unwrap();
+        assert_eq!(main.status(), crate::api::ModuleStatus::Instantiated);
+
+        let promise = context.evaluate_module(&main).unwrap();
+        assert!(context.value_type_mask(&promise) & VALUE_PROMISE != 0);
+        assert_eq!(main.status(), crate::api::ModuleStatus::Evaluated);
+
+        let namespace = context.module_namespace(&main).unwrap();
+        context.set_global("ns", namespace).unwrap();
+        assert_eq!(context.eval("ns.doubled").unwrap().as_number(), Some(84.0));
+        assert!(main.identity_hash() != 0);
     }
 
     #[test]

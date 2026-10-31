@@ -786,6 +786,94 @@ class Script {
   MaybeLocal<Value> Run(Local<Context> context);
 };
 
+/* Where an offset in a module's source is (`v8::Location`): a 0-based line and
+ * column, which is the shape the Rust bridge's `Location` exposes. */
+struct Location {
+  int line_number = 0;
+  int column_number = 0;
+
+  int GetLineNumber() const { return line_number; }
+  int GetColumnNumber() const { return column_number; }
+};
+
+/* Where a module is in its life (`v8::ModuleStatus`). */
+enum class ModuleStatus {
+  kUninstantiated = 0,
+  kInstantiating = 1,
+  kInstantiated = 2,
+  kEvaluating = 3,
+  kEvaluated = 4,
+  kErrored = 5,
+};
+
+class Module;
+
+/* The host's resolver, called for each import a module declares
+ * (`v8::ResolveModuleCallback`). Returning an empty handle is a failed link. */
+using ResolveModuleCallback = MaybeLocal<Module> (*)(Local<Context> context,
+                                                     Local<String> specifier,
+                                                     Local<Module> referrer);
+
+/* A module record (`v8::Module`). The facade object is a handle over the
+ * engine's pinned record; modules are never freed, like scripts and templates. */
+class Module {
+ public:
+  ModuleStatus GetStatus() const;
+  Local<Value> GetException() const;
+  Local<Value> GetModuleNamespace();
+  int GetModuleRequestsLength() const;
+  Local<String> GetModuleRequest(int index) const;
+  Local<Integer> GetIdentityHash() const;
+  Maybe<bool> IsSourceTextModule() const;
+  Maybe<bool> IsSyntheticModule() const;
+
+  /* Link the module and its imports, asking `callback` for each specifier in
+   * the graph (`Module::InstantiateModule`). */
+  Maybe<bool> InstantiateModule(Local<Context> context,
+                                ResolveModuleCallback callback);
+  MaybeLocal<Value> Evaluate(Local<Context> context);
+  Location SourceOffsetToLocation(int offset) const;
+};
+
+/* The source a compile reads (`v8::Source`). Its resource name is the module's
+ * specifier and the name a stack frame reports. */
+class Source {
+ public:
+  Source(Local<String> source_string, const ScriptOrigin& origin)
+      : source_(source_string), name_(origin.ResourceName()) {}
+  explicit Source(Local<String> source_string) : source_(source_string) {}
+
+  Local<String> source_string() const { return source_; }
+  Local<Value> resource_name() const { return name_; }
+
+ private:
+  Local<String> source_;
+  Local<Value> name_;
+};
+
+/* How a compile reads its input (`v8::CompileOptions` and `NoCacheReason`).
+ * `kConsumeCodeCache` and the reasons are accepted and ignored: this facade
+ * has no code cache yet. */
+enum CompileOptions {
+  kNoCompileOptions = 0,
+  kConsumeCodeCache = 1,
+  kEagerCompile = 2,
+};
+
+enum class NoCacheReason {
+  kNoCacheNoReason = 0,
+  kNoCacheBecauseCachingDisabled = 1,
+};
+
+/* The compiler entry points that take a `Source` (`v8::ScriptCompiler`). */
+class ScriptCompiler {
+ public:
+  static MaybeLocal<Module> CompileModule(
+      Isolate* isolate, Source* source,
+      CompileOptions options = kNoCompileOptions,
+      NoCacheReason reason = NoCacheReason::kNoCacheNoReason);
+};
+
 /* The exceptions a host catches around a compile or a run (`v8::TryCatch`).
  *
  * The committed state is the context's pending error, and the destructor clears

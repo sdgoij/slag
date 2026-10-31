@@ -16,6 +16,7 @@ typedef struct SlagScript SlagScript;
 typedef struct SlagTraced SlagTraced;
 typedef struct SlagBuffer SlagBuffer;
 typedef struct SlagWeak SlagWeak;
+typedef struct SlagModule SlagModule;
 
 typedef uint64_t (*slag_host_fn)(void* data, const void* call, uint64_t this_value,
                                  const uint64_t* args, size_t len);
@@ -291,6 +292,37 @@ int32_t slag_watch_collections(SlagContext* context, void* data,
 int32_t slag_array_buffer_detach(SlagContext* context, uint64_t value, uint64_t key,
                                 int32_t has_key);
 void slag_array_buffer_set_detach_key(SlagContext* context, uint64_t value, uint64_t key);
+
+/* Modules (`v8::Module`). A module box is never freed: the facade gives a host
+ * a handle over it for as long as the module is reachable. */
+enum SlagModuleStatus {
+  SLAG_MODULE_UNINSTANTIATED = 0,
+  SLAG_MODULE_INSTANTIATING = 1,
+  SLAG_MODULE_INSTANTIATED = 2,
+  SLAG_MODULE_EVALUATING = 3,
+  SLAG_MODULE_EVALUATED = 4,
+  SLAG_MODULE_ERRORED = 5,
+};
+int32_t slag_module_compile(SlagContext* context, const uint8_t* specifier,
+                            size_t specifier_len, const uint8_t* name,
+                            size_t name_len, const uint8_t* source,
+                            size_t source_len, SlagModule** out);
+int32_t slag_module_status(const SlagModule* module);
+int32_t slag_module_exception(const SlagModule* module, uint64_t* out);
+int32_t slag_module_identity_hash(const SlagModule* module);
+int32_t slag_module_is_source_text(const SlagModule* module);
+int32_t slag_module_is_synthetic(const SlagModule* module);
+size_t slag_module_request_count(const SlagModule* module);
+int32_t slag_module_request(const SlagModule* module, size_t index, uint64_t* out);
+int32_t slag_module_source_offset_to_location(const SlagModule* module, int32_t offset,
+                                              int32_t* line, int32_t* column);
+int32_t slag_module_register(SlagContext* context, const SlagModule* module,
+                             uint64_t specifier);
+int32_t slag_module_instantiate(SlagContext* context, const SlagModule* module);
+int32_t slag_module_evaluate(SlagContext* context, const SlagModule* module,
+                             uint64_t* out);
+int32_t slag_module_namespace(SlagContext* context, const SlagModule* module,
+                              uint64_t* out);
 
 int32_t slag_collect(SlagContext* context);
 int64_t slag_value_to_utf8(uint64_t value, char* buffer, size_t len);

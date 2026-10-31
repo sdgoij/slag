@@ -912,6 +912,31 @@ Heap statistics use the same `context`-side walk the Rust bridge's
 `api::heap` documents; the constants (an unlimited `heap_size_limit`, zero for
 the stores this engine does not have) are the bridge's, restated in V8's struct.
 
+*Modules (2026-10-31).* The engine's module machinery was already complete and
+only `api::Module` reached it; `embed` had nothing. So the rung added an
+`embed::JsModule` that pins the record (a module is not a language value, so no
+handle scope roots it, which is why the Rust bridge has `pin()`), plus the
+compile/register/instantiate/evaluate/namespace entry points over the same
+`crate::module` functions. `register_module` inserts into the realm's
+`loaded_modules` with a write barrier, exactly as the bridge's `register` does,
+so linking resolves imports without asking the host twice.
+
+The C++ `Module` is a handle over the `SlagModule` box, and the module box is
+never freed, like a script or a template. `InstantiateModule` is the one piece
+with real logic in the facade: because the engine links from its registry, the
+resolver has to be asked for every request in the graph, so the facade keeps a
+worklist and pushes each resolved dependency after registering it. A resolver
+that answers empty leaves the V8 `Nothing` contract intact (the callback is
+expected to have thrown). The harness checks the dependency's kind and identity,
+the request list, linking, the evaluation promise, and the export read from the
+namespace; a runtime test does the same through `embed`.
+
+What this leaves for the Wasm rung: `v8-wasm.h`'s `WasmModuleObject`,
+`WasmInstanceObject`, `WasmMemoryObject`, and the streaming builder. The engine
+has the compiler and the interpreter, and `hello-world` already runs WebAssembly
+through `WebAssembly.instantiate`, so the work is the C++ shape over
+`runtime::wasm`, not a new compiler.
+
 The ABI shape is roughly a struct of up to seven C function pointers, the data
 pointer, and the flags, handed over once per template, with the return codes
 `Intercepted` already defines; the callbacks receive a `PropertyCallbackInfo`

@@ -31,8 +31,8 @@ use crux::string::JsString;
 use crux::value::{Value, ValueKind};
 use slag::api::{Local as EngineLocal, Traced};
 use slag::{
-    CallbackWindow, CompiledScript, Context, ErrorKind, FunctionCall, HostFn, JsError, JsValue,
-    OwnProperty,
+    CallbackWindow, CompiledScript, Context, ErrorKind, FunctionCall, HostFn, JsError, JsModule,
+    JsValue, OwnProperty,
 };
 
 /// The isolate a host enters. The engine's contexts are the state; this token
@@ -88,6 +88,12 @@ pub(crate) struct PendingError {
 /// A parsed, not-yet-run script (`v8::Script`).
 pub struct SlagScript {
     script: CompiledScript,
+}
+
+/// A module record (`v8::Module`). The Rust box pins the record; a module is
+/// never freed, like a script or a template in this facade.
+pub struct SlagModule {
+    module: JsModule,
 }
 
 /// A host-traced root (`v8::TracedReference<T>`): the engine keeps the value
@@ -1079,6 +1085,295 @@ pub unsafe extern "C" fn slag_script_run(
 pub unsafe extern "C" fn slag_script_free(script: *mut SlagScript) {
     if !script.is_null() {
         drop(Box::from_raw(script));
+    }
+}
+
+/// Parse `source` as a module (`v8::ScriptCompiler::CompileModule`). `name` is
+/// the frame name and may be absent; `specifier` is the name importers resolve
+/// the module by.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn slag_module_compile(
+    context: *mut SlagContext,
+    specifier: *const u8,
+    specifier_len: usize,
+    name: *const u8,
+    name_len: usize,
+    source: *const u8,
+    source_len: usize,
+    out: *mut *mut SlagModule,
+) -> i32 {
+    let Some(context) = context.as_mut() else {
+        return 2;
+    };
+    let Ok(specifier) = text(specifier, specifier_len) else {
+        return 2;
+    };
+    let name = if name.is_null() || name_len == 0 {
+        None
+    } else {
+        match text(name, name_len) {
+            Ok(name) => Some(name),
+            Err(()) => return 2,
+        }
+    };
+    let Ok(source) = text(source, source_len) else {
+        return 2;
+    };
+    let compiled = {
+        let Ok(mut engine) = context.context.try_borrow_mut() else {
+            reentrant(context);
+            return 1;
+        };
+        engine.compile_module(specifier, name, source)
+    };
+    match compiled {
+        Ok(module) => {
+            if !out.is_null() {
+                *out = Box::into_raw(Box::new(SlagModule { module }));
+            }
+            0
+        }
+        Err(error) => {
+            record(context, error);
+            1
+        }
+    }
+}
+
+/// The module's state as a `SlagModuleStatus` number; -1 for a bad argument.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn slag_module_status(module: *const SlagModule) -> i32 {
+    let Some(module) = module.as_ref() else {
+        return -1;
+    };
+    match module.module.status() {
+        slag::api::ModuleStatus::Uninstantiated => 0,
+        slag::api::ModuleStatus::Instantiating => 1,
+        slag::api::ModuleStatus::Instantiated => 2,
+        slag::api::ModuleStatus::Evaluating => 3,
+        slag::api::ModuleStatus::Evaluated => 4,
+        slag::api::ModuleStatus::Errored => 5,
+    }
+}
+
+/// The module's evaluation error, written to `out`. 0 with a value, 1 when it
+/// has none, 2 for a bad argument.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn slag_module_exception(module: *const SlagModule, out: *mut u64) -> i32 {
+    let Some(module) = module.as_ref() else {
+        return 2;
+    };
+    match module.module.exception() {
+        Some(value) => {
+            if !out.is_null() {
+                *out = value.bits();
+            }
+            0
+        }
+        None => 1,
+    }
+}
+
+/// The module's identity hash (`v8::Module::GetIdentityHash`).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn slag_module_identity_hash(module: *const SlagModule) -> i32 {
+    module
+        .as_ref()
+        .map_or(0, |module| module.module.identity_hash())
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn slag_module_is_source_text(module: *const SlagModule) -> i32 {
+    module
+        .as_ref()
+        .map_or(0, |module| i32::from(module.module.is_source_text()))
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn slag_module_is_synthetic(module: *const SlagModule) -> i32 {
+    module
+        .as_ref()
+        .map_or(0, |module| i32::from(module.module.is_synthetic()))
+}
+
+/// How many imports the module declares (`Module::GetModuleRequestsLength`).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn slag_module_request_count(module: *const SlagModule) -> usize {
+    module
+        .as_ref()
+        .map_or(0, |module| module.module.request_count())
+}
+
+/// The `index`-th request's specifier as a string value, written to `out`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn slag_module_request(
+    module: *const SlagModule,
+    index: usize,
+    out: *mut u64,
+) -> i32 {
+    let Some(module) = module.as_ref() else {
+        return 2;
+    };
+    match module.module.request_specifier(index) {
+        Some(specifier) => {
+            if !out.is_null() {
+                *out = Value::String(Handle::new(specifier)).bits();
+            }
+            0
+        }
+        None => 1,
+    }
+}
+
+/// Where `offset` into the module's source is, as a 0-based line and column.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn slag_module_source_offset_to_location(
+    module: *const SlagModule,
+    offset: i32,
+    line: *mut i32,
+    column: *mut i32,
+) -> i32 {
+    let Some(module) = module.as_ref() else {
+        return 2;
+    };
+    let location = module
+        .module
+        .source_offset_to_location(offset.max(0) as u32);
+    if !line.is_null() {
+        *line = location.line as i32;
+    }
+    if !column.is_null() {
+        *column = location.column as i32;
+    }
+    0
+}
+
+/// Name `module` for later resolutions of `specifier` (a string value), which
+/// is what `Module::InstantiateModule`'s host callback does with a resolved
+/// dependency.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn slag_module_register(
+    context: *mut SlagContext,
+    module: *const SlagModule,
+    specifier: u64,
+) -> i32 {
+    let Some(context) = context.as_ref() else {
+        return 2;
+    };
+    let Some(module) = module.as_ref() else {
+        return 2;
+    };
+    let Some(text) = Value::from_bits(specifier).as_string() else {
+        return 2;
+    };
+    let specifier = JsString::owned_of(&text);
+    let Ok(mut engine) = context.context.try_borrow_mut() else {
+        reentrant(context);
+        return 1;
+    };
+    match engine.register_module(&specifier.to_string_lossy(), &module.module) {
+        Ok(()) => 0,
+        Err(error) => {
+            record(context, error);
+            1
+        }
+    }
+}
+
+/// Link the module and everything the registry resolves for it
+/// (`Module::InstantiateModule`).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn slag_module_instantiate(
+    context: *mut SlagContext,
+    module: *const SlagModule,
+) -> i32 {
+    let Some(context) = context.as_mut() else {
+        return 2;
+    };
+    let Some(module) = module.as_ref() else {
+        return 2;
+    };
+    let linked = {
+        let Ok(mut engine) = context.context.try_borrow_mut() else {
+            reentrant(context);
+            return 1;
+        };
+        engine.instantiate_module(&module.module)
+    };
+    match linked {
+        Ok(()) => 0,
+        Err(error) => {
+            record(context, error);
+            1
+        }
+    }
+}
+
+/// Evaluate the module (`Module::Evaluate`); the value is a promise.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn slag_module_evaluate(
+    context: *mut SlagContext,
+    module: *const SlagModule,
+    out: *mut u64,
+) -> i32 {
+    let Some(context) = context.as_mut() else {
+        return 2;
+    };
+    let Some(module) = module.as_ref() else {
+        return 2;
+    };
+    let evaluated = {
+        let Ok(mut engine) = context.context.try_borrow_mut() else {
+            reentrant(context);
+            return 1;
+        };
+        engine.evaluate_module(&module.module)
+    };
+    match evaluated {
+        Ok(value) => {
+            if !out.is_null() {
+                *out = value.to_bits();
+            }
+            0
+        }
+        Err(error) => {
+            record(context, error);
+            1
+        }
+    }
+}
+
+/// The module's namespace object (`Module::GetModuleNamespace`).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn slag_module_namespace(
+    context: *mut SlagContext,
+    module: *const SlagModule,
+    out: *mut u64,
+) -> i32 {
+    let Some(context) = context.as_mut() else {
+        return 2;
+    };
+    let Some(module) = module.as_ref() else {
+        return 2;
+    };
+    let namespace = {
+        let Ok(mut engine) = context.context.try_borrow_mut() else {
+            reentrant(context);
+            return 1;
+        };
+        engine.module_namespace(&module.module)
+    };
+    match namespace {
+        Ok(value) => {
+            if !out.is_null() {
+                *out = value.to_bits();
+            }
+            0
+        }
+        Err(error) => {
+            record(context, error);
+            1
+        }
     }
 }
 

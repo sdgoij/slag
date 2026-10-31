@@ -341,6 +341,25 @@ buffer record: the four measured numbers are real, `heap_size_limit` is the
 largest `size_t` (the arena has no limit), the executable/global-handle numbers
 are zero because those stores do not exist, and `embedded_blob_size` is zero.
 
+### Modules
+
+`ScriptCompiler::CompileModule` parses a `Source` as a module in the entered
+realm, with the source's resource name as the module's specifier and the name a
+stack frame reports. The returned `Module` answers `GetStatus`, `GetException`,
+`GetModuleNamespace`, `GetIdentityHash`, `GetModuleRequestsLength`,
+`GetModuleRequest`, `IsSourceTextModule`/`IsSyntheticModule`, and
+`SourceOffsetToLocation` (0-based, the same conversion the Rust bridge's
+`Location` does).
+
+`Module::InstantiateModule(context, resolve)` walks the module graph: it asks
+the host's `ResolveModuleCallback` for each request, including the requests a
+resolved dependency declares, registers each answer under its specifier in the
+engine's module registry, and then links. A resolver that returns an empty
+handle leaves the error pending. `Evaluate` answers the evaluation promise, and
+the run drains the job queues so a synchronous body is `kEvaluated` when it
+returns. Modules are pinned records and are never freed, like scripts and
+templates.
+
 ### Buffers and typed arrays
 
 `BackingStore` is a handle to the engine's refcounted byte block, so a store
@@ -447,6 +466,9 @@ not a claim that gin itself links.
   `ClearWeak`/`IsWeak`; `AddGC*Callback` and their removals;
   `RequestGarbageCollectionForTesting` and `LowMemoryNotification`;
   `Isolate::GetHeapStatistics` and `HeapStatistics`.
+- `Source`/`ScriptCompiler::CompileModule` and the `Module` surface: status,
+  exception, namespace, requests, identity hash, kind predicates, the host
+  resolver through `InstantiateModule`, `Evaluate`, and `SourceOffsetToLocation`.
 - Handles and persistents as engine roots: a handle slot or a `Global` over an
   engine value retains it for that object's lifetime, and a facade pointer is
   never registered.
@@ -498,6 +520,12 @@ not a claim that gin itself links.
 - Heap statistics report `SIZE_MAX` for the limit and zeros for the executable,
   global-handle, and embedded-blob sizes, because this engine has none of those
   stores; the values are documented in the Rust bridge's `api::heap` module.
+- A module is never freed and `CreateSyntheticModule` is absent: the engine has
+  the record and the bridge has the synthetic form, but the facade's
+  evaluation-steps callback has no C++ shape yet. `CompileOptions` and
+  `NoCacheReason` are accepted and ignored (there is no code cache), and
+  `Module::GetModuleRequests` as a `FixedArray` is not exposed; the length and
+  index forms are.
 - `Platform` is a handle plus a message pump: `PumpMessageLoop` runs the
   isolate's queued jobs (microtasks, promise reactions, due timers) and answers
   whether it ran any. There are no host-posted platform tasks or task runners
@@ -574,3 +602,6 @@ only the handle, scrubs the stack, collects, and checks that the callback and
 its second pass ran, that the handle reads empty, and that `ClearWeak` keeps a
 value alive without calling back; it then checks the GC hooks around requested
 collections and their removal, and the heap statistics against a live buffer.
+The module block compiles a dependency and a main module, resolves the import
+through a file-scope callback, checks the request list, links, evaluates, and
+reads the export from the namespace.
