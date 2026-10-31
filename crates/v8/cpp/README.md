@@ -171,11 +171,12 @@ an array-index key and a string or symbol is itself, which is the reading V8's
 A handler callback may allocate and may read. The operation that called it holds
 the context, so the ordinary entry points refuse re-entry; instead the facade
 publishes the callback on `PropertyCallbackInfo::token()`, and `Object::New`,
-`Array::New`, `Object::Get`, `Object::Has`, `Object::Set`, and `Object::Delete`
-route through it while they are called on behalf of a running handler. That is
-what lets a getter answer with an object it built, a descriptor answer with its
-own descriptor, an enumerator answer with its array, and an accessor read another
-property of its holder.
+`Array::New`, `Object::Get`, `Object::Has`, `Object::Set`, `Object::Delete`,
+`Object::GetRealNamedProperty`, and the real-property predicates route through it
+while they are called on behalf of a running handler. That is what lets a getter
+answer with an object it built, a descriptor answer with its own descriptor, an
+enumerator answer with its array, and an accessor read another property of its
+holder, including the own-property forms.
 
 `SetHandler` also takes an `IndexedPropertyHandlerConfiguration`: a key that is
 an array index goes to those callbacks when they are installed, and to the named
@@ -285,11 +286,9 @@ not a claim that gin itself links.
 - Host callbacks receive `this` now (`FunctionCallbackInfo::This`), but the
   `Object` surface is still narrow: `GetIdentityHash`'s siblings are absent. An
   ordinary entry point cannot be re-entered from a callback, because the
-  operation that called the callback holds the context; `Object::New`,
-  `Array::New`, `Object::Get`, `Object::Has`, `Object::Set`, and `Object::Delete`
-  route through the window `PropertyCallbackInfo::token()` names while one is
-  running, and use the ordinary entry points otherwise. The real-property reads
-  (`GetRealNamedProperty` and the predicates) do not take the window.
+  operation that called the callback holds the context; every `Object` operation
+  the facade offers routes through the window `PropertyCallbackInfo::token()`
+  names while one is running, and uses the ordinary entry point otherwise.
 - An accessor installed with `SetAccessor` keeps its specification for the
   process: a template owns its specifications and is never freed, and
   `Object::SetAccessor` allocates one and holds it for the object's lifetime. The

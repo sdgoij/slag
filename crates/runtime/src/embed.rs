@@ -366,6 +366,26 @@ impl CallbackWindow {
         };
         object.0.delete_key(&key)
     }
+
+    /// The object's own property with no interceptor and no prototype walk (the
+    /// re-entrant counterpart of [`Context::get_own_property`]).
+    pub fn get_own_property(
+        &self,
+        object: JsValue,
+        key: JsValue,
+    ) -> Result<Option<JsValue>, JsError> {
+        get_own_property_with(crate::context::callback_agent(self.agent)?, object, key)
+    }
+
+    /// The kind of the object's own property (the re-entrant counterpart of
+    /// [`Context::own_property_kind`]).
+    pub fn own_property_kind(
+        &self,
+        object: JsValue,
+        key: JsValue,
+    ) -> Result<Option<OwnProperty>, JsError> {
+        own_property_kind_with(crate::context::callback_agent(self.agent)?, object, key)
+    }
 }
 
 /// Host-defined behavior the embedding API exposes. Each callback is
@@ -834,30 +854,7 @@ impl Context {
         object: JsValue,
         key: JsValue,
     ) -> Result<Option<JsValue>, JsError> {
-        let key_value = key.into_value();
-        let key = crate::context::to_property_key(self.agent_mut(), &key_value)?;
-        let Some(object) = object.as_object() else {
-            return Err(JsError::new(
-                ErrorKind::TypeError,
-                "value is not an object".into(),
-            ));
-        };
-        let Some(property) = object.0.ordinary_get_own_property(&key)? else {
-            return Ok(None);
-        };
-        match property.kind {
-            PropertyKind::Data { value, .. } => Ok(Some(JsValue(value))),
-            // An own accessor is authoritative, so the getter runs without a
-            // chain walk (`get_property_key` makes the same choice).
-            PropertyKind::Accessor {
-                get: Some(getter), ..
-            } if crux::value::is_callable(&getter) => {
-                let receiver = object.as_value().into_value();
-                crate::function::call_callback(self.agent_mut(), &getter, receiver, &[])
-                    .map(|value| Some(JsValue(value)))
-            }
-            PropertyKind::Accessor { .. } => Ok(Some(JsValue::undefined())),
-        }
+        get_own_property_with(self.agent_mut(), object, key)
     }
 
     /// The kind of `object`'s own property named by `key`, `None` when it has no
@@ -870,24 +867,7 @@ impl Context {
         object: JsValue,
         key: JsValue,
     ) -> Result<Option<OwnProperty>, JsError> {
-        let key_value = key.into_value();
-        let key = crate::context::to_property_key(self.agent_mut(), &key_value)?;
-        let Some(object) = object.as_object() else {
-            return Err(JsError::new(
-                ErrorKind::TypeError,
-                "value is not an object".into(),
-            ));
-        };
-        let Some(property) = object.0.ordinary_get_own_property(&key)? else {
-            return Ok(None);
-        };
-        let indexed = crux::object::array_index_of(&key).is_some();
-        Ok(Some(match (property.kind, indexed) {
-            (PropertyKind::Data { .. }, false) => OwnProperty::DataNamed,
-            (PropertyKind::Data { .. }, true) => OwnProperty::DataIndexed,
-            (PropertyKind::Accessor { .. }, false) => OwnProperty::CallbackNamed,
-            (PropertyKind::Accessor { .. }, true) => OwnProperty::CallbackIndexed,
-        }))
+        own_property_kind_with(self.agent_mut(), object, key)
     }
 
     /// A fresh dense array inheriting `%Array.prototype%` with one own data
@@ -1797,6 +1777,66 @@ fn realm_object_prototype(agent: &Agent) -> Result<Option<Handle<CruxObject>>, J
         .intrinsics
         .get("%Object.prototype%")
         .and_then(|value| value.as_object()))
+}
+
+/// The shared body of [`Context::get_own_property`] and
+/// [`CallbackWindow::get_own_property`].
+fn get_own_property_with(
+    agent: &mut Agent,
+    object: JsValue,
+    key: JsValue,
+) -> Result<Option<JsValue>, JsError> {
+    let key_value = key.into_value();
+    let key = crate::context::to_property_key(agent, &key_value)?;
+    let Some(object) = object.as_object() else {
+        return Err(JsError::new(
+            ErrorKind::TypeError,
+            "value is not an object".into(),
+        ));
+    };
+    let Some(property) = object.0.ordinary_get_own_property(&key)? else {
+        return Ok(None);
+    };
+    match property.kind {
+        PropertyKind::Data { value, .. } => Ok(Some(JsValue(value))),
+        // An own accessor is authoritative, so the getter runs without a chain
+        // walk (`get_property_key` makes the same choice).
+        PropertyKind::Accessor {
+            get: Some(getter), ..
+        } if crux::value::is_callable(&getter) => {
+            let receiver = object.as_value().into_value();
+            crate::function::call_callback(agent, &getter, receiver, &[])
+                .map(|value| Some(JsValue(value)))
+        }
+        PropertyKind::Accessor { .. } => Ok(Some(JsValue::undefined())),
+    }
+}
+
+/// The shared body of [`Context::own_property_kind`] and
+/// [`CallbackWindow::own_property_kind`].
+fn own_property_kind_with(
+    agent: &mut Agent,
+    object: JsValue,
+    key: JsValue,
+) -> Result<Option<OwnProperty>, JsError> {
+    let key_value = key.into_value();
+    let key = crate::context::to_property_key(agent, &key_value)?;
+    let Some(object) = object.as_object() else {
+        return Err(JsError::new(
+            ErrorKind::TypeError,
+            "value is not an object".into(),
+        ));
+    };
+    let Some(property) = object.0.ordinary_get_own_property(&key)? else {
+        return Ok(None);
+    };
+    let indexed = crux::object::array_index_of(&key).is_some();
+    Ok(Some(match (property.kind, indexed) {
+        (PropertyKind::Data { .. }, false) => OwnProperty::DataNamed,
+        (PropertyKind::Data { .. }, true) => OwnProperty::DataIndexed,
+        (PropertyKind::Accessor { .. }, false) => OwnProperty::CallbackNamed,
+        (PropertyKind::Accessor { .. }, true) => OwnProperty::CallbackIndexed,
+    }))
 }
 
 /// The shared body of `Context::define_accessor`, `Context::define_accessor_key`,
@@ -3699,6 +3739,19 @@ mod tests {
                 window
                     .has_property(object.as_value(), JsValue::string("nested"))
                     .unwrap()
+            );
+            assert_eq!(
+                window
+                    .get_own_property(object.as_value(), JsValue::string("nested"))
+                    .unwrap()
+                    .and_then(|value| value.as_number()),
+                Some(6.0)
+            );
+            assert_eq!(
+                window
+                    .own_property_kind(object.as_value(), JsValue::string("nested"))
+                    .unwrap(),
+                Some(OwnProperty::DataNamed)
             );
             assert!(
                 window

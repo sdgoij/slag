@@ -670,21 +670,22 @@ the header. `gin-shapes` reads the accessor from script (the getter builds the
 object it answers with), writes it from script, and checks the object form
 through C++.
 
-*The callback window reaches the reads (2026-10-31).* The last gap in the
-window was that a callback could allocate and set but not read: `Object::Get`,
-`Object::Has`, and `Object::Delete` took the ordinary entry points, which refuse
-re-entry. They now route through the token like `Object::Set`, over
-`CallbackWindow::get_property`, `has_property`, and `delete_property`, so an
-accessor can read another property of its holder, ask whether it has one, and
-delete one, all while the operation that called it holds the context. The
-real-property reads (`GetRealNamedProperty` and the predicates) still take the
-ordinary path, which is the only caveat left on the `Object` surface besides
-`GetIdentityHash`'s siblings. `gin-shapes` reads `tag` with `Get` and `Has`
-inside the accessor getter and deletes `scratch` inside the setter, and the
-script check sees the value the nested read returned.
+*The callback window reaches the own-property reads (2026-10-31).* The last gap in
+the window was that a callback could allocate, read, write, and delete but not
+ask the interceptor-free questions: `Object::GetRealNamedProperty` and the
+`HasReal*Property` predicates took the ordinary entry points, which refuse
+re-entry. They now route through the token as well, over
+`CallbackWindow::get_own_property` and `own_property_kind`, so a callback can ask
+what it owns without going through any handler. The shared bodies moved into free
+`get_own_property_with`/`own_property_kind_with` so `Context` and the window run
+the same code. `gin-shapes` reads and tests `tag` with both forms inside the
+accessor getter, and the runtime window test sets, reads, has, deletes, and
+re-checks a property through the window.
 
 With that, every callback a `NamedPropertyHandlerConfiguration` or an accessor
-carries is wired, and the window covers allocation, reads, writes, and deletes.
+carries is wired, and every `Object` operation the facade offers takes the window
+while a callback runs. The one remaining absence on the surface is
+`GetIdentityHash`'s siblings.
 
 The ABI shape is roughly a struct of up to seven C function pointers, the data
 pointer, and the flags, handed over once per template, with the return codes

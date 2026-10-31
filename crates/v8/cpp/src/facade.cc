@@ -13,6 +13,11 @@ namespace {
  * in the C ABI's root registry; a facade pointer slot does not. */
 thread_local std::deque<v8::HandleSlot> g_handles;
 
+/* The token of the host callback that is running, or null. A callback's property
+ * work goes through the window it names; outside one, the ordinary entry points
+ * run. Declared here because the own-property helper below reads it. */
+thread_local const void* g_callback_token = nullptr;
+
 std::size_t HandleMark() { return g_handles.size(); }
 
 v8::HandleSlot* HandleCreate(uint64_t value, bool rooted) {
@@ -45,8 +50,13 @@ int OwnPropertyKind(v8::Local<v8::Context> context, const v8::Object* object,
   auto* current = reinterpret_cast<v8::Context*>(
       static_cast<uintptr_t>(context.raw()));
   int32_t kind = -1;
-  if (slag_object_own_property_kind(current->slag(), v8::Raw(object), key,
-                                    &kind) != 0) {
+  const int status =
+      g_callback_token != nullptr
+          ? slag_callback_object_own_property_kind(
+                current->slag(), g_callback_token, v8::Raw(object), key, &kind)
+          : slag_object_own_property_kind(current->slag(), v8::Raw(object), key,
+                                          &kind);
+  if (status != 0) {
     return -1;
   }
   return kind;
@@ -73,8 +83,6 @@ v8::NamedPropertyHandlerConfiguration* Configuration(void* state) {
  * ABI reports it (`slag_callback_token`), and the allocation entry points admit
  * only a token that names a running callback, so a host's `Object::New` inside a
  * getter allocates through the operation that called the handler. */
-thread_local const void* g_callback_token = nullptr;
-
 class CallbackToken {
  public:
   CallbackToken() : previous_(g_callback_token) {
@@ -606,8 +614,13 @@ MaybeLocal<Value> Object::GetRealNamedProperty(Local<Context> context,
       static_cast<uintptr_t>(context.raw()));
   uint64_t out = 0;
   int32_t found = 0;
-  if (slag_object_get_own_key(current->slag(), Raw(this), key.raw(), &out,
-                              &found) != 0) {
+  const int status =
+      g_callback_token != nullptr
+          ? slag_callback_object_get_own_key(current->slag(), g_callback_token,
+                                             Raw(this), key.raw(), &out, &found)
+          : slag_object_get_own_key(current->slag(), Raw(this), key.raw(), &out,
+                                    &found);
+  if (status != 0) {
     return MaybeLocal<Value>();
   }
   if (found == 0) return MaybeLocal<Value>();

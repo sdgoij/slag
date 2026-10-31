@@ -973,6 +973,78 @@ pub unsafe extern "C" fn slag_callback_object_delete_key(
     }
 }
 
+/// The own property through a running callback (`v8::Object::GetRealNamedProperty`
+/// inside a handler).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn slag_callback_object_get_own_key(
+    context: *mut SlagContext,
+    token: *const c_void,
+    object: u64,
+    key: u64,
+    out: *mut u64,
+    found: *mut i32,
+) -> i32 {
+    let Some(context) = context.as_ref() else {
+        return 2;
+    };
+    let Some(window) = CallbackWindow::admit(token) else {
+        return 2;
+    };
+    match window.get_own_property(JsValue::from_bits(object), JsValue::from_bits(key)) {
+        Ok(answer) => {
+            if !found.is_null() {
+                *found = i32::from(answer.is_some());
+            }
+            if !out.is_null()
+                && let Some(value) = answer
+            {
+                *out = value.to_bits();
+            }
+            0
+        }
+        Err(error) => {
+            record(context, error);
+            1
+        }
+    }
+}
+
+/// The kind of the own property through a running callback
+/// (`v8::Object::HasRealNamedProperty` and its siblings inside a handler).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn slag_callback_object_own_property_kind(
+    context: *mut SlagContext,
+    token: *const c_void,
+    object: u64,
+    key: u64,
+    out: *mut i32,
+) -> i32 {
+    let Some(context) = context.as_ref() else {
+        return 2;
+    };
+    let Some(window) = CallbackWindow::admit(token) else {
+        return 2;
+    };
+    match window.own_property_kind(JsValue::from_bits(object), JsValue::from_bits(key)) {
+        Ok(kind) => {
+            if !out.is_null() {
+                *out = match kind {
+                    None => 0,
+                    Some(OwnProperty::DataNamed) => 1,
+                    Some(OwnProperty::DataIndexed) => 2,
+                    Some(OwnProperty::CallbackNamed) => 3,
+                    Some(OwnProperty::CallbackIndexed) => 4,
+                };
+            }
+            0
+        }
+        Err(error) => {
+            record(context, error);
+            1
+        }
+    }
+}
+
 /// How many internal fields `object` carries
 /// (`v8::Object::InternalFieldCount`); 0 for a non-object and for an object no
 /// template made.

@@ -202,6 +202,8 @@ struct HostAccessor {
   int reads = 0;
   int hits = 0;
   int deleted = 0;
+  int real_reads = 0;
+  int real_hits = 0;
   int last = 0;
 };
 
@@ -216,12 +218,21 @@ void HostAccessGet(v8::Local<v8::Name> property,
   if (answer.IsEmpty()) return;
   answer->Set(context, v8::String::NewFromUtf8Literal(isolate, "name"), property);
   answer->Set(context, v8::String::NewFromUtf8Literal(isolate, "data"), info.Data());
-  // A read of another property of the holder goes through the same window.
+  // A read of another property of the holder goes through the same window,
+  // including the real-property (interceptor-free) forms.
   v8::Local<v8::Name> tag = v8::String::NewFromUtf8Literal(isolate, "tag");
   ++host_accessor.reads;
   if (info.Holder()->Has(context, tag).FromMaybe(false)) {
     ++host_accessor.hits;
     answer->Set(context, tag, info.Holder()->Get(context, tag).ToLocalChecked());
+  }
+  if (info.Holder()->HasRealNamedProperty(context, tag).FromMaybe(false)) {
+    ++host_accessor.real_hits;
+  }
+  v8::Local<v8::Value> real;
+  if (info.Holder()->GetRealNamedProperty(context, tag).ToLocal(&real) &&
+      real->Int32Value(context).FromMaybe(-1) == 7) {
+    ++host_accessor.real_reads;
   }
   info.GetReturnValue().Set(answer);
 }
@@ -854,7 +865,8 @@ int main() {
             .ToLocal(&read) &&
         read->Int32Value(current).FromMaybe(-1) == 1;
     if (!accessor_read || host_accessor.gets == 0 || host_accessor.reads == 0 ||
-        host_accessor.hits == 0) {
+        host_accessor.hits == 0 || host_accessor.real_reads == 0 ||
+        host_accessor.real_hits == 0) {
       fprintf(stderr, "the accessor getter did not answer\n");
       ++failures;
     }
