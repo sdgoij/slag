@@ -21041,3 +21041,43 @@ Gates: fmt, clippy workspace `--all-targets -D warnings`, `cargo test
 annexB 1086, intl402 3365), corpus parity 0, `mean-jitGap` 8.08. The language
 sweep is the gate that matters here: it is where per-iteration binding
 semantics are pinned.
+
+## NULL (2026-10-31): the closure site record, and the chain-before-compile trap
+
+Two follow-ups from the closure profile above, both built, both rejected, and the
+second one produced the more useful result.
+
+**The site record does not pay in situ.** The plan was to move the site-static
+fields (params, body, both capture chains — 40 bytes, all GC-free and immutable)
+into one `Rc<FunctionSite>` shared per declaration site, so the per-closure
+record carries a pointer instead of 40 bytes: `EcmaFunction` 152 -> 112, and
+`Agent::register_ecma_function`'s insert is the largest single phase of closure
+creation. The standalone insert probe supports that: `scratch/insertbench`
+measures ~1.2 ns per byte today (152 B 205 ns, 96 B 140, 48 B 80). Implemented
+across 36 reader sites (rustc enumerates them; a `site.params` rewrite), with a
+`SiteKey { body, outer }` cache keyed by the body `Rc` identity and the chain's
+slice address. The result, 200k closures in one process, minima of 7 interleaved
+rounds: **75.9 ms before, 76.6 ms after** (medians 78.4 vs 77.3). No signal. The
+slowest form of the change, adding 24 bytes to the record and re-timing, was also
+inside the noise. So the probe's slope is a property of the probe (a 64-entry
+table, everything cache-resident) and does not transfer: in the real path the
+insert is one of about ten costs and the map stays small, so moving record bytes
+out of it buys nothing measurable. Reverted.
+
+**The per-iteration chain must stay out of the record's construction.** Folding
+`per_iteration_chain` into `register_function` (instead of the post-creation
+`ecma_function_mut` patch) looked free: it removes a second map lookup and a
+`Vec` clone, and measured -5.2% on a 2M-closure capture loop. It is not free. The
+patch exists because **a chain present when the body compiles selects the
+`LoadPerIteration` lowering**, and a generator's per-resume environment does not
+satisfy it: `generator::tests::generator_closure_per_iteration` (a closure
+created per iteration of `for (let i...)` inside a generator) starts returning
+the same `i` for all three closures, i.e. the closures share one binding. The
+committed behaviour (chain installed after `register_function` returns, empty at
+compile time) reads the binding through the capture context and is correct. That
+order is now documented on the field, because nothing in the old code explained
+it and the "obvious" cleanup is a miscompile. Reverted with it.
+
+Both were verified against the full gate set before reverting: fmt, clippy
+workspace `--all-targets -D warnings`, `cargo test --workspace` 5866 pass. The
+only durable output of the attempt is the trap above.

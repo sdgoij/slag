@@ -338,6 +338,15 @@ pub struct EcmaFunction {
     /// i...)` loop captures the per-iteration env; its references to those
     /// heads compile to static `LoadPerIteration` reads (resolved against
     /// the closure's own `lexical_env` at run time) instead of env walks.
+    ///
+    /// Deliberately EMPTY while the body compiles: the chain is installed
+    /// after `register_function` returns (see
+    /// `instantiate_function_with_resolved_source`). A chain present at
+    /// compile time selects the `LoadPerIteration` lowering, and a
+    /// generator's per-resume environment does not satisfy it, so closures
+    /// created per iteration inside a generator would share one binding
+    /// (`generator::tests::generator_closure_per_iteration`). Passing it into
+    /// `register_function` is the obvious cleanup and is a miscompile.
     pub per_iteration_chain: PerIterationChain,
     /// Cut 46: the function is a NAMED function expression (its own name is
     /// bound by the immutable self-binding scope wrapping the body) rather
