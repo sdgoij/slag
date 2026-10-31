@@ -20857,3 +20857,61 @@ a `this` slot has `frame_size == arity + 1`. Emitting the receiver write plus
 the `OrdinaryCallBindThis` choice (strict / object / nullish→global) in the
 caller's machine code — bailing only for a primitive receiver, which boxes —
 removes the helper round trip from every method call.
+
+## LANDED (2026-10-31): a receiver-tail leaf frame writes its own receiver
+
+The scoped follow-up from the plain-object chain note: `leaf_call_fill` ran once
+per method call because the aliased in-frame lane requires `frame_size == arity`
+and a body reading `this` has one slot more. Every method call paid an FFI round
+trip that rebuilt a frame differing from the argument region in exactly one slot.
+
+The probe now also records `LeafInlineInfo::this_tail`: the frame needs no fill
+at all when `this_slot == arity` and the *fillable* length is `arity + 1`, so the
+compiled hit path stores the receiver at `args_ptr + arity*8` and calls the entry
+in-frame. Both lowerings carry the lane (the per-step `emit_call` and the opt
+tier's `emit_leaf_call`). Only a heap receiver takes it: object and function
+tags are adjacent, so one biased compare (`(bits >> 44) - ObjectPattern <= 1`)
+covers both, and they bind as themselves under strict and sloppy alike. Every
+other receiver (a primitive, which a sloppy callee has to box, or a nullish one,
+which becomes the global object) falls to the fill lane, which runs the full
+`OrdinaryCallBindThis` exactly as before.
+
+Two things had to be right, both found by measurement:
+
+- **The frame is not the last slot.** The receiver's address is
+  `args_ptr + arity*8`, not `args_ptr + (frame_size-1)*8`. The probe reported
+  `size=2 arity=0 this_slot=Some(0)` for `Item.prototype.sum = function () {
+  return this.x + this.y; }`, which is impossible unless something grows the
+  frame past the named bindings. It is `alloc_scratch_slot`: the register
+  lowering spills the accumulator into a hidden slot at `frame_size`. So the
+  frame has a *fillable* prefix and hidden scratch slots, and `ScopeInfo` now
+  records the boundary (`fill_len`; hidden slots are written before read, so an
+  entry fill can skip them). `LeafInlineInfo` carries `fill_len` for the same
+  reason, `fill_leaf_frame` stops at it, and the tail lane's room check charges
+  `(frame_size - arity)` slots, not one. Without this, the lane covered only
+  bodies whose lowering happened to spill nothing, and the corpus row that
+  needed it (`construct_churn`) still filled.
+- **A ClifValue bound inside a sibling block does not dominate.** `emit_call`
+  re-binds `frame_size_64` inside the aliased block; using that binding thirty
+  lines later compiled to `uses value v320 from non-dominating inst336` and
+  cranelift refused the whole body. Three corpus rows fell to ~2x (the
+  interpreter) until the shadowing was found. `emit_call` is the place this
+  happens: check which `frame_size_64`/`stack_ptr`/`buf_end` binding is in
+  scope before reusing one in a new block.
+
+Measured. The synthetic shape (an object passed through a parameter, so the
+inliner cannot splice the call away, `s += o.inc(1)` at 2M, one process,
+minima of 3-5): **53.1-57.7 ms -> 42.2-42.8 ms, -20%**, i.e. 26.8 -> 21.2
+ns/call; the old binary counts `leaf_call_fill` 1,999,995 times, the new one 0.
+The corpus census is where the fill went: `leaf_call_fill` was 3,498,814 per
+`calls/construct_churn` run and is now **0 in every corpus row**. Corpus A/B
+(five rounds, interleaved, minima per row): `construct_churn` 61.7 -> 56.8 ms
+(-7.9%, the absolute 4.9 ms), total 1889.8 -> 1879.6 ms (-0.54%); every other
+row moved inside its own noise band (+/-5%), including the rows the earlier
+dominance bug had doubled.
+
+Gates: fmt, clippy workspace `--all-targets -D warnings`, `cargo test
+--workspace` 5866 pass / 0 fail, four sweeps at 100% (language 23726, built-ins
+23821, annexB 1086, intl402 3365; the first language run reported 3 hangs and
+the rerun of the same binary was clean, so they are this machine under load),
+corpus parity 0, `mean-jitGap` 8.40.

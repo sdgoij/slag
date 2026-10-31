@@ -5086,6 +5086,7 @@ fn emit_leaf_room_check(
     args_ptr: ClifValue,
     argc: ClifValue,
     stack_usage: ClifValue,
+    extra_bytes: i64,
 ) -> ClifValue {
     let buf_end = builder.ins().load(
         types::I64,
@@ -5097,6 +5098,7 @@ fn emit_leaf_room_check(
     let args_top = builder.ins().iadd(args_ptr, argc_bytes);
     let stack_bytes = builder.ins().imul_imm_s(stack_usage, 8);
     let top_needed = builder.ins().iadd(args_top, stack_bytes);
+    let top_needed = builder.ins().iadd_imm_s(top_needed, extra_bytes);
     builder
         .ins()
         .icmp(IntCC::UnsignedLessThanOrEqual, top_needed, buf_end)
@@ -5398,7 +5400,7 @@ fn emit_leaf_call(
     let not_aliased = builder.create_block();
     builder.ins().brif(aliased, room, &[], not_aliased, &[]);
     builder.switch_to_block(room);
-    let fits = emit_leaf_room_check(builder, abi, args_ptr, argc, stack_usage);
+    let fits = emit_leaf_room_check(builder, abi, args_ptr, argc, stack_usage, 0);
     let inline = builder.create_block();
     builder.ins().brif(fits, inline, &[], cert, &[]);
     builder.switch_to_block(inline);
@@ -5417,6 +5419,78 @@ fn emit_leaf_call(
     // The non-aliased hit: rebuild the frame from the recorded descriptor
     // (`leaf_call_fill`, no `leaf_lookup`), then call the cached entry above it.
     builder.switch_to_block(not_aliased);
+    // A frame that is the argument region plus ONE receiver slot (`this_tail`:
+    // `frame_size == arity + 1` with `this` at `arity`, all params passed)
+    // needs no fill at all — the machine code writes the bound receiver into
+    // that slot and calls in-frame. An object or function receiver binds as
+    // itself under both strictness modes; any other receiver keeps the fill
+    // lane, which performs the full `OrdinaryCallBindThis`.
+    let this_tail = builder.ins().load(
+        types::I32,
+        MemFlagsData::new(),
+        cache,
+        Offset32::new(leaf_inline_offset(std::mem::offset_of!(LeafInlineInfo, this_tail)) as i32),
+    );
+    let this_tail = builder.ins().icmp_imm_u(IntCC::NotEqual, this_tail, 0);
+    let arity_64 = builder.ins().uextend(types::I64, arity);
+    let argc_ge_arity = builder
+        .ins()
+        .icmp(IntCC::UnsignedLessThanOrEqual, arity_64, argc);
+    let tail = builder.ins().band(this_tail, argc_ge_arity);
+    let tail_check = builder.create_block();
+    let fill_check = builder.create_block();
+    builder.ins().brif(tail, tail_check, &[], fill_check, &[]);
+    builder.switch_to_block(tail_check);
+    let receiver_tag = builder.ins().ushr_imm_u(this, 44);
+    let receiver_off = builder.ins().iadd_imm_s(
+        receiver_tag,
+        -((crux::TAG_PREFIX >> 44) as i64 | crux::TAG_OBJECT as i64),
+    );
+    let receiver_ok = builder
+        .ins()
+        .icmp_imm_u(IntCC::UnsignedLessThanOrEqual, receiver_off, 1);
+    // The frame starts at the arguments: an extra slot for the receiver, plus
+    // any hidden scratch slots past it. Neither check writes, so they share
+    // one branch.
+    let buf_end = builder.ins().load(
+        types::I64,
+        MemFlagsData::new(),
+        abi.vm,
+        Offset32::new(std::mem::offset_of!(JitCallContext, buf_end) as i32),
+    );
+    let argc_bytes = builder.ins().imul_imm_s(argc, 8);
+    let args_top = builder.ins().iadd(args_ptr, argc_bytes);
+    let stack_bytes = builder.ins().imul_imm_s(stack_usage, 8);
+    let tail_extra = builder.ins().isub(frame_size_64, arity_64);
+    let tail_extra_bytes = builder.ins().imul_imm_s(tail_extra, 8);
+    let top_needed = builder.ins().iadd(args_top, stack_bytes);
+    let top_needed = builder.ins().iadd(top_needed, tail_extra_bytes);
+    let fits = builder
+        .ins()
+        .icmp(IntCC::UnsignedLessThanOrEqual, top_needed, buf_end);
+    let tail_ok = builder.ins().band(receiver_ok, fits);
+    let tail_inline = builder.create_block();
+    builder
+        .ins()
+        .brif(tail_ok, tail_inline, &[], fill_check, &[]);
+    builder.switch_to_block(tail_inline);
+    let frame_bytes = builder.ins().imul_imm_s(frame_size_64, 8);
+    let receiver_bytes = builder.ins().imul_imm_s(arity_64, 8);
+    let receiver_slot = builder.ins().iadd(args_ptr, receiver_bytes);
+    builder
+        .ins()
+        .store(MemFlagsData::new(), this, receiver_slot, Offset32::new(0));
+    let stack_ptr = builder.ins().iadd(args_ptr, frame_bytes);
+    emit_leaf_call_tail(
+        builder,
+        abi,
+        cached_entry,
+        args_ptr,
+        stack_ptr,
+        value,
+        merge,
+    );
+    builder.switch_to_block(fill_check);
     let fill_ok = builder.ins().load(
         types::I32,
         MemFlagsData::new(),
@@ -5532,7 +5606,7 @@ fn emit_leaf_call(
         cache,
         Offset32::new(leaf_inline_offset(std::mem::offset_of!(LeafInlineInfo, stack_usage)) as i32),
     );
-    let fits = emit_leaf_room_check(builder, abi, args_ptr, argc, stack_usage);
+    let fits = emit_leaf_room_check(builder, abi, args_ptr, argc, stack_usage, 0);
     let env_inline_call = builder.create_block();
     builder.ins().brif(fits, env_inline_call, &[], cert, &[]);
     builder.switch_to_block(env_inline_call);

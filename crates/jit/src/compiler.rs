@@ -5430,6 +5430,82 @@ impl<'a> Lowerer<'a> {
         // (`fill_ok`). A frame wider than the record's TDZ mask keeps the old
         // probe fallback rather than mis-filling.
         self.builder.switch_to_block(not_aliased);
+        // A frame that is the argument region plus ONE receiver slot
+        // (`this_tail`: `frame_size == arity + 1` with `this` at `arity`, all
+        // params passed) needs no fill at all — the machine code writes the
+        // bound receiver into that slot and calls in-frame, so the common
+        // method call never reaches `leaf_call_fill`. An object or function
+        // receiver binds as itself under both strictness modes; anything else
+        // (a primitive, which a sloppy callee boxes, or a nullish one, which
+        // becomes the global object) keeps the fill lane.
+        let this_tail = self.builder.ins().load(
+            types::I32,
+            MemFlagsData::new(),
+            cache,
+            Offset32::new(
+                leaf_inline_offset(std::mem::offset_of!(LeafInlineInfo, this_tail)) as i32,
+            ),
+        );
+        let this_tail = self.builder.ins().icmp_imm_u(IntCC::NotEqual, this_tail, 0);
+        let arity_64 = self.builder.ins().uextend(types::I64, arity);
+        let argc_ge_arity = self
+            .builder
+            .ins()
+            .icmp(IntCC::UnsignedLessThanOrEqual, arity_64, argc);
+        let tail = self.builder.ins().band(this_tail, argc_ge_arity);
+        let tail_check = self.builder.create_block();
+        let fill_check = self.builder.create_block();
+        self.builder
+            .ins()
+            .brif(tail, tail_check, &[], fill_check, &[]);
+        self.builder.switch_to_block(tail_check);
+        // Object and function tags are adjacent, so one biased compare covers
+        // both: `(bits >> 44) - ObjectPattern <= 1`.
+        let receiver_tag = self.builder.ins().ushr_imm_u(this, 44);
+        let receiver_off = self.builder.ins().iadd_imm_s(
+            receiver_tag,
+            -((crux::TAG_PREFIX >> 44) as i64 | crux::TAG_OBJECT as i64),
+        );
+        let receiver_ok =
+            self.builder
+                .ins()
+                .icmp_imm_u(IntCC::UnsignedLessThanOrEqual, receiver_off, 1);
+        // The frame starts at the arguments: an extra slot for the receiver,
+        // plus any hidden scratch slots past it. Neither check writes, so they
+        // share one branch.
+        let buf_end = self.builder.ins().load(
+            types::I64,
+            MemFlagsData::new(),
+            ctx,
+            Offset32::new(std::mem::offset_of!(JitCallContext, buf_end) as i32),
+        );
+        let argc_bytes = self.builder.ins().imul_imm_s(argc, 8);
+        let args_top = self.builder.ins().iadd(args_ptr, argc_bytes);
+        let stack_bytes = self.builder.ins().imul_imm_s(stack_usage, 8);
+        let tail_frame_size_64 = self.builder.ins().uextend(types::I64, frame_size);
+        let tail_extra = self.builder.ins().isub(tail_frame_size_64, arity_64);
+        let tail_extra_bytes = self.builder.ins().imul_imm_s(tail_extra, 8);
+        let top_needed = self.builder.ins().iadd(args_top, stack_bytes);
+        let top_needed = self.builder.ins().iadd(top_needed, tail_extra_bytes);
+        let fits = self
+            .builder
+            .ins()
+            .icmp(IntCC::UnsignedLessThanOrEqual, top_needed, buf_end);
+        let tail_ok = self.builder.ins().band(receiver_ok, fits);
+        let tail_inline = self.builder.create_block();
+        self.builder
+            .ins()
+            .brif(tail_ok, tail_inline, &[], fill_check, &[]);
+        self.builder.switch_to_block(tail_inline);
+        let tail_frame_bytes = self.builder.ins().imul_imm_s(tail_frame_size_64, 8);
+        let receiver_bytes = self.builder.ins().imul_imm_s(arity_64, 8);
+        let receiver_slot = self.builder.ins().iadd(args_ptr, receiver_bytes);
+        self.builder
+            .ins()
+            .store(MemFlagsData::new(), this, receiver_slot, Offset32::new(0));
+        let stack_ptr = self.builder.ins().iadd(args_ptr, tail_frame_bytes);
+        self.emit_leaf_call_tail(cached_entry, args_ptr, stack_ptr, pre_call_sp, merge)?;
+        self.builder.switch_to_block(fill_check);
         let fill_ok = self.builder.ins().load(
             types::I32,
             MemFlagsData::new(),

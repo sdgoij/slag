@@ -660,6 +660,7 @@ mod tests {
     fn scope(frame_size: usize) -> ScopeInfo {
         ScopeInfo {
             frame_size,
+            fill_len: frame_size,
             arity: 0,
             slots: Default::default(),
             tdz_store: vec![false; frame_size],
@@ -6319,6 +6320,90 @@ run(); run(); run(); run(); run(); run(); run(); run(); run();";
         assert!(
             probes <= 200,
             "the probe must run only while the site warms up ({probes} probes): a per-visit re-probe would count ~100K"
+        );
+    }
+
+    #[test]
+    fn installed_jit_a_receiver_tail_frame_calls_without_a_fill() {
+        // A leaf whose frame is the params plus the receiver
+        // (`frame_size == arity + 1`, `this` at `arity`) used to need
+        // `leaf_call_fill` on every call: the frame is not the argument
+        // region, so the aliased in-frame lane refused it. Nothing in that
+        // frame needs building except the receiver, so the compiled hit path
+        // now writes the receiver itself and calls in-frame. Counting the
+        // fill isolates the fix: without it the warm site counts ~100K fills.
+        //
+        // The receiver is passed through a parameter so the call site has no
+        // static callee and the inliner cannot splice the body into the loop,
+        // which would hide the call lane entirely.
+        static PROBE_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        static FILL_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        extern "C" fn counting_leaf_call_probe(
+            ctx: *mut c_void,
+            callee: u64,
+            this: u64,
+            args: *mut u64,
+            argc: u64,
+            site: u64,
+        ) -> u64 {
+            PROBE_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            (runtime::jit::JIT_SLOW_PATHS.leaf_call_probe)(ctx, callee, this, args, argc, site)
+        }
+        extern "C" fn counting_leaf_call_fill(
+            ctx: *mut c_void,
+            callee: u64,
+            this: u64,
+            args: *mut u64,
+            argc: u64,
+            site: u64,
+        ) -> u64 {
+            FILL_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            (runtime::jit::JIT_SLOW_PATHS.leaf_call_fill)(ctx, callee, this, args, argc, site)
+        }
+        let mut helpers = runtime_helpers();
+        helpers.leaf_call_probe = Some(counting_leaf_call_probe);
+        helpers.leaf_call_fill = Some(counting_leaf_call_fill);
+
+        let source = "var counter = { v: 0, inc: function (x) { this.v += x; return this.v; } };\n\
+                      function run(o) {\n\
+                        var s = 0;\n\
+                        for (var i = 0; i < 100000; i++) { s += o.inc(1); }\n\
+                        return s;\n\
+                      }\n\
+                      run(counter);";
+        let interp = {
+            let mut agent = runtime::Agent::new();
+            agent.initialize_host_defined_realm().expect("realm");
+            agent.run_script(source).expect("interp runs")
+        };
+
+        extern "C" fn noop_drop(_cache: *mut c_void) {}
+        let mut agent = runtime::Agent::new();
+        agent.initialize_host_defined_realm().expect("realm");
+        let mut cache = JitCache::new(helpers).expect("isa");
+        agent.jit_hook = Some(runtime::jit::JitHook {
+            cache: (&mut cache as *mut JitCache) as *mut c_void,
+            lookup: jit_cache_lookup,
+            drop_cache: noop_drop,
+            helpers: &runtime::jit::JIT_SLOW_PATHS,
+        });
+        let value = agent.run_script(source).expect("jit runs");
+        let compiled = cache.compiled_count();
+        agent.jit_hook = None;
+        assert_eq!(
+            value, interp,
+            "the receiver write must bind exactly as the interpreter's frame fill"
+        );
+        assert!(compiled >= 2, "{compiled} bodies must compile");
+        let probes = PROBE_CALLS.load(std::sync::atomic::Ordering::Relaxed);
+        let fills = FILL_CALLS.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            probes >= 1,
+            "the site must probe once, which is what records the frame shape"
+        );
+        assert!(
+            fills <= 5,
+            "the warm site must write the receiver itself, not fill the frame ({fills} fills)"
         );
     }
 

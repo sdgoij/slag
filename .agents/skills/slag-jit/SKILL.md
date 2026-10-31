@@ -551,6 +551,22 @@ verdict when it is at rest. Traps:
   is what let the hit path drop the `Rc` clone — and makes the probe and the
   hit path bind the identical global. Every `JitCallContext { … }` literal
   (three in `ir.rs`/`jit.rs`, four in the jit crate's tests) needs the field.
+- **A frame's `this` slot is where the RECEIVER goes, and the frame is not the
+  last slot.** `LeafInlineInfo::this_tail` admits the fill-free shape
+  (`this_slot == arity` and `fill_len == arity + 1`): the machine code stores the
+  receiver at `args_ptr + arity*8` and calls in-frame, so a method call stops
+  paying `leaf_call_fill` (`calls/construct_churn` 61.7 -> 56.8 ms, a 2M-call
+  method loop -20%). Two traps. First, `ScopeInfo::frame_size` can exceed the
+  named bindings: `alloc_scratch_slot` (the register lowering's accumulator
+  spill) and `alloc_hoist_slot` append hidden slots, and they are written before
+  read, hence the separate `fill_len` boundary — fill and TDZ-mask by index
+  `0..fill_len`, never `0..frame_size`, and compute the receiver's address from
+  `arity`, not `frame_size - 1`. Second, `emit_call` re-binds
+  `frame_size_64`/`stack_ptr`/`buf_end` inside the aliased block; reusing one of
+  those bindings in a new block is a cranelift VERIFIER error that refuses the
+  whole body (`uses value from non-dominating inst`), which silently drops that
+  body to the interpreter and doubles whole corpus rows. Type checking will not
+  catch it: bind fresh values per block.
 - **An environment-using leaf gets the env lane, not `call_slow` (G13).** A
   body reading a captured binding lowers to `LoadContextSlot`, which is
   leaf-safe, so it IS `leaf_inline` — but the machine code cannot call it

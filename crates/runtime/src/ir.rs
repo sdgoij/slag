@@ -1716,9 +1716,19 @@ pub struct CatchHandler {
 /// is `None` and the body uses the environment machinery unchanged.
 #[derive(Debug, Clone)]
 pub struct ScopeInfo {
-    /// Total frame slots for named bindings. Params occupy slots `0..arity`
-    /// (in source order), `var` bindings follow in first-declaration order.
+    /// Total frame slots, including the hidden scratch slots the register
+    /// lowering appends (see [`ScopeInfo::fill_len`]). Params occupy slots
+    /// `0..arity` (in source order), `var` bindings follow in
+    /// first-declaration order.
     pub frame_size: usize,
+    /// How many leading frame slots an entry fill must initialize (params,
+    /// `var`/lexical bindings, `this`, `arguments`). The slots in
+    /// `fill_len..frame_size` are hidden scratch slots (`alloc_scratch_slot`,
+    /// `alloc_hoist_slot`), which are WRITTEN BEFORE READ within one run of
+    /// the body, so a caller that leaves them untouched is unobservable. A
+    /// leaf call uses this to tell "the frame is just params plus `this`"
+    /// from "the frame has slots that need building".
+    pub fill_len: usize,
     /// The parameter count: `setup_frame` copies only this many arguments
     /// (extra call arguments are ignored per spec 10.2.11 — copying by
     /// `frame_size` would let them land in `var` slots).
@@ -19525,8 +19535,10 @@ impl Compiler {
     /// Reserve a fresh hidden frame slot beyond the named bindings (gap-close
     /// M6 slice 2): `Compiler.scope` is owned, and the frame is sized from
     /// `ScopeInfo::frame_size` only when a compiled body runs, so growing it
-    /// mid-compile is sound (the slot initializes `undefined`; hidden slots
-    /// never carry the TDZ marker and never appear in leaf bodies).
+    /// mid-compile is sound (the slot is written before the loop reads it;
+    /// hidden slots never carry the TDZ marker, never appear in leaf bodies
+    /// and are outside `ScopeInfo::fill_len`, so an entry fill leaves them
+    /// alone).
     fn alloc_hoist_slot(&mut self) -> usize {
         let scope = self
             .scope
@@ -25746,7 +25758,8 @@ fn load_operand(ops: &mut Vec<LeafOp>, operand: RegOperand) -> bool {
 /// lowering must keep across an op that reuses the accumulator (the
 /// `a[k & M] = (k & N)` key). Hidden slots are never named and never carry the
 /// TDZ marker, so writing one is unobservable; they grow the frame by one word
-/// per spill site.
+/// per spill site and stay outside `ScopeInfo::fill_len` (the spill stores the
+/// slot before anything reads it).
 fn alloc_scratch_slot(scope: &mut ScopeInfo) -> usize {
     let slot = scope.frame_size;
     scope.frame_size += 1;
@@ -27380,6 +27393,7 @@ fn analyze_scope(function: &EcmaFunction) -> Option<ScopeInfo> {
     };
     Some(ScopeInfo {
         frame_size,
+        fill_len: frame_size,
         arity,
         slots: scan.slots,
         tdz_store: scan.tdz,
@@ -31080,6 +31094,7 @@ fn analyze_script_scope(
         script_slots_allows(stmts, &certified, &var_certs).then(|| ScriptSlots {
             scope: ScopeInfo {
                 frame_size: scan.next_slot,
+                fill_len: scan.next_slot,
                 arity: 0,
                 slots: scan.slots,
                 tdz_store: scan.tdz,

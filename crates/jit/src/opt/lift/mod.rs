@@ -3503,6 +3503,7 @@ mod tests {
     fn scope(frame_size: usize) -> ScopeInfo {
         ScopeInfo {
             frame_size,
+            fill_len: frame_size,
             arity: 0,
             slots: Default::default(),
             tdz_store: vec![false; frame_size],

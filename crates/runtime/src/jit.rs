@@ -110,12 +110,22 @@ pub struct LeafInlineInfo {
     pub entry: u64,
     /// The leaf's maximum value-stack depth above its frame, in slots.
     pub stack_usage: u64,
-    /// The leaf's frame size (params + vars + TDZ slots).
+    /// The leaf's frame size (params + vars + TDZ slots + hidden scratch
+    /// slots): the region the compiled lane carves above the arguments.
     pub frame_size: u32,
+    /// How many leading frame slots the entry fill initializes. Slots in
+    /// `fill_len..frame_size` are hidden scratch slots the body writes before
+    /// reading, so a receiver-only lane can skip them.
+    pub fill_len: u32,
     /// The leaf's parameter count.
     pub arity: u32,
     /// G14: the leaf's `this` slot, or [`NO_THIS_SLOT`] when it has none.
     pub this_slot: u32,
+    /// 1 when the fillable frame is the argument region plus exactly one slot
+    /// — `fill_len == arity + 1` with the `this` slot at `arity` — so the
+    /// compiled hit path writes the receiver itself and calls in-frame
+    /// instead of rebuilding the frame through `leaf_call_fill`.
+    pub this_tail: u32,
     /// G14: whether the leaf is strict (its `this` binding keeps the
     /// receiver, so no nullish→global coercion applies).
     pub strict: u32,
@@ -156,8 +166,10 @@ impl LeafInlineInfo {
             entry: 0,
             stack_usage: 0,
             frame_size: 0,
+            fill_len: 0,
             arity: 0,
             this_slot: NO_THIS_SLOT,
+            this_tail: 0,
             strict: 0,
             tdz_mask: 0,
             fill_ok: 0,
@@ -3332,11 +3344,18 @@ fn leaf_fill_info(
     needs_lexical_env: bool,
 ) -> LeafInlineInfo {
     let this_slot = scope.this_slot.map_or(NO_THIS_SLOT, |slot| slot as u32);
-    let (tdz_mask, fill_ok) = if scope.frame_size > TDZ_MASK_SLOTS {
+    // A fillable frame of the params plus the receiver and nothing else needs
+    // no fill: its slots ARE the argument region plus one slot the compiled
+    // hit path writes itself (see `LeafInlineInfo::this_tail`). Slots past
+    // `fill_len` are hidden scratch the body writes before reading, so they do
+    // not disqualify the shape.
+    let this_tail =
+        u32::from(scope.this_slot == Some(scope.arity) && scope.fill_len == scope.arity + 1);
+    let (tdz_mask, fill_ok) = if scope.fill_len > TDZ_MASK_SLOTS {
         (0, 0)
     } else {
         let mut tdz_mask = 0;
-        for slot in 0..scope.frame_size {
+        for slot in 0..scope.fill_len {
             if scope.tdz_store.get(slot).copied().unwrap_or(false) {
                 tdz_mask |= 1u64 << slot;
             }
@@ -3354,8 +3373,10 @@ fn leaf_fill_info(
         entry,
         stack_usage: stack_usage as u64,
         frame_size: scope.frame_size as u32,
+        fill_len: scope.fill_len as u32,
         arity: scope.arity as u32,
         this_slot,
+        this_tail,
         strict: u32::from(strict),
         tdz_mask,
         fill_ok,
@@ -3373,13 +3394,15 @@ fn leaf_fill_info(
 /// cannot do, so it refuses), check the frame + working area fits in the
 /// caller's buffer, then write the slots: params copied from the arguments
 /// (missing ones `undefined`), `var` slots `undefined`, lexical slots the TDZ
-/// marker, the `this` slot the bound receiver. The aliased frame IS the
-/// argument region, so only its working area is checked and nothing is
-/// written. Shared by `leaf_call_probe` (a site's first visit, which fills from
-/// the scope) and `leaf_call_fill` (the compiled hit path, which fills from the
-/// recorded descriptor), so both produce the identical frame and reject on the
-/// identical conditions. Returns false when the receiver cannot be bound or the
-/// area does not fit.
+/// marker, the `this` slot the bound receiver. Only the `fill_len` leading
+/// slots are written: the hidden scratch slots past them are written before
+/// read by the body itself, so leaving them untouched is unobservable. The
+/// aliased frame IS the argument region, so only its working area is checked
+/// and nothing is written. Shared by `leaf_call_probe` (a site's first visit,
+/// which fills from the scope) and `leaf_call_fill` (the compiled hit path,
+/// which fills from the recorded descriptor), so both produce the identical
+/// frame and reject on the identical conditions. Returns false when the
+/// receiver cannot be bound or the area does not fit.
 #[inline]
 fn fill_leaf_frame(
     info: &LeafInlineInfo,
@@ -3391,6 +3414,7 @@ fn fill_leaf_frame(
     global_bits: u64,
 ) -> bool {
     let frame_size = info.frame_size as usize;
+    let fill_len = info.fill_len as usize;
     let arity = info.arity as usize;
     let bound_this = if info.this_slot == NO_THIS_SLOT {
         0
@@ -3423,7 +3447,7 @@ fn fill_leaf_frame(
     // the duration of these synchronous helpers.
     if !aliased {
         let frame = args_top as *mut u64;
-        for slot in 0..frame_size {
+        for slot in 0..fill_len {
             let value = if slot as u32 == info.this_slot {
                 bound_this
             } else if slot < arity {
@@ -8296,6 +8320,7 @@ mod tests {
     fn scope_info(frame_size: usize) -> crate::ir::ScopeInfo {
         crate::ir::ScopeInfo {
             frame_size,
+            fill_len: frame_size,
             arity: 0,
             slots: Default::default(),
             tdz_store: vec![false; frame_size],
