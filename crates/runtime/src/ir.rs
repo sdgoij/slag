@@ -28243,8 +28243,16 @@ struct FastScopeScan {
     /// The lexical bindings declared inside an open loop body: a closure
     /// capturing one bails the body to the env path (the per-iteration
     /// freshness of a body-block scope is not flattenable into the capture
-    /// context).
+    /// context). A plain `for` HEAD binding is not one of these even when the
+    /// `for` sits inside another loop's body: the head has its own
+    /// per-iteration handling (`for_head_lexicals` + the compiler's
+    /// `has_context` arm), which is why `scanning_for_head` suppresses this
+    /// marking. The for-in/for-of arms allocate their heads themselves and so
+    /// never reach the marking at all.
     loop_body_lexicals: HashSet<crux::AtomId>,
+    /// Set while the scan is declaring a plain `for` head, so a lexical head
+    /// inside another loop's body is not mistaken for a body-block lexical.
+    scanning_for_head: bool,
     /// Every name bound anywhere in the body (see `collect_body_bindings`):
     /// the closure-capture check tests references against this complete
     /// set, not the incremental `slots`.
@@ -28462,7 +28470,16 @@ impl FastScopeScan {
                 let init_ok = match init {
                     None => true,
                     Some(ForInit::Expr(expr)) => self.expr(expr, depth),
-                    Some(ForInit::VarDecl { kind, decls }) => self.decls(kind, decls, depth),
+                    Some(ForInit::VarDecl { kind, decls }) => {
+                        // A head declaration is a loop-head binding, not a
+                        // body-block lexical, even when this `for` sits
+                        // inside another loop's body.
+                        let outer = self.scanning_for_head;
+                        self.scanning_for_head = true;
+                        let ok = self.decls(kind, decls, depth);
+                        self.scanning_for_head = outer;
+                        ok
+                    }
                 };
                 self.open_loop_body_depths.push(depth + 1);
                 let result = !pattern_head_captured
@@ -28995,11 +29012,12 @@ impl FastScopeScan {
             // iteration (the body block re-creates each iteration): a
             // closure capturing it must stay on the env path — the
             // certified per-iteration machinery covers only the
-            // loop-head names.
-            if self
-                .open_loop_body_depths
-                .iter()
-                .any(|&body_depth| depth >= body_depth)
+            // loop-head names. A plain `for` head is one of those names.
+            if !self.scanning_for_head
+                && self
+                    .open_loop_body_depths
+                    .iter()
+                    .any(|&body_depth| depth >= body_depth)
             {
                 self.loop_body_lexicals.insert(name);
             }

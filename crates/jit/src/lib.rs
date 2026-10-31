@@ -7327,6 +7327,40 @@ run(); run(); run(); run(); run(); run(); run(); run(); run();";
     }
 
     #[test]
+    fn installed_jit_per_iteration_head_inside_another_loop() {
+        // A plain `for` head is a loop-HEAD binding, not a body-block lexical,
+        // even when the `for` sits inside another loop's body. The scan used
+        // to mark it by nesting depth (the for-in/for-of arms allocate their
+        // heads themselves and never did), so the whole enclosing body fell to
+        // the interpreter at ~3x the compiled cost. The closures must still
+        // see their own iteration's binding.
+        let source = "function make() { var out = []; \
+                       for (let r = 0; r < 2; r++) { \
+                         for (let i = 0; i < 3; i++) { \
+                           out.push(function () { return r + ':' + i; }); \
+                         } \
+                       } \
+                       var last = ''; \
+                       for (var k = 0; k < 20; k++) { last = out[5](); } \
+                       return out[0]() + '|' + out[2]() + '|' + out[5]() + '|' + last; }\n\
+                     make();";
+        let interp = {
+            let mut agent = runtime::Agent::new();
+            agent.initialize_host_defined_realm().expect("realm");
+            agent.run_script(source).expect("interp runs")
+        };
+        let (value, compiled) = with_jit_agent(|agent| agent.run_script(source).expect("runs"));
+        assert_eq!(value, interp, "the per-iteration copies must match");
+        assert_eq!(
+            value.as_string().map(|s| s.to_string()),
+            Some("0:0|0:2|1:2|1:2".to_string())
+        );
+        // `bench` (the script), `make` and the pushed closure. `make` is the
+        // body the scan used to refuse, so a reverted marking drops this to 1.
+        assert!(compiled >= 2, "{compiled} bodies");
+    }
+
+    #[test]
     fn installed_jit_per_iteration_head_reads_by_name_through_eval() {
         // `eval` resolves the head by name, which walks into a per-iteration
         // record rather than its slot table.

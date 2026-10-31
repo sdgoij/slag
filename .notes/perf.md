@@ -20998,3 +20998,46 @@ per-iteration environment machinery the for-in/for-of heads already use
 which the for-in form does not need. That is the next coverage lever, and it is
 worth more than any single ratio: it turns an interpreted body into a compiled
 one.
+
+## CORRECTION + LANDED (2026-10-31): a plain `for` head is not a loop-body lexical
+
+The entry above called the plain-`for` head capture a machinery gap on the order
+of the body-block one. It is not: it is the `loop_body_lexicals` marking
+over-reaching. That set exists so a closure capturing a lexical declared inside
+a loop BODY bails to the env path (the body block's per-iteration freshness is
+not flattenable), and `declare_pattern` fills it from
+`open_loop_body_depths`. A plain `for` scans its head through the generic
+`decls`, so when the `for` sits inside another loop's body the head binding is
+declared at a depth inside that body and gets marked — even though it is a
+loop-HEAD binding, which the certified machinery DOES cover (the compiler's
+`has_context` arm emits `EnterPerIteration`/`PerIteration` for it). The
+for-in/for-of arms allocate their heads themselves and never reach the marking,
+which is the whole asymmetry: the same closure over a for-in head compiled, over
+a plain-`for` head did not.
+
+`FastScopeScan::scanning_for_head` now suppresses the marking for a plain-`for`
+head declaration, so nesting no longer changes the answer. Measured (20000
+iterations of the same 3-key loop, `SLAG_JIT_REPORT=1` for the body count):
+
+| shape | compiled | before ms | after ms |
+|---|---:|---:|---:|
+| `for (let k = 0; ...) { ... = function () { return k; }; }` inside `for (var r ...)` | 1 -> 2 | 98.2 | **41.5** |
+| the same with the closure created under an `if` | 1 -> 2 | 59.7 | **17.6** |
+| the same shape NOT nested in another loop (already certified) | 2 | 29 | 29 |
+| a closure capturing a body-block `let z` (still, deliberately, refused) | 1 | 104.0 | 104.0 |
+
+`for (let i = 0; ...) fns.push(function () { return i; })` is the idiomatic
+closure-in-a-loop shape, so this is a tier-eligibility fix, not a ratio: the
+body now compiles instead of running interpreted.
+
+The corpus cannot see it. A whole-corpus `SLAG_JIT_REPORT` reports the same 104
+compiled bodies and the identical refusal list before and after, because every
+fixture that creates a closure per iteration does it over a for-in head. The A/B
+is therefore noise in both directions (`wide_literal` +11%, `spread_assign`
++10%, `num_valueof` -13% in the same window, none touched by this change).
+
+Gates: fmt, clippy workspace `--all-targets -D warnings`, `cargo test
+--workspace` 5866 pass, four sweeps at 100% (language 23726, built-ins 23821,
+annexB 1086, intl402 3365), corpus parity 0, `mean-jitGap` 8.08. The language
+sweep is the gate that matters here: it is where per-iteration binding
+semantics are pinned.
