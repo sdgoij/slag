@@ -20412,3 +20412,31 @@ allocations per match on every backtracking pattern.
 
 Gates: fmt, `clippy --workspace --all-targets -D warnings`, 5863 tests (two new
 `SmallStack` tests), four sweeps 51,998 at 100%, corpus parity 0.
+
+## MEASURED (2026-10-30): a prototype method read is 10 ns dearer than an own one, and it is the chain, not a trim
+
+The prototype method read was the other candidate off the builtin-call
+decomposition (`m.get(k)` 29.2 ns against `mg.get(k)` with the method installed
+as an own data property, 18.0). Reading the member alone, 100k iterations:
+
+| shape | ns/iter |
+| --- | ---: |
+| `var f = m.get;` (method on `Map.prototype`) | 23.7 |
+| `var f = mg.get;` (own data property) | 13.4 |
+| nothing (the loop floor) | 1.0 |
+
+So the own read is ~12 ns and the chain read ~22: the difference is the compiled
+chain path, which after the own-value cell misses runs a map-id-keyed cell probe
+(`(map_id ^ name) & (MEMBER_CELLS - 1)`), two cell loads, the link count, then
+per-link `(id, generation)` loads and compares from the receiver's direct
+prototype, and only then the value. That is a dozen dependent loads and five
+branches against the own cell's single probe.
+
+No cheap trim is available. Serving the chain result out of the own-value cell
+would be stale: a script replacing `Map.prototype.get` bumps the PROTOTYPE's
+generation, and the cell is keyed on the receiver's. The fix is a cell shape that
+carries the found link's generation next to the value (a proto-method cell keyed
+on `(map_id, name)` with the link generation gate), which is a redesign of the
+cell, not a slice, and it would pay on every method call in the corpus.
+
+Not started; recorded so the next session does not re-derive the 10 ns split.
