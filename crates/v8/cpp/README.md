@@ -151,32 +151,34 @@ alive. The copy check was verified to fail when the copy is made empty instead.
 
 `ObjectTemplate::SetHandler` installs a `NamedPropertyHandlerConfiguration` on a
 template, and `NewInstance` then makes an object whose property access is offered
-to the handler first. Four callbacks are carried: `getter`, `setter`, `query`,
-and `deleter`. Each returns V8's `Intercepted`, and `kNo` runs the engine's own
-internal method, so a handler can answer one name and let the rest through.
+to the handler first. All seven of V8's callbacks are carried: `getter`,
+`setter`, `query`, `deleter`, `enumerator`, `descriptor`, and `definer`. Each
+returns V8's `Intercepted`, and `kNo` runs the engine's own internal method, so a
+handler can answer one name and let the rest through.
 
 A template's handler makes its instances `crux::host::HostOps` objects, one
 behaviour per template, with the configuration's `data` value pinned for as long
 as an instance can call it. A handler is consulted *before* the object's own
 lookup, which is V8's masking default; there is no non-masking mode.
 
-**One callback is absent on purpose:** the enumerator. It needs the engine's
-`own_property_keys` seam wired through the handler (and `Object.keys` needs the
-`descriptor` callback, which exists), so it is the next milestone rather than a
-missing capability. A host that needs it does not compile, which is the only
-honest failure mode.
+The `enumerator` answers `[[OwnPropertyKeys]]` with the array of keys the host
+owns, and the two configurations' answers are concatenated, the indexed one
+first (V8's order: element indices before string keys). A number element becomes
+an array-index key and a string or symbol is itself, which is the reading V8's
+`KeepNumbers` describes. An enumerator that was never installed, or that answers
+`kNo`, adds nothing.
 
 A handler callback may allocate. The operation that called it holds the context,
 so the ordinary entry points refuse re-entry; instead the facade publishes the
 callback on `PropertyCallbackInfo::token()`, and `Object::New`, `Array::New`, and
 `Object::Set` route through it while they are called on behalf of a running
-handler. That is what lets a getter answer with an object it built, or a
-descriptor answer with its own descriptor.
+handler. That is what lets a getter answer with an object it built, a descriptor
+answer with its own descriptor, and an enumerator answer with its array.
 
 `SetHandler` also takes an `IndexedPropertyHandlerConfiguration`: a key that is
 an array index goes to those callbacks when they are installed, and to the named
-handler otherwise, which is V8's routing rule. It carries the same callbacks and
-no enumerator.
+handler otherwise, which is V8's routing rule. It carries the same seven
+callbacks.
 
 `gin-shapes` installs a handler that owns three names through its query, answers
 one through its getter and declines the rest, takes a set and a delete, and
@@ -186,7 +188,9 @@ which sees the descriptor marshalled back into `v8::PropertyDescriptor`. A gette
 for `fresh` returns `Object::New` with a property set on it, and one for `list`
 returns `Array::New` over two strings; both are built during the callback. The
 same answers are repeated through C++ (`Get`/`Has`/`Set`/`Delete`) and through a
-script, where `in` and a member read both reach the handler.
+script, where `in` and a member read both reach the handler. `Object.keys`
+walks the enumerator's keys, and the indexed handler's enumerator is read back
+through `Reflect.ownKeys`.
 
 ## The gin target
 
@@ -263,14 +267,12 @@ not a claim that gin itself links.
   freed.
 - Host callbacks receive `this` now (`FunctionCallbackInfo::This`), but the
   `Object` surface is still narrow: `SetAccessor` and `GetIdentityHash`'s
-  siblings are absent. A handler has no enumerator (see above). An ordinary
-  entry point cannot be re-entered from a callback, because the operation that
-  called the callback holds the context; a callback's allocations go through the
-  window `PropertyCallbackInfo::token()` names, which the facade wires into
-  `Object::New`, `Array::New`, and `Object::Set`. A callback's get work does not
-  reach `Object::Get` or `Object::Has`: only allocation and `Object::Set` take the
-  window. The indexed `descriptor` and `definer` callbacks are in the ABI but
-  nothing in `gin-shapes` exercises them yet.
+  siblings are absent. An ordinary entry point cannot be re-entered from a
+  callback, because the operation that called the callback holds the context; a
+  callback's allocations go through the window `PropertyCallbackInfo::token()`
+  names, which the facade wires into `Object::New`, `Array::New`, and
+  `Object::Set`. A callback's reads do not reach `Object::Get` or `Object::Has`:
+  only allocation and `Object::Set` take the window.
 - `load()` is compiled but refused at run time. The sample re-enters through
   `ExecuteString`, and the safe engine path for a host callback is
   `FunctionCall::eval` (`slag_call_eval`), which the sample does not call. The

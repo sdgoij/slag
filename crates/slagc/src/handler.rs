@@ -3,8 +3,8 @@
 //! V8 consults a handler before the engine's own internal method: a `kNo` answer
 //! means "not intercepted, run the ordinary method", which is the `Option` the
 //! engine's [`HostOps`] seam already expresses. The named handler carries all
-//! seven of V8's callbacks except the enumerator; the indexed one carries the
-//! same set keyed by an array index.
+//! seven of V8's callbacks, and the indexed one the same set keyed by an array
+//! index.
 //!
 //! The `data` a configuration carries is a language value in V8, so it is pinned
 //! for as long as this handler is (one handler per configuration, shared by the
@@ -20,6 +20,7 @@ use crux::heap::{Pin, pin};
 use crux::host::HostOps;
 use crux::object::JsObject;
 use crux::property::PropertyKey;
+use crux::string::JsString;
 use crux::value::{Value, ValueKind};
 
 use slag::CallbackWindow;
@@ -94,6 +95,9 @@ pub struct SlagPropertyHandler {
     pub query: Option<unsafe extern "C" fn(*mut c_void, u64, u64, u64, *mut u64) -> i32>,
     /// `(state, data, holder, key, out)`: the out slot holds a boolean.
     pub deleter: Option<unsafe extern "C" fn(*mut c_void, u64, u64, u64, *mut u64) -> i32>,
+    /// `(state, data, holder, out)`: [[OwnPropertyKeys]], the out slot receiving
+    /// the array of keys the host owns.
+    pub enumerator: Option<unsafe extern "C" fn(*mut c_void, u64, u64, *mut u64) -> i32>,
     /// `(state, data, holder, key, out)`: [[GetOwnProperty]], where the out slot
     /// receives the descriptor object.
     pub descriptor: Option<unsafe extern "C" fn(*mut c_void, u64, u64, u64, *mut u64) -> i32>,
@@ -118,6 +122,7 @@ pub struct SlagPropertyHandler {
         Option<unsafe extern "C" fn(*mut c_void, u64, u64, u32, u64, u64, i32) -> i32>,
     pub indexed_query: Option<unsafe extern "C" fn(*mut c_void, u64, u64, u32, *mut u64) -> i32>,
     pub indexed_deleter: Option<unsafe extern "C" fn(*mut c_void, u64, u64, u32, *mut u64) -> i32>,
+    pub indexed_enumerator: Option<unsafe extern "C" fn(*mut c_void, u64, u64, *mut u64) -> i32>,
     /// The indexed twins of `descriptor` and `definer`.
     pub indexed_descriptor:
         Option<unsafe extern "C" fn(*mut c_void, u64, u64, u32, *mut u64) -> i32>,
@@ -150,6 +155,8 @@ impl fmt::Debug for SlagPropertyHandler {
             .field("indexed_setter", &self.indexed_setter.is_some())
             .field("indexed_query", &self.indexed_query.is_some())
             .field("indexed_deleter", &self.indexed_deleter.is_some())
+            .field("enumerator", &self.enumerator.is_some())
+            .field("indexed_enumerator", &self.indexed_enumerator.is_some())
             .field("descriptor", &self.descriptor.is_some())
             .field("definer", &self.definer.is_some())
             .field("indexed_descriptor", &self.indexed_descriptor.is_some())
@@ -227,6 +234,47 @@ fn property_of(descriptor: crux::property::PropertyDescriptor) -> crux::object::
 /// delete, which is what an unset slot means.
 fn deleted(answer: u64) -> bool {
     matches!(Value::from_bits(answer).kind(), ValueKind::Boolean(true))
+}
+
+/// The keys an enumerator answered with: the array it wrote into its slot, read
+/// back as engine keys. A number element is an array index (V8's `KeepNumbers`
+/// spells an index as a number), a string or a symbol is itself, and anything
+/// else is skipped.
+fn keys_of_answer(answer: Value) -> Vec<PropertyKey> {
+    let Some(array) = answer.as_object() else {
+        return Vec::new();
+    };
+    let length = array
+        .get(&JsString::from_utf8("length"))
+        .ok()
+        .and_then(|value| value.as_number())
+        .filter(|length| length.is_finite() && *length > 0.0)
+        .unwrap_or(0.0);
+    let mut keys = Vec::new();
+    for position in 0..length as u64 {
+        let Ok(Some(property)) = array.get_own_property_key(&PropertyKey::from_index(position))
+        else {
+            continue;
+        };
+        let crux::object::PropertyKind::Data { value, .. } = property.kind else {
+            continue;
+        };
+        if value.is_hole() {
+            continue;
+        }
+        match value.kind() {
+            ValueKind::String(text) => keys.push(PropertyKey::from_js_string(&text)),
+            ValueKind::Symbol(symbol) => keys.push(PropertyKey::Symbol(symbol)),
+            // 2^32 - 2, the largest array index (spec 6.1.7.1).
+            ValueKind::Number(number)
+                if number.fract() == 0.0 && (0.0..=4_294_967_294.0).contains(&number) =>
+            {
+                keys.push(PropertyKey::from_index(number as u64));
+            }
+            _ => {}
+        }
+    }
+    keys
 }
 
 impl CxxHandler {
@@ -552,5 +600,59 @@ impl HostOps for CxxHandler {
             (INTERCEPTED_THROW, _) => Some(Err(thrown())),
             (_, answer) => Some(Ok(deleted(answer))),
         }
+    }
+
+    fn own_property_keys(&self, object: &JsObject) -> Option<Result<Vec<PropertyKey>, JsError>> {
+        let indexed = self.handler.indexed_enumerator;
+        let named = self.handler.enumerator;
+        if indexed.is_none() && named.is_none() {
+            // Neither handler enumerates: the engine's own [[OwnPropertyKeys]].
+            return None;
+        }
+        let answers = match self.callback(|| {
+            let mut answers = Vec::new();
+            // The indexed enumerator is asked first, which is V8's order:
+            // element indices before string keys.
+            if let Some(callback) = indexed {
+                let mut answer = 0;
+                // SAFETY: as in `get`.
+                let code = unsafe {
+                    callback(
+                        self.handler.indexed_state,
+                        self.handler.data,
+                        object.self_value().bits(),
+                        &mut answer,
+                    )
+                };
+                answers.push((code, answer));
+            }
+            if let Some(callback) = named {
+                let mut answer = 0;
+                // SAFETY: as in `get`.
+                let code = unsafe {
+                    callback(
+                        self.handler.state,
+                        self.handler.data,
+                        object.self_value().bits(),
+                        &mut answer,
+                    )
+                };
+                answers.push((code, answer));
+            }
+            answers
+        }) {
+            Ok(answers) => answers,
+            Err(error) => return Some(Err(error)),
+        };
+        let mut keys = Vec::new();
+        for (code, answer) in answers {
+            match code {
+                // Not intercepted: this enumerator adds nothing.
+                INTERCEPTED_NO => {}
+                INTERCEPTED_THROW => return Some(Err(thrown())),
+                _ => keys.extend(keys_of_answer(Value::from_bits(answer))),
+            }
+        }
+        Some(Ok(keys))
     }
 }

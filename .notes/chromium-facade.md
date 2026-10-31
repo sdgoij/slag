@@ -461,7 +461,7 @@ The facade side is the gin shape: `ObjectTemplate::SetInternalFieldCount` and `N
 
 *The real-property predicates (2026-10-31).* `HasRealNamedProperty`, `HasRealIndexedProperty`, and `HasRealNamedCallbackProperty` are in, over one ABI call that reports which kind the own property is (absent, data named, data indexed, callback named, callback indexed). The named/indexed split is a divergence with a reason: V8 keeps a named dictionary and an elements store and the predicates ask one of them, while this engine has a single own-property store, so the split follows the key. An array index (`crux::object::array_index_of`, the spec's 0 to 2^32-2) is the indexed kind, and a canonical numeric index that is not an array index ("1.5") stays named, which is what V8's named store would answer. `gin-shapes` checks the own name is found, the inherited `toString` is not, the index key "0" is indexed and not named, and a data property is not a callback property; forcing the kind to always read "data named" was verified to fail the check. Interceptors are scoped in section 14.1, where the finding is that this is a design decision rather than plumbing: the engine's handler seam builds a `HostOps` object for the realm global, and a `NewInstance` object has no `HostOps`, so gin's and Blink's instance handlers have nowhere to run yet.
 
-*Named-property handlers (2026-10-31).* The decision above was taken and the first slice landed. `ObjectTemplate::SetHandler` installs a `v8::NamedPropertyHandlerConfiguration`, and `NewInstance` on that template makes a crux host object (`Context::create_host_object`) whose getter, setter, query, and deleter are consulted before the engine's own internal method; `Intercepted::kNo` falls back, so masking is the only mode. The configuration's `data` value is pinned for as long as an instance can call it. The enumerator and the descriptor/definer pair are absent from the ABI and the C++ struct, each for a stated reason (a callback cannot yet allocate through the borrowed context; there is no descriptor ABI), so a host that needs one does not compile. Two engine-side findings came out of it and are fixed: `in` now delegates host objects to crux's [[HasProperty]] (`module.rs`), which it previously did only for proxies and typed arrays, and the real-property reads now use `ordinary_get_own_property` because V8 defines them to skip interceptors. `gin-shapes` checks the handler through `Get`/`Has`/`Set`/`Delete` and through a script, and the runtime test covers the `in` path plus its fallback to the prototype chain.
+*Named-property handlers (2026-10-31).* The decision above was taken and the first slice landed. `ObjectTemplate::SetHandler` installs a `v8::NamedPropertyHandlerConfiguration`, and `NewInstance` on that template makes a crux host object (`Context::create_host_object`) whose getter, setter, query, and deleter are consulted before the engine's own internal method; `Intercepted::kNo` falls back, so masking is the only mode. The configuration's `data` value is pinned for as long as an instance can call it. The enumerator and the descriptor/definer pair were absent from the ABI and the C++ struct at that point, each for a stated reason (a callback could not yet allocate through the borrowed context; there was no descriptor ABI), so a host that needed one did not compile; both have since landed, below. Two engine-side findings came out of it and are fixed: `in` now delegates host objects to crux's [[HasProperty]] (`module.rs`), which it previously did only for proxies and typed arrays, and the real-property reads now use `ordinary_get_own_property` because V8 defines them to skip interceptors. `gin-shapes` checks the handler through `Get`/`Has`/`Set`/`Delete` and through a script, and the runtime test covers the `in` path plus its fallback to the prototype chain.
 
 ## 12. Cost model
 
@@ -587,21 +587,12 @@ So the milestone needs a decision before code:
 
 **Decided (2026-10-31): option 1, and the first slice is in.** `NewInstance` on a
 template with a handler now makes a `crux::host::HostOps` object
-(`Context::create_host_object`), one behaviour per template, and the named
-handler carries six of V8's seven callbacks (getter, setter, query, deleter,
-descriptor, definer). The configuration's `data` value is pinned for as long as
-an instance can call it, and `kNo` falls back to the engine's own internal
-method, so masking is the only mode.
-
-What is deliberately absent, and why:
-
-- the **enumerator** builds the array it answers with through the allocation
-  window a callback gets, and needs the engine's `own_property_keys` seam wired
-  through the handler; that wiring is the last piece of the set, not a missing
-  capability.
-
-Because the C struct does not carry them, a host that needs one does not compile
-rather than having it silently ignored.
+(`Context::create_host_object`), one behaviour per template. All seven of V8's
+callbacks are carried for the named handler (getter, setter, query, deleter,
+enumerator, descriptor, definer), and the indexed one carries the same set. The
+configuration's `data` value is pinned for as long as an instance can call it,
+and `kNo` falls back to the engine's own internal method, so masking is the only
+mode.
 
 The work also exposed an engine gap worth recording: the `in` operator's
 `has_property_with_deferred_trigger` delegated to crux only for proxies and
@@ -614,7 +605,7 @@ real-property predicates are defined to *skip* interceptors, and crux's
 `ordinary_get_own_property` is exactly that question, so the embed helpers use it
 rather than the interceptor-consulting `get_own_property_key`.
 
-*Indexed handlers, and why the enumerator waits (2026-10-31).* `SetHandler` now
+*Indexed handlers, and why the enumerator waited (2026-10-31).* `SetHandler` now
 takes an `IndexedPropertyHandlerConfiguration` too, with the same four callbacks
 keyed by an array index, and the handler routes a key by its shape: an array
 index goes to the indexed callback when one is installed, and to the named one
@@ -656,10 +647,19 @@ facade finds the context from `g_current_context`, so a host has to enter an
 isolate and a context the way V8's samples do; `gin-shapes` did not before, which
 is why its first allocation attempt returned an empty handle.
 
-What remains in the handler sequence is the enumerator, which now needs only the
-`own_property_keys` wiring (its two prerequisites, the descriptor callback and
-allocation, have landed). `SetAccessor` is a separate surface: it needs an
-accessor callback whose getter runs as a function with the property's key in hand.
+*The enumerator (2026-10-31).* With both prerequisites in place the enumerator
+landed, and the handler set is complete: `[[OwnPropertyKeys]]` dispatches to
+`HostOps::own_property_keys`, the indexed enumerator is asked first and the two
+answers are concatenated (V8's order: element indices before string keys), and a
+key answer is read back from the array the callback built. A number element is an
+array index and a string or symbol is itself, the reading V8's `KeepNumbers`
+describes; a hole or any other element is skipped. `gin-shapes` reads the named
+enumerator through `Object.keys` (which also needs each key's own descriptor) and
+the indexed one through `Reflect.ownKeys` (which asks only for the keys, so it
+needs no descriptor callback).
+
+What remains is `SetAccessor`, a separate surface: it needs an accessor callback
+whose getter runs as a function with the property's key in hand.
 
 The ABI shape is roughly a struct of up to seven C function pointers, the data
 pointer, and the flags, handed over once per template, with the return codes

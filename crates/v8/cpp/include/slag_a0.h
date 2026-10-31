@@ -50,6 +50,9 @@ typedef struct SlagPropertyHandler {
                    uint64_t* out);
   int32_t (*deleter)(void* state, uint64_t data, uint64_t holder, uint64_t key,
                      uint64_t* out);
+  /* [[OwnPropertyKeys]]: the out slot receives the array of keys the host owns. */
+  int32_t (*enumerator)(void* state, uint64_t data, uint64_t holder,
+                        uint64_t* out);
   /* [[GetOwnProperty]]: the out slot receives a descriptor object, which the
    * Rust side reads with the engine's own ToPropertyDescriptor. */
   int32_t (*descriptor)(void* state, uint64_t data, uint64_t holder,
@@ -67,6 +70,8 @@ typedef struct SlagPropertyHandler {
                            uint32_t index, uint64_t* out);
   int32_t (*indexed_deleter)(void* state, uint64_t data, uint64_t holder,
                              uint32_t index, uint64_t* out);
+  int32_t (*indexed_enumerator)(void* state, uint64_t data, uint64_t holder,
+                                uint64_t* out);
   int32_t (*indexed_descriptor)(void* state, uint64_t data, uint64_t holder,
                                 uint32_t index, uint64_t* out);
   int32_t (*indexed_definer)(void* state, uint64_t data, uint64_t holder,

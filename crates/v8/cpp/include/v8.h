@@ -521,13 +521,9 @@ class PropertyCallbackInfo {
   const void* token_;
 };
 
-/* The handler callbacks (`v8::NamedProperty*Callback`).
- *
- * The enumerator is absent: a `v8::NamedPropertyEnumeratorCallback` builds the
- * array it answers with, and allocating one goes through the context, which the
- * operation that called the handler holds borrowed. Until a callback can
- * allocate through the live borrow, the callback is not offered, so a host that
- * needs it does not compile. */
+/* The handler callbacks (`v8::NamedProperty*Callback`). The enumerator answers
+ * with the keys the host owns, so it builds an array; a callback's allocations
+ * go through the running window (`PropertyCallbackInfo::token`). */
 using NamedPropertyGetterCallback =
     Intercepted (*)(Local<Name> property, const PropertyCallbackInfo<Value>& info);
 using NamedPropertySetterCallback =
@@ -537,6 +533,8 @@ using NamedPropertyQueryCallback = Intercepted (*)(
     Local<Name> property, const PropertyCallbackInfo<Integer>& info);
 using NamedPropertyDeleterCallback = Intercepted (*)(
     Local<Name> property, const PropertyCallbackInfo<Boolean>& info);
+using NamedPropertyEnumeratorCallback = Intercepted (*)(
+    const PropertyCallbackInfo<Array>& info);
 using NamedPropertyDescriptorCallback = Intercepted (*)(
     Local<Name> property, const PropertyCallbackInfo<Value>& info);
 using NamedPropertyDefinerCallback = Intercepted (*)(
@@ -553,6 +551,8 @@ using IndexedPropertyQueryCallback = Intercepted (*)(
     uint32_t index, const PropertyCallbackInfo<Integer>& info);
 using IndexedPropertyDeleterCallback = Intercepted (*)(
     uint32_t index, const PropertyCallbackInfo<Boolean>& info);
+using IndexedPropertyEnumeratorCallback = Intercepted (*)(
+    const PropertyCallbackInfo<Array>& info);
 using IndexedPropertyDescriptorCallback = Intercepted (*)(
     uint32_t index, const PropertyCallbackInfo<Value>& info);
 using IndexedPropertyDefinerCallback = Intercepted (*)(
@@ -570,18 +570,15 @@ enum class PropertyHandlerFlags : int {
 };
 
 /* What a host installs on an object template
- * (`v8::NamedPropertyHandlerConfiguration`).
- *
- * The `descriptor`, `definer`, and `enumerator` callbacks are absent on
- * purpose: they need a property-descriptor ABI and a re-entrant allocation path
- * that do not exist yet, so a host that needs them does not compile rather than
- * having them silently ignored. */
+ * (`v8::NamedPropertyHandlerConfiguration`): all seven of V8's callbacks. The
+ * parameter order follows V8's, with `data` and `flags` last. */
 struct NamedPropertyHandlerConfiguration {
   NamedPropertyHandlerConfiguration(
       NamedPropertyGetterCallback getter = nullptr,
       NamedPropertySetterCallback setter = nullptr,
       NamedPropertyQueryCallback query = nullptr,
       NamedPropertyDeleterCallback deleter = nullptr,
+      NamedPropertyEnumeratorCallback enumerator = nullptr,
       NamedPropertyDescriptorCallback descriptor = nullptr,
       NamedPropertyDefinerCallback definer = nullptr,
       Local<Value> data = Local<Value>(),
@@ -590,6 +587,7 @@ struct NamedPropertyHandlerConfiguration {
         setter(setter),
         query(query),
         deleter(deleter),
+        enumerator(enumerator),
         descriptor(descriptor),
         definer(definer),
         data(data),
@@ -599,6 +597,7 @@ struct NamedPropertyHandlerConfiguration {
   NamedPropertySetterCallback setter;
   NamedPropertyQueryCallback query;
   NamedPropertyDeleterCallback deleter;
+  NamedPropertyEnumeratorCallback enumerator;
   NamedPropertyDescriptorCallback descriptor;
   NamedPropertyDefinerCallback definer;
   Local<Value> data;
@@ -614,6 +613,7 @@ struct IndexedPropertyHandlerConfiguration {
       IndexedPropertySetterCallback setter = nullptr,
       IndexedPropertyQueryCallback query = nullptr,
       IndexedPropertyDeleterCallback deleter = nullptr,
+      IndexedPropertyEnumeratorCallback enumerator = nullptr,
       IndexedPropertyDescriptorCallback descriptor = nullptr,
       IndexedPropertyDefinerCallback definer = nullptr,
       Local<Value> data = Local<Value>(),
@@ -622,6 +622,7 @@ struct IndexedPropertyHandlerConfiguration {
         setter(setter),
         query(query),
         deleter(deleter),
+        enumerator(enumerator),
         descriptor(descriptor),
         definer(definer),
         data(data),
@@ -631,6 +632,7 @@ struct IndexedPropertyHandlerConfiguration {
   IndexedPropertySetterCallback setter;
   IndexedPropertyQueryCallback query;
   IndexedPropertyDeleterCallback deleter;
+  IndexedPropertyEnumeratorCallback enumerator;
   IndexedPropertyDescriptorCallback descriptor;
   IndexedPropertyDefinerCallback definer;
   Local<Value> data;

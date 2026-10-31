@@ -50,6 +50,8 @@ struct HostNames {
   int definers = 0;
   int definer_descriptors = 0;
   int allocations = 0;
+  int enumerators = 0;
+  int indexed_enumerators = 0;
 };
 
 HostNames host_names;
@@ -129,6 +131,20 @@ v8::Intercepted HostDelete(v8::Local<v8::Name> property,
   return v8::Intercepted::kYes;
 }
 
+// The enumerator answers with the names the host owns. It builds the array inside
+// the callback, which the allocation window makes legal.
+v8::Intercepted HostEnumerate(
+    const v8::PropertyCallbackInfo<v8::Array>& info) {
+  v8::Isolate* isolate = info.GetIsolate();
+  ++host_names.enumerators;
+  v8::Local<v8::Value> elements[] = {
+      v8::String::NewFromUtf8Literal(isolate, kHostNames[0]),
+      v8::String::NewFromUtf8Literal(isolate, kHostNames[1]),
+      v8::String::NewFromUtf8Literal(isolate, kHostNames[2])};
+  info.GetReturnValue().Set(v8::Array::New(isolate, elements, 3));
+  return v8::Intercepted::kYes;
+}
+
 // The indexed twins: the host owns elements 0..2, and an index past them falls
 // back to the engine.
 v8::Intercepted HostGetIndex(uint32_t index,
@@ -160,6 +176,19 @@ v8::Intercepted HostDeleteIndex(
   if (index >= 3) return v8::Intercepted::kNo;
   ++host_names.indexed_deleters;
   info.GetReturnValue().Set(v8::Boolean::New(info.GetIsolate(), true));
+  return v8::Intercepted::kYes;
+}
+
+// The indexed enumerator answers with numbers, which the engine reads back as
+// array-index keys (V8's `KeepNumbers`).
+v8::Intercepted HostEnumerateIndex(
+    const v8::PropertyCallbackInfo<v8::Array>& info) {
+  v8::Isolate* isolate = info.GetIsolate();
+  ++host_names.indexed_enumerators;
+  v8::Local<v8::Value> elements[] = {v8::Integer::New(isolate, 0),
+                                     v8::Integer::New(isolate, 1),
+                                     v8::Integer::New(isolate, 2)};
+  info.GetReturnValue().Set(v8::Array::New(isolate, elements, 3));
   return v8::Intercepted::kYes;
 }
 
@@ -538,8 +567,8 @@ int main() {
     v8::Context::Scope context_scope(current);
 
     v8::NamedPropertyHandlerConfiguration configuration(
-        HostGet, HostSet, HostQuery, HostDelete, HostDescriptor, HostDefiner,
-        v8::Integer::New(isolate, 7));
+        HostGet, HostSet, HostQuery, HostDelete, HostEnumerate, HostDescriptor,
+        HostDefiner, v8::Integer::New(isolate, 7));
     v8::Local<v8::ObjectTemplate> tmpl = v8::ObjectTemplate::New(isolate);
     tmpl->SetHandler(configuration);
     v8::Local<v8::Object> instance = tmpl->NewInstance(current).ToLocalChecked();
@@ -669,10 +698,28 @@ int main() {
       ++failures;
     }
 
+    // `Object.keys` walks the enumerator's keys and reads each one's own
+    // descriptor, so it exercises both callbacks together.
+    v8::Local<v8::Value> keys;
+    bool enumerated =
+        v8::Script::Compile(
+            current,
+            v8::String::NewFromUtf8Literal(
+                isolate, "Object.keys(handled).join(',') === 'alpha,beta,gamma' ? 1 : 0"))
+            .ToLocalChecked()
+            ->Run(current)
+            .ToLocal(&keys) &&
+        keys->Int32Value(current).FromMaybe(-1) == 1;
+    if (!enumerated || host_names.enumerators == 0) {
+      fprintf(stderr, "the enumerator's keys did not reach Object.keys\n");
+      ++failures;
+    }
+
     // The indexed handler owns elements 0..2; a higher index falls back.
     v8::IndexedPropertyHandlerConfiguration indexed(HostGetIndex, HostSetIndex,
                                                    HostQueryIndex,
-                                                   HostDeleteIndex);
+                                                   HostDeleteIndex,
+                                                   HostEnumerateIndex);
     v8::Local<v8::ObjectTemplate> elements = v8::ObjectTemplate::New(isolate);
     elements->SetHandler(indexed);
     v8::Local<v8::Object> array_like =
@@ -691,6 +738,31 @@ int main() {
     if (host_names.indexed_getters == 0 || host_names.indexed_setters == 0 ||
         host_names.indexed_deleters == 0) {
       fprintf(stderr, "an indexed callback was never asked\n");
+      ++failures;
+    }
+
+    // `Reflect.ownKeys` asks only for the keys, so it reaches the indexed
+    // enumerator without needing a descriptor callback.
+    const char kArrayLike[] = "array_like";
+    if (slag_object_set(slag_global(current->slag()),
+                       reinterpret_cast<const uint8_t*>(kArrayLike),
+                       sizeof(kArrayLike) - 1, array_like.raw()) != 0) {
+      fprintf(stderr, "the indexed instance could not be installed\n");
+      ++failures;
+    }
+    v8::Local<v8::Value> indexed_keys;
+    bool indexed_enumerated =
+        v8::Script::Compile(
+            current,
+            v8::String::NewFromUtf8Literal(
+                isolate,
+                "Reflect.ownKeys(array_like).join(',') === '0,1,2' ? 1 : 0"))
+            .ToLocalChecked()
+            ->Run(current)
+            .ToLocal(&indexed_keys) &&
+        indexed_keys->Int32Value(current).FromMaybe(-1) == 1;
+    if (!indexed_enumerated || host_names.indexed_enumerators == 0) {
+      fprintf(stderr, "the indexed enumerator's keys did not reach the engine\n");
       ++failures;
     }
   }

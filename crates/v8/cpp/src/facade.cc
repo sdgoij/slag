@@ -212,6 +212,34 @@ int32_t DeleterTrampoline(void* state, uint64_t data, uint64_t holder,
       configuration->deleter(v8::Local<v8::Name>::New(key), info));
 }
 
+int32_t EnumeratorTrampoline(void* state, uint64_t data, uint64_t holder,
+                             uint64_t* out) {
+  auto* configuration = Configuration(state);
+  if (configuration == nullptr || configuration->enumerator == nullptr ||
+      out == nullptr) {
+    return 0;
+  }
+  *out = slag_undefined();
+  CallbackToken token;
+  v8::PropertyCallbackInfo<v8::Array> info(v8::g_current_isolate, holder, data,
+                                           out, token.get());
+  return static_cast<int32_t>(configuration->enumerator(info));
+}
+
+int32_t IndexedEnumeratorTrampoline(void* state, uint64_t data, uint64_t holder,
+                                    uint64_t* out) {
+  auto* configuration = IndexedConfiguration(state);
+  if (configuration == nullptr || configuration->enumerator == nullptr ||
+      out == nullptr) {
+    return 0;
+  }
+  *out = slag_undefined();
+  CallbackToken token;
+  v8::PropertyCallbackInfo<v8::Array> info(v8::g_current_isolate, holder, data,
+                                           out, token.get());
+  return static_cast<int32_t>(configuration->enumerator(info));
+}
+
 /* The descriptor a definer is handed: built from the ABI's present-or-absent
  * fields, into the `v8::PropertyDescriptor` the callback takes. */
 v8::PropertyDescriptor DescriptorOf(const SlagPropertyDescriptor& source) {
@@ -675,12 +703,14 @@ MaybeLocal<Object> ObjectTemplate::NewInstance(Local<Context> context) {
     handler.setter = SetterTrampoline;
     handler.query = QueryTrampoline;
     handler.deleter = DeleterTrampoline;
+    handler.enumerator = EnumeratorTrampoline;
     handler.descriptor = DescriptorTrampoline;
     handler.definer = DefinerTrampoline;
     handler.indexed_getter = IndexedGetterTrampoline;
     handler.indexed_setter = IndexedSetterTrampoline;
     handler.indexed_query = IndexedQueryTrampoline;
     handler.indexed_deleter = IndexedDeleterTrampoline;
+    handler.indexed_enumerator = IndexedEnumeratorTrampoline;
     handler.indexed_descriptor = IndexedDescriptorTrampoline;
     handler.indexed_definer = IndexedDefinerTrampoline;
     handler.data = named_handler_.data.IsEmpty()
