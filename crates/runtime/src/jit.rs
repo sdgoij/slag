@@ -207,6 +207,24 @@ pub struct CertifiedInlineInfo {
     /// rejections); the certified lane must re-check the id, which the lane
     /// already resolves for the `ecma_functions` lookup.
     pub callee_id: u64,
+    /// G25: the callee's `[[Environment]]`, cached so a warm call skips the
+    /// `ecma_functions` borrow and its map lookup. The callee box holds the
+    /// environment edge (or the realm roots the shared global environment), so
+    /// the handle is live exactly while `callee_id` names a live callee.
+    pub environment: Option<crate::env::EnvRef>,
+    /// G25: the callee realm's global object, as a NaN-boxed value word.
+    pub global: u64,
+    /// G25: the address of the `CompiledBody` the cached entry belongs to
+    /// (`ctx.body` for the nested run); the code cache owns the body for as
+    /// long as the record's `code_gen` is current.
+    pub body_ptr: u64,
+    /// G25: 1 when the body owns a `try` (a non-empty handler table), so a
+    /// nested run takes the control-isolation path.
+    pub has_handlers: u32,
+    /// G25: 1 when the body has an `arguments` slot, which makes the lane
+    /// re-check the caller's realm per call; such a site stays on the registry
+    /// path.
+    pub needs_realm: u32,
 }
 
 impl CertifiedInlineInfo {
@@ -226,6 +244,11 @@ impl CertifiedInlineInfo {
             has_call_apply: 0,
             has_call_intrinsic: 0,
             callee_id: 0,
+            environment: None,
+            global: 0,
+            body_ptr: 0,
+            has_handlers: 0,
+            needs_realm: 0,
         }
     }
 }
@@ -2565,6 +2588,18 @@ pub fn dump_cert_profile() {
     println!("cert\tmark-overhead\t{:.1}", per_mark * 2.0);
 }
 
+/// G25: the callee-static facts a warm certified call reads from its call-site
+/// record instead of the `ecma_functions` registry, so the hot path's only
+/// lookup is the record itself.
+#[derive(Clone, Copy)]
+struct HotCallee {
+    environment: crate::env::EnvRef,
+    global: crux::handle::Handle<crux::JsObject>,
+    body_ptr: *const CompiledBody,
+    /// Whether the body owns a `try` (its handler table is non-empty).
+    has_handlers: bool,
+}
+
 /// The shared certified-body lane: a call (`construct == false`) or a base
 /// constructor (`construct == true`) to a *different* certified body runs its
 /// machine code directly on this ctx, with a nested frame carved from
@@ -2634,52 +2669,98 @@ fn certified_lane_inline(
         return Ok(None);
     };
     phase!(0);
+    // G25: a warm call reads the callee-static facts from its call-site
+    // record, which the probe filled and the record's code-generation and
+    // callee-id gates keep valid. That skips the `ecma_functions` borrow, its
+    // map lookup, the body `Rc` clone and the realm dereference; the
+    // environment stays live through the callee box's `[[Environment]]` edge
+    // (or the realm root for the shared global environment) while the callee
+    // being called is live.
+    let hot = cached.and_then(|c| {
+        if construct
+            || c.needs_realm != 0
+            || c.fill_ok == 0
+            || c.entry == 0
+            || c.body_ptr == 0
+            || c.callee_id != function.id()
+        {
+            return None;
+        }
+        let environment = c.environment?;
+        match Value::from_bits(c.global).kind() {
+            ValueKind::Object(global) => Some(HotCallee {
+                environment,
+                global,
+                body_ptr: c.body_ptr as *const CompiledBody,
+                has_handlers: c.has_handlers != 0,
+            }),
+            _ => None,
+        }
+    });
     // Resolve the callee's registered record in one scoped borrow: a
     // generator/async body's call/construct produces an iterator or a promise
     // rather than a run of the body. A class constructor cannot be CALLED at
     // all (the call gate refuses it), but a base class constructor IS what the
     // construct lane runs.
-    let (body, environment, strict, realm) = {
-        let Some(data) = agent.ecma_function(&function.id()) else {
-            return Ok(None);
-        };
-        if data.is_generator || data.is_async {
-            return Ok(None);
-        }
-        if construct {
-            // C2: the construct gate (base kind, no fields/private methods, a
-            // constructible definition with a non-lexical `this`, and the
-            // shared-lane eligibility) — a non-leaf certified base constructor
-            // is admitted here, unlike the leaf-only `construct_inline`.
-            if !data.certified_construct_eligible() {
+    let (body, environment, strict, global, realm) = match hot {
+        Some(hot) => (
+            None,
+            hot.environment,
+            cached.is_some_and(|c| c.strict != 0),
+            hot.global,
+            None,
+        ),
+        None => {
+            let Some(data) = agent.ecma_function(&function.id()) else {
+                return Ok(None);
+            };
+            if data.is_generator || data.is_async {
                 return Ok(None);
             }
-        } else if data.is_class_constructor {
-            return Ok(None);
+            if construct {
+                // C2: the construct gate (base kind, no fields/private methods,
+                // a constructible definition with a non-lexical `this`, and the
+                // shared-lane eligibility) — a non-leaf certified base constructor
+                // is admitted here, unlike the leaf-only `construct_inline`.
+                if !data.certified_construct_eligible() {
+                    return Ok(None);
+                }
+            } else if data.is_class_constructor {
+                return Ok(None);
+            }
+            let Some(body) = data.ir.clone() else {
+                return Ok(None);
+            };
+            (
+                Some(body),
+                data.environment,
+                data.strict,
+                data.realm.global_object,
+                Some(data.realm),
+            )
         }
-        let Some(body) = data.ir.clone() else {
-            return Ok(None);
-        };
-        (body, data.environment, data.strict, data.realm)
     };
-    let global = realm.global_object;
     // The lane's gate: the self gate minus the `this` requirement (bound
     // below) plus the super/`ThisValue` machinery it cannot install. The
     // call-site probe already ran it (cached); the derived path re-runs it. A
     // construct already ran it inside `certified_construct_eligible` above, so
     // it is not re-scanned here.
-    if cached.is_none() && !construct && !body.certified_callee_eligible() {
-        return Ok(None);
+    if hot.is_none() && cached.is_none() {
+        let body = body.as_ref().expect("a cold lane call resolved its body");
+        if !construct && !body.certified_callee_eligible() {
+            return Ok(None);
+        }
     }
     // An unmapped-`arguments` object is built from the *current* realm's
     // intrinsics (`%Object.prototype%`, `%ThrowTypeError%`), and a lane run
     // pushes no context, so `current_realm` is the caller's: a cross-realm
     // callee would build its object in the wrong realm. Refuse that case — the
     // funnel pushes the callee's realm and is correct.
-    if body
-        .scope
-        .as_ref()
-        .is_some_and(|scope| scope.arguments_slot.is_some())
+    if let (Some(realm), Some(body)) = (realm.as_ref(), body.as_ref())
+        && body
+            .scope
+            .as_ref()
+            .is_some_and(|scope| scope.arguments_slot.is_some())
         && !agent
             .current_realm()
             .is_ok_and(|current| current.as_ptr() == realm.as_ptr())
@@ -2687,8 +2768,12 @@ fn certified_lane_inline(
         return Ok(None);
     }
     phase!(1);
-    let Some(scope) = body.scope.as_ref() else {
-        return Ok(None);
+    let scope = match body.as_ref() {
+        Some(body) => match body.scope.as_ref() {
+            Some(scope) => Some(scope),
+            None => return Ok(None),
+        },
+        None => None,
     };
     // C1: the call-site probe cached the entry, `stack_usage` and the frame
     // descriptor, validated by the record's identity + code-generation gates.
@@ -2712,7 +2797,13 @@ fn certified_lane_inline(
         // site uses; a below-threshold or sticky-refused body falls back here.
         // Outlined and cold: a hot call whose site cached the verdict never
         // reaches it (PGO: 77% of this function's blocks never run).
-        let Some(triple) = certified_lane_compile(hook, &body, scope.frame_size) else {
+        let Some(triple) = certified_lane_compile(
+            hook,
+            body.as_ref().expect("a cold lane call resolved its body"),
+            scope
+                .expect("a cold lane call resolved its scope")
+                .frame_size,
+        ) else {
             return Ok(None);
         };
         triple
@@ -2735,7 +2826,10 @@ fn certified_lane_inline(
             (cached.this_slot != NO_THIS_SLOT).then_some(cached.this_slot as usize),
             cached.arity as usize,
         ),
-        None => (strict, scope.this_slot, scope.arity),
+        None => {
+            let scope = scope.expect("a cold lane call resolved its scope");
+            (strict, scope.this_slot, scope.arity)
+        }
     };
     let this_value: Option<Value> = if construct {
         // C2: the receiver is created here — after every refusal above, so a
@@ -2778,7 +2872,14 @@ fn certified_lane_inline(
     // whatever the callee abandons on an abrupt exit. A callee without
     // `handlers` cannot touch those stacks (the gate), so the common call keeps
     // the one-length fast path.
-    let callee_control = !body.handlers.is_empty();
+    let callee_control = match hot {
+        Some(hot) => hot.has_handlers,
+        None => !body
+            .as_ref()
+            .expect("a cold lane call resolved its body")
+            .handlers
+            .is_empty(),
+    };
     let (scratch, saved, control_free, buf_base, args_len, args_base_len) = unsafe {
         let vm = &mut *ctx.vm;
         let base = vm.stack.len();
@@ -2839,7 +2940,12 @@ fn certified_lane_inline(
             args.get(slot).copied().unwrap_or(Value::Undefined)
         } else if match cached {
             Some(cached) => cached.tdz_mask >> slot & 1 == 1,
-            None => scope.tdz_store.get(slot).copied().unwrap_or(false),
+            None => scope
+                .expect("a cold lane call resolved its scope")
+                .tdz_store
+                .get(slot)
+                .copied()
+                .unwrap_or(false),
         } {
             Value::uninitialized()
         } else {
@@ -2855,13 +2961,26 @@ fn certified_lane_inline(
     phase!(4);
     let frame_ptr = buf_ptr as *mut c_void;
     let stack_ptr = unsafe { buf_ptr.add(frame_len) } as *mut c_void;
-    let (apply_builtin_bits, call_builtin_bits) =
-        if cached.map_or(body.has_call_apply, |c| c.has_call_apply != 0) {
-            call_apply_intrinsic_bits(agent)
-        } else {
-            (0, 0)
-        };
-    let intrinsic_bits = if cached.map_or(body.has_call_intrinsic, |c| c.has_call_intrinsic != 0) {
+    let (apply_builtin_bits, call_builtin_bits) = if cached.map_or_else(
+        || {
+            body.as_ref()
+                .expect("a cold lane call resolved its body")
+                .has_call_apply
+        },
+        |c| c.has_call_apply != 0,
+    ) {
+        call_apply_intrinsic_bits(agent)
+    } else {
+        (0, 0)
+    };
+    let intrinsic_bits = if cached.map_or_else(
+        || {
+            body.as_ref()
+                .expect("a cold lane call resolved its body")
+                .has_call_intrinsic
+        },
+        |c| c.has_call_intrinsic != 0,
+    ) {
         intrinsic_bits(agent)
     } else {
         no_intrinsic_bits()
@@ -2876,7 +2995,7 @@ fn certified_lane_inline(
     let (saved_nested, saved_call_args) = unsafe {
         let vm = &mut *ctx.vm;
         let saved = vm.install_nested_frame(buf_ptr);
-        let call_args = if scope.arguments_slot.is_some() {
+        let call_args = if scope.is_some_and(|scope| scope.arguments_slot.is_some()) {
             Some(std::mem::replace(&mut vm.call_args, args.to_vec()))
         } else {
             None
@@ -2897,14 +3016,25 @@ fn certified_lane_inline(
         member_map_cells: ctx.member_map_cells,
         member_chain_cells: ctx.member_chain_cells,
         globals_unshadowed: cached.map_or_else(
-            || Vm::global_reads_are_unshadowed(environment, &body.ident_names),
+            || {
+                Vm::global_reads_are_unshadowed(
+                    environment,
+                    &body
+                        .as_ref()
+                        .expect("a cold lane call resolved its body")
+                        .ident_names,
+                )
+            },
             |c| c.globals_unshadowed != 0,
         ),
         buf_end: (buf_ptr as usize + buf_len * std::mem::size_of::<Value>()) as *mut c_void,
         leaf_epoch: 0,
         leaf_records: ctx.leaf_records,
         leaf_gen: ctx.leaf_gen,
-        body: std::rc::Rc::as_ptr(&body),
+        body: match hot {
+            Some(hot) => hot.body_ptr,
+            None => std::rc::Rc::as_ptr(body.as_ref().expect("a cold lane call resolved its body")),
+        },
         tail: false,
         current_function: callee,
         self_entry: entry as usize as u64,
@@ -3411,10 +3541,10 @@ fn certified_verdict(
     // Resolve the callee-static facts in one scoped borrow. A generator/async
     // call produces an iterator or a promise rather than a run of the body, and
     // a class constructor cannot be called at all, so all three are refusals.
-    let (ir, environment, strict) = match agent.ecma_function(&function.id()) {
+    let (ir, environment, strict, realm) = match agent.ecma_function(&function.id()) {
         Some(data) if !data.is_generator && !data.is_async && !data.is_class_constructor => {
             match data.ir.clone() {
-                Some(ir) => (ir, data.environment, data.strict),
+                Some(ir) => (ir, data.environment, data.strict, data.realm),
                 None => return CertifiedInlineInfo::empty(),
             }
         }
@@ -3465,6 +3595,11 @@ fn certified_verdict(
         has_call_apply: u32::from(ir.has_call_apply),
         has_call_intrinsic: u32::from(ir.has_call_intrinsic),
         callee_id: function.id(),
+        environment: Some(environment),
+        global: Value::Object(realm.global_object).bits(),
+        body_ptr: std::rc::Rc::as_ptr(&ir) as u64,
+        has_handlers: u32::from(!ir.handlers.is_empty()),
+        needs_realm: u32::from(scope.arguments_slot.is_some()),
     }
 }
 

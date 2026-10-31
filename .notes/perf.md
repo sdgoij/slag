@@ -20608,3 +20608,54 @@ ladder would sit in the tree as a silent miscompile risk.
 Verified: clippy `-D warnings`; `cargo test --workspace` 5864 pass / 0 fail;
 four sweeps at 100% (language 23726, built-ins 23821, annexB 1086, intl402
 3365); corpus parity 0.
+
+## LANDED (2026-10-31): the certified call site caches the callee-static facts
+
+The lane's `resolve` phase (`ecma_function` + the `Rc` clone + the realm read,
+~5 ns of the corrected phase table below) now comes from the call-site record:
+`CertifiedInlineInfo` carries the closure environment, the realm global as a
+NaN-boxed word, the compiled body's address, the handler flag, and a
+"needs the realm check" flag for a body with an `arguments` slot. A warm call
+whose record still matches (code generation + callee id) resolves no registry
+entry at all, and the nested context's `body` is the record's pointer.
+
+Measured with the interleaved old/new protocol (same row, one process per row,
+three rounds, per-binary minima): `nl3` (one non-leaf call per iteration)
+58.4 -> 57.2 ms, the head-let row 336.6 -> 332.6 ms. That is the honest size of
+the `resolve` phase, 1-2 %, and it is inside this machine's spread on those
+rows (the same binary ranges 332-368 on the head-let row). The change is kept
+for the frame work rather than for the number: the record is the template the
+compiled lane will write its per-depth context from.
+
+### The corrected phase table
+
+The 2026-10-31 phase profile overstates every phase by one mark pair (~6.6 ns).
+Subtracting it a second time (the totals then reconcile: 48 measured against
+the 53 ns unprofiled call) gives:
+
+| phase | ns/call |
+| --- | ---: |
+| scratch save | 13.2 |
+| restore | 11.8 |
+| ctx build | 6.0 |
+| resolve | 4.9 |
+| frame fill | 4.8 |
+| the callee's own run | 4.6 |
+| nested frame + `call_args` | 3.3 |
+| this-bind | 1.2 |
+| entry gates | ~0 |
+
+So HALF of a non-leaf call is the scratch save/restore pair — 18 fields plus
+the 72-byte builder struct, twice, through a 152-byte struct — and every other
+line is 6 ns or less. Three local slices at the other lines measured flat (ctx
+sharing: a regression; the builder-only-when-enabled save: flat; the
+callee-static cache: 1-2 %). The remaining lever is the pair itself, and the
+only way to shrink it is to stop moving the struct: the compiled lane would
+spill the caller's live scratch fields into its own frame (10 loads and 10
+stores each way) instead of building, passing and unpacking a 152-byte value,
+and fold the resets into the same block.
+
+Verified: clippy `-D warnings`; `cargo test --workspace` 5864 pass / 0 fail;
+four sweeps at 100% (language 23726, built-ins 23821, annexB 1086, intl402
+3365); corpus parity 0, `mean-jitGap` 8.09; four env-call shapes under
+`--gc-stress` return the plain run's values.
