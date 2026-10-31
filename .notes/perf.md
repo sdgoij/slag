@@ -20740,3 +20740,35 @@ corpus parity 0. (A first sweep run reported four hangs on unrelated fixtures â€
 two TypedArray `copyWithin` and two regexp-literal files â€” and the immediate
 re-run reported none; those fixtures pass in isolation too, so it was machine
 load, not the batch.)
+
+## MEASURED (2026-10-31): what `Object.assign` / spread costs
+
+`objects/spread_assign` (`{x,y,z}` + `Object.assign({}, o)` + one store, 200k
+iterations) is 137 ms against node's 36. The pieces, one process per row:
+
+| probe (200k iterations) | slag | node |
+| --- | ---: | ---: |
+| `{x,y,z}` + three reads (the literal, no call) | 0.23 ms | 0.16 |
+| `Object.is(i, i)` (a static builtin call, no allocation) | 6.6 | 21.4 |
+| `Object.keys({})` | 33.4 | 20.4 |
+| `Object.assign({}, hoisted-empty)` + `Object.keys` | 39.9 | 49.1 |
+| `Object.assign({}, o)` with three keys + reads | 93.9 | 28.5 |
+| `{}` + three explicit stores + reads | 35.9 | 0.2 |
+
+So the assign call is ~200 ns fixed plus ~97 ns per copied key (a key-count
+sweep of 0/1/3/6/9 gives 265, 249, 427, 745 and 1020 ns per iteration). The
+literal-and-reads loop is free (the JIT scalars it away), and `Object.is` shows
+the call floor at ~30 ns, so ~170 ns of the fixed cost is the assign handler's
+own work: `to_object` on both sides, the `kept_during_job` push/pop of the two
+objects, `own_string_data_keys` (a `Vec` sized by the map), and the return. The
+per-key term is `get_own_property_key` + `create_data_property_key`
+(`has_own_property_key`, then the transition + field write + generation bump)
+plus a `kept_during_job` push of the copied value per key.
+
+Note the corpus row is dominated by the per-key term (three keys = ~290 of its
+~470 ns), and a plain compiled store on the same fresh object costs ~60 ns
+(`{}` + three stores = 180 ns per object), so the copy path's per-key overhead
+over a store is ~35 ns.
+
+Not started; recorded so the next session starts from the split rather than the
+row.
