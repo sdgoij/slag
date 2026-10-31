@@ -277,6 +277,39 @@ int32_t AccessorSetterTrampoline(void* data, uint64_t holder, uint64_t key,
   return 0;
 }
 
+/* The FunctionTemplate pair behind `Object::SetAccessorProperty`: each run
+ * builds the info a FunctionCallback takes, with the receiver as `this` and (for
+ * a setter) the assigned value as the only argument. */
+struct TemplateAccessor {
+  v8::FunctionCallback getter = nullptr;
+  v8::FunctionCallback setter = nullptr;
+};
+
+int32_t TemplateAccessorGetter(void* data, uint64_t holder, uint64_t,
+                               uint64_t* out) {
+  auto* accessor = static_cast<TemplateAccessor*>(data);
+  if (accessor == nullptr || accessor->getter == nullptr || out == nullptr) {
+    return 1;
+  }
+  *out = slag_undefined();
+  v8::FunctionCallbackInfo<v8::Value> info(v8::g_current_isolate, nullptr,
+                                           holder, nullptr, 0);
+  accessor->getter(info);
+  *out = info.return_value();
+  return 0;
+}
+
+int32_t TemplateAccessorSetter(void* data, uint64_t holder, uint64_t,
+                               uint64_t value) {
+  auto* accessor = static_cast<TemplateAccessor*>(data);
+  if (accessor == nullptr || accessor->setter == nullptr) return 1;
+  uint64_t args[1] = {value};
+  v8::FunctionCallbackInfo<v8::Value> info(v8::g_current_isolate, nullptr,
+                                           holder, args, 1);
+  accessor->setter(info);
+  return 0;
+}
+
 /* The descriptor a definer is handed: built from the ABI's present-or-absent
  * fields, into the `v8::PropertyDescriptor` the callback takes. */
 v8::PropertyDescriptor DescriptorOf(const SlagPropertyDescriptor& source) {
@@ -904,7 +937,8 @@ Maybe<bool> Object::Has(Local<Context> context, uint32_t index) {
 
 void Object::SetAccessor(Local<Context> context, Local<Name> name,
                          AccessorNameGetterCallback getter,
-                         AccessorNameSetterCallback setter, Local<Value> data) {
+                         AccessorNameSetterCallback setter, Local<Value> data,
+                         PropertyAttribute attribute) {
   if (context.IsEmpty() || name.IsEmpty() || getter == nullptr) return;
   auto* current = reinterpret_cast<Context*>(
       static_cast<uintptr_t>(context.raw()));
@@ -916,12 +950,141 @@ void Object::SetAccessor(Local<Context> context, Local<Name> name,
   accessor->setter = setter;
   accessor->name_bits = name.raw();
   accessor->data_bits = data.IsEmpty() ? slag_undefined() : data.raw();
+  accessor->attributes = static_cast<int32_t>(attribute);
   slag_root_retain(accessor->name_bits);
   slag_root_retain(accessor->data_bits);
   slag_object_set_accessor(
       current->slag(), Raw(this), accessor->name_bits, &AccessorGetterTrampoline,
       accessor->setter == nullptr ? nullptr : &AccessorSetterTrampoline,
-      accessor);
+      accessor, accessor->attributes);
+}
+
+void Object::SetAccessorProperty(Local<Name> name,
+                                 Local<FunctionTemplate> getter,
+                                 Local<FunctionTemplate> setter,
+                                 PropertyAttribute attribute) {
+  SlagContext* slag = CurrentSlagContext();
+  if (slag == nullptr || name.IsEmpty() || getter.IsEmpty()) return;
+  // The specification is owned for the object's life, like `SetAccessor`'s.
+  auto* accessor = new TemplateAccessor();
+  accessor->getter = getter->callback();
+  accessor->setter = setter.IsEmpty() ? nullptr : setter->callback();
+  slag_object_set_accessor(
+      slag, Raw(this), name.raw(), &TemplateAccessorGetter,
+      accessor->setter == nullptr ? nullptr : &TemplateAccessorSetter, accessor,
+      static_cast<int32_t>(attribute));
+}
+
+MaybeLocal<Value> Object::GetPrivate(Local<Context> context, Local<Private> key) {
+  return Get(context, Local<Value>(key));
+}
+
+Maybe<bool> Object::SetPrivate(Local<Context> context, Local<Private> key,
+                               Local<Value> value) {
+  return Set(context, Local<Value>(key), value);
+}
+
+Maybe<bool> Object::HasPrivate(Local<Context> context, Local<Private> key) {
+  return Has(context, Local<Value>(key));
+}
+
+bool Object::DeletePrivate(Local<Context> context, Local<Private> key) {
+  return Delete(context, Local<Value>(key));
+}
+
+namespace {
+
+Local<Value> MakeException(SlagExceptionKind kind, Local<String> message) {
+  v8::String::Utf8Value text(v8::g_current_isolate, message);
+  const char* data = *text == nullptr ? "" : *text;
+  uint64_t out = 0;
+  if (slag_exception_new(CurrentSlagContext(), static_cast<int32_t>(kind),
+                         reinterpret_cast<const uint8_t*>(data),
+                         data == nullptr ? 0 : std::strlen(data), &out) != 0) {
+    return Local<Value>();
+  }
+  return Local<Value>::New(out);
+}
+
+}  // namespace
+
+Local<Value> Exception::Error(Local<String> message) {
+  return MakeException(SLAG_EXCEPTION_ERROR, message);
+}
+
+Local<Value> Exception::EvalError(Local<String> message) {
+  return MakeException(SLAG_EXCEPTION_EVAL_ERROR, message);
+}
+
+Local<Value> Exception::RangeError(Local<String> message) {
+  return MakeException(SLAG_EXCEPTION_RANGE_ERROR, message);
+}
+
+Local<Value> Exception::ReferenceError(Local<String> message) {
+  return MakeException(SLAG_EXCEPTION_REFERENCE_ERROR, message);
+}
+
+Local<Value> Exception::SyntaxError(Local<String> message) {
+  return MakeException(SLAG_EXCEPTION_SYNTAX_ERROR, message);
+}
+
+Local<Value> Exception::TypeError(Local<String> message) {
+  return MakeException(SLAG_EXCEPTION_TYPE_ERROR, message);
+}
+
+Local<Value> Exception::UriError(Local<String> message) {
+  return MakeException(SLAG_EXCEPTION_URI_ERROR, message);
+}
+
+Local<v8::Message> Exception::CreateMessage(Isolate*, Local<Value>) {
+  // A position exists only for a compile error (see `TryCatch::Message`), and a
+  // value here has none.
+  return Local<v8::Message>();
+}
+
+Local<Private> Private::ForApi(Isolate* isolate, Local<String> name) {
+  if (isolate == nullptr) return Local<Private>();
+  v8::String::Utf8Value text(isolate, name);
+  std::string key = *text == nullptr ? std::string() : std::string(*text);
+  auto found = isolate->private_names_.find(key);
+  if (found != isolate->private_names_.end()) {
+    return Local<Private>::New(found->second);
+  }
+  uint64_t value = 0;
+  if (slag_symbol_new(reinterpret_cast<const uint8_t*>(key.data()), key.size(),
+                      &value) != 0) {
+    return Local<Private>();
+  }
+  // One name, one private: the registry keeps the symbol alive across handle
+  // scopes, which is what makes a later request for the same name the same key.
+  slag_root_retain(value);
+  isolate->private_names_.emplace(std::move(key), value);
+  return Local<Private>::New(value);
+}
+
+Local<Private> Private::New(Isolate* isolate, Local<String> name) {
+  if (isolate == nullptr) return Local<Private>();
+  v8::String::Utf8Value text(isolate, name);
+  const char* data = *text == nullptr ? "" : *text;
+  uint64_t value = 0;
+  if (slag_symbol_new(reinterpret_cast<const uint8_t*>(data),
+                      data == nullptr ? 0 : std::strlen(data), &value) != 0) {
+    return Local<Private>();
+  }
+  return Local<Private>::New(value);
+}
+
+Local<Value> Private::Name() const {
+  uint64_t description = 0;
+  if (slag_symbol_description(Raw(this), &description) != 0) {
+    return Local<Value>();
+  }
+  return Local<Value>::New(description);
+}
+
+void Isolate::ThrowException(Local<Value> exception) {
+  if (exception.IsEmpty()) return;
+  slag_throw_exception(CurrentSlagContext(), exception.raw());
 }
 
 namespace {
@@ -1257,18 +1420,34 @@ void ObjectTemplate::Set(Isolate*, const char* name,
 void ObjectTemplate::SetAccessor(Local<Name> name,
                                  AccessorNameGetterCallback getter,
                                  AccessorNameSetterCallback setter,
-                                 Local<Value> data) {
+                                 Local<Value> data, PropertyAttribute attribute) {
   if (name.IsEmpty() || getter == nullptr) return;
   Accessor accessor;
   accessor.getter = getter;
   accessor.setter = setter;
   accessor.name_bits = name.raw();
   accessor.data_bits = data.IsEmpty() ? slag_undefined() : data.raw();
+  accessor.attributes = static_cast<int32_t>(attribute);
   // The template outlives the scopes the name and data were made in, and it is
   // never freed, so the roots are held for the process (like `Global` holds one).
   slag_root_retain(accessor.name_bits);
   slag_root_retain(accessor.data_bits);
   accessors_.push_back(std::move(accessor));
+}
+
+void ObjectTemplate::SetNativeDataProperty(Local<Name> name,
+                                           AccessorNameGetterCallback getter,
+                                           AccessorNameSetterCallback setter,
+                                           Local<Value> data,
+                                           PropertyAttribute attribute) {
+  SetAccessor(name, getter, setter, data, attribute);
+}
+
+void ObjectTemplate::SetLazyDataProperty(Local<Name> name,
+                                         AccessorNameGetterCallback getter,
+                                         Local<Value> data,
+                                         PropertyAttribute attribute) {
+  SetAccessor(name, getter, nullptr, data, attribute);
 }
 
 MaybeLocal<Object> ObjectTemplate::NewInstance(Local<Context> context) {
@@ -1330,7 +1509,7 @@ MaybeLocal<Object> ObjectTemplate::NewInstance(Local<Context> context) {
     const slag_accessor_setter setter =
         accessor.setter == nullptr ? nullptr : &AccessorSetterTrampoline;
     if (slag_object_set_accessor(slag, object, accessor.name_bits, getter,
-                                 setter, &accessor) != 0) {
+                                 setter, &accessor, accessor.attributes) != 0) {
       return MaybeLocal<Object>();
     }
   }
@@ -1397,6 +1576,8 @@ Isolate* Isolate::New(const CreateParams&) {
 void Isolate::Dispose() {
   for (Context* context : contexts_) delete context;
   contexts_.clear();
+  for (const auto& entry : private_names_) slag_root_release(entry.second);
+  private_names_.clear();
   if (slag_ != nullptr) slag_isolate_free(slag_);
   delete this;
 }

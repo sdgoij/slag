@@ -18,8 +18,9 @@ pub use runtime::HostHooks;
 pub use runtime::dump;
 pub use runtime::embed::{
     BufferInfo, CallbackWindow, CompiledScript, Context, FunctionCall, HostCallbacks, HostFn,
-    JsObject, JsValue, OwnProperty, TypedArrayInfo, TypedArrayKind, buffer_info, typed_array_info,
-    value_is_constructor, value_type_mask,
+    JsObject, JsValue, OwnProperty, PROPERTY_DONT_DELETE, PROPERTY_DONT_ENUM, PROPERTY_READ_ONLY,
+    TypedArrayInfo, TypedArrayKind, buffer_info, typed_array_info, value_is_constructor,
+    value_type_mask,
 };
 pub use runtime::embed::{OutputFn, RandomFn};
 

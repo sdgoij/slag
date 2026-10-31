@@ -820,6 +820,43 @@ policy. What the rung leaves out is `DataView::New` (the predicate is there),
 the resizable/growable creation forms, and `ArrayBuffer::Allocator` actually
 backing the engine's allocations (it is still a type the samples delete).
 
+*Errors, private names, and data properties (2026-10-31).* The error factories
+are engine constructors rather than facade strings: `Exception::TypeError` and
+its siblings call `builtins::error::to_throwable`, so the value carries the
+realm's own `name`, `message`, and stack, and `Isolate::ThrowException` records
+an arbitrary value as the pending exception (the same slot `TryCatch::Exception`
+reads). `Exception::CreateMessage` answers empty, which is the narrowing the
+error path already documents: a position exists only for a compile error.
+
+Private names are the symbol model the Rust bridge already uses, and the
+facade now has the same shape: `Private::ForApi` keeps a per-isolate registry
+(description to retained symbol, released in `Dispose`), `Private::New` mints a
+fresh symbol, and `Private::Name` reads the description back. The
+divergence is the one `.notes/embedding.md` records for the bridge and the
+harness pins: the property is invisible to `Object.keys` and `in` but visible to
+`Object.getOwnPropertySymbols`, because the engine has no private-name kind.
+Because the facade's private name is a symbol value, `Private` derives from
+`Name` here rather than V8's `Data`, so the ordinary key paths reach it; the
+four `Object::*Private` methods are those paths with the private as the key.
+
+The data-property forms were almost free once attributes existed: `SetAccessor`
+takes a `PropertyAttribute`, `define_accessor_key` maps `DontEnum`/`DontDelete`
+onto the descriptor and drops the setter for `ReadOnly`, so
+`SetNativeDataProperty` and `SetLazyDataProperty` are that call. The lazy form is
+the honest half-step: the engine has no one-shot slot, so the getter runs on
+every read and the property is an accessor rather than a data slot.
+`Object::SetAccessorProperty` needed one new piece, a trampoline that builds a
+`FunctionCallbackInfo` (receiver as `this`, the assigned value as argument zero)
+and calls the `FunctionTemplate`'s callback, so a template-based accessor runs
+the same code its function would.
+
+`Signature` is the one item from this rung not landed: it exists for embedder
+access checks, which are A4, and the Rust bridge models it as an opaque data
+type for the same reason. The harness checks the thrown error's name and
+message, the private name dedupe and round trip, the lazy and native getters
+with `DontEnum`/`ReadOnly`, and the template accessor pair; two runtime tests
+pin the error values and the attribute semantics.
+
 The ABI shape is roughly a struct of up to seven C function pointers, the data
 pointer, and the flags, handed over once per template, with the return codes
 `Intercepted` already defines; the callbacks receive a `PropertyCallbackInfo`

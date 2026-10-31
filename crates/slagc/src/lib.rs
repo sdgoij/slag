@@ -24,8 +24,10 @@ mod handler;
 use handler::CxxHandler;
 pub use handler::{SlagPropertyDescriptor, SlagPropertyHandler};
 
+use crux::handle::Handle;
 use crux::heap::{GcAny, RootSource, Trace, register_root_source};
 use crux::property::PropertyKey;
+use crux::string::JsString;
 use crux::value::{Value, ValueKind};
 use slag::api::{Local as EngineLocal, Traced};
 use slag::{
@@ -1437,6 +1439,105 @@ pub unsafe extern "C" fn slag_value_to_object(
     }
 }
 
+/// A built-in error object (`v8::Exception::Error` and its typed siblings).
+/// `kind` is a `SlagExceptionKind` number; the value carries the engine's own
+/// `name`, `message`, and stack, so a script catches what V8 would have made.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn slag_exception_new(
+    context: *mut SlagContext,
+    kind: i32,
+    text_ptr: *const u8,
+    len: usize,
+    out: *mut u64,
+) -> i32 {
+    let Some(context) = context.as_mut() else {
+        return 2;
+    };
+    let Some(kind) = error_kind(kind) else {
+        return 2;
+    };
+    let Ok(message) = text(text_ptr, len) else {
+        return 2;
+    };
+    let created = {
+        let Ok(mut engine) = context.context.try_borrow_mut() else {
+            reentrant(context);
+            return 1;
+        };
+        engine.error_value(kind, message)
+    };
+    match created {
+        Ok(value) => {
+            if !out.is_null() {
+                *out = value.to_bits();
+            }
+            0
+        }
+        Err(error) => {
+            record(context, error);
+            1
+        }
+    }
+}
+
+/// Throw `value` (`Isolate::ThrowException`): the pending exception becomes
+/// exactly that language value, so `TryCatch::Exception` hands it back.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn slag_throw_exception(context: *mut SlagContext, value: u64) -> i32 {
+    let Some(context) = context.as_ref() else {
+        return 2;
+    };
+    record(
+        context,
+        JsError::new(ErrorKind::Error, String::new()).with_value(Value::from_bits(value)),
+    );
+    0
+}
+
+fn error_kind(kind: i32) -> Option<ErrorKind> {
+    Some(match kind {
+        0 => ErrorKind::Error,
+        1 => ErrorKind::EvalError,
+        2 => ErrorKind::RangeError,
+        3 => ErrorKind::ReferenceError,
+        4 => ErrorKind::SyntaxError,
+        5 => ErrorKind::TypeError,
+        6 => ErrorKind::UriError,
+        _ => return None,
+    })
+}
+
+/// A symbol with `description` (`v8::Private::New` and `v8::Private::ForApi`).
+/// The isolate-facing dedupe is the facade's, not the engine's.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn slag_symbol_new(text_ptr: *const u8, len: usize, out: *mut u64) -> i32 {
+    let Ok(description) = text(text_ptr, len) else {
+        return 2;
+    };
+    let symbol = crux::symbol::Symbol::new(Some(JsString::from_utf8(description)));
+    if !out.is_null() {
+        *out = Value::Symbol(Handle::new(symbol)).bits();
+    }
+    0
+}
+
+/// A symbol's description (`v8::Private::Name`), or `undefined` when it has
+/// none. Answers 2 when the value is not a symbol.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn slag_symbol_description(value: u64, out: *mut u64) -> i32 {
+    let ValueKind::Symbol(symbol) = Value::from_bits(value).kind() else {
+        return 2;
+    };
+    let description = match symbol.description.as_ref() {
+        Some(text) => Value::String(Handle::new(text.clone())),
+        None => Value::Undefined,
+    };
+    if !out.is_null() {
+        *out = description.bits();
+    }
+    0
+}
+
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn slag_global(context: *mut SlagContext) -> u64 {
     match context.as_ref().and_then(|context| {
@@ -1997,6 +2098,7 @@ pub unsafe extern "C" fn slag_object_set_accessor(
     getter: SlagAccessorGetter,
     setter: SlagAccessorSetter,
     data: *mut c_void,
+    attributes: i32,
 ) -> i32 {
     let Some(context) = context.as_ref() else {
         return 2;
@@ -2019,6 +2121,7 @@ pub unsafe extern "C" fn slag_object_set_accessor(
     };
     let pending = Rc::clone(&context.pending_error);
     let get = getter.map(|callback| accessor_getter(Rc::clone(&pending), callback, data, key));
+    let attributes = u8::try_from(attributes).unwrap_or(0);
     let set = setter.map(|callback| accessor_setter(pending, callback, data, key));
     let engine = match context.context.try_borrow() {
         Ok(engine) => engine,
@@ -2027,7 +2130,7 @@ pub unsafe extern "C" fn slag_object_set_accessor(
             return 1;
         }
     };
-    match engine.define_accessor_key(&target, &property, &label, get, set) {
+    match engine.define_accessor_key(&target, &property, &label, get, set, attributes) {
         Ok(()) => 0,
         Err(error) => {
             record(context, error);

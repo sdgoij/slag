@@ -17,6 +17,7 @@
 #include <memory>
 #include <string>
 #include <type_traits>
+#include <unordered_map>
 #include <vector>
 
 #include "slag_a0.h"
@@ -35,6 +36,8 @@ class Script;
 class Message;
 class TryCatch;
 class ArrayBuffer;
+class Private;
+class Exception;
 
 template <class T>
 class FunctionCallbackInfo;
@@ -228,6 +231,16 @@ enum class Intercepted {
   kThrow = 3,
 };
 
+/* The attributes a property is installed with (`v8::PropertyAttribute`). The
+ * facade honours `DontEnum` and `DontDelete` on an accessor and treats
+ * `ReadOnly` as "no setter"; the template forms carry the same bits. */
+enum PropertyAttribute {
+  None = 0,
+  ReadOnly = 1 << 0,
+  DontEnum = 1 << 1,
+  DontDelete = 1 << 2,
+};
+
 class Value {
  public:
   /* The type predicates (`v8::Value::IsArray` and its siblings). The shape bits
@@ -350,11 +363,27 @@ class Object : public Value {
 
   /* Install an accessor on this object (`Object::SetAccessor`): a read of `name`
    * runs `getter` and a write runs `setter`. The specification is owned by the
-   * engine for the object's lifetime, like a template. */
+   * engine for the object's lifetime, like a template. `attribute` carries
+   * V8's `DontEnum`/`DontDelete` bits; `ReadOnly` installs no setter. */
   void SetAccessor(Local<Context> context, Local<Name> name,
                    AccessorNameGetterCallback getter,
                    AccessorNameSetterCallback setter = nullptr,
-                   Local<Value> data = Local<Value>());
+                   Local<Value> data = Local<Value>(),
+                   PropertyAttribute attribute = None);
+
+  /* Install an accessor whose get and set are FunctionTemplates
+   * (`Object::SetAccessorProperty`): each runs with the receiver as `this`. */
+  void SetAccessorProperty(Local<Name> name, Local<FunctionTemplate> getter,
+                           Local<FunctionTemplate> setter,
+                           PropertyAttribute attribute = None);
+
+  /* Private names (`Object::GetPrivate` and its siblings). A private name is
+   * the symbol `v8::Private` minted, so the ordinary key paths reach it. */
+  MaybeLocal<Value> GetPrivate(Local<Context> context, Local<Private> key);
+  Maybe<bool> SetPrivate(Local<Context> context, Local<Private> key,
+                         Local<Value> value);
+  Maybe<bool> HasPrivate(Local<Context> context, Local<Private> key);
+  bool DeletePrivate(Local<Context> context, Local<Private> key);
 
   /* The own-property predicates (`Object::HasRealNamedProperty` and its
    * siblings): no interceptor and no prototype walk. `HasRealIndexedProperty`
@@ -605,6 +634,41 @@ class String : public Name {
 class Boolean : public Value {
  public:
   static Local<Boolean> New(Isolate* isolate, bool value);
+};
+
+/* A private name (`v8::Private`). V8's `Private` derives from `Data` and is used
+ * only through the `Object::*Private` methods; the engine models a private name
+ * as a symbol, so this one is a `Value` too and the ordinary key paths reach it
+ * (which is the divergence `.notes/embedding.md` records for the Rust bridge).
+ * `ForApi` dedupes by name across the isolate; `New` mints a fresh name each
+ * call. */
+class Private : public Name {
+ public:
+  static Local<Private> ForApi(Isolate* isolate, Local<String> name);
+  static Local<Private> New(Isolate* isolate, Local<String> name);
+
+  /* The name the private was minted with (`Private::Name`), or `undefined`. */
+  Local<Value> Name() const;
+};
+
+/* Make a built-in error object to throw (`v8::Exception::Error` and its typed
+ * siblings). The value is the engine's own constructor result, so a script
+ * catches an object with the usual `name`, `message`, and stack. */
+class Exception {
+ public:
+  static Local<Value> Error(Local<String> message);
+  static Local<Value> EvalError(Local<String> message);
+  static Local<Value> RangeError(Local<String> message);
+  static Local<Value> ReferenceError(Local<String> message);
+  static Local<Value> SyntaxError(Local<String> message);
+  static Local<Value> TypeError(Local<String> message);
+  static Local<Value> UriError(Local<String> message);
+
+  /* A message's source position. The engine records one only for a compile
+   * error (see `TryCatch::Message`), so an exception made at run time has none
+   * and this answers an empty handle. */
+  static Local<v8::Message> CreateMessage(Isolate* isolate,
+                                          Local<Value> exception);
 };
 
 /* A property descriptor (`v8::PropertyDescriptor`): what a definer callback
@@ -976,7 +1040,20 @@ class ObjectTemplate {
    * arriving on the callback info. */
   void SetAccessor(Local<Name> name, AccessorNameGetterCallback getter,
                    AccessorNameSetterCallback setter = nullptr,
-                   Local<Value> data = Local<Value>());
+                   Local<Value> data = Local<Value>(),
+                   PropertyAttribute attribute = None);
+
+  /* The data-property forms (`v8::ObjectTemplate::SetNativeDataProperty` and
+   * `SetLazyDataProperty`): both install the same accessor. The engine has no
+   * one-shot slot, so a lazy getter runs on every read rather than once, and
+   * the property is an accessor rather than a data slot. */
+  void SetNativeDataProperty(Local<Name> name, AccessorNameGetterCallback getter,
+                             AccessorNameSetterCallback setter = nullptr,
+                             Local<Value> data = Local<Value>(),
+                             PropertyAttribute attribute = None);
+  void SetLazyDataProperty(Local<Name> name, AccessorNameGetterCallback getter,
+                           Local<Value> data = Local<Value>(),
+                           PropertyAttribute attribute = None);
 
   /* One installed accessor: the name and data are retained for the template's
    * lifetime (templates are not freed), and their bits are kept so the
@@ -987,6 +1064,7 @@ class ObjectTemplate {
     uint64_t data_bits = 0;
     AccessorNameGetterCallback getter = nullptr;
     AccessorNameSetterCallback setter = nullptr;
+    int32_t attributes = 0;
   };
   const std::deque<Accessor>& accessors() const { return accessors_; }
 
@@ -1043,6 +1121,9 @@ class Isolate {
   static Isolate* New(const CreateParams& params);
   void Dispose();
   void ThrowError(const char* message);
+  /* Throw `exception` (`Isolate::ThrowException`): the pending exception
+   * becomes exactly that language value. */
+  void ThrowException(Local<Value> exception);
   Local<Context> GetCurrentContext();
 
   /* Drain the job queues now (`Isolate::PerformMicrotaskCheckpoint`). */
@@ -1082,8 +1163,12 @@ class Isolate {
   SlagIsolate* slag_ = nullptr;
   std::vector<Context*> contexts_;
   MicrotasksPolicy microtasks_policy_ = MicrotasksPolicy::kAuto;
+  /* `Private::ForApi`'s one-name-one-private registry: the description and the
+   * symbol bits, retained until `Dispose`. */
+  std::unordered_map<std::string, uint64_t> private_names_;
 
   friend class Context;
+  friend class Private;
   friend bool platform::PumpMessageLoop(Platform*, Isolate*);
 };
 

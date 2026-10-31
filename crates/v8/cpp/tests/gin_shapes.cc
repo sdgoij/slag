@@ -210,6 +210,46 @@ struct HostAccessor {
 
 HostAccessor host_accessor;
 
+// The data-property and accessor-property forms: a lazy getter (read on every
+// access), a native setter, and a FunctionTemplate accessor pair.
+struct HostProperties {
+  int lazy_reads = 0;
+  int native_writes = 0;
+  int template_reads = 0;
+  int template_writes = 0;
+  int last_written = -1;
+};
+
+HostProperties host_properties;
+
+void HostLazyGet(v8::Local<v8::Name>,
+                 const v8::PropertyCallbackInfo<v8::Value>& info) {
+  ++host_properties.lazy_reads;
+  info.GetReturnValue().Set(v8::Integer::New(info.GetIsolate(), 41));
+}
+
+void HostNativeSet(v8::Local<v8::Name>, v8::Local<v8::Value> value,
+                   const v8::PropertyCallbackInfo<void>& info) {
+  ++host_properties.native_writes;
+  host_properties.last_written =
+      value->Int32Value(info.GetIsolate()->GetCurrentContext()).FromMaybe(-1);
+}
+
+void PropertyTemplateGet(const v8::FunctionCallbackInfo<v8::Value>& info) {
+  ++host_properties.template_reads;
+  info.GetReturnValue().Set(v8::Integer::New(info.GetIsolate(), 77));
+}
+
+void PropertyTemplateSet(const v8::FunctionCallbackInfo<v8::Value>& info) {
+  ++host_properties.template_writes;
+  if (info.Length() > 0) {
+    host_properties.last_written =
+        info[0]
+            ->Int32Value(info.GetIsolate()->GetCurrentContext())
+            .FromMaybe(-1);
+  }
+}
+
 void HostAccessGet(v8::Local<v8::Name> property,
                    const v8::PropertyCallbackInfo<v8::Value>& info) {
   v8::Isolate* isolate = info.GetIsolate();
@@ -1236,6 +1276,175 @@ int main() {
         run("'abc'")->ToObject(current).ToLocalChecked();
     expect(boxed->IsObject() && !boxed->IsString(),
            "ToObject boxes a primitive");
+  }
+
+  // Errors, private names, and the data-property forms: the values a host
+  // throws, the keys it hides, and the accessors a template installs.
+  {
+    v8::HandleScope scope(isolate);
+    v8::Local<v8::Context> current = context.Get(isolate);
+    v8::Context::Scope context_scope(current);
+    const auto expect = [&](bool condition, const char* what) {
+      if (!condition) {
+        fprintf(stderr, "properties: %s\n", what);
+        ++failures;
+      }
+    };
+    const auto run = [&](const char* source) {
+      return v8::Script::Compile(
+                 current, v8::String::NewFromUtf8Literal(isolate, source))
+          .ToLocalChecked()
+          ->Run(current)
+          .ToLocalChecked();
+    };
+    const auto bind = [&](const char* name, v8::Local<v8::Value> value) {
+      current->Global()
+          ->Set(current, v8::String::NewFromUtf8Literal(isolate, name), value)
+          .ToChecked();
+    };
+    const auto number_at = [&](const char* name) {
+      return current->Global()
+          ->Get(current, v8::String::NewFromUtf8Literal(isolate, name))
+          .ToLocalChecked()
+          ->Int32Value(current)
+          .FromMaybe(-1);
+    };
+
+    // The error factories make the engine's own objects, and ThrowException
+    // hands exactly that value to the host.
+    {
+      v8::TryCatch type_catch(isolate);
+      isolate->ThrowException(v8::Exception::TypeError(
+          v8::String::NewFromUtf8Literal(isolate, "bad shape")));
+      expect(type_catch.HasCaught(), "ThrowException was caught");
+      v8::Local<v8::Value> thrown = type_catch.Exception();
+      expect(!thrown.IsEmpty() && thrown->IsNativeError(),
+             "the thrown value is a native error");
+      v8::Local<v8::Object> error = thrown.As<v8::Object>();
+      v8::String::Utf8Value name(
+          isolate, error->Get(current, v8::String::NewFromUtf8Literal(isolate,
+                                                                   "name"))
+                       .ToLocalChecked());
+      v8::String::Utf8Value message(
+          isolate,
+          error->Get(current, v8::String::NewFromUtf8Literal(isolate, "message"))
+              .ToLocalChecked());
+      expect(*name != nullptr && strcmp(*name, "TypeError") == 0 &&
+                 *message != nullptr && strcmp(*message, "bad shape") == 0,
+             "a TypeError carries its name and message");
+      expect(v8::Exception::CreateMessage(isolate, thrown).IsEmpty(),
+             "a runtime error has no source message");
+    }
+    {
+      v8::TryCatch error_catch(isolate);
+      isolate->ThrowException(
+          v8::Exception::RangeError(v8::String::NewFromUtf8Literal(isolate, "q")));
+      v8::Local<v8::Value> thrown = error_catch.Exception();
+      v8::String::Utf8Value name(
+          isolate,
+          thrown.As<v8::Object>()
+              ->Get(current, v8::String::NewFromUtf8Literal(isolate, "name"))
+              .ToLocalChecked());
+      expect(error_catch.HasCaught() && *name != nullptr &&
+                 strcmp(*name, "RangeError") == 0,
+             "a RangeError carries its name");
+    }
+
+    // Private names: ForApi dedupes, New mints, and a private property round
+    // trips by a key the ordinary walks do not list.
+    v8::Local<v8::Private> api_key = v8::Private::ForApi(
+        isolate, v8::String::NewFromUtf8Literal(isolate, "shapes.k"));
+    v8::Local<v8::Private> same_key = v8::Private::ForApi(
+        isolate, v8::String::NewFromUtf8Literal(isolate, "shapes.k"));
+    v8::Local<v8::Private> fresh_a = v8::Private::New(
+        isolate, v8::String::NewFromUtf8Literal(isolate, "shapes.k"));
+    v8::Local<v8::Private> fresh_b = v8::Private::New(
+        isolate, v8::String::NewFromUtf8Literal(isolate, "shapes.k"));
+    expect(api_key.raw() == same_key.raw() &&
+               fresh_a.raw() != fresh_b.raw(),
+           "ForApi dedupes and New mints fresh names");
+    v8::String::Utf8Value key_name(isolate, api_key->Name());
+    expect(*key_name != nullptr && strcmp(*key_name, "shapes.k") == 0,
+           "Private::Name answers the minted name");
+
+    v8::Local<v8::Object> private_host =
+        v8::ObjectTemplate::New(isolate)->NewInstance(current).ToLocalChecked();
+    expect(private_host->SetPrivate(current, api_key,
+                                    v8::Integer::New(isolate, 5))
+                   .FromMaybe(false) &&
+               private_host->HasPrivate(current, api_key).FromMaybe(false) &&
+               private_host->GetPrivate(current, api_key)
+                       .ToLocalChecked()
+                       ->Int32Value(current)
+                       .FromMaybe(-1) == 5,
+           "a private property round trips");
+    bind("privateHost", private_host);
+    run("globalThis.privateKeys = Object.keys(privateHost).length;"
+        " globalThis.privateSymbols ="
+        " Object.getOwnPropertySymbols(privateHost).length;");
+    expect(number_at("privateKeys") == 0, "a private key is not an object key");
+    expect(private_host->DeletePrivate(current, api_key) &&
+               !private_host->HasPrivate(current, api_key).FromMaybe(true),
+           "DeletePrivate removed the property");
+
+    // The template's data-property forms: a lazy getter runs on every read (the
+    // engine has no one-shot slot), and a native setter takes the write.
+    host_properties = HostProperties{};
+    v8::Local<v8::ObjectTemplate> data_template = v8::ObjectTemplate::New(isolate);
+    data_template->SetLazyDataProperty(
+        v8::String::NewFromUtf8Literal(isolate, "lazy"), &HostLazyGet);
+    data_template->SetNativeDataProperty(
+        v8::String::NewFromUtf8Literal(isolate, "native"), &HostLazyGet,
+        &HostNativeSet);
+    data_template->SetNativeDataProperty(
+        v8::String::NewFromUtf8Literal(isolate, "hidden"), &HostLazyGet, nullptr,
+        v8::Local<v8::Value>(), v8::DontEnum);
+    data_template->SetNativeDataProperty(
+        v8::String::NewFromUtf8Literal(isolate, "frozen"), &HostLazyGet,
+        &HostNativeSet, v8::Local<v8::Value>(), v8::ReadOnly);
+    v8::Local<v8::Object> data_host =
+        data_template->NewInstance(current).ToLocalChecked();
+    bind("dataHost", data_host);
+    run("globalThis.lazyValue = dataHost.lazy;"
+        " globalThis.lazyAgain = dataHost.lazy;"
+        " dataHost.native = 33;"
+        " dataHost.frozen = 44;"
+        " globalThis.enumerable = Object.keys(dataHost).join(',');");
+    expect(number_at("lazyValue") == 41 && number_at("lazyAgain") == 41,
+           "a lazy data property answered its getter");
+    expect(host_properties.lazy_reads == 2,
+           "the lazy getter ran on every read");
+    expect(host_properties.native_writes == 1 &&
+               host_properties.last_written == 33,
+           "a native setter took the write");
+    v8::String::Utf8Value enumerable(
+        isolate, current->Global()
+                     ->Get(current, v8::String::NewFromUtf8Literal(
+                                                   isolate, "enumerable"))
+                     .ToLocalChecked());
+    expect(*enumerable != nullptr && strcmp(*enumerable, "lazy,native,frozen") == 0,
+           "DontEnum hid one accessor and left the others");
+
+    // An accessor whose get and set are FunctionTemplates, with the receiver as
+    // this and the assigned value as the setter's first argument.
+    host_properties = HostProperties{};
+    v8::Local<v8::Object> paired_host =
+        v8::ObjectTemplate::New(isolate)->NewInstance(current).ToLocalChecked();
+    v8::Local<v8::FunctionTemplate> getter_template =
+        v8::FunctionTemplate::New(isolate, &PropertyTemplateGet);
+    v8::Local<v8::FunctionTemplate> setter_template =
+        v8::FunctionTemplate::New(isolate, &PropertyTemplateSet);
+    paired_host->SetAccessorProperty(
+        v8::String::NewFromUtf8Literal(isolate, "paired"), getter_template,
+        setter_template);
+    bind("pairedHost", paired_host);
+    run("globalThis.pairedValue = pairedHost.paired;"
+        " pairedHost.paired = 12;");
+    expect(number_at("pairedValue") == 77, "the template getter ran");
+    expect(host_properties.template_reads == 1 &&
+               host_properties.template_writes == 1 &&
+               host_properties.last_written == 12,
+           "the template setter took the write");
   }
 
   // Buffers and typed arrays: the bytes a host hands to JavaScript, the views

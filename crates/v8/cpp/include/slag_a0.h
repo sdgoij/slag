@@ -66,6 +66,25 @@ enum SlagValueType {
   SLAG_VALUE_DATA_VIEW = 1 << 24,
 };
 
+/* `v8::PropertyAttribute` bits, as an accessor is installed with them. The
+ * numbers mirror `runtime::embed`'s `PROPERTY_*` constants. */
+enum SlagPropertyAttribute {
+  SLAG_PROPERTY_READ_ONLY = 1 << 0,
+  SLAG_PROPERTY_DONT_ENUM = 1 << 1,
+  SLAG_PROPERTY_DONT_DELETE = 1 << 2,
+};
+
+/* The built-in error constructors (`v8::Exception::Error` and its siblings). */
+enum SlagExceptionKind {
+  SLAG_EXCEPTION_ERROR = 0,
+  SLAG_EXCEPTION_EVAL_ERROR = 1,
+  SLAG_EXCEPTION_RANGE_ERROR = 2,
+  SLAG_EXCEPTION_REFERENCE_ERROR = 3,
+  SLAG_EXCEPTION_SYNTAX_ERROR = 4,
+  SLAG_EXCEPTION_TYPE_ERROR = 5,
+  SLAG_EXCEPTION_URI_ERROR = 6,
+};
+
 /* A property descriptor as the definer callback receives it
  * (v8::PropertyDescriptor). Each field is present-or-absent, because V8's
  * descriptor distinguishes "not mentioned" from "mentioned and false". */
@@ -250,6 +269,15 @@ int32_t slag_value_is_constructor(SlagContext* context, uint64_t value);
 int32_t slag_value_to_string(SlagContext* context, uint64_t value, uint64_t* out);
 int32_t slag_value_to_number_context(SlagContext* context, uint64_t value, double* out);
 int32_t slag_value_to_object(SlagContext* context, uint64_t value, uint64_t* out);
+/* The built-in error constructors (`v8::Exception`) and an arbitrary throw
+ * (`Isolate::ThrowException`). */
+int32_t slag_exception_new(SlagContext* context, int32_t kind, const uint8_t* text,
+                           size_t len, uint64_t* out);
+int32_t slag_throw_exception(SlagContext* context, uint64_t value);
+/* A symbol with a description, which is how the facade models
+ * `v8::Private`. */
+int32_t slag_symbol_new(const uint8_t* text, size_t len, uint64_t* out);
+int32_t slag_symbol_description(uint64_t value, uint64_t* out);
 uint64_t slag_global(SlagContext* context);
 int32_t slag_object_new(SlagContext* context, size_t internal_fields,
                         int32_t api_wrapper, uint64_t* out);
@@ -290,7 +318,7 @@ int32_t slag_object_register_fn(SlagContext* context, uint64_t object, const uin
                                 size_t name_len, slag_host_fn callback, void* data);
 int32_t slag_object_set_accessor(SlagContext* context, uint64_t object, uint64_t key,
                                  slag_accessor_getter getter, slag_accessor_setter setter,
-                                 void* data);
+                                 void* data, int32_t attributes);
 int32_t slag_object_set(uint64_t object, const uint8_t* key, size_t key_len,
                         uint64_t value);
 int32_t slag_object_get_key(SlagContext* context, uint64_t object, uint64_t key,

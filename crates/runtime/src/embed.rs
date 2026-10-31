@@ -209,6 +209,7 @@ impl FunctionCall<'_> {
             key,
             get,
             set,
+            0,
         )
     }
 
@@ -900,7 +901,7 @@ impl Context {
         set: Option<HostFn>,
     ) -> Result<(), JsError> {
         let property = PropertyKey::from_js_string(&JsString::from_utf8(key));
-        self.define_accessor_key(target, &property, key, get, set)
+        self.define_accessor_key(target, &property, key, get, set, 0)
     }
 
     /// The key-value form of [`define_accessor`](Self::define_accessor), for a
@@ -913,6 +914,7 @@ impl Context {
         label: &str,
         get: Option<HostFn>,
         set: Option<HostFn>,
+        attributes: u8,
     ) -> Result<(), JsError> {
         define_accessor_with(
             realm_function_prototype(&self.agent)?,
@@ -921,6 +923,7 @@ impl Context {
             label,
             get,
             set,
+            attributes,
         )
     }
 
@@ -1285,6 +1288,15 @@ impl Context {
             ValueKind::Function(f) => Ok(JsObject(f.object)),
             _ => unreachable!("ToObject always returns an object or function"),
         }
+    }
+
+    /// A built-in error object (`v8::Exception::Error` and its typed siblings):
+    /// the realm's constructor over the message, so the value is what a script
+    /// catches, with the engine's own `name`, `message`, and stack.
+    pub fn error_value(&mut self, kind: ErrorKind, message: &str) -> Result<JsValue, JsError> {
+        let agent = self.agent_mut();
+        let error = JsError::new(kind, message.to_string());
+        crate::builtins::error::to_throwable(agent, &error).map(JsValue)
     }
 
     /// The V8-style stack the engine captured for `value`, when it is an object
@@ -2004,6 +2016,13 @@ fn own_property_kind_with(
     }))
 }
 
+/// The bits `v8::PropertyAttribute` carries, mirrored by `slag_a0.h`'s
+/// `SLAG_PROPERTY_*` (the same numbers; edit both in one go). An accessor has
+/// no `writable`, so only the other two change its descriptor.
+pub const PROPERTY_READ_ONLY: u8 = 1 << 0;
+pub const PROPERTY_DONT_ENUM: u8 = 1 << 1;
+pub const PROPERTY_DONT_DELETE: u8 = 1 << 2;
+
 /// The shared body of `Context::define_accessor`, `Context::define_accessor_key`,
 /// and `FunctionCall::define_accessor`.
 fn define_accessor_with(
@@ -2013,7 +2032,15 @@ fn define_accessor_with(
     label: &str,
     get: Option<HostFn>,
     set: Option<HostFn>,
+    attributes: u8,
 ) -> Result<(), JsError> {
+    // V8's `ReadOnly` on an accessor means a write is ignored, which the engine
+    // says by having no setter at all.
+    let set = if attributes & PROPERTY_READ_ONLY != 0 {
+        None
+    } else {
+        set
+    };
     let getter = get
         .map(|callback| {
             build_host_fn(
@@ -2043,8 +2070,8 @@ fn define_accessor_with(
             writable: None,
             get: getter,
             set: setter,
-            enumerable: Some(true),
-            configurable: Some(true),
+            enumerable: Some(attributes & PROPERTY_DONT_ENUM == 0),
+            configurable: Some(attributes & PROPERTY_DONT_DELETE == 0),
         },
     )?;
     Ok(())
@@ -3196,6 +3223,66 @@ mod tests {
         assert_eq!(context.external_memory(8), before + 40);
         assert!(context.detach_buffer(&buffer, None));
         assert_eq!(context.external_memory(0), before);
+    }
+
+    #[test]
+    fn error_values_carry_their_kind() {
+        let mut context = Context::new().unwrap();
+        let value = context.error_value(ErrorKind::TypeError, "bad").unwrap();
+        assert!(context.value_type_mask(&value) & VALUE_NATIVE_ERROR != 0);
+        context.set_global("made", value).unwrap();
+        assert_eq!(
+            context.eval("made.name").unwrap().as_string().as_deref(),
+            Some("TypeError")
+        );
+        assert_eq!(
+            context.eval("made.message").unwrap().as_string().as_deref(),
+            Some("bad")
+        );
+    }
+
+    #[test]
+    fn accessor_attributes_are_honoured() {
+        let mut context = Context::new().unwrap();
+        let object = context.eval("({})").unwrap();
+        let target = object.as_object().expect("an object");
+        let get: HostFn = Box::new(|_| Ok(JsValue::number(7.0)));
+        let set_calls = std::rc::Rc::new(std::cell::Cell::new(0));
+        let counted = std::rc::Rc::clone(&set_calls);
+        let set: HostFn = Box::new(move |_| {
+            counted.set(counted.get() + 1);
+            Ok(JsValue::undefined())
+        });
+        let key = PropertyKey::from_js_string(&JsString::from_utf8("hidden"));
+        context
+            .define_accessor_key(
+                &target,
+                &key,
+                "hidden",
+                Some(get),
+                Some(set),
+                PROPERTY_DONT_ENUM | PROPERTY_DONT_DELETE | PROPERTY_READ_ONLY,
+            )
+            .unwrap();
+        context.set_global("host", object).unwrap();
+
+        assert_eq!(context.eval("host.hidden").unwrap().as_number(), Some(7.0));
+        // DontEnum keeps it out of the key walk, and DontDelete refuses `delete`.
+        assert_eq!(
+            context
+                .eval("Object.keys(host).length")
+                .unwrap()
+                .as_number(),
+            Some(0.0)
+        );
+        assert_eq!(
+            context.eval("delete host.hidden").unwrap().as_boolean(),
+            Some(false)
+        );
+        // ReadOnly installs no setter, so a sloppy write is a no-op.
+        context.eval("host.hidden = 1;").unwrap();
+        assert_eq!(set_calls.get(), 0);
+        assert_eq!(context.eval("host.hidden").unwrap().as_number(), Some(7.0));
     }
 
     #[test]

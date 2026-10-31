@@ -261,6 +261,33 @@ answers a string value (`typeof null` is `"object"`). `StrictEquals` is `===`
 (NaN differs from itself) and `SameValue` is `Object.is` (NaN equals itself,
 `+0` and `-0` differ).
 
+### Errors, private names, and data properties
+
+`Exception::Error`, `TypeError`, `RangeError`, `ReferenceError`,
+`SyntaxError`, `EvalError`, and `UriError` make the engine's own error objects
+from a message, so a script catches an object with the usual `name`, `message`,
+and stack. `Isolate::ThrowException(value)` makes any value the pending
+exception, which is what `TryCatch::Exception` hands back.
+`Exception::CreateMessage` answers an empty handle: a position exists only for a
+compile error (see above), and no runtime factory produces one.
+
+`Private::ForApi` mints one name per description for the isolate, `Private::New`
+mints a fresh name per call, and `Private::Name` reads the description back.
+`Object::GetPrivate`/`SetPrivate`/`HasPrivate`/`DeletePrivate` are the ordinary
+key paths with the private value as the key. The engine models a private name as
+a symbol, so the property is hidden from `Object.keys`, `for-in`, and `in` but
+not from `Object.getOwnPropertySymbols`; that is the same half-step the Rust
+bridge documents, and the harness pins it.
+
+`ObjectTemplate::SetNativeDataProperty` and `SetLazyDataProperty` install the
+accessor `SetAccessor` installs: the engine has no one-shot slot, so a lazy
+getter runs on every read rather than once and the property is an accessor
+rather than a data slot. `Object::SetAccessorProperty` installs an accessor
+whose get and set are `FunctionTemplate`s; each runs with the receiver as `this`
+and (for the setter) the assigned value as the first argument. The
+`PropertyAttribute` bits are honoured: `DontEnum` and `DontDelete` reach the
+descriptor, and `ReadOnly` installs no setter.
+
 ### Buffers and typed arrays
 
 `BackingStore` is a handle to the engine's refcounted byte block, so a store
@@ -353,6 +380,13 @@ not a claim that gin itself links.
 - `Isolate::AdjustAmountOfExternalAllocatedMemory` and
   `ExternalMemoryAccounter`, over the engine's live-buffer walk plus the host's
   account.
+- `Exception::Error` and its typed siblings, `Isolate::ThrowException`, and
+  `Exception::CreateMessage` (empty for a runtime value). `Private::ForApi`,
+  `New`, and `Name`, with `Object::GetPrivate`/`SetPrivate`/`HasPrivate`/
+  `DeletePrivate`.
+- `PropertyAttribute`, `ObjectTemplate::SetNativeDataProperty` and
+  `SetLazyDataProperty`, and `Object::SetAccessorProperty` over
+  `FunctionTemplate` getters and setters.
 - Handles and persistents as engine roots: a handle slot or a `Global` over an
   engine value retains it for that object's lifetime, and a facade pointer is
   never registered.
@@ -388,6 +422,10 @@ not a claim that gin itself links.
 - `ArrayBuffer::New` needs an entered `Context::Scope` because the engine
   allocates in a realm; V8 takes the isolate alone. `BackingStore::Data` is the
   block's live base, so a caller must not hold the pointer across a resize.
+- A lazy data property's getter runs on every read (there is no one-shot slot),
+  and a private name is a symbol, so `Object.getOwnPropertySymbols` can see a
+  property V8's private names hide completely. `Signature` is absent, along with
+  the embedder access checks it exists for.
 - `Platform` is a handle plus a message pump: `PumpMessageLoop` runs the
   isolate's queued jobs (microtasks, promise reactions, due timers) and answers
   whether it ran any. There are no host-posted platform tasks or task runners
@@ -451,4 +489,8 @@ differences on `NaN` and the two zeroes, `BooleanValue`, `TypeOf`, and the three
 coercions. Its buffer block writes through an `ArrayBuffer`, a `BackingStore`,
 and a `Uint8Array` and reads the bytes back from the script, then checks the
 view geometry, the out-of-range RangeError, `GetBackingStore`, detach with and
-without a key, `SharedArrayBuffer`, and the external-memory account.
+without a key, `SharedArrayBuffer`, and the external-memory account. The
+property block throws an `Exception::TypeError` and reads its name and message
+back, round-trips a private property (and checks `Object.keys` does not list
+it), reads a lazy and a native data property, checks `DontEnum` and `ReadOnly`,
+and runs a `FunctionTemplate` accessor pair.
