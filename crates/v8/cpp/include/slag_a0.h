@@ -48,8 +48,20 @@ double slag_value_to_number(uint64_t value);
 int32_t slag_value_is_string(uint64_t value);
 int32_t slag_value_is_undefined(uint64_t value);
 uint64_t slag_global(SlagContext* context);
+int32_t slag_object_new(SlagContext* context, size_t internal_fields,
+                        int32_t api_wrapper, uint64_t* out);
+size_t slag_object_internal_field_count(uint64_t object);
+int32_t slag_object_is_api_wrapper(uint64_t object);
+int32_t slag_object_set_internal_field(uint64_t object, size_t index, void* pointer);
+void* slag_object_internal_field(uint64_t object, size_t index);
+int32_t slag_object_register_fn(SlagContext* context, uint64_t object, const uint8_t* name,
+                                size_t name_len, slag_host_fn callback, void* data);
 int32_t slag_object_set(uint64_t object, const uint8_t* key, size_t key_len,
                         uint64_t value);
+int32_t slag_object_get_key(SlagContext* context, uint64_t object, uint64_t key,
+                            uint64_t* out);
+int32_t slag_object_set_key(SlagContext* context, uint64_t object, uint64_t key,
+                            uint64_t value);
 const char* slag_version(void);
 
 #ifdef __cplusplus

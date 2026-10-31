@@ -106,6 +106,33 @@ collection with nothing retaining it. The harness therefore asserts
 holds: constructing the `Global` moves it by exactly one, the scope's own slot
 by another, and `Reset()` back to the original count.
 
+### Internal fields and wrappables
+
+`ObjectTemplate::SetInternalFieldCount` and `ObjectTemplate::NewInstance` give an
+object the shape gin wraps: N internal fields, the template's host functions, and
+`IsApiWrapper` set. `Object::SetAlignedPointerInInternalField` and
+`GetAlignedPointerFromInternalField` (in all three of V8's argument forms) store
+and read the host's pointers, `Object::Wrappable<T>()` reads the wrappable from
+the first field, and `FunctionCallbackInfo::This()` is what a wrappable method
+eeds to recover its C++ object.
+
+The storage is the object's own, not a table. `crux::object::JsObject` carries
+one handle to a box of opaque pointers plus the API-wrapper bit, so the fields
+die with the object. A table keyed by address would be unsound: the arena's free
+list reuses swept slots, so a recycled address would hand a later object an
+earlier object's pointer. The payload goes 424 to 432 bytes, which is the same
+448-byte arena class, so an object that never carries host fields allocates
+exactly as it did before.
+
+`gin-shapes` builds the wrappable shape end to end: a template with one internal
+field and a `bump` method, an instance holding a `HostCounter*`, a forced
+collection with the pointer read back, and `counter.bump(10)` run from a script
+so the method reaches the counter through `this`.
+
+Two deviations, both deliberate. `CppHeapPointerTag` is accepted and not
+inspected, because there is no pointer-tag check to make. `Wrappable<T>` has no
+cppgc `GarbageCollectedMixin` constraint, because the facade has no cppgc.
+
 ## The gin target
 
 Actual `gin` cannot be built standalone. `gin/BUILD.gn` has public deps
@@ -142,6 +169,10 @@ not a claim that gin itself links.
 - `ObjectTemplate`/`FunctionTemplate` and host callbacks with arguments and a
   return value.
 - `Global<T>`, `Maybe<T>`, `MaybeLocal<T>`.
+- `ObjectTemplate::SetInternalFieldCount`/`NewInstance`, internal fields, and
+  `Object::Wrappable<T>`, `IsApiWrapper`, `This()`.
+- `Object::Get`/`Set` by a key value, through the engine's ToPropertyKey (so a
+  numeric or object key names the property the language would).
 - Handles and persistents as engine roots: a handle slot or a `Global` over an
   engine value retains it for that object's lifetime, and a facade pointer is
   never registered.
@@ -151,8 +182,9 @@ not a claim that gin itself links.
 ## What it does not
 
 - It is not source-compatible with the rest of `v8.h`. There are no interceptors,
-  no internal fields, no `Wrappable`, no `TracedReference`, no platform tasks,
-  no snapshots, no inspector.
+  no `cppgc`, no platform tasks, no snapshots, no inspector.
+- `CppHeapPointerTag` is accepted and ignored, and `Wrappable<T>()` does not
+  require a cppgc mixin: the facade has no pointer tags and no cppgc.
 - `Global<T>` keeps a value alive, but a `Global` leaked past `Isolate::Dispose`
   is not detected and leaves a dangling retention in the thread-local registry.
 - `Message` is always empty and `StackTrace` is always empty, so the sample's
@@ -162,8 +194,9 @@ not a claim that gin itself links.
 - `PumpMessageLoop` always returns false; the engine drains jobs inline.
 - `Isolate::Dispose` frees the contexts the facade created; templates are not
   freed.
-- Host callbacks do not receive `this` yet (`FunctionCallbackInfo` has no
-  `This()`).
+- Host callbacks receive `this` now (`FunctionCallbackInfo::This`), but the
+  `Object` surface is only `Get`/`Set` by key: the index forms (`Get(context,
+  uint32_t)`), `Has`, `Delete`, and `GetRealNamedProperty` are still absent.
 - `load()` is compiled but refused at run time. The sample re-enters through
   `ExecuteString`, and the safe engine path for a host callback is
   `FunctionCall::eval` (`slag_call_eval`), which the sample does not call. The

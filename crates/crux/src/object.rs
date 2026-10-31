@@ -922,6 +922,31 @@ pub fn mark_prototype(proto: Option<&Handle<JsObject>>) {
     }
 }
 
+/// The host's internal fields for one object: opaque pointers the engine never
+/// interprets, so `trace` visits nothing.
+///
+/// The object is the only reference to this box, so the fields die with it. That
+/// is what keeps a recycled arena slot from handing a later object an earlier
+/// object's pointer, which is why they are not a table keyed by address.
+pub struct InternalFields {
+    fields: RefCell<Vec<usize>>,
+    /// `v8::Object::IsApiWrapper`: an embedder template made this object.
+    api_wrapper: bool,
+}
+
+impl InternalFields {
+    fn new(count: usize, api_wrapper: bool) -> Self {
+        Self {
+            fields: RefCell::new(vec![0; count]),
+            api_wrapper,
+        }
+    }
+}
+
+impl Trace for InternalFields {
+    fn trace(&self, _visit: &mut dyn FnMut(GcAny)) {}
+}
+
 /// An ECMAScript object. Equality is identity: each object carries a unique
 /// `id` (mirroring `Symbol`), so `Handle<JsObject>` equality and the derived
 /// `PartialEq` on `Value` are identity tests.
@@ -1051,6 +1076,63 @@ pub struct JsObject {
     /// right after creation, then read-only. The BigInt variant stores a GC
     /// handle (a `Copy` handle into the heap), so `boxed` is a trace edge.
     pub boxed: Cell<Option<BoxedPrimitive>>,
+    /// The host's internal fields (`v8::Object::SetAlignedPointerInInternalField`)
+    /// and the API-wrapper bit (`v8::Object::IsApiWrapper`), or `None` for an
+    /// object no embedder template made. A `Cell`-handle rather than a
+    /// collection: the payload goes 424 to 432 bytes, and with the 16-byte
+    /// `GcHeader` both round to the same 448-byte arena class, so an object that
+    /// never carries host fields allocates exactly as it did before.
+    pub internal_fields: Cell<Option<Handle<InternalFields>>>,
+}
+
+impl JsObject {
+    /// How many internal fields this object carries
+    /// (`v8::Object::InternalFieldCount`); 0 for an object no embedder template
+    /// made.
+    pub fn internal_field_count(&self) -> usize {
+        self.internal_fields
+            .get()
+            .map_or(0, |fields| fields.fields.borrow().len())
+    }
+
+    /// Whether an embedder template made this object
+    /// (`v8::Object::IsApiWrapper`).
+    pub fn is_api_wrapper(&self) -> bool {
+        self.internal_fields
+            .get()
+            .is_some_and(|fields| fields.api_wrapper)
+    }
+
+    /// Give this object `count` internal fields, all null, and record whether it
+    /// is an API wrapper. The engine calls this once, at creation: a second call
+    /// would drop the host's pointers, so it does nothing.
+    pub fn set_internal_fields(&self, count: usize, api_wrapper: bool) {
+        if self.internal_fields.get().is_none() {
+            self.internal_fields
+                .set(Some(Handle::new(InternalFields::new(count, api_wrapper))));
+        }
+    }
+
+    /// Write one internal field. `false` when the object has no such field.
+    pub fn set_internal_field(&self, index: usize, pointer: usize) -> bool {
+        let Some(fields) = self.internal_fields.get() else {
+            return false;
+        };
+        let mut fields = fields.fields.borrow_mut();
+        let Some(slot) = fields.get_mut(index) else {
+            return false;
+        };
+        *slot = pointer;
+        true
+    }
+
+    /// The pointer in one internal field, 0 when the object has no such field.
+    pub fn internal_field(&self, index: usize) -> usize {
+        self.internal_fields
+            .get()
+            .and_then(|fields| fields.fields.borrow().get(index).copied())
+            .unwrap_or(0)
+    }
 }
 
 impl Trace for JsObject {
@@ -1080,9 +1162,14 @@ impl Trace for JsObject {
         // The strong function back-reference keeps the function alive while
         // its object part is reachable; `self_handle` is a self-cycle
         // (redundant to mark). The wrapper mirror's BigInt is a GC handle, so
-        // `boxed` is a heap edge too.
+        // `boxed` is a heap edge too. The internal-fields box holds host
+        // pointers, so its own trace visits nothing, but the box must be marked
+        // or the sweep would free it under the object.
         self.function_self.trace(visit);
         self.boxed.trace(visit);
+        if let Some(fields) = self.internal_fields.get() {
+            fields.trace(visit);
+        }
     }
 
     fn request_finalize(&self) {
@@ -1195,6 +1282,7 @@ impl JsObject {
         Self {
             id: next_object_id(),
             kind: ObjectKind::Ordinary,
+            internal_fields: Cell::new(None),
             array_dense: Cell::new(None),
             typed_array: Cell::new(None),
             prototype: Cell::new(prototype),
@@ -1231,6 +1319,10 @@ impl JsObject {
         unsafe {
             std::ptr::write(std::ptr::addr_of_mut!((*this).id), next_object_id());
             std::ptr::write(std::ptr::addr_of_mut!((*this).kind), ObjectKind::Ordinary);
+            std::ptr::write(
+                std::ptr::addr_of_mut!((*this).internal_fields),
+                Cell::new(None),
+            );
             std::ptr::write(std::ptr::addr_of_mut!((*this).array_dense), Cell::new(None));
             std::ptr::write(std::ptr::addr_of_mut!((*this).typed_array), Cell::new(None));
             std::ptr::write(
@@ -1564,6 +1656,7 @@ impl JsObject {
         Self {
             id: next_object_id(),
             kind,
+            internal_fields: Cell::new(None),
             array_dense: Cell::new(None),
             typed_array: Cell::new(None),
             prototype: Cell::new(prototype),
@@ -1591,6 +1684,7 @@ impl JsObject {
         let object = Handle::new(Self {
             id: next_object_id(),
             kind: ObjectKind::IsHTMLDDA,
+            internal_fields: Cell::new(None),
             array_dense: Cell::new(None),
             typed_array: Cell::new(None),
             prototype: Cell::new(prototype),
@@ -1643,6 +1737,10 @@ impl JsObject {
                 std::ptr::write(
                     std::ptr::addr_of_mut!((*this).kind),
                     ObjectKind::Array(slots),
+                );
+                std::ptr::write(
+                    std::ptr::addr_of_mut!((*this).internal_fields),
+                    Cell::new(None),
                 );
                 std::ptr::write(
                     std::ptr::addr_of_mut!((*this).array_dense),
@@ -1756,6 +1854,7 @@ impl JsObject {
         let string = Handle::new(Self {
             id: next_object_id(),
             kind: ObjectKind::String(Handle::new(value)),
+            internal_fields: Cell::new(None),
             array_dense: Cell::new(None),
             typed_array: Cell::new(None),
             prototype: Cell::new(prototype),
@@ -1794,6 +1893,7 @@ impl JsObject {
         let proxy = Handle::new(Self {
             id: next_object_id(),
             kind: ObjectKind::Proxy(Handle::new(slots)),
+            internal_fields: Cell::new(None),
             array_dense: Cell::new(None),
             typed_array: Cell::new(None),
             prototype: Cell::new(None),
@@ -1827,6 +1927,7 @@ impl JsObject {
         let object = Handle::new(Self {
             id: next_object_id(),
             kind: ObjectKind::IntegerIndexed(slots_handle),
+            internal_fields: Cell::new(None),
             array_dense: Cell::new(None),
             typed_array: Cell::new(Some(slots_handle)),
             prototype: Cell::new(prototype),
@@ -1941,6 +2042,7 @@ impl JsObject {
                 exports,
                 deferred,
             })),
+            internal_fields: Cell::new(None),
             array_dense: Cell::new(None),
             typed_array: Cell::new(None),
             prototype: Cell::new(None),
@@ -2001,6 +2103,7 @@ impl JsObject {
                 env: None,
                 formals: formals.to_vec(),
             })),
+            internal_fields: Cell::new(None),
             array_dense: Cell::new(None),
             typed_array: Cell::new(None),
             prototype: Cell::new(prototype),
@@ -2105,6 +2208,7 @@ impl JsObject {
                 env: None,
                 formals: Vec::new(),
             })),
+            internal_fields: Cell::new(None),
             array_dense: Cell::new(None),
             typed_array: Cell::new(None),
             prototype: Cell::new(prototype),
@@ -5754,6 +5858,45 @@ pub(crate) fn value_get_method(value: &Value, key: &JsString) -> Result<Option<V
 mod tests {
     use super::*;
     use crate::symbol::Symbol;
+
+    #[test]
+    fn internal_fields_round_trip_and_stay_out_of_the_property_table() {
+        let object = JsObject::ordinary_object_create(None);
+        assert_eq!(object.internal_field_count(), 0);
+        assert!(!object.is_api_wrapper());
+        assert!(
+            !object.set_internal_field(0, 0x1122),
+            "an object with no fields rejects a write"
+        );
+
+        object.set_internal_fields(2, true);
+        assert_eq!(object.internal_field_count(), 2);
+        assert!(object.is_api_wrapper());
+        assert_eq!(object.internal_field(0), 0, "a fresh field reads null");
+        assert!(object.set_internal_field(1, 0xdead_beef));
+        assert_eq!(object.internal_field(1), 0xdead_beef);
+        assert!(!object.set_internal_field(2, 0x33), "out of range");
+        assert_eq!(object.internal_field(7), 0, "out of range reads null");
+
+        // The fields are the host's, not the language's: no own properties.
+        assert_eq!(object.properties.borrow().len(), 0);
+
+        // A second set would drop the pointers the host already stored.
+        object.set_internal_fields(4, false);
+        assert_eq!(object.internal_field_count(), 2);
+        assert!(object.is_api_wrapper());
+    }
+
+    #[test]
+    #[cfg(target_pointer_width = "64")]
+    fn the_internal_field_slot_costs_no_arena_bytes() {
+        // The payload grew 424 -> 432 B. With the 16-byte `GcHeader` that is
+        // 440 -> 448 before rounding to the 16-byte class, so both land in the
+        // 448-byte class and an object that never carries host fields allocates
+        // exactly as it did before. A field that pushed the payload past 432
+        // would move every object up a class, which is what this guards.
+        assert_eq!(std::mem::size_of::<JsObject>(), 432);
+    }
 
     #[test]
     fn map_described_inline_holes_read_absent_until_written() {

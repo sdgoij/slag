@@ -40,8 +40,8 @@ std::string ValueText(uint64_t value) {
 uint64_t HostTrampoline(void* data, const void* call, uint64_t this_value,
                         const uint64_t* args, size_t len) {
   auto* function = static_cast<v8::FunctionTemplate*>(data);
-  (void)this_value;
-  v8::FunctionCallbackInfo<v8::Value> info(v8::g_current_isolate, call, args,
+  v8::FunctionCallbackInfo<v8::Value> info(v8::g_current_isolate, call,
+                                           this_value, args,
                                            static_cast<int>(len));
   function->callback()(info);
   return info.return_value();
@@ -87,6 +87,59 @@ bool Value::IsUndefined() const {
 }
 
 bool Value::IsString() const { return slag_value_is_string(Raw(this)) != 0; }
+
+int Object::InternalFieldCount() const {
+  return static_cast<int>(slag_object_internal_field_count(Raw(this)));
+}
+
+bool Object::IsApiWrapper() const {
+  return slag_object_is_api_wrapper(Raw(this)) != 0;
+}
+
+void Object::SetAlignedPointerInInternalField(int index, void* value,
+                                              CppHeapPointerTag) {
+  if (index < 0) return;
+  slag_object_set_internal_field(Raw(this), static_cast<size_t>(index), value);
+}
+
+void* Object::GetAlignedPointerFromInternalField(int index) const {
+  if (index < 0) return nullptr;
+  return slag_object_internal_field(Raw(this), static_cast<size_t>(index));
+}
+
+void* Object::GetAlignedPointerFromInternalField(Isolate*, int index) const {
+  return GetAlignedPointerFromInternalField(index);
+}
+
+void* Object::GetAlignedPointerFromInternalField(Local<Context>,
+                                                 int index) const {
+  return GetAlignedPointerFromInternalField(index);
+}
+
+MaybeLocal<Value> Object::Get(Local<Context> context, Local<Value> key) {
+  if (context.IsEmpty() || key.IsEmpty()) return MaybeLocal<Value>();
+  auto* current = reinterpret_cast<Context*>(
+      static_cast<uintptr_t>(context.raw()));
+  uint64_t out = 0;
+  if (slag_object_get_key(current->slag(), Raw(this), key.raw(), &out) != 0) {
+    return MaybeLocal<Value>();
+  }
+  return Local<Value>::New(out);
+}
+
+Maybe<bool> Object::Set(Local<Context> context, Local<Value> key,
+                        Local<Value> value) {
+  if (context.IsEmpty() || key.IsEmpty() || value.IsEmpty()) {
+    return Maybe<bool>();
+  }
+  auto* current = reinterpret_cast<Context*>(
+      static_cast<uintptr_t>(context.raw()));
+  if (slag_object_set_key(current->slag(), Raw(this), key.raw(), value.raw()) !=
+      0) {
+    return Maybe<bool>();
+  }
+  return Maybe<bool>(true);
+}
 
 Local<Number> Number::New(Isolate*, double value) {
   return Local<Number>::New(slag_number_new(value));
@@ -196,6 +249,30 @@ void ObjectTemplate::Set(Isolate*, const char* name,
       name == nullptr ? std::string() : std::string(name),
       reinterpret_cast<FunctionTemplate*>(
           static_cast<uintptr_t>(function.raw()))});
+}
+
+MaybeLocal<Object> ObjectTemplate::NewInstance(Local<Context> context) {
+  if (context.IsEmpty()) return MaybeLocal<Object>();
+  auto* current = reinterpret_cast<Context*>(
+      static_cast<uintptr_t>(context.raw()));
+  SlagContext* slag = current->slag();
+
+  uint64_t object = 0;
+  if (slag_object_new(slag, static_cast<size_t>(internal_fields_), 1, &object) !=
+      0) {
+    return MaybeLocal<Object>();
+  }
+  // The functions below allocate, so the instance has to be a root first.
+  Local<Object> instance = Local<Object>::New(object);
+  for (const auto& entry : entries_) {
+    if (slag_object_register_fn(
+            slag, object,
+            reinterpret_cast<const uint8_t*>(entry.name.data()),
+            entry.name.size(), &HostTrampoline, entry.function) != 0) {
+      return MaybeLocal<Object>();
+    }
+  }
+  return instance;
 }
 
 Local<Context> Context::New(Isolate* isolate, std::nullptr_t,

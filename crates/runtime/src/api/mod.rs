@@ -1277,6 +1277,35 @@ mod tests {
     }
 
     #[test]
+    fn a_template_instance_carries_its_internal_fields() {
+        let mut isolate = isolate();
+        let context = context(&mut isolate);
+        let template = ObjectTemplate::new(&mut isolate);
+        template.set_internal_field_count(2);
+
+        let object = template.new_instance(&context).unwrap();
+        let fields = object
+            .value()
+            .as_object()
+            .expect("an instance is an object");
+        assert_eq!(fields.internal_field_count(), 2);
+        assert!(fields.is_api_wrapper(), "a template made it");
+        assert_eq!(fields.internal_field(0), 0, "a fresh field is null");
+
+        let mut marker = Box::new(7u8);
+        let pointer = (&mut *marker as *mut u8) as usize;
+        assert!(fields.set_internal_field(0, pointer));
+        assert_eq!(fields.internal_field(0), pointer);
+        assert!(!fields.set_internal_field(2, pointer), "past the end");
+
+        // The global object was not made by a template.
+        let global = context.global();
+        let plain = global.value().as_object().expect("the global is an object");
+        assert_eq!(plain.internal_field_count(), 0);
+        assert!(!plain.is_api_wrapper());
+    }
+
+    #[test]
     fn external_round_trips_host_pointers() {
         let mut isolate = isolate();
         let context = context(&mut isolate);

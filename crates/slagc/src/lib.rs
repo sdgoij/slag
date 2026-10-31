@@ -76,6 +76,32 @@ fn reentrant(context: &SlagContext) {
     );
 }
 
+/// Wrap a C callback in the engine's `HostFn`, with this context's pending-error
+/// slot: a callback that set an error fails the call rather than returning.
+fn host_fn(context: &SlagContext, callback: SlagHostFn, data: *mut c_void) -> HostFn {
+    let pending = Rc::clone(&context.pending_error);
+    Box::new(move |call: &FunctionCall<'_>| {
+        let args: Vec<u64> = call.args().iter().map(JsValue::to_bits).collect();
+        let this = call.this().to_bits();
+        let produced = match callback {
+            Some(callback) => unsafe {
+                callback(
+                    data,
+                    call as *const FunctionCall<'_> as *const c_void,
+                    this,
+                    args.as_ptr(),
+                    args.len(),
+                )
+            },
+            None => JsValue::undefined().to_bits(),
+        };
+        if let Some(message) = pending.borrow_mut().take() {
+            return Err(JsError::new(ErrorKind::Error, message));
+        }
+        Ok(JsValue::from_bits(produced))
+    })
+}
+
 thread_local! {
     /// The values the facade's handle slots still hold. The engine consults
     /// this as a root source, so a `Local<T>` is a precise root rather than a
@@ -296,27 +322,7 @@ pub unsafe extern "C" fn slag_register_fn(
     let Ok(name) = text(name, name_len) else {
         return 2;
     };
-    let pending = Rc::clone(&context.pending_error);
-    let host: HostFn = Box::new(move |call: &FunctionCall<'_>| {
-        let args: Vec<u64> = call.args().iter().map(JsValue::to_bits).collect();
-        let this = call.this().to_bits();
-        let produced = match callback {
-            Some(callback) => unsafe {
-                callback(
-                    data,
-                    call as *const FunctionCall<'_> as *const c_void,
-                    this,
-                    args.as_ptr(),
-                    args.len(),
-                )
-            },
-            None => JsValue::undefined().to_bits(),
-        };
-        if let Some(message) = pending.borrow_mut().take() {
-            return Err(JsError::new(ErrorKind::Error, message));
-        }
-        Ok(JsValue::from_bits(produced))
-    });
+    let host = host_fn(context, callback, data);
     let Ok(mut engine) = context.context.try_borrow_mut() else {
         reentrant(context);
         return 1;
@@ -536,6 +542,204 @@ pub unsafe extern "C" fn slag_object_set(
     }
 }
 
+/// Create an ordinary object in `context`'s realm with `count` internal fields,
+/// writing its tagged value to `out`. `api_wrapper` sets
+/// `v8::Object::IsApiWrapper`: this is the engine half of
+/// `v8::ObjectTemplate::NewInstance`. An internal field is the host's untraced
+/// pointer, not something the language can see.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn slag_object_new(
+    context: *mut SlagContext,
+    count: usize,
+    api_wrapper: i32,
+    out: *mut u64,
+) -> i32 {
+    let Some(context) = context.as_ref() else {
+        return 2;
+    };
+    let created = {
+        let engine = match context.context.try_borrow() {
+            Ok(engine) => engine,
+            Err(_) => {
+                reentrant(context);
+                return 1;
+            }
+        };
+        engine.create_object()
+    };
+    let object = match created {
+        Ok(object) => object,
+        Err(error) => {
+            record(context, error);
+            return 1;
+        }
+    };
+    object.set_internal_fields(count, api_wrapper != 0);
+    if !out.is_null() {
+        *out = object.as_value().to_bits();
+    }
+    0
+}
+
+/// How many internal fields `object` carries
+/// (`v8::Object::InternalFieldCount`); 0 for a non-object and for an object no
+/// template made.
+#[unsafe(no_mangle)]
+pub extern "C" fn slag_object_internal_field_count(object: u64) -> usize {
+    JsValue::from_bits(object)
+        .as_object()
+        .map_or(0, |object| object.internal_field_count())
+}
+
+/// Whether an embedder template made `object`
+/// (`v8::Object::IsApiWrapper`).
+#[unsafe(no_mangle)]
+pub extern "C" fn slag_object_is_api_wrapper(object: u64) -> i32 {
+    i32::from(
+        JsValue::from_bits(object)
+            .as_object()
+            .is_some_and(|object| object.is_api_wrapper()),
+    )
+}
+
+/// Write one internal field (`v8::Object::SetAlignedPointerInInternalField`).
+/// Returns 2 when the object has no such field, where V8 aborts.
+#[unsafe(no_mangle)]
+pub extern "C" fn slag_object_set_internal_field(
+    object: u64,
+    index: usize,
+    pointer: *mut c_void,
+) -> i32 {
+    match JsValue::from_bits(object).as_object() {
+        Some(object) if object.set_internal_field(index, pointer as usize) => 0,
+        _ => 2,
+    }
+}
+
+/// The pointer in one internal field
+/// (`v8::Object::GetAlignedPointerFromInternalField`), null when there is none.
+#[unsafe(no_mangle)]
+pub extern "C" fn slag_object_internal_field(object: u64, index: usize) -> *mut c_void {
+    JsValue::from_bits(object)
+        .as_object()
+        .map_or(std::ptr::null_mut(), |object| {
+            object.internal_field(index) as *mut c_void
+        })
+}
+
+/// Define a host function on `object`: the per-instance methods a template's
+/// `NewInstance` carries. The property roots the function.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn slag_object_register_fn(
+    context: *mut SlagContext,
+    object: u64,
+    name: *const u8,
+    name_len: usize,
+    callback: SlagHostFn,
+    data: *mut c_void,
+) -> i32 {
+    let Some(context) = context.as_ref() else {
+        return 2;
+    };
+    let Ok(name) = text(name, name_len) else {
+        return 2;
+    };
+    let Some(object) = JsValue::from_bits(object).as_object() else {
+        return 2;
+    };
+    let host = host_fn(context, callback, data);
+    let created = {
+        let engine = match context.context.try_borrow() {
+            Ok(engine) => engine,
+            Err(_) => {
+                reentrant(context);
+                return 1;
+            }
+        };
+        engine.create_function(name, 0, host)
+    };
+    let function = match created {
+        Ok(function) => function,
+        Err(error) => {
+            record(context, error);
+            return 1;
+        }
+    };
+    match object.set(name, function) {
+        Ok(()) => 0,
+        Err(error) => {
+            record(context, error);
+            1
+        }
+    }
+}
+
+/// [[Get]] a property by a key value (`v8::Object::Get`), writing the result to
+/// `out`. ToPropertyKey runs in the engine, so a numeric or object key reads the
+/// property the language would.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn slag_object_get_key(
+    context: *mut SlagContext,
+    object: u64,
+    key: u64,
+    out: *mut u64,
+) -> i32 {
+    let Some(context) = context.as_mut() else {
+        return 2;
+    };
+    let result = {
+        let Ok(mut engine) = context.context.try_borrow_mut() else {
+            reentrant(context);
+            return 1;
+        };
+        engine.get_property(JsValue::from_bits(object), JsValue::from_bits(key))
+    };
+    match result {
+        Ok(value) => {
+            if !out.is_null() {
+                *out = value.to_bits();
+            }
+            0
+        }
+        Err(error) => {
+            record(context, error);
+            1
+        }
+    }
+}
+
+/// [[Set]] a property by a key value (`v8::Object::Set`), throwing on failure as
+/// V8's throwing mode does.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn slag_object_set_key(
+    context: *mut SlagContext,
+    object: u64,
+    key: u64,
+    value: u64,
+) -> i32 {
+    let Some(context) = context.as_mut() else {
+        return 2;
+    };
+    let result = {
+        let Ok(mut engine) = context.context.try_borrow_mut() else {
+            reentrant(context);
+            return 1;
+        };
+        engine.set_property(
+            JsValue::from_bits(object),
+            JsValue::from_bits(key),
+            JsValue::from_bits(value),
+        )
+    };
+    match result {
+        Ok(()) => 0,
+        Err(error) => {
+            record(context, error);
+            1
+        }
+    }
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn slag_version() -> *const c_char {
     c"slag-a0".as_ptr()
@@ -712,6 +916,84 @@ mod tests {
                 0
             );
             assert_eq!(slag_value_to_number(value), 42.0);
+
+            slag_context_free(context);
+            slag_isolate_free(isolate);
+        }
+    }
+
+    #[test]
+    fn an_api_object_carries_host_pointers_and_instance_methods() {
+        unsafe extern "C" fn double(
+            _data: *mut c_void,
+            _call: *const c_void,
+            _this: u64,
+            args: *const u64,
+            len: usize,
+        ) -> u64 {
+            let arg = if len == 0 {
+                0.0
+            } else {
+                slag_value_to_number(*args)
+            };
+            JsValue::number(arg * 2.0).to_bits()
+        }
+
+        unsafe {
+            let isolate = slag_isolate_new();
+            let context = slag_context_new(isolate);
+
+            let mut object = 0;
+            assert_eq!(slag_object_new(context, 2, 1, &mut object), 0);
+            assert_eq!(slag_object_internal_field_count(object), 2);
+            assert_eq!(slag_object_is_api_wrapper(object), 1);
+            let mut marker = Box::new(7u8);
+            let pointer: *mut c_void = (&mut *marker as *mut u8).cast();
+            assert_eq!(
+                slag_object_internal_field(object, 0),
+                std::ptr::null_mut(),
+                "a fresh slot"
+            );
+            assert_eq!(slag_object_set_internal_field(object, 0, pointer), 0);
+            assert_eq!(slag_object_internal_field(object, 0), pointer);
+            assert_eq!(
+                slag_object_set_internal_field(object, 2, pointer),
+                2,
+                "past the end"
+            );
+
+            // An instance method, as a template's NewInstance would define.
+            let name = b"twice";
+            assert_eq!(
+                slag_object_register_fn(
+                    context,
+                    object,
+                    name.as_ptr(),
+                    name.len(),
+                    Some(double),
+                    std::ptr::null_mut()
+                ),
+                0
+            );
+
+            let key = b"thing";
+            assert_eq!(
+                slag_object_set(slag_global(context), key.as_ptr(), key.len(), object),
+                0
+            );
+            let source = b"thing.twice(21)";
+            let mut value = 0;
+            assert_eq!(
+                slag_eval(context, source.as_ptr(), source.len(), &mut value),
+                0
+            );
+            assert_eq!(slag_value_to_number(value), 42.0);
+
+            // An ordinary object answers the same questions with zeroes.
+            let plain = slag_global(context);
+            assert_eq!(slag_object_internal_field_count(plain), 0);
+            assert_eq!(slag_object_is_api_wrapper(plain), 0);
+            assert_eq!(slag_object_internal_field(plain, 0), std::ptr::null_mut());
 
             slag_context_free(context);
             slag_isolate_free(isolate);

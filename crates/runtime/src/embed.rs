@@ -585,6 +585,36 @@ impl Context {
         )))
     }
 
+    /// [[Get]] a property by the key value a host built (`v8::Object::Get`):
+    /// ToPropertyKey runs through the agent, so a numeric or object key reads the
+    /// property the language would.
+    pub fn get_property(&mut self, object: JsValue, key: JsValue) -> Result<JsValue, JsError> {
+        let base = object.into_value();
+        let key_value = key.into_value();
+        let key = crate::context::to_property_key(self.agent_mut(), &key_value)?;
+        crate::context::get_property_key(self.agent_mut(), &base, &key, base).map(JsValue)
+    }
+
+    /// [[Set]] a property by the key value a host built (`v8::Object::Set`),
+    /// throwing on failure as V8's throwing mode does.
+    pub fn set_property(
+        &mut self,
+        object: JsValue,
+        key: JsValue,
+        value: JsValue,
+    ) -> Result<(), JsError> {
+        let key_value = key.into_value();
+        let key = crate::context::to_property_key(self.agent_mut(), &key_value)?;
+        let Some(object) = object.as_object() else {
+            return Err(JsError::new(
+                ErrorKind::TypeError,
+                "value is not an object".into(),
+            ));
+        };
+        object.0.set_key(&key, value.into_value(), true)?;
+        Ok(())
+    }
+
     /// A fresh dense array inheriting `%Array.prototype%` with one own data
     /// property per value — `Array.isArray` is true and `length` is
     /// `values.len()` (no `eval("[]")` needed; the array and its elements are
@@ -2305,6 +2335,36 @@ impl JsObject {
     pub fn as_value(&self) -> JsValue {
         JsValue(Value::Object(self.0))
     }
+
+    /// How many internal fields this object carries
+    /// (`v8::Object::InternalFieldCount`).
+    pub fn internal_field_count(&self) -> usize {
+        self.0.internal_field_count()
+    }
+
+    /// Whether an embedder template made this object
+    /// (`v8::Object::IsApiWrapper`).
+    pub fn is_api_wrapper(&self) -> bool {
+        self.0.is_api_wrapper()
+    }
+
+    /// Give this object `count` internal fields and record whether it is an API
+    /// wrapper. A second call is a no-op: it would drop the host's pointers.
+    pub fn set_internal_fields(&self, count: usize, api_wrapper: bool) {
+        self.0.set_internal_fields(count, api_wrapper);
+    }
+
+    /// Write one internal field; `false` when the object has no such field
+    /// (`v8::Object::SetAlignedPointerInInternalField`).
+    pub fn set_internal_field(&self, index: usize, pointer: usize) -> bool {
+        self.0.set_internal_field(index, pointer)
+    }
+
+    /// The pointer in one internal field, 0 when there is none
+    /// (`v8::Object::GetAlignedPointerFromInternalField`).
+    pub fn internal_field(&self, index: usize) -> usize {
+        self.0.internal_field(index)
+    }
 }
 
 impl From<Handle<CruxObject>> for JsObject {
@@ -2466,6 +2526,44 @@ mod tests {
         assert_eq!(seen[0].length, 2);
         assert_eq!(seen[0].first.as_deref(), Some("a"));
         assert_eq!(seen[0].args, 2);
+    }
+
+    #[test]
+    fn a_property_key_goes_through_to_property_key() {
+        let mut context = Context::new().unwrap();
+        let object = context.create_object().unwrap();
+        context
+            .set_property(
+                object.as_value(),
+                JsValue::number(7.0),
+                JsValue::number(3.0),
+            )
+            .unwrap();
+        // The number key and the string key name the same property, because the
+        // engine's ToPropertyKey runs, not a facade-side conversion.
+        assert_eq!(
+            context
+                .get_property(object.as_value(), JsValue::string("7"))
+                .unwrap()
+                .as_number(),
+            Some(3.0)
+        );
+        // A host object with a `toString` is coerced by the language, not read
+        // as the object's identity.
+        context
+            .eval("globalThis.keyed = { toString: () => 'made' }")
+            .unwrap();
+        let keyed = context.eval("keyed").unwrap();
+        context
+            .set_property(object.as_value(), keyed, JsValue::number(4.0))
+            .unwrap();
+        assert_eq!(
+            context
+                .get_property(object.as_value(), JsValue::string("made"))
+                .unwrap()
+                .as_number(),
+            Some(4.0)
+        );
     }
 
     #[test]

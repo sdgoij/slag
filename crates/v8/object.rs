@@ -2,6 +2,7 @@
 //! `v8::Map`, `v8::Set`).
 
 use std::collections::HashSet;
+use std::ffi::c_void;
 use std::num::NonZeroI32;
 
 use crate::data::{
@@ -94,6 +95,45 @@ impl Object {
 }
 
 impl<'s> LocalHandle<'s, Object> {
+    /// How many internal fields this object carries
+    /// (`v8::Object::InternalFieldCount`).
+    pub fn internal_field_count(&self) -> i32 {
+        self.engine()
+            .value()
+            .as_object()
+            .map_or(0, |object| object.internal_field_count() as i32)
+    }
+
+    /// Store a host pointer in one internal field
+    /// (`v8::Object::SetAlignedPointerInInternalField`).
+    ///
+    /// The field is the host's: the engine never traces it, and it lives exactly
+    /// as long as the object (V8's rule too, which is why V8 aborts on an index
+    /// past the object's count; here the write is simply refused).
+    pub fn set_aligned_pointer_in_internal_field(&self, index: i32, data: *mut c_void) {
+        let Some(index) = usize::try_from(index).ok() else {
+            return;
+        };
+        if let Some(object) = self.engine().value().as_object() {
+            object.set_internal_field(index, data as usize);
+        }
+    }
+
+    /// The host pointer in one internal field
+    /// (`v8::Object::GetAlignedPointerFromInternalField`), null when the object
+    /// has no such field.
+    pub fn get_aligned_pointer_from_internal_field(&self, index: i32) -> *mut c_void {
+        let Some(index) = usize::try_from(index).ok() else {
+            return std::ptr::null_mut();
+        };
+        self.engine()
+            .value()
+            .as_object()
+            .map_or(std::ptr::null_mut(), |object| {
+                object.internal_field(index) as *mut c_void
+            })
+    }
+
     /// [[Get]] a property by a private name (`v8::Object::GetPrivate`).
     ///
     /// A private name is a symbol here — see [`private`](crate::private) — so

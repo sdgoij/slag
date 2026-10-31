@@ -337,15 +337,14 @@ impl<'s> LocalHandle<'s, ObjectTemplate> {
         Some(Local::from_engine(value))
     }
 
-    /// Record how many internal fields instances get
+    /// Set how many internal fields instances get
     /// (`v8::ObjectTemplate::SetInternalFieldCount`).
     ///
-    /// The count is recorded and reported back, and that is the whole of it:
-    /// this engine's objects have no internal-field slots, and the crate's
-    /// `SetAlignedPointerInInternalField` and its reader are deliberately absent
-    /// rather than present-and-wrong — a host that needs a slot has to ask for
-    /// one through [`Context`](crate::Context)'s embedder data, which the
-    /// isolate does keep.
+    /// An instance of this template carries that many `v8::Object` internal
+    /// fields, which a host writes with
+    /// [`set_aligned_pointer_in_internal_field`](crate::Object) and reads with
+    /// [`get_aligned_pointer_from_internal_field`](crate::Object); the engine
+    /// stores them on the object and never traces them.
     pub fn set_internal_field_count(&self, count: usize) {
         self.object_template().set_internal_field_count(count);
     }

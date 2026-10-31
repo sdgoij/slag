@@ -587,10 +587,9 @@ pub struct ObjectTemplate {
     /// template), so the link has to be here to be found when the object is made.
     /// Weak, because the function template holds this template.
     owner: RefCell<Option<Weak<FunctionTemplate>>>,
-    /// How many internal fields instances were promised. Recorded and reported,
-    /// and nothing else: an object here has no internal-field slots (see the
-    /// bridge's `set_internal_field_count`, which says the same where a host
-    /// would look).
+    /// How many internal fields instances were promised. An instance carries
+    /// that many `v8::Object` internal fields, which the host owns (the engine
+    /// never traces them): see `JsObject::internal_fields`.
     internal_field_count: std::cell::Cell<usize>,
     /// Host state the embedder attached. The engine never reads it: it is where
     /// a bridge keeps its own view of a template, which then lives exactly as
@@ -824,7 +823,9 @@ impl ObjectTemplate {
     /// An instance of a function's [`instance_template`](FunctionTemplate::instance_template)
     /// gets that function's `.prototype` as its prototype — the link that puts a
     /// class's methods in reach — and an instance of a plain object template gets
-    /// %Object.prototype%.
+    /// %Object.prototype%. It also carries the template's internal-field count
+    /// and is an API wrapper, which is what makes it a wrapper an embedder can
+    /// hang its own object on.
     pub fn new_instance(&self, context: &Context) -> Result<Local, JsError> {
         let owner_prototype = match self.owner.borrow().as_ref().and_then(Weak::upgrade) {
             Some(owner) => {
@@ -841,6 +842,7 @@ impl ObjectTemplate {
                 .and_then(|value| value.as_object())
         });
         let object = JsObject::ordinary_object_create(object_prototype);
+        object.set_internal_fields(self.internal_field_count.get(), true);
         self.apply(context.realm(), &object)?;
         Ok(Local(Value::Object(object)))
     }
@@ -952,6 +954,7 @@ impl ObjectTemplate {
             .get("%Object.prototype%")
             .and_then(|value| value.as_object());
         let object = JsObject::ordinary_object_create(object_prototype);
+        object.set_internal_fields(self.internal_field_count.get(), true);
         self.apply(realm, &object)?;
         Ok(Value::Object(object))
     }

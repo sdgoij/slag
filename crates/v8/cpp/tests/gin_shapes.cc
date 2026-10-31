@@ -28,6 +28,25 @@ int NumberArg(const v8::FunctionCallbackInfo<v8::Value>& info, int index) {
       .FromMaybe(0);
 }
 
+// The C++ object a wrapper names: gin keeps its pointer in the wrapper's first
+// internal field, and the wrapper's methods recover it from `this`.
+struct HostCounter {
+  int value;
+};
+
+void Bump(const v8::FunctionCallbackInfo<v8::Value>& info) {
+  auto* counter = info.This().As<v8::Object>()->Wrappable<HostCounter>();
+  if (counter == nullptr) {
+    fprintf(stderr, "a wrappable method lost its object\n");
+    info.GetReturnValue().Set(v8::Integer::New(info.GetIsolate(), -1));
+    return;
+  }
+  const int by = NumberArg(info, 0);
+  counter->value += by == 0 ? 1 : by;
+  info.GetReturnValue().Set(
+      v8::Integer::New(info.GetIsolate(), counter->value));
+}
+
 void Print(const v8::FunctionCallbackInfo<v8::Value>& info) {
   for (int i = 0; i < info.Length(); ++i) {
     v8::HandleScope scope(info.GetIsolate());
@@ -165,6 +184,107 @@ int main() {
       ++failures;
     }
     delete pinned;
+  }
+
+  // A gin-shaped wrappable: a template with one internal field and a method,
+  // an instance carrying a host pointer, and the pointer read back through
+  // `this` after a collection has run.
+  {
+    v8::HandleScope scope(isolate);
+    v8::Local<v8::Context> current = context.Get(isolate);
+
+    v8::Local<v8::ObjectTemplate> tmpl = v8::ObjectTemplate::New(isolate);
+    tmpl->SetInternalFieldCount(1);
+    tmpl->Set(isolate, "bump", v8::FunctionTemplate::New(isolate, Bump));
+    if (tmpl->InternalFieldCount() != 1) {
+      fprintf(stderr, "the template forgot its internal field count\n");
+      ++failures;
+    }
+
+    v8::Local<v8::Object> wrapper = tmpl->NewInstance(current).ToLocalChecked();
+    if (wrapper->InternalFieldCount() != 1) {
+      fprintf(stderr, "an instance has %d internal fields, expected 1\n",
+              wrapper->InternalFieldCount());
+      ++failures;
+    }
+    if (!wrapper->IsApiWrapper()) {
+      fprintf(stderr, "an instance is not an API wrapper\n");
+      ++failures;
+    }
+    if (wrapper->GetAlignedPointerFromInternalField(0) != nullptr) {
+      fprintf(stderr, "a fresh internal field is not null\n");
+      ++failures;
+    }
+
+    auto* counter = new HostCounter{5};
+    wrapper->SetAlignedPointerInInternalField(
+        0, counter, v8::CppHeapPointerTag::kEmbedderObjectWrapperTag);
+    if (wrapper->Wrappable<HostCounter>() != counter) {
+      fprintf(stderr, "Wrappable did not read the stored pointer\n");
+      ++failures;
+    }
+    if (wrapper->GetAlignedPointerFromInternalField(current, 0) != counter ||
+        wrapper->GetAlignedPointerFromInternalField(isolate, 0) != counter) {
+      fprintf(stderr, "an internal field overload disagrees\n");
+      ++failures;
+    }
+
+    // Past the end: V8 aborts, the facade reports the refusal and keeps the
+    // object's real fields intact.
+    wrapper->SetAlignedPointerInInternalField(3, counter);
+    if (wrapper->GetAlignedPointerFromInternalField(3) != nullptr) {
+      fprintf(stderr, "an out-of-range internal field was stored\n");
+      ++failures;
+    }
+
+    if (slag_collect(current->slag()) != 0) {
+      fprintf(stderr, "collection failed\n");
+      ++failures;
+    }
+    if (wrapper->Wrappable<HostCounter>() != counter) {
+      fprintf(stderr, "the wrappable did not survive the collection\n");
+      ++failures;
+    }
+
+    // Reach the instance from JS so the method runs with `this`. Installing it
+    // through `Object::Set`/`Get` also exercises the value-keyed property path.
+    v8::Local<v8::Value> key =
+        v8::String::NewFromUtf8Literal(isolate, "counter");
+    v8::Local<v8::Object> global = current->Global();
+    if (!global->Set(current, key, wrapper).FromMaybe(false)) {
+      fprintf(stderr, "the wrapper could not be installed\n");
+      ++failures;
+    }
+    v8::Local<v8::Value> installed;
+    if (!global->Get(current, key).ToLocal(&installed) ||
+        installed.raw() != wrapper.raw()) {
+      fprintf(stderr, "Get did not return the wrapper Set stored\n");
+      ++failures;
+    }
+
+    // A numeric key is the engine's ToPropertyKey, not the facade's.
+    wrapper->Set(current, v8::Integer::New(isolate, 7),
+                 v8::Integer::New(isolate, 3));
+    v8::Local<v8::Value> by_index;
+    if (!wrapper->Get(current, v8::String::NewFromUtf8Literal(isolate, "7"))
+             .ToLocal(&by_index) ||
+        by_index->Int32Value(current).FromMaybe(-1) != 3) {
+      fprintf(stderr, "a numeric key did not reach the property it names\n");
+      ++failures;
+    }
+
+    v8::Local<v8::Value> result =
+        v8::Script::Compile(current, v8::String::NewFromUtf8Literal(
+                                         isolate, "counter.bump(10)"))
+            .ToLocalChecked()
+            ->Run(current)
+            .ToLocalChecked();
+    if (result->Int32Value(current).FromMaybe(-1) != 15) {
+      fprintf(stderr, "counter.bump(10) did not reach the wrappable\n");
+      ++failures;
+    }
+
+    delete counter;
   }
 
   isolate->Dispose();

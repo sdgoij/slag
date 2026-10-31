@@ -188,6 +188,18 @@ class MaybeLocal {
   Local<T> local_;
 };
 
+/* The tag a host attaches to a pointer it stores in an internal field
+ * (`v8-sandbox.h`). Slag's internal fields are untraced opaque words with no
+ * pointer-tag check, so the enumerators exist so a host that passes one
+ * compiles, and their values are placeholders rather than V8's. */
+enum class CppHeapPointerTag : uint16_t {
+  kFirstTag = 0,
+  kDefaultTag = kFirstTag,
+  kEmbedderObjectWrapperTag = 1,
+  kLastTag = kEmbedderObjectWrapperTag,
+  kAnyCppHeapPointer = 0xffff,
+};
+
 class Value {
  public:
   bool IsUndefined() const;
@@ -196,7 +208,44 @@ class Value {
   Maybe<int32_t> Int32Value(Local<Context> context) const;
 };
 
-class Object : public Value {};
+class Object : public Value {
+ public:
+  /* The internal field `Wrappable<T>` reads: the first, where gin keeps the
+   * wrapper information. V8 hides this field index behind its own constant; the
+   * facade names it because it is the convention between these two sides. */
+  static constexpr int kWrappableFieldIndex = 0;
+
+  int InternalFieldCount() const;
+  bool IsApiWrapper() const;
+
+  /* Store the host's pointer in one internal field
+   * (`Object::SetAlignedPointerInInternalField`). V8 aborts on an index past the
+   * count; the facade records the ABI's refusal instead, and `tag` is not
+   * inspected. */
+  void SetAlignedPointerInInternalField(
+      int index, void* value,
+      CppHeapPointerTag tag = CppHeapPointerTag::kDefaultTag);
+
+  void* GetAlignedPointerFromInternalField(int index) const;
+  void* GetAlignedPointerFromInternalField(Isolate* isolate, int index) const;
+  void* GetAlignedPointerFromInternalField(Local<Context> context,
+                                           int index) const;
+
+  /* [[Get]] and [[Set]] by a key value (`Object::Get`/`Object::Set`). The key
+   * goes through the engine's ToPropertyKey, so a number or an object key names
+   * the property the language would. */
+  MaybeLocal<Value> Get(Local<Context> context, Local<Value> key);
+  Maybe<bool> Set(Local<Context> context, Local<Value> key, Local<Value> value);
+
+  /* The C++ object this wrapper names. V8 requires its `T` to be a cppgc
+   * `GarbageCollectedMixin`; the facade has no cppgc, so there is no such
+   * constraint and nothing is checked. */
+  template <class T>
+  T* Wrappable() const {
+    return static_cast<T*>(
+        GetAlignedPointerFromInternalField(kWrappableFieldIndex));
+  }
+};
 
 class Number : public Value {
  public:
@@ -291,9 +340,10 @@ template <class T>
 class FunctionCallbackInfo {
  public:
   FunctionCallbackInfo(Isolate* isolate, const void* call,
-                       const uint64_t* args, int length)
+                       uint64_t this_value, const uint64_t* args, int length)
       : isolate_(isolate),
         call_(call),
+        this_value_(this_value),
         args_(args),
         length_(length),
         return_value_(slag_undefined()) {}
@@ -301,6 +351,7 @@ class FunctionCallbackInfo {
   Isolate* GetIsolate() const { return isolate_; }
   int Length() const { return length_; }
   Local<T> operator[](int index) const { return Local<T>::New(args_[index]); }
+  Local<T> This() const { return Local<T>::New(this_value_); }
   ReturnValue<T> GetReturnValue() const {
     return ReturnValue<T>(&return_value_);
   }
@@ -310,6 +361,7 @@ class FunctionCallbackInfo {
  private:
   Isolate* isolate_;
   const void* call_;
+  uint64_t this_value_;
   const uint64_t* args_;
   int length_;
   mutable uint64_t return_value_;
@@ -341,8 +393,18 @@ class ObjectTemplate {
            Local<FunctionTemplate> function);
   const std::vector<Entry>& entries() const { return entries_; }
 
+  /* How many internal fields each instance carries
+   * (`v8::ObjectTemplate::SetInternalFieldCount`). */
+  void SetInternalFieldCount(int count) { internal_fields_ = count; }
+  int InternalFieldCount() const { return internal_fields_; }
+
+  /* Create an instance of this template: an ordinary object with the template's
+   * internal fields, its host functions, and `IsApiWrapper` set. */
+  MaybeLocal<Object> NewInstance(Local<Context> context);
+
  private:
   std::vector<Entry> entries_;
+  int internal_fields_ = 0;
 };
 
 class Context {
