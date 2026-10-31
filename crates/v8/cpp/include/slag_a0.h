@@ -13,6 +13,7 @@ extern "C" {
 typedef struct SlagIsolate SlagIsolate;
 typedef struct SlagContext SlagContext;
 typedef struct SlagScript SlagScript;
+typedef struct SlagTraced SlagTraced;
 
 typedef uint64_t (*slag_host_fn)(void* data, const void* call, uint64_t this_value,
                                  const uint64_t* args, size_t len);
@@ -42,6 +43,12 @@ uint64_t slag_number_new(double value);
 void slag_root_retain(uint64_t value);
 void slag_root_release(uint64_t value);
 size_t slag_root_count(void);
+SlagTraced* slag_traced_new(uint64_t value);
+int32_t slag_traced_get(const SlagTraced* traced, uint64_t* out);
+int32_t slag_traced_is_empty(const SlagTraced* traced);
+SlagTraced* slag_traced_clone(const SlagTraced* traced);
+void slag_traced_reset(SlagTraced* traced);
+void slag_traced_free(SlagTraced* traced);
 int32_t slag_collect(SlagContext* context);
 int64_t slag_value_to_utf8(uint64_t value, char* buffer, size_t len);
 double slag_value_to_number(uint64_t value);

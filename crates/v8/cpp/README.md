@@ -133,6 +133,20 @@ Two deviations, both deliberate. `CppHeapPointerTag` is accepted and not
 inspected, because there is no pointer-tag check to make. `Wrappable<T>` has no
 cppgc `GarbageCollectedMixin` constraint, because the facade has no cppgc.
 
+### Traced references
+
+`TracedReference<T>` is the root a host keeps in its own structures: the engine
+holds the value for as long as the object exists, `Reset` or the destructor
+releases it, and a copy is a second reference, so resetting one does not clear
+the other. V8's version is traced through the embedder's collector; this facade
+has no embedder-heap tracing, so the reference is a root the C++ side owns and
+must release.
+
+`gin-shapes` creates an object in a scope, marks it, takes a traced reference,
+lets the scope pop, forces a collection and reads the mark back through the
+reference, then releases the original and checks the copy still keeps the value
+alive. The copy check was verified to fail when the copy is made empty instead.
+
 ## The gin target
 
 Actual `gin` cannot be built standalone. `gin/BUILD.gn` has public deps
@@ -173,6 +187,8 @@ not a claim that gin itself links.
   `Object::Wrappable<T>`, `IsApiWrapper`, `This()`.
 - `Object::Get`/`Set` by a key value, through the engine's ToPropertyKey (so a
   numeric or object key names the property the language would).
+- `TracedReference<T>` as a host-owned root: copy is a second reference, `Reset`
+  releases it, and the destructor releases it like any persistent.
 - Handles and persistents as engine roots: a handle slot or a `Global` over an
   engine value retains it for that object's lifetime, and a facade pointer is
   never registered.
@@ -181,6 +197,8 @@ not a claim that gin itself links.
 
 ## What it does not
 
+- `TracedReference<T>` is a root the host owns, not an edge the embedder's
+  collector traces: it never clears on its own and has no `SetWeak`.
 - It is not source-compatible with the rest of `v8.h`. There are no interceptors,
   no `cppgc`, no platform tasks, no snapshots, no inspector.
 - `CppHeapPointerTag` is accepted and ignored, and `Wrappable<T>()` does not

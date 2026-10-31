@@ -21,6 +21,7 @@ use std::rc::Rc;
 
 use crux::heap::{GcAny, RootSource, Trace, register_root_source};
 use crux::value::Value;
+use slag::api::{Local as EngineLocal, Traced};
 use slag::{CompiledScript, Context, ErrorKind, FunctionCall, HostFn, JsError, JsValue};
 
 /// The isolate a host enters. The engine's contexts are the state; this token
@@ -43,6 +44,13 @@ pub struct SlagContext {
 /// A parsed, not-yet-run script (`v8::Script`).
 pub struct SlagScript {
     script: CompiledScript,
+}
+
+/// A host-traced root (`v8::TracedReference<T>`): the engine keeps the value
+/// alive until the host frees this box, which is what the C++ handle's `Reset`
+/// and destructor do.
+pub struct SlagTraced {
+    traced: Traced,
 }
 
 /// The C++ function a registered host global calls. `call` is the
@@ -170,6 +178,72 @@ pub unsafe extern "C" fn slag_collect(context: *mut SlagContext) -> i32 {
     };
     engine.agent_mut().collect_garbage();
     0
+}
+
+/// Make `value` a root the host owns (`v8::TracedReference<T>`), returned as a
+/// box the host frees with [`slag_traced_free`]. A clone is a *second*
+/// reference, so releasing one does not release the other.
+#[unsafe(no_mangle)]
+pub extern "C" fn slag_traced_new(value: u64) -> *mut SlagTraced {
+    Box::into_raw(Box::new(SlagTraced {
+        traced: Traced::new(EngineLocal::from_value(
+            JsValue::from_bits(value).into_value(),
+        )),
+    }))
+}
+
+/// The value a traced reference names, written to `out`. 0 on success, 1 once
+/// the reference has been released, 2 for a bad argument.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn slag_traced_get(traced: *const SlagTraced, out: *mut u64) -> i32 {
+    let Some(traced) = traced.as_ref() else {
+        return 2;
+    };
+    match traced.traced.to_local() {
+        Some(value) => {
+            if !out.is_null() {
+                *out = value.value().bits();
+            }
+            0
+        }
+        None => 1,
+    }
+}
+
+/// Whether the host has released `traced` (`v8::TracedReference<T>::IsEmpty`).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn slag_traced_is_empty(traced: *const SlagTraced) -> i32 {
+    traced
+        .as_ref()
+        .map_or(1, |traced| i32::from(traced.traced.is_empty()))
+}
+
+/// A second reference to the same value, as its own box.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn slag_traced_clone(traced: *const SlagTraced) -> *mut SlagTraced {
+    let Some(traced) = traced.as_ref() else {
+        return std::ptr::null_mut();
+    };
+    Box::into_raw(Box::new(SlagTraced {
+        traced: traced.traced.clone(),
+    }))
+}
+
+/// Release the reference (`v8::TracedReference<T>::Reset`): the value stops
+/// being a root at the next collection.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn slag_traced_reset(traced: *mut SlagTraced) {
+    if let Some(traced) = traced.as_mut() {
+        traced.traced.reset();
+    }
+}
+
+/// Free the box, which is the host releasing its reference.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn slag_traced_free(traced: *mut SlagTraced) {
+    if !traced.is_null() {
+        drop(Box::from_raw(traced));
+    }
 }
 
 #[unsafe(no_mangle)]
@@ -839,6 +913,51 @@ mod tests {
         assert!(
             swept.contains(&rooted),
             "the second release left the value rooted: {swept:?}"
+        );
+    }
+
+    #[test]
+    fn a_traced_reference_roots_until_the_host_releases_it() {
+        use crux::handle::Handle;
+        use crux::string::JsString;
+
+        // `Heap::collect` is the deterministic entry point: it does not scan the
+        // stack, so only a registered root keeps the box.
+        let value = Value::String(Handle::new(JsString::from_utf8("traced")));
+        let box_addr = value.as_string().expect("string").as_any().addr();
+
+        let traced = slag_traced_new(value.bits());
+        assert!(!traced.is_null());
+        unsafe {
+            assert_eq!(slag_traced_is_empty(traced), 0);
+        }
+
+        // A clone is a second reference: releasing the first leaves the value
+        // rooted by the copy.
+        let copy = unsafe { slag_traced_clone(traced) };
+        assert!(!copy.is_null());
+        unsafe { slag_traced_free(traced) };
+        let swept = crux::heap::with_heap_mut(|heap| heap.collect(&[]));
+        assert!(
+            !swept.contains(&box_addr),
+            "the copy stopped rooting the value: {swept:?}"
+        );
+
+        unsafe {
+            let mut out = 0;
+            assert_eq!(slag_traced_get(copy, &mut out), 0);
+            assert_eq!(out, value.bits());
+
+            slag_traced_reset(copy);
+            assert_eq!(slag_traced_is_empty(copy), 1);
+            assert_eq!(slag_traced_get(copy, &mut out), 1, "a released reference");
+            slag_traced_free(copy);
+        }
+
+        let swept = crux::heap::with_heap_mut(|heap| heap.collect(&[]));
+        assert!(
+            swept.contains(&box_addr),
+            "the released value was still rooted: {swept:?}"
         );
     }
 

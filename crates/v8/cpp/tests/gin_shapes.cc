@@ -287,6 +287,80 @@ int main() {
     delete counter;
   }
 
+  // A host-traced reference: a root the C++ side owns and releases. Once the
+  // handle scope pops, the object is reachable only through the reference.
+  {
+    v8::TracedReference<v8::Object> traced;
+    v8::TracedReference<v8::Object> copy;
+    {
+      v8::HandleScope scope(isolate);
+      v8::Local<v8::Context> current = context.Get(isolate);
+      v8::Local<v8::ObjectTemplate> plain = v8::ObjectTemplate::New(isolate);
+      v8::Local<v8::Object> object =
+          plain->NewInstance(current).ToLocalChecked();
+      if (!object
+               ->Set(current, v8::String::NewFromUtf8Literal(isolate, "mark"),
+                     v8::Integer::New(isolate, 41))
+               .FromMaybe(false)) {
+        fprintf(stderr, "the traced object could not be marked\n");
+        ++failures;
+      }
+      traced.Reset(isolate, object);
+      copy = traced;
+      if (traced.IsEmpty() || copy.IsEmpty()) {
+        fprintf(stderr, "a traced reference started empty\n");
+        ++failures;
+      }
+    }
+
+    bool survived = false;
+    {
+      v8::HandleScope scope(isolate);
+      v8::Local<v8::Context> current = context.Get(isolate);
+      if (slag_collect(current->slag()) != 0) {
+        fprintf(stderr, "collection failed\n");
+        ++failures;
+      }
+      v8::Local<v8::Value> mark;
+      if (traced.Get(isolate)
+              ->Get(current, v8::String::NewFromUtf8Literal(isolate, "mark"))
+              .ToLocal(&mark) &&
+          mark->Int32Value(current).FromMaybe(-1) == 41) {
+        survived = true;
+      }
+    }
+    if (!survived) {
+      fprintf(stderr, "a traced reference lost its value\n");
+      ++failures;
+    }
+
+    // The copy is a second reference, so releasing the first must not clear it.
+    traced.Reset();
+    if (!traced.IsEmpty()) {
+      fprintf(stderr, "Reset left a traced reference non-empty\n");
+      ++failures;
+    }
+    {
+      v8::HandleScope scope(isolate);
+      v8::Local<v8::Context> current = context.Get(isolate);
+      slag_collect(current->slag());
+      v8::Local<v8::Value> mark;
+      if (!copy.Get(isolate)
+               ->Get(current, v8::String::NewFromUtf8Literal(isolate, "mark"))
+               .ToLocal(&mark) ||
+          mark->Int32Value(current).FromMaybe(-1) != 41) {
+        fprintf(stderr, "the copy did not keep the value alive\n");
+        ++failures;
+      }
+    }
+
+    copy.Reset();
+    if (!copy.IsEmpty()) {
+      fprintf(stderr, "Reset left the copy non-empty\n");
+      ++failures;
+    }
+  }
+
   isolate->Dispose();
   delete params.array_buffer_allocator;
   return failures == 0 ? 0 : 1;

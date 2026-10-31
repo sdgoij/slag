@@ -38,6 +38,13 @@ impl Local {
         Self(Value::String(Handle::new(JsString::from_utf8(&text))))
     }
 
+    /// The handle over a value the engine already produced. The bridge's
+    /// boundary conversion: a host hands back the tagged word it was given, and
+    /// only the engine can say what kind of value it is.
+    pub fn from_value(value: Value) -> Self {
+        Self(value)
+    }
+
     /// Wrap an object handle.
     pub fn object(object: Handle<JsObject>) -> Self {
         Self(Value::Object(object))

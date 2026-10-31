@@ -565,6 +565,85 @@ class Global {
   bool empty_ = true;
 };
 
+/* A host-traced root: the engine keeps the value alive for as long as this
+ * object exists, and the host says when it is gone. V8's `TracedReference` is
+ * meant for an object the embedder's own collector manages; this facade has no
+ * embedder-heap tracing, so the reference is simply a root the C++ side owns
+ * and a host must release (`Reset` or the destructor) like any persistent.
+ *
+ * A copy is a second reference, not another handle to the same one, so
+ * resetting one does not clear the other. That is the engine's `Traced`
+ * semantics, and what Blink's `TraceWrapperV8Reference` relies on. */
+class TracedReferenceBase {
+ public:
+  TracedReferenceBase() = default;
+  ~TracedReferenceBase() { Reset(); }
+
+  TracedReferenceBase(const TracedReferenceBase& other)
+      : traced_(CloneTraced(other.traced_)) {}
+  TracedReferenceBase& operator=(const TracedReferenceBase& other) {
+    if (this != &other) {
+      Reset();
+      traced_ = CloneTraced(other.traced_);
+    }
+    return *this;
+  }
+
+  bool IsEmpty() const { return traced_ == nullptr; }
+
+  void Reset() {
+    if (traced_ != nullptr) {
+      slag_traced_free(traced_);
+      traced_ = nullptr;
+    }
+  }
+
+ protected:
+  void Adopt(uint64_t value, bool empty) {
+    Reset();
+    if (!empty) traced_ = slag_traced_new(value);
+  }
+
+  /* The tagged word, `false` when the reference is empty or the engine has
+   * released the value. The word is not tested against 0: `+0.0` is a value
+   * whose bits are 0. */
+  bool TryValue(uint64_t* out) const {
+    return traced_ != nullptr && slag_traced_get(traced_, out) == 0;
+  }
+
+ private:
+  static SlagTraced* CloneTraced(SlagTraced* traced) {
+    return traced == nullptr ? nullptr : slag_traced_clone(traced);
+  }
+
+  SlagTraced* traced_ = nullptr;
+};
+
+template <class T>
+class TracedReference : public TracedReferenceBase {
+ public:
+  // The templated `Reset` below would hide the base's release.
+  using TracedReferenceBase::Reset;
+
+  TracedReference() = default;
+  TracedReference(Isolate*, Local<T> that) { Reset(nullptr, that); }
+
+  template <class S, class = std::enable_if_t<std::is_base_of_v<T, S>>>
+  TracedReference(const TracedReference<S>& other)
+      : TracedReferenceBase(other) {}
+
+  /* The value, while the host has not released this reference. */
+  Local<T> Get(Isolate*) const {
+    uint64_t value = 0;
+    return TryValue(&value) ? Local<T>::New(value) : Local<T>();
+  }
+
+  template <class S, class = std::enable_if_t<std::is_base_of_v<T, S>>>
+  void Reset(Isolate*, const Local<S>& that) {
+    Adopt(that.IsEmpty() ? 0 : that.raw(), that.IsEmpty());
+  }
+};
+
 /* The tagged word behind a `this` pointer: API objects have no fields. */
 inline uint64_t Raw(const void* self) {
   return static_cast<uint64_t>(reinterpret_cast<uintptr_t>(self));
