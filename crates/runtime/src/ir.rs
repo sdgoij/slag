@@ -16480,41 +16480,10 @@ pub(crate) fn object_fast_create(
         .object_prototype()
         .and_then(|value| crate::context::as_object(&value));
     let object = crux::object::JsObject::ordinary_object_create(proto);
-    // Resolve the vector-free head shape from the object's (empty) map —
-    // the cached child chain shared by every literal with the same key
-    // prefix — then adopt. The base map is the canonical empty map for the
-    // prototype, so its whole-literal composite cache (G3) serves every
-    // `Step::ObjectFast` with this key list from one lookup instead of one
-    // `get_or_create_child` per key.
-    let head = names.len().min(crux::object::INLINE_FIELDS);
-    let mut base = object
-        .map
-        .get()
-        .ok_or_else(|| JsError::new(ErrorKind::TypeError, "fresh object without a map".into()))?;
-    // The composite cache covers the whole key list, in-object head and
-    // vector tail alike: one lookup serves every literal of this shape. A
-    // duplicate key resolves to an existing descriptor, so the shape then
-    // describes fewer keys than the literal and is neither cached nor
-    // adopted (the sequential fallback applies the redefinition).
-    let shape = match base.composite_child(names) {
-        Some(shape) => shape,
-        _ => {
-            let attrs = crux::MapAttrs::new(true, true, true);
-            let mut shape = base;
-            for name in names.iter() {
-                shape = shape
-                    .get_or_create_child(crux::PropertyKey::String(*name), attrs)
-                    .ok_or_else(|| {
-                        JsError::new(ErrorKind::TypeError, "cannot fork the literal shape".into())
-                    })?;
-            }
-            if shape.descriptor_count() == names.len() {
-                base.set_composite_child(names, shape);
-            }
-            shape
-        }
-    };
-    if object.adopt_literal_properties(shape, &values[..head], &values[head..]) {
+    // Resolve the whole-literal shape from the object's (empty) map and adopt
+    // in one batch — the same entry `Object.assign({}, o)` and `{...o}` use
+    // for a fresh destination.
+    if object.adopt_fresh_data_properties(names, values) {
         return Ok(Value::Object(object));
     }
     {

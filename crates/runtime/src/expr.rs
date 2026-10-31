@@ -859,6 +859,12 @@ pub(crate) fn copy_data_properties(
             Some(keys) => keys,
             None => from_obj.own_property_keys()?,
         };
+        if ordinary_source
+            && let Some((atoms, values)) = plain_data_snapshot(&from_obj, &keys)?
+            && to.adopt_fresh_data_properties(&atoms, &values)
+        {
+            return Ok(());
+        }
         for key in keys {
             let Some(property) = from_obj.get_own_property_key(&key)? else {
                 continue;
@@ -884,6 +890,38 @@ pub(crate) fn copy_data_properties(
     })();
     agent.roots.kept_during_job.borrow_mut().truncate(root_len);
     result
+}
+
+/// The plain-data snapshot a fresh-destination copy adopts in one batch: every
+/// own key of `from` that is a string atom with an enumerable data descriptor,
+/// in enumeration order. `None` when a key is not copyable that way (an
+/// accessor — whose get would run user code — a non-data descriptor, or a
+/// non-string key), which keeps the caller on the per-key loop.
+pub(crate) type PlainDataSnapshot = (Vec<crux::AtomId>, Vec<Value>);
+
+pub(crate) fn plain_data_snapshot(
+    from: &crux::handle::Handle<crux::object::JsObject>,
+    keys: &[crux::PropertyKey],
+) -> Result<Option<PlainDataSnapshot>, JsError> {
+    let mut atoms = Vec::with_capacity(keys.len());
+    let mut values = Vec::with_capacity(keys.len());
+    for key in keys {
+        let crux::PropertyKey::String(atom) = key else {
+            return Ok(None);
+        };
+        let Some(property) = from.get_own_property_key(key)? else {
+            continue;
+        };
+        if !property.enumerable {
+            continue;
+        }
+        let crux::object::PropertyKind::Data { value, .. } = property.kind else {
+            return Ok(None);
+        };
+        atoms.push(*atom);
+        values.push(value);
+    }
+    Ok(Some((atoms, values)))
 }
 
 /// The property name, evaluating computed keys (spec 13.2.5.5).

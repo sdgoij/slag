@@ -20772,3 +20772,37 @@ over a store is ~35 ns.
 
 Not started; recorded so the next session starts from the split rather than the
 row.
+
+## LANDED (2026-10-31): `Object.assign({}, o)` and `{...o}` adopt one shape
+
+The per-key copy loop behind `Object.assign` and object spread now takes the
+literal batch when the destination is fresh: `adopt_fresh_data_properties`
+resolves the shape from the destination's empty map (composite-cached, the same
+entry the whole-literal create uses) and adopts the source's whole key list in
+one pass. The snapshot is the source's own string keys with plain enumerable
+data descriptors; an accessor (whose get runs user code), a symbol or index key,
+or a non-data descriptor keeps the per-key loop.
+
+The [[Set]]/CreateDataProperty distinction is what makes the assign form legal:
+assign uses `[[Set]]`, which would fire a prototype setter, so the batch also
+requires the destination to be ordinary, extensible, empty of own properties,
+and on `null` or the realm's `%Object.prototype%` — whose only accessor is
+`__proto__`, and a `__proto__` key in the source is filtered out (the per-key
+loop then runs the setter). Object spread already used CreateDataProperty, so it
+needs neither check.
+
+| probe | before | after |
+| --- | ---: | ---: |
+| `objects/spread_assign` (isolated A/B, 3 rounds) | 95.2 ms | **71.0** |
+| `Object.assign({}, o)` with 3 keys + `Object.keys` | 80.1 | **58.6** |
+| the same with 9 keys | 193.9 | **98.4** |
+
+A ten-case differential battery is byte-identical to node: a source `__proto__`
+own property (setter in assign, own property in spread), a target with a
+prototype setter, a class instance, a null-prototype target, a frozen target
+(TypeError), a getter source (one get), multi-source, a non-enumerable own
+property, symbol keys, and key order.
+
+Verified: clippy `-D warnings`; `cargo test --workspace` 5866 pass / 0 fail;
+four sweeps at 100% (language 23726, built-ins 23821, annexB 1086, intl402
+3365); corpus parity 0 (`spread_assign` 137 → 78.7 ms in the corpus run).

@@ -1617,6 +1617,23 @@ fn object_assign(agent: &mut Agent, args: &[Value]) -> Result<Value, JsError> {
             None => source.own_property_keys()?,
         };
         let ordinary_source = matches!(source.kind, crux::object::ObjectKind::Ordinary);
+        // Fast path: a plain-data source into a fresh destination on the
+        // realm's %Object.prototype% — `Object.assign({}, o)`, the spread
+        // idiom. `[[Set]]` and `CreateDataProperty` agree here: the
+        // destination has no own property to conflict with, and the only
+        // accessor on %Object.prototype% is `__proto__`, which the key filter
+        // excludes (assign uses [[Set]], unlike object spread's
+        // CreateDataProperty). One shape lookup then covers every key.
+        if ordinary_source
+            && !keys.is_empty()
+            && let Some((atoms, values)) = crate::expr::plain_data_snapshot(&source, &keys)?
+            && !atoms.is_empty()
+            && !atoms.iter().any(|atom| *atom == crux::proto_atom())
+            && target_is_fresh_plain(&target, agent)
+            && target.adopt_fresh_data_properties(&atoms, &values)
+        {
+            continue;
+        }
         for key in keys {
             let Some(prop) = source.get_own_property_key(&key)? else {
                 continue;
@@ -1645,6 +1662,32 @@ fn object_assign(agent: &mut Agent, args: &[Value]) -> Result<Value, JsError> {
         }
     }
     Ok(target_value)
+}
+
+/// Whether `target` is a fresh ordinary object on `null` or the realm's
+/// `%Object.prototype%` — the shape `Object.assign`'s batch path can copy into
+/// (see `object_assign`).
+fn target_is_fresh_plain(target: &crux::handle::Handle<JsObject>, agent: &Agent) -> bool {
+    if !matches!(target.kind, crux::object::ObjectKind::Ordinary) || !target.extensible.get() {
+        return false;
+    }
+    if target.map.get().is_some_and(|map| !map.is_empty()) || !target.properties.borrow().is_empty()
+    {
+        return false;
+    }
+    let Ok(realm) = agent.current_realm() else {
+        return false;
+    };
+    let object_prototype = realm
+        .intrinsics
+        .object_prototype()
+        .and_then(|value| as_object(&value));
+    let prototype = target.get_prototype_of().ok().flatten();
+    match (prototype, object_prototype) {
+        (None, _) => true,
+        (Some(prototype), Some(expected)) => prototype.id() == expected.id(),
+        _ => false,
+    }
 }
 
 /// Object.fromEntries (spec 20.1.2.7): walk an iterable of [key, value]
