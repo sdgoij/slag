@@ -188,7 +188,9 @@ not a claim that gin itself links.
 - `Object::Get`/`Set` by a key value, through the engine's ToPropertyKey (so a
   numeric or object key names the property the language would), with the
   `uint32_t` index forms built on them. `Has` (own property plus the chain),
-  `Delete`, and `GetRealNamedProperty` (own property only, no chain).
+  `Delete`, `GetRealNamedProperty` (own property only, no chain), and the
+  own-property predicates `HasRealNamedProperty`,
+  `HasRealIndexedProperty`, and `HasRealNamedCallbackProperty`.
 - `TracedReference<T>` as a host-owned root: copy is a second reference, `Reset`
   releases it, and the destructor releases it like any persistent.
 - Handles and persistents as engine roots: a handle slot or a `Global` over an
@@ -215,10 +217,10 @@ not a claim that gin itself links.
 - `Isolate::Dispose` frees the contexts the facade created; templates are not
   freed.
 - Host callbacks receive `this` now (`FunctionCallbackInfo::This`), but the
-  `Object` surface is narrow: the other own-property predicates
-  (`HasRealNamedProperty`, `HasRealIndexedProperty`, `HasRealNamedCallbackProperty`),
-  the accessor/internal-field `SetAccessor`, and `GetIdentityHash`'s siblings are
-  absent.
+  `Object` surface is still narrow: `SetAccessor`, the interceptor
+  (`SetHandler`) surface, and `GetIdentityHash`'s siblings are absent. See
+  `.notes/chromium-facade.md` section 14.1 for why interceptors need a decision
+  before code.
 - `load()` is compiled but refused at run time. The sample re-enters through
   `ExecuteString`, and the safe engine path for a host callback is
   `FunctionCall::eval` (`slag_call_eval`), which the sample does not call. The

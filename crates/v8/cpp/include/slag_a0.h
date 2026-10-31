@@ -75,6 +75,8 @@ int32_t slag_object_delete_key(SlagContext* context, uint64_t object, uint64_t k
                                int32_t* out);
 int32_t slag_object_get_own_key(SlagContext* context, uint64_t object, uint64_t key,
                                 uint64_t* out, int32_t* found);
+int32_t slag_object_own_property_kind(SlagContext* context, uint64_t object,
+                                      uint64_t key, int32_t* out);
 const char* slag_version(void);
 
 #ifdef __cplusplus

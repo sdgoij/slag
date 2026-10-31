@@ -258,6 +258,14 @@ class Object : public Value {
    * property. */
   MaybeLocal<Value> GetRealNamedProperty(Local<Context> context, Local<Name> key);
 
+  /* The own-property predicates (`Object::HasRealNamedProperty` and its
+   * siblings): no interceptor and no prototype walk. `HasRealIndexedProperty`
+   * asks about an array index; the other two about a name. */
+  Maybe<bool> HasRealNamedProperty(Local<Context> context, Local<Name> key);
+  Maybe<bool> HasRealIndexedProperty(Local<Context> context, uint32_t index);
+  Maybe<bool> HasRealNamedCallbackProperty(Local<Context> context,
+                                           Local<Name> key);
+
   /* The C++ object this wrapper names. V8 requires its `T` to be a cppgc
    * `GarbageCollectedMixin`; the facade has no cppgc, so there is no such
    * constraint and nothing is checked. */

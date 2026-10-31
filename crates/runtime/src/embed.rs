@@ -680,6 +680,36 @@ impl Context {
         }
     }
 
+    /// The kind of `object`'s own property named by `key`, `None` when it has no
+    /// own property there (`v8::Object::HasRealNamedProperty` and its siblings).
+    /// No interceptor and no prototype is consulted. An array-index key is
+    /// reported as indexed: the engine keeps one own-property store, so the
+    /// split follows the key's shape rather than which store V8 keeps it in.
+    pub fn own_property_kind(
+        &mut self,
+        object: JsValue,
+        key: JsValue,
+    ) -> Result<Option<OwnProperty>, JsError> {
+        let key_value = key.into_value();
+        let key = crate::context::to_property_key(self.agent_mut(), &key_value)?;
+        let Some(object) = object.as_object() else {
+            return Err(JsError::new(
+                ErrorKind::TypeError,
+                "value is not an object".into(),
+            ));
+        };
+        let Some(property) = object.0.get_own_property_key(&key)? else {
+            return Ok(None);
+        };
+        let indexed = crux::object::array_index_of(&key).is_some();
+        Ok(Some(match (property.kind, indexed) {
+            (PropertyKind::Data { .. }, false) => OwnProperty::DataNamed,
+            (PropertyKind::Data { .. }, true) => OwnProperty::DataIndexed,
+            (PropertyKind::Accessor { .. }, false) => OwnProperty::CallbackNamed,
+            (PropertyKind::Accessor { .. }, true) => OwnProperty::CallbackIndexed,
+        }))
+    }
+
     /// A fresh dense array inheriting `%Array.prototype%` with one own data
     /// property per value — `Array.isArray` is true and `length` is
     /// `values.len()` (no `eval("[]")` needed; the array and its elements are
@@ -2331,6 +2361,17 @@ impl fmt::Display for JsValue {
 #[derive(Debug, Clone)]
 pub struct JsObject(Handle<CruxObject>);
 
+/// What an object's own property is, for V8's real-property predicates: the
+/// kind, and whether the key names an array index, which V8 keeps in a separate
+/// store from the named properties.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OwnProperty {
+    DataNamed,
+    DataIndexed,
+    CallbackNamed,
+    CallbackIndexed,
+}
+
 impl JsObject {
     /// [[Get]] the named property. Accessor properties run through the agent
     /// when inside an eval/call window.
@@ -2679,6 +2720,82 @@ mod tests {
                 .unwrap()
         );
         assert!(!context.has_property(object.as_value(), key).unwrap());
+    }
+
+    #[test]
+    fn own_property_kind_splits_named_from_indexed() {
+        let mut context = Context::new().unwrap();
+        let object = context.create_object().unwrap();
+
+        assert_eq!(
+            context
+                .own_property_kind(object.as_value(), JsValue::string("mark"))
+                .unwrap(),
+            None
+        );
+        context
+            .set_property(
+                object.as_value(),
+                JsValue::string("mark"),
+                JsValue::number(1.0),
+            )
+            .unwrap();
+        assert_eq!(
+            context
+                .own_property_kind(object.as_value(), JsValue::string("mark"))
+                .unwrap(),
+            Some(OwnProperty::DataNamed)
+        );
+
+        // An array-index key is the indexed kind. 1.5 is a canonical numeric
+        // index but not an array index, so it stays a named property, which is
+        // what V8's named store would answer.
+        context
+            .set_property(
+                object.as_value(),
+                JsValue::number(0.0),
+                JsValue::number(2.0),
+            )
+            .unwrap();
+        assert_eq!(
+            context
+                .own_property_kind(object.as_value(), JsValue::string("0"))
+                .unwrap(),
+            Some(OwnProperty::DataIndexed)
+        );
+        context
+            .set_property(
+                object.as_value(),
+                JsValue::string("1.5"),
+                JsValue::number(3.0),
+            )
+            .unwrap();
+        assert_eq!(
+            context
+                .own_property_kind(object.as_value(), JsValue::string("1.5"))
+                .unwrap(),
+            Some(OwnProperty::DataNamed)
+        );
+
+        // An accessor is the callback kind, and the getter still runs through
+        // the own-property read.
+        context
+            .eval("globalThis.accessorHost = {}; Object.defineProperty(accessorHost, 'x', { get: () => 7 })")
+            .unwrap();
+        let host = context.eval("accessorHost").unwrap();
+        assert_eq!(
+            context
+                .own_property_kind(host.clone(), JsValue::string("x"))
+                .unwrap(),
+            Some(OwnProperty::CallbackNamed)
+        );
+        assert_eq!(
+            context
+                .get_own_property(host, JsValue::string("x"))
+                .unwrap()
+                .and_then(|value| value.as_number()),
+            Some(7.0)
+        );
     }
 
     #[test]

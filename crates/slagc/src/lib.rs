@@ -22,7 +22,9 @@ use std::rc::Rc;
 use crux::heap::{GcAny, RootSource, Trace, register_root_source};
 use crux::value::Value;
 use slag::api::{Local as EngineLocal, Traced};
-use slag::{CompiledScript, Context, ErrorKind, FunctionCall, HostFn, JsError, JsValue};
+use slag::{
+    CompiledScript, Context, ErrorKind, FunctionCall, HostFn, JsError, JsValue, OwnProperty,
+};
 
 /// The isolate a host enters. The engine's contexts are the state; this token
 /// exists so the facade's `Isolate` can own and free them in order.
@@ -907,6 +909,47 @@ pub unsafe extern "C" fn slag_object_get_own_key(
             if !out.is_null() && !found.is_null() {
                 *found = i32::from(value.is_some());
                 *out = value.map_or(0, |value| value.to_bits());
+            }
+            0
+        }
+        Err(error) => {
+            record(context, error);
+            1
+        }
+    }
+}
+
+/// Which kind of own property `object` has under `key`, for V8's real-property
+/// predicates: 0 absent, 1 data named, 2 data indexed, 3 callback named,
+/// 4 callback indexed. 0 on success with `out` written, 1 with a pending error,
+/// 2 for a bad argument.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn slag_object_own_property_kind(
+    context: *mut SlagContext,
+    object: u64,
+    key: u64,
+    out: *mut i32,
+) -> i32 {
+    let Some(context) = context.as_mut() else {
+        return 2;
+    };
+    let result = {
+        let Ok(mut engine) = context.context.try_borrow_mut() else {
+            reentrant(context);
+            return 1;
+        };
+        engine.own_property_kind(JsValue::from_bits(object), JsValue::from_bits(key))
+    };
+    match result {
+        Ok(kind) => {
+            if !out.is_null() {
+                *out = match kind {
+                    None => 0,
+                    Some(OwnProperty::DataNamed) => 1,
+                    Some(OwnProperty::DataIndexed) => 2,
+                    Some(OwnProperty::CallbackNamed) => 3,
+                    Some(OwnProperty::CallbackIndexed) => 4,
+                };
             }
             0
         }

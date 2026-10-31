@@ -459,6 +459,8 @@ The facade side is the gin shape: `ObjectTemplate::SetInternalFieldCount` and `N
 
 *The rest of the Object surface (2026-10-31).* `Object` now has `Has` and `Delete` by key value (and by index), with `Has` walking the prototype chain and `Delete` answering true for a property that was never there, and `GetRealNamedProperty`, which is the own-property read with no interceptor and no chain walk and an own accessor's getter run on the receiver. The index forms are the key-value forms with the number built for the caller, so an index and the string it renders to are one property. The engine side is three embed helpers on `Context` (`has_property`, `delete_property`, `get_own_property`) over the existing `has_property_key`, `delete_key`, and `get_own_property_key`, plus ToPropertyKey, and three ABI functions. `Name` joins the facade's hierarchy as `Value`'s property-key subclass so `GetRealNamedProperty` takes the `Local<Name>` V8 takes. `gin-shapes` checks the own method and `Object.prototype.toString` are found, a key on neither is not, index write/read, the own-property read seeing `mark` but not the inherited `toString`, and delete-then-gone; forcing `Has` to always answer true was verified to fail two of those checks. `HasRealNamedProperty`, `HasRealIndexedProperty`, `HasRealNamedCallbackProperty`, `SetAccessor`, interceptors, and cppgc remain.
 
+*The real-property predicates (2026-10-31).* `HasRealNamedProperty`, `HasRealIndexedProperty`, and `HasRealNamedCallbackProperty` are in, over one ABI call that reports which kind the own property is (absent, data named, data indexed, callback named, callback indexed). The named/indexed split is a divergence with a reason: V8 keeps a named dictionary and an elements store and the predicates ask one of them, while this engine has a single own-property store, so the split follows the key. An array index (`crux::object::array_index_of`, the spec's 0 to 2^32-2) is the indexed kind, and a canonical numeric index that is not an array index ("1.5") stays named, which is what V8's named store would answer. `gin-shapes` checks the own name is found, the inherited `toString` is not, the index key "0" is indexed and not named, and a data property is not a callback property; forcing the kind to always read "data named" was verified to fail the check. Interceptors are scoped in section 14.1, where the finding is that this is a design decision rather than plumbing: the engine's handler seam builds a `HostOps` object for the realm global, and a `NewInstance` object has no `HostOps`, so gin's and Blink's instance handlers have nowhere to run yet.
+
 ## 12. Cost model
 
 These are order-of-magnitude inferences, not commitments. Basis: 66 headers and
@@ -545,6 +547,49 @@ exactly once. Blink's buffers are not engine-owned.
 6. **Product.** Is the goal a browser that runs Slag, or V8 API compatibility as
    an artifact? Route A is the second; `.notes/browser.md` Routes B and C are
    the first.
+
+### 14.1 Interceptors: what the next milestone costs
+
+Interceptors are not plumbing. The Rust crate's `interceptor.rs` already maps all
+seven V8 callbacks onto `crux::host::HostOps` (`descriptor`, `getter`, `query`,
+`setter`, `deleter`, `enumerator`, `definer`), with `Intercepted::kNo` meaning
+"run the ordinary method", and it documents the divergences it accepts
+(`NON_MASKING`, `ALL_CAN_READ`, `ONLY_INTERCEPT_STRINGS` accepted and not
+honoured; `kThrow` refused by name; the query's attributes dropped; the two
+enumerators asked and concatenated).
+
+The structural constraint is where a handler can live. That bridge installs a
+handler under the template's address and builds the realm's **global object** as
+a `HostOps` object when the context is made from that template. A
+`v8::ObjectTemplate::NewInstance` object is an ordinary object here, and an
+ordinary object has no `HostOps`, so a host that sets a handler on an instance
+template has nowhere for the engine to call it from. gin and Blink do exactly
+that, and Blink's named properties on the global object depend on it too.
+
+So the milestone needs a decision before code:
+
+1. **Per-instance host objects (faithful).** Make `ObjectTemplate::NewInstance`
+   create a `HostOps`-backed object whose methods dispatch to the template's
+   handler plus a per-object data pointer. The engine change is a host object
+   with interceptor state rather than a fixed realm-global hookup; the C++ side
+   then gets `NamedPropertyHandlerConfiguration`, `PropertyCallbackInfo<Value>`,
+   the seven callback typedefs, and `Intercepted`. This is the shape both gin and
+   Blink assume.
+2. **Global-template handlers only (cheap, wrong for gin).** Wire the C++
+   `SetHandler` only where the engine already has a seam, which covers the
+   global object and nothing an instance template promises. It would compile a
+   host's code and silently not intercept what it expects, so it should only be
+   taken with the limitation stated loudly.
+3. **Defer until a real consumer exists.** Keep it out of the facade until the
+   Blink bindings milestone reaches the named-property tests.
+
+The ABI shape is roughly a struct of up to seven C function pointers, the data
+pointer, and the flags, handed over once per template, with the return codes
+`Intercepted` already defines; the callbacks receive a `PropertyCallbackInfo`
+over the same argument/this/return-value convention `FunctionCallbackInfo` uses.
+The trap on the C++ side is the callback's `ReturnValue` and the value handles
+it hands back: they must be rooted by the caller's handle scope, or the
+interceptor's own temporaries die before the engine reads them.
 
 ## 15. Sources
 

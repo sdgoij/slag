@@ -315,6 +315,23 @@ int main() {
       ++failures;
     }
 
+    // The real-property predicates are own-only, and split named from indexed.
+    if (!wrapper->HasRealNamedProperty(current, mark_key).FromMaybe(false) ||
+        wrapper
+            ->HasRealNamedProperty(
+                current, v8::String::NewFromUtf8Literal(isolate, "toString"))
+            .FromMaybe(true) ||
+        wrapper->HasRealNamedProperty(
+                   current, v8::String::NewFromUtf8Literal(isolate, "0"))
+            .FromMaybe(true) ||
+        !wrapper->HasRealIndexedProperty(current, 0).FromMaybe(false) ||
+        wrapper->HasRealIndexedProperty(current, 1).FromMaybe(true) ||
+        wrapper->HasRealNamedCallbackProperty(current, mark_key).FromMaybe(
+            true)) {
+      fprintf(stderr, "a real-property predicate answered the wrong way\n");
+      ++failures;
+    }
+
     // Delete removes the own property, and deleting an absent one is true
     // (there is nothing left to delete).
     if (!wrapper->Delete(current, mark_key) ||

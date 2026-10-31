@@ -37,6 +37,21 @@ std::string ValueText(uint64_t value) {
   return std::string(buffer.data(), static_cast<size_t>(len));
 }
 
+/* Which of V8's own-property kinds `key` names on `object`: 0 absent, 1 data
+ * named, 2 data indexed, 3 callback named, 4 callback indexed. -1 when the
+ * engine reported an error, which is then pending. */
+int OwnPropertyKind(v8::Local<v8::Context> context, const v8::Object* object,
+                    uint64_t key) {
+  auto* current = reinterpret_cast<v8::Context*>(
+      static_cast<uintptr_t>(context.raw()));
+  int32_t kind = -1;
+  if (slag_object_own_property_kind(current->slag(), v8::Raw(object), key,
+                                    &kind) != 0) {
+    return -1;
+  }
+  return kind;
+}
+
 uint64_t HostTrampoline(void* data, const void* call, uint64_t this_value,
                         const uint64_t* args, size_t len) {
   auto* function = static_cast<v8::FunctionTemplate*>(data);
@@ -197,6 +212,31 @@ MaybeLocal<Value> Object::GetRealNamedProperty(Local<Context> context,
   }
   if (found == 0) return MaybeLocal<Value>();
   return Local<Value>::New(out);
+}
+
+Maybe<bool> Object::HasRealNamedProperty(Local<Context> context,
+                                         Local<Name> key) {
+  if (context.IsEmpty() || key.IsEmpty()) return Maybe<bool>();
+  const int kind = OwnPropertyKind(context, this, key.raw());
+  if (kind < 0) return Maybe<bool>();
+  return Maybe<bool>(kind == 1 || kind == 3);
+}
+
+Maybe<bool> Object::HasRealIndexedProperty(Local<Context> context,
+                                           uint32_t index) {
+  if (context.IsEmpty()) return Maybe<bool>();
+  const uint64_t key = slag_number_new(static_cast<double>(index));
+  const int kind = OwnPropertyKind(context, this, key);
+  if (kind < 0) return Maybe<bool>();
+  return Maybe<bool>(kind == 2 || kind == 4);
+}
+
+Maybe<bool> Object::HasRealNamedCallbackProperty(Local<Context> context,
+                                                 Local<Name> key) {
+  if (context.IsEmpty() || key.IsEmpty()) return Maybe<bool>();
+  const int kind = OwnPropertyKind(context, this, key.raw());
+  if (kind < 0) return Maybe<bool>();
+  return Maybe<bool>(kind == 3);
 }
 
 Local<Number> Number::New(Isolate*, double value) {
