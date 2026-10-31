@@ -108,6 +108,9 @@ int32_t slag_eval(SlagContext* context, const uint8_t* source, size_t len, uint6
 int32_t slag_compile(SlagContext* context, const uint8_t* source, size_t len,
                      const uint8_t* name, size_t name_len, SlagScript** out);
 int32_t slag_script_run(SlagContext* context, SlagScript* script, uint64_t* out);
+/* Drain the job queues. 1 when a job was queued, 0 when none was, -1 with a
+ * pending error when a job threw. */
+int32_t slag_drain_jobs(SlagContext* context);
 void slag_script_free(SlagScript* script);
 int32_t slag_register_fn(SlagContext* context, const uint8_t* name, size_t name_len,
                          slag_host_fn callback, void* data);

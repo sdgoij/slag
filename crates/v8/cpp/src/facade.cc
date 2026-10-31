@@ -390,9 +390,28 @@ std::unique_ptr<Platform> NewDefaultPlatform() {
   return std::make_unique<Platform>();
 }
 
-bool PumpMessageLoop(Platform*, Isolate*) { return false; }
+bool PumpMessageLoop(Platform*, Isolate* isolate) {
+  return isolate != nullptr && isolate->PumpMessages();
+}
 
 }  // namespace platform
+
+bool Isolate::PumpMessages() {
+  bool ran = false;
+  for (Context* context : contexts_) {
+    if (context == nullptr) continue;
+    // -1 means a job threw and left the error pending; that still counts as a
+    // task the pump ran.
+    if (slag_drain_jobs(context->slag()) != 0) ran = true;
+  }
+  return ran;
+}
+
+void Isolate::PerformMicrotaskCheckpoint() {
+  auto* context = reinterpret_cast<Context*>(
+      static_cast<uintptr_t>(g_current_context));
+  if (context != nullptr) slag_drain_jobs(context->slag());
+}
 
 ArrayBuffer::Allocator* ArrayBuffer::Allocator::NewDefaultAllocator() {
   return new Allocator();
@@ -750,6 +769,13 @@ MaybeLocal<Value> Script::Run(Local<Context> context) {
       static_cast<uintptr_t>(Raw(this)));
   if (slag_script_run(current->slag(), script, &out) != 0) {
     return MaybeLocal<Value>();
+  }
+  // `kAuto` (the default, and what V8 does when the call stack empties) drains
+  // the run's own microtasks here; `kExplicit` leaves them for the checkpoint.
+  // A run that threw leaves its error pending and queues nothing new.
+  if (g_current_isolate == nullptr ||
+      g_current_isolate->GetMicrotasksPolicy() == MicrotasksPolicy::kAuto) {
+    slag_drain_jobs(current->slag());
   }
   return Local<Value>::New(out);
 }

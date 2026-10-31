@@ -422,8 +422,9 @@ value-sized `Local<T>`, not the indirect-slot design of §3; A1 replaced that
 with the indirect slot, below. Two limits are
 recorded rather than hidden: the sample's `load()` re-entry is refused at the
 ABI (the safe path is `FunctionCall::eval`, which the sample does not use), and
-an uncaught `Error` prints the engine's generic `TypeError: Uncaught exception`
-because `JsError` does not expose the thrown value through the ABI yet.
+an uncaught `Error` printed the engine's generic `TypeError: Uncaught exception`
+because `JsError` did not expose the thrown value through the ABI yet (that and
+the message/stack path landed later, above).
 
 *A1 result (2026-10-31).* `Local<T>` is now an indirect slot (`Address*` into a
 thread-local handle stack), `HandleScope` restores the stack on exit, `Global<T>`
@@ -734,6 +735,26 @@ way). `String::Utf8Value` also had to start running ToString through the engine,
 which is why the runner prints `Error: boom` instead of a tag; it falls back to
 the primitive rendering while a callback holds the context, because no host code
 can run there.
+
+*Microtasks and the message pump (2026-10-31).* The platform rung was next, and it
+started from a finding: `slag_script_run` reaches `Context::eval_script`, which
+by design does not drain, and nothing else drained either, so a script's promise
+reactions and due timers never ran in the facade at all (the sample printed
+nothing for `Promise.resolve(1).then(print)`). Three pieces close that.
+`Isolate::SetMicrotasksPolicy` (with `kAuto` the default, `kExplicit`, and
+`kScoped` accepted as explicit because there is no `MicrotasksScope` to close)
+drives whether `Script::Run` drains when it returns; `Isolate::PerformMicrotaskCheckpoint`
+drains on demand; and `platform::PumpMessageLoop` drains the isolate's contexts
+and reports whether it ran anything, which is what the sample's
+`while (PumpMessageLoop(...)) continue;` loop asks. The engine gained
+`Context::drain_jobs` and `has_pending_jobs` over the existing `run_jobs` and
+`job_queues_empty`, plus one ABI call, and a runtime test pins the
+"queued, drained, nothing left" sequence.
+
+What is still missing on this surface is the host-task half: the facade's
+`Platform` has no task runner, so `PostTask`/`CallOnForegroundThread` and
+platform tasks do not exist, and the pump only ever runs engine work. `kScoped`
+and `MicrotasksScope` are the other stated gap.
 
 The ABI shape is roughly a struct of up to seven C function pointers, the data
 pointer, and the flags, handed over once per template, with the return codes

@@ -1043,6 +1043,71 @@ int main() {
     }
   }
 
+  // Microtasks: the default policy drains a run's own jobs, and `kExplicit`
+  // leaves them for the checkpoint or the platform's message pump.
+  {
+    v8::HandleScope scope(isolate);
+    v8::Local<v8::Context> current = context.Get(isolate);
+    v8::Context::Scope context_scope(current);
+    std::unique_ptr<v8::Platform> platform = v8::platform::NewDefaultPlatform();
+    const auto read = [&](const char* name) {
+      return current->Global()
+          ->Get(current, v8::String::NewFromUtf8Literal(isolate, name))
+          .ToLocalChecked()
+          ->Int32Value(current)
+          .FromMaybe(-1);
+    };
+    const auto run = [&](const char* source) {
+      return v8::Script::Compile(
+                 current, v8::String::NewFromUtf8Literal(isolate, source))
+          .ToLocalChecked()
+          ->Run(current);
+    };
+
+    // `kAuto` (the default): the promise reaction has run when Run returns.
+    run(
+        "globalThis.settled = 0;"
+        " Promise.resolve(1).then(function () { globalThis.settled = 1; });");
+    if (read("settled") != 1) {
+      fprintf(stderr, "the default policy did not drain the run's microtasks\n");
+      ++failures;
+    }
+
+    // `kExplicit`: nothing runs until the host pumps or checkpoints.
+    isolate->SetMicrotasksPolicy(v8::MicrotasksPolicy::kExplicit);
+    if (isolate->GetMicrotasksPolicy() != v8::MicrotasksPolicy::kExplicit) {
+      fprintf(stderr, "the microtasks policy did not stick\n");
+      ++failures;
+    }
+    run(
+        "globalThis.pumped = 0;"
+        " Promise.resolve(1).then(function () { globalThis.pumped = 1; });");
+    if (read("pumped") != 0) {
+      fprintf(stderr, "kExplicit drained without being asked\n");
+      ++failures;
+    }
+    if (!v8::platform::PumpMessageLoop(platform.get(), isolate) ||
+        read("pumped") != 1) {
+      fprintf(stderr, "the message pump did not run the queued job\n");
+      ++failures;
+    }
+    if (v8::platform::PumpMessageLoop(platform.get(), isolate)) {
+      fprintf(stderr, "a second pump found work that was not there\n");
+      ++failures;
+    }
+
+    // The explicit checkpoint drains the same way.
+    run(
+        "globalThis.checked = 0;"
+        " Promise.resolve(1).then(function () { globalThis.checked = 1; });");
+    isolate->PerformMicrotaskCheckpoint();
+    if (read("checked") != 1) {
+      fprintf(stderr, "the checkpoint did not run the queued job\n");
+      ++failures;
+    }
+    isolate->SetMicrotasksPolicy(v8::MicrotasksPolicy::kAuto);
+  }
+
   // A host-traced reference: a root the C++ side owns and releases. Once it
   // handle scope pops, the object is reachable only through the reference.
   {

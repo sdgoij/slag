@@ -946,6 +946,21 @@ impl Context {
         Ok(JsValue(value))
     }
 
+    /// Drain every queued job (`Isolate::PerformMicrotaskCheckpoint`), answering
+    /// whether anything was queued: a microtask, a promise reaction, or a due
+    /// timer. What `Platform::PumpMessageLoop` reports as "ran a task".
+    pub fn drain_jobs(&mut self) -> Result<bool, JsError> {
+        let queued = !self.agent.job_queues_empty();
+        self.agent.run_jobs()?;
+        Ok(queued)
+    }
+
+    /// Whether a job is queued. Reads only, so a caller that cannot borrow the
+    /// context (a callback) can still ask.
+    pub fn has_pending_jobs(&self) -> bool {
+        !self.agent.job_queues_empty()
+    }
+
     /// Evaluate a Script WITHOUT draining the job queues. Pending microtasks
     /// and timers stay queued until the caller runs [`Context::run_jobs`]; a
     /// host binding that stringifies the completion before the drain avoids
@@ -3913,6 +3928,27 @@ mod tests {
         context.run_jobs().unwrap();
         let result = context.eval("globalThis.result").unwrap();
         assert_eq!(result.as_number(), Some(7.0));
+    }
+
+    #[test]
+    fn drain_jobs_reports_what_it_ran() {
+        let mut context = Context::new().unwrap();
+        // `eval_script` leaves the queues alone, which is what an explicit-policy
+        // host's entry point is.
+        context
+            .eval_script(
+                "globalThis.settled = 0;\
+                 Promise.resolve(1).then(function () { globalThis.settled = 1; });",
+            )
+            .unwrap();
+        assert!(context.has_pending_jobs());
+        assert!(context.drain_jobs().unwrap(), "the reaction was queued");
+        assert!(!context.has_pending_jobs());
+        assert!(!context.drain_jobs().unwrap(), "nothing was left to run");
+        assert_eq!(
+            context.eval("globalThis.settled").unwrap().as_number(),
+            Some(1.0)
+        );
     }
 
     #[test]

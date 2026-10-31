@@ -53,6 +53,16 @@ class Maybe;
 
 enum class NewStringType { kNormal, kInternalized };
 
+/* When the job queues drain (`v8::MicrotasksPolicy`).
+ *
+ * `kAuto`, the default, drains after a successful `Script::Run` returns, so the
+ * run's own microtasks have settled by the time the host sees the result.
+ * `kExplicit` leaves them queued until the host calls
+ * `Isolate::PerformMicrotaskCheckpoint` or pumps the message loop. `kScoped` is
+ * accepted and behaves like `kExplicit`: the facade has no `MicrotasksScope` to
+ * close. */
+enum class MicrotasksPolicy { kExplicit = 0, kScoped = 1, kAuto = 2 };
+
 class Platform {
  public:
   virtual ~Platform() = default;
@@ -811,6 +821,16 @@ class Isolate {
   void ThrowError(const char* message);
   Local<Context> GetCurrentContext();
 
+  /* Drain the job queues now (`Isolate::PerformMicrotaskCheckpoint`). */
+  void PerformMicrotaskCheckpoint();
+
+  /* When the job queues drain (`Isolate::SetMicrotasksPolicy`). `kAuto` is the
+   * default: a successful `Script::Run` drains when it returns. */
+  void SetMicrotasksPolicy(MicrotasksPolicy policy) {
+    microtasks_policy_ = policy;
+  }
+  MicrotasksPolicy GetMicrotasksPolicy() const { return microtasks_policy_; }
+
   class Scope {
    public:
     explicit Scope(Isolate* isolate) : previous_(g_current_isolate) {
@@ -826,10 +846,16 @@ class Isolate {
   Isolate() = default;
   ~Isolate() = default;
 
+  /* Run every context's queued jobs, answering whether any was queued
+   * (`platform::PumpMessageLoop`). */
+  bool PumpMessages();
+
   SlagIsolate* slag_ = nullptr;
   std::vector<Context*> contexts_;
+  MicrotasksPolicy microtasks_policy_ = MicrotasksPolicy::kAuto;
 
   friend class Context;
+  friend bool platform::PumpMessageLoop(Platform*, Isolate*);
 };
 
 /*

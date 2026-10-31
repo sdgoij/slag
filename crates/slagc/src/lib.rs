@@ -689,6 +689,31 @@ fn copy_text(text: Option<&str>, buffer: *mut c_char, len: usize) {
     }
 }
 
+/// Drain the context's job queues (`v8::Isolate::PerformMicrotaskCheckpoint` and
+/// the platform's message pump). Returns 1 when a job was queued, 0 when none
+/// was, and -1 with a pending error when a job threw. A pump from inside a
+/// callback is a no-op: that operation already holds the context.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn slag_drain_jobs(context: *mut SlagContext) -> i32 {
+    let Some(context) = context.as_mut() else {
+        return 0;
+    };
+    let queued = match context.context.try_borrow() {
+        Ok(engine) => engine.has_pending_jobs(),
+        Err(_) => return 0,
+    };
+    let Ok(mut engine) = context.context.try_borrow_mut() else {
+        return 0;
+    };
+    match engine.run_jobs() {
+        Ok(()) => i32::from(queued),
+        Err(error) => {
+            record(context, error);
+            -1
+        }
+    }
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn slag_undefined() -> u64 {
     JsValue::undefined().to_bits()

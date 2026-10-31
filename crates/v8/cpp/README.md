@@ -273,6 +273,8 @@ not a claim that gin itself links.
 - `TryCatch`, `Isolate::ThrowError`, `Message` (a compile error's position), and
   `TryCatch::StackTrace` (the captured stack of a thrown `Error`).
   `TryCatch::Exception` returns the thrown language value.
+- `Isolate::SetMicrotasksPolicy` / `PerformMicrotaskCheckpoint` and
+  `platform::PumpMessageLoop`, over the engine's job queues.
 - `ObjectTemplate`/`FunctionTemplate` and host callbacks with arguments and a
   return value.
 - `Global<T>`, `Maybe<T>`, `MaybeLocal<T>`.
@@ -316,7 +318,14 @@ not a claim that gin itself links.
 - `String::Utf8Value` runs ToString through the engine, so an object's own
   `toString` runs; it falls back to a primitive rendering when a callback already
   holds the context (a property name is a string in that case anyway).
-- `PumpMessageLoop` always returns false; the engine drains jobs inline.
+- `Platform` is a handle plus a message pump: `PumpMessageLoop` runs the
+  isolate's queued jobs (microtasks, promise reactions, due timers) and answers
+  whether it ran any. There are no host-posted platform tasks or task runners
+  yet, so `PostTask`/`CallOnForegroundThread` are absent rather than ignored.
+- Microtasks follow `Isolate::SetMicrotasksPolicy`: `kAuto` (the default) drains
+  after a successful `Script::Run`, `kExplicit` leaves the queues for
+  `PerformMicrotaskCheckpoint` or `PumpMessageLoop`, and `kScoped` is accepted
+  and behaves like `kExplicit` (there is no `MicrotasksScope` to close).
 - `Isolate::Dispose` frees the contexts the facade created; templates are not
   freed.
 - Host callbacks receive `this` now (`FunctionCallbackInfo::This`), and
