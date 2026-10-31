@@ -762,6 +762,14 @@ pub fn length_atom() -> AtomId {
     *LENGTH.get_or_init(|| intern_utf8("length"))
 }
 
+/// The interned `lastIndex` atom: the regexp match protocol reads and writes
+/// that name on every `test`/`exec`, so a per-call `JsString` encode for it is
+/// a per-call allocation in the hottest builtin loop there is.
+pub fn last_index_atom() -> AtomId {
+    static LAST_INDEX: OnceLock<AtomId> = OnceLock::new();
+    *LAST_INDEX.get_or_init(|| intern_utf8("lastIndex"))
+}
+
 /// Returns the interned text for `id`.
 pub fn lookup(id: AtomId) -> JsString {
     LOOKUP_MEMO.with(|memo| {

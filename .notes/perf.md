@@ -20344,3 +20344,42 @@ borrow, `same_value`, the entry `Vec`) is the next thing to price, not the brand
 
 Gates: fmt, `clippy --workspace --all-targets -D warnings`, 5861 tests, four
 sweeps 51,998 at 100%, corpus parity 0 (`mean-jitGap` 8.28).
+
+## LANDED (2026-10-30): the regexp match protocol stops encoding its own property name
+
+`regexp_exec_protocol` runs on every `test`, `exec`, `match`, `replace` and
+`split`, and it read `lastIndex` with `get_property(agent, re, &JsString::from_utf8("lastIndex"), ...)`
+plus `obj.set(&JsString::from_utf8("lastIndex"), ...)` on the failure paths: a
+per-call UTF-8 encode and box for a name that never changes, and a full chain
+walk for a read whose own property is almost always plain data. Two changes:
+
+- `crux::string::last_index_atom`, so the name is an interned atom (the same
+  pattern as `length_atom`).
+- The read takes the object's OWN `lastIndex` when it is a data property (a data
+  own property shadows the chain for [[Get]], so this is the exact read); an
+  absent or accessor own property still takes the general [[Get]]. The write stays
+  `set_key`, the spec's [[Set]] with the in-place own-writable-data fast path,
+  which also bumps the generation the read-side value cell needs (writing through
+  the compiled store's `write_data_property` entry instead is a latent stale read:
+  that entry leaves cell refresh to its caller, and 11 fixtures caught exactly
+  that, `lastIndex` reading 1 after the reset had landed in the vector).
+
+| probe (100k calls, one row per process, minima of 3) | before | after |
+| --- | ---: | ---: |
+| `/[a-z]+/.test(s)` | 35.05 | **33.59 (-4.2%)** |
+| `/a/.test(s)` (matches, no search) | 15.89 | **13.66 (-14.0%)** |
+| `/^[a-z]+$/.test(s)` | 42.35 | **39.68 (-6.3%)** |
+
+The decomposition that led here, worth keeping: a `test` costs **~150 ns fixed**
+plus the pattern (`/a/` and `/z/`, which differ only in whether the search scans,
+measure the same 155 ns, and `[a-z]+` adds ~200), while a builtin call itself is
+18 ns (`mg.get(k)` through an own data property) and a certified leaf call is
+5.8. So ~130 ns in a `test` is not the call and not the scan: it is the protocol
+around the engine (the encode, the chain walk, `Matcher::new`, the engine's
+per-call `tasks`/`choices` vectors) and then the engine's own per-call state.
+`Matcher::new`'s two `Vec::new()`s and its `HashMap::new()` are the next thing to
+price, and they want a reusable scratch matcher on the regexp record rather than
+a per-call one.
+
+Gates: fmt, `clippy --workspace --all-targets -D warnings`, 5861 tests, four
+sweeps 51,998 at 100%, corpus parity 0.
