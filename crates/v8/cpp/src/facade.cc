@@ -468,6 +468,18 @@ uint32_t TypeMaskOf(const void* self) {
   return slag_value_type_mask(CurrentSlagContext(), Raw(self));
 }
 
+/* The engine's collection observer: one per context, with the isolate as its
+ * data, so every collection the agent drives reaches the host's prologue and
+ * epilogue lists. `phase` is 0 for the prologue and 1 for the epilogue. */
+void CollectionObserver(void* data, int32_t phase, int32_t gc_type) {
+  auto* isolate = static_cast<v8::Isolate*>(data);
+  if (isolate == nullptr) return;
+  isolate->NotifyGcCallbacks(
+      gc_type == SLAG_GC_TYPE_SCAVENGE ? v8::kGCTypeScavenge
+                                       : v8::kGCTypeMarkSweepCompact,
+      phase == 0);
+}
+
 }  // namespace
 
 bool Value::IsUndefined() const {
@@ -1168,6 +1180,92 @@ void Isolate::ThrowException(Local<Value> exception) {
   slag_throw_exception(CurrentSlagContext(), exception.raw());
 }
 
+void Isolate::GetHeapStatistics(HeapStatistics* statistics) {
+  if (statistics == nullptr) return;
+  const int64_t account = slag_isolate_adjust_external_memory(slag_, 0);
+  SlagHeapStatistics stats{};
+  bool filled = false;
+  int64_t extra_buffers = 0;
+  for (Context* context : contexts_) {
+    if (context == nullptr) continue;
+    if (!filled) {
+      if (slag_heap_statistics(context->slag(), account, &stats) != 0) continue;
+      filled = true;
+    } else {
+      extra_buffers += slag_context_external_memory(context->slag());
+    }
+  }
+  *statistics = HeapStatistics{};
+  if (!filled) return;
+  statistics->total_heap_size = stats.total_heap_size;
+  statistics->total_heap_size_executable = stats.total_heap_size_executable;
+  statistics->total_physical_size = stats.total_physical_size;
+  statistics->total_available_size = stats.total_available_size;
+  statistics->used_heap_size = stats.used_heap_size;
+  statistics->heap_size_limit = stats.heap_size_limit;
+  statistics->malloced_memory =
+      stats.malloced_memory + static_cast<size_t>(extra_buffers);
+  statistics->external_memory =
+      stats.external_memory + static_cast<size_t>(extra_buffers);
+  statistics->peak_malloced_memory = stats.peak_malloced_memory;
+  statistics->does_zap_garbage = stats.does_zap_garbage != 0;
+  statistics->number_of_native_contexts = stats.number_of_native_contexts;
+  statistics->number_of_detached_contexts = stats.number_of_detached_contexts;
+  statistics->total_global_handles_size = stats.total_global_handles_size;
+  statistics->used_global_handles_size = stats.used_global_handles_size;
+  statistics->embedded_blob_size = stats.embedded_blob_size;
+}
+
+void Isolate::NotifyGcCallbacks(GCType type, bool prologue) {
+  auto& callbacks = prologue ? prologue_callbacks_ : epilogue_callbacks_;
+  // A callback may add or remove one, so run a snapshot of the list.
+  const std::vector<std::pair<GCCallback, void*>> snapshot = callbacks;
+  for (const auto& entry : snapshot) {
+    entry.first(this, type, kNoGCCallbackFlags, entry.second);
+  }
+}
+
+void Isolate::RequestGarbageCollectionForTesting(GarbageCollectionType) {
+  for (Context* context : contexts_) {
+    if (context == nullptr) continue;
+    slag_collect(context->slag());
+  }
+}
+
+void Isolate::LowMemoryNotification() {
+  RequestGarbageCollectionForTesting(kFullGarbageCollection);
+}
+
+void Isolate::AddGCEpilogueCallback(GCCallback callback, void* data) {
+  if (callback == nullptr) return;
+  epilogue_callbacks_.emplace_back(callback, data);
+}
+
+void Isolate::RemoveGCEpilogueCallback(GCCallback callback, void* data) {
+  for (auto it = epilogue_callbacks_.begin(); it != epilogue_callbacks_.end();
+       ++it) {
+    if (it->first == callback && it->second == data) {
+      epilogue_callbacks_.erase(it);
+      return;
+    }
+  }
+}
+
+void Isolate::AddGCPrologueCallback(GCCallback callback, void* data) {
+  if (callback == nullptr) return;
+  prologue_callbacks_.emplace_back(callback, data);
+}
+
+void Isolate::RemoveGCPrologueCallback(GCCallback callback, void* data) {
+  for (auto it = prologue_callbacks_.begin(); it != prologue_callbacks_.end();
+       ++it) {
+    if (it->first == callback && it->second == data) {
+      prologue_callbacks_.erase(it);
+      return;
+    }
+  }
+}
+
 namespace {
 
 /* `v8::Array`'s allocation, shared by the length and element forms. A null
@@ -1617,6 +1715,7 @@ Local<Context> Context::New(Isolate* isolate, std::nullptr_t,
 
   auto* context = new Context();
   context->slag_ = slag;
+  slag_watch_collections(slag, isolate, &CollectionObserver);
 
   if (!global_template.IsEmpty()) {
     auto* tmpl = reinterpret_cast<ObjectTemplate*>(

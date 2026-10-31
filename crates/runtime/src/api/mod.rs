@@ -1716,6 +1716,33 @@ mod tests {
         assert_eq!(PHASES.with(|phases| phases.borrow().clone()), vec![1, 2]);
     }
 
+    /// A second pass registered *from inside* the first pass: the sweep had
+    /// already queued what it saw, so this one lands in the late queue and the
+    /// same drain must run it after every first pass.
+    #[test]
+    fn a_second_pass_registered_by_the_first_runs_in_the_same_drain() {
+        static LATE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        LATE.store(false, std::sync::atomic::Ordering::SeqCst);
+
+        let mut isolate = isolate();
+        let _context = context(&mut isolate);
+        let weak = an_unrooted_weak_handle();
+        weak.set_callback(Box::new(|| {
+            crux::heap::queue_late_second_pass(Box::new(|| {
+                LATE.store(true, std::sync::atomic::Ordering::SeqCst);
+            }));
+        }));
+
+        scrub_stack(32);
+        isolate.agent().collect_garbage();
+        assert!(!LATE.load(std::sync::atomic::Ordering::SeqCst));
+        isolate.run_finalizers();
+        assert!(
+            LATE.load(std::sync::atomic::Ordering::SeqCst),
+            "the late second pass runs in the same drain"
+        );
+    }
+
     /// A traced reference over a value nothing else names, made in a frame that
     /// returns only the handle, so the conservative scan cannot root the value.
     #[inline(never)]

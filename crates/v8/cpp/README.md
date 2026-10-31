@@ -307,6 +307,40 @@ documents. `Object::GetCreationContext`/`GetCreationContextChecked` answer the
 entered context, because the engine does not record a holder's realm on each
 object and the facade has one realm per entered context.
 
+### Weak handles, GC hooks, and heap statistics
+
+`Global<T>::SetWeak` turns a persistent into a weak handle: the strong retention
+is released, `Get` reads the live value from the engine and answers empty once a
+collection has taken it, and the callback runs after that collection with a
+`WeakCallbackInfo<P>` (the template parameter is the type of the pointer
+`SetWeak` was given, as in V8). `GetParameter` is that pointer; `GetValue` is
+empty because the value is already gone. `SetSecondPassCallback` registers a
+guaranteed finalizer that runs after every first pass of the same drain, even if
+the first pass released the handle. `ClearWeak` takes the value back under a
+strong hold while it is alive, `IsWeak` and `SetWrapperClassId`
+/`WrapperClassId` complete the persistent surface.
+
+One detail is load-bearing: `SetWeak` clears the `Global`'s own value word as
+well as releasing the root. A `Global` is usually a local, and the engine's
+conservative stack scan would read that word as a root and keep the value alive,
+so the weak handle would never empty. `Get` reads the engine's live bits
+instead.
+
+`AddGCPrologueCallback`/`AddGCEpilogueCallback` (and their removals) sit on the
+engine's collection observer, so they run around every collection the agent
+drives, including the ones its growth policy starts. The callback receives the
+generation (`kGCTypeScavenge` or `kGCTypeMarkSweepCompact`) and
+`kNoGCCallbackFlags`. `RequestGarbageCollectionForTesting` and
+`LowMemoryNotification` collect now; the engine has one full collection, so
+`kMinorGarbageCollection` runs that one. The engine also drains the death
+callbacks the sweep queued, so a weak finalizer has run when the request
+returns.
+
+`Isolate::GetHeapStatistics` fills V8's struct from the arena walk and the live
+buffer record: the four measured numbers are real, `heap_size_limit` is the
+largest `size_t` (the arena has no limit), the executable/global-handle numbers
+are zero because those stores do not exist, and `embedded_blob_size` is zero.
+
 ### Buffers and typed arrays
 
 `BackingStore` is a handle to the engine's refcounted byte block, so a store
@@ -409,6 +443,10 @@ not a claim that gin itself links.
 - Embedder data (value and aligned-pointer slots, the field count, and
   `ClearAllSlots`), security tokens (get, set, and use-default), and
   `Object::GetCreationContext`/`GetCreationContextChecked`.
+- `Global<T>::SetWeak` with `WeakCallbackInfo`, the second-pass callback, and
+  `ClearWeak`/`IsWeak`; `AddGC*Callback` and their removals;
+  `RequestGarbageCollectionForTesting` and `LowMemoryNotification`;
+  `Isolate::GetHeapStatistics` and `HeapStatistics`.
 - Handles and persistents as engine roots: a handle slot or a `Global` over an
   engine value retains it for that object's lifetime, and a facade pointer is
   never registered.
@@ -453,6 +491,13 @@ not a claim that gin itself links.
   rather than a facade decision. Embedder value slots and aligned-pointer slots
   are separate stores, so `GetEmbedderData` on a pointer slot answers
   `undefined` rather than an `External`.
+- `WeakCallbackInfo::GetValue` is always empty and every `WeakCallbackType`
+  behaves as `kParameter`: the engine reports the death, not which kind of
+  reference held the value. GC callbacks always receive `kNoGCCallbackFlags`,
+  and `kMinorGarbageCollection` runs the one full collection the engine has.
+- Heap statistics report `SIZE_MAX` for the limit and zeros for the executable,
+  global-handle, and embedded-blob sizes, because this engine has none of those
+  stores; the values are documented in the Rust bridge's `api::heap` module.
 - `Platform` is a handle plus a message pump: `PumpMessageLoop` runs the
   isolate's queued jobs (microtasks, promise reactions, due timers) and answers
   whether it ran any. There are no host-posted platform tasks or task runners
@@ -524,4 +569,8 @@ and runs a `FunctionTemplate` accessor pair. The embedder block round-trips a
 value and a pointer slot, checks that a value outlives the scope that made it,
 that `ClearAllSlots` releases both roots, that the default security token is
 one shared object and a set token reads back, and that an object reports the
-entered context.
+entered context. The weak-handle block makes a value in a frame that returns
+only the handle, scrubs the stack, collects, and checks that the callback and
+its second pass ran, that the handle reads empty, and that `ClearWeak` keeps a
+value alive without calling back; it then checks the GC hooks around requested
+collections and their removal, and the heap statistics against a live buffer.

@@ -15,6 +15,7 @@ typedef struct SlagContext SlagContext;
 typedef struct SlagScript SlagScript;
 typedef struct SlagTraced SlagTraced;
 typedef struct SlagBuffer SlagBuffer;
+typedef struct SlagWeak SlagWeak;
 
 typedef uint64_t (*slag_host_fn)(void* data, const void* call, uint64_t this_value,
                                  const uint64_t* args, size_t len);
@@ -243,6 +244,49 @@ size_t slag_typed_array_length(uint64_t value);
  * and one realm's buffer bytes, which the facade adds to it. */
 int64_t slag_isolate_adjust_external_memory(SlagIsolate* isolate, int64_t change);
 int64_t slag_context_external_memory(SlagContext* context);
+
+/* The heap numbers `v8::Isolate::GetHeapStatistics` fills. Every field is a
+ * count except `does_zap_garbage`; the facade copies them into V8's struct. */
+typedef struct SlagHeapStatistics {
+  size_t total_heap_size;
+  size_t total_heap_size_executable;
+  size_t total_physical_size;
+  size_t total_available_size;
+  size_t used_heap_size;
+  size_t heap_size_limit;
+  size_t malloced_memory;
+  size_t external_memory;
+  size_t peak_malloced_memory;
+  int32_t does_zap_garbage;
+  size_t number_of_native_contexts;
+  size_t number_of_detached_contexts;
+  size_t total_global_handles_size;
+  size_t used_global_handles_size;
+  size_t embedded_blob_size;
+} SlagHeapStatistics;
+int32_t slag_heap_statistics(SlagContext* context, int64_t host_account,
+                             SlagHeapStatistics* out);
+
+/* Weak persistent handles (`v8::Global<T>::SetWeak`). The value is not kept
+ * alive, and the callback runs after the collection that took it. */
+typedef void (*SlagWeakCallback)(void* data);
+SlagWeak* slag_weak_new(uint64_t value);
+int32_t slag_weak_get(const SlagWeak* weak, uint64_t* out);
+void slag_weak_clear(const SlagWeak* weak);
+void slag_weak_free(SlagWeak* weak);
+int32_t slag_weak_set_callback(const SlagWeak* weak, void* data,
+                               SlagWeakCallback callback);
+int32_t slag_weak_queue_second_pass(void* data, SlagWeakCallback callback);
+
+/* The collection observer `v8::Isolate::AddGC*Callback` sits on: the phases are
+ * prologue (0) and epilogue (1), and the type is a `SlagGcType`. */
+enum SlagGcType {
+  SLAG_GC_TYPE_SCAVENGE = 1,
+  SLAG_GC_TYPE_MARK_SWEEP_COMPACT = 2,
+};
+typedef void (*SlagCollectionObserver)(void* data, int32_t phase, int32_t gc_type);
+int32_t slag_watch_collections(SlagContext* context, void* data,
+                               SlagCollectionObserver observer);
 
 int32_t slag_array_buffer_detach(SlagContext* context, uint64_t value, uint64_t key,
                                 int32_t has_key);

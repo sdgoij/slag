@@ -1018,6 +1018,7 @@ pub struct HeapState {
     weak_handles: RefCell<Vec<WeakEntry>>,
     pending_weak_callbacks: RefCell<Vec<Box<dyn FnOnce()>>>,
     pending_weak_second_pass: RefCell<Vec<Box<dyn FnOnce()>>>,
+    pending_late_second_pass: RefCell<Vec<Box<dyn FnOnce()>>>,
     next_weak_id: Cell<u64>,
     traced_handles: RefCell<Vec<TracedEntry>>,
     next_traced_id: Cell<u64>,
@@ -1061,6 +1062,7 @@ impl HeapState {
             weak_handles: RefCell::new(Vec::new()),
             pending_weak_callbacks: RefCell::new(Vec::new()),
             pending_weak_second_pass: RefCell::new(Vec::new()),
+            pending_late_second_pass: RefCell::new(Vec::new()),
             next_weak_id: Cell::new(1),
             traced_handles: RefCell::new(Vec::new()),
             next_traced_id: Cell::new(1),
@@ -2143,11 +2145,32 @@ pub fn take_pending_weak_callbacks() -> Vec<Box<dyn FnOnce()>> {
 }
 
 per_heap!(
-    /// The second-pass callbacks the sweeps since the last drain queued. Drained
-    /// after every first pass.
+    /// The guaranteed second-pass callbacks the sweeps since the last drain queued.
+    /// Drained after every first pass.
     PENDING_WEAK_SECOND_PASS = PendingWeakSecondPass =>
         pending_weak_second_pass: RefCell<Vec<Box<dyn FnOnce()>>>;
 );
+
+per_heap!(
+    /// The second-pass callbacks a *first pass* registered while it ran
+    /// (`v8::WeakCallbackInfo::SetSecondPassCallback`). The sweep queued only the
+    /// ones it saw, so one registered later lands here and the same drain runs it
+    /// after every first pass, whatever the handle's state is by then.
+    PENDING_LATE_SECOND_PASS = PendingLateSecondPass =>
+        pending_late_second_pass: RefCell<Vec<Box<dyn FnOnce()>>>;
+);
+
+/// Queue a guaranteed finalizer registered from inside a first pass. It runs
+/// after every first pass of the same drain, even if the first pass cleared the
+/// handle that carried it.
+pub fn queue_late_second_pass(callback: Box<dyn FnOnce()>) {
+    PENDING_LATE_SECOND_PASS.with(|pending| pending.borrow_mut().push(callback));
+}
+
+/// Take the guaranteed finalizers a first pass registered.
+pub fn take_late_second_pass_callbacks() -> Vec<Box<dyn FnOnce()>> {
+    PENDING_LATE_SECOND_PASS.with(|pending| std::mem::take(&mut *pending.borrow_mut()))
+}
 
 /// Take the guaranteed second-pass callbacks, in the order their boxes were
 /// swept. The isolate drains [`take_pending_weak_callbacks`] first, so a second

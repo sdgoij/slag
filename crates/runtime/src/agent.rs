@@ -3396,6 +3396,12 @@ impl Agent {
         for callback in crux::heap::take_pending_weak_callbacks() {
             callback();
         }
+        // A guaranteed finalizer registered from inside its own first pass: the
+        // sweep had already taken the ones it queued, so this is the only place
+        // the late registrations can run.
+        for callback in crux::heap::take_late_second_pass_callbacks() {
+            callback();
+        }
         // The guaranteed pass, after every first pass: a first pass that cleared
         // its handle cannot cancel it (`SetSecondPassCallback`).
         for callback in crux::heap::take_pending_weak_second_pass_callbacks() {

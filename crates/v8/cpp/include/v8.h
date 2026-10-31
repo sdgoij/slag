@@ -1143,6 +1143,50 @@ class Context {
   friend class Isolate;
 };
 
+/* The kind of collection a GC callback was told about (`v8::GCType`). */
+enum GCType {
+  kGCTypeScavenge = 1 << 0,
+  kGCTypeMarkSweepCompact = 1 << 1,
+  kGCTypeAll = kGCTypeScavenge | kGCTypeMarkSweepCompact,
+};
+
+/* The flags a GC callback receives (`v8::GCCallbackFlags`). Accepted and passed
+ * through; the facade has no retained-object infos to construct. */
+enum GCCallbackFlags {
+  kNoGCCallbackFlags = 0,
+  kGCCallbackFlagConstructRetainedObjectInfos = 1 << 1,
+  kGCCallbackFlagForced = 1 << 2,
+  kGCCallbackFlagSynchronousPhantomCallbackProcessing = 1 << 3,
+};
+
+/* Which collection to request (`Isolate::RequestGarbageCollectionForTesting`).
+ * The engine has one full collection, so both names run it. */
+enum GarbageCollectionType {
+  kFullGarbageCollection = 0,
+  kMinorGarbageCollection = 1,
+};
+
+/* The heap numbers `Isolate::GetHeapStatistics` fills (`v8::HeapStatistics`).
+ * The four measured fields come from the arena walk and the buffer record; the
+ * constants are the ones the Rust bridge's own `HeapStatistics` documents. */
+struct HeapStatistics {
+  size_t total_heap_size = 0;
+  size_t total_heap_size_executable = 0;
+  size_t total_physical_size = 0;
+  size_t total_available_size = 0;
+  size_t used_heap_size = 0;
+  size_t heap_size_limit = 0;
+  size_t malloced_memory = 0;
+  size_t external_memory = 0;
+  size_t peak_malloced_memory = 0;
+  bool does_zap_garbage = false;
+  size_t number_of_native_contexts = 0;
+  size_t number_of_detached_contexts = 0;
+  size_t total_global_handles_size = 0;
+  size_t used_global_handles_size = 0;
+  size_t embedded_blob_size = 0;
+};
+
 class Isolate {
  public:
   struct CreateParams {
@@ -1164,6 +1208,30 @@ class Isolate {
    * total, the engine's live buffer bytes included
    * (`Isolate::AdjustAmountOfExternalAllocatedMemory`). */
   int64_t AdjustAmountOfExternalAllocatedMemory(int64_t change);
+
+  /* The heap's numbers (`Isolate::GetHeapStatistics`). The arena is shared by
+   * the isolate's contexts, so the first entered one answers it; each further
+   * context's live buffers are added to the external total. */
+  void GetHeapStatistics(HeapStatistics* statistics);
+
+  /* Collect now (`Isolate::RequestGarbageCollectionForTesting` and
+   * `LowMemoryNotification`), running the prologue and epilogue callbacks
+   * around it. The engine also collects on its own growth policy, and those
+   * collections do not reach these callbacks: the hook is the facade's around
+   * an explicit request. */
+  void RequestGarbageCollectionForTesting(GarbageCollectionType type);
+  void LowMemoryNotification();
+
+  using GCCallback = void (*)(Isolate* isolate, GCType type,
+                              GCCallbackFlags flags, void* data);
+  void AddGCEpilogueCallback(GCCallback callback, void* data = nullptr);
+  void RemoveGCEpilogueCallback(GCCallback callback, void* data = nullptr);
+  void AddGCPrologueCallback(GCCallback callback, void* data = nullptr);
+  void RemoveGCPrologueCallback(GCCallback callback, void* data = nullptr);
+
+  /* The trampoline the engine's collection observer calls: `prologue` selects
+   * the list, and `type` is the generation it was told about. */
+  void NotifyGcCallbacks(GCType type, bool prologue);
 
   /* When the job queues drain (`Isolate::SetMicrotasksPolicy`). `kAuto` is the
    * default: a successful `Script::Run` drains when it returns. */
@@ -1194,6 +1262,8 @@ class Isolate {
   SlagIsolate* slag_ = nullptr;
   std::vector<Context*> contexts_;
   MicrotasksPolicy microtasks_policy_ = MicrotasksPolicy::kAuto;
+  std::vector<std::pair<GCCallback, void*>> prologue_callbacks_;
+  std::vector<std::pair<GCCallback, void*>> epilogue_callbacks_;
   /* `Private::ForApi`'s one-name-one-private registry: the description and the
    * symbol bits, retained until `Dispose`. */
   std::unordered_map<std::string, uint64_t> private_names_;
@@ -1254,6 +1324,81 @@ Local<T> Local<T>::New(uint64_t value) {
       HandleScope::CreateHandle(value, std::is_base_of_v<Value, T>));
 }
 
+/* How a weak handle is watched (`v8::WeakCallbackType`). All three run the same
+ * parameter-based callback here: the engine reports the death, not which kind
+ * of reference it was holding. */
+enum class WeakCallbackType {
+  kParameter = 0,
+  kInternalFields = 1,
+  kFinalizer = 2,
+};
+
+/* The context a weak death callback is handed (`v8::WeakCallbackInfo`). `T` is
+ * the type of the pointer `SetWeak` was given, as in V8. The value is already
+ * gone, so `GetValue` answers empty; `GetParameter` is the host's own pointer,
+ * which is what a finalizer uses. */
+template <class T>
+class WeakCallbackInfo {
+ public:
+  using Callback = void (*)(const WeakCallbackInfo<T>&);
+
+  WeakCallbackInfo(Isolate* isolate, void* parameter)
+      : isolate_(isolate), parameter_(parameter) {}
+
+  Isolate* GetIsolate() const { return isolate_; }
+  T* GetParameter() const { return static_cast<T*>(parameter_); }
+  Local<Value> GetValue() const { return Local<Value>(); }
+
+  /* A guaranteed finalizer for the same death: it runs after every first pass
+   * of the drain, even if this pass released the handle. */
+  void SetSecondPassCallback(Callback callback) const;
+
+ private:
+  Isolate* isolate_;
+  void* parameter_;
+};
+
+namespace internal {
+
+template <class T>
+struct WeakCallbackSpec {
+  Isolate* isolate;
+  void* parameter;
+  typename WeakCallbackInfo<T>::Callback callback;
+};
+
+template <class T>
+struct WeakSecondPassSpec {
+  Isolate* isolate;
+  void* parameter;
+  typename WeakCallbackInfo<T>::Callback callback;
+};
+
+}  // namespace internal
+
+template <class T>
+inline void WeakCallbackTrampoline(void* data) {
+  auto* spec = static_cast<internal::WeakCallbackSpec<T>*>(data);
+  WeakCallbackInfo<T> info(spec->isolate, spec->parameter);
+  spec->callback(info);
+  delete spec;
+}
+
+template <class T>
+inline void WeakSecondPassTrampoline(void* data) {
+  auto* spec = static_cast<internal::WeakSecondPassSpec<T>*>(data);
+  WeakCallbackInfo<T> info(spec->isolate, spec->parameter);
+  spec->callback(info);
+  delete spec;
+}
+
+template <class T>
+inline void WeakCallbackInfo<T>::SetSecondPassCallback(Callback callback) const {
+  auto* spec =
+      new internal::WeakSecondPassSpec<T>{isolate_, parameter_, callback};
+  slag_weak_queue_second_pass(spec, &WeakSecondPassTrampoline<T>);
+}
+
 /* A persistent handle. It outlives every `HandleScope`, so the C ABI's root
  * registry has to hold what it names for exactly as long as this object exists;
  * a handle slot cannot do that, because the scope that allocated it pops.
@@ -1286,7 +1431,13 @@ class Global {
 
   bool IsEmpty() const { return empty_; }
   Local<T> Get(Isolate*) const {
-    return empty_ ? Local<T>() : Local<T>::New(value_);
+    if (empty_) return Local<T>();
+    if (weak_ != nullptr) {
+      uint64_t live = 0;
+      if (slag_weak_get(weak_, &live) != 0) return Local<T>();
+      return Local<T>::New(live);
+    }
+    return Local<T>::New(value_);
   }
 
   void Reset() { Release(); }
@@ -1294,6 +1445,50 @@ class Global {
     Release();
     Hold(local);
   }
+
+  /* Watch the value without keeping it alive (`Global::SetWeak`). The strong
+   * retention is released here, and `callback` runs after the collection that
+   * takes the value. A facade pointer is held strongly instead: there is nothing
+   * for the engine to watch. */
+  template <class P>
+  void SetWeak(P* parameter, typename WeakCallbackInfo<P>::Callback callback,
+               WeakCallbackType type) {
+    (void)type;
+    if (empty_ || !kEngineValue || weak_ != nullptr) return;
+    weak_ = slag_weak_new(value_);
+    slag_root_release(value_);
+    // The word must go: a `Global` is usually a local, and the conservative
+    // stack scan would read these bits as a root and keep the value alive, so
+    // the weak handle would never empty. `Get` reads the live bits from the
+    // engine instead.
+    value_ = 0;
+    // The engine owns the specification: it runs the trampoline once and the
+    // trampoline frees it.
+    auto* spec = new internal::WeakCallbackSpec<P>{
+        g_current_isolate, static_cast<void*>(parameter), callback};
+    slag_weak_set_callback(weak_, spec, &WeakCallbackTrampoline<P>);
+  }
+
+  /* Take the value back under a strong hold (`Global::ClearWeak`), while it is
+   * still alive. A value the collector already took leaves the handle empty. */
+  void ClearWeak() {
+    if (weak_ == nullptr) return;
+    uint64_t live = 0;
+    if (slag_weak_get(weak_, &live) == 0) {
+      slag_root_retain(live);
+      value_ = live;
+      empty_ = false;
+    } else {
+      empty_ = true;
+    }
+    slag_weak_free(weak_);
+    weak_ = nullptr;
+  }
+
+  bool IsWeak() const { return weak_ != nullptr; }
+
+  void SetWrapperClassId(uint16_t class_id) { wrapper_class_id_ = class_id; }
+  uint16_t WrapperClassId() const { return wrapper_class_id_; }
 
  private:
   // A `T` that derives from `Value` is an engine value and the registry must
@@ -1311,18 +1506,30 @@ class Global {
   void Adopt(Global& other) noexcept {
     value_ = other.value_;
     empty_ = other.empty_;
+    weak_ = other.weak_;
+    wrapper_class_id_ = other.wrapper_class_id_;
     other.value_ = 0;
     other.empty_ = true;
+    other.weak_ = nullptr;
   }
 
   void Release() {
-    if (!empty_ && kEngineValue) slag_root_release(value_);
+    if (weak_ != nullptr) {
+      // Clears the engine entry and frees the box; a callback already run left
+      // the entry gone, which `slag_weak_free` treats as a no-op.
+      slag_weak_free(weak_);
+      weak_ = nullptr;
+    } else if (!empty_ && kEngineValue) {
+      slag_root_release(value_);
+    }
     value_ = 0;
     empty_ = true;
   }
 
   uint64_t value_ = 0;
   bool empty_ = true;
+  SlagWeak* weak_ = nullptr;
+  uint16_t wrapper_class_id_ = 0;
 };
 
 /* A host-traced root: the engine keeps the value alive for as long as this

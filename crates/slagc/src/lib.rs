@@ -108,6 +108,34 @@ pub struct SlagBuffer {
     resizable: bool,
 }
 
+/// A weak persistent handle (`v8::Global<T>::SetWeak`): it does not keep its
+/// value alive, and the collector empties it on the sweep that takes the value.
+pub struct SlagWeak {
+    handle: crux::heap::WeakHandle,
+}
+
+/// The heap numbers `v8::Isolate::GetHeapStatistics` fills, mirrored from
+/// `runtime::api::HeapStatistics`. Every field is a `usize` except the flags;
+/// the facade copies them into V8's struct.
+#[repr(C)]
+pub struct SlagHeapStatistics {
+    pub total_heap_size: usize,
+    pub total_heap_size_executable: usize,
+    pub total_physical_size: usize,
+    pub total_available_size: usize,
+    pub used_heap_size: usize,
+    pub heap_size_limit: usize,
+    pub malloced_memory: usize,
+    pub external_memory: usize,
+    pub peak_malloced_memory: usize,
+    pub does_zap_garbage: i32,
+    pub number_of_native_contexts: usize,
+    pub number_of_detached_contexts: usize,
+    pub total_global_handles_size: usize,
+    pub used_global_handles_size: usize,
+    pub embedded_blob_size: usize,
+}
+
 /// The C++ function a registered host global calls. `call` is the
 /// `FunctionCall*` for this invocation, usable with [`slag_call_eval`] when the
 /// host callback re-enters the engine.
@@ -249,7 +277,7 @@ pub unsafe extern "C" fn slag_collect(context: *mut SlagContext) -> i32 {
         reentrant(context);
         return 1;
     };
-    engine.agent_mut().collect_garbage();
+    engine.collect_garbage();
     0
 }
 
@@ -704,6 +732,179 @@ pub unsafe extern "C" fn slag_context_external_memory(context: *mut SlagContext)
         Some(engine) => engine.external_memory(0),
         None => 0,
     }
+}
+
+/// Fill `out` with the heap's numbers (`v8::Isolate::GetHeapStatistics`).
+/// `host_account` is the isolate's external-memory account, which is added to
+/// the engine's own buffer walk.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn slag_heap_statistics(
+    context: *mut SlagContext,
+    host_account: i64,
+    out: *mut SlagHeapStatistics,
+) -> i32 {
+    let Some(out) = out.as_mut() else {
+        return 2;
+    };
+    let Some(context) = context.as_ref() else {
+        return 2;
+    };
+    let Ok(engine) = context.context.try_borrow() else {
+        return 1;
+    };
+    let stats = engine.heap_statistics(host_account);
+    *out = SlagHeapStatistics {
+        total_heap_size: stats.total_heap_size,
+        total_heap_size_executable: stats.total_heap_size_executable,
+        total_physical_size: stats.total_physical_size,
+        total_available_size: stats.total_available_size,
+        used_heap_size: stats.used_heap_size,
+        heap_size_limit: stats.heap_size_limit,
+        malloced_memory: stats.malloced_memory,
+        external_memory: stats.external_memory,
+        peak_malloced_memory: stats.peak_malloced_memory,
+        does_zap_garbage: i32::from(stats.does_zap_garbage),
+        number_of_native_contexts: stats.number_of_native_contexts,
+        number_of_detached_contexts: stats.number_of_detached_contexts,
+        total_global_handles_size: stats.total_global_handles_size,
+        used_global_handles_size: stats.used_global_handles_size,
+        embedded_blob_size: 0,
+    };
+    0
+}
+
+/// A weak persistent handle over `value` (`v8::Global<T>::SetWeak`).
+#[unsafe(no_mangle)]
+pub extern "C" fn slag_weak_new(value: u64) -> *mut SlagWeak {
+    Box::into_raw(Box::new(SlagWeak {
+        handle: crux::heap::weak_new(Value::from_bits(value)),
+    }))
+}
+
+/// The value the handle still names, written to `out`. 0 while it is alive, 1
+/// once a sweep has taken it, 2 for a bad argument.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn slag_weak_get(weak: *const SlagWeak, out: *mut u64) -> i32 {
+    let Some(weak) = weak.as_ref() else {
+        return 2;
+    };
+    match crux::heap::weak_get(weak.handle) {
+        Some(value) => {
+            if !out.is_null() {
+                *out = value.bits();
+            }
+            0
+        }
+        None => 1,
+    }
+}
+
+/// Release the handle without freeing the box
+/// (`Global<T>::ClearWeak` keeps the object).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn slag_weak_clear(weak: *const SlagWeak) {
+    if let Some(weak) = weak.as_ref() {
+        crux::heap::weak_clear(weak.handle);
+    }
+}
+
+/// Release the handle and free the box.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn slag_weak_free(weak: *mut SlagWeak) {
+    if !weak.is_null() {
+        let boxed = Box::from_raw(weak);
+        crux::heap::weak_clear(boxed.handle);
+    }
+}
+
+/// The C callback a weak handle's death runs. The second pass is a separate
+/// queue, so it needs no handle: it runs after every first pass of the same
+/// drain even if the first pass released the handle.
+pub type SlagWeakCallback = extern "C" fn(*mut c_void);
+
+/// Register the callback the engine runs after the collection that took the
+/// value. `data` is the host's pointer, passed back unchanged.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn slag_weak_set_callback(
+    weak: *const SlagWeak,
+    data: *mut c_void,
+    callback: Option<SlagWeakCallback>,
+) -> i32 {
+    let Some(weak) = weak.as_ref() else {
+        return 2;
+    };
+    let Some(callback) = callback else {
+        return 2;
+    };
+    crux::heap::weak_set_callback(weak.handle, Box::new(move || callback(data)));
+    0
+}
+
+/// Queue a guaranteed finalizer for the current drain
+/// (`v8::WeakCallbackInfo::SetSecondPassCallback`): it runs after every first
+/// pass, even if the first pass released the handle.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn slag_weak_queue_second_pass(
+    data: *mut c_void,
+    callback: Option<SlagWeakCallback>,
+) -> i32 {
+    let Some(callback) = callback else {
+        return 2;
+    };
+    crux::heap::queue_late_second_pass(Box::new(move || callback(data)));
+    0
+}
+
+/// The collection phases a host observer receives, mirroring `SlagGcType`.
+const SLAG_GC_PROLOGUE: i32 = 0;
+const SLAG_GC_SCAVENGE: i32 = 1;
+const SLAG_GC_MARK_SWEEP: i32 = 2;
+
+/// A host observer of this agent's collections (`v8::Isolate::AddGC*Callback`).
+pub type SlagCollectionObserver = extern "C" fn(*mut c_void, i32, i32);
+
+struct HostCollectionObserver {
+    data: *mut c_void,
+    observer: SlagCollectionObserver,
+}
+
+impl crux::heap::GcObserver for HostCollectionObserver {
+    fn prologue(&self, generation: crux::heap::GcGeneration) {
+        (self.observer)(self.data, SLAG_GC_PROLOGUE, gc_type(generation));
+    }
+
+    fn epilogue(&self, generation: crux::heap::GcGeneration) {
+        (self.observer)(self.data, 1, gc_type(generation));
+    }
+}
+
+fn gc_type(generation: crux::heap::GcGeneration) -> i32 {
+    match generation {
+        crux::heap::GcGeneration::Minor => SLAG_GC_SCAVENGE,
+        crux::heap::GcGeneration::Major => SLAG_GC_MARK_SWEEP,
+    }
+}
+
+/// Watch every collection this context's agent drives, including the ones its
+/// growth policy starts. The observer runs around the mark and sweep, so a host
+/// timer or a diagnostics hook sees both ends.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn slag_watch_collections(
+    context: *mut SlagContext,
+    data: *mut c_void,
+    observer: Option<SlagCollectionObserver>,
+) -> i32 {
+    let Some(context) = context.as_ref() else {
+        return 2;
+    };
+    let Some(observer) = observer else {
+        return 2;
+    };
+    let Ok(engine) = context.context.try_borrow() else {
+        return 1;
+    };
+    engine.add_collection_observer(Box::new(HostCollectionObserver { data, observer }));
+    0
 }
 
 fn typed_array_kind(kind: i32) -> Option<slag::TypedArrayKind> {

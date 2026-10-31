@@ -222,6 +222,63 @@ struct HostProperties {
 
 HostProperties host_properties;
 
+// Weak handles and GC callbacks: the death callbacks a persistent's finalizer
+// runs and the hooks around a requested collection.
+struct WeakState {
+  int first = 0;
+  int second = 0;
+  int cleared_survived = 0;
+  void* parameter = nullptr;
+};
+
+WeakState weak_state;
+int gc_prologue = 0;
+int gc_epilogue = 0;
+
+void WeakGoneSecond(const v8::WeakCallbackInfo<int>&) { ++weak_state.second; }
+
+void WeakGone(const v8::WeakCallbackInfo<int>& info) {
+  ++weak_state.first;
+  weak_state.parameter = info.GetParameter();
+  info.SetSecondPassCallback(&WeakGoneSecond);
+}
+
+void WeakClearedSurvived(const v8::WeakCallbackInfo<int>&) {
+  ++weak_state.cleared_survived;
+}
+
+void GCCallbackPrologue(v8::Isolate*, v8::GCType, v8::GCCallbackFlags, void*) {
+  ++gc_prologue;
+}
+
+void GCCallbackEpilogue(v8::Isolate*, v8::GCType type, v8::GCCallbackFlags,
+                        void*) {
+  if ((type & v8::kGCTypeMarkSweepCompact) != 0) ++gc_epilogue;
+}
+
+// Make a weak persistent over a value no C++ local names: the frame that held
+// the local has returned, and the caller scrubs the stack, so the conservative
+// scan cannot root what the weak handle is watching.
+#if defined(_MSC_VER)
+__declspec(noinline)
+#endif
+void MakeUnrootedWeak(v8::Isolate* isolate, v8::Global<v8::Object>* weak,
+                      int* parameter,
+                      void (*callback)(const v8::WeakCallbackInfo<int>&)) {
+  v8::HandleScope scope(isolate);
+  weak->Reset(isolate, v8::Object::New(isolate));
+  weak->SetWeak(parameter, callback, v8::WeakCallbackType::kParameter);
+}
+
+#if defined(_MSC_VER)
+__declspec(noinline)
+#endif
+void ScrubStack(int depth) {
+  volatile uint64_t pad[16] = {};
+  if (depth > 0) ScrubStack(depth - 1);
+  (void)pad[0];
+}
+
 void HostLazyGet(v8::Local<v8::Name>,
                  const v8::PropertyCallbackInfo<v8::Value>& info) {
   ++host_properties.lazy_reads;
@@ -1662,6 +1719,76 @@ int main() {
                creation.raw() == current.raw() &&
                made->GetCreationContextChecked().raw() == current.raw(),
            "an object reports the entered context");
+  }
+
+  // Weak handles, GC callbacks, and heap statistics: the lifetime hooks an
+  // embedding needs around a persistent and around a requested collection.
+  {
+    v8::HandleScope scope(isolate);
+    v8::Local<v8::Context> current = context.Get(isolate);
+    v8::Context::Scope context_scope(current);
+    const auto expect = [&](bool condition, const char* what) {
+      if (!condition) {
+        fprintf(stderr, "weak handles: %s\n", what);
+        ++failures;
+      }
+    };
+
+    // The value is made in a frame that returns only the handle, and the stack
+    // is scrubbed, so the conservative scan cannot keep it alive.
+    weak_state = WeakState{};
+    v8::Global<v8::Object> weak;
+    int parameter = 0;
+    MakeUnrootedWeak(isolate, &weak, &parameter, &WeakGone);
+    expect(weak.IsWeak(), "SetWeak made the handle weak");
+    ScrubStack(16);
+    isolate->RequestGarbageCollectionForTesting(v8::kFullGarbageCollection);
+    expect(weak_state.first == 1 && weak_state.second == 1 &&
+               weak_state.parameter == &parameter,
+           "a weak callback and its second pass ran");
+    expect(weak.Get(isolate).IsEmpty(), "a dead weak handle reads empty");
+    weak.Reset();
+
+    // ClearWeak before the death keeps the value alive and cancels the callback.
+    weak_state = WeakState{};
+    v8::Global<v8::Object> kept;
+    int cleared_parameter = 0;
+    MakeUnrootedWeak(isolate, &kept, &cleared_parameter, &WeakClearedSurvived);
+    kept.ClearWeak();
+    ScrubStack(16);
+    isolate->RequestGarbageCollectionForTesting(v8::kFullGarbageCollection);
+    expect(weak_state.cleared_survived == 0 && !kept.IsWeak() &&
+               !kept.Get(isolate).IsEmpty(),
+           "ClearWeak made the handle strong again");
+    kept.Reset();
+
+    // The hooks run around an explicit collection, and removal takes effect.
+    gc_prologue = 0;
+    gc_epilogue = 0;
+    isolate->AddGCPrologueCallback(&GCCallbackPrologue);
+    isolate->AddGCEpilogueCallback(&GCCallbackEpilogue);
+    isolate->RequestGarbageCollectionForTesting(v8::kFullGarbageCollection);
+    expect(gc_prologue == 1 && gc_epilogue == 1,
+           "the GC callbacks ran around the request");
+    isolate->RemoveGCEpilogueCallback(&GCCallbackEpilogue);
+    isolate->RequestGarbageCollectionForTesting(v8::kFullGarbageCollection);
+    expect(gc_prologue == 2 && gc_epilogue == 1,
+           "RemoveGCEpilogueCallback removed the hook");
+    isolate->LowMemoryNotification();
+    expect(gc_prologue == 3, "LowMemoryNotification collected");
+    isolate->RemoveGCPrologueCallback(&GCCallbackPrologue);
+
+    // The heap statistics report the arena and the live buffers.
+    v8::Local<v8::ArrayBuffer> measured = v8::ArrayBuffer::New(isolate, 64);
+    v8::HeapStatistics stats;
+    isolate->GetHeapStatistics(&stats);
+    expect(!measured.IsEmpty() && stats.total_heap_size > 0 &&
+               stats.used_heap_size > 0 &&
+               stats.used_heap_size <= stats.total_heap_size &&
+               stats.heap_size_limit > stats.total_heap_size &&
+               stats.external_memory >= 64 &&
+               stats.number_of_native_contexts >= 1 && !stats.does_zap_garbage,
+           "the heap statistics report the arena");
   }
 
   // A host-traced reference: a root the C++ side owns and releases. Once it

@@ -1191,6 +1191,50 @@ impl Context {
         crate::api::external_memory_of(&self.agent, host_account)
     }
 
+    /// Register an observer of this agent's collections
+    /// (`v8::Isolate::AddGCPrologueCallback` and its epilogue sibling). It runs
+    /// around every collection the agent drives, including the ones its own
+    /// growth policy starts.
+    pub fn add_collection_observer(&self, observer: Box<dyn crux::heap::GcObserver>) {
+        self.agent.add_collection_observer(observer);
+    }
+
+    /// Collect now and run the host death callbacks the sweep queued, so a weak
+    /// handle's callback has run when this returns
+    /// (`Isolate::RequestGarbageCollectionForTesting`; the Rust bridge's
+    /// collectors drain at the next safe point instead).
+    pub fn collect_garbage(&mut self) {
+        self.agent.collect_garbage();
+        self.agent.run_host_finalizers();
+    }
+
+    /// The heap's numbers for a V8 host
+    /// (`v8::Isolate::GetHeapStatistics`). The fields and the constants this
+    /// engine reports instead of a measured number are the ones
+    /// [`api::heap`](crate::api::heap) documents for the Rust bridge.
+    pub fn heap_statistics(&self, host_account: i64) -> crate::api::HeapStatistics {
+        let (committed, live) =
+            crux::heap::with_heap(|heap| (heap.committed_bytes(), heap.live_bytes()));
+        let external = self.external_memory(host_account) as usize;
+        crate::api::HeapStatistics {
+            total_heap_size: committed,
+            total_physical_size: committed,
+            used_heap_size: live,
+            external_memory: external,
+            total_allocated_bytes: committed,
+            total_heap_size_executable: 0,
+            malloced_memory: external,
+            peak_malloced_memory: external,
+            heap_size_limit: usize::MAX,
+            total_available_size: usize::MAX - live,
+            number_of_native_contexts: self.agent.realm_count.get(),
+            number_of_detached_contexts: 0,
+            does_zap_garbage: false,
+            total_global_handles_size: 0,
+            used_global_handles_size: 0,
+        }
+    }
+
     /// Detach a buffer (`v8::ArrayBuffer::Detach`). `key` is the
     /// [[ArrayBufferDetachKey]] the host installed; a mismatch, or an already
     /// detached buffer, answers false and leaves it alone.

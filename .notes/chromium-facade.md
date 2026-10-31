@@ -878,9 +878,39 @@ is the engine gap `get_security_token` in the Rust bridge already records.
 
 `Object::GetCreationContext` is the entered context. V8 reads the object's
 creation context out of its map; this engine does not record a realm on an
-object, and the facade has one realm per entered context, so the entered one is
+object, and the facade has one realm per context, so the entered one is
 the truthful answer while a `Context::Scope` is active and the handle is empty
 otherwise.
+
+*Weak handles, GC hooks, and heap statistics (2026-10-31).* The weak rung began
+with a finding rather than a port: the engine's `WeakHandle` already reports a
+death, but its `second_pass` slot is filled by the *sweep*, so a callback
+registered from inside a first pass (which is the only time
+`SetSecondPassCallback` is called) had nowhere to go. `crux::heap` gained
+`queue_late_second_pass`/`take_late_second_pass_callbacks`, and
+`Agent::run_host_finalizers` drains them after every first pass, so the
+guaranteed finalizer keeps its promise even when the first pass released the
+handle.
+
+The C++ shape is `Global<T>::SetWeak` over a `SlagWeak` box: the strong
+retention is released, the handle holds only the engine's weak entry, and the
+trampoline builds a `WeakCallbackInfo<P>` (the parameter type, as in V8) and
+calls the host. `SetWeak` also clears the `Global`'s own value word, which is
+the trap the harness caught: the engine's conservative stack scan read that word
+as a root, so the value survived every collection and the callback never ran.
+The harness now makes the value in a frame that returns only the handle and
+scrubs the stack, mirroring the api test's `an_unrooted_weak_handle`.
+
+GC callbacks took the better road once the pieces were in view: the agent
+already has `add_collection_observer` (a `GcObserver` that runs around the mark
+and sweep), so the facade registers one observer per context and forwards to
+the host's prologue and epilogue lists. That makes the hooks fire for every
+collection the engine starts, not just a requested one, and `RequestGarbage
+CollectionForTesting`/`LowMemoryNotification` are thin over `slag_collect`, which
+now also drains the death callbacks so a weak finalizer has run when it returns.
+Heap statistics use the same `context`-side walk the Rust bridge's
+`api::heap` documents; the constants (an unlimited `heap_size_limit`, zero for
+the stores this engine does not have) are the bridge's, restated in V8's struct.
 
 The ABI shape is roughly a struct of up to seven C function pointers, the data
 pointer, and the flags, handed over once per template, with the return codes
