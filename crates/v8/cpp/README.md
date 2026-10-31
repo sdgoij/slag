@@ -239,6 +239,28 @@ neighbouring objects do not collide and never zero. The Rust bridge's
 `GetIdentityHash` uses the same function, and both agree with handle equality:
 two handles that compare equal hash equal.
 
+### Value predicates and conversions
+
+`Value` carries V8's type predicates: `IsUndefined`/`IsNull` to
+`IsArray`/`IsProxy`/`IsTypedArray`, plus `BooleanValue`, `TypeOf`, `ToString`,
+`ToNumber`, `ToObject`, `StrictEquals`, and `SameValue`. `Object::IsCallable` and
+`Object::IsConstructor` sit beside them.
+
+The shape bits come from the value itself, so they answer anywhere. The brands
+the engine records in per-object tables (`IsDate`, `IsRegExp`, `IsPromise`,
+`IsMap`, `IsSet`, `IsNativeError`, `IsArrayBuffer`) need the agent, which the
+entered `Context::Scope` owns, so V8's rule applies: a brand asked outside any
+context answers false rather than crashing. `IsConstructor` also needs the
+agent, because the `[[Construct]]` slots that make an arrow, a method, or an
+async/generator function non-constructible live in the function record, not in
+the value's tag.
+
+`ToString`/`ToNumber`/`ToObject` run the object's own `toString`/`valueOf`, so
+they take a `Local<Context>`; an empty result leaves the error pending. `TypeOf`
+answers a string value (`typeof null` is `"object"`). `StrictEquals` is `===`
+(NaN differs from itself) and `SameValue` is `Object.is` (NaN equals itself,
+`+0` and `-0` differ).
+
 ## The gin target
 
 Actual `gin` cannot be built standalone. `gin/BUILD.gn` has public deps
@@ -295,6 +317,9 @@ not a claim that gin itself links.
   `Array::New` (length and element forms).
 - `TracedReference<T>` as a host-owned root: copy is a second reference, `Reset`
   releases it, and the destructor releases it like any persistent.
+- The `Value` predicates and conversions: `IsUndefined` through `IsNativeError`,
+  `Object::IsCallable`/`IsConstructor`, `BooleanValue`, `TypeOf`, `ToString`,
+  `ToNumber`, `ToObject`, `StrictEquals`, `SameValue`, and `Local::operator==`.
 - Handles and persistents as engine roots: a handle slot or a `Global` over an
   engine value retains it for that object's lifetime, and a facade pointer is
   never registered.
@@ -318,6 +343,12 @@ not a claim that gin itself links.
 - `String::Utf8Value` runs ToString through the engine, so an object's own
   `toString` runs; it falls back to a primitive rendering when a callback already
   holds the context (a property name is a string in that case anyway).
+- The brand predicates (`IsDate`, `IsRegExp`, `IsPromise`, `IsMap`, `IsSet`,
+  `IsNativeError`, `IsArrayBuffer`) and `Object::IsConstructor` need the entered
+  context, which is where the agent lives: with no `Context::Scope` on the stack
+  they answer false. V8 reads the isolate off the handle's location instead, so
+  a host that keeps a value outside every scope and asks its brand gets a
+  different answer here.
 - `Platform` is a handle plus a message pump: `PumpMessageLoop` runs the
   isolate's queued jobs (microtasks, promise reactions, due timers) and answers
   whether it ran any. There are no host-posted platform tasks or task runners
@@ -372,3 +403,10 @@ a b
 
 The `3 + 4 = 7` line is the sample's WebAssembly half, running through the
 engine's `wasm` feature.
+
+`gin-shapes` exits 0 only if every check passes; the predicate block asserts the
+shape and brand bits for objects, arrays, functions, numbers, strings, symbols,
+bigints, dates, regexps, promises, maps, sets, errors, typed arrays, array
+buffers, proxies, and arguments objects, plus the `StrictEquals`/`SameValue`
+differences on `NaN` and the two zeroes, `BooleanValue`, `TypeOf`, and the three
+coercions.

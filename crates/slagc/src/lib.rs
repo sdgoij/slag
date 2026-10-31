@@ -851,6 +851,170 @@ pub extern "C" fn slag_value_is_undefined(value: u64) -> i32 {
     i32::from(JsValue::from_bits(value).is_undefined())
 }
 
+/// Which of V8's `Value` predicates the value answers, as a bitmask (the bits
+/// are `slag_a0.h`'s `SLAG_VALUE_*`, mirrored from `runtime::embed`).
+///
+/// The brands (date, regexp, map, set, promise, native error, array buffer)
+/// live in the agent, so the ordinary host call reads `context`. Inside a host
+/// callback the run that called in still holds the context's cell, so the live
+/// window answers instead.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn slag_value_type_mask(context: *mut SlagContext, value: u64) -> u32 {
+    let value = JsValue::from_bits(value);
+    if let Some(context) = context.as_ref()
+        && let Ok(engine) = context.context.try_borrow()
+    {
+        return engine.value_type_mask(&value);
+    }
+    slag::value_type_mask(&value)
+}
+
+/// Strict equality (spec 7.2.16): `===`, so NaN differs from itself and a
+/// number and its string do not agree.
+#[unsafe(no_mangle)]
+pub extern "C" fn slag_value_strict_equals(left: u64, right: u64) -> i32 {
+    i32::from(crux::ops::is_strictly_equal(
+        &Value::from_bits(left),
+        &Value::from_bits(right),
+    ))
+}
+
+/// SameValue (spec 7.2.11): `Object.is`, where NaN equals itself and `+0` and
+/// `-0` differ.
+#[unsafe(no_mangle)]
+pub extern "C" fn slag_value_same_value(left: u64, right: u64) -> i32 {
+    i32::from(crux::ops::same_value(
+        &Value::from_bits(left),
+        &Value::from_bits(right),
+    ))
+}
+
+/// ToBoolean (spec 7.1.2), which needs no agent.
+#[unsafe(no_mangle)]
+pub extern "C" fn slag_value_boolean(value: u64) -> i32 {
+    i32::from(crux::convert::to_boolean(&Value::from_bits(value)))
+}
+
+/// `typeof` as a string value (spec 13.5.3), which needs no agent.
+#[unsafe(no_mangle)]
+pub extern "C" fn slag_value_typeof(value: u64) -> u64 {
+    JsValue::string(crux::value::type_of(&Value::from_bits(value))).to_bits()
+}
+
+/// IsCallable (spec 7.2.3).
+#[unsafe(no_mangle)]
+pub extern "C" fn slag_value_is_callable(value: u64) -> i32 {
+    i32::from(crux::value::is_callable(&Value::from_bits(value)))
+}
+
+/// IsConstructor (spec 7.2.4). The `[[Construct]]` slots live in the agent, so
+/// the ordinary host call reads `context`; inside a callback the run holds the
+/// cell and the live window answers.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn slag_value_is_constructor(context: *mut SlagContext, value: u64) -> i32 {
+    let value = JsValue::from_bits(value);
+    if let Some(context) = context.as_ref()
+        && let Ok(engine) = context.context.try_borrow()
+    {
+        return i32::from(engine.value_is_constructor(&value));
+    }
+    i32::from(slag::value_is_constructor(&value))
+}
+
+/// ToString as a value (`v8::Value::ToString`), which runs host code, so it needs
+/// the context.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn slag_value_to_string(
+    context: *mut SlagContext,
+    value: u64,
+    out: *mut u64,
+) -> i32 {
+    let Some(context) = context.as_mut() else {
+        return 2;
+    };
+    let converted = {
+        let Ok(mut engine) = context.context.try_borrow_mut() else {
+            reentrant(context);
+            return 1;
+        };
+        engine.to_string_value(&JsValue::from_bits(value))
+    };
+    match converted {
+        Ok(value) => {
+            if !out.is_null() {
+                *out = value.to_bits();
+            }
+            0
+        }
+        Err(error) => {
+            record(context, error);
+            1
+        }
+    }
+}
+
+/// ToNumber (`v8::Value::ToNumber`), which may run `valueOf`/`toString`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn slag_value_to_number_context(
+    context: *mut SlagContext,
+    value: u64,
+    out: *mut f64,
+) -> i32 {
+    let Some(context) = context.as_mut() else {
+        return 2;
+    };
+    let converted = {
+        let Ok(mut engine) = context.context.try_borrow_mut() else {
+            reentrant(context);
+            return 1;
+        };
+        engine.to_number(&JsValue::from_bits(value))
+    };
+    match converted {
+        Ok(number) => {
+            if !out.is_null() {
+                *out = number;
+            }
+            0
+        }
+        Err(error) => {
+            record(context, error);
+            1
+        }
+    }
+}
+
+/// ToObject (`v8::Value::ToObject`), which boxes a primitive.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn slag_value_to_object(
+    context: *mut SlagContext,
+    value: u64,
+    out: *mut u64,
+) -> i32 {
+    let Some(context) = context.as_mut() else {
+        return 2;
+    };
+    let converted = {
+        let Ok(mut engine) = context.context.try_borrow_mut() else {
+            reentrant(context);
+            return 1;
+        };
+        engine.to_object(&JsValue::from_bits(value))
+    };
+    match converted {
+        Ok(object) => {
+            if !out.is_null() {
+                *out = object.as_value().to_bits();
+            }
+            0
+        }
+        Err(error) => {
+            record(context, error);
+            1
+        }
+    }
+}
+
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn slag_global(context: *mut SlagContext) -> u64 {
     match context.as_ref().and_then(|context| {

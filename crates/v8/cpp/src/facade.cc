@@ -417,11 +417,150 @@ ArrayBuffer::Allocator* ArrayBuffer::Allocator::NewDefaultAllocator() {
   return new Allocator();
 }
 
-bool Value::IsUndefined() const {
-  return slag_value_is_undefined(Raw(this)) != 0;
+namespace {
+
+/* The A0 context entered on this thread, or null. V8's predicates read the
+ * isolate off the handle's location; the facade keeps the entered context in a
+ * thread-local instead, which is the same scope. */
+SlagContext* CurrentSlagContext() {
+  const auto* context = reinterpret_cast<const Context*>(
+      static_cast<uintptr_t>(g_current_context));
+  return context == nullptr ? nullptr : context->slag();
 }
 
-bool Value::IsString() const { return slag_value_is_string(Raw(this)) != 0; }
+/* Which `v8::Value` predicates a value answers. The brands need the agent, and
+ * the entered context owns it; with none there is no table to ask, so only the
+ * shape bits answer. */
+uint32_t TypeMaskOf(const void* self) {
+  return slag_value_type_mask(CurrentSlagContext(), Raw(self));
+}
+
+}  // namespace
+
+bool Value::IsUndefined() const {
+  return (TypeMaskOf(this) & SLAG_VALUE_UNDEFINED) != 0;
+}
+
+bool Value::IsNull() const { return (TypeMaskOf(this) & SLAG_VALUE_NULL) != 0; }
+
+bool Value::IsNullOrUndefined() const {
+  return (TypeMaskOf(this) & (SLAG_VALUE_NULL | SLAG_VALUE_UNDEFINED)) != 0;
+}
+
+bool Value::IsBoolean() const {
+  return (TypeMaskOf(this) & SLAG_VALUE_BOOLEAN) != 0;
+}
+
+bool Value::IsNumber() const {
+  return (TypeMaskOf(this) & SLAG_VALUE_NUMBER) != 0;
+}
+
+bool Value::IsInt32() const { return (TypeMaskOf(this) & SLAG_VALUE_INT32) != 0; }
+
+bool Value::IsUint32() const {
+  return (TypeMaskOf(this) & SLAG_VALUE_UINT32) != 0;
+}
+
+bool Value::IsBigInt() const { return (TypeMaskOf(this) & SLAG_VALUE_BIGINT) != 0; }
+
+bool Value::IsSymbol() const { return (TypeMaskOf(this) & SLAG_VALUE_SYMBOL) != 0; }
+
+bool Value::IsString() const { return (TypeMaskOf(this) & SLAG_VALUE_STRING) != 0; }
+
+bool Value::IsFunction() const {
+  return (TypeMaskOf(this) & SLAG_VALUE_FUNCTION) != 0;
+}
+
+bool Value::IsObject() const { return (TypeMaskOf(this) & SLAG_VALUE_OBJECT) != 0; }
+
+bool Value::IsArray() const { return (TypeMaskOf(this) & SLAG_VALUE_ARRAY) != 0; }
+
+bool Value::IsExternal() const {
+  return (TypeMaskOf(this) & SLAG_VALUE_EXTERNAL) != 0;
+}
+
+bool Value::IsTypedArray() const {
+  return (TypeMaskOf(this) & SLAG_VALUE_TYPED_ARRAY) != 0;
+}
+
+bool Value::IsProxy() const { return (TypeMaskOf(this) & SLAG_VALUE_PROXY) != 0; }
+
+bool Value::IsArgumentsObject() const {
+  return (TypeMaskOf(this) & SLAG_VALUE_ARGUMENTS) != 0;
+}
+
+bool Value::IsDate() const { return (TypeMaskOf(this) & SLAG_VALUE_DATE) != 0; }
+
+bool Value::IsRegExp() const { return (TypeMaskOf(this) & SLAG_VALUE_REGEXP) != 0; }
+
+bool Value::IsPromise() const { return (TypeMaskOf(this) & SLAG_VALUE_PROMISE) != 0; }
+
+bool Value::IsMap() const { return (TypeMaskOf(this) & SLAG_VALUE_MAP) != 0; }
+
+bool Value::IsSet() const { return (TypeMaskOf(this) & SLAG_VALUE_SET) != 0; }
+
+bool Value::IsArrayBuffer() const {
+  return (TypeMaskOf(this) & SLAG_VALUE_ARRAY_BUFFER) != 0;
+}
+
+bool Value::IsNativeError() const {
+  return (TypeMaskOf(this) & SLAG_VALUE_NATIVE_ERROR) != 0;
+}
+
+bool Value::BooleanValue(Isolate*) const {
+  return slag_value_boolean(Raw(this)) != 0;
+}
+
+MaybeLocal<String> Value::TypeOf(Local<Context>) const {
+  return MaybeLocal<String>(Local<String>::New(slag_value_typeof(Raw(this))));
+}
+
+MaybeLocal<String> Value::ToString(Local<Context> context) const {
+  if (context.IsEmpty()) return MaybeLocal<String>();
+  auto* current = reinterpret_cast<Context*>(
+      static_cast<uintptr_t>(context.raw()));
+  uint64_t out = 0;
+  if (slag_value_to_string(current->slag(), Raw(this), &out) != 0) {
+    return MaybeLocal<String>();
+  }
+  return MaybeLocal<String>(Local<String>::New(out));
+}
+
+Maybe<double> Value::ToNumber(Local<Context> context) const {
+  if (context.IsEmpty()) return Maybe<double>();
+  auto* current = reinterpret_cast<Context*>(
+      static_cast<uintptr_t>(context.raw()));
+  double out = 0;
+  if (slag_value_to_number_context(current->slag(), Raw(this), &out) != 0) {
+    return Maybe<double>();
+  }
+  return Maybe<double>(out);
+}
+
+MaybeLocal<Object> Value::ToObject(Local<Context> context) const {
+  if (context.IsEmpty()) return MaybeLocal<Object>();
+  auto* current = reinterpret_cast<Context*>(
+      static_cast<uintptr_t>(context.raw()));
+  uint64_t out = 0;
+  if (slag_value_to_object(current->slag(), Raw(this), &out) != 0) {
+    return MaybeLocal<Object>();
+  }
+  return MaybeLocal<Object>(Local<Object>::New(out));
+}
+
+bool Value::StrictEquals(Local<Value> that) const {
+  return slag_value_strict_equals(Raw(this), that.raw()) != 0;
+}
+
+bool Value::SameValue(Local<Value> that) const {
+  return slag_value_same_value(Raw(this), that.raw()) != 0;
+}
+
+bool Object::IsCallable() const { return slag_value_is_callable(Raw(this)) != 0; }
+
+bool Object::IsConstructor() const {
+  return slag_value_is_constructor(CurrentSlagContext(), Raw(this)) != 0;
+}
 
 int Object::InternalFieldCount() const {
   return static_cast<int>(slag_object_internal_field_count(Raw(this)));

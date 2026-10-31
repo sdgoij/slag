@@ -9,6 +9,7 @@
 
 #include <stdio.h>
 #include <string.h>
+#include <string>
 
 #include "include/slag_a0.h"
 #include "include/v8-context.h"
@@ -1106,6 +1107,130 @@ int main() {
       ++failures;
     }
     isolate->SetMicrotasksPolicy(v8::MicrotasksPolicy::kAuto);
+  }
+
+  // Value predicates and conversions: a host that inspects a value the engine
+  // returned asks the value, rather than guessing the type from its bits.
+  {
+    v8::HandleScope scope(isolate);
+    v8::Local<v8::Context> current = context.Get(isolate);
+    v8::Context::Scope context_scope(current);
+    const auto run = [&](const char* source) {
+      return v8::Script::Compile(
+                 current, v8::String::NewFromUtf8Literal(isolate, source))
+          .ToLocalChecked()
+          ->Run(current)
+          .ToLocalChecked();
+    };
+    const auto expect = [&](bool condition, const char* what) {
+      if (!condition) {
+        fprintf(stderr, "value predicates: %s\n", what);
+        ++failures;
+      }
+    };
+    const auto render = [&](v8::Local<v8::String> string) {
+      v8::String::Utf8Value utf8(isolate, string);
+      return *utf8 == nullptr ? std::string() : std::string(*utf8);
+    };
+
+    // The shape bits, which need no agent.
+    v8::Local<v8::Value> object = run("({ a: 1 })");
+    expect(object->IsObject() && !object->IsArray() &&
+               !object->IsFunction() && !object->IsString(),
+           "a plain object's type bits");
+    v8::Local<v8::Value> array = run("[1, 2]");
+    expect(array->IsArray() && array->IsObject() && !array->IsFunction(),
+           "an array's type bits");
+
+    v8::Local<v8::Value> called = run("(function named() {})");
+    expect(called->IsFunction() && called->IsObject() &&
+               called.As<v8::Object>()->IsCallable() &&
+               called.As<v8::Object>()->IsConstructor(),
+           "a function is a callable, constructible object");
+    v8::Local<v8::Value> arrow = run("() => 1");
+    expect(arrow->IsFunction() && arrow.As<v8::Object>()->IsCallable() &&
+               !arrow.As<v8::Object>()->IsConstructor(),
+           "an arrow is callable but not a constructor");
+
+    expect(run("7")->IsNumber() && run("7")->IsInt32() &&
+               run("7")->IsUint32(),
+           "a small integer is a number, an int32, and a uint32");
+    expect(run("-1")->IsInt32() && !run("-1")->IsUint32(),
+           "a negative integer is not a uint32");
+    expect(run("3.5")->IsNumber() && !run("3.5")->IsInt32(),
+           "a fraction is not an int32");
+    expect(run("'abc'")->IsString() && !run("'abc'")->IsNumber(),
+           "a string's type bits");
+    expect(run("Symbol('s')")->IsSymbol() &&
+               !run("Symbol('s')")->IsString(),
+           "a symbol's type bits");
+    expect(run("10n")->IsBigInt(), "a bigint's type bits");
+    expect(run("undefined")->IsUndefined() &&
+               run("undefined")->IsNullOrUndefined() &&
+               !run("undefined")->IsNull(),
+           "undefined's type bits");
+    expect(run("null")->IsNull() && run("null")->IsNullOrUndefined() &&
+               !run("null")->IsUndefined() && !run("null")->IsObject(),
+           "null's type bits");
+
+    // The brands, which the agent records per object and so need the context.
+    expect(run("new Date(0)")->IsDate(), "a Date's brand");
+    expect(run("/x/")->IsRegExp(), "a RegExp's brand");
+    expect(run("Promise.resolve(1)")->IsPromise(), "a Promise's brand");
+    expect(run("new Map()")->IsMap(), "a Map's brand");
+    expect(run("new Set()")->IsSet(), "a Set's brand");
+    expect(run("new Error('x')")->IsNativeError(), "an Error's brand");
+    expect(run("new Uint8Array(2)")->IsTypedArray() &&
+               !run("new Uint8Array(2)")->IsArray(),
+           "a typed array's brand");
+    expect(run("new ArrayBuffer(2)")->IsArrayBuffer(),
+           "an ArrayBuffer's brand");
+    expect(run("new Proxy({}, {})")->IsProxy(), "a Proxy's brand");
+    expect(run("(function () { return arguments; })()")->IsArgumentsObject(),
+           "an arguments object's brand");
+    expect(!object->IsDate() && !object->IsMap() && !object->IsRegExp(),
+           "a plain object has no brand");
+
+    // StrictEquals and SameValue differ exactly where the spec says: NaN and
+    // the two zeroes.
+    v8::Local<v8::Value> nan = run("NaN");
+    v8::Local<v8::Value> zero = run("0");
+    v8::Local<v8::Value> negative_zero = run("-0");
+    expect(!nan->StrictEquals(nan), "NaN is not strictly equal to itself");
+    expect(nan->SameValue(nan), "NaN is SameValue to itself");
+    expect(zero->StrictEquals(negative_zero),
+           "+0 is strictly equal to -0");
+    expect(!zero->SameValue(negative_zero), "+0 is not SameValue to -0");
+    expect(!run("1")->StrictEquals(run("'1'")),
+           "a number and its string are not strictly equal");
+    expect(array->StrictEquals(array) && !array->StrictEquals(run("[1, 2]")),
+           "objects compare by identity");
+
+    // ToBoolean and typeof.
+    expect(!run("''")->BooleanValue(isolate) &&
+               !run("0")->BooleanValue(isolate) &&
+               run("({})")->BooleanValue(isolate),
+           "BooleanValue follows ToBoolean");
+    expect(render(run("'x'")->TypeOf(current).ToLocalChecked()) == "string" &&
+               render(run("() => 1")->TypeOf(current).ToLocalChecked()) ==
+                   "function" &&
+               render(run("null")->TypeOf(current).ToLocalChecked()) ==
+                   "object",
+           "TypeOf answers typeof");
+
+    // The coercions run host code: a custom toString/valueOf takes part.
+    v8::Local<v8::Value> described = run(
+        "({ toString: function () { return 'custom'; } })");
+    expect(render(described->ToString(current).ToLocalChecked()) == "custom",
+           "ToString ran the object's toString");
+    expect(run("({ valueOf: function () { return 7; } })")
+                   ->ToNumber(current)
+                   .FromMaybe(-1) == 7,
+           "ToNumber ran the object's valueOf");
+    v8::Local<v8::Value> boxed =
+        run("'abc'")->ToObject(current).ToLocalChecked();
+    expect(boxed->IsObject() && !boxed->IsString(),
+           "ToObject boxes a primitive");
   }
 
   // A host-traced reference: a root the C++ side owns and releases. Once it

@@ -756,6 +756,35 @@ What is still missing on this surface is the host-task half: the facade's
 platform tasks do not exist, and the pump only ever runs engine work. `kScoped`
 and `MicrotasksScope` are the other stated gap.
 
+*Value predicates and conversions (2026-10-31).* The whole predicate surface is
+in: `IsUndefined` through `IsNativeError`, `Object::IsCallable`/`IsConstructor`,
+`BooleanValue`, `TypeOf`, `ToString`, `ToNumber`, `ToObject`, `StrictEquals`,
+`SameValue`, and `Local::operator==`. The shape bits (undefined, null, boolean,
+number plus the int32/uint32 ranges, bigint, symbol, string, object, function,
+array, external, typed array, proxy, arguments) come from the value's tag, so a
+single `Value`-bits mask answers all of them. The brands (date, regexp, promise,
+map, set, native error, array buffer) live in the agent's per-object tables, and
+so does the `[[Construct]]` slot that makes an arrow, a method, or an
+async/generator function non-constructible.
+
+That is where the rung turned up a real bug rather than plumbing. The first cut
+read the brands off `crux::function::current_agent()`, the TLS window, which is
+live inside a host callback but empty for the ordinary host call, so
+`value->IsDate()` on a value a `Script::Run` returned would have answered false.
+The mask now takes the entered context's own agent, and the facade passes the
+`SlagContext` behind the thread-local `Context::Scope`, which is the same scope
+V8 reads the isolate from. `Object::IsConstructor` had the same shape but a
+second defect: it asked `crux::value::is_constructor`, which reports every
+ECMAScript function as constructible, so an arrow answered true there while
+`new (() => 1)` threw. It now uses the runtime's narrowed `is_constructor`, which
+consults the function record. `gin-shapes` checks the shape and brand bits, the
+`NaN`/`-0` differences between `===` and `Object.is`, `BooleanValue`, `TypeOf`
+on an object, a function, and `null`, a custom `toString` and `valueOf` through
+the coercions, and `ToObject` boxing a primitive; a runtime test pins the mask
+and the arrow/method/generator narrowing. The known narrowing is that a brand
+asked with no `Context::Scope` on the stack answers false, where V8 would read
+the isolate off the handle location.
+
 The ABI shape is roughly a struct of up to seven C function pointers, the data
 pointer, and the flags, handed over once per template, with the return codes
 `Intercepted` already defines; the callbacks receive a `PropertyCallbackInfo`

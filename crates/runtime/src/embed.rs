@@ -1187,6 +1187,30 @@ impl Context {
         )
     }
 
+    /// ToString as a value (`Value::ToString`): the host gets the string the
+    /// engine made, so a string input answers the same value.
+    pub fn to_string_value(&mut self, value: &JsValue) -> Result<JsValue, JsError> {
+        let agent = self.agent_mut();
+        Ok(JsValue(Value::String(Handle::new(
+            crate::context::to_string(agent, &value.0)?,
+        ))))
+    }
+
+    /// Which V8-style `Value` predicates this value answers (`IsDate` and its
+    /// siblings). Reads the brands from this context's own agent, so it works
+    /// from host code that is outside any engine window, where the live-agent
+    /// slot that [`value_type_mask`] consults is empty.
+    pub fn value_type_mask(&self, value: &JsValue) -> u32 {
+        value_type_mask_with(value, Some(&self.agent))
+    }
+
+    /// IsConstructor (spec 7.2.4), with the `[[Construct]]` slots crux's
+    /// `Function`-level check does not carry (an arrow, a method, and an
+    /// async/generator function are not constructors).
+    pub fn value_is_constructor(&self, value: &JsValue) -> bool {
+        crate::function::is_constructor(&self.agent, &value.0)
+    }
+
     /// Render a thrown value the way a host reports it: an `Error`'s `stack`
     /// when it has one (the shape Node's uncaught handler prints), else the
     /// `console.log` rendering of the value. A script's escaping throw arrives
@@ -2616,6 +2640,120 @@ impl From<JsValue> for Value {
     }
 }
 
+/// The bits [`value_type_mask`] answers, mirrored by `slag_a0.h`'s
+/// `SLAG_VALUE_*` (the same numbers; edit both in one go).
+pub const VALUE_UNDEFINED: u32 = 1 << 0;
+pub const VALUE_NULL: u32 = 1 << 1;
+pub const VALUE_BOOLEAN: u32 = 1 << 2;
+pub const VALUE_NUMBER: u32 = 1 << 3;
+pub const VALUE_BIGINT: u32 = 1 << 4;
+pub const VALUE_SYMBOL: u32 = 1 << 5;
+pub const VALUE_STRING: u32 = 1 << 6;
+/// An object or a function, which is V8's `Value::IsObject`.
+pub const VALUE_OBJECT: u32 = 1 << 7;
+pub const VALUE_FUNCTION: u32 = 1 << 8;
+pub const VALUE_ARRAY: u32 = 1 << 9;
+pub const VALUE_EXTERNAL: u32 = 1 << 10;
+pub const VALUE_TYPED_ARRAY: u32 = 1 << 11;
+pub const VALUE_PROXY: u32 = 1 << 12;
+pub const VALUE_ARGUMENTS: u32 = 1 << 13;
+pub const VALUE_INT32: u32 = 1 << 14;
+pub const VALUE_UINT32: u32 = 1 << 15;
+pub const VALUE_DATE: u32 = 1 << 16;
+pub const VALUE_REGEXP: u32 = 1 << 17;
+pub const VALUE_PROMISE: u32 = 1 << 18;
+pub const VALUE_MAP: u32 = 1 << 19;
+pub const VALUE_SET: u32 = 1 << 20;
+pub const VALUE_ARRAY_BUFFER: u32 = 1 << 21;
+pub const VALUE_NATIVE_ERROR: u32 = 1 << 22;
+
+/// Which of V8's `Value` predicates `value` answers, as a bitmask, read from
+/// the agent that is live on this thread.
+///
+/// The shape bits come from the value itself. The brands the engine records as
+/// per-object tables (date, regexp, map, set, promise, native error, array
+/// buffer) are read from the live agent — the read-only TLS pointer — so this
+/// works inside a host callback, where the context's own cell is borrowed by
+/// the run that called in. Outside any window there is no table to ask and
+/// those bits are clear, which is why [`Context::value_type_mask`] takes the
+/// agent directly for the ordinary host call.
+pub fn value_type_mask(value: &JsValue) -> u32 {
+    value_type_mask_with(value, crate::context::current_agent().ok())
+}
+
+/// IsConstructor (spec 7.2.4), with the `[[Construct]]` slots crux's
+/// `Function`-level check does not carry: an arrow, a method, and an
+/// async/generator function are not constructors. Reads the live agent; with no
+/// window open the crux answer is all there is, and it reports every ECMAScript
+/// function as constructible.
+pub fn value_is_constructor(value: &JsValue) -> bool {
+    match crate::context::current_agent() {
+        Ok(agent) => crate::function::is_constructor(agent, &value.0),
+        Err(_) => crux::value::is_constructor(&value.0),
+    }
+}
+
+fn value_type_mask_with(value: &JsValue, agent: Option<&Agent>) -> u32 {
+    let mut mask = 0u32;
+    match value.0.kind() {
+        ValueKind::Undefined => mask |= VALUE_UNDEFINED,
+        ValueKind::Null => mask |= VALUE_NULL,
+        ValueKind::Boolean(_) => mask |= VALUE_BOOLEAN,
+        ValueKind::Number(number) => {
+            mask |= VALUE_NUMBER;
+            if number.fract() == 0.0 {
+                if (f64::from(i32::MIN)..=f64::from(i32::MAX)).contains(&number) {
+                    mask |= VALUE_INT32;
+                }
+                if (0.0..=f64::from(u32::MAX)).contains(&number) {
+                    mask |= VALUE_UINT32;
+                }
+            }
+        }
+        ValueKind::BigInt(_) => mask |= VALUE_BIGINT,
+        ValueKind::Symbol(_) => mask |= VALUE_SYMBOL,
+        ValueKind::String(_) => mask |= VALUE_STRING,
+        // A function is an object to V8's `IsObject`.
+        ValueKind::Function(_) => mask |= VALUE_OBJECT | VALUE_FUNCTION,
+        ValueKind::Object(object) => {
+            mask |= VALUE_OBJECT;
+            match object.kind {
+                ObjectKind::Array(_) => mask |= VALUE_ARRAY,
+                ObjectKind::Arguments(_) => mask |= VALUE_ARGUMENTS,
+                ObjectKind::Proxy(_) => mask |= VALUE_PROXY,
+                ObjectKind::IntegerIndexed(_) => mask |= VALUE_TYPED_ARRAY,
+                ObjectKind::External(_) => mask |= VALUE_EXTERNAL,
+                _ => {}
+            }
+            if let Some(agent) = agent {
+                let id = object.id();
+                if agent.date_data.contains_key(&id) {
+                    mask |= VALUE_DATE;
+                }
+                if agent.error_data.contains(&id) {
+                    mask |= VALUE_NATIVE_ERROR;
+                }
+                if agent.roots.regexp_data.borrow().contains_key(&id) {
+                    mask |= VALUE_REGEXP;
+                }
+                if agent.roots.map_data.borrow().contains_key(&id) {
+                    mask |= VALUE_MAP;
+                }
+                if agent.roots.set_data.borrow().contains_key(&id) {
+                    mask |= VALUE_SET;
+                }
+                if agent.is_promise_object(id) {
+                    mask |= VALUE_PROMISE;
+                }
+                if agent.buffer_state(id).is_some_and(|state| !state.is_shared) {
+                    mask |= VALUE_ARRAY_BUFFER;
+                }
+            }
+        }
+    }
+    mask
+}
+
 impl fmt::Display for JsValue {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", self.0)
@@ -2802,6 +2940,60 @@ mod tests {
         assert_eq!(eval("1 + 2").as_number(), Some(3.0));
         assert_eq!(eval("'a' + 'b'").as_string().as_deref(), Some("ab"));
         assert_eq!(eval("undefined").type_name(), "undefined");
+    }
+
+    #[test]
+    fn value_type_mask_reports_shapes_and_brands() {
+        let mut context = Context::new().unwrap();
+        let mask = |context: &mut Context, source: &str| {
+            let value = context.eval(source).unwrap();
+            context.value_type_mask(&value)
+        };
+
+        assert_eq!(mask(&mut context, "null"), VALUE_NULL);
+        assert_eq!(
+            mask(&mut context, "7"),
+            VALUE_NUMBER | VALUE_INT32 | VALUE_UINT32
+        );
+        // Negative zero has no int32 sign of its own, so it is a uint32.
+        assert_eq!(
+            mask(&mut context, "-0"),
+            VALUE_NUMBER | VALUE_INT32 | VALUE_UINT32
+        );
+        assert_eq!(mask(&mut context, "-1"), VALUE_NUMBER | VALUE_INT32);
+        assert_eq!(mask(&mut context, "3.5"), VALUE_NUMBER);
+        assert_eq!(mask(&mut context, "'x'"), VALUE_STRING);
+        assert_eq!(mask(&mut context, "() => 1"), VALUE_OBJECT | VALUE_FUNCTION);
+        assert_eq!(mask(&mut context, "({})"), VALUE_OBJECT);
+        assert_eq!(mask(&mut context, "[]"), VALUE_OBJECT | VALUE_ARRAY);
+        assert_eq!(mask(&mut context, "new Date(0)"), VALUE_OBJECT | VALUE_DATE);
+        assert_eq!(mask(&mut context, "new Map()"), VALUE_OBJECT | VALUE_MAP);
+        assert_eq!(
+            mask(&mut context, "new Uint8Array(1)"),
+            VALUE_OBJECT | VALUE_TYPED_ARRAY
+        );
+        assert_eq!(
+            mask(&mut context, "new ArrayBuffer(1)"),
+            VALUE_OBJECT | VALUE_ARRAY_BUFFER
+        );
+        // A Date is an object, so it carries no other shape bit.
+        assert_eq!(mask(&mut context, "new Date(0)") & VALUE_ARRAY, 0);
+    }
+
+    #[test]
+    fn value_is_constructor_narrows_arrows_and_methods() {
+        let mut context = Context::new().unwrap();
+        let is_constructor = |context: &mut Context, source: &str| {
+            let value = context.eval(source).unwrap();
+            context.value_is_constructor(&value)
+        };
+
+        assert!(is_constructor(&mut context, "(function () {})"));
+        assert!(is_constructor(&mut context, "(function () {}).bind(null)"));
+        assert!(!is_constructor(&mut context, "() => 1"));
+        assert!(!is_constructor(&mut context, "({ m() {} }).m"));
+        assert!(!is_constructor(&mut context, "(async function () {})"));
+        assert!(!is_constructor(&mut context, "(function* () {})"));
     }
 
     #[test]

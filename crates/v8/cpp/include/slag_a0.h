@@ -34,6 +34,35 @@ typedef struct SlagMessage {
   int32_t column;
 } SlagMessage;
 
+/* Which `v8::Value` predicates a value answers (`slag_value_type_mask`). The
+ * numbers mirror `runtime::embed`'s `VALUE_*` constants; edit both in one go. */
+enum SlagValueType {
+  SLAG_VALUE_UNDEFINED = 1 << 0,
+  SLAG_VALUE_NULL = 1 << 1,
+  SLAG_VALUE_BOOLEAN = 1 << 2,
+  SLAG_VALUE_NUMBER = 1 << 3,
+  SLAG_VALUE_BIGINT = 1 << 4,
+  SLAG_VALUE_SYMBOL = 1 << 5,
+  SLAG_VALUE_STRING = 1 << 6,
+  /* An object or a function, which is V8's `Value::IsObject`. */
+  SLAG_VALUE_OBJECT = 1 << 7,
+  SLAG_VALUE_FUNCTION = 1 << 8,
+  SLAG_VALUE_ARRAY = 1 << 9,
+  SLAG_VALUE_EXTERNAL = 1 << 10,
+  SLAG_VALUE_TYPED_ARRAY = 1 << 11,
+  SLAG_VALUE_PROXY = 1 << 12,
+  SLAG_VALUE_ARGUMENTS = 1 << 13,
+  SLAG_VALUE_INT32 = 1 << 14,
+  SLAG_VALUE_UINT32 = 1 << 15,
+  SLAG_VALUE_DATE = 1 << 16,
+  SLAG_VALUE_REGEXP = 1 << 17,
+  SLAG_VALUE_PROMISE = 1 << 18,
+  SLAG_VALUE_MAP = 1 << 19,
+  SLAG_VALUE_SET = 1 << 20,
+  SLAG_VALUE_ARRAY_BUFFER = 1 << 21,
+  SLAG_VALUE_NATIVE_ERROR = 1 << 22,
+};
+
 /* A property descriptor as the definer callback receives it
  * (v8::PropertyDescriptor). Each field is present-or-absent, because V8's
  * descriptor distinguishes "not mentioned" from "mentioned and false". */
@@ -149,6 +178,20 @@ int64_t slag_value_to_utf8_context(SlagContext* context, uint64_t value,
 double slag_value_to_number(uint64_t value);
 int32_t slag_value_is_string(uint64_t value);
 int32_t slag_value_is_undefined(uint64_t value);
+/* Which `v8::Value` predicates the value answers (`SlagValueType` bits). The
+ * brands need the context's agent, so a call outside any `Context::Scope`
+ * answers only the shape bits. */
+uint32_t slag_value_type_mask(SlagContext* context, uint64_t value);
+int32_t slag_value_strict_equals(uint64_t left, uint64_t right);
+int32_t slag_value_same_value(uint64_t left, uint64_t right);
+int32_t slag_value_boolean(uint64_t value);
+uint64_t slag_value_typeof(uint64_t value);
+int32_t slag_value_is_callable(uint64_t value);
+int32_t slag_value_is_constructor(SlagContext* context, uint64_t value);
+/* The conversions that run host code, so they need the context. */
+int32_t slag_value_to_string(SlagContext* context, uint64_t value, uint64_t* out);
+int32_t slag_value_to_number_context(SlagContext* context, uint64_t value, double* out);
+int32_t slag_value_to_object(SlagContext* context, uint64_t value, uint64_t* out);
 uint64_t slag_global(SlagContext* context);
 int32_t slag_object_new(SlagContext* context, size_t internal_fields,
                         int32_t api_wrapper, uint64_t* out);

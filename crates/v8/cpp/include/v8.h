@@ -127,6 +127,17 @@ class Local {
     return Local<S>::FromSlot(location_);
   }
 
+  /* The same value, which is how V8's handles compare: two handles over one
+   * value are equal, and an empty handle equals only another empty one. */
+  template <class S>
+  bool operator==(const Local<S>& that) const {
+    return raw() == that.raw();
+  }
+  template <class S>
+  bool operator!=(const Local<S>& that) const {
+    return !(*this == that);
+  }
+
   T* operator->() const {
     return reinterpret_cast<T*>(static_cast<uintptr_t>(raw()));
   }
@@ -225,8 +236,46 @@ enum class Intercepted {
 
 class Value {
  public:
+  /* The type predicates (`v8::Value::IsArray` and its siblings). The shape bits
+   * come from the value; the brands the engine records per object (date,
+   * regexp, map, set, promise, native error, array buffer) need a live agent, so
+   * they answer false outside one. */
   bool IsUndefined() const;
+  bool IsNull() const;
+  bool IsNullOrUndefined() const;
+  bool IsBoolean() const;
+  bool IsNumber() const;
+  bool IsInt32() const;
+  bool IsUint32() const;
+  bool IsBigInt() const;
+  bool IsSymbol() const;
   bool IsString() const;
+  bool IsFunction() const;
+  bool IsObject() const;
+  bool IsArray() const;
+  bool IsExternal() const;
+  bool IsTypedArray() const;
+  bool IsProxy() const;
+  bool IsArgumentsObject() const;
+  bool IsDate() const;
+  bool IsRegExp() const;
+  bool IsPromise() const;
+  bool IsMap() const;
+  bool IsSet() const;
+  bool IsArrayBuffer() const;
+  bool IsNativeError() const;
+
+  /* ToBoolean, `typeof`, and the coercions. `ToString`/`ToNumber`/`ToObject`
+   * run host code, so they need the context; an empty answer leaves the error
+   * pending. */
+  bool BooleanValue(Isolate* isolate) const;
+  MaybeLocal<String> TypeOf(Local<Context> context) const;
+  MaybeLocal<String> ToString(Local<Context> context) const;
+  Maybe<double> ToNumber(Local<Context> context) const;
+  MaybeLocal<Object> ToObject(Local<Context> context) const;
+  bool StrictEquals(Local<Value> that) const;
+  bool SameValue(Local<Value> that) const;
+
   Maybe<uint32_t> Uint32Value(Local<Context> context) const;
   Maybe<int32_t> Int32Value(Local<Context> context) const;
 };
@@ -262,6 +311,11 @@ class Object : public Value {
   void SetAlignedPointerInInternalField(
       int index, void* value,
       CppHeapPointerTag tag = CppHeapPointerTag::kDefaultTag);
+
+  /* Whether the object is callable (`Object::IsCallable`) or a constructor
+   * (`Object::IsConstructor`). */
+  bool IsCallable() const;
+  bool IsConstructor() const;
 
   void* GetAlignedPointerFromInternalField(int index) const;
   void* GetAlignedPointerFromInternalField(Isolate* isolate, int index) const;
