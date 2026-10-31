@@ -168,8 +168,16 @@ impl Isolate {
 /// host that over-corrects with a negative change is told it holds no external
 /// memory rather than a negative number of bytes.
 fn external_memory(isolate: &Isolate) -> i64 {
-    let mut total = isolate.external_memory_adjustment;
-    for state in isolate.agent.roots.buffer_data.borrow().values() {
+    external_memory_of(&isolate.agent, isolate.external_memory_adjustment)
+}
+
+/// The bytes of the buffers `agent` holds plus `adjustment`, floored at zero.
+/// Split out of [`external_memory`] so the embedding API
+/// (`embed::Context::external_memory`) reports the same total for an agent that
+/// is not wrapped in an `api::Isolate`.
+pub(crate) fn external_memory_of(agent: &crate::agent::Agent, adjustment: i64) -> i64 {
+    let mut total = adjustment;
+    for state in agent.roots.buffer_data.borrow().values() {
         if state.detached || state.shared.is_borrowed() {
             continue;
         }

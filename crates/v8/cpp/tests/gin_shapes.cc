@@ -1185,6 +1185,11 @@ int main() {
            "a typed array's brand");
     expect(run("new ArrayBuffer(2)")->IsArrayBuffer(),
            "an ArrayBuffer's brand");
+    expect(run("new SharedArrayBuffer(2)")->IsSharedArrayBuffer() &&
+               !run("new SharedArrayBuffer(2)")->IsArrayBuffer(),
+           "a SharedArrayBuffer's brand");
+    expect(run("new DataView(new ArrayBuffer(2))")->IsDataView(),
+           "a DataView's brand");
     expect(run("new Proxy({}, {})")->IsProxy(), "a Proxy's brand");
     expect(run("(function () { return arguments; })()")->IsArgumentsObject(),
            "an arguments object's brand");
@@ -1231,6 +1236,154 @@ int main() {
         run("'abc'")->ToObject(current).ToLocalChecked();
     expect(boxed->IsObject() && !boxed->IsString(),
            "ToObject boxes a primitive");
+  }
+
+  // Buffers and typed arrays: the bytes a host hands to JavaScript, the views
+  // over them, and the detach protocol.
+  {
+    v8::HandleScope scope(isolate);
+    v8::Local<v8::Context> current = context.Get(isolate);
+    v8::Context::Scope context_scope(current);
+    const auto expect = [&](bool condition, const char* what) {
+      if (!condition) {
+        fprintf(stderr, "buffers: %s\n", what);
+        ++failures;
+      }
+    };
+    const auto run = [&](const char* source) {
+      return v8::Script::Compile(
+                 current, v8::String::NewFromUtf8Literal(isolate, source))
+          .ToLocalChecked()
+          ->Run(current)
+          .ToLocalChecked();
+    };
+    const auto bind = [&](const char* name, v8::Local<v8::Value> value) {
+      current->Global()
+          ->Set(current, v8::String::NewFromUtf8Literal(isolate, name), value)
+          .ToChecked();
+    };
+    const auto number_at = [&](const char* name) {
+      return current->Global()
+          ->Get(current, v8::String::NewFromUtf8Literal(isolate, name))
+          .ToLocalChecked()
+          ->Int32Value(current)
+          .FromMaybe(-1);
+    };
+
+    // A new buffer is zeroed, and a host write is what the script reads.
+    v8::Local<v8::ArrayBuffer> buffer = v8::ArrayBuffer::New(isolate, 16);
+    expect(!buffer.IsEmpty() && buffer->ByteLength() == 16 &&
+               buffer->IsDetachable() && !buffer->WasDetached(),
+           "a new ArrayBuffer's geometry");
+    expect(buffer->Data() != nullptr, "a new ArrayBuffer has bytes");
+    static_cast<uint8_t*>(buffer->Data())[0] = 7;
+    bind("hostBuffer", buffer);
+    run("globalThis.firstByte = new Uint8Array(hostBuffer)[0];");
+    expect(number_at("firstByte") == 7, "the script read the host's byte");
+
+    // A host-owned store: writing through it is what the script reads, and the
+    // buffer and the store name the same bytes.
+    std::unique_ptr<v8::BackingStore> fresh =
+        v8::ArrayBuffer::NewBackingStore(isolate, 8);
+    expect(!fresh->IsEmpty() && fresh->ByteLength() == 8 &&
+               fresh->Data() != nullptr,
+           "a new backing store's geometry");
+    std::shared_ptr<v8::BackingStore> shared(std::move(fresh));
+    v8::Local<v8::ArrayBuffer> over_store =
+        v8::ArrayBuffer::New(isolate, shared);
+    expect(!over_store.IsEmpty() && over_store->ByteLength() == 8,
+           "an ArrayBuffer over a store");
+    static_cast<uint8_t*>(shared->Data())[2] = 9;
+    bind("storeBuffer", over_store);
+    run("globalThis.thirdByte = new Uint8Array(storeBuffer)[2];");
+    expect(number_at("thirdByte") == 9, "the store shares the buffer's bytes");
+
+    // A view's bytes are the buffer's bytes, in both directions, and the view
+    // reports the geometry it was built with.
+    v8::Local<v8::Uint8Array> bytes =
+        v8::Uint8Array::New(buffer, 0, 16);
+    expect(bytes->Length() == 16 && bytes->ByteLength() == 16 &&
+               bytes->ByteOffset() == 0 && bytes->HasBuffer(),
+           "a Uint8Array's geometry");
+    expect(bytes->Buffer().raw() == buffer.raw(),
+           "a view answers the buffer it was built over");
+    bind("hostView", bytes);
+    run("hostView[1] = 11;");
+    expect(static_cast<uint8_t*>(buffer->Data())[1] == 11,
+           "a script write reached the buffer");
+
+    v8::Local<v8::Uint32Array> words = v8::Uint32Array::New(buffer, 4, 2);
+    expect(words->ByteOffset() == 4 && words->ByteLength() == 8 &&
+               words->Length() == 2,
+           "a Uint32Array's geometry");
+    v8::Local<v8::Float64Array> doubles = v8::Float64Array::New(buffer, 8, 1);
+    expect(doubles->Length() == 1 && doubles->ByteLength() == 8,
+           "a Float64Array's geometry");
+    v8::Local<v8::BigInt64Array> big = v8::BigInt64Array::New(buffer, 8, 1);
+    expect(big->Length() == 1, "a BigInt64Array's geometry");
+
+    // A range that does not fit is the engine's RangeError, not a view.
+    {
+      v8::TryCatch range_catch(isolate);
+      v8::Local<v8::Uint32Array> bad = v8::Uint32Array::New(buffer, 15, 1);
+      expect(bad.IsEmpty() && range_catch.HasCaught(),
+             "an out-of-range view left an error pending");
+    }
+
+    // GetBackingStore names the same bytes the buffer has.
+    std::shared_ptr<v8::BackingStore> read_back = buffer->GetBackingStore();
+    expect(read_back && read_back->ByteLength() == 16 &&
+               read_back->Data() == buffer->Data(),
+           "GetBackingStore names the buffer's bytes");
+
+    // Detach: the bytes go away, views report empty, and a second detach is
+    // refused.
+    expect(buffer->Detach(), "a detachable buffer detached");
+    expect(buffer->WasDetached() && buffer->ByteLength() == 0 &&
+               buffer->Data() == nullptr && !buffer->Detach(),
+           "a detached buffer's state");
+    run("globalThis.viewLength = hostView.length;");
+    expect(number_at("viewLength") == 0, "a detached buffer's view is empty");
+
+    // A detach key is only satisfied by the key itself.
+    {
+      v8::Local<v8::ArrayBuffer> keyed = v8::ArrayBuffer::New(isolate, 4);
+      v8::Local<v8::Value> key = v8::String::NewFromUtf8Literal(isolate, "k");
+      keyed->SetDetachKey(key);
+      expect(!keyed->Detach(), "a keyed buffer detached without its key");
+      expect(keyed->Detach(key) && keyed->WasDetached(),
+             "a keyed buffer detached with its key");
+    }
+
+    // A SharedArrayBuffer's store is shared, and its bytes are writable.
+    v8::Local<v8::SharedArrayBuffer> shared_buffer =
+        v8::SharedArrayBuffer::New(isolate, 8);
+    std::shared_ptr<v8::BackingStore> shared_store =
+        shared_buffer->GetBackingStore();
+    expect(shared_buffer->ByteLength() == 8 && shared_store &&
+               shared_store->IsShared() &&
+               shared_store->ByteLength() == 8,
+           "a SharedArrayBuffer and its store");
+
+    // The external-memory account moves by what the host records and comes back
+    // when the host takes it away.
+    const int64_t account_before =
+        isolate->AdjustAmountOfExternalAllocatedMemory(0);
+    expect(isolate->AdjustAmountOfExternalAllocatedMemory(4096) ==
+               account_before + 4096,
+           "the external-memory account moved by the host's change");
+    expect(isolate->AdjustAmountOfExternalAllocatedMemory(-4096) ==
+               account_before,
+           "the external-memory account came back");
+    {
+      v8::ExternalMemoryAccounter accounter;
+      accounter.Update(isolate, 1024);
+      expect(isolate->AdjustAmountOfExternalAllocatedMemory(0) ==
+                 account_before + 1024,
+             "ExternalMemoryAccounter recorded its size");
+    }
+    expect(isolate->AdjustAmountOfExternalAllocatedMemory(0) == account_before,
+           "ExternalMemoryAccounter gave its size back");
   }
 
   // A host-traced reference: a root the C++ side owns and releases. Once it

@@ -1142,6 +1142,119 @@ impl Context {
         Ok(JsValue(value))
     }
 
+    /// Create an ArrayBuffer over a block the host already holds (spec
+    /// 25.1.2.2 with a supplied [[ArrayBufferData]]). The block is cloned, so
+    /// the host's own handle and the buffer share the same bytes.
+    pub fn array_buffer_from_shared(
+        &mut self,
+        shared: SharedBuffer,
+        byte_length: usize,
+    ) -> Result<JsValue, JsError> {
+        let value = crate::builtins::array_buffer::array_buffer_from_block(
+            self.agent_mut(),
+            shared,
+            byte_length,
+        )?;
+        Ok(JsValue(value))
+    }
+
+    /// Create a SharedArrayBuffer over a block the host already holds (spec
+    /// 25.3.2.1 with a supplied [[ArrayBufferData]]).
+    pub fn shared_array_buffer_from_shared(
+        &mut self,
+        shared: SharedBuffer,
+        byte_length: usize,
+    ) -> Result<JsValue, JsError> {
+        let value = crate::builtins::array_buffer::shared_array_buffer_from_block(
+            self.agent_mut(),
+            shared,
+            byte_length,
+        )?;
+        Ok(JsValue(value))
+    }
+
+    /// The bytes behind an ArrayBuffer or SharedArrayBuffer, or `None` when the
+    /// value is not a buffer. Nothing is copied: the returned block is a second
+    /// handle to the same storage.
+    pub fn buffer_info(&self, value: &JsValue) -> Option<BufferInfo> {
+        buffer_info_with(&self.agent, value)
+    }
+
+    /// The bytes the agent's live buffers hold plus the host's own account,
+    /// floored at zero (`v8::Isolate::GetHeapStatistics`'s `external_memory`).
+    /// The buffer part is the engine's own walk; the account is the host's,
+    /// which the ABI keeps on the isolate.
+    pub fn external_memory(&self, host_account: i64) -> i64 {
+        crate::api::external_memory_of(&self.agent, host_account)
+    }
+
+    /// Detach a buffer (`v8::ArrayBuffer::Detach`). `key` is the
+    /// [[ArrayBufferDetachKey]] the host installed; a mismatch, or an already
+    /// detached buffer, answers false and leaves it alone.
+    pub fn detach_buffer(&mut self, value: &JsValue, key: Option<&JsValue>) -> bool {
+        let Some(object) = value.0.as_object() else {
+            return false;
+        };
+        let id = object.id();
+        if crate::builtins::array_buffer::is_detached(&self.agent, id) {
+            return false;
+        }
+        let key = key.map_or(Value::Undefined, |key| key.0);
+        crate::builtins::array_buffer::detach_array_buffer_with_key(&mut self.agent, id, &key)
+    }
+
+    /// Record a buffer's [[ArrayBufferDetachKey]]; `undefined` clears it
+    /// (`v8::ArrayBuffer::SetDetachKey`).
+    pub fn set_detach_key(&mut self, value: &JsValue, key: &JsValue) {
+        if let Some(object) = value.0.as_object() {
+            crate::builtins::array_buffer::set_detach_key(&mut self.agent, object.id(), key.0);
+        }
+    }
+
+    /// A typed array over `buffer` (`v8::Uint8Array::New` and its siblings).
+    /// The engine validates the byte geometry against the buffer and throws its
+    /// RangeError or TypeError when it does not fit.
+    pub fn create_typed_array(
+        &mut self,
+        kind: TypedArrayKind,
+        buffer: &JsValue,
+        byte_offset: usize,
+        length: usize,
+    ) -> Result<JsValue, JsError> {
+        let agent = &mut self.agent;
+        let prototype = agent
+            .current_realm()?
+            .intrinsics
+            .get(kind.prototype())
+            .and_then(|value| value.as_object())
+            .ok_or_else(|| {
+                JsError::new(
+                    ErrorKind::TypeError,
+                    format!("{} missing", kind.prototype()),
+                )
+            })?;
+        let args = [
+            Value::Number(byte_offset as f64),
+            Value::Number(length as f64),
+        ];
+        crate::builtins::typed_array::typed_array_buffer_path(
+            agent,
+            prototype,
+            kind.element_type(),
+            &buffer.0,
+            &args,
+        )
+        .map(JsValue)
+    }
+
+    /// The geometry of a typed array view (`v8::TypedArray`'s accessors), or
+    /// `None` when the value is not a typed array. Detach and a shrink below
+    /// the view's range read as a zero-length view at offset zero, which is how
+    /// the spec's Integer-Indexed accessors report them.
+    pub fn typed_array_info(&self, value: &JsValue) -> Option<TypedArrayInfo> {
+        typed_array_info(value)
+    }
+
     // ── coercions & type checks (Phase 1: embedding API) ────────────────────
     // The coercion half of what `bun_jsc`'s `JSC__JSValue__*` externs do:
     // ToNumber/ToString/ToObject need an agent (objects run valueOf/toString),
@@ -2640,6 +2753,109 @@ impl From<JsValue> for Value {
     }
 }
 
+/// The bytes behind a buffer object, as [`Context::buffer_info`] reports them.
+pub struct BufferInfo {
+    /// The shared byte block: a second handle to the same storage, so it keeps
+    /// the bytes alive on its own.
+    pub block: SharedBuffer,
+    pub byte_length: usize,
+    pub is_shared: bool,
+    pub detached: bool,
+    pub resizable: bool,
+    pub has_detach_key: bool,
+}
+
+/// The typed array kind a host asks a `v8::<Kind>Array::New` for. The
+/// intrinsics key each kind's prototype is also derived from it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TypedArrayKind {
+    Int8,
+    Uint8,
+    Uint8Clamped,
+    Int16,
+    Uint16,
+    Int32,
+    Uint32,
+    Float16,
+    Float32,
+    Float64,
+    BigInt64,
+    BigUint64,
+}
+
+impl TypedArrayKind {
+    fn element_type(self) -> crux::typed_array::ElementType {
+        use crux::typed_array::ElementType;
+        match self {
+            Self::Int8 => ElementType::Int8,
+            Self::Uint8 => ElementType::Uint8,
+            Self::Uint8Clamped => ElementType::Uint8Clamped,
+            Self::Int16 => ElementType::Int16,
+            Self::Uint16 => ElementType::Uint16,
+            Self::Int32 => ElementType::Int32,
+            Self::Uint32 => ElementType::Uint32,
+            Self::Float16 => ElementType::Float16,
+            Self::Float32 => ElementType::Float32,
+            Self::Float64 => ElementType::Float64,
+            Self::BigInt64 => ElementType::BigInt64,
+            Self::BigUint64 => ElementType::BigUint64,
+        }
+    }
+
+    fn prototype(self) -> &'static str {
+        match self {
+            Self::Int8 => "%Int8Array.prototype%",
+            Self::Uint8 => "%Uint8Array.prototype%",
+            Self::Uint8Clamped => "%Uint8ClampedArray.prototype%",
+            Self::Int16 => "%Int16Array.prototype%",
+            Self::Uint16 => "%Uint16Array.prototype%",
+            Self::Int32 => "%Int32Array.prototype%",
+            Self::Uint32 => "%Uint32Array.prototype%",
+            Self::Float16 => "%Float16Array.prototype%",
+            Self::Float32 => "%Float32Array.prototype%",
+            Self::Float64 => "%Float64Array.prototype%",
+            Self::BigInt64 => "%BigInt64Array.prototype%",
+            Self::BigUint64 => "%BigUint64Array.prototype%",
+        }
+    }
+}
+
+/// The geometry of a typed array view, or `None` when the value is not one.
+/// Reads only the object's own slots, so it needs no agent and answers inside a
+/// host callback.
+pub fn typed_array_info(value: &JsValue) -> Option<TypedArrayInfo> {
+    let object = value.0.as_object()?;
+    let ObjectKind::IntegerIndexed(slots) = &object.kind else {
+        return None;
+    };
+    let out_of_bounds = !slots.auto_length
+        && slots.buffer.is_resizable()
+        && slots.byte_offset + slots.byte_length > slots.buffer.byte_length();
+    let (byte_offset, length) = if slots.buffer.is_detached() || out_of_bounds {
+        (0, 0)
+    } else {
+        (slots.byte_offset, typed_array_effective_length(slots))
+    };
+    Some(TypedArrayInfo {
+        buffer: slots.buffer_object,
+        byte_offset,
+        byte_length: length * slots.element_type.size(),
+        length,
+        element_type: slots.element_type,
+    })
+}
+
+/// The geometry of a typed array view, as [`Context::typed_array_info`]
+/// reports it.
+pub struct TypedArrayInfo {
+    /// The viewed buffer, as the language value the `buffer` accessor answers.
+    pub buffer: Value,
+    pub byte_offset: usize,
+    pub byte_length: usize,
+    pub length: usize,
+    pub element_type: crux::typed_array::ElementType,
+}
+
 /// The bits [`value_type_mask`] answers, mirrored by `slag_a0.h`'s
 /// `SLAG_VALUE_*` (the same numbers; edit both in one go).
 pub const VALUE_UNDEFINED: u32 = 1 << 0;
@@ -2666,6 +2882,8 @@ pub const VALUE_MAP: u32 = 1 << 19;
 pub const VALUE_SET: u32 = 1 << 20;
 pub const VALUE_ARRAY_BUFFER: u32 = 1 << 21;
 pub const VALUE_NATIVE_ERROR: u32 = 1 << 22;
+pub const VALUE_SHARED_ARRAY_BUFFER: u32 = 1 << 23;
+pub const VALUE_DATA_VIEW: u32 = 1 << 24;
 
 /// Which of V8's `Value` predicates `value` answers, as a bitmask, read from
 /// the agent that is live on this thread.
@@ -2679,6 +2897,26 @@ pub const VALUE_NATIVE_ERROR: u32 = 1 << 22;
 /// agent directly for the ordinary host call.
 pub fn value_type_mask(value: &JsValue) -> u32 {
     value_type_mask_with(value, crate::context::current_agent().ok())
+}
+
+/// [`Context::buffer_info`] for the agent that is live on this thread: what a
+/// host callback can ask, where the context's own cell is borrowed by the run
+/// that called in.
+pub fn buffer_info(value: &JsValue) -> Option<BufferInfo> {
+    buffer_info_with(crate::context::current_agent().ok()?, value)
+}
+
+fn buffer_info_with(agent: &Agent, value: &JsValue) -> Option<BufferInfo> {
+    let object = value.0.as_object()?;
+    let state = agent.buffer_state(object.id())?;
+    Some(BufferInfo {
+        block: state.shared.clone(),
+        byte_length: state.byte_length,
+        is_shared: state.is_shared,
+        detached: state.detached,
+        resizable: state.resizable || state.growable,
+        has_detach_key: state.detach_key.is_some(),
+    })
 }
 
 /// IsConstructor (spec 7.2.4), with the `[[Construct]]` slots crux's
@@ -2745,8 +2983,15 @@ fn value_type_mask_with(value: &JsValue, agent: Option<&Agent>) -> u32 {
                 if agent.is_promise_object(id) {
                     mask |= VALUE_PROMISE;
                 }
-                if agent.buffer_state(id).is_some_and(|state| !state.is_shared) {
-                    mask |= VALUE_ARRAY_BUFFER;
+                if let Some(state) = agent.buffer_state(id) {
+                    if state.is_shared {
+                        mask |= VALUE_SHARED_ARRAY_BUFFER;
+                    } else {
+                        mask |= VALUE_ARRAY_BUFFER;
+                    }
+                }
+                if agent.has_data_view(id) {
+                    mask |= VALUE_DATA_VIEW;
                 }
             }
         }
@@ -2888,6 +3133,69 @@ mod tests {
 
     fn eval(source: &str) -> JsValue {
         Context::new().unwrap().eval(source).unwrap()
+    }
+
+    #[test]
+    fn buffer_info_and_detach_round_trip() {
+        let mut context = Context::new().unwrap();
+        let shared = SharedBuffer::new(8);
+        shared.write(0, b"abcdefgh").unwrap();
+        let value = context.array_buffer_from_shared(shared, 8).unwrap();
+
+        let info = context.buffer_info(&value).unwrap();
+        assert_eq!(info.byte_length, 8);
+        assert!(!info.is_shared && !info.detached && !info.resizable);
+        assert!(!info.has_detach_key);
+        assert_eq!(info.block.read(0, 3).unwrap(), b"abc");
+
+        let key = context.eval("'k'").unwrap();
+        context.set_detach_key(&value, &key);
+        assert!(context.buffer_info(&value).unwrap().has_detach_key);
+        assert!(!context.detach_buffer(&value, None));
+        assert!(context.detach_buffer(&value, Some(&key)));
+        let info = context.buffer_info(&value).unwrap();
+        assert!(info.detached);
+        assert_eq!(info.byte_length, 0);
+        assert!(context.value_type_mask(&value) & VALUE_ARRAY_BUFFER != 0);
+    }
+
+    #[test]
+    fn typed_array_info_reports_the_view() {
+        let mut context = Context::new().unwrap();
+        let buffer = context.array_buffer_from_bytes(&[0u8; 16]).unwrap();
+        let view = context
+            .create_typed_array(TypedArrayKind::Uint32, &buffer, 4, 2)
+            .unwrap();
+        let info = context.typed_array_info(&view).unwrap();
+        assert_eq!(info.byte_offset, 4);
+        assert_eq!(info.byte_length, 8);
+        assert_eq!(info.length, 2);
+        assert_eq!(info.buffer.bits(), buffer.0.bits());
+        assert!(context.value_type_mask(&view) & VALUE_TYPED_ARRAY != 0);
+
+        // The engine validates the geometry: a misaligned offset and a range
+        // past the end are both its own errors.
+        assert!(
+            context
+                .create_typed_array(TypedArrayKind::Uint32, &buffer, 15, 1)
+                .is_err()
+        );
+        assert!(
+            context
+                .create_typed_array(TypedArrayKind::Uint32, &buffer, 0, 5)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn external_memory_counts_live_buffer_bytes() {
+        let mut context = Context::new().unwrap();
+        let before = context.external_memory(0);
+        let buffer = context.array_buffer_from_bytes(&[0u8; 32]).unwrap();
+        assert_eq!(context.external_memory(0), before + 32);
+        assert_eq!(context.external_memory(8), before + 40);
+        assert!(context.detach_buffer(&buffer, None));
+        assert_eq!(context.external_memory(0), before);
     }
 
     #[test]

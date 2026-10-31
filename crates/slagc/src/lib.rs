@@ -34,9 +34,13 @@ use slag::{
 };
 
 /// The isolate a host enters. The engine's contexts are the state; this token
-/// exists so the facade's `Isolate` can own and free them in order.
+/// exists so the facade's `Isolate` can own and free them in order, and so the
+/// host's external-memory account (`AdjustAmountOfExternalAllocatedMemory`)
+/// has somewhere to live.
 pub struct SlagIsolate {
-    _private: (),
+    /// The bytes the host says it holds outside the engine's heap. The engine's
+    /// own buffer walk is added when the total is asked for.
+    external_memory: std::cell::Cell<i64>,
 }
 
 /// One realm and its pending-exception slot (`v8::Context`).
@@ -89,6 +93,17 @@ pub struct SlagScript {
 /// and destructor do.
 pub struct SlagTraced {
     traced: Traced,
+}
+
+/// A block of buffer bytes the host holds independently of a JavaScript buffer
+/// (`v8::BackingStore`). The block is a refcounted handle to the same storage
+/// the buffer names, so this box can outlive the object that came from and the
+/// bytes stay alive while it exists.
+pub struct SlagBuffer {
+    block: crux::typed_array::SharedBuffer,
+    byte_length: usize,
+    is_shared: bool,
+    resizable: bool,
 }
 
 /// The C++ function a registered host global calls. `call` is the
@@ -302,9 +317,416 @@ pub unsafe extern "C" fn slag_traced_free(traced: *mut SlagTraced) {
     }
 }
 
+/// A new zeroed block of `byte_length` bytes
+/// (`v8::ArrayBuffer::NewBackingStore`).
+#[unsafe(no_mangle)]
+pub extern "C" fn slag_buffer_new(byte_length: usize) -> *mut SlagBuffer {
+    Box::into_raw(Box::new(SlagBuffer {
+        block: crux::typed_array::SharedBuffer::new(byte_length),
+        byte_length,
+        is_shared: false,
+        resizable: false,
+    }))
+}
+
+/// How a host releases memory it lent to a backing store
+/// (`v8::BackingStoreDeleterCallback`). The engine calls it once, with the
+/// bytes, their length, and the host's own pointer.
+pub type SlagBufferDeleter = extern "C" fn(*mut u8, usize, *mut c_void);
+
+/// A block over memory the host owns
+/// (`ArrayBuffer::NewBackingStore(data, length, deleter, deleter_data)`).
+///
+/// # Safety
+///
+/// `data` must point at `byte_length` readable and writable bytes that stay
+/// valid until `deleter` runs, and `deleter` must be the only thing that
+/// releases them.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn slag_buffer_borrowed(
+    data: *mut u8,
+    byte_length: usize,
+    deleter: Option<SlagBufferDeleter>,
+    deleter_data: *mut c_void,
+) -> *mut SlagBuffer {
+    let release = deleter.map(|deleter| {
+        Box::new(move || deleter(data, byte_length, deleter_data)) as Box<dyn FnOnce()>
+    });
+    // SAFETY: the caller's contract; `release` is the one call that frees the
+    // bytes.
+    let block = unsafe { crux::typed_array::SharedBuffer::borrowed(data, byte_length, release) };
+    Box::into_raw(Box::new(SlagBuffer {
+        block,
+        byte_length,
+        is_shared: false,
+        resizable: false,
+    }))
+}
+
+/// The first byte of the block, or null for an empty one
+/// (`v8::BackingStore::Data`).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn slag_buffer_data(buffer: *const SlagBuffer) -> *mut u8 {
+    match buffer.as_ref() {
+        Some(buffer) => buffer.block.data_ptr(),
+        None => std::ptr::null_mut(),
+    }
+}
+
+/// The block's length in bytes (`v8::BackingStore::ByteLength`).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn slag_buffer_byte_length(buffer: *const SlagBuffer) -> usize {
+    buffer.as_ref().map_or(0, |buffer| buffer.byte_length)
+}
+
+/// Whether the block backs a SharedArrayBuffer (`v8::BackingStore::IsShared`).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn slag_buffer_is_shared(buffer: *const SlagBuffer) -> i32 {
+    buffer
+        .as_ref()
+        .map_or(0, |buffer| i32::from(buffer.is_shared))
+}
+
+/// Whether the buffer the block came from may be resized by JavaScript.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn slag_buffer_is_resizable(buffer: *const SlagBuffer) -> i32 {
+    buffer
+        .as_ref()
+        .map_or(0, |buffer| i32::from(buffer.resizable))
+}
+
+/// Whether the bytes are the host's rather than the engine's
+/// (`SharedBuffer::is_borrowed`): an external-memory walk skips those.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn slag_buffer_is_borrowed(buffer: *const SlagBuffer) -> i32 {
+    buffer
+        .as_ref()
+        .map_or(0, |buffer| i32::from(buffer.block.is_borrowed()))
+}
+
+/// Release one host handle to the block. The storage stays alive while a
+/// buffer or another handle still names it.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn slag_buffer_free(buffer: *mut SlagBuffer) {
+    if !buffer.is_null() {
+        drop(Box::from_raw(buffer));
+    }
+}
+
+/// Create an ArrayBuffer (or a SharedArrayBuffer, for a shared block) over
+/// `buffer` (`v8::ArrayBuffer::New` with a `BackingStore`).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn slag_buffer_to_array_buffer(
+    context: *mut SlagContext,
+    buffer: *const SlagBuffer,
+    out: *mut u64,
+) -> i32 {
+    let Some(context) = context.as_mut() else {
+        return 2;
+    };
+    let Some(buffer) = buffer.as_ref() else {
+        return 2;
+    };
+    let created = {
+        let Ok(mut engine) = context.context.try_borrow_mut() else {
+            reentrant(context);
+            return 1;
+        };
+        let block = buffer.block.clone();
+        let length = buffer.byte_length;
+        if buffer.is_shared {
+            engine.shared_array_buffer_from_shared(block, length)
+        } else {
+            engine.array_buffer_from_shared(block, length)
+        }
+    };
+    match created {
+        Ok(value) => {
+            if !out.is_null() {
+                *out = value.to_bits();
+            }
+            0
+        }
+        Err(error) => {
+            record(context, error);
+            1
+        }
+    }
+}
+
+/// Clone the block behind an ArrayBuffer/SharedArrayBuffer into a host handle
+/// (`v8::ArrayBuffer::GetBackingStore`). A null pointer answers a value that is
+/// not a buffer; a detached buffer answers its block with a zero length, which
+/// is how V8 reports it.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn slag_buffer_of(context: *mut SlagContext, value: u64) -> *mut SlagBuffer {
+    let Some(info) = buffer_info_of(context, value) else {
+        return std::ptr::null_mut();
+    };
+    let byte_length = if info.detached { 0 } else { info.byte_length };
+    Box::into_raw(Box::new(SlagBuffer {
+        block: info.block,
+        byte_length,
+        is_shared: info.is_shared,
+        resizable: info.resizable,
+    }))
+}
+
+unsafe fn buffer_info_of(context: *mut SlagContext, value: u64) -> Option<slag::BufferInfo> {
+    let value = JsValue::from_bits(value);
+    match context
+        .as_ref()
+        .and_then(|context| context.context.try_borrow().ok())
+    {
+        Some(engine) => engine.buffer_info(&value),
+        // Inside a callback the run holds the context's cell; the live window
+        // has the agent the buffer table lives on.
+        None => slag::buffer_info(&value),
+    }
+}
+
+/// A buffer's byte length, zero once detached (`v8::ArrayBuffer::ByteLength`).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn slag_array_buffer_byte_length(
+    context: *mut SlagContext,
+    value: u64,
+) -> usize {
+    match buffer_info_of(context, value) {
+        Some(info) if !info.detached => info.byte_length,
+        _ => 0,
+    }
+}
+
+/// A buffer's first byte, or a null pointer when it is detached or not a buffer
+/// (`v8::ArrayBuffer::Data`).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn slag_array_buffer_data(context: *mut SlagContext, value: u64) -> *mut u8 {
+    match buffer_info_of(context, value) {
+        Some(info) if !info.detached => info.block.data_ptr(),
+        _ => std::ptr::null_mut(),
+    }
+}
+
+/// Whether the buffer was detached (`v8::ArrayBuffer::WasDetached`).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn slag_array_buffer_is_detached(
+    context: *mut SlagContext,
+    value: u64,
+) -> i32 {
+    i32::from(buffer_info_of(context, value).is_some_and(|info| info.detached))
+}
+
+/// Whether the buffer may be detached (`v8::ArrayBuffer::IsDetachable`): not
+/// shared and not already detached.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn slag_array_buffer_is_detachable(
+    context: *mut SlagContext,
+    value: u64,
+) -> i32 {
+    i32::from(buffer_info_of(context, value).is_some_and(|info| !info.is_shared && !info.detached))
+}
+
+/// Create a SharedArrayBuffer over `buffer`, whatever the block's own flags say
+/// (`v8::SharedArrayBuffer::New` with a `BackingStore`).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn slag_shared_array_buffer_new(
+    context: *mut SlagContext,
+    buffer: *const SlagBuffer,
+    out: *mut u64,
+) -> i32 {
+    let Some(context) = context.as_mut() else {
+        return 2;
+    };
+    let Some(buffer) = buffer.as_ref() else {
+        return 2;
+    };
+    let created = {
+        let Ok(mut engine) = context.context.try_borrow_mut() else {
+            reentrant(context);
+            return 1;
+        };
+        engine.shared_array_buffer_from_shared(buffer.block.clone(), buffer.byte_length)
+    };
+    match created {
+        Ok(value) => {
+            if !out.is_null() {
+                *out = value.to_bits();
+            }
+            0
+        }
+        Err(error) => {
+            record(context, error);
+            1
+        }
+    }
+}
+
+/// Detach a buffer (`v8::ArrayBuffer::Detach`). `key` is absent when the host
+/// passed none; answers 1 when the buffer was detached, 0 when it refused (a
+/// key mismatch or an already detached buffer).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn slag_array_buffer_detach(
+    context: *mut SlagContext,
+    value: u64,
+    key: u64,
+    has_key: i32,
+) -> i32 {
+    let Some(context) = context.as_mut() else {
+        return 0;
+    };
+    let Ok(mut engine) = context.context.try_borrow_mut() else {
+        reentrant(context);
+        return 0;
+    };
+    let value = JsValue::from_bits(value);
+    let key = if has_key != 0 {
+        Some(JsValue::from_bits(key))
+    } else {
+        None
+    };
+    i32::from(engine.detach_buffer(&value, key.as_ref()))
+}
+
+/// Record a buffer's [[ArrayBufferDetachKey]]
+/// (`v8::ArrayBuffer::SetDetachKey`); `undefined` clears it.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn slag_array_buffer_set_detach_key(
+    context: *mut SlagContext,
+    value: u64,
+    key: u64,
+) {
+    let Some(context) = context.as_ref() else {
+        return;
+    };
+    let Ok(mut engine) = context.context.try_borrow_mut() else {
+        reentrant(context);
+        return;
+    };
+    engine.set_detach_key(&JsValue::from_bits(value), &JsValue::from_bits(key));
+}
+
+/// A typed array over `buffer` (`v8::Uint8Array::New` and its siblings).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn slag_typed_array_new(
+    context: *mut SlagContext,
+    kind: i32,
+    buffer: u64,
+    byte_offset: usize,
+    length: usize,
+    out: *mut u64,
+) -> i32 {
+    let Some(context) = context.as_mut() else {
+        return 2;
+    };
+    let Some(kind) = typed_array_kind(kind) else {
+        return 2;
+    };
+    let created = {
+        let Ok(mut engine) = context.context.try_borrow_mut() else {
+            reentrant(context);
+            return 1;
+        };
+        engine.create_typed_array(kind, &JsValue::from_bits(buffer), byte_offset, length)
+    };
+    match created {
+        Ok(value) => {
+            if !out.is_null() {
+                *out = value.to_bits();
+            }
+            0
+        }
+        Err(error) => {
+            record(context, error);
+            1
+        }
+    }
+}
+
+/// The buffer a typed array views (`v8::ArrayBufferView::Buffer`), written to
+/// `out`. Answers 0 for a view and 2 for a value that is not one.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn slag_typed_array_buffer(value: u64, out: *mut u64) -> i32 {
+    match slag::typed_array_info(&JsValue::from_bits(value)) {
+        Some(info) => {
+            if !out.is_null() {
+                *out = info.buffer.bits();
+            }
+            0
+        }
+        None => 2,
+    }
+}
+
+/// A typed array's byte offset, byte length, and element count
+/// (`v8::ArrayBufferView::ByteOffset`/`ByteLength` and `TypedArray::Length`).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn slag_typed_array_byte_offset(value: u64) -> usize {
+    slag::typed_array_info(&JsValue::from_bits(value)).map_or(0, |info| info.byte_offset)
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn slag_typed_array_byte_length(value: u64) -> usize {
+    slag::typed_array_info(&JsValue::from_bits(value)).map_or(0, |info| info.byte_length)
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn slag_typed_array_length(value: u64) -> usize {
+    slag::typed_array_info(&JsValue::from_bits(value)).map_or(0, |info| info.length)
+}
+
+/// Add `change` bytes to the host's external-memory account and answer the new
+/// account (`v8::Isolate::AdjustAmountOfExternalAllocatedMemory`). The engine's
+/// own buffer walk is added by the caller
+/// ([`slag_context_external_memory`]).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn slag_isolate_adjust_external_memory(
+    isolate: *mut SlagIsolate,
+    change: i64,
+) -> i64 {
+    let Some(isolate) = isolate.as_ref() else {
+        return 0;
+    };
+    let total = isolate.external_memory.get().saturating_add(change).max(0);
+    isolate.external_memory.set(total);
+    total
+}
+
+/// The bytes this realm's live buffers hold, without the host's account
+/// (`GetHeapStatistics`'s `external_memory` for one realm).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn slag_context_external_memory(context: *mut SlagContext) -> i64 {
+    match context
+        .as_ref()
+        .and_then(|context| context.context.try_borrow().ok())
+    {
+        Some(engine) => engine.external_memory(0),
+        None => 0,
+    }
+}
+
+fn typed_array_kind(kind: i32) -> Option<slag::TypedArrayKind> {
+    Some(match kind {
+        0 => slag::TypedArrayKind::Int8,
+        1 => slag::TypedArrayKind::Uint8,
+        2 => slag::TypedArrayKind::Uint8Clamped,
+        3 => slag::TypedArrayKind::Int16,
+        4 => slag::TypedArrayKind::Uint16,
+        5 => slag::TypedArrayKind::Int32,
+        6 => slag::TypedArrayKind::Uint32,
+        7 => slag::TypedArrayKind::Float16,
+        8 => slag::TypedArrayKind::Float32,
+        9 => slag::TypedArrayKind::Float64,
+        10 => slag::TypedArrayKind::BigInt64,
+        11 => slag::TypedArrayKind::BigUint64,
+        _ => return None,
+    })
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn slag_isolate_new() -> *mut SlagIsolate {
-    Box::into_raw(Box::new(SlagIsolate { _private: () }))
+    Box::into_raw(Box::new(SlagIsolate {
+        external_memory: std::cell::Cell::new(0),
+    }))
 }
 
 #[unsafe(no_mangle)]

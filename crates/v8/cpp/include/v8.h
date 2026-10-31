@@ -85,14 +85,8 @@ class V8 {
   static const char* GetVersion();
 };
 
-class ArrayBuffer {
- public:
-  class Allocator {
-   public:
-    virtual ~Allocator() = default;
-    static Allocator* NewDefaultAllocator();
-  };
-};
+/* `ArrayBuffer` derives from `Object`, so it is defined below; only pointers
+ * to it appear before that point (`Isolate::CreateParams`). */
 
 /*
  * The current execution state. The samples create one isolate and enter one
@@ -263,6 +257,8 @@ class Value {
   bool IsMap() const;
   bool IsSet() const;
   bool IsArrayBuffer() const;
+  bool IsSharedArrayBuffer() const;
+  bool IsDataView() const;
   bool IsNativeError() const;
 
   /* ToBoolean, `typeof`, and the coercions. `ToString`/`ToNumber`/`ToObject`
@@ -376,6 +372,180 @@ class Object : public Value {
     return static_cast<T*>(
         GetAlignedPointerFromInternalField(kWrappableFieldIndex));
   }
+};
+
+/* A block of buffer bytes (`v8::BackingStore`). The facade's store is a handle
+ * to the engine's refcounted block, so a store taken from a buffer keeps the
+ * bytes alive after the object that named them is gone. A new store is owned by
+ * the caller (`std::unique_ptr`); a store read off a buffer is shared
+ * (`std::shared_ptr`), the ownership V8's modern signatures use. */
+class BackingStore {
+ public:
+  ~BackingStore();
+
+  void* Data() const;
+  size_t ByteLength() const;
+  bool IsShared() const;
+  bool IsEmpty() const { return buffer_ == nullptr; }
+
+ private:
+  friend class ArrayBuffer;
+  friend class SharedArrayBuffer;
+
+  explicit BackingStore(SlagBuffer* buffer) : buffer_(buffer) {}
+
+  BackingStore(const BackingStore&) = delete;
+  BackingStore& operator=(const BackingStore&) = delete;
+
+  SlagBuffer* buffer_ = nullptr;
+};
+
+/* How a host releases memory it lent to a backing store
+ * (`v8::BackingStoreDeleterCallback`): the bytes, their length, and the host's
+ * own context pointer. */
+using BackingStoreDeleterCallback = void (*)(void* data, size_t length,
+                                             void* deleter_data);
+
+/* A JavaScript ArrayBuffer (`v8::ArrayBuffer`): either a new zeroed buffer, a
+ * buffer over a backing store, or the store behind an existing buffer. The
+ * host's external-memory account is told about the bytes through
+ * `Isolate::AdjustAmountOfExternalAllocatedMemory`, as in V8. */
+class ArrayBuffer : public Object {
+ public:
+  class Allocator {
+   public:
+    virtual ~Allocator() = default;
+    static Allocator* NewDefaultAllocator();
+  };
+
+  static Local<ArrayBuffer> New(Isolate* isolate, size_t byte_length);
+  static Local<ArrayBuffer> New(Isolate* isolate,
+                                std::shared_ptr<BackingStore> backing_store);
+
+  static std::unique_ptr<BackingStore> NewBackingStore(Isolate* isolate,
+                                                       size_t byte_length);
+  /* A store over memory the host owns. `deleter` runs once, when the last
+   * buffer and store over the bytes are gone. */
+  static std::unique_ptr<BackingStore> NewBackingStore(
+      void* data, size_t byte_length, BackingStoreDeleterCallback deleter,
+      void* deleter_data);
+
+  size_t ByteLength() const;
+  void* Data() const;
+  std::shared_ptr<BackingStore> GetBackingStore() const;
+
+  /* `Detach` answers false when the buffer is already detached or when `key`
+   * does not match its [[ArrayBufferDetachKey]]. */
+  bool Detach(Local<Value> key = Local<Value>());
+  bool IsDetachable() const;
+  bool WasDetached() const;
+  void SetDetachKey(Local<Value> key);
+};
+
+/* A JavaScript SharedArrayBuffer (`v8::SharedArrayBuffer`). */
+class SharedArrayBuffer : public Object {
+ public:
+  static Local<SharedArrayBuffer> New(Isolate* isolate, size_t byte_length);
+  static Local<SharedArrayBuffer> New(
+      Isolate* isolate, std::shared_ptr<BackingStore> backing_store);
+  static std::shared_ptr<BackingStore> NewBackingStore(Isolate* isolate,
+                                                       size_t byte_length);
+
+  size_t ByteLength() const;
+  void* Data() const;
+  std::shared_ptr<BackingStore> GetBackingStore() const;
+};
+
+/* A view over a buffer (`v8::ArrayBufferView`). `Buffer()` is empty for a view
+ * over a SharedArrayBuffer, which the `.Buffer()` callers check with
+ * `HasBuffer()`. */
+class ArrayBufferView : public Object {
+ public:
+  size_t ByteLength() const;
+  size_t ByteOffset() const;
+  bool HasBuffer() const;
+  Local<ArrayBuffer> Buffer() const;
+};
+
+/* An Integer-Indexed view (`v8::TypedArray`). */
+class TypedArray : public ArrayBufferView {
+ public:
+  size_t Length() const;
+};
+
+/* The twelve typed array constructors. Each `New` validates the byte geometry
+ * against the buffer in the engine, so a range that does not fit leaves the
+ * RangeError (or the detached TypeError) pending in the isolate. */
+class Int8Array : public TypedArray {
+ public:
+  static Local<Int8Array> New(Local<ArrayBuffer> array_buffer,
+                              size_t byte_offset, size_t length);
+};
+
+class Uint8Array : public TypedArray {
+ public:
+  static Local<Uint8Array> New(Local<ArrayBuffer> array_buffer,
+                               size_t byte_offset, size_t length);
+};
+
+class Uint8ClampedArray : public TypedArray {
+ public:
+  static Local<Uint8ClampedArray> New(Local<ArrayBuffer> array_buffer,
+                                      size_t byte_offset, size_t length);
+};
+
+class Int16Array : public TypedArray {
+ public:
+  static Local<Int16Array> New(Local<ArrayBuffer> array_buffer,
+                               size_t byte_offset, size_t length);
+};
+
+class Uint16Array : public TypedArray {
+ public:
+  static Local<Uint16Array> New(Local<ArrayBuffer> array_buffer,
+                                size_t byte_offset, size_t length);
+};
+
+class Int32Array : public TypedArray {
+ public:
+  static Local<Int32Array> New(Local<ArrayBuffer> array_buffer,
+                               size_t byte_offset, size_t length);
+};
+
+class Uint32Array : public TypedArray {
+ public:
+  static Local<Uint32Array> New(Local<ArrayBuffer> array_buffer,
+                                size_t byte_offset, size_t length);
+};
+
+class Float16Array : public TypedArray {
+ public:
+  static Local<Float16Array> New(Local<ArrayBuffer> array_buffer,
+                                 size_t byte_offset, size_t length);
+};
+
+class Float32Array : public TypedArray {
+ public:
+  static Local<Float32Array> New(Local<ArrayBuffer> array_buffer,
+                                 size_t byte_offset, size_t length);
+};
+
+class Float64Array : public TypedArray {
+ public:
+  static Local<Float64Array> New(Local<ArrayBuffer> array_buffer,
+                                 size_t byte_offset, size_t length);
+};
+
+class BigInt64Array : public TypedArray {
+ public:
+  static Local<BigInt64Array> New(Local<ArrayBuffer> array_buffer,
+                                  size_t byte_offset, size_t length);
+};
+
+class BigUint64Array : public TypedArray {
+ public:
+  static Local<BigUint64Array> New(Local<ArrayBuffer> array_buffer,
+                                   size_t byte_offset, size_t length);
 };
 
 /* A JavaScript array (`v8::Array`). The element forms are the ones a handler
@@ -878,6 +1048,11 @@ class Isolate {
   /* Drain the job queues now (`Isolate::PerformMicrotaskCheckpoint`). */
   void PerformMicrotaskCheckpoint();
 
+  /* Add `change` bytes to the host's external-memory account and answer the new
+   * total, the engine's live buffer bytes included
+   * (`Isolate::AdjustAmountOfExternalAllocatedMemory`). */
+  int64_t AdjustAmountOfExternalAllocatedMemory(int64_t change);
+
   /* When the job queues drain (`Isolate::SetMicrotasksPolicy`). `kAuto` is the
    * default: a successful `Script::Run` drains when it returns. */
   void SetMicrotasksPolicy(MicrotasksPolicy policy) {
@@ -910,6 +1085,28 @@ class Isolate {
 
   friend class Context;
   friend bool platform::PumpMessageLoop(Platform*, Isolate*);
+};
+
+/* The host's external-memory account scoped to an object's lifetime
+ * (`v8::ExternalMemoryAccounter`): `Update` keeps one number, and the
+ * destructor gives back whatever is still recorded. The account belongs to one
+ * isolate; switching isolates is not supported, as in V8. */
+class ExternalMemoryAccounter {
+ public:
+  ExternalMemoryAccounter() = default;
+  explicit ExternalMemoryAccounter(size_t size) : size_(size) {}
+  ~ExternalMemoryAccounter();
+
+  ExternalMemoryAccounter(const ExternalMemoryAccounter&) = delete;
+  ExternalMemoryAccounter& operator=(const ExternalMemoryAccounter&) = delete;
+
+  void Update(Isolate* isolate, size_t size);
+  void Increase(Isolate* isolate, size_t size);
+  void Decrease(Isolate* isolate, size_t size);
+
+ private:
+  Isolate* isolate_ = nullptr;
+  size_t size_ = 0;
 };
 
 /*

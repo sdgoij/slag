@@ -40,6 +40,11 @@ pub use crux::host::HostOps;
 pub use external::External;
 pub use handle::{EscapableHandleScope, Global, HandleScope, Local, MaybeLocal, Traced, Weak};
 pub use heap::HeapStatistics;
+
+/// The external-memory total for an agent plus the host's own account, shared
+/// with the embedding API (`embed::Context::external_memory`) so the two faces
+/// report one number.
+pub(crate) use heap::external_memory_of;
 pub use json::Json;
 pub use microtask::MicrotasksPolicy;
 pub use module::{

@@ -261,6 +261,32 @@ answers a string value (`typeof null` is `"object"`). `StrictEquals` is `===`
 (NaN differs from itself) and `SameValue` is `Object.is` (NaN equals itself,
 `+0` and `-0` differ).
 
+### Buffers and typed arrays
+
+`BackingStore` is a handle to the engine's refcounted byte block, so a store
+taken from a buffer keeps the bytes alive after the object naming them is gone.
+`ArrayBuffer::New(Isolate*, size_t)` makes a zeroed buffer, `New(isolate, store)`
+wraps a store, and `NewBackingStore` makes a fresh store or one over memory the
+host owns with a `BackingStoreDeleterCallback`. `ByteLength`, `Data`,
+`GetBackingStore`, `Detach`, `IsDetachable`, `WasDetached`, and `SetDetachKey`
+are the buffer's own surface; `SharedArrayBuffer` repeats the creation and read
+forms. The engine validates a typed array's geometry in `Uint8Array::New` and
+its eleven siblings, so a misaligned offset or a range past the end leaves the
+RangeError pending and answers an empty handle.
+
+The bytes are shared, not copied: a host writing through `Data()` or a store is
+what a script reading a view sees, and the reverse. `ArrayBufferView` gives
+`ByteLength`, `ByteOffset`, `HasBuffer`, and `Buffer` (`HasBuffer` is false for
+a view over a `SharedArrayBuffer`, matching V8), and `TypedArray::Length` is the
+element count. `IsDataView`, `IsArrayBuffer`, and `IsSharedArrayBuffer` join the
+value predicates.
+
+`Isolate::AdjustAmountOfExternalAllocatedMemory` adds the host's account to the
+engine's walk of live buffer bytes and answers the total. `ExternalMemoryAccounter`
+is the scoped form. As the Rust bridge documents, the number is reported rather
+than consulted: this engine's collections are paced by its own growth policy, so
+an adjustment does not trigger one.
+
 ## The gin target
 
 Actual `gin` cannot be built standalone. `gin/BUILD.gn` has public deps
@@ -320,6 +346,13 @@ not a claim that gin itself links.
 - The `Value` predicates and conversions: `IsUndefined` through `IsNativeError`,
   `Object::IsCallable`/`IsConstructor`, `BooleanValue`, `TypeOf`, `ToString`,
   `ToNumber`, `ToObject`, `StrictEquals`, `SameValue`, and `Local::operator==`.
+- `ArrayBuffer` and `SharedArrayBuffer` (creation, `ByteLength`, `Data`,
+  `GetBackingStore`, and the detach protocol), `BackingStore` (fresh and
+  host-owned, with a deleter), and the `ArrayBufferView`/`TypedArray` hierarchy
+  with `New` for all twelve element kinds.
+- `Isolate::AdjustAmountOfExternalAllocatedMemory` and
+  `ExternalMemoryAccounter`, over the engine's live-buffer walk plus the host's
+  account.
 - Handles and persistents as engine roots: a handle slot or a `Global` over an
   engine value retains it for that object's lifetime, and a facade pointer is
   never registered.
@@ -349,6 +382,12 @@ not a claim that gin itself links.
   they answer false. V8 reads the isolate off the handle's location instead, so
   a host that keeps a value outside every scope and asks its brand gets a
   different answer here.
+- `DataView` itself is absent: `Value::IsDataView` answers, but there is no
+  `v8::DataView::New`. Resizable and growable buffers can be created from a
+  script, not from the facade, so `New` has no maximum-byte-length form yet.
+- `ArrayBuffer::New` needs an entered `Context::Scope` because the engine
+  allocates in a realm; V8 takes the isolate alone. `BackingStore::Data` is the
+  block's live base, so a caller must not hold the pointer across a resize.
 - `Platform` is a handle plus a message pump: `PumpMessageLoop` runs the
   isolate's queued jobs (microtasks, promise reactions, due timers) and answers
   whether it ran any. There are no host-posted platform tasks or task runners
@@ -409,4 +448,7 @@ shape and brand bits for objects, arrays, functions, numbers, strings, symbols,
 bigints, dates, regexps, promises, maps, sets, errors, typed arrays, array
 buffers, proxies, and arguments objects, plus the `StrictEquals`/`SameValue`
 differences on `NaN` and the two zeroes, `BooleanValue`, `TypeOf`, and the three
-coercions.
+coercions. Its buffer block writes through an `ArrayBuffer`, a `BackingStore`,
+and a `Uint8Array` and reads the bytes back from the script, then checks the
+view geometry, the out-of-range RangeError, `GetBackingStore`, detach with and
+without a key, `SharedArrayBuffer`, and the external-memory account.

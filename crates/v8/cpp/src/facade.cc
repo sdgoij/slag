@@ -503,6 +503,14 @@ bool Value::IsArrayBuffer() const {
   return (TypeMaskOf(this) & SLAG_VALUE_ARRAY_BUFFER) != 0;
 }
 
+bool Value::IsSharedArrayBuffer() const {
+  return (TypeMaskOf(this) & SLAG_VALUE_SHARED_ARRAY_BUFFER) != 0;
+}
+
+bool Value::IsDataView() const {
+  return (TypeMaskOf(this) & SLAG_VALUE_DATA_VIEW) != 0;
+}
+
 bool Value::IsNativeError() const {
   return (TypeMaskOf(this) & SLAG_VALUE_NATIVE_ERROR) != 0;
 }
@@ -560,6 +568,220 @@ bool Object::IsCallable() const { return slag_value_is_callable(Raw(this)) != 0;
 
 bool Object::IsConstructor() const {
   return slag_value_is_constructor(CurrentSlagContext(), Raw(this)) != 0;
+}
+
+BackingStore::~BackingStore() { slag_buffer_free(buffer_); }
+
+void* BackingStore::Data() const { return slag_buffer_data(buffer_); }
+
+size_t BackingStore::ByteLength() const {
+  return slag_buffer_byte_length(buffer_);
+}
+
+bool BackingStore::IsShared() const {
+  return slag_buffer_is_shared(buffer_) != 0;
+}
+
+Local<ArrayBuffer> ArrayBuffer::New(Isolate*, size_t byte_length) {
+  SlagBuffer* store = slag_buffer_new(byte_length);
+  uint64_t out = 0;
+  const int32_t created =
+      slag_buffer_to_array_buffer(CurrentSlagContext(), store, &out);
+  slag_buffer_free(store);
+  return created == 0 ? Local<ArrayBuffer>::New(out) : Local<ArrayBuffer>();
+}
+
+Local<ArrayBuffer> ArrayBuffer::New(Isolate*,
+                                    std::shared_ptr<BackingStore> backing_store) {
+  if (!backing_store) return Local<ArrayBuffer>();
+  uint64_t out = 0;
+  const int32_t created = slag_buffer_to_array_buffer(
+      CurrentSlagContext(), backing_store->buffer_, &out);
+  return created == 0 ? Local<ArrayBuffer>::New(out) : Local<ArrayBuffer>();
+}
+
+std::unique_ptr<BackingStore> ArrayBuffer::NewBackingStore(Isolate*,
+                                                          size_t byte_length) {
+  return std::unique_ptr<BackingStore>(
+      new BackingStore(slag_buffer_new(byte_length)));
+}
+
+std::unique_ptr<BackingStore> ArrayBuffer::NewBackingStore(
+    void* data, size_t byte_length, BackingStoreDeleterCallback deleter,
+    void* deleter_data) {
+  return std::unique_ptr<BackingStore>(new BackingStore(slag_buffer_borrowed(
+      static_cast<uint8_t*>(data), byte_length, deleter, deleter_data)));
+}
+
+size_t ArrayBuffer::ByteLength() const {
+  return slag_array_buffer_byte_length(CurrentSlagContext(), Raw(this));
+}
+
+void* ArrayBuffer::Data() const {
+  return slag_array_buffer_data(CurrentSlagContext(), Raw(this));
+}
+
+std::shared_ptr<BackingStore> ArrayBuffer::GetBackingStore() const {
+  SlagBuffer* store = slag_buffer_of(CurrentSlagContext(), Raw(this));
+  if (store == nullptr) return std::shared_ptr<BackingStore>();
+  return std::shared_ptr<BackingStore>(new BackingStore(store));
+}
+
+bool ArrayBuffer::Detach(Local<Value> key) {
+  const bool has_key = !key.IsEmpty();
+  return slag_array_buffer_detach(CurrentSlagContext(), Raw(this),
+                                  has_key ? key.raw() : 0,
+                                  has_key ? 1 : 0) != 0;
+}
+
+bool ArrayBuffer::IsDetachable() const {
+  return slag_array_buffer_is_detachable(CurrentSlagContext(), Raw(this)) != 0;
+}
+
+bool ArrayBuffer::WasDetached() const {
+  return slag_array_buffer_is_detached(CurrentSlagContext(), Raw(this)) != 0;
+}
+
+void ArrayBuffer::SetDetachKey(Local<Value> key) {
+  slag_array_buffer_set_detach_key(CurrentSlagContext(), Raw(this),
+                                   key.IsEmpty() ? slag_undefined() : key.raw());
+}
+
+Local<SharedArrayBuffer> SharedArrayBuffer::New(Isolate*, size_t byte_length) {
+  SlagBuffer* store = slag_buffer_new(byte_length);
+  uint64_t out = 0;
+  const int32_t created =
+      slag_shared_array_buffer_new(CurrentSlagContext(), store, &out);
+  slag_buffer_free(store);
+  return created == 0 ? Local<SharedArrayBuffer>::New(out)
+                      : Local<SharedArrayBuffer>();
+}
+
+Local<SharedArrayBuffer> SharedArrayBuffer::New(
+    Isolate*, std::shared_ptr<BackingStore> backing_store) {
+  if (!backing_store) return Local<SharedArrayBuffer>();
+  uint64_t out = 0;
+  const int32_t created = slag_shared_array_buffer_new(
+      CurrentSlagContext(), backing_store->buffer_, &out);
+  return created == 0 ? Local<SharedArrayBuffer>::New(out)
+                      : Local<SharedArrayBuffer>();
+}
+
+std::shared_ptr<BackingStore> SharedArrayBuffer::NewBackingStore(
+    Isolate*, size_t byte_length) {
+  return std::shared_ptr<BackingStore>(
+      new BackingStore(slag_buffer_new(byte_length)));
+}
+
+size_t SharedArrayBuffer::ByteLength() const {
+  return slag_array_buffer_byte_length(CurrentSlagContext(), Raw(this));
+}
+
+void* SharedArrayBuffer::Data() const {
+  return slag_array_buffer_data(CurrentSlagContext(), Raw(this));
+}
+
+std::shared_ptr<BackingStore> SharedArrayBuffer::GetBackingStore() const {
+  SlagBuffer* store = slag_buffer_of(CurrentSlagContext(), Raw(this));
+  if (store == nullptr) return std::shared_ptr<BackingStore>();
+  return std::shared_ptr<BackingStore>(new BackingStore(store));
+}
+
+size_t ArrayBufferView::ByteLength() const {
+  return slag_typed_array_byte_length(Raw(this));
+}
+
+size_t ArrayBufferView::ByteOffset() const {
+  return slag_typed_array_byte_offset(Raw(this));
+}
+
+bool ArrayBufferView::HasBuffer() const {
+  uint64_t buffer = 0;
+  if (slag_typed_array_buffer(Raw(this), &buffer) != 0) return false;
+  return !Local<Value>::New(buffer)->IsSharedArrayBuffer();
+}
+
+Local<ArrayBuffer> ArrayBufferView::Buffer() const {
+  uint64_t buffer = 0;
+  if (slag_typed_array_buffer(Raw(this), &buffer) != 0) {
+    return Local<ArrayBuffer>();
+  }
+  if (Local<Value>::New(buffer)->IsSharedArrayBuffer()) {
+    return Local<ArrayBuffer>();
+  }
+  return Local<ArrayBuffer>::New(buffer);
+}
+
+size_t TypedArray::Length() const { return slag_typed_array_length(Raw(this)); }
+
+namespace {
+
+/* One constructor body for the twelve typed arrays: the engine validates the
+ * geometry, so a range that does not fit leaves the error pending and answers
+ * an empty handle here. */
+template <class T>
+Local<T> NewTypedArray(int32_t kind, Local<ArrayBuffer> buffer, size_t byte_offset,
+                       size_t length) {
+  uint64_t out = 0;
+  if (slag_typed_array_new(CurrentSlagContext(), kind, buffer.raw(), byte_offset,
+                           length, &out) != 0) {
+    return Local<T>();
+  }
+  return Local<T>::New(out);
+}
+
+}  // namespace
+
+#define SLAG_TYPED_ARRAY_NEW(Class, Kind)                                  \
+  Local<Class> Class::New(Local<ArrayBuffer> array_buffer, size_t byte_offset, \
+                          size_t length) {                                 \
+    return NewTypedArray<Class>(Kind, array_buffer, byte_offset, length);    \
+  }
+
+SLAG_TYPED_ARRAY_NEW(Int8Array, SLAG_TYPED_INT8)
+SLAG_TYPED_ARRAY_NEW(Uint8Array, SLAG_TYPED_UINT8)
+SLAG_TYPED_ARRAY_NEW(Uint8ClampedArray, SLAG_TYPED_UINT8_CLAMPED)
+SLAG_TYPED_ARRAY_NEW(Int16Array, SLAG_TYPED_INT16)
+SLAG_TYPED_ARRAY_NEW(Uint16Array, SLAG_TYPED_UINT16)
+SLAG_TYPED_ARRAY_NEW(Int32Array, SLAG_TYPED_INT32)
+SLAG_TYPED_ARRAY_NEW(Uint32Array, SLAG_TYPED_UINT32)
+SLAG_TYPED_ARRAY_NEW(Float16Array, SLAG_TYPED_FLOAT16)
+SLAG_TYPED_ARRAY_NEW(Float32Array, SLAG_TYPED_FLOAT32)
+SLAG_TYPED_ARRAY_NEW(Float64Array, SLAG_TYPED_FLOAT64)
+SLAG_TYPED_ARRAY_NEW(BigInt64Array, SLAG_TYPED_BIGINT64)
+SLAG_TYPED_ARRAY_NEW(BigUint64Array, SLAG_TYPED_BIGUINT64)
+
+#undef SLAG_TYPED_ARRAY_NEW
+
+int64_t Isolate::AdjustAmountOfExternalAllocatedMemory(int64_t change) {
+  int64_t total = slag_isolate_adjust_external_memory(this->slag_, change);
+  for (Context* context : contexts_) {
+    if (context == nullptr) continue;
+    total += slag_context_external_memory(context->slag());
+  }
+  return total < 0 ? 0 : total;
+}
+
+ExternalMemoryAccounter::~ExternalMemoryAccounter() {
+  if (isolate_ != nullptr) {
+    isolate_->AdjustAmountOfExternalAllocatedMemory(
+        -static_cast<int64_t>(size_));
+  }
+}
+
+void ExternalMemoryAccounter::Update(Isolate* isolate, size_t size) {
+  isolate_ = isolate;
+  isolate->AdjustAmountOfExternalAllocatedMemory(
+      static_cast<int64_t>(size) - static_cast<int64_t>(size_));
+  size_ = size;
+}
+
+void ExternalMemoryAccounter::Increase(Isolate* isolate, size_t size) {
+  Update(isolate, size_ + size);
+}
+
+void ExternalMemoryAccounter::Decrease(Isolate* isolate, size_t size) {
+  Update(isolate, size_ > size ? size_ - size : 0);
 }
 
 int Object::InternalFieldCount() const {

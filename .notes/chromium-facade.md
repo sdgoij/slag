@@ -785,6 +785,41 @@ and the arrow/method/generator narrowing. The known narrowing is that a brand
 asked with no `Context::Scope` on the stack answers false, where V8 would read
 the isolate off the handle location.
 
+*Buffers and typed arrays (2026-10-31).* `ArrayBuffer`, `SharedArrayBuffer`,
+`BackingStore`, and the `ArrayBufferView`/`TypedArray` hierarchy are in, so the
+bytes side of the boundary is real rather than a stub. The engine already had
+the storage: `SharedBuffer` is a refcounted block, `BufferState` holds the
+length, the shared/detached/resizable flags, and the detach key, and
+`typed_array_buffer_path` is the constructor the language's own `new
+Uint8Array(buffer, offset, length)` runs. The facade's job was to expose them.
+
+`BackingStore` is a C++ handle to a cloned `SharedBuffer`, so a store read off a
+buffer outlives the object that named it and a host that writes through the
+store writes what a script reads. A host-owned block goes through
+`SharedBuffer::borrowed` with the C deleter boxed as its `FnOnce`, so the
+release happens exactly once, when the last buffer and store are gone. Every
+typed array `New` delegates to the language constructor, which means the
+alignment and bounds checks are the engine's own RangeError rather than a second
+implementation in the facade; an out-of-range range answers an empty handle with
+the error pending, which is what a V8 host's `MaybeLocal` check expects.
+
+The detach protocol is the engine's: `Detach()` runs
+`detach_array_buffer_with_key` with `undefined`, so a buffer with a
+[[ArrayBufferDetachKey]] refuses it and `Detach(key)` is the only way through;
+`WasDetached`/`ByteLength`/`Data` read the live state, and a view over a
+detached buffer reports length zero at offset zero.
+
+External memory needed one refactor: `api::heap` computed the buffer walk inline
+for the Rust bridge's `Isolate::GetHeapStatistics`, and the C++ isolate is a
+different type, so the walk moved into `external_memory_of(agent, adjustment)`.
+`Isolate::AdjustAmountOfExternalAllocatedMemory` keeps the host's account on the
+`SlagIsolate` box and adds each context's buffer bytes, which is what makes the
+number the same one the Rust bridge reports. As there, the number is reported
+rather than consulted: this engine's collections are paced by its own growth
+policy. What the rung leaves out is `DataView::New` (the predicate is there),
+the resizable/growable creation forms, and `ArrayBuffer::Allocator` actually
+backing the engine's allocations (it is still a type the samples delete).
+
 The ABI shape is roughly a struct of up to seven C function pointers, the data
 pointer, and the flags, handed over once per template, with the return codes
 `Intercepted` already defines; the callbacks receive a `PropertyCallbackInfo`

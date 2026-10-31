@@ -17,8 +17,9 @@ pub use crux::error::{ErrorKind, JsError};
 pub use runtime::HostHooks;
 pub use runtime::dump;
 pub use runtime::embed::{
-    CallbackWindow, CompiledScript, Context, FunctionCall, HostCallbacks, HostFn, JsObject,
-    JsValue, OwnProperty, value_is_constructor, value_type_mask,
+    BufferInfo, CallbackWindow, CompiledScript, Context, FunctionCall, HostCallbacks, HostFn,
+    JsObject, JsValue, OwnProperty, TypedArrayInfo, TypedArrayKind, buffer_info, typed_array_info,
+    value_is_constructor, value_type_mask,
 };
 pub use runtime::embed::{OutputFn, RandomFn};
 

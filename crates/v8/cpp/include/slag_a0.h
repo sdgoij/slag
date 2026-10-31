@@ -14,6 +14,7 @@ typedef struct SlagIsolate SlagIsolate;
 typedef struct SlagContext SlagContext;
 typedef struct SlagScript SlagScript;
 typedef struct SlagTraced SlagTraced;
+typedef struct SlagBuffer SlagBuffer;
 
 typedef uint64_t (*slag_host_fn)(void* data, const void* call, uint64_t this_value,
                                  const uint64_t* args, size_t len);
@@ -61,6 +62,8 @@ enum SlagValueType {
   SLAG_VALUE_SET = 1 << 20,
   SLAG_VALUE_ARRAY_BUFFER = 1 << 21,
   SLAG_VALUE_NATIVE_ERROR = 1 << 22,
+  SLAG_VALUE_SHARED_ARRAY_BUFFER = 1 << 23,
+  SLAG_VALUE_DATA_VIEW = 1 << 24,
 };
 
 /* A property descriptor as the definer callback receives it
@@ -171,6 +174,61 @@ int32_t slag_traced_is_empty(const SlagTraced* traced);
 SlagTraced* slag_traced_clone(const SlagTraced* traced);
 void slag_traced_reset(SlagTraced* traced);
 void slag_traced_free(SlagTraced* traced);
+
+/* A block of buffer bytes the host holds independently of a JavaScript buffer
+ * (v8::BackingStore). The storage is shared with any buffer built over it, so
+ * freeing this handle does not free bytes a live buffer still names. */
+typedef void (*SlagBufferDeleter)(void* data, size_t byte_length, void* deleter_data);
+SlagBuffer* slag_buffer_new(size_t byte_length);
+SlagBuffer* slag_buffer_borrowed(void* data, size_t byte_length,
+                                SlagBufferDeleter deleter, void* deleter_data);
+void* slag_buffer_data(const SlagBuffer* buffer);
+size_t slag_buffer_byte_length(const SlagBuffer* buffer);
+int32_t slag_buffer_is_shared(const SlagBuffer* buffer);
+int32_t slag_buffer_is_resizable(const SlagBuffer* buffer);
+int32_t slag_buffer_is_borrowed(const SlagBuffer* buffer);
+void slag_buffer_free(SlagBuffer* buffer);
+int32_t slag_buffer_to_array_buffer(SlagContext* context, const SlagBuffer* buffer,
+                                    uint64_t* out);
+SlagBuffer* slag_buffer_of(SlagContext* context, uint64_t value);
+size_t slag_array_buffer_byte_length(SlagContext* context, uint64_t value);
+void* slag_array_buffer_data(SlagContext* context, uint64_t value);
+int32_t slag_array_buffer_is_detached(SlagContext* context, uint64_t value);
+int32_t slag_array_buffer_is_detachable(SlagContext* context, uint64_t value);
+int32_t slag_shared_array_buffer_new(SlagContext* context, const SlagBuffer* buffer,
+                                     uint64_t* out);
+
+/* The typed array kinds (`v8::Uint8Array` and its siblings). */
+enum SlagTypedArrayKind {
+  SLAG_TYPED_INT8 = 0,
+  SLAG_TYPED_UINT8 = 1,
+  SLAG_TYPED_UINT8_CLAMPED = 2,
+  SLAG_TYPED_INT16 = 3,
+  SLAG_TYPED_UINT16 = 4,
+  SLAG_TYPED_INT32 = 5,
+  SLAG_TYPED_UINT32 = 6,
+  SLAG_TYPED_FLOAT16 = 7,
+  SLAG_TYPED_FLOAT32 = 8,
+  SLAG_TYPED_FLOAT64 = 9,
+  SLAG_TYPED_BIGINT64 = 10,
+  SLAG_TYPED_BIGUINT64 = 11,
+};
+int32_t slag_typed_array_new(SlagContext* context, int32_t kind, uint64_t buffer,
+                            size_t byte_offset, size_t length, uint64_t* out);
+int32_t slag_typed_array_buffer(uint64_t value, uint64_t* out);
+size_t slag_typed_array_byte_offset(uint64_t value);
+size_t slag_typed_array_byte_length(uint64_t value);
+size_t slag_typed_array_length(uint64_t value);
+
+/* The host's external-memory account (`AdjustAmountOfExternalAllocatedMemory`)
+ * and one realm's buffer bytes, which the facade adds to it. */
+int64_t slag_isolate_adjust_external_memory(SlagIsolate* isolate, int64_t change);
+int64_t slag_context_external_memory(SlagContext* context);
+
+int32_t slag_array_buffer_detach(SlagContext* context, uint64_t value, uint64_t key,
+                                int32_t has_key);
+void slag_array_buffer_set_detach_key(SlagContext* context, uint64_t value, uint64_t key);
+
 int32_t slag_collect(SlagContext* context);
 int64_t slag_value_to_utf8(uint64_t value, char* buffer, size_t len);
 int64_t slag_value_to_utf8_context(SlagContext* context, uint64_t value,
