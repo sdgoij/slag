@@ -67,8 +67,14 @@ uint64_t HostTrampoline(void* data, const void* call, uint64_t this_value,
   auto* function = static_cast<v8::FunctionTemplate*>(data);
   v8::FunctionCallbackInfo<v8::Value> info(v8::g_current_isolate, call,
                                            this_value, args,
-                                           static_cast<int>(len));
+                                           static_cast<int>(len),
+                                           function->data().raw());
+  // A host callback may allocate or write through the entry points, which are
+  // not re-entered from a callback unless the token names the running window.
+  const void* previous = g_callback_token;
+  g_callback_token = slag_callback_token();
   function->callback()(info);
+  g_callback_token = previous;
   return info.return_value();
 }
 
@@ -614,6 +620,229 @@ bool Object::IsCallable() const { return slag_value_is_callable(Raw(this)) != 0;
 bool Object::IsConstructor() const {
   return slag_value_is_constructor(CurrentSlagContext(), Raw(this)) != 0;
 }
+
+Local<Value> Object::GetPrototype() {
+  SlagContext* slag = CurrentSlagContext();
+  uint64_t out = 0;
+  if (slag == nullptr || slag_object_prototype(slag, Raw(this), &out) != 0) {
+    return Local<Value>();
+  }
+  return Local<Value>::New(out);
+}
+
+bool Object::SetPrototype(Local<Context> context, Local<Value> prototype) {
+  if (context.IsEmpty()) return false;
+  auto* current = reinterpret_cast<Context*>(
+      static_cast<uintptr_t>(context.raw()));
+  return slag_object_set_prototype(current->slag(), Raw(this),
+                                   prototype.IsEmpty() ? slag_null()
+                                                       : prototype.raw()) != 0;
+}
+
+MaybeLocal<Value> Function::Call(Local<Context> context, Local<Value> recv,
+                                 int argc, Local<Value> argv[]) {
+  if (context.IsEmpty()) return MaybeLocal<Value>();
+  auto* current = reinterpret_cast<Context*>(
+      static_cast<uintptr_t>(context.raw()));
+  std::vector<uint64_t> args;
+  args.reserve(argc < 0 ? 0 : static_cast<size_t>(argc));
+  for (int i = 0; i < argc; ++i) args.push_back(argv[i].raw());
+  uint64_t out = 0;
+  if (slag_call(current->slag(), Raw(this),
+                recv.IsEmpty() ? slag_undefined() : recv.raw(), args.data(),
+                args.size(), &out) != 0) {
+    return MaybeLocal<Value>();
+  }
+  return Local<Value>::New(out);
+}
+
+MaybeLocal<Object> Function::NewInstance(Local<Context> context, int argc,
+                                         Local<Value> argv[]) {
+  if (context.IsEmpty()) return MaybeLocal<Object>();
+  auto* current = reinterpret_cast<Context*>(
+      static_cast<uintptr_t>(context.raw()));
+  std::vector<uint64_t> args;
+  args.reserve(argc < 0 ? 0 : static_cast<size_t>(argc));
+  for (int i = 0; i < argc; ++i) args.push_back(argv[i].raw());
+  uint64_t out = 0;
+  if (slag_construct(current->slag(), Raw(this), args.data(), args.size(),
+                     &out) != 0) {
+    return MaybeLocal<Object>();
+  }
+  return Local<Object>::New(out);
+}
+
+Local<Function> Function::New(Local<Context> context, FunctionCallback callback,
+                              Local<Value> data, int length,
+                              ConstructorBehavior behavior,
+                              SideEffectType side_effect_type) {
+  v8::Local<v8::FunctionTemplate> tmpl = v8::FunctionTemplate::New(
+      g_current_isolate, callback, data, v8::Local<v8::Signature>(), length,
+      behavior, side_effect_type);
+  v8::Local<v8::Function> function;
+  if (tmpl.IsEmpty() || !tmpl->GetFunction(context).ToLocal(&function)) {
+    return Local<Function>();
+  }
+  return function;
+}
+
+Local<Signature> Signature::New(Isolate*, Local<FunctionTemplate> function) {
+  if (function.IsEmpty()) return Local<Signature>();
+  auto* signature = new Signature(reinterpret_cast<FunctionTemplate*>(
+      static_cast<uintptr_t>(function.raw())));
+  return Local<Signature>::New(reinterpret_cast<uint64_t>(signature));
+}
+
+Local<FunctionTemplate> Signature::GetFunctionTemplate() const {
+  if (function_ == nullptr) return Local<FunctionTemplate>();
+  return Local<FunctionTemplate>::New(reinterpret_cast<uint64_t>(function_));
+}
+
+Local<AccessorSignature> AccessorSignature::New(Isolate*,
+                                                Local<FunctionTemplate>) {
+  return Local<AccessorSignature>::New(
+      reinterpret_cast<uint64_t>(new AccessorSignature()));
+}
+
+Local<FunctionTemplate> FunctionTemplate::New(
+    Isolate*, FunctionCallback callback, Local<Value> data, Local<Signature>,
+    int length, ConstructorBehavior behavior, SideEffectType) {
+  auto* tmpl = new FunctionTemplate(callback);
+  tmpl->data_bits_ = data.IsEmpty() ? slag_undefined() : data.raw();
+  slag_root_retain(tmpl->data_bits_);
+  tmpl->length_ = length;
+  tmpl->allow_construction_ = behavior != ConstructorBehavior::kThrow;
+  return Local<FunctionTemplate>::New(reinterpret_cast<uint64_t>(tmpl));
+}
+
+void FunctionTemplate::SetCallHandler(FunctionCallback callback,
+                                      Local<Value> data) {
+  callback_ = callback;
+  if (data_bits_ != 0) slag_root_release(data_bits_);
+  data_bits_ = data.IsEmpty() ? slag_undefined() : data.raw();
+  slag_root_retain(data_bits_);
+}
+
+void FunctionTemplate::SetClassName(const char* name) {
+  class_name_ = name == nullptr ? std::string() : std::string(name);
+}
+
+void FunctionTemplate::Inherit(Local<FunctionTemplate> parent) {
+  parent_ = parent.IsEmpty()
+                ? nullptr
+                : reinterpret_cast<FunctionTemplate*>(
+                      static_cast<uintptr_t>(parent.raw()));
+}
+
+Local<ObjectTemplate> FunctionTemplate::InstanceTemplate() {
+  if (instance_template_ == nullptr) {
+    Local<ObjectTemplate> created = ObjectTemplate::New(g_current_isolate);
+    instance_template_ = reinterpret_cast<ObjectTemplate*>(
+        static_cast<uintptr_t>(created.raw()));
+  }
+  return Local<ObjectTemplate>::New(
+      reinterpret_cast<uint64_t>(instance_template_));
+}
+
+Local<ObjectTemplate> FunctionTemplate::PrototypeTemplate() {
+  if (prototype_template_ == nullptr) {
+    Local<ObjectTemplate> created = ObjectTemplate::New(g_current_isolate);
+    prototype_template_ = reinterpret_cast<ObjectTemplate*>(
+        static_cast<uintptr_t>(created.raw()));
+  }
+  return Local<ObjectTemplate>::New(
+      reinterpret_cast<uint64_t>(prototype_template_));
+}
+
+MaybeLocal<Function> FunctionTemplate::GetFunction(Local<Context> context) {
+  if (context.IsEmpty()) return MaybeLocal<Function>();
+  auto* current = reinterpret_cast<Context*>(
+      static_cast<uintptr_t>(context.raw()));
+  Local<Object> prototype;
+  if (!BuildPrototypeObject(context).ToLocal(&prototype)) {
+    return MaybeLocal<Function>();
+  }
+  const std::string name =
+      class_name_.empty() ? "FunctionTemplate" : class_name_;
+  uint64_t out = 0;
+  Local<ObjectTemplate> instance = InstanceTemplate();
+  if (slag_template_constructor(
+          current->slag(), reinterpret_cast<const uint8_t*>(name.data()),
+          name.size(), static_cast<uint32_t>(length_), prototype.raw(),
+          static_cast<size_t>(instance->InternalFieldCount()), 1,
+          allow_construction_ ? 1 : 0, &HostTrampoline, this, &out) != 0) {
+    return MaybeLocal<Function>();
+  }
+  return MaybeLocal<Function>(Local<Function>::New(out));
+}
+
+MaybeLocal<Object> FunctionTemplate::BuildPrototypeObject(Local<Context> context) {
+  if (context.IsEmpty()) return MaybeLocal<Object>();
+  auto* current = reinterpret_cast<Context*>(
+      static_cast<uintptr_t>(context.raw()));
+  Local<ObjectTemplate> instance = InstanceTemplate();
+  Local<Object> prototype;
+  if (!instance->NewInstance(context).ToLocal(&prototype)) {
+    return MaybeLocal<Object>();
+  }
+  // Inherit chains the prototypes: the parent's built prototype is this one's
+  // prototype, so an instance reaches the parent's members.
+  if (parent_ != nullptr) {
+    Local<Object> parent_prototype;
+    if (parent_->BuildPrototypeObject(context).ToLocal(&parent_prototype)) {
+      prototype->SetPrototype(context, parent_prototype);
+    }
+  }
+  // The prototype template's members live on the function's prototype object.
+  if (prototype_template_ != nullptr) {
+    for (const auto& entry : prototype_template_->entries()) {
+      slag_object_register_fn(
+          current->slag(), prototype.raw(),
+          reinterpret_cast<const uint8_t*>(entry.name.data()),
+          entry.name.size(), &HostTrampoline, entry.function);
+    }
+    for (const auto& accessor : prototype_template_->accessors()) {
+      const slag_accessor_getter getter =
+          accessor.getter == nullptr ? nullptr : &AccessorGetterTrampoline;
+      const slag_accessor_setter setter =
+          accessor.setter == nullptr ? nullptr : &AccessorSetterTrampoline;
+      slag_object_set_accessor(
+          current->slag(), prototype.raw(), accessor.name_bits, getter, setter,
+          const_cast<v8::ObjectTemplate::Accessor*>(&accessor),
+          accessor.attributes);
+    }
+  }
+  return prototype;
+}
+
+Isolate* Isolate::GetCurrent() { return g_current_isolate; }
+
+Isolate* Isolate::TryGetCurrent() { return g_current_isolate; }
+
+namespace {
+
+thread_local int g_microtasks_scope_depth = 0;
+
+}  // namespace
+
+MicrotasksScope::MicrotasksScope(Isolate* isolate, Type type)
+    : isolate_(isolate), type_(type) {
+  ++g_microtasks_scope_depth;
+}
+
+MicrotasksScope::~MicrotasksScope() {
+  if (g_microtasks_scope_depth > 0) --g_microtasks_scope_depth;
+  if (g_microtasks_scope_depth == 0 && type_ == kRunMicrotasks &&
+      isolate_ != nullptr) {
+    isolate_->PerformMicrotaskCheckpoint();
+  }
+}
+
+int MicrotasksScope::GetCurrentDepth(Isolate*) {
+  return g_microtasks_scope_depth;
+}
+
+bool MicrotasksScope::IsRunningMicrotasks(Isolate*) { return false; }
 
 BackingStore::~BackingStore() { slag_buffer_free(buffer_); }
 
@@ -1790,12 +2019,6 @@ MaybeLocal<Value> TryCatch::StackTrace(Local<Context> context) const {
   if (len <= 0) return MaybeLocal<Value>();
   return MaybeLocal<Value>(Local<Value>::New(slag_string_new(
       reinterpret_cast<const uint8_t*>(buffer), static_cast<size_t>(len))));
-}
-
-Local<FunctionTemplate> FunctionTemplate::New(Isolate*,
-                                              FunctionCallback callback) {
-  return Local<FunctionTemplate>::New(
-      reinterpret_cast<uint64_t>(new FunctionTemplate(callback)));
 }
 
 Local<ObjectTemplate> ObjectTemplate::New(Isolate*) {

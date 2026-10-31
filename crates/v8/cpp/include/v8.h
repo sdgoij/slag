@@ -400,6 +400,12 @@ class Object : public Value {
   Maybe<bool> HasRealNamedCallbackProperty(Local<Context> context,
                                            Local<Name> key);
 
+  /* The object's prototype (`Object::GetPrototype`): `null` when it has none.
+   * `SetPrototype` answers whether the engine accepted the change; an empty
+   * handle sets a null prototype. */
+  Local<Value> GetPrototype();
+  bool SetPrototype(Local<Context> context, Local<Value> prototype);
+
   /* The C++ object this wrapper names. V8 requires its `T` to be a cppgc
    * `GarbageCollectedMixin`; the facade has no cppgc, so there is no such
    * constraint and nothing is checked. */
@@ -982,18 +988,22 @@ template <class T>
 class FunctionCallbackInfo {
  public:
   FunctionCallbackInfo(Isolate* isolate, const void* call,
-                       uint64_t this_value, const uint64_t* args, int length)
+                       uint64_t this_value, const uint64_t* args, int length,
+                       uint64_t data = 0)
       : isolate_(isolate),
         call_(call),
         this_value_(this_value),
         args_(args),
         length_(length),
+        data_(data),
         return_value_(slag_undefined()) {}
 
   Isolate* GetIsolate() const { return isolate_; }
   int Length() const { return length_; }
   Local<T> operator[](int index) const { return Local<T>::New(args_[index]); }
   Local<T> This() const { return Local<T>::New(this_value_); }
+  /* The value the template gave the callback (`FunctionCallbackInfo::Data`). */
+  Local<Value> Data() const { return Local<Value>::New(data_); }
   ReturnValue<T> GetReturnValue() const {
     return ReturnValue<T>(&return_value_);
   }
@@ -1006,6 +1016,7 @@ class FunctionCallbackInfo {
   uint64_t this_value_;
   const uint64_t* args_;
   int length_;
+  uint64_t data_;
   mutable uint64_t return_value_;
 };
 
@@ -1162,16 +1173,99 @@ struct IndexedPropertyHandlerConfiguration {
   PropertyHandlerFlags flags;
 };
 
-class FunctionTemplate {
+/* How a constructor behaves when called without `new`
+ * (`v8::ConstructorBehavior`). The facade accepts both and calls the handler
+ * either way. */
+enum class ConstructorBehavior { kThrow = 0, kAllow = 1 };
+
+/* Whether a callback may have side effects (`v8::SideEffectType`). Accepted and
+ * not consulted: the engine has no side-effect analysis to feed. */
+enum class SideEffectType {
+  kHasSideEffect = 0,
+  kHasNoSideEffect = 1,
+  kHasSideEffectToReceiver = 2,
+};
+
+/* A function value (`v8::Function`). */
+class Function : public Object {
  public:
-  static Local<FunctionTemplate> New(Isolate* isolate,
-                                     FunctionCallback callback);
-  FunctionCallback callback() const { return callback_; }
+  static Local<Function> New(
+      Local<Context> context, FunctionCallback callback,
+      Local<Value> data = Local<Value>(), int length = 0,
+      ConstructorBehavior behavior = ConstructorBehavior::kAllow,
+      SideEffectType side_effect_type = SideEffectType::kHasSideEffect);
+
+  MaybeLocal<Value> Call(Local<Context> context, Local<Value> recv, int argc,
+                         Local<Value> argv[]);
+  MaybeLocal<Object> NewInstance(Local<Context> context, int argc,
+                                 Local<Value> argv[]);
+};
+
+/* A function template's signature (`v8::Signature` and `v8::AccessorSignature`):
+ * the type an access check is declared over. Accepted and not consulted, because
+ * the engine has no embedder access checks; the object exists so a host's
+ * declarations compile. */
+class Signature {
+ public:
+  static Local<Signature> New(Isolate* isolate,
+                              Local<FunctionTemplate> function);
+
+  Local<FunctionTemplate> GetFunctionTemplate() const;
 
  private:
+  friend class FunctionTemplate;
+  explicit Signature(FunctionTemplate* function) : function_(function) {}
+  FunctionTemplate* function_ = nullptr;
+};
+
+class AccessorSignature {
+ public:
+  static Local<AccessorSignature> New(Isolate* isolate,
+                                      Local<FunctionTemplate> function);
+};
+
+class FunctionTemplate {
+ public:
+  static Local<FunctionTemplate> New(
+      Isolate* isolate, FunctionCallback callback,
+      Local<Value> data = Local<Value>(),
+      Local<Signature> signature = Local<Signature>(), int length = 0,
+      ConstructorBehavior behavior = ConstructorBehavior::kAllow,
+      SideEffectType side_effect_type = SideEffectType::kHasSideEffect);
+
+  FunctionCallback callback() const { return callback_; }
+  /* The value the template hands its callbacks (`FunctionCallbackInfo::Data`). */
+  Local<Value> data() const { return Local<Value>::New(data_bits_); }
+  void SetCallHandler(FunctionCallback callback,
+                      Local<Value> data = Local<Value>());
+  void SetClassName(const char* name);
+  void Inherit(Local<FunctionTemplate> parent);
+
+  Local<ObjectTemplate> InstanceTemplate();
+  Local<ObjectTemplate> PrototypeTemplate();
+
+  /* Materialize the function (`FunctionTemplate::GetFunction`): an instance
+   * inherits from `InstanceTemplate`'s object (which also carries the
+   * `PrototypeTemplate`'s entries), with the template's internal fields and
+   * API-wrapper bit. */
+  MaybeLocal<Function> GetFunction(Local<Context> context);
+
+ private:
+  friend class Signature;
   explicit FunctionTemplate(FunctionCallback callback) : callback_(callback) {}
 
+  /* The object `new` instances inherit from: the instance template's object,
+   * chained to the parent's and carrying the prototype template's members. */
+  MaybeLocal<Object> BuildPrototypeObject(Local<Context> context);
+
   FunctionCallback callback_;
+  uint64_t data_bits_ = 0;
+  std::string class_name_;
+  int length_ = 0;
+  bool allow_construction_ = true;
+  FunctionTemplate* parent_ = nullptr;
+  ObjectTemplate* instance_template_ = nullptr;
+  ObjectTemplate* prototype_template_ = nullptr;
 };
 
 class ObjectTemplate {
@@ -1219,6 +1313,18 @@ class ObjectTemplate {
                            Local<Value> data = Local<Value>(),
                            PropertyAttribute attribute = None);
 
+  /* Install a call-as-function handler
+   * (`v8::ObjectTemplate::SetCallAsFunctionHandler`). The engine's template
+   * instances are ordinary objects, which are not callable, so this records the
+   * handler but an instance stays uncallable; a host that needs one makes the
+   * callable in its own constructor. */
+  void SetCallAsFunctionHandler(FunctionCallback callback,
+                                Local<Value> data = Local<Value>()) {
+    call_as_function_ = callback;
+    call_as_function_data_ = data;
+  }
+  FunctionCallback call_as_function() const { return call_as_function_; }
+
   /* One installed accessor: the name and data are retained for the template's
    * lifetime (templates are not freed), and their bits are kept so the
    * trampolines do not have to make a handle per access. `Global` is defined
@@ -1241,6 +1347,8 @@ class ObjectTemplate {
   std::vector<Entry> entries_;
   std::deque<Accessor> accessors_;
   int internal_fields_ = 0;
+  FunctionCallback call_as_function_ = nullptr;
+  Local<Value> call_as_function_data_;
   NamedPropertyHandlerConfiguration named_handler_;
   IndexedPropertyHandlerConfiguration indexed_handler_;
   bool has_named_handler_ = false;
@@ -1298,6 +1406,44 @@ class Context {
   uint64_t security_token_ = 0;
 
   friend class Isolate;
+};
+
+/* Thread locking (`v8::Locker`/`v8::Unlocker`). The engine is single-threaded
+ * per isolate, so these record nothing and never block; a host that needs
+ * cross-thread sharing needs the engine to grow a locker, not this facade. */
+class Locker {
+ public:
+  explicit Locker(Isolate*) {}
+  ~Locker() = default;
+  Locker(const Locker&) = delete;
+  Locker& operator=(const Locker&) = delete;
+};
+
+class Unlocker {
+ public:
+  explicit Unlocker(Isolate*) {}
+  ~Unlocker() = default;
+};
+
+/* A scope that drains the microtask queue as it exits (`v8::MicrotasksScope`):
+ * the outermost `kRunMicrotasks` scope drains through the isolate's checkpoint.
+ * `kDoNotRunMicrotasks` leaves the queue alone. */
+class MicrotasksScope {
+ public:
+  enum Type { kDoNotRunMicrotasks, kRunMicrotasks };
+
+  MicrotasksScope(Isolate* isolate, Type type);
+  ~MicrotasksScope();
+
+  MicrotasksScope(const MicrotasksScope&) = delete;
+  MicrotasksScope& operator=(const MicrotasksScope&) = delete;
+
+  static int GetCurrentDepth(Isolate* isolate);
+  static bool IsRunningMicrotasks(Isolate* isolate);
+
+ private:
+  Isolate* isolate_;
+  Type type_;
 };
 
 /* The kind of collection a GC callback was told about (`v8::GCType`). */
@@ -1367,6 +1513,10 @@ class Isolate {
 
   static Isolate* New(const CreateParams& params);
   void Dispose();
+  /* The isolate entered on this thread (`Isolate::GetCurrent`), or null. The
+   * facade's `GetCurrent` and `TryGetCurrent` are the same answer. */
+  static Isolate* GetCurrent();
+  static Isolate* TryGetCurrent();
   void ThrowError(const char* message);
   /* Throw `exception` (`Isolate::ThrowException`): the pending exception
    * becomes exactly that language value. */

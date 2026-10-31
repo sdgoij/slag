@@ -977,6 +977,33 @@ cached compile needs the engine to serialize its compiled program; the Rust
 bridge's `CachedData` is a copy of the source and checks it rather than trusting
 it, and that is the honest ceiling until the engine has a cache format.
 
+*Function templates and prototypes (2026-10-31).* The A3 shape is in, and it
+needed one engine addition and one engine fix. The addition is
+`embed::create_template_constructor`: `Function::create_builtin` over a fixed
+prototype, an instance shape (internal fields and the API-wrapper bit) and an
+optional `[[Construct]]`, which is what `FunctionTemplate::GetFunction`
+materializes. The parameter count tripped clippy, so the shape is a
+`TemplateInstance` value rather than five arguments; that reads better anyway.
+
+The fix is the one worth remembering. A host *function* callback used to run
+without a published `CallbackWindow`, so the facade's `Object::Set` inside it
+took the ordinary entry point and recorded "re-entrant evaluation is not
+supported". The constructor in the harness sets two properties on `this`, which
+is how it surfaced. `slagc`'s `host_fn` now wraps every callback in
+`CallbackWindow::enter(context.agent)`, so the token names a live window and the
+property surface works from a function callback exactly as it already did from a
+property callback. The same fix covers allocation (`Object::New`, `Array::New`)
+from a function callback.
+
+`Inherit` chains the *built prototype objects*, not the instance templates: a
+child's prototype inherits from the parent's built prototype, which is the
+object carrying the parent's `PrototypeTemplate` members. The first version
+chained the parent's instance object and the harness's inherited method was not
+found. `ConstructorBehavior::kThrow` is enforced by passing `None` as the
+construct closure, and the harness checks that `new` on such a function throws.
+What is still absent is the call-as-function handler's behaviour (recorded, not
+installed) and the access checks `Signature` exists for, which are A4.
+
 The ABI shape is roughly a struct of up to seven C function pointers, the data
 pointer, and the flags, handed over once per template, with the return codes
 `Intercepted` already defines; the callbacks receive a `PropertyCallbackInfo`

@@ -183,6 +183,7 @@ int32_t slag_pending_message(SlagContext* context, SlagMessage* out, char* name,
 void slag_clear_error(SlagContext* context);
 
 uint64_t slag_undefined(void);
+uint64_t slag_null(void);
 uint64_t slag_boolean_new(int32_t value);
 uint64_t slag_string_new(const uint8_t* text, size_t len);
 uint64_t slag_number_new(double value);
@@ -374,6 +375,18 @@ int32_t slag_symbol_description(uint64_t value, uint64_t* out);
 /* A fresh null-prototype object for an isolate's default security token. */
 uint64_t slag_security_token_new(void);
 uint64_t slag_global(SlagContext* context);
+int32_t slag_call(SlagContext* context, uint64_t function, uint64_t this_value,
+                  const uint64_t* args, size_t len, uint64_t* out);
+int32_t slag_construct(SlagContext* context, uint64_t constructor,
+                       const uint64_t* args, size_t len, uint64_t* out);
+int32_t slag_template_constructor(SlagContext* context, const uint8_t* name,
+                                  size_t name_len, uint32_t length, uint64_t proto,
+                                  size_t internal_fields, int32_t api_wrapper,
+                                  int32_t allow_construction, slag_host_fn callback,
+                                  void* data, uint64_t* out);
+int32_t slag_object_prototype(SlagContext* context, uint64_t object, uint64_t* out);
+int32_t slag_object_set_prototype(SlagContext* context, uint64_t object,
+                                  uint64_t prototype);
 int32_t slag_object_new(SlagContext* context, size_t internal_fields,
                         int32_t api_wrapper, uint64_t* out);
 int32_t slag_object_new_handler(SlagContext* context, size_t internal_fields,

@@ -201,7 +201,12 @@ fn reentrant(context: &SlagContext) {
 /// slot: a callback that set an error fails the call rather than returning.
 fn host_fn(context: &SlagContext, callback: SlagHostFn, data: *mut c_void) -> HostFn {
     let pending = Rc::clone(&context.pending_error);
+    let agent = context.agent;
     Box::new(move |call: &FunctionCall<'_>| {
+        // Publish the running window, so a callback that allocates or writes
+        // through the flat ABI's token route (`slag_callback_token`) is admitted
+        // rather than refused as a re-entry.
+        let _window = CallbackWindow::enter(agent);
         let args: Vec<u64> = call.args().iter().map(JsValue::to_bits).collect();
         let this = call.this().to_bits();
         let produced = match callback {
@@ -1579,6 +1584,208 @@ pub unsafe extern "C" fn slag_register_fn(
     }
 }
 
+/// Call `function` with `this` and arguments (`Function::Call`).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn slag_call(
+    context: *mut SlagContext,
+    function: u64,
+    this: u64,
+    args: *const u64,
+    len: usize,
+    out: *mut u64,
+) -> i32 {
+    let Some(context) = context.as_mut() else {
+        return 2;
+    };
+    let values: Vec<JsValue> = slice_of::<u64>(args, len)
+        .iter()
+        .map(|bits| JsValue::from_bits(*bits))
+        .collect();
+    let called = {
+        let Ok(mut engine) = context.context.try_borrow_mut() else {
+            reentrant(context);
+            return 1;
+        };
+        engine.call(
+            &JsValue::from_bits(function),
+            &JsValue::from_bits(this),
+            &values,
+        )
+    };
+    match called {
+        Ok(value) => {
+            if !out.is_null() {
+                *out = value.to_bits();
+            }
+            0
+        }
+        Err(error) => {
+            record(context, error);
+            1
+        }
+    }
+}
+
+/// Construct `constructor` with arguments (`Function::NewInstance`).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn slag_construct(
+    context: *mut SlagContext,
+    constructor: u64,
+    args: *const u64,
+    len: usize,
+    out: *mut u64,
+) -> i32 {
+    let Some(context) = context.as_mut() else {
+        return 2;
+    };
+    let values: Vec<JsValue> = slice_of::<u64>(args, len)
+        .iter()
+        .map(|bits| JsValue::from_bits(*bits))
+        .collect();
+    let constructed = {
+        let Ok(mut engine) = context.context.try_borrow_mut() else {
+            reentrant(context);
+            return 1;
+        };
+        engine.construct(&JsValue::from_bits(constructor), &values)
+    };
+    match constructed {
+        Ok(value) => {
+            if !out.is_null() {
+                *out = value.to_bits();
+            }
+            0
+        }
+        Err(error) => {
+            record(context, error);
+            1
+        }
+    }
+}
+
+/// A constructible host function over a fixed prototype and instance shape
+/// (`v8::FunctionTemplate::GetFunction`): `proto` is the object `new` instances
+/// inherit from, and `internal_fields`/`api_wrapper` are the template's shape.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn slag_template_constructor(
+    context: *mut SlagContext,
+    name: *const u8,
+    name_len: usize,
+    length: u32,
+    proto: u64,
+    internal_fields: usize,
+    api_wrapper: i32,
+    allow_construction: i32,
+    callback: SlagHostFn,
+    data: *mut c_void,
+    out: *mut u64,
+) -> i32 {
+    let Some(context) = context.as_mut() else {
+        return 2;
+    };
+    let Ok(name) = text(name, name_len) else {
+        return 2;
+    };
+    let Some(prototype) = JsValue::from_bits(proto).as_object() else {
+        return 2;
+    };
+    let host = host_fn(context, callback, data);
+    let created = {
+        let Ok(engine) = context.context.try_borrow() else {
+            reentrant(context);
+            return 1;
+        };
+        engine.create_template_constructor(
+            name,
+            length,
+            slag::TemplateInstance {
+                prototype,
+                internal_fields,
+                api_wrapper: api_wrapper != 0,
+                allow_construction: allow_construction != 0,
+            },
+            host,
+        )
+    };
+    match created {
+        Ok(value) => {
+            if !out.is_null() {
+                *out = value.to_bits();
+            }
+            0
+        }
+        Err(error) => {
+            record(context, error);
+            1
+        }
+    }
+}
+
+/// The object's prototype (`Object::GetPrototype`), or `slag_null()` when it has
+/// none. Answers 2 for a value with no object half.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn slag_object_prototype(
+    context: *mut SlagContext,
+    object: u64,
+    out: *mut u64,
+) -> i32 {
+    let Some(context) = context.as_ref() else {
+        return 2;
+    };
+    let prototype = {
+        let Ok(engine) = context.context.try_borrow() else {
+            reentrant(context);
+            return 1;
+        };
+        engine.object_prototype(&JsValue::from_bits(object))
+    };
+    match prototype {
+        Ok(Some(proto)) => {
+            if !out.is_null() {
+                *out = proto.to_bits();
+            }
+            0
+        }
+        Ok(None) => {
+            if !out.is_null() {
+                *out = Value::Null.bits();
+            }
+            0
+        }
+        Err(error) => {
+            record(context, error);
+            1
+        }
+    }
+}
+
+/// Set the object's prototype (`Object::SetPrototype`), answering 1 when the
+/// change took and 0 when the engine refused it.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn slag_object_set_prototype(
+    context: *mut SlagContext,
+    object: u64,
+    prototype: u64,
+) -> i32 {
+    let Some(context) = context.as_ref() else {
+        return 0;
+    };
+    let changed = {
+        let Ok(engine) = context.context.try_borrow() else {
+            reentrant(context);
+            return 0;
+        };
+        engine.set_object_prototype(&JsValue::from_bits(object), &JsValue::from_bits(prototype))
+    };
+    match changed {
+        Ok(changed) => i32::from(changed),
+        Err(error) => {
+            record(context, error);
+            0
+        }
+    }
+}
+
 /// Evaluate inside a host callback (`FunctionCall::eval`), which is the safe
 /// re-entry path: the outer evaluation is already running.
 #[unsafe(no_mangle)]
@@ -1808,6 +2015,11 @@ pub unsafe extern "C" fn slag_drain_jobs(context: *mut SlagContext) -> i32 {
 #[unsafe(no_mangle)]
 pub extern "C" fn slag_undefined() -> u64 {
     JsValue::undefined().to_bits()
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn slag_null() -> u64 {
+    Value::Null.bits()
 }
 
 #[unsafe(no_mangle)]

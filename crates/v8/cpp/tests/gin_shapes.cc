@@ -279,6 +279,22 @@ void ScrubStack(int depth) {
   (void)pad[0];
 }
 
+// A function template's callback and the method its prototype template carries.
+void TemplateConstructor(const v8::FunctionCallbackInfo<v8::Value>& info) {
+  v8::Isolate* isolate = info.GetIsolate();
+  v8::Local<v8::Context> context = isolate->GetCurrentContext();
+  v8::Local<v8::Object> self = info.This().As<v8::Object>();
+  v8::Local<v8::Value> first = v8::Integer::New(isolate, -1);
+  if (info.Length() > 0) first = info[0];
+  self->Set(context, v8::String::NewFromUtf8Literal(isolate, "arg0"), first);
+  self->Set(context, v8::String::NewFromUtf8Literal(isolate, "data"),
+            info.Data());
+}
+
+void ParentKind(const v8::FunctionCallbackInfo<v8::Value>& info) {
+  info.GetReturnValue().Set(v8::Integer::New(info.GetIsolate(), 42));
+}
+
 // The dependency a module resolver hands back. V8's resolver is a plain
 // function pointer, so the module it answers with lives at file scope.
 v8::Global<v8::Module> module_dependency;
@@ -2021,6 +2037,119 @@ int main() {
       delete params.array_buffer_allocator;
     }
     delete[] blob.data;
+  }
+
+  // Function templates and prototypes: materialize a template, inherit from
+  // another, put a method on the prototype template, and read/set prototypes.
+  {
+    v8::HandleScope scope(isolate);
+    v8::Local<v8::Context> current = context.Get(isolate);
+    v8::Context::Scope context_scope(current);
+    const auto expect = [&](bool condition, const char* what) {
+      if (!condition) {
+        fprintf(stderr, "templates: %s\n", what);
+        ++failures;
+      }
+    };
+    const auto bind = [&](const char* name, v8::Local<v8::Value> value) {
+      current->Global()
+          ->Set(current, v8::String::NewFromUtf8Literal(isolate, name), value)
+          .ToChecked();
+    };
+    const auto run = [&](const char* source) {
+      v8::TryCatch caught(isolate);
+      v8::Local<v8::Value> result;
+      v8::Local<v8::Script> script;
+      if (!v8::Script::Compile(
+               current, v8::String::NewFromUtf8Literal(isolate, source))
+               .ToLocal(&script) ||
+          !script->Run(current).ToLocal(&result)) {
+        v8::String::Utf8Value text(isolate, caught.Exception());
+        fprintf(stderr, "templates: script failed: %s\n",
+                *text == nullptr ? "" : *text);
+      }
+      return result;
+    };
+    const auto number_at = [&](const char* name) {
+      return current->Global()
+          ->Get(current, v8::String::NewFromUtf8Literal(isolate, name))
+          .ToLocalChecked()
+          ->Int32Value(current)
+          .FromMaybe(-1);
+    };
+
+    v8::Local<v8::Value> data = v8::Integer::New(isolate, 7);
+    v8::Local<v8::FunctionTemplate> parent =
+        v8::FunctionTemplate::New(isolate, &TemplateConstructor);
+    parent->SetClassName("Parent");
+    parent->PrototypeTemplate()->Set(
+        isolate, "kind", v8::FunctionTemplate::New(isolate, &ParentKind));
+    v8::Local<v8::Signature> signature = v8::Signature::New(isolate, parent);
+
+    v8::Local<v8::FunctionTemplate> child = v8::FunctionTemplate::New(
+        isolate, &TemplateConstructor, data, signature, 1,
+        v8::ConstructorBehavior::kAllow);
+    child->SetClassName("Child");
+    child->Inherit(parent);
+    child->InstanceTemplate()->SetInternalFieldCount(1);
+
+    v8::Local<v8::Function> constructor;
+    expect(child->GetFunction(current).ToLocal(&constructor),
+           "the template materialized a function");
+    expect(v8::Isolate::GetCurrent() == isolate &&
+               v8::Isolate::TryGetCurrent() == isolate,
+           "GetCurrent answers the entered isolate");
+    bind("Child", constructor);
+    run("var made = new Child(5);"
+        " globalThis.madeArg = made.arg0;"
+        " globalThis.madeData = made.data;"
+        " globalThis.madeKind = made.kind();"
+        " globalThis.madeIsChild = made instanceof Child;");
+    expect(number_at("madeArg") == 5, "the constructor ran with the argument");
+    expect(number_at("madeData") == 7,
+           "the callback read the template's data");
+    expect(number_at("madeKind") == 42,
+           "an instance reached the parent's prototype method");
+    expect(number_at("madeIsChild") == 1, "the instance is an instance");
+
+    // ConstructorBehavior::kThrow materializes a function with no [[Construct]].
+    v8::Local<v8::FunctionTemplate> plain_template = v8::FunctionTemplate::New(
+        isolate, &TemplateConstructor, v8::Local<v8::Value>(),
+        v8::Local<v8::Signature>(), 0, v8::ConstructorBehavior::kThrow);
+    v8::Local<v8::Function> plain_function;
+    expect(plain_template->GetFunction(current).ToLocal(&plain_function),
+           "a kThrow template materialized");
+    bind("Plain", plain_function);
+    run("try { new Plain(); globalThis.plainConstructed = 1; }"
+        " catch (e) { globalThis.plainConstructed = 0; }");
+    expect(number_at("plainConstructed") == 0,
+           "kThrow materialized a non-constructible function");
+
+    v8::Local<v8::Object> plain = v8::Object::New(isolate);
+    v8::Local<v8::Object> prototype = v8::Object::New(isolate);
+    prototype->Set(current, v8::String::NewFromUtf8Literal(isolate, "mark"),
+                   v8::Integer::New(isolate, 9));
+    expect(plain->SetPrototype(current, prototype) &&
+               plain->GetPrototype().raw() == prototype.raw(),
+           "SetPrototype and GetPrototype agree");
+    bind("plain", plain);
+    run("globalThis.inheritedMark = plain.mark;");
+    expect(number_at("inheritedMark") == 9,
+           "the prototype's property is inherited");
+
+    // A MicrotasksScope drains the queue on its outermost exit.
+    isolate->SetMicrotasksPolicy(v8::MicrotasksPolicy::kExplicit);
+    run("globalThis.scopeSettled = 0;"
+        " Promise.resolve(1).then(function () { globalThis.scopeSettled = 1; });");
+    expect(number_at("scopeSettled") == 0, "kExplicit left the job queued");
+    {
+      v8::MicrotasksScope microtasks(isolate,
+                                     v8::MicrotasksScope::kRunMicrotasks);
+      expect(v8::MicrotasksScope::GetCurrentDepth(isolate) == 1,
+             "the scope reports its depth");
+    }
+    expect(number_at("scopeSettled") == 1, "the scope drained on exit");
+    isolate->SetMicrotasksPolicy(v8::MicrotasksPolicy::kAuto);
   }
 
   // A host-traced reference: a root the C++ side owns and releases. Once it

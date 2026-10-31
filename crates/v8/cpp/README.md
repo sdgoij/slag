@@ -341,6 +341,32 @@ buffer record: the four measured numbers are real, `heap_size_limit` is the
 largest `size_t` (the arena has no limit), the executable/global-handle numbers
 are zero because those stores do not exist, and `embedded_blob_size` is zero.
 
+### Function templates and prototypes
+
+`FunctionTemplate::New` takes V8's full option list (data, signature, length,
+`ConstructorBehavior`, `SideEffectType`); the data reaches a callback as
+`FunctionCallbackInfo::Data`, and `SetCallHandler` replaces it. `GetFunction`
+materializes a function whose `new` builds an instance with the instance
+template's internal-field count and API-wrapper bit, inheriting from the built
+prototype object. `PrototypeTemplate`'s members land on that prototype, and
+`Inherit(parent)` chains to the parent's built prototype, so an instance reaches
+the parent's methods. `ConstructorBehavior::kThrow` really does materialize a
+function with no `[[Construct]]`.
+
+`Function::New`/`Call`/`NewInstance` are the direct function forms, `Signature`
+and `AccessorSignature` are the declaration types an access check is written
+over (accepted and not consulted, because the engine has no embedder access
+checks), and `Object::GetPrototype`/`SetPrototype` are the engine's own internal
+method, so a cycle is refused rather than installed. `Isolate::GetCurrent` and
+`TryGetCurrent` answer the entered isolate. `MicrotasksScope` drains the queue
+when its outermost `kRunMicrotasks` scope exits, and `Locker`/`Unlocker` are
+accepted: the engine is single-threaded per isolate.
+
+A host function callback runs with its window published, so `Object::Set` (and
+the rest of the property surface) inside it takes the token route instead of
+recording a re-entrant refusal. That was the one engine-side fix this rung
+needed, and it is what the constructor in the harness exercises.
+
 ### Modules
 
 `ScriptCompiler::CompileModule` parses a `Source` as a module in the entered
@@ -501,6 +527,11 @@ not a claim that gin itself links.
     WebAssembly decoder.
   - `SnapshotCreator` with `SetDefaultContext` and `CreateBlob`, `StartupData`,
     and `Isolate::CreateParams::snapshot_blob` restoring onto the first context.
+  - `FunctionTemplate::New` with its full options, `SetCallHandler`,
+    `SetClassName`, `Inherit`, `InstanceTemplate`, `PrototypeTemplate`, and
+    `GetFunction`; `Function::New`/`Call`/`NewInstance`; `Signature` and
+    `AccessorSignature`; `Object::GetPrototype`/`SetPrototype`;
+    `Isolate::GetCurrent`/`TryGetCurrent`; `MicrotasksScope`; `Locker`/`Unlocker`.
 - Handles and persistents as engine roots: a handle slot or a `Global` over an
   engine value retains it for that object's lifetime, and a facade pointer is
   never registered.
@@ -567,6 +598,12 @@ not a claim that gin itself links.
   `SnapshotCreator::AddContext`, `SetDataBlob`, `AddData`, the external
   references, and the code cache are absent; a cached compile would need the
   engine to serialize its compiled program, which it does not yet do.
+- An `ObjectTemplate::SetCallAsFunctionHandler` handler is recorded but the
+  instance is not callable (the engine's template instances are ordinary
+  objects), and `Signature`/`AccessorSignature` are accepted without an access
+  check. `FunctionTemplate::InstanceTemplate`'s own accessors and members reach
+  instances through the prototype object rather than as own properties, and
+  `SideEffectType` is not consulted.
 - `Platform` is a handle plus a message pump: `PumpMessageLoop` runs the
   isolate's queued jobs (microtasks, promise reactions, due timers) and answers
   whether it ran any. There are no host-posted platform tasks or task runners
@@ -649,4 +686,7 @@ reads the export from the namespace. The WebAssembly block compiles the sample's
 `add` module, reads its decoded module back, makes a second module object from
 it, binds it, and calls the export through a script's `WebAssembly.Instance`.
 The snapshot block writes a realm with the console and timers removed, then
-restores the blob in a fresh isolate and reads the global back.
+restores the blob in a fresh isolate and reads the global back. The template
+block materializes a child template that inherits a parent's prototype method,
+checks the data, argument, and instance checks, a `kThrow` template that cannot
+be constructed, prototype get/set, and a `MicrotasksScope` draining on exit.

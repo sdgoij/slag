@@ -759,6 +759,117 @@ impl Context {
         Ok(JsValue(Value::Function(function)))
     }
 
+    /// Like [`create_constructor`](Self::create_constructor), but the instance
+    /// shape is the host's: `prototype` is the object `new` inherits from
+    /// (`v8::FunctionTemplate::InstanceTemplate`'s instance), and each instance
+    /// carries `internal_fields` and the API-wrapper bit before the callback
+    /// runs.
+    pub fn create_template_constructor(
+        &self,
+        name: &str,
+        length: u32,
+        instance: TemplateInstance,
+        callback: HostFn,
+    ) -> Result<JsValue, JsError> {
+        let TemplateInstance {
+            prototype,
+            internal_fields,
+            api_wrapper,
+            allow_construction,
+        } = instance;
+        let prototype = prototype.0;
+        let function_prototype = realm_function_prototype(&self.agent)?;
+        let callback = Rc::new(callback);
+        let call_callback = Rc::clone(&callback);
+        let call: NativeFn = Box::new(move |agent, this, args| {
+            call_callback(&FunctionCall {
+                agent,
+                this,
+                args,
+                new_target: None,
+            })
+            .map(JsValue::into_value)
+        });
+        let construct: Option<NativeCtor> = if allow_construction {
+            let construct_callback = Rc::clone(&callback);
+            Some(Box::new(move |agent, new_target, args| {
+                let instance = CruxObject::ordinary_object_create(Some(prototype));
+                if internal_fields > 0 || api_wrapper {
+                    instance.set_internal_fields(internal_fields, api_wrapper);
+                }
+                let this = Value::Object(instance);
+                let result = construct_callback(&FunctionCall {
+                    agent,
+                    this: &this,
+                    args,
+                    new_target: Some(new_target),
+                })?;
+                let raw = result.into_value();
+                Ok(if raw.is_object() || raw.is_function() {
+                    raw
+                } else {
+                    this
+                })
+            }))
+        } else {
+            None
+        };
+
+        let function = Function::create_builtin(
+            Some(JsString::from_utf8(name)),
+            length as u64,
+            call,
+            construct,
+            function_prototype,
+        )?;
+        function.define_property(
+            &JsString::from_utf8("prototype"),
+            &PropertyDescriptor {
+                value: Some(Value::Object(prototype)),
+                writable: Some(true),
+                get: None,
+                set: None,
+                enumerable: Some(false),
+                configurable: Some(false),
+            },
+        )?;
+        prototype.define_property_or_throw(
+            &JsString::from_utf8("constructor"),
+            &PropertyDescriptor {
+                value: Some(Value::Function(function)),
+                writable: Some(true),
+                get: None,
+                set: None,
+                enumerable: Some(false),
+                configurable: Some(true),
+            },
+        )?;
+        Ok(JsValue(Value::Function(function)))
+    }
+
+    /// The object's prototype (`Object::GetPrototype`).
+    pub fn object_prototype(&self, value: &JsValue) -> Result<Option<JsValue>, JsError> {
+        let Some(object) = value.0.as_object() else {
+            return Err(JsError::new(ErrorKind::TypeError, "not an object".into()));
+        };
+        object
+            .get_prototype_of()
+            .map(|proto| proto.map(|proto| JsValue(Value::Object(proto))))
+    }
+
+    /// Set the object's prototype (`Object::SetPrototype`); a null prototype
+    /// detaches it. Answers whether the change took.
+    pub fn set_object_prototype(
+        &self,
+        value: &JsValue,
+        prototype: &JsValue,
+    ) -> Result<bool, JsError> {
+        let Some(object) = value.0.as_object() else {
+            return Ok(false);
+        };
+        object.set_prototype_of(prototype.0.as_object())
+    }
+
     /// A plain object inheriting `%Object.prototype%` — a namespace to hang
     /// host functions on (no `eval("({})")` needed).
     pub fn create_object(&self) -> Result<JsObject, JsError> {
@@ -2972,6 +3083,19 @@ impl TypedArrayKind {
     }
 }
 
+/// The instance shape a template's constructor builds
+/// (`v8::FunctionTemplate::InstanceTemplate` and `ConstructorBehavior`).
+pub struct TemplateInstance {
+    /// The object `new` instances inherit from.
+    pub prototype: JsObject,
+    /// The internal fields each instance carries.
+    pub internal_fields: usize,
+    /// Whether the instance is an API wrapper (`IsApiWrapper`).
+    pub api_wrapper: bool,
+    /// Whether `new` is allowed at all (`ConstructorBehavior`).
+    pub allow_construction: bool,
+}
+
 /// A module record (`v8::Module`). The record is not a language value, so this
 /// box holds a pin: a host handle over the record has nothing else rooting it.
 pub struct JsModule {
@@ -3568,6 +3692,74 @@ mod tests {
         // panic.
         let not_a_module = context.eval("({})").unwrap();
         assert!(context.wasm_compiled_module(&not_a_module).is_err());
+    }
+
+    #[test]
+    fn a_template_constructor_builds_instances_with_its_prototype() {
+        let mut context = Context::new().unwrap();
+        let prototype = context.create_object().unwrap();
+        context
+            .define_accessor(
+                &prototype,
+                "kind",
+                Some(Box::new(|_| Ok(JsValue::number(42.0)))),
+                None,
+            )
+            .unwrap();
+        let constructor = context
+            .create_template_constructor(
+                "Thing",
+                1,
+                TemplateInstance {
+                    prototype,
+                    internal_fields: 1,
+                    api_wrapper: true,
+                    allow_construction: true,
+                },
+                Box::new(|_| Ok(JsValue::undefined())),
+            )
+            .unwrap();
+        context.set_global("Thing", constructor).unwrap();
+
+        assert_eq!(
+            context.eval("new Thing().kind").unwrap().as_number(),
+            Some(42.0)
+        );
+        assert_eq!(
+            context
+                .eval("new Thing().constructor === Thing")
+                .unwrap()
+                .as_boolean(),
+            Some(true)
+        );
+        assert_eq!(
+            context
+                .eval("Object.getPrototypeOf(new Thing()) === Thing.prototype")
+                .unwrap()
+                .as_boolean(),
+            Some(true)
+        );
+
+        // Prototype reads and writes go through the engine's own internal
+        // method, so a cycle is refused rather than installed.
+        let plain = context.create_object().unwrap();
+        let proto = context.create_object().unwrap();
+        assert!(
+            context
+                .set_object_prototype(&plain.as_value(), &proto.as_value())
+                .unwrap()
+        );
+        let read = context
+            .object_prototype(&plain.as_value())
+            .unwrap()
+            .expect("a prototype");
+        assert_eq!(read.0.bits(), proto.as_value().0.bits());
+        assert!(
+            !context
+                .set_object_prototype(&proto.as_value(), &plain.as_value())
+                .unwrap(),
+            "a prototype cycle is refused"
+        );
     }
 
     #[test]
