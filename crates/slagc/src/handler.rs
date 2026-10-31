@@ -175,14 +175,14 @@ pub(crate) struct CxxHandler {
     agent: crux::function::AgentPtr,
     /// The context's pending-error slot: a callback that sets one fails the
     /// operation rather than returning, the same contract a host function has.
-    pending_error: Rc<RefCell<Option<String>>>,
+    pending_error: Rc<RefCell<Option<JsError>>>,
 }
 
 impl CxxHandler {
     pub(crate) fn new(
         handler: SlagPropertyHandler,
         agent: crux::function::AgentPtr,
-        pending_error: Rc<RefCell<Option<String>>>,
+        pending_error: Rc<RefCell<Option<JsError>>>,
     ) -> Self {
         Self {
             handler,
@@ -287,7 +287,7 @@ impl CxxHandler {
             body()
         };
         match self.pending_error.borrow_mut().take() {
-            Some(message) => Err(JsError::new(ErrorKind::Error, message)),
+            Some(error) => Err(error),
             None => Ok(answer),
         }
     }

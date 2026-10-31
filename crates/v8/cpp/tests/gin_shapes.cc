@@ -909,7 +909,79 @@ int main() {
     }
   }
 
-  // A host-traced reference: a root the C++ side owns and releases. Once the
+  // Identity hashes and the thrown value: a host keys a table by the hash, and
+  // TryCatch hands back the value a script threw.
+  {
+    v8::HandleScope scope(isolate);
+    v8::Local<v8::Context> current = context.Get(isolate);
+    v8::Context::Scope context_scope(current);
+
+    v8::Local<v8::Object> one =
+        v8::ObjectTemplate::New(isolate)->NewInstance(current).ToLocalChecked();
+    // The hash is stable and never zero, and neighbouring objects do not all
+    // share one answer: a hash may collide, but a table must not be linear.
+    const int one_hash = one->GetIdentityHash();
+    int hashes[8] = {};
+    for (int i = 0; i < 8; ++i) {
+      hashes[i] = v8::ObjectTemplate::New(isolate)
+                      ->NewInstance(current)
+                      .ToLocalChecked()
+                      ->GetIdentityHash();
+    }
+    int distinct = 0;
+    for (int i = 0; i < 8; ++i) {
+      bool first = hashes[i] != 0;
+      for (int j = 0; j < i; ++j) {
+        if (hashes[j] == hashes[i]) first = false;
+      }
+      distinct += first ? 1 : 0;
+    }
+    if (one_hash == 0 || one_hash != one->GetIdentityHash()) {
+      fprintf(stderr, "the identity hash is zero or not stable\n");
+      ++failures;
+    }
+    if (distinct < 4) {
+      fprintf(stderr, "the identity hash does not vary between objects\n");
+      ++failures;
+    }
+
+    // A clean run leaves nothing pending.
+    {
+      v8::TryCatch try_catch(isolate);
+      v8::Script::Compile(current,
+                          v8::String::NewFromUtf8Literal(isolate, "1 + 1"))
+          .ToLocalChecked()
+          ->Run(current);
+      if (try_catch.HasCaught()) {
+        fprintf(stderr, "a clean run was reported as caught\n");
+        ++failures;
+      }
+    }
+
+    // A throw carries its value: the object the script threw, not a message.
+    v8::TryCatch try_catch(isolate);
+    v8::Script::Compile(
+        current,
+        v8::String::NewFromUtf8Literal(isolate, "throw { code: 99 }"))
+        .ToLocalChecked()
+        ->Run(current);
+    if (!try_catch.HasCaught()) {
+      fprintf(stderr, "the throw was not caught\n");
+      ++failures;
+    }
+    v8::Local<v8::Value> exception = try_catch.Exception();
+    if (exception.IsEmpty() ||
+        exception.As<v8::Object>()
+                ->Get(current, v8::String::NewFromUtf8Literal(isolate, "code"))
+                .ToLocalChecked()
+                ->Int32Value(current)
+                .FromMaybe(-1) != 99) {
+      fprintf(stderr, "the thrown value did not come back\n");
+      ++failures;
+    }
+  }
+
+  // A host-traced reference: a root the C++ side owns and releases. Once it
   // handle scope pops, the object is reachable only through the reference.
   {
     v8::TracedReference<v8::Object> traced;

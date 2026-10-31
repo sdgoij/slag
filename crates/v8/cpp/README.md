@@ -210,6 +210,20 @@ The specification is kept for the process: a template is never freed, and
 `Object::SetAccessor` allocates one for the object's lifetime. The name and data
 are rooted in the ABI's registry, which is what a `Global` does for a host.
 
+### Errors and object identity
+
+`TryCatch::HasCaught` asks whether the last operation left an error, and
+`TryCatch::Exception` returns the thrown language value when there is one: a
+script's `throw` keeps its value across the boundary, so `catch`-style host code
+sees the object that was thrown rather than a message rebuilt from it. A host
+`ThrowError` records a message, so its text is what comes back. `Message` and
+`StackTrace` are still empty (see the limits below).
+
+`Object::GetIdentityHash` answers the engine's id for the object, mixed so
+neighbouring objects do not collide and never zero. The Rust bridge's
+`GetIdentityHash` uses the same function, and both agree with handle equality:
+two handles that compare equal hash equal.
+
 ## The gin target
 
 Actual `gin` cannot be built standalone. `gin/BUILD.gn` has public deps
@@ -241,8 +255,9 @@ not a claim that gin itself links.
 - `String::NewFromUtf8Literal`, `String::NewFromUtf8`, `String::Utf8Value`.
 - `Number::New`, `Integer::New`.
 - `Script::Compile` (parse only) and `Script::Run`.
-- `TryCatch`, `Isolate::ThrowError`, a minimal `Message` (empty, so the sample
-  prints the exception rather than a source line).
+- `TryCatch`, `Isolate::ThrowError`, and a minimal `Message` (empty, so the
+  sample prints the exception rather than a source line). `TryCatch::Exception`
+  returns the thrown language value.
 - `ObjectTemplate`/`FunctionTemplate` and host callbacks with arguments and a
   return value.
 - `Global<T>`, `Maybe<T>`, `MaybeLocal<T>`.
@@ -251,13 +266,16 @@ not a claim that gin itself links.
 - `Object::Get`/`Set` by a key value, through the engine's ToPropertyKey (so a
   numeric or object key names the property the language would), with the
   `uint32_t` index forms built on them. `Has` (own property plus the chain),
-  `Delete`, `GetRealNamedProperty` (own property only, no chain), and the
+  `Delete`, `GetRealNamedProperty` (own property only, no chain), the
   own-property predicates `HasRealNamedProperty`,
-  `HasRealIndexedProperty`, and `HasRealNamedCallbackProperty`.
+  `HasRealIndexedProperty`, and `HasRealNamedCallbackProperty`, and
+  `GetIdentityHash`.
 - `ObjectTemplate::SetHandler` with the named and indexed property handlers:
-  getter, setter, query, deleter, and (for the named one) descriptor and
-  definer, plus `Intercepted`, `PropertyCallbackInfo<T>`, and
-  `PropertyDescriptor`.
+  getter, setter, query, deleter, enumerator, descriptor, and definer, plus
+  `Intercepted`, `PropertyCallbackInfo<T>`, and `PropertyDescriptor`.
+- `ObjectTemplate::SetAccessor` and `Object::SetAccessor` with
+  `AccessorNameGetterCallback`/`AccessorNameSetterCallback`, `Object::New`, and
+  `Array::New` (length and element forms).
 - `TracedReference<T>` as a host-owned root: copy is a second reference, `Reset`
   releases it, and the destructor releases it like any persistent.
 - Handles and persistents as engine roots: a handle slot or a `Global` over an
@@ -276,15 +294,19 @@ not a claim that gin itself links.
   require a cppgc mixin: the facade has no pointer tags and no cppgc.
 - `Global<T>` keeps a value alive, but a `Global` leaked past `Isolate::Dispose`
   is not detected and leaves a dangling retention in the thread-local registry.
-- `Message` is always empty and `StackTrace` is always empty, so the sample's
-  rich error path (source line, caret) is compiled but not taken. An uncaught
-  `Error` therefore prints the engine's generic `TypeError: Uncaught exception`
-  rather than the thrown message; the ABI does not yet expose the thrown value.
+- `Message` is always empty and `StackTrace` is always empty. `TryCatch::Exception`
+  does return the thrown value, though: a script's `throw` carries one, so the
+  object comes back as it was thrown instead of being rebuilt from a message. A
+  host `ThrowError` records only a message, so its text is the fallback. The
+  sample's rich path (source line, caret) is still not taken, because the message
+  and stack are what it reads.
 - `PumpMessageLoop` always returns false; the engine drains jobs inline.
 - `Isolate::Dispose` frees the contexts the facade created; templates are not
   freed.
-- Host callbacks receive `this` now (`FunctionCallbackInfo::This`), but the
-  `Object` surface is still narrow: `GetIdentityHash`'s siblings are absent. An
+- Host callbacks receive `this` now (`FunctionCallbackInfo::This`), and
+  `Object::GetIdentityHash` answers the engine's id for the object, mixed so
+  neighbouring objects do not collide (the Rust bridge's fold is the same
+  function). The rest of the `Object` surface is what V8 declares beyond it. An
   ordinary entry point cannot be re-entered from a callback, because the
   operation that called the callback holds the context; every `Object` operation
   the facade offers routes through the window `PropertyCallbackInfo::token()`

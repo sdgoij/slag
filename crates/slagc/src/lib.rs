@@ -47,7 +47,10 @@ pub struct SlagIsolate {
 /// sample shell does not use it, so it is refused rather than unsound.
 pub struct SlagContext {
     context: RefCell<Context>,
-    pending_error: Rc<RefCell<Option<String>>>,
+    /// The error the last failed operation left: its message is what
+    /// `slag_take_error` reports, and the thrown value, when there is one, is
+    /// what `TryCatch::Exception` returns.
+    pending_error: Rc<RefCell<Option<JsError>>>,
     /// The context's agent address, which is stable because the context boxes it.
     /// A host callback publishes it as its token so it can allocate through the
     /// operation that is running (see [`slag_callback_token`]).
@@ -98,7 +101,7 @@ unsafe fn slice_of<'a, T>(ptr: *const T, len: usize) -> &'a [T] {
 }
 
 fn record(context: &SlagContext, error: JsError) {
-    *context.pending_error.borrow_mut() = Some(error.to_string());
+    *context.pending_error.borrow_mut() = Some(error);
 }
 
 fn reentrant(context: &SlagContext) {
@@ -130,8 +133,8 @@ fn host_fn(context: &SlagContext, callback: SlagHostFn, data: *mut c_void) -> Ho
             },
             None => JsValue::undefined().to_bits(),
         };
-        if let Some(message) = pending.borrow_mut().take() {
-            return Err(JsError::new(ErrorKind::Error, message));
+        if let Some(error) = pending.borrow_mut().take() {
+            return Err(error);
         }
         Ok(JsValue::from_bits(produced))
     })
@@ -479,7 +482,7 @@ pub unsafe extern "C" fn slag_throw_error(
         return;
     };
     let message = text(message, len).unwrap_or("error");
-    *context.pending_error.borrow_mut() = Some(message.to_string());
+    *context.pending_error.borrow_mut() = Some(JsError::new(ErrorKind::Error, message.to_string()));
 }
 
 #[unsafe(no_mangle)]
@@ -504,7 +507,7 @@ pub unsafe extern "C" fn slag_take_error(
     let Some(message) = context.pending_error.borrow_mut().take() else {
         return -1;
     };
-    let bytes = message.as_bytes();
+    let bytes = message.message.as_bytes();
     if buffer.is_null() || len == 0 {
         return 0;
     }
@@ -512,6 +515,28 @@ pub unsafe extern "C" fn slag_take_error(
     std::ptr::copy_nonoverlapping(bytes.as_ptr(), buffer.cast::<u8>(), copy);
     *buffer.add(copy) = 0;
     copy as i64
+}
+
+/// Take the thrown value of the pending exception, when it has one
+/// (`v8::TryCatch::Exception`), writing its tagged bits to `out` and clearing
+/// the pending error. Returns 0 when nothing is pending or the error carries no
+/// language value, which leaves the message for [`slag_take_error`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn slag_take_exception(context: *mut SlagContext, out: *mut u64) -> i32 {
+    let Some(context) = context.as_ref() else {
+        return 0;
+    };
+    let mut pending = context.pending_error.borrow_mut();
+    match pending.as_ref().and_then(|error| error.value) {
+        Some(value) => {
+            *pending = None;
+            if !out.is_null() {
+                *out = value.bits();
+            }
+            1
+        }
+        None => 0,
+    }
 }
 
 #[unsafe(no_mangle)]
@@ -1045,6 +1070,17 @@ pub unsafe extern "C" fn slag_callback_object_own_property_kind(
     }
 }
 
+/// The object's identity hash (`v8::Object::GetIdentityHash`): the engine's id
+/// for the object, mixed so neighbouring objects do not collide and never zero.
+/// 0 for a non-object.
+#[unsafe(no_mangle)]
+pub extern "C" fn slag_object_identity_hash(object: u64) -> i32 {
+    match JsValue::from_bits(object).as_object() {
+        Some(object) => crux::object::identity_hash(object.id()),
+        None => 0,
+    }
+}
+
 /// How many internal fields `object` carries
 /// (`v8::Object::InternalFieldCount`); 0 for a non-object and for an object no
 /// template made.
@@ -1103,9 +1139,9 @@ fn property_key_of(value: Value) -> Option<PropertyKey> {
 
 /// Turn an accessor callback's report into the host function's result: an error
 /// the callback recorded fails the access, and so does a report without one.
-fn accessor_result(pending: Option<String>, code: i32, message: &str) -> Result<(), JsError> {
-    if let Some(message) = pending {
-        return Err(JsError::new(ErrorKind::Error, message));
+fn accessor_result(pending: Option<JsError>, code: i32, message: &str) -> Result<(), JsError> {
+    if let Some(error) = pending {
+        return Err(error);
     }
     if code != 0 {
         return Err(JsError::new(ErrorKind::Error, message.into()));
@@ -1114,7 +1150,7 @@ fn accessor_result(pending: Option<String>, code: i32, message: &str) -> Result<
 }
 
 fn accessor_getter(
-    pending: Rc<RefCell<Option<String>>>,
+    pending: Rc<RefCell<Option<JsError>>>,
     callback: unsafe extern "C" fn(*mut c_void, u64, u64, *mut u64) -> i32,
     data: *mut c_void,
     key: u64,
@@ -1137,7 +1173,7 @@ fn accessor_getter(
 }
 
 fn accessor_setter(
-    pending: Rc<RefCell<Option<String>>>,
+    pending: Rc<RefCell<Option<JsError>>>,
     callback: unsafe extern "C" fn(*mut c_void, u64, u64, u64) -> i32,
     data: *mut c_void,
     key: u64,

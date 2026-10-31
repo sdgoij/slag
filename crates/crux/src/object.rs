@@ -65,6 +65,21 @@ pub fn take_dead_wrapper_ids() -> Vec<u64> {
 /// The next unreserved block of object ids.
 static OBJECT_ID_BLOCKS: AtomicU64 = AtomicU64::new(1);
 
+/// The identity hash a host keys a table by, from an object id
+/// (`v8::Object::GetIdentityHash`).
+///
+/// Ids are consecutive, so folding one to the width a host sees must mix it:
+/// keeping only the low bits (or forcing the low bit non-zero) makes every
+/// neighbouring pair collide, which turns a host's table into a linear probe.
+/// The result is odd, so it is never zero — a host reads zero as "no identity".
+pub fn identity_hash(id: u64) -> i32 {
+    let mut mixed = id.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    mixed = (mixed ^ (mixed >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    mixed = (mixed ^ (mixed >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    mixed ^= mixed >> 31;
+    ((mixed as u32) | 1) as i32
+}
+
 /// How many ids a thread reserves at once. One atomic per block rather than one
 /// per object is what keeps the construct hot path (GC-5) to a cell update,
 /// which is why the counter was thread-local to begin with.
@@ -5858,6 +5873,17 @@ pub(crate) fn value_get_method(value: &Value, key: &JsString) -> Result<Option<V
 mod tests {
     use super::*;
     use crate::symbol::Symbol;
+
+    #[test]
+    fn identity_hash_mixes_neighbouring_ids() {
+        // Non-zero, stable, and neighbouring ids answer different hashes: the
+        // fold a host keys a table by must not collide for consecutive objects.
+        assert_ne!(identity_hash(0), 0);
+        assert_eq!(identity_hash(11), identity_hash(11));
+        for id in 0..32 {
+            assert_ne!(identity_hash(id), identity_hash(id + 1));
+        }
+    }
 
     #[test]
     fn internal_fields_round_trip_and_stay_out_of_the_property_table() {

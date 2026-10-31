@@ -687,6 +687,26 @@ carries is wired, and every `Object` operation the facade offers takes the windo
 while a callback runs. The one remaining absence on the surface is
 `GetIdentityHash`'s siblings.
 
+*The thrown value and the identity hash (2026-10-31).* Two remaining gaps closed.
+The pending-error slot now holds the engine's `JsError` rather than its message,
+so `TryCatch::Exception` can hand back the value a script threw (`slag_take_exception`)
+instead of a string rebuilt from the text; a host `ThrowError` still records a
+message only, and its text is the fallback. The same change makes a host function
+or property callback that records an error propagate that error's value rather
+than a fresh `Error`, because `host_fn` and `CxxHandler::callback` return the
+stored error instead of rebuilding one.
+
+`Object::GetIdentityHash` answers the engine's object id through
+`crux::object::identity_hash`, a splitmix-style fold. The first attempt folded
+the id the way the `v8` crate's bridge did (low bits, forced odd), and the
+harness caught the consequence: consecutive ids collide, so every neighbouring
+pair of objects hashed the same, which is a linear probe for a host's table. The
+fold now lives in `crux` and both faces use it, so the facade and the Rust bridge
+agree on the hash of an object; `gin-shapes` checks stability, non-zero, and that
+eight objects give at least four distinct answers (a hash may collide, a table
+should not be linear). `TryCatch` also gains a clean-run check and a `throw
+{ code: 99 }` whose value comes back intact.
+
 The ABI shape is roughly a struct of up to seven C function pointers, the data
 pointer, and the flags, handed over once per template, with the return codes
 `Intercepted` already defines; the callbacks receive a `PropertyCallbackInfo`

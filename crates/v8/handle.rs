@@ -622,9 +622,9 @@ fn fold_identity(identity: Option<u64>) -> NonZeroI32 {
     let Some(identity) = identity else {
         panic!("bridge bug: a handle with no identity was hashed");
     };
-    // The low bits are the ones that differ between live boxes, and forcing the
-    // low bit keeps the result non-zero; the fallback is unreachable.
-    NonZeroI32::new((identity as u32 | 1) as i32).unwrap_or(NonZeroI32::MIN)
+    // The engine's fold mixes consecutive ids, because keeping only the low bits
+    // makes neighbouring objects collide (see `crux::object::identity_hash`).
+    NonZeroI32::new(crux::object::identity_hash(identity)).unwrap_or(NonZeroI32::MIN)
 }
 
 /// Whether two payloads name the same thing.

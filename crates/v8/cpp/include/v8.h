@@ -284,6 +284,10 @@ class Object : public Value {
    * property. */
   MaybeLocal<Value> GetRealNamedProperty(Local<Context> context, Local<Name> key);
 
+  /* The object's identity hash (`Object::GetIdentityHash`): stable for the
+   * object's life, and equal for handles that compare equal. */
+  int GetIdentityHash() const;
+
   /* Install an accessor on this object (`Object::SetAccessor`): a read of `name`
    * runs `getter` and a write runs `setter`. The specification is owned by the
    * engine for the object's lifetime, like a template. */

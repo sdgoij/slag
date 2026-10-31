@@ -110,6 +110,7 @@ int32_t slag_call_eval(const void* call, const uint8_t* source, size_t len,
 void slag_throw_error(SlagContext* context, const uint8_t* message, size_t len);
 int32_t slag_has_error(SlagContext* context);
 int64_t slag_take_error(SlagContext* context, char* buffer, size_t len);
+int32_t slag_take_exception(SlagContext* context, uint64_t* out);
 
 uint64_t slag_undefined(void);
 uint64_t slag_boolean_new(int32_t value);
@@ -161,6 +162,7 @@ int32_t slag_callback_object_own_property_kind(SlagContext* context,
                                                const void* token, uint64_t object,
                                                uint64_t key, int32_t* out);
 size_t slag_object_internal_field_count(uint64_t object);
+int32_t slag_object_identity_hash(uint64_t object);
 int32_t slag_object_is_api_wrapper(uint64_t object);
 int32_t slag_object_set_internal_field(uint64_t object, size_t index, void* pointer);
 void* slag_object_internal_field(uint64_t object, size_t index);

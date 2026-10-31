@@ -607,6 +607,10 @@ bool Object::Delete(Local<Context> context, uint32_t index) {
                 Local<Value>::New(slag_number_new(static_cast<double>(index))));
 }
 
+int Object::GetIdentityHash() const {
+  return slag_object_identity_hash(Raw(this));
+}
+
 MaybeLocal<Value> Object::GetRealNamedProperty(Local<Context> context,
                                                Local<Name> key) {
   if (context.IsEmpty() || key.IsEmpty()) return MaybeLocal<Value>();
@@ -740,6 +744,13 @@ Local<Value> TryCatch::Exception() const {
   auto* context = reinterpret_cast<Context*>(
       static_cast<uintptr_t>(g_current_context));
   if (context == nullptr) return Local<Value>();
+  // The thrown value first: a script's `throw` carries one, and that is what V8
+  // hands back. A host `ThrowError` records a message only, so its text is the
+  // fallback.
+  uint64_t thrown = 0;
+  if (slag_take_exception(context->slag(), &thrown) != 0) {
+    return Local<Value>::New(thrown);
+  }
   char buffer[1024];
   int64_t len = slag_take_error(context->slag(), buffer, sizeof(buffer));
   if (len < 0) return Local<Value>();
