@@ -658,8 +658,22 @@ enumerator through `Object.keys` (which also needs each key's own descriptor) an
 the indexed one through `Reflect.ownKeys` (which asks only for the keys, so it
 needs no descriptor callback).
 
-What remains is `SetAccessor`, a separate surface: it needs an accessor callback
-whose getter runs as a function with the property's key in hand.
+*Accessors (2026-10-31).* `SetAccessor` landed last, on both a template and an
+existing object. The engine has no separate accessor seam and does not need one:
+the getter and setter are installed as an own accessor property whose get and set
+are *host functions*, so they run with the dispatch's agent, its allocation
+window, and the context's pending-error slot. The C++ side stores a specification
+per accessor (the two callbacks, the name bits, the data bits) and passes its
+address, which the Rust side keeps for the property's life; the name and data are
+rooted in the ABI registry because `Global` is defined after `ObjectTemplate` in
+the header. `gin-shapes` reads the accessor from script (the getter builds the
+object it answers with), writes it from script, and checks the object form
+through C++.
+
+With that, every callback a `NamedPropertyHandlerConfiguration` or an accessor
+carries is wired. What the facade still does not offer is the rest of the
+`Object` surface (`GetIdentityHash`'s siblings) and the reads a callback cannot
+make (`Object::Get`, `Object::Has` take no window).
 
 The ABI shape is roughly a struct of up to seven C function pointers, the data
 pointer, and the flags, handed over once per template, with the return codes

@@ -240,6 +240,35 @@ int32_t IndexedEnumeratorTrampoline(void* state, uint64_t data, uint64_t holder,
   return static_cast<int32_t>(configuration->enumerator(info));
 }
 
+int32_t AccessorGetterTrampoline(void* data, uint64_t holder, uint64_t key,
+                                 uint64_t* out) {
+  auto* accessor = static_cast<v8::ObjectTemplate::Accessor*>(data);
+  if (accessor == nullptr || accessor->getter == nullptr || out == nullptr) {
+    return 1;
+  }
+  *out = slag_undefined();
+  CallbackToken token;
+  v8::PropertyCallbackInfo<v8::Value> info(v8::g_current_isolate, holder,
+                                           accessor->data_bits, out,
+                                           token.get());
+  accessor->getter(v8::Local<v8::Name>::New(key), info);
+  return 0;
+}
+
+int32_t AccessorSetterTrampoline(void* data, uint64_t holder, uint64_t key,
+                                 uint64_t value) {
+  auto* accessor = static_cast<v8::ObjectTemplate::Accessor*>(data);
+  if (accessor == nullptr || accessor->setter == nullptr) return 1;
+  CallbackToken token;
+  uint64_t answer = slag_undefined();
+  v8::PropertyCallbackInfo<void> info(v8::g_current_isolate, holder,
+                                      accessor->data_bits, &answer,
+                                      token.get());
+  accessor->setter(v8::Local<v8::Name>::New(key),
+                   v8::Local<v8::Value>::New(value), info);
+  return 0;
+}
+
 /* The descriptor a definer is handed: built from the ABI's present-or-absent
  * fields, into the `v8::PropertyDescriptor` the callback takes. */
 v8::PropertyDescriptor DescriptorOf(const SlagPropertyDescriptor& source) {
@@ -473,6 +502,28 @@ Maybe<bool> Object::Has(Local<Context> context, uint32_t index) {
              Local<Value>::New(slag_number_new(static_cast<double>(index))));
 }
 
+void Object::SetAccessor(Local<Context> context, Local<Name> name,
+                         AccessorNameGetterCallback getter,
+                         AccessorNameSetterCallback setter, Local<Value> data) {
+  if (context.IsEmpty() || name.IsEmpty() || getter == nullptr) return;
+  auto* current = reinterpret_cast<Context*>(
+      static_cast<uintptr_t>(context.raw()));
+  // The Rust side keeps this pointer, so the specification is owned by the engine
+  // for the object's lifetime, the same way a template is. The name and data are
+  // roots for the process, like a `Global` the host never resets.
+  auto* accessor = new ObjectTemplate::Accessor();
+  accessor->getter = getter;
+  accessor->setter = setter;
+  accessor->name_bits = name.raw();
+  accessor->data_bits = data.IsEmpty() ? slag_undefined() : data.raw();
+  slag_root_retain(accessor->name_bits);
+  slag_root_retain(accessor->data_bits);
+  slag_object_set_accessor(
+      current->slag(), Raw(this), accessor->name_bits, &AccessorGetterTrampoline,
+      accessor->setter == nullptr ? nullptr : &AccessorSetterTrampoline,
+      accessor);
+}
+
 namespace {
 
 /* `v8::Array`'s allocation, shared by the length and element forms. A null
@@ -686,6 +737,23 @@ void ObjectTemplate::Set(Isolate*, const char* name,
           static_cast<uintptr_t>(function.raw()))});
 }
 
+void ObjectTemplate::SetAccessor(Local<Name> name,
+                                 AccessorNameGetterCallback getter,
+                                 AccessorNameSetterCallback setter,
+                                 Local<Value> data) {
+  if (name.IsEmpty() || getter == nullptr) return;
+  Accessor accessor;
+  accessor.getter = getter;
+  accessor.setter = setter;
+  accessor.name_bits = name.raw();
+  accessor.data_bits = data.IsEmpty() ? slag_undefined() : data.raw();
+  // The template outlives the scopes the name and data were made in, and it is
+  // never freed, so the roots are held for the process (like `Global` holds one).
+  slag_root_retain(accessor.name_bits);
+  slag_root_retain(accessor.data_bits);
+  accessors_.push_back(std::move(accessor));
+}
+
 MaybeLocal<Object> ObjectTemplate::NewInstance(Local<Context> context) {
   if (context.IsEmpty()) return MaybeLocal<Object>();
   auto* current = reinterpret_cast<Context*>(
@@ -734,6 +802,18 @@ MaybeLocal<Object> ObjectTemplate::NewInstance(Local<Context> context) {
             slag, object,
             reinterpret_cast<const uint8_t*>(entry.name.data()),
             entry.name.size(), &HostTrampoline, entry.function) != 0) {
+      return MaybeLocal<Object>();
+    }
+  }
+  // Each accessor's specification lives in the template, which is not freed, so
+  // its address is stable for as long as an instance can call it.
+  for (auto& accessor : accessors_) {
+    const slag_accessor_getter getter =
+        accessor.getter == nullptr ? nullptr : &AccessorGetterTrampoline;
+    const slag_accessor_setter setter =
+        accessor.setter == nullptr ? nullptr : &AccessorSetterTrampoline;
+    if (slag_object_set_accessor(slag, object, accessor.name_bits, getter,
+                                 setter, &accessor) != 0) {
       return MaybeLocal<Object>();
     }
   }

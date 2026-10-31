@@ -201,19 +201,29 @@ impl FunctionCall<'_> {
         get: Option<HostFn>,
         set: Option<HostFn>,
     ) -> Result<(), JsError> {
+        let property = PropertyKey::from_js_string(&JsString::from_utf8(key));
         define_accessor_with(
             realm_function_prototype(crate::context::callback_agent(self.agent)?)?,
             target,
+            &property,
             key,
             get,
             set,
         )
     }
+
+    /// Open the property-callback window this call runs in: the property-callback
+    /// form of the agent [`FunctionCall`] is handed. The facade installs an
+    /// accessor's getter and setter as host functions, and this is what makes the
+    /// token a `v8::PropertyCallbackInfo` publishes name a running window.
+    pub fn enter_callback_window(&self) -> CallbackGuard {
+        CallbackWindow::enter(self.agent)
+    }
 }
 
 /// A re-entrant window for a host callback that is not a function call: the
-/// property handlers' getter, setter, descriptor, definer, and (when it lands)
-/// enumerator callbacks.
+/// property handlers' getter, setter, descriptor, definer, and enumerator
+/// callbacks, and an accessor's getter and setter.
 ///
 /// [`FunctionCall`] is the same window for a function call. What both provide is
 /// an agent to allocate through: the operation that called the callback holds
@@ -869,10 +879,26 @@ impl Context {
         get: Option<HostFn>,
         set: Option<HostFn>,
     ) -> Result<(), JsError> {
+        let property = PropertyKey::from_js_string(&JsString::from_utf8(key));
+        self.define_accessor_key(target, &property, key, get, set)
+    }
+
+    /// The key-value form of [`define_accessor`](Self::define_accessor), for a
+    /// symbol key or a name a host holds as a value
+    /// (`v8::ObjectTemplate::SetAccessor`).
+    pub fn define_accessor_key(
+        &self,
+        target: &JsObject,
+        key: &PropertyKey,
+        label: &str,
+        get: Option<HostFn>,
+        set: Option<HostFn>,
+    ) -> Result<(), JsError> {
         define_accessor_with(
             realm_function_prototype(&self.agent)?,
             target,
             key,
+            label,
             get,
             set,
         )
@@ -1733,12 +1759,13 @@ fn realm_object_prototype(agent: &Agent) -> Result<Option<Handle<CruxObject>>, J
         .and_then(|value| value.as_object()))
 }
 
-/// The shared body of `Context::define_accessor` and
-/// `FunctionCall::define_accessor`.
+/// The shared body of `Context::define_accessor`, `Context::define_accessor_key`,
+/// and `FunctionCall::define_accessor`.
 fn define_accessor_with(
     function_prototype: Option<Handle<CruxObject>>,
     target: &JsObject,
-    key: &str,
+    key: &crux::property::PropertyKey,
+    label: &str,
     get: Option<HostFn>,
     set: Option<HostFn>,
 ) -> Result<(), JsError> {
@@ -1746,7 +1773,7 @@ fn define_accessor_with(
         .map(|callback| {
             build_host_fn(
                 function_prototype,
-                Some(JsString::from_utf8(&format!("get {key}"))),
+                Some(JsString::from_utf8(&format!("get {label}"))),
                 0,
                 callback,
             )
@@ -1757,15 +1784,15 @@ fn define_accessor_with(
         .map(|callback| {
             build_host_fn(
                 function_prototype,
-                Some(JsString::from_utf8(&format!("set {key}"))),
+                Some(JsString::from_utf8(&format!("set {label}"))),
                 0,
                 callback,
             )
             .map(Value::Function)
         })
         .transpose()?;
-    target.0.define_property_or_throw(
-        &JsString::from_utf8(key),
+    target.0.define_property_key_or_throw(
+        key,
         &PropertyDescriptor {
             value: None,
             writable: None,

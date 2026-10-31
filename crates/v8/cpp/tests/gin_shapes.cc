@@ -192,6 +192,36 @@ v8::Intercepted HostEnumerateIndex(
   return v8::Intercepted::kYes;
 }
 
+// An accessor installed with `SetAccessor`: the getter allocates the object it
+// answers with and reports the property's key and the accessor's data, and the
+// setter records the value it was given.
+struct HostAccessor {
+  int gets = 0;
+  int sets = 0;
+  int last = 0;
+};
+
+HostAccessor host_accessor;
+
+void HostAccessGet(v8::Local<v8::Name> property,
+                   const v8::PropertyCallbackInfo<v8::Value>& info) {
+  v8::Isolate* isolate = info.GetIsolate();
+  ++host_accessor.gets;
+  v8::Local<v8::Context> context = isolate->GetCurrentContext();
+  v8::Local<v8::Object> answer = v8::Object::New(context);
+  if (answer.IsEmpty()) return;
+  answer->Set(context, v8::String::NewFromUtf8Literal(isolate, "name"), property);
+  answer->Set(context, v8::String::NewFromUtf8Literal(isolate, "data"), info.Data());
+  info.GetReturnValue().Set(answer);
+}
+
+void HostAccessSet(v8::Local<v8::Name>, v8::Local<v8::Value> value,
+                   const v8::PropertyCallbackInfo<void>& info) {
+  ++host_accessor.sets;
+  host_accessor.last =
+      value->Int32Value(info.GetIsolate()->GetCurrentContext()).FromMaybe(-1);
+}
+
 // A descriptor callback answers with an object, so it builds one inside the
 // callback: the re-entrant window is what makes that legal.
 v8::Intercepted HostDescriptor(
@@ -763,6 +793,79 @@ int main() {
         indexed_keys->Int32Value(current).FromMaybe(-1) == 1;
     if (!indexed_enumerated || host_names.indexed_enumerators == 0) {
       fprintf(stderr, "the indexed enumerator's keys did not reach the engine\n");
+      ++failures;
+    }
+  }
+
+  // An accessor installed on a template: a read runs the getter (which allocates),
+  // a write runs the setter, and the accessor's data arrives on the info.
+  {
+    v8::HandleScope scope(isolate);
+    v8::Local<v8::Context> current = context.Get(isolate);
+    v8::Context::Scope context_scope(current);
+
+    v8::Local<v8::ObjectTemplate> tmpl = v8::ObjectTemplate::New(isolate);
+    tmpl->SetAccessor(v8::String::NewFromUtf8Literal(isolate, "lazy"),
+                      HostAccessGet, HostAccessSet,
+                      v8::Integer::New(isolate, 3));
+    v8::Local<v8::Object> object = tmpl->NewInstance(current).ToLocalChecked();
+
+    const char kAccessorObject[] = "accessor_obj";
+    if (slag_object_set(slag_global(current->slag()),
+                        reinterpret_cast<const uint8_t*>(kAccessorObject),
+                        sizeof(kAccessorObject) - 1, object.raw()) != 0) {
+      fprintf(stderr, "the accessor instance could not be installed\n");
+      ++failures;
+    }
+
+    v8::Local<v8::Value> read;
+    bool accessor_read =
+        v8::Script::Compile(
+            current,
+            v8::String::NewFromUtf8Literal(
+                isolate,
+                "(accessor_obj.lazy.name === 'lazy' &&"
+                " accessor_obj.lazy.data === 3 &&"
+                " Object.keys(accessor_obj).indexOf('lazy') >= 0) ? 1 : 0"))
+            .ToLocalChecked()
+            ->Run(current)
+            .ToLocal(&read) &&
+        read->Int32Value(current).FromMaybe(-1) == 1;
+    if (!accessor_read || host_accessor.gets == 0) {
+      fprintf(stderr, "the accessor getter did not answer\n");
+      ++failures;
+    }
+
+    v8::Local<v8::Value> wrote;
+    bool accessor_write =
+        v8::Script::Compile(
+            current,
+            v8::String::NewFromUtf8Literal(isolate, "accessor_obj.lazy = 9; 1"))
+            .ToLocalChecked()
+            ->Run(current)
+            .ToLocal(&wrote) &&
+        wrote->Int32Value(current).FromMaybe(-1) == 1;
+    if (!accessor_write || host_accessor.sets == 0 || host_accessor.last != 9) {
+      fprintf(stderr, "the accessor setter did not take the write\n");
+      ++failures;
+    }
+
+    // The object form installs the same accessor on an object that already
+    // exists, and reads it back through C++.
+    v8::Local<v8::Object> plain =
+        v8::ObjectTemplate::New(isolate)->NewInstance(current).ToLocalChecked();
+    plain->SetAccessor(current,
+                       v8::String::NewFromUtf8Literal(isolate, "lazy"),
+                       HostAccessGet, nullptr, v8::Integer::New(isolate, 5));
+    v8::Local<v8::Value> direct =
+        plain->Get(current, v8::String::NewFromUtf8Literal(isolate, "lazy"))
+            .ToLocalChecked();
+    v8::Local<v8::Value> direct_data =
+        direct.As<v8::Object>()
+            ->Get(current, v8::String::NewFromUtf8Literal(isolate, "data"))
+            .ToLocalChecked();
+    if (direct_data->Int32Value(current).FromMaybe(-1) != 5) {
+      fprintf(stderr, "Object::SetAccessor did not answer with its data\n");
       ++failures;
     }
   }

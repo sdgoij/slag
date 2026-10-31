@@ -18,6 +18,15 @@ typedef struct SlagTraced SlagTraced;
 typedef uint64_t (*slag_host_fn)(void* data, const void* call, uint64_t this_value,
                                  const uint64_t* args, size_t len);
 
+/* The C callbacks of an accessor (`v8::ObjectTemplate::SetAccessor` and
+ * v8::Object::SetAccessor). The getter writes the value it answers through
+ * `out`; both report 0 on success and 1 with an error pending in the context.
+ * `key` is the name value the accessor was installed under. */
+typedef int32_t (*slag_accessor_getter)(void* data, uint64_t holder, uint64_t key,
+                                        uint64_t* out);
+typedef int32_t (*slag_accessor_setter)(void* data, uint64_t holder, uint64_t key,
+                                        uint64_t value);
+
 /* A property descriptor as the definer callback receives it
  * (v8::PropertyDescriptor). Each field is present-or-absent, because V8's
  * descriptor distinguishes "not mentioned" from "mentioned and false". */
@@ -145,6 +154,9 @@ int32_t slag_object_set_internal_field(uint64_t object, size_t index, void* poin
 void* slag_object_internal_field(uint64_t object, size_t index);
 int32_t slag_object_register_fn(SlagContext* context, uint64_t object, const uint8_t* name,
                                 size_t name_len, slag_host_fn callback, void* data);
+int32_t slag_object_set_accessor(SlagContext* context, uint64_t object, uint64_t key,
+                                 slag_accessor_getter getter, slag_accessor_setter setter,
+                                 void* data);
 int32_t slag_object_set(uint64_t object, const uint8_t* key, size_t key_len,
                         uint64_t value);
 int32_t slag_object_get_key(SlagContext* context, uint64_t object, uint64_t key,

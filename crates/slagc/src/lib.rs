@@ -25,7 +25,8 @@ use handler::CxxHandler;
 pub use handler::{SlagPropertyDescriptor, SlagPropertyHandler};
 
 use crux::heap::{GcAny, RootSource, Trace, register_root_source};
-use crux::value::Value;
+use crux::property::PropertyKey;
+use crux::value::{Value, ValueKind};
 use slag::api::{Local as EngineLocal, Traced};
 use slag::{
     CallbackWindow, CompiledScript, Context, ErrorKind, FunctionCall, HostFn, JsError, JsValue,
@@ -70,6 +71,13 @@ pub struct SlagTraced {
 /// host callback re-enters the engine.
 pub type SlagHostFn =
     Option<unsafe extern "C" fn(*mut c_void, *const c_void, u64, *const u64, usize) -> u64>;
+
+/// The C++ side's accessor callbacks (`v8::ObjectTemplate::SetAccessor`):
+/// `(data, holder, key, out)` writes the value a read answers, and
+/// `(data, holder, key, value)` takes a write. Both report 1 with an error in the
+/// context's pending slot, and 2 for a bad argument.
+pub type SlagAccessorGetter = Option<unsafe extern "C" fn(*mut c_void, u64, u64, *mut u64) -> i32>;
+pub type SlagAccessorSetter = Option<unsafe extern "C" fn(*mut c_void, u64, u64, u64) -> i32>;
 
 unsafe fn bytes<'a>(ptr: *const u8, len: usize) -> &'a [u8] {
     if ptr.is_null() {
@@ -919,6 +927,122 @@ pub extern "C" fn slag_object_internal_field(object: u64, index: usize) -> *mut 
         .map_or(std::ptr::null_mut(), |object| {
             object.internal_field(index) as *mut c_void
         })
+}
+
+/// The property key a name value names: the string or symbol `SetAccessor`
+/// passes (`v8::Name`).
+fn property_key_of(value: Value) -> Option<PropertyKey> {
+    match value.kind() {
+        ValueKind::String(text) => Some(PropertyKey::from_js_string(&text)),
+        ValueKind::Symbol(symbol) => Some(PropertyKey::Symbol(symbol)),
+        _ => None,
+    }
+}
+
+/// Turn an accessor callback's report into the host function's result: an error
+/// the callback recorded fails the access, and so does a report without one.
+fn accessor_result(pending: Option<String>, code: i32, message: &str) -> Result<(), JsError> {
+    if let Some(message) = pending {
+        return Err(JsError::new(ErrorKind::Error, message));
+    }
+    if code != 0 {
+        return Err(JsError::new(ErrorKind::Error, message.into()));
+    }
+    Ok(())
+}
+
+fn accessor_getter(
+    pending: Rc<RefCell<Option<String>>>,
+    callback: unsafe extern "C" fn(*mut c_void, u64, u64, *mut u64) -> i32,
+    data: *mut c_void,
+    key: u64,
+) -> HostFn {
+    Box::new(move |call: &FunctionCall<'_>| {
+        // The getter runs as a host function, so the agent is already the
+        // dispatch's; publishing it is what lets the callback allocate.
+        let _window = call.enter_callback_window();
+        let mut answer = JsValue::undefined().to_bits();
+        // SAFETY: the callback is the facade's, and the pointers are this
+        // invocation's.
+        let code = unsafe { callback(data, call.this().to_bits(), key, &mut answer) };
+        accessor_result(
+            pending.borrow_mut().take(),
+            code,
+            "the accessor getter failed",
+        )?;
+        Ok(JsValue::from_bits(answer))
+    })
+}
+
+fn accessor_setter(
+    pending: Rc<RefCell<Option<String>>>,
+    callback: unsafe extern "C" fn(*mut c_void, u64, u64, u64) -> i32,
+    data: *mut c_void,
+    key: u64,
+) -> HostFn {
+    Box::new(move |call: &FunctionCall<'_>| {
+        let _window = call.enter_callback_window();
+        let value = call.arg(0).unwrap_or_else(JsValue::undefined).to_bits();
+        // SAFETY: as in `accessor_getter`.
+        let code = unsafe { callback(data, call.this().to_bits(), key, value) };
+        accessor_result(
+            pending.borrow_mut().take(),
+            code,
+            "the accessor setter failed",
+        )?;
+        Ok(JsValue::undefined())
+    })
+}
+
+/// Define an accessor property (`v8::ObjectTemplate::SetAccessor` and
+/// `v8::Object::SetAccessor`): `key` names it, and the two callbacks run as host
+/// functions, so a read or a write reaches the host with the property's key and
+/// a working allocation window. `data` is handed back to each callback.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn slag_object_set_accessor(
+    context: *mut SlagContext,
+    object: u64,
+    key: u64,
+    getter: SlagAccessorGetter,
+    setter: SlagAccessorSetter,
+    data: *mut c_void,
+) -> i32 {
+    let Some(context) = context.as_ref() else {
+        return 2;
+    };
+    let Some(target) = JsValue::from_bits(object).as_object() else {
+        return 2;
+    };
+    let key_value = Value::from_bits(key);
+    let Some(property) = property_key_of(key_value) else {
+        return 2;
+    };
+    // A `SetAccessor` always has a getter; a write-only property is not one V8
+    // offers.
+    if getter.is_none() {
+        return 2;
+    }
+    let label = match key_value.kind() {
+        ValueKind::String(text) => text.to_string_lossy(),
+        _ => "symbol".to_string(),
+    };
+    let pending = Rc::clone(&context.pending_error);
+    let get = getter.map(|callback| accessor_getter(Rc::clone(&pending), callback, data, key));
+    let set = setter.map(|callback| accessor_setter(pending, callback, data, key));
+    let engine = match context.context.try_borrow() {
+        Ok(engine) => engine,
+        Err(_) => {
+            reentrant(context);
+            return 1;
+        }
+    };
+    match engine.define_accessor_key(&target, &property, &label, get, set) {
+        Ok(()) => 0,
+        Err(error) => {
+            record(context, error);
+            1
+        }
+    }
 }
 
 /// Define a host function on `object`: the per-instance methods a template's

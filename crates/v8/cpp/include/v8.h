@@ -13,6 +13,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <memory>
 #include <string>
 #include <type_traits>
@@ -37,6 +38,8 @@ class ArrayBuffer;
 
 template <class T>
 class FunctionCallbackInfo;
+template <class T>
+class PropertyCallbackInfo;
 template <class T>
 class ReturnValue;
 template <class T>
@@ -218,6 +221,14 @@ class Value {
   Maybe<int32_t> Int32Value(Local<Context> context) const;
 };
 
+/* An accessor's callbacks (`v8::AccessorNameGetterCallback` and its setter):
+ * the key the accessor was installed under, and the property-callback info the
+ * handler callbacks use. */
+using AccessorNameGetterCallback = void (*)(Local<Name> property,
+                                            const PropertyCallbackInfo<Value>& info);
+using AccessorNameSetterCallback = void (*)(Local<Name> property, Local<Value> value,
+                                            const PropertyCallbackInfo<void>& info);
+
 class Object : public Value {
  public:
   /* The internal field `Wrappable<T>` reads: the first, where gin keeps the
@@ -272,6 +283,14 @@ class Object : public Value {
    * (`Object::GetRealNamedProperty`). Empty when the object has no such own
    * property. */
   MaybeLocal<Value> GetRealNamedProperty(Local<Context> context, Local<Name> key);
+
+  /* Install an accessor on this object (`Object::SetAccessor`): a read of `name`
+   * runs `getter` and a write runs `setter`. The specification is owned by the
+   * engine for the object's lifetime, like a template. */
+  void SetAccessor(Local<Context> context, Local<Name> name,
+                   AccessorNameGetterCallback getter,
+                   AccessorNameSetterCallback setter = nullptr,
+                   Local<Value> data = Local<Value>());
 
   /* The own-property predicates (`Object::HasRealNamedProperty` and its
    * siblings): no interceptor and no prototype walk. `HasRealIndexedProperty`
@@ -676,6 +695,25 @@ class ObjectTemplate {
    * (`v8::ObjectTemplate::SetHandler` with an indexed configuration). */
   void SetHandler(const IndexedPropertyHandlerConfiguration& configuration);
 
+  /* Install an accessor on every instance (`v8::ObjectTemplate::SetAccessor`):
+   * a read of `name` runs `getter` and a write runs `setter`, with `data`
+   * arriving on the callback info. */
+  void SetAccessor(Local<Name> name, AccessorNameGetterCallback getter,
+                   AccessorNameSetterCallback setter = nullptr,
+                   Local<Value> data = Local<Value>());
+
+  /* One installed accessor: the name and data are retained for the template's
+   * lifetime (templates are not freed), and their bits are kept so the
+   * trampolines do not have to make a handle per access. `Global` is defined
+   * later in this header, so the retention is the ABI's root registry. */
+  struct Accessor {
+    uint64_t name_bits = 0;
+    uint64_t data_bits = 0;
+    AccessorNameGetterCallback getter = nullptr;
+    AccessorNameSetterCallback setter = nullptr;
+  };
+  const std::deque<Accessor>& accessors() const { return accessors_; }
+
   /* Create an instance of this template: an ordinary object with the template's
    * internal fields, its host functions, and `IsApiWrapper` set. A template with
    * a handler makes an object whose property access goes to it. */
@@ -683,6 +721,7 @@ class ObjectTemplate {
 
  private:
   std::vector<Entry> entries_;
+  std::deque<Accessor> accessors_;
   int internal_fields_ = 0;
   NamedPropertyHandlerConfiguration named_handler_;
   IndexedPropertyHandlerConfiguration indexed_handler_;

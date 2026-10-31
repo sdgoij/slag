@@ -192,6 +192,21 @@ script, where `in` and a member read both reach the handler. `Object.keys`
 walks the enumerator's keys, and the indexed handler's enumerator is read back
 through `Reflect.ownKeys`.
 
+### Accessors
+
+`ObjectTemplate::SetAccessor` and `Object::SetAccessor` install an accessor whose
+getter and setter are the host's callbacks (`v8::AccessorNameGetterCallback` and
+`v8::AccessorNameSetterCallback`). Each callback receives the property's key and
+a `PropertyCallbackInfo` carrying the accessor's `data`, and the getter answers
+through `GetReturnValue()`. The engine installs the pair as an own accessor
+property whose get and set are host functions, so the callbacks run with the
+normal host-function agent and the allocation window; a template installs one on
+every instance, and the object form installs one on the object it is called on.
+
+The specification is kept for the process: a template is never freed, and
+`Object::SetAccessor` allocates one for the object's lifetime. The name and data
+are rooted in the ABI's registry, which is what a `Global` does for a host.
+
 ## The gin target
 
 Actual `gin` cannot be built standalone. `gin/BUILD.gn` has public deps
@@ -266,13 +281,18 @@ not a claim that gin itself links.
 - `Isolate::Dispose` frees the contexts the facade created; templates are not
   freed.
 - Host callbacks receive `this` now (`FunctionCallbackInfo::This`), but the
-  `Object` surface is still narrow: `SetAccessor` and `GetIdentityHash`'s
-  siblings are absent. An ordinary entry point cannot be re-entered from a
-  callback, because the operation that called the callback holds the context; a
-  callback's allocations go through the window `PropertyCallbackInfo::token()`
-  names, which the facade wires into `Object::New`, `Array::New`, and
-  `Object::Set`. A callback's reads do not reach `Object::Get` or `Object::Has`:
-  only allocation and `Object::Set` take the window.
+  `Object` surface is still narrow: `GetIdentityHash`'s siblings are absent. An
+  ordinary entry point cannot be re-entered from a callback, because the
+  operation that called the callback holds the context; a callback's allocations
+  go through the window `PropertyCallbackInfo::token()` names, which the facade
+  wires into `Object::New`, `Array::New`, and `Object::Set`. A callback's reads
+  do not reach `Object::Get` or `Object::Has`: only allocation and `Object::Set`
+  take the window.
+- An accessor installed with `SetAccessor` keeps its specification for the
+  process: a template owns its specifications and is never freed, and
+  `Object::SetAccessor` allocates one and holds it for the object's lifetime. The
+  name and data are roots in the ABI's registry rather than `Global`s, because
+  `Global` is defined after `ObjectTemplate` in the header.
 - `load()` is compiled but refused at run time. The sample re-enters through
   `ExecuteString`, and the safe engine path for a host callback is
   `FunctionCall::eval` (`slag_call_eval`), which the sample does not call. The
