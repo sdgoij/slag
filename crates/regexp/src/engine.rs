@@ -5,6 +5,7 @@
 //! drives a task stack (the forward path) and a backtrack stack (the choice
 //! points), so recursion depth tracks pattern structure, never input length.
 
+use crate::small_stack::SmallStack;
 use crate::{CharClass, Node, Predicate, Regex};
 
 /// Canonicalize (spec 22.2.3.2.2): simple case folding under `u`/`v`,
@@ -357,13 +358,25 @@ struct Choice<'a> {
     resume: Option<Task<'a>>,
 }
 
+/// Inline task-stack capacity: a match that never nests deeper than this never
+/// allocates (see `small_stack`). Eight covers literals, classes, small groups
+/// and a repeat's own bookkeeping.
+const TASK_STACK_INLINE: usize = 8;
+
+/// Inline backtrack-point capacity (see `TASK_STACK_INLINE`).
+const CHOICE_STACK_INLINE: usize = 4;
+
 /// The explicit-stack backtracking matcher.
 struct Matcher<'a, 'i> {
     re: &'a Regex,
     ctx: Ctx<'i>,
     caps: Caps,
-    tasks: Vec<Task<'a>>,
-    choices: Vec<Choice<'a>>,
+    /// The forward-path task stack: inline for a shallow match (a one-atom
+    /// pattern must not allocate), spilling only for a deep one.
+    tasks: SmallStack<Task<'a>, TASK_STACK_INLINE>,
+    /// The backtrack points: inline up to [`CHOICE_STACK_INLINE`], so a short
+    /// backtracking match does not grow a `Vec` from empty.
+    choices: SmallStack<Choice<'a>, CHOICE_STACK_INLINE>,
     pos: usize,
     dir: i32,
     /// Whether the pattern contains no backreferences. When true, a
@@ -426,8 +439,8 @@ impl<'a, 'i> Matcher<'a, 'i> {
                 unicode: re.flags.has_unicode(),
             },
             caps,
-            tasks: Vec::new(),
-            choices: Vec::new(),
+            tasks: SmallStack::new(),
+            choices: SmallStack::new(),
             pos: 0,
             dir: 1,
             steps: 0,

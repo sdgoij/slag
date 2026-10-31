@@ -20383,3 +20383,32 @@ a per-call one.
 
 Gates: fmt, `clippy --workspace --all-targets -D warnings`, 5861 tests, four
 sweeps 51,998 at 100%, corpus parity 0.
+
+## LANDED (2026-10-30): the regexp matcher's task stack is inline
+
+The engine built its task and backtrack-point stacks as empty `Vec`s on every
+match, so even `/a/` against an EMPTY input allocated once: the counting
+allocator in `crates/regexp/tests/perf.rs` reports 1.00 allocs per
+`search_end_at` call, and the engine's fixed cost was 54 of the 60 ns a
+`/a/.test(...)` cost. `SmallStack<T, N>` (new module) keeps the first `N`
+entries in the matcher and spills to a `Vec` only past that, with the drop
+accounting a non-`Copy` element needs (`Task` holds an `Rc<[usize]>`).
+
+| engine-only, 1M calls (perf harness) | before | after |
+| --- | ---: | ---: |
+| `/a/` on 8 units | 60 ns, 1.0 allocs | **49 ns, 0.0** |
+| `/[a-z]+/` on 8 units | 261 ns, 6.0 | **225 ns, 4.0** |
+| `/a/` on empty (setup only) | 57 ns, 1.0 | **47 ns, 0.0** |
+
+Corpus `opcost/regexp_test` 32.9 -> **29.6 ms** (-10%), and the jitless column
+43.2 -> 38.8, because the interpreter runs the same engine.
+
+What is left in `/[a-z]+/`'s 225 ns is 4 allocations: each backtrack point
+snapshots the continuation as `Rc::from(tasks.as_slice())`, and 8 characters of
+`[a-z]+` create four of them. Replacing that snapshot with an index into a
+shared task log (the choice records the task length, and the log is copied only
+when a choice is popped below its base) is the next engine slice, worth ~4
+allocations per match on every backtracking pattern.
+
+Gates: fmt, `clippy --workspace --all-targets -D warnings`, 5863 tests (two new
+`SmallStack` tests), four sweeps 51,998 at 100%, corpus parity 0.
