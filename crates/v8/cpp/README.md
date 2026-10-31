@@ -288,6 +288,25 @@ and (for the setter) the assigned value as the first argument. The
 `PropertyAttribute` bits are honoured: `DontEnum` and `DontDelete` reach the
 descriptor, and `ReadOnly` installs no setter.
 
+### Embedder data, security tokens, and creation context
+
+`Context::SetEmbedderData`/`GetEmbedderData` and
+`SetAlignedPointerInEmbedderData`/`GetAlignedPointerFromEmbedderData` are the
+slots a host attaches to a realm, with `GetNumberOfEmbedderDataFields` and
+`ClearAllSlots`. A value slot is a root, so replacing one releases the old root
+and `ClearAllSlots` (or the context's destructor) releases them all; a pointer
+slot is the host's address and is not traced. The two stores are separate, and
+the Rust bridge keeps only the pointer form.
+
+`Context::GetSecurityToken` answers the context's token, or the isolate's
+default (one null-prototype object, minted on the first ask and shared by every
+context without one) when none was set. `SetSecurityToken` replaces it and
+`UseDefaultSecurityToken` goes back. The token is stored and not consulted: the
+engine has no cross-context access check, which is the gap the Rust bridge
+documents. `Object::GetCreationContext`/`GetCreationContextChecked` answer the
+entered context, because the engine does not record a holder's realm on each
+object and the facade has one realm per entered context.
+
 ### Buffers and typed arrays
 
 `BackingStore` is a handle to the engine's refcounted byte block, so a store
@@ -387,6 +406,9 @@ not a claim that gin itself links.
 - `PropertyAttribute`, `ObjectTemplate::SetNativeDataProperty` and
   `SetLazyDataProperty`, and `Object::SetAccessorProperty` over
   `FunctionTemplate` getters and setters.
+- Embedder data (value and aligned-pointer slots, the field count, and
+  `ClearAllSlots`), security tokens (get, set, and use-default), and
+  `Object::GetCreationContext`/`GetCreationContextChecked`.
 - Handles and persistents as engine roots: a handle slot or a `Global` over an
   engine value retains it for that object's lifetime, and a facade pointer is
   never registered.
@@ -426,6 +448,11 @@ not a claim that gin itself links.
   and a private name is a symbol, so `Object.getOwnPropertySymbols` can see a
   property V8's private names hide completely. `Signature` is absent, along with
   the embedder access checks it exists for.
+- The security token is stored and never consulted: a context's objects are
+  reachable from every other context on the isolate, which is an engine gap
+  rather than a facade decision. Embedder value slots and aligned-pointer slots
+  are separate stores, so `GetEmbedderData` on a pointer slot answers
+  `undefined` rather than an `External`.
 - `Platform` is a handle plus a message pump: `PumpMessageLoop` runs the
   isolate's queued jobs (microtasks, promise reactions, due timers) and answers
   whether it ran any. There are no host-posted platform tasks or task runners
@@ -493,4 +520,8 @@ without a key, `SharedArrayBuffer`, and the external-memory account. The
 property block throws an `Exception::TypeError` and reads its name and message
 back, round-trips a private property (and checks `Object.keys` does not list
 it), reads a lazy and a native data property, checks `DontEnum` and `ReadOnly`,
-and runs a `FunctionTemplate` accessor pair.
+and runs a `FunctionTemplate` accessor pair. The embedder block round-trips a
+value and a pointer slot, checks that a value outlives the scope that made it,
+that `ClearAllSlots` releases both roots, that the default security token is
+one shared object and a set token reads back, and that an object reports the
+entered context.

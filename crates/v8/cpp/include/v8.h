@@ -371,6 +371,13 @@ class Object : public Value {
                    Local<Value> data = Local<Value>(),
                    PropertyAttribute attribute = None);
 
+  /* The context this object was created in (`Object::GetCreationContext`). The
+   * facade has one realm per entered context and the engine does not record a
+   * holder's realm on each object, so the entered context is the answer; with
+   * none entered the handle is empty. */
+  MaybeLocal<Context> GetCreationContext() const;
+  Local<Context> GetCreationContextChecked() const;
+
   /* Install an accessor whose get and set are FunctionTemplates
    * (`Object::SetAccessorProperty`): each runs with the receiver as `this`. */
   void SetAccessorProperty(Local<Name> name, Local<FunctionTemplate> getter,
@@ -1095,6 +1102,26 @@ class Context {
   /* The A0 C ABI context behind this facade object. */
   SlagContext* slag() const { return slag_; }
 
+  /* The host's embedder data (`Context::SetEmbedderData`,
+   * `SetAlignedPointerInEmbedderData`, and their readers). A value slot roots
+   * what it holds; a pointer slot is the host's address and is not traced. The
+   * two stores are separate here: the engine has no tagged slot array, and the
+   * Rust bridge keeps only the pointer form. */
+  void SetAlignedPointerInEmbedderData(int index, void* value);
+  void* GetAlignedPointerFromEmbedderData(int index);
+  void SetEmbedderData(int index, Local<Value> value);
+  Local<Value> GetEmbedderData(int index);
+  uint32_t GetNumberOfEmbedderDataFields();
+  void ClearAllSlots();
+
+  /* The token another context must answer to be allowed to reach this one's
+   * properties (`Context::GetSecurityToken`). Stored and not consulted: the
+   * engine has no cross-context access check, which is the gap the Rust
+   * bridge's `get_security_token` documents. */
+  Local<Value> GetSecurityToken();
+  void SetSecurityToken(Local<Value> token);
+  void UseDefaultSecurityToken();
+
   class Scope {
    public:
     explicit Scope(Local<Context> context) : previous_(g_current_context) {
@@ -1108,6 +1135,10 @@ class Context {
 
  private:
   SlagContext* slag_ = nullptr;
+  std::vector<void*> pointer_slots_;
+  std::vector<uint64_t> value_slots_;
+  /* Retained while set; zero means "the isolate's default". */
+  uint64_t security_token_ = 0;
 
   friend class Isolate;
 };
@@ -1166,6 +1197,9 @@ class Isolate {
   /* `Private::ForApi`'s one-name-one-private registry: the description and the
    * symbol bits, retained until `Dispose`. */
   std::unordered_map<std::string, uint64_t> private_names_;
+  /* The default security token, minted on the first ask and shared by every
+   * context without one of its own. Retained until `Dispose`. */
+  uint64_t default_security_token_ = 0;
 
   friend class Context;
   friend class Private;

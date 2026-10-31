@@ -1538,6 +1538,14 @@ pub unsafe extern "C" fn slag_symbol_description(value: u64, out: *mut u64) -> i
     0
 }
 
+/// A plain object with no prototype, which is what an isolate's default
+/// security token is (`v8::Context::GetSecurityToken`): opaque, comparable by
+/// identity, and shared by every context that has no token of its own.
+#[unsafe(no_mangle)]
+pub extern "C" fn slag_security_token_new() -> u64 {
+    Value::Object(crux::object::JsObject::ordinary_object_create(None)).bits()
+}
+
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn slag_global(context: *mut SlagContext) -> u64 {
     match context.as_ref().and_then(|context| {

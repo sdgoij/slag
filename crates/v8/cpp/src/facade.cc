@@ -1082,6 +1082,87 @@ Local<Value> Private::Name() const {
   return Local<Value>::New(description);
 }
 
+MaybeLocal<Context> Object::GetCreationContext() const {
+  if (g_current_context == 0) return MaybeLocal<Context>();
+  return MaybeLocal<Context>(Local<Context>::New(g_current_context));
+}
+
+Local<Context> Object::GetCreationContextChecked() const {
+  if (g_current_context == 0) return Local<Context>();
+  return Local<Context>::New(g_current_context);
+}
+
+void Context::SetAlignedPointerInEmbedderData(int index, void* value) {
+  if (index < 0) return;
+  const auto slot = static_cast<size_t>(index);
+  if (pointer_slots_.size() <= slot) pointer_slots_.resize(slot + 1, nullptr);
+  pointer_slots_[slot] = value;
+}
+
+void* Context::GetAlignedPointerFromEmbedderData(int index) {
+  if (index < 0) return nullptr;
+  const auto slot = static_cast<size_t>(index);
+  return slot < pointer_slots_.size() ? pointer_slots_[slot] : nullptr;
+}
+
+void Context::SetEmbedderData(int index, Local<Value> value) {
+  if (index < 0) return;
+  const auto slot = static_cast<size_t>(index);
+  if (value_slots_.size() <= slot) value_slots_.resize(slot + 1, 0);
+  const uint64_t bits = value.IsEmpty() ? slag_undefined() : value.raw();
+  slag_root_retain(bits);
+  if (value_slots_[slot] != 0) slag_root_release(value_slots_[slot]);
+  value_slots_[slot] = bits;
+}
+
+Local<Value> Context::GetEmbedderData(int index) {
+  if (index < 0) return Local<Value>();
+  const auto slot = static_cast<size_t>(index);
+  const uint64_t bits = slot < value_slots_.size() && value_slots_[slot] != 0
+                            ? value_slots_[slot]
+                            : slag_undefined();
+  return Local<Value>::New(bits);
+}
+
+uint32_t Context::GetNumberOfEmbedderDataFields() {
+  const size_t fields = pointer_slots_.size() > value_slots_.size()
+                            ? pointer_slots_.size()
+                            : value_slots_.size();
+  return static_cast<uint32_t>(fields);
+}
+
+void Context::ClearAllSlots() {
+  for (uint64_t bits : value_slots_) {
+    if (bits != 0) slag_root_release(bits);
+  }
+  value_slots_.clear();
+  pointer_slots_.clear();
+}
+
+Local<Value> Context::GetSecurityToken() {
+  if (security_token_ != 0) return Local<Value>::New(security_token_);
+  Isolate* isolate = g_current_isolate;
+  if (isolate == nullptr) return Local<Value>();
+  uint64_t& token = isolate->default_security_token_;
+  if (token == 0) {
+    token = slag_security_token_new();
+    slag_root_retain(token);
+  }
+  return Local<Value>::New(token);
+}
+
+void Context::SetSecurityToken(Local<Value> token) {
+  const uint64_t bits = token.IsEmpty() ? 0 : token.raw();
+  if (bits != 0) slag_root_retain(bits);
+  if (security_token_ != 0) slag_root_release(security_token_);
+  security_token_ = bits;
+}
+
+void Context::UseDefaultSecurityToken() {
+  if (security_token_ != 0) slag_root_release(security_token_);
+  security_token_ = 0;
+}
+
 void Isolate::ThrowException(Local<Value> exception) {
   if (exception.IsEmpty()) return;
   slag_throw_exception(CurrentSlagContext(), exception.raw());
@@ -1556,6 +1637,8 @@ Local<Context> Context::New(Isolate* isolate, std::nullptr_t,
 }
 
 Context::~Context() {
+  ClearAllSlots();
+  UseDefaultSecurityToken();
   if (slag_ != nullptr) slag_context_free(slag_);
 }
 
@@ -1578,6 +1661,10 @@ void Isolate::Dispose() {
   contexts_.clear();
   for (const auto& entry : private_names_) slag_root_release(entry.second);
   private_names_.clear();
+  if (default_security_token_ != 0) {
+    slag_root_release(default_security_token_);
+    default_security_token_ = 0;
+  }
   if (slag_ != nullptr) slag_isolate_free(slag_);
   delete this;
 }

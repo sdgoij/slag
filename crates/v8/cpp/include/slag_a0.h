@@ -278,6 +278,8 @@ int32_t slag_throw_exception(SlagContext* context, uint64_t value);
  * `v8::Private`. */
 int32_t slag_symbol_new(const uint8_t* text, size_t len, uint64_t* out);
 int32_t slag_symbol_description(uint64_t value, uint64_t* out);
+/* A fresh null-prototype object for an isolate's default security token. */
+uint64_t slag_security_token_new(void);
 uint64_t slag_global(SlagContext* context);
 int32_t slag_object_new(SlagContext* context, size_t internal_fields,
                         int32_t api_wrapper, uint64_t* out);

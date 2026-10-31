@@ -857,6 +857,31 @@ message, the private name dedupe and round trip, the lazy and native getters
 with `DontEnum`/`ReadOnly`, and the template accessor pair; two runtime tests
 pin the error values and the attribute semantics.
 
+*Embedder data and security tokens (2026-10-31).* The host's realm slots are the
+facade's, not the engine's: `Context` keeps one vector of aligned pointers and
+one of values, retains a value on write and releases the replaced one, and
+releases the rest in `ClearAllSlots` and the destructor. Two stores rather than
+V8's one tagged array is a stated narrowing, and it is why `GetEmbedderData` on
+a pointer slot answers `undefined` instead of an `External`; the Rust bridge has
+the same shape and keeps only the pointer half. The check is a delta on
+`slag_root_count` around `ClearAllSlots` (it must release exactly the two slots
+written) plus a value that outlives the handle scope that made it and a
+collection.
+
+The default security token is the bridge's construction exactly: a
+null-prototype object minted on the first ask through `slag_security_token_new`
+(`crux::object::JsObject::ordinary_object_create(None)`, which needs no agent)
+and retained by the isolate until `Dispose`, so every context without a token of
+its own answers the same object. A set token is retained on the context and
+released when replaced or reset to the default. The token gates nothing, which
+is the engine gap `get_security_token` in the Rust bridge already records.
+
+`Object::GetCreationContext` is the entered context. V8 reads the object's
+creation context out of its map; this engine does not record a realm on an
+object, and the facade has one realm per entered context, so the entered one is
+the truthful answer while a `Context::Scope` is active and the handle is empty
+otherwise.
+
 The ABI shape is roughly a struct of up to seven C function pointers, the data
 pointer, and the flags, handed over once per template, with the return codes
 `Intercepted` already defines; the callbacks receive a `PropertyCallbackInfo`

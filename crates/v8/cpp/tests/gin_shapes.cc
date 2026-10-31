@@ -1595,6 +1595,75 @@ int main() {
            "ExternalMemoryAccounter gave its size back");
   }
 
+  // Embedder data, security tokens, and the creation context: the slots and
+  // identity a host attaches to a realm.
+  {
+    v8::HandleScope scope(isolate);
+    v8::Local<v8::Context> current = context.Get(isolate);
+    v8::Context::Scope context_scope(current);
+    const auto expect = [&](bool condition, const char* what) {
+      if (!condition) {
+        fprintf(stderr, "embedder data: %s\n", what);
+        ++failures;
+      }
+    };
+
+    int marker = 0;
+    current->SetAlignedPointerInEmbedderData(1, &marker);
+    expect(current->GetAlignedPointerFromEmbedderData(1) == &marker &&
+               current->GetAlignedPointerFromEmbedderData(0) == nullptr &&
+               current->GetAlignedPointerFromEmbedderData(7) == nullptr,
+           "an aligned pointer slot round trips");
+
+    current->SetEmbedderData(0, v8::Integer::New(isolate, 5));
+    current->SetEmbedderData(0, v8::Integer::New(isolate, 6));
+    expect(current->GetEmbedderData(0)->Int32Value(current).FromMaybe(-1) == 6,
+           "an embedder value round trips");
+    expect(current->GetEmbedderData(3)->IsUndefined(),
+           "an unwritten embedder value is undefined");
+    expect(current->GetNumberOfEmbedderDataFields() >= 2,
+           "the field count covers both stores");
+
+    // The slot is what names a value set inside a scope that has since popped.
+    {
+      v8::HandleScope inner(isolate);
+      current->SetEmbedderData(2, v8::Integer::New(isolate, 9));
+    }
+    slag_collect(current->slag());
+    expect(current->GetEmbedderData(2)->Int32Value(current).FromMaybe(-1) == 9,
+           "an embedder value outlived the scope that made it");
+
+    const size_t roots_before_clear = slag_root_count();
+    current->ClearAllSlots();
+    const size_t released = roots_before_clear - slag_root_count();
+    expect(released == 2 &&
+               current->GetEmbedderData(0)->IsUndefined() &&
+               current->GetAlignedPointerFromEmbedderData(1) == nullptr &&
+               current->GetNumberOfEmbedderDataFields() == 0,
+           "ClearAllSlots released both slots and forgot them");
+
+    // One default token per isolate, and a set token replaces it until the
+    // context goes back to the default.
+    v8::Local<v8::Value> default_token = current->GetSecurityToken();
+    expect(!default_token.IsEmpty() && default_token->IsObject() &&
+               default_token.raw() == current->GetSecurityToken().raw(),
+           "the default security token is one shared object");
+    v8::Local<v8::Value> custom = v8::Object::New(isolate);
+    current->SetSecurityToken(custom);
+    expect(current->GetSecurityToken().raw() == custom.raw(),
+           "a set security token reads back");
+    current->UseDefaultSecurityToken();
+    expect(current->GetSecurityToken().raw() == default_token.raw(),
+           "UseDefaultSecurityToken went back to the default");
+
+    v8::Local<v8::Object> made = v8::Object::New(isolate);
+    v8::Local<v8::Context> creation;
+    expect(made->GetCreationContext().ToLocal(&creation) &&
+               creation.raw() == current.raw() &&
+               made->GetCreationContextChecked().raw() == current.raw(),
+           "an object reports the entered context");
+  }
+
   // A host-traced reference: a root the C++ side owns and releases. Once it
   // handle scope pops, the object is reachable only through the reference.
   {
