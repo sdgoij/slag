@@ -20484,3 +20484,55 @@ path.
 Verified: clippy `-D warnings` clean; `cargo test --workspace` 5864 pass / 0
 fail; four sweeps at 100% (language 23726, built-ins 23821, annexB 1086,
 intl402 3365); corpus parity 0, `mean-jitGap` 8.14.
+
+## MEASURED (2026-10-31): the two call floors, and two certified-lane slices that do not pay
+
+With the env leaf lane landed, the call lanes measure clean (1M calls, one row
+per process, min of reps):
+
+| probe | ms | reading |
+| --- | ---: | --- |
+| `g(x) { return x + 1 }` (leaf) | 6.9 | ~7 ns/call, the floor |
+| `g(x) { return h(x) }`, `h` a leaf | 59.6 | ~53 ns/call, the certified lane |
+| `f(1)` with `f` writing a captured binding | 13.4 | env leaf, in machine code now |
+| `f(i)` with `f` reading a captured binding | 8.6 | idem |
+
+So a non-leaf JS call costs ~8x a leaf call, and that is the mass in the
+amplified test262 rows: `language/.../for-in/head-let-fresh-binding-per-iteration`
+makes nine certified calls per body (six `assert.sameValue`, three `fns.x()`),
+and at ~53 ns each they are the row's whole 347 ms. Two slices aimed at it were
+implemented, measured and REVERTED:
+
+**Running the callee on the caller's ctx instead of building a fresh one.**
+This mirrors `self_call_inline` (which patches `buf_end` and the nested frame
+only) by patching the callee-owned ctx fields and restoring them after. It is
+SLOWER: 59.6 -> 65.0 ms on the probe, 347 -> 367 on the head-let row. The
+reason is `JitCallContext::intrinsic_bits`, a 15-word inline array: saving,
+writing and restoring it copies 360 bytes per call, where the old construction
+wrote 120 once. The array is the one ctx field whose copy dominates.
+
+**Caching the callee-static facts in the call-site record** (the closure
+environment, the realm global, the body address, the handler flag, and a
+"needs a realm check" flag for an `arguments` body), so a warm call skips the
+`ecma_functions` borrow, its map lookup, the body `Rc` clone and the realm
+dereference. Neutral: 59.6 -> 60.4 ms, head-let 357 -> 358. The registry lookup
+is NOT what the 53 ns is made of.
+
+The conclusion is the one the C3 note reached from the other side: the cost is
+spread over the frame carve (`vm.stack` resize plus the per-slot fill), the
+scratch save/restore (18 fields each way), the ctx construction and the FFI
+boundary, and no single field or lookup is worth a slice. Closing it needs the
+compiled nested-call path (the C3 frame work): the machine code carves the
+frame, and the callee-owned ctx becomes a pointer to a per-realm template
+instead of an inline array, so a nested ctx costs a handful of stores.
+
+Two creation numbers worth keeping, from the same session (300k creates, one
+row per process): a plain function expression with no capture costs 264 ns
+(`g3`), the same create inside a `for (let x in o)` head costs 443 ns, and the
+loop without the create only 57 ns. `SLAG_CLOSURE_PROFILE=1` splits the 264 as
+`function-object` 37, `registry-insert` 82 (which includes the
+`store_construct_patterns` cell write), `props-batch` 19, `compiled-body` 10,
+and ~110 outside `register_function` (the prelude's site lookups and the
+step-entry marshalling). Note the profiler's slot 11 ("pre-epilogue") double
+counts `register_function` (it marks after the call with the mark left over from
+before it), so read `register-total` for that phase, not `pre-epilogue`.
