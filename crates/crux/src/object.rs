@@ -4081,6 +4081,18 @@ impl JsObject {
         true
     }
 
+    /// Whether this object is the empty ordinary receiver
+    /// [`Self::adopt_fresh_data_properties`] requires: an ordinary, extensible
+    /// object still on its canonical empty map with an empty property vector.
+    /// Cheap and allocation-free, so a copy path can test it before building
+    /// the snapshot the batch would need.
+    pub fn is_fresh_plain_object(&self) -> bool {
+        matches!(self.kind, ObjectKind::Ordinary)
+            && self.extensible.get()
+            && self.map.get().is_some_and(|map| map.is_empty())
+            && self.properties.borrow().is_empty()
+    }
+
     /// The whole-key-list define for a FRESH ordinary receiver: resolve (or
     /// fork and cache) the shape `names` from the receiver's current empty map
     /// and adopt `values` in one batch, exactly like a whole object literal.

@@ -859,7 +859,11 @@ pub(crate) fn copy_data_properties(
             Some(keys) => keys,
             None => from_obj.own_property_keys()?,
         };
+        // The freshness test is cheap and allocation-free, so it runs before
+        // the snapshot: a copy into a destination that already has properties
+        // pays neither the snapshot's vectors nor the second descriptor read.
         if ordinary_source
+            && to.is_fresh_plain_object()
             && let Some((atoms, values)) = plain_data_snapshot(&from_obj, &keys)?
             && to.adopt_fresh_data_properties(&atoms, &values)
         {

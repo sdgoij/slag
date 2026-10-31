@@ -20806,3 +20806,17 @@ property, symbol keys, and key order.
 Verified: clippy `-D warnings`; `cargo test --workspace` 5866 pass / 0 fail;
 four sweeps at 100% (language 23726, built-ins 23821, annexB 1086, intl402
 3365); corpus parity 0 (`spread_assign` 137 → 78.7 ms in the corpus run).
+
+## LANDED (2026-10-31): the copy batch tests the destination before snapshotting
+
+`Object.assign` and object spread built the (key-vector, values) snapshot before
+asking whether the destination could adopt it, so every copy into an object that
+already had properties paid two `Vec`s and a second descriptor read per key for
+nothing. The destination's freshness is a cheap allocation-free predicate
+(`JsObject::is_fresh_plain_object`, exposed for exactly this order), so it now
+runs first. A copy into a warm destination: 43.7 -> 29.6 ms (200k assigns,
+interleaved A/B). The adopting path is unchanged (69.6 vs 71.2, within noise),
+since the extra test repeats what `adopt_literal_properties` checks anyway.
+
+Verified: clippy `-D warnings`; `cargo test --workspace` 5866 pass / 0 fail;
+four sweeps at 100%; corpus parity 0 (`spread_assign` 76.2 ms).

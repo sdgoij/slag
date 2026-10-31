@@ -1626,10 +1626,10 @@ fn object_assign(agent: &mut Agent, args: &[Value]) -> Result<Value, JsError> {
         // CreateDataProperty). One shape lookup then covers every key.
         if ordinary_source
             && !keys.is_empty()
+            && target_is_fresh_plain(&target, agent)
             && let Some((atoms, values)) = crate::expr::plain_data_snapshot(&source, &keys)?
             && !atoms.is_empty()
             && !atoms.iter().any(|atom| *atom == crux::proto_atom())
-            && target_is_fresh_plain(&target, agent)
             && target.adopt_fresh_data_properties(&atoms, &values)
         {
             continue;
