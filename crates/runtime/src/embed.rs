@@ -211,6 +211,113 @@ impl FunctionCall<'_> {
     }
 }
 
+/// A re-entrant window for a host callback that is not a function call: the
+/// property handlers' getter, setter, descriptor, definer, and (when it lands)
+/// enumerator callbacks.
+///
+/// [`FunctionCall`] is the same window for a function call. What both provide is
+/// an agent to allocate through: the operation that called the callback holds
+/// the context, so the callback cannot borrow it and has no other way to build
+/// the values it answers with. The window is published as it opens, so a flat C
+/// ABI can name it with an opaque token (`FunctionCallbackInfo::call` is the
+/// function-call form); a token names only the window that published it, so one
+/// used after its callback returned is refused rather than re-entering an
+/// operation that is no longer running.
+pub struct CallbackWindow {
+    agent: crux::function::AgentPtr,
+}
+
+thread_local! {
+    /// The agent of the innermost running host property callback, or null.
+    static CALLBACK_WINDOW: std::cell::Cell<crux::function::AgentPtr> =
+        const { std::cell::Cell::new(std::ptr::null_mut()) };
+}
+
+/// Restores the window that was running when a callback opened its own.
+pub struct CallbackGuard {
+    previous: crux::function::AgentPtr,
+}
+
+impl Drop for CallbackGuard {
+    fn drop(&mut self) {
+        CALLBACK_WINDOW.with(|slot| slot.set(self.previous));
+    }
+}
+
+impl CallbackWindow {
+    /// Publish `agent` as this thread's live callback agent until the returned
+    /// guard drops.
+    pub fn enter(agent: crux::function::AgentPtr) -> CallbackGuard {
+        let previous = CALLBACK_WINDOW.with(|slot| slot.replace(agent));
+        CallbackGuard { previous }
+    }
+
+    /// The window `token` names, or `None` when no such window is running.
+    pub fn admit(token: *const std::ffi::c_void) -> Option<Self> {
+        let agent = CALLBACK_WINDOW.with(|slot| slot.get());
+        (!agent.is_null() && agent as *const std::ffi::c_void == token).then_some(Self { agent })
+    }
+
+    /// The token of the window running on this thread, or null outside one.
+    pub fn token() -> *const std::ffi::c_void {
+        CALLBACK_WINDOW.with(|slot| slot.get()) as *const std::ffi::c_void
+    }
+
+    /// An ordinary object in the running realm (the re-entrant counterpart of
+    /// [`Context::create_object`]).
+    pub fn create_object(&self) -> Result<JsObject, JsError> {
+        Ok(JsObject(CruxObject::ordinary_object_create(
+            realm_object_prototype(crate::context::callback_agent(self.agent)?)?,
+        )))
+    }
+
+    /// An array holding `values` (the re-entrant counterpart of
+    /// [`Context::create_array`]).
+    pub fn create_array(&self, values: &[JsValue]) -> Result<JsValue, JsError> {
+        // SAFETY: `JsValue` is `#[repr(transparent)]` over `Value`, so the two
+        // element types share size and alignment and the slice is reinterpreted
+        // in place (the same cast `FunctionCall::args` makes).
+        let values =
+            unsafe { std::slice::from_raw_parts(values.as_ptr() as *const Value, values.len()) };
+        Ok(JsValue(crate::builtins::array::array_from_values(
+            crate::context::callback_agent(self.agent)?,
+            values,
+        )?))
+    }
+
+    /// An array of `length` holes.
+    pub fn create_array_with_length(&self, length: u32) -> Result<JsValue, JsError> {
+        Ok(JsValue(Value::Object(
+            crate::builtins::array::array_create(
+                crate::context::callback_agent(self.agent)?,
+                f64::from(length),
+            )?,
+        )))
+    }
+
+    /// [[Set]] a property by the key value a host built, throwing on failure as
+    /// V8's throwing mode does (the re-entrant counterpart of
+    /// [`Context::set_property`]).
+    pub fn set_property(
+        &self,
+        object: JsValue,
+        key: JsValue,
+        value: JsValue,
+    ) -> Result<(), JsError> {
+        let key_value = key.into_value();
+        let agent = crate::context::callback_agent(self.agent)?;
+        let key = crate::context::to_property_key(agent, &key_value)?;
+        let Some(object) = object.as_object() else {
+            return Err(JsError::new(
+                ErrorKind::TypeError,
+                "value is not an object".into(),
+            ));
+        };
+        object.0.set_key(&key, value.into_value(), true)?;
+        Ok(())
+    }
+}
+
 /// Host-defined behavior the embedding API exposes. Each callback is
 /// optional; `None` falls back to a sensible default (console output to
 /// stdout/stderr, the built-in PRNG, no rejection reporting).
@@ -584,6 +691,13 @@ impl Context {
     pub fn create_object(&self) -> Result<JsObject, JsError> {
         Ok(JsObject(CruxObject::ordinary_object_create(
             realm_object_prototype(&self.agent)?,
+        )))
+    }
+
+    /// An array of `length` holes.
+    pub fn create_array_with_length(&self, length: u32) -> Result<JsValue, JsError> {
+        Ok(JsValue(Value::Object(
+            crate::builtins::array::array_create(&self.agent, f64::from(length))?,
         )))
     }
 
@@ -3475,6 +3589,50 @@ mod tests {
                 .as_deref(),
             Some("b")
         );
+    }
+
+    #[test]
+    fn a_callback_window_allocates_through_its_token() {
+        let mut context = Context::new().unwrap();
+        let agent = context.agent_mut() as *mut Agent as crux::function::AgentPtr;
+        // No window is running: there is no token, and the null one is refused.
+        assert!(CallbackWindow::token().is_null());
+        assert!(CallbackWindow::admit(CallbackWindow::token()).is_none());
+
+        let (token, object, array) = {
+            let _guard = CallbackWindow::enter(agent);
+            let token = CallbackWindow::token();
+            assert!(!token.is_null());
+            let window = CallbackWindow::admit(token).expect("the window is running");
+            let object = window.create_object().unwrap();
+            window
+                .set_property(
+                    object.as_value(),
+                    JsValue::string("mark"),
+                    JsValue::number(5.0),
+                )
+                .unwrap();
+            let array = window.create_array_with_length(3).unwrap();
+            (token, object, array)
+        };
+
+        // The values the window built are ordinary values of the realm.
+        assert_eq!(
+            context
+                .get_property(object.as_value(), JsValue::string("mark"))
+                .unwrap()
+                .as_number(),
+            Some(5.0)
+        );
+        assert_eq!(
+            context
+                .get_property(array, JsValue::string("length"))
+                .unwrap()
+                .as_number(),
+            Some(3.0)
+        );
+        // The guarded window is gone, so its token names nothing.
+        assert!(CallbackWindow::admit(token).is_none());
     }
 
     #[test]

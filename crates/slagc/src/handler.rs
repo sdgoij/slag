@@ -2,18 +2,18 @@
 //!
 //! V8 consults a handler before the engine's own internal method: a `kNo` answer
 //! means "not intercepted, run the ordinary method", which is the `Option` the
-//! engine's [`HostOps`] seam already expresses. The five value-shaped callbacks
-//! are carried here (getter, setter, query, deleter, enumerator). The descriptor
-//! and definer pair need a property-descriptor ABI, so they are absent from the
-//! C struct rather than accepted and ignored: a host that needs them does not
-//! compile, which is the only honest failure mode.
+//! engine's [`HostOps`] seam already expresses. The named handler carries all
+//! seven of V8's callbacks except the enumerator; the indexed one carries the
+//! same set keyed by an array index.
 //!
 //! The `data` a configuration carries is a language value in V8, so it is pinned
 //! for as long as this handler is (one handler per configuration, shared by the
 //! objects made from it), and the C++ side gets it back on the callback info.
 
+use std::cell::RefCell;
 use std::ffi::c_void;
 use std::fmt;
+use std::rc::Rc;
 
 use crux::error::{ErrorKind, JsError};
 use crux::heap::{Pin, pin};
@@ -21,6 +21,8 @@ use crux::host::HostOps;
 use crux::object::JsObject;
 use crux::property::PropertyKey;
 use crux::value::{Value, ValueKind};
+
+use slag::CallbackWindow;
 
 /// A property descriptor as the definer callback receives it
 /// (`v8::PropertyDescriptor`): each field present-or-absent, because V8's
@@ -161,13 +163,25 @@ impl fmt::Debug for SlagPropertyHandler {
 pub(crate) struct CxxHandler {
     handler: SlagPropertyHandler,
     _data: Pin,
+    /// The context's agent, published as a callback's token (the flat form of
+    /// `FunctionCall`'s agent pointer) so a callback can allocate.
+    agent: crux::function::AgentPtr,
+    /// The context's pending-error slot: a callback that sets one fails the
+    /// operation rather than returning, the same contract a host function has.
+    pending_error: Rc<RefCell<Option<String>>>,
 }
 
 impl CxxHandler {
-    pub(crate) fn new(handler: SlagPropertyHandler) -> Self {
+    pub(crate) fn new(
+        handler: SlagPropertyHandler,
+        agent: crux::function::AgentPtr,
+        pending_error: Rc<RefCell<Option<String>>>,
+    ) -> Self {
         Self {
             handler,
             _data: pin(Value::from_bits(handler.data)),
+            agent,
+            pending_error,
         }
     }
 }
@@ -215,29 +229,46 @@ fn deleted(answer: u64) -> bool {
     matches!(Value::from_bits(answer).kind(), ValueKind::Boolean(true))
 }
 
+impl CxxHandler {
+    /// Run `body` as one host callback: the window it needs to allocate is
+    /// published for its duration, and an error it recorded fails the operation
+    /// the way a host function's does.
+    fn callback<T>(&self, body: impl FnOnce() -> T) -> Result<T, JsError> {
+        let answer = {
+            let _window = CallbackWindow::enter(self.agent);
+            body()
+        };
+        match self.pending_error.borrow_mut().take() {
+            Some(message) => Err(JsError::new(ErrorKind::Error, message)),
+            None => Ok(answer),
+        }
+    }
+}
+
 impl HostOps for CxxHandler {
     fn get_own_property(
         &self,
         object: &JsObject,
         key: &PropertyKey,
     ) -> Option<Result<crux::object::Property, JsError>> {
-        // The indexed twin first, the same routing as `get`.
-        let intercepted = if let Some(index) = crux::object::array_index_of(key)
-            && let Some(callback) = self.handler.indexed_descriptor
-        {
-            let mut answer = 0;
-            // SAFETY: as in `get`.
-            let code = unsafe {
-                callback(
-                    self.handler.indexed_state,
-                    self.handler.data,
-                    object.self_value().bits(),
-                    index as u32,
-                    &mut answer,
-                )
-            };
-            (code, answer)
-        } else {
+        let intercepted = match self.callback(|| {
+            // The indexed twin first, the same routing as `get`.
+            if let Some(index) = crux::object::array_index_of(key)
+                && let Some(callback) = self.handler.indexed_descriptor
+            {
+                let mut answer = 0;
+                // SAFETY: as in `get`.
+                let code = unsafe {
+                    callback(
+                        self.handler.indexed_state,
+                        self.handler.data,
+                        object.self_value().bits(),
+                        index as u32,
+                        &mut answer,
+                    )
+                };
+                return Some((code, answer));
+            }
             let callback = self.handler.descriptor?;
             let key = key_value(key);
             let mut answer = 0;
@@ -251,7 +282,11 @@ impl HostOps for CxxHandler {
                     &mut answer,
                 )
             };
-            (code, answer)
+            Some((code, answer))
+        }) {
+            Ok(Some(intercepted)) => intercepted,
+            Ok(None) => return None,
+            Err(error) => return Some(Err(error)),
         };
         Some(match intercepted {
             // Not intercepted: the engine's own [[GetOwnProperty]] runs, which
@@ -271,23 +306,24 @@ impl HostOps for CxxHandler {
         desc: &crux::property::PropertyDescriptor,
     ) -> Option<Result<bool, JsError>> {
         let descriptor = SlagPropertyDescriptor::of(desc);
-        let intercepted = if let Some(index) = crux::object::array_index_of(key)
-            && let Some(callback) = self.handler.indexed_definer
-        {
-            let mut answer = 0;
-            // SAFETY: as in `get`.
-            let code = unsafe {
-                callback(
-                    self.handler.indexed_state,
-                    self.handler.data,
-                    object.self_value().bits(),
-                    index as u32,
-                    &descriptor,
-                    &mut answer,
-                )
-            };
-            (code, answer)
-        } else {
+        let intercepted = match self.callback(|| {
+            if let Some(index) = crux::object::array_index_of(key)
+                && let Some(callback) = self.handler.indexed_definer
+            {
+                let mut answer = 0;
+                // SAFETY: as in `get`.
+                let code = unsafe {
+                    callback(
+                        self.handler.indexed_state,
+                        self.handler.data,
+                        object.self_value().bits(),
+                        index as u32,
+                        &descriptor,
+                        &mut answer,
+                    )
+                };
+                return Some((code, answer));
+            }
             let callback = self.handler.definer?;
             let key = key_value(key);
             let mut answer = 0;
@@ -302,7 +338,11 @@ impl HostOps for CxxHandler {
                     &mut answer,
                 )
             };
-            (code, answer)
+            Some((code, answer))
+        }) {
+            Ok(Some(intercepted)) => intercepted,
+            Ok(None) => return None,
+            Err(error) => return Some(Err(error)),
         };
         match intercepted {
             // Not intercepted: the engine's own [[DefineOwnProperty]] runs.
@@ -318,92 +358,98 @@ impl HostOps for CxxHandler {
         key: &PropertyKey,
         receiver: &Value,
     ) -> Option<Result<Value, JsError>> {
-        // An array index goes to the indexed callback when one is installed, and
-        // to the named one otherwise, which is V8's routing rule.
-        if let Some(index) = crux::object::array_index_of(key)
-            && let Some(getter) = self.handler.indexed_getter
-        {
+        let intercepted = match self.callback(|| {
+            // An array index goes to the indexed callback when one is installed,
+            // and to the named one otherwise, which is V8's routing rule.
+            if let Some(index) = crux::object::array_index_of(key)
+                && let Some(getter) = self.handler.indexed_getter
+            {
+                let mut answer = 0;
+                // SAFETY: as in the named call below.
+                let code = unsafe {
+                    getter(
+                        self.handler.indexed_state,
+                        self.handler.data,
+                        object.self_value().bits(),
+                        index as u32,
+                        receiver.bits(),
+                        &mut answer,
+                    )
+                };
+                return Some((code, answer));
+            }
+            let getter = self.handler.getter?;
+            // The key is a value the callback can name, and the local is what
+            // keeps it on the collector's conservative scan while the host runs.
+            let key = key_value(key);
             let mut answer = 0;
-            // SAFETY: as in the named call below.
-            let intercepted = unsafe {
+            // SAFETY: the callback is the host's, and every pointer it gets
+            // points at this frame's locals.
+            let code = unsafe {
                 getter(
-                    self.handler.indexed_state,
+                    self.handler.state,
                     self.handler.data,
                     object.self_value().bits(),
-                    index as u32,
+                    key.bits(),
                     receiver.bits(),
                     &mut answer,
                 )
             };
-            return match intercepted {
-                INTERCEPTED_NO => None,
-                INTERCEPTED_THROW => Some(Err(thrown())),
-                _ => Some(Ok(Value::from_bits(answer))),
-            };
-        }
-        let getter = self.handler.getter?;
-        // The key is a value the callback can name, and the local is what keeps
-        // it on the collector's conservative scan while the host runs.
-        let key = key_value(key);
-        let mut answer = 0;
-        // SAFETY: the callback is the host's, and every pointer it gets points
-        // at this frame's locals.
-        let intercepted = unsafe {
-            getter(
-                self.handler.state,
-                self.handler.data,
-                object.self_value().bits(),
-                key.bits(),
-                receiver.bits(),
-                &mut answer,
-            )
+            Some((code, answer))
+        }) {
+            Ok(Some(intercepted)) => intercepted,
+            Ok(None) => return None,
+            Err(error) => return Some(Err(error)),
         };
         match intercepted {
-            INTERCEPTED_NO => None,
-            INTERCEPTED_THROW => Some(Err(thrown())),
-            _ => Some(Ok(Value::from_bits(answer))),
+            (INTERCEPTED_NO, _) => None,
+            (INTERCEPTED_THROW, _) => Some(Err(thrown())),
+            (_, answer) => Some(Ok(Value::from_bits(answer))),
         }
     }
 
     fn has_property(&self, object: &JsObject, key: &PropertyKey) -> Option<Result<bool, JsError>> {
-        // The indexed twin first, the same routing as `get`.
-        if let Some(index) = crux::object::array_index_of(key)
-            && let Some(query) = self.handler.indexed_query
-        {
-            let mut answer = 0;
-            // SAFETY: as in the named call below.
-            let intercepted = unsafe {
+        let intercepted = match self.callback(|| {
+            // The indexed twin first, the same routing as `get`.
+            if let Some(index) = crux::object::array_index_of(key)
+                && let Some(query) = self.handler.indexed_query
+            {
+                let mut answer = 0;
+                // SAFETY: as in the named call below.
+                let code = unsafe {
+                    query(
+                        self.handler.indexed_state,
+                        self.handler.data,
+                        object.self_value().bits(),
+                        index as u32,
+                        &mut answer,
+                    )
+                };
+                return Some((code, answer));
+            }
+            let query = self.handler.query?;
+            let key = key_value(key);
+            let mut attributes = 0;
+            // SAFETY: as in `get`. The attributes a query sets are dropped: the
+            // engine's `has_property` answers existence only.
+            let code = unsafe {
                 query(
-                    self.handler.indexed_state,
+                    self.handler.state,
                     self.handler.data,
                     object.self_value().bits(),
-                    index as u32,
-                    &mut answer,
+                    key.bits(),
+                    &mut attributes,
                 )
             };
-            return match intercepted {
-                INTERCEPTED_NO => None,
-                INTERCEPTED_THROW => Some(Err(thrown())),
-                _ => Some(Ok(true)),
-            };
-        }
-        let query = self.handler.query?;
-        let key = key_value(key);
-        let mut attributes = 0;
-        // SAFETY: as in `get`. The attributes a query sets are dropped: the
-        // engine's `has_property` answers existence only.
-        let intercepted = unsafe {
-            query(
-                self.handler.state,
-                self.handler.data,
-                object.self_value().bits(),
-                key.bits(),
-                &mut attributes,
-            )
+            Some((code, attributes))
+        }) {
+            Ok(Some(intercepted)) => intercepted,
+            Ok(None) => return None,
+            Err(error) => return Some(Err(error)),
         };
         match intercepted {
-            INTERCEPTED_NO => None,
-            INTERCEPTED_THROW => Some(Err(thrown())),
+            (INTERCEPTED_NO, _) => None,
+            (INTERCEPTED_THROW, _) => Some(Err(thrown())),
             _ => Some(Ok(true)),
         }
     }
@@ -416,41 +462,43 @@ impl HostOps for CxxHandler {
         receiver: &Value,
         throw: bool,
     ) -> Option<Result<bool, JsError>> {
-        // The indexed twin first, the same routing as `get`.
-        if let Some(index) = crux::object::array_index_of(key)
-            && let Some(setter) = self.handler.indexed_setter
-        {
-            // SAFETY: as in the named call below.
-            let intercepted = unsafe {
+        let intercepted = match self.callback(|| {
+            // The indexed twin first, the same routing as `get`.
+            if let Some(index) = crux::object::array_index_of(key)
+                && let Some(setter) = self.handler.indexed_setter
+            {
+                // SAFETY: as in the named call below.
+                let code = unsafe {
+                    setter(
+                        self.handler.indexed_state,
+                        self.handler.data,
+                        object.self_value().bits(),
+                        index as u32,
+                        value.bits(),
+                        receiver.bits(),
+                        i32::from(throw),
+                    )
+                };
+                return Some(code);
+            }
+            let setter = self.handler.setter?;
+            let key = key_value(key);
+            // SAFETY: as in `get`.
+            Some(unsafe {
                 setter(
-                    self.handler.indexed_state,
+                    self.handler.state,
                     self.handler.data,
                     object.self_value().bits(),
-                    index as u32,
+                    key.bits(),
                     value.bits(),
                     receiver.bits(),
                     i32::from(throw),
                 )
-            };
-            return match intercepted {
-                INTERCEPTED_NO => None,
-                INTERCEPTED_THROW => Some(Err(thrown())),
-                _ => Some(Ok(true)),
-            };
-        }
-        let setter = self.handler.setter?;
-        let key = key_value(key);
-        // SAFETY: as in `get`.
-        let intercepted = unsafe {
-            setter(
-                self.handler.state,
-                self.handler.data,
-                object.self_value().bits(),
-                key.bits(),
-                value.bits(),
-                receiver.bits(),
-                i32::from(throw),
-            )
+            })
+        }) {
+            Ok(Some(intercepted)) => intercepted,
+            Ok(None) => return None,
+            Err(error) => return Some(Err(error)),
         };
         match intercepted {
             INTERCEPTED_NO => None,
@@ -462,44 +510,47 @@ impl HostOps for CxxHandler {
     }
 
     fn delete(&self, object: &JsObject, key: &PropertyKey) -> Option<Result<bool, JsError>> {
-        // The indexed twin first, the same routing as `get`.
-        if let Some(index) = crux::object::array_index_of(key)
-            && let Some(deleter) = self.handler.indexed_deleter
-        {
+        let intercepted = match self.callback(|| {
+            // The indexed twin first, the same routing as `get`.
+            if let Some(index) = crux::object::array_index_of(key)
+                && let Some(deleter) = self.handler.indexed_deleter
+            {
+                let mut answer = 0;
+                // SAFETY: as in the named call below.
+                let code = unsafe {
+                    deleter(
+                        self.handler.indexed_state,
+                        self.handler.data,
+                        object.self_value().bits(),
+                        index as u32,
+                        &mut answer,
+                    )
+                };
+                return Some((code, answer));
+            }
+            let deleter = self.handler.deleter?;
+            let key = key_value(key);
             let mut answer = 0;
-            // SAFETY: as in the named call below.
-            let intercepted = unsafe {
+            // SAFETY: as in `get`.
+            let code = unsafe {
                 deleter(
-                    self.handler.indexed_state,
+                    self.handler.state,
                     self.handler.data,
                     object.self_value().bits(),
-                    index as u32,
+                    key.bits(),
                     &mut answer,
                 )
             };
-            return match intercepted {
-                INTERCEPTED_NO => None,
-                INTERCEPTED_THROW => Some(Err(thrown())),
-                _ => Some(Ok(deleted(answer))),
-            };
-        }
-        let deleter = self.handler.deleter?;
-        let key = key_value(key);
-        let mut answer = 0;
-        // SAFETY: as in `get`.
-        let intercepted = unsafe {
-            deleter(
-                self.handler.state,
-                self.handler.data,
-                object.self_value().bits(),
-                key.bits(),
-                &mut answer,
-            )
+            Some((code, answer))
+        }) {
+            Ok(Some(intercepted)) => intercepted,
+            Ok(None) => return None,
+            Err(error) => return Some(Err(error)),
         };
         match intercepted {
-            INTERCEPTED_NO => None,
-            INTERCEPTED_THROW => Some(Err(thrown())),
-            _ => Some(Ok(deleted(answer))),
+            (INTERCEPTED_NO, _) => None,
+            (INTERCEPTED_THROW, _) => Some(Err(thrown())),
+            (_, answer) => Some(Ok(deleted(answer))),
         }
     }
 }

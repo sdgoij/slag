@@ -49,6 +49,7 @@ struct HostNames {
   int descriptors = 0;
   int definers = 0;
   int definer_descriptors = 0;
+  int allocations = 0;
 };
 
 HostNames host_names;
@@ -73,8 +74,29 @@ v8::Intercepted HostGet(v8::Local<v8::Name> property,
     fprintf(stderr, "handler data did not reach the callback\n");
     ++host_names.data_misses;
   }
+  v8::Local<v8::Context> context = isolate->GetCurrentContext();
   if (strcmp(*text, "alpha") == 0) {
     info.GetReturnValue().Set(v8::Integer::New(isolate, 42));
+    return v8::Intercepted::kYes;
+  }
+  // These two answer with values the callback builds, which is the re-entrant
+  // allocation path: the operation that asked the handler holds the context.
+  if (strcmp(*text, "fresh") == 0) {
+    v8::Local<v8::Object> made = v8::Object::New(context);
+    if (made.IsEmpty()) return v8::Intercepted::kNo;
+    made->Set(context, v8::String::NewFromUtf8Literal(isolate, "value"),
+              v8::Integer::New(isolate, 11));
+    info.GetReturnValue().Set(made);
+    ++host_names.allocations;
+    return v8::Intercepted::kYes;
+  }
+  if (strcmp(*text, "list") == 0) {
+    v8::Local<v8::Value> elements[] = {
+        v8::String::NewFromUtf8Literal(isolate, "a"),
+        v8::String::NewFromUtf8Literal(isolate, "b")};
+    v8::Local<v8::Array> made = v8::Array::New(isolate, elements, 2);
+    info.GetReturnValue().Set(made);
+    ++host_names.allocations;
     return v8::Intercepted::kYes;
   }
   // Declining lets the engine's own property run, which is what kNo means.
@@ -141,20 +163,28 @@ v8::Intercepted HostDeleteIndex(
   return v8::Intercepted::kYes;
 }
 
-// A descriptor callback cannot build the descriptor object it answers with: that
-// allocates, and the operation that called the handler holds the context. So the
-// answer is built once, at the top level, and handed back from here.
-v8::Global<v8::Value> descriptor_answer;
-
+// A descriptor callback answers with an object, so it builds one inside the
+// callback: the re-entrant window is what makes that legal.
 v8::Intercepted HostDescriptor(
     v8::Local<v8::Name> property,
     const v8::PropertyCallbackInfo<v8::Value>& info) {
-  v8::String::Utf8Value text(info.GetIsolate(), property);
+  v8::Isolate* isolate = info.GetIsolate();
+  v8::String::Utf8Value text(isolate, property);
   if (!*text || !IsHostName(*text)) return v8::Intercepted::kNo;
   ++host_names.descriptors;
-  if (descriptor_answer.IsEmpty()) return v8::Intercepted::kNo;
-  info.GetReturnValue().Set(
-      descriptor_answer.Get(info.GetIsolate()).As<v8::Value>());
+  v8::Local<v8::Context> context = isolate->GetCurrentContext();
+  v8::Local<v8::Object> answer = v8::Object::New(context);
+  if (answer.IsEmpty()) return v8::Intercepted::kNo;
+  answer->Set(context, v8::String::NewFromUtf8Literal(isolate, "value"),
+              v8::Integer::New(isolate, 42));
+  answer->Set(context,
+              v8::String::NewFromUtf8Literal(isolate, "enumerable"),
+              v8::Boolean::New(isolate, true));
+  answer->Set(context,
+              v8::String::NewFromUtf8Literal(isolate, "configurable"),
+              v8::Boolean::New(isolate, true));
+  info.GetReturnValue().Set(answer);
+  ++host_names.allocations;
   return v8::Intercepted::kYes;
 }
 
@@ -213,6 +243,10 @@ int main() {
   params.array_buffer_allocator =
       v8::ArrayBuffer::Allocator::NewDefaultAllocator();
   v8::Isolate* isolate = v8::Isolate::New(params);
+  // A property callback reports this isolate, and the facade resolves the
+  // context an allocation goes through from it, so the host enters it the way
+  // V8's samples do.
+  v8::Isolate::Scope isolate_scope(isolate);
 
   v8::Global<v8::Context> context;
   {
@@ -499,22 +533,9 @@ int main() {
   {
     v8::HandleScope scope(isolate);
     v8::Local<v8::Context> current = context.Get(isolate);
-
-    // The descriptor callback answers with this object, built here because a
-    // callback cannot allocate.
-    {
-      v8::Local<v8::Object> answer =
-          v8::ObjectTemplate::New(isolate)->NewInstance(current).ToLocalChecked();
-      answer->Set(current, v8::String::NewFromUtf8Literal(isolate, "value"),
-                  v8::Integer::New(isolate, 42));
-      answer->Set(current,
-                  v8::String::NewFromUtf8Literal(isolate, "enumerable"),
-                  v8::Boolean::New(isolate, true));
-      answer->Set(current,
-                  v8::String::NewFromUtf8Literal(isolate, "configurable"),
-                  v8::Boolean::New(isolate, true));
-      descriptor_answer.Reset(isolate, answer);
-    }
+    // A property callback runs with the host's context entered, which is how the
+    // facade finds the context an allocation goes through.
+    v8::Context::Scope context_scope(current);
 
     v8::NamedPropertyHandlerConfiguration configuration(
         HostGet, HostSet, HostQuery, HostDelete, HostDescriptor, HostDefiner,
@@ -627,7 +648,26 @@ int main() {
       fprintf(stderr, "the descriptor or definer callback was never asked\n");
       ++failures;
     }
-    descriptor_answer.Reset();
+
+    // The getter and the descriptor answer with values built inside the callback.
+    // A fresh object each read is the proof that allocation ran.
+    v8::Local<v8::Value> allocated;
+    bool built =
+        v8::Script::Compile(
+            current,
+            v8::String::NewFromUtf8Literal(
+                isolate,
+                "(handled.fresh.value === 11 &&"
+                " handled.fresh !== handled.fresh &&"
+                " handled.list.length === 2 && handled.list[0] === 'a') ? 1 : 0"))
+            .ToLocalChecked()
+            ->Run(current)
+            .ToLocal(&allocated) &&
+        allocated->Int32Value(current).FromMaybe(-1) == 1;
+    if (!built || host_names.allocations == 0) {
+      fprintf(stderr, "a callback did not allocate the value it answered\n");
+      ++failures;
+    }
 
     // The indexed handler owns elements 0..2; a higher index falls back.
     v8::IndexedPropertyHandlerConfiguration indexed(HostGetIndex, HostSetIndex,

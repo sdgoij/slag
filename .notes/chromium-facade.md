@@ -587,18 +587,18 @@ So the milestone needs a decision before code:
 
 **Decided (2026-10-31): option 1, and the first slice is in.** `NewInstance` on a
 template with a handler now makes a `crux::host::HostOps` object
-(`Context::create_host_object`), one behaviour per template, and four callbacks
-are carried: getter, setter, query, deleter. The configuration's `data` value is
-pinned for as long as an instance can call it, and `kNo` falls back to the
-engine's own internal method, so masking is the only mode.
+(`Context::create_host_object`), one behaviour per template, and the named
+handler carries six of V8's seven callbacks (getter, setter, query, deleter,
+descriptor, definer). The configuration's `data` value is pinned for as long as
+an instance can call it, and `kNo` falls back to the engine's own internal
+method, so masking is the only mode.
 
 What is deliberately absent, and why:
 
-- the **enumerator** builds the array it answers with, and allocating one goes
-  through the context, which the operation that called the handler holds
-  borrowed. A handler callback cannot allocate an object or an array until there
-  is a re-entrant allocation path (the shape `FunctionCall` has for host
-  functions).
+- the **enumerator** builds the array it answers with through the allocation
+  window a callback gets, and needs the engine's `own_property_keys` seam wired
+  through the handler; that wiring is the last piece of the set, not a missing
+  capability.
 
 Because the C struct does not carry them, a host that needs one does not compile
 rather than having it silently ignored.
@@ -634,16 +634,32 @@ three attributes as present-or-absent fields, because a descriptor distinguishes
 (answering a descriptor object, which the Rust side reads with the engine's own
 `to_property_descriptor`) and `definer` (receiving the marshalled descriptor);
 `Object::defineProperty` and `Object.getOwnPropertyDescriptor` now reach a host.
-The `gin-shapes` handler answers a descriptor it built before installing itself,
-because a callback still cannot allocate, and checks that a define arrives at the
-`definer` with value and writable set.
+The `gin-shapes` handler answers a descriptor it builds inside the callback, and
+checks that a define arrives at the `definer` with value and writable set.
 
-That leaves the order unchanged for what remains: the re-entrant allocation path
-(a callback cannot allocate an object or an array while the calling operation
-holds the context), then the enumerator, which needs both it and the
-descriptor callback that just landed. `SetAccessor` is a separate surface: it
-needs an accessor callback whose getter runs as a function with the property's
-key in hand.
+*Re-entrant allocation (2026-10-31).* The allocation path landed next.
+`CallbackWindow` in `crates/runtime/src/embed.rs` is the property-callback form
+of `FunctionCall`: opening it publishes the context's agent as a token, and
+`Object::New`, `Array::New`, and `Object::Set` take the token's route while a
+callback is running, so a getter can answer with an object or an array it built
+and a descriptor can build its own descriptor. The token is only admitted while
+its window is running, which keeps the ordinary entry points refusing re-entry
+(the `load()` case stays refused) instead of making every re-entry legal.
+
+The mechanism is the TLS shape the audit rejected for `NativeFn` (the pointer is
+the context's boxed agent, an ancestor of the live `&mut Agent` reborrows), so it
+is a stated divergence rather than the final form: threading the agent through
+`crux`'s host seam is the sound version and is separate, larger work. The v8
+crate's Rust handler already allocates this way (`api::Context::with_agent`
+reaches the same boxed agent), so the facade matches the existing bridge. The
+facade finds the context from `g_current_context`, so a host has to enter an
+isolate and a context the way V8's samples do; `gin-shapes` did not before, which
+is why its first allocation attempt returned an empty handle.
+
+What remains in the handler sequence is the enumerator, which now needs only the
+`own_property_keys` wiring (its two prerequisites, the descriptor callback and
+allocation, have landed). `SetAccessor` is a separate surface: it needs an
+accessor callback whose getter runs as a function with the property's key in hand.
 
 The ABI shape is roughly a struct of up to seven C function pointers, the data
 pointer, and the flags, handed over once per template, with the return codes

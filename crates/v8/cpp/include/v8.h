@@ -225,6 +225,12 @@ class Object : public Value {
    * facade names it because it is the convention between these two sides. */
   static constexpr int kWrappableFieldIndex = 0;
 
+  /* An ordinary object (`v8::Object::New`). Inside a property-handler callback
+   * this allocates through the running callback, which is what lets a getter
+   * answer with an object it just built. */
+  static Local<Object> New(Isolate* isolate);
+  static Local<Object> New(Local<Context> context);
+
   int InternalFieldCount() const;
   bool IsApiWrapper() const;
 
@@ -283,6 +289,19 @@ class Object : public Value {
     return static_cast<T*>(
         GetAlignedPointerFromInternalField(kWrappableFieldIndex));
   }
+};
+
+/* A JavaScript array (`v8::Array`). The element forms are the ones a handler
+ * needs: an indexed property handler's enumerator answers with the names it
+ * owns, which is an array. */
+class Array : public Object {
+ public:
+  static Local<Array> New(Isolate* isolate, int length = 0);
+  static Local<Array> New(Isolate* isolate, Local<Value>* elements,
+                          size_t length);
+  static Local<Array> New(Local<Context> context, int length = 0);
+  static Local<Array> New(Local<Context> context, Local<Value>* elements,
+                          size_t length);
 };
 
 class Number : public Value {
@@ -476,11 +495,12 @@ template <class T>
 class PropertyCallbackInfo {
  public:
   PropertyCallbackInfo(Isolate* isolate, uint64_t holder, uint64_t data,
-                       uint64_t* return_value)
+                       uint64_t* return_value, const void* token)
       : isolate_(isolate),
         holder_(holder),
         data_(data),
-        return_value_(return_value) {}
+        return_value_(return_value),
+        token_(token) {}
 
   Isolate* GetIsolate() const { return isolate_; }
   Local<Object> This() const { return Local<Object>::New(holder_); }
@@ -488,11 +508,17 @@ class PropertyCallbackInfo {
   Local<Value> Data() const { return Local<Value>::New(data_); }
   ReturnValue<T> GetReturnValue() const { return ReturnValue<T>(return_value_); }
 
+  /* The running callback, as an opaque token. The facade uses it to route
+   * allocation (`Object::New`, `Array::New`) and `Object::Set` through the
+   * operation that called the handler; a host does not need to name it. */
+  const void* token() const { return token_; }
+
  private:
   Isolate* isolate_;
   uint64_t holder_;
   uint64_t data_;
   uint64_t* return_value_;
+  const void* token_;
 };
 
 /* The handler callbacks (`v8::NamedProperty*Callback`).

@@ -69,6 +69,27 @@ v8::NamedPropertyHandlerConfiguration* Configuration(void* state) {
   return static_cast<v8::NamedPropertyHandlerConfiguration*>(state);
 }
 
+/* The token of the host callback that is running, for as long as it runs. The
+ * ABI reports it (`slag_callback_token`), and the allocation entry points admit
+ * only a token that names a running callback, so a host's `Object::New` inside a
+ * getter allocates through the operation that called the handler. */
+thread_local const void* g_callback_token = nullptr;
+
+class CallbackToken {
+ public:
+  CallbackToken() : previous_(g_callback_token) {
+    token_ = slag_callback_token();
+    g_callback_token = token_;
+  }
+  ~CallbackToken() { g_callback_token = previous_; }
+
+  const void* get() const { return token_; }
+
+ private:
+  const void* previous_ = nullptr;
+  const void* token_ = nullptr;
+};
+
 v8::IndexedPropertyHandlerConfiguration* IndexedConfiguration(void* state) {
   return static_cast<v8::IndexedPropertyHandlerConfiguration*>(state);
 }
@@ -83,8 +104,9 @@ int32_t IndexedGetterTrampoline(void* state, uint64_t data, uint64_t holder,
   }
   (void)receiver;
   *out = slag_undefined();
+  CallbackToken token;
   v8::PropertyCallbackInfo<v8::Value> info(v8::g_current_isolate, holder, data,
-                                           out);
+                                           out, token.get());
   return static_cast<int32_t>(configuration->getter(index, info));
 }
 
@@ -96,8 +118,9 @@ int32_t IndexedSetterTrampoline(void* state, uint64_t data, uint64_t holder,
   (void)receiver;
   (void)throw_on_error;
   uint64_t answer = slag_undefined();
+  CallbackToken token;
   v8::PropertyCallbackInfo<void> info(v8::g_current_isolate, holder, data,
-                                      &answer);
+                                      &answer, token.get());
   return static_cast<int32_t>(
       configuration->setter(index, v8::Local<v8::Value>::New(value), info));
 }
@@ -110,8 +133,9 @@ int32_t IndexedQueryTrampoline(void* state, uint64_t data, uint64_t holder,
     return 0;
   }
   *out = slag_undefined();
+  CallbackToken token;
   v8::PropertyCallbackInfo<v8::Integer> info(v8::g_current_isolate, holder,
-                                             data, out);
+                                             data, out, token.get());
   return static_cast<int32_t>(configuration->query(index, info));
 }
 
@@ -123,8 +147,9 @@ int32_t IndexedDeleterTrampoline(void* state, uint64_t data, uint64_t holder,
     return 0;
   }
   *out = slag_undefined();
+  CallbackToken token;
   v8::PropertyCallbackInfo<v8::Boolean> info(v8::g_current_isolate, holder,
-                                             data, out);
+                                             data, out, token.get());
   return static_cast<int32_t>(configuration->deleter(index, info));
 }
 
@@ -136,8 +161,9 @@ int32_t GetterTrampoline(void* state, uint64_t data, uint64_t holder,
     return 0;
   }
   *out = slag_undefined();
+  CallbackToken token;
   v8::PropertyCallbackInfo<v8::Value> info(v8::g_current_isolate, holder, data,
-                                           out);
+                                           out, token.get());
   return static_cast<int32_t>(
       configuration->getter(v8::Local<v8::Name>::New(key), info));
 }
@@ -149,8 +175,9 @@ int32_t SetterTrampoline(void* state, uint64_t data, uint64_t holder,
   if (configuration == nullptr || configuration->setter == nullptr) return 0;
   (void)throw_on_error;
   uint64_t answer = slag_undefined();
+  CallbackToken token;
   v8::PropertyCallbackInfo<void> info(v8::g_current_isolate, holder, data,
-                                      &answer);
+                                      &answer, token.get());
   return static_cast<int32_t>(configuration->setter(
       v8::Local<v8::Name>::New(key), v8::Local<v8::Value>::New(value), info));
 }
@@ -163,8 +190,9 @@ int32_t QueryTrampoline(void* state, uint64_t data, uint64_t holder,
     return 0;
   }
   *out = slag_undefined();
+  CallbackToken token;
   v8::PropertyCallbackInfo<v8::Integer> info(v8::g_current_isolate, holder,
-                                             data, out);
+                                             data, out, token.get());
   return static_cast<int32_t>(
       configuration->query(v8::Local<v8::Name>::New(key), info));
 }
@@ -177,8 +205,9 @@ int32_t DeleterTrampoline(void* state, uint64_t data, uint64_t holder,
     return 0;
   }
   *out = slag_undefined();
+  CallbackToken token;
   v8::PropertyCallbackInfo<v8::Boolean> info(v8::g_current_isolate, holder,
-                                             data, out);
+                                             data, out, token.get());
   return static_cast<int32_t>(
       configuration->deleter(v8::Local<v8::Name>::New(key), info));
 }
@@ -214,8 +243,9 @@ int32_t DescriptorTrampoline(void* state, uint64_t data, uint64_t holder,
     return 0;
   }
   *out = slag_undefined();
+  CallbackToken token;
   v8::PropertyCallbackInfo<v8::Value> info(v8::g_current_isolate, holder, data,
-                                           out);
+                                           out, token.get());
   return static_cast<int32_t>(
       configuration->descriptor(v8::Local<v8::Name>::New(key), info));
 }
@@ -229,8 +259,9 @@ int32_t DefinerTrampoline(void* state, uint64_t data, uint64_t holder,
     return 0;
   }
   *out = slag_undefined();
+  CallbackToken token;
   v8::PropertyCallbackInfo<v8::Boolean> info(v8::g_current_isolate, holder,
-                                             data, out);
+                                             data, out, token.get());
   return static_cast<int32_t>(configuration->definer(
       v8::Local<v8::Name>::New(key), DescriptorOf(*source), info));
 }
@@ -244,8 +275,9 @@ int32_t IndexedDescriptorTrampoline(void* state, uint64_t data,
     return 0;
   }
   *out = slag_undefined();
+  CallbackToken token;
   v8::PropertyCallbackInfo<v8::Value> info(v8::g_current_isolate, holder, data,
-                                           out);
+                                           out, token.get());
   return static_cast<int32_t>(configuration->descriptor(index, info));
 }
 
@@ -259,8 +291,9 @@ int32_t IndexedDefinerTrampoline(void* state, uint64_t data, uint64_t holder,
     return 0;
   }
   *out = slag_undefined();
+  CallbackToken token;
   v8::PropertyCallbackInfo<v8::Boolean> info(v8::g_current_isolate, holder,
-                                             data, out);
+                                             data, out, token.get());
   return static_cast<int32_t>(
       configuration->definer(index, DescriptorOf(*source), info));
 }
@@ -334,6 +367,26 @@ void* Object::GetAlignedPointerFromInternalField(Local<Context>,
   return GetAlignedPointerFromInternalField(index);
 }
 
+Local<Object> Object::New(Local<Context> context) {
+  if (context.IsEmpty()) return Local<Object>();
+  auto* current = reinterpret_cast<Context*>(
+      static_cast<uintptr_t>(context.raw()));
+  uint64_t out = 0;
+  // Inside a handler this is the only allocation path there is: the ordinary
+  // one borrows the context, which the operation that called the handler holds.
+  const int status =
+      g_callback_token != nullptr
+          ? slag_callback_object_new(current->slag(), g_callback_token, &out)
+          : slag_object_new(current->slag(), 0, 0, &out);
+  if (status != 0) return Local<Object>();
+  return Local<Object>::New(out);
+}
+
+Local<Object> Object::New(Isolate* isolate) {
+  if (isolate == nullptr) return Local<Object>();
+  return New(isolate->GetCurrentContext());
+}
+
 MaybeLocal<Value> Object::Get(Local<Context> context, Local<Value> key) {
   if (context.IsEmpty() || key.IsEmpty()) return MaybeLocal<Value>();
   auto* current = reinterpret_cast<Context*>(
@@ -352,8 +405,13 @@ Maybe<bool> Object::Set(Local<Context> context, Local<Value> key,
   }
   auto* current = reinterpret_cast<Context*>(
       static_cast<uintptr_t>(context.raw()));
-  if (slag_object_set_key(current->slag(), Raw(this), key.raw(), value.raw()) !=
-      0) {
+  const int status =
+      g_callback_token != nullptr
+          ? slag_callback_object_set_key(current->slag(), g_callback_token,
+                                         Raw(this), key.raw(), value.raw())
+          : slag_object_set_key(current->slag(), Raw(this), key.raw(),
+                                value.raw());
+  if (status != 0) {
     return Maybe<bool>();
   }
   return Maybe<bool>(true);
@@ -385,6 +443,50 @@ Maybe<bool> Object::Has(Local<Context> context, Local<Value> key) {
 Maybe<bool> Object::Has(Local<Context> context, uint32_t index) {
   return Has(context,
              Local<Value>::New(slag_number_new(static_cast<double>(index))));
+}
+
+namespace {
+
+/* `v8::Array`'s allocation, shared by the length and element forms. A null
+ * `values` makes `length` holes. */
+Local<Array> NewArray(Local<Context> context, const uint64_t* values,
+                      size_t length) {
+  if (context.IsEmpty()) return Local<Array>();
+  auto* current = reinterpret_cast<Context*>(
+      static_cast<uintptr_t>(context.raw()));
+  uint64_t out = 0;
+  const int status =
+      g_callback_token != nullptr
+          ? slag_callback_array_new(current->slag(), g_callback_token, values,
+                                    length, &out)
+          : slag_array_new(current->slag(), values, length, &out);
+  if (status != 0) return Local<Array>();
+  return Local<Array>::New(out);
+}
+
+}  // namespace
+
+Local<Array> Array::New(Local<Context> context, int length) {
+  return NewArray(context, nullptr, length < 0 ? 0 : static_cast<size_t>(length));
+}
+
+Local<Array> Array::New(Local<Context> context, Local<Value>* elements,
+                        size_t length) {
+  if (elements == nullptr) return NewArray(context, nullptr, length);
+  std::vector<uint64_t> values(length);
+  for (size_t i = 0; i < length; ++i) values[i] = elements[i].raw();
+  return NewArray(context, values.data(), length);
+}
+
+Local<Array> Array::New(Isolate* isolate, int length) {
+  if (isolate == nullptr) return Local<Array>();
+  return New(isolate->GetCurrentContext(), length);
+}
+
+Local<Array> Array::New(Isolate* isolate, Local<Value>* elements,
+                        size_t length) {
+  if (isolate == nullptr) return Local<Array>();
+  return New(isolate->GetCurrentContext(), elements, length);
 }
 
 bool Object::Delete(Local<Context> context, Local<Value> key) {

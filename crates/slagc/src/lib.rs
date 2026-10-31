@@ -28,7 +28,8 @@ use crux::heap::{GcAny, RootSource, Trace, register_root_source};
 use crux::value::Value;
 use slag::api::{Local as EngineLocal, Traced};
 use slag::{
-    CompiledScript, Context, ErrorKind, FunctionCall, HostFn, JsError, JsValue, OwnProperty,
+    CallbackWindow, CompiledScript, Context, ErrorKind, FunctionCall, HostFn, JsError, JsValue,
+    OwnProperty,
 };
 
 /// The isolate a host enters. The engine's contexts are the state; this token
@@ -46,6 +47,10 @@ pub struct SlagIsolate {
 pub struct SlagContext {
     context: RefCell<Context>,
     pending_error: Rc<RefCell<Option<String>>>,
+    /// The context's agent address, which is stable because the context boxes it.
+    /// A host callback publishes it as its token so it can allocate through the
+    /// operation that is running (see [`slag_callback_token`]).
+    agent: crux::function::AgentPtr,
 }
 
 /// A parsed, not-yet-run script (`v8::Script`).
@@ -75,6 +80,13 @@ unsafe fn bytes<'a>(ptr: *const u8, len: usize) -> &'a [u8] {
 
 unsafe fn text<'a>(ptr: *const u8, len: usize) -> Result<&'a str, ()> {
     std::str::from_utf8(bytes(ptr, len)).map_err(|_| ())
+}
+
+unsafe fn slice_of<'a, T>(ptr: *const T, len: usize) -> &'a [T] {
+    if ptr.is_null() || len == 0 {
+        return &[];
+    }
+    std::slice::from_raw_parts(ptr, len)
 }
 
 fn record(context: &SlagContext, error: JsError) {
@@ -268,10 +280,14 @@ pub unsafe extern "C" fn slag_isolate_free(isolate: *mut SlagIsolate) {
 #[unsafe(no_mangle)]
 pub extern "C" fn slag_context_new(_isolate: *mut SlagIsolate) -> *mut SlagContext {
     match Context::new() {
-        Ok(context) => Box::into_raw(Box::new(SlagContext {
-            context: RefCell::new(context),
-            pending_error: Rc::new(RefCell::new(None)),
-        })),
+        Ok(mut context) => {
+            let agent = context.agent_mut() as *mut _ as crux::function::AgentPtr;
+            Box::into_raw(Box::new(SlagContext {
+                context: RefCell::new(context),
+                pending_error: Rc::new(RefCell::new(None)),
+                agent,
+            }))
+        }
         Err(_) => std::ptr::null_mut(),
     }
 }
@@ -693,7 +709,11 @@ pub unsafe extern "C" fn slag_object_new_handler(
                 return 1;
             }
         };
-        engine.create_host_object(Rc::new(CxxHandler::new(*handler)))
+        engine.create_host_object(Rc::new(CxxHandler::new(
+            *handler,
+            context.agent,
+            Rc::clone(&context.pending_error),
+        )))
     };
     let object = match created {
         Ok(object) => object,
@@ -707,6 +727,152 @@ pub unsafe extern "C" fn slag_object_new_handler(
         *out = object.as_value().to_bits();
     }
     0
+}
+
+/// The token of the host callback that is running on this thread, or null when
+/// there is none. The facade publishes it on `PropertyCallbackInfo`; the
+/// allocation entry points below admit only a running token.
+#[unsafe(no_mangle)]
+pub extern "C" fn slag_callback_token() -> *const c_void {
+    CallbackWindow::token()
+}
+
+/// An ordinary object allocated through a running callback (`v8::Object::New`
+/// inside a getter, say). Returns 2 when `token` names no running callback.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn slag_callback_object_new(
+    context: *mut SlagContext,
+    token: *const c_void,
+    out: *mut u64,
+) -> i32 {
+    let Some(context) = context.as_ref() else {
+        return 2;
+    };
+    let Some(window) = CallbackWindow::admit(token) else {
+        return 2;
+    };
+    match window.create_object() {
+        Ok(object) => {
+            if !out.is_null() {
+                *out = object.as_value().to_bits();
+            }
+            0
+        }
+        Err(error) => {
+            record(context, error);
+            1
+        }
+    }
+}
+
+/// An array allocated at the top level (`v8::Array::New`). A null `values`
+/// makes `len` holes; otherwise the `len` values are the elements.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn slag_array_new(
+    context: *mut SlagContext,
+    values: *const u64,
+    len: usize,
+    out: *mut u64,
+) -> i32 {
+    let Some(context) = context.as_ref() else {
+        return 2;
+    };
+    let engine = match context.context.try_borrow() {
+        Ok(engine) => engine,
+        Err(_) => {
+            reentrant(context);
+            return 1;
+        }
+    };
+    let created = if values.is_null() {
+        engine.create_array_with_length(u32::try_from(len).unwrap_or(u32::MAX))
+    } else {
+        let values: Vec<JsValue> = slice_of::<u64>(values, len)
+            .iter()
+            .map(|bits| JsValue::from_bits(*bits))
+            .collect();
+        engine.create_array(&values)
+    };
+    match created {
+        Ok(array) => {
+            if !out.is_null() {
+                *out = array.to_bits();
+            }
+            0
+        }
+        Err(error) => {
+            record(context, error);
+            1
+        }
+    }
+}
+
+/// The callback form of [`slag_array_new`] (`v8::Array::New` inside a handler).
+/// Returns 2 when `token` names no running callback.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn slag_callback_array_new(
+    context: *mut SlagContext,
+    token: *const c_void,
+    values: *const u64,
+    len: usize,
+    out: *mut u64,
+) -> i32 {
+    let Some(context) = context.as_ref() else {
+        return 2;
+    };
+    let Some(window) = CallbackWindow::admit(token) else {
+        return 2;
+    };
+    let created = if values.is_null() {
+        window.create_array_with_length(u32::try_from(len).unwrap_or(u32::MAX))
+    } else {
+        let values: Vec<JsValue> = slice_of::<u64>(values, len)
+            .iter()
+            .map(|bits| JsValue::from_bits(*bits))
+            .collect();
+        window.create_array(&values)
+    };
+    match created {
+        Ok(array) => {
+            if !out.is_null() {
+                *out = array.to_bits();
+            }
+            0
+        }
+        Err(error) => {
+            record(context, error);
+            1
+        }
+    }
+}
+
+/// [[Set]] a property through a running callback (`v8::Object::Set` inside a
+/// handler). Returns 2 when `token` names no running callback.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn slag_callback_object_set_key(
+    context: *mut SlagContext,
+    token: *const c_void,
+    object: u64,
+    key: u64,
+    value: u64,
+) -> i32 {
+    let Some(context) = context.as_ref() else {
+        return 2;
+    };
+    let Some(window) = CallbackWindow::admit(token) else {
+        return 2;
+    };
+    match window.set_property(
+        JsValue::from_bits(object),
+        JsValue::from_bits(key),
+        JsValue::from_bits(value),
+    ) {
+        Ok(()) => 0,
+        Err(error) => {
+            record(context, error);
+            1
+        }
+    }
 }
 
 /// How many internal fields `object` carries
