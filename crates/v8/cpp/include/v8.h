@@ -461,6 +461,17 @@ using NamedPropertyQueryCallback = Intercepted (*)(
 using NamedPropertyDeleterCallback = Intercepted (*)(
     Local<Name> property, const PropertyCallbackInfo<Boolean>& info);
 
+/* The indexed twins (`v8::IndexedProperty*Callback`): the key is an array
+ * index, not a name. */
+using IndexedPropertyGetterCallback = Intercepted (*)(
+    uint32_t index, const PropertyCallbackInfo<Value>& info);
+using IndexedPropertySetterCallback = Intercepted (*)(
+    uint32_t index, Local<Value> value, const PropertyCallbackInfo<void>& info);
+using IndexedPropertyQueryCallback = Intercepted (*)(
+    uint32_t index, const PropertyCallbackInfo<Integer>& info);
+using IndexedPropertyDeleterCallback = Intercepted (*)(
+    uint32_t index, const PropertyCallbackInfo<Boolean>& info);
+
 /* How a handler is consulted (`v8::PropertyHandlerFlags`). Accepted and not
  * honoured: the engine's seam consults the host before its own lookup, so there
  * is no non-masking mode and no string-only mode to select. */
@@ -501,6 +512,32 @@ struct NamedPropertyHandlerConfiguration {
   PropertyHandlerFlags flags;
 };
 
+/* What a host installs for element keys
+ * (`v8::IndexedPropertyHandlerConfiguration`). A key that is an array index
+ * goes to these when they are installed, and to the named handler otherwise. */
+struct IndexedPropertyHandlerConfiguration {
+  IndexedPropertyHandlerConfiguration(
+      IndexedPropertyGetterCallback getter = nullptr,
+      IndexedPropertySetterCallback setter = nullptr,
+      IndexedPropertyQueryCallback query = nullptr,
+      IndexedPropertyDeleterCallback deleter = nullptr,
+      Local<Value> data = Local<Value>(),
+      PropertyHandlerFlags flags = PropertyHandlerFlags::kNone)
+      : getter(getter),
+        setter(setter),
+        query(query),
+        deleter(deleter),
+        data(data),
+        flags(flags) {}
+
+  IndexedPropertyGetterCallback getter;
+  IndexedPropertySetterCallback setter;
+  IndexedPropertyQueryCallback query;
+  IndexedPropertyDeleterCallback deleter;
+  Local<Value> data;
+  PropertyHandlerFlags flags;
+};
+
 class FunctionTemplate {
  public:
   static Local<FunctionTemplate> New(Isolate* isolate,
@@ -534,6 +571,10 @@ class ObjectTemplate {
    * instance's property access is offered to the handler first. */
   void SetHandler(const NamedPropertyHandlerConfiguration& configuration);
 
+  /* The same for element keys
+   * (`v8::ObjectTemplate::SetHandler` with an indexed configuration). */
+  void SetHandler(const IndexedPropertyHandlerConfiguration& configuration);
+
   /* Create an instance of this template: an ordinary object with the template's
    * internal fields, its host functions, and `IsApiWrapper` set. A template with
    * a handler makes an object whose property access goes to it. */
@@ -542,8 +583,10 @@ class ObjectTemplate {
  private:
   std::vector<Entry> entries_;
   int internal_fields_ = 0;
-  NamedPropertyHandlerConfiguration handler_;
-  bool has_handler_ = false;
+  NamedPropertyHandlerConfiguration named_handler_;
+  IndexedPropertyHandlerConfiguration indexed_handler_;
+  bool has_named_handler_ = false;
+  bool has_indexed_handler_ = false;
 };
 
 class Context {

@@ -615,6 +615,23 @@ real-property predicates are defined to *skip* interceptors, and crux's
 `ordinary_get_own_property` is exactly that question, so the embed helpers use it
 rather than the interceptor-consulting `get_own_property_key`.
 
+*Indexed handlers, and why the enumerator waits (2026-10-31).* `SetHandler` now
+takes an `IndexedPropertyHandlerConfiguration` too, with the same four callbacks
+keyed by an array index, and the handler routes a key by its shape: an array
+index goes to the indexed callback when one is installed, and to the named one
+otherwise. That is V8's rule and the rule the crate's bridge already documents.
+
+While wiring the enumerator the reason it cannot be useful yet became concrete:
+`Object.keys` reads each key's own descriptor, and a host object whose
+`get_own_property` is not implemented falls through to the ordinary method, which
+reports the key absent — so the enumerator's keys are dropped before a caller
+sees them. The crate's interceptor answers `get_own_property` through its
+`descriptor` callback for exactly this reason. So the order is now: a
+property-descriptor ABI (which carries `descriptor` and `definer`), then the
+re-entrant allocation path a callback needs to build the enumerator's array, then
+the enumerator itself. `SetAccessor` is a separate surface: it needs an accessor
+callback whose getter runs as a function with the property's key in hand.
+
 The ABI shape is roughly a struct of up to seven C function pointers, the data
 pointer, and the flags, handed over once per template, with the return codes
 `Intercepted` already defines; the callbacks receive a `PropertyCallbackInfo`

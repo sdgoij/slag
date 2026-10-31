@@ -43,6 +43,9 @@ struct HostNames {
   int setters = 0;
   int deleters = 0;
   int data_misses = 0;
+  int indexed_getters = 0;
+  int indexed_setters = 0;
+  int indexed_deleters = 0;
 };
 
 HostNames host_names;
@@ -97,6 +100,40 @@ v8::Intercepted HostDelete(v8::Local<v8::Name> property,
   v8::String::Utf8Value text(info.GetIsolate(), property);
   if (!*text || !IsHostName(*text)) return v8::Intercepted::kNo;
   ++host_names.deleters;
+  info.GetReturnValue().Set(v8::Boolean::New(info.GetIsolate(), true));
+  return v8::Intercepted::kYes;
+}
+
+// The indexed twins: the host owns elements 0..2, and an index past them falls
+// back to the engine.
+v8::Intercepted HostGetIndex(uint32_t index,
+                             const v8::PropertyCallbackInfo<v8::Value>& info) {
+  ++host_names.indexed_getters;
+  if (index >= 3) return v8::Intercepted::kNo;
+  info.GetReturnValue().Set(
+      v8::Integer::New(info.GetIsolate(), static_cast<int32_t>(index * 10)));
+  return v8::Intercepted::kYes;
+}
+
+v8::Intercepted HostSetIndex(uint32_t index, v8::Local<v8::Value>,
+                             const v8::PropertyCallbackInfo<void>& info) {
+  (void)info;
+  if (index >= 3) return v8::Intercepted::kNo;
+  ++host_names.indexed_setters;
+  return v8::Intercepted::kYes;
+}
+
+v8::Intercepted HostQueryIndex(
+    uint32_t index, const v8::PropertyCallbackInfo<v8::Integer>& info) {
+  if (index >= 3) return v8::Intercepted::kNo;
+  info.GetReturnValue().Set(v8::Integer::New(info.GetIsolate(), 0));
+  return v8::Intercepted::kYes;
+}
+
+v8::Intercepted HostDeleteIndex(
+    uint32_t index, const v8::PropertyCallbackInfo<v8::Boolean>& info) {
+  if (index >= 3) return v8::Intercepted::kNo;
+  ++host_names.indexed_deleters;
   info.GetReturnValue().Set(v8::Boolean::New(info.GetIsolate(), true));
   return v8::Intercepted::kYes;
 }
@@ -499,6 +536,31 @@ int main() {
       ++failures;
     }
     if (host_names.data_misses != 0) {
+      ++failures;
+    }
+
+    // The indexed handler owns elements 0..2; a higher index falls back.
+    v8::IndexedPropertyHandlerConfiguration indexed(HostGetIndex, HostSetIndex,
+                                                   HostQueryIndex,
+                                                   HostDeleteIndex);
+    v8::Local<v8::ObjectTemplate> elements = v8::ObjectTemplate::New(isolate);
+    elements->SetHandler(indexed);
+    v8::Local<v8::Object> array_like =
+        elements->NewInstance(current).ToLocalChecked();
+    if (array_like->Get(current, 1).ToLocalChecked()->Int32Value(current).FromMaybe(
+            -1) != 10 ||
+        !array_like->Has(current, 2).FromMaybe(false) ||
+        array_like->Has(current, 3).FromMaybe(true) ||
+        !array_like->Set(current, 0, v8::Integer::New(isolate, 1))
+             .FromMaybe(false) ||
+        !array_like->Delete(current, 0) ||
+        array_like->Get(current, 3).ToLocalChecked()->IsUndefined() == false) {
+      fprintf(stderr, "an indexed handler answered the wrong way\n");
+      ++failures;
+    }
+    if (host_names.indexed_getters == 0 || host_names.indexed_setters == 0 ||
+        host_names.indexed_deleters == 0) {
+      fprintf(stderr, "an indexed callback was never asked\n");
       ++failures;
     }
   }

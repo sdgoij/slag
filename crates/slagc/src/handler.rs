@@ -53,10 +53,22 @@ pub struct SlagPropertyHandler {
     pub query: Option<unsafe extern "C" fn(*mut c_void, u64, u64, u64, *mut u64) -> i32>,
     /// `(state, data, holder, key, out)`: the out slot holds a boolean.
     pub deleter: Option<unsafe extern "C" fn(*mut c_void, u64, u64, u64, *mut u64) -> i32>,
+    /// The indexed twins, for a key that is an array index: `(state, data,
+    /// holder, index, receiver, out)` and so on. V8 routes a key by its shape,
+    /// and so does this handler: an array index goes to the indexed callback
+    /// when one is installed, and to the named one otherwise.
+    pub indexed_getter:
+        Option<unsafe extern "C" fn(*mut c_void, u64, u64, u32, u64, *mut u64) -> i32>,
+    pub indexed_setter:
+        Option<unsafe extern "C" fn(*mut c_void, u64, u64, u32, u64, u64, i32) -> i32>,
+    pub indexed_query: Option<unsafe extern "C" fn(*mut c_void, u64, u64, u32, *mut u64) -> i32>,
+    pub indexed_deleter: Option<unsafe extern "C" fn(*mut c_void, u64, u64, u32, *mut u64) -> i32>,
     /// The configuration's `data`, as tagged `Value` bits.
     pub data: u64,
-    /// The C++ side's trampoline context (the host callbacks themselves).
+    /// The C++ side's trampoline context for the named callbacks.
     pub state: *mut c_void,
+    /// The same for the indexed callbacks, which are their own configuration.
+    pub indexed_state: *mut c_void,
 }
 
 impl fmt::Debug for SlagPropertyHandler {
@@ -66,6 +78,10 @@ impl fmt::Debug for SlagPropertyHandler {
             .field("setter", &self.setter.is_some())
             .field("query", &self.query.is_some())
             .field("deleter", &self.deleter.is_some())
+            .field("indexed_getter", &self.indexed_getter.is_some())
+            .field("indexed_setter", &self.indexed_setter.is_some())
+            .field("indexed_query", &self.indexed_query.is_some())
+            .field("indexed_deleter", &self.indexed_deleter.is_some())
             .finish()
     }
 }
@@ -120,6 +136,29 @@ impl HostOps for CxxHandler {
         key: &PropertyKey,
         receiver: &Value,
     ) -> Option<Result<Value, JsError>> {
+        // An array index goes to the indexed callback when one is installed, and
+        // to the named one otherwise, which is V8's routing rule.
+        if let Some(index) = crux::object::array_index_of(key)
+            && let Some(getter) = self.handler.indexed_getter
+        {
+            let mut answer = 0;
+            // SAFETY: as in the named call below.
+            let intercepted = unsafe {
+                getter(
+                    self.handler.indexed_state,
+                    self.handler.data,
+                    object.self_value().bits(),
+                    index as u32,
+                    receiver.bits(),
+                    &mut answer,
+                )
+            };
+            return match intercepted {
+                INTERCEPTED_NO => None,
+                INTERCEPTED_THROW => Some(Err(thrown())),
+                _ => Some(Ok(Value::from_bits(answer))),
+            };
+        }
         let getter = self.handler.getter?;
         // The key is a value the callback can name, and the local is what keeps
         // it on the collector's conservative scan while the host runs.
@@ -145,6 +184,27 @@ impl HostOps for CxxHandler {
     }
 
     fn has_property(&self, object: &JsObject, key: &PropertyKey) -> Option<Result<bool, JsError>> {
+        // The indexed twin first, the same routing as `get`.
+        if let Some(index) = crux::object::array_index_of(key)
+            && let Some(query) = self.handler.indexed_query
+        {
+            let mut answer = 0;
+            // SAFETY: as in the named call below.
+            let intercepted = unsafe {
+                query(
+                    self.handler.indexed_state,
+                    self.handler.data,
+                    object.self_value().bits(),
+                    index as u32,
+                    &mut answer,
+                )
+            };
+            return match intercepted {
+                INTERCEPTED_NO => None,
+                INTERCEPTED_THROW => Some(Err(thrown())),
+                _ => Some(Ok(true)),
+            };
+        }
         let query = self.handler.query?;
         let key = key_value(key);
         let mut attributes = 0;
@@ -174,6 +234,28 @@ impl HostOps for CxxHandler {
         receiver: &Value,
         throw: bool,
     ) -> Option<Result<bool, JsError>> {
+        // The indexed twin first, the same routing as `get`.
+        if let Some(index) = crux::object::array_index_of(key)
+            && let Some(setter) = self.handler.indexed_setter
+        {
+            // SAFETY: as in the named call below.
+            let intercepted = unsafe {
+                setter(
+                    self.handler.indexed_state,
+                    self.handler.data,
+                    object.self_value().bits(),
+                    index as u32,
+                    value.bits(),
+                    receiver.bits(),
+                    i32::from(throw),
+                )
+            };
+            return match intercepted {
+                INTERCEPTED_NO => None,
+                INTERCEPTED_THROW => Some(Err(thrown())),
+                _ => Some(Ok(true)),
+            };
+        }
         let setter = self.handler.setter?;
         let key = key_value(key);
         // SAFETY: as in `get`.
@@ -198,6 +280,27 @@ impl HostOps for CxxHandler {
     }
 
     fn delete(&self, object: &JsObject, key: &PropertyKey) -> Option<Result<bool, JsError>> {
+        // The indexed twin first, the same routing as `get`.
+        if let Some(index) = crux::object::array_index_of(key)
+            && let Some(deleter) = self.handler.indexed_deleter
+        {
+            let mut answer = 0;
+            // SAFETY: as in the named call below.
+            let intercepted = unsafe {
+                deleter(
+                    self.handler.indexed_state,
+                    self.handler.data,
+                    object.self_value().bits(),
+                    index as u32,
+                    &mut answer,
+                )
+            };
+            return match intercepted {
+                INTERCEPTED_NO => None,
+                INTERCEPTED_THROW => Some(Err(thrown())),
+                _ => Some(Ok(deleted(answer))),
+            };
+        }
         let deleter = self.handler.deleter?;
         let key = key_value(key);
         let mut answer = 0;

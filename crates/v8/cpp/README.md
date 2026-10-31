@@ -162,11 +162,21 @@ lookup, which is V8's masking default; there is no non-masking mode.
 
 Three callbacks are absent on purpose:
 
-- the enumerator, because it builds an array and allocating through the
-  facade needs the context the calling operation holds borrowed;
+- the enumerator, because it builds the array it answers with and allocating one
+  through the facade needs the context that the calling operation holds
+  borrowed. It also needs a `descriptor` callback to be observable at all:
+  `Object.keys` reads each key's own descriptor, and a host object whose
+  descriptor lookup falls through to the ordinary method reports the key as
+  absent. The descriptor ABI therefore comes before the enumerator;
 - `definer` and `descriptor`, which need a property-descriptor ABI.
 
 A host that needs them does not compile, which is the only honest failure mode.
+
+`SetHandler` also takes an `IndexedPropertyHandlerConfiguration`: a key that is
+an array index goes to those callbacks when they are installed, and to the named
+handler otherwise, which is V8's routing rule. It carries the same four
+callbacks (getter, setter, query, deleter) and no enumerator, for the same
+reason.
 
 `gin-shapes` installs a handler that owns three names through its query, answers
 one through its getter and declines the rest, and takes a set and a delete; it
@@ -217,8 +227,9 @@ not a claim that gin itself links.
   `Delete`, `GetRealNamedProperty` (own property only, no chain), and the
   own-property predicates `HasRealNamedProperty`,
   `HasRealIndexedProperty`, and `HasRealNamedCallbackProperty`.
-- `ObjectTemplate::SetHandler` with the named-property getter, setter, query and
-  deleter callbacks, and `Intercepted` / `PropertyCallbackInfo<T>`.
+- `ObjectTemplate::SetHandler` with the named and indexed property handlers:
+  getter, setter, query, and deleter in each, and `Intercepted` /
+  `PropertyCallbackInfo<T>`.
 - `TracedReference<T>` as a host-owned root: copy is a second reference, `Reset`
   releases it, and the destructor releases it like any persistent.
 - Handles and persistents as engine roots: a handle slot or a `Global` over an

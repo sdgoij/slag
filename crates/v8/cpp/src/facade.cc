@@ -69,6 +69,65 @@ v8::NamedPropertyHandlerConfiguration* Configuration(void* state) {
   return static_cast<v8::NamedPropertyHandlerConfiguration*>(state);
 }
 
+v8::IndexedPropertyHandlerConfiguration* IndexedConfiguration(void* state) {
+  return static_cast<v8::IndexedPropertyHandlerConfiguration*>(state);
+}
+
+int32_t IndexedGetterTrampoline(void* state, uint64_t data, uint64_t holder,
+                                uint32_t index, uint64_t receiver,
+                                uint64_t* out) {
+  auto* configuration = IndexedConfiguration(state);
+  if (configuration == nullptr || configuration->getter == nullptr ||
+      out == nullptr) {
+    return 0;
+  }
+  (void)receiver;
+  *out = slag_undefined();
+  v8::PropertyCallbackInfo<v8::Value> info(v8::g_current_isolate, holder, data,
+                                           out);
+  return static_cast<int32_t>(configuration->getter(index, info));
+}
+
+int32_t IndexedSetterTrampoline(void* state, uint64_t data, uint64_t holder,
+                                uint32_t index, uint64_t value,
+                                uint64_t receiver, int32_t throw_on_error) {
+  auto* configuration = IndexedConfiguration(state);
+  if (configuration == nullptr || configuration->setter == nullptr) return 0;
+  (void)receiver;
+  (void)throw_on_error;
+  uint64_t answer = slag_undefined();
+  v8::PropertyCallbackInfo<void> info(v8::g_current_isolate, holder, data,
+                                      &answer);
+  return static_cast<int32_t>(
+      configuration->setter(index, v8::Local<v8::Value>::New(value), info));
+}
+
+int32_t IndexedQueryTrampoline(void* state, uint64_t data, uint64_t holder,
+                               uint32_t index, uint64_t* out) {
+  auto* configuration = IndexedConfiguration(state);
+  if (configuration == nullptr || configuration->query == nullptr ||
+      out == nullptr) {
+    return 0;
+  }
+  *out = slag_undefined();
+  v8::PropertyCallbackInfo<v8::Integer> info(v8::g_current_isolate, holder,
+                                             data, out);
+  return static_cast<int32_t>(configuration->query(index, info));
+}
+
+int32_t IndexedDeleterTrampoline(void* state, uint64_t data, uint64_t holder,
+                                 uint32_t index, uint64_t* out) {
+  auto* configuration = IndexedConfiguration(state);
+  if (configuration == nullptr || configuration->deleter == nullptr ||
+      out == nullptr) {
+    return 0;
+  }
+  *out = slag_undefined();
+  v8::PropertyCallbackInfo<v8::Boolean> info(v8::g_current_isolate, holder,
+                                             data, out);
+  return static_cast<int32_t>(configuration->deleter(index, info));
+}
+
 int32_t GetterTrampoline(void* state, uint64_t data, uint64_t holder,
                          uint64_t key, uint64_t receiver, uint64_t* out) {
   auto* configuration = Configuration(state);
@@ -423,17 +482,24 @@ MaybeLocal<Object> ObjectTemplate::NewInstance(Local<Context> context) {
 
   uint64_t object = 0;
   int status = 0;
-  if (has_handler_) {
-    // The handler struct carries the templates's callbacks plus the address of
-    // the configuration the trampolines read them from. The configuration lives
-    // as long as this template, like the template itself.
+  if (has_named_handler_ || has_indexed_handler_) {
+    // The handler struct carries each configuration's callbacks plus the
+    // address of the configuration the trampolines read them from. The
+    // configurations live as long as this template, like the template itself.
     SlagPropertyHandler handler{};
     handler.getter = GetterTrampoline;
     handler.setter = SetterTrampoline;
     handler.query = QueryTrampoline;
     handler.deleter = DeleterTrampoline;
-    handler.data = handler_.data.IsEmpty() ? slag_undefined() : handler_.data.raw();
-    handler.state = &handler_;
+    handler.indexed_getter = IndexedGetterTrampoline;
+    handler.indexed_setter = IndexedSetterTrampoline;
+    handler.indexed_query = IndexedQueryTrampoline;
+    handler.indexed_deleter = IndexedDeleterTrampoline;
+    handler.data = named_handler_.data.IsEmpty()
+                       ? slag_undefined()
+                       : named_handler_.data.raw();
+    handler.state = &named_handler_;
+    handler.indexed_state = &indexed_handler_;
     status = slag_object_new_handler(slag, static_cast<size_t>(internal_fields_),
                                      1, &handler, &object);
   } else {
@@ -458,8 +524,14 @@ MaybeLocal<Object> ObjectTemplate::NewInstance(Local<Context> context) {
 
 void ObjectTemplate::SetHandler(
     const NamedPropertyHandlerConfiguration& configuration) {
-  handler_ = configuration;
-  has_handler_ = true;
+  named_handler_ = configuration;
+  has_named_handler_ = true;
+}
+
+void ObjectTemplate::SetHandler(
+    const IndexedPropertyHandlerConfiguration& configuration) {
+  indexed_handler_ = configuration;
+  has_indexed_handler_ = true;
 }
 
 Local<Context> Context::New(Isolate* isolate, std::nullptr_t,

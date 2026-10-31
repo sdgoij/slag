@@ -32,8 +32,18 @@ typedef struct SlagPropertyHandler {
                    uint64_t* out);
   int32_t (*deleter)(void* state, uint64_t data, uint64_t holder, uint64_t key,
                      uint64_t* out);
+  int32_t (*indexed_getter)(void* state, uint64_t data, uint64_t holder,
+                            uint32_t index, uint64_t receiver, uint64_t* out);
+  int32_t (*indexed_setter)(void* state, uint64_t data, uint64_t holder,
+                            uint32_t index, uint64_t value, uint64_t receiver,
+                            int32_t throw_on_error);
+  int32_t (*indexed_query)(void* state, uint64_t data, uint64_t holder,
+                           uint32_t index, uint64_t* out);
+  int32_t (*indexed_deleter)(void* state, uint64_t data, uint64_t holder,
+                             uint32_t index, uint64_t* out);
   uint64_t data;
   void* state;
+  void* indexed_state;
 } SlagPropertyHandler;
 
 SlagIsolate* slag_isolate_new(void);
