@@ -20659,3 +20659,38 @@ Verified: clippy `-D warnings`; `cargo test --workspace` 5864 pass / 0 fail;
 four sweeps at 100% (language 23726, built-ins 23821, annexB 1086, intl402
 3365); corpus parity 0, `mean-jitGap` 8.09; four env-call shapes under
 `--gc-stress` return the plain run's values.
+
+## LANDED (2026-10-31): the string builder leaves `VmScratch`
+
+The scratch record a nested run saves and restores was 160 bytes, and the
+72-byte `Vm` string builder was the largest field in it — moved out, moved
+back, and passed by value through a 160-byte struct on both sides of every
+nested call (the self-call, certified-call and interpreter nested-run lanes).
+A builder is enabled only inside a planned `s += e` append loop, so it is idle
+at essentially every call site: `save_scratch` now pushes it onto
+`Vm::saved_builders` (a LIFO, one entry per nesting level) only when it is
+enabled, and the record carries a `builder_saved` flag instead. An idle builder
+is left in place, and restore disables whatever the nested run left behind while
+keeping the storage it grew. The record drops to 88 bytes.
+
+Measured with the interleaved old/new protocol (one process per row, three
+rounds, per-binary minima):
+
+| row | before | after |
+| --- | ---: | ---: |
+| `nl3` (one non-leaf call per iteration, 1M) | 59.0 ms | **50.6 ms (-14 %)** |
+| head-let (nine non-leaf calls per body) | 346.7 | 349.8 (flat) |
+| `strings/concat_loop` (the builder row) | 7.92 | 8.03 (flat) |
+| `strings/coercion_concat` | 39.45 | 39.50 (flat) |
+
+So the save/restore pair really was the lane's largest term (-8 ns per non-leaf
+call), and the rows that do not move are the ones whose mass is not in the call
+lane: head-let's three closure creations and its for-in machinery dominate even
+nine certified calls per body. The append rows are flat, which is the check
+that the lazy builder path costs nothing where the builder is genuinely live.
+
+Verified: clippy `-D warnings`; `cargo test --workspace` 5864 pass / 0 fail;
+four sweeps at 100% (language 23726, built-ins 23821, annexB 1086, intl402
+3365); corpus parity 0, `mean-jitGap` 8.21; `concat_loop`, `coercion_concat`,
+head-let, an env-closure probe and a for-in closure probe under `--gc-stress`
+all return their plain-run values.

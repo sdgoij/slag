@@ -3742,7 +3742,10 @@ pub(crate) struct VmScratch {
     acc: Value,
     loop_counter: f64,
     loop_num: f64,
-    builder: Builder,
+    /// Whether the caller had a live string builder, which
+    /// [`Vm::save_scratch`] moved onto `Vm::saved_builders` (it is 72 bytes and
+    /// idle outside a planned append loop, so it is not part of this record).
+    builder_saved: bool,
     completion: Value,
     completion_is_empty: bool,
     switch_disc: Value,
@@ -4103,6 +4106,12 @@ pub struct Vm {
     /// The active string builder for a planned `s += e` append loop (see
     /// [`Builder`]). `owner == usize::MAX` outside such a loop.
     pub(crate) builder: Builder,
+    /// The builders a nested run took off `Vm::builder` and must put back
+    /// (LIFO, one per nesting level). A `Builder` is 72 bytes and is enabled
+    /// only inside a planned append loop, so keeping it out of `VmScratch`
+    /// leaves that struct small enough for the lane's save/restore to stay in
+    /// registers; a save from any other call pushes nothing.
+    pub(crate) saved_builders: Vec<Builder>,
     /// Completion-register saves for the `finally` blocks currently running
     /// (nested finallys push in order).
     completion_stack: Vec<(Value, bool)>,
@@ -4315,6 +4324,7 @@ impl Vm {
             loop_counter: 0.0,
             loop_num: 0.0,
             builder: Builder::inactive(),
+            saved_builders: Vec::new(),
             completion_stack: Vec::new(),
             list_stack: Vec::new(),
             var_ref_stack: Vec::new(),
@@ -4338,12 +4348,20 @@ impl Vm {
     /// puts the caller's back.
     #[inline]
     pub(crate) fn save_scratch(&mut self) -> VmScratch {
+        // A builder is enabled only inside a planned append loop, so this is a
+        // branch in the common case and the 72-byte move happens only when
+        // there is a live one. See `Vm::saved_builders`.
+        let builder_saved = self.builder.enabled;
+        if builder_saved {
+            self.saved_builders
+                .push(std::mem::replace(&mut self.builder, Builder::inactive()));
+        }
         let scratch = VmScratch {
             ip: self.ip,
             acc: self.acc,
             loop_counter: self.loop_counter,
             loop_num: self.loop_num,
-            builder: std::mem::replace(&mut self.builder, Builder::inactive()),
+            builder_saved,
             completion: self.completion,
             completion_is_empty: self.completion_is_empty,
             switch_disc: self.switch_disc,
@@ -4550,7 +4568,20 @@ impl Vm {
         self.acc = scratch.acc;
         self.loop_counter = scratch.loop_counter;
         self.loop_num = scratch.loop_num;
-        self.builder = scratch.builder;
+        // The builder was not part of the scratch record (see
+        // `Vm::saved_builders`): put back the one the nested run took off, or
+        // disable whatever the nested run left behind. A disabled builder is
+        // never read, so its cursor fields may stay as the nested run left
+        // them; the storage it grew is kept.
+        if scratch.builder_saved {
+            if let Some(builder) = self.saved_builders.pop() {
+                self.builder = builder;
+            }
+        } else {
+            self.builder.enabled = false;
+            self.builder.owner = usize::MAX;
+            self.builder.rhs_ok = false;
+        }
         self.completion = scratch.completion;
         self.completion_is_empty = scratch.completion_is_empty;
         self.switch_disc = scratch.switch_disc;
@@ -4662,6 +4693,7 @@ impl Vm {
         self.acc = Value::Undefined;
         self.loop_counter = 0.0;
         self.builder = Builder::inactive();
+        self.saved_builders.clear();
         self.completion_stack.clear();
         self.list_stack.clear();
         self.var_ref_stack.clear();
