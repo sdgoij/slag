@@ -16,7 +16,10 @@ use crux::property::{PropertyDescriptor, PropertyKey};
 use crux::string::JsString;
 use crux::value::{Value, ValueKind, is_callable};
 
-use crate::agent::{Agent, MapEntry, SetEntry};
+use std::cell::RefCell;
+use std::rc::Rc;
+
+use crate::agent::{Agent, MapCollection, MapEntry, SetCollection, SetEntry};
 use crate::context::{as_object, get_property};
 use crate::expr::IteratorRecord;
 use crate::realm::Realm;
@@ -489,13 +492,49 @@ fn set_of(agent: &Agent, this: &Value) -> Result<Handle<JsObject>, JsError> {
     Ok(object)
 }
 
+/// The spec's incompatible-receiver TypeError (`RequireInternalSlot`).
+fn incompatible_receiver() -> JsError {
+    JsError::new(
+        ErrorKind::TypeError,
+        "Method called on an incompatible receiver".into(),
+    )
+}
+
+/// The receiver's [[MapData]] with `map_of`'s brand check folded into the SAME
+/// table lookup: both key on the object id, so a builtin that needs the data
+/// would otherwise hash it twice per call.
+fn map_data_of(agent: &Agent, this: &Value) -> Result<Rc<RefCell<MapCollection>>, JsError> {
+    let ValueKind::Object(object) = this.kind() else {
+        return Err(incompatible_receiver());
+    };
+    agent
+        .map_collection(object.id())
+        .ok_or_else(incompatible_receiver)
+}
+
+/// The `[[SetData]]` twin of [`map_data_of`].
+fn set_data_of(agent: &Agent, this: &Value) -> Result<Rc<RefCell<SetCollection>>, JsError> {
+    let ValueKind::Object(object) = this.kind() else {
+        return Err(incompatible_receiver());
+    };
+    agent
+        .set_collection(object.id())
+        .ok_or_else(incompatible_receiver)
+}
+
 /// The fast path of `Map.prototype.get`: `Some(value)` for a Map receiver
 /// (including `undefined` for a missing key), `None` when the receiver is not a
 /// Map — the caller then runs the exact builtin, which throws the TypeError.
 pub(crate) fn map_get_fast(agent: &Agent, this: &Value, key: &Value) -> Option<Value> {
-    let object = map_of(agent, this).ok()?;
+    // The data table IS the brand: a live collection record for the receiver's
+    // id means it is a Map `map_of` would accept, so one lookup answers both
+    // questions (and `None` still sends the caller to the exact builtin, which
+    // throws the spec's TypeError).
+    let ValueKind::Object(object) = this.kind() else {
+        return None;
+    };
+    let data = agent.map_collection(object.id())?;
     let key = canonicalize_key(*key);
-    let data = agent.map_collection(object.id()).unwrap();
     let data = data.borrow();
     Some(data.get_value(&key))
 }
@@ -503,9 +542,12 @@ pub(crate) fn map_get_fast(agent: &Agent, this: &Value, key: &Value) -> Option<V
 /// The fast path of `Set.prototype.has`: `Some(has)` for a Set receiver, `None`
 /// when the receiver is not a Set (the caller runs the exact builtin).
 pub(crate) fn set_has_fast(agent: &Agent, this: &Value, value: &Value) -> Option<bool> {
-    let object = set_of(agent, this).ok()?;
+    // See `map_get_fast`: the collection record is the brand.
+    let ValueKind::Object(object) = this.kind() else {
+        return None;
+    };
+    let data = agent.set_collection(object.id())?;
     let value = canonicalize_key(*value);
-    let data = agent.set_collection(object.id()).unwrap();
     let data = data.borrow();
     Some(data.contains(&value))
 }
@@ -521,9 +563,11 @@ pub(crate) fn map_set_fast(
     key: &Value,
     value: &Value,
 ) -> Option<Value> {
-    let object = map_of(agent, this).ok()?;
+    let ValueKind::Object(object) = this.kind() else {
+        return None;
+    };
+    let data = agent.map_collection(object.id())?;
     let key = canonicalize_key(*key);
-    let data = agent.map_collection(object.id()).unwrap();
     let mut data = data.borrow_mut();
     data.set(key, *value);
     Some(*this)
@@ -608,10 +652,9 @@ fn iter_result(agent: &Agent, value: Value, done: bool) -> Result<Value, JsError
 
 /// Map.prototype.set (spec 24.1.3.11): update in place or append.
 fn map_set(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsError> {
-    let object = map_of(agent, this)?;
+    let data = map_data_of(agent, this)?;
     let key = canonicalize_key(args.first().cloned().unwrap_or(Value::Undefined));
     let value = args.get(1).cloned().unwrap_or(Value::Undefined);
-    let data = agent.map_collection(object.id()).unwrap();
     let mut data = data.borrow_mut();
     data.set(key, value);
     Ok(*this)
@@ -619,27 +662,24 @@ fn map_set(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsE
 
 /// Map.prototype.delete (spec 24.1.3.3): mark the entry ~empty~.
 fn map_delete(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsError> {
-    let object = map_of(agent, this)?;
+    let data = map_data_of(agent, this)?;
     let key = canonicalize_key(args.first().cloned().unwrap_or(Value::Undefined));
-    let data = agent.map_collection(object.id()).unwrap();
     let mut data = data.borrow_mut();
     Ok(Value::Boolean(data.remove(&key)))
 }
 
 /// Map.prototype.get (spec 24.1.3.6).
 fn map_get(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsError> {
-    let object = map_of(agent, this)?;
+    let data = map_data_of(agent, this)?;
     let key = canonicalize_key(args.first().cloned().unwrap_or(Value::Undefined));
-    let data = agent.map_collection(object.id()).unwrap();
     let data = data.borrow();
     Ok(data.get_value(&key))
 }
 
 /// Map.prototype.has (spec 24.1.3.7).
 fn map_has(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsError> {
-    let object = map_of(agent, this)?;
+    let data = map_data_of(agent, this)?;
     let key = canonicalize_key(args.first().cloned().unwrap_or(Value::Undefined));
-    let data = agent.map_collection(object.id()).unwrap();
     let data = data.borrow();
     Ok(Value::Boolean(data.contains(&key)))
 }
@@ -656,8 +696,7 @@ fn map_clear(agent: &mut Agent, this: &Value, _args: &[Value]) -> Result<Value, 
 
 /// get Map.prototype.size (spec 24.1.3.9).
 fn map_size(agent: &mut Agent, this: &Value, _args: &[Value]) -> Result<Value, JsError> {
-    let object = map_of(agent, this)?;
-    let data = agent.map_collection(object.id()).unwrap();
+    let data = map_data_of(agent, this)?;
     let data = data.borrow();
     Ok(Value::Number(data.live_count() as f64))
 }
@@ -864,9 +903,8 @@ fn species_getter(_agent: &mut Agent, this: &Value, _args: &[Value]) -> Result<V
 
 /// Set.prototype.add (spec 24.2.3.1): append when the value is new.
 fn set_add(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsError> {
-    let object = set_of(agent, this)?;
+    let data = set_data_of(agent, this)?;
     let value = canonicalize_key(args.first().cloned().unwrap_or(Value::Undefined));
-    let data = agent.set_collection(object.id()).unwrap();
     let mut data = data.borrow_mut();
     data.add(value);
     Ok(*this)
@@ -874,18 +912,16 @@ fn set_add(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsE
 
 /// Set.prototype.delete (spec 24.2.3.4).
 fn set_delete(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsError> {
-    let object = set_of(agent, this)?;
+    let data = set_data_of(agent, this)?;
     let value = canonicalize_key(args.first().cloned().unwrap_or(Value::Undefined));
-    let data = agent.set_collection(object.id()).unwrap();
     let mut data = data.borrow_mut();
     Ok(Value::Boolean(data.remove(&value)))
 }
 
 /// Set.prototype.has (spec 24.2.3.8).
 fn set_has(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsError> {
-    let object = set_of(agent, this)?;
+    let data = set_data_of(agent, this)?;
     let value = canonicalize_key(args.first().cloned().unwrap_or(Value::Undefined));
-    let data = agent.set_collection(object.id()).unwrap();
     let data = data.borrow();
     Ok(Value::Boolean(data.contains(&value)))
 }

@@ -20310,3 +20310,37 @@ Until then the lane pays for a full activation per element, which is also why
 `--jitless` and the JIT cost the same on that row.
 
 Measured and reverted, so the tree carries no gate.
+
+## LANDED (2026-10-30): a keyed-collection call hashes its receiver id once
+
+`Map.get`/`has`/`set`/`delete`/`size` and the `Set` twins each did two lookups
+into the agent's identity table: `map_of`/`set_of` ran `has_map`/`has_set` (a
+`contains_key` on the object id) for the brand check, then the body looked the
+SAME id up again for the data, cloned the `Rc`, and borrowed it. The table entry
+IS the brand (a live record for the id means the receiver is a Map the brand
+check accepts), so both the compiled intrinsic helpers
+(`map_get_fast`/`set_has_fast`/`map_set_fast`) and the nine hot builtins now do
+one lookup, via `map_data_of`/`set_data_of`. That also removes nine `.unwrap()`
+calls from the receiver path, replacing them with the same TypeError the brand
+check raises.
+
+| row | before | after |
+| --- | ---: | ---: |
+| `opcost/map_get` | 3.13 | **2.83 (-9.6%)** |
+| `opcost/set_has` | 3.10 | **2.85 (-8.1%)** |
+| `builtins/map_churn` | 29.24 | **27.14 (-7.2%)** |
+| `builtins/set_churn` | 39.64 | **38.52 (-2.8%)** |
+
+Both halves are in the numbers above: the fast-path folding alone was -6.3% /
+-1.8% / -10.2% / -7.6%, and the builtins' own bodies added another -1.1% /
+-1.3% on the churn rows.
+
+The remaining ~28 ns for one `Map.get` on a 1024-entry map (node: 3) is not the
+table walk or the key hash, which are now single identity-hashed probes. It is
+the call lane around them, and it is the same wall as the callback rows: a builtin
+invocation from compiled code pays the general-path scaffolding, which the
+`CallIntrinsic` helpers avoid. Per-op work inside the collection (the `RefCell`
+borrow, `same_value`, the entry `Vec`) is the next thing to price, not the brand.
+
+Gates: fmt, `clippy --workspace --all-targets -D warnings`, 5861 tests, four
+sweeps 51,998 at 100%, corpus parity 0 (`mean-jitGap` 8.28).
