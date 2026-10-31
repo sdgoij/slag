@@ -35,7 +35,7 @@ use crate::agent::Agent;
 use crate::context::ReferenceBase;
 use crate::env::EnvRecord;
 use crate::ir::{
-    Builder, CompiledBody, EnvStack, INTRINSIC_COUNT, INTRINSICS, MEMBER_CELLS, MemberValueCell,
+    Builder, CompiledBody, EnvStack, INTRINSIC_COUNT, MEMBER_CELLS, MemberValueCell,
     PropertyKeyName, ScopeInfo, Vm,
 };
 use crux::error::{ErrorKind, JsError};
@@ -539,10 +539,11 @@ pub struct JitCallContext {
     /// `CallIntrinsic` site or no realm/intrinsic is current). The compiled
     /// `CallIntrinsic` site compares the resolved callee against its kind's
     /// slot, and the identity check is the retirement — a reassigned
-    /// `Math.<name>` no longer matches. The intrinsics are stable for the
-    /// realm's life and a certified body's own statements never switch realms,
-    /// so a per-run snapshot is sound.
-    pub intrinsic_bits: [u64; INTRINSIC_COUNT],
+    /// `Math.<name>` no longer matches. The array belongs to the realm (see
+    /// `Intrinsics::intrinsic_bits`), so the context holds a pointer rather
+    /// than a copy: the context is rebuilt per nested call, and copying the 15
+    /// words was the dominant term there.
+    pub intrinsic_bits: *const u64,
     /// The current realm's %String.prototype% as a NaN-boxed `Value` word (0
     /// when no realm is current), snapshotted at ctx setup. The compiled
     /// member read serves a primitive string's non-index members from the
@@ -2768,7 +2769,7 @@ fn certified_lane_inline(
     let intrinsic_bits = if cached.map_or(body.has_call_intrinsic, |c| c.has_call_intrinsic != 0) {
         intrinsic_bits(agent)
     } else {
-        [0; INTRINSIC_COUNT]
+        no_intrinsic_bits()
     };
     // The frame-reading Rust helpers (`builder_bind`/`builder_store`,
     // `create_function_decl`) resolve `frame_get` through `nested_frame`, so
@@ -7524,19 +7525,19 @@ pub(crate) fn string_prototype_bits(agent: &Agent) -> u64 {
 /// The realm's identity bits for every recognized Stage-B intrinsic, indexed by
 /// `Intrinsic as usize` (all 0 when no realm is current — the identity checks
 /// then never match and the sites fall back to the general call).
-pub(crate) fn intrinsic_bits(agent: &Agent) -> [u64; INTRINSIC_COUNT] {
-    let Ok(realm) = agent.current_realm() else {
-        return [0; INTRINSIC_COUNT];
-    };
-    let mut bits = [0u64; INTRINSIC_COUNT];
-    for (slot, kind) in bits.iter_mut().zip(INTRINSICS) {
-        *slot = realm
-            .intrinsics
-            .intrinsic(kind)
-            .map(|value| value.bits())
-            .unwrap_or(0);
+pub(crate) fn intrinsic_bits(agent: &Agent) -> *const u64 {
+    match agent.current_realm() {
+        Ok(realm) => realm.intrinsics.intrinsic_bits(),
+        Err(_) => no_intrinsic_bits(),
     }
-    bits
+}
+
+/// A zeroed identity-bits array for contexts whose body has no `CallIntrinsic`
+/// site: the compiled gate reads through the pointer unconditionally, so it is
+/// never null.
+pub fn no_intrinsic_bits() -> *const u64 {
+    static ZERO: [u64; INTRINSIC_COUNT] = [0; INTRINSIC_COUNT];
+    ZERO.as_ptr()
 }
 
 pub(crate) fn run_jit_body(
@@ -7640,7 +7641,7 @@ pub(crate) fn run_jit_body(
     let intrinsic_bits = if ir.has_call_intrinsic {
         intrinsic_bits(agent)
     } else {
-        [0; INTRINSIC_COUNT]
+        no_intrinsic_bits()
     };
     let mut ctx = JitCallContext {
         pending: false,
@@ -7918,7 +7919,7 @@ pub(crate) fn run_jit_resume(
     let intrinsic_bits = if ir.has_call_intrinsic {
         intrinsic_bits(agent)
     } else {
-        [0; INTRINSIC_COUNT]
+        no_intrinsic_bits()
     };
     let mut ctx = JitCallContext {
         pending: false,

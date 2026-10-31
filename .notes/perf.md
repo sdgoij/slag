@@ -20536,3 +20536,30 @@ and ~110 outside `register_function` (the prelude's site lookups and the
 step-entry marshalling). Note the profiler's slot 11 ("pre-epilogue") double
 counts `register_function` (it marks after the call with the mark left over from
 before it), so read `register-total` for that phase, not `pre-epilogue`.
+
+## LANDED (2026-10-31): the call context points at the realm's intrinsic identity bits
+
+`JitCallContext::intrinsic_bits` was a 15-word inline array, rebuilt per context:
+`intrinsic_bits(agent)` resolved every recognized `Intrinsic` through
+`Intrinsics::intrinsic` (a `RefCell` borrow plus a slot read, 15 times) and the
+caller then copied the array into the struct. The realm now caches the array
+once (`Intrinsics::intrinsic_bits`, filled on first request, in the realm box,
+which the arena never moves) and the context holds a `*const u64` to it; the
+compiled gate loads the pointer and then the kind's word. A context built for a
+body with no `CallIntrinsic` site points at a shared zeroed array, so the
+compiled read is never a null dereference.
+
+The context shrinks by 112 bytes and a nested context build no longer copies the
+array (this is the prerequisite the 2026-10-31 certified-lane note names). On
+its own the change is NEUTRAL on the corpus: a non-leaf call probe 59.4 (was
+59.6), `set_churn`-shape 39.7 (was 38.6-39.1, i.e. inside the run-to-run spread
+of this machine), head-let 348.8 (was 347-357), corpus parity 0,
+`mean-jitGap` 8.20. The cost only shows for a *certified call into a body that
+has an intrinsic site*, where the old path re-resolved 15 intrinsics per call
+(probe: a callee with an unreachable `st.has` site 72.9 ms per million calls
+against 70.8 for the same callee without one, a difference the run-to-run
+spread cannot separate, so treat it as an upper bound of ~2 ns).
+
+Verified: clippy `-D warnings`; `cargo test --workspace` 5864 pass / 0 fail;
+four sweeps at 100% (language 23726, built-ins 23821, annexB 1086, intl402
+3365); corpus parity 0.

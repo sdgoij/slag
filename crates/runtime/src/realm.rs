@@ -18,7 +18,7 @@ use crux::value::{Value, ValueKind};
 
 use crate::agent::Agent;
 use crate::env::{EnvRef, new_global_environment};
-use crate::ir::{INTRINSIC_COUNT, Intrinsic};
+use crate::ir::{INTRINSIC_COUNT, INTRINSICS, Intrinsic};
 
 /// A Realm Record (spec 9.3 table): the intrinsic registry, the global
 /// object, and the global environment.
@@ -192,6 +192,14 @@ pub struct Intrinsics {
     /// `CallIntrinsic` step compares the member-read result against its kind's
     /// slot per call, and the values are stable for the realm's life.
     intrinsic_cache: RefCell<[Option<Value>; INTRINSIC_COUNT]>,
+    /// G24: the identity bits of every Stage-B intrinsic (index = `Intrinsic as
+    /// usize`), filled on first request and stable for the realm's life, like
+    /// `intrinsic_cache`. The compiled intrinsic gate reads one word through a
+    /// pointer to this array instead of the call context carrying all 15 words
+    /// by value — the context is rebuilt per call, and copying the array was
+    /// the dominant term in that build. The array lives in the realm box, which
+    /// the GC arena never moves, so the address is stable.
+    intrinsic_bits: RefCell<Option<[u64; INTRINSIC_COUNT]>>,
     /// The realm's %String.prototype% value, cached after the first
     /// resolution: primitive-string member reads resolve their chain
     /// directly against it instead of boxing a per-read String-exotic
@@ -296,6 +304,21 @@ impl Intrinsics {
         if let Some(realm) = self.owner.get() {
             crux::heap::write_barrier(&*realm, value);
         }
+    }
+
+    /// The address of the realm's cached intrinsic identity bits (see the
+    /// field). Filled on the first request and never rewritten, so a caller may
+    /// hold the pointer for a whole compiled run.
+    pub fn intrinsic_bits(&self) -> *const u64 {
+        let mut slot = self.intrinsic_bits.borrow_mut();
+        let bits = slot.get_or_insert_with(|| {
+            let mut bits = [0u64; INTRINSIC_COUNT];
+            for (entry, kind) in bits.iter_mut().zip(INTRINSICS) {
+                *entry = self.intrinsic(kind).map(|value| value.bits()).unwrap_or(0);
+            }
+            bits
+        });
+        bits.as_ptr()
     }
 
     pub fn get(&self, name: &str) -> Option<Value> {

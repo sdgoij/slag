@@ -15172,7 +15172,7 @@ impl Vm {
         let intrinsic_bits = if ir.has_call_intrinsic {
             crate::jit::intrinsic_bits(agent)
         } else {
-            [0; INTRINSIC_COUNT]
+            crate::jit::no_intrinsic_bits()
         };
         let mut ctx = crate::jit::JitCallContext {
             pending: false,

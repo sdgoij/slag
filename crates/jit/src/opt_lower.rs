@@ -3610,14 +3610,19 @@ fn emit_intrinsic(
     // checks each kind needs. The collection/array kinds validate their receiver
     // and index/`from` in the helper, so only the callee identity is guarded;
     // `Math` and `charCodeAt` need a Number argument, and `charCodeAt` a String
-    // receiver.
-    let bit_offset = std::mem::offset_of!(JitCallContext, intrinsic_bits)
-        + kind as usize * std::mem::size_of::<u64>();
-    let expected = builder.ins().load(
+    // receiver. The bits live in the realm (G24), so `intrinsic_bits` is a
+    // pointer to the array and the gate loads the kind's word through it.
+    let bits = builder.ins().load(
         types::I64,
         MemFlagsData::new(),
         abi.vm,
-        Offset32::new(bit_offset as i32),
+        Offset32::new(std::mem::offset_of!(JitCallContext, intrinsic_bits) as i32),
+    );
+    let expected = builder.ins().load(
+        types::I64,
+        MemFlagsData::new(),
+        bits,
+        Offset32::new((kind as usize * std::mem::size_of::<u64>()) as i32),
     );
     let non_zero = builder.ins().icmp_imm_u(IntCC::NotEqual, expected, 0);
     let callee_ok = builder.ins().icmp(IntCC::Equal, callee, expected);

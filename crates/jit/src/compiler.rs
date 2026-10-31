@@ -7107,13 +7107,19 @@ impl<'a> Lowerer<'a> {
                 );
                 let argc_imm = self.builder.ins().iconst(types::I64, i64::from(*argc));
                 let ctx = self.vm();
-                let bit_offset =
-                    std::mem::offset_of!(JitCallContext, intrinsic_bits) + *kind as usize * 8;
-                let expected = self.builder.ins().load(
+                // G24: the identity bits live in the realm; the context holds a
+                // pointer to that array.
+                let bits = self.builder.ins().load(
                     types::I64,
                     MemFlagsData::new(),
                     ctx,
-                    Offset32::new(bit_offset as i32),
+                    Offset32::new(std::mem::offset_of!(JitCallContext, intrinsic_bits) as i32),
+                );
+                let expected = self.builder.ins().load(
+                    types::I64,
+                    MemFlagsData::new(),
+                    bits,
+                    Offset32::new((*kind as usize * 8) as i32),
                 );
                 let non_zero = self.builder.ins().icmp_imm_u(IntCC::NotEqual, expected, 0);
                 let callee_ok = self.builder.ins().icmp(IntCC::Equal, callee, expected);
