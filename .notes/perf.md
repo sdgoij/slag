@@ -20915,3 +20915,86 @@ Gates: fmt, clippy workspace `--all-targets -D warnings`, `cargo test
 23821, annexB 1086, intl402 3365; the first language run reported 3 hangs and
 the rerun of the same binary was clean, so they are this machine under load),
 corpus parity 0, `mean-jitGap` 8.40.
+
+## MEASURED (2026-10-31): the corpus is three assertion fixtures, closures, and a certification hole
+
+Ranked by absolute milliseconds rather than by gap ratio (`scratch/ab/rank.js`),
+the corpus is not 78 equal rows. Three amplified test262 fixtures are 684 of the
+~1880 ms total (36%):
+
+| row | slag ms | node ms | ratio |
+|---|---:|---:|---:|
+| `language/statements/for-in/head-let-fresh-binding-per-iteration` | 364.3 | 60.5 | 6.0x |
+| `language/expressions/template-literal/evaluation-order` | 213.6 | 33.1 | 6.5x |
+| `language/statements/try/completion-values` | 107.4 | 86.3 | 1.2x |
+
+Every one of them is an `assert` harness (nine `assert.sameValue` calls per
+body) wrapping a few closures, so the family ranking understates them: `language`
+is 6.72x by mean gap and 36% of the wall clock. Next is `opcost` (~500 ms over
+36 rows, mean gap 10.41, each row one builtin call through `call_slow`), then
+`objects` (~190), `calls` (~195), `builtins` (~185).
+
+**Decomposed the top row** (100k iterations, one process, node beside it):
+
+| shape | slag ms | node ms |
+|---|---:|---:|
+| nine `assert.sameValue` calls per iteration, nothing else | 82.5 | 41.1 |
+| `Object.create(null)` + three stores + three reads | 46.8 | 13.5 |
+| the for-in fixture without the three calls | 224.5 | 27.4 |
+| the whole fixture shape | 311.1 | 27.6 |
+
+So per iteration (~3.6 us against node's 0.6): 9 certified calls ~0.9 us, three
+closures ~1.25 us, the for-in plus the dictionary object ~0.5 us. The `cert`
+profile of the assert-only shape puts the lane at ~90 ns of non-callee work per
+call (`scratch`, `env`, `ctx`, frame fill, restore); node inlines the callee
+away entirely, which is the gap the splice cannot close without a static proof.
+
+**Closure creation is 417 ns, 491 ns with a capture**, against node's ~35
+(`SLAG_CLOSURE_PROFILE=1`, 2.1M closures, 3 per iteration, plain `var` loop so
+no per-iteration machinery is involved):
+
+| phase | no capture | with capture |
+|---|---:|---:|
+| function-object | 48 | 48 |
+| registry-insert | 53 | **81** |
+| props-batch | 23 | 23 |
+| compiled-body | 12 | 12 |
+| record-init | 3.5 | 3.5 |
+| prelude (source/body/params lookups) | 16 | 25 |
+| per-iteration chain patch (second `ecma_function_mut`) | 0 | **39** |
+| register-total | 261 | 293 |
+| instantiate-total | 417 | **491** |
+
+The registry insert (`Agent::register_ecma_function`) is the largest single
+phase and the only one that grows with the record: `EcmaFunction` is 152 bytes
+and the insert is 0.7 ns/byte. The chain patch is a second map lookup plus a
+`Vec` clone for data that is site-static. Both are what a shared `Rc<SiteData>`
+for the site-static fields (params, body, ir, source info, outer chain,
+per-iteration chain, declaring script) would remove; the measurement here says
+that is worth ~60-100 ns of 490, i.e. ~20% of a closure, not the 12x to node.
+
+**The certification hole, and it is a coverage bug, not a ratio.** A closure
+capturing a `let` declared in a *body block* or bound by a plain `for` head
+makes the whole enclosing body uncertified, so it runs interpreted: 3x slower
+than the same body compiled. `SLAG_JIT_REPORT=1` reports `compiled 0` for the
+enclosing body and no refusal line (the body is never offered to the JIT).
+
+| shape (20000 iterations of a 3-key loop) | compiled | ms |
+|---|---|---:|
+| `for (var i; ...) arr[i] = function () { return i; }` | 2 | 29.2 |
+| `for (let k = 0; ...) arr[k] = function () { return 1; }` (head used as a key) | 2 | 29.1 |
+| `for (let x in o) arr[x] = function () { return x; }` (for-in head) | 2 | 35.0 |
+| `for (let k = 0; ...) ... = function () { return k; }` (**for head captured**) | 1 | 83.1 |
+| `for (var i; ...) { let z = i; arr[i] = function () { return z; } }` (**body lexical captured**) | 1 | 97.5 |
+| `for (let k = 0; ...) if (k === 1) f = function () { return k; }` (**head captured**) | 1 | 54.3 |
+
+The body-block case is deliberate (`FastScopeScan::loop_body_lexicals`: "the
+per-iteration freshness of a body-block scope is not flattenable into the
+capture context"). The plain-`for` head case is not separately documented and is
+the more common idiom (`for (let i = 0; ...) fns.push(() => i)`). Both need the
+per-iteration environment machinery the for-in/for-of heads already use
+(`Step::PerIteration`/`EnterPerIteration` with the head names), plus the spec
+14.7.4.4 copy of the binding into the fresh environment for the plain `for`,
+which the for-in form does not need. That is the next coverage lever, and it is
+worth more than any single ratio: it turns an interpreted body into a compiled
+one.
