@@ -628,6 +628,13 @@ fn stack_delta(step: &Step) -> Result<i32, Unsupported> {
         | Step::SaveCompletion
         | Step::RestoreCompletion
         | Step::FunctionDeclInit { .. } => 0,
+        // The pause/step protocol's debug point (§14.4): a no-op on every
+        // compiled tier for the same reason as `emit_step`'s arm. Refusing it
+        // here does not just add a branch, it demotes the whole body from the
+        // optimizing tier to the baseline one, which measured as +12.7% on
+        // `opcost`+`control` and up to 13x on the smallest rows, so this arm is
+        // load-bearing.
+        Step::DebugCheck { .. } => 0,
         // A member-name assignment pops `value` (and, for the compound form, the
         // old value) plus the object, and pushes the stored value (the
         // expression result).
@@ -1329,7 +1336,8 @@ fn emit_step(
         | Step::ListBegin
         | Step::ListEnd
         | Step::SaveCompletion
-        | Step::RestoreCompletion => {}
+        | Step::RestoreCompletion
+        | Step::DebugCheck { .. } => {}
         Step::Binary(op) => {
             let right = stack.pop().ok_or(Unsupported::Stack)?;
             let left = stack.pop().ok_or(Unsupported::Stack)?;

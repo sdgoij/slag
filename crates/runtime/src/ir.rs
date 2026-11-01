@@ -9027,14 +9027,13 @@ impl Vm {
                 context.lexical_environment = self.lexical_env
             }
             match step {
-                Step::DebugCheck { span } => {
+                Step::DebugCheck { .. } => {
                     // Inert for now, and deliberately not a hook: the pause it
                     // exists for is the next slice of §14.4, and a step that
                     // calls a no-op would be a recorded-but-ignored hook. What
                     // this landing owes is the emission and the measurement of
                     // what emitting it costs, so the pause can be added
                     // without a layout change underneath it.
-                    let _ = span;
                 }
                 Step::LoadIdent { name } => {
                     let value = self.load_ident_value(agent, *name, body.env_constant)?;
@@ -20446,9 +20445,11 @@ impl Compiler {
     fn compile_statement(&mut self, stmt: &Stmt) -> Result<(), JsError> {
         // The debug point (§14.4): one per statement, at its source span, so a
         // debugger has a place to stop that is not also a place the compiler
-        // may fold away. It is inert until the pause slice lands, and the cost
-        // of emitting it is what the landing measures.
-        self.emit(Step::DebugCheck { span: stmt.span });
+        // may fold away. `SLAG_DEBUG_POINTS=0` is the same-binary seam that
+        // suppresses it, and the A/B that priced it is in `.notes/perf.md`.
+        if debug_points_enabled() {
+            self.emit(Step::DebugCheck { span: stmt.span });
+        }
         match &stmt.kind {
             StmtKind::Block(block) => {
                 self.emit(Step::ListBegin);
@@ -26022,6 +26023,29 @@ pub fn is_compound_assign(op: &AssignOp) -> bool {
     )
 }
 
+/// Whether the compiler emits a debug point per statement.
+///
+/// **On by default, and that is a measurement.** `SLAG_DEBUG_POINTS=0` is the
+/// same-binary seam; the A/B that priced the emission is recorded in
+/// `.notes/perf.md` (2026-11-01) and the answer was that the step itself is
+/// free (full corpus, 7 interleaved rounds: -0.02% and -0.14% in two runs).
+/// What cost 13x on the `opcost` rows was two lowering refusals, not the step:
+/// `lower_step`'s catch-all demoted every leaf body, and the optimizing tier's
+/// lift refused the body outright, which is what a session cannot survive.
+///
+/// It has to be on rather than attach-gated: a session refuses compilation
+/// (`lookup_info_for`), so the body a session runs is the bytecode built
+/// *before* the attach, and a switch that is read at attach time could not put
+/// the points into it. Cached, because `std::env::var_os` costs ~140 ns and
+/// this is consulted once per statement compiled.
+fn debug_points_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| match std::env::var_os("SLAG_DEBUG_POINTS") {
+        Some(value) => value != "0",
+        None => true,
+    })
+}
+
 /// The body's maximum value-stack depth above its entry stack pointer, in
 /// slots. Stored on [`CompiledBody`] so the JIT can size its working area and
 /// the interpreter can bound an activation's stack growth without recomputing
@@ -27610,6 +27634,11 @@ fn lower_step(
     env_constant: bool,
 ) -> Option<()> {
     match step {
+        // A debug point is transparent to a register run and to leaf
+        // classification: it emits no op and changes no slot. Refusing it here
+        // (which is what the catch-all does) demotes every leaf body that now
+        // contains one, and the call lane loses its leaf inline.
+        Step::DebugCheck { .. } => {}
         Step::Push(value) => stack.push(RegOperand::Const(*value)),
         Step::PushAcc => {
             // At most two accumulator-loop counter reads per body: the

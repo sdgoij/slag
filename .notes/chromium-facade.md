@@ -1474,6 +1474,42 @@ and frame reads. (4) Breakpoints against the position table. (5)
 `evaluateOnCallFrame` through the callback window. (1) is the rule that makes
 the rest honest and is the only one that needs nothing else in place.
 
+**2026-11-01, R2's emission measured.** R1 landed (`Agent::debug_attached`, and
+`lookup_info_for` refuses the compiled tiers and does not serve a cached entry
+while a session is attached), and so did the point: `Step::DebugCheck { span }`
+precedes each statement's first step, emitted by `compile_statement`. Two
+corrections to this section from the code. **The span rides in the step**, not in
+a per-body `(step_index, Span)` table: `Span` fits the step's existing payload,
+and an index would be a second thing to keep in step with the bytecode. A body's
+positions are therefore derived by scanning its steps when breakpoints land,
+which is a debugging-time cost and not a per-statement one. The point is also
+**not** a branch reading a `Cell<bool>` yet — that is the pause slice; the
+emission is the bytecode change the pause can be attached to without a second
+layout change under it.
+
+The measurement answered the cost question, and it answered it by finding a bug
+rather than a price. Emitting the step is **free**: full corpus, one process per
+row, 7 interleaved rounds alternating order, per-row minima, `SLAG_DEBUG_POINTS`
+as the same-binary seam: **1092.2 ms against 1093.8 ms (-0.14%)**, mean -0.17%,
+no row outside the noise floor. What was not free was every lowering that had to
+learn about the step, and each failure looked like the step being expensive:
+
+- `lower_step`'s catch-all *refuses* an unknown step, so every leaf body gained
+a refusal and lost its leaf-call inline: **+93%** per row on `opcost`, with
+  `obj_prop` 0.041 to 0.614 ms. The fix is an arm that emits nothing.
+- the optimizing tier's lift refuses a body outright, so a body containing one
+demoted to the baseline tier: **+12.7%** on `opcost`+`control` as a directory
+  run, up to **13x** on the small rows (`obj_prop` 0.043 to 0.604 ms). The fix is
+  `0` in `stack_delta` and an empty arm in the optimizer's emitter.
+
+The second one is the load-bearing result, and it changes the decision: a
+session cannot survive a tier that refuses the step, so the emission is **on by
+default**. R1 alone does not make the compiled tiers harmless here — the body a
+session runs is the bytecode built *before* the attach, which is why the points
+have to be in every body rather than compiled in on attach. What R1 buys is that
+the compiled tiers, which model the point as a no-op, cannot run at all while a
+session is attached. The fallback in the cost paragraph above is not taken.
+
 ## 15. Sources
 
 Verified on 2026-10-31:
