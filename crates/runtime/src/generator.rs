@@ -757,6 +757,7 @@ fn finish_resume(
                 ErrorKind::TypeError,
                 "withdrawn call escaped the generator driver".into(),
             )),
+            VmOutcome::Paused(_) => Err(crate::ir::pause_without_run()),
             VmOutcome::Suspended(Suspension::Yield { value, delegate }) => {
                 let context = agent.roots.execution_context_stack.pop().ok_or_else(|| {
                     JsError::new(ErrorKind::TypeError, "no context to pop".into())

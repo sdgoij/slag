@@ -74,6 +74,14 @@ impl FunctionCall<'_> {
         JsValue(*self.this)
     }
 
+    /// The live agent, for a callback that has to act on the engine itself
+    /// rather than through the JS API. Test-only with
+    /// [`Agent::request_pause`], which is the only caller today.
+    #[cfg(test)]
+    pub(crate) fn agent_ptr(&self) -> crux::function::AgentPtr {
+        self.agent
+    }
+
     /// The number of arguments.
     pub fn length(&self) -> usize {
         self.args.len()
@@ -5019,6 +5027,46 @@ mod tests {
                 .unwrap()
                 .as_number(),
             Some(7.0)
+        );
+    }
+
+    #[test]
+    fn a_pause_request_stops_the_run_without_running_the_enclosing_finally() {
+        // The property that decides the shape of the pause protocol: it is an
+        // outcome, not an error. If it travelled as an error, the interpreter's
+        // try machinery would run `fin = true`, which is a different program.
+        let mut context = Context::new().unwrap();
+        let pause_now = context
+            .create_function(
+                "pauseNow",
+                0,
+                Box::new(|call| {
+                    crate::context::callback_agent(call.agent_ptr())?.request_pause();
+                    Ok(JsValue::undefined())
+                }),
+            )
+            .unwrap();
+        context.set_global("pauseNow", pause_now).unwrap();
+        context.agent_mut().set_debug_attached(true).unwrap();
+        let error = context
+            .eval(
+                "globalThis.ran = false; globalThis.fin = false; \
+                 try { pauseNow(); globalThis.ran = true; } finally { globalThis.fin = true; }",
+            )
+            .unwrap_err();
+        assert_eq!(
+            error.message, "execution paused, but this run has nowhere to park it yet",
+            "the pause must reach the entry point as its own signal"
+        );
+        assert_eq!(
+            context.eval("globalThis.ran").unwrap().as_boolean(),
+            Some(false),
+            "the statement after the pause must not run"
+        );
+        assert_eq!(
+            context.eval("globalThis.fin").unwrap().as_boolean(),
+            Some(false),
+            "the pause must not be routed through the try machinery"
         );
     }
 

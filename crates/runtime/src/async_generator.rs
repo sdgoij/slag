@@ -762,6 +762,7 @@ fn drive(
             ErrorKind::TypeError,
             "withdrawn call escaped the async-generator driver".into(),
         )),
+        VmOutcome::Paused(_) => Err(crate::ir::pause_without_run()),
         VmOutcome::Suspended(Suspension::Yield {
             value,
             delegate: true,

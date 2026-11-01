@@ -1649,6 +1649,29 @@ reaches a `try`-wrapped loop *without* running its `finally`; (2)
 host re-entry through the `CallbackWindow`; (4) breakpoints against the step
 spans the emission now carries.
 
+**2026-11-01, step 1 landed.** `VmOutcome::Paused(PauseReason)` exists, the
+`DebugCheck` arm observes a pending `Agent::pause_requested` and returns it, and
+all ten `match` sites on `VmOutcome` handle the variant explicitly (script,
+`ordinary_call`'s two paths, the construct path, module evaluation, generator and
+async-generator drivers, the async-await driver's two sites, and `run_leaf_body`).
+Nothing is parked yet, so every site reports `pause_without_run` instead of
+letting the run continue; `Agent::request_pause` is `#[cfg(test)]` until step 2
+gives that error somewhere real to put the state.
+
+`a_pause_request_stops_the_run_without_running_the_enclosing_finally` is the test
+that decides the shape: a host function asks for a pause, and the script
+`try { pauseNow(); ran = true; } finally { fin = true; }` must leave *both*
+assignments unrun. If the pause travelled as an error, `fin` would be true.
+
+Two findings from wiring it. First, the `DebugCheck` arm comes before any step
+that can run user code, but a pause requested *inside* a register run (a fused
+loop body, where the point is transparent to the lowering) is not observed until
+the run ends and the next step-path point is reached. That is a property of the
+register lane, not a bug in the point, and it is worth a run-boundary check when
+stepping needs an exact position. Second, the leaf lane `run_leaf_body` can now
+see a paused outcome, which is why its arm is explicit: a leaf body carries
+points like any other body.
+
 ## 15. Sources
 
 Verified on 2026-10-31:

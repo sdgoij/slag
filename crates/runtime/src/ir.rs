@@ -2724,6 +2724,36 @@ pub enum VmOutcome {
     /// and consumed once per non-leaf call, on the interpreter's hottest path,
     /// and growing it (or boxing it) costs more than the record's own move.
     Call,
+    /// A debug session stopped the run at a debug point. It is an outcome and
+    /// deliberately not an error: routing it through the step error path would
+    /// run the enclosing `catch` and `finally`, which is a different program.
+    /// The `Vm`'s state is intact, which is what makes a resume possible.
+    Paused(PauseReason),
+}
+
+/// Why a run paused. One variant today because one trigger is reachable: a
+/// host's `pause now` request, observed at the next debug point. Breakpoints,
+/// stepping and pause-on-exception each arrive with the machinery that can
+/// evaluate them (a position table, a step mode, and the `JsError` site).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PauseReason {
+    /// The host asked to stop at the next point (`Agent::request_pause`).
+    Requested,
+}
+
+/// The error a run reports when a pause reaches an entry point that cannot park
+/// it yet.
+///
+/// A pause is an outcome rather than an error (see [`VmOutcome::Paused`]), so
+/// this is not how a session is meant to end: it exists because the parking
+/// slice is not in yet, and a run that cannot park must fail loudly rather than
+/// continue past a stop the host asked for. `Agent::request_pause` is
+/// crate-visible for the same reason.
+pub(crate) fn pause_without_run() -> JsError {
+    JsError::new(
+        ErrorKind::Error,
+        "execution paused, but this run has nowhere to park it yet".into(),
+    )
 }
 
 /// The body a [`Vm::run_inner`] driver is currently executing: a proper tail
@@ -9028,12 +9058,15 @@ impl Vm {
             }
             match step {
                 Step::DebugCheck { .. } => {
-                    // Inert for now, and deliberately not a hook: the pause it
-                    // exists for is the next slice of §14.4, and a step that
-                    // calls a no-op would be a recorded-but-ignored hook. What
-                    // this landing owes is the emission and the measurement of
-                    // what emitting it costs, so the pause can be added
-                    // without a layout change underneath it.
+                    // A debug point is where a pending request is observed
+                    // (§14.4). It returns an outcome rather than an error so
+                    // the enclosing `catch`/`finally` do not run, and it clears
+                    // the request so the resumed run does not stop again at the
+                    // same point.
+                    if agent.pause_requested() {
+                        agent.clear_pause_request();
+                        return Ok(VmOutcome::Paused(PauseReason::Requested));
+                    }
                 }
                 Step::LoadIdent { name } => {
                     let value = self.load_ident_value(agent, *name, body.env_constant)?;
@@ -13575,6 +13608,9 @@ impl Vm {
                 ErrorKind::TypeError,
                 "withdrawn call escaped a leaf body".into(),
             )),
+            // A leaf body carries debug points like any other (the point is
+            // transparent to the register lowering), so a pause can reach here.
+            Ok(VmOutcome::Paused(_)) => Err(pause_without_run()),
             Err(error) => Err(error),
         }
     }

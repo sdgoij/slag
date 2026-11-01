@@ -1888,6 +1888,10 @@ fn execute_module_body(
                 "module body suspended on a non-await point".into(),
             ));
         }
+        Ok(VmOutcome::Paused(_)) => {
+            agent.roots.execution_context_stack.pop();
+            return Err(crate::ir::pause_without_run());
+        }
         Err(error) => {
             agent.roots.execution_context_stack.pop();
             // An abrupt completion that is not a statement-level `throw` — a

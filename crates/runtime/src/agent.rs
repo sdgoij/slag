@@ -1982,6 +1982,9 @@ pub struct Agent {
     /// the fact. The read is one predictable load on the compile path, which is
     /// not hot, and nothing at all on an interpreted body's execution.
     pub debug_attached: std::cell::Cell<bool>,
+    /// A host's pending `pause now` request (`Agent::request_pause`). The next
+    /// debug point observes it, clears it and returns a paused outcome.
+    pub pause_requested: std::cell::Cell<bool>,
     /// The heap this agent allocates in, when a host owns the arena (an
     /// isolate under the `v8` bridge). Null for a bare agent, whose heap is the
     /// thread's own.
@@ -2256,6 +2259,29 @@ impl Agent {
         self.termination.load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    /// Ask a running execution to stop at its next debug point
+    /// (`Debugger.pause`). The point observes it and returns
+    /// [`crate::ir::VmOutcome::Paused`], which is an outcome rather than an
+    /// error so the enclosing `catch`/`finally` do not run.
+    ///
+    /// Test-only until the run can be parked and resumed: nothing outside a
+    /// test may request a pause yet, because every entry point reports it as an
+    /// internal error instead of parking (see [`crate::ir::pause_without_run`]).
+    #[cfg(test)]
+    pub(crate) fn request_pause(&self) {
+        self.pause_requested.set(true);
+    }
+
+    /// Whether a pause request is outstanding.
+    pub(crate) fn pause_requested(&self) -> bool {
+        self.pause_requested.get()
+    }
+
+    /// Consume the request (the debug point that observed it).
+    pub(crate) fn clear_pause_request(&self) {
+        self.pause_requested.set(false);
+    }
+
     /// Attach or detach a debug session (`Isolate::SetDebugAttached`).
     ///
     /// Sets the flag `lookup_info_for` reads, and recompiles the bytecode,
@@ -2408,6 +2434,7 @@ impl Agent {
             jit_hook: None,
             jit_depth: 0,
             debug_attached: std::cell::Cell::new(false),
+            pause_requested: std::cell::Cell::new(false),
             roots: Rc::new(AgentRoots::new()),
             heap_state: std::cell::Cell::new(std::ptr::null()),
             host_hooks: None,

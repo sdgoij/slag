@@ -3280,6 +3280,9 @@ pub(crate) fn run_compiled_body_on(
                 "withdrawn call escaped the driver".into(),
             ));
         }
+        Ok(VmOutcome::Paused(_)) => {
+            return Err(crate::ir::pause_without_run());
+        }
         // The body env's `using` resources dispose on an abrupt error too
         // (spec 14.2.3 step 6, mirroring the walker's eval_statement_list);
         // a throwing disposal folds into the error as a SuppressedError.
@@ -3775,6 +3778,10 @@ fn ordinary_construct(
                         "withdrawn call escaped the driver".into(),
                     ));
                 }
+                Ok(VmOutcome::Paused(_)) => {
+                    agent.return_vm(vm);
+                    return Err(crate::ir::pause_without_run());
+                }
                 Err(error) => {
                     agent.return_vm(vm);
                     return Err(body_error_after_disposal(agent, &body_env, error));
@@ -3963,6 +3970,10 @@ fn ordinary_construct(
                             ErrorKind::TypeError,
                             "withdrawn call escaped the driver".into(),
                         ));
+                    }
+                    Ok(VmOutcome::Paused(_)) => {
+                        agent.return_vm(vm);
+                        return Err(crate::ir::pause_without_run());
                     }
                     Err(error) => {
                         agent.return_vm(vm);

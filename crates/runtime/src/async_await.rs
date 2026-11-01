@@ -293,6 +293,7 @@ pub fn call_async_function(
                         "async function suspended on a non-await point".into(),
                     ));
                 }
+                VmOutcome::Paused(_) => return Err(crate::ir::pause_without_run()),
             }
             Ok(capability.promise)
         };
@@ -468,6 +469,7 @@ fn resume_async(
                 "async function suspended on a non-await point".into(),
             ));
         }
+        VmOutcome::Paused(_) => return Err(crate::ir::pause_without_run()),
         VmOutcome::Completed(completion) => {
             settle_async_completion(agent, &state, completion)?;
         }

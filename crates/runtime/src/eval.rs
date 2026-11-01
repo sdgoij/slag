@@ -135,6 +135,10 @@ pub fn eval_program(
                 "withdrawn call escaped the script driver".into(),
             ));
         }
+        Ok(crate::ir::VmOutcome::Paused(_)) => {
+            agent.return_vm(vm);
+            return Err(crate::ir::pause_without_run());
+        }
         Err(error) => {
             agent.return_vm(vm);
             return Err(error);
