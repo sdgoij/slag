@@ -2905,6 +2905,10 @@ int main() {
       }
       expect(isolate->MayAccess(current, theirs),
              "the default token admits another context's object");
+      // The object's own realm decides, not the one that happens to be entered:
+      // `current` is the entered context here and `theirs` is `foreign`'s.
+      expect(theirs->GetCreationContextChecked().raw() == foreign.raw(),
+             "an object reports the context it was created in");
       expect(isolate->MayAccess(current, v8::Object::New(isolate)),
              "a value of the accessing realm is always reachable");
 

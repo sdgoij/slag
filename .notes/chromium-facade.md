@@ -1324,6 +1324,24 @@ does not have.
 which answered empty outside every scope; it now uses the context's own isolate,
 which `MayAccess` needs because a host may compare tokens between scripts.
 
+*The last two A4 items, and the guard they produced (2026-11-01).*
+`Object::GetCreationContext` answered the entered context because the engine had
+no per-object realm to ask. It has one now, so the facade's
+`Isolate::ContextForRealm(realm)` turns it back into the context and the answer
+is the object's own (`gin-shapes` reads an object created in a second context
+while the first is entered, which the old code could not have passed). The
+entered-context answer survives only as the fallback for an object no realm
+names, which is what a host-made value outside every context is.
+
+The signature check moved to where the trampolines cannot forget it. Each one
+used to publish the callback token and then ask the receiver check itself, two
+steps that a new trampoline had to remember in the right order (the check reads
+the engine, so the token must come first). `HostCall` is now that pair: it opens
+the window, asks `AdmitsReceiver`, and records the refusal, and every trampoline
+(function, callable instance, both accessor kinds, both template-accessor kinds)
+starts with it. `FunctionTemplate::signature_type()` is the one unwrap of a
+`Signature`, so no trampoline handles that type at all.
+
 ## 15. Sources
 
 Verified on 2026-10-31:

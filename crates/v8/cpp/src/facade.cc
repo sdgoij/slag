@@ -103,63 +103,6 @@ void ThrowIllegalInvocation() {
                         sizeof(kRefusal) - 1);
 }
 
-uint64_t HostTrampoline(void* data, const void* call, uint64_t this_value,
-                        const uint64_t* args, size_t len) {
-  auto* function = static_cast<v8::FunctionTemplate*>(data);
-  if (function == nullptr) return slag_undefined();
-  // A host callback may allocate or write through the entry points, which are
-  // not re-entered from a callback unless the token names the running window.
-  // The signature check reads the receiver's prototype chain, which is one of
-  // those entry points, so the window is published before it runs.
-  const void* previous = g_callback_token;
-  g_callback_token = slag_callback_token();
-  uint64_t result = slag_undefined();
-  if (!function->AllowsReceiver(this_value)) {
-    // V8's access check: a method installed with a signature does not run on a
-    // receiver that is not an instance, and the call fails with a TypeError.
-    static constexpr char kRefusal[] = "Illegal invocation";
-    slag_throw_error_kind(CurrentSlagContext(), 5,
-                          reinterpret_cast<const uint8_t*>(kRefusal),
-                          sizeof(kRefusal) - 1);
-  } else {
-    v8::FunctionCallbackInfo<v8::Value> info(v8::g_current_isolate, call,
-                                             this_value, args,
-                                             static_cast<int>(len),
-                                             function->data().raw());
-    function->callback()(info);
-    result = info.return_value();
-  }
-  g_callback_token = previous;
-  return result;
-}
-
-/* The body of a callable template instance
- * (`ObjectTemplate::SetCallAsFunctionHandler`): the template is the data, so the
- * handler and its data value are read at call time. */
-uint64_t CallAsFunctionTrampoline(void* data, const void* call,
-                                  uint64_t this_value, const uint64_t* args,
-                                  size_t len) {
-  auto* tmpl = static_cast<v8::ObjectTemplate*>(data);
-  if (tmpl == nullptr || tmpl->call_as_function() == nullptr) {
-    return slag_undefined();
-  }
-  v8::FunctionCallbackInfo<v8::Value> info(
-      v8::g_current_isolate, call, this_value, args, static_cast<int>(len),
-      tmpl->call_as_function_data().raw());
-  const void* previous = g_callback_token;
-  g_callback_token = slag_callback_token();
-  tmpl->call_as_function()(info);
-  g_callback_token = previous;
-  return info.return_value();
-}
-
-/* The property-handler callbacks, adapted from the flat ABI to the C++ shapes.
- * `state` is the configuration the template installed, so the trampoline can
- * reach the host's own callback; the answer slot is where the host writes. */
-v8::NamedPropertyHandlerConfiguration* Configuration(void* state) {
-  return static_cast<v8::NamedPropertyHandlerConfiguration*>(state);
-}
-
 /* The token of the host callback that is running, for as long as it runs. The
  * ABI reports it (`slag_callback_token`), and the allocation entry points admit
  * only a token that names a running callback, so a host's `Object::New` inside a
@@ -178,6 +121,69 @@ class CallbackToken {
   const void* previous_ = nullptr;
   const void* token_ = nullptr;
 };
+
+/* What every host trampoline does before host code runs, in one object: open the
+ * callback window and admit the receiver its signature declares.
+ *
+ * The window opens first, because the check itself reads the engine (the
+ * prototype chain) and an entry point outside a window is refused. Keeping the
+ * two together is the point: a new trampoline cannot publish the token and
+ * forget the signature, which each of the older ones had to remember.
+ */
+class HostCall {
+ public:
+  HostCall(v8::FunctionTemplate* signature, uint64_t receiver)
+      : token_(), admitted_(AdmitsReceiver(signature, receiver)) {
+    if (!admitted_) ThrowIllegalInvocation();
+  }
+
+  bool admitted() const { return admitted_; }
+  const void* token() const { return token_.get(); }
+
+ private:
+  CallbackToken token_;
+  bool admitted_;
+};
+
+uint64_t HostTrampoline(void* data, const void* call, uint64_t this_value,
+                        const uint64_t* args, size_t len) {
+  auto* function = static_cast<v8::FunctionTemplate*>(data);
+  if (function == nullptr) return slag_undefined();
+  HostCall host_call(function->signature_type(), this_value);
+  if (!host_call.admitted()) return slag_undefined();
+  v8::FunctionCallbackInfo<v8::Value> info(v8::g_current_isolate, call,
+                                           this_value, args,
+                                           static_cast<int>(len),
+                                           function->data().raw());
+  function->callback()(info);
+  return info.return_value();
+}
+
+/* The body of a callable template instance
+ * (`ObjectTemplate::SetCallAsFunctionHandler`): the template is the data, so the
+ * handler and its data value are read at call time. */
+uint64_t CallAsFunctionTrampoline(void* data, const void* call,
+                                  uint64_t this_value, const uint64_t* args,
+                                  size_t len) {
+  auto* tmpl = static_cast<v8::ObjectTemplate*>(data);
+  if (tmpl == nullptr || tmpl->call_as_function() == nullptr) {
+    return slag_undefined();
+  }
+  // An instance template's call handler declares no receiver type of its own.
+  HostCall host_call(nullptr, this_value);
+  v8::FunctionCallbackInfo<v8::Value> info(
+      v8::g_current_isolate, call, this_value, args, static_cast<int>(len),
+      tmpl->call_as_function_data().raw());
+  tmpl->call_as_function()(info);
+  return info.return_value();
+}
+
+/* The property-handler callbacks, adapted from the flat ABI to the C++ shapes.
+ * `state` is the configuration the template installed, so the trampoline can
+ * reach the host's own callback; the answer slot is where the host writes. */
+v8::NamedPropertyHandlerConfiguration* Configuration(void* state) {
+  return static_cast<v8::NamedPropertyHandlerConfiguration*>(state);
+}
 
 /* The per-object access check a template installed
  * (`ObjectTemplate::SetAccessCheckCallback`). `state` is the template, which is
@@ -367,14 +373,11 @@ int32_t AccessorGetterTrampoline(void* data, uint64_t holder, uint64_t key,
     return 1;
   }
   *out = slag_undefined();
-  CallbackToken token;
-  if (!AdmitsReceiver(accessor->signature, holder)) {
-    ThrowIllegalInvocation();
-    return 1;
-  }
+  HostCall host_call(accessor->signature, holder);
+  if (!host_call.admitted()) return 1;
   v8::PropertyCallbackInfo<v8::Value> info(v8::g_current_isolate, holder,
                                            accessor->data_bits, out,
-                                           token.get());
+                                           host_call.token());
   accessor->getter(v8::Local<v8::Name>::New(key), info);
   return 0;
 }
@@ -383,15 +386,12 @@ int32_t AccessorSetterTrampoline(void* data, uint64_t holder, uint64_t key,
                                  uint64_t value) {
   auto* accessor = static_cast<v8::ObjectTemplate::Accessor*>(data);
   if (accessor == nullptr || accessor->setter == nullptr) return 1;
-  CallbackToken token;
-  if (!AdmitsReceiver(accessor->signature, holder)) {
-    ThrowIllegalInvocation();
-    return 1;
-  }
+  HostCall host_call(accessor->signature, holder);
+  if (!host_call.admitted()) return 1;
   uint64_t answer = slag_undefined();
   v8::PropertyCallbackInfo<void> info(v8::g_current_isolate, holder,
                                       accessor->data_bits, &answer,
-                                      token.get());
+                                      host_call.token());
   accessor->setter(v8::Local<v8::Name>::New(key),
                    v8::Local<v8::Value>::New(value), info);
   return 0;
@@ -417,20 +417,16 @@ int32_t TemplateAccessorGetter(void* data, uint64_t holder, uint64_t,
     return 1;
   }
   *out = slag_undefined();
-  // The template's own signature, not the template as a type: `AllowsReceiver`
-  // is where a `Signature` declared on the getter is enforced, the same call
-  // the function's own trampoline makes.
-  if (accessor->getter_template != nullptr &&
-      !accessor->getter_template->AllowsReceiver(holder)) {
-    ThrowIllegalInvocation();
-    return 1;
-  }
+  // The template's own signature: `signature_type` is what a `Signature` on the
+  // getter declares, and a template without one admits anything.
+  HostCall host_call(
+      accessor->getter_template == nullptr
+          ? nullptr
+          : accessor->getter_template->signature_type(),
+      holder);
+  if (!host_call.admitted()) return 1;
   v8::FunctionCallbackInfo<v8::Value> info(v8::g_current_isolate, nullptr,
                                            holder, nullptr, 0);
-  // The getter runs inside the engine's callback window, so the conversion and
-  // allocation entry points have to see the token the way a host function's
-  // `HostTrampoline` publishes it.
-  CallbackToken token;
   accessor->getter(info);
   *out = info.return_value();
   return 0;
@@ -440,15 +436,15 @@ int32_t TemplateAccessorSetter(void* data, uint64_t holder, uint64_t,
                                uint64_t value) {
   auto* accessor = static_cast<TemplateAccessor*>(data);
   if (accessor == nullptr || accessor->setter == nullptr) return 1;
-  if (accessor->setter_template != nullptr &&
-      !accessor->setter_template->AllowsReceiver(holder)) {
-    ThrowIllegalInvocation();
-    return 1;
-  }
+  HostCall host_call(
+      accessor->setter_template == nullptr
+          ? nullptr
+          : accessor->setter_template->signature_type(),
+      holder);
+  if (!host_call.admitted()) return 1;
   uint64_t args[1] = {value};
   v8::FunctionCallbackInfo<v8::Value> info(v8::g_current_isolate, nullptr,
                                            holder, args, 1);
-  CallbackToken token;
   accessor->setter(info);
   return 0;
 }
@@ -932,9 +928,7 @@ Local<ObjectTemplate> FunctionTemplate::PrototypeTemplate() {
 }
 
 bool FunctionTemplate::AllowsReceiver(uint64_t receiver) const {
-  return signature_ == nullptr
-             ? true
-             : AdmitsReceiver(signature_->function_, receiver);
+  return AdmitsReceiver(signature_type(), receiver);
 }
 
 MaybeLocal<Function> FunctionTemplate::GetFunction(Local<Context> context) {
@@ -1577,11 +1571,28 @@ Local<Value> Private::Name() const {
 }
 
 MaybeLocal<Context> Object::GetCreationContext() const {
-  if (g_current_context == 0) return MaybeLocal<Context>();
-  return MaybeLocal<Context>(Local<Context>::New(g_current_context));
+  v8::Isolate* isolate = v8::g_current_isolate;
+  if (isolate == nullptr) return MaybeLocal<Context>();
+  v8::Context* owner = isolate->ContextForRealm(slag_value_realm(Raw(this)));
+  if (owner == nullptr) {
+    // Nothing recorded a realm (a host built the object outside every context),
+    // or the realm belongs to no context of this isolate. The entered context is
+    // the honest answer then, and V8 answers empty when none is entered either.
+    if (g_current_context == 0) return MaybeLocal<Context>();
+    owner = reinterpret_cast<Context*>(static_cast<uintptr_t>(g_current_context));
+  }
+  return MaybeLocal<Context>(
+      Local<Context>::New(reinterpret_cast<uint64_t>(owner)));
 }
 
 Local<Context> Object::GetCreationContextChecked() const {
+  v8::Isolate* isolate = v8::g_current_isolate;
+  if (isolate != nullptr) {
+    v8::Context* owner = isolate->ContextForRealm(slag_value_realm(Raw(this)));
+    if (owner != nullptr) {
+      return Local<Context>::New(reinterpret_cast<uint64_t>(owner));
+    }
+  }
   if (g_current_context == 0) return Local<Context>();
   return Local<Context>::New(g_current_context);
 }
@@ -1652,6 +1663,14 @@ uint64_t Context::effective_security_token() const {
   return isolate_ == nullptr ? 0 : isolate_->default_security_token_;
 }
 
+Context* Isolate::ContextForRealm(uint32_t realm) {
+  if (realm == 0) return nullptr;
+  for (Context* context : contexts_) {
+    if (slag_context_realm(context->slag()) == realm) return context;
+  }
+  return nullptr;
+}
+
 bool Isolate::MayAccess(Local<Context> accessing_context,
                         Local<Object> accessed_object) {
   if (accessing_context.IsEmpty() || accessed_object.IsEmpty()) return false;
@@ -1663,16 +1682,15 @@ bool Isolate::MayAccess(Local<Context> accessing_context,
   if (realm == 0 || realm == slag_context_realm(accessing->slag())) {
     return true;
   }
-  for (Context* owner : contexts_) {
-    if (slag_context_realm(owner->slag()) == realm) {
-      return owner->effective_security_token() ==
-             accessing->effective_security_token();
-    }
+  Context* owner = ContextForRealm(realm);
+  if (owner == nullptr) {
+    // A realm no context of this isolate claims: a script-made realm (a shadow
+    // realm) has no security token of its own to compare, so it is treated as
+    // the caller's.
+    return true;
   }
-  // A realm no context of this isolate claims: a script-made realm (a shadow
-  // realm) has no security token of its own to compare, so it is treated as the
-  // caller's.
-  return true;
+  return owner->effective_security_token() ==
+         accessing->effective_security_token();
 }
 
 void Context::SetSecurityToken(Local<Value> token) {

@@ -1441,6 +1441,12 @@ class FunctionTemplate {
    * materialized. It is the identity a signature's receiver check walks to
    * (`AllowsReceiver`). */
   uint64_t prototype_bits() const { return prototype_bits_; }
+
+  /* The type the template's `Signature` declares, or null. The receiver check
+   * takes this, so a trampoline never has to unwrap a `Signature` itself. */
+  FunctionTemplate* signature_type() const {
+    return signature_ == nullptr ? nullptr : signature_->function_;
+  }
   /* The value the template hands its callbacks (`FunctionCallbackInfo::Data`). */
   Local<Value> data() const { return Local<Value>::New(data_bits_); }
   void SetCallHandler(FunctionCallback callback,
@@ -1887,6 +1893,11 @@ class Isolate {
    * (`platform::PumpMessageLoop`). */
   bool PumpMessages();
 
+  /* The context of this isolate whose realm is `realm`, or null when none is
+   * (an object the host built outside every context). The realm is the engine's
+   * fact (`slag_value_realm`); this is the facade's context for it. */
+  Context* ContextForRealm(uint32_t realm);
+
   SlagIsolate* slag_ = nullptr;
   std::vector<Context*> contexts_;
   MicrotasksPolicy microtasks_policy_ = MicrotasksPolicy::kAuto;
@@ -1909,6 +1920,7 @@ class Isolate {
   friend class Context;
   friend class Private;
   friend class ArrayBuffer;
+  friend class Object;
   friend bool platform::PumpMessageLoop(Platform*, Isolate*);
 };
 

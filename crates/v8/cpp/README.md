@@ -380,9 +380,9 @@ The token does not gate ordinary property access, which matches V8: an object is
 only checked when it asks to be. A template that calls
 `SetAccessCheckCallback(isolate, nullptr)` asks for exactly this check, so its
 instances answer the token comparison instead of a host callback.
-`Object::GetCreationContext`/`GetCreationContextChecked` still answer the
-entered context rather than the object's own realm; the engine records the realm
-now, so that is a small remaining gap rather than a missing fact.
+`Object::GetCreationContext`/`GetCreationContextChecked` answer the context the
+object's realm belongs to, and fall back to the entered one only for a value no
+realm names (a host built it outside every context).
 
 ### Weak handles, GC hooks, and heap statistics
 
@@ -556,11 +556,14 @@ template whose function was never materialized admits nothing, since no instance
 of it can exist.
 
 The check reads the chain through the callback's window when a trampoline is
-running, so it works inside a host callback. The same check is the only one a
-receiver-type declaration makes: `AdmitsReceiver` in `facade.cc` is called by the
-call trampoline, by both accessor trampolines and by the `SetAccessorProperty`
-trampolines, so an accessor and a method cannot disagree about what an instance
-is.
+running, so it works inside a host callback. Every trampoline begins with one
+`HostCall` guard, which opens that window and asks the receiver check in the one
+order that works (the check reads the engine, so the window has to be open
+first); a new trampoline cannot publish one and forget the other. All of it is a
+single `AdmitsReceiver` call, so a method, an accessor declared over
+`AccessorSignature`, and an accessor whose getter template carries a `Signature`
+agree about what an instance is, and a refusal is `Illegal invocation` in every
+case.
 
 `AccessorSignature::New(isolate, template)` declares the same thing for an
 accessor. `ObjectTemplate::SetAccessor` and `Object::SetAccessor` take it as an
