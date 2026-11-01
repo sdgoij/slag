@@ -162,6 +162,27 @@ class CallbackToken {
   const void* token_ = nullptr;
 };
 
+/* The per-object access check a template installed
+ * (`ObjectTemplate::SetAccessCheckCallback`). `state` is the template, which is
+ * never freed, so the callback and its data are read at access time; `holder` is
+ * the instance and `data` the value the template was given. The realm
+ * comparison has already happened by the time this runs, so a template with a
+ * null callback answers "allowed" (it only reaches here with none installed
+ * when the check is configured and then cleared, which the facade does not do). */
+int32_t AccessCheckTrampoline(void* state, uint64_t data, uint64_t holder) {
+  auto* tmpl = static_cast<v8::ObjectTemplate*>(state);
+  if (tmpl == nullptr || tmpl->access_check() == nullptr) return 1;
+  CallbackToken token;
+  v8::Local<v8::Context> accessing;
+  if (v8::g_current_isolate != nullptr) {
+    accessing = v8::g_current_isolate->GetCurrentContext();
+  }
+  const bool allowed =
+      tmpl->access_check()(accessing, v8::Local<v8::Object>::New(holder),
+                           v8::Local<v8::Value>::New(data));
+  return allowed ? 1 : 0;
+}
+
 v8::IndexedPropertyHandlerConfiguration* IndexedConfiguration(void* state) {
   return static_cast<v8::IndexedPropertyHandlerConfiguration*>(state);
 }
@@ -2762,28 +2783,43 @@ MaybeLocal<Object> ObjectTemplate::NewInstance(Local<Context> context) {
 
   uint64_t object = 0;
   int status = 0;
-  if (has_named_handler_ || has_indexed_handler_) {
+  const bool has_handler = has_named_handler_ || has_indexed_handler_;
+  if (has_handler || access_check_ != nullptr) {
     // The handler struct carries each configuration's callbacks plus the
     // address of the configuration the trampolines read them from. The
     // configurations live as long as this template, like the template itself.
     SlagPropertyHandler handler{};
-    handler.getter = GetterTrampoline;
-    handler.setter = SetterTrampoline;
-    handler.query = QueryTrampoline;
-    handler.deleter = DeleterTrampoline;
-    handler.enumerator = EnumeratorTrampoline;
-    handler.descriptor = DescriptorTrampoline;
-    handler.definer = DefinerTrampoline;
-    handler.indexed_getter = IndexedGetterTrampoline;
-    handler.indexed_setter = IndexedSetterTrampoline;
-    handler.indexed_query = IndexedQueryTrampoline;
-    handler.indexed_deleter = IndexedDeleterTrampoline;
-    handler.indexed_enumerator = IndexedEnumeratorTrampoline;
-    handler.indexed_descriptor = IndexedDescriptorTrampoline;
-    handler.indexed_definer = IndexedDefinerTrampoline;
-    handler.data = named_handler_.data.IsEmpty()
-                       ? slag_undefined()
-                       : named_handler_.data.raw();
+    if (has_handler) {
+      handler.getter = GetterTrampoline;
+      handler.setter = SetterTrampoline;
+      handler.query = QueryTrampoline;
+      handler.deleter = DeleterTrampoline;
+      handler.enumerator = EnumeratorTrampoline;
+      handler.descriptor = DescriptorTrampoline;
+      handler.definer = DefinerTrampoline;
+      handler.indexed_getter = IndexedGetterTrampoline;
+      handler.indexed_setter = IndexedSetterTrampoline;
+      handler.indexed_query = IndexedQueryTrampoline;
+      handler.indexed_deleter = IndexedDeleterTrampoline;
+      handler.indexed_enumerator = IndexedEnumeratorTrampoline;
+      handler.indexed_descriptor = IndexedDescriptorTrampoline;
+      handler.indexed_definer = IndexedDefinerTrampoline;
+    }
+    if (access_check_ != nullptr) {
+      // An instance of a checked template is a host object, not an ordinary
+      // one: the check has to run before every property internal method, and a
+      // host object is the shape the engine never serves from a compiled fast
+      // path.
+      handler.access_check = &AccessCheckTrampoline;
+      handler.access_check_state = this;
+    }
+    // A configuration's `data` is what an access-check-with-handler hands its
+    // callback (`SetAccessCheckCallbackAndHandler` takes no data of its own).
+    handler.data = has_handler
+                       ? (named_handler_.data.IsEmpty()
+                              ? slag_undefined()
+                              : named_handler_.data.raw())
+                       : access_check_data_bits_;
     handler.state = &named_handler_;
     handler.indexed_state = &indexed_handler_;
     status = slag_object_new_handler(slag, static_cast<size_t>(internal_fields_),
@@ -2832,6 +2868,27 @@ void ObjectTemplate::SetHandler(
     const NamedPropertyHandlerConfiguration& configuration) {
   named_handler_ = configuration;
   has_named_handler_ = true;
+}
+
+void ObjectTemplate::SetAccessCheckCallback(Isolate*,
+                                            AccessCheckCallback callback,
+                                            Local<Value> data) {
+  access_check_ = callback;
+  const uint64_t bits = data.IsEmpty() ? slag_undefined() : data.raw();
+  if (bits != access_check_data_bits_) {
+    // The template outlives the scope the data was made in, and it is never
+    // freed, so the root is held for the process (like an accessor's data).
+    if (access_check_data_bits_ != 0) slag_root_release(access_check_data_bits_);
+    slag_root_retain(bits);
+    access_check_data_bits_ = bits;
+  }
+}
+
+void ObjectTemplate::SetAccessCheckCallbackAndHandler(
+    Isolate* isolate, AccessCheckCallback callback,
+    const NamedPropertyHandlerConfiguration& configuration) {
+  SetAccessCheckCallback(isolate, callback, configuration.data);
+  SetHandler(configuration);
 }
 
 void ObjectTemplate::SetHandler(

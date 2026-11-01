@@ -142,6 +142,13 @@ pub struct SlagPropertyHandler {
     pub state: *mut c_void,
     /// The same for the indexed callbacks, which are their own configuration.
     pub indexed_state: *mut c_void,
+    /// `v8::ObjectTemplate::SetAccessCheckCallback`: `(state, data, holder)`,
+    /// answering 1 to allow a cross-realm access and 0 to refuse it. A null
+    /// pointer means the template installed no check at all.
+    pub access_check: Option<unsafe extern "C" fn(*mut c_void, u64, u64) -> i32>,
+    /// The access check's own trampoline context: a template can carry a check
+    /// without a named handler, so it cannot share `state`.
+    pub access_check_state: *mut c_void,
 }
 
 impl fmt::Debug for SlagPropertyHandler {
@@ -161,6 +168,7 @@ impl fmt::Debug for SlagPropertyHandler {
             .field("definer", &self.definer.is_some())
             .field("indexed_descriptor", &self.indexed_descriptor.is_some())
             .field("indexed_definer", &self.indexed_definer.is_some())
+            .field("access_check", &self.access_check.is_some())
             .finish()
     }
 }
@@ -212,6 +220,11 @@ fn thrown() -> JsError {
         ErrorKind::Error,
         "a property handler answered kThrow, whose thrown value this ABI cannot carry".into(),
     )
+}
+
+/// The error a refused access check raises, spelled the way V8 spells it.
+fn illegal_access() -> JsError {
+    JsError::new(ErrorKind::TypeError, "Illegal access".into())
 }
 
 /// The engine `Property` a descriptor answer describes: the engine's own
@@ -291,6 +304,37 @@ impl CxxHandler {
             None => Ok(answer),
         }
     }
+
+    /// Refuse this internal method when the template's access check does
+    /// (`v8::ObjectTemplate::SetAccessCheckCallback`).
+    ///
+    /// Only a cross-realm access is checked, which is what V8's `AccessCheck`
+    /// decides before it calls anything: an object of the running realm, or of
+    /// no realm at all, is the caller's own. The realm compared against is the
+    /// engine's current one, so the check fires for every access JavaScript
+    /// makes and for an access a host callback makes while a script runs; a
+    /// host reading the object from C++ with no realm current gets the same
+    /// answer V8 gives outside a context.
+    fn access_denied(&self, object: &JsObject) -> Option<JsError> {
+        let check = self.handler.access_check?;
+        let realm = object.realm();
+        if realm == 0 || realm == crux::object::current_realm() {
+            return None;
+        }
+        let allowed = {
+            let _window = CallbackWindow::enter(self.agent);
+            // SAFETY: the state and data are the template's, and a template
+            // outlives every instance it made.
+            unsafe {
+                check(
+                    self.handler.access_check_state,
+                    self.handler.data,
+                    object.self_value().bits(),
+                )
+            }
+        };
+        (allowed == 0).then(illegal_access)
+    }
 }
 
 impl HostOps for CxxHandler {
@@ -299,6 +343,9 @@ impl HostOps for CxxHandler {
         object: &JsObject,
         key: &PropertyKey,
     ) -> Option<Result<crux::object::Property, JsError>> {
+        if let Some(error) = self.access_denied(object) {
+            return Some(Err(error));
+        }
         let intercepted = match self.callback(|| {
             // The indexed twin first, the same routing as `get`.
             if let Some(index) = crux::object::array_index_of(key)
@@ -353,6 +400,9 @@ impl HostOps for CxxHandler {
         key: &PropertyKey,
         desc: &crux::property::PropertyDescriptor,
     ) -> Option<Result<bool, JsError>> {
+        if let Some(error) = self.access_denied(object) {
+            return Some(Err(error));
+        }
         let descriptor = SlagPropertyDescriptor::of(desc);
         let intercepted = match self.callback(|| {
             if let Some(index) = crux::object::array_index_of(key)
@@ -406,6 +456,9 @@ impl HostOps for CxxHandler {
         key: &PropertyKey,
         receiver: &Value,
     ) -> Option<Result<Value, JsError>> {
+        if let Some(error) = self.access_denied(object) {
+            return Some(Err(error));
+        }
         let intercepted = match self.callback(|| {
             // An array index goes to the indexed callback when one is installed,
             // and to the named one otherwise, which is V8's routing rule.
@@ -457,6 +510,9 @@ impl HostOps for CxxHandler {
     }
 
     fn has_property(&self, object: &JsObject, key: &PropertyKey) -> Option<Result<bool, JsError>> {
+        if let Some(error) = self.access_denied(object) {
+            return Some(Err(error));
+        }
         let intercepted = match self.callback(|| {
             // The indexed twin first, the same routing as `get`.
             if let Some(index) = crux::object::array_index_of(key)
@@ -510,6 +566,9 @@ impl HostOps for CxxHandler {
         receiver: &Value,
         throw: bool,
     ) -> Option<Result<bool, JsError>> {
+        if let Some(error) = self.access_denied(object) {
+            return Some(Err(error));
+        }
         let intercepted = match self.callback(|| {
             // The indexed twin first, the same routing as `get`.
             if let Some(index) = crux::object::array_index_of(key)
@@ -558,6 +617,9 @@ impl HostOps for CxxHandler {
     }
 
     fn delete(&self, object: &JsObject, key: &PropertyKey) -> Option<Result<bool, JsError>> {
+        if let Some(error) = self.access_denied(object) {
+            return Some(Err(error));
+        }
         let intercepted = match self.callback(|| {
             // The indexed twin first, the same routing as `get`.
             if let Some(index) = crux::object::array_index_of(key)
@@ -603,6 +665,9 @@ impl HostOps for CxxHandler {
     }
 
     fn own_property_keys(&self, object: &JsObject) -> Option<Result<Vec<PropertyKey>, JsError>> {
+        if let Some(error) = self.access_denied(object) {
+            return Some(Err(error));
+        }
         let indexed = self.handler.indexed_enumerator;
         let named = self.handler.enumerator;
         if indexed.is_none() && named.is_none() {

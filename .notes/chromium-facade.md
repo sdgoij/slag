@@ -1234,6 +1234,35 @@ no way to ask yet (`slag_value_realm` / `slag_value_same_realm` come with the
 hook), so the README's "a signature is enforced, a per-object access check and
 the security token are not" still holds.
 
+*Per-object access checks, and where the hook actually had to go (2026-11-01).*
+§14.2's third item turned out not to be a hook on `get`/`set`/`has`. Those are
+the interpreter's entry points, and the compiled lanes do not go through them:
+a named read is served from a member-value cell validated by the object's id and
+generation, and an element read from the dense buffer. A runtime hook would be
+bypassed by any hot function, which in a browser is every function that matters.
+So the check is enforced by the object's **shape** instead: an instance of a
+template with `SetAccessCheckCallback` is an engine host object, and a host
+object never takes a compiled fast lane (`is_plain_object` fails, the
+interpreter's own fast path is `Ordinary | Array` only). Every property internal
+method then arrives at the handler, and the handler runs the check first. This
+costs nothing on the hot paths because the gate is a dispatch that already
+existed, and it is what the notes already said host objects are for: the route a
+V8 named-property handler rides.
+
+The engine side is three pure queries, `slag_value_realm`,
+`slag_value_same_realm` and `slag_context_realm`, plus `slag_context_enter` /
+`slag_context_leave`, which `Context::Scope` uses to make the entered context's
+realm current. That last pair matters: realm attribution is a thread-local, so
+without it a host-side access between scripts would compare against whichever
+realm was created last. With it, and with `realm_for` preferring the prototype
+over the ambient (a realm's prototypes are its own, so `{}` from realm A belongs
+to A even when B is running), the answer is right for a same-realm read, a
+cross-realm read, and a host-side read.
+
+Still open in A4: `AccessorSignature` enforcement, `Object::SetAccessor`'s
+signature parameter, the security token (comparable now, consulted by nothing),
+and moving `Signature`'s prototype-chain check behind the same callback.
+
 ## 15. Sources
 
 Verified on 2026-10-31:

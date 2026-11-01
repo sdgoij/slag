@@ -53,6 +53,11 @@ pub struct SlagIsolate {
 /// sample shell does not use it, so it is refused rather than unsound.
 pub struct SlagContext {
     context: RefCell<Context>,
+    /// The realm this context's objects are created in, read once at creation
+    /// so `slag_context_realm` and the scope enter/leave pair never borrow the
+    /// engine. It is also the realm `Context::Scope` makes current, which is
+    /// what an access check compares a value's realm against.
+    realm: u32,
     /// The error the last failed operation left: its message is what
     /// `slag_take_error` reports, the thrown value is what `TryCatch::Exception`
     /// returns, and a compile's position is what `TryCatch::Message` answers.
@@ -1084,8 +1089,10 @@ pub extern "C" fn slag_context_new(_isolate: *mut SlagIsolate) -> *mut SlagConte
     match Context::new() {
         Ok(mut context) => {
             let agent = context.agent_mut() as *mut _ as crux::function::AgentPtr;
+            let realm = context.realm_signifier();
             Box::into_raw(Box::new(SlagContext {
                 context: RefCell::new(context),
+                realm,
                 pending_error: Rc::new(RefCell::new(None)),
                 agent,
                 resolvers: RefCell::new(std::collections::HashMap::new()),
@@ -3929,6 +3936,50 @@ pub unsafe extern "C" fn slag_symbol_description(value: u64, out: *mut u64) -> i
 #[unsafe(no_mangle)]
 pub extern "C" fn slag_security_token_new() -> u64 {
     Value::Object(crux::object::JsObject::ordinary_object_create(None)).bits()
+}
+
+/// The realm an object was created in, 0 for anything that is not an object (a
+/// function answers its object part's realm).
+#[unsafe(no_mangle)]
+pub extern "C" fn slag_value_realm(value: u64) -> u32 {
+    Value::from_bits(value)
+        .as_object()
+        .map_or(0, |object| object.realm())
+}
+
+/// Whether two values were created in the same realm. A value with no realm is
+/// never in the same realm as anything, which is the reading a check wants: it
+/// has nothing to compare.
+#[unsafe(no_mangle)]
+pub extern "C" fn slag_value_same_realm(left: u64, right: u64) -> i32 {
+    let realm = slag_value_realm(left);
+    i32::from(realm != 0 && realm == slag_value_realm(right))
+}
+
+/// The realm a context's objects are created in: the comparing half of an
+/// access check, which asks a value's realm against the entered context's.
+/// Answers 0 for a null context.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn slag_context_realm(context: *mut SlagContext) -> u32 {
+    context.as_ref().map_or(0, |context| context.realm)
+}
+
+/// Make `context`'s realm the one objects created from here on belong to
+/// (`v8::Context::Scope`), answering the realm to restore: the pair is what
+/// makes a host-side access, one made from C++ between scripts, compare against
+/// the context it was made in rather than whichever realm happened to be last.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn slag_context_enter(context: *mut SlagContext) -> u32 {
+    match context.as_ref() {
+        Some(context) => crux::object::set_current_realm(context.realm),
+        None => crux::object::current_realm(),
+    }
+}
+
+/// Restore the realm [`slag_context_enter`] answered.
+#[unsafe(no_mangle)]
+pub extern "C" fn slag_context_leave(realm: u32) {
+    crux::object::set_current_realm(realm);
 }
 
 #[unsafe(no_mangle)]

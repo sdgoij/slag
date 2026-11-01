@@ -548,8 +548,39 @@ of it can exist.
 
 The check reads the chain through the callback's window when a trampoline is
 running, so it works inside a host callback. `AccessorSignature` is still
-accepted and not consulted, and there is no `SetAccessCheckCallback` or
-per-object check: those are the rest of A4.
+accepted and not consulted.
+
+### Per-object access checks
+
+`ObjectTemplate::SetAccessCheckCallback(isolate, callback, data)` and
+`SetAccessCheckCallbackAndHandler(isolate, callback, configuration)` install the
+check Blink puts on a cross-origin wrapper. The callback is V8's shape,
+`bool(Local<Context> accessing, Local<Object> accessed, Local<Value> data)`, and
+it is consulted only for a **cross-realm** access, which is where V8 consults it
+too: a same-realm read of the same object never reaches it. A refused access
+fails with V8's `TypeError: Illegal access`.
+
+An instance of a checked template is an engine **host object**, not an ordinary
+one. That is the whole reason the check is enforced: the engine's compiled
+member and element lanes serve plain objects straight from a cached value cell,
+so an ordinary object reached from another realm could be read before any
+runtime hook ran. A host object never takes those lanes (`is_plain_object` fails,
+the interpreter's own fast path is `Ordinary | Array` only), so `[[Get]]`,
+`[[Set]]`, `[[HasProperty]]`, `[[Delete]]`, `[[GetOwnProperty]]`,
+`[[DefineOwnProperty]]` and `[[OwnPropertyKeys]]` all arrive at the handler, and
+every one of them runs the check first.
+
+The realm compared against is the engine's current one, which follows
+`v8::Context::Scope` as well as the script that is running, so a host-side access
+from C++ between scripts is checked against the context it was made in. The
+engine side is `slag_value_realm` / `slag_value_same_realm` and
+`slag_context_realm`, and every object records the realm it was created in (see
+`.notes/chromium-facade.md` section 14.2).
+
+What is still missing from the A4 section: `AccessorSignature` enforcement, the
+security token (stored, and now comparable, but nothing consults it), and a
+signature's check is still the trampoline's rather than moving behind the same
+hook.
 
 ## The gin target
 
@@ -700,11 +731,14 @@ not a claim that gin itself links.
 - A lazy data property's getter runs on every read (there is no one-shot slot),
   and a private name is a symbol, so `Object.getOwnPropertySymbols` can see a
   property V8's private names hide completely.
-- The security token is stored and never consulted: a context's objects are
-  reachable from every other context on the isolate, which is an engine gap
-  rather than a facade decision. Embedder value slots and aligned-pointer slots
-  are separate stores, so `GetEmbedderData` on a pointer slot answers
-  `undefined` rather than an `External`.
+- The security token is stored and never consulted, so two contexts that set
+different tokens can still reach each other's ordinary objects. The token is
+now *comparable* (`slag_value_same_realm`, `slag_context_realm`), which is what
+using it needs, but nothing compares it: a cross-origin wrapper is protected by
+its own access check (`SetAccessCheckCallbackAndHandler`, above), and an
+ordinary object has no check to run. Embedder value slots and aligned-pointer
+slots are separate stores, so `GetEmbedderData` on a pointer slot answers
+`undefined` rather than an `External`.
 - `WeakCallbackInfo::GetValue` is always empty and every `WeakCallbackType`
   behaves as `kParameter`: the engine reports the death, not which kind of
   reference held the value. GC callbacks always receive `kNoGCCallbackFlags`,
@@ -733,11 +767,12 @@ not a claim that gin itself links.
   itself, so `typeof instance` is `"function"` and a call runs the host's code.
 - `Signature` is enforced for function templates only: `AccessorSignature` is
   accepted and not consulted, and `Object::SetAccessor` has no signature
-  parameter yet. There is no per-object access check: `SetAccessCheckCallback`
-  and `SetAccessCheckCallbackAndHandler` are absent, so a host cannot declare a
-  check on one object, and the security token is stored but never consulted.
-  Both of those need the engine to know which realm an object came from, which
-  it does not record; `.notes/chromium-facade.md` §14.2 sketches the change.
+  parameter yet. A per-object access check is enforced
+  (`SetAccessCheckCallback` and `SetAccessCheckCallbackAndHandler`) for every
+  property internal method of an instance, on a cross-realm access only. An
+  instance of a checked template is a host object, so a template that also asks
+  for a callable instance keeps the handler object instead (the engine's host
+  objects have no `[[Call]]`).
 - `Platform` is a handle plus a message pump: `PumpMessageLoop` runs the
   isolate's queued jobs (microtasks, promise reactions, due timers) and answers
   whether it ran any. There are no host-posted platform tasks or task runners
@@ -861,6 +896,11 @@ handler, a method, and an internal field, checks that the instance is a function
 calls it through a script, and checks that a template with a property handler
 keeps a handler object instead. The signature block declares a method over a
 `Signature`, calls it on an instance (allowed), and calls it on a foreign object
-(refused with a `TypeError` whose message is `Illegal invocation`). The promise
+(refused with a `TypeError` whose message is `Illegal invocation`). The access
+check block installs a per-object check on a template, reads its instance from
+its own realm (allowed, and the callback never runs), reads it from a second
+context (refused with a `TypeError`, and the callback ran exactly once), and
+reads an instance of a template whose callback allows the access from that same
+second context. The promise
 block checks the two statics, and the buffer block makes a `DataView` over the
 host's buffer, writes through it, and checks that the bytes land in the buffer.

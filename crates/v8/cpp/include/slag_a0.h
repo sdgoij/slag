@@ -150,6 +150,16 @@ typedef struct SlagPropertyHandler {
   uint64_t data;
   void* state;
   void* indexed_state;
+  /* `v8::ObjectTemplate::SetAccessCheckCallback`: whether a cross-realm access
+   * to an instance of the template may proceed. Args are `(state, data,
+   * holder)`; answer 1 to allow, 0 to refuse with `TypeError: Illegal access`.
+   * The host asks `Isolate::GetEnteredContext()` for the accessing context, the
+   * same way V8's callback is handed one. Only a cross-realm access consults
+   * it, so a null pointer here means "never check", not "never access". */
+  int32_t (*access_check)(void* state, uint64_t data, uint64_t holder);
+  /* The access check's own trampoline context: a template can carry a check
+   * without a named handler, so it cannot share `state`. */
+  void* access_check_state;
 } SlagPropertyHandler;
 
 SlagIsolate* slag_isolate_new(void);
@@ -512,6 +522,21 @@ int32_t slag_throw_exception(SlagContext* context, uint64_t value);
  * `v8::Private`. */
 int32_t slag_symbol_new(const uint8_t* text, size_t len, uint64_t* out);
 int32_t slag_symbol_description(uint64_t value, uint64_t* out);
+/* The realm an object was created in, as the realm's own signifier (`Realm`'s
+ * `signifier`); 0 for a value that is not an object, and for an object no
+ * realm recorded (a host built it outside any context, from a protoless
+ * prototype). A function answers its object part's realm. Two values are in the
+ * same realm when the two answers are equal and non-zero, which is what
+ * `slag_value_same_realm` spells out. */
+uint32_t slag_value_realm(uint64_t value);
+int32_t slag_value_same_realm(uint64_t left, uint64_t right);
+/* The realm a context's objects are created in. This is the comparing half of
+ * an access check: a value's realm against the entered context's. */
+uint32_t slag_context_realm(SlagContext* context);
+/* Make a context's realm the one objects created from here on belong to,
+ * answering the realm to restore (`v8::Context::Scope`). */
+uint32_t slag_context_enter(SlagContext* context);
+void slag_context_leave(uint32_t realm);
 /* A fresh null-prototype object for an isolate's default security token. */
 uint64_t slag_security_token_new(void);
 uint64_t slag_global(SlagContext* context);

@@ -1002,6 +1002,14 @@ impl Context {
         &self.agent
     }
 
+    /// The identity of the realm this context's objects are created in: the
+    /// answer `JsObject::realm` gives for one of them. A host compares it with
+    /// a value's realm to tell a cross-context access from its own. 0 when the
+    /// context has no realm, which only a partly built one can.
+    pub fn realm_signifier(&self) -> u32 {
+        self.agent.first_realm().map_or(0, |realm| realm.signifier)
+    }
+
     /// The underlying agent, mutably.
     pub fn agent_mut(&mut self) -> &mut Agent {
         &mut self.agent

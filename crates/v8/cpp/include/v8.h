@@ -1512,6 +1512,30 @@ class ObjectTemplate {
   FunctionCallback call_as_function() const { return call_as_function_; }
   Local<Value> call_as_function_data() const { return call_as_function_data_; }
 
+  /* Install a per-object access check (`ObjectTemplate::SetAccessCheckCallback`
+   * and `SetAccessCheckCallbackAndHandler`): a property access to an instance
+   * from another realm consults `callback`, which answers whether it may
+   * proceed. An instance is an engine host object, so no compiled fast path can
+   * serve the property before the check runs. The check fires only on a
+   * cross-realm access, which is where V8 consults it too; a call the callback
+   * refuses raises `TypeError: Illegal access`. */
+  using AccessCheckCallback = bool (*)(Local<Context> accessing_context,
+                                       Local<Object> accessed_object,
+                                       Local<Value> data);
+  void SetAccessCheckCallback(Isolate* isolate, AccessCheckCallback callback,
+                              Local<Value> data = Local<Value>());
+  /* The same, and a named-property handler: this is the pair Blink configures
+   * on a cross-origin wrapper (`SetAccessCheckCallbackAndHandler`). The check
+   * has no data of its own here, so the configuration's `data` is handed to
+   * both. */
+  void SetAccessCheckCallbackAndHandler(
+      Isolate* isolate, AccessCheckCallback callback,
+      const NamedPropertyHandlerConfiguration& configuration);
+  AccessCheckCallback access_check() const { return access_check_; }
+  Local<Value> access_check_data() const {
+    return Local<Value>::New(access_check_data_bits_);
+  }
+
   /* One installed accessor: the name and data are retained for the template's
    * lifetime (templates are not freed), and their bits are kept so the
    * trampolines do not have to make a handle per access. `Global` is defined
@@ -1527,7 +1551,8 @@ class ObjectTemplate {
 
   /* Create an instance of this template: an ordinary object with the template's
    * internal fields, its host functions, and `IsApiWrapper` set. A template with
-   * a handler makes an object whose property access goes to it. */
+   * a handler makes an object whose property access goes to it, and a template
+   * with an access check makes one that refuses a cross-realm access. */
   MaybeLocal<Object> NewInstance(Local<Context> context);
 
  private:
@@ -1540,6 +1565,10 @@ class ObjectTemplate {
   IndexedPropertyHandlerConfiguration indexed_handler_;
   bool has_named_handler_ = false;
   bool has_indexed_handler_ = false;
+  AccessCheckCallback access_check_ = nullptr;
+  /* The check's `data`, retained for the template's lifetime (templates are not
+   * freed), like an accessor's name and data. */
+  uint64_t access_check_data_bits_ = 0;
 };
 
 class Context {
@@ -1571,21 +1600,39 @@ class Context {
 
   /* The token another context must answer to be allowed to reach this one's
    * properties (`Context::GetSecurityToken`). Stored and not consulted: the
-   * engine has no cross-context access check, which is the gap the Rust
-   * bridge's `get_security_token` documents. */
+   * engine's per-object access check compares realms, not tokens, so a token
+   * gates nothing yet. A cross-origin wrapper is protected by its template's
+   * access check (`ObjectTemplate::SetAccessCheckCallback`). */
   Local<Value> GetSecurityToken();
   void SetSecurityToken(Local<Value> token);
   void UseDefaultSecurityToken();
 
   class Scope {
    public:
-    explicit Scope(Local<Context> context) : previous_(g_current_context) {
+    explicit Scope(Local<Context> context)
+        : previous_(g_current_context), realm_(0) {
       g_current_context = context.raw();
+      // The engine's current realm follows the entered context, so a host-side
+      // access compares against the context it was made in rather than
+      // whichever realm was created last. An empty handle enters no realm, and
+      // the ABI answers the one already current, so the exit pair stays
+      // balanced either way.
+      SlagContext* slag = nullptr;
+      if (context.raw() != 0) {
+        slag = reinterpret_cast<Context*>(
+                   static_cast<uintptr_t>(context.raw()))
+                   ->slag();
+      }
+      realm_ = slag_context_enter(slag);
     }
-    ~Scope() { g_current_context = previous_; }
+    ~Scope() {
+      g_current_context = previous_;
+      slag_context_leave(realm_);
+    }
 
    private:
     uint64_t previous_;
+    uint32_t realm_;
   };
 
  private:

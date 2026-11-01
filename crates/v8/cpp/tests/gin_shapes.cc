@@ -491,6 +491,23 @@ void GuardedBody(const v8::FunctionCallbackInfo<v8::Value>& info) {
       info.GetIsolate(), NumberArg(info, 0) * 2));
 }
 
+// The two answers a per-object access check can give
+// (`ObjectTemplate::SetAccessCheckCallback`). The count is the host's proof
+// that the check ran only where it should: a same-realm access never reaches
+// it.
+int access_checks = 0;
+bool DenyAccess(v8::Local<v8::Context>, v8::Local<v8::Object>,
+                v8::Local<v8::Value>) {
+  ++access_checks;
+  return false;
+}
+bool AllowAccess(v8::Local<v8::Context>, v8::Local<v8::Object>,
+                 v8::Local<v8::Value> data) {
+  ++access_checks;
+  // The template's data arrives, which is what a host uses to name its origin.
+  return data->IsInt32();
+}
+
 // A host allocator that counts what it lends, so the harness can prove the facade
 // draws a backing store from it and gives the bytes back.
 struct CountingAllocator : v8::ArrayBuffer::Allocator {
@@ -2709,6 +2726,76 @@ int main() {
     run("globalThis.inheritedMark = plain.mark;");
     expect(number_at("inheritedMark") == 9,
            "the prototype's property is inherited");
+
+    // A per-object access check: an instance of a template that installs one is
+    // readable in its own realm and refused from another
+    // (`ObjectTemplate::SetAccessCheckCallback`).
+    {
+      v8::Local<v8::ObjectTemplate> checked = v8::ObjectTemplate::New(isolate);
+      checked->SetAccessCheckCallback(isolate, &DenyAccess,
+                                      v8::Integer::New(isolate, 3));
+      v8::Local<v8::Object> guarded =
+          checked->NewInstance(current).ToLocalChecked();
+      guarded->Set(current, v8::String::NewFromUtf8Literal(isolate, "value"),
+                   v8::Integer::New(isolate, 11)).ToChecked();
+      bind("guarded", guarded);
+      run("globalThis.sameRealm = guarded.value;");
+      expect(number_at("sameRealm") == 11,
+             "an access-checked object is readable in its own realm");
+      expect(access_checks == 0,
+             "a same-realm access does not consult the check");
+
+      // A second realm, which is where the check fires. Reading the object from
+      // it is refused, and the refusal is the callback's answer.
+      v8::Local<v8::Context> other = v8::Context::New(isolate);
+      {
+        v8::Context::Scope other_scope(other);
+        other->Global()
+            ->Set(other, v8::String::NewFromUtf8Literal(isolate, "guarded"),
+                  guarded)
+            .ToChecked();
+        bool refused = false;
+        {
+          v8::TryCatch caught(isolate);
+          v8::Local<v8::Script> script;
+          v8::Local<v8::Value> result;
+          if (!v8::Script::Compile(
+                   other,
+                   v8::String::NewFromUtf8Literal(isolate, "guarded.value"))
+                   .ToLocal(&script) ||
+              !script->Run(other).ToLocal(&result)) {
+            refused = caught.HasCaught();
+          }
+        }
+        expect(refused,
+               "a cross-realm read of an access-checked object is refused");
+        expect(access_checks == 1,
+               "the check ran once, for the cross-realm read");
+
+        // The callback's answer is the decision: a template that allows the
+        // access is read across realms like any other object.
+        v8::Local<v8::ObjectTemplate> shared = v8::ObjectTemplate::New(isolate);
+        shared->SetAccessCheckCallback(isolate, &AllowAccess,
+                                       v8::Integer::New(isolate, 4));
+        v8::Local<v8::Object> open =
+            shared->NewInstance(current).ToLocalChecked();
+        open->Set(current, v8::String::NewFromUtf8Literal(isolate, "value"),
+                  v8::Integer::New(isolate, 21))
+            .ToChecked();
+        other->Global()
+            ->Set(other, v8::String::NewFromUtf8Literal(isolate, "open"), open)
+            .ToChecked();
+        v8::TryCatch caught(isolate);
+        v8::Local<v8::Script> script;
+        v8::Local<v8::Value> result;
+        expect(v8::Script::Compile(
+                   other, v8::String::NewFromUtf8Literal(isolate, "open.value"))
+                       .ToLocal(&script) &&
+                   script->Run(other).ToLocal(&result) &&
+                   result->Int32Value(other).FromMaybe(-1) == 21,
+               "the check's allow answer admits the cross-realm read");
+      }
+    }
 
     // A MicrotasksScope drains the queue on its outermost exit.
     isolate->SetMicrotasksPolicy(v8::MicrotasksPolicy::kExplicit);

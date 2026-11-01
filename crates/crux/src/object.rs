@@ -79,15 +79,20 @@ pub fn set_current_realm(realm: u32) -> u32 {
     CREATION_REALM.with(|slot| slot.replace(realm))
 }
 
-/// The realm a fresh object belongs to: the realm being built, or — when no
-/// realm is being built — the realm of the prototype the object is created on.
-/// The second arm is what carries a realm through the ordinary API: a host
-/// calling `Object::new(&context)` between scripts runs inside no execution
-/// context, and the context's own `%Object.prototype%` already knows its realm.
+/// The realm a fresh object belongs to: the realm of the prototype it is
+/// created on, or — for an object that has none — the realm being built.
+///
+/// The prototype comes first because it is the more specific fact: a realm
+/// builds its own intrinsics, so `{}` created from realm A's `%Object.prototype%`
+/// belongs to A even when the realm being executed differs (a cross-realm
+/// constructor call, which V8's map-carried native context answers the same
+/// way). Only a protoless object needs the ambient: realm bootstrap creates the
+/// global object and `%Object.prototype%` before anything can name a realm, and
+/// `Object.create(null)` has no prototype to ask.
 fn realm_for(prototype: Option<Handle<JsObject>>) -> u32 {
-    match current_realm() {
-        0 => prototype.map_or(0, |object| object.realm()),
-        realm => realm,
+    match prototype {
+        Some(object) => object.realm(),
+        None => current_realm(),
     }
 }
 

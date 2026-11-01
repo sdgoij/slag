@@ -3207,6 +3207,13 @@ impl Agent {
         self.roots.execution_context_stack.pop();
     }
 
+    /// The first Realm Record this agent created. A host that owns one context
+    /// per agent (the flat C surface does) gets that context's realm, and one
+    /// answer does not depend on which execution context happens to be running.
+    pub fn first_realm(&self) -> Option<Handle<Realm>> {
+        self.roots.realms.borrow().first().copied()
+    }
+
     /// The current Realm Record (the Realm component of the running context).
     pub fn current_realm(&self) -> Result<Handle<Realm>, JsError> {
         // A running execution context wins, as its own context wins in V8's
