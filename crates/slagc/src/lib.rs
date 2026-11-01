@@ -3982,6 +3982,122 @@ pub extern "C" fn slag_context_leave(realm: u32) {
     crux::object::set_current_realm(realm);
 }
 
+/// One captured call frame, as the flat ABI carries it (`v8::StackFrame`).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SlagStackFrame {
+    pub script_id: u32,
+    pub line: i32,
+    pub column: i32,
+    pub function_name: u64,
+    pub script_name: u64,
+}
+
+/// How many frames the running stack has, innermost first
+/// (`v8::StackTrace::GetFrameCount`). 0 outside any running code.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn slag_stack_frame_count(context: *mut SlagContext) -> i32 {
+    stack_frame_count(context, std::ptr::null())
+}
+
+/// The same inside a running host callback, where the engine is borrowed and
+/// only the callback's window can read the stack.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn slag_callback_stack_frame_count(
+    context: *mut SlagContext,
+    token: *const c_void,
+) -> i32 {
+    stack_frame_count(context, token)
+}
+
+unsafe fn stack_frame_count(context: *mut SlagContext, token: *const c_void) -> i32 {
+    let Some(context) = context.as_ref() else {
+        return 0;
+    };
+    let count = if token.is_null() {
+        let Ok(engine) = context.context.try_borrow() else {
+            return 0;
+        };
+        slag::api::stack_trace::stack_frames(engine.agent(), usize::MAX).len()
+    } else {
+        let Some(window) = CallbackWindow::admit(token) else {
+            return 0;
+        };
+        // SAFETY: the window names the agent the operation that entered it
+        // holds, which outlives the callback.
+        let agent: &_ = unsafe { &*(window.agent() as *const _) };
+        slag::api::stack_trace::stack_frames(agent, usize::MAX).len()
+    };
+    i32::try_from(count).unwrap_or(i32::MAX)
+}
+
+/// Frame `index` of the running stack, innermost first, written to `out`.
+/// Answers 0 when it exists and 2 for a bad argument.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn slag_stack_frame(
+    context: *mut SlagContext,
+    index: usize,
+    out: *mut SlagStackFrame,
+) -> i32 {
+    stack_frame(context, std::ptr::null(), index, out)
+}
+
+/// The same inside a running host callback.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn slag_callback_stack_frame(
+    context: *mut SlagContext,
+    token: *const c_void,
+    index: usize,
+    out: *mut SlagStackFrame,
+) -> i32 {
+    stack_frame(context, token, index, out)
+}
+
+unsafe fn stack_frame(
+    context: *mut SlagContext,
+    token: *const c_void,
+    index: usize,
+    out: *mut SlagStackFrame,
+) -> i32 {
+    let Some(context) = context.as_ref() else {
+        return 2;
+    };
+    let Some(out) = out.as_mut() else {
+        return 2;
+    };
+    let frames = if token.is_null() {
+        let Ok(engine) = context.context.try_borrow() else {
+            return 2;
+        };
+        slag::api::stack_trace::stack_frames(engine.agent(), index + 1)
+    } else {
+        let Some(window) = CallbackWindow::admit(token) else {
+            return 2;
+        };
+        // SAFETY: as in `stack_frame_count`.
+        let agent: &_ = unsafe { &*(window.agent() as *const _) };
+        slag::api::stack_trace::stack_frames(agent, index + 1)
+    };
+    let Some(frame) = frames.get(index) else {
+        return 2;
+    };
+    let name_bits = |name: &Option<String>| {
+        name.as_ref().map_or(0, |text| {
+            Value::String(Handle::new(JsString::from_utf8(text))).bits()
+        })
+    };
+    *out = SlagStackFrame {
+        // The engine's frames do not carry a per-script id yet; a frame that
+        // has a name is identified by it, which is what a host displays.
+        script_id: 0,
+        line: i32::try_from(frame.line).unwrap_or(0),
+        column: i32::try_from(frame.column).unwrap_or(0),
+        function_name: name_bits(&frame.function_name),
+        script_name: name_bits(&frame.script_name),
+    };
+    0
+}
+
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn slag_global(context: *mut SlagContext) -> u64 {
     match context.as_ref().and_then(|context| {

@@ -525,6 +525,27 @@ bool MessageListener(v8::Local<v8::Message> message, v8::Local<v8::Value>) {
   return true;
 }
 
+// A host callback that captures the running stack as data
+// (`StackTrace::CurrentStackTrace`), which is what an inspector's
+// `Debugger.paused` and `Runtime.exceptionThrown` carry.
+int trace_frames = -1;
+std::string trace_function;
+bool trace_overflow_empty = false;
+void TraceProbe(const v8::FunctionCallbackInfo<v8::Value>& info) {
+  v8::Isolate* isolate = info.GetIsolate();
+  v8::Local<v8::StackTrace> trace =
+      v8::StackTrace::CurrentStackTrace(isolate, 8);
+  if (trace.IsEmpty()) return;
+  trace_frames = trace->GetFrameCount();
+  if (trace_frames > 0) {
+    v8::Local<v8::StackFrame> frame = trace->GetFrame(0);
+    v8::String::Utf8Value name(isolate, frame->GetFunctionName());
+    trace_function = *name == nullptr ? "" : *name;
+  }
+  trace_overflow_empty =
+      trace->GetFrame(static_cast<uint32_t>(trace_frames + 1)).IsEmpty();
+}
+
 // An accessor declared over an `AccessorSignature`: its getter runs for an
 // instance and is refused with `Illegal invocation` for anything else.
 int guard_reads = 0;
@@ -3026,6 +3047,25 @@ int main() {
       slag_clear_error(current->slag());
       expect(message_listener_messages == 1,
              "a removed listener hears nothing");
+    }
+
+    // Stacks as data: the frames a `Debugger.paused` or
+    // `Runtime.exceptionThrown` notification carries, where
+    // `TryCatch::StackTrace` only renders a string.
+    {
+      v8::Local<v8::ObjectTemplate> probe_template =
+          v8::ObjectTemplate::New(isolate);
+      probe_template->Set(
+          isolate, "trace", v8::FunctionTemplate::New(isolate, &TraceProbe));
+      v8::Local<v8::Object> probe =
+          probe_template->NewInstance(current).ToLocalChecked();
+      bind("probe", probe);
+      run("(function inner() { probe.trace(); })();");
+      expect(trace_frames >= 1, "the running stack has a frame");
+      expect(!trace_function.empty(),
+             "the innermost frame names its function");
+      expect(trace_overflow_empty,
+             "an out-of-range frame index answers an empty handle");
     }
 
     // A MicrotasksScope drains the queue on its outermost exit.

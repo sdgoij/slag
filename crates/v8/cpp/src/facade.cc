@@ -2791,6 +2791,77 @@ TryCatch::~TryCatch() {
   if (context != nullptr) slag_clear_error(context->slag());
 }
 
+StackFrame::StackFrame(uint32_t script_id, int line, int column,
+                       uint64_t function_name, uint64_t script_name)
+    : script_id_(script_id),
+      line_(line),
+      column_(column),
+      function_name_(function_name),
+      script_name_(script_name) {
+  // The engine's strings are only valid while a handle holds them, and a frame
+  // outlives the scope it was captured in, so the two names are rooted here.
+  if (function_name_ != 0) slag_root_retain(function_name_);
+  if (script_name_ != 0) slag_root_retain(script_name_);
+}
+
+StackFrame::~StackFrame() {
+  if (function_name_ != 0) slag_root_release(function_name_);
+  if (script_name_ != 0) slag_root_release(script_name_);
+}
+
+Local<String> StackFrame::GetScriptName() const {
+  return script_name_ == 0 ? Local<String>() : Local<String>::New(script_name_);
+}
+
+Local<String> StackFrame::GetFunctionName() const {
+  return function_name_ == 0 ? Local<String>()
+                             : Local<String>::New(function_name_);
+}
+
+StackTrace::StackTrace(std::vector<StackFrame*> frames)
+    : frames_(std::move(frames)) {}
+
+StackTrace::~StackTrace() {
+  for (StackFrame* frame : frames_) delete frame;
+}
+
+Local<StackFrame> StackTrace::GetFrame(uint32_t index) const {
+  if (index >= frames_.size()) return Local<StackFrame>();
+  return Local<StackFrame>::New(reinterpret_cast<uint64_t>(frames_[index]));
+}
+
+Local<StackTrace> StackTrace::CurrentStackTrace(Isolate* isolate,
+                                                int frame_limit,
+                                                StackTraceOptions) {
+  SlagContext* slag = CurrentSlagContext();
+  if (isolate == nullptr || slag == nullptr || frame_limit <= 0) {
+    return Local<StackTrace>();
+  }
+  int32_t count = g_callback_token != nullptr
+                      ? slag_callback_stack_frame_count(slag, g_callback_token)
+                      : slag_stack_frame_count(slag);
+  if (count <= 0) {
+    return Local<StackTrace>::New(
+        reinterpret_cast<uint64_t>(new StackTrace(std::vector<StackFrame*>())));
+  }
+  if (count > frame_limit) count = frame_limit;
+  std::vector<StackFrame*> frames;
+  frames.reserve(static_cast<size_t>(count));
+  for (int32_t index = 0; index < count; ++index) {
+    SlagStackFrame frame{};
+    const int32_t status =
+        g_callback_token != nullptr
+            ? slag_callback_stack_frame(slag, g_callback_token,
+                                        static_cast<size_t>(index), &frame)
+            : slag_stack_frame(slag, static_cast<size_t>(index), &frame);
+    if (status != 0) break;
+    frames.push_back(new StackFrame(frame.script_id, frame.line, frame.column,
+                                    frame.function_name, frame.script_name));
+  }
+  return Local<StackTrace>::New(
+      reinterpret_cast<uint64_t>(new StackTrace(std::move(frames))));
+}
+
 Message::Message(uint64_t resource_name, uint64_t source_line, uint64_t text,
                  int line, int start, int end)
     : resource_name_(resource_name),

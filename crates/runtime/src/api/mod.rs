@@ -25,7 +25,7 @@ mod module;
 mod object;
 mod promise;
 mod script;
-pub(crate) mod stack_trace;
+pub mod stack_trace;
 mod template;
 mod try_catch;
 #[cfg(feature = "wasm")]

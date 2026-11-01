@@ -159,7 +159,7 @@ impl Isolate {
 
 /// The frame view of the agent's execution contexts: innermost first, at most
 /// `limit` of them.
-pub(crate) fn stack_frames(agent: &Agent, limit: usize) -> Vec<StackFrame> {
+pub fn stack_frames(agent: &Agent, limit: usize) -> Vec<StackFrame> {
     let mut frames = Vec::new();
     agent.for_each_frame(|context| {
         if frames.len() == limit {

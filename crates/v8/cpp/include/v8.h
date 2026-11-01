@@ -1049,6 +1049,72 @@ class Message {
   int end_;
 };
 
+/* One captured call frame (`v8::StackFrame`): the innermost frame of a stack a
+ * host captured with `StackTrace::CurrentStackTrace`. The names are roots, so a
+ * frame outlives the scope it was captured in (like `Message`'s strings). */
+class StackFrame {
+ public:
+  /* The 1-based line, 0 when the engine has none. */
+  int GetLineNumber() const { return line_; }
+  /* The 1-based column, 0 when the engine has none. */
+  int GetColumnNumber() const { return column_; }
+  /* The script's id, 0 when the code carries none (a classic script has no
+   * per-script identity in this engine yet, which the inspector's
+   * `Debugger.scriptParsed` needs and has not got). */
+  int GetScriptId() const { return static_cast<int>(script_id_); }
+  Local<String> GetScriptName() const;
+  Local<String> GetScriptNameOrSourceURL() const { return GetScriptName(); }
+  Local<String> GetFunctionName() const;
+
+ private:
+  friend class StackTrace;
+  StackFrame(uint32_t script_id, int line, int column, uint64_t function_name,
+             uint64_t script_name);
+  ~StackFrame();
+  StackFrame(const StackFrame&) = delete;
+  StackFrame& operator=(const StackFrame&) = delete;
+
+  uint32_t script_id_;
+  int line_;
+  int column_;
+  uint64_t function_name_;
+  uint64_t script_name_;
+};
+
+enum StackTraceOptions { kOverview = 0, kDetailed = 1 };
+
+/* The running stack as data (`v8::StackTrace`): what an inspector's
+ * `Debugger.paused` and `Runtime.exceptionThrown` carry, where
+ * `TryCatch::StackTrace` only answers a rendered string. */
+class StackTrace {
+ public:
+  /* Capture the running stack, innermost first, at most `frame_limit` frames.
+   * Empty outside any entered context. */
+  static Local<StackTrace> CurrentStackTrace(
+      Isolate* isolate, int frame_limit,
+      StackTraceOptions options = StackTraceOptions::kOverview);
+  int GetFrameCount() const { return static_cast<int>(frames_.size()); }
+  Local<StackFrame> GetFrame(uint32_t index) const;
+  /* The name of the script the innermost frame runs (`v8::Script`'s own). */
+  static Local<String> CurrentScriptNameOrSourceURL(Isolate* isolate) {
+    Local<StackTrace> trace = CurrentStackTrace(isolate, 1);
+    if (trace.IsEmpty() || trace->GetFrameCount() == 0) {
+      return Local<String>();
+    }
+    return trace->GetFrame(0)->GetScriptName();
+  }
+
+ private:
+  explicit StackTrace(std::vector<StackFrame*> frames);
+  ~StackTrace();
+  StackTrace(const StackTrace&) = delete;
+  StackTrace& operator=(const StackTrace&) = delete;
+
+  /* Each frame is its own heap object (a `Local<StackFrame>` is a handle over
+   * it), so a host can hold one after the trace's own handle is gone. */
+  std::vector<StackFrame*> frames_;
+};
+
 class Script {
   public:
   static MaybeLocal<Script> Compile(Local<Context> context,

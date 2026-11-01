@@ -276,6 +276,13 @@ impl CallbackWindow {
         CALLBACK_WINDOW.with(|slot| slot.get()) as *const std::ffi::c_void
     }
 
+    /// The agent whose window this is. A reading helper that needs the agent
+    /// (a stack capture) reads it here rather than borrowing the context, which
+    /// is what the operation that entered the window holds.
+    pub fn agent(&self) -> crux::function::AgentPtr {
+        self.agent
+    }
+
     /// An ordinary object in the running realm (the re-entrant counterpart of
     /// [`Context::create_object`]).
     pub fn create_object(&self) -> Result<JsObject, JsError> {

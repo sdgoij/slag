@@ -537,6 +537,29 @@ uint32_t slag_context_realm(SlagContext* context);
  * answering the realm to restore (`v8::Context::Scope`). */
 uint32_t slag_context_enter(SlagContext* context);
 void slag_context_leave(uint32_t realm);
+
+/* One captured call frame (`v8::StackFrame`): the script's id (0 when the code
+ * carries none), the 1-based line and 1-based column (0 when unknown), and the
+ * function and script names as tagged `Value` bits (0 when the frame has
+ * none). The bits are engine strings the caller does not own. */
+typedef struct SlagStackFrame {
+  uint32_t script_id;
+  int32_t line;
+  int32_t column;
+  uint64_t function_name;
+  uint64_t script_name;
+} SlagStackFrame;
+/* How many frames the running stack has, innermost first
+ * (`v8::StackTrace::GetFrameCount`). */
+int32_t slag_stack_frame_count(SlagContext* context);
+/* Frame `index` of the running stack, innermost first, written to `out`.
+ * Answers 0 when the frame exists, 2 for a bad argument. */
+int32_t slag_stack_frame(SlagContext* context, size_t index, SlagStackFrame* out);
+/* The same inside a running host callback, where the engine is borrowed and
+ * only the callback's window can read the stack. */
+int32_t slag_callback_stack_frame_count(SlagContext* context, const void* token);
+int32_t slag_callback_stack_frame(SlagContext* context, const void* token,
+                                  size_t index, SlagStackFrame* out);
 /* A fresh null-prototype object for an isolate's default security token. */
 uint64_t slag_security_token_new(void);
 uint64_t slag_global(SlagContext* context);
