@@ -1487,32 +1487,63 @@ method because the pause loop is the host's), `V8Inspector` (`create`,
 
 What is missing, in the order it blocks A5:
 
-1. **A session is per context and a Blink group is a frame.** A frame holds a
-   main world plus an isolated world per extension, each a `v8::Context`;
-   `connect` refuses a group with more than one. The session has to own the
-   group: scripts keyed by context, the resolved breakpoint set pushed to each
-   context's agent, a stop in any of them announced once.
-2. **cppgc.** `ManagedChannel`/`Persistent`/`Visitor` come from V8's own tree,
+1. **cppgc.** `ManagedChannel`/`Persistent`/`Visitor` come from V8's own tree,
    so a replacement either ships cppgc or shims exactly the surface Blink
    touches. This is a build-integration cost, not a protocol one.
-3. **The generated protocol tree.** `wrapObject` answers a
+2. **The generated protocol tree.** `wrapObject` answers a
    `protocol::Runtime::API::RemoteObject` that Blink's generated code
    serializes, so this is the `inspector_protocol` generator (or a hand-written
    subset of its `Value`/`Serializable`/`toJson` base classes for the four
    crossing types: `Runtime.RemoteObject`, `Runtime.StackTrace`,
    `Debugger.SearchMatch`, `Debugger.Paused`).
-4. **The client callbacks** `V8StackTrace`, `exceptionThrown`, the console
+3. **The client callbacks** `V8StackTrace`, `exceptionThrown`, the console
    family, `deepSerialize`/`valueSubtype`/`descriptionForValueSubtype`,
    `isInspectableHeapObject`.
-5. **The pause loop's ownership.** V8 calls `runMessageLoopOnPause` from inside
+4. **The pause loop's ownership.** V8 calls `runMessageLoopOnPause` from inside
    the run and the resumed run's completion still reaches `Script::Run`; here
    the resume happens inside `dispatchProtocolMessage`, so the completion value
    is the only casualty and the host polls. Closing it means keeping
    `slag_debug_resume`'s answer until the `Script::Run` that started the run
    asks for it.
-6. `state()` is empty (breakpoints are the session's, so a reattach starts with
+5. `state()` is empty (breakpoints are the session's, so a reattach starts with
    none) and `setSkipAllPauses*`/`triggerPreciseCoverageDeltaUpdate` are absent:
    each would be a no-op today, and a no-op hook is worse than a missing one.
+
+**2026-11-01, the group is the session.** The first of those is closed, and it
+was the one that changed the shape rather than adding a verb. A session is now a
+*context group*: `slag_inspector_new` returns a handle, `add_context` joins the
+contexts (each gets an `executionContextId`), and `dispatch`/`poll` fan out over
+all of them. The context stores the group as an `Rc`, so `slag_compile` still
+registers its script with no handle in hand, and `SlagContext::drop` removes the
+context from the group's pointer list, which is what keeps a dispatch from
+walking a freed context. What the protocol layer grew:
+
+- `inspector::Target { id, context }`, and `Session::dispatch_group` /
+  `poll_group` / `add_script_in` over a slice of them. The single-context
+  `dispatch`/`poll`/`add_script` are the same code with one target whose id is 1,
+  so every existing test survived unchanged.
+- Script ids are the group's and each script remembers the context that
+  compiled it, so `scriptParsed` carries `executionContextId` and a stop can be
+  attributed to the world it happened in.
+- A breakpoint resolved by URL holds *every* script the URL matched, so one
+  `setBreakpointByUrl` answers a location per world, and `hitBreakpoints` only
+  lists breakpoints belonging to the world that stopped.
+- The breakpoint set is pushed to every context's agent with the script's text
+  identity, so a URL breakpoint also fires in a world that compiles the same
+  text later (V8's `breakpointResolved`), and a stop in one world cannot report
+  another's breakpoint.
+- Commands that act on a halted run (`evaluateOnCallFrame`,
+  `Runtime.getProperties`, the steps) route to the announced target, then to the
+  first parked one. `Debugger.enable`/`disable`/`pause` and the breakpoint set
+  apply to every context. A step arms only the halted context, because arming
+  every agent would make an unrelated script stop later.
+- `Runtime.evaluate` honours `contextId`; without one it means the halted
+  target, then the first.
+
+One thing is still per-group rather than per-context in a way Blink tolerates
+and a stricter host would not: `Debugger.pause` arms every context's one-shot
+ticket, because nothing clears another context's ticket, so a context that runs
+later also stops. V8 clears the request when the first pause reports.
 
 One trap worth keeping: a `Channel` callback runs inside the session's own
 call, where its state is borrowed, so `dispatchProtocolMessage` from

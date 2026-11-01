@@ -70,112 +70,47 @@ class Utf8StringBuffer final : public StringBuffer {
 /* The facade's context behind a handle. */
 inline v8::Context* ContextOf(v8::Local<v8::Context> handle) {
   if (handle.IsEmpty()) return nullptr;
-  return reinterpret_cast<v8::Context*>(
-      static_cast<uintptr_t>(handle.raw()));
+  return reinterpret_cast<v8::Context*>(static_cast<uintptr_t>(handle.raw()));
 }
 
-/* One session's channel, its context, and the protocol it drives. */
+class InspectorImpl;
+
+/* One context group: the engine session that debugs it and the contexts that
+ * joined. A group is a frame in Chromium, so its worlds are the contexts. */
+struct GroupState {
+  SlagInspector* slag = nullptr;
+  std::vector<v8::Context*> contexts;
+  /* One client per group: two sessions would share one engine's debug points. */
+  bool connected = false;
+};
+
+/* One client's session over a group: its channel, and the protocol it drives. */
 class InspectorSessionImpl final : public V8InspectorSession {
  public:
-  InspectorSessionImpl(v8::Context* context, V8Inspector::Channel* channel)
-      : context_(context), channel_(channel) {}
+  InspectorSessionImpl(InspectorImpl* owner, SlagInspector* slag,
+                       int context_group_id, V8Inspector::Channel* channel);
+  ~InspectorSessionImpl() override;
 
-  ~InspectorSessionImpl() override { stop(); }
+  void dispatchProtocolMessage(StringView message) override;
+  std::vector<uint8_t> state() override;
+  void stop() override;
+  void resume(bool setTerminateOnResume) override;
+  EvaluateResult evaluate(v8::Local<v8::Context> context, StringView expression,
+                          bool includeCommandLineAPI) override;
+  void pollEvents() override;
 
-  void dispatchProtocolMessage(StringView message) override {
-    if (context_ == nullptr) return;
-    const std::string text = Utf8Of(message);
-    const auto* bytes = reinterpret_cast<const uint8_t*>(text.data());
-    const int64_t call_id = slag_inspector_call_id(bytes, text.size());
-    SlagMessages messages{};
-    if (slag_inspector_dispatch(context_->slag(), bytes, text.size(),
-                                &messages) != 0) {
-      return;
-    }
-    Deliver(messages, call_id, /*answers_a_command=*/true);
-    slag_messages_free(&messages);
-    // A command can leave the run stopped (a resume that reaches another
-    // breakpoint, or a step), and a stop is an event, not an answer.
-    pollEvents();
-  }
-
-  void pollEvents() override {
-    if (context_ == nullptr) return;
-    SlagMessages messages{};
-    if (slag_inspector_poll(context_->slag(), &messages) != 0) return;
-    Deliver(messages, -1, /*answers_a_command=*/false);
-    slag_messages_free(&messages);
-  }
-
-  std::vector<uint8_t> state() override { return std::vector<uint8_t>(); }
-
-  void stop() override {
-    if (context_ == nullptr) return;
-    slag_inspector_close(context_->slag());
-    context_ = nullptr;
-  }
-
-  void resume(bool /*setTerminateOnResume*/) override {
-    if (context_ == nullptr) return;
-    SlagPause pause{};
-    // Only a parked run continues, and a resume with nothing parked is not an
-    // error (a client may resume after a stop it already handled).
-    if (slag_debug_paused(context_->slag(), &pause) == 1) {
-      uint64_t completion = 0;
-      slag_debug_resume(context_->slag(), &completion);
-    }
-    pollEvents();
-  }
-
-  EvaluateResult evaluate(v8::Local<v8::Context> context,
-                          StringView expression,
-                          bool /*includeCommandLineAPI*/) override {
-    EvaluateResult result;
-    if (context_ == nullptr || ContextOf(context) != context_) return result;
-    const std::string text = Utf8Of(expression);
-    uint64_t value = 0;
-    if (slag_inspector_evaluate(context_->slag(),
-                                reinterpret_cast<const uint8_t*>(text.data()),
-                                text.size(), &value) == 0) {
-      result.type = EvaluateResult::ResultType::kSuccess;
-      result.value = v8::Local<v8::Value>::New(value);
-      return result;
-    }
-    result.type = EvaluateResult::ResultType::kException;
-    // The thrown value is the result here, so the pending error is consumed:
-    // a client that reads the exception must not leave the next operation
-    // inheriting it (which is what `TryCatch`'s destructor does for its own
-    // scope).
-    uint64_t thrown = 0;
-    const bool has_value =
-        slag_pending_exception(context_->slag(), &thrown) != 0;
-    slag_clear_error(context_->slag());
-    result.value = v8::Local<v8::Value>::New(has_value ? thrown : 0);
-    return result;
-  }
+  int context_group_id() const { return context_group_id_; }
 
  private:
   /* Send the messages a call produced to the channel. A dispatch's last
    * message is the response to its command and the rest are events; a poll's
    * are all events. */
   void Deliver(const SlagMessages& messages, int64_t call_id,
-               bool answers_a_command) {
-    for (size_t index = 0; index < messages.len; ++index) {
-      const SlagProtocolMessage& message = messages.items[index];
-      const bool is_answer =
-          answers_a_command && index + 1 == messages.len;
-      auto buffer = StringBuffer::create(
-          StringView(message.ptr, message.len));
-      if (is_answer) {
-        channel_->sendResponse(static_cast<int>(call_id), std::move(buffer));
-      } else {
-        channel_->sendNotification(std::move(buffer));
-      }
-    }
-    channel_->flushProtocolNotifications();
-  }
+               bool answers_a_command);
 
-  v8::Context* context_;
+  InspectorImpl* owner_;
+  SlagInspector* slag_;
+  int context_group_id_;
   V8Inspector::Channel* channel_;
 };
 
@@ -184,20 +119,51 @@ class InspectorImpl final : public V8Inspector {
   InspectorImpl(v8::Isolate* isolate, V8InspectorClient* client)
       : isolate_(isolate), client_(client) {}
 
-  void contextCreated(const V8ContextInfo& info) override {
-    groups_[info.contextGroupId].push_back(info.context);
+  ~InspectorImpl() override {
+    for (InspectorSessionImpl* session : sessions_) session->stop();
+    for (auto& entry : groups_) {
+      if (entry.second.slag != nullptr) slag_inspector_free(entry.second.slag);
+    }
   }
 
-  void contextDestroyed(v8::Local<v8::Context> context) override {
+  InspectorImpl(const InspectorImpl&) = delete;
+  InspectorImpl& operator=(const InspectorImpl&) = delete;
+
+  void contextCreated(const V8ContextInfo& info) override {
+    v8::Context* context = ContextOf(info.context);
+    if (context == nullptr) return;
+    GroupState& group = groups_[info.contextGroupId];
+    if (group.slag == nullptr && slag_inspector_new(&group.slag) != 0) return;
+    // A context belongs to one group, so joining twice is a bug in the caller
+    // rather than something to paper over: the session would see the context
+    // in two places.
+    if (slag_inspector_add_context(group.slag, context->slag(), nullptr) == 0) {
+      group.contexts.push_back(context);
+    }
+  }
+
+  void contextDestroyed(v8::Local<v8::Context> handle) override {
+    v8::Context* context = ContextOf(handle);
+    if (context == nullptr) return;
     for (auto& entry : groups_) {
-      std::vector<v8::Local<v8::Context>>& contexts = entry.second;
-      contexts.erase(std::remove(contexts.begin(), contexts.end(), context),
-                     contexts.end());
+      GroupState& group = entry.second;
+      auto found = std::find(group.contexts.begin(), group.contexts.end(),
+                             context);
+      if (found == group.contexts.end()) continue;
+      group.contexts.erase(found);
+      slag_inspector_remove_context(group.slag, context->slag());
+      return;
     }
   }
 
   void resetContextGroup(int contextGroupId) override {
-    groups_.erase(contextGroupId);
+    auto found = groups_.find(contextGroupId);
+    if (found == groups_.end()) return;
+    for (InspectorSessionImpl* session : sessions_) {
+      if (session->context_group_id() == contextGroupId) session->stop();
+    }
+    if (found->second.slag != nullptr) slag_inspector_free(found->second.slag);
+    groups_.erase(found);
   }
 
   std::unique_ptr<V8InspectorSession> connect(int contextGroupId,
@@ -205,21 +171,142 @@ class InspectorImpl final : public V8Inspector {
                                               StringView /*state*/) override {
     if (channel == nullptr) return nullptr;
     auto found = groups_.find(contextGroupId);
-    if (found == groups_.end() || found->second.size() != 1) return nullptr;
-    v8::Context* context = ContextOf(found->second.front());
-    if (context == nullptr) return nullptr;
-    // A second session on one context would have to share the engine's single
-    // debugger, and the protocol session owns it: the engine's breakpoint set
-    // is per agent, so two clients would overwrite each other's.
-    if (slag_inspector_open(context->slag()) != 0) return nullptr;
-    return std::make_unique<InspectorSessionImpl>(context, channel);
+    if (found == groups_.end() || found->second.slag == nullptr) return nullptr;
+    if (found->second.connected) return nullptr;
+    if (slag_inspector_open(found->second.slag) != 0) return nullptr;
+    found->second.connected = true;
+    return std::make_unique<InspectorSessionImpl>(this, found->second.slag,
+                                                  contextGroupId, channel);
+  }
+
+  void AddSession(InspectorSessionImpl* session) {
+    sessions_.push_back(session);
+  }
+
+  void RemoveSession(InspectorSessionImpl* session) {
+    sessions_.erase(std::remove(sessions_.begin(), sessions_.end(), session),
+                    sessions_.end());
+  }
+
+  /* A stopped session frees its group for the next client. */
+  void SessionStopped(int contextGroupId) {
+    auto found = groups_.find(contextGroupId);
+    if (found != groups_.end()) found->second.connected = false;
   }
 
  private:
   v8::Isolate* isolate_;
   V8InspectorClient* client_;
-  std::map<int, std::vector<v8::Local<v8::Context>>> groups_;
+  std::map<int, GroupState> groups_;
+  std::vector<InspectorSessionImpl*> sessions_;
 };
+
+InspectorSessionImpl::InspectorSessionImpl(InspectorImpl* owner,
+                                           SlagInspector* slag,
+                                           int context_group_id,
+                                           V8Inspector::Channel* channel)
+    : owner_(owner),
+      slag_(slag),
+      context_group_id_(context_group_id),
+      channel_(channel) {
+  owner_->AddSession(this);
+}
+
+InspectorSessionImpl::~InspectorSessionImpl() {
+  stop();
+  owner_->RemoveSession(this);
+}
+
+void InspectorSessionImpl::dispatchProtocolMessage(StringView message) {
+  if (slag_ == nullptr) return;
+  const std::string text = Utf8Of(message);
+  const auto* bytes = reinterpret_cast<const uint8_t*>(text.data());
+  const int64_t call_id = slag_inspector_call_id(bytes, text.size());
+  SlagMessages messages{};
+  if (slag_inspector_dispatch(slag_, bytes, text.size(), &messages) != 0) {
+    return;
+  }
+  Deliver(messages, call_id, /*answers_a_command=*/true);
+  slag_messages_free(&messages);
+  // A command can leave a run stopped (a resume that reaches another
+  // breakpoint, or a step), and a stop is an event, not an answer.
+  pollEvents();
+}
+
+void InspectorSessionImpl::pollEvents() {
+  if (slag_ == nullptr) return;
+  SlagMessages messages{};
+  if (slag_inspector_poll(slag_, &messages) != 0) return;
+  Deliver(messages, -1, /*answers_a_command=*/false);
+  slag_messages_free(&messages);
+}
+
+std::vector<uint8_t> InspectorSessionImpl::state() {
+  return std::vector<uint8_t>();
+}
+
+void InspectorSessionImpl::stop() {
+  if (slag_ == nullptr) return;
+  slag_inspector_close(slag_);
+  slag_ = nullptr;
+  owner_->SessionStopped(context_group_id_);
+}
+
+void InspectorSessionImpl::resume(bool /*setTerminateOnResume*/) {
+  if (slag_ == nullptr) return;
+  SlagMessages messages{};
+  if (slag_inspector_resume(slag_, &messages) == 0) {
+    Deliver(messages, -1, /*answers_a_command=*/false);
+    slag_messages_free(&messages);
+  }
+  // A resume can stop again (a breakpoint further on), and that stop is an
+  // event the client learns about by polling.
+  pollEvents();
+}
+
+V8InspectorSession::EvaluateResult InspectorSessionImpl::evaluate(
+    v8::Local<v8::Context> context, StringView expression,
+    bool /*includeCommandLineAPI*/) {
+  EvaluateResult result;
+  v8::Context* target = ContextOf(context);
+  if (slag_ == nullptr || target == nullptr) return result;
+  const std::string text = Utf8Of(expression);
+  uint64_t value = 0;
+  const int32_t status =
+      slag_inspector_evaluate(slag_, target->slag(),
+                              reinterpret_cast<const uint8_t*>(text.data()),
+                              text.size(), &value);
+  if (status == 0) {
+    result.type = EvaluateResult::ResultType::kSuccess;
+    result.value = v8::Local<v8::Value>::New(value);
+    return result;
+  }
+  // 2 is the engine refusing the context (it is not in the group), which is
+  // `kNotRun`; 1 is a throw, and a throw is the result here, so the pending
+  // error is consumed the way `TryCatch`'s scope consumes one.
+  if (status != 1) return result;
+  uint64_t thrown = 0;
+  const bool has_value = slag_pending_exception(target->slag(), &thrown) != 0;
+  slag_clear_error(target->slag());
+  result.type = EvaluateResult::ResultType::kException;
+  result.value = v8::Local<v8::Value>::New(has_value ? thrown : 0);
+  return result;
+}
+
+void InspectorSessionImpl::Deliver(const SlagMessages& messages,
+                                   int64_t call_id, bool answers_a_command) {
+  for (size_t index = 0; index < messages.len; ++index) {
+    const SlagProtocolMessage& message = messages.items[index];
+    const bool is_answer = answers_a_command && index + 1 == messages.len;
+    auto buffer = StringBuffer::create(StringView(message.ptr, message.len));
+    if (is_answer) {
+      channel_->sendResponse(static_cast<int>(call_id), std::move(buffer));
+    } else {
+      channel_->sendNotification(std::move(buffer));
+    }
+  }
+  channel_->flushProtocolNotifications();
+}
 
 }  // namespace
 

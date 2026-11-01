@@ -23,9 +23,11 @@ mod handler;
 mod inspector_abi;
 
 pub use inspector_abi::{
-    SlagMessages, SlagProtocolMessage, slag_inspector_add_script, slag_inspector_call_id,
-    slag_inspector_can_dispatch, slag_inspector_close, slag_inspector_dispatch,
-    slag_inspector_evaluate, slag_inspector_open, slag_inspector_poll, slag_messages_free,
+    SlagInspector, SlagMessages, SlagProtocolMessage, slag_inspector_add_context,
+    slag_inspector_add_script, slag_inspector_call_id, slag_inspector_can_dispatch,
+    slag_inspector_close, slag_inspector_dispatch, slag_inspector_evaluate, slag_inspector_free,
+    slag_inspector_new, slag_inspector_open, slag_inspector_poll, slag_inspector_remove_context,
+    slag_inspector_resume, slag_messages_free,
 };
 
 use handler::CxxHandler;
@@ -80,11 +82,11 @@ pub struct SlagContext {
     /// and the resolving function are roots for as long as an entry exists, which
     /// is what keeps the key from ever naming another function.
     resolvers: RefCell<std::collections::HashMap<u64, Resolver>>,
-    /// The protocol session a `v8_inspector` client connected to, when one has.
-    /// It lives here rather than behind an opaque handle because a compile
-    /// registers its script with it: V8 announces `Debugger.scriptParsed` at
-    /// compilation, and `slag_compile` is the only place that sees the text.
-    inspector: RefCell<Option<inspector_abi::InspectorState>>,
+    /// The inspector group this context belongs to, when one claimed it. A group
+    /// holds raw pointers to its members, so a context removes itself in `Drop`,
+    /// and a compile reaches the session through the `Rc` rather than a handle
+    /// the host could free first.
+    group: RefCell<Option<Rc<inspector_abi::Group>>>,
 }
 
 /// One capability a `v8::Promise::Resolver` handle names: the promise it settles
@@ -101,6 +103,15 @@ impl Drop for SlagContext {
             slag_root_release(resolver.promise);
             if resolver.reject != 0 {
                 slag_root_release(resolver.reject);
+            }
+        }
+        // The group holds raw pointers to its members, so a context leaves it
+        // here: a freed context left in the list would be read by the next
+        // dispatch.
+        if let Some(group) = self.group.get_mut().take() {
+            let this = self as *const SlagContext as *mut SlagContext;
+            if let Ok(mut members) = group.contexts.try_borrow_mut() {
+                members.retain(|member| !std::ptr::eq(member.context, this));
             }
         }
     }
@@ -1108,7 +1119,7 @@ pub extern "C" fn slag_context_new(_isolate: *mut SlagIsolate) -> *mut SlagConte
                 pending_error: Rc::new(RefCell::new(None)),
                 agent,
                 resolvers: RefCell::new(std::collections::HashMap::new()),
-                inspector: RefCell::new(None),
+                group: RefCell::new(None),
             }))
         }
         Err(_) => std::ptr::null_mut(),
@@ -1186,18 +1197,12 @@ pub unsafe extern "C" fn slag_compile(
             // records it, and `Debugger.enable` replays the announcements. The
             // hook is the reason `slag_inspector_add_script` also exists: text a
             // host loads some other way is registered by hand.
-            let failed = match context.inspector.try_borrow_mut() {
-                Ok(mut guard) => match guard.as_mut() {
-                    Some(state) => match state.session.add_script(&engine, name, source) {
-                        Ok((_id, events)) => {
-                            state.pending.extend(events);
-                            None
-                        }
-                        Err(message) => Some(message),
-                    },
-                    None => None,
-                },
-                Err(_) => None,
+            let failed = match context.group.borrow().as_ref() {
+                Some(group) => {
+                    let pointer = context as *const SlagContext as *mut SlagContext;
+                    group.register_script(pointer, &engine, name, source).err()
+                }
+                None => None,
             };
             if let Some(message) = failed {
                 // The text parsed, but the body the debugger compiles for its
@@ -5483,15 +5488,27 @@ mod tests {
 
     /// The dispatcher sends a command through the same door a DevTools client
     /// does, and reads the answer the way `V8Inspector::Channel` split it.
-    unsafe fn send(context: *mut SlagContext, command: &str) -> Vec<String> {
+    unsafe fn send(inspector: *mut SlagInspector, command: &str) -> Vec<String> {
         let mut out = SlagMessages {
             items: std::ptr::null_mut(),
             len: 0,
         };
         assert_eq!(
-            slag_inspector_dispatch(context, command.as_ptr(), command.len(), &mut out),
+            slag_inspector_dispatch(inspector, command.as_ptr(), command.len(), &mut out),
             0
         );
+        let messages = messages_of(&out);
+        slag_messages_free(&mut out);
+        messages
+    }
+
+    /// The events a poll answered.
+    unsafe fn poll(inspector: *mut SlagInspector) -> Vec<String> {
+        let mut out = SlagMessages {
+            items: std::ptr::null_mut(),
+            len: 0,
+        };
+        assert_eq!(slag_inspector_poll(inspector, &mut out), 0);
         let messages = messages_of(&out);
         slag_messages_free(&mut out);
         messages
@@ -5501,14 +5518,28 @@ mod tests {
     fn a_protocol_session_announces_stops_and_resumes_them() {
         unsafe {
             let isolate = slag_isolate_new();
-            let context = slag_context_new(isolate);
+            // A group is a frame: its main world and an isolated world, each a
+            // context of its own.
+            let main = slag_context_new(isolate);
+            let world = slag_context_new(isolate);
 
-            assert_eq!(slag_inspector_open(context), 0);
+            let mut inspector = std::ptr::null_mut();
+            assert_eq!(slag_inspector_new(&mut inspector), 0);
+            let mut main_id = 0;
+            let mut world_id = 0;
+            assert_eq!(slag_inspector_add_context(inspector, main, &mut main_id), 0);
             assert_eq!(
-                slag_inspector_open(context),
-                3,
-                "one session at a time on a context"
+                slag_inspector_add_context(inspector, world, &mut world_id),
+                0
             );
+            assert_eq!((main_id, world_id), (1, 2));
+            assert_eq!(
+                slag_inspector_add_context(inspector, main, &mut main_id),
+                3,
+                "a context belongs to one group"
+            );
+            assert_eq!(slag_inspector_open(inspector), 0);
+
             assert_eq!(
                 slag_inspector_can_dispatch(b"Debugger.enable".as_ptr(), 15),
                 1
@@ -5524,92 +5555,122 @@ mod tests {
                 "an event names no command"
             );
 
-            // Enabling before any script exists is the free one.
-            let enable = send(context, "{\"id\":1,\"method\":\"Debugger.enable\"}");
+            // Enabling before any script exists is the free one, and it attaches
+            // every context of the group.
+            let enable = send(inspector, "{\"id\":1,\"method\":\"Debugger.enable\"}");
             assert_eq!(enable.len(), 1);
             assert!(enable[0].contains("\"id\":1"), "{}", enable[0]);
 
             let source: &[u8] = b"const marker = 1;\nglobalThis.hit = marker + 1;\n'end';";
             let url: &[u8] = b"app.js";
             let mut script = std::ptr::null_mut();
-            assert_eq!(
-                slag_compile(
-                    context,
-                    source.as_ptr(),
-                    source.len(),
-                    url.as_ptr(),
-                    url.len(),
-                    &mut script,
-                ),
-                0
-            );
+            let mut world_script = std::ptr::null_mut();
+            for context in [main, world] {
+                let mut compiled = std::ptr::null_mut();
+                assert_eq!(
+                    slag_compile(
+                        context,
+                        source.as_ptr(),
+                        source.len(),
+                        url.as_ptr(),
+                        url.len(),
+                        &mut compiled,
+                    ),
+                    0
+                );
+                if context == main {
+                    script = compiled;
+                } else {
+                    world_script = compiled;
+                }
+            }
 
-            // A compile queued the script's announcement; the client hears it
-            // on the next poll, which is how V8 reports `scriptParsed`.
-            let mut out = SlagMessages {
-                items: std::ptr::null_mut(),
-                len: 0,
-            };
-            assert_eq!(slag_inspector_poll(context, &mut out), 0);
-            let events = messages_of(&out);
-            slag_messages_free(&mut out);
-            assert_eq!(events.len(), 1, "{events:?}");
+            // Each compile queued its announcement, each naming the context it
+            // was compiled in: V8 reports `scriptParsed` from the compile.
+            let events = poll(inspector);
+            assert_eq!(events.len(), 2, "{events:?}");
+            assert!(events[0].contains("\"scriptId\":\"1\""), "{}", events[0]);
             assert!(
-                events[0].contains("Debugger.scriptParsed") && events[0].contains("app.js"),
+                events[0].contains("\"executionContextId\":1"),
                 "{}",
                 events[0]
             );
+            assert!(events[1].contains("\"scriptId\":\"2\""), "{}", events[1]);
+            assert!(
+                events[1].contains("\"executionContextId\":2"),
+                "{}",
+                events[1]
+            );
 
+            // One URL, compiled in both worlds: one breakpoint, two locations.
             let breakpoint = send(
-                context,
+                inspector,
                 "{\"id\":2,\"method\":\"Debugger.setBreakpointByUrl\",\"params\":\
                  {\"url\":\"app.js\",\"lineNumber\":1,\"columnNumber\":0}}",
             );
             let answer = breakpoint.last().expect("a response");
             assert!(answer.contains("breakpointId"), "{answer}");
             assert!(answer.contains("\"lineNumber\":1"), "{answer}");
+            assert_eq!(
+                answer.matches("scriptId").count(),
+                2,
+                "a location per context: {answer}"
+            );
 
             let mut value = 0;
             assert_eq!(
-                slag_script_run(context, script, &mut value),
+                slag_script_run(world, world_script, &mut value),
                 SLAG_RUN_PAUSED,
                 "the breakpoint stopped the script"
             );
 
-            assert_eq!(slag_inspector_poll(context, &mut out), 0);
-            let stopped = messages_of(&out);
-            slag_messages_free(&mut out);
+            let stopped = poll(inspector);
             assert_eq!(stopped.len(), 1, "{stopped:?}");
             assert!(stopped[0].contains("Debugger.paused"), "{}", stopped[0]);
             assert!(stopped[0].contains("callFrames"), "{}", stopped[0]);
+            assert!(
+                stopped[0].contains("\"scriptId\":\"2\""),
+                "the stop names the world's script: {}",
+                stopped[0]
+            );
 
             let evaluate = send(
-                context,
+                inspector,
                 "{\"id\":3,\"method\":\"Debugger.evaluateOnCallFrame\",\"params\":\
                  {\"callFrameId\":\"frame-1\",\"expression\":\"marker + 41\"}}",
             );
             let answer = evaluate.last().expect("a response");
             assert!(answer.contains("\"value\":42"), "{answer}");
 
-            let resume = send(context, "{\"id\":4,\"method\":\"Debugger.resume\"}");
+            let resume = send(inspector, "{\"id\":4,\"method\":\"Debugger.resume\"}");
             assert_eq!(resume.len(), 2, "resumed then the response: {resume:?}");
             assert!(resume[0].contains("Debugger.resumed"), "{}", resume[0]);
             assert!(resume[1].contains("\"id\":4"), "{}", resume[1]);
 
             // The resumed run finished inside the dispatch, so nothing is left
-            // parked for the host that started it.
+            // parked for the host that started it, in either context.
             let mut pause = SlagPause::default();
-            assert_eq!(slag_debug_paused(context, &mut pause), 0);
+            assert_eq!(slag_debug_paused(world, &mut pause), 0);
+            assert_eq!(slag_debug_paused(main, &mut pause), 0);
 
-            assert_eq!(slag_inspector_close(context), 0);
+            assert_eq!(slag_inspector_close(inspector), 0);
             assert_eq!(
-                slag_inspector_close(context),
+                slag_inspector_close(inspector),
                 0,
                 "closing what is not open is a no-op"
             );
 
+            // A freed context leaves the group: the next enable must not walk a
+            // stale member.
+            slag_context_free(world);
+            assert_eq!(slag_inspector_open(inspector), 0);
+            let enable = send(inspector, "{\"id\":9,\"method\":\"Debugger.enable\"}");
+            assert!(enable.last().expect("a response").contains("\"id\":9"));
+
+            slag_inspector_free(inspector);
             slag_script_free(script);
-            slag_context_free(context);
+            slag_script_free(world_script);
+            slag_context_free(main);
             slag_isolate_free(isolate);
         }
     }

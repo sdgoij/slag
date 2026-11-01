@@ -7,17 +7,24 @@
 //! list, which the facade sends through the `V8Inspector::Channel` it was
 //! handed.
 //!
-//! The session's state lives on the context rather than behind an opaque
-//! handle, because compiling a script has to register it with the session: V8
-//! reports `Debugger.scriptParsed` when the script is compiled, and
-//! `Script::Compile` is the only place that knows the text and the origin it
-//! was compiled with.
+//! A [`Group`] is one protocol session and the contexts it debugs, which is
+//! what a CDP session spans: `V8ContextInfo` names a group, a Blink group is a
+//! frame, and each world of a frame is a context of its own. A context joins by
+//! pointer and is given an execution context id, and it is removed before the
+//! context is freed (`SlagContext::drop`), because the group holds pointers.
+//! The group keeps compiling scripts registered with it: V8 reports
+//! `Debugger.scriptParsed` when a script is compiled, and `Script::Compile` is
+//! the only place that knows the text and the origin it was compiled with.
 //!
 //! The messages a call produces keep the session's order: for a dispatch, the
 //! events first and the response to the command last, so a transport answers
 //! with the last message and notifies with the rest.
 
-use slag::{ErrorKind, JsError};
+use std::cell::{Cell, RefCell};
+use std::rc::Rc;
+
+use inspector::Target;
+use slag::{Context, ErrorKind, JsError};
 
 use crate::{SlagContext, record, reentrant, text};
 
@@ -38,22 +45,78 @@ pub struct SlagMessages {
     pub len: usize,
 }
 
-/// A context's protocol session and the events a compile queued for it.
-pub(crate) struct InspectorState {
-    pub(crate) session: inspector::Session,
-    /// `Debugger.scriptParsed` events a compile produced. A compile cannot send
-    /// a notification (it has no channel), so they wait for the next poll,
-    /// which is the call that reaches the host's.
-    pub(crate) pending: Vec<String>,
+/// One context of a group.
+pub(crate) struct Member {
+    pub(crate) context: *mut SlagContext,
+    /// The `executionContextId` the protocol names it by.
+    id: u32,
 }
 
-impl InspectorState {
-    pub(crate) fn new() -> Self {
-        Self {
-            session: inspector::Session::new(),
-            pending: Vec::new(),
-        }
+/// A context group's session: what one `V8InspectorSession` is.
+pub(crate) struct Group {
+    /// The session, or `None` until the host connects and after it disconnects.
+    session: RefCell<Option<inspector::Session>>,
+    /// The contexts that joined, in join order.
+    pub(crate) contexts: RefCell<Vec<Member>>,
+    next_id: Cell<u32>,
+    /// Protocol events a compile queued. A compile has no channel, so they wait
+    /// for the next poll, which is the call that reaches the host's.
+    pending: RefCell<Vec<String>>,
+}
+
+impl Group {
+    fn new() -> Rc<Self> {
+        Rc::new(Self {
+            session: RefCell::new(None),
+            contexts: RefCell::new(Vec::new()),
+            next_id: Cell::new(1),
+            pending: RefCell::new(Vec::new()),
+        })
     }
+
+    /// The execution context id a member was given.
+    fn execution_context_of(&self, context: *mut SlagContext) -> Option<u32> {
+        let members = self.contexts.try_borrow().ok()?;
+        members
+            .iter()
+            .find(|member| std::ptr::eq(member.context, context))
+            .map(|member| member.id)
+    }
+
+    /// Register a script a member compiled, queueing the events the session owes
+    /// its client. `Ok(None)` when there is nothing to announce: no member, no
+    /// session, or a session that is inside another call.
+    pub(crate) fn register_script(
+        &self,
+        context: *mut SlagContext,
+        engine: &Context,
+        name: &str,
+        source: &str,
+    ) -> Result<Option<u32>, String> {
+        let Some(execution_context) = self.execution_context_of(context) else {
+            return Ok(None);
+        };
+        // A compile can run inside a channel callback, where the session is
+        // already borrowed; the script still compiles and runs, it is just not
+        // announced.
+        let Ok(mut session) = self.session.try_borrow_mut() else {
+            return Ok(None);
+        };
+        let Some(session) = session.as_mut() else {
+            return Ok(None);
+        };
+        let (id, events) = session.add_script_in(execution_context, engine, name, source)?;
+        if let Ok(mut pending) = self.pending.try_borrow_mut() {
+            pending.extend(events);
+        }
+        Ok(Some(id))
+    }
+}
+
+/// The C handle on a group: shared with the contexts that joined it, so a
+/// context compiling a script reaches the session without a second pointer.
+pub struct SlagInspector {
+    group: Rc<Group>,
 }
 
 /// Hand `messages` to the caller through `out`, each as its own owned span.
@@ -93,59 +156,243 @@ unsafe fn answer(out: *mut SlagMessages, messages: Vec<String>) {
     *out = SlagMessages { items, len };
 }
 
-/// Open a protocol session on `context` (`V8Inspector::connect`). Answers 0 on
-/// success, 2 for a bad handle, and 3 when a session is already open: the state
-/// is per context, and a context group with several contexts has no group-wide
-/// session yet (see `.notes/chromium-facade.md` section 14.3).
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn slag_inspector_open(context: *mut SlagContext) -> i32 {
-    let Some(context) = context.as_ref() else {
-        return 2;
-    };
-    let Ok(mut state) = context.inspector.try_borrow_mut() else {
-        return 2;
-    };
-    if state.is_some() {
-        return 3;
+/// Record the re-entrancy error on a member, for a call that found the session
+/// already inside another one (a channel callback dispatching).
+fn refuse_reentry(group: &Group) {
+    let member = group
+        .contexts
+        .try_borrow()
+        .ok()
+        .and_then(|members| members.first().map(|member| member.context));
+    // SAFETY: a member is a live context (see `with_targets`).
+    if let Some(context) = member {
+        unsafe { reentrant(&*context) };
     }
-    *state = Some(InspectorState::new());
+}
+
+/// Run `f` with the group's targets, each engine context borrowed for the call.
+///
+/// Answers 1 with a pending error when the group or one of its engines is
+/// already borrowed, which is what a channel callback reaching back into the
+/// session would do.
+fn with_targets<R>(group: &Group, f: impl FnOnce(&mut [Target<'_>]) -> R) -> Result<R, i32> {
+    let Ok(members) = group.contexts.try_borrow() else {
+        refuse_reentry(group);
+        return Err(1);
+    };
+    let mut engines = Vec::with_capacity(members.len());
+    for member in members.iter() {
+        // SAFETY: a member is a live context. Freeing one removes it from its
+        // group first (`SlagContext::drop`), so a member pointer is never stale.
+        let context = unsafe { &*member.context };
+        let Ok(engine) = context.context.try_borrow_mut() else {
+            reentrant(context);
+            return Err(1);
+        };
+        engines.push((member.id, engine));
+    }
+    let mut targets: Vec<Target<'_>> = engines
+        .iter_mut()
+        .map(|(id, engine)| Target::new(*id, engine))
+        .collect();
+    Ok(f(&mut targets))
+}
+
+/// Create a group session (`V8Inspector::create` for one group). Answers 0 on
+/// success and 2 for a bad argument.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn slag_inspector_new(out: *mut *mut SlagInspector) -> i32 {
+    let Some(out) = out.as_mut() else {
+        return 2;
+    };
+    *out = Box::into_raw(Box::new(SlagInspector {
+        group: Group::new(),
+    }));
     0
 }
 
-/// Close the session: a parked run resumes, the engine detaches, and the script
-/// registry is dropped. Answers 0 on success (including when nothing was open),
-/// 1 with a pending error, and 2 for a bad handle.
+/// Free the handle. Every context leaves the group first, so a compile after
+/// this point finds no session. A parked run is not resumed: `close` is the
+/// call that does that, and a host frees the handle after it.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn slag_inspector_close(context: *mut SlagContext) -> i32 {
+pub unsafe extern "C" fn slag_inspector_free(inspector: *mut SlagInspector) {
+    if inspector.is_null() {
+        return;
+    }
+    let inspector = Box::from_raw(inspector);
+    let group = &inspector.group;
+    if let Ok(members) = group.contexts.try_borrow() {
+        for member in members.iter() {
+            // SAFETY: members are live contexts until they leave, and leaving
+            // takes the slot's own `Rc`, not this pointer.
+            if let Ok(mut slot) = (&*member.context).group.try_borrow_mut() {
+                *slot = None;
+            }
+        }
+    }
+    if let Ok(mut members) = group.contexts.try_borrow_mut() {
+        members.clear();
+    }
+    if let Ok(mut session) = group.session.try_borrow_mut() {
+        *session = None;
+    }
+}
+
+/// Add a context to the group, answering the execution context id it was given.
+/// Answers 0 on success, 2 for a bad handle, and 3 when the context already
+/// belongs to a group: one engine's debug points have one session.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn slag_inspector_add_context(
+    inspector: *mut SlagInspector,
+    context: *mut SlagContext,
+    out_id: *mut u32,
+) -> i32 {
+    let Some(inspector) = inspector.as_ref() else {
+        return 2;
+    };
     let Some(context) = context.as_ref() else {
         return 2;
     };
-    let Ok(mut state) = context.inspector.try_borrow_mut() else {
+    let group = &inspector.group;
+    let Ok(joined) = context.group.try_borrow() else {
+        return 2;
+    };
+    if joined.is_some() {
+        return 3;
+    }
+    drop(joined);
+    let Ok(mut members) = group.contexts.try_borrow_mut() else {
+        return 2;
+    };
+    if members
+        .iter()
+        .any(|member| std::ptr::eq(member.context, context))
+    {
+        return 3;
+    }
+    let id = group.next_id.get();
+    group.next_id.set(id + 1);
+    members.push(Member {
+        context: context as *const SlagContext as *mut SlagContext,
+        id,
+    });
+    drop(members);
+    if let Ok(mut slot) = context.group.try_borrow_mut() {
+        *slot = Some(Rc::clone(group));
+    }
+    if let Some(out_id) = out_id.as_mut() {
+        *out_id = id;
+    }
+    0
+}
+
+/// Remove a context from the group (`contextDestroyed`, or a context leaving).
+/// Answers 0 on success, 2 for a bad handle, and 3 when it is not a member.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn slag_inspector_remove_context(
+    inspector: *mut SlagInspector,
+    context: *mut SlagContext,
+) -> i32 {
+    let Some(inspector) = inspector.as_ref() else {
+        return 2;
+    };
+    let Some(context) = context.as_ref() else {
+        return 2;
+    };
+    let group = &inspector.group;
+    let Ok(mut members) = group.contexts.try_borrow_mut() else {
+        return 2;
+    };
+    let before = members.len();
+    members.retain(|member| !std::ptr::eq(member.context, context));
+    let removed = members.len() != before;
+    drop(members);
+    if !removed {
+        return 3;
+    }
+    if let Ok(mut slot) = context.group.try_borrow_mut() {
+        *slot = None;
+    }
+    0
+}
+
+/// Connect: start a session over the group's contexts. Answers 0 on success
+/// (including when one is already open), 1 with a pending error, and 2 for a
+/// bad handle.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn slag_inspector_open(inspector: *mut SlagInspector) -> i32 {
+    let Some(inspector) = inspector.as_ref() else {
+        return 2;
+    };
+    let group = &inspector.group;
+    let Ok(mut session) = group.session.try_borrow_mut() else {
+        refuse_reentry(group);
         return 1;
     };
-    if state.take().is_none() {
+    if session.is_none() {
+        *session = Some(inspector::Session::new());
+    }
+    0
+}
+
+/// Disconnect: a parked run in any context continues, every context detaches,
+/// and the script registry is dropped. Answers 0 on success (including when
+/// nothing was open), 1 with a pending error, and 2 for a bad handle.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn slag_inspector_close(inspector: *mut SlagInspector) -> i32 {
+    let Some(inspector) = inspector.as_ref() else {
+        return 2;
+    };
+    let group = &inspector.group;
+    let Ok(mut session) = group.session.try_borrow_mut() else {
+        refuse_reentry(group);
+        return 1;
+    };
+    if session.take().is_none() {
         return 0;
     }
-    drop(state);
-    let Ok(mut engine) = context.context.try_borrow_mut() else {
-        return 1;
-    };
-    let mut status = 0;
-    // A stop holds the run's activations. Closing the session must not leave
-    // the host holding a parked run that nothing can resume or report, so the
-    // run is continued before the debug points are dropped.
-    let resumed = engine.paused().is_some().then(|| engine.resume_paused());
-    if let Some(Err(error)) = resumed {
-        record(context, error);
-        status = 1;
+    drop(session);
+    if let Ok(mut pending) = group.pending.try_borrow_mut() {
+        pending.clear();
     }
-    if let Err(error) = engine.set_debug_attached(false) {
-        if status == 0 {
-            record(context, error);
+    let outcome = with_targets(group, |targets| {
+        let mut status = 0;
+        for target in targets.iter_mut() {
+            // A stop holds the run's activations. Closing the session must not
+            // leave a host holding a parked run that nothing can resume or
+            // report, so the run is continued before the points are dropped.
+            let resumed = target
+                .context
+                .paused()
+                .is_some()
+                .then(|| target.context.resume_paused());
+            if let Some(Err(error)) = resumed {
+                record_engine(group, target.id, error);
+                status = 1;
+            }
+            if let Err(error) = target.context.set_debug_attached(false) {
+                record_engine(group, target.id, error);
+                status = 1;
+            }
         }
-        status = 1;
+        status
+    });
+    outcome.unwrap_or_else(|code| code)
+}
+
+/// Record an engine error on the member `id` names, so the host reads it from
+/// the context it happened in.
+fn record_engine(group: &Group, id: u32, error: JsError) {
+    let context = group.contexts.try_borrow().ok().and_then(|members| {
+        members
+            .iter()
+            .find(|member| member.id == id)
+            .map(|member| member.context)
+    });
+    // SAFETY: a member is a live context (see `with_targets`).
+    if let Some(context) = context {
+        unsafe { record(&*context, error) };
     }
-    status
 }
 
 /// Feed one protocol message to the session, answering the events it caused and
@@ -154,86 +401,132 @@ pub unsafe extern "C" fn slag_inspector_close(context: *mut SlagContext) -> i32 
 /// a bad handle or when no session is open.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn slag_inspector_dispatch(
-    context: *mut SlagContext,
+    inspector: *mut SlagInspector,
     message: *const u8,
     len: usize,
     out: *mut SlagMessages,
 ) -> i32 {
-    let Some(context) = context.as_ref() else {
+    let Some(inspector) = inspector.as_ref() else {
         return 2;
     };
     let Ok(message) = text(message, len) else {
         return 2;
     };
-    let Ok(mut guard) = context.inspector.try_borrow_mut() else {
-        // The session is already borrowed: a channel callback reached back into
-        // it, which the facade's `Channel` contract forbids.
-        reentrant(context);
+    let group = &inspector.group;
+    let Ok(mut guard) = group.session.try_borrow_mut() else {
+        refuse_reentry(group);
         return 1;
     };
-    let Some(state) = guard.as_mut() else {
+    let Some(session) = guard.as_mut() else {
         return 2;
     };
-    let Ok(mut engine) = context.context.try_borrow_mut() else {
-        reentrant(context);
+    let Ok(messages) = with_targets(group, |targets| session.dispatch_group(targets, message))
+    else {
         return 1;
     };
-    let messages = state.session.dispatch(&mut engine, message);
-    drop(engine);
     drop(guard);
     answer(out, messages);
     0
 }
 
-/// Drain what the run produced: the `Debugger.scriptParsed` events a compile
+/// Continue a parked run in any context of the group
+/// (`V8InspectorSession::resume`), answering the events the resume produced.
+/// The command's own response is dropped: the client did not send it.
+/// Answers 0 on success, 1 with a pending error, and 2 for a bad handle or when
+/// no session is open.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn slag_inspector_resume(
+    inspector: *mut SlagInspector,
+    out: *mut SlagMessages,
+) -> i32 {
+    let Some(inspector) = inspector.as_ref() else {
+        return 2;
+    };
+    let group = &inspector.group;
+    let Ok(mut guard) = group.session.try_borrow_mut() else {
+        refuse_reentry(group);
+        return 1;
+    };
+    let Some(session) = guard.as_mut() else {
+        return 2;
+    };
+    // A dispatch answers the events it caused and then its response; the last
+    // message is that response, and a resume the client did not send has none
+    // to report.
+    let Ok(mut messages) = with_targets(group, |targets| {
+        session.dispatch_group(targets, "{\"id\":0,\"method\":\"Debugger.resume\"}")
+    }) else {
+        return 1;
+    };
+    messages.pop();
+    drop(guard);
+    answer(out, messages);
+    0
+}
+
+/// Drain what the runs produced: the `Debugger.scriptParsed` events a compile
 /// queued, then a `Debugger.paused` for a stop that has not been announced.
 /// Every message is an event. Answers 0 on success, 1 with a pending error, and
 /// 2 for a bad handle or when no session is open.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn slag_inspector_poll(
-    context: *mut SlagContext,
+    inspector: *mut SlagInspector,
     out: *mut SlagMessages,
 ) -> i32 {
-    let Some(context) = context.as_ref() else {
+    let Some(inspector) = inspector.as_ref() else {
         return 2;
     };
-    let Ok(mut guard) = context.inspector.try_borrow_mut() else {
+    let group = &inspector.group;
+    let Ok(mut guard) = group.session.try_borrow_mut() else {
+        refuse_reentry(group);
         return 1;
     };
-    let Some(state) = guard.as_mut() else {
+    let Some(session) = guard.as_mut() else {
         return 2;
     };
-    let Ok(engine) = context.context.try_borrow() else {
-        reentrant(context);
+    let Ok(stopped) = with_targets(group, |targets| session.poll_group(targets)) else {
         return 1;
     };
-    let mut messages: Vec<String> = state.pending.drain(..).collect();
-    messages.extend(state.session.poll(&engine));
-    drop(engine);
+    let mut messages: Vec<String> = match group.pending.try_borrow_mut() {
+        Ok(mut pending) => pending.drain(..).collect(),
+        Err(_) => Vec::new(),
+    };
+    messages.extend(stopped);
     drop(guard);
     answer(out, messages);
     0
 }
 
-/// Evaluate `source` in the session's context (`V8InspectorSession::evaluate`),
-/// which is how a host injects the command line API it installs. Answers 0 with
-/// the value through `out`, 1 with a pending error, and 2 for a bad handle or
-/// when no session is open.
+/// Evaluate `source` in `context` (`V8InspectorSession::evaluate`), which is how
+/// a host injects the command line API it installs. Answers 0 with the value
+/// through `out`, 1 with a pending error, and 2 for a bad handle or when the
+/// context is not a member of a connected group.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn slag_inspector_evaluate(
+    inspector: *mut SlagInspector,
     context: *mut SlagContext,
     source: *const u8,
     len: usize,
     out: *mut u64,
 ) -> i32 {
+    let Some(inspector) = inspector.as_ref() else {
+        return 2;
+    };
     let Some(context) = context.as_ref() else {
         return 2;
     };
     let Ok(source) = text(source, len) else {
         return 2;
     };
-    match context.inspector.try_borrow() {
-        Ok(state) if state.is_some() => {}
+    let group = &inspector.group;
+    if group
+        .execution_context_of(context as *const SlagContext as *mut SlagContext)
+        .is_none()
+    {
+        return 2;
+    }
+    match group.session.try_borrow() {
+        Ok(session) if session.is_some() => {}
         _ => return 2,
     }
     let Ok(mut engine) = context.context.try_borrow_mut() else {
@@ -254,6 +547,50 @@ pub unsafe extern "C" fn slag_inspector_evaluate(
     }
 }
 
+/// Register text the host did not compile through [`slag_compile`], which
+/// registers the scripts it compiles itself. The events due are queued and
+/// answered by the next [`slag_inspector_poll`]. Answers 0 on success, 1 with a
+/// pending error (the body the debugger needs did not compile), and 2 for a bad
+/// handle or a context that is not a member.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn slag_inspector_add_script(
+    inspector: *mut SlagInspector,
+    context: *mut SlagContext,
+    name: *const u8,
+    name_len: usize,
+    source: *const u8,
+    source_len: usize,
+) -> i32 {
+    let Some(inspector) = inspector.as_ref() else {
+        return 2;
+    };
+    let Some(context) = context.as_ref() else {
+        return 2;
+    };
+    let Ok(name) = text(name, name_len) else {
+        return 2;
+    };
+    let Ok(source) = text(source, source_len) else {
+        return 2;
+    };
+    let Ok(engine) = context.context.try_borrow() else {
+        reentrant(context);
+        return 1;
+    };
+    let pointer = context as *const SlagContext as *mut SlagContext;
+    match inspector
+        .group
+        .register_script(pointer, &engine, name, source)
+    {
+        Ok(Some(_)) => 0,
+        Ok(None) => 2,
+        Err(message) => {
+            record(context, JsError::new(ErrorKind::SyntaxError, message));
+            1
+        }
+    }
+}
+
 /// Whether the session answers `method` (`V8InspectorSession::canDispatchMethod`).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn slag_inspector_can_dispatch(method: *const u8, len: usize) -> i32 {
@@ -264,7 +601,7 @@ pub unsafe extern "C" fn slag_inspector_can_dispatch(method: *const u8, len: usi
 }
 
 /// The command id `message` answers, or -1 when it names none: what a transport
-/// needs to tell the answer to a command from an event.
+/// needs to tell a response from an event.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn slag_inspector_call_id(message: *const u8, len: usize) -> i64 {
     let Ok(message) = text(message, len) else {
@@ -301,54 +638,4 @@ pub unsafe extern "C" fn slag_messages_free(messages: *mut SlagMessages) {
         items: std::ptr::null_mut(),
         len: 0,
     };
-}
-
-/// Register `source` with the session under `name`, the way compiling it does.
-///
-/// The facade compiles through [`slag_compile`], which calls this itself, so
-/// this entry point is for a host that has text it did not compile here (a
-/// script it loaded as a module) and still wants it breakable. Answers 0 on
-/// success, 1 with a pending error, and 2 for a bad handle or no session.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn slag_inspector_add_script(
-    context: *mut SlagContext,
-    name: *const u8,
-    name_len: usize,
-    source: *const u8,
-    source_len: usize,
-    out: *mut SlagMessages,
-) -> i32 {
-    let Some(context) = context.as_ref() else {
-        return 2;
-    };
-    let Ok(name) = text(name, name_len) else {
-        return 2;
-    };
-    let Ok(source) = text(source, source_len) else {
-        return 2;
-    };
-    let Ok(mut guard) = context.inspector.try_borrow_mut() else {
-        return 2;
-    };
-    let Some(state) = guard.as_mut() else {
-        return 2;
-    };
-    let Ok(engine) = context.context.try_borrow() else {
-        reentrant(context);
-        return 1;
-    };
-    match state.session.add_script(&engine, name, source) {
-        Ok((_id, events)) => {
-            drop(engine);
-            drop(guard);
-            answer(out, events);
-            0
-        }
-        Err(message) => {
-            drop(engine);
-            drop(guard);
-            record(context, JsError::new(ErrorKind::SyntaxError, message));
-            1
-        }
-    }
 }

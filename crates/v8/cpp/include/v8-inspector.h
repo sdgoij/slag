@@ -174,13 +174,14 @@ class V8Inspector {
     virtual void flushProtocolNotifications() = 0;
   };
 
-  /* Connect a session to `contextGroupId`'s context.
+  /* Connect a session to `contextGroupId`'s contexts.
    *
-   * Answers null when the group is unknown, already has a session, or holds
-   * more than one context. The session is per context today, and a Blink group
-   * is a frame: one main world plus an isolated world per extension, each a
-   * `v8::Context`. Making the session group-wide is what that limitation costs
-   * (`.notes/chromium-facade.md` section 14.3). */
+   * Answers null when the group is unknown or already has a client. Every
+   * context that joined the group is part of the session, which is what a
+   * Blink group needs: a frame's main world and its isolated worlds are
+   * separate `v8::Context`s of one group. Two clients are refused because the
+   * engine's debug points and breakpoint set are per context and one session
+   * owns them. */
   virtual std::unique_ptr<V8InspectorSession> connect(
       int contextGroupId, Channel* channel,
       StringView state = StringView()) = 0;

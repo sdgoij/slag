@@ -1,12 +1,13 @@
-// A DevTools session over the inspector facade, end to end: an inspector, a
-// context group, a session with a channel, the protocol's own commands and the
+// A DevTools session over a context group, end to end: an inspector, a frame's
+// two worlds, a session with a channel, the protocol's own commands and the
 // events it answers with.
 //
 // This is the path a browser drives. Blink does not talk to the engine's debug
-// points (see `debugger.cc`); it connects a `V8InspectorSession`, sends Chrome
-// DevTools Protocol messages, and reads the events back. Everything below the
-// `v8_inspector` calls is `crates/inspector`, which is also what a Rust host
-// uses.
+// points (see `debugger.cc`); it connects a `V8InspectorSession` for a frame,
+// sends Chrome DevTools Protocol messages, and reads the events back. A frame
+// is a context group and each of its worlds is a context, so the same URL
+// compiles twice and one breakpoint covers both. Everything below the
+// `v8_inspector` calls is `crates/inspector`.
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -50,12 +51,14 @@ namespace {
 
 const char kUrl[] = "app.js";
 
-// `marker` is a script-level `const`, so the stop's frame is the script's own
-// and the evaluation below reads a slot of it.
+// `marker` is a script-level `const`, so each world's stop is in its own
+// script frame and the evaluation below reads a slot of it.
 const char kSource[] =
     "const marker = 41;\n"
     "globalThis.hit = marker + 1;\n"
     "globalThis.hit;";
+
+const int kGroup = 7;
 
 v8_inspector::StringView View(const char* text) {
   return v8_inspector::StringView(
@@ -104,16 +107,58 @@ class RecordingChannel final : public v8_inspector::V8Inspector::Channel {
 
 class Client final : public v8_inspector::V8InspectorClient {};
 
+// Print the events a call produced, answering whether one contains `wanted`.
+bool Drain(RecordingChannel& channel, const char* wanted) {
+  bool found = false;
+  for (const std::string& event : channel.TakeNotifications()) {
+    printf("  event: %s\n", event.c_str());
+    if (event.find(wanted) != std::string::npos) found = true;
+  }
+  return found;
+}
+
+bool Compile(v8::Isolate* isolate, v8::Local<v8::Context> context,
+             v8::Local<v8::Script>* out) {
+  v8::Context::Scope scope(context);
+  v8::Local<v8::String> source = v8::String::NewFromUtf8Literal(isolate, kSource);
+  v8::Local<v8::String> name = v8::String::NewFromUtf8Literal(isolate, kUrl);
+  v8::ScriptOrigin origin(name);
+  return v8::Script::Compile(context, source, &origin).ToLocal(out);
+}
+
+// Answers null when the run completed, else the reason it did not.
+const char* RunToStop(v8::Local<v8::Context> context,
+                      v8::Local<v8::Script> script) {
+  v8::Context::Scope scope(context);
+  v8::Local<v8::Value> value;
+  if (script->Run(context).ToLocal(&value)) return "the run did not stop";
+  return context->Paused(nullptr) ? nullptr : "the run failed";
+}
+
+bool Contains(const std::vector<std::pair<int, std::string>>& responses,
+              int id, const char* text) {
+  for (const auto& response : responses) {
+    if (response.first == id) {
+      printf("  response %d: %s\n", id, response.second.c_str());
+      return response.second.find(text) != std::string::npos;
+    }
+  }
+  return false;
+}
+
 // Answers null on success, or the reason the demo failed.
-const char* RunDemo(v8::Isolate* isolate, v8::Local<v8::Context> context) {
+const char* RunDemo(v8::Isolate* isolate, v8::Local<v8::Context> main_world,
+                    v8::Local<v8::Context> isolated_world) {
   Client client;
   std::unique_ptr<v8_inspector::V8Inspector> inspector =
       v8_inspector::V8Inspector::create(isolate, &client);
 
-  const int kGroup = 7;
-  v8_inspector::V8ContextInfo info(context, kGroup, View("app"));
-  info.origin = View("http://example.test");
-  inspector->contextCreated(info);
+  v8_inspector::V8ContextInfo main_info(main_world, kGroup, View("main"));
+  main_info.origin = View("http://example.test");
+  inspector->contextCreated(main_info);
+  v8_inspector::V8ContextInfo world_info(isolated_world, kGroup, View("isolated"));
+  world_info.origin = View("http://example.test");
+  inspector->contextCreated(world_info);
 
   if (!v8_inspector::V8InspectorSession::canDispatchMethod(View("Debugger.enable"))) {
     return "the session does not claim Debugger.enable";
@@ -127,117 +172,136 @@ const char* RunDemo(v8::Isolate* isolate, v8::Local<v8::Context> context) {
       inspector->connect(kGroup, &channel);
   if (!session) return "connect";
   if (inspector->connect(kGroup, &channel)) {
-    return "a second session on one context was accepted";
+    return "a second client on one group was accepted";
   }
 
-  // Enabling the debugger is what attaches the engine: until then a run
-  // carries no debug points at all.
+  // Enabling the debugger is what attaches the engine, and it attaches every
+  // context of the group: until then a run carries no debug points at all.
   session->dispatchProtocolMessage(
       View("{\"id\":1,\"method\":\"Debugger.enable\"}"));
+  if (!Contains(channel.TakeResponses(), 1, "\"result\"")) {
+    return "enable answered nothing";
+  }
+
+  v8::Local<v8::Script> main_script;
+  v8::Local<v8::Script> world_script;
+  if (!Compile(isolate, main_world, &main_script)) return "compile (main)";
+  if (!Compile(isolate, isolated_world, &world_script)) return "compile (isolated)";
+
+  // Each compile registered its script, and each announcement names the
+  // context it was compiled in; the ids are the group's, so they are 1 and 2.
+  session->pollEvents();
+  printf("compiled the same URL in both worlds:\n");
   {
-    auto answers = channel.TakeResponses();
-    if (answers.size() != 1 || answers[0].first != 1) return "enable answered nothing";
-    printf("enabled: %s\n", answers[0].second.c_str());
+    bool first = false;
+    bool second = false;
+    for (const std::string& event : channel.TakeNotifications()) {
+      printf("  event: %s\n", event.c_str());
+      if (event.find("\"scriptId\":\"1\"") != std::string::npos &&
+          event.find("\"executionContextId\":1") != std::string::npos) {
+        first = true;
+      }
+      if (event.find("\"scriptId\":\"2\"") != std::string::npos &&
+          event.find("\"executionContextId\":2") != std::string::npos) {
+        second = true;
+      }
+    }
+    if (!first || !second) return "a script was announced for the wrong world";
   }
 
-  v8::Local<v8::String> source = v8::String::NewFromUtf8Literal(isolate, kSource);
-  v8::Local<v8::String> name = v8::String::NewFromUtf8Literal(isolate, kUrl);
-  v8::ScriptOrigin origin(name);
-  v8::Local<v8::Script> script;
-  if (!v8::Script::Compile(context, source, &origin).ToLocal(&script)) {
-    return "compile";
-  }
-
-  // The compile registered the script with the session, so a URL breakpoint
-  // now has something to resolve against.
+  // One URL, compiled in both worlds: one breakpoint, one location per world.
   session->dispatchProtocolMessage(View(
       "{\"id\":2,\"method\":\"Debugger.setBreakpointByUrl\",\"params\":"
       "{\"url\":\"app.js\",\"lineNumber\":1,\"columnNumber\":0}}"));
   {
     auto answers = channel.TakeResponses();
     if (answers.size() != 1) return "the breakpoint answered nothing";
-    if (answers[0].second.find("breakpointId") == std::string::npos) {
-      return "the breakpoint resolved to no id";
-    }
     printf("breakpoint: %s\n", answers[0].second.c_str());
-  }
-  // The script announcement was queued by the compile and reached the channel
-  // with that dispatch's poll.
-  for (const std::string& event : channel.TakeNotifications()) {
-    printf("event: %s\n", event.c_str());
+    const size_t locations = answers[0].second.find("locations");
+    if (locations == std::string::npos) return "the breakpoint resolved to nothing";
+    // Two locations: one per world.
+    const std::string after = answers[0].second.substr(locations);
+    if (after.find("\"scriptId\":\"2\"") == std::string::npos) {
+      return "the breakpoint did not resolve in the second world";
+    }
   }
 
-  v8::MaybeLocal<v8::Value> ran = script->Run(context);
-  v8::Local<v8::Value> completed;
-  if (ran.ToLocal(&completed)) return "the breakpoint did not stop the run";
-  v8::Context::PauseInfo pause;
-  if (!context->Paused(&pause)) return "the run is not parked";
-
-  // The drain a host's pause loop makes: V8 announces the stop from inside the
-  // run, this facade leaves the loop to the host.
+  // The main world runs and stops on its own script.
+  if (const char* error = RunToStop(main_world, main_script)) return error;
   session->pollEvents();
   {
     auto events = channel.TakeNotifications();
-    bool announced = false;
+    bool stopped = false;
     for (const std::string& event : events) {
-      printf("event: %s\n", event.c_str());
-      if (event.find("Debugger.paused") != std::string::npos) {
-        if (event.find("callFrames") == std::string::npos) {
-          return "the stop announced no call frames";
-        }
-        announced = true;
+      if (event.find("Debugger.paused") == std::string::npos) continue;
+      printf("paused (main): %s\n", event.c_str());
+      if (event.find("\"scriptId\":\"1\"") == std::string::npos) {
+        return "the stop named the other world's script";
       }
+      stopped = true;
     }
-    if (!announced) return "the stop was not announced";
+    if (!stopped) return "the main world's stop was not announced";
   }
-
-  // `callFrameId` names one of the frames `Debugger.paused` listed: the
-  // innermost parked activation.
   session->dispatchProtocolMessage(View(
       "{\"id\":3,\"method\":\"Debugger.evaluateOnCallFrame\",\"params\":"
       "{\"callFrameId\":\"frame-1\",\"expression\":\"marker + 1\"}}"));
-  {
-    auto answers = channel.TakeResponses();
-    if (answers.size() != 1) return "the evaluation answered nothing";
-    if (answers[0].second.find("\"value\":42") == std::string::npos) {
-      return "the halted frame's binding was not in view";
-    }
-    printf("evaluated: %s\n", answers[0].second.c_str());
+  if (!Contains(channel.TakeResponses(), 3, "\"value\":42")) {
+    return "the halted frame's binding was not in view";
   }
-
-  session->dispatchProtocolMessage(
-      View("{\"id\":4,\"method\":\"Debugger.resume\"}"));
+  session->dispatchProtocolMessage(View("{\"id\":4,\"method\":\"Debugger.resume\"}"));
   {
     auto answers = channel.TakeResponses();
     if (answers.size() != 1) return "the resume answered nothing";
+    Drain(channel, "Debugger.resumed");
   }
+
+  // The isolated world runs the same text and stops on the second script.
+  if (const char* error = RunToStop(isolated_world, world_script)) return error;
+  session->pollEvents();
   {
     auto events = channel.TakeNotifications();
-    bool resumed = false;
+    bool stopped = false;
     for (const std::string& event : events) {
-      printf("event: %s\n", event.c_str());
-      if (event.find("Debugger.resumed") != std::string::npos) resumed = true;
+      if (event.find("Debugger.paused") == std::string::npos) continue;
+      printf("paused (isolated): %s\n", event.c_str());
+      if (event.find("\"scriptId\":\"2\"") == std::string::npos) {
+        return "the isolated world's stop named the first script";
+      }
+      stopped = true;
     }
-    if (!resumed) return "the resume announced nothing";
+    if (!stopped) return "the isolated world's stop was not announced";
   }
-  if (context->Paused(nullptr)) return "a resumed run must not stay parked";
+  session->dispatchProtocolMessage(View(
+      "{\"id\":5,\"method\":\"Debugger.evaluateOnCallFrame\",\"params\":"
+      "{\"callFrameId\":\"frame-1\",\"expression\":\"marker + 1\"}}"));
+  if (!Contains(channel.TakeResponses(), 5, "\"value\":42")) {
+    return "the isolated world's frame was not in view";
+  }
+  session->dispatchProtocolMessage(View("{\"id\":6,\"method\":\"Debugger.resume\"}"));
+  channel.TakeResponses();
+  Drain(channel, "Debugger.resumed");
+  if (main_world->Paused(nullptr) || isolated_world->Paused(nullptr)) {
+    return "a resumed run must not stay parked";
+  }
 
-  // A stop inside the session's own lifetime is the case the close has to
-  // clear: the run continues and the engine detaches.
+  // The other half of the surface: running a host's own script in a context it
+  // names, which is how a client installs what it exposes on the command line.
+  auto injected = session->evaluate(main_world, View("globalThis.hit"));
+  if (injected.type !=
+      v8_inspector::V8InspectorSession::EvaluateResult::ResultType::kSuccess) {
+    return "the injected evaluation did not run";
+  }
+  printf("evaluated in the main world: globalThis.hit = %d\n",
+         injected.value->Int32Value(main_world).FromMaybe(-1));
+
+  // A stop inside one session's lifetime is the case the close has to clear.
   session->stop();
-  inspector->contextDestroyed(context);
-  if (context->Paused(nullptr)) return "closing a session left the run parked";
-
-  v8::Local<v8::Value> hit;
-  v8::Local<v8::String> question =
-      v8::String::NewFromUtf8Literal(isolate, "globalThis.hit");
-  if (!v8::Script::Compile(context, question).ToLocal(&script)) {
-    return "probe compile";
+  if (main_world->Paused(nullptr) || isolated_world->Paused(nullptr)) {
+    return "closing a session left a run parked";
   }
-  if (!script->Run(context).ToLocal(&hit)) return "probe run";
-  const int32_t produced = hit->Int32Value(context).FromMaybe(0);
-  printf("after resuming, globalThis.hit = %d\n", produced);
-  if (produced != 42) return "the resumed run did not finish the statement";
+  inspector->contextDestroyed(isolated_world);
+  inspector->contextDestroyed(main_world);
+  inspector->resetContextGroup(kGroup);
   return nullptr;
 }
 
@@ -261,10 +325,12 @@ int main(int argc, char* argv[]) {
   {
     v8::Isolate::Scope isolate_scope(isolate);
     v8::HandleScope handle_scope(isolate);
-    v8::Local<v8::Context> context = v8::Context::New(isolate);
-    v8::Context::Scope context_scope(context);
+    v8::Local<v8::Context> main_world = v8::Context::New(isolate);
+    // The isolated world a browser makes for an extension or for DevTools
+    // itself: a context of the same frame, so of the same group.
+    v8::Local<v8::Context> isolated_world = v8::Context::New(isolate);
 
-    if (const char* error = RunDemo(isolate, context)) {
+    if (const char* error = RunDemo(isolate, main_world, isolated_world)) {
       fprintf(stderr, "inspector: %s\n", error);
       status = 1;
     }

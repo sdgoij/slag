@@ -20,11 +20,37 @@
 //! The host drives it as Chrome does: register each script it compiles, feed
 //! messages to [`Session::dispatch`], and ask [`Session::poll`] for the events a
 //! run produced.
+//!
+//! A session is a *context group*: the embedder groups execution contexts
+//! (Chromium groups by frame), and each world of a frame is a context of its
+//! own. [`Session::dispatch_group`] and [`Session::poll_group`] take the group's
+//! [`Target`]s, so a URL breakpoint resolves in every context that compiled the
+//! text and a stop is announced for the context it happened in. The
+//! single-context forms (`dispatch`, `poll`, `add_script`) are the same code
+//! with one target whose id is 1.
 
 use std::collections::HashMap;
 
 use serde_json::{json, Value as Json};
 use slag::{Context, JsValue};
+
+/// One execution context a session debugs, as a command sees it.
+///
+/// The protocol's session spans a *context group*: the embedder groups contexts
+/// (Chromium groups by frame), and each world of a frame is a `v8::Context` of
+/// its own. `id` is the `executionContextId` those worlds are named by, and
+/// `context` is the engine handle a command that runs code or reads a halted
+/// frame needs.
+pub struct Target<'a> {
+    pub id: u32,
+    pub context: &'a mut Context,
+}
+
+impl<'a> Target<'a> {
+    pub fn new(id: u32, context: &'a mut Context) -> Self {
+        Self { id, context }
+    }
+}
 
 /// One registered script: what the protocol's ids and URLs name.
 struct Script {
@@ -39,14 +65,32 @@ struct Script {
     /// requested position, because the engine matches a point by its own offset
     /// exactly.
     points: Vec<(u32, u32)>,
+    /// The execution context that compiled it. A group can hold the same URL in
+    /// more than one context, so this is what keeps a stop, a breakpoint and a
+    /// `scriptParsed` in the world they belong to.
+    context: u32,
 }
 
-/// A breakpoint the session set. `offset` is the engine's point; `requested` is
-/// where the host asked, which is what a `Debugger.paused` frame reports as the
-/// resolved location.
+/// A breakpoint the session set, in every script its selector resolved to: one
+/// URL can name a script compiled in more than one execution context.
 struct Breakpoint {
+    hits: Vec<Hit>,
+}
+
+/// Where a breakpoint resolved: the script and the engine's point in it.
+struct Hit {
     script_id: u32,
     offset: u32,
+}
+
+/// The stop that has been announced and not resumed.
+struct Announced {
+    target: u32,
+}
+
+/// The index of the target `id` names.
+fn target_index(targets: &[Target<'_>], id: u32) -> Option<usize> {
+    targets.iter().position(|target| target.id == id)
 }
 
 /// Why a dispatch did not produce a result.
@@ -57,14 +101,16 @@ enum DispatchError {
     Unknown,
 }
 
-/// A CDP session over one engine context.
+/// A CDP session over one context group.
 pub struct Session {
     scripts: Vec<Script>,
     breakpoints: HashMap<String, Breakpoint>,
     next_breakpoint: u64,
     enabled: bool,
-    /// The call frame id of the stop that has been announced and not resumed.
-    paused: Option<String>,
+    /// The stop that has been announced and not resumed. Two contexts can each
+    /// have a parked run; a client drives one stop at a time, so the announced
+    /// one is the target every frame-bound command applies to.
+    paused: Option<Announced>,
 }
 
 impl Default for Session {
@@ -96,6 +142,20 @@ impl Session {
         url: &str,
         source: &str,
     ) -> Result<(u32, Vec<String>), String> {
+        self.add_script_in(1, context, url, source)
+    }
+
+    /// [`add_script`](Self::add_script) for a group: `execution_context_id` is
+    /// the target that compiled the text. Script ids are the group's, so a
+    /// client's `scriptId` names the same script in `scriptParsed`,
+    /// `Debugger.paused` and `getScriptSource`.
+    pub fn add_script_in(
+        &mut self,
+        execution_context_id: u32,
+        context: &Context,
+        url: &str,
+        source: &str,
+    ) -> Result<(u32, Vec<String>), String> {
         let points = context.debug_points(source).map_err(|e| e.message)?;
         let identity = context.script_identity(source);
         let id = self.scripts.len() as u32 + 1;
@@ -105,6 +165,7 @@ impl Session {
             source: source.to_string(),
             identity,
             points,
+            context: execution_context_id,
         });
         let script = self.scripts.last().expect("just pushed");
         let events = if self.enabled {
@@ -154,17 +215,26 @@ impl Session {
         )
     }
 
-    /// Handle one protocol message, answering the response and the events it
-    /// produced (events first, as a `paused`/`resumed` pair arrives before the
-    /// response to the command that caused it).
+    /// Handle one protocol message against a single execution context.
+    ///
+    /// The answer is the events the command caused and then its response, as a
+    /// `paused`/`resumed` pair arrives before the response to the command that
+    /// caused it.
     pub fn dispatch(&mut self, context: &mut Context, message: &str) -> Vec<String> {
+        self.dispatch_group(&mut [Target::new(1, context)], message)
+    }
+
+    /// [`dispatch`](Self::dispatch) over a context group: the commands that
+    /// change engine state apply to every target, and the ones that act on a
+    /// halted run apply to the target that is parked.
+    pub fn dispatch_group(&mut self, targets: &mut [Target<'_>], message: &str) -> Vec<String> {
         let Ok(request) = serde_json::from_str::<Json>(message) else {
             return vec![error(None, -32700, "parse error")];
         };
         let id = request.get("id").cloned();
         let method = request.get("method").and_then(Json::as_str).unwrap_or("");
         let params = request.get("params").cloned().unwrap_or(Json::Null);
-        match self.handle(context, method, &params) {
+        match self.handle(targets, method, &params) {
             Ok((result, events)) => {
                 let mut out = events;
                 out.push(response(id, result));
@@ -181,25 +251,36 @@ impl Session {
         if !self.enabled || self.paused.is_some() {
             return Vec::new();
         }
-        let Some(info) = context.paused() else {
+        self.announce(1, context).unwrap_or_default()
+    }
+
+    /// [`poll`](Self::poll) over a context group: the first target with a parked
+    /// run answers, because a client drives one stop at a time.
+    pub fn poll_group(&mut self, targets: &mut [Target<'_>]) -> Vec<String> {
+        if !self.enabled || self.paused.is_some() {
             return Vec::new();
-        };
+        }
+        for target in targets.iter_mut() {
+            if let Some(events) = self.announce(target.id, target.context) {
+                return events;
+            }
+        }
+        Vec::new()
+    }
+
+    /// The `Debugger.paused` for target `id`'s parked run, when it has one.
+    fn announce(&mut self, id: u32, context: &Context) -> Option<Vec<String>> {
+        let info = context.paused()?;
         let offset = info.position.map(|span| span.start).unwrap_or(0);
-        let (stopped_script, line, column) = self.location_of(offset).unwrap_or((1, 0, 0));
+        let (stopped_script, line, column) = self.location_of(id, offset).unwrap_or((1, 0, 0));
         let reason = match info.reason {
             slag::PauseReason::Breakpoint => "breakpoint",
             slag::PauseReason::Requested => "other",
             slag::PauseReason::Step => "step",
         };
-        let hit: Vec<String> = self
-            .breakpoints
-            .iter()
-            .filter(|(_, breakpoint)| breakpoint.offset == offset)
-            .map(|(id, _)| id.clone())
-            .collect();
+        let hit = self.breakpoints_hit_at(id, offset);
         let call_frames = self.call_frames(context, stopped_script, line, column);
-        let frame = "frame-1";
-        self.paused = Some(frame.to_string());
+        self.paused = Some(Announced { target: id });
         let mut params = json!({
             "callFrames": call_frames,
             "reason": reason,
@@ -207,7 +288,61 @@ impl Session {
         if !hit.is_empty() {
             params["hitBreakpoints"] = json!(hit);
         }
-        vec![event("Debugger.paused", params)]
+        Some(vec![event("Debugger.paused", params)])
+    }
+
+    /// The breakpoints whose point is `offset` in the target `id` names: a stop
+    /// in one world must not report a breakpoint that belongs to another.
+    fn breakpoints_hit_at(&self, target: u32, offset: u32) -> Vec<String> {
+        self.breakpoints
+            .iter()
+            .filter(|(_, breakpoint)| {
+                breakpoint
+                    .hits
+                    .iter()
+                    .any(|hit| hit.offset == offset && self.in_target(hit.script_id, target))
+            })
+            .map(|(id, _)| id.clone())
+            .collect()
+    }
+
+    /// Whether the script `script_id` names was compiled by the target `target`.
+    fn in_target(&self, script_id: u32, target: u32) -> bool {
+        self.scripts
+            .iter()
+            .any(|script| script.id == script_id && script.context == target)
+    }
+
+    /// The target a command that acts on a halted run applies to: the announced
+    /// one while it is parked, else the first parked one.
+    fn stopped_index(&self, targets: &[Target<'_>]) -> Option<usize> {
+        if let Some(announced) = &self.paused {
+            if let Some(index) = target_index(targets, announced.target) {
+                if targets[index].context.paused().is_some() {
+                    return Some(index);
+                }
+            }
+        }
+        targets
+            .iter()
+            .position(|target| target.context.paused().is_some())
+    }
+
+    /// Continue every parked run in the group, answering whether there was one.
+    fn resume_all(&self, targets: &mut [Target<'_>]) -> bool {
+        let mut resumed = false;
+        for target in targets.iter_mut() {
+            if target.context.paused().is_none() {
+                continue;
+            }
+            resumed = true;
+            // A run that throws while finishing reports that to whoever started
+            // it (`Script::Run`), not to the `Debugger.resume` that continued
+            // it, so the error is not this answer's. Nothing is pending before a
+            // resume, so nothing is left pending by one.
+            let _ = target.context.resume_paused();
+        }
+        resumed
     }
 
     /// The parked activations as protocol call frames, innermost first.
@@ -422,24 +557,46 @@ impl Session {
 
     fn handle(
         &mut self,
-        context: &mut Context,
+        targets: &mut [Target<'_>],
         method: &str,
         params: &Json,
     ) -> Result<(Json, Vec<String>), DispatchError> {
         match method {
             "Runtime.enable" => Ok((json!({}), Vec::new())),
-            "Runtime.getProperties" => self.get_properties(context, params),
+            "Runtime.getProperties" => {
+                let Some(index) = self.stopped_index(targets) else {
+                    return Err(DispatchError::Protocol("no run is halted".into()));
+                };
+                self.get_properties(targets[index].context, params)
+            }
             // The object ids this session hands out name a position in the
             // parked run, not a handle it holds, so there is nothing to release.
             "Runtime.releaseObject" | "Runtime.releaseObjectGroup" => Ok((json!({}), Vec::new())),
             "Runtime.evaluate" => {
                 let expression = params["expression"].as_str().unwrap_or("");
-                Ok((evaluation(context.eval(expression)), Vec::new()))
+                // `contextId` names the target; a client that omits it means the
+                // one it is looking at, which is the halted one when there is
+                // one.
+                let index = params
+                    .get("contextId")
+                    .and_then(Json::as_u64)
+                    .and_then(|id| target_index(targets, id as u32))
+                    .or_else(|| self.stopped_index(targets))
+                    .unwrap_or(0);
+                let Some(target) = targets.get_mut(index) else {
+                    return Err(DispatchError::Protocol("no execution context".into()));
+                };
+                Ok((evaluation(target.context.eval(expression)), Vec::new()))
             }
             "Debugger.enable" => {
-                context
-                    .set_debug_attached(true)
-                    .map_err(|error| DispatchError::Protocol(error.message))?;
+                // Attaching is per engine context, and a group is what the
+                // protocol enables: a breakpoint has to be live in every world.
+                for target in targets.iter_mut() {
+                    target
+                        .context
+                        .set_debug_attached(true)
+                        .map_err(|error| DispatchError::Protocol(error.message))?;
+                }
                 self.enabled = true;
                 // A client that enables after scripts were registered expects
                 // their `scriptParsed` events then.
@@ -447,36 +604,52 @@ impl Session {
                 Ok((json!({}), events))
             }
             "Debugger.disable" => {
+                self.paused = None;
                 let mut events = Vec::new();
-                if self.paused.take().is_some() {
-                    let _ = context.resume_paused();
+                if self.resume_all(targets) {
                     events.push(event("Debugger.resumed", json!({})));
                 }
-                let _ = context.set_debug_attached(false);
+                for target in targets.iter_mut() {
+                    target
+                        .context
+                        .set_debug_attached(false)
+                        .map_err(|error| DispatchError::Protocol(error.message))?;
+                    target.context.set_script_breakpoints(&[]);
+                }
                 self.enabled = false;
                 self.breakpoints.clear();
-                context.set_breakpoints(&[]);
                 Ok((json!({}), events))
             }
-            "Debugger.setBreakpointByUrl" => self.set_breakpoint(context, params),
+            "Debugger.setBreakpointByUrl" => self.set_breakpoint(targets, params),
             "Debugger.removeBreakpoint" => {
                 let id = params["breakpointId"].as_str().unwrap_or("");
                 if self.breakpoints.remove(id).is_none() {
                     return Err(DispatchError::Protocol(format!("no breakpoint {id}")));
                 }
-                self.push_breakpoints(context);
+                self.push_breakpoints(targets);
                 Ok((json!({}), Vec::new()))
             }
             "Debugger.pause" => {
-                context.request_pause();
+                // A pause is group-wide: whichever context runs next stops. The
+                // engine's request is one-shot per context and nothing clears
+                // another context's ticket, so a context that runs later stops
+                // as well; `poll` reports the first and the client resumes the
+                // rest.
+                for target in targets.iter_mut() {
+                    target.context.request_pause();
+                }
                 Ok((json!({}), Vec::new()))
             }
             "Debugger.resume" => {
                 self.paused = None;
                 // Nothing parked is not an error: the client may resume after a
                 // stop it already handled.
-                let _ = context.resume_paused();
-                Ok((json!({}), vec![event("Debugger.resumed", json!({}))]))
+                let events = if self.resume_all(targets) {
+                    vec![event("Debugger.resumed", json!({}))]
+                } else {
+                    Vec::new()
+                };
+                Ok((json!({}), events))
             }
             "Debugger.stepOver" | "Debugger.stepInto" | "Debugger.stepOut" => {
                 let mode = match method {
@@ -484,26 +657,39 @@ impl Session {
                     "Debugger.stepOver" => slag::StepMode::Over,
                     _ => slag::StepMode::Out,
                 };
+                // A step is relative to the halted activation, so only its
+                // context is armed: arming every context would make an
+                // unrelated script stop later.
+                let Some(index) = self.stopped_index(targets) else {
+                    return Err(DispatchError::Protocol("no run is halted".into()));
+                };
+                targets[index].context.request_step(mode);
                 self.paused = None;
-                context.request_step(mode);
                 // The resume itself reports the stop it produced through the
                 // paused error; `poll` is what announces it, so a step that
                 // lands immediately emits `resumed` then `paused` in order.
-                let _ = context.resume_paused();
-                Ok((json!({}), vec![event("Debugger.resumed", json!({}))]))
+                let events = if self.resume_all(targets) {
+                    vec![event("Debugger.resumed", json!({}))]
+                } else {
+                    Vec::new()
+                };
+                Ok((json!({}), events))
             }
             "Debugger.evaluateOnCallFrame" => {
                 let expression = params["expression"].as_str().unwrap_or("");
-                // `frame-N` is the N-th parked activation, innermost first
-                // (`Debugger.paused`'s `callFrames`), or the halted one when the
-                // client names nothing.
+                // `frame-N` is the N-th parked activation of the halted target,
+                // innermost first (`Debugger.paused`'s `callFrames`), or the
+                // halted one when the client names nothing.
                 let level = params["callFrameId"]
                     .as_str()
                     .and_then(|id| id.strip_prefix("frame-"))
                     .and_then(|index| index.parse::<usize>().ok())
                     .map_or(0, |index| index.saturating_sub(1));
+                let Some(index) = self.stopped_index(targets) else {
+                    return Err(DispatchError::Protocol("no run is halted".into()));
+                };
                 Ok((
-                    evaluation(context.evaluate_paused_at(level, expression)),
+                    evaluation(targets[index].context.evaluate_paused_at(level, expression)),
                     Vec::new(),
                 ))
             }
@@ -523,60 +709,81 @@ impl Session {
 
     fn set_breakpoint(
         &mut self,
-        context: &mut Context,
+        targets: &mut [Target<'_>],
         params: &Json,
     ) -> Result<(Json, Vec<String>), DispatchError> {
         let url = params["url"].as_str().unwrap_or("");
         let line = params["lineNumber"].as_u64().unwrap_or(0) as u32;
         let column = params["columnNumber"].as_u64().unwrap_or(0) as u32;
-        let Some(script) = self.scripts.iter().find(|script| script.url == url) else {
+        // A URL can name a script in more than one execution context: a world
+        // that compiled the same text is a breakpoint in each of them.
+        let matches: Vec<(u32, String)> = self
+            .scripts
+            .iter()
+            .filter(|script| script.url == url)
+            .map(|script| (script.id, script.source.clone()))
+            .collect();
+        if matches.is_empty() {
             return Err(DispatchError::Protocol(format!("no script for {url}")));
-        };
-        let script_id = script.id;
-        let source = script.source.clone();
+        }
         let id = self.mint_breakpoint();
-        // The offset a breakpoint stops at is the first *code* position at or
-        // after the request, not the line's first character: the engine matches
-        // a debug point by the span it starts at, and a statement's span starts
-        // at its first token. That is also what makes a breakpoint inside a
-        // function body work, because the span offsets of every body are offsets
-        // into this one text.
-        let Some(offset) = code_offset_of(&source, line, column) else {
-            // Chrome allows a breakpoint with no location yet: it answers an id
-            // and no locations, and the client keeps it.
-            return Ok((json!({ "breakpointId": id, "locations": [] }), Vec::new()));
-        };
-        let (line, column) = position_of(&source, offset);
-        self.breakpoints
-            .insert(id.clone(), Breakpoint { script_id, offset });
-        self.push_breakpoints(context);
-        let locations = vec![json!({
-            "scriptId": script_id.to_string(),
-            "lineNumber": line,
-            "columnNumber": column,
-        })];
+        let mut hits = Vec::new();
+        let mut locations = Vec::new();
+        for (script_id, source) in matches {
+            // The offset a breakpoint stops at is the first *code* position at
+            // or after the request, not the line's first character: the engine
+            // matches a debug point by the span it starts at, and a statement's
+            // span starts at its first token. That is also what makes a
+            // breakpoint inside a function body work, because the span offsets
+            // of every body are offsets into this one text.
+            let Some(offset) = code_offset_of(&source, line, column) else {
+                continue;
+            };
+            let (resolved_line, resolved_column) = position_of(&source, offset);
+            hits.push(Hit { script_id, offset });
+            locations.push(json!({
+                "scriptId": script_id.to_string(),
+                "lineNumber": resolved_line,
+                "columnNumber": resolved_column,
+            }));
+        }
+        // Chrome allows a breakpoint with no location yet: it answers an id and
+        // no locations, and the client keeps it. That is also the answer when
+        // the line carries no code in any script the URL names.
+        if !hits.is_empty() {
+            self.breakpoints.insert(id.clone(), Breakpoint { hits });
+            self.push_breakpoints(targets);
+        }
         Ok((
             json!({ "breakpointId": id, "locations": locations }),
             Vec::new(),
         ))
     }
 
-    /// Hand the engine the whole set, each breakpoint with the identity of the
+    /// Hand every context the whole set, each entry with the identity of the
     /// script it resolved in: the engine matches a point by offset, so removing
     /// one breakpoint means replacing the list.
-    fn push_breakpoints(&self, context: &mut Context) {
+    fn push_breakpoints(&self, targets: &mut [Target<'_>]) {
         let pairs: Vec<(u64, u32)> = self
             .breakpoints
             .values()
-            .filter_map(|breakpoint| {
+            .flat_map(|breakpoint| breakpoint.hits.iter())
+            .filter_map(|hit| {
                 let script = self
                     .scripts
                     .iter()
-                    .find(|script| script.id == breakpoint.script_id)?;
-                Some((script.identity, breakpoint.offset))
+                    .find(|script| script.id == hit.script_id)?;
+                Some((script.identity, hit.offset))
             })
             .collect();
-        context.set_script_breakpoints(&pairs);
+        // The set is per engine context and every entry names its script by the
+        // text's identity, so each context takes all of it: a context matches
+        // the entries whose text it runs. That is the URL semantics the protocol
+        // asks for, and it is also why a script a context compiles later, after
+        // the breakpoint was resolved elsewhere, is still breakable.
+        for target in targets.iter_mut() {
+            target.context.set_script_breakpoints(&pairs);
+        }
     }
 
     fn mint_breakpoint(&mut self) -> String {
@@ -584,15 +791,16 @@ impl Session {
         format!("1:{}:0", self.next_breakpoint)
     }
 
-    /// The script and 0-based position a stop's offset belongs to: the
-    /// breakpoint at that offset if there is one, else the first script that
-    /// carries a point there.
-    fn location_of(&self, offset: u32) -> Option<(u32, u32, u32)> {
+    /// The script and 0-based position a stop's offset belongs to in the target
+    /// `target`: the breakpoint at that offset if there is one, else the first
+    /// script of that target that carries a point there.
+    fn location_of(&self, target: u32, offset: u32) -> Option<(u32, u32, u32)> {
         let at_offset = self
             .breakpoints
             .values()
-            .find(|breakpoint| breakpoint.offset == offset)
-            .map(|breakpoint| breakpoint.script_id);
+            .flat_map(|breakpoint| breakpoint.hits.iter())
+            .find(|hit| hit.offset == offset && self.in_target(hit.script_id, target))
+            .map(|hit| hit.script_id);
         if let Some(script_id) = at_offset {
             let script = self.scripts.iter().find(|script| script.id == script_id)?;
             let (line, column) = position_of(&script.source, offset);
@@ -601,6 +809,7 @@ impl Session {
         let script = self
             .scripts
             .iter()
+            .filter(|script| script.context == target)
             .find(|script| script.points.iter().any(|(start, _)| *start == offset))?;
         let (line, column) = position_of(&script.source, offset);
         Some((script.id, line, column))
@@ -720,6 +929,7 @@ fn script_parsed(script: &Script) -> String {
             "startColumn": 0,
             "endLine": end_line,
             "endColumn": end_column,
+            "executionContextId": script.context,
             "hash": "",
         }),
     )
@@ -1148,5 +1358,146 @@ mod tests {
             Some(0)
         );
         assert!(response["result"]["breakpointId"].is_string());
+    }
+
+    /// A session over two execution contexts, which is what a context group is:
+    /// a frame's main world and one isolated world, each a `v8::Context`.
+    fn group() -> (Session, Context, Context) {
+        (
+            Session::new(),
+            Context::new().expect("a context"),
+            Context::new().expect("a context"),
+        )
+    }
+
+    #[test]
+    fn one_url_in_two_contexts_resolves_and_stops_in_each() {
+        let (mut session, mut main, mut world) = group();
+        let mut targets = [Target::new(1, &mut main), Target::new(2, &mut world)];
+        // The debug points exist only while a session is attached, and the
+        // protocol is what attaches every context of the group.
+        session.dispatch_group(&mut targets, r#"{"id":0,"method":"Debugger.enable"}"#);
+        // The same text in both worlds: one URL, one breakpoint, two scripts,
+        // and the group mints the ids so a client can tell them apart.
+        let (first, _) = session
+            .add_script_in(1, targets[0].context, "app.js", SOURCE)
+            .unwrap();
+        let (second, _) = session
+            .add_script_in(2, targets[1].context, "app.js", SOURCE)
+            .unwrap();
+        assert_eq!((first, second), (1, 2));
+
+        let answer = session.dispatch_group(
+            &mut targets,
+            r#"{"id":1,"method":"Debugger.setBreakpointByUrl","params":{"url":"app.js","lineNumber":1,"columnNumber":0}}"#,
+        );
+        let response: Json = serde_json::from_str(&answer[0]).unwrap();
+        let locations = response["result"]["locations"].as_array().unwrap();
+        assert_eq!(locations.len(), 2, "one per context: {response}");
+        assert_eq!(locations[0]["scriptId"], "1");
+        assert_eq!(locations[1]["scriptId"], "2");
+
+        // A run in the second world stops on its own script, not the first's.
+        let error = targets[1]
+            .context
+            .agent_mut()
+            .run_script(SOURCE)
+            .unwrap_err();
+        assert_eq!(error.message, "execution paused at a breakpoint");
+        assert!(
+            targets[0].context.paused().is_none(),
+            "the other world's run is untouched"
+        );
+        let events = session.poll_group(&mut targets);
+        assert_eq!(events.len(), 1, "{events:?}");
+        let paused: Json = serde_json::from_str(&events[0]).unwrap();
+        assert_eq!(
+            paused["params"]["callFrames"][0]["location"]["scriptId"], "2",
+            "{paused}"
+        );
+
+        // The evaluation runs in the world that stopped.
+        let answer = session.dispatch_group(
+            &mut targets,
+            r#"{"id":2,"method":"Debugger.evaluateOnCallFrame","params":{"callFrameId":"frame-1","expression":"a + 41"}}"#,
+        );
+        let response: Json = serde_json::from_str(&answer[0]).unwrap();
+        assert_eq!(response["result"]["result"]["value"], 42.0, "{response}");
+
+        let answer = session.dispatch_group(&mut targets, r#"{"id":3,"method":"Debugger.resume"}"#);
+        let answers: Vec<Json> = answer
+            .iter()
+            .map(|text| serde_json::from_str(text).unwrap())
+            .collect();
+        assert_eq!(answers[0]["method"], "Debugger.resumed");
+        assert!(
+            targets[1].context.paused().is_none(),
+            "the resumed run finished"
+        );
+    }
+
+    #[test]
+    fn a_script_parsed_event_names_the_context_that_compiled_it() {
+        let (mut session, mut main, mut world) = group();
+        let mut targets = [Target::new(1, &mut main), Target::new(2, &mut world)];
+        session.dispatch_group(&mut targets, r#"{"id":1,"method":"Debugger.enable"}"#);
+        let (id, events) = session
+            .add_script_in(2, targets[1].context, "world.js", "globalThis.w = 1;")
+            .unwrap();
+        assert_eq!(id, 1, "script ids are the group's");
+        assert_eq!(events.len(), 1, "{events:?}");
+        let parsed: Json = serde_json::from_str(&events[0]).unwrap();
+        assert_eq!(parsed["params"]["executionContextId"], 2);
+    }
+
+    #[test]
+    fn runtime_evaluate_honours_the_context_it_names() {
+        let (mut session, mut main, mut world) = group();
+        let mut targets = [Target::new(1, &mut main), Target::new(2, &mut world)];
+        let answer = session.dispatch_group(
+            &mut targets,
+            r#"{"id":1,"method":"Runtime.evaluate","params":{"expression":"globalThis.here = 1","contextId":2}}"#,
+        );
+        assert!(answer[0].contains("\"result\""), "{answer:?}");
+        let seen = targets[0].context.eval("globalThis.here === 1").unwrap();
+        assert_eq!(
+            seen.as_boolean(),
+            Some(false),
+            "the context the command did not name is untouched"
+        );
+        let seen = targets[1].context.eval("globalThis.here === 1").unwrap();
+        assert_eq!(seen.as_boolean(), Some(true));
+    }
+
+    #[test]
+    fn a_step_arms_only_the_halted_context() {
+        let (mut session, mut main, mut world) = group();
+        let mut targets = [Target::new(1, &mut main), Target::new(2, &mut world)];
+        session.dispatch_group(&mut targets, r#"{"id":0,"method":"Debugger.enable"}"#);
+        session
+            .add_script_in(1, targets[0].context, "app.js", SOURCE)
+            .unwrap();
+        session.dispatch_group(
+            &mut targets,
+            r#"{"id":1,"method":"Debugger.setBreakpointByUrl","params":{"url":"app.js","lineNumber":1,"columnNumber":0}}"#,
+        );
+        assert!(targets[0].context.agent_mut().run_script(SOURCE).is_err());
+        assert_eq!(session.poll_group(&mut targets).len(), 1);
+
+        // The step lands on the next statement of the halted activation.
+        session.dispatch_group(&mut targets, r#"{"id":2,"method":"Debugger.stepOver"}"#);
+        let stepped: Json = serde_json::from_str(&session.poll_group(&mut targets)[0]).unwrap();
+        assert_eq!(stepped["params"]["reason"], "step", "{stepped}");
+        session.dispatch_group(&mut targets, r#"{"id":3,"method":"Debugger.resume"}"#);
+
+        // The other context was never armed, so its run passes its own points.
+        // A different text, or the breakpoint above would match it too: a URL
+        // breakpoint is the text's identity, wherever that text runs.
+        let other = "var b = 1;\nb = b + 2;\nb;\n";
+        assert!(
+            targets[1].context.agent_mut().run_script(other).is_ok(),
+            "a step in one world must not stop another"
+        );
+        assert!(session.poll_group(&mut targets).is_empty());
     }
 }
