@@ -73,6 +73,10 @@ pub fn eval_program(
     let context = agent.running_context()?.clone();
     let env = context.lexical_environment;
     let mut vm = agent.take_vm(env, strict);
+    // Only a starter that can park and resume this activation declares it
+    // parkable (`script_evaluation`'s ticket); a direct eval's body takes no
+    // ticket and therefore defers every stop inside it.
+    vm.pause_ok = agent.take_pause_ticket().unwrap_or(false);
     // Cut 16: a slotified script's declared vars live in the frame — the
     // prologue already loaded them from the global object, so no argument
     // copies are needed.
@@ -91,6 +95,29 @@ pub fn eval_program(
     } else {
         vm.start(agent, &body)
     };
+    // A stop below this activation (in a function the script called) unwinds
+    // through here as a marker: this activation parks itself too, with the call
+    // site it was performing, so the resume can deliver the callee's result
+    // into it (`resume_paused`).
+    if agent.pause_in_flight() {
+        let info = agent.pause_info();
+        let site = vm.take_pause_site();
+        // Read the context now rather than at entry: the callees' contexts are
+        // popped on the way out, so the script's own is current, and the calls
+        // it made have written their sites into it.
+        let context = agent
+            .running_context()
+            .map(|running| running.clone())
+            .unwrap_or(context);
+        agent.park_paused_level(crate::agent::PausedLevel {
+            vm,
+            body,
+            context,
+            site,
+        });
+        agent.clear_pause_in_flight();
+        return Err(crate::ir::paused_run_error(info));
+    }
     finish_script_run(agent, vm, body, context, outcome)
 }
 
@@ -101,7 +128,7 @@ pub fn eval_program(
 /// is also where a session's run comes to rest.
 fn finish_script_run(
     agent: &mut Agent,
-    vm: Box<crate::ir::Vm>,
+    mut vm: Box<crate::ir::Vm>,
     body: std::rc::Rc<crate::ir::CompiledBody>,
     context: crate::context::ExecutionContext,
     outcome: Result<crate::ir::VmOutcome, JsError>,
@@ -156,12 +183,14 @@ fn finish_script_run(
             ));
         }
         Ok(crate::ir::VmOutcome::Paused(info)) => {
-            agent.park_paused(crate::agent::PausedRun {
+            let site = vm.take_pause_site();
+            agent.park_paused_level(crate::agent::PausedLevel {
                 vm,
                 body,
-                info,
                 context,
+                site,
             });
+            agent.clear_pause_in_flight();
             return Err(crate::ir::paused_run_error(info));
         }
         Err(error) => {
@@ -180,11 +209,13 @@ fn finish_script_run(
 /// Resume the run a debug session stopped (`.notes/chromium-facade.md` section
 /// 14.4).
 ///
-/// The parked record is taken, its execution context pushed back, and the same
-/// `Vm` continues from its `ip`: a debug point has already advanced past
-/// itself, so the resumed run does not stop there again. The completion is
-/// finished exactly as the original entry would have finished it, and a second
-/// stop re-parks and reports the paused error again.
+/// The parked activation stack is taken, its contexts are pushed back, and the
+/// levels run innermost first: a debug point has already advanced `ip` past
+/// itself, so the innermost resumes at its next step, and each level's
+/// completion is delivered into the call site the level above it was
+/// performing. A throw travels the same way and starts the caller's handler
+/// search from its call step. A second stop puts the whole stack back and
+/// reports the paused error again.
 pub fn resume_paused(agent: &mut Agent) -> Result<Value, JsError> {
     let Some(run) = agent.take_paused_run() else {
         return Err(JsError::new(
@@ -193,15 +224,132 @@ pub fn resume_paused(agent: &mut Agent) -> Result<Value, JsError> {
         ));
     };
     let crate::agent::PausedRun {
-        mut vm,
-        body,
+        levels: mut parked,
         info: _,
-        context,
     } = run;
-    agent.roots.execution_context_stack.push(context.clone());
-    let outcome = vm.start(agent, &body);
-    agent.roots.execution_context_stack.pop();
-    finish_script_run(agent, vm, body, context, outcome)
+    if parked.is_empty() {
+        return Err(JsError::new(
+            ErrorKind::Error,
+            "the parked run has no activation".into(),
+        ));
+    }
+    // Every level's context goes back on the stack, outermost first: the
+    // original nesting pushed them in that order, and a resumed activation
+    // reads the same chain (the realm, the active script, a stack trace).
+    let mut pushed = 0;
+    for level in parked.iter().rev() {
+        agent
+            .roots
+            .execution_context_stack
+            .push(level.context.clone());
+        pushed += 1;
+    }
+    let mut delivery: Option<Result<Value, JsError>> = None;
+    while !parked.is_empty() {
+        let level = parked.remove(0);
+        let crate::agent::PausedLevel {
+            mut vm,
+            body,
+            context,
+            site,
+        } = level;
+        // Every parked activation was parkable when it stopped, so it still is.
+        vm.pause_ok = true;
+        match delivery.take() {
+            None => {}
+            Some(Ok(value)) => {
+                let site = site.expect("a level below the innermost has a call site");
+                vm.land_call_result(site, value);
+            }
+            Some(Err(error)) => vm.set_pending_throw(error),
+        }
+        let outcome = vm.start(agent, &body);
+        agent.roots.execution_context_stack.pop();
+        pushed -= 1;
+        let level = crate::agent::PausedLevel {
+            vm,
+            body,
+            context,
+            site,
+        };
+        // The outcome has to be judged before the level can be consumed, so the
+        // two re-park cases peel off first.
+        let stop = match &outcome {
+            Ok(crate::ir::VmOutcome::Paused(info)) => Some(*info),
+            Err(_) if agent.pause_in_flight() => Some(agent.pause_info()),
+            _ => None,
+        };
+        if let Some(info) = stop {
+            return repark_paused(agent, info, parked, level, pushed);
+        }
+        let crate::agent::PausedLevel {
+            vm, body, context, ..
+        } = level;
+        let completion = match outcome {
+            Ok(crate::ir::VmOutcome::Completed(completion)) => {
+                if parked.is_empty() {
+                    // The outermost activation: its completion is the run's.
+                    return finish_script_run(
+                        agent,
+                        vm,
+                        body,
+                        context,
+                        Ok(crate::ir::VmOutcome::Completed(completion)),
+                    );
+                }
+                delivery = Some(crate::function::finish_call_level(
+                    agent,
+                    &context.lexical_environment,
+                    completion,
+                ));
+                continue;
+            }
+            Ok(crate::ir::VmOutcome::Suspended(_)) => Err(JsError::new(
+                ErrorKind::SyntaxError,
+                "yield/await in a function a debugger stopped".into(),
+            )),
+            // `run_inner`'s driver consumes these before a body can complete; an
+            // escaped one is an internal invariant violation.
+            Ok(crate::ir::VmOutcome::TailCall(_)) => Err(JsError::new(
+                ErrorKind::TypeError,
+                "tail call escaped the driver".into(),
+            )),
+            Ok(crate::ir::VmOutcome::Call) => Err(JsError::new(
+                ErrorKind::TypeError,
+                "withdrawn call escaped the driver".into(),
+            )),
+            Ok(crate::ir::VmOutcome::Paused(_)) => Err(JsError::new(
+                ErrorKind::Error,
+                "a stop was reported twice".into(),
+            )),
+            Err(error) => Err(error),
+        };
+        delivery = Some(completion);
+    }
+    Err(JsError::new(
+        ErrorKind::Error,
+        "the parked run ran out of activations".into(),
+    ))
+}
+
+/// Put a whole activation stack back after a resume stopped again, and report
+/// the stop: the outermost park already happened, so this is the error the
+/// host's resume call returns.
+fn repark_paused(
+    agent: &mut Agent,
+    info: crate::ir::PauseInfo,
+    mut parked: Vec<crate::agent::PausedLevel>,
+    level: crate::agent::PausedLevel,
+    pushed: usize,
+) -> Result<Value, JsError> {
+    for _ in 0..pushed {
+        agent.roots.execution_context_stack.pop();
+    }
+    parked.insert(0, level);
+    agent.set_pause_info(info);
+    agent.park_paused_levels(parked);
+    agent.clear_pause_in_flight();
+    Err(crate::ir::paused_run_error(info))
 }
 
 /// The debug points a script's body carries, as `(start, end)` source offsets:
@@ -266,11 +414,18 @@ pub fn evaluate_paused(agent: &mut Agent, source: &str) -> Result<Value, JsError
                 "no paused run to evaluate on".into(),
             ));
         };
+        // The innermost level is the activation the debugger is looking at.
+        let Some(level) = run.levels.first() else {
+            return Err(JsError::new(
+                ErrorKind::Error,
+                "the parked run has no activation".into(),
+            ));
+        };
         (
-            run.context.clone(),
-            run.body.scope.clone(),
-            run.vm.frame_values(),
-            run.vm.strict,
+            level.context.clone(),
+            level.body.scope.clone(),
+            level.vm.frame_values(),
+            level.vm.strict,
         )
     };
     let Some(scope) = scope else {
@@ -353,8 +508,14 @@ fn evaluate_in_paused_env(
 
 /// Install an evaluation's slots into the halted frame it ran against.
 fn write_back_frame(agent: &Agent, values: &[Value]) {
-    if let Some(run) = agent.roots.paused.borrow_mut().as_mut() {
-        run.vm.set_frame_values(values);
+    if let Some(level) = agent
+        .roots
+        .paused
+        .borrow_mut()
+        .as_mut()
+        .and_then(|run| run.levels.first_mut())
+    {
+        level.vm.set_frame_values(values);
     }
 }
 

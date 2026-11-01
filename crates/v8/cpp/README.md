@@ -84,9 +84,18 @@ pending rather than throwing.
 - **A breakpoint is a source offset.** Resolve a (line, column) against the
 script text yourself; the facade has no script registry, so the offset set is
 per context and a session debugs one script at a time.
-- **A stop happens in the outermost activation.** A breakpoint inside a function
-that is still on the stack stops when control returns to the outermost frame;
-lifting that is the continuation-stack slice.
+- **A stop happens in the activation that hit the point.** A breakpoint inside a
+function stops there, with every activation above it parked and resumed in
+order, so the caller's call site receives the callee's result (or its throw)
+when the run continues. While a session is attached an ordinary call runs on a
+`Vm` of its own (the certified nested lane is refused), which is what makes that
+resumable; the debugger pays the funnel, not the engine.
+- **A stop the engine cannot resume defers.** A point inside a generator or
+async body, a direct eval, a module body, a bound or proxied callee, or a class
+field initializer is not honoured yet: those runs are started by machinery that
+keeps its own state outside a `Vm`, so a stop would have nowhere to resume to.
+The point waits, as it did for every nested activation before the continuation
+stack landed.
 - **`EvaluateOnPausedFrame` sees the stopped scope, frame slots included.** An
 expression and an assignment both reach a certified body's locals: the engine
 compiles the evaluation against the halted body's scope, runs it on the frame,

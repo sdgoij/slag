@@ -171,6 +171,37 @@ pub fn stack_frames(agent: &Agent, limit: usize) -> Vec<StackFrame> {
     frames
 }
 
+/// The frames of a run a debug session stopped, innermost first: one per parked
+/// activation (`.notes/chromium-facade.md` section 14.4).
+///
+/// A parked activation's own context is what names it, and the calls it made
+/// wrote their sites into it (`Vm::set_site`), so every frame but the innermost
+/// already reports where it is. The innermost is mid-body rather than at a
+/// call, so its position comes from the stop itself.
+pub fn paused_frames(agent: &Agent) -> Vec<StackFrame> {
+    let paused = agent.roots.paused.borrow();
+    let Some(run) = paused.as_ref() else {
+        return Vec::new();
+    };
+    let mut frames: Vec<StackFrame> = run
+        .levels
+        .iter()
+        .map(|level| frame_of(agent, &level.context))
+        .collect();
+    if let Some(first) = frames.first_mut()
+        && let Some(span) = run.info.position
+        && let Some(source) = run
+            .levels
+            .first()
+            .and_then(|level| level.context.source.as_ref())
+    {
+        let (line, column) = line_column_at(source.as_slice(), span.start as usize);
+        first.line = line;
+        first.column = column;
+    }
+    frames
+}
+
 /// Whether an execution context is a frame a host sees.
 ///
 /// The realm's bootstrap context is the one context with no function, no script

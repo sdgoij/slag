@@ -511,28 +511,51 @@ impl Trace for ContextStack {
 /// This is slice 1 of that conversion: the job queues, the promise tables and
 /// the generator tables. The rest of `Agent::trace_roots`'s fields follow in
 /// later slices.
-/// A run a debug session stopped at a debug point (`VmOutcome::Paused`).
+/// One activation a debug session stopped (`.notes/chromium-facade.md` section
+/// 14.4).
 ///
-/// The `Vm` is exactly what a resume needs: `run_inner` continues from its
-/// `ip`, and `body` is the body the driver was executing. It lives on
-/// [`AgentRoots`] so a collection can trace it and so the state outlives the
-/// host call that hit the stop.
-pub struct PausedRun {
+/// A stop below the outermost activation unwinds the Rust frames above it, so
+/// every activation on the way out parks itself in one of these: the `Vm` with
+/// its `ip` and stacks, the body it was running, the context it pushed, and the
+/// call site its own result goes to when the level above it resumes.
+pub(crate) struct PausedLevel {
     pub(crate) vm: Box<crate::ir::Vm>,
-    pub(crate) body: std::rc::Rc<crate::ir::CompiledBody>,
-    pub(crate) info: crate::ir::PauseInfo,
-    /// The context the run was executing under. The caller that pushed it pops
-    /// it when the paused error reaches it, so a resume has to push it back.
-    pub(crate) context: crate::context::ExecutionContext,
+    pub(crate) body: Rc<crate::ir::CompiledBody>,
+    /// The context this activation pushed. The unwinding owner pops it, so a
+    /// resume has to push it back.
+    pub(crate) context: ExecutionContext,
+    /// The call site in *this* activation that was performing the level below
+    /// it: where that level's result (or throw) lands when this one resumes.
+    /// `None` for the innermost level, whose result is the run's.
+    pub(crate) site: Option<crate::ir::PauseSite>,
 }
 
-impl Trace for PausedRun {
+impl Trace for PausedLevel {
     fn trace(&self, visit: &mut dyn FnMut(GcAny)) {
         self.vm.trace(visit);
         self.body.trace(visit);
         // The context's environments are heap values (and the only reference to
         // them once the caller that pushed it has popped it).
         self.context.trace(visit);
+    }
+}
+
+/// A run a debug session stopped (`VmOutcome::Paused`).
+///
+/// `levels` is the parked activation stack, innermost first: a breakpoint
+/// inside a called function parks the callee's activation and then every
+/// caller's on the way out, and a resume walks them back in the same order,
+/// delivering each level's result into the call site the level above it was
+/// performing. It lives on [`AgentRoots`] so a collection can trace it and so
+/// the state outlives the host call that hit the stop.
+pub struct PausedRun {
+    pub(crate) levels: Vec<PausedLevel>,
+    pub(crate) info: crate::ir::PauseInfo,
+}
+
+impl Trace for PausedRun {
+    fn trace(&self, visit: &mut dyn FnMut(GcAny)) {
+        self.levels.trace(visit);
     }
 }
 pub(crate) struct AgentRoots {
@@ -2025,12 +2048,25 @@ pub struct Agent {
     /// [`Agent::set_breakpoints`]; empty means no session breakpoints.
     pub breakpoints: RefCell<std::collections::HashSet<u32>>,
     /// How many `Vm` activations are on the native stack (`Vm::run_inner`
-    /// increments it). A pause is honored only at the outermost one
-    /// ([`Agent::at_host_depth`]): unwinding a nested activation would have to
-    /// park every frame above it, and the channel from a callee's run back to
-    /// its caller's call step is a `Result<Value, JsError>`, which cannot carry
-    /// an outcome.
+    /// increments it). Informational: parkability is decided per activation by
+    /// [`Vm::pause_ok`], because a native frame between two activations (a
+    /// builtin calling a callback) makes the inner one un-resumable however
+    /// deep the stack is.
     pub vm_depth: std::cell::Cell<usize>,
+    /// The reason and position of the stop that is parking activations right
+    /// now. Set by the debug point, taken by the innermost level's park.
+    pause_info: Cell<Option<crate::ir::PauseInfo>>,
+    /// Set while a stop's marker is unwinding: each layer that owns a `Vm` on
+    /// the way out parks it and lets the marker continue, instead of routing it
+    /// through a `catch`/`finally` as a thrown value.
+    pause_in_flight: Cell<bool>,
+    /// Declares the parkability of the activation about to start, for the
+    /// starter that can park and resume it: `Some(true)` just before the run it
+    /// names, taken by that run's owner. A `None` take means the activation is
+    /// not parkable, which is the case for every run a starter did not declare
+    /// (a generator's resumption, a module evaluation, a direct eval, the
+    /// certified nested lane).
+    pause_ticket: Cell<Option<bool>>,
     /// The heap this agent allocates in, when a host owns the arena (an
     /// isolate under the `v8` bridge). Null for a bare agent, whose heap is the
     /// thread's own.
@@ -2310,8 +2346,9 @@ impl Agent {
     /// [`crate::ir::VmOutcome::Paused`], which is an outcome rather than an
     /// error so the enclosing `catch`/`finally` do not run.
     ///
-    /// It takes effect only in the outermost activation, which is where a
-    /// session's run is parked and resumed (see [`Agent::vm_depth`]).
+    /// It takes effect at the next point of an activation the session made
+    /// parkable, and a stop inside a called function parks the caller's
+    /// activations too (see [`PausedRun`]).
     pub fn request_pause(&self) {
         self.pause_requested.set(true);
     }
@@ -2340,12 +2377,6 @@ impl Agent {
         self.breakpoints.borrow().contains(&offset)
     }
 
-    /// Whether the running activation is the outermost one, i.e. the only
-    /// frame a pause can be parked from today (see [`Agent::vm_depth`]).
-    pub(crate) fn at_host_depth(&self) -> bool {
-        self.vm_depth.get() <= 1
-    }
-
     /// The paused run this agent is holding, if any. A host that saw
     /// [`crate::ir::paused_run_error`] reads the state from here.
     pub fn paused_reason(&self) -> Option<crate::ir::PauseReason> {
@@ -2371,6 +2402,23 @@ impl Agent {
             .and_then(|run| run.info.position)
     }
 
+    /// How many activations the parked run holds, innermost first: the script's
+    /// activation plus one per call that was in progress below it. This is what
+    /// a debugger's call frame list is built from.
+    pub fn paused_depth(&self) -> usize {
+        self.roots
+            .paused
+            .borrow()
+            .as_ref()
+            .map_or(0, |run| run.levels.len())
+    }
+
+    /// The parked run's frames, innermost first (a debugger's call stack).
+    /// Empty when nothing is parked.
+    pub fn paused_frames(&self) -> Vec<crate::api::stack_trace::StackFrame> {
+        crate::api::stack_trace::paused_frames(self)
+    }
+
     /// Take the parked run. Steps 3 and 4 of the protocol (resume and frame
     /// reads) are what consume it; until then this is how a test observes that
     /// the state survived the stop.
@@ -2380,12 +2428,113 @@ impl Agent {
 
     /// Park a run that stopped at a debug point.
     ///
-    /// A second pause replaces the first: a host that ignores a paused run and
-    /// runs again drops it (the `Vm` is dropped rather than returned to the
-    /// pool), which is the debugger's bug to notice, not a state the engine can
-    /// resolve.
-    pub(crate) fn park_paused(&self, run: PausedRun) {
-        *self.roots.paused.borrow_mut() = Some(run);
+    /// Called once per activation on the way out, innermost first, so the
+    /// levels accumulate in the order a resume consumes them.
+    pub(crate) fn park_paused_level(&self, level: PausedLevel) {
+        let mut paused = self.roots.paused.borrow_mut();
+        match paused.as_mut() {
+            Some(run) => run.levels.push(level),
+            None => {
+                let info = self.pause_info.get().unwrap_or(crate::ir::PauseInfo {
+                    reason: crate::ir::PauseReason::Requested,
+                    position: None,
+                });
+                *paused = Some(PausedRun {
+                    levels: vec![level],
+                    info,
+                });
+                self.pause_info.set(None);
+            }
+        }
+    }
+
+    /// Put a whole activation stack back after a resume stopped again. The
+    /// levels arrive innermost first, as [`park_paused_level`] accumulates them.
+    pub(crate) fn park_paused_levels(&self, levels: Vec<PausedLevel>) {
+        let mut paused = self.roots.paused.borrow_mut();
+        let info = paused
+            .as_ref()
+            .map(|run| run.info)
+            .or_else(|| self.pause_info.get())
+            .unwrap_or(crate::ir::PauseInfo {
+                reason: crate::ir::PauseReason::Requested,
+                position: None,
+            });
+        self.pause_info.set(None);
+        *paused = Some(PausedRun { levels, info });
+    }
+
+    /// The reason and position the debug point is parking with.
+    pub(crate) fn set_pause_info(&self, info: crate::ir::PauseInfo) {
+        self.pause_info.set(Some(info));
+    }
+
+    /// The stop a park point is about to report, for its error message.
+    pub(crate) fn pause_info(&self) -> crate::ir::PauseInfo {
+        self.pause_info
+            .get()
+            .or_else(|| self.roots.paused.borrow().as_ref().map(|run| run.info))
+            .unwrap_or(crate::ir::PauseInfo {
+                reason: crate::ir::PauseReason::Requested,
+                position: None,
+            })
+    }
+
+    /// Whether a stop's marker is unwinding (see [`Agent::pause_in_flight`]).
+    pub(crate) fn pause_in_flight(&self) -> bool {
+        self.pause_in_flight.get()
+    }
+
+    /// Mark a stop whose activation parked itself and whose callers still have
+    /// to park theirs.
+    pub(crate) fn set_pause_in_flight(&self) {
+        self.pause_in_flight.set(true);
+    }
+
+    /// The stop reached the topmost activation: the run is parked and the
+    /// host owns it now.
+    pub(crate) fn clear_pause_in_flight(&self) {
+        self.pause_in_flight.set(false);
+    }
+
+    /// Declare the activation about to start parkable or not.
+    pub(crate) fn set_pause_ticket(&self, parkable: bool) {
+        self.pause_ticket.set(Some(parkable));
+    }
+
+    /// Take the declaration the starter made for the run that is starting.
+    pub(crate) fn take_pause_ticket(&self) -> Option<bool> {
+        self.pause_ticket.take()
+    }
+
+    /// Withdraw a declaration whose run never took it (the callee turned out to
+    /// be something other than a `Vm` activation).
+    pub(crate) fn clear_pause_ticket(&self) {
+        self.pause_ticket.set(None);
+    }
+
+    /// Whether a stopped call can be resumed by the host: the callee runs on a
+    /// `Vm` of its own that a level can own, and nothing between it and the
+    /// script's activation has state only a native frame holds.
+    ///
+    /// A generator or async body is started and resumed by its own machinery, a
+    /// class-field initializer's caller carries a depth counter outside the
+    /// `Vm`, and a cross-realm callee's context chain includes a bootstrap
+    /// context the resume would not reproduce. All of those defer their stops,
+    /// which is the same answer a point they cannot reach gives today.
+    pub(crate) fn pause_resumable_call(&self, callee: &Value) -> bool {
+        if !self.debug_attached.get() || self.realm_count.get() != 1 {
+            return false;
+        }
+        let ValueKind::Function(function) = callee.kind() else {
+            return false;
+        };
+        if !matches!(function.kind, crux::function::FunctionKind::EcmaScript) {
+            return false;
+        }
+        self.ecma_function(&function.id()).is_some_and(|data| {
+            !data.is_generator && !data.is_async && !data.class_field_initializer
+        })
     }
 
     /// Consume the request (the debug point that observed it).
@@ -2547,6 +2696,9 @@ impl Agent {
             debug_attached: std::cell::Cell::new(false),
             pause_requested: std::cell::Cell::new(false),
             vm_depth: std::cell::Cell::new(0),
+            pause_info: Cell::new(None),
+            pause_in_flight: Cell::new(false),
+            pause_ticket: Cell::new(None),
             breakpoints: RefCell::new(std::collections::HashSet::new()),
             roots: Rc::new(AgentRoots::new()),
             heap_state: std::cell::Cell::new(std::ptr::null()),

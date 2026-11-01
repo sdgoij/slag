@@ -2989,10 +2989,12 @@ fn ordinary_call(
         // so a caller from another realm sees the right constructor (mirrors
         // the slow path below).
         let result = match result {
-            Err(e) if e.value.is_none() => match crate::builtins::error::to_throwable(agent, &e) {
-                Ok(value) => Err(e.with_value(value)),
-                Err(conversion) => Err(conversion),
-            },
+            Err(e) if e.value.is_none() && !agent.pause_in_flight() => {
+                match crate::builtins::error::to_throwable(agent, &e) {
+                    Ok(value) => Err(e.with_value(value)),
+                    Err(conversion) => Err(conversion),
+                }
+            }
             other => other,
         };
         agent.roots.execution_context_stack.pop();
@@ -3109,12 +3111,15 @@ fn ordinary_call(
     })();
     // A kind-only engine error escapes the body with the function's realm
     // context still current; surface it as that realm's error object now, so
-    // a caller from another realm sees the right constructor.
+    // a caller from another realm sees the right constructor (mirrors the
+    // certified branch above). A stop's marker is not an engine error.
     let result = match result {
-        Err(e) if e.value.is_none() => match crate::builtins::error::to_throwable(agent, &e) {
-            Ok(value) => Err(e.with_value(value)),
-            Err(conversion) => Err(conversion),
-        },
+        Err(e) if e.value.is_none() && !agent.pause_in_flight() => {
+            match crate::builtins::error::to_throwable(agent, &e) {
+                Ok(value) => Err(e.with_value(value)),
+                Err(conversion) => Err(conversion),
+            }
+        }
         other => other,
     };
     agent.roots.execution_context_stack.pop();
@@ -3156,8 +3161,15 @@ fn run_compiled_body(
     this_value: Option<Value>,
     function_value: Value,
 ) -> Result<Value, JsError> {
+    // The context is read now, not at entry: a stop below this activation is
+    // parked by this call, and by then the call site has been written into this
+    // activation's context (`Vm::set_site`), which is what makes the caller's
+    // frame report the call the stop interrupted.
     let body_env = agent.running_context()?.lexical_environment;
     let mut vm = agent.take_vm(body_env, strict);
+    // The declaring call step said this activation can be parked and resumed
+    // (see `Agent::pause_resumable_call`); nothing else can be.
+    vm.pause_ok = agent.take_pause_ticket().unwrap_or(false);
     let result = run_compiled_body_on(
         agent,
         &mut vm,
@@ -3168,6 +3180,22 @@ fn run_compiled_body(
         body_env,
         false,
     );
+    // `ordinary_call` pushed this activation's context before the run and pops
+    // it after, so it is still current here; the guard only keeps a defensive
+    // path from building a level with no context.
+    if agent.pause_in_flight()
+        && let Ok(context) = agent.running_context()
+    {
+        let site = vm.take_pause_site();
+        let context = context.clone();
+        agent.park_paused_level(crate::agent::PausedLevel {
+            vm,
+            body: ir.clone(),
+            context,
+            site,
+        });
+        return result;
+    }
     agent.return_vm(vm);
     result
 }
@@ -3280,17 +3308,38 @@ pub(crate) fn run_compiled_body_on(
                 "withdrawn call escaped the driver".into(),
             ));
         }
-        Ok(VmOutcome::Paused(_)) => {
-            return Err(crate::ir::pause_without_run());
+        Ok(VmOutcome::Paused(info)) => {
+            // The stop is this activation's own: record it and let the marker
+            // unwind. The owner of this `Vm` parks the activation; nothing here
+            // may dispose the body env, because the run is not finished.
+            agent.set_pause_info(info);
+            agent.set_pause_in_flight();
+            return Err(crate::ir::pause_unwinds());
         }
         // The body env's `using` resources dispose on an abrupt error too
         // (spec 14.2.3 step 6, mirroring the walker's eval_statement_list);
-        // a throwing disposal folds into the error as a SuppressedError.
+        // a throwing disposal folds into the error as a SuppressedError. A
+        // stop's marker is not a throw: the run is parked, not over.
         Err(error) => {
+            if agent.pause_in_flight() {
+                return Err(error);
+            }
             return Err(body_error_after_disposal(agent, &body_env, error));
         }
     };
-    let result = crate::eval::dispose_env_resources(agent, &body_env, Ok(completion));
+    finish_call_level(agent, &body_env, completion)
+}
+
+/// Finish an ordinary body that ran to completion: dispose the body env's
+/// `using` resources (spec 14.2.3 step 6) and map the completion to the call
+/// result. Shared with a resumed activation, which reaches the same point with
+/// the completion its parked run produced (`eval::resume_paused`).
+pub(crate) fn finish_call_level(
+    agent: &mut Agent,
+    body_env: &crate::env::EnvRef,
+    completion: Completion,
+) -> Result<Value, JsError> {
+    let result = crate::eval::dispose_env_resources(agent, body_env, Ok(completion));
     let completion = result?;
     body_completion_to_value(completion)
 }
@@ -3778,11 +3827,19 @@ fn ordinary_construct(
                         "withdrawn call escaped the driver".into(),
                     ));
                 }
-                Ok(VmOutcome::Paused(_)) => {
+                Ok(VmOutcome::Paused(info)) => {
+                    // A constructor body is not parkable (`vm.pause_ok` is false
+                    // for it), so a stop here means the run was started by a
+                    // path that cannot resume it.
+                    agent.set_pause_info(info);
                     agent.return_vm(vm);
                     return Err(crate::ir::pause_without_run());
                 }
                 Err(error) => {
+                    if agent.pause_in_flight() {
+                        agent.return_vm(vm);
+                        return Err(error);
+                    }
                     agent.return_vm(vm);
                     return Err(body_error_after_disposal(agent, &body_env, error));
                 }
@@ -3971,11 +4028,19 @@ fn ordinary_construct(
                             "withdrawn call escaped the driver".into(),
                         ));
                     }
-                    Ok(VmOutcome::Paused(_)) => {
+                    Ok(VmOutcome::Paused(info)) => {
+                        // A constructor body is not parkable (`vm.pause_ok` is
+                        // false for it), so a stop here means the run was started
+                        // by a path that cannot resume it.
+                        agent.set_pause_info(info);
                         agent.return_vm(vm);
                         return Err(crate::ir::pause_without_run());
                     }
                     Err(error) => {
+                        if agent.pause_in_flight() {
+                            agent.return_vm(vm);
+                            return Err(error);
+                        }
                         agent.return_vm(vm);
                         return Err(body_error_after_disposal(agent, &body_env, error));
                     }

@@ -109,6 +109,11 @@ pub fn script_evaluation(
     agent.roots.execution_context_stack.push(context);
 
     let strict = script_is_strict(&script.source, &script.code);
+    // The script's activation is the run a session can always park: it is the
+    // bottom of every resumable chain (`.notes/chromium-facade.md` section
+    // 14.4), so it declares itself parkable and the calls it makes hand the
+    // declaration down. An eval body declares nothing and therefore defers.
+    agent.set_pause_ticket(agent.debug_points());
     let result = (|| -> Result<Value, JsError> {
         global_declaration_instantiation(agent, &script.code, &global_env, strict)?;
         crate::eval::eval_program(

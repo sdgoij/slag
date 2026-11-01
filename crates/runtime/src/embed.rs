@@ -5123,11 +5123,14 @@ mod tests {
             .take_paused_run()
             .expect("the state survives the stop");
         assert!(
-            run.vm.ip > 0
-                && matches!(
-                    run.body.steps[run.vm.ip - 1],
-                    crate::ir::Step::DebugCheck { .. }
-                ),
+            {
+                let level = run.levels.first().expect("the stop parked an activation");
+                level.vm.ip > 0
+                    && matches!(
+                        level.body.steps[level.vm.ip - 1],
+                        crate::ir::Step::DebugCheck { .. }
+                    )
+            },
             "the parked Vm stopped at the point it observed"
         );
         assert_eq!(
@@ -5143,11 +5146,12 @@ mod tests {
     }
 
     #[test]
-    fn a_pause_requested_inside_a_nested_call_stops_at_the_outermost_point() {
-        // The depth gate: a nested activation cannot be parked (its callee's run
-        // returns a `Value`, not an outcome), so the request waits for the
-        // outermost body's next point. The nested body therefore finishes, and
-        // the statement after the call does not run.
+    fn a_pause_requested_inside_a_called_function_stops_in_that_function() {
+        // A session runs every call on a `Vm` of its own (the certified nested
+        // lane is refused while one is attached), so a stop below the script's
+        // activation parks two levels: the callee where it stopped, and the
+        // caller's call site, which is where the callee's result lands on
+        // resume (`.notes/chromium-facade.md` section 14.4).
         let mut context = Context::new().unwrap();
         let pause_now = context
             .create_function(
@@ -5171,14 +5175,171 @@ mod tests {
             .unwrap_err();
         assert_eq!(error.message, "execution paused at the host's request");
         assert_eq!(
+            context.agent().paused_depth(),
+            2,
+            "the callee's activation and the caller's both park"
+        );
+        assert_eq!(
             context.eval("globalThis.ran").unwrap().as_boolean(),
-            Some(true),
-            "the nested body runs to its own end before the gate is consulted"
+            Some(false),
+            "the statement the request reached inside the callee has not run"
         );
         assert_eq!(
             context.eval("globalThis.after").unwrap().as_boolean(),
             Some(false),
-            "the outermost body stops at its next point"
+            "the statement after the call has not run either"
+        );
+        crate::eval::resume_paused(context.agent_mut()).unwrap();
+        assert_eq!(
+            context.eval("globalThis.ran").unwrap().as_boolean(),
+            Some(true),
+            "the callee finishes on resume"
+        );
+        assert_eq!(
+            context.eval("globalThis.after").unwrap().as_boolean(),
+            Some(true),
+            "the callee's result lands at the call site and the script continues"
+        );
+    }
+
+    #[test]
+    fn a_breakpoint_in_a_called_function_stops_there_and_report_its_position() {
+        let mut context = Context::new().unwrap();
+        context.agent_mut().set_debug_attached(true).unwrap();
+        let source = "globalThis.ran = false; \
+                      function f() { globalThis.ran = true; return 7; } \
+                      globalThis.got = f();";
+        let offset = source.find("globalThis.ran = true;").unwrap() as u32;
+        context.agent_mut().set_breakpoints(&[offset]);
+        let error = context.eval(source).unwrap_err();
+        assert_eq!(error.message, "execution paused at a breakpoint");
+        assert_eq!(
+            context.agent().paused_position().map(|span| span.start),
+            Some(offset),
+            "the stop names the statement inside the callee"
+        );
+        assert_eq!(context.agent().paused_depth(), 2);
+        assert_eq!(
+            context.eval("globalThis.ran").unwrap().as_boolean(),
+            Some(false)
+        );
+        crate::eval::resume_paused(context.agent_mut()).unwrap();
+        assert_eq!(
+            context.eval("globalThis.got").unwrap().as_number(),
+            Some(7.0),
+            "the callee's return value lands at the caller's call site"
+        );
+    }
+
+    #[test]
+    fn a_call_that_throws_after_a_resume_reaches_the_callers_handler() {
+        let mut context = Context::new().unwrap();
+        context.agent_mut().set_debug_attached(true).unwrap();
+        let source = "globalThis.caught = null; \
+                      function f() { let stop = 1; throw new Error('boom'); } \
+                      try { f(); } catch (e) { globalThis.caught = e.message; } \
+                      globalThis.done = true;";
+        let offset = source.find("let stop").unwrap() as u32;
+        context.agent_mut().set_breakpoints(&[offset]);
+        let error = context.eval(source).unwrap_err();
+        assert_eq!(error.message, "execution paused at a breakpoint");
+        crate::eval::resume_paused(context.agent_mut()).unwrap();
+        assert_eq!(
+            context
+                .eval("globalThis.caught")
+                .unwrap()
+                .as_string()
+                .map(|s| s.to_string()),
+            Some("boom".to_string()),
+            "the throw travels to the caller's handler, which was open above the call"
+        );
+        assert_eq!(
+            context.eval("globalThis.done").unwrap().as_boolean(),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn a_stop_two_calls_down_parks_every_activation() {
+        let mut context = Context::new().unwrap();
+        context.agent_mut().set_debug_attached(true).unwrap();
+        let source = "globalThis.seen = 0; \
+                      function inner() { globalThis.seen = 1; return 2; } \
+                      function outer() { return inner() + 1; } \
+                      globalThis.total = outer();";
+        let offset = source.find("globalThis.seen = 1").unwrap() as u32;
+        context.agent_mut().set_breakpoints(&[offset]);
+        let error = context.eval(source).unwrap_err();
+        assert_eq!(error.message, "execution paused at a breakpoint");
+        assert_eq!(
+            context.agent().paused_depth(),
+            3,
+            "the script, the outer call and the inner call all park"
+        );
+        crate::eval::resume_paused(context.agent_mut()).unwrap();
+        assert_eq!(
+            context.eval("globalThis.total").unwrap().as_number(),
+            Some(3.0),
+            "each level's result lands at the call site above it, in order"
+        );
+    }
+
+    #[test]
+    fn a_stop_two_calls_down_reports_every_parked_activation_as_a_frame() {
+        let mut context = Context::new().unwrap();
+        context.agent_mut().set_debug_attached(true).unwrap();
+        let source = "globalThis.seen = 0;\n\
+                      function inner() { globalThis.seen = 1; return 2; }\n\
+                      function outer() { return inner() + 1; }\n\
+                      globalThis.total = outer();";
+        let offset = source.find("globalThis.seen = 1").unwrap() as u32;
+        context.agent_mut().set_breakpoints(&[offset]);
+        assert!(context.eval(source).is_err());
+        let frames = context.agent().paused_frames();
+        let names: Vec<Option<&str>> = frames
+            .iter()
+            .map(|frame| frame.function_name.as_deref())
+            .collect();
+        assert_eq!(
+            names,
+            vec![Some("inner"), Some("outer"), None],
+            "the innermost activation is first and the script's own frame has no name"
+        );
+        assert_eq!(
+            (frames[0].line, frames[0].column),
+            (2, 20),
+            "the stopped frame reports where the stop is"
+        );
+        assert_eq!(
+            (frames[1].line, frames[1].column),
+            (3, 27),
+            "a caller reports the call site the stop interrupted"
+        );
+        crate::eval::resume_paused(context.agent_mut()).unwrap();
+        assert_eq!(
+            context.eval("globalThis.total").unwrap().as_number(),
+            Some(3.0)
+        );
+    }
+
+    #[test]
+    fn evaluating_at_a_stop_inside_a_callee_reads_the_callees_frame() {
+        let mut context = Context::new().unwrap();
+        context.agent_mut().set_debug_attached(true).unwrap();
+        let source = "function f() { let local = 10; globalThis.at = 1; return local; } \
+                      globalThis.result = f();";
+        let offset = source.find("globalThis.at").unwrap() as u32;
+        context.agent_mut().set_breakpoints(&[offset]);
+        assert!(context.eval(source).is_err());
+        assert_eq!(
+            context.evaluate_paused("local * 2").unwrap().as_number(),
+            Some(20.0),
+            "the halted activation is the callee, so its slots are what the expression sees"
+        );
+        crate::eval::resume_paused(context.agent_mut()).unwrap();
+        assert_eq!(
+            context.eval("globalThis.result").unwrap().as_number(),
+            Some(10.0)
         );
     }
 

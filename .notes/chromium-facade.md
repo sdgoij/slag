@@ -1424,13 +1424,15 @@ that made it possible is `eval::debug_points(source)` (exposed as
 session's setting and answers its `DebugCheck` spans, so a host can resolve a
 line before the first run and the run then reuses that body.
 
-Three limits are the session's own and visible in its answers rather than
-silent: a stop reports **one** call frame (the outermost activation, the only one
-that stops), `scopeChain` is empty and objects answer as `{"type": "object"}`
-because there is no scope or property model to read, and `Runtime.getProperties`
-is deliberately absent. Stepping answers `-32601`, as does
-`setPauseOnExceptions`: both are real protocol methods that this engine cannot
-honour yet, and a method-not-found is the honest answer until they can.
+Three limits were the session's own and visible in its answers rather than
+silent: a stop reported **one** call frame (the outermost activation, the only
+one that stopped then), `scopeChain` was empty and objects answered as
+`{"type": "object"}` because there is no scope or property model to read, and
+`Runtime.getProperties` is deliberately absent. Stepping answers `-32601`, as
+does `setPauseOnExceptions`: both are real protocol methods that this engine
+cannot honour yet, and a method-not-found is the honest answer until they can.
+The frame list is now the parked activation stack (§14.4); the scope chain and
+the property model are still open.
 
 ### 14.4 Pause and step: the protocol the compiled tiers have to agree to
 
@@ -1860,6 +1862,74 @@ position table and breakpoints, `evaluateOnCallFrame` through the
 `CallbackWindow`, and the facade's `Debugger` surface. Resuming mid-`try` also
 means the try stack, the for-of stacks and the completion registers all survived
 the park, which they do because the record is the whole `Vm`.
+
+**2026-11-01, the continuation stack landed: a stop parks every activation.**
+A breakpoint inside a called function now stops there, and the resume walks the
+parked activations innermost-first, delivering each result (or throw) into the
+call site the level above was performing. The design settled on four pieces:
+
+- **`PausedRun` is a stack of `PausedLevel`** (innermost first), each owning its
+  `Vm`, its body, the `ExecutionContext` it pushed, and the `PauseSite` its own
+  result lands at (the `arg_start`/`below` pair `complete_call` would have used).
+  `Trace` covers all four: a parked level is a GC root like a running one.
+- **Parkability is declared, not discovered.** `Vm::pause_ok` is set by the
+  starter that can park and resume the activation, from a one-shot ticket on the
+  agent (`script_evaluation` declares the script's own activation; `complete_call`
+  declares a callee that will run on a `Vm` of its own). Everything else leaves
+  it false, so a debug point there defers: that covers generator and async
+  bodies, direct evals, module bodies, bound and proxied callees, class field
+  initializers, and the certified nested lane. The old `at_host_depth` gate is
+  gone; depth alone cannot tell a callee from a callback a builtin invoked.
+- **The marker is an error nobody routes.** A stop below the outermost activation
+  unwinds Rust frames, so the layers between compose through `Result`. The
+  in-flight bit (`Agent::pause_in_flight`) is what every layer on the way out
+  checks: `run_inner_impl` skips `route_step_error` (a pause must never run a
+  `catch`/`finally`), `run_compiled_body_on` skips `using` disposal, and the
+  `to_throwable` conversions skip a marker that is not an engine error. Each
+  owner of a `Vm` on the way out parks its level (`run_compiled_body`, and
+  `eval_program` for the script's activation), and the script's activation
+  clears the bit and reports `paused_run_error`.
+- **A session gives up the certified nested lane.** `run_certified_call_nested`
+  shares the caller's `Vm` and keeps the caller's `ip` and env in native locals,
+  so it cannot be parked. While a session is attached it refuses, and every call
+  takes the pooled funnel, one `Vm` per activation. That is the cost the
+  debugger pays so the engine does not grow a second frame model.
+
+Resume reconstructs the context stack outermost-first (so a resumed activation
+sees the chain it had), runs each level with `pause_ok` restored, lands a value
+with `Vm::land_call_result` and a throw with `Vm::pending_throw` at the top of
+`run_inner_impl`'s loop, then re-enters `finish_call_level` for a call or
+`finish_script_run` for the script. A second stop puts the whole stack back with
+`park_paused_levels` and reports the paused error again.
+
+Two findings worth keeping. First, a level's context must be read at *park* time,
+not at entry: `set_site` writes the call site into the caller's context as the
+call runs, so the entry-time copy has no position and the caller's frame would
+report 0:0. Second, `paused_frames` (agent.rs → `api::stack_trace`) is the frame
+stack the inspector was missing: each level's own context names it, its calls
+wrote their sites into it, and the innermost frame's position comes from the stop
+itself.
+
+Also changed on the protocol side: a breakpoint is now resolved to the first
+*code* position at or after the request rather than snapped to a point of the
+script's own body. That is what makes a breakpoint inside a function work at all
+through the offset API, because every body's spans are offsets into the same
+text; the engine still matches a point by its own `span.start` exactly.
+
+On cost: the whole slice is inert without a session. `pause_ok` is false, no
+ticket is ever set and the in-flight bit is never raised, so the only added work
+on a production call is the one flag read at the top of
+`run_certified_call_nested` (it already reads two others there). No same-binary
+A/B was run for it, because there is no seam that turns the check on without
+attaching a session; the debugger's own cost, by contrast, is the pooled call
+funnel that a session chooses on purpose.
+
+Still open, in order: stepping (`stepOver`/`stepInto`/`stepOut`, which is the
+same machinery advanced one statement at a time, plus the step-out target), the
+`scopeChain` and `Runtime.getProperties` behind it (a scope and property model,
+not a pause question), constructs as parkable levels (a `new` whose body stops is
+deferred today, because its completion has a `this`-based mapping to apply), and
+`evaluateOnCallFrame` honouring the frame id it is given.
 
 ## 15. Sources
 

@@ -2731,6 +2731,17 @@ pub enum VmOutcome {
     Paused(PauseInfo),
 }
 
+/// Where a stopped call left its result: the call site on the caller's value
+/// stack, restored by the same truncate-and-push `complete_call` does
+/// (`.notes/chromium-facade.md` section 14.4).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PauseSite {
+    /// The first argument's index in `Vm::stack`.
+    pub(crate) arg_start: usize,
+    /// How many values below the call site the call site replaces.
+    pub(crate) below: usize,
+}
+
 /// What stopped a run: the reason and the position the session is looking at.
 #[derive(Debug, Clone, Copy)]
 pub struct PauseInfo {
@@ -2761,6 +2772,21 @@ pub(crate) fn pause_without_run() -> JsError {
     JsError::new(
         ErrorKind::Error,
         "execution paused, but this run has nowhere to park it yet".into(),
+    )
+}
+
+/// The error a stopped activation reports to the call step that was performing
+/// it, on its way out to the owner of the outermost `Vm`.
+///
+/// It is not a thrown value and must never be routed through a handler: every
+/// layer between the stop and the park point checks
+/// [`Agent::pause_in_flight`](crate::agent::Agent) and parks its own activation
+/// instead of translating the error. The message is therefore never a script's
+/// to see, and `Err` is only how the layers between compose.
+pub(crate) fn pause_unwinds() -> JsError {
+    JsError::new(
+        ErrorKind::Error,
+        "a debug session stopped an activation below this one".into(),
     )
 }
 
@@ -4483,6 +4509,20 @@ pub struct Vm {
     /// certified-callee lane) neither observes nor clobbers the caller's
     /// record, and the same-stack frame's pop restores it.
     reg_resume: Option<u32>,
+    /// Whether this activation may stop at a debug point. Only the starters
+    /// that can park and resume the activation set it (a script run, and a
+    /// call the pause ticket named); everything else leaves it false, so a
+    /// debug point there defers rather than unwinding state no one can
+    /// restore (`.notes/chromium-facade.md` section 14.4).
+    pub(crate) pause_ok: bool,
+    /// Where this activation's result goes once it resumes: the call site it
+    /// was performing when a stop below it reached `complete_call`. `None`
+    /// when nothing was called from here.
+    pause_site: Option<PauseSite>,
+    /// A throw to deliver into this activation's next step: the activation
+    /// below it threw while the host was resuming the run, so the call step's
+    /// error is routed exactly as a throwing call's would be.
+    pending_throw: Option<JsError>,
     /// Cut 45: the next body of a JIT tail-call chain — a compiled body's
     /// `tail_call` helper replaced the frame (via `tail_prepare_ordinary`)
     /// and stashed the callee's body here; `run_compiled_body` loops on it
@@ -4612,6 +4652,9 @@ impl Trace for Vm {
         self.var_ref_stack.trace(visit);
         self.call_args.trace(visit);
         self.pending_call.trace(visit);
+        if let Some(error) = &self.pending_throw {
+            error.value.trace(visit);
+        }
         self.current_function.trace(visit);
         self.current_new_target.trace(visit);
         self.saved_control.trace(visit);
@@ -4764,6 +4807,9 @@ impl Vm {
             call_args: Vec::new(),
             pending_call: None,
             reg_resume: None,
+            pause_ok: false,
+            pause_site: None,
+            pending_throw: None,
             tail_replaced: None,
             current_function: None,
             current_new_target: None,
@@ -5120,6 +5166,9 @@ impl Vm {
         self.call_args.clear();
         self.pending_call = None;
         self.reg_resume = None;
+        self.pause_ok = false;
+        self.pause_site = None;
+        self.pending_throw = None;
         self.current_function = None;
         self.current_new_target = None;
         self.saved_control.clear();
@@ -5153,6 +5202,9 @@ impl Vm {
         self.call_args.clear();
         self.pending_call = None;
         self.reg_resume = None;
+        self.pause_ok = false;
+        self.pause_site = None;
+        self.pending_throw = None;
         self.leaf_frame_base = None;
         self.leaf_frame_offset = 0;
         self.global = None;
@@ -8237,6 +8289,16 @@ impl Vm {
         if agent.jit_hook.is_some() {
             return Ok(None);
         }
+        // A session needs every activation on a `Vm` of its own: this frame
+        // runs the callee in the caller's driver, with the caller's `ip`, env
+        // and `pause_ok` in this loop's locals, so a point inside the callee
+        // could not be parked and resumed. The pooled funnel gives each
+        // activation its own `Vm`, which is what `resume_paused` replays
+        // (`.notes/chromium-facade.md` section 14.4). The cost is the
+        // debugger's, not the engine's.
+        if agent.debug_attached.get() {
+            return Ok(None);
+        }
         // A cross-realm callee runs with its own realm pushed by `call_inner`;
         // a termination request stops before any new activation.
         if agent.realm_count.get() != 1 || agent.is_terminating() {
@@ -8506,6 +8568,16 @@ impl Vm {
         // Record the agent for the duration so crux-side ECMAScript calls
         // (proxy traps reached through property access) can find the runtime.
         crux::function::with_agent(agent as *mut Agent as *mut (), || {
+            // A resumed activation lands the outcome of the call it was
+            // performing before its next step runs: a value is the call site's
+            // result, a throw starts the handler search from that step, exactly
+            // as a callee that threw in place would (`.notes/chromium-facade.md`
+            // section 14.4).
+            if let Some(error) = self.pending_throw.take()
+                && let Some(outcome) = self.route_step_error(agent, current.get(), error)?
+            {
+                return Ok(outcome);
+            }
             loop {
                 let body = current.get();
                 if let Some(error) = pending_error.take() {
@@ -8606,9 +8678,14 @@ impl Vm {
                 };
                 match outcome {
                     Ok(outcome) => return Ok(outcome),
+                    // A stop is not a step error: routing it would run the
+                    // enclosing `catch`/`finally`, which is a different
+                    // program. Every activation on the way out parks itself
+                    // instead.
+                    Err(error) if agent.pause_in_flight() => return Err(error),
                     Err(error) => {
                         if self.inline_calls.len() <= frame_base {
-                            match self.route_step_error(agent, current.get(), error)? {
+                            match self.route_step_error(agent, body, error)? {
                                 Some(outcome) => return Ok(outcome),
                                 None => continue,
                             }
@@ -8739,6 +8816,15 @@ impl Vm {
         let ValueKind::Function(function) = callee.kind() else {
             return Ok(None);
         };
+        // A session gives up this lane: the nested activation shares the
+        // caller's `Vm` and keeps the caller's `ip` and env in this function's
+        // native locals, so it cannot be parked and resumed. Taking the pooled
+        // funnel instead puts every activation on a `Vm` of its own, which is
+        // what the continuation stack needs (`.notes/chromium-facade.md`
+        // section 14.4). The cost is the debugger's, not the engine's.
+        if agent.debug_attached.get() {
+            return Ok(None);
+        }
         if !matches!(function.kind, crux::function::FunctionKind::EcmaScript) {
             return Ok(None);
         }
@@ -8891,6 +8977,14 @@ impl Vm {
             self.strict,
             agent.field_initializer_depth,
         );
+        // The nested activation shares this Vm, so it cannot park: its caller's
+        // `ip` and env live in this function's native locals, and a resume would
+        // have nothing to restore them from (`run_inner`'s driver is not
+        // re-entered for the caller). Clearing the flag makes every debug point
+        // inside the callee defer, which is the honest answer until the nested
+        // lane grows a parked level of its own.
+        let saved_pause_ok = self.pause_ok;
+        self.pause_ok = false;
         self.lexical_env = body_env;
         self.env_stack.reset(body_env);
         self.body_context = Some(body_env);
@@ -8919,6 +9013,7 @@ impl Vm {
         self.current_new_target = current_new_target;
         self.strict = strict;
         agent.field_initializer_depth = field_depth;
+        self.pause_ok = saved_pause_ok;
         self.call_args = saved_call_args;
         self.nested_frame = saved_nested;
         self.leaf_frame_base = saved_leaf_base;
@@ -8932,9 +9027,10 @@ impl Vm {
         }
         self.restore_scratch(scratch);
         // A kind-only engine error escapes with the callee's realm context
-        // still current; build it while it is (mirrors `ordinary_call`).
+        // still current; build it while it is (mirrors `ordinary_call`). A
+        // stop's marker is not an engine error and must not be translated.
         let run = match run {
-            Err(error) if error.value.is_none() => {
+            Err(error) if error.value.is_none() && !agent.pause_in_flight() => {
                 match crate::builtins::error::to_throwable(agent, &error) {
                     Ok(value) => Err(error.with_value(value)),
                     Err(conversion) => Err(conversion),
@@ -8978,17 +9074,32 @@ impl Vm {
             // C3a: a certified callee runs as a nested frame on this Vm; every
             // other callable takes the pooled-Vm funnel.
             PendingCall::Function { callee, .. } => {
-                match self.run_certified_call_nested(agent, &callee, this, arg_start, argc)? {
-                    Some(value) => value,
-                    None => {
-                        let args = &self.stack[arg_start..arg_start + argc];
-                        crate::function::call_inner(agent, &callee, this, args)?
-                    }
+                // A callee that will run on a `Vm` of its own can be resumed by
+                // the host, so this activation declares it parkable: the ticket
+                // is the whole of that declaration, and only a session's
+                // parkable activation ever sets one (`.pause_ok` is false in
+                // every other run, including the nested lane's).
+                let resumable = self.pause_ok && agent.pause_resumable_call(&callee);
+                if resumable {
+                    agent.set_pause_ticket(true);
                 }
+                let run =
+                    match self.run_certified_call_nested(agent, &callee, this, arg_start, argc) {
+                        Ok(Some(value)) => Ok(value),
+                        Ok(None) => {
+                            let args = &self.stack[arg_start..arg_start + argc];
+                            crate::function::call_inner(agent, &callee, this, args)
+                        }
+                        Err(error) => Err(error),
+                    };
+                if resumable {
+                    agent.clear_pause_ticket();
+                }
+                run
             }
             PendingCall::Handler { handler, .. } => {
                 let args = &self.stack[arg_start..arg_start + argc];
-                handler(agent, &this, args)?
+                handler(agent, &this, args)
             }
             PendingCall::Native { callee, .. } => {
                 let args = &self.stack[arg_start..arg_start + argc];
@@ -8996,16 +9107,47 @@ impl Vm {
                     ValueKind::Function(function) => match &function.kind {
                         crux::function::FunctionKind::Builtin {
                             call: Some(native), ..
-                        } => native(agent as *mut Agent as *mut (), &this, args)?,
-                        _ => crate::function::call_inner(agent, &callee, this, args)?,
+                        } => native(agent as *mut Agent as *mut (), &this, args),
+                        _ => crate::function::call_inner(agent, &callee, this, args),
                     },
-                    _ => crate::function::call_inner(agent, &callee, this, args)?,
+                    _ => crate::function::call_inner(agent, &callee, this, args),
                 }
             }
         };
+        // A stop below this call: the activation parks with its call site, and
+        // the marker continues outwards. The stack is left as it is, because
+        // the callee's result does not exist yet.
+        if agent.pause_in_flight() {
+            self.set_pause_site(arg_start, below);
+            return result.map(|_| ());
+        }
         self.stack.truncate(arg_start - below);
-        self.stack.push(result);
+        self.stack.push(result?);
         Ok(())
+    }
+
+    /// Park-safe view of the call site: the activation's own result lands
+    /// where the call's did (`complete_call`'s truncate-and-push).
+    pub(crate) fn take_pause_site(&mut self) -> Option<PauseSite> {
+        self.pause_site.take()
+    }
+
+    /// Land a resumed call's result at the call site it was performing.
+    pub(crate) fn land_call_result(&mut self, site: PauseSite, value: Value) {
+        self.stack.truncate(site.arg_start - site.below);
+        self.stack.push(value);
+    }
+
+    /// Hand a resumed activation the throw its callee produced, for the driver
+    /// to route through the handler table as a throwing call's error is.
+    pub(crate) fn set_pending_throw(&mut self, error: JsError) {
+        self.pending_throw = Some(error);
+    }
+
+    /// Remember the call site a stop below this activation interrupted, so the
+    /// level this activation parks can deliver the callee's result into it.
+    pub(crate) fn set_pause_site(&mut self, arg_start: usize, below: usize) {
+        self.pause_site = Some(PauseSite { arg_start, below });
     }
 
     /// Whether a call record is waiting to be performed — a step withdrew an
@@ -9119,23 +9261,27 @@ impl Vm {
                     // returns an outcome rather than an error so the enclosing
                     // `catch`/`finally` do not run, and the request is cleared
                     // so the resumed run does not stop again at the same point.
-                    // Only the outermost activation stops: a nested one would
-                    // have to park the frames above it, and a callee's run
-                    // returns a `Value` to its caller, not an outcome. A run
-                    // parked for a frame evaluation is not paused again.
-                    if agent.at_host_depth() && !agent.has_paused_run() {
-                        if agent.breakpoint_at(span.start) {
-                            return Ok(VmOutcome::Paused(PauseInfo {
-                                reason: PauseReason::Breakpoint,
-                                position: Some(*span),
-                            }));
-                        }
-                        if agent.pause_requested() {
+                    // Only an activation a starter declared parkable stops; a
+                    // nested lane, a generator's resumption, an eval body or a
+                    // module body defers, because resuming those would need
+                    // state nobody kept. A run parked for a frame evaluation is
+                    // not paused again.
+                    if self.pause_ok && !agent.has_paused_run() {
+                        let stop = if agent.breakpoint_at(span.start) {
+                            Some(PauseReason::Breakpoint)
+                        } else if agent.pause_requested() {
                             agent.clear_pause_request();
-                            return Ok(VmOutcome::Paused(PauseInfo {
-                                reason: PauseReason::Requested,
+                            Some(PauseReason::Requested)
+                        } else {
+                            None
+                        };
+                        if let Some(reason) = stop {
+                            let info = PauseInfo {
+                                reason,
                                 position: Some(*span),
-                            }));
+                            };
+                            agent.set_pause_info(info);
+                            return Ok(VmOutcome::Paused(info));
                         }
                     }
                 }

@@ -8,10 +8,11 @@
 //! engine's offset-matched debug points, and turns stops into
 //! `Debugger.paused`/`Debugger.resumed` events.
 //!
-//! What it does not do yet, because the engine cannot: report more than one call
-//! frame (the outermost activation is the only one that stops), expose a scope
-//! chain or remote objects (`Runtime.getProperties`), or step. Stepping is the
-//! same continuation question as nested stops, one statement at a time.
+//! What it does not do yet, because the engine cannot: expose a scope chain or
+//! remote objects (`Runtime.getProperties`), or step. Stepping is one statement
+//! at a time through the same continuation stack. A stop reports every parked
+//! activation as a call frame, but only the innermost one can be evaluated
+//! against (`evaluateOnCallFrame` ignores the id it is given).
 //!
 //! The host drives it as Chrome does: register each script it compiles, feed
 //! messages to [`Session::dispatch`], and ask [`Session::poll`] for the events a
@@ -137,7 +138,7 @@ impl Session {
             return Vec::new();
         };
         let offset = info.position.map(|span| span.start).unwrap_or(0);
-        let (script_id, line, column) = self.location_of(offset).unwrap_or((1, 0, 0));
+        let (stopped_script, line, column) = self.location_of(offset).unwrap_or((1, 0, 0));
         let reason = match info.reason {
             slag::PauseReason::Breakpoint => "breakpoint",
             slag::PauseReason::Requested => "other",
@@ -148,26 +149,79 @@ impl Session {
             .filter(|(_, breakpoint)| breakpoint.offset == offset)
             .map(|(id, _)| id.clone())
             .collect();
+        let call_frames = self.call_frames(context, stopped_script, line, column);
         let frame = "frame-1";
         self.paused = Some(frame.to_string());
         let mut params = json!({
-            "callFrames": [{
-                "callFrameId": frame,
-                "functionName": "",
-                "location": {
-                    "scriptId": script_id.to_string(),
-                    "lineNumber": line,
-                    "columnNumber": column,
-                },
-                "scopeChain": [],
-                "this": {"type": "undefined"},
-            }],
+            "callFrames": call_frames,
             "reason": reason,
         });
         if !hit.is_empty() {
             params["hitBreakpoints"] = json!(hit);
         }
         vec![event("Debugger.paused", params)]
+    }
+
+    /// The parked activations as protocol call frames, innermost first.
+    ///
+    /// The engine reports each frame's own function name and site, so the
+    /// caller frames point at the call the stop interrupted. A frame belongs to
+    /// the script the engine names, else to the script the stop resolved in:
+    /// the engine's breakpoints are agent-wide, so a session is one script at a
+    /// time (see `Agent::set_breakpoints`), which makes that fallback exact
+    /// until the facade grows a per-script identity.
+    fn call_frames(&self, context: &Context, script: u32, line: u32, column: u32) -> Json {
+        let frames = context.agent().paused_frames();
+        if frames.is_empty() {
+            return json!([{
+                "callFrameId": "frame-1",
+                "functionName": "",
+                "location": {
+                    "scriptId": script.to_string(),
+                    "lineNumber": line,
+                    "columnNumber": column,
+                },
+                "scopeChain": [],
+                "this": {"type": "undefined"},
+            }]);
+        }
+        let call_frames: Vec<Json> = frames
+            .iter()
+            .enumerate()
+            .map(|(index, frame)| {
+                let script_id = frame
+                    .script_name
+                    .as_ref()
+                    .and_then(|name| self.scripts.iter().find(|script| &script.url == name))
+                    .map_or(script, |script| script.id);
+                // The innermost frame's position is the stop's own; a caller's
+                // is the site its context recorded. A frame with neither
+                // answers -1, which is what the protocol uses for "unknown"
+                // rather than the first line of the file.
+                let (line_number, column_number) = if index == 0 {
+                    (line as i64, column as i64)
+                } else if frame.line == 0 {
+                    (-1, -1)
+                } else {
+                    (
+                        frame.line.saturating_sub(1) as i64,
+                        frame.column.saturating_sub(1) as i64,
+                    )
+                };
+                json!({
+                    "callFrameId": format!("frame-{}", index + 1),
+                    "functionName": frame.function_name.as_deref().unwrap_or(""),
+                    "location": {
+                        "scriptId": script_id.to_string(),
+                        "lineNumber": line_number,
+                        "columnNumber": column_number,
+                    },
+                    "scopeChain": [],
+                    "this": {"type": "undefined"},
+                })
+            })
+            .collect();
+        Json::Array(call_frames)
     }
 
     fn handle(
@@ -253,16 +307,16 @@ impl Session {
         let Some(script) = self.scripts.iter().find(|script| script.url == url) else {
             return Err(DispatchError::Protocol(format!("no script for {url}")));
         };
-        let requested = offset_of(&script.source, line, column);
         let script_id = script.id;
-        let resolved = script
-            .points
-            .iter()
-            .map(|(start, _)| *start)
-            .find(|start| *start >= requested);
         let source = script.source.clone();
         let id = self.mint_breakpoint();
-        let Some(offset) = resolved else {
+        // The offset a breakpoint stops at is the first *code* position at or
+        // after the request, not the line's first character: the engine matches
+        // a debug point by the span it starts at, and a statement's span starts
+        // at its first token. That is also what makes a breakpoint inside a
+        // function body work, because the span offsets of every body are offsets
+        // into this one text.
+        let Some(offset) = code_offset_of(&source, line, column) else {
             // Chrome allows a breakpoint with no location yet: it answers an id
             // and no locations, and the client keeps it.
             return Ok((json!({ "breakpointId": id, "locations": [] }), Vec::new()));
@@ -413,6 +467,25 @@ fn offset_of(source: &str, line: u32, column: u32) -> u32 {
     offset as u32
 }
 
+/// The offset of the first code position at or after a 0-based line and column:
+/// the request's own offset when it is already on code, else the next
+/// non-whitespace character. `None` when the line has no code (past its end, or
+/// blank), which is the case a breakpoint answers with no locations.
+fn code_offset_of(source: &str, line: u32, column: u32) -> Option<u32> {
+    let offset = offset_of(source, line, column) as usize;
+    let rest = source.get(offset..)?;
+    let skip = rest
+        .char_indices()
+        .take_while(|(_, character)| *character == ' ' || *character == '\t')
+        .last()
+        .map_or(0, |(at, character)| at + character.len_utf8());
+    let at = offset + skip;
+    let next = source.get(at..)?.chars().next()?;
+    // A blank line, the end of the text, or the next line's start means the
+    // request names nothing to break on.
+    (!matches!(next, '\n' | '\r' | '\u{2028}' | '\u{2029}')).then_some(at as u32)
+}
+
 /// The 0-based line and column of a source offset: the inverse of [`offset_of`]
 /// for ASCII, and the same approximation otherwise.
 fn position_of(source: &str, offset: u32) -> (u32, u32) {
@@ -516,6 +589,47 @@ mod tests {
         assert!(
             session.poll(&context).is_empty(),
             "the same stop is announced once"
+        );
+    }
+
+    #[test]
+    fn a_stop_inside_a_called_function_reports_both_frames() {
+        let (mut context, mut session) = session();
+        let source = "function f() {\n  globalThis.hit = 1;\n  return 2;\n}\nvar v = f();\n";
+        session.add_script(&context, "app.js", source).unwrap();
+        session.dispatch(
+            &mut context,
+            r#"{"id":2,"method":"Debugger.setBreakpointByUrl","params":{"url":"app.js","lineNumber":1,"columnNumber":0}}"#,
+        );
+        let error = context.agent_mut().run_script(source).unwrap_err();
+        assert_eq!(error.message, "execution paused at a breakpoint");
+        let events = session.poll(&context);
+        assert_eq!(events.len(), 1, "{events:?}");
+        let paused: Json = serde_json::from_str(&events[0]).unwrap();
+        let frames = paused["params"]["callFrames"].as_array().unwrap();
+        assert_eq!(
+            frames.len(),
+            2,
+            "the callee's activation and the script's: {paused}"
+        );
+        assert_eq!(frames[0]["functionName"], "f");
+        assert_eq!(frames[0]["location"]["lineNumber"], 1);
+        assert_eq!(frames[0]["callFrameId"], "frame-1");
+        assert_eq!(
+            frames[1]["functionName"], "",
+            "the script's own activation has no function name"
+        );
+        assert_eq!(
+            frames[1]["location"]["lineNumber"], 4,
+            "the caller frame points at the call the stop interrupted: {paused}"
+        );
+        assert_eq!(frames[1]["location"]["scriptId"], "1");
+        // A resume finishes both activations.
+        session.dispatch(&mut context, r#"{"id":3,"method":"Debugger.resume"}"#);
+        assert_eq!(
+            context.eval("globalThis.v").err().map(|e| e.message),
+            None,
+            "the run finished without a second stop"
         );
     }
 

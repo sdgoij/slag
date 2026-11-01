@@ -51,6 +51,21 @@ const char kSource[] =
 
 const char kBreakpoint[] = "counter = counter + 1;";
 
+// The second demo: a stop *inside* a called function. The engine parks every
+// activation above the stop and resumes them in order, so the evaluation below
+// sees the innermost activation's parameters, not the script's.
+const char kNestedSource[] =
+    "globalThis.trace = [];\n"
+    "function inner(x) {\n"
+    "  globalThis.trace.push(x);\n"
+    "  return x * 2;\n"
+    "}\n"
+    "function outer(x) { return inner(x) + 1; }\n"
+    "globalThis.final = outer(5);\n"
+    "globalThis.final;";
+
+const char kNestedBreakpoint[] = "globalThis.trace.push(x);";
+
 // Answers null on success, or the reason the demo failed.
 const char* RunDemo(v8::Isolate* isolate, v8::Local<v8::Context> context) {
   context->SetDebugAttached(true);
@@ -107,6 +122,50 @@ const char* RunDemo(v8::Isolate* isolate, v8::Local<v8::Context> context) {
   return nullptr;
 }
 
+// A breakpoint inside a function the script called: the stop is in that
+// activation, and the evaluation at it sees that activation's frame.
+const char* RunNestedDemo(v8::Isolate* isolate, v8::Local<v8::Context> context) {
+  const char* at = strstr(kNestedSource, kNestedBreakpoint);
+  if (at == nullptr) return "the nested breakpoint text moved";
+  uint32_t offset = static_cast<uint32_t>(at - kNestedSource);
+  context->SetBreakpoints(&offset, 1);
+
+  v8::Local<v8::String> source =
+      v8::String::NewFromUtf8Literal(isolate, kNestedSource);
+  v8::Local<v8::Script> script;
+  if (!v8::Script::Compile(context, source).ToLocal(&script)) {
+    return "nested compile";
+  }
+  {
+    (void)script->Run(context);
+    v8::Context::PauseInfo pause;
+    if (!context->Paused(&pause)) return "the nested breakpoint did not stop";
+    if (pause.start != offset) return "the nested stop named the wrong position";
+    printf("paused: breakpoint inside inner at offset %u\n", pause.start);
+
+    /* `x` is `inner`'s parameter: the halt is in the callee's activation, not
+     * the script's, which is what the parked caller stack carries. */
+    v8::Local<v8::Value> probed;
+    v8::Local<v8::String> question = v8::String::NewFromUtf8Literal(isolate, "x");
+    if (!context->EvaluateOnPausedFrame(question).ToLocal(&probed)) {
+      return "evaluate at the nested stop";
+    }
+    int32_t answer = probed->Int32Value(context).FromMaybe(0);
+    printf("evaluated: x = %d\n", answer);
+    if (answer != 5) return "the halted activation is not the callee's";
+  }
+
+  v8::Local<v8::Value> value;
+  if (!context->Resume().ToLocal(&value)) return "nested resume";
+  int32_t completed = value->Int32Value(context).FromMaybe(0);
+  printf("resumed: the nested run completed with %d\n", completed);
+  if (completed != 11) {
+    return "the caller's call site did not receive the callee's result";
+  }
+  context->SetBreakpoints(nullptr, 0);
+  return nullptr;
+}
+
 }  // namespace
 
 int main(int argc, char* argv[]) {
@@ -131,6 +190,9 @@ int main(int argc, char* argv[]) {
     v8::Context::Scope context_scope(context);
 
     if (const char* error = RunDemo(isolate, context)) {
+      fprintf(stderr, "debugger: %s\n", error);
+      status = 1;
+    } else if (const char* error = RunNestedDemo(isolate, context)) {
       fprintf(stderr, "debugger: %s\n", error);
       status = 1;
     }
