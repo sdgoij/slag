@@ -171,6 +171,43 @@ int32_t slag_eval(SlagContext* context, const uint8_t* source, size_t len, uint6
 int32_t slag_compile(SlagContext* context, const uint8_t* source, size_t len,
                      const uint8_t* name, size_t name_len, SlagScript** out);
 int32_t slag_script_run(SlagContext* context, SlagScript* script, uint64_t* out);
+
+/* `slag_script_run`'s extra code: a debug session stopped the run at a debug
+ * point. The state is the parked run (`slag_debug_paused`), and no error is
+ * pending, so a host must not report one. */
+#define SLAG_RUN_PAUSED 3
+
+/* A parked run (`v8::Context::Paused` in the facade). `reason` is one of the
+ * SLAG_PAUSE_* values; `start`/`end` are the source offsets of the debug point
+ * that stopped the run (0 when there is no position). */
+typedef struct SlagPause {
+  uint32_t reason;
+  uint32_t start;
+  uint32_t end;
+} SlagPause;
+
+enum SlagPauseReason {
+  SLAG_PAUSE_NONE = 0,
+  /* A host `slag_debug_pause` request was observed at a debug point. */
+  SLAG_PAUSE_REQUESTED = 1,
+  /* A debug point's offset was one of the session's breakpoints. */
+  SLAG_PAUSE_BREAKPOINT = 2
+};
+
+/* The debugger surface (see the facade's `v8::Context` extensions). A session
+ * must be attached before any debug point exists, and the engine recompiles its
+ * bytecode on the attach and the detach, so the points cost nothing otherwise.
+ * Each answers 0 on success, 1 with a pending error, and 2 for a bad handle. */
+int32_t slag_debug_attach(SlagContext* context, int32_t attached);
+/* Replace the session's breakpoints: `count` source offsets, which is what
+ * resolving a (line, column) against the script text produces. */
+int32_t slag_debug_set_breakpoints(SlagContext* context, const uint32_t* offsets,
+                                   size_t count);
+int32_t slag_debug_pause(SlagContext* context);
+/* 1 when a run is parked (and `out` is filled), 0 when none is. */
+int32_t slag_debug_paused(SlagContext* context, SlagPause* out);
+/* Continue the parked run; its completion value is written through `out`. */
+int32_t slag_debug_resume(SlagContext* context, uint64_t* out);
 /* Drain the job queues. 1 when a job was queued, 0 when none was, -1 with a
  * pending error when a job threw. */
 int32_t slag_drain_jobs(SlagContext* context);

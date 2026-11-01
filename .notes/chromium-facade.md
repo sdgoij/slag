@@ -1736,6 +1736,29 @@ share an offset (every one of them, trivially, since offsets start at 0) would
 cross-trigger. That is the facade's job, not something the engine can guess:
 the engine has no script identity to hand out yet.
 
+**2026-11-01, the facade surface.** The protocol is now reachable from C++:
+`slag_debug_attach` / `set_breakpoints` / `pause` / `paused` / `resume` on
+`crates/slagc`, exposed as `v8::Context` methods (not `v8.h` API: V8 puts the
+same machinery behind the inspector, which is A5's cost), and `debugger.exe`
+runs the whole path in one process. Two decisions worth keeping:
+
+- **A pause is a distinct return code from the ABI, not a pending error.**
+  `slag_script_run` answers `SLAG_RUN_PAUSED` (3) when the run it started stopped
+  at a point, with nothing thrown, so `Script::Run` answers empty and does not
+  report a script error to a message listener. Only a pause *that call* produced
+  counts, which is what stops a stale parked run from swallowing a later real
+  error.
+- **The engine-side embedding API grew the same surface** (`embed::Context`'s
+  `set_debug_attached` / `set_breakpoints` / `request_pause` / `paused` /
+  `resume_paused`, with `PauseInfo`/`PauseReason` re-exported), so a Rust host
+  and the C++ facade drive one implementation. `request_pause` is public now
+  that a host calls it.
+
+The C++ surface is documented in `crates/v8/cpp/README.md`'s Debugger section,
+which is also where the four guarantees (free when detached, an outcome not an
+error, offset breakpoints, outermost-only stops) are stated for a host
+integrator.
+
 Still open, in order: the continuation stack (the depth restriction above), the
 position table and breakpoints, `evaluateOnCallFrame` through the
 `CallbackWindow`, and the facade's `Debugger` surface. Resuming mid-`try` also

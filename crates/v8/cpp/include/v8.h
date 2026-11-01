@@ -1736,6 +1736,36 @@ class Context {
   void SetSecurityToken(Local<Value> token);
   void UseDefaultSecurityToken();
 
+  /* The debugger surface. These are not `v8.h` methods: V8 puts the same
+   * machinery behind the inspector protocol, which is A5's cost, so the facade
+   * exposes the engine's own protocol instead (see the README's Debugger
+   * section).
+   *
+   * `SetDebugAttached` opens a session. The engine emits a debug point per
+   * statement and per loop back edge only while one is attached, and recompiles
+   * its bytecode on both transitions, so a normal run carries no points at all.
+   * `SetBreakpoints` takes source offsets into the script text, which is what
+   * resolving a (line, column) with `v8::Message` gives. `RequestPause` stops at
+   * the next point the run reaches. `Paused` reports a stopped run and where it
+   * stopped, and `Resume` continues it, answering the value the script
+   * completes with.
+   *
+   * Until the continuation stack lands, a stop happens in the outermost
+   * activation: a breakpoint inside a function that is still on the stack when
+   * the point is reached stops when control returns to the outermost frame. */
+  struct PauseInfo {
+    enum Reason { kNone = 0, kRequested = 1, kBreakpoint = 2 };
+    Reason reason = kNone;
+    /* The debug point's span: byte offsets into the script text. */
+    uint32_t start = 0;
+    uint32_t end = 0;
+  };
+  void SetDebugAttached(bool attached);
+  void SetBreakpoints(const uint32_t* offsets, size_t count);
+  void RequestPause();
+  bool Paused(PauseInfo* out) const;
+  MaybeLocal<Value> Resume();
+
   class Scope {
    public:
     explicit Scope(Local<Context> context)

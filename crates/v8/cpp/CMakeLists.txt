@@ -31,6 +31,11 @@ target_link_libraries(hello-world PRIVATE v8_facade)
 add_executable(shell samples/shell.cc)
 target_link_libraries(shell PRIVATE v8_facade)
 
+# The facade's debugger surface end to end (a session, a breakpoint, the stop,
+# the resume). Not a V8 sample: V8 exposes this through the inspector.
+add_executable(debugger samples/debugger.cc)
+target_link_libraries(debugger PRIVATE v8_facade)
+
 # A gin-shaped harness, not gin itself: gin is a Chromium component (see the
 # README's A1 section).
 add_executable(gin-shapes tests/gin_shapes.cc)

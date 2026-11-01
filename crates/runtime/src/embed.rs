@@ -41,6 +41,8 @@ use crate::host::HostHooks;
 use crate::module::SourceTextModule;
 use crate::realm::Realm;
 
+pub use crate::ir::{PauseInfo, PauseReason};
+
 /// A console or rejection callback: receives the rendered text.
 pub type OutputFn = Box<dyn Fn(&str)>;
 
@@ -1028,6 +1030,41 @@ impl Context {
     /// The underlying agent, mutably.
     pub fn agent_mut(&mut self) -> &mut Agent {
         &mut self.agent
+    }
+
+    /// Attach or detach a debug session (`.notes/chromium-facade.md` section
+    /// 14.4).
+    ///
+    /// The flag is a compile input: the engine emits a debug point per statement
+    /// and per loop back edge only under a session, and recompiles its bytecode
+    /// on the transition, so a normal run pays nothing for the points.
+    pub fn set_debug_attached(&mut self, attached: bool) -> Result<(), JsError> {
+        self.agent.set_debug_attached(attached)
+    }
+
+    /// Replace the session's breakpoints: source offsets into the text the
+    /// running script's spans index.
+    pub fn set_breakpoints(&mut self, offsets: &[u32]) {
+        self.agent.set_breakpoints(offsets);
+    }
+
+    /// Ask the run to stop at its next debug point (`Debugger.pause`).
+    pub fn request_pause(&mut self) {
+        self.agent.request_pause();
+    }
+
+    /// The parked run's reason and position, when a session stopped one.
+    pub fn paused(&self) -> Option<PauseInfo> {
+        let reason = self.agent.paused_reason()?;
+        Some(PauseInfo {
+            reason,
+            position: self.agent.paused_position(),
+        })
+    }
+
+    /// Continue the parked run, answering the value its script completes with.
+    pub fn resume_paused(&mut self) -> Result<JsValue, JsError> {
+        crate::eval::resume_paused(&mut self.agent).map(JsValue)
     }
 
     /// Write this realm's state as a snapshot blob.

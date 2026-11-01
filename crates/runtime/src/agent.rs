@@ -2310,11 +2310,9 @@ impl Agent {
     /// [`crate::ir::VmOutcome::Paused`], which is an outcome rather than an
     /// error so the enclosing `catch`/`finally` do not run.
     ///
-    /// Test-only until the run can be parked and resumed: nothing outside a
-    /// test may request a pause yet, because every entry point reports it as an
-    /// internal error instead of parking (see [`crate::ir::pause_without_run`]).
-    #[cfg(test)]
-    pub(crate) fn request_pause(&self) {
+    /// It takes effect only in the outermost activation, which is where a
+    /// session's run is parked and resumed (see [`Agent::vm_depth`]).
+    pub fn request_pause(&self) {
         self.pause_requested.set(true);
     }
 

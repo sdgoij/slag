@@ -32,7 +32,7 @@ use crux::value::{Value, ValueKind};
 use slag::api::{Local as EngineLocal, Traced};
 use slag::{
     CallbackWindow, CompiledScript, Context, ErrorKind, FunctionCall, HostFn, JsError, JsModule,
-    JsValue, OwnProperty, PromiseHandles, PromiseState,
+    JsValue, OwnProperty, PauseReason, PromiseHandles, PromiseState,
 };
 
 /// The isolate a host enters. The engine's contexts are the state; this token
@@ -1209,6 +1209,7 @@ pub unsafe extern "C" fn slag_script_run(
         reentrant(context);
         return 1;
     };
+    let was_paused = engine.paused().is_some();
     match engine.run_compiled_script(&script.script) {
         Ok(value) => {
             if !out.is_null() {
@@ -1217,6 +1218,14 @@ pub unsafe extern "C" fn slag_script_run(
             0
         }
         Err(error) => {
+            // A session's pause is not a thrown value: the parked run is the
+            // state (`slag_debug_paused`), so the host is told to look there
+            // rather than at a pending exception. Only a pause this call
+            // produced counts, or a stale parked run would swallow a real
+            // error from a later run.
+            if !was_paused && engine.paused().is_some() {
+                return SLAG_RUN_PAUSED;
+            }
             record(context, error);
             1
         }
@@ -2102,6 +2111,143 @@ pub unsafe extern "C" fn slag_drain_jobs(context: *mut SlagContext) -> i32 {
         Err(error) => {
             record(context, error);
             -1
+        }
+    }
+}
+
+/// Why a parked run stopped (`SlagPause::reason`).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SlagPause {
+    /// 0 none, 1 a host pause request, 2 a breakpoint.
+    pub reason: u32,
+    /// The source offset of the debug point that stopped the run.
+    pub start: u32,
+    pub end: u32,
+}
+
+const PAUSE_REQUESTED: u32 = 1;
+const PAUSE_BREAKPOINT: u32 = 2;
+
+/// [`slag_script_run`]'s extra code: a session stopped the run at a debug point.
+const SLAG_RUN_PAUSED: i32 = 3;
+
+/// Attach or detach a debug session. Returns 0 on success, 1 with a pending
+/// error, and 2 for a bad handle.
+///
+/// The flag is a compile input: the engine emits a debug point per statement and
+/// per loop back edge only under a session, and recompiles its bytecode on the
+/// transition, so a normal run pays nothing.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn slag_debug_attach(context: *mut SlagContext, attached: i32) -> i32 {
+    let Some(context) = context.as_ref() else {
+        return 2;
+    };
+    let Ok(mut engine) = context.context.try_borrow_mut() else {
+        reentrant(context);
+        return 1;
+    };
+    match engine.set_debug_attached(attached != 0) {
+        Ok(()) => 0,
+        Err(error) => {
+            record(context, error);
+            1
+        }
+    }
+}
+
+/// Replace the session's breakpoints with `count` source offsets. Returns 0 on
+/// success and 2 for a bad handle.
+///
+/// An offset is a position in the text the script's spans index, which is what
+/// resolving a (line, column) against the script source gives. The set is per
+/// agent, so a session debugging one script at a time is the supported shape.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn slag_debug_set_breakpoints(
+    context: *mut SlagContext,
+    offsets: *const u32,
+    count: usize,
+) -> i32 {
+    let Some(context) = context.as_ref() else {
+        return 2;
+    };
+    let Ok(mut engine) = context.context.try_borrow_mut() else {
+        reentrant(context);
+        return 2;
+    };
+    let offsets = if offsets.is_null() || count == 0 {
+        &[][..]
+    } else {
+        // SAFETY: the caller passes `count` offsets, which it owns for the call.
+        unsafe { std::slice::from_raw_parts(offsets, count) }
+    };
+    engine.set_breakpoints(offsets);
+    0
+}
+
+/// Ask the run to stop at its next debug point (`Debugger.pause`). Returns 0 on
+/// success and 2 for a bad handle.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn slag_debug_pause(context: *mut SlagContext) -> i32 {
+    let Some(context) = context.as_ref() else {
+        return 2;
+    };
+    let Ok(mut engine) = context.context.try_borrow_mut() else {
+        reentrant(context);
+        return 2;
+    };
+    engine.request_pause();
+    0
+}
+
+/// Report the parked run. Returns 1 when one is parked (and fills `out`), 0 when
+/// none is, and 2 for a bad handle.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn slag_debug_paused(context: *mut SlagContext, out: *mut SlagPause) -> i32 {
+    let Some(context) = context.as_ref() else {
+        return 2;
+    };
+    let Ok(engine) = context.context.try_borrow() else {
+        return 0;
+    };
+    let Some(info) = engine.paused() else {
+        return 0;
+    };
+    if let Some(out) = out.as_mut() {
+        *out = SlagPause {
+            reason: match info.reason {
+                PauseReason::Requested => PAUSE_REQUESTED,
+                PauseReason::Breakpoint => PAUSE_BREAKPOINT,
+            },
+            start: info.position.map_or(0, |span| span.start),
+            end: info.position.map_or(0, |span| span.end),
+        };
+    }
+    1
+}
+
+/// Continue the parked run, writing its value through `out`. Returns 0 on
+/// success, 1 with a pending error (including "there was nothing to resume"),
+/// and 2 for a bad handle.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn slag_debug_resume(context: *mut SlagContext, out: *mut u64) -> i32 {
+    let Some(context) = context.as_mut() else {
+        return 2;
+    };
+    let Ok(mut engine) = context.context.try_borrow_mut() else {
+        reentrant(context);
+        return 1;
+    };
+    match engine.resume_paused() {
+        Ok(value) => {
+            if let Some(out) = out.as_mut() {
+                *out = value.to_bits();
+            }
+            0
+        }
+        Err(error) => {
+            record(context, error);
+            1
         }
     }
 }
@@ -5144,6 +5290,63 @@ mod tests {
             swept.contains(&box_addr),
             "the released value was still rooted: {swept:?}"
         );
+    }
+
+    #[test]
+    fn a_session_stops_at_a_breakpoint_and_resumes() {
+        unsafe {
+            let isolate = slag_isolate_new();
+            let context = slag_context_new(isolate);
+
+            let source: &[u8] = b"globalThis.ran = false; \
+                                  try { globalThis.ran = true; } \
+                                  finally { globalThis.fin = true; } 'done';";
+            let needle: &[u8] = b"globalThis.ran = true;";
+            let offset = source
+                .windows(needle.len())
+                .position(|window| window == needle)
+                .expect("the breakpoint text is in the source") as u32;
+
+            assert_eq!(slag_debug_attach(context, 1), 0);
+            assert_eq!(slag_debug_set_breakpoints(context, &offset, 1), 0);
+
+            let mut script = std::ptr::null_mut();
+            assert_eq!(
+                slag_compile(
+                    context,
+                    source.as_ptr(),
+                    source.len(),
+                    std::ptr::null(),
+                    0,
+                    &mut script,
+                ),
+                0
+            );
+            let mut value = 0;
+            assert_eq!(
+                slag_script_run(context, script, &mut value),
+                SLAG_RUN_PAUSED,
+                "a stopped run is reported as a pause, not as a thrown value"
+            );
+            assert_eq!(slag_has_error(context), 0, "a pause is not an error");
+
+            let mut pause = SlagPause::default();
+            assert_eq!(slag_debug_paused(context, &mut pause), 1);
+            assert_eq!(pause.reason, PAUSE_BREAKPOINT);
+            assert_eq!(pause.start, offset);
+
+            assert_eq!(slag_debug_resume(context, &mut value), 0);
+            assert_eq!(slag_value_is_string(value), 1, "the script's completion");
+            assert_eq!(
+                slag_debug_paused(context, &mut pause),
+                0,
+                "nothing is parked"
+            );
+
+            slag_script_free(script);
+            slag_context_free(context);
+            slag_isolate_free(isolate);
+        }
     }
 
     #[test]

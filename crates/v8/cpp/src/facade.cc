@@ -1705,6 +1705,33 @@ void Context::UseDefaultSecurityToken() {
   security_token_ = 0;
 }
 
+void Context::SetDebugAttached(bool attached) {
+  slag_debug_attach(slag_, attached ? 1 : 0);
+}
+
+void Context::SetBreakpoints(const uint32_t* offsets, size_t count) {
+  slag_debug_set_breakpoints(slag_, offsets, count);
+}
+
+void Context::RequestPause() { slag_debug_pause(slag_); }
+
+bool Context::Paused(PauseInfo* out) const {
+  SlagPause pause = {};
+  if (slag_debug_paused(slag_, &pause) != 1) return false;
+  if (out != nullptr) {
+    out->reason = static_cast<PauseInfo::Reason>(pause.reason);
+    out->start = pause.start;
+    out->end = pause.end;
+  }
+  return true;
+}
+
+MaybeLocal<Value> Context::Resume() {
+  uint64_t out = 0;
+  if (slag_debug_resume(slag_, &out) != 0) return MaybeLocal<Value>();
+  return Local<Value>::New(out);
+}
+
 void Isolate::ThrowException(Local<Value> exception) {
   if (exception.IsEmpty()) return;
   slag_throw_exception(CurrentSlagContext(), exception.raw());
@@ -2480,7 +2507,14 @@ MaybeLocal<Value> Script::Run(Local<Context> context) {
   uint64_t out = 0;
   auto* script = reinterpret_cast<SlagScript*>(
       static_cast<uintptr_t>(Raw(this)));
-  if (slag_script_run(current->slag(), script, &out) != 0) {
+  int32_t status = slag_script_run(current->slag(), script, &out);
+  if (status == SLAG_RUN_PAUSED) {
+    /* A session stopped the run at a debug point: the parked state is the
+     * answer (`Context::Paused`/`Resume`), and nothing is pending, so this is
+     * not reported as a failed script. */
+    return MaybeLocal<Value>();
+  }
+  if (status != 0) {
     // Nothing caught it: this is the report a message listener (and so the
     // inspector) exists for. `kAuto`'s drain does not run for a failed script.
     if (g_try_catch_depth == 0) {

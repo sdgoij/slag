@@ -49,7 +49,44 @@ crates/v8/cpp/build/Release/hello-world.exe
 crates/v8/cpp/build/Release/shell.exe -e "print(1 + 2)"
 crates/v8/cpp/build/Release/shell.exe -e "print(version())"
 crates/v8/cpp/build/Release/gin-shapes.exe
+crates/v8/cpp/build/Release/debugger.exe
 ```
+
+## The debugger surface
+
+`debugger.exe` is the whole protocol in one run: attach a session, set a
+breakpoint resolved from the script text, run until it stops, inspect where it
+stopped, and resume.
+
+```c++
+context->SetDebugAttached(true);
+uint32_t offset = /* the statement's byte offset in the script text */;
+context->SetBreakpoints(&offset, 1);
+script->Run(context);                       // answers empty: the run is parked
+v8::Context::PauseInfo pause;
+context->Paused(&pause);                    // kBreakpoint, offset..offset+len
+context->Resume().ToLocal(&value);          // the script's completion value
+```
+
+These are `v8::Context` extensions, not `v8.h` API: V8 exposes the same
+machinery through the inspector protocol, which is A5's cost. The shapes below
+are what the engine guarantees today (`.notes/chromium-facade.md` §14.4).
+
+- **The points cost nothing until a session is attached.** The engine emits a
+debug point per statement and per loop back edge only while one is, and
+recompiles its bytecode on both transitions, so a normal run carries none. The
+measured price is 0 on the compiled tier and +1.11% interpreted when attached
+(`.notes/perf.md`).
+- **A stop is an outcome, never an error.** `finally` blocks and `catch`
+handlers do not run, which is why `Script::Run` answers empty with nothing
+pending rather than throwing.
+- **A breakpoint is a source offset.** Resolve a (line, column) against the
+script text yourself; the facade has no script registry, so the offset set is
+per context and a session debugs one script at a time.
+- **A stop happens in the outermost activation.** A breakpoint inside a function
+that is still on the stack stops when control returns to the outermost frame;
+lifting that is the continuation-stack slice.
+
 
 ## A1: the indirect handle
 
