@@ -1584,10 +1584,10 @@ process per row, per-row minima: compiled tier **1076.0 against 1078.8 ms
 3531.8 ms (-1.38%)**. The +1.11% is gone from a normal run and comes back under
 a session, which is the point.
 
-Two gaps stay recorded. The per-loop-back-edge point is still not emitted, and
-now has the mechanism that would make it free when no session is attached, so it
-is the next thing to emit. And the attach's own cost is unmeasured beyond "one
-compile per registered function".
+One gap was still open at that point, and is closed by the next paragraph: the
+per-loop-back-edge point, which now had the mechanism to be free when no session
+is attached. The attach's own cost stays unmeasured beyond "one compile per
+registered function".
 
 **2026-11-01, the back-edge point landed.** R2 is now complete: `compile_statement`
 emits one point per statement, and each loop form emits one at its back edge,
@@ -1615,6 +1615,39 @@ debug build. `every_loop_back_edge_carries_a_debug_point` asserts the emission
 structurally (the step before each backward branch, in each of the seven loop
 shapes) rather than by count, and `a_loop_runs_correctly_with_a_session_attached`
 runs a `continue`-heavy loop with a session to cover the interpreter path.
+
+**2026-11-01, scoping the pause itself.** With both emission rules in place, the
+next slice is `VmOutcome::Paused` and the `PausedRun` record, and reading the
+driver first changed what that slice looks like. Two facts decide it:
+
+- **A pause is an outcome, never an error.** Routing it through the step error
+  path would run the enclosing `finally` blocks and `catch` handlers, which is a
+  different program. So it has to propagate as a value from
+  `run_inner_inner` the whole way out, and every layer that can swallow, convert
+  or continue on a value must be told about it.
+- **There are four places that own a `Vm`.** `eval_program` and three sites in
+  `function.rs` (`ordinary_call`'s fast and slow paths, and the construct path)
+  each do `take_vm` / run / `return_vm`. A pause in a nested call therefore has
+  to unwind through each of those owners, and each has to park *its* `Vm`
+  instead of returning it to the pool. So the record is a stack of paused runs,
+  not one: `PausedRun` holds the innermost `Vm` and each enclosing frame's
+  `Vm` above it, in order, until the host entry that the session is attached to.
+  Resume re-enters the outermost correctly-sized layer and each parked `Vm`
+  continues at the step that withdrew it.
+
+The propagation surface is therefore the *return* of every `run` call inside a
+call step (the in-place path and the withdrawn `VmOutcome::Call` path), the
+leaf lane's `run_leaf`, and the JIT's compiled callee lane, which cannot return
+a pause at all because a session refuses compilation. That last point is the one
+piece of good news: `lookup_info_for` already guarantees no compiled body is
+running under a session, so the pause protocol does not need a JIT-side deopt.
+
+Build order, once the slice starts: (1) `PauseReason` and the outcome variant,
+with every `match` on `VmOutcome` updated and a test that a `pause now` request
+reaches a `try`-wrapped loop *without* running its `finally`; (2)
+`PausedRun`/`Vm::paused` plumbing through the four owners; (3) resume and the
+host re-entry through the `CallbackWindow`; (4) breakpoints against the step
+spans the emission now carries.
 
 ## 15. Sources
 
