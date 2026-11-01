@@ -2418,7 +2418,7 @@ fn certified_lane_inline(
     } else {
         // Compile (or promote) through the same choke point every other JIT
         // site uses; a below-threshold or sticky-refused body falls back here.
-        let info_ptr = lookup_info(hook, &body, true);
+        let info_ptr = lookup_info_for(agent, hook, &body, true);
         if info_ptr.is_null() {
             return Ok(None);
         }
@@ -3101,7 +3101,7 @@ fn certified_verdict(
     let Some(scope) = ir.scope.as_ref() else {
         return CertifiedInlineInfo::empty();
     };
-    let info_ptr = crate::jit::lookup_info(hook, &ir, depth > 0);
+    let info_ptr = lookup_info_for(agent, hook, &ir, depth > 0);
     if info_ptr.is_null() {
         return CertifiedInlineInfo::empty();
     }
@@ -3239,7 +3239,7 @@ extern "C" fn leaf_call_probe(
     let Some(hook) = agent.jit_hook else {
         reject!("no-jit-hook");
     };
-    let info_ptr = crate::jit::lookup_info(hook, &ir, agent.jit_depth > 0);
+    let info_ptr = lookup_info_for(agent, hook, &ir, agent.jit_depth > 0);
     if info_ptr.is_null() {
         // Two different nulls. A body the compile threshold has not promoted
         // yet still counts the consult above toward that threshold, so a later
@@ -6954,6 +6954,29 @@ fn note_body_use(body: &CompiledBody) {
     }
 }
 
+/// [`lookup_info`] with the debugger's rule in front of it: the gate every
+/// caller that holds an `&Agent` uses.
+///
+/// §14.4 of `.notes/chromium-facade.md` states the rule: a stepping hook the
+/// interpreter consults is skipped by every body compiled before the session,
+/// so a session cannot filter afterwards; it has to prevent compilation. This is
+/// the same reason V8 disables optimization under the debugger, and the rule
+/// that makes the rest of the stepping protocol honest.
+pub(crate) fn lookup_info_for(
+    agent: &crate::agent::Agent,
+    hook: crate::jit::JitHook,
+    ir: &std::rc::Rc<CompiledBody>,
+    in_flight: bool,
+) -> *const JitCompiledInfo {
+    if agent.debug_attached.get() {
+        if std::env::var("JIT_DUMP_CLIF").is_ok() {
+            eprintln!("jit skip: debugger attached");
+        }
+        return std::ptr::null();
+    }
+    lookup_info(hook, ir, in_flight)
+}
+
 pub(crate) fn lookup_info(
     hook: crate::jit::JitHook,
     ir: &std::rc::Rc<CompiledBody>,
@@ -7147,7 +7170,7 @@ pub(crate) fn run_jit_body(
     crate::stack::enter_js()?;
     // The value-stack side of the same guard (see `Vm::check_value_stack`).
     vm.check_value_stack(ir.max_stack)?;
-    let info_ptr = lookup_info(hook, ir, agent.jit_depth > 0);
+    let info_ptr = lookup_info_for(agent, hook, ir, agent.jit_depth > 0);
     if info_ptr.is_null() {
         return Ok(JitRunOutcome::Interp);
     }
@@ -7417,7 +7440,7 @@ pub(crate) fn run_jit_resume(
     if agent.jit_depth == 0 {
         agent.leaf_gen = agent.leaf_gen.wrapping_add(1);
     }
-    let info_ptr = lookup_info(hook, ir, agent.jit_depth > 0);
+    let info_ptr = lookup_info_for(agent, hook, ir, agent.jit_depth > 0);
     if info_ptr.is_null() {
         return Ok(JitRunOutcome::Interp);
     }
@@ -8120,6 +8143,35 @@ mod tests {
         let ptr2 = lookup_info(hook, &body, false);
         assert_eq!(ptr, ptr2);
         assert_eq!(fake_lookup_calls(), 1);
+    }
+
+    #[test]
+    fn a_debug_session_refuses_compilation_and_cached_entries() {
+        // §14.4 of `.notes/chromium-facade.md`: a stepping hook the interpreter
+        // consults is skipped by code compiled before the session, so a session
+        // prevents compilation instead of filtering after it.
+        let agent = crate::agent::Agent::new();
+        let hook = JitHook {
+            cache: std::ptr::null_mut(),
+            lookup: fake_loop_lookup,
+            drop_cache: fake_drop_cache,
+            helpers: &JIT_SLOW_PATHS as *const JitSlowPaths,
+        };
+        let body = make_body(vec![crate::ir::Step::Push(Value::Undefined)], true);
+        assert!(
+            !lookup_info_for(&agent, hook, &body, false).is_null(),
+            "a body compiles while no session is attached"
+        );
+        agent.debug_attached.set(true);
+        assert!(
+            lookup_info_for(&agent, hook, &body, false).is_null(),
+            "a session must not serve the entry compiled before it"
+        );
+        agent.debug_attached.set(false);
+        assert!(
+            !lookup_info_for(&agent, hook, &body, false).is_null(),
+            "the cached entry is served again once the session detaches"
+        );
     }
 
     #[test]

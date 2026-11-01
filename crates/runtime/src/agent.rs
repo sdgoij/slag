@@ -1975,6 +1975,13 @@ pub struct Agent {
     /// buffers (`runtime::jit::MAX_JIT_DEPTH`), and the cache's in-flight
     /// signal: eviction is disabled while any frame runs.
     pub jit_depth: usize,
+    /// Whether a debug session is attached (`Isolate::SetDebugAttached`). While
+    /// it is, the JIT refuses to compile and serves no cached entry: a stepping
+    /// hook the interpreter consults is skipped by code compiled before the
+    /// session, so a session turns compilation off rather than filtering after
+    /// the fact. The read is one predictable load on the compile path, which is
+    /// not hot, and nothing at all on an interpreted body's execution.
+    pub debug_attached: std::cell::Cell<bool>,
     /// The heap this agent allocates in, when a host owns the arena (an
     /// isolate under the `v8` bridge). Null for a bare agent, whose heap is the
     /// thread's own.
@@ -2365,6 +2372,7 @@ impl Agent {
             collection_observers: RefCell::new(Vec::new()),
             jit_hook: None,
             jit_depth: 0,
+            debug_attached: std::cell::Cell::new(false),
             roots: Rc::new(AgentRoots::new()),
             heap_state: std::cell::Cell::new(std::ptr::null()),
             host_hooks: None,
