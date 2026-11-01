@@ -1087,12 +1087,37 @@ std::shared_ptr<BackingStore> SharedArrayBuffer::GetBackingStore() const {
   return std::shared_ptr<BackingStore>(new BackingStore(store));
 }
 
-size_t ArrayBufferView::ByteLength() const {
-  return slag_typed_array_byte_length(Raw(this));
+Local<DataView> DataView::New(Local<ArrayBuffer> array_buffer,
+                             size_t byte_offset, size_t byte_length) {
+  if (array_buffer.IsEmpty()) return Local<DataView>();
+  SlagContext* slag = CurrentSlagContext();
+  if (slag == nullptr) return Local<DataView>();
+  uint64_t out = 0;
+  if (slag_data_view_new(slag, array_buffer.raw(), byte_offset, byte_length,
+                         &out) != 0) {
+    return Local<DataView>();
+  }
+  return Local<DataView>::New(out);
 }
 
+Local<DataView> DataView::New(Local<SharedArrayBuffer> shared_array_buffer,
+                             size_t byte_offset, size_t byte_length) {
+  if (shared_array_buffer.IsEmpty()) return Local<DataView>();
+  SlagContext* slag = CurrentSlagContext();
+  if (slag == nullptr) return Local<DataView>();
+  uint64_t out = 0;
+  if (slag_data_view_new(slag, shared_array_buffer.raw(), byte_offset,
+                         byte_length, &out) != 0) {
+    return Local<DataView>();
+  }
+  return Local<DataView>::New(out);
+}
+
+size_t ArrayBufferView::ByteLength() const {
+  return slag_array_view_byte_length(CurrentSlagContext(), Raw(this));
+}
 size_t ArrayBufferView::ByteOffset() const {
-  return slag_typed_array_byte_offset(Raw(this));
+  return slag_array_view_byte_offset(CurrentSlagContext(), Raw(this));
 }
 
 bool ArrayBufferView::HasBuffer() const {
@@ -1768,6 +1793,35 @@ Maybe<bool> SettleResolver(uint64_t resolver, uint64_t value, int reject) {
 }  // namespace
 
 Promise::PromiseState Promise::State() { return StateOf(Raw(this)); }
+
+MaybeLocal<Promise> Promise::Resolve(Local<Context> context,
+                                    Local<Value> value) {
+  if (context.IsEmpty() || value.IsEmpty()) return MaybeLocal<Promise>();
+  auto* current = reinterpret_cast<Context*>(
+      static_cast<uintptr_t>(context.raw()));
+  uint64_t out = 0;
+  const int status =
+      g_callback_token != nullptr
+          ? slag_callback_promise_resolved(current->slag(), g_callback_token,
+                                           value.raw(), &out)
+          : slag_promise_resolved(current->slag(), value.raw(), &out);
+  if (status != 0) return MaybeLocal<Promise>();
+  return MaybeLocal<Promise>(Local<Promise>::New(out));
+}
+
+MaybeLocal<Promise> Promise::Reject(Local<Context> context, Local<Value> value) {
+  if (context.IsEmpty() || value.IsEmpty()) return MaybeLocal<Promise>();
+  auto* current = reinterpret_cast<Context*>(
+      static_cast<uintptr_t>(context.raw()));
+  uint64_t out = 0;
+  const int status =
+      g_callback_token != nullptr
+          ? slag_callback_promise_rejected(current->slag(), g_callback_token,
+                                           value.raw(), &out)
+          : slag_promise_rejected(current->slag(), value.raw(), &out);
+  if (status != 0) return MaybeLocal<Promise>();
+  return MaybeLocal<Promise>(Local<Promise>::New(out));
+}
 
 Local<Value> Promise::Result() { return ResultOf(Raw(this)); }
 

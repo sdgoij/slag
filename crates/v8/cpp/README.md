@@ -492,7 +492,9 @@ host owns with a `BackingStoreDeleterCallback`. `ByteLength`, `Data`,
 are the buffer's own surface; `SharedArrayBuffer` repeats the creation and read
 forms. The engine validates a typed array's geometry in `Uint8Array::New` and
 its eleven siblings, so a misaligned offset or a range past the end leaves the
-RangeError pending and answers an empty handle.
+RangeError pending and answers an empty handle. `DataView::New` is the same
+shape for the untyped view; its geometry arrives from the engine's DataView
+record, which the view accessors read.
 
 The bytes are shared, not copied: a host writing through `Data()` or a store is
 what a script reading a view sees, and the reverse. `ArrayBufferView` gives
@@ -603,14 +605,16 @@ not a claim that gin itself links.
   `Object::IsCallable`/`IsConstructor`, `BooleanValue`, `TypeOf`, `ToString`,
   `ToNumber`, `ToObject`, `Int32Value`, `Uint32Value`, `IntegerValue`,
   `StrictEquals`, `SameValue`, and `Local::operator==`.
-- `Promise` (`State`, `Result`, `MarkAsHandled`, `Then`, `Then2`, `Catch`) and
-  `Promise::Resolver` (`New`, `GetPromise`, `Resolve`, `Reject`).
+- `Promise` (`State`, `Result`, `MarkAsHandled`, `Then`, `Then2`, `Catch`, static
+  `Resolve` and `Reject`) and `Promise::Resolver` (`New`, `GetPromise`, `Resolve`,
+  `Reject`).
 - `Map` and `Set`: `New`, the keyed operations, `Clear`, `Size`, and `AsArray`.
 - `ArrayBuffer` and `SharedArrayBuffer` (creation, `ByteLength`, `Data`,
   `GetBackingStore`, and the detach protocol), `BackingStore` (fresh and
   host-owned, with a deleter), `ArrayBuffer::Allocator` (the host's bytes, from
-  `Isolate::CreateParams`), and the `ArrayBufferView`/`TypedArray` hierarchy
-  with `New` for all twelve element kinds.
+  `Isolate::CreateParams`), `DataView::New`, and the
+  `ArrayBufferView`/`TypedArray` hierarchy with `New` for all twelve element
+  kinds.
 - `Isolate::AdjustAmountOfExternalAllocatedMemory` and
   `ExternalMemoryAccounter`, over the engine's live-buffer walk plus the host's
   account.
@@ -672,19 +676,17 @@ not a claim that gin itself links.
   they answer false. V8 reads the isolate off the handle's location instead, so
   a host that keeps a value outside every scope and asks its brand gets a
   different answer here.
-- `DataView` itself is absent: `Value::IsDataView` answers, but there is no
-  `v8::DataView::New`. Resizable and growable buffers can be created from a
-  script, not from the facade, so `New` has no maximum-byte-length form yet.
-- `ArrayBuffer::New` needs an entered `Context::Scope` because the engine
-  allocates in a realm; V8 takes the isolate alone. `BackingStore::Data` is the
-  block's live base, so a caller must not hold the pointer across a resize.
-  `SharedArrayBuffer::New` ignores the isolate's allocator (the engine allocates
-  shared memory itself), and an isolate with no allocator still gets buffers
-  from the engine, where V8 would refuse.
+- `DataView` is `New` and the `ArrayBufferView` accessors: the geometry comes
+  from the engine's DataView record, so the accessors need an entered context
+  (a typed array's answer does not). `ArrayBuffer::New` needs an entered
+  `Context::Scope` because the engine allocates in a realm; V8 takes the isolate
+  alone. `BackingStore::Data` is the block's live base, so a caller must not hold
+  the pointer across a resize. `SharedArrayBuffer::New` ignores the isolate's
+  allocator (the engine allocates shared memory itself), and an isolate with no
+  allocator still gets buffers from the engine, where V8 would refuse.
 - A lazy data property's getter runs on every read (there is no one-shot slot),
   and a private name is a symbol, so `Object.getOwnPropertySymbols` can see a
-  property V8's private names hide completely. `Signature` is absent, along with
-  the embedder access checks it exists for.
+  property V8's private names hide completely.
 - The security token is stored and never consulted: a context's objects are
   reachable from every other context on the isolate, which is an engine gap
   rather than a facade decision. Embedder value slots and aligned-pointer slots
@@ -737,9 +739,9 @@ not a claim that gin itself links.
 - A `Promise::Resolver` keeps its promise and rejecting function for the
   context's life, so a resolver that never settles is never released (V8
   collects the capability with the promise). `Resolver::New(context, promise)`,
-  `Promise::WithResolvers`, the `Promise::Resolve`/`Reject` statics, and
-  `Isolate::SetPromiseRejectCallback` with `PromiseRejectMessage` are absent; the
-  engine reports unhandled rejections to the embedder callback instead.
+  `Promise::WithResolvers`, and `Isolate::SetPromiseRejectCallback` with
+  `PromiseRejectMessage` are absent; the engine reports unhandled rejections to
+  the embedder callback instead.
 - Microtasks follow `Isolate::SetMicrotasksPolicy`: `kAuto` (the default) drains
   after a successful `Script::Run`, `kExplicit` leaves the queues for
   `PerformMicrotaskCheckpoint` or `PumpMessageLoop`, and `kScoped` is accepted
@@ -842,4 +844,6 @@ handler, a method, and an internal field, checks that the instance is a function
 calls it through a script, and checks that a template with a property handler
 keeps a handler object instead. The signature block declares a method over a
 `Signature`, calls it on an instance (allowed), and calls it on a foreign object
-(refused with a `TypeError` whose message is `Illegal invocation`).
+(refused with a `TypeError` whose message is `Illegal invocation`). The promise
+block checks the two statics, and the buffer block makes a `DataView` over the
+host's buffer, writes through it, and checks that the bytes land in the buffer.

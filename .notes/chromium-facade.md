@@ -1141,6 +1141,18 @@ enforcement, `SetAccessCheckCallback` and the per-object check, and making the
 security token mean something (it is stored today and never consulted, which is
 an engine gap rather than a facade decision).
 
+*`DataView` and the promise statics (2026-11-01).* The last of the small compile
+gaps landed: `v8::DataView::New` (both buffer kinds) and `Promise::Resolve` /
+`Promise::Reject`. `DataView` exposed a real modelling difference rather than a
+missing wrapper: `ArrayBufferView::ByteLength`/`ByteOffset` read a typed array's
+own slots, which a DataView does not have, so both accessors answered 0 for one.
+The engine keeps a DataView's geometry in its `dataview_data` table, which is
+agent state, so the view accessors now go through `slag_array_view_byte_offset` /
+`_byte_length` (typed array first, agent-free; DataView second, through the
+context) and need an entered context for a DataView. The two promise statics are
+`Promise.resolve`/`Promise.reject` faithfully: `Resolve` answers the value itself
+when it is already a promise of the realm.
+
 ## 15. Sources
 
 Verified on 2026-10-31:

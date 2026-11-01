@@ -457,6 +457,36 @@ pub unsafe extern "C" fn slag_buffer_data(buffer: *const SlagBuffer) -> *mut u8 
     }
 }
 
+/// The byte offset of a view (`v8::ArrayBufferView::ByteOffset`): a typed array's
+/// own slots answer without the engine, and a `DataView`'s record needs it.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn slag_array_view_byte_offset(
+    context: *mut SlagContext,
+    value: u64,
+) -> usize {
+    array_view_geometry(context, value).map_or(0, |geometry| geometry.0)
+}
+
+/// The byte length of a view (`v8::ArrayBufferView::ByteLength`), read the same
+/// way as [`slag_array_view_byte_offset`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn slag_array_view_byte_length(
+    context: *mut SlagContext,
+    value: u64,
+) -> usize {
+    array_view_geometry(context, value).map_or(0, |geometry| geometry.1)
+}
+
+unsafe fn array_view_geometry(context: *mut SlagContext, value: u64) -> Option<(usize, usize)> {
+    let value = JsValue::from_bits(value);
+    if let Some(info) = slag::typed_array_info(&value) {
+        return Some((info.byte_offset, info.byte_length));
+    }
+    let context = context.as_ref()?;
+    let engine = context.context.try_borrow().ok()?;
+    engine.data_view_info(value)
+}
+
 /// The block's length in bytes (`v8::BackingStore::ByteLength`).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn slag_buffer_byte_length(buffer: *const SlagBuffer) -> usize {
@@ -2895,6 +2925,8 @@ trait PromiseOps {
         on_rejected: JsValue,
     ) -> Result<JsValue, JsError>;
     fn settle(&mut self, function: JsValue, value: JsValue) -> Result<bool, JsError>;
+    fn resolved(&mut self, value: JsValue) -> Result<JsValue, JsError>;
+    fn rejected(&mut self, reason: JsValue) -> Result<JsValue, JsError>;
     fn state(&mut self, promise: JsValue) -> Result<PromiseState, JsError>;
     fn result(&mut self, promise: JsValue) -> Result<JsValue, JsError>;
     fn mark_handled(&mut self, promise: JsValue) -> Result<(), JsError>;
@@ -2916,6 +2948,14 @@ impl PromiseOps for Context {
 
     fn settle(&mut self, function: JsValue, value: JsValue) -> Result<bool, JsError> {
         Context::promise_settle(self, function, value)
+    }
+
+    fn resolved(&mut self, value: JsValue) -> Result<JsValue, JsError> {
+        Context::promise_resolved(self, value)
+    }
+
+    fn rejected(&mut self, reason: JsValue) -> Result<JsValue, JsError> {
+        Context::promise_rejected(self, reason)
     }
 
     fn state(&mut self, promise: JsValue) -> Result<PromiseState, JsError> {
@@ -2947,6 +2987,14 @@ impl PromiseOps for CallbackWindow {
 
     fn settle(&mut self, function: JsValue, value: JsValue) -> Result<bool, JsError> {
         CallbackWindow::promise_settle(self, function, value)
+    }
+
+    fn resolved(&mut self, value: JsValue) -> Result<JsValue, JsError> {
+        CallbackWindow::promise_resolved(self, value)
+    }
+
+    fn rejected(&mut self, reason: JsValue) -> Result<JsValue, JsError> {
+        CallbackWindow::promise_rejected(self, reason)
     }
 
     fn state(&mut self, promise: JsValue) -> Result<PromiseState, JsError> {
@@ -3140,6 +3188,89 @@ unsafe fn promise_then_of(
         *out = derived.to_bits();
     }
     0
+}
+
+/// `Promise.resolve(value)` (`v8::Promise::Resolve`): the value itself when it is
+/// already a promise of this realm, and a new fulfilled promise otherwise.
+unsafe fn promise_resolved_of(
+    context: *mut SlagContext,
+    token: *const c_void,
+    value: u64,
+    out: *mut u64,
+) -> i32 {
+    match promise_call(context, token, |ops| {
+        ops.resolved(JsValue::from_bits(value))
+    }) {
+        Ok(promise) => {
+            if !out.is_null() {
+                *out = promise.to_bits();
+            }
+            0
+        }
+        Err(status) => status,
+    }
+}
+
+/// `Promise.reject(reason)` (`v8::Promise::Reject`): a new rejected promise.
+unsafe fn promise_rejected_of(
+    context: *mut SlagContext,
+    token: *const c_void,
+    reason: u64,
+    out: *mut u64,
+) -> i32 {
+    match promise_call(context, token, |ops| {
+        ops.rejected(JsValue::from_bits(reason))
+    }) {
+        Ok(promise) => {
+            if !out.is_null() {
+                *out = promise.to_bits();
+            }
+            0
+        }
+        Err(status) => status,
+    }
+}
+
+/// `v8::Promise::Resolve`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn slag_promise_resolved(
+    context: *mut SlagContext,
+    value: u64,
+    out: *mut u64,
+) -> i32 {
+    promise_resolved_of(context, std::ptr::null(), value, out)
+}
+
+/// [`slag_promise_resolved`] inside a running callback.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn slag_callback_promise_resolved(
+    context: *mut SlagContext,
+    token: *const c_void,
+    value: u64,
+    out: *mut u64,
+) -> i32 {
+    promise_resolved_of(context, token, value, out)
+}
+
+/// `v8::Promise::Reject`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn slag_promise_rejected(
+    context: *mut SlagContext,
+    reason: u64,
+    out: *mut u64,
+) -> i32 {
+    promise_rejected_of(context, std::ptr::null(), reason, out)
+}
+
+/// [`slag_promise_rejected`] inside a running callback.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn slag_callback_promise_rejected(
+    context: *mut SlagContext,
+    token: *const c_void,
+    reason: u64,
+    out: *mut u64,
+) -> i32 {
+    promise_rejected_of(context, token, reason, out)
 }
 
 /// `v8::Promise::Resolver::New`: the pair's resolving function (which is the
@@ -3428,6 +3559,40 @@ pub unsafe extern "C" fn slag_map_clear(context: *mut SlagContext, map: u64) -> 
     match container_call(context, |engine| engine.map_clear(JsValue::from_bits(map))) {
         Ok(()) => 0,
         Err(status) => status,
+    }
+}
+
+/// A `DataView` over `buffer` (`v8::DataView::New`): the engine validates the
+/// geometry, so a range past the end leaves the RangeError pending.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn slag_data_view_new(
+    context: *mut SlagContext,
+    buffer: u64,
+    byte_offset: usize,
+    byte_length: usize,
+    out: *mut u64,
+) -> i32 {
+    let Some(context) = context.as_mut() else {
+        return 2;
+    };
+    let created = {
+        let Ok(mut engine) = context.context.try_borrow_mut() else {
+            reentrant(context);
+            return 1;
+        };
+        engine.create_data_view(JsValue::from_bits(buffer), byte_offset, byte_length)
+    };
+    match created {
+        Ok(value) => {
+            if !out.is_null() {
+                *out = value.to_bits();
+            }
+            0
+        }
+        Err(error) => {
+            record(context, error);
+            1
+        }
     }
 }
 

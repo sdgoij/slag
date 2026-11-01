@@ -252,6 +252,18 @@ int32_t slag_callback_promise_mark_handled(SlagContext* context, const void* tok
 int32_t slag_callback_promise_then(SlagContext* context, const void* token,
                                    uint64_t promise, uint64_t on_fulfilled,
                                    uint64_t on_rejected, uint64_t* out);
+/* `v8::Promise::Resolve` and `Reject`: a promise settled with the value (the value
+ * itself when it already is a promise of the realm). */
+int32_t slag_promise_resolved(SlagContext* context, uint64_t value, uint64_t* out);
+int32_t slag_promise_rejected(SlagContext* context, uint64_t reason, uint64_t* out);
+int32_t slag_callback_promise_resolved(SlagContext* context, const void* token,
+                                       uint64_t value, uint64_t* out);
+int32_t slag_callback_promise_rejected(SlagContext* context, const void* token,
+                                       uint64_t reason, uint64_t* out);
+/* A DataView over a buffer (`v8::DataView::New`); the engine validates the
+ * geometry. */
+int32_t slag_data_view_new(SlagContext* context, uint64_t buffer,
+                           size_t byte_offset, size_t byte_length, uint64_t* out);
 /* Containers (`v8::Map`, `v8::Set`). Each operation runs the engine's own
  * `%Map.prototype.*%`/`%Set.prototype.*%` intrinsic and `Size` reads the
  * internal [[MapData]]/[[SetData]], so a script cannot change what a host's call
@@ -299,6 +311,10 @@ SlagBuffer* slag_buffer_borrowed(void* data, size_t byte_length,
                                 int32_t counted);
 void* slag_buffer_data(const SlagBuffer* buffer);
 size_t slag_buffer_byte_length(const SlagBuffer* buffer);
+/* A view's geometry (`v8::ArrayBufferView::ByteOffset` and `ByteLength`): a typed
+ * array answers from its own slots, a `DataView` from the context's record. */
+size_t slag_array_view_byte_offset(SlagContext* context, uint64_t value);
+size_t slag_array_view_byte_length(SlagContext* context, uint64_t value);
 int32_t slag_buffer_is_shared(const SlagBuffer* buffer);
 int32_t slag_buffer_is_resizable(const SlagBuffer* buffer);
 int32_t slag_buffer_is_borrowed(const SlagBuffer* buffer);

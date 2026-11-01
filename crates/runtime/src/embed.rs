@@ -426,6 +426,18 @@ impl CallbackWindow {
         promise_settle(crate::context::callback_agent(self.agent)?, function, value)
     }
 
+    /// `Promise.resolve(value)` in the running realm (the re-entrant counterpart
+    /// of [`Context::promise_resolved`]).
+    pub fn promise_resolved(&self, value: JsValue) -> Result<JsValue, JsError> {
+        promise_resolved(crate::context::callback_agent(self.agent)?, value)
+    }
+
+    /// `Promise.reject(reason)` in the running realm (the re-entrant counterpart
+    /// of [`Context::promise_rejected`]).
+    pub fn promise_rejected(&self, reason: JsValue) -> Result<JsValue, JsError> {
+        promise_rejected(crate::context::callback_agent(self.agent)?, reason)
+    }
+
     /// A promise's state (the re-entrant counterpart of
     /// [`Context::promise_state`]).
     pub fn promise_state(&self, promise: JsValue) -> Result<PromiseState, JsError> {
@@ -595,6 +607,28 @@ fn missing_intrinsic(name: &str) -> JsError {
         ErrorKind::Error,
         format!("the realm has no {name} intrinsic"),
     )
+}
+
+/// `Promise.resolve(value)` (`v8::Promise::Resolve`): the value itself when it is
+/// already a promise of this realm, and a new fulfilled promise otherwise.
+pub fn promise_resolved(agent: &mut Agent, value: JsValue) -> Result<JsValue, JsError> {
+    let constructor = agent
+        .current_realm()?
+        .intrinsics
+        .get("%Promise%")
+        .ok_or_else(no_promise)?;
+    crate::promise::promise_resolve(agent, &constructor, value.into_value()).map(JsValue)
+}
+
+/// `Promise.reject(reason)` (`v8::Promise::Reject`): a new rejected promise.
+pub fn promise_rejected(agent: &mut Agent, reason: JsValue) -> Result<JsValue, JsError> {
+    let handles = promise_capability(agent)?;
+    crate::promise::reject_promise(
+        agent,
+        &handles.promise.clone().into_value(),
+        reason.into_value(),
+    )?;
+    Ok(handles.promise)
 }
 
 /// A fresh `Map` (`v8::Map::New`) from the realm's `%Map%`.
@@ -1359,6 +1393,16 @@ impl Context {
         create_callable_instance(self.agent_mut(), callback)
     }
 
+    /// `Promise.resolve(value)` in this realm (`v8::Promise::Resolve`).
+    pub fn promise_resolved(&mut self, value: JsValue) -> Result<JsValue, JsError> {
+        promise_resolved(self.agent_mut(), value)
+    }
+
+    /// `Promise.reject(reason)` in this realm (`v8::Promise::Reject`).
+    pub fn promise_rejected(&mut self, reason: JsValue) -> Result<JsValue, JsError> {
+        promise_rejected(self.agent_mut(), reason)
+    }
+
     /// Mark the promise handled (`v8::Promise::MarkAsHandled`).
     pub fn promise_mark_handled(&self, promise: JsValue) -> Result<(), JsError> {
         promise_mark_handled(&self.agent, promise)
@@ -2034,12 +2078,57 @@ impl Context {
         .map(JsValue)
     }
 
+    /// A `DataView` over `buffer` (`v8::DataView::New`): the realm's own
+    /// constructor validates the geometry, so a range past the end leaves the
+    /// RangeError pending.
+    pub fn create_data_view(
+        &mut self,
+        buffer: JsValue,
+        byte_offset: usize,
+        byte_length: usize,
+    ) -> Result<JsValue, JsError> {
+        let agent = &mut self.agent;
+        construct_intrinsic(
+            agent,
+            "%DataView%",
+            &[
+                buffer,
+                JsValue::number(byte_offset as f64),
+                JsValue::number(byte_length as f64),
+            ],
+        )
+    }
+
     /// The geometry of a typed array view (`v8::TypedArray`'s accessors), or
     /// `None` when the value is not a typed array. Detach and a shrink below
     /// the view's range read as a zero-length view at offset zero, which is how
     /// the spec's Integer-Indexed accessors report them.
     pub fn typed_array_info(&self, value: &JsValue) -> Option<TypedArrayInfo> {
         typed_array_info(value)
+    }
+
+    /// The geometry of a `DataView` (`v8::DataView`'s `ByteOffset`/`ByteLength`),
+    /// or `None` when the value is not one. A view with no explicit length tracks
+    /// the buffer's remaining bytes.
+    pub fn data_view_info(&self, value: JsValue) -> Option<(usize, usize)> {
+        let object = value.0.as_object()?;
+        let state = self.agent.dataview_state(object.id())?;
+        let byte_offset = state.byte_offset;
+        let byte_length = match state.byte_length {
+            Some(length) => length,
+            None => {
+                let buffer_id = crate::context::as_object(&state.buffer_object)
+                    .map(|object| object.id())
+                    .unwrap_or(u64::MAX);
+                let buffer_length = self
+                    .agent
+                    .buffer_state(buffer_id)
+                    .map(|state| state.byte_length)
+                    .unwrap_or(0);
+                buffer_length.saturating_sub(byte_offset)
+            }
+        };
+        Some((byte_offset, byte_length))
     }
 
     // ── coercions & type checks (Phase 1: embedding API) ────────────────────
@@ -5427,6 +5516,22 @@ mod tests {
         );
         // The guarded window is gone, so its token names nothing.
         assert!(CallbackWindow::admit(token).is_none());
+    }
+
+    #[test]
+    fn a_data_view_takes_its_geometry() {
+        let mut context = Context::new().unwrap();
+        let buffer = context.eval("new ArrayBuffer(16)").unwrap();
+        let view = context.create_data_view(buffer, 4, 8).unwrap();
+        context.set_global("view", view.clone()).unwrap();
+        assert_eq!(
+            context.eval("view.byteOffset").unwrap().as_number(),
+            Some(4.0)
+        );
+        assert_eq!(
+            context.eval("view.byteLength").unwrap().as_number(),
+            Some(8.0)
+        );
     }
 
     #[test]

@@ -1674,6 +1674,26 @@ int main() {
     expect(caught->Result()->Int32Value(current).FromMaybe(-1) == 5,
            "the rejection handler ran");
 
+    // The statics: Resolve answers the promise it is given when it is one of
+    // this realm's, and makes a new settled promise otherwise.
+    v8::Local<v8::Promise> same =
+        v8::Promise::Resolve(current, promise).ToLocalChecked();
+    expect(same.raw() == promise.raw(),
+           "Resolve answered the promise it was given");
+    v8::Local<v8::Promise> fresh =
+        v8::Promise::Resolve(current, v8::Integer::New(isolate, 3))
+            .ToLocalChecked();
+    expect(fresh->State() == v8::Promise::kFulfilled &&
+               fresh->Result()->Int32Value(current).FromMaybe(-1) == 3,
+           "Resolve fulfilled a new promise");
+    v8::Local<v8::Promise> failed =
+        v8::Promise::Reject(current,
+                            v8::String::NewFromUtf8Literal(isolate, "no"))
+            .ToLocalChecked();
+    expect(failed->State() == v8::Promise::kRejected &&
+               !failed->MarkAsHandled().IsNothing(),
+           "Reject rejected a new promise");
+
     // A host function that builds and settles a capability inside the call, which
     // is what a promise-returning accessor does.
     v8::Local<v8::ObjectTemplate> tmpl = v8::ObjectTemplate::New(isolate);
@@ -2006,6 +2026,22 @@ int main() {
     bind("hostBuffer", buffer);
     run("globalThis.firstByte = new Uint8Array(hostBuffer)[0];");
     expect(number_at("firstByte") == 7, "the script read the host's byte");
+
+    // A DataView over the buffer: the engine validates the geometry, so a range
+    // past the end leaves the RangeError pending.
+    v8::Local<v8::DataView> view = v8::DataView::New(buffer, 4, 8);
+    expect(!view.IsEmpty() && view->IsDataView() && view->ByteOffset() == 4 &&
+               view->ByteLength() == 8,
+           "DataView::New answered the view");
+    bind("hostView", view);
+    run("hostView.setInt32(0, 1234, true);"
+        " globalThis.viewByte = new Uint8Array(hostBuffer)[4] |"
+        "   (new Uint8Array(hostBuffer)[5] << 8);");
+    expect(number_at("viewByte") == (1234 & 0xffff),
+           "a write through the view is in the buffer");
+    expect(v8::DataView::New(buffer, 12, 8).IsEmpty(),
+           "a view past the end is refused");
+    slag_clear_error(current->slag());
 
     // A host-owned store: writing through it is what the script reads, and the
     // buffer and the store name the same bytes.

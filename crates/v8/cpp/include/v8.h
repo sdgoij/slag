@@ -607,6 +607,17 @@ class ArrayBufferView : public Object {
   Local<ArrayBuffer> Buffer() const;
 };
 
+/* A view over a buffer with any element type (`v8::DataView`). The engine
+ * validates the geometry, so a range past the end leaves the RangeError pending
+ * and answers an empty handle. */
+class DataView : public ArrayBufferView {
+ public:
+  static Local<DataView> New(Local<ArrayBuffer> array_buffer,
+                             size_t byte_offset, size_t byte_length);
+  static Local<DataView> New(Local<SharedArrayBuffer> shared_array_buffer,
+                             size_t byte_offset, size_t byte_length);
+};
+
 /* An Integer-Indexed view (`v8::TypedArray`). */
 class TypedArray : public ArrayBufferView {
  public:
@@ -743,6 +754,12 @@ class Promise : public Object {
  public:
   /* A promise's state (`v8::Promise::PromiseState`). */
   enum PromiseState { kPending, kFulfilled, kRejected };
+
+  /* A promise resolved with `value` (`v8::Promise::Resolve`): the value itself
+   * when it is already a promise of the realm, and a new fulfilled one
+   * otherwise. `Reject` makes a new rejected promise. */
+  static MaybeLocal<Promise> Resolve(Local<Context> context, Local<Value> value);
+  static MaybeLocal<Promise> Reject(Local<Context> context, Local<Value> value);
 
   /* The state the engine recorded. A value that is not a promise answers
    * `kPending`, which is what a pending one answers too; V8 does not offer a
