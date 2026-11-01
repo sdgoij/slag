@@ -36,6 +36,22 @@
 
 #ifdef _WIN32
 #include <crtdbg.h>
+
+namespace {
+// Armed before `main`, so an abort or a failed assertion raised while the first
+// globals are built is reported on stderr instead of a modal box.
+struct SuppressDialogBoxes {
+  SuppressDialogBoxes() {
+    _set_abort_behavior(0, _WRITE_ABORT_MSG | _CALL_REPORTFAULT);
+    _set_error_mode(_OUT_TO_STDERR);
+    _CrtSetReportMode(_CRT_ASSERT, _CRTDBG_MODE_FILE);
+    _CrtSetReportFile(_CRT_ASSERT, _CRTDBG_FILE_STDERR);
+    _CrtSetReportMode(_CRT_ERROR, _CRTDBG_MODE_FILE);
+    _CrtSetReportFile(_CRT_ERROR, _CRTDBG_FILE_STDERR);
+  }
+};
+const SuppressDialogBoxes kSuppressDialogBoxes;
+}  // namespace
 #endif
 
 #include "include/v8-context.h"
@@ -73,18 +89,6 @@ void ReportException(v8::Isolate* isolate, v8::TryCatch* handler);
 static bool run_shell;
 
 int main(int argc, char* argv[]) {
-#ifdef _WIN32
-  // A harness must never block on a modal dialog: a failed assertion or an abort
-  // is a failure the caller reads from stderr and the exit code, not something
-  // that waits for a click. The debug CRT raises one for `abort()` and for its
-  // own assertion reports, and this is the process-wide off switch for both.
-  _set_abort_behavior(0, _WRITE_ABORT_MSG | _CALL_REPORTFAULT);
-  _set_error_mode(_OUT_TO_STDERR);
-  _CrtSetReportMode(_CRT_ASSERT, _CRTDBG_MODE_FILE);
-  _CrtSetReportFile(_CRT_ASSERT, _CRTDBG_FILE_STDERR);
-  _CrtSetReportMode(_CRT_ERROR, _CRTDBG_MODE_FILE);
-  _CrtSetReportFile(_CRT_ERROR, _CRTDBG_FILE_STDERR);
-#endif
   if (!v8::V8::InitializeICUDefaultLocation(argv[0])) {
     fprintf(stderr, "Failed to initialize ICU\n");
     return 1;

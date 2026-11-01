@@ -14,6 +14,23 @@
 
 #ifdef _WIN32
 #include <crtdbg.h>
+
+namespace {
+// Armed before `main` runs, so a failed assertion or an abort raised while the
+// first allocation happens is reported on stderr instead of waiting for a click
+// on a modal box. A harness must never block its caller.
+struct SuppressDialogBoxes {
+  SuppressDialogBoxes() {
+    _set_abort_behavior(0, _WRITE_ABORT_MSG | _CALL_REPORTFAULT);
+    _set_error_mode(_OUT_TO_STDERR);
+    _CrtSetReportMode(_CRT_ASSERT, _CRTDBG_MODE_FILE);
+    _CrtSetReportFile(_CRT_ASSERT, _CRTDBG_FILE_STDERR);
+    _CrtSetReportMode(_CRT_ERROR, _CRTDBG_MODE_FILE);
+    _CrtSetReportFile(_CRT_ERROR, _CRTDBG_FILE_STDERR);
+  }
+};
+const SuppressDialogBoxes kSuppressDialogBoxes;
+}  // namespace
 #endif
 
 #include "include/slag_a0.h"
@@ -521,6 +538,77 @@ bool AllowAccess(v8::Local<v8::Context>, v8::Local<v8::Object>,
   return data->IsInt32();
 }
 
+// The three helpers every block's `run`, `bind` and `number_at` delegate to.
+//
+// A harness must report a failing step, not die on it: `ToLocalChecked` and
+// `ToChecked` abort the process (exit code 3, no message once stdout is gone),
+// which turns a regression into a silent exit code. Each of these prints what
+// failed and counts it, and answers a defined value so the rest of the block
+// still runs and can report more.
+
+// Compile and run `source` in `context`; *undefined* when it threw.
+v8::Local<v8::Value> RunScript(v8::Isolate* isolate,
+                               v8::Local<v8::Context> context,
+                               const char* source, int* failures) {
+  v8::TryCatch caught(isolate);
+  v8::Local<v8::Script> script;
+  v8::Local<v8::Value> result;
+  if (v8::Script::Compile(context,
+                          v8::String::NewFromUtf8Literal(isolate, source))
+          .ToLocal(&script) &&
+      script->Run(context).ToLocal(&result)) {
+    return result;
+  }
+  v8::Local<v8::Value> thrown = caught.Exception();
+  if (thrown.IsEmpty()) {
+    fprintf(stderr, "script failed with no exception: %.90s\n", source);
+  } else {
+    v8::String::Utf8Value text(isolate, thrown);
+    fprintf(stderr, "script threw %s: %.90s\n",
+            *text == nullptr ? "(unrenderable)" : *text, source);
+  }
+  ++*failures;
+  return v8::Local<v8::Value>();
+}
+
+// Define a global binding; a refused define is reported.
+void BindGlobal(v8::Isolate* isolate, v8::Local<v8::Context> context,
+                const char* name, v8::Local<v8::Value> value, int* failures) {
+  if (context->Global()
+          ->Set(context, v8::String::NewFromUtf8Literal(isolate, name), value)
+          .FromMaybe(false)) {
+    return;
+  }
+  fprintf(stderr, "could not bind the global '%s'\n", name);
+  ++*failures;
+}
+
+// Set a named property on `object`; a refused write is reported.
+void SetOrReport(v8::Isolate* isolate, v8::Local<v8::Context> context,
+                 v8::Local<v8::Object> object, const char* name,
+                 v8::Local<v8::Value> value, int* failures) {
+  if (object->Set(context, v8::String::NewFromUtf8Literal(isolate, name), value)
+          .FromMaybe(false)) {
+    return;
+  }
+  fprintf(stderr, "could not set '%s' on the object\n", name);
+  ++*failures;
+}
+
+// Read a global as an int, answering -1 and reporting when the read fails.
+int IntGlobal(v8::Isolate* isolate, v8::Local<v8::Context> context,
+              const char* name, int* failures) {
+  v8::Local<v8::Value> value;
+  if (!context->Global()
+           ->Get(context, v8::String::NewFromUtf8Literal(isolate, name))
+           .ToLocal(&value)) {
+    fprintf(stderr, "could not read the global '%s'\n", name);
+    ++*failures;
+    return -1;
+  }
+  return value->Int32Value(context).FromMaybe(-1);
+}
+
 // A host allocator that counts what it lends, so the harness can prove the facade
 // draws a backing store from it and gives the bytes back.
 struct CountingAllocator : v8::ArrayBuffer::Allocator {
@@ -545,18 +633,6 @@ struct CountingAllocator : v8::ArrayBuffer::Allocator {
 }  // namespace
 
 int main() {
-#ifdef _WIN32
-  // A harness must never block on a modal dialog: a failed assertion or an abort
-  // is a failure the caller reads from stderr and the exit code, not something
-  // that waits for a click. The debug CRT raises one for `abort()` and for its
-  // own assertion reports, and this is the process-wide off switch for both.
-  _set_abort_behavior(0, _WRITE_ABORT_MSG | _CALL_REPORTFAULT);
-  _set_error_mode(_OUT_TO_STDERR);
-  _CrtSetReportMode(_CRT_ASSERT, _CRTDBG_MODE_FILE);
-  _CrtSetReportFile(_CRT_ASSERT, _CRTDBG_FILE_STDERR);
-  _CrtSetReportMode(_CRT_ERROR, _CRTDBG_MODE_FILE);
-  _CrtSetReportFile(_CRT_ERROR, _CRTDBG_FILE_STDERR);
-#endif
   // Unbuffered, so a run that dies mid-way still shows how far it got: a
   // block-buffered stdout loses everything when the process aborts.
   setvbuf(stdout, nullptr, _IONBF, 0);
@@ -1298,10 +1374,7 @@ int main() {
           .FromMaybe(-1);
     };
     const auto run = [&](const char* source) {
-      return v8::Script::Compile(
-                 current, v8::String::NewFromUtf8Literal(isolate, source))
-          .ToLocalChecked()
-          ->Run(current);
+      return RunScript(isolate, current, source, &failures);
     };
 
     // `kAuto` (the default): the promise reaction has run when Run returns.
@@ -1355,11 +1428,7 @@ int main() {
     v8::Local<v8::Context> current = context.Get(isolate);
     v8::Context::Scope context_scope(current);
     const auto run = [&](const char* source) {
-      return v8::Script::Compile(
-                 current, v8::String::NewFromUtf8Literal(isolate, source))
-          .ToLocalChecked()
-          ->Run(current)
-          .ToLocalChecked();
+      return RunScript(isolate, current, source, &failures);
     };
     const auto expect = [&](bool condition, const char* what) {
       if (!condition) {
@@ -1490,11 +1559,7 @@ int main() {
       }
     };
     const auto run = [&](const char* source) {
-      return v8::Script::Compile(
-                 current, v8::String::NewFromUtf8Literal(isolate, source))
-          .ToLocalChecked()
-          ->Run(current)
-          .ToLocalChecked();
+      return RunScript(isolate, current, source, &failures);
     };
 
     // NewFromOneByte takes Latin-1: 0xE9 is U+00E9, not the first byte of a
@@ -1634,18 +1699,10 @@ int main() {
       }
     };
     const auto run = [&](const char* source) {
-      return v8::Script::Compile(
-                 current, v8::String::NewFromUtf8Literal(isolate, source))
-          .ToLocalChecked()
-          ->Run(current)
-          .ToLocalChecked();
+      return RunScript(isolate, current, source, &failures);
     };
     const auto number_at = [&](const char* name) {
-      return current->Global()
-          ->Get(current, v8::String::NewFromUtf8Literal(isolate, name))
-          .ToLocalChecked()
-          ->Int32Value(current)
-          .FromMaybe(-1);
+      return IntGlobal(isolate, current, name, &failures);
     };
 
     v8::Local<v8::Promise::Resolver> resolver =
@@ -1745,9 +1802,7 @@ int main() {
     tmpl->Set(isolate, "makePromise",
               v8::FunctionTemplate::New(isolate, MakePromise));
     v8::Local<v8::Object> host = tmpl->NewInstance(current).ToLocalChecked();
-    current->Global()
-        ->Set(current, v8::String::NewFromUtf8Literal(isolate, "host"), host)
-        .ToChecked();
+    BindGlobal(isolate, current, "host", host, &failures);
     run("host.makePromise(99).then(function (value) {"
         " globalThis.callbackPromise = value; });");
     isolate->PerformMicrotaskCheckpoint();
@@ -1768,23 +1823,13 @@ int main() {
       }
     };
     const auto run = [&](const char* source) {
-      return v8::Script::Compile(
-                 current, v8::String::NewFromUtf8Literal(isolate, source))
-          .ToLocalChecked()
-          ->Run(current)
-          .ToLocalChecked();
+      return RunScript(isolate, current, source, &failures);
     };
     const auto bind = [&](const char* name, v8::Local<v8::Value> value) {
-      current->Global()
-          ->Set(current, v8::String::NewFromUtf8Literal(isolate, name), value)
-          .ToChecked();
+      BindGlobal(isolate, current, name, value, &failures);
     };
     const auto number_at = [&](const char* name) {
-      return current->Global()
-          ->Get(current, v8::String::NewFromUtf8Literal(isolate, name))
-          .ToLocalChecked()
-          ->Int32Value(current)
-          .FromMaybe(-1);
+      return IntGlobal(isolate, current, name, &failures);
     };
 
     v8::Local<v8::Map> map = v8::Map::New(current);
@@ -1873,23 +1918,13 @@ int main() {
       }
     };
     const auto run = [&](const char* source) {
-      return v8::Script::Compile(
-                 current, v8::String::NewFromUtf8Literal(isolate, source))
-          .ToLocalChecked()
-          ->Run(current)
-          .ToLocalChecked();
+      return RunScript(isolate, current, source, &failures);
     };
     const auto bind = [&](const char* name, v8::Local<v8::Value> value) {
-      current->Global()
-          ->Set(current, v8::String::NewFromUtf8Literal(isolate, name), value)
-          .ToChecked();
+      BindGlobal(isolate, current, name, value, &failures);
     };
     const auto number_at = [&](const char* name) {
-      return current->Global()
-          ->Get(current, v8::String::NewFromUtf8Literal(isolate, name))
-          .ToLocalChecked()
-          ->Int32Value(current)
-          .FromMaybe(-1);
+      return IntGlobal(isolate, current, name, &failures);
     };
 
     // The error factories make the engine's own objects, and ThrowException
@@ -2042,23 +2077,13 @@ int main() {
       }
     };
     const auto run = [&](const char* source) {
-      return v8::Script::Compile(
-                 current, v8::String::NewFromUtf8Literal(isolate, source))
-          .ToLocalChecked()
-          ->Run(current)
-          .ToLocalChecked();
+      return RunScript(isolate, current, source, &failures);
     };
     const auto bind = [&](const char* name, v8::Local<v8::Value> value) {
-      current->Global()
-          ->Set(current, v8::String::NewFromUtf8Literal(isolate, name), value)
-          .ToChecked();
+      BindGlobal(isolate, current, name, value, &failures);
     };
     const auto number_at = [&](const char* name) {
-      return current->Global()
-          ->Get(current, v8::String::NewFromUtf8Literal(isolate, name))
-          .ToLocalChecked()
-          ->Int32Value(current)
-          .FromMaybe(-1);
+      return IntGlobal(isolate, current, name, &failures);
     };
 
     // A new buffer is zeroed, and a host write is what the script reads.
@@ -2466,16 +2491,10 @@ int main() {
       }
     };
     const auto bind = [&](const char* name, v8::Local<v8::Value> value) {
-      current->Global()
-          ->Set(current, v8::String::NewFromUtf8Literal(isolate, name), value)
-          .ToChecked();
+      BindGlobal(isolate, current, name, value, &failures);
     };
     const auto number_at = [&](const char* name) {
-      return current->Global()
-          ->Get(current, v8::String::NewFromUtf8Literal(isolate, name))
-          .ToLocalChecked()
-          ->Int32Value(current)
-          .FromMaybe(-1);
+      return IntGlobal(isolate, current, name, &failures);
     };
 
     // (func (export "add") (param i32 i32) (result i32) local.get 0
@@ -2665,9 +2684,7 @@ int main() {
       }
     };
     const auto bind = [&](const char* name, v8::Local<v8::Value> value) {
-      current->Global()
-          ->Set(current, v8::String::NewFromUtf8Literal(isolate, name), value)
-          .ToChecked();
+      BindGlobal(isolate, current, name, value, &failures);
     };
     const auto run = [&](const char* source) {
       v8::TryCatch caught(isolate);
@@ -2684,11 +2701,7 @@ int main() {
       return result;
     };
     const auto number_at = [&](const char* name) {
-      return current->Global()
-          ->Get(current, v8::String::NewFromUtf8Literal(isolate, name))
-          .ToLocalChecked()
-          ->Int32Value(current)
-          .FromMaybe(-1);
+      return IntGlobal(isolate, current, name, &failures);
     };
 
     v8::Local<v8::Value> data = v8::Integer::New(isolate, 7);
@@ -2820,8 +2833,8 @@ int main() {
                                       v8::Integer::New(isolate, 3));
       v8::Local<v8::Object> guarded =
           checked->NewInstance(current).ToLocalChecked();
-      guarded->Set(current, v8::String::NewFromUtf8Literal(isolate, "value"),
-                   v8::Integer::New(isolate, 11)).ToChecked();
+      SetOrReport(isolate, current, guarded, "value",
+                  v8::Integer::New(isolate, 11), &failures);
       bind("guarded", guarded);
       run("globalThis.sameRealm = guarded.value;");
       expect(number_at("sameRealm") == 11,
@@ -2834,10 +2847,8 @@ int main() {
       v8::Local<v8::Context> other = v8::Context::New(isolate);
       {
         v8::Context::Scope other_scope(other);
-        other->Global()
-            ->Set(other, v8::String::NewFromUtf8Literal(isolate, "guarded"),
-                  guarded)
-            .ToChecked();
+        SetOrReport(isolate, other, other->Global(), "guarded", guarded,
+                    &failures);
         bool refused = false;
         {
           v8::TryCatch caught(isolate);
@@ -2863,12 +2874,9 @@ int main() {
                                        v8::Integer::New(isolate, 4));
         v8::Local<v8::Object> open =
             shared->NewInstance(current).ToLocalChecked();
-        open->Set(current, v8::String::NewFromUtf8Literal(isolate, "value"),
-                  v8::Integer::New(isolate, 21))
-            .ToChecked();
-        other->Global()
-            ->Set(other, v8::String::NewFromUtf8Literal(isolate, "open"), open)
-            .ToChecked();
+        SetOrReport(isolate, current, open, "value",
+                    v8::Integer::New(isolate, 21), &failures);
+        SetOrReport(isolate, other, other->Global(), "open", open, &failures);
         v8::TryCatch caught(isolate);
         v8::Local<v8::Script> script;
         v8::Local<v8::Value> result;
@@ -2909,23 +2917,13 @@ int main() {
       }
     };
     const auto run = [&](const char* source) {
-      return v8::Script::Compile(
-                 current, v8::String::NewFromUtf8Literal(isolate, source))
-          .ToLocalChecked()
-          ->Run(current)
-          .ToLocalChecked();
+      return RunScript(isolate, current, source, &failures);
     };
     const auto bind = [&](const char* name, v8::Local<v8::Value> value) {
-      current->Global()
-          ->Set(current, v8::String::NewFromUtf8Literal(isolate, name), value)
-          .ToChecked();
+      BindGlobal(isolate, current, name, value, &failures);
     };
     const auto number_at = [&](const char* name) {
-      return current->Global()
-          ->Get(current, v8::String::NewFromUtf8Literal(isolate, name))
-          .ToLocalChecked()
-          ->Int32Value(current)
-          .FromMaybe(-1);
+      return IntGlobal(isolate, current, name, &failures);
     };
 
     v8::Local<v8::ObjectTemplate> tmpl = v8::ObjectTemplate::New(isolate);
@@ -2983,23 +2981,13 @@ int main() {
       }
     };
     const auto run = [&](const char* source) {
-      return v8::Script::Compile(
-                 current, v8::String::NewFromUtf8Literal(isolate, source))
-          .ToLocalChecked()
-          ->Run(current)
-          .ToLocalChecked();
+      return RunScript(isolate, current, source, &failures);
     };
     const auto bind = [&](const char* name, v8::Local<v8::Value> value) {
-      current->Global()
-          ->Set(current, v8::String::NewFromUtf8Literal(isolate, name), value)
-          .ToChecked();
+      BindGlobal(isolate, current, name, value, &failures);
     };
     const auto number_at = [&](const char* name) {
-      return current->Global()
-          ->Get(current, v8::String::NewFromUtf8Literal(isolate, name))
-          .ToLocalChecked()
-          ->Int32Value(current)
-          .FromMaybe(-1);
+      return IntGlobal(isolate, current, name, &failures);
     };
 
     v8::Local<v8::FunctionTemplate> guarded =

@@ -1289,6 +1289,19 @@ code 3 and no message, which is why the harness now sets stdout unbuffered and
 switches the CRT's abort and assert dialogs off at startup: a failing run must
 print and exit, never block on a modal box.
 
+*The harness reports instead of aborting (2026-11-01).* The abort was reachable
+because every block's `run`, `bind` and `number_at` ended in `ToLocalChecked` or
+`ToChecked`, so a thrown script killed the process before anything could say
+what it was. Those three now delegate to `RunScript`, `BindGlobal` and
+`IntGlobal`, which go through a `TryCatch`, print what threw with the first 90
+characters of the source, and count a failure, so one broken block no longer
+hides the rest of the run. The check was made the hard way: a probe script that
+throws prints and exits 1 with the rest of the harness still running, where it
+used to abort with no output at all. A block's own ad-hoc `ToLocalChecked()` is
+still a hard stop, and the dialog suppression (a static initializer now, so it is
+armed before `main`, and `main` keeps the unbuffered stdout) is what keeps that
+from blocking a caller.
+
 ## 15. Sources
 
 Verified on 2026-10-31:

@@ -856,7 +856,15 @@ a b
 The `3 + 4 = 7` line is the sample's WebAssembly half, running through the
 engine's `wasm` feature.
 
-`gin-shapes` exits 0 only if every check passes; the predicate block asserts the
+`gin-shapes` exits 0 only if every check passes. A failing step is **reported, not
+fatal**: the shared `run`, `bind` and `number_at` helpers compile and run through
+a `TryCatch`, print what threw (with the first 90 characters of the source) and
+count a failure, so one broken block does not hide the rest of the run. The
+remaining ad-hoc `ToLocalChecked()` calls in a block are still hard stops, which
+is why the harness also switches the CRT's abort and assert dialogs off at
+startup (a static initializer, so it is armed before `main`) and runs stdout
+unbuffered: a dying run prints and exits instead of opening a modal box.
+The predicate block asserts the
 shape and brand bits for objects, arrays, functions, numbers, strings, symbols,
 bigints, dates, regexps, promises, maps, sets, errors, typed arrays, array
 buffers, proxies, and arguments objects, plus the `StrictEquals`/`SameValue`
