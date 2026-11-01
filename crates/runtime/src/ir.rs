@@ -3686,6 +3686,14 @@ impl Frame {
             Frame::Heap(vec) => &mut vec[slot],
         }
     }
+
+    #[inline]
+    pub(crate) fn len(&self) -> usize {
+        match self {
+            Frame::Inline(buf) => buf.len(),
+            Frame::Heap(vec) => vec.len(),
+        }
+    }
 }
 
 /// Build a certified body's frame: params in slots `0..arity` (source
@@ -5186,6 +5194,26 @@ impl Vm {
     /// scope analysis certified.
     pub fn setup_frame(&mut self, scope: &ScopeInfo, args: &[Value]) {
         self.frame = leaf_frame(scope, args);
+    }
+
+    /// The frame's slots, copied out for a debugger evaluation
+    /// (`Debugger.evaluateOnCallFrame`). A certified body keeps its locals here
+    /// rather than in an environment, so this is the only way an evaluation can
+    /// see them.
+    pub(crate) fn frame_values(&self) -> Vec<Value> {
+        (0..self.frame.len())
+            .map(|slot| *self.frame.get(slot))
+            .collect()
+    }
+
+    /// Write a debugger evaluation's slots back into the frame it ran against,
+    /// so an assignment in the evaluated expression reaches the halted body's
+    /// local. Both frames belong to the same scope, so the lengths agree; the
+    /// shorter of the two bounds a mismatch rather than panicking.
+    pub(crate) fn set_frame_values(&mut self, values: &[Value]) {
+        for (slot, value) in values.iter().take(self.frame.len()).enumerate() {
+            *self.frame.get_mut(slot) = *value;
+        }
     }
 
     /// The activation-granularity value-stack guard: called once when a body
@@ -29273,6 +29301,61 @@ pub fn compile_statements(
         leaf_ops: None,
         reg_ops: None,
         script_globals: compiler.script_globals,
+        jit_info: std::cell::Cell::new(0),
+        jit_calls: std::cell::Cell::new(0),
+        jit_evictions: std::cell::Cell::new(0),
+        jit_used: std::cell::Cell::new(0),
+        ident_names,
+        has_loop,
+        has_call_apply,
+        has_call_intrinsic,
+        max_stack,
+        nested_gate: std::cell::Cell::new(None),
+        same_stack_gate: std::cell::Cell::new(None),
+        feedback: std::cell::RefCell::new(None),
+    })
+}
+
+/// Compile an eval's statements against an existing frame scope: the debugger's
+/// frame evaluation (`Debugger.evaluateOnCallFrame`).
+///
+/// The scope is the halted body's, so a name that is a slot there compiles to a
+/// slot access — which is what makes a certified body's locals visible, and
+/// writable, to the evaluated expression. Everything the scope does not name
+/// still resolves through the environment chain, exactly as a direct eval does.
+pub(crate) fn compile_eval_in_frame(
+    stmts: &[Stmt],
+    scope: ScopeInfo,
+    strict: bool,
+    debug_points: bool,
+) -> Result<CompiledBody, JsError> {
+    let _guard = CompilingGuard::new();
+    let mut compiler = Compiler {
+        scope: Some(scope),
+        strict,
+        debug_points,
+        ..Compiler::default()
+    };
+    compiler.compile_statements(stmts)?;
+    compiler.resolve();
+    let has_loop = body_has_loop(&compiler.steps);
+    let has_call_apply = body_has_call_apply(&compiler.steps);
+    let has_call_intrinsic = body_has_call_intrinsic(&compiler.steps);
+    let ident_names = collect_ident_names(&compiler.steps);
+    let max_stack = max_stack_usage(&compiler.steps);
+    Ok(CompiledBody {
+        steps: compiler.steps,
+        handlers: compiler.handlers,
+        strict,
+        scope: compiler.scope,
+        env_constant: !compiler.env_changing,
+        // An evaluation is never a callee.
+        leaf: false,
+        leaf_needs_env: false,
+        leaf_uses_env: false,
+        leaf_ops: None,
+        reg_ops: None,
+        script_globals: None,
         jit_info: std::cell::Cell::new(0),
         jit_calls: std::cell::Cell::new(0),
         jit_evictions: std::cell::Cell::new(0),

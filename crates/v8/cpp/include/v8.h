@@ -1765,12 +1765,10 @@ class Context {
   void RequestPause();
   bool Paused(PauseInfo* out) const;
   MaybeLocal<Value> Resume();
-  /* Evaluate `source` at the stopped position (`Debugger.evaluateOnCallFrame`):
-   * a direct eval under the paused run's context, so the scope the run stopped
-   * in is what the expression sees. A certified body's own locals live in the
-   * halted frame's slot array rather than in an environment, so an expression
-   * naming one of those reports it undefined until the evaluation is compiled
-   * against the frame. */
+  /* Evaluate `source` at the stopped position (`Debugger.evaluateOnCallFrame`).
+   * The evaluation is compiled against the halted body's scope, so a certified
+   * body's slot locals are both readable and writable: an assignment reaches the
+   * local the resumed body will read. */
   MaybeLocal<Value> EvaluateOnPausedFrame(Local<String> source);
 
   class Scope {

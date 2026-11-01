@@ -5367,6 +5367,61 @@ mod tests {
     }
 
     #[test]
+    fn evaluating_at_the_pause_reaches_the_halted_frames_slots() {
+        // A call-free script is slotified (`script_slots_allows`), so its `var`
+        // lives in the frame and the global is only a prologue/epilogue mirror.
+        // That makes the two halves distinguishable: a read must see the slot,
+        // and an assignment must not reach the global.
+        let mut context = Context::new().unwrap();
+        context.agent_mut().set_debug_attached(true).unwrap();
+        let source = "var local = 41;
+local = local + 1;
+local;
+";
+        let offset = source.find("local = local + 1;").unwrap() as u32;
+        context.agent_mut().set_breakpoints(&[offset]);
+
+        let error = context.agent_mut().run_script(source).unwrap_err();
+        assert_eq!(error.message, "execution paused at a breakpoint");
+        assert_eq!(
+            context.agent().paused_position().map(|span| span.start),
+            Some(offset)
+        );
+
+        assert_eq!(
+            context.evaluate_paused("local + 1").unwrap().as_number(),
+            Some(42.0),
+            "the slot local is in view"
+        );
+        assert_eq!(
+            context
+                .evaluate_paused("(local = 100, local)")
+                .unwrap()
+                .as_number(),
+            Some(100.0)
+        );
+        assert!(
+            context
+                .evaluate_paused("globalThis.local")
+                .unwrap()
+                .is_undefined(),
+            "the assignment reached the frame slot, not its global mirror"
+        );
+
+        let value = crate::eval::resume_paused(context.agent_mut()).unwrap();
+        assert_eq!(
+            value.as_number(),
+            Some(101.0),
+            "the resumed body reads the slot the evaluation wrote"
+        );
+        assert_eq!(
+            context.eval("globalThis.local").unwrap().as_number(),
+            Some(101.0),
+            "the epilogue mirrors the slot once the script completes"
+        );
+    }
+
+    #[test]
     fn create_object_builds_a_namespace() {
         let mut context = Context::new().unwrap();
         let host = context.create_object().unwrap();

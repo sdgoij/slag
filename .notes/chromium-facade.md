@@ -1760,15 +1760,23 @@ error, offset breakpoints, outermost-only stops) are stated for a host
 integrator.
 
 **2026-11-01, `evaluateOnCallFrame` landed; what the continuation stack costs.**
-`eval::evaluate_paused` runs the host's expression as a direct eval under the
-paused run's own context and strictness, so a top-level `let`/`const`, a global
-read and a captured binding are all in view, and the parked record is untouched
-(an evaluation cannot pause, and the debug point's gate refuses while one is
-parked, or it would overwrite the record it is evaluating against). What it does
-not see is a certified body's *slot* locals: those live in the halted frame's
-`Vm::frame`, and a direct eval resolves through environments, so an expression
-naming one reports it undefined. Closing that needs the evaluation compiled
-against the frame, which is its own slice.
+`eval::evaluate_paused` compiles the host's expression against the *halted
+body's* scope (`ir::compile_eval_in_frame`), runs it on a scratch `Vm` whose
+frame is a copy of the parked one, and writes the frame back. That is what makes
+a certified body's locals real to the evaluation: a name that is a slot there
+becomes a slot access, so `counter + 1` reads the frame and `counter = 100`
+writes it, and the resumed body then reads what the debugger wrote (the C++
+sample prints `evaluated: counter = 100` then `resumed: the script completed with
+101`). A body with no scope keeps the environment-path direct eval, which is
+what a direct eval already does for it. Two consequences worth keeping:
+
+- The evaluation cannot pause: the point's gate refuses while a run is parked,
+  or the evaluation would overwrite the record it is evaluating against.
+- The evaluation's step points are off (`debug_points: false`), so a breakpoint
+  inside an expression cannot stop it mid-way either.
+
+`using` at the top level of an evaluation is a `SyntaxError`, as it is for
+`eval`: the scratch run has no disposal pass to give it.
 
 Lifting the outermost-only restriction is bigger than it looks, and the reason is
 now concrete rather than a hunch. A stop inside a called function has to unwind a

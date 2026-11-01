@@ -207,33 +207,115 @@ pub fn resume_paused(agent: &mut Agent) -> Result<Value, JsError> {
 /// Evaluate `source` at a stopped session's position
 /// (`Debugger.evaluateOnCallFrame`).
 ///
-/// The evaluation runs as a direct eval under the context the run stopped in,
-/// so the paused body's lexical scope is what the expression sees: a top-level
-/// `let`/`const`, a `var` read through the global object, a captured binding.
-/// What it does not see are the frame's *slots*: a certified body keeps its
-/// locals in the halted frame's slot array (`Vm::frame`), and a direct eval
-/// resolves names through environments, so an expression naming a slot local
-/// reports it as undefined. Reading slot locals needs the evaluation to be
-/// compiled against that frame, which is the next slice.
+/// A certified body keeps its locals in the halted frame's slot array rather
+/// than in an environment, so the evaluation is compiled against that body's
+/// scope: a name that is a slot there becomes a slot access, which makes the
+/// locals both readable and writable (an assignment reaches the halted body's
+/// local, and the frame is written back afterwards). Everything the scope does
+/// not name still resolves through the environment chain, as a direct eval
+/// does. A body without a scope keeps the plain environment-path evaluation.
 ///
 /// The evaluation cannot pause: the parked record is the frame being evaluated
 /// against, and a second stop would overwrite it.
 pub fn evaluate_paused(agent: &mut Agent, source: &str) -> Result<Value, JsError> {
-    let Some((context, strict)) = agent.paused_frame() else {
-        return Err(JsError::new(
-            ErrorKind::Error,
-            "no paused run to evaluate on".into(),
-        ));
+    let (context, scope, frame, strict) = {
+        let paused = agent.roots.paused.borrow();
+        let Some(run) = paused.as_ref() else {
+            return Err(JsError::new(
+                ErrorKind::Error,
+                "no paused run to evaluate on".into(),
+            ));
+        };
+        (
+            run.context.clone(),
+            run.body.scope.clone(),
+            run.vm.frame_values(),
+            run.vm.strict,
+        )
     };
+    let Some(scope) = scope else {
+        return evaluate_in_paused_env(agent, context, strict, source);
+    };
+
+    let units = JsString::from_utf8(source);
+    let eval_context = parser::EvalContext {
+        in_function: context.function.is_some(),
+        in_method: false,
+        allow_private: false,
+    };
+    let program = parser::parse_script_utf16_eval(units.as_slice(), &eval_context, &[])?;
+    if program
+        .body
+        .iter()
+        .any(|stmt| matches!(stmt.kind, StmtKind::UsingDecl { .. }))
+    {
+        return Err(JsError::new(
+            ErrorKind::SyntaxError,
+            "using declarations are not allowed at the top level of eval".into(),
+        ));
+    }
+    let body = crate::ir::compile_eval_in_frame(&program.body, scope, strict, false)?;
+
     agent.roots.execution_context_stack.push(context);
-    let result = crate::script::perform_eval(
-        agent,
-        &crux::string::JsString::from_utf8(source),
-        strict,
-        true,
-    );
+    let result = (|| -> Result<Value, JsError> {
+        let env = agent.running_context()?.lexical_environment;
+        let mut vm = agent.take_vm(env, strict);
+        vm.set_frame_values(&frame);
+        let outcome = vm.start(agent, &body);
+        // Assignments the expression made are the body's, whether it completed
+        // or threw, so the frame goes back before the outcome is judged.
+        let updated = vm.frame_values();
+        let completion = match outcome {
+            Ok(crate::ir::VmOutcome::Completed(completion)) => completion,
+            Ok(crate::ir::VmOutcome::Suspended(_)) => {
+                agent.return_vm(vm);
+                return Err(JsError::new(
+                    ErrorKind::SyntaxError,
+                    "yield/await in a script top level".into(),
+                ));
+            }
+            // The points are off for an evaluation (`debug_points: false`), so
+            // nothing can stop it, and a driver outcome cannot escape it.
+            Ok(_) => {
+                agent.return_vm(vm);
+                return Err(JsError::new(
+                    ErrorKind::Error,
+                    "a frame evaluation produced a driver outcome".into(),
+                ));
+            }
+            Err(error) => {
+                agent.return_vm(vm);
+                write_back_frame(agent, &updated);
+                return Err(error);
+            }
+        };
+        agent.return_vm(vm);
+        write_back_frame(agent, &updated);
+        completion_to_result(completion)
+    })();
     agent.roots.execution_context_stack.pop();
     result
+}
+
+/// The environment-path evaluation: a direct eval under the paused run's
+/// context, for a body that keeps no frame slots.
+fn evaluate_in_paused_env(
+    agent: &mut Agent,
+    context: crate::context::ExecutionContext,
+    strict: bool,
+    source: &str,
+) -> Result<Value, JsError> {
+    agent.roots.execution_context_stack.push(context);
+    let result = crate::script::perform_eval(agent, &JsString::from_utf8(source), strict, true);
+    agent.roots.execution_context_stack.pop();
+    result
+}
+
+/// Install an evaluation's slots into the halted frame it ran against.
+fn write_back_frame(agent: &Agent, values: &[Value]) {
+    if let Some(run) = agent.roots.paused.borrow_mut().as_mut() {
+        run.vm.set_frame_values(values);
+    }
 }
 
 pub(crate) fn eval_statement_list(

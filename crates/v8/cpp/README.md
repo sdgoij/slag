@@ -87,10 +87,11 @@ per context and a session debugs one script at a time.
 - **A stop happens in the outermost activation.** A breakpoint inside a function
 that is still on the stack stops when control returns to the outermost frame;
 lifting that is the continuation-stack slice.
-- **`EvaluateOnPausedFrame` sees the stopped scope, not its frame slots.** An
-expression runs as a direct eval under the paused run's context, so top-level
-bindings, globals and captured variables are in view; a certified body's locals
-live in the halted frame's slot array, so naming one reports it undefined.
+- **`EvaluateOnPausedFrame` sees the stopped scope, frame slots included.** An
+expression and an assignment both reach a certified body's locals: the engine
+compiles the evaluation against the halted body's scope, runs it on the frame,
+and writes the frame back, so `counter = 100` at a stop changes what the resumed
+code reads.
 
 
 ## A1: the indirect handle

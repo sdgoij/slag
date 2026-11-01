@@ -40,19 +40,16 @@ const SuppressDialogBoxes kSuppressDialogBoxes;
 
 namespace {
 
-// The breakpointed statement sits inside a `try`, so the demo also shows that a
-// stop does not unwind: the `finally` runs only after the resume.
+// A call-free script is the case where the engine keeps its `var`s in the
+// halted frame rather than on the global object, so the evaluation below shows
+// both halves of `EvaluateOnPausedFrame`: it reads the slot, and an assignment
+// reaches the slot the resumed script then reads.
 const char kSource[] =
-    "let counter = 41;\n"
-    "globalThis.ran = false;\n"
-    "try {\n"
-    "  globalThis.ran = true;\n"
-    "} finally {\n"
-    "  globalThis.fin = true;\n"
-    "}\n"
-    "globalThis.ran;";
+    "var counter = 41;\n"
+    "counter = counter + 1;\n"
+    "counter;";
 
-const char kBreakpoint[] = "globalThis.ran = true;";
+const char kBreakpoint[] = "counter = counter + 1;";
 
 // Answers null on success, or the reason the demo failed.
 const char* RunDemo(v8::Isolate* isolate, v8::Local<v8::Context> context) {
@@ -77,8 +74,9 @@ const char* RunDemo(v8::Isolate* isolate, v8::Local<v8::Context> context) {
     if (pause.start != offset) return "the stop named the wrong position";
     printf("paused: breakpoint at offset %u\n", pause.start);
 
-    /* Evaluate at the stop: a top-level `let` is in the scope the run stopped
-     * in, so the expression sees it. */
+    /* Evaluate at the stop: `counter` is a frame slot of the halted script,
+     * so the expression reads it and the assignment writes the slot the script
+     * will use when it continues. */
     v8::Local<v8::Value> probed;
     v8::Local<v8::String> question =
         v8::String::NewFromUtf8Literal(isolate, "counter + 1");
@@ -87,7 +85,14 @@ const char* RunDemo(v8::Isolate* isolate, v8::Local<v8::Context> context) {
     }
     int32_t answer = probed->Int32Value(context).FromMaybe(0);
     printf("evaluated: counter + 1 = %d\n", answer);
-    if (answer != 42) return "the paused frame's scope was not in view";
+    if (answer != 42) return "the halted frame's slot was not in view";
+
+    v8::Local<v8::String> assignment =
+        v8::String::NewFromUtf8Literal(isolate, "(counter = 100, counter)");
+    if (!context->EvaluateOnPausedFrame(assignment).ToLocal(&probed)) {
+      return "assign on the paused frame";
+    }
+    printf("evaluated: counter = %d\n", probed->Int32Value(context).FromMaybe(0));
   }
 
   v8::Local<v8::Value> value;
@@ -95,7 +100,9 @@ const char* RunDemo(v8::Isolate* isolate, v8::Local<v8::Context> context) {
   if (!resumed.ToLocal(&value)) return "resume";
   int32_t completed = value->Int32Value(context).FromMaybe(0);
   printf("resumed: the script completed with %d\n", completed);
-  if (completed != 1) return "the resumed run did not reach the script's value";
+  if (completed != 101) {
+    return "the resumed run did not read the slot the evaluation wrote";
+  }
   if (context->Paused(nullptr)) return "a finished run must not stay parked";
   return nullptr;
 }
