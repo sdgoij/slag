@@ -226,6 +226,62 @@ int32_t slag_debug_resume(SlagContext* context, uint64_t* out);
  * a direct eval under the paused run's context, answering its value. */
 int32_t slag_debug_evaluate(SlagContext* context, const uint8_t* source, size_t len,
                             uint64_t* out);
+
+/* The inspector: a Chrome DevTools Protocol session over the debugger above
+ * (`v8-inspector.h` in the facade). The engine speaks in source offsets and the
+ * protocol in script ids, URLs and (line, column) commands, so the session owns
+ * that translation: a script registered here is what a URL breakpoint resolves
+ * against, and a stop becomes a `Debugger.paused` with its call frames. The
+ * protocol itself is not in C++; `dispatch` and `poll` are the whole seam.
+ *
+ * One session per context. A Blink context group is a frame and holds a main
+ * world plus its isolated worlds, each a `v8::Context`, so a group-wide session
+ * is what this has to grow next (`.notes/chromium-facade.md` section 14.3). */
+
+/* One protocol message: a JSON text the session produced, owned by the
+ * `SlagMessages` that lists it. */
+typedef struct SlagProtocolMessage {
+  uint8_t* ptr;
+  size_t len;
+} SlagProtocolMessage;
+
+/* The messages one call produced, in the session's delivery order. A dispatch
+ * answers the events it caused first and the response to its command last, so a
+ * transport replies with the last message and notifies with the rest; a poll
+ * answers only events. Free with `slag_messages_free`. */
+typedef struct SlagMessages {
+  SlagProtocolMessage* items;
+  size_t len;
+} SlagMessages;
+
+/* Open a session; answers 3 when one is already open on the context. */
+int32_t slag_inspector_open(SlagContext* context);
+/* Close it: a parked run continues and the engine detaches. */
+int32_t slag_inspector_close(SlagContext* context);
+/* Feed one protocol message, answering its events and its response. Answers 0
+ * even when the response is a protocol error, which is data. */
+int32_t slag_inspector_dispatch(SlagContext* context, const uint8_t* message,
+                                size_t len, SlagMessages* out);
+/* The events a run produced: the script announcements a compile queued, then a
+ * `Debugger.paused` for a stop that has not been announced. */
+int32_t slag_inspector_poll(SlagContext* context, SlagMessages* out);
+void slag_messages_free(SlagMessages* messages);
+/* Evaluate `source` in the session's context (`V8InspectorSession::evaluate`):
+ * how a host injects what it installs for the command line. */
+int32_t slag_inspector_evaluate(SlagContext* context, const uint8_t* source,
+                                size_t len, uint64_t* out);
+/* Register text the host did not compile through `slag_compile`, which
+ * registers the scripts it compiles itself. `out` answers the `scriptParsed`
+ * events due. */
+int32_t slag_inspector_add_script(SlagContext* context, const uint8_t* name,
+                                  size_t name_len, const uint8_t* source,
+                                  size_t source_len, SlagMessages* out);
+/* Whether the session answers `method`
+ * (`V8InspectorSession::canDispatchMethod`). */
+int32_t slag_inspector_can_dispatch(const uint8_t* method, size_t len);
+/* The id the command `message` answers, or -1 for a message that names none:
+ * what a transport needs to tell a response from an event. */
+int64_t slag_inspector_call_id(const uint8_t* message, size_t len);
 /* Drain the job queues. 1 when a job was queued, 0 when none was, -1 with a
  * pending error when a job threw. */
 int32_t slag_drain_jobs(SlagContext* context);

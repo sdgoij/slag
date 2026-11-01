@@ -50,6 +50,7 @@ crates/v8/cpp/build/Release/shell.exe -e "print(1 + 2)"
 crates/v8/cpp/build/Release/shell.exe -e "print(version())"
 crates/v8/cpp/build/Release/gin-shapes.exe
 crates/v8/cpp/build/Release/debugger.exe
+crates/v8/cpp/build/Release/inspector.exe
 ```
 
 ## The debugger surface
@@ -124,6 +125,56 @@ bindings are exposed on the Rust embedding API (`Context::paused_scopes` and
 `Context::own_properties`) and through the inspector's `scopeChain` and
 `Runtime.getProperties`; V8 puts the same machinery behind the inspector, so
 `v8::Context` does not grow it. A listing never runs a getter.
+
+## The inspector surface
+
+`v8-inspector.h` is the V8-shaped door onto the same machinery: a DevTools
+client creates an inspector, announces its contexts by group, connects a
+session with a channel, and from then on speaks the Chrome DevTools Protocol.
+`inspector.exe` runs that path end to end: `Debugger.enable`,
+`setBreakpointByUrl`, the script's `scriptParsed`, the run stopping at the
+breakpoint, `Debugger.paused` with its call frames and scope chain,
+`evaluateOnCallFrame`, `Debugger.resume`, `Debugger.resumed`.
+
+```c++
+v8_inspector::V8ContextInfo info(context, group, View("app"));
+inspector->contextCreated(info);
+channel = /* your V8Inspector::Channel */;
+auto session = inspector->connect(group, &channel);
+session->dispatchProtocolMessage(View("{\"id\":1,\"method\":\"Debugger.enable\"}"));
+script->Run(context);          // stops: answers empty
+session->pollEvents();         // the channel now holds Debugger.paused
+```
+
+- **The protocol is the Rust session's.** `crates/inspector` owns the script
+registry, breakpoint resolution and `Debugger.paused`; `crates/slagc` carries it
+across the C ABI (`slag_inspector_*`) and this layer is the shell that speaks
+`StringView` and `Channel`. Nothing about the protocol is implemented in C++.
+- **A compile registers its script.** `Script::Compile` feeds the session, which
+is where V8 reports `scriptParsed` from; the announcement reaches the channel on
+the next poll. `slag_inspector_add_script` is the door for text a host loads
+some other way.
+- **The pause loop is the host's.** V8 calls
+`V8InspectorClient::runMessageLoopOnPause` from inside the run and returns to it
+after the debugger resumes. Here the run returns with the park in place, the
+host polls the session, and the resume happens inside
+`dispatchProtocolMessage`; a resumed run therefore completes there, and the
+value it completes with is not `Script::Run`'s. `pollEvents` is this facade's
+own method, not V8's, and exists for exactly that reason.
+- **One session per context, and one context per group.** A Blink group is a
+frame and holds a main world plus its isolated worlds, so this is the next thing
+the session has to grow; `connect` answers null for such a group rather than
+pretending to cover it.
+- **A channel callback must not re-enter the session.** The callbacks run inside
+the session's own call, where its state is borrowed, so `dispatchProtocolMessage`
+called from `sendNotification` is refused. Record the message and dispatch after
+the call returns, which is what a browser's channel does anyway.
+- **What is not here is the generated protocol tree.** `wrapObject`/
+`unwrapObject` (Blink's DOM, Network, EventBreakpoints and Log agents call
+them), `searchInTextByLines`, `supportedDomains`, `deepSerialize`,
+`V8StackTrace` and the console and async-task callbacks all need
+`protocol::*` types generated from `js_protocol.pdl`; `.notes/chromium-facade.md`
+§14.3 records each with its cost.
 
 
 ## A1: the indirect handle

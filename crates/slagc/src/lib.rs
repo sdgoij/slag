@@ -20,6 +20,13 @@ use std::ffi::{c_char, c_void};
 use std::rc::Rc;
 
 mod handler;
+mod inspector_abi;
+
+pub use inspector_abi::{
+    SlagMessages, SlagProtocolMessage, slag_inspector_add_script, slag_inspector_call_id,
+    slag_inspector_can_dispatch, slag_inspector_close, slag_inspector_dispatch,
+    slag_inspector_evaluate, slag_inspector_open, slag_inspector_poll, slag_messages_free,
+};
 
 use handler::CxxHandler;
 pub use handler::{SlagPropertyDescriptor, SlagPropertyHandler};
@@ -73,6 +80,11 @@ pub struct SlagContext {
     /// and the resolving function are roots for as long as an entry exists, which
     /// is what keeps the key from ever naming another function.
     resolvers: RefCell<std::collections::HashMap<u64, Resolver>>,
+    /// The protocol session a `v8_inspector` client connected to, when one has.
+    /// It lives here rather than behind an opaque handle because a compile
+    /// registers its script with it: V8 announces `Debugger.scriptParsed` at
+    /// compilation, and `slag_compile` is the only place that sees the text.
+    inspector: RefCell<Option<inspector_abi::InspectorState>>,
 }
 
 /// One capability a `v8::Promise::Resolver` handle names: the promise it settles
@@ -1096,6 +1108,7 @@ pub extern "C" fn slag_context_new(_isolate: *mut SlagIsolate) -> *mut SlagConte
                 pending_error: Rc::new(RefCell::new(None)),
                 agent,
                 resolvers: RefCell::new(std::collections::HashMap::new()),
+                inspector: RefCell::new(None),
             }))
         }
         Err(_) => std::ptr::null_mut(),
@@ -1167,6 +1180,33 @@ pub unsafe extern "C" fn slag_compile(
     };
     match engine.compile_script(source) {
         Ok(script) => {
+            // Under a session a compile is what announces the script: V8 reports
+            // `Debugger.scriptParsed` here, and the registry's ids and URLs are
+            // what a breakpoint names. A session that is not enabled still
+            // records it, and `Debugger.enable` replays the announcements. The
+            // hook is the reason `slag_inspector_add_script` also exists: text a
+            // host loads some other way is registered by hand.
+            let failed = match context.inspector.try_borrow_mut() {
+                Ok(mut guard) => match guard.as_mut() {
+                    Some(state) => match state.session.add_script(&engine, name, source) {
+                        Ok((_id, events)) => {
+                            state.pending.extend(events);
+                            None
+                        }
+                        Err(message) => Some(message),
+                    },
+                    None => None,
+                },
+                Err(_) => None,
+            };
+            if let Some(message) = failed {
+                // The text parsed, but the body the debugger compiles for its
+                // points did not: the script cannot be broken on or stepped, so
+                // this is the compile failure a host hears about rather than a
+                // script that silently runs outside the session.
+                record(context, JsError::new(ErrorKind::SyntaxError, message));
+                return 1;
+            }
             if !out.is_null() {
                 *out = Box::into_raw(Box::new(SlagScript { script }));
             }
@@ -5417,6 +5457,155 @@ mod tests {
                 slag_debug_paused(context, &mut pause),
                 0,
                 "nothing is parked"
+            );
+
+            slag_script_free(script);
+            slag_context_free(context);
+            slag_isolate_free(isolate);
+        }
+    }
+
+    /// The message spans one call answered, so a test reads them the way a
+    /// transport does.
+    unsafe fn messages_of(messages: &SlagMessages) -> Vec<String> {
+        if messages.items.is_null() {
+            return Vec::new();
+        }
+        std::slice::from_raw_parts(messages.items, messages.len)
+            .iter()
+            .map(|span| {
+                std::str::from_utf8(std::slice::from_raw_parts(span.ptr, span.len))
+                    .expect("protocol messages are utf-8")
+                    .to_string()
+            })
+            .collect()
+    }
+
+    /// The dispatcher sends a command through the same door a DevTools client
+    /// does, and reads the answer the way `V8Inspector::Channel` split it.
+    unsafe fn send(context: *mut SlagContext, command: &str) -> Vec<String> {
+        let mut out = SlagMessages {
+            items: std::ptr::null_mut(),
+            len: 0,
+        };
+        assert_eq!(
+            slag_inspector_dispatch(context, command.as_ptr(), command.len(), &mut out),
+            0
+        );
+        let messages = messages_of(&out);
+        slag_messages_free(&mut out);
+        messages
+    }
+
+    #[test]
+    fn a_protocol_session_announces_stops_and_resumes_them() {
+        unsafe {
+            let isolate = slag_isolate_new();
+            let context = slag_context_new(isolate);
+
+            assert_eq!(slag_inspector_open(context), 0);
+            assert_eq!(
+                slag_inspector_open(context),
+                3,
+                "one session at a time on a context"
+            );
+            assert_eq!(
+                slag_inspector_can_dispatch(b"Debugger.enable".as_ptr(), 15),
+                1
+            );
+            assert_eq!(slag_inspector_can_dispatch(b"Page.reload".as_ptr(), 11), 0);
+
+            let numbered: &[u8] = b"{\"id\":7,\"method\":\"Debugger.pause\"}";
+            assert_eq!(slag_inspector_call_id(numbered.as_ptr(), numbered.len()), 7);
+            let event_only: &[u8] = b"{\"method\":\"x\"}";
+            assert_eq!(
+                slag_inspector_call_id(event_only.as_ptr(), event_only.len()),
+                -1,
+                "an event names no command"
+            );
+
+            // Enabling before any script exists is the free one.
+            let enable = send(context, "{\"id\":1,\"method\":\"Debugger.enable\"}");
+            assert_eq!(enable.len(), 1);
+            assert!(enable[0].contains("\"id\":1"), "{}", enable[0]);
+
+            let source: &[u8] = b"const marker = 1;\nglobalThis.hit = marker + 1;\n'end';";
+            let url: &[u8] = b"app.js";
+            let mut script = std::ptr::null_mut();
+            assert_eq!(
+                slag_compile(
+                    context,
+                    source.as_ptr(),
+                    source.len(),
+                    url.as_ptr(),
+                    url.len(),
+                    &mut script,
+                ),
+                0
+            );
+
+            // A compile queued the script's announcement; the client hears it
+            // on the next poll, which is how V8 reports `scriptParsed`.
+            let mut out = SlagMessages {
+                items: std::ptr::null_mut(),
+                len: 0,
+            };
+            assert_eq!(slag_inspector_poll(context, &mut out), 0);
+            let events = messages_of(&out);
+            slag_messages_free(&mut out);
+            assert_eq!(events.len(), 1, "{events:?}");
+            assert!(
+                events[0].contains("Debugger.scriptParsed") && events[0].contains("app.js"),
+                "{}",
+                events[0]
+            );
+
+            let breakpoint = send(
+                context,
+                "{\"id\":2,\"method\":\"Debugger.setBreakpointByUrl\",\"params\":\
+                 {\"url\":\"app.js\",\"lineNumber\":1,\"columnNumber\":0}}",
+            );
+            let answer = breakpoint.last().expect("a response");
+            assert!(answer.contains("breakpointId"), "{answer}");
+            assert!(answer.contains("\"lineNumber\":1"), "{answer}");
+
+            let mut value = 0;
+            assert_eq!(
+                slag_script_run(context, script, &mut value),
+                SLAG_RUN_PAUSED,
+                "the breakpoint stopped the script"
+            );
+
+            assert_eq!(slag_inspector_poll(context, &mut out), 0);
+            let stopped = messages_of(&out);
+            slag_messages_free(&mut out);
+            assert_eq!(stopped.len(), 1, "{stopped:?}");
+            assert!(stopped[0].contains("Debugger.paused"), "{}", stopped[0]);
+            assert!(stopped[0].contains("callFrames"), "{}", stopped[0]);
+
+            let evaluate = send(
+                context,
+                "{\"id\":3,\"method\":\"Debugger.evaluateOnCallFrame\",\"params\":\
+                 {\"callFrameId\":\"frame-1\",\"expression\":\"marker + 41\"}}",
+            );
+            let answer = evaluate.last().expect("a response");
+            assert!(answer.contains("\"value\":42"), "{answer}");
+
+            let resume = send(context, "{\"id\":4,\"method\":\"Debugger.resume\"}");
+            assert_eq!(resume.len(), 2, "resumed then the response: {resume:?}");
+            assert!(resume[0].contains("Debugger.resumed"), "{}", resume[0]);
+            assert!(resume[1].contains("\"id\":4"), "{}", resume[1]);
+
+            // The resumed run finished inside the dispatch, so nothing is left
+            // parked for the host that started it.
+            let mut pause = SlagPause::default();
+            assert_eq!(slag_debug_paused(context, &mut pause), 0);
+
+            assert_eq!(slag_inspector_close(context), 0);
+            assert_eq!(
+                slag_inspector_close(context),
+                0,
+                "closing what is not open is a no-op"
             );
 
             slag_script_free(script);

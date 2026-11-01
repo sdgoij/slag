@@ -1434,6 +1434,90 @@ cannot honour yet, and a method-not-found is the honest answer until they can.
 The frame list is now the parked activation stack (§14.4); the scope chain and
 the property model are still open.
 
+**2026-11-01, slice 6: what Blink actually calls, and the `v8_inspector`
+surface over the protocol.** The decision is that the protocol stays in
+`crates/inspector` and the facade ships only the V8-shaped shell: a new
+`slag_inspector_*` C ABI (in `crates/slagc`) carries dispatch, poll, script
+registration and evaluation, and `crates/v8/cpp/include/v8-inspector.h` +
+`src/inspector.cc` implement the classes Blink compiles against.
+
+Before designing it, the call sites in `third_party/blink/renderer/` were read
+rather than inferred from the header, and they are small in number and large in
+dependency:
+
+- `platform/bindings/thread_debugger.h` subclasses `V8InspectorClient` and calls
+  `V8Inspector::create(isolate, this)`. `core/inspector/thread_debugger_common_impl.cc`,
+  `main_thread_debugger.cc` and `worker_thread_debugger.cc` drive the inspector:
+  `contextCreated`/`contextDestroyed`/`resetContextGroup`, `idleStarted`/
+  `idleFinished`, `exceptionThrown`/`exceptionRevoked`, and the async-task
+  instrumentation (`asyncTaskScheduled`/`Canceled`/`Started`/`Finished`,
+  `allAsyncTasksCanceled`). The client overrides are `runMessageLoopOnPause`,
+  `ensureDefaultContextInGroup`, `consoleAPIMessage`, `consoleTime`/`TimeEnd`/
+  `TimeStamp`/`TimeStampWithArgs`, `deepSerialize`, `valueSubtype`,
+  `descriptionForValueSubtype`, `isInspectableHeapObject`, `currentTimeMS`,
+  `installAdditionalCommandLineAPI`, `beginUserGesture`, `generateUniqueId`,
+  `startRepeatingTimer`/`cancelTimer`.
+- `core/inspector/devtools_session.cc` calls `connectShared(group,
+  ManagedChannel*, cbor state, trust, pause state, V8EmbedderState)`, then
+  `stop`, `dispatchProtocolMessage`, `setSkipAllPausesForInternalUse`,
+  `triggerPreciseCoverageDeltaUpdate`, `state`, `resume(true)`, and the static
+  `canDispatchMethod`.
+- `core/inspector/inspector_injected_script_manager.cc` calls `evaluate(context,
+  source, includeCommandLineAPI)`.
+- `inspector_dom_debugger_agent.cc`, `inspector_network_agent.cc`,
+  `inspector_event_breakpoints_agent.cc` and `inspector_log_agent.cc` call
+  `wrapObject(...)`, and the generated Blink protocol code names
+  `v8_inspector::protocol::Runtime::API::{RemoteObject, StackTrace}` and
+  `Debugger::API::{SearchMatch, Paused::ReasonEnum}`. Those are the generated
+  inspector-protocol base classes, not a type a facade can leave opaque.
+- `V8Inspector::ManagedChannel` derives from `cppgc::GarbageCollected`, and
+  `DevToolsSession` is the channel, so a replacement target drags cppgc's
+  headers and `Persistent` along with it.
+
+What landed (and what `inspector.exe` proves in one process): `slag_inspector_
+open/close/dispatch/poll/evaluate/add_script/can_dispatch/call_id` with
+`SlagMessages` owning the JSON texts, the session's state on the context (so
+`slag_compile` registers the script it compiles, which is where V8 reports
+`scriptParsed`), `Session::call_id`/`Session::can_dispatch` in the protocol
+crate, and the C++ `StringView`, `StringBuffer`, `V8ContextInfo`,
+`V8InspectorClient`, `V8InspectorSession` (`dispatchProtocolMessage`, `state`,
+`stop`, `resume`, `evaluate`, plus `pollEvents`, which is this facade's own
+method because the pause loop is the host's), `V8Inspector` (`create`,
+`contextCreated`, `contextDestroyed`, `resetContextGroup`, `connect`, `Channel`).
+
+What is missing, in the order it blocks A5:
+
+1. **A session is per context and a Blink group is a frame.** A frame holds a
+   main world plus an isolated world per extension, each a `v8::Context`;
+   `connect` refuses a group with more than one. The session has to own the
+   group: scripts keyed by context, the resolved breakpoint set pushed to each
+   context's agent, a stop in any of them announced once.
+2. **cppgc.** `ManagedChannel`/`Persistent`/`Visitor` come from V8's own tree,
+   so a replacement either ships cppgc or shims exactly the surface Blink
+   touches. This is a build-integration cost, not a protocol one.
+3. **The generated protocol tree.** `wrapObject` answers a
+   `protocol::Runtime::API::RemoteObject` that Blink's generated code
+   serializes, so this is the `inspector_protocol` generator (or a hand-written
+   subset of its `Value`/`Serializable`/`toJson` base classes for the four
+   crossing types: `Runtime.RemoteObject`, `Runtime.StackTrace`,
+   `Debugger.SearchMatch`, `Debugger.Paused`).
+4. **The client callbacks** `V8StackTrace`, `exceptionThrown`, the console
+   family, `deepSerialize`/`valueSubtype`/`descriptionForValueSubtype`,
+   `isInspectableHeapObject`.
+5. **The pause loop's ownership.** V8 calls `runMessageLoopOnPause` from inside
+   the run and the resumed run's completion still reaches `Script::Run`; here
+   the resume happens inside `dispatchProtocolMessage`, so the completion value
+   is the only casualty and the host polls. Closing it means keeping
+   `slag_debug_resume`'s answer until the `Script::Run` that started the run
+   asks for it.
+6. `state()` is empty (breakpoints are the session's, so a reattach starts with
+   none) and `setSkipAllPauses*`/`triggerPreciseCoverageDeltaUpdate` are absent:
+   each would be a no-op today, and a no-op hook is worse than a missing one.
+
+One trap worth keeping: a `Channel` callback runs inside the session's own
+call, where its state is borrowed, so `dispatchProtocolMessage` from
+`sendNotification` is refused. Record and dispatch after the call returns.
+
 ### 14.4 Pause and step: the protocol the compiled tiers have to agree to
 
 The `Debugger` domain needs four verbs (breakpoint at a position, step in, over

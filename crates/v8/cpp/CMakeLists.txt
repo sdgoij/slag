@@ -15,7 +15,7 @@ if(NOT EXISTS "${SLAGC_LIB}")
     "${SLAGC_LIB}. Pass -DSLAGC_LIB=<path> for a debug build.")
 endif()
 
-add_library(v8_facade STATIC src/facade.cc)
+add_library(v8_facade STATIC src/facade.cc src/inspector.cc)
 target_include_directories(v8_facade PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}")
 target_link_libraries(v8_facade PUBLIC "${SLAGC_LIB}")
 
@@ -35,6 +35,11 @@ target_link_libraries(shell PRIVATE v8_facade)
 # the resume). Not a V8 sample: V8 exposes this through the inspector.
 add_executable(debugger samples/debugger.cc)
 target_link_libraries(debugger PRIVATE v8_facade)
+
+# A DevTools session over `v8-inspector.h`: the protocol's own commands, the
+# context group, the channel, and the events a stop produces.
+add_executable(inspector samples/inspector.cc)
+target_link_libraries(inspector PRIVATE v8_facade)
 
 # A gin-shaped harness, not gin itself: gin is a Chromium component (see the
 # README's A1 section).

@@ -115,6 +115,45 @@ impl Session {
         Ok((id, events))
     }
 
+    /// The command id `message` answers, as [`dispatch`](Self::dispatch) reads
+    /// it, or `None` when it names none.
+    ///
+    /// A transport needs this because `V8Inspector::Channel` separates the
+    /// answer to a command from an event, and the protocol carries it in the
+    /// request. Chrome numbers its commands; an id of another type is echoed
+    /// in the response but is not one this can name.
+    pub fn call_id(message: &str) -> Option<i64> {
+        serde_json::from_str::<Json>(message)
+            .ok()?
+            .get("id")?
+            .as_i64()
+    }
+
+    /// Whether this session answers `method` at all
+    /// (`V8InspectorSession::canDispatchMethod`), which is how a host decides
+    /// whether a message belongs to the debugger or to its own agents.
+    pub fn can_dispatch(method: &str) -> bool {
+        matches!(
+            method,
+            "Runtime.enable"
+                | "Runtime.getProperties"
+                | "Runtime.releaseObject"
+                | "Runtime.releaseObjectGroup"
+                | "Runtime.evaluate"
+                | "Debugger.enable"
+                | "Debugger.disable"
+                | "Debugger.setBreakpointByUrl"
+                | "Debugger.removeBreakpoint"
+                | "Debugger.pause"
+                | "Debugger.resume"
+                | "Debugger.stepOver"
+                | "Debugger.stepInto"
+                | "Debugger.stepOut"
+                | "Debugger.evaluateOnCallFrame"
+                | "Debugger.getScriptSource"
+        )
+    }
+
     /// Handle one protocol message, answering the response and the events it
     /// produced (events first, as a `paused`/`resumed` pair arrives before the
     /// response to the command that caused it).

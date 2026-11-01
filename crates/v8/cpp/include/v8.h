@@ -1750,9 +1750,9 @@ class Context {
    * stopped, and `Resume` continues it, answering the value the script
    * completes with.
    *
-   * Until the continuation stack lands, a stop happens in the outermost
-   * activation: a breakpoint inside a function that is still on the stack when
-   * the point is reached stops when control returns to the outermost frame. */
+   * A stop parks every activation it interrupted, so a breakpoint inside a
+   * function stops there; `Resume` continues them, outermost last. The same
+   * stops are what `v8-inspector.h` reports as `Debugger.paused`. */
   struct PauseInfo {
     enum Reason { kNone = 0, kRequested = 1, kBreakpoint = 2, kStep = 3 };
     Reason reason = kNone;

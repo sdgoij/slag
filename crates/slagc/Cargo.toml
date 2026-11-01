@@ -16,3 +16,7 @@ crux = { path = "../crux" }
 # The parser's own source-position view, for the position a `v8::Message`
 # reports (a compile error's span indexes the text that was compiled).
 syntax = { path = "../syntax" }
+# The Chrome DevTools Protocol session behind `v8_inspector` (see
+# `inspector_abi`). The protocol is the inspector's own and stays host-side; the
+# facade's C++ layer is only the V8-shaped shell around it.
+inspector = { path = "../inspector" }

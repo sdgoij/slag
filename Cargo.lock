@@ -927,6 +927,7 @@ name = "slagc"
 version = "0.2.0"
 dependencies = [
  "crux",
+ "inspector",
  "slag",
  "syntax",
 ]
