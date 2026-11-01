@@ -172,9 +172,13 @@ impl Session {
     /// Register a script the host is about to run, answering its id and the
     /// events a session that is already enabled owes the client.
     ///
-    /// The engine compiles the body here (and caches it), so the points a
-    /// breakpoint resolves against are the points the run will carry. A body
-    /// that does not compile is the host's compile error, not a debug event.
+    /// Registration is a copy of the text: the debug points are the engine's
+    /// work, and they are compiled on the first `Debugger.enable` (or here, if
+    /// a client is already attached). A host that never connects a debugger
+    /// therefore pays nothing for the registry, and a client that attaches
+    /// later still hears about every script that already ran, which is what V8
+    /// does. A body that does not compile is the host's compile error, not a
+    /// debug event.
     pub fn add_script(
         &mut self,
         context: &Context,
@@ -195,7 +199,13 @@ impl Session {
         url: &str,
         source: &str,
     ) -> Result<(u32, Vec<String>), String> {
-        let points = context.debug_points(source).map_err(|e| e.message)?;
+        // The points are the engine's compile; a registry that no client is
+        // listening to does not need them yet (`Debugger.enable` fills them).
+        let points = if self.enabled {
+            context.debug_points(source).map_err(|e| e.message)?
+        } else {
+            Vec::new()
+        };
         let identity = context.script_identity(source);
         let id = self.scripts.len() as u32 + 1;
         self.scripts.push(Script {
@@ -213,6 +223,17 @@ impl Session {
             Vec::new()
         };
         Ok((id, events))
+    }
+
+    /// Drop what belongs to one client: the domains it enabled, its
+    /// breakpoints, and the stop it is looking at. The script registry stays,
+    /// so a client that reattaches to a running page still hears about the
+    /// scripts that already ran.
+    pub fn reset(&mut self) {
+        self.enabled = false;
+        self.runtime = false;
+        self.paused = None;
+        self.breakpoints.clear();
     }
 
     /// The command id `message` answers, as [`dispatch`](Self::dispatch) reads
@@ -656,6 +677,12 @@ impl Session {
                         .map_err(|error| DispatchError::Protocol(error.message))?;
                 }
                 self.enabled = true;
+                // The points a breakpoint resolves against are the ones the run
+                // will carry, so they are compiled before the client can ask
+                // for a location. A script registered while no client was
+                // attached has none yet; one registered under a session already
+                // has them.
+                self.fill_points(targets);
                 // A client that enables after scripts were registered expects
                 // their `scriptParsed` events then.
                 let events = self.scripts.iter().map(script_parsed).collect();
@@ -841,6 +868,23 @@ impl Session {
         // the breakpoint was resolved elsewhere, is still breakable.
         for target in targets.iter_mut() {
             target.context.set_script_breakpoints(&pairs);
+        }
+    }
+
+    /// Compile the points of every script that has none, for the targets that
+    /// own it. A failure leaves the script without points, which costs it
+    /// breakpoints and nothing else: the text is already known to parse, since
+    /// the host compiled it.
+    fn fill_points(&mut self, targets: &mut [Target<'_>]) {
+        for target in targets.iter_mut() {
+            for script in self.scripts.iter_mut() {
+                if script.context != target.id || !script.points.is_empty() {
+                    continue;
+                }
+                if let Ok(points) = target.context.debug_points(&script.source) {
+                    script.points = points;
+                }
+            }
         }
     }
 
@@ -1605,6 +1649,34 @@ mod tests {
         );
         let seen = targets[1].context.eval("globalThis.here === 1").unwrap();
         assert_eq!(seen.as_boolean(), Some(true));
+    }
+
+    #[test]
+    fn a_reset_keeps_the_registry_and_drops_the_client_state() {
+        let (mut context, mut session) = session();
+        session.add_script(&context, "app.js", SOURCE).unwrap();
+        let frames: [ExceptionFrame<'_>; 0] = [];
+        session.dispatch(&mut context, r#"{"id":2,"method":"Runtime.enable"}"#);
+        assert!(session.exception(&error_report(&frames)).is_some());
+
+        session.reset();
+        // A script registered between the two clients is still announced to
+        // the second one, and gets its points at that enable rather than now.
+        let (_, events) = session.add_script(&context, "other.js", "1;").unwrap();
+        assert!(events.is_empty(), "no client is enabled after a reset");
+        assert!(
+            session.exception(&error_report(&frames)).is_none(),
+            "Runtime is off again"
+        );
+        let answer = session.dispatch(&mut context, r#"{"id":3,"method":"Debugger.enable"}"#);
+        assert_eq!(
+            answer.len(),
+            3,
+            "both scripts, then the response: {answer:?}"
+        );
+        let first: Json = serde_json::from_str(&answer[0]).unwrap();
+        assert_eq!(first["method"], "Debugger.scriptParsed");
+        assert_eq!(first["params"]["url"], "app.js");
     }
 
     #[test]

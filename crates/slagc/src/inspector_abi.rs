@@ -54,8 +54,14 @@ pub(crate) struct Member {
 
 /// A context group's session: what one `V8InspectorSession` is.
 pub(crate) struct Group {
-    /// The session, or `None` until the host connects and after it disconnects.
-    session: RefCell<Option<inspector::Session>>,
+    /// The protocol session. It exists for the group's lifetime rather than
+    /// only between `open` and `close`, so a script compiled before a client
+    /// attaches is still announced to it, which is what V8 does; `reset` drops
+    /// the state that belongs to a client.
+    session: RefCell<inspector::Session>,
+    /// Whether a client is connected. Commands are refused while it is not,
+    /// which is the state a page is in before DevTools is opened.
+    connected: Cell<bool>,
     /// The contexts that joined, in join order.
     pub(crate) contexts: RefCell<Vec<Member>>,
     next_id: Cell<u32>,
@@ -67,11 +73,16 @@ pub(crate) struct Group {
 impl Group {
     fn new() -> Rc<Self> {
         Rc::new(Self {
-            session: RefCell::new(None),
+            session: RefCell::new(inspector::Session::new()),
+            connected: Cell::new(false),
             contexts: RefCell::new(Vec::new()),
             next_id: Cell::new(1),
             pending: RefCell::new(Vec::new()),
         })
+    }
+
+    fn is_connected(&self) -> bool {
+        self.connected.get()
     }
 
     /// The execution context id a member was given.
@@ -84,8 +95,8 @@ impl Group {
     }
 
     /// Register a script a member compiled, queueing the events the session owes
-    /// its client. `Ok(None)` when there is nothing to announce: no member, no
-    /// session, or a session that is inside another call.
+    /// its client. `Ok(None)` when the context is not a member: there is nothing
+    /// to attribute the script to.
     pub(crate) fn register_script(
         &self,
         context: *mut SlagContext,
@@ -100,9 +111,6 @@ impl Group {
         // already borrowed; the script still compiles and runs, it is just not
         // announced.
         let Ok(mut session) = self.session.try_borrow_mut() else {
-            return Ok(None);
-        };
-        let Some(session) = session.as_mut() else {
             return Ok(None);
         };
         let (id, events) = session.add_script_in(execution_context, engine, name, source)?;
@@ -264,8 +272,9 @@ pub unsafe extern "C" fn slag_inspector_free(inspector: *mut SlagInspector) {
     if let Ok(mut members) = group.contexts.try_borrow_mut() {
         members.clear();
     }
+    group.connected.set(false);
     if let Ok(mut session) = group.session.try_borrow_mut() {
-        *session = None;
+        session.reset();
     }
 }
 
@@ -356,33 +365,41 @@ pub unsafe extern "C" fn slag_inspector_open(inspector: *mut SlagInspector) -> i
         return 2;
     };
     let group = &inspector.group;
+    if group.is_connected() {
+        return 0;
+    }
     let Ok(mut session) = group.session.try_borrow_mut() else {
         refuse_reentry(group);
         return 1;
     };
-    if session.is_none() {
-        *session = Some(inspector::Session::new());
-    }
+    // A fresh client starts with no domains enabled and no breakpoints; the
+    // registry stays, so the scripts that already ran are announced to it.
+    session.reset();
+    group.connected.set(true);
     0
 }
 
 /// Disconnect: a parked run in any context continues, every context detaches,
-/// and the script registry is dropped. Answers 0 on success (including when
-/// nothing was open), 1 with a pending error, and 2 for a bad handle.
+/// and what the client asked for is dropped. The script registry stays, so a
+/// reattached client still hears about the scripts that already ran. Answers 0
+/// on success (including when nothing was open), 1 with a pending error, and 2
+/// for a bad handle.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn slag_inspector_close(inspector: *mut SlagInspector) -> i32 {
     let Some(inspector) = inspector.as_ref() else {
         return 2;
     };
     let group = &inspector.group;
+    if !group.is_connected() {
+        return 0;
+    }
     let Ok(mut session) = group.session.try_borrow_mut() else {
         refuse_reentry(group);
         return 1;
     };
-    if session.take().is_none() {
-        return 0;
-    }
+    session.reset();
     drop(session);
+    group.connected.set(false);
     if let Ok(mut pending) = group.pending.try_borrow_mut() {
         pending.clear();
     }
@@ -405,6 +422,10 @@ pub unsafe extern "C" fn slag_inspector_close(inspector: *mut SlagInspector) -> 
                 record_engine(group, target.id, error);
                 status = 1;
             }
+            // The breakpoint set belongs to the client that is leaving: the
+            // engine keeps its own copy, so a reattached client's runs would
+            // otherwise stop where the previous one asked.
+            target.context.set_script_breakpoints(&[]);
         }
         status
     });
@@ -444,18 +465,18 @@ pub unsafe extern "C" fn slag_inspector_dispatch(
         return 2;
     };
     let group = &inspector.group;
-    let Ok(mut guard) = group.session.try_borrow_mut() else {
+    if !group.is_connected() {
+        return 2;
+    }
+    let Ok(mut session) = group.session.try_borrow_mut() else {
         refuse_reentry(group);
         return 1;
-    };
-    let Some(session) = guard.as_mut() else {
-        return 2;
     };
     let Ok(messages) = with_targets(group, |targets| session.dispatch_group(targets, message))
     else {
         return 1;
     };
-    drop(guard);
+    drop(session);
     answer(out, messages);
     0
 }
@@ -506,12 +527,12 @@ pub unsafe extern "C" fn slag_inspector_exception(
         });
     }
     let group = &inspector.group;
-    let Ok(mut guard) = group.session.try_borrow_mut() else {
+    if !group.is_connected() {
+        return 2;
+    }
+    let Ok(mut session) = group.session.try_borrow_mut() else {
         refuse_reentry(group);
         return 1;
-    };
-    let Some(session) = guard.as_mut() else {
-        return 2;
     };
     let reported = session.exception(&inspector::ExceptionReport {
         message,
@@ -522,7 +543,7 @@ pub unsafe extern "C" fn slag_inspector_exception(
         frames: &frames,
     });
     let (exception_id, messages) = reported.unwrap_or((0, Vec::new()));
-    drop(guard);
+    drop(session);
     if let Some(out_id) = out_id.as_mut() {
         *out_id = exception_id;
     }
@@ -548,15 +569,15 @@ pub unsafe extern "C" fn slag_inspector_exception_revoked(
         return 2;
     };
     let group = &inspector.group;
-    let Ok(mut guard) = group.session.try_borrow_mut() else {
+    if !group.is_connected() {
+        return 2;
+    }
+    let Ok(mut session) = group.session.try_borrow_mut() else {
         refuse_reentry(group);
         return 1;
     };
-    let Some(session) = guard.as_mut() else {
-        return 2;
-    };
     let messages = session.revoke_exception(exception_id, reason);
-    drop(guard);
+    drop(session);
     answer(out, messages);
     0
 }
@@ -575,12 +596,12 @@ pub unsafe extern "C" fn slag_inspector_resume(
         return 2;
     };
     let group = &inspector.group;
-    let Ok(mut guard) = group.session.try_borrow_mut() else {
+    if !group.is_connected() {
+        return 2;
+    }
+    let Ok(mut session) = group.session.try_borrow_mut() else {
         refuse_reentry(group);
         return 1;
-    };
-    let Some(session) = guard.as_mut() else {
-        return 2;
     };
     // A dispatch answers the events it caused and then its response; the last
     // message is that response, and a resume the client did not send has none
@@ -591,7 +612,7 @@ pub unsafe extern "C" fn slag_inspector_resume(
         return 1;
     };
     messages.pop();
-    drop(guard);
+    drop(session);
     answer(out, messages);
     0
 }
@@ -609,12 +630,12 @@ pub unsafe extern "C" fn slag_inspector_poll(
         return 2;
     };
     let group = &inspector.group;
-    let Ok(mut guard) = group.session.try_borrow_mut() else {
+    if !group.is_connected() {
+        return 2;
+    }
+    let Ok(mut session) = group.session.try_borrow_mut() else {
         refuse_reentry(group);
         return 1;
-    };
-    let Some(session) = guard.as_mut() else {
-        return 2;
     };
     let Ok(stopped) = with_targets(group, |targets| session.poll_group(targets)) else {
         return 1;
@@ -624,7 +645,7 @@ pub unsafe extern "C" fn slag_inspector_poll(
         Err(_) => Vec::new(),
     };
     messages.extend(stopped);
-    drop(guard);
+    drop(session);
     answer(out, messages);
     0
 }
@@ -651,15 +672,14 @@ pub unsafe extern "C" fn slag_inspector_evaluate(
         return 2;
     };
     let group = &inspector.group;
+    if !group.is_connected() {
+        return 2;
+    }
     if group
         .execution_context_of(context as *const SlagContext as *mut SlagContext)
         .is_none()
     {
         return 2;
-    }
-    match group.session.try_borrow() {
-        Ok(session) if session.is_some() => {}
-        _ => return 2,
     }
     let Ok(mut engine) = context.context.try_borrow_mut() else {
         reentrant(context);

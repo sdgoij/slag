@@ -1594,6 +1594,31 @@ worth making on its own terms.
   async-task callbacks. `V8StackTraceId` (the cross-debugger async chain) has no
   engine machinery behind it at all.
 
+**2026-11-01, the lifecycle edges, found by testing them.** Three of the things a
+browser does constantly were not covered, and one of them was broken:
+
+- **Reattach.** A client that closes and a client that attaches to the running
+  page are two clients: the second must hear `scriptParsed` for the scripts that
+  already ran, and must not inherit the first one's breakpoints. The session is
+  now made with the group instead of at `connect`, `reset()` drops what belongs
+  to a client (both domains, the breakpoints, the announced stop) and keeps the
+  registry, and `close` clears each context's engine-side breakpoint set. That
+  last part was a real bug: the engine kept the old set, so a run after a
+  reattach stopped at a breakpoint the new client never set. The registry
+  change has a second effect worth stating: registration no longer needs a
+  client, because a page compiles before DevTools opens.
+- **Points are lazy.** Registration is now a copy of the text; the debug points
+  are compiled on the first `Debugger.enable` that covers the script (or at
+  registration, if a client is already attached). This is what keeps the
+  "a host that never opens DevTools pays nothing" promise: an inspector that
+  exists but is never connected costs one source copy per script and no
+  compile. `Debugger.enable` fills them before it replays `scriptParsed`, so a
+  breakpoint still resolves against the points the run will carry.
+- Two groups in one process keep their own ids and breakpoint sets (tested), and
+  a context freed under a parked run leaves its group without the next poll
+  reading it (tested), which is the pointer that `SlagContext::drop` exists to
+  clean up.
+
 ### 14.4 Pause and step: the protocol the compiled tiers have to agree to
 
 The `Debugger` domain needs four verbs (breakpoint at a position, step in, over

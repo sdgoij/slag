@@ -6246,4 +6246,210 @@ mod tests {
             slag_isolate_free(isolate);
         }
     }
+
+    /// Compile `source` under `name`, answering the script handle.
+    unsafe fn compile_named(
+        context: *mut SlagContext,
+        name: &[u8],
+        source: &[u8],
+    ) -> *mut SlagScript {
+        let mut script = std::ptr::null_mut();
+        assert_eq!(
+            slag_compile(
+                context,
+                source.as_ptr(),
+                source.len(),
+                name.as_ptr(),
+                name.len(),
+                &mut script,
+            ),
+            0
+        );
+        script
+    }
+
+    #[test]
+    fn a_reattached_session_announces_the_scripts_that_already_ran() {
+        unsafe {
+            let isolate = slag_isolate_new();
+            let context = slag_context_new(isolate);
+            let mut inspector = std::ptr::null_mut();
+            assert_eq!(slag_inspector_new(&mut inspector), 0);
+            assert_eq!(
+                slag_inspector_add_context(inspector, context, std::ptr::null_mut()),
+                0
+            );
+            assert_eq!(slag_inspector_open(inspector), 0);
+            send(inspector, "{\"id\":1,\"method\":\"Debugger.enable\"}");
+
+            let source: &[u8] = b"globalThis.ran = 1;";
+            let script = compile_named(context, b"page.js", source);
+            assert_eq!(poll(inspector).len(), 1, "the compile announced it");
+            let set = send(
+                inspector,
+                "{\"id\":2,\"method\":\"Debugger.setBreakpointByUrl\",\"params\":\
+                 {\"url\":\"page.js\",\"lineNumber\":0,\"columnNumber\":0}}",
+            );
+            assert!(
+                !set.is_empty() && set[0].contains("breakpointId"),
+                "{set:?}"
+            );
+
+            // The client goes away and a second one attaches to the running
+            // page, which is what opening and closing DevTools does.
+            assert_eq!(slag_inspector_close(inspector), 0);
+            assert_eq!(slag_inspector_open(inspector), 0);
+            let enable = send(inspector, "{\"id\":3,\"method\":\"Debugger.enable\"}");
+            assert_eq!(
+                enable.len(),
+                2,
+                "the script is announced again, then the response: {enable:?}"
+            );
+            assert!(
+                enable[0].contains("Debugger.scriptParsed") && enable[0].contains("page.js"),
+                "{}",
+                enable[0]
+            );
+            assert!(enable[1].contains("\"id\":3"), "{}", enable[1]);
+
+            // The breakpoint belonged to the client that set it, so this run
+            // must not stop: the engine's own set was cleared with the session.
+            let mut value = 0;
+            assert_eq!(
+                slag_script_run(context, script, &mut value),
+                0,
+                "a breakpoint from a closed session must not stop a run"
+            );
+            assert!(poll(inspector).is_empty());
+
+            assert_eq!(slag_inspector_close(inspector), 0);
+            slag_inspector_free(inspector);
+            slag_script_free(script);
+            slag_context_free(context);
+            slag_isolate_free(isolate);
+        }
+    }
+
+    #[test]
+    fn two_groups_keep_their_own_ids_and_breakpoints() {
+        unsafe {
+            let isolate = slag_isolate_new();
+            let first_context = slag_context_new(isolate);
+            let second_context = slag_context_new(isolate);
+            let mut first = std::ptr::null_mut();
+            let mut second = std::ptr::null_mut();
+            assert_eq!(slag_inspector_new(&mut first), 0);
+            assert_eq!(slag_inspector_new(&mut second), 0);
+            assert_eq!(
+                slag_inspector_add_context(first, first_context, std::ptr::null_mut()),
+                0
+            );
+            assert_eq!(
+                slag_inspector_add_context(second, second_context, std::ptr::null_mut()),
+                0
+            );
+            assert_eq!(slag_inspector_open(first), 0);
+            assert_eq!(slag_inspector_open(second), 0);
+            send(first, "{\"id\":1,\"method\":\"Debugger.enable\"}");
+            send(second, "{\"id\":1,\"method\":\"Debugger.enable\"}");
+
+            let source: &[u8] = b"globalThis.ran = 1;";
+            let first_script = compile_named(first_context, b"app.js", source);
+            let second_script = compile_named(second_context, b"app.js", source);
+            assert_eq!(poll(first).len(), 1);
+            assert_eq!(poll(second).len(), 1);
+
+            let set = send(
+                first,
+                "{\"id\":2,\"method\":\"Debugger.setBreakpointByUrl\",\"params\":\
+                 {\"url\":\"app.js\",\"lineNumber\":0,\"columnNumber\":0}}",
+            );
+            assert!(
+                set[0].contains("\"scriptId\":\"1\""),
+                "each group numbers its own scripts: {set:?}"
+            );
+
+            // A breakpoint in one group's session is not the other's: the
+            // contexts are different and so are the engine's sets.
+            let mut value = 0;
+            assert_eq!(
+                slag_script_run(second_context, second_script, &mut value),
+                0,
+                "the second group has no breakpoint"
+            );
+            assert!(poll(second).is_empty());
+            assert_eq!(
+                slag_script_run(first_context, first_script, &mut value),
+                SLAG_RUN_PAUSED,
+                "the group that set it stops"
+            );
+            assert_eq!(poll(first).len(), 1);
+
+            assert_eq!(slag_inspector_close(first), 0);
+            assert_eq!(slag_inspector_close(second), 0);
+            slag_inspector_free(first);
+            slag_inspector_free(second);
+            slag_script_free(first_script);
+            slag_script_free(second_script);
+            slag_context_free(first_context);
+            slag_context_free(second_context);
+            slag_isolate_free(isolate);
+        }
+    }
+
+    #[test]
+    fn a_context_freed_while_parked_leaves_the_group() {
+        unsafe {
+            let isolate = slag_isolate_new();
+            let parked_context = slag_context_new(isolate);
+            let other_context = slag_context_new(isolate);
+            let mut inspector = std::ptr::null_mut();
+            assert_eq!(slag_inspector_new(&mut inspector), 0);
+            assert_eq!(
+                slag_inspector_add_context(inspector, parked_context, std::ptr::null_mut()),
+                0
+            );
+            assert_eq!(
+                slag_inspector_add_context(inspector, other_context, std::ptr::null_mut()),
+                0
+            );
+            assert_eq!(slag_inspector_open(inspector), 0);
+            send(inspector, "{\"id\":1,\"method\":\"Debugger.enable\"}");
+
+            let source: &[u8] = b"globalThis.ran = 1;";
+            let script = compile_named(parked_context, b"gone.js", source);
+            let _ = poll(inspector);
+            send(
+                inspector,
+                "{\"id\":2,\"method\":\"Debugger.setBreakpointByUrl\",\"params\":\
+                 {\"url\":\"gone.js\",\"lineNumber\":0,\"columnNumber\":0}}",
+            );
+            let mut value = 0;
+            assert_eq!(
+                slag_script_run(parked_context, script, &mut value),
+                SLAG_RUN_PAUSED
+            );
+
+            // The frame tears the context down under the stop. The group holds
+            // pointers to its members, so this is the read that would dangle.
+            slag_context_free(parked_context);
+            assert!(
+                poll(inspector).is_empty(),
+                "the freed context holds no stop"
+            );
+            assert_eq!(slag_inspector_close(inspector), 0);
+            assert_eq!(slag_inspector_open(inspector), 0);
+            let enable = send(inspector, "{\"id\":4,\"method\":\"Debugger.enable\"}");
+            assert!(
+                enable.last().is_some_and(|text| text.contains("\"id\":4")),
+                "the remaining context still answers: {enable:?}"
+            );
+
+            assert_eq!(slag_inspector_close(inspector), 0);
+            slag_inspector_free(inspector);
+            slag_script_free(script);
+            slag_context_free(other_context);
+            slag_isolate_free(isolate);
+        }
+    }
 }
