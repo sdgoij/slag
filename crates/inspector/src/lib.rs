@@ -31,6 +31,9 @@ struct Script {
     id: u32,
     url: String,
     source: String,
+    /// The engine's identity for this text, which is what the breakpoint set
+    /// names: an offset alone is ambiguous across scripts.
+    identity: u64,
     /// The body's debug points as `(start, end)` source offsets, from the
     /// engine. A breakpoint resolves to the first point at or after the
     /// requested position, because the engine matches a point by its own offset
@@ -94,11 +97,13 @@ impl Session {
         source: &str,
     ) -> Result<(u32, Vec<String>), String> {
         let points = context.debug_points(source).map_err(|e| e.message)?;
+        let identity = context.script_identity(source);
         let id = self.scripts.len() as u32 + 1;
         self.scripts.push(Script {
             id,
             url: url.to_string(),
             source: source.to_string(),
+            identity,
             points,
         });
         let script = self.scripts.last().expect("just pushed");
@@ -517,11 +522,22 @@ impl Session {
         ))
     }
 
-    /// Hand the engine the whole set: it matches a point by offset, so removing
+    /// Hand the engine the whole set, each breakpoint with the identity of the
+    /// script it resolved in: the engine matches a point by offset, so removing
     /// one breakpoint means replacing the list.
     fn push_breakpoints(&self, context: &mut Context) {
-        let offsets: Vec<u32> = self.breakpoints.values().map(|bp| bp.offset).collect();
-        context.set_breakpoints(&offsets);
+        let pairs: Vec<(u64, u32)> = self
+            .breakpoints
+            .values()
+            .filter_map(|breakpoint| {
+                let script = self
+                    .scripts
+                    .iter()
+                    .find(|script| script.id == breakpoint.script_id)?;
+                Some((script.identity, breakpoint.offset))
+            })
+            .collect();
+        context.set_script_breakpoints(&pairs);
     }
 
     fn mint_breakpoint(&mut self) -> String {
@@ -970,6 +986,37 @@ mod tests {
         let deep = &response["result"]["result"][0];
         assert_eq!(deep["name"], "deep", "{response}");
         assert_eq!(deep["value"]["value"], 7.0);
+    }
+
+    #[test]
+    fn a_breakpoint_in_one_script_does_not_stop_another() {
+        let (mut context, mut session) = session();
+        // Same length and the same offset for their one statement: an
+        // offset-only breakpoint set would fire in both.
+        let named = "globalThis.one = 1;";
+        let other = "globalThis.two = 2;";
+        session.add_script(&context, "a.js", named).unwrap();
+        session.add_script(&context, "b.js", other).unwrap();
+        session.dispatch(
+            &mut context,
+            r#"{"id":2,"method":"Debugger.setBreakpointByUrl","params":{"url":"a.js","lineNumber":0,"columnNumber":0}}"#,
+        );
+        assert!(
+            context.agent_mut().run_script(other).is_ok(),
+            "the other script runs to its end"
+        );
+        assert!(
+            session.poll(&context).is_empty(),
+            "a breakpoint in one script must not stop another"
+        );
+        assert!(context.agent_mut().run_script(named).is_err());
+        let events = session.poll(&context);
+        assert_eq!(events.len(), 1, "the script it names stops: {events:?}");
+        let paused: Json = serde_json::from_str(&events[0]).unwrap();
+        assert_eq!(
+            paused["params"]["callFrames"][0]["location"]["scriptId"],
+            "1"
+        );
     }
 
     #[test]

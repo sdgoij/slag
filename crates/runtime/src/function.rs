@@ -348,6 +348,11 @@ pub struct EcmaFunction {
     /// self-tail-call — statically the running body itself — which compiles
     /// to an in-place frame rebind + jump instead of a runtime round-trip.
     pub named_expression: bool,
+    /// The source text this function was declared in, as the engine's identity
+    /// for it (see [`source_identity`]), so a compiled body can carry it and a
+    /// breakpoint can name one script. `None` under a text the host never
+    /// identified.
+    pub script: Option<u64>,
     /// Lazy `prototype` (MakeConstructor deferral): set on plain ordinary
     /// functions at register — the own `prototype` property and its
     /// prototype object are NOT created eagerly; the first observation of
@@ -500,6 +505,7 @@ impl EcmaFunction {
 
     fn set_compiled(&mut self, ir: std::rc::Rc<crate::ir::CompiledBody>) {
         self.leaf_inline = ir.leaf && !self.is_class_constructor && !self.class_field_initializer;
+        ir.script.set(self.script);
         self.ir = Some(ir);
         self.construct_inline = self.compute_construct_inline();
     }
@@ -1197,6 +1203,15 @@ fn source_hash(source: &JsString) -> usize {
     fnv1a_units(source.as_slice())
 }
 
+/// The engine's identity for a piece of source text: the hash a breakpoint
+/// names so it cannot fire in another script (`.notes/chromium-facade.md`
+/// section 14.4). Derived from the text, so the same text is the same identity
+/// however many times it is handed over, which is also why a host does not have
+/// to keep a registry of them.
+pub(crate) fn source_identity(source: &JsString) -> u64 {
+    fnv1a_units(source.as_slice()) as u64
+}
+
 /// The source text a span refers to: the innermost enclosing execution context
 /// that carries a source covering the span.
 ///
@@ -1693,6 +1708,7 @@ fn register_function(
         is_async: kind.is_async,
         is_generator: kind.is_generator,
         class_field_initializer: false,
+        script: agent.script_for_new_record(),
         source_info,
         declaring_script_or_module,
         ir: None,
@@ -2100,6 +2116,7 @@ pub fn instantiate_arrow(
         is_async,
         is_generator: false,
         class_field_initializer,
+        script: agent.script_for_new_record(),
         source_info,
         declaring_script_or_module,
         ir: None,

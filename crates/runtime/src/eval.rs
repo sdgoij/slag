@@ -40,9 +40,10 @@ pub fn eval_program(
     jsx: bool,
     source: Option<&crux::JsString>,
 ) -> Result<Value, JsError> {
+    let script = agent.current_script();
     let body = match source {
         Some(source) => {
-            let key = (source.clone(), strict, fast_script, jsx);
+            let key = (script, source.clone(), strict, fast_script, jsx);
             if let Some(body) = agent.roots.script_bodies.borrow().get(&key).cloned() {
                 body
             } else {
@@ -52,6 +53,7 @@ pub fn eval_program(
                     fast_script,
                     agent.debug_points(),
                 )?);
+                body.script.set(script);
                 agent
                     .roots
                     .script_bodies
@@ -60,12 +62,16 @@ pub fn eval_program(
                 body
             }
         }
-        None => std::rc::Rc::new(crate::ir::compile_statements(
-            &program.body,
-            strict,
-            fast_script,
-            agent.debug_points(),
-        )?),
+        None => {
+            let body = std::rc::Rc::new(crate::ir::compile_statements(
+                &program.body,
+                strict,
+                fast_script,
+                agent.debug_points(),
+            )?);
+            body.script.set(script);
+            body
+        }
     };
     // The context is captured, not just its environment: a pause parks the run,
     // and the caller that pushed this context pops it on the way out, so a
@@ -394,7 +400,10 @@ pub fn debug_points(agent: &Agent, source: &str) -> Result<Vec<(u32, u32)>, JsEr
     let jsx = false;
     let script = crate::script::parse_script(source, realm, None)?;
     let strict = crate::script::script_is_strict(&script.source, &script.code);
-    let key = (script.source.clone(), strict, true, jsx);
+    // The identity the run of this text will carry, so the body cached here is
+    // the body that run reuses and its points are breakpoint-comparable.
+    let identity = crate::function::source_identity(&script.source);
+    let key = (Some(identity), script.source.clone(), strict, true, jsx);
     if let Some(body) = agent.roots.script_bodies.borrow().get(&key).cloned() {
         return Ok(point_spans(&body));
     }
@@ -404,6 +413,7 @@ pub fn debug_points(agent: &Agent, source: &str) -> Result<Vec<(u32, u32)>, JsEr
         true,
         true,
     )?);
+    body.script.set(Some(identity));
     let spans = point_spans(&body);
     agent.roots.script_bodies.borrow_mut().insert(key, body);
     Ok(spans)

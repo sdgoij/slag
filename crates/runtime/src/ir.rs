@@ -2020,6 +2020,12 @@ impl ScopeInfo {
 #[derive(Debug, Clone)]
 pub struct CompiledBody {
     pub steps: Vec<Step>,
+    /// The source text this body was compiled from, as the engine's own
+    /// identity for it (`.notes/chromium-facade.md` section 14.4): a
+    /// breakpoint names one of these, so two scripts whose offsets happen to
+    /// coincide cannot cross-trigger. `None` for a body whose text the host
+    /// never identified (a direct eval's, a synthesized one).
+    pub script: std::cell::Cell<Option<u64>>,
     pub handlers: Vec<Handler>,
     pub strict: bool,
     /// The fast-path frame layout, when the scope analysis certified the
@@ -9288,8 +9294,11 @@ impl Vm {
                     // not paused again.
                     if self.pause_ok && !agent.has_paused_run() {
                         // A breakpoint outranks a step: a session that is
-                        // stepping still stops where it asked to.
-                        let stop = if agent.breakpoint_at(span.start) {
+                        // stepping still stops where it asked to. The point is
+                        // matched against the body's source identity, so a
+                        // breakpoint set in one script cannot fire in another
+                        // whose offsets happen to coincide.
+                        let stop = if agent.breakpoint_at(body.script.get(), span.start) {
                             Some(PauseReason::Breakpoint)
                         } else if agent.pause_requested() {
                             agent.clear_pause_request();
@@ -29409,6 +29418,7 @@ pub fn compile_body(
             steps: compiler.steps,
             handlers: compiler.handlers,
             strict: function.strict,
+            script: std::cell::Cell::new(None),
             scope: compiler.scope,
             env_constant,
             leaf,
@@ -29501,6 +29511,7 @@ pub fn compile_statements(
         steps: compiler.steps,
         handlers: compiler.handlers,
         strict,
+        script: std::cell::Cell::new(None),
         scope: compiler.scope,
         env_constant: !compiler.env_changing,
         // Scripts are never the callee of a call, so the leaf-inline fast
@@ -29557,6 +29568,7 @@ pub(crate) fn compile_eval_in_frame(
         steps: compiler.steps,
         handlers: compiler.handlers,
         strict,
+        script: std::cell::Cell::new(None),
         scope: compiler.scope,
         env_constant: !compiler.env_changing,
         // An evaluation is never a callee.

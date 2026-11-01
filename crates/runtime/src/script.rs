@@ -95,6 +95,11 @@ pub fn script_evaluation(
     script: &Handle<ScriptRecord>,
 ) -> Result<Value, JsError> {
     let global_env = script.realm.global_env();
+    // The script's identity is its text (see `Agent::script_identity`). Every
+    // function this evaluation declares carries it, which is what lets a
+    // breakpoint name one script.
+    let identity = crate::function::source_identity(&script.source);
+    let previous = agent.set_current_script(Some(identity));
     let context = crate::context::ExecutionContext {
         function: None,
         realm: script.realm,
@@ -127,6 +132,7 @@ pub fn script_evaluation(
     })();
 
     agent.roots.execution_context_stack.pop();
+    agent.set_current_script(previous);
     result
 }
 
@@ -936,10 +942,14 @@ pub fn perform_eval(
         position: None,
     };
     agent.roots.execution_context_stack.push(eval_context);
+    // The eval'd text is its own source: a function the eval declares belongs
+    // to the eval's spans, not to the caller script's.
+    let previous = agent.set_current_script(Some(crate::function::source_identity(source)));
     let result = (|| -> Result<Value, JsError> {
         eval_declaration_instantiation(agent, &program, &variable_env, &lexical_env, strict_eval)?;
         crate::eval::eval_program(agent, &program, strict_eval, false, false, Some(source))
     })();
+    agent.set_current_script(previous);
     agent.roots.execution_context_stack.pop();
     result
 }

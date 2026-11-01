@@ -8074,6 +8074,7 @@ mod tests {
             steps,
             handlers: Vec::new(),
             strict: false,
+            script: std::cell::Cell::new(None),
             scope: None,
             env_constant: true,
             leaf: false,

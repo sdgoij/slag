@@ -661,6 +661,7 @@ mod tests {
             steps,
             handlers: Vec::new(),
             strict: false,
+            script: std::cell::Cell::new(None),
             scope: Some(scope(frame_size)),
             env_constant: true,
             leaf: false,

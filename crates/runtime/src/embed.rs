@@ -1077,8 +1077,25 @@ impl Context {
 
     /// Replace the session's breakpoints: source offsets into the text the
     /// running script's spans index.
+    ///
+    /// An offset alone is ambiguous across scripts, because every script's spans
+    /// start at zero; a host with more than one script uses
+    /// [`Context::set_script_breakpoints`].
     pub fn set_breakpoints(&mut self, offsets: &[u32]) {
         self.agent.set_breakpoints(offsets);
+    }
+
+    /// Replace the session's breakpoints with ones that name their script, as
+    /// returned by [`Context::script_identity`].
+    pub fn set_script_breakpoints(&mut self, breakpoints: &[(u64, u32)]) {
+        self.agent.set_script_breakpoints(breakpoints);
+    }
+
+    /// The engine's identity for a piece of source text: what a breakpoint
+    /// names so it cannot fire in another script. Derived from the text, so the
+    /// host needs no registry of its own.
+    pub fn script_identity(&self, source: &str) -> u64 {
+        Agent::script_identity(source)
     }
 
     /// The debug points a script's body carries, as `(start, end)` source
@@ -5655,6 +5672,63 @@ mod tests {
                 .any(|property| property.symbol.as_deref() == Some("Symbol.iterator")),
             "a symbol key is reported by its description"
         );
+    }
+
+    #[test]
+    fn a_breakpoint_names_its_script_so_another_cannot_cross_trigger() {
+        let mut context = Context::new().unwrap();
+        context.agent_mut().set_debug_attached(true).unwrap();
+        // The two scripts are the same length and both start their one statement
+        // at offset 0, which is exactly the ambiguity an offset-only breakpoint
+        // set has across scripts.
+        let named = "globalThis.one = 1;";
+        let other = "globalThis.two = 2;";
+        assert_eq!(named.len(), other.len());
+        let identity = context.script_identity(named);
+        context.agent_mut().set_script_breakpoints(&[(identity, 0)]);
+        assert!(
+            context.eval(other).is_ok(),
+            "a breakpoint in one script must not stop another"
+        );
+        assert!(context.agent().paused_reason().is_none());
+        let error = context.eval(named).unwrap_err();
+        assert_eq!(error.message, "execution paused at a breakpoint");
+        assert_eq!(
+            context.agent().paused_position().map(|span| span.start),
+            Some(0)
+        );
+        crate::eval::resume_paused(context.agent_mut()).unwrap();
+        assert_eq!(
+            context.eval("globalThis.one").unwrap().as_number(),
+            Some(1.0)
+        );
+    }
+
+    #[test]
+    fn a_breakpoint_inside_a_function_inherits_its_scripts_identity() {
+        // A function body's spans are offsets into the text its script was
+        // parsed from, so the body has to carry that script's identity or a
+        // breakpoint inside a function could never fire.
+        let mut context = Context::new().unwrap();
+        context.agent_mut().set_debug_attached(true).unwrap();
+        let named = "function fa() { globalThis.a = 1; }\nfa();";
+        let other = "function fb() { globalThis.b = 1; }\nfb();";
+        let at = named.find("globalThis.a = 1;").unwrap() as u32;
+        let identity = context.script_identity(named);
+        context
+            .agent_mut()
+            .set_script_breakpoints(&[(identity, at)]);
+        assert!(context.eval(other).is_ok());
+        assert!(context.agent().paused_reason().is_none());
+        let error = context.eval(named).unwrap_err();
+        assert_eq!(error.message, "execution paused at a breakpoint");
+        assert_eq!(
+            context.agent().paused_frames()[0].function_name.as_deref(),
+            Some("fa"),
+            "the stop is inside the function, not at the script's own point"
+        );
+        crate::eval::resume_paused(context.agent_mut()).unwrap();
+        assert_eq!(context.eval("globalThis.a").unwrap().as_number(), Some(1.0));
     }
 
     #[test]

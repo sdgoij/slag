@@ -412,7 +412,11 @@ impl crux::heap::Trace for ErrorStack {
 
 /// The key of a cached SCRIPT/EVAL body: the exact source text plus
 /// (strict, fast_script, jsx) — see [`AgentRoots::script_bodies`].
-pub(crate) type ScriptBodyKey = (crux::JsString, bool, bool, bool);
+/// Per-source compiled SCRIPT/EVAL bodies, keyed by the exact source text
+/// plus (strict, fast_script, jsx) and the script identity the text carries:
+/// `run_script`/`perform_eval` re-parse the same source into a fresh AST each
+/// call, so without this an eval-in-a-loop recompiled the IR per iteration.
+pub(crate) type ScriptBodyKey = (Option<u64>, crux::JsString, bool, bool, bool);
 
 /// One leaf-inline cache cell: the function id it was filled for, then the
 /// verdict — `Some` is the entry the inline call path needs, `None` is a
@@ -1602,7 +1606,9 @@ impl Trace for AgentRoots {
         }
         if let Ok(bodies) = self.script_bodies.try_borrow() {
             for (key, body) in bodies.iter() {
-                key.0.trace(visit);
+                // The key's first slot is the source identity, which holds no
+                // edge; the text after it does.
+                key.1.trace(visit);
                 body.trace(visit);
             }
         } else {
@@ -2077,15 +2083,21 @@ pub struct Agent {
     /// A host's pending `pause now` request (`Agent::request_pause`). The next
     /// debug point observes it, clears it and returns a paused outcome.
     pub pause_requested: std::cell::Cell<bool>,
-    /// The session's breakpoints: source offsets a debug point stops at. See
-    /// [`Agent::set_breakpoints`]; empty means no session breakpoints.
-    pub breakpoints: RefCell<std::collections::HashSet<u32>>,
+    /// The session's breakpoints: a source identity and an offset into that
+    /// text. `None` for the identity means "any script", which is what the
+    /// facade's offset-only API has always meant.
+    pub breakpoints: RefCell<Vec<(Option<u64>, u32)>>,
     /// How many `Vm` activations are on the native stack (`Vm::run_inner`
     /// increments it). Informational: parkability is decided per activation by
     /// [`Vm::pause_ok`], because a native frame between two activations (a
     /// builtin calling a callback) makes the inner one un-resumable however
     /// deep the stack is.
     pub vm_depth: std::cell::Cell<usize>,
+    /// The engine's identity for the script that is running (see
+    /// [`Agent::script_identity`]): the text a function declared right now
+    /// belongs to. A direct eval clears it for its own run, because the eval's
+    /// text is its own and its spans index that text.
+    pub current_script: std::cell::Cell<Option<u64>>,
     /// The reason and position of the stop that is parking activations right
     /// now. Set by the debug point, taken by the innermost level's park.
     pause_info: Cell<Option<crate::ir::PauseInfo>>,
@@ -2411,12 +2423,66 @@ impl Agent {
     /// facade's script registry will add (a shared offset across two scripts
     /// would otherwise cross-trigger).
     pub fn set_breakpoints(&self, offsets: &[u32]) {
-        *self.breakpoints.borrow_mut() = offsets.iter().copied().collect();
+        *self.breakpoints.borrow_mut() = offsets.iter().map(|offset| (None, *offset)).collect();
     }
 
-    /// Whether a debug point at `offset` is a breakpoint.
-    pub(crate) fn breakpoint_at(&self, offset: u32) -> bool {
-        self.breakpoints.borrow().contains(&offset)
+    /// Replace the session's breakpoints with ones that name the script they
+    /// belong to: a pair of the engine's source identity
+    /// ([`Agent::script_identity`]) and the offset into that text.
+    ///
+    /// This is what a host with more than one script needs. An offset alone is
+    /// ambiguous across scripts, because every script's spans start at zero.
+    pub fn set_script_breakpoints(&self, breakpoints: &[(u64, u32)]) {
+        *self.breakpoints.borrow_mut() = breakpoints
+            .iter()
+            .map(|(script, offset)| (Some(*script), *offset))
+            .collect();
+    }
+
+    /// The engine's identity for a piece of source text: what a breakpoint names
+    /// so it cannot fire in another script. Derived from the text, so the same
+    /// text is the same script however many times a host hands it over.
+    pub fn script_identity(source: &str) -> u64 {
+        crate::function::source_identity(&JsString::from_utf8(source))
+    }
+
+    /// Whether a debug point at `offset` in a body compiled from `script` is a
+    /// breakpoint.
+    pub(crate) fn breakpoint_at(&self, script: Option<u64>, offset: u32) -> bool {
+        self.breakpoints.borrow().iter().any(|(breaks_in, at)| {
+            *at == offset && breaks_in.is_none_or(|breaks_in| Some(breaks_in) == script)
+        })
+    }
+
+    /// The identity of the script running now, which is what a function
+    /// declared at this moment belongs to.
+    pub(crate) fn current_script(&self) -> Option<u64> {
+        self.current_script.get()
+    }
+
+    /// The identity a function created right now belongs to.
+    ///
+    /// The running script is the common case. Outside one (a job the script
+    /// queued, a callback a builtin is draining) the enclosing frame's own text
+    /// is the answer, because that is the text whose spans the new body's spans
+    /// index. That fallback hashes the text, so it only runs while a session is
+    /// attached: without one no breakpoint can name a script, so the identity is
+    /// never read and the hash would be paid for nothing.
+    pub(crate) fn script_for_new_record(&self) -> Option<u64> {
+        if let Some(script) = self.current_script.get() {
+            return Some(script);
+        }
+        if !self.debug_attached.get() {
+            return None;
+        }
+        let source = self.running_context().ok()?.source.clone()?;
+        Some(crate::function::source_identity(&source))
+    }
+
+    /// Set the running script's identity, answering the one it replaced so a
+    /// caller can put it back.
+    pub(crate) fn set_current_script(&self, script: Option<u64>) -> Option<u64> {
+        self.current_script.replace(script)
     }
 
     /// The paused run this agent is holding, if any. A host that saw
@@ -2768,13 +2834,14 @@ impl Agent {
             debug_attached: std::cell::Cell::new(false),
             pause_requested: std::cell::Cell::new(false),
             vm_depth: std::cell::Cell::new(0),
+            current_script: std::cell::Cell::new(None),
             pause_info: Cell::new(None),
             pause_in_flight: Cell::new(false),
             pause_ticket: Cell::new(None),
             pending_step: Cell::new(None),
             step: Cell::new(None),
             level_depth: Cell::new(0),
-            breakpoints: RefCell::new(std::collections::HashSet::new()),
+            breakpoints: RefCell::new(Vec::new()),
             roots: Rc::new(AgentRoots::new()),
             heap_state: std::cell::Cell::new(std::ptr::null()),
             host_hooks: None,

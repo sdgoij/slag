@@ -2032,6 +2032,35 @@ serialising, which the scope listing deliberately does not do.
 Still open on this axis: the class name, accessor getters in a listing, and
 getters that would need the engine to run code at a stop.
 
+**2026-11-01, a breakpoint names its script.** The offset-only breakpoint set was
+wrong for any host with more than one script: every script's spans start at zero,
+so a breakpoint at offset 100 stopped whichever script reached 100 first. The
+engine now identifies a body's source text itself and matches a breakpoint against
+that identity.
+
+- **The identity is the text's hash** (`function::source_identity`, the same FNv-1a
+  the site cache already used), so the host needs no registry: the same text is
+  the same script however many times it is handed over, and
+  `Context::script_identity(source)` is the whole handshake.
+- **`CompiledBody` carries it**, stamped where a body is compiled: `eval_program`
+  from the running script, `set_compiled` from the record's own identity. A
+  function body's spans are offsets into the text its script was parsed from, so
+  without that inheritance a breakpoint inside a function could never fire; that
+  case has its own test.
+- **A record takes the identity of what created it**: the running script, or, when
+  nothing is running (a job the script queued, a callback a builtin is draining),
+  the enclosing frame's own text. That fallback hashes the text, so it only runs
+  while a session is attached, because without one no breakpoint can name a
+  script and the hash would be paid for nothing.
+- Test262's text is not a script in this sense, so a body whose text nobody
+  identified keeps `None` and matches only the old offset-only sets, which still
+  exist for the facade's ABI (`set_breakpoints`) and mean "any script".
+
+One behaviour to know: a body compiled before the host identified its text (a
+script run before `add_script`) carries the identity of that run, which is the
+same hash, so registering late is harmless. The identity is a hash, not a
+registry entry, so nothing has to be cleaned up either.
+
 ## 15. Sources
 
 Verified on 2026-10-31:

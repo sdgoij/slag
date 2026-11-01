@@ -86,7 +86,10 @@ handlers do not run, which is why `Script::Run` answers empty with nothing
 pending rather than throwing.
 - **A breakpoint is a source offset.** Resolve a (line, column) against the
 script text yourself; the facade has no script registry, so the offset set is
-per context and a session debugs one script at a time.
+per context and a session debugs one script at a time. A host with more than one
+script asks the engine for the text's identity (`Context::script_identity`) and
+sets the breakpoints with it, which is what stops an offset that happens to
+coincide in another script from firing there.
 - **A stop happens in the activation that hit the point.** A breakpoint inside a
 function stops there, with every activation above it parked and resumed in
 order, so the caller's call site receives the callee's result (or its throw)
