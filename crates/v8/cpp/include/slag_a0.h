@@ -450,6 +450,22 @@ int32_t slag_wasm_get_compiled(SlagContext* context, uint64_t object,
 int32_t slag_wasm_from_compiled(SlagContext* context,
                                 const SlagWasmModule* compiled, uint64_t* out);
 void slag_wasm_module_free(SlagWasmModule* compiled);
+/* A `WebAssembly.Instance` and a `WebAssembly.Memory` (`v8::WasmInstanceObject`
+ * and `v8::WasmMemoryObject`). The instance's exports are the engine's own
+ * exports record, so the brand and the lookups come from the same table. */
+int32_t slag_wasm_is_instance(SlagContext* context, uint64_t value);
+int32_t slag_wasm_is_memory(SlagContext* context, uint64_t value);
+int32_t slag_wasm_instance_export(SlagContext* context, uint64_t instance,
+                                  uint32_t index, uint64_t* out, int32_t* found);
+int32_t slag_wasm_instance_export_named(SlagContext* context, uint64_t instance,
+                                        uint64_t name, uint64_t* out,
+                                        int32_t* found);
+int32_t slag_wasm_instance_function_index(SlagContext* context,
+                                          uint64_t instance, uint64_t name);
+int32_t slag_wasm_instance_memory(SlagContext* context, uint64_t instance,
+                                  uint64_t* out, int32_t* found);
+int32_t slag_wasm_memory_buffer(SlagContext* context, uint64_t memory,
+                                uint64_t* out);
 
 int32_t slag_collect(SlagContext* context);
 int64_t slag_value_to_utf8(uint64_t value, char* buffer, size_t len);

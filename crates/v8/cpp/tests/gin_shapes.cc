@@ -2470,6 +2470,68 @@ int main() {
         .ToLocalChecked()
         ->Run(current);
     expect(number_at("wasmAnswer") == 7, "the instantiated export ran");
+
+    // The instance surface: the engine's exports record is the brand and the
+    // lookup table, so a host reaches the same export the script did.
+    v8::Local<v8::Value> instance =
+        v8::Script::Compile(
+            current,
+            v8::String::NewFromUtf8Literal(
+                isolate,
+                "globalThis.wasmInstance ="
+                " new WebAssembly.Instance(wasmModule); globalThis.wasmInstance"))
+            .ToLocalChecked()
+            ->Run(current)
+            .ToLocalChecked();
+    expect(v8::WasmInstanceObject::IsWasmInstanceObject(instance),
+           "an instance names itself");
+    expect(!v8::WasmInstanceObject::IsWasmInstanceObject(
+               v8::Object::New(isolate).As<v8::Value>()),
+           "an ordinary object is not an instance");
+
+    v8::Local<v8::WasmInstanceObject> as_instance =
+        instance.As<v8::WasmInstanceObject>();
+    v8::Local<v8::Value> add = as_instance
+                                   ->GetExportedFunction(
+                                       current,
+                                       v8::String::NewFromUtf8Literal(isolate, "add"))
+                                   .ToLocalChecked();
+    expect(add->IsFunction(), "the named export is a function");
+    expect(as_instance->GetFunctionIndex(
+               v8::String::NewFromUtf8Literal(isolate, "add")) == 0,
+           "the export's function index came back");
+    expect(as_instance
+               ->GetExportedFunction(current, 0)
+               .ToLocalChecked()
+               ->IsFunction(),
+           "the indexed export is the same function");
+    expect(as_instance
+               ->GetExportedFunction(
+                   current, v8::String::NewFromUtf8Literal(isolate, "nope"))
+               .IsEmpty(),
+           "a name that is not exported answers empty");
+    expect(as_instance->GetMemoryObject().IsEmpty(),
+           "a module without a memory has none");
+
+    // A memory is an object too, and its buffer is the engine's ArrayBuffer.
+    v8::Local<v8::Value> memory =
+        v8::Script::Compile(
+            current,
+            v8::String::NewFromUtf8Literal(
+                isolate,
+                "new WebAssembly.Memory({ initial: 1 })"))
+            .ToLocalChecked()
+            ->Run(current)
+            .ToLocalChecked();
+    expect(v8::WasmMemoryObject::IsWasmMemoryObject(memory),
+           "a memory names itself");
+    expect(!v8::WasmMemoryObject::IsWasmMemoryObject(instance),
+           "an instance is not a memory");
+    v8::Local<v8::WasmMemoryObject> as_memory = memory.As<v8::WasmMemoryObject>();
+    v8::Local<v8::ArrayBuffer> pages = as_memory->Buffer();
+    expect(!pages.IsEmpty() && pages->ByteLength() == 65536 &&
+               as_memory->Size() == 65536,
+           "a one-page memory answers its buffer");
   }
 
   // Snapshots: write a realm's globals into a blob, then restore the blob in a

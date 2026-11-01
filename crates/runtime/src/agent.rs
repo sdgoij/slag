@@ -2731,6 +2731,14 @@ impl Agent {
         self.roots.dataview_data.borrow().contains_key(&id)
     }
 
+    /// The exports object of a `WebAssembly.Instance`, or `None` when the object
+    /// is not one: the record is what makes an instance an instance, the same way
+    /// the DataView table answers `IsDataView`.
+    #[cfg(feature = "wasm")]
+    pub fn wasm_instance_exports_of(&self, id: u64) -> Option<Value> {
+        self.roots.wasm_instance_exports.borrow().get(&id).copied()
+    }
+
     /// The state of a registered ArrayBuffer, or `None`. A guard into the
     /// table: keep it to the statement that reads it (see the field's note).
     pub fn buffer_state(

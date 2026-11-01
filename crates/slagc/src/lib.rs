@@ -3749,6 +3749,163 @@ pub unsafe extern "C" fn slag_callback_value_has_prototype_in_chain(
     prototype_chain(context, token, value, prototype)
 }
 
+/// Whether the value is a `WebAssembly.Instance` (`v8::WasmInstanceObject`): the
+/// engine's per-instance exports record is the brand.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn slag_wasm_is_instance(context: *mut SlagContext, value: u64) -> i32 {
+    let Some(context) = context.as_ref() else {
+        return 0;
+    };
+    let Ok(engine) = context.context.try_borrow() else {
+        return 0;
+    };
+    i32::from(
+        engine
+            .wasm_instance_exports(JsValue::from_bits(value))
+            .is_some(),
+    )
+}
+
+/// Whether the value is a `WebAssembly.Memory` (`v8::WasmMemoryObject`).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn slag_wasm_is_memory(context: *mut SlagContext, value: u64) -> i32 {
+    let Some(context) = context.as_ref() else {
+        return 0;
+    };
+    let Ok(engine) = context.context.try_borrow() else {
+        return 0;
+    };
+    i32::from(engine.is_wasm_memory(JsValue::from_bits(value)))
+}
+
+/// The `index`-th export of an instance when it is a function
+/// (`v8::WasmInstanceObject::GetExportedFunction`). Answers 0 with `found` set.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn slag_wasm_instance_export(
+    context: *mut SlagContext,
+    instance: u64,
+    index: u32,
+    out: *mut u64,
+    found: *mut i32,
+) -> i32 {
+    wasm_export(context, out, found, |engine| {
+        engine.wasm_exported_by_index(JsValue::from_bits(instance), index)
+    })
+}
+
+/// A named export of an instance when it is a function.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn slag_wasm_instance_export_named(
+    context: *mut SlagContext,
+    instance: u64,
+    name: u64,
+    out: *mut u64,
+    found: *mut i32,
+) -> i32 {
+    wasm_export(context, out, found, |engine| {
+        engine.wasm_exported_by_name(JsValue::from_bits(instance), JsValue::from_bits(name))
+    })
+}
+
+unsafe fn wasm_export(
+    context: *mut SlagContext,
+    out: *mut u64,
+    found: *mut i32,
+    body: impl FnOnce(&mut Context) -> Result<Option<JsValue>, JsError>,
+) -> i32 {
+    let Some(context) = context.as_mut() else {
+        return 2;
+    };
+    let exported = {
+        let Ok(mut engine) = context.context.try_borrow_mut() else {
+            reentrant(context);
+            return 1;
+        };
+        body(&mut engine)
+    };
+    match exported {
+        Ok(exported) => {
+            if !found.is_null() {
+                *found = i32::from(exported.is_some());
+            }
+            if let (Some(value), false) = (exported, out.is_null()) {
+                *out = value.to_bits();
+            }
+            0
+        }
+        Err(error) => {
+            record(context, error);
+            1
+        }
+    }
+}
+
+/// The engine's function index for a named export of an instance, or -1
+/// (`v8::WasmInstanceObject::GetFunctionIndex`).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn slag_wasm_instance_function_index(
+    context: *mut SlagContext,
+    instance: u64,
+    name: u64,
+) -> i32 {
+    let Some(context) = context.as_mut() else {
+        return -1;
+    };
+    let Ok(mut engine) = context.context.try_borrow_mut() else {
+        return -1;
+    };
+    let Ok(Some(exported)) =
+        engine.wasm_exported_by_name(JsValue::from_bits(instance), JsValue::from_bits(name))
+    else {
+        return -1;
+    };
+    engine.wasm_function_index(exported)
+}
+
+/// The first memory an instance exports (`v8::WasmInstanceObject::GetMemoryObject`).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn slag_wasm_instance_memory(
+    context: *mut SlagContext,
+    instance: u64,
+    out: *mut u64,
+    found: *mut i32,
+) -> i32 {
+    wasm_export(context, out, found, |engine| {
+        engine.wasm_instance_memory(JsValue::from_bits(instance))
+    })
+}
+
+/// A memory's current buffer (`v8::WasmMemoryObject::Buffer`).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn slag_wasm_memory_buffer(
+    context: *mut SlagContext,
+    memory: u64,
+    out: *mut u64,
+) -> i32 {
+    let Some(context) = context.as_mut() else {
+        return 2;
+    };
+    let created = {
+        let Ok(mut engine) = context.context.try_borrow_mut() else {
+            reentrant(context);
+            return 1;
+        };
+        engine.wasm_memory_buffer(JsValue::from_bits(memory))
+    };
+    match created {
+        Ok(value) => {
+            if !out.is_null() {
+                *out = value.to_bits();
+            }
+            0
+        }
+        Err(error) => {
+            record(context, error);
+            1
+        }
+    }
+}
+
 /// A symbol's description (`v8::Private::Name`), or `undefined` when it has
 /// none. Answers 2 when the value is not a symbol.
 #[unsafe(no_mangle)]

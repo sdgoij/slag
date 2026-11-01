@@ -481,6 +481,14 @@ move-only owner of the engine's plain-data module, `is_null()` until read), and
 compiled module between objects or isolates. `MemorySpan<T>` is the minimal
 `v8::MemorySpan` shape.
 
+`WasmInstanceObject` reads what a script's `WebAssembly.Instance` built:
+`IsWasmInstanceObject` (the engine's per-instance exports record is the brand),
+`GetExportedFunction` by name and by export order, `GetFunctionIndex` (the
+engine's own index for the exported wrapper), and `GetMemoryObject` (the first
+exported memory, or empty). `WasmMemoryObject` answers `IsWasmMemoryObject`,
+`Buffer` (the engine's own `buffer` getter, so a grown memory materializes the
+current buffer), and `Size`.
+
 ### Buffers and typed arrays
 
 `BackingStore` is a handle to the engine's refcounted byte block, so a store
@@ -649,6 +657,9 @@ not a claim that gin itself links.
     `GetFunction`; `Function::New`/`Call`/`NewInstance`; `Signature` and
     `AccessorSignature`; `Object::GetPrototype`/`SetPrototype`;
     `Isolate::GetCurrent`/`TryGetCurrent`; `MicrotasksScope`; `Locker`/`Unlocker`.
+- `WasmInstanceObject` (`IsWasmInstanceObject`, `GetExportedFunction` by name and
+  by index, `GetFunctionIndex`, `GetMemoryObject`) and `WasmMemoryObject`
+  (`IsWasmMemoryObject`, `Buffer`, `Size`).
 - Handles and persistents as engine roots: a handle slot or a `Global` over an
   engine value retains it for that object's lifetime, and a facade pointer is
   never registered.
@@ -707,10 +718,11 @@ not a claim that gin itself links.
   `NoCacheReason` are accepted and ignored (there is no code cache), and
   `Module::GetModuleRequests` as a `FixedArray` is not exposed; the length and
   index forms are.
-- `WasmInstanceObject`, `WasmMemoryObject`, and `WasmStreaming` are absent: the
-  module object and its compiled form are the whole C++ surface so far, while a
-  script instantiates through the JS API. `CompiledWasmModule` carries no wire
-  bytes, so `GetWireBytesRef` is absent rather than wrong.
+- `WasmStreaming` is absent, and `CompiledWasmModule` carries no wire bytes, so
+  `GetWireBytesRef` is absent rather than wrong. `WasmInstanceObject` reads what
+  a module *exports*: a memory the module imports but does not export has no
+  `GetMemoryObject` answer, and `GetFunctionIndex` answers -1 for an export that
+  is not a wasm function wrapper.
 - A snapshot carries the realm's globals only, and writing one refuses a realm
   that still holds host callbacks (delete `console` and the timers first).
   `SnapshotCreator::AddContext`, `SetDataBlob`, `AddData`, the external

@@ -2517,6 +2517,103 @@ CompiledWasmModule WasmModuleObject::GetCompiledModule() {
   return CompiledWasmModule(compiled);
 }
 
+bool WasmInstanceObject::IsWasmInstanceObject(Local<Value> value) {
+  if (value.IsEmpty()) return false;
+  return slag_wasm_is_instance(CurrentSlagContext(), value.raw()) != 0;
+}
+
+namespace {
+
+/* One export lookup's answer: the value, and whether there was one. */
+struct WasmExport {
+  bool found = false;
+  uint64_t value = 0;
+};
+
+WasmExport ExportOf(SlagContext* slag, int status, int32_t found,
+                    uint64_t value) {
+  WasmExport answer;
+  (void)slag;
+  if (status == 0 && found != 0) {
+    answer.found = true;
+    answer.value = value;
+  }
+  return answer;
+}
+
+}  // namespace
+
+MaybeLocal<Value> WasmInstanceObject::GetExportedFunction(Local<Context> context,
+                                                         Local<Name> name) {
+  if (context.IsEmpty() || name.IsEmpty()) return MaybeLocal<Value>();
+  auto* current = reinterpret_cast<Context*>(
+      static_cast<uintptr_t>(context.raw()));
+  uint64_t value = 0;
+  int32_t found = 0;
+  const int status = slag_wasm_instance_export_named(
+      current->slag(), Raw(this), name.raw(), &value, &found);
+  const WasmExport answer = ExportOf(current->slag(), status, found, value);
+  if (!answer.found) return MaybeLocal<Value>();
+  return MaybeLocal<Value>(Local<Value>::New(answer.value));
+}
+
+MaybeLocal<Value> WasmInstanceObject::GetExportedFunction(Local<Context> context,
+                                                         int index) {
+  if (context.IsEmpty() || index < 0) return MaybeLocal<Value>();
+  auto* current = reinterpret_cast<Context*>(
+      static_cast<uintptr_t>(context.raw()));
+  uint64_t value = 0;
+  int32_t found = 0;
+  const int status = slag_wasm_instance_export(
+      current->slag(), Raw(this), static_cast<uint32_t>(index), &value, &found);
+  const WasmExport answer = ExportOf(current->slag(), status, found, value);
+  if (!answer.found) return MaybeLocal<Value>();
+  return MaybeLocal<Value>(Local<Value>::New(answer.value));
+}
+
+int WasmInstanceObject::GetFunctionIndex(Local<Name> name) {
+  if (name.IsEmpty()) return -1;
+  return slag_wasm_instance_function_index(CurrentSlagContext(), Raw(this),
+                                           name.raw());
+}
+
+Local<WasmMemoryObject> WasmInstanceObject::GetMemoryObject() {
+  SlagContext* slag = CurrentSlagContext();
+  uint64_t memory = 0;
+  int32_t found = 0;
+  if (slag == nullptr ||
+      slag_wasm_instance_memory(slag, Raw(this), &memory, &found) != 0 ||
+      found == 0) {
+    return Local<WasmMemoryObject>();
+  }
+  return Local<WasmMemoryObject>::New(memory);
+}
+
+bool WasmMemoryObject::IsWasmMemoryObject(Local<Value> value) {
+  if (value.IsEmpty()) return false;
+  return slag_wasm_is_memory(CurrentSlagContext(), value.raw()) != 0;
+}
+
+Local<ArrayBuffer> WasmMemoryObject::Buffer() {
+  SlagContext* slag = CurrentSlagContext();
+  uint64_t buffer = 0;
+  if (slag == nullptr ||
+      slag_wasm_memory_buffer(slag, Raw(this), &buffer) != 0) {
+    return Local<ArrayBuffer>();
+  }
+  return Local<ArrayBuffer>::New(buffer);
+}
+
+size_t WasmMemoryObject::Size() const {
+  SlagContext* slag = CurrentSlagContext();
+  uint64_t buffer = 0;
+  if (slag == nullptr ||
+      slag_wasm_memory_buffer(slag, Raw(this), &buffer) != 0) {
+    return 0;
+  }
+  return slag_array_buffer_byte_length(slag, buffer);
+}
+
 bool TryCatch::HasCaught() const {
   auto* context = reinterpret_cast<Context*>(
       static_cast<uintptr_t>(g_current_context));

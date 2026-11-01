@@ -490,6 +490,31 @@ class CompiledWasmModule {
   SlagWasmModule* module_ = nullptr;
 };
 
+/* A `WebAssembly.Memory` (`v8::WasmMemoryObject`). */
+class WasmMemoryObject : public Object {
+ public:
+  static bool IsWasmMemoryObject(Local<Value> value);
+  /* The memory's current buffer, which the engine materializes after a grow. */
+  Local<ArrayBuffer> Buffer();
+  size_t Size() const;
+};
+
+/* A `WebAssembly.Instance` (`v8::WasmInstanceObject`): the engine's exports
+ * record is both the brand and the lookup table, so `IsWasmInstanceObject`
+ * answers for exactly the objects the rest of this class can read. */
+class WasmInstanceObject : public Object {
+ public:
+  static bool IsWasmInstanceObject(Local<Value> value);
+
+  /* A named or indexed export when it is a function. */
+  MaybeLocal<Value> GetExportedFunction(Local<Context> context, Local<Name> name);
+  MaybeLocal<Value> GetExportedFunction(Local<Context> context, int index);
+  /* The engine's function index for the named export, or -1. */
+  int GetFunctionIndex(Local<Name> name);
+  /* The first memory the instance exports, or an empty handle. */
+  Local<WasmMemoryObject> GetMemoryObject();
+};
+
 /* A WebAssembly module object (`v8::WasmModuleObject`): the object
  * `WebAssembly.Module` answers, compiled here or made from a decoded module. */
 class WasmModuleObject : public Object {

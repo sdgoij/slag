@@ -2107,6 +2107,109 @@ impl Context {
         typed_array_info(value)
     }
 
+    /// The exports object of a `WebAssembly.Instance` (`v8::WasmInstanceObject`),
+    /// or `None` when the value is not one.
+    #[cfg(feature = "wasm")]
+    pub fn wasm_instance_exports(&self, value: JsValue) -> Option<JsValue> {
+        let object = value.as_object()?;
+        self.agent
+            .wasm_instance_exports_of(object.id())
+            .map(JsValue)
+    }
+
+    /// Whether the value is a `WebAssembly.Memory` (`v8::WasmMemoryObject`).
+    #[cfg(feature = "wasm")]
+    pub fn is_wasm_memory(&self, value: JsValue) -> bool {
+        value
+            .as_object()
+            .is_some_and(|object| self.agent.wasm_memories.contains_key(&object.id()))
+    }
+
+    /// The `index`-th export of an instance, in the module's export order, when
+    /// it is a function (`v8::WasmInstanceObject::GetExportedFunction`).
+    #[cfg(feature = "wasm")]
+    pub fn wasm_exported_by_index(
+        &mut self,
+        instance: JsValue,
+        index: u32,
+    ) -> Result<Option<JsValue>, JsError> {
+        let Some(exports) = self.wasm_instance_exports(instance) else {
+            return Ok(None);
+        };
+        let keys = exports
+            .as_object()
+            .map(|object| object.property_keys())
+            .transpose()?
+            .unwrap_or_default();
+        let Some(name) = keys.get(index as usize) else {
+            return Ok(None);
+        };
+        let name = name.clone();
+        let value = self.get_property(exports, JsValue::string(name))?;
+        Ok(crux::value::is_callable(&value.clone().into_value()).then_some(value))
+    }
+
+    /// A named export of an instance, when it is a function.
+    #[cfg(feature = "wasm")]
+    pub fn wasm_exported_by_name(
+        &mut self,
+        instance: JsValue,
+        name: JsValue,
+    ) -> Result<Option<JsValue>, JsError> {
+        let Some(exports) = self.wasm_instance_exports(instance) else {
+            return Ok(None);
+        };
+        let value = self.get_property(exports, name)?;
+        let callable = crux::value::is_callable(value.value());
+        Ok(callable.then_some(value))
+    }
+
+    /// The engine's function index for an exported wrapper, or -1
+    /// (`v8::WasmInstanceObject::GetFunctionIndex`).
+    #[cfg(feature = "wasm")]
+    pub fn wasm_function_index(&self, exported: JsValue) -> i32 {
+        let Some(id) = exported.value().as_function().map(|function| function.id()) else {
+            return -1;
+        };
+        self.agent
+            .wasm_exports
+            .get(&id)
+            .map_or(-1, |(_, index)| i32::try_from(*index).unwrap_or(-1))
+    }
+
+    /// The first memory an instance exports (`v8::WasmInstanceObject::GetMemoryObject`),
+    /// or `None` when it exports none.
+    #[cfg(feature = "wasm")]
+    pub fn wasm_instance_memory(&mut self, instance: JsValue) -> Result<Option<JsValue>, JsError> {
+        let Some(exports) = self.wasm_instance_exports(instance) else {
+            return Ok(None);
+        };
+        let keys = exports
+            .as_object()
+            .map(|object| object.property_keys())
+            .transpose()?
+            .unwrap_or_default();
+        for name in keys {
+            let value = self.get_property(exports.clone(), JsValue::string(name))?;
+            if self.is_wasm_memory(value.clone()) {
+                return Ok(Some(value));
+            }
+        }
+        Ok(None)
+    }
+
+    /// A memory's current buffer (`v8::WasmMemoryObject::Buffer`): the engine's
+    /// own `buffer` getter, which materializes it when the memory was grown.
+    #[cfg(feature = "wasm")]
+    pub fn wasm_memory_buffer(&mut self, memory: JsValue) -> Result<JsValue, JsError> {
+        call_intrinsic(
+            self.agent_mut(),
+            "%get WebAssembly.Memory.prototype.buffer%",
+            memory,
+            &[],
+        )
+    }
+
     /// The geometry of a `DataView` (`v8::DataView`'s `ByteOffset`/`ByteLength`),
     /// or `None` when the value is not one. A view with no explicit length tracks
     /// the buffer's remaining bytes.
