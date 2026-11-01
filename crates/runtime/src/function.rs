@@ -317,6 +317,7 @@ pub struct EcmaFunction {
     /// step IR, and ordinary calls/constructs run it on the VM. Shared so
     /// the per-call record read does not copy the steps.
     pub ir: Option<std::rc::Rc<crate::ir::CompiledBody>>,
+
     /// Cut 33: the cached leaf-inline verdict for `do_call_fast` — the
     /// record-derived eligibility (certified leaf body, ordinary callable)
     /// is immutable once the ir compiles, so the per-call check reads one
@@ -1578,14 +1579,14 @@ pub fn make_method(agent: &mut Agent, function: &Value, home_object: Value) -> R
 /// the per-body JIT fast pointer stays warm instead of recompiling the IR
 /// and machine code per closure.
 fn shared_compiled_body(
-    agent: &mut Agent,
+    agent: &Agent,
     data: &EcmaFunction,
     body_key: usize,
 ) -> Result<CompiledBodyCacheEntry, JsError> {
     if let Some(entry) = agent.roots.compiled_bodies.borrow().get(&body_key) {
         return Ok(entry.clone());
     }
-    let (compiled, this_writes) = crate::ir::compile_body(data)?;
+    let (compiled, this_writes) = crate::ir::compile_body(data, agent.debug_points())?;
     let entry = CompiledBodyCacheEntry {
         compiled: std::rc::Rc::new(compiled),
         this_writes,
@@ -1596,6 +1597,44 @@ fn shared_compiled_body(
         .borrow_mut()
         .insert(body_key, entry.clone());
     Ok(entry)
+}
+
+/// Recompile one registered function's body under the agent's current debug
+/// setting and install it on the record (`Agent::set_debug_attached`).
+///
+/// The compile is a pure function of the record, so the new body differs from
+/// the old one only in the debug points. That is why the record's derived
+/// verdicts are recomputed by `set_compiled` and the constructor's
+/// `this_writes` pattern is NOT re-stored: the pattern is a function of the
+/// same source and cannot change.
+pub(crate) fn recompile_record(agent: &Agent, id: u64) -> Result<(), JsError> {
+    let body_key = {
+        let data = agent.ecma_function(&id).ok_or_else(|| {
+            JsError::new(
+                ErrorKind::TypeError,
+                "Function body is not registered".into(),
+            )
+        })?;
+        if data.ir.is_none() {
+            // Never compiled: nothing to translate, and the next call compiles
+            // under the current setting (the site cache was cleared).
+            return Ok(());
+        }
+        std::rc::Rc::as_ptr(&data.body) as usize
+    };
+    let entry = {
+        let data = agent.ecma_function(&id).ok_or_else(|| {
+            JsError::new(
+                ErrorKind::TypeError,
+                "Function body is not registered".into(),
+            )
+        })?;
+        shared_compiled_body(agent, &data, body_key)?
+    };
+    if let Some(mut data) = agent.ecma_function_mut(&id) {
+        data.set_compiled(entry.compiled);
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1657,6 +1696,7 @@ fn register_function(
         source_info,
         declaring_script_or_module,
         ir: None,
+
         leaf_inline: false,
         construct_inline: false,
         outer_chain,
@@ -2063,6 +2103,7 @@ pub fn instantiate_arrow(
         source_info,
         declaring_script_or_module,
         ir: None,
+
         leaf_inline: false,
         construct_inline: false,
         outer_chain,

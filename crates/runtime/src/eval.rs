@@ -50,6 +50,7 @@ pub fn eval_program(
                     &program.body,
                     strict,
                     fast_script,
+                    agent.debug_points(),
                 )?);
                 agent
                     .roots
@@ -63,6 +64,7 @@ pub fn eval_program(
             &program.body,
             strict,
             fast_script,
+            agent.debug_points(),
         )?),
     };
     let env = agent.running_context()?.lexical_environment;
@@ -7443,7 +7445,7 @@ mod tests {
     fn fast_script_compiles_globals_to_direct_access() {
         let program =
             parser::parse_script("var n = 0; for (var i = 0; i < 100; i++) { n += i; } n").unwrap();
-        let body = crate::ir::compile_statements(&program.body, false, true).unwrap();
+        let body = crate::ir::compile_statements(&program.body, false, true, false).unwrap();
         assert!(
             body.script_globals.is_some(),
             "the script must be certified"
@@ -7492,7 +7494,7 @@ mod tests {
             "the loop test must fuse against the global binding"
         );
         // The eval/module mode never certifies.
-        let body = crate::ir::compile_statements(&program.body, false, false).unwrap();
+        let body = crate::ir::compile_statements(&program.body, false, false, false).unwrap();
         assert!(
             body.script_globals.is_none(),
             "eval/module mode must stay env-path"
@@ -7542,7 +7544,7 @@ mod tests {
             "var n = 0; for (var i = 0; i < 3; i++) { n = n + i; } String(hook)",
         )
         .unwrap();
-        let body = crate::ir::compile_statements(&program.body, false, true).unwrap();
+        let body = crate::ir::compile_statements(&program.body, false, true, false).unwrap();
         assert!(
             body.scope.is_some() && body.script_globals.is_some(),
             "a member call must not un-certify the script"
@@ -7626,7 +7628,7 @@ mod tests {
         // script stays certified: the parameter rule is not a cliff.
         let program =
             parser::parse_script("var q = 0; function h(a = 1) { return a; } q = h();").unwrap();
-        let body = crate::ir::compile_statements(&program.body, false, true).unwrap();
+        let body = crate::ir::compile_statements(&program.body, false, true, false).unwrap();
         assert!(
             body.scope.is_some() && body.script_globals.is_some(),
             "a literal default must not un-certify the script"
@@ -7692,7 +7694,7 @@ mod tests {
             "var o = { a: 1, b: 2 }; var s = ''; for (var k in o) { s += k; } s",
         )
         .unwrap();
-        let body = crate::ir::compile_statements(&program.body, false, true).unwrap();
+        let body = crate::ir::compile_statements(&program.body, false, true, false).unwrap();
         assert!(
             body.scope.is_some() && body.script_globals.is_some(),
             "a for-in head must not un-certify the script"
@@ -7730,7 +7732,7 @@ mod tests {
              for (var i = 0; i < 3; i++) s += p.get(); s",
         )
         .unwrap();
-        let body = crate::ir::compile_statements(&program.body, false, true).unwrap();
+        let body = crate::ir::compile_statements(&program.body, false, true, false).unwrap();
         assert!(
             body.scope.is_some() && body.script_globals.is_some(),
             "a global-blind closure must not un-certify the script"
@@ -7744,7 +7746,7 @@ mod tests {
             "var d = 1; var a = () => d; a()",
         ] {
             let program = parser::parse_script(source).unwrap();
-            let body = crate::ir::compile_statements(&program.body, false, true).unwrap();
+            let body = crate::ir::compile_statements(&program.body, false, true, false).unwrap();
             assert!(body.scope.is_none(), "must not be certified: {source}");
         }
         // `this.<undeclared name>` is a real global property — always current,

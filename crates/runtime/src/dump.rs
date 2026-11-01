@@ -32,7 +32,7 @@ pub fn ast(source: &str) -> Result<String, String> {
 pub fn bytecode(source: &str) -> Result<String, String> {
     let program = parser::parse_script(source).map_err(|error| format!("parse: {error}"))?;
     let strict = crate::script::script_is_strict(&crux::JsString::from_utf8(source), &program);
-    let body = crate::ir::compile_statements(&program.body, strict, true)
+    let body = crate::ir::compile_statements(&program.body, strict, true, false)
         .map_err(|error| format!("compile: {error}"))?;
     Ok(crate::ir::debug_body_to_string(&body))
 }

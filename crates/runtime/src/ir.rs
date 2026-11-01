@@ -18923,6 +18923,10 @@ struct Compiler {
     /// RMW instead of staying an unfused `BinLeftReg`/`BinImm`/`StoreReg`.
     /// Scoped like `proven_num_slots`.
     proven_int_slots: std::collections::HashSet<usize>,
+    /// Whether to emit a debug point before each statement (§14.4). A compile
+    /// input from `Agent::set_debug_attached`, not a run-time test: the dispatch
+    /// it costs in the interpreter is only avoidable by not emitting the step.
+    debug_points: bool,
 }
 
 /// Where a binding lives for emission purposes: a frame slot (fast body),
@@ -20445,9 +20449,10 @@ impl Compiler {
     fn compile_statement(&mut self, stmt: &Stmt) -> Result<(), JsError> {
         // The debug point (§14.4): one per statement, at its source span, so a
         // debugger has a place to stop that is not also a place the compiler
-        // may fold away. `SLAG_DEBUG_POINTS=0` is the same-binary seam that
-        // suppresses it, and the A/B that priced it is in `.notes/perf.md`.
-        if debug_points_enabled() {
+        // may fold away. A compile input (the session flag, recompiled on the
+        // attach transition), because the dispatch it costs in the interpreter
+        // cannot be removed once the step is in the body.
+        if self.debug_points {
             self.emit(Step::DebugCheck { span: stmt.span });
         }
         match &stmt.kind {
@@ -26025,36 +26030,27 @@ pub fn is_compound_assign(op: &AssignOp) -> bool {
 
 /// Whether the compiler emits a debug point per statement.
 ///
-/// **On by default, and that is a measurement.** `SLAG_DEBUG_POINTS=0` is the
-/// same-binary seam; the A/B that priced the emission is recorded in
-/// `.notes/perf.md` (2026-11-01) and the answer was that the step itself is
-/// free (full corpus, 7 interleaved rounds: -0.02% and -0.14% in two runs).
-/// What cost 13x on the `opcost` rows was two lowering refusals, not the step:
-/// `lower_step`'s catch-all demoted every leaf body, and the optimizing tier's
-/// lift refused the body outright, which is what a session cannot survive.
+/// The answer is the session flag: a point is one extra step dispatch per
+/// statement in the interpreter, and `--jitless` measured **+1.11%** for it
+/// corpus-wide (2.35 ns a dispatch; `.notes/perf.md`, 2026-11-01). The compiled
+/// tier pays nothing, so the product never saw it, but a normal run should not
+/// pay it either. `SLAG_DEBUG_POINTS` overrides the flag (`1` on, `0` off) for
+/// the same-binary A/B those numbers came from.
 ///
-/// It has to be on rather than attach-gated: a session refuses compilation
-/// (`lookup_info_for`), so the body a session runs is the bytecode built
-/// *before* the attach, and a switch that is read at attach time could not put
-/// the points into it. Nor can an attach drop the bytecode caches to force a
-/// recompile: a function record holds its own `ir` and has no recompile path,
-/// so the record's body would survive the drop or the function would be
-/// demoted to the interpreted environment path for good. Cached, because
-/// `std::env::var_os` costs ~140 ns and this is consulted once per statement
-/// compiled.
+/// A session can gate this only because `Agent::set_debug_attached` recompiles
+/// the bytecode on the transition: the body a session runs was built before the
+/// attach, and no run-time test can remove the dispatch that makes a point
+/// expensive. That is also why the protocol's per-iteration (back-edge) point
+/// is not emitted yet: at 2.35 ns a dispatch it costs +6.9% on a tight loop,
+/// and it needs the same recompile to be free when no session is attached.
 ///
-/// The interpreter does pay for it, which is the honest half of the number:
-/// `--jitless` is +1.11% corpus-wide, since a point is one extra step dispatch
-/// per statement. That is why the protocol's per-iteration (back-edge) point is
-/// deliberately not emitted here: at 2.35 ns a dispatch it costs +6.9% on a
-/// tight loop, and both costs go away with the slice that gives a session its
-/// own bytecode (invalidate the cached bodies on attach).
-pub(crate) fn debug_points_enabled() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| match std::env::var_os("SLAG_DEBUG_POINTS") {
-        Some(value) => value != "0",
-        None => true,
-    })
+/// Cached, because `std::env::var_os` costs ~140 ns and this is consulted once
+/// per statement compiled.
+pub(crate) fn debug_points_enabled(attached: bool) -> bool {
+    static OVERRIDE: std::sync::OnceLock<Option<bool>> = std::sync::OnceLock::new();
+    OVERRIDE
+        .get_or_init(|| std::env::var_os("SLAG_DEBUG_POINTS").map(|value| value != "0"))
+        .unwrap_or(attached)
 }
 
 /// The body's maximum value-stack depth above its entry stack pointer, in
@@ -27645,11 +27641,13 @@ fn lower_step(
     env_constant: bool,
 ) -> Option<()> {
     match step {
-        // A debug point is transparent to a register run and to leaf
-        // classification: it emits no op and changes no slot. Refusing it here
-        // (which is what the catch-all does) demotes every leaf body that now
-        // contains one, and the call lane loses its leaf inline.
-        Step::DebugCheck { .. } => {}
+        // A debug point has no register form: lowering one would drop it, and
+        // a session would run straight past its own stop (a whole-body program
+        // and a lowered loop body both dispatch no steps). Refusing keeps that
+        // statement, and the region around it, on the step path — the same
+        // trade `steps_are_leaf` makes for the leaf lane. A body compiled with
+        // no session holds no points, so the free lanes keep it.
+        Step::DebugCheck { .. } => return None,
         Step::Push(value) => stack.push(RegOperand::Const(*value)),
         Step::PushAcc => {
             // At most two accumulator-loop counter reads per body: the
@@ -28534,14 +28532,13 @@ fn lower_leaf_ops_segmented(
             if matches!(steps[i], Step::ListBegin | Step::ListEnd) {
                 break;
             }
-            // A debug point is transparent to a register run: it is a no-op on
-            // both lanes, and treating it as a boundary would split every loop
-            // body that has one. The step stays in the body, so the run's
-            // recorded `start` still names the step the compiled entry is
-            // entered at.
+            // A debug point ends the run: the ops dispatch nothing, so a point
+            // absorbed into a run is a point the session never consults (the
+            // whole loop body would run straight past a breakpoint). Ending the
+            // run here leaves the point on the step path. With no session
+            // attached no body holds one, so the free lane keeps the run.
             if matches!(steps[i], Step::DebugCheck { .. }) {
-                i += 1;
-                continue;
+                break;
             }
             if lower_step(
                 &steps[i],
@@ -28885,6 +28882,7 @@ fn leaf_op_reads_context(op: &LeafOp) -> bool {
 /// doesn't use lexical `this` or is not a constructor).
 pub fn compile_body(
     function: &EcmaFunction,
+    debug_points: bool,
 ) -> Result<(CompiledBody, (usize, [crux::AtomId; 4])), JsError> {
     let _guard = CompilingGuard::new();
     let scope = analyze_scope(function);
@@ -28899,6 +28897,7 @@ pub fn compile_body(
             .as_ref()
             .map(|name| crux::intern(name.as_slice())),
         named_expression: function.named_expression,
+        debug_points,
         ..Compiler::default()
     };
     // Cut 3 continuation: the body's `arguments` slot is filled at entry —
@@ -29075,6 +29074,7 @@ pub fn compile_statements(
     stmts: &[Stmt],
     strict: bool,
     fast_script: bool,
+    debug_points: bool,
 ) -> Result<CompiledBody, JsError> {
     let _guard = CompilingGuard::new();
     let (slots, script_globals, script_assigned) = if fast_script {
@@ -29092,6 +29092,7 @@ pub fn compile_statements(
         script_certified: slots.as_ref().map(|slots| slots.certified.clone()),
         script_var_certs: slots.as_ref().map(|slots| slots.var_certs.clone()),
         strict,
+        debug_points,
         ..Compiler::default()
     };
     // Cut 16: a slotified script's prologue loads each declared var's

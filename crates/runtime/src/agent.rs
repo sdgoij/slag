@@ -2258,19 +2258,37 @@ impl Agent {
 
     /// Attach or detach a debug session (`Isolate::SetDebugAttached`).
     ///
-    /// The flag does one thing: `lookup_info_for` refuses the compiled tiers
-    /// while it is set, so a session cannot be skipped by code compiled before
-    /// it (§14.4 of `.notes/chromium-facade.md`). The bytecode already carries a
-    /// point per statement, so nothing has to be recompiled here, and that is
-    /// deliberate: a function record holds its own `ir` and has no recompile
-    /// path (`set_compiled` runs only at creation, and the record no longer
-    /// carries the name `compile_body` takes), so dropping the bytecode caches
-    /// would either leave the record's body in place or demote the function to
-    /// the interpreted environment path permanently. Recompiling with points
-    /// only under a session is the design V8 uses, and it needs a record-level
-    /// recompile first.
-    pub fn set_debug_attached(&self, attached: bool) {
+    /// Sets the flag `lookup_info_for` reads, and recompiles the bytecode,
+    /// because the flag is a compile input: a body built without the points has
+    /// nowhere for a session to stop, and one built with them pays a step
+    /// dispatch per statement in the interpreter (`--jitless` measured +1.11%).
+    /// Three owners hold a compiled body and all three have to be refreshed:
+    /// the per-site `compiled_bodies` cache, the per-source `script_bodies`
+    /// cache, and each `EcmaFunction` record's own `ir`, which is the one
+    /// `ordinary_call` reads. The caches recompile lazily on their next use; a
+    /// record has no such path, so it is recompiled here. An old body is not
+    /// freed while the JIT cache lists it (its entry owns a strong `Rc`).
+    ///
+    /// The cost is one compile per registered function, on a transition a human
+    /// triggered.
+    pub fn set_debug_attached(&self, attached: bool) -> Result<(), JsError> {
+        if self.debug_attached.get() == attached {
+            return Ok(());
+        }
         self.debug_attached.set(attached);
+        self.roots.compiled_bodies.borrow_mut().clear();
+        self.roots.script_bodies.borrow_mut().clear();
+        let ids: Vec<u64> = self.roots.ecma_functions.borrow().keys().copied().collect();
+        for id in ids {
+            crate::function::recompile_record(self, id)?;
+        }
+        Ok(())
+    }
+
+    /// Whether the compiler emits per-statement debug points: the session flag,
+    /// with `SLAG_DEBUG_POINTS` as the same-binary A/B override.
+    pub(crate) fn debug_points(&self) -> bool {
+        crate::ir::debug_points_enabled(self.debug_attached.get())
     }
 
     /// The heap limit a host asked for, if any
@@ -4153,55 +4171,104 @@ impl Agent {
 mod tests {
     use super::*;
 
-    #[test]
-    fn attaching_a_session_keeps_the_bytecode_that_already_has_the_points() {
-        // The compiled body always carries the points, so an attach only has to
-        // stop the JIT (`lookup_info_for`). Dropping the bytecode caches here
-        // would be wrong, and the reason is a property of the function record:
-        // it holds its own `ir` and has no recompile path (`set_compiled` runs
-        // only at creation, and the record no longer carries the name
-        // `compile_body` takes), so a cleared cache either leaves the record's
-        // body in place or demotes the function to the interpreted env path for
-        // good. That is why attach-time bytecode needs its own slice.
-        let mut agent = Agent::new();
-        agent.initialize_host_defined_realm().unwrap();
-        let expected = if crate::ir::debug_points_enabled() {
+    /// The points a two-statement body carries under a given session state,
+    /// honouring the `SLAG_DEBUG_POINTS` override the perf protocol uses.
+    fn expected_points(attached: bool) -> usize {
+        if crate::ir::debug_points_enabled(attached) {
             2
         } else {
             0
-        };
-        let points = |body: &crate::ir::CompiledBody| {
-            body.steps
-                .iter()
-                .filter(|step| matches!(step, crate::ir::Step::DebugCheck { .. }))
-                .count()
+        }
+    }
+
+    fn point_count(body: &crate::ir::CompiledBody) -> usize {
+        body.steps
+            .iter()
+            .filter(|step| matches!(step, crate::ir::Step::DebugCheck { .. }))
+            .count()
+    }
+
+    #[test]
+    fn a_debug_session_recompiles_the_cached_script_bytecode() {
+        let mut agent = Agent::new();
+        agent.initialize_host_defined_realm().unwrap();
+        let cached = |agent: &Agent| {
+            agent
+                .roots
+                .script_bodies
+                .borrow()
+                .values()
+                .next()
+                .cloned()
+                .expect("the script body is cached")
         };
         agent.run_script("var n = 1; n += 1;").unwrap();
-        let body = agent
-            .roots
-            .script_bodies
-            .borrow()
-            .values()
-            .next()
-            .cloned()
-            .expect("the script body is cached");
-        assert_eq!(points(&body), expected, "one point per statement");
-        agent.set_debug_attached(true);
-        assert!(agent.debug_attached.get());
-        let again = agent
-            .roots
-            .script_bodies
-            .borrow()
-            .values()
-            .next()
-            .cloned()
-            .expect("the attach must not drop the body");
-        assert!(
-            std::rc::Rc::ptr_eq(&body, &again),
-            "the attach must not drop the bytecode"
+        let before = cached(&agent);
+        assert_eq!(point_count(&before), expected_points(false));
+        agent.set_debug_attached(true).unwrap();
+        agent.run_script("var n = 1; n += 1;").unwrap();
+        let during = cached(&agent);
+        assert_eq!(
+            point_count(&during),
+            expected_points(true),
+            "a session sees the same statements, now with points"
         );
-        agent.set_debug_attached(false);
-        assert!(!agent.debug_attached.get());
+        assert!(
+            !std::rc::Rc::ptr_eq(&before, &during),
+            "the attach must recompile the cached script"
+        );
+        agent.set_debug_attached(false).unwrap();
+        agent.run_script("var n = 1; n += 1;").unwrap();
+        assert_eq!(
+            point_count(&cached(&agent)),
+            expected_points(false),
+            "the detach must drop them again"
+        );
+    }
+
+    #[test]
+    fn a_debug_session_recompiles_a_function_record_in_place() {
+        // The record's own `ir` is the body `ordinary_call` runs, and it has no
+        // recompile-on-miss path, so `set_debug_attached` has to replace it.
+        let mut agent = Agent::new();
+        agent.initialize_host_defined_realm().unwrap();
+        agent
+            .run_script("function f() { return 1 + 1; } f();")
+            .unwrap();
+        let function_id = |agent: &Agent| {
+            let table = agent.roots.ecma_functions.borrow();
+            table
+                .iter()
+                .find(|(_, data)| {
+                    data.name
+                        .as_ref()
+                        .is_some_and(|name| name.to_string_lossy() == "f")
+                })
+                .map(|(id, _)| *id)
+                .expect("f is a registered function")
+        };
+        let record_body = |agent: &Agent, id: u64| {
+            agent
+                .ecma_function(&id)
+                .expect("the record is registered")
+                .ir
+                .clone()
+                .expect("the record has a compiled body")
+        };
+        let id = function_id(&agent);
+        let before = record_body(&agent, id);
+        assert_eq!(point_count(&before), 0, "no session, no points");
+        agent.set_debug_attached(true).unwrap();
+        let during = record_body(&agent, id);
+        assert_eq!(
+            point_count(&during),
+            1,
+            "the attach must replace the record's body with one that has the point"
+        );
+        assert!(
+            !std::rc::Rc::ptr_eq(&before, &during),
+            "the record must hold the recompiled body"
+        );
     }
 
     #[test]

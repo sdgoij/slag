@@ -1503,14 +1503,15 @@ learn about the step, and each failure looked like the step being expensive:
   `0` in `stack_delta` and an empty arm in the optimizer's emitter.
 
 The second one is the load-bearing result, and it changes the decision: a
-session cannot survive a tier that refuses the step, so the emission is **on by
-default**. R1 alone does not make the compiled tiers harmless here — the body a
-session runs is the bytecode built *before* the attach, which is why the points
-have to be in every body rather than compiled in on attach. What R1 buys is that
-the compiled tiers, which model the point as a no-op, cannot run at all while a
-session is attached. The fallback in the cost paragraph above is not taken for
-the statements, because the compiled tier is free; the second measurement below
-takes it for the loop back edge.
+session cannot survive a tier that refuses the step, so the emission was **on by
+default** while the attach could not recompile the bytecode (the third
+measurement below gates it). R1 alone does not make the compiled tiers harmless
+here — the body a session runs is the bytecode built *before* the attach, which
+is why the points have to be in the body a session runs rather than compiled in
+on attach. What R1 buys is that the compiled tiers, which model the point as a
+no-op, cannot run at all while a session is attached. The fallback in the cost
+paragraph above is not taken for the statements, because the compiled tier is
+free; the second measurement below takes it for the loop back edge.
 
 **2026-11-01, second measurement: the interpreter, and the back edge.** The
 number above is the JIT tier. `--jitless`, same seam, full corpus, 5 interleaved
@@ -1550,7 +1551,43 @@ to be recomputed. That record-level recompile is therefore step one of the
 slice.
 
 Until it lands, the point stays always-on and `Agent::set_debug_attached` only
-flips the flag `lookup_info_for` reads.
+flips the flag `lookup_info_for` reads. **It landed as the third measurement
+below.**
+
+**2026-11-01, the attach-time bytecode landed.** The record-level recompile that
+paragraph said was missing now exists, so the emission is gated on the session
+flag and a normal run pays nothing:
+
+- `EcmaFunction` carries `compile_name: Option<AtomId>`, the interned form of the
+  name `compile_body` was given at creation. It is a compile *input* (`Cut
+  46`/`47` compare the body's own name against a tail call's callee), so a
+  recompile without it would silently lose the self-tail-call fusion. Eight
+  bytes on the record; the 200 to 152 shrink measured flat, so the record's size
+  is not where its cost lives.
+- `function::recompile_record` recompiles one record from its own state plus that
+  name and installs it through `set_compiled`, which recomputes `leaf_inline` and
+  `construct_inline`. It does not re-store a constructor's `this_writes`: the
+  pattern is a function of the same source.
+- `Agent::set_debug_attached` clears the two bytecode caches, then recompiles
+  every registered record, and returns `Result` because a compile can fail. The
+  caches recompile lazily on next use; a record has no such path, which is why
+  that half is eager. The cost is one compile per registered function, on a
+  transition a human triggered.
+- An old body is never freed under the JIT cache: `Entry::body` is a strong `Rc`,
+  so a body the cache still lists outlives the record's reference and the entry
+  can still clear its fast cell on eviction.
+
+Measured after the change with the same-binary seam (A = default, B =
+`SLAG_DEBUG_POINTS=1`, which is what a session compiles), full corpus, one
+process per row, per-row minima: compiled tier **1076.0 against 1078.8 ms
+(-0.26%)**, no row outside the noise floor, and `--jitless` **3482.9 against
+3531.8 ms (-1.38%)**. The +1.11% is gone from a normal run and comes back under
+a session, which is the point.
+
+Two gaps stay recorded. The per-loop-back-edge point is still not emitted, and
+now has the mechanism that would make it free when no session is attached, so it
+is the next thing to emit. And the attach's own cost is unmeasured beyond "one
+compile per registered function".
 
 ## 15. Sources
 

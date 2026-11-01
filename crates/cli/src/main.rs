@@ -482,7 +482,7 @@ fn dump_bytecode(source: &str) -> Result<(), u8> {
         Ok(program) => {
             let strict =
                 runtime::script::script_is_strict(&crux::JsString::from_utf8(source), &program);
-            match runtime::ir::compile_statements(&program.body, strict, true) {
+            match runtime::ir::compile_statements(&program.body, strict, true, false) {
                 Ok(body) => {
                     runtime::ir::debug_print_body(&body);
                     Ok(())
