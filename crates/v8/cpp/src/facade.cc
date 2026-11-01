@@ -2463,6 +2463,11 @@ MaybeLocal<Script> Script::Compile(Local<Context> context,
                    reinterpret_cast<const uint8_t*>(text.data()), text.size(),
                    reinterpret_cast<const uint8_t*>(name.data()), name.size(),
                    &script) != 0) {
+    // A syntax error is a message too, and nothing can have caught it yet.
+    if (g_try_catch_depth == 0) {
+      Isolate::NotifyMessageListeners(g_current_isolate, current->slag(),
+                                      Isolate::kMessageError);
+    }
     return MaybeLocal<Script>();
   }
   return Local<Script>::New(reinterpret_cast<uint64_t>(script));
@@ -2476,6 +2481,12 @@ MaybeLocal<Value> Script::Run(Local<Context> context) {
   auto* script = reinterpret_cast<SlagScript*>(
       static_cast<uintptr_t>(Raw(this)));
   if (slag_script_run(current->slag(), script, &out) != 0) {
+    // Nothing caught it: this is the report a message listener (and so the
+    // inspector) exists for. `kAuto`'s drain does not run for a failed script.
+    if (g_try_catch_depth == 0) {
+      Isolate::NotifyMessageListeners(g_current_isolate, current->slag(),
+                                      Isolate::kMessageError);
+    }
     return MaybeLocal<Value>();
   }
   // `kAuto` (the default, and what V8 does when the call stack empties) drains
@@ -2771,6 +2782,7 @@ bool TryCatch::HasCaught() const {
 }
 
 TryCatch::~TryCatch() {
+  --g_try_catch_depth;
   delete message_;
   // V8's TryCatch resets the isolate's pending exception when it goes out of
   // scope, so the next operation starts clean.
@@ -2799,6 +2811,10 @@ Message::~Message() {
   slag_root_release(text_);
 }
 
+/* The message the context's pending error describes (see the definition below);
+ * `TryCatch::Message` and the message listeners both read it. */
+v8::Message* BuildPendingMessage(SlagContext* slag);
+
 Local<v8::Message> TryCatch::Message() const {
   if (message_ != nullptr) {
     return Local<v8::Message>::New(reinterpret_cast<uint64_t>(message_));
@@ -2806,26 +2822,107 @@ Local<v8::Message> TryCatch::Message() const {
   auto* context = reinterpret_cast<Context*>(
       static_cast<uintptr_t>(g_current_context));
   if (context == nullptr) return Local<v8::Message>();
+  message_ = BuildPendingMessage(context->slag());
+  if (message_ == nullptr) return Local<v8::Message>();
+  return Local<v8::Message>::New(reinterpret_cast<uint64_t>(message_));
+}
+
+/* The message the context's pending error describes, or null.
+ *
+ * A compile records a position and the source line; a runtime error records
+ * neither, so its message is the error's own text with an empty line and
+ * position. That is what V8 hands a message listener for an uncaught throw, and
+ * the inspector's `Runtime.exceptionThrown` is built from it. */
+v8::Message* BuildPendingMessage(SlagContext* slag) {
+  if (slag == nullptr) return nullptr;
   SlagMessage position{};
   char name[256];
   char source_line[1024];
-  // Only a compile records a position, so a runtime error has no message to
-  // report and the host prints the exception alone.
-  if (slag_pending_message(context->slag(), &position, name, sizeof(name),
-                           source_line, sizeof(source_line)) != 1) {
-    return Local<v8::Message>();
+  const bool compile =
+      slag_pending_message(slag, &position, name, sizeof(name), source_line,
+                           sizeof(source_line)) == 1;
+  if (!compile) {
+    name[0] = '\0';
+    source_line[0] = '\0';
   }
-  char text[1024];
-  int64_t len = slag_pending_error(context->slag(), text, sizeof(text));
-  if (len < 0) return Local<v8::Message>();
-  message_ = new v8::Message(
+  char text[1100];
+  int64_t len = -1;
+  uint64_t thrown = 0;
+  // A thrown value is the error itself, and V8 spells an uncaught one with a
+  // leading `Uncaught `; a host-recorded error (a `ThrowError`, a compile
+  // failure) has only its message.
+  if (slag_pending_exception(slag, &thrown) != 0 && thrown != 0) {
+    char value[1024];
+    // The context form runs the value's own `toString`, which is what makes an
+    // `Error` read as `Error: message` rather than `[object Object]`.
+    if (slag_value_to_utf8_context(slag, thrown, value, sizeof(value)) >= 0) {
+      const int written = snprintf(text, sizeof(text), "Uncaught %s", value);
+      if (written > 0) {
+        len = written < static_cast<int>(sizeof(text))
+                  ? written
+                  : static_cast<int>(sizeof(text)) - 1;
+      }
+    }
+  }
+  if (len < 0) {
+    len = slag_pending_error(slag, text, sizeof(text));
+  }
+  if (len < 0) return nullptr;
+  return new v8::Message(
       slag_string_new(reinterpret_cast<const uint8_t*>(name), strlen(name)),
       slag_string_new(reinterpret_cast<const uint8_t*>(source_line),
                       strlen(source_line)),
       slag_string_new(reinterpret_cast<const uint8_t*>(text),
                       static_cast<size_t>(len)),
-      position.line, position.column, position.column);
-  return Local<v8::Message>::New(reinterpret_cast<uint64_t>(message_));
+      compile ? position.line : 0, compile ? position.column : 0,
+      compile ? position.column : 0);
+}
+
+void Isolate::AddMessageListener(MessageCallback callback, Local<Value> data) {
+  AddMessageListenerWithErrorLevel(callback, kAllMessageLevels, data);
+}
+
+void Isolate::AddMessageListenerWithErrorLevel(MessageCallback callback,
+                                               int message_levels,
+                                               Local<Value> data) {
+  if (callback == nullptr) return;
+  const uint64_t bits = data.IsEmpty() ? slag_undefined() : data.raw();
+  slag_root_retain(bits);
+  message_listeners_.push_back(MessageListener{callback, message_levels, bits});
+}
+
+bool Isolate::RemoveMessageListener(MessageCallback callback) {
+  return RemoveMessageListenerWithErrorLevel(callback, kAllMessageLevels);
+}
+
+bool Isolate::RemoveMessageListenerWithErrorLevel(MessageCallback callback,
+                                                  int message_levels) {
+  for (auto entry = message_listeners_.begin();
+       entry != message_listeners_.end(); ++entry) {
+    if (entry->callback == callback && entry->levels == message_levels) {
+      slag_root_release(entry->data_bits);
+      message_listeners_.erase(entry);
+      return true;
+    }
+  }
+  return false;
+}
+
+/* Report the context's pending error to the listeners that asked for the level,
+ * the way V8 reports an error nothing caught. `TryCatch` suppresses it, which is
+ * why the caller checks `g_try_catch_depth` first. */
+void Isolate::NotifyMessageListeners(Isolate* isolate, SlagContext* slag,
+                                     int level) {
+  if (isolate == nullptr || isolate->message_listeners_.empty()) return;
+  v8::Message* message = BuildPendingMessage(slag);
+  if (message == nullptr) return;
+  const uint64_t bits = reinterpret_cast<uint64_t>(message);
+  for (const auto& entry : isolate->message_listeners_) {
+    if ((entry.levels & level) == 0) continue;
+    entry.callback(v8::Local<v8::Message>::New(bits),
+                   v8::Local<v8::Value>::New(entry.data_bits));
+  }
+  delete message;
 }
 
 Local<Value> TryCatch::Exception() const {
@@ -3112,6 +3209,10 @@ Isolate* Isolate::New(const CreateParams& params) {
 void Isolate::Dispose() {
   for (Context* context : contexts_) delete context;
   contexts_.clear();
+  for (const auto& listener : message_listeners_) {
+    slag_root_release(listener.data_bits);
+  }
+  message_listeners_.clear();
   for (const auto& entry : private_names_) slag_root_release(entry.second);
   private_names_.clear();
   if (default_security_token_ != 0) {

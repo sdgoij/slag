@@ -1342,6 +1342,46 @@ the window, asks `AdmitsReceiver`, and records the refusal, and every trampoline
 starts with it. `FunctionTemplate::signature_type()` is the one unwrap of a
 `Signature`, so no trampoline handles that type at all.
 
+### 14.3 The inspector: what A5 needs, in the order it is needed
+
+The milestone table makes A5 `content_shell --dump-dom`, so the exit criterion is
+a Blink build and not the inspector. The inspector is the other half of A5's cost
+row ("snapshots, streaming compile, inspector") and it is the part the facade
+can start on before Blink exists, because everything it consumes is an engine
+fact a host could also use. This section is the order.
+
+1. **Message listeners.** `Isolate::AddMessageListener(WithErrorLevel)` and
+   `RemoveMessageListener(WithErrorLevel)` are in (2026-11-01), delivering an
+   uncaught error as a `v8::Message` and honouring `TryCatch` as V8 does. This is
+   `Runtime.exceptionThrown` and half of `Log.entryAdded`.
+2. **Console routing.** The engine has no `console`; `embed::Context` installs
+   one for the Rust embedding, and the C facade's contexts have none. A browser's
+   `console.log` is Blink's object calling its own message store, so what the
+   inspector needs from this side is only that a console call can carry a
+   `v8::Message` and a stack. That makes the stack the next item.
+3. **Stacks as data.** `TryCatch::StackTrace` answers a string today. The
+   inspector wants call frames (function name, script id, line, column), which
+the engine has (`api::stack_trace` walks the execution contexts) and the facade
+   discards. `V8StackTrace`/`V8StackTraceImpl` are the header shape for it.
+4. **Script identity.** `Debugger.scriptParsed` needs a stable id per compiled
+   script and its source, url and start line. `ScriptOrigin` already carries the
+   name; the engine's `ScriptRecord` carries the source. What is missing is an
+   id the host can hold, which is the same `SourceTextModule`-style handle the
+   facade already uses for scripts.
+5. **Pause and step.** The one genuinely large engine item: a `Debugger` domain
+   needs the VM to consult a hook at source-position granularity, and the
+   compiled tiers to either decline or emit the same check. This is the second
+   instance of the trap the access check hit: a hook on the interpreter alone is
+   bypassed by every compiled function. It should be designed together with the
+   JIT's step protocol rather than after it.
+6. **`v8-inspector.h`.** `V8Inspector`, `V8InspectorSession`, `V8InspectorClient`,
+   `StringView`, `StringBuffer`, `V8StackTrace` and the protocol dispatch on top
+   of 1 to 5. The protocol itself is the inspector's own and does not belong in
+   the facade.
+
+Slices 1 to 4 are host-useful without an inspector and should land on their own;
+slice 5 is a project, and slice 6 is glue once 1 to 5 exist.
+
 ## 15. Sources
 
 Verified on 2026-10-31:

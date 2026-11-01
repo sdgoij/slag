@@ -512,6 +512,19 @@ void GuardedBody(const v8::FunctionCallbackInfo<v8::Value>& info) {
       info.GetIsolate(), NumberArg(info, 0) * 2));
 }
 
+// The message listener an inspector's `Runtime.exceptionThrown` is built on: it
+// is called for an error nothing caught, and a `TryCatch` suppresses it.
+int message_listener_messages = 0;
+std::string message_listener_text;
+bool MessageListener(v8::Local<v8::Message> message, v8::Local<v8::Value>) {
+  ++message_listener_messages;
+  v8::Isolate* isolate = v8::Isolate::GetCurrent();
+  if (isolate == nullptr) return true;
+  v8::String::Utf8Value text(isolate, message->Get());
+  message_listener_text = *text == nullptr ? "" : *text;
+  return true;
+}
+
 // An accessor declared over an `AccessorSignature`: its getter runs for an
 // instance and is refused with `Illegal invocation` for anything else.
 int guard_reads = 0;
@@ -2967,6 +2980,52 @@ int main() {
       foreign->UseDefaultSecurityToken();
       expect(!current->GetSecurityToken().IsEmpty(),
              "the default token is minted on demand");
+    }
+
+    // Message listeners: the report an inspector's `Runtime` and `Log` domains
+    // are built on. An error nothing caught reaches the listener with its
+    // message, and a `TryCatch` suppresses the report.
+    {
+      message_listener_messages = 0;
+      message_listener_text.clear();
+      isolate->AddMessageListenerWithErrorLevel(&MessageListener,
+                                                v8::Isolate::kMessageError);
+      v8::Local<v8::Script> throwing;
+      expect(v8::Script::Compile(
+                 current,
+                 v8::String::NewFromUtf8Literal(
+                     isolate, "throw new Error('uncaught');"))
+                 .ToLocal(&throwing),
+             "the throwing script compiled");
+      v8::Local<v8::Value> ignored;
+      (void)throwing->Run(current).ToLocal(&ignored);
+      expect(message_listener_messages == 1,
+             "an uncaught error reached the message listener");
+      expect(message_listener_text.find("uncaught") != std::string::npos,
+             "the listener saw the error's message");
+      // Nothing consumed it, so the harness clears it before carrying on.
+      slag_clear_error(current->slag());
+      {
+        v8::TryCatch caught(isolate);
+        (void)throwing->Run(current).ToLocal(&ignored);
+        expect(caught.HasCaught(), "the TryCatch caught the second run");
+      }
+      expect(message_listener_messages == 1,
+             "a TryCatch suppressed the report");
+      expect(isolate->RemoveMessageListenerWithErrorLevel(
+                 &MessageListener, v8::Isolate::kMessageError),
+             "the message listener was removed");
+      v8::Local<v8::Script> again;
+      expect(v8::Script::Compile(
+                 current,
+                 v8::String::NewFromUtf8Literal(isolate,
+                                                "throw new Error('second');"))
+                 .ToLocal(&again),
+             "the second throwing script compiled");
+      (void)again->Run(current).ToLocal(&ignored);
+      slag_clear_error(current->slag());
+      expect(message_listener_messages == 1,
+             "a removed listener hears nothing");
     }
 
     // A MicrotasksScope drains the queue on its outermost exit.

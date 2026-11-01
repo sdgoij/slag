@@ -218,15 +218,24 @@ script's `throw` keeps its value across the boundary, so `catch`-style host code
 sees the object that was thrown rather than a message rebuilt from it. A host
 `ThrowError` records a message, so its text is what comes back.
 
-`TryCatch::Message` answers the position a **compile** error was found at: the
-script's name (the `ScriptOrigin` the host passed to `Script::Compile`), the
-1-based line, the 0-based start column, the line's text, and the message text.
-That is what makes the sample take its rich path for a syntax error. A runtime
-error has no position, so its message is empty and the host prints the exception
-alone: `JsError::span` indexes whichever source the failing code was parsed from
-and does not say which, so recording it against the running script would put a
-wrong position on the error. This is the narrowing the Rust bridge documents in
-its own `position` module.
+`TryCatch::Message` answers what the engine recorded for the pending error. A
+**compile** error carries a position: the script's name (the `ScriptOrigin` the
+host passed to `Script::Compile`), the 1-based line, the 0-based start column,
+the line's text, and the message text. That is what makes the sample take its
+rich path for a syntax error. A **runtime** error has no position (`JsError::span`
+indexes whichever source the failing code was parsed from and does not say
+which, so recording it against the running script would put a wrong position on
+the error), so its message is the thrown value's own `toString` with the `Uncaught `
+prefix V8 uses, an empty line and column 0: `Uncaught Error: boom`. This is the
+narrowing the Rust bridge documents in its own `position` module.
+
+`Isolate::AddMessageListener` and `AddMessageListenerWithErrorLevel` are how a
+host hears about an error **nothing caught**: the listener gets a `v8::Message`
+(built exactly as `TryCatch::Message` builds it) and the `data` value the host
+registered. A `TryCatch` on the stack suppresses the report, which is V8's rule
+and the reason the facade counts them. This is the feed an inspector's
+`Runtime.exceptionThrown` and `Log.entryAdded` are built from, and it is what
+`RemoveMessageListener`/`RemoveMessageListenerWithErrorLevel` stop.
 
 `TryCatch::StackTrace` returns the V8-style stack the engine captured for a
 thrown `Error`, when it has one, as a string. `String::Utf8Value` runs ToString,
@@ -731,9 +740,10 @@ not a claim that gin itself links.
 - `Global<T>` keeps a value alive, but a `Global` leaked past `Isolate::Dispose`
   is not detected and leaves a dangling retention in the thread-local registry.
 - `Message` and `StackTrace` answer what the engine recorded, which is narrower
-  than V8: a message exists only for a compile error (see above), and the stack
-  is a string rather than an array of call sites. The sample's rich path is
-  therefore taken for a syntax error and not for a runtime error.
+  than V8: a runtime error's message is the thrown value's text with an empty
+  position rather than the throw site, and the stack is a string rather than an
+  array of call sites. The sample's rich path is therefore taken for a syntax
+  error and not for a runtime error.
 - `String::Utf8Value` runs ToString through the engine, so an object's own
   `toString` runs; it falls back to a primitive rendering when a callback already
   holds the context (a property name is a string in that case anyway).

@@ -122,6 +122,10 @@ class V8 {
  * chain.
  */
 inline thread_local uint64_t g_current_context = 0;
+/* How many `TryCatch`es are alive on this thread. V8 reports an error to the
+ * message listeners only when nothing is catching it, and the inspector's
+ * `Runtime.exceptionThrown` rides on that. */
+inline thread_local int g_try_catch_depth = 0;
 inline thread_local Isolate* g_current_isolate = nullptr;
 
 using Address = uint64_t;
@@ -1149,7 +1153,9 @@ class ScriptCompiler {
  * the same pending error without consuming it. */
 class TryCatch {
  public:
-  explicit TryCatch(Isolate* isolate) : isolate_(isolate) {}
+  explicit TryCatch(Isolate* isolate) : isolate_(isolate) {
+    ++g_try_catch_depth;
+  }
   ~TryCatch();
 
   TryCatch(const TryCatch&) = delete;
@@ -1821,6 +1827,29 @@ class Isolate {
   /* Throw `exception` (`Isolate::ThrowException`): the pending exception
    * becomes exactly that language value. */
   void ThrowException(Local<Value> exception);
+
+  /* How `Isolate::AddMessageListenerWithErrorLevel` filters. */
+  enum MessageErrorLevel {
+    kMessageLog = (1 << 0),
+    kMessageDebug = (1 << 1),
+    kMessageInfo = (1 << 2),
+    kMessageWarning = (1 << 3),
+    kMessageError = (1 << 4),
+    kAllMessageLevels = 0x1f,
+    kNoMessageLevels = 0
+  };
+  /* `(message, data)`: answer false to let the next listener see it. This is
+   * V8's `MessageCallback`, and it is how a host (the inspector included) hears
+   * about an error nothing caught. */
+  using MessageCallback = bool (*)(Local<Message> message, Local<Value> data);
+  void AddMessageListener(MessageCallback callback,
+                          Local<Value> data = Local<Value>());
+  void AddMessageListenerWithErrorLevel(MessageCallback callback,
+                                        int message_levels,
+                                        Local<Value> data = Local<Value>());
+  bool RemoveMessageListener(MessageCallback callback);
+  bool RemoveMessageListenerWithErrorLevel(MessageCallback callback,
+                                           int message_levels);
   Local<Context> GetCurrentContext();
   /* The entered context (`Isolate::GetEnteredContext` and
    * `Isolate::GetEnteredOrMicrotaskContext`). The facade enters a context only
@@ -1909,6 +1938,20 @@ class Isolate {
   /* The default security token, minted on the first ask and shared by every
    * context without one of its own. Retained until `Dispose`. */
   uint64_t default_security_token_ = 0;
+  struct MessageListener {
+    MessageCallback callback = nullptr;
+    int levels = kAllMessageLevels;
+    /* The `data` value, retained until `Dispose` (or the listener is removed). */
+    uint64_t data_bits = 0;
+  };
+  std::vector<MessageListener> message_listeners_;
+
+  /* Deliver the pending error to the listeners that asked for `level`. A
+   * `TryCatch` suppresses the report, so the caller checks the depth first. */
+  static void NotifyMessageListeners(Isolate* isolate, SlagContext* slag,
+                                     int level);
+
+  friend class Script;
   /* `CreateParams::array_buffer_allocator`: the host's allocator for the backing
    * stores this isolate makes. Null means the engine allocates its own. */
   ArrayBuffer::Allocator* array_buffer_allocator_ = nullptr;
