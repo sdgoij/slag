@@ -2889,6 +2889,82 @@ int main() {
       }
     }
 
+    // Security tokens: a value of another realm is reachable when the two
+    // contexts answer the same token, which is V8's default access check
+    // (`Isolate::MayAccess`) and what a template installs by asking for a check
+    // with no callback.
+    {
+      const auto run_in = [&](v8::Local<v8::Context> target, const char* source) {
+        return RunScript(isolate, target, source, &failures);
+      };
+      v8::Local<v8::Context> foreign = v8::Context::New(isolate);
+      v8::Local<v8::Object> theirs;
+      {
+        v8::Context::Scope foreign_scope(foreign);
+        theirs = v8::Object::New(isolate);
+      }
+      expect(isolate->MayAccess(current, theirs),
+             "the default token admits another context's object");
+      expect(isolate->MayAccess(current, v8::Object::New(isolate)),
+             "a value of the accessing realm is always reachable");
+
+      // A context with a token of its own is a different origin.
+      v8::Local<v8::Value> token = v8::Object::New(isolate).As<v8::Value>();
+      foreign->SetSecurityToken(token);
+      expect(!isolate->MayAccess(current, theirs),
+             "a context with its own token is not reachable");
+      expect(foreign->GetSecurityToken().raw() == token.raw(),
+             "GetSecurityToken answers the token that was set");
+
+      // The same token on both sides is the same origin again, which is how a
+      // host makes two contexts one principal.
+      current->SetSecurityToken(token);
+      expect(isolate->MayAccess(current, theirs),
+             "a shared token admits the other context's object");
+
+      // A template that installs a check with no callback gets the default
+      // check: the token comparison, not the callback.
+      v8::Local<v8::ObjectTemplate> checked = v8::ObjectTemplate::New(isolate);
+      checked->SetAccessCheckCallback(isolate, nullptr);
+      v8::Local<v8::Object> guarded =
+          checked->NewInstance(current).ToLocalChecked();
+      SetOrReport(isolate, current, guarded, "value",
+                  v8::Integer::New(isolate, 5), &failures);
+      {
+        v8::Context::Scope foreign_scope(foreign);
+        SetOrReport(isolate, foreign, foreign->Global(), "guarded", guarded,
+                    &failures);
+        run_in(foreign, "globalThis.sharedRead = guarded.value;");
+        expect(IntGlobal(isolate, foreign, "sharedRead", &failures) == 5,
+               "a shared token read the checked object");
+      }
+
+      // A different token on the accessing side refuses the same read, and the
+      // instance is untouched because the check ran first.
+      foreign->SetSecurityToken(v8::Object::New(isolate));
+      {
+        v8::Context::Scope foreign_scope(foreign);
+        run_in(foreign,
+               "globalThis.denied = 0;"
+               " globalThis.deniedValue = -1;"
+               " try {"
+               "  globalThis.deniedValue = guarded.value;"
+               "} catch (e) {"
+               "  globalThis.denied = 1;"
+               "  globalThis.deniedMessage = e.message;"
+               "}");
+        expect(IntGlobal(isolate, foreign, "denied", &failures) == 1,
+               "a different token refused the checked object");
+        expect(IntGlobal(isolate, foreign, "deniedValue", &failures) == -1,
+               "the refused read answered nothing");
+      }
+
+      current->UseDefaultSecurityToken();
+      foreign->UseDefaultSecurityToken();
+      expect(!current->GetSecurityToken().IsEmpty(),
+             "the default token is minted on demand");
+    }
+
     // A MicrotasksScope drains the queue on its outermost exit.
     isolate->SetMicrotasksPolicy(v8::MicrotasksPolicy::kExplicit);
     run("globalThis.scopeSettled = 0;"

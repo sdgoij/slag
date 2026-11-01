@@ -1302,6 +1302,28 @@ still a hard stop, and the dialog suppression (a static initializer now, so it i
 armed before `main`, and `main` keeps the unbuffered stdout) is what keeps that
 from blocking a caller.
 
+*The security token means something (2026-11-01).* This was the last item of the
+A4 section that was stored and never consulted. `Isolate::MayAccess(accessing,
+accessed)` is the comparison itself: a value of the accessing realm is
+reachable, a value of another realm is reachable exactly when the two contexts
+answer the same token, and a realm no context of the isolate claims (a shadow
+realm a script made) is the caller's. Contexts that never set a token answer the
+isolate's shared default, so "every context in the test suite shares one token"
+still admits everything and nothing regressed.
+
+Two decisions. The check lives in the facade, not the engine: the engine records
+realms and the facade is what knows which context is which origin, so the tokens
+stay on the side that owns them. And an object is only checked when it asks to
+be, which is V8's rule: `SetAccessCheckCallback(isolate, nullptr)` now means
+"the default check" instead of "allowed", so a template can ask for the token
+comparison without a callback. Ordinary property access is not gated by the
+token, and the README says so rather than implying a security model the engine
+does not have.
+
+`Context::GetSecurityToken` used to mint the default on the *entered* isolate,
+which answered empty outside every scope; it now uses the context's own isolate,
+which `MayAccess` needs because a host may compare tokens between scripts.
+
 ## 15. Sources
 
 Verified on 2026-10-31:

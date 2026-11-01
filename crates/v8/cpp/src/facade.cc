@@ -183,16 +183,26 @@ class CallbackToken {
  * (`ObjectTemplate::SetAccessCheckCallback`). `state` is the template, which is
  * never freed, so the callback and its data are read at access time; `holder` is
  * the instance and `data` the value the template was given. The realm
- * comparison has already happened by the time this runs, so a template with a
- * null callback answers "allowed" (it only reaches here with none installed
- * when the check is configured and then cleared, which the facade does not do). */
+ * comparison has already happened by the time this runs. A template that
+ * installed a check without a callback gets V8's default check, which is the
+ * security-token comparison (`Isolate::MayAccess`); with neither there is
+ * nothing to ask, so the access is admitted. */
 int32_t AccessCheckTrampoline(void* state, uint64_t data, uint64_t holder) {
   auto* tmpl = static_cast<v8::ObjectTemplate*>(state);
-  if (tmpl == nullptr || tmpl->access_check() == nullptr) return 1;
+  if (tmpl == nullptr) return 1;
   CallbackToken token;
   v8::Local<v8::Context> accessing;
-  if (v8::g_current_isolate != nullptr) {
-    accessing = v8::g_current_isolate->GetCurrentContext();
+  v8::Isolate* isolate = v8::g_current_isolate;
+  if (isolate != nullptr) {
+    accessing = isolate->GetCurrentContext();
+  }
+  if (tmpl->access_check() == nullptr) {
+    // No callback: the default check. With no entered context there is nothing
+    // to compare against, which V8 answers by not checking either.
+    if (isolate == nullptr || accessing.IsEmpty()) return 1;
+    return isolate->MayAccess(accessing, v8::Local<v8::Object>::New(holder))
+               ? 1
+               : 0;
   }
   const bool allowed =
       tmpl->access_check()(accessing, v8::Local<v8::Object>::New(holder),
@@ -1625,14 +1635,44 @@ void Context::ClearAllSlots() {
 
 Local<Value> Context::GetSecurityToken() {
   if (security_token_ != 0) return Local<Value>::New(security_token_);
-  Isolate* isolate = g_current_isolate;
-  if (isolate == nullptr) return Local<Value>();
-  uint64_t& token = isolate->default_security_token_;
+  // The context's own isolate, not the entered one: a token is asked for by a
+  // host that may be between scopes, and `Isolate::MayAccess` compares tokens
+  // outside any scope too.
+  if (isolate_ == nullptr) return Local<Value>();
+  uint64_t& token = isolate_->default_security_token_;
   if (token == 0) {
     token = slag_security_token_new();
     slag_root_retain(token);
   }
   return Local<Value>::New(token);
+}
+
+uint64_t Context::effective_security_token() const {
+  if (security_token_ != 0) return security_token_;
+  return isolate_ == nullptr ? 0 : isolate_->default_security_token_;
+}
+
+bool Isolate::MayAccess(Local<Context> accessing_context,
+                        Local<Object> accessed_object) {
+  if (accessing_context.IsEmpty() || accessed_object.IsEmpty()) return false;
+  auto* accessing = reinterpret_cast<Context*>(
+      static_cast<uintptr_t>(accessing_context.raw()));
+  const uint32_t realm = slag_value_realm(accessed_object.raw());
+  // A value of the accessing realm, or one no realm names (a host made it
+  // outside every context), is the caller's own.
+  if (realm == 0 || realm == slag_context_realm(accessing->slag())) {
+    return true;
+  }
+  for (Context* owner : contexts_) {
+    if (slag_context_realm(owner->slag()) == realm) {
+      return owner->effective_security_token() ==
+             accessing->effective_security_token();
+    }
+  }
+  // A realm no context of this isolate claims: a script-made realm (a shadow
+  // realm) has no security token of its own to compare, so it is treated as the
+  // caller's.
+  return true;
 }
 
 void Context::SetSecurityToken(Local<Value> token) {
@@ -2869,7 +2909,7 @@ MaybeLocal<Object> ObjectTemplate::NewInstance(Local<Context> context) {
   uint64_t object = 0;
   int status = 0;
   const bool has_handler = has_named_handler_ || has_indexed_handler_;
-  if (has_handler || access_check_ != nullptr) {
+  if (has_handler || has_access_check_) {
     // The handler struct carries each configuration's callbacks plus the
     // address of the configuration the trampolines read them from. The
     // configurations live as long as this template, like the template itself.
@@ -2890,11 +2930,12 @@ MaybeLocal<Object> ObjectTemplate::NewInstance(Local<Context> context) {
       handler.indexed_descriptor = IndexedDescriptorTrampoline;
       handler.indexed_definer = IndexedDefinerTrampoline;
     }
-    if (access_check_ != nullptr) {
+    if (has_access_check_) {
       // An instance of a checked template is a host object, not an ordinary
       // one: the check has to run before every property internal method, and a
       // host object is the shape the engine never serves from a compiled fast
-      // path.
+      // path. A null callback still counts, because the default check (the
+      // security token) is what it asks for.
       handler.access_check = &AccessCheckTrampoline;
       handler.access_check_state = this;
     }
@@ -2959,6 +3000,7 @@ void ObjectTemplate::SetAccessCheckCallback(Isolate*,
                                             AccessCheckCallback callback,
                                             Local<Value> data) {
   access_check_ = callback;
+  has_access_check_ = true;
   const uint64_t bits = data.IsEmpty() ? slag_undefined() : data.raw();
   if (bits != access_check_data_bits_) {
     // The template outlives the scope the data was made in, and it is never

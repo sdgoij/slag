@@ -369,11 +369,20 @@ the Rust bridge keeps only the pointer form.
 `Context::GetSecurityToken` answers the context's token, or the isolate's
 default (one null-prototype object, minted on the first ask and shared by every
 context without one) when none was set. `SetSecurityToken` replaces it and
-`UseDefaultSecurityToken` goes back. The token is stored and not consulted: the
-engine has no cross-context access check, which is the gap the Rust bridge
-documents. `Object::GetCreationContext`/`GetCreationContextChecked` answer the
-entered context, because the engine does not record a holder's realm on each
-object and the facade has one realm per entered context.
+`UseDefaultSecurityToken` goes back. Two contexts that answer the same token are
+one principal, and that is what `Isolate::MayAccess(accessing_context,
+accessed_object)` decides: a value of the accessing realm is always reachable, a
+value of another realm only when the two contexts' tokens match. A realm no
+context of the isolate claims (a shadow realm a script made) is treated as the
+caller's, and an empty handle on either side answers `false`.
+
+The token does not gate ordinary property access, which matches V8: an object is
+only checked when it asks to be. A template that calls
+`SetAccessCheckCallback(isolate, nullptr)` asks for exactly this check, so its
+instances answer the token comparison instead of a host callback.
+`Object::GetCreationContext`/`GetCreationContextChecked` still answer the
+entered context rather than the object's own realm; the engine records the realm
+now, so that is a small remaining gap rather than a missing fact.
 
 ### Weak handles, GC hooks, and heap statistics
 
@@ -589,9 +598,9 @@ engine side is `slag_value_realm` / `slag_value_same_realm` and
 `slag_context_realm`, and every object records the realm it was created in (see
 `.notes/chromium-facade.md` section 14.2).
 
-What is still missing from the A4 section: the security token (stored, and now
-comparable, but nothing consults it) and a signature's check moving behind the
-handler rather than staying in the trampolines.
+What is still missing from the A4 section: `Object::GetCreationContext` answers
+the entered context rather than the object's recorded realm, and a signature's
+check is the trampoline's rather than living behind the handler.
 
 ## The gin target
 
@@ -742,14 +751,16 @@ not a claim that gin itself links.
 - A lazy data property's getter runs on every read (there is no one-shot slot),
   and a private name is a symbol, so `Object.getOwnPropertySymbols` can see a
   property V8's private names hide completely.
-- The security token is stored and never consulted, so two contexts that set
-different tokens can still reach each other's ordinary objects. The token is
-now *comparable* (`slag_value_same_realm`, `slag_context_realm`), which is what
-using it needs, but nothing compares it: a cross-origin wrapper is protected by
-its own access check (`SetAccessCheckCallbackAndHandler`, above), and an
-ordinary object has no check to run. Embedder value slots and aligned-pointer
-slots are separate stores, so `GetEmbedderData` on a pointer slot answers
-`undefined` rather than an `External`.
+- The security token gates an access check, not ordinary property access: two
+contexts that set different tokens can still reach each other's ordinary
+objects, which is V8's behaviour too (only an object that asks to be checked is
+checked). The check itself is `Isolate::MayAccess`, and a template that
+installs an access check with no callback gets it; a cross-origin wrapper is
+protected by its own check (`SetAccessCheckCallbackAndHandler`, above), and an
+ordinary object has no check to run. A realm no context of the isolate claims
+(a shadow realm) is treated as the caller's. Embedder value slots and
+aligned-pointer slots are separate stores, so `GetEmbedderData` on a pointer
+slot answers `undefined` rather than an `External`.
 - `WeakCallbackInfo::GetValue` is always empty and every `WeakCallbackType`
   behaves as `kParameter`: the engine reports the death, not which kind of
   reference held the value. GC callbacks always receive `kNoGCCallbackFlags`,
@@ -921,7 +932,12 @@ template, reads it from an instance (allowed, the getter ran once), calls it
 through a descriptor with a foreign `this` (refused, the getter did not run, and
 the message is `Illegal invocation`), and checks that an
 `Object::SetAccessorProperty` getter whose template carries a `Signature` is
-refused on a plain receiver. The access
+refused on a plain receiver. The security-token block checks that
+`Isolate::MayAccess` admits another context's object under the shared default
+token, refuses it once that context sets a token of its own, admits it again
+when both contexts set the same token, and checks that an instance of a template
+that installed a check with no callback is read under a shared token and refused
+under a different one (with the read answering nothing). The access
 check block installs a per-object check on a template, reads its instance from
 its own realm (allowed, and the callback never runs), reads it from a second
 context (refused with a `TypeError`, and the callback ran exactly once), and

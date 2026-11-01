@@ -1614,6 +1614,9 @@ class ObjectTemplate {
   bool has_named_handler_ = false;
   bool has_indexed_handler_ = false;
   AccessCheckCallback access_check_ = nullptr;
+  /* Whether a check was installed at all: a null callback still asks for one,
+   * and the default check is the security-token comparison. */
+  bool has_access_check_ = false;
   /* The check's `data`, retained for the template's lifetime (templates are not
    * freed), like an accessor's name and data. */
   uint64_t access_check_data_bits_ = 0;
@@ -1690,6 +1693,11 @@ class Context {
   std::vector<uint64_t> value_slots_;
   /* Retained while set; zero means "the isolate's default". */
   uint64_t security_token_ = 0;
+
+  /* The token this context is compared by: its own, or the isolate's shared
+   * default when it set none. Two contexts that never set one answer the same
+   * value whether or not the default has been minted yet. */
+  uint64_t effective_security_token() const;
 
   friend class Isolate;
 };
@@ -1814,6 +1822,12 @@ class Isolate {
    * `GetCurrentContext`; there is no microtask-context distinction to make. */
   Local<Context> GetEnteredContext();
   Local<Context> GetEnteredOrMicrotaskContext();
+
+  /* Whether `accessing_context` may reach `accessed_object`: an object of the
+   * accessing realm always, and anything else only when the two contexts answer
+   * the same security token (`v8::Isolate::MayAccess`). A realm no context of
+   * this isolate claims is treated as the caller's own. */
+  bool MayAccess(Local<Context> accessing_context, Local<Object> accessed_object);
 
   /* Drain the job queues now (`Isolate::PerformMicrotaskCheckpoint`). */
   void PerformMicrotaskCheckpoint();
