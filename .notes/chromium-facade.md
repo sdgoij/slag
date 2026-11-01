@@ -1382,6 +1382,36 @@ the engine has (`api::stack_trace` walks the execution contexts) and the facade
 Slices 1 to 4 are host-useful without an inspector and should land on their own;
 slice 5 is a project, and slice 6 is glue once 1 to 5 exist.
 
+**2026-11-01, slices 1 to 5 in, and what slice 6 still needs.** The pause protocol
+(§14.4) is reachable from C++ (`SetDebugAttached`, `SetBreakpoints`,
+`RequestPause`, `Paused`, `Resume`, `EvaluateOnPausedFrame`, with `debugger.exe`
+running the path), so the inspector's remaining work is the protocol layer, and
+this is the concrete plan rather than a restatement:
+
+- **A script registry is the inspector's first object.** CDP speaks in script ids
+  and URLs, the engine speaks in source offsets. `crates/inspector` (a new,
+  host-side crate like `slag`, with `serde_json` already in the workspace) holds
+  `id -> (url, source, strict, jsx)` and mints the ids on `compile`.
+- **Line to offset needs one engine query that does not exist yet.** A CDP
+  breakpoint is `(url, lineNumber, columnNumber)`, and the engine matches a point
+  by its own `span.start` exactly, so the session has to resolve a line to the
+  first debug point *at or after* it. That needs the compiled body's point spans:
+  `Agent::debug_points(source, strict, fast_script, jsx) -> Option<Vec<(u32, u32)>>`,
+  read from the cached `script_bodies` entry. Without it a line breakpoint can
+  only be set at a column the host guessed, which is not what a debugger does.
+- **`Debugger.paused` needs the frame stack, which is slice 5's remaining half.**
+  The engine reports one position, not a `PauseInfo.frames` list (§14.4), so a
+  session can emit one call frame (the outermost activation, which is the only
+  one that stops today) and no scope chain. `Runtime.getProperties` and the
+  remote-object table are a bigger model that should not be started before the
+  frame stack exists, because every scope reference in it is a frame.
+- **The verbs that are cheap once the above exist:** `Debugger.enable/disable`
+  (attach/detach), `setBreakpointByUrl`/`removeBreakpoint`, `resume`, `paused`/
+  `resumed` events, `evaluateOnCallFrame` (a one-line map onto
+  `EvaluateOnPausedFrame`), `Runtime.evaluate`, `Debugger.getScriptSource`.
+  Stepping (`stepOver`/`stepInto`/`stepOut`) is not cheap: it is the same
+  continuation question as nested stops, one statement at a time.
+
 ### 14.4 Pause and step: the protocol the compiled tiers have to agree to
 
 The `Debugger` domain needs four verbs (breakpoint at a position, step in, over
