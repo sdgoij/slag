@@ -9099,7 +9099,7 @@ impl Vm {
                 // is the whole of that declaration, and only a session's
                 // parkable activation ever sets one (`.pause_ok` is false in
                 // every other run, including the nested lane's).
-                let resumable = self.pause_ok && agent.pause_resumable_call(&callee);
+                let resumable = self.pause_ok && agent.pause_resumable_callee(&callee);
                 if resumable {
                     agent.set_pause_ticket(true);
                 }
@@ -10549,8 +10549,30 @@ impl Vm {
                 Step::Construct { span } => {
                     self.set_site(agent, *span);
                     let callee = self.pop();
-                    let result = self.step_construct(agent, callee)?;
-                    self.stack.push(result);
+                    // A `new` whose body will run on a `Vm` of its own can be
+                    // parked and resumed, so this step declares it parkable, the
+                    // same way `complete_call` declares a call.
+                    let resumable = self.pause_ok && agent.pause_resumable_callee(&callee);
+                    if resumable {
+                        agent.set_pause_ticket(true);
+                    }
+                    let result = self.step_construct(agent, callee);
+                    if resumable {
+                        agent.clear_pause_ticket();
+                    }
+                    match result {
+                        Ok(result) => self.stack.push(result),
+                        Err(error) => {
+                            // A stop below this step: the constructed object lands
+                            // where the step's result would, so the resume pushes
+                            // it here (`Vm::land_call_result`).
+                            if agent.pause_in_flight() {
+                                let site = self.stack.len();
+                                self.set_pause_site(site, 0);
+                            }
+                            return Err(error);
+                        }
+                    }
                 }
                 Step::TaggedTemplate(template) => {
                     let tag = self.pop();
@@ -15251,7 +15273,17 @@ impl Vm {
             return ctor(agent, &callee, args, &callee);
         }
         let _stress = StressSuppress::new();
-        crate::function::construct(agent, &callee, args, &callee)
+        // A `new` of an ordinary function runs its body on a `Vm` of its own, so
+        // the construct can be parked and resumed (see `LevelKind::Construct`).
+        let resumable = self.pause_ok && agent.pause_resumable_callee(&callee);
+        if resumable {
+            agent.set_pause_ticket(true);
+        }
+        let result = crate::function::construct(agent, &callee, args, &callee);
+        if resumable {
+            agent.clear_pause_ticket();
+        }
+        result
     }
 
     /// The fast-call path (`CallFast`): the 0-2 arguments are already on the
@@ -27447,9 +27479,17 @@ fn steps_are_leaf(steps: &[Step]) -> bool {
     steps.iter().all(|step| {
         !matches!(
             step,
-            // Re-entry: a nested call/construct/tagged template runs on its
-            // own Vm. A leaf must contain none, so it cannot recurse.
-            Step::Call { .. }
+            // A debug point is consulted by the interpreter driver only, and a
+            // leaf body runs its steps in place on the caller's `Vm` with the
+            // caller's `pause_ok`: a point honoured there would try to park an
+            // activation that has no `Vm` of its own. A body compiled under a
+            // session is therefore never a leaf, which is the same trade the
+            // session makes when it refuses the JIT and the certified nested
+            // lane (`.notes/chromium-facade.md` section 14.4).
+            Step::DebugCheck { .. }
+                // Re-entry: a nested call/construct/tagged template runs on its
+                // own Vm. A leaf must contain none, so it cannot recurse.
+                | Step::Call { .. }
                 | Step::CallFast { .. }
                 | Step::CallIntrinsic { .. }
                 | Step::CallFastGlobal { .. }

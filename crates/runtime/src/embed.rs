@@ -5393,6 +5393,108 @@ mod tests {
     }
 
     #[test]
+    fn a_breakpoint_inside_a_constructor_stops_there() {
+        let mut context = Context::new().unwrap();
+        context.agent_mut().set_debug_attached(true).unwrap();
+        let source = "function P(x) { globalThis.seen = x; this.x = x; }\n\
+                      globalThis.p = new P(3);";
+        let at = source.find("globalThis.seen = x;").unwrap() as u32;
+        context.agent_mut().set_breakpoints(&[at]);
+        let error = context.eval(source).unwrap_err();
+        assert_eq!(error.message, "execution paused at a breakpoint");
+        assert_eq!(context.agent().paused_depth(), 2);
+        assert_eq!(
+            context.agent().paused_frames()[0].function_name.as_deref(),
+            Some("P"),
+            "the halt is in the constructor's activation"
+        );
+        assert_eq!(
+            context.evaluate_paused("x").unwrap().as_number(),
+            Some(3.0),
+            "the constructor's parameter is in view"
+        );
+        crate::eval::resume_paused(context.agent_mut()).unwrap();
+        assert_eq!(
+            context.eval("globalThis.p.x").unwrap().as_number(),
+            Some(3.0),
+            "the instance the resume produced is the one `new` returns"
+        );
+    }
+
+    #[test]
+    fn a_breakpoint_inside_a_derived_constructor_stops_there() {
+        let mut context = Context::new().unwrap();
+        context.agent_mut().set_debug_attached(true).unwrap();
+        let source = "class A { constructor() { this.a = 1; } }\n\
+                      class B extends A { constructor() { super(); globalThis.seen = 1; } }\n\
+                      globalThis.inst = new B();";
+        let at = source.find("globalThis.seen = 1;").unwrap() as u32;
+        context.agent_mut().set_breakpoints(&[at]);
+        let error = context.eval(source).unwrap_err();
+        assert_eq!(error.message, "execution paused at a breakpoint");
+        assert_eq!(
+            context.agent().paused_frames()[0].function_name.as_deref(),
+            Some("B")
+        );
+        crate::eval::resume_paused(context.agent_mut()).unwrap();
+        assert_eq!(
+            context.eval("globalThis.inst.a").unwrap().as_number(),
+            Some(1.0),
+            "a derived constructor's `this` is the one `super()` bound"
+        );
+        assert_eq!(
+            context
+                .eval("globalThis.inst instanceof B")
+                .unwrap()
+                .as_boolean(),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn a_constructor_that_returns_an_object_after_a_resume_overrides_this() {
+        let mut context = Context::new().unwrap();
+        context.agent_mut().set_debug_attached(true).unwrap();
+        let source = "function Q() { globalThis.hit = 1; return { custom: true }; }\n\
+                      globalThis.q = new Q();";
+        let at = source.find("globalThis.hit = 1;").unwrap() as u32;
+        context.agent_mut().set_breakpoints(&[at]);
+        assert!(context.eval(source).is_err());
+        crate::eval::resume_paused(context.agent_mut()).unwrap();
+        assert_eq!(
+            context.eval("globalThis.q.custom").unwrap().as_boolean(),
+            Some(true),
+            "the object return wins over the `this` the engine bound"
+        );
+    }
+
+    #[test]
+    fn a_throw_inside_a_constructor_after_a_resume_reaches_the_callers_handler() {
+        let mut context = Context::new().unwrap();
+        context.agent_mut().set_debug_attached(true).unwrap();
+        let source = "globalThis.caught = null;\n\
+                      function R() { globalThis.hit = 1; throw new Error('ctor'); }\n\
+                      try { new R(); } catch (e) { globalThis.caught = e.message; }\n\
+                      globalThis.done = true;";
+        let at = source.find("globalThis.hit = 1;").unwrap() as u32;
+        context.agent_mut().set_breakpoints(&[at]);
+        assert!(context.eval(source).is_err());
+        crate::eval::resume_paused(context.agent_mut()).unwrap();
+        assert_eq!(
+            context
+                .eval("globalThis.caught")
+                .unwrap()
+                .as_string()
+                .map(|s| s.to_string()),
+            Some("ctor".to_string())
+        );
+        assert_eq!(
+            context.eval("globalThis.done").unwrap().as_boolean(),
+            Some(true)
+        );
+    }
+
+    #[test]
     fn a_throw_that_reaches_the_top_after_a_resume_is_that_error() {
         let mut context = Context::new().unwrap();
         context.agent_mut().set_debug_attached(true).unwrap();

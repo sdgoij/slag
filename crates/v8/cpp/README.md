@@ -98,12 +98,18 @@ async body, a direct eval, a module body, a bound or proxied callee, or a class
 field initializer is not honoured yet: those runs are started by machinery that
 keeps its own state outside a `Vm`, so a stop would have nowhere to resume to.
 The point waits, as it did for every nested activation before the continuation
-stack landed.
+stack landed. A body compiled under a session is also never a leaf, so a point
+inside a callee always runs on a `Vm` of its own rather than in place.
 - **`EvaluateOnPausedFrame` sees the stopped scope, frame slots included.** An
 expression and an assignment both reach a certified body's locals: the engine
 compiles the evaluation against the halted body's scope, runs it on the frame,
 and writes the frame back, so `counter = 100` at a stop changes what the resumed
 code reads. It evaluates the halted activation, which is the innermost one.
+- **A breakpoint inside a constructor stops there too.** A `new` parks the same
+way a call does; the difference is the result rule the resume reapplies (spec
+10.2.1 steps 15-21): an object return wins, a base constructor falls back to the
+`this` it bound, and a derived one to the `this` its `super()` bound, which is
+why the constructor's FunctionEnv travels with the parked level.
 - **Stepping is `StepOver`/`StepInto`/`StepOut` then `Resume`.** The step is
 relative to the activation that was halted: over stops at its next point (or an
 outer one, so a callee's points are passed through), into stops at any point

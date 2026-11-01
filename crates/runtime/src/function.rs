@@ -3193,6 +3193,7 @@ fn run_compiled_body(
             body: ir.clone(),
             context,
             site,
+            kind: crate::agent::LevelKind::Call,
         });
         return result;
     }
@@ -3342,6 +3343,69 @@ pub(crate) fn finish_call_level(
     let result = crate::eval::dispose_env_resources(agent, body_env, Ok(completion));
     let completion = result?;
     body_completion_to_value(completion)
+}
+
+/// Finish a parked activation: a call maps its completion to the call's result,
+/// a `new` maps it to the constructed object (`.notes/chromium-facade.md`
+/// section 14.4).
+pub(crate) fn finish_level(
+    agent: &mut Agent,
+    kind: crate::agent::LevelKind,
+    body_env: &crate::env::EnvRef,
+    completion: Completion,
+) -> Result<Value, JsError> {
+    match kind {
+        crate::agent::LevelKind::Construct { this, this_env } => {
+            finish_construct_level(agent, body_env, completion, this, this_env)
+        }
+        crate::agent::LevelKind::Script | crate::agent::LevelKind::Call => {
+            finish_call_level(agent, body_env, completion)
+        }
+    }
+}
+
+/// Finish a constructor body that ran to completion: dispose the body env's
+/// `using` resources, then apply spec 10.2.1 [[Construct]] steps 15-21 — an
+/// object return wins, a base constructor falls back to the `this` the engine
+/// bound, and a derived one to the `this` its `super()` bound.
+pub(crate) fn finish_construct_level(
+    agent: &mut Agent,
+    body_env: &crate::env::EnvRef,
+    completion: Completion,
+    this: Value,
+    this_env: Option<crate::env::EnvRef>,
+) -> Result<Value, JsError> {
+    let result = crate::eval::dispose_env_resources(agent, body_env, Ok(completion));
+    let completion = result?;
+    let derived = this_env.is_some();
+    match completion {
+        Completion::Return(value) => match value.kind() {
+            ValueKind::Object(_) | ValueKind::Function(_) => Ok(value),
+            _ if derived => {
+                if matches!(value.kind(), ValueKind::Undefined) {
+                    this_env
+                        .as_ref()
+                        .expect("a derived constructor carries its FunctionEnv")
+                        .get_this_binding()
+                } else {
+                    Err(JsError::new(
+                        ErrorKind::TypeError,
+                        "Derived constructors may only return object or undefined".into(),
+                    ))
+                }
+            }
+            _ => Ok(this),
+        },
+        Completion::Normal(_) | Completion::Empty => match &this_env {
+            Some(env) => env.get_this_binding(),
+            None => Ok(this),
+        },
+        Completion::Throw(value) => Err(crate::flow::uncaught_error(value)),
+        Completion::Break { .. } | Completion::Continue { .. } => Err(JsError::new(
+            ErrorKind::SyntaxError,
+            "Illegal break/continue statement".into(),
+        )),
+    }
 }
 
 /// CreateUnmappedArgumentsObject (spec 10.4.4.9): the strict-mode arguments
@@ -3752,16 +3816,17 @@ fn ordinary_construct(
         // (script_or_module and private_environment are never consulted; the
         // source is, for the closures the body creates and for a host's view
         // of the call).
-        // The context's `function` is read only by a sloppy body's mapped
-        // `arguments` creation (Step::CreateArguments, for `callee`); every
-        // other certified-path reader is excluded by certification, so the
-        // clone is skipped unless the body uses `arguments` in sloppy mode.
-        let context_function = (ir
+        // The context's `function` is read by a sloppy body's mapped
+        // `arguments` creation (Step::CreateArguments, for `callee`), by a
+        // stack trace, and by a debug session's frame list, so the clone is
+        // skipped unless one of those can see it.
+        let context_function = ((ir
             .scope
             .as_ref()
             .is_some_and(|scope| scope.arguments_slot.is_some())
             && !strict)
-            .then_some(function_value);
+            || agent.debug_points())
+        .then_some(function_value);
         agent.roots.execution_context_stack.push(ExecutionContext {
             function: context_function,
             realm,
@@ -3776,6 +3841,9 @@ fn ordinary_construct(
         let result = (|| -> Result<Value, JsError> {
             let body_env = agent.running_context()?.lexical_environment;
             let mut vm = agent.take_vm(body_env, strict);
+            // Only a `new` the declaring step could resume declares the body
+            // parkable (`Agent::pause_resumable_callee`); nothing else can be.
+            vm.pause_ok = agent.take_pause_ticket().unwrap_or(false);
             // Closures created inside the body record the function's
             // captured environment — the running context's lexical env here
             // (set above) is that environment, so a depth-0 static
@@ -3828,10 +3896,25 @@ fn ordinary_construct(
                     ));
                 }
                 Ok(VmOutcome::Paused(info)) => {
-                    // A constructor body is not parkable (`vm.pause_ok` is false
-                    // for it), so a stop here means the run was started by a
-                    // path that cannot resume it.
+                    // The stop is this activation's own: park it, and let the
+                    // marker unwind into the step that built the `new`.
                     agent.set_pause_info(info);
+                    agent.set_pause_in_flight();
+                    if let Ok(context) = agent.running_context() {
+                        let site = vm.take_pause_site();
+                        let context = context.clone();
+                        agent.park_paused_level(crate::agent::PausedLevel {
+                            vm,
+                            body: ir.clone(),
+                            context,
+                            site,
+                            kind: crate::agent::LevelKind::Construct {
+                                this,
+                                this_env: None,
+                            },
+                        });
+                        return Err(crate::ir::pause_unwinds());
+                    }
                     agent.return_vm(vm);
                     return Err(crate::ir::pause_without_run());
                 }
@@ -3966,6 +4049,9 @@ fn ordinary_construct(
             {
                 let body_env = agent.running_context()?.lexical_environment;
                 let mut vm = agent.take_vm(body_env, data.strict);
+                // Only a `new` the declaring step could resume declares the body
+                // parkable (`Agent::pause_resumable_callee`).
+                vm.pause_ok = agent.take_pause_ticket().unwrap_or(false);
                 // Cut 3 continuation (nested context chains): a certified
                 // body's static context-chain reads resolve against its
                 // captured environment (its own capture context when it has
@@ -4029,10 +4115,36 @@ fn ordinary_construct(
                         ));
                     }
                     Ok(VmOutcome::Paused(info)) => {
-                        // A constructor body is not parkable (`vm.pause_ok` is
-                        // false for it), so a stop here means the run was started
-                        // by a path that cannot resume it.
+                        // The stop is this activation's own: park it with the
+                        // `this` binding the resume has to fall back to (a
+                        // derived constructor's comes from `super()`, so the
+                        // FunctionEnv travels with the level), then let the
+                        // marker unwind into the step that built the `new`.
                         agent.set_pause_info(info);
+                        agent.set_pause_in_flight();
+                        if let Ok(context) = agent.running_context() {
+                            let site = vm.take_pause_site();
+                            let context = context.clone();
+                            let kind = if derived {
+                                crate::agent::LevelKind::Construct {
+                                    this: Value::Undefined,
+                                    this_env: Some(function_env),
+                                }
+                            } else {
+                                crate::agent::LevelKind::Construct {
+                                    this,
+                                    this_env: None,
+                                }
+                            };
+                            agent.park_paused_level(crate::agent::PausedLevel {
+                                vm,
+                                body: ir.clone(),
+                                context,
+                                site,
+                                kind,
+                            });
+                            return Err(crate::ir::pause_unwinds());
+                        }
                         agent.return_vm(vm);
                         return Err(crate::ir::pause_without_run());
                     }

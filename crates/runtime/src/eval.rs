@@ -114,6 +114,7 @@ pub fn eval_program(
             body,
             context,
             site,
+            kind: crate::agent::LevelKind::Script,
         });
         agent.clear_pause_in_flight();
         return Err(crate::ir::paused_run_error(info));
@@ -189,6 +190,7 @@ fn finish_script_run(
                 body,
                 context,
                 site,
+                kind: crate::agent::LevelKind::Script,
             });
             agent.clear_pause_in_flight();
             return Err(crate::ir::paused_run_error(info));
@@ -258,6 +260,7 @@ pub fn resume_paused(agent: &mut Agent) -> Result<Value, JsError> {
             body,
             context,
             site,
+            kind,
         } = level;
         // Every parked activation was parkable when it stopped, so it still is.
         vm.pause_ok = true;
@@ -289,6 +292,7 @@ pub fn resume_paused(agent: &mut Agent) -> Result<Value, JsError> {
             body,
             context,
             site,
+            kind,
         };
         // The outcome has to be judged before the level can be consumed, so the
         // two re-park cases peel off first.
@@ -303,7 +307,11 @@ pub fn resume_paused(agent: &mut Agent) -> Result<Value, JsError> {
             return repark_paused(agent, info, parked, level, pushed);
         }
         let crate::agent::PausedLevel {
-            vm, body, context, ..
+            vm,
+            body,
+            context,
+            kind,
+            ..
         } = level;
         if parked.is_empty() {
             // The outermost activation: its outcome is the run's, however it
@@ -314,7 +322,7 @@ pub fn resume_paused(agent: &mut Agent) -> Result<Value, JsError> {
         }
         let completion = match outcome {
             Ok(crate::ir::VmOutcome::Completed(completion)) => {
-                crate::function::finish_call_level(agent, &context.lexical_environment, completion)
+                crate::function::finish_level(agent, kind, &context.lexical_environment, completion)
             }
             Ok(crate::ir::VmOutcome::Suspended(_)) => Err(JsError::new(
                 ErrorKind::SyntaxError,

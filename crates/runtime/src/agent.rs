@@ -511,6 +511,36 @@ impl Trace for ContextStack {
 /// This is slice 1 of that conversion: the job queues, the promise tables and
 /// the generator tables. The rest of `Agent::trace_roots`'s fields follow in
 /// later slices.
+/// How a parked activation's completion becomes a value, which is what the
+/// resume has to reproduce (`.notes/chromium-facade.md` section 14.4).
+///
+/// A call and a `new` differ only in the last step: a constructor's completion is
+/// mapped to the constructed object (spec 10.2.1 steps 15-21), falling back to
+/// the `this` the engine bound before the body ran.
+pub(crate) enum LevelKind {
+    /// The script's own activation, finished by `finish_script_run`.
+    Script,
+    /// An ordinary call.
+    Call,
+    /// A `new`. `this_env` is the constructor's FunctionEnv, which only a
+    /// *derived* constructor needs, because `super()` is what binds `this`.
+    Construct {
+        this: Value,
+        this_env: Option<crate::env::EnvRef>,
+    },
+}
+
+impl Trace for LevelKind {
+    fn trace(&self, visit: &mut dyn FnMut(GcAny)) {
+        match self {
+            LevelKind::Script | LevelKind::Call => {}
+            LevelKind::Construct { this, this_env } => {
+                this.trace(visit);
+                this_env.trace(visit);
+            }
+        }
+    }
+}
 /// One activation a debug session stopped (`.notes/chromium-facade.md` section
 /// 14.4).
 ///
@@ -528,6 +558,8 @@ pub(crate) struct PausedLevel {
     /// it: where that level's result (or throw) lands when this one resumes.
     /// `None` for the innermost level, whose result is the run's.
     pub(crate) site: Option<crate::ir::PauseSite>,
+    /// How this activation's completion becomes a value.
+    pub(crate) kind: LevelKind,
 }
 
 impl Trace for PausedLevel {
@@ -537,6 +569,7 @@ impl Trace for PausedLevel {
         // The context's environments are heap values (and the only reference to
         // them once the caller that pushed it has popped it).
         self.context.trace(visit);
+        self.kind.trace(visit);
     }
 }
 
@@ -2552,16 +2585,16 @@ impl Agent {
         }
     }
 
-    /// Whether a stopped call can be resumed by the host: the callee runs on a
-    /// `Vm` of its own that a level can own, and nothing between it and the
-    /// script's activation has state only a native frame holds.
+    /// Whether a stopped call or `new` can be resumed by the host: the callee
+    /// runs on a `Vm` of its own that a level can own, and nothing between it
+    /// and the script's activation has state only a native frame holds.
     ///
     /// A generator or async body is started and resumed by its own machinery, a
     /// class-field initializer's caller carries a depth counter outside the
     /// `Vm`, and a cross-realm callee's context chain includes a bootstrap
     /// context the resume would not reproduce. All of those defer their stops,
     /// which is the same answer a point they cannot reach gives today.
-    pub(crate) fn pause_resumable_call(&self, callee: &Value) -> bool {
+    pub(crate) fn pause_resumable_callee(&self, callee: &Value) -> bool {
         if !self.debug_attached.get() || self.realm_count.get() != 1 {
             return false;
         }

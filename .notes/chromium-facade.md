@@ -1965,10 +1965,39 @@ run, and the write-back goes to that level's `Vm`. The facade's
 name says.
 
 What is still open: the `scopeChain` and `Runtime.getProperties` behind it (a
-scope and property model, not a pause question), constructs as parkable levels
-(a `new` whose body stops is deferred, because its completion has a `this`-based
-mapping to apply), and stops inside a generator or async body, a direct eval, a
-module body, or a bound or proxied callee, which all still defer.
+scope and property model, not a pause question), stops inside a generator or
+async body, a direct eval, a module body, or a bound or proxied callee (all
+defer), and the position table a multi-script session would need.
+
+**2026-11-01, constructs park like calls.** A `new` of an ordinary function now
+stops inside the constructor and resumes into the step that built it. The
+machinery is the call's, with one addition: a level records *how* its completion
+becomes a value (`LevelKind`), because spec 10.2.1 steps 15-21 map a
+constructor's completion differently from a call's. A base constructor's level
+carries the `this` the engine bound; a derived one carries its FunctionEnv,
+because `super()` is what binds `this` and only the environment remembers it.
+`function::finish_construct_level` is that rule in one place, and
+`function::finish_level` is what `resume_paused` calls for any parked level.
+Three smaller things went with it:
+
+- **The construct step declares its own ticket.** `Step::Construct` is performed
+  in place rather than withdrawn like a call, so it sets the site itself
+  (`stack.len()` where the result goes, `below` 0) when the marker comes back.
+- **A body compiled under a session is never a leaf.** A leaf body runs its
+  steps in place on the caller's `Vm`, and its driver turns a `Paused` outcome
+  into a real error (`pause_without_run`), which is exactly the "a pause must
+  never become an error" trap. `steps_are_leaf` now rejects `DebugCheck`, so a
+  body with points takes a `Vm` of its own. Nothing changes when no session is
+  attached, because then no body carries a point.
+- **A certified constructor's context records its function while a session is
+  attached.** The certified construct path skipped the `function` slot unless
+  the body used sloppy `arguments`, which left a constructor frame with no name
+  in a stack trace and in the inspector's `callFrames`.
+
+Four engine tests cover a base constructor's stop and its parameter, a derived
+constructor whose `this` comes from `super()`, an object return overriding
+`this` after a resume, and a throw inside a constructor reaching the caller's
+handler.
 
 ## 15. Sources
 
