@@ -1412,6 +1412,26 @@ this is the concrete plan rather than a restatement:
   Stepping (`stepOver`/`stepInto`/`stepOut`) is not cheap: it is the same
   continuation question as nested stops, one statement at a time.
 
+**2026-11-01, the protocol layer landed.** `crates/inspector` is a
+`serde_json`-based session over the pause protocol: it owns the script registry
+(id, url, source, and the body's debug points), resolves a
+`(url, line, column)` breakpoint to the first point at or after that position,
+and answers `Debugger.enable/disable/pause/resume/evaluateOnCallFrame/`
+`getScriptSource/setBreakpointByUrl/removeBreakpoint` plus `Runtime.enable/`
+`evaluate`, with `Debugger.scriptParsed/paused/resumed` events. The engine part
+that made it possible is `eval::debug_points(source)` (exposed as
+`Context::debug_points`), which compiles and caches a script's body under the
+session's setting and answers its `DebugCheck` spans, so a host can resolve a
+line before the first run and the run then reuses that body.
+
+Three limits are the session's own and visible in its answers rather than
+silent: a stop reports **one** call frame (the outermost activation, the only one
+that stops), `scopeChain` is empty and objects answer as `{"type": "object"}`
+because there is no scope or property model to read, and `Runtime.getProperties`
+is deliberately absent. Stepping answers `-32601`, as does
+`setPauseOnExceptions`: both are real protocol methods that this engine cannot
+honour yet, and a method-not-found is the honest answer until they can.
+
 ### 14.4 Pause and step: the protocol the compiled tiers have to agree to
 
 The `Debugger` domain needs four verbs (breakpoint at a position, step in, over

@@ -204,6 +204,46 @@ pub fn resume_paused(agent: &mut Agent) -> Result<Value, JsError> {
     finish_script_run(agent, vm, body, context, outcome)
 }
 
+/// The debug points a script's body carries, as `(start, end)` source offsets:
+/// what a host needs to turn a line-and-column breakpoint into a real stop
+/// (`Debugger.setBreakpointByUrl`), because the engine matches a point by its
+/// own offset exactly.
+///
+/// The script goal is the one a host registers and debugs (`run_script`'s), so
+/// the body compiled here is the one that run will reuse: the same source, the
+/// same strictness the parser decides, and the debug points on. A script with
+/// no session attached still answers its points, which is what lets a host
+/// resolve a breakpoint before the first run.
+pub fn debug_points(agent: &Agent, source: &str) -> Result<Vec<(u32, u32)>, JsError> {
+    let realm = agent.current_realm()?;
+    let jsx = false;
+    let script = crate::script::parse_script(source, realm, None)?;
+    let strict = crate::script::script_is_strict(&script.source, &script.code);
+    let key = (script.source.clone(), strict, true, jsx);
+    if let Some(body) = agent.roots.script_bodies.borrow().get(&key).cloned() {
+        return Ok(point_spans(&body));
+    }
+    let body = std::rc::Rc::new(crate::ir::compile_statements(
+        &script.code.body,
+        strict,
+        true,
+        true,
+    )?);
+    let spans = point_spans(&body);
+    agent.roots.script_bodies.borrow_mut().insert(key, body);
+    Ok(spans)
+}
+
+fn point_spans(body: &crate::ir::CompiledBody) -> Vec<(u32, u32)> {
+    body.steps
+        .iter()
+        .filter_map(|step| match step {
+            crate::ir::Step::DebugCheck { span } => Some((span.start, span.end)),
+            _ => None,
+        })
+        .collect()
+}
+
 /// Evaluate `source` at a stopped session's position
 /// (`Debugger.evaluateOnCallFrame`).
 ///

@@ -1048,6 +1048,13 @@ impl Context {
         self.agent.set_breakpoints(offsets);
     }
 
+    /// The debug points a script's body carries, as `(start, end)` source
+    /// offsets: what resolving a line-and-column breakpoint needs, since the
+    /// engine matches a point by its own offset exactly.
+    pub fn debug_points(&self, source: &str) -> Result<Vec<(u32, u32)>, JsError> {
+        crate::eval::debug_points(&self.agent, source)
+    }
+
     /// Ask the run to stop at its next debug point (`Debugger.pause`).
     pub fn request_pause(&mut self) {
         self.agent.request_pause();

@@ -439,6 +439,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "inspector"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+ "slag",
+]
+
+[[package]]
 name = "itertools"
 version = "0.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
