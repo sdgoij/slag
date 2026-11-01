@@ -443,19 +443,30 @@ pub(crate) type EnumKeyCacheCell = Option<crate::ir::EnumKeyCell>;
 /// than a reference, because a pushed or popped context cannot be pointed at
 /// from outside the cell. Holding one across a push or pop panics, so a guard's
 /// life has to stay inside one operation.
-pub(crate) struct ContextStack(RefCell<Vec<ExecutionContext>>);
+pub(crate) struct ContextStack(RefCell<Vec<ExecutionContext>>, RefCell<Vec<u32>>);
 
 impl ContextStack {
     fn new() -> ContextStack {
-        ContextStack(RefCell::new(Vec::new()))
+        ContextStack(RefCell::new(Vec::new()), RefCell::new(Vec::new()))
     }
 
     pub(crate) fn push(&self, context: ExecutionContext) {
+        // Objects created by the code this context runs belong to its realm, so
+        // the realm the engine stamps them with follows the stack. The previous
+        // value is saved rather than derived from the new top: the stack can be
+        // empty underneath (a job), and `run_job` sets the ambient for that.
+        let previous = crux::object::set_current_realm(context.realm.signifier);
+        self.1.borrow_mut().push(previous);
         self.0.borrow_mut().push(context);
     }
 
     pub(crate) fn pop(&self) -> Option<ExecutionContext> {
-        self.0.borrow_mut().pop()
+        let popped = self.0.borrow_mut().pop();
+        if popped.is_some() {
+            let previous = self.1.borrow_mut().pop().unwrap_or(0);
+            crux::object::set_current_realm(previous);
+        }
+        popped
     }
 
     #[cfg(test)]
@@ -3481,10 +3492,14 @@ impl Agent {
         RUNNING_JOB_REGION.with(|slot| *slot.borrow_mut() = Some(region));
         // The job runs in its own realm (spec 9.5.4): enter it for the closure,
         // so engine hooks that ask for the current realm answer one rather than
-        // failing while a job is in flight.
+        // failing while a job is in flight. The creation realm follows it, so an
+        // object a job builds belongs to the realm the job was enqueued for.
         let previous = self.roots.entered_realm.get();
         self.roots.entered_realm.set(job.realm);
+        let previous_creation_realm =
+            crux::object::set_current_realm(job.realm.map_or(0, |realm| realm.signifier));
         let result = (job.closure)(self);
+        crux::object::set_current_realm(previous_creation_realm);
         self.roots.entered_realm.set(previous);
         RUNNING_JOB_REGION.with(|slot| *slot.borrow_mut() = None);
         // GC-4: the job ended — its KeepDuringJob set is no longer needed.

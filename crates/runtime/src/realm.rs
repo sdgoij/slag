@@ -25,6 +25,11 @@ use crate::ir::{INTRINSIC_COUNT, Intrinsic};
 #[derive(Debug)]
 pub struct Realm {
     pub agent_signifier: u64,
+    /// The realm's own identity, distinct from `agent_signifier` (every realm
+    /// of one agent shares that one). An object's map records it as the realm
+    /// the object was created in ([`JsObject::realm`]), which is what a
+    /// cross-realm access check and the security token compare against.
+    pub signifier: u32,
     pub intrinsics: Intrinsics,
     pub global_object: Handle<JsObject>,
     pub global_env: EnvRef,
@@ -626,6 +631,16 @@ fn as_object(value: &Value) -> Option<Handle<JsObject>> {
     value.as_object()
 }
 
+/// Realm signifiers, distinct from object ids so a realm is never mistaken for
+/// an object in a table keyed by both. Zero means "no realm", so the counter
+/// starts at one; a process would have to create four billion contexts to
+/// exhaust it, and the facade mints one per `v8::Context`.
+static REALM_SIGNIFIERS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
+
+fn next_realm_signifier() -> u32 {
+    REALM_SIGNIFIERS.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
 /// InitializeHostDefinedRealm (spec 9.3.4): CreateIntrinsics, the global
 /// object, NewGlobalEnvironment, and SetDefaultGlobalBindings. The caller
 /// pushes the bootstrap execution context.
@@ -651,6 +666,22 @@ pub fn initialize_host_defined_realm_with_global(
     agent: &Agent,
     global_ops: Option<Rc<dyn HostOps>>,
 ) -> Result<Handle<Realm>, JsError> {
+    let signifier = next_realm_signifier();
+    // Nothing this realm builds can name its realm until the Realm record
+    // exists, and the first two objects it builds are protoless: the global
+    // object (created here, before `%Object.prototype%` is installed) and
+    // `%Object.prototype%` itself. The ambient is what stamps their maps, and
+    // every other intrinsic inherits from them.
+    crux::object::with_realm(signifier, || {
+        initialize_realm_with_signifier(agent, global_ops, signifier)
+    })
+}
+
+fn initialize_realm_with_signifier(
+    agent: &Agent,
+    global_ops: Option<Rc<dyn HostOps>>,
+    signifier: u32,
+) -> Result<Handle<Realm>, JsError> {
     let intrinsics = Intrinsics::default();
     // The global object's prototype is %Object.prototype% once the intrinsic
     // table is populated (Phase 5+); until then it is null.
@@ -664,6 +695,7 @@ pub fn initialize_host_defined_realm_with_global(
     let global_env = new_global_environment(global, global);
     let realm = Handle::new(Realm {
         agent_signifier: agent.signifier,
+        signifier,
         intrinsics,
         global_object: global,
         global_env,
@@ -941,6 +973,69 @@ mod tests {
                 .unwrap(),
             Value::Boolean(true),
             "a host op that answers `None` leaves the ordinary method running"
+        );
+    }
+
+    /// Every object a realm builds carries that realm's signifier, and no two
+    /// realms share one. The global object and `%Object.prototype%` are the
+    /// interesting half: both are created before any of the realm's own objects
+    /// exist, so nothing but the bootstrap ambient can say which realm they
+    /// belong to.
+    #[test]
+    fn objects_carry_the_realm_that_created_them() {
+        let mut first = Agent::new();
+        let first_realm = first.initialize_host_defined_realm().unwrap();
+        let mut second = Agent::new();
+        let second_realm = second.initialize_host_defined_realm().unwrap();
+        assert_ne!(
+            first_realm.signifier, second_realm.signifier,
+            "two realms never share a signifier"
+        );
+        assert_ne!(first_realm.signifier, 0, "0 means \"no realm\"");
+
+        assert_eq!(first_realm.global_object.realm(), first_realm.signifier);
+        assert_eq!(second_realm.global_object.realm(), second_realm.signifier);
+        for realm in [&first_realm, &second_realm] {
+            let object_prototype = realm
+                .intrinsics
+                .get("%Object.prototype%")
+                .and_then(|value| as_object(&value))
+                .expect("%Object.prototype% is an object");
+            assert_eq!(object_prototype.realm(), realm.signifier);
+        }
+
+        // A literal is built from the realm's %Object.prototype%, and gains a
+        // property after creation (a shape fork): both keep the realm.
+        let literal = first.run_script("({ x: 1 })").unwrap();
+        let literal = literal.as_object().expect("a literal is an object");
+        assert_eq!(literal.realm(), first_realm.signifier);
+        assert_eq!(
+            second
+                .run_script("({ x: 1 })")
+                .unwrap()
+                .as_object()
+                .unwrap()
+                .realm(),
+            second_realm.signifier
+        );
+
+        // A protoless object built by running code belongs to the realm that
+        // code runs in: no prototype can answer, so the execution context the
+        // object is created under does.
+        let bare = first
+            .run_script("Object.create(null)")
+            .unwrap()
+            .as_object()
+            .expect("Object.create(null) is an object");
+        assert_eq!(bare.realm(), first_realm.signifier);
+
+        // With nothing current, a protoless object has no realm to take. (The
+        // ambient is thread-wide, and both realms' bootstrap contexts are still
+        // pushed here, so the scope is cleared explicitly.)
+        assert_eq!(
+            crux::object::with_realm(0, || JsObject::ordinary_object_create(None)).realm(),
+            0,
+            "nothing current means no realm"
         );
     }
 

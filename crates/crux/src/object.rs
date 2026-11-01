@@ -43,6 +43,55 @@ fn is_length_key(key: &PropertyKey) -> bool {
 }
 
 thread_local! {
+    /// The realm objects created right now belong to. Realm bootstrap sets it
+    /// (a realm's global object and its intrinsics are built before the realm
+    /// record exists, so the prototype cannot answer yet); elsewhere it is 0
+    /// and [`realm_for`] falls back to the prototype. 0 is "no realm".
+    static CREATION_REALM: Cell<u32> = const { Cell::new(0) };
+}
+
+/// The realm objects created right now belong to, for the one case a
+/// prototype cannot answer; 0 when nothing says.
+pub fn current_realm() -> u32 {
+    CREATION_REALM.with(Cell::get)
+}
+
+/// Run `body` with `realm` as the realm of every object created inside it.
+/// Restores the previous realm on the way out (realm bootstrap can nest: a host
+/// builds a context while another is being built).
+pub fn with_realm<T>(realm: u32, body: impl FnOnce() -> T) -> T {
+    struct Restore(u32);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            CREATION_REALM.with(|slot| slot.set(self.0));
+        }
+    }
+    let previous = set_current_realm(realm);
+    let _restore = Restore(previous);
+    body()
+}
+
+/// Set the realm objects created right now belong to, answering the previous
+/// one. The runtime's execution-context stack mirrors its push and pop on this
+/// pair, so an object created while code runs belongs to the realm that code
+/// runs in; [`with_realm`] is the scoped form.
+pub fn set_current_realm(realm: u32) -> u32 {
+    CREATION_REALM.with(|slot| slot.replace(realm))
+}
+
+/// The realm a fresh object belongs to: the realm being built, or — when no
+/// realm is being built — the realm of the prototype the object is created on.
+/// The second arm is what carries a realm through the ordinary API: a host
+/// calling `Object::new(&context)` between scripts runs inside no execution
+/// context, and the context's own `%Object.prototype%` already knows its realm.
+fn realm_for(prototype: Option<Handle<JsObject>>) -> u32 {
+    match current_realm() {
+        0 => prototype.map_or(0, |object| object.realm()),
+        realm => realm,
+    }
+}
+
+thread_local! {
     /// The object ids this thread may still hand out: the next one and the
     /// end of the block it reserved (see [`next_object_id`]).
     static OBJECT_IDS: std::cell::Cell<(u64, u64)> = const { std::cell::Cell::new((0, 0)) };
@@ -1098,6 +1147,14 @@ pub struct JsObject {
     /// `GcHeader` both round to the same 448-byte arena class, so an object that
     /// never carries host fields allocates exactly as it did before.
     pub internal_fields: Cell<Option<Handle<InternalFields>>>,
+    /// The realm this object was created in ([`JsObject::realm`]); 0 is "no
+    /// realm". A field rather than a lookup through the shape, because an
+    /// object that drops to dictionary mode loses its map (`drop_map`), and
+    /// that is precisely what an access-checked host object does: every define
+    /// on a template instance changes its attributes. The `u32` keeps the
+    /// payload inside the 448-byte arena class (see the guard test at the end
+    /// of this file).
+    realm: Cell<u32>,
 }
 
 impl JsObject {
@@ -1298,6 +1355,7 @@ impl JsObject {
             id: next_object_id(),
             kind: ObjectKind::Ordinary,
             internal_fields: Cell::new(None),
+            realm: Cell::new(realm_for(prototype)),
             array_dense: Cell::new(None),
             typed_array: Cell::new(None),
             prototype: Cell::new(prototype),
@@ -1337,6 +1395,10 @@ impl JsObject {
             std::ptr::write(
                 std::ptr::addr_of_mut!((*this).internal_fields),
                 Cell::new(None),
+            );
+            std::ptr::write(
+                std::ptr::addr_of_mut!((*this).realm),
+                Cell::new(realm_for(prototype)),
             );
             std::ptr::write(std::ptr::addr_of_mut!((*this).array_dense), Cell::new(None));
             std::ptr::write(std::ptr::addr_of_mut!((*this).typed_array), Cell::new(None));
@@ -1411,6 +1473,18 @@ impl JsObject {
     /// key per-object state (promises, generators) in agent-side tables.
     pub fn id(&self) -> u64 {
         self.id
+    }
+
+    /// The realm this object was created in, as the realm record's own
+    /// signifier; 0 when nothing recorded one (a host built the object outside
+    /// any context, from a protoless prototype).
+    ///
+    /// This is what a cross-realm access check and the security token compare:
+    /// an access from realm A to an object of realm B goes through the object's
+    /// check, and an access within one realm does not. An object with no realm
+    /// is treated as the caller's own.
+    pub fn realm(&self) -> u32 {
+        self.realm.get()
     }
 
     /// Part B, B5.2: map-based read fast path. Check the object's map for
@@ -1672,6 +1746,7 @@ impl JsObject {
             id: next_object_id(),
             kind,
             internal_fields: Cell::new(None),
+            realm: Cell::new(realm_for(prototype)),
             array_dense: Cell::new(None),
             typed_array: Cell::new(None),
             prototype: Cell::new(prototype),
@@ -1700,6 +1775,7 @@ impl JsObject {
             id: next_object_id(),
             kind: ObjectKind::IsHTMLDDA,
             internal_fields: Cell::new(None),
+            realm: Cell::new(realm_for(prototype)),
             array_dense: Cell::new(None),
             typed_array: Cell::new(None),
             prototype: Cell::new(prototype),
@@ -1756,6 +1832,10 @@ impl JsObject {
                 std::ptr::write(
                     std::ptr::addr_of_mut!((*this).internal_fields),
                     Cell::new(None),
+                );
+                std::ptr::write(
+                    std::ptr::addr_of_mut!((*this).realm),
+                    Cell::new(realm_for(prototype)),
                 );
                 std::ptr::write(
                     std::ptr::addr_of_mut!((*this).array_dense),
@@ -1870,6 +1950,7 @@ impl JsObject {
             id: next_object_id(),
             kind: ObjectKind::String(Handle::new(value)),
             internal_fields: Cell::new(None),
+            realm: Cell::new(realm_for(prototype)),
             array_dense: Cell::new(None),
             typed_array: Cell::new(None),
             prototype: Cell::new(prototype),
@@ -1909,6 +1990,7 @@ impl JsObject {
             id: next_object_id(),
             kind: ObjectKind::Proxy(Handle::new(slots)),
             internal_fields: Cell::new(None),
+            realm: Cell::new(realm_for(None)),
             array_dense: Cell::new(None),
             typed_array: Cell::new(None),
             prototype: Cell::new(None),
@@ -1943,6 +2025,7 @@ impl JsObject {
             id: next_object_id(),
             kind: ObjectKind::IntegerIndexed(slots_handle),
             internal_fields: Cell::new(None),
+            realm: Cell::new(realm_for(prototype)),
             array_dense: Cell::new(None),
             typed_array: Cell::new(Some(slots_handle)),
             prototype: Cell::new(prototype),
@@ -2058,6 +2141,7 @@ impl JsObject {
                 deferred,
             })),
             internal_fields: Cell::new(None),
+            realm: Cell::new(realm_for(None)),
             array_dense: Cell::new(None),
             typed_array: Cell::new(None),
             prototype: Cell::new(None),
@@ -2119,6 +2203,7 @@ impl JsObject {
                 formals: formals.to_vec(),
             })),
             internal_fields: Cell::new(None),
+            realm: Cell::new(realm_for(prototype)),
             array_dense: Cell::new(None),
             typed_array: Cell::new(None),
             prototype: Cell::new(prototype),
@@ -2224,6 +2309,7 @@ impl JsObject {
                 formals: Vec::new(),
             })),
             internal_fields: Cell::new(None),
+            realm: Cell::new(realm_for(prototype)),
             array_dense: Cell::new(None),
             typed_array: Cell::new(None),
             prototype: Cell::new(prototype),
@@ -5919,9 +6005,61 @@ mod tests {
         // The payload grew 424 -> 432 B. With the 16-byte `GcHeader` that is
         // 440 -> 448 before rounding to the 16-byte class, so both land in the
         // 448-byte class and an object that never carries host fields allocates
-        // exactly as it did before. A field that pushed the payload past 432
-        // would move every object up a class, which is what this guards.
+        // exactly as it did before. The realm field fit in the padding this
+        // layout already had. A field that pushed the payload past 432 would
+        // move every object up a class, which is what this guards.
         assert_eq!(std::mem::size_of::<JsObject>(), 432);
+    }
+
+    #[test]
+    fn an_object_takes_the_realm_of_the_shape_it_was_created_on() {
+        // Realm bootstrap is the only time no prototype can answer: the
+        // global object and %Object.prototype% are protoless. The ambient is
+        // what stamps them, and every object built on those (or on a further
+        // prototype) inherits the answer.
+        let proto = with_realm(9, || JsObject::ordinary_object_create(None));
+        assert_eq!(proto.realm(), 9, "the ambient stamps a protoless object");
+
+        let object = JsObject::ordinary_object_create(Some(proto));
+        assert_eq!(object.realm(), 9, "a prototype carries its realm");
+
+        // The realm is a field, not a shape lookup: an object that drops to
+        // dictionary mode (`drop_map`) keeps it, which is what an embedder
+        // wrapper does as soon as a define changes its attributes.
+        object
+            .define_property(
+                &JsString::from_utf8("x"),
+                &PropertyDescriptor {
+                    value: None,
+                    writable: None,
+                    enumerable: Some(false),
+                    configurable: Some(true),
+                    get: Some(Value::Number(1.0)),
+                    set: None,
+                },
+            )
+            .unwrap();
+        assert!(object.map.get().is_none(), "the define dropped the map");
+        assert_eq!(object.realm(), 9, "a dictionary-mode object keeps it");
+
+        assert_eq!(
+            JsObject::ordinary_object_create(None).realm(),
+            0,
+            "outside a realm, a protoless object has none"
+        );
+    }
+
+    #[test]
+    fn the_ambient_realm_is_scoped() {
+        assert_eq!(current_realm(), 0);
+        with_realm(3, || {
+            assert_eq!(current_realm(), 3);
+            // Realm bootstrap nests (a host can build a context while another
+            // is being built), so the outer realm has to come back.
+            with_realm(4, || assert_eq!(current_realm(), 4));
+            assert_eq!(current_realm(), 3);
+        });
+        assert_eq!(current_realm(), 0);
     }
 
     #[test]

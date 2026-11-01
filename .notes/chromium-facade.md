@@ -1206,6 +1206,34 @@ are reused), so the slice is a `realm` field stamped at creation plus a hook the
 ordinary property paths consult on a cross-realm access. Until then a signature
 is the only access check the facade enforces.
 
+*The realm an object was created in (2026-11-01).* The first half of §14.2 is
+in: `JsObject` carries `realm: Cell<u32>`, the realm record carries a
+`signifier` (0 is "no realm", so the counter starts at one), and every object
+constructor stamps it. Two sources decide the value, in that order: the realm
+being built, which covers realm bootstrap (the global object and
+`%Object.prototype%` are protoless and are created before the realm record
+exists), and the realm of the prototype the object is created on, which covers
+everything built while no realm is current (a host calling `Object::new`
+between scripts). The execution-context stack keeps the first source live:
+`ContextStack::push`/`pop` save and restore it, so an object made by running
+code belongs to the realm that code runs in, and `run_job` sets it for a job.
+
+Three decisions are worth recording. The field is a `u32`, and it fit in
+padding the payload already had: `size_of::<JsObject>()` is still 432 bytes, so
+the 448-byte arena class (and the guard test that pins it) is unchanged. The
+realm is **not** read back through the map, which was the first attempt: an
+object that drops to dictionary mode (`drop_map`) loses its map, and an
+embedder wrapper drops its map on the first define whose attributes differ from
+the shape, so the map is exactly the wrong place for the fact an access check
+needs. And the prototype is consulted at *creation* rather than trusted later,
+so a later `setPrototypeOf` cannot change which realm an object reports.
+
+What is left of §14.2 is the hook: `get`/`set`/`has` consult the object's realm
+on a cross-realm access, and `Signature`'s check moves behind it. The facade has
+no way to ask yet (`slag_value_realm` / `slag_value_same_realm` come with the
+hook), so the README's "a signature is enforced, a per-object access check and
+the security token are not" still holds.
+
 ## 15. Sources
 
 Verified on 2026-10-31:
