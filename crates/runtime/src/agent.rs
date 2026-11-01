@@ -2256,6 +2256,23 @@ impl Agent {
         self.termination.load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    /// Attach or detach a debug session (`Isolate::SetDebugAttached`).
+    ///
+    /// The flag does one thing: `lookup_info_for` refuses the compiled tiers
+    /// while it is set, so a session cannot be skipped by code compiled before
+    /// it (§14.4 of `.notes/chromium-facade.md`). The bytecode already carries a
+    /// point per statement, so nothing has to be recompiled here, and that is
+    /// deliberate: a function record holds its own `ir` and has no recompile
+    /// path (`set_compiled` runs only at creation, and the record no longer
+    /// carries the name `compile_body` takes), so dropping the bytecode caches
+    /// would either leave the record's body in place or demote the function to
+    /// the interpreted environment path permanently. Recompiling with points
+    /// only under a session is the design V8 uses, and it needs a record-level
+    /// recompile first.
+    pub fn set_debug_attached(&self, attached: bool) {
+        self.debug_attached.set(attached);
+    }
+
     /// The heap limit a host asked for, if any
     /// (`v8::CreateParams::heap_limits`).
     pub fn set_heap_limits(&mut self, initial: usize, maximum: usize) {
@@ -4135,6 +4152,57 @@ impl Agent {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn attaching_a_session_keeps_the_bytecode_that_already_has_the_points() {
+        // The compiled body always carries the points, so an attach only has to
+        // stop the JIT (`lookup_info_for`). Dropping the bytecode caches here
+        // would be wrong, and the reason is a property of the function record:
+        // it holds its own `ir` and has no recompile path (`set_compiled` runs
+        // only at creation, and the record no longer carries the name
+        // `compile_body` takes), so a cleared cache either leaves the record's
+        // body in place or demotes the function to the interpreted env path for
+        // good. That is why attach-time bytecode needs its own slice.
+        let mut agent = Agent::new();
+        agent.initialize_host_defined_realm().unwrap();
+        let expected = if crate::ir::debug_points_enabled() {
+            2
+        } else {
+            0
+        };
+        let points = |body: &crate::ir::CompiledBody| {
+            body.steps
+                .iter()
+                .filter(|step| matches!(step, crate::ir::Step::DebugCheck { .. }))
+                .count()
+        };
+        agent.run_script("var n = 1; n += 1;").unwrap();
+        let body = agent
+            .roots
+            .script_bodies
+            .borrow()
+            .values()
+            .next()
+            .cloned()
+            .expect("the script body is cached");
+        assert_eq!(points(&body), expected, "one point per statement");
+        agent.set_debug_attached(true);
+        assert!(agent.debug_attached.get());
+        let again = agent
+            .roots
+            .script_bodies
+            .borrow()
+            .values()
+            .next()
+            .cloned()
+            .expect("the attach must not drop the body");
+        assert!(
+            std::rc::Rc::ptr_eq(&body, &again),
+            "the attach must not drop the bytecode"
+        );
+        agent.set_debug_attached(false);
+        assert!(!agent.debug_attached.get());
+    }
 
     #[test]
     fn compiled_regexps_are_shared_by_source_and_flags() {

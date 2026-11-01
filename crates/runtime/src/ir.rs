@@ -26036,8 +26036,12 @@ pub fn is_compound_assign(op: &AssignOp) -> bool {
 /// It has to be on rather than attach-gated: a session refuses compilation
 /// (`lookup_info_for`), so the body a session runs is the bytecode built
 /// *before* the attach, and a switch that is read at attach time could not put
-/// the points into it. Cached, because `std::env::var_os` costs ~140 ns and
-/// this is consulted once per statement compiled.
+/// the points into it. Nor can an attach drop the bytecode caches to force a
+/// recompile: a function record holds its own `ir` and has no recompile path,
+/// so the record's body would survive the drop or the function would be
+/// demoted to the interpreted environment path for good. Cached, because
+/// `std::env::var_os` costs ~140 ns and this is consulted once per statement
+/// compiled.
 ///
 /// The interpreter does pay for it, which is the honest half of the number:
 /// `--jitless` is +1.11% corpus-wide, since a point is one extra step dispatch
@@ -26045,7 +26049,7 @@ pub fn is_compound_assign(op: &AssignOp) -> bool {
 /// deliberately not emitted here: at 2.35 ns a dispatch it costs +6.9% on a
 /// tight loop, and both costs go away with the slice that gives a session its
 /// own bytecode (invalidate the cached bodies on attach).
-fn debug_points_enabled() -> bool {
+pub(crate) fn debug_points_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| match std::env::var_os("SLAG_DEBUG_POINTS") {
         Some(value) => value != "0",

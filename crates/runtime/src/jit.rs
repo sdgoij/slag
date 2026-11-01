@@ -8162,12 +8162,12 @@ mod tests {
             !lookup_info_for(&agent, hook, &body, false).is_null(),
             "a body compiles while no session is attached"
         );
-        agent.debug_attached.set(true);
+        agent.set_debug_attached(true);
         assert!(
             lookup_info_for(&agent, hook, &body, false).is_null(),
             "a session must not serve the entry compiled before it"
         );
-        agent.debug_attached.set(false);
+        agent.set_debug_attached(false);
         assert!(
             !lookup_info_for(&agent, hook, &body, false).is_null(),
             "the cached entry is served again once the session detaches"

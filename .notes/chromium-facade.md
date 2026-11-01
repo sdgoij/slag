@@ -1532,6 +1532,26 @@ is. Until that slice lands, a loop with no statements (the shape the back-edge
 point exists for) has no per-iteration place to stop, and a `continue` skips the
 last statement's point; both are recorded gaps, not silently missing hooks.
 
+**2026-11-01, the attach-time bytecode is not a cache clear.** Dropping the
+cached bodies on attach and letting the next call recompile looks like a small
+slice and is not, which is worth recording before someone tries it. A compiled
+body is reachable from three places: `AgentRoots::compiled_bodies` (per site),
+`AgentRoots::script_bodies` (per script text), and the `EcmaFunction` record's
+own `ir`. The third is the one the call path reads (`ordinary_call` builds its
+`FastCall` from the record), and it has **no recompile path**: `set_compiled`
+runs only at function creation. So clearing the record's `ir` demotes that
+function to the interpreted environment path for good, while clearing only the
+site cache leaves the record's body in place, i.e. a session with no points in
+exactly the functions that were already warm. Recompiling a record also cannot
+be done from the record alone: `compile_body` takes the function's `name`, which
+the record no longer carries (it was dropped on the way to 152 bytes), and the
+verdicts `set_compiled` derives (`leaf_inline`, `construct_inline`) would have
+to be recomputed. That record-level recompile is therefore step one of the
+slice.
+
+Until it lands, the point stays always-on and `Agent::set_debug_attached` only
+flips the flag `lookup_info_for` reads.
+
 ## 15. Sources
 
 Verified on 2026-10-31:
