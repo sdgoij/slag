@@ -9093,8 +9093,9 @@ impl Vm {
                     // so the resumed run does not stop again at the same point.
                     // Only the outermost activation stops: a nested one would
                     // have to park the frames above it, and a callee's run
-                    // returns a `Value` to its caller, not an outcome.
-                    if agent.at_host_depth() {
+                    // returns a `Value` to its caller, not an outcome. A run
+                    // parked for a frame evaluation is not paused again.
+                    if agent.at_host_depth() && !agent.has_paused_run() {
                         if agent.breakpoint_at(span.start) {
                             return Ok(VmOutcome::Paused(PauseInfo {
                                 reason: PauseReason::Breakpoint,

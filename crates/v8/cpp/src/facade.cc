@@ -1732,6 +1732,17 @@ MaybeLocal<Value> Context::Resume() {
   return Local<Value>::New(out);
 }
 
+MaybeLocal<Value> Context::EvaluateOnPausedFrame(Local<String> source) {
+  if (source.IsEmpty()) return MaybeLocal<Value>();
+  std::string text = ValueText(source.raw());
+  uint64_t out = 0;
+  if (slag_debug_evaluate(slag_, reinterpret_cast<const uint8_t*>(text.data()),
+                          text.size(), &out) != 0) {
+    return MaybeLocal<Value>();
+  }
+  return Local<Value>::New(out);
+}
+
 void Isolate::ThrowException(Local<Value> exception) {
   if (exception.IsEmpty()) return;
   slag_throw_exception(CurrentSlagContext(), exception.raw());

@@ -1067,6 +1067,13 @@ impl Context {
         crate::eval::resume_paused(&mut self.agent).map(JsValue)
     }
 
+    /// Evaluate `source` at the stopped position
+    /// (`Debugger.evaluateOnCallFrame`): a direct eval under the paused run's
+    /// own context and strictness.
+    pub fn evaluate_paused(&mut self, source: &str) -> Result<JsValue, JsError> {
+        crate::eval::evaluate_paused(&mut self.agent, source).map(JsValue)
+    }
+
     /// Write this realm's state as a snapshot blob.
     ///
     /// The blob carries the realm's global bindings (`realm_global`), which is
@@ -5303,6 +5310,60 @@ mod tests {
             "a point is matched by its own offset, not by neighbourhood"
         );
         assert!(context.agent().paused_reason().is_none());
+    }
+
+    #[test]
+    fn evaluating_at_the_pause_sees_the_stopped_scope() {
+        let mut context = Context::new().unwrap();
+        let pause_now = context
+            .create_function(
+                "pauseNow",
+                0,
+                Box::new(|call| {
+                    crate::context::callback_agent(call.agent_ptr())?.request_pause();
+                    Ok(JsValue::undefined())
+                }),
+            )
+            .unwrap();
+        context.set_global("pauseNow", pause_now).unwrap();
+        context.agent_mut().set_debug_attached(true).unwrap();
+        let error = context
+            .eval(
+                "let counter = 41; globalThis.ran = false; \
+                 try { pauseNow(); globalThis.ran = true; } \
+                 finally { globalThis.fin = true; } 'done';",
+            )
+            .unwrap_err();
+        assert_eq!(error.message, "execution paused at the host's request");
+
+        assert_eq!(
+            context.evaluate_paused("counter + 1").unwrap().as_number(),
+            Some(42.0),
+            "the scope the run stopped in is what the expression sees"
+        );
+        assert_eq!(
+            context.agent().paused_reason(),
+            Some(crate::ir::PauseReason::Requested),
+            "an evaluation does not disturb the parked run"
+        );
+        assert_eq!(
+            context
+                .evaluate_paused("globalThis.ran")
+                .unwrap()
+                .as_boolean(),
+            Some(false),
+            "the stop is still where it was"
+        );
+
+        let value = crate::eval::resume_paused(context.agent_mut()).unwrap();
+        assert_eq!(
+            value.as_string().map(|text| text.to_string_lossy()),
+            Some("done".to_string())
+        );
+        assert_eq!(
+            context.eval("globalThis.ran").unwrap().as_boolean(),
+            Some(true)
+        );
     }
 
     #[test]

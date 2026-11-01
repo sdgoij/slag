@@ -208,6 +208,10 @@ int32_t slag_debug_pause(SlagContext* context);
 int32_t slag_debug_paused(SlagContext* context, SlagPause* out);
 /* Continue the parked run; its completion value is written through `out`. */
 int32_t slag_debug_resume(SlagContext* context, uint64_t* out);
+/* Evaluate `source` at the stopped position (`Debugger.evaluateOnCallFrame`):
+ * a direct eval under the paused run's context, answering its value. */
+int32_t slag_debug_evaluate(SlagContext* context, const uint8_t* source, size_t len,
+                            uint64_t* out);
 /* Drain the job queues. 1 when a job was queued, 0 when none was, -1 with a
  * pending error when a job threw. */
 int32_t slag_drain_jobs(SlagContext* context);

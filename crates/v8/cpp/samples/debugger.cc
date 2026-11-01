@@ -43,6 +43,7 @@ namespace {
 // The breakpointed statement sits inside a `try`, so the demo also shows that a
 // stop does not unwind: the `finally` runs only after the resume.
 const char kSource[] =
+    "let counter = 41;\n"
     "globalThis.ran = false;\n"
     "try {\n"
     "  globalThis.ran = true;\n"
@@ -75,6 +76,18 @@ const char* RunDemo(v8::Isolate* isolate, v8::Local<v8::Context> context) {
     }
     if (pause.start != offset) return "the stop named the wrong position";
     printf("paused: breakpoint at offset %u\n", pause.start);
+
+    /* Evaluate at the stop: a top-level `let` is in the scope the run stopped
+     * in, so the expression sees it. */
+    v8::Local<v8::Value> probed;
+    v8::Local<v8::String> question =
+        v8::String::NewFromUtf8Literal(isolate, "counter + 1");
+    if (!context->EvaluateOnPausedFrame(question).ToLocal(&probed)) {
+      return "evaluate on the paused frame";
+    }
+    int32_t answer = probed->Int32Value(context).FromMaybe(0);
+    printf("evaluated: counter + 1 = %d\n", answer);
+    if (answer != 42) return "the paused frame's scope was not in view";
   }
 
   v8::Local<v8::Value> value;

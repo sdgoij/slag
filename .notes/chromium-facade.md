@@ -1759,6 +1759,44 @@ which is also where the four guarantees (free when detached, an outcome not an
 error, offset breakpoints, outermost-only stops) are stated for a host
 integrator.
 
+**2026-11-01, `evaluateOnCallFrame` landed; what the continuation stack costs.**
+`eval::evaluate_paused` runs the host's expression as a direct eval under the
+paused run's own context and strictness, so a top-level `let`/`const`, a global
+read and a captured binding are all in view, and the parked record is untouched
+(an evaluation cannot pause, and the debug point's gate refuses while one is
+parked, or it would overwrite the record it is evaluating against). What it does
+not see is a certified body's *slot* locals: those live in the halted frame's
+`Vm::frame`, and a direct eval resolves through environments, so an expression
+naming one reports it undefined. Closing that needs the evaluation compiled
+against the frame, which is its own slice.
+
+Lifting the outermost-only restriction is bigger than it looks, and the reason is
+now concrete rather than a hunch. A stop inside a called function has to unwind a
+stack of activations, and this engine builds that stack out of two different
+things:
+
+- The **certified nested lane** (`run_certified_call_nested`) runs the callee on
+the caller's own `Vm`, and it saves the caller's `ip`, `lexical_env`,
+  `body_context`, `current_function`, `current_new_target`, `strict` and
+  `field_initializer_depth` in **native locals**, restoring them when the callee
+  returns. A pause escapes through those locals' frames, so the restore happens
+  but the *resume* has nothing to restore from: the parked `Vm`'s `ip` is the
+  callee's, while the record's `body` is the outermost one, and resuming would
+  index one body's steps with the other's cursor. That is why the depth gate is
+  load-bearing for correctness, not just for parking simplicity.
+- The **pooled lane** gives the callee its own `Vm`, and the channel back to the
+  caller's call step is `Result<Value, JsError>`.
+
+So the record has to become a stack of levels, each holding the body, the `ip`,
+and enough of the call site to deliver the callee's completion when the level
+above it is resumed, plus the nested lane's saved env/frame fields. Resume then
+walks innermost-first: run a level to completion, deliver its value into the
+level below, continue, repeat. `complete_call` is not re-enterable today (it
+consumes the `PendingCall`), so the call step's delivery has to become an
+explicit resume point rather than a function call. The alternative that removes
+this whole class of problem is the one V8 uses: every call runs on one `Vm`, and
+the C3 lane is this engine's seed of it.
+
 Still open, in order: the continuation stack (the depth restriction above), the
 position table and breakpoints, `evaluateOnCallFrame` through the
 `CallbackWindow`, and the facade's `Debugger` surface. Resuming mid-`try` also

@@ -65,6 +65,7 @@ context->SetBreakpoints(&offset, 1);
 script->Run(context);                       // answers empty: the run is parked
 v8::Context::PauseInfo pause;
 context->Paused(&pause);                    // kBreakpoint, offset..offset+len
+context->EvaluateOnPausedFrame(src).ToLocal(&value);  // in the paused scope
 context->Resume().ToLocal(&value);          // the script's completion value
 ```
 
@@ -86,6 +87,10 @@ per context and a session debugs one script at a time.
 - **A stop happens in the outermost activation.** A breakpoint inside a function
 that is still on the stack stops when control returns to the outermost frame;
 lifting that is the continuation-stack slice.
+- **`EvaluateOnPausedFrame` sees the stopped scope, not its frame slots.** An
+expression runs as a direct eval under the paused run's context, so top-level
+bindings, globals and captured variables are in view; a certified body's locals
+live in the halted frame's slot array, so naming one reports it undefined.
 
 
 ## A1: the indirect handle

@@ -2252,6 +2252,40 @@ pub unsafe extern "C" fn slag_debug_resume(context: *mut SlagContext, out: *mut 
     }
 }
 
+/// Evaluate `source` at the stopped position (`Debugger.evaluateOnCallFrame`).
+/// Returns 0 with the value through `out`, 1 with a pending error, and 2 for a
+/// bad handle.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn slag_debug_evaluate(
+    context: *mut SlagContext,
+    source: *const u8,
+    len: usize,
+    out: *mut u64,
+) -> i32 {
+    let Some(context) = context.as_mut() else {
+        return 2;
+    };
+    let Ok(source) = text(source, len) else {
+        return 2;
+    };
+    let Ok(mut engine) = context.context.try_borrow_mut() else {
+        reentrant(context);
+        return 1;
+    };
+    match engine.evaluate_paused(source) {
+        Ok(value) => {
+            if let Some(out) = out.as_mut() {
+                *out = value.to_bits();
+            }
+            0
+        }
+        Err(error) => {
+            record(context, error);
+            1
+        }
+    }
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn slag_undefined() -> u64 {
     JsValue::undefined().to_bits()
@@ -5334,6 +5368,19 @@ mod tests {
             assert_eq!(slag_debug_paused(context, &mut pause), 1);
             assert_eq!(pause.reason, PAUSE_BREAKPOINT);
             assert_eq!(pause.start, offset);
+
+            // Evaluating at the stop runs under the paused run's context.
+            let probe: &[u8] = b"1 + 1";
+            assert_eq!(
+                slag_debug_evaluate(context, probe.as_ptr(), probe.len(), &mut value),
+                0
+            );
+            assert_eq!(slag_value_to_number(value), 2.0);
+            assert_eq!(
+                slag_debug_paused(context, &mut pause),
+                1,
+                "an evaluation leaves the run parked"
+            );
 
             assert_eq!(slag_debug_resume(context, &mut value), 0);
             assert_eq!(slag_value_is_string(value), 1, "the script's completion");

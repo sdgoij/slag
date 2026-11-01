@@ -204,6 +204,38 @@ pub fn resume_paused(agent: &mut Agent) -> Result<Value, JsError> {
     finish_script_run(agent, vm, body, context, outcome)
 }
 
+/// Evaluate `source` at a stopped session's position
+/// (`Debugger.evaluateOnCallFrame`).
+///
+/// The evaluation runs as a direct eval under the context the run stopped in,
+/// so the paused body's lexical scope is what the expression sees: a top-level
+/// `let`/`const`, a `var` read through the global object, a captured binding.
+/// What it does not see are the frame's *slots*: a certified body keeps its
+/// locals in the halted frame's slot array (`Vm::frame`), and a direct eval
+/// resolves names through environments, so an expression naming a slot local
+/// reports it as undefined. Reading slot locals needs the evaluation to be
+/// compiled against that frame, which is the next slice.
+///
+/// The evaluation cannot pause: the parked record is the frame being evaluated
+/// against, and a second stop would overwrite it.
+pub fn evaluate_paused(agent: &mut Agent, source: &str) -> Result<Value, JsError> {
+    let Some((context, strict)) = agent.paused_frame() else {
+        return Err(JsError::new(
+            ErrorKind::Error,
+            "no paused run to evaluate on".into(),
+        ));
+    };
+    agent.roots.execution_context_stack.push(context);
+    let result = crate::script::perform_eval(
+        agent,
+        &crux::string::JsString::from_utf8(source),
+        strict,
+        true,
+    );
+    agent.roots.execution_context_stack.pop();
+    result
+}
+
 pub(crate) fn eval_statement_list(
     agent: &mut Agent,
     stmts: &[Stmt],

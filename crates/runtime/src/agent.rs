@@ -2356,6 +2356,23 @@ impl Agent {
             .map(|run| run.info.reason)
     }
 
+    /// The parked run's context and strictness, for evaluating at the stop
+    /// (`Debugger.evaluateOnCallFrame`): the evaluation has to run under the
+    /// context the run stopped in, with the body's own strictness.
+    pub(crate) fn paused_frame(&self) -> Option<(crate::context::ExecutionContext, bool)> {
+        self.roots
+            .paused
+            .borrow()
+            .as_ref()
+            .map(|run| (run.context.clone(), run.vm.strict))
+    }
+
+    /// Whether a run is parked, which is what stops a frame evaluation from
+    /// pausing (and overwriting the record it is evaluating against).
+    pub(crate) fn has_paused_run(&self) -> bool {
+        self.roots.paused.borrow().is_some()
+    }
+
     /// Where the paused run stopped, if it is holding one.
     pub fn paused_position(&self) -> Option<crux::span::Span> {
         self.roots
