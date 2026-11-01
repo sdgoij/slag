@@ -1860,10 +1860,23 @@ impl Context {
     /// is returned here, which is what lets a host report a compile failure
     /// separately from a runtime one.
     pub fn compile_script(&self, source: &str) -> Result<CompiledScript, JsError> {
+        self.compile_script_named(source, None)
+    }
+
+    /// [`compile_script`](Self::compile_script) for a script the host named:
+    /// `name` is `ScriptOrigin::ResourceName`, which the run keeps so a frame
+    /// of this script answers it (`v8::StackFrame::GetScriptName`) and so an
+    /// `import()` written here has a referrer.
+    pub fn compile_script_named(
+        &self,
+        source: &str,
+        name: Option<&str>,
+    ) -> Result<CompiledScript, JsError> {
         let realm = self.agent.current_realm()?;
         crate::script::parse_script(source, realm, None)?;
         Ok(CompiledScript {
             source: source.to_string(),
+            name: name.filter(|name| !name.is_empty()).map(str::to_string),
         })
     }
 
@@ -1872,7 +1885,13 @@ impl Context {
     /// the compile made the syntax failure a separate event, which is the
     /// property a host's `TryCatch` needs.
     pub fn run_compiled_script(&mut self, script: &CompiledScript) -> Result<JsValue, JsError> {
-        self.eval_script(&script.source)
+        let Some(name) = script.name.as_deref() else {
+            return self.eval_script(&script.source);
+        };
+        let value = self
+            .agent
+            .run_script_named(&script.source, Some(JsString::from_utf8(name)))?;
+        Ok(JsValue(value))
     }
 
     /// Like [`Context::eval`], parsing with the JSX extension enabled: JSX
@@ -3778,9 +3797,16 @@ fn describe_value(value: &Value) -> String {
 #[derive(Debug, Clone)]
 pub struct CompiledScript {
     source: String,
+    /// The `ScriptOrigin` name the host compiled it under, which the run keeps
+    /// in the script record so a frame can answer it.
+    name: Option<String>,
 }
 
 impl CompiledScript {
+    /// The `ScriptOrigin` name the host compiled it under, if any.
+    pub fn name(&self) -> Option<&str> {
+        self.name.as_deref()
+    }
     /// The source the script was compiled from.
     pub fn source(&self) -> &str {
         &self.source

@@ -60,6 +60,25 @@ const char kSource[] =
 
 const int kGroup = 7;
 
+// The script whose error is reported: `capture` is a host function, so the
+// stack is still live when the trace is taken, which is where a browser
+// captures one (at `Error` construction, not where the error surfaces).
+const char kThrowingSource[] =
+    "function inner() { return capture(); }\n"
+    "function outer() { return inner(); }\n"
+    "outer();\n"
+    "throw new Error('boom');";
+
+// What the host function records: the trace, taken while the frames exist.
+v8_inspector::V8Inspector* g_inspector = nullptr;
+std::unique_ptr<v8_inspector::V8StackTrace> g_captured;
+
+void CaptureCallback(const v8::FunctionCallbackInfo<v8::Value>& info) {
+  (void)info;
+  if (g_inspector == nullptr) return;
+  g_captured = g_inspector->captureStackTrace(true);
+}
+
 v8_inspector::StringView View(const char* text) {
   return v8_inspector::StringView(
       reinterpret_cast<const uint8_t*>(text), strlen(text));
@@ -70,6 +89,12 @@ std::string Utf8(v8_inspector::StringView text) {
   if (!text.is8Bit()) return std::string();
   return std::string(reinterpret_cast<const char*>(text.characters8()),
                      text.length());
+}
+
+// The UTF-8 view of a string the sample owns; `StringView` does not own bytes.
+v8_inspector::StringView ViewOf(const std::string& text) {
+  return v8_inspector::StringView(
+      reinterpret_cast<const uint8_t*>(text.data()), text.size());
 }
 
 // A channel that records what the session sends.
@@ -293,6 +318,101 @@ const char* RunDemo(v8::Isolate* isolate, v8::Local<v8::Context> main_world,
   }
   printf("evaluated in the main world: globalThis.hit = %d\n",
          injected.value->Int32Value(main_world).FromMaybe(-1));
+
+  // The exception path: a trace is taken where the error value is created and
+  // reported when it reaches the host. `Runtime.enable` is what asks for the
+  // events; without it V8 reports nothing, and neither does this session.
+  session->dispatchProtocolMessage(View("{\"id\":7,\"method\":\"Runtime.enable\"}"));
+  if (!Contains(channel.TakeResponses(), 7, "\"result\"")) {
+    return "Runtime.enable answered nothing";
+  }
+  v8::Local<v8::FunctionTemplate> capture_template =
+      v8::FunctionTemplate::New(isolate, CaptureCallback);
+  v8::Local<v8::Function> capture;
+  if (!capture_template->GetFunction(main_world).ToLocal(&capture)) {
+    return "capture function";
+  }
+  v8::Local<v8::String> capture_name =
+      v8::String::NewFromUtf8Literal(isolate, "capture");
+  if (!main_world->Global()->Set(main_world, capture_name, capture).FromMaybe(
+          false)) {
+    return "install capture";
+  }
+  g_inspector = inspector.get();
+  {
+    v8::Context::Scope scope(main_world);
+    v8::Local<v8::String> source =
+        v8::String::NewFromUtf8Literal(isolate, kThrowingSource);
+    v8::Local<v8::String> name =
+        v8::String::NewFromUtf8Literal(isolate, "throwing.js");
+    v8::ScriptOrigin origin(name);
+    v8::Local<v8::Script> script;
+    if (!v8::Script::Compile(main_world, source, &origin).ToLocal(&script)) {
+      return "compile (throwing)";
+    }
+    v8::TryCatch try_catch(isolate);
+    v8::Local<v8::Value> value;
+    if (script->Run(main_world).ToLocal(&value)) {
+      return "the throwing script completed";
+    }
+    if (!try_catch.HasCaught()) return "the throw was not recorded";
+    std::string text;
+    int line = 0;
+    int column = 0;
+    v8::Local<v8::Message> message = try_catch.Message();
+    if (!message.IsEmpty()) {
+      v8::String::Utf8Value rendered(isolate, message->Get());
+      if (rendered) text = *rendered;
+      line = message->GetLineNumber(main_world).FromMaybe(0);
+      column = message->GetStartColumn(main_world).FromMaybe(0);
+    }
+    if (!g_captured || g_captured->isEmpty()) {
+      return "the trace was not captured where the frames were live";
+    }
+    printf("captured: %zu frames, top function '%s'\n",
+           g_captured->frames().size(),
+           Utf8(g_captured->topFunctionName()).c_str());
+
+    // `exceptionThrown` counts the column from zero (V8's `v8::Message`) and
+    // the ABI counts it from one, so the caller adds one.
+    const unsigned exception_id = inspector->exceptionThrown(
+        main_world, View("Uncaught"), try_catch.Exception(), ViewOf(text),
+        View("throwing.js"), static_cast<unsigned>(line),
+        static_cast<unsigned>(column + 1), std::move(g_captured), 0);
+    if (exception_id == 0) return "the exception was not reported";
+    bool reported = false;
+    for (const std::string& event : channel.TakeNotifications()) {
+      if (event.find("Runtime.exceptionThrown") == std::string::npos) continue;
+      printf("reported: %s\n", event.c_str());
+      if (event.find("\"exceptionId\":1") == std::string::npos) {
+        return "the report carried the wrong exception id";
+      }
+      if (event.find("boom") == std::string::npos) {
+        return "the report carried no message";
+      }
+      if (event.find("\"functionName\":\"inner\"") == std::string::npos) {
+        return "the report's stack does not start in the frame that captured it";
+      }
+      if (event.find("\"functionName\":\"outer\"") == std::string::npos) {
+        return "the report's stack is missing the caller";
+      }
+      if (event.find("\"scriptId\":\"3\"") == std::string::npos &&
+          event.find("\"url\":\"throwing.js\"") == std::string::npos) {
+        return "the report names no script for the throw";
+      }
+      reported = true;
+    }
+    if (!reported) return "no Runtime.exceptionThrown reached the channel";
+    inspector->exceptionRevoked(main_world, exception_id, View("a handler took it"));
+    bool revoked = false;
+    for (const std::string& event : channel.TakeNotifications()) {
+      if (event.find("Runtime.exceptionRevoked") != std::string::npos) {
+        printf("revoked: %s\n", event.c_str());
+        revoked = true;
+      }
+    }
+    if (!revoked) return "the revocation was not reported";
+  }
 
   // A stop inside one session's lifetime is the case the close has to clear.
   session->stop();

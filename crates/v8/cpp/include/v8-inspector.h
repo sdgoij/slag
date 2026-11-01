@@ -73,6 +73,37 @@ class StringBuffer {
   static std::unique_ptr<StringBuffer> create(StringView text);
 };
 
+/* One frame of a [`V8StackTrace`]: the views point into the trace that
+ * produced them, so they are valid while it lives. */
+struct V8StackFrame {
+  StringView sourceURL;
+  StringView functionName;
+  int lineNumber = 0;
+  int columnNumber = 0;
+  int scriptId = 0;
+};
+
+/* A stack captured where an error value was created. A frame is gone by the
+ * time the error reaches the embedder, so the host captures here and reports
+ * later (`V8Inspector::exceptionThrown`). */
+class V8StackTrace {
+ public:
+  virtual ~V8StackTrace();
+  virtual bool isEmpty() const = 0;
+  virtual StringView topSourceURL() const = 0;
+  virtual int topLineNumber() const = 0;
+  virtual int topColumnNumber() const = 0;
+  virtual int topScriptId() const = 0;
+  virtual StringView topFunctionName() const = 0;
+  virtual StringView firstNonEmptySourceURL() const = 0;
+  virtual std::vector<V8StackFrame> frames() const = 0;
+  /* A copy, for a host that keeps one of its own (`SourceLocation::Clone`).
+   * The async chain V8 would drop here does not exist in this engine. */
+  virtual std::unique_ptr<V8StackTrace> clone() = 0;
+  /* The `Error.stack` rendering: one `    at ...` line per frame. */
+  virtual std::unique_ptr<StringBuffer> toString() const = 0;
+};
+
 /* How a context joins an inspector: the embedder's group id (Chromium groups
  * by frame) and the names the client shows for it. */
 class V8ContextInfo {
@@ -162,6 +193,31 @@ class V8Inspector {
   virtual void contextDestroyed(v8::Local<v8::Context> context) = 0;
   /* Every context of the group is gone. */
   virtual void resetContextGroup(int contextGroupId) = 0;
+
+  /* Capture the running stack, which is what a host does where it creates an
+   * error value. `fullStack` caps the capture (200 frames against 10); V8 also
+   * stops a short capture at its API boundary, and this engine's frames carry
+   * that flag but the ABI does not expose it yet, so the difference here is the
+   * frame count. Answers null when no context is entered. */
+  virtual std::unique_ptr<V8StackTrace> captureStackTrace(bool fullStack) = 0;
+
+  /* Report an uncaught exception: the `Runtime.exceptionThrown` event, and the
+   * id `exceptionRevoked` names back. Answers 0 when no client is connected or
+   * none enabled `Runtime`, which is the protocol's own rule.
+   *
+   * `scriptId` is V8's own script numbering, which this facade does not mint: a
+   * session resolves the script from the URL the host compiled it under. */
+  virtual unsigned exceptionThrown(v8::Local<v8::Context> context,
+                                   StringView message,
+                                   v8::Local<v8::Value> exception,
+                                   StringView detailedMessage, StringView url,
+                                   unsigned lineNumber, unsigned columnNumber,
+                                   std::unique_ptr<V8StackTrace> stackTrace,
+                                   int scriptId) = 0;
+
+  /* The error is no longer uncaught (a handler took it). */
+  virtual void exceptionRevoked(v8::Local<v8::Context> context,
+                                unsigned exceptionId, StringView message) = 0;
 
   /* Where a session's messages go: `sendResponse` for the answer to a command,
    * `sendNotification` for an event. The channel outlives the session. */

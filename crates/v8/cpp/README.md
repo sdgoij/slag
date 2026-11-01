@@ -134,7 +134,10 @@ session with a channel, and from then on speaks the Chrome DevTools Protocol.
 `inspector.exe` runs that path end to end over a frame's two worlds: two
 contexts in one group, the same URL compiled in both, one breakpoint resolving
 to two locations, a stop in each world naming its own script, and
-`evaluateOnCallFrame` answering in the world that stopped.
+`evaluateOnCallFrame` answering in the world that stopped. It then takes the
+exception path: a host function captures the stack while the frames are still
+live, the script throws, and the capture becomes `Runtime.exceptionThrown` with
+one call frame per activation.
 
 ```c++
 v8_inspector::V8ContextInfo info(context, group, View("app"));
@@ -168,6 +171,21 @@ host polls the session, and the resume happens inside
 `dispatchProtocolMessage`; a resumed run therefore completes there, and the
 value it completes with is not `Script::Run`'s. `pollEvents` and `resume` are
 this facade's own methods, not V8's, and exist for exactly that reason.
+- **A stack is data, captured where the error value is made.** `captureStackTrace`
+reads the running stack, through the callback's own window when a host function
+is on it (the engine is borrowed by the run there), and `exceptionThrown` turns
+that capture into `Runtime.exceptionThrown`: the message, the script the session
+resolved from the URL, and one `CallFrame` per frame. `exceptionRevoked`
+withdraws one a handler took. Frames carry a URL because a compiled script now
+keeps the `ScriptOrigin` name the host gave it, which is also what
+`v8::StackFrame::GetScriptName` and `Error.stack` answer.
+- **`Runtime.enable` is what asks for exceptions.** Without it the session
+reports none, which is the protocol's rule and keeps a debugger from collecting
+every uncaught error in a page that never asked for them.
+- **`toString` renders, `buildInspectorObject` does not exist.** A trace can
+print itself (`    at f (app.js:3:5)`, what `Error.stack` and Blink's trace
+writer want); the protocol-shaped form it would also offer is a generated type,
+so it is absent with the rest of the generated tree.
 - **A channel callback must not re-enter the session.** The callbacks run inside
 the session's own call, where its state is borrowed, so `dispatchProtocolMessage`
 called from `sendNotification` is refused. Record the message and dispatch after

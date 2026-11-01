@@ -287,6 +287,43 @@ int32_t slag_inspector_dispatch(SlagInspector* inspector, const uint8_t* message
 int32_t slag_inspector_poll(SlagInspector* inspector, SlagMessages* out);
 /* Free the messages a call answered, and the array that listed them. */
 void slag_messages_free(SlagMessages* messages);
+/* One frame of a reported stack: the function name and the script's URL or name
+ * as UTF-8 spans borrowed for the call, and the 1-based position. */
+typedef struct SlagExceptionFrame {
+  const uint8_t* function_name;
+  size_t function_name_len;
+  const uint8_t* url;
+  size_t url_len;
+  uint32_t line;
+  uint32_t column;
+} SlagExceptionFrame;
+
+/* An uncaught exception a host reports (`V8Inspector::exceptionThrown`).
+ * `is_error` is 1 when the thrown value is an error object, and `frames` is the
+ * stack the host captured where the value was created, innermost first. */
+typedef struct SlagException {
+  const uint8_t* message;
+  size_t message_len;
+  const uint8_t* url;
+  size_t url_len;
+  uint32_t line;
+  uint32_t column;
+  int32_t is_error;
+  const SlagExceptionFrame* frames;
+  size_t frame_count;
+} SlagException;
+
+/* Report an uncaught exception, answering through `out_id` the id that names it
+ * (0 when no client enabled `Runtime`) and through `out` the events that client
+ * is owed. */
+int32_t slag_inspector_exception(SlagInspector* inspector,
+                                 const SlagException* report, uint32_t* out_id,
+                                 SlagMessages* out);
+/* Withdraw an exception a handler took (`V8Inspector::exceptionRevoked`). */
+int32_t slag_inspector_exception_revoked(SlagInspector* inspector,
+                                         uint32_t exception_id,
+                                         const uint8_t* reason, size_t reason_len,
+                                         SlagMessages* out);
 /* Evaluate `source` in `context` (`V8InspectorSession::evaluate`): how a host
  * injects what it installs for the command line. */
 int32_t slag_inspector_evaluate(SlagInspector* inspector, SlagContext* context,

@@ -88,6 +88,36 @@ struct Announced {
     target: u32,
 }
 
+/// One uncaught exception, as the engine and the host know it. The engine
+/// records the thrown value and where it happened; the stack is the host's,
+/// because a host captures it where the value is created (a frame is gone by
+/// the time the error reaches it).
+pub struct ExceptionReport<'a> {
+    /// The text the client shows: the host's message for the thrown value.
+    pub message: &'a str,
+    /// The script's URL or name, as the host names it.
+    pub url: &'a str,
+    /// The position this report names, with the 1-based line and column that
+    /// `v8::Message` answers; the protocol counts both from zero.
+    pub line: u32,
+    pub column: u32,
+    /// Whether the thrown value is an error object, which is what the
+    /// protocol's `subtype` distinguishes.
+    pub is_error: bool,
+    /// The frames of the stack captured where the value was created, innermost
+    /// first.
+    pub frames: &'a [ExceptionFrame<'a>],
+}
+
+/// One frame of an [`ExceptionReport`].
+pub struct ExceptionFrame<'a> {
+    pub function_name: &'a str,
+    pub url: &'a str,
+    /// 1-based, or 0 for "no position".
+    pub line: u32,
+    pub column: u32,
+}
+
 /// The index of the target `id` names.
 fn target_index(targets: &[Target<'_>], id: u32) -> Option<usize> {
     targets.iter().position(|target| target.id == id)
@@ -106,7 +136,14 @@ pub struct Session {
     scripts: Vec<Script>,
     breakpoints: HashMap<String, Breakpoint>,
     next_breakpoint: u64,
+    /// The `Debugger` domain is enabled.
     enabled: bool,
+    /// The `Runtime` domain is enabled. An exception event belongs to a client
+    /// that asked for it, which is the same rule the `Debugger` events follow.
+    runtime: bool,
+    /// The id the next exception report is named by, so `exceptionRevoked` can
+    /// name the same one back.
+    next_exception: u32,
     /// The stop that has been announced and not resumed. Two contexts can each
     /// have a parked run; a client drives one stop at a time, so the announced
     /// one is the target every frame-bound command applies to.
@@ -126,6 +163,8 @@ impl Session {
             breakpoints: HashMap::new(),
             next_breakpoint: 0,
             enabled: false,
+            runtime: false,
+            next_exception: 0,
             paused: None,
         }
     }
@@ -197,6 +236,7 @@ impl Session {
         matches!(
             method,
             "Runtime.enable"
+                | "Runtime.disable"
                 | "Runtime.getProperties"
                 | "Runtime.releaseObject"
                 | "Runtime.releaseObjectGroup"
@@ -279,7 +319,7 @@ impl Session {
             slag::PauseReason::Step => "step",
         };
         let hit = self.breakpoints_hit_at(id, offset);
-        let call_frames = self.call_frames(context, stopped_script, line, column);
+        let call_frames = self.call_frames(id, context, stopped_script, line, column);
         self.paused = Some(Announced { target: id });
         let mut params = json!({
             "callFrames": call_frames,
@@ -347,13 +387,20 @@ impl Session {
 
     /// The parked activations as protocol call frames, innermost first.
     ///
-    /// The engine reports each frame's own function name and site, so the
-    /// caller frames point at the call the stop interrupted. A frame belongs to
-    /// the script the engine names, else to the script the stop resolved in:
-    /// the engine's breakpoints are agent-wide, so a session is one script at a
-    /// time (see `Agent::set_breakpoints`), which makes that fallback exact
-    /// until the facade grows a per-script identity.
-    fn call_frames(&self, context: &Context, script: u32, line: u32, column: u32) -> Json {
+    /// The engine reports each frame's own function name, script name and site,
+    /// so the caller frames point at the call the stop interrupted. A frame
+    /// belongs to a script of the *stopped target*: two worlds can run the same
+    /// URL, and a frame must name the one it is in. A frame the session has no
+    /// script for answers the script the stop resolved in, which is the script
+    /// the run is executing.
+    fn call_frames(
+        &self,
+        target: u32,
+        context: &Context,
+        script: u32,
+        line: u32,
+        column: u32,
+    ) -> Json {
         let frames = context.agent().paused_frames();
         if frames.is_empty() {
             return json!([{
@@ -375,7 +422,11 @@ impl Session {
                 let script_id = frame
                     .script_name
                     .as_ref()
-                    .and_then(|name| self.scripts.iter().find(|script| &script.url == name))
+                    .and_then(|name| {
+                        self.scripts
+                            .iter()
+                            .find(|script| script.context == target && &script.url == name)
+                    })
                     .map_or(script, |script| script.id);
                 // The engine reports each frame's own site, in the source text
                 // its spans index, so no point lookup is needed here. A frame
@@ -562,7 +613,14 @@ impl Session {
         params: &Json,
     ) -> Result<(Json, Vec<String>), DispatchError> {
         match method {
-            "Runtime.enable" => Ok((json!({}), Vec::new())),
+            "Runtime.enable" => {
+                self.runtime = true;
+                Ok((json!({}), Vec::new()))
+            }
+            "Runtime.disable" => {
+                self.runtime = false;
+                Ok((json!({}), Vec::new()))
+            }
             "Runtime.getProperties" => {
                 let Some(index) = self.stopped_index(targets) else {
                     return Err(DispatchError::Protocol("no run is halted".into()));
@@ -791,6 +849,79 @@ impl Session {
         format!("1:{}:0", self.next_breakpoint)
     }
 
+    /// The `Runtime.exceptionThrown` event for a report, with the id that names
+    /// it to `exceptionRevoked`. `None` when the client did not enable
+    /// `Runtime`: V8 reports an uncaught error only to a client that asked.
+    pub fn exception(&mut self, report: &ExceptionReport<'_>) -> Option<(u32, Vec<String>)> {
+        if !self.runtime {
+            return None;
+        }
+        self.next_exception += 1;
+        let exception_id = self.next_exception;
+        let mut details = json!({
+            "exceptionId": exception_id,
+            "text": report.message,
+            // The protocol counts lines and columns from zero; the host counts
+            // them from one, as `v8::Message` does.
+            "lineNumber": report.line.saturating_sub(1),
+            "columnNumber": report.column.saturating_sub(1),
+            "url": report.url,
+            "exception": if report.is_error {
+                json!({"type": "object", "subtype": "error", "description": report.message})
+            } else {
+                json!({"type": "object", "description": report.message})
+            },
+        });
+        if let Some(script) = self.scripts.iter().find(|script| script.url == report.url) {
+            details["scriptId"] = json!(script.id.to_string());
+        }
+        if !report.frames.is_empty() {
+            let frames: Vec<Json> = report
+                .frames
+                .iter()
+                .map(|frame| {
+                    // A frame's `scriptId` is the group's id for the script the
+                    // frame runs, which is what connects it to `scriptParsed`.
+                    let script_id = self
+                        .scripts
+                        .iter()
+                        .find(|script| script.url == frame.url)
+                        .map_or_else(String::new, |script| script.id.to_string());
+                    json!({
+                        "functionName": frame.function_name,
+                        "scriptId": script_id,
+                        "url": frame.url,
+                        "lineNumber": frame.line.saturating_sub(1),
+                        "columnNumber": frame.column.saturating_sub(1),
+                    })
+                })
+                .collect();
+            details["stackTrace"] = json!({ "callFrames": frames });
+        }
+        Some((
+            exception_id,
+            vec![event(
+                "Runtime.exceptionThrown",
+                json!({
+                    "timestamp": timestamp_ms(),
+                    "exceptionDetails": details,
+                }),
+            )],
+        ))
+    }
+
+    /// `Runtime.exceptionRevoked`: the error a host reported is no longer
+    /// uncaught (a `catch` or an `unhandledrejection` handler took it).
+    pub fn revoke_exception(&mut self, exception_id: u32, reason: &str) -> Vec<String> {
+        if !self.runtime {
+            return Vec::new();
+        }
+        vec![event(
+            "Runtime.exceptionRevoked",
+            json!({ "exceptionId": exception_id, "reason": reason }),
+        )]
+    }
+
     /// The script and 0-based position a stop's offset belongs to in the target
     /// `target`: the breakpoint at that offset if there is one, else the first
     /// script of that target that carries a point there.
@@ -949,6 +1080,13 @@ fn error(id: Option<Json>, code: i64, message: &str) -> String {
 
 fn event(method: &str, params: Json) -> String {
     json!({ "method": method, "params": params }).to_string()
+}
+
+/// The wall-clock time the protocol's `timestamp` carries, in milliseconds.
+fn timestamp_ms() -> f64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0.0, |elapsed| elapsed.as_secs_f64() * 1000.0)
 }
 
 /// The source offset of a 0-based line and column. Lines and columns are counted
@@ -1499,5 +1637,86 @@ mod tests {
             "a step in one world must not stop another"
         );
         assert!(session.poll_group(&mut targets).is_empty());
+    }
+
+    fn error_report<'a>(frames: &'a [ExceptionFrame<'a>]) -> ExceptionReport<'a> {
+        ExceptionReport {
+            message: "Uncaught Error: boom",
+            url: "app.js",
+            line: 2,
+            column: 3,
+            is_error: true,
+            frames,
+        }
+    }
+
+    #[test]
+    fn an_exception_report_names_the_script_and_its_frames() {
+        let (mut context, mut session) = session();
+        session.add_script(&context, "app.js", SOURCE).unwrap();
+        session.dispatch(&mut context, r#"{"id":2,"method":"Runtime.enable"}"#);
+        let frames = [
+            ExceptionFrame {
+                function_name: "inner",
+                url: "app.js",
+                line: 3,
+                column: 5,
+            },
+            ExceptionFrame {
+                function_name: "",
+                url: "other.js",
+                line: 1,
+                column: 1,
+            },
+        ];
+        let (id, events) = session.exception(&error_report(&frames)).expect("enabled");
+        assert_eq!(id, 1);
+        assert_eq!(events.len(), 1);
+        let thrown: Json = serde_json::from_str(&events[0]).unwrap();
+        assert_eq!(thrown["method"], "Runtime.exceptionThrown");
+        assert!(thrown["params"]["timestamp"].is_number());
+        let details = &thrown["params"]["exceptionDetails"];
+        assert_eq!(details["exceptionId"], 1);
+        assert_eq!(details["text"], "Uncaught Error: boom");
+        assert_eq!(details["lineNumber"], 1, "the protocol counts from zero");
+        assert_eq!(details["columnNumber"], 2);
+        assert_eq!(
+            details["scriptId"], "1",
+            "the registry's id for the URL: {thrown}"
+        );
+        assert_eq!(details["exception"]["subtype"], "error");
+        let calls = details["stackTrace"]["callFrames"].as_array().unwrap();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0]["functionName"], "inner");
+        assert_eq!(calls[0]["scriptId"], "1");
+        assert_eq!(calls[0]["lineNumber"], 2);
+        assert_eq!(
+            calls[1]["scriptId"], "",
+            "a frame in a script the session never saw names no id"
+        );
+    }
+
+    #[test]
+    fn an_exception_is_reported_only_to_a_client_that_enabled_runtime() {
+        let (_context, mut session) = session();
+        let frames: [ExceptionFrame<'_>; 0] = [];
+        assert!(
+            session.exception(&error_report(&frames)).is_none(),
+            "Debugger.enable alone must not start a stream of exceptions"
+        );
+        assert!(session.revoke_exception(1, "handled").is_empty());
+    }
+
+    #[test]
+    fn a_revoked_exception_names_the_report_it_withdraws() {
+        let (mut context, mut session) = session();
+        session.dispatch(&mut context, r#"{"id":2,"method":"Runtime.enable"}"#);
+        let frames: [ExceptionFrame<'_>; 0] = [];
+        let (id, _) = session.exception(&error_report(&frames)).expect("enabled");
+        let events = session.revoke_exception(id, "a handler took it");
+        let revoked: Json = serde_json::from_str(&events[0]).unwrap();
+        assert_eq!(revoked["method"], "Runtime.exceptionRevoked");
+        assert_eq!(revoked["params"]["exceptionId"], id);
+        assert_eq!(revoked["params"]["reason"], "a handler took it");
     }
 }

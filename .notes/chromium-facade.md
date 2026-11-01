@@ -1498,7 +1498,10 @@ What is missing, in the order it blocks A5:
    `Debugger.SearchMatch`, `Debugger.Paused`).
 3. **The client callbacks** `V8StackTrace`, `exceptionThrown`, the console
    family, `deepSerialize`/`valueSubtype`/`descriptionForValueSubtype`,
-   `isInspectableHeapObject`.
+   `isInspectableHeapObject`. The first two landed on 2026-11-01 (below); the
+   console family is Blink's own message store, and what it needs from this side
+   is only that a console call can carry a `v8::Message` and a stack, which is
+   `Isolate::AddMessageListener` plus the same capture.
 4. **The pause loop's ownership.** V8 calls `runMessageLoopOnPause` from inside
    the run and the resumed run's completion still reaches `Script::Run`; here
    the resume happens inside `dispatchProtocolMessage`, so the completion value
@@ -1561,6 +1564,35 @@ hosts that reference it and is not pulled into the ones that do not.
 One trap worth keeping: a `Channel` callback runs inside the session's own
 call, where its state is borrowed, so `dispatchProtocolMessage` from
 `sendNotification` is refused. Record and dispatch after the call returns.
+
+**2026-11-01, stacks as data and `Runtime.exceptionThrown`.** Slices 2 and 3 of
+this section are in, and the second one needed a small engine change that was
+worth making on its own terms.
+
+- `V8StackTrace` / `V8StackFrame` exist with `captureStackTrace(bool)`. The
+  capture reads the running stack, and inside a host function it goes through
+  that call's window (`slag_callback_token`) because the run holds the engine:
+  the naive `slag_stack_frame` answers nothing there, which looked like an empty
+  capture until the window path was used. `fullStack` is a frame-count cap (10
+  against 200); V8 also stops a short capture at its API boundary and the ABI
+  does not expose the engine's `is_user_javascript` flag yet.
+- `exceptionThrown` / `exceptionRevoked` produce `Runtime.exceptionThrown` and
+  `Runtime.exceptionRevoked` through the group's session, which only reports
+  them when `Runtime.enable` was asked for. `exceptionThrown` returns the id the
+  revocation names back, and 0 when no client is listening.
+- **A classic script now keeps the name its host compiled it under.**
+  `ScriptRecord::name` existed and `Agent::run_script_named` existed, but
+  `Context::compile_script` never passed one, so every frame of a classic script
+  answered no URL: `v8::StackFrame::GetScriptName`, `Error.stack` and the
+  inspector's `CallFrame.url` were all empty. `compile_script_named` threads it
+  through `CompiledScript`, and `slag_compile` already had the name. One
+  protocol bug fell out of that: the frame script lookup matched by URL across
+  the whole group, so two worlds running the same URL named the first script;
+  it now resolves within the stopped target.
+- Still missing for the full header: `buildInspectorObject` (a generated
+  `protocol::Runtime::API::StackTrace`), `isTopScriptOpaque`, and the console and
+  async-task callbacks. `V8StackTraceId` (the cross-debugger async chain) has no
+  engine machinery behind it at all.
 
 ### 14.4 Pause and step: the protocol the compiled tiers have to agree to
 

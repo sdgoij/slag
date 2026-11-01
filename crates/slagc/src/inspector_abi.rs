@@ -119,6 +119,37 @@ pub struct SlagInspector {
     group: Rc<Group>,
 }
 
+/// One frame of a reported stack, borrowed for the call.
+#[repr(C)]
+pub struct SlagExceptionFrame {
+    pub function_name: *const u8,
+    pub function_name_len: usize,
+    pub url: *const u8,
+    pub url_len: usize,
+    /// 1-based, or 0 for "no position".
+    pub line: u32,
+    pub column: u32,
+}
+
+/// An uncaught exception a host is reporting
+/// (`V8Inspector::exceptionThrown`). The engine knows the thrown value and
+/// where it happened; the frames are the host's, because a host captures the
+/// stack where the value is created, before it unwinds.
+#[repr(C)]
+pub struct SlagException {
+    pub message: *const u8,
+    pub message_len: usize,
+    pub url: *const u8,
+    pub url_len: usize,
+    /// 1-based, or 0 for "no position".
+    pub line: u32,
+    pub column: u32,
+    /// 1 when the thrown value is an error object.
+    pub is_error: i32,
+    pub frames: *const SlagExceptionFrame,
+    pub frame_count: usize,
+}
+
 /// Hand `messages` to the caller through `out`, each as its own owned span.
 ///
 /// # Safety
@@ -424,6 +455,107 @@ pub unsafe extern "C" fn slag_inspector_dispatch(
     else {
         return 1;
     };
+    drop(guard);
+    answer(out, messages);
+    0
+}
+
+/// Report an uncaught exception (`V8Inspector::exceptionThrown`), answering the
+/// id that names it through `out_id` and the events a `Runtime` client is owed.
+/// The id is 0 when no client enabled `Runtime`, which is the protocol's own
+/// rule: an exception stream belongs to a client that asked for it.
+///
+/// Answers 0 on success, 1 with a pending error, and 2 for a bad handle.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn slag_inspector_exception(
+    inspector: *mut SlagInspector,
+    report: *const SlagException,
+    out_id: *mut u32,
+    out: *mut SlagMessages,
+) -> i32 {
+    let Some(inspector) = inspector.as_ref() else {
+        return 2;
+    };
+    let Some(report) = report.as_ref() else {
+        return 2;
+    };
+    let Ok(message) = text(report.message, report.message_len) else {
+        return 2;
+    };
+    let Ok(url) = text(report.url, report.url_len) else {
+        return 2;
+    };
+    let spans: &[SlagExceptionFrame] = if report.frames.is_null() || report.frame_count == 0 {
+        &[]
+    } else {
+        std::slice::from_raw_parts(report.frames, report.frame_count)
+    };
+    let mut frames = Vec::with_capacity(spans.len());
+    for span in spans {
+        let Ok(function_name) = text(span.function_name, span.function_name_len) else {
+            return 2;
+        };
+        let Ok(frame_url) = text(span.url, span.url_len) else {
+            return 2;
+        };
+        frames.push(inspector::ExceptionFrame {
+            function_name,
+            url: frame_url,
+            line: span.line,
+            column: span.column,
+        });
+    }
+    let group = &inspector.group;
+    let Ok(mut guard) = group.session.try_borrow_mut() else {
+        refuse_reentry(group);
+        return 1;
+    };
+    let Some(session) = guard.as_mut() else {
+        return 2;
+    };
+    let reported = session.exception(&inspector::ExceptionReport {
+        message,
+        url,
+        line: report.line,
+        column: report.column,
+        is_error: report.is_error != 0,
+        frames: &frames,
+    });
+    let (exception_id, messages) = reported.unwrap_or((0, Vec::new()));
+    drop(guard);
+    if let Some(out_id) = out_id.as_mut() {
+        *out_id = exception_id;
+    }
+    answer(out, messages);
+    0
+}
+
+/// Withdraw an exception a host reported (`V8Inspector::exceptionRevoked`): a
+/// handler took it, so it is no longer uncaught. Answers the events a `Runtime`
+/// client is owed through `out`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn slag_inspector_exception_revoked(
+    inspector: *mut SlagInspector,
+    exception_id: u32,
+    reason: *const u8,
+    reason_len: usize,
+    out: *mut SlagMessages,
+) -> i32 {
+    let Some(inspector) = inspector.as_ref() else {
+        return 2;
+    };
+    let Ok(reason) = text(reason, reason_len) else {
+        return 2;
+    };
+    let group = &inspector.group;
+    let Ok(mut guard) = group.session.try_borrow_mut() else {
+        refuse_reentry(group);
+        return 1;
+    };
+    let Some(session) = guard.as_mut() else {
+        return 2;
+    };
+    let messages = session.revoke_exception(exception_id, reason);
     drop(guard);
     answer(out, messages);
     0

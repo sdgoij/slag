@@ -23,11 +23,12 @@ mod handler;
 mod inspector_abi;
 
 pub use inspector_abi::{
-    SlagInspector, SlagMessages, SlagProtocolMessage, slag_inspector_add_context,
-    slag_inspector_add_script, slag_inspector_call_id, slag_inspector_can_dispatch,
-    slag_inspector_close, slag_inspector_dispatch, slag_inspector_evaluate, slag_inspector_free,
-    slag_inspector_new, slag_inspector_open, slag_inspector_poll, slag_inspector_remove_context,
-    slag_inspector_resume, slag_messages_free,
+    SlagException, SlagExceptionFrame, SlagInspector, SlagMessages, SlagProtocolMessage,
+    slag_inspector_add_context, slag_inspector_add_script, slag_inspector_call_id,
+    slag_inspector_can_dispatch, slag_inspector_close, slag_inspector_dispatch,
+    slag_inspector_evaluate, slag_inspector_exception, slag_inspector_exception_revoked,
+    slag_inspector_free, slag_inspector_new, slag_inspector_open, slag_inspector_poll,
+    slag_inspector_remove_context, slag_inspector_resume, slag_messages_free,
 };
 
 use handler::CxxHandler;
@@ -1189,7 +1190,7 @@ pub unsafe extern "C" fn slag_compile(
         reentrant(context);
         return 1;
     };
-    match engine.compile_script(source) {
+    match engine.compile_script_named(source, Some(name)) {
         Ok(script) => {
             // Under a session a compile is what announces the script: V8 reports
             // `Debugger.scriptParsed` here, and the registry's ids and URLs are
@@ -5671,6 +5672,48 @@ mod tests {
             slag_script_free(script);
             slag_script_free(world_script);
             slag_context_free(main);
+            slag_isolate_free(isolate);
+        }
+    }
+
+    #[test]
+    fn a_compiled_script_keeps_the_name_it_was_compiled_under() {
+        unsafe {
+            let isolate = slag_isolate_new();
+            let context = slag_context_new(isolate);
+            let source: &[u8] = b"function f() { throw new Error('boom'); }\nf();";
+            let name: &[u8] = b"named.js";
+            let mut script = std::ptr::null_mut();
+            assert_eq!(
+                slag_compile(
+                    context,
+                    source.as_ptr(),
+                    source.len(),
+                    name.as_ptr(),
+                    name.len(),
+                    &mut script,
+                ),
+                0
+            );
+            let mut value = 0;
+            assert_eq!(
+                slag_script_run(context, script, &mut value),
+                1,
+                "the script throws"
+            );
+            let mut buffer = [0 as c_char; 512];
+            let len = slag_pending_stack(context, buffer.as_mut_ptr(), buffer.len());
+            assert!(len > 0, "the error carries a stack");
+            let text = std::ffi::CStr::from_ptr(buffer.as_ptr())
+                .to_str()
+                .expect("utf-8");
+            assert!(
+                text.contains("named.js"),
+                "the frame names the script it runs: {text}"
+            );
+
+            slag_script_free(script);
+            slag_context_free(context);
             slag_isolate_free(isolate);
         }
     }

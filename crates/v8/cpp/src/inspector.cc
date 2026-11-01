@@ -73,6 +73,117 @@ inline v8::Context* ContextOf(v8::Local<v8::Context> handle) {
   return reinterpret_cast<v8::Context*>(static_cast<uintptr_t>(handle.raw()));
 }
 
+StringView ViewOf(const std::string& text) {
+  return StringView(reinterpret_cast<const uint8_t*>(text.data()), text.size());
+}
+
+/* The UTF-8 text a tagged engine string answers, empty for "no string". */
+std::string Utf8OfValue(uint64_t bits) {
+  if (bits == 0) return std::string();
+  const int64_t length = slag_value_to_utf8(bits, nullptr, 0);
+  if (length <= 0) return std::string();
+  std::string text(static_cast<size_t>(length) + 1, '\0');
+  slag_value_to_utf8(bits, text.data(), text.size());
+  text.resize(static_cast<size_t>(length));
+  return text;
+}
+
+/* One captured frame, owning its strings: `V8StackFrame` reports views into
+ * them, so the trace has to keep them. */
+struct TraceFrame {
+  std::string function_name;
+  std::string url;
+  int line = 0;
+  int column = 0;
+  int script_id = 0;
+};
+
+class V8StackTraceImpl final : public V8StackTrace {
+ public:
+  explicit V8StackTraceImpl(std::vector<TraceFrame> frames)
+      : frames_(std::move(frames)) {}
+
+  bool isEmpty() const override { return frames_.empty(); }
+
+  StringView topSourceURL() const override {
+    return frames_.empty() ? StringView() : ViewOf(frames_.front().url);
+  }
+
+  int topLineNumber() const override {
+    return frames_.empty() ? 0 : frames_.front().line;
+  }
+
+  int topColumnNumber() const override {
+    return frames_.empty() ? 0 : frames_.front().column;
+  }
+
+  int topScriptId() const override {
+    return frames_.empty() ? 0 : frames_.front().script_id;
+  }
+
+  StringView topFunctionName() const override {
+    return frames_.empty() ? StringView() : ViewOf(frames_.front().function_name);
+  }
+
+  StringView firstNonEmptySourceURL() const override {
+    for (const TraceFrame& frame : frames_) {
+      if (!frame.url.empty()) return ViewOf(frame.url);
+    }
+    return StringView();
+  }
+
+  std::vector<V8StackFrame> frames() const override {
+    std::vector<V8StackFrame> out;
+    out.reserve(frames_.size());
+    for (const TraceFrame& frame : frames_) {
+      V8StackFrame view;
+      view.sourceURL = ViewOf(frame.url);
+      view.functionName = ViewOf(frame.function_name);
+      view.lineNumber = frame.line;
+      view.columnNumber = frame.column;
+      view.scriptId = frame.script_id;
+      out.push_back(view);
+    }
+    return out;
+  }
+
+  std::unique_ptr<V8StackTrace> clone() override {
+    return std::make_unique<V8StackTraceImpl>(frames_);
+  }
+
+  std::unique_ptr<StringBuffer> toString() const override {
+    std::string out;
+    for (const TraceFrame& frame : frames_) {
+      out += "    at ";
+      if (!frame.function_name.empty()) {
+        out += frame.function_name;
+        if (!frame.url.empty()) {
+          out += " (";
+          out += frame.url;
+          out += ':';
+          out += std::to_string(frame.line);
+          out += ':';
+          out += std::to_string(frame.column);
+          out += ')';
+        }
+      } else if (!frame.url.empty()) {
+        out += frame.url;
+        out += ':';
+        out += std::to_string(frame.line);
+        out += ':';
+        out += std::to_string(frame.column);
+      } else {
+        out += "<anonymous>";
+      }
+      out += '\n';
+    }
+    return StringBuffer::create(ViewOf(out));
+  }
+
+ private:
+  std::vector<TraceFrame> frames_;
+};
+
 class InspectorImpl;
 
 /* One context group: the engine session that debugs it and the contexts that
@@ -98,6 +209,10 @@ class InspectorSessionImpl final : public V8InspectorSession {
   EvaluateResult evaluate(v8::Local<v8::Context> context, StringView expression,
                           bool includeCommandLineAPI) override;
   void pollEvents() override;
+
+  /* Send messages the inspector produced outside a dispatch (an exception
+   * event) to the channel, taking the list. */
+  void Notify(SlagMessages messages);
 
   int context_group_id() const { return context_group_id_; }
 
@@ -194,7 +309,36 @@ class InspectorImpl final : public V8Inspector {
     if (found != groups_.end()) found->second.connected = false;
   }
 
+  std::unique_ptr<V8StackTrace> captureStackTrace(bool fullStack) override;
+  unsigned exceptionThrown(v8::Local<v8::Context> context, StringView message,
+                           v8::Local<v8::Value> exception,
+                           StringView detailedMessage, StringView url,
+                           unsigned lineNumber, unsigned columnNumber,
+                           std::unique_ptr<V8StackTrace> stackTrace,
+                           int scriptId) override;
+  void exceptionRevoked(v8::Local<v8::Context> context, unsigned exceptionId,
+                        StringView message) override;
+
  private:
+  /* The group a context belongs to, and its state, or a null state. */
+  GroupState* GroupOf(v8::Context* context, int* context_group_id) {
+    for (auto& entry : groups_) {
+      for (v8::Context* member : entry.second.contexts) {
+        if (member != context) continue;
+        *context_group_id = entry.first;
+        return &entry.second;
+      }
+    }
+    return nullptr;
+  }
+
+  /* The live client session of a group, or null. */
+  InspectorSessionImpl* SessionFor(int context_group_id) {
+    for (InspectorSessionImpl* session : sessions_) {
+      if (session->context_group_id() == context_group_id) return session;
+    }
+    return nullptr;
+  }
   v8::Isolate* isolate_;
   V8InspectorClient* client_;
   std::map<int, GroupState> groups_;
@@ -252,6 +396,11 @@ void InspectorSessionImpl::stop() {
   owner_->SessionStopped(context_group_id_);
 }
 
+void InspectorSessionImpl::Notify(SlagMessages messages) {
+  Deliver(messages, -1, /*answers_a_command=*/false);
+  slag_messages_free(&messages);
+}
+
 void InspectorSessionImpl::resume(bool /*setTerminateOnResume*/) {
   if (slag_ == nullptr) return;
   SlagMessages messages{};
@@ -293,6 +442,124 @@ V8InspectorSession::EvaluateResult InspectorSessionImpl::evaluate(
   return result;
 }
 
+std::unique_ptr<V8StackTrace> InspectorImpl::captureStackTrace(bool fullStack) {
+  v8::Isolate* isolate = v8::Isolate::GetCurrent();
+  if (isolate == nullptr) return nullptr;
+  v8::Context* context = ContextOf(isolate->GetCurrentContext());
+  if (context == nullptr) return nullptr;
+  // Inside a host callback the engine is borrowed by the run, so the stack is
+  // read through that call's own window; anywhere else the context reads it.
+  const void* window = slag_callback_token();
+  const auto frame_count = [&]() {
+    return window != nullptr
+               ? slag_callback_stack_frame_count(context->slag(), window)
+               : slag_stack_frame_count(context->slag());
+  };
+  const auto frame_at = [&](size_t index, SlagStackFrame* out) {
+    return window != nullptr
+               ? slag_callback_stack_frame(context->slag(), window, index, out)
+               : slag_stack_frame(context->slag(), index, out);
+  };
+  const int32_t available = frame_count();
+  // V8 stops a short capture at its API boundary; the engine's frames carry
+  // that flag but the ABI does not expose it, so the difference here is the
+  // frame count.
+  const int32_t limit = fullStack ? 200 : 10;
+  std::vector<TraceFrame> frames;
+  frames.reserve(static_cast<size_t>(available < limit ? available : limit));
+  for (int32_t index = 0;
+       index < available && static_cast<int32_t>(frames.size()) < limit;
+       ++index) {
+    SlagStackFrame frame{};
+    if (frame_at(static_cast<size_t>(index), &frame) != 0) break;
+    frames.push_back(TraceFrame{Utf8OfValue(frame.function_name),
+                                Utf8OfValue(frame.script_name), frame.line,
+                                frame.column,
+                                static_cast<int>(frame.script_id)});
+  }
+  return std::make_unique<V8StackTraceImpl>(std::move(frames));
+}
+
+unsigned InspectorImpl::exceptionThrown(
+    v8::Local<v8::Context> handle, StringView /*message*/,
+    v8::Local<v8::Value> exception, StringView detailedMessage, StringView url,
+    unsigned lineNumber, unsigned columnNumber,
+    std::unique_ptr<V8StackTrace> stackTrace, int /*scriptId*/) {
+  v8::Context* context = ContextOf(handle);
+  if (context == nullptr) return 0;
+  int context_group_id = 0;
+  GroupState* group = GroupOf(context, &context_group_id);
+  if (group == nullptr || group->slag == nullptr) return 0;
+  InspectorSessionImpl* session = SessionFor(context_group_id);
+  if (session == nullptr) return 0;
+
+  const std::string text = Utf8Of(detailedMessage);
+  const std::string where = Utf8Of(url);
+  // A frame reports views, so the strings are copied first and only then
+  // pointed at; the vectors do not grow after the pointers are taken.
+  const std::vector<V8StackFrame> captured =
+      stackTrace ? stackTrace->frames() : std::vector<V8StackFrame>();
+  std::vector<std::pair<std::string, std::string>> named;
+  named.reserve(captured.size());
+  for (const V8StackFrame& frame : captured) {
+    named.emplace_back(Utf8Of(frame.functionName), Utf8Of(frame.sourceURL));
+  }
+  std::vector<SlagExceptionFrame> frames;
+  frames.reserve(captured.size());
+  for (size_t index = 0; index < captured.size(); ++index) {
+    const std::string& function_name = named[index].first;
+    const std::string& frame_url = named[index].second;
+    frames.push_back(SlagExceptionFrame{
+        reinterpret_cast<const uint8_t*>(function_name.data()),
+        function_name.size(), reinterpret_cast<const uint8_t*>(frame_url.data()),
+        frame_url.size(), static_cast<uint32_t>(captured[index].lineNumber),
+        static_cast<uint32_t>(captured[index].columnNumber)});
+  }
+  const bool is_error =
+      !exception.IsEmpty() &&
+      (slag_value_type_mask(context->slag(), exception.raw()) &
+       SLAG_VALUE_NATIVE_ERROR) != 0;
+  SlagException report{};
+  report.message = reinterpret_cast<const uint8_t*>(text.data());
+  report.message_len = text.size();
+  report.url = reinterpret_cast<const uint8_t*>(where.data());
+  report.url_len = where.size();
+  report.line = lineNumber;
+  report.column = columnNumber;
+  report.is_error = is_error ? 1 : 0;
+  report.frames = frames.empty() ? nullptr : frames.data();
+  report.frame_count = frames.size();
+
+  uint32_t exception_id = 0;
+  SlagMessages messages{};
+  if (slag_inspector_exception(group->slag, &report, &exception_id, &messages) !=
+      0) {
+    return 0;
+  }
+  session->Notify(messages);
+  return exception_id;
+}
+
+void InspectorImpl::exceptionRevoked(v8::Local<v8::Context> handle,
+                                     unsigned exceptionId, StringView message) {
+  v8::Context* context = ContextOf(handle);
+  if (context == nullptr) return;
+  int context_group_id = 0;
+  GroupState* group = GroupOf(context, &context_group_id);
+  if (group == nullptr || group->slag == nullptr) return;
+  InspectorSessionImpl* session = SessionFor(context_group_id);
+  if (session == nullptr) return;
+  const std::string reason = Utf8Of(message);
+  SlagMessages messages{};
+  if (slag_inspector_exception_revoked(
+          group->slag, exceptionId,
+          reinterpret_cast<const uint8_t*>(reason.data()), reason.size(),
+          &messages) != 0) {
+    return;
+  }
+  session->Notify(messages);
+}
+
 void InspectorSessionImpl::Deliver(const SlagMessages& messages,
                                    int64_t call_id, bool answers_a_command) {
   for (size_t index = 0; index < messages.len; ++index) {
@@ -316,6 +583,7 @@ std::unique_ptr<StringBuffer> StringBuffer::create(StringView text) {
 
 V8InspectorClient::~V8InspectorClient() = default;
 V8InspectorSession::~V8InspectorSession() = default;
+V8StackTrace::~V8StackTrace() = default;
 V8Inspector::Channel::~Channel() = default;
 V8Inspector::~V8Inspector() = default;
 
