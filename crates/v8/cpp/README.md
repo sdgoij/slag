@@ -507,6 +507,19 @@ is the scoped form. As the Rust bridge documents, the number is reported rather
 than consulted: this engine's collections are paced by its own growth policy, so
 an adjustment does not trigger one.
 
+`ArrayBuffer::Allocator` is the host's own source for those bytes.
+`Isolate::CreateParams::array_buffer_allocator` is kept by the isolate, and
+`ArrayBuffer::New(isolate, length)` and `NewBackingStore(isolate, length)` draw a
+zeroed block from `Allocate` and hand it back through `Free` once the last buffer
+and store over it are gone, so a host that counts or partitions its memory sees
+the bytes. `AllocateUninitialized` and `Reallocate` default to `Allocate` and
+copy-and-free. An isolate without an allocator falls back to the engine's own
+block, which is what V8 refuses to do; the facade is lenient there because the
+engine can allocate. A store made by
+`NewBackingStore(data, length, deleter, deleter_data)` is the host's own address
+range: its deleter releases it, and its bytes stay out of the isolate's external
+memory, which is V8's rule too.
+
 ## The gin target
 
 Actual `gin` cannot be built standalone. `gin/BUILD.gn` has public deps
@@ -574,7 +587,8 @@ not a claim that gin itself links.
 - `Map` and `Set`: `New`, the keyed operations, `Clear`, `Size`, and `AsArray`.
 - `ArrayBuffer` and `SharedArrayBuffer` (creation, `ByteLength`, `Data`,
   `GetBackingStore`, and the detach protocol), `BackingStore` (fresh and
-  host-owned, with a deleter), and the `ArrayBufferView`/`TypedArray` hierarchy
+  host-owned, with a deleter), `ArrayBuffer::Allocator` (the host's bytes, from
+  `Isolate::CreateParams`), and the `ArrayBufferView`/`TypedArray` hierarchy
   with `New` for all twelve element kinds.
 - `Isolate::AdjustAmountOfExternalAllocatedMemory` and
   `ExternalMemoryAccounter`, over the engine's live-buffer walk plus the host's
@@ -641,6 +655,9 @@ not a claim that gin itself links.
 - `ArrayBuffer::New` needs an entered `Context::Scope` because the engine
   allocates in a realm; V8 takes the isolate alone. `BackingStore::Data` is the
   block's live base, so a caller must not hold the pointer across a resize.
+  `SharedArrayBuffer::New` ignores the isolate's allocator (the engine allocates
+  shared memory itself), and an isolate with no allocator still gets buffers
+  from the engine, where V8 would refuse.
 - A lazy data property's getter runs on every read (there is no one-shot slot),
   and a private name is a symbol, so `Object.getOwnPropertySymbols` can see a
   property V8's private names hide completely. `Signature` is absent, along with
@@ -786,4 +803,7 @@ and one through `Catch` (draining the jobs between), and makes and settles one
 from inside a host callback. The container block rounds a map and a set through
 `Set`/`Get`/`Has`/`Delete`/`Clear`/`Add`, reads both `Size`s and both `AsArray`s,
 checks that a script reads the same entries the host wrote, and checks that
-`Size` refuses a handle that is not a map.
+`Size` refuses a handle that is not a map. The allocator block makes a buffer and
+a store through a counting host allocator, checks that both drew their bytes from
+it, that dropping the store called `Free` at once, and that the bytes are still
+the isolate's external memory.

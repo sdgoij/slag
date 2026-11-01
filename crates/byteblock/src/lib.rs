@@ -197,6 +197,12 @@ struct BorrowedBlock {
     data: *mut u8,
     byte_length: usize,
     deleter: Option<Box<dyn FnOnce()>>,
+    /// Whether the block's bytes are the isolate's external memory. A host that
+    /// lends an address range through a deleter keeps its own account (the
+    /// block is skipped by the external-memory walk); an address range handed
+    /// out by the isolate's array-buffer allocator is the isolate's, exactly as
+    /// an owning block would be.
+    counted: bool,
 }
 
 /// Where a borrowed block is held: `Rc` single-agent, `Arc` under `workers`,
@@ -844,10 +850,38 @@ impl SharedBuffer {
         byte_length: usize,
         deleter: Option<Box<dyn FnOnce()>>,
     ) -> Self {
+        // SAFETY: forwarded; the count is the caller's contract too.
+        unsafe { Self::borrowed_with_accounting(data, byte_length, deleter, false) }
+    }
+
+    /// [`borrowed`](Self::borrowed) for a block the isolate accounts for: the
+    /// bytes came from the host's array-buffer allocator, so an external-memory
+    /// walk counts them the way it counts an owning block's.
+    ///
+    /// # Safety
+    ///
+    /// The same contract as [`borrowed`](Self::borrowed).
+    pub unsafe fn borrowed_counted(
+        data: *mut u8,
+        byte_length: usize,
+        deleter: Option<Box<dyn FnOnce()>>,
+    ) -> Self {
+        // SAFETY: forwarded.
+        unsafe { Self::borrowed_with_accounting(data, byte_length, deleter, true) }
+    }
+
+    /// The shared body of the two borrowed constructors.
+    unsafe fn borrowed_with_accounting(
+        data: *mut u8,
+        byte_length: usize,
+        deleter: Option<Box<dyn FnOnce()>>,
+        counted: bool,
+    ) -> Self {
         let borrowed = BorrowedRc::new(BorrowedBlock {
             data,
             byte_length,
             deleter,
+            counted,
         });
         // The state box's base is the host's address, which borrowed memory does
         // not move out of, so it is set once and never refreshed.
@@ -882,6 +916,16 @@ impl SharedBuffer {
     /// must not be assumed to have storage of its own.
     pub fn is_borrowed(&self) -> bool {
         self.borrowed.is_some()
+    }
+
+    /// Whether the block's bytes belong in the isolate's external-memory
+    /// account: an owning block always does, and a borrowed one only when its
+    /// bytes came from the isolate's array-buffer allocator.
+    pub fn counts_as_external(&self) -> bool {
+        match &self.borrowed {
+            Some(borrowed) => borrowed.counted,
+            None => true,
+        }
     }
 
     /// Mark the owning buffer detached (mirrors the runtime's `BufferState`).

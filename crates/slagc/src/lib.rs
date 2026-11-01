@@ -410,6 +410,10 @@ pub type SlagBufferDeleter = extern "C" fn(*mut u8, usize, *mut c_void);
 /// A block over memory the host owns
 /// (`ArrayBuffer::NewBackingStore(data, length, deleter, deleter_data)`).
 ///
+/// `counted` says whether the bytes belong in the isolate's external-memory
+/// account: the address range a host lends through a deleter is the host's own
+/// (0), while one its array-buffer allocator handed out is the isolate's (1).
+///
 /// # Safety
 ///
 /// `data` must point at `byte_length` readable and writable bytes that stay
@@ -421,13 +425,20 @@ pub unsafe extern "C" fn slag_buffer_borrowed(
     byte_length: usize,
     deleter: Option<SlagBufferDeleter>,
     deleter_data: *mut c_void,
+    counted: i32,
 ) -> *mut SlagBuffer {
     let release = deleter.map(|deleter| {
         Box::new(move || deleter(data, byte_length, deleter_data)) as Box<dyn FnOnce()>
     });
     // SAFETY: the caller's contract; `release` is the one call that frees the
     // bytes.
-    let block = unsafe { crux::typed_array::SharedBuffer::borrowed(data, byte_length, release) };
+    let block = unsafe {
+        if counted != 0 {
+            crux::typed_array::SharedBuffer::borrowed_counted(data, byte_length, release)
+        } else {
+            crux::typed_array::SharedBuffer::borrowed(data, byte_length, release)
+        }
+    };
     Box::into_raw(Box::new(SlagBuffer {
         block,
         byte_length,

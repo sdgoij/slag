@@ -290,7 +290,8 @@ void slag_traced_free(SlagTraced* traced);
 typedef void (*SlagBufferDeleter)(void* data, size_t byte_length, void* deleter_data);
 SlagBuffer* slag_buffer_new(size_t byte_length);
 SlagBuffer* slag_buffer_borrowed(void* data, size_t byte_length,
-                                SlagBufferDeleter deleter, void* deleter_data);
+                                SlagBufferDeleter deleter, void* deleter_data,
+                                int32_t counted);
 void* slag_buffer_data(const SlagBuffer* buffer);
 size_t slag_buffer_byte_length(const SlagBuffer* buffer);
 int32_t slag_buffer_is_shared(const SlagBuffer* buffer);

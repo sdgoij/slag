@@ -8,6 +8,7 @@
 // Chromium's base library.
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <string>
 
@@ -466,15 +467,36 @@ void MakePromise(const v8::FunctionCallbackInfo<v8::Value>& info) {
   info.GetReturnValue().Set(resolver->GetPromise());
 }
 
+// A host allocator that counts what it lends, so the harness can prove the facade
+// draws a backing store from it and gives the bytes back.
+struct CountingAllocator : v8::ArrayBuffer::Allocator {
+  size_t allocated = 0;
+  size_t freed = 0;
+  size_t allocations = 0;
+
+  void* Allocate(size_t length) override {
+    void* data = ::calloc(length, 1);
+    if (data == nullptr) return nullptr;
+    allocated += length;
+    ++allocations;
+    return data;
+  }
+
+  void Free(void* data, size_t length) override {
+    freed += length;
+    ::free(data);
+  }
+};
+
 }  // namespace
 
 int main() {
   v8::V8::InitializeICUDefaultLocation(nullptr);
   v8::V8::Initialize();
 
+  CountingAllocator allocator;
   v8::Isolate::CreateParams params;
-  params.array_buffer_allocator =
-      v8::ArrayBuffer::Allocator::NewDefaultAllocator();
+  params.array_buffer_allocator = &allocator;
   v8::Isolate* isolate = v8::Isolate::New(params);
   // A property callback reports this isolate, and the facade resolves the
   // context an allocation goes through from it, so the host enters it the way
@@ -2066,6 +2088,48 @@ int main() {
            "ExternalMemoryAccounter gave its size back");
   }
 
+  // The host's allocator: a backing store's bytes come from it, and go back when
+  // the last buffer and store over them are gone.
+  {
+    v8::HandleScope scope(isolate);
+    v8::Local<v8::Context> current = context.Get(isolate);
+    v8::Context::Scope context_scope(current);
+    const auto expect = [&](bool condition, const char* what) {
+      if (!condition) {
+        fprintf(stderr, "allocator: %s\n", what);
+        ++failures;
+      }
+    };
+
+    const size_t allocated_before = allocator.allocated;
+    v8::Local<v8::ArrayBuffer> buffer = v8::ArrayBuffer::New(isolate, 64);
+    expect(!buffer.IsEmpty() && buffer->ByteLength() == 64,
+           "ArrayBuffer::New answered a buffer");
+    expect(allocator.allocated >= allocated_before + 64,
+           "the buffer's bytes came from the host's allocator");
+
+    // A store the host drops hands its bytes back at once: no buffer over it
+    // keeps the block alive.
+    const size_t freed_before = allocator.freed;
+    {
+      std::unique_ptr<v8::BackingStore> store =
+          v8::ArrayBuffer::NewBackingStore(isolate, 32);
+      expect(store != nullptr && store->ByteLength() == 32,
+             "NewBackingStore answered a store");
+      expect(allocator.allocated >= allocated_before + 96,
+             "the store's bytes came from the allocator too");
+    }
+    expect(allocator.freed >= freed_before + 32,
+           "Free ran when the store went");
+
+    // The bytes are still the isolate's external memory while the buffer is
+    // alive, which is the number HeapStatistics reports.
+    v8::HeapStatistics stats;
+    isolate->GetHeapStatistics(&stats);
+    expect(stats.external_memory >= 64,
+           "the allocator's bytes are external memory");
+  }
+
   // Embedder data, security tokens, and the creation context: the slots and
   // identity a host attaches to a realm.
   {
@@ -2609,6 +2673,5 @@ int main() {
   }
 
   isolate->Dispose();
-  delete params.array_buffer_allocator;
   return failures == 0 ? 0 : 1;
 }

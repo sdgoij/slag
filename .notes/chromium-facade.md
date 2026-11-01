@@ -1079,6 +1079,29 @@ shape needs it, so the facade refuses a re-entry with the existing pending error
 instead of growing twelve more entry points. That is the first thing to revisit
 if a binding turns out to call `Map::Set` from a getter.
 
+*The host's array-buffer allocator (2026-11-01).* `ArrayBuffer::Allocator` became
+a real interface with `Allocate`/`AllocateUninitialized`/`Free`/`Reallocate`, and
+`Isolate::CreateParams::array_buffer_allocator` is now kept by the isolate: a
+backing store it makes is drawn from the host's allocator and released through
+it. That is the hook Blink needs, because its bytes must come from the partition
+allocator rather than from inside the engine's own arena.
+
+The implementation reuses `ArrayBuffer::NewBackingStore(data, length, deleter,
+  deleter_data)`: the allocator's bytes are lent to the engine exactly like a
+host's own range, with `Free` as the deleter. That exposed one modelling
+difference worth recording: an external-memory walk skips a borrowed block, on
+the assumption that the host that lent it accounts for it. Allocator-provided
+bytes are not that: V8 reports them as external memory. So `SharedBuffer` grew
+`borrowed_counted`, the ABI's `slag_buffer_borrowed` grew a `counted` flag, and
+the walk now skips a borrowed block only when it is *not* counted. The harness
+proves the whole path with a counting allocator: both creation forms draw their
+bytes from it, dropping a store calls `Free` immediately, and the bytes still
+show up in `HeapStatistics::external_memory`.
+
+`SharedArrayBuffer::New` still allocates its own block, as V8's shared memory
+does, and an isolate with no allocator falls back to the engine's allocation
+where V8 would refuse.
+
 ## 15. Sources
 
 Verified on 2026-10-31:

@@ -540,10 +540,22 @@ using BackingStoreDeleterCallback = void (*)(void* data, size_t length,
  * `Isolate::AdjustAmountOfExternalAllocatedMemory`, as in V8. */
 class ArrayBuffer : public Object {
  public:
+  /* The host's allocator for buffer bytes (`v8::ArrayBuffer::Allocator`). A
+   * backing store the facade creates for an isolate with one of these draws its
+   * bytes from it and calls `Free` once the last buffer and store over them are
+   * gone, so the host's own accounting (a partition allocator, say) sees them. */
   class Allocator {
    public:
     virtual ~Allocator() = default;
     static Allocator* NewDefaultAllocator();
+
+    /* `length` zeroed bytes, or null when the allocation fails. */
+    virtual void* Allocate(size_t length) = 0;
+    /* `length` bytes, not zeroed. */
+    virtual void* AllocateUninitialized(size_t length);
+    virtual void Free(void* data, size_t length) = 0;
+    /* A new, larger block whose first `old_length` bytes are copied, or null. */
+    virtual void* Reallocate(void* data, size_t old_length, size_t new_length);
   };
 
   static Local<ArrayBuffer> New(Isolate* isolate, size_t byte_length);
@@ -1711,6 +1723,9 @@ class Isolate {
   /* The default security token, minted on the first ask and shared by every
    * context without one of its own. Retained until `Dispose`. */
   uint64_t default_security_token_ = 0;
+  /* `CreateParams::array_buffer_allocator`: the host's allocator for the backing
+   * stores this isolate makes. Null means the engine allocates its own. */
+  ArrayBuffer::Allocator* array_buffer_allocator_ = nullptr;
   /* The startup blob `CreateParams::snapshot_blob` named, and whether the first
    * context has consumed it. */
   std::vector<uint8_t> snapshot_blob_;
@@ -1718,6 +1733,7 @@ class Isolate {
 
   friend class Context;
   friend class Private;
+  friend class ArrayBuffer;
   friend bool platform::PumpMessageLoop(Platform*, Isolate*);
 };
 

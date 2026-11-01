@@ -2,6 +2,7 @@
 #include "include/v8.h"
 
 #include <cstring>
+#include <cstdlib>
 #include <deque>
 #include <string>
 #include <vector>
@@ -457,8 +458,45 @@ void Isolate::PerformMicrotaskCheckpoint() {
   if (context != nullptr) slag_drain_jobs(context->slag());
 }
 
+/* The allocator `NewDefaultAllocator` answers with: `calloc` for a zeroed
+ * block, as V8's `Allocate` promises, and `malloc` for the uninitialized form. */
+class DefaultAllocator : public ArrayBuffer::Allocator {
+ public:
+  void* Allocate(size_t length) override {
+    return length == 0 ? nullptr : std::calloc(length, 1);
+  }
+
+  void* AllocateUninitialized(size_t length) override {
+    return length == 0 ? nullptr : std::malloc(length);
+  }
+
+  void Free(void* data, size_t) override { std::free(data); }
+};
+
+/* A backing store's bytes go back to the allocator that lent them.
+ *
+ * The store's lifetime is the engine's, not the host's: this runs when the last
+ * buffer and store over the bytes are gone. */
+void ReleaseThroughAllocator(void* data, size_t length, void* deleter_data) {
+  auto* allocator = static_cast<v8::ArrayBuffer::Allocator*>(deleter_data);
+  if (allocator != nullptr) allocator->Free(data, length);
+}
+
 ArrayBuffer::Allocator* ArrayBuffer::Allocator::NewDefaultAllocator() {
-  return new Allocator();
+  return new DefaultAllocator();
+}
+
+void* ArrayBuffer::Allocator::AllocateUninitialized(size_t length) {
+  return Allocate(length);
+}
+
+void* ArrayBuffer::Allocator::Reallocate(void* data, size_t old_length,
+                                         size_t new_length) {
+  void* moved = Allocate(new_length);
+  if (moved == nullptr || data == nullptr) return moved;
+  std::memcpy(moved, data, old_length < new_length ? old_length : new_length);
+  Free(data, old_length);
+  return moved;
 }
 
 namespace {
@@ -861,12 +899,14 @@ bool BackingStore::IsShared() const {
   return slag_buffer_is_shared(buffer_) != 0;
 }
 
-Local<ArrayBuffer> ArrayBuffer::New(Isolate*, size_t byte_length) {
-  SlagBuffer* store = slag_buffer_new(byte_length);
+Local<ArrayBuffer> ArrayBuffer::New(Isolate* isolate, size_t byte_length) {
+  // A store from the host's allocator when the isolate has one, and the
+  // engine's own block otherwise.
+  std::unique_ptr<BackingStore> store = NewBackingStore(isolate, byte_length);
+  if (!store) return Local<ArrayBuffer>();
   uint64_t out = 0;
   const int32_t created =
-      slag_buffer_to_array_buffer(CurrentSlagContext(), store, &out);
-  slag_buffer_free(store);
+      slag_buffer_to_array_buffer(CurrentSlagContext(), store->buffer_, &out);
   return created == 0 ? Local<ArrayBuffer>::New(out) : Local<ArrayBuffer>();
 }
 
@@ -879,17 +919,31 @@ Local<ArrayBuffer> ArrayBuffer::New(Isolate*,
   return created == 0 ? Local<ArrayBuffer>::New(out) : Local<ArrayBuffer>();
 }
 
-std::unique_ptr<BackingStore> ArrayBuffer::NewBackingStore(Isolate*,
+std::unique_ptr<BackingStore> ArrayBuffer::NewBackingStore(Isolate* isolate,
                                                           size_t byte_length) {
-  return std::unique_ptr<BackingStore>(
-      new BackingStore(slag_buffer_new(byte_length)));
+  auto* allocator =
+      isolate != nullptr ? isolate->array_buffer_allocator_ : nullptr;
+  if (allocator == nullptr || byte_length == 0) {
+    return std::unique_ptr<BackingStore>(
+        new BackingStore(slag_buffer_new(byte_length)));
+  }
+  void* data = allocator->Allocate(byte_length);
+  if (data == nullptr) return nullptr;
+  // The block is the host's until the last buffer over it is gone, which is
+  // when the deleter hands the bytes back. The isolate accounts for the bytes,
+  // unlike an address range the host lends through its own deleter.
+  return std::unique_ptr<BackingStore>(new BackingStore(slag_buffer_borrowed(
+      static_cast<uint8_t*>(data), byte_length, &ReleaseThroughAllocator,
+      allocator, 1)));
 }
 
 std::unique_ptr<BackingStore> ArrayBuffer::NewBackingStore(
     void* data, size_t byte_length, BackingStoreDeleterCallback deleter,
     void* deleter_data) {
+  // A host's own address range: its deleter releases it, and the engine leaves
+  // the bytes out of the isolate's external-memory account.
   return std::unique_ptr<BackingStore>(new BackingStore(slag_buffer_borrowed(
-      static_cast<uint8_t*>(data), byte_length, deleter, deleter_data)));
+      static_cast<uint8_t*>(data), byte_length, deleter, deleter_data, 0)));
 }
 
 size_t ArrayBuffer::ByteLength() const {
@@ -2613,6 +2667,7 @@ Isolate* Isolate::New(const CreateParams& params) {
     delete isolate;
     return nullptr;
   }
+  isolate->array_buffer_allocator_ = params.array_buffer_allocator;
   // The blob is copied: V8's contract lets the caller free its `StartupData`
   // once `New` returns, and the first context restores from this copy.
   if (params.snapshot_blob != nullptr &&

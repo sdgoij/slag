@@ -178,7 +178,7 @@ fn external_memory(isolate: &Isolate) -> i64 {
 pub(crate) fn external_memory_of(agent: &crate::agent::Agent, adjustment: i64) -> i64 {
     let mut total = adjustment;
     for state in agent.roots.buffer_data.borrow().values() {
-        if state.detached || state.shared.is_borrowed() {
+        if state.detached || !state.shared.counts_as_external() {
             continue;
         }
         total = total.saturating_add(state.shared.byte_length() as i64);
