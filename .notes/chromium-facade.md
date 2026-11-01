@@ -1698,6 +1698,33 @@ debugger. Lifting the restriction is the continuation-stack work (park each fram
 on the way out and resume innermost-first, feeding each completion back into the
 frame below), and it starts with the call-step channel in `ordinary_call`.
 
+**2026-11-01, step 3: resume.** `PausedRun` now carries the
+`ExecutionContext` as well as the `Vm` and its body, because the caller that
+pushed the context pops it while the run is parked, and
+`eval::resume_paused(agent)` takes the record, pushes that context back, runs the
+same `Vm` from its `ip` and finishes the completion through the same
+`finish_script_run` the original entry uses (so the `using` disposal, the
+`Completion::Return` mapping a compiled script needs, and the invariants are one
+implementation rather than two). A debug point has already advanced `ip` past
+itself, so the resumed run does not stop there again, and a second stop re-parks
+with the same context and reports the paused error.
+
+The context had to join the record for a reason worth naming: tracing. The
+caller popped it, so the parked run became the only reference to the run's
+environments, and a collection between the stop and the resume would have swept
+them. `Trace for PausedRun` covers the `Vm`, the body and the context.
+
+`resuming_a_paused_script_runs_the_rest_of_it` is the end-to-end check: the
+script pauses inside a `try`, the resume returns the script's completion value
+(`'done'`), the statement the pause stopped at runs, the `finally` completes as
+ordinary control flow, and the paused slot is empty afterwards.
+
+Still open, in order: the continuation stack (the depth restriction above), the
+position table and breakpoints, `evaluateOnCallFrame` through the
+`CallbackWindow`, and the facade's `Debugger` surface. Resuming mid-`try` also
+means the try stack, the for-of stacks and the completion registers all survived
+the park, which they do because the record is the whole `Vm`.
+
 ## 15. Sources
 
 Verified on 2026-10-31:

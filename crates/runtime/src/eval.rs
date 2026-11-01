@@ -67,7 +67,11 @@ pub fn eval_program(
             agent.debug_points(),
         )?),
     };
-    let env = agent.running_context()?.lexical_environment;
+    // The context is captured, not just its environment: a pause parks the run,
+    // and the caller that pushed this context pops it on the way out, so a
+    // resumed run has to push it back (see `resume_paused`).
+    let context = agent.running_context()?.clone();
+    let env = context.lexical_environment;
     let mut vm = agent.take_vm(env, strict);
     // Cut 16: a slotified script's declared vars live in the frame — the
     // prologue already loaded them from the global object, so no argument
@@ -87,6 +91,22 @@ pub fn eval_program(
     } else {
         vm.start(agent, &body)
     };
+    finish_script_run(agent, vm, body, context, outcome)
+}
+
+/// Finish a script or eval run: the outcome-to-value mapping every script
+/// boundary shares, including the one a resume re-enters.
+///
+/// A run that stopped again parks itself and reports the paused error, so this
+/// is also where a session's run comes to rest.
+fn finish_script_run(
+    agent: &mut Agent,
+    vm: Box<crate::ir::Vm>,
+    body: std::rc::Rc<crate::ir::CompiledBody>,
+    context: crate::context::ExecutionContext,
+    outcome: Result<crate::ir::VmOutcome, JsError>,
+) -> Result<Value, JsError> {
+    let env = vm.lexical_env;
     let completion = match outcome {
         Ok(crate::ir::VmOutcome::Completed(completion)) => {
             // Cut 65: a compiled script falls off the end with the machine
@@ -138,8 +158,9 @@ pub fn eval_program(
         Ok(crate::ir::VmOutcome::Paused(reason)) => {
             agent.park_paused(crate::agent::PausedRun {
                 vm,
-                body: body.clone(),
+                body,
                 reason,
+                context,
             });
             return Err(crate::ir::paused_run_error(reason));
         }
@@ -154,6 +175,33 @@ pub fn eval_program(
     agent.return_vm(vm);
     let completion = result?;
     completion_to_result(completion)
+}
+
+/// Resume the run a debug session stopped (`.notes/chromium-facade.md` section
+/// 14.4).
+///
+/// The parked record is taken, its execution context pushed back, and the same
+/// `Vm` continues from its `ip`: a debug point has already advanced past
+/// itself, so the resumed run does not stop there again. The completion is
+/// finished exactly as the original entry would have finished it, and a second
+/// stop re-parks and reports the paused error again.
+pub fn resume_paused(agent: &mut Agent) -> Result<Value, JsError> {
+    let Some(run) = agent.take_paused_run() else {
+        return Err(JsError::new(
+            ErrorKind::Error,
+            "no paused run to resume".into(),
+        ));
+    };
+    let crate::agent::PausedRun {
+        mut vm,
+        body,
+        reason: _,
+        context,
+    } = run;
+    agent.roots.execution_context_stack.push(context.clone());
+    let outcome = vm.start(agent, &body);
+    agent.roots.execution_context_stack.pop();
+    finish_script_run(agent, vm, body, context, outcome)
 }
 
 pub(crate) fn eval_statement_list(

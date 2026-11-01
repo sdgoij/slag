@@ -521,12 +521,18 @@ pub struct PausedRun {
     pub(crate) vm: Box<crate::ir::Vm>,
     pub(crate) body: std::rc::Rc<crate::ir::CompiledBody>,
     pub(crate) reason: crate::ir::PauseReason,
+    /// The context the run was executing under. The caller that pushed it pops
+    /// it when the paused error reaches it, so a resume has to push it back.
+    pub(crate) context: crate::context::ExecutionContext,
 }
 
 impl Trace for PausedRun {
     fn trace(&self, visit: &mut dyn FnMut(GcAny)) {
         self.vm.trace(visit);
         self.body.trace(visit);
+        // The context's environments are heap values (and the only reference to
+        // them once the caller that pushed it has popped it).
+        self.context.trace(visit);
     }
 }
 pub(crate) struct AgentRoots {

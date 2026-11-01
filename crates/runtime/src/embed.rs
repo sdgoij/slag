@@ -5132,6 +5132,51 @@ mod tests {
     }
 
     #[test]
+    fn resuming_a_paused_script_runs_the_rest_of_it() {
+        let mut context = Context::new().unwrap();
+        let pause_now = context
+            .create_function(
+                "pauseNow",
+                0,
+                Box::new(|call| {
+                    crate::context::callback_agent(call.agent_ptr())?.request_pause();
+                    Ok(JsValue::undefined())
+                }),
+            )
+            .unwrap();
+        context.set_global("pauseNow", pause_now).unwrap();
+        context.agent_mut().set_debug_attached(true).unwrap();
+        let error = context
+            .eval(
+                "globalThis.ran = false; globalThis.fin = false; \
+                 try { pauseNow(); globalThis.ran = true; } finally { globalThis.fin = true; } \
+                 'done';",
+            )
+            .unwrap_err();
+        assert_eq!(error.message, "execution paused at the host's request");
+        let value = crate::eval::resume_paused(context.agent_mut()).unwrap();
+        assert_eq!(
+            value.as_string().map(|text| text.to_string_lossy()),
+            Some("done".to_string()),
+            "the resumed run completes the script"
+        );
+        assert_eq!(
+            context.eval("globalThis.ran").unwrap().as_boolean(),
+            Some(true),
+            "the statement the pause stopped at runs on resume"
+        );
+        assert_eq!(
+            context.eval("globalThis.fin").unwrap().as_boolean(),
+            Some(true),
+            "the finally completes as normal control flow"
+        );
+        assert!(
+            context.agent().paused_reason().is_none(),
+            "the paused slot is empty once the run finished"
+        );
+    }
+
+    #[test]
     fn create_object_builds_a_namespace() {
         let mut context = Context::new().unwrap();
         let host = context.create_object().unwrap();
