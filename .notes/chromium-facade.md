@@ -1545,6 +1545,19 @@ and a stricter host would not: `Debugger.pause` arms every context's one-shot
 ticket, because nothing clears another context's ticket, so a context that runs
 later also stops. V8 clears the request when the first pause reports.
 
+**Where the cost lands, and why that is the right place.** Nothing here made the
+engine pay: `crates/runtime` has no change for any of it, a context that is not
+in a group does one `RefCell` borrow after a successful compile and nothing
+else, and debug points exist only while `Debugger.enable` has attached (0 on the
+compiled tier, +1.11% interpreted, measured). A step is a park and a resume, and
+`Debugger.pause` arming a whole group is the same kind of trade: both are
+development-tool costs with no shipping path, neither can happen without a
+session attached, and a debugger that is cheap to step in is not a goal worth
+paying for in the interpreter. The one cost a C++ host pays whether or not it
+connects a client is link size: `hello-world.exe` is 23.6 MB against
+`inspector.exe`'s 24.1 MB, so the protocol layer is about half a megabyte on the
+hosts that reference it and is not pulled into the ones that do not.
+
 One trap worth keeping: a `Channel` callback runs inside the session's own
 call, where its state is borrowed, so `dispatchProtocolMessage` from
 `sendNotification` is refused. Record and dispatch after the call returns.
