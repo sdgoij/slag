@@ -1754,7 +1754,7 @@ class Context {
    * activation: a breakpoint inside a function that is still on the stack when
    * the point is reached stops when control returns to the outermost frame. */
   struct PauseInfo {
-    enum Reason { kNone = 0, kRequested = 1, kBreakpoint = 2 };
+    enum Reason { kNone = 0, kRequested = 1, kBreakpoint = 2, kStep = 3 };
     Reason reason = kNone;
     /* The debug point's span: byte offsets into the script text. */
     uint32_t start = 0;
@@ -1763,6 +1763,12 @@ class Context {
   void SetDebugAttached(bool attached);
   void SetBreakpoints(const uint32_t* offsets, size_t count);
   void RequestPause();
+  /* Ask the next Resume to stop after one step: StepOver at the next point of
+   * the halted activation or an outer one, StepInto at the next point anywhere,
+   * StepOut once the halted activation has returned to a caller. */
+  void StepInto();
+  void StepOver();
+  void StepOut();
   bool Paused(PauseInfo* out) const;
   MaybeLocal<Value> Resume();
   /* Evaluate `source` at the stopped position (`Debugger.evaluateOnCallFrame`).

@@ -32,7 +32,7 @@ use crux::value::{Value, ValueKind};
 use slag::api::{Local as EngineLocal, Traced};
 use slag::{
     CallbackWindow, CompiledScript, Context, ErrorKind, FunctionCall, HostFn, JsError, JsModule,
-    JsValue, OwnProperty, PauseReason, PromiseHandles, PromiseState,
+    JsValue, OwnProperty, PauseReason, PromiseHandles, PromiseState, StepMode,
 };
 
 /// The isolate a host enters. The engine's contexts are the state; this token
@@ -2119,7 +2119,7 @@ pub unsafe extern "C" fn slag_drain_jobs(context: *mut SlagContext) -> i32 {
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct SlagPause {
-    /// 0 none, 1 a host pause request, 2 a breakpoint.
+    /// 0 none, 1 a host pause request, 2 a breakpoint, 3 a step.
     pub reason: u32,
     /// The source offset of the debug point that stopped the run.
     pub start: u32,
@@ -2128,6 +2128,7 @@ pub struct SlagPause {
 
 const PAUSE_REQUESTED: u32 = 1;
 const PAUSE_BREAKPOINT: u32 = 2;
+const PAUSE_STEP: u32 = 3;
 
 /// [`slag_script_run`]'s extra code: a session stopped the run at a debug point.
 const SLAG_RUN_PAUSED: i32 = 3;
@@ -2218,12 +2219,40 @@ pub unsafe extern "C" fn slag_debug_paused(context: *mut SlagContext, out: *mut 
             reason: match info.reason {
                 PauseReason::Requested => PAUSE_REQUESTED,
                 PauseReason::Breakpoint => PAUSE_BREAKPOINT,
+                PauseReason::Step => PAUSE_STEP,
             },
             start: info.position.map_or(0, |span| span.start),
             end: info.position.map_or(0, |span| span.end),
         };
     }
     1
+}
+
+/// The step modes [`slag_debug_step`] accepts.
+const STEP_INTO: i32 = 1;
+const STEP_OVER: i32 = 2;
+const STEP_OUT: i32 = 3;
+
+/// Ask the next resume to stop after one step: `mode` is 1 for `stepInto`, 2
+/// for `stepOver` and 3 for `stepOut`. Returns 0 on success, 1 with a pending
+/// error, 2 for a bad handle, and 3 for a mode this ABI does not have.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn slag_debug_step(context: *mut SlagContext, mode: i32) -> i32 {
+    let Some(context) = context.as_mut() else {
+        return 2;
+    };
+    let Ok(mut engine) = context.context.try_borrow_mut() else {
+        reentrant(context);
+        return 1;
+    };
+    let step = match mode {
+        STEP_INTO => StepMode::Into,
+        STEP_OVER => StepMode::Over,
+        STEP_OUT => StepMode::Out,
+        _ => return 3,
+    };
+    engine.request_step(step);
+    0
 }
 
 /// Continue the parked run, writing its value through `out`. Returns 0 on

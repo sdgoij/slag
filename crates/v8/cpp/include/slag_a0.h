@@ -191,7 +191,16 @@ enum SlagPauseReason {
   /* A host `slag_debug_pause` request was observed at a debug point. */
   SLAG_PAUSE_REQUESTED = 1,
   /* A debug point's offset was one of the session's breakpoints. */
-  SLAG_PAUSE_BREAKPOINT = 2
+  SLAG_PAUSE_BREAKPOINT = 2,
+  /* A step the host asked the previous resume for stopped the run. */
+  SLAG_PAUSE_STEP = 3
+};
+
+/* The step a resume should stop after (`slag_debug_step`). */
+enum SlagStepMode {
+  SLAG_STEP_INTO = 1,
+  SLAG_STEP_OVER = 2,
+  SLAG_STEP_OUT = 3
 };
 
 /* The debugger surface (see the facade's `v8::Context` extensions). A session
@@ -206,6 +215,11 @@ int32_t slag_debug_set_breakpoints(SlagContext* context, const uint32_t* offsets
 int32_t slag_debug_pause(SlagContext* context);
 /* 1 when a run is parked (and `out` is filled), 0 when none is. */
 int32_t slag_debug_paused(SlagContext* context, SlagPause* out);
+/* Ask the next resume to stop after one step: `SLAG_STEP_INTO` stops at the
+ * next point anywhere, `SLAG_STEP_OVER` at the next point of the halted
+ * activation or an outer one, and `SLAG_STEP_OUT` once it has returned.
+ * Answers 3 for a mode this ABI does not have. */
+int32_t slag_debug_step(SlagContext* context, int32_t mode);
 /* Continue the parked run; its completion value is written through `out`. */
 int32_t slag_debug_resume(SlagContext* context, uint64_t* out);
 /* Evaluate `source` at the stopped position (`Debugger.evaluateOnCallFrame`):

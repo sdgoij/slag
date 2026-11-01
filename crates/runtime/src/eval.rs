@@ -244,6 +244,12 @@ pub fn resume_paused(agent: &mut Agent) -> Result<Value, JsError> {
             .push(level.context.clone());
         pushed += 1;
     }
+    // The innermost parked level is the activation a step is relative to, so
+    // this is where the depth a step compares against comes from.
+    let mut depth = parked.len() - 1;
+    if let Some(mode) = agent.take_pending_step() {
+        agent.arm_step(mode, depth);
+    }
     let mut delivery: Option<Result<Value, JsError>> = None;
     while !parked.is_empty() {
         let level = parked.remove(0);
@@ -255,6 +261,7 @@ pub fn resume_paused(agent: &mut Agent) -> Result<Value, JsError> {
         } = level;
         // Every parked activation was parkable when it stopped, so it still is.
         vm.pause_ok = true;
+        agent.set_level_depth(depth);
         match delivery.take() {
             None => {}
             Some(Ok(value)) => {
@@ -264,8 +271,19 @@ pub fn resume_paused(agent: &mut Agent) -> Result<Value, JsError> {
             Some(Err(error)) => vm.set_pending_throw(error),
         }
         let outcome = vm.start(agent, &body);
+        // The activation's context is refreshed before it comes off the stack:
+        // the calls it made during the resume wrote their sites into it, which
+        // is what its frame reports if it stops again.
+        let context = agent
+            .running_context()
+            .map(|running| running.clone())
+            .unwrap_or(context);
         agent.roots.execution_context_stack.pop();
         pushed -= 1;
+        depth = depth.saturating_sub(1);
+        // A stop below this activation set its call site again on the Vm; one
+        // at its own point leaves the previous value alone.
+        let site = vm.take_pause_site().or(site);
         let level = crate::agent::PausedLevel {
             vm,
             body,
@@ -280,29 +298,23 @@ pub fn resume_paused(agent: &mut Agent) -> Result<Value, JsError> {
             _ => None,
         };
         if let Some(info) = stop {
+            agent.clear_step();
+            agent.set_level_depth(0);
             return repark_paused(agent, info, parked, level, pushed);
         }
         let crate::agent::PausedLevel {
             vm, body, context, ..
         } = level;
+        if parked.is_empty() {
+            // The outermost activation: its outcome is the run's, however it
+            // ended.
+            agent.clear_step();
+            agent.set_level_depth(0);
+            return finish_script_run(agent, vm, body, context, outcome);
+        }
         let completion = match outcome {
             Ok(crate::ir::VmOutcome::Completed(completion)) => {
-                if parked.is_empty() {
-                    // The outermost activation: its completion is the run's.
-                    return finish_script_run(
-                        agent,
-                        vm,
-                        body,
-                        context,
-                        Ok(crate::ir::VmOutcome::Completed(completion)),
-                    );
-                }
-                delivery = Some(crate::function::finish_call_level(
-                    agent,
-                    &context.lexical_environment,
-                    completion,
-                ));
-                continue;
+                crate::function::finish_call_level(agent, &context.lexical_environment, completion)
             }
             Ok(crate::ir::VmOutcome::Suspended(_)) => Err(JsError::new(
                 ErrorKind::SyntaxError,
@@ -332,22 +344,29 @@ pub fn resume_paused(agent: &mut Agent) -> Result<Value, JsError> {
     ))
 }
 
-/// Put a whole activation stack back after a resume stopped again, and report
-/// the stop: the outermost park already happened, so this is the error the
-/// host's resume call returns.
+/// Put the activation stack back after a resume stopped again, and report the
+/// stop: the outermost park already happened, so this is the error the host's
+/// resume call returns.
+///
+/// The levels are appended rather than replaced, because a stop *deeper* than
+/// the level being resumed has already parked itself and every activation
+/// between it and this one on the way out; `parked` is only the outer
+/// activations this resume had not run yet.
 fn repark_paused(
     agent: &mut Agent,
     info: crate::ir::PauseInfo,
-    mut parked: Vec<crate::agent::PausedLevel>,
+    parked: Vec<crate::agent::PausedLevel>,
     level: crate::agent::PausedLevel,
     pushed: usize,
 ) -> Result<Value, JsError> {
     for _ in 0..pushed {
         agent.roots.execution_context_stack.pop();
     }
-    parked.insert(0, level);
     agent.set_pause_info(info);
-    agent.park_paused_levels(parked);
+    agent.park_paused_level(level);
+    for outer in parked {
+        agent.park_paused_level(outer);
+    }
     agent.clear_pause_in_flight();
     Err(crate::ir::paused_run_error(info))
 }
@@ -393,7 +412,15 @@ fn point_spans(body: &crate::ir::CompiledBody) -> Vec<(u32, u32)> {
 }
 
 /// Evaluate `source` at a stopped session's position
-/// (`Debugger.evaluateOnCallFrame`).
+/// (`Debugger.evaluateOnCallFrame`), on the innermost parked activation.
+pub fn evaluate_paused(agent: &mut Agent, source: &str) -> Result<Value, JsError> {
+    evaluate_paused_at(agent, 0, source)
+}
+
+/// Evaluate `source` on the `level`-th parked activation, innermost first: what
+/// a protocol client asks for when it names a call frame that is not the halted
+/// one. A caller's slots and environment are its own, so the expression sees
+/// that activation's locals and an assignment writes them back into its frame.
 ///
 /// A certified body keeps its locals in the halted frame's slot array rather
 /// than in an environment, so the evaluation is compiled against that body's
@@ -405,7 +432,7 @@ fn point_spans(body: &crate::ir::CompiledBody) -> Vec<(u32, u32)> {
 ///
 /// The evaluation cannot pause: the parked record is the frame being evaluated
 /// against, and a second stop would overwrite it.
-pub fn evaluate_paused(agent: &mut Agent, source: &str) -> Result<Value, JsError> {
+pub fn evaluate_paused_at(agent: &mut Agent, level: usize, source: &str) -> Result<Value, JsError> {
     let (context, scope, frame, strict) = {
         let paused = agent.roots.paused.borrow();
         let Some(run) = paused.as_ref() else {
@@ -414,11 +441,10 @@ pub fn evaluate_paused(agent: &mut Agent, source: &str) -> Result<Value, JsError
                 "no paused run to evaluate on".into(),
             ));
         };
-        // The innermost level is the activation the debugger is looking at.
-        let Some(level) = run.levels.first() else {
+        let Some(level) = run.levels.get(level) else {
             return Err(JsError::new(
                 ErrorKind::Error,
-                "the parked run has no activation".into(),
+                "the parked run has no such call frame".into(),
             ));
         };
         (
@@ -480,12 +506,12 @@ pub fn evaluate_paused(agent: &mut Agent, source: &str) -> Result<Value, JsError
             }
             Err(error) => {
                 agent.return_vm(vm);
-                write_back_frame(agent, &updated);
+                write_back_frame(agent, level, &updated);
                 return Err(error);
             }
         };
         agent.return_vm(vm);
-        write_back_frame(agent, &updated);
+        write_back_frame(agent, level, &updated);
         completion_to_result(completion)
     })();
     agent.roots.execution_context_stack.pop();
@@ -507,13 +533,13 @@ fn evaluate_in_paused_env(
 }
 
 /// Install an evaluation's slots into the halted frame it ran against.
-fn write_back_frame(agent: &Agent, values: &[Value]) {
+fn write_back_frame(agent: &Agent, level: usize, values: &[Value]) {
     if let Some(level) = agent
         .roots
         .paused
         .borrow_mut()
         .as_mut()
-        .and_then(|run| run.levels.first_mut())
+        .and_then(|run| run.levels.get_mut(level))
     {
         level.vm.set_frame_values(values);
     }

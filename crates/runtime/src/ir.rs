@@ -2758,6 +2758,25 @@ pub enum PauseReason {
     /// A point whose source offset is one of the session's breakpoints
     /// (`Agent::set_breakpoints`).
     Breakpoint,
+    /// The host asked the previous resume to stop after one step
+    /// (`Agent::request_step`).
+    Step,
+}
+
+/// What a resume should stop at (`Debugger.stepOver`/`stepInto`/`stepOut`).
+///
+/// The modes are written relative to the activation that was halted: a step
+/// stops in the same activation, a deeper one, or an outer one
+/// (`.notes/chromium-facade.md` section 14.4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StepMode {
+    /// Stop at the next point anywhere, including inside a callee.
+    Into,
+    /// Stop at the next point in the halted activation or an outer one, never
+    /// inside a callee it calls.
+    Over,
+    /// Stop when the halted activation has returned, in one of its callers.
+    Out,
 }
 
 /// The error a run reports when a pause reaches an entry point that cannot park
@@ -2802,6 +2821,7 @@ pub(crate) fn paused_run_error(info: PauseInfo) -> JsError {
         match info.reason {
             PauseReason::Requested => "execution paused at the host's request".into(),
             PauseReason::Breakpoint => "execution paused at a breakpoint".into(),
+            PauseReason::Step => "execution paused after a step".into(),
         },
     )
 }
@@ -9267,11 +9287,15 @@ impl Vm {
                     // state nobody kept. A run parked for a frame evaluation is
                     // not paused again.
                     if self.pause_ok && !agent.has_paused_run() {
+                        // A breakpoint outranks a step: a session that is
+                        // stepping still stops where it asked to.
                         let stop = if agent.breakpoint_at(span.start) {
                             Some(PauseReason::Breakpoint)
                         } else if agent.pause_requested() {
                             agent.clear_pause_request();
                             Some(PauseReason::Requested)
+                        } else if agent.step_allows_stop() {
+                            Some(PauseReason::Step)
                         } else {
                             None
                         };

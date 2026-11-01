@@ -1715,6 +1715,10 @@ void Context::SetBreakpoints(const uint32_t* offsets, size_t count) {
 
 void Context::RequestPause() { slag_debug_pause(slag_); }
 
+void Context::StepInto() { slag_debug_step(slag_, SLAG_STEP_INTO); }
+void Context::StepOver() { slag_debug_step(slag_, SLAG_STEP_OVER); }
+void Context::StepOut() { slag_debug_step(slag_, SLAG_STEP_OUT); }
+
 bool Context::Paused(PauseInfo* out) const {
   SlagPause pause = {};
   if (slag_debug_paused(slag_, &pause) != 1) return false;

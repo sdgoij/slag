@@ -2067,6 +2067,15 @@ pub struct Agent {
     /// (a generator's resumption, a module evaluation, a direct eval, the
     /// certified nested lane).
     pause_ticket: Cell<Option<bool>>,
+    /// The step the host asked for the next resume, before it is armed: a resume
+    /// is what knows the activation depth the step is relative to.
+    pending_step: Cell<Option<crate::ir::StepMode>>,
+    /// The armed step and the activation depth it was asked at. Cleared by the
+    /// stop that consumes it or by the run that finishes without one.
+    step: Cell<Option<(crate::ir::StepMode, usize)>>,
+    /// How many parked activations are outside the one running now: 0 for a run
+    /// that has not stopped, `i` while a resume is running its `i`-th level.
+    level_depth: Cell<usize>,
     /// The heap this agent allocates in, when a host owns the arena (an
     /// isolate under the `v8` bridge). Null for a bare agent, whose heap is the
     /// thread's own.
@@ -2448,22 +2457,6 @@ impl Agent {
         }
     }
 
-    /// Put a whole activation stack back after a resume stopped again. The
-    /// levels arrive innermost first, as [`park_paused_level`] accumulates them.
-    pub(crate) fn park_paused_levels(&self, levels: Vec<PausedLevel>) {
-        let mut paused = self.roots.paused.borrow_mut();
-        let info = paused
-            .as_ref()
-            .map(|run| run.info)
-            .or_else(|| self.pause_info.get())
-            .unwrap_or(crate::ir::PauseInfo {
-                reason: crate::ir::PauseReason::Requested,
-                position: None,
-            });
-        self.pause_info.set(None);
-        *paused = Some(PausedRun { levels, info });
-    }
-
     /// The reason and position the debug point is parking with.
     pub(crate) fn set_pause_info(&self, info: crate::ir::PauseInfo) {
         self.pause_info.set(Some(info));
@@ -2511,6 +2504,52 @@ impl Agent {
     /// be something other than a `Vm` activation).
     pub(crate) fn clear_pause_ticket(&self) {
         self.pause_ticket.set(None);
+    }
+
+    /// Ask the next resume to stop after one step (`Debugger.stepOver`,
+    /// `stepInto`, `stepOut`). The resume arms it, because a step is relative to
+    /// the activation that was halted, which only the resume knows.
+    pub fn request_step(&self, mode: crate::ir::StepMode) {
+        self.pending_step.set(Some(mode));
+    }
+
+    /// Take the step a resume is starting with. The caller arms it with the
+    /// halted activation's depth.
+    pub(crate) fn take_pending_step(&self) -> Option<crate::ir::StepMode> {
+        self.pending_step.take()
+    }
+
+    /// Arm a step relative to the activation at `depth`.
+    pub(crate) fn arm_step(&self, mode: crate::ir::StepMode, depth: usize) {
+        self.step.set(Some((mode, depth)));
+    }
+
+    /// Consume the armed step: the stop it produced, or the run that finished
+    /// without one, owns it.
+    pub(crate) fn clear_step(&self) {
+        self.step.set(None);
+    }
+
+    /// Set the activation depth a step is judged against (see
+    /// [`Agent::level_depth`]).
+    pub(crate) fn set_level_depth(&self, depth: usize) {
+        self.level_depth.set(depth);
+    }
+
+    /// Whether the armed step wants a stop at the activation running now.
+    ///
+    /// The rule is the protocol's: a step *into* stops at any point, a step
+    /// *over* at a point of the halted activation or an outer one (so a callee's
+    /// points are passed through), and a step *out* only once the halted
+    /// activation has returned.
+    pub(crate) fn step_allows_stop(&self) -> bool {
+        let depth = self.level_depth.get();
+        match self.step.get() {
+            Some((crate::ir::StepMode::Into, _)) => true,
+            Some((crate::ir::StepMode::Over, armed)) => depth <= armed,
+            Some((crate::ir::StepMode::Out, armed)) => depth < armed,
+            None => false,
+        }
     }
 
     /// Whether a stopped call can be resumed by the host: the callee runs on a
@@ -2699,6 +2738,9 @@ impl Agent {
             pause_info: Cell::new(None),
             pause_in_flight: Cell::new(false),
             pause_ticket: Cell::new(None),
+            pending_step: Cell::new(None),
+            step: Cell::new(None),
+            level_depth: Cell::new(0),
             breakpoints: RefCell::new(std::collections::HashSet::new()),
             roots: Rc::new(AgentRoots::new()),
             heap_state: std::cell::Cell::new(std::ptr::null()),

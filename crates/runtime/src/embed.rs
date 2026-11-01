@@ -41,7 +41,7 @@ use crate::host::HostHooks;
 use crate::module::SourceTextModule;
 use crate::realm::Realm;
 
-pub use crate::ir::{PauseInfo, PauseReason};
+pub use crate::ir::{PauseInfo, PauseReason, StepMode};
 
 /// A console or rejection callback: receives the rendered text.
 pub type OutputFn = Box<dyn Fn(&str)>;
@@ -1069,6 +1069,12 @@ impl Context {
         })
     }
 
+    /// Ask the next resume to stop after one step (`Debugger.stepOver`,
+    /// `stepInto`, `stepOut`). The resume is what performs it.
+    pub fn request_step(&mut self, mode: StepMode) {
+        self.agent.request_step(mode);
+    }
+
     /// Continue the parked run, answering the value its script completes with.
     pub fn resume_paused(&mut self) -> Result<JsValue, JsError> {
         crate::eval::resume_paused(&mut self.agent).map(JsValue)
@@ -1076,9 +1082,17 @@ impl Context {
 
     /// Evaluate `source` at the stopped position
     /// (`Debugger.evaluateOnCallFrame`): a direct eval under the paused run's
-    /// own context and strictness.
+    /// own context and strictness, against the innermost parked activation.
     pub fn evaluate_paused(&mut self, source: &str) -> Result<JsValue, JsError> {
         crate::eval::evaluate_paused(&mut self.agent, source).map(JsValue)
+    }
+
+    /// Evaluate `source` at the `level`-th parked activation, innermost first:
+    /// the frame a protocol client names when it asks for one that is not the
+    /// halted one. A caller's locals are its own, and an assignment writes back
+    /// into that activation's frame.
+    pub fn evaluate_paused_at(&mut self, level: usize, source: &str) -> Result<JsValue, JsError> {
+        crate::eval::evaluate_paused_at(&mut self.agent, level, source).map(JsValue)
     }
 
     /// Write this realm's state as a snapshot blob.
@@ -5282,6 +5296,119 @@ mod tests {
             Some(3.0),
             "each level's result lands at the call site above it, in order"
         );
+    }
+
+    #[test]
+    fn stepping_over_a_call_that_returns_stops_in_the_caller() {
+        let mut context = Context::new().unwrap();
+        context.agent_mut().set_debug_attached(true).unwrap();
+        let source = "globalThis.a = 0;\n\
+                      function f() { globalThis.a = 1; }\n\
+                      f();\n\
+                      globalThis.after = 1;";
+        let at = source.find("globalThis.a = 1;").unwrap() as u32;
+        let after = source.find("globalThis.after = 1;").unwrap() as u32;
+        context.agent_mut().set_breakpoints(&[at]);
+        let error = context.eval(source).unwrap_err();
+        assert_eq!(error.message, "execution paused at a breakpoint");
+        assert_eq!(context.agent().paused_depth(), 2);
+        context.request_step(crate::ir::StepMode::Over);
+        let error = crate::eval::resume_paused(context.agent_mut()).unwrap_err();
+        assert_eq!(error.message, "execution paused after a step");
+        assert_eq!(
+            context.agent().paused_position().map(|span| span.start),
+            Some(after),
+            "the callee returned, so the step lands on the script's next statement"
+        );
+        assert_eq!(
+            context.agent().paused_depth(),
+            1,
+            "only the script's activation is parked at that stop"
+        );
+        assert_eq!(
+            context.agent().paused_reason(),
+            Some(crate::ir::PauseReason::Step)
+        );
+        crate::eval::resume_paused(context.agent_mut()).unwrap();
+    }
+
+    #[test]
+    fn stepping_into_a_call_stops_in_the_callee() {
+        let mut context = Context::new().unwrap();
+        context.agent_mut().set_debug_attached(true).unwrap();
+        let source = "globalThis.trace = [];\n\
+                      function g() { globalThis.trace.push(1); return 1; }\n\
+                      function f() { g(); globalThis.after = 1; }\n\
+                      f();";
+        let call = source.find("g();").unwrap() as u32;
+        let inside = source.find("globalThis.trace.push(1);").unwrap() as u32;
+        context.agent_mut().set_breakpoints(&[call]);
+        let error = context.eval(source).unwrap_err();
+        assert_eq!(error.message, "execution paused at a breakpoint");
+        assert_eq!(context.agent().paused_depth(), 2);
+        context.request_step(crate::ir::StepMode::Into);
+        let error = crate::eval::resume_paused(context.agent_mut()).unwrap_err();
+        assert_eq!(error.message, "execution paused after a step");
+        assert_eq!(
+            context.agent().paused_position().map(|span| span.start),
+            Some(inside),
+            "step-into stops at the first point of the callee"
+        );
+        assert_eq!(
+            context.agent().paused_depth(),
+            3,
+            "the script, f and g are all parked"
+        );
+        crate::eval::resume_paused(context.agent_mut()).unwrap();
+        assert_eq!(
+            context.eval("globalThis.after").unwrap().as_number(),
+            Some(1.0)
+        );
+    }
+
+    #[test]
+    fn stepping_out_stops_in_the_caller() {
+        let mut context = Context::new().unwrap();
+        context.agent_mut().set_debug_attached(true).unwrap();
+        let source = "globalThis.trace = [];\n\
+                      function g() { globalThis.trace.push(1); return 1; }\n\
+                      function f() { g(); globalThis.after = 1; }\n\
+                      f();";
+        let inside = source.find("globalThis.trace.push(1);").unwrap() as u32;
+        let after = source.find("globalThis.after = 1;").unwrap() as u32;
+        context.agent_mut().set_breakpoints(&[inside]);
+        let error = context.eval(source).unwrap_err();
+        assert_eq!(error.message, "execution paused at a breakpoint");
+        assert_eq!(context.agent().paused_depth(), 3);
+        context.request_step(crate::ir::StepMode::Out);
+        let error = crate::eval::resume_paused(context.agent_mut()).unwrap_err();
+        assert_eq!(error.message, "execution paused after a step");
+        assert_eq!(
+            context.agent().paused_position().map(|span| span.start),
+            Some(after),
+            "step-out stops where the caller resumes, not at a deeper point"
+        );
+        assert_eq!(context.agent().paused_depth(), 2);
+        crate::eval::resume_paused(context.agent_mut()).unwrap();
+    }
+
+    #[test]
+    fn a_throw_that_reaches_the_top_after_a_resume_is_that_error() {
+        let mut context = Context::new().unwrap();
+        context.agent_mut().set_debug_attached(true).unwrap();
+        let source = "function f() { globalThis.s = 1; throw new Error('boom'); }\n\
+                      f();";
+        let at = source.find("globalThis.s = 1;").unwrap() as u32;
+        context.agent_mut().set_breakpoints(&[at]);
+        assert!(context.eval(source).is_err());
+        let error = crate::eval::resume_paused(context.agent_mut()).unwrap_err();
+        assert!(
+            error.value.is_some(),
+            "an uncaught throw reaches the host as the thrown value, not an \
+             internal error: {}",
+            error.message
+        );
+        assert!(context.agent().paused_reason().is_none());
     }
 
     #[test]

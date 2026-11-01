@@ -1931,6 +1931,45 @@ not a pause question), constructs as parkable levels (a `new` whose body stops i
 deferred today, because its completion has a `this`-based mapping to apply), and
 `evaluateOnCallFrame` honouring the frame id it is given.
 
+**2026-11-01, stepping and per-frame evaluation landed on the same machinery.**
+A step is a property of the *resume*, not of the point: `Agent::request_step`
+records the mode, `resume_paused` arms it against the depth of the innermost
+parked level (`levels.len() - 1`), and a `level_depth` counter set per level
+while the resume walks is what the point gate compares against. A step *into*
+stops anywhere, *over* at a depth at or outside the armed one (so a callee's
+points are passed through, and the stop lands in the caller when the callee
+returns), and *out* only below it. A breakpoint still outranks a step. The
+reason is `PauseReason::Step`, which maps to `Debugger.paused`'s `"step"` and to
+`SLAG_PAUSE_STEP`/`kStep` on the facade.
+
+The same slice fixed three things the continuation stack exposed:
+
+- **Re-parking has to append, not replace.** A second stop *deeper* than the
+  level being resumed has already parked itself and every activation between it
+  and that level on the way out, so `repark_paused` appends the running level and
+  the outer ones after them. Replacing the record silently dropped the callee's
+  level, which is what step-into caught.
+- **A re-parked level's call site is the new one.** The site a level delivers
+  into is set on its `Vm` by `complete_call` at the stop, so the re-park takes
+  `vm.take_pause_site()`; the site the level had when it was first parked
+  describes a call that has already finished.
+- **The outermost level's outcome is the run's, however it ended.** A throw that
+  reaches the top after a resume used to fall through the delivery match and
+  report an internal "ran out of activations" error; the emptiness test now
+  happens before the match, so `finish_script_run` sees every outcome.
+
+`evaluate_paused_at(level, source)` is `evaluateOnCallFrame` over the frame the
+client names: the same compile against that activation's scope, the same scratch
+run, and the write-back goes to that level's `Vm`. The facade's
+`EvaluateOnPausedFrame` stays the halted (innermost) frame, which is what its
+name says.
+
+What is still open: the `scopeChain` and `Runtime.getProperties` behind it (a
+scope and property model, not a pause question), constructs as parkable levels
+(a `new` whose body stops is deferred, because its completion has a `this`-based
+mapping to apply), and stops inside a generator or async body, a direct eval, a
+module body, or a bound or proxied callee, which all still defer.
+
 ## 15. Sources
 
 Verified on 2026-10-31:

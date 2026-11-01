@@ -9,10 +9,12 @@
 //! `Debugger.paused`/`Debugger.resumed` events.
 //!
 //! What it does not do yet, because the engine cannot: expose a scope chain or
-//! remote objects (`Runtime.getProperties`), or step. Stepping is one statement
-//! at a time through the same continuation stack. A stop reports every parked
-//! activation as a call frame, but only the innermost one can be evaluated
-//! against (`evaluateOnCallFrame` ignores the id it is given).
+//! remote objects (`Runtime.getProperties`). A stop reports every parked
+//! activation as a call frame, `stepOver`/`stepInto`/`stepOut` stop at the next
+//! statement of the halted activation, a deeper one or an outer one, and
+//! `evaluateOnCallFrame` evaluates against the frame its `callFrameId` names.
+//! A `stepInto` a generator or a builtin callback's body is deferred, because
+//! those runs cannot be parked yet.
 //!
 //! The host drives it as Chrome does: register each script it compiles, feed
 //! messages to [`Session::dispatch`], and ask [`Session::poll`] for the events a
@@ -142,6 +144,7 @@ impl Session {
         let reason = match info.reason {
             slag::PauseReason::Breakpoint => "breakpoint",
             slag::PauseReason::Requested => "other",
+            slag::PauseReason::Step => "step",
         };
         let hit: Vec<String> = self
             .breakpoints
@@ -194,13 +197,11 @@ impl Session {
                     .as_ref()
                     .and_then(|name| self.scripts.iter().find(|script| &script.url == name))
                     .map_or(script, |script| script.id);
-                // The innermost frame's position is the stop's own; a caller's
-                // is the site its context recorded. A frame with neither
-                // answers -1, which is what the protocol uses for "unknown"
-                // rather than the first line of the file.
-                let (line_number, column_number) = if index == 0 {
-                    (line as i64, column as i64)
-                } else if frame.line == 0 {
+                // The engine reports each frame's own site, in the source text
+                // its spans index, so no point lookup is needed here. A frame
+                // with neither answers -1, which is what the protocol uses for
+                // "unknown" rather than the first line of the file.
+                let (line_number, column_number) = if frame.line == 0 {
                     (-1, -1)
                 } else {
                     (
@@ -278,9 +279,34 @@ impl Session {
                 let _ = context.resume_paused();
                 Ok((json!({}), vec![event("Debugger.resumed", json!({}))]))
             }
+            "Debugger.stepOver" | "Debugger.stepInto" | "Debugger.stepOut" => {
+                let mode = match method {
+                    "Debugger.stepInto" => slag::StepMode::Into,
+                    "Debugger.stepOver" => slag::StepMode::Over,
+                    _ => slag::StepMode::Out,
+                };
+                self.paused = None;
+                context.request_step(mode);
+                // The resume itself reports the stop it produced through the
+                // paused error; `poll` is what announces it, so a step that
+                // lands immediately emits `resumed` then `paused` in order.
+                let _ = context.resume_paused();
+                Ok((json!({}), vec![event("Debugger.resumed", json!({}))]))
+            }
             "Debugger.evaluateOnCallFrame" => {
                 let expression = params["expression"].as_str().unwrap_or("");
-                Ok((evaluation(context.evaluate_paused(expression)), Vec::new()))
+                // `frame-N` is the N-th parked activation, innermost first
+                // (`Debugger.paused`'s `callFrames`), or the halted one when the
+                // client names nothing.
+                let level = params["callFrameId"]
+                    .as_str()
+                    .and_then(|id| id.strip_prefix("frame-"))
+                    .and_then(|index| index.parse::<usize>().ok())
+                    .map_or(0, |index| index.saturating_sub(1));
+                Ok((
+                    evaluation(context.evaluate_paused_at(level, expression)),
+                    Vec::new(),
+                ))
             }
             "Debugger.getScriptSource" => {
                 let script_id = params["scriptId"]
@@ -634,11 +660,73 @@ mod tests {
     }
 
     #[test]
+    fn evaluate_on_call_frame_reads_the_frame_it_names() {
+        let (mut context, mut session) = session();
+        let source = "function f(x) {\n  globalThis.hit = 1;\n  return x;\n}\nvar v = f(7);\n";
+        session.add_script(&context, "app.js", source).unwrap();
+        session.dispatch(
+            &mut context,
+            r#"{"id":2,"method":"Debugger.setBreakpointByUrl","params":{"url":"app.js","lineNumber":1,"columnNumber":0}}"#,
+        );
+        assert!(context.agent_mut().run_script(source).is_err());
+        session.poll(&context);
+        // frame-1 is the halted activation, frame-2 its caller (the script).
+        let answer = session.dispatch(
+            &mut context,
+            r#"{"id":3,"method":"Debugger.evaluateOnCallFrame","params":{"callFrameId":"frame-1","expression":"x * 2"}}"#,
+        );
+        let response: Json = serde_json::from_str(&answer[0]).unwrap();
+        assert_eq!(response["result"]["result"]["value"], 14.0, "{response}");
+        let answer = session.dispatch(
+            &mut context,
+            r#"{"id":4,"method":"Debugger.evaluateOnCallFrame","params":{"callFrameId":"frame-2","expression":"typeof x"}}"#,
+        );
+        let response: Json = serde_json::from_str(&answer[0]).unwrap();
+        assert_eq!(
+            response["result"]["result"]["value"], "undefined",
+            "the caller has no `x`: {response}"
+        );
+    }
+
+    #[test]
     fn an_unknown_method_is_refused_in_the_protocol_way() {
         let (mut context, mut session) = session();
-        let answer = session.dispatch(&mut context, r#"{"id":7,"method":"Debugger.stepInto"}"#);
+        let answer = session.dispatch(
+            &mut context,
+            r#"{"id":7,"method":"Debugger.setPauseOnExceptions"}"#,
+        );
         let response: Json = serde_json::from_str(&answer[0]).unwrap();
         assert_eq!(response["error"]["code"], -32601);
+    }
+
+    #[test]
+    fn stepping_over_stops_at_the_next_line_in_the_same_frame() {
+        let (mut context, mut session) = session();
+        let source = "function f() {\n  globalThis.a = 1;\n  globalThis.b = 1;\n}\nf();\n";
+        session.add_script(&context, "app.js", source).unwrap();
+        session.dispatch(
+            &mut context,
+            r#"{"id":2,"method":"Debugger.setBreakpointByUrl","params":{"url":"app.js","lineNumber":1,"columnNumber":0}}"#,
+        );
+        assert!(context.agent_mut().run_script(source).is_err());
+        assert!(session.poll(&context).len() == 1);
+
+        let answer = session.dispatch(&mut context, r#"{"id":3,"method":"Debugger.stepOver"}"#);
+        let answers: Vec<Json> = answer
+            .iter()
+            .map(|text| serde_json::from_str(text).unwrap())
+            .collect();
+        assert_eq!(answers[0]["method"], "Debugger.resumed");
+        let events = session.poll(&context);
+        assert_eq!(events.len(), 1, "the step stopped again: {events:?}");
+        let paused: Json = serde_json::from_str(&events[0]).unwrap();
+        assert_eq!(paused["params"]["reason"], "step");
+        let frame = &paused["params"]["callFrames"][0];
+        assert_eq!(frame["functionName"], "f");
+        assert_eq!(
+            frame["location"]["lineNumber"], 2,
+            "the step landed on the next statement, not in the script: {paused}"
+        );
     }
 
     #[test]

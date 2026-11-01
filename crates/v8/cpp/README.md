@@ -54,9 +54,9 @@ crates/v8/cpp/build/Release/debugger.exe
 
 ## The debugger surface
 
-`debugger.exe` is the whole protocol in one run: attach a session, set a
+`debugger.exe` is the whole protocol in three runs: attach a session, set a
 breakpoint resolved from the script text, run until it stops, inspect where it
-stopped, and resume.
+stopped, resume; then the same inside a called function; then stepping.
 
 ```c++
 context->SetDebugAttached(true);
@@ -67,6 +67,9 @@ v8::Context::PauseInfo pause;
 context->Paused(&pause);                    // kBreakpoint, offset..offset+len
 context->EvaluateOnPausedFrame(src).ToLocal(&value);  // in the paused scope
 context->Resume().ToLocal(&value);          // the script's completion value
+
+context->StepOver();                        // ask the next resume to step
+script->Run(context) /* or */ context->Resume();     // stops again: kStep
 ```
 
 These are `v8::Context` extensions, not `v8.h` API: V8 exposes the same
@@ -100,7 +103,13 @@ stack landed.
 expression and an assignment both reach a certified body's locals: the engine
 compiles the evaluation against the halted body's scope, runs it on the frame,
 and writes the frame back, so `counter = 100` at a stop changes what the resumed
-code reads.
+code reads. It evaluates the halted activation, which is the innermost one.
+- **Stepping is `StepOver`/`StepInto`/`StepOut` then `Resume`.** The step is
+relative to the activation that was halted: over stops at its next point (or an
+outer one, so a callee's points are passed through), into stops at any point
+including a callee's, out stops once the halted activation has returned. A
+breakpoint outranks a step, so a session that is stepping still stops where it
+asked to, and the stop reports `PauseInfo::kStep`.
 
 
 ## A1: the indirect handle

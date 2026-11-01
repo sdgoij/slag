@@ -66,6 +66,20 @@ const char kNestedSource[] =
 
 const char kNestedBreakpoint[] = "globalThis.trace.push(x);";
 
+// The third demo: stepping. A breakpoint stops inside `f`, and each step stops
+// at the next statement of the halted activation until the callee returns, when
+// the stop lands back in the script.
+const char kStepSource[] =
+    "function f() {\n"
+    "  globalThis.steps = 1;\n"
+    "  globalThis.steps = 2;\n"
+    "}\n"
+    "f();\n"
+    "globalThis.steps;";
+
+const char kStepFirst[] = "globalThis.steps = 1;";
+const char kStepSecond[] = "globalThis.steps = 2;";
+
 // Answers null on success, or the reason the demo failed.
 const char* RunDemo(v8::Isolate* isolate, v8::Local<v8::Context> context) {
   context->SetDebugAttached(true);
@@ -166,6 +180,51 @@ const char* RunNestedDemo(v8::Isolate* isolate, v8::Local<v8::Context> context) 
   return nullptr;
 }
 
+const char* RunStepDemo(v8::Isolate* isolate, v8::Local<v8::Context> context) {
+  const char* first = strstr(kStepSource, kStepFirst);
+  const char* second = strstr(kStepSource, kStepSecond);
+  if (first == nullptr || second == nullptr) return "the step text moved";
+  uint32_t at_first = static_cast<uint32_t>(first - kStepSource);
+  uint32_t at_second = static_cast<uint32_t>(second - kStepSource);
+  context->SetBreakpoints(&at_first, 1);
+
+  v8::Local<v8::String> source = v8::String::NewFromUtf8Literal(isolate, kStepSource);
+  v8::Local<v8::Script> script;
+  if (!v8::Script::Compile(context, source).ToLocal(&script)) return "step compile";
+  (void)script->Run(context);
+
+  v8::Context::PauseInfo pause;
+  if (!context->Paused(&pause)) return "the step demo did not stop";
+  if (pause.start != at_first) return "the step demo stopped in the wrong place";
+
+  /* Step over: the next statement of the halted activation. The resume answers
+   * empty, because it stopped again. */
+  context->StepOver();
+  (void)context->Resume();
+  if (!context->Paused(&pause)) return "step over did not stop";
+  if (pause.reason != v8::Context::PauseInfo::kStep) return "the stop was not a step";
+  if (pause.start != at_second) return "step over landed on the wrong statement";
+  printf("stepped: over to offset %u, reason step\n", pause.start);
+
+  /* Step over again: the callee ends, so the stop lands in the script at the
+   * statement after the call. */
+  context->SetBreakpoints(nullptr, 0);
+  context->StepOver();
+  (void)context->Resume();
+  if (!context->Paused(&pause)) return "step over the return did not stop";
+  printf("stepped: over the return to offset %u\n", pause.start);
+  if (pause.start != static_cast<uint32_t>(strstr(kStepSource, "globalThis.steps;") - kStepSource)) {
+    return "the step out of the callee landed in the wrong frame";
+  }
+
+  v8::Local<v8::Value> value;
+  if (!context->Resume().ToLocal(&value)) return "step demo resume";
+  int32_t completed = value->Int32Value(context).FromMaybe(0);
+  printf("resumed: the stepped run completed with %d\n", completed);
+  if (completed != 2) return "the stepped run completed with the wrong value";
+  return nullptr;
+}
+
 }  // namespace
 
 int main(int argc, char* argv[]) {
@@ -193,6 +252,9 @@ int main(int argc, char* argv[]) {
       fprintf(stderr, "debugger: %s\n", error);
       status = 1;
     } else if (const char* error = RunNestedDemo(isolate, context)) {
+      fprintf(stderr, "debugger: %s\n", error);
+      status = 1;
+    } else if (const char* error = RunStepDemo(isolate, context)) {
       fprintf(stderr, "debugger: %s\n", error);
       status = 1;
     }
