@@ -467,6 +467,23 @@ void MakePromise(const v8::FunctionCallbackInfo<v8::Value>& info) {
   info.GetReturnValue().Set(resolver->GetPromise());
 }
 
+// A call-as-function handler: the arguments arrive and the template's data value
+// is on the info. `this` is the call's receiver, which for a plain call is
+// undefined (as in V8); the instance's own internal fields are reached from the
+// host side, on the callee value.
+void CallableBody(const v8::FunctionCallbackInfo<v8::Value>& info) {
+  v8::Isolate* isolate = info.GetIsolate();
+  v8::Local<v8::Context> context = isolate->GetCurrentContext();
+  const int32_t a = NumberArg(info, 0);
+  const int32_t b = NumberArg(info, 1);
+  const int32_t base = info.Data()->Int32Value(context).FromMaybe(0);
+  info.GetReturnValue().Set(v8::Integer::New(isolate, a + b + base));
+}
+
+void CallableMarker(const v8::FunctionCallbackInfo<v8::Value>& info) {
+  info.GetReturnValue().Set(v8::Integer::New(info.GetIsolate(), 7));
+}
+
 // A host allocator that counts what it lends, so the harness can prove the facade
 // draws a backing store from it and gives the bytes back.
 struct CountingAllocator : v8::ArrayBuffer::Allocator {
@@ -2596,6 +2613,80 @@ int main() {
     }
     expect(number_at("scopeSettled") == 1, "the scope drained on exit");
     isolate->SetMicrotasksPolicy(v8::MicrotasksPolicy::kAuto);
+  }
+
+  // A call-as-function handler: the instance a template builds is callable, and a
+  // call runs the host's handler with the instance as `this`.
+  {
+    v8::HandleScope scope(isolate);
+    v8::Local<v8::Context> current = context.Get(isolate);
+    v8::Context::Scope context_scope(current);
+    const auto expect = [&](bool condition, const char* what) {
+      if (!condition) {
+        fprintf(stderr, "callable: %s\n", what);
+        ++failures;
+      }
+    };
+    const auto run = [&](const char* source) {
+      return v8::Script::Compile(
+                 current, v8::String::NewFromUtf8Literal(isolate, source))
+          .ToLocalChecked()
+          ->Run(current)
+          .ToLocalChecked();
+    };
+    const auto bind = [&](const char* name, v8::Local<v8::Value> value) {
+      current->Global()
+          ->Set(current, v8::String::NewFromUtf8Literal(isolate, name), value)
+          .ToChecked();
+    };
+    const auto number_at = [&](const char* name) {
+      return current->Global()
+          ->Get(current, v8::String::NewFromUtf8Literal(isolate, name))
+          .ToLocalChecked()
+          ->Int32Value(current)
+          .FromMaybe(-1);
+    };
+
+    v8::Local<v8::ObjectTemplate> tmpl = v8::ObjectTemplate::New(isolate);
+    tmpl->SetInternalFieldCount(1);
+    tmpl->Set(isolate, "mark",
+              v8::FunctionTemplate::New(isolate, CallableMarker));
+    tmpl->SetCallAsFunctionHandler(CallableBody, v8::Integer::New(isolate, 100));
+
+    v8::Local<v8::Object> callable = tmpl->NewInstance(current).ToLocalChecked();
+    expect(callable.As<v8::Value>()->IsFunction(),
+           "a call handler makes the instance callable");
+    expect(callable->InternalFieldCount() == 1,
+           "the callable instance keeps its internal fields");
+
+    auto* counter = new HostCounter{5};
+    callable->SetAlignedPointerInInternalField(0, counter);
+    expect(callable->Wrappable<HostCounter>() == counter,
+           "the callable instance carries its internal field");
+    bind("callable", callable);
+    run("globalThis.callableAnswer = callable(2, 3);"
+        " globalThis.callableMark = callable.mark();"
+        " globalThis.callableIsFunction = typeof callable === 'function' ? 1 : 0;");
+    expect(number_at("callableAnswer") == 105,
+           "the handler ran with its arguments and data");
+    expect(number_at("callableMark") == 7,
+           "the callable carries the template's method");
+    expect(number_at("callableIsFunction") == 1,
+           "a script sees the instance as a function");
+
+    // A template with a property handler keeps the handler object instead, since
+    // the engine's host objects have no [[Call]]; the instance is then not
+    // callable, which is the narrowing the README records.
+    v8::Local<v8::ObjectTemplate> handled = v8::ObjectTemplate::New(isolate);
+    v8::NamedPropertyHandlerConfiguration configuration(
+        HostGet, HostSet, HostQuery, HostDelete, HostEnumerate, HostDescriptor,
+        HostDefiner);
+    handled->SetHandler(configuration);
+    handled->SetCallAsFunctionHandler(CallableBody);
+    v8::Local<v8::Object> plain = handled->NewInstance(current).ToLocalChecked();
+    expect(!plain.As<v8::Value>()->IsFunction(),
+           "a template with a handler keeps a handler object");
+    delete counter;
   }
 
   // A host-traced reference: a root the C++ side owns and releases. Once it

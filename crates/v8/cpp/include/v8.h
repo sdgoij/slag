@@ -1445,16 +1445,18 @@ class ObjectTemplate {
                            PropertyAttribute attribute = None);
 
   /* Install a call-as-function handler
-   * (`v8::ObjectTemplate::SetCallAsFunctionHandler`). The engine's template
-   * instances are ordinary objects, which are not callable, so this records the
-   * handler but an instance stays uncallable; a host that needs one makes the
-   * callable in its own constructor. */
+   * (`v8::ObjectTemplate::SetCallAsFunctionHandler`). An instance built from a
+   * template with one is callable: the facade makes a builtin whose body is the
+   * handler, with the template's members and internal fields on the callee
+   * itself. A template that also has a property handler keeps the handler
+   * object instead, because the engine's host objects have no [[Call]]. */
   void SetCallAsFunctionHandler(FunctionCallback callback,
                                 Local<Value> data = Local<Value>()) {
     call_as_function_ = callback;
     call_as_function_data_ = data;
   }
   FunctionCallback call_as_function() const { return call_as_function_; }
+  Local<Value> call_as_function_data() const { return call_as_function_data_; }
 
   /* One installed accessor: the name and data are retained for the template's
    * lifetime (templates are not freed), and their bits are kept so the

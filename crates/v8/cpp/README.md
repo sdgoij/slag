@@ -559,7 +559,7 @@ not a claim that gin itself links.
 - `Isolate::SetMicrotasksPolicy` / `PerformMicrotaskCheckpoint` and
   `platform::PumpMessageLoop`, over the engine's job queues.
 - `ObjectTemplate`/`FunctionTemplate` and host callbacks with arguments and a
-  return value.
+  return value. `SetCallAsFunctionHandler` makes the instance callable.
 - `Global<T>`, `Maybe<T>`, `MaybeLocal<T>`.
 - `ObjectTemplate::SetInternalFieldCount`/`NewInstance`, internal fields, and
   `Object::Wrappable<T>`, `IsApiWrapper`, `This()`.
@@ -689,16 +689,20 @@ not a claim that gin itself links.
   `SnapshotCreator::AddContext`, `SetDataBlob`, `AddData`, the external
   references, and the code cache are absent; a cached compile would need the
   engine to serialize its compiled program, which it does not yet do.
-- An `ObjectTemplate::SetCallAsFunctionHandler` handler is recorded but the
-  instance is not callable (the engine's template instances are ordinary
-  objects), and `Signature`/`AccessorSignature` are accepted without an access
-  check. `FunctionTemplate::InstanceTemplate`'s own accessors and members reach
-  instances through the prototype object rather than as own properties, and
-  `SideEffectType` is not consulted.
+- `SetCallAsFunctionHandler` makes an instance callable: a builtin whose body is
+  the handler, with the template's members and internal fields on the callee
+  itself, so `typeof instance` is `"function"` and a call runs the host's code.
 - `Platform` is a handle plus a message pump: `PumpMessageLoop` runs the
   isolate's queued jobs (microtasks, promise reactions, due timers) and answers
   whether it ran any. There are no host-posted platform tasks or task runners
   yet, so `PostTask`/`CallOnForegroundThread` are absent rather than ignored.
+- An `ObjectTemplate` with both a call handler and a property handler keeps the
+  handler object, which is not callable: the engine's host objects have no
+  `[[Call]]`. A callable instance also carries the builtin's `length` property
+  and its `[[Prototype]]` is `%Object.prototype%`, as V8's callable instance's
+  is. `Signature`/`AccessorSignature` are accepted without an access check, and
+  `FunctionTemplate::InstanceTemplate`'s own accessors and members reach
+  instances through the prototype object rather than as own properties.
 - A `Map`/`Set` operation runs an engine intrinsic, so the container surface has
   no callback form yet: calling one from a host callback records a re-entrancy
   error instead of running. `WeakMap`/`WeakSet` and the `Map`/`Set` iterators as
@@ -806,4 +810,7 @@ checks that a script reads the same entries the host wrote, and checks that
 `Size` refuses a handle that is not a map. The allocator block makes a buffer and
 a store through a counting host allocator, checks that both drew their bytes from
 it, that dropping the store called `Free` at once, and that the bytes are still
-the isolate's external memory.
+the isolate's external memory. The callable block builds a template with a call
+handler, a method, and an internal field, checks that the instance is a function,
+calls it through a script, and checks that a template with a property handler
+keeps a handler object instead.

@@ -79,6 +79,26 @@ uint64_t HostTrampoline(void* data, const void* call, uint64_t this_value,
   return info.return_value();
 }
 
+/* The body of a callable template instance
+ * (`ObjectTemplate::SetCallAsFunctionHandler`): the template is the data, so the
+ * handler and its data value are read at call time. */
+uint64_t CallAsFunctionTrampoline(void* data, const void* call,
+                                  uint64_t this_value, const uint64_t* args,
+                                  size_t len) {
+  auto* tmpl = static_cast<v8::ObjectTemplate*>(data);
+  if (tmpl == nullptr || tmpl->call_as_function() == nullptr) {
+    return slag_undefined();
+  }
+  v8::FunctionCallbackInfo<v8::Value> info(
+      v8::g_current_isolate, call, this_value, args, static_cast<int>(len),
+      tmpl->call_as_function_data().raw());
+  const void* previous = g_callback_token;
+  g_callback_token = slag_callback_token();
+  tmpl->call_as_function()(info);
+  g_callback_token = previous;
+  return info.return_value();
+}
+
 /* The property-handler callbacks, adapted from the flat ABI to the C++ shapes.
  * `state` is the configuration the template installed, so the trampoline can
  * reach the host's own callback; the answer slot is where the host writes. */
@@ -2570,6 +2590,14 @@ MaybeLocal<Object> ObjectTemplate::NewInstance(Local<Context> context) {
     handler.indexed_state = &indexed_handler_;
     status = slag_object_new_handler(slag, static_cast<size_t>(internal_fields_),
                                      1, &handler, &object);
+  } else if (call_as_function_ != nullptr) {
+    // The instance is callable: a builtin whose body is the template's handler,
+    // with the template's members and internal fields on its object part. A
+    // template with a property handler keeps the handler object instead, since
+    // the engine's host objects have no [[Call]].
+    status = slag_object_new_callable(slag,
+                                      static_cast<size_t>(internal_fields_), 1,
+                                      &CallAsFunctionTrampoline, this, &object);
   } else {
     status = slag_object_new(slag, static_cast<size_t>(internal_fields_), 1,
                              &object);

@@ -1102,6 +1102,22 @@ show up in `HeapStatistics::external_memory`.
 does, and an isolate with no allocator falls back to the engine's allocation
 where V8 would refuse.
 
+*Callable template instances (2026-11-01).* `SetCallAsFunctionHandler` used to be
+recorded and ignored. Making it work needed no engine change after one
+observation: a function in this engine already has an object part
+(`Function.object`), so the instance can *be* a builtin whose body runs the host's
+handler, with the template's members, internal fields, and API-wrapper bit on the
+callee itself. `create_callable_instance` builds it, and `JsValue::as_object`
+now maps a function to its object part (which is what `context::as_object` always
+did, and what makes every `slag_object_*` entry point accept a callable).
+
+Two narrowings are recorded rather than hidden: a template with both a call
+handler and a property handler keeps the handler object, because the engine's
+host objects have no `[[Call]]` and a callable cannot also be a `HostOps` object;
+and the callable carries the builtin's `length` property, since `create_builtin`
+always installs one. `info.This()` inside the handler is the call's receiver,
+which for a plain `f()` is undefined, exactly as in V8.
+
 ## 15. Sources
 
 Verified on 2026-10-31:

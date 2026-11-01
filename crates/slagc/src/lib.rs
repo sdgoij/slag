@@ -3659,6 +3659,49 @@ pub extern "C" fn slag_callback_token() -> *const c_void {
     CallbackWindow::token()
 }
 
+/// An object that is also callable (`ObjectTemplate::NewInstance` for a template
+/// with a call handler): the value is a builtin whose body runs `callback`, and
+/// its object part carries `count` internal fields.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn slag_object_new_callable(
+    context: *mut SlagContext,
+    count: usize,
+    api_wrapper: i32,
+    callback: SlagHostFn,
+    data: *mut c_void,
+    out: *mut u64,
+) -> i32 {
+    let Some(context) = context.as_ref() else {
+        return 2;
+    };
+    let host = host_fn(context, callback, data);
+    let created = {
+        let mut engine = match context.context.try_borrow_mut() {
+            Ok(engine) => engine,
+            Err(_) => {
+                reentrant(context);
+                return 1;
+            }
+        };
+        engine.create_callable_instance(host)
+    };
+    let value = match created {
+        Ok(value) => value,
+        Err(error) => {
+            record(context, error);
+            return 1;
+        }
+    };
+    let Some(object) = value.as_object() else {
+        return 2;
+    };
+    object.set_internal_fields(count, api_wrapper != 0);
+    if !out.is_null() {
+        *out = value.to_bits();
+    }
+    0
+}
+
 /// An ordinary object allocated through a running callback (`v8::Object::New`
 /// inside a getter, say). Returns 2 when `token` names no running callback.
 #[unsafe(no_mangle)]

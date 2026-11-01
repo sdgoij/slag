@@ -742,6 +742,36 @@ fn not_a_set() -> JsError {
     JsError::new(ErrorKind::TypeError, "value is not a Set".into())
 }
 
+/// A callable template instance (`ObjectTemplate::SetCallAsFunctionHandler`):
+/// the value is a builtin function whose body runs the host's callback, and its
+/// object part is where the instance's properties and internal fields go.
+///
+/// V8 makes the instance itself callable; here the value that is callable is a
+/// function whose object part is the instance, which is the same thing from the
+/// language's side: `typeof instance` is `"function"`, properties live on it,
+/// and a call runs the host's handler. Two narrowings come with it: the builtin
+/// carries its `length` property (`create_builtin` always installs one, so a
+/// template member named `length` replaces it), and the instance's `[[Prototype]]`
+/// is `%Object.prototype%` rather than `%Function.prototype%`, as V8's callable
+/// instance has.
+pub fn create_callable_instance(agent: &mut Agent, callback: HostFn) -> Result<JsValue, JsError> {
+    let prototype = realm_object_prototype(agent)?;
+    let call: crux::function::NativeFn = Box::new(move |agent, this, args| {
+        // The host trampoline publishes the running window as its token, so the
+        // callback has to be inside one.
+        let _window = CallbackWindow::enter(agent);
+        callback(&FunctionCall {
+            agent,
+            this,
+            args,
+            new_target: None,
+        })
+        .map(JsValue::into_value)
+    });
+    let function = crux::function::Function::create_builtin(None, 0, call, None, prototype)?;
+    Ok(JsValue(Value::Function(function)))
+}
+
 /// Host-defined behavior the embedding API exposes. Each callback is
 /// optional; `None` falls back to a sensible default (console output to
 /// stdout/stderr, the built-in PRNG, no rejection reporting).
@@ -1286,6 +1316,13 @@ impl Context {
     /// or *undefined* while pending.
     pub fn promise_result(&self, promise: JsValue) -> Result<JsValue, JsError> {
         promise_result(&self.agent, promise)
+    }
+
+    /// A callable instance (`ObjectTemplate::SetCallAsFunctionHandler`): a
+    /// builtin whose body is `callback`, with its object part carrying the
+    /// instance's members.
+    pub fn create_callable_instance(&mut self, callback: HostFn) -> Result<JsValue, JsError> {
+        create_callable_instance(self.agent_mut(), callback)
     }
 
     /// Mark the promise handled (`v8::Promise::MarkAsHandled`).
@@ -3440,7 +3477,10 @@ impl JsValue {
     }
 
     pub fn as_object(&self) -> Option<JsObject> {
-        self.0.as_object().map(JsObject)
+        // A function is an object too, and its object part is where properties
+        // and internal fields live, so an instance from a template with a call
+        // handler is an object like any other here.
+        crate::context::as_object(&self.0).map(JsObject)
     }
 
     /// The underlying crux value.
@@ -5343,6 +5383,49 @@ mod tests {
         );
         // The guarded window is gone, so its token names nothing.
         assert!(CallbackWindow::admit(token).is_none());
+    }
+
+    #[test]
+    fn a_callable_instance_dispatches_to_its_host_body() {
+        let mut context = Context::new().unwrap();
+        let callable = context
+            .create_callable_instance(Box::new(|call| {
+                let a = call
+                    .arg(0)
+                    .and_then(|value| value.as_number())
+                    .unwrap_or(0.0);
+                let b = call
+                    .arg(1)
+                    .and_then(|value| value.as_number())
+                    .unwrap_or(0.0);
+                Ok(JsValue::number(a + b))
+            }))
+            .unwrap();
+        // The callee's object part takes properties like any other object.
+        context
+            .set_property(
+                callable.clone(),
+                JsValue::string("mark"),
+                JsValue::number(9.0),
+            )
+            .unwrap();
+        context.set_global("callable", callable).unwrap();
+        assert_eq!(
+            context.eval("callable(2, 3)").unwrap().as_number(),
+            Some(5.0)
+        );
+        assert_eq!(
+            context.eval("callable.mark").unwrap().as_number(),
+            Some(9.0)
+        );
+        assert_eq!(
+            context
+                .eval("typeof callable")
+                .unwrap()
+                .as_string()
+                .as_deref(),
+            Some("function")
+        );
     }
 
     #[test]

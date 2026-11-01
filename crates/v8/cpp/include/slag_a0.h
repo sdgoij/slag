@@ -495,6 +495,12 @@ int32_t slag_object_new(SlagContext* context, size_t internal_fields,
 int32_t slag_object_new_handler(SlagContext* context, size_t internal_fields,
                                 int32_t api_wrapper, const SlagPropertyHandler* handler,
                                 uint64_t* out);
+/* An object that is also callable (a template instance built with
+ * `SetCallAsFunctionHandler`): a builtin whose body runs `callback`, with its
+ * object part carrying `internal_fields`. */
+int32_t slag_object_new_callable(SlagContext* context, size_t internal_fields,
+                                 int32_t api_wrapper, slag_host_fn callback,
+                                 void* data, uint64_t* out);
 
 /* The token of the host callback that is running, or NULL outside one. A callback
  * needs it to allocate: the operation that called the callback holds the context,
