@@ -526,6 +526,237 @@ pub fn evaluate_paused_at(agent: &mut Agent, level: usize, source: &str) -> Resu
     result
 }
 
+/// One binding of a scope a debugger lists.
+#[derive(Debug, Clone)]
+pub struct PausedBinding {
+    pub name: JsString,
+    /// `None` while the binding is in its temporal dead zone: the engine knows
+    /// the name but has no value to answer.
+    pub value: Option<Value>,
+}
+
+/// The kinds of scope this engine can name (the protocol's `Scope.type`, less
+/// the ones it has no record for).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PausedScopeKind {
+    /// The halted activation's own bindings (a certified body's frame slots).
+    Local,
+    /// A function record reached through the chain, or a captured binding.
+    Closure,
+    /// A block record.
+    Block,
+    /// A catch parameter's record.
+    Catch,
+    /// A `with` statement's object record.
+    With,
+    /// The global record's declarative half.
+    Global,
+    /// A module record.
+    Module,
+}
+
+/// One scope of a paused activation, innermost first.
+#[derive(Debug, Clone)]
+pub struct PausedScope {
+    pub kind: PausedScopeKind,
+    pub name: Option<String>,
+    pub bindings: Vec<PausedBinding>,
+}
+
+/// A bound on how many records one chain reports, so a pathological chain
+/// cannot turn a debug read into an unbounded walk.
+const MAX_PAUSED_SCOPES: usize = 64;
+
+/// The scopes of the `level`-th parked activation, innermost first: what a
+/// debugger's scope chain is built from (`Debugger.paused`'s `scopeChain`).
+///
+/// A certified body keeps its bindings in frame slots, so its own scope comes
+/// from the body's slot table rather than from an environment; the chain below
+/// it is the environment walk. A global record contributes its declarative half
+/// only, because the global *object*'s properties are not a scope: they are an
+/// object, reachable by evaluating `globalThis`.
+pub fn paused_scopes(agent: &Agent, level: usize) -> Result<Vec<PausedScope>, JsError> {
+    let paused = agent.roots.paused.borrow();
+    let Some(run) = paused.as_ref() else {
+        return Ok(Vec::new());
+    };
+    let Some(level) = run.levels.get(level) else {
+        return Err(JsError::new(
+            ErrorKind::Error,
+            "the parked run has no such call frame".into(),
+        ));
+    };
+    let mut scopes = Vec::new();
+    let certified = level.body.scope.is_some();
+    if let Some(scope) = &level.body.scope {
+        let frame = level.vm.frame_values();
+        let mut bindings: Vec<PausedBinding> = scope
+            .slots
+            .iter()
+            .filter_map(|(atom, slot)| {
+                let value = *frame.get(*slot)?;
+                Some(PausedBinding {
+                    name: crux::lookup(*atom),
+                    // A `let`/`const` whose declaration has not run yet is a
+                    // name with no value, which the debugger still shows.
+                    value: (!value.is_uninitialized()).then_some(value),
+                })
+            })
+            .collect();
+        // The slot table is a map, whose order is not stable between reads.
+        bindings.sort_by_key(|binding| binding.name.to_string_lossy());
+        scopes.push(PausedScope {
+            kind: PausedScopeKind::Local,
+            name: None,
+            bindings,
+        });
+    }
+    let mut env = level.context.lexical_environment;
+    for _ in 0..MAX_PAUSED_SCOPES {
+        let record = &*env;
+        let pushed = match record {
+            EnvRecord::Declarative(declarative) => Some(PausedScope {
+                kind: if declarative.is_catch_param.get() {
+                    PausedScopeKind::Catch
+                } else {
+                    PausedScopeKind::Block
+                },
+                name: None,
+                bindings: declarative_bindings(declarative),
+            }),
+            EnvRecord::Object(object) => Some(PausedScope {
+                kind: PausedScopeKind::With,
+                name: None,
+                bindings: own_data_bindings(&Value::Object(object.binding_object))?,
+            }),
+            EnvRecord::Function(function) => {
+                let mut bindings = declarative_bindings(&function.declarative);
+                if function.this_binding_status.get() == crate::env::ThisBindingStatus::Initialized
+                {
+                    bindings.push(PausedBinding {
+                        name: JsString::from_utf8("this"),
+                        value: Some(*function.this_value.borrow()),
+                    });
+                }
+                Some(PausedScope {
+                    kind: if certified {
+                        PausedScopeKind::Closure
+                    } else {
+                        PausedScopeKind::Local
+                    },
+                    name: None,
+                    bindings,
+                })
+            }
+            EnvRecord::Global(global) => Some(PausedScope {
+                kind: PausedScopeKind::Global,
+                name: None,
+                bindings: declarative_bindings(&global.declarative),
+            }),
+            EnvRecord::Module(module) => Some(PausedScope {
+                kind: PausedScopeKind::Module,
+                name: None,
+                bindings: declarative_bindings(&module.declarative),
+            }),
+        };
+        if let Some(scope) = pushed {
+            scopes.push(scope);
+        }
+        let Some(outer) = record.outer() else {
+            break;
+        };
+        env = outer;
+    }
+    Ok(scopes)
+}
+
+/// A declarative record's bindings, with a module import resolved through to the
+/// binding it names (spec 9.2.5 `CreateImportBinding`).
+fn declarative_bindings(env: &crate::env::DeclarativeEnv) -> Vec<PausedBinding> {
+    env.bindings
+        .borrow()
+        .iter()
+        .map(|(name, binding)| PausedBinding {
+            name: name.clone(),
+            value: match &binding.indirect {
+                Some(indirect) => indirect.0.get_binding_value(&indirect.1, false).ok(),
+                None => binding.value,
+            },
+        })
+        .collect()
+}
+
+/// A `with` record's bindings: the object's own data properties. An accessor is
+/// skipped rather than invoked, because listing a scope must not run code.
+fn own_data_bindings(object: &Value) -> Result<Vec<PausedBinding>, JsError> {
+    Ok(own_properties(object)?
+        .into_iter()
+        .filter_map(|property| {
+            let name = property.name?;
+            Some(PausedBinding {
+                name,
+                value: property.value,
+            })
+        })
+        .collect())
+}
+
+/// One own property of a value, as a debugger reads it (`Runtime.getProperties`).
+#[derive(Debug, Clone)]
+pub struct OwnPropertyView {
+    /// The property's name, for a string key.
+    pub name: Option<JsString>,
+    /// The property's symbol, reported by description, for a symbol key.
+    pub symbol: Option<String>,
+    /// The data value. `None` for an accessor, which a listing never invokes.
+    pub value: Option<Value>,
+    pub accessor: bool,
+    pub enumerable: bool,
+    pub writable: bool,
+    pub configurable: bool,
+}
+
+/// A value's own properties, in the engine's own-property order. A non-object
+/// has none.
+pub fn own_properties(value: &Value) -> Result<Vec<OwnPropertyView>, JsError> {
+    let ValueKind::Object(object) = value.kind() else {
+        return Ok(Vec::new());
+    };
+    let mut properties = Vec::new();
+    for key in object.own_property_keys()? {
+        let Some(property) = object.ordinary_get_own_property(&key)? else {
+            continue;
+        };
+        let (data, accessor, writable) = match property.kind {
+            crux::object::PropertyKind::Data { value, writable } => (Some(value), false, writable),
+            crux::object::PropertyKind::Accessor { .. } => (None, true, false),
+        };
+        let (name, symbol) = match &key {
+            crux::property::PropertyKey::String(atom) => (Some(crux::lookup(*atom)), None),
+            crux::property::PropertyKey::Symbol(symbol) => (
+                None,
+                Some(
+                    symbol
+                        .description
+                        .as_ref()
+                        .map(|text| text.to_string_lossy())
+                        .unwrap_or_default(),
+                ),
+            ),
+        };
+        properties.push(OwnPropertyView {
+            name,
+            symbol,
+            value: data,
+            accessor,
+            enumerable: property.enumerable,
+            writable,
+            configurable: property.configurable,
+        });
+    }
+    Ok(properties)
+}
+
 /// The environment-path evaluation: a direct eval under the paused run's
 /// context, for a body that keeps no frame slots.
 fn evaluate_in_paused_env(

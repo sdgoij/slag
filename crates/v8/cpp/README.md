@@ -116,6 +116,11 @@ outer one, so a callee's points are passed through), into stops at any point
 including a callee's, out stops once the halted activation has returned. A
 breakpoint outranks a step, so a session that is stepping still stops where it
 asked to, and the stop reports `PauseInfo::kStep`.
+- **The scope chain is the protocol's, not the facade's.** A halted activation's
+bindings are exposed on the Rust embedding API (`Context::paused_scopes` and
+`Context::own_properties`) and through the inspector's `scopeChain` and
+`Runtime.getProperties`; V8 puts the same machinery behind the inspector, so
+`v8::Context` does not grow it. A listing never runs a getter.
 
 
 ## A1: the indirect handle

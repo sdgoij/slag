@@ -1999,6 +1999,39 @@ constructor whose `this` comes from `super()`, an object return overriding
 `this` after a resume, and a throw inside a constructor reaching the caller's
 handler.
 
+**2026-11-01, the scope chain and `Runtime.getProperties`.** A stop now carries
+what the inspector's scope panel needs, and the client can walk it. The engine
+grew two reads:
+
+- `eval::paused_scopes(level)` lists a parked activation's scopes innermost
+  first. A certified body's own bindings are *frame slots*, so that scope comes
+  from the body's slot table rather than from an environment; the chain below it
+  is the environment walk (`Declarative`, `Slot`, `Object`, `Function`, `Global`,
+  `Module`), with a module import resolved through to the binding it names and a
+  `with` record listed by its object's own data properties (an accessor is never
+  invoked: listing a scope must not run code). The global record contributes its
+  declarative half only, because the global *object*'s properties are an object,
+  not a scope; `globalThis` reaches those.
+- `eval::own_properties(value)` is the engine's own-key order with each entry's
+  kind and attributes, and no getter run.
+
+The protocol side is a **path model** with no roots of its own: an object id is
+`scope:<level>:<index>` plus one escaped segment per step down (`/name`, then
+`/property`), and every read re-derives the value from the parked run. Nothing
+is held between messages, so a stop cannot keep a value alive and there is no
+registry to release (`releaseObject` is a no-op because there is nothing to
+release). A name containing the separator is escaped, which is what makes an
+object property called `a/b` expandable at all.
+
+Two things a client may notice. A binding in its temporal dead zone is listed
+with no value rather than dropped, so a debugger still shows the name. And a
+remote object's `className` is `typeof`'s answer (`Object`, `Function`), not the
+constructor's name: getting the real one means reading a property while
+serialising, which the scope listing deliberately does not do.
+
+Still open on this axis: the class name, accessor getters in a listing, and
+getters that would need the engine to run code at a stop.
+
 ## 15. Sources
 
 Verified on 2026-10-31:

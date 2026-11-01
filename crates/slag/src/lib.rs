@@ -17,11 +17,11 @@ pub use crux::error::{ErrorKind, JsError};
 pub use runtime::HostHooks;
 pub use runtime::dump;
 pub use runtime::embed::{
-    BufferInfo, CallbackWindow, CompiledScript, Context, FunctionCall, HostCallbacks, HostFn,
-    JsModule, JsObject, JsValue, OwnProperty, PROPERTY_DONT_DELETE, PROPERTY_DONT_ENUM,
-    PROPERTY_READ_ONLY, PauseInfo, PauseReason, PromiseHandles, PromiseState, StepMode,
-    TemplateInstance, TypedArrayInfo, TypedArrayKind, buffer_info, typed_array_info,
-    value_is_constructor, value_type_mask,
+    BindingView, BufferInfo, CallbackWindow, CompiledScript, Context, FunctionCall, HostCallbacks,
+    HostFn, JsModule, JsObject, JsValue, OwnProperty, OwnPropertyView, PROPERTY_DONT_DELETE,
+    PROPERTY_DONT_ENUM, PROPERTY_READ_ONLY, PauseInfo, PauseReason, PausedScopeKind,
+    PromiseHandles, PromiseState, ScopeView, StepMode, TemplateInstance, TypedArrayInfo,
+    TypedArrayKind, buffer_info, typed_array_info, value_is_constructor, value_type_mask,
 };
 pub use runtime::embed::{OutputFn, RandomFn};
 

@@ -41,7 +41,40 @@ use crate::host::HostHooks;
 use crate::module::SourceTextModule;
 use crate::realm::Realm;
 
+pub use crate::eval::PausedScopeKind;
 pub use crate::ir::{PauseInfo, PauseReason, StepMode};
+
+/// One scope of a halted activation, as a debugger reads it
+/// (`Debugger.paused`'s `scopeChain`).
+#[derive(Debug, Clone)]
+pub struct ScopeView {
+    pub kind: crate::eval::PausedScopeKind,
+    pub name: Option<String>,
+    pub bindings: Vec<BindingView>,
+}
+
+/// One binding inside a [`ScopeView`].
+#[derive(Debug, Clone)]
+pub struct BindingView {
+    pub name: String,
+    /// `None` while the binding is in its temporal dead zone.
+    pub value: Option<JsValue>,
+}
+
+/// One own property of a value, as `Runtime.getProperties` answers it.
+#[derive(Debug, Clone)]
+pub struct OwnPropertyView {
+    /// The property's name, for a string key.
+    pub name: Option<String>,
+    /// The property's symbol, by description, for a symbol key.
+    pub symbol: Option<String>,
+    /// The data value. `None` for an accessor, which a listing never invokes.
+    pub value: Option<JsValue>,
+    pub accessor: bool,
+    pub enumerable: bool,
+    pub writable: bool,
+    pub configurable: bool,
+}
 
 /// A console or rejection callback: receives the rendered text.
 pub type OutputFn = Box<dyn Fn(&str)>;
@@ -1093,6 +1126,47 @@ impl Context {
     /// into that activation's frame.
     pub fn evaluate_paused_at(&mut self, level: usize, source: &str) -> Result<JsValue, JsError> {
         crate::eval::evaluate_paused_at(&mut self.agent, level, source).map(JsValue)
+    }
+
+    /// The scopes of the parked run's `level`-th activation, innermost first:
+    /// the bindings a debugger's scope panel lists (`Debugger.paused`'s
+    /// `scopeChain`). Empty when nothing is parked.
+    pub fn paused_scopes(&self, level: usize) -> Result<Vec<ScopeView>, JsError> {
+        let scopes = crate::eval::paused_scopes(&self.agent, level)?;
+        Ok(scopes
+            .into_iter()
+            .map(|scope| ScopeView {
+                kind: scope.kind,
+                name: scope.name,
+                bindings: scope
+                    .bindings
+                    .into_iter()
+                    .map(|binding| BindingView {
+                        name: binding.name.to_string_lossy(),
+                        value: binding.value.map(JsValue),
+                    })
+                    .collect(),
+            })
+            .collect())
+    }
+
+    /// `value`'s own properties, in the engine's own-property order: what
+    /// `Runtime.getProperties` answers. An accessor reports no value, because a
+    /// listing must not run code.
+    pub fn own_properties(&self, value: JsValue) -> Result<Vec<OwnPropertyView>, JsError> {
+        let properties = crate::eval::own_properties(&value.0)?;
+        Ok(properties
+            .into_iter()
+            .map(|property| OwnPropertyView {
+                name: property.name.map(|name| name.to_string_lossy()),
+                symbol: property.symbol,
+                value: property.value.map(JsValue),
+                accessor: property.accessor,
+                enumerable: property.enumerable,
+                writable: property.writable,
+                configurable: property.configurable,
+            })
+            .collect())
     }
 
     /// Write this realm's state as a snapshot blob.
@@ -5491,6 +5565,95 @@ mod tests {
         assert_eq!(
             context.eval("globalThis.done").unwrap().as_boolean(),
             Some(true)
+        );
+    }
+
+    #[test]
+    fn a_stop_reports_the_scopes_its_bindings_live_in() {
+        let mut context = Context::new().unwrap();
+        context.agent_mut().set_debug_attached(true).unwrap();
+        let source = "let outer = 1;\n\
+                      function f(param) {\n  let local = 2;\n  globalThis.hit = 1;\n  return param + local;\n}\n\
+                      globalThis.result = f(10);";
+        let at = source.find("globalThis.hit = 1;").unwrap() as u32;
+        context.agent_mut().set_breakpoints(&[at]);
+        assert!(context.eval(source).is_err());
+        let scopes = context.paused_scopes(0).unwrap();
+        let local = &scopes[0];
+        assert_eq!(local.kind, crate::eval::PausedScopeKind::Local);
+        let values: Vec<(String, Option<f64>)> = local
+            .bindings
+            .iter()
+            .map(|binding| {
+                (
+                    binding.name.clone(),
+                    binding.value.as_ref().and_then(|value| value.as_number()),
+                )
+            })
+            .collect();
+        assert!(
+            values.contains(&("param".to_string(), Some(10.0))),
+            "the halted activation's parameter is a binding of its own scope: {values:?}"
+        );
+        assert!(
+            values.contains(&("local".to_string(), Some(2.0))),
+            "{values:?}"
+        );
+        let global = scopes
+            .iter()
+            .find(|scope| scope.kind == crate::eval::PausedScopeKind::Global)
+            .expect("the chain reaches the global record");
+        assert!(
+            global
+                .bindings
+                .iter()
+                .any(|binding| binding.name == "outer"),
+            "a top-level `let` is the global record's declarative half"
+        );
+        crate::eval::resume_paused(context.agent_mut()).unwrap();
+        assert_eq!(
+            context.eval("globalThis.result").unwrap().as_number(),
+            Some(12.0)
+        );
+    }
+
+    #[test]
+    fn own_properties_lists_values_without_running_getters() {
+        let mut context = Context::new().unwrap();
+        let value = context
+            .eval(
+                "globalThis.probed = false; ({\n  a: 1,\n  get b() { globalThis.probed = true; return 2; },\n  [Symbol.iterator]: 3,\n})",
+            )
+            .unwrap();
+        let properties = context.own_properties(value).unwrap();
+        let named = |wanted: &str| {
+            properties
+                .iter()
+                .find(|property| property.name.as_deref().is_some_and(|name| name == wanted))
+                .unwrap_or_else(|| panic!("no property {wanted}"))
+        };
+        assert_eq!(
+            named("a")
+                .value
+                .as_ref()
+                .and_then(|value| value.as_number()),
+            Some(1.0)
+        );
+        let accessor = named("b");
+        assert!(
+            accessor.accessor && accessor.value.is_none(),
+            "an accessor reports its kind, never its value"
+        );
+        assert_eq!(
+            context.eval("globalThis.probed").unwrap().as_boolean(),
+            Some(false),
+            "listing must not run a getter"
+        );
+        assert!(
+            properties
+                .iter()
+                .any(|property| property.symbol.as_deref() == Some("Symbol.iterator")),
+            "a symbol key is reported by its description"
         );
     }
 

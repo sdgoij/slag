@@ -8,13 +8,14 @@
 //! engine's offset-matched debug points, and turns stops into
 //! `Debugger.paused`/`Debugger.resumed` events.
 //!
-//! What it does not do yet, because the engine cannot: expose a scope chain or
-//! remote objects (`Runtime.getProperties`). A stop reports every parked
-//! activation as a call frame, `stepOver`/`stepInto`/`stepOut` stop at the next
-//! statement of the halted activation, a deeper one or an outer one, and
-//! `evaluateOnCallFrame` evaluates against the frame its `callFrameId` names.
-//! A `stepInto` a generator or a builtin callback's body is deferred, because
-//! those runs cannot be parked yet.
+//! What it does not do yet, because the engine cannot: report a remote object's
+//! class name (only `typeof`) and invoke an accessor's getter while listing. A
+//! stop reports every parked activation as a call frame, `stepOver`/`stepInto`/
+//! `stepOut` stop at the next statement of the halted activation, a deeper one or
+//! an outer one, `evaluateOnCallFrame` evaluates against the frame its
+//! `callFrameId` names, and each frame carries a scope chain that
+//! `Runtime.getProperties` reads binding by binding. A `stepInto` a generator or
+//! a builtin callback's body is deferred, because those runs cannot be parked.
 //!
 //! The host drives it as Chrome does: register each script it compiles, feed
 //! messages to [`Session::dispatch`], and ask [`Session::poll`] for the events a
@@ -217,12 +218,162 @@ impl Session {
                         "lineNumber": line_number,
                         "columnNumber": column_number,
                     },
-                    "scopeChain": [],
+                    "scopeChain": self.scope_chain(context, index),
                     "this": {"type": "undefined"},
                 })
             })
             .collect();
         Json::Array(call_frames)
+    }
+
+    /// One frame's scope chain: the activation's scopes, innermost first, each
+    /// named by an id the client resolves through `Runtime.getProperties`.
+    ///
+    /// The id carries the level and the scope's index in the chain rather than a
+    /// reference the session has to keep alive, so a stop holds no roots of its
+    /// own: a scope is re-derived from the parked run on every read.
+    fn scope_chain(&self, context: &Context, level: usize) -> Json {
+        let Ok(scopes) = context.paused_scopes(level) else {
+            return Json::Array(Vec::new());
+        };
+        Json::Array(
+            scopes
+                .iter()
+                .enumerate()
+                .map(|(index, scope)| {
+                    let kind = scope_type(scope.kind);
+                    json!({
+                        "type": kind,
+                        "object": {
+                            "type": "object",
+                            "className": "Object",
+                            "description": kind,
+                            "objectId": format!("scope:{level}:{index}"),
+                        },
+                    })
+                })
+                .collect(),
+        )
+    }
+
+    /// `Runtime.getProperties`: a scope's bindings, or a value's own properties.
+    ///
+    /// `objectId` is a path rather than a session-held handle: a scope
+    /// (`scope:<level>:<index>`), a binding inside it, or a property of one,
+    /// with each step of the path escaped so a name may contain the separator.
+    fn get_properties(
+        &self,
+        context: &mut Context,
+        params: &Json,
+    ) -> Result<(Json, Vec<String>), DispatchError> {
+        let object_id = params["objectId"].as_str().unwrap_or("");
+        let mut parts = object_id.split('/');
+        let root = parts.next().unwrap_or("");
+        let path: Vec<&str> = parts.collect();
+        let (level, index) = parse_scope_root(root)?;
+        if path.is_empty() {
+            let scopes = context
+                .paused_scopes(level)
+                .map_err(|error| DispatchError::Protocol(error.message))?;
+            let Some(scope) = scopes.get(index) else {
+                return Err(DispatchError::Protocol(format!(
+                    "no scope {index} in call frame {level}"
+                )));
+            };
+            let result: Vec<Json> = scope
+                .bindings
+                .iter()
+                .map(|binding| {
+                    let child = format!("{object_id}/{}", escape(&binding.name));
+                    let mut descriptor = json!({
+                        "name": binding.name,
+                        "configurable": false,
+                        "enumerable": true,
+                        "isOwn": true,
+                        "writable": false,
+                    });
+                    match &binding.value {
+                        Some(value) => {
+                            descriptor["value"] = remote_object(value, Some(child));
+                        }
+                        None => {
+                            // Still in its temporal dead zone: the engine knows
+                            // the name and has nothing to answer.
+                            descriptor["value"] = json!({"type": "undefined"});
+                        }
+                    }
+                    descriptor
+                })
+                .collect();
+            return Ok((json!({ "result": result }), Vec::new()));
+        }
+        let value = self
+            .resolve(context, level, index, &path)
+            .map_err(DispatchError::Protocol)?;
+        let properties = context
+            .own_properties(value)
+            .map_err(|error| DispatchError::Protocol(error.message))?;
+        let result: Vec<Json> = properties
+            .iter()
+            .map(|property| {
+                let key = property
+                    .name
+                    .clone()
+                    .or_else(|| property.symbol.clone())
+                    .unwrap_or_default();
+                let mut descriptor = json!({
+                    "name": key,
+                    "configurable": property.configurable,
+                    "enumerable": property.enumerable,
+                    "isOwn": true,
+                    "writable": property.writable,
+                });
+                if let Some(symbol) = &property.symbol {
+                    descriptor["symbol"] = remote_object(&JsValue::string(symbol.clone()), None);
+                }
+                if let Some(value) = &property.value {
+                    let child = format!("{object_id}/{}", escape(&key));
+                    descriptor["value"] = remote_object(value, Some(child));
+                }
+                descriptor
+            })
+            .collect();
+        Ok((json!({ "result": result }), Vec::new()))
+    }
+
+    /// Walk an object id's path: the named binding of a scope, then a property
+    /// per remaining step.
+    fn resolve(
+        &self,
+        context: &mut Context,
+        level: usize,
+        index: usize,
+        path: &[&str],
+    ) -> Result<JsValue, String> {
+        let Some((first, rest)) = path.split_first() else {
+            return Err("an object id names no binding".into());
+        };
+        let scopes = context
+            .paused_scopes(level)
+            .map_err(|error| error.message)?;
+        let Some(scope) = scopes.get(index) else {
+            return Err(format!("no scope {index} in call frame {level}"));
+        };
+        let name = unescape(first);
+        let Some(binding) = scope.bindings.iter().find(|binding| binding.name == name) else {
+            return Err(format!("no binding {name} in scope {index}"));
+        };
+        let mut value = binding
+            .value
+            .clone()
+            .ok_or_else(|| format!("the binding {name} is not initialized"))?;
+        for step in rest {
+            let key = JsValue::string(unescape(step));
+            value = context
+                .get_property(value, key)
+                .map_err(|error| error.message)?;
+        }
+        Ok(value)
     }
 
     fn handle(
@@ -233,6 +384,10 @@ impl Session {
     ) -> Result<(Json, Vec<String>), DispatchError> {
         match method {
             "Runtime.enable" => Ok((json!({}), Vec::new())),
+            "Runtime.getProperties" => self.get_properties(context, params),
+            // The object ids this session hands out name a position in the
+            // parked run, not a handle it holds, so there is nothing to release.
+            "Runtime.releaseObject" | "Runtime.releaseObjectGroup" => Ok((json!({}), Vec::new())),
             "Runtime.evaluate" => {
                 let expression = params["expression"].as_str().unwrap_or("");
                 Ok((evaluation(context.eval(expression)), Vec::new()))
@@ -397,11 +552,48 @@ impl Session {
     }
 }
 
+/// A scope's protocol `type` name.
+fn scope_type(kind: slag::PausedScopeKind) -> &'static str {
+    match kind {
+        slag::PausedScopeKind::Local => "local",
+        slag::PausedScopeKind::Closure => "closure",
+        slag::PausedScopeKind::Block => "block",
+        slag::PausedScopeKind::Catch => "catch",
+        slag::PausedScopeKind::With => "with",
+        slag::PausedScopeKind::Global => "global",
+        slag::PausedScopeKind::Module => "module",
+    }
+}
+
+/// The `(level, index)` a scope object id names, from its `scope:<l>:<i>` root.
+fn parse_scope_root(root: &str) -> Result<(usize, usize), DispatchError> {
+    let mut parts = root.split(':');
+    let tag = parts.next().unwrap_or("");
+    let level = parts.next().and_then(|text| text.parse::<usize>().ok());
+    let index = parts.next().and_then(|text| text.parse::<usize>().ok());
+    match (tag, level, index, parts.next()) {
+        ("scope", Some(level), Some(index), None) => Ok((level, index)),
+        _ => Err(DispatchError::Protocol(format!(
+            "object id {root} is not a scope"
+        ))),
+    }
+}
+
+/// Escape a path step, so a name may contain the separator.
+fn escape(text: &str) -> String {
+    text.replace('%', "%25").replace('/', "%2F")
+}
+
+/// The inverse of [`escape`].
+fn unescape(text: &str) -> String {
+    text.replace("%2F", "/").replace("%25", "%")
+}
+
 /// A CDP command's answer to an evaluation: a remote object, or the exception
 /// details Chrome expects for one that threw.
 fn evaluation(result: Result<JsValue, slag::JsError>) -> Json {
     match result {
-        Ok(value) => json!({ "result": remote_object(&value) }),
+        Ok(value) => json!({ "result": remote_object(&value, None) }),
         Err(error) => json!({
             "result": {"type": "object", "subtype": "error", "description": error.message},
             "exceptionDetails": {"text": error.message},
@@ -413,7 +605,12 @@ fn evaluation(result: Result<JsValue, slag::JsError>) -> Json {
 /// else is named as an object, because the engine exposes no description or
 /// property listing yet (`Runtime.getProperties` needs a scope model it does not
 /// have).
-fn remote_object(value: &JsValue) -> Json {
+/// A value as the protocol's `RemoteObject`.
+///
+/// `object_id` is the path a client expands the value through. A primitive
+/// carries its value and needs none; an object carries one, because its own
+/// properties are only reachable through the position it was found at.
+fn remote_object(value: &JsValue, object_id: Option<String>) -> Json {
     if value.is_undefined() {
         return json!({ "type": "undefined" });
     }
@@ -434,7 +631,27 @@ fn remote_object(value: &JsValue) -> Json {
     if let Some(text) = value.as_string() {
         return json!({ "type": "string", "value": text });
     }
-    json!({ "type": "object" })
+    let class = value.type_name();
+    let mut object = json!({
+        "type": if class == "function" { "function" } else { "object" },
+        "className": class_of(class),
+        "description": class,
+    });
+    if let Some(id) = object_id {
+        object["objectId"] = json!(id);
+    }
+    object
+}
+
+/// The constructor name a remote object reports: the engine knows `typeof`, and
+/// a class name would need a property read the protocol layer should not make
+/// while listing a scope.
+fn class_of(type_name: &str) -> &'static str {
+    match type_name {
+        "function" => "Function",
+        "object" => "Object",
+        _ => "Object",
+    }
 }
 
 fn script_parsed(script: &Script) -> String {
@@ -686,6 +903,73 @@ mod tests {
             response["result"]["result"]["value"], "undefined",
             "the caller has no `x`: {response}"
         );
+    }
+
+    #[test]
+    fn a_scope_chain_reads_its_bindings_and_expands_a_value() {
+        let (mut context, mut session) = session();
+        // The property name contains the path separator, so the id a client
+        // gets back has to escape it or expanding the value would walk one
+        // step too far.
+        let source = "function f(param) {\n  let local = { \"a/b\": { deep: 7 } };\n  globalThis.seen = local;\n  globalThis.hit = 1;\n}\nf(5);\n";
+        session.add_script(&context, "app.js", source).unwrap();
+        session.dispatch(
+            &mut context,
+            r#"{"id":2,"method":"Debugger.setBreakpointByUrl","params":{"url":"app.js","lineNumber":3,"columnNumber":0}}"#,
+        );
+        assert!(context.agent_mut().run_script(source).is_err());
+        let events = session.poll(&context);
+        let paused: Json = serde_json::from_str(&events[0]).unwrap();
+        let scopes = paused["params"]["callFrames"][0]["scopeChain"]
+            .as_array()
+            .unwrap();
+        assert_eq!(scopes[0]["type"], "local", "{paused}");
+        let scope_id = scopes[0]["object"]["objectId"].as_str().unwrap();
+
+        let answer = session.dispatch(
+            &mut context,
+            &format!(
+                r#"{{"id":3,"method":"Runtime.getProperties","params":{{"objectId":"{scope_id}"}}}}"#
+            ),
+        );
+        let response: Json = serde_json::from_str(&answer[0]).unwrap();
+        let properties = response["result"]["result"].as_array().unwrap();
+        let find = |wanted: &str| {
+            properties
+                .iter()
+                .find(|property| property["name"] == wanted)
+                .unwrap_or_else(|| panic!("no binding {wanted}: {response}"))
+        };
+        assert_eq!(find("param")["value"]["value"], 5.0);
+        let local = find("local");
+        assert_eq!(local["value"]["type"], "object");
+        let local_id = local["value"]["objectId"].as_str().unwrap();
+
+        // The value the binding names is expandable through the same path.
+        let answer = session.dispatch(
+            &mut context,
+            &format!(
+                r#"{{"id":4,"method":"Runtime.getProperties","params":{{"objectId":"{local_id}"}}}}"#
+            ),
+        );
+        let response: Json = serde_json::from_str(&answer[0]).unwrap();
+        let nested = &response["result"]["result"][0];
+        assert_eq!(nested["name"], "a/b", "{response}");
+        let nested_id = nested["value"]["objectId"].as_str().unwrap();
+        assert!(
+            nested_id.contains("%2F"),
+            "the separator in a name is escaped: {nested_id}"
+        );
+        let answer = session.dispatch(
+            &mut context,
+            &format!(
+                r#"{{"id":5,"method":"Runtime.getProperties","params":{{"objectId":"{nested_id}"}}}}"#
+            ),
+        );
+        let response: Json = serde_json::from_str(&answer[0]).unwrap();
+        let deep = &response["result"]["result"][0];
+        assert_eq!(deep["name"], "deep", "{response}");
+        assert_eq!(deep["value"]["value"], 7.0);
     }
 
     #[test]
