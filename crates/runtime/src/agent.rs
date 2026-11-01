@@ -520,7 +520,7 @@ impl Trace for ContextStack {
 pub struct PausedRun {
     pub(crate) vm: Box<crate::ir::Vm>,
     pub(crate) body: std::rc::Rc<crate::ir::CompiledBody>,
-    pub(crate) reason: crate::ir::PauseReason,
+    pub(crate) info: crate::ir::PauseInfo,
     /// The context the run was executing under. The caller that pushed it pops
     /// it when the paused error reaches it, so a resume has to push it back.
     pub(crate) context: crate::context::ExecutionContext,
@@ -2021,6 +2021,9 @@ pub struct Agent {
     /// A host's pending `pause now` request (`Agent::request_pause`). The next
     /// debug point observes it, clears it and returns a paused outcome.
     pub pause_requested: std::cell::Cell<bool>,
+    /// The session's breakpoints: source offsets a debug point stops at. See
+    /// [`Agent::set_breakpoints`]; empty means no session breakpoints.
+    pub breakpoints: RefCell<std::collections::HashSet<u32>>,
     /// How many `Vm` activations are on the native stack (`Vm::run_inner`
     /// increments it). A pause is honored only at the outermost one
     /// ([`Agent::at_host_depth`]): unwinding a nested activation would have to
@@ -2320,6 +2323,25 @@ impl Agent {
         self.pause_requested.get()
     }
 
+    /// Replace the session's breakpoints: source offsets into the text the
+    /// running body's spans index.
+    ///
+    /// A breakpoint is checked at each debug point by the offset of the
+    /// statement it precedes, which is what a host gets when it resolves a
+    /// (script, line, column) against the script's text. The set is agent-wide
+    /// for now: a session debugging one script at a time is the shape the
+    /// facade drives, and a multi-script session needs the script id that the
+    /// facade's script registry will add (a shared offset across two scripts
+    /// would otherwise cross-trigger).
+    pub fn set_breakpoints(&self, offsets: &[u32]) {
+        *self.breakpoints.borrow_mut() = offsets.iter().copied().collect();
+    }
+
+    /// Whether a debug point at `offset` is a breakpoint.
+    pub(crate) fn breakpoint_at(&self, offset: u32) -> bool {
+        self.breakpoints.borrow().contains(&offset)
+    }
+
     /// Whether the running activation is the outermost one, i.e. the only
     /// frame a pause can be parked from today (see [`Agent::vm_depth`]).
     pub(crate) fn at_host_depth(&self) -> bool {
@@ -2329,7 +2351,20 @@ impl Agent {
     /// The paused run this agent is holding, if any. A host that saw
     /// [`crate::ir::paused_run_error`] reads the state from here.
     pub fn paused_reason(&self) -> Option<crate::ir::PauseReason> {
-        self.roots.paused.borrow().as_ref().map(|run| run.reason)
+        self.roots
+            .paused
+            .borrow()
+            .as_ref()
+            .map(|run| run.info.reason)
+    }
+
+    /// Where the paused run stopped, if it is holding one.
+    pub fn paused_position(&self) -> Option<crux::span::Span> {
+        self.roots
+            .paused
+            .borrow()
+            .as_ref()
+            .and_then(|run| run.info.position)
     }
 
     /// Take the parked run. Steps 3 and 4 of the protocol (resume and frame
@@ -2508,6 +2543,7 @@ impl Agent {
             debug_attached: std::cell::Cell::new(false),
             pause_requested: std::cell::Cell::new(false),
             vm_depth: std::cell::Cell::new(0),
+            breakpoints: RefCell::new(std::collections::HashSet::new()),
             roots: Rc::new(AgentRoots::new()),
             heap_state: std::cell::Cell::new(std::ptr::null()),
             host_hooks: None,

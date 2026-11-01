@@ -2728,17 +2728,25 @@ pub enum VmOutcome {
     /// deliberately not an error: routing it through the step error path would
     /// run the enclosing `catch` and `finally`, which is a different program.
     /// The `Vm`'s state is intact, which is what makes a resume possible.
-    Paused(PauseReason),
+    Paused(PauseInfo),
 }
 
-/// Why a run paused. One variant today because one trigger is reachable: a
-/// host's `pause now` request, observed at the next debug point. Breakpoints,
-/// stepping and pause-on-exception each arrive with the machinery that can
-/// evaluate them (a position table, a step mode, and the `JsError` site).
+/// What stopped a run: the reason and the position the session is looking at.
+#[derive(Debug, Clone, Copy)]
+pub struct PauseInfo {
+    pub reason: PauseReason,
+    /// The debug point's span. `None` for a stop that is not at a point.
+    pub position: Option<crux::span::Span>,
+}
+
+/// Why a run paused.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PauseReason {
     /// The host asked to stop at the next point (`Agent::request_pause`).
     Requested,
+    /// A point whose source offset is one of the session's breakpoints
+    /// (`Agent::set_breakpoints`).
+    Breakpoint,
 }
 
 /// The error a run reports when a pause reaches an entry point that cannot park
@@ -2762,11 +2770,12 @@ pub(crate) fn pause_without_run() -> JsError {
 /// It is an error only because the entry points return `Result<Value, JsError>`;
 /// the state itself is the parked run, and a host that saw this asks the agent
 /// for it rather than treating the message as a script error.
-pub(crate) fn paused_run_error(reason: PauseReason) -> JsError {
+pub(crate) fn paused_run_error(info: PauseInfo) -> JsError {
     JsError::new(
         ErrorKind::Error,
-        match reason {
+        match info.reason {
             PauseReason::Requested => "execution paused at the host's request".into(),
+            PauseReason::Breakpoint => "execution paused at a breakpoint".into(),
         },
     )
 }
@@ -9077,17 +9086,28 @@ impl Vm {
                 context.lexical_environment = self.lexical_env
             }
             match step {
-                Step::DebugCheck { .. } => {
-                    // A debug point is where a pending request is observed
-                    // (§14.4). It returns an outcome rather than an error so
-                    // the enclosing `catch`/`finally` do not run, and it clears
-                    // the request so the resumed run does not stop again at the
-                    // same point. Only the outermost activation stops: a nested
-                    // one would have to park the frames above it, and a callee's
-                    // run returns a `Value` to its caller, not an outcome.
-                    if agent.at_host_depth() && agent.pause_requested() {
-                        agent.clear_pause_request();
-                        return Ok(VmOutcome::Paused(PauseReason::Requested));
+                Step::DebugCheck { span } => {
+                    // A debug point is where a session is consulted (§14.4). It
+                    // returns an outcome rather than an error so the enclosing
+                    // `catch`/`finally` do not run, and the request is cleared
+                    // so the resumed run does not stop again at the same point.
+                    // Only the outermost activation stops: a nested one would
+                    // have to park the frames above it, and a callee's run
+                    // returns a `Value` to its caller, not an outcome.
+                    if agent.at_host_depth() {
+                        if agent.breakpoint_at(span.start) {
+                            return Ok(VmOutcome::Paused(PauseInfo {
+                                reason: PauseReason::Breakpoint,
+                                position: Some(*span),
+                            }));
+                        }
+                        if agent.pause_requested() {
+                            agent.clear_pause_request();
+                            return Ok(VmOutcome::Paused(PauseInfo {
+                                reason: PauseReason::Requested,
+                                position: Some(*span),
+                            }));
+                        }
                     }
                 }
                 Step::LoadIdent { name } => {

@@ -1719,6 +1719,23 @@ script pauses inside a `try`, the resume returns the script's completion value
 (`'done'`), the statement the pause stopped at runs, the `finally` completes as
 ordinary control flow, and the paused slot is empty afterwards.
 
+**2026-11-01, step 4a: breakpoints.** A breakpoint is a source offset
+(`Agent::set_breakpoints`), matched at each debug point against the offset of
+the statement it precedes, and the stop reports a `PauseInfo { reason, position }`
+so the host knows both why and where (`paused_reason`, `paused_position`). This
+is also the position table, without building one: the span rides in the step, and
+the host already owns the script text it needs to turn a (line, column) into an
+offset, so a per-body index would be a second copy of a fact. Two tests pin it:
+the breakpoint stops at exactly its statement (inside a `try`, so the
+no-`finally` property is re-checked with a second reason), and an offset that is
+not a point's own does not stop.
+
+The set is agent-wide, which is one script per session. A multi-script session
+needs the script id the facade's registry will assign, or two scripts whose texts
+share an offset (every one of them, trivially, since offsets start at 0) would
+cross-trigger. That is the facade's job, not something the engine can guess:
+the engine has no script identity to hand out yet.
+
 Still open, in order: the continuation stack (the depth restriction above), the
 position table and breakpoints, `evaluateOnCallFrame` through the
 `CallbackWindow`, and the facade's `Debugger` surface. Resuming mid-`try` also

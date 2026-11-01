@@ -155,14 +155,14 @@ fn finish_script_run(
                 "withdrawn call escaped the script driver".into(),
             ));
         }
-        Ok(crate::ir::VmOutcome::Paused(reason)) => {
+        Ok(crate::ir::VmOutcome::Paused(info)) => {
             agent.park_paused(crate::agent::PausedRun {
                 vm,
                 body,
-                reason,
+                info,
                 context,
             });
-            return Err(crate::ir::paused_run_error(reason));
+            return Err(crate::ir::paused_run_error(info));
         }
         Err(error) => {
             agent.return_vm(vm);
@@ -195,7 +195,7 @@ pub fn resume_paused(agent: &mut Agent) -> Result<Value, JsError> {
     let crate::agent::PausedRun {
         mut vm,
         body,
-        reason: _,
+        info: _,
         context,
     } = run;
     agent.roots.execution_context_stack.push(context.clone());

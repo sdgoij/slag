@@ -5132,6 +5132,38 @@ mod tests {
     }
 
     #[test]
+    fn a_breakpoint_inside_a_hot_loop_body_stops_there() {
+        // A certified loop body is the shape the interpreter's register lane
+        // exists for, and a run that absorbed the loop's points would execute
+        // the whole body without ever consulting the session.
+        let mut context = Context::new().unwrap();
+        context.agent_mut().set_debug_attached(true).unwrap();
+        let source = "function sum(n) {\n\
+                          var s = 0;\n\
+                          for (var i = 0; i < n; i++) { s = s + i; }\n\
+                          return s;\n\
+                      }\n\
+                      globalThis.r = sum(3);";
+        let at = source.find("s = s + i;").unwrap() as u32;
+        context.agent_mut().set_breakpoints(&[at]);
+        let error = context.eval(source).unwrap_err();
+        assert_eq!(error.message, "execution paused at a breakpoint");
+        assert_eq!(
+            context.agent().paused_position().map(|span| span.start),
+            Some(at),
+            "the point inside the loop body is where the run stopped"
+        );
+        // The same point comes round on every iteration, so resume until the
+        // run finishes.
+        let mut stops = 0;
+        while crate::eval::resume_paused(context.agent_mut()).is_err() {
+            stops += 1;
+            assert!(stops < 10, "the run must reach its end");
+        }
+        assert_eq!(context.eval("globalThis.r").unwrap().as_number(), Some(3.0));
+    }
+
+    #[test]
     fn resuming_a_paused_script_runs_the_rest_of_it() {
         let mut context = Context::new().unwrap();
         let pause_now = context
@@ -5174,6 +5206,66 @@ mod tests {
             context.agent().paused_reason().is_none(),
             "the paused slot is empty once the run finished"
         );
+    }
+
+    #[test]
+    fn a_breakpoint_stops_the_run_at_its_statement() {
+        // A breakpoint is a source offset, which is what a host gets when it
+        // resolves a (script, line, column) against the script's text. The text
+        // here is ASCII, so the byte offsets the test computes are the UTF-16
+        // units the parser's spans count.
+        let mut context = Context::new().unwrap();
+        context.agent_mut().set_debug_attached(true).unwrap();
+        let source = "globalThis.ran = false; try { globalThis.ran = true; } \
+                      finally { globalThis.fin = true; } 'done';";
+        let offset = source.find("globalThis.ran = true;").unwrap() as u32;
+        context.agent_mut().set_breakpoints(&[offset]);
+        let error = context.eval(source).unwrap_err();
+        assert_eq!(error.message, "execution paused at a breakpoint");
+        assert_eq!(
+            context.agent().paused_reason(),
+            Some(crate::ir::PauseReason::Breakpoint)
+        );
+        assert_eq!(
+            context.agent().paused_position().map(|span| span.start),
+            Some(offset),
+            "the stop names the statement the breakpoint resolved to"
+        );
+        assert_eq!(
+            context.eval("globalThis.ran").unwrap().as_boolean(),
+            Some(false),
+            "the breakpointed statement has not run yet"
+        );
+        let value = crate::eval::resume_paused(context.agent_mut()).unwrap();
+        assert_eq!(
+            value.as_string().map(|text| text.to_string_lossy()),
+            Some("done".to_string()),
+            "the resume passes the breakpoint and completes"
+        );
+        assert_eq!(
+            context.eval("globalThis.ran").unwrap().as_boolean(),
+            Some(true)
+        );
+        assert_eq!(
+            context.eval("globalThis.fin").unwrap().as_boolean(),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn a_breakpoint_off_a_statement_start_does_not_stop() {
+        let mut context = Context::new().unwrap();
+        context.agent_mut().set_debug_attached(true).unwrap();
+        context.agent_mut().set_breakpoints(&[3]);
+        assert_eq!(
+            context
+                .eval("globalThis.off = 1; globalThis.off")
+                .unwrap()
+                .as_number(),
+            Some(1.0),
+            "a point is matched by its own offset, not by neighbourhood"
+        );
+        assert!(context.agent().paused_reason().is_none());
     }
 
     #[test]
