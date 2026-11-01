@@ -511,6 +511,24 @@ impl Trace for ContextStack {
 /// This is slice 1 of that conversion: the job queues, the promise tables and
 /// the generator tables. The rest of `Agent::trace_roots`'s fields follow in
 /// later slices.
+/// A run a debug session stopped at a debug point (`VmOutcome::Paused`).
+///
+/// The `Vm` is exactly what a resume needs: `run_inner` continues from its
+/// `ip`, and `body` is the body the driver was executing. It lives on
+/// [`AgentRoots`] so a collection can trace it and so the state outlives the
+/// host call that hit the stop.
+pub struct PausedRun {
+    pub(crate) vm: Box<crate::ir::Vm>,
+    pub(crate) body: std::rc::Rc<crate::ir::CompiledBody>,
+    pub(crate) reason: crate::ir::PauseReason,
+}
+
+impl Trace for PausedRun {
+    fn trace(&self, visit: &mut dyn FnMut(GcAny)) {
+        self.vm.trace(visit);
+        self.body.trace(visit);
+    }
+}
 pub(crate) struct AgentRoots {
     /// The registry this agent registered in, for `Drop` to release the entry
     /// when no heap is entered. Null when it registered in this thread's own
@@ -588,6 +606,10 @@ pub(crate) struct AgentRoots {
     /// too, so it is traced here rather than by the map's values-only `Trace`.
     pub(crate) script_bodies:
         RefCell<std::collections::HashMap<ScriptBodyKey, std::rc::Rc<crate::ir::CompiledBody>>>,
+    /// The run a debug session stopped, kept so it can be inspected and
+    /// resumed instead of being returned to the pool with its frames. Traced:
+    /// a parked `Vm` holds frame slots and stack entries like a running one.
+    pub(crate) paused: RefCell<Option<PausedRun>>,
     /// Every realm created in this agent (the bootstrap realm plus any the
     /// host creates via `$262.createRealm`), so a realm's builtin called from
     /// another realm can dispatch with its own realm current.
@@ -1317,6 +1339,7 @@ impl AgentRoots {
             vm_pool: RefCell::new(Vec::new()),
             compiled_bodies: RefCell::new(std::collections::HashMap::default()),
             script_bodies: RefCell::new(std::collections::HashMap::new()),
+            paused: RefCell::new(None),
             realms: RefCell::new(Vec::new()),
             function_realms: RefCell::new(std::collections::HashMap::new()),
             shadow_realms: RefCell::new(std::collections::HashMap::default()),
@@ -1519,6 +1542,13 @@ impl Trace for AgentRoots {
             for (key, body) in bodies.iter() {
                 key.0.trace(visit);
                 body.trace(visit);
+            }
+        } else {
+            crux::heap::note_aborted_trace();
+        }
+        if let Ok(paused) = self.paused.try_borrow() {
+            if let Some(run) = paused.as_ref() {
+                run.trace(visit);
             }
         } else {
             crux::heap::note_aborted_trace();
@@ -1985,6 +2015,13 @@ pub struct Agent {
     /// A host's pending `pause now` request (`Agent::request_pause`). The next
     /// debug point observes it, clears it and returns a paused outcome.
     pub pause_requested: std::cell::Cell<bool>,
+    /// How many `Vm` activations are on the native stack (`Vm::run_inner`
+    /// increments it). A pause is honored only at the outermost one
+    /// ([`Agent::at_host_depth`]): unwinding a nested activation would have to
+    /// park every frame above it, and the channel from a callee's run back to
+    /// its caller's call step is a `Result<Value, JsError>`, which cannot carry
+    /// an outcome.
+    pub vm_depth: std::cell::Cell<usize>,
     /// The heap this agent allocates in, when a host owns the arena (an
     /// isolate under the `v8` bridge). Null for a bare agent, whose heap is the
     /// thread's own.
@@ -2277,6 +2314,35 @@ impl Agent {
         self.pause_requested.get()
     }
 
+    /// Whether the running activation is the outermost one, i.e. the only
+    /// frame a pause can be parked from today (see [`Agent::vm_depth`]).
+    pub(crate) fn at_host_depth(&self) -> bool {
+        self.vm_depth.get() <= 1
+    }
+
+    /// The paused run this agent is holding, if any. A host that saw
+    /// [`crate::ir::paused_run_error`] reads the state from here.
+    pub fn paused_reason(&self) -> Option<crate::ir::PauseReason> {
+        self.roots.paused.borrow().as_ref().map(|run| run.reason)
+    }
+
+    /// Take the parked run. Steps 3 and 4 of the protocol (resume and frame
+    /// reads) are what consume it; until then this is how a test observes that
+    /// the state survived the stop.
+    pub fn take_paused_run(&self) -> Option<PausedRun> {
+        self.roots.paused.borrow_mut().take()
+    }
+
+    /// Park a run that stopped at a debug point.
+    ///
+    /// A second pause replaces the first: a host that ignores a paused run and
+    /// runs again drops it (the `Vm` is dropped rather than returned to the
+    /// pool), which is the debugger's bug to notice, not a state the engine can
+    /// resolve.
+    pub(crate) fn park_paused(&self, run: PausedRun) {
+        *self.roots.paused.borrow_mut() = Some(run);
+    }
+
     /// Consume the request (the debug point that observed it).
     pub(crate) fn clear_pause_request(&self) {
         self.pause_requested.set(false);
@@ -2435,6 +2501,7 @@ impl Agent {
             jit_depth: 0,
             debug_attached: std::cell::Cell::new(false),
             pause_requested: std::cell::Cell::new(false),
+            vm_depth: std::cell::Cell::new(0),
             roots: Rc::new(AgentRoots::new()),
             heap_state: std::cell::Cell::new(std::ptr::null()),
             host_hooks: None,

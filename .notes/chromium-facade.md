@@ -1672,6 +1672,32 @@ stepping needs an exact position. Second, the leaf lane `run_leaf_body` can now
 see a paused outcome, which is why its arm is explicit: a leaf body carries
 points like any other body.
 
+**2026-11-01, step 2a: the run parks.** `PausedRun { vm, body, reason }` lives on
+`AgentRoots` (traced with the rest: a parked `Vm` holds frame slots and stack
+entries like a running one), `Agent::take_paused_run` hands it out, and the
+script/eval boundary parks instead of returning the `Vm` to the pool. The entry
+points still report an error (their signature is `Result<Value, JsError>`), but
+that error now means "ask the agent for the run", which is why it has its own
+`paused_run_error` and a message a host can rely on.
+
+What made this step small is one deliberate restriction, and it is the shape of
+the next step: **a pause is honoured only at the outermost activation**
+(`Agent::vm_depth`, incremented by `Vm::run_inner`). A nested activation cannot
+be parked without parking every frame above it, and the channel from a callee's
+run back to its caller's call step is `Result<Value, JsError>`, which cannot
+carry an outcome. The alternative, an error sentinel unwound past the `catch`
+handlers, is what the termination flag does today (`execution terminated` is
+catchable, unlike V8's) and is exactly the behaviour the pause exists to avoid.
+So a request raised inside a nested call waits for the outermost body's next
+point: `a_pause_requested_inside_a_nested_call_stops_at_the_outermost_point`
+pins that (the nested body finishes; the statement after the call does not run).
+
+Consequence to keep in mind for A5: a breakpoint inside a called function will
+not stop until control returns to the outermost frame, which is not a usable
+debugger. Lifting the restriction is the continuation-stack work (park each frame
+on the way out and resume innermost-first, feeding each completion back into the
+frame below), and it starts with the call-step channel in `ordinary_call`.
+
 ## 15. Sources
 
 Verified on 2026-10-31:

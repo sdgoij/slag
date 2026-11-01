@@ -5055,8 +5055,29 @@ mod tests {
             )
             .unwrap_err();
         assert_eq!(
-            error.message, "execution paused, but this run has nowhere to park it yet",
+            error.message, "execution paused at the host's request",
             "the pause must reach the entry point as its own signal"
+        );
+        assert_eq!(
+            context.agent().paused_reason(),
+            Some(crate::ir::PauseReason::Requested),
+            "the stopped run is parked on the agent"
+        );
+        // A parked Vm holds frame slots and stack entries, so it has to be a GC
+        // root while it sits there. Frame reads (step 3) are what will inspect
+        // them; a collection here is what catches a missing trace meanwhile.
+        context.agent().collect_garbage();
+        let run = context
+            .agent()
+            .take_paused_run()
+            .expect("the state survives the stop");
+        assert!(
+            run.vm.ip > 0
+                && matches!(
+                    run.body.steps[run.vm.ip - 1],
+                    crate::ir::Step::DebugCheck { .. }
+                ),
+            "the parked Vm stopped at the point it observed"
         );
         assert_eq!(
             context.eval("globalThis.ran").unwrap().as_boolean(),
@@ -5067,6 +5088,46 @@ mod tests {
             context.eval("globalThis.fin").unwrap().as_boolean(),
             Some(false),
             "the pause must not be routed through the try machinery"
+        );
+    }
+
+    #[test]
+    fn a_pause_requested_inside_a_nested_call_stops_at_the_outermost_point() {
+        // The depth gate: a nested activation cannot be parked (its callee's run
+        // returns a `Value`, not an outcome), so the request waits for the
+        // outermost body's next point. The nested body therefore finishes, and
+        // the statement after the call does not run.
+        let mut context = Context::new().unwrap();
+        let pause_now = context
+            .create_function(
+                "pauseNow",
+                0,
+                Box::new(|call| {
+                    crate::context::callback_agent(call.agent_ptr())?.request_pause();
+                    Ok(JsValue::undefined())
+                }),
+            )
+            .unwrap();
+        context.set_global("pauseNow", pause_now).unwrap();
+        context.agent_mut().set_debug_attached(true).unwrap();
+        let error = context
+            .eval(
+                "globalThis.ran = false; globalThis.after = false; \
+                 function f() { pauseNow(); globalThis.ran = true; } \
+                 f(); \
+                 globalThis.after = true;",
+            )
+            .unwrap_err();
+        assert_eq!(error.message, "execution paused at the host's request");
+        assert_eq!(
+            context.eval("globalThis.ran").unwrap().as_boolean(),
+            Some(true),
+            "the nested body runs to its own end before the gate is consulted"
+        );
+        assert_eq!(
+            context.eval("globalThis.after").unwrap().as_boolean(),
+            Some(false),
+            "the outermost body stops at its next point"
         );
     }
 

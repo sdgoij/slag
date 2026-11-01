@@ -2756,6 +2756,21 @@ pub(crate) fn pause_without_run() -> JsError {
     )
 }
 
+/// The error a script or eval reports when a session stopped it and the run is
+/// parked at [`crate::agent::Agent::take_paused_run`].
+///
+/// It is an error only because the entry points return `Result<Value, JsError>`;
+/// the state itself is the parked run, and a host that saw this asks the agent
+/// for it rather than treating the message as a script error.
+pub(crate) fn paused_run_error(reason: PauseReason) -> JsError {
+    JsError::new(
+        ErrorKind::Error,
+        match reason {
+            PauseReason::Requested => "execution paused at the host's request".into(),
+        },
+    )
+}
+
 /// The body a [`Vm::run_inner`] driver is currently executing: a proper tail
 /// call replaces it, and the enum owns each replacement's `Rc` so the
 /// per-iteration reborrow stays valid.
@@ -8118,6 +8133,10 @@ impl Vm {
         // The value-stack side of the same guard: a body's `max_stack` bounds
         // every slot it can push, so one check at entry bounds the run.
         self.check_value_stack(body.max_stack)?;
+        // The pause protocol's depth: only the outermost activation can be
+        // parked (see `Agent::vm_depth`), so a point above it defers a request
+        // rather than unwinding frames that have nowhere to go.
+        agent.vm_depth.set(agent.vm_depth.get() + 1);
         // Cut 36 mirror: whether every name this body reads through the env
         // chain resolves at the global env for the whole run — the read can
         // then serve the warmed global-value cell instead of walking the env
@@ -8141,6 +8160,7 @@ impl Vm {
             });
         });
         let result = self.run_inner_impl(agent, body);
+        agent.vm_depth.set(agent.vm_depth.get().saturating_sub(1));
         ACTIVE_RUNS.with(|stack| {
             stack.borrow_mut().pop();
         });
@@ -9062,8 +9082,10 @@ impl Vm {
                     // (§14.4). It returns an outcome rather than an error so
                     // the enclosing `catch`/`finally` do not run, and it clears
                     // the request so the resumed run does not stop again at the
-                    // same point.
-                    if agent.pause_requested() {
+                    // same point. Only the outermost activation stops: a nested
+                    // one would have to park the frames above it, and a callee's
+                    // run returns a `Value` to its caller, not an outcome.
+                    if agent.at_host_depth() && agent.pause_requested() {
                         agent.clear_pause_request();
                         return Ok(VmOutcome::Paused(PauseReason::Requested));
                     }
