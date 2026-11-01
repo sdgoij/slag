@@ -26038,6 +26038,13 @@ pub fn is_compound_assign(op: &AssignOp) -> bool {
 /// *before* the attach, and a switch that is read at attach time could not put
 /// the points into it. Cached, because `std::env::var_os` costs ~140 ns and
 /// this is consulted once per statement compiled.
+///
+/// The interpreter does pay for it, which is the honest half of the number:
+/// `--jitless` is +1.11% corpus-wide, since a point is one extra step dispatch
+/// per statement. That is why the protocol's per-iteration (back-edge) point is
+/// deliberately not emitted here: at 2.35 ns a dispatch it costs +6.9% on a
+/// tight loop, and both costs go away with the slice that gives a session its
+/// own bytecode (invalidate the cached bodies on attach).
 fn debug_points_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| match std::env::var_os("SLAG_DEBUG_POINTS") {

@@ -1495,10 +1495,10 @@ no row outside the noise floor. What was not free was every lowering that had to
 learn about the step, and each failure looked like the step being expensive:
 
 - `lower_step`'s catch-all *refuses* an unknown step, so every leaf body gained
-a refusal and lost its leaf-call inline: **+93%** per row on `opcost`, with
+  a refusal and lost its leaf-call inline: **+93%** per row on `opcost`, with
   `obj_prop` 0.041 to 0.614 ms. The fix is an arm that emits nothing.
 - the optimizing tier's lift refuses a body outright, so a body containing one
-demoted to the baseline tier: **+12.7%** on `opcost`+`control` as a directory
+  demoted to the baseline tier: **+12.7%** on `opcost`+`control` as a directory
   run, up to **13x** on the small rows (`obj_prop` 0.043 to 0.604 ms). The fix is
   `0` in `stack_delta` and an empty arm in the optimizer's emitter.
 
@@ -1508,7 +1508,29 @@ default**. R1 alone does not make the compiled tiers harmless here — the body 
 session runs is the bytecode built *before* the attach, which is why the points
 have to be in every body rather than compiled in on attach. What R1 buys is that
 the compiled tiers, which model the point as a no-op, cannot run at all while a
-session is attached. The fallback in the cost paragraph above is not taken.
+session is attached. The fallback in the cost paragraph above is not taken for
+the statements, because the compiled tier is free; the second measurement below
+takes it for the loop back edge.
+
+**2026-11-01, second measurement: the interpreter, and the back edge.** The
+number above is the JIT tier. `--jitless`, same seam, full corpus, 5 interleaved
+rounds: **+1.11%** (3528.8 against 3490.1 ms), worst on the statement-dense rows
+(`try_catch_loop` +8.4%, `switch_dispatch` +6.2%). A point is one extra step
+dispatch in the interpreter, about 2.35 ns, not the "one predictable branch"
+this section assumed; it is small enough per statement that the compiled tier,
+which is the product, does not see it. The per-iteration case is different: one
+extra point in a 2M-iteration bare loop costs **+6.9%** interpreted (73.06
+against 68.36 ms; the switch-off control on the same pair is +0.33%).
+
+That is why **the back-edge half of R2 is not emitted**, and why the fallback
+this section rejected is the shape to take, only later and in full: a session
+must get its own bytecode. On attach, invalidate the cached bodies so they are
+recompiled with both points; on detach, invalidate again. That is what V8 does
+(it flushes and recompiles bytecode under a debugger), it removes the +1.11% as
+well, and it is safe only at a stop-the-world point, which R1's attach already
+is. Until that slice lands, a loop with no statements (the shape the back-edge
+point exists for) has no per-iteration place to stop, and a `continue` skips the
+last statement's point; both are recorded gaps, not silently missing hooks.
 
 ## 15. Sources
 
