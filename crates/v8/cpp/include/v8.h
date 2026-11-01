@@ -1526,6 +1526,9 @@ class Context {
 
   Local<Object> Global() const;
 
+  /* The isolate this context was made on (`v8::Context::GetIsolate`). */
+  Isolate* GetIsolate() const { return isolate_; }
+
   /* The A0 C ABI context behind this facade object. */
   SlagContext* slag() const { return slag_; }
 
@@ -1562,6 +1565,7 @@ class Context {
 
  private:
   SlagContext* slag_ = nullptr;
+  Isolate* isolate_ = nullptr;
   std::vector<void*> pointer_slots_;
   std::vector<uint64_t> value_slots_;
   /* Retained while set; zero means "the isolate's default". */
@@ -1684,6 +1688,12 @@ class Isolate {
    * becomes exactly that language value. */
   void ThrowException(Local<Value> exception);
   Local<Context> GetCurrentContext();
+  /* The entered context (`Isolate::GetEnteredContext` and
+   * `Isolate::GetEnteredOrMicrotaskContext`). The facade enters a context only
+   * through `Context::Scope`, so both answer the same handle as
+   * `GetCurrentContext`; there is no microtask-context distinction to make. */
+  Local<Context> GetEnteredContext();
+  Local<Context> GetEnteredOrMicrotaskContext();
 
   /* Drain the job queues now (`Isolate::PerformMicrotaskCheckpoint`). */
   void PerformMicrotaskCheckpoint();

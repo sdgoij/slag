@@ -1153,6 +1153,59 @@ context) and need an entered context for a DataView. The two promise statics are
 `Promise.resolve`/`Promise.reject` faithfully: `Resolve` answers the value itself
 when it is already a promise of the realm.
 
+### 14.2 Per-object access checks: what the engine must record
+
+The facade enforces a `Signature` for a function template today (a
+prototype-chain check, above). What it cannot enforce is the *per-object* check
+Blink configures with `Object::SetAccessCheckCallback` and
+`ObjectTemplate::SetAccessCheckCallbackAndHandler`, which is what makes a
+cross-origin `Location` readable or not, and the security token is stored and
+never consulted for the same reason. Both want one fact the engine does not
+have: **which realm an object came from**.
+
+V8 keeps it in the object's map, and every access through a context whose token
+differs from the object's goes through the check. This engine's `JsObject` has no
+such field, and the two places that could approximate it are both wrong:
+
+- a side table keyed by object id is unsafe, because the arena's free list reuses
+  arena slots, so a swept object's id can name a later object (the same reason an
+table keyed by address was rejected for internal fields);
+- the facade keeping its own table has the same problem and cannot see objects a
+  script created anyway.
+
+So the first slice is engine work, in the shape the internal-fields work already
+took:
+
+1. A `realm: Cell<Option<Handle<Realm>>>` on `JsObject` (8 bytes, and the field
+   two in-place initializers must both write it, which is the documented trap).
+2. Stamped at creation, from the agent's current realm, everywhere an object is
+   made for a realm (the arena fast path, `array_create`, host objects, function
+   object parts). Objects with none read as "no realm", and the check treats that
+   as the caller's own.
+3. A `HostOps`-style hook, or a smaller per-object callback registered on the
+   realm, consulted by `get`/`set`/`has` when the object's realm differs from the
+   running one. `Signature`'s check would then move behind it rather than living
+   in the trampoline.
+
+Until that lands, the honest statement is the one the README makes: a signature
+is enforced, a per-object access check and the security token are not.
+
+*Worlds plumbing: the context-isolate link (2026-11-01).* The first A4 additions
+are the ones every Blink bindings file assumes: `Context::GetIsolate`, which the
+facade now records when it creates a context, and
+`Isolate::GetEnteredContext`/`GetEnteredOrMicrotaskContext`, which answer the
+entered `Context::Scope` (the facade has no separate microtask-context notion to
+distinguish, and says so in the header). `gin-shapes` checks both against the
+scope it entered.
+
+The rest of A4 is blocked on an engine fact, and §14.2 records it: a per-object
+access check (`SetAccessCheckCallback`) and the security token both need to know
+which realm an object came from, and `JsObject` does not record one. A side table
+is not an option for the reason internal fields already rejected one (arena slots
+are reused), so the slice is a `realm` field stamped at creation plus a hook the
+ordinary property paths consult on a cross-realm access. Until then a signature
+is the only access check the facade enforces.
+
 ## 15. Sources
 
 Verified on 2026-10-31:

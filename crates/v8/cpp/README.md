@@ -627,6 +627,8 @@ not a claim that gin itself links.
   `FunctionTemplate` getters and setters.
 - `Signature` on `FunctionTemplate::New`, enforced on the receiver (the method
   only runs on an instance of the named template).
+- `Context::GetIsolate`, and `Isolate::GetEnteredContext` /
+  `GetEnteredOrMicrotaskContext` (the entered `Context::Scope`).
 - Embedder data (value and aligned-pointer slots, the field count, and
   `ClearAllSlots`), security tokens (get, set, and use-default), and
   `Object::GetCreationContext`/`GetCreationContextChecked`.
@@ -718,9 +720,12 @@ not a claim that gin itself links.
   the handler, with the template's members and internal fields on the callee
   itself, so `typeof instance` is `"function"` and a call runs the host's code.
 - `Signature` is enforced for function templates only: `AccessorSignature` is
-  accepted and not consulted, `SetAccessCheckCallback` and the per-object access
-  check it configures are absent, and the security token is stored but not
-  consulted (an engine gap, noted above).
+  accepted and not consulted, and `Object::SetAccessor` has no signature
+  parameter yet. There is no per-object access check: `SetAccessCheckCallback`
+  and `SetAccessCheckCallbackAndHandler` are absent, so a host cannot declare a
+  check on one object, and the security token is stored but never consulted.
+  Both of those need the engine to know which realm an object came from, which
+  it does not record; `.notes/chromium-facade.md` §14.2 sketches the change.
 - `Platform` is a handle plus a message pump: `PumpMessageLoop` runs the
   isolate's queued jobs (microtasks, promise reactions, due timers) and answers
   whether it ran any. There are no host-posted platform tasks or task runners

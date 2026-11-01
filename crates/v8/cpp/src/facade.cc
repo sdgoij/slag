@@ -2751,6 +2751,7 @@ Local<Context> Context::New(Isolate* isolate, std::nullptr_t,
 
   auto* context = new Context();
   context->slag_ = slag;
+  context->isolate_ = isolate;
   slag_watch_collections(slag, isolate, &CollectionObserver);
 
   if (!global_template.IsEmpty()) {
@@ -2837,6 +2838,12 @@ Local<Context> Isolate::GetCurrentContext() {
   // way, and a zero handle dereferences to null).
   if (g_current_context == 0) return Local<Context>();
   return Local<Context>::New(g_current_context);
+}
+
+Local<Context> Isolate::GetEnteredContext() { return GetCurrentContext(); }
+
+Local<Context> Isolate::GetEnteredOrMicrotaskContext() {
+  return GetCurrentContext();
 }
 
 }  // namespace v8

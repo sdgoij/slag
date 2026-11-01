@@ -2605,6 +2605,11 @@ int main() {
     expect(v8::Isolate::GetCurrent() == isolate &&
                v8::Isolate::TryGetCurrent() == isolate,
            "GetCurrent answers the entered isolate");
+    expect(current->GetIsolate() == isolate,
+           "a context names its isolate back");
+    expect(isolate->GetEnteredContext().raw() == current.raw() &&
+               isolate->GetEnteredOrMicrotaskContext().raw() == current.raw(),
+           "the entered-context accessors answer the scope's context");
     bind("Child", constructor);
     run("var made = new Child(5);"
         " globalThis.madeArg = made.arg0;"
