@@ -156,6 +156,17 @@ pub const NO_FOR_OF_CURSOR: (usize, usize) = (usize::MAX, usize::MAX);
 /// One resumable-function instruction.
 #[derive(Debug, Clone)]
 pub enum Step {
+    /// A debug point: one per statement and one per loop back edge, carrying
+    /// the statement's source span.
+    ///
+    /// It does nothing unless a session is attached: the driver reads one flag
+    /// and falls through, which is what a debug-break slot costs in V8. The
+    /// compiled tiers treat it as a no-op because a session refuses to compile
+    /// at all (`lookup_info_for`), so no compiled body can be running past one.
+    /// See `.notes/chromium-facade.md` §14.4.
+    DebugCheck {
+        span: crux::span::Span,
+    },
     // ----- stack -----
     Push(Value),
     Pop,
@@ -9016,6 +9027,15 @@ impl Vm {
                 context.lexical_environment = self.lexical_env
             }
             match step {
+                Step::DebugCheck { span } => {
+                    // Inert for now, and deliberately not a hook: the pause it
+                    // exists for is the next slice of §14.4, and a step that
+                    // calls a no-op would be a recorded-but-ignored hook. What
+                    // this landing owes is the emission and the measurement of
+                    // what emitting it costs, so the pause can be added
+                    // without a layout change underneath it.
+                    let _ = span;
+                }
                 Step::LoadIdent { name } => {
                     let value = self.load_ident_value(agent, *name, body.env_constant)?;
                     self.stack.push(value);
@@ -20424,6 +20444,11 @@ impl Compiler {
     }
 
     fn compile_statement(&mut self, stmt: &Stmt) -> Result<(), JsError> {
+        // The debug point (§14.4): one per statement, at its source span, so a
+        // debugger has a place to stop that is not also a place the compiler
+        // may fold away. It is inert until the pause slice lands, and the cost
+        // of emitting it is what the landing measures.
+        self.emit(Step::DebugCheck { span: stmt.span });
         match &stmt.kind {
             StmtKind::Block(block) => {
                 self.emit(Step::ListBegin);
@@ -28468,6 +28493,15 @@ fn lower_leaf_ops_segmented(
             // its step-path `ListBegin` pushed).
             if matches!(steps[i], Step::ListBegin | Step::ListEnd) {
                 break;
+            }
+            // A debug point is transparent to a register run: it is a no-op on
+            // both lanes, and treating it as a boundary would split every loop
+            // body that has one. The step stays in the body, so the run's
+            // recorded `start` still names the step the compiled entry is
+            // entered at.
+            if matches!(steps[i], Step::DebugCheck { .. }) {
+                i += 1;
+                continue;
             }
             if lower_step(
                 &steps[i],

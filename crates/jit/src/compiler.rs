@@ -9273,6 +9273,14 @@ impl<'a> Lowerer<'a> {
             Step::NormalizeCompletion | Step::ListBegin | Step::ListEnd => {
                 self.fall_through(index);
             }
+            // The debug point (§14.4). A no-op here is correct rather than a
+            // placeholder: a session refuses to compile at all
+            // (`lookup_info_for`), so a compiled body can never be running when
+            // one is attached, and a body compiled without one has nothing to
+            // stop for.
+            Step::DebugCheck { .. } => {
+                self.fall_through(index);
+            }
             _ => return Err(Unsupported::Step(step_name(step))),
         }
         Ok(())
