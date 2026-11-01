@@ -7441,6 +7441,81 @@ mod tests {
 
     // ---- Cut 5: script-level bindings (top-level vars) ----
 
+    /// The debug points follow the compile flag, not an environment read.
+    #[test]
+    fn the_debug_point_emission_follows_the_compile_flag() {
+        let program = parser::parse_script("var n = 1; n += 1;").unwrap();
+        let points = |debug_points: bool| {
+            let body =
+                crate::ir::compile_statements(&program.body, false, true, debug_points).unwrap();
+            body.steps
+                .iter()
+                .filter(|step| matches!(step, crate::ir::Step::DebugCheck { .. }))
+                .count()
+        };
+        assert_eq!(points(true), 2, "one point per statement");
+        assert_eq!(points(false), 0, "no session, no points");
+    }
+
+    /// Every loop's back edge carries a point, which is the half a `continue`
+    /// and a statement-less body need: without it an iteration has nowhere to
+    /// stop. Checked structurally (the step before each backward branch) so it
+    /// does not depend on how many statements the body happens to have.
+    #[test]
+    fn every_loop_back_edge_carries_a_debug_point() {
+        let sources = [
+            "var s = 0; while (s < 10) { s = s + 1; }",
+            "var s = 0; do { s = s + 1; } while (s < 10);",
+            "var s = 0; for (var i = 0; i < 10; i++) { s = s + i; }",
+            "var s = 0; for (;;) { s = s + 1; if (s > 10) { break; } }",
+            "var s = 0; for (var k in { a: 1 }) { s = s + k.length; }",
+            "var s = 0; for (var v of [1, 2]) { s = s + v; }",
+            "var s = 0; while (s < 3) { s = s + 1; continue; }",
+        ];
+        for source in sources {
+            let program = parser::parse_script(source).unwrap();
+            let with_points =
+                crate::ir::compile_statements(&program.body, false, true, true).unwrap();
+            let mut back_edges = 0;
+            for (index, step) in with_points.steps.iter().enumerate() {
+                let is_back = match step {
+                    crate::ir::Step::Jump(target) => *target <= index,
+                    crate::ir::Step::JumpIfTrue(target) => *target <= index,
+                    crate::ir::Step::FastLoopHead { .. } => true,
+                    // The certified for-in/for-of loop re-runs its protocol
+                    // step at the bottom instead of jumping: the top fetch's
+                    // `back` is the forward edge, the bottom one's is the loop.
+                    crate::ir::Step::ForOfNext { back, .. }
+                    | crate::ir::Step::ForInNext { back, .. }
+                    | crate::ir::Step::ForOfNextBindLocal { back, .. } => *back <= index,
+                    _ => false,
+                };
+                if !is_back {
+                    continue;
+                }
+                back_edges += 1;
+                assert!(
+                    index > 0
+                        && matches!(
+                            with_points.steps[index - 1],
+                            crate::ir::Step::DebugCheck { .. }
+                        ),
+                    "{source}: the back edge at {index} must be preceded by a debug point"
+                );
+            }
+            assert!(back_edges > 0, "{source}: expected a back edge");
+            let without_points =
+                crate::ir::compile_statements(&program.body, false, true, false).unwrap();
+            assert!(
+                !without_points
+                    .steps
+                    .iter()
+                    .any(|step| matches!(step, crate::ir::Step::DebugCheck { .. })),
+                "{source}: no session, no points"
+            );
+        }
+    }
+
     #[test]
     fn fast_script_compiles_globals_to_direct_access() {
         let program =

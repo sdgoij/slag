@@ -4189,6 +4189,21 @@ mod tests {
     }
 
     #[test]
+    fn a_loop_runs_correctly_with_a_session_attached() {
+        // End to end: the session path's bytecode carries a point per statement
+        // and per back edge, and `continue` is what exercises the latter.
+        let mut agent = Agent::new();
+        agent.initialize_host_defined_realm().unwrap();
+        agent.set_debug_attached(true).unwrap();
+        let value = agent
+            .run_script(
+                "var s = 0; for (var i = 0; i < 100; i++) { if (i % 3 === 0) { continue; } s = s + i; } s",
+            )
+            .unwrap();
+        assert_eq!(value.as_number(), Some(3267.0));
+    }
+
+    #[test]
     fn a_debug_session_recompiles_the_cached_script_bytecode() {
         let mut agent = Agent::new();
         agent.initialize_host_defined_realm().unwrap();

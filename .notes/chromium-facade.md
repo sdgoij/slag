@@ -1589,6 +1589,33 @@ now has the mechanism that would make it free when no session is attached, so it
 is the next thing to emit. And the attach's own cost is unmeasured beyond "one
 compile per registered function".
 
+**2026-11-01, the back-edge point landed.** R2 is now complete: `compile_statement`
+emits one point per statement, and each loop form emits one at its back edge,
+through a single `emit_debug_point` gate. The five shapes are the four statement
+loops (`while` before its jump, `do`-`while` before its `jump_if_true`, `for`
+before its jump, and `for`'s two fused paths before `FastLoopHead`) and the
+certified `for`-in/`for`-of loop, whose back edge is not a jump at all: it re-runs
+the protocol step at the bottom, so the point goes immediately before that fetch
+(after the per-iteration env update, which keeps it the fetch's immediate
+predecessor on both the fall-through and the `continue` path). `async` for-of has
+the same bottom `Jump` shape and is covered by the same site.
+
+The one trap this hit, and the reason it was not a two-line change: the fused
+loop's planners (`plan_loop_num`, `plan_loop_int`, `plan_builder`) gate on
+`head == body_start + 1`, i.e. the body is exactly one `RunRegBody`. A point
+emitted before `FastLoopHead` sits inside that range, so every one of them would
+have declined and the loop would have silently lost its int32/number/string-
+builder lane *when a session was attached* (the one configuration where the
+bytecode differs). They now ask `body_is_sole_run`, which accepts trailing steps
+that emit nothing.
+
+The cost is zero in the default configuration, because no point is emitted
+without a session; the session path pays one dispatch per iteration and is a
+debug build. `every_loop_back_edge_carries_a_debug_point` asserts the emission
+structurally (the step before each backward branch, in each of the seven loop
+shapes) rather than by count, and `a_loop_runs_correctly_with_a_session_attached`
+runs a `continue`-heavy loop with a session to cover the interpreter path.
+
 ## 15. Sources
 
 Verified on 2026-10-31:

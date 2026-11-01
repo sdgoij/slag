@@ -19807,6 +19807,14 @@ impl Compiler {
         self.steps.push(step);
     }
 
+    /// Emit a debug point if a session is attached (§14.4). One place for the
+    /// gate, so the statement and back-edge sites cannot drift apart.
+    fn emit_debug_point(&mut self, span: crux::span::Span) {
+        if self.debug_points {
+            self.emit(Step::DebugCheck { span });
+        }
+    }
+
     fn jump(&mut self, target: usize) {
         let index = self.steps.len();
         self.steps.push(Step::Jump(0));
@@ -20452,9 +20460,7 @@ impl Compiler {
         // may fold away. A compile input (the session flag, recompiled on the
         // attach transition), because the dispatch it costs in the interpreter
         // cannot be removed once the step is in the body.
-        if self.debug_points {
-            self.emit(Step::DebugCheck { span: stmt.span });
-        }
+        self.emit_debug_point(stmt.span);
         match &stmt.kind {
             StmtKind::Block(block) => {
                 self.emit(Step::ListBegin);
@@ -20778,6 +20784,10 @@ impl Compiler {
                     self.jump_if_false(end_label);
                 }
                 self.compile_statement(body)?;
+                // The back edge (§14.4): a `continue` skips the body's last
+                // statement point, and a body with no statements has none at
+                // all, so the iteration boundary needs its own.
+                self.emit_debug_point(stmt.span);
                 self.jump(test_label);
                 self.place(end_label);
                 self.emit(Step::NormalizeCompletion);
@@ -20803,6 +20813,7 @@ impl Compiler {
                 self.compile_statement(body)?;
                 self.place(test_label);
                 self.compile_expr(test)?;
+                self.emit_debug_point(stmt.span);
                 self.jump_if_true(body_label);
                 self.place(end_label);
                 self.emit(Step::NormalizeCompletion);
@@ -20816,12 +20827,18 @@ impl Compiler {
                 body,
             } => {
                 let guard = self.begin_loop_sync(stmt);
-                self.compile_for(init.as_ref(), test.as_ref(), update.as_ref(), body)?;
+                self.compile_for(
+                    init.as_ref(),
+                    test.as_ref(),
+                    update.as_ref(),
+                    body,
+                    stmt.span,
+                )?;
                 self.end_loop_sync(guard);
             }
             StmtKind::ForIn { left, right, body } => {
                 let guard = self.begin_loop_sync(stmt);
-                self.compile_for_in(left, right, body)?;
+                self.compile_for_in(left, right, body, stmt.span)?;
                 self.end_loop_sync(guard);
             }
             StmtKind::ForOf {
@@ -20832,9 +20849,9 @@ impl Compiler {
             } => {
                 let guard = self.begin_loop_sync(stmt);
                 if *is_await {
-                    self.compile_async_for_of(left, right, body)?;
+                    self.compile_async_for_of(left, right, body, stmt.span)?;
                 } else {
-                    self.compile_for_of(left, right, body)?;
+                    self.compile_for_of(left, right, body, stmt.span)?;
                 }
                 self.end_loop_sync(guard);
             }
@@ -21206,6 +21223,7 @@ impl Compiler {
         update: Option<&Expr>,
         body: &Stmt,
         recv_slot: usize,
+        loop_span: crux::span::Span,
     ) -> Result<(), JsError> {
         self.emit(Step::ResetCompletion);
         // The guard: pop RECV, push its effective length on a probe hit.
@@ -21255,7 +21273,7 @@ impl Compiler {
         // copy re-establishes its own redirect and the outer one resumes.
         let saved = self.hoisted_length;
         self.hoisted_length = Some((recv_slot, hoist_slot));
-        self.compile_for(init, Some(&fake_test), update, body)?;
+        self.compile_for(init, Some(&fake_test), update, body, loop_span)?;
         self.hoisted_length = saved;
         self.jump(done_label);
         // Fallback copy: the original per-iteration member test. Suppress the
@@ -21265,7 +21283,7 @@ impl Compiler {
         self.place(miss_label);
         let saved = self.hoist_suppressed;
         self.hoist_suppressed = true;
-        self.compile_for(init, test, update, body)?;
+        self.compile_for(init, test, update, body, loop_span)?;
         self.hoist_suppressed = saved;
         self.place(done_label);
         Ok(())
@@ -21471,6 +21489,7 @@ impl Compiler {
         update: Option<&'a Expr>,
         body: &'a Stmt,
         plan: MemberHoistPlan<'a>,
+        span: crux::span::Span,
     ) -> Result<(), JsError> {
         self.emit(Step::ResetCompletion);
         let mut guards: Vec<(usize, crux::AtomId, usize, bool)> = Vec::new();
@@ -21590,7 +21609,7 @@ impl Compiler {
         };
         self.proven_num_slots = number_slots.iter().copied().collect();
         self.proven_int_slots = read_slots.iter().copied().collect();
-        self.compile_for(init, test, update, body)?;
+        self.compile_for(init, test, update, body, span)?;
         self.hoisted_exprs = saved_exprs;
         self.hoisted_members = saved_members.clone();
         self.hoisted_globals = saved_globals.clone();
@@ -21606,7 +21625,7 @@ impl Compiler {
             self.hoist_suppressed = true;
             self.hoisted_members = Some(guards.clone());
             self.hoisted_globals = Some(globals);
-            self.compile_for(init, test, update, body)?;
+            self.compile_for(init, test, update, body, span)?;
             self.hoisted_members = saved_members.clone();
             self.hoisted_globals = saved_globals;
             self.hoist_suppressed = saved_suppressed;
@@ -21615,7 +21634,7 @@ impl Compiler {
         // General copy: the original per-iteration reads.
         self.place(general_label);
         self.hoist_suppressed = true;
-        self.compile_for(init, test, update, body)?;
+        self.compile_for(init, test, update, body, span)?;
         self.hoist_suppressed = saved_suppressed;
         self.place(done_label);
         Ok(())
@@ -21674,8 +21693,22 @@ impl Compiler {
     /// the RMW's accumulator is a proven Number, and the slot is a proven
     /// Number at loop entry from the straight-line prefix (`Push(Number)` +
     /// store, no backward/escaping jump).
+    /// Whether `[body_start, head)` is one `RunRegBody` followed only by steps
+    /// that emit nothing (a `DebugCheck`). That is the shape the loop planners
+    /// below specialize on, and a debug point must not change the verdict: it
+    /// marks the iteration boundary, and letting it drop the int32/number/builder
+    /// lane would make attaching a session silently change the bytecode's shape
+    /// as well as its points.
+    fn body_is_sole_run(&self, body_start: usize, head: usize) -> bool {
+        head > body_start
+            && matches!(self.steps.get(body_start), Some(Step::RunRegBody { .. }))
+            && self.steps[body_start + 1..head]
+                .iter()
+                .all(|step| matches!(step, Step::DebugCheck { .. }))
+    }
+
     fn plan_loop_num(&mut self, bind: usize, body_start: usize, head: usize, store: usize) {
-        if head != body_start + 1 {
+        if !self.body_is_sole_run(body_start, head) {
             return;
         }
         let (rmw_index, slot) = {
@@ -21778,7 +21811,7 @@ impl Compiler {
     /// `(i & 255)`), keeping that prefix and folding only the RMW tail. A rhs
     /// the pass cannot prove stays on the step path.
     fn plan_loop_int(&mut self, bind: usize, body_start: usize, head: usize, store: usize) {
-        if head != body_start + 1 {
+        if !self.body_is_sole_run(body_start, head) {
             return;
         }
         let counter = if self.counter_is_int32(head, bind) {
@@ -21898,7 +21931,7 @@ impl Compiler {
     /// never observe `s` mid-build. The runtime handles non-string seeds and
     /// non-string operands by falling back to the exact generic `+`.
     fn plan_builder(&mut self, bb: usize, body_start: usize, head: usize, fbind: usize, bs: usize) {
-        if head != body_start + 1 {
+        if !self.body_is_sole_run(body_start, head) {
             return;
         }
         let counter = match &self.steps[fbind] {
@@ -21998,6 +22031,7 @@ impl Compiler {
         test: Option<&Expr>,
         update: Option<&Expr>,
         body: &Stmt,
+        span: crux::span::Span,
     ) -> Result<(), JsError> {
         // Gap-close M6 slice 2: hoist a certified loop's typed-array
         // `length` test limit. The hoist needs its own emission (a guard +
@@ -22006,10 +22040,10 @@ impl Compiler {
         // (its test is the original member shape).
         if !self.hoist_suppressed {
             if let Some(recv_slot) = self.hoistable_length_loop(init, test, update, body) {
-                return self.compile_hoisted_length_for(init, test, update, body, recv_slot);
+                return self.compile_hoisted_length_for(init, test, update, body, recv_slot, span);
             }
             if let Some(plan) = self.hoistable_member_loop(init, test, update, body) {
-                return self.compile_hoisted_member_for(init, test, update, body, plan);
+                return self.compile_hoisted_member_for(init, test, update, body, plan, span);
             }
         }
         self.emit(Step::ResetCompletion);
@@ -22315,6 +22349,7 @@ impl Compiler {
                         }
                         self.acc_binding = saved;
                         self.place(continue_label);
+                        self.emit_debug_point(span);
                         let index = self.steps.len();
                         self.emit(Step::FastLoopHead {
                             var: FastLoopVar::Counter,
@@ -22358,6 +22393,7 @@ impl Compiler {
                     self.place(body_start);
                     self.compile_fast_loop_body(body, continue_label)?;
                     self.place(continue_label);
+                    self.emit_debug_point(span);
                     let index = self.steps.len();
                     self.emit(Step::FastLoopHead {
                         var,
@@ -22429,6 +22465,7 @@ impl Compiler {
                 self.emit(Step::Pop);
             }
         }
+        self.emit_debug_point(span);
         self.jump(test_label);
         if per_iteration_entered {
             // The loop body compiled with the captured-head names resolving
@@ -22488,6 +22525,7 @@ impl Compiler {
         emit_next: Step,
         protocol_entered: bool,
         cursor: (usize, usize),
+        span: crux::span::Span,
     ) -> Result<(usize, usize), JsError> {
         let ForBinding::VarDecl { kind, pattern, .. } = left else {
             unreachable!("the certified scan only allows Ident VarDecl for-of/in heads")
@@ -22598,6 +22636,11 @@ impl Compiler {
                 names: per_iteration.clone(),
             });
         }
+        // The back edge (§14.4): the certified loop re-runs the protocol step at
+        // the bottom instead of jumping, so the iteration boundary is the step
+        // right before that fetch. Placed after the per-iteration env update so
+        // the point is the fetch's immediate predecessor on every path.
+        self.emit_debug_point(span);
         // Cut 35 slice 18: the do-while back edge — the per-iteration fetch
         // at the loop bottom re-runs the protocol step in place of the old
         // `Jump(top_label)`, so a straight-line body has no per-element jump
@@ -22652,6 +22695,7 @@ impl Compiler {
         left: &ForBinding,
         right: &Expr,
         body: &Stmt,
+        span: crux::span::Span,
     ) -> Result<(), JsError> {
         // Annex B.2.6: `for (var a = init in expr)` — the initializer runs
         // once and binds `a` before the RHS is evaluated (sloppy mode only).
@@ -22678,6 +22722,7 @@ impl Compiler {
             Step::ForInNext { done: 0, back: 0 },
             false,
             NO_FOR_OF_CURSOR,
+            span,
         )?;
         self.fixups
             .push(Fixup::ForInBoundary(begin_index, top, end));
@@ -22689,6 +22734,7 @@ impl Compiler {
         left: &ForBinding,
         right: &Expr,
         body: &Stmt,
+        span: crux::span::Span,
     ) -> Result<(), JsError> {
         self.compile_expr(right)?;
         // The inline fast-array cursor: two hidden frame slots the begin helper
@@ -22708,6 +22754,7 @@ impl Compiler {
             Step::ForOfNext { done: 0, back: 0 },
             true,
             cursor,
+            span,
         )?;
         self.fixups
             .push(Fixup::ForOfBoundary(begin_index, top, end));
@@ -22719,6 +22766,7 @@ impl Compiler {
         left: &ForBinding,
         right: &Expr,
         body: &Stmt,
+        span: crux::span::Span,
     ) -> Result<(), JsError> {
         self.emit(Step::ResetCompletion);
         // Certified body: the scan accepted an Ident VarDecl head (any other
@@ -22727,7 +22775,7 @@ impl Compiler {
         // TDZ) and the per-iteration environments unless a body closure
         // captures the head.
         if self.scope.is_some() {
-            return self.compile_certified_for_in(left, right, body);
+            return self.compile_certified_for_in(left, right, body, span);
         }
         // Annex B.2.6: `for (var a = init in expr)` — the initializer runs
         // once and binds `a` before the RHS is evaluated (sloppy mode only).
@@ -22791,6 +22839,7 @@ impl Compiler {
             self.emit(Step::ForInRestore);
             self.scope_count -= 1;
         }
+        self.emit_debug_point(span);
         self.jump(top_label);
         self.place(end_label);
         if lexical_head {
@@ -22810,12 +22859,13 @@ impl Compiler {
         left: &ForBinding,
         right: &Expr,
         body: &Stmt,
+        span: crux::span::Span,
     ) -> Result<(), JsError> {
         self.emit(Step::ResetCompletion);
         // Certified body: the scan accepted an Ident VarDecl head (see
         // `compile_for_in`).
         if self.scope.is_some() {
-            return self.compile_certified_for_of(left, right, body);
+            return self.compile_certified_for_of(left, right, body, span);
         }
         let tdz = self.enter_iter_tdz_env(left);
         self.compile_expr(right)?;
@@ -22898,6 +22948,7 @@ impl Compiler {
             self.emit(Step::ForOfRestore);
             self.scope_count -= 1;
         }
+        self.emit_debug_point(span);
         self.jump(top_label);
         self.place(end_label);
         if lexical_head {
@@ -22917,6 +22968,7 @@ impl Compiler {
         left: &ForBinding,
         right: &Expr,
         body: &Stmt,
+        span: crux::span::Span,
     ) -> Result<(), JsError> {
         self.emit(Step::ResetCompletion);
         let tdz = self.enter_iter_tdz_env(left);
@@ -22974,6 +23026,7 @@ impl Compiler {
             self.emit(Step::AsyncForOfRestore);
             self.scope_count -= 1;
         }
+        self.emit_debug_point(span);
         self.jump(top_label);
         self.place(end_label);
         if lexical_head {
