@@ -56,6 +56,19 @@ class MaybeLocal;
 template <class T>
 class Maybe;
 
+class AccessorSignature;
+class Signature;
+class FunctionTemplate;
+class ObjectTemplate;
+class Name;
+class Private;
+class ArrayBuffer;
+class Value;
+class Context;
+class Isolate;
+class Object;
+class Script;
+
 enum class NewStringType { kNormal, kInternalized };
 
 /* How `String::Write` behaves about the trailing NUL (`v8::WriteOptions`). The
@@ -386,6 +399,12 @@ class Object : public Value {
                    AccessorNameGetterCallback getter,
                    AccessorNameSetterCallback setter = nullptr,
                    Local<Value> data = Local<Value>(),
+                   PropertyAttribute attribute = None);
+  /* The same, declared over a receiver type (`v8::AccessorSignature`). */
+  void SetAccessor(Local<Context> context, Local<Name> name,
+                   AccessorNameGetterCallback getter,
+                   AccessorNameSetterCallback setter, Local<Value> data,
+                   Local<AccessorSignature> signature,
                    PropertyAttribute attribute = None);
 
   /* The context this object was created in (`Object::GetCreationContext`). The
@@ -1396,6 +1415,16 @@ class AccessorSignature {
  public:
   static Local<AccessorSignature> New(Isolate* isolate,
                                       Local<FunctionTemplate> function);
+  Local<FunctionTemplate> GetFunctionTemplate() const;
+
+ private:
+  friend class Object;
+  friend class ObjectTemplate;
+  explicit AccessorSignature(FunctionTemplate* function) : function_(function) {}
+  /* The template the check walks to. The trampolines read it from the accessor
+   * specification rather than from a handle. */
+  FunctionTemplate* function() const { return function_; }
+  FunctionTemplate* function_ = nullptr;
 };
 
 class FunctionTemplate {
@@ -1408,6 +1437,10 @@ class FunctionTemplate {
       SideEffectType side_effect_type = SideEffectType::kHasSideEffect);
 
   FunctionCallback callback() const { return callback_; }
+  /* The built prototype instances inherit from, 0 until the template is
+   * materialized. It is the identity a signature's receiver check walks to
+   * (`AllowsReceiver`). */
+  uint64_t prototype_bits() const { return prototype_bits_; }
   /* The value the template hands its callbacks (`FunctionCallbackInfo::Data`). */
   Local<Value> data() const { return Local<Value>::New(data_bits_); }
   void SetCallHandler(FunctionCallback callback,
@@ -1431,6 +1464,7 @@ class FunctionTemplate {
 
  private:
   friend class Signature;
+  friend class AccessorSignature;
   explicit FunctionTemplate(FunctionCallback callback) : callback_(callback) {}
 
   /* The object `new` instances inherit from: the instance template's object,
@@ -1484,6 +1518,15 @@ class ObjectTemplate {
   void SetAccessor(Local<Name> name, AccessorNameGetterCallback getter,
                    AccessorNameSetterCallback setter = nullptr,
                    Local<Value> data = Local<Value>(),
+                   PropertyAttribute attribute = None);
+  /* The same, declared over a receiver type (`v8::AccessorSignature`): the
+   * getter and setter only run when `this` is an instance of that template's
+   * built prototype, and fail with `TypeError: Illegal invocation` otherwise.
+   * `signature` has no default, so an ordinary call cannot land on this
+   * overload. */
+  void SetAccessor(Local<Name> name, AccessorNameGetterCallback getter,
+                   AccessorNameSetterCallback setter, Local<Value> data,
+                   Local<AccessorSignature> signature,
                    PropertyAttribute attribute = None);
 
   /* The data-property forms (`v8::ObjectTemplate::SetNativeDataProperty` and
@@ -1545,6 +1588,11 @@ class ObjectTemplate {
     uint64_t data_bits = 0;
     AccessorNameGetterCallback getter = nullptr;
     AccessorNameSetterCallback setter = nullptr;
+    /* The receiver type the accessor is declared over (`AccessorSignature`).
+     * The getter and setter trampolines run the same `AllowsReceiver` check a
+     * function template's signature does, so an accessor and a method cannot
+     * disagree about what an instance is. */
+    FunctionTemplate* signature = nullptr;
     int32_t attributes = 0;
   };
   const std::deque<Accessor>& accessors() const { return accessors_; }

@@ -12,6 +12,10 @@
 #include <string.h>
 #include <string>
 
+#ifdef _WIN32
+#include <crtdbg.h>
+#endif
+
 #include "include/slag_a0.h"
 #include "include/v8-context.h"
 #include "include/v8-initialization.h"
@@ -491,6 +495,15 @@ void GuardedBody(const v8::FunctionCallbackInfo<v8::Value>& info) {
       info.GetIsolate(), NumberArg(info, 0) * 2));
 }
 
+// An accessor declared over an `AccessorSignature`: its getter runs for an
+// instance and is refused with `Illegal invocation` for anything else.
+int guard_reads = 0;
+void SignatureGuardGet(v8::Local<v8::Name>,
+                       const v8::PropertyCallbackInfo<v8::Value>& info) {
+  ++guard_reads;
+  info.GetReturnValue().Set(v8::Integer::New(info.GetIsolate(), 77));
+}
+
 // The two answers a per-object access check can give
 // (`ObjectTemplate::SetAccessCheckCallback`). The count is the host's proof
 // that the check ran only where it should: a same-realm access never reaches
@@ -532,6 +545,21 @@ struct CountingAllocator : v8::ArrayBuffer::Allocator {
 }  // namespace
 
 int main() {
+#ifdef _WIN32
+  // A harness must never block on a modal dialog: a failed assertion or an abort
+  // is a failure the caller reads from stderr and the exit code, not something
+  // that waits for a click. The debug CRT raises one for `abort()` and for its
+  // own assertion reports, and this is the process-wide off switch for both.
+  _set_abort_behavior(0, _WRITE_ABORT_MSG | _CALL_REPORTFAULT);
+  _set_error_mode(_OUT_TO_STDERR);
+  _CrtSetReportMode(_CRT_ASSERT, _CRTDBG_MODE_FILE);
+  _CrtSetReportFile(_CRT_ASSERT, _CRTDBG_FILE_STDERR);
+  _CrtSetReportMode(_CRT_ERROR, _CRTDBG_MODE_FILE);
+  _CrtSetReportFile(_CRT_ERROR, _CRTDBG_FILE_STDERR);
+#endif
+  // Unbuffered, so a run that dies mid-way still shows how far it got: a
+  // block-buffered stdout loses everything when the process aborts.
+  setvbuf(stdout, nullptr, _IONBF, 0);
   v8::V8::InitializeICUDefaultLocation(nullptr);
   v8::V8::Initialize();
 
@@ -2677,6 +2705,14 @@ int main() {
     child->SetClassName("Child");
     child->Inherit(parent);
     child->InstanceTemplate()->SetInternalFieldCount(1);
+    // An accessor declared over an `AccessorSignature`: it lands on the built
+    // prototype, so it must be installed before the template is materialized
+    // (the prototype object is built once and kept).
+    v8::Local<v8::AccessorSignature> guard_signature =
+        v8::AccessorSignature::New(isolate, parent);
+    child->PrototypeTemplate()->SetAccessor(
+        v8::String::NewFromUtf8Literal(isolate, "guard"), &SignatureGuardGet,
+        nullptr, v8::Local<v8::Value>(), guard_signature);
 
     v8::Local<v8::Function> constructor;
     expect(child->GetFunction(current).ToLocal(&constructor),
@@ -2701,6 +2737,54 @@ int main() {
     expect(number_at("madeKind") == 42,
            "an instance reached the parent's prototype method");
     expect(number_at("madeIsChild") == 1, "the instance is an instance");
+
+    // An accessor declared over an `AccessorSignature` runs for an instance and
+    // is refused for any other `this`, through the same receiver check a
+    // method's signature makes.
+    {
+      run("var guarded = new Child(1);"
+          " globalThis.guardOwn = guarded.guard;"
+          " var descriptor = Object.getOwnPropertyDescriptor("
+          "   Object.getPrototypeOf(guarded), 'guard');"
+          " try {"
+          "   descriptor.get.call({});"
+          "   globalThis.guardForeign = 1;"
+          " } catch (e) {"
+          "   globalThis.guardForeign = 0;"
+          "   globalThis.guardMessage = e.message;"
+          " }");
+      expect(number_at("guardOwn") == 77 && guard_reads == 1,
+             "an accessor declared over a signature ran for its instance");
+      expect(number_at("guardForeign") == 0,
+             "the accessor refused a receiver outside the signature");
+      expect(guard_reads == 1,
+             "the refused accessor did not run its getter");
+      run("globalThis.guardRefused = globalThis.guardMessage === "
+          "'Illegal invocation';");
+      expect(number_at("guardRefused") == 1,
+             "the refusal is Illegal invocation");
+    }
+
+    // The same check reaches `SetAccessorProperty`, whose getter and setter are
+    // function templates: a template carrying a signature is enforced there
+    // too, so an accessor declared over a type refuses a foreign receiver.
+    {
+      v8::Local<v8::FunctionTemplate> signed_getter = v8::FunctionTemplate::New(
+          isolate, &ParentKind, v8::Local<v8::Value>(), signature);
+      v8::Local<v8::Object> holder = v8::Object::New(isolate);
+      holder->SetAccessorProperty(
+          v8::String::NewFromUtf8Literal(isolate, "signed"), signed_getter,
+          v8::Local<v8::FunctionTemplate>());
+      bind("signedHolder", holder);
+      run("try {"
+          "  signedHolder.signed;"
+          "  globalThis.signedRefused = 0;"
+          "} catch (e) {"
+          "  globalThis.signedRefused = e.message === 'Illegal invocation';"
+          "}");
+      expect(number_at("signedRefused") == 1,
+             "a template accessor over a signature refused a foreign receiver");
+    }
 
     // ConstructorBehavior::kThrow materializes a function with no [[Construct]].
     v8::Local<v8::FunctionTemplate> plain_template = v8::FunctionTemplate::New(

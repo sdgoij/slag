@@ -1263,6 +1263,32 @@ Still open in A4: `AccessorSignature` enforcement, `Object::SetAccessor`'s
 signature parameter, the security token (comparable now, consulted by nothing),
 and moving `Signature`'s prototype-chain check behind the same callback.
 
+*One receiver check, and two ways into it (2026-11-01).* The two gaps the
+paragraph above names are closed, and they closed into one seam.
+`AdmitsReceiver(template, receiver)` is now the only place the prototype-chain
+walk lives; the call trampoline asks it through `FunctionTemplate::AllowsReceiver`,
+and the ordinary-accessor and `SetAccessorProperty` trampolines ask it directly
+before they build a callback info. So a method, an accessor declared over
+`AccessorSignature`, and an accessor whose getter template carries a `Signature`
+all agree about what an instance is, and a refusal is `Illegal invocation` in
+every case.
+
+The accessor signature is an overload rather than a new position in the existing
+signature: `signature` sits before the attribute and has no default, so
+`SetAccessor(name, getter, setter, data, None)` still binds the old form and
+nothing that compiled before changes meaning. The signature itself is stored on
+the accessor specification as the template pointer, because the trampolines
+already read that specification and it outlives every instance.
+
+One trap for the next person: a *template's* own signature is not a receiver
+type. The first version of the `SetAccessorProperty` check compared the getter
+template's built prototype against the receiver, and a never-materialized
+template has no prototype, so every such accessor was refused. In a harness
+whose scripts end in `ToLocalChecked()`, that surfaces as an `abort()` with exit
+code 3 and no message, which is why the harness now sets stdout unbuffered and
+switches the CRT's abort and assert dialogs off at startup: a failing run must
+print and exit, never block on a modal box.
+
 ## 15. Sources
 
 Verified on 2026-10-31:

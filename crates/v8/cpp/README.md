@@ -547,8 +547,20 @@ template whose function was never materialized admits nothing, since no instance
 of it can exist.
 
 The check reads the chain through the callback's window when a trampoline is
-running, so it works inside a host callback. `AccessorSignature` is still
-accepted and not consulted.
+running, so it works inside a host callback. The same check is the only one a
+receiver-type declaration makes: `AdmitsReceiver` in `facade.cc` is called by the
+call trampoline, by both accessor trampolines and by the `SetAccessorProperty`
+trampolines, so an accessor and a method cannot disagree about what an instance
+is.
+
+`AccessorSignature::New(isolate, template)` declares the same thing for an
+accessor. `ObjectTemplate::SetAccessor` and `Object::SetAccessor` take it as an
+overload (the signature sits before the attribute and has no default, so an
+ordinary call cannot land on it), and a getter or setter whose `this` is not an
+instance fails with `Illegal invocation` without running the host callback.
+`Object::SetAccessorProperty` needs no signature argument: its getter and setter
+are function templates, so a `Signature` declared on either is enforced through
+the template's own `AllowsReceiver`.
 
 ### Per-object access checks
 
@@ -577,10 +589,9 @@ engine side is `slag_value_realm` / `slag_value_same_realm` and
 `slag_context_realm`, and every object records the realm it was created in (see
 `.notes/chromium-facade.md` section 14.2).
 
-What is still missing from the A4 section: `AccessorSignature` enforcement, the
-security token (stored, and now comparable, but nothing consults it), and a
-signature's check is still the trampoline's rather than moving behind the same
-hook.
+What is still missing from the A4 section: the security token (stored, and now
+comparable, but nothing consults it) and a signature's check moving behind the
+handler rather than staying in the trampolines.
 
 ## The gin target
 
@@ -765,14 +776,14 @@ slots are separate stores, so `GetEmbedderData` on a pointer slot answers
 - `SetCallAsFunctionHandler` makes an instance callable: a builtin whose body is
   the handler, with the template's members and internal fields on the callee
   itself, so `typeof instance` is `"function"` and a call runs the host's code.
-- `Signature` is enforced for function templates only: `AccessorSignature` is
-  accepted and not consulted, and `Object::SetAccessor` has no signature
-  parameter yet. A per-object access check is enforced
-  (`SetAccessCheckCallback` and `SetAccessCheckCallbackAndHandler`) for every
-  property internal method of an instance, on a cross-realm access only. An
-  instance of a checked template is a host object, so a template that also asks
-  for a callable instance keeps the handler object instead (the engine's host
-  objects have no `[[Call]]`).
+- `Signature` and `AccessorSignature` are enforced for function templates and
+  for accessors (`SetAccessor`, `SetAccessorProperty`), by one receiver check:
+  the template's built prototype must be on the receiver's chain. A per-object
+  access check is enforced (`SetAccessCheckCallback` and
+  `SetAccessCheckCallbackAndHandler`) for every property internal method of an
+  instance, on a cross-realm access only. An instance of a checked template is a
+  host object, so a template that also asks for a callable instance keeps the
+  handler object instead (the engine's host objects have no `[[Call]]`).
 - `Platform` is a handle plus a message pump: `PumpMessageLoop` runs the
   isolate's queued jobs (microtasks, promise reactions, due timers) and answers
   whether it ran any. There are no host-posted platform tasks or task runners
@@ -896,7 +907,13 @@ handler, a method, and an internal field, checks that the instance is a function
 calls it through a script, and checks that a template with a property handler
 keeps a handler object instead. The signature block declares a method over a
 `Signature`, calls it on an instance (allowed), and calls it on a foreign object
-(refused with a `TypeError` whose message is `Illegal invocation`). The access
+(refused with a `TypeError` whose message is `Illegal invocation`). The accessor
+signature block declares a getter over an `AccessorSignature` on a prototype
+template, reads it from an instance (allowed, the getter ran once), calls it
+through a descriptor with a foreign `this` (refused, the getter did not run, and
+the message is `Illegal invocation`), and checks that an
+`Object::SetAccessorProperty` getter whose template carries a `Signature` is
+refused on a plain receiver. The access
 check block installs a per-object check on a template, reads its instance from
 its own realm (allowed, and the callback never runs), reads it from a second
 context (refused with a `TypeError`, and the callback ran exactly once), and

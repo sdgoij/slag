@@ -86,6 +86,23 @@ bool InstanceOf(uint64_t receiver, uint64_t prototype) {
   return answer == 1;
 }
 
+/* The one receiver-type check a signature makes (`v8::Signature` on a function
+ * template, `v8::AccessorSignature` on an accessor): whether `receiver` is an
+ * instance of the type `signature` names, decided by walking the prototype
+ * chain to the template's built prototype. A null signature admits anything. */
+bool AdmitsReceiver(v8::FunctionTemplate* signature, uint64_t receiver) {
+  if (signature == nullptr) return true;
+  return InstanceOf(receiver, signature->prototype_bits());
+}
+
+/* Refuse a receiver the signature does not admit, the way V8 spells it. */
+void ThrowIllegalInvocation() {
+  static constexpr char kRefusal[] = "Illegal invocation";
+  slag_throw_error_kind(CurrentSlagContext(), 5,
+                        reinterpret_cast<const uint8_t*>(kRefusal),
+                        sizeof(kRefusal) - 1);
+}
+
 uint64_t HostTrampoline(void* data, const void* call, uint64_t this_value,
                         const uint64_t* args, size_t len) {
   auto* function = static_cast<v8::FunctionTemplate*>(data);
@@ -341,6 +358,10 @@ int32_t AccessorGetterTrampoline(void* data, uint64_t holder, uint64_t key,
   }
   *out = slag_undefined();
   CallbackToken token;
+  if (!AdmitsReceiver(accessor->signature, holder)) {
+    ThrowIllegalInvocation();
+    return 1;
+  }
   v8::PropertyCallbackInfo<v8::Value> info(v8::g_current_isolate, holder,
                                            accessor->data_bits, out,
                                            token.get());
@@ -353,6 +374,10 @@ int32_t AccessorSetterTrampoline(void* data, uint64_t holder, uint64_t key,
   auto* accessor = static_cast<v8::ObjectTemplate::Accessor*>(data);
   if (accessor == nullptr || accessor->setter == nullptr) return 1;
   CallbackToken token;
+  if (!AdmitsReceiver(accessor->signature, holder)) {
+    ThrowIllegalInvocation();
+    return 1;
+  }
   uint64_t answer = slag_undefined();
   v8::PropertyCallbackInfo<void> info(v8::g_current_isolate, holder,
                                       accessor->data_bits, &answer,
@@ -368,6 +393,11 @@ int32_t AccessorSetterTrampoline(void* data, uint64_t holder, uint64_t key,
 struct TemplateAccessor {
   v8::FunctionCallback getter = nullptr;
   v8::FunctionCallback setter = nullptr;
+  /* The templates themselves, so the receiver check each declares runs here the
+   * way it runs for a call: `Object::SetAccessorProperty` takes function
+   * templates, and a template can carry a signature. */
+  v8::FunctionTemplate* getter_template = nullptr;
+  v8::FunctionTemplate* setter_template = nullptr;
 };
 
 int32_t TemplateAccessorGetter(void* data, uint64_t holder, uint64_t,
@@ -377,6 +407,14 @@ int32_t TemplateAccessorGetter(void* data, uint64_t holder, uint64_t,
     return 1;
   }
   *out = slag_undefined();
+  // The template's own signature, not the template as a type: `AllowsReceiver`
+  // is where a `Signature` declared on the getter is enforced, the same call
+  // the function's own trampoline makes.
+  if (accessor->getter_template != nullptr &&
+      !accessor->getter_template->AllowsReceiver(holder)) {
+    ThrowIllegalInvocation();
+    return 1;
+  }
   v8::FunctionCallbackInfo<v8::Value> info(v8::g_current_isolate, nullptr,
                                            holder, nullptr, 0);
   // The getter runs inside the engine's callback window, so the conversion and
@@ -392,6 +430,11 @@ int32_t TemplateAccessorSetter(void* data, uint64_t holder, uint64_t,
                                uint64_t value) {
   auto* accessor = static_cast<TemplateAccessor*>(data);
   if (accessor == nullptr || accessor->setter == nullptr) return 1;
+  if (accessor->setter_template != nullptr &&
+      !accessor->setter_template->AllowsReceiver(holder)) {
+    ThrowIllegalInvocation();
+    return 1;
+  }
   uint64_t args[1] = {value};
   v8::FunctionCallbackInfo<v8::Value> info(v8::g_current_isolate, nullptr,
                                            holder, args, 1);
@@ -810,10 +853,17 @@ Local<FunctionTemplate> Signature::GetFunctionTemplate() const {
   return Local<FunctionTemplate>::New(reinterpret_cast<uint64_t>(function_));
 }
 
-Local<AccessorSignature> AccessorSignature::New(Isolate*,
-                                                Local<FunctionTemplate>) {
+Local<AccessorSignature> AccessorSignature::New(
+    Isolate*, Local<FunctionTemplate> function) {
+  auto* signature = new AccessorSignature(
+      reinterpret_cast<FunctionTemplate*>(static_cast<uintptr_t>(function.raw())));
   return Local<AccessorSignature>::New(
-      reinterpret_cast<uint64_t>(new AccessorSignature()));
+      reinterpret_cast<uint64_t>(signature));
+}
+
+Local<FunctionTemplate> AccessorSignature::GetFunctionTemplate() const {
+  return Local<FunctionTemplate>::New(
+      reinterpret_cast<uint64_t>(function_));
 }
 
 Local<FunctionTemplate> FunctionTemplate::New(
@@ -872,8 +922,9 @@ Local<ObjectTemplate> FunctionTemplate::PrototypeTemplate() {
 }
 
 bool FunctionTemplate::AllowsReceiver(uint64_t receiver) const {
-  if (signature_ == nullptr || signature_->function_ == nullptr) return true;
-  return InstanceOf(receiver, signature_->function_->prototype_bits_);
+  return signature_ == nullptr
+             ? true
+             : AdmitsReceiver(signature_->function_, receiver);
 }
 
 MaybeLocal<Function> FunctionTemplate::GetFunction(Local<Context> context) {
@@ -1352,6 +1403,15 @@ void Object::SetAccessor(Local<Context> context, Local<Name> name,
                          AccessorNameGetterCallback getter,
                          AccessorNameSetterCallback setter, Local<Value> data,
                          PropertyAttribute attribute) {
+  SetAccessor(context, name, getter, setter, data,
+              Local<AccessorSignature>(), attribute);
+}
+
+void Object::SetAccessor(Local<Context> context, Local<Name> name,
+                         AccessorNameGetterCallback getter,
+                         AccessorNameSetterCallback setter, Local<Value> data,
+                         Local<AccessorSignature> signature,
+                         PropertyAttribute attribute) {
   if (context.IsEmpty() || name.IsEmpty() || getter == nullptr) return;
   auto* current = reinterpret_cast<Context*>(
       static_cast<uintptr_t>(context.raw()));
@@ -1363,6 +1423,11 @@ void Object::SetAccessor(Local<Context> context, Local<Name> name,
   accessor->setter = setter;
   accessor->name_bits = name.raw();
   accessor->data_bits = data.IsEmpty() ? slag_undefined() : data.raw();
+  accessor->signature = signature.IsEmpty()
+                            ? nullptr
+                            : reinterpret_cast<AccessorSignature*>(
+                                  static_cast<uintptr_t>(signature.raw()))
+                                  ->function();
   accessor->attributes = static_cast<int32_t>(attribute);
   slag_root_retain(accessor->name_bits);
   slag_root_retain(accessor->data_bits);
@@ -1381,7 +1446,13 @@ void Object::SetAccessorProperty(Local<Name> name,
   // The specification is owned for the object's life, like `SetAccessor`'s.
   auto* accessor = new TemplateAccessor();
   accessor->getter = getter->callback();
-  accessor->setter = setter.IsEmpty() ? nullptr : setter->callback();
+  accessor->getter_template = reinterpret_cast<FunctionTemplate*>(
+      static_cast<uintptr_t>(getter.raw()));
+  if (!setter.IsEmpty()) {
+    accessor->setter = setter->callback();
+    accessor->setter_template = reinterpret_cast<FunctionTemplate*>(
+        static_cast<uintptr_t>(setter.raw()));
+  }
   slag_object_set_accessor(
       slag, Raw(this), name.raw(), &TemplateAccessorGetter,
       accessor->setter == nullptr ? nullptr : &TemplateAccessorSetter, accessor,
@@ -2746,12 +2817,26 @@ void ObjectTemplate::SetAccessor(Local<Name> name,
                                  AccessorNameGetterCallback getter,
                                  AccessorNameSetterCallback setter,
                                  Local<Value> data, PropertyAttribute attribute) {
+  SetAccessor(name, getter, setter, data, Local<AccessorSignature>(), attribute);
+}
+
+void ObjectTemplate::SetAccessor(Local<Name> name,
+                                 AccessorNameGetterCallback getter,
+                                 AccessorNameSetterCallback setter,
+                                 Local<Value> data,
+                                 Local<AccessorSignature> signature,
+                                 PropertyAttribute attribute) {
   if (name.IsEmpty() || getter == nullptr) return;
   Accessor accessor;
   accessor.getter = getter;
   accessor.setter = setter;
   accessor.name_bits = name.raw();
   accessor.data_bits = data.IsEmpty() ? slag_undefined() : data.raw();
+  accessor.signature = signature.IsEmpty()
+                            ? nullptr
+                            : reinterpret_cast<AccessorSignature*>(
+                                  static_cast<uintptr_t>(signature.raw()))
+                                  ->function();
   accessor.attributes = static_cast<int32_t>(attribute);
   // The template outlives the scopes the name and data were made in, and it is
   // never freed, so the roots are held for the process (like `Global` holds one).
