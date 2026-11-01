@@ -443,6 +443,16 @@ impl CallbackWindow {
     pub fn promise_mark_handled(&self, promise: JsValue) -> Result<(), JsError> {
         promise_mark_handled(crate::context::callback_agent(self.agent)?, promise)
     }
+
+    /// Whether a receiver is on `prototype`'s chain (the re-entrant counterpart of
+    /// [`Context::has_prototype_in_chain`]).
+    pub fn has_prototype_in_chain(
+        &self,
+        value: JsValue,
+        prototype: JsValue,
+    ) -> Result<bool, JsError> {
+        has_prototype_in_chain(value, prototype)
+    }
 }
 
 /// The three values a capability is made of (`v8::Promise::Resolver`): the
@@ -770,6 +780,30 @@ pub fn create_callable_instance(agent: &mut Agent, callback: HostFn) -> Result<J
     });
     let function = crux::function::Function::create_builtin(None, 0, call, None, prototype)?;
     Ok(JsValue(Value::Function(function)))
+}
+
+/// Whether `prototype` is on `value`'s prototype chain, which is the receiver
+/// check `v8::Signature` declares: a method installed with one may only run on
+/// an instance of the type the signature names. The walk starts at the value's
+/// prototype, so a prototype object is not an instance of itself.
+///
+/// The chain is the one the engine stores (a proxy's `[[GetPrototypeOf]]`
+/// included), so a host object's prototype is what a script would see.
+pub fn has_prototype_in_chain(value: JsValue, prototype: JsValue) -> Result<bool, JsError> {
+    let Some(prototype) = crate::context::as_object(&prototype.into_value()) else {
+        return Ok(false);
+    };
+    let Some(value) = crate::context::as_object(&value.into_value()) else {
+        return Ok(false);
+    };
+    let mut current = value.get_prototype_of()?;
+    while let Some(object) = current {
+        if object.ptr_eq(prototype) {
+            return Ok(true);
+        }
+        current = object.get_prototype_of()?;
+    }
+    Ok(false)
 }
 
 /// Host-defined behavior the embedding API exposes. Each callback is
@@ -1328,6 +1362,16 @@ impl Context {
     /// Mark the promise handled (`v8::Promise::MarkAsHandled`).
     pub fn promise_mark_handled(&self, promise: JsValue) -> Result<(), JsError> {
         promise_mark_handled(&self.agent, promise)
+    }
+
+    /// Whether `prototype` is on `value`'s prototype chain (`v8::Signature`'s
+    /// receiver check).
+    pub fn has_prototype_in_chain(
+        &self,
+        value: JsValue,
+        prototype: JsValue,
+    ) -> Result<bool, JsError> {
+        has_prototype_in_chain(value, prototype)
     }
 
     /// A fresh `Map` in this realm (`v8::Map::New`).
@@ -5383,6 +5427,32 @@ mod tests {
         );
         // The guarded window is gone, so its token names nothing.
         assert!(CallbackWindow::admit(token).is_none());
+    }
+
+    #[test]
+    fn a_prototype_chain_walk_answers_the_signature_question() {
+        let mut context = Context::new().unwrap();
+        let object_prototype = context.eval("Object.prototype").unwrap();
+        let instance = context.eval("({})").unwrap();
+        assert!(
+            context
+                .has_prototype_in_chain(instance.clone(), object_prototype.clone())
+                .unwrap()
+        );
+        // A prototype is not an instance of itself, and a null prototype has no
+        // chain at all.
+        assert!(
+            !context
+                .has_prototype_in_chain(object_prototype.clone(), object_prototype)
+                .unwrap()
+        );
+        let bare = context.eval("Object.create(null)").unwrap();
+        let second_prototype = context.eval("Object.prototype").unwrap();
+        assert!(
+            !context
+                .has_prototype_in_chain(bare, second_prototype)
+                .unwrap()
+        );
     }
 
     #[test]

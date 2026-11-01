@@ -63,20 +63,57 @@ int OwnPropertyKind(v8::Local<v8::Context> context, const v8::Object* object,
   return kind;
 }
 
+/* The A0 context entered on this thread, or null. V8's predicates read the
+ * isolate off the handle's location; the facade keeps the entered context in a
+ * thread-local instead, which is the same scope. */
+SlagContext* CurrentSlagContext() {
+  const auto* context = reinterpret_cast<const v8::Context*>(
+      static_cast<uintptr_t>(v8::g_current_context));
+  return context == nullptr ? nullptr : context->slag();
+}
+
+/* Whether `receiver` is an instance of the type `prototype` names: the engine
+ * walks the chain (`slag_value_has_prototype_in_chain`), through the callback's
+ * window when a trampoline is running and the ordinary path otherwise. */
+bool InstanceOf(uint64_t receiver, uint64_t prototype) {
+  if (prototype == 0) return false;
+  const int answer =
+      g_callback_token != nullptr
+          ? slag_callback_value_has_prototype_in_chain(
+                CurrentSlagContext(), g_callback_token, receiver, prototype)
+          : slag_value_has_prototype_in_chain(CurrentSlagContext(), receiver,
+                                              prototype);
+  return answer == 1;
+}
+
 uint64_t HostTrampoline(void* data, const void* call, uint64_t this_value,
                         const uint64_t* args, size_t len) {
   auto* function = static_cast<v8::FunctionTemplate*>(data);
-  v8::FunctionCallbackInfo<v8::Value> info(v8::g_current_isolate, call,
-                                           this_value, args,
-                                           static_cast<int>(len),
-                                           function->data().raw());
+  if (function == nullptr) return slag_undefined();
   // A host callback may allocate or write through the entry points, which are
   // not re-entered from a callback unless the token names the running window.
+  // The signature check reads the receiver's prototype chain, which is one of
+  // those entry points, so the window is published before it runs.
   const void* previous = g_callback_token;
   g_callback_token = slag_callback_token();
-  function->callback()(info);
+  uint64_t result = slag_undefined();
+  if (!function->AllowsReceiver(this_value)) {
+    // V8's access check: a method installed with a signature does not run on a
+    // receiver that is not an instance, and the call fails with a TypeError.
+    static constexpr char kRefusal[] = "Illegal invocation";
+    slag_throw_error_kind(CurrentSlagContext(), 5,
+                          reinterpret_cast<const uint8_t*>(kRefusal),
+                          sizeof(kRefusal) - 1);
+  } else {
+    v8::FunctionCallbackInfo<v8::Value> info(v8::g_current_isolate, call,
+                                             this_value, args,
+                                             static_cast<int>(len),
+                                             function->data().raw());
+    function->callback()(info);
+    result = info.return_value();
+  }
   g_callback_token = previous;
-  return info.return_value();
+  return result;
 }
 
 /* The body of a callable template instance
@@ -521,15 +558,6 @@ void* ArrayBuffer::Allocator::Reallocate(void* data, size_t old_length,
 
 namespace {
 
-/* The A0 context entered on this thread, or null. V8's predicates read the
- * isolate off the handle's location; the facade keeps the entered context in a
- * thread-local instead, which is the same scope. */
-SlagContext* CurrentSlagContext() {
-  const auto* context = reinterpret_cast<const Context*>(
-      static_cast<uintptr_t>(g_current_context));
-  return context == nullptr ? nullptr : context->slag();
-}
-
 /* Which `v8::Value` predicates a value answers. The brands need the agent, and
  * the entered context owns it; with none there is no table to ask, so only the
  * shape bits answer. */
@@ -768,11 +796,16 @@ Local<AccessorSignature> AccessorSignature::New(Isolate*,
 }
 
 Local<FunctionTemplate> FunctionTemplate::New(
-    Isolate*, FunctionCallback callback, Local<Value> data, Local<Signature>,
-    int length, ConstructorBehavior behavior, SideEffectType) {
+    Isolate*, FunctionCallback callback, Local<Value> data,
+    Local<Signature> signature, int length, ConstructorBehavior behavior,
+    SideEffectType) {
   auto* tmpl = new FunctionTemplate(callback);
   tmpl->data_bits_ = data.IsEmpty() ? slag_undefined() : data.raw();
   slag_root_retain(tmpl->data_bits_);
+  if (!signature.IsEmpty()) {
+    tmpl->signature_ =
+        reinterpret_cast<Signature*>(static_cast<uintptr_t>(signature.raw()));
+  }
   tmpl->length_ = length;
   tmpl->allow_construction_ = behavior != ConstructorBehavior::kThrow;
   return Local<FunctionTemplate>::New(reinterpret_cast<uint64_t>(tmpl));
@@ -817,6 +850,11 @@ Local<ObjectTemplate> FunctionTemplate::PrototypeTemplate() {
       reinterpret_cast<uint64_t>(prototype_template_));
 }
 
+bool FunctionTemplate::AllowsReceiver(uint64_t receiver) const {
+  if (signature_ == nullptr || signature_->function_ == nullptr) return true;
+  return InstanceOf(receiver, signature_->function_->prototype_bits_);
+}
+
 MaybeLocal<Function> FunctionTemplate::GetFunction(Local<Context> context) {
   if (context.IsEmpty()) return MaybeLocal<Function>();
   auto* current = reinterpret_cast<Context*>(
@@ -841,6 +879,11 @@ MaybeLocal<Function> FunctionTemplate::GetFunction(Local<Context> context) {
 
 MaybeLocal<Object> FunctionTemplate::BuildPrototypeObject(Local<Context> context) {
   if (context.IsEmpty()) return MaybeLocal<Object>();
+  // One prototype per template: every instance shares it, which is what makes a
+  // signature's receiver check an identity walk.
+  if (prototype_bits_ != 0) {
+    return MaybeLocal<Object>(Local<Object>::New(prototype_bits_));
+  }
   auto* current = reinterpret_cast<Context*>(
       static_cast<uintptr_t>(context.raw()));
   Local<ObjectTemplate> instance = InstanceTemplate();
@@ -875,6 +918,10 @@ MaybeLocal<Object> FunctionTemplate::BuildPrototypeObject(Local<Context> context
           accessor.attributes);
     }
   }
+  // Rooted for the template's life (templates are never freed), so the signature
+  // check can name it and a later instance inherits from the same object.
+  prototype_bits_ = prototype.raw();
+  slag_root_retain(prototype_bits_);
   return prototype;
 }
 

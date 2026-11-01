@@ -1865,6 +1865,25 @@ pub unsafe extern "C" fn slag_throw_error(
     record(context, JsError::new(ErrorKind::Error, message.to_string()));
 }
 
+/// Record a pending error of `kind` without building the language object, which
+/// is what a trampoline can do while it holds the engine (`v8::Signature`'s
+/// refusal is a TypeError). The call that ran the trampoline turns it into the
+/// thrown value, as [`slag_throw_error`] does.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn slag_throw_error_kind(
+    context: *mut SlagContext,
+    kind: i32,
+    message: *const u8,
+    len: usize,
+) {
+    let Some(context) = context.as_mut() else {
+        return;
+    };
+    let kind = error_kind(kind).unwrap_or(ErrorKind::Error);
+    let message = text(message, len).unwrap_or("error");
+    record(context, JsError::new(kind, message.to_string()));
+}
+
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn slag_has_error(context: *mut SlagContext) -> i32 {
     match context.as_ref() {
@@ -3506,6 +3525,63 @@ pub unsafe extern "C" fn slag_set_as_array(
     container_value(context, out, |engine| {
         engine.set_as_array(JsValue::from_bits(set))
     })
+}
+
+/// Whether `prototype` is on `value`'s prototype chain (`v8::Signature`'s
+/// receiver check): 1 yes, 0 no, a negative status otherwise.
+unsafe fn prototype_chain(
+    context: *mut SlagContext,
+    token: *const c_void,
+    value: u64,
+    prototype: u64,
+) -> i32 {
+    let Some(current) = context.as_ref() else {
+        return -2;
+    };
+    let value = JsValue::from_bits(value);
+    let prototype = JsValue::from_bits(prototype);
+    let answer = if token.is_null() {
+        let Ok(engine) = current.context.try_borrow() else {
+            reentrant(current);
+            return -1;
+        };
+        engine.has_prototype_in_chain(value, prototype)
+    } else {
+        let Some(window) = CallbackWindow::admit(token) else {
+            return -2;
+        };
+        window.has_prototype_in_chain(value, prototype)
+    };
+    match answer {
+        Ok(flag) => i32::from(flag),
+        Err(error) => {
+            record(current, error);
+            -1
+        }
+    }
+}
+
+/// Whether `prototype` is on `value`'s prototype chain: the receiver check a
+/// `v8::Signature` declares.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn slag_value_has_prototype_in_chain(
+    context: *mut SlagContext,
+    value: u64,
+    prototype: u64,
+) -> i32 {
+    prototype_chain(context, std::ptr::null(), value, prototype)
+}
+
+/// [`slag_value_has_prototype_in_chain`] inside a running callback, where the
+/// engine is borrowed and only the window can walk a chain.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn slag_callback_value_has_prototype_in_chain(
+    context: *mut SlagContext,
+    token: *const c_void,
+    value: u64,
+    prototype: u64,
+) -> i32 {
+    prototype_chain(context, token, value, prototype)
 }
 
 /// A symbol's description (`v8::Private::Name`), or `undefined` when it has

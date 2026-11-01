@@ -171,6 +171,11 @@ int32_t slag_call_eval(const void* call, const uint8_t* source, size_t len,
                        uint64_t* out);
 
 void slag_throw_error(SlagContext* context, const uint8_t* message, size_t len);
+/* Record a pending error of `kind` (the `slag_exception_new` codes: 0 Error,
+ * 5 TypeError) without building the language object, for a trampoline that holds
+ * the engine. The call turns it into the thrown value. */
+void slag_throw_error_kind(SlagContext* context, int32_t kind, const uint8_t* message,
+                           size_t len);
 int32_t slag_has_error(SlagContext* context);
 /* Copy the pending error's message into the buffer (NUL terminated). Returns the
  * byte length, or -1 when nothing is pending. */
@@ -488,6 +493,14 @@ int32_t slag_template_constructor(SlagContext* context, const uint8_t* name,
                                   int32_t allow_construction, slag_host_fn callback,
                                   void* data, uint64_t* out);
 int32_t slag_object_prototype(SlagContext* context, uint64_t object, uint64_t* out);
+/* Whether `prototype` is on `value`'s prototype chain (`v8::Signature`'s
+ * receiver check): 1 yes, 0 no. The callback form is for a trampoline, where the
+ * engine is borrowed. */
+int32_t slag_value_has_prototype_in_chain(SlagContext* context, uint64_t value,
+                                          uint64_t prototype);
+int32_t slag_callback_value_has_prototype_in_chain(SlagContext* context,
+                                                   const void* token, uint64_t value,
+                                                   uint64_t prototype);
 int32_t slag_object_set_prototype(SlagContext* context, uint64_t object,
                                   uint64_t prototype);
 int32_t slag_object_new(SlagContext* context, size_t internal_fields,

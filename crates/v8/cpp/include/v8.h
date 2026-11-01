@@ -1333,9 +1333,10 @@ class Function : public Object {
 };
 
 /* A function template's signature (`v8::Signature` and `v8::AccessorSignature`):
- * the type an access check is declared over. Accepted and not consulted, because
- * the engine has no embedder access checks; the object exists so a host's
- * declarations compile. */
+ * the type a call or access is declared over. `New` records the template, and
+ * the check is the receiver's prototype chain: a method installed with a
+ * signature only runs on an instance of that template's built prototype, which
+ * is what V8's access check answers. */
 class Signature {
  public:
   static Local<Signature> New(Isolate* isolate,
@@ -1381,12 +1382,19 @@ class FunctionTemplate {
    * API-wrapper bit. */
   MaybeLocal<Function> GetFunction(Local<Context> context);
 
+  /* Whether this template's signature admits `receiver` as `this`: its built
+   * prototype must be on the receiver's chain. A template without a signature
+   * admits any receiver. Called by the call trampolines. */
+  bool AllowsReceiver(uint64_t receiver) const;
+
  private:
   friend class Signature;
   explicit FunctionTemplate(FunctionCallback callback) : callback_(callback) {}
 
   /* The object `new` instances inherit from: the instance template's object,
-   * chained to the parent's and carrying the prototype template's members. */
+   * chained to the parent's and carrying the prototype template's members. Built
+   * once and kept, so every instance of one template shares a prototype (which is
+   * what makes a signature's check an identity test). */
   MaybeLocal<Object> BuildPrototypeObject(Local<Context> context);
 
   FunctionCallback callback_;
@@ -1397,6 +1405,10 @@ class FunctionTemplate {
   FunctionTemplate* parent_ = nullptr;
   ObjectTemplate* instance_template_ = nullptr;
   ObjectTemplate* prototype_template_ = nullptr;
+  /* The declared signature, and the built prototype the check compares against
+   * (rooted, and 0 until the template is materialized). */
+  Signature* signature_ = nullptr;
+  uint64_t prototype_bits_ = 0;
 };
 
 class ObjectTemplate {

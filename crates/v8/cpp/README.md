@@ -520,6 +520,27 @@ engine can allocate. A store made by
 range: its deleter releases it, and its bytes stay out of the isolate's external
 memory, which is V8's rule too.
 
+### Signatures and access checks
+
+`Signature::New(isolate, function_template)` declares the type a method may run
+on, and `FunctionTemplate::New` takes it: a method installed with one only runs
+when its receiver is an instance of that template, which the engine answers by
+walking the receiver's prototype chain (starting at the receiver's prototype, so
+a prototype is not an instance of itself). Any other receiver fails the call with
+V8's `TypeError: Illegal invocation` and the handler does not run.
+
+The check needs the template's *built* prototype, so `BuildPrototypeObject` now
+builds once and keeps the object (rooted for the template's life): every instance
+of one template shares a prototype, which is what makes the check an identity
+walk, and it is also what V8's `FunctionTemplate` does. A signature over a
+template whose function was never materialized admits nothing, since no instance
+of it can exist.
+
+The check reads the chain through the callback's window when a trampoline is
+running, so it works inside a host callback. `AccessorSignature` is still
+accepted and not consulted, and there is no `SetAccessCheckCallback` or
+per-object check: those are the rest of A4.
+
 ## The gin target
 
 Actual `gin` cannot be built standalone. `gin/BUILD.gn` has public deps
@@ -600,6 +621,8 @@ not a claim that gin itself links.
 - `PropertyAttribute`, `ObjectTemplate::SetNativeDataProperty` and
   `SetLazyDataProperty`, and `Object::SetAccessorProperty` over
   `FunctionTemplate` getters and setters.
+- `Signature` on `FunctionTemplate::New`, enforced on the receiver (the method
+  only runs on an instance of the named template).
 - Embedder data (value and aligned-pointer slots, the field count, and
   `ClearAllSlots`), security tokens (get, set, and use-default), and
   `Object::GetCreationContext`/`GetCreationContextChecked`.
@@ -692,6 +715,10 @@ not a claim that gin itself links.
 - `SetCallAsFunctionHandler` makes an instance callable: a builtin whose body is
   the handler, with the template's members and internal fields on the callee
   itself, so `typeof instance` is `"function"` and a call runs the host's code.
+- `Signature` is enforced for function templates only: `AccessorSignature` is
+  accepted and not consulted, `SetAccessCheckCallback` and the per-object access
+  check it configures are absent, and the security token is stored but not
+  consulted (an engine gap, noted above).
 - `Platform` is a handle plus a message pump: `PumpMessageLoop` runs the
   isolate's queued jobs (microtasks, promise reactions, due timers) and answers
   whether it ran any. There are no host-posted platform tasks or task runners
@@ -813,4 +840,6 @@ it, that dropping the store called `Free` at once, and that the bytes are still
 the isolate's external memory. The callable block builds a template with a call
 handler, a method, and an internal field, checks that the instance is a function,
 calls it through a script, and checks that a template with a property handler
-keeps a handler object instead.
+keeps a handler object instead. The signature block declares a method over a
+`Signature`, calls it on an instance (allowed), and calls it on a foreign object
+(refused with a `TypeError` whose message is `Illegal invocation`).

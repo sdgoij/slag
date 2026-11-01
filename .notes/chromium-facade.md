@@ -1118,6 +1118,29 @@ and the callable carries the builtin's `length` property, since `create_builtin`
 always installs one. `info.This()` inside the handler is the call's receiver,
 which for a plain `f()` is undefined, exactly as in V8.
 
+*Signature access checks (2026-11-01).* A4 opens with the access check A3 left
+accepted-and-ignored: `Signature::New(isolate, template)` now guards the method
+it is declared on, and a receiver that is not an instance fails the call with
+V8's `TypeError: Illegal invocation`. The check is a prototype-chain walk, and it
+runs inside the trampoline, so it goes through the callback's window like every
+other engine-reading entry point; the refusal itself has to be recorded rather
+than constructed, since allocating an Error object inside a trampoline would need
+the engine. `slag_throw_error_kind` exists for exactly that: it records a
+`JsError` of any kind, which the call turns into the thrown value.
+
+One prerequisite turned out to be a fidelity fix in its own right. The check
+compares against the template's built prototype, and `BuildPrototypeObject` used
+to build a fresh prototype object on every call, so two instances of one template
+had different prototypes and the identity walk could never succeed. It now builds
+once and keeps the object (rooted; templates are never freed), which is what V8
+does and what `instanceof` through a materialized template now reports
+consistently.
+
+What A4 still needs is the rest of the section: `AccessorSignature`
+enforcement, `SetAccessCheckCallback` and the per-object check, and making the
+security token mean something (it is stored today and never consulted, which is
+an engine gap rather than a facade decision).
+
 ## 15. Sources
 
 Verified on 2026-10-31:

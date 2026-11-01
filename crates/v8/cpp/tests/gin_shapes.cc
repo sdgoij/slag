@@ -484,6 +484,13 @@ void CallableMarker(const v8::FunctionCallbackInfo<v8::Value>& info) {
   info.GetReturnValue().Set(v8::Integer::New(info.GetIsolate(), 7));
 }
 
+// A method declared over a signature: it may only run on an instance of the
+// template the signature names.
+void GuardedBody(const v8::FunctionCallbackInfo<v8::Value>& info) {
+  info.GetReturnValue().Set(v8::Integer::New(
+      info.GetIsolate(), NumberArg(info, 0) * 2));
+}
+
 // A host allocator that counts what it lends, so the harness can prove the facade
 // draws a backing store from it and gives the bytes back.
 struct CountingAllocator : v8::ArrayBuffer::Allocator {
@@ -2687,6 +2694,73 @@ int main() {
     expect(!plain.As<v8::Value>()->IsFunction(),
            "a template with a handler keeps a handler object");
     delete counter;
+  }
+
+  // A signature's access check: the method only runs on an instance of the type
+  // the signature names, and anything else fails the call with a TypeError.
+  {
+    v8::HandleScope scope(isolate);
+    v8::Local<v8::Context> current = context.Get(isolate);
+    v8::Context::Scope context_scope(current);
+    const auto expect = [&](bool condition, const char* what) {
+      if (!condition) {
+        fprintf(stderr, "signature: %s\n", what);
+        ++failures;
+      }
+    };
+    const auto run = [&](const char* source) {
+      return v8::Script::Compile(
+                 current, v8::String::NewFromUtf8Literal(isolate, source))
+          .ToLocalChecked()
+          ->Run(current)
+          .ToLocalChecked();
+    };
+    const auto bind = [&](const char* name, v8::Local<v8::Value> value) {
+      current->Global()
+          ->Set(current, v8::String::NewFromUtf8Literal(isolate, name), value)
+          .ToChecked();
+    };
+    const auto number_at = [&](const char* name) {
+      return current->Global()
+          ->Get(current, v8::String::NewFromUtf8Literal(isolate, name))
+          .ToLocalChecked()
+          ->Int32Value(current)
+          .FromMaybe(-1);
+    };
+
+    v8::Local<v8::FunctionTemplate> guarded =
+        v8::FunctionTemplate::New(isolate, &TemplateConstructor);
+    guarded->SetClassName("Guarded");
+    v8::Local<v8::Signature> signature = v8::Signature::New(isolate, guarded);
+    guarded->PrototypeTemplate()->Set(
+        isolate, "guarded",
+        v8::FunctionTemplate::New(isolate, &GuardedBody, v8::Local<v8::Value>(),
+                                  signature));
+    v8::Local<v8::Function> constructor;
+    expect(guarded->GetFunction(current).ToLocal(&constructor),
+           "the guarded template materialized");
+    bind("Guarded", constructor);
+
+    run("globalThis.guardedInstance = new Guarded();"
+        " globalThis.guardedAllowed = guardedInstance.guarded(4);"
+        " try {"
+        "   guardedInstance.guarded.call({}, 4);"
+        "   globalThis.guardedRefused = 0;"
+        " } catch (e) {"
+        "   globalThis.guardedRefused = e instanceof TypeError ? 1 : 2;"
+        "   globalThis.guardedMessage = e.message;"
+        " }");
+    expect(number_at("guardedAllowed") == 8,
+           "an instance reaches the guarded method");
+    expect(number_at("guardedRefused") == 1,
+           "a receiver that is not an instance fails with a TypeError");
+    v8::String::Utf8Value message(
+        isolate, current->Global()
+                     ->Get(current, v8::String::NewFromUtf8Literal(
+                                                   isolate, "guardedMessage"))
+                     .ToLocalChecked());
+    expect(*message != nullptr && strcmp(*message, "Illegal invocation") == 0,
+           "the refusal names the access check");
   }
 
   // A host-traced reference: a root the C++ side owns and releases. Once it
