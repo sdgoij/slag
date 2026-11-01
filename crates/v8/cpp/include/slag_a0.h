@@ -319,6 +319,12 @@ typedef struct SlagException {
 int32_t slag_inspector_exception(SlagInspector* inspector,
                                  const SlagException* report, uint32_t* out_id,
                                  SlagMessages* out);
+/* Install a breakpoint a browser hands over when a client attaches. Answers 3
+ * when the group has no script with that URL yet, which such a breakpoint can
+ * outlive. */
+int32_t slag_inspector_embedder_breakpoint(SlagInspector* inspector,
+                                           const uint8_t* url, size_t url_len,
+                                           uint32_t line, uint32_t column);
 /* Withdraw an exception a handler took (`V8Inspector::exceptionRevoked`). */
 int32_t slag_inspector_exception_revoked(SlagInspector* inspector,
                                          uint32_t exception_id,

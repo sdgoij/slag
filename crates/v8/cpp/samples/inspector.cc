@@ -419,6 +419,57 @@ const char* RunDemo(v8::Isolate* isolate, v8::Local<v8::Context> main_world,
   if (main_world->Paused(nullptr) || isolated_world->Paused(nullptr)) {
     return "closing a session left a run parked";
   }
+
+  // A browser hands its own breakpoints to a session as it connects, so a
+  // client that attaches to a page already running still stops where the
+  // browser asked. The script here was compiled before that attach.
+  v8::Local<v8::Script> again_script;
+  {
+    v8::Context::Scope scope(main_world);
+    v8::Local<v8::String> source =
+        v8::String::NewFromUtf8Literal(isolate, "globalThis.again = 1;");
+    v8::Local<v8::String> name =
+        v8::String::NewFromUtf8Literal(isolate, "again.js");
+    v8::ScriptOrigin origin(name);
+    if (!v8::Script::Compile(main_world, source, &origin).ToLocal(&again_script)) {
+      return "compile (again)";
+    }
+  }
+  v8_inspector::V8EmbedderState embedder_state;
+  v8_inspector::V8URLBreakpoint from_browser;
+  from_browser.breakpointId = View("browser-1");
+  from_browser.lineNumber = 0;
+  from_browser.selectorType = v8_inspector::V8URLBreakpoint::kUrl;
+  from_browser.selector = View("again.js");
+  embedder_state.urlBreakpoints.push_back(from_browser);
+
+  RecordingChannel second_channel;
+  std::unique_ptr<v8_inspector::V8InspectorSession> second = inspector->connect(
+      kGroup, &second_channel, v8_inspector::StringView(), embedder_state);
+  if (!second) return "reattach connect";
+  second->dispatchProtocolMessage(
+      View("{\"id\":1,\"method\":\"Debugger.enable\"}"));
+  second_channel.TakeResponses();
+  {
+    v8::Context::Scope scope(main_world);
+    v8::Local<v8::Value> value;
+    if (again_script->Run(main_world).ToLocal(&value)) {
+      return "the browser's breakpoint did not stop the reattached run";
+    }
+  }
+  second->pollEvents();
+  {
+    bool stopped = false;
+    for (const std::string& event : second_channel.TakeNotifications()) {
+      printf("reattached: %s\n", event.c_str());
+      if (event.find("Debugger.paused") != std::string::npos) stopped = true;
+    }
+    if (!stopped) return "the reattached session did not announce the stop";
+  }
+  second->resume();
+  if (main_world->Paused(nullptr)) return "the resumed run stayed parked";
+  second->stop();
+
   inspector->contextDestroyed(isolated_world);
   inspector->contextDestroyed(main_world);
   inspector->resetContextGroup(kGroup);

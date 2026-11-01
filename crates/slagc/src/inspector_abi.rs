@@ -582,6 +582,47 @@ pub unsafe extern "C" fn slag_inspector_exception_revoked(
     0
 }
 
+/// Install a breakpoint a browser hands over when a client attaches
+/// (`V8EmbedderState`'s URL breakpoints): the same resolution as
+/// `Debugger.setBreakpointByUrl`, with no client to answer and no locations to
+/// report back. Answers 0 on success, 1 with a pending error, 2 for a bad
+/// handle, and 3 when no script of the group has that URL (the browser may know
+/// a breakpoint for a page whose script has not compiled yet).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn slag_inspector_embedder_breakpoint(
+    inspector: *mut SlagInspector,
+    url: *const u8,
+    url_len: usize,
+    line: u32,
+    column: u32,
+) -> i32 {
+    let Some(inspector) = inspector.as_ref() else {
+        return 2;
+    };
+    let Ok(url) = text(url, url_len) else {
+        return 2;
+    };
+    let group = &inspector.group;
+    if !group.is_connected() {
+        return 2;
+    }
+    let Ok(mut session) = group.session.try_borrow_mut() else {
+        refuse_reentry(group);
+        return 1;
+    };
+    let installed = with_targets(group, |targets| {
+        session.embedder_breakpoint(targets, url, line, column)
+    });
+    drop(session);
+    match installed {
+        Ok(Ok(_id)) => 0,
+        // The only failure the session reports on this path is a URL it has no
+        // script for, which a browser-originating breakpoint can outlive.
+        Ok(Err(_)) => 3,
+        Err(code) => code,
+    }
+}
+
 /// Continue a parked run in any context of the group
 /// (`V8InspectorSession::resume`), answering the events the resume produced.
 /// The command's own response is dropped: the client did not send it.

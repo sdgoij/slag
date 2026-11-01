@@ -186,6 +186,14 @@ every uncaught error in a page that never asked for them.
 print itself (`    at f (app.js:3:5)`, what `Error.stack` and Blink's trace
 writer want); the protocol-shaped form it would also offer is a generated type,
 so it is absent with the rest of the generated tree.
+- **The browser can bring its own breakpoints.** `connect` takes a
+`V8EmbedderState`, and its `kUrl` breakpoints are installed before the session
+answers anything, so a client attaching to a page that already ran stops where
+the browser asked without the frontend re-sending it. `kUrlRegex`,
+`kScriptHash` and conditional breakpoints are refused rather than approximated:
+the first needs a regex engine, the second is Chromium's hash of the source
+rather than the engine's text identity, and a condition would have to run code
+at every stop.
 - **A channel callback must not re-enter the session.** The callbacks run inside
 the session's own call, where its state is borrowed, so `dispatchProtocolMessage`
 called from `sendNotification` is refused. Record the message and dispatch after

@@ -1487,9 +1487,18 @@ method because the pause loop is the host's), `V8Inspector` (`create`,
 
 What is missing, in the order it blocks A5:
 
-1. **cppgc.** `ManagedChannel`/`Persistent`/`Visitor` come from V8's own tree,
-   so a replacement either ships cppgc or shims exactly the surface Blink
-   touches. This is a build-integration cost, not a protocol one.
+1. **cppgc.** `ManagedChannel` derives from `cppgc::GarbageCollected`, and
+   Blink's `DevToolsSession` is the channel, so `connectShared(ManagedChannel*,
+   ...)` cannot even be declared without the type. `v8/BUILD.gn` says it does
+   not have to be reimplemented: cppgc is a target family of its own
+   (`cppgc_headers`, `cppgc_base`, `cppgc`) with a standalone mode
+   (`cppgc_is_standalone`). The catch is one line of that file: outside
+   standalone builds `//v8:cppgc` does `deps += [ ":v8" ]`, which is the caged
+   heap and sandbox glue living in the JS engine's tree. So the choice is
+   (a) keep `//v8:cppgc` and the sliver of V8 it needs, or (b) build it
+   standalone and lose the caged heap. Both are build-graph decisions; a
+   substitute is not an option, because a heap object's layout has to agree with
+   Oilpan's, which is not a header a facade can fake.
 2. **The generated protocol tree.** `wrapObject` answers a
    `protocol::Runtime::API::RemoteObject` that Blink's generated code
    serializes, so this is the `inspector_protocol` generator (or a hand-written
@@ -1618,6 +1627,24 @@ browser does constantly were not covered, and one of them was broken:
   a context freed under a parked run leaves its group without the next poll
   reading it (tested), which is the pointer that `SlagContext::drop` exists to
   clean up.
+
+**2026-11-01, the browser's own breakpoints.** `V8EmbedderState` and
+`V8URLBreakpoint` are in, and `connect` installs them before the session answers
+anything, which is the half of a reattach the browser owns: Chromium keeps its
+breakpoints in the browser process, so a renderer that attaches after a
+navigation must not wait for a frontend to re-send them. `kUrl` only. A
+`kUrlRegex` selector would need a regular expression engine the session does not
+have, `kScriptHash` is Chromium's hash of the source rather than this engine's
+text identity, and a `condition` is skipped because honouring it means running
+code at every stop; a breakpoint that fires more often than asked is worse than
+one that never fires, so the header says which of the three it honours instead
+of pretending.
+
+The same connect now does the other half: the script registry survives a
+`close`, so the second client in `inspector.exe` hears `scriptParsed` for the
+scripts compiled before DevTools was ever opened (four of them, including the
+one compiled while no client existed) and then stops on the browser's breakpoint
+without a single protocol command.
 
 ### 14.4 Pause and step: the protocol the compiled tiers have to agree to
 

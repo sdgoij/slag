@@ -800,6 +800,40 @@ impl Session {
         let url = params["url"].as_str().unwrap_or("");
         let line = params["lineNumber"].as_u64().unwrap_or(0) as u32;
         let column = params["columnNumber"].as_u64().unwrap_or(0) as u32;
+        let (id, locations) = self.breakpoint_at_url(targets, url, line, column)?;
+        Ok((
+            json!({ "breakpointId": id, "locations": locations }),
+            Vec::new(),
+        ))
+    }
+
+    /// A breakpoint a *browser* hands over when a client attaches
+    /// (`V8EmbedderState`'s URL breakpoints): the same resolution as
+    /// `Debugger.setBreakpointByUrl`, with no client to answer and no locations
+    /// to report back. The id is returned so the caller can name it later.
+    pub fn embedder_breakpoint(
+        &mut self,
+        targets: &mut [Target<'_>],
+        url: &str,
+        line: u32,
+        column: u32,
+    ) -> Result<String, String> {
+        match self.breakpoint_at_url(targets, url, line, column) {
+            Ok((id, _)) => Ok(id),
+            Err(DispatchError::Protocol(message)) => Err(message),
+            Err(DispatchError::Unknown) => Err("no such method".to_string()),
+        }
+    }
+
+    /// The body the two share: resolve the URL against the registry, record
+    /// every hit and push the set to every context.
+    fn breakpoint_at_url(
+        &mut self,
+        targets: &mut [Target<'_>],
+        url: &str,
+        line: u32,
+        column: u32,
+    ) -> Result<(String, Vec<Json>), DispatchError> {
         // A URL can name a script in more than one execution context: a world
         // that compiled the same text is a breakpoint in each of them.
         let matches: Vec<(u32, String)> = self
@@ -839,10 +873,7 @@ impl Session {
             self.breakpoints.insert(id.clone(), Breakpoint { hits });
             self.push_breakpoints(targets);
         }
-        Ok((
-            json!({ "breakpointId": id, "locations": locations }),
-            Vec::new(),
-        ))
+        Ok((id, locations))
     }
 
     /// Hand every context the whole set, each entry with the identity of the

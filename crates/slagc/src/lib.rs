@@ -26,9 +26,9 @@ pub use inspector_abi::{
     SlagException, SlagExceptionFrame, SlagInspector, SlagMessages, SlagProtocolMessage,
     slag_inspector_add_context, slag_inspector_add_script, slag_inspector_call_id,
     slag_inspector_can_dispatch, slag_inspector_close, slag_inspector_dispatch,
-    slag_inspector_evaluate, slag_inspector_exception, slag_inspector_exception_revoked,
-    slag_inspector_free, slag_inspector_new, slag_inspector_open, slag_inspector_poll,
-    slag_inspector_remove_context, slag_inspector_resume, slag_messages_free,
+    slag_inspector_embedder_breakpoint, slag_inspector_evaluate, slag_inspector_exception,
+    slag_inspector_exception_revoked, slag_inspector_free, slag_inspector_new, slag_inspector_open,
+    slag_inspector_poll, slag_inspector_remove_context, slag_inspector_resume, slag_messages_free,
 };
 
 use handler::CxxHandler;
@@ -6321,6 +6321,66 @@ mod tests {
                 "a breakpoint from a closed session must not stop a run"
             );
             assert!(poll(inspector).is_empty());
+
+            assert_eq!(slag_inspector_close(inspector), 0);
+            slag_inspector_free(inspector);
+            slag_script_free(script);
+            slag_context_free(context);
+            slag_isolate_free(isolate);
+        }
+    }
+
+    #[test]
+    fn an_embedder_breakpoint_is_installed_before_the_client_asks() {
+        unsafe {
+            let isolate = slag_isolate_new();
+            let context = slag_context_new(isolate);
+            let mut inspector = std::ptr::null_mut();
+            assert_eq!(slag_inspector_new(&mut inspector), 0);
+            assert_eq!(
+                slag_inspector_add_context(inspector, context, std::ptr::null_mut()),
+                0
+            );
+            // The page compiled before DevTools was opened: the registry takes
+            // it without a client, which is what makes a late attach useful.
+            let source: &[u8] = b"globalThis.ran = 1;";
+            let script = compile_named(context, b"early.js", source);
+            assert_eq!(slag_inspector_open(inspector), 0);
+
+            let url: &[u8] = b"early.js";
+            assert_eq!(
+                slag_inspector_embedder_breakpoint(inspector, url.as_ptr(), url.len(), 0, 0),
+                0,
+                "the browser's breakpoint resolves against a script that already ran"
+            );
+            let unknown: &[u8] = b"later.js";
+            assert_eq!(
+                slag_inspector_embedder_breakpoint(
+                    inspector,
+                    unknown.as_ptr(),
+                    unknown.len(),
+                    0,
+                    0
+                ),
+                3,
+                "a URL the group has not compiled yet is not an error"
+            );
+
+            send(inspector, "{\"id\":1,\"method\":\"Debugger.enable\"}");
+            let mut value = 0;
+            assert_eq!(
+                slag_script_run(context, script, &mut value),
+                SLAG_RUN_PAUSED,
+                "the browser's breakpoint stops the run without any protocol command"
+            );
+            let stopped = poll(inspector);
+            assert_eq!(stopped.len(), 1, "{stopped:?}");
+            assert!(stopped[0].contains("Debugger.paused"), "{}", stopped[0]);
+            assert!(
+                stopped[0].contains("\"reason\":\"breakpoint\""),
+                "{}",
+                stopped[0]
+            );
 
             assert_eq!(slag_inspector_close(inspector), 0);
             slag_inspector_free(inspector);

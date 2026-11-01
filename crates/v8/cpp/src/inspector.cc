@@ -283,12 +283,28 @@ class InspectorImpl final : public V8Inspector {
 
   std::unique_ptr<V8InspectorSession> connect(int contextGroupId,
                                               Channel* channel,
-                                              StringView /*state*/) override {
+                                              StringView /*state*/,
+                                              V8EmbedderState embedderState) override {
     if (channel == nullptr) return nullptr;
     auto found = groups_.find(contextGroupId);
     if (found == groups_.end() || found->second.slag == nullptr) return nullptr;
     if (found->second.connected) return nullptr;
     if (slag_inspector_open(found->second.slag) != 0) return nullptr;
+    // The browser's own breakpoints are installed before the session answers
+    // anything, which is what lets a client attach to a page already running.
+    for (const V8URLBreakpoint& breakpoint : embedderState.urlBreakpoints) {
+      if (breakpoint.selectorType != V8URLBreakpoint::kUrl) continue;
+      if (breakpoint.condition.length() != 0) continue;
+      const std::string url = Utf8Of(breakpoint.selector);
+      const int32_t status = slag_inspector_embedder_breakpoint(
+          found->second.slag, reinterpret_cast<const uint8_t*>(url.data()),
+          url.size(), static_cast<uint32_t>(breakpoint.lineNumber),
+          static_cast<uint32_t>(breakpoint.columnNumber.value_or(0)));
+      // 3 is "no script with that URL yet", which a browser-originating
+      // breakpoint outlives; anything else is a back-end failure and the
+      // connect fails with it rather than pretending to have them installed.
+      if (status != 0 && status != 3) return nullptr;
+    }
     found->second.connected = true;
     return std::make_unique<InspectorSessionImpl>(this, found->second.slag,
                                                   contextGroupId, channel);

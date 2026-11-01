@@ -28,6 +28,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -102,6 +103,33 @@ class V8StackTrace {
   virtual std::unique_ptr<V8StackTrace> clone() = 0;
   /* The `Error.stack` rendering: one `    at ...` line per frame. */
   virtual std::unique_ptr<StringBuffer> toString() const = 0;
+};
+
+/* A breakpoint the browser already knows about, handed to a session as it
+ * connects (`V8EmbedderState`). Chromium keeps these in the browser process, so
+ * a renderer that attaches after a navigation gets them without the frontend
+ * re-sending anything.
+ *
+ * Only `kUrl` is honoured: `kUrlRegex` would need a regular expression engine the
+ * session does not have, and `kScriptHash` is Chromium's hash of the source
+ * rather than the identity this engine derives. A `condition` is skipped for a
+ * sharper reason: honouring it means running code at every stop, which the
+ * session does not do yet. Skipping is deliberate: a breakpoint that fires more
+ * often than it was asked to is worse than one that does not fire. */
+struct V8URLBreakpoint {
+  StringView breakpointId;
+  int lineNumber = 0;
+  std::optional<int> columnNumber;
+
+  enum SelectorType { kUrl, kUrlRegex, kScriptHash };
+  SelectorType selectorType = kUrl;
+  StringView selector;
+
+  StringView condition;
+};
+
+struct V8EmbedderState {
+  std::vector<V8URLBreakpoint> urlBreakpoints;
 };
 
 /* How a context joins an inspector: the embedder's group id (Chromium groups
@@ -237,10 +265,14 @@ class V8Inspector {
    * Blink group needs: a frame's main world and its isolated worlds are
    * separate `v8::Context`s of one group. Two clients are refused because the
    * engine's debug points and breakpoint set are per context and one session
-   * owns them. */
+   * owns them.
+   *
+   * `state` is the client's own persisted blob, which this facade does not
+   * interpret; `embedder_state` is the browser's, and its URL breakpoints are
+   * installed before the session answers anything. */
   virtual std::unique_ptr<V8InspectorSession> connect(
-      int contextGroupId, Channel* channel,
-      StringView state = StringView()) = 0;
+      int contextGroupId, Channel* channel, StringView state = StringView(),
+      V8EmbedderState embedderState = {}) = 0;
 };
 
 }  // namespace v8_inspector
