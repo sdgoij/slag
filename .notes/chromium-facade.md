@@ -1372,8 +1372,8 @@ the engine has (`api::stack_trace` walks the execution contexts) and the facade
    needs the VM to consult a hook at source-position granularity, and the
    compiled tiers to either decline or emit the same check. This is the second
    instance of the trap the access check hit: a hook on the interpreter alone is
-   bypassed by every compiled function. It should be designed together with the
-   JIT's step protocol rather than after it.
+   bypassed by every compiled function. §14.4 fixes the protocol before any of
+   it lands.
 6. **`v8-inspector.h`.** `V8Inspector`, `V8InspectorSession`, `V8InspectorClient`,
    `StringView`, `StringBuffer`, `V8StackTrace` and the protocol dispatch on top
    of 1 to 5. The protocol itself is the inspector's own and does not belong in
@@ -1381,6 +1381,98 @@ the engine has (`api::stack_trace` walks the execution contexts) and the facade
 
 Slices 1 to 4 are host-useful without an inspector and should land on their own;
 slice 5 is a project, and slice 6 is glue once 1 to 5 exist.
+
+### 14.4 Pause and step: the protocol the compiled tiers have to agree to
+
+The `Debugger` domain needs four verbs (breakpoint at a position, step in, over
+and out, pause on exception, pause now), and three data needs (the paused
+position, the frame stack, and evaluation on a paused frame). This section fixes
+the contract before any of it lands, because the cost lands in the VM and the
+JIT, and a protocol fixed after the fact is a rewrite.
+
+**What the engine has.** `Step` (`crates/runtime/src/ir.rs`) is the interpreter's
+bytecode and `Vm::run_*` is its driver; `LeafOp` is the register tier with a
+second `step` loop; `crates/jit` compiles a `CompiledBody` whose entry does not
+return to the driver until the body finishes. `VmOutcome`
+(`Completed`/`Suspended`/`TailCall`/`Call`) is already a *resumable* protocol:
+await and yield suspend a `Vm` and resume it later, and the `Vm`'s `ip`,
+`stack`, `frame`, try stack and for-of stacks are plain fields. The
+execution-context stack already holds what a host would read
+(`api::stack_trace` walks it). `Span`s exist in the AST, but **no `Step` carries
+one** — that is the first thing to add.
+
+**The trap, restated.** A hook consulted only by the interpreter driver is
+skipped by every body the JIT compiled, and by the leaf tier if its loop does
+not consult it too. The access check hit this and solved it by shape (a host
+object takes no fast lane). Debugging cannot do that, because the object being
+debugged is ordinary code by definition. So the protocol is written as three
+rules the *compiler and the JIT* obey, not as a hook the interpreter happens to
+call.
+
+**R1. A debug session disables compilation.** `lookup_info` and
+`lookup_info_leaf` answer null while a session is attached, and every
+already-compiled body is evicted through the existing eviction path. This is not
+a fidelity compromise: V8 disables optimization under the debugger for the same
+reason (its stepping machinery is in the bytecode handler), and the cost is paid
+only while debugging. It also makes the protocol testable: with the rule in
+place a debug build can assert that no compiled body ran
+(`jit_depth`-style, in the entry hook), so a future tier cannot quietly
+reintroduce the bypass.
+
+**R2. One debug point per statement, and one per loop back edge.** A new
+`Step::DebugCheck { position: u32 }` precedes each statement's first step and
+each back edge. It reads one `Cell<bool>` on the agent (`debug_attached`); when
+false it is a predictable load and a not-taken branch, which is exactly what
+V8's debug-break slot costs. The `position` indexes a per-body
+`Vec<(u32 step_index, Span)>` the compiler builds while emitting, so the host
+can ask "where am I" and "which statements are at line N" without decoding a
+step, and a breakpoint is a set of positions in that table.
+
+**R3. Exceptions are a debug point too.** `PauseOnExceptions` (`None`,
+`Uncaught`, `All`) is consulted where the VM turns a `JsError` into
+`Vm.thrown` — one place in the driver — rather than in the throwers, so a throw
+from a builtin, a native and a `throw` statement all pause the same way.
+
+**Pause and resume.** `VmOutcome` gains `Paused(PauseReason)`, and `run_inner`
+returns it with the `Vm` intact. That is the architectural commitment to take
+seriously: today a `Vm` is a local of the run, so a paused run cannot be
+inspected or resumed. The driver must keep the paused `Vm` and its
+`ExecutionContext` in a `PausedRun` record on the agent, which is what makes
+resume possible — the same shape a generator uses, already proven in this
+engine. A resume re-enters the same loop with the same `Vm`.
+
+**Re-entrancy, the hardest part.** While paused, the host calls
+`Debugger.evaluateOnCallFrame`, `callFunctionOn`, `getProperties`. Those run
+code, and the pause hook itself is called from inside the borrowed agent. The
+`CallbackWindow` seam already allows a host callback to allocate and call
+through the operation that entered it, so evaluation goes through that window
+while the paused `Vm` sits in the record rather than on the Rust stack. The
+consequence for the facade is a rule worth writing down now: a session never
+touches a paused frame directly, it hands the engine a frame id and gets values
+back. Anything else means the paused `Vm` and a live `&mut Agent` overlap.
+
+**Data the host sees.** `PauseInfo { reason, script_id, position, frames }` and
+`DebugFrame { function_name, script_id, position, this, scope_chain }`. Scopes
+are the one place the engine's environment model would leak: they are read
+through the same `EnvRef` walk `stack_trace` uses and answered as key/value
+pairs, so no `EnvRef` crosses the ABI.
+
+**Cost, and how it is measured.** Two numbers, both with the same-binary A/B
+protocol and both recorded in the perf archive: with `DebugCheck` emitted and
+`debug_attached == false`, the benchmark rows must be within noise (one
+predictable branch per statement is the budget); with a session attached, the
+JIT is off entirely and the numbers are the interpreter's, which is expected and
+not a regression. If the first number is outside noise, the fallback is to emit
+`DebugCheck` only into bodies compiled while a session is attached — but that
+changes the bytecode per compile, so it is the option to take only with a
+measurement in hand.
+
+**Order of landing.** (1) R1: the `debug_attached` flag, the compile gate, the
+"no compiled body ran" assertion, and the ABI to set it. (2) R2's `DebugCheck`
+and the position table. (3) `VmOutcome::Paused`, the `PausedRun` record, resume,
+and frame reads. (4) Breakpoints against the position table. (5)
+`evaluateOnCallFrame` through the callback window. (1) is the rule that makes
+the rest honest and is the only one that needs nothing else in place.
 
 ## 15. Sources
 
