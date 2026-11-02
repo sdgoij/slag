@@ -5739,6 +5739,62 @@ mod tests {
         );
     }
 
+    /// The register lane's stack-form call op (`LeafOp::CallFast`): a method
+    /// call in a loop runs inside the same `RunRegBody` dispatch as the
+    /// arithmetic around it, with the receiver (`this`) and callee taken from
+    /// the materialized stack region.
+    #[test]
+    fn register_lane_method_calls_lower_and_match_the_interpreter() {
+        let source = "function f(a, n) { var s = 0; for (var i = 0; i < n; i++) { s = (s + a.m(i)) | 0; } return s; }";
+        let mut agent = Agent::new();
+        agent.initialize_host_defined_realm().unwrap();
+        agent.run_script(source).unwrap();
+        let ir = compiled_body_of(&mut agent, "f");
+        assert!(
+            ir.steps.iter().any(|step| matches!(
+                step,
+                crate::ir::Step::RunRegBody { ops }
+                    if ops
+                        .iter()
+                        .any(|op| matches!(op, crate::ir::LeafOp::CallFast { .. }))
+            )),
+            "a method call inside a loop body must lower into the register run"
+        );
+        // `this` is the receiver, not the callee.
+        assert_eq!(
+            run("function f(a, n) { var s = 0; for (var i = 0; i < n; i++) { s = (s + a.m(i)) | 0; } return s; } f({ k: 10, m: function (x) { return this.k + x; } }, 4)")
+                .unwrap(),
+            Value::Number(46.0)
+        );
+        // A registered builtin reached through the stack form (the handler
+        // path, with `this` the array).
+        assert_eq!(
+            run("function f(a, n) { var s = 0; for (var i = 0; i < n; i++) { s = s + a.push(i); } return s; } f([], 4)")
+                .unwrap(),
+            Value::Number(10.0)
+        );
+        // A throwing method: the error reaches the loop's own handler.
+        assert_eq!(
+            run("function f(a, n) { var s = 0; for (var i = 0; i < n; i++) { try { s = s + a.m(i); } catch (e) { return s + e; } } return s; } f({ m: function (x) { if (x === 2) { throw 100; } return x; } }, 10)")
+                .unwrap(),
+            Value::Number(101.0)
+        );
+        // A method that withdraws (it contains a loop and a `try`, so it is
+        // not a leaf) is completed in place by the op.
+        assert_eq!(
+            run("function f(a, n) { var s = 0; for (var i = 0; i < n; i++) { s = (s + a.m(i)) | 0; } return s; } f({ m: function (x) { var t = 0; for (var j = 0; j < 3; j++) { try { t = t + j; } catch (e) { t = -1; } } return t + x; } }, 4)")
+                .unwrap(),
+            Value::Number(18.0)
+        );
+        // Zero-argument method call: the callee and receiver are the only
+        // stack values.
+        assert_eq!(
+            run("function f(a, n) { var s = 0; for (var i = 0; i < n; i++) { s = (s + a.m()) | 0; } return s; } f({ m: function () { return 3; } }, 4)")
+                .unwrap(),
+            Value::Number(12.0)
+        );
+    }
+
     #[test]
     fn fast_path_nested_context_chain() {
         // Cut 3 continuation (nested context chains): a certified closure's

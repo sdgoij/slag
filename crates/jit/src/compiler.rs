@@ -10723,6 +10723,44 @@ impl<'a> Lowerer<'a> {
                 let result = self.pop();
                 self.set_acc_bits(result);
             }
+            LeafOp::CallFast {
+                argc,
+                direct_eval,
+                span: _,
+            } => {
+                // The stack form: `[this, callee, a1..aN]` under the sp, the
+                // same region `Step::CallFast` lowers, with the continuation
+                // rule above.
+                let sp = self.builder.use_var(self.sp_var);
+                let args_ptr = self.builder.ins().iadd_imm_s(sp, -((*argc as i64) * 8));
+                let callee_ptr = self.builder.ins().iadd_imm_s(sp, -((*argc as i64 + 1) * 8));
+                let this_ptr = self.builder.ins().iadd_imm_s(sp, -((*argc as i64 + 2) * 8));
+                let callee = self.builder.ins().load(
+                    types::I64,
+                    MemFlagsData::new(),
+                    callee_ptr,
+                    Offset32::new(0),
+                );
+                let this = self.builder.ins().load(
+                    types::I64,
+                    MemFlagsData::new(),
+                    this_ptr,
+                    Offset32::new(0),
+                );
+                let argc_imm = self.builder.ins().iconst(types::I64, i64::from(*argc));
+                self.emit_call(
+                    step,
+                    callee,
+                    this,
+                    args_ptr,
+                    argc_imm,
+                    this_ptr,
+                    *direct_eval,
+                    false,
+                )?;
+                let result = self.pop();
+                self.set_acc_bits(result);
+            }
             LeafOp::BinRemConst { divisor } => {
                 // A proven-integral `% <const>`: the spec's `fmod` is the
                 // truncated integer remainder, so an `srem` is exact for

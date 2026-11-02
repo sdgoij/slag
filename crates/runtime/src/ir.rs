@@ -1628,6 +1628,17 @@ pub enum LeafOp {
         argc: u8,
         span: crux::Span,
     },
+    /// acc = `(this, callee)(argc stack values)` — the register form of
+    /// `Step::CallFast`: the receiver and callee are the two stack values
+    /// under the arguments (a method call's `this`/`o.m` pair, or
+    /// `undefined`/callee for a plain call whose callee is not a frame slot
+    /// or global). Same result contract and completion discipline as
+    /// [`LeafOp::CallFastSlot`].
+    CallFast {
+        argc: u8,
+        direct_eval: bool,
+        span: crux::Span,
+    },
     /// acc = pop() op acc — the spilled left operand combined with the
     /// accumulator right operand (a body that spilled the first operand of
     /// a binary while computing the second).
@@ -13496,6 +13507,18 @@ impl Vm {
                     // performed here, because the driver's protocol
                     // (`VmOutcome::Call`) resumes at the next STEP and would
                     // skip the rest of this run.
+                    if let Some(pending) = self.pending_call.take() {
+                        self.complete_call(agent, pending)?;
+                    }
+                    self.acc = self.pop();
+                }
+                LeafOp::CallFast {
+                    argc,
+                    direct_eval,
+                    span,
+                } => {
+                    self.set_site(agent, *span);
+                    self.do_call_fast(agent, *argc as usize, *direct_eval)?;
                     if let Some(pending) = self.pending_call.take() {
                         self.complete_call(agent, pending)?;
                     }
@@ -25602,7 +25625,8 @@ fn run_acc_is_number(ops: &[LeafOp], upto: usize, proven: &HashSet<usize>) -> bo
             | LeafOp::GetMemberComputed { .. }
             | LeafOp::GetMemberNameLocal { .. }
             | LeafOp::GetMemberComputedLocal { .. }
-            | LeafOp::CallFastSlot { .. } => false,
+            | LeafOp::CallFastSlot { .. }
+            | LeafOp::CallFast { .. } => false,
             _ => known,
         };
     }
@@ -26015,6 +26039,27 @@ fn spill_live_acc(scope: &mut ScopeInfo, ops: &mut Vec<LeafOp>, stack: &mut [Reg
             _ => {}
         }
     }
+    true
+}
+
+/// Materialize a shadow operand onto the machine stack — a register-lane
+/// call's `this`, callee, or argument slot. A frame slot pushes directly
+/// (`PushReg` leaves the accumulator alone); every other re-readable operand
+/// goes through the (by then spilled) accumulator. `false` for an operand the
+/// single-accumulator model cannot re-read (a post-increment write-back, an
+/// already spilled value), which keeps the step on the step path.
+fn push_operand(ops: &mut Vec<LeafOp>, operand: &RegOperand) -> bool {
+    if let RegOperand::Reg { slot, tdz } = operand {
+        ops.push(LeafOp::PushReg {
+            slot: *slot,
+            tdz: *tdz,
+        });
+        return true;
+    }
+    if !load_operand(ops, operand.clone()) {
+        return false;
+    }
+    ops.push(LeafOp::PushAcc);
     true
 }
 
@@ -26772,25 +26817,39 @@ fn lower_step(
             let start = stack.len().checked_sub(*argc as usize)?;
             let args = stack.split_off(start);
             for arg in &args {
-                match arg {
-                    RegOperand::Reg { slot, tdz } => ops.push(LeafOp::PushReg {
-                        slot: *slot,
-                        tdz: *tdz,
-                    }),
-                    // Every other re-readable operand materializes through
-                    // the accumulator (nothing live holds it — the spill
-                    // above moved a live value to a scratch slot).
-                    _ => {
-                        if !load_operand(ops, arg.clone()) {
-                            return None;
-                        }
-                        ops.push(LeafOp::PushAcc);
-                    }
+                if !push_operand(ops, arg) {
+                    return None;
                 }
             }
             ops.push(LeafOp::CallFastSlot {
                 callee_slot: *slot,
                 argc: *argc,
+                span: *span,
+            });
+            stack.push(RegOperand::Acc);
+        }
+        Step::CallFast {
+            argc,
+            direct_eval,
+            span,
+        } => {
+            // The stack form of the same call: `[this, callee, arg1..argN]`.
+            // Every operand is materialized in source order, so the callee and
+            // receiver arrive where the step path put them. Same spill rule
+            // and same operand limits as `CallFastSlot`.
+            if !spill_live_acc(scope, ops, stack) {
+                return None;
+            }
+            let start = stack.len().checked_sub(*argc as usize + 2)?;
+            let operands = stack.split_off(start);
+            for operand in &operands {
+                if !push_operand(ops, operand) {
+                    return None;
+                }
+            }
+            ops.push(LeafOp::CallFast {
+                argc: *argc,
+                direct_eval: *direct_eval,
                 span: *span,
             });
             stack.push(RegOperand::Acc);
