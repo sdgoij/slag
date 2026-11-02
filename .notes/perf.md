@@ -15984,14 +15984,35 @@ chain read itself site-cacheable (receiver shape -> link shape -> link field).
 
 Remaining levers, in expected-value order:
 
-1. **Calls inside a register run.** `LeafOp::CallFastSlot` (args pushed from
-   frame slots, result into `acc`) would collapse `js_call`/`method_call`/
-   `map_get` loops to one dispatch. Blocked on the JIT: `emit_call` continues at
-   the *step* index (`fall_through(index)`), so an op inside a `RunRegBody`
-   would jump out of the run. Parameterize the continuation first.
-2. **Loop-plan parity for hoisted-read loops.** Give the hoist a Number/int
-   proof for the hoisted *read* slots and let `plan_loop_int` use it for a
-   guarded copy. Needs an int (not Number) proof level in `RegInt` to keep
-   `|0`'s int semantics.
+1. **Calls inside a register run** — DONE (2026-11-02). `LeafOp::CallFastSlot`
+   + `PushReg` lower a frame-slot call into the run, and the JIT lowers both: a
+   call op's continuation is the next *op*, so it goes through `emit_call` with
+   `emit_fall_through` off and keeps emitting on the merge block. `js_call`
+   -10..15% (isolated, min of 12-20), `calls/direct_leaf` -12%; rows whose
+   callee is not a frame slot (`method_call`, `apply_call` — `CallFast` /
+   `CallApply`) are untouched and remain the largest call-shaped gap.
+2. **Loop-plan parity for hoisted-read loops.** `plan_loop_int`'s
+   `int_rmw_prefix_shape` declines because `IntProvenance` cannot prove the
+   hoisted slot `Int` (the pass only sees slots a register op writes). The
+   lattice member it needs already exists (`RegInt::Int` = provably a Number in
+   i32 range, which is exactly what `ToInt32` needs), and the loop copy that
+   would use it already exists (`proven_num_slots`). Two routes:
+   - Compile-time: give the hoist guard an i32 mode (the existing `numbers: true`
+     guard only checks Number, and its proof feeds the invariant-RHS reduction,
+     not the read slots) plus a `proven_int_slots` seed for
+     `IntProvenance::new`. This needs a third loop copy (reads-as-int / reads /
+     general), which risks the JIT's `JIT_MAX_COMPILE_STEPS` cap — obj_prop is
+     ~33 of the 64 steps today and the opcost family is deliberately kept under
+     it, so measure the step count before adding a copy.
+   - Runtime: a checked RHS mode, `IntRhs::AccChecked`, mirroring
+     `CounterChecked` (whose slow block converts exactly for a counter outside
+     i32). `IntRhs::Acc`'s interpreter arm is `acc.as_number().unwrap_or(0.0) as
+     i32` — exact only because the plan proved Int — so a checked mode needs an
+     exact fallback (`ToInt32(left op acc)` for an arbitrary `acc`, string
+     concat included) and a JIT slow block or helper.
+
+   Measured cost of the gap: `obj_prop` 49 ns/iter vs `baseline` 30 ns/iter for
+the same work (the hoisted copy is 7 ops with `FastLoopBind num: None` vs 5 ops
+with `BinStoreInt` and `num: Some(1)`).
 3. **Post-call tails.** A register run that starts with an operand already on
    the machine stack (`Binary` after a call) would remove 3 more dispatches.
