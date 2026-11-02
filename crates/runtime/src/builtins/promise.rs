@@ -416,53 +416,30 @@ pub fn dispatch_call(
     }
     let realm = agent.current_realm().ok()?;
     let intrinsics = &realm.intrinsics;
-    // Dispatch by stored intrinsic identity (the %eval% pattern): comparing
-    // against the registered functions avoids re-reading properties, which
-    // could be user-modified accessors (e.g. `Promise.resolve` getters).
-    for name in [THEN, CATCH, FINALLY] {
-        let key = format!("%Promise.prototype.{name}%");
-        if intrinsics.get(&key).as_ref() == Some(callee) {
-            let handler = match name {
-                THEN => promise_then as fn(&mut Agent, &Value, &[Value]) -> Result<Value, JsError>,
-                CATCH => promise_catch,
-                FINALLY => promise_finally_method,
-                _ => unreachable!(),
-            };
-            return Some(handler(agent, this, args));
-        }
-    }
-    for name in [
-        RESOLVE,
-        REJECT,
-        ALL,
-        ALL_SETTLED,
-        ALL_KEYED,
-        ALL_SETTLED_KEYED,
-        ANY,
-        RACE,
-        WITH_RESOLVERS,
-        TRY,
-    ] {
-        let key = format!("%Promise.{name}%");
-        if intrinsics.get(&key).as_ref() == Some(callee) {
-            let handler = match name {
-                RESOLVE => {
-                    promise_static_resolve
-                        as fn(&mut Agent, &Value, &[Value]) -> Result<Value, JsError>
-                }
-                REJECT => promise_static_reject,
-                ALL => promise_all,
-                ALL_SETTLED => promise_all_settled,
-                ALL_KEYED => promise_all_keyed,
-                ALL_SETTLED_KEYED => promise_all_settled_keyed,
-                ANY => promise_any,
-                RACE => promise_race,
-                WITH_RESOLVERS => promise_with_resolvers,
-                TRY => promise_try,
-                _ => unreachable!(),
-            };
-            return Some(handler(agent, this, args));
-        }
+    // Dispatch by stored intrinsic identity (the %eval% pattern). The callee's
+    // names come from the table's id index, so this is one lookup instead of a
+    // `format!` plus a string-keyed probe per arm.
+    let resolved = intrinsics.name_of(callee);
+    for name in resolved.names() {
+        let handler = match &**name {
+            "%Promise.prototype.then%" => {
+                promise_then as fn(&mut Agent, &Value, &[Value]) -> Result<Value, JsError>
+            }
+            "%Promise.prototype.catch%" => promise_catch,
+            "%Promise.prototype.finally%" => promise_finally_method,
+            "%Promise.resolve%" => promise_static_resolve,
+            "%Promise.reject%" => promise_static_reject,
+            "%Promise.all%" => promise_all,
+            "%Promise.allSettled%" => promise_all_settled,
+            "%Promise.allKeyed%" => promise_all_keyed,
+            "%Promise.allSettledKeyed%" => promise_all_settled_keyed,
+            "%Promise.any%" => promise_any,
+            "%Promise.race%" => promise_race,
+            "%Promise.withResolvers%" => promise_with_resolvers,
+            "%Promise.try%" => promise_try,
+            _ => continue,
+        };
+        return Some(handler(agent, this, args));
     }
     None
 }
@@ -480,6 +457,25 @@ pub fn dispatch_construct(
         return None;
     }
     Some(promise_constructor(agent, args, new_target))
+}
+
+/// The construct handler `Intrinsics::define` registers for `%Promise%`, so a
+/// construct dispatches through the O(1) registry instead of the identity
+/// chain in `construct_inner`.
+pub(crate) fn construct_handler_for(name: &str) -> Option<crate::function::BuiltinCtor> {
+    match name {
+        PROMISE => Some(promise_construct),
+        _ => None,
+    }
+}
+
+fn promise_construct(
+    agent: &mut Agent,
+    _callee: &Value,
+    args: &[Value],
+    new_target: &Value,
+) -> Result<Value, JsError> {
+    promise_constructor(agent, args, new_target)
 }
 
 /// The Promise Resolve/Reject Function algorithm (spec 27.2.1.3.2).

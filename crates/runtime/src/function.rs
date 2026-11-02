@@ -2618,6 +2618,13 @@ fn construct_inner(
                 construct(agent, target, &all, new_target)
             }
             _ => {
+                // A registered builtin constructor dispatches through the O(1)
+                // registry (the construct-side mirror of `call_inner`'s
+                // `builtin_handler`); only an unregistered one walks the
+                // identity chain below.
+                if let Some(ctor) = agent.builtin_ctor_lookup(function.id()) {
+                    return ctor(agent, callee, args, new_target);
+                }
                 if let Some(result) =
                     crate::builtins::function::dispatch_construct(agent, callee, args, new_target)
                 {
