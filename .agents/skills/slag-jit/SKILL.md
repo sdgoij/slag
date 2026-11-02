@@ -199,6 +199,19 @@ inside a for-of body takes the non-try `for_of_close_all` path; the
 `error_sp` truncate is only for the try path, and it doesn't matter here
 (the body returns immediately — the sp is on the callee's private buffer).
 
+**A new `LeafOp` has THREE implementations, not one.** The interpreter's
+`run_leaf_ops` arm is only the first: `compiler.rs::emit_leaf_op` (the
+baseline tier) and `opt/lift/mod.rs::emit_leaf_op` (the optimizing tier)
+must both know it as well. The lift is the trap — it returns
+`Unsupported::Step("RunRegBody")` for an op it does not know, the whole
+body then bails from the optimizing tier to the baseline tier, and JIT
+mode silently loses 10-30% on exactly the bodies the op was added for
+while every value stays correct. Measured on the register-lane call ops:
+`opcost/js_call` +21% and `opcost/method_call` +11% in JIT mode until the
+lift learned them. Check with `JIT_DUMP_CLIF=1` — `opt bail: Step("RunRegBody")`
+means a lifted body was refused — and prefer a JIT-mode A/B against the
+previous commit, because the per-body bail leaves no other trace.
+
 ## 8. Visibility and the shared core
 
 The JIT helpers reach Vm state through the ctx's `agent`/`vm` pointers:
