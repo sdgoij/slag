@@ -16015,8 +16015,23 @@ Remaining levers, in expected-value order:
    needs an exact `ToInt32(left op acc)` fallback for arbitrary `acc` (string
    concat included) plus a JIT slow block or helper, and the compile-time
    proof is free at runtime.
-3. **Post-call tails.** A register run that starts with an operand already on
-   the machine stack (`Binary` after a call) would remove 3 more dispatches.
+3. **Post-call tails** — CLOSED (2026-11-02) as not worth it. The evidence is
+   the `CallIntrinsic` op experiment above: collapsing five dispatches
+   (`LoadLocal`/`Dup`/`GetMemberName`/arg/`CallIntrinsic`) into one register
+   run on `map_get`, `array_indexof`, `set_has`, `array_at`, `num_valueof`,
+   `string_indexof` measured neutral in both modes. Those rows are not
+   dispatch-bound, and the tail is only two dispatches, so the machine-stack
+   operand model it needs (a `Stack` operand, LIFO consumption, and a per-step
+   stack-effect table to seed it) buys nothing.
+
+   If it is ever revisited, note that `max_stack_usage` cannot be used as the
+   table: it is a conservative *bound*, and it was one slot wrong for
+   `Step::BinaryImm` (fixed: the step is stack-neutral). An exact model needs
+   its own table plus a validation harness — a debug build that tracks the
+   expected depth against `self.stack.len()` per step, run over the suite and
+   the corpus — before anything seeds real stack consumption from it. The JIT
+   side needs `RunRegBody`'s `set_sp_offset(entry_sp)` truncate to become
+   `entry_sp + net` for a run that consumes pre-existing values.
 ## SIZED (2026-11-02): the post-call tail is ~2 dispatches, and a stack-model change
 
 Investigated the last lever from the opcost decomposition: the three steps a
@@ -16065,3 +16080,17 @@ intrinsic lowering for nothing.
 
 That closes the call-shaped work: the frame-slot form, the stack form, and
 their JIT tier coverage are in; the intrinsic form is measured and declined.
+## CLOSED (2026-11-02): the post-call tail, killed by measurement before it was built
+
+The tail lever needed a machine-stack operand model in the register lowering
+(a `Stack` operand, LIFO consumption, and a per-step stack-effect table to seed
+it) plus a JIT truncate change. Before building that, the `CallIntrinsic`
+experiment answered the question: collapsing five dispatches into one run on
+the same rows (map_get, array_indexof, set_has, array_at, num_valueof,
+string_indexof) measured neutral in both modes, so those rows are not
+dispatch-bound and the tail's two dispatches cannot pay for the model.
+
+Record the two things a future attempt must know: max_stack_usage is a bound,
+not a model (it was one slot wrong for Step::BinaryImm, now fixed), so an
+exact table plus a depth-vs-stack.len() validation harness comes first; and
+RunRegBody's JIT truncate assumes a run never consumes pre-existing stack.
