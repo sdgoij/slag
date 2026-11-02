@@ -414,9 +414,16 @@ impl crux::heap::Trace for ErrorStack {
 /// (strict, fast_script, jsx) — see [`AgentRoots::script_bodies`].
 pub(crate) type ScriptBodyKey = (crux::JsString, bool, bool, bool);
 
-/// One leaf-inline cache cell: the function id it was filled for plus the
-/// record body's hot path needs.
-pub(crate) type LeafCacheCell = Option<(u64, crate::ir::LeafEntry)>;
+/// One leaf-inline cache cell: the function id it was filled for, then the
+/// verdict — `Some` is the entry the inline call path needs, `None` is a
+/// known *not-a-leaf* body.
+///
+/// The negative is cached because a miss here costs an `ecma_functions` probe,
+/// and every non-leaf call reaches this probe before it withdraws (the inline
+/// lane is tried first, and it cannot know the callee is not a leaf without
+/// asking). `leaf_inline` is final for an id: `set_compiled` sets it before
+/// `register_ecma_function` publishes the record, and ids are never reused.
+pub(crate) type LeafCacheCell = Option<(u64, Option<crate::ir::LeafEntry>)>;
 
 /// One same-stack record cell: the function id it was filled for plus the
 /// record the lane's frame push needs.
@@ -1527,7 +1534,9 @@ impl Trace for AgentRoots {
             cell.trace(visit);
         }
         for (_, entry) in self.leaf_cache.borrow().iter().flatten() {
-            entry.trace(visit);
+            if let Some(entry) = entry {
+                entry.trace(visit);
+            }
         }
         for (_, entry) in self.same_stack_cache.borrow().iter().flatten() {
             entry.trace(visit);
@@ -2860,18 +2869,25 @@ impl Agent {
         let cached = {
             let cells = self.roots.leaf_cache.borrow();
             match cells[index].as_ref() {
-                Some((cached_id, entry)) if *cached_id == id => Some(entry.clone()),
+                // A cached `None` is a body known not to be leaf-inlineable;
+                // the outer `Some(entry)` tells the two apart from a cold cell.
+                Some((cached_id, verdict)) if *cached_id == id => match verdict {
+                    Some(entry) => Some(Some(entry.clone())),
+                    None => Some(None),
+                },
                 _ => None,
             }
         };
-        if let Some(entry) = cached {
-            return Some(entry);
+        if let Some(hit) = cached {
+            return hit;
         }
         // The record guard stays inside this block: the cache write below is
         // an allocation-free store, but a guard is never worth extending.
         let (ir, strict, environment, construct_inline) = {
             let data = self.ecma_function(&id)?;
             if !data.leaf_inline {
+                drop(data);
+                self.roots.leaf_cache.borrow_mut()[index] = Some((id, None));
                 return None;
             }
             let ir = data.ir.clone().expect("leaf_inline implies a compiled ir");
@@ -2890,7 +2906,7 @@ impl Agent {
             // so the construct-inline verdict rides along.
             construct_inline,
         };
-        self.roots.leaf_cache.borrow_mut()[index] = Some((id, entry.clone()));
+        self.roots.leaf_cache.borrow_mut()[index] = Some((id, Some(entry.clone())));
         Some(entry)
     }
 
