@@ -15984,13 +15984,20 @@ chain read itself site-cacheable (receiver shape -> link shape -> link field).
 
 Remaining levers, in expected-value order:
 
-1. **Calls inside a register run** — DONE (2026-11-02). `LeafOp::CallFastSlot`
-   + `PushReg` lower a frame-slot call into the run, and the JIT lowers both: a
-   call op's continuation is the next *op*, so it goes through `emit_call` with
-   `emit_fall_through` off and keeps emitting on the merge block. `js_call`
-   -10..15% (isolated, min of 12-20), `calls/direct_leaf` -12%; rows whose
-   callee is not a frame slot (`method_call`, `apply_call` — `CallFast` /
-   `CallApply`) are untouched and remain the largest call-shaped gap.
+1. **Calls inside a register run** — DONE (2026-11-02), both call shapes. The
+   slot form (`CallFastSlot` + `PushReg`) and the stack form (`CallFast`, the
+   `[this, callee, args]` shape every method call compiles to) lower into the
+   run, and the JIT lowers both: a call op's continuation is the next *op*, so
+   it goes through `emit_call` with `emit_fall_through` off and keeps emitting
+   on the merge block. Measured (isolated, min of 12): `opcost/method_call`
+   -17..-20%, `opcost/num_valueof` -8%, `calls/method_call` -16%,
+   `opcost/js_call` -10..-17%, `calls/direct_leaf` -12%. The remaining
+   call-shaped step is `CallIntrinsic` (`Math.abs`, `arr.indexOf`, `Map.get`,
+   `str.charCodeAt` in a loop): its JIT lowering is a ~200-line inline block in
+   the `Step::CallIntrinsic` arm, so the op needs that factored into a method
+   first, then the same merge-block continuation. Rows where the callee is a
+   builtin with a big body (`map_get`, `string_charat`, `prim_prop`) barely
+   move — the dispatch is not what they spend their time on.
 2. **Loop-plan parity for hoisted-read loops.** `plan_loop_int`'s
    `int_rmw_prefix_shape` declines because `IntProvenance` cannot prove the
    hoisted slot `Int` (the pass only sees slots a register op writes). The
