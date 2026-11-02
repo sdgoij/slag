@@ -6123,6 +6123,7 @@ impl<'a> Lowerer<'a> {
                 reads,
                 prim_slots,
                 numbers,
+                int_slots,
                 target,
             } => {
                 // LICM: verify every value-operand slot holds a non-object
@@ -6143,6 +6144,28 @@ impl<'a> Lowerer<'a> {
                     } else {
                         self.emit_value_dangerous(value, false)
                     };
+                    bad = Some(match bad {
+                        Some(prev) => self.builder.ins().bor(prev, bad_slot),
+                        None => bad_slot,
+                    });
+                }
+                for slot in int_slots {
+                    // The int32 loop-accumulator plan's guard: the slot must be
+                    // a double that is an exact i32 (the saturating round trip
+                    // rejects NaN, a fraction, and anything out of range).
+                    let value = self.load_slot(*slot);
+                    let is_num = self.is_double(value);
+                    let is_num = self.bint(is_num);
+                    let num = self
+                        .builder
+                        .ins()
+                        .bitcast(types::F64, MemFlagsData::new(), value);
+                    let int = self.builder.ins().fcvt_to_sint_sat(types::I32, num);
+                    let back = self.builder.ins().fcvt_from_sint(types::F64, int);
+                    let exact = self.builder.ins().fcmp(FloatCC::Equal, back, num);
+                    let exact = self.bint(exact);
+                    let good = self.builder.ins().band(is_num, exact);
+                    let bad_slot = self.builder.ins().icmp_imm_u(IntCC::Equal, good, 0);
                     bad = Some(match bad {
                         Some(prev) => self.builder.ins().bor(prev, bad_slot),
                         None => bad_slot,

@@ -1003,6 +1003,13 @@ pub enum Step {
         /// rather than merely non-object primitives — the RHS-hoist result
         /// guard that gates the raw-f64 num-slot reduction.
         numbers: bool,
+        /// Slots that must hold an exact int32 Number — the guard that gates
+        /// the int32 loop-accumulator plan for a hoisted read (the plan can
+        /// only prove the hoisted slot `Int` if its value is in range, and a
+        /// non-int value takes the read-hoisted copy instead). A NaN, a
+        /// fractional value, or one outside `i32` fails the check, which is
+        /// exactly what `ToInt32` cannot represent exactly.
+        int_slots: Vec<usize>,
         target: usize,
     },
     /// LICM: the invariant-global read guard. Probes each global's data cell;
@@ -10901,6 +10908,7 @@ impl Vm {
                     reads,
                     prim_slots,
                     numbers,
+                    int_slots,
                     target,
                 } => {
                     // LICM: a once-per-loop guard. Every VALUE-operand slot
@@ -10917,6 +10925,14 @@ impl Vm {
                         } else {
                             !value.is_object() && !value.is_function()
                         }
+                    }) && int_slots.iter().all(|slot| {
+                        // An exact int32: `ToInt32` of such a value is the value
+                        // itself, which is what the fused RMW's wrapping i32 op
+                        // assumes. `trunc()` rejects NaN/fractional, the bounds
+                        // reject the saturating conversion's range.
+                        self.frame_get(*slot).as_number().is_some_and(|n| {
+                            n.trunc() == n && (-2147483648.0..=2147483647.0).contains(&n)
+                        })
                     });
                     if ok {
                         for (recv_slot, name, hoist_slot, strict) in reads {
@@ -17849,6 +17865,13 @@ struct Compiler {
     /// num-slot plan accepts them as a raw-f64 RHS ([`NumRhs::Slot`]). Scoped
     /// like `hoisted_members`; empty elsewhere.
     proven_num_slots: std::collections::HashSet<usize>,
+    /// LICM: frame slots the compiler has proven hold an exact int32 throughout
+    /// the fast copy being compiled — the hoisted reads whose guard passed the
+    /// int32 check. The int32 loop-accumulator plan seeds its provenance pass
+    /// with them, so a read in the loop's arithmetic fuses into the wrapping
+    /// RMW instead of staying an unfused `BinLeftReg`/`BinImm`/`StoreReg`.
+    /// Scoped like `proven_num_slots`.
+    proven_int_slots: std::collections::HashSet<usize>,
 }
 
 /// Where a binding lives for emission purposes: a frame slot (fast body),
@@ -20319,6 +20342,7 @@ impl Compiler {
                 reads: guards.clone(),
                 prim_slots: plan.prim_slots,
                 numbers: false,
+                int_slots: Vec::new(),
                 target: 0,
             });
             self.fixups.push(Fixup::HoistMemberGuard {
@@ -20345,6 +20369,7 @@ impl Compiler {
         let saved_exprs = self.hoisted_exprs.take();
         let saved_globals = self.hoisted_globals.take();
         let saved_proven = std::mem::take(&mut self.proven_num_slots);
+        let saved_proven_int = std::mem::take(&mut self.proven_int_slots);
         // Precompute the invariant RHS expressions into fresh hidden slots. The
         // member and global read redirects are active (their reads load the
         // guard's slots); the expression redirect is not, so they compile
@@ -20373,10 +20398,31 @@ impl Compiler {
                 reads: Vec::new(),
                 prim_slots: number_slots.clone(),
                 numbers: true,
+                int_slots: Vec::new(),
                 target: 0,
             });
             self.fixups.push(Fixup::HoistMemberGuard {
                 index: number_index,
+                label: readonly_label,
+            });
+        }
+        // A third guard bounds the hoisted READ values to exact int32, which is
+        // what the int32 loop-accumulator plan needs to prove the read slot
+        // `Int` (a read in ordinary arithmetic, `s = (s + o.step) | 0`). A
+        // non-int read (a fractional step, a string) takes the read-hoisted
+        // copy: the reads stay hoisted, only the fused RMW is given up.
+        let read_slots: Vec<usize> = guards.iter().map(|(_, _, slot, _)| *slot).collect();
+        if !read_slots.is_empty() {
+            let int_index = self.steps.len();
+            self.emit(Step::HoistMemberGuard {
+                reads: Vec::new(),
+                prim_slots: Vec::new(),
+                numbers: false,
+                int_slots: read_slots.clone(),
+                target: 0,
+            });
+            self.fixups.push(Fixup::HoistMemberGuard {
+                index: int_index,
                 label: readonly_label,
             });
         }
@@ -20393,17 +20439,19 @@ impl Compiler {
             Some(expr_map)
         };
         self.proven_num_slots = number_slots.iter().copied().collect();
+        self.proven_int_slots = read_slots.iter().copied().collect();
         self.compile_for(init, test, update, body)?;
         self.hoisted_exprs = saved_exprs;
         self.hoisted_members = saved_members.clone();
         self.hoisted_globals = saved_globals.clone();
         self.proven_num_slots = saved_proven;
+        self.proven_int_slots = saved_proven_int;
         self.hoist_suppressed = saved_suppressed;
         self.jump(done_label);
-        if !expr_slots.is_empty() || !globals.is_empty() {
-            // Read-hoisted copy: the RHS was computed but was not a Number (or
-            // the hoisted globals were not Numbers), so the reduction is
-            // dropped.
+        if !expr_slots.is_empty() || !globals.is_empty() || !read_slots.is_empty() {
+            // Read-hoisted copy: the RHS was computed but was not a Number, or
+            // the hoisted reads were not exact int32, so the reduction / the
+            // fused int RMW is dropped (the reads themselves stay hoisted).
             self.place(readonly_label);
             self.hoist_suppressed = true;
             self.hoisted_members = Some(guards.clone());
@@ -20589,9 +20637,8 @@ impl Compiler {
             RegInt::Unknown
         };
         let Some((prefix_len, slot, op, rhs, mask)) = (match &self.steps[body_start] {
-            Step::RunRegBody { ops } => {
-                int_rmw_shape(ops, counter).or_else(|| int_rmw_prefix_shape(ops, counter))
-            }
+            Step::RunRegBody { ops } => int_rmw_shape(ops, counter)
+                .or_else(|| int_rmw_prefix_shape(ops, counter, &self.proven_int_slots)),
             _ => None,
         }) else {
             return;
@@ -20639,7 +20686,7 @@ impl Compiler {
         let Step::RunRegBody { ops } = &mut self.steps[body_start] else {
             return;
         };
-        let mut pass = IntProvenance::new(counter);
+        let mut pass = IntProvenance::new(counter).seeded(&self.proven_int_slots);
         for op in ops.iter_mut() {
             let divisor = match op {
                 LeafOp::BinImm {
@@ -25191,6 +25238,7 @@ fn int_rmw_shape(ops: &[LeafOp], counter: RegInt) -> Option<(usize, usize, Binar
 fn int_rmw_prefix_shape(
     ops: &[LeafOp],
     counter: RegInt,
+    proven_int: &HashSet<usize>,
 ) -> Option<(usize, usize, BinaryOp, IntRhs, i32)> {
     let tail = ops.len().checked_sub(3)?;
     let (
@@ -25228,7 +25276,7 @@ fn int_rmw_prefix_shape(
             )
         }
         _ => {
-            if reg_int_acc(prefix, counter) < RegInt::Int {
+            if reg_int_acc_seeded(prefix, counter, proven_int) < RegInt::Int {
                 return None;
             }
             (tail, IntRhs::Acc)
@@ -25275,6 +25323,17 @@ impl IntProvenance {
             slots: HashMap::new(),
             counter,
         }
+    }
+
+    /// Seed the frame slots a LICM guard proved exact int32 for the whole
+    /// loop (the hoisted reads whose int guard passed): the pass itself only
+    /// sees slots a register op writes, and a hoisted read is written by a
+    /// step before the loop, not by the body.
+    fn seeded(mut self, proven_int: &HashSet<usize>) -> Self {
+        for slot in proven_int {
+            self.slots.insert(*slot, RegInt::Int);
+        }
+        self
     }
 
     fn slot_of(&self, slot: usize) -> RegInt {
@@ -25364,11 +25423,21 @@ impl IntProvenance {
 
 /// The accumulator's integrality after running the pass over `ops`, plus the
 /// integrality of each written frame slot.
+#[cfg(test)]
 pub(crate) fn reg_int_provenance(
     ops: &[LeafOp],
     counter: RegInt,
 ) -> (RegInt, HashMap<usize, RegInt>) {
-    let mut pass = IntProvenance::new(counter);
+    reg_int_provenance_seeded(ops, counter, &HashSet::new())
+}
+
+/// [`reg_int_provenance`] with the LICM-proven int32 slots seeded.
+pub(crate) fn reg_int_provenance_seeded(
+    ops: &[LeafOp],
+    counter: RegInt,
+    proven_int: &HashSet<usize>,
+) -> (RegInt, HashMap<usize, RegInt>) {
+    let mut pass = IntProvenance::new(counter).seeded(proven_int);
     for op in ops {
         pass.step(op);
     }
@@ -25377,8 +25446,14 @@ pub(crate) fn reg_int_provenance(
 
 /// The accumulator's integrality after running the pass over `ops` — the
 /// prefix query the A2 RHS proof and the `%` guard elision both use.
+#[cfg(test)]
 pub(crate) fn reg_int_acc(ops: &[LeafOp], counter: RegInt) -> RegInt {
     reg_int_provenance(ops, counter).0
+}
+
+/// [`reg_int_acc`] with the LICM-proven int32 slots seeded.
+fn reg_int_acc_seeded(ops: &[LeafOp], counter: RegInt, proven_int: &HashSet<usize>) -> RegInt {
+    reg_int_provenance_seeded(ops, counter, proven_int).0
 }
 
 /// The lattice transfer for a binary op given each operand's integrality.

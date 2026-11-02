@@ -5795,6 +5795,65 @@ mod tests {
         );
     }
 
+    /// A hoisted invariant read used in the loop's arithmetic takes the int32
+    /// loop-accumulator plan (`s = (s + o.step) | 0`): the read-guard's exact
+    /// int32 check seeds the provenance pass, so the RMW tail fuses into
+    /// `BinStoreInt` instead of staying an unfused
+    /// `BinLeftReg`/`BinImm`/`StoreReg` (the shape that measured 19 ns/iter
+    /// slower than the same loop over a frame slot). A value that is not exact
+    /// int32 falls back to the read-hoisted copy and must stay correct.
+    #[test]
+    fn hoisted_int_read_fuses_into_the_int_loop() {
+        let source = "function f(o, n) { var s = 0; for (var i = 0; i < n; i++) { s = (s + o.step) | 0; } return s; }";
+        let mut agent = Agent::new();
+        agent.initialize_host_defined_realm().unwrap();
+        agent.run_script(source).unwrap();
+        let ir = compiled_body_of(&mut agent, "f");
+        assert!(
+            ir.steps.iter().any(|step| matches!(
+                step,
+                crate::ir::Step::RunRegBody { ops }
+                    if ops
+                        .iter()
+                        .any(|op| matches!(op, crate::ir::LeafOp::BinStoreInt { .. }))
+            )),
+            "a hoisted exact-int32 read must fuse the loop's RMW"
+        );
+        // The fused path.
+        assert_eq!(
+            run("function f(o, n) { var s = 0; for (var i = 0; i < n; i++) { s = (s + o.step) | 0; } return s; } f({ step: 7 }, 5)")
+                .unwrap(),
+            Value::Number(35.0)
+        );
+        // A fractional read: the int guard declines, the read stays hoisted and
+        // `ToInt32` is applied per iteration (0.5 truncates to 0 every time).
+        assert_eq!(
+            run("function f(o, n) { var s = 0; for (var i = 0; i < n; i++) { s = (s + o.step) | 0; } return s; } f({ step: 0.5 }, 4)")
+                .unwrap(),
+            Value::Number(0.0)
+        );
+        // Out of int32 range: the saturating conversion must not be used; the
+        // exact per-iteration `ToInt32` wraps.
+        assert_eq!(
+            run("function f(o, n) { var s = 0; for (var i = 0; i < n; i++) { s = (s + o.step) | 0; } return s; } f({ step: 2147483648 }, 3)")
+                .unwrap(),
+            Value::Number(-2147483648.0)
+        );
+        // A string read: `+` concatenates and `| 0` parses the result, which no
+        // i32 fusion may skip.
+        assert_eq!(
+            run("function f(o, n) { var s = 0; for (var i = 0; i < n; i++) { s = (s + o.step) | 0; } return s; } f({ step: '3' }, 3)")
+                .unwrap(),
+            Value::Number(333.0)
+        );
+        // `NaN` and `-0` are the boundary cases of the exactness test.
+        assert_eq!(
+            run("function f(o, n) { var s = 0; for (var i = 0; i < n; i++) { s = (s + o.step) | 0; } return s; } f({ step: NaN }, 3)")
+                .unwrap(),
+            Value::Number(0.0)
+        );
+    }
+
     #[test]
     fn fast_path_nested_context_chain() {
         // Cut 3 continuation (nested context chains): a certified closure's
