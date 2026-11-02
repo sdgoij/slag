@@ -753,7 +753,7 @@ fn finish_resume(
             )),
             // `run_inner`'s driver performs a withdrawn call before the body
             // can complete; an escaped one is an internal invariant violation.
-            VmOutcome::Call(_) => Err(JsError::new(
+            VmOutcome::Call => Err(JsError::new(
                 ErrorKind::TypeError,
                 "withdrawn call escaped the generator driver".into(),
             )),

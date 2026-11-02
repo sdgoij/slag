@@ -1858,7 +1858,7 @@ fn execute_module_body(
         }
         // `run_inner`'s driver performs a withdrawn call before the body can
         // complete; an escaped one is an internal invariant violation.
-        Ok(VmOutcome::Call(_)) => {
+        Ok(VmOutcome::Call) => {
             agent.roots.execution_context_stack.pop();
             return Err(JsError::new(
                 ErrorKind::TypeError,

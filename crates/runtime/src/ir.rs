@@ -2578,9 +2578,13 @@ pub enum VmOutcome {
     /// up the callee's context and frame on this Vm, and `run_inner`'s
     /// driver continues with the carried body.
     TailCall(std::rc::Rc<CompiledBody>),
-    /// A call step withdrew its activation: the driver performs the recorded
-    /// call and resumes the same body (see [`PendingCall`]).
-    Call(Box<PendingCall>),
+    /// A call step withdrew its activation: the driver performs the record the
+    /// step left on the Vm ([`Vm::pending_call`]) and resumes the same body
+    /// (see [`PendingCall`]). The record stays on the Vm rather than riding
+    /// the outcome so this variant stays payload-free: the outcome is produced
+    /// and consumed once per non-leaf call, on the interpreter's hottest path,
+    /// and growing it (or boxing it) costs more than the record's own move.
+    Call,
 }
 
 /// The body a [`Vm::run_inner`] driver is currently executing: a proper tail
@@ -8014,8 +8018,12 @@ impl Vm {
                     // in this loop (no nested activation); every other callee
                     // keeps the pooled/nested funnel, whose error is the step
                     // error path below.
-                    Ok(VmOutcome::Call(pending)) => {
-                        let inline = match &*pending {
+                    Ok(VmOutcome::Call) => {
+                        let pending = self
+                            .pending_call
+                            .take()
+                            .expect("a withdrawn call leaves its record on the Vm");
+                        let inline = match &pending {
                             PendingCall::Function {
                                 callee,
                                 this,
@@ -8047,7 +8055,7 @@ impl Vm {
                                 }
                             }
                         }
-                        match self.complete_call(agent, *pending) {
+                        match self.complete_call(agent, pending) {
                             Ok(()) => continue,
                             Err(error) => Err(error),
                         }
@@ -8174,10 +8182,11 @@ impl Vm {
 
     /// Take the record a call step just made, as the outcome the driver
     /// performs with the dispatch frame popped.
-    fn take_pending_call(&mut self) -> Option<VmOutcome> {
-        self.pending_call
-            .take()
-            .map(|pending| VmOutcome::Call(Box::new(pending)))
+    /// The outcome a call arm returns when the step withdrew its activation.
+    /// The record itself stays on the Vm ([`Self::pending_call`]) and the
+    /// driver takes it; nothing is allocated to carry it across.
+    fn withdrawn_call_outcome(&self) -> Option<VmOutcome> {
+        self.pending_call.is_some().then_some(VmOutcome::Call)
     }
 
     /// C3: run a certified callee's body as a nested activation on this Vm
@@ -9535,7 +9544,7 @@ impl Vm {
                         self.record_call_site(agent, body, &callee);
                     }
                     self.do_call(agent, *direct_eval)?;
-                    if let Some(outcome) = self.take_pending_call() {
+                    if let Some(outcome) = self.withdrawn_call_outcome() {
                         return Ok(outcome);
                     }
                 }
@@ -9552,7 +9561,7 @@ impl Vm {
                         self.record_call_site(agent, body, &callee);
                     }
                     self.do_call_fast(agent, argc, *direct_eval)?;
-                    if let Some(outcome) = self.take_pending_call() {
+                    if let Some(outcome) = self.withdrawn_call_outcome() {
                         return Ok(outcome);
                     }
                 }
@@ -9561,14 +9570,14 @@ impl Vm {
                     if !self.do_call_intrinsic(agent, *kind, *argc as usize)? {
                         self.do_call_fast(agent, *argc as usize, false)?;
                     }
-                    if let Some(outcome) = self.take_pending_call() {
+                    if let Some(outcome) = self.withdrawn_call_outcome() {
                         return Ok(outcome);
                     }
                 }
                 Step::CallApply { argc, kind, span } => {
                     self.set_site(agent, *span);
                     self.do_call_apply(agent, *argc as usize, *kind)?;
-                    if let Some(outcome) = self.take_pending_call() {
+                    if let Some(outcome) = self.withdrawn_call_outcome() {
                         return Ok(outcome);
                     }
                 }
@@ -9628,7 +9637,7 @@ impl Vm {
                         self.record_call_site(agent, body, &callee);
                     }
                     self.do_call_fast_global(agent, *name, None, *argc as usize, *direct_eval)?;
-                    if let Some(outcome) = self.take_pending_call() {
+                    if let Some(outcome) = self.withdrawn_call_outcome() {
                         return Ok(outcome);
                     }
                 }
@@ -9637,7 +9646,7 @@ impl Vm {
                     let callee = *self.frame_get(*slot);
                     self.record_call_site(agent, body, &callee);
                     self.do_call_fast_slot(agent, *slot, None, *argc as usize)?;
-                    if let Some(outcome) = self.take_pending_call() {
+                    if let Some(outcome) = self.withdrawn_call_outcome() {
                         return Ok(outcome);
                     }
                 }
@@ -13007,7 +13016,7 @@ impl Vm {
                 ErrorKind::TypeError,
                 "tail call escaped a leaf body".into(),
             )),
-            Ok(VmOutcome::Call(_)) => Err(JsError::new(
+            Ok(VmOutcome::Call) => Err(JsError::new(
                 ErrorKind::TypeError,
                 "withdrawn call escaped a leaf body".into(),
             )),

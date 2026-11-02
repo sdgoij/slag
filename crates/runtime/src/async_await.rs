@@ -281,7 +281,7 @@ pub fn call_async_function(
                 // `run_inner`'s driver performs a withdrawn call before the
                 // body can complete; an escaped one is an internal invariant
                 // violation.
-                VmOutcome::Call(_) => {
+                VmOutcome::Call => {
                     return Err(JsError::new(
                         ErrorKind::TypeError,
                         "withdrawn call escaped the async driver".into(),
@@ -456,7 +456,7 @@ fn resume_async(
         }
         // `run_inner`'s driver performs a withdrawn call before the body can
         // complete; an escaped one is an internal invariant violation.
-        VmOutcome::Call(_) => {
+        VmOutcome::Call => {
             return Err(JsError::new(
                 ErrorKind::TypeError,
                 "withdrawn call escaped the async driver".into(),

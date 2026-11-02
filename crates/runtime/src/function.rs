@@ -3210,7 +3210,7 @@ pub(crate) fn run_compiled_body_on(
         }
         // `run_inner`'s driver performs a withdrawn call before the body can
         // complete; an escaped one is an internal invariant violation.
-        Ok(VmOutcome::Call(_)) => {
+        Ok(VmOutcome::Call) => {
             return Err(JsError::new(
                 ErrorKind::TypeError,
                 "withdrawn call escaped the driver".into(),
@@ -3704,7 +3704,7 @@ fn ordinary_construct(
                 // `run_inner`'s driver performs a withdrawn call before the
                 // body can complete; an escaped one is an internal invariant
                 // violation.
-                Ok(VmOutcome::Call(_)) => {
+                Ok(VmOutcome::Call) => {
                     agent.return_vm(vm);
                     return Err(JsError::new(
                         ErrorKind::TypeError,
@@ -3893,7 +3893,7 @@ fn ordinary_construct(
                     // `run_inner`'s driver performs a withdrawn call before
                     // the body can complete; an escaped one is an internal
                     // invariant violation.
-                    Ok(VmOutcome::Call(_)) => {
+                    Ok(VmOutcome::Call) => {
                         agent.return_vm(vm);
                         return Err(JsError::new(
                             ErrorKind::TypeError,

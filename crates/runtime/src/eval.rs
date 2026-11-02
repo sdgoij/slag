@@ -126,7 +126,7 @@ pub fn eval_program(
         }
         // `run_inner`'s driver performs a withdrawn call before the body can
         // complete; an escaped one is an internal invariant violation.
-        Ok(crate::ir::VmOutcome::Call(_)) => {
+        Ok(crate::ir::VmOutcome::Call) => {
             agent.return_vm(vm);
             return Err(JsError::new(
                 ErrorKind::TypeError,
