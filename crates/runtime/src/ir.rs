@@ -24724,8 +24724,11 @@ pub fn max_stack_usage(steps: &[Step]) -> usize {
         match step {
             Step::Push(_) | Step::Dup | Step::PushAcc => depth += 1,
             Step::Pop => depth = depth.saturating_sub(1),
-            // Two operands in, one result out.
-            Step::Binary(_) | Step::BinaryImm { .. } => depth = depth.saturating_sub(1),
+            // One operand in, one result out (the interpreter pops the left
+            // operand and pushes the result): net zero. `Step::Binary` is the
+            // two-operand form.
+            Step::Binary(_) => depth = depth.saturating_sub(1),
+            Step::BinaryImm { .. } => {}
             // The test pops; the keep variants leave the value.
             Step::JumpIfFalse(_) | Step::JumpIfTrue(_) => depth = depth.saturating_sub(1),
             // The hoist guard pops the receiver and pushes the length back on
