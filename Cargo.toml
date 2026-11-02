@@ -66,3 +66,13 @@ license = "MIT OR Apache-2.0"
 [profile.release]
 lto = "thin"
 codegen-units = 1
+
+# The same codegen as `release` plus line tables, for `tools/profile.py`'s
+# symbolizer (and `llvm-symbolizer`): a release image's unwind table names only
+# the functions with a public symbol, so a merged hot path — the interpreter's
+# dispatch loop is a single 100 KB function — reports as whatever public symbol
+# precedes it. `debug = 1` adds the line table and nothing else, so codegen, and
+# therefore the timings taken from this build, are the release ones.
+[profile.prof]
+inherits = "release"
+debug = 1
