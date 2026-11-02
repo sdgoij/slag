@@ -2217,6 +2217,32 @@ impl CompiledBody {
         })
     }
 
+    /// Whether a call to this body can run as a same-stack interpreter frame:
+    /// the driver enters it in the same `run_inner_impl` loop, with the
+    /// caller's activation state parked on [`Vm::inline_calls`], instead of a
+    /// nested `run_inner` activation (which is a Rust recursion).
+    ///
+    /// The requirements are what make the frame pop exact:
+    /// - `env_constant` — `lexical_env` is fixed for the run (the per-step
+    ///   context sync is skipped and no per-iteration env can replace the one
+    ///   installed at entry);
+    /// - `nested_call_eligible` — no `TailCall*` frame replacement and no
+    ///   `Vm::args` vector step;
+    /// - no semantic control — `try`/for-in/for-of/destructure/yield/await
+    ///   leave the shared control stacks populated, which the pop would have to
+    ///   park and swap instead of clearing;
+    /// - no `using` binding — the pop skips `dispose_env_resources`, which is
+    ///   exact only when the body binds no disposable.
+    pub(crate) fn same_stack_eligible(&self) -> bool {
+        self.env_constant
+            && self.nested_call_eligible()
+            && !self.touches_semantic_control()
+            && !self
+                .steps
+                .iter()
+                .any(|step| matches!(step, Step::UsingInit { .. }))
+    }
+
     /// Stage O count probe: record the member read at step `ip` whose receiver
     /// had object map id `map` (`0` = a receiver with no speculatable shape).
     /// A no-op unless the probe is enabled; the store is allocated on the first
@@ -2522,6 +2548,33 @@ impl<'a> CurrentBody<'a> {
             CurrentBody::Borrowed(body) => body,
             CurrentBody::Owned(rc) => rc,
         }
+    }
+}
+
+/// The driver's body after a same-stack frame pops: the caller's tail-call
+/// replacement when it had one, else the activation's original body.
+fn restore_caller<'a>(
+    caller: Option<std::rc::Rc<CompiledBody>>,
+    root: &'a CompiledBody,
+) -> CurrentBody<'a> {
+    match caller {
+        Some(rc) => CurrentBody::Owned(rc),
+        None => CurrentBody::Borrowed(root),
+    }
+}
+
+/// A completed same-stack callee body's value: the function-body mapping (a
+/// `return` value, else `undefined`). A `Throw` completion is an error, and a
+/// `Break`/`Continue` escaping the body is a compiler invariant violation.
+fn inline_completion_value(completion: Completion) -> Result<Value, JsError> {
+    match completion {
+        Completion::Return(value) => Ok(value),
+        Completion::Normal(_) | Completion::Empty => Ok(Value::Undefined),
+        Completion::Throw(value) => Err(crate::flow::uncaught_error(value)),
+        Completion::Break { .. } | Completion::Continue { .. } => Err(JsError::new(
+            ErrorKind::SyntaxError,
+            "Illegal break/continue statement".into(),
+        )),
     }
 }
 
@@ -3645,6 +3698,7 @@ impl Drop for ActiveRunGuard {
 /// caller's `globals_unshadowed` verdict, and the shared value/array-index/
 /// `var`-reference/class cursors (saved, and truncated back on restore so a
 /// nested run's error path cannot leak an entry into the caller).
+#[derive(Debug)]
 pub(crate) struct VmScratch {
     ip: usize,
     acc: Value,
@@ -3752,6 +3806,54 @@ impl Trace for SavedControl {
             env.trace(visit);
         }
         self.env_stack.trace(visit);
+    }
+}
+
+impl Trace for VmScratch {
+    fn trace(&self, visit: &mut dyn FnMut(GcAny)) {
+        self.acc.trace(visit);
+        self.completion.trace(visit);
+        self.switch_disc.trace(visit);
+    }
+}
+
+/// A same-stack interpreter call frame: the caller's activation state for a
+/// callee that the driver runs in the SAME `run_inner_impl` loop instead of a
+/// nested `run_inner` activation (and thus a Rust recursion).
+///
+/// It stores what [`Vm::save_scratch`] plus the activation's env fields and
+/// frame cursors hold. It lives on the `Vm` (`Vm::inline_calls`) rather than in
+/// the driver's Rust frame because `acc`/`completion`/`lexical_env` can hold
+/// live GC values and a collection may run during the callee; a `Vec` on the
+/// Rust heap is invisible to the conservative stack scan.
+#[derive(Debug)]
+struct InlineCallFrame {
+    scratch: VmScratch,
+    lexical_env: EnvRef,
+    body_context: Option<EnvRef>,
+    current_function: Option<Value>,
+    current_new_target: Option<Value>,
+    strict: bool,
+    call_args: Vec<Value>,
+    nested_frame: Option<*mut Value>,
+    leaf_frame_base: Option<usize>,
+    leaf_frame_offset: usize,
+    field_initializer_depth: usize,
+    arg_start: usize,
+    below: usize,
+    /// The caller's body when it was a tail-call replacement; `None` means the
+    /// activation's original borrowed body.
+    caller: Option<std::rc::Rc<CompiledBody>>,
+}
+
+impl Trace for InlineCallFrame {
+    fn trace(&self, visit: &mut dyn FnMut(GcAny)) {
+        self.scratch.trace(visit);
+        self.lexical_env.trace(visit);
+        self.body_context.trace(visit);
+        self.current_function.trace(visit);
+        self.current_new_target.trace(visit);
+        self.call_args.trace(visit);
     }
 }
 
@@ -4035,6 +4137,10 @@ pub struct Vm {
     /// the live stacks (see [`SavedControl`]); traced so a collection during
     /// the nested run keeps the caller's `try`/iterator state alive.
     saved_control: Vec<SavedControl>,
+    /// Same-stack interpreter call frames: the callers of bodies the driver is
+    /// currently running in one `run_inner_impl` loop (see
+    /// [`InlineCallFrame`]). Empty whenever no such call is open.
+    inline_calls: Vec<InlineCallFrame>,
 }
 
 impl Trace for Vm {
@@ -4085,6 +4191,7 @@ impl Trace for Vm {
         self.current_function.trace(visit);
         self.current_new_target.trace(visit);
         self.saved_control.trace(visit);
+        self.inline_calls.trace(visit);
     }
 }
 
@@ -4234,6 +4341,7 @@ impl Vm {
             current_function: None,
             current_new_target: None,
             saved_control: Vec::new(),
+            inline_calls: Vec::new(),
         }
     }
 
@@ -4580,6 +4688,7 @@ impl Vm {
         self.current_function = None;
         self.current_new_target = None;
         self.saved_control.clear();
+        self.inline_calls.clear();
     }
 
     /// Re-point a pooled Vm at a new run's env and strictness. The pool hands
@@ -7573,19 +7682,271 @@ impl Vm {
         result
     }
 
+    /// Enter the callee of a withdrawn interpreter call as a same-stack frame
+    /// (see [`InlineCallFrame`]): resolve the callee's body, bind `this`, carve
+    /// its frame on the value stack, install its activation, and return the body
+    /// for the driver to run in the same loop. `Ok(None)` means the callee is
+    /// not eligible and the caller keeps the nested/pooled path.
+    ///
+    /// `caller` is the body the driver was running when the call was withdrawn
+    /// (`Some` only for a tail-call replacement); the pop restores it.
+    #[allow(clippy::too_many_arguments)]
+    fn try_push_inline_call(
+        &mut self,
+        agent: &mut Agent,
+        callee: Value,
+        this: Value,
+        arg_start: usize,
+        argc: usize,
+        below: usize,
+        caller: Option<std::rc::Rc<CompiledBody>>,
+    ) -> Result<Option<std::rc::Rc<CompiledBody>>, JsError> {
+        let ValueKind::Function(function) = callee.kind() else {
+            return Ok(None);
+        };
+        if !matches!(function.kind, crux::function::FunctionKind::EcmaScript) {
+            return Ok(None);
+        }
+        // A hooked agent compiles and runs a callee through
+        // `run_compiled_body_on`; entering the body directly in this loop
+        // would bypass the JIT, which would then never even be consulted for
+        // it. The same-stack path is the interpreter's (`--jitless` and the
+        // deopt target), so it stands down whenever a hook is installed.
+        if agent.jit_hook.is_some() {
+            return Ok(None);
+        }
+        // A cross-realm callee runs with its own realm pushed by `call_inner`;
+        // a termination request stops before any new activation.
+        if agent.realm_count.get() != 1 || agent.is_terminating() {
+            return Ok(None);
+        }
+        let (ir, old_env, realm, strict, parse_text) = {
+            let Some(data) = agent.ecma_function(&function.id()) else {
+                return Ok(None);
+            };
+            // Resumable and class-machinery bodies keep the funnel, which owns
+            // the iterator/promise and field-initializer context handling.
+            if data.is_generator
+                || data.is_async
+                || data.is_class_constructor
+                || data.class_field_initializer
+            {
+                return Ok(None);
+            }
+            let Some(ir) = data.ir.clone() else {
+                return Ok(None);
+            };
+            if !ir.same_stack_eligible() {
+                return Ok(None);
+            }
+            (
+                ir,
+                data.environment,
+                data.realm,
+                data.strict,
+                data.parse_text().cloned(),
+            )
+        };
+        let scope = ir.scope.as_ref().expect("a certified body has a scope");
+        // OrdinaryCallBindThis (spec 10.2.1.1), resolved before any mutation so
+        // a primitive receiver — which needs boxing, and thus allocation —
+        // falls back to the funnel instead of being quietly mis-bound.
+        let this_value = if scope.this_slot.is_some() {
+            if strict {
+                this
+            } else {
+                match this.kind() {
+                    ValueKind::Undefined | ValueKind::Null => Value::Object(realm.global_object),
+                    ValueKind::Object(_) | ValueKind::Function(_) => this,
+                    _ => return Ok(None),
+                }
+            }
+        } else {
+            Value::Undefined
+        };
+        // The activation's value-stack bound, now also bounding the depth of
+        // the same-stack frame chain: the callee's own steps push `max_stack`
+        // above its carved frame, and every enclosing frame keeps its segment.
+        self.check_value_stack(ir.max_stack.saturating_add(scope.frame_size))?;
+        let body_env =
+            match scope.new_body_context(&old_env, &self.stack[arg_start..arg_start + argc])? {
+                Some(context) => context,
+                None => old_env,
+            };
+        agent
+            .roots
+            .execution_context_stack
+            .push(crate::context::ExecutionContext {
+                function: Some(callee),
+                realm,
+                script_or_module: None,
+                lexical_environment: body_env,
+                variable_environment: body_env,
+                private_environment: None,
+                source: parse_text,
+                annex_b_hoistable: Default::default(),
+                position: None,
+            });
+        let base = self.stack.len();
+        // A control-free caller (the common case) needs only the shallow save
+        // plus a clear on exit; the callee is gated to leave nothing on the
+        // semantically scanned stacks.
+        let control_free = self.is_control_free();
+        let scratch = if control_free {
+            let mut scratch = self.save_scratch();
+            scratch.mark_env_swapped();
+            scratch
+        } else {
+            self.save_scratch_full()
+        };
+        // Carve the callee's frame above the call site — the leaf/nested lane's
+        // layout, so the callee's frame slots are a flat `vm.stack` segment.
+        self.stack.resize(base + scope.frame_size, Value::Undefined);
+        for slot in 0..scope.frame_size {
+            let value = if Some(slot) == scope.this_slot {
+                this_value
+            } else if slot < scope.arity.min(argc) {
+                self.stack[arg_start + slot]
+            } else if slot < scope.arity {
+                Value::Undefined
+            } else if scope.tdz_store.get(slot).copied().unwrap_or(false) {
+                Value::uninitialized()
+            } else {
+                Value::Undefined
+            };
+            self.stack[base + slot] = value;
+        }
+        self.inline_calls.push(InlineCallFrame {
+            scratch,
+            lexical_env: self.lexical_env,
+            body_context: self.body_context,
+            current_function: self.current_function,
+            current_new_target: self.current_new_target,
+            strict: self.strict,
+            call_args: std::mem::take(&mut self.call_args),
+            nested_frame: self.nested_frame,
+            leaf_frame_base: self.leaf_frame_base,
+            leaf_frame_offset: self.leaf_frame_offset,
+            field_initializer_depth: agent.field_initializer_depth,
+            arg_start,
+            below,
+            caller,
+        });
+        self.leaf_frame_base = Some(base);
+        self.leaf_frame_offset = 0;
+        self.nested_frame = None;
+        if scope.arguments_slot.is_some() {
+            self.call_args = self.stack[arg_start..arg_start + argc].to_vec();
+        }
+        self.lexical_env = body_env;
+        self.env_stack.reset(body_env);
+        self.body_context = Some(body_env);
+        self.current_function = Some(callee);
+        self.current_new_target = None;
+        self.strict = strict;
+        agent.field_initializer_depth = 0;
+        self.globals_unshadowed = Self::global_reads_are_unshadowed(body_env, &ir.ident_names);
+        Ok(Some(ir))
+    }
+
+    /// Pop the innermost same-stack frame and restore the caller's activation
+    /// state. `result` is landed at the call site when the callee completed
+    /// normally; on an abrupt exit the call site is left in place for the
+    /// caller's error routing. Returns the caller's body when it was a
+    /// tail-call replacement (`None` means the activation's original body).
+    fn pop_inline_call(
+        &mut self,
+        agent: &mut Agent,
+        result: Option<Value>,
+    ) -> Option<std::rc::Rc<CompiledBody>> {
+        let InlineCallFrame {
+            scratch,
+            lexical_env,
+            body_context,
+            current_function,
+            current_new_target,
+            strict,
+            call_args,
+            nested_frame,
+            leaf_frame_base,
+            leaf_frame_offset,
+            field_initializer_depth,
+            arg_start,
+            below,
+            caller,
+        } = self
+            .inline_calls
+            .pop()
+            .expect("a same-stack frame is pushed before it is popped");
+        let control_saved = scratch.control_saved;
+        // The env fields go back first: `restore_scratch`'s `env_stack` reset
+        // addresses the caller's `lexical_env`.
+        self.lexical_env = lexical_env;
+        self.body_context = body_context;
+        self.current_function = current_function;
+        self.current_new_target = current_new_target;
+        self.strict = strict;
+        self.call_args = call_args;
+        self.nested_frame = nested_frame;
+        self.leaf_frame_base = leaf_frame_base;
+        self.leaf_frame_offset = leaf_frame_offset;
+        agent.field_initializer_depth = field_initializer_depth;
+        if !control_saved {
+            // The caller held no control state at entry, so clearing whatever
+            // the callee left (a `list_stack` entry from a `return` that
+            // skipped its block's `ListEnd`) restores it exactly.
+            self.clear_control_state();
+        }
+        self.restore_scratch(scratch);
+        agent.roots.execution_context_stack.pop();
+        if let Some(value) = result {
+            self.stack.truncate(arg_start - below);
+            self.stack.push(value);
+        }
+        caller
+    }
+
     fn run_inner_impl(
         &mut self,
         agent: &mut Agent,
         body: &CompiledBody,
     ) -> Result<VmOutcome, JsError> {
+        // The activation's original body: a same-stack frame whose caller is
+        // not a tail-call replacement returns to it.
+        let root = body;
+        // The frame depth this driver owns: a nested activation on the same
+        // `Vm` (the certified-callee lane's `run_certified_call_nested` ->
+        // `run_compiled_body_on` -> `run_inner`) shares `inline_calls` with its
+        // caller, so it must never pop a frame it did not push.
+        let frame_base = self.inline_calls.len();
         // A proper tail call replaces the running body instead of recursing:
         // the handler swaps in the callee's body and the driver loops.
         let mut current = CurrentBody::Borrowed(body);
+        // An error raised inside a same-stack callee, after its frame is popped:
+        // it routes against the caller at the call step's continuation.
+        let mut pending_error: Option<JsError> = None;
         // Record the agent for the duration so crux-side ECMAScript calls
         // (proxy traps reached through property access) can find the runtime.
         crux::function::with_agent(agent as *mut Agent as *mut (), || {
             loop {
                 let body = current.get();
+                if let Some(error) = pending_error.take() {
+                    match self.route_step_error(agent, body, error) {
+                        Ok(Some(outcome)) => return Ok(outcome),
+                        Ok(None) => continue,
+                        Err(error) => {
+                            if self.inline_calls.len() <= frame_base {
+                                return Err(error);
+                            }
+                            // The caller was itself a same-stack callee and did
+                            // not cover the error: pop one more level.
+                            let caller = self.pop_inline_call(agent, None);
+                            current = restore_caller(caller, root);
+                            pending_error = Some(error);
+                            continue;
+                        }
+                    }
+                }
                 let outcome = match self.run_inner_inner(agent, body) {
                     Ok(VmOutcome::TailCall(next)) => {
                         current = CurrentBody::Owned(next);
@@ -7600,21 +7961,89 @@ impl Vm {
                     }
                     // A call step withdrew the dispatch frame: perform the
                     // recorded activation here, with that frame popped, then
-                    // resume the same body. An error from the callee is the
-                    // step error path below (the callee's own body already
-                    // disposed its resources at its own level).
-                    Ok(VmOutcome::Call(pending)) => match self.complete_call(agent, *pending) {
-                        Ok(()) => continue,
-                        Err(error) => Err(error),
-                    },
+                    // resume the same body. A same-stack frame runs the callee
+                    // in this loop (no nested activation); every other callee
+                    // keeps the pooled/nested funnel, whose error is the step
+                    // error path below.
+                    Ok(VmOutcome::Call(pending)) => {
+                        let inline = match &*pending {
+                            PendingCall::Function {
+                                callee,
+                                this,
+                                arg_start,
+                                argc,
+                                below,
+                            } => Some((*callee, *this, *arg_start, *argc, *below)),
+                            _ => None,
+                        };
+                        if let Some((callee, this, arg_start, argc, below)) = inline {
+                            let caller = match &current {
+                                CurrentBody::Owned(rc) => Some(rc.clone()),
+                                CurrentBody::Borrowed(_) => None,
+                            };
+                            match self.try_push_inline_call(
+                                agent, callee, this, arg_start, argc, below, caller,
+                            ) {
+                                Ok(Some(next)) => {
+                                    // The callee body is owned by its
+                                    // `EcmaFunction` record, so the active-run
+                                    // tracer keeps seeing the literals.
+                                    current = CurrentBody::Owned(next);
+                                    continue;
+                                }
+                                Ok(None) => {}
+                                Err(error) => {
+                                    pending_error = Some(error);
+                                    continue;
+                                }
+                            }
+                        }
+                        match self.complete_call(agent, *pending) {
+                            Ok(()) => continue,
+                            Err(error) => Err(error),
+                        }
+                    }
+                    // A same-stack callee completed: restore its caller and
+                    // land the result at the call site.
+                    Ok(VmOutcome::Completed(completion))
+                        if self.inline_calls.len() > frame_base =>
+                    {
+                        let value = inline_completion_value(completion);
+                        let caller = self.pop_inline_call(agent, value.as_ref().ok().copied());
+                        if let Err(error) = value {
+                            pending_error = Some(error);
+                        }
+                        current = restore_caller(caller, root);
+                        continue;
+                    }
                     other => other,
                 };
                 match outcome {
                     Ok(outcome) => return Ok(outcome),
-                    Err(error) => match self.route_step_error(agent, body, error)? {
-                        Some(outcome) => return Ok(outcome),
-                        None => continue,
-                    },
+                    Err(error) => {
+                        if self.inline_calls.len() <= frame_base {
+                            match self.route_step_error(agent, current.get(), error)? {
+                                Some(outcome) => return Ok(outcome),
+                                None => continue,
+                            }
+                        }
+                        // A same-stack callee's error: convert a kind-only
+                        // engine error while the callee's context is still
+                        // current (mirrors `run_certified_call_nested`), pop to
+                        // the caller, and route it there.
+                        let error = if error.value.is_none() {
+                            match crate::builtins::error::to_throwable(agent, &error) {
+                                Ok(value) => error.with_value(value),
+                                Err(conversion) => conversion,
+                            }
+                        } else {
+                            error
+                        };
+                        let caller = self.pop_inline_call(agent, None);
+                        current = restore_caller(caller, root);
+                        pending_error = Some(error);
+                        continue;
+                    }
                 }
             }
         })

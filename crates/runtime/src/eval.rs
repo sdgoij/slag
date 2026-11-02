@@ -5635,6 +5635,50 @@ mod tests {
         );
     }
 
+    /// Same-stack interpreter calls (`Vm::try_push_inline_call`): a certified
+    /// callee runs in the caller's `run_inner_impl` loop instead of a nested
+    /// activation, so its frame is a value-stack segment and its return,
+    /// recursion and errors all land at the call site. These are the shapes
+    /// that exercised real bugs while it was built: a nested call in argument
+    /// position, an error crossing the popped frame into the caller's `try`,
+    /// deep recursion, and the value-stack depth guard.
+    #[test]
+    fn same_stack_calls_match_the_interpreter() {
+        assert_eq!(
+            run(
+                "function inc(x) { return x + 1; } function f(x) { return inc(inc(inc(x))); } f(1)"
+            )
+            .unwrap(),
+            Value::Number(4.0)
+        );
+        assert_eq!(
+            run("function fib(n) { if (n < 2) { return n; } return fib(n - 1) + fib(n - 2); } fib(15)")
+                .unwrap(),
+            Value::Number(610.0)
+        );
+        // An error raised in the inlined callee pops its frame and routes at
+        // the caller's handler (the caller keeps its own `try`).
+        assert_eq!(
+            run("function g() { throw 1; } function f() { try { g(); } catch (e) { return e + 1; } } f()")
+                .unwrap(),
+            Value::Number(2.0)
+        );
+        // Two levels: the middle callee is itself inlined and does not cover
+        // the error, so it unwinds to the outer caller.
+        assert_eq!(
+            run("function h() { throw 7; } function g() { return h(); } function f() { try { return g(); } catch (e) { return e * 2; } } f()")
+                .unwrap(),
+            Value::Number(14.0)
+        );
+        // The same-stack frame chain is bounded by the value-stack cap, which
+        // surfaces the catchable call-stack RangeError.
+        assert_eq!(
+            run("function r(n) { return r(n + 1); } try { r(0); } catch (e) { e instanceof RangeError; }")
+                .unwrap(),
+            Value::Boolean(true)
+        );
+    }
+
     #[test]
     fn fast_path_nested_context_chain() {
         // Cut 3 continuation (nested context chains): a certified closure's
