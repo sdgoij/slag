@@ -16017,3 +16017,38 @@ Remaining levers, in expected-value order:
    proof is free at runtime.
 3. **Post-call tails.** A register run that starts with an operand already on
    the machine stack (`Binary` after a call) would remove 3 more dispatches.
+## SIZED (2026-11-02): the post-call tail is ~2 dispatches, and a stack-model change
+
+Investigated the last lever from the opcost decomposition: the three steps a
+call's result goes through (`s = (s + <call>) | 0` spends `Binary`,
+`BinaryImm`, `FusedStoreLocal` as separate dispatches). Sized it on
+`opcost/math_abs` (85 ns/iter, eleven dispatches per iteration: a RunRegBody
+for `k = i & 1023`, then LoadLocal/LoadIdent/Dup/GetMemberName/LoadLocal/
+CallIntrinsic/Binary/BinaryImm/FusedStoreLocal/FastLoopHead), so the tail is
+worth about two dispatches, ~10-12% of that row. (An in-binary ablation was
+attempted and thrown away: an `env::var_os` check in the arm costs more than
+the call it removed.)
+
+It is not a small extension, because the tail's operands are on the machine
+stack, not in frame slots:
+
+- The register lowering's operand model only addresses the accumulator and
+  frame slots. A run that begins with values already on the value stack needs
+  a `Stack` operand and, to seed it, a per-step stack-effect table. The only
+  such table today is the match inside `max_stack_usage`, which folds the
+  delta into a max; extracting a reusable `(pops, pushes)` function is a
+  ~150-arm mechanical refactor of a load-bearing function (the JIT sizes its
+  working area from it), so it needs its own careful pass, not a drive-by.
+- `Step::RunRegBody`'s JIT lowering ends with `set_sp_offset(entry_sp)` to
+  truncate the run's transient stack use, which assumes a run never consumes
+  stack that existed before it. A run that pops pre-existing values (the
+  tail's `Binary`) changes the contract: the truncate has to land at
+  `entry_sp + net`. Getting that wrong is silent stack corruption, which is
+  why this is a design change rather than a lowering arm.
+
+A cheaper separate item found on the way: `Dup` of an *accumulator* value is
+rejected by `lower_step` (only re-readable operands duplicate), which keeps
+`o[k].m(x)`-shaped bodies (a computed receiver read, then the callee) on the
+step path. Spilling the accumulator to a scratch slot and duplicating the
+slot would lift that in ~15 lines, but no corpus row uses the shape, so it is
+an unmeasured real-world bet.
