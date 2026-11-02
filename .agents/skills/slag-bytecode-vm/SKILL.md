@@ -944,6 +944,31 @@ splices inert). The regression is pinned by
 `feedback::tests::records_key_by_the_executing_step_not_the_next`; mutate the
 recorder back to `self.ip` and it bites.
 
+## 19. Profile with `--profile prof`, not the release image's symbols
+
+`tools/profile.py` names a sample by the PE unwind range containing it and
+the PDB's *public* symbol at that range's start. The interpreter's dispatch
+loop is one ~100 KB merged function whose start has no public symbol, so it
+reports as whatever public symbol precedes it — which produced a confident
+"57% in `Vm::setup_frame`" for a workload that never called it, and a
+`builtin_handler::closure$0` that was really a hashbrown probe. Any
+attribution from the release image is a guess about a neighbour.
+
+`cargo build --profile prof -p cli` gives the same codegen with line tables,
+and `llvm-symbolizer -f -i --obj target/prof/slag.exe 0x<base+offset>` names
+the exact line and the inlined frames (`crate::ir::Vm::run_inner_inner
+ir.rs:11247`). Timings from that build are still release timings. Two traps:
+- A sample outside the image is code in *another module*, not necessarily JIT
+  code. The sampler resolves it to `(module, offset)` — `profile outside
+  VCRUNTIME140.dll 0x1c17b 192` is the CRT's `memmove`, ~15% of the same-stack
+  call lane on a recursion benchmark.
+- Resolve that module **when printing**, never while sampling: the loader's
+  API deadlocks if the sampling thread calls it while the engine thread — which
+  may be inside a load — is suspended.
+- Naive bisection by "which function is hot" wastes a build per guess. The
+  flat self-time table cannot say which *caller* paid, so a slice chosen from
+  it must still be A/B'd against its own previous commit, with a control row.
+
 ## Validation loop
 
 `cargo clippy --workspace --all-targets -- -D warnings` clean, then

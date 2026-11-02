@@ -16094,3 +16094,60 @@ Record the two things a future attempt must know: max_stack_usage is a bound,
 not a model (it was one slot wrong for Step::BinaryImm, now fixed), so an
 exact table plus a depth-vs-stack.len() validation harness comes first; and
 RunRegBody's JIT truncate assumes a run never consumes pre-existing stack.
+## LANDED (2026-11-02): the interpreter's per-call path, four slices and a profiler
+
+The starting complaint was the whole interpreter being slow, and the first
+measurement of it was a misreading: `tools/profile.py` resolves samples through
+the PE unwind table and the PDB's public symbols, so the interpreter's dispatch
+loop — one 100 KB merged function with no public symbol at its start — reported
+as whatever public symbol preceded it, which was `Vm::setup_frame`. A `prof`
+profile (`inherits = "release"`, `debug = 1`, so identical codegen) lets
+`llvm-symbolizer` name every address and every inlined frame; the attribution
+below is from that.
+
+The workload that drives this is a two-million-call recursion with a
+four-step body: the same-stack lane costs ~190 ns per call, and the leaf lane
+~60 ns for an equally empty callee. Four slices, each measured alone against
+its own previous commit (jitless, min-of-10 interleaved rounds, alternating
+order, with a control row):
+
+- **The same-stack gate is cached on the body.** `same_stack_eligible` is a
+  pure function of the step list, and it recomputed three full scans per call.
+  `recursive_fib` 502.8 -> 444.8 ms (−11.5%), control −0.8%.
+- **A withdrawn call no longer allocates.** `VmOutcome::Call(Box<PendingCall>)`
+  boxed the record per non-leaf call; the record now stays on the Vm and the
+  outcome is a payload-free marker. `recursive_fib` −10.7%, `direct_leaf`
+  −6.5%, `method_call` −4.8%. Carrying the record *inline* in the variant
+  instead cost `direct_leaf` 11% — the leaf lane pays for the wider return type
+  and never produces that variant.
+- **The same-stack record is cached on the function id** (a direct-mapped
+  table, the `leaf_lookup` shape). The HashMap probe, the record accessor's
+  closure and the `parse_text` clone were ~9% of the call path together.
+  `recursive_fib` −5.8%.
+- **The not-a-leaf verdict is cached in the leaf cache.** Every non-leaf call
+  reached `leaf_lookup`'s miss path first, which re-probed `ecma_functions`
+  before it could report "not a leaf" — ~5.5% of the run, the largest single
+  item left. `recursive_fib` −5.2%, `closure_capture` −10.7%.
+
+Cumulatively `calls/recursive_fib` went 569 -> 344 ms (−40%) across the four,
+and the corpus's `calls` family gap closed from ~21x to ~5x on node --jitless
+(whole-corpus geomeans are noise; treat the direction only).
+
+### What is left, and the one measurement that is still missing
+
+- **~15% of the same-stack lane is `memmove` in VCRUNTIME140**, on blocks of
+  256 bytes to 8 KB. The sampler now reports the module *and offset* of an
+  outside sample (`profile outside VCRUNTIME140.dll 0x1c17b 192`), which is
+  how this was identified; no engine function in the profile calls a mem*
+  import, so the copy is reached some other way. `save_scratch`/`restore_scratch`
+  are the obvious suspects (`VmScratch` ~192 B, `InlineCallFrame` ~336 B, and
+  the frame round trip moves both), but taking `restore_scratch` by `&mut`
+  instead of by value measured neutral-to-negative (b_gen −1.5%, method_call
+  +4.4%, closure_capture +4.5%) and was reverted, so the copy is probably not
+  that one. A stack-walking sampler (or a `memcpy` hook) is the way to find it.
+- **`save_scratch` is 4-6% and `restore_scratch` ~1%** on their own. The
+  structural fix is a callee-saved "clobber mask" per body — the callee's step
+  list says which registers it can write, so the frame only has to carry those
+  — which is a real redesign of the frame, not a slice.
+- **`builtin_handler::closure$0` was never that function.** It was the
+  misattribution that the prof profile resolved.
