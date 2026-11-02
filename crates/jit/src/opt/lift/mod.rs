@@ -1524,7 +1524,7 @@ fn emit_step(
             emit_frame_store(builder, block, slot, next);
         }
         Step::RunRegBody { ops } => {
-            emit_reg_body(builder, block, ops, counter)?;
+            emit_reg_body(builder, block, ops, counter, index)?;
         }
         // The whole-literal fused creates (I6-0a): the N value expressions are
         // already on the operand stack (in source order), so the lift pops them
@@ -1810,6 +1810,7 @@ fn emit_reg_body(
     block: BlockId,
     ops: &[LeafOp],
     counter: Option<usize>,
+    index: usize,
 ) -> Result<(), Unsupported> {
     let mut acc = builder.emit(
         block,
@@ -1824,7 +1825,7 @@ fn emit_reg_body(
     // the pairs balance inside the body.
     let mut spill: Vec<ValueId> = Vec::new();
     for op in ops {
-        acc = emit_leaf_op(builder, block, op, acc, counter, &mut spill)?;
+        acc = emit_leaf_op(builder, block, op, acc, counter, &mut spill, index)?;
     }
     Ok(())
 }
@@ -1892,6 +1893,7 @@ fn emit_leaf_op(
     acc: ValueId,
     counter: Option<usize>,
     spill: &mut Vec<ValueId>,
+    index: usize,
 ) -> Result<ValueId, Unsupported> {
     let load = |b: &mut Builder, slot: usize, t: bool| -> ValueId {
         if t {
@@ -2181,6 +2183,62 @@ fn emit_leaf_op(
         LeafOp::PushAcc => {
             spill.push(acc);
             acc
+        }
+        // The register lane's argument materialization: the slot lands on the
+        // register body's model stack (`spill`), where a following call op
+        // consumes it in source order.
+        LeafOp::PushReg { slot, tdz: t } => {
+            let value = load(builder, *slot, *t);
+            spill.push(value);
+            acc
+        }
+        // The call ops: the lift's calls are `Op::Call`/`Op::Intrinsic` over
+        // `[this, callee, args..]`, so the materialized region is exactly the
+        // operand list. The result becomes the accumulator (the ops' contract).
+        LeafOp::CallFastSlot {
+            callee_slot, argc, ..
+        } => {
+            let argc = *argc as usize;
+            if spill.len() < argc {
+                return Err(Unsupported::Stack);
+            }
+            let args = spill.split_off(spill.len() - argc);
+            let callee = emit_frame_load(builder, block, *callee_slot);
+            let this = builder.emit(
+                block,
+                Op::Const,
+                &[],
+                Type::Undefined,
+                Effects::pure(),
+                Imm::U64(crux::Value::Undefined.bits()),
+            );
+            let mut call_args = Vec::with_capacity(argc + 2);
+            call_args.push(this);
+            call_args.push(callee);
+            call_args.extend(args);
+            builder.emit(
+                block,
+                Op::Call,
+                &call_args,
+                Type::Unknown,
+                Effects::call(),
+                Imm::Int(index as i32),
+            )
+        }
+        LeafOp::CallFast { argc, .. } => {
+            let argc = *argc as usize;
+            if spill.len() < argc + 2 {
+                return Err(Unsupported::Stack);
+            }
+            let call_args = spill.split_off(spill.len() - (argc + 2));
+            builder.emit(
+                block,
+                Op::Call,
+                &call_args,
+                Type::Unknown,
+                Effects::call(),
+                Imm::Int(index as i32),
+            )
         }
         LeafOp::BinAccPop { op } => {
             let left = spill.pop().ok_or(Unsupported::Stack)?;
