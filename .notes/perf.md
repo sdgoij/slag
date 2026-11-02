@@ -15998,28 +15998,22 @@ Remaining levers, in expected-value order:
    first, then the same merge-block continuation. Rows where the callee is a
    builtin with a big body (`map_get`, `string_charat`, `prim_prop`) barely
    move — the dispatch is not what they spend their time on.
-2. **Loop-plan parity for hoisted-read loops.** `plan_loop_int`'s
-   `int_rmw_prefix_shape` declines because `IntProvenance` cannot prove the
-   hoisted slot `Int` (the pass only sees slots a register op writes). The
-   lattice member it needs already exists (`RegInt::Int` = provably a Number in
-   i32 range, which is exactly what `ToInt32` needs), and the loop copy that
-   would use it already exists (`proven_num_slots`). Two routes:
-   - Compile-time: give the hoist guard an i32 mode (the existing `numbers: true`
-     guard only checks Number, and its proof feeds the invariant-RHS reduction,
-     not the read slots) plus a `proven_int_slots` seed for
-     `IntProvenance::new`. This needs a third loop copy (reads-as-int / reads /
-     general), which risks the JIT's `JIT_MAX_COMPILE_STEPS` cap — obj_prop is
-     ~33 of the 64 steps today and the opcost family is deliberately kept under
-     it, so measure the step count before adding a copy.
-   - Runtime: a checked RHS mode, `IntRhs::AccChecked`, mirroring
-     `CounterChecked` (whose slow block converts exactly for a counter outside
-     i32). `IntRhs::Acc`'s interpreter arm is `acc.as_number().unwrap_or(0.0) as
-     i32` — exact only because the plan proved Int — so a checked mode needs an
-     exact fallback (`ToInt32(left op acc)` for an arbitrary `acc`, string
-     concat included) and a JIT slow block or helper.
-
-   Measured cost of the gap: `obj_prop` 49 ns/iter vs `baseline` 30 ns/iter for
-the same work (the hoisted copy is 7 ops with `FastLoopBind num: None` vs 5 ops
-with `BinStoreInt` and `num: Some(1)`).
+2. **Loop-plan parity for hoisted-read loops** — DONE (2026-11-02), route (a).
+   The hoist guard gained `int_slots` (a Number whose `trunc()` is itself and
+   whose magnitude is in i32 range — exactly where `ToInt32` is the value), and
+   the compiler seeds the provenance pass with those slots via
+   `proven_int_slots`, so `int_rmw_prefix_shape` succeeds and the tail collapses
+   to `BinStoreInt`. A read that is not exact int32 takes the read-hoisted copy
+   (= the previous behavior), so the guard can only add a fast path. Measured:
+   `opcost/obj_prop` 4.05 -> 2.41 ms jitless (now within 2% of `baseline`
+   instead of 19 ns/iter behind), 0.61 -> 0.25 ms in JIT mode. The body grew by
+   one guard + one loop copy and stayed well under `JIT_MAX_COMPILE_STEPS`
+   (obj_prop went from ~33 to ~42 of 64); a body already near the cap that
+   hoists a non-int read now pays a copy it cannot use — worth watching if a
+   row ever stops compiling.
+   The other route (a runtime-checked `IntRhs::AccChecked`) was not taken: it
+   needs an exact `ToInt32(left op acc)` fallback for arbitrary `acc` (string
+   concat included) plus a JIT slow block or helper, and the compile-time
+   proof is free at runtime.
 3. **Post-call tails.** A register run that starts with an operand already on
    the machine stack (`Binary` after a call) would remove 3 more dispatches.
