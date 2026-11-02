@@ -15936,3 +15936,62 @@ class's inferred name) so the function is created with its final `name` and the
 literal can take `ObjectFast`. Not measured; no corpus row uses the pattern
 (two files contain `: function (` and neither evaluates it in a loop), so this is
 a real-world win rather than a corpus one.
+
+## MEASURED (2026-11-02): the `opcost` deltas are loop-plan and dispatch-count costs, not operation costs
+
+Decomposed the `opcost` family (isolated, `--jitless`, min-of-N, 100k iterations,
+`baseline` subtracted) by dumping the compiled bodies (`SLAG_DBG_BODY`), then
+ablating the arms with a throwaway release build. Two of the family's readings
+were misattributed:
+
+**`obj_prop` (`s = (s + o.x) | 0`) has no per-iteration member read.** The
+compiler hoists it: `Step::HoistMemberGuard` probes `o.x` in the preheader into a
+hidden slot and jumps to a *copy* of the loop that reads the slot. Ablating the
+whole `LeafOp::GetMemberNameLocal` arm (replacing its result with a constant,
+bytecode unchanged) moved the row by zero. The +19 ns/iter is the hoisted loop's
+*machine form*, not the read:
+
+| loop copy | body ops | `FastLoopBind` |
+| --- | --- | ---: |
+| `baseline` (no read, RMW fused) | `LoadCounter, BinReg, StoreReg, LoadReg, BinStoreInt` (5) | `num: Some(1)` |
+| `obj_prop` hoisted copy | `LoadCounter, BinReg, StoreReg, LoadReg, BinLeftReg, BinImm, StoreReg` (7) | `num: None` |
+
+`plan_loop_int` declined the fused `BinStoreInt` because the RHS comes from the
+hoisted slot, whose `IntProvenance` is unknown. The hoist's `numbers: true` guard
+proves *Number*, not *int*, and only for the invariant-RHS reduction
+(`plan.exprs`), never for a read slot. Consequence: **every loop that hoists an
+invariant read out of its arithmetic runs the unfused 7-op form** — a 63%
+overhead on the bare loop, in code that reads a config value per iteration.
+
+**`js_call` is dispatch-bound, not call-bound.** Its loop body is 8 step
+dispatches per iteration — `RunRegBody(3 ops), LoadLocal, LoadLocal,
+CallFastSlot, Binary, BinaryImm, FusedStoreLocal` — because the register lane
+stops at the call and the post-call tail cannot start a run (the lowering's
+operand stack is empty after a call). `baseline` is 2 dispatches
+(`RunRegBody(5 ops)` + `FastLoopHead`). The call machinery itself (slot leaf
+cell, leaf inline) is tight; the +57 ns is ~6 extra dispatches at ~5 ns plus the
+lost fusion.
+
+**A per-site shape-keyed member-read cache does not pay** (implemented, measured,
+reverted). The design: a `(map_id, name) -> in_fields slot` record per register
+op. Measured against a stashed baseline, alternating order, min-of-10-20:
+`objects/many_objects_read` -1.3%, `objects/proto_read` **+10.5%**,
+`objects/own_read` within its own ±7.5% band, `opcost/baseline` (no reads) -3%
+(layout noise). The 16-entry `(map_id, name)` map cell already serves
+shape-shared own-data reads; the per-site probe is a pure tax on chain reads,
+which no own-data cache can serve. Don't rebuild it without first making the
+chain read itself site-cacheable (receiver shape -> link shape -> link field).
+
+Remaining levers, in expected-value order:
+
+1. **Calls inside a register run.** `LeafOp::CallFastSlot` (args pushed from
+   frame slots, result into `acc`) would collapse `js_call`/`method_call`/
+   `map_get` loops to one dispatch. Blocked on the JIT: `emit_call` continues at
+   the *step* index (`fall_through(index)`), so an op inside a `RunRegBody`
+   would jump out of the run. Parameterize the continuation first.
+2. **Loop-plan parity for hoisted-read loops.** Give the hoist a Number/int
+   proof for the hoisted *read* slots and let `plan_loop_int` use it for a
+   guarded copy. Needs an int (not Number) proof level in `RegInt` to keep
+   `|0`'s int semantics.
+3. **Post-call tails.** A register run that starts with an operand already on
+   the machine stack (`Binary` after a call) would remove 3 more dispatches.
