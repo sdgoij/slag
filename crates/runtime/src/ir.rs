@@ -3268,6 +3268,39 @@ pub const GLOBAL_CELLS: usize = 256;
 /// path).
 pub(crate) const LEAF_CACHE: usize = 256;
 
+/// A cached same-stack record: everything `try_push_inline_call` reads out of
+/// the `ecma_functions` map, resolved once per body. A body enters this table
+/// only after passing every gate the lane needs (the record's resumable/class
+/// flags and `same_stack_eligible`), so an entry's presence IS the verdict —
+/// and function ids are never reused, so a hit needs no generation check, the
+/// same rule `leaf_cache` follows.
+#[derive(Clone)]
+pub(crate) struct SameStackEntry {
+    pub ir: std::rc::Rc<CompiledBody>,
+    pub environment: EnvRef,
+    pub realm: Handle<crate::realm::Realm>,
+    pub strict: bool,
+    /// The body's own text, which the frame this call pushes runs
+    /// ([`EcmaFunction::parse_text`]).
+    pub parse_text: Option<JsString>,
+}
+
+impl Trace for SameStackEntry {
+    fn trace(&self, visit: &mut dyn FnMut(GcAny)) {
+        // `ir` is native `Rc` data whose `Step` constants hold no GC edges (see
+        // `LeafEntry::trace`); the rest are handles.
+        self.environment.trace(visit);
+        self.realm.trace(visit);
+        self.parse_text.trace(visit);
+    }
+}
+
+/// The same-stack record cache: function id -> [`SameStackEntry`]. Sized like
+/// `LEAF_CACHE`, and for the same reason — a megamorphic recursion or call
+/// step must keep its callees' records live, or every call falls back to the
+/// HashMap this exists to skip.
+pub(crate) const SAME_STACK_CACHE: usize = 256;
+
 /// The direct-mapped installed-builtin handler cache (Cut 81): function id
 /// -> the agent-dependent builtin's native handler, populated lazily from
 /// the thread-local `BUILTIN_HANDLERS` registry on a miss. Registrations
@@ -7773,33 +7806,16 @@ impl Vm {
         if agent.realm_count.get() != 1 || agent.is_terminating() {
             return Ok(None);
         }
-        let (ir, old_env, realm, strict, parse_text) = {
-            let Some(data) = agent.ecma_function(&function.id()) else {
-                return Ok(None);
-            };
-            // Resumable and class-machinery bodies keep the funnel, which owns
-            // the iterator/promise and field-initializer context handling.
-            if data.is_generator
-                || data.is_async
-                || data.is_class_constructor
-                || data.class_field_initializer
-            {
-                return Ok(None);
-            }
-            let Some(ir) = data.ir.clone() else {
-                return Ok(None);
-            };
-            if !ir.same_stack_eligible() {
-                return Ok(None);
-            }
-            (
-                ir,
-                data.environment,
-                data.realm,
-                data.strict,
-                data.parse_text().cloned(),
-            )
+        let Some(entry) = agent.same_stack_lookup(function.id()) else {
+            return Ok(None);
         };
+        let (ir, old_env, realm, strict, parse_text) = (
+            entry.ir,
+            entry.environment,
+            entry.realm,
+            entry.strict,
+            entry.parse_text,
+        );
         let scope = ir.scope.as_ref().expect("a certified body has a scope");
         // OrdinaryCallBindThis (spec 10.2.1.1), resolved before any mutation so
         // a primitive receiver — which needs boxing, and thus allocation —

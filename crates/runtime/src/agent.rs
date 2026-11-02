@@ -418,6 +418,10 @@ pub(crate) type ScriptBodyKey = (crux::JsString, bool, bool, bool);
 /// record body's hot path needs.
 pub(crate) type LeafCacheCell = Option<(u64, crate::ir::LeafEntry)>;
 
+/// One same-stack record cell: the function id it was filled for plus the
+/// record the lane's frame push needs.
+pub(crate) type SameStackCell = Option<(u64, crate::ir::SameStackEntry)>;
+
 /// The agent's execution-context stack (spec 9.4).
 ///
 /// It lives in [`AgentRoots`] with the other containers the collector reads, so
@@ -808,6 +812,10 @@ pub(crate) struct AgentRoots {
     /// leaf call skips the `ecma_functions` HashMap lookup. Boxed per the
     /// Cut 27 lesson.
     pub(crate) leaf_cache: RefCell<Box<[LeafCacheCell; crate::ir::LEAF_CACHE]>>,
+    /// The same-stack record cache: function id → what `try_push_inline_call`
+    /// reads out of the `ecma_functions` record, so a hot recursive or plain
+    /// call skips the HashMap lookup. Boxed per the Cut 27 lesson.
+    pub(crate) same_stack_cache: RefCell<Box<[SameStackCell; crate::ir::SAME_STACK_CACHE]>>,
     /// The IC value cells, in the roots like the rest of the traced state.
     /// They are `Cell`s (not `RefCell`s): the payloads are `Copy`, so a read
     /// is a load and a write a store, with no borrow flag on the hot path.
@@ -1316,6 +1324,7 @@ impl AgentRoots {
             global_leaf_cells: RefCell::new(Box::new(std::array::from_fn(|_| None))),
             slot_leaf_cells: RefCell::new(Box::new(std::array::from_fn(|_| None))),
             leaf_cache: RefCell::new(Box::new(std::array::from_fn(|_| None))),
+            same_stack_cache: RefCell::new(Box::new(std::array::from_fn(|_| None))),
             member_value_cells: std::array::from_fn(|_| {
                 Cell::new(crate::ir::MemberValueCell::empty())
             }),
@@ -1518,6 +1527,9 @@ impl Trace for AgentRoots {
             cell.trace(visit);
         }
         for (_, entry) in self.leaf_cache.borrow().iter().flatten() {
+            entry.trace(visit);
+        }
+        for (_, entry) in self.same_stack_cache.borrow().iter().flatten() {
             entry.trace(visit);
         }
         // The IC value caches hold Values; the index-only caches re-resolve
@@ -2879,6 +2891,60 @@ impl Agent {
             construct_inline,
         };
         self.roots.leaf_cache.borrow_mut()[index] = Some((id, entry.clone()));
+        Some(entry)
+    }
+
+    /// The same-stack record for `id`: a direct-mapped cache over the
+    /// `ecma_functions` map, so the interpreter's withdrawn-call lane skips a
+    /// HashMap lookup per call (the same shape as [`Self::leaf_lookup`]). A
+    /// miss resolves the record and caches it only when the body passes every
+    /// gate the lane needs, so a hit is the whole verdict; ids are never
+    /// reused, so a hit needs no generation check.
+    pub(crate) fn same_stack_lookup(&mut self, id: u64) -> Option<crate::ir::SameStackEntry> {
+        let index =
+            id.wrapping_mul(0x9E37_79B9_7F4A_7C15) as usize & (crate::ir::SAME_STACK_CACHE - 1);
+        let cached = {
+            let cells = self.roots.same_stack_cache.borrow();
+            match cells[index].as_ref() {
+                Some((cached_id, entry)) if *cached_id == id => Some(entry.clone()),
+                _ => None,
+            }
+        };
+        if let Some(entry) = cached {
+            return Some(entry);
+        }
+        let (ir, environment, realm, strict, parse_text) = {
+            let data = self.ecma_function(&id)?;
+            // Resumable and class-machinery bodies keep the pooled funnel,
+            // which owns the iterator/promise and field-initializer context
+            // handling.
+            if data.is_generator
+                || data.is_async
+                || data.is_class_constructor
+                || data.class_field_initializer
+            {
+                return None;
+            }
+            let ir = data.ir.clone()?;
+            if !ir.same_stack_eligible() {
+                return None;
+            }
+            (
+                ir,
+                data.environment,
+                data.realm,
+                data.strict,
+                data.parse_text().cloned(),
+            )
+        };
+        let entry = crate::ir::SameStackEntry {
+            ir,
+            environment,
+            realm,
+            strict,
+            parse_text,
+        };
+        self.roots.same_stack_cache.borrow_mut()[index] = Some((id, entry.clone()));
         Some(entry)
     }
 
