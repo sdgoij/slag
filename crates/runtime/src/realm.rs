@@ -562,6 +562,7 @@ impl Intrinsics {
                 .or_else(|| crate::builtins::json::handler_for(name))
                 .or_else(|| crate::generator::handler_for(name))
                 .or_else(|| crate::async_generator::handler_for(name))
+                .or_else(|| crate::builtins::promise::handler_for(name))
         {
             crate::function::register_builtin_handler(function.id(), handler);
         }

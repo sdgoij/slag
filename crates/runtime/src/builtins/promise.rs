@@ -478,6 +478,30 @@ fn promise_construct(
     promise_constructor(agent, args, new_target)
 }
 
+/// The call handler `Intrinsics::define` registers for the promise builtins,
+/// so a call dispatches through the O(1) `builtin_handler` registry instead of
+/// walking the identity chain.
+pub(crate) fn handler_for(name: &str) -> Option<crate::function::BuiltinHandler> {
+    Some(match name {
+        "%Promise.prototype.then%" => {
+            promise_then as fn(&mut Agent, &Value, &[Value]) -> Result<Value, JsError>
+        }
+        "%Promise.prototype.catch%" => promise_catch,
+        "%Promise.prototype.finally%" => promise_finally_method,
+        "%Promise.resolve%" => promise_static_resolve,
+        "%Promise.reject%" => promise_static_reject,
+        "%Promise.all%" => promise_all,
+        "%Promise.allSettled%" => promise_all_settled,
+        "%Promise.allKeyed%" => promise_all_keyed,
+        "%Promise.allSettledKeyed%" => promise_all_settled_keyed,
+        "%Promise.any%" => promise_any,
+        "%Promise.race%" => promise_race,
+        "%Promise.withResolvers%" => promise_with_resolvers,
+        "%Promise.try%" => promise_try,
+        _ => return None,
+    })
+}
+
 /// The Promise Resolve/Reject Function algorithm (spec 27.2.1.3.2).
 fn dispatch_resolver(
     agent: &mut Agent,

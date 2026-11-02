@@ -2468,7 +2468,7 @@ fn builtin_dispatch_at(
     args: &[Value],
 ) -> Option<Result<Value, JsError>> {
     match index {
-        1 => crate::builtins::function::dispatch_call(agent, callee, this, args),
+        1 => crate::builtins::promise::dispatch_call(agent, callee, this, args),
         2 => crate::builtins::object::dispatch_call(agent, callee, this, args),
         3 => crate::builtins::array::dispatch_call(agent, callee, this, args),
         4 => crate::builtins::typed_array::dispatch_call(agent, callee, this, args),
@@ -2487,7 +2487,7 @@ fn builtin_dispatch_at(
         17 => crate::builtins::string::dispatch_call(agent, callee, this, args),
         18 => crate::builtins::regexp::dispatch_call(agent, callee, this, args),
         19 => crate::builtins::weakref::dispatch_call(agent, callee, this, args),
-        20 => crate::builtins::promise::dispatch_call(agent, callee, this, args),
+        20 => crate::builtins::function::dispatch_call(agent, callee, this, args),
         21 => crate::async_await::dispatch_resume(agent, callee, args),
         22 => crate::async_await::dispatch_async_from_sync(agent, callee, args),
         23 => crate::generator::dispatch_call(agent, callee, this, args),
