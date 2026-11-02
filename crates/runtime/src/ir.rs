@@ -2007,6 +2007,12 @@ pub struct CompiledBody {
     /// the interpreter's nested-call carve consults (both are pure functions of
     /// the step list, so they are computed once instead of scanned per call).
     pub nested_gate: std::cell::Cell<Option<(bool, bool)>>,
+    /// Cached `same_stack_eligible` verdict: the gate is a pure function of the
+    /// step list (`env_constant` and `scope` are fixed at compile time), and it
+    /// is consulted on every withdrawn call to this body. Recomputing it means
+    /// three full step scans per call — hundreds of nanoseconds per recursive
+    /// call on a hot body.
+    pub same_stack_gate: std::cell::Cell<Option<bool>>,
     /// Stage O: the per-site feedback store (`.notes/optimizing-tier-plan.md`),
     /// keyed by step index. Allocated lazily and only when the probe
     /// (`SLAG_FEEDBACK`) is enabled, so a default build allocates nothing.
@@ -2272,13 +2278,18 @@ impl CompiledBody {
     /// - no `using` binding — the pop skips `dispose_env_resources`, which is
     ///   exact only when the body binds no disposable.
     pub(crate) fn same_stack_eligible(&self) -> bool {
-        self.env_constant
+        if let Some(verdict) = self.same_stack_gate.get() {
+            return verdict;
+        }
+        let verdict = self.env_constant
             && self.nested_call_eligible()
             && !self.touches_semantic_control()
             && !self
                 .steps
                 .iter()
-                .any(|step| matches!(step, Step::UsingInit { .. }))
+                .any(|step| matches!(step, Step::UsingInit { .. }));
+        self.same_stack_gate.set(Some(verdict));
+        verdict
     }
 
     /// Stage O count probe: record the member read at step `ip` whose receiver
@@ -27340,6 +27351,7 @@ pub fn compile_body(
             has_call_intrinsic,
             max_stack,
             nested_gate: std::cell::Cell::new(None),
+            same_stack_gate: std::cell::Cell::new(None),
             feedback: std::cell::RefCell::new(None),
         },
         compiler.this_writes,
@@ -27427,6 +27439,7 @@ pub fn compile_statements(
         has_call_intrinsic,
         max_stack,
         nested_gate: std::cell::Cell::new(None),
+        same_stack_gate: std::cell::Cell::new(None),
         feedback: std::cell::RefCell::new(None),
     })
 }
