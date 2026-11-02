@@ -16052,3 +16052,16 @@ rejected by `lower_step` (only re-readable operands duplicate), which keeps
 step path. Spilling the accumulator to a scratch slot and duplicating the
 slot would lift that in ~15 lines, but no corpus row uses the shape, so it is
 an unmeasured real-world bet.
+## MEASURED (2026-11-02): the intrinsic register op does not pay
+
+Tried `LeafOp::CallIntrinsic` (the last call-shaped step, `m.get(k)` /
+`arr.indexOf(k)` in a loop) with all three implementations — interpreter arm,
+baseline lowering, and the optimizing tier's lift — and measured it neutral:
+jitless within +-2% on map_get/set_has/array_at/array_indexof/num_valueof/
+string_indexof, JIT mode within +-2.7% on the same rows. The bodies do
+collapse to one dispatch (the shape is as expected), so those rows are simply
+not dispatch-bound. Reverted rather than carrying a third copy of the
+intrinsic lowering for nothing.
+
+That closes the call-shaped work: the frame-slot form, the stack form, and
+their JIT tier coverage are in; the intrinsic form is measured and declined.
