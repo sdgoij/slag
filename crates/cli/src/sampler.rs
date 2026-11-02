@@ -11,8 +11,10 @@
 //!
 //! `tools/profile.py` turns those into function names with
 //! `llvm-symbolizer`, so the binary needs no symbol handling of its own. A
-//! sample outside the executable's image is a compiled (JIT) body, reported
-//! as `outside`.
+//! sample outside the executable's image is code in another module — the
+//! system heap, a C runtime's `memcpy`, JIT-generated code — and is counted
+//! per containing module (see `profile outside <module> <count>`), because
+//! "outside" on its own says only that the engine's own code is not running.
 //!
 //! The reading is a flat self-time share: it answers "which function is
 //! running", not "which caller is paying". That is the question a
@@ -77,6 +79,8 @@ mod imp {
     const THREAD_QUERY_INFORMATION: u32 = 0x0040;
     // `CONTEXT_CONTROL` on AMD64 (`CONTEXT_AMD64 | 0x1`).
     const CONTEXT_CONTROL: u32 = 0x0010_0001;
+    const GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS: u32 = 0x0000_0004;
+    const GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT: u32 = 0x0000_0002;
 
     #[link(name = "kernel32")]
     unsafe extern "system" {
@@ -88,6 +92,8 @@ mod imp {
         fn CloseHandle(object: Handle) -> i32;
         fn Sleep(millis: u32);
         fn GetModuleHandleW(name: *const u16) -> Handle;
+        fn GetModuleHandleExW(flags: u32, address: *const u16, module: *mut Handle) -> i32;
+        fn GetModuleFileNameW(module: Handle, name: *mut u16, size: u32) -> u32;
     }
 
     #[link(name = "winmm")]
@@ -122,12 +128,16 @@ mod imp {
         worker: Option<JoinHandle<Histogram>>,
     }
 
-    /// `Self`-time histogram: image offset -> samples, plus the samples that
-    /// landed outside the executable (JIT-generated code).
+    /// `Self`-time histogram: image offset -> samples, plus the raw addresses of
+    /// the samples that landed outside the executable. Those are resolved to a
+    /// module only when the profile is printed: the loader's API deadlocks if a
+    /// sampling thread calls it while the engine thread — which may be inside a
+    /// load — is suspended.
     pub struct Histogram {
         pub samples: u64,
         pub outside: u64,
         pub by_offset: HashMap<u64, u64>,
+        pub outside_rips: HashMap<usize, u64>,
     }
 
     impl Sampler {
@@ -188,6 +198,7 @@ mod imp {
             samples: 0,
             outside: 0,
             by_offset: HashMap::new(),
+            outside_rips: HashMap::new(),
         };
         let interval = Duration::from_micros(interval_micros);
         let mut deadline = Instant::now();
@@ -202,6 +213,7 @@ mod imp {
                         *histogram.by_offset.entry((rip - base) as u64).or_insert(0) += 1;
                     } else {
                         histogram.outside += 1;
+                        *histogram.outside_rips.entry(rip).or_insert(0) += 1;
                     }
                 }
                 unsafe { ResumeThread(handle) };
@@ -225,6 +237,29 @@ mod imp {
         }
         unsafe { CloseHandle(handle) };
         histogram
+    }
+
+    /// The `(file name, address - module base)` of the module containing
+    /// `address` (`("<unknown>", 0)` when no loaded module owns it).
+    fn module_of(address: usize) -> (String, usize) {
+        // SAFETY: both calls only read module metadata for a live address; the
+        // temporary `Handle` is never used as a reference.
+        unsafe {
+            let mut module: Handle = std::ptr::null_mut();
+            let flags = GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS
+                | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT;
+            if GetModuleHandleExW(flags, address as *const u16, &mut module) == 0 {
+                return ("<unknown>".to_string(), 0);
+            }
+            let mut buffer = [0u16; 260];
+            let len = GetModuleFileNameW(module, buffer.as_mut_ptr(), buffer.len() as u32) as usize;
+            let name = String::from_utf16_lossy(&buffer[..len.min(buffer.len())]);
+            let file = match name.rsplit(['\\', '/']).next() {
+                Some(file) if !file.is_empty() => file.to_string(),
+                _ => "<unknown>".to_string(),
+            };
+            (file, address.wrapping_sub(module as usize))
+        }
     }
 
     /// The loaded image's `SizeOfImage`, read from its own PE header.
@@ -265,6 +300,18 @@ mod imp {
         rows.sort_by(|a, b| b.1.cmp(a.1));
         for (offset, count) in rows {
             eprintln!("profile 0x{offset:x} {count} {:.2}", shared(*count));
+        }
+        let mut modules: HashMap<(String, usize), u64> = HashMap::new();
+        for (rip, count) in &histogram.outside_rips {
+            *modules.entry(module_of(*rip)).or_insert(0) += count;
+        }
+        let mut modules: Vec<(&(String, usize), &u64)> = modules.iter().collect();
+        modules.sort_by(|a, b| b.1.cmp(a.1));
+        for ((module, offset), count) in modules {
+            eprintln!(
+                "profile outside {module} 0x{offset:x} {count} {:.2}",
+                shared(*count)
+            );
         }
         eprintln!("profile end");
     }
