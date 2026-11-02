@@ -5679,6 +5679,66 @@ mod tests {
         );
     }
 
+    /// The register lane's call op (`LeafOp::CallFastSlot`): a loop body whose
+    /// call sits between register ops runs as one `RunRegBody` dispatch
+    /// instead of a step per argument/operand. The op runs the call to
+    /// completion (a run has no resume point for a withdrawn activation), so
+    /// the shapes below cover the leaf-inline callee, the general callee that
+    /// withdraws, a throwing callee, and a live accumulator value under the
+    /// argument list.
+    #[test]
+    fn register_lane_calls_lower_and_match_the_interpreter() {
+        let source = "function f(g, n) { var s = 0; for (var i = 0; i < n; i++) { s = (s + g(i)) | 0; } return s; }";
+        let mut agent = Agent::new();
+        agent.initialize_host_defined_realm().unwrap();
+        agent.run_script(source).unwrap();
+        let ir = compiled_body_of(&mut agent, "f");
+        assert!(
+            ir.steps.iter().any(|step| matches!(
+                step,
+                crate::ir::Step::RunRegBody { ops }
+                    if ops
+                        .iter()
+                        .any(|op| matches!(op, crate::ir::LeafOp::CallFastSlot { .. }))
+            )),
+            "a frame-slot call inside a loop body must lower into the register run"
+        );
+        // The leaf-inline callee: the loop's own result.
+        assert_eq!(
+            run("function f(g, n) { var s = 0; for (var i = 0; i < n; i++) { s = (s + g(i)) | 0; } return s; } f(function (x) { return x + 1; }, 5)")
+                .unwrap(),
+            Value::Number(15.0)
+        );
+        // The callee withdraws (it is not a leaf: it contains its own loop and
+        // a `try`), so the op completes the activation in place.
+        assert_eq!(
+            run("function f(g, n) { var s = 0; for (var i = 0; i < n; i++) { s = (s + g(i)) | 0; } return s; } f(function (x) { var t = 0; for (var j = 0; j < 3; j++) { try { t = t + j; } catch (e) { t = -1; } } return t + x; }, 4)")
+                .unwrap(),
+            Value::Number(18.0)
+        );
+        // A live accumulator value under the argument list (the left operand
+        // of the add) survives the call: it is spilled to a scratch slot.
+        assert_eq!(
+            run("function f(g, o, n) { var s = 0; for (var i = 0; i < n; i++) { s = (s + (o.x + g(i))) | 0; } return s; } f(function (x) { return x * 10; }, { x: 3 }, 3)")
+                .unwrap(),
+            Value::Number(39.0)
+        );
+        // A throwing callee's error reaches the loop's own handler with the
+        // iteration's earlier state intact.
+        assert_eq!(
+            run("function f(g, n) { var s = 0; for (var i = 0; i < n; i++) { try { s = s + g(i); } catch (e) { return s + e; } } return s; } f(function (x) { if (x === 2) { throw 100; } return x; }, 10)")
+                .unwrap(),
+            Value::Number(101.0)
+        );
+        // A getter callee (the call runs user code that allocates and can
+        // observe the caller's frame slots only through captured bindings).
+        assert_eq!(
+            run("function f(g, n) { var s = 0; for (var i = 0; i < n; i++) { s = (s + g(i)) | 0; } return s; } var obj = { v: 0, get next() { this.v = this.v + 1; return this.v; } }; f(function (x) { return x + obj.next; }, 4)")
+                .unwrap(),
+            Value::Number(16.0)
+        );
+    }
+
     #[test]
     fn fast_path_nested_context_chain() {
         // Cut 3 continuation (nested context chains): a certified closure's

@@ -10691,6 +10691,38 @@ impl<'a> Lowerer<'a> {
                 let bits = self.acc_bits();
                 self.push(bits);
             }
+            LeafOp::PushReg { slot, tdz } => {
+                // The register lane's argument materialization: the frame
+                // slot lands on the value stack without touching the
+                // accumulator (a live accumulator value under the argument
+                // list survives).
+                let bits = self.load_slot(*slot);
+                if *tdz {
+                    self.emit_tdz_check(bits)?;
+                }
+                self.push(bits);
+            }
+            LeafOp::CallFastSlot {
+                callee_slot,
+                argc,
+                span: _,
+            } => {
+                // `Step::CallFastSlot`'s lowering, minus the fall-through: the
+                // call's continuation is the NEXT OP of this register run, not
+                // the next step, so `emit_call` leaves the builder on its
+                // merge block (sp restored to the region under the arguments,
+                // the result pushed) and the run keeps emitting.
+                let sp = self.builder.use_var(self.sp_var);
+                let args_ptr = self.builder.ins().iadd_imm_s(sp, -((*argc as i64) * 8));
+                let callee = self.load_slot(*callee_slot);
+                let this = self.builder.ins().iconst(types::I64, self.undef_bits);
+                let argc_imm = self.builder.ins().iconst(types::I64, i64::from(*argc));
+                self.emit_call(
+                    step, callee, this, args_ptr, argc_imm, args_ptr, false, false,
+                )?;
+                let result = self.pop();
+                self.set_acc_bits(result);
+            }
             LeafOp::BinRemConst { divisor } => {
                 // A proven-integral `% <const>`: the spec's `fmod` is the
                 // truncated integer remainder, so an `srem` is exact for

@@ -1608,6 +1608,26 @@ pub enum LeafOp {
     /// value back via `BinAccPop`. The push/pop pairs balance inside the
     /// body; every caller truncates the stack on completion or error.
     PushAcc,
+    /// Push the frame slot's value onto the value stack — the argument
+    /// materialization in front of a register-lane call. Unlike a
+    /// `LoadReg` + `PushAcc` pair it leaves the accumulator alone, so a live
+    /// accumulator value under the argument list survives; `tdz` mirrors
+    /// `LoadLocal`'s uninitialized-binding check.
+    PushReg { slot: usize, tdz: bool },
+    /// acc = `frame[callee_slot](argc stack values)` — the register form of
+    /// `Step::CallFastSlot`. The step form leaves its result on the value
+    /// stack for the next step to consume; the register form lands it in the
+    /// accumulator, so the rest of the run continues without a dispatch.
+    ///
+    /// The call runs to completion inside the op. A run has no resume point,
+    /// so a withdrawn activation (`PendingCall`) cannot be handed to the
+    /// driver the way a call step's is — the driver would resume at the next
+    /// step and drop the rest of the run — and is performed in place instead.
+    CallFastSlot {
+        callee_slot: usize,
+        argc: u8,
+        span: crux::Span,
+    },
     /// acc = pop() op acc — the spilled left operand combined with the
     /// accumulator right operand (a body that spilled the first operand of
     /// a binary while computing the second).
@@ -13455,6 +13475,32 @@ impl Vm {
                     self.acc = self.get_member_computed(agent, object, key)?;
                 }
                 LeafOp::PushAcc => self.stack.push(self.acc),
+                LeafOp::PushReg { slot, tdz } => {
+                    let value = *self.frame_get(*slot);
+                    if *tdz && value.is_uninitialized() {
+                        return Err(JsError::new(
+                            ErrorKind::ReferenceError,
+                            "Cannot access a binding before initialization".into(),
+                        ));
+                    }
+                    self.stack.push(value);
+                }
+                LeafOp::CallFastSlot {
+                    callee_slot,
+                    argc,
+                    span,
+                } => {
+                    self.set_site(agent, *span);
+                    self.do_call_fast_slot(agent, *callee_slot, None, *argc as usize)?;
+                    // A run owns no resume point: a withdrawn activation is
+                    // performed here, because the driver's protocol
+                    // (`VmOutcome::Call`) resumes at the next STEP and would
+                    // skip the rest of this run.
+                    if let Some(pending) = self.pending_call.take() {
+                        self.complete_call(agent, pending)?;
+                    }
+                    self.acc = self.pop();
+                }
                 LeafOp::BinAccPop { op } => {
                     let left = self.pop();
                     self.acc = Self::binary_inline(agent, *op, &left, &self.acc)?;
@@ -24672,12 +24718,12 @@ pub fn max_stack_usage(steps: &[Step]) -> usize {
             Step::UpdateSuperComputed { .. } => depth = depth.saturating_sub(2),
             Step::DeleteSuper | Step::ResolveSuperRefName { .. } => {}
             Step::ResolveSuperRefComputed => depth = depth.saturating_sub(2),
-            // The register body's transient pushes (each `PushAcc`) are
-            // unwound by the entry-depth truncate.
+            // The register body's transient pushes (each `PushAcc`/`PushReg`)
+            // are unwound by the entry-depth truncate.
             Step::RunRegBody { ops } => {
                 let transient = ops
                     .iter()
-                    .filter(|op| matches!(op, LeafOp::PushAcc))
+                    .filter(|op| matches!(op, LeafOp::PushAcc | LeafOp::PushReg { .. }))
                     .count();
                 max = max.max(depth + transient);
             }
@@ -25445,7 +25491,9 @@ fn leaf_op_touches_slot(op: &LeafOp, slot: usize) -> bool {
         | LeafOp::BinImmLocal { slot: s, .. }
         | LeafOp::BinCtxReg { slot: s, .. }
         | LeafOp::StoreMemberNameLocal { object_slot: s, .. }
-        | LeafOp::GetMemberNameLocal { object_slot: s, .. } => *s == slot,
+        | LeafOp::GetMemberNameLocal { object_slot: s, .. }
+        | LeafOp::PushReg { slot: s, .. } => *s == slot,
+        LeafOp::CallFastSlot { callee_slot, .. } => *callee_slot == slot,
         LeafOp::StoreMemberComputedLocal { object_slot, key } => {
             *object_slot == slot || operand(key)
         }
@@ -25553,7 +25601,8 @@ fn run_acc_is_number(ops: &[LeafOp], upto: usize, proven: &HashSet<usize>) -> bo
             | LeafOp::GetMemberName { .. }
             | LeafOp::GetMemberComputed { .. }
             | LeafOp::GetMemberNameLocal { .. }
-            | LeafOp::GetMemberComputedLocal { .. } => false,
+            | LeafOp::GetMemberComputedLocal { .. }
+            | LeafOp::CallFastSlot { .. } => false,
             _ => known,
         };
     }
@@ -26706,6 +26755,44 @@ fn lower_step(
                     ops.push(LeafOp::GetMemberComputed { key });
                 }
             }
+            stack.push(RegOperand::Acc);
+        }
+        Step::CallFastSlot { slot, argc, span } => {
+            // The register form of a frame-slot call. The arguments land on
+            // the machine stack (the callee reads them there) in source
+            // order, then the call op leaves its result in the accumulator.
+            // A live accumulator value below the call must move to a scratch
+            // slot first — the result overwrites the accumulator — and an
+            // argument the single-accumulator model cannot materialize (a
+            // post-increment write-back, an already spilled value) keeps the
+            // step path.
+            if !spill_live_acc(scope, ops, stack) {
+                return None;
+            }
+            let start = stack.len().checked_sub(*argc as usize)?;
+            let args = stack.split_off(start);
+            for arg in &args {
+                match arg {
+                    RegOperand::Reg { slot, tdz } => ops.push(LeafOp::PushReg {
+                        slot: *slot,
+                        tdz: *tdz,
+                    }),
+                    // Every other re-readable operand materializes through
+                    // the accumulator (nothing live holds it — the spill
+                    // above moved a live value to a scratch slot).
+                    _ => {
+                        if !load_operand(ops, arg.clone()) {
+                            return None;
+                        }
+                        ops.push(LeafOp::PushAcc);
+                    }
+                }
+            }
+            ops.push(LeafOp::CallFastSlot {
+                callee_slot: *slot,
+                argc: *argc,
+                span: *span,
+            });
             stack.push(RegOperand::Acc);
         }
         // A statement's completion is only read at the body's end, where
