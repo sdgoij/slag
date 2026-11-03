@@ -944,3 +944,64 @@ under both.
 item with a measured number of more than ~2% (`perf.md`, COSTED), and it is
 prerequisite to nothing else in this plan, so it can be dropped at C5.3 without
 leaving the engine half-migrated.
+
+### C5 correction (2026-11-03, measured while starting C5.3): the push is the site, and the chain cannot order
+
+Two facts found by reading and measuring the preconditions, before any C5.3
+code. Both invalidate the slice as written above.
+
+**1. The pushed context is also the current *site*.** `Vm::set_site` writes
+`position` on the **top context** every time a call or throw step runs
+(`ir.rs:12827`), and `frame_site` resolves that position against the context's
+own `source` to print `inner:3:10` (`api/stack_trace.rs:288`). So "drop the
+push and synthesize the frame from the chain" would lose every lane frame's
+line and column — the golden test added with C5.1
+(`a_same_stack_recursion_reports_every_level`) is exactly what would have
+caught it. Any replacement record must carry `function`, `position` **and** a
+source, not just the function.
+
+**2. `execution_context_stack` is the only structure that orders activations
+across Vms.** A lane callee can call a builtin that re-enters JavaScript on a
+*pooled* `Vm` (`Array.prototype.forEach`'s callback), which pushes its own
+context into the same stack. The global stack interleaves the two Vms
+correctly; a per-`Vm` `inline_calls` chain cannot place its levels among the
+other Vm's, because it does not know they exist. So C5.3's "contexts for
+non-lane activations + chain frames for lane levels" cannot be made exact —
+ordering, not content, is the obstacle.
+
+**Therefore C5.4 is not "remove the record" but "shrink it in place":** a
+`FrameEntry::Lane { function, position }` variant (~24 bytes) inside the same
+ordered stack, with the source resolved from the function's record when a
+trace is built. That preserves ordering and the site, and cuts the per-call
+write from 184 to ~24 bytes — but that is 160 of the ~672 bytes a call copies,
+i.e. **~2–3% of the call path, not the 5–8% estimated above**, and it still
+needs the `running_context()` audit (a Lane entry has no
+`lexical_environment`, so `running_context()` would answer with the caller's
+during a lane callee).
+
+**Verdict: stop at C5.1.** ~2–3% does not buy a redesign of the context stack
+plus the `running_context()` audit, and the two slices that were supposed to
+be free (C5.2's chain, C5.3's switch) no longer have a sound target. C5.1's
+seam stays: it is what any future frame source plugs into, and the golden test
+is the contract.
+
+### Where the 184 bytes actually are (the cheaper alternative, if anyone revisits)
+
+Measured with `size_of` on the field types:
+
+| field | bytes |
+|---|---|
+| `annex_b_hoistable: RefCell<HashSet<(u32,u32)>>` | **56** |
+| `source: Option<JsString>` | 48 |
+| `function: Option<Value>` | 16 |
+| `script_or_module: Option<ScriptOrModule>` | 16 |
+| `position: Option<Span>` | 12 |
+| realm + two envs + private env | 32 |
+
+`annex_b_hoistable` is a third of the struct and is an **empty** `HashSet` in
+every context except one that actually hoists an Annex B block-level function.
+Allocating it lazily (`Option<Box<…>>`) takes `ExecutionContext` from 184 to
+~136 bytes for every push — lane, script, module, async resumption — plus less
+to trace and to copy. It is worth ~1% on call-heavy rows, which is under this
+machine's noise floor, so it is recorded here rather than landed as an
+unmeasurable change.
