@@ -16133,21 +16133,51 @@ Cumulatively `calls/recursive_fib` went 569 -> 344 ms (−40%) across the four,
 and the corpus's `calls` family gap closed from ~21x to ~5x on node --jitless
 (whole-corpus geomeans are noise; treat the direction only).
 
-### What is left, and the one measurement that is still missing
+### What is left: three struct moves, and the one thing that crashed the machine
 
-- **~15% of the same-stack lane is `memmove` in VCRUNTIME140**, on blocks of
-  256 bytes to 8 KB. The sampler now reports the module *and offset* of an
-  outside sample (`profile outside VCRUNTIME140.dll 0x1c17b 192`), which is
-  how this was identified; no engine function in the profile calls a mem*
-  import, so the copy is reached some other way. `save_scratch`/`restore_scratch`
-  are the obvious suspects (`VmScratch` ~192 B, `InlineCallFrame` ~336 B, and
-  the frame round trip moves both), but taking `restore_scratch` by `&mut`
-  instead of by value measured neutral-to-negative (b_gen −1.5%, method_call
-  +4.4%, closure_capture +4.5%) and was reverted, so the copy is probably not
-  that one. A stack-walking sampler (or a `memcpy` hook) is the way to find it.
+- **The `memmove` is three struct moves per call, and the sizes name them.**
+  A sample inside the CRT's `memmove` has the copy size in `%r8`, so recording
+  `%r8` at each outside sample buckets the copies. A two-million-call recursion
+  shows exactly three sizes: **168, 184 and 320 bytes**, which are
+  `VmScratch`, `ExecutionContext` and `InlineCallFrame` (measured with
+  `size_of`). So each call writes the caller's scratch into the frame, the
+  frame into `inline_calls`, and a context onto the execution-context stack —
+  ~670 bytes of copying, ~11-16% of the call path. `Value` is 8 bytes, so the
+  frame is 40 Values' worth of state moved per call.
+- **Neither obvious restructuring paid, and both were reverted.** Taking
+  `restore_scratch` by `&mut` (so the scratch is read out of the frame instead
+  of copied out of it) measured −1.5% on the isolated bench but +4.4% on
+  `method_call` and +4.5% on `closure_capture`. Reading and dropping the frame
+  in place (`mem::take` + index + `truncate`) measured `recursive_fib` +4.3%
+  and the isolated bench +3.9%, reproduced twice. Both are consistent with the
+  optimiser already forwarding most of the frame round trip, so the remaining
+  cost is the *bytes written*, not the number of moves — which is what makes
+  the clobber mask below the right shape of fix rather than a copy-elision
+  exercise.
 - **`save_scratch` is 4-6% and `restore_scratch` ~1%** on their own. The
   structural fix is a callee-saved "clobber mask" per body — the callee's step
   list says which registers it can write, so the frame only has to carry those
   — which is a real redesign of the frame, not a slice.
 - **`builtin_handler::closure$0` was never that function.** It was the
   misattribution that the prof profile resolved.
+
+### Hazard: the sampler suspends the engine thread
+
+Two sampler runs hung hard enough to take this machine down twice. What the
+runs had in common: the sampler **suspends the engine thread**, and everything
+it does between the suspend and the resume has to be lock-free. The first hang
+was a stack-walking variant that called `RtlLookupFunctionEntry` — it takes the
+loader lock, which the suspended engine thread may hold. The second was left
+running with a deadlocked sampler thread *and* the engine thread still
+suspended, after the shell command timed out; the sampler's inter-sample loop
+busy-spins (`yield_now` under `timeBeginPeriod(1)`), so each orphan burned a
+core. Killing the engine binaries and rebuilding the git index fixed the tree;
+the crash had truncated `crates/runtime/src/ir.rs` to 1.5 MB of NUL bytes (a
+hard reset mid-write, not a clean exit).
+
+Rules for using it again: never call a loader/registry/heap API while the
+thread is suspended; bound every run with a watchdog that resumes the thread;
+never leave a sampler run to a shell timeout; and prefer the wall-clock A/B
+with a control row for anything that does not need the flat table. If the
+clobber mask lands, the sampler is not needed to justify it — the struct sizes
+above already size the work.
