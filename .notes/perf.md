@@ -16181,3 +16181,120 @@ never leave a sampler run to a shell timeout; and prefer the wall-clock A/B
 with a control row for anything that does not need the flat table. If the
 clobber mask lands, the sampler is not needed to justify it — the struct sizes
 above already size the work.
+
+## PROPOSED (2026-11-03): the per-call frame, sized before it is built
+
+The copies are now named (168 + 184 + 320 bytes per same-stack call), so the
+work can be sized instead of guessed. Three levers remain, in order of
+expected value. The estimate for each is `copy bytes removed / 672` scaled by
+the measured 11-16% share of the copies, applied to call-heavy rows.
+
+### 1. Do not push an ExecutionContext for a same-stack certified callee (~8-10%)
+
+`try_push_inline_call` pushes a 184-byte `ExecutionContext` per call — its two
+`EnvRef`s, the `realm` handle, the callee's `parse_text` (a 40-byte `JsString`
+in the `Small` shape), `annex_b_hoistable`, plus the `default()` and the drop on
+the way out. It exists for two readers: `enclosing_source` (a closure the body
+creates resolves its span against the body's text) and stack capture (a host
+that throws sees `at fib:1:26`).
+
+The leaf lane already runs a certified body with **no** context push, and its
+stack fidelity was verified when it landed (a throwing leaf callback still
+reports `at cbLeaf:2:62`). So the same-stack lane is the only one paying, and
+the two readers are the whole obstacle:
+- `enclosing_source` can read the running body's text off the frame chain
+  (`inline_calls` + `vm.current_function`'s record) instead of the context
+  stack — the lane already keeps exactly that chain, and `current_function` is
+  the callee's `Value`.
+- `capture_stack` walks `agent.roots.execution_context_stack` today. It would
+  need the interpreter's frame chain as a second source, or the lane would have
+  to synthesize the frames on demand (it has the body, the ip and the function
+  for each live level, which is everything a stack frame prints).
+
+Risk: error stacks are conformance-visible everywhere, so this needs the
+`test262 --lib` cluster plus explicit stack assertions (a throwing recursion,
+a throw inside a nested closure, `Function.prototype.toString` of a nested
+function) before any timing is trusted. Highest payoff of the three, and the
+only one that also removes handle traffic rather than bytes.
+
+### 2. A callee-saved clobber mask, with a compact frame (~4-5%)
+
+A frame exists to carry the caller's registers across the callee. If a callee's
+steps cannot write a register, the caller's value is still in the `Vm` when the
+callee returns — so it need not be saved at all. That is a callee-saved mask,
+and it is the only way to shrink the *distinct* data written per call: the
+copy-elision ceiling is 168 B (the intermediate scratch), and both attempts to
+collect it measured worse (see above), so nothing more is available on that
+axis.
+
+**Where the mask lives.** `CompiledBody` gains
+`clobber: ScratchMask` (a `u32` bit set over `ScratchReg`), computed in
+`compile_body` from the step list and invalidated by the same things that
+invalidate the body (it is derived from `steps`, so it is computed once at
+compile time beside `same_stack_eligible`).
+
+**How it is derived — default-deny.** The match is exhaustive over `Step`, and
+every variant not explicitly classified returns `ScratchMask::FULL`. A new
+`Step` variant therefore cannot silently lose a save: the match fails to
+compile until someone says what it writes. `Step::RunRegBody`/`RunLeafBody`
+report the union of their `LeafOp` writes, or `FULL`, whichever is cheaper to
+prove. The registers are `ip`, `acc`, `completion`(+`completion_is_empty`),
+`loop_counter`, `loop_num`, `builder`, `switch_disc`(+`_set`), `chain_short`,
+`globals_unshadowed`, `stack_len`, `array_index_len`, `var_ref_len`,
+`class_len`, `env_reset`. Three of them are effectively always set for a
+same-stack callee and belong in the frame unconditionally rather than in the
+mask: `ip`, `stack_len`, and `globals_unshadowed` (the lane itself writes it at
+entry).
+
+**The frame must shrink, or the mask buys nothing.** Writing only the masked
+fields into a fixed `VmScratch` still copies 320 bytes into `inline_calls`. So
+`InlineCallFrame`'s `scratch: VmScratch` becomes
+
+```rust
+enum SavedScratch {
+    Compact { mask: u32, values: [Value; 6] },  // 8 + 48
+    Full(Box<VmScratch>),                       // 8; only for bodies that report FULL
+}
+```
+
+`Value` is 8 bytes, so six slots hold the six common registers; a body whose
+mask does not fit falls to `Full`, which allocates — and that allocation is
+acceptable only because a body that reports `FULL` is the exception, and it is
+the *same* body every time (so it is measurable, not occasional). If the
+common case does not fit in six slots, the honest answer is that the mask is
+not worth it and this should be dropped rather than enlarged.
+
+**Restore.** Bits drive both directions, one `if` per bit, so both sides are
+straight-line and branch-predictable for a monomorphic call site.
+
+**Test.** A unit test that compiles a body per `Step` variant and asserts the
+mask is never smaller than the set of fields the step writes (the exhaustive
+match makes the *default* safe; the test pins the classifications that relax
+it), plus the corpus value parity and `test262 --lib`. The dangerous failure is
+silent: a missed write leaves the caller reading the callee's value, which
+shows up as a wrong number, not a crash.
+
+### 3. Take `Builder` out of `VmScratch` (~2-3%)
+
+`Builder` is 72 of `VmScratch`'s 168 bytes, and it is only live inside
+`s += x`/template steps. Making `Vm::builder` an `Option<Box<Builder>>` takes
+the scratch to ~104 B and the frame to ~256 B. This is JIT-visible: the
+compiled `LeafOp::BuilderAppend` inline path composes `VM_BUILDER_OFFSET +
+BUILDER_BUF_OFFSET`, so the boxed shape needs one extra load in
+`crates/jit/src/compiler.rs` and the `offset_of!` constants in
+`crates/runtime/src/jit.rs` must move behind the indirection. Cheap in the
+interpreter, and it must be A/B'd in **both** modes.
+
+### What is not worth doing
+
+Copy elision of the frame round trip. Measured twice, worse both times
+(`recursive_fib` +4.3%, `method_call` +4.4%): the optimiser already forwards
+most of it, and the bytes are inherent to recording the caller's state.
+
+### The honest ceiling
+
+No single remaining item exceeds ~10%, and the three above overlap (1 removes
+184 B, 2 removes ~100 B, 3 removes 64 B). Past that, the per-call protocol
+itself is the cost — which is the "one frame, not one Vm per call" plan in
+`.notes/call-frame-plan.md`, not a slice of it. If the goal is a step change
+rather than 3-10%, that plan is the only route in this file.
