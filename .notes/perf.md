@@ -16482,3 +16482,42 @@ Neither is a 20-minute slice, so this is recorded rather than started: the
 enum cache needs the accessor/proxy gate designed first, and the atom cache
 wants the site count (`Handle::new` appears 578 times) audited before it is
 assumed to pay anywhere but here.
+
+## LANDED (2026-11-03): `Object.keys` at node speed, from an enumerable-key cache
+
+The builtins survey above sized the row: `Object.keys` ~590 ns per call on a
+6-key object against node's ~120, spent on one `Vec<PropertyKey>`, six
+own-descriptor re-reads, six 48-byte `JsString` clones out of the lookup memo,
+six GC string allocations, two intermediate vectors and the array.
+
+Landed: a direct-mapped cell in `AgentRoots` keyed by (object id, generation)
+holding the enumerable own string keys as ready-made `Value`s, traced through
+the cell because they live in a Rust-heap `Rc` the collector cannot see. The
+gate is `JsObject::own_string_props`, which already refuses every kind whose
+keys are not its stored property vector (proxy, typed array, module namespace,
+array, string wrapper, host object); a generation mismatch refills. The result
+array is still built fresh, as the API requires — only the *keys* are shared,
+which is unobservable because strings are immutable and primitives have no
+identity.
+
+Why `keys` and not `values`/`entries`: `EnumerableOwnProperties` re-reads each
+descriptor because a getter for an earlier key may hide a later one, and a
+cached enumerability verdict would break
+`getter-making-future-key-nonenumerable`. Reading keys runs no user code at
+all, so nothing can mutate the object between the validation and the array
+build — the re-read cannot change its answer.
+
+Measured (jitless, min-of-10, alternating, previous commit): `Object.keys`
+alone 15.02 → 5.06 ms (**−66%**, ~590 → ~110 ns/call against node's ~120), the
+`builtins/object_keys` corpus row 62.4 → **50.9 ms (−18.4%)**, controls flat
+(`map_churn` +0.5%, `set_churn` −1.8%, `json_roundtrip` −1.7%). Pinned by a
+test covering ordering, add/delete/enumerability invalidation and the
+proxy/string/array/typed-array fallbacks; workspace, `test262 --lib` and the
+corpus parity check all green.
+
+Still open in the family, in value order: `Object.entries` (~1420 ns/call, six
+pair arrays — the key list could come from this cache while the per-key
+enumerability re-read stays), the atom → `Value` string cache (~10% here and
+anywhere an atom becomes a JS string), and `for-in`'s per-iteration fresh
+binding (16.75× on the largest row in the corpus, but that is environment
+machinery, not enumeration).
