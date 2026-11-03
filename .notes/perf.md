@@ -16298,3 +16298,74 @@ No single remaining item exceeds ~10%, and the three above overlap (1 removes
 itself is the cost — which is the "one frame, not one Vm per call" plan in
 `.notes/call-frame-plan.md`, not a slice of it. If the goal is a step change
 rather than 3-10%, that plan is the only route in this file.
+
+## COSTED (2026-11-03): the call-frame plan is ~70% landed, and its perf win is banked
+
+Asked to cost `.notes/call-frame-plan.md` against today's numbers. The
+answer changes the recommendation, so it is recorded before any stage is
+started: every stage that had a measurable call-cost win has been landed or
+probed, and what is left is architecture and correctness with a measured
+payoff near zero.
+
+### Ledger (what the plan itself records)
+
+| stage | status | measured |
+|---|---|---|
+| C0 (frame/working region on `vm.stack`; private JIT buffer retired) | **landed** (C0a–C0d, 2026-10-04) | none by design (substrate) |
+| C1 (re-entrant certified frames + call-site verdict) | **landed** C1a–C1c | jit `non-leaf call` 7.41 → ~5.5 ms (1.35×) |
+| C2 (construct on the frame) | C2a landed; **C2b declined** | double eligibility scan removed (128 → ~111 ms/500k); the rest is not cacheable |
+| C3a (uniform nested frame for the interpreter call) | **probed negative, reverted** | `recursive_fib` +10–15% **slower** |
+| C3.1 (control watermarks on 13 stacks) | **probed, declined, reverted** | −2.6% vs C3.2 |
+| C3.2 (frame carve + gate cache) | **landed** | `closure capture` −8%, `apply_call` −4.6%, `direct_leaf` −3.3% |
+| C3.3 (per-frame registers / locals rewrite / clobber mask) | **probed, declined** | 0–2% ceiling; the plan says *do not attempt either this or the mask* |
+| C3.4 (retire `take_vm` from `complete_call`) | **dead** | C3a measured its premise false; it needs C3.1 + C3.3, both declined |
+| C4 (args in the frame; retire `Vm::args` + the adaptor) | not started | no measured target in the plan |
+| C5 (exception/stack-walk/`Error.stack`/GC over the frame chain) | not started | correctness net; ~0 perf |
+
+### Cost of what remains
+
+Effort is in working sessions, calibrated from the plan's own history (C0 took
+four sub-steps including one reverted for heap corruption; C3a, C3.1 and C3.3
+were each a session that ended in a revert).
+
+- **C4 — 3–5 sessions, high risk, unknown (small) gain.** It retires
+  `Vm::args` and the truncating adaptor, so it touches the unmapped-`arguments`
+  object, `ArgsBase`/`ArgsPush`/`ArgsSpread`, spread calls (`call_vector`'s
+  unbounded extend, which C0 explicitly cannot reserve) and the compiled arg
+  passing. The plan's own target line is "arg-heavy rows; no parity change" —
+  there is no measured number to chase, and the arguments object's semantics
+  are conformance-visible. **Do not start this as a perf change**; start it only
+  if something else needs args-in-frame.
+- **C5 — 2–4 sessions, medium-high risk, ~0 gain.** It is the net under
+  everything else. It is also the *dependency* for the one remaining perf lever
+  (below), which is what makes it worth doing at all now.
+- **C3.4 — 0.** Its premise (the pooled `Vm` is the cost) was measured false by
+  C3a, and the two stages it needs were declined on measurement. Treat it as
+  closed, not pending.
+
+So finishing the plan as written is **5–9 sessions, mostly correctness, with no
+measured call-cost gain** — and the parts of it that were supposed to deliver
+the gain have each been tried and recorded.
+
+### What that implies for the next slice
+
+The plan's perf claim was "one frame push and nothing per-activation is
+copied". Today's measurement says the per-activation copying that remains is
+the three struct moves (168 + 184 + 320 bytes, above), and the plan's own
+C3.3 ablation (skip seven of ten register slots) measured that block at noise.
+
+That leaves exactly one item with a credible number left, and it is **not** a
+mask: the `ExecutionContext` push, 184 bytes plus three handle increments and
+a drop, ~5–8% of the call path (4.1% of it is the copy alone). It is also
+**C5-dependent**: dropping the push needs stack capture and `enclosing_source`
+to read the lane's frame chain instead of the context stack. So the honest
+ordering is C5 → drop the push, not mask → mask → construct.
+
+### Correction to the proposals above
+
+The clobber-mask entry claims ~4–5%; that over-credited it. Its copy-exact
+share is 100 of 672 bytes ≈ 2%, and the plan's C3.3 ablation already measured
+the register block at noise on this workload. Treat the mask as **~2%, and
+already probed-and-declined once** — the plan's C3.3 verdict stands unless a
+measurement contradicts it, and none does. The `Builder`-boxing entry is ~1.4%
+by the same arithmetic, not 2–3%.
