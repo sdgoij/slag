@@ -880,8 +880,8 @@ fn run_jit_benchmarks() -> Result<(), u8> {
     println!("slag {VERSION} JIT vs interpreter micro-benchmarks");
     println!("(ratio < 1 means the JIT is faster; ~1 means the body did not JIT)");
     for (name, source) in benchmarks {
-        let (interp, interp_result) = bench_once(source, false, Some(SAMPLE_FLOOR))?;
-        let (jit, jit_result) = bench_once(source, true, Some(SAMPLE_FLOOR))?;
+        let (interp, interp_result, _) = bench_once(source, false, Some(SAMPLE_FLOOR))?;
+        let (jit, jit_result, _) = bench_once(source, true, Some(SAMPLE_FLOOR))?;
         let ratio = jit.as_secs_f64() / interp.as_secs_f64();
         let agrees = interp_result == jit_result;
         if agrees {
@@ -922,11 +922,17 @@ fn run_corpus(dir: &std::path::Path, jit: bool) -> Result<(), u8> {
             .map(|rel| rel.display().to_string())
             .unwrap_or_else(|_| path.display().to_string())
             .replace('\\', "/");
-        let (elapsed, result) = bench_once(&source, jit, Some(TIMING_FLOOR))?;
+        let (elapsed, result, steps_per_call) = bench_once(&source, jit, Some(TIMING_FLOOR))?;
         let ms = elapsed.as_secs_f64() * 1000.0;
         match result {
             Some(value) => println!("bench\t{mode}\t{name}\t{ms}\t{value}"),
             None => println!("bench\t{mode}\t{name}\t{ms}\tNA"),
+        }
+        // The step census is its own line so the bench table's parser (which
+        // keys on the `bench` tag) is unaffected. Off unless the crate was
+        // built with `--features step-stats`.
+        if runtime::step_stats::enabled() {
+            println!("steps\t{mode}\t{name}\t{steps_per_call}");
         }
     }
     // Temporary helper instrument: one process runs exactly one mode over one
@@ -1029,7 +1035,7 @@ fn bench_once(
     source: &str,
     jit: bool,
     batch_target: Option<std::time::Duration>,
-) -> Result<(std::time::Duration, Option<f64>), u8> {
+) -> Result<(std::time::Duration, Option<f64>, f64), u8> {
     const WARMUP: u32 = 2;
     const TIMED: u32 = 3;
     // A batch-size cap so a pathological (closed-form-folded) workload
@@ -1131,6 +1137,7 @@ fn bench_once(
     // pressure the previous timed calls' garbage creates on allocation-heavy
     // rows like the rope builds).
     let mut best = f64::INFINITY;
+    let steps_before = runtime::step_stats::steps();
     for _ in 0..TIMED {
         let start = Instant::now();
         for _ in 0..reps {
@@ -1141,7 +1148,18 @@ fn bench_once(
             best = per_call;
         }
     }
-    Ok((std::time::Duration::from_secs_f64(best), value.as_number()))
+    // Steps per call over the SAME window as the timed samples, so a caller
+    // that reports a row's time also reports the step count that time covers.
+    let steps_per_call = if runtime::step_stats::enabled() {
+        (runtime::step_stats::steps() - steps_before) as f64 / (TIMED as u64 * reps) as f64
+    } else {
+        0.0
+    };
+    Ok((
+        std::time::Duration::from_secs_f64(best),
+        value.as_number(),
+        steps_per_call,
+    ))
 }
 
 #[cfg(test)]

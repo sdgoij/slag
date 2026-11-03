@@ -34,6 +34,9 @@ jit = ["dep:jit"]
 # The WebAssembly JS API (`WebAssembly` global): on by default; drop it with
 # `--no-default-features` (keep the JIT with `--features jit`).
 wasm = ["runtime/wasm"]
+# The executed-step census (`runtime::step_stats`): one atomic per dispatched
+# step, so counts are exact but wall times are inflated. Diagnostic only.
+step-stats = ["runtime/step-stats"]
 # Cut 11: run wasm bodies natively (native targets only). On by default for
 # native builds — `runtime` activates `wasm/compile` from a
 # `cfg(not(target_arch = "wasm32"))` table — so this feature is only an explicit

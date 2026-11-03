@@ -56,6 +56,11 @@ raylib-sys = { version = "6.0.0", default-features = false, features = ["GLFW_BU
 # it drops the feature (and the `wasm` crate) with `--no-default-features`.
 default = ["wasm"]
 wasm = ["dep:wasm"]
+# Executed-step census (`slag_runtime::step_stats`). Off by default: the
+# increment is an atomic in the dispatch loop, so a counting build is exact but
+# its wall times are inflated. Read timing from a default build and join the
+# two offline as `time per call / steps per call`.
+step-stats = []
 # Cut 11: run wasm bodies natively through Cranelift. Native builds get this
 # by default — the `cfg(not(target_arch = "wasm32"))` table above activates
 # `wasm/compile` for them — so the feature is only an explicit request, and on

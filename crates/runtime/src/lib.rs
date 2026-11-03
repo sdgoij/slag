@@ -39,6 +39,7 @@ mod rlx;
 pub mod script;
 pub mod snapshot;
 pub mod stack;
+pub mod step_stats;
 mod time;
 #[cfg(feature = "workers")]
 pub mod workers;
