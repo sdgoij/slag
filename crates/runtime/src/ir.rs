@@ -3268,6 +3268,38 @@ pub const GLOBAL_CELLS: usize = 256;
 /// path).
 pub(crate) const LEAF_CACHE: usize = 256;
 
+/// One enumerable-key cache cell: the object it was filled for, the generation
+/// it was filled at, and that object's enumerable own string keys as
+/// ready-made JS values.
+///
+/// Only an `ObjectKind::Ordinary` object is cached, and only its *keys* — the
+/// property vector is the whole key set for that kind, and every mutation that
+/// can add, remove, reorder or re-classify a key bumps the object's generation
+/// (`set_key`, `define_property_key`, `define_fresh`, `delete_key`,
+/// `map_add_property_cell`), so a generation match validates the list. That is
+/// what lets `Object.keys` hand out the same string values on every call
+/// instead of allocating one per key: strings are immutable and primitives
+/// have no identity, so sharing them is unobservable.
+///
+/// The values are traced through the cell: they live in a Rust-heap `Rc`, which
+/// the collector cannot see on its own.
+pub(crate) struct EnumKeyCell {
+    pub id: u64,
+    pub generation: u32,
+    pub keys: std::rc::Rc<[Value]>,
+}
+
+impl Trace for EnumKeyCell {
+    fn trace(&self, visit: &mut dyn FnMut(GcAny)) {
+        for key in self.keys.iter() {
+            key.trace(visit);
+        }
+    }
+}
+
+/// The enumerable-key cache size (a direct-mapped table over object ids).
+pub(crate) const ENUM_KEY_CELLS: usize = 64;
+
 /// A cached same-stack record: everything `try_push_inline_call` reads out of
 /// the `ecma_functions` map, resolved once per body. A body enters this table
 /// only after passing every gate the lane needs (the record's resumable/class

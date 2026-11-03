@@ -429,6 +429,9 @@ pub(crate) type LeafCacheCell = Option<(u64, Option<crate::ir::LeafEntry>)>;
 /// record the lane's frame push needs.
 pub(crate) type SameStackCell = Option<(u64, crate::ir::SameStackEntry)>;
 
+/// One enumerable-key cache cell; see [`crate::ir::EnumKeyCell`].
+pub(crate) type EnumKeyCacheCell = Option<crate::ir::EnumKeyCell>;
+
 /// The agent's execution-context stack (spec 9.4).
 ///
 /// It lives in [`AgentRoots`] with the other containers the collector reads, so
@@ -823,6 +826,10 @@ pub(crate) struct AgentRoots {
     /// reads out of the `ecma_functions` record, so a hot recursive or plain
     /// call skips the HashMap lookup. Boxed per the Cut 27 lesson.
     pub(crate) same_stack_cache: RefCell<Box<[SameStackCell; crate::ir::SAME_STACK_CACHE]>>,
+    /// The enumerable-key cache: object id → its enumerable own string keys as
+    /// ready-made values, so `Object.keys` on a stable object allocates only
+    /// the result array. Boxed per the Cut 27 lesson.
+    pub(crate) enum_key_cells: RefCell<Box<[EnumKeyCacheCell; crate::ir::ENUM_KEY_CELLS]>>,
     /// The IC value cells, in the roots like the rest of the traced state.
     /// They are `Cell`s (not `RefCell`s): the payloads are `Copy`, so a read
     /// is a load and a write a store, with no borrow flag on the hot path.
@@ -1332,6 +1339,7 @@ impl AgentRoots {
             slot_leaf_cells: RefCell::new(Box::new(std::array::from_fn(|_| None))),
             leaf_cache: RefCell::new(Box::new(std::array::from_fn(|_| None))),
             same_stack_cache: RefCell::new(Box::new(std::array::from_fn(|_| None))),
+            enum_key_cells: RefCell::new(Box::new(std::array::from_fn(|_| None))),
             member_value_cells: std::array::from_fn(|_| {
                 Cell::new(crate::ir::MemberValueCell::empty())
             }),
@@ -1540,6 +1548,9 @@ impl Trace for AgentRoots {
         }
         for (_, entry) in self.same_stack_cache.borrow().iter().flatten() {
             entry.trace(visit);
+        }
+        for cell in self.enum_key_cells.borrow().iter().flatten() {
+            cell.trace(visit);
         }
         // The IC value caches hold Values; the index-only caches re-resolve
         // from the (traced) objects and need no tracing.
@@ -2986,6 +2997,60 @@ impl Agent {
         };
         self.roots.same_stack_cache.borrow_mut()[index] = Some((id, entry.clone()));
         Some(entry)
+    }
+
+    /// The enumerable own string keys of `object`, as ready-made values: a
+    /// direct-mapped cache over the property vector, so `Object.keys` on a
+    /// stable object allocates only its result array.
+    ///
+    /// `None` means "not cacheable" — the object's key set is not its stored
+    /// property vector (`own_string_props` refuses every exotic kind: a proxy,
+    /// a typed array, a module namespace, an array, a string wrapper, a host
+    /// object), and those keep the exact per-kind path.
+    ///
+    /// `Object.keys` is the caller this exists for, and it is the one caller
+    /// the cache is sound for: `EnumerableOwnProperties` re-reads each
+    /// descriptor because a getter for an earlier key may hide a later one,
+    /// but reading *keys* runs no user code at all, so nothing can mutate the
+    /// object between the validation and the array build. `values`/`entries`
+    /// run getters and must keep re-reading enumerability per key.
+    pub(crate) fn enumerable_key_values(
+        &mut self,
+        object: &Handle<crux::object::JsObject>,
+    ) -> Option<std::rc::Rc<[Value]>> {
+        let id = object.id();
+        let generation = object.generation();
+        let index =
+            id.wrapping_mul(0x9E37_79B9_7F4A_7C15) as usize & (crate::ir::ENUM_KEY_CELLS - 1);
+        {
+            let cells = self.roots.enum_key_cells.borrow();
+            if let Some(cell) = cells[index].as_ref()
+                && cell.id == id
+                && cell.generation == generation
+            {
+                return Some(cell.keys.clone());
+            }
+        }
+        let props = object.own_string_props()?;
+        // GC-2: the values accumulate in a local `Vec` the stack scan cannot
+        // see while the next `Handle::new` allocates.
+        let _stress = crate::ir::StressSuppress::new();
+        let keys: Vec<Value> = props
+            .into_iter()
+            .filter_map(|(key, enumerable)| match key {
+                crux::property::PropertyKey::String(id) if enumerable => {
+                    Some(Value::String(Handle::new(crux::lookup(id))))
+                }
+                _ => None,
+            })
+            .collect();
+        let keys: std::rc::Rc<[Value]> = keys.into();
+        self.roots.enum_key_cells.borrow_mut()[index] = Some(crate::ir::EnumKeyCell {
+            id,
+            generation,
+            keys: keys.clone(),
+        });
+        Some(keys)
     }
 
     /// The direct-mapped builtin-call verdict for `id`: a probe that fills from

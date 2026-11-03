@@ -1084,7 +1084,17 @@ fn object_values(agent: &mut Agent, args: &[Value]) -> Result<Value, JsError> {
 
 /// Object.keys (spec 20.1.2.18): the enumerable own string keys.
 fn object_keys(agent: &mut Agent, args: &[Value]) -> Result<Value, JsError> {
-    let keys = enumerable_string_keys(agent, &arg(args, 0))?;
+    let object = to_object(agent, &arg(args, 0))?;
+    // A plain object's key list is its property vector, so a generation-checked
+    // cache can hand back the same key values and skip the enumeration and its
+    // per-key string allocations (see `Agent::enumerable_key_values`).
+    if let Some(obj) = as_object(&object)
+        && let Some(keys) = agent.enumerable_key_values(&obj)
+    {
+        let _stress = crate::ir::StressSuppress::new();
+        return array_of(agent, &keys);
+    }
+    let keys = enumerable_string_keys(agent, &object)?;
     // GC-2: the freshly-boxed key strings accumulate in a local Vec
     // the stack scan cannot see while the next `Handle::new` fires a
     // stress collection — suppress the window so the half-built Vec
@@ -1626,6 +1636,37 @@ mod tests {
 
     fn str(value: &str) -> Value {
         Value::String(Handle::new(JsString::from_utf8(value)))
+    }
+
+    /// `Object.keys` serves a plain object's keys from a generation-checked
+    /// cache, so every mutation that can change the list has to invalidate it,
+    /// and every kind whose keys are not its stored property vector has to miss
+    /// the cache entirely.
+    #[test]
+    fn object_keys_reflects_mutation_and_refuses_exotic_kinds() {
+        let observed = run(
+            "var o = { b: 1, 2: 2, a: 3, 10: 4 };\
+             var first = Object.keys(o).join();\
+             o.c = 5;\
+             var added = Object.keys(o).join();\
+             delete o.b;\
+             var deleted = Object.keys(o).join();\
+             Object.defineProperty(o, 'a', { enumerable: false });\
+             var hidden = Object.keys(o).join();\
+             Object.defineProperty(o, 'a', { enumerable: true });\
+             var shown = Object.keys(o).join();\
+             var proxy = Object.keys(new Proxy({ x: 1, y: 2 }, { ownKeys: function () { return ['y']; } })).join();\
+             JSON.stringify([first, added, deleted, hidden, shown, proxy,\
+               Object.keys('abc').join(), Object.keys([7, 8, 9]).join(),\
+               Object.keys(new Int32Array(3)).join(), Object.keys(Object.create({ k: 1 })).join()])",
+        )
+        .unwrap();
+        assert_eq!(
+            observed,
+            str(
+                "[\"2,10,b,a\",\"2,10,b,a,c\",\"2,10,a,c\",\"2,10,c\",\"2,10,a,c\",\"y\",\"0,1,2\",\"0,1,2\",\"0,1,2\",\"\"]"
+            )
+        );
     }
 
     #[test]
