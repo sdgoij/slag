@@ -860,3 +860,87 @@ remains at any lane (body, leaf, self-call, certified-callee, or suspension).
    frame is shared — deferred until C1–C3 land, and only on a measured
    compile-time or coverage constraint (the general-path compile was probed
    and de-scoped once already, `perf.md:120`).
+
+## 8. Stage C5 detail: the frame-chain net (and the one push it unlocks)
+
+C5 was written as the correctness net under C1 ("stack-walk/`Error.stack`/GC
+over the frame chain"). Costing it against today's numbers gives it a second,
+concrete job: it is the **dependency** for the last measured per-call cost in
+interpreter code, the `ExecutionContext` the same-stack lane pushes on every
+call (184 bytes, three handle increments, a `Default::default()` and a drop —
+~5–8% of the call path, of which 4.1% is the copy alone; see `perf.md`,
+"COSTED").
+
+### What the lane already has
+
+`try_push_inline_call` pushes a full `ExecutionContext` per call so that two
+readers keep working. The lane does not need the *context* to serve them — it
+needs a **frame chain**, and it already keeps one:
+
+| chain level | function | site |
+|---|---|---|
+| innermost | `Vm::current_function` | `Vm::ip` |
+| each caller | `inline_calls[i].current_function` | `inline_calls[i].scratch.ip` |
+
+`parse_text()` on the level function's record supplies the source. So
+(function, source, ip) per activation is derivable with no new state, which is
+everything `frame_line` needs: a certified context carries `position: None`, so
+a lane frame prints its function name and nothing else — exactly what it prints
+today.
+
+### The readers, and what each needs
+
+- `builtins/error.rs::define_stack` — `context.function`, plus `frame_line`'s
+  `script_name`/`frame_site` (position, absent for these frames).
+- `api/stack_trace.rs::{is_frame, frame_of, frames}` — the same three fields.
+- `function.rs::enclosing_source` — each level's `source`, and the rule is
+  "the innermost context whose text covers the span". The chain must supply it,
+  or a closure created in a lane callee resolves its span against the caller's
+  text (silent: a wrong `toString`, not a crash).
+- `Agent::current_realm` / `AgentRoots::collection_realm` — realm only. The
+  lane's gate (`realm_count == 1`) makes the caller's context answer correctly.
+- `Agent::running_context()` — the audit's real subject: with no push, a lane
+  callee's `running_context()` is the **caller's**, so any helper it reaches
+  that re-reads `lexical_environment`/`source` from it sees the caller's. The
+  lane sets `Vm::lexical_env` itself and does not use `run_compiled_body`, but
+  this list has to be enumerated by grep, not assumed, before C5.4.
+
+### Slices
+
+- **C5.1 — one seam for the frame views.** `define_stack` and
+  `api::stack_trace` both walk `execution_context_stack` with their own filter.
+  Collapse that into one `Agent`-level accessor that returns exactly today's
+  list. Behavior-identical (the five stack tests plus `test262 --lib` pin it),
+  no perf claim — it exists so lanes have one place to be taught to.
+- **C5.2 — the chain accessor and its proving probe.** `Vm::activation_chain()`
+  yielding (function, source, ip) innermost-first, plus a test that asserts its
+  `function` sequence equals the context-derived one for a nested same-stack
+  call. This is the slice that proves the chain is complete **before** anything
+  depends on it; landing it changes no behavior.
+- **C5.3 — the switch.** The seam returns contexts for non-lane activations and
+  chain frames for lane levels; `enclosing_source` gains the chain as a source.
+  Gate: the stack fixtures must be **byte-identical**, plus language and
+  built-ins. If byte-identical cannot be achieved, **stop here** — the push
+  stays, and C5 closes as "conformance-visible frames cost 184 bytes a call".
+- **C5.4 — drop the push.** Remove it from `try_push_inline_call` (and the pop),
+  with the `running_context()` audit from above landed in the same change.
+  Gate: `test262 --lib` (3324), the six sweeps, `--gc-stress`/`--nursery-stress`,
+  and the corpus A/B probe — this is the only slice with a measurement, ~5–8%
+  on call-heavy rows.
+- **C5.5 — the net.** `collection_realm`, tracing (the chain's `Value`s are
+  already traced through `inline_calls`/`current_function`, so nothing on the
+  Rust side may hold one across a collection — `slag-gc-rooting`'s trap),
+  `--gc-verify`.
+
+### Cost and risk
+
+Four to six sessions. C5.1/C5.2 change no behavior and are free. C5.3 is where
+the printed stacks can drift (medium risk, fully gated by fixtures). C5.4 is the
+payoff and the riskiest, because `running_context()` is read from many places
+and the failure is a wrong environment rather than a crash. C5.5 is the net
+under both.
+
+**Order against the other candidates.** This is the only remaining interpreter
+item with a measured number of more than ~2% (`perf.md`, COSTED), and it is
+prerequisite to nothing else in this plan, so it can be dropped at C5.3 without
+leaving the engine half-migrated.
