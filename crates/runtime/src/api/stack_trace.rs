@@ -160,15 +160,15 @@ impl Isolate {
 /// The frame view of the agent's execution contexts: innermost first, at most
 /// `limit` of them.
 pub(crate) fn stack_frames(agent: &Agent, limit: usize) -> Vec<StackFrame> {
-    agent.roots.execution_context_stack.with(|stack| {
-        stack
-            .iter()
-            .rev()
-            .filter(|context| is_frame(context))
-            .take(limit)
-            .map(|context| frame_of(agent, context))
-            .collect()
-    })
+    let mut frames = Vec::new();
+    agent.for_each_frame(|context| {
+        if frames.len() == limit {
+            return false;
+        }
+        frames.push(frame_of(agent, context));
+        true
+    });
+    frames
 }
 
 /// Whether an execution context is a frame a host sees.

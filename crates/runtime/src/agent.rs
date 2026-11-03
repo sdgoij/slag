@@ -2394,6 +2394,30 @@ impl Agent {
         }
     }
 
+    /// Walk the activations a stack view reports — the execution-context stack,
+    /// innermost first, filtered to the contexts that are code the engine is
+    /// running (see [`crate::api::stack_trace::is_frame`]). `visit` returns
+    /// `false` to stop.
+    ///
+    /// One walk for every frame view (`Error.stack` and the host-facing
+    /// `StackFrame` list) so that "what is on the stack" is answered in one
+    /// place. The next source of frames is the interpreter's same-stack call
+    /// chain (`.notes/call-frame-plan.md` §8), and it has to be taught to each
+    /// of them identically.
+    pub(crate) fn for_each_frame(&self, mut visit: impl FnMut(&ExecutionContext) -> bool) {
+        self.roots.execution_context_stack.with(|stack| {
+            for context in stack
+                .iter()
+                .rev()
+                .filter(|context| crate::api::stack_trace::is_frame(context))
+            {
+                if !visit(context) {
+                    return;
+                }
+            }
+        });
+    }
+
     /// The running execution context: the top of the stack. Invariant: the
     /// stack is never empty after `initialize_host_defined_realm` has run.
     pub fn running_context(&self) -> Result<Ref<'_, ExecutionContext>, JsError> {

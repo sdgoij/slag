@@ -580,16 +580,6 @@ fn define_stack(
     };
     let mut lines = vec![header];
     let mut frames: Vec<crate::api::StackFrame> = Vec::new();
-    // The realm's bootstrap context is not code the engine is running, so it is
-    // not a frame: the same rule every other frame view uses.
-    let frame_contexts: Vec<_> = agent.roots.execution_context_stack.with(|stack| {
-        stack
-            .iter()
-            .rev()
-            .filter(|context| crate::api::stack_trace::is_frame(context))
-            .cloned()
-            .collect()
-    });
     // A named constructor omits the frames above it — the ones newer than it,
     // its own included — and keeps the frames older than it, which is why a
     // host passes its own builder and still reports its caller
@@ -598,7 +588,10 @@ fn define_stack(
     // a name that is not on the stack omits every frame, the same rule read to
     // its end.
     let mut up_to = until;
-    for context in &frame_contexts {
+    // The realm's bootstrap context is not code the engine is running, so it is
+    // not a frame: `for_each_frame` applies the same rule every other frame
+    // view uses.
+    agent.for_each_frame(|context| {
         if let Some(named) = up_to {
             let found = context
                 .function
@@ -606,16 +599,17 @@ fn define_stack(
                 .map(|current| is_same_function(current, named))
                 .unwrap_or(false);
             if !found {
-                continue;
+                return true;
             }
             // The named constructor's own frame goes with them.
             up_to = None;
-            continue;
+            return true;
         }
         let (line, frame) = frame_line(agent, context, false);
         lines.push(line);
         frames.push(frame);
-    }
+        true
+    });
     // V8's `CaptureAsyncStackTrace`: a stack captured while a promise-reaction
     // job is the current task carries the awaiting frames of the chain that job
     // settles, so an error a host builds inside a job still names the async body
@@ -1028,6 +1022,25 @@ mod tests {
     /// already installed a stack, so a no-op capture leaves the two identical.
     /// The observable is the frame **count** rather than a frame's text, because
     /// the frames this engine records still carry no name (§12's tenth item).
+    ///
+    /// The other half of that contract is the exact frame list a same-stack
+    /// recursion produces, pinned here because the lane's per-call
+    /// `ExecutionContext` is what puts those frames on the stack today, and
+    /// `.notes/call-frame-plan.md` §8 proposes deriving them from the Vm's
+    /// frame chain instead. A change to that source must reproduce this string
+    /// byte for byte.
+    #[test]
+    fn a_same_stack_recursion_reports_every_level() {
+        let stack = run("function inner(n) {\n  if (n > 0) { return inner(n - 1); }\n  return new Error('boom').stack;\n}\ninner(2);")
+            .unwrap()
+            .as_string()
+            .map(|text| text.to_string_lossy())
+            .unwrap();
+        assert_eq!(
+            stack,
+            "Error: boom\n    at inner:3:10\n    at inner:2:23\n    at inner:2:23\n    at <anonymous>:5:1"
+        );
+    }
     #[test]
     fn capture_stack_trace_restarts_the_stack_at_its_call_site() {
         let observed = run("function make() { return new Error('boom'); } \
