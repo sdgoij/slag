@@ -16369,3 +16369,52 @@ the register block at noise on this workload. Treat the mask as **~2%, and
 already probed-and-declined once** — the plan's C3.3 verdict stands unless a
 measurement contradicts it, and none does. The `Builder`-boxing entry is ~1.4%
 by the same arithmetic, not 2–3%.
+
+## MEASURED (2026-11-03): `Step` is 200 bytes, and that does not cost time
+
+Starting on the dispatch loop, the first thing measured was the encoding: a
+`Step` is **200 bytes**, so a compiled body's step array costs 200 bytes per
+instruction. The fat payloads are identifiable with `size_of` on the field
+types:
+
+| variant | payload | bytes |
+|---|---|---|
+| `ObjectAccessorName` / `ObjectAccessorComputed` | `param: Option<BindingElement>` | **152** |
+| `CreateArrow` | `named: Option<JsString>` (48) + `body: ArrowBody` (32) + … | ~130 |
+| `RegExpLiteral` | two `JsString`s | ~104 |
+| `ObjectMethodName` / `Computed` | `function: Function` by value | ~88 |
+
+`BindingElement` is 152 on its own (`Stmt` is 328 and already boxed), so two
+admittedly rare variants set the size for every step in every body.
+
+**The obvious fix is to box those fields, and the measurement says not to.**
+A 400-statement function is ~1,200 steps ≈ 240 KB of step array, and a
+20-statement function called 20× more often does the *same* 200,000
+statements. If step density mattered, the big body would lose; it does not:
+
+| workload | statements | ms |
+|---|---|---|
+| `big.js` — one 400-statement body, 500 calls | 200,000 | 3.62–3.85 |
+| `small.js` — one 20-statement body, 10,000 calls | 200,000 | 4.01–4.08 |
+
+The big body is *faster*, which is the expected shape when the reads are a
+sequential walk the prefetcher covers: a step array is streamed, not randomly
+probed. Shrinking `Step` to ~64 bytes is a real memory win (3× smaller compiled
+bodies, less to trace and to build) and a corpus-invisible speed change, so it
+is recorded here as a memory change to make only if memory becomes the metric.
+
+**And the loop itself is not slow.** `nop.js` (a two-statement loop body,
+~5 steps per iteration) runs 2,000,000 iterations in ~17 ms: ~8.5 ns per
+iteration, **~1.7 ns per step**, which is a competitive switch dispatch. So the
+19% "dispatch" share the flat profile showed on `recursive_fib` was the steps'
+own work spread over many arms — not dispatch overhead to be tuned away — and
+fusing steps (the register lane, `BinStoreInt`, the fused call steps) is the
+only lever that touches it, which is where the engine has already spent its
+effort.
+
+The dispatch loop is therefore **closed as a perf lever**: no encoding change
+and no `ip`-in-a-register rewrite, because the loop is already at ~5 cycles per
+step and the array size is invisible. If the interpreter needs another step
+change it is in the *bodies* the compiler emits (fewer steps per operation) or
+in the non-dispatch machinery the corpus gaps actually point at, not in the
+dispatch.
