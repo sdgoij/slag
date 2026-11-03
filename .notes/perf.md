@@ -16418,3 +16418,67 @@ step and the array size is invisible. If the interpreter needs another step
 change it is in the *bodies* the compiler emits (fewer steps per operation) or
 in the non-dispatch machinery the corpus gaps actually point at, not in the
 dispatch.
+
+## SURVEY (2026-11-03): the builtins family, and where its interpreter time goes
+
+Opening the family by the corpus numbers, because the call path is now the
+least of the interpreter's problems (jitless gaps: `builtins` 140×, `language`
+10.5×, `objects` 2.45×, `calls` 4.8×, `opcost` 3.87×).
+
+Per row (jit / jitless ms, gap against node --jitless):
+
+| row | jitless ms | jlGap | actionable? |
+|---|---|---|---|
+| `promise_churn` | 210.0 | 385 | **no** — node folds it (0.5 ms) |
+| `async_churn` | 205.4 | 441 | **no** — same fold (0.5 ms) |
+| `object_keys` | 98.1 | **13.6** | yes |
+| `set_churn` | 70.8 | 4.2 | yes |
+| `math_intrinsics` | 63.6 | 0.36 | slag is 15× faster |
+| `json_roundtrip` | 55.4 | 3.6 | moderate |
+| `map_churn` | 54.7 | 4.4 | yes |
+
+So the family's two largest gaps are measurement artifacts (a closed-form fold
+on a workload that allocates 2000 promises), and the real leader is
+`Object.keys`/`values`/`entries`.
+
+### `object_keys`, split into its three calls
+
+20000 iterations over a 6-key object, baseline (no call) 155 ns/iteration:
+
+| call | ns/call |
+|---|---|
+| `Object.keys(o)` | ~590 |
+| `Object.values(o)` | ~540 |
+| `Object.entries(o)` | ~1420 |
+
+Against node's ~120 ns per call for the whole trio. `entries` is 2.4× `keys`
+because it allocates one two-element array *per key* (six per call) on top of
+the key work — that part is inherent to the API.
+
+What `keys` spends its 590 ns on, per call: one `Vec<PropertyKey>` from
+`own_property_keys`, six own-descriptor re-reads (spec-required: a getter hit
+for an earlier key may hide a later one), six `crux::lookup` clones (each a
+48-byte `JsString` copy out of a thread-local memo), six `Handle::new` GC
+string allocations, one intermediate `Vec<JsString>`, one `Vec<Value>`, and the
+result array.
+
+### The two levers, with their traps
+
+1. **An enum cache for plain objects** (V8's): per (object id, generation), the
+   enumerable string keys as ready-made `Value`s, so a stable object skips the
+   descriptor re-reads *and* the six allocations. Sound only if every mutation
+   that could reorder/hide a key bumps the generation — which `for_in_cells`
+   already relies on — **and** it must be refused for anything with an accessor
+   or a proxy, because the spec's per-key re-read exists precisely for
+   `getter-making-future-key-nonenumerable`. This is the big one (~2-3× on the
+   row) and the one with a conformance trap.
+2. **An atom → `Value` string cache**: a traced direct-mapped cell table (the
+   `leaf_cache` shape) keyed by `AtomId`, so a property-name string is 8 bytes
+   copied instead of a `Handle::new`. Worth ~10% of this row, and it would pay
+   anywhere an atom becomes a JS string (for-in values, `getOwnPropertyNames`,
+   spread, `Map` keys).
+
+Neither is a 20-minute slice, so this is recorded rather than started: the
+enum cache needs the accessor/proxy gate designed first, and the atom cache
+wants the site count (`Handle::new` appears 578 times) audited before it is
+assumed to pay anywhere but here.
