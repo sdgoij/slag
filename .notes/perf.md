@@ -16521,3 +16521,49 @@ enumerability re-read stays), the atom → `Value` string cache (~10% here and
 anywhere an atom becomes a JS string), and `for-in`'s per-iteration fresh
 binding (16.75× on the largest row in the corpus, but that is environment
 machinery, not enumeration).
+
+## MEASURED (2026-11-03): allocation is 3–5× node, and that is what `Object.entries` is spending
+
+Chasing `Object.entries` (1420 ns/call, the largest per-call cost in the
+`object_keys` row) by looking at what it allocates — six two-element pair
+arrays plus the result array — turned up something bigger than the
+enumeration.
+
+Per iteration, 200,000 iterations, baseline (155 ns for the loop alone)
+subtracted, the same workloads under `node --jitless`:
+
+| allocation | slag | node |
+|---|---|---|
+| `var a = [i, i & 7]` | **137 ns** | 27 ns |
+| `var a = []` | **72 ns** | — |
+| `var a = [i]` | 108 ns | — |
+| `var a = [i, x, y, z]` | 154 ns | — |
+| `var o = { x: i, y: i & 7 }` | **72 ns** | 19 ns |
+| `var t = "k" + (i & 7)` | **82 ns** | 10 ns |
+
+So an **empty** array costs 72 ns, the first two elements ~30 ns each and the
+rest ~8 — the per-*object* cost dominates, and an object literal costs the
+same 72. `JsObject::array_create` (`crux/object.rs:1619`) allocates **two**
+heap cells: a separate `Handle<ArraySlots>` and then the `JsObject` through
+`new_in_place` (whose comment already records the ~80 ns stack-build-and-copy
+lesson). That is where the 72 ns goes, and it is paid by every array, every
+object literal, every `Map`/`Set` churn step and six of `Object.entries`'
+seven allocations.
+
+**Consequence for the slice I was about to write:** caching `entries`' key
+list would save only the `own_property_keys` walk and six string allocations
+(~300 of the 1420 ns), because the six pair arrays and the result array are
+960 ns of it. So the ordering flips — the separate `ArraySlots` allocation is
+the lever, and the `entries` cache is worth doing only after it.
+
+**Why this is not a 20-minute change.** The `ArraySlots` split is load-bearing:
+`.agents/skills/slag-dense-arrays` documents `elem_ptr`/`elem_len`/`elem_cap`,
+the `Value::hole()` sentinel, the JIT's inline dense append re-validating
+extensible + the chain verdict, and why the read lane is single-agent. Making a
+small dense array keep its elements inline (or lazily materialize `ArraySlots`)
+touches the compiled append and the length mirror, and
+`.agents/skills/slag-object-layout` says the arena's 16-byte granularity means
+a layout change only pays when it removes real hot-path writes (`INLINE_FIELDS`
+16 → 8 did pay; boxing `property_index` did not). That is a session's worth of
+probe-first work, not a slice: read both skills, measure `size_of` and the
+allocation path, then decide between inline small elements and a lazy `ArraySlots`.
