@@ -16567,3 +16567,47 @@ a layout change only pays when it removes real hot-path writes (`INLINE_FIELDS`
 16 → 8 did pay; boxing `property_index` did not). That is a session's worth of
 probe-first work, not a slice: read both skills, measure `size_of` and the
 allocation path, then decide between inline small elements and a lazy `ArraySlots`.
+
+## MEASURED (2026-11-03): object allocation is not sized by the object
+
+Following the allocation numbers above into the allocator itself. Two
+measurements, and the second corrects the first.
+
+**`Gc::new(payload)` cost against payload size** (release, 300k allocations,
+crate-internal microbench):
+
+| payload | ns |
+|---|---|
+| 8 B | 15.1 |
+| 64 B | 21.4 |
+| 416 B | 67.3 |
+| 1024 B | 158.2 |
+
+That reads as 15 ns fixed + ~0.125 ns/byte, and it *looks* like the reason an
+empty array costs 72 ns: `JsObject` is **416 bytes** (`SmallProps` 144 of it,
+`in_fields` 64, `property_index` 56, `private_elements` 32, `boxed` 16 — the
+last three are empty for almost every object).
+
+**So `property_index` was boxed** (`RefCell<Option<HashMap>>` → `Option<Box<…>>`,
+−40 bytes, `JsObject` 416 → **376**, five call sites) and measured: nothing.
+`[]`, `[i]`, `[i, x]`, `[i, x, y, z]`, the object literal and the concat string
+all moved within ±3% of noise.
+
+**The first table was the trap.** `Gc::new(Big([7; 52]))` builds the payload on
+the stack and copies it into the arena — the 0.125 ns/byte was *that* copy, not
+the object's field writes. A real `new_in_place` init writes only the fields
+the initializer touches, and the arena's free list hands back the *same* hot
+slots under churn, so neither the byte count nor the cache-line count of
+`JsObject` drives the cost. The boxed-field change was reverted, and the same
+lesson the `slag-dense-arrays` skill records for `Step` applies here: a size
+reduction is not a speed change unless it removes writes on the hot path.
+
+**What the 72 ns actually is, then:** one ~15 ns fixed allocation path (two
+thread-local accesses, a `RefCell` borrow, the box header, `note_alloc`, the
+stress check) **paid twice per array** — the `JsObject` and a separate
+`ArraySlots` cell — plus the elements `Vec` on the first two appends. That
+"sizes" the only remaining structural item here: an array pays two arena
+allocations where an object pays one, and removing the second is the
+`ArraySlots`-inline/lazy redesign the dense-arrays skill marks as
+load-bearing for the compiled append. Not a slice; recorded as the next step
+in this area, with the numbers to justify it.
