@@ -5144,6 +5144,16 @@ impl Vm {
         name as usize & (GLOBAL_CELLS - 1)
     }
 
+    /// The direct-mapped index for the stack-callee leaf cache. It lives in the
+    /// UPPER half of the slot table so a hot fused-slot call (whose index is a
+    /// small frame slot) and a hot stack call cannot evict each other; a
+    /// collision inside the half only costs a miss, because every hit is
+    /// validated by the callee's heap payload.
+    fn value_leaf_index(payload: u64) -> usize {
+        const HALF: usize = SLOT_LEAF_CELLS / 2;
+        HALF + ((payload.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 32) as usize & (HALF - 1))
+    }
+
     /// Resolve and cache the global-object slot for a declared top-level
     /// name (own data property only; the reference path handles the rest).
     /// A miss CLEARS the slot: the cache is indexed by the name atom alone,
@@ -14349,6 +14359,39 @@ impl Vm {
         let arg_start = n - argc;
         let callee = self.stack[arg_start - 1];
         let this = self.stack[arg_start - 2];
+        // The stack-callee leaf cache: the same direct-mapped cell the fused
+        // slot form uses, indexed by the callee's heap payload instead of a
+        // frame slot. Without it this shape (the plain `f(x)` / `o.m(x)`
+        // call, where the callee arrives on the value stack) pays the full
+        // `leaf_lookup` on every call while the slot form pays one payload
+        // compare. A direct eval keeps the general path: its callee must run
+        // with the caller's environment, which the leaf run cannot do.
+        if !direct_eval && let Some(payload) = callee.heap_payload() {
+            let index = Self::value_leaf_index(payload);
+            let cached = {
+                let cells = agent.roots.slot_leaf_cells.borrow();
+                match cells[index].as_ref() {
+                    Some(cell) if cell.payload == payload => Some(cell.entry.clone()),
+                    _ => None,
+                }
+            };
+            if let Some(entry) = cached
+                && self.can_inline_leaf()
+                && agent.realm_count.get() == 1
+                && !agent.is_terminating()
+            {
+                return self.run_leaf_entry(agent, argc, this, entry, 2);
+            }
+            return self.fast_call_core(
+                agent,
+                argc,
+                direct_eval,
+                callee,
+                this,
+                2,
+                LeafCacheSite::Slot { index, callee },
+            );
+        }
         // The shared core: `below` values under the argument region (2 for
         // `CallFast`'s `[this, callee]`) are removed with the arguments when
         // the result replaces the call site.
