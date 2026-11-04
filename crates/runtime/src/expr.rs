@@ -1308,6 +1308,15 @@ pub(crate) fn apply_binary(
 ) -> Result<Value, JsError> {
     match op {
         BinaryOp::Add => {
+            // smi + smi: integer addition with an overflow check, so an
+            // integer result stays an inline integer instead of round-tripping
+            // f64. Overflow (and `-0.0`, which a smi cannot hold) falls
+            // through to the exact double path.
+            if let (Some(a), Some(b)) = (left.as_smi(), right.as_smi())
+                && let Some(sum) = a.checked_add(b)
+            {
+                return Ok(Value::smi(sum));
+            }
             // Fast path: both operands are already numbers — direct double
             // addition without the ToPrimitive round-trips.
             if let (Some(left), Some(right)) = (left.as_number(), right.as_number()) {
@@ -1489,6 +1498,19 @@ fn numeric_binary(
     left: &Value,
     right: &Value,
 ) -> Result<Value, JsError> {
+    // smi `-`/`*`: exact integer arithmetic when it does not overflow, so the
+    // result stays an inline integer. Div/Rem/Exp stay on the double path
+    // (their results are not generally integers).
+    if let (Some(a), Some(b)) = (left.as_smi(), right.as_smi()) {
+        let result = match op {
+            BinaryOp::Sub => a.checked_sub(b),
+            BinaryOp::Mul => a.checked_mul(b),
+            _ => None,
+        };
+        if let Some(result) = result {
+            return Ok(Value::smi(result));
+        }
+    }
     // Fast path: both raw operands are already numbers — direct machine
     // arithmetic before the ToPrimitive/ToNumeric round-trips (ToNumeric on
     // a primitive is identity, so skipping it is exact). This is the hot
@@ -1701,6 +1723,10 @@ fn abstract_relational(
     right: &Value,
     left_first: bool,
 ) -> Result<Option<bool>, JsError> {
+    // smi < smi: integer compare, no f64 decode.
+    if let (Some(a), Some(b)) = (left.as_smi(), right.as_smi()) {
+        return Ok(Some(a < b));
+    }
     // Fast path: both operands are already numbers — direct comparison
     // without the ToPrimitive round-trips (ToPrimitive on a primitive is a
     // no-op, so skipping it is exact). This is the hot shape of loop tests.

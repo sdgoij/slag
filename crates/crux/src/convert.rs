@@ -643,6 +643,17 @@ pub fn to_index(value: &Value) -> Result<u64, JsError> {
     if value.is_undefined() {
         return Ok(0);
     }
+    // An inline integer index is already the answer: no f64 round-trip.
+    if let Some(index) = value.as_smi() {
+        return if index < 0 {
+            Err(JsError::new(
+                ErrorKind::RangeError,
+                "Index out of range".into(),
+            ))
+        } else {
+            Ok(index as u64)
+        };
+    }
     let number = to_number(value)?;
     let integer = to_integer_or_infinity(number);
     if !(0.0..9007199254740991.0).contains(&integer) {
