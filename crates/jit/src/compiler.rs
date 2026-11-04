@@ -2913,10 +2913,7 @@ impl<'a> Lowerer<'a> {
         // `ToPropertyKey` normalizes to `"0"` before it ever reaches a
         // computed read — round-trips to index 0.
         self.builder.switch_to_block(entry);
-        let num = self
-            .builder
-            .ins()
-            .bitcast(types::F64, MemFlagsData::new(), key);
+        let num = self.value_as_f64(key);
         let max = self.builder.ins().f64const(4294967295.0);
         let lt_max = self.builder.ins().fcmp(FloatCC::LessThan, num, max);
         let idx = self.builder.ins().fcvt_to_uint_sat(types::I64, num);
@@ -2992,10 +2989,7 @@ impl<'a> Lowerer<'a> {
             .builder
             .ins()
             .iadd_imm_s(dense_base, crux::heap::GCBOX_DATA_OFFSET as i64);
-        let num = self
-            .builder
-            .ins()
-            .bitcast(types::F64, MemFlagsData::new(), index);
+        let num = self.value_as_f64(index);
         // ToIntegerOrInfinity of a Number: truncate toward zero, and map NaN
         // to +0 (the saturating conversion's NaN result is not the spec's).
         let trunc_i = self.builder.ins().fcvt_to_sint_sat(types::I64, num);
@@ -3338,10 +3332,7 @@ impl<'a> Lowerer<'a> {
         self.builder.seal_block(probe);
         // The canonical-index gate (mirrors the read arm's).
         self.builder.switch_to_block(key_ok_check);
-        let num = self
-            .builder
-            .ins()
-            .bitcast(types::F64, MemFlagsData::new(), key);
+        let num = self.value_as_f64(key);
         let max = self.builder.ins().f64const(4294967295.0);
         let lt_max = self.builder.ins().fcmp(FloatCC::LessThan, num, max);
         let idx = self.builder.ins().fcvt_to_uint_sat(types::I64, num);
@@ -3734,10 +3725,7 @@ impl<'a> Lowerer<'a> {
         // The key gate + bounds (identical to the dense arm's gate, plus the
         // element-count bound).
         self.builder.switch_to_block(key_gate);
-        let num = self
-            .builder
-            .ins()
-            .bitcast(types::F64, MemFlagsData::new(), key);
+        let num = self.value_as_f64(key);
         let max = self.builder.ins().f64const(4294967295.0);
         let lt_max = self.builder.ins().fcmp(FloatCC::LessThan, num, max);
         let idx = self.builder.ins().fcvt_to_uint_sat(types::I64, num);
@@ -3934,10 +3922,7 @@ impl<'a> Lowerer<'a> {
         // is needed; `-0.0` round-trips to index 0, which is the correct
         // canonicalization.
         self.builder.switch_to_block(key_ok_check);
-        let num = self
-            .builder
-            .ins()
-            .bitcast(types::F64, MemFlagsData::new(), key);
+        let num = self.value_as_f64(key);
         let max = self.builder.ins().f64const(4294967295.0);
         let lt_max = self.builder.ins().fcmp(FloatCC::LessThan, num, max);
         let idx = self.builder.ins().fcvt_to_uint_sat(types::I64, num);
@@ -4307,10 +4292,7 @@ impl<'a> Lowerer<'a> {
         // (which only a real f64 can pass — a heap value's bits decode as
         // NaN) runs first, in its own block, before the fcvt in `ints`.
         self.builder.switch_to_block(key_range);
-        let num = self
-            .builder
-            .ins()
-            .bitcast(types::F64, MemFlagsData::new(), key);
+        let num = self.value_as_f64(key);
         let zero = self.builder.ins().f64const(0.0);
         let max = self.builder.ins().f64const(4294967295.0);
         let ge0 = self
@@ -4329,10 +4311,7 @@ impl<'a> Lowerer<'a> {
         // observable behavior. The range gate doubles as the is-double gate:
         // non-double bits decode as NaN, which fails the range.
         self.builder.switch_to_block(val_range);
-        let vnum = self
-            .builder
-            .ins()
-            .bitcast(types::F64, MemFlagsData::new(), value);
+        let vnum = self.value_as_f64(value);
         let v255 = self.builder.ins().f64const(255.0);
         let vge0 = self
             .builder
@@ -5623,18 +5602,10 @@ impl<'a> Lowerer<'a> {
     /// `bits & TAG_MASK == TAG_PREFIX` and `(bits >> 44) & 0xF == TAG_SMI` —
     /// the inline-integer Number check (smi-aware, I8).
     fn is_smi(&mut self, bits: ClifValue) -> ClifValue {
-        let is_tagged = self.builder.ins().band_imm_u(bits, crux::TAG_MASK as i64);
-        let is_tagged =
-            self.builder
-                .ins()
-                .icmp_imm_u(IntCC::Equal, is_tagged, crux::TAG_PREFIX as i64);
-        let tag = self.builder.ins().ushr_imm_u(bits, 44);
-        let tag = self.builder.ins().band_imm_u(tag, 0xF);
-        let is_smi_tag = self
-            .builder
+        let masked = self.builder.ins().band_imm_u(bits, crux::SMI_MASK as i64);
+        self.builder
             .ins()
-            .icmp_imm_u(IntCC::Equal, tag, crux::TAG_SMI as i64);
-        self.builder.ins().band(is_tagged, is_smi_tag)
+            .icmp_imm_u(IntCC::Equal, masked, crux::SMI_PREFIX as i64)
     }
 
     /// `is_double(bits) || is_smi(bits)` — the Number check (I8).
@@ -6175,7 +6146,7 @@ impl<'a> Lowerer<'a> {
                     let bad_slot = if *numbers {
                         // The RHS result must be a Number for the raw-f64
                         // num-slot reduction.
-                        let is_num = self.is_double(value);
+                        let is_num = self.is_number(value);
                         let is_num = self.bint(is_num);
                         self.builder.ins().icmp_imm_u(IntCC::Equal, is_num, 0)
                     } else {
@@ -6191,12 +6162,9 @@ impl<'a> Lowerer<'a> {
                     // a double that is an exact i32 (the saturating round trip
                     // rejects NaN, a fraction, and anything out of range).
                     let value = self.load_slot(*slot);
-                    let is_num = self.is_double(value);
+                    let is_num = self.is_number(value);
                     let is_num = self.bint(is_num);
-                    let num = self
-                        .builder
-                        .ins()
-                        .bitcast(types::F64, MemFlagsData::new(), value);
+                    let num = self.value_as_f64(value);
                     let int = self.builder.ins().fcvt_to_sint_sat(types::I32, num);
                     let back = self.builder.ins().fcvt_from_sint(types::F64, int);
                     let exact = self.builder.ins().fcmp(FloatCC::Equal, back, num);
@@ -6426,11 +6394,8 @@ impl<'a> Lowerer<'a> {
             }
             Step::PopAcc => {
                 let bits = self.pop();
-                let num = self
-                    .builder
-                    .ins()
-                    .bitcast(types::F64, MemFlagsData::new(), bits);
-                let is_num = self.is_double(bits);
+                let num = self.value_as_f64(bits);
+                let is_num = self.is_number(bits);
                 let zero = self.builder.ins().f64const(0.0);
                 let sel = self.builder.ins().select(is_num, num, zero);
                 self.builder.def_var(self.counter_var, sel);
@@ -6512,8 +6477,8 @@ impl<'a> Lowerer<'a> {
                 let obj_ok = self.builder.ins().band(is_obj, tag_obj);
                 let gate = if inline_compound {
                     let old_bits = old.expect("compound assigns carry the cached old value");
-                    let old_num = self.is_double(old_bits);
-                    let value_num = self.is_double(value);
+                    let old_num = self.is_number(old_bits);
+                    let value_num = self.is_number(value);
                     let nums = self.builder.ins().band(old_num, value_num);
                     self.builder.ins().band(obj_ok, nums)
                 } else if compound {
@@ -6536,14 +6501,8 @@ impl<'a> Lowerer<'a> {
                 self.builder.switch_to_block(fast_prep);
                 let new = if inline_compound {
                     let old_bits = old.expect("compound assigns carry the cached old value");
-                    let old_f =
-                        self.builder
-                            .ins()
-                            .bitcast(types::F64, MemFlagsData::new(), old_bits);
-                    let value_f =
-                        self.builder
-                            .ins()
-                            .bitcast(types::F64, MemFlagsData::new(), value);
+                    let old_f = self.value_as_f64(old_bits);
+                    let value_f = self.value_as_f64(value);
                     let res = match op {
                         AssignOp::AddAssign => self.builder.ins().fadd(old_f, value_f),
                         AssignOp::SubAssign => self.builder.ins().fsub(old_f, value_f),
@@ -6883,7 +6842,7 @@ impl<'a> Lowerer<'a> {
                     args_ptr,
                     Offset32::new(0),
                 );
-                let arg_ok = self.is_double(arg1);
+                let arg_ok = self.is_number(arg1);
                 let callee_gate = self.builder.ins().band(non_zero, callee_ok);
                 let gate = match kind {
                     // `indexOf`/`get`/`has`/`set`/`at`/`includes` validate their
@@ -6997,7 +6956,7 @@ impl<'a> Lowerer<'a> {
                         let obj_blk = self.builder.create_block();
                         let kind_blk = self.builder.create_block();
                         let dense_blk = self.builder.create_block();
-                        let index_ok = self.is_double(arg1);
+                        let index_ok = self.is_number(arg1);
                         self.builder.ins().brif(index_ok, obj_blk, &[], slow, &[]);
                         self.builder.seal_block(obj_blk);
                         self.builder.switch_to_block(obj_blk);
@@ -7099,10 +7058,7 @@ impl<'a> Lowerer<'a> {
                         self.builder.ins().jump(merge, &[]);
                     }
                     _ => {
-                        let num = self
-                            .builder
-                            .ins()
-                            .bitcast(types::F64, MemFlagsData::new(), arg1);
+                        let num = self.value_as_f64(arg1);
                         let result = match kind {
                             Intrinsic::MathAbs => self.builder.ins().fabs(num),
                             Intrinsic::MathCeil => self.builder.ins().ceil(num),
@@ -8962,11 +8918,8 @@ impl<'a> Lowerer<'a> {
         if self.slot_is_lexical(slot) {
             self.emit_tdz_check(bits)?;
         }
-        let is_num = self.is_double(bits);
-        let num = self
-            .builder
-            .ins()
-            .bitcast(types::F64, MemFlagsData::new(), bits);
+        let is_num = self.is_number(bits);
+        let num = self.value_as_f64(bits);
         let imm_c = self.builder.ins().f64const(imm);
         let eq = self.builder.ins().fcmp(FloatCC::Equal, num, imm_c);
         let is_num_64 = self.bint(is_num);
@@ -9092,11 +9045,8 @@ impl<'a> Lowerer<'a> {
         imm: f64,
     ) -> Result<ClifValue, Unsupported> {
         let cc = rel_cc(op)?;
-        let is_num = self.is_double(bits);
-        let num = self
-            .builder
-            .ins()
-            .bitcast(types::F64, MemFlagsData::new(), bits);
+        let is_num = self.is_number(bits);
+        let num = self.value_as_f64(bits);
         let imm_num = self.builder.ins().f64const(imm);
         let cmp = self.builder.ins().fcmp(cc, num, imm_num);
         let test_fast = self.bint(cmp);
@@ -9127,11 +9077,8 @@ impl<'a> Lowerer<'a> {
             // matches `fast_loop_bind`'s release-mode `unwrap_or(0.0)`).
             FastLoopVar::Slot(slot) => {
                 let bits = self.load_slot(slot);
-                let num = self
-                    .builder
-                    .ins()
-                    .bitcast(types::F64, MemFlagsData::new(), bits);
-                let is_num = self.is_double(bits);
+                let num = self.value_as_f64(bits);
+                let is_num = self.is_number(bits);
                 let zero = self.builder.ins().f64const(0.0);
                 let sel = self.builder.ins().select(is_num, num, zero);
                 self.builder.def_var(self.counter_var, sel);
@@ -9290,17 +9237,11 @@ impl<'a> Lowerer<'a> {
         right: ClifValue,
     ) -> Result<ClifValue, Unsupported> {
         let cc = rel_cc(op)?;
-        let left_num = self.is_double(left);
-        let right_num = self.is_double(right);
+        let left_num = self.is_number(left);
+        let right_num = self.is_number(right);
         let both = self.builder.ins().band(left_num, right_num);
-        let left_f = self
-            .builder
-            .ins()
-            .bitcast(types::F64, MemFlagsData::new(), left);
-        let right_f = self
-            .builder
-            .ins()
-            .bitcast(types::F64, MemFlagsData::new(), right);
+        let left_f = self.value_as_f64(left);
+        let right_f = self.value_as_f64(right);
         let cmp = self.builder.ins().fcmp(cc, left_f, right_f);
         let test_fast = self.bint(cmp);
         let test_var = self.builder.declare_var(types::I64);
@@ -9334,11 +9275,8 @@ impl<'a> Lowerer<'a> {
         if self.slot_is_lexical(slot) {
             self.emit_tdz_check(old)?;
         }
-        let is_num = self.is_double(old);
-        let num = self
-            .builder
-            .ins()
-            .bitcast(types::F64, MemFlagsData::new(), old);
+        let is_num = self.is_number(old);
+        let num = self.value_as_f64(old);
         let delta = if matches!(op, UpdateOp::Increment) {
             1.0
         } else {
@@ -9380,11 +9318,8 @@ impl<'a> Lowerer<'a> {
     /// the falsy/truthy tags inline, and any other heap value (an empty
     /// string is falsy per spec) through `to_boolean_slow`.
     fn emit_truthiness(&mut self, bits: ClifValue) -> Result<ClifValue, Unsupported> {
-        let is_double = self.is_double(bits);
-        let num = self
-            .builder
-            .ins()
-            .bitcast(types::F64, MemFlagsData::new(), bits);
+        let is_number = self.is_number(bits);
+        let num = self.value_as_f64(bits);
         let zero = self.builder.ins().f64const(0.0);
         let eq0 = self.builder.ins().fcmp(FloatCC::Equal, num, zero);
         let nan = self.builder.ins().fcmp(FloatCC::Unordered, num, num);
@@ -9414,10 +9349,10 @@ impl<'a> Lowerer<'a> {
             .icmp_imm_u(IntCC::Equal, bits, self.true_bits);
         let is_true = self.bint(true_cmp);
         let known = self.builder.ins().bor(falsy_tag, is_true);
-        let fast_falsy = self.builder.ins().select(is_double, falsy_num, falsy_tag);
+        let fast_falsy = self.builder.ins().select(is_number, falsy_num, falsy_tag);
         // Slow path: a heap value that is not one of the known tags
         // (bigint/string/symbol/object/function — the empty string is falsy).
-        let is_double64 = self.bint(is_double);
+        let is_double64 = self.bint(is_number);
         let not_dbl_cmp = self.builder.ins().icmp_imm_u(IntCC::Equal, is_double64, 0);
         let not_double = self.bint(not_dbl_cmp);
         let unknown_cmp = self.builder.ins().icmp_imm_u(IntCC::Equal, known, 0);
@@ -9495,14 +9430,8 @@ impl<'a> Lowerer<'a> {
         lhs_known: bool,
         rhs_known: bool,
     ) -> Result<ClifValue, Unsupported> {
-        let lhs_num = self
-            .builder
-            .ins()
-            .bitcast(types::F64, MemFlagsData::new(), lhs);
-        let rhs_num = self
-            .builder
-            .ins()
-            .bitcast(types::F64, MemFlagsData::new(), rhs);
+        let lhs_num = self.value_as_f64(lhs);
+        let rhs_num = self.value_as_f64(rhs);
         let (l_wide, _) = self.trunc_i32(lhs_num);
         let (r_wide, _) = self.trunc_i32(rhs_num);
         let l_back = self.builder.ins().fcvt_from_sint(types::F64, l_wide);
@@ -9529,12 +9458,12 @@ impl<'a> Lowerer<'a> {
         let lhs_dbl = if lhs_known {
             self.builder.ins().iconst(types::I8, 1)
         } else {
-            self.is_double(lhs)
+            self.is_number(lhs)
         };
         let rhs_dbl = if rhs_known {
             self.builder.ins().iconst(types::I8, 1)
         } else {
-            self.is_double(rhs)
+            self.is_number(rhs)
         };
         let mut guard = self.builder.ins().band(lhs_dbl, rhs_dbl);
         guard = self.builder.ins().band(guard, l_int);
@@ -9587,15 +9516,9 @@ impl<'a> Lowerer<'a> {
         rhs: ClifValue,
     ) -> Result<ClifValue, Unsupported> {
         let same = self.builder.ins().icmp(IntCC::Equal, lhs, rhs);
-        let lf = self
-            .builder
-            .ins()
-            .bitcast(types::F64, MemFlagsData::new(), lhs);
-        let rf = self
-            .builder
-            .ins()
-            .bitcast(types::F64, MemFlagsData::new(), rhs);
-        let l_dbl = self.is_double(lhs);
+        let lf = self.value_as_f64(lhs);
+        let rf = self.value_as_f64(rhs);
+        let l_dbl = self.is_number(lhs);
         let l_nan = self.builder.ins().fcmp(FloatCC::Unordered, lf, lf);
         let l_nan = self.builder.ins().band(l_nan, l_dbl);
         // Comparison results are i8 0/1, so a negation is `bxor 1` (`bnot`
@@ -9603,11 +9526,15 @@ impl<'a> Lowerer<'a> {
         let one = self.builder.ins().iconst(types::I8, 1);
         let not_nan = self.builder.ins().bxor(l_nan, one);
         let same_non_nan = self.builder.ins().band(same, not_nan);
-        let zero = self.builder.ins().f64const(0.0);
-        let l_zero = self.builder.ins().fcmp(FloatCC::Equal, lf, zero);
-        let r_zero = self.builder.ins().fcmp(FloatCC::Equal, rf, zero);
-        let both_zero = self.builder.ins().band(l_zero, r_zero);
-        let mut eq = self.builder.ins().bor(same_non_nan, both_zero);
+        // Two Numbers compare by value: a smi and a double can hold the same
+        // number with different bits (`2 === 2.0`), and `+0 === -0`. A NaN
+        // (only ever a double) is never equal to anything, which the fcmp
+        // already answers.
+        let r_dbl = self.is_number(rhs);
+        let both_num = self.builder.ins().band(l_dbl, r_dbl);
+        let num_eq = self.builder.ins().fcmp(FloatCC::Equal, lf, rf);
+        let numeric = self.builder.ins().band(both_num, num_eq);
+        let mut eq = self.builder.ins().bor(same_non_nan, numeric);
         if op == BinaryOp::StrictNotEqual {
             eq = self.builder.ins().bxor(eq, one);
         }
@@ -9676,14 +9603,8 @@ impl<'a> Lowerer<'a> {
             let op_imm = self.builder.ins().iconst(types::I64, op as i64);
             return self.call_slow(self.sig_binary, Helper::BinarySlow, &[op_imm, lhs, rhs]);
         };
-        let lhs_num = self
-            .builder
-            .ins()
-            .bitcast(types::F64, MemFlagsData::new(), lhs);
-        let rhs_num = self
-            .builder
-            .ins()
-            .bitcast(types::F64, MemFlagsData::new(), rhs);
+        let lhs_num = self.value_as_f64(lhs);
+        let rhs_num = self.value_as_f64(rhs);
         // `int_guard` is the extra run-time condition the integer shapes need
         // (both operands inside the truncating conversion's range); `None` for
         // the float shapes, whose fast result is exact for any two Numbers.
@@ -9718,12 +9639,12 @@ impl<'a> Lowerer<'a> {
         let lhs_dbl = if lhs_known {
             self.builder.ins().iconst(types::I8, 1)
         } else {
-            self.is_double(lhs)
+            self.is_number(lhs)
         };
         let rhs_dbl = if rhs_known {
             self.builder.ins().iconst(types::I8, 1)
         } else {
-            self.is_double(rhs)
+            self.is_number(rhs)
         };
         let both = self.builder.ins().band(lhs_dbl, rhs_dbl);
         let both = match int_guard {
@@ -9814,9 +9735,7 @@ impl<'a> Lowerer<'a> {
             self.builder.use_var(self.acc_num_var)
         } else {
             let bits = self.builder.use_var(self.acc_var);
-            self.builder
-                .ins()
-                .bitcast(types::F64, MemFlagsData::new(), bits)
+            self.value_as_f64(bits)
         }
     }
 
@@ -9845,11 +9764,7 @@ impl<'a> Lowerer<'a> {
 
     fn bin_form_num(&mut self, form: BinForm) -> ClifValue {
         match form {
-            BinForm::Bits(bits) => {
-                self.builder
-                    .ins()
-                    .bitcast(types::F64, MemFlagsData::new(), bits)
-            }
+            BinForm::Bits(bits) => self.value_as_f64(bits),
             BinForm::Num(num) => num,
         }
     }
@@ -9999,10 +9914,7 @@ impl<'a> Lowerer<'a> {
             return;
         };
         let bits = self.load_slot(slot);
-        let num = self
-            .builder
-            .ins()
-            .bitcast(types::F64, MemFlagsData::new(), bits);
+        let num = self.value_as_f64(bits);
         self.builder.def_var(var, num);
     }
 
@@ -10035,10 +9947,7 @@ impl<'a> Lowerer<'a> {
             return;
         };
         let bits = self.load_slot(slot);
-        let num = self
-            .builder
-            .ins()
-            .bitcast(types::F64, MemFlagsData::new(), bits);
+        let num = self.value_as_f64(bits);
         let wide = self.builder.ins().fcvt_to_sint_sat(types::I64, num);
         let int = self.builder.ins().ireduce(types::I32, wide);
         self.builder.def_var(var, int);
@@ -10096,9 +10005,7 @@ impl<'a> Lowerer<'a> {
                 // A guard-proven Number slot (the LICM RHS hoist): its frame
                 // word IS an f64 — no tag check, no canonicalization.
                 let bits = self.load_slot(slot);
-                self.builder
-                    .ins()
-                    .bitcast(types::F64, MemFlagsData::new(), bits)
+                self.value_as_f64(bits)
             }
         };
         let res = self.emit_arith(op, left, right)?;
@@ -10253,11 +10160,8 @@ impl<'a> Lowerer<'a> {
                     self.set_acc_num(new_num);
                 } else {
                     let old = self.builder.use_var(self.acc_var);
-                    let is_num = self.is_double(old);
-                    let num = self
-                        .builder
-                        .ins()
-                        .bitcast(types::F64, MemFlagsData::new(), old);
+                    let is_num = self.is_number(old);
+                    let num = self.value_as_f64(old);
                     let delta_c = self.builder.ins().f64const(delta);
                     let new_num = self.builder.ins().fadd(num, delta_c);
                     let new_bits =
@@ -10292,11 +10196,8 @@ impl<'a> Lowerer<'a> {
                 if *tdz {
                     self.emit_tdz_check(old)?;
                 }
-                let is_num = self.is_double(old);
-                let num = self
-                    .builder
-                    .ins()
-                    .bitcast(types::F64, MemFlagsData::new(), old);
+                let is_num = self.is_number(old);
+                let num = self.value_as_f64(old);
                 let delta = if matches!(op, syntax::ast::UpdateOp::Increment) {
                     1.0
                 } else {
@@ -10823,10 +10724,7 @@ impl<'a> Lowerer<'a> {
                 // value outside the conversion's domain falls to the exact
                 // `binary_slow`.
                 let lhs = self.acc_bits();
-                let num = self
-                    .builder
-                    .ins()
-                    .bitcast(types::F64, MemFlagsData::new(), lhs);
+                let num = self.value_as_f64(lhs);
                 let abs = self.builder.ins().fabs(num);
                 let bound = self.builder.ins().f64const(9223372036854775808.0);
                 let in_range = self.builder.ins().fcmp(FloatCC::LessThan, abs, bound);
@@ -10940,11 +10838,8 @@ impl<'a> Lowerer<'a> {
                 if *tdz {
                     self.emit_tdz_check(old)?;
                 }
-                let is_num = self.is_double(old);
-                let num = self
-                    .builder
-                    .ins()
-                    .bitcast(types::F64, MemFlagsData::new(), old);
+                let is_num = self.is_number(old);
+                let num = self.value_as_f64(old);
                 let delta = if matches!(op, UpdateOp::Increment) {
                     1.0
                 } else {

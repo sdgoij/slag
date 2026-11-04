@@ -312,7 +312,7 @@ fn resolve(
                 // A raw float never reaches a non-float parameter (the unbox
                 // pass canonicalizes that edge); keep the word well-formed.
                 (Type::Float, _) => builder.ins().bitcast(types::I64, MemFlagsData::new(), v),
-                (_, Some(Type::Float)) => builder.ins().bitcast(types::F64, MemFlagsData::new(), v),
+                (_, Some(Type::Float)) => value_as_f64(builder, v),
                 _ => v,
             };
             Ok(v.into())
@@ -641,7 +641,7 @@ fn lower_inst(
             };
             let value = arg!(0);
             let ok = match inst.ty {
-                Type::Number => is_double(builder, value),
+                Type::Number => is_number(builder, value),
                 _ => return Err(Unsupported::Step("opt:guard-type")),
             };
             emit_guard(builder, abi, ok, step, &inst.args[1..], values)?;
@@ -1560,12 +1560,10 @@ fn lower_inst(
             let fast = builder.create_block();
             let slow = builder.create_block();
             let merge = builder.create_block();
-            let is_num = is_double(builder, value);
+            let is_num = is_number(builder, value);
             builder.ins().brif(is_num, fast, &[], slow, &[]);
             builder.switch_to_block(fast);
-            let num = builder
-                .ins()
-                .bitcast(types::F64, MemFlagsData::new(), value);
+            let num = value_as_f64(builder, value);
             let delta = if inc == UpdateOp::Increment as i32 {
                 1.0
             } else {
@@ -1671,7 +1669,7 @@ fn as_f64(builder: &mut FunctionBuilder, v: ClifValue, ty: Type) -> ClifValue {
     match ty {
         Type::Float => v,
         Type::Int => builder.ins().fcvt_from_sint(types::F64, v),
-        _ => builder.ins().bitcast(types::F64, MemFlagsData::new(), v),
+        _ => value_as_f64(builder, v),
     }
 }
 
@@ -1688,7 +1686,7 @@ fn int_to_bits(builder: &mut FunctionBuilder, v: ClifValue) -> ClifValue {
 /// i32 representation. The saturating conversion is exact on an in-range value,
 /// so no range guard is needed.
 fn bits_to_int(builder: &mut FunctionBuilder, v: ClifValue) -> ClifValue {
-    let f = builder.ins().bitcast(types::F64, MemFlagsData::new(), v);
+    let f = value_as_f64(builder, v);
     builder.ins().fcvt_to_sint_sat(types::I32, f)
 }
 
@@ -2072,7 +2070,7 @@ fn emit_dense_element_read(
     // negative, huge and non-double keys (a NaN-boxed heap value bitcasts to a
     // NaN, whose compare fails).
     builder.switch_to_block(entry);
-    let num = builder.ins().bitcast(types::F64, MemFlagsData::new(), key);
+    let num = value_as_f64(builder, key);
     let max = builder.ins().f64const(4294967295.0);
     let lt_max = builder.ins().fcmp(FloatCC::LessThan, num, max);
     let idx = builder.ins().fcvt_to_uint_sat(types::I64, num);
@@ -2145,9 +2143,7 @@ fn emit_array_at_inline(
     let slots_ptr = builder
         .ins()
         .iadd_imm_s(dense_base, crux::heap::GCBOX_DATA_OFFSET as i64);
-    let num = builder
-        .ins()
-        .bitcast(types::F64, MemFlagsData::new(), index);
+    let num = value_as_f64(builder, index);
     // ToIntegerOrInfinity of a Number: truncate toward zero, and map NaN to
     // +0 (the saturating conversion's NaN result is not part of the spec).
     let trunc_i = builder.ins().fcvt_to_sint_sat(types::I64, num);
@@ -2359,7 +2355,7 @@ fn emit_typed_element_read(
     builder.seal_block(key_gate);
     // The key gate + bounds (the dense arm's gate, plus the element-count bound).
     builder.switch_to_block(key_gate);
-    let num = builder.ins().bitcast(types::F64, MemFlagsData::new(), key);
+    let num = value_as_f64(builder, key);
     let max = builder.ins().f64const(4294967295.0);
     let lt_max = builder.ins().fcmp(FloatCC::LessThan, num, max);
     let idx = builder.ins().fcvt_to_uint_sat(types::I64, num);
@@ -2600,7 +2596,7 @@ fn emit_typed_element_store(
     // The canonical-index key gate (same as the dense arm's, plus the
     // element-count bound).
     builder.switch_to_block(key_gate);
-    let num = builder.ins().bitcast(types::F64, MemFlagsData::new(), key);
+    let num = value_as_f64(builder, key);
     let max = builder.ins().f64const(4294967295.0);
     let lt_max = builder.ins().fcmp(FloatCC::LessThan, num, max);
     let idx = builder.ins().fcvt_to_uint_sat(types::I64, num);
@@ -2637,9 +2633,7 @@ fn emit_typed_element_store(
             // (which is also how a heap value's bits decode) and for the
             // infinities, so those go to the helper, which distinguishes a
             // real NaN from the NaN-boxed non-Number tags.
-            let vnum = builder
-                .ins()
-                .bitcast(types::F64, MemFlagsData::new(), value);
+            let vnum = value_as_f64(builder, value);
             let lo = builder.ins().f64const(vmin);
             let hi = builder.ins().f64const(vmax);
             let gt = builder.ins().fcmp(FloatCC::GreaterThan, vnum, lo);
@@ -2666,9 +2660,7 @@ fn emit_typed_element_store(
             builder.ins().jump(merge, &[]);
             continue;
         }
-        let vnum = builder
-            .ins()
-            .bitcast(types::F64, MemFlagsData::new(), value);
+        let vnum = value_as_f64(builder, value);
         let lo = builder.ins().f64const(vmin);
         let hi = builder.ins().f64const(vmax);
         let ge = builder.ins().fcmp(FloatCC::GreaterThanOrEqual, vnum, lo);
@@ -3211,7 +3203,7 @@ fn emit_intrinsic(
     let mut gate = builder.ins().band(non_zero, callee_ok);
     match kind {
         Intrinsic::StringCharCodeAt => {
-            let arg_ok = is_double(builder, arg1);
+            let arg_ok = is_number(builder, arg1);
             gate = builder.ins().band(gate, arg_ok);
             let this_ok = is_string(builder, this);
             gate = builder.ins().band(gate, this_ok);
@@ -3221,7 +3213,7 @@ fn emit_intrinsic(
         | Intrinsic::MathFloor
         | Intrinsic::MathTrunc
         | Intrinsic::MathSqrt => {
-            let arg_ok = is_double(builder, arg1);
+            let arg_ok = is_number(builder, arg1);
             gate = builder.ins().band(gate, arg_ok);
         }
         Intrinsic::ArrayIndexOf
@@ -3246,7 +3238,7 @@ fn emit_intrinsic(
         | Intrinsic::MathFloor
         | Intrinsic::MathTrunc
         | Intrinsic::MathSqrt => {
-            let num = builder.ins().bitcast(types::F64, MemFlagsData::new(), arg1);
+            let num = value_as_f64(builder, arg1);
             let result = match kind {
                 Intrinsic::MathAbs => builder.ins().fabs(num),
                 Intrinsic::MathCeil => builder.ins().ceil(num),
@@ -3280,7 +3272,7 @@ fn emit_intrinsic(
             let obj_blk = builder.create_block();
             let kind_blk = builder.create_block();
             let dense_blk = builder.create_block();
-            let index_ok = is_double(builder, arg1);
+            let index_ok = is_number(builder, arg1);
             builder.ins().brif(index_ok, obj_blk, &[], slow, &[]);
             builder.seal_block(obj_blk);
             builder.switch_to_block(obj_blk);
@@ -3473,7 +3465,7 @@ fn emit_dense_element_store_inline(
     let value_check = builder.create_block();
     let fast_write = builder.create_block();
     builder.switch_to_block(entry);
-    let num = builder.ins().bitcast(types::F64, MemFlagsData::new(), key);
+    let num = value_as_f64(builder, key);
     let max = builder.ins().f64const(4294967295.0);
     let lt_max = builder.ins().fcmp(FloatCC::LessThan, num, max);
     let idx = builder.ins().fcvt_to_uint_sat(types::I64, num);
@@ -5209,8 +5201,8 @@ fn emit_strict_eq(
     let slow = builder.create_block();
     let merge = builder.create_block();
     let same = builder.ins().icmp(IntCC::Equal, lhs, rhs);
-    let lf = builder.ins().bitcast(types::F64, MemFlagsData::new(), lhs);
-    let rf = builder.ins().bitcast(types::F64, MemFlagsData::new(), rhs);
+    let lf = value_as_f64(builder, lhs);
+    let rf = value_as_f64(builder, rhs);
     // A tagged value's bits also decode as a NaN, so the NaN test is gated on
     // the double tag: `undefined === undefined` must not read as unequal.
     let l_dbl_bits = builder.ins().band_imm_u(lhs, crux::TAG_MASK as i64);
@@ -5228,11 +5220,15 @@ fn emit_strict_eq(
     let one = builder.ins().iconst(types::I8, 1);
     let not_nan = builder.ins().bxor(l_nan, one);
     let same_non_nan = builder.ins().band(same, not_nan);
-    let zero = builder.ins().f64const(0.0);
-    let l_zero = builder.ins().fcmp(FloatCC::Equal, lf, zero);
-    let r_zero = builder.ins().fcmp(FloatCC::Equal, rf, zero);
-    let both_zero = builder.ins().band(l_zero, r_zero);
-    let eq = builder.ins().bor(same_non_nan, both_zero);
+    // Two Numbers compare by value: a smi and a double can hold the same number
+    // with different bits (`2 === 2.0`), and `+0 === -0`. A NaN (only ever a
+    // double) is never equal to anything, which the fcmp already answers.
+    let l_num = is_number(builder, lhs);
+    let r_num = is_number(builder, rhs);
+    let both_num = builder.ins().band(l_num, r_num);
+    let num_eq = builder.ins().fcmp(FloatCC::Equal, lf, rf);
+    let numeric = builder.ins().band(both_num, num_eq);
+    let eq = builder.ins().bor(same_non_nan, numeric);
     // Strings and BigInts compare by content even when their boxes differ.
     let l_non_dbl = builder.ins().bxor(l_dbl, one);
     let r_non_dbl = builder.ins().bxor(r_dbl, one);
@@ -5349,8 +5345,8 @@ fn call_numeric_binary(
     vals: (ClifValue, ClifValue, (bool, bool)),
 ) -> Result<ClifValue, Unsupported> {
     let (lhs, rhs, (lhs_known, rhs_known)) = vals;
-    let lhs_num = builder.ins().bitcast(types::F64, MemFlagsData::new(), lhs);
-    let rhs_num = builder.ins().bitcast(types::F64, MemFlagsData::new(), rhs);
+    let lhs_num = value_as_f64(builder, lhs);
+    let rhs_num = value_as_f64(builder, rhs);
     let fast = match op {
         Op::Lt | Op::Le | Op::Gt | Op::Ge => {
             let cc = match op {
@@ -5382,12 +5378,12 @@ fn call_numeric_binary(
     let lhs_dbl = if lhs_known {
         builder.ins().iconst(types::I8, 1)
     } else {
-        is_double(builder, lhs)
+        is_number(builder, lhs)
     };
     let rhs_dbl = if rhs_known {
         builder.ins().iconst(types::I8, 1)
     } else {
-        is_double(builder, rhs)
+        is_number(builder, rhs)
     };
     let both = builder.ins().band(lhs_dbl, rhs_dbl);
     let result = builder.declare_var(types::I64);
@@ -5419,6 +5415,32 @@ fn is_double(builder: &mut FunctionBuilder, bits: ClifValue) -> ClifValue {
     builder
         .ins()
         .icmp_imm_u(IntCC::NotEqual, masked, crux::TAG_PREFIX as i64)
+}
+
+/// `TAG_PREFIX` and tag `TAG_SMI` — the inline-integer Number check.
+fn is_smi(builder: &mut FunctionBuilder, bits: ClifValue) -> ClifValue {
+    let masked = builder.ins().band_imm_u(bits, crux::SMI_MASK as i64);
+    builder
+        .ins()
+        .icmp_imm_u(IntCC::Equal, masked, crux::SMI_PREFIX as i64)
+}
+
+/// `is_double || is_smi` — the Number check.
+fn is_number(builder: &mut FunctionBuilder, bits: ClifValue) -> ClifValue {
+    let double = is_double(builder, bits);
+    let smi = is_smi(builder, bits);
+    builder.ins().bor(double, smi)
+}
+
+/// Decode a Number-typed `bits` to its f64 value: a smi widens from its low
+/// i32, a double is a bitcast. The caller must have proven `is_number`.
+fn value_as_f64(builder: &mut FunctionBuilder, bits: ClifValue) -> ClifValue {
+    let smi = is_smi(builder, bits);
+    let payload = builder.ins().band_imm_u(bits, crux::PAYLOAD_MASK as i64);
+    let i32v = builder.ins().ireduce(types::I32, payload);
+    let smi_f64 = builder.ins().fcvt_from_sint(types::F64, i32v);
+    let dbl_f64 = builder.ins().bitcast(types::F64, MemFlagsData::new(), bits);
+    builder.ins().select(smi, smi_f64, dbl_f64)
 }
 
 /// Canonicalize a computed double's bits: a NaN whose top bits collide with the
@@ -5502,12 +5524,12 @@ fn call_int_binary(
     let lhs_dbl = if lhs_known {
         builder.ins().iconst(types::I8, 1)
     } else {
-        is_double(builder, lhs)
+        is_number(builder, lhs)
     };
     let rhs_dbl = if rhs_known {
         builder.ins().iconst(types::I8, 1)
     } else {
-        is_double(builder, rhs)
+        is_number(builder, rhs)
     };
     let known = builder.ins().band(lhs_dbl, rhs_dbl);
     let both = builder.ins().band(known, in_range);
@@ -5562,7 +5584,7 @@ fn int_operand(
         let one = builder.ins().iconst(types::I8, 1);
         (v, one)
     } else {
-        let num = builder.ins().bitcast(types::F64, MemFlagsData::new(), v);
+        let num = value_as_f64(builder, v);
         let (wide, range) = trunc_i32(builder, num, false);
         (builder.ins().ireduce(types::I32, wide), range)
     }
@@ -5582,8 +5604,8 @@ fn call_mod_int(
     rhs: ClifValue,
     operands_known: bool,
 ) -> Result<ClifValue, Unsupported> {
-    let lhs_num = builder.ins().bitcast(types::F64, MemFlagsData::new(), lhs);
-    let rhs_num = builder.ins().bitcast(types::F64, MemFlagsData::new(), rhs);
+    let lhs_num = value_as_f64(builder, lhs);
+    let rhs_num = value_as_f64(builder, rhs);
     let (l_wide, _) = trunc_i32(builder, lhs_num, false);
     let (r_wide, _) = trunc_i32(builder, rhs_num, false);
     let l_back = builder.ins().fcvt_from_sint(types::F64, l_wide);
@@ -5605,12 +5627,12 @@ fn call_mod_int(
     let lhs_dbl = if operands_known {
         builder.ins().iconst(types::I8, 1)
     } else {
-        is_double(builder, lhs)
+        is_number(builder, lhs)
     };
     let rhs_dbl = if operands_known {
         builder.ins().iconst(types::I8, 1)
     } else {
-        is_double(builder, rhs)
+        is_number(builder, rhs)
     };
     let mut guard = builder.ins().band(lhs_dbl, rhs_dbl);
     guard = builder.ins().band(guard, l_int);
