@@ -945,6 +945,9 @@ fn run_corpus(dir: &std::path::Path, jit: bool) -> Result<(), u8> {
     // The I5a call-site probe runs in the INTERPRETER (`--jitless`), so it dumps
     // in either mode; inert unless `SLAG_FEEDBACK` is set.
     jit::dump_feedback_summary();
+    // The step census histogram, when the crate was built with
+    // `--features step-stats` (one workload per process attributes it).
+    runtime::step_stats::dump_buckets();
     Ok(())
 }
 

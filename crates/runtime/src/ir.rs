@@ -8574,7 +8574,7 @@ impl Vm {
                 }
             };
             self.ip += 1;
-            crate::step_stats::count_step();
+            crate::step_stats::count_step(step);
             // Steps that read the running context (resolve_binding, member
             // helpers, closure creation) see the VM's lexical environment
             // through the context; the sync is skipped when it has not
