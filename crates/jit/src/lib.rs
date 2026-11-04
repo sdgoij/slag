@@ -886,7 +886,7 @@ mod tests {
         );
         let compiled = engine.compile(&body, &helpers_all()).expect("lowers");
         let bits = run(&compiled, 0);
-        assert_eq!(Value::from_bits(bits).as_number(), Some(3.0));
+        assert_eq!(bits, Value::Number(3.0).bits());
     }
 
     #[test]
@@ -938,7 +938,7 @@ mod tests {
         let bits = run(&compiled, 2);
         // sum(0..1000) — the counter runs 0..999, then the head's test fails
         // at 1000 and the counter is stored back.
-        assert_eq!(Value::from_bits(bits).as_number(), Some(499_500.0));
+        assert_eq!(bits, Value::Number(499_500.0).bits());
     }
 
     #[test]
@@ -965,7 +965,7 @@ mod tests {
             0,
         );
         let compiled = engine.compile(&body, &helpers_all()).expect("lowers");
-        assert_eq!(Value::from_bits(run(&compiled, 0)).as_number(), Some(3.0));
+        assert_eq!(run(&compiled, 0), Value::Number(3.0).bits());
     }
 
     #[test]
@@ -1026,7 +1026,7 @@ mod tests {
         );
         let compiled = engine.compile(&body, &helpers_all()).expect("lowers");
         let bits = run(&compiled, 2);
-        assert_eq!(Value::from_bits(bits).as_number(), Some(10.0));
+        assert_eq!(bits, Value::Number(10.0).bits());
     }
 
     #[test]
@@ -1299,7 +1299,7 @@ mod tests {
         assert!(!ctx.pending, "a test-double helper set the error flag");
         assert_eq!(frame[1], 0xDEAD_BEEF_CAFE_F00D, "frame overrun");
         assert_eq!(stack[64], 0xDEAD_BEEF_CAFE_F00D, "stack overrun");
-        assert_eq!(Value::from_bits(result).as_number(), Some(0.0));
+        assert_eq!(result, Value::Number(0.0).bits());
     }
 
     #[test]
@@ -1601,7 +1601,7 @@ mod tests {
         assert!(!ctx.pending, "a test-double helper set the error flag");
         assert_eq!(frame[1], 0xDEAD_BEEF_CAFE_F00D, "frame overrun");
         assert_eq!(stack[64], 0xDEAD_BEEF_CAFE_F00D, "stack overrun");
-        assert_eq!(Value::from_bits(result).as_number(), Some(0.0));
+        assert_eq!(result, Value::Number(0.0).bits());
     }
 
     #[test]
@@ -1696,7 +1696,7 @@ mod tests {
         assert!(!ctx.pending, "a test-double helper set the error flag");
         assert_eq!(frame[1], 0xDEAD_BEEF_CAFE_F00D, "frame overrun");
         assert_eq!(stack[64], 0xDEAD_BEEF_CAFE_F00D, "stack overrun");
-        assert_eq!(Value::from_bits(result).as_number(), Some(0.0));
+        assert_eq!(result, Value::Number(0.0).bits());
     }
 
     #[test]

@@ -61,18 +61,6 @@ const TAG_UNINITIALIZED: u64 = 9;
 /// no tagged value uses tag 10), so `kind()`'s reserved-tag `unreachable!`
 /// stays unreachable — every dense-buffer reader filters holes first.
 const TAG_HOLE: u64 = 10;
-/// The inline-small-integer Number tag (tag 11 in the reserved range). Not
-/// emitted yet — every Number still boxes as a double — but reserved so the
-/// JIT's inline number paths can be made smi-aware before the representation
-/// flip that will start using it.
-pub const TAG_SMI: u64 = 11;
-
-/// The NaN-boxing prefix plus the tag nibble (bits 63-44): the tag lives in
-/// bits 47-44, so a smi test needs this wider mask, not `TAG_MASK`.
-pub const SMI_MASK: u64 = 0xFFFF_F000_0000_0000;
-/// The full high-word prefix of a smi (`TAG_PREFIX | (TAG_SMI << 44)`), so the
-/// smi test is one mask and one compare. Public for the JIT's inline checks.
-pub const SMI_PREFIX: u64 = TAG_PREFIX | (TAG_SMI << 44);
 
 /// The raw bits of the frame-slot TDZ / unset-inline-field marker (tag 9 in
 /// the reserved range): `TAG_PREFIX | (9 << 44)`. `pub` so the JIT's inline
@@ -159,17 +147,6 @@ impl Value {
 
     #[inline]
     pub fn Number(n: f64) -> Value {
-        // Small whole numbers box as an inline smi so integer arithmetic skips
-        // the f64 round-trip. `-0.0` must stay a double (`1 / -0.0` is
-        // -Infinity and `Object.is(-0, 0)` distinguishes them), so only a
-        // non-negative-zero whole value in i32 range is a smi.
-        if n.fract() == 0.0
-            && n >= i32::MIN as f64
-            && n <= i32::MAX as f64
-            && n.to_bits() != (-0.0f64).to_bits()
-        {
-            return Value::smi(n as i32);
-        }
         let bits = n.to_bits();
         // Colliding quiet NaNs (top 16 bits 0x7FF8) would read as a tag.
         let bits = if bits & TAG_MASK == TAG_PREFIX {
@@ -178,15 +155,6 @@ impl Value {
             bits
         };
         Value(bits, std::marker::PhantomData)
-    }
-
-    /// An inline 32-bit integer Number.
-    #[inline]
-    pub const fn smi(n: i32) -> Value {
-        Value(
-            TAG_PREFIX | (TAG_SMI << 44) | (n as u32 as u64),
-            std::marker::PhantomData,
-        )
     }
 
     pub fn BigInt(h: Handle<BigInt>) -> Value {
@@ -333,7 +301,6 @@ impl Value {
                 TAG_FUNCTION => {
                     ValueKind::Function(unsafe { self.take_ref(TAG_FUNCTION) }.unwrap())
                 }
-                TAG_SMI => ValueKind::Number(self.payload() as u32 as i32 as f64),
                 _ => unreachable!("reserved tag"),
             }
         }
@@ -356,12 +323,7 @@ impl Value {
 
     #[inline]
     pub fn is_number(&self) -> bool {
-        self.is_double() || self.is_smi()
-    }
-
-    #[inline]
-    pub fn is_smi(&self) -> bool {
-        !self.is_double() && self.tag() == TAG_SMI
+        self.is_double()
     }
 
     #[inline]
@@ -393,17 +355,6 @@ impl Value {
     pub fn as_number(&self) -> Option<f64> {
         if self.is_double() {
             Some(f64::from_bits(self.0))
-        } else if self.is_smi() {
-            Some(self.payload() as u32 as i32 as f64)
-        } else {
-            None
-        }
-    }
-
-    #[inline]
-    pub fn as_smi(&self) -> Option<i32> {
-        if self.is_smi() {
-            Some(self.payload() as u32 as i32)
         } else {
             None
         }
@@ -524,7 +475,7 @@ impl fmt::Display for Value {
 /// The `Type` abstract operation (spec 7.2.1). Proxies over callable
 /// functions report `function` like the spec's typeof.
 pub fn type_of(value: &Value) -> &'static str {
-    if value.is_number() {
+    if value.is_double() {
         return "number";
     }
     match value.tag() {
@@ -787,13 +738,8 @@ mod tests {
         ] {
             assert_eq!(Value::from_bits(v.bits()).bits(), v.bits());
         }
-        // `bits_are_double` distinguishes a double from every tag, including
-        // the inline smi; `is_number` covers both.
-        assert!(!Value::bits_are_double(Value::Number(1.0).bits()));
-        assert!(Value::Number(1.0).is_smi());
-        assert_eq!(Value::Number(1.0).as_smi(), Some(1));
-        assert!(Value::bits_are_double(Value::Number(3.5).bits()));
-        assert!(Value::bits_are_double(Value::Number(-0.0).bits()));
+        // The JIT's inline double check mirrors `is_number`.
+        assert!(Value::bits_are_double(Value::Number(1.0).bits()));
         assert!(!Value::bits_are_double(Value::Undefined.bits()));
         assert!(!Value::bits_are_double(Value::Boolean(true).bits()));
         assert!(!Value::bits_are_double(Value::uninitialized().bits()));

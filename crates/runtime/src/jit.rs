@@ -5994,9 +5994,7 @@ extern "C" fn char_code_at(ctx: *mut c_void, this: u64, arg: u64) -> u64 {
     let Some(string) = Value::from_bits(this).as_string() else {
         return Value::Number(f64::NAN).bits();
     };
-    let position = crux::convert::to_integer_or_infinity(
-        Value::from_bits(arg).as_number().unwrap_or(f64::NAN),
-    );
+    let position = crux::convert::to_integer_or_infinity(f64::from_bits(arg));
     let size = string.len() as f64;
     if position < 0.0 || position >= size {
         return Value::Number(f64::NAN).bits();
