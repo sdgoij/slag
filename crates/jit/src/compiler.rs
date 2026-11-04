@@ -4739,21 +4739,15 @@ impl<'a> Lowerer<'a> {
         let same = self.builder.create_block();
         let helper = self.builder.create_block();
         let done = self.builder.create_block();
-        let disc_num = self.is_double(disc);
-        let test_num = self.is_double(test);
+        let disc_num = self.is_number(disc);
+        let test_num = self.is_number(test);
         let both_num = self.builder.ins().band(disc_num, test_num);
         self.builder.ins().brif(both_num, num, &[], bits, &[]);
         // Two Numbers: `===` is the f64 compare (NaN unequal, +0 === -0).
         self.builder.seal_block(num);
         self.builder.switch_to_block(num);
-        let a = self
-            .builder
-            .ins()
-            .bitcast(types::F64, MemFlagsData::new(), disc);
-        let b = self
-            .builder
-            .ins()
-            .bitcast(types::F64, MemFlagsData::new(), test);
+        let a = self.value_as_f64(disc);
+        let b = self.value_as_f64(test);
         let eq = self.builder.ins().fcmp(FloatCC::Equal, a, b);
         self.builder.def_var(var, eq);
         self.builder.ins().jump(done, &[]);
@@ -5624,6 +5618,49 @@ impl<'a> Lowerer<'a> {
         self.builder
             .ins()
             .icmp_imm_u(IntCC::NotEqual, masked, crux::TAG_PREFIX as i64)
+    }
+
+    /// `bits & TAG_MASK == TAG_PREFIX` and `(bits >> 44) & 0xF == TAG_SMI` —
+    /// the inline-integer Number check (smi-aware, I8).
+    fn is_smi(&mut self, bits: ClifValue) -> ClifValue {
+        let is_tagged = self.builder.ins().band_imm_u(bits, crux::TAG_MASK as i64);
+        let is_tagged =
+            self.builder
+                .ins()
+                .icmp_imm_u(IntCC::Equal, is_tagged, crux::TAG_PREFIX as i64);
+        let tag = self.builder.ins().ushr_imm_u(bits, 44);
+        let tag = self.builder.ins().band_imm_u(tag, 0xF);
+        let is_smi_tag = self
+            .builder
+            .ins()
+            .icmp_imm_u(IntCC::Equal, tag, crux::TAG_SMI as i64);
+        self.builder.ins().band(is_tagged, is_smi_tag)
+    }
+
+    /// `is_double(bits) || is_smi(bits)` — the Number check (I8).
+    fn is_number(&mut self, bits: ClifValue) -> ClifValue {
+        let double = self.is_double(bits);
+        let smi = self.is_smi(bits);
+        self.builder.ins().bor(double, smi)
+    }
+
+    /// Decode a Number-typed `bits` to its `f64` value: a smi is widened from
+    /// its low 32-bit i32, a double is a bitcast. The caller must have proven
+    /// `is_number(bits)` first (a non-Number passes garbage, exactly as the
+    /// old bitcast-after-`is_double` did).
+    fn value_as_f64(&mut self, bits: ClifValue) -> ClifValue {
+        let smi = self.is_smi(bits);
+        let payload = self
+            .builder
+            .ins()
+            .band_imm_u(bits, crux::PAYLOAD_MASK as i64);
+        let i32 = self.builder.ins().ireduce(types::I32, payload);
+        let smi_f64 = self.builder.ins().fcvt_from_sint(types::F64, i32);
+        let dbl_f64 = self
+            .builder
+            .ins()
+            .bitcast(types::F64, MemFlagsData::new(), bits);
+        self.builder.ins().select(smi, smi_f64, dbl_f64)
     }
 
     /// `bits & TAG_MASK == TAG_PREFIX` and `(bits >> 44) & 0xF == TAG_STRING`

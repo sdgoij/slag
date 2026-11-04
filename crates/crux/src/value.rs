@@ -61,6 +61,11 @@ const TAG_UNINITIALIZED: u64 = 9;
 /// no tagged value uses tag 10), so `kind()`'s reserved-tag `unreachable!`
 /// stays unreachable — every dense-buffer reader filters holes first.
 const TAG_HOLE: u64 = 10;
+/// The inline-small-integer Number tag (tag 11 in the reserved range). Not
+/// emitted yet — every Number still boxes as a double — but reserved so the
+/// JIT's inline number paths can be made smi-aware before the representation
+/// flip that will start using it.
+pub const TAG_SMI: u64 = 11;
 
 /// The raw bits of the frame-slot TDZ / unset-inline-field marker (tag 9 in
 /// the reserved range): `TAG_PREFIX | (9 << 44)`. `pub` so the JIT's inline
