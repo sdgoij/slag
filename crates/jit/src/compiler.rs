@@ -9201,11 +9201,8 @@ impl<'a> Lowerer<'a> {
             // general path plus `fast_loop_test`'s relational fallback.
             FastLoopVar::Slot(slot) => {
                 let old = self.load_slot(slot);
-                let is_num = self.is_double(old);
-                let num = self
-                    .builder
-                    .ins()
-                    .bitcast(types::F64, MemFlagsData::new(), old);
+                let is_num = self.is_number(old);
+                let num = self.value_as_f64(old);
                 let delta = if matches!(inc, UpdateOp::Increment) {
                     1.0
                 } else {
@@ -9224,14 +9221,11 @@ impl<'a> Lowerer<'a> {
                 let limit_bits = self.emit_rel_limit_bits(limit)?;
                 let limit_is_num = match limit {
                     RelLimit::Imm(_) => self.builder.ins().iconst(types::I8, 1),
-                    _ => self.is_double(limit_bits),
+                    _ => self.is_number(limit_bits),
                 };
                 let both = self.builder.ins().band(is_num, limit_is_num);
                 let cc = rel_cc(op)?;
-                let limit_num =
-                    self.builder
-                        .ins()
-                        .bitcast(types::F64, MemFlagsData::new(), limit_bits);
+                let limit_num = self.value_as_f64(limit_bits);
                 let cmp = self.builder.ins().fcmp(cc, new_num, limit_num);
                 let test_fast = self.bint(cmp);
                 let new_var = self.builder.declare_var(types::I64);
