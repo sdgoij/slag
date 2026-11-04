@@ -10021,6 +10021,14 @@ impl<'a> Lowerer<'a> {
         op: &LeafOp,
     ) -> Result<(), Unsupported> {
         match op {
+            // A branch makes the register program a whole-body executor. The
+            // JIT's per-step tier lowers register bodies as straight-line op
+            // runs, so a branching program bails the body to the interpreter
+            // (which now runs it as a program). The JIT is a consumer of the
+            // bytecode, not a constraint on it.
+            LeafOp::Jump(_) | LeafOp::JumpIfFalsy(_) => {
+                return Err(Unsupported::Step("RunRegBody"));
+            }
             LeafOp::LoadReg { slot, tdz } => {
                 let bits = self.load_slot(*slot);
                 if *tdz {

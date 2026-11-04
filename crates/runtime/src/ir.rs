@@ -1705,6 +1705,12 @@ pub enum LeafOp {
     BinRemConst { divisor: i32 },
     /// Complete with `Completion::Return(acc)`.
     ReturnAcc,
+    /// Jump to `target` (an index into the op array). Control flow inside a
+    /// register program, so a whole certified body can be one `RunRegBody`
+    /// instead of straight-line fragments around dispatched `Step`s.
+    Jump(usize),
+    /// Branch to `target` when the accumulator is falsy (`ToBoolean` false).
+    JumpIfFalsy(usize),
 }
 
 /// A `try` region's handler: the covered ranges and the catch/finally
@@ -13190,7 +13196,9 @@ impl Vm {
     /// path's end-of-steps completion.
     #[inline(always)]
     fn run_leaf_ops(&mut self, agent: &mut Agent, ops: &[LeafOp]) -> Result<Completion, JsError> {
-        for op in ops {
+        let mut pc = 0;
+        while let Some(op) = ops.get(pc) {
+            pc += 1;
             match op {
                 LeafOp::LoadReg { slot, tdz } => {
                     let value = *self.frame_get(*slot);
@@ -13293,7 +13301,18 @@ impl Vm {
                     // `apply_binary` (two tag checks + a direct op) — the
                     // general evaluator adds a call and the RHS tag check
                     // for no semantic gain (mirrors `Step::BinaryImm`).
-                    let value = if let Some(num) = self.acc.as_number() {
+                    let smi_value = self.acc.as_smi().and_then(|a| {
+                        let b = Self::smi_from_f64(*imm)?;
+                        match op {
+                            BinaryOp::Add => a.checked_add(b).map(Value::smi),
+                            BinaryOp::Sub => a.checked_sub(b).map(Value::smi),
+                            BinaryOp::Mul => a.checked_mul(b).map(Value::smi),
+                            _ => None,
+                        }
+                    });
+                    let value = if let Some(value) = smi_value {
+                        value
+                    } else if let Some(num) = self.acc.as_number() {
                         match op {
                             BinaryOp::Add => Value::Number(num + imm),
                             BinaryOp::Sub => Value::Number(num - imm),
@@ -13738,6 +13757,12 @@ impl Vm {
                 LeafOp::ReturnAcc => {
                     return Ok(Completion::Return(self.acc));
                 }
+                LeafOp::Jump(target) => pc = *target,
+                LeafOp::JumpIfFalsy(target) => {
+                    if !crux::convert::to_boolean(&self.acc) {
+                        pc = *target;
+                    }
+                }
             }
         }
         Ok(Completion::Empty)
@@ -13759,6 +13784,21 @@ impl Vm {
         left: &Value,
         right: &Value,
     ) -> Result<Value, JsError> {
+        // smi `+`/`-`/`*`: exact integer arithmetic when it does not overflow,
+        // so an integer loop's accumulator stays an inline integer instead of
+        // round-tripping f64. Everything else (div, bitwise, comparison) keeps
+        // the paths below.
+        if let (Some(a), Some(b)) = (left.as_smi(), right.as_smi()) {
+            let result = match op {
+                BinaryOp::Add => a.checked_add(b),
+                BinaryOp::Sub => a.checked_sub(b),
+                BinaryOp::Mul => a.checked_mul(b),
+                _ => None,
+            };
+            if let Some(result) = result {
+                return Ok(Value::smi(result));
+            }
+        }
         if let (Some(left), Some(right)) = (left.as_number(), right.as_number()) {
             match op {
                 BinaryOp::Add => return Ok(Value::Number(left + right)),
@@ -13779,6 +13819,20 @@ impl Vm {
             }
         }
         crate::expr::apply_binary(agent, op, left, right)
+    }
+
+    /// The f64 as an inline i32, when it is a whole number in range and not
+    /// `-0.0` (the same rule `Value::Number` uses to choose a smi).
+    fn smi_from_f64(n: f64) -> Option<i32> {
+        if n.fract() == 0.0
+            && n >= i32::MIN as f64
+            && n <= i32::MAX as f64
+            && n.to_bits() != (-0.0f64).to_bits()
+        {
+            Some(n as i32)
+        } else {
+            None
+        }
     }
 
     /// The string-string `Add` fast path: the rope concat, kept out of the
