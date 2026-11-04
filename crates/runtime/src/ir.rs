@@ -31801,9 +31801,25 @@ fn acc_stmt_safe(stmt: &Stmt, name: crux::AtomId) -> bool {
         | StmtKind::ClassDecl(_)
         | StmtKind::With { .. }
         | StmtKind::Try { .. }
-        | StmtKind::Switch { .. }
         | StmtKind::ForIn { .. }
         | StmtKind::UsingDecl { .. } => false,
+        // A switch is safe for the accumulator when it only reads the counter
+        // and its cases are safe: an unlabeled `break` breaks the switch (not
+        // the loop), and an unlabeled `continue` continues the loop, so the
+        // late counter sync stays correct. A labeled transfer out of the loop
+        // is rejected separately by `acc_body_label_transfers_inside`.
+        StmtKind::Switch {
+            discriminant,
+            cases,
+        } => {
+            acc_expr_safe(discriminant, name, false)
+                && cases.iter().all(|case| {
+                    case.test
+                        .as_ref()
+                        .is_none_or(|test| acc_expr_safe(test, name, false))
+                        && case.consequent.iter().all(|s| acc_stmt_safe(s, name))
+                })
+        }
     }
 }
 
